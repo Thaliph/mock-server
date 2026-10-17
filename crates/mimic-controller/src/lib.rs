@@ -71,7 +71,15 @@ impl Running {
     }
 }
 
+/// Choisit ring comme fournisseur cryptographique du processus. Deux fournisseurs sont
+/// compilés (aws-lc-rs vient d'object_store) : sans ce choix, le premier client TLS
+/// construit par `kube` panique. Sans effet si un fournisseur est déjà installé.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub async fn start(config: ControllerConfig) -> Result<Running, String> {
+    install_crypto_provider();
     config.validate()?;
     let store = open(&config.store)?;
     let (auth, client) = match &config.auth {

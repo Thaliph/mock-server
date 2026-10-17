@@ -84,6 +84,7 @@ const UI_PORT: u16 = 8081;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    mimic_controller::install_crypto_provider();
     match run(cli.command).await {
         Ok(code) => std::process::exit(code),
         Err(e) => {
