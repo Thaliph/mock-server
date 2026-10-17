@@ -17,6 +17,7 @@ hyper = { version = "1.12.0", features = ["http1", "http2", "server", "client"] 
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
 mimic-core = { version = "0.1.0", path = "../mimic-core" }
 nix = { version = "0.31.3", features = ["net", "socket"] }
+object_store = { version = "0.14.2", features = ["aws"] }
 prometheus-client = "0.25.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
