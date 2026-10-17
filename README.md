@@ -44,6 +44,8 @@ Déploiement dans Kubernetes : voir [deploy/README.md](deploy/README.md).
 
 ## mimicctl
 
+Référence complète, droits nécessaires et interface web du contrôleur : [docs/cli.md](docs/cli.md).
+
 ```sh
 cargo install --path crates/mimicctl
 mimicctl mode checkout mock -n shop          # bascule tous les pods du workload
@@ -64,6 +66,8 @@ cargo insta review              # après un changement voulu de la sortie OpenAP
 sudo ./scripts/e2e-netns.sh     # interception iptables réelle, dans un namespace réseau jetable
 ./scripts/e2e-kind.sh           # démo OpenTelemetry sur kind (charge comprise) : injection, rapport, bascule mock
 ```
+
+Reproduire et lire le test sur kind : [docs/e2e-kind.md](docs/e2e-kind.md).
 
 Les tests portent l'identifiant du critère d'acceptation qu'ils couvrent
 (`inf_01_…`, `red_04_…`), voir la section 11 de la spec.
