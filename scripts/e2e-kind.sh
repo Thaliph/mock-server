@@ -130,6 +130,17 @@ kubectl -n mimic-system rollout status deploy/mimic-injector --timeout=180s
 # Le caBundle est posé par le cainjector : attendre qu'il le soit avant de créer des pods.
 retry 60 sh -c '[ -n "$(kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath="{.webhooks[0].clientConfig.caBundle}")" ]'
 
+# Le webhook est en failurePolicy Ignore : un pod créé avant que son Service réponde n'est
+# pas injecté. Attendre qu'un pod d'essai (dry-run côté serveur) ressorte injecté.
+kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+kubectl label namespace "$NS" mimic.platform.io/enabled=true --overwrite
+injects() {
+  kubectl -n "$NS" run mimic-probe --image=busybox --restart=Never --dry-run=server \
+    --labels app.kubernetes.io/name=mimic-probe -o jsonpath='{.spec.initContainers[*].name}' 2>/dev/null |
+    grep -qw mimic
+}
+retry 120 injects || fail "le webhook n'injecte pas"
+
 log "démo OpenTelemetry"
 kubectl apply -f tests/e2e/otel-demo.yaml -f tests/e2e/client.yaml
 retry 60 kubectl -n "$NS" get configmap mimic-controller-ca >/dev/null
