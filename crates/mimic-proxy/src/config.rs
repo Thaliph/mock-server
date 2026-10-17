@@ -62,6 +62,7 @@ pub struct Config {
     pub redact: RedactSection,
     pub mock: MockSection,
     pub store: StoreConfig,
+    pub tls: TlsConfig,
     pub share: Option<ShareConfig>,
     /// Fichier d'annotations du pod exposé par l'API downward, surveillé pour la bascule de mode.
     pub annotations_file: Option<PathBuf>,
@@ -80,6 +81,7 @@ impl Default for Config {
             redact: RedactSection::default(),
             mock: MockSection::default(),
             store: StoreConfig::default(),
+            tls: TlsConfig::default(),
             share: None,
             annotations_file: None,
         }
@@ -234,6 +236,21 @@ impl From<StrategyName> for Strategy {
 pub struct StoreConfig {
     /// Répertoire de persistance locale (JSONL). Absent : mémoire seule.
     pub dir: Option<PathBuf>,
+}
+
+/// Interception TLS sortante (spec §4.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Hôtes interceptés : `api.stripe.com`, `*.salesforce.com`, ou `*`. Vide : aucun.
+    pub intercept: Vec<String>,
+    /// CA fournie (Secret) ; absente, une CA éphémère est générée au démarrage.
+    pub ca_cert_file: Option<PathBuf>,
+    pub ca_key_file: Option<PathBuf>,
+    /// Répertoire partagé avec l'application où publier `ca.crt` et `ca-bundle.crt`.
+    pub ca_dir: Option<PathBuf>,
+    /// CA supplémentaire à laquelle se fier vers l'amont (CA d'entreprise, tests).
+    pub upstream_ca_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

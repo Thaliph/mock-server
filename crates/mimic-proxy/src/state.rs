@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use http_body_util::combinators::UnsyncBoxBody;
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -29,13 +30,20 @@ pub struct Discovery {
     pub outbound: BTreeMap<String, Value>,
 }
 
+pub struct TlsState {
+    pub ca: Arc<crate::tls::Ca>,
+    pub server: Arc<rustls::ServerConfig>,
+}
+
 pub struct AppState {
     pub config: Config,
     mode: AtomicU8,
     pub store: Store,
     pub metrics: Metrics,
     pub redactor: Redactor,
-    pub client: Client<HttpConnector, ProxyBody>,
+    pub client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    /// Interception TLS : CA et configuration serveur, si `tls.intercept` n'est pas vide.
+    pub tls: Option<TlsState>,
     engine: Mutex<Option<(u64, MockEngine)>>,
     discovery: Mutex<Option<(u64, Arc<Discovery>)>>,
     pub share_status: Mutex<ShareStatus>,
@@ -52,7 +60,7 @@ pub struct ShareStatus {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Arc<Self> {
+    pub fn new(config: Config) -> Result<Arc<Self>, String> {
         let salt = match &config.redact.salt {
             Some(s) => s.as_bytes().to_vec(),
             None => ulid::Ulid::generate().to_string().into_bytes(),
@@ -64,9 +72,29 @@ impl AppState {
             },
             salt,
         );
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
+        let mut http = HttpConnector::new();
+        http.set_nodelay(true);
+        http.enforce_http(false);
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(crate::tls::client_config(
+                config.tls.upstream_ca_file.as_deref(),
+            )?)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http);
         let client = Client::builder(TokioExecutor::new()).build(connector);
+        let tls = if config.tls.intercept.is_empty() {
+            None
+        } else {
+            let ca = Arc::new(crate::tls::Ca::load(&config.tls)?);
+            if let Some(dir) = &config.tls.ca_dir {
+                ca.publish(dir)?;
+            }
+            Some(TlsState {
+                server: ca.server_config()?,
+                ca,
+            })
+        };
         let metrics = Metrics::new();
         metrics.set_mode(config.mode);
         let store = Store::new(
@@ -77,7 +105,7 @@ impl AppState {
             enabled: config.share.is_some(),
             ..ShareStatus::default()
         };
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             mode: AtomicU8::new(config.mode.to_u8()),
             config,
             store,
@@ -88,7 +116,13 @@ impl AppState {
             discovery: Mutex::new(None),
             share_status: Mutex::new(share_status),
             share_notify: tokio::sync::Notify::new(),
-        })
+            tls,
+        }))
+    }
+
+    /// Vrai si l'hôte doit être intercepté en TLS.
+    pub fn intercepts(&self, host: &str) -> bool {
+        self.tls.is_some() && crate::tls::intercepted(&self.config.tls.intercept, host)
     }
 
     pub fn mode(&self) -> Mode {

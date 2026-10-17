@@ -120,6 +120,32 @@ pub async fn sniff(stream: &TcpStream) -> Protocol {
     }
 }
 
+/// SNI du ClientHello en attente sur la connexion, lu sans le consommer.
+pub async fn peek_sni(stream: &TcpStream) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + SNIFF_TIMEOUT;
+    let mut buf = vec![0u8; 16 * 1024 + 5];
+    loop {
+        let n = tokio::time::timeout_at(deadline, stream.peek(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        if let Some(name) = crate::tls::parse_sni(&buf[..n]) {
+            return Some(name);
+        }
+        // Enregistrement complet sans SNI : inutile d'attendre davantage.
+        if n >= 5 && n >= 5 + u16::from_be_bytes([buf[3], buf[4]]) as usize {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

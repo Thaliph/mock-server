@@ -78,6 +78,12 @@ pub struct PassthroughLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TlsFailureLabels {
+    pub authority: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ModeLabel {
     pub mode: String,
 }
@@ -103,6 +109,7 @@ pub struct Metrics {
     pub share_peers: Gauge,
     pub mode: Family<ModeLabel, Gauge>,
     pub passthrough: Family<PassthroughLabels, Counter>,
+    pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
     authorities: Mutex<BTreeSet<String>>,
 }
 
@@ -123,6 +130,7 @@ impl Metrics {
         let share_peers = Gauge::default();
         let mode = Family::default();
         let passthrough = Family::default();
+        let tls_handshake_failures = Family::default();
         registry.register(
             "mimic_requests",
             "Requêtes traitées par le sidecar",
@@ -179,6 +187,11 @@ impl Metrics {
             "Connexions redirigées non HTTP relayées en tunnel",
             passthrough.clone(),
         );
+        registry.register(
+            "mimic_tls_handshake_failures",
+            "Poignées de main TLS interceptées refusées (CA non approuvée, épinglage)",
+            tls_handshake_failures.clone(),
+        );
         Self {
             registry,
             requests,
@@ -193,6 +206,7 @@ impl Metrics {
             share_peers,
             mode,
             passthrough,
+            tls_handshake_failures,
             authorities: Mutex::new(BTreeSet::new()),
         }
     }

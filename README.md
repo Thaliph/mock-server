@@ -17,7 +17,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P3 | Proxy `mimic-proxy` : record, mock, page d'admin, métriques | fait |
 | P3b | Partage entre sidecars d'un workload | fait |
 | P4 | `mimic-init` (iptables), détection de protocole, image, manifests | fait |
-| P5 | Interception TLS sortante | à faire |
+| P5 | Interception TLS sortante | fait |
 | P7 | Webhook d'injection et `mimicctl` | à faire |
 
 ## Lancer le sidecar en local

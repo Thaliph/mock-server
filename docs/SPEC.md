@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.4** ; ajout de la détection de protocole sur le trafic redirigé (§3.1) et des critères INI-*.
+> Statut : **v0.5** ; interception TLS sortante implémentée (§4.2, configuration `tls` en §9.1).
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -137,6 +137,9 @@ C'est le cas central du mode `mock` (appels HTTPS vers des SaaS).
   3. pour la JVM : truststore généré + `JAVA_TOOL_OPTIONS=-Djavax.net.ssl.trustStore=...`.
 - Mimic lit le SNI, forge à la volée un certificat pour ce nom (cache LRU), termine le TLS côté app et ouvre un vrai TLS vers la destination (`rustls` + racines système) en mode `record`.
 - **MITM opt-in par hôte** : `tls.intercept: ["api.stripe.com", "*.salesforce.com"]`. Tout hôte non listé passe en tunnel TLS opaque (on n'enregistre que SNI, durée, octets).
+- En proxy explicite, un `CONNECT` vers un hôte intercepté est terminé par Mimic ; en transparent, le SNI est lu dans le ClientHello sans consommer les octets.
+- En mode `mock`, un hôte intercepté est servi depuis les enregistrements ; un hôte non intercepté est refusé (O3).
+- Le sidecar publie `ca.crt` (CA Mimic seule) et `ca-bundle.crt` (racines système + CA Mimic) dans `tls.ca_dir`.
 - Limite connue : le **certificate pinning** côté app rend le MITM impossible. Ces hôtes sont détectés (échec de handshake côté app) et signalés dans les métriques.
 
 ---
@@ -376,6 +379,9 @@ outbound:
   exclude_cidrs: [10.96.0.10/32]
 tls:
   intercept: ["api.stripe.com", "*.salesforce.com"]
+  ca_dir: /var/run/mimic/ca            # ca.crt et ca-bundle.crt publiés pour l'app
+  # ca_cert_file / ca_key_file : CA fournie (Secret cert-manager) ; absente, CA éphémère
+  # upstream_ca_file : CA supplémentaire de confiance vers les dépendances
 capture:
   bodies: true
   max_body_bytes: 1048576

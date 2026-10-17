@@ -11,6 +11,7 @@ pub mod proxy;
 pub mod share;
 pub mod state;
 pub mod store;
+pub mod tls;
 pub mod watch;
 
 use std::convert::Infallible;
@@ -28,7 +29,7 @@ use crate::proxy::ConnInfo;
 use crate::state::AppState;
 
 #[derive(Debug, Clone, Copy)]
-enum Listener {
+pub(crate) enum Listener {
     Inbound,
     Outbound,
     Admin,
@@ -72,7 +73,7 @@ impl Running {
 /// Démarre les listeners et les tâches de fond.
 pub async fn start(config: Config) -> Result<Running, String> {
     config.validate()?;
-    let state = AppState::new(config);
+    let state = AppState::new(config)?;
     if let Some(dir) = &state.config.store.dir {
         let loaded = state
             .store
@@ -147,32 +148,86 @@ async fn serve(listener: TcpListener, state: Arc<AppState>, kind: Listener) {
             listen,
             peer,
             original_dst: net::original_dst(&stream),
+            tls_authority: None,
         };
         let state = state.clone();
         tokio::spawn(async move {
             // Le trafic redirigé par iptables n'est pas forcément HTTP.
             if let (Some(dst), Listener::Inbound | Listener::Outbound) = (info.original_dst, kind) {
                 let protocol = net::sniff(&stream).await;
+                if protocol == net::Protocol::Tls
+                    && matches!(kind, Listener::Outbound)
+                    && let Some(host) = net::peek_sni(&stream).await
+                    && state.intercepts(&host)
+                {
+                    let authority = format!("{host}:{}", dst.port());
+                    tls_serve(state, stream, info, authority).await;
+                    return;
+                }
                 if protocol != net::Protocol::Http {
                     let inbound = matches!(kind, Listener::Inbound);
                     proxy::tunnel(state, stream, dst, protocol, inbound).await;
                     return;
                 }
             }
-            let svc = service_fn(move |req| {
-                let state = state.clone();
-                async move {
-                    let resp = match kind {
-                        Listener::Inbound => proxy::inbound(state, info, req).await,
-                        Listener::Outbound => proxy::outbound(state, info, req).await,
-                        Listener::Admin => admin::handle(state, req).await,
-                    };
-                    Ok::<_, Infallible>(resp)
-                }
-            });
-            let _ = auto::Builder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(TokioIo::new(stream), svc)
-                .await;
+            serve_http(TokioIo::new(stream), state, kind, info).await;
         });
     }
+}
+
+/// Termine le TLS côté application avec un certificat forgé, puis traite le HTTP déchiffré.
+pub(crate) async fn tls_serve<IO>(
+    state: Arc<AppState>,
+    io: IO,
+    mut info: ConnInfo,
+    authority: String,
+) where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Some(tls) = &state.tls else { return };
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls.server.clone());
+    match acceptor.accept(io).await {
+        Ok(stream) => {
+            info.tls_authority = Some(authority);
+            serve_http(TokioIo::new(stream), state, Listener::Outbound, info).await;
+        }
+        Err(e) => {
+            // Typiquement : l'application ne fait pas confiance à la CA, ou épingle le certificat.
+            tracing::warn!(%authority, error = %e, "poignée de main TLS refusée par l'application");
+            let label = state.metrics.authority(&authority);
+            state
+                .metrics
+                .tls_handshake_failures
+                .get_or_create(&metrics::TlsFailureLabels {
+                    authority: label,
+                    reason: "client_rejected".into(),
+                })
+                .inc();
+        }
+    }
+}
+
+pub(crate) async fn serve_http<IO>(
+    io: TokioIo<IO>,
+    state: Arc<AppState>,
+    kind: Listener,
+    info: ConnInfo,
+) where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let svc = service_fn(move |req| {
+        let state = state.clone();
+        let info = info.clone();
+        async move {
+            let resp = match kind {
+                Listener::Inbound => proxy::inbound(state, info, req).await,
+                Listener::Outbound => proxy::outbound(state, info, req).await,
+                Listener::Admin => admin::handle(state, req).await,
+            };
+            Ok::<_, Infallible>(resp)
+        }
+    });
+    let _ = auto::Builder::new(TokioExecutor::new())
+        .serve_connection_with_upgrades(io, svc)
+        .await;
 }
