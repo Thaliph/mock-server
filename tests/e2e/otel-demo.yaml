@@ -1,0 +1,104 @@
+# Deux services de la démo OpenTelemetry (https://github.com/open-telemetry/opentelemetry-demo) :
+# shipping (Rust) appelle quote (PHP) en HTTP pour chiffrer une livraison. Le namespace
+# est ouvert à l'injection ; shipping reçoit mimic, quote et le client de test s'en retirent.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otel-demo
+  labels:
+    mimic.platform.io/enabled: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quote
+  namespace: otel-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: quote}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: quote}
+      annotations:
+        mimic.platform.io/inject: "false"
+    spec:
+      containers:
+        - name: quote
+          image: ghcr.io/open-telemetry/demo:2.1.3-quote
+          env:
+            - {name: QUOTE_PORT, value: "8090"}
+            - {name: OTEL_PHP_AUTOLOAD_ENABLED, value: "false"}
+            - {name: OTEL_SERVICE_NAME, value: quote}
+          ports:
+            - {name: http, containerPort: 8090}
+          readinessProbe:
+            tcpSocket: {port: http}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: quote
+  namespace: otel-demo
+spec:
+  selector: {app.kubernetes.io/name: quote}
+  ports:
+    - {name: http, port: 8090, targetPort: http}
+---
+# Deux réplicas : la bascule doit aligner les deux pods sur le même snapshot (spec §5.6).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shipping
+  namespace: otel-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: shipping}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: shipping}
+    spec:
+      containers:
+        - name: shipping
+          image: ghcr.io/open-telemetry/demo:2.1.3-shipping
+          env:
+            - {name: SHIPPING_PORT, value: "50050"}
+            - {name: QUOTE_ADDR, value: "http://quote:8090"}
+            - {name: OTEL_SERVICE_NAME, value: shipping}
+            # Pas de collecteur dans ce test : les exports de télémétrie échouent sans gêner.
+            - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318"}
+          ports:
+            - {name: http, containerPort: 50050}
+          readinessProbe:
+            tcpSocket: {port: http}
+          resources:
+            requests: {cpu: 20m, memory: 16Mi}
+            limits: {memory: 64Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shipping
+  namespace: otel-demo
+spec:
+  selector: {app.kubernetes.io/name: shipping}
+  ports:
+    - {name: http, port: 50050, targetPort: http}
+---
+# Client du test : joue le rôle du frontend de la démo.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: otel-demo
+  annotations:
+    mimic.platform.io/inject: "false"
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "infinity"]
