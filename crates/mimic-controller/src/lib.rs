@@ -124,14 +124,20 @@ pub async fn start(config: ControllerConfig) -> Result<Running, String> {
 }
 
 async fn serve(listener: TcpListener, router: Router, tls: Option<tokio_rustls::TlsAcceptor>) {
+    // Les connexions appartiennent à cette tâche : l'arrêter les ferme aussi.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            a = listener.accept() => a,
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let Ok((stream, _)) = accepted else {
             continue;
         };
         let _ = stream.set_nodelay(true);
         let service = TowerToHyperService::new(router.clone());
         let tls = tls.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
             let result = match tls {
                 Some(acceptor) => match acceptor.accept(stream).await {

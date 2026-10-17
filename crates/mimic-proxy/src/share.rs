@@ -1,8 +1,8 @@
 //! Partage des enregistrements entre les sidecars d'un même workload (spec §5.4).
 //!
-//! Chaque sidecar publie ses nouveaux échanges (déjà redactés) dans un segment JSONL sous
-//! `<prefixe>/<namespace>/<workload>/exchanges/<instance>/`, puis importe les segments des
-//! autres instances. Aucun appel à l'API Kubernetes, aucune connexion entre pods.
+//! Chaque sidecar publie ses nouveaux échanges (déjà redactés) dans un segment JSONL, puis
+//! importe les segments des autres instances. Le support est le contrôleur (recommandé) ou un
+//! stockage objet partagé sous `<prefixe>/<namespace>/<workload>/exchanges/<instance>/`.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -14,8 +14,23 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::config::ShareConfig;
+use crate::control::ControllerClient;
 use crate::state::AppState;
 use crate::store::Origin;
+
+/// Support du partage.
+#[derive(Clone)]
+enum Backend {
+    Object(Arc<dyn ObjectStore>),
+    Controller(Arc<ControllerClient>),
+}
+
+/// Segment vu sur le support : clé de lecture, instance qui l'a écrit, date.
+struct Seen {
+    key: String,
+    instance: String,
+    modified_ms: i64,
+}
 
 /// Demande une synchronisation immédiate ; faux si le partage est désactivé.
 pub fn trigger(state: &AppState) -> bool {
@@ -27,14 +42,17 @@ pub fn trigger(state: &AppState) -> bool {
 }
 
 /// Lance la boucle de partage si elle est configurée.
-pub fn spawn(state: &Arc<AppState>) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
+pub fn spawn(
+    state: &Arc<AppState>,
+    controller: Option<Arc<ControllerClient>>,
+) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
     let Some(config) = state.config.share.clone() else {
         return Ok(None);
     };
     let base = base_path(state);
     let state = state.clone();
     Ok(Some(tokio::spawn(async move {
-        let mut sharer = Sharer::new(config, base);
+        let mut sharer = Sharer::new(config, base, controller);
         loop {
             sharer.sync(&state).await;
             let interval = sharer.config.interval;
@@ -47,14 +65,14 @@ pub fn spawn(state: &Arc<AppState>) -> Result<Option<tokio::task::JoinHandle<()>
 }
 
 /// Dernière publication avant l'arrêt, bornée dans le temps.
-pub async fn final_sync(state: &AppState) {
+pub async fn final_sync(state: &AppState, controller: Option<Arc<ControllerClient>>) {
     let Some(config) = state.config.share.clone() else {
         return;
     };
-    let mut sharer = Sharer::new(config, base_path(state));
+    let mut sharer = Sharer::new(config, base_path(state), controller);
     let publish = async {
-        if let Ok(store) = sharer.backend() {
-            let _ = publish(state, store.as_ref(), &sharer.base).await;
+        if let Ok(backend) = sharer.backend() {
+            let _ = publish(state, &backend, &sharer.base).await;
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(5), publish).await;
@@ -74,28 +92,28 @@ struct Sharer {
     config: ShareConfig,
     /// Chemin relatif au support, sans le préfixe de l'URL.
     base: String,
-    store: Option<Arc<dyn ObjectStore>>,
+    backend: Option<Backend>,
     imported: HashSet<String>,
 }
 
 impl Sharer {
-    fn new(config: ShareConfig, base: String) -> Self {
+    fn new(config: ShareConfig, base: String, controller: Option<Arc<ControllerClient>>) -> Self {
         Self {
             config,
             base,
-            store: None,
+            backend: controller.map(Backend::Controller),
             imported: HashSet::new(),
         }
     }
 
     /// Construit le support à la demande : une erreur au démarrage est retentée au cycle suivant.
-    fn backend(&mut self) -> Result<Arc<dyn ObjectStore>, String> {
-        if let Some(s) = &self.store {
-            return Ok(s.clone());
+    fn backend(&mut self) -> Result<Backend, String> {
+        if let Some(b) = &self.backend {
+            return Ok(b.clone());
         }
-        let store = open(&self.config.url)?;
-        self.store = Some(store.clone());
-        Ok(store)
+        let b = Backend::Object(open(&self.config.url)?);
+        self.backend = Some(b.clone());
+        Ok(b)
     }
 
     async fn sync(&mut self, state: &AppState) {
@@ -124,41 +142,26 @@ impl Sharer {
     }
 
     async fn try_sync(&mut self, state: &AppState) -> Result<BTreeSet<String>, String> {
-        let store = self.backend()?;
-        publish(state, store.as_ref(), &self.base).await?;
+        let backend = self.backend()?;
+        publish(state, &backend, &self.base).await?;
 
         let me = &state.config.instance;
         let oldest_ms = now_ms().saturating_sub(self.config.retention.as_millis() as u64) as i64;
-        let prefix = Path::from(self.base.as_str());
-        let mut listing = store.list(Some(&prefix));
         let mut peers = BTreeSet::new();
         let mut to_import = vec![];
-        while let Some(meta) = listing.next().await {
-            let meta = meta.map_err(|e| format!("liste du partage: {e}"))?;
-            let location = meta.location.to_string();
-            let Some(instance) = instance_of(&self.base, &location) else {
-                continue;
-            };
-            if instance == *me {
+        for seg in list(&backend, &self.base).await? {
+            if seg.instance == *me {
                 continue;
             }
-            peers.insert(instance.to_string());
-            if meta.last_modified.timestamp_millis() < oldest_ms
-                || self.imported.contains(&location)
-            {
+            peers.insert(seg.instance.clone());
+            if seg.modified_ms < oldest_ms || self.imported.contains(&seg.key) {
                 continue;
             }
-            to_import.push(meta.location);
+            to_import.push(seg.key);
         }
         let mut imported = 0;
-        for location in to_import {
-            let bytes = store
-                .get(&location)
-                .await
-                .map_err(|e| format!("lecture de {location}: {e}"))?
-                .bytes()
-                .await
-                .map_err(|e| format!("lecture de {location}: {e}"))?;
+        for key in to_import {
+            let bytes = get(&backend, &key).await?;
             for line in bytes.split(|b| *b == b'\n') {
                 if line.is_empty() {
                     continue;
@@ -168,7 +171,7 @@ impl Sharer {
                     imported += 1;
                 }
             }
-            self.imported.insert(location.to_string());
+            self.imported.insert(key);
         }
         if imported > 0 {
             tracing::debug!(imported, "échanges importés des autres sidecars");
@@ -178,8 +181,54 @@ impl Sharer {
     }
 }
 
+async fn list(backend: &Backend, base: &str) -> Result<Vec<Seen>, String> {
+    match backend {
+        Backend::Controller(c) => Ok(c
+            .segments()
+            .await?
+            .into_iter()
+            .map(|s| Seen {
+                key: s.key,
+                instance: s.instance,
+                modified_ms: s.modified_ms,
+            })
+            .collect()),
+        Backend::Object(store) => {
+            let prefix = Path::from(base);
+            let mut listing = store.list(Some(&prefix));
+            let mut out = vec![];
+            while let Some(meta) = listing.next().await {
+                let meta = meta.map_err(|e| format!("liste du partage: {e}"))?;
+                let key = meta.location.to_string();
+                let Some(instance) = instance_of(base, &key) else {
+                    continue;
+                };
+                out.push(Seen {
+                    instance: instance.to_string(),
+                    modified_ms: meta.last_modified.timestamp_millis(),
+                    key,
+                });
+            }
+            Ok(out)
+        }
+    }
+}
+
+async fn get(backend: &Backend, key: &str) -> Result<bytes::Bytes, String> {
+    match backend {
+        Backend::Controller(c) => c.segment(key).await,
+        Backend::Object(store) => store
+            .get(&Path::from(key))
+            .await
+            .map_err(|e| format!("lecture de {key}: {e}"))?
+            .bytes()
+            .await
+            .map_err(|e| format!("lecture de {key}: {e}")),
+    }
+}
+
 /// Publie les nouveaux échanges locaux ; en cas d'échec ils restent en attente.
-async fn publish(state: &AppState, store: &dyn ObjectStore, base: &str) -> Result<(), String> {
+async fn publish(state: &AppState, backend: &Backend, base: &str) -> Result<(), String> {
     let pending = state.store.take_unshared();
     if pending.is_empty() {
         return Ok(());
@@ -191,18 +240,25 @@ async fn publish(state: &AppState, store: &dyn ObjectStore, base: &str) -> Resul
             body.push(b'\n');
         }
     }
-    let path = Path::from(format!(
-        "{base}/{}/{}.jsonl",
-        state.config.instance,
-        ulid::Ulid::generate()
-    ));
-    match store.put(&path, PutPayload::from(body)).await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            state.store.restore_unshared(pending);
-            Err(format!("publication de {path}: {e}"))
+    let result = match backend {
+        Backend::Controller(c) => c.put_segment(body).await,
+        Backend::Object(store) => {
+            let path = Path::from(format!(
+                "{base}/{}/{}.jsonl",
+                state.config.instance,
+                ulid::Ulid::generate()
+            ));
+            store
+                .put(&path, PutPayload::from(body))
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("publication de {path}: {e}"))
         }
+    };
+    if result.is_err() {
+        state.store.restore_unshared(pending);
     }
+    result
 }
 
 /// Instance qui a écrit un segment : premier segment du chemin après la base.
@@ -239,7 +295,7 @@ fn open(url: &str) -> Result<Arc<dyn ObjectStore>, String> {
     Err(format!("URL de partage non supportée: {url}"))
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

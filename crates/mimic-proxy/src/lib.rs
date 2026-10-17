@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod capture;
 pub mod config;
+pub mod control;
 pub mod metrics;
 pub mod net;
 pub mod proxy;
@@ -41,6 +42,7 @@ pub struct Running {
     inbound: Option<SocketAddr>,
     outbound: Option<SocketAddr>,
     admin: SocketAddr,
+    controller: Option<Arc<control::ControllerClient>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -63,7 +65,7 @@ impl Running {
 
     /// Arrête les listeners et les tâches de fond, après une dernière synchronisation.
     pub async fn shutdown(self) {
-        share::final_sync(&self.state).await;
+        share::final_sync(&self.state, self.controller.clone()).await;
         for t in self.tasks {
             t.abort();
         }
@@ -108,10 +110,26 @@ pub async fn start(config: Config) -> Result<Running, String> {
     };
     let (admin, t) = bind(state.config.admin.listen, Listener::Admin).await?;
     tasks.push(t);
-    if let Some(path) = state.config.annotations_file.clone() {
-        tasks.push(tokio::spawn(watch::watch_annotations(state.clone(), path)));
-    }
-    if let Some(t) = share::spawn(&state)? {
+    // Un sidecar piloté n'obéit qu'au contrôleur : l'annotation de mode est ignorée.
+    let controller = match &state.config.share {
+        Some(share) if share.is_controller() => {
+            control::restore(&state);
+            let client = Arc::new(control::ControllerClient::new(&state, share)?);
+            tasks.push(control::spawn(
+                state.clone(),
+                client.clone(),
+                share.mode_poll,
+            ));
+            Some(client)
+        }
+        _ => {
+            if let Some(path) = state.config.annotations_file.clone() {
+                tasks.push(tokio::spawn(watch::watch_annotations(state.clone(), path)));
+            }
+            None
+        }
+    };
+    if let Some(t) = share::spawn(&state, controller.clone())? {
         tasks.push(t);
     }
     tracing::info!(
@@ -126,6 +144,7 @@ pub async fn start(config: Config) -> Result<Running, String> {
         inbound,
         outbound,
         admin,
+        controller,
         tasks,
     })
 }

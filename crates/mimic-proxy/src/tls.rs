@@ -200,6 +200,23 @@ pub fn client_config(extra_ca: Option<&Path>) -> Result<ClientConfig, String> {
         .with_no_client_auth())
 }
 
+/// Configuration client qui ne fait confiance qu'aux certificats de `ca` (CA du contrôleur).
+pub fn pinned_client_config(ca: &Path) -> Result<ClientConfig, String> {
+    let pem = std::fs::read_to_string(ca).map_err(|e| format!("{}: {e}", ca.display()))?;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in pem_certs(&pem)? {
+        roots.add(cert).map_err(err)?;
+    }
+    if roots.is_empty() {
+        return Err(format!("{}: aucun certificat", ca.display()));
+    }
+    Ok(ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(err)?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 fn pem_certs(pem: &str) -> Result<Vec<CertificateDer<'static>>, String> {
     use rustls_pki_types::pem::PemObject;
     CertificateDer::pem_slice_iter(pem.as_bytes())

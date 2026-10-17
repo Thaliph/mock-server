@@ -43,6 +43,10 @@ pub async fn handle(state: Arc<AppState>, req: Request<Incoming>) -> Response<Pr
             }
         }
         (&Method::GET, "/mode") => text(StatusCode::OK, state.mode().as_str()),
+        (&Method::PUT, "/mode") | (&Method::DELETE, "/store") if state.config.controlled() => text(
+            StatusCode::FORBIDDEN,
+            "sidecar piloté par le contrôleur : basculer via la ressource MimicWorkload",
+        ),
         (&Method::PUT, "/mode") => {
             let body = match Limited::new(req.into_body(), 1024).collect().await {
                 Ok(b) => b.to_bytes(),
@@ -130,6 +134,10 @@ fn status(state: &AppState) -> Value {
         },
         "store": {"local": local, "peer": peer},
         "share": *state.share_status.lock().expect("verrou du partage"),
+        "snapshot": state.snapshot().map(|s| s.id.clone()),
+        "controller": state.config.controlled().then(|| {
+            state.controller_status.lock().expect("verrou du contrôleur").clone()
+        }),
     })
 }
 

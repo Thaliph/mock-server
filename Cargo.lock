@@ -1857,6 +1857,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "mimic-controller",
  "mimic-core",
  "nix",
  "object_store",

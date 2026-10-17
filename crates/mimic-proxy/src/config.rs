@@ -256,12 +256,57 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShareConfig {
-    /// `file:///chemin` ou `s3://bucket/prefixe`.
+    /// URL du contrôleur (`https://…`), ou support partagé sans contrôleur
+    /// (`file:///chemin`, `s3://bucket/prefixe`).
     pub url: String,
     #[serde(default = "default_share_interval", with = "duration_secs")]
     pub interval: Duration,
     #[serde(default = "default_share_retention", with = "duration_secs")]
     pub retention: Duration,
+    /// Période du battement vers le contrôleur.
+    #[serde(default = "default_mode_poll", with = "duration_secs")]
+    pub mode_poll: Duration,
+    /// Seule CA de confiance pour le contrôleur (spec §7.1).
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Jeton de ServiceAccount projeté, relu à chaque appel (le kubelet le renouvelle).
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    /// Autorise un contrôleur en `http://` : tests uniquement.
+    #[serde(default)]
+    pub allow_insecure: bool,
+}
+
+impl Default for ShareConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            interval: default_share_interval(),
+            retention: default_share_retention(),
+            mode_poll: default_mode_poll(),
+            ca_file: None,
+            token_file: None,
+            allow_insecure: false,
+        }
+    }
+}
+
+impl ShareConfig {
+    /// Partage par un contrôleur plutôt que par un support objet.
+    pub fn is_controller(&self) -> bool {
+        self.url.starts_with("https://") || self.url.starts_with("http://")
+    }
+}
+
+impl Config {
+    /// Vrai si le sidecar est piloté par un contrôleur : il n'accepte alors aucun autre ordre.
+    pub fn controlled(&self) -> bool {
+        self.share.as_ref().is_some_and(ShareConfig::is_controller)
+    }
+}
+
+fn default_mode_poll() -> Duration {
+    Duration::from_secs(2)
 }
 
 fn default_share_interval() -> Duration {
@@ -335,8 +380,20 @@ impl Config {
             if self.workload.name.is_empty() {
                 return Err("share exige un nom de workload (MIMIC_WORKLOAD)".into());
             }
-            if !share.url.starts_with("file://") && !share.url.starts_with("s3://") {
+            let scheme_ok = ["file://", "s3://", "https://", "http://"]
+                .iter()
+                .any(|p| share.url.starts_with(p));
+            if !scheme_ok {
                 return Err(format!("share.url non supportée: {}", share.url));
+            }
+            if share.url.starts_with("http://") && !share.allow_insecure {
+                return Err(
+                    "share.url en http:// refusée : le contrôleur doit être joint en HTTPS (share.allow_insecure pour les tests)"
+                        .into(),
+                );
+            }
+            if share.url.starts_with("https://") && share.ca_file.is_none() {
+                return Err("share.ca_file requis : seule la CA du contrôleur fait foi".into());
             }
         }
         if self
@@ -386,13 +443,45 @@ mod tests {
     #[test]
     fn share_requires_workload() {
         let c = Config {
-            share: Some(ShareConfig {
-                url: "file:///tmp/x".into(),
-                interval: default_share_interval(),
-                retention: default_share_retention(),
-            }),
+            share: Some(share("file:///tmp/x")),
             ..Config::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    fn share(url: &str) -> ShareConfig {
+        ShareConfig {
+            url: url.into(),
+            ..ShareConfig::default()
+        }
+    }
+
+    #[test]
+    fn sec_04_controller_must_be_reached_over_https_with_its_ca() {
+        let with = |s: ShareConfig| {
+            let mut c = Config {
+                share: Some(s),
+                ..Config::default()
+            };
+            c.workload.name = "api".into();
+            c.validate()
+        };
+        assert!(with(share("http://ctl:8443")).is_err());
+        assert!(
+            with(ShareConfig {
+                allow_insecure: true,
+                ..share("http://ctl:8443")
+            })
+            .is_ok()
+        );
+        assert!(with(share("https://ctl:8443")).is_err(), "CA exigée");
+        assert!(
+            with(ShareConfig {
+                ca_file: Some("/ca.crt".into()),
+                ..share("https://ctl:8443")
+            })
+            .is_ok()
+        );
+        assert!(with(share("ftp://x")).is_err());
     }
 }

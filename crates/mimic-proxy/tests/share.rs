@@ -23,6 +23,7 @@ fn shared(
         url: url.into(),
         interval: Duration::from_millis(100),
         retention: Duration::from_secs(3600),
+        ..ShareConfig::default()
     });
     c
 }
