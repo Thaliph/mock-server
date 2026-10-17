@@ -1,0 +1,332 @@
+//! Mutation des pods par le webhook d'injection (spec §9.4, INJ-01 à 07).
+
+use k8s_openapi::api::core::v1::{Container, EnvVar, Pod};
+use mimic_injector::config::InjectorConfig;
+use mimic_injector::inject::{Outcome, mutate};
+use serde_json::json;
+
+fn config() -> InjectorConfig {
+    serde_yaml::from_str(
+        r#"
+image: registry.example.com/platform/mimic:0.1.0
+exclude_outbound_cidrs: [10.96.0.1/32]
+sidecar_config: |
+  mode: record
+  store: { dir: /var/lib/mimic }
+"#,
+    )
+    .unwrap()
+}
+
+fn pod(extra: serde_json::Value) -> Pod {
+    let mut v = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "generateName": "checkout-7d9f-",
+            "labels": {"app.kubernetes.io/name": "checkout"}
+        },
+        "spec": {"containers": [{
+            "name": "app",
+            "image": "registry.example.com/team/checkout:1.4.2",
+            "ports": [{"containerPort": 8080}, {"containerPort": 9090, "protocol": "UDP"}]
+        }]}
+    });
+    merge(&mut v, extra);
+    serde_json::from_value(v).unwrap()
+}
+
+fn merge(a: &mut serde_json::Value, b: serde_json::Value) {
+    match (a, b) {
+        (serde_json::Value::Object(a), serde_json::Value::Object(b)) => {
+            for (k, v) in b {
+                merge(a.entry(k).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (a, b) => *a = b,
+    }
+}
+
+fn injected(pod: &Pod) -> Pod {
+    match mutate(pod, &config()) {
+        Outcome::Injected(p) => *p,
+        Outcome::Skipped(reason) => panic!("non injecté : {reason}"),
+    }
+}
+
+fn env<'a>(c: &'a Container, name: &str) -> Option<&'a EnvVar> {
+    c.env.iter().flatten().find(|e| e.name == name)
+}
+
+fn env_value<'a>(c: &'a Container, name: &str) -> Option<&'a str> {
+    env(c, name).and_then(|e| e.value.as_deref())
+}
+
+#[test]
+fn inj_01_pod_receives_init_container_and_native_sidecar() {
+    let p = injected(&pod(json!({})));
+    let spec = p.spec.as_ref().unwrap();
+    let inits = spec.init_containers.as_ref().unwrap();
+    assert_eq!(inits[0].name, "mimic-init");
+    assert_eq!(env_value(&inits[0], "MIMIC_INBOUND_PORTS"), Some("8080"));
+    assert_eq!(
+        env_value(&inits[0], "MIMIC_EXCLUDE_OUTBOUND_CIDRS"),
+        Some("10.96.0.1/32")
+    );
+    let caps = inits[0]
+        .security_context
+        .as_ref()
+        .unwrap()
+        .capabilities
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        caps.add.as_deref().unwrap(),
+        ["NET_ADMIN".to_string(), "NET_RAW".to_string()]
+    );
+
+    let sidecar = &inits[1];
+    assert_eq!(sidecar.name, "mimic");
+    assert_eq!(sidecar.restart_policy.as_deref(), Some("Always"));
+    assert_eq!(
+        sidecar.image.as_deref(),
+        Some("registry.example.com/platform/mimic:0.1.0")
+    );
+    let sc = sidecar.security_context.as_ref().unwrap();
+    assert_eq!(sc.run_as_user, Some(1337));
+    assert_eq!(sc.run_as_non_root, Some(true));
+    assert!(sidecar.startup_probe.is_some());
+    assert_eq!(env_value(sidecar, "MIMIC_WORKLOAD"), Some("checkout"));
+    assert!(
+        env_value(sidecar, "MIMIC_CONFIG_YAML")
+            .unwrap()
+            .contains("mode: record")
+    );
+    assert!(env(sidecar, "POD_NAME").unwrap().value_from.is_some());
+    let salt = env(sidecar, "MIMIC_REDACT_SALT").unwrap();
+    let secret = salt
+        .value_from
+        .as_ref()
+        .unwrap()
+        .secret_key_ref
+        .as_ref()
+        .unwrap();
+    assert_eq!(secret.name, "checkout-mimic");
+    assert_eq!(secret.optional, Some(true));
+    assert!(env(sidecar, "MIMIC_TLS_INTERCEPT").is_none());
+
+    let volumes: Vec<&str> = spec
+        .volumes
+        .iter()
+        .flatten()
+        .map(|v| v.name.as_str())
+        .collect();
+    for v in [
+        "mimic-store",
+        "mimic-token",
+        "mimic-controller-ca",
+        "mimic-ca",
+    ] {
+        assert!(volumes.contains(&v), "volume {v} absent : {volumes:?}");
+    }
+    let token = spec
+        .volumes
+        .iter()
+        .flatten()
+        .find(|v| v.name == "mimic-token")
+        .unwrap();
+    let sa = token.projected.as_ref().unwrap().sources.as_ref().unwrap()[0]
+        .service_account_token
+        .as_ref()
+        .unwrap();
+    assert_eq!(sa.audience.as_deref(), Some("mimic-controller"));
+
+    let meta = &p.metadata;
+    assert_eq!(
+        meta.annotations.as_ref().unwrap()["mimic.platform.io/status"],
+        "injected"
+    );
+    assert_eq!(
+        meta.labels.as_ref().unwrap()["mimic.platform.io/sidecar"],
+        "true"
+    );
+    // L'application elle-même n'est pas touchée sans interception TLS.
+    assert_eq!(spec.containers[0].env, None);
+    assert_eq!(spec.containers[0].volume_mounts, None);
+}
+
+#[test]
+fn inj_01_without_tcp_ports_all_inbound_is_intercepted() {
+    let mut p = pod(json!({}));
+    p.spec.as_mut().unwrap().containers[0].ports = None;
+    let p = injected(&p);
+    let init = &p.spec.unwrap().init_containers.unwrap()[0];
+    assert_eq!(env_value(init, "MIMIC_INBOUND_PORTS"), Some("*"));
+}
+
+#[test]
+fn inj_02_already_injected_pod_is_left_alone() {
+    let once = injected(&pod(json!({})));
+    assert!(matches!(mutate(&once, &config()), Outcome::Skipped(_)));
+}
+
+#[test]
+fn inj_03_opt_out_host_network_and_mesh_are_skipped() {
+    let cases = [
+        pod(json!({"metadata": {"annotations": {"mimic.platform.io/inject": "false"}}})),
+        pod(json!({"spec": {"hostNetwork": true}})),
+        {
+            let mut p = pod(json!({}));
+            p.spec.as_mut().unwrap().containers.push(Container {
+                name: "istio-proxy".into(),
+                ..Container::default()
+            });
+            p
+        },
+    ];
+    for p in cases {
+        match mutate(&p, &config()) {
+            Outcome::Skipped(reason) => assert!(!reason.is_empty()),
+            Outcome::Injected(_) => panic!("pod injecté à tort : {:?}", p.metadata),
+        }
+    }
+}
+
+#[test]
+fn inj_04_pod_without_workload_name_is_skipped() {
+    let mut p = pod(json!({}));
+    p.metadata.labels = None;
+    match mutate(&p, &config()) {
+        Outcome::Skipped(reason) => assert!(reason.contains("workload"), "{reason}"),
+        Outcome::Injected(_) => panic!("pod injecté sans workload"),
+    }
+}
+
+#[test]
+fn inj_04_workload_name_precedence() {
+    let p = pod(json!({"metadata": {
+        "annotations": {"mimic.platform.io/workload": "shop-checkout"},
+        "labels": {"app": "other"}
+    }}));
+    let p = injected(&p);
+    let sidecar = &p.spec.unwrap().init_containers.unwrap()[1];
+    assert_eq!(env_value(sidecar, "MIMIC_WORKLOAD"), Some("shop-checkout"));
+
+    let mut p = pod(json!({"metadata": {"labels": {"app": "legacy"}}}));
+    p.metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove("app.kubernetes.io/name");
+    let p = injected(&p);
+    let sidecar = &p.spec.unwrap().init_containers.unwrap()[1];
+    assert_eq!(env_value(sidecar, "MIMIC_WORKLOAD"), Some("legacy"));
+}
+
+#[test]
+fn inj_05_tls_intercept_wires_the_ca_into_the_app() {
+    let mut p = pod(json!({"metadata": {"annotations": {
+        "mimic.platform.io/tls-intercept": "api.stripe.com, *.salesforce.com"
+    }}}));
+    p.spec.as_mut().unwrap().containers[0].env = Some(vec![EnvVar {
+        name: "NODE_EXTRA_CA_CERTS".into(),
+        value: Some("/etc/app/ca.pem".into()),
+        ..EnvVar::default()
+    }]);
+    let p = injected(&p);
+    let spec = p.spec.unwrap();
+    let sidecar = &spec.init_containers.as_ref().unwrap()[1];
+    assert_eq!(
+        env_value(sidecar, "MIMIC_TLS_INTERCEPT"),
+        Some("api.stripe.com,*.salesforce.com")
+    );
+    let app = &spec.containers[0];
+    assert_eq!(
+        env_value(app, "SSL_CERT_FILE"),
+        Some("/var/run/mimic/ca/ca-bundle.crt")
+    );
+    assert_eq!(
+        env_value(app, "REQUESTS_CA_BUNDLE"),
+        Some("/var/run/mimic/ca/ca-bundle.crt")
+    );
+    assert_eq!(
+        env_value(app, "CURL_CA_BUNDLE"),
+        Some("/var/run/mimic/ca/ca-bundle.crt")
+    );
+    // Variable déjà définie par l'application : gardée.
+    assert_eq!(
+        env_value(app, "NODE_EXTRA_CA_CERTS"),
+        Some("/etc/app/ca.pem")
+    );
+    let mount = app
+        .volume_mounts
+        .iter()
+        .flatten()
+        .find(|m| m.name == "mimic-ca")
+        .unwrap();
+    assert_eq!(mount.mount_path, "/var/run/mimic/ca");
+    assert_eq!(mount.read_only, Some(true));
+}
+
+#[test]
+fn inj_06_annotations_override_ports_exclusions_and_config() {
+    let p = pod(json!({"metadata": {"annotations": {
+        "mimic.platform.io/inbound-ports": "8080,8443",
+        "mimic.platform.io/exclude-outbound-cidrs": "10.0.0.0/8",
+        "mimic.platform.io/exclude-outbound-ports": "5432",
+        "mimic.platform.io/config": "checkout-mimic"
+    }}}));
+    let p = injected(&p);
+    let spec = p.spec.unwrap();
+    let inits = spec.init_containers.as_ref().unwrap();
+    assert_eq!(
+        env_value(&inits[0], "MIMIC_INBOUND_PORTS"),
+        Some("8080,8443")
+    );
+    assert_eq!(
+        env_value(&inits[0], "MIMIC_EXCLUDE_OUTBOUND_CIDRS"),
+        Some("10.96.0.1/32,10.0.0.0/8")
+    );
+    assert_eq!(
+        env_value(&inits[0], "MIMIC_EXCLUDE_OUTBOUND_PORTS"),
+        Some("5432")
+    );
+    let sidecar = &inits[1];
+    assert!(env(sidecar, "MIMIC_CONFIG_YAML").is_none());
+    assert_eq!(
+        sidecar.args.as_deref().unwrap(),
+        ["--config".to_string(), "/etc/mimic/mimic.yaml".to_string()]
+    );
+    let vol = spec
+        .volumes
+        .iter()
+        .flatten()
+        .find(|v| v.name == "mimic-config")
+        .unwrap();
+    assert_eq!(vol.config_map.as_ref().unwrap().name, "checkout-mimic");
+}
+
+#[test]
+fn inj_07_existing_init_containers_run_after_mimic() {
+    let mut p = pod(json!({}));
+    p.spec.as_mut().unwrap().init_containers = Some(vec![
+        Container {
+            name: "migrate".into(),
+            ..Container::default()
+        },
+        Container {
+            name: "warmup".into(),
+            ..Container::default()
+        },
+    ]);
+    let p = injected(&p);
+    let names: Vec<String> = p
+        .spec
+        .unwrap()
+        .init_containers
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, ["mimic-init", "mimic", "migrate", "warmup"]);
+}

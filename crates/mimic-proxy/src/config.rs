@@ -336,16 +336,27 @@ impl Config {
     /// Lit un fichier YAML puis applique les variables d'environnement
     /// `MIMIC_MODE`, `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD`, `MIMIC_REDACT_SALT`.
     pub fn load(path: Option<&std::path::Path>) -> Result<Config, String> {
-        let mut config = match path {
-            Some(p) => {
+        Config::load_with(path, |k| std::env::var(k).ok())
+    }
+
+    /// Fichier s'il est donné, sinon YAML en ligne de `MIMIC_CONFIG_YAML` (posé par le
+    /// webhook d'injection, spec §9.4), sinon défauts ; puis surcharges d'environnement.
+    pub fn load_with(
+        path: Option<&std::path::Path>,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<Config, String> {
+        let mut config = match (path, get("MIMIC_CONFIG_YAML")) {
+            (Some(p), _) => {
                 let text = std::fs::read_to_string(p)
                     .map_err(|e| format!("lecture de {}: {e}", p.display()))?;
                 serde_yaml::from_str(&text)
                     .map_err(|e| format!("configuration {} invalide: {e}", p.display()))?
             }
-            None => Config::default(),
+            (None, Some(text)) => serde_yaml::from_str(&text)
+                .map_err(|e| format!("MIMIC_CONFIG_YAML invalide: {e}"))?,
+            (None, None) => Config::default(),
         };
-        config.apply_env(|k| std::env::var(k).ok())?;
+        config.apply_env(get)?;
         config.validate()?;
         Ok(config)
     }
@@ -365,6 +376,14 @@ impl Config {
         }
         if let Some(v) = get("MIMIC_REDACT_SALT") {
             self.redact.salt = Some(v);
+        }
+        if let Some(v) = get("MIMIC_TLS_INTERCEPT") {
+            self.tls.intercept = v
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(String::from)
+                .collect();
         }
         Ok(())
     }
@@ -438,6 +457,27 @@ mod tests {
         assert_eq!(c.mode, Mode::MockPartial);
         assert_eq!(c.instance, "api-7d9f-x");
         assert!(c.apply_env(|_| Some("nope".into())).is_err());
+    }
+
+    #[test]
+    fn inj_09_inline_yaml_then_env_overrides() {
+        let c = Config::load_with(None, |k| match k {
+            "MIMIC_CONFIG_YAML" => {
+                Some("mode: mock\ncapture:\n  samples_per_operation: 7\n".into())
+            }
+            "MIMIC_TLS_INTERCEPT" => Some("api.stripe.com, *.salesforce.com".into()),
+            "POD_NAME" => Some("checkout-1".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.mode, Mode::Mock);
+        assert_eq!(c.capture.samples_per_operation, 7);
+        assert_eq!(c.instance, "checkout-1");
+        assert_eq!(c.tls.intercept, ["api.stripe.com", "*.salesforce.com"]);
+        let bad = Config::load_with(None, |k| {
+            (k == "MIMIC_CONFIG_YAML").then(|| "mood: x".into())
+        });
+        assert!(bad.unwrap_err().contains("MIMIC_CONFIG_YAML"));
     }
 
     #[test]

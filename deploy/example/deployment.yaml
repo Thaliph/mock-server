@@ -1,5 +1,5 @@
-# Exemple d'application avec le sidecar mimic injecté à la main (le webhook d'injection
-# viendra en phase P7). Kubernetes >= 1.29 pour les native sidecars.
+# Exemple d'application avec le sidecar mimic injecté à la main, pour voir ce qu'ajoute
+# le webhook d'injection (deploy/injector/, voir deployment-injected.yaml). Kubernetes >= 1.29 pour les native sidecars.
 # Le namespace porte le label mimic.platform.io/enabled=true (CA publiée par trust-manager).
 # Bascule : ressource MimicWorkload (example/mimicworkload.yaml), jamais ce template.
 apiVersion: apps/v1
