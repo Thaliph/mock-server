@@ -193,13 +193,26 @@ async fn forward(
     };
     let original_uri = std::mem::replace(&mut parts.uri, uri);
     strip_hop_by_hop(&mut parts.headers);
-    if !parts.headers.contains_key(http::header::HOST)
-        && let Ok(v) = HeaderValue::from_str(&target.authority)
-    {
-        parts.headers.insert(http::header::HOST, v);
+    // Même version vers l'amont qu'en entrée : un serveur gRPC (h2c) refuse HTTP/1.1.
+    let h2 = parts.version == http::Version::HTTP_2;
+    if h2 {
+        // En HTTP/2, l'authority voyage dans `:authority` ; seul `te: trailers` est permis.
+        parts.headers.remove(http::header::HOST);
+        if parts
+            .headers
+            .get(http::header::TE)
+            .is_some_and(|v| v != "trailers")
+        {
+            parts.headers.remove(http::header::TE);
+        }
+    } else {
+        parts.version = http::Version::HTTP_11;
+        if !parts.headers.contains_key(http::header::HOST)
+            && let Ok(v) = HeaderValue::from_str(&target.authority)
+        {
+            parts.headers.insert(http::header::HOST, v);
+        }
     }
-    // HTTP/1.1 vers l'amont : le client choisit le protocole selon la connexion.
-    parts.version = http::Version::HTTP_11;
     let req_headers = to_headers(&parts.headers);
     let method = parts.method.to_string();
 
@@ -212,7 +225,8 @@ async fn forward(
     };
 
     let authority_label = state.metrics.authority(&target.authority);
-    let response = match state.client.request(Request::from_parts(parts, body)).await {
+    let client = if h2 { &state.client_h2 } else { &state.client };
+    let response = match client.request(Request::from_parts(parts, body)).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(authority = %target.authority, error = %e, "échec vers l'amont");

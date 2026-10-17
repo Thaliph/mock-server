@@ -123,6 +123,8 @@ Seuls HTTP et HTTPS sont gérés (décision du 17/10, Q5). Le reste traverse Mim
 | WebSocket / SSE | passthrough, métadonnées seulement (upgrade, durée) |
 | TCP non HTTP | tunnel opaque, détecté par sniffing des premiers octets ; à exclure par port dans `mimic-init` si on veut le sortir du chemin |
 
+Le relais garde la version de la requête reçue : une requête HTTP/2 part en HTTP/2 vers l'amont (h2c en connaissance préalable, h2 via ALPN en HTTPS), trailers compris, car un serveur gRPC refuse HTTP/1.1 ; une requête HTTP/1.x part en HTTP/1.1.
+
 ---
 
 ## 4. TLS
@@ -816,7 +818,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 |----|-------------|-------|-------|
 | PRX-01 | mode record, upstream factice | 10 000 requêtes | toutes relayées sans altération, toutes enregistrées |
 | PRX-02 | réponse streamée de 500 MiB | relais | mémoire du proxy < 64 MiB, body tronqué dans le store |
-| PRX-03 | upstream HTTP/2 | relais | h2 négocié de bout en bout |
+| PRX-03 | client et upstream gRPC en h2c | relais | HTTP/2 de bout en bout, `te: trailers` et trailers (`grpc-status`) relayés, échange enregistré |
 | PRX-04 | trafic TCP non HTTP redirigé (client qui parle en premier, ou serveur qui parle en premier) | relais | tunnel transparent, octets identiques |
 | PRX-04b | connexion TLS redirigée | mode record / mode mock | tunnel opaque / connexion refusée, compteur `refused` |
 | PRX-09 | application à l'écoute sur l'IP du pod seulement, puis sur `127.0.0.1` seulement | relais entrant | la première est jointe sur l'IP du pod, la seconde par repli sur `127.0.0.1` ; sans aucune écoute, l'IP du pod est retenue et rien n'est mémorisé |
