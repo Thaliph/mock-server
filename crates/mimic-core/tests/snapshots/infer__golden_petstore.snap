@@ -1,0 +1,595 @@
+---
+source: crates/mimic-core/tests/infer.rs
+expression: doc
+---
+{
+  "info": {
+    "title": "petstore",
+    "version": "1.0.0",
+    "x-mimic-direction": "inbound"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/pets": {
+      "get": {
+        "operationId": "getPets",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-tenant",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "sample-1": {
+                    "value": [
+                      {
+                        "born": "2024-02-11T10:00:00Z",
+                        "id": 1,
+                        "name": "pet1",
+                        "status": "pending",
+                        "tag": "cat"
+                      },
+                      {
+                        "born": "2024-03-12T10:00:00Z",
+                        "id": 2,
+                        "name": "pet2",
+                        "status": "sold",
+                        "tag": "bird"
+                      },
+                      {
+                        "born": "2024-04-13T10:00:00Z",
+                        "id": 3,
+                        "name": "pet3",
+                        "status": "available",
+                        "tag": "dog"
+                      },
+                      {
+                        "born": "2024-05-14T10:00:00Z",
+                        "id": 4,
+                        "name": "pet4",
+                        "status": "pending",
+                        "tag": "cat"
+                      },
+                      {
+                        "born": "2024-06-15T10:00:00Z",
+                        "id": 5,
+                        "name": "pet5",
+                        "status": "sold",
+                        "tag": "bird"
+                      }
+                    ]
+                  },
+                  "sample-2": {
+                    "value": [
+                      {
+                        "born": "2024-02-11T10:00:00Z",
+                        "id": 1,
+                        "name": "pet1",
+                        "status": "pending",
+                        "tag": "cat"
+                      },
+                      {
+                        "born": "2024-03-12T10:00:00Z",
+                        "id": 2,
+                        "name": "pet2",
+                        "status": "sold",
+                        "tag": "bird"
+                      },
+                      {
+                        "born": "2024-04-13T10:00:00Z",
+                        "id": 3,
+                        "name": "pet3",
+                        "status": "available",
+                        "tag": "dog"
+                      },
+                      {
+                        "born": "2024-05-14T10:00:00Z",
+                        "id": 4,
+                        "name": "pet4",
+                        "status": "pending",
+                        "tag": "cat"
+                      },
+                      {
+                        "born": "2024-06-15T10:00:00Z",
+                        "id": 5,
+                        "name": "pet5",
+                        "status": "sold",
+                        "tag": "bird"
+                      },
+                      {
+                        "born": "2024-07-16T10:00:00Z",
+                        "id": 6,
+                        "name": "pet6",
+                        "status": "available",
+                        "tag": "dog"
+                      },
+                      {
+                        "born": "2024-08-17T10:00:00Z",
+                        "id": 7,
+                        "name": "pet7",
+                        "status": "pending",
+                        "tag": "cat"
+                      },
+                      {
+                        "born": "2024-09-18T10:00:00Z",
+                        "id": 8,
+                        "name": "pet8",
+                        "status": "sold",
+                        "tag": "bird"
+                      }
+                    ]
+                  },
+                  "sample-3": {
+                    "value": [
+                      {
+                        "born": "2024-02-11T10:00:00Z",
+                        "id": 1,
+                        "name": "pet1",
+                        "status": "pending",
+                        "tag": "cat"
+                      },
+                      {
+                        "born": "2024-03-12T10:00:00Z",
+                        "id": 2,
+                        "name": "pet2",
+                        "status": "sold",
+                        "tag": "bird"
+                      },
+                      {
+                        "born": "2024-04-13T10:00:00Z",
+                        "id": 3,
+                        "name": "pet3",
+                        "status": "available",
+                        "tag": "dog"
+                      },
+                      {
+                        "born": "2024-05-14T10:00:00Z",
+                        "id": 4,
+                        "name": "pet4",
+                        "status": "pending",
+                        "tag": "cat"
+                      },
+                      {
+                        "born": "2024-06-15T10:00:00Z",
+                        "id": 5,
+                        "name": "pet5",
+                        "status": "sold",
+                        "tag": "bird"
+                      },
+                      {
+                        "born": "2024-07-16T10:00:00Z",
+                        "id": 6,
+                        "name": "pet6",
+                        "status": "available",
+                        "tag": "dog"
+                      },
+                      {
+                        "born": "2024-08-17T10:00:00Z",
+                        "id": 7,
+                        "name": "pet7",
+                        "status": "pending",
+                        "tag": "cat"
+                      },
+                      {
+                        "born": "2024-09-18T10:00:00Z",
+                        "id": 8,
+                        "name": "pet8",
+                        "status": "sold",
+                        "tag": "bird"
+                      }
+                    ]
+                  }
+                },
+                "schema": {
+                  "items": {
+                    "properties": {
+                      "born": {
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "integer"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "type": "string"
+                      },
+                      "tag": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "born",
+                      "id",
+                      "name",
+                      "status",
+                      "tag"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Observed response"
+          }
+        },
+        "x-mimic-stats": {
+          "count": 4,
+          "latency_ms": {
+            "max": 35.0,
+            "p50": 25.0,
+            "p90": 35.0,
+            "p99": 35.0
+          },
+          "rate_rps_p95": 4.0,
+          "status": {
+            "200": 1.0
+          }
+        }
+      },
+      "post": {
+        "operationId": "postPets",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "sample-1": {
+                  "value": {
+                    "name": "rex",
+                    "tag": "dog"
+                  }
+                },
+                "sample-2": {
+                  "value": {
+                    "tag": "dog"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "tag": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "tag"
+                ],
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "sample-1": {
+                    "value": {
+                      "born": "2024-02-11T10:00:00Z",
+                      "id": 9,
+                      "name": "rex",
+                      "status": "pending",
+                      "tag": "cat"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "born": {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "integer"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "born",
+                    "id",
+                    "name",
+                    "status",
+                    "tag"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Observed response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "sample-1": {
+                    "value": {
+                      "code": 422,
+                      "message": "name is required"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "code": {
+                      "type": "integer"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Observed response"
+          }
+        },
+        "x-mimic-stats": {
+          "count": 2,
+          "latency_ms": {
+            "max": 40.0,
+            "p50": 8.0,
+            "p90": 40.0,
+            "p99": 40.0
+          },
+          "rate_rps_p95": 2.0,
+          "status": {
+            "201": 0.5,
+            "422": 0.5
+          }
+        }
+      }
+    },
+    "/pets/{petId}": {
+      "delete": {
+        "operationId": "deletePetsByPetId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "petId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Observed response"
+          }
+        },
+        "x-mimic-stats": {
+          "count": 2,
+          "latency_ms": {
+            "max": 12.0,
+            "p50": 12.0,
+            "p90": 12.0,
+            "p99": 12.0
+          },
+          "rate_rps_p95": 2.0,
+          "status": {
+            "204": 1.0
+          }
+        }
+      },
+      "get": {
+        "operationId": "getPetsByPetId",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "petId",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "sample-1": {
+                    "value": {
+                      "born": "2024-02-11T10:00:00Z",
+                      "id": 1,
+                      "name": "pet1",
+                      "status": "pending",
+                      "tag": "cat"
+                    }
+                  },
+                  "sample-2": {
+                    "value": {
+                      "born": "2024-03-12T10:00:00Z",
+                      "id": 2,
+                      "name": "pet2",
+                      "status": "sold",
+                      "tag": "bird"
+                    }
+                  },
+                  "sample-3": {
+                    "value": {
+                      "born": "2024-04-13T10:00:00Z",
+                      "id": 3,
+                      "name": "pet3",
+                      "status": "available",
+                      "tag": "dog"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "born": {
+                      "format": "date-time",
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "integer"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "born",
+                    "id",
+                    "name",
+                    "status",
+                    "tag"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Observed response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "sample-1": {
+                    "value": {
+                      "code": 404,
+                      "message": "not found"
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "code": {
+                      "type": "integer"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Observed response"
+          }
+        },
+        "x-mimic-stats": {
+          "count": 9,
+          "latency_ms": {
+            "max": 13.0,
+            "p50": 9.0,
+            "p90": 13.0,
+            "p99": 13.0
+          },
+          "rate_rps_p95": 4.0,
+          "status": {
+            "200": 0.8889,
+            "404": 0.1111
+          }
+        }
+      }
+    },
+    "/store/inventory": {
+      "get": {
+        "operationId": "getStoreInventory",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "sample-1": {
+                    "value": {
+                      "available": 3,
+                      "pending": 3,
+                      "sold": 2
+                    }
+                  }
+                },
+                "schema": {
+                  "properties": {
+                    "available": {
+                      "type": "integer"
+                    },
+                    "pending": {
+                      "type": "integer"
+                    },
+                    "sold": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "available",
+                    "pending",
+                    "sold"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Observed response"
+          }
+        },
+        "x-mimic-stats": {
+          "count": 1,
+          "latency_ms": {
+            "max": 7.0,
+            "p50": 7.0,
+            "p90": 7.0,
+            "p99": 7.0
+          },
+          "rate_rps_p95": 1.0,
+          "status": {
+            "200": 1.0
+          }
+        }
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "http://petstore.svc:8080"
+    }
+  ]
+}
