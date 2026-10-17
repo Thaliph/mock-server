@@ -10,7 +10,8 @@
 | `certificates.yaml` | CA dédiée et certificat du contrôleur (cert-manager), CA publiée dans les namespaces (trust-manager) |
 | `controller.yaml` | configuration, PVC, Deployment, Service, NetworkPolicy |
 
-Prérequis : cert-manager et trust-manager. Ordre : `namespace`, `crd`, `rbac`,
+Prérequis : cert-manager et trust-manager, ce dernier avec `mimic-system` comme namespace
+de confiance (`--set app.trust.namespace=mimic-system`), car la CA du contrôleur y vit. Ordre : `namespace`, `crd`, `rbac`,
 `certificates`, puis `controller`.
 
 ## Webhook d'injection (`injector/`), une fois par cluster

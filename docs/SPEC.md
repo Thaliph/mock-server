@@ -866,6 +866,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | E2E-02 | Même pod en mode mock avec NetworkPolicy deny-all egress : le tir k6 réussit à > 99,9 %, aucun paquet ne sort (vérifié par les compteurs du faux SaaS). |
 | E2E-03 | Changement d'annotation `record → mock` sans redémarrage du pod. |
 | E2E-04 | Namespace labellisé `env=production` : le mode mock est refusé. |
+| E2E-05 | Démo OpenTelemetry sur kind (`scripts/e2e-kind.sh`, à chaque PR vers `main`) : shipping, injecté par le webhook, appelle quote en HTTP ; en record les deux API sont découvertes par le contrôleur ; après `mimicctl mode shipping mock`, les deux pods s'alignent sur un snapshot, quote est arrêté et toutes les requêtes à shipping réussissent ; retour en record. |
 
 **Performance (PRF)** : seuils bloquants en CI nightly : O1 et O2 mesurés avec `oha` à 1 000 req/s sur 60 s, comparés à une exécution sans sidecar.
 

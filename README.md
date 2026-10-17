@@ -61,6 +61,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo insta review              # après un changement voulu de la sortie OpenAPI
 sudo ./scripts/e2e-netns.sh     # interception iptables réelle, dans un namespace réseau jetable
+./scripts/e2e-kind.sh           # démo OpenTelemetry sur kind : injection, contrôleur, bascule mock
 ```
 
 Les tests portent l'identifiant du critère d'acceptation qu'ils couvrent
