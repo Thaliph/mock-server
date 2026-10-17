@@ -1,0 +1,89 @@
+# Exemple d'application avec le sidecar mimic injecté à la main (le webhook d'injection
+# viendra en phase P7). Kubernetes >= 1.29 pour les native sidecars.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: checkout
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: checkout
+      annotations:
+        # Bascule à chaud : kubectl annotate pod -l app.kubernetes.io/name=checkout \
+        #   mimic.platform.io/mode=mock --overwrite
+        mimic.platform.io/mode: record
+    spec:
+      initContainers:
+        - name: mimic-init
+          image: registry.example.com/platform/mimic:0.1.0
+          command: ["/usr/local/bin/mimic-init"]
+          env:
+            - name: MIMIC_INBOUND_PORTS
+              value: "8080"
+            # API Kubernetes et autres destinations qui ne doivent pas transiter par mimic.
+            - name: MIMIC_EXCLUDE_OUTBOUND_CIDRS
+              value: "10.96.0.1/32"
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "NET_RAW"]
+        # Native sidecar : démarre avant l'application et s'arrête après elle.
+        - name: mimic
+          image: registry.example.com/platform/mimic:0.1.0
+          restartPolicy: Always
+          args: ["--config", "/etc/mimic/mimic.yaml"]
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: MIMIC_WORKLOAD
+              valueFrom: {fieldRef: {fieldPath: "metadata.labels['app.kubernetes.io/name']"}}
+            # Sel commun aux réplicas pour des marqueurs de redaction cohérents.
+            - name: MIMIC_REDACT_SALT
+              valueFrom: {secretKeyRef: {name: checkout-mimic, key: redact-salt}}
+            # Identifiants S3 du partage (ou IRSA / workload identity).
+            - name: AWS_REGION
+              value: eu-west-3
+          ports:
+            - {name: mimic-admin, containerPort: 15000}
+          readinessProbe:
+            httpGet: {path: /readyz, port: mimic-admin}
+          livenessProbe:
+            httpGet: {path: /healthz, port: mimic-admin}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            runAsUser: 1337
+            runAsGroup: 1337
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: mimic-config, mountPath: /etc/mimic}
+            - {name: mimic-store, mountPath: /var/lib/mimic}
+            - {name: podinfo, mountPath: /etc/podinfo}
+      containers:
+        - name: app
+          image: registry.example.com/team/checkout:1.4.2
+          ports:
+            - {name: http, containerPort: 8080}
+      volumes:
+        - name: mimic-config
+          configMap: {name: checkout-mimic}
+        - name: mimic-store
+          emptyDir: {sizeLimit: 512Mi}
+        - name: podinfo
+          downwardAPI:
+            items:
+              - path: annotations
+                fieldRef: {fieldPath: metadata.annotations}

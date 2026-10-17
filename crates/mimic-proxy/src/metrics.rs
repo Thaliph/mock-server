@@ -71,6 +71,13 @@ pub struct ResultLabel {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PassthroughLabels {
+    pub direction: String,
+    pub kind: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ModeLabel {
     pub mode: String,
 }
@@ -95,6 +102,7 @@ pub struct Metrics {
     pub share_sync: Family<ResultLabel, Counter>,
     pub share_peers: Gauge,
     pub mode: Family<ModeLabel, Gauge>,
+    pub passthrough: Family<PassthroughLabels, Counter>,
     authorities: Mutex<BTreeSet<String>>,
 }
 
@@ -114,6 +122,7 @@ impl Metrics {
         let share_sync = Family::default();
         let share_peers = Gauge::default();
         let mode = Family::default();
+        let passthrough = Family::default();
         registry.register(
             "mimic_requests",
             "Requêtes traitées par le sidecar",
@@ -165,6 +174,11 @@ impl Metrics {
             share_peers.clone(),
         );
         registry.register("mimic_mode", "Mode courant (1)", mode.clone());
+        registry.register(
+            "mimic_passthrough_connections",
+            "Connexions redirigées non HTTP relayées en tunnel",
+            passthrough.clone(),
+        );
         Self {
             registry,
             requests,
@@ -178,6 +192,7 @@ impl Metrics {
             share_sync,
             share_peers,
             mode,
+            passthrough,
             authorities: Mutex::new(BTreeSet::new()),
         }
     }

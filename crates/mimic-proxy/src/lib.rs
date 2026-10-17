@@ -150,6 +150,15 @@ async fn serve(listener: TcpListener, state: Arc<AppState>, kind: Listener) {
         };
         let state = state.clone();
         tokio::spawn(async move {
+            // Le trafic redirigé par iptables n'est pas forcément HTTP.
+            if let (Some(dst), Listener::Inbound | Listener::Outbound) = (info.original_dst, kind) {
+                let protocol = net::sniff(&stream).await;
+                if protocol != net::Protocol::Http {
+                    let inbound = matches!(kind, Listener::Inbound);
+                    proxy::tunnel(state, stream, dst, protocol, inbound).await;
+                    return;
+                }
+            }
             let svc = service_fn(move |req| {
                 let state = state.clone();
                 async move {

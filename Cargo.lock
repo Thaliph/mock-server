@@ -1191,6 +1191,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimic-init"
+version = "0.1.0"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "mimic-proxy"
 version = "0.1.0"
 dependencies = [
