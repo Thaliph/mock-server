@@ -1843,6 +1843,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimic-injector"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "clap",
+ "hyper-util",
+ "json-patch",
+ "k8s-openapi",
+ "kube",
+ "mimic-proxy",
+ "prometheus-client",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mimic-proxy"
 version = "0.1.0"
 dependencies = [
