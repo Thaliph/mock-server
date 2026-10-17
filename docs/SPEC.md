@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.5** ; interception TLS sortante implémentée (§4.2, configuration `tls` en §9.1).
+> Statut : **v0.6** ; ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -66,7 +66,8 @@ Composants livrés :
 |-----------|------|-------|
 | `mimic-proxy` | Proxy transparent L7, capture, mock | binaire principal |
 | `mimic-init` | Init container qui pose les règles iptables | binaire (ou mode du binaire principal) |
-| `mimic-core` | Modèle de données, inférence OpenAPI, matching, redaction | lib, sans I/O, testée en isolation |
+| `mimic-core` | Modèle de données, inférence OpenAPI, matching, redaction, snapshots, rejeu | lib, sans I/O, testée en isolation |
+| `mimic-controller` | Plan de contrôle : agrège les enregistrements par workload, interface de découverte centrale, snapshots de mock, bascule de mode | binaire, un Deployment par cluster |
 | `mimic-injector` | Webhook d'admission qui injecte sidecar + init | binaire (phase 3) |
 | `mimicctl` | CLI : bascule de mode, export, diff de specs | binaire (phase 3) |
 
@@ -104,19 +105,22 @@ eBPF est excellent pour **observer** passivement, mais :
 
 Piste v2 : un mode `observe-ebpf` en lecture seule pour les pods où l'on ne veut rien injecter dans le chemin réseau.
 
-### 3.3 Coexistence avec un service mesh
+### 3.3 Service mesh : hors périmètre
 
-Si Istio/Linkerd est présent, ses règles iptables et les nôtres se chevauchent. Ordre retenu **[DÉFAUT]** : l'app parle à Mimic, Mimic parle au proxy du mesh (Mimic est le plus proche de l'app, il voit donc le trafic en clair avant le mTLS du mesh). À valider selon le mesh réellement utilisé (question Q3).
+Les pods déjà dans un service mesh (Istio, Linkerd) ne sont pas pris en charge : leurs règles iptables et celles de Mimic se chevaucheraient. Mimic vise les workloads hors mesh (décision du 17/10, Q3).
 
 ### 3.4 Protocoles
+
+Seuls HTTP et HTTPS sont gérés (décision du 17/10, Q5). Le reste traverse Mimic sans être enregistré ni mocké.
 
 | Protocole | v1 |
 |-----------|----|
 | HTTP/1.1 | record + mock |
 | HTTP/2 (h2c et h2 via ALPN) | record + mock |
-| gRPC | record + mock au niveau HTTP/2 (bodies binaires, pas d'inférence protobuf) ; inférence via descripteurs en v2 |
+| HTTPS vers un hôte de `tls.intercept` | record + mock (§4.2) |
+| HTTPS vers un autre hôte | tunnel opaque en record, refusé en mock |
 | WebSocket / SSE | passthrough, métadonnées seulement (upgrade, durée) |
-| TCP non HTTP | passthrough, détecté par sniffing des premiers octets |
+| TCP non HTTP | tunnel opaque, détecté par sniffing des premiers octets ; à exclure par port dans `mimic-init` si on veut le sortir du chemin |
 
 ---
 
@@ -157,10 +161,15 @@ Le mode `mock` ne touche jamais le trafic entrant : le tir de perf frappe la vra
 
 ### 5.1 Bascule de mode
 
-- Déclarée par annotation de pod : `mimic.platform.io/mode: record`.
-- Le sidecar lit les annotations via un **volume downward API** (`fieldRef: metadata.annotations`), que le kubelet met à jour à chaud quand l'annotation change. Aucun droit RBAC sur l'API K8s n'est nécessaire.
-- Aussi pilotable via l'API admin (`PUT /mode`) et `mimicctl mode set mock -l app=checkout`.
-- La bascule est atomique pour les nouvelles requêtes ; les requêtes en vol finissent dans l'ancien mode.
+Aucune bascule ne redémarre de pod. Trois moyens, du plus recommandé au moins recommandé :
+
+1. **Par le contrôleur** (§5.5), pour tout le workload d'un coup : bouton de l'interface ou `PUT /v1/workloads/{namespace}/{workload}/mode`. C'est le seul moyen qui garantit que tous les pods répondent de la même manière en mock (§5.6).
+2. **Par annotation de pod** : `kubectl annotate pods -l app=checkout mimic.platform.io/mode=mock --overwrite`. Le sidecar lit les annotations via un **volume downward API** (`fieldRef: metadata.annotations`), que le kubelet met à jour à chaud. Aucun droit RBAC n'est nécessaire. Il faut annoter les **pods**, pas le template du Deployment : modifier le template déclenche un rollout.
+3. **Par l'API admin d'un sidecar** (`PUT /mode`), pour un seul pod, en débogage.
+
+Quand le contrôleur a un mode souhaité pour le workload, il l'emporte sur l'annotation et l'API admin locale : un sidecar qui diverge est réaligné au battement suivant.
+
+La bascule est atomique pour les nouvelles requêtes ; les requêtes en vol finissent dans l'ancien mode.
 
 ### 5.2 Mode `record`
 
@@ -226,7 +235,7 @@ Le type de correspondance vaut `exact` si le score est 1, `template` si le chemi
 
 | Stratégie | Comportement |
 |-----------|--------------|
-| `best` **[DÉFAUT]** | meilleur score, puis le plus récent |
+| `best` **[DÉFAUT]** | meilleur score, puis la réponse la plus fréquente, puis la plus récente (§5.6) |
 | `round-robin` | rotation sur les exemples |
 | `sequence` | rejoue dans l'ordre d'enregistrement (scénarios à état : création puis lecture) |
 | `weighted-status` | respecte la distribution des codes observés (ex. 2 % de 429) pour reproduire les erreurs réelles |
@@ -265,6 +274,36 @@ Un Deployment a souvent plusieurs réplicas, et chaque pod ne voit qu'une partie
 - **Fusion** : dédoublonnage par identifiant d'échange (ULID préfixé par l'instance, donc unique dans le workload). Les plafonds de capture (§5.2) s'appliquent après fusion, ce qui borne la mémoire quel que soit le nombre de réplicas.
 - **Panne du support** : la synchronisation échoue sans bloquer le trafic ; le sidecar continue avec ses données locales et l'échec est compté en métrique.
 - **Rétention** : les segments plus vieux que `share.retention` (7 jours par défaut) ne sont plus importés ; leur suppression est laissée à une règle de cycle de vie du bucket.
+- **Deux supports possibles** : `share.url` vaut soit l'URL du contrôleur (`http://mimic-controller.mimic-system:8080`, recommandé), soit un stockage objet partagé (`s3://…`, `file://…`) sans contrôleur. Sans contrôleur, il n'y a ni interface centrale, ni snapshot, ni bascule de workload.
+
+### 5.5 Contrôleur
+
+`mimic-controller` est le plan de contrôle, à la manière de Kiali pour Istio : un Deployment unique par cluster (namespace `mimic-system`), qui ne se trouve jamais dans le chemin des requêtes. Si le contrôleur tombe, le trafic continue ; seuls le partage et la bascule attendent son retour.
+
+- **Ingestion** : chaque sidecar lui envoie ses segments d'échanges, déjà redactés, et lit ceux des autres instances (§5.4). Le contrôleur les range sur son support (`file://` sur un PVC, ou `s3://`) avec la même disposition qu'au §5.4.
+- **Battement** : chaque sidecar envoie toutes les `share.mode_poll` (2 s par défaut) son instance, son mode et son snapshot chargé. La réponse porte l'état souhaité du workload : `{mode, snapshot}`, chacun pouvant être absent. Le contrôleur en déduit la liste des pods du workload et leur convergence.
+- **Interface de découverte centrale** : la page du contrôleur liste les workloads, puis pour chacun les pods (mode, snapshot, dernier battement, aligné ou non), les opérations du service et de chaque dépendance avec leurs paramètres requis (même rendu que la page d'admin du sidecar, §9.2), les snapshots, et les requêtes enregistrées (§5.7). La page d'admin de chaque sidecar reste disponible pour déboguer un pod.
+- **Persistance** : segments, snapshots et état souhaité (`<namespace>/<workload>/desired.json`) sont sur le support ; un redémarrage du contrôleur ne perd rien. L'état des pods est reconstruit par les battements.
+- **Accès** : Service `ClusterIP` sans authentification en v1, protégé par NetworkPolicy (seuls les pods portant un sidecar Mimic et le port-forward y accèdent).
+- **Aucun droit Kubernetes** : le contrôleur ne lit ni n'écrit l'API Kubernetes en v1. La piste v2 est de lire une annotation posée sur le Deployment pour piloter le mode en GitOps.
+
+### 5.6 Cohérence du mock entre les pods : snapshots
+
+Plusieurs pods d'un même workload doivent répondre de la même manière en mock, y compris sur un endpoint qu'un pod n'a jamais vu passer. Le partage seul (§5.4) ne suffit pas : à un instant donné, deux pods n'ont pas forcément importé les mêmes segments, et leurs stores bornés n'évincent pas les mêmes échanges.
+
+- **Snapshot** : jeu figé d'échanges sortants d'un workload, construit par le contrôleur au moment de la bascule en mock à partir de tous les segments du workload. Il est immuable et identifié par une empreinte de son contenu (`sha256`, 16 caractères hexadécimaux) : mêmes échanges, même identifiant, quel que soit l'ordre d'arrivée.
+- **Construction** (`mimic-core::snapshot`, fonction pure) : échanges sortants terminés, dédoublonnés par identifiant, triés par date puis identifiant, au plus `snapshot.max_per_key` (50) par couple (authority, méthode, chemin, code), les plus récents gardés.
+- **Bascule** : `PUT …/mode {"mode":"mock"}` construit un snapshot et le désigne comme état souhaité ; `{"mode":"mock","snapshot":"<id>"}` réutilise un snapshot existant, ce qui permet de rejouer un tir de perf dans des conditions identiques d'une semaine à l'autre. Chaque sidecar télécharge le snapshot une fois, le garde en cache (sur disque si `store.dir` est configuré), puis construit son moteur de mock **uniquement** à partir du snapshot. Tant que le snapshot n'est pas chargé, le sidecar mocke avec ses données locales et le signale (`snapshot: null` dans son battement).
+- **Même appel vu par plusieurs sidecars** : chaque pod enregistre son exemplaire, avec un identifiant propre ; rien n'est fusionné à tort. Au rejeu, ces exemplaires sont des candidats de même score. La stratégie `best` choisit alors la **réponse la plus fréquente** (même code et même body), puis la plus récente. Une erreur ponctuelle vue par un seul pod ne masque donc pas la réponse habituelle ; pour la reproduire en proportion, utiliser `weighted-status`. Toutes les durées des exemplaires alimentent la distribution de latence de l'opération.
+- **Ce qui est identique d'un pod à l'autre** : à requête égale, le code, les headers et le body servis (stratégie `best`). La latence suit la même distribution sur chaque pod, mais le tirage est propre à chaque pod. Les stratégies à état (`round-robin`, `sequence`) avancent indépendamment sur chaque pod.
+
+### 5.7 Requêtes enregistrées et rejeu
+
+Le contrôleur expose la liste des requêtes entrantes enregistrées pour le workload, toutes instances confondues, les plus récentes d'abord : méthode, chemin, query, headers, body, code, durée, instance. Elle sert à rejouer le trafic réel contre l'application pendant un tir de perf.
+
+- `GET …/requests?direction=inbound&limit=&format=json` : liste JSON, affichée aussi dans l'interface ;
+- `format=jsonl` : un échange par ligne, rejouable par n'importe quel outil ;
+- `format=k6` : script k6 prêt à lancer (`k6 run -e TARGET=http://checkout:8080 script.js`), qui rejoue les requêtes dans l'ordre d'enregistrement. Les headers redactés et les headers propres à la connexion ne sont pas rejoués ; le script le signale en commentaire et accepte un header d'authentification par `-e AUTHORIZATION=…`.
 
 ---
 
@@ -394,9 +433,22 @@ mock:
   latency: { factor: 1.0 }
   match_headers: ["accept", "x-api-version"]
 share:
-  url: s3://mimic-recordings/cluster-a   # ou file:///var/lib/mimic-shared
+  url: http://mimic-controller.mimic-system:8080   # ou s3://bucket/prefixe, file:///var/lib/mimic-shared
   interval: 10s
   retention: 168h
+  mode_poll: 2s     # battement vers le contrôleur
+```
+
+Configuration du contrôleur (`mimic-controller --config`) :
+
+```yaml
+listen: 0.0.0.0:8080
+store: file:///var/lib/mimic-controller   # ou s3://bucket/prefixe
+retention: 168h
+max_exchanges_per_workload: 200000
+snapshot:
+  max_per_key: 50
+pod_timeout: 30s   # un pod sans battement depuis ce délai est affiché absent
 ```
 
 La configuration est validée au démarrage ; une configuration invalide fait échouer le conteneur avec un message explicite (pas de démarrage en mode dégradé silencieux).
@@ -423,6 +475,29 @@ La configuration est validée au démarrage ; une configuration invalide fait é
 - pour chaque opération, dépliable : les paramètres (chemin, query, headers) avec leur type et un marqueur **requis**, le schéma du body de requête, les codes de réponse avec schéma et exemples ;
 - des liens de téléchargement des documents OpenAPI.
 
+### 9.2b API du contrôleur (port 8080)
+
+Préfixe `/v1/workloads/{namespace}/{workload}` noté `…`.
+
+| Méthode | Chemin | Rôle |
+|---------|--------|------|
+| GET | `/` | interface : liste des workloads |
+| GET | `/ui/{namespace}/{workload}` | interface : page d'un workload |
+| GET | `/v1/workloads` | workloads connus, avec pods et état souhaité |
+| POST | `…/segments?instance=` | ingestion d'un segment JSONL |
+| GET | `…/segments` | liste des segments (`key`, `instance`, `modified_ms`, `size`) |
+| GET | `…/segments/{instance}/{file}` | contenu d'un segment |
+| POST | `…/heartbeat` | battement d'un sidecar, réponse : état souhaité |
+| GET/PUT | `…/mode` | état souhaité `{mode, snapshot}` ; `PUT {"mode":null}` rend la main aux sidecars |
+| GET/POST | `…/snapshots` | liste / construction d'un snapshot |
+| GET | `…/snapshots/{id}` | contenu JSONL d'un snapshot |
+| GET | `…/operations` | opérations découvertes sur tout le workload |
+| GET | `…/openapi/inbound`, `…/openapi/outbound/{authority}` | documents OpenAPI du workload |
+| GET | `…/requests?direction=&limit=&format=` | requêtes enregistrées (§5.7) |
+| GET | `/metrics`, `/healthz` | Prometheus, probe |
+
+Métriques du contrôleur : `mimic_controller_segments_total{result}`, `mimic_controller_workloads`, `mimic_controller_pods{state}` (`aligned`, `diverging`, `absent`), `mimic_controller_snapshots_total`.
+
 ### 9.3 Observabilité
 
 Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives dans tous les modes :
@@ -441,7 +516,8 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 | `mimic_share_peers` | jauge | | tous |
 | `mimic_mode` | jauge (1 pour le mode courant) | `mode` | tous |
 | `mimic_passthrough_connections_total` | compteur | `direction`, `kind` (`tls`, `tcp`), `result` (`relayed`, `refused`, `error`) | tous |
-| `mimic_tls_handshake_failures_total` | compteur | `authority`, `reason` | P5 |
+| `mimic_tls_handshake_failures_total` | compteur | `authority`, `reason` | tous |
+| `mimic_mock_snapshot_exchanges` | jauge (0 sans snapshot) | | mock |
 
 `authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité.
 
@@ -546,6 +622,35 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-09 | deux enregistrements de même chemin, query `?page=1` et `?page=2` | requête `?page=2` | l'enregistrement `page=2` est choisi |
 | MCK-10 | enregistrement sur une autre méthode ou une autre authority | requête | aucune correspondance |
 | MCK-11 | même graine, mêmes requêtes | deux exécutions | décisions et latences identiques |
+| MCK-12 | trois exemplaires du même appel, deux en `200 {a}` et un en `500`, le `500` le plus récent | stratégie `best` | `200 {a}` |
+
+**Snapshots (SNP)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| SNP-01 | un ensemble d'échanges, dans n'importe quel ordre, avec doublons (proptest) | construction | même identifiant et même contenu |
+| SNP-02 | plus de `max_per_key` échanges sur un même couple | construction | les `max_per_key` plus récents sont gardés |
+| SNP-03 | deux sidecars ; A a vu `GET /users/7` de la dépendance, B ne l'a jamais vu | bascule en mock par le contrôleur | A et B renvoient la même réponse, octet pour octet |
+| SNP-04 | snapshot existant, puis nouveaux enregistrements | `PUT mode {"mode":"mock","snapshot":id}` | les pods chargent ce snapshot, sans les nouveaux enregistrements |
+| SNP-05 | snapshot chargé, contrôleur arrêté | requêtes mockées | toujours servies depuis le snapshot |
+
+**Contrôleur (CTL)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| CTL-01 | deux sidecars d'un workload avec `share.url` vers le contrôleur | trafic sur chacun | le contrôleur liste le workload, ses deux pods et l'union des opérations |
+| CTL-02 | pods en record | `PUT …/mode {"mode":"mock"}` | tous les pods passent en mock sans redémarrage, avec le même snapshot, et apparaissent alignés |
+| CTL-03 | pods en mock | `PUT …/mode {"mode":"record"}` | tous repassent en record, sans snapshot |
+| CTL-04 | contrôleur sur `file://` avec segments, snapshot et état souhaité | redémarrage | tout est retrouvé |
+| CTL-05 | trafic enregistré avec une query toujours présente | `GET /ui/{ns}/{wl}` | la page liste l'opération, marque le paramètre requis, montre les pods et les boutons de bascule |
+
+**Rejeu (RPL)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| RPL-01 | requêtes entrantes enregistrées par deux pods | `GET …/requests?direction=inbound` | toutes listées, les plus récentes d'abord, avec l'instance |
+| RPL-02 | requête avec un header `authorization` redacté | `format=k6` | script k6 valide qui rejoue méthode, chemin, query et body, sans le header redacté |
+| RPL-03 | requêtes enregistrées | `format=jsonl` | un échange par ligne, relisible tel quel |
 
 **Partage (SHR)**
 
@@ -619,9 +724,9 @@ Ces points changent la conception ; les défauts ci-dessus restent appliqués ta
 |---|----------|---------------|
 | Q1 | Interception : proxy transparent iptables (`NET_ADMIN` dans le pod) acceptable, ou faut-il viser sans privilège (proxy explicite) ou eBPF ? | iptables |
 | Q2 | TLS sortant vers les SaaS : peut-on faire confiance à une CA Mimic dans les apps (MITM), avec quels runtimes majoritaires (JVM, Go, Node, Python) ? | MITM opt-in par hôte |
-| Q3 | Service mesh présent sur les clusters cibles ? Lequel ? | aucun |
+| Q3 | Service mesh présent sur les clusters cibles ? Lequel ? | tranché : hors périmètre |
 | Q4 | Payloads : a-t-on le droit de stocker des exemples redactés, et où (S3, PVC, autre) ? | S3 chiffré, redaction par défaut |
-| Q5 | Protocoles à couvrir au-delà d'HTTP (gRPC, Kafka, bases de données) ? | HTTP/1.1, HTTP/2, gRPC en record/mock brut |
+| Q5 | Protocoles à couvrir au-delà d'HTTP (gRPC, Kafka, bases de données) ? | tranché : HTTP et HTTPS uniquement |
 | Q6 | Version minimale de Kubernetes (native sidecar à partir de 1.29) ? | ≥ 1.29 |
 | Q7 | Génération automatique de scénarios k6 depuis la spec inbound : dans le périmètre ? | oui, phase 5 |
 
@@ -640,7 +745,8 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P3b | Partage entre sidecars d'un workload | SHR-* |
 | P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
-| P6 | Export S3, chargement cross-environnement, garde-fou production | E2E-04 |
+| P6 | Contrôleur : ingestion, interface centrale, snapshots, bascule de workload, requêtes rejouables | MCK-12, SNP-*, CTL-*, RPL-* |
+| P6b | Chargement cross-environnement, garde-fou production | E2E-04 |
 | P7 | Webhook d'injection + `mimicctl` | tests d'admission |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 
