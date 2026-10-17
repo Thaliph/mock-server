@@ -171,6 +171,16 @@ fn render_page(state: &AppState) -> String {
         local,
         peer
     );
+    if state.config.controlled() {
+        let _ = write!(
+            h,
+            "<span>piloté par le contrôleur · snapshot {}</span>",
+            esc(&state
+                .snapshot()
+                .map(|s| s.id.clone())
+                .unwrap_or_else(|| "aucun".into()))
+        );
+    }
     if share.enabled {
         let _ = write!(
             h,

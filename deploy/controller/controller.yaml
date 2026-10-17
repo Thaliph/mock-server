@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+data:
+  controller.yaml: |
+    listen: 0.0.0.0:8443
+    ui_listen: 127.0.0.1:8081
+    tls:
+      cert_file: /etc/mimic/tls/tls.crt
+      key_file: /etc/mimic/tls/tls.key
+    auth:
+      kind: kubernetes
+    store: file:///var/lib/mimic-controller
+    retention: 604800
+    max_exchanges_per_workload: 200000
+    snapshot:
+      max_per_key: 50
+    pod_timeout: 30
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests: {storage: 10Gi}
+---
+# Un seul réplica : l'état des pods vit en mémoire, le reste sur le PVC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: mimic-controller}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: mimic-controller}
+    spec:
+      serviceAccountName: mimic-controller
+      securityContext:
+        runAsUser: 1337
+        runAsGroup: 1337
+        fsGroup: 1337
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: controller
+          image: registry.example.com/platform/mimic:0.1.0
+          command: ["/usr/local/bin/mimic-controller"]
+          args: ["--config", "/etc/mimic/controller.yaml"]
+          ports:
+            - {name: api, containerPort: 8443}
+          readinessProbe:
+            httpGet: {path: /healthz, port: api, scheme: HTTPS}
+          livenessProbe:
+            httpGet: {path: /healthz, port: api, scheme: HTTPS}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 2Gi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/mimic/controller.yaml, subPath: controller.yaml}
+            - {name: tls, mountPath: /etc/mimic/tls, readOnly: true}
+            - {name: data, mountPath: /var/lib/mimic-controller}
+      volumes:
+        - name: config
+          configMap: {name: mimic-controller}
+        - name: tls
+          secret: {secretName: mimic-controller-tls}
+        - name: data
+          persistentVolumeClaim: {claimName: mimic-controller}
+---
+# Seule l'API des sidecars est exposée ; l'interface reste sur 127.0.0.1:8081 :
+#   kubectl port-forward -n mimic-system deploy/mimic-controller 8081
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+spec:
+  selector: {app.kubernetes.io/name: mimic-controller}
+  ports:
+    - {name: api, port: 8443, targetPort: api}
+---
+# Seuls les pods porteurs d'un sidecar mimic joignent l'API.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: mimic-controller}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: {mimic.platform.io/sidecar: "true"}
+      ports:
+        - {port: 8443, protocol: TCP}

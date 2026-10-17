@@ -1,5 +1,5 @@
 # Garde-fou du mode mock (objectif O3) : le pod ne peut plus joindre que le DNS et le
-# stockage du partage. Toute requête non mockée échoue au lieu d'atteindre un SaaS.
+# contrôleur mimic. Toute requête non mockée échoue au lieu d'atteindre un SaaS.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -13,8 +13,10 @@ spec:
     - ports:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
-    # Stockage S3 du partage : adapter au CIDR de l'endpoint.
     - to:
-        - ipBlock: {cidr: 52.95.0.0/16}
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: mimic-system}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: mimic-controller}
       ports:
-        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 8443}

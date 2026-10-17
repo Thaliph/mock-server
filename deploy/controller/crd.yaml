@@ -1,0 +1,96 @@
+# Généré par `mimic-controller crd` ; ne pas modifier à la main (vérifié par les tests).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mimicworkloads.mimic.platform.io
+spec:
+  group: mimic.platform.io
+  names:
+    kind: MimicWorkload
+    plural: mimicworkloads
+    shortNames:
+    - mw
+    singular: mimicworkload
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .status.snapshot
+      name: Snapshot
+      type: string
+    - jsonPath: .status.aligned
+      name: Aligned
+      type: integer
+    - jsonPath: .status.pods
+      name: Pods
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for MimicWorkloadSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              mode:
+                description: Mode souhaité pour tous les pods du workload.
+                enum:
+                - passthrough
+                - record
+                - mock
+                - mock-partial
+                type: string
+              snapshot:
+                description: Snapshot à rejouer ; absent, le contrôleur en construit un à l'entrée en mock.
+                nullable: true
+                type: string
+            required:
+            - mode
+            type: object
+          status:
+            nullable: true
+            properties:
+              aligned:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              conditions:
+                default: []
+                items:
+                  properties:
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              pods:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              snapshot:
+                nullable: true
+                type: string
+            required:
+            - aligned
+            - pods
+            type: object
+        required:
+        - spec
+        title: MimicWorkload
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

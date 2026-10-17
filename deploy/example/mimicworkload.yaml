@@ -1,0 +1,10 @@
+# État souhaité du workload `checkout` : seule façon de basculer ses sidecars (spec §5.5.1).
+#   kubectl patch mimicworkload checkout -n shop --type merge -p '{"spec":{"mode":"mock"}}'
+#   kubectl get mimicworkload -n shop   # mode, snapshot servi, pods alignés
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata:
+  name: checkout
+  namespace: shop
+spec:
+  mode: record
