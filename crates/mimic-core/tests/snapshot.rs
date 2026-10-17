@@ -1,9 +1,10 @@
-//! Critères SNP-01 et SNP-02 de la spec (§5.6) : construction des snapshots de mock.
+//! Critères SNP-01, SNP-02 et SNP-06 de la spec (§5.6) : construction des snapshots de mock.
 
 mod common;
 
 use common::{ExchangeExt, exchange};
-use mimic_core::model::{Direction, Exchange};
+use mimic_core::mock::{MockConfig, MockDecision, MockEngine, MockRequest};
+use mimic_core::model::{Body, Direction, Exchange};
 use mimic_core::snapshot::{Snapshot, SnapshotOptions, build};
 use proptest::prelude::*;
 use serde_json::json;
@@ -53,6 +54,35 @@ fn snp_02_keeps_the_most_recent_per_key() {
     let s = build(recs, &SnapshotOptions { max_per_key: 3 });
     let ids: Vec<_> = s.exchanges.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, ["07", "08", "09"]);
+}
+
+#[test]
+fn snp_06_replayable_examples_survive_more_recent_bodyless_ones() {
+    // Comme un sidecar qui a gardé le body des 2 premiers appels seulement.
+    let recs: Vec<_> = (0..10)
+        .map(|i| {
+            let mut e = out("/a", i, &format!("{i:02}"));
+            if i >= 2 {
+                e.resp_body = Body::Skipped { size: 9 };
+            }
+            e
+        })
+        .collect();
+    let s = build(recs, &SnapshotOptions { max_per_key: 3 });
+    let ids: Vec<_> = s.exchanges.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, ["00", "01", "07", "08", "09"]);
+
+    let mut engine = MockEngine::new(s.exchanges, MockConfig::default());
+    let req = MockRequest {
+        authority: "api.saas.io:443".into(),
+        method: "GET".into(),
+        path: "/a".into(),
+        ..MockRequest::default()
+    };
+    match engine.respond(&req) {
+        MockDecision::Matched(r) => assert_eq!(r.exchange_id, "01"),
+        MockDecision::Unmatched => panic!("l'endpoint doit rester servi"),
+    }
 }
 
 #[test]

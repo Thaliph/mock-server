@@ -624,3 +624,48 @@ async fn prx_03_grpc_h2c_relayed_end_to_end_with_trailers() {
     assert_eq!(e.status, 200);
     assert_eq!(e.path, "/oteldemo.ShippingService/GetQuote");
 }
+
+/// MCK-08 pour `br` et `zstd` (spec §5.2) : body décodé à l'enregistrement, réencodé au rejeu.
+#[tokio::test]
+async fn mck_08_brotli_and_zstd_responses_are_replayed() {
+    let saas = fake_server().await;
+    let p = proxy(config(None, Mode::Record)).await;
+    let raw = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{}", p.outbound_addr())).unwrap())
+        .no_gzip()
+        .build()
+        .unwrap();
+    for path in ["/br", "/zstd"] {
+        assert_eq!(raw.get(saas.url(path)).send().await.unwrap().status(), 200);
+    }
+    let list = wait_exchanges(&p, "direction=outbound", 2).await;
+    for v in &list {
+        let e = decode(v);
+        assert!(
+            matches!(e.resp_body, mimic_core::model::Body::Captured { .. }),
+            "{} : {:?}",
+            e.path,
+            e.resp_body
+        );
+    }
+    let hits = saas.hits();
+    set_mode(&p, "mock").await;
+
+    let r = raw.get(saas.url("/br")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-encoding"], "br");
+    let mut out = String::new();
+    std::io::Read::read_to_string(
+        &mut brotli::Decompressor::new(&r.bytes().await.unwrap()[..], 4096),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out, r#"{"compressed":"br"}"#);
+
+    let r = raw.get(saas.url("/zstd")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-encoding"], "zstd");
+    let out = zstd::decode_all(&r.bytes().await.unwrap()[..]).unwrap();
+    assert_eq!(out, br#"{"compressed":"zstd"}"#);
+    assert_eq!(saas.hits(), hits, "rien n'est sorti");
+}

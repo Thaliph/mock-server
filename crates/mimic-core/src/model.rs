@@ -64,6 +64,11 @@ impl Body {
             _ => None,
         }
     }
+
+    /// Vrai si le mock peut rejouer ce body à l'identique : capturé en entier, ou vide.
+    pub fn is_replayable(&self) -> bool {
+        matches!(self, Body::Empty | Body::Captured { .. })
+    }
 }
 
 /// Marque laissée à chaque valeur remplacée par la redaction.
