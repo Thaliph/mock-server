@@ -4,10 +4,11 @@
 #
 # 1. installe cert-manager, trust-manager, le contrôleur et le webhook d'injection ;
 # 2. déploie la démo : tous ses services reçoivent mimic par le webhook, sauf valkey-cart ;
-# 3. record : le trafic est relayé, l'API de shipping et celle de quote sont découvertes ;
+# 3. record : devis demandés au frontend (gRPC vers shipping, HTTP vers quote) ; l'API de
+#    shipping et celle de quote sont découvertes ;
 # 4. après LOAD_SECONDS de charge, rapport de découverte (mimicctl report) et documents
 #    OpenAPI dans REPORT_DIR, rapport ajouté au résumé du job GitHub Actions ;
-# 5. mock (mimicctl) : quote est arrêté, shipping répond toujours depuis le snapshot ;
+# 5. mock (mimicctl) : quote est arrêté, shipping répond depuis le snapshot ;
 # 6. retour en record.
 #
 # Variables : CLUSTER (mimic), MIMIC_IMAGE (mimic:e2e), SKIP_BUILD=1 si l'image est déjà
@@ -149,28 +150,33 @@ for p in $(kubectl -n "$NS" get pods -o name); do
   esac
 done
 
-# N requêtes POST /get-quote depuis le client ; échoue si l'une n'est pas un 200 chiffré.
+# N devis de livraison demandés au frontend (GET /api/shipping) : frontend appelle shipping
+# en gRPC, shipping appelle quote en HTTP. Échoue si l'un n'est pas un 200 chiffré.
 traffic() {
   kubectl -n "$NS" exec client -- sh -c '
     ok=0
     for i in $(seq 1 '"$1"'); do
-      body=$(curl -sS -m 5 -X POST http://shipping:8080/get-quote \
-        -H "content-type: application/json" \
-        -d "{\"items\":[{\"quantity\":3}],\"address\":{\"zip_code\":\"94043\"}}" -w "\n%{http_code}") || continue
+      body=$(curl -sS -m 10 -G http://frontend-proxy:8080/api/shipping \
+        --data-urlencode "itemList=[{\"productId\":\"66VCHSJNUP\",\"quantity\":3}]" \
+        --data-urlencode "currencyCode=USD" \
+        --data-urlencode "address={\"streetAddress\":\"1600 Amphitheatre Parkway\",\"city\":\"Mountain View\",\"state\":\"CA\",\"country\":\"United States\",\"zipCode\":\"94043\"}" \
+        -w "\n%{http_code}") || continue
       code=$(echo "$body" | tail -1)
-      echo "$body" | head -1 | grep -q cost_usd && [ "$code" = 200 ] && ok=$((ok + 1))
+      echo "$body" | head -1 | grep -q currencyCode && [ "$code" = 200 ] && ok=$((ok + 1))
     done
     echo "$ok/'"$1"'"
     [ "$ok" -eq '"$1"' ]'
 }
 
 log "record : trafic relayé et enregistré"
+# Les services de la démo n'ont pas de readiness probe : attendre qu'ils répondent.
+retry 300 traffic 1 >/dev/null || fail "la démo ne répond pas"
 traffic 40 || fail "requêtes en échec en record"
 
 log "découverte centralisée"
 # export_has <motif> <workload> <arguments de mimicctl export>
 export_has() { mimicctl export "$2" -n "$NS" "${@:3}" 2>/dev/null | grep -q "$1"; }
-retry 90 export_has '"/get-quote"' shipping --inbound || fail "API de shipping absente du contrôleur"
+retry 90 export_has '"/oteldemo.ShippingService/GetQuote"' shipping --inbound || fail "API de shipping absente du contrôleur"
 retry 30 export_has '"/getquote"' shipping --outbound quote:8080 || fail "API de quote absente du contrôleur"
 mimicctl export shipping -n "$NS" --inbound --openapi-version 3.0 -o /tmp/shipping-3.0.yaml
 grep -q "openapi: 3.0.3" /tmp/shipping-3.0.yaml || fail "export 3.0"
