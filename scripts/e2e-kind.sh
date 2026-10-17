@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
-# Démo de bout en bout sur kind (spec §11, E2E) avec deux services de la démo
-# OpenTelemetry : shipping appelle quote en HTTP.
+# Démo de bout en bout sur kind (spec §11, E2E-05) avec la démo OpenTelemetry et son
+# générateur de charge (tests/e2e/otel-demo.yaml, généré par scripts/otel-demo.py).
 #
 # 1. installe cert-manager, trust-manager, le contrôleur et le webhook d'injection ;
-# 2. déploie la démo : shipping reçoit mimic par le webhook ;
+# 2. déploie la démo : tous ses services reçoivent mimic par le webhook, sauf valkey-cart ;
 # 3. record : le trafic est relayé, l'API de shipping et celle de quote sont découvertes ;
-# 4. mock (mimicctl) : quote est arrêté, shipping répond toujours depuis le snapshot ;
-# 5. retour en record.
+# 4. après LOAD_SECONDS de charge, rapport de découverte (mimicctl report) et documents
+#    OpenAPI dans REPORT_DIR, rapport ajouté au résumé du job GitHub Actions ;
+# 5. mock (mimicctl) : quote est arrêté, shipping répond toujours depuis le snapshot ;
+# 6. retour en record.
 #
 # Variables : CLUSTER (mimic), MIMIC_IMAGE (mimic:e2e), SKIP_BUILD=1 si l'image est déjà
-# construite, MIMICCTL (chemin du binaire, sinon construit par cargo).
+# construite, MIMICCTL (chemin du binaire, sinon construit par cargo), LOAD_SECONDS (180),
+# REPORT_DIR (target/e2e-report).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CLUSTER=${CLUSTER:-mimic}
 IMAGE=${MIMIC_IMAGE:-mimic:e2e}
 NS=otel-demo
+LOAD_SECONDS=${LOAD_SECONDS:-180}
+REPORT_DIR=${REPORT_DIR:-target/e2e-report}
 CERT_MANAGER=v1.21.1
 TRUST_MANAGER=v0.24.0
 
@@ -28,12 +33,21 @@ diagnostics() {
   kubectl get mimicworkloads -A -o yaml || true
   kubectl -n mimic-system logs deploy/mimic-controller --tail=100 || true
   kubectl -n mimic-system logs deploy/mimic-injector --tail=50 || true
-  for p in $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -o name 2>/dev/null); do
+  kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -40 || true
+  # shipping, puis tout pod de la démo qui n'est pas prêt.
+  local pods
+  pods=$( (kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -o name
+    kubectl -n "$NS" get pods -o json 2>/dev/null | jq -r '.items[]
+      | select(any(.status.conditions[]?; .type == "Ready" and .status != "True"))
+      | "pod/" + .metadata.name') | sort -u) || true
+  for p in $pods; do
     kubectl -n "$NS" describe "$p" | tail -30 || true
     kubectl -n "$NS" logs "$p" -c mimic --tail=80 || true
     kubectl -n "$NS" logs "$p" -c mimic-init || true
-    kubectl -n "$NS" logs "$p" -c shipping --tail=30 || true
+    kubectl -n "$NS" logs "$p" --all-containers --tail=30 || true
   done
+  # Ce qui a été découvert jusque-là aide autant que les logs.
+  [ -n "${reported:-}" ] || report || true
 }
 trap 'status=$?; [ $status -ne 0 ] && diagnostics; exit $status' EXIT
 
@@ -51,6 +65,20 @@ if [ -z "${MIMICCTL:-}" ]; then
   MIMICCTL=target/debug/mimicctl
 fi
 mimicctl() { "$MIMICCTL" "$@"; }
+
+# Rapport de découverte et documents OpenAPI des services ; ajouté au résumé du job.
+report() {
+  mkdir -p "$REPORT_DIR/openapi"
+  mimicctl report -n "$NS" > "$REPORT_DIR/report.md"
+  for d in $(kubectl -n "$NS" get deploy -o name); do
+    mimicctl export "${d#*/}" -n "$NS" --inbound -o "$REPORT_DIR/openapi/${d#*/}.yaml" 2>/dev/null || true
+  done
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    cat "$REPORT_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
+  fi
+  reported=1
+  echo "rapport : $REPORT_DIR/report.md"
+}
 
 log "cluster kind $CLUSTER"
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --config tests/e2e/kind.yaml
@@ -84,26 +112,31 @@ kubectl -n mimic-system rollout status deploy/mimic-injector --timeout=180s
 retry 60 sh -c '[ -n "$(kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath="{.webhooks[0].clientConfig.caBundle}")" ]'
 
 log "démo OpenTelemetry"
-kubectl apply -f tests/e2e/otel-demo.yaml
+kubectl apply -f tests/e2e/otel-demo.yaml -f tests/e2e/client.yaml
 retry 60 kubectl -n "$NS" get configmap mimic-controller-ca >/dev/null
-kubectl -n "$NS" rollout status deploy/quote --timeout=180s
-kubectl -n "$NS" rollout status deploy/shipping --timeout=240s
+for d in $(kubectl -n "$NS" get deploy -o name); do
+  kubectl -n "$NS" rollout status "$d" --timeout=600s
+done
 kubectl -n "$NS" wait --for=condition=Ready pod/client --timeout=120s
+load_started=$SECONDS
 
 log "injection"
-for p in $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -o name); do
+for p in $(kubectl -n "$NS" get pods -o name); do
   inits=$(kubectl -n "$NS" get "$p" -o jsonpath='{.spec.initContainers[*].name}')
-  [ "$inits" = "mimic-init mimic" ] || fail "$p : init containers « $inits »"
+  case "$p" in
+    pod/client|pod/valkey-cart-*)
+      case " $inits " in *" mimic "*) fail "$p injecté malgré mimic.platform.io/inject=false" ;; esac ;;
+    *)
+      case "$inits " in "mimic-init mimic "*) ;; *) fail "$p : init containers « $inits »" ;; esac ;;
+  esac
 done
-quote_inits=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=quote -o jsonpath='{.items[0].spec.initContainers}')
-[ -z "$quote_inits" ] || fail "quote injecté malgré mimic.platform.io/inject=false"
 
 # N requêtes POST /get-quote depuis le client ; échoue si l'une n'est pas un 200 chiffré.
 traffic() {
   kubectl -n "$NS" exec client -- sh -c '
     ok=0
     for i in $(seq 1 '"$1"'); do
-      body=$(curl -sS -m 5 -X POST http://shipping:50050/get-quote \
+      body=$(curl -sS -m 5 -X POST http://shipping:8080/get-quote \
         -H "content-type: application/json" \
         -d "{\"items\":[{\"quantity\":3}],\"address\":{\"zip_code\":\"94043\"}}" -w "\n%{http_code}") || continue
       code=$(echo "$body" | tail -1)
@@ -117,14 +150,22 @@ log "record : trafic relayé et enregistré"
 traffic 40 || fail "requêtes en échec en record"
 
 log "découverte centralisée"
-export_has() { mimicctl export shipping -n "$NS" "${@:2}" 2>/dev/null | grep -q "$1"; }
-retry 90 export_has '"/get-quote"' --inbound || fail "API de shipping absente du contrôleur"
-retry 30 export_has '"/getquote"' --outbound quote:8090 || fail "API de quote absente du contrôleur"
+# export_has <motif> <workload> <arguments de mimicctl export>
+export_has() { mimicctl export "$2" -n "$NS" "${@:3}" 2>/dev/null | grep -q "$1"; }
+retry 90 export_has '"/get-quote"' shipping --inbound || fail "API de shipping absente du contrôleur"
+retry 30 export_has '"/getquote"' shipping --outbound quote:8080 || fail "API de quote absente du contrôleur"
 mimicctl export shipping -n "$NS" --inbound --openapi-version 3.0 -o /tmp/shipping-3.0.yaml
 grep -q "openapi: 3.0.3" /tmp/shipping-3.0.yaml || fail "export 3.0"
 mimicctl export shipping -n "$NS" --inbound -o /tmp/shipping.json
 mimicctl diff /tmp/shipping.json /tmp/shipping.json --fail-on-breaking
 mimicctl requests shipping -n "$NS" --format k6 | grep -q "k6/http" || fail "script k6"
+
+log "charge du générateur de la démo ($LOAD_SECONDS s)"
+remaining=$((load_started + LOAD_SECONDS - SECONDS))
+[ $remaining -gt 0 ] && sleep "$remaining"
+# Le trafic du générateur entre par frontend-proxy et descend jusqu'au catalogue.
+retry 60 export_has '"/api/products' frontend-proxy --inbound || fail "trafic du générateur absent"
+report
 
 log "bascule en mock"
 mimicctl mode shipping mock -n "$NS"

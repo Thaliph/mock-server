@@ -1,6 +1,10 @@
 //! Construction des requêtes de `mimicctl`, sans cluster (spec §9.5, CLI-*).
 
-use mimicctl::{Target, export_path, requests_path, status_table, workload_apply};
+use mimicctl::{
+    Target, WorkloadData, export_path, operations_path, report_markdown, requests_path,
+    sample_requests_path, status_table, workload_apply,
+};
+use serde_json::{Value, json};
 
 #[test]
 fn cli_01_mode_builds_an_apply_of_the_workload_resource() {
@@ -61,4 +65,132 @@ fn status_lists_mode_snapshot_and_alignment() {
     for cell in ["shop", "checkout", "mock", "3f9a0c1e5b7d2a46", "2/3"] {
         assert!(lines[1].contains(cell), "{table}");
     }
+}
+
+fn op(direction: &str, authority: &str, method: &str, path: &str, count: u64) -> Value {
+    json!({
+        "direction": direction,
+        "authority": authority,
+        "method": method,
+        "path": path,
+        "count": count,
+        "status": {"200": 0.75, "404": 0.25},
+        "latency_ms": {"p50": 1.5, "p99": 12.0},
+        "parameters": [],
+    })
+}
+
+fn checkout() -> WorkloadData {
+    // 12 opérations : 10 sur le service, 2 sur la dépendance quote:8080.
+    let mut operations: Vec<Value> = (0..10)
+        .map(|i| op("inbound", "checkout", "GET", &format!("/r{i}"), 10 + i))
+        .collect();
+    operations.push(op("inbound", "checkout", "GET", "/items/{id}", 500));
+    let mut post = op("outbound", "quote:8080", "POST", "/getquote", 300);
+    post["parameters"] = json!([
+        {"name": "x-tenant", "in": "header", "required": true, "schema": {}},
+        {"name": "page", "in": "query", "required": false, "schema": {}},
+    ]);
+    operations.push(post);
+    let requests = vec![
+        // Ne correspond pas : autre méthode.
+        json!({"direction": "inbound", "authority": "checkout:8080", "method": "POST", "path": "/items/42",
+               "req_headers": [{"name": "x-wrong", "value": "1"}], "instance": "checkout-a"}),
+        json!({"direction": "inbound", "authority": "checkout:8080", "method": "GET", "path": "/items/42",
+               "req_headers": [
+                   {"name": "accept", "value": "application/json"},
+                   {"name": "authorization", "value": "[REDACTED]"},
+                   {"name": "x-pipe", "value": "a|b"},
+                   {"name": "cookie", "value": "x".repeat(200)},
+               ], "instance": "checkout-a"}),
+    ];
+    WorkloadData {
+        namespace: "shop".into(),
+        name: "checkout".into(),
+        mode: Some("record".into()),
+        pods: 2,
+        aligned: 2,
+        operations,
+        requests,
+    }
+}
+
+#[test]
+fn cli_04_report_lists_apis_and_top_calls_with_headers() {
+    let md = report_markdown(&[checkout()], 10);
+
+    // API découvertes : le service et sa dépendance, opérations et appels.
+    let service = md.lines().find(|l| l.contains("| service |")).expect(&md);
+    assert!(
+        service.contains("checkout") && service.contains("| 11 |"),
+        "{service}"
+    );
+    assert!(
+        service.contains(&(500 + (10..20).sum::<u64>()).to_string()),
+        "{service}"
+    );
+    let dep = md.lines().find(|l| l.contains("`quote:8080`")).expect(&md);
+    assert!(dep.contains("| 1 |") && dep.contains("| 300 |"), "{dep}");
+
+    // Exactement 10 opérations, par appels décroissants.
+    let rows: Vec<&str> = md
+        .lines()
+        .filter(|l| {
+            l.starts_with("| ")
+                && l.contains(" | `")
+                && (l.contains(" | GET ") || l.contains(" | POST "))
+        })
+        .collect();
+    assert_eq!(rows.len(), 10, "{md}");
+    assert!(rows[0].contains("/items/{id}"), "{}", rows[0]);
+    assert!(rows[1].contains("/getquote"), "{}", rows[1]);
+    assert!(rows[2].contains("/r9"), "{}", rows[2]);
+    assert!(!md.contains("`/r0`") && !md.contains("`/r1`"), "{md}");
+    assert!(
+        rows[0].contains("200 75 %") && rows[0].contains("404 25 %"),
+        "{}",
+        rows[0]
+    );
+    assert!(
+        rows[0].contains("1.5") && rows[0].contains("12"),
+        "{}",
+        rows[0]
+    );
+
+    // Headers de la requête enregistrée correspondante.
+    assert!(md.contains("| `accept` | `application/json` |"), "{md}");
+    assert!(md.contains("| `authorization` | `[REDACTED]` |"), "{md}");
+    assert!(md.contains("a\\|b"), "{md}");
+    assert!(!md.contains("x-wrong"), "{md}");
+    assert!(!md.contains(&"x".repeat(81)), "{md}");
+    assert!(md.contains(&format!("{}…", "x".repeat(80))), "{md}");
+    // Sans requête : les paramètres header déclarés.
+    assert!(md.contains("`x-tenant`"), "{md}");
+    assert!(!md.contains("`page`"), "{md}");
+
+    // Déterministe.
+    assert_eq!(md, report_markdown(&[checkout()], 10));
+}
+
+#[test]
+fn report_without_traffic_says_so() {
+    let mut w = checkout();
+    w.operations.clear();
+    w.requests.clear();
+    let md = report_markdown(&[w], 10);
+    assert!(md.contains("shop/checkout"), "{md}");
+    assert!(md.contains("Aucun trafic"), "{md}");
+    assert!(report_markdown(&[], 10).contains("Aucun workload"));
+}
+
+#[test]
+fn report_paths() {
+    assert_eq!(
+        operations_path("shop", "checkout"),
+        "/v1/workloads/shop/checkout/operations"
+    );
+    assert_eq!(
+        sample_requests_path("shop", "checkout", "outbound", 500),
+        "/v1/workloads/shop/checkout/requests?direction=outbound&format=json&limit=500"
+    );
 }

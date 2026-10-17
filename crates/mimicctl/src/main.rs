@@ -7,7 +7,10 @@ use hyper_util::rt::TokioIo;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use mimic_controller::crd::MimicWorkload;
-use mimicctl::{Target, export_path, requests_path, status_table, workload_apply};
+use mimicctl::{
+    Target, WorkloadData, export_path, operations_path, report_markdown, requests_path,
+    sample_requests_path, status_table, workload_apply,
+};
 
 /// Pilote mimic depuis le poste : bascule, statut, export et diff (spec §9.5).
 #[derive(Parser)]
@@ -65,6 +68,17 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
+    /// Rapport Markdown de la découverte : API, opérations les plus appelées et headers.
+    Report {
+        workload: Option<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        #[arg(short = 'A', long)]
+        all_namespaces: bool,
+        /// Nombre d'opérations les plus appelées par workload.
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+    },
     /// Différence entre deux documents OpenAPI (YAML ou JSON).
     Diff {
         old: PathBuf,
@@ -80,6 +94,8 @@ enum Command {
 const CONTROLLER_NAMESPACE: &str = "mimic-system";
 const CONTROLLER_SELECTOR: &str = "app.kubernetes.io/name=mimic-controller";
 const UI_PORT: u16 = 8081;
+/// Requêtes lues par sens pour trouver un exemple de headers à chaque opération.
+const REPORT_SAMPLES: usize = 500;
 
 #[tokio::main]
 async fn main() {
@@ -188,6 +204,55 @@ async fn run(command: Command) -> Result<i32, String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(0)
         }
+        Command::Report {
+            workload,
+            namespace: ns,
+            all_namespaces,
+            top,
+        } => {
+            let client = client().await?;
+            let ns = if all_namespaces {
+                None
+            } else {
+                Some(namespace(ns, &client).await)
+            };
+            let known = controller_json(client.clone(), "/v1/workloads").await?;
+            let mut workloads = vec![];
+            for w in known.as_array().into_iter().flatten() {
+                let (wns, name) = (w["namespace"].as_str(), w["name"].as_str());
+                let (Some(wns), Some(name)) = (wns, name) else {
+                    continue;
+                };
+                if ns.as_deref().is_some_and(|n| n != wns)
+                    || workload.as_deref().is_some_and(|n| n != name)
+                {
+                    continue;
+                }
+                let operations =
+                    controller_json(client.clone(), &operations_path(wns, name)).await?;
+                let mut requests = vec![];
+                for direction in ["inbound", "outbound"] {
+                    let path = sample_requests_path(wns, name, direction, REPORT_SAMPLES);
+                    if let serde_json::Value::Array(list) =
+                        controller_json(client.clone(), &path).await?
+                    {
+                        requests.extend(list);
+                    }
+                }
+                let pods = w["pods"].as_array().map_or(0, Vec::len);
+                workloads.push(WorkloadData {
+                    namespace: wns.into(),
+                    name: name.into(),
+                    mode: w["desired"]["mode"].as_str().map(String::from),
+                    pods,
+                    aligned: w["aligned"].as_u64().unwrap_or(0) as usize,
+                    operations: operations.as_array().cloned().unwrap_or_default(),
+                    requests,
+                });
+            }
+            print!("{}", report_markdown(&workloads, top));
+            Ok(0)
+        }
         Command::Diff {
             old,
             new,
@@ -236,6 +301,12 @@ fn write_doc(doc: &serde_json::Value, output: Option<&Path>) -> Result<(), Strin
             Ok(())
         }
     }
+}
+
+async fn controller_json(client: kube::Client, path: &str) -> Result<serde_json::Value, String> {
+    let body = controller_get(client, path).await?;
+    serde_json::from_slice(&body)
+        .map_err(|e| format!("réponse du contrôleur illisible ({path}): {e}"))
 }
 
 /// `GET` sur l'interface du contrôleur, liée à 127.0.0.1 dans son pod : on y passe par

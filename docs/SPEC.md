@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.8** ; injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
+> Statut : **v0.9** ; rapport de découverte `mimicctl report` (§9.5) et démo OpenTelemetry complète, avec son générateur de charge, en validation des PR (E2E-05). v0.8 : injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -624,9 +624,11 @@ Outil des humains. Il parle à l'API Kubernetes avec le kubeconfig courant et n'
 | `mimicctl export <workload> (--inbound \| --outbound <authority>) [--openapi-version 3.1\|3.0] [-o fichier]` | document OpenAPI depuis l'interface du contrôleur |
 | `mimicctl requests <workload> [--format json\|jsonl\|k6] [--limit n]` | requêtes enregistrées (§5.7) |
 | `mimicctl diff <ancien> <nouveau> [--json] [--fail-on-breaking]` | différence entre deux documents OpenAPI (YAML ou JSON) |
+| `mimicctl report [<workload>] [-n ns \| -A] [--top n]` | rapport Markdown de ce que les sidecars ont découvert (ci-dessous) |
 
 - `export` et `requests` ouvrent un port-forward vers le pod du contrôleur (port 8081), comme `kubectl port-forward` : même RBAC (`pods/portforward` dans `mimic-system`), aucun port exposé.
 - `--openapi-version 3.0` convertit le document 3.1 (`mimic-core::openapi::to_3_0`) : `type: [T, "null"]` devient `type: T` avec `nullable: true`, les `examples` d'un schéma deviennent `example` (le premier), `openapi` vaut `3.0.3`.
+- **Rapport** : pour chaque workload connu du contrôleur (filtré par nom ou namespace, ou tous avec `-A`), son mode et ses pods, la liste des API découvertes (le service, puis chaque dépendance par authority) avec leur nombre d'opérations et d'appels, puis les `n` opérations les plus appelées (10 par défaut) avec leurs codes, leur latence p50 et p99 et les headers d'une requête enregistrée de cette opération (même sens, même dépendance, même méthode, chemin conforme au template). Les headers sont ceux du store, donc déjà redactés (§7) ; une valeur est tronquée à 80 caractères. Sans requête enregistrée, les headers déclarés comme paramètres de l'opération sont listés. Tri par appels décroissants, puis sens, API, chemin et méthode : deux rapports sur les mêmes données sont identiques. Le Markdown est fait pour le résumé d'un job GitHub Actions (`>> $GITHUB_STEP_SUMMARY`).
 - **Diff** (`mimic-core::diff`, fonction pure) : opérations ajoutées et supprimées, puis pour chaque opération commune les paramètres ajoutés, supprimés ou devenus requis, et les codes de réponse ajoutés ou supprimés. Sont **cassants** : une opération supprimée, un paramètre devenu requis, un paramètre requis ajouté, un code 2xx supprimé. Sortie texte triée, `--json` pour une sortie machine. Avec `--fail-on-breaking`, le code de sortie vaut 1 s'il y a un changement cassant, ce qui sert en CI à comparer la découverte d'une semaine à l'autre.
 
 ---
@@ -842,6 +844,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | CLI-01 | `mimicctl mode checkout mock -n shop` | construction de la requête | apply d'une `MimicWorkload` `shop/checkout` avec `spec.mode: mock`, sans snapshot |
 | CLI-02 | mode inconnu | `mimicctl mode checkout fast` | refus avant tout appel, avec la liste des modes valides |
 | CLI-03 | export d'une dépendance, puis requêtes en k6 | construction du chemin | `/v1/workloads/shop/checkout/openapi/outbound/api.stripe.com`, `/v1/workloads/shop/checkout/requests?direction=inbound&format=k6&limit=100` |
+| CLI-04 | un workload avec 12 opérations (service et dépendance `quote:8080`), une requête enregistrée de `GET /items/{id}` | `mimicctl report --top 10` | les deux API avec leurs opérations et appels ; exactement 10 opérations, triées par appels décroissants ; les headers de la requête, `\|` échappé et valeurs longues tronquées ; une opération sans requête liste ses paramètres header |
 
 **Conversion OpenAPI (OAS)**
 
@@ -866,7 +869,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | E2E-02 | Même pod en mode mock avec NetworkPolicy deny-all egress : le tir k6 réussit à > 99,9 %, aucun paquet ne sort (vérifié par les compteurs du faux SaaS). |
 | E2E-03 | Changement d'annotation `record → mock` sans redémarrage du pod. |
 | E2E-04 | Namespace labellisé `env=production` : le mode mock est refusé. |
-| E2E-05 | Démo OpenTelemetry sur kind (`scripts/e2e-kind.sh`, à chaque PR vers `main`) : shipping, injecté par le webhook, appelle quote en HTTP ; en record les deux API sont découvertes par le contrôleur ; après `mimicctl mode shipping mock`, les deux pods s'alignent sur un snapshot, quote est arrêté et toutes les requêtes à shipping réussissent ; retour en record. |
+| E2E-05 | Démo OpenTelemetry sur kind (`scripts/e2e-kind.sh`, à chaque PR vers `main`) : les services de la démo, sans la chaîne de télémétrie ni Kafka, avec son générateur de charge actif ; tous injectés par le webhook sauf `valkey-cart` (opt-out). Shipping (2 réplicas) appelle quote en HTTP ; en record les deux API sont découvertes par le contrôleur. Après quelques minutes de charge, `mimicctl report -A` est publié dans le résumé du job et les documents OpenAPI en artefact. Après `mimicctl mode shipping mock`, les deux pods s'alignent sur un snapshot, quote est arrêté et toutes les requêtes à shipping réussissent ; retour en record. |
 
 **Performance (PRF)** : seuils bloquants en CI nightly : O1 et O2 mesurés avec `oha` à 1 000 req/s sur 60 s, comparés à une exécution sans sidecar.
 
@@ -913,7 +916,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
 | P6b | Chargement cross-environnement, garde-fou production | E2E-04 |
-| P7 | Webhook d'injection + `mimicctl` | INJ-*, CLI-*, OAS-*, DIF-* |
+| P7 | Webhook d'injection + `mimicctl` (dont le rapport) | INJ-*, CLI-*, OAS-*, DIF-*, E2E-05 |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 
 P1 et P3 sont du Rust pur sans I/O : c'est le meilleur point d'entrée pour Claude Code, qui peut avancer en TDD strict sur des fonctions déterministes avant de toucher au réseau.
