@@ -71,7 +71,7 @@ jobs:
           MIMIC_IMAGE: mimic:e2e
           MIMICCTL: target/debug/mimicctl
           SKIP_BUILD: "1"
-          LOAD_SECONDS: "180"
+          LOAD_SECONDS: "300"
           REPORT_DIR: target/e2e-report
       - uses: actions/upload-artifact@v4
         if: always()

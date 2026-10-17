@@ -8,19 +8,22 @@
 #    shipping et celle de quote sont découvertes ;
 # 4. après LOAD_SECONDS de charge, rapport de découverte (mimicctl report) et documents
 #    OpenAPI dans REPORT_DIR, rapport ajouté au résumé du job GitHub Actions ;
-# 5. mock (mimicctl) : quote est arrêté, shipping répond depuis le snapshot ;
-# 6. retour en record.
+# 5. mock global : tout passe en mock sauf le générateur ; les métriques des sidecars
+#    montrent que seul frontend-proxy reçoit encore du trafic et répond depuis le snapshot ;
+# 6. mock de shipping (mimicctl) : quote est arrêté, shipping répond depuis le snapshot ;
+# 7. retour en record.
 #
 # Variables : CLUSTER (mimic), MIMIC_IMAGE (mimic:e2e), SKIP_BUILD=1 si l'image est déjà
-# construite, MIMICCTL (chemin du binaire, sinon construit par cargo), LOAD_SECONDS (180),
-# REPORT_DIR (target/e2e-report).
+# construite, MIMICCTL (chemin du binaire, sinon construit par cargo), LOAD_SECONDS (300),
+# MOCK_WINDOW (60, secondes d'observation en mock global), REPORT_DIR (target/e2e-report).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CLUSTER=${CLUSTER:-mimic}
 IMAGE=${MIMIC_IMAGE:-mimic:e2e}
 NS=otel-demo
-LOAD_SECONDS=${LOAD_SECONDS:-180}
+LOAD_SECONDS=${LOAD_SECONDS:-300}
+MOCK_WINDOW=${MOCK_WINDOW:-60}
 REPORT_DIR=${REPORT_DIR:-target/e2e-report}
 CERT_MANAGER=v1.21.1
 TRUST_MANAGER=v0.24.0
@@ -202,6 +205,73 @@ remaining=$((load_started + LOAD_SECONDS - SECONDS))
 # Le trafic du générateur entre par frontend-proxy et descend jusqu'au catalogue.
 retry 60 export_has '"/api/products' frontend-proxy --inbound || fail "trafic du générateur absent"
 report
+
+log "mock global : seul frontend-proxy, cible du générateur, reçoit du trafic"
+# Le générateur reste en record : c'est le client. Tous les autres sidecars répondent
+# depuis leur snapshot, donc plus aucune requête n'atteint les applications derrière.
+mocked=$(kubectl -n "$NS" get deploy -o name | sed 's|.*/||' | grep -vxE 'load-generator|valkey-cart')
+for w in $mocked; do mimicctl mode "$w" mock -n "$NS" >/dev/null; done
+# all_aligned <mode> : chaque workload de $mocked a tous ses pods sur <mode> (et un snapshot en mock).
+all_aligned() {
+  local out w
+  out=$(mimicctl status -n "$NS")
+  for w in $mocked; do
+    echo "$out" | awk -v w="$w" -v m="$1" '
+      $2 == w && $3 == m && (m != "mock" || $4 != "-") { split($5, a, "/"); if (a[2] > 0 && a[1] == a[2]) ok = 1 }
+      END { exit !ok }' || return 1
+  done
+}
+retry 120 all_aligned mock || { mimicctl status -n "$NS"; fail "les pods ne s'alignent pas en mock"; }
+# Laisser finir les requêtes parties avant la bascule.
+sleep 15
+# metric_sum <workload> <filtre awk> : somme des séries `mimic_*` retenues, sur tous ses pods.
+metric_sum() {
+  local total=0 p n
+  for p in $(kubectl -n "$NS" get pods -l "opentelemetry.io/name=$1" -o name); do
+    n=$(kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15000/proxy/metrics" \
+      | awk "$2"' { s += $NF } END { printf "%d", s }')
+    total=$((total + n))
+  done
+  echo "$total"
+}
+INBOUND='/^mimic_requests_total[{]/ && /direction="inbound"/'
+SERVED='/^mimic_mock_responses_total[{]/ && !/match="unmatched"/'
+UNMATCHED='/^mimic_mock_responses_total[{]/ && /match="unmatched"/'
+declare -A before
+for w in $mocked; do before[$w]=$(metric_sum "$w" "$INBOUND"); done
+served0=$(metric_sum frontend-proxy "$SERVED")
+unmatched0=$(metric_sum frontend-proxy "$UNMATCHED")
+sleep "$MOCK_WINDOW"
+{
+  echo "## Mock global ($MOCK_WINDOW s, tout sauf load-generator)"
+  echo
+  echo "| Workload | Requêtes entrantes |"
+  echo "|---|---:|"
+} > "$REPORT_DIR/mock.md"
+leaks=""
+for w in $mocked; do
+  delta=$(( $(metric_sum "$w" "$INBOUND") - ${before[$w]} ))
+  echo "| $w | $delta |" >> "$REPORT_DIR/mock.md"
+  case "$w" in
+    frontend-proxy) front=$delta ;;
+    *) [ "$delta" -eq 0 ] || leaks="$leaks $w($delta)" ;;
+  esac
+done
+served=$(( $(metric_sum frontend-proxy "$SERVED") - served0 ))
+unmatched=$(( $(metric_sum frontend-proxy "$UNMATCHED") - unmatched0 ))
+{
+  echo
+  echo "frontend-proxy : $served réponses servies depuis le snapshot, $unmatched sans correspondance (599)."
+} >> "$REPORT_DIR/mock.md"
+cat "$REPORT_DIR/mock.md"
+[ -n "${GITHUB_STEP_SUMMARY:-}" ] && { echo; cat "$REPORT_DIR/mock.md"; } >> "$GITHUB_STEP_SUMMARY"
+[ -z "$leaks" ] || fail "trafic entrant en mock :$leaks"
+[ "$front" -gt 0 ] || fail "frontend-proxy ne reçoit plus le trafic du générateur"
+[ "$served" -gt 0 ] || fail "frontend-proxy ne répond pas depuis le snapshot"
+
+log "retour en record après le mock global"
+for w in $mocked; do mimicctl mode "$w" record -n "$NS" >/dev/null; done
+retry 120 all_aligned record || { mimicctl status -n "$NS"; fail "retour en record"; }
 
 log "bascule en mock"
 mimicctl mode shipping mock -n "$NS"
