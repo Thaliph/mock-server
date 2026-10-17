@@ -282,15 +282,21 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
         .expect("verrou du contrôleur")
         .desired
         .clone();
-    // Le snapshot d'abord : un passage en mock sert ainsi directement le bon jeu.
+    // Le snapshot d'abord : un passage en mock sert ainsi directement le bon jeu. S'il ne
+    // peut pas être téléchargé, le mode est appliqué quand même (le mock sert alors les
+    // données locales, rien ne sort) et le téléchargement est retenté au battement suivant.
     let mut fetched = None;
+    let mut fetch_error = None;
     match &desired.snapshot {
-        Some(id) if loaded.as_ref() != Some(id) => {
-            let snap = Arc::new(client.snapshot(id).await?);
-            tracing::info!(snapshot = %id, exchanges = snap.exchanges.len(), "snapshot chargé");
-            state.set_snapshot(Some(snap.clone()));
-            fetched = Some(snap);
-        }
+        Some(id) if loaded.as_ref() != Some(id) => match client.snapshot(id).await {
+            Ok(snap) => {
+                let snap = Arc::new(snap);
+                tracing::info!(snapshot = %id, exchanges = snap.exchanges.len(), "snapshot chargé");
+                state.set_snapshot(Some(snap.clone()));
+                fetched = Some(snap);
+            }
+            Err(e) => fetch_error = Some(format!("snapshot {id}: {e}")),
+        },
         None if loaded.is_some() => state.set_snapshot(None),
         _ => {}
     }
@@ -311,5 +317,5 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
             .expect("verrou du contrôleur")
             .desired = desired;
     }
-    Ok(())
+    fetch_error.map_or(Ok(()), Err)
 }
