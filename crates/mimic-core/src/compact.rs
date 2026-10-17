@@ -145,6 +145,33 @@ pub fn hour_of(ms: i64) -> (String, i64, i64) {
     (name, start, start + HOUR_MS)
 }
 
+/// Début (ms Unix) de l'heure UTC nommée `AAAAMMJJHH` ; `None` si le nom est invalide.
+pub fn hour_start(name: &str) -> Option<i64> {
+    if name.len() != 10 || !name.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| name[r].parse::<i64>().ok();
+    let (y, m, d, h) = (num(0..4)?, num(4..6)?, num(6..8)?, num(8..10)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 {
+        return None;
+    }
+    let days = days_from_civil(y, m as u32, d as u32);
+    let start = (days * 24 + h) * HOUR_MS;
+    // Rejette les dates impossibles (31 février) : le nom doit se relire à l'identique.
+    (hour_of(start).0 == name).then_some(start)
+}
+
+/// Nombre de jours depuis le 1er janvier 1970 d'une date grégorienne (`days_from_civil`).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = i64::from((m + 9) % 12);
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Date grégorienne d'un nombre de jours depuis le 1er janvier 1970 (algorithme de
 /// H. Hinnant, `civil_from_days`).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {

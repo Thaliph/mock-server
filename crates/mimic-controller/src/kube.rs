@@ -44,24 +44,30 @@ pub async fn publish_status(ctl: Arc<Ctl>, client: kube::Client) {
     let mut last: BTreeMap<(String, String), MimicWorkloadStatus> = BTreeMap::new();
     loop {
         tokio::time::sleep(STATUS_INTERVAL).await;
-        for (ns, name) in ctl.workload_keys().await {
-            let status = {
-                let w = ctl.workload(&ns, &name).await;
-                if w.spec.is_none() {
-                    continue;
-                }
-                let s = ctl.summary(&w);
-                MimicWorkloadStatus {
-                    snapshot: w.desired.snapshot.clone(),
-                    pods: s.pods,
-                    aligned: s.aligned,
-                    observed_generation: w.generation,
-                    conditions: vec![StatusCondition {
-                        type_: "Aligned".into(),
-                        status: if s.ready { "True" } else { "False" }.into(),
-                        reason: s.reason,
-                    }],
-                }
+        let keys = ctl.workload_keys().await;
+        // Les workloads disparus ne gardent pas leur dernier statut publié.
+        last.retain(|k, _| keys.binary_search(k).is_ok());
+        for (ns, name) in keys {
+            // Lecture de l'état court : jamais derrière un calcul ou une I/O.
+            let status = ctl
+                .with_live(&ns, &name, |w| {
+                    w.spec.as_ref()?;
+                    let s = ctl.summary(w);
+                    Some(MimicWorkloadStatus {
+                        snapshot: w.desired.snapshot.clone(),
+                        pods: s.pods,
+                        aligned: s.aligned,
+                        observed_generation: w.generation,
+                        conditions: vec![StatusCondition {
+                            type_: "Aligned".into(),
+                            status: if s.ready { "True" } else { "False" }.into(),
+                            reason: s.reason,
+                        }],
+                    })
+                })
+                .await;
+            let Some(status) = status else {
+                continue;
             };
             let key = (ns.clone(), name.clone());
             if last.get(&key) == Some(&status) {

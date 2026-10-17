@@ -28,6 +28,7 @@ pub struct Metrics {
     pub workloads: Gauge,
     pub pods: Family<StateLabel, Gauge>,
     pub snapshots: Counter,
+    pub exchanges: Gauge,
 }
 
 impl Default for Metrics {
@@ -38,6 +39,7 @@ impl Default for Metrics {
         let workloads = Gauge::default();
         let pods = Family::<StateLabel, Gauge>::default();
         let snapshots = Counter::default();
+        let exchanges = Gauge::default();
         registry.register(
             "mimic_controller_segments",
             "Segments reçus des sidecars",
@@ -63,6 +65,11 @@ impl Default for Metrics {
             "Snapshots construits",
             snapshots.clone(),
         );
+        registry.register(
+            "mimic_controller_exchanges",
+            "Échanges en mémoire, tous workloads",
+            exchanges.clone(),
+        );
         Self {
             registry,
             segments,
@@ -70,6 +77,7 @@ impl Default for Metrics {
             workloads,
             pods,
             snapshots,
+            exchanges,
         }
     }
 }

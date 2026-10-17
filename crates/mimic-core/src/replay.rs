@@ -52,9 +52,10 @@ pub fn recent_requests<E: Borrow<Exchange>>(
     out
 }
 
-/// Script k6 qui rejoue les requêtes dans l'ordre d'enregistrement.
-pub fn k6_script(exchanges: &[Exchange]) -> String {
-    let mut ordered: Vec<&Exchange> = exchanges.iter().collect();
+/// Script k6 qui rejoue les requêtes dans l'ordre d'enregistrement, à partir d'échanges ou de
+/// références.
+pub fn k6_script<E: Borrow<Exchange>>(exchanges: &[E]) -> String {
+    let mut ordered: Vec<&Exchange> = exchanges.iter().map(Borrow::borrow).collect();
     ordered.sort_by(|a, b| (a.started_at_ms, &a.id).cmp(&(b.started_at_ms, &b.id)));
     let mut dropped = BTreeSet::new();
     let requests: Vec<Value> = ordered

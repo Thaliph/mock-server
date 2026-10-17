@@ -73,6 +73,6 @@ fn rpl_02_k6_script_replays_requests_without_redacted_headers() {
 
 #[test]
 fn k6_script_of_nothing_is_still_valid() {
-    let script = k6_script(&[]);
+    let script = k6_script::<Exchange>(&[]);
     assert!(embedded(&script).is_empty());
 }

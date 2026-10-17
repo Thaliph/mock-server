@@ -4,7 +4,7 @@
 mod common;
 
 use common::{ExchangeExt, exchange};
-use mimic_core::compact::{BodySamples, Compactor, hour_of};
+use mimic_core::compact::{BodySamples, Compactor, hour_of, hour_start};
 use mimic_core::model::{Body, Exchange};
 use proptest::prelude::*;
 use serde_json::json;
@@ -104,6 +104,27 @@ fn ctl_11_hours_are_named_in_utc() {
     // Passage d'année, année bissextile.
     assert_eq!(hour_of(951_782_400_000).0, "2000022900");
     assert_eq!(hour_of(1_704_067_199_999).0, "2023123123");
+    // Le nom se relit.
+    assert_eq!(hour_start("2025100908"), Some(start));
+    assert_eq!(hour_start("1970010100"), Some(0));
+    for bad in [
+        "2025023100",
+        "2025100924",
+        "202510090",
+        "abcdefghij",
+        "2025130100",
+    ] {
+        assert_eq!(hour_start(bad), None, "{bad}");
+    }
+}
+
+proptest! {
+    #[test]
+    fn ctl_11_hour_names_roundtrip(ms in 0i64..4_102_444_800_000) {
+        let (name, start, end) = hour_of(ms);
+        prop_assert!(start <= ms && ms < end);
+        prop_assert_eq!(hour_start(&name), Some(start));
+    }
 }
 
 proptest! {

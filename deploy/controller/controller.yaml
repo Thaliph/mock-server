@@ -15,9 +15,14 @@ data:
     store: file:///var/lib/mimic-controller
     retention: 604800
     max_exchanges_per_workload: 200000
+    max_exchanges_total: 1000000
+    samples_per_operation: 20
+    max_bytes_per_workload: 268435456
+    discovery_interval: 30
     snapshot:
       max_per_key: 50
     pod_timeout: 30
+    pod_forget: 600
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -62,9 +67,11 @@ spec:
             httpGet: {path: /healthz, port: api, scheme: HTTPS}
           livenessProbe:
             httpGet: {path: /healthz, port: api, scheme: HTTPS}
+          # Environ 2 Ko par échange gardé : max_exchanges_total (1 000 000), plus le pic
+          # d'une inférence sur le plus gros workload.
           resources:
             requests: {cpu: 100m, memory: 256Mi}
-            limits: {memory: 2Gi}
+            limits: {memory: 4Gi}
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

@@ -38,6 +38,8 @@ async fn controller(dir: &Path, tls: Option<TlsFiles>) -> mimic_controller::Runn
         store: format!("file://{}", dir.join("ctl").display()),
         auth: AuthConfig::Static { tokens: tokens() },
         tls,
+        // Découverte recalculée dès qu'une vue la trouve périmée (§5.5.2).
+        discovery_interval: Duration::ZERO,
         ..ControllerConfig::default()
     })
     .await
