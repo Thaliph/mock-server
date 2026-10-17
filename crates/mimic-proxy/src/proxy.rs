@@ -32,12 +32,14 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// Informations sur la connexion acceptée.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConnInfo {
     pub listen: SocketAddr,
     pub peer: SocketAddr,
     /// Destination d'origine avant redirection iptables, si différente de l'écoute.
     pub original_dst: Option<SocketAddr>,
+    /// `hôte:port` d'une connexion TLS interceptée et déchiffrée.
+    pub tls_authority: Option<String>,
 }
 
 pub fn boxed<B>(body: B) -> ProxyBody
@@ -105,9 +107,15 @@ pub async fn outbound(
     req: Request<Incoming>,
 ) -> Response<ProxyBody> {
     if req.method() == Method::CONNECT {
-        return connect(state, req);
+        return connect(state, info, req);
     }
-    let target = if let Some(a) = req.uri().authority() {
+    let target = if let Some(a) = &info.tls_authority {
+        Target {
+            scheme: "https".into(),
+            authority: a.clone(),
+            connect: a.clone(),
+        }
+    } else if let Some(a) = req.uri().authority() {
         let scheme = req.uri().scheme_str().unwrap_or("http").to_string();
         let authority = normalize_authority(a.as_str(), &scheme);
         Target {
@@ -174,7 +182,12 @@ async fn forward(
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".into());
-    let uri: Uri = match format!("http://{}{}", target.connect, path_and_query).parse() {
+    let scheme = if target.scheme == "https" {
+        "https"
+    } else {
+        "http"
+    };
+    let uri: Uri = match format!("{scheme}://{}{}", target.connect, path_and_query).parse() {
         Ok(u) => u,
         Err(_) => return text(StatusCode::BAD_REQUEST, "mimic: URI invalide"),
     };
@@ -442,13 +455,32 @@ fn mock_response(state: &AppState, r: MockResponse) -> Response<ProxyBody> {
     response
 }
 
-/// Tunnel `CONNECT` : relayé à l'aveugle (TLS non intercepté avant la phase P5), refusé en mock.
-fn connect(state: Arc<AppState>, req: Request<Incoming>) -> Response<ProxyBody> {
-    let Some(authority) = req.uri().authority().map(|a| a.to_string()) else {
+/// Tunnel `CONNECT` : intercepté si l'hôte est dans `tls.intercept`, sinon relayé à
+/// l'aveugle, ou refusé en mock.
+fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Response<ProxyBody> {
+    let Some(authority) = req
+        .uri()
+        .authority()
+        .map(|a| normalize_authority(a.as_str(), "https"))
+    else {
         return text(StatusCode::BAD_REQUEST, "mimic: CONNECT sans destination");
     };
+    let host = req.uri().host().unwrap_or_default().to_string();
     let mode = state.mode();
     let label = state.metrics.authority(&authority);
+    if state.intercepts(&host) {
+        count_request(&state, Direction::Outbound, mode, &label, "CONNECT", 200);
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    let io = hyper_util::rt::TokioIo::new(upgraded);
+                    crate::tls_serve(state, io, info, authority).await;
+                }
+                Err(e) => tracing::debug!(error = %e, "upgrade CONNECT échoué"),
+            }
+        });
+        return Response::new(boxed(Empty::<Bytes>::new()));
+    }
     if mode == Mode::Mock {
         mock_metric(&state, &label, "unmatched");
         count_request(&state, Direction::Outbound, mode, &label, "CONNECT", 403);

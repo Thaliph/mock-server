@@ -55,7 +55,65 @@ async fn count(
 
 pub async fn fake_server() -> Fake {
     let hits = Arc::new(AtomicUsize::new(0));
-    let app = Router::new()
+    let app = router(hits.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Fake { addr, hits, handle }
+}
+
+/// Même serveur factice en HTTPS, avec un certificat autosigné pour `localhost`.
+/// Renvoie aussi le PEM de ce certificat, auquel les clients doivent se fier.
+pub async fn fake_https_server() -> (Fake, String) {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let pem = cert.pem();
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.der().clone()],
+        rustls_pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+    )
+    .unwrap();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = router(hits.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let acceptor = acceptor.clone();
+            let app = app.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let svc = hyper_util::service::TowerToHyperService::new(app);
+                let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(tls), svc)
+                    .await;
+            });
+        }
+    });
+    (Fake { addr, hits, handle }, pem)
+}
+
+fn router(hits: Arc<AtomicUsize>) -> Router {
+    Router::new()
         .route(
             "/users/{id}",
             get(|Path(id): Path<u64>| async move {
@@ -129,16 +187,7 @@ pub async fn fake_server() -> Fake {
                     .into_response()
             }),
         )
-        .layer(axum::middleware::map_request_with_state(
-            hits.clone(),
-            count,
-        ));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    Fake { addr, hits, handle }
+        .layer(axum::middleware::map_request_with_state(hits, count))
 }
 
 /// Configuration de test : ports éphémères, application derrière `inbound`.

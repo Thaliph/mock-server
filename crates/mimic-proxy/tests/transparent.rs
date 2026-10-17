@@ -103,10 +103,20 @@ async fn transparent_interception_in_network_namespace() {
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
     )
     .unwrap();
+    let ca_dir = dir.path().join("ca");
+    std::fs::create_dir(&ca_dir).unwrap();
+    std::fs::set_permissions(&ca_dir, std::os::unix::fs::PermissionsExt::from_mode(0o777)).unwrap();
+    let (https, https_pem) = fake_https_server().await;
+    let upstream_pem = dir.path().join("upstream.pem");
+    std::fs::write(&upstream_pem, &https_pem).unwrap();
     let config = dir.path().join("mimic.yaml");
     std::fs::write(
         &config,
-        "mode: record\ninstance: e2e-0\ninbound:\n  enabled: false\noutbound:\n  listen: 127.0.0.1:15001\nadmin:\n  listen: 127.0.0.1:15000\n",
+        format!(
+            "mode: record\ninstance: e2e-0\ninbound:\n  enabled: false\noutbound:\n  listen: 127.0.0.1:15001\nadmin:\n  listen: 127.0.0.1:15000\ntls:\n  intercept: [localhost]\n  ca_dir: {}\n  upstream_ca_file: {}\n",
+            ca_dir.display(),
+            upstream_pem.display()
+        ),
     )
     .unwrap();
     let _sidecar = Sidecar(
@@ -146,6 +156,36 @@ async fn transparent_interception_in_network_namespace() {
         format!("127.0.0.1:{}", saas.addr.port())
     );
     assert_eq!(recorded["path"], "/users/4");
+
+    // PRX-06 en transparent : HTTPS intercepté d'après le SNI, sans proxy configuré.
+    let ca = std::fs::read(ca_dir.join("ca.crt")).unwrap();
+    let tls_app = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+        .build()
+        .unwrap();
+    let https_url = format!("https://localhost:{}/users/5", https.addr.port());
+    let r = tls_app.get(&https_url).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let list: Vec<Value> = client()
+            .get(format!("{ADMIN}/exchanges?direction=outbound"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if list
+            .iter()
+            .any(|e| e["scheme"] == "https" && e["path"] == "/users/5")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "échange HTTPS non enregistré");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // PRX-04 : protocole où le client parle en premier, octets identiques.
     let echo = tcp_server(None);
@@ -197,6 +237,14 @@ async fn transparent_interception_in_network_namespace() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.json::<Value>().await.unwrap()["id"], 4);
     assert_eq!(saas.hits(), hits);
+
+    // HTTPS intercepté servi en mock, sans joindre la dépendance.
+    let https_hits = https.hits();
+    https.stop();
+    let r = tls_app.get(&https_url).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<Value>().await.unwrap()["id"], 5);
+    assert_eq!(https.hits(), https_hits);
 
     let m = client()
         .get(format!("{ADMIN}/metrics"))

@@ -14,15 +14,21 @@ http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["http1", "http2", "server", "client"] }
-hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "http1", "tls12", "native-tokio", "logging"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2", "service"] }
 mimic-core = { version = "0.1.0", path = "../mimic-core" }
 nix = { version = "0.31.3", features = ["net", "socket"] }
 object_store = { version = "0.14.2", features = ["aws"] }
 prometheus-client = "0.25.1"
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring", "x509-parser"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8.5"
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_yaml = "0.9.34"
 tokio = { version = "1.53.3", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 ulid = "3.0.0"
