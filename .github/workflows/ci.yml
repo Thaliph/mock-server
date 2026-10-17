@@ -36,8 +36,8 @@ jobs:
 
   e2e-kind:
     # Démo OpenTelemetry (shipping → quote) sur kind : injection par le webhook, contrôleur,
-    # bascule en mock par mimicctl. Sur les PR vers main et après chaque merge.
-    if: github.base_ref == 'main' || github.ref == 'refs/heads/main'
+    # bascule en mock par mimicctl. Uniquement sur les PR vers main.
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

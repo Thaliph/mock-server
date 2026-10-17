@@ -316,4 +316,20 @@ mod tests {
         assert_eq!(instance_of(base, "ns/api/exchanges/api-a"), None);
         assert_eq!(instance_of(base, "ns/apix/exchanges/a/1.jsonl"), None);
     }
+
+    /// Deux fournisseurs rustls sont compilés (aws-lc-rs vient d'object_store) : le
+    /// client S3 ne doit pas paniquer faute d'en avoir choisi un.
+    #[tokio::test]
+    async fn s3_store_does_not_panic_on_crypto_provider() {
+        let store = open("s3://mimic-test/prefixe").unwrap();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures_util::StreamExt::next(&mut store.list(None)),
+        )
+        .await;
+        // Réseau absent ou bucket inconnu : une erreur, jamais une panique.
+        if let Ok(Some(item)) = first {
+            assert!(item.is_err());
+        }
+    }
 }
