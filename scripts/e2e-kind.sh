@@ -170,7 +170,8 @@ traffic() {
 
 log "record : trafic relayé et enregistré"
 # Les services de la démo n'ont pas de readiness probe : attendre qu'ils répondent.
-retry 300 traffic 1 >/dev/null || fail "la démo ne répond pas"
+echo "attente de la démo (5 min au plus)"
+retry 300 traffic 1 >/dev/null 2>&1 || fail "la démo ne répond pas"
 traffic 40 || fail "requêtes en échec en record"
 
 log "découverte centralisée"

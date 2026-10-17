@@ -53,6 +53,8 @@ pub struct AppState {
     pub share_status: Mutex<ShareStatus>,
     /// Réveille la boucle de partage (`POST /share/sync`).
     pub share_notify: tokio::sync::Notify,
+    /// Adresse de l'application pour le trafic entrant, par port (spec §3.1).
+    pub inbound_targets: crate::net::InboundTargets,
 }
 
 /// Source du moteur de mock en cache.
@@ -124,6 +126,7 @@ impl AppState {
             .unwrap_or_default();
         Ok(Arc::new(Self {
             mode: AtomicU8::new(config.mode.to_u8()),
+            inbound_targets: crate::net::InboundTargets::new(config.inbound.upstream),
             config,
             store,
             metrics,

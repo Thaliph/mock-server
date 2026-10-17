@@ -1,6 +1,6 @@
 //! Traitement du trafic entrant et sortant : relais, capture et mock (spec §5).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -70,10 +70,10 @@ pub async fn inbound(
     info: ConnInfo,
     req: Request<Incoming>,
 ) -> Response<ProxyBody> {
-    let target = state.config.inbound.upstream.or_else(|| {
-        info.original_dst
-            .map(|d| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), d.port()))
-    });
+    let target = match info.original_dst {
+        Some(dst) => Some(state.inbound_targets.resolve(dst).await),
+        None => state.config.inbound.upstream,
+    };
     let Some(target) = target else {
         return text(
             StatusCode::BAD_GATEWAY,
@@ -216,6 +216,13 @@ async fn forward(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(authority = %target.authority, error = %e, "échec vers l'amont");
+            // L'application a pu changer d'adresse d'écoute : refaire le choix (spec §3.1).
+            if direction == Direction::Inbound
+                && e.is_connect()
+                && let Ok(a) = target.connect.parse::<SocketAddr>()
+            {
+                state.inbound_targets.forget(a.port());
+            }
             state
                 .metrics
                 .upstream_errors
@@ -546,9 +553,7 @@ pub async fn tunnel(
         return;
     }
     let target = if inbound {
-        state.config.inbound.upstream.unwrap_or_else(|| {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), original_dst.port())
-        })
+        state.inbound_targets.resolve(original_dst).await
     } else {
         original_dst
     };
