@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.7** ; le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
+> Statut : **v0.8** ; injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -68,8 +68,8 @@ Composants livrés :
 | `mimic-init` | Init container qui pose les règles iptables | binaire (ou mode du binaire principal) |
 | `mimic-core` | Modèle de données, inférence OpenAPI, matching, redaction, snapshots, rejeu | lib, sans I/O, testée en isolation |
 | `mimic-controller` | Plan de contrôle : agrège les enregistrements par workload, interface de découverte centrale, snapshots de mock, bascule de mode | binaire, un Deployment par cluster |
-| `mimic-injector` | Webhook d'admission qui injecte sidecar + init | binaire (phase 3) |
-| `mimicctl` | CLI : bascule de mode, export, diff de specs | binaire (phase 3) |
+| `mimic-injector` | Webhook d'admission qui injecte sidecar + init (§9.4) | binaire |
+| `mimicctl` | CLI : bascule de mode, export, diff de specs (§9.5) | binaire |
 
 Principe structurant : **toute la logique métier vit dans `mimic-core`, en fonctions pures**. Le proxy n'est qu'un adaptateur réseau. C'est ce qui permet d'écrire les tests avant le code.
 
@@ -579,6 +579,56 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 
 Logs JSON structurés (`tracing`). Propagation de `traceparent` inchangée.
 
+### 9.4 Injection automatique (`mimic-injector`)
+
+Webhook d'admission mutant (`MutatingWebhookConfiguration`), déployé dans `mimic-system`, qui ajoute à la création d'un pod ce que `deploy/example/deployment.yaml` écrit à la main.
+
+- **Portée** : les pods des namespaces labellisés `mimic.platform.io/enabled=true`, le label qui leur fait déjà recevoir la CA du contrôleur. Un pod s'en retire par l'annotation `mimic.platform.io/inject: "false"`.
+- **Fonction pure, sans appel à l'API** : la mutation ne dépend que du pod et de la configuration du webhook (`mimic-injector::inject`), et se teste sans cluster. `sideEffects: None` ; `failurePolicy: Ignore`, si bien qu'un webhook indisponible laisse créer le pod sans Mimic au lieu de le bloquer ; `timeoutSeconds: 5`.
+- **Ce qui est ajouté** (patch JSON) :
+  - l'init container `mimic-init` (`NET_ADMIN`, `NET_RAW`), en tête. Ports entrants : annotation `mimic.platform.io/inbound-ports`, sinon les `containerPort` TCP des conteneurs de l'app, sinon `*`. CIDR sortants exclus : ceux de la configuration du webhook (API Kubernetes) puis l'annotation `mimic.platform.io/exclude-outbound-cidrs`. Ports sortants exclus : annotation `mimic.platform.io/exclude-outbound-ports` ;
+  - le native sidecar `mimic`, juste après `mimic-init` et donc avant les init containers de l'app, avec une `startupProbe` sur `/healthz` : l'app ne démarre qu'une fois le proxy prêt. Variables `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` (valeur figée à l'admission) et `MIMIC_REDACT_SALT` lue dans le Secret `<workload>-mimic`, clé `redact-salt`, facultatif ;
+  - la configuration du sidecar : par défaut celle du webhook (`sidecar_config`), passée en ligne par `MIMIC_CONFIG_YAML` ; l'annotation `mimic.platform.io/config: <configmap>` monte ce ConfigMap (clé `mimic.yaml`) à la place ;
+  - les volumes : store (`emptyDir`), jeton projeté d'audience `mimic-controller`, CA du contrôleur (ConfigMap `mimic-controller-ca`), répertoire de CA Mimic (`emptyDir`, `/var/run/mimic/ca`) ;
+  - si l'annotation `mimic.platform.io/tls-intercept` liste des hôtes (séparés par des virgules) : `MIMIC_TLS_INTERCEPT` pour le sidecar, et dans chaque conteneur de l'app le répertoire de CA monté en lecture seule avec `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE` et `CURL_CA_BUNDLE` (§4.2). Une variable déjà définie par l'app n'est pas écrasée ;
+  - l'annotation `mimic.platform.io/status: injected` et le label `mimic.platform.io/sidecar: "true"` (NetworkPolicy du contrôleur).
+- **Nom du workload** : annotation `mimic.platform.io/workload`, sinon label `app.kubernetes.io/name`, sinon label `app` (§5.4).
+- **Pods laissés tels quels**, admis avec un avertissement d'admission visible par `kubectl` : pod déjà injecté (idempotence, réinvocation), `hostNetwork: true`, conteneur `istio-proxy` ou `linkerd-proxy` présent (§3.3), aucun nom de workload trouvé.
+- Le webhook est servi en HTTPS (certificat cert-manager, `caBundle` posé par le cainjector). Métrique `mimic_injector_admissions_total{result}` (`injected`, `skipped`, `error`).
+
+Côté sidecar, `MIMIC_CONFIG_YAML` contient le YAML de la configuration quand aucun fichier n'est donné (`--config` ou `MIMIC_CONFIG` l'emportent) ; `MIMIC_TLS_INTERCEPT` remplace `tls.intercept`.
+
+Configuration du webhook (`mimic-injector --config`) :
+
+```yaml
+listen: 0.0.0.0:8443
+tls: { cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key }
+image: registry.example.com/platform/mimic:0.1.0
+exclude_outbound_cidrs: [10.96.0.1/32]   # API Kubernetes
+sidecar_config: |                       # configuration par défaut des sidecars (§9.1)
+  mode: record
+  share: { url: https://mimic-controller.mimic-system.svc:8443, ... }
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { memory: 256Mi }
+```
+
+### 9.5 CLI `mimicctl`
+
+Outil des humains. Il parle à l'API Kubernetes avec le kubeconfig courant et n'a que les droits de son utilisateur (RBAC, §7.1).
+
+| Commande | Effet |
+|----------|-------|
+| `mimicctl mode <workload> <mode> [--snapshot id] [-n ns]` | crée ou met à jour la `MimicWorkload` (server-side apply, gestionnaire `mimicctl`) |
+| `mimicctl status [<workload>] [-n ns \| -A]` | mode souhaité, snapshot servi, pods alignés |
+| `mimicctl export <workload> (--inbound \| --outbound <authority>) [--openapi-version 3.1\|3.0] [-o fichier]` | document OpenAPI depuis l'interface du contrôleur |
+| `mimicctl requests <workload> [--format json\|jsonl\|k6] [--limit n]` | requêtes enregistrées (§5.7) |
+| `mimicctl diff <ancien> <nouveau> [--json] [--fail-on-breaking]` | différence entre deux documents OpenAPI (YAML ou JSON) |
+
+- `export` et `requests` ouvrent un port-forward vers le pod du contrôleur (port 8081), comme `kubectl port-forward` : même RBAC (`pods/portforward` dans `mimic-system`), aucun port exposé.
+- `--openapi-version 3.0` convertit le document 3.1 (`mimic-core::openapi::to_3_0`) : `type: [T, "null"]` devient `type: T` avec `nullable: true`, les `examples` d'un schéma deviennent `example` (le premier), `openapi` vaut `3.0.3`.
+- **Diff** (`mimic-core::diff`, fonction pure) : opérations ajoutées et supprimées, puis pour chaque opération commune les paramètres ajoutés, supprimés ou devenus requis, et les codes de réponse ajoutés ou supprimés. Sont **cassants** : une opération supprimée, un paramètre devenu requis, un paramètre requis ajouté, un code 2xx supprimé. Sortie texte triée, `--json` pour une sortie machine. Avec `--fail-on-breaking`, le code de sortie vaut 1 s'il y a un changement cassant, ce qui sert en CI à comparer la découverte d'une semaine à l'autre.
+
 ---
 
 ## 10. Stack Rust
@@ -609,8 +659,8 @@ mimic/
 │   │   └── tests/          # tests d'acceptation INF-*, RED-*, fixtures, snapshots
 │   ├── mimic-proxy/        # adaptateur réseau, store, admin API
 │   ├── mimic-init/         # règles iptables
-│   ├── mimic-injector/     # webhook (phase 3)
-│   └── mimicctl/           # CLI (phase 3)
+│   ├── mimic-injector/     # webhook d'injection
+│   └── mimicctl/           # CLI
 ├── tests/e2e/              # scénarios kind (phase P4)
 ├── deploy/                 # manifests, chart Helm du webhook
 └── docs/SPEC.md            # ce document
@@ -771,6 +821,43 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | PRX-06 | hôte dans `tls.intercept`, app faisant confiance à la CA | requête HTTPS | échange déchiffré et enregistré |
 | PRX-07 | hôte hors `tls.intercept` | requête HTTPS | tunnel opaque, seuls SNI et durée enregistrés |
 
+**Injection (INJ)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| INJ-01 | pod avec le label `app.kubernetes.io/name: checkout` et un conteneur sur le port 8080 | admission | `mimic-init` en tête avec `MIMIC_INBOUND_PORTS=8080`, native sidecar `mimic` juste après (`restartPolicy: Always`, UID 1337, `startupProbe`), `MIMIC_WORKLOAD=checkout`, volumes, annotation et label ajoutés |
+| INJ-02 | pod déjà injecté | nouvelle admission | aucun patch |
+| INJ-03 | annotation `mimic.platform.io/inject: "false"`, ou `hostNetwork`, ou conteneur `istio-proxy` | admission | aucun patch, un avertissement |
+| INJ-04 | pod sans nom de workload | admission | aucun patch, un avertissement |
+| INJ-05 | annotation `mimic.platform.io/tls-intercept: api.stripe.com` | admission | `MIMIC_TLS_INTERCEPT` dans le sidecar ; CA montée et variables de confiance dans l'app, sans écraser une variable existante |
+| INJ-06 | annotations `inbound-ports`, `exclude-outbound-cidrs`, `exclude-outbound-ports` et `config` | admission | valeurs reprises par `mimic-init`, ConfigMap monté à la place de la configuration en ligne |
+| INJ-07 | pod avec ses propres init containers | admission | `mimic-init` puis `mimic` passent avant eux, leur ordre est conservé |
+| INJ-08 | `AdmissionReview` d'un pod | `POST /mutate` en HTTPS | `allowed: true`, même `uid`, patch JSON qui s'applique au pod et donne le pod de INJ-01 |
+| INJ-09 | `MIMIC_CONFIG_YAML` et `MIMIC_TLS_INTERCEPT` définis, sans fichier | démarrage du sidecar | configuration lue comme depuis un fichier, puis surchargée par l'environnement |
+
+**CLI (CLI)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| CLI-01 | `mimicctl mode checkout mock -n shop` | construction de la requête | apply d'une `MimicWorkload` `shop/checkout` avec `spec.mode: mock`, sans snapshot |
+| CLI-02 | mode inconnu | `mimicctl mode checkout fast` | refus avant tout appel, avec la liste des modes valides |
+| CLI-03 | export d'une dépendance, puis requêtes en k6 | construction du chemin | `/v1/workloads/shop/checkout/openapi/outbound/api.stripe.com`, `/v1/workloads/shop/checkout/requests?direction=inbound&format=k6&limit=100` |
+
+**Conversion OpenAPI (OAS)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| OAS-01 | document 3.1 avec `type: [string, "null"]` et des `examples` de schéma | conversion en 3.0 | `openapi: 3.0.3`, `type: string` avec `nullable: true`, `example` ; aucun type tableau ni `examples` de schéma ne subsiste |
+
+**Diff de specs (DIF)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| DIF-01 | deux fois le même document | diff | aucune différence |
+| DIF-02 | opération supprimée, opération ajoutée | diff | les deux listées, seule la suppression est cassante |
+| DIF-03 | paramètre de query devenu requis, paramètre facultatif ajouté | diff | le premier cassant, le second non |
+| DIF-04 | code 404 ajouté, code 200 supprimé | diff | l'ajout n'est pas cassant, la suppression du 200 l'est |
+
 **E2E (E2E)**
 
 | ID | Scénario |
@@ -825,7 +912,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
 | P6b | Chargement cross-environnement, garde-fou production | E2E-04 |
-| P7 | Webhook d'injection + `mimicctl` | tests d'admission |
+| P7 | Webhook d'injection + `mimicctl` | INJ-*, CLI-*, OAS-*, DIF-* |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 
 P1 et P3 sont du Rust pur sans I/O : c'est le meilleur point d'entrée pour Claude Code, qui peut avancer en TDD strict sur des fonctions déterministes avant de toucher au réseau.
