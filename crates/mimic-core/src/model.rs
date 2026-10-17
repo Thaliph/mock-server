@@ -64,6 +64,15 @@ impl Body {
             _ => None,
         }
     }
+
+    /// Octets conservés en mémoire (body complet ou préfixe).
+    pub fn kept_bytes(&self) -> usize {
+        match self {
+            Body::Captured { data } => data.len(),
+            Body::Truncated { prefix, .. } => prefix.len(),
+            Body::Empty | Body::Skipped { .. } => 0,
+        }
+    }
 }
 
 /// Marque laissée à chaque valeur remplacée par la redaction.
@@ -112,6 +121,45 @@ impl Exchange {
     /// Premier header de réponse portant ce nom (insensible à la casse).
     pub fn resp_header(&self, name: &str) -> Option<&str> {
         find_header(&self.resp_headers, name)
+    }
+
+    /// Taille estimée en mémoire, en octets : la structure, chaque chaîne et chaque body,
+    /// avec un surcoût forfaitaire par allocation. Sert au budget du store (spec §5.2).
+    pub fn approx_bytes(&self) -> usize {
+        // Surcoût moyen de l'allocateur pour un bloc sur le tas.
+        const ALLOC: usize = 16;
+        let s = |v: &str| if v.is_empty() { 0 } else { v.len() + ALLOC };
+        let headers = |h: &[Header]| -> usize {
+            h.iter()
+                .map(|h| size_of::<Header>() + s(&h.name) + s(&h.value))
+                .sum::<usize>()
+                + if h.is_empty() { 0 } else { ALLOC }
+        };
+        let body = |b: &Body| match b.kept_bytes() {
+            0 => 0,
+            n => n + ALLOC,
+        };
+        size_of::<Exchange>()
+            + s(&self.id)
+            + s(&self.scheme)
+            + s(&self.authority)
+            + s(&self.method)
+            + s(&self.path)
+            + self
+                .query
+                .iter()
+                .map(|(k, v)| size_of::<(String, String)>() + s(k) + s(v))
+                .sum::<usize>()
+            + headers(&self.req_headers)
+            + headers(&self.resp_headers)
+            + body(&self.req_body)
+            + body(&self.resp_body)
+            + self.trace_id.as_deref().map_or(0, s)
+            + self
+                .redactions
+                .iter()
+                .map(|r| size_of::<RedactionMark>() + s(&r.location))
+                .sum::<usize>()
     }
 }
 
