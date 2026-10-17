@@ -719,7 +719,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-05 | `latency.factor: 2` | 1 000 requêtes | p50 entre 180 et 220 ms |
 | MCK-06 | stratégie `sequence`, enregistrement POST puis GET | rejeu | réponses servies dans l'ordre d'origine |
 | MCK-07 | distribution 98 % 200 / 2 % 429, `weighted-status` | 10 000 requêtes | 429 entre 1,5 % et 2,5 % |
-| MCK-08 | réponse enregistrée gzip | rejeu | `Content-Encoding: gzip` conservé, body identique |
+| MCK-08 | réponse enregistrée gzip, br ou zstd | rejeu | `Content-Encoding` conservé, body identique une fois décodé |
 
 **Moteur de mock, niveau `mimic-core` (MCK, suite)**
 

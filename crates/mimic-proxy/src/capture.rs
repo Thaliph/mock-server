@@ -21,7 +21,7 @@ pub struct Captured {
 }
 
 impl Captured {
-    /// Conversion vers le modèle, en décodant `gzip`/`deflate` si nécessaire.
+    /// Conversion vers le modèle, en décodant `gzip`, `deflate`, `br` ou `zstd` si nécessaire.
     pub fn into_body(self, keep: bool, limit: usize, content_encoding: Option<&str>) -> Body {
         if self.size == 0 {
             return Body::Empty;
@@ -57,6 +57,11 @@ fn decode(encoding: &str, data: &[u8], limit: usize) -> Option<Vec<u8>> {
         "deflate" => flate2::read::ZlibDecoder::new(data)
             .take(limit as u64 + 1)
             .read_to_end(&mut out),
+        "br" => brotli::Decompressor::new(data, 4096)
+            .take(limit as u64 + 1)
+            .read_to_end(&mut out),
+        "zstd" => zstd::stream::read::Decoder::new(data)
+            .and_then(|d| d.take(limit as u64 + 1).read_to_end(&mut out)),
         _ => return None,
     };
     (read.is_ok() && out.len() <= limit).then_some(out)
@@ -76,6 +81,15 @@ pub fn encode(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
             e.write_all(data).ok()?;
             e.finish().ok()
         }
+        "br" => {
+            let mut out = Vec::new();
+            let mut e = brotli::CompressorWriter::new(&mut out, 4096, 1, 22);
+            e.write_all(data).ok()?;
+            e.flush().ok()?;
+            drop(e);
+            Some(out)
+        }
+        "zstd" => zstd::encode_all(data, 1).ok(),
         "identity" => Some(data.to_vec()),
         _ => None,
     }
