@@ -215,7 +215,9 @@ async fn forward(
     let response = match state.client.request(Request::from_parts(parts, body)).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(authority = %target.authority, error = %e, "échec vers l'amont");
+            if let Some(omitted) = state.upstream_log.allow(Instant::now()) {
+                tracing::warn!(authority = %target.authority, error = %e, omitted, "échec vers l'amont");
+            }
             state
                 .metrics
                 .upstream_errors
@@ -504,7 +506,9 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
             }
             Err(e) => {
-                tracing::warn!(%authority, error = %e, "tunnel vers l'amont impossible");
+                if let Some(omitted) = state.upstream_log.allow(Instant::now()) {
+                    tracing::warn!(%authority, error = %e, omitted, "tunnel vers l'amont impossible");
+                }
                 state
                     .metrics
                     .upstream_errors
@@ -559,7 +563,9 @@ pub async fn tunnel(
             let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
         }
         Err(e) => {
-            tracing::warn!(%target, error = %e, "tunnel impossible");
+            if let Some(omitted) = state.upstream_log.allow(Instant::now()) {
+                tracing::warn!(%target, error = %e, omitted, "tunnel impossible");
+            }
             count("error");
         }
     }

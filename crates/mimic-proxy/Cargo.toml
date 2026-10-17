@@ -39,5 +39,6 @@ workspace = true
 [dev-dependencies]
 mimic-controller = { version = "0.1.0", path = "../mimic-controller" }
 axum = "0.8.9"
+nix = { version = "0.31.3", features = ["resource"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 tempfile = "3.27.0"

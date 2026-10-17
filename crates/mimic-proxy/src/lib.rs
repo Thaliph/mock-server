@@ -12,6 +12,7 @@ pub mod proxy;
 pub mod share;
 pub mod state;
 pub mod store;
+pub mod throttle;
 pub mod tls;
 pub mod watch;
 
@@ -154,14 +155,10 @@ async fn serve(listener: TcpListener, state: Arc<AppState>, kind: Listener) {
         Ok(a) => a,
         Err(_) => return,
     };
+    // Erreur d'accept (EMFILE sous un tir) : pause et log limité plutôt qu'une boucle à vide.
+    let errors = throttle::LogLimiter::per_second();
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "accept échoué");
-                continue;
-            }
-        };
+        let (stream, peer) = throttle::accept_with_backoff(|| listener.accept(), &errors).await;
         let _ = stream.set_nodelay(true);
         let info = ConnInfo {
             listen,

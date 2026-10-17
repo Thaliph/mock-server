@@ -19,6 +19,7 @@ use serde_json::Value;
 use crate::config::{Config, Mode};
 use crate::metrics::{DiscoveryLabels, Metrics, OriginLabel};
 use crate::store::Store;
+use crate::throttle::LogLimiter;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = UnsyncBoxBody<bytes::Bytes, BoxError>;
@@ -53,6 +54,8 @@ pub struct AppState {
     pub share_status: Mutex<ShareStatus>,
     /// Réveille la boucle de partage (`POST /share/sync`).
     pub share_notify: tokio::sync::Notify,
+    /// Logs d'échec vers l'amont, limités en débit (spec §9.3).
+    pub upstream_log: LogLimiter,
 }
 
 /// Source du moteur de mock en cache.
@@ -138,6 +141,7 @@ impl AppState {
             discovery: Mutex::new(None),
             share_status: Mutex::new(share_status),
             share_notify: tokio::sync::Notify::new(),
+            upstream_log: LogLimiter::per_second(),
             tls,
         }))
     }
