@@ -63,24 +63,27 @@ fn refuse(ctl: &Ctl, e: AuthError) -> Response {
 }
 
 /// Authentifie, valide les noms, puis vérifie que l'appelant agit pour lui-même.
+/// La réponse de refus est boîtée : `Response` est trop volumineuse pour un `Err`.
 async fn guard(
     ctl: &Ctl,
     headers: &HeaderMap,
     ns: &str,
     wl: &str,
     instance: Option<&str>,
-) -> Result<(), Response> {
-    let token = bearer(headers).ok_or_else(|| refuse(ctl, AuthError::Missing))?;
+) -> Result<(), Box<Response>> {
+    let token = bearer(headers).ok_or_else(|| Box::new(refuse(ctl, AuthError::Missing)))?;
     let id = ctl
         .auth
         .authenticate(token)
         .await
-        .map_err(|e| refuse(ctl, e))?;
+        .map_err(|e| Box::new(refuse(ctl, e)))?;
     let names_ok = valid_name(ns) && valid_name(wl) && instance.is_none_or(valid_name);
     if !names_ok {
-        return Err((StatusCode::BAD_REQUEST, "nom invalide").into_response());
+        return Err(Box::new(
+            (StatusCode::BAD_REQUEST, "nom invalide").into_response(),
+        ));
     }
-    authorize(&id, ns, wl, instance).map_err(|e| refuse(ctl, e))
+    authorize(&id, ns, wl, instance).map_err(|e| Box::new(refuse(ctl, e)))
 }
 
 #[derive(Deserialize)]
@@ -96,7 +99,7 @@ async fn post_segment(
     body: Bytes,
 ) -> Response {
     if let Err(r) = guard(&ctl, &headers, &ns, &wl, Some(&q.instance)).await {
-        return r;
+        return *r;
     }
     let result = ctl.ingest(&ns, &wl, &q.instance, &body).await;
     let label = if result.is_ok() { "ok" } else { "error" };
@@ -118,7 +121,7 @@ async fn list_segments(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = guard(&ctl, &headers, &ns, &wl, None).await {
-        return r;
+        return *r;
     }
     match ctl.segments(&ns, &wl).await {
         Ok(list) => axum::Json(list).into_response(),
@@ -132,7 +135,7 @@ async fn get_segment(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = guard(&ctl, &headers, &ns, &wl, None).await {
-        return r;
+        return *r;
     }
     if !valid_name(&instance) || !valid_name(&file) {
         return (StatusCode::BAD_REQUEST, "nom invalide").into_response();
@@ -157,7 +160,7 @@ async fn heartbeat(
     axum::Json(hb): axum::Json<Heartbeat>,
 ) -> Response {
     if let Err(r) = guard(&ctl, &headers, &ns, &wl, Some(&hb.instance)).await {
-        return r;
+        return *r;
     }
     let desired = ctl
         .heartbeat(
@@ -179,7 +182,7 @@ async fn get_snapshot(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = guard(&ctl, &headers, &ns, &wl, None).await {
-        return r;
+        return *r;
     }
     snapshot_response(&ctl, &ns, &wl, &id).await
 }
