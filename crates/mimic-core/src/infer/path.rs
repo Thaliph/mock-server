@@ -54,6 +54,11 @@ impl SegmentKind {
     }
 }
 
+/// Vrai si le segment ressemble à un identifiant (entier, UUID, ULID, hex, base64url, date).
+pub fn is_identifier(s: &str) -> bool {
+    SegmentKind::of(s).is_identifier(s)
+}
+
 /// Description d'un paramètre de chemin d'un template.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathParam {
