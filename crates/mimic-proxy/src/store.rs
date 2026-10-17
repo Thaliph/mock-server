@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mimic_core::model::{Body, Direction, Exchange};
+use mimic_core::compact::{body_key, has_body, strip_bodies};
+use mimic_core::model::{Direction, Exchange};
 
 /// Provenance d'un échange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +106,9 @@ impl Store {
                 return Added::Duplicate;
             }
             let key = body_key(&e);
-            let has_body = has_body_any(&e);
+            let with_body = has_body(&e);
             let mut result = Added::Stored;
-            if has_body {
+            if with_body {
                 let samples = inner.samples;
                 let count = inner.bodies.entry(key).or_default();
                 if *count >= samples {
@@ -134,7 +135,7 @@ impl Store {
             while inner.list.len() > inner.max {
                 if let Some((old, o)) = inner.list.pop_front() {
                     inner.ids.remove(&old.id);
-                    if has_body_any(&old)
+                    if has_body(&old)
                         && let Some(c) = inner.bodies.get_mut(&body_key(&old))
                     {
                         *c = c.saturating_sub(1);
@@ -237,32 +238,10 @@ impl Store {
     }
 }
 
-fn body_key(e: &Exchange) -> String {
-    format!(
-        "{:?}|{}|{}|{}|{}",
-        e.direction, e.authority, e.method, e.path, e.status
-    )
-}
-
-fn has_body_any(e: &Exchange) -> bool {
-    matches!(e.req_body, Body::Captured { .. } | Body::Truncated { .. })
-        || matches!(e.resp_body, Body::Captured { .. } | Body::Truncated { .. })
-}
-
-fn strip_bodies(e: &mut Exchange) {
-    for b in [&mut e.req_body, &mut e.resp_body] {
-        let size = match b {
-            Body::Captured { data } => data.len() as u64,
-            Body::Truncated { size, .. } => *size,
-            _ => continue,
-        };
-        *b = Body::Skipped { size };
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mimic_core::model::Body;
 
     fn ex(id: &str, path: &str) -> Exchange {
         Exchange {

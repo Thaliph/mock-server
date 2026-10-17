@@ -1,5 +1,6 @@
 //! Requêtes enregistrées et rejeu (spec §5.7).
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine;
@@ -22,21 +23,33 @@ const NOT_REPLAYED: &[&str] = &[
     "upgrade",
 ];
 
-/// Échanges d'une direction, sans doublon, les plus récents d'abord.
-pub fn recent_requests(
-    exchanges: impl IntoIterator<Item = Exchange>,
+/// Échanges d'une direction, sans doublon, les plus récents d'abord. Accepte des échanges
+/// ou des références (`E: Borrow<Exchange>`) et rend les mêmes éléments, sans copie.
+pub fn recent_requests<E: Borrow<Exchange>>(
+    exchanges: impl IntoIterator<Item = E>,
     direction: Direction,
     limit: usize,
-) -> Vec<Exchange> {
-    let mut list: Vec<Exchange> = exchanges
+) -> Vec<E> {
+    let mut list: Vec<E> = exchanges
         .into_iter()
-        .filter(|e| e.direction == direction)
+        .filter(|e| e.borrow().direction == direction)
         .collect();
-    list.sort_by(|a, b| (b.started_at_ms, &b.id).cmp(&(a.started_at_ms, &a.id)));
+    list.sort_by(|a, b| {
+        let (a, b) = (a.borrow(), b.borrow());
+        (b.started_at_ms, &b.id).cmp(&(a.started_at_ms, &a.id))
+    });
+    // Premiers `limit` identifiants distincts : la déduplication s'arrête à la limite.
     let mut seen = BTreeSet::new();
-    list.retain(|e| seen.insert(e.id.clone()));
-    list.truncate(limit);
-    list
+    let mut out = Vec::with_capacity(limit.min(list.len()));
+    for e in list {
+        if out.len() >= limit {
+            break;
+        }
+        if seen.insert(e.borrow().id.clone()) {
+            out.push(e);
+        }
+    }
+    out
 }
 
 /// Script k6 qui rejoue les requêtes dans l'ordre d'enregistrement.

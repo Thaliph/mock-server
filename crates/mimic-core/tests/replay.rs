@@ -25,6 +25,9 @@ fn rpl_01_most_recent_first_inbound_only_without_duplicates() {
     let r = recent_requests(list, Direction::Inbound, 10);
     let ids: Vec<_> = r.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, ["pod-b-1", "pod-a-2", "pod-a-1"]);
+    // Sur des références (contrôleur, §5.5.2) : mêmes éléments, sans copie.
+    let refs = recent_requests(r.iter(), Direction::Inbound, 2);
+    assert_eq!(refs, r.iter().take(2).collect::<Vec<_>>());
     let r = recent_requests(r, Direction::Inbound, 2);
     assert_eq!(r.len(), 2);
 }

@@ -95,6 +95,8 @@ proptest! {
             shuffled.push(first.clone());
         }
         let opts = SnapshotOptions { max_per_key: 5 };
+        // Le contrôleur construit sur des références (§5.5.2) : même snapshot.
+        prop_assert_eq!(build(&shuffled, &opts), build(recs.clone(), &opts));
         prop_assert_eq!(build(recs, &opts), build(shuffled, &opts));
     }
 }
