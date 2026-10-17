@@ -5,7 +5,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use mimic_core::model::Exchange;
+use mimic_core::model::{Body, Exchange};
 use mimic_proxy::config::{Mode, Unmatched};
 use serde_json::{Value, json};
 
@@ -113,6 +113,68 @@ async fn prx_upstream_down_gives_502_and_metric() {
     assert_eq!(r.status(), 502);
     let m = metrics(&p).await;
     assert!(m.contains("mimic_upstream_errors_total{"), "{m}");
+}
+
+#[tokio::test]
+async fn cap_03_full_reservoir_bodies_are_neither_decoded_nor_redacted() {
+    let app = fake_server().await;
+    let mut cfg = config(Some(app.addr), Mode::Record);
+    cfg.capture.samples_per_operation = 0;
+    cfg.capture.max_body_bytes = 256;
+    let p = proxy(cfg).await;
+    let c = client();
+    c.post(inbound(&p, "/echo"))
+        .header("authorization", "Bearer top-secret-token")
+        .json(&json!({"email": "jane@example.com"}))
+        .send()
+        .await
+        .unwrap();
+    c.post(inbound(&p, "/echo"))
+        .json(&json!({"pad": "x".repeat(1000)}))
+        .send()
+        .await
+        .unwrap();
+    let list: Vec<Exchange> = wait_exchanges(&p, "direction=inbound", 2)
+        .await
+        .iter()
+        .map(decode)
+        .collect();
+    for e in &list {
+        assert!(
+            matches!(e.req_body, Body::Skipped { .. }),
+            "{:?}",
+            e.req_body
+        );
+        assert!(
+            matches!(e.resp_body, Body::Skipped { .. }),
+            "{:?}",
+            e.resp_body
+        );
+        assert!(
+            e.redactions.iter().all(|m| !m.location.contains("body")),
+            "body redacté puis jeté : {:?}",
+            e.redactions
+        );
+    }
+    // Les headers sont redactés dans tous les cas.
+    assert!(list.iter().any(|e| {
+        e.redactions
+            .iter()
+            .any(|m| m.location.contains("authorization"))
+    }));
+    let m = metrics(&p).await;
+    let reason = |r: &str| {
+        metric_value(
+            &m,
+            &format!("mimic_capture_dropped_total{{reason=\"{r}\"}}"),
+        )
+    };
+    assert_eq!(reason("sample_limit"), Some(2.0));
+    assert_eq!(
+        reason("truncated"),
+        None,
+        "body tronqué alors qu'il est jeté"
+    );
 }
 
 /// Journal de test : les lignes de log émises sur ce fil (runtime courant).

@@ -290,13 +290,24 @@ async fn finalize(
     let total = resp.ended.saturating_duration_since(p.started);
     observe_duration(&state, p.direction, p.mode, &p.authority_label, total);
     let capture = &state.config.capture;
+    let id = format!("{}-{}", state.config.instance, ulid::Ulid::generate());
+    let path = p.uri.path().to_string();
+    // Réservoir de l'opération : un body qui ne serait pas gardé n'est ni décodé, ni parsé,
+    // ni redacté (spec §5.2).
+    let keep = capture.bodies
+        && state
+            .store
+            .wants_bodies(p.direction, &p.authority, &p.method, &path, p.status, &id);
+    if capture.bodies && !keep && (req.size > 0 || resp.size > 0) {
+        dropped(&state, "sample_limit");
+    }
     let req_body = req.into_body(
-        capture.bodies,
+        keep,
         capture.max_body_bytes,
         find(&p.req_headers, "content-encoding"),
     );
     let resp_body = resp.into_body(
-        capture.bodies,
+        keep,
         capture.max_body_bytes,
         find(&p.resp_headers, "content-encoding"),
     );
@@ -306,13 +317,13 @@ async fn finalize(
         }
     }
     let mut exchange = Exchange {
-        id: format!("{}-{}", state.config.instance, ulid::Ulid::generate()),
+        id,
         direction: p.direction,
         started_at_ms: p.started_ms,
         scheme: p.scheme,
         authority: p.authority,
         method: p.method,
-        path: p.uri.path().to_string(),
+        path,
         query: parse_query(p.uri.query()),
         trace_id: find(&p.req_headers, "traceparent")
             .and_then(|t| t.split('-').nth(1))

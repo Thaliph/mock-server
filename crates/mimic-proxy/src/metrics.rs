@@ -104,6 +104,7 @@ pub struct Metrics {
     pub mock_latency: HistogramFamily<AuthorityLabel>,
     pub discovered_operations: Family<DiscoveryLabels, Gauge>,
     pub store_exchanges: Family<OriginLabel, Gauge>,
+    pub store_bytes: Gauge,
     pub capture_dropped: Family<ReasonLabel, Counter>,
     pub share_sync: Family<ResultLabel, Counter>,
     pub share_peers: Gauge,
@@ -126,6 +127,7 @@ impl Metrics {
             Family::new_with_constructor(latency_histogram);
         let discovered_operations = Family::default();
         let store_exchanges = Family::default();
+        let store_bytes = Gauge::default();
         let capture_dropped = Family::default();
         let share_sync = Family::default();
         let share_peers = Gauge::default();
@@ -169,6 +171,11 @@ impl Metrics {
             store_exchanges.clone(),
         );
         registry.register(
+            "mimic_store_bytes",
+            "Octets estimés des échanges en mémoire",
+            store_bytes.clone(),
+        );
+        registry.register(
             "mimic_capture_dropped",
             "Captures abandonnées ou réduites",
             capture_dropped.clone(),
@@ -208,6 +215,7 @@ impl Metrics {
             mock_latency,
             discovered_operations,
             store_exchanges,
+            store_bytes,
             capture_dropped,
             share_sync,
             share_peers,
@@ -230,6 +238,15 @@ impl Metrics {
         }
         seen.insert(authority.to_string());
         authority.to_string()
+    }
+
+    /// Compteur `mimic_capture_dropped_total` d'une raison.
+    pub fn dropped(&self, reason: &str) -> Counter {
+        self.capture_dropped
+            .get_or_create(&ReasonLabel {
+                reason: reason.into(),
+            })
+            .clone()
     }
 
     pub fn set_mode(&self, current: Mode) {

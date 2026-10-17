@@ -6,6 +6,7 @@ pub mod admin;
 pub mod capture;
 pub mod config;
 pub mod control;
+pub mod journal;
 pub mod metrics;
 pub mod net;
 pub mod proxy;
@@ -70,6 +71,7 @@ impl Running {
         for t in self.tasks {
             t.abort();
         }
+        self.state.store.sync_journal();
     }
 }
 
@@ -78,9 +80,14 @@ pub async fn start(config: Config) -> Result<Running, String> {
     config.validate()?;
     let state = AppState::new(config)?;
     if let Some(dir) = &state.config.store.dir {
+        let journal = journal::JournalConfig::new(
+            dir,
+            state.config.store.segment_bytes,
+            state.config.store.max_segments,
+        );
         let loaded = state
             .store
-            .persist_to(dir)
+            .persist_to(&journal)
             .map_err(|e| format!("store {}: {e}", dir.display()))?;
         tracing::info!(loaded, dir = %dir.display(), "store local rechargé");
     }
