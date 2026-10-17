@@ -208,13 +208,6 @@ impl Store {
         std::mem::take(&mut self.lock().unshared)
     }
 
-    /// Remet des échanges en tête de la file de publication (publication échouée).
-    pub fn restore_unshared(&self, mut list: Vec<Exchange>) {
-        let mut inner = self.lock();
-        list.append(&mut inner.unshared);
-        inner.unshared = list;
-    }
-
     pub fn clear(&self) {
         let mut inner = self.lock();
         inner.list.clear();

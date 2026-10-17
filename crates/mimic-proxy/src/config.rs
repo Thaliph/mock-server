@@ -275,6 +275,9 @@ pub struct ShareConfig {
     /// Autorise un contrôleur en `http://` : tests uniquement.
     #[serde(default)]
     pub allow_insecure: bool,
+    /// Échanges en attente de publication, au plus : au-delà, les plus anciens sont abandonnés.
+    #[serde(default = "default_max_pending")]
+    pub max_pending: usize,
 }
 
 impl Default for ShareConfig {
@@ -287,6 +290,7 @@ impl Default for ShareConfig {
             ca_file: None,
             token_file: None,
             allow_insecure: false,
+            max_pending: default_max_pending(),
         }
     }
 }
@@ -307,6 +311,10 @@ impl Config {
 
 fn default_mode_poll() -> Duration {
     Duration::from_secs(2)
+}
+
+fn default_max_pending() -> usize {
+    50_000
 }
 
 fn default_share_interval() -> Duration {

@@ -132,15 +132,21 @@ impl ControllerClient {
         Ok(bytes)
     }
 
-    pub async fn put_segment(&self, body: Vec<u8>) -> Result<(), String> {
-        let path = format!("/segments?instance={}", self.instance);
+    /// Publie un segment sous son identifiant : une reprise du même segment est sans effet.
+    pub async fn put_segment(&self, id: &str, body: Vec<u8>) -> Result<(), String> {
+        let path = format!("/segments?instance={}&segment={id}", self.instance);
         self.call(Method::POST, &path, Some((body, "application/x-ndjson")))
             .await
             .map(|_| ())
     }
 
-    pub async fn segments(&self) -> Result<Vec<Segment>, String> {
-        let b = self.call(Method::GET, "/segments", None).await?;
+    /// Segments du workload ; avec `since_ms`, seulement ceux modifiés depuis.
+    pub async fn segments(&self, since_ms: Option<i64>) -> Result<Vec<Segment>, String> {
+        let path = match since_ms {
+            Some(ms) => format!("/segments?since_ms={ms}"),
+            None => "/segments".to_string(),
+        };
+        let b = self.call(Method::GET, &path, None).await?;
         serde_json::from_slice(&b).map_err(|e| format!("liste des segments: {e}"))
     }
 

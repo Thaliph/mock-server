@@ -53,6 +53,8 @@ pub struct AppState {
     pub share_status: Mutex<ShareStatus>,
     /// Réveille la boucle de partage (`POST /share/sync`).
     pub share_notify: tokio::sync::Notify,
+    /// Segments en attente de publication, bornés par `share.max_pending`.
+    pub share_outbox: Mutex<crate::share::Outbox>,
 }
 
 /// Source du moteur de mock en cache.
@@ -138,6 +140,7 @@ impl AppState {
             discovery: Mutex::new(None),
             share_status: Mutex::new(share_status),
             share_notify: tokio::sync::Notify::new(),
+            share_outbox: Mutex::new(Default::default()),
             tls,
         }))
     }
