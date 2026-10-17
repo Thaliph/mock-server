@@ -19,7 +19,10 @@ data:
       latency_factor: 1.0
     store:
       dir: /var/lib/mimic
+    # Partage, bascule et snapshots passent par le contrôleur (spec §5.5, §7.1).
     share:
-      url: s3://mimic-recordings/cluster-a
+      url: https://mimic-controller.mimic-system.svc:8443
+      ca_file: /etc/mimic-ca/ca.crt
+      token_file: /var/run/secrets/mimic/token
       interval: 10
-    annotations_file: /etc/podinfo/annotations
+      mode_poll: 2

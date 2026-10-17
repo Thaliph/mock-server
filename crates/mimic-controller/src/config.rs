@@ -1,0 +1,155 @@
+//! Configuration du contrôleur (spec §9.1).
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ControllerConfig {
+    /// API des sidecars (HTTPS si `tls` est renseigné).
+    pub listen: SocketAddr,
+    /// Interface en lecture seule ; liée à la boucle locale, joignable par port-forward.
+    pub ui_listen: SocketAddr,
+    pub tls: Option<TlsFiles>,
+    pub auth: AuthConfig,
+    /// `file:///chemin` ou `s3://bucket/prefixe`.
+    pub store: String,
+    #[serde(with = "duration_secs")]
+    pub retention: Duration,
+    pub max_exchanges_per_workload: usize,
+    pub snapshot: SnapshotConfig,
+    /// Un pod sans battement depuis ce délai est affiché absent.
+    #[serde(with = "duration_secs")]
+    pub pod_timeout: Duration,
+}
+
+impl Default for ControllerConfig {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:8443".parse().expect("adresse valide"),
+            ui_listen: "127.0.0.1:8081".parse().expect("adresse valide"),
+            tls: None,
+            auth: AuthConfig::Kubernetes,
+            store: "file:///var/lib/mimic-controller".into(),
+            retention: Duration::from_secs(7 * 24 * 3600),
+            max_exchanges_per_workload: 200_000,
+            snapshot: SnapshotConfig::default(),
+            pod_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsFiles {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SnapshotConfig {
+    pub max_per_key: usize,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self { max_per_key: 50 }
+    }
+}
+
+/// Authentification des sidecars (spec §7.1).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum AuthConfig {
+    /// Jetons de ServiceAccount validés par `TokenReview` ; active aussi la surveillance
+    /// des ressources `MimicWorkload`.
+    #[default]
+    Kubernetes,
+    /// Jetons fixes, pour les tests et le développement hors cluster.
+    Static { tokens: BTreeMap<String, Identity> },
+}
+
+/// Pod authentifié.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub namespace: String,
+    pub pod: String,
+    pub workload: String,
+}
+
+impl ControllerConfig {
+    pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
+        let config: Self = match path {
+            Some(p) => {
+                let text = std::fs::read_to_string(p)
+                    .map_err(|e| format!("lecture de {}: {e}", p.display()))?;
+                serde_yaml::from_str(&text)
+                    .map_err(|e| format!("configuration {} invalide: {e}", p.display()))?
+            }
+            None => Self::default(),
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.store.starts_with("file://") && !self.store.starts_with("s3://") {
+            return Err(format!("store non supporté: {}", self.store));
+        }
+        if self.snapshot.max_per_key == 0 {
+            return Err("snapshot.max_per_key doit être positif".into());
+        }
+        if matches!(self.auth, AuthConfig::Kubernetes) && self.tls.is_none() {
+            return Err(
+                "auth kubernetes exige tls : les sidecars n'acceptent le contrôleur qu'en HTTPS"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Durées exprimées en secondes dans le YAML.
+mod duration_secs {
+    use super::*;
+    use serde::Deserializer;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let secs = f64::deserialize(d)?;
+        Duration::try_from_secs_f64(secs).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kubernetes_auth_requires_tls() {
+        assert!(ControllerConfig::default().validate().is_err());
+        let c = ControllerConfig {
+            tls: Some(TlsFiles {
+                cert_file: "c".into(),
+                key_file: "k".into(),
+            }),
+            ..ControllerConfig::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn yaml_example() {
+        let c: ControllerConfig = serde_yaml::from_str(
+            "listen: 0.0.0.0:8443\nauth: { kind: static, tokens: { t: { namespace: a, pod: p, workload: w } } }\nretention: 60\nsnapshot: { max_per_key: 5 }\n",
+        )
+        .unwrap();
+        assert_eq!(c.retention, Duration::from_secs(60));
+        assert_eq!(c.snapshot.max_per_key, 5);
+        assert!(matches!(c.auth, AuthConfig::Static { .. }));
+    }
+}

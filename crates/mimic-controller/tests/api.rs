@@ -1,0 +1,588 @@
+//! Critères CTL-*, SEC-02, SEC-03, SEC-06 et RPL-* de la spec (§5.5 à §5.7, §7.1),
+//! au niveau de l'API du contrôleur.
+
+use std::collections::BTreeMap;
+
+use mimic_controller::config::{AuthConfig, ControllerConfig, Identity};
+use mimic_controller::reconcile::MimicWorkloadSpec;
+use mimic_controller::{Running, start};
+use serde_json::{Value, json};
+
+const WL: &str = "/v1/workloads/shop/checkout";
+
+fn identity(ns: &str, pod: &str, workload: &str) -> Identity {
+    Identity {
+        namespace: ns.into(),
+        pod: pod.into(),
+        workload: workload.into(),
+    }
+}
+
+async fn controller(dir: &std::path::Path) -> Running {
+    let tokens = BTreeMap::from([
+        (
+            "tok-a".to_string(),
+            identity("shop", "checkout-a", "checkout"),
+        ),
+        (
+            "tok-b".to_string(),
+            identity("shop", "checkout-b", "checkout"),
+        ),
+        ("tok-web".to_string(), identity("shop", "web-a", "web")),
+        (
+            "tok-other-ns".to_string(),
+            identity("bank", "checkout-a", "checkout"),
+        ),
+    ]);
+    start(ControllerConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        ui_listen: "127.0.0.1:0".parse().unwrap(),
+        store: format!("file://{}", dir.display()),
+        auth: AuthConfig::Static { tokens },
+        ..ControllerConfig::default()
+    })
+    .await
+    .unwrap()
+}
+
+/// Route de l'API des sidecars.
+fn url(c: &Running, path: &str) -> String {
+    format!("http://{}{path}", c.api_addr())
+}
+
+/// Route de l'interface en lecture seule.
+fn ui(c: &Running, path: &str) -> String {
+    format!("http://{}{path}", c.ui_addr())
+}
+
+fn token_of(instance: &str) -> &'static str {
+    match instance {
+        "checkout-a" => "tok-a",
+        "checkout-b" => "tok-b",
+        _ => "inconnu",
+    }
+}
+
+async fn set_mode(c: &Running, mode: &str, snapshot: Option<&str>) -> Value {
+    c.apply_spec(
+        "shop",
+        "checkout",
+        Some(MimicWorkloadSpec {
+            mode: mode.into(),
+            snapshot: snapshot.map(Into::into),
+        }),
+    )
+    .await;
+    get_json(c, &format!("{WL}/mode")).await
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+/// Échange minimal au format du store, tel qu'un sidecar l'envoie.
+fn exchange(id: &str, direction: &str, method: &str, path: &str, query: Value, at: u64) -> Value {
+    json!({
+        "id": id, "direction": direction, "started_at_ms": at, "scheme": "http",
+        "authority": if direction == "outbound" { "api.saas.io:443" } else { "checkout:8080" },
+        "method": method, "path": path, "query": query,
+        "req_headers": [{"name": "authorization", "value": "<redacted:sha256:0123abcd>"}],
+        "req_body": {"kind": "empty"},
+        "status": 200,
+        "resp_headers": [{"name": "content-type", "value": "application/json"}],
+        "resp_body": {"kind": "captured", "data": "eyJpZCI6N30="},
+        "ttfb_us": 1000, "total_us": 2000, "trace_id": null
+    })
+}
+
+async fn push(c: &Running, instance: &str, exchanges: &[Value]) {
+    let body: String = exchanges.iter().map(|e| format!("{e}\n")).collect();
+    let r = client()
+        .post(url(c, &format!("{WL}/segments?instance={instance}")))
+        .bearer_auth(token_of(instance))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201, "{}", r.text().await.unwrap());
+}
+
+/// Lecture sur l'interface.
+async fn get_json(c: &Running, path: &str) -> Value {
+    let r = client().get(ui(c, path)).send().await.unwrap();
+    assert!(r.status().is_success(), "{path}: {}", r.status());
+    r.json().await.unwrap()
+}
+
+async fn heartbeat(c: &Running, instance: &str, mode: &str, snapshot: Option<&str>) -> Value {
+    client()
+        .post(url(c, &format!("{WL}/heartbeat")))
+        .bearer_auth(token_of(instance))
+        .json(&json!({"instance": instance, "mode": mode, "snapshot": snapshot}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn segments_are_listed_and_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    push(
+        &c,
+        "checkout-a",
+        &[exchange(
+            "checkout-a-1",
+            "inbound",
+            "GET",
+            "/a",
+            json!([]),
+            1,
+        )],
+    )
+    .await;
+    let list: Value = client()
+        .get(url(&c, &format!("{WL}/segments")))
+        .bearer_auth("tok-b")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let seg = &list.as_array().unwrap()[0];
+    assert_eq!(seg["instance"], "checkout-a");
+    let key = seg["key"].as_str().unwrap();
+    let body = client()
+        .get(url(&c, &format!("{WL}/segments/{key}")))
+        .bearer_auth("tok-b")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("checkout-a-1"));
+}
+
+#[tokio::test]
+async fn invalid_segments_and_instances_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    let r = client()
+        .post(url(&c, &format!("{WL}/segments?instance=checkout-a")))
+        .bearer_auth("tok-a")
+        .body("pas du json\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = client()
+        .post(url(&c, &format!("{WL}/segments?instance=../x")))
+        .bearer_auth("tok-a")
+        .body("")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+}
+
+#[tokio::test]
+async fn without_resource_sidecars_are_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    assert_eq!(
+        heartbeat(&c, "checkout-a", "record", None).await,
+        json!({"mode": null, "snapshot": null})
+    );
+    // L'interface ne permet aucune écriture.
+    let r = client()
+        .put(ui(&c, &format!("{WL}/mode")))
+        .json(&json!({"mode": "mock"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error());
+    let r = client()
+        .put(url(&c, &format!("{WL}/mode")))
+        .bearer_auth("tok-a")
+        .json(&json!({"mode": "mock"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error());
+}
+
+#[tokio::test]
+async fn sec_02_missing_or_invalid_token_is_401() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    let r = client()
+        .get(url(&c, &format!("{WL}/segments")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let r = client()
+        .post(url(&c, &format!("{WL}/heartbeat")))
+        .bearer_auth("faux")
+        .json(&json!({"instance": "checkout-a", "mode": "record", "snapshot": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let r = client().get(url(&c, "/healthz")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let m = client()
+        .get(ui(&c, "/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains(r#"mimic_controller_auth_failures_total{reason="missing"} 1"#),
+        "{m}"
+    );
+    assert!(
+        m.contains(r#"mimic_controller_auth_failures_total{reason="invalid"} 1"#),
+        "{m}"
+    );
+}
+
+#[tokio::test]
+async fn sec_03_token_is_bound_to_its_pod_and_workload() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    let body = format!(
+        "{}\n",
+        exchange("checkout-a-1", "inbound", "GET", "/a", json!([]), 1)
+    );
+    // Autre workload du même namespace.
+    let r = client()
+        .post(url(&c, &format!("{WL}/segments?instance=web-a")))
+        .bearer_auth("tok-web")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    // Même nom de workload, autre namespace.
+    let r = client()
+        .get(url(&c, &format!("{WL}/segments")))
+        .bearer_auth("tok-other-ns")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    // Bon workload, mais au nom d'une autre instance.
+    let r = client()
+        .post(url(&c, &format!("{WL}/segments?instance=checkout-b")))
+        .bearer_auth("tok-a")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    let r = client()
+        .post(url(&c, &format!("{WL}/heartbeat")))
+        .bearer_auth("tok-a")
+        .json(&json!({"instance": "checkout-b", "mode": "record", "snapshot": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+}
+
+#[tokio::test]
+async fn sec_06_ui_is_bound_to_loopback_by_default() {
+    let config = ControllerConfig::default();
+    assert!(config.ui_listen.ip().is_loopback());
+}
+
+#[tokio::test]
+async fn ctl_02_mock_builds_a_snapshot_and_heartbeats_report_alignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    push(
+        &c,
+        "checkout-a",
+        &[exchange(
+            "checkout-a-1",
+            "outbound",
+            "GET",
+            "/users/7",
+            json!([]),
+            1,
+        )],
+    )
+    .await;
+    let desired = set_mode(&c, "mock", None).await;
+    assert_eq!(desired["mode"], "mock");
+    let id = desired["snapshot"].as_str().unwrap().to_string();
+    assert_eq!(heartbeat(&c, "checkout-a", "record", None).await, desired);
+    heartbeat(&c, "checkout-b", "mock", Some(&id)).await;
+    let wl = get_json(&c, "/v1/workloads").await;
+    let pods = &wl[0]["pods"];
+    let state = |i: &str| {
+        pods.as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["instance"] == i)
+            .unwrap()["state"]
+            .clone()
+    };
+    assert_eq!(state("checkout-a"), "diverging");
+    assert_eq!(state("checkout-b"), "aligned");
+    let snap = client()
+        .get(url(&c, &format!("{WL}/snapshots/{id}")))
+        .bearer_auth("tok-b")
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    mimic_core::snapshot::Snapshot::from_jsonl(&snap, &id).unwrap();
+
+    // CTL-03 : retour en record, sans snapshot.
+    let desired = set_mode(&c, "record", None).await;
+    assert_eq!(desired, json!({"mode": "record", "snapshot": null}));
+    // SNP-04 : un snapshot épinglé est rejoué tel quel.
+    push(
+        &c,
+        "checkout-a",
+        &[exchange(
+            "checkout-a-2",
+            "outbound",
+            "GET",
+            "/users/8",
+            json!([]),
+            2,
+        )],
+    )
+    .await;
+    let desired = set_mode(&c, "mock", Some(&id)).await;
+    assert_eq!(desired["snapshot"], id.as_str());
+}
+
+#[tokio::test]
+async fn ctl_04_restart_keeps_segments_snapshots_and_desired_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    push(
+        &c,
+        "checkout-a",
+        &[
+            exchange("checkout-a-1", "outbound", "GET", "/users/7", json!([]), 1),
+            exchange(
+                "checkout-a-2",
+                "inbound",
+                "GET",
+                "/orders",
+                json!([["page", "1"]]),
+                2,
+            ),
+        ],
+    )
+    .await;
+    let desired = set_mode(&c, "mock", None).await;
+    c.shutdown().await;
+
+    let c = controller(dir.path()).await;
+    assert_eq!(get_json(&c, &format!("{WL}/mode")).await, desired);
+    let id = desired["snapshot"].as_str().unwrap();
+    let r = client()
+        .get(ui(&c, &format!("{WL}/snapshots/{id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let snaps = get_json(&c, &format!("{WL}/snapshots")).await;
+    assert_eq!(snaps[0]["id"], id);
+    let ops = get_json(&c, &format!("{WL}/operations")).await;
+    assert!(
+        ops.as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["path"] == "/orders")
+    );
+    let wl = get_json(&c, "/v1/workloads").await;
+    assert_eq!(wl[0]["namespace"], "shop");
+    assert_eq!(wl[0]["name"], "checkout");
+}
+
+#[tokio::test]
+async fn ctl_05_workload_page_shows_operations_pods_and_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    let reqs: Vec<Value> = (0..5)
+        .map(|i| {
+            exchange(
+                &format!("checkout-a-{i}"),
+                "inbound",
+                "GET",
+                &format!("/users/{}", 10 + i),
+                json!([["page", i.to_string()]]),
+                i,
+            )
+        })
+        .collect();
+    push(&c, "checkout-a", &reqs).await;
+    heartbeat(&c, "checkout-a", "record", None).await;
+    let html = client()
+        .get(ui(&c, "/ui/shop/checkout"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("/users/{userId}"), "{html}");
+    assert!(html.contains("requis"));
+    assert!(html.contains("checkout-a"));
+    assert!(html.contains("kubectl patch mimicworkload checkout -n shop"));
+    let home = client()
+        .get(ui(&c, "/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(home.contains("/ui/shop/checkout"));
+}
+
+#[tokio::test]
+async fn rpl_01_to_03_recorded_requests_in_every_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    push(
+        &c,
+        "checkout-a",
+        &[exchange(
+            "checkout-a-1",
+            "inbound",
+            "GET",
+            "/a",
+            json!([]),
+            1,
+        )],
+    )
+    .await;
+    push(
+        &c,
+        "checkout-b",
+        &[
+            exchange(
+                "checkout-b-1",
+                "inbound",
+                "POST",
+                "/b",
+                json!([["q", "x"]]),
+                2,
+            ),
+            exchange("checkout-b-2", "outbound", "GET", "/users/7", json!([]), 3),
+        ],
+    )
+    .await;
+
+    let list = get_json(&c, &format!("{WL}/requests?direction=inbound")).await;
+    let summary: Vec<(String, String)> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["instance"].as_str().unwrap().into(),
+                r["path"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("checkout-b".into(), "/b".into()),
+            ("checkout-a".into(), "/a".into())
+        ]
+    );
+
+    let jsonl = client()
+        .get(ui(
+            &c,
+            &format!("{WL}/requests?direction=inbound&format=jsonl"),
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let lines: Vec<mimic_core::model::Exchange> = jsonl
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+
+    let r = client()
+        .get(ui(
+            &c,
+            &format!("{WL}/requests?direction=inbound&format=k6"),
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("javascript")
+    );
+    let script = r.text().await.unwrap();
+    assert!(script.contains("k6/http"));
+    assert!(script.contains("\"/b\""));
+    assert!(!script.contains("<redacted:"));
+}
+
+#[tokio::test]
+async fn metrics_and_health() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    push(
+        &c,
+        "checkout-a",
+        &[exchange(
+            "checkout-a-1",
+            "inbound",
+            "GET",
+            "/a",
+            json!([]),
+            1,
+        )],
+    )
+    .await;
+    heartbeat(&c, "checkout-a", "record", None).await;
+    let r = client().get(url(&c, "/healthz")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let m = client()
+        .get(ui(&c, "/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        m.contains(r#"mimic_controller_segments_total{result="ok"} 1"#),
+        "{m}"
+    );
+    assert!(m.contains("mimic_controller_workloads 1"), "{m}");
+    assert!(
+        m.contains(r#"mimic_controller_pods{state="aligned"} 1"#),
+        "{m}"
+    );
+}

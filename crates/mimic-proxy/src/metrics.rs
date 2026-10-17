@@ -107,6 +107,7 @@ pub struct Metrics {
     pub capture_dropped: Family<ReasonLabel, Counter>,
     pub share_sync: Family<ResultLabel, Counter>,
     pub share_peers: Gauge,
+    pub mock_snapshot_exchanges: Gauge,
     pub mode: Family<ModeLabel, Gauge>,
     pub passthrough: Family<PassthroughLabels, Counter>,
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
@@ -128,6 +129,7 @@ impl Metrics {
         let capture_dropped = Family::default();
         let share_sync = Family::default();
         let share_peers = Gauge::default();
+        let mock_snapshot_exchanges = Gauge::default();
         let mode = Family::default();
         let passthrough = Family::default();
         let tls_handshake_failures = Family::default();
@@ -181,6 +183,11 @@ impl Metrics {
             "Autres sidecars du workload vus au dernier partage",
             share_peers.clone(),
         );
+        registry.register(
+            "mimic_mock_snapshot_exchanges",
+            "Échanges du snapshot imposé par le contrôleur (0 sans snapshot)",
+            mock_snapshot_exchanges.clone(),
+        );
         registry.register("mimic_mode", "Mode courant (1)", mode.clone());
         registry.register(
             "mimic_passthrough_connections",
@@ -204,6 +211,7 @@ impl Metrics {
             capture_dropped,
             share_sync,
             share_peers,
+            mock_snapshot_exchanges,
             mode,
             passthrough,
             tls_handshake_failures,

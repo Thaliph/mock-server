@@ -176,6 +176,22 @@ fn best_strategy_prefers_most_recent_among_equals() {
 }
 
 #[test]
+fn mck_12_best_prefers_most_frequent_response_among_copies() {
+    // Le même appel vu par trois sidecars : deux fois 200, une fois 500, le 500 en dernier.
+    let recs = vec![
+        out("GET", "/users/7").resp_json(json!({"name": "a"})),
+        out("GET", "/users/7").resp_json(json!({"name": "a"})),
+        out("GET", "/users/7")
+            .status(500)
+            .resp_json(json!({"error": "boom"})),
+    ];
+    let mut m = engine(recs, MockConfig::default());
+    let r = matched(m.respond(&req("GET", "/users/7")));
+    assert_eq!(r.status, 200);
+    assert_eq!(body_json(&r)["name"], "a");
+}
+
+#[test]
 fn mck_07_weighted_status_reproduces_error_rate() {
     let mut recs: Vec<_> = (0..98)
         .map(|_| out("POST", "/charge").status(200))

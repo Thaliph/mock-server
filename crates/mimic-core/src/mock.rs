@@ -30,7 +30,7 @@ const W_BODY: f64 = 0.2;
 /// Choix parmi plusieurs enregistrements candidats.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Strategy {
-    /// Meilleur score, puis le plus récent.
+    /// Meilleur score, puis la réponse la plus fréquente, puis la plus récente.
     #[default]
     Best,
     /// Rotation sur les candidats de meilleur score.
@@ -198,7 +198,7 @@ impl MockEngine {
         let cursor_key = format!("{}|{}|{}", key.0, key.1, req.path);
 
         let chosen = match config.strategy {
-            Strategy::Best => *top.last().expect("top non vide"),
+            Strategy::Best => most_frequent(&top),
             Strategy::RoundRobin => {
                 let i = next_cursor(cursors, cursor_key);
                 top[i % top.len()]
@@ -239,6 +239,27 @@ impl MockEngine {
             exchange_id: e.id.clone(),
         })
     }
+}
+
+/// Réponse la plus fréquente parmi des candidats triés chronologiquement ; à égalité,
+/// celle dont l'exemplaire est le plus récent. Renvoie l'exemplaire le plus récent.
+fn most_frequent<'a, T>(top: &[&'a (&'a Exchange, T, f64)]) -> &'a (&'a Exchange, T, f64) {
+    // Par réponse (code, body) : nombre d'exemplaires et index du plus récent.
+    let mut groups: BTreeMap<(u16, &[u8]), (usize, usize)> = BTreeMap::new();
+    for (i, c) in top.iter().enumerate() {
+        let e = c.0;
+        let g = groups
+            .entry((e.status, e.resp_body.bytes().unwrap_or_default()))
+            .or_default();
+        g.0 += 1;
+        g.1 = i;
+    }
+    let (_, last) = groups
+        .values()
+        .max_by_key(|(count, last)| (*count, *last))
+        .copied()
+        .expect("top non vide");
+    top[last]
 }
 
 fn next_cursor(cursors: &mut BTreeMap<String, usize>, key: String) -> usize {

@@ -1,0 +1,83 @@
+//! Métriques du contrôleur (spec §9.2b).
+
+use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::registry::Registry;
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ResultLabel {
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ReasonLabel {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StateLabel {
+    pub state: String,
+}
+
+pub struct Metrics {
+    registry: Registry,
+    pub segments: Family<ResultLabel, Counter>,
+    pub auth_failures: Family<ReasonLabel, Counter>,
+    pub workloads: Gauge,
+    pub pods: Family<StateLabel, Gauge>,
+    pub snapshots: Counter,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        let mut registry = Registry::default();
+        let segments = Family::<ResultLabel, Counter>::default();
+        let auth_failures = Family::<ReasonLabel, Counter>::default();
+        let workloads = Gauge::default();
+        let pods = Family::<StateLabel, Gauge>::default();
+        let snapshots = Counter::default();
+        registry.register(
+            "mimic_controller_segments",
+            "Segments reçus des sidecars",
+            segments.clone(),
+        );
+        registry.register(
+            "mimic_controller_auth_failures",
+            "Appels de sidecars refusés",
+            auth_failures.clone(),
+        );
+        registry.register(
+            "mimic_controller_workloads",
+            "Workloads connus",
+            workloads.clone(),
+        );
+        registry.register(
+            "mimic_controller_pods",
+            "Pods par état d'alignement",
+            pods.clone(),
+        );
+        registry.register(
+            "mimic_controller_snapshots",
+            "Snapshots construits",
+            snapshots.clone(),
+        );
+        Self {
+            registry,
+            segments,
+            auth_failures,
+            workloads,
+            pods,
+            snapshots,
+        }
+    }
+}
+
+impl Metrics {
+    pub fn encode(&self) -> String {
+        let mut out = String::new();
+        let _ = prometheus_client::encoding::text::encode(&mut out, &self.registry);
+        out
+    }
+}

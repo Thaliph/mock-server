@@ -1,0 +1,61 @@
+# Droits du contrôleur (spec §7.1) : rien au-delà de ce qui suit.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mimic-controller
+rules:
+  - apiGroups: ["mimic.platform.io"]
+    resources: ["mimicworkloads"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["mimic.platform.io"]
+    resources: ["mimicworkloads/status"]
+    verbs: ["patch"]
+  # Validation des jetons des sidecars.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # Rattachement du pod authentifié à son workload.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mimic-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mimic-controller
+subjects:
+  - kind: ServiceAccount
+    name: mimic-controller
+    namespace: mimic-system
+---
+# Qui peut basculer un workload : à lier par namespace (RoleBinding) aux équipes autorisées.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mimic-operator
+rules:
+  - apiGroups: ["mimic.platform.io"]
+    resources: ["mimicworkloads"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Lecture seule, agrégée au rôle standard `view`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mimic-viewer
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["mimic.platform.io"]
+    resources: ["mimicworkloads"]
+    verbs: ["get", "list", "watch"]

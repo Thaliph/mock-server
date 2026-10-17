@@ -18,6 +18,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P3b | Partage entre sidecars d'un workload | fait |
 | P4 | `mimic-init` (iptables), détection de protocole, image, manifests | fait |
 | P5 | Interception TLS sortante | fait |
+| P6 | Contrôleur, CRD `MimicWorkload`, snapshots, authentification, rejeu k6 | fait (non validé sur un vrai cluster) |
 | P7 | Webhook d'injection et `mimicctl` | à faire |
 
 ## Lancer le sidecar en local
