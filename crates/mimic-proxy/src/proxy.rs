@@ -488,6 +488,51 @@ fn connect(state: Arc<AppState>, req: Request<Incoming>) -> Response<ProxyBody> 
     Response::new(boxed(Empty::<Bytes>::new()))
 }
 
+/// Relais TCP opaque d'une connexion redirigée non HTTP (spec §3.1).
+pub async fn tunnel(
+    state: Arc<AppState>,
+    mut stream: tokio::net::TcpStream,
+    original_dst: SocketAddr,
+    protocol: crate::net::Protocol,
+    inbound: bool,
+) {
+    let direction = if inbound { "inbound" } else { "outbound" };
+    let count = |result: &str| {
+        state
+            .metrics
+            .passthrough
+            .get_or_create(&crate::metrics::PassthroughLabels {
+                direction: direction.into(),
+                kind: protocol.as_str().into(),
+                result: result.into(),
+            })
+            .inc();
+    };
+    // En mock, aucun appel chiffré ne doit atteindre une dépendance (O3).
+    if !inbound && protocol == crate::net::Protocol::Tls && state.mode() == Mode::Mock {
+        count("refused");
+        return;
+    }
+    let target = if inbound {
+        state.config.inbound.upstream.unwrap_or_else(|| {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), original_dst.port())
+        })
+    } else {
+        original_dst
+    };
+    match tokio::net::TcpStream::connect(target).await {
+        Ok(mut upstream) => {
+            count("relayed");
+            let _ = upstream.set_nodelay(true);
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+        }
+        Err(e) => {
+            tracing::warn!(%target, error = %e, "tunnel impossible");
+            count("error");
+        }
+    }
+}
+
 fn count_request(
     state: &AppState,
     direction: Direction,

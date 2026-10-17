@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkout-mimic
+data:
+  mimic.yaml: |
+    mode: record
+    inbound:
+      listen: 0.0.0.0:15006
+    outbound:
+      listen: 127.0.0.1:15001
+    admin:
+      listen: 0.0.0.0:15000
+    capture:
+      samples_per_operation: 20
+    mock:
+      strategy: best
+      unmatched: error
+      latency_factor: 1.0
+    store:
+      dir: /var/lib/mimic
+    share:
+      url: s3://mimic-recordings/cluster-a
+      interval: 10
+    annotations_file: /etc/podinfo/annotations

@@ -23,3 +23,13 @@ jobs:
       - run: cargo test --workspace
         env:
           INSTA_UPDATE: "no"
+
+  e2e-netns:
+    # Interception transparente réelle (iptables + SO_ORIGINAL_DST) dans un namespace jetable.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --bins && cargo test -p mimic-proxy --test transparent --no-run
+      - run: sudo -E env "PATH=$PATH" ./scripts/e2e-netns.sh

@@ -1,0 +1,12 @@
+# Collecte des métriques du sidecar par l'opérateur VictoriaMetrics.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: mimic
+spec:
+  selector:
+    matchExpressions:
+      - {key: app.kubernetes.io/name, operator: Exists}
+  podMetricsEndpoints:
+    - port: mimic-admin
+      path: /metrics

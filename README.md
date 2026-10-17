@@ -16,6 +16,9 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P2 | Moteur de mock (`mimic-core::mock`) | fait |
 | P3 | Proxy `mimic-proxy` : record, mock, page d'admin, métriques | fait |
 | P3b | Partage entre sidecars d'un workload | fait |
+| P4 | `mimic-init` (iptables), détection de protocole, image, manifests | fait |
+| P5 | Interception TLS sortante | à faire |
+| P7 | Webhook d'injection et `mimicctl` | à faire |
 
 ## Lancer le sidecar en local
 
@@ -36,6 +39,8 @@ admin:
 
 Bascule de mode : `curl -X PUT --data mock http://127.0.0.1:15000/mode`.
 
+Déploiement dans Kubernetes : voir [deploy/README.md](deploy/README.md).
+
 ## Développement
 
 ```sh
@@ -43,6 +48,7 @@ cargo test --workspace          # tests unitaires, propriétés et snapshots
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo insta review              # après un changement voulu de la sortie OpenAPI
+sudo ./scripts/e2e-netns.sh     # interception iptables réelle, dans un namespace réseau jetable
 ```
 
 Les tests portent l'identifiant du critère d'acceptation qu'ils couvrent
