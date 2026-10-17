@@ -1,0 +1,162 @@
+# Webhook d'injection (spec §9.4) : ajoute mimic-init et le sidecar mimic aux pods des
+# namespaces labellisés mimic.platform.io/enabled=true. À appliquer après controller/.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mimic-injector
+  namespace: mimic-system
+# Le webhook n'appelle pas l'API Kubernetes.
+automountServiceAccountToken: false
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: mimic-injector-tls
+  namespace: mimic-system
+spec:
+  secretName: mimic-injector-tls
+  duration: 2160h
+  renewBefore: 360h
+  dnsNames:
+    - mimic-injector.mimic-system.svc
+    - mimic-injector.mimic-system.svc.cluster.local
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: mimic-ca, kind: Issuer}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimic-injector
+  namespace: mimic-system
+data:
+  injector.yaml: |
+    listen: 0.0.0.0:8443
+    tls: {cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key}
+    image: registry.example.com/platform/mimic:0.1.0
+    # API Kubernetes : jamais redirigée vers le sidecar.
+    exclude_outbound_cidrs: [10.96.0.1/32]
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {memory: 256Mi}
+    # Configuration par défaut des sidecars (spec §9.1). Un pod peut monter la sienne
+    # avec l'annotation mimic.platform.io/config: <configmap>.
+    sidecar_config: |
+      mode: record
+      inbound:
+        listen: 0.0.0.0:15006
+      outbound:
+        listen: 127.0.0.1:15001
+      admin:
+        listen: 0.0.0.0:15000
+      capture:
+        samples_per_operation: 20
+      mock:
+        strategy: best
+        unmatched: error
+        latency_factor: 1.0
+      store:
+        dir: /var/lib/mimic
+      tls:
+        ca_dir: /var/run/mimic/ca
+      share:
+        url: https://mimic-controller.mimic-system.svc:8443
+        ca_file: /etc/mimic-ca/ca.crt
+        token_file: /var/run/secrets/mimic/token
+        interval: 10
+        mode_poll: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mimic-injector
+  namespace: mimic-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: mimic-injector}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: mimic-injector}
+    spec:
+      serviceAccountName: mimic-injector
+      securityContext:
+        runAsUser: 1337
+        runAsGroup: 1337
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: injector
+          image: registry.example.com/platform/mimic:0.1.0
+          command: ["/usr/local/bin/mimic-injector"]
+          args: ["--config", "/etc/mimic/injector.yaml"]
+          ports:
+            - {name: webhook, containerPort: 8443}
+          readinessProbe:
+            httpGet: {path: /healthz, port: webhook, scheme: HTTPS}
+          livenessProbe:
+            httpGet: {path: /healthz, port: webhook, scheme: HTTPS}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/mimic/injector.yaml, subPath: injector.yaml}
+            - {name: tls, mountPath: /etc/mimic/tls, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: mimic-injector}
+        - name: tls
+          secret: {secretName: mimic-injector-tls}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimic-injector
+  namespace: mimic-system
+spec:
+  selector: {app.kubernetes.io/name: mimic-injector}
+  ports:
+    - {name: webhook, port: 443, targetPort: webhook}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mimic-injector
+  namespace: mimic-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: mimic-injector}
+---
+# failurePolicy Ignore : webhook indisponible, le pod est créé sans mimic plutôt que bloqué.
+# Le caBundle est posé par le cainjector de cert-manager.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: mimic-injector
+  annotations:
+    cert-manager.io/inject-ca-from: mimic-system/mimic-injector-tls
+webhooks:
+  - name: inject.mimic.platform.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    reinvocationPolicy: Never
+    namespaceSelector:
+      matchLabels: {mimic.platform.io/enabled: "true"}
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: mimic-injector
+        namespace: mimic-system
+        path: /mutate
+        port: 443

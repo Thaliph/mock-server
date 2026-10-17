@@ -19,7 +19,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P4 | `mimic-init` (iptables), détection de protocole, image, manifests | fait |
 | P5 | Interception TLS sortante | fait |
 | P6 | Contrôleur, CRD `MimicWorkload`, snapshots, authentification, rejeu k6 | fait (non validé sur un vrai cluster) |
-| P7 | Webhook d'injection et `mimicctl` | à faire |
+| P7 | Webhook d'injection `mimic-injector` et CLI `mimicctl` | fait (non validé sur un vrai cluster) |
 
 ## Lancer le sidecar en local
 
@@ -41,6 +41,17 @@ admin:
 Bascule de mode : `curl -X PUT --data mock http://127.0.0.1:15000/mode`.
 
 Déploiement dans Kubernetes : voir [deploy/README.md](deploy/README.md).
+
+## mimicctl
+
+```sh
+cargo install --path crates/mimicctl
+mimicctl mode checkout mock -n shop          # bascule tous les pods du workload
+mimicctl status -A                           # mode souhaité, snapshot, pods alignés
+mimicctl export checkout -n shop --inbound --openapi-version 3.0 -o checkout.yaml
+mimicctl requests checkout -n shop --format k6 > replay.js
+mimicctl diff semaine-1.yaml semaine-2.yaml --fail-on-breaking
+```
 
 ## Développement
 

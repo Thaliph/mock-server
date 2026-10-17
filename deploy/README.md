@@ -13,12 +13,34 @@
 Prérequis : cert-manager et trust-manager. Ordre : `namespace`, `crd`, `rbac`,
 `certificates`, puis `controller`.
 
+## Webhook d'injection (`injector/`), une fois par cluster
+
+`injector.yaml` : configuration (image et configuration par défaut des sidecars),
+certificat, Deployment, Service et `MutatingWebhookConfiguration`. À appliquer après
+`controller/`, dont il réutilise l'Issuer `mimic-ca`.
+
+Tout pod créé dans un namespace labellisé `mimic.platform.io/enabled=true` reçoit
+`mimic-init` et le sidecar (spec §9.4). Annotations de pod reconnues :
+
+| Annotation | Effet |
+|------------|-------|
+| `mimic.platform.io/inject: "false"` | pas d'injection |
+| `mimic.platform.io/workload` | nom du workload (sinon label `app.kubernetes.io/name`, puis `app`) |
+| `mimic.platform.io/inbound-ports` | ports entrants interceptés (défaut : ports TCP déclarés) |
+| `mimic.platform.io/exclude-outbound-cidrs`, `…/exclude-outbound-ports` | destinations jamais redirigées |
+| `mimic.platform.io/tls-intercept` | hôtes HTTPS interceptés ; l'app reçoit la CA Mimic |
+| `mimic.platform.io/config` | ConfigMap de configuration du sidecar à la place de celle du webhook |
+
+Le webhook est en `failurePolicy: Ignore` : s'il est indisponible, les pods sont créés
+sans mimic. Un pod laissé tel quel l'est avec un avertissement visible dans `kubectl`.
+
 ## Application (`example/`)
 
 | Fichier | Rôle |
 |---------|------|
 | `configmap.yaml` | configuration du sidecar (spec §9.1), rattaché au contrôleur |
-| `deployment.yaml` | init container iptables, native sidecar, jeton projeté et CA du contrôleur |
+| `deployment.yaml` | injection à la main : init container iptables, native sidecar, jeton projeté et CA du contrôleur |
+| `deployment-injected.yaml` | le même workload avec le webhook : rien à ajouter au template |
 | `mimicworkload.yaml` | état souhaité du workload : le seul moyen de le basculer |
 | `vmpodscrape.yaml` | collecte des métriques par VictoriaMetrics |
 | `networkpolicy-mock.yaml` | à appliquer pendant un tir en mode mock pour garantir qu'aucun appel ne sort |
