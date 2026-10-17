@@ -370,3 +370,39 @@ async fn sec_05_only_the_controller_ca_is_trusted() {
     .await;
     converged(&[&a], "passthrough", &Value::Null).await;
 }
+
+#[tokio::test]
+async fn snp_06_hot_endpoint_stays_servable_beyond_the_sample_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+
+    // Endpoint très sollicité : bien plus d'appels que samples_per_operation (20)
+    // et que snapshot.max_per_key (50). Seuls les 20 premiers gardent leur body.
+    let url = saas.url("/users/1");
+    let recorded = served(&a, &url).await;
+    for _ in 0..99 {
+        assert_eq!(served(&a, &url).await.0, 200);
+    }
+    eventually("le contrôleur a reçu les 100 appels", || async {
+        ui_json(
+            &ctl,
+            "/v1/workloads/ns/api/requests?direction=outbound&limit=1000",
+        )
+        .await
+        .as_array()
+        .is_some_and(|l| l.len() == 100)
+    })
+    .await;
+
+    let s1 = apply(&ctl, "mock", None).await["snapshot"].clone();
+    converged(&[&a], "mock", &s1).await;
+    let hits = saas.hits();
+    assert_eq!(
+        served(&a, &url).await,
+        recorded,
+        "réponse enregistrée rejouée"
+    );
+    assert_eq!(saas.hits(), hits, "rien n'est sorti");
+}

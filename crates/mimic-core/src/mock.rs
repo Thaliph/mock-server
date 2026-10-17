@@ -183,7 +183,7 @@ impl MockEngine {
         let latencies: Vec<u64> = same_op.iter().map(|(e, _)| e.total_us).collect();
         let servable: Vec<(&Exchange, PathMatch, f64)> = same_op
             .into_iter()
-            .filter(|(e, _)| matches!(e.resp_body, Body::Empty | Body::Captured { .. }))
+            .filter(|(e, _)| e.resp_body.is_replayable())
             .map(|(e, m)| {
                 let s = score(config, e, m, req);
                 (e, m, s)
