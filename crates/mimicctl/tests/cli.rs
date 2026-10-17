@@ -194,3 +194,29 @@ fn report_paths() {
         "/v1/workloads/shop/checkout/requests?direction=outbound&format=json&limit=500"
     );
 }
+
+#[test]
+fn cli_05_status_of_a_previous_generation_is_not_shown_as_aligned() {
+    let mut mw = workload_apply("shop", "checkout", "mock", None).unwrap();
+    // Le spec vient de passer en mock (génération 5) ; le statut date encore du record.
+    mw.metadata.generation = Some(5);
+    mw.status = Some(mimic_controller::crd::MimicWorkloadStatus {
+        snapshot: Some("3f9a0c1e5b7d2a46".into()),
+        pods: 2,
+        aligned: 2,
+        observed_generation: Some(4),
+        ..Default::default()
+    });
+    let table = status_table(std::slice::from_ref(&mw));
+    let row = table.lines().nth(1).unwrap();
+    assert!(row.ends_with("?/2"), "{table}");
+    assert!(!row.contains("3f9a0c1e5b7d2a46"), "{table}");
+
+    mw.status.as_mut().unwrap().observed_generation = Some(5);
+    let table = status_table(&[mw]);
+    let row = table.lines().nth(1).unwrap();
+    assert!(
+        row.ends_with("2/2") && row.contains("3f9a0c1e5b7d2a46"),
+        "{table}"
+    );
+}

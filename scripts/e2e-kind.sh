@@ -175,9 +175,14 @@ traffic() {
         --data-urlencode "itemList=[{\"productId\":\"66VCHSJNUP\",\"quantity\":3}]" \
         --data-urlencode "currencyCode=USD" \
         --data-urlencode "address={\"streetAddress\":\"1600 Amphitheatre Parkway\",\"city\":\"Mountain View\",\"state\":\"CA\",\"country\":\"United States\",\"zipCode\":\"94043\"}" \
-        -w "\n%{http_code}") || continue
+        -w "\n%{http_code}") || { echo "échec $i : curl"; continue; }
       code=$(echo "$body" | tail -1)
-      echo "$body" | head -1 | grep -q currencyCode && [ "$code" = 200 ] && ok=$((ok + 1))
+      if echo "$body" | head -1 | grep -q currencyCode && [ "$code" = 200 ]; then
+        ok=$((ok + 1))
+      elif [ $((i - ok)) -le 3 ]; then
+        # Les premiers échecs disent quel service a cédé (message gRPC du frontend).
+        echo "échec $i : $code $(echo "$body" | head -1 | cut -c1-300)"
+      fi
     done
     echo "$ok/'"$1"'"
     [ "$ok" -eq '"$1"' ]'

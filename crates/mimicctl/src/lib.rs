@@ -106,12 +106,23 @@ pub fn status_table(items: &[MimicWorkload]) -> String {
     ]];
     for mw in items {
         let status = mw.status.clone().unwrap_or_default();
+        // Statut d'une génération antérieure : il décrit l'état souhaité d'avant la bascule.
+        let stale = mw.metadata.generation.is_some()
+            && status.observed_generation != mw.metadata.generation;
+        let (snapshot, aligned) = if stale {
+            ("?".to_string(), "?".to_string())
+        } else {
+            (
+                status.snapshot.unwrap_or_else(|| "-".into()),
+                status.aligned.to_string(),
+            )
+        };
         rows.push([
             mw.metadata.namespace.clone().unwrap_or_default(),
             mw.metadata.name.clone().unwrap_or_default(),
             mw.spec.mode.clone(),
-            status.snapshot.unwrap_or_else(|| "-".into()),
-            format!("{}/{}", status.aligned, status.pods),
+            snapshot,
+            format!("{aligned}/{}", status.pods),
         ]);
     }
     let widths: Vec<usize> = (0..5)
