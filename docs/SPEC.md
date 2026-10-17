@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.2** ; la phase P1 (inférence et redaction) est implémentée dans `crates/mimic-core`.
+> Statut : **v0.3** ; ajout du partage entre sidecars (§5.4), de la page d'admin (§9.2) et des métriques détaillées (§9.3).
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -191,7 +191,7 @@ Règles de capture :
 
 ### 5.3 Mode `mock`
 
-Pour chaque requête sortante, le moteur de correspondance (`mimic-core::matcher`) cherche la meilleure réponse enregistrée.
+Pour chaque requête sortante, le moteur de correspondance (`mimic-core::mock`) cherche la meilleure réponse enregistrée.
 
 **Clé de correspondance**, par ordre de priorité :
 
@@ -202,7 +202,16 @@ Pour chaque requête sortante, le moteur de correspondance (`mimic-core::matcher
 5. headers discriminants configurés (ex. `Accept`, `X-Api-Version`) ;
 6. body : égalité canonique JSON, puis similarité (champs communs).
 
-Chaque critère donne un score ; le meilleur candidat au-dessus d'un seuil gagne. Le score et le candidat retenu sont exposés dans un header de debug optionnel `x-mimic-match: exact|template|fuzzy;score=0.82`.
+Le chemin est éliminatoire : un candidat doit avoir la même authority, la même méthode et un chemin égal ou de même template. Parmi les candidats restants, le score (entre 0 et 1) est la moyenne pondérée de :
+
+| Critère | Poids | Mesure |
+|---------|-------|--------|
+| chemin | 0,4 | 1 si égal, 0,5 si seul le template correspond |
+| query | 0,3 | indice de Jaccard sur les couples (nom, valeur) |
+| headers discriminants | 0,1 | part des headers configurés de même valeur |
+| body | 0,2 | 1 si JSON canonique égal, sinon Jaccard sur les couples (clé de premier niveau, valeur) |
+
+Le type de correspondance vaut `exact` si le score est 1, `template` si le chemin n'est égal qu'au template, `fuzzy` sinon. Il est exposé dans le header `x-mimic-match: exact;score=1.00` (désactivable).
 
 **Stratégies de sélection** quand plusieurs exemples correspondent :
 
@@ -213,17 +222,19 @@ Chaque critère donne un score ; le meilleur candidat au-dessus d'un seuil gagne
 | `sequence` | rejoue dans l'ordre d'enregistrement (scénarios à état : création puis lecture) |
 | `weighted-status` | respecte la distribution des codes observés (ex. 2 % de 429) pour reproduire les erreurs réelles |
 
-**Latence rejouée** : la latence n'est pas copiée d'un exemple unique, elle est tirée dans l'histogramme enregistré de l'opération (HDR histogram), avec un multiplicateur configurable (`latency.factor: 1.0`, `0` pour la désactiver, `2.0` pour simuler une dépendance dégradée). Le TTFB et le temps de transfert sont rejoués séparément.
+**Latence rejouée** : la latence n'est pas copiée d'un exemple unique, elle est tirée dans la distribution empirique des durées enregistrées pour l'opération (même authority, méthode et template), avec un multiplicateur configurable (`latency.factor: 1.0`, `0` pour la désactiver, `2.0` pour simuler une dépendance dégradée). En v1, la durée totale est appliquée avant l'envoi de la réponse ; le rejeu séparé du TTFB et du temps de transfert viendra avec le streaming des réponses mockées.
+
+Le tirage aléatoire (latence, `weighted-status`) utilise un générateur à graine (`mock.seed`) : un même tir rejoué avec la même graine produit la même séquence.
 
 **Requête sans correspondance**, comportement configurable :
 
 | Option | Réponse |
 |--------|---------|
 | `error` **[DÉFAUT]** | `599` + header `x-mimic-unmatched: true`, compté en métrique |
-| `generate` | réponse synthétique générée depuis le schéma OpenAPI de la dépendance |
+| `generate` | réponse synthétique générée depuis le schéma OpenAPI de la dépendance (v2) |
 | `passthrough` | relayée (équivaut à `mock-partial`) |
 
-**Réécriture dynamique** : certains champs ne doivent pas être rejoués tels quels (dates, IDs repris de la requête). Des règles optionnelles permettent de les recalculer :
+**Réécriture dynamique** (v2) : certains champs ne doivent pas être rejoués tels quels (dates, IDs repris de la requête). Des règles optionnelles permettent de les recalculer :
 
 ```yaml
 rewrite:
@@ -233,6 +244,18 @@ rewrite:
         "$.id": "{{request.path.id}}"
         "$.created": "{{now.unix}}"
 ```
+
+### 5.4 Partage entre les sidecars d'un même workload
+
+Un Deployment a souvent plusieurs réplicas, et chaque pod ne voit qu'une partie du trafic. Les sidecars d'un même workload mettent donc leurs enregistrements en commun : la découverte couvre tout le trafic du workload, et n'importe quel pod peut répondre en mode mock avec un enregistrement fait par un autre.
+
+- **Identité du workload** : `namespace` + nom du workload, lus via l'API downward. Le nom vient de l'annotation `mimic.platform.io/workload`, sinon du label `app.kubernetes.io/name`, sinon du label `app`. Chaque sidecar a un identifiant d'instance (nom du pod).
+- **Support partagé** : un stockage objet (S3-compatible en production, répertoire local ou PVC `ReadWriteMany` en test). Aucun appel à l'API Kubernetes, aucune connexion entre pods.
+- **Disposition** : `<prefix>/<namespace>/<workload>/exchanges/<instance>/<segment>.jsonl`. Un segment ne contient que des échanges déjà redactés.
+- **Synchronisation** toutes les `share.interval` (10 s par défaut) : le sidecar publie un segment avec ses nouveaux échanges, liste les segments des autres instances et importe ceux qu'il n'a pas encore lus.
+- **Fusion** : dédoublonnage par identifiant d'échange (ULID préfixé par l'instance, donc unique dans le workload). Les plafonds de capture (§5.2) s'appliquent après fusion, ce qui borne la mémoire quel que soit le nombre de réplicas.
+- **Panne du support** : la synchronisation échoue sans bloquer le trafic ; le sidecar continue avec ses données locales et l'échec est compté en métrique.
+- **Rétention** : les segments plus vieux que `share.retention` (7 jours par défaut) ne sont plus importés ; leur suppression est laissée à une règle de cycle de vie du bucket.
 
 ---
 
@@ -324,7 +347,7 @@ Option `capture.bodies: false` pour ne garder que métadonnées et schémas (inf
 
 ## 8. Stockage et export
 
-- **Store local** : fichiers JSONL segmentés et compressés zstd dans un `emptyDir` (`/var/lib/mimic`), rotation par taille (100 MiB par défaut). Index en mémoire reconstruit au démarrage.
+- **Store local** : fichiers JSONL segmentés (compression zstd en v2) dans un `emptyDir` (`/var/lib/mimic`), rotation par taille (100 MiB par défaut). Index en mémoire reconstruit au démarrage.
 - **Export** **[DÉFAUT : stockage objet S3-compatible]** : envoi périodique et à l'arrêt du pod (`preStop`) des segments et des documents OpenAPI vers `s3://<bucket>/<cluster>/<namespace>/<workload>/<date>/`. Chiffrement côté serveur requis.
 - **Chargement en mode mock** : depuis le store local si présent, sinon téléchargé depuis S3 pour le workload (`mimic.platform.io/mock-source: s3://...`). C'est ce qui permet d'enregistrer en environnement A et de mocker en environnement B.
 - Les ConfigMaps ne sont pas utilisées (limite de 1 MiB).
@@ -358,8 +381,10 @@ mock:
   unmatched: error
   latency: { factor: 1.0 }
   match_headers: ["accept", "x-api-version"]
-export:
-  s3: { bucket: mimic-recordings, interval: 5m }
+share:
+  url: s3://mimic-recordings/cluster-a   # ou file:///var/lib/mimic-shared
+  interval: 10s
+  retention: 168h
 ```
 
 La configuration est validée au démarrage ; une configuration invalide fait échouer le conteneur avec un message explicite (pas de démarrage en mode dégradé silencieux).
@@ -368,24 +393,44 @@ La configuration est validée au démarrage ; une configuration invalide fait é
 
 | Méthode | Chemin | Rôle |
 |---------|--------|------|
+| GET | `/` | page d'admin (voir ci-dessous) |
+| GET | `/api/operations` | opérations découvertes, en JSON |
 | GET | `/healthz`, `/readyz` | probes |
 | GET | `/metrics` | Prometheus |
 | GET/PUT | `/mode` | lire / changer le mode |
 | GET | `/openapi/inbound` | spec du service |
 | GET | `/openapi/outbound/{authority}` | spec d'une dépendance |
 | GET | `/exchanges?direction=&path=&limit=` | inspection |
-| POST | `/export` | export immédiat |
+| POST | `/share/sync` | synchronisation immédiate avec les autres sidecars |
 | DELETE | `/store` | purge |
+
+**Page d'admin** : page HTML autonome (aucune ressource externe, utilisable par `kubectl port-forward` dans un cluster sans accès Internet), rendue côté serveur à partir des documents OpenAPI du workload. Elle montre :
+
+- le mode courant, l'instance, le workload et l'état de la synchronisation (nombre de pairs, dernière synchro) ;
+- pour le service puis pour chaque dépendance : la liste des opérations (méthode, template, nombre d'appels, répartition des codes, latences p50/p99) ;
+- pour chaque opération, dépliable : les paramètres (chemin, query, headers) avec leur type et un marqueur **requis**, le schéma du body de requête, les codes de réponse avec schéma et exemples ;
+- des liens de téléchargement des documents OpenAPI.
 
 ### 9.3 Observabilité
 
-Métriques Prometheus (scrapables par VictoriaMetrics) :
+Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives dans tous les modes :
 
-- `mimic_requests_total{direction, mode, authority, status}`
-- `mimic_proxy_overhead_seconds` (histogramme, temps ajouté par Mimic)
-- `mimic_mock_match_total{result="exact|template|fuzzy|unmatched"}`
-- `mimic_tls_handshake_failures_total{authority, reason}` (détection du pinning)
-- `mimic_store_bytes`, `mimic_capture_dropped_total{reason}`
+| Métrique | Type | Labels | Mode |
+|----------|------|--------|------|
+| `mimic_requests_total` | compteur | `direction`, `mode`, `authority`, `method`, `status` | tous |
+| `mimic_request_duration_seconds` | histogramme | `direction`, `mode`, `authority` | tous |
+| `mimic_upstream_errors_total` | compteur | `direction`, `authority`, `kind` | record |
+| `mimic_mock_responses_total` | compteur | `authority`, `match` (`exact`, `template`, `fuzzy`, `unmatched`) | mock |
+| `mimic_mock_injected_latency_seconds` | histogramme | `authority` | mock |
+| `mimic_discovered_operations` | jauge | `direction`, `authority` | tous |
+| `mimic_store_exchanges` | jauge | `origin` (`local`, `peer`) | tous |
+| `mimic_capture_dropped_total` | compteur | `reason` | tous |
+| `mimic_share_sync_total` | compteur | `result` (`ok`, `error`) | tous |
+| `mimic_share_peers` | jauge | | tous |
+| `mimic_mode` | jauge (1 pour le mode courant) | `mode` | tous |
+| `mimic_tls_handshake_failures_total` | compteur | `authority`, `reason` | P5 |
+
+`authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité.
 
 Logs JSON structurés (`tracing`). Propagation de `traceparent` inchangée.
 
@@ -481,6 +526,32 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-07 | distribution 98 % 200 / 2 % 429, `weighted-status` | 10 000 requêtes | 429 entre 1,5 % et 2,5 % |
 | MCK-08 | réponse enregistrée gzip | rejeu | `Content-Encoding: gzip` conservé, body identique |
 
+**Moteur de mock, niveau `mimic-core` (MCK, suite)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| MCK-09 | deux enregistrements de même chemin, query `?page=1` et `?page=2` | requête `?page=2` | l'enregistrement `page=2` est choisi |
+| MCK-10 | enregistrement sur une autre méthode ou une autre authority | requête | aucune correspondance |
+| MCK-11 | même graine, mêmes requêtes | deux exécutions | décisions et latences identiques |
+
+**Partage (SHR)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| SHR-01 | deux sidecars du même workload sur un support partagé, chacun ayant vu des opérations différentes | synchronisation | chaque sidecar documente l'union des opérations |
+| SHR-02 | enregistrement d'une dépendance fait par le sidecar A | requête mockée sur le sidecar B | B répond avec l'enregistrement de A |
+| SHR-03 | segments déjà importés | nouvelle synchronisation | aucun échange dupliqué |
+| SHR-04 | sidecar d'un autre workload sur le même support | synchronisation | ses échanges ne sont pas importés |
+| SHR-05 | support indisponible | synchronisation | le trafic n'est pas affecté, `mimic_share_sync_total{result="error"}` augmente |
+
+**Admin et métriques (ADM)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| ADM-01 | trafic enregistré sur `GET /users/{userId}` avec query `page` toujours présente | `GET /` | la page liste l'opération et marque `page` comme requis |
+| ADM-02 | trafic entrant et sortant, en record puis en mock | `GET /metrics` | les métriques du tableau §9.3 sont présentes avec les bons labels |
+| ADM-03 | `PUT /mode` avec `mock` | requête suivante | servie en mock, `mimic_mode{mode="mock"} 1` |
+
 **Proxy (PRX)**
 
 | ID | Étant donné | Quand | Alors |
@@ -540,8 +611,9 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 |-------|---------|-----------------|
 | P0 | Workspace, CI (fmt, clippy, test, deny), modèle `Exchange`, fixtures | build vert |
 | P1 | `mimic-core::infer` + `redact` sur fixtures (aucun réseau) | INF-*, RED-* |
-| P2 | Proxy HTTP en clair : record entrant/sortant, store local, API admin | PRX-01 à 05 |
-| P3 | `mimic-core::matcher` + mode mock + latence | MCK-* |
+| P2 | `mimic-core::mock` : matching, stratégies, latence | MCK-01 à 11 (niveau cœur) |
+| P3 | Proxy HTTP en clair : record et mock, store, API et page d'admin, métriques | PRX-01 à 05, MCK-* de bout en bout, ADM-* |
+| P3b | Partage entre sidecars d'un workload | SHR-* |
 | P4 | `mimic-init` iptables, manifest d'exemple, E2E kind | E2E-01 à 03 |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Export S3, chargement cross-environnement, garde-fou production | E2E-04 |
