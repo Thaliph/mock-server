@@ -13,8 +13,28 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 |-------|---------|------|
 | P0 | Workspace, CI, modèle `Exchange`, fixtures | fait |
 | P1 | Inférence OpenAPI et redaction (`mimic-core`) | fait |
-| P2 | Proxy HTTP en clair, mode record | à faire |
-| P3 | Matching et mode mock | à faire |
+| P2 | Moteur de mock (`mimic-core::mock`) | fait |
+| P3 | Proxy `mimic-proxy` : record, mock, page d'admin, métriques | fait |
+| P3b | Partage entre sidecars d'un workload | à faire |
+
+## Lancer le sidecar en local
+
+```sh
+cargo run -p mimic-proxy -- --config exemple.yaml
+```
+
+```yaml
+mode: record
+inbound:
+  listen: 127.0.0.1:15006
+  upstream: 127.0.0.1:8080   # l'application
+outbound:
+  listen: 127.0.0.1:15001    # à utiliser comme HTTP_PROXY par l'application
+admin:
+  listen: 127.0.0.1:15000    # page d'admin sur http://127.0.0.1:15000/
+```
+
+Bascule de mode : `curl -X PUT --data mock http://127.0.0.1:15000/mode`.
 
 ## Développement
 
