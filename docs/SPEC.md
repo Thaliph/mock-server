@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.3** ; ajout du partage entre sidecars (§5.4), de la page d'admin (§9.2) et des métriques détaillées (§9.3).
+> Statut : **v0.4** ; ajout de la détection de protocole sur le trafic redirigé (§3.1) et des critères INI-*.
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -80,9 +80,15 @@ Principe structurant : **toute la logique métier vit dans `mimic-core`, en fonc
 
 Même mécanique qu'Istio, éprouvée :
 
-- `mimic-init` (capability `NET_ADMIN`, exécuté avant l'app) pose :
-  - **entrant** : `PREROUTING` → `REDIRECT --to-port 15006` pour les ports déclarés de l'app ;
-  - **sortant** : `OUTPUT` → `REDIRECT --to-port 15001`, en excluant l'UID du sidecar (`-m owner ! --uid-owner 1337`) pour éviter les boucles, et en excluant `localhost` et les CIDR configurés (ex. DNS kube-system).
+- `mimic-init` (capability `NET_ADMIN`, exécuté avant l'app) pose, dans la table `nat` et des chaînes dédiées `MIMIC_INBOUND` / `MIMIC_OUTBOUND` :
+  - **entrant** : `PREROUTING` → `REDIRECT --to-ports 15006` pour les ports déclarés de l'app (ou tous les ports, `*`), sauf les ports du sidecar ;
+  - **sortant** : `OUTPUT` → `REDIRECT --to-ports 15001` pour tout TCP, sauf : le trafic de l'UID du sidecar (`-m owner --uid-owner 1337 -j RETURN`, ce qui évite les boucles), le trafic vers l'IP du pod via `lo`, les CIDR et ports exclus (ex. API Kubernetes, bases de données si on préfère ne pas les faire transiter).
+- Les règles sont générées par une fonction pure (testée) et appliquées en une fois par `iptables-restore --noflush` ; une deuxième exécution ne duplique rien.
+- **Détection du protocole** : le trafic redirigé n'est pas forcément HTTP. Pour chaque connexion redirigée, le proxy lit sans les consommer les premiers octets (`peek`) :
+  - méthode HTTP/1 ou préface HTTP/2 : traitement HTTP (record, mock) ;
+  - enregistrement TLS (`0x16`) : tunnel TCP opaque tant que l'interception TLS (§4.2) n'est pas activée ; **refusé en mode `mock`** pour garantir qu'aucun appel ne sort (O3) ;
+  - autre protocole, ou rien reçu au bout de 300 ms (protocole où le serveur parle en premier, comme MySQL) : tunnel TCP opaque vers la destination d'origine.
+  Chaque tunnel est compté dans `mimic_passthrough_connections_total`.
 - Le proxy récupère la destination d'origine avec `getsockopt(SO_ORIGINAL_DST)` (IPv4) et `IP6T_SO_ORIGINAL_DST` (IPv6).
 - Sur K8s ≥ 1.29, le sidecar est déclaré en **native sidecar** (`initContainers` + `restartPolicy: Always`) pour démarrer avant l'app et s'arrêter après elle.
 
@@ -428,6 +434,7 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 | `mimic_share_sync_total` | compteur | `result` (`ok`, `error`) | tous |
 | `mimic_share_peers` | jauge | | tous |
 | `mimic_mode` | jauge (1 pour le mode courant) | `mode` | tous |
+| `mimic_passthrough_connections_total` | compteur | `direction`, `kind` (`tls`, `tcp`), `result` (`relayed`, `refused`, `error`) | tous |
 | `mimic_tls_handshake_failures_total` | compteur | `authority`, `reason` | P5 |
 
 `authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité.
@@ -552,6 +559,15 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ADM-02 | trafic entrant et sortant, en record puis en mock | `GET /metrics` | les métriques du tableau §9.3 sont présentes avec les bons labels |
 | ADM-03 | `PUT /mode` avec `mock` | requête suivante | servie en mock, `mimic_mode{mode="mock"} 1` |
 
+**Init (INI)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| INI-01 | ports entrants `8080,9090` | génération | une règle `REDIRECT` par port vers 15006, ports du sidecar exclus |
+| INI-02 | ports entrants `*` | génération | redirection de tout le TCP entrant sauf les ports du sidecar |
+| INI-03 | UID, CIDR et ports sortants exclus | génération | règles `RETURN` placées avant la redirection sortante |
+| INI-04 | règles déjà posées | deuxième application | aucune règle dupliquée |
+
 **Proxy (PRX)**
 
 | ID | Étant donné | Quand | Alors |
@@ -559,7 +575,9 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | PRX-01 | mode record, upstream factice | 10 000 requêtes | toutes relayées sans altération, toutes enregistrées |
 | PRX-02 | réponse streamée de 500 MiB | relais | mémoire du proxy < 64 MiB, body tronqué dans le store |
 | PRX-03 | upstream HTTP/2 | relais | h2 négocié de bout en bout |
-| PRX-04 | trafic TCP non HTTP (protocole Postgres) | relais | passthrough transparent |
+| PRX-04 | trafic TCP non HTTP redirigé (client qui parle en premier, ou serveur qui parle en premier) | relais | tunnel transparent, octets identiques |
+| PRX-04b | connexion TLS redirigée | mode record / mode mock | tunnel opaque / connexion refusée, compteur `refused` |
+| PRX-08 | règles iptables posées par `mimic-init` dans un namespace réseau, sidecar sous l'UID 1337 | l'application appelle une dépendance HTTP sans proxy configuré | l'appel est enregistré avec l'authority d'origine, puis servi en mock |
 | PRX-05 | bascule record → mock pendant une charge | bascule | aucune requête en erreur, nouvelles requêtes mockées |
 | PRX-06 | hôte dans `tls.intercept`, app faisant confiance à la CA | requête HTTPS | échange déchiffré et enregistré |
 | PRX-07 | hôte hors `tls.intercept` | requête HTTPS | tunnel opaque, seuls SNI et durée enregistrés |
@@ -614,7 +632,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P2 | `mimic-core::mock` : matching, stratégies, latence | MCK-01 à 11 (niveau cœur) |
 | P3 | Proxy HTTP en clair : record et mock, store, API et page d'admin, métriques | PRX-01 à 05, MCK-* de bout en bout, ADM-* |
 | P3b | Partage entre sidecars d'un workload | SHR-* |
-| P4 | `mimic-init` iptables, manifest d'exemple, E2E kind | E2E-01 à 03 |
+| P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Export S3, chargement cross-environnement, garde-fou production | E2E-04 |
 | P7 | Webhook d'injection + `mimicctl` | tests d'admission |
