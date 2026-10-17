@@ -34,6 +34,19 @@ diagnostics() {
   kubectl -n mimic-system logs deploy/mimic-controller --tail=100 || true
   kubectl -n mimic-system logs deploy/mimic-injector --tail=50 || true
   kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -40 || true
+  # Confiance sidecars → contrôleur : la CA publiée doit avoir signé le certificat servi.
+  kubectl -n mimic-system get certificates,certificaterequests -o wide || true
+  for src in "secret/mimic-controller-ca ca\.crt" "secret/mimic-controller-tls ca\.crt" "configmap/mimic-controller-ca ca\.crt"; do
+    set -- $src
+    for ns in mimic-system "$NS"; do
+      pem=$(kubectl -n "$ns" get "$1" -o jsonpath="{.data.$2}" 2>/dev/null) || continue
+      [ -n "$pem" ] || continue
+      case "$1" in secret/*) pem=$(echo "$pem" | base64 -d) ;; esac
+      echo "$ns/$1 : $(echo "$pem" | openssl x509 -noout -fingerprint -sha256 -startdate 2>/dev/null | tr '\n' ' ')"
+    done
+  done
+  df -h / 2>/dev/null | tail -1 || true
+  docker exec "$CLUSTER-control-plane" df -h /var/lib/containerd 2>/dev/null | tail -1 || true
   # shipping, puis tout pod de la démo qui n'est pas prêt.
   local pods
   pods=$( (kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -o name
@@ -42,7 +55,9 @@ diagnostics() {
       | "pod/" + .metadata.name') | sort -u) || true
   for p in $pods; do
     kubectl -n "$NS" describe "$p" | tail -30 || true
-    kubectl -n "$NS" logs "$p" -c mimic --tail=80 || true
+    # Premières erreurs, puis les plus récentes.
+    kubectl -n "$NS" logs "$p" -c mimic 2>/dev/null | grep -m5 '"WARN"\|"ERROR"' || true
+    kubectl -n "$NS" logs "$p" -c mimic --tail=40 || true
     kubectl -n "$NS" logs "$p" -c mimic-init || true
     kubectl -n "$NS" logs "$p" --all-containers --tail=30 || true
   done
@@ -75,6 +90,9 @@ report() {
   done
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     cat "$REPORT_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
+    echo "::group::rapport de découverte"
+    cat "$REPORT_DIR/report.md"
+    echo "::endgroup::"
   fi
   reported=1
   echo "rapport : $REPORT_DIR/report.md"
