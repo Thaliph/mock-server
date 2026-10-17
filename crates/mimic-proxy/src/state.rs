@@ -39,6 +39,8 @@ pub struct AppState {
     engine: Mutex<Option<(u64, MockEngine)>>,
     discovery: Mutex<Option<(u64, Arc<Discovery>)>>,
     pub share_status: Mutex<ShareStatus>,
+    /// Réveille la boucle de partage (`POST /share/sync`).
+    pub share_notify: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -85,6 +87,7 @@ impl AppState {
             engine: Mutex::new(None),
             discovery: Mutex::new(None),
             share_status: Mutex::new(share_status),
+            share_notify: tokio::sync::Notify::new(),
         })
     }
 

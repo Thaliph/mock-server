@@ -15,7 +15,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P1 | Inférence OpenAPI et redaction (`mimic-core`) | fait |
 | P2 | Moteur de mock (`mimic-core::mock`) | fait |
 | P3 | Proxy `mimic-proxy` : record, mock, page d'admin, métriques | fait |
-| P3b | Partage entre sidecars d'un workload | à faire |
+| P3b | Partage entre sidecars d'un workload | fait |
 
 ## Lancer le sidecar en local
 
