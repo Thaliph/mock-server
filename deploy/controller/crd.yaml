@@ -59,6 +59,9 @@ spec:
                 default: []
                 items:
                   properties:
+                    message:
+                      nullable: true
+                      type: string
                     reason:
                       nullable: true
                       type: string

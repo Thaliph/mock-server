@@ -4,12 +4,12 @@ use clap::{Parser, Subcommand};
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use mimic_controller::crd::MimicWorkload;
 use mimicctl::{
-    Target, WorkloadData, export_path, operations_path, report_markdown, requests_path,
-    sample_requests_path, status_table, workload_apply,
+    Target, WorkloadData, check_namespace, export_path, operations_path, report_markdown,
+    requests_path, sample_requests_path, status_table, workload_apply,
 };
 
 /// Pilote mimic depuis le poste : bascule, statut, export et diff (spec §9.5).
@@ -133,6 +133,7 @@ async fn run(command: Command) -> Result<i32, String> {
             let client = client().await?;
             let ns = namespace(ns, &client).await;
             let mw = workload_apply(&ns, &workload, &mode, snapshot.as_deref())?;
+            check_namespace(&ns, &mode, namespace_labels(&client, &ns).await.as_ref())?;
             let api: Api<MimicWorkload> = Api::namespaced(client, &ns);
             api.patch(
                 &workload,
@@ -271,6 +272,25 @@ async fn run(command: Command) -> Result<i32, String> {
                 print!("{}", d.to_text());
             }
             Ok(i32::from(fail_on_breaking && d.is_breaking()))
+        }
+    }
+}
+
+/// Labels du namespace, pour le garde-fou production ; `None` si on ne peut pas les lire
+/// (droit `get` absent) : le contrôleur applique alors le garde-fou seul.
+async fn namespace_labels(
+    client: &kube::Client,
+    ns: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let api: Api<Namespace> = Api::all(client.clone());
+    match api.get_opt(ns).await {
+        Ok(Some(n)) => Some(n.metadata.labels.unwrap_or_default()),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!(
+                "mimicctl: labels du namespace {ns} illisibles ({e}) ; le contrôleur appliquera le garde-fou production"
+            );
+            None
         }
     }
 }

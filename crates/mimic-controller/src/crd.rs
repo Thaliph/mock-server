@@ -53,6 +53,8 @@ pub struct StatusCondition {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Manifeste de la CRD, tel que livré dans `deploy/controller/crd.yaml`.

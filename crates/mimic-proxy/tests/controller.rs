@@ -247,6 +247,46 @@ async fn ctl_02_03_snp_03_to_05_switch_and_identical_responses() {
     .await;
 }
 
+/// Le garde-fou production vu de bout en bout : namespace labellisé `env=production`,
+/// le sidecar ne bascule jamais en mock (E2E-04 sans cluster).
+#[tokio::test]
+async fn crd_07_production_namespace_never_switches_the_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    assert_eq!(served(&a, &saas.url("/users/7")).await.0, 200);
+    let prod: BTreeMap<String, String> = [("env".to_string(), "production".to_string())].into();
+    ctl.set_namespace_labels("ns", &prod).await;
+
+    for mode in ["mock", "mock-partial"] {
+        let desired = apply(&ctl, mode, None).await;
+        assert!(desired["mode"].is_null(), "{desired}");
+        assert!(desired["snapshot"].is_null(), "{desired}");
+        let wl = ui_json(&ctl, "/v1/workloads").await;
+        assert_eq!(wl[0]["reason"], "ProductionNamespace", "{wl}");
+        assert_eq!(wl[0]["ready"], false);
+    }
+    // Plusieurs battements plus tard, toujours en record, et aucun snapshot construit.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(status(&a).await["mode"], "record");
+    let snaps = ui_json(&ctl, "/v1/workloads/ns/api/snapshots").await;
+    assert_eq!(snaps.as_array().map(Vec::len), Some(0), "{snaps}");
+    let hits = saas.hits();
+    assert_eq!(served(&a, &saas.url("/users/7")).await.0, 200);
+    assert_eq!(saas.hits(), hits + 1, "la vraie dépendance est appelée");
+
+    // Label retiré : le mock est accepté ; label reposé : retour en record.
+    ctl.set_namespace_labels("ns", &BTreeMap::new()).await;
+    let desired = ui_json(&ctl, "/v1/workloads/ns/api/mode").await;
+    assert_eq!(desired["mode"], "mock-partial");
+    converged(&[&a], "mock-partial", &desired["snapshot"]).await;
+    ctl.set_namespace_labels("ns", &prod).await;
+    let desired = ui_json(&ctl, "/v1/workloads/ns/api/mode").await;
+    assert_eq!(desired["mode"], "record", "{desired}");
+    converged(&[&a], "record", &Value::Null).await;
+}
+
 #[tokio::test]
 async fn sidecar_restarts_in_the_last_desired_state() {
     let dir = tempfile::tempdir().unwrap();

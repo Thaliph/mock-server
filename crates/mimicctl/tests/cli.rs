@@ -1,8 +1,8 @@
 //! Construction des requêtes de `mimicctl`, sans cluster (spec §9.5, CLI-*).
 
 use mimicctl::{
-    Target, WorkloadData, export_path, operations_path, report_markdown, requests_path,
-    sample_requests_path, status_table, workload_apply,
+    Target, WorkloadData, check_namespace, export_path, operations_path, report_markdown,
+    requests_path, sample_requests_path, status_table, workload_apply,
 };
 use serde_json::{Value, json};
 
@@ -219,4 +219,22 @@ fn cli_05_status_of_a_previous_generation_is_not_shown_as_aligned() {
         row.ends_with("2/2") && row.contains("3f9a0c1e5b7d2a46"),
         "{table}"
     );
+}
+
+#[test]
+fn cli_06_mock_is_refused_in_a_production_namespace() {
+    let prod: std::collections::BTreeMap<String, String> =
+        [("env".to_string(), "production".to_string())].into();
+    for mode in ["mock", "mock-partial"] {
+        let err = check_namespace("shop", mode, Some(&prod)).unwrap_err();
+        assert!(err.contains("shop"), "{err}");
+        assert!(err.contains("env=production"), "{err}");
+    }
+    for mode in ["record", "passthrough"] {
+        assert!(check_namespace("shop", mode, Some(&prod)).is_ok());
+    }
+    let staging = [("env".to_string(), "staging".to_string())].into();
+    assert!(check_namespace("shop", "mock", Some(&staging)).is_ok());
+    // Labels illisibles (droit absent) : le contrôleur tranche.
+    assert!(check_namespace("shop", "mock", None).is_ok());
 }

@@ -33,8 +33,8 @@ use crate::auth::Authenticator;
 use crate::config::ControllerConfig;
 use crate::metrics::{Metrics, StateLabel};
 use crate::reconcile::{
-    Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, pod_state, reconcile,
-    summarize,
+    Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, guard_pod, is_production,
+    pod_state, reconcile_guarded, summarize,
 };
 
 pub type Key = (String, String);
@@ -57,6 +57,8 @@ pub struct Ctl {
     scanned: OnceCell<()>,
     /// Échanges en mémoire, tous workloads confondus.
     total: AtomicUsize,
+    /// Namespaces labellisés `env=production` : le mock y est refusé (spec §5.5.1).
+    production: Mutex<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -483,6 +485,47 @@ impl Ctl {
             workloads: Mutex::new(BTreeMap::new()),
             scanned: OnceCell::new(),
             total: AtomicUsize::new(0),
+            production: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// Vrai si le namespace est labellisé `env=production`.
+    pub fn is_production(&self, ns: &str) -> bool {
+        self.production
+            .lock()
+            .expect("verrou des namespaces")
+            .contains(ns)
+    }
+
+    /// Labels courants d'un namespace (création, modification) ; un changement du garde-fou
+    /// réconcilie aussitôt les ressources du namespace.
+    pub async fn set_namespace_labels(&self, ns: &str, labels: &BTreeMap<String, String>) {
+        let production = is_production(labels);
+        let changed = {
+            let mut set = self.production.lock().expect("verrou des namespaces");
+            if production {
+                set.insert(ns.to_string())
+            } else {
+                set.remove(ns)
+            }
+        };
+        if !changed {
+            return;
+        }
+        tracing::info!(namespace = ns, production, "garde-fou production");
+        let entries: Vec<Arc<Entry>> = self
+            .entries()
+            .into_iter()
+            .filter(|e| e.namespace == ns)
+            .collect();
+        for e in entries {
+            let (spec, generation) = {
+                let live = e.live();
+                (live.spec.clone(), live.generation)
+            };
+            if spec.is_some() {
+                self.apply_spec(ns, &e.name, spec, generation).await;
+            }
         }
     }
 
@@ -853,11 +896,13 @@ impl Ctl {
     ) -> Desired {
         let e = self.ready(ns, wl).await;
         let now = now_ms();
+        let production = self.is_production(ns);
         let mut live = e.live();
         if !live.pods.contains_key(instance) {
             // Un nouveau pod remplace souvent un ancien (déploiement) : on oublie les disparus.
             self.forget_pods(&mut live, now);
         }
+        let desired = guard_pod(live.desired.clone(), production, &report.mode);
         live.pods.insert(
             instance.into(),
             Pod {
@@ -866,7 +911,7 @@ impl Ctl {
                 last_seen_ms: now,
             },
         );
-        live.desired.clone()
+        desired
     }
 
     fn forget_pods(&self, live: &mut Live, now: u64) {
@@ -972,7 +1017,13 @@ impl Ctl {
                 known.insert(id);
             }
         }
-        let mut outcome = reconcile(spec.as_ref(), &current, &|id| known.contains(id));
+        let production = self.is_production(ns);
+        let mut outcome = reconcile_guarded(
+            spec.as_ref(),
+            &current,
+            &|id| known.contains(id),
+            production,
+        );
         if outcome.action == Action::BuildSnapshot
             && let Some(spec) = &spec
         {

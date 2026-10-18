@@ -58,6 +58,24 @@ pub fn workload_apply(
     })
 }
 
+/// Garde-fou production (spec §9.5) : `mock` et `mock-partial` sont refusés dans un namespace
+/// labellisé `env=production`. `labels` absent (namespace illisible) : accepté, le contrôleur
+/// refusera de toute façon.
+pub fn check_namespace(
+    namespace: &str,
+    mode: &str,
+    labels: Option<&BTreeMap<String, String>>,
+) -> Result<(), String> {
+    use mimic_controller::reconcile::{PRODUCTION_LABEL, is_mock, is_production};
+    if is_mock(mode) && labels.is_some_and(is_production) {
+        return Err(format!(
+            "le namespace {namespace} est labellisé {}={} : le mode {mode} y est refusé (garde-fou production)",
+            PRODUCTION_LABEL.0, PRODUCTION_LABEL.1
+        ));
+    }
+    Ok(())
+}
+
 fn base(namespace: &str, workload: &str) -> String {
     format!("/v1/workloads/{namespace}/{workload}")
 }

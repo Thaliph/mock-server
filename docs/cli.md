@@ -40,6 +40,12 @@ contrôleur construit un snapshot des réponses enregistrées et tous les pods s
 même ; `--snapshot` rejoue un snapshot existant (par exemple celui d'un tir précédent).
 Un mode inconnu est refusé avant tout appel au cluster.
 
+**Garde-fou production** : dans un namespace labellisé `env=production`, `mock` et
+`mock-partial` sont refusés avec le code de sortie 2, sans rien appliquer. `mimicctl` lit
+pour cela les labels du namespace (`get` sur `namespaces`, inclus dans `mimic-operator`) ;
+s'il ne le peut pas, il le signale et applique, et c'est le contrôleur qui refuse (conditions
+`Aligned` et `Allowed` à `False`, raison `ProductionNamespace`).
+
 ```sh
 mimicctl mode checkout mock -n shop
 mimicctl mode checkout mock --snapshot 3f9a0c1e5b7d2a46 -n shop

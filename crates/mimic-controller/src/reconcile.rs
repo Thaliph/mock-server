@@ -1,9 +1,18 @@
 //! Réconciliation de `MimicWorkload` et alignement des pods (spec §5.5.1) : fonctions pures.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::crd::MODES;
 pub use crate::crd::MimicWorkloadSpec;
+use crate::crd::{MODES, MimicWorkloadStatus, StatusCondition};
+
+/// Label de namespace qui interdit le mock (spec §1 et §5.5.1).
+pub const PRODUCTION_LABEL: (&str, &str) = ("env", "production");
+/// Raison du refus, reprise dans les conditions `Aligned` et `Allowed`.
+pub const PRODUCTION_REASON: &str = "ProductionNamespace";
+/// Mode imposé à la place d'un mock refusé.
+const FALLBACK_MODE: &str = "record";
 
 /// État souhaité transmis aux sidecars ; vide, chaque sidecar garde le mode de sa configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,8 +36,61 @@ pub struct Outcome {
     pub error: Option<String>,
 }
 
-fn is_mock(mode: &str) -> bool {
+/// Vrai pour `mock` et `mock-partial`, les modes que le garde-fou refuse en production.
+pub fn is_mock(mode: &str) -> bool {
     mode == "mock" || mode == "mock-partial"
+}
+
+/// Vrai si les labels d'un namespace le désignent comme namespace de production.
+pub fn is_production(labels: &BTreeMap<String, String>) -> bool {
+    labels.get(PRODUCTION_LABEL.0).map(String::as_str) == Some(PRODUCTION_LABEL.1)
+}
+
+/// Comme `reconcile`, dans un namespace de production ou non : en production, `mock` et
+/// `mock-partial` sont refusés, sans snapshot construit ; un état souhaité déjà en mock
+/// repasse en `record` (spec §5.5.1).
+pub fn reconcile_guarded(
+    spec: Option<&MimicWorkloadSpec>,
+    current: &Desired,
+    exists: &dyn Fn(&str) -> bool,
+    production: bool,
+) -> Outcome {
+    match spec {
+        Some(s) if production && is_mock(&s.mode) => Outcome {
+            desired: leave_mock(current.clone()),
+            action: Action::None,
+            error: Some(PRODUCTION_REASON.into()),
+        },
+        _ => reconcile(spec, current, exists),
+    }
+}
+
+/// État souhaité sans mock : inchangé s'il n'en était pas un, sinon `record` sans snapshot.
+fn leave_mock(d: Desired) -> Desired {
+    if d.mode.as_deref().is_some_and(is_mock) {
+        Desired {
+            mode: Some(FALLBACK_MODE.into()),
+            snapshot: None,
+        }
+    } else {
+        d
+    }
+}
+
+/// Dernier rempart, au battement : un pod d'un namespace de production ne reçoit jamais de
+/// mock, et un pod qui en annonce un (configuration, état rechargé du disque) reçoit `record`.
+pub fn guard_pod(desired: Desired, production: bool, reported_mode: &str) -> Desired {
+    if !production {
+        return desired;
+    }
+    let desired = leave_mock(desired);
+    if desired.mode.is_none() && is_mock(reported_mode) {
+        return Desired {
+            mode: Some(FALLBACK_MODE.into()),
+            snapshot: None,
+        };
+    }
+    desired
 }
 
 /// Calcule l'état souhaité à partir de la ressource et de l'état courant.
@@ -150,5 +212,48 @@ pub fn summarize(states: &[PodState], error: Option<&str>) -> Summary {
         aligned,
         ready: reason.is_none(),
         reason,
+    }
+}
+
+/// Statut publié sur la ressource : snapshot servi, pods alignés et conditions `Aligned` et
+/// `Allowed` (spec §5.5.1).
+pub fn status_of(
+    desired: &Desired,
+    summary: &Summary,
+    generation: Option<i64>,
+) -> MimicWorkloadStatus {
+    let refused = summary.reason.as_deref() == Some(PRODUCTION_REASON);
+    let allowed = if refused {
+        StatusCondition {
+            type_: "Allowed".into(),
+            status: "False".into(),
+            reason: Some(PRODUCTION_REASON.into()),
+            message: Some(format!(
+                "mock et mock-partial sont refusés dans un namespace labellisé {}={}",
+                PRODUCTION_LABEL.0, PRODUCTION_LABEL.1
+            )),
+        }
+    } else {
+        StatusCondition {
+            type_: "Allowed".into(),
+            status: "True".into(),
+            reason: None,
+            message: None,
+        }
+    };
+    MimicWorkloadStatus {
+        snapshot: desired.snapshot.clone(),
+        pods: summary.pods,
+        aligned: summary.aligned,
+        observed_generation: generation,
+        conditions: vec![
+            StatusCondition {
+                type_: "Aligned".into(),
+                status: if summary.ready { "True" } else { "False" }.into(),
+                reason: summary.reason.clone(),
+                message: None,
+            },
+            allowed,
+        ],
     }
 }

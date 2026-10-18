@@ -1,7 +1,10 @@
 //! Critères CRD-* de la spec (§5.5.1) : réconciliation de `MimicWorkload`, sans cluster.
 
+use std::collections::BTreeMap;
+
 use mimic_controller::reconcile::{
-    Action, Desired, MimicWorkloadSpec, PodReport, PodState, pod_state, reconcile, summarize,
+    Action, Desired, MimicWorkloadSpec, PRODUCTION_REASON, PodReport, PodState, guard_pod,
+    is_production, pod_state, reconcile, reconcile_guarded, status_of, summarize,
 };
 
 fn spec(mode: &str, snapshot: Option<&str>) -> MimicWorkloadSpec {
@@ -16,6 +19,13 @@ fn desired(mode: &str, snapshot: Option<&str>) -> Desired {
         mode: Some(mode.into()),
         snapshot: snapshot.map(Into::into),
     }
+}
+
+fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 const ID: &str = "3f9a0c1e5b7d2a46";
@@ -127,4 +137,109 @@ fn crd_06_status_counts_aligned_pods() {
     let s = summarize(&[PodState::Aligned], Some("SnapshotNotFound"));
     assert!(!s.ready);
     assert_eq!(s.reason.as_deref(), Some("SnapshotNotFound"));
+}
+
+#[test]
+fn crd_07_production_namespace_refuses_mock() {
+    assert!(is_production(&labels(&[("env", "production")])));
+    assert!(!is_production(&labels(&[("env", "staging")])));
+    assert!(!is_production(&labels(&[("environment", "production")])));
+    assert!(!is_production(&BTreeMap::new()));
+
+    for mode in ["mock", "mock-partial"] {
+        // Depuis record : rien ne change, aucun snapshot n'est construit.
+        let previous = desired("record", None);
+        let o = reconcile_guarded(Some(&spec(mode, None)), &previous, &|_| true, true);
+        assert_eq!(o.action, Action::None, "{mode}");
+        assert_eq!(o.desired, previous);
+        assert_eq!(o.error.as_deref(), Some(PRODUCTION_REASON));
+        // Snapshot épinglé : refusé aussi.
+        let o = reconcile_guarded(Some(&spec(mode, Some(ID))), &previous, &|_| true, true);
+        assert_eq!(o.desired, previous);
+        assert_eq!(o.error.as_deref(), Some(PRODUCTION_REASON));
+        // Depuis le mock (namespace labellisé après coup) : retour en record.
+        let o = reconcile_guarded(
+            Some(&spec(mode, None)),
+            &desired("mock", Some(ID)),
+            &|_| true,
+            true,
+        );
+        assert_eq!(o.desired, desired("record", None));
+        assert_eq!(o.error.as_deref(), Some(PRODUCTION_REASON));
+        // Ressource toute neuve : l'état souhaité reste vide.
+        let o = reconcile_guarded(
+            Some(&spec(mode, None)),
+            &Desired::default(),
+            &|_| true,
+            true,
+        );
+        assert_eq!(o.desired, Desired::default());
+    }
+    // record et passthrough restent permis.
+    let o = reconcile_guarded(
+        Some(&spec("passthrough", None)),
+        &desired("mock", Some(ID)),
+        &|_| true,
+        true,
+    );
+    assert_eq!(o.desired, desired("passthrough", None));
+    assert_eq!(o.error, None);
+    // Label retiré : le mock est de nouveau accepté.
+    let o = reconcile_guarded(
+        Some(&spec("mock", None)),
+        &desired("record", None),
+        &|_| false,
+        false,
+    );
+    assert_eq!(o.action, Action::BuildSnapshot);
+    assert_eq!(o.error, None);
+
+    // Battement : jamais de mock vers un pod de production, même annoncé par le pod.
+    assert_eq!(
+        guard_pod(Desired::default(), true, "mock"),
+        desired("record", None)
+    );
+    assert_eq!(
+        guard_pod(Desired::default(), true, "mock-partial"),
+        desired("record", None)
+    );
+    assert_eq!(
+        guard_pod(Desired::default(), true, "record"),
+        Desired::default()
+    );
+    assert_eq!(
+        guard_pod(desired("mock", Some(ID)), true, "record"),
+        desired("record", None)
+    );
+    assert_eq!(
+        guard_pod(desired("mock", Some(ID)), false, "record"),
+        desired("mock", Some(ID))
+    );
+
+    // Statut : conditions Aligned et Allowed explicites.
+    let s = summarize(&[PodState::Aligned], Some(PRODUCTION_REASON));
+    let st = status_of(&desired("record", None), &s, Some(3));
+    assert_eq!(st.observed_generation, Some(3));
+    let cond = |t: &str| st.conditions.iter().find(|c| c.type_ == t).unwrap().clone();
+    assert_eq!(cond("Aligned").status, "False");
+    assert_eq!(cond("Aligned").reason.as_deref(), Some(PRODUCTION_REASON));
+    let allowed = cond("Allowed");
+    assert_eq!(allowed.status, "False");
+    assert_eq!(allowed.reason.as_deref(), Some(PRODUCTION_REASON));
+    assert!(
+        allowed
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("env=production"),
+        "{allowed:?}"
+    );
+    let ok = status_of(
+        &desired("mock", Some(ID)),
+        &summarize(&[PodState::Aligned], None),
+        Some(4),
+    );
+    assert_eq!(ok.snapshot.as_deref(), Some(ID));
+    let allowed = ok.conditions.iter().find(|c| c.type_ == "Allowed").unwrap();
+    assert_eq!(allowed.status, "True");
 }

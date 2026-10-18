@@ -20,10 +20,14 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
-  # Rattachement du pod authentifié à son workload.
+  # Rattachement du pod authentifié à son workload, et ses labels (spec.selector).
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
+  # Garde-fou production : labels des namespaces (env=production, spec §5.5.1).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -47,6 +51,11 @@ rules:
   - apiGroups: ["mimic.platform.io"]
     resources: ["mimicworkloads"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # `mimicctl mode` lit les labels du namespace (garde-fou production) ; lié par
+  # RoleBinding, ce droit ne porte que sur le namespace du RoleBinding.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
 ---
 # Lecture seule, agrégée au rôle standard `view`.
 apiVersion: rbac.authorization.k8s.io/v1

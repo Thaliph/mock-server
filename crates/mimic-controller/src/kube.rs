@@ -5,13 +5,51 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use k8s_openapi::api::core::v1::Namespace;
 use kube::ResourceExt;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, ListParams, Patch, PatchParams};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
 
-use crate::crd::{MimicWorkload, MimicWorkloadStatus, StatusCondition};
+use crate::crd::{MimicWorkload, MimicWorkloadStatus};
+use crate::reconcile::status_of;
 use crate::state::Ctl;
+
+/// Première lecture des labels de tous les namespaces, avant de servir les sidecars : sans
+/// elle, un redémarrage laisserait une fenêtre sans garde-fou production (spec §5.5.1).
+pub async fn load_namespaces(ctl: &Ctl, client: &kube::Client) -> Result<(), String> {
+    let api: Api<Namespace> = Api::all(client.clone());
+    let list = api
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| format!("liste des namespaces (garde-fou production): {e}"))?;
+    for ns in list.items {
+        ctl.set_namespace_labels(&ns.name_any(), ns.labels()).await;
+    }
+    Ok(())
+}
+
+/// Suit les labels des namespaces : poser ou retirer `env=production` réconcilie les
+/// ressources du namespace.
+pub async fn watch_namespaces(ctl: Arc<Ctl>, client: kube::Client) {
+    let api: Api<Namespace> = Api::all(client);
+    let mut events = watcher::watcher(api, watcher::Config::default())
+        .default_backoff()
+        .boxed();
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(Event::Apply(ns) | Event::InitApply(ns)) => {
+                ctl.set_namespace_labels(&ns.name_any(), ns.labels()).await;
+            }
+            Ok(Event::Delete(ns)) => {
+                ctl.set_namespace_labels(&ns.name_any(), &BTreeMap::new())
+                    .await;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "surveillance des namespaces"),
+        }
+    }
+}
 
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -52,18 +90,7 @@ pub async fn publish_status(ctl: Arc<Ctl>, client: kube::Client) {
             let status = ctl
                 .with_live(&ns, &name, |w| {
                     w.spec.as_ref()?;
-                    let s = ctl.summary(w);
-                    Some(MimicWorkloadStatus {
-                        snapshot: w.desired.snapshot.clone(),
-                        pods: s.pods,
-                        aligned: s.aligned,
-                        observed_generation: w.generation,
-                        conditions: vec![StatusCondition {
-                            type_: "Aligned".into(),
-                            status: if s.ready { "True" } else { "False" }.into(),
-                            reason: s.reason,
-                        }],
-                    })
+                    Some(status_of(&w.desired, &ctl.summary(w), w.generation))
                 })
                 .await;
             let Some(status) = status else {
