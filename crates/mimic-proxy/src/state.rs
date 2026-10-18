@@ -43,6 +43,8 @@ pub struct AppState {
     pub metrics: Metrics,
     pub redactor: Redactor,
     pub client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    /// Client HTTP/2 seulement (h2c en connaissance préalable, h2 via ALPN) : gRPC.
+    pub client_h2: Client<HttpsConnector<HttpConnector>, ProxyBody>,
     /// Interception TLS : CA et configuration serveur, si `tls.intercept` n'est pas vide.
     pub tls: Option<TlsState>,
     engine: Mutex<Option<(EngineKey, MockEngine)>>,
@@ -53,6 +55,8 @@ pub struct AppState {
     pub share_status: Mutex<ShareStatus>,
     /// Réveille la boucle de partage (`POST /share/sync`).
     pub share_notify: tokio::sync::Notify,
+    /// Adresse de l'application pour le trafic entrant, par port (spec §3.1).
+    pub inbound_targets: crate::net::InboundTargets,
 }
 
 /// Source du moteur de mock en cache.
@@ -86,14 +90,21 @@ impl AppState {
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
         http.enforce_http(false);
+        let tls_client = crate::tls::client_config(config.tls.upstream_ca_file.as_deref())?;
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(crate::tls::client_config(
-                config.tls.upstream_ca_file.as_deref(),
-            )?)
+            .with_tls_config(tls_client.clone())
             .https_or_http()
             .enable_http1()
-            .wrap_connector(http);
+            .wrap_connector(http.clone());
         let client = Client::builder(TokioExecutor::new()).build(connector);
+        let connector_h2 = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls_client)
+            .https_or_http()
+            .enable_http2()
+            .wrap_connector(http);
+        let client_h2 = Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build(connector_h2);
         let tls = if config.tls.intercept.is_empty() {
             None
         } else {
@@ -124,11 +135,13 @@ impl AppState {
             .unwrap_or_default();
         Ok(Arc::new(Self {
             mode: AtomicU8::new(config.mode.to_u8()),
+            inbound_targets: crate::net::InboundTargets::new(config.inbound.upstream),
             config,
             store,
             metrics,
             redactor,
             client,
+            client_h2,
             engine: Mutex::new(None),
             snapshot: Mutex::new(None),
             controller_status: Mutex::new(crate::control::ControllerStatus {
