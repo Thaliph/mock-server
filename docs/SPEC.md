@@ -264,7 +264,7 @@ Le type de correspondance vaut `exact` si le score est 1, `template` si le chemi
 | Stratégie | Comportement |
 |-----------|--------------|
 | `best` **[DÉFAUT]** | meilleur score, puis la réponse la plus fréquente, puis la plus récente (§5.6) |
-| `round-robin` | rotation sur les exemples |
+| `round-robin` | rotation sur les exemples ; un curseur par chemin enregistré, et un seul par opération pour les chemins jamais enregistrés |
 | `sequence` | rejoue dans l'ordre d'enregistrement (scénarios à état : création puis lecture) |
 | `weighted-status` | respecte la distribution des codes observés (ex. 2 % de 429) pour reproduire les erreurs réelles |
 
@@ -275,11 +275,11 @@ Le tirage aléatoire (latence, `weighted-status`) utilise un générateur à gra
 **Tenue en charge du mock** : le coût d'une requête mockée ne dépend ni de la taille du store ni du nombre de requêtes concurrentes.
 
 - **Index** : le moteur range les enregistrements par (authority, méthode, forme du chemin), la forme étant celle du §5.2 (segment identifiant remplacé par sa nature) : deux chemins sont « égaux ou de même template » si et seulement s'ils ont la même forme. Une requête ne compare que les enregistrements **rejouables** de son opération ; les autres ne servent qu'à la distribution de latence, extraite une fois à la construction. Le moteur partage les échanges du store sans les copier.
-- **Vue immuable, sans verrou** : le moteur est construit hors du chemin des requêtes, puis publié d'un bloc ; une requête lit le moteur courant sans prendre de verrou et ne le construit jamais quand il sait lui répondre. Seuls les curseurs de `round-robin` et `sequence` ont un verrou, tenu le temps d'avancer d'un pas.
+- **Vue immuable, sans verrou** : le moteur est construit hors du chemin des requêtes, puis publié d'un bloc ; une requête lit le moteur courant sans prendre de verrou et ne le construit jamais quand il sait lui répondre. Les curseurs de `round-robin` et `sequence` sont des compteurs atomiques fixés à la construction : un par chemin enregistré, et un par opération pour les requêtes dont le chemin n'a jamais été enregistré (identifiants uniques). Leur nombre ne dépend donc pas du nombre de chemins demandés.
 - **Construction à la bascule** : passer en `mock` ou `mock-partial`, ou recevoir un snapshot en mock, construit le moteur avant que le nouveau mode ou le nouveau snapshot ne serve une requête. Repasser en `record` ou `passthrough` libère le moteur.
-- **Données locales qui changent** : sans snapshot, le store évolue encore pendant le mock (imports des pairs en partage direct, §5.4 ; requêtes relayées puis enregistrées en `mock-partial`). Le moteur courant continue de servir, et un moteur à jour est reconstruit en tâche de fond, au plus une fois par seconde. Une requête sans correspondance dans un moteur construit avant son arrivée attend, avant de conclure, un moteur qui connaît tous les enregistrements présents à son arrivée ; les requêtes qui attendent ensemble partagent la même construction. En `mock-partial`, une requête relayée puis enregistrée est donc servie par le mock dès la suivante.
+- **Données locales qui changent** : sans snapshot, le store évolue encore pendant le mock (imports des pairs en partage direct, §5.4 ; requêtes relayées puis enregistrées en `mock-partial`). Le moteur courant continue de servir, et un moteur à jour est reconstruit en tâche de fond, au plus une fois par seconde. Une requête sans correspondance dans un moteur construit avant son arrivée ne déclenche pas de construction : tant que le mock sert sans snapshot, le store tient un index, par opération, des échanges sortants ajoutés depuis la construction du moteur en service. La requête est comparée aux enregistrements de son opération arrivés depuis (un petit moteur construit sur eux seuls), puis conclut, et la reconstruction complète reste celle de la tâche de fond. En `mock-partial`, une requête relayée puis enregistrée est donc servie par le mock dès la suivante, sans que chaque échange relayé reconstruise le moteur. L'index est vidé à chaque publication d'un moteur ; au-delà de 4 096 ajouts sans publication, il est abandonné et une requête sans correspondance attend, comme repli, un moteur qui connaît tous les enregistrements présents à son arrivée (les requêtes qui attendent ensemble partagent la même construction).
 - **Réponse préparée** : headers convertis et body réencodé dans son `Content-Encoding` d'origine (`gzip`, `deflate`, `br`, `zstd`) une seule fois par enregistrement, au premier rejeu, puis servis tels quels.
-- **Constructions comptées** : `mimic_mock_engine_builds_total{trigger}`, avec `switch` (bascule de mode ou de snapshot), `refresh` (reconstruction en tâche de fond) et `unmatched` (requête sans correspondance sur un moteur périmé).
+- **Constructions comptées** : `mimic_mock_engine_builds_total{trigger}`, avec `switch` (bascule de mode ou de snapshot), `refresh` (reconstruction en tâche de fond) et `unmatched` (requête sans correspondance sur un moteur périmé, quand l'index des ajouts a été abandonné).
 
 **WebSocket** : une poignée de main WebSocket n'est jamais servie depuis le store, puisque les trames ne sont pas enregistrées (§3.4). En `mock` comme en `mock-partial`, elle est relayée vers l'amont et enregistrée, quel que soit `mock.unmatched`, sans passer par le moteur (ni `mimic_mock_responses_total`, ni latence injectée). Le moteur ignore les échanges de code `1xx` : ils ne sont ni rejoués ni comptés dans la distribution de latence, dont la durée d'une connexion WebSocket fausserait le tirage.
 
@@ -705,6 +705,8 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 
 `authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité.
 
+**Coût sur le chemin des requêtes** : compter une requête n'alloue rien. Les labels fixes (`direction`, `mode`, `match`, `kind`, `reason`, méthodes standard) sont des chaînes statiques, le code est un entier, et l'authority est une chaîne partagée, résolue sous un verrou pris en lecture. Les jauges du store (`mimic_store_exchanges`, `mimic_store_bytes`) sont calculées à la lecture de `/metrics`, et non à chaque échange enregistré.
+
 **Label `version`** : quand la version du pod est connue, toutes les métriques du sidecar portent le label constant `version`, pour comparer deux versions d'un workload (p99, débit, codes ; CPU et mémoire du kubelet par jointure sur `pod`, §5.8). La valeur vient, dans l'ordre, de `MIMIC_VERSION`, de `version` dans la configuration, puis de `MIMIC_POD_TEMPLATE_HASH` ; l'injecteur pose les deux variables depuis les labels du pod (§9.4). Valeur vide : pas de label. Elle est fixée au démarrage et tronquée à 63 caractères (taille maximale d'un label Kubernetes) : un pod n'a qu'une valeur, le label ne multiplie donc aucune série d'un pod, et le nombre de valeurs suit celui des versions déployées, pas le trafic.
 
 Logs JSON structurés (`tracing`). Propagation de `traceparent` inchangée.
@@ -881,6 +883,8 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-17 | moteur en service, puis nouvel échange sortant dans le store (import d'un pair) ; mode `mock-partial` | requêtes avec correspondance ; requête sur le nouvel échange ; requête relayée puis la même | les premières servies par le moteur courant, sans construction ; la deuxième servie depuis le nouvel échange, pas `599` ; la troisième mockée dès la seconde fois |
 | MCK-18 | enregistrement dont la réponse est en `gzip` | rejeux successifs | le body est encodé une seule fois : les mêmes octets, sans nouvel encodage, à chaque rejeu |
 | MCK-19 | poignée de main WebSocket enregistrée (`101`, body vide, durée de connexion de 60 s) et un `200` de 10 ms sur le même chemin | construction du moteur, requête sur ce chemin | le `101` n'est ni compté ni rejouable : le `200` est servi, avec une latence de 10 ms ; seul, le `101` donne une absence de correspondance |
+| MCK-20 | stratégie `round-robin`, puis `sequence` ; deux enregistrements rejouables de `GET /users/1` et deux de `GET /users/2` | 10 000 requêtes sur des identifiants jamais enregistrés, puis 100 requêtes alternées sur `/users/1` et `/users/2` | le moteur tient au plus un curseur par chemin enregistré et un par opération (ici 2 + 1), quel que soit le nombre de chemins demandés ; `round-robin` : les 10 000 sont réparties à parts égales sur les quatre enregistrements, et `/users/1` comme `/users/2` alternent entre leurs deux enregistrements ; `sequence` : les 10 000 parcourent les quatre enregistrements dans l'ordre d'enregistrement |
+| MCK-21 | mode `mock-partial`, moteur en service sur 2 000 échanges | 200 requêtes vers 200 opérations inconnues, chacune relayée puis enregistrée, suivie de la même ; requêtes avec correspondance entre elles | aucune construction déclenchée par une requête (`mimic_mock_engine_builds_total{trigger="unmatched"}` à 0) et au plus une reconstruction en tâche de fond par seconde écoulée (plus une) ; chaque requête répétée est mockée (`x-mimic-match`), l'amont n'en reçoit que 200 ; les requêtes avec correspondance sont servies |
 
 **Snapshots (SNP)**
 
@@ -1002,6 +1006,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ADM-02 | trafic entrant et sortant, en record puis en mock | `GET /metrics` | les métriques du tableau §9.3 sont présentes avec les bons labels |
 | ADM-03 | `PUT /mode` avec `mock` | requête suivante | servie en mock, `mimic_mode{mode="mock"} 1` |
 | ADM-04 | `MIMIC_VERSION=v2` ; puis `MIMIC_VERSION` vide et `MIMIC_POD_TEMPLATE_HASH=7d9f` ; puis aucune version | trafic, `GET /metrics` | chaque métrique porte `version="v2"`, puis `version="7d9f"`, puis aucun label `version` ; valeur tronquée à 63 caractères |
+| ADM-05 | authority et séries déjà vues | comptage d'une requête : `mimic_requests_total`, durée, réponse et latence injectée du mock, erreur amont, capture abandonnée | aucune allocation mémoire ; l'authority est résolue sans verrou exclusif ; après du trafic, `/metrics` donne des jauges du store exactes, calculées à la lecture |
 
 **Init (INI)**
 
@@ -1129,6 +1134,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P3c | Sidecar borné : réservoir par opération, budget mémoire, journal local segmenté, file de partage bornée, logs limités | CAP-*, SHR-06, SHR-07, PRX-10, PRX-11 |
 | P3d | Mock fidèle et concurrent : moteur indexé par forme de chemin et sans verrou, construit à la bascule, latence comptée depuis l'arrivée avec un minuteur précis, réponse préparée une fois, redaction sans réécriture des bodies intacts | MCK-13 à 18, RED-05 |
 | P3e | Correctifs fonctionnels : relais WebSocket dans tous les modes, poignée de main enregistrée, jamais rejouée ; énumérations inférées seulement sur un échantillon suffisant | PRX-12 à 14, MCK-19, INF-09 |
+| P3f | Chemin chaud du sidecar : métriques sans allocation, curseurs de `round-robin` et `sequence` bornés, mock-partial sans reconstruction du moteur par échange relayé | MCK-20, MCK-21, ADM-05 |
 | P4 | `mimic-init` iptables, détection de protocole (connexions muettes comprises), image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08, PRX-15 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
