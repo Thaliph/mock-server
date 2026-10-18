@@ -1,5 +1,5 @@
-//! Critères MCK-16, MCK-17 et RED-05 (spec §5.3, §7 et §11.2) : moteur de mock construit à la
-//! bascule, servi sans reconstruction, et bodies rejoués octet pour octet.
+//! Critères MCK-16, MCK-17, MCK-21 et RED-05 (spec §5.3, §7 et §11.2) : moteur de mock
+//! construit à la bascule, servi sans reconstruction, et bodies rejoués octet pour octet.
 
 mod common;
 
@@ -117,11 +117,17 @@ async fn mck_17_store_changes_do_not_block_matched_requests() {
     let r = get("/orders/7").await;
     assert_eq!(r.status(), 200);
     assert_eq!(r.text().await.unwrap(), r#"{"order":7}"#);
+    // Servie par l'index des ajouts (MCK-21) : la reconstruction se fait en tâche de fond.
     let m = metrics(&p).await;
-    assert!(
-        builds(&m, "unmatched") + builds(&m, "refresh") >= 1.0,
-        "{m}"
-    );
+    assert_eq!(builds(&m, "unmatched"), 0.0, "{m}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while builds(&metrics(&p).await, "refresh") < 1.0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reconstruction en tâche de fond"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // Toujours rien pour une requête inconnue.
     assert_eq!(get("/nothing").await.status().as_u16(), 599);
 
@@ -169,4 +175,57 @@ async fn red_05_untouched_json_is_replayed_byte_for_byte() {
         raw.len().to_string().as_str()
     );
     assert_eq!(r.text().await.unwrap(), raw);
+}
+
+/// mock-partial : un échange relayé puis enregistré ne reconstruit pas le moteur ; la même
+/// requête est mockée dès la suivante (spec §5.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mck_21_relayed_exchanges_do_not_rebuild_the_engine() {
+    let saas = fake_server().await;
+    let p = proxy(config(None, Mode::Record)).await;
+    for i in 0..2_000 {
+        let path = format!("/users/{}", i % 50 + 1);
+        p.state().store.add(
+            recorded(&path, &format!("peer-{i:05}"), &format!(r#"{{"n":{i}}}"#)),
+            Origin::Peer,
+        );
+    }
+    set_mode(&p, "mock-partial").await;
+    let started = std::time::Instant::now();
+    let app = app_client(&p);
+    for i in 0..200 {
+        // Opération inconnue : relayée, puis enregistrée.
+        let url = saas.url(&format!("/items{i}"));
+        let r = app.get(&url).send().await.unwrap();
+        assert!(!r.headers().contains_key("x-mimic-match"));
+        let stored = 2_001 + i;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while p.state().store.len() < stored {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "échange {i} enregistré"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // La même : mockée, sans nouvel appel à l'amont.
+        let r = app.get(&url).send().await.unwrap();
+        assert!(r.headers().contains_key("x-mimic-match"), "requête {i}");
+        assert_eq!(saas.hits(), i + 1);
+        // Avec correspondance : servie par le moteur en service.
+        let r = app
+            .get(format!("http://dep.test/users/{}", i % 50 + 1))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let m = metrics(&p).await;
+    assert_eq!(builds(&m, "switch"), 1.0, "{m}");
+    assert_eq!(builds(&m, "unmatched"), 0.0, "{m}");
+    assert!(
+        builds(&m, "refresh") <= elapsed.ceil() + 1.0,
+        "{elapsed} s : {m}"
+    );
+    assert_eq!(saas.hits(), 200);
 }
