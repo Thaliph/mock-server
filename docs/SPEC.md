@@ -403,7 +403,13 @@ Algorithme (implémenté dans `mimic-core::infer::path`) :
 
 - JSON : fusion incrémentale des types observés. Un champ présent dans 100 % des exemples est `required`. Plusieurs types → `oneOf` (sauf `null` → `type: [T, "null"]`).
 - Formats détectés : `date-time`, `date`, `uuid`, `email`, `uri`, `ipv4`.
-- Enum : chaîne avec ≤ 10 valeurs distinctes sur ≥ 30 observations.
+- Enum : un `enum` ferme le contrat (toute autre valeur devient invalide). Il n'est déclaré que si l'échantillon le justifie, sinon la chaîne reste un `type: string` ouvert. Toutes les conditions suivantes doivent tenir :
+  - au moins `min_observations` observations de la chaîne (**20** par défaut ; c'est le nombre de bodies gardés par couple (opération, code) en capture, §5.2) ;
+  - au moins deux valeurs distinctes, et au plus `max_values` (**10** par défaut) : une valeur unique est une constante observée, pas un ensemble fermé ;
+  - chaque valeur vue au moins `min_value_count` fois (**2** par défaut) : une valeur rare laisse supposer que d'autres n'ont pas encore été vues ;
+  - pas de série numérotée : deux valeurs qui ne diffèrent que par leurs chiffres (`user0` et `user6`, `v1` et `v2`) décrivent un nom ou un compteur, pas une liste de constantes.
+
+  Les trois seuils sont réglables dans les options d'inférence (`InferOptions::enums`, §6). Un format détecté (`uuid`, `date`…) l'emporte sur l'`enum`. Les valeurs de l'`enum` sont triées, ce qui garde la sortie déterministe (INF-08).
 - Tableaux : schéma des items fusionné sur tous les éléments.
 - `application/x-www-form-urlencoded` et `multipart/form-data` : propriétés à plat.
 - Autres types : `format: binary`, pas d'inférence.
@@ -757,6 +763,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | INF-06 | champ `status` avec 3 valeurs sur 100 observations | inférence | `enum` de 3 valeurs |
 | INF-07 | n'importe quel corpus (proptest) | inférence | la spec produite est un OpenAPI 3.1 valide |
 | INF-08 | même corpus, ordre des échanges permuté (proptest) | inférence | spec identique (déterminisme) |
+| INF-09 | champs texte de réponse sur 60 appels : `name` ∈ `user0`…`user6` ; `status` à 3 valeurs sur 20 observations, chacune vue au moins deux fois ; `kind` à 3 valeurs dont une vue une seule fois ; `tier` à 2 valeurs sur 19 observations ; `plan` toujours `basic` ; puis les mêmes `tier` avec `min_observations: 10` | inférence | `enum` seulement pour `status` (et `tier` avec le seuil abaissé) ; `name`, `kind`, `tier` et `plan` restent `type: string` sans `enum` |
 
 **Redaction (RED)**
 
@@ -1021,6 +1028,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P3b | Partage entre sidecars d'un workload | SHR-* |
 | P3c | Sidecar borné : réservoir par opération, budget mémoire, journal local segmenté, file de partage bornée, logs limités | CAP-*, SHR-06, SHR-07, PRX-10, PRX-11 |
 | P3d | Mock fidèle et concurrent : moteur indexé par forme de chemin et sans verrou, construit à la bascule, latence comptée depuis l'arrivée avec un minuteur précis, réponse préparée une fois, redaction sans réécriture des bodies intacts | MCK-13 à 18, RED-05 |
+| P3e | Correctifs fonctionnels : énumérations inférées seulement sur un échantillon suffisant | INF-09 |
 | P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |

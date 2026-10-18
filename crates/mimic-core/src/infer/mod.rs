@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use crate::model::{Body, Direction, Exchange, is_json, media_type};
 use crate::redact::is_marker;
 use path::{PathTemplater, SegmentKind, Templated};
+pub use schema::EnumRules;
 use schema::SchemaAcc;
 
 /// Headers de requête qui ne décrivent pas l'API (transport, proxy, traçage, authentification).
@@ -59,6 +60,8 @@ pub struct InferOptions {
     pub direction: Direction,
     /// Nombre d'exemples conservés par corps (requête ou réponse) et type de contenu.
     pub max_examples: usize,
+    /// Seuils au-delà desquels une chaîne devient un `enum` (spec §6.3).
+    pub enums: EnumRules,
 }
 
 impl InferOptions {
@@ -68,11 +71,17 @@ impl InferOptions {
             version: version.into(),
             direction: Direction::Inbound,
             max_examples: 3,
+            enums: EnumRules::default(),
         }
     }
 
     pub fn direction(mut self, direction: Direction) -> Self {
         self.direction = direction;
+        self
+    }
+
+    pub fn enums(mut self, enums: EnumRules) -> Self {
+        self.enums = enums;
         self
     }
 }
@@ -82,6 +91,15 @@ impl InferOptions {
 pub fn infer_outbound<E: Borrow<Exchange>>(
     exchanges: &[E],
     version: &str,
+) -> BTreeMap<String, Value> {
+    infer_outbound_with(exchanges, &InferOptions::new("", version))
+}
+
+/// Comme [`infer_outbound`], avec les options de `base` (seuils, exemples) ; le titre de chaque
+/// document est l'authority de la dépendance.
+pub fn infer_outbound_with<E: Borrow<Exchange>>(
+    exchanges: &[E],
+    base: &InferOptions,
 ) -> BTreeMap<String, Value> {
     let mut by_authority: BTreeMap<&str, Vec<&Exchange>> = BTreeMap::new();
     for e in exchanges
@@ -94,7 +112,11 @@ pub fn infer_outbound<E: Borrow<Exchange>>(
     by_authority
         .into_iter()
         .map(|(authority, list)| {
-            let opts = InferOptions::new(authority, version).direction(Direction::Outbound);
+            let opts = InferOptions {
+                title: authority.to_string(),
+                direction: Direction::Outbound,
+                ..base.clone()
+            };
             (authority.to_string(), infer(&list, &opts))
         })
         .collect()
@@ -118,7 +140,7 @@ pub fn infer<E: Borrow<Exchange>>(exchanges: &[E], opts: &InferOptions) -> Value
         let key = (t.template.clone(), e.method.to_ascii_lowercase());
         ops.entry(key)
             .or_insert_with(|| OperationAcc::new(&t))
-            .add(e, opts.max_examples);
+            .add(e, opts);
     }
 
     let mut paths = Map::new();
@@ -126,7 +148,7 @@ pub fn infer<E: Borrow<Exchange>>(exchanges: &[E], opts: &InferOptions) -> Value
         let item = paths
             .entry(template.clone())
             .or_insert_with(|| Value::Object(Map::new()));
-        item[method.as_str()] = op.to_operation(template, method);
+        item[method.as_str()] = op.to_operation(template, method, &opts.enums);
     }
 
     let direction = match opts.direction {
@@ -188,7 +210,8 @@ impl OperationAcc {
         }
     }
 
-    fn add(&mut self, e: &Exchange, max_examples: usize) {
+    fn add(&mut self, e: &Exchange, opts: &InferOptions) {
+        let (rules, max_examples) = (&opts.enums, opts.max_examples);
         self.count += 1;
         self.latencies_us.push(e.total_us);
         self.started_ms.push(e.started_at_ms);
@@ -200,7 +223,7 @@ impl OperationAcc {
                 entry.0 += 1;
             }
             if !is_marker(value) {
-                entry.1.add_scalar_text(value);
+                entry.1.add_scalar_text(value, rules);
             }
         }
         let mut seen = BTreeSet::new();
@@ -212,7 +235,7 @@ impl OperationAcc {
             if seen.insert(&h.name) {
                 entry.0 += 1;
             }
-            entry.1.add_scalar_text(&h.value);
+            entry.1.add_scalar_text(&h.value, rules);
         }
 
         if let Some(ct) = e.req_header("content-type") {
@@ -221,6 +244,7 @@ impl OperationAcc {
                 &media_type(ct),
                 &e.req_body,
                 max_examples,
+                rules,
             );
         }
         let resp = self.responses.entry(e.status).or_default();
@@ -231,11 +255,12 @@ impl OperationAcc {
                 &media_type(ct),
                 &e.resp_body,
                 max_examples,
+                rules,
             );
         }
     }
 
-    fn to_operation(&self, template: &str, method: &str) -> Value {
+    fn to_operation(&self, template: &str, method: &str, rules: &EnumRules) -> Value {
         let mut parameters = vec![];
         for (name, kinds) in &self.path_params {
             parameters.push(json!({
@@ -250,7 +275,7 @@ impl OperationAcc {
                 let schema = if acc.count() == 0 {
                     json!({"type": "string"})
                 } else {
-                    acc.to_schema()
+                    acc.to_schema(rules)
                 };
                 parameters.push(json!({
                     "name": name,
@@ -269,7 +294,7 @@ impl OperationAcc {
         if !self.request.is_empty() {
             op.insert(
                 "requestBody".into(),
-                json!({"content": content_to_json(&self.request)}),
+                json!({"content": content_to_json(&self.request, rules)}),
             );
         }
         let mut responses = Map::new();
@@ -277,7 +302,7 @@ impl OperationAcc {
             let mut r = Map::new();
             r.insert("description".into(), "Observed response".into());
             if !resp.content.is_empty() {
-                r.insert("content".into(), content_to_json(&resp.content));
+                r.insert("content".into(), content_to_json(&resp.content, rules));
             }
             responses.insert(status.to_string(), Value::Object(r));
         }
@@ -319,6 +344,7 @@ fn add_body(
     media: &str,
     body: &Body,
     max_examples: usize,
+    rules: &EnumRules,
 ) {
     let Some(data) = body.bytes() else {
         return;
@@ -339,8 +365,8 @@ fn add_body(
         {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
             let mut acc = SchemaAcc::default();
-            acc.add_scalar_text(v);
-            let typed = match acc.to_schema()["type"].as_str() {
+            acc.add_scalar_text(v, rules);
+            let typed = match acc.to_schema(rules)["type"].as_str() {
                 Some("integer") => v
                     .parse::<i64>()
                     .map(Value::from)
@@ -357,7 +383,7 @@ fn add_body(
     let content = target.entry(media.to_string()).or_default();
     match value {
         Some(v) => {
-            content.schema.add(&v);
+            content.schema.add(&v, rules);
             if content.examples.len() < max_examples {
                 content.examples.push(v);
             }
@@ -366,13 +392,13 @@ fn add_body(
     }
 }
 
-fn content_to_json(content: &BTreeMap<String, ContentAcc>) -> Value {
+fn content_to_json(content: &BTreeMap<String, ContentAcc>, rules: &EnumRules) -> Value {
     let mut out = Map::new();
     for (media, c) in content {
         let schema = if c.binary && c.schema.count() == 0 {
             json!({"type": "string", "format": "binary"})
         } else {
-            c.schema.to_schema()
+            c.schema.to_schema(rules)
         };
         let mut m = Map::new();
         m.insert("schema".into(), schema);
