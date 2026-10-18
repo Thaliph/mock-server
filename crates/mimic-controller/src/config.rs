@@ -29,6 +29,10 @@ pub struct ControllerConfig {
     pub max_bytes_per_workload: u64,
     /// Endpoints gardés avec un exemple, par workload (spec §5.5.3).
     pub max_exemplars_per_workload: usize,
+    /// Taille sérialisée des exemples d'un workload (spec §5.5.3).
+    pub max_exemplar_bytes_per_workload: u64,
+    /// Taille sérialisée des exemples de tous les workloads.
+    pub max_exemplar_bytes_total: u64,
     /// Au plus un recalcul de la découverte d'un workload par intervalle.
     #[serde(with = "duration_secs")]
     pub discovery_interval: Duration,
@@ -56,6 +60,8 @@ impl Default for ControllerConfig {
             samples_per_operation: 20,
             max_bytes_per_workload: 256 * 1024 * 1024,
             max_exemplars_per_workload: mimic_core::exemplar::DEFAULT_MAX_ENDPOINTS,
+            max_exemplar_bytes_per_workload: 64 * 1024 * 1024,
+            max_exemplar_bytes_total: 512 * 1024 * 1024,
             discovery_interval: Duration::from_secs(30),
             snapshot: SnapshotConfig::default(),
             pod_timeout: Duration::from_secs(30),
@@ -132,6 +138,12 @@ impl ControllerConfig {
         }
         if self.max_exemplars_per_workload == 0 {
             return Err("max_exemplars_per_workload doit être positif".into());
+        }
+        if self.max_exemplar_bytes_per_workload == 0 || self.max_exemplar_bytes_total == 0 {
+            return Err(
+                "max_exemplar_bytes_per_workload et max_exemplar_bytes_total doivent être positifs"
+                    .into(),
+            );
         }
         if self.snapshot.max_per_key == 0 {
             return Err("snapshot.max_per_key doit être positif".into());

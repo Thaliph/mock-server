@@ -19,6 +19,8 @@ data:
     samples_per_operation: 20
     max_bytes_per_workload: 268435456
     max_exemplars_per_workload: 10000
+    max_exemplar_bytes_per_workload: 67108864  # 64 MiB d'exemples sérialisés par workload
+    max_exemplar_bytes_total: 536870912        # 512 MiB tous workloads confondus
     discovery_interval: 30
     snapshot:
       max_per_key: 50

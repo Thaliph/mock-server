@@ -61,6 +61,8 @@ pub struct Ctl {
     scanned: OnceCell<()>,
     /// Échanges en mémoire, tous workloads confondus.
     total: AtomicUsize,
+    /// Taille des exemples, tous workloads confondus (borne `max_exemplar_bytes_total`).
+    exemplar_room: Room,
     /// Namespaces labellisés `env=production` : le mock y est refusé (spec §5.5.1).
     production: Mutex<BTreeSet<String>>,
 }
@@ -151,6 +153,16 @@ struct Data {
     version: u64,
 }
 
+/// Place des exemples commune à tous les workloads.
+struct Room {
+    /// Octets tenus ; pris sous le verrou des échanges d'un workload, jamais l'inverse.
+    used: Mutex<u64>,
+    max: u64,
+}
+
+/// Exemples refusés : (borne en nombre, bornes en octets).
+type Refused = (u64, u64);
+
 /// Exemples ajoutés à une vue.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Extra {
@@ -203,13 +215,13 @@ impl Borrow<Exchange> for Tagged<'_> {
 }
 
 impl Data {
-    fn new(samples: usize, max_exemplars: usize) -> Self {
+    fn new(samples: usize, max_exemplars: usize, max_exemplar_bytes: u64) -> Self {
         Self {
             chunks: VecDeque::new(),
             len: 0,
             ids: BTreeSet::new(),
             bodies: BodySamples::new(samples),
-            exemplars: Exemplars::new(max_exemplars),
+            exemplars: Exemplars::with_limits(max_exemplars, max_exemplar_bytes),
             flushed: 0,
             offered: BTreeSet::new(),
             version: 0,
@@ -229,20 +241,38 @@ impl Data {
         }
     }
 
-    /// Propose des candidats aux exemples ; `key` est le segment d'où ils viennent. Rend le
-    /// nombre de candidats refusés faute de place.
-    fn offer(&mut self, key: Option<&str>, list: Vec<Arc<Exchange>>) -> u64 {
+    /// Propose des candidats aux exemples ; `key` est le segment d'où ils viennent. Rend les
+    /// candidats refusés faute de place.
+    fn offer(&mut self, key: Option<&str>, list: Vec<Arc<Exchange>>, room: &Room) -> Refused {
         if let Some(k) = key {
             self.offered.insert(k.to_string());
         }
-        let (version, refused) = (self.exemplars.version(), self.exemplars.refused());
-        for x in list {
-            self.exemplars.offer_shared(x);
+        self.propose(list, room, false)
+    }
+
+    /// Reprend les exemples relus de `exemplars.jsonl`, ceux sans body compris.
+    fn restore(&mut self, list: Vec<Arc<Exchange>>, room: &Room) -> Refused {
+        self.propose(list, room, true)
+    }
+
+    fn propose(&mut self, list: Vec<Arc<Exchange>>, room: &Room, restore: bool) -> Refused {
+        let x = &mut self.exemplars;
+        let (version, refused, refused_bytes) = (x.version(), x.refused(), x.refused_bytes());
+        let mut used = room.used.lock().expect("verrou de la place des exemples");
+        for e in list {
+            let (before, left) = (x.bytes(), room.max.saturating_sub(*used));
+            if restore {
+                x.restore_within(e, left);
+            } else {
+                x.offer_shared_within(e, left);
+            }
+            *used = (*used + x.bytes()).saturating_sub(before);
         }
-        if self.exemplars.version() != version {
+        drop(used);
+        if x.version() != version {
             self.version += 1;
         }
-        self.exemplars.refused() - refused
+        (x.refused() - refused, x.refused_bytes() - refused_bytes)
     }
 
     /// Garde les échanges inconnus de `list`, sans doublon.
@@ -548,6 +578,10 @@ fn parse_lines(bytes: &[u8]) -> Vec<Exchange> {
 
 impl Ctl {
     pub fn new(config: ControllerConfig, store: Arc<dyn ObjectStore>, auth: Authenticator) -> Self {
+        let exemplar_room = Room {
+            used: Mutex::new(0),
+            max: config.max_exemplar_bytes_total,
+        };
         Self {
             config,
             store,
@@ -556,6 +590,7 @@ impl Ctl {
             workloads: Mutex::new(BTreeMap::new()),
             scanned: OnceCell::new(),
             total: AtomicUsize::new(0),
+            exemplar_room,
             production: Mutex::new(BTreeSet::new()),
         }
     }
@@ -618,6 +653,7 @@ impl Ctl {
                     data: Mutex::new(Data::new(
                         self.config.samples_per_operation,
                         self.config.max_exemplars_per_workload,
+                        self.config.max_exemplar_bytes_per_workload,
                     )),
                     discovery: Mutex::new(DiscoveryCache::default()),
                 })
@@ -809,16 +845,17 @@ impl Ctl {
         .await
         .unwrap_or_default();
         let max = self.config.max_exchanges_per_workload;
-        let (mut added, mut refused) = (0, 0);
+        let (mut added, mut refused) = (0, (0, 0));
         {
             let mut d = e.data();
             for (key, instance, list, best) in parsed {
                 // Proposés avant que le plafond de bodies ne retire les leurs.
-                refused += d.offer(Some(&key), best);
+                let (count, bytes) = d.offer(Some(&key), best, &self.exemplar_room);
+                refused = (refused.0 + count, refused.1 + bytes);
                 added += d.push_front(instance, list, max);
             }
         }
-        self.metrics.exemplars_refused.inc_by(refused);
+        self.metrics.refuse_exemplars(refused);
         self.total.fetch_add(added, Ordering::Relaxed);
     }
 
@@ -937,8 +974,8 @@ impl Ctl {
             e.load_started.load(Ordering::Relaxed)
         };
         // Exemples proposés tels que reçus, avant le plafond de bodies en mémoire.
-        let refused = e.data().offer(Some(&key), best);
-        self.metrics.exemplars_refused.inc_by(refused);
+        let refused = e.data().offer(Some(&key), best, &self.exemplar_room);
+        self.metrics.refuse_exemplars(refused);
         if loading {
             let (added, evicted) =
                 e.data()
@@ -1264,12 +1301,16 @@ impl Ctl {
         self.metrics
             .exchanges
             .set(self.total.load(Ordering::Relaxed) as i64);
-        let exemplars: usize = self
+        let (exemplars, bytes) = self
             .entries()
             .iter()
-            .map(|e| e.data().exemplars.len())
-            .sum();
+            .map(|e| {
+                let d = e.data();
+                (d.exemplars.len(), d.exemplars.bytes())
+            })
+            .fold((0, 0), |(n, b), (dn, db)| (n + dn, b + db));
         self.metrics.exemplars.set(exemplars as i64);
+        self.metrics.exemplars_bytes.set(bytes as i64);
         let mut counts: BTreeMap<&'static str, i64> =
             [("aligned", 0), ("diverging", 0), ("absent", 0)].into();
         for (ns, wl) in keys {
@@ -1372,12 +1413,12 @@ impl Ctl {
                 .map_err(|err| format!("lecture de {path}: {err}"))?;
                 let refused = {
                     let mut d = e.data();
-                    let refused = d.offer(None, list);
+                    let refused = d.restore(list, &self.exemplar_room);
                     // Relus du support : rien à réécrire.
                     d.flushed = d.exemplars.version();
                     refused
                 };
-                self.metrics.exemplars_refused.inc_by(refused);
+                self.metrics.refuse_exemplars(refused);
                 Ok::<(), String>(())
             })
             .await
@@ -1442,8 +1483,8 @@ impl Ctl {
             let best = tokio::task::spawn_blocking(move || winners(&parse_lines(&bytes)))
                 .await
                 .unwrap_or_default();
-            let refused = e.data().offer(Some(&key), best);
-            self.metrics.exemplars_refused.inc_by(refused);
+            let refused = e.data().offer(Some(&key), best, &self.exemplar_room);
+            self.metrics.refuse_exemplars(refused);
         }
         match self.flush_exemplars(e).await {
             Ok(()) => true,
@@ -1521,8 +1562,8 @@ impl Ctl {
                         {
                             Ok((c, best)) => {
                                 compactor = c;
-                                let refused = e.data().offer(Some(key), best);
-                                self.metrics.exemplars_refused.inc_by(refused);
+                                let refused = e.data().offer(Some(key), best, &self.exemplar_room);
+                                self.metrics.refuse_exemplars(refused);
                             }
                             Err(_) => {
                                 compactor = Compactor::new(0);

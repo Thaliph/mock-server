@@ -31,8 +31,10 @@ pub struct Metrics {
     pub exchanges: Gauge,
     /// Exemples par endpoint gardés, tous workloads (spec §5.5.3).
     pub exemplars: Gauge,
-    /// Candidats sans exemple faute de place (`max_exemplars_per_workload`).
-    pub exemplars_refused: Counter,
+    /// Taille sérialisée des exemples gardés, tous workloads.
+    pub exemplars_bytes: Gauge,
+    /// Exemples refusés : `count` (`max_exemplars_per_workload`), `bytes` (bornes en octets).
+    pub exemplars_refused: Family<ReasonLabel, Counter>,
 }
 
 impl Default for Metrics {
@@ -45,7 +47,14 @@ impl Default for Metrics {
         let snapshots = Counter::default();
         let exchanges = Gauge::default();
         let exemplars = Gauge::default();
-        let exemplars_refused = Counter::default();
+        let exemplars_bytes = Gauge::default();
+        let exemplars_refused = Family::<ReasonLabel, Counter>::default();
+        // Les deux raisons sont exposées dès le départ, à zéro.
+        for reason in ["count", "bytes"] {
+            let _ = exemplars_refused.get_or_create(&ReasonLabel {
+                reason: reason.into(),
+            });
+        }
         registry.register(
             "mimic_controller_segments",
             "Segments reçus des sidecars",
@@ -83,8 +92,13 @@ impl Default for Metrics {
         );
         registry.register(
             "mimic_controller_exemplars_refused",
-            "Candidats sans exemple : plafond d'endpoints du workload atteint",
+            "Exemples refusés : plafond d'endpoints (count) ou bornes en octets (bytes)",
             exemplars_refused.clone(),
+        );
+        registry.register(
+            "mimic_controller_exemplars_bytes",
+            "Taille sérialisée des exemples gardés, tous workloads",
+            exemplars_bytes.clone(),
         );
         Self {
             registry,
@@ -95,12 +109,26 @@ impl Default for Metrics {
             snapshots,
             exchanges,
             exemplars,
+            exemplars_bytes,
             exemplars_refused,
         }
     }
 }
 
 impl Metrics {
+    /// Compte des exemples refusés, en nombre puis en octets.
+    pub fn refuse_exemplars(&self, (count, bytes): (u64, u64)) {
+        for (reason, n) in [("count", count), ("bytes", bytes)] {
+            if n > 0 {
+                self.exemplars_refused
+                    .get_or_create(&ReasonLabel {
+                        reason: reason.into(),
+                    })
+                    .inc_by(n);
+            }
+        }
+    }
+
     pub fn encode(&self) -> String {
         let mut out = String::new();
         let _ = prometheus_client::encoding::text::encode(&mut out, &self.registry);

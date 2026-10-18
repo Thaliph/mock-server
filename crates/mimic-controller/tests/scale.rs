@@ -1088,7 +1088,10 @@ async fn ctl_18_examples_are_bounded_and_counted() {
     let m = get_text(&c, "/metrics").await;
     assert_eq!(metric(&m, "mimic_controller_exemplars"), Some(2.0), "{m}");
     assert_eq!(
-        metric(&m, r#"mimic_controller_exemplars_refused_total{reason="count"}"#),
+        metric(
+            &m,
+            r#"mimic_controller_exemplars_refused_total{reason="count"}"#
+        ),
         Some(1.0),
         "{m}"
     );
@@ -1183,8 +1186,8 @@ async fn ctl_22_examples_are_bounded_in_bytes() {
     assert_eq!(
         ex,
         [
-            captured("checkout-a-4", "/a"),
             ("checkout-a-2".into(), "/b".into(), "skipped".into()),
+            captured("checkout-a-4", "/a"),
         ]
     );
     let m = get_text(&c, "/metrics").await;
@@ -1220,6 +1223,10 @@ async fn ctl_22_total_bound_spans_workloads() {
     );
     assert_eq!(
         exemplars(dir.path(), "web"),
-        [("web-a-1".to_string(), "/w".to_string(), "skipped".to_string())]
+        [(
+            "web-a-1".to_string(),
+            "/w".to_string(),
+            "skipped".to_string()
+        )]
     );
 }
