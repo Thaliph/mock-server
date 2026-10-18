@@ -173,6 +173,12 @@ impl Store {
         self.insert(e, origin, true)
     }
 
+    /// Échange local gardé en mémoire seulement : ni journal, ni file de publication
+    /// (`capture.inbound: metadata`, spec §5.2).
+    pub fn add_ephemeral(&self, e: Exchange) -> Added {
+        self.insert(e, Origin::Local, false)
+    }
+
     /// Vrai si un échange de cette clé et de cet identifiant garderait ses bodies : à vérifier
     /// avant de décoder, parser et redacter un body qui serait jeté (spec §5.2).
     pub fn wants_bodies(

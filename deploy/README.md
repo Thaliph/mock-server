@@ -9,6 +9,7 @@
 | `rbac.yaml` | droits du contrôleur, rôles `mimic-operator` (bascule) et `mimic-viewer` |
 | `certificates.yaml` | CA dédiée et certificat du contrôleur (cert-manager), CA publiée dans les namespaces (trust-manager) |
 | `controller.yaml` | configuration, PVC, Deployment, Service, NetworkPolicy |
+| `production-guard.yaml` | facultatif (Kubernetes ≥ 1.30) : `ValidatingAdmissionPolicy` qui refuse une `MimicWorkload` en `mock` ou `mock-partial` dans un namespace labellisé `env=production` |
 
 Prérequis : cert-manager et trust-manager, ce dernier avec `mimic-system` comme namespace
 de confiance (`--set app.trust.namespace=mimic-system`), car la CA du contrôleur y vit. Ordre : `namespace`, `crd`, `rbac`,
@@ -31,6 +32,10 @@ Tout pod créé dans un namespace labellisé `mimic.platform.io/enabled=true` re
 | `mimic.platform.io/exclude-outbound-cidrs`, `…/exclude-outbound-ports` | destinations jamais redirigées |
 | `mimic.platform.io/tls-intercept` | hôtes HTTPS interceptés ; l'app reçoit la CA Mimic |
 | `mimic.platform.io/config` | ConfigMap de configuration du sidecar à la place de celle du webhook |
+
+Le sidecar reçoit aussi `MIMIC_VERSION` (label `version_label` du pod,
+`app.kubernetes.io/version` par défaut) et `MIMIC_POD_TEMPLATE_HASH` : toutes ses métriques
+portent alors le label `version`, pour comparer deux versions d'un workload.
 
 Le webhook est en `failurePolicy: Ignore` : s'il est indisponible, les pods sont créés
 sans mimic. Un pod laissé tel quel l'est avec un avertissement visible dans `kubectl`.
@@ -61,6 +66,12 @@ kubectl get mimicworkload -n shop   # snapshot servi, pods alignés
 
 Rejouer un snapshot précis lors d'un tir suivant : `{"spec":{"mode":"mock","snapshot":"<id>"}}`.
 Le droit de basculer est le droit de modifier `mimicworkloads` (rôle `mimic-operator`).
+
+**Garde-fou production** : dans un namespace labellisé `env=production`, le contrôleur ne
+transmet jamais `mock` ni `mock-partial` aux sidecars (un workload déjà en mock repasse en
+`record` dès que le label est posé) et l'indique sur la ressource : conditions `Aligned` et
+`Allowed` à `False`, raison `ProductionNamespace`. `mimicctl mode` refuse aussi (code 2), et
+`production-guard.yaml` refuse la ressource dès l'admission.
 Les sidecars refusent tout autre ordre (`PUT /mode` répond `403`, l'annotation est ignorée).
 
 ## Voir ce que la découverte a trouvé

@@ -127,6 +127,7 @@ fn status(state: &AppState) -> Value {
     let (local, peer) = state.store.counts();
     json!({
         "mode": state.mode().as_str(),
+        "capture_inbound": state.inbound_capture().as_str(),
         "instance": state.config.instance,
         "workload": {
             "namespace": state.config.workload.namespace,

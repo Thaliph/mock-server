@@ -12,7 +12,9 @@
 #    montrent que seules ses cibles (frontend-proxy, flagd) reçoivent encore du trafic,
 #    frontend-proxy répondant depuis le snapshot ;
 # 6. mock de shipping (mimicctl) : quote est arrêté, shipping répond depuis le snapshot ;
-# 7. retour en record.
+# 7. retour en record ;
+# 8. garde-fou production (E2E-04) : namespace labellisé env=production, mock refusé par le
+#    contrôleur, par mimicctl et par la politique d'admission.
 #
 # Variables : CLUSTER (mimic), MIMIC_IMAGE (mimic:e2e), SKIP_BUILD=1 si l'image est déjà
 # construite, MIMICCTL (chemin du binaire, sinon construit par cargo), LOAD_SECONDS (300),
@@ -123,7 +125,8 @@ helm upgrade --install trust-manager jetstack/trust-manager \
 manifest() { sed "s#registry.example.com/platform/mimic:0.1.0#$IMAGE#g" "$@"; }
 
 log "contrôleur"
-kubectl apply -f deploy/controller/crd.yaml -f deploy/controller/rbac.yaml
+kubectl apply -f deploy/controller/crd.yaml -f deploy/controller/rbac.yaml \
+  -f deploy/controller/production-guard.yaml
 retry 60 kubectl apply -f deploy/controller/certificates.yaml
 manifest deploy/controller/controller.yaml | kubectl apply -f -
 kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
@@ -315,5 +318,27 @@ kubectl -n "$NS" rollout status deploy/quote --timeout=120s
 mimicctl mode shipping record -n "$NS"
 retry 60 sh -c "\"$MIMICCTL\" status shipping -n $NS | tail -1 | grep -qE 'record .* 2/2$'" || fail "retour en record"
 traffic 10 || fail "requêtes en échec après le retour en record"
+
+log "garde-fou production (E2E-04)"
+PROD=mimic-prod
+kubectl create namespace "$PROD" --dry-run=client -o yaml | kubectl apply -f -
+kubectl label namespace "$PROD" env- >/dev/null 2>&1 || true
+# Ressource en mock créée avant le label : le contrôleur la refuse dès que le label est posé.
+echo '{"apiVersion":"mimic.platform.io/v1alpha1","kind":"MimicWorkload","metadata":{"name":"guard"},"spec":{"mode":"mock"}}' |
+  kubectl -n "$PROD" apply -f -
+kubectl label namespace "$PROD" env=production --overwrite
+refused() {
+  kubectl -n "$PROD" get mimicworkload guard \
+    -o jsonpath='{.status.conditions[?(@.type=="Allowed")].reason}' | grep -qx ProductionNamespace
+}
+retry 60 refused || fail "condition Allowed=False absente"
+code=0; mimicctl mode guard mock -n "$PROD" 2>/dev/null || code=$?
+[ "$code" -eq 2 ] || fail "mimicctl mode mock accepté en production (code $code)"
+# Politique d'admission : une ressource en mock y est refusée.
+denied() {
+  ! kubectl -n "$PROD" patch mimicworkload guard --type merge -p '{"spec":{"mode":"mock-partial"}}' 2>/dev/null
+}
+retry 30 denied || fail "politique d'admission inactive"
+kubectl delete namespace "$PROD" --wait=false
 
 log "démo réussie"

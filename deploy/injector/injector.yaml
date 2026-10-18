@@ -38,6 +38,8 @@ data:
     resources:
       requests: {cpu: 50m, memory: 64Mi}
       limits: {memory: 256Mi}
+    # Label du pod repris en label `version` des métriques (sinon pod-template-hash).
+    version_label: app.kubernetes.io/version
     # Configuration par défaut des sidecars (spec §9.1). Un pod peut monter la sienne
     # avec l'annotation mimic.platform.io/config: <configmap>.
     sidecar_config: |

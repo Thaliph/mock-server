@@ -25,6 +25,12 @@ fn tokens() -> BTreeMap<String, Identity> {
                     namespace: "ns".into(),
                     pod: p.to_string(),
                     workload: "api".into(),
+                    // api-a est l'ancienne version, api-b la nouvelle (CRD-08).
+                    labels: [(
+                        "version".to_string(),
+                        if *p == "api-a" { "v1" } else { "v2" }.to_string(),
+                    )]
+                    .into(),
                 },
             )
         })
@@ -109,6 +115,7 @@ async fn apply(ctl: &mimic_controller::Running, mode: &str, snapshot: Option<&st
         Some(MimicWorkloadSpec {
             mode: mode.into(),
             snapshot: snapshot.map(Into::into),
+            ..MimicWorkloadSpec::default()
         }),
     )
     .await;
@@ -247,6 +254,153 @@ async fn ctl_02_03_snp_03_to_05_switch_and_identical_responses() {
     .await;
 }
 
+/// Le garde-fou production vu de bout en bout : namespace labellisé `env=production`,
+/// le sidecar ne bascule jamais en mock (E2E-04 sans cluster).
+#[tokio::test]
+async fn crd_07_production_namespace_never_switches_the_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    assert_eq!(served(&a, &saas.url("/users/7")).await.0, 200);
+    let prod: BTreeMap<String, String> = [("env".to_string(), "production".to_string())].into();
+    ctl.set_namespace_labels("ns", &prod).await;
+
+    for mode in ["mock", "mock-partial"] {
+        let desired = apply(&ctl, mode, None).await;
+        assert!(desired["mode"].is_null(), "{desired}");
+        assert!(desired["snapshot"].is_null(), "{desired}");
+        let wl = ui_json(&ctl, "/v1/workloads").await;
+        assert_eq!(wl[0]["reason"], "ProductionNamespace", "{wl}");
+        assert_eq!(wl[0]["ready"], false);
+    }
+    // Plusieurs battements plus tard, toujours en record, et aucun snapshot construit.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(status(&a).await["mode"], "record");
+    let snaps = ui_json(&ctl, "/v1/workloads/ns/api/snapshots").await;
+    assert_eq!(snaps.as_array().map(Vec::len), Some(0), "{snaps}");
+    let hits = saas.hits();
+    assert_eq!(served(&a, &saas.url("/users/7")).await.0, 200);
+    assert_eq!(saas.hits(), hits + 1, "la vraie dépendance est appelée");
+
+    // Label retiré : le mock est accepté ; label reposé : retour en record.
+    ctl.set_namespace_labels("ns", &BTreeMap::new()).await;
+    let desired = ui_json(&ctl, "/v1/workloads/ns/api/mode").await;
+    assert_eq!(desired["mode"], "mock-partial");
+    converged(&[&a], "mock-partial", &desired["snapshot"]).await;
+    ctl.set_namespace_labels("ns", &prod).await;
+    let desired = ui_json(&ctl, "/v1/workloads/ns/api/mode").await;
+    assert_eq!(desired["mode"], "record", "{desired}");
+    converged(&[&a], "record", &Value::Null).await;
+}
+
+/// Blue/green : seul le pod de la nouvelle version bascule en mock ; l'autre reste dans le
+/// mode de sa configuration et n'est pas compté.
+#[tokio::test]
+async fn crd_08_selector_switches_only_selected_pods() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    let b = proxy(piloted(None, &ctl, dir.path(), "api-b")).await;
+    // L'ancienne version enregistre la dépendance.
+    let url7 = saas.url("/users/7");
+    let recorded = served(&a, &url7).await;
+    eventually("appel reçu", || async {
+        ui_json(&ctl, "/v1/workloads/ns/api/requests?direction=outbound")
+            .await
+            .as_array()
+            .is_some_and(|l| l.len() == 1)
+    })
+    .await;
+    ctl.apply_spec(
+        "ns",
+        "api",
+        Some(MimicWorkloadSpec {
+            mode: "mock".into(),
+            selector: Some(mimic_controller::crd::LabelSelector {
+                match_labels: [("version".to_string(), "v2".to_string())].into(),
+                ..Default::default()
+            }),
+            ..MimicWorkloadSpec::default()
+        }),
+    )
+    .await;
+    let desired = ui_json(&ctl, "/v1/workloads/ns/api/mode").await;
+    let snap = desired["snapshot"].clone();
+    assert!(snap.is_string(), "{desired}");
+    converged(&[&b], "mock", &snap).await;
+    eventually("seul le pod sélectionné compte", || async {
+        let wl = ui_json(&ctl, "/v1/workloads").await;
+        wl[0]["selected_pods"] == 1 && wl[0]["aligned"] == 1 && wl[0]["ready"] == true
+    })
+    .await;
+    let s = status(&a).await;
+    assert_eq!(s["mode"], "record", "{s}");
+    assert!(s["snapshot"].is_null());
+    // La nouvelle version rejoue ce que l'ancienne a enregistré ; l'ancienne appelle la vraie
+    // dépendance.
+    let hits = saas.hits();
+    assert_eq!(served(&b, &url7).await.2, recorded.2);
+    assert_eq!(saas.hits(), hits);
+    assert_eq!(served(&a, &url7).await.0, 200);
+    assert_eq!(saas.hits(), hits + 1);
+    let wl = ui_json(&ctl, "/v1/workloads").await;
+    let pods = wl[0]["pods"].as_array().unwrap();
+    let selected = |i: &str| pods.iter().find(|p| p["instance"] == i).unwrap()["selected"].clone();
+    assert_eq!(selected("api-a"), false);
+    assert_eq!(selected("api-b"), true);
+
+    // Retour en record sans sélecteur : tout le workload.
+    apply(&ctl, "record", None).await;
+    converged(&[&a, &b], "record", &Value::Null).await;
+    eventually("deux pods comptés", || async {
+        ui_json(&ctl, "/v1/workloads").await[0]["selected_pods"] == 2
+    })
+    .await;
+}
+
+/// La capture de l'entrant imposée par la ressource atteint les sidecars, et l'alignement
+/// en tient compte.
+#[tokio::test]
+async fn crd_09_capture_from_the_workload_reaches_the_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let app = fake_server().await;
+    let a = proxy(piloted(Some(app.addr), &ctl, dir.path(), "api-a")).await;
+    assert_eq!(status(&a).await["capture_inbound"], "full");
+    ctl.apply_spec(
+        "ns",
+        "api",
+        Some(MimicWorkloadSpec {
+            mode: "record".into(),
+            capture: Some(mimic_controller::crd::CaptureSpec {
+                inbound: Some("off".into()),
+            }),
+            ..MimicWorkloadSpec::default()
+        }),
+    )
+    .await;
+    eventually("capture off appliquée", || async {
+        status(&a).await["capture_inbound"] == "off"
+    })
+    .await;
+    eventually("pod aligné", || async {
+        let wl = ui_json(&ctl, "/v1/workloads").await;
+        wl[0]["aligned"] == 1 && wl[0]["ready"] == true
+    })
+    .await;
+    client().get(inbound(&a, "/users/1")).send().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(exchanges(&a, "direction=inbound").await.is_empty());
+    // Plus de capture imposée : retour à celle de la configuration.
+    apply(&ctl, "record", None).await;
+    eventually("capture full rétablie", || async {
+        status(&a).await["capture_inbound"] == "full"
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn sidecar_restarts_in_the_last_desired_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -346,6 +500,7 @@ async fn sec_05_only_the_controller_ca_is_trusted() {
         Some(MimicWorkloadSpec {
             mode: "passthrough".into(),
             snapshot: None,
+            ..MimicWorkloadSpec::default()
         }),
     )
     .await;

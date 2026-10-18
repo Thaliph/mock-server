@@ -33,8 +33,8 @@ use crate::auth::Authenticator;
 use crate::config::ControllerConfig;
 use crate::metrics::{Metrics, StateLabel};
 use crate::reconcile::{
-    Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, pod_state, reconcile,
-    summarize,
+    Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, desired_for_pod, desired_of,
+    guard_pod, is_production, pod_state, reconcile_guarded, selects, summarize,
 };
 
 pub type Key = (String, String);
@@ -57,6 +57,8 @@ pub struct Ctl {
     scanned: OnceCell<()>,
     /// Échanges en mémoire, tous workloads confondus.
     total: AtomicUsize,
+    /// Namespaces labellisés `env=production` : le mock y est refusé (spec §5.5.1).
+    production: Mutex<BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +66,8 @@ pub struct Pod {
     pub instance: String,
     pub report: PodReport,
     pub last_seen_ms: u64,
+    /// Labels du pod lus dans l'API à l'authentification (spec §7.1).
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Documents OpenAPI d'un workload.
@@ -483,6 +487,47 @@ impl Ctl {
             workloads: Mutex::new(BTreeMap::new()),
             scanned: OnceCell::new(),
             total: AtomicUsize::new(0),
+            production: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// Vrai si le namespace est labellisé `env=production`.
+    pub fn is_production(&self, ns: &str) -> bool {
+        self.production
+            .lock()
+            .expect("verrou des namespaces")
+            .contains(ns)
+    }
+
+    /// Labels courants d'un namespace (création, modification) ; un changement du garde-fou
+    /// réconcilie aussitôt les ressources du namespace.
+    pub async fn set_namespace_labels(&self, ns: &str, labels: &BTreeMap<String, String>) {
+        let production = is_production(labels);
+        let changed = {
+            let mut set = self.production.lock().expect("verrou des namespaces");
+            if production {
+                set.insert(ns.to_string())
+            } else {
+                set.remove(ns)
+            }
+        };
+        if !changed {
+            return;
+        }
+        tracing::info!(namespace = ns, production, "garde-fou production");
+        let entries: Vec<Arc<Entry>> = self
+            .entries()
+            .into_iter()
+            .filter(|e| e.namespace == ns)
+            .collect();
+        for e in entries {
+            let (spec, generation) = {
+                let live = e.live();
+                (live.spec.clone(), live.generation)
+            };
+            if spec.is_some() {
+                self.apply_spec(ns, &e.name, spec, generation).await;
+            }
         }
     }
 
@@ -850,23 +895,32 @@ impl Ctl {
         wl: &str,
         instance: &str,
         report: PodReport,
+        labels: BTreeMap<String, String>,
     ) -> Desired {
         let e = self.ready(ns, wl).await;
         let now = now_ms();
+        let production = self.is_production(ns);
         let mut live = e.live();
         if !live.pods.contains_key(instance) {
             // Un nouveau pod remplace souvent un ancien (déploiement) : on oublie les disparus.
             self.forget_pods(&mut live, now);
         }
+        // État propre au pod : sélection (spec.selector), puis garde-fou production.
+        let desired = guard_pod(
+            desired_for_pod(&live.desired, &labels),
+            production,
+            &report.mode,
+        );
         live.pods.insert(
             instance.into(),
             Pod {
                 instance: instance.into(),
                 report,
                 last_seen_ms: now,
+                labels,
             },
         );
-        live.desired.clone()
+        desired
     }
 
     fn forget_pods(&self, live: &mut Live, now: u64) {
@@ -972,17 +1026,20 @@ impl Ctl {
                 known.insert(id);
             }
         }
-        let mut outcome = reconcile(spec.as_ref(), &current, &|id| known.contains(id));
+        let production = self.is_production(ns);
+        let mut outcome = reconcile_guarded(
+            spec.as_ref(),
+            &current,
+            &|id| known.contains(id),
+            production,
+        );
         if outcome.action == Action::BuildSnapshot
             && let Some(spec) = &spec
         {
             match self.build_snapshot(&e).await {
                 Ok(snap) => {
                     tracing::info!(namespace = ns, workload = wl, snapshot = %snap.id, exchanges = snap.exchanges.len(), "snapshot construit");
-                    outcome.desired = Desired {
-                        mode: Some(spec.mode.clone()),
-                        snapshot: Some(snap.id),
-                    };
+                    outcome.desired = desired_of(spec, Some(snap.id));
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "construction du snapshot échouée");
@@ -1009,25 +1066,28 @@ impl Ctl {
         }
     }
 
-    pub fn pod_states(&self, live: &Live) -> Vec<(Pod, PodState)> {
+    /// Chaque pod, son état au regard de l'état souhaité qui lui revient, et s'il est
+    /// sélectionné par `spec.selector`.
+    pub fn pod_states(&self, live: &Live) -> Vec<(Pod, PodState, bool)> {
         let now = now_ms();
         let timeout = self.config.pod_timeout.as_millis() as u64;
         live.pods
             .values()
             .map(|p| {
-                let s = pod_state(&p.report, p.last_seen_ms, now, timeout, &live.desired);
-                (p.clone(), s)
+                let want = desired_for_pod(&live.desired, &p.labels);
+                let s = pod_state(&p.report, p.last_seen_ms, now, timeout, &want);
+                (p.clone(), s, selects(&live.desired, &p.labels))
             })
             .collect()
     }
 
+    /// Statut du workload : seuls les pods sélectionnés comptent (spec §5.5.1).
     pub fn summary(&self, live: &Live) -> Summary {
-        let now = now_ms();
-        let timeout = self.config.pod_timeout.as_millis() as u64;
-        let states: Vec<PodState> = live
-            .pods
-            .values()
-            .map(|p| pod_state(&p.report, p.last_seen_ms, now, timeout, &live.desired))
+        let states: Vec<PodState> = self
+            .pod_states(live)
+            .into_iter()
+            .filter(|(_, _, selected)| *selected)
+            .map(|(_, s, _)| s)
             .collect();
         summarize(&states, live.error.as_deref())
     }
@@ -1118,7 +1178,7 @@ impl Ctl {
             [("aligned", 0), ("diverging", 0), ("absent", 0)].into();
         for (ns, wl) in keys {
             let states = self.with_live(&ns, &wl, |l| self.pod_states(l)).await;
-            for (_, s) in states {
+            for (_, s, _) in states {
                 *counts.entry(s.as_str()).or_default() += 1;
             }
         }

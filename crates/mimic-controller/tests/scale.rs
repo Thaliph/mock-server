@@ -31,6 +31,7 @@ fn config(dir: &Path) -> ControllerConfig {
                     namespace: "shop".into(),
                     pod: pod.to_string(),
                     workload: wl.to_string(),
+                    ..Identity::default()
                 },
             )
         })
@@ -456,6 +457,7 @@ async fn ctl_08_heartbeats_never_wait_for_storage_or_computation() {
         Some(MimicWorkloadSpec {
             mode: "record".into(),
             snapshot: None,
+            ..MimicWorkloadSpec::default()
         }),
     )
     .await;
@@ -551,6 +553,7 @@ async fn ctl_10_retention_gc_removes_old_segments_only() {
         Some(MimicWorkloadSpec {
             mode: "mock".into(),
             snapshot: None,
+            ..MimicWorkloadSpec::default()
         }),
     )
     .await;

@@ -14,7 +14,7 @@ use mimic_core::redact::{RedactConfig, Redactor};
 use mimic_core::snapshot::Snapshot;
 use serde_json::Value;
 
-use crate::config::{Config, Mode};
+use crate::config::{Config, InboundCapture, Mode};
 use crate::metrics::{DiscoveryLabels, Metrics, OriginLabel};
 use crate::store::{Drops, Limits, Store};
 use crate::throttle::LogLimiter;
@@ -38,6 +38,8 @@ pub struct TlsState {
 pub struct AppState {
     pub config: Config,
     mode: AtomicU8,
+    /// Capture de l'entrant courante : celle de la configuration, ou celle du contrôleur.
+    inbound_capture: AtomicU8,
     pub store: Store,
     pub metrics: Metrics,
     pub redactor: Redactor,
@@ -112,7 +114,7 @@ impl AppState {
                 ca,
             })
         };
-        let metrics = Metrics::new();
+        let metrics = Metrics::with_version(config.metrics_version());
         metrics.set_mode(config.mode);
         let store = Store::with_limits(
             Limits {
@@ -140,6 +142,7 @@ impl AppState {
             .unwrap_or_default();
         Ok(Arc::new(Self {
             mode: AtomicU8::new(config.mode.to_u8()),
+            inbound_capture: AtomicU8::new(config.capture.inbound as u8),
             inbound_targets: crate::net::InboundTargets::new(config.inbound.upstream),
             config,
             store,
@@ -189,6 +192,23 @@ impl AppState {
             );
         }
         self.metrics.set_mode(mode);
+    }
+
+    pub fn inbound_capture(&self) -> InboundCapture {
+        InboundCapture::from_u8(self.inbound_capture.load(Ordering::SeqCst))
+    }
+
+    /// Change la capture de l'entrant, pour les requêtes suivantes.
+    pub fn set_inbound_capture(&self, c: InboundCapture) {
+        let previous =
+            InboundCapture::from_u8(self.inbound_capture.swap(c as u8, Ordering::SeqCst));
+        if previous != c {
+            tracing::info!(
+                from = previous.as_str(),
+                to = c.as_str(),
+                "capture de l'entrant"
+            );
+        }
     }
 
     pub fn snapshot(&self) -> Option<Arc<Snapshot>> {

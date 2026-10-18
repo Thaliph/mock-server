@@ -57,6 +57,16 @@ impl Running {
         self.ctl.apply_spec(ns, wl, spec, None).await;
     }
 
+    /// Équivalent d'une création ou modification du namespace `ns` avec ces labels
+    /// (garde-fou production, spec §5.5.1) : utilisé par les tests et hors cluster.
+    pub async fn set_namespace_labels(
+        &self,
+        ns: &str,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) {
+        self.ctl.set_namespace_labels(ns, labels).await;
+    }
+
     pub async fn shutdown(self) {
         for t in &self.tasks {
             t.abort();
@@ -111,6 +121,11 @@ pub async fn start_with(
         None => None,
     };
     let ctl = Arc::new(Ctl::new(config, store, auth));
+    // Garde-fou production : les labels des namespaces sont connus avant de servir un
+    // sidecar ou de réconcilier une ressource (spec §5.5.1).
+    if let Some(client) = &client {
+        crate::kube::load_namespaces(&ctl, client).await?;
+    }
 
     let api_listener = TcpListener::bind(ctl.config.listen)
         .await
@@ -126,6 +141,10 @@ pub async fn start_with(
     ];
     tasks.push(tokio::spawn(maintenance(ctl.clone())));
     if let Some(client) = client {
+        tasks.push(tokio::spawn(crate::kube::watch_namespaces(
+            ctl.clone(),
+            client.clone(),
+        )));
         tasks.push(tokio::spawn(crate::kube::watch(
             ctl.clone(),
             client.clone(),

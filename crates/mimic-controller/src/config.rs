@@ -92,11 +92,14 @@ pub enum AuthConfig {
 }
 
 /// Pod authentifié.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
     pub namespace: String,
     pub pod: String,
     pub workload: String,
+    /// Labels du pod, comparés à `spec.selector` (spec §5.5.1).
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 impl ControllerConfig {

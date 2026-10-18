@@ -330,3 +330,49 @@ fn inj_07_existing_init_containers_run_after_mimic() {
         .collect();
     assert_eq!(names, ["mimic-init", "mimic", "migrate", "warmup"]);
 }
+
+/// Chemin `fieldRef` d'une variable posée par l'API downward.
+fn field_path<'a>(c: &'a Container, name: &str) -> Option<&'a str> {
+    env(c, name)?
+        .value_from
+        .as_ref()?
+        .field_ref
+        .as_ref()
+        .map(|f| f.field_path.as_str())
+}
+
+fn sidecar_of(p: &Pod) -> Container {
+    p.spec
+        .as_ref()
+        .unwrap()
+        .init_containers
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|c| c.name == "mimic")
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn inj_10_version_labels_reach_the_sidecar() {
+    let s = sidecar_of(&injected(&pod(json!({}))));
+    assert_eq!(
+        field_path(&s, "MIMIC_VERSION"),
+        Some("metadata.labels['app.kubernetes.io/version']")
+    );
+    assert_eq!(
+        field_path(&s, "MIMIC_POD_TEMPLATE_HASH"),
+        Some("metadata.labels['pod-template-hash']")
+    );
+    let mut cfg = config();
+    cfg.version_label = "app.example.com/release".into();
+    let s = match mutate(&pod(json!({})), &cfg) {
+        Outcome::Injected(p) => sidecar_of(&p),
+        Outcome::Skipped(r) => panic!("{r}"),
+    };
+    assert_eq!(
+        field_path(&s, "MIMIC_VERSION"),
+        Some("metadata.labels['app.example.com/release']")
+    );
+}

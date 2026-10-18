@@ -20,6 +20,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P5 | Interception TLS sortante | fait |
 | P6 | Contrôleur, CRD `MimicWorkload`, snapshots, authentification, rejeu k6 | fait (non validé sur un vrai cluster) |
 | P7 | Webhook d'injection `mimic-injector` et CLI `mimicctl` | fait, validé sur kind avec la démo OpenTelemetry |
+| P6d | Parcours SRE : garde-fou production, `capture.inbound`, `selector`, label `version` des métriques | fait (étape kind E2E-04 ajoutée, non jouée en local) |
 
 ## Lancer le sidecar en local
 
@@ -45,6 +46,8 @@ Déploiement dans Kubernetes : voir [deploy/README.md](deploy/README.md).
 ## mimicctl
 
 Référence complète, droits nécessaires et interface web du contrôleur : [docs/cli.md](docs/cli.md).
+Tir de charge d'un workload isolé, métriques à suivre et exemple blue/green avec Argo Rollouts :
+[docs/sre-load-test.md](docs/sre-load-test.md).
 
 ```sh
 cargo install --path crates/mimicctl

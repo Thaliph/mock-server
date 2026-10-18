@@ -33,6 +33,20 @@ spec:
         properties:
           spec:
             properties:
+              capture:
+                description: Capture imposée aux sidecars ; absente, chacun garde celle de sa configuration.
+                nullable: true
+                properties:
+                  inbound:
+                    description: |-
+                      Capture de l'entrant : `full`, `metadata` (sans query, headers ni body, rien de
+                      publié) ou `off` (métriques seules).
+                    enum:
+                    - full
+                    - metadata
+                    - off
+                    type: string
+                type: object
               mode:
                 description: Mode souhaité pour tous les pods du workload.
                 enum:
@@ -41,6 +55,34 @@ spec:
                 - mock
                 - mock-partial
                 type: string
+              selector:
+                description: |-
+                  Seuls les pods sélectionnés appliquent l'état souhaité ; les autres gardent le mode
+                  de leur configuration (spec §5.5.1). Absent : tous les pods du workload.
+                nullable: true
+                properties:
+                  matchExpressions:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        operator:
+                          description: '`In`, `NotIn`, `Exists` ou `DoesNotExist`.'
+                          type: string
+                        values:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
               snapshot:
                 description: Snapshot à rejouer ; absent, le contrôleur en construit un à l'entrée en mock.
                 nullable: true
@@ -59,6 +101,9 @@ spec:
                 default: []
                 items:
                   properties:
+                    message:
+                      nullable: true
+                      type: string
                     reason:
                       nullable: true
                       type: string

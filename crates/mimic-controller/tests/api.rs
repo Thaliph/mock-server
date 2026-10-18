@@ -15,6 +15,7 @@ fn identity(ns: &str, pod: &str, workload: &str) -> Identity {
         namespace: ns.into(),
         pod: pod.into(),
         workload: workload.into(),
+        ..Identity::default()
     }
 }
 
@@ -70,6 +71,7 @@ async fn set_mode(c: &Running, mode: &str, snapshot: Option<&str>) -> Value {
         Some(MimicWorkloadSpec {
             mode: mode.into(),
             snapshot: snapshot.map(Into::into),
+            ..MimicWorkloadSpec::default()
         }),
     )
     .await;

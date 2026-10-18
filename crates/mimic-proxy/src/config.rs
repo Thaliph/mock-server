@@ -48,6 +48,45 @@ impl Mode {
     }
 }
 
+/// Capture de l'entrant (spec §5.2) : réglable pendant un tir de charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InboundCapture {
+    /// Échange complet.
+    #[default]
+    Full,
+    /// Méthode, chemin, code, durées et taille des bodies, en mémoire seulement.
+    Metadata,
+    /// Aucun échange : métriques seules.
+    Off,
+}
+
+impl InboundCapture {
+    pub const ALL: [InboundCapture; 3] = [
+        InboundCapture::Full,
+        InboundCapture::Metadata,
+        InboundCapture::Off,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InboundCapture::Full => "full",
+            InboundCapture::Metadata => "metadata",
+            InboundCapture::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<InboundCapture> {
+        InboundCapture::ALL
+            .into_iter()
+            .find(|c| c.as_str() == s.trim())
+    }
+
+    pub(crate) fn from_u8(v: u8) -> InboundCapture {
+        InboundCapture::ALL[v as usize % InboundCapture::ALL.len()]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -66,6 +105,8 @@ pub struct Config {
     pub share: Option<ShareConfig>,
     /// Fichier d'annotations du pod exposé par l'API downward, surveillé pour la bascule de mode.
     pub annotations_file: Option<PathBuf>,
+    /// Version du pod, label `version` de toutes les métriques (spec §9.3).
+    pub version: Option<String>,
 }
 
 impl Default for Config {
@@ -84,6 +125,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             share: None,
             annotations_file: None,
+            version: None,
         }
     }
 }
@@ -158,6 +200,8 @@ pub struct CaptureConfig {
     pub max_exchanges: usize,
     /// Budget mémoire du store en octets estimés, bodies au plus pour moitié (spec §5.2).
     pub max_store_bytes: usize,
+    /// Capture de l'entrant ; le contrôleur peut l'imposer (spec §5.5.1).
+    pub inbound: InboundCapture,
 }
 
 impl Default for CaptureConfig {
@@ -170,6 +214,7 @@ impl Default for CaptureConfig {
             // Un quart de la limite de 256 Mi posée par l'injecteur : le moteur de mock en
             // copie le sortant, la découverte le parcourt.
             max_store_bytes: 64 * 1024 * 1024,
+            inbound: InboundCapture::Full,
         }
     }
 }
@@ -329,6 +374,20 @@ impl ShareConfig {
 }
 
 impl Config {
+    /// Valeur du label `version` des métriques : bornée à 63 caractères (taille maximale
+    /// d'un label Kubernetes), absente si vide.
+    pub fn metrics_version(&self) -> Option<String> {
+        let v = self.version.as_deref()?.trim();
+        let mut out = String::new();
+        for c in v.chars() {
+            if out.len() + c.len_utf8() > 63 {
+                break;
+            }
+            out.push(c);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Vrai si le sidecar est piloté par un contrôleur : il n'accepte alors aucun autre ordre.
     pub fn controlled(&self) -> bool {
         self.share.as_ref().is_some_and(ShareConfig::is_controller)
@@ -414,6 +473,18 @@ impl Config {
         }
         if let Some(v) = get("MIMIC_REDACT_SALT") {
             self.redact.salt = Some(v);
+        }
+        // Version : MIMIC_VERSION, puis la configuration, puis le hash du template ; une
+        // variable vide (label absent du pod) ne compte pas.
+        let non_empty = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(v) = non_empty("MIMIC_VERSION") {
+            self.version = Some(v);
+        } else if self.version.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            self.version = non_empty("MIMIC_POD_TEMPLATE_HASH");
         }
         if let Some(v) = get("MIMIC_TLS_INTERCEPT") {
             self.tls.intercept = v
@@ -538,6 +609,58 @@ mod tests {
             url: url.into(),
             ..ShareConfig::default()
         }
+    }
+
+    #[test]
+    fn adm_04_version_from_environment_then_config_then_template_hash() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let mut c = Config::default();
+        c.apply_env(env(&[
+            ("MIMIC_VERSION", "v2"),
+            ("MIMIC_POD_TEMPLATE_HASH", "7d9f"),
+        ]))
+        .unwrap();
+        assert_eq!(c.version.as_deref(), Some("v2"));
+        // Variable vide (label absent du pod) : celle de la configuration, puis le hash.
+        let mut c = Config {
+            version: Some("v1.4.2".into()),
+            ..Config::default()
+        };
+        c.apply_env(env(&[
+            ("MIMIC_VERSION", ""),
+            ("MIMIC_POD_TEMPLATE_HASH", "7d9f"),
+        ]))
+        .unwrap();
+        assert_eq!(c.version.as_deref(), Some("v1.4.2"));
+        let mut c = Config::default();
+        c.apply_env(env(&[
+            ("MIMIC_VERSION", ""),
+            ("MIMIC_POD_TEMPLATE_HASH", "7d9f"),
+        ]))
+        .unwrap();
+        assert_eq!(c.version.as_deref(), Some("7d9f"));
+        let mut c = Config::default();
+        c.apply_env(env(&[
+            ("MIMIC_VERSION", " "),
+            ("MIMIC_POD_TEMPLATE_HASH", ""),
+        ]))
+        .unwrap();
+        assert_eq!(c.version, None);
+        // Valeur bornée à 63 caractères.
+        let long = "é".repeat(40);
+        let c = Config {
+            version: Some(long),
+            ..Config::default()
+        };
+        let v = c.metrics_version().unwrap();
+        assert!(v.len() <= 63 && !v.is_empty(), "{v}");
     }
 
     #[test]

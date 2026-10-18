@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use kube::api::ObjectMeta;
-use mimic_controller::crd::{MODES, MimicWorkload, MimicWorkloadSpec};
+use mimic_controller::crd::{
+    CaptureSpec, INBOUND_CAPTURES, LabelSelector, MODES, MimicWorkload, MimicWorkloadSpec,
+};
 use serde_json::Value;
 
 /// Document OpenAPI à exporter.
@@ -33,6 +35,59 @@ pub fn workload_apply(
     mode: &str,
     snapshot: Option<&str>,
 ) -> Result<MimicWorkload, String> {
+    let opts = ModeOptions {
+        snapshot: snapshot.map(String::from),
+        ..ModeOptions::default()
+    };
+    workload_apply_with(namespace, workload, mode, &opts)
+}
+
+/// Options de `mimicctl mode` au-delà du mode (spec §9.5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModeOptions {
+    pub snapshot: Option<String>,
+    /// `full`, `metadata` ou `off` (`spec.capture.inbound`).
+    pub capture_inbound: Option<String>,
+    /// Égalités `clé=valeur` séparées par des virgules (`spec.selector.matchLabels`).
+    pub selector: Option<String>,
+}
+
+/// Caractères permis dans une clé de label (préfixe DNS compris) ou une valeur.
+fn label_part_ok(s: &str, key: bool) -> bool {
+    !s.is_empty()
+        && s.len() <= if key { 253 } else { 63 }
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') || (key && b == b'/')
+        })
+}
+
+/// `k=v,k2=v2` → `matchLabels` ; refusé si une égalité est mal formée.
+pub fn parse_selector(text: &str) -> Result<LabelSelector, String> {
+    let mut match_labels = BTreeMap::new();
+    for part in text.split(',') {
+        let (k, v) = part
+            .split_once('=')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .filter(|(k, v)| label_part_ok(k, true) && label_part_ok(v, false))
+            .ok_or_else(|| {
+                format!("sélecteur invalide « {text} » : attendu clé=valeur[,clé=valeur…]")
+            })?;
+        match_labels.insert(k.to_string(), v.to_string());
+    }
+    Ok(LabelSelector {
+        match_labels,
+        ..LabelSelector::default()
+    })
+}
+
+/// Comme `workload_apply`, avec toutes les options ; une option invalide est refusée
+/// avant tout appel.
+pub fn workload_apply_with(
+    namespace: &str,
+    workload: &str,
+    mode: &str,
+    opts: &ModeOptions,
+) -> Result<MimicWorkload, String> {
     if !MODES.contains(&mode) {
         return Err(format!(
             "mode inconnu « {mode} » ; modes valides : {}",
@@ -44,6 +99,15 @@ pub fn workload_apply(
             return Err(format!("{what} invalide : « {name} »"));
         }
     }
+    if let Some(c) = &opts.capture_inbound
+        && !INBOUND_CAPTURES.contains(&c.as_str())
+    {
+        return Err(format!(
+            "capture de l'entrant inconnue « {c} » ; valeurs valides : {}",
+            INBOUND_CAPTURES.join(", ")
+        ));
+    }
+    let selector = opts.selector.as_deref().map(parse_selector).transpose()?;
     Ok(MimicWorkload {
         metadata: ObjectMeta {
             name: Some(workload.into()),
@@ -52,10 +116,32 @@ pub fn workload_apply(
         },
         spec: MimicWorkloadSpec {
             mode: mode.into(),
-            snapshot: snapshot.map(String::from),
+            snapshot: opts.snapshot.clone(),
+            selector,
+            capture: opts.capture_inbound.as_ref().map(|c| CaptureSpec {
+                inbound: Some(c.clone()),
+            }),
         },
         status: None,
     })
+}
+
+/// Garde-fou production (spec §9.5) : `mock` et `mock-partial` sont refusés dans un namespace
+/// labellisé `env=production`. `labels` absent (namespace illisible) : accepté, le contrôleur
+/// refusera de toute façon.
+pub fn check_namespace(
+    namespace: &str,
+    mode: &str,
+    labels: Option<&BTreeMap<String, String>>,
+) -> Result<(), String> {
+    use mimic_controller::reconcile::{PRODUCTION_LABEL, is_mock, is_production};
+    if is_mock(mode) && labels.is_some_and(is_production) {
+        return Err(format!(
+            "le namespace {namespace} est labellisé {}={} : le mode {mode} y est refusé (garde-fou production)",
+            PRODUCTION_LABEL.0, PRODUCTION_LABEL.1
+        ));
+    }
+    Ok(())
 }
 
 fn base(namespace: &str, workload: &str) -> String {
@@ -117,10 +203,20 @@ pub fn status_table(items: &[MimicWorkload]) -> String {
                 status.aligned.to_string(),
             )
         };
+        // Garde-fou production : le mode demandé n'est pas appliqué.
+        let refused = status
+            .conditions
+            .iter()
+            .any(|c| c.type_ == "Allowed" && c.status == "False");
+        let mode = if refused {
+            format!("{} (refusé)", mw.spec.mode)
+        } else {
+            mw.spec.mode.clone()
+        };
         rows.push([
             mw.metadata.namespace.clone().unwrap_or_default(),
             mw.metadata.name.clone().unwrap_or_default(),
-            mw.spec.mode.clone(),
+            mode,
             snapshot,
             format!("{aligned}/{}", status.pods),
         ]);

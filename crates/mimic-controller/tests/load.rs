@@ -249,6 +249,7 @@ impl Ctl {
                     Some(MimicWorkloadSpec {
                         mode,
                         snapshot: None,
+                        ..MimicWorkloadSpec::default()
                     }),
                     Some(1),
                 )
@@ -285,6 +286,7 @@ fn tokens(pods: &[(String, String)]) -> BTreeMap<String, Identity> {
                     namespace: NS.into(),
                     pod: pod.clone(),
                     workload: wl.clone(),
+                    ..Identity::default()
                 },
             )
         })

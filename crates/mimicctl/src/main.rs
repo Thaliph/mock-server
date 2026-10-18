@@ -4,12 +4,12 @@ use clap::{Parser, Subcommand};
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use mimic_controller::crd::MimicWorkload;
 use mimicctl::{
-    Target, WorkloadData, export_path, operations_path, report_markdown, requests_path,
-    sample_requests_path, status_table, workload_apply,
+    ModeOptions, Target, WorkloadData, check_namespace, export_path, operations_path,
+    report_markdown, requests_path, sample_requests_path, status_table, workload_apply_with,
 };
 
 /// Pilote mimic depuis le poste : bascule, statut, export et diff (spec §9.5).
@@ -30,6 +30,13 @@ enum Command {
         /// Rejoue ce snapshot au lieu d'en construire un.
         #[arg(long)]
         snapshot: Option<String>,
+        /// Capture de l'entrant pendant un tir : full, metadata ou off.
+        #[arg(long)]
+        capture_inbound: Option<String>,
+        /// Seuls ces pods basculent (`clé=valeur[,…]`, par exemple pod-template-hash=7d9f) ;
+        /// les autres gardent le mode de leur configuration.
+        #[arg(long)]
+        selector: Option<String>,
         #[arg(short, long)]
         namespace: Option<String>,
     },
@@ -126,13 +133,21 @@ async fn run(command: Command) -> Result<i32, String> {
             workload,
             mode,
             snapshot,
+            capture_inbound,
+            selector,
             namespace: ns,
         } => {
-            // Validation avant toute connexion au cluster (CLI-02).
-            workload_apply(ns.as_deref().unwrap_or("default"), &workload, &mode, None)?;
+            let opts = ModeOptions {
+                snapshot,
+                capture_inbound,
+                selector,
+            };
+            // Validation avant toute connexion au cluster (CLI-02, CLI-07).
+            workload_apply_with(ns.as_deref().unwrap_or("default"), &workload, &mode, &opts)?;
             let client = client().await?;
             let ns = namespace(ns, &client).await;
-            let mw = workload_apply(&ns, &workload, &mode, snapshot.as_deref())?;
+            let mw = workload_apply_with(&ns, &workload, &mode, &opts)?;
+            check_namespace(&ns, &mode, namespace_labels(&client, &ns).await.as_ref())?;
             let api: Api<MimicWorkload> = Api::namespaced(client, &ns);
             api.patch(
                 &workload,
@@ -271,6 +286,25 @@ async fn run(command: Command) -> Result<i32, String> {
                 print!("{}", d.to_text());
             }
             Ok(i32::from(fail_on_breaking && d.is_breaking()))
+        }
+    }
+}
+
+/// Labels du namespace, pour le garde-fou production ; `None` si on ne peut pas les lire
+/// (droit `get` absent) : le contrôleur applique alors le garde-fou seul.
+async fn namespace_labels(
+    client: &kube::Client,
+    ns: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let api: Api<Namespace> = Api::all(client.clone());
+    match api.get_opt(ns).await {
+        Ok(Some(n)) => Some(n.metadata.labels.unwrap_or_default()),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!(
+                "mimicctl: labels du namespace {ns} illisibles ({e}) ; le contrôleur appliquera le garde-fou production"
+            );
+            None
         }
     }
 }
