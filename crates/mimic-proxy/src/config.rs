@@ -567,6 +567,29 @@ mod tests {
         assert_eq!(s.retention, day);
     }
 
+    /// `mock.websocket` : `relay` par défaut, `refuse` accepté, valeur inconnue refusée au
+    /// démarrage (MCK-23).
+    #[test]
+    fn mck_23_mock_websocket_defaults_to_relay() {
+        assert_eq!(Config::default().mock.websocket, MockWebsocket::Relay);
+        let c: Config = serde_yaml::from_str("mode: mock\n").unwrap();
+        assert_eq!(c.mock.websocket, MockWebsocket::Relay);
+        let c = Config::load_with(None, |k| {
+            (k == "MIMIC_CONFIG_YAML").then(|| "mode: mock\nmock:\n  websocket: refuse\n".into())
+        })
+        .unwrap();
+        assert_eq!(c.mock.websocket, MockWebsocket::Refuse);
+        assert_eq!(MockWebsocket::parse("refuse"), Some(MockWebsocket::Refuse));
+        assert_eq!(MockWebsocket::Relay.as_str(), "relay");
+        let err = Config::load_with(None, |k| {
+            (k == "MIMIC_CONFIG_YAML").then(|| "mock:\n  websocket: drop\n".into())
+        })
+        .unwrap_err();
+        assert!(err.contains("websocket") && err.contains("drop"), "{err}");
+        assert!(err.contains("relay") && err.contains("refuse"), "{err}");
+        assert_eq!(MockWebsocket::parse("drop"), None);
+    }
+
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(serde_yaml::from_str::<Config>("mood: mock\n").is_err());

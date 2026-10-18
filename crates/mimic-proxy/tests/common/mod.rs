@@ -18,6 +18,8 @@ use mimic_proxy::{Running, start};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+pub mod ws;
+
 /// Serveur HTTP factice qui compte ses requêtes.
 pub struct Fake {
     pub addr: SocketAddr,
