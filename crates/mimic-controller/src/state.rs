@@ -1095,7 +1095,7 @@ impl Ctl {
                             workload = wl,
                             snapshot = id,
                             full = full_bytes,
-                            identity = form.identity.len(),
+                            identity = form.identity_len,
                             zstd = form.zstd.len(),
                             gzip = form.gzip.len(),
                             "forme de mock calculée"

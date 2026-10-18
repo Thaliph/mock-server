@@ -16,12 +16,15 @@ pub const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const ZSTD_LEVEL: i32 = 9;
 const GZIP_LEVEL: u32 = 9;
 
-/// Forme de mock sérialisée, et ses versions compressées.
+/// Forme de mock compressée. Seules les versions compressées sont gardées : la forme telle
+/// quelle, rarement demandée (un sidecar envoie toujours `Accept-Encoding`), est
+/// décompressée à la demande.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedMock {
     /// Empreinte de la forme sérialisée (`ETag`, sans guillemets).
     pub etag: String,
-    pub identity: Bytes,
+    /// Taille de la forme sérialisée, sans compression.
+    pub identity_len: usize,
     pub zstd: Bytes,
     pub gzip: Bytes,
 }
@@ -39,7 +42,7 @@ impl EncodedMock {
         let gzip = gz.finish().map_err(|e| format!("gzip: {e}"))?;
         Ok(Self {
             etag: digest(&identity),
-            identity: identity.into(),
+            identity_len: identity.len(),
             zstd: zstd.into(),
             gzip: gzip.into(),
         })
@@ -47,16 +50,13 @@ impl EncodedMock {
 
     /// Octets tenus en mémoire.
     pub fn size(&self) -> usize {
-        self.identity.len() + self.zstd.len() + self.gzip.len()
+        self.zstd.len() + self.gzip.len()
     }
 
-    /// Corps à servir pour cet encodage.
-    pub fn body(&self, encoding: Encoding) -> Bytes {
-        match encoding {
-            Encoding::Zstd => self.zstd.clone(),
-            Encoding::Gzip => self.gzip.clone(),
-            Encoding::Identity => self.identity.clone(),
-        }
+    /// Forme sérialisée telle quelle, décompressée : calcul à faire hors des threads du
+    /// serveur.
+    pub fn identity(&self) -> Result<Vec<u8>, String> {
+        zstd::decode_all(&self.zstd[..]).map_err(|e| format!("zstd: {e}"))
     }
 }
 
@@ -226,10 +226,23 @@ mod tests {
     fn form(n: usize) -> EncodedMock {
         EncodedMock {
             etag: n.to_string(),
-            identity: vec![0; n].into(),
-            zstd: Bytes::new(),
+            identity_len: n,
+            zstd: vec![0; n].into(),
             gzip: Bytes::new(),
         }
+    }
+
+    #[test]
+    fn identity_is_the_decompressed_form() {
+        let full = mimic_core::snapshot::build(
+            Vec::<mimic_core::model::Exchange>::new(),
+            &Default::default(),
+        );
+        let form = EncodedMock::from_full(&full.to_jsonl(), &full.id).unwrap();
+        let expected = MockSnapshot::from_snapshot(&full).to_json();
+        assert_eq!(form.identity().unwrap(), expected);
+        assert_eq!(form.etag, digest(&expected));
+        assert!(EncodedMock::from_full(b"", "0000000000000000").is_err());
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::auth::{AuthError, authorize, bearer};
 use crate::config::Identity;
 use crate::metrics::ReasonLabel;
-use crate::mock_form;
+use crate::mock_form::{self, Encoding};
 use crate::reconcile::PodReport;
 use crate::state::{Ctl, IngestError, valid_name};
 
@@ -248,12 +248,23 @@ async fn get_mock_snapshot(
             .unwrap_or_default();
     }
     let encoding = mock_form::pick(text(header::ACCEPT_ENCODING));
+    let body = match encoding {
+        Encoding::Zstd => form.zstd.clone(),
+        Encoding::Gzip => form.gzip.clone(),
+        // Sans compression acceptée : décompressée hors des threads du serveur.
+        Encoding::Identity => match tokio::task::spawn_blocking(move || form.identity()).await {
+            Ok(Ok(b)) => Bytes::from(b),
+            _ => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "forme de mock illisible")
+                    .into_response();
+            }
+        },
+    };
     let mut out = out.header(header::CONTENT_TYPE, "application/json");
     if let Some(e) = encoding.header() {
         out = out.header(header::CONTENT_ENCODING, e);
     }
-    out.body(axum::body::Body::from(form.body(encoding)))
-        .unwrap_or_default()
+    out.body(axum::body::Body::from(body)).unwrap_or_default()
 }
 
 pub async fn snapshot_response(ctl: &Ctl, ns: &str, wl: &str, id: &str) -> Response {
