@@ -32,7 +32,8 @@ Les options `-n/--namespace` prennent le namespace du contexte par défaut. Code
 
 ```sh
 mimicctl mode <workload> <passthrough|record|mock|mock-partial> [--snapshot <id>] \
-  [--selector k=v[,k=v…]] [--capture-inbound full|metadata|off] [-n ns]
+  [--selector k=v[,k=v…]] [--capture-inbound full|metadata|off] \
+  [--mock-websocket relay|refuse] [-n ns]
 ```
 
 Crée ou met à jour la ressource `MimicWorkload` du workload (server-side apply, gestionnaire
@@ -66,12 +67,19 @@ Pour un tir de charge (guide : [sre-load-test.md](sre-load-test.md)) :
 - `--capture-inbound metadata|off` (`spec.capture.inbound`) : pendant le tir, le sidecar ne
   garde de l'entrant que les métadonnées, en mémoire (`metadata`), ou rien que les métriques
   (`off`) ; `full` est le défaut.
+- `--mock-websocket relay|refuse` (`spec.mock.websocket`) : en mock, une poignée de main
+  WebSocket sortante est relayée vers la vraie dépendance (`relay`, le défaut : les trames ne
+  sont pas enregistrées, il n'y a rien à rejouer), ou refusée par le sidecar (`refuse`) :
+  réponse `503` avec le header `x-mimic-websocket: refused`, sans aucune connexion vers la
+  dépendance. Avec `refuse`, plus rien ne sort du pod en mock. L'entrant n'est pas touché :
+  l'application reçoit toujours ses WebSockets.
 
 Un apply sans ces options les retire : `mimicctl mode checkout record` remet tout le
 workload dans le même état.
 
 ```sh
 mimicctl mode checkout mock --selector pod-template-hash=7d9f8c6b5 --capture-inbound metadata -n perf
+mimicctl mode checkout mock --mock-websocket refuse -n perf   # isolement strict, WebSockets compris
 mimicctl mode checkout record -n perf
 ```
 
