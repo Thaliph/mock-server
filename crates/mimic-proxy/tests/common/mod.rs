@@ -174,6 +174,34 @@ fn router(hits: Arc<AtomicUsize>) -> Router {
             }),
         )
         .route(
+            "/br",
+            get(|| async {
+                let mut out = Vec::new();
+                brotli::CompressorWriter::new(&mut out, 4096, 5, 22)
+                    .write_all(br#"{"compressed":"br"}"#)
+                    .unwrap();
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/json"),
+                        (header::CONTENT_ENCODING, "br"),
+                    ],
+                    out,
+                )
+            }),
+        )
+        .route(
+            "/zstd",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "application/json"),
+                        (header::CONTENT_ENCODING, "zstd"),
+                    ],
+                    zstd::encode_all(&br#"{"compressed":"zstd"}"#[..], 3).unwrap(),
+                )
+            }),
+        )
+        .route(
             "/big",
             get(|| async {
                 let chunk = bytes::Bytes::from(vec![b'x'; 64 * 1024]);

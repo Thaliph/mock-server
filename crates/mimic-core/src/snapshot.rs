@@ -59,8 +59,10 @@ pub fn build<E: Borrow<Exchange>>(
         .filter(|e: &&Exchange| seen.insert(e.id.as_str()))
         .collect();
 
-    // Plafond par clé, en partant des plus récents.
-    let mut per_key: BTreeMap<(&str, String, &str, u16), usize> = BTreeMap::new();
+    // Plafond par clé, en partant des plus récents. Il est compté à part pour les réponses
+    // rejouables : au-delà du plafond d'exemples du sidecar, les échanges récents d'un endpoint
+    // très sollicité n'ont plus de body et ne doivent pas évincer ceux qui en ont un.
+    let mut per_key: BTreeMap<(&str, String, &str, u16, bool), usize> = BTreeMap::new();
     let mut kept: Vec<Exchange> = unique
         .into_iter()
         .rev()
@@ -71,6 +73,7 @@ pub fn build<E: Borrow<Exchange>>(
                     e.method.to_ascii_uppercase(),
                     e.path.as_str(),
                     e.status,
+                    e.resp_body.is_replayable(),
                 ))
                 .or_default();
             *n += 1;
