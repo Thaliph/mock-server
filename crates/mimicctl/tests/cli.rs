@@ -1,8 +1,9 @@
 //! Construction des requêtes de `mimicctl`, sans cluster (spec §9.5, CLI-*).
 
 use mimicctl::{
-    Target, WorkloadData, check_namespace, export_path, operations_path, report_markdown,
-    requests_path, sample_requests_path, status_table, workload_apply,
+    ModeOptions, Target, WorkloadData, check_namespace, export_path, operations_path,
+    report_markdown, requests_path, sample_requests_path, status_table, workload_apply,
+    workload_apply_with,
 };
 use serde_json::{Value, json};
 
@@ -237,4 +238,26 @@ fn cli_06_mock_is_refused_in_a_production_namespace() {
     assert!(check_namespace("shop", "mock", Some(&staging)).is_ok());
     // Labels illisibles (droit absent) : le contrôleur tranche.
     assert!(check_namespace("shop", "mock", None).is_ok());
+}
+
+#[test]
+fn cli_07_capture_inbound_option() {
+    let opts = ModeOptions {
+        capture_inbound: Some("metadata".into()),
+        ..ModeOptions::default()
+    };
+    let mw = workload_apply_with("shop", "checkout", "mock", &opts).unwrap();
+    let v = serde_json::to_value(&mw).unwrap();
+    assert_eq!(
+        v["spec"],
+        json!({"mode": "mock", "capture": {"inbound": "metadata"}})
+    );
+    let bad = ModeOptions {
+        capture_inbound: Some("fast".into()),
+        ..ModeOptions::default()
+    };
+    let err = workload_apply_with("shop", "checkout", "mock", &bad).unwrap_err();
+    for c in ["full", "metadata", "off"] {
+        assert!(err.contains(c), "{err}");
+    }
 }

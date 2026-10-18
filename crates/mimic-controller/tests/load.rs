@@ -249,6 +249,7 @@ impl Ctl {
                     Some(MimicWorkloadSpec {
                         mode,
                         snapshot: None,
+                        ..MimicWorkloadSpec::default()
                     }),
                     Some(1),
                 )

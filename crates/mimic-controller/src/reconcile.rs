@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub use crate::crd::MimicWorkloadSpec;
-use crate::crd::{MODES, MimicWorkloadStatus, StatusCondition};
+use crate::crd::{INBOUND_CAPTURES, MODES, MimicWorkloadStatus, StatusCondition};
 
 /// Label de namespace qui interdit le mock (spec §1 et §5.5.1).
 pub const PRODUCTION_LABEL: (&str, &str) = ("env", "production");
@@ -14,11 +14,24 @@ pub const PRODUCTION_REASON: &str = "ProductionNamespace";
 /// Mode imposé à la place d'un mock refusé.
 const FALLBACK_MODE: &str = "record";
 
-/// État souhaité transmis aux sidecars ; vide, chaque sidecar garde le mode de sa configuration.
+/// État souhaité transmis aux sidecars ; vide, chaque sidecar garde le mode et la capture
+/// de sa configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Desired {
     pub mode: Option<String>,
     pub snapshot: Option<String>,
+    /// Capture de l'entrant imposée (`full`, `metadata`, `off`, spec §5.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_inbound: Option<String>,
+}
+
+/// État souhaité de la ressource une fois son snapshot connu.
+pub fn desired_of(spec: &MimicWorkloadSpec, snapshot: Option<String>) -> Desired {
+    Desired {
+        mode: Some(spec.mode.clone()),
+        snapshot,
+        capture_inbound: spec.capture.as_ref().and_then(|c| c.inbound.clone()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +84,7 @@ fn leave_mock(d: Desired) -> Desired {
         Desired {
             mode: Some(FALLBACK_MODE.into()),
             snapshot: None,
+            ..d
         }
     } else {
         d
@@ -87,7 +101,7 @@ pub fn guard_pod(desired: Desired, production: bool, reported_mode: &str) -> Des
     if desired.mode.is_none() && is_mock(reported_mode) {
         return Desired {
             mode: Some(FALLBACK_MODE.into()),
-            snapshot: None,
+            ..desired
         };
     }
     desired
@@ -105,14 +119,6 @@ pub fn reconcile(
         action: Action::None,
         error: Some(error.into()),
     };
-    let set = |mode: &str, snapshot: Option<String>| Outcome {
-        desired: Desired {
-            mode: Some(mode.into()),
-            snapshot,
-        },
-        action: Action::None,
-        error: None,
-    };
     let Some(spec) = spec else {
         return Outcome {
             desired: Desired::default(),
@@ -120,15 +126,24 @@ pub fn reconcile(
             error: None,
         };
     };
+    let set = |snapshot: Option<String>| Outcome {
+        desired: desired_of(spec, snapshot),
+        action: Action::None,
+        error: None,
+    };
     if !MODES.contains(&spec.mode.as_str()) {
         return keep("InvalidMode");
     }
+    let capture = spec.capture.as_ref().and_then(|c| c.inbound.as_deref());
+    if capture.is_some_and(|c| !INBOUND_CAPTURES.contains(&c)) {
+        return keep("InvalidCapture");
+    }
     if !is_mock(&spec.mode) {
-        return set(&spec.mode, None);
+        return set(None);
     }
     if let Some(pinned) = &spec.snapshot {
         return if exists(pinned) {
-            set(&spec.mode, Some(pinned.clone()))
+            set(Some(pinned.clone()))
         } else {
             keep("SnapshotNotFound")
         };
@@ -136,7 +151,7 @@ pub fn reconcile(
     // Le snapshot courant est gardé tant que le workload reste en mock.
     match &current.snapshot {
         Some(id) if current.mode.as_deref().is_some_and(is_mock) && exists(id) => {
-            set(&spec.mode, Some(id.clone()))
+            set(Some(id.clone()))
         }
         _ => Outcome {
             desired: current.clone(),
@@ -147,10 +162,13 @@ pub fn reconcile(
 }
 
 /// Ce qu'un sidecar annonce dans son battement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodReport {
     pub mode: String,
     pub snapshot: Option<String>,
+    /// Capture de l'entrant appliquée ; absente chez un ancien sidecar.
+    #[serde(default)]
+    pub capture_inbound: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -183,7 +201,16 @@ pub fn pod_state(
     }
     match &desired.mode {
         None => PodState::Aligned,
-        Some(m) if *m == pod.mode && desired.snapshot == pod.snapshot => PodState::Aligned,
+        Some(m)
+            if *m == pod.mode
+                && desired.snapshot == pod.snapshot
+                && desired
+                    .capture_inbound
+                    .as_ref()
+                    .is_none_or(|c| pod.capture_inbound.as_ref() == Some(c)) =>
+        {
+            PodState::Aligned
+        }
         Some(_) => PodState::Diverging,
     }
 }

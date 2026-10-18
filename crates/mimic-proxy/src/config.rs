@@ -48,6 +48,45 @@ impl Mode {
     }
 }
 
+/// Capture de l'entrant (spec §5.2) : réglable pendant un tir de charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InboundCapture {
+    /// Échange complet.
+    #[default]
+    Full,
+    /// Méthode, chemin, code, durées et taille des bodies, en mémoire seulement.
+    Metadata,
+    /// Aucun échange : métriques seules.
+    Off,
+}
+
+impl InboundCapture {
+    pub const ALL: [InboundCapture; 3] = [
+        InboundCapture::Full,
+        InboundCapture::Metadata,
+        InboundCapture::Off,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InboundCapture::Full => "full",
+            InboundCapture::Metadata => "metadata",
+            InboundCapture::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<InboundCapture> {
+        InboundCapture::ALL
+            .into_iter()
+            .find(|c| c.as_str() == s.trim())
+    }
+
+    pub(crate) fn from_u8(v: u8) -> InboundCapture {
+        InboundCapture::ALL[v as usize % InboundCapture::ALL.len()]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -158,6 +197,8 @@ pub struct CaptureConfig {
     pub max_exchanges: usize,
     /// Budget mémoire du store en octets estimés, bodies au plus pour moitié (spec §5.2).
     pub max_store_bytes: usize,
+    /// Capture de l'entrant ; le contrôleur peut l'imposer (spec §5.5.1).
+    pub inbound: InboundCapture,
 }
 
 impl Default for CaptureConfig {
@@ -170,6 +211,7 @@ impl Default for CaptureConfig {
             // Un quart de la limite de 256 Mi posée par l'injecteur : le moteur de mock en
             // copie le sortant, la découverte le parcourt.
             max_store_bytes: 64 * 1024 * 1024,
+            inbound: InboundCapture::Full,
         }
     }
 }

@@ -15,7 +15,7 @@ use hyper_util::rt::TokioExecutor;
 use mimic_core::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Mode, ShareConfig};
+use crate::config::{InboundCapture, Mode, ShareConfig};
 use crate::state::AppState;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,6 +27,9 @@ const MAX_BODY: usize = 256 * 1024 * 1024;
 pub struct Desired {
     pub mode: Option<String>,
     pub snapshot: Option<String>,
+    /// Capture de l'entrant imposée ; absente, celle de la configuration (spec §5.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_inbound: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -155,11 +158,17 @@ impl ControllerClient {
             .await
     }
 
-    pub async fn heartbeat(&self, mode: Mode, snapshot: Option<String>) -> Result<Desired, String> {
+    pub async fn heartbeat(
+        &self,
+        mode: Mode,
+        snapshot: Option<String>,
+        capture: InboundCapture,
+    ) -> Result<Desired, String> {
         let body = serde_json::json!({
             "instance": self.instance,
             "mode": mode.as_str(),
             "snapshot": snapshot,
+            "capture_inbound": capture.as_str(),
         });
         let b = self
             .call(
@@ -219,6 +228,13 @@ pub fn restore(state: &AppState) {
     }
     if let Some(m) = desired.mode.as_deref().and_then(Mode::parse) {
         state.set_mode(m);
+    }
+    if let Some(c) = desired
+        .capture_inbound
+        .as_deref()
+        .and_then(InboundCapture::parse)
+    {
+        state.set_inbound_capture(c);
     }
     tracing::info!(mode = ?desired.mode, snapshot = ?desired.snapshot, "dernier état souhaité rechargé");
     state
@@ -281,7 +297,9 @@ pub fn spawn(
 
 async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String> {
     let loaded = state.snapshot().map(|s| s.id.clone());
-    let desired = client.heartbeat(state.mode(), loaded.clone()).await?;
+    let desired = client
+        .heartbeat(state.mode(), loaded.clone(), state.inbound_capture())
+        .await?;
     let previous = state
         .controller_status
         .lock()
@@ -314,6 +332,14 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
         // Ressource supprimée : retour au mode de la configuration.
         None if previous.mode.is_some() => state.set_mode(state.config.mode),
         None => {}
+    }
+    match desired.capture_inbound.as_deref() {
+        Some(c) => match InboundCapture::parse(c) {
+            Some(c) => state.set_inbound_capture(c),
+            None => return Err(format!("capture de l'entrant inconnue: {c}")),
+        },
+        // Plus de capture imposée : celle de la configuration.
+        None => state.set_inbound_capture(state.config.capture.inbound),
     }
     if desired != previous || fetched.is_some() {
         save(state, &desired, fetched.as_deref());

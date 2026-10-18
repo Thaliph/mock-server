@@ -8,8 +8,8 @@ use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::api::{Api, ListParams, Patch, PatchParams};
 use mimic_controller::crd::MimicWorkload;
 use mimicctl::{
-    Target, WorkloadData, check_namespace, export_path, operations_path, report_markdown,
-    requests_path, sample_requests_path, status_table, workload_apply,
+    ModeOptions, Target, WorkloadData, check_namespace, export_path, operations_path,
+    report_markdown, requests_path, sample_requests_path, status_table, workload_apply_with,
 };
 
 /// Pilote mimic depuis le poste : bascule, statut, export et diff (spec §9.5).
@@ -30,6 +30,9 @@ enum Command {
         /// Rejoue ce snapshot au lieu d'en construire un.
         #[arg(long)]
         snapshot: Option<String>,
+        /// Capture de l'entrant pendant un tir : full, metadata ou off.
+        #[arg(long)]
+        capture_inbound: Option<String>,
         #[arg(short, long)]
         namespace: Option<String>,
     },
@@ -126,13 +129,18 @@ async fn run(command: Command) -> Result<i32, String> {
             workload,
             mode,
             snapshot,
+            capture_inbound,
             namespace: ns,
         } => {
-            // Validation avant toute connexion au cluster (CLI-02).
-            workload_apply(ns.as_deref().unwrap_or("default"), &workload, &mode, None)?;
+            let opts = ModeOptions {
+                snapshot,
+                capture_inbound,
+            };
+            // Validation avant toute connexion au cluster (CLI-02, CLI-07).
+            workload_apply_with(ns.as_deref().unwrap_or("default"), &workload, &mode, &opts)?;
             let client = client().await?;
             let ns = namespace(ns, &client).await;
-            let mw = workload_apply(&ns, &workload, &mode, snapshot.as_deref())?;
+            let mw = workload_apply_with(&ns, &workload, &mode, &opts)?;
             check_namespace(&ns, &mode, namespace_labels(&client, &ns).await.as_ref())?;
             let api: Api<MimicWorkload> = Api::namespaced(client, &ns);
             api.patch(

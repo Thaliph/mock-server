@@ -15,7 +15,7 @@ use mimic_core::model::{Body, Direction, Exchange, Header};
 use tokio::sync::oneshot;
 
 use crate::capture::{Captured, TeeBody};
-use crate::config::{Mode, Unmatched};
+use crate::config::{InboundCapture, Mode, Unmatched};
 use crate::engine::{MockSet, Trigger};
 use crate::metrics::{
     AuthorityLabel, DirectionLabel, DurationLabels, MockLabels, ReasonLabel, RequestLabels,
@@ -86,7 +86,16 @@ pub async fn inbound(
     let authority = host_header(req.headers())
         .map(|h| normalize_authority(&h, "http"))
         .unwrap_or_else(|| target.to_string());
-    let record = state.mode() != Mode::Passthrough;
+    // Capture de l'entrant réglable pendant un tir (spec §5.2) ; rien en passthrough.
+    let record = if state.mode() == Mode::Passthrough {
+        Record::No
+    } else {
+        match state.inbound_capture() {
+            InboundCapture::Full => Record::Full,
+            InboundCapture::Metadata => Record::Metadata,
+            InboundCapture::Off => Record::Timed,
+        }
+    };
     let (parts, body) = req.into_parts();
     forward(
         state,
@@ -146,7 +155,11 @@ pub async fn outbound(
     // Les trames ne sont pas enregistrées, il n'y a donc rien à rejouer : une poignée de main
     // WebSocket est relayée dans tous les modes, et enregistrée hors passthrough (spec §3.4).
     if is_websocket_upgrade(&parts) {
-        let record = mode != Mode::Passthrough;
+        let record = if mode == Mode::Passthrough {
+            Record::No
+        } else {
+            Record::Full
+        };
         return forward(
             state,
             Direction::Outbound,
@@ -164,14 +177,37 @@ pub async fn outbound(
                 Direction::Outbound,
                 parts,
                 boxed(body),
-                false,
+                Record::No,
                 target,
             )
             .await
         }
-        Mode::Record => forward(state, Direction::Outbound, parts, boxed(body), true, target).await,
+        Mode::Record => {
+            forward(
+                state,
+                Direction::Outbound,
+                parts,
+                boxed(body),
+                Record::Full,
+                target,
+            )
+            .await
+        }
         Mode::Mock | Mode::MockPartial => serve_mock(state, parts, body, target).await,
     }
+}
+
+/// Ce que `forward` garde d'un échange (spec §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Record {
+    /// Rien : métriques seules, durée jusqu'au premier octet (passthrough).
+    No,
+    /// Rien non plus, mais durée mesurée jusqu'au dernier octet (`capture.inbound: off`).
+    Timed,
+    /// Métadonnées seules, en mémoire, ni journalisées ni publiées.
+    Metadata,
+    /// Échange complet.
+    Full,
 }
 
 /// Où envoyer la requête et sous quel nom l'enregistrer.
@@ -189,7 +225,7 @@ async fn forward(
     direction: Direction,
     mut parts: http::request::Parts,
     body: ProxyBody,
-    record: bool,
+    record: Record,
     target: Target,
 ) -> Response<ProxyBody> {
     let started = Instant::now();
@@ -242,8 +278,14 @@ async fn forward(
     let req_headers = to_headers(&parts.headers);
     let method = parts.method.to_string();
 
-    let limit = state.config.capture.max_body_bytes;
-    let (body, req_capture) = if record {
+    let metadata = record == Record::Metadata;
+    // En métadonnées, le tee compte les octets sans en copier aucun.
+    let limit = if metadata {
+        0
+    } else {
+        state.config.capture.max_body_bytes
+    };
+    let (body, req_capture) = if matches!(record, Record::Full | Record::Metadata) {
         let (tee, rx) = TeeBody::new(body, limit);
         (boxed(tee), Some(rx))
     } else {
@@ -285,8 +327,19 @@ async fn forward(
     let status = resp_parts.status.as_u16();
     count_request(&state, direction, mode, &authority_label, &method, status);
 
-    if switched || req_capture.is_none() {
+    if switched || (req_capture.is_none() && record != Record::Timed) {
         observe_duration(&state, direction, mode, &authority_label, ttfb);
+    }
+    if record == Record::Timed && !switched {
+        // Durée jusqu'au dernier octet, comme en capture complète, sans rien garder.
+        let (tee, done) = TeeBody::new(resp_body, 0);
+        tokio::spawn(async move {
+            if let Ok(c) = done.await {
+                let total = c.ended.saturating_duration_since(started);
+                observe_duration(&state, direction, mode, &authority_label, total);
+            }
+        });
+        return Response::from_parts(resp_parts, boxed(tee));
     }
     let pending = req_capture.map(|rx| {
         let pending = Pending {
@@ -303,6 +356,7 @@ async fn forward(
             req_headers,
             status,
             resp_headers: to_headers(&resp_parts.headers),
+            metadata,
         };
         (pending, rx)
     });
@@ -394,8 +448,14 @@ async fn relay_websocket(
 
 /// Échange d'une connexion WebSocket : la poignée de main, sans body ni trame ; `total` est la
 /// durée de la connexion.
-fn record_websocket(state: &AppState, p: Pending, ended: Instant) {
+fn record_websocket(state: &AppState, mut p: Pending, ended: Instant) {
     let total = ended.saturating_duration_since(p.started);
+    let metadata = p.metadata;
+    if metadata {
+        p.req_headers.clear();
+        p.resp_headers.clear();
+        p.uri = p.uri.path().parse().unwrap_or_default();
+    }
     let mut exchange = Exchange {
         id: format!("{}-{}", state.config.instance, ulid::Ulid::generate()),
         direction: p.direction,
@@ -415,9 +475,13 @@ fn record_websocket(state: &AppState, p: Pending, ended: Instant) {
         total_us: total.as_micros() as u64,
         redactions: vec![],
     };
-    // Headers redactés avant d'entrer dans le store, comme pour tout échange (RED-04).
-    state.redactor.redact(&mut exchange);
-    state.store.add(exchange, Origin::Local);
+    if metadata {
+        state.store.add_ephemeral(exchange);
+    } else {
+        // Headers redactés avant d'entrer dans le store, comme pour tout échange (RED-04).
+        state.redactor.redact(&mut exchange);
+        state.store.add(exchange, Origin::Local);
+    }
     state.refresh_store_metrics();
 }
 
@@ -443,6 +507,8 @@ struct Pending {
     req_headers: Vec<Header>,
     status: u16,
     resp_headers: Vec<Header>,
+    /// `capture.inbound: metadata` : ni query, ni headers, ni body (spec §5.2).
+    metadata: bool,
 }
 
 async fn finalize(
@@ -456,6 +522,10 @@ async fn finalize(
     };
     let total = resp.ended.saturating_duration_since(p.started);
     observe_duration(&state, p.direction, p.mode, &p.authority_label, total);
+    if p.metadata {
+        record_metadata(&state, p, req, resp, total);
+        return;
+    }
     let capture = &state.config.capture;
     let id = format!("{}-{}", state.config.instance, ulid::Ulid::generate());
     let path = p.uri.path().to_string();
@@ -506,6 +576,32 @@ async fn finalize(
     if state.store.add(exchange, Origin::Local) == Added::StoredWithoutBodies {
         dropped(&state, "sample_limit");
     }
+    state.refresh_store_metrics();
+}
+
+/// Échange réduit à ses métadonnées : rien n'est décodé, redacté, journalisé ni publié ; il
+/// ne reste qu'en mémoire (spec §5.2).
+fn record_metadata(state: &AppState, p: Pending, req: Captured, resp: Captured, total: Duration) {
+    let exchange = Exchange {
+        id: format!("{}-{}", state.config.instance, ulid::Ulid::generate()),
+        direction: p.direction,
+        started_at_ms: p.started_ms,
+        scheme: p.scheme,
+        authority: p.authority,
+        method: p.method,
+        path: p.uri.path().to_string(),
+        query: vec![],
+        trace_id: None,
+        req_headers: vec![],
+        req_body: req.into_body(false, 0, None),
+        status: p.status,
+        resp_headers: vec![],
+        resp_body: resp.into_body(false, 0, None),
+        ttfb_us: p.ttfb.as_micros() as u64,
+        total_us: total.as_micros() as u64,
+        redactions: vec![],
+    };
+    state.store.add_ephemeral(exchange);
     state.refresh_store_metrics();
 }
 
@@ -592,7 +688,15 @@ async fn serve_mock(
             let passthrough =
                 mode == Mode::MockPartial || state.config.mock.unmatched == Unmatched::Passthrough;
             if passthrough {
-                return forward(state, Direction::Outbound, parts, full(body), true, target).await;
+                return forward(
+                    state,
+                    Direction::Outbound,
+                    parts,
+                    full(body),
+                    Record::Full,
+                    target,
+                )
+                .await;
             }
             count_request(
                 &state,

@@ -171,6 +171,8 @@ struct Heartbeat {
     instance: String,
     mode: String,
     snapshot: Option<String>,
+    #[serde(default)]
+    capture_inbound: Option<String>,
 }
 
 async fn heartbeat(
@@ -190,6 +192,7 @@ async fn heartbeat(
             PodReport {
                 mode: hb.mode,
                 snapshot: hb.snapshot,
+                capture_inbound: hb.capture_inbound,
             },
         )
         .await;

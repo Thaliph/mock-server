@@ -33,8 +33,8 @@ use crate::auth::Authenticator;
 use crate::config::ControllerConfig;
 use crate::metrics::{Metrics, StateLabel};
 use crate::reconcile::{
-    Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, guard_pod, is_production,
-    pod_state, reconcile_guarded, summarize,
+    Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, desired_of, guard_pod,
+    is_production, pod_state, reconcile_guarded, summarize,
 };
 
 pub type Key = (String, String);
@@ -1030,10 +1030,7 @@ impl Ctl {
             match self.build_snapshot(&e).await {
                 Ok(snap) => {
                     tracing::info!(namespace = ns, workload = wl, snapshot = %snap.id, exchanges = snap.exchanges.len(), "snapshot construit");
-                    outcome.desired = Desired {
-                        mode: Some(spec.mode.clone()),
-                        snapshot: Some(snap.id),
-                    };
+                    outcome.desired = desired_of(spec, Some(snap.id));
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "construction du snapshot échouée");

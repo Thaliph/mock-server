@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use mimic_controller::crd::CaptureSpec;
 use mimic_controller::reconcile::{
     Action, Desired, MimicWorkloadSpec, PRODUCTION_REASON, PodReport, PodState, guard_pod,
     is_production, pod_state, reconcile, reconcile_guarded, status_of, summarize,
@@ -11,6 +12,7 @@ fn spec(mode: &str, snapshot: Option<&str>) -> MimicWorkloadSpec {
     MimicWorkloadSpec {
         mode: mode.into(),
         snapshot: snapshot.map(Into::into),
+        ..MimicWorkloadSpec::default()
     }
 }
 
@@ -18,6 +20,7 @@ fn desired(mode: &str, snapshot: Option<&str>) -> Desired {
     Desired {
         mode: Some(mode.into()),
         snapshot: snapshot.map(Into::into),
+        ..Desired::default()
     }
 }
 
@@ -104,10 +107,12 @@ fn crd_06_status_counts_aligned_pods() {
     let aligned = PodReport {
         mode: "mock".into(),
         snapshot: Some(ID.into()),
+        ..PodReport::default()
     };
     let late = PodReport {
         mode: "record".into(),
         snapshot: None,
+        ..PodReport::default()
     };
     let now = 100_000;
     assert_eq!(
@@ -242,4 +247,70 @@ fn crd_07_production_namespace_refuses_mock() {
     assert_eq!(ok.snapshot.as_deref(), Some(ID));
     let allowed = ok.conditions.iter().find(|c| c.type_ == "Allowed").unwrap();
     assert_eq!(allowed.status, "True");
+}
+
+#[test]
+fn crd_09_capture_inbound_is_part_of_the_desired_state() {
+    let mut s = spec("mock", Some(ID));
+    s.capture = Some(CaptureSpec {
+        inbound: Some("metadata".into()),
+    });
+    let o = reconcile(Some(&s), &Desired::default(), &|_| true);
+    assert_eq!(o.desired.capture_inbound.as_deref(), Some("metadata"));
+    assert_eq!(o.desired.mode.as_deref(), Some("mock"));
+    // En record aussi, la capture demandée est transmise.
+    let mut r = spec("record", None);
+    r.capture = s.capture.clone();
+    let o = reconcile(Some(&r), &Desired::default(), &|_| true);
+    assert_eq!(o.desired.capture_inbound.as_deref(), Some("metadata"));
+    // Une capture inconnue est refusée sans changer l'état souhaité.
+    let mut bad = spec("mock", Some(ID));
+    bad.capture = Some(CaptureSpec {
+        inbound: Some("bodies".into()),
+    });
+    let previous = desired("record", None);
+    let o = reconcile(Some(&bad), &previous, &|_| true);
+    assert_eq!(o.desired, previous);
+    assert_eq!(o.error.as_deref(), Some("InvalidCapture"));
+    // Sans spec.capture, aucune capture imposée.
+    let o = reconcile(Some(&spec("mock", Some(ID))), &Desired::default(), &|_| {
+        true
+    });
+    assert_eq!(o.desired.capture_inbound, None);
+
+    // Alignement : la capture demandée doit être appliquée.
+    let want = Desired {
+        capture_inbound: Some("metadata".into()),
+        ..desired("mock", Some(ID))
+    };
+    let report = |capture: Option<&str>| PodReport {
+        mode: "mock".into(),
+        snapshot: Some(ID.into()),
+        capture_inbound: capture.map(Into::into),
+    };
+    let now = 100_000;
+    assert_eq!(
+        pod_state(&report(Some("full")), now, now, 30_000, &want),
+        PodState::Diverging
+    );
+    assert_eq!(
+        pod_state(&report(None), now, now, 30_000, &want),
+        PodState::Diverging,
+        "ancien sidecar qui n'annonce pas sa capture"
+    );
+    assert_eq!(
+        pod_state(&report(Some("metadata")), now, now, 30_000, &want),
+        PodState::Aligned
+    );
+    // Sans capture imposée, celle du pod est libre.
+    assert_eq!(
+        pod_state(
+            &report(Some("full")),
+            now,
+            now,
+            30_000,
+            &desired("mock", Some(ID))
+        ),
+        PodState::Aligned
+    );
 }

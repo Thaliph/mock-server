@@ -5,6 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub const MODES: &[&str] = &["passthrough", "record", "mock", "mock-partial"];
+/// Captures de l'entrant (spec §5.2).
+pub const INBOUND_CAPTURES: &[&str] = &["full", "metadata", "off"];
 
 #[derive(CustomResource, Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
@@ -26,6 +28,22 @@ pub struct MimicWorkloadSpec {
     /// Snapshot à rejouer ; absent, le contrôleur en construit un à l'entrée en mock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    /// Capture imposée aux sidecars ; absente, chacun garde celle de sa configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureSpec>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CaptureSpec {
+    /// Capture de l'entrant : `full`, `metadata` (sans query, headers ni body, rien de
+    /// publié) ou `off` (métriques seules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "capture_schema")]
+    pub inbound: Option<String>,
+}
+
+fn capture_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "enum": INBOUND_CAPTURES })
 }
 
 fn mode_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {

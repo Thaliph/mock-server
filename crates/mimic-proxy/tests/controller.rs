@@ -109,6 +109,7 @@ async fn apply(ctl: &mimic_controller::Running, mode: &str, snapshot: Option<&st
         Some(MimicWorkloadSpec {
             mode: mode.into(),
             snapshot: snapshot.map(Into::into),
+            ..MimicWorkloadSpec::default()
         }),
     )
     .await;
@@ -287,6 +288,47 @@ async fn crd_07_production_namespace_never_switches_the_sidecar() {
     converged(&[&a], "record", &Value::Null).await;
 }
 
+/// La capture de l'entrant imposée par la ressource atteint les sidecars, et l'alignement
+/// en tient compte.
+#[tokio::test]
+async fn crd_09_capture_from_the_workload_reaches_the_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let app = fake_server().await;
+    let a = proxy(piloted(Some(app.addr), &ctl, dir.path(), "api-a")).await;
+    assert_eq!(status(&a).await["capture_inbound"], "full");
+    ctl.apply_spec(
+        "ns",
+        "api",
+        Some(MimicWorkloadSpec {
+            mode: "record".into(),
+            capture: Some(mimic_controller::crd::CaptureSpec {
+                inbound: Some("off".into()),
+            }),
+            ..MimicWorkloadSpec::default()
+        }),
+    )
+    .await;
+    eventually("capture off appliquée", || async {
+        status(&a).await["capture_inbound"] == "off"
+    })
+    .await;
+    eventually("pod aligné", || async {
+        let wl = ui_json(&ctl, "/v1/workloads").await;
+        wl[0]["aligned"] == 1 && wl[0]["ready"] == true
+    })
+    .await;
+    client().get(inbound(&a, "/users/1")).send().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(exchanges(&a, "direction=inbound").await.is_empty());
+    // Plus de capture imposée : retour à celle de la configuration.
+    apply(&ctl, "record", None).await;
+    eventually("capture full rétablie", || async {
+        status(&a).await["capture_inbound"] == "full"
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn sidecar_restarts_in_the_last_desired_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -386,6 +428,7 @@ async fn sec_05_only_the_controller_ca_is_trusted() {
         Some(MimicWorkloadSpec {
             mode: "passthrough".into(),
             snapshot: None,
+            ..MimicWorkloadSpec::default()
         }),
     )
     .await;

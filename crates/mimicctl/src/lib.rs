@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use kube::api::ObjectMeta;
-use mimic_controller::crd::{MODES, MimicWorkload, MimicWorkloadSpec};
+use mimic_controller::crd::{
+    CaptureSpec, INBOUND_CAPTURES, MODES, MimicWorkload, MimicWorkloadSpec,
+};
 use serde_json::Value;
 
 /// Document OpenAPI à exporter.
@@ -33,6 +35,29 @@ pub fn workload_apply(
     mode: &str,
     snapshot: Option<&str>,
 ) -> Result<MimicWorkload, String> {
+    let opts = ModeOptions {
+        snapshot: snapshot.map(String::from),
+        ..ModeOptions::default()
+    };
+    workload_apply_with(namespace, workload, mode, &opts)
+}
+
+/// Options de `mimicctl mode` au-delà du mode (spec §9.5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModeOptions {
+    pub snapshot: Option<String>,
+    /// `full`, `metadata` ou `off` (`spec.capture.inbound`).
+    pub capture_inbound: Option<String>,
+}
+
+/// Comme `workload_apply`, avec toutes les options ; une option invalide est refusée
+/// avant tout appel.
+pub fn workload_apply_with(
+    namespace: &str,
+    workload: &str,
+    mode: &str,
+    opts: &ModeOptions,
+) -> Result<MimicWorkload, String> {
     if !MODES.contains(&mode) {
         return Err(format!(
             "mode inconnu « {mode} » ; modes valides : {}",
@@ -44,6 +69,14 @@ pub fn workload_apply(
             return Err(format!("{what} invalide : « {name} »"));
         }
     }
+    if let Some(c) = &opts.capture_inbound
+        && !INBOUND_CAPTURES.contains(&c.as_str())
+    {
+        return Err(format!(
+            "capture de l'entrant inconnue « {c} » ; valeurs valides : {}",
+            INBOUND_CAPTURES.join(", ")
+        ));
+    }
     Ok(MimicWorkload {
         metadata: ObjectMeta {
             name: Some(workload.into()),
@@ -52,7 +85,10 @@ pub fn workload_apply(
         },
         spec: MimicWorkloadSpec {
             mode: mode.into(),
-            snapshot: snapshot.map(String::from),
+            snapshot: opts.snapshot.clone(),
+            capture: opts.capture_inbound.as_ref().map(|c| CaptureSpec {
+                inbound: Some(c.clone()),
+            }),
         },
         status: None,
     })
