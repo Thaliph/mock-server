@@ -496,3 +496,8 @@ fn html(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+/// Pod du contrôleur dont l'interface est lue (spec §5.5.4, §9.5).
+pub fn controller_pod(_pods: &[k8s_openapi::api::core::v1::Pod]) -> Result<String, String> {
+    todo!()
+}

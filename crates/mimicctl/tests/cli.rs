@@ -309,3 +309,45 @@ fn cli_07_selector_option_and_refused_status() {
         "{table}"
     );
 }
+
+fn controller_pod_of(name: &str, phase: &str, leader: bool) -> k8s_openapi::api::core::v1::Pod {
+    let mut labels = json!({"app.kubernetes.io/name": "mimic-controller"});
+    if leader {
+        labels["mimic.platform.io/leader"] = json!("true");
+    }
+    serde_json::from_value(json!({
+        "metadata": {"name": name, "labels": labels},
+        "status": {"phase": phase}
+    }))
+    .unwrap()
+}
+
+/// L'interface est lue sur la réplique active du contrôleur (CLI-08, spec §5.5.4, §9.5).
+#[test]
+fn cli_08_ui_is_read_on_the_active_replica() {
+    use mimicctl::controller_pod;
+    let passive = controller_pod_of("ctl-p", "Running", false);
+    let active = controller_pod_of("ctl-a", "Running", true);
+    assert_eq!(
+        controller_pod(&[passive.clone(), active.clone()]).unwrap(),
+        "ctl-a"
+    );
+    assert_eq!(
+        controller_pod(&[active.clone(), passive.clone()]).unwrap(),
+        "ctl-a"
+    );
+    // Marquée mais plus en marche (arrêt en cours) : la passive en marche.
+    let leaving = controller_pod_of("ctl-a", "Failed", true);
+    assert_eq!(
+        controller_pod(&[leaving, passive.clone()]).unwrap(),
+        "ctl-p"
+    );
+    // Contrôleur d'une version antérieure, sans marque : le premier pod en marche.
+    let pending = controller_pod_of("ctl-0", "Pending", false);
+    assert_eq!(
+        controller_pod(&[pending.clone(), passive.clone()]).unwrap(),
+        "ctl-p"
+    );
+    assert!(controller_pod(&[pending]).is_err());
+    assert!(controller_pod(&[]).is_err());
+}
