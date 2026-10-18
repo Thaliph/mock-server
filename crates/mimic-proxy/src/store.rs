@@ -740,10 +740,10 @@ mod tests {
         }
     }
 
-    /// Index des ajouts de MCK-21 : par opération, oublié à la publication, abandonné au-delà
+    /// Index des ajouts de MCK-22 : par opération, oublié à la publication, abandonné au-delà
     /// de sa borne.
     #[test]
-    fn mck_21_additions_are_indexed_per_operation() {
+    fn mck_22_additions_are_indexed_per_operation() {
         let s = Store::new(10_000, 10);
         s.add(ex("old", "/users/1"), Origin::Local);
         assert_eq!(ids_since(&s, "/users/1", 0), None, "index non tenu");

@@ -1,4 +1,4 @@
-//! Critères MCK-16, MCK-17, MCK-21 et RED-05 (spec §5.3, §7 et §11.2) : moteur de mock
+//! Critères MCK-16, MCK-17, MCK-22 et RED-05 (spec §5.3, §7 et §11.2) : moteur de mock
 //! construit à la bascule, servi sans reconstruction, et bodies rejoués octet pour octet.
 
 mod common;
@@ -117,7 +117,7 @@ async fn mck_17_store_changes_do_not_block_matched_requests() {
     let r = get("/orders/7").await;
     assert_eq!(r.status(), 200);
     assert_eq!(r.text().await.unwrap(), r#"{"order":7}"#);
-    // Servie par l'index des ajouts (MCK-21) : la reconstruction se fait en tâche de fond.
+    // Servie par l'index des ajouts (MCK-22) : la reconstruction se fait en tâche de fond.
     let m = metrics(&p).await;
     assert_eq!(builds(&m, "unmatched"), 0.0, "{m}");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -180,7 +180,7 @@ async fn red_05_untouched_json_is_replayed_byte_for_byte() {
 /// mock-partial : un échange relayé puis enregistré ne reconstruit pas le moteur ; la même
 /// requête est mockée dès la suivante (spec §5.3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mck_21_relayed_exchanges_do_not_rebuild_the_engine() {
+async fn mck_22_relayed_exchanges_do_not_rebuild_the_engine() {
     let saas = fake_server().await;
     let p = proxy(config(None, Mode::Record)).await;
     for i in 0..2_000 {

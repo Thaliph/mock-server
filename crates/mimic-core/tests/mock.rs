@@ -473,7 +473,7 @@ fn mck_19_websocket_handshake_is_never_replayed() {
 /// Curseurs de `round-robin` et `sequence` bornés : un par chemin enregistré, un par opération
 /// pour les chemins jamais enregistrés, quel que soit le nombre de chemins demandés (§5.3).
 #[test]
-fn mck_20_cursors_are_bounded_by_recorded_paths() {
+fn mck_21_cursors_are_bounded_by_recorded_paths() {
     let recs = vec![
         out("GET", "/users/1").resp_json(json!({"u": 1, "v": "a"})),
         out("GET", "/users/1").resp_json(json!({"u": 1, "v": "b"})),
