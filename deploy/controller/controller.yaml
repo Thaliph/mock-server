@@ -13,11 +13,12 @@ data:
     auth:
       kind: kubernetes
     store: file:///var/lib/mimic-controller
-    retention: 604800
+    retention: 86400                   # 24 heures ; les exemples par endpoint couvrent le reste
     max_exchanges_per_workload: 200000
     max_exchanges_total: 1000000
     samples_per_operation: 20
     max_bytes_per_workload: 268435456
+    max_exemplars_per_workload: 10000
     discovery_interval: 30
     snapshot:
       max_per_key: 50

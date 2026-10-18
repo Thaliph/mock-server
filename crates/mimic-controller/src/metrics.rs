@@ -29,6 +29,10 @@ pub struct Metrics {
     pub pods: Family<StateLabel, Gauge>,
     pub snapshots: Counter,
     pub exchanges: Gauge,
+    /// Exemples par endpoint gardés, tous workloads (spec §5.5.3).
+    pub exemplars: Gauge,
+    /// Candidats sans exemple faute de place (`max_exemplars_per_workload`).
+    pub exemplars_refused: Counter,
 }
 
 impl Default for Metrics {
@@ -40,6 +44,8 @@ impl Default for Metrics {
         let pods = Family::<StateLabel, Gauge>::default();
         let snapshots = Counter::default();
         let exchanges = Gauge::default();
+        let exemplars = Gauge::default();
+        let exemplars_refused = Counter::default();
         registry.register(
             "mimic_controller_segments",
             "Segments reçus des sidecars",
@@ -70,6 +76,16 @@ impl Default for Metrics {
             "Échanges en mémoire, tous workloads",
             exchanges.clone(),
         );
+        registry.register(
+            "mimic_controller_exemplars",
+            "Exemples par endpoint gardés, tous workloads",
+            exemplars.clone(),
+        );
+        registry.register(
+            "mimic_controller_exemplars_refused",
+            "Candidats sans exemple : plafond d'endpoints du workload atteint",
+            exemplars_refused.clone(),
+        );
         Self {
             registry,
             segments,
@@ -78,6 +94,8 @@ impl Default for Metrics {
             pods,
             snapshots,
             exchanges,
+            exemplars,
+            exemplars_refused,
         }
     }
 }

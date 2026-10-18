@@ -49,7 +49,8 @@ impl Default for ControllerConfig {
             tls: None,
             auth: AuthConfig::Kubernetes,
             store: "file:///var/lib/mimic-controller".into(),
-            retention: Duration::from_secs(7 * 24 * 3600),
+            // Historique court : les exemples par endpoint couvrent le reste (spec §5.5.3).
+            retention: Duration::from_secs(24 * 3600),
             max_exchanges_per_workload: 200_000,
             max_exchanges_total: 1_000_000,
             samples_per_operation: 20,
@@ -128,6 +129,9 @@ impl ControllerConfig {
             return Err(
                 "max_exchanges_per_workload et max_exchanges_total doivent être positifs".into(),
             );
+        }
+        if self.max_exemplars_per_workload == 0 {
+            return Err("max_exemplars_per_workload doit être positif".into());
         }
         if self.snapshot.max_per_key == 0 {
             return Err("snapshot.max_per_key doit être positif".into());

@@ -65,6 +65,11 @@ kubectl get mimicworkload -n shop   # snapshot servi, pods alignés
 ```
 
 Rejouer un snapshot précis lors d'un tir suivant : `{"spec":{"mode":"mock","snapshot":"<id>"}}`.
+Tous les pods servent ce même snapshot, poussé par le contrôleur : les sidecars ne s'échangent
+pas leurs enregistrements. Les snapshots ne sont jamais supprimés ; l'historique des échanges
+est de 24 heures (`retention` dans `controller.yaml`), et chaque endpoint du workload garde un
+exemple rejouable au-delà (`<namespace>/<workload>/exemplars.jsonl` sur le PVC, au plus
+`max_exemplars_per_workload` endpoints, spec §5.5.3).
 Le droit de basculer est le droit de modifier `mimicworkloads` (rôle `mimic-operator`).
 
 **Garde-fou production** : dans un namespace labellisé `env=production`, le contrôleur ne

@@ -67,7 +67,9 @@ impl Running {
         self.ctl.set_namespace_labels(ns, labels).await;
     }
 
+    /// Arrête les tâches, après avoir écrit les exemples par endpoint qui ont changé.
     pub async fn shutdown(self) {
+        self.ctl.flush_all().await;
         for t in &self.tasks {
             t.abort();
         }

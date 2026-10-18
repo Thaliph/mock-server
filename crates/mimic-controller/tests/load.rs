@@ -1,15 +1,16 @@
 //! Banc de charge du contrôleur (spec §5.5.2, hors critères 11.2), ignoré par défaut.
 //!
 //! Le contrôleur tourne dans son propre runtime tokio (threads `ctl-rt`, dont on mesure le
-//! temps CPU) ; des sidecars simulés rejouent le protocole réel (§5.4, §5.5) : battement,
-//! publication d'un segment sous son identifiant, liste des segments, import de ceux des pairs.
+//! temps CPU) ; des sidecars simulés rejouent le protocole réel (§5.4, §5.5) : battement et
+//! publication d'un segment sous son identifiant. Avec `LOAD_PEER_IMPORT=1`, ils rejouent le
+//! protocole d'avant la v0.11 : liste des segments et import de ceux des pairs, pour comparer.
 //!
 //! Lancement :
 //! `cargo test --release -p mimic-controller --test load -- --ignored --nocapture --test-threads 1 <scénario>`
 //! Paramètres par variables d'environnement : `LOAD_PODS`, `LOAD_WORKLOADS`, `LOAD_SECS`,
 //! `LOAD_SPEEDUP`, `LOAD_EXCHANGES`, `LOAD_BODY`, `LOAD_CTL_WORKERS`, `LOAD_UI_MS`,
-//! `LOAD_PRELOAD`, `LOAD_PRELOAD_AGE_DAYS`, `LOAD_SINCE` (1 : liste incrémentale, comme le
-//! sidecar), `LOAD_SEGMENTS`, `LOAD_BIG_EXCHANGES`, `LOAD_JOIN_SEGMENTS`,
+//! `LOAD_PRELOAD`, `LOAD_PRELOAD_AGE_DAYS`, `LOAD_PEER_IMPORT`, `LOAD_SINCE` (avec l'import :
+//! 1 pour la liste incrémentale), `LOAD_SEGMENTS`, `LOAD_BIG_EXCHANGES`, `LOAD_JOIN_SEGMENTS`,
 //! `LOAD_DISCOVERY_SECS`, `LOAD_MAX_TOTAL`, `LOAD_GC_SEGMENTS`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -352,8 +353,9 @@ async fn sidecar(
     let prefix = format!("{base}/v1/workloads/{NS}/{wl}");
     let mut imported = BTreeSet::new();
     let mut counter = 0u64;
-    // Liste incrémentale (`since_ms`), comme le sidecar (SHR-06) ; ignorée par un
-    // contrôleur qui ne la connaît pas.
+    // Ancien protocole : liste et import des segments des pairs, éventuellement incrémental
+    // (`since_ms`). Un sidecar à jour ne fait que publier (SHR-10).
+    let import_peers = env("LOAD_PEER_IMPORT", 0) == 1;
     let incremental = env("LOAD_SINCE", 0) == 1;
     let mut listed_upto: Option<i64> = None;
     // Décalage initial : les pods ne démarrent pas tous à la même milliseconde.
@@ -386,6 +388,11 @@ async fn sidecar(
                     .body(seg);
                 timed(&stats, "post_segment", req).await;
             }
+            if !import_peers {
+                let wake = next_hb.min(next_share).min(stop);
+                tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+                continue;
+            }
             let url = match listed_upto {
                 Some(ms) if incremental => format!("{prefix}/segments?since_ms={}", ms - 60_000),
                 _ => format!("{prefix}/segments"),
@@ -394,7 +401,7 @@ async fn sidecar(
             if let Some(b) = timed(&stats, "list_segments", req).await {
                 stats.bytes_in.fetch_add(b.len() as u64, Ordering::Relaxed);
                 let list: Vec<Value> = serde_json::from_slice(&b).unwrap_or_default();
-                let oldest = now_ms().saturating_sub(7 * 24 * 3600 * 1000) as i64;
+                let oldest = now_ms().saturating_sub(24 * 3600 * 1000) as i64;
                 if let Some(max) = list.iter().filter_map(|s| s["modified_ms"].as_i64()).max() {
                     listed_upto = Some(listed_upto.map_or(max, |m| m.max(max)));
                 }
@@ -605,8 +612,10 @@ fn write_segments(root: &std::path::Path, wl: &str, n: u64, age_days: Option<u64
     }
 }
 
-/// Arrivée d'un pod dans un workload qui a déjà `LOAD_JOIN_SEGMENTS` segments récents :
-/// sa première synchronisation importe tout l'historique, un GET par segment.
+/// Arrivée d'un pod dans un workload qui a déjà `LOAD_JOIN_SEGMENTS` segments récents. Avec
+/// l'ancien protocole (`LOAD_PEER_IMPORT=1`), sa première synchronisation importe tout
+/// l'historique, un GET par segment ; un sidecar à jour ne télécharge rien en record, et
+/// seulement le snapshot du workload en mock (mesuré ensuite).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn load_pod_join() {
@@ -640,11 +649,46 @@ async fn load_pod_join() {
     .await;
     let wall = t.elapsed();
     println!(
-        "\n== arrivée d'un pod : {n} segments de {per_segment} échanges importés en {:.1} s, CPU contrôleur {:.1} s",
+        "\n== arrivée d'un pod : {n} segments de {per_segment} échanges, import des pairs {}, en {:.1} s, CPU contrôleur {:.1} s",
+        if env("LOAD_PEER_IMPORT", 0) == 1 {
+            "oui"
+        } else {
+            "non"
+        },
         wall.as_secs_f64(),
         ctl_cpu_secs() - cpu0
     );
     stats.report(wall);
+    // En mock, le pod télécharge le snapshot du workload, une fois.
+    let t = Instant::now();
+    ctl.apply_spec("wl0", "mock").await;
+    let built = t.elapsed();
+    let desired: Value = client()
+        .get(ctl.ui(&format!("/v1/workloads/{NS}/wl0/mode")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = desired["snapshot"].as_str().unwrap_or_default().to_string();
+    let snap = client()
+        .get(ctl.api(&format!("/v1/workloads/{NS}/wl0/snapshots/{id}")))
+        .bearer_auth("tok-wl0-new")
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    println!(
+        "snapshot construit en {:.1} s : {} échanges, {:.2} Mo téléchargés par le pod en mock",
+        built.as_secs_f64(),
+        snap.split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .count(),
+        snap.len() as f64 / 1e6
+    );
 }
 
 fn env_list(name: &str, default: &[u64]) -> Vec<u64> {
@@ -798,9 +842,11 @@ async fn load_big_workload() {
     stats.report(Duration::from_secs(1));
 }
 
-/// Passe de maintenance (CTL-10, CTL-11) sur un support vieilli : `LOAD_GC_SEGMENTS`
-/// segments de 20 échanges datés du dernier jour (à compacter par heure) et autant d'il y a
-/// 8 jours (hors rétention), pendant que des battements continuent.
+/// Passe de maintenance (CTL-10, CTL-11, CTL-17) sur un support vieilli : `LOAD_GC_SEGMENTS`
+/// segments de 20 échanges datés des 23 dernières heures (à compacter par heure) et autant
+/// d'il y a `LOAD_GC_OLD_DAYS` jours (2 par défaut, hors rétention), pendant que des
+/// battements continuent. Les segments, rangés avant le démarrage, sont relus pour les
+/// exemples par endpoint avant d'être supprimés.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn load_maintenance() {
@@ -813,8 +859,11 @@ async fn load_maintenance() {
     let mut counter = 0;
     let now = std::time::SystemTime::now();
     for i in 0..n {
-        // Dernier jour : réparti sur 24 heures révolues ; 8 jours : hors rétention.
-        for age in [3_600 + i * 82_800 / n.max(1), 8 * 86_400] {
+        // 23 dernières heures : à compacter ; ancien : hors rétention.
+        for age in [
+            3_600 + i * 79_200 / n.max(1),
+            env("LOAD_GC_OLD_DAYS", 2) * 86_400,
+        ] {
             let seg = segment_body("wl0-peer", &mut counter, 20, body);
             let path = dir.join(format!("{}.jsonl", ulid::Ulid::generate()));
             std::fs::write(&path, seg).unwrap();
@@ -858,11 +907,15 @@ async fn load_maintenance() {
     let cpu = ctl_cpu_secs() - cpu0;
     stop.store(true, Ordering::Relaxed);
     pinger.await.unwrap();
+    let exemplars = std::fs::metadata(ctl.dir.path().join(format!("{NS}/wl0/exemplars.jsonl")))
+        .map(|m| m.len())
+        .unwrap_or(0);
     println!(
-        "\n== maintenance : {files0} fichiers ({:.0} Mo) -> {} fichiers ({:.0} Mo) en {:.1} s, CPU contrôleur {cpu:.1} s",
+        "\n== maintenance : {files0} fichiers ({:.0} Mo) -> {} fichiers ({:.0} Mo, dont exemplars.jsonl {:.1} Ko) en {:.1} s, CPU contrôleur {cpu:.1} s",
         bytes0 as f64 / 1e6,
         count_files(ctl.dir.path()),
         dir_bytes(ctl.dir.path()) as f64 / 1e6,
+        exemplars as f64 / 1024.0,
         wall.as_secs_f64()
     );
     stats.report(wall);
