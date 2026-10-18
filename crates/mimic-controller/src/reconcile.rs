@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub use crate::crd::MimicWorkloadSpec;
-use crate::crd::{INBOUND_CAPTURES, LabelSelector, MODES, MimicWorkloadStatus, StatusCondition};
+use crate::crd::{
+    INBOUND_CAPTURES, LabelSelector, MOCK_WEBSOCKETS, MODES, MimicWorkloadStatus, StatusCondition,
+};
 
 /// Label de namespace qui interdit le mock (spec §1 et §5.5.1).
 pub const PRODUCTION_LABEL: (&str, &str) = ("env", "production");
@@ -23,6 +25,9 @@ pub struct Desired {
     /// Capture de l'entrant imposée (`full`, `metadata`, `off`, spec §5.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_inbound: Option<String>,
+    /// WebSocket sortant en mock imposé (`relay`, `refuse`, spec §3.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mock_websocket: Option<String>,
     /// Pods concernés ; jamais transmis aux sidecars, qui reçoivent leur propre état.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<LabelSelector>,
@@ -52,6 +57,7 @@ pub fn desired_of(spec: &MimicWorkloadSpec, snapshot: Option<String>) -> Desired
         mode: Some(spec.mode.clone()),
         snapshot,
         capture_inbound: spec.capture.as_ref().and_then(|c| c.inbound.clone()),
+        mock_websocket: spec.mock.as_ref().and_then(|m| m.websocket.clone()),
         selector: spec.selector.clone(),
     }
 }
@@ -160,6 +166,10 @@ pub fn reconcile(
     if capture.is_some_and(|c| !INBOUND_CAPTURES.contains(&c)) {
         return keep("InvalidCapture");
     }
+    let websocket = spec.mock.as_ref().and_then(|m| m.websocket.as_deref());
+    if websocket.is_some_and(|w| !MOCK_WEBSOCKETS.contains(&w)) {
+        return keep("InvalidMock");
+    }
     if !is_mock(&spec.mode) {
         return set(None);
     }
@@ -191,6 +201,9 @@ pub struct PodReport {
     /// Capture de l'entrant appliquée ; absente chez un ancien sidecar.
     #[serde(default)]
     pub capture_inbound: Option<String>,
+    /// WebSocket sortant en mock appliqué ; absent chez un ancien sidecar.
+    #[serde(default)]
+    pub mock_websocket: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -229,7 +242,11 @@ pub fn pod_state(
                 && desired
                     .capture_inbound
                     .as_ref()
-                    .is_none_or(|c| pod.capture_inbound.as_ref() == Some(c)) =>
+                    .is_none_or(|c| pod.capture_inbound.as_ref() == Some(c))
+                && desired
+                    .mock_websocket
+                    .as_ref()
+                    .is_none_or(|w| pod.mock_websocket.as_ref() == Some(w)) =>
         {
             PodState::Aligned
         }

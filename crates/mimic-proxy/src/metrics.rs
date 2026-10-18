@@ -98,8 +98,10 @@ pub struct TriggerLabel {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct DirectionLabel {
+pub struct WebsocketLabels {
     pub direction: &'static str,
+    /// `relayed` (`101` de l'amont relayé) ou `refused` (refus en mock, spec §3.4).
+    pub result: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -132,7 +134,7 @@ pub struct Metrics {
     pub mode: Family<ModeLabel, Gauge>,
     pub passthrough: Family<PassthroughLabels, Counter>,
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
-    pub websocket_connections: Family<DirectionLabel, Counter>,
+    pub websocket_connections: Family<WebsocketLabels, Counter>,
     /// Authorities internées : au plus `MAX_AUTHORITIES` chaînes, jamais libérées.
     authorities: RwLock<BTreeSet<&'static str>>,
 }
@@ -252,7 +254,7 @@ impl Metrics {
         );
         registry.register(
             "mimic_websocket_connections",
-            "Connexions WebSocket établies (101 de l'amont relayé)",
+            "Poignées de main WebSocket : 101 de l'amont relayé, ou refus en mock",
             websocket_connections.clone(),
         );
         Self {
@@ -363,6 +365,17 @@ impl Metrics {
         self.mock_latency
             .get_or_create(&AuthorityLabel { authority })
             .observe(d.as_secs_f64());
+    }
+
+    /// `mimic_websocket_connections_total` : poignée de main relayée (`relayed`) ou refusée
+    /// en mock (`refused`).
+    pub fn count_websocket(&self, direction: Direction, result: &'static str) {
+        self.websocket_connections
+            .get_or_create(&WebsocketLabels {
+                direction: direction_label(direction),
+                result,
+            })
+            .inc();
     }
 
     /// `mimic_upstream_errors_total` : échec de connexion (`connect`) ou de réponse (`request`).

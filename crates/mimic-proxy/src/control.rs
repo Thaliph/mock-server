@@ -16,7 +16,7 @@ use hyper_util::rt::TokioExecutor;
 use mimic_core::snapshot::{MockSnapshot, Snapshot, digest};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{InboundCapture, Mode, ShareConfig};
+use crate::config::{InboundCapture, MockWebsocket, Mode, ShareConfig};
 use crate::state::AppState;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -46,6 +46,10 @@ pub struct Desired {
     /// Capture de l'entrant imposée ; absente, celle de la configuration (spec §5.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_inbound: Option<String>,
+    /// WebSocket sortant en mock imposé (`relay`, `refuse`) ; absent, celui de la
+    /// configuration (spec §3.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mock_websocket: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -174,12 +178,14 @@ impl ControllerClient {
         mode: Mode,
         snapshot: Option<String>,
         capture: InboundCapture,
+        websocket: MockWebsocket,
     ) -> Result<Desired, String> {
         let body = serde_json::json!({
             "instance": self.instance,
             "mode": mode.as_str(),
             "snapshot": snapshot,
             "capture_inbound": capture.as_str(),
+            "mock_websocket": websocket.as_str(),
         });
         let b = self
             .call(
@@ -301,6 +307,13 @@ pub fn restore(state: &AppState) {
     {
         state.set_inbound_capture(c);
     }
+    if let Some(w) = desired
+        .mock_websocket
+        .as_deref()
+        .and_then(MockWebsocket::parse)
+    {
+        state.set_mock_websocket(w);
+    }
     tracing::info!(mode = ?desired.mode, snapshot = ?desired.snapshot, "dernier état souhaité rechargé");
     state
         .controller_status
@@ -375,7 +388,12 @@ pub fn spawn(
 async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String> {
     let loaded = state.snapshot().map(|s| s.id.clone());
     let desired = client
-        .heartbeat(state.mode(), loaded.clone(), state.inbound_capture())
+        .heartbeat(
+            state.mode(),
+            loaded.clone(),
+            state.inbound_capture(),
+            state.mock_websocket(),
+        )
         .await?;
     let previous = state
         .controller_status
@@ -424,6 +442,14 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
         },
         // Plus de capture imposée : celle de la configuration.
         None => state.set_inbound_capture(state.config.capture.inbound),
+    }
+    match desired.mock_websocket.as_deref() {
+        Some(w) => match MockWebsocket::parse(w) {
+            Some(w) => state.set_mock_websocket(w),
+            None => return Err(format!("réglage WebSocket inconnu: {w}")),
+        },
+        // Plus de réglage imposé : celui de la configuration.
+        None => state.set_mock_websocket(state.config.mock.websocket),
     }
     if desired != previous || fetched.is_some() {
         save(state, &desired, fetched.as_deref());

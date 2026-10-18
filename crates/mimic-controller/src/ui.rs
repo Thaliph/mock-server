@@ -75,6 +75,7 @@ async fn workload_json(ctl: &Ctl, ns: &str, wl: &str) -> Value {
                     "mode": p.report.mode,
                     "snapshot": p.report.snapshot,
                     "capture_inbound": p.report.capture_inbound,
+                    "mock_websocket": p.report.mock_websocket,
                     "last_seen_ms": p.last_seen_ms,
                     "state": s.as_str(),
                     "selected": selected,

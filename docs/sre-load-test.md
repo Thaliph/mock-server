@@ -14,7 +14,12 @@ Ce que fait mimic pendant le tir :
 - avec `--capture-inbound metadata` (ou `off`), le sidecar ne copie plus les bodies entrants
   et n'en publie rien : son coût reste négligeable devant celui de l'application, et le store
   ne grossit pas avec le trafic du tir ;
-- avec `--selector`, seuls les pods choisis basculent (par exemple le nouveau ReplicaSet).
+- avec `--selector`, seuls les pods choisis basculent (par exemple le nouveau ReplicaSet) ;
+- exception : une connexion WebSocket sortante n'a pas de réponse rejouable (les trames ne
+  sont pas enregistrées) et reste relayée vers la vraie dépendance. Avec
+  `--mock-websocket refuse`, le sidecar la refuse en `503` (`x-mimic-websocket: refused`) et
+  plus rien ne sort du pod ; les refus se comptent dans
+  `mimic_websocket_connections_total{result="refused"}`.
 
 > **Garde-fou production.** Dans un namespace labellisé `env=production`, `mock` et
 > `mock-partial` sont refusés : par `mimicctl` (code de sortie 2), par le contrôleur
@@ -57,6 +62,9 @@ le prochain `replay.js` sera toujours tiré du trafic réel.
 ```sh
 mimicctl mode checkout mock --capture-inbound metadata -n perf
 kubectl apply -n perf -f deploy/example/networkpolicy-mock.yaml   # facultatif : rien ne sort
+# Le workload ouvre des WebSockets vers ses dépendances ? Les refuser aussi, sinon la
+# NetworkPolicy les fait échouer en 502 :
+#   mimicctl mode checkout mock --capture-inbound metadata --mock-websocket refuse -n perf
 until mimicctl status checkout -n perf | tail -1 | grep -qE ' ([0-9]+)/\1$'; do sleep 2; done
 ```
 
@@ -130,6 +138,7 @@ Contrôles du mock pendant le tir :
 |---------|---------|
 | `sum(rate(mimic_mock_responses_total{namespace="perf", match="unmatched"}[1m]))` | 0 : sinon une dépendance répond `599`, le tir mesure des erreurs |
 | `histogram_quantile(0.99, sum by (le) (rate(mimic_mock_injected_latency_seconds_bucket{namespace="perf"}[1m])))` | proche de la latence réelle des dépendances |
+| `sum(rate(mimic_websocket_connections_total{namespace="perf", direction="outbound"}[1m])) by (result)` | `relayed` : WebSockets relayés vers les vraies dépendances ; `refused` : refusés (`--mock-websocket refuse`) |
 | `rate(container_cpu_usage_seconds_total{namespace="perf", container="mimic"}[1m])` | faible devant celui de l'application |
 
 ## 5. Revenir en record

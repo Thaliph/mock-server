@@ -14,7 +14,7 @@ use mimic_core::redact::{RedactConfig, Redactor};
 use mimic_core::snapshot::MockSnapshot;
 use serde_json::Value;
 
-use crate::config::{Config, InboundCapture, Mode};
+use crate::config::{Config, InboundCapture, MockWebsocket, Mode};
 use crate::metrics::{DiscoveryLabels, Metrics, OriginLabel};
 use crate::store::{Drops, Limits, Store};
 use crate::throttle::LogLimiter;
@@ -40,6 +40,8 @@ pub struct AppState {
     mode: AtomicU8,
     /// Capture de l'entrant courante : celle de la configuration, ou celle du contrôleur.
     inbound_capture: AtomicU8,
+    /// WebSocket sortant en mock : réglage de la configuration, ou celui du contrôleur.
+    mock_websocket: AtomicU8,
     pub store: Store,
     pub metrics: Metrics,
     pub redactor: Redactor,
@@ -144,6 +146,7 @@ impl AppState {
         Ok(Arc::new(Self {
             mode: AtomicU8::new(config.mode.to_u8()),
             inbound_capture: AtomicU8::new(config.capture.inbound as u8),
+            mock_websocket: AtomicU8::new(config.mock.websocket as u8),
             inbound_targets: crate::net::InboundTargets::new(config.inbound.upstream),
             config,
             store,
@@ -208,6 +211,23 @@ impl AppState {
                 from = previous.as_str(),
                 to = c.as_str(),
                 "capture de l'entrant"
+            );
+        }
+    }
+
+    pub fn mock_websocket(&self) -> MockWebsocket {
+        MockWebsocket::from_u8(self.mock_websocket.load(Ordering::SeqCst))
+    }
+
+    /// Change le traitement des WebSockets sortants en mock, pour les poignées de main
+    /// suivantes ; les connexions déjà relayées continuent.
+    pub fn set_mock_websocket(&self, w: MockWebsocket) {
+        let previous = MockWebsocket::from_u8(self.mock_websocket.swap(w as u8, Ordering::SeqCst));
+        if previous != w {
+            tracing::info!(
+                from = previous.as_str(),
+                to = w.as_str(),
+                "WebSocket sortant en mock"
             );
         }
     }
