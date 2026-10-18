@@ -189,4 +189,4 @@ OpenAPI, snapshots, dernières requêtes et exports pour le rejeu (k6, JSONL, JS
 Chaque sidecar a aussi sa page d'admin, limitée à ce que ce pod a vu (sous contrôleur, aucun
 sidecar n'importe le trafic des autres pods ; le workload entier est dans l'interface du
 contrôleur) :
-`kubectl port-forward -n shop pod/<pod> 15000` puis `http://127.0.0.1:15000/`.
+`kubectl port-forward -n shop pod/<pod> 15100` puis `http://127.0.0.1:15100/`.

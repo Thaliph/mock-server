@@ -303,7 +303,7 @@ sleep 15
 scrape() {
   local p
   for p in $(kubectl -n "$NS" get pods -l "opentelemetry.io/name=$1" -o name); do
-    kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15000/proxy/metrics"
+    kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15100/proxy/metrics"
   done
 }
 # total <filtre awk> : somme des séries retenues, lues sur l'entrée standard.
@@ -410,7 +410,7 @@ shipping_mock_state() {
   local p
   for p in $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -o name | sort); do
     printf '%s %s %s\n' "${p#pod/}" \
-      "$(kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15000/proxy/metrics" | metric_of mimic_mock_snapshot_exchanges)" \
+      "$(kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15100/proxy/metrics" | metric_of mimic_mock_snapshot_exchanges)" \
       "$(kubectl -n "$NS" logs "$p" -c mimic | grep -c 'snapshot chargé' || true)"
   done
 }
@@ -540,12 +540,12 @@ ws_handshake() {
 ws_count() { kubectl -n "$NS" exec client -- curl -sS -m 5 http://ws-echo:8080/count; }
 # ws_metric <result> : mimic_websocket_connections_total sortant du sidecar de ws-client.
 ws_metric() {
-  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15000/proxy/metrics" |
+  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15100/proxy/metrics" |
     total '/^mimic_websocket_connections_total[{]/ && /direction="outbound"/ && /result="'"$1"'"/'
 }
 # ws_applied <websocket> : le sidecar de ws-client est en mock, snapshot chargé, avec ce réglage.
 ws_applied() {
-  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15000/proxy/api/status" |
+  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15100/proxy/api/status" |
     jq -e --arg w "$1" '.mode == "mock" and .snapshot != null and .mock_websocket == $w' >/dev/null
 }
 # ws_aligned : statut publié pour la génération courante, le pod aligné.

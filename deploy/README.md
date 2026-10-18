@@ -140,7 +140,7 @@ kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic
 ```
 
 La page d'admin d'un sidecar reste disponible pour déboguer un pod :
-`kubectl port-forward deploy/checkout 15000:15000`.
+`kubectl port-forward deploy/checkout 15100:15100`.
 
 Si les noeuds utilisent iptables en mode legacy, ajouter `MIMIC_IPTABLES=iptables-legacy`
 à l'init container.

@@ -151,7 +151,7 @@ impl Default for InboundConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            listen: ([0, 0, 0, 0], 15006).into(),
+            listen: ([0, 0, 0, 0], 15106).into(),
             upstream: None,
         }
     }
@@ -169,7 +169,7 @@ impl Default for OutboundConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            listen: ([127, 0, 0, 1], 15001).into(),
+            listen: ([127, 0, 0, 1], 15101).into(),
         }
     }
 }
@@ -183,7 +183,7 @@ pub struct AdminConfig {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            listen: ([0, 0, 0, 0], 15000).into(),
+            listen: ([0, 0, 0, 0], 15100).into(),
         }
     }
 }

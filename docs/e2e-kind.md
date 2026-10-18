@@ -106,8 +106,8 @@ mimicctl status -n otel-demo                       # mode, snapshot, pods align�
 kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081
 # puis http://127.0.0.1:8081/ : workloads, API découvertes, snapshots, requêtes
 kubectl -n mimic-system get lease mimic-controller   # réplique active
-kubectl port-forward -n otel-demo deploy/frontend 15000
-# puis http://127.0.0.1:15000/ : page d'admin d'un sidecar, /metrics pour ses métriques
+kubectl port-forward -n otel-demo deploy/frontend 15100
+# puis http://127.0.0.1:15100/ : page d'admin d'un sidecar, /metrics pour ses métriques
 ```
 
 ## Régénérer la démo

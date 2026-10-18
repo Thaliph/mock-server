@@ -6,11 +6,11 @@ data:
   mimic.yaml: |
     mode: record
     inbound:
-      listen: 0.0.0.0:15006
+      listen: 0.0.0.0:15106
     outbound:
-      listen: 127.0.0.1:15001
+      listen: 127.0.0.1:15101
     admin:
-      listen: 0.0.0.0:15000
+      listen: 0.0.0.0:15100
     capture:
       samples_per_operation: 20
     mock:
