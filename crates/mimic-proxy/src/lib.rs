@@ -179,8 +179,21 @@ async fn serve(listener: TcpListener, state: Arc<AppState>, kind: Listener) {
         let state = state.clone();
         tokio::spawn(async move {
             // Le trafic redirigé par iptables n'est pas forcément HTTP.
+            let mut stream = stream;
             if let (Some(dst), Listener::Inbound | Listener::Outbound) = (info.original_dst, kind) {
-                let protocol = net::sniff(&stream).await;
+                let inbound = matches!(kind, Listener::Inbound);
+                let (protocol, upstream) = match net::detect(&stream).await {
+                    net::Detected::Protocol(p) => (p, None),
+                    net::Detected::Silent => {
+                        match proxy::resolve_silent(state.clone(), stream, dst, inbound).await {
+                            proxy::Silent::Client(s, p, upstream) => {
+                                stream = s;
+                                (p, upstream)
+                            }
+                            proxy::Silent::Done => return,
+                        }
+                    }
+                };
                 if protocol == net::Protocol::Tls
                     && matches!(kind, Listener::Outbound)
                     && let Some(host) = net::peek_sni(&stream).await
@@ -191,8 +204,7 @@ async fn serve(listener: TcpListener, state: Arc<AppState>, kind: Listener) {
                     return;
                 }
                 if protocol != net::Protocol::Http {
-                    let inbound = matches!(kind, Listener::Inbound);
-                    proxy::tunnel(state, stream, dst, protocol, inbound).await;
+                    proxy::tunnel(state, stream, dst, protocol, inbound, upstream).await;
                     return;
                 }
             }
