@@ -15,6 +15,7 @@ fn identity(ns: &str, pod: &str, workload: &str) -> Identity {
         namespace: ns.into(),
         pod: pod.into(),
         workload: workload.into(),
+        ..Identity::default()
     }
 }
 

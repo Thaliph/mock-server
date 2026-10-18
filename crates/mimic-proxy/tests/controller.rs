@@ -25,6 +25,12 @@ fn tokens() -> BTreeMap<String, Identity> {
                     namespace: "ns".into(),
                     pod: p.to_string(),
                     workload: "api".into(),
+                    // api-a est l'ancienne version, api-b la nouvelle (CRD-08).
+                    labels: [(
+                        "version".to_string(),
+                        if *p == "api-a" { "v1" } else { "v2" }.to_string(),
+                    )]
+                    .into(),
                 },
             )
         })
@@ -286,6 +292,72 @@ async fn crd_07_production_namespace_never_switches_the_sidecar() {
     let desired = ui_json(&ctl, "/v1/workloads/ns/api/mode").await;
     assert_eq!(desired["mode"], "record", "{desired}");
     converged(&[&a], "record", &Value::Null).await;
+}
+
+/// Blue/green : seul le pod de la nouvelle version bascule en mock ; l'autre reste dans le
+/// mode de sa configuration et n'est pas compté.
+#[tokio::test]
+async fn crd_08_selector_switches_only_selected_pods() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    let b = proxy(piloted(None, &ctl, dir.path(), "api-b")).await;
+    // L'ancienne version enregistre la dépendance.
+    let url7 = saas.url("/users/7");
+    let recorded = served(&a, &url7).await;
+    eventually("appel reçu", || async {
+        ui_json(&ctl, "/v1/workloads/ns/api/requests?direction=outbound")
+            .await
+            .as_array()
+            .is_some_and(|l| l.len() == 1)
+    })
+    .await;
+    ctl.apply_spec(
+        "ns",
+        "api",
+        Some(MimicWorkloadSpec {
+            mode: "mock".into(),
+            selector: Some(mimic_controller::crd::LabelSelector {
+                match_labels: [("version".to_string(), "v2".to_string())].into(),
+                ..Default::default()
+            }),
+            ..MimicWorkloadSpec::default()
+        }),
+    )
+    .await;
+    let desired = ui_json(&ctl, "/v1/workloads/ns/api/mode").await;
+    let snap = desired["snapshot"].clone();
+    assert!(snap.is_string(), "{desired}");
+    converged(&[&b], "mock", &snap).await;
+    eventually("seul le pod sélectionné compte", || async {
+        let wl = ui_json(&ctl, "/v1/workloads").await;
+        wl[0]["selected_pods"] == 1 && wl[0]["aligned"] == 1 && wl[0]["ready"] == true
+    })
+    .await;
+    let s = status(&a).await;
+    assert_eq!(s["mode"], "record", "{s}");
+    assert!(s["snapshot"].is_null());
+    // La nouvelle version rejoue ce que l'ancienne a enregistré ; l'ancienne appelle la vraie
+    // dépendance.
+    let hits = saas.hits();
+    assert_eq!(served(&b, &url7).await.2, recorded.2);
+    assert_eq!(saas.hits(), hits);
+    assert_eq!(served(&a, &url7).await.0, 200);
+    assert_eq!(saas.hits(), hits + 1);
+    let wl = ui_json(&ctl, "/v1/workloads").await;
+    let pods = wl[0]["pods"].as_array().unwrap();
+    let selected = |i: &str| pods.iter().find(|p| p["instance"] == i).unwrap()["selected"].clone();
+    assert_eq!(selected("api-a"), false);
+    assert_eq!(selected("api-b"), true);
+
+    // Retour en record sans sélecteur : tout le workload.
+    apply(&ctl, "record", None).await;
+    converged(&[&a, &b], "record", &Value::Null).await;
+    eventually("deux pods comptés", || async {
+        ui_json(&ctl, "/v1/workloads").await[0]["selected_pods"] == 2
+    })
+    .await;
 }
 
 /// La capture de l'entrant imposée par la ressource atteint les sidecars, et l'alignement

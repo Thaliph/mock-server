@@ -8,3 +8,10 @@ metadata:
   namespace: shop
 spec:
   mode: record
+  # Pendant un tir (docs/sre-load-test.md) : seuls ces pods basculent, les autres gardent le
+  # mode de leur configuration ; l'entrant n'est gardé qu'en métadonnées.
+  # selector:
+  #   matchLabels:
+  #     pod-template-hash: 7d9f8c6b5
+  # capture:
+  #   inbound: metadata

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub use crate::crd::MimicWorkloadSpec;
-use crate::crd::{INBOUND_CAPTURES, MODES, MimicWorkloadStatus, StatusCondition};
+use crate::crd::{INBOUND_CAPTURES, LabelSelector, MODES, MimicWorkloadStatus, StatusCondition};
 
 /// Label de namespace qui interdit le mock (spec §1 et §5.5.1).
 pub const PRODUCTION_LABEL: (&str, &str) = ("env", "production");
@@ -23,6 +23,27 @@ pub struct Desired {
     /// Capture de l'entrant imposée (`full`, `metadata`, `off`, spec §5.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_inbound: Option<String>,
+    /// Pods concernés ; jamais transmis aux sidecars, qui reçoivent leur propre état.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<LabelSelector>,
+}
+
+/// Vrai si l'état souhaité s'applique à un pod portant ces labels.
+pub fn selects(desired: &Desired, labels: &BTreeMap<String, String>) -> bool {
+    desired.selector.as_ref().is_none_or(|s| s.matches(labels))
+}
+
+/// État souhaité transmis à un pod : celui du workload s'il est sélectionné, sinon un état
+/// vide, c'est-à-dire le mode et la capture de sa configuration (spec §5.5.1).
+pub fn desired_for_pod(desired: &Desired, labels: &BTreeMap<String, String>) -> Desired {
+    if selects(desired, labels) {
+        Desired {
+            selector: None,
+            ..desired.clone()
+        }
+    } else {
+        Desired::default()
+    }
 }
 
 /// État souhaité de la ressource une fois son snapshot connu.
@@ -31,6 +52,7 @@ pub fn desired_of(spec: &MimicWorkloadSpec, snapshot: Option<String>) -> Desired
         mode: Some(spec.mode.clone()),
         snapshot,
         capture_inbound: spec.capture.as_ref().and_then(|c| c.inbound.clone()),
+        selector: spec.selector.clone(),
     }
 }
 

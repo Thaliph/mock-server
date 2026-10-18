@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use mimic_controller::crd::CaptureSpec;
+use mimic_controller::crd::{CaptureSpec, LabelSelector, LabelSelectorRequirement};
 use mimic_controller::reconcile::{
-    Action, Desired, MimicWorkloadSpec, PRODUCTION_REASON, PodReport, PodState, guard_pod,
-    is_production, pod_state, reconcile, reconcile_guarded, status_of, summarize,
+    Action, Desired, MimicWorkloadSpec, PRODUCTION_REASON, PodReport, PodState, desired_for_pod,
+    guard_pod, is_production, pod_state, reconcile, reconcile_guarded, selects, status_of,
+    summarize,
 };
 
 fn spec(mode: &str, snapshot: Option<&str>) -> MimicWorkloadSpec {
@@ -313,4 +314,79 @@ fn crd_09_capture_inbound_is_part_of_the_desired_state() {
         ),
         PodState::Aligned
     );
+}
+
+fn requirement(key: &str, operator: &str, values: &[&str]) -> LabelSelectorRequirement {
+    LabelSelectorRequirement {
+        key: key.into(),
+        operator: operator.into(),
+        values: values.iter().map(|v| v.to_string()).collect(),
+    }
+}
+
+#[test]
+fn crd_08_selector_limits_the_desired_state_to_selected_pods() {
+    let v1 = labels(&[("app", "checkout"), ("version", "v1")]);
+    let v2 = labels(&[("app", "checkout"), ("version", "v2")]);
+    let none = BTreeMap::new();
+
+    // Sémantique Kubernetes.
+    let by_labels = LabelSelector {
+        match_labels: labels(&[("version", "v2")]),
+        ..LabelSelector::default()
+    };
+    assert!(by_labels.matches(&v2));
+    assert!(!by_labels.matches(&v1));
+    assert!(!by_labels.matches(&none));
+    assert!(
+        LabelSelector::default().matches(&v1),
+        "sélecteur vide : tout"
+    );
+    let expr = |r: LabelSelectorRequirement| LabelSelector {
+        match_expressions: vec![r],
+        ..LabelSelector::default()
+    };
+    assert!(expr(requirement("version", "In", &["v2", "v3"])).matches(&v2));
+    assert!(!expr(requirement("version", "In", &["v2", "v3"])).matches(&v1));
+    assert!(!expr(requirement("version", "In", &["v2"])).matches(&none));
+    assert!(expr(requirement("version", "NotIn", &["v1"])).matches(&v2));
+    assert!(!expr(requirement("version", "NotIn", &["v1"])).matches(&v1));
+    assert!(expr(requirement("version", "NotIn", &["v1"])).matches(&none));
+    assert!(expr(requirement("version", "Exists", &[])).matches(&v1));
+    assert!(!expr(requirement("version", "Exists", &[])).matches(&none));
+    assert!(expr(requirement("version", "DoesNotExist", &[])).matches(&none));
+    assert!(!expr(requirement("version", "DoesNotExist", &[])).matches(&v1));
+    assert!(!expr(requirement("version", "Matches", &["v2"])).matches(&v2));
+    assert!(!expr(requirement("version", "In", &[])).matches(&v2));
+    assert!(!expr(requirement("version", "Exists", &["v2"])).matches(&v2));
+    // matchLabels et matchExpressions se combinent par un ET.
+    let both = LabelSelector {
+        match_labels: labels(&[("app", "checkout")]),
+        match_expressions: vec![requirement("version", "NotIn", &["v1"])],
+    };
+    assert!(both.matches(&v2));
+    assert!(!both.matches(&v1));
+
+    // L'état souhaité porte le sélecteur ; chaque pod reçoit le sien.
+    let mut s = spec("mock", Some(ID));
+    s.selector = Some(by_labels.clone());
+    let o = reconcile(Some(&s), &Desired::default(), &|_| true);
+    assert_eq!(o.desired.selector.as_ref(), Some(&by_labels));
+    assert!(selects(&o.desired, &v2));
+    assert!(!selects(&o.desired, &v1));
+    assert_eq!(desired_for_pod(&o.desired, &v2), desired("mock", Some(ID)));
+    assert_eq!(
+        desired_for_pod(&o.desired, &v1),
+        Desired::default(),
+        "repli : mode de la configuration"
+    );
+    // Sans sélecteur, tous les pods.
+    let all = desired("mock", Some(ID));
+    assert!(selects(&all, &v1));
+    assert_eq!(desired_for_pod(&all, &v1), all);
+
+    // Alignement : un pod non sélectionné en record n'est pas compté ; c'est au résumé
+    // de ne compter que les pods sélectionnés.
+    let s = summarize(&[PodState::Aligned], None);
+    assert_eq!((s.pods, s.aligned, s.ready), (1, 1, true));
 }

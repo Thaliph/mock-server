@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 
 use kube::api::ObjectMeta;
 use mimic_controller::crd::{
-    CaptureSpec, INBOUND_CAPTURES, MODES, MimicWorkload, MimicWorkloadSpec,
+    CaptureSpec, INBOUND_CAPTURES, LabelSelector, MODES, MimicWorkload, MimicWorkloadSpec,
 };
 use serde_json::Value;
 
@@ -48,6 +48,36 @@ pub struct ModeOptions {
     pub snapshot: Option<String>,
     /// `full`, `metadata` ou `off` (`spec.capture.inbound`).
     pub capture_inbound: Option<String>,
+    /// Égalités `clé=valeur` séparées par des virgules (`spec.selector.matchLabels`).
+    pub selector: Option<String>,
+}
+
+/// Caractères permis dans une clé de label (préfixe DNS compris) ou une valeur.
+fn label_part_ok(s: &str, key: bool) -> bool {
+    !s.is_empty()
+        && s.len() <= if key { 253 } else { 63 }
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') || (key && b == b'/')
+        })
+}
+
+/// `k=v,k2=v2` → `matchLabels` ; refusé si une égalité est mal formée.
+pub fn parse_selector(text: &str) -> Result<LabelSelector, String> {
+    let mut match_labels = BTreeMap::new();
+    for part in text.split(',') {
+        let (k, v) = part
+            .split_once('=')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .filter(|(k, v)| label_part_ok(k, true) && label_part_ok(v, false))
+            .ok_or_else(|| {
+                format!("sélecteur invalide « {text} » : attendu clé=valeur[,clé=valeur…]")
+            })?;
+        match_labels.insert(k.to_string(), v.to_string());
+    }
+    Ok(LabelSelector {
+        match_labels,
+        ..LabelSelector::default()
+    })
 }
 
 /// Comme `workload_apply`, avec toutes les options ; une option invalide est refusée
@@ -77,6 +107,7 @@ pub fn workload_apply_with(
             INBOUND_CAPTURES.join(", ")
         ));
     }
+    let selector = opts.selector.as_deref().map(parse_selector).transpose()?;
     Ok(MimicWorkload {
         metadata: ObjectMeta {
             name: Some(workload.into()),
@@ -86,6 +117,7 @@ pub fn workload_apply_with(
         spec: MimicWorkloadSpec {
             mode: mode.into(),
             snapshot: opts.snapshot.clone(),
+            selector,
             capture: opts.capture_inbound.as_ref().map(|c| CaptureSpec {
                 inbound: Some(c.clone()),
             }),
@@ -171,10 +203,20 @@ pub fn status_table(items: &[MimicWorkload]) -> String {
                 status.aligned.to_string(),
             )
         };
+        // Garde-fou production : le mode demandé n'est pas appliqué.
+        let refused = status
+            .conditions
+            .iter()
+            .any(|c| c.type_ == "Allowed" && c.status == "False");
+        let mode = if refused {
+            format!("{} (refusé)", mw.spec.mode)
+        } else {
+            mw.spec.mode.clone()
+        };
         rows.push([
             mw.metadata.namespace.clone().unwrap_or_default(),
             mw.metadata.name.clone().unwrap_or_default(),
-            mw.spec.mode.clone(),
+            mode,
             snapshot,
             format!("{aligned}/{}", status.pods),
         ]);

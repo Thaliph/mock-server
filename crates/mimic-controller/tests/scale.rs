@@ -31,6 +31,7 @@ fn config(dir: &Path) -> ControllerConfig {
                     namespace: "shop".into(),
                     pod: pod.to_string(),
                     workload: wl.to_string(),
+                    ..Identity::default()
                 },
             )
         })

@@ -33,6 +33,10 @@ enum Command {
         /// Capture de l'entrant pendant un tir : full, metadata ou off.
         #[arg(long)]
         capture_inbound: Option<String>,
+        /// Seuls ces pods basculent (`clé=valeur[,…]`, par exemple pod-template-hash=7d9f) ;
+        /// les autres gardent le mode de leur configuration.
+        #[arg(long)]
+        selector: Option<String>,
         #[arg(short, long)]
         namespace: Option<String>,
     },
@@ -130,11 +134,13 @@ async fn run(command: Command) -> Result<i32, String> {
             mode,
             snapshot,
             capture_inbound,
+            selector,
             namespace: ns,
         } => {
             let opts = ModeOptions {
                 snapshot,
                 capture_inbound,
+                selector,
             };
             // Validation avant toute connexion au cluster (CLI-02, CLI-07).
             workload_apply_with(ns.as_deref().unwrap_or("default"), &workload, &mode, &opts)?;

@@ -147,6 +147,7 @@ impl KubeAuth {
             namespace,
             pod,
             workload,
+            labels: found.metadata.labels.unwrap_or_default(),
         };
         self.cache
             .lock()
@@ -180,6 +181,7 @@ mod tests {
             namespace: "shop".into(),
             pod: "checkout-a".into(),
             workload: "checkout".into(),
+            ..Identity::default()
         }
     }
 

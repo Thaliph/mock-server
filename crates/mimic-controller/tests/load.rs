@@ -286,6 +286,7 @@ fn tokens(pods: &[(String, String)]) -> BTreeMap<String, Identity> {
                     namespace: NS.into(),
                     pod: pod.clone(),
                     workload: wl.clone(),
+                    ..Identity::default()
                 },
             )
         })

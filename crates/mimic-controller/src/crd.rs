@@ -1,5 +1,7 @@
 //! Ressource `MimicWorkload` (spec §5.5.1).
 
+use std::collections::BTreeMap;
+
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,9 +30,57 @@ pub struct MimicWorkloadSpec {
     /// Snapshot à rejouer ; absent, le contrôleur en construit un à l'entrée en mock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    /// Seuls les pods sélectionnés appliquent l'état souhaité ; les autres gardent le mode
+    /// de leur configuration (spec §5.5.1). Absent : tous les pods du workload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<LabelSelector>,
     /// Capture imposée aux sidecars ; absente, chacun garde celle de sa configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CaptureSpec>,
+}
+
+/// Label selector Kubernetes : `matchLabels` et `matchExpressions`, combinés par un ET.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelSelector {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub match_labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub match_expressions: Vec<LabelSelectorRequirement>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LabelSelectorRequirement {
+    pub key: String,
+    /// `In`, `NotIn`, `Exists` ou `DoesNotExist`.
+    pub operator: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+}
+
+impl LabelSelector {
+    /// Vrai si ces labels sont sélectionnés. Un sélecteur vide sélectionne tout ; une
+    /// expression invalide (opérateur inconnu, valeurs manquantes ou en trop) ne sélectionne
+    /// rien.
+    pub fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.match_labels
+            .iter()
+            .all(|(k, v)| labels.get(k) == Some(v))
+            && self.match_expressions.iter().all(|r| r.matches(labels))
+    }
+}
+
+impl LabelSelectorRequirement {
+    fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
+        let value = labels.get(&self.key);
+        match self.operator.as_str() {
+            "In" if !self.values.is_empty() => value.is_some_and(|v| self.values.contains(v)),
+            "NotIn" if !self.values.is_empty() => value.is_none_or(|v| !self.values.contains(v)),
+            "Exists" if self.values.is_empty() => value.is_some(),
+            "DoesNotExist" if self.values.is_empty() => value.is_none(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

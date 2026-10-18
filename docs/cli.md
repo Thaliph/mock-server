@@ -31,7 +31,8 @@ Les options `-n/--namespace` prennent le namespace du contexte par défaut. Code
 ### `mode` : basculer un workload
 
 ```sh
-mimicctl mode <workload> <passthrough|record|mock|mock-partial> [--snapshot <id>] [-n ns]
+mimicctl mode <workload> <passthrough|record|mock|mock-partial> [--snapshot <id>] \
+  [--selector k=v[,k=v…]] [--capture-inbound full|metadata|off] [-n ns]
 ```
 
 Crée ou met à jour la ressource `MimicWorkload` du workload (server-side apply, gestionnaire
@@ -55,6 +56,25 @@ mimicctl mode checkout record -n shop
 Seules les dépendances du workload sont mockées : son trafic entrant continue d'arriver à
 l'application. C'est ce qui permet de charger un workload isolé de ses dépendances.
 
+Pour un tir de charge (guide : [sre-load-test.md](sre-load-test.md)) :
+
+- `--selector k=v[,k=v…]` (`spec.selector.matchLabels`) : seuls les pods qui portent ces
+  labels basculent, par exemple le ReplicaSet de la nouvelle version
+  (`pod-template-hash=7d9f8c6b5`). Les autres reçoivent un état vide et gardent le mode de
+  leur configuration (`record` avec l'injecteur). Le contrôleur lit les labels dans l'API,
+  pas dans ce qu'annonce le sidecar.
+- `--capture-inbound metadata|off` (`spec.capture.inbound`) : pendant le tir, le sidecar ne
+  garde de l'entrant que les métadonnées, en mémoire (`metadata`), ou rien que les métriques
+  (`off`) ; `full` est le défaut.
+
+Un apply sans ces options les retire : `mimicctl mode checkout record` remet tout le
+workload dans le même état.
+
+```sh
+mimicctl mode checkout mock --selector pod-template-hash=7d9f8c6b5 --capture-inbound metadata -n perf
+mimicctl mode checkout record -n perf
+```
+
 ### `status` : état des bascules
 
 ```sh
@@ -66,7 +86,9 @@ NAMESPACE   WORKLOAD   MODE   SNAPSHOT           ALIGNED
 shop        checkout   mock   3f9a0c1e5b7d2a46   3/3
 ```
 
-`ALIGNED` compte les pods qui appliquent l'état souhaité sur les pods vus récemment. Juste
+`ALIGNED` compte les pods qui appliquent l'état souhaité (mode, snapshot et capture) sur les
+pods vus récemment, parmi les seuls pods sélectionnés quand la ressource a un `selector`. Un
+mode refusé par le garde-fou production est affiché `mock (refusé)`. Juste
 après une bascule, tant que le contrôleur n'a pas publié le statut de la nouvelle
 génération, `SNAPSHOT` vaut `?` et `ALIGNED` `?/3` : attendre `3/3` avant de lancer un tir.
 

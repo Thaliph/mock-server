@@ -62,13 +62,15 @@ async fn workload_json(ctl: &Ctl, ns: &str, wl: &str) -> Value {
         let pods: Vec<Value> = ctl
             .pod_states(w)
             .into_iter()
-            .map(|(p, s)| {
+            .map(|(p, s, selected)| {
                 json!({
                     "instance": p.instance,
                     "mode": p.report.mode,
                     "snapshot": p.report.snapshot,
+                    "capture_inbound": p.report.capture_inbound,
                     "last_seen_ms": p.last_seen_ms,
                     "state": s.as_str(),
+                    "selected": selected,
                 })
             })
             .collect();
@@ -78,6 +80,7 @@ async fn workload_json(ctl: &Ctl, ns: &str, wl: &str) -> Value {
             "spec": w.spec,
             "desired": w.desired,
             "pods": pods,
+            "selected_pods": summary.pods,
             "aligned": summary.aligned,
             "ready": summary.ready,
             "reason": summary.reason,
@@ -314,7 +317,7 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
     } else {
         h.push_str("<table><tr><th>Instance</th><th>Mode</th><th>Snapshot</th><th>Dernier battement</th><th>État</th></tr>");
         let now = now_ms();
-        for (p, s) in &pods {
+        for (p, s, selected) in &pods {
             let _ = write!(
                 h,
                 "<tr><td class=\"p\">{}</td><td>{}</td><td>{}</td><td>il y a {} s</td><td>{}</td></tr>",
@@ -323,6 +326,7 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
                 esc(p.report.snapshot.as_deref().unwrap_or("-")),
                 now.saturating_sub(p.last_seen_ms) / 1000,
                 match s.as_str() {
+                    _ if !selected => "<span class=\"c5\">non sélectionné</span>",
                     "aligned" => "<span class=\"c2\">aligné</span>",
                     "diverging" => "<span class=\"c4\">en cours d'alignement</span>",
                     _ => "<span class=\"c5\">absent</span>",

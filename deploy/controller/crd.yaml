@@ -55,6 +55,34 @@ spec:
                 - mock
                 - mock-partial
                 type: string
+              selector:
+                description: |-
+                  Seuls les pods sélectionnés appliquent l'état souhaité ; les autres gardent le mode
+                  de leur configuration (spec §5.5.1). Absent : tous les pods du workload.
+                nullable: true
+                properties:
+                  matchExpressions:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        operator:
+                          description: '`In`, `NotIn`, `Exists` ou `DoesNotExist`.'
+                          type: string
+                        values:
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
               snapshot:
                 description: Snapshot à rejouer ; absent, le contrôleur en construit un à l'entrée en mock.
                 nullable: true

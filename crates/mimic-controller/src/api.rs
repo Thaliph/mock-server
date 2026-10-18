@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 
 use crate::auth::{AuthError, authorize, bearer};
+use crate::config::Identity;
 use crate::metrics::ReasonLabel;
 use crate::reconcile::PodReport;
 use crate::state::{Ctl, IngestError, valid_name};
@@ -70,7 +71,7 @@ async fn guard(
     ns: &str,
     wl: &str,
     instance: Option<&str>,
-) -> Result<(), Box<Response>> {
+) -> Result<Identity, Box<Response>> {
     let token = bearer(headers).ok_or_else(|| Box::new(refuse(ctl, AuthError::Missing)))?;
     let id = ctl
         .auth
@@ -83,7 +84,8 @@ async fn guard(
             (StatusCode::BAD_REQUEST, "nom invalide").into_response(),
         ));
     }
-    authorize(&id, ns, wl, instance).map_err(|e| Box::new(refuse(ctl, e)))
+    authorize(&id, ns, wl, instance).map_err(|e| Box::new(refuse(ctl, e)))?;
+    Ok(id)
 }
 
 #[derive(Deserialize)]
@@ -181,9 +183,10 @@ async fn heartbeat(
     headers: HeaderMap,
     axum::Json(hb): axum::Json<Heartbeat>,
 ) -> Response {
-    if let Err(r) = guard(&ctl, &headers, &ns, &wl, Some(&hb.instance)).await {
-        return *r;
-    }
+    let id = match guard(&ctl, &headers, &ns, &wl, Some(&hb.instance)).await {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
     let desired = ctl
         .heartbeat(
             &ns,
@@ -194,6 +197,7 @@ async fn heartbeat(
                 snapshot: hb.snapshot,
                 capture_inbound: hb.capture_inbound,
             },
+            id.labels,
         )
         .await;
     axum::Json(desired).into_response()

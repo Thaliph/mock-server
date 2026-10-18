@@ -261,3 +261,51 @@ fn cli_07_capture_inbound_option() {
         assert!(err.contains(c), "{err}");
     }
 }
+
+#[test]
+fn cli_07_selector_option_and_refused_status() {
+    let opts = ModeOptions {
+        selector: Some("pod-template-hash=7d9f,track=green".into()),
+        capture_inbound: Some("metadata".into()),
+        ..ModeOptions::default()
+    };
+    let mw = workload_apply_with("shop", "checkout", "mock", &opts).unwrap();
+    let v = serde_json::to_value(&mw).unwrap();
+    assert_eq!(
+        v["spec"],
+        json!({
+            "mode": "mock",
+            "selector": {"matchLabels": {"pod-template-hash": "7d9f", "track": "green"}},
+            "capture": {"inbound": "metadata"},
+        })
+    );
+    for bad in ["track", "=green", "track=", "a=b,,c=d", "Track Name=x"] {
+        let opts = ModeOptions {
+            selector: Some(bad.into()),
+            ..ModeOptions::default()
+        };
+        assert!(
+            workload_apply_with("shop", "checkout", "mock", &opts).is_err(),
+            "{bad}"
+        );
+    }
+
+    // Statut d'une ressource refusée par le garde-fou production.
+    let mut mw = workload_apply("shop", "checkout", "mock", None).unwrap();
+    mw.status = Some(mimic_controller::crd::MimicWorkloadStatus {
+        pods: 2,
+        aligned: 2,
+        conditions: vec![mimic_controller::crd::StatusCondition {
+            type_: "Allowed".into(),
+            status: "False".into(),
+            reason: Some("ProductionNamespace".into()),
+            message: None,
+        }],
+        ..Default::default()
+    });
+    let table = status_table(&[mw]);
+    assert!(
+        table.lines().nth(1).unwrap().contains("mock (refusé)"),
+        "{table}"
+    );
+}
