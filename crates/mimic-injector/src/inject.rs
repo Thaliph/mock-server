@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
-    EnvVarSource, HTTPGetAction, ObjectFieldSelector, Pod, Probe, ProjectedVolumeSource,
-    SecretKeySelector, SecurityContext, ServiceAccountTokenProjection, Volume, VolumeMount,
-    VolumeProjection,
+    EnvVarSource, ExecAction, HTTPGetAction, ObjectFieldSelector, Pod, Probe,
+    ProjectedVolumeSource, SecretKeySelector, SecurityContext, ServiceAccountTokenProjection,
+    Volume, VolumeMount, VolumeProjection,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -21,18 +21,67 @@ pub const ANNOTATION_INBOUND_PORTS: &str = "mimic.platform.io/inbound-ports";
 pub const ANNOTATION_EXCLUDE_CIDRS: &str = "mimic.platform.io/exclude-outbound-cidrs";
 pub const ANNOTATION_EXCLUDE_PORTS: &str = "mimic.platform.io/exclude-outbound-ports";
 pub const ANNOTATION_TLS_INTERCEPT: &str = "mimic.platform.io/tls-intercept";
+pub const ANNOTATION_MESH: &str = "mimic.platform.io/mesh";
 pub const LABEL_SIDECAR: &str = "mimic.platform.io/sidecar";
 
-pub const SIDECAR_UID: i64 = 1337;
-pub const ADMIN_PORT: i32 = 15000;
+/// Hors de l'UID et des ports des mesh (spec §3.3.1).
+pub const SIDECAR_UID: i64 = 1338;
+pub const ADMIN_PORT: i32 = 15100;
 pub const CONFIG_DIR: &str = "/etc/mimic";
 pub const STORE_DIR: &str = "/var/lib/mimic";
 pub const TOKEN_DIR: &str = "/var/run/secrets/mimic";
 pub const CONTROLLER_CA_DIR: &str = "/etc/mimic-ca";
 pub const CA_DIR: &str = "/var/run/mimic/ca";
+const PROXY_BIN: &str = "/usr/local/bin/mimic-proxy";
 
-/// Conteneurs de service mesh avec lesquels Mimic ne cohabite pas (spec §3.3).
-const MESH_CONTAINERS: &[&str] = &["istio-proxy", "linkerd-proxy"];
+/// Conteneurs posés par le webhook d'un mesh, et mesh qu'ils signalent (spec §3.3.3).
+const MESH_CONTAINERS: &[(&str, &str)] = &[
+    ("istio-init", "istio"),
+    ("istio-validation", "istio"),
+    ("istio-proxy", "istio"),
+    ("linkerd-init", "linkerd"),
+    ("linkerd-network-validator", "linkerd"),
+    ("linkerd-proxy", "linkerd"),
+];
+/// Valeurs de `MIMIC_MESH` (spec §3.3.3).
+const MESH_MODES: &[&str] = &["auto", "none", "istio", "istio-ambient", "linkerd"];
+
+fn mesh_container(c: &Container) -> Option<&'static str> {
+    MESH_CONTAINERS
+        .iter()
+        .find(|(name, _)| *name == c.name)
+        .map(|(_, mesh)| *mesh)
+}
+
+/// Mesh dont le webhook a déjà injecté ses conteneurs.
+fn mesh_of(pod: &Pod) -> Option<&'static str> {
+    let spec = pod.spec.as_ref()?;
+    spec.init_containers
+        .iter()
+        .flatten()
+        .chain(&spec.containers)
+        .find_map(mesh_container)
+}
+
+/// `MIMIC_MESH` : annotation, sinon le mesh vu dans le pod, sinon `auto`.
+fn mesh_mode(pod: &Pod) -> String {
+    annotation(pod, ANNOTATION_MESH)
+        .filter(|v| MESH_MODES.contains(v))
+        .or_else(|| mesh_of(pod))
+        .unwrap_or("auto")
+        .into()
+}
+
+/// Avertissement d'admission pour une annotation `mimic.platform.io/mesh` inconnue.
+pub fn mesh_warning(pod: &Pod) -> Option<String> {
+    let value = annotation(pod, ANNOTATION_MESH)?;
+    (!MESH_MODES.contains(&value)).then(|| {
+        format!(
+            "{ANNOTATION_MESH} inconnue : {value} ({}) ; mesh détecté par mimic-init",
+            MESH_MODES.join(", ")
+        )
+    })
+}
 
 #[derive(Debug)]
 pub enum Outcome {
@@ -74,32 +123,22 @@ fn split_list(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn already_injected(pod: &Pod) -> bool {
+    annotation(pod, ANNOTATION_STATUS) == Some("injected")
+        || pod
+            .spec
+            .iter()
+            .flat_map(|s| s.init_containers.iter().flatten())
+            .any(|c| c.name == "mimic")
+}
+
 fn skip_reason(pod: &Pod) -> Option<String> {
     let spec = pod.spec.as_ref()?;
-    if annotation(pod, ANNOTATION_STATUS) == Some("injected")
-        || spec
-            .init_containers
-            .iter()
-            .flatten()
-            .any(|c| c.name == "mimic")
-    {
-        return Some("mimic déjà injecté".into());
-    }
     if annotation(pod, ANNOTATION_INJECT) == Some("false") {
         return Some(format!("injection désactivée par {ANNOTATION_INJECT}"));
     }
     if spec.host_network == Some(true) {
         return Some("hostNetwork : les règles iptables toucheraient le noeud".into());
-    }
-    let all = spec
-        .containers
-        .iter()
-        .chain(spec.init_containers.iter().flatten());
-    if let Some(c) = all
-        .into_iter()
-        .find(|c| MESH_CONTAINERS.contains(&c.name.as_str()))
-    {
-        return Some(format!("service mesh détecté ({}), hors périmètre", c.name));
     }
     None
 }
@@ -113,6 +152,8 @@ fn inbound_ports(pod: &Pod) -> String {
         .spec
         .iter()
         .flat_map(|s| s.containers.iter())
+        // Les ports du proxy du mesh ne sont pas ceux de l'application.
+        .filter(|c| mesh_container(c).is_none())
         .flat_map(|c| c.ports.iter().flatten())
         .filter(|p| p.protocol.as_deref().unwrap_or("TCP") == "TCP")
         .map(|p| p.container_port)
@@ -158,13 +199,29 @@ fn mount(name: &str, path: &str, read_only: bool) -> VolumeMount {
     }
 }
 
-fn probe(path: &str, period: i32, failures: i32) -> Probe {
-    Probe {
-        http_get: Some(HTTPGetAction {
+/// Sonde HTTP du kubelet, ou `exec` dans un pod du mesh (spec §3.3.4).
+fn probe(pod: &Pod, path: &str, period: i32, failures: i32) -> Probe {
+    let (http_get, exec) = if mesh_of(pod).is_some() {
+        let mut command = vec![PROXY_BIN.to_string()];
+        if annotation(pod, ANNOTATION_CONFIG).is_some() {
+            command.extend(["--config".into(), format!("{CONFIG_DIR}/mimic.yaml")]);
+        }
+        command.extend(["--probe".into(), path.into()]);
+        let exec = ExecAction {
+            command: Some(command),
+        };
+        (None, Some(exec))
+    } else {
+        let http = HTTPGetAction {
             path: Some(path.into()),
             port: IntOrString::String("mimic-admin".into()),
             ..HTTPGetAction::default()
-        }),
+        };
+        (Some(http), None)
+    };
+    Probe {
+        http_get,
+        exec,
         period_seconds: Some(period),
         failure_threshold: Some(failures),
         ..Probe::default()
@@ -177,6 +234,9 @@ fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
         cidrs.extend(split_list(a));
     }
     let mut envs = vec![
+        env("MIMIC_MESH", mesh_mode(pod)),
+        // Cible du trajet entrant en ambient (spec §3.3.2).
+        field_env("POD_IP", "status.podIP"),
         env("MIMIC_INBOUND_PORTS", inbound_ports(pod)),
         env("MIMIC_EXCLUDE_OUTBOUND_CIDRS", cidrs.join(",")),
     ];
@@ -273,9 +333,9 @@ fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]
             ..ContainerPort::default()
         }]),
         // L'application ne démarre qu'une fois le proxy prêt (et la CA publiée).
-        startup_probe: Some(probe("/healthz", 1, 30)),
-        readiness_probe: Some(probe("/readyz", 10, 3)),
-        liveness_probe: Some(probe("/healthz", 10, 3)),
+        startup_probe: Some(probe(pod, "/healthz", 1, 30)),
+        readiness_probe: Some(probe(pod, "/readyz", 10, 3)),
+        liveness_probe: Some(probe(pod, "/healthz", 10, 3)),
         resources: Some(resources),
         security_context: Some(SecurityContext {
             run_as_user: Some(SIDECAR_UID),
@@ -368,10 +428,60 @@ fn trust_ca(c: &mut Container) {
         .push(mount("mimic-ca", CA_DIR, true));
 }
 
+/// Place `mimic` (`mimic-init` puis le sidecar) en tête des init containers, ou juste
+/// après le dernier conteneur du mesh (spec §9.4).
+fn place(mut inits: Vec<Container>, mimic: [Container; 2]) -> Vec<Container> {
+    let at = inits
+        .iter()
+        .rposition(|c| mesh_container(c).is_some())
+        .map_or(0, |i| i + 1);
+    inits.splice(at..at, mimic);
+    inits
+}
+
+/// Réinvocation (spec §9.4) : un pod injecté avant le webhook du mesh repasse derrière ses
+/// conteneurs, avec `MIMIC_MESH` et les sondes d'un pod du mesh.
+fn adapt(pod: &Pod) -> Outcome {
+    let skipped = || Outcome::Skipped("mimic déjà injecté".into());
+    if mesh_of(pod).is_none() {
+        return skipped();
+    }
+    let mut out = pod.clone();
+    let spec = out.spec.get_or_insert_with(Default::default);
+    let mut inits = spec.init_containers.take().unwrap_or_default();
+    let take = |inits: &mut Vec<Container>, name: &str| {
+        inits
+            .iter()
+            .position(|c| c.name == name)
+            .map(|i| inits.remove(i))
+    };
+    let (Some(mut init), Some(mut side)) =
+        (take(&mut inits, "mimic-init"), take(&mut inits, "mimic"))
+    else {
+        return skipped();
+    };
+    let envs = init.env.get_or_insert_with(Vec::new);
+    match envs.iter_mut().find(|e| e.name == "MIMIC_MESH") {
+        Some(e) => e.value = Some(mesh_mode(pod)),
+        None => envs.insert(0, env("MIMIC_MESH", mesh_mode(pod))),
+    }
+    side.startup_probe = Some(probe(pod, "/healthz", 1, 30));
+    side.readiness_probe = Some(probe(pod, "/readyz", 10, 3));
+    side.liveness_probe = Some(probe(pod, "/healthz", 10, 3));
+    spec.init_containers = Some(place(inits, [init, side]));
+    if out == *pod {
+        return skipped();
+    }
+    Outcome::Injected(Box::new(out))
+}
+
 /// Pod tel qu'il doit être admis, ou la raison pour laquelle il reste tel quel.
 pub fn mutate(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
     if pod.spec.is_none() {
         return Outcome::Skipped("pod sans spec".into());
+    }
+    if already_injected(pod) {
+        return adapt(pod);
     }
     if let Some(reason) = skip_reason(pod) {
         return Outcome::Skipped(reason);
@@ -390,9 +500,10 @@ pub fn mutate(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
     let side = sidecar(pod, cfg, &workload, &intercept);
     let new_volumes = volumes(pod, cfg);
     let spec = out.spec.get_or_insert_with(Default::default);
-    let mut inits = vec![init, side];
-    inits.extend(spec.init_containers.take().unwrap_or_default());
-    spec.init_containers = Some(inits);
+    spec.init_containers = Some(place(
+        spec.init_containers.take().unwrap_or_default(),
+        [init, side],
+    ));
     spec.volumes
         .get_or_insert_with(Vec::new)
         .extend(new_volumes);

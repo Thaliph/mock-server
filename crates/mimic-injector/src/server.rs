@@ -22,7 +22,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 
 use crate::config::{InjectorConfig, TlsFiles};
-use crate::inject::{Outcome, mutate};
+use crate::inject::{Outcome, mesh_warning, mutate};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ResultLabel {
@@ -62,7 +62,10 @@ pub fn review(
                 return ("error", resp.into_review());
             };
             match resp.clone().with_patch(json_patch::diff(&before, &after)) {
-                Ok(r) => ("injected", r.into_review()),
+                Ok(mut r) => {
+                    r.warnings = mesh_warning(pod).map(|w| vec![w]);
+                    ("injected", r.into_review())
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "patch non sérialisable");
                     ("error", resp.into_review())

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use common::*;
 use serde_json::Value;
 
-const ADMIN: &str = "http://127.0.0.1:15000";
+const ADMIN: &str = "http://127.0.0.1:15100";
 
 struct Sidecar(Child);
 
@@ -135,7 +135,7 @@ async fn transparent_interception_in_network_namespace() {
     std::fs::write(
         &config,
         format!(
-            "mode: record\ninstance: e2e-0\ninbound:\n  enabled: false\noutbound:\n  listen: 127.0.0.1:15001\nadmin:\n  listen: 127.0.0.1:15000\ntls:\n  intercept: [localhost]\n  ca_dir: {}\n  upstream_ca_file: {}\n",
+            "mode: record\ninstance: e2e-0\ninbound:\n  enabled: false\noutbound:\n  listen: 127.0.0.1:15101\nadmin:\n  listen: 127.0.0.1:15100\ntls:\n  intercept: [localhost]\n  ca_dir: {}\n  upstream_ca_file: {}\n",
             ca_dir.display(),
             upstream_pem.display()
         ),
@@ -143,7 +143,7 @@ async fn transparent_interception_in_network_namespace() {
     .unwrap();
     let _sidecar = Sidecar(
         Command::new("setpriv")
-            .args(["--reuid=1337", "--regid=1337", "--clear-groups"])
+            .args(["--reuid=1338", "--regid=1338", "--clear-groups"])
             .arg(env!("CARGO_BIN_EXE_mimic-proxy"))
             .arg("--config")
             .arg(&config)

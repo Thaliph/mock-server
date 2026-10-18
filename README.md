@@ -34,15 +34,15 @@ cargo run -p mimic-proxy -- --config exemple.yaml
 ```yaml
 mode: record
 inbound:
-  listen: 127.0.0.1:15006
+  listen: 127.0.0.1:15106
   upstream: 127.0.0.1:8080   # l'application
 outbound:
-  listen: 127.0.0.1:15001    # à utiliser comme HTTP_PROXY par l'application
+  listen: 127.0.0.1:15101    # à utiliser comme HTTP_PROXY par l'application
 admin:
-  listen: 127.0.0.1:15000    # page d'admin sur http://127.0.0.1:15000/
+  listen: 127.0.0.1:15100    # page d'admin sur http://127.0.0.1:15100/
 ```
 
-Bascule de mode : `curl -X PUT --data mock http://127.0.0.1:15000/mode`.
+Bascule de mode : `curl -X PUT --data mock http://127.0.0.1:15100/mode`.
 
 Déploiement dans Kubernetes : voir [deploy/README.md](deploy/README.md).
 

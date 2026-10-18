@@ -1,7 +1,8 @@
 //! Critère ADM-05 (spec §9.3) : compter une requête n'alloue rien.
 //!
-//! Seul test de ce binaire : l'allocateur instrumenté compte les allocations de tout le
-//! processus, aucun autre test ne doit tourner pendant la mesure.
+//! Binaire sans harnais (`harness = false`) : l'allocateur instrumenté compte les
+//! allocations de tout le processus, et les threads du harnais de libtest peuvent en faire
+//! pendant la mesure. Ici, la mesure tourne seule, sur le thread principal.
 
 use std::alloc::System;
 use std::time::Duration;
@@ -31,7 +32,11 @@ fn count_one(m: &Metrics) {
     }
 }
 
-#[test]
+fn main() {
+    adm_05_counting_a_request_does_not_allocate();
+    println!("test adm_05_counting_a_request_does_not_allocate ... ok");
+}
+
 fn adm_05_counting_a_request_does_not_allocate() {
     let m = Metrics::new();
     // Première fois : séries et authority créées.

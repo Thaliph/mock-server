@@ -18,6 +18,9 @@ pub mod throttle;
 pub mod tls;
 pub mod watch;
 
+mod probe;
+pub use probe::{probe, probe_addr};
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;

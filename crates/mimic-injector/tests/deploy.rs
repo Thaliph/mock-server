@@ -57,6 +57,12 @@ fn webhook_never_blocks_pod_creation() {
     assert_eq!(hook["clientConfig"]["service"]["path"], "/mutate");
 }
 
+#[test]
+fn inj_12_webhook_is_called_again_after_the_mesh_webhook() {
+    let hook = &kind("MutatingWebhookConfiguration")["webhooks"][0];
+    assert_eq!(hook["reinvocationPolicy"], "IfNeeded");
+}
+
 /// `512Mi`, `256Mi`, `1Gi` → octets.
 fn quantity(q: &str) -> u64 {
     let (n, unit) = q.split_at(q.find(|c: char| !c.is_ascii_digit()).unwrap_or(q.len()));

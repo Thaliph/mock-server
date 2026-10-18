@@ -55,7 +55,7 @@ spec:
             - name: MIMIC_REDACT_SALT
               valueFrom: {secretKeyRef: {name: checkout-mimic, key: redact-salt}}
           ports:
-            - {name: mimic-admin, containerPort: 15000}
+            - {name: mimic-admin, containerPort: 15100}
           readinessProbe:
             httpGet: {path: /readyz, port: mimic-admin}
           livenessProbe:
@@ -64,8 +64,8 @@ spec:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {memory: 256Mi}
           securityContext:
-            runAsUser: 1337
-            runAsGroup: 1337
+            runAsUser: 1338
+            runAsGroup: 1338
             runAsNonRoot: true
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

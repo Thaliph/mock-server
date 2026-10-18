@@ -38,11 +38,9 @@ MOCK_WINDOW=${MOCK_WINDOW:-60}
 # 2 s, soit moins de 10 s ; 30 s couvrent aussi un bail qui expire (15 s + 2 s) (§5.5.4).
 FAILOVER_SECONDS=${FAILOVER_SECONDS:-30}
 REPORT_DIR=${REPORT_DIR:-target/e2e-report}
-CERT_MANAGER=v1.21.1
-TRUST_MANAGER=v0.24.0
 
-log() { printf '\n== %s\n' "$*"; }
-fail() { printf '\nÉCHEC : %s\n' "$*" >&2; exit 1; }
+# shellcheck source=scripts/e2e-lib.sh
+. scripts/e2e-lib.sh
 
 diagnostics() {
   log "diagnostic"
@@ -93,21 +91,6 @@ diagnostics() {
 }
 trap 'status=$?; [ $status -ne 0 ] && diagnostics; exit $status' EXIT
 
-# Réessaie une commande jusqu'à ce qu'elle réussisse, pendant $1 secondes.
-retry() {
-  local deadline=$((SECONDS + $1)); shift
-  until "$@"; do
-    [ $SECONDS -ge $deadline ] && return 1
-    sleep 3
-  done
-}
-
-if [ -z "${MIMICCTL:-}" ]; then
-  cargo build -q -p mimicctl
-  MIMICCTL=target/debug/mimicctl
-fi
-mimicctl() { "$MIMICCTL" "$@"; }
-
 # Rapport de découverte et documents OpenAPI des services ; ajouté au résumé du job.
 report() {
   mkdir -p "$REPORT_DIR/openapi"
@@ -125,93 +108,8 @@ report() {
   echo "rapport : $REPORT_DIR/report.md"
 }
 
-log "cluster kind $CLUSTER"
-kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --config tests/e2e/kind.yaml
-if [ -z "${SKIP_BUILD:-}" ]; then
-  docker build -t "$IMAGE" .
-fi
-kind load docker-image "$IMAGE" --name "$CLUSTER"
-
-log "cert-manager et trust-manager"
-kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/$CERT_MANAGER/cert-manager.yaml" >/dev/null
-kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
-# La CA du contrôleur vit dans mimic-system : c'est le namespace de confiance de trust-manager.
-kubectl apply -f deploy/controller/namespace.yaml
-helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null
-helm upgrade --install trust-manager jetstack/trust-manager \
-  --version "$TRUST_MANAGER" -n cert-manager --set app.trust.namespace=mimic-system --wait
-
-# cert-manager peut réémettre la CA juste après sa création : un certificat feuille
-# signé entre-temps par l'ancienne CA reste « Ready » mais n'est plus vérifiable par les
-# sidecars (invalid peer certificate: BadSignature). On compare la CA qui a signé la
-# feuille à la CA publiée et, si elles diffèrent, on supprime le Secret de la feuille
-# pour que cert-manager la réémette avec la CA courante.
-leaf_signed_by_current_ca() {
-  local ca leaf
-  ca=$(kubectl -n mimic-system get secret mimic-controller-ca -o jsonpath='{.data.tls\.crt}')
-  leaf=$(kubectl -n mimic-system get secret "$1" -o jsonpath='{.data.ca\.crt}')
-  [ -n "$ca" ] && [ "$ca" = "$leaf" ]
-}
-reissue_if_stale() {
-  local secret attempt
-  for secret in "$@"; do
-    for attempt in 1 2 3; do
-      kubectl -n mimic-system wait --for=condition=Ready certificate --all --timeout=120s >/dev/null
-      leaf_signed_by_current_ca "$secret" && break
-      echo "$secret signé par une ancienne CA : réémission ($attempt)"
-      kubectl -n mimic-system delete secret "$secret"
-      REISSUED=1
-      sleep 3
-    done
-    leaf_signed_by_current_ca "$secret" || fail "$secret n'est pas signé par la CA publiée"
-  done
-}
-
-# Les manifests livrés, avec l'image construite pour le test.
-manifest() { sed "s#registry.example.com/platform/mimic:0.1.0#$IMAGE#g" "$@"; }
-
-log "contrôleur"
-kubectl apply -f deploy/controller/crd.yaml -f deploy/controller/rbac.yaml \
-  -f deploy/controller/production-guard.yaml
-retry 60 kubectl apply -f deploy/controller/certificates.yaml
-reissue_if_stale mimic-controller-tls
-manifest deploy/controller/controller.yaml | kubectl apply -f -
-kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
-# Deux réplicas prêts, dont une seule active : celle qui porte la marque (spec §5.5.4).
-CTL_PODS=app.kubernetes.io/name=mimic-controller
-leader() {
-  kubectl -n mimic-system get pod -l "$CTL_PODS,mimic.platform.io/leader=true" \
-    -o jsonpath='{.items[*].metadata.name}'
-}
-has_leader() { [ "$(leader | wc -w)" -eq 1 ]; }
-retry 60 has_leader || fail "aucune réplique active du contrôleur"
-echo "réplique active : $(leader)"
-
-log "webhook d'injection"
-# kind n'a qu'un nœud : avec deux réplicas du contrôleur, les requêtes CPU des sidecars
-# (50m chacun, une vingtaine de pods) ne laissaient plus de place aux pods de test
-# ajoutés en fin de script (Insufficient cpu). Le test ne porte pas sur ces requêtes :
-# on les abaisse à 10m pour les sidecars injectés ici.
-manifest deploy/injector/injector.yaml \
-  | sed 's#requests: {cpu: 50m, memory: 64Mi}#requests: {cpu: 10m, memory: 64Mi}#' \
-  | kubectl apply -f -
-reissue_if_stale mimic-injector-tls
-# Le webhook lit son certificat au démarrage : le relancer si sa feuille a été réémise.
-[ -z "${REISSUED:-}" ] || kubectl -n mimic-system rollout restart deploy/mimic-injector
-kubectl -n mimic-system rollout status deploy/mimic-injector --timeout=180s
-# Le caBundle est posé par le cainjector : attendre qu'il le soit avant de créer des pods.
-retry 60 sh -c '[ -n "$(kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath="{.webhooks[0].clientConfig.caBundle}")" ]'
-
-# Le webhook est en failurePolicy Ignore : un pod créé avant que son Service réponde n'est
-# pas injecté. Attendre qu'un pod d'essai (dry-run côté serveur) ressorte injecté.
-kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-kubectl label namespace "$NS" mimic.platform.io/enabled=true --overwrite
-injects() {
-  kubectl -n "$NS" run mimic-probe --image=busybox --restart=Never --dry-run=server \
-    --labels app.kubernetes.io/name=mimic-probe -o jsonpath='{.spec.initContainers[*].name}' 2>/dev/null |
-    grep -qw mimic
-}
-retry 120 injects || fail "le webhook n'injecte pas"
+kind_cluster
+install_mimic "$NS"
 
 log "démo OpenTelemetry"
 kubectl apply -f tests/e2e/otel-demo.yaml -f tests/e2e/client.yaml
@@ -303,7 +201,7 @@ sleep 15
 scrape() {
   local p
   for p in $(kubectl -n "$NS" get pods -l "opentelemetry.io/name=$1" -o name); do
-    kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15000/proxy/metrics"
+    kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15100/proxy/metrics"
   done
 }
 # total <filtre awk> : somme des séries retenues, lues sur l'entrée standard.
@@ -410,7 +308,7 @@ shipping_mock_state() {
   local p
   for p in $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -o name | sort); do
     printf '%s %s %s\n' "${p#pod/}" \
-      "$(kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15000/proxy/metrics" | metric_of mimic_mock_snapshot_exchanges)" \
+      "$(kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15100/proxy/metrics" | metric_of mimic_mock_snapshot_exchanges)" \
       "$(kubectl -n "$NS" logs "$p" -c mimic | grep -c 'snapshot chargé' || true)"
   done
 }
@@ -540,12 +438,12 @@ ws_handshake() {
 ws_count() { kubectl -n "$NS" exec client -- curl -sS -m 5 http://ws-echo:8080/count; }
 # ws_metric <result> : mimic_websocket_connections_total sortant du sidecar de ws-client.
 ws_metric() {
-  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15000/proxy/metrics" |
+  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15100/proxy/metrics" |
     total '/^mimic_websocket_connections_total[{]/ && /direction="outbound"/ && /result="'"$1"'"/'
 }
 # ws_applied <websocket> : le sidecar de ws-client est en mock, snapshot chargé, avec ce réglage.
 ws_applied() {
-  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15000/proxy/api/status" |
+  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15100/proxy/api/status" |
     jq -e --arg w "$1" '.mode == "mock" and .snapshot != null and .mock_websocket == $w' >/dev/null
 }
 # ws_aligned : statut publié pour la génération courante, le pod aligné.

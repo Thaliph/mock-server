@@ -106,9 +106,24 @@ mimicctl status -n otel-demo                       # mode, snapshot, pods align�
 kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081
 # puis http://127.0.0.1:8081/ : workloads, API découvertes, snapshots, requêtes
 kubectl -n mimic-system get lease mimic-controller   # réplique active
-kubectl port-forward -n otel-demo deploy/frontend 15000
-# puis http://127.0.0.1:15000/ : page d'admin d'un sidecar, /metrics pour ses métriques
+kubectl port-forward -n otel-demo deploy/frontend 15100
+# puis http://127.0.0.1:15100/ : page d'admin d'un sidecar, /metrics pour ses métriques
 ```
+
+## Test dans un service mesh
+
+`scripts/e2e-mesh.sh istio` et `scripts/e2e-mesh.sh linkerd` (critères E2E-08 et E2E-09,
+job `e2e-mesh` de la CI) installent le mesh et mimic dans le même cluster kind, puis
+vérifient dans chaque namespace (Istio : un en sidecar, un en ambient ; Linkerd : un) que :
+
+- mimic passe après les conteneurs du mesh et que `mimic-init` reconnaît le mesh ;
+- le client atteint le serveur par le mesh, qui refuse un client hors mesh (mTLS exigé) ;
+- les sidecars du client et du serveur enregistrent l'échange ;
+- le client en mock répond seul une fois le serveur arrêté.
+
+`istioctl` et `linkerd` sont téléchargés dans `target/e2e-bin` (Istio) et `~/.linkerd2`
+(Linkerd) ; `ISTIO_VERSION` et `LINKERD_VERSION` choisissent leurs versions. Les deux
+mesh ne cohabitent pas dans un même cluster : utiliser un cluster par mesh (`CLUSTER`).
 
 ## Régénérer la démo
 

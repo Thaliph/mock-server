@@ -13,6 +13,6 @@ COPY --from=build /src/target/release/mimic-proxy /src/target/release/mimic-init
      /src/target/release/mimic-injector /usr/local/bin/
 # Le sidecar tourne sous l'UID exclu des redirections (spec §3.1) ; l'init container
 # repasse en root avec NET_ADMIN dans son securityContext.
-USER 1337:1337
-EXPOSE 15000 15001 15006
+USER 1338:1338
+EXPOSE 15100 15101 15106
 ENTRYPOINT ["/usr/local/bin/mimic-proxy"]
