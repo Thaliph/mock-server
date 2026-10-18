@@ -88,7 +88,8 @@ Même mécanique qu'Istio, éprouvée :
 - **Détection du protocole** : le trafic redirigé n'est pas forcément HTTP. Pour chaque connexion redirigée, le proxy lit sans les consommer les premiers octets (`peek`) :
   - méthode HTTP/1 ou préface HTTP/2 : traitement HTTP (record, mock) ;
   - enregistrement TLS (`0x16`) : tunnel TCP opaque tant que l'interception TLS (§4.2) n'est pas activée ; **refusé en mode `mock`** pour garantir qu'aucun appel ne sort (O3) ;
-  - autre protocole, ou rien reçu au bout de 300 ms (protocole où le serveur parle en premier, comme MySQL) : tunnel TCP opaque vers la destination d'origine.
+  - autre protocole : tunnel TCP opaque vers la destination d'origine ;
+  - rien reçu au bout de 300 ms : connexion **muette**. C'est le cas d'un protocole où le serveur parle en premier (MySQL, SMTP), mais aussi d'une connexion HTTP ouverte d'avance par un pool de connexions (hyper, Go, Java…) et utilisée plus tard. Le proxy ne tranche qu'au premier octet : il ouvre la connexion vers la destination d'origine et attend le premier qui parle. Si c'est l'application et que ses octets sont du HTTP, la connexion vers la destination est refermée sans avoir servi et la connexion est traitée en HTTP (record, mock) ; sinon, tunnel opaque. En sortie, en `mock` et `mock-partial`, rien n'est ouvert vers la dépendance (O3) : le proxy attend jusqu'à 30 s que l'application parle, puis la traite comme ci-dessus ; une application muette au-delà est relayée en tunnel, comme un protocole inconnu.
   Chaque tunnel est compté dans `mimic_passthrough_connections_total`.
 - Le proxy récupère la destination d'origine avec `getsockopt(SO_ORIGINAL_DST)` (IPv4) et `IP6T_SO_ORIGINAL_DST` (IPv6).
 - **Relais entrant** : le trafic entrant est envoyé à sa destination d'origine (IP du pod et port), comme Istio depuis 1.10, pour qu'une application qui n'écoute que sur l'IP du pod reste joignable (Next.js en mode standalone écoute sur `$HOSTNAME`, résolu en IP du pod). Si rien n'y écoute pour ce port, le proxy se rabat sur `127.0.0.1` (application liée à la boucle locale). Le choix est mémorisé par port et réévalué après un échec de connexion ; `inbound.upstream` impose une adresse.
@@ -942,6 +943,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | PRX-03 | client et upstream gRPC en h2c | relais | HTTP/2 de bout en bout, `te: trailers` et trailers (`grpc-status`) relayés, échange enregistré |
 | PRX-04 | trafic TCP non HTTP redirigé (client qui parle en premier, ou serveur qui parle en premier) | relais | tunnel transparent, octets identiques |
 | PRX-04b | connexion TLS redirigée | mode record / mode mock | tunnel opaque / connexion refusée, compteur `refused` |
+| PRX-15 | connexion HTTP redirigée restée muette plus de 300 ms (ouverte d'avance par un pool), en record puis en mock | la requête arrive ensuite sur la même connexion | traitée en HTTP : enregistrée en record ; servie depuis le store en mock sans joindre la dépendance ; aucun tunnel compté |
 | PRX-09 | application à l'écoute sur l'IP du pod seulement, puis sur `127.0.0.1` seulement | relais entrant | la première est jointe sur l'IP du pod, la seconde par repli sur `127.0.0.1` ; sans aucune écoute, l'IP du pod est retenue et rien n'est mémorisé |
 | PRX-08 | règles iptables posées par `mimic-init` dans un namespace réseau, sidecar sous l'UID 1337 | l'application appelle une dépendance HTTP sans proxy configuré | l'appel est enregistré avec l'authority d'origine, puis servi en mock |
 | PRX-05 | bascule record → mock pendant une charge | bascule | aucune requête en erreur, nouvelles requêtes mockées |
@@ -1046,7 +1048,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P3c | Sidecar borné : réservoir par opération, budget mémoire, journal local segmenté, file de partage bornée, logs limités | CAP-*, SHR-06, SHR-07, PRX-10, PRX-11 |
 | P3d | Mock fidèle et concurrent : moteur indexé par forme de chemin et sans verrou, construit à la bascule, latence comptée depuis l'arrivée avec un minuteur précis, réponse préparée une fois, redaction sans réécriture des bodies intacts | MCK-13 à 18, RED-05 |
 | P3e | Correctifs fonctionnels : relais WebSocket dans tous les modes, poignée de main enregistrée, jamais rejouée ; énumérations inférées seulement sur un échantillon suffisant | PRX-12 à 14, MCK-19, INF-09 |
-| P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
+| P4 | `mimic-init` iptables, détection de protocole (connexions muettes comprises), image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08, PRX-15 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
 | P6b | Chargement cross-environnement, garde-fou production | E2E-04 |
