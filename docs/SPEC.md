@@ -212,7 +212,7 @@ Règles de capture :
   - le réservoir est déterministe : chaque échange reçoit une priorité, hachage stable de son identifiant, et le réservoir garde les `N` échanges de plus petite priorité. Chaque échange du flux a la même chance d'être gardé, qu'il arrive pendant le warm-up ou à la fin du tir, et le résultat ne dépend pas de l'ordre d'arrivée (fusion entre sidecars comprise, §5.4). Un exemple remplacé perd ses bodies et garde ses métadonnées ;
   - la décision est prise **avant** tout décodage, parsing JSON et redaction du body : un body qui ne serait pas gardé n'est pas traité (compté `reason="sample_limit"`) ; les headers et la query sont redactés dans tous les cas ;
   - les compteurs d'un couple disparaissent avec son dernier exemple : leur nombre est borné par celui des bodies gardés ;
-- mémoire : en plus de `capture.max_exchanges` (50 000), le store a un budget en octets estimés, `capture.max_store_bytes` (64 MiB par défaut). Les bodies gardés en occupent au plus la moitié : au-delà, les bodies des échanges les plus anciens sont retirés en premier. Au-delà du budget, les échanges les plus anciens sont évincés. Un nouvel échange garde donc ses bodies, même quand les métadonnées remplissent le budget. Chaque retrait est compté (`reason="store_budget"`). Les défauts tiennent dans la limite mémoire de 256 Mi posée par l'injecteur (§9.4) : store et file de partage (§5.4) en occupent au plus un tiers, le reste couvre la copie du moteur de mock, la découverte et les bodies en vol ;
+- mémoire : en plus de `capture.max_exchanges` (50 000), le store a un budget en octets estimés, `capture.max_store_bytes` (64 MiB par défaut). Les bodies gardés en occupent au plus la moitié : au-delà, les bodies des échanges les plus anciens sont retirés en premier. Au-delà du budget, les échanges les plus anciens sont évincés. Un nouvel échange garde donc ses bodies, même quand les métadonnées remplissent le budget. Chaque retrait est compté (`reason="store_budget"`). Les défauts tiennent dans la limite mémoire de 256 Mi posée par l'injecteur (§9.4) : store et file de partage (§5.4) en occupent au plus un tiers, le reste couvre l'index du moteur de mock (§5.3), la découverte et les bodies en vol ;
 - taille max capturée : 1 MiB par body ; au-delà, préfixe + taille ;
 - content-encoding (`gzip`, `br`, `zstd`) décodé pour l'inférence, encodage d'origine conservé pour le rejeu ;
 - streaming : le proxy ne bufferise jamais la réponse complète avant de la relayer ; la capture se fait en tee.
@@ -250,9 +250,18 @@ Le type de correspondance vaut `exact` si le score est 1, `template` si le chemi
 | `sequence` | rejoue dans l'ordre d'enregistrement (scénarios à état : création puis lecture) |
 | `weighted-status` | respecte la distribution des codes observés (ex. 2 % de 429) pour reproduire les erreurs réelles |
 
-**Latence rejouée** : la latence n'est pas copiée d'un exemple unique, elle est tirée dans la distribution empirique des durées enregistrées pour l'opération (même authority, méthode et template), avec un multiplicateur configurable (`latency.factor: 1.0`, `0` pour la désactiver, `2.0` pour simuler une dépendance dégradée). En v1, la durée totale est appliquée avant l'envoi de la réponse ; le rejeu séparé du TTFB et du temps de transfert viendra avec le streaming des réponses mockées.
+**Latence rejouée** : la latence n'est pas copiée d'un exemple unique, elle est tirée dans la distribution empirique des durées enregistrées pour l'opération (même authority, méthode et template), avec un multiplicateur configurable (`latency.factor: 1.0`, `0` pour la désactiver, `2.0` pour simuler une dépendance dégradée). La durée tirée est comptée depuis l'arrivée de la requête (fin de ses headers) : la réponse part à arrivée + latence, et la lecture du body de requête, le choix de l'enregistrement et la préparation de la réponse sont pris sur cette attente au lieu de s'y ajouter, comme pour la durée mesurée en record. L'attente est faite par un minuteur à la microseconde : le temporisateur de tokio arrondit à la milliseconde supérieure, ce qui rejouerait une dépendance de 140 µs à plus d'une milliseconde. Le minuteur est armé en avance de son retard moyen de réveil, mesuré en continu (plafonné à 1 ms), pour que les réponses partent en moyenne à l'heure. Une latence nulle (ou déjà écoulée) n'attend pas. En v1, la durée totale est appliquée avant l'envoi de la réponse ; le rejeu séparé du TTFB et du temps de transfert viendra avec le streaming des réponses mockées.
 
-Le tirage aléatoire (latence, `weighted-status`) utilise un générateur à graine (`mock.seed`) : un même tir rejoué avec la même graine produit la même séquence.
+Le tirage aléatoire (latence, `weighted-status`) utilise un générateur à graine (`mock.seed`) : un même tir rejoué en série avec la même graine produit la même séquence. Sous concurrence, le générateur avance d'un pas atomique par tirage : la même graine donne le même ensemble de tirages, distribué aux requêtes dans leur ordre d'arrivée.
+
+**Tenue en charge du mock** : le coût d'une requête mockée ne dépend ni de la taille du store ni du nombre de requêtes concurrentes.
+
+- **Index** : le moteur range les enregistrements par (authority, méthode, forme du chemin), la forme étant celle du §5.2 (segment identifiant remplacé par sa nature) : deux chemins sont « égaux ou de même template » si et seulement s'ils ont la même forme. Une requête ne compare que les enregistrements **rejouables** de son opération ; les autres ne servent qu'à la distribution de latence, extraite une fois à la construction. Le moteur partage les échanges du store sans les copier.
+- **Vue immuable, sans verrou** : le moteur est construit hors du chemin des requêtes, puis publié d'un bloc ; une requête lit le moteur courant sans prendre de verrou et ne le construit jamais quand il sait lui répondre. Seuls les curseurs de `round-robin` et `sequence` ont un verrou, tenu le temps d'avancer d'un pas.
+- **Construction à la bascule** : passer en `mock` ou `mock-partial`, ou recevoir un snapshot en mock, construit le moteur avant que le nouveau mode ou le nouveau snapshot ne serve une requête. Repasser en `record` ou `passthrough` libère le moteur.
+- **Données locales qui changent** : sans snapshot, le store évolue encore pendant le mock (imports des pairs, requêtes relayées puis enregistrées en `mock-partial`). Le moteur courant continue de servir, et un moteur à jour est reconstruit en tâche de fond, au plus une fois par seconde. Une requête sans correspondance dans un moteur construit avant son arrivée attend, avant de conclure, un moteur qui connaît tous les enregistrements présents à son arrivée ; les requêtes qui attendent ensemble partagent la même construction. En `mock-partial`, une requête relayée puis enregistrée est donc servie par le mock dès la suivante.
+- **Réponse préparée** : headers convertis et body réencodé dans son `Content-Encoding` d'origine (`gzip`, `deflate`, `br`, `zstd`) une seule fois par enregistrement, au premier rejeu, puis servis tels quels.
+- **Constructions comptées** : `mimic_mock_engine_builds_total{trigger}`, avec `switch` (bascule de mode ou de snapshot), `refresh` (reconstruction en tâche de fond) et `unmatched` (requête sans correspondance sur un moteur périmé).
 
 **Requête sans correspondance**, comportement configurable :
 
@@ -443,6 +452,8 @@ Le hash est calculé sur `sel || valeur`, avec un sel propre à l'installation, 
 
 Bodies que la redaction ne peut pas analyser : un body JSON ou formulaire tronqué, ou un JSON invalide, est remplacé par `Skipped { size }`, car on ne peut pas garantir qu'il ne contient pas de secret. Les bodies binaires ne sont pas modifiés.
 
+Un body JSON ou formulaire où aucune valeur n'est remplacée est gardé octet pour octet (ordre des clés, espaces, écriture des nombres) : seul un body redacté est réécrit, ce qui garde au mock sa fidélité (O5).
+
 Conséquence pour le mode `mock` : un body redacté est rejoué redacté. Les headers d'authentification sortants ne participent jamais au matching. Si une réponse doit contenir une valeur réaliste, on passe par les règles `rewrite`.
 
 Option `capture.bodies: false` pour ne garder que métadonnées et schémas (inférence faite en mémoire, exemples jetés).
@@ -616,6 +627,7 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 | `mimic_passthrough_connections_total` | compteur | `direction`, `kind` (`tls`, `tcp`), `result` (`relayed`, `refused`, `error`) | tous |
 | `mimic_tls_handshake_failures_total` | compteur | `authority`, `reason` | tous |
 | `mimic_mock_snapshot_exchanges` | jauge (0 sans snapshot) | | mock |
+| `mimic_mock_engine_builds_total` | compteur | `trigger` (`switch`, `refresh`, `unmatched`, §5.3) | mock |
 
 `authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité.
 
@@ -754,6 +766,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | RED-02 | deux requêtes avec le même token | capture | même marqueur de redaction |
 | RED-03 | body avec un numéro de carte valide (Luhn) | capture | remplacé ; un numéro invalide de même longueur ne l'est pas |
 | RED-04 | n'importe quel body contenant une valeur secrète injectée (proptest) | capture puis lecture du store brut | la valeur n'apparaît dans aucun octet du store |
+| RED-05 | body JSON sans valeur à redacter, aux clés non triées, avec espaces et `1.0` ; même body avec une adresse e-mail | capture, puis rejeu en mock | le premier est stocké et rejoué octet pour octet ; le second est réécrit avec sa marque |
 
 **Matching et mock (MCK)**
 
@@ -776,6 +789,17 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-10 | enregistrement sur une autre méthode ou une autre authority | requête | aucune correspondance |
 | MCK-11 | même graine, mêmes requêtes | deux exécutions | décisions et latences identiques |
 | MCK-12 | trois exemplaires du même appel, deux en `200 {a}` et un en `500`, le `500` le plus récent | stratégie `best` | `200 {a}` |
+
+**Mock concurrent et fidèle (MCK, suite, §5.3)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| MCK-13 | 3 enregistrements rejouables de `GET /users/{id}`, 10 000 sans body de la même opération et 5 000 sur d'autres chemins de la même authority | requête `GET /users/9` | seuls les 3 rejouables sont comparés à la requête ; la latence est tirée parmi les 10 003 durées de l'opération |
+| MCK-14 | un moteur partagé par 8 threads, même graine qu'une exécution en série | 8 000 requêtes concurrentes, stratégies `best`, `weighted-status` et `round-robin` | `best` : mêmes réponses qu'en série ; `weighted-status` : même ensemble de latences tirées qu'en série ; `round-robin` sur 4 candidats : chacun servi 2 000 fois |
+| MCK-15 | une dépendance réelle d'environ 3,5 ms et une sans délai, enregistrées ; un sidecar en mock sur ces enregistrements (`latency.factor: 1`), un autre sans latence (`latency.factor: 0`) | appels en série entrelacés via le sidecar en record (dépendance réelle) et via les sidecars en mock, durée vue par l'application | 3,5 ms : p50 rejoué à ±10 % de celui de la dépendance ; sans délai : p50 rejoué au plus 1,5 fois celui de la dépendance ; sans latence : p50 sous 1 ms |
+| MCK-16 | store de 2 000 échanges sortants, mode record | bascule en mock, puis 200 requêtes mockées concurrentes | moteur construit une fois, à la bascule : `mimic_mock_engine_builds_total{trigger="switch"}` vaut 1 avant la première requête et aucune requête n'en construit |
+| MCK-17 | moteur en service, puis nouvel échange sortant dans le store (import d'un pair) ; mode `mock-partial` | requêtes avec correspondance ; requête sur le nouvel échange ; requête relayée puis la même | les premières servies par le moteur courant, sans construction ; la deuxième servie depuis le nouvel échange, pas `599` ; la troisième mockée dès la seconde fois |
+| MCK-18 | enregistrement dont la réponse est en `gzip` | rejeux successifs | le body est encodé une seule fois : les mêmes octets, sans nouvel encodage, à chaque rejeu |
 
 **Snapshots (SNP)**
 
@@ -996,6 +1020,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P3 | Proxy HTTP en clair : record et mock, store, API et page d'admin, métriques | PRX-01 à 05, MCK-* de bout en bout, ADM-* |
 | P3b | Partage entre sidecars d'un workload | SHR-* |
 | P3c | Sidecar borné : réservoir par opération, budget mémoire, journal local segmenté, file de partage bornée, logs limités | CAP-*, SHR-06, SHR-07, PRX-10, PRX-11 |
+| P3d | Mock fidèle et concurrent : moteur indexé par forme de chemin et sans verrou, construit à la bascule, latence comptée depuis l'arrivée avec un minuteur précis, réponse préparée une fois, redaction sans réécriture des bodies intacts | MCK-13 à 18, RED-05 |
 | P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
