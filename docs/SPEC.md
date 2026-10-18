@@ -207,7 +207,12 @@ struct Exchange {
 Règles de capture :
 
 - métadonnées : 100 % des échanges ;
-- bodies : au plus `N` exemples par couple (opération, code retour), `N = 20` par défaut, avec remplacement par échantillonnage réservoir pour garder de la diversité ;
+- bodies : au plus `N` exemples par couple (opération, code retour), `N = 20` par défaut (`capture.samples_per_operation`), avec remplacement par échantillonnage réservoir pour garder de la diversité :
+  - l'opération est (sens, authority, méthode, **forme** du chemin) : un segment identifiant (entier, UUID, ULID, hex, base64url, date) y est remplacé par sa nature, comme pour la correspondance du mock (§5.3). `/users/1` et `/users/2` comptent pour la même opération ;
+  - le réservoir est déterministe : chaque échange reçoit une priorité, hachage stable de son identifiant, et le réservoir garde les `N` échanges de plus petite priorité. Chaque échange du flux a la même chance d'être gardé, qu'il arrive pendant le warm-up ou à la fin du tir, et le résultat ne dépend pas de l'ordre d'arrivée (fusion entre sidecars comprise, §5.4). Un exemple remplacé perd ses bodies et garde ses métadonnées ;
+  - la décision est prise **avant** tout décodage, parsing JSON et redaction du body : un body qui ne serait pas gardé n'est pas traité (compté `reason="sample_limit"`) ; les headers et la query sont redactés dans tous les cas ;
+  - les compteurs d'un couple disparaissent avec son dernier exemple : leur nombre est borné par celui des bodies gardés ;
+- mémoire : en plus de `capture.max_exchanges` (50 000), le store a un budget en octets estimés, `capture.max_store_bytes` (64 MiB par défaut). Les bodies gardés en occupent au plus la moitié : au-delà, les bodies des échanges les plus anciens sont retirés en premier. Au-delà du budget, les échanges les plus anciens sont évincés. Un nouvel échange garde donc ses bodies, même quand les métadonnées remplissent le budget. Chaque retrait est compté (`reason="store_budget"`). Les défauts tiennent dans la limite mémoire de 256 Mi posée par l'injecteur (§9.4) : store et file de partage (§5.4) en occupent au plus un tiers, le reste couvre la copie du moteur de mock, la découverte et les bodies en vol ;
 - taille max capturée : 1 MiB par body ; au-delà, préfixe + taille ;
 - content-encoding (`gzip`, `br`, `zstd`) décodé pour l'inférence, encodage d'origine conservé pour le rejeu ;
 - streaming : le proxy ne bufferise jamais la réponse complète avant de la relayer ; la capture se fait en tee.
@@ -276,10 +281,11 @@ Un Deployment a souvent plusieurs réplicas, et chaque pod ne voit qu'une partie
 - **Support partagé** : un stockage objet (S3-compatible en production, répertoire local ou PVC `ReadWriteMany` en test). Aucun appel à l'API Kubernetes, aucune connexion entre pods.
 - **Disposition** : `<prefix>/<namespace>/<workload>/exchanges/<instance>/<segment>.jsonl`, où `<segment>` est un ULID choisi par le sidecar. Un segment ne contient que des échanges déjà redactés. Avec un contrôleur, les segments d'une heure révolue sont fusionnés en un segment horaire `exchanges/_hour/<AAAAMMJJHH>.jsonl` (§5.5.2) : les noms d'instance qui commencent par `_` sont réservés et ne désignent jamais un pair.
 - **Synchronisation** toutes les `share.interval` (10 s par défaut) : le sidecar publie ses nouveaux échanges, liste les segments des autres instances et importe ceux qu'il n'a pas encore lus.
-- **Publication** : les nouveaux échanges sont rangés dans des segments d'au plus 8 MiB, chacun avec son identifiant. Un segment dont l'envoi échoue reste en tête de la file et sera renvoyé tel quel, avec le même identifiant : une reprise après un délai dépassé ne crée pas de doublon (§5.5.2). La file d'envoi est bornée à `share.max_pending` échanges (50 000 par défaut) ; au-delà, les segments les plus anciens sont abandonnés et comptés dans `mimic_capture_dropped_total{reason="share_backlog"}`. Après un échec, la synchronisation suivante attend `share.interval` × 2ⁿ (n échecs consécutifs), plafonné à 5 minutes, avec une gigue de 50 % : les sidecars ne reviennent pas tous en même temps quand le support revient.
+- **Publication** : les échanges de la file de publication sont envoyés du plus ancien au plus récent, en segments d'au plus 8 MiB, chacun avec son identifiant. Un segment dont l'envoi échoue reste en tête de la file et sera renvoyé tel quel, avec le même identifiant : une reprise après un délai dépassé ne crée pas de doublon (§5.5.2). Seul un segment entamé par la borne de la file (ses plus anciens échanges jetés) repart sous un nouvel identifiant. Après un échec, la synchronisation suivante attend `share.interval` × 2ⁿ (n échecs consécutifs), plafonné à 5 minutes, avec une gigue de 50 % : les sidecars ne reviennent pas tous en même temps quand le support revient.
 - **Liste incrémentale** : après une première liste complète, le sidecar ne demande que les segments datés d'au moins la date du plus récent déjà listé moins 60 s, une marge qui couvre les écritures concurrentes (`?since_ms=` vers le contrôleur, filtre local sur un stockage objet ou un contrôleur qui ignore le paramètre). Ce curseur n'avance qu'après l'import réussi de tous les segments listés.
 - **Fusion** : dédoublonnage par identifiant d'échange (ULID préfixé par l'instance, donc unique dans le workload). Les plafonds de capture (§5.2) s'appliquent après fusion, ce qui borne la mémoire quel que soit le nombre de réplicas.
 - **Panne du support** : la synchronisation échoue sans bloquer le trafic ; le sidecar continue avec ses données locales et l'échec est compté en métrique.
+- **File de publication** : les échanges locaux pas encore publiés attendent dans une file unique, bornée en octets (`share.max_backlog_bytes`, 16 MiB par défaut) et en nombre (`share.max_pending`, 50 000 échanges par défaut). Quand le support reste indisponible, les plus anciens sont jetés au profit des plus récents dès que l'une des deux bornes est dépassée, et chaque échange jeté est compté (`mimic_capture_dropped_total{reason="share_backlog"}`) ; une publication échouée laisse ses échanges en tête de file, sous ces mêmes bornes. Sans partage configuré, aucune file n'est tenue.
 - **Rétention** : les segments plus vieux que `share.retention` (7 jours par défaut) ne sont plus importés. Avec un contrôleur, c'est lui qui les supprime (§5.5.2) ; avec un stockage objet sans contrôleur, leur suppression est laissée à une règle de cycle de vie du bucket.
 - **Deux supports possibles** : `share.url` vaut soit l'URL du contrôleur (`https://mimic-controller.mimic-system:8443`, recommandé), soit un stockage objet partagé (`s3://…`, `file://…`) sans contrôleur. Sans contrôleur, il n'y a ni interface centrale, ni snapshot, ni bascule de workload.
 
@@ -457,7 +463,10 @@ Le contrôleur doit être sûr de parler au bon sidecar, et le sidecar sûr de r
 
 ## 8. Stockage et export
 
-- **Store local** : fichiers JSONL segmentés (compression zstd en v2) dans un `emptyDir` (`/var/lib/mimic`), rotation par taille (100 MiB par défaut). Index en mémoire reconstruit au démarrage.
+- **Store local** : fichiers JSONL segmentés `local-<n>.jsonl` (compression zstd en v2) dans un `emptyDir` (`/var/lib/mimic`), seulement si `store.dir` est configuré. Ils ne contiennent que des échanges déjà redactés (RED-04).
+  - **Écriture** : par un fil dédié, alimenté par une file bornée (4 096 échanges et 16 MiB). Ni sérialisation, ni écriture, ni appel système ne se font sous le verrou du store ou sur un worker du proxy. Le tampon est vidé toutes les 100 ms, et à l'arrêt. File pleine (disque lent) : l'échange reste en mémoire, mais sa ligne n'est pas écrite, et c'est compté (`reason="local_backlog"`).
+  - **Rotation** par taille : un segment est fermé au-delà de `store.segment_bytes` (32 MiB par défaut), et seuls les `store.max_segments` (4) segments les plus récents sont gardés, le plus ancien étant supprimé. Le journal occupe donc au plus 128 MiB (plus une ligne), le quart de l'`emptyDir` de 512 Mi posé par l'injecteur : le reste est laissé aux snapshots imposés gardés dans le même répertoire (§5.6, jusqu'à 256 MiB).
+  - **Redémarrage** : le store en mémoire est reconstruit à partir des segments présents, du plus ancien au plus récent, dans les limites du §5.2. `DELETE /store` supprime les segments.
 - **Export** **[DÉFAUT : stockage objet S3-compatible]** : envoi périodique et à l'arrêt du pod (`preStop`) des segments et des documents OpenAPI vers `s3://<bucket>/<cluster>/<namespace>/<workload>/<date>/`. Chiffrement côté serveur requis.
 - **Chargement en mode mock** : depuis le store local si présent, sinon téléchargé depuis S3 pour le workload (`mimic.platform.io/mock-source: s3://...`). C'est ce qui permet d'enregistrer en environnement A et de mocker en environnement B.
 - Les ConfigMaps ne sont pas utilisées (limite de 1 MiB).
@@ -487,6 +496,12 @@ capture:
   bodies: true
   max_body_bytes: 1048576
   samples_per_operation: 20
+  max_exchanges: 50000
+  max_store_bytes: 67108864   # 64 MiB, budget mémoire du store (§5.2)
+store:
+  dir: /var/lib/mimic          # absent : mémoire seule
+  segment_bytes: 33554432      # 32 MiB par segment local-<n>.jsonl (§8)
+  max_segments: 4
 redact:
   extra_json_paths: ["$.customer.phone"]
 mock:
@@ -501,7 +516,8 @@ share:
   interval: 10       # secondes
   retention: 604800  # secondes (7 jours)
   mode_poll: 2       # secondes, battement vers le contrôleur
-  max_pending: 50000 # échanges en attente de publication, au plus
+  max_backlog_bytes: 16777216  # 16 MiB, file des échanges pas encore publiés (§5.4)
+  max_pending: 50000           # même file, en nombre d'échanges
 ```
 
 Configuration du contrôleur (`mimic-controller --config`) :
@@ -592,7 +608,8 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 | `mimic_mock_injected_latency_seconds` | histogramme | `authority` | mock |
 | `mimic_discovered_operations` | jauge | `direction`, `authority` | tous |
 | `mimic_store_exchanges` | jauge | `origin` (`local`, `peer`) | tous |
-| `mimic_capture_dropped_total` | compteur | `reason` | tous |
+| `mimic_store_bytes` | jauge (octets estimés des échanges en mémoire, §5.2) | | tous |
+| `mimic_capture_dropped_total` | compteur | `reason` (`truncated`, `sample_limit`, `store_budget`, `share_backlog`, `local_backlog`) | tous |
 | `mimic_share_sync_total` | compteur | `result` (`ok`, `error`) | tous |
 | `mimic_share_peers` | jauge | | tous |
 | `mimic_mode` | jauge (1 pour le mode courant) | `mode` | tous |
@@ -603,6 +620,8 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 `authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité.
 
 Logs JSON structurés (`tracing`). Propagation de `traceparent` inchangée.
+
+Sous charge, les logs d'erreurs répétitives sont limités en débit : au plus une ligne par seconde pour les échecs vers l'amont et pour les erreurs d'`accept`, avec le nombre de lignes omises depuis la précédente. Les compteurs restent exacts (`mimic_upstream_errors_total`). Une erreur d'`accept` (par exemple `EMFILE`, plus de descripteurs) suspend l'écoute concernée pendant 50 ms avant de réessayer, au lieu de boucler à 100 % de CPU au moment où l'on mesure le pod.
 
 ### 9.4 Injection automatique (`mimic-injector`)
 
@@ -834,8 +853,23 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | SHR-03 | segments déjà importés | nouvelle synchronisation | aucun échange dupliqué |
 | SHR-04 | sidecar d'un autre workload sur le même support | synchronisation | ses échanges ne sont pas importés |
 | SHR-05 | support indisponible | synchronisation | le trafic n'est pas affecté, `mimic_share_sync_total{result="error"}` augmente |
-| SHR-06 | sidecar qui a déjà listé des segments | synchronisations suivantes | liste demandée avec `since_ms` = date du plus récent listé moins 60 s ; un import échoué ne fait pas avancer le curseur |
-| SHR-07 | contrôleur qui refuse les publications, puis revient | publications successives | même identifiant de segment à chaque reprise, attente croissante entre les tentatives, file bornée à `share.max_pending` avec `mimic_capture_dropped_total{reason="share_backlog"}`, segments d'au plus 8 MiB |
+| SHR-06 | sidecar sans partage configuré | trafic enregistré | aucun échange n'est gardé pour publication |
+| SHR-07 | partage configuré, support indisponible, trafic au-delà de `share.max_backlog_bytes` | synchronisations échouées répétées | la file reste sous sa borne et garde les échanges les plus récents ; les échanges jetés sont comptés dans `mimic_capture_dropped_total{reason="share_backlog"}` |
+| SHR-08 | sidecar qui a déjà listé des segments | synchronisations suivantes | liste demandée avec `since_ms` = date du plus récent listé moins 60 s ; un import échoué ne fait pas avancer le curseur |
+| SHR-09 | contrôleur qui refuse les publications, puis revient ; trafic au-delà de `share.max_pending` | publications successives | même identifiant de segment à chaque reprise, attente croissante entre les tentatives ; la même file reste sous `share.max_pending`, garde les plus récents et compte les jetés dans `mimic_capture_dropped_total{reason="share_backlog"}` ; segments d'au plus 8 MiB |
+
+**Capture et store (CAP)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| CAP-01 | 100 réponses `GET /users/{n}` avec n distinct, `samples_per_operation: 20` | capture | au plus 20 bodies gardés pour l'opération, les autres échanges en métadonnées seules |
+| CAP-02 | même flux d'échanges présenté dans deux ordres différents | capture | mêmes exemples gardés ; parmi eux, des échanges arrivés après les `N` premiers |
+| CAP-03 | réservoir d'une opération plein (ici `samples_per_operation: 0`), réponse JSON avec une adresse e-mail et plus grosse que `max_body_bytes` | capture | body ni décodé ni redacté ni tronqué : `Skipped`, aucune marque de redaction de body, `reason="sample_limit"` compté et `reason="truncated"` inchangé |
+| CAP-04 | ids uniques dans les chemins, échanges évincés | capture prolongée | les compteurs d'échantillonnage n'existent que pour les couples qui ont encore un exemple |
+| CAP-05 | `capture.max_store_bytes` dépassé | ajout d'échanges | les bodies les plus anciens sont retirés dès que les bodies dépassent la moitié du budget, et les échanges les plus anciens sont évincés au-delà du budget ; le store reste sous le budget, le dernier échange garde ses bodies, et `reason="store_budget"` est compté |
+| CAP-06 | `store.dir`, `segment_bytes` et `max_segments` petits | trafic au-delà de plusieurs segments | au plus `max_segments` fichiers `local-<n>.jsonl`, chacun sous `segment_bytes` plus une ligne ; après redémarrage, les échanges les plus récents sont rechargés et les plus anciens ne le sont plus |
+| CAP-07 | file du journal local pleine | ajout d'échanges | l'ajout ne bloque pas, l'échange est en mémoire, la ligne non écrite est comptée (`reason="local_backlog"`) ; sans demande explicite, une ligne écrite est sur disque en moins d'une seconde |
+| CAP-08 | configuration par défaut du webhook (§9.4) | injection d'un pod | journal local au plus le quart de l'`emptyDir` du store ; budget du store et file de partage au plus le tiers de la limite mémoire du sidecar |
 
 **Admin et métriques (ADM)**
 
@@ -868,6 +902,8 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | PRX-05 | bascule record → mock pendant une charge | bascule | aucune requête en erreur, nouvelles requêtes mockées |
 | PRX-06 | hôte dans `tls.intercept`, app faisant confiance à la CA | requête HTTPS | échange déchiffré et enregistré |
 | PRX-07 | hôte hors `tls.intercept` | requête HTTPS | tunnel opaque, seuls SNI et durée enregistrés |
+| PRX-10 | `accept` en échec répété (EMFILE) | boucle d'écoute | 50 ms au moins entre deux tentatives, au plus une ligne de log par seconde ; l'écoute reprend dès que l'erreur cesse |
+| PRX-11 | amont injoignable | rafale de 200 requêtes | 200 réponses `502` et `mimic_upstream_errors_total` à 200, mais au plus une ligne de log par seconde, la suivante indiquant le nombre de lignes omises |
 
 **Injection (INJ)**
 
@@ -959,11 +995,12 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P2 | `mimic-core::mock` : matching, stratégies, latence | MCK-01 à 11 (niveau cœur) |
 | P3 | Proxy HTTP en clair : record et mock, store, API et page d'admin, métriques | PRX-01 à 05, MCK-* de bout en bout, ADM-* |
 | P3b | Partage entre sidecars d'un workload | SHR-* |
+| P3c | Sidecar borné : réservoir par opération, budget mémoire, journal local segmenté, file de partage bornée, logs limités | CAP-*, SHR-06, SHR-07, PRX-10, PRX-11 |
 | P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
 | P6b | Chargement cross-environnement, garde-fou production | E2E-04 |
-| P6c | Contrôleur à l'échelle : index des segments, liste incrémentale, verrous courts, GC et compaction, budget mémoire, ingestion idempotente | CTL-06 à 15, SHR-06, SHR-07 |
+| P6c | Contrôleur à l'échelle : index des segments, liste incrémentale, verrous courts, GC et compaction, budget mémoire, ingestion idempotente | CTL-06 à 15, SHR-08, SHR-09 |
 | P7 | Webhook d'injection + `mimicctl` (dont le rapport) | INJ-*, CLI-*, OAS-*, DIF-*, E2E-05 |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 

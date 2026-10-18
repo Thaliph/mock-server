@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn shr_07_segments_are_split_at_the_size_limit() {
+    fn shr_09_segments_are_split_at_the_size_limit() {
         let list: Vec<Exchange> = (0..5).map(|i| ex(&i.to_string(), 300)).collect();
         let line = serde_json::to_vec(&list[0]).unwrap().len() + 1;
         let parts = split(&list, 2 * line);
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn shr_07_outbox_keeps_the_most_recent_and_its_identifiers() {
+    fn shr_09_outbox_keeps_the_most_recent_and_its_identifiers() {
         let mut o = Outbox::default();
         assert_eq!(
             o.enqueue(vec![ex("1", 1), ex("2", 1)], 3, MAX_SEGMENT_BYTES),
@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn shr_07_backoff_grows_and_is_capped() {
+    fn shr_09_backoff_grows_and_is_capped() {
         let i = Duration::from_secs(10);
         assert_eq!(backoff(i, 0), i);
         for n in 1..8 {

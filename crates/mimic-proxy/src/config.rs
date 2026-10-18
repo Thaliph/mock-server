@@ -151,10 +151,13 @@ impl Default for AdminConfig {
 pub struct CaptureConfig {
     pub bodies: bool,
     pub max_body_bytes: usize,
-    /// Bodies conservés par (sens, authority, méthode, chemin, code) ; au-delà, métadonnées seules.
+    /// Bodies conservés par (sens, authority, méthode, forme du chemin, code), choisis par
+    /// réservoir ; au-delà, métadonnées seules (spec §5.2).
     pub samples_per_operation: usize,
     /// Nombre maximal d'échanges en mémoire ; les plus anciens sont évincés.
     pub max_exchanges: usize,
+    /// Budget mémoire du store en octets estimés, bodies au plus pour moitié (spec §5.2).
+    pub max_store_bytes: usize,
 }
 
 impl Default for CaptureConfig {
@@ -164,6 +167,9 @@ impl Default for CaptureConfig {
             max_body_bytes: 1024 * 1024,
             samples_per_operation: 20,
             max_exchanges: 50_000,
+            // Un quart de la limite de 256 Mi posée par l'injecteur : le moteur de mock en
+            // copie le sortant, la découverte le parcourt.
+            max_store_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -231,11 +237,27 @@ impl From<StrategyName> for Strategy {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StoreConfig {
-    /// Répertoire de persistance locale (JSONL). Absent : mémoire seule.
+    /// Répertoire de persistance locale (segments JSONL). Absent : mémoire seule.
     pub dir: Option<PathBuf>,
+    /// Taille au-delà de laquelle un segment `local-<n>.jsonl` est fermé (spec §8).
+    pub segment_bytes: u64,
+    /// Segments gardés ; le plus ancien est supprimé au-delà.
+    pub max_segments: usize,
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            // 4 × 32 MiB : le quart de l'emptyDir de 512 Mi posé par l'injecteur, le reste
+            // étant laissé aux snapshots imposés.
+            segment_bytes: 32 * 1024 * 1024,
+            max_segments: 4,
+        }
+    }
 }
 
 /// Interception TLS sortante (spec §4.2).
@@ -275,7 +297,10 @@ pub struct ShareConfig {
     /// Autorise un contrôleur en `http://` : tests uniquement.
     #[serde(default)]
     pub allow_insecure: bool,
-    /// Échanges en attente de publication, au plus : au-delà, les plus anciens sont abandonnés.
+    /// Borne en octets de la file des échanges pas encore publiés (spec §5.4).
+    #[serde(default = "default_share_backlog")]
+    pub max_backlog_bytes: usize,
+    /// Borne en nombre d'échanges de la même file (spec §5.4).
     #[serde(default = "default_max_pending")]
     pub max_pending: usize,
 }
@@ -290,6 +315,7 @@ impl Default for ShareConfig {
             ca_file: None,
             token_file: None,
             allow_insecure: false,
+            max_backlog_bytes: default_share_backlog(),
             max_pending: default_max_pending(),
         }
     }
@@ -319,6 +345,10 @@ fn default_max_pending() -> usize {
 
 fn default_share_interval() -> Duration {
     Duration::from_secs(10)
+}
+
+fn default_share_backlog() -> usize {
+    16 * 1024 * 1024
 }
 
 fn default_share_retention() -> Duration {
@@ -402,6 +432,12 @@ impl Config {
         }
         if self.capture.max_exchanges == 0 {
             return Err("capture.max_exchanges doit être positif".into());
+        }
+        if self.capture.max_store_bytes == 0 {
+            return Err("capture.max_store_bytes doit être positif".into());
+        }
+        if self.store.segment_bytes == 0 || self.store.max_segments == 0 {
+            return Err("store.segment_bytes et store.max_segments doivent être positifs".into());
         }
         if let Some(share) = &self.share {
             if self.workload.name.is_empty() {

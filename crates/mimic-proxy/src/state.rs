@@ -18,7 +18,8 @@ use serde_json::Value;
 
 use crate::config::{Config, Mode};
 use crate::metrics::{DiscoveryLabels, Metrics, OriginLabel};
-use crate::store::Store;
+use crate::store::{Drops, Limits, Store};
+use crate::throttle::LogLimiter;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = UnsyncBoxBody<bytes::Bytes, BoxError>;
@@ -59,6 +60,8 @@ pub struct AppState {
     pub share_outbox: Mutex<crate::share::Outbox>,
     /// Adresse de l'application pour le trafic entrant, par port (spec §3.1).
     pub inbound_targets: crate::net::InboundTargets,
+    /// Logs d'échec vers l'amont, limités en débit (spec §9.3).
+    pub upstream_log: LogLimiter,
 }
 
 /// Source du moteur de mock en cache.
@@ -121,9 +124,18 @@ impl AppState {
         };
         let metrics = Metrics::new();
         metrics.set_mode(config.mode);
-        let store = Store::new(
-            config.capture.max_exchanges,
-            config.capture.samples_per_operation,
+        let store = Store::with_limits(
+            Limits {
+                max_exchanges: config.capture.max_exchanges,
+                samples: config.capture.samples_per_operation,
+                max_bytes: config.capture.max_store_bytes,
+                share_backlog: config.share.as_ref().map(|s| s.max_backlog_bytes),
+            },
+            Drops {
+                store_budget: metrics.dropped("store_budget"),
+                share_backlog: metrics.dropped("share_backlog"),
+                local_backlog: metrics.dropped("local_backlog"),
+            },
         );
         let share_status = ShareStatus {
             enabled: config.share.is_some(),
@@ -154,6 +166,7 @@ impl AppState {
             share_status: Mutex::new(share_status),
             share_notify: tokio::sync::Notify::new(),
             share_outbox: Mutex::new(Default::default()),
+            upstream_log: LogLimiter::per_second(),
             tls,
         }))
     }
@@ -283,6 +296,7 @@ impl AppState {
     }
 
     pub fn refresh_store_metrics(&self) {
+        self.metrics.store_bytes.set(self.store.bytes() as i64);
         let (local, peer) = self.store.counts();
         for (origin, n) in [("local", local), ("peer", peer)] {
             self.metrics
