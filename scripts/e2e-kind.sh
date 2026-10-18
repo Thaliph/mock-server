@@ -14,7 +14,11 @@
 # 6. mock de shipping (mimicctl) : quote est arrêté, shipping répond depuis le snapshot ;
 # 7. retour en record ;
 # 8. garde-fou production (E2E-04) : namespace labellisé env=production, mock refusé par le
-#    contrôleur, par mimicctl et par la politique d'admission.
+#    contrôleur, par mimicctl et par la politique d'admission ;
+# 9. WebSocket en mock (E2E-07, tests/e2e/websocket.yaml) : avec mock.websocket relay, la
+#    poignée de main sortante d'un pod injecté aboutit (101) ; avec refuse, sous une
+#    NetworkPolicy qui coupe sa sortie, elle reçoit le 503 du sidecar et le serveur ne voit
+#    aucune connexion.
 #
 # Variables : CLUSTER (mimic), MIMIC_IMAGE (mimic:e2e), SKIP_BUILD=1 si l'image est déjà
 # construite, MIMICCTL (chemin du binaire, sinon construit par cargo), LOAD_SECONDS (300),
@@ -68,6 +72,12 @@ diagnostics() {
     kubectl -n "$NS" logs "$p" -c mimic-init || true
     kubectl -n "$NS" logs "$p" --all-containers --tail=30 || true
   done
+  # Étape WebSocket (E2E-07), si elle a commencé.
+  if kubectl -n "$NS" get deploy ws-client >/dev/null 2>&1; then
+    kubectl -n "$NS" logs deploy/ws-client -c mimic --tail=30 || true
+    kubectl -n "$NS" logs deploy/ws-echo --tail=20 || true
+    kubectl -n "$NS" get networkpolicy -o wide || true
+  fi
   # Ce qui a été découvert jusque-là aide autant que les logs.
   [ -n "${reported:-}" ] || report || true
 }
@@ -370,5 +380,71 @@ denied() {
 }
 retry 30 denied || fail "politique d'admission inactive"
 kubectl delete namespace "$PROD" --wait=false
+
+log "WebSocket en mock : relais puis refus (E2E-07)"
+# ws-echo (non injecté) compte les connexions et les poignées de main qu'il reçoit ; ws-client
+# (curl, injecté) l'appelle à travers son sidecar.
+kubectl apply -f tests/e2e/websocket.yaml
+kubectl -n "$NS" rollout status deploy/ws-echo --timeout=120s
+kubectl -n "$NS" rollout status deploy/ws-client --timeout=180s
+ws_pod=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=ws-client \
+  --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+case " $(kubectl -n "$NS" get pod "$ws_pod" -o jsonpath='{.spec.initContainers[*].name}') " in
+  *" mimic "*) ;; *) fail "ws-client n'est pas injecté" ;;
+esac
+# ws_handshake : en-tête de la réponse à une poignée de main sortante de ws-client vers
+# ws-echo. curl garde la connexion ouverte après un 101 : -m la coupe (code 28).
+ws_handshake() {
+  kubectl -n "$NS" exec "$ws_pod" -c curl -- curl -sS -i -N --http1.1 -m 3 \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' http://ws-echo:8080/ws 2>/dev/null |
+    tr -d '\r' | sed '/^$/q' || true
+}
+# ws_count : « connexions poignées » vues par ws-echo, lues depuis le pod client (non injecté).
+ws_count() { kubectl -n "$NS" exec client -- curl -sS -m 5 http://ws-echo:8080/count; }
+# ws_metric <result> : mimic_websocket_connections_total sortant du sidecar de ws-client.
+ws_metric() {
+  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15000/proxy/metrics" |
+    total '/^mimic_websocket_connections_total[{]/ && /direction="outbound"/ && /result="'"$1"'"/'
+}
+# ws_applied <websocket> : le sidecar de ws-client est en mock, snapshot chargé, avec ce réglage.
+ws_applied() {
+  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15000/proxy/api/status" |
+    jq -e --arg w "$1" '.mode == "mock" and .snapshot != null and .mock_websocket == $w' >/dev/null
+}
+# ws_aligned : statut publié pour la génération courante, le pod aligné.
+ws_aligned() { mimicctl status ws-client -n "$NS" | tail -1 | grep -qE '\s1/1$'; }
+
+# relay (défaut) : la poignée de main sortante joint ws-echo et aboutit.
+mimicctl mode ws-client mock -n "$NS" >/dev/null
+retry 90 ws_applied relay || fail "ws-client ne passe pas en mock"
+retry 60 ws_aligned || { mimicctl status ws-client -n "$NS"; fail "ws-client non aligné en mock"; }
+before=$(ws_count) relayed=$(ws_metric relayed)
+head=$(ws_handshake)
+echo "relay : $(echo "$head" | head -1)"
+echo "$head" | head -1 | grep -q '^HTTP/1.1 101' || fail "relay : poignée de main non aboutie : $head"
+after=$(ws_count)
+[ "${after#* }" -gt "${before#* }" ] || fail "relay : ws-echo n'a pas reçu la poignée de main ($before -> $after)"
+[ "$(ws_metric relayed)" -gt "$relayed" ] || fail "relay : result=\"relayed\" n'augmente pas"
+
+# refuse : sortie de ws-client coupée sauf DNS et contrôleur ; le sidecar répond lui-même.
+kubectl apply -f tests/e2e/websocket-egress.yaml
+mimicctl mode ws-client mock --mock-websocket refuse -n "$NS" >/dev/null
+retry 60 ws_applied refuse || fail "ws-client n'applique pas mock.websocket: refuse"
+retry 60 ws_aligned || { mimicctl status ws-client -n "$NS"; fail "ws-client non aligné avec refuse"; }
+before=$(ws_count) refused=$(ws_metric refused)
+head=$(ws_handshake)
+echo "refuse : $(echo "$head" | head -1)"
+echo "$head" | head -1 | grep -q '^HTTP/1.1 503' || fail "refuse : 503 attendu : $head"
+echo "$head" | grep -qix 'x-mimic-websocket: refused' || fail "refuse : x-mimic-websocket absent : $head"
+after=$(ws_count)
+[ "$after" = "$before" ] || fail "refuse : ws-echo a reçu une connexion ($before -> $after)"
+[ "$(ws_metric refused)" -gt "$refused" ] || fail "refuse : result=\"refused\" n'augmente pas"
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  printf '\n## WebSocket en mock (E2E-07)\n\n| mock.websocket | Réponse | ws-echo (connexions poignées) |\n|---|---|---|\n| relay | 101 | jointe |\n| refuse | 503, x-mimic-websocket: refused | %s, inchangé |\n' \
+    "$after" >> "$GITHUB_STEP_SUMMARY"
+fi
+kubectl delete -f tests/e2e/websocket-egress.yaml -f tests/e2e/websocket.yaml --wait=false
+kubectl -n "$NS" delete mimicworkload ws-client --wait=false
 
 log "démo réussie"
