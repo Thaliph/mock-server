@@ -117,12 +117,16 @@ impl Redactor {
         }
         match body {
             Body::Captured { data } => {
+                let before = marks.len();
                 let redacted = if is_json(media) {
                     self.redact_json_bytes(data, side, marks)
                 } else {
                     Some(self.redact_form(data, side, marks))
                 };
                 match redacted {
+                    // Rien de remplacé : octets d'origine gardés (ordre des clés, espaces,
+                    // écriture des nombres), le mock les rejoue à l'identique (spec §7, O5).
+                    Some(_) if marks.len() == before => {}
                     Some(bytes) => *data = bytes,
                     // Body illisible : impossible de garantir qu'il ne contient pas de secret.
                     None => {
@@ -149,7 +153,12 @@ impl Redactor {
         }
         let mut value: Value = serde_json::from_slice(data).ok()?;
         let mut path = vec![];
+        let before = marks.len();
         self.redact_json(&mut value, &mut path, &format!("{side}.body"), marks);
+        if marks.len() == before {
+            // Rien à réécrire : l'appelant garde les octets d'origine.
+            return Some(vec![]);
+        }
         serde_json::to_vec(&value).ok()
     }
 
