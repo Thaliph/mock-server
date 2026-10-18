@@ -122,7 +122,7 @@ pod_of() { kubectl -n "$1" get pod -l "app.kubernetes.io/name=$2" -o name | head
 
 # Ordre des conteneurs et mesh vu par mimic-init, pour chaque pod du cas $1.
 check_injection() {
-  local ns app p inits containers mesh_name expected
+  local ns app p inits containers mesh_name expected logs
   ns=$(ns_of "$1")
   case "$1" in
     sidecar) mesh_name=istio expected="mesh IstioSidecar" ;;
@@ -144,8 +144,10 @@ check_injection() {
       [ "$(kubectl -n "$ns" get "$p" -o jsonpath='{.metadata.annotations.ambient\.istio\.io/redirection}')" = enabled ] ||
         fail "$p : pas pris en charge par ztunnel"
     fi
-    kubectl -n "$ns" logs "$p" -c mimic-init
-    kubectl -n "$ns" logs "$p" -c mimic-init | grep -q "$expected" || fail "$p : mimic-init n'a pas reconnu le mesh ($expected)"
+    # Logs lus d'abord : avec pipefail, `grep -q` qui s'arrête tôt ferait échouer kubectl.
+    logs=$(kubectl -n "$ns" logs "$p" -c mimic-init)
+    echo "$logs"
+    case "$logs" in *"$expected"*) ;; *) fail "$p : mimic-init n'a pas reconnu le mesh ($expected)" ;; esac
   done
 }
 
@@ -171,7 +173,11 @@ refused_outside() {
   [ "${code:-000}" != 200 ]
 }
 
-export_has() { mimicctl export "$2" -n "$3" "${@:4}" 2>/dev/null | grep -q "$1"; }
+export_has() {
+  local out
+  out=$(mimicctl export "$2" -n "$3" "${@:4}" 2>/dev/null) || return 1
+  case "$out" in *"$1"*) ;; *) return 1 ;; esac
+}
 
 aligned() {
   local line
