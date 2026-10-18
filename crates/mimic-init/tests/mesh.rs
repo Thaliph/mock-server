@@ -149,6 +149,7 @@ fn ini_06_istio_sidecar_rules() {
 fn ini_07_istio_ambient_rules() {
     let r = render(&RulesConfig {
         mesh: ambient(),
+        pod_ip: Some("10.244.0.20".into()),
         ..RulesConfig::default()
     });
     assert!(!r.restore.contains("MIMIC_INBOUND"));
@@ -159,7 +160,7 @@ fn ini_07_istio_ambient_rules() {
     );
     let leg = position(
         &out,
-        "-A MIMIC_OUTBOUND -o lo -m mark --mark 0x539/0xfff -p tcp -j REDIRECT --to-ports 15106",
+        "-A MIMIC_OUTBOUND -o lo -m mark --mark 0x539/0xfff -p tcp -j DNAT --to-destination 10.244.0.20:15106",
     );
     let own = position(
         &out,
@@ -175,6 +176,36 @@ fn ini_07_istio_ambient_rules() {
     );
     assert!(excluded < leg && leg < own && own < mesh && mesh < redirect);
     assert!(r.jumps[0].first);
+
+    // Sans IP du pod, ou pour l'autre famille d'adresses : redirection vers la boucle locale.
+    let leg =
+        "-A MIMIC_OUTBOUND -o lo -m mark --mark 0x539/0xfff -p tcp -j REDIRECT --to-ports 15106";
+    for c in [
+        RulesConfig {
+            mesh: ambient(),
+            ..RulesConfig::default()
+        },
+        RulesConfig {
+            mesh: ambient(),
+            pod_ip: Some("10.244.0.20".into()),
+            ipv6: true,
+            ..RulesConfig::default()
+        },
+    ] {
+        assert!(render(&c).restore.contains(leg), "{c:?}");
+    }
+    let v6 = render(&RulesConfig {
+        mesh: ambient(),
+        pod_ip: Some("fd00::14".into()),
+        ipv6: true,
+        ..RulesConfig::default()
+    });
+    assert!(
+        v6.restore
+            .contains("-p tcp -j DNAT --to-destination [fd00::14]:15106"),
+        "{}",
+        v6.restore
+    );
 }
 
 #[test]

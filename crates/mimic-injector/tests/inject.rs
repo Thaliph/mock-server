@@ -70,6 +70,16 @@ fn inj_01_pod_receives_init_container_and_native_sidecar() {
     assert_eq!(inits[0].name, "mimic-init");
     assert_eq!(env_value(&inits[0], "MIMIC_INBOUND_PORTS"), Some("8080"));
     assert_eq!(env_value(&inits[0], "MIMIC_MESH"), Some("auto"));
+    // IP du pod pour le trajet entrant ambient (spec §3.3.2).
+    let pod_ip = inits[0]
+        .env
+        .iter()
+        .flatten()
+        .find(|e| e.name == "POD_IP")
+        .and_then(|e| e.value_from.as_ref())
+        .and_then(|v| v.field_ref.as_ref())
+        .map(|f| f.field_path.as_str());
+    assert_eq!(pod_ip, Some("status.podIP"));
     assert_eq!(
         env_value(&inits[0], "MIMIC_EXCLUDE_OUTBOUND_CIDRS"),
         Some("10.96.0.1/32")

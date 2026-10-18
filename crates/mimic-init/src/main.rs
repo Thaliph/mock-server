@@ -40,6 +40,9 @@ struct Args {
     /// Service mesh du pod (spec §3.3.3) : `auto`, `none`, `istio`, `istio-ambient`, `linkerd`.
     #[arg(long, env = "MIMIC_MESH", default_value = "auto")]
     mesh: String,
+    /// IP du pod (`status.podIP`) : cible du trajet entrant en ambient (spec §3.3.2).
+    #[arg(long, env = "POD_IP")]
+    pod_ip: Option<String>,
     /// Affiche les règles sans les appliquer.
     #[arg(long)]
     dry_run: bool,
@@ -84,6 +87,7 @@ fn run(args: &Args) -> Result<(), String> {
         exclude_outbound_ports: parse_ports(&args.exclude_outbound_ports)?,
         ipv6: false,
         mesh: resolved.mesh,
+        pod_ip: args.pod_ip.clone(),
     };
     let ip6tables = resolved.tool.replacen("iptables", "ip6tables", 1);
     let mut families = vec![(resolved.tool.as_str(), base.clone())];

@@ -48,6 +48,8 @@ pub struct RulesConfig {
     pub ipv6: bool,
     /// Service mesh du pod (spec §3.3) : change les règles posées.
     pub mesh: Mesh,
+    /// IP du pod (`POD_IP`), cible du trajet entrant en ambient (spec §3.3.2).
+    pub pod_ip: Option<String>,
 }
 
 impl Default for RulesConfig {
@@ -64,6 +66,7 @@ impl Default for RulesConfig {
             exclude_outbound_ports: vec![],
             ipv6: false,
             mesh: Mesh::None,
+            pod_ip: None,
         }
     }
 }
@@ -349,6 +352,23 @@ pub fn render(c: &RulesConfig) -> Rules {
 
 /// Règles dans un pod du mesh (spec §3.3.2) : rien en `PREROUTING`, tout dans
 /// `MIMIC_OUTBOUND`, sautée en tête de `OUTPUT`.
+/// Cible du trajet entrant dans un mesh. En ambient, ztunnel se connecte à l'application
+/// avec l'adresse source du client : une redirection vers 127.0.0.1 rendrait la réponse
+/// impossible à router, d'où un DNAT vers l'IP du pod quand elle est connue (spec §3.3.2).
+fn inbound_target(c: &RulesConfig) -> String {
+    let port = c.inbound_port;
+    match (&c.mesh, c.pod_ip.as_deref()) {
+        (Mesh::IstioAmbient { .. }, Some(ip)) if ip.contains(':') == c.ipv6 => {
+            if c.ipv6 {
+                format!("DNAT --to-destination [{ip}]:{port}")
+            } else {
+                format!("DNAT --to-destination {ip}:{port}")
+            }
+        }
+        _ => format!("REDIRECT --to-ports {port}"),
+    }
+}
+
 fn render_mesh(c: &RulesConfig) -> Rules {
     let inbound = c.inbound_ports != InboundPorts::None;
     let mut r = String::from("*nat\n");
@@ -376,6 +396,7 @@ fn render_mesh(c: &RulesConfig) -> Rules {
             Mesh::Linkerd { proxy_uid } => format!("-o lo -m owner --uid-owner {proxy_uid}"),
             Mesh::None => unreachable!("render_mesh hors mesh"),
         };
+        let target = inbound_target(c);
         let mut excluded = sidecar_ports(c);
         excluded.extend(&c.exclude_inbound_ports);
         excluded.sort_unstable();
@@ -385,18 +406,13 @@ fn render_mesh(c: &RulesConfig) -> Rules {
         }
         match &c.inbound_ports {
             InboundPorts::All => {
-                let _ = writeln!(
-                    r,
-                    "-A {OUTBOUND_CHAIN} {leg} -p tcp -j REDIRECT --to-ports {}",
-                    c.inbound_port
-                );
+                let _ = writeln!(r, "-A {OUTBOUND_CHAIN} {leg} -p tcp -j {target}");
             }
             InboundPorts::List(ports) => {
                 for p in ports.iter().filter(|p| !excluded.contains(p)) {
                     let _ = writeln!(
                         r,
-                        "-A {OUTBOUND_CHAIN} {leg} -p tcp --dport {p} -j REDIRECT --to-ports {}",
-                        c.inbound_port
+                        "-A {OUTBOUND_CHAIN} {leg} -p tcp --dport {p} -j {target}"
                     );
                 }
             }

@@ -235,6 +235,8 @@ fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
     }
     let mut envs = vec![
         env("MIMIC_MESH", mesh_mode(pod)),
+        // Cible du trajet entrant en ambient (spec §3.3.2).
+        field_env("POD_IP", "status.podIP"),
         env("MIMIC_INBOUND_PORTS", inbound_ports(pod)),
         env("MIMIC_EXCLUDE_OUTBOUND_CIDRS", cidrs.join(",")),
     ];
