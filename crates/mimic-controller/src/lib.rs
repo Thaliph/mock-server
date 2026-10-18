@@ -7,6 +7,7 @@ pub mod auth;
 pub mod config;
 pub mod crd;
 pub mod kube;
+pub mod leader;
 pub mod metrics;
 pub mod mock_form;
 pub mod reconcile;
@@ -26,6 +27,7 @@ use tokio::net::TcpListener;
 
 use crate::auth::{Authenticator, KubeAuth};
 use crate::config::{AuthConfig, ControllerConfig, TlsFiles};
+use crate::leader::{Coordination, Election, Role};
 use crate::reconcile::MimicWorkloadSpec;
 use crate::state::Ctl;
 
@@ -37,6 +39,8 @@ pub struct Running {
     api: SocketAddr,
     ui: SocketAddr,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Élection de la réplique active ; absente : une seule réplique, toujours active.
+    election: Option<Arc<Election>>,
 }
 
 impl Running {
@@ -68,14 +72,52 @@ impl Running {
         self.ctl.set_namespace_labels(ns, labels).await;
     }
 
-    /// Arrête les tâches, après avoir écrit les exemples par endpoint qui ont changé.
+    /// Vrai si cette réplique sert les sidecars (spec §5.5.4).
+    pub fn is_leader(&self) -> bool {
+        self.ctl.is_active()
+    }
+
+    /// Attend que la réplique soit active, état rechargé et marque posée ; immédiat sans
+    /// élection.
+    pub async fn leading(&self) {
+        if let Some(e) = &self.election {
+            e.wait(Role::Active).await;
+        }
+    }
+
+    /// Attend la perte du bail : la réplique ne sert plus et le processus doit s'arrêter.
+    /// Ne se termine jamais sans élection.
+    pub async fn lost(&self) {
+        match &self.election {
+            Some(e) => e.wait(Role::Lost).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Arrêt propre. Sans élection, arrête les tâches après avoir écrit les exemples par
+    /// endpoint qui ont changé ; avec, retire d'abord la marque et cesse de servir, puis
+    /// écrit les exemples et rend le bail (spec §5.5.4).
     pub async fn shutdown(self) {
-        self.ctl.flush_all().await;
+        match &self.election {
+            Some(e) => e.shutdown(&self.ctl).await,
+            None => self.ctl.flush_all().await,
+        }
         for t in &self.tasks {
             t.abort();
         }
         for t in self.tasks {
             let _ = t.await;
+        }
+    }
+
+    /// Arrêt brutal, comme un processus tué (tests) : rien n'est écrit ni rendu.
+    pub fn kill(self) {
+        self.ctl.set_active(false);
+        if let Some(e) = &self.election {
+            e.kill();
+        }
+        for t in &self.tasks {
+            t.abort();
         }
     }
 
@@ -100,10 +142,31 @@ pub async fn start(config: ControllerConfig) -> Result<Running, String> {
     start_with(config, store).await
 }
 
-/// Comme `start`, sur un support déjà ouvert (tests).
+/// Comme `start`, sur un support déjà ouvert (tests). Avec `leader_election`, sur le bail
+/// Kubernetes, ce qui exige `auth: kubernetes`.
 pub async fn start_with(
     config: ControllerConfig,
     store: Arc<dyn ObjectStore>,
+) -> Result<Running, String> {
+    launch(config, store, None).await
+}
+
+/// Réplique élue sur un bail donné (tests, hors cluster) ; `leader_election` est requis.
+pub async fn start_elected(
+    config: ControllerConfig,
+    store: Arc<dyn ObjectStore>,
+    coord: Arc<dyn Coordination>,
+) -> Result<Running, String> {
+    if config.leader_election.is_none() {
+        return Err("start_elected exige leader_election".into());
+    }
+    launch(config, store, Some(coord)).await
+}
+
+async fn launch(
+    config: ControllerConfig,
+    store: Arc<dyn ObjectStore>,
+    coord: Option<Arc<dyn Coordination>>,
 ) -> Result<Running, String> {
     install_crypto_provider();
     config.validate()?;
@@ -123,11 +186,32 @@ pub async fn start_with(
         Some(files) => Some(tls_acceptor(files)?),
         None => None,
     };
+    let election = match &config.leader_election {
+        None => None,
+        Some(le) => {
+            let coord = match (coord, &client) {
+                (Some(c), _) => c,
+                (None, Some(client)) => Arc::new(crate::kube::KubeLease::new(
+                    client.clone(),
+                    &le.namespace,
+                    &le.lease,
+                )) as Arc<dyn Coordination>,
+                (None, None) => {
+                    return Err("leader_election exige auth kubernetes (bail Kubernetes)".into());
+                }
+            };
+            Some(Election::new(coord, le.identity()?, le.timings()))
+        }
+    };
     let ctl = Arc::new(Ctl::new(config, store, auth));
     // Garde-fou production : les labels des namespaces sont connus avant de servir un
-    // sidecar ou de réconcilier une ressource (spec §5.5.1).
-    if let Some(client) = &client {
-        crate::kube::load_namespaces(&ctl, client).await?;
+    // sidecar ou de réconcilier une ressource (spec §5.5.1). Avec élection, la prise de
+    // relais s'en charge.
+    if election.is_none() {
+        if let Some(client) = &client {
+            crate::kube::load_namespaces(&ctl, client).await?;
+        }
+        ctl.set_active(true);
     }
 
     let api_listener = TcpListener::bind(ctl.config.listen)
@@ -142,32 +226,40 @@ pub async fn start_with(
         tokio::spawn(serve(api_listener, api::router(ctl.clone()), tls)),
         tokio::spawn(serve(ui_listener, ui::router(ctl.clone()), None)),
     ];
-    tasks.push(tokio::spawn(maintenance(ctl.clone())));
-    if let Some(client) = client {
-        tasks.push(tokio::spawn(crate::kube::watch_namespaces(
-            ctl.clone(),
-            client.clone(),
-        )));
-        tasks.push(tokio::spawn(crate::kube::watch(
-            ctl.clone(),
-            client.clone(),
-        )));
-        tasks.push(tokio::spawn(crate::kube::publish_status(
-            ctl.clone(),
-            client,
-        )));
+    match &election {
+        // La passive n'a ni maintenance ni surveillance : la prise de relais les lance.
+        Some(e) => e.spawn(ctl.clone(), client),
+        None => {
+            tasks.push(tokio::spawn(maintenance(ctl.clone())));
+            if let Some(client) = client {
+                tasks.push(tokio::spawn(crate::kube::watch_namespaces(
+                    ctl.clone(),
+                    client.clone(),
+                )));
+                tasks.push(tokio::spawn(crate::kube::watch(
+                    ctl.clone(),
+                    client.clone(),
+                    None,
+                )));
+                tasks.push(tokio::spawn(crate::kube::publish_status(
+                    ctl.clone(),
+                    client,
+                )));
+            }
+        }
     }
-    tracing::info!(%api, %ui, tls = ctl.config.tls.is_some(), "contrôleur démarré");
+    tracing::info!(%api, %ui, tls = ctl.config.tls.is_some(), election = election.is_some(), "contrôleur démarré");
     Ok(Running {
         ctl,
         api,
         ui,
         tasks,
+        election,
     })
 }
 
 /// Passe de maintenance du support et des pods (spec §5.5.2), après chaque intervalle.
-async fn maintenance(ctl: Arc<Ctl>) {
+pub(crate) async fn maintenance(ctl: Arc<Ctl>) {
     loop {
         tokio::time::sleep(MAINTENANCE_INTERVAL).await;
         ctl.maintain().await;

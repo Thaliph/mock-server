@@ -1,5 +1,7 @@
 //! Métriques du contrôleur (spec §9.2b).
 
+use std::sync::atomic::AtomicU64;
+
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -35,6 +37,10 @@ pub struct Metrics {
     pub exemplars_bytes: Gauge,
     /// Exemples refusés : `count` (`max_exemplars_per_workload`), `bytes` (bornes en octets).
     pub exemplars_refused: Family<ReasonLabel, Counter>,
+    /// 1 pour la réplique active, 0 pour la passive (spec §5.5.4).
+    pub leader: Gauge,
+    /// Durée de la dernière prise de relais, en secondes.
+    pub takeover_seconds: Gauge<f64, AtomicU64>,
 }
 
 impl Default for Metrics {
@@ -49,6 +55,8 @@ impl Default for Metrics {
         let exemplars = Gauge::default();
         let exemplars_bytes = Gauge::default();
         let exemplars_refused = Family::<ReasonLabel, Counter>::default();
+        let leader = Gauge::default();
+        let takeover_seconds = Gauge::<f64, AtomicU64>::default();
         // Les deux raisons sont exposées dès le départ, à zéro.
         for reason in ["count", "bytes"] {
             let _ = exemplars_refused.get_or_create(&ReasonLabel {
@@ -100,6 +108,16 @@ impl Default for Metrics {
             "Taille sérialisée des exemples gardés, tous workloads",
             exemplars_bytes.clone(),
         );
+        registry.register(
+            "mimic_controller_leader",
+            "Réplique active (1) ou passive (0)",
+            leader.clone(),
+        );
+        registry.register(
+            "mimic_controller_takeover_seconds",
+            "Durée de la dernière prise de relais : rechargement de l'état persisté jusqu'à la marque",
+            takeover_seconds.clone(),
+        );
         Self {
             registry,
             segments,
@@ -111,6 +129,8 @@ impl Default for Metrics {
             exemplars,
             exemplars_bytes,
             exemplars_refused,
+            leader,
+            takeover_seconds,
         }
     }
 }

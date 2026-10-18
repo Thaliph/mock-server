@@ -351,13 +351,8 @@ async fn controller_get(client: kube::Client, path: &str) -> Result<Bytes, Strin
         .list(&ListParams::default().labels(CONTROLLER_SELECTOR))
         .await
         .map_err(|e| format!("pods du contrôleur: {e}"))?;
-    let running = list
-        .items
-        .iter()
-        .find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"));
-    let name = running
-        .and_then(|p| p.metadata.name.clone())
-        .ok_or_else(|| format!("aucun pod du contrôleur en marche dans {CONTROLLER_NAMESPACE}"))?;
+    let name = mimicctl::controller_pod(&list.items)
+        .map_err(|e| format!("{e} dans {CONTROLLER_NAMESPACE}"))?;
     let mut pf = pods
         .portforward(&name, &[UI_PORT])
         .await
