@@ -1,15 +1,20 @@
-//! Store des échanges : mémoire bornée, persistance JSONL locale optionnelle (spec §5.2 et §8).
+//! Store des échanges : mémoire bornée en nombre et en octets, persistance JSONL locale
+//! optionnelle (spec §5.2 et §8).
 //!
-//! Tout échange qui entre ici est déjà redacté.
+//! Tout échange qui entre ici est déjà redacté. Les bodies sont échantillonnés par
+//! (opération, code) avec un réservoir déterministe (`mimic_core::sample`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mimic_core::model::{Body, Direction, Exchange};
+use mimic_core::sample::{Offer, Reservoir, priority, sample_key};
+use prometheus_client::metrics::counter::Counter;
+
+use crate::journal::{Journal, JournalConfig};
 
 /// Provenance d'un échange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,53 +34,105 @@ pub enum Added {
     Duplicate,
 }
 
+/// Bornes du store.
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub max_exchanges: usize,
+    /// Bodies gardés par (opération, code).
+    pub samples: usize,
+    /// Budget en octets estimés (`Exchange::approx_bytes`).
+    pub max_bytes: usize,
+    /// Borne de la file de publication ; `None` sans partage : rien n'y est gardé.
+    pub share_backlog: Option<usize>,
+}
+
+impl Limits {
+    /// Bornes en nombre seulement, sans partage.
+    pub fn new(max_exchanges: usize, samples: usize) -> Self {
+        Self {
+            max_exchanges,
+            samples,
+            max_bytes: usize::MAX,
+            share_backlog: None,
+        }
+    }
+}
+
+/// Compteurs des retraits (`mimic_capture_dropped_total{reason}`).
+#[derive(Debug, Clone, Default)]
+pub struct Drops {
+    pub store_budget: Counter,
+    pub share_backlog: Counter,
+    pub local_backlog: Counter,
+}
+
 pub struct Store {
     inner: Mutex<Inner>,
+    limits: Limits,
+    drops: Drops,
+    journal: OnceLock<Journal>,
     version: AtomicU64,
     outbound_version: AtomicU64,
 }
 
-struct Inner {
-    list: VecDeque<(Exchange, Origin)>,
-    ids: HashSet<String>,
-    bodies: HashMap<String, usize>,
-    max: usize,
-    samples: usize,
-    local: usize,
-    peer: usize,
-    file: Option<BufWriter<File>>,
-    /// Échanges locaux pas encore publiés aux autres sidecars.
-    unshared: Vec<Exchange>,
+struct Entry {
+    e: Arc<Exchange>,
+    origin: Origin,
+    bytes: usize,
+    /// Part de `bytes` occupée par les bodies.
+    body_bytes: usize,
+    /// Place dans le réservoir (clé, priorité) tant que l'échange garde ses bodies.
+    sample: Option<(String, u64)>,
 }
 
-const LOCAL_FILE: &str = "local.jsonl";
+#[derive(Default)]
+struct Inner {
+    /// Échanges par numéro d'arrivée : le premier est le plus ancien.
+    list: BTreeMap<u64, Entry>,
+    next: u64,
+    ids: HashMap<String, u64>,
+    /// Réservoirs non vides, par clé d'échantillonnage.
+    samples: BTreeMap<String, Reservoir>,
+    /// Numéros des échanges qui gardent des bodies, du plus ancien au plus récent.
+    with_bodies: BTreeSet<u64>,
+    bytes: usize,
+    /// Octets des bodies gardés, au plus la moitié du budget.
+    body_bytes: usize,
+    local: usize,
+    peer: usize,
+    /// Échanges locaux pas encore publiés aux autres sidecars, avec leur taille.
+    unshared: VecDeque<(usize, Arc<Exchange>)>,
+    unshared_bytes: usize,
+}
 
 impl Store {
     pub fn new(max: usize, samples: usize) -> Self {
+        Self::with_limits(Limits::new(max, samples), Drops::default())
+    }
+
+    pub fn with_limits(limits: Limits, drops: Drops) -> Self {
         Self {
-            inner: Mutex::new(Inner {
-                list: VecDeque::new(),
-                ids: HashSet::new(),
-                bodies: HashMap::new(),
-                max,
-                samples,
-                local: 0,
-                peer: 0,
-                file: None,
-                unshared: vec![],
-            }),
+            inner: Mutex::new(Inner::default()),
+            limits,
+            drops,
+            journal: OnceLock::new(),
             version: AtomicU64::new(0),
             outbound_version: AtomicU64::new(0),
         }
     }
 
-    /// Ouvre le répertoire de persistance : recharge `local.jsonl`, puis y ajoute les nouveaux échanges.
-    pub fn persist_to(&self, dir: &Path) -> std::io::Result<usize> {
-        std::fs::create_dir_all(dir)?;
-        let path: PathBuf = dir.join(LOCAL_FILE);
+    /// Ouvre le répertoire de persistance : recharge les segments présents, du plus ancien au
+    /// plus récent, puis y journalise les nouveaux échanges locaux.
+    pub fn persist_to(&self, cfg: &JournalConfig) -> std::io::Result<usize> {
+        std::fs::create_dir_all(&cfg.dir)?;
+        let mut existing = crate::journal::segments(&cfg.dir)?;
+        let extra = existing.len().saturating_sub(cfg.max_segments);
+        for (_, old) in existing.drain(..extra) {
+            std::fs::remove_file(old)?;
+        }
         let mut loaded = 0;
-        if path.exists() {
-            for line in BufReader::new(File::open(&path)?).lines() {
+        for (_, path) in &existing {
+            for line in BufReader::new(File::open(path)?).lines() {
                 let line = line?;
                 if line.trim().is_empty() {
                     continue;
@@ -88,70 +145,133 @@ impl Store {
                 }
             }
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        self.lock().file = Some(BufWriter::new(file));
+        let journal = Journal::start(cfg, existing, self.drops.local_backlog.clone())?;
+        let _ = self.journal.set(journal);
         Ok(loaded)
+    }
+
+    /// Attend que le journal local ait écrit tout ce qui lui a été confié.
+    pub fn sync_journal(&self) {
+        if let Some(j) = self.journal.get() {
+            j.sync();
+        }
     }
 
     pub fn add(&self, e: Exchange, origin: Origin) -> Added {
         self.insert(e, origin, true)
     }
 
+    /// Vrai si un échange de cette clé et de cet identifiant garderait ses bodies : à vérifier
+    /// avant de décoder, parser et redacter un body qui serait jeté (spec §5.2).
+    pub fn wants_bodies(
+        &self,
+        direction: Direction,
+        authority: &str,
+        method: &str,
+        path: &str,
+        status: u16,
+        id: &str,
+    ) -> bool {
+        if self.limits.samples == 0 {
+            return false;
+        }
+        let key = sample_key(direction, authority, method, path, status);
+        let prio = priority(id);
+        let inner = self.lock();
+        inner
+            .samples
+            .get(&key)
+            .is_none_or(|r| r.admits(self.limits.samples, prio))
+    }
+
     fn insert(&self, mut e: Exchange, origin: Origin, persist: bool) -> Added {
-        let outbound = e.direction == Direction::Outbound;
-        {
-            let mut inner = self.lock();
-            if inner.ids.contains(&e.id) {
-                return Added::Duplicate;
-            }
-            let key = body_key(&e);
-            let has_body = has_body_any(&e);
-            let mut result = Added::Stored;
-            if has_body {
-                let samples = inner.samples;
-                let count = inner.bodies.entry(key).or_default();
-                if *count >= samples {
+        let mut inner = self.lock();
+        if inner.ids.contains_key(&e.id) {
+            return Added::Duplicate;
+        }
+        let mut outbound_changed = e.direction == Direction::Outbound;
+        let mut result = Added::Stored;
+        let mut sample = None;
+        if has_body_any(&e) {
+            let key = sample_key(e.direction, &e.authority, &e.method, &e.path, e.status);
+            let prio = priority(&e.id);
+            let reservoir = inner.samples.entry(key.clone()).or_default();
+            match reservoir.offer(self.limits.samples, prio, &e.id) {
+                Offer::Rejected => {
+                    if reservoir.is_empty() {
+                        inner.samples.remove(&key);
+                    }
                     strip_bodies(&mut e);
                     result = Added::StoredWithoutBodies;
-                } else {
-                    *count += 1;
                 }
-            }
-            if persist && origin == Origin::Local {
-                if let Some(f) = inner.file.as_mut()
-                    && let Ok(line) = serde_json::to_string(&e)
-                {
-                    let _ = writeln!(f, "{line}").and_then(|_| f.flush());
-                }
-                inner.unshared.push(e.clone());
-            }
-            inner.ids.insert(e.id.clone());
-            match origin {
-                Origin::Local => inner.local += 1,
-                Origin::Peer => inner.peer += 1,
-            }
-            inner.list.push_back((e, origin));
-            while inner.list.len() > inner.max {
-                if let Some((old, o)) = inner.list.pop_front() {
-                    inner.ids.remove(&old.id);
-                    if has_body_any(&old)
-                        && let Some(c) = inner.bodies.get_mut(&body_key(&old))
-                    {
-                        *c = c.saturating_sub(1);
-                    }
-                    match o {
-                        Origin::Local => inner.local -= 1,
-                        Origin::Peer => inner.peer -= 1,
+                Offer::Kept => sample = Some((key, prio)),
+                Offer::Replaced(old) => {
+                    sample = Some((key, prio));
+                    if let Some(seq) = inner.ids.get(&old).copied() {
+                        outbound_changed |= inner.strip(seq);
                     }
                 }
             }
-            drop(inner);
-            self.version.fetch_add(1, Ordering::SeqCst);
-            if outbound {
-                self.outbound_version.fetch_add(1, Ordering::SeqCst);
-            }
-            result
         }
+        let e = Arc::new(e);
+        let bytes = e.approx_bytes();
+        let body_bytes = e.req_body.kept_bytes() + e.resp_body.kept_bytes();
+        let local = persist && origin == Origin::Local;
+        if local && let Some(max) = self.limits.share_backlog {
+            inner.unshared_bytes += bytes;
+            inner.unshared.push_back((bytes, e.clone()));
+            inner.trim_unshared(max, &self.drops.share_backlog);
+        }
+        let seq = inner.next;
+        inner.next += 1;
+        if sample.is_some() {
+            inner.with_bodies.insert(seq);
+        }
+        inner.ids.insert(e.id.clone(), seq);
+        match origin {
+            Origin::Local => inner.local += 1,
+            Origin::Peer => inner.peer += 1,
+        }
+        inner.bytes += bytes;
+        inner.body_bytes += body_bytes;
+        let journal = (local && self.journal.get().is_some()).then(|| e.clone());
+        inner.list.insert(
+            seq,
+            Entry {
+                e,
+                origin,
+                bytes,
+                body_bytes,
+                sample,
+            },
+        );
+        while inner.list.len() > self.limits.max_exchanges {
+            outbound_changed |= inner.evict_oldest().unwrap_or(false);
+        }
+        // Budget en octets : les bodies en occupent au plus la moitié, retirés du plus ancien
+        // au plus récent ; au-delà du budget, les échanges les plus anciens sont évincés.
+        while inner.body_bytes > self.limits.max_bytes / 2
+            && let Some(seq) = inner.with_bodies.first().copied()
+        {
+            outbound_changed |= inner.strip(seq);
+            self.drops.store_budget.inc();
+        }
+        while inner.bytes > self.limits.max_bytes
+            && let Some(changed) = inner.evict_oldest()
+        {
+            outbound_changed |= changed;
+            self.drops.store_budget.inc();
+        }
+        drop(inner);
+        // Hors du verrou : le journal ne fait qu'une mise en file, sans I/O.
+        if let (Some(e), Some(j)) = (journal, self.journal.get()) {
+            j.append(e, bytes);
+        }
+        self.version.fetch_add(1, Ordering::SeqCst);
+        if outbound_changed {
+            self.outbound_version.fetch_add(1, Ordering::SeqCst);
+        }
+        result
     }
 
     /// Change à chaque ajout ou purge.
@@ -165,15 +285,19 @@ impl Store {
     }
 
     pub fn snapshot(&self) -> Vec<Exchange> {
-        self.lock().list.iter().map(|(e, _)| e.clone()).collect()
+        self.lock()
+            .list
+            .values()
+            .map(|en| Exchange::clone(&en.e))
+            .collect()
     }
 
     pub fn snapshot_direction(&self, direction: Direction) -> Vec<Exchange> {
         self.lock()
             .list
-            .iter()
-            .filter(|(e, _)| e.direction == direction)
-            .map(|(e, _)| e.clone())
+            .values()
+            .filter(|en| en.e.direction == direction)
+            .map(|en| Exchange::clone(&en.e))
             .collect()
     }
 
@@ -181,11 +305,11 @@ impl Store {
     pub fn recent(&self, direction: Option<Direction>, limit: usize) -> Vec<Exchange> {
         self.lock()
             .list
-            .iter()
+            .values()
             .rev()
-            .filter(|(e, _)| direction.is_none_or(|d| e.direction == d))
+            .filter(|en| direction.is_none_or(|d| en.e.direction == d))
             .take(limit)
-            .map(|(e, _)| e.clone())
+            .map(|en| Exchange::clone(&en.e))
             .collect()
     }
 
@@ -202,32 +326,58 @@ impl Store {
         self.len() == 0
     }
 
-    /// Récupère les échanges locaux à publier.
-    pub fn take_unshared(&self) -> Vec<Exchange> {
-        std::mem::take(&mut self.lock().unshared)
+    /// Octets estimés des échanges en mémoire.
+    pub fn bytes(&self) -> usize {
+        self.lock().bytes
     }
 
-    /// Remet des échanges en tête de la file de publication (publication échouée).
-    pub fn restore_unshared(&self, mut list: Vec<Exchange>) {
+    /// Couples (opération, code) qui ont encore au moins un exemple avec bodies.
+    pub fn sample_keys(&self) -> usize {
+        self.lock().samples.len()
+    }
+
+    /// Octets estimés de la file de publication.
+    pub fn unshared_bytes(&self) -> usize {
+        self.lock().unshared_bytes
+    }
+
+    /// Récupère les échanges locaux à publier.
+    pub fn take_unshared(&self) -> Vec<Exchange> {
         let mut inner = self.lock();
-        list.append(&mut inner.unshared);
-        inner.unshared = list;
+        inner.unshared_bytes = 0;
+        let list = std::mem::take(&mut inner.unshared);
+        drop(inner);
+        list.into_iter()
+            .map(|(_, e)| Arc::unwrap_or_clone(e))
+            .collect()
+    }
+
+    /// Remet des échanges en tête de la file de publication (publication échouée), sans
+    /// dépasser sa borne : les plus anciens sont jetés.
+    pub fn restore_unshared(&self, list: Vec<Exchange>) {
+        let Some(max) = self.limits.share_backlog else {
+            return;
+        };
+        let mut inner = self.lock();
+        for e in list.into_iter().rev() {
+            let bytes = e.approx_bytes();
+            inner.unshared_bytes += bytes;
+            inner.unshared.push_front((bytes, Arc::new(e)));
+        }
+        inner.trim_unshared(max, &self.drops.share_backlog);
     }
 
     pub fn clear(&self) {
         let mut inner = self.lock();
-        inner.list.clear();
-        inner.ids.clear();
-        inner.bodies.clear();
-        inner.unshared.clear();
-        inner.local = 0;
-        inner.peer = 0;
-        if let Some(f) = inner.file.as_mut() {
-            // Le fichier local est tronqué : la purge doit survivre au redémarrage.
-            let _ = f.flush();
-            let _ = f.get_ref().set_len(0);
-        }
+        *inner = Inner {
+            next: inner.next,
+            ..Inner::default()
+        };
         drop(inner);
+        // Les segments sont supprimés : la purge doit survivre au redémarrage.
+        if let Some(j) = self.journal.get() {
+            j.clear();
+        }
         self.version.fetch_add(1, Ordering::SeqCst);
         self.outbound_version.fetch_add(1, Ordering::SeqCst);
     }
@@ -237,11 +387,65 @@ impl Store {
     }
 }
 
-fn body_key(e: &Exchange) -> String {
-    format!(
-        "{:?}|{}|{}|{}|{}",
-        e.direction, e.authority, e.method, e.path, e.status
-    )
+impl Inner {
+    /// Retire les bodies d'un échange ; vrai s'il est sortant.
+    fn strip(&mut self, seq: u64) -> bool {
+        let Some(entry) = self.list.get_mut(&seq) else {
+            return false;
+        };
+        if let Some((key, prio)) = entry.sample.take() {
+            unsample(&mut self.samples, &key, prio, &entry.e.id);
+        }
+        self.with_bodies.remove(&seq);
+        match Arc::get_mut(&mut entry.e) {
+            Some(e) => strip_bodies(e),
+            // Encore en file (journal, partage) : copie sans bodies, l'original y reste.
+            None => entry.e = Arc::new(without_bodies(&entry.e)),
+        }
+        let bytes = entry.e.approx_bytes();
+        self.bytes = self.bytes - entry.bytes + bytes;
+        self.body_bytes -= entry.body_bytes;
+        entry.bytes = bytes;
+        entry.body_bytes = 0;
+        entry.e.direction == Direction::Outbound
+    }
+
+    /// Évince l'échange le plus ancien ; `Some(sortant)`, ou `None` si le store est vide.
+    fn evict_oldest(&mut self) -> Option<bool> {
+        let (seq, entry) = self.list.pop_first()?;
+        self.ids.remove(&entry.e.id);
+        self.with_bodies.remove(&seq);
+        if let Some((key, prio)) = &entry.sample {
+            unsample(&mut self.samples, key, *prio, &entry.e.id);
+        }
+        self.bytes -= entry.bytes;
+        self.body_bytes -= entry.body_bytes;
+        match entry.origin {
+            Origin::Local => self.local -= 1,
+            Origin::Peer => self.peer -= 1,
+        }
+        Some(entry.e.direction == Direction::Outbound)
+    }
+
+    fn trim_unshared(&mut self, max: usize, dropped: &Counter) {
+        while self.unshared_bytes > max {
+            let Some((bytes, _)) = self.unshared.pop_front() else {
+                break;
+            };
+            self.unshared_bytes -= bytes;
+            dropped.inc();
+        }
+    }
+}
+
+/// Retire un exemple de son réservoir, et le réservoir vidé de la map.
+fn unsample(samples: &mut BTreeMap<String, Reservoir>, key: &str, prio: u64, id: &str) {
+    if let Some(r) = samples.get_mut(key) {
+        r.remove(prio, id);
+        if r.is_empty() {
+            samples.remove(key);
+        }
+    }
 }
 
 fn has_body_any(e: &Exchange) -> bool {
@@ -249,14 +453,41 @@ fn has_body_any(e: &Exchange) -> bool {
         || matches!(e.resp_body, Body::Captured { .. } | Body::Truncated { .. })
 }
 
+fn skipped(b: &Body) -> Body {
+    match b {
+        Body::Captured { data } => Body::Skipped {
+            size: data.len() as u64,
+        },
+        Body::Truncated { size, .. } => Body::Skipped { size: *size },
+        other => other.clone(),
+    }
+}
+
 fn strip_bodies(e: &mut Exchange) {
-    for b in [&mut e.req_body, &mut e.resp_body] {
-        let size = match b {
-            Body::Captured { data } => data.len() as u64,
-            Body::Truncated { size, .. } => *size,
-            _ => continue,
-        };
-        *b = Body::Skipped { size };
+    e.req_body = skipped(&e.req_body);
+    e.resp_body = skipped(&e.resp_body);
+}
+
+/// Copie des métadonnées d'un échange, bodies remplacés par leur taille.
+fn without_bodies(e: &Exchange) -> Exchange {
+    Exchange {
+        id: e.id.clone(),
+        direction: e.direction,
+        started_at_ms: e.started_at_ms,
+        scheme: e.scheme.clone(),
+        authority: e.authority.clone(),
+        method: e.method.clone(),
+        path: e.path.clone(),
+        query: e.query.clone(),
+        req_headers: e.req_headers.clone(),
+        req_body: skipped(&e.req_body),
+        status: e.status,
+        resp_headers: e.resp_headers.clone(),
+        resp_body: skipped(&e.resp_body),
+        ttfb_us: e.ttfb_us,
+        total_us: e.total_us,
+        trace_id: e.trace_id.clone(),
+        redactions: e.redactions.clone(),
     }
 }
 
@@ -286,6 +517,20 @@ mod tests {
         }
     }
 
+    fn with_body(id: &str, size: usize) -> Exchange {
+        let mut e = ex(id, &format!("/{id}"));
+        e.resp_body = Body::captured(vec![b'x'; size]);
+        e
+    }
+
+    fn kept(s: &Store) -> BTreeSet<String> {
+        s.snapshot()
+            .into_iter()
+            .filter(|e| matches!(e.resp_body, Body::Captured { .. }))
+            .map(|e| e.id)
+            .collect()
+    }
+
     #[test]
     fn duplicates_are_ignored() {
         let s = Store::new(10, 10);
@@ -300,12 +545,7 @@ mod tests {
         for i in 0..4 {
             s.add(ex(&i.to_string(), "/a"), Origin::Local);
         }
-        let bodies = s
-            .snapshot()
-            .iter()
-            .filter(|e| matches!(e.resp_body, Body::Captured { .. }))
-            .count();
-        assert_eq!(bodies, 2);
+        assert_eq!(kept(&s).len(), 2);
         assert_eq!(s.len(), 4);
     }
 
@@ -321,14 +561,243 @@ mod tests {
     }
 
     #[test]
+    fn cap_01_identifiers_in_paths_count_for_one_operation() {
+        let s = Store::new(1000, 20);
+        for i in 0..100 {
+            s.add(
+                ex(&format!("api-0-{i}"), &format!("/users/{i}")),
+                Origin::Local,
+            );
+        }
+        assert_eq!(kept(&s).len(), 20);
+        assert_eq!(s.len(), 100);
+        assert_eq!(s.sample_keys(), 1);
+    }
+
+    #[test]
+    fn cap_02_same_exchanges_in_any_order_keep_the_same_bodies() {
+        let all: Vec<Exchange> = (0..100)
+            .map(|i| ex(&format!("api-0-{i}"), &format!("/users/{i}")))
+            .collect();
+        let (a, b) = (Store::new(1000, 20), Store::new(1000, 20));
+        for e in &all {
+            a.add(e.clone(), Origin::Local);
+        }
+        for e in all.iter().rev() {
+            b.add(e.clone(), Origin::Peer);
+        }
+        assert_eq!(kept(&a), kept(&b));
+        let first: BTreeSet<String> = all[..20].iter().map(|e| e.id.clone()).collect();
+        assert!(!kept(&a).is_subset(&first), "réservoir figé sur le warm-up");
+    }
+
+    #[test]
+    fn cap_03_bodies_are_wanted_only_if_the_reservoir_would_keep_them() {
+        let s = Store::new(100, 1);
+        let want = |id: &str| s.wants_bodies(Direction::Outbound, "a:80", "GET", "/u/9", 200, id);
+        assert!(want("first"));
+        s.add(ex("first", "/u/1"), Origin::Local);
+        let p = priority("first");
+        let ids: Vec<String> = (0..64).map(|i| format!("id-{i}")).collect();
+        let higher = ids.iter().find(|i| priority(i) > p).unwrap();
+        let lower = ids.iter().find(|i| priority(i) < p).unwrap();
+        assert!(!want(higher), "réservoir plein d'un exemple prioritaire");
+        assert!(want(lower));
+        assert!(
+            s.wants_bodies(Direction::Outbound, "a:80", "GET", "/u/9", 404, higher),
+            "autre code, autre réservoir"
+        );
+        let none = Store::new(100, 0);
+        assert!(!none.wants_bodies(Direction::Outbound, "a:80", "GET", "/u/9", 200, "x"));
+    }
+
+    #[test]
+    fn cap_04_sampling_counters_are_purged_with_their_last_example() {
+        let s = Store::new(10, 2);
+        for i in 0..1000 {
+            let mut e = ex(&format!("api-0-{i}"), "/users/1");
+            e.authority = format!("h{i}:80");
+            s.add(e, Origin::Local);
+        }
+        assert_eq!(s.len(), 10);
+        assert_eq!(s.sample_keys(), 10);
+        s.clear();
+        assert_eq!(s.sample_keys(), 0);
+    }
+
+    #[test]
+    fn cap_05_budget_strips_oldest_bodies_then_evicts_oldest_exchanges() {
+        // Bodies de 10 000 octets : deux tiennent dans la moitié du budget, pas trois.
+        let budget = 50_000;
+        let drops = Drops::default();
+        let s = Store::with_limits(
+            Limits {
+                max_bytes: budget,
+                ..Limits::new(1000, 1000)
+            },
+            drops.clone(),
+        );
+        for i in 0..3 {
+            s.add(with_body(&format!("{i:03}"), 10_000), Origin::Local);
+        }
+        assert_eq!(s.len(), 3, "bodies retirés avant tout échange");
+        assert_eq!(kept(&s), BTreeSet::from(["001".into(), "002".into()]));
+        assert_eq!(drops.store_budget.get(), 1);
+        for i in 3..300 {
+            s.add(with_body(&format!("{i:03}"), 10_000), Origin::Local);
+            assert!(s.bytes() <= budget);
+        }
+        assert!(
+            (10..300).contains(&s.len()),
+            "{} échanges : évincés au-delà du budget",
+            s.len()
+        );
+        let ids: Vec<String> = s.snapshot().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids.last().map(String::as_str), Some("299"));
+        assert_eq!(kept(&s), BTreeSet::from(["298".into(), "299".into()]));
+        assert!(drops.store_budget.get() > 298);
+    }
+
+    #[test]
+    fn shr_06_without_share_nothing_waits_for_publication() {
+        let s = Store::new(1000, 20);
+        for i in 0..100 {
+            s.add(ex(&i.to_string(), "/a"), Origin::Local);
+        }
+        assert_eq!(s.unshared_bytes(), 0);
+        assert!(s.take_unshared().is_empty());
+    }
+
+    #[test]
+    fn shr_07_share_backlog_is_bounded_and_keeps_the_newest() {
+        let one = ex("000", "/a").approx_bytes();
+        let max = 10 * one;
+        let drops = Drops::default();
+        let s = Store::with_limits(
+            Limits {
+                share_backlog: Some(max),
+                ..Limits::new(1000, 20)
+            },
+            drops.clone(),
+        );
+        for i in 0..100 {
+            s.add(ex(&format!("{i:03}"), "/a"), Origin::Local);
+            assert!(s.unshared_bytes() <= max);
+        }
+        // Les importés ne sont jamais republiés.
+        s.add(ex("peer", "/a"), Origin::Peer);
+        let pending = s.take_unshared();
+        let ids: Vec<&str> = pending.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids.len(), 10);
+        assert_eq!(ids.last(), Some(&"099"));
+        assert!(!ids.contains(&"000"));
+        // Publication échouée, puis du trafic : la file reste bornée, les plus récents gagnent.
+        s.restore_unshared(pending);
+        for i in 100..105 {
+            s.add(ex(&format!("{i:03}"), "/a"), Origin::Local);
+        }
+        assert!(s.unshared_bytes() <= max);
+        let ids: Vec<String> = s.take_unshared().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids.first().map(String::as_str), Some("095"));
+        assert_eq!(ids.last().map(String::as_str), Some("104"));
+        assert_eq!(drops.share_backlog.get(), 95);
+    }
+
+    fn journal(dir: &std::path::Path, segment_bytes: u64, max_segments: usize) -> JournalConfig {
+        JournalConfig::new(dir, segment_bytes, max_segments)
+    }
+
+    #[test]
     fn persistence_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
+        let cfg = journal(dir.path(), 1 << 20, 4);
         let s = Store::new(10, 10);
-        s.persist_to(dir.path()).unwrap();
+        s.persist_to(&cfg).unwrap();
         s.add(ex("1", "/a"), Origin::Local);
         s.add(ex("2", "/b"), Origin::Peer);
+        s.sync_journal();
         let t = Store::new(10, 10);
-        assert_eq!(t.persist_to(dir.path()).unwrap(), 1);
+        assert_eq!(t.persist_to(&cfg).unwrap(), 1);
         assert_eq!(t.snapshot()[0].id, "1");
+    }
+
+    #[test]
+    fn cap_06_local_journal_rotates_and_reloads_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = serde_json::to_vec(&ex("0000", "/a")).unwrap().len() as u64 + 1;
+        let cfg = journal(dir.path(), 10 * line, 3);
+        let s = Store::new(1000, 1000);
+        s.persist_to(&cfg).unwrap();
+        for i in 0..200 {
+            s.add(ex(&format!("{i:04}"), "/a"), Origin::Local);
+        }
+        s.sync_journal();
+        let files = crate::journal::segments(dir.path()).unwrap();
+        assert!(files.len() <= 3, "{files:?}");
+        for (_, f) in &files {
+            assert!(std::fs::metadata(f).unwrap().len() <= 11 * line);
+        }
+        let t = Store::new(1000, 1000);
+        let loaded = t.persist_to(&cfg).unwrap();
+        assert!(loaded > 0 && loaded <= 30, "{loaded} rechargés");
+        let ids: Vec<String> = t.snapshot().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids.last().map(String::as_str), Some("0199"));
+        assert!(!ids.contains(&"0000".to_string()));
+    }
+
+    #[test]
+    fn cap_06_clear_removes_the_local_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = journal(dir.path(), 1 << 20, 4);
+        let s = Store::new(10, 10);
+        s.persist_to(&cfg).unwrap();
+        s.add(ex("1", "/a"), Origin::Local);
+        s.clear();
+        s.add(ex("2", "/a"), Origin::Local);
+        s.sync_journal();
+        let t = Store::new(10, 10);
+        assert_eq!(t.persist_to(&cfg).unwrap(), 1);
+        assert_eq!(t.snapshot()[0].id, "2");
+    }
+
+    #[test]
+    fn cap_07_full_journal_never_blocks_and_counts_dropped_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = JournalConfig {
+            backlog_bytes: 0,
+            ..journal(dir.path(), 1 << 20, 4)
+        };
+        let drops = Drops::default();
+        let s = Store::with_limits(Limits::new(100, 10), drops.clone());
+        s.persist_to(&cfg).unwrap();
+        for i in 0..10 {
+            assert_eq!(
+                s.add(ex(&i.to_string(), "/a"), Origin::Local),
+                Added::Stored
+            );
+        }
+        assert_eq!(s.len(), 10);
+        assert_eq!(drops.local_backlog.get(), 10);
+    }
+
+    #[test]
+    fn cap_07_lines_reach_the_disk_without_explicit_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::new(10, 10);
+        s.persist_to(&journal(dir.path(), 1 << 20, 4)).unwrap();
+        s.add(ex("1", "/a"), Origin::Local);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let on_disk: usize = crate::journal::segments(dir.path())
+                .unwrap()
+                .iter()
+                .map(|(_, p)| std::fs::read_to_string(p).unwrap().lines().count())
+                .sum();
+            if on_disk == 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "ligne pas écrite");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

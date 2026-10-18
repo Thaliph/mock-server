@@ -211,6 +211,53 @@ async fn shr_05_unavailable_share_does_not_affect_traffic() {
 }
 
 #[tokio::test]
+async fn shr_06_without_share_nothing_waits_for_publication() {
+    let app = fake_server().await;
+    let a = proxy(config(Some(app.addr), Mode::Record)).await;
+    for i in 0..20 {
+        client()
+            .get(inbound(&a, &format!("/users/{i}")))
+            .send()
+            .await
+            .unwrap();
+    }
+    wait_exchanges(&a, "direction=inbound", 20).await;
+    assert_eq!(a.state().store.unshared_bytes(), 0);
+    assert!(a.state().store.take_unshared().is_empty());
+}
+
+#[tokio::test]
+async fn shr_07_unavailable_share_keeps_a_bounded_backlog() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let url = format!("file://{}/sub", file.path().display());
+    let app = fake_server().await;
+    let mut cfg = shared(Some(app.addr), Mode::Record, &url, "api-a", "api");
+    let max = 8 * 1024;
+    cfg.share.as_mut().unwrap().max_backlog_bytes = max;
+    let a = proxy(cfg).await;
+    for i in 0..100 {
+        let r = client()
+            .get(inbound(&a, &format!("/users/{i}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    wait_exchanges(&a, "direction=inbound&limit=1000", 100).await;
+    assert!(a.state().store.unshared_bytes() <= max);
+    let dropped = metric_value(
+        &metrics(&a).await,
+        r#"mimic_capture_dropped_total{reason="share_backlog"}"#,
+    )
+    .unwrap_or(0.0);
+    assert!(dropped > 0.0, "échanges jetés non comptés");
+    // Les plus récents restent à publier.
+    let pending = a.state().store.take_unshared();
+    assert!(pending.iter().any(|e| e.path == "/users/99"));
+    assert!(!pending.iter().any(|e| e.path == "/users/0"));
+}
+
+#[tokio::test]
 async fn sync_endpoint_reports_when_sharing_is_disabled() {
     let p = proxy(config(None, Mode::Record)).await;
     let r = client()
