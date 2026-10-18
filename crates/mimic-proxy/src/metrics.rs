@@ -1,7 +1,15 @@
 //! Métriques Prometheus (spec §9.3).
+//!
+//! Compter une requête n'alloue rien : les labels fixes sont des chaînes statiques, le code un
+//! entier, et l'authority une chaîne partagée (`Arc<str>`), résolue sous un verrou pris en
+//! lecture. Seule la première requête d'une série la crée.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use mimic_core::model::Direction;
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -17,85 +25,85 @@ const MAX_AUTHORITIES: usize = 100;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RequestLabels {
-    pub direction: String,
-    pub mode: String,
-    pub authority: String,
-    pub method: String,
-    pub status: String,
+    pub direction: &'static str,
+    pub mode: &'static str,
+    pub authority: Arc<str>,
+    pub method: Cow<'static, str>,
+    pub status: u16,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DurationLabels {
-    pub direction: String,
-    pub mode: String,
-    pub authority: String,
+    pub direction: &'static str,
+    pub mode: &'static str,
+    pub authority: Arc<str>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct UpstreamErrorLabels {
-    pub direction: String,
-    pub authority: String,
-    pub kind: String,
+    pub direction: &'static str,
+    pub authority: Arc<str>,
+    pub kind: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct MockLabels {
-    pub authority: String,
-    pub r#match: String,
+    pub authority: Arc<str>,
+    pub r#match: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct AuthorityLabel {
-    pub authority: String,
+    pub authority: Arc<str>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DiscoveryLabels {
-    pub direction: String,
-    pub authority: String,
+    pub direction: &'static str,
+    pub authority: Arc<str>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct OriginLabel {
-    pub origin: String,
+    pub origin: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ReasonLabel {
-    pub reason: String,
+    pub reason: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ResultLabel {
-    pub result: String,
+    pub result: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PassthroughLabels {
-    pub direction: String,
-    pub kind: String,
-    pub result: String,
+    pub direction: &'static str,
+    pub kind: &'static str,
+    pub result: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TlsFailureLabels {
-    pub authority: String,
-    pub reason: String,
+    pub authority: Arc<str>,
+    pub reason: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TriggerLabel {
-    pub trigger: String,
+    pub trigger: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DirectionLabel {
-    pub direction: String,
+    pub direction: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ModeLabel {
-    pub mode: String,
+    pub mode: &'static str,
 }
 
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
@@ -124,7 +132,8 @@ pub struct Metrics {
     pub passthrough: Family<PassthroughLabels, Counter>,
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
     pub websocket_connections: Family<DirectionLabel, Counter>,
-    authorities: Mutex<BTreeSet<String>>,
+    authorities: RwLock<BTreeSet<Arc<str>>>,
+    other: Arc<str>,
 }
 
 impl Metrics {
@@ -264,38 +273,125 @@ impl Metrics {
             passthrough,
             tls_handshake_failures,
             websocket_connections,
-            authorities: Mutex::new(BTreeSet::new()),
+            authorities: RwLock::new(BTreeSet::new()),
+            other: Arc::from("other"),
         }
     }
 
-    /// Valeur de label d'authority à cardinalité bornée.
-    pub fn authority(&self, authority: &str) -> String {
-        let mut seen = self.authorities.lock().expect("verrou des authorities");
-        if seen.contains(authority) {
-            return authority.to_string();
+    /// Valeur de label d'authority à cardinalité bornée. Une authority déjà vue est lue sous le
+    /// verrou pris en lecture, sans copie.
+    pub fn authority(&self, authority: &str) -> Arc<str> {
+        {
+            let seen = self.authorities.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(a) = seen.get(authority) {
+                return a.clone();
+            }
+            if seen.len() >= MAX_AUTHORITIES {
+                return self.other.clone();
+            }
+        }
+        let mut seen = self.authorities.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(a) = seen.get(authority) {
+            return a.clone();
         }
         if seen.len() >= MAX_AUTHORITIES {
-            return "other".to_string();
+            return self.other.clone();
         }
-        seen.insert(authority.to_string());
-        authority.to_string()
+        let a: Arc<str> = Arc::from(authority);
+        seen.insert(a.clone());
+        a
     }
 
     /// Compteur `mimic_capture_dropped_total` d'une raison.
-    pub fn dropped(&self, reason: &str) -> Counter {
+    pub fn dropped(&self, reason: &'static str) -> Counter {
         self.capture_dropped
-            .get_or_create(&ReasonLabel {
-                reason: reason.into(),
-            })
+            .get_or_create(&ReasonLabel { reason })
             .clone()
+    }
+
+    /// `mimic_requests_total` : une requête traitée.
+    pub fn count_request(
+        &self,
+        direction: Direction,
+        mode: Mode,
+        authority: &Arc<str>,
+        method: &str,
+        status: u16,
+    ) {
+        self.requests
+            .get_or_create(&RequestLabels {
+                direction: direction_label(direction),
+                mode: mode.as_str(),
+                authority: authority.clone(),
+                method: method_label(method),
+                status,
+            })
+            .inc();
+    }
+
+    /// `mimic_request_duration_seconds` : durée vue par l'appelant.
+    pub fn observe_duration(
+        &self,
+        direction: Direction,
+        mode: Mode,
+        authority: &Arc<str>,
+        d: Duration,
+    ) {
+        self.request_duration
+            .get_or_create(&DurationLabels {
+                direction: direction_label(direction),
+                mode: mode.as_str(),
+                authority: authority.clone(),
+            })
+            .observe(d.as_secs_f64());
+    }
+
+    /// `mimic_mock_responses_total` : réponse du mock, par type de correspondance.
+    pub fn count_mock(&self, authority: &Arc<str>, kind: &'static str) {
+        self.mock_responses
+            .get_or_create(&MockLabels {
+                authority: authority.clone(),
+                r#match: kind,
+            })
+            .inc();
+    }
+
+    /// `mimic_mock_injected_latency_seconds` : latence injectée par le mock.
+    pub fn observe_mock_latency(&self, authority: &Arc<str>, d: Duration) {
+        self.mock_latency
+            .get_or_create(&AuthorityLabel {
+                authority: authority.clone(),
+            })
+            .observe(d.as_secs_f64());
+    }
+
+    /// `mimic_upstream_errors_total` : échec de connexion (`connect`) ou de réponse (`request`).
+    pub fn count_upstream_error(
+        &self,
+        direction: Direction,
+        authority: &Arc<str>,
+        kind: &'static str,
+    ) {
+        self.upstream_errors
+            .get_or_create(&UpstreamErrorLabels {
+                direction: direction_label(direction),
+                authority: authority.clone(),
+                kind,
+            })
+            .inc();
+    }
+
+    /// `mimic_capture_dropped_total` : une capture abandonnée ou réduite.
+    pub fn count_dropped(&self, reason: &'static str) {
+        self.capture_dropped
+            .get_or_create(&ReasonLabel { reason })
+            .inc();
     }
 
     pub fn set_mode(&self, current: Mode) {
         for m in Mode::ALL {
             self.mode
-                .get_or_create(&ModeLabel {
-                    mode: m.as_str().into(),
-                })
+                .get_or_create(&ModeLabel { mode: m.as_str() })
                 .set(i64::from(m == current));
         }
     }
@@ -305,6 +401,25 @@ impl Metrics {
         prometheus_client::encoding::text::encode(&mut out, &self.registry)
             .expect("encodage des métriques");
         out
+    }
+}
+
+/// Label `direction`.
+pub fn direction_label(d: Direction) -> &'static str {
+    match d {
+        Direction::Inbound => "inbound",
+        Direction::Outbound => "outbound",
+    }
+}
+
+/// Label `method` : statique pour les méthodes standard, copié pour les autres.
+fn method_label(method: &str) -> Cow<'static, str> {
+    const STANDARD: [&str; 9] = [
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE",
+    ];
+    match STANDARD.iter().find(|m| **m == method) {
+        Some(m) => Cow::Borrowed(m),
+        None => Cow::Owned(method.to_string()),
     }
 }
 

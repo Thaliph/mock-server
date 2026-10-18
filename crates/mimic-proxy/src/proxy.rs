@@ -17,10 +17,7 @@ use tokio::sync::oneshot;
 use crate::capture::{Captured, TeeBody};
 use crate::config::{InboundCapture, Mode, Unmatched};
 use crate::engine::{MockSet, Trigger};
-use crate::metrics::{
-    AuthorityLabel, DirectionLabel, DurationLabels, MockLabels, ReasonLabel, RequestLabels,
-    UpstreamErrorLabels,
-};
+use crate::metrics::DirectionLabel;
 use crate::state::{AppState, BoxError, ProxyBody};
 use crate::store::{Added, Origin};
 
@@ -307,15 +304,10 @@ async fn forward(
             {
                 state.inbound_targets.forget(a.port());
             }
+            let kind = if e.is_connect() { "connect" } else { "request" };
             state
                 .metrics
-                .upstream_errors
-                .get_or_create(&UpstreamErrorLabels {
-                    direction: dir_str(direction).into(),
-                    authority: authority_label.clone(),
-                    kind: if e.is_connect() { "connect" } else { "request" }.into(),
-                })
-                .inc();
+                .count_upstream_error(direction, &authority_label, kind);
             count_request(&state, direction, mode, &authority_label, &method, 502);
             return text(StatusCode::BAD_GATEWAY, "mimic: amont injoignable");
         }
@@ -365,7 +357,7 @@ async fn forward(
             .metrics
             .websocket_connections
             .get_or_create(&DirectionLabel {
-                direction: dir_str(direction).into(),
+                direction: dir_str(direction),
             })
             .inc();
         let upstream_upgrade = resp_parts.extensions.remove::<OnUpgrade>();
@@ -482,7 +474,6 @@ fn record_websocket(state: &AppState, mut p: Pending, ended: Instant) {
         state.redactor.redact(&mut exchange);
         state.store.add(exchange, Origin::Local);
     }
-    state.refresh_store_metrics();
 }
 
 /// Identifiant de trace W3C tiré de `traceparent`.
@@ -501,7 +492,7 @@ struct Pending {
     ttfb: Duration,
     scheme: String,
     authority: String,
-    authority_label: String,
+    authority_label: Arc<str>,
     method: String,
     uri: Uri,
     req_headers: Vec<Header>,
@@ -576,7 +567,6 @@ async fn finalize(
     if state.store.add(exchange, Origin::Local) == Added::StoredWithoutBodies {
         dropped(&state, "sample_limit");
     }
-    state.refresh_store_metrics();
 }
 
 /// Échange réduit à ses métadonnées : rien n'est décodé, redacté, journalisé ni publié ; il
@@ -602,7 +592,6 @@ fn record_metadata(state: &AppState, p: Pending, req: Captured, resp: Captured, 
         redactions: vec![],
     };
     state.store.add_ephemeral(exchange);
-    state.refresh_store_metrics();
 }
 
 async fn serve_mock(
@@ -658,11 +647,7 @@ async fn serve_mock(
             let latency = Duration::from_micros(r.latency_us);
             state
                 .metrics
-                .mock_latency
-                .get_or_create(&AuthorityLabel {
-                    authority: authority_label.clone(),
-                })
-                .observe(latency.as_secs_f64());
+                .observe_mock_latency(&authority_label, latency);
             // Réponse prête avant l'attente : sa préparation est prise sur la latence.
             let response = mock_response(&state, &set, &r);
             count_request(
@@ -786,13 +771,7 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
                 }
                 state
                     .metrics
-                    .upstream_errors
-                    .get_or_create(&UpstreamErrorLabels {
-                        direction: "outbound".into(),
-                        authority: label,
-                        kind: "connect".into(),
-                    })
-                    .inc();
+                    .count_upstream_error(Direction::Outbound, &label, "connect");
             }
         }
     });
@@ -924,14 +903,19 @@ pub async fn tunnel(
     let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
 }
 
-fn count_tunnel(state: &AppState, inbound: bool, protocol: crate::net::Protocol, result: &str) {
+fn count_tunnel(
+    state: &AppState,
+    inbound: bool,
+    protocol: crate::net::Protocol,
+    result: &'static str,
+) {
     state
         .metrics
         .passthrough
         .get_or_create(&crate::metrics::PassthroughLabels {
-            direction: if inbound { "inbound" } else { "outbound" }.into(),
-            kind: protocol.as_str().into(),
-            result: result.into(),
+            direction: if inbound { "inbound" } else { "outbound" },
+            kind: protocol.as_str(),
+            result,
         })
         .inc();
 }
@@ -953,67 +937,37 @@ fn count_request(
     state: &AppState,
     direction: Direction,
     mode: Mode,
-    authority: &str,
+    authority: &Arc<str>,
     method: &str,
     status: u16,
 ) {
     state
         .metrics
-        .requests
-        .get_or_create(&RequestLabels {
-            direction: dir_str(direction).into(),
-            mode: mode.as_str().into(),
-            authority: authority.into(),
-            method: method.into(),
-            status: status.to_string(),
-        })
-        .inc();
+        .count_request(direction, mode, authority, method, status);
 }
 
 fn observe_duration(
     state: &AppState,
     direction: Direction,
     mode: Mode,
-    authority: &str,
+    authority: &Arc<str>,
     d: Duration,
 ) {
     state
         .metrics
-        .request_duration
-        .get_or_create(&DurationLabels {
-            direction: dir_str(direction).into(),
-            mode: mode.as_str().into(),
-            authority: authority.into(),
-        })
-        .observe(d.as_secs_f64());
+        .observe_duration(direction, mode, authority, d);
 }
 
-fn mock_metric(state: &AppState, authority: &str, kind: &str) {
-    state
-        .metrics
-        .mock_responses
-        .get_or_create(&MockLabels {
-            authority: authority.into(),
-            r#match: kind.into(),
-        })
-        .inc();
+fn mock_metric(state: &AppState, authority: &Arc<str>, kind: &'static str) {
+    state.metrics.count_mock(authority, kind);
 }
 
-fn dropped(state: &AppState, reason: &str) {
-    state
-        .metrics
-        .capture_dropped
-        .get_or_create(&ReasonLabel {
-            reason: reason.into(),
-        })
-        .inc();
+fn dropped(state: &AppState, reason: &'static str) {
+    state.metrics.count_dropped(reason);
 }
 
 pub fn dir_str(d: Direction) -> &'static str {
-    match d {
-        Direction::Inbound => "inbound",
-        Direction::Outbound => "outbound",
-    }
+    crate::metrics::direction_label(d)
 }
 
 fn now_ms() -> u64 {

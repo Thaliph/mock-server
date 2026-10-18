@@ -210,7 +210,7 @@ impl AppState {
         self.metrics
             .mock_engine_builds
             .get_or_create(&TriggerLabel {
-                trigger: trigger.as_str().into(),
+                trigger: trigger.as_str(),
             })
             .inc();
         set

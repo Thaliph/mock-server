@@ -238,7 +238,7 @@ pub(crate) async fn tls_serve<IO>(
                 .tls_handshake_failures
                 .get_or_create(&metrics::TlsFailureLabels {
                     authority: label,
-                    reason: "client_rejected".into(),
+                    reason: "client_rejected",
                 })
                 .inc();
         }
