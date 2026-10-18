@@ -126,7 +126,7 @@ fn ctl_16_snapshot_keeps_the_replayable_version_of_an_exchange() {
         vec![full.clone(), stripped.clone()],
     ] {
         let s = build(list, &SnapshotOptions::default());
-        assert_eq!(s.exchanges, [full.clone()]);
+        assert_eq!(s.exchanges, std::slice::from_ref(&full));
     }
 }
 

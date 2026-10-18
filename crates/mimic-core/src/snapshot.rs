@@ -34,8 +34,10 @@ pub fn build<E: Borrow<Exchange>>(
     exchanges: impl IntoIterator<Item = E>,
     opts: &SnapshotOptions,
 ) -> Snapshot {
-    // Tri total : date, identifiant, puis contenu sérialisé pour départager deux versions d'un
-    // même id. La sérialisation n'est faite qu'en cas d'égalité, rare.
+    // Tri total : date, identifiant, puis, pour départager deux versions d'un même id, la
+    // version rejouable d'abord (un exemple par endpoint garde son body quand la mémoire l'a
+    // retiré, §5.5.3), enfin le contenu sérialisé. La sérialisation n'est faite qu'en cas
+    // d'égalité, rare. Le premier de chaque id est gardé.
     let mut keyed: Vec<E> = exchanges
         .into_iter()
         .filter(|e| {
@@ -47,6 +49,11 @@ pub fn build<E: Borrow<Exchange>>(
         let (a, b) = (a.borrow(), b.borrow());
         (a.started_at_ms, &a.id)
             .cmp(&(b.started_at_ms, &b.id))
+            .then_with(|| {
+                b.resp_body
+                    .is_replayable()
+                    .cmp(&a.resp_body.is_replayable())
+            })
             .then_with(|| {
                 let line = |e: &Exchange| serde_json::to_string(e).unwrap_or_default();
                 line(a).cmp(&line(b))
