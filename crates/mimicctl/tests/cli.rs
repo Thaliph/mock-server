@@ -263,6 +263,32 @@ fn cli_07_capture_inbound_option() {
 }
 
 #[test]
+fn cli_08_mock_websocket_option() {
+    let opts = ModeOptions {
+        mock_websocket: Some("refuse".into()),
+        ..ModeOptions::default()
+    };
+    let mw = workload_apply_with("shop", "checkout", "mock", &opts).unwrap();
+    let v = serde_json::to_value(&mw).unwrap();
+    assert_eq!(
+        v["spec"],
+        json!({"mode": "mock", "mock": {"websocket": "refuse"}})
+    );
+    let bad = ModeOptions {
+        mock_websocket: Some("drop".into()),
+        ..ModeOptions::default()
+    };
+    let err = workload_apply_with("shop", "checkout", "mock", &bad).unwrap_err();
+    for w in ["relay", "refuse"] {
+        assert!(err.contains(w), "{err}");
+    }
+    // Sans l'option, pas de spec.mock : l'apply la retire.
+    let mw = workload_apply_with("shop", "checkout", "mock", &ModeOptions::default()).unwrap();
+    let v = serde_json::to_value(&mw).unwrap();
+    assert!(v["spec"].get("mock").is_none(), "{v}");
+}
+
+#[test]
 fn cli_07_selector_option_and_refused_status() {
     let opts = ModeOptions {
         selector: Some("pod-template-hash=7d9f,track=green".into()),

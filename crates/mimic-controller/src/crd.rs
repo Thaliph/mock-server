@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub const MODES: &[&str] = &["passthrough", "record", "mock", "mock-partial"];
 /// Captures de l'entrant (spec §5.2).
 pub const INBOUND_CAPTURES: &[&str] = &["full", "metadata", "off"];
+/// Traitements d'une poignée de main WebSocket sortante en mock (spec §3.4).
+pub const MOCK_WEBSOCKETS: &[&str] = &["relay", "refuse"];
 
 #[derive(CustomResource, Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[kube(
@@ -37,6 +39,9 @@ pub struct MimicWorkloadSpec {
     /// Capture imposée aux sidecars ; absente, chacun garde celle de sa configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CaptureSpec>,
+    /// Réglages du mock imposés aux sidecars ; absents, chacun garde ceux de sa configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mock: Option<MockSpec>,
 }
 
 /// Label selector Kubernetes : `matchLabels` et `matchExpressions`, combinés par un ET.
@@ -90,6 +95,19 @@ pub struct CaptureSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "capture_schema")]
     pub inbound: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MockSpec {
+    /// Poignée de main WebSocket sortante en mock : `relay` (relayée vers la dépendance) ou
+    /// `refuse` (réponse `503` sans joindre la dépendance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "mock_websocket_schema")]
+    pub websocket: Option<String>,
+}
+
+fn mock_websocket_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "type": "string", "enum": MOCK_WEBSOCKETS })
 }
 
 fn capture_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {

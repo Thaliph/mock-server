@@ -16,6 +16,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P2 | Moteur de mock (`mimic-core::mock`) | fait |
 | P3 | Proxy `mimic-proxy` : record, mock, page d'admin, métriques | fait |
 | P3b | Partage entre sidecars d'un workload | fait |
+| P3g | WebSocket en mock réglable : `mock.websocket: relay` (défaut) ou `refuse` (`503` sans joindre la dépendance), par la configuration, la `MimicWorkload` et `mimicctl mode --mock-websocket` | fait (étape kind E2E-07 ajoutée, jouée par la CI) |
 | P4 | `mimic-init` (iptables), détection de protocole, image, manifests | fait |
 | P5 | Interception TLS sortante | fait |
 | P6 | Contrôleur, CRD `MimicWorkload`, snapshots, authentification, rejeu k6 | fait (non validé sur un vrai cluster) |

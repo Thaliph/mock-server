@@ -47,6 +47,19 @@ spec:
                     - off
                     type: string
                 type: object
+              mock:
+                description: Réglages du mock imposés aux sidecars ; absents, chacun garde ceux de sa configuration.
+                nullable: true
+                properties:
+                  websocket:
+                    description: |-
+                      Poignée de main WebSocket sortante en mock : `relay` (relayée vers la dépendance) ou
+                      `refuse` (réponse `503` sans joindre la dépendance).
+                    enum:
+                    - relay
+                    - refuse
+                    type: string
+                type: object
               mode:
                 description: Mode souhaité pour tous les pods du workload.
                 enum:

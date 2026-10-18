@@ -420,6 +420,50 @@ async fn crd_09_capture_from_the_workload_reaches_the_sidecar() {
     .await;
 }
 
+/// Le refus des WebSockets en mock imposé par la ressource atteint le sidecar : il
+/// l'applique, l'annonce, et revient à sa configuration sans `spec.mock` (spec §3.4, §5.5.1).
+#[tokio::test]
+async fn prx_17_websocket_refusal_from_the_workload_reaches_the_sidecar() {
+    use common::ws::{echo_and_close, echo_server, outbound_refused, outbound_ws};
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let server = echo_server().await;
+    let a = proxy(piloted(Some(server.addr), &ctl, dir.path(), "api-a")).await;
+    assert_eq!(status(&a).await["mock_websocket"], "relay");
+    let spec = |websocket: Option<&str>| MimicWorkloadSpec {
+        mode: "mock".into(),
+        mock: websocket.map(|w| mimic_controller::crd::MockSpec {
+            websocket: Some(w.into()),
+        }),
+        ..MimicWorkloadSpec::default()
+    };
+    ctl.apply_spec("ns", "api", Some(spec(Some("refuse"))))
+        .await;
+    eventually("refus appliqué en mock", || async {
+        let s = status(&a).await;
+        s["mode"] == "mock" && s["mock_websocket"] == "refuse"
+    })
+    .await;
+    eventually("pod aligné", || async {
+        let wl = ui_json(&ctl, "/v1/workloads").await;
+        wl[0]["aligned"] == 1 && wl[0]["ready"] == true
+    })
+    .await;
+    let (head, _) = outbound_refused(&a, &server, "/ws").await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert_eq!(server.accepted(), 0, "dépendance jointe");
+
+    // Plus de réglage imposé : celui de la configuration, le relais.
+    ctl.apply_spec("ns", "api", Some(spec(None))).await;
+    eventually("relais rétabli", || async {
+        status(&a).await["mock_websocket"] == "relay"
+    })
+    .await;
+    let (ws, _) = outbound_ws(&a, &server, "/ws", &[]).await;
+    echo_and_close(ws, Duration::ZERO).await;
+    assert_eq!(server.connections(), 1);
+}
+
 #[tokio::test]
 async fn sidecar_restarts_in_the_last_desired_state() {
     let dir = tempfile::tempdir().unwrap();

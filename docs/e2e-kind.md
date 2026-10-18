@@ -70,6 +70,18 @@ Relancer sans reconstruire : `SKIP_BUILD=1 ./scripts/e2e-kind.sh`. La démo est 
    retour en record.
 6. **Mock de shipping** : `mimicctl mode shipping mock`, quote est arrêté, et 40 devis
    doivent encore réussir ; retour en record, 10 devis de plus.
+7. **Garde-fou production** (E2E-04) : dans un namespace labellisé `env=production`, le mock
+   est refusé par le contrôleur, par `mimicctl` et par la politique d'admission.
+8. **WebSocket en mock** (E2E-07, `tests/e2e/websocket.yaml`) : `ws-echo`, un petit serveur
+   WebSocket non injecté (bibliothèque standard Python, sur l'image de recommendation de la
+   démo, déjà présente), compte les connexions et poignées de main reçues (`GET /count`) ;
+   `ws-client`, un pod curl injecté, l'appelle à travers son sidecar. En `mock` avec
+   `relay` (défaut), la poignée de main aboutit (`101`) et `ws-echo` la compte. Puis
+   `tests/e2e/websocket-egress.yaml` coupe la sortie de `ws-client` (seuls le DNS et le
+   contrôleur restent joignables) et `mimicctl mode ws-client mock --mock-websocket refuse` :
+   la poignée de main reçoit le `503` du sidecar (`x-mimic-websocket: refused`), `ws-echo` ne
+   voit aucune nouvelle connexion et `mimic_websocket_connections_total{result="refused"}`
+   augmente. Les ressources de l'étape sont ensuite supprimées.
 
 En CI, le rapport et le bilan du mock sont ajoutés au résumé du job et imprimés dans le log
 (groupe « rapport de découverte »), et `REPORT_DIR` est publié en artefact `e2e-report`.

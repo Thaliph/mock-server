@@ -180,6 +180,8 @@ struct Heartbeat {
     snapshot: Option<String>,
     #[serde(default)]
     capture_inbound: Option<String>,
+    #[serde(default)]
+    mock_websocket: Option<String>,
 }
 
 async fn heartbeat(
@@ -201,6 +203,7 @@ async fn heartbeat(
                 mode: hb.mode,
                 snapshot: hb.snapshot,
                 capture_inbound: hb.capture_inbound,
+                mock_websocket: hb.mock_websocket,
             },
             id.labels,
         )

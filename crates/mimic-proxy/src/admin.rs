@@ -128,6 +128,7 @@ fn status(state: &AppState) -> Value {
     json!({
         "mode": state.mode().as_str(),
         "capture_inbound": state.inbound_capture().as_str(),
+        "mock_websocket": state.mock_websocket().as_str(),
         "instance": state.config.instance,
         "workload": {
             "namespace": state.config.workload.namespace,

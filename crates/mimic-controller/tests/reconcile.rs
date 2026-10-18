@@ -288,6 +288,7 @@ fn crd_09_capture_inbound_is_part_of_the_desired_state() {
         mode: "mock".into(),
         snapshot: Some(ID.into()),
         capture_inbound: capture.map(Into::into),
+        ..PodReport::default()
     };
     let now = 100_000;
     assert_eq!(
@@ -389,4 +390,90 @@ fn crd_08_selector_limits_the_desired_state_to_selected_pods() {
     // de ne compter que les pods sélectionnés.
     let s = summarize(&[PodState::Aligned], None);
     assert_eq!((s.pods, s.aligned, s.ready), (1, 1, true));
+}
+
+#[test]
+fn crd_10_mock_websocket_is_part_of_the_desired_state() {
+    use mimic_controller::crd::MockSpec;
+    let with = |mode: &str, websocket: &str| MimicWorkloadSpec {
+        mock: Some(MockSpec {
+            websocket: Some(websocket.into()),
+        }),
+        ..spec(mode, Some(ID))
+    };
+    let o = reconcile(Some(&with("mock", "refuse")), &Desired::default(), &|_| {
+        true
+    });
+    assert_eq!(o.desired.mock_websocket.as_deref(), Some("refuse"));
+    assert_eq!(o.desired.mode.as_deref(), Some("mock"));
+    assert_eq!(o.error, None);
+    // En record aussi le réglage est transmis : il ne prend effet qu'en mock.
+    let mut r = with("record", "refuse");
+    r.snapshot = None;
+    let o = reconcile(Some(&r), &Desired::default(), &|_| true);
+    assert_eq!(o.desired.mock_websocket.as_deref(), Some("refuse"));
+    // Valeur inconnue : état souhaité inchangé, raison InvalidMock.
+    let previous = desired("record", None);
+    let o = reconcile(Some(&with("mock", "drop")), &previous, &|_| true);
+    assert_eq!(o.desired, previous);
+    assert_eq!(o.error.as_deref(), Some("InvalidMock"));
+    // Sans spec.mock, aucun réglage imposé.
+    let o = reconcile(Some(&spec("mock", Some(ID))), &Desired::default(), &|_| {
+        true
+    });
+    assert_eq!(o.desired.mock_websocket, None);
+
+    // Passer de relay à refuse sans quitter le mock garde le snapshot courant.
+    let current = Desired {
+        mock_websocket: Some("relay".into()),
+        ..desired("mock", Some(ID))
+    };
+    let mut unpinned = with("mock", "refuse");
+    unpinned.snapshot = None;
+    let o = reconcile(Some(&unpinned), &current, &|id| id == ID);
+    assert_eq!(o.action, Action::None);
+    assert_eq!(o.desired.snapshot.as_deref(), Some(ID));
+    assert_eq!(o.desired.mock_websocket.as_deref(), Some("refuse"));
+
+    // Alignement : le réglage imposé doit être appliqué.
+    let want = Desired {
+        mock_websocket: Some("refuse".into()),
+        ..desired("mock", Some(ID))
+    };
+    let report = |websocket: Option<&str>| PodReport {
+        mode: "mock".into(),
+        snapshot: Some(ID.into()),
+        mock_websocket: websocket.map(Into::into),
+        ..PodReport::default()
+    };
+    let now = 100_000;
+    assert_eq!(
+        pod_state(&report(Some("relay")), now, now, 30_000, &want),
+        PodState::Diverging
+    );
+    assert_eq!(
+        pod_state(&report(None), now, now, 30_000, &want),
+        PodState::Diverging,
+        "sidecar d'une version antérieure, qui n'annonce pas le réglage"
+    );
+    assert_eq!(
+        pod_state(&report(Some("refuse")), now, now, 30_000, &want),
+        PodState::Aligned
+    );
+    // Sans réglage imposé, celui du pod est libre.
+    assert_eq!(
+        pod_state(
+            &report(Some("relay")),
+            now,
+            now,
+            30_000,
+            &desired("mock", Some(ID))
+        ),
+        PodState::Aligned
+    );
+    // Le pod sélectionné reçoit le réglage, qui voyage dans la réponse au battement.
+    let pod = desired_for_pod(&want, &labels(&[]));
+    assert_eq!(pod.mock_websocket.as_deref(), Some("refuse"));
+    let json = serde_json::to_value(&pod).unwrap();
+    assert_eq!(json["mock_websocket"], "refuse");
 }

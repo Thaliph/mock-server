@@ -116,3 +116,20 @@ fn ctl_21_retention_defaults_to_24_hours() {
     let config: ControllerConfig = serde_yaml::from_str(text).unwrap();
     assert_eq!(config.retention, day);
 }
+
+/// Le schéma de la CRD livrée n'accepte que `relay` et `refuse` pour `spec.mock.websocket`
+/// (CRD-10).
+#[test]
+fn crd_10_schema_restricts_mock_websocket() {
+    let crd = docs(include_str!("../../../deploy/controller/crd.yaml"));
+    let schema = &crd[0]["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+    let websocket = &schema["properties"]["spec"]["properties"]["mock"]["properties"]["websocket"];
+    let values: Vec<&str> = websocket["enum"]
+        .as_sequence()
+        .expect("enum de spec.mock.websocket")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(values, ["relay", "refuse"]);
+    assert_eq!(mimic_controller::crd::MOCK_WEBSOCKETS, ["relay", "refuse"]);
+}
