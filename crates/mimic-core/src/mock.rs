@@ -281,7 +281,9 @@ impl MockEngine {
         let mut len = 0;
         for r in exchanges {
             let e = r.exchange();
-            if e.direction != Direction::Outbound || e.status == 0 {
+            // Un `1xx` n'est pas une réponse finale : une poignée de main WebSocket (`101`) n'a
+            // pas de réponse rejouable et sa durée est celle de la connexion (spec §5.3).
+            if e.direction != Direction::Outbound || e.status < 200 {
                 continue;
             }
             len += 1;

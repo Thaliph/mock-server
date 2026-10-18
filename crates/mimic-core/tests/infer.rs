@@ -3,7 +3,7 @@
 mod common;
 
 use common::{ExchangeExt, exchange, openapi_violations, sequence};
-use mimic_core::infer::{InferOptions, infer, infer_outbound};
+use mimic_core::infer::{EnumRules, InferOptions, infer, infer_outbound};
 use mimic_core::model::{Direction, Exchange};
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -109,6 +109,73 @@ fn inf_06b_enum_needs_enough_observations() {
     let doc = doc(exchanges);
     let status = &response_schema(&doc, "/order", "get", "200")["properties"]["status"];
     assert!(status.get("enum").is_none(), "{status}");
+}
+
+/// Une chaîne ne devient `enum` que si l'échantillon le justifie (§6.3) : la démo déclarait
+/// `name` ∈ `user0`…`user6`, ce qui rendait le contrat faux.
+#[test]
+fn inf_09_enum_only_on_a_sufficient_sample() {
+    let mut exchanges = vec![];
+    for i in 0..60 {
+        let id = i % 7;
+        exchanges.push(
+            exchange("GET", &format!("/users/{id}"))
+                .resp_json(json!({"id": id, "name": format!("user{id}")})),
+        );
+    }
+    let states = ["paid", "pending", "shipped"];
+    for i in 0..20 {
+        exchanges.push(exchange("GET", "/orders").resp_json(json!({"status": states[i % 3]})));
+    }
+    for i in 0..30 {
+        let kind = match i {
+            0 => "video",
+            _ if i % 2 == 0 => "book",
+            _ => "music",
+        };
+        exchanges.push(exchange("GET", "/kinds").resp_json(json!({"kind": kind})));
+    }
+    let tiers = ["gold", "silver"];
+    for i in 0..19 {
+        exchanges.push(exchange("GET", "/tiers").resp_json(json!({"tier": tiers[i % 2]})));
+    }
+    for _ in 0..25 {
+        exchanges.push(exchange("GET", "/plans").resp_json(json!({"plan": "basic"})));
+    }
+    let exchanges = sequence(exchanges);
+    let field = |doc: &Value, path: &str, name: &str| {
+        response_schema(doc, path, "get", "200")["properties"][name].clone()
+    };
+
+    let doc = infer(&exchanges, &InferOptions::new("svc", "0.0.0"));
+    assert_eq!(
+        field(&doc, "/orders", "status")["enum"],
+        json!(["paid", "pending", "shipped"])
+    );
+    for (path, name) in [
+        ("/users/{userId}", "name"),
+        ("/kinds", "kind"),
+        ("/tiers", "tier"),
+        ("/plans", "plan"),
+    ] {
+        let schema = field(&doc, path, name);
+        assert_eq!(schema, json!({"type": "string"}), "{path} {name}");
+    }
+
+    // Seuils réglables dans les options d'inférence.
+    let rules = EnumRules {
+        min_observations: 10,
+        ..EnumRules::default()
+    };
+    let doc = infer(&exchanges, &InferOptions::new("svc", "0.0.0").enums(rules));
+    assert_eq!(
+        field(&doc, "/tiers", "tier")["enum"],
+        json!(["gold", "silver"])
+    );
+    assert_eq!(
+        field(&doc, "/users/{userId}", "name"),
+        json!({"type": "string"})
+    );
 }
 
 #[test]

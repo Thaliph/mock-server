@@ -445,3 +445,27 @@ fn mck_14_engine_is_shared_between_threads() {
         "{per:?}"
     );
 }
+
+/// Poignée de main WebSocket enregistrée : ni rejouable, ni dans la distribution de latence
+/// (spec §3.4 et §5.3).
+#[test]
+fn mck_19_websocket_handshake_is_never_replayed() {
+    let mut handshake = out("GET", "/ws").status(101).latency_ms(60_000);
+    handshake.resp_body = Body::Empty;
+    let ok = out("GET", "/ws")
+        .resp_json(json!({"ok": true}))
+        .latency_ms(10);
+
+    let m = engine(vec![handshake.clone(), ok], MockConfig::default());
+    assert_eq!(m.len(), 1);
+    assert_eq!(m.replayable(), 1);
+    for _ in 0..50 {
+        let r = matched(m.respond(&req("GET", "/ws")));
+        assert_eq!(r.status, 200);
+        assert_eq!(r.latency_us, 10_000);
+    }
+
+    let m = engine(vec![handshake], MockConfig::default());
+    assert!(m.is_empty());
+    assert_eq!(m.respond(&req("GET", "/ws")), MockDecision::Unmatched);
+}

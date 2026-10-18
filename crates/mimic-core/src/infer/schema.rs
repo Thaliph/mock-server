@@ -7,10 +7,27 @@ use serde_json::{Map, Value, json};
 use super::path::{is_iso_date, is_uuid};
 use crate::redact::is_email;
 
-/// Au plus ce nombre de valeurs distinctes pour produire un `enum`.
-pub const ENUM_MAX_VALUES: usize = 10;
-/// Nombre minimal d'observations d'une chaîne pour produire un `enum`.
-pub const ENUM_MIN_OBSERVATIONS: u64 = 30;
+/// Conditions pour déclarer une chaîne comme `enum` (spec §6.3). Un `enum` ferme le contrat :
+/// il n'est produit que si l'échantillon est assez grand pour le justifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumRules {
+    /// Nombre minimal d'observations de la chaîne.
+    pub min_observations: u64,
+    /// Nombre minimal d'observations de chaque valeur.
+    pub min_value_count: u64,
+    /// Nombre maximal de valeurs distinctes.
+    pub max_values: usize,
+}
+
+impl Default for EnumRules {
+    fn default() -> Self {
+        Self {
+            min_observations: 20,
+            min_value_count: 2,
+            max_values: 10,
+        }
+    }
+}
 
 const FORMATS: [&str; 6] = ["date-time", "date", "uuid", "email", "uri", "ipv4"];
 
@@ -31,8 +48,9 @@ pub struct SchemaAcc {
 #[derive(Debug, Default, Clone)]
 struct StringAcc {
     count: u64,
-    /// Valeurs distinctes, `None` dès que [`ENUM_MAX_VALUES`] est dépassé.
-    values: Option<BTreeSet<String>>,
+    /// Occurrences de chaque valeur distincte, `None` dès que [`EnumRules::max_values`] est
+    /// dépassé : la mémoire reste bornée quel que soit le nombre de valeurs.
+    values: Option<BTreeMap<String, u64>>,
     /// Formats encore compatibles avec toutes les valeurs vues.
     formats: BTreeSet<&'static str>,
 }
@@ -44,33 +62,33 @@ struct ObjectAcc {
 }
 
 impl SchemaAcc {
-    pub fn add(&mut self, v: &Value) {
+    pub fn add(&mut self, v: &Value, rules: &EnumRules) {
         self.count += 1;
         match v {
             Value::Null => self.nulls += 1,
             Value::Bool(_) => self.bools += 1,
             Value::Number(n) if n.is_i64() || n.is_u64() => self.integers += 1,
             Value::Number(_) => self.numbers += 1,
-            Value::String(s) => self.add_string(s),
+            Value::String(s) => self.add_string(s, rules),
             Value::Array(items) => {
                 self.arrays += 1;
                 let acc = self.array.get_or_insert_with(Default::default);
                 for item in items {
-                    acc.add(item);
+                    acc.add(item, rules);
                 }
             }
             Value::Object(map) => {
                 let obj = self.object.get_or_insert_with(Default::default);
                 obj.count += 1;
                 for (k, v) in map {
-                    obj.props.entry(k.clone()).or_default().add(v);
+                    obj.props.entry(k.clone()).or_default().add(v, rules);
                 }
             }
         }
     }
 
     /// Ajoute une valeur textuelle typée au mieux (paramètres de query, headers, formulaires).
-    pub fn add_scalar_text(&mut self, s: &str) {
+    pub fn add_scalar_text(&mut self, s: &str, rules: &EnumRules) {
         let v = if let Ok(i) = s.parse::<i64>() {
             Value::from(i)
         } else if s == "true" || s == "false" {
@@ -78,19 +96,24 @@ impl SchemaAcc {
         } else {
             Value::String(s.to_string())
         };
-        self.add(&v);
+        self.add(&v, rules);
     }
 
-    fn add_string(&mut self, s: &str) {
+    fn add_string(&mut self, s: &str, rules: &EnumRules) {
         let acc = self.strings.get_or_insert_with(|| StringAcc {
-            values: Some(BTreeSet::new()),
+            values: Some(BTreeMap::new()),
             formats: FORMATS.into_iter().collect(),
             ..Default::default()
         });
         acc.count += 1;
         if let Some(values) = &mut acc.values {
-            values.insert(s.to_string());
-            if values.len() > ENUM_MAX_VALUES {
+            match values.get_mut(s) {
+                Some(n) => *n += 1,
+                None => {
+                    values.insert(s.to_string(), 1);
+                }
+            }
+            if values.len() > rules.max_values {
                 acc.values = None;
             }
         }
@@ -101,7 +124,7 @@ impl SchemaAcc {
         self.count
     }
 
-    pub fn to_schema(&self) -> Value {
+    pub fn to_schema(&self, rules: &EnumRules) -> Value {
         let mut variants: Vec<Value> = vec![];
         if self.bools > 0 {
             variants.push(json!({"type": "boolean"}));
@@ -112,17 +135,17 @@ impl SchemaAcc {
             variants.push(json!({"type": "integer"}));
         }
         if let Some(s) = &self.strings {
-            variants.push(s.to_schema());
+            variants.push(s.to_schema(rules));
         }
         if let Some(o) = &self.object {
-            variants.push(o.to_schema());
+            variants.push(o.to_schema(rules));
         }
         if self.arrays > 0 {
             let items = self
                 .array
                 .as_ref()
                 .filter(|a| a.count > 0)
-                .map(|a| a.to_schema())
+                .map(|a| a.to_schema(rules))
                 .unwrap_or_else(|| json!({}));
             variants.push(json!({"type": "array", "items": items}));
         }
@@ -149,27 +172,60 @@ impl SchemaAcc {
 }
 
 impl StringAcc {
-    fn to_schema(&self) -> Value {
+    fn to_schema(&self, rules: &EnumRules) -> Value {
         let mut schema = Map::new();
         schema.insert("type".into(), "string".into());
         // Le premier format compatible dans l'ordre de FORMATS (date-time avant date, etc.).
         if let Some(f) = FORMATS.iter().find(|f| self.formats.contains(*f)) {
             schema.insert("format".into(), (*f).into());
-        } else if let Some(values) = &self.values
-            && self.count >= ENUM_MIN_OBSERVATIONS
-        {
-            schema.insert("enum".into(), values.iter().cloned().collect());
+        } else if let Some(values) = self.enum_values(rules) {
+            schema.insert("enum".into(), values);
         }
         Value::Object(schema)
     }
+
+    /// Valeurs de l'`enum`, triées, si l'échantillon justifie de fermer le contrat (§6.3).
+    fn enum_values(&self, rules: &EnumRules) -> Option<Value> {
+        let values = self.values.as_ref()?;
+        let enough = self.count >= rules.min_observations
+            && (2..=rules.max_values).contains(&values.len())
+            && values.values().all(|n| *n >= rules.min_value_count);
+        if !enough {
+            return None;
+        }
+        // Série numérotée (`user0`, `user6`) : deux valeurs de même squelette sans leurs chiffres.
+        let skeletons: BTreeSet<String> = values.keys().map(|v| skeleton(v)).collect();
+        if skeletons.len() < values.len() {
+            return None;
+        }
+        Some(values.keys().cloned().collect())
+    }
+}
+
+/// La valeur où chaque suite de chiffres est remplacée par `#` : `user12` → `user#`.
+fn skeleton(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_digits = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+            }
+            in_digits = true;
+        } else {
+            out.push(c);
+            in_digits = false;
+        }
+    }
+    out
 }
 
 impl ObjectAcc {
-    fn to_schema(&self) -> Value {
+    fn to_schema(&self, rules: &EnumRules) -> Value {
         let properties: Map<String, Value> = self
             .props
             .iter()
-            .map(|(k, acc)| (k.clone(), acc.to_schema()))
+            .map(|(k, acc)| (k.clone(), acc.to_schema(rules)))
             .collect();
         let required: Vec<Value> = self
             .props
@@ -278,15 +334,24 @@ mod tests {
 
     #[test]
     fn empty_array_has_open_items() {
+        let rules = EnumRules::default();
         let mut acc = SchemaAcc::default();
-        acc.add(&json!([]));
-        assert_eq!(acc.to_schema(), json!({"type": "array", "items": {}}));
+        acc.add(&json!([]), &rules);
+        assert_eq!(acc.to_schema(&rules), json!({"type": "array", "items": {}}));
     }
 
     #[test]
     fn only_nulls() {
+        let rules = EnumRules::default();
         let mut acc = SchemaAcc::default();
-        acc.add(&Value::Null);
-        assert_eq!(acc.to_schema(), json!({"type": "null"}));
+        acc.add(&Value::Null, &rules);
+        assert_eq!(acc.to_schema(&rules), json!({"type": "null"}));
+    }
+
+    #[test]
+    fn skeletons() {
+        assert_eq!(skeleton("user12"), "user#");
+        assert_eq!(skeleton("SKU-3-14"), "SKU-#-#");
+        assert_eq!(skeleton("paid"), "paid");
     }
 }
