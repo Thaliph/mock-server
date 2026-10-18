@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.9** ; rapport de découverte `mimicctl report` (§9.5) et démo OpenTelemetry complète, avec son générateur de charge, en validation des PR (E2E-05). v0.8 : injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
+> Statut : **v0.10** ; parcours SRE de tir de charge (§5.8) : garde-fou production côté contrôleur et `mimicctl`, capture entrante réglable pendant un tir (`capture.inbound`), bascule limitée aux pods sélectionnés (`spec.selector`) et métriques comparables par version. v0.9 : rapport de découverte `mimicctl report` (§9.5) et démo OpenTelemetry complète, avec son générateur de charge, en validation des PR (E2E-05). v0.8 : injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -34,7 +34,7 @@ Mimic est un sidecar qui :
 - Protocoles non HTTP (Postgres, Redis, Kafka, AMQP) : passés en **passthrough** TCP, ni enregistrés ni mockés.
 - Mock du trafic **entrant** (on ne remplace pas l'application elle-même).
 - Interface graphique.
-- Production : Mimic est conçu pour les environnements hors production. Un garde-fou refuse le mode `mock` dans un namespace labellisé `env=production`.
+- Production : Mimic est conçu pour les environnements hors production. Un garde-fou refuse les modes `mock` et `mock-partial` dans un namespace labellisé `env=production` (§5.5.1, §9.5) : le contrôleur ne les transmet jamais aux sidecars de ce namespace, et `mimicctl mode` les refuse.
 
 ---
 
@@ -225,7 +225,14 @@ Règles de capture :
 - mémoire : en plus de `capture.max_exchanges` (50 000), le store a un budget en octets estimés, `capture.max_store_bytes` (64 MiB par défaut). Les bodies gardés en occupent au plus la moitié : au-delà, les bodies des échanges les plus anciens sont retirés en premier. Au-delà du budget, les échanges les plus anciens sont évincés. Un nouvel échange garde donc ses bodies, même quand les métadonnées remplissent le budget. Chaque retrait est compté (`reason="store_budget"`). Les défauts tiennent dans la limite mémoire de 256 Mi posée par l'injecteur (§9.4) : store et file de partage (§5.4) en occupent au plus un tiers, le reste couvre l'index du moteur de mock (§5.3), la découverte et les bodies en vol ;
 - taille max capturée : 1 MiB par body ; au-delà, préfixe + taille ;
 - content-encoding (`gzip`, `br`, `zstd`) décodé pour l'inférence, encodage d'origine conservé pour le rejeu ;
-- streaming : le proxy ne bufferise jamais la réponse complète avant de la relayer ; la capture se fait en tee.
+- streaming : le proxy ne bufferise jamais la réponse complète avant de la relayer ; la capture se fait en tee ;
+- **capture de l'entrant** (`capture.inbound`, que la `MimicWorkload` peut imposer, §5.5.1 et §5.8) : pendant un tir de charge, on mesure le pod, pas le sidecar. Le sortant n'est jamais concerné, et en `passthrough` rien n'est enregistré quel que soit le réglage.
+
+  | Valeur | Échange entrant gardé |
+  |--------|-----------------------|
+  | `full` **[DÉFAUT]** | tel que décrit ci-dessus |
+  | `metadata` | sens, authority, méthode, chemin, code, `ttfb`, `total` et taille des bodies (`Skipped { size }`, ou `Empty`) ; ni query, ni headers, ni body. Le tee ne copie aucun octet, il les compte ; rien n'est décodé ni redacté. L'échange reste dans le store **en mémoire** du sidecar (inspection, statistiques de latence de la page d'admin), sous ses plafonds, sans entrer dans le réservoir : il n'est ni écrit dans le journal local (§8), ni publié (§5.4). La découverte du workload et les requêtes rejouables (§5.7) restent donc celles du trafic réel |
+  | `off` | aucun : seules les métriques sont tenues (`mimic_requests_total`, `mimic_request_duration_seconds`, mesurée jusqu'au dernier octet de la réponse, comme en `full`) |
 
 ### 5.3 Mode `mock`
 
@@ -316,7 +323,7 @@ Un Deployment a souvent plusieurs réplicas, et chaque pod ne voit qu'une partie
 
 - **Seule autorité** : le contrôleur est le seul à modifier le mode et le snapshot des sidecars. Il lit l'état souhaité dans les ressources `MimicWorkload` (§5.5.1), qu'il surveille par l'API Kubernetes.
 - **Ingestion** : chaque sidecar lui envoie ses segments d'échanges, déjà redactés, et lit ceux des autres instances (§5.4). Le contrôleur les range sur son support (`file://` sur un PVC, ou `s3://`) avec la même disposition qu'au §5.4. L'ingestion est idempotente (§5.5.2).
-- **Battement** : chaque sidecar envoie toutes les `share.mode_poll` (2 s par défaut) son instance, son mode et son snapshot chargé. La réponse porte l'état souhaité du workload : `{mode, snapshot}`, chacun pouvant être absent. Sans `MimicWorkload`, l'état souhaité est vide et chaque sidecar reste dans le mode de sa configuration.
+- **Battement** : chaque sidecar envoie toutes les `share.mode_poll` (2 s par défaut) son instance, son mode, son snapshot chargé et sa capture de l'entrant (`capture_inbound`, §5.2). La réponse porte l'état souhaité **pour ce pod** : `{mode, snapshot, capture_inbound}`, chacun pouvant être absent. Sans `MimicWorkload`, l'état souhaité est vide et chaque sidecar reste dans le mode et la capture de sa configuration ; il y revient quand l'état souhaité redevient vide. Un pod que `spec.selector` ne sélectionne pas reçoit lui aussi un état vide (§5.5.1), et un pod d'un namespace de production ne reçoit jamais `mock` ni `mock-partial` (garde-fou, §5.5.1).
 - **Authentification** : chaque appel d'un sidecar est authentifié par un jeton de ServiceAccount, et le contrôleur ne lui permet d'agir que pour son propre pod et son propre workload (§7.1).
 - **Interface de découverte centrale**, en lecture seule : la page du contrôleur liste les workloads, puis pour chacun les pods (mode, snapshot, dernier battement, aligné ou non), les opérations du service et de chaque dépendance avec leurs paramètres requis (même rendu que la page d'admin du sidecar, §9.2), les snapshots, les requêtes enregistrées (§5.7) et la commande `kubectl` qui bascule le workload. Elle est servie sur un port distinct lié à `127.0.0.1`, donc joignable seulement par `kubectl port-forward`, lui-même soumis au RBAC (`pods/portforward` dans `mimic-system`).
 - **Persistance** : segments, snapshots et snapshot courant de chaque workload (`<namespace>/<workload>/desired.json`) sont sur le support ; un redémarrage du contrôleur ne perd rien. L'état des pods est reconstruit par les battements.
@@ -333,13 +340,20 @@ metadata:
 spec:
   mode: mock              # passthrough | record | mock | mock-partial
   snapshot: 3f9a0c1e5b7d2a46   # facultatif : rejoue ce snapshot au lieu d'en construire un
+  selector:               # facultatif : seuls ces pods appliquent l'état souhaité (label selector standard)
+    matchLabels:
+      pod-template-hash: 7d9f8c6b5
+  capture:
+    inbound: metadata     # facultatif : full | metadata | off (§5.2) ; absent, celle de la configuration
 status:
   snapshot: 3f9a0c1e5b7d2a46   # snapshot effectivement servi
-  pods: 3
-  aligned: 3
+  pods: 3                 # pods sélectionnés vus récemment
+  aligned: 3              # parmi eux, ceux qui appliquent l'état souhaité
   observedGeneration: 4
   conditions:
-    - type: Aligned       # tous les pods vus récemment appliquent l'état souhaité
+    - type: Aligned       # tous les pods sélectionnés vus récemment appliquent l'état souhaité
+      status: "True"
+    - type: Allowed       # False quand le garde-fou refuse le mode (raison ProductionNamespace)
       status: "True"
 ```
 
@@ -348,6 +362,9 @@ Réconciliation (fonction pure dans le contrôleur, testée sans cluster) :
 - `spec.mode` en `mock` ou `mock-partial` sans `spec.snapshot` : le contrôleur construit un snapshot si `status.snapshot` est vide, puis l'écrit dans `status.snapshot`. Le snapshot reste le même tant que le mode ne quitte pas le mock, ce qui garde les pods alignés même si de nouveaux échanges arrivent.
 - `spec.snapshot` renseigné : ce snapshot est servi ; s'il n'existe pas, la condition `Aligned` passe à `False` avec la raison `SnapshotNotFound` et les sidecars gardent leur état.
 - `spec.mode` en `record` ou `passthrough` : aucun snapshot, `status.snapshot` est vidé.
+- **Garde-fou production** : si le namespace de la ressource porte le label `env=production`, `mock` et `mock-partial` sont refusés. Aucun snapshot n'est construit ; l'état souhaité reste celui d'avant s'il n'était pas un mock, sinon il devient `record` sans snapshot (un namespace labellisé après coup sort donc du mock). Les conditions `Aligned` et `Allowed` passent à `False` avec la raison `ProductionNamespace` et un message explicite. Le contrôleur surveille les labels des namespaces : poser ou retirer le label réconcilie aussitôt les ressources du namespace. En plus, dans un tel namespace, le battement ne répond jamais `mock` ni `mock-partial`, et un pod qui annonce l'un de ces modes (configuration, état rechargé du disque) reçoit `record`. Le contrôleur lit les labels des namespaces avant de servir les sidecars : un redémarrage ne laisse pas de fenêtre sans garde-fou. En option (Kubernetes ≥ 1.30), la `ValidatingAdmissionPolicy` de `deploy/controller/production-guard.yaml` refuse la ressource dès l'admission ; elle ne remplace pas le garde-fou du contrôleur, qui couvre aussi un label posé après coup.
+- **Sélection** (`spec.selector`, même sémantique qu'un label selector Kubernetes : `matchLabels` et `matchExpressions` avec `In`, `NotIn`, `Exists`, `DoesNotExist` ; un sélecteur vide sélectionne tous les pods, une expression invalide aucun) : seuls les pods sélectionnés reçoivent l'état souhaité. Les autres reçoivent un état vide, donc le **mode et la capture de leur configuration** (`record` avec la configuration de l'injecteur) : c'est le mode de repli, sans snapshot. Un pod est sélectionné d'après les labels lus par le contrôleur dans l'API Kubernetes à l'authentification de son jeton (§7.1, gardés 60 s) ; ce que le sidecar annonce n'entre pas en compte. `status.pods` et `status.aligned` ne comptent que les pods sélectionnés ; l'interface montre les autres comme « non sélectionnés ». Le snapshot est construit à partir de tous les échanges du workload, pods non sélectionnés compris.
+- **Capture** (`spec.capture.inbound`) : transmise aux pods sélectionnés avec le mode ; absente, chaque sidecar garde celle de sa configuration. Un pod n'est aligné que s'il applique aussi la capture demandée.
 - Ressource supprimée : l'état souhaité redevient vide.
 - `status` est mis à jour à chaque changement d'alignement des pods.
 
@@ -381,6 +398,18 @@ Le contrôleur expose la liste des requêtes entrantes enregistrées pour le wor
 - `GET …/requests?direction=inbound&limit=&format=json` : liste JSON, affichée aussi dans l'interface ;
 - `format=jsonl` : un échange par ligne, rejouable par n'importe quel outil ;
 - `format=k6` : script k6 prêt à lancer (`k6 run -e TARGET=http://checkout:8080 script.js`), qui rejoue les requêtes dans l'ordre d'enregistrement. Les headers redactés et les headers propres à la connexion ne sont pas rejoués ; le script le signale en commentaire et accepte un header d'authentification par `-e AUTHORIZATION=…`.
+
+### 5.8 Tir de charge d'un workload (parcours SRE)
+
+But : mesurer la latence et la consommation d'un pod sous charge, isolé de ses dépendances, pour dimensionner le workload ; et, dans une stratégie de déploiement blue/green hors production, comparer la nouvelle version à l'ancienne avant de la promouvoir. Guide pas à pas : `docs/sre-load-test.md`.
+
+1. **Enregistrer** : le workload tourne en `record` ; le contrôleur accumule ses requêtes entrantes et les réponses de ses dépendances.
+2. **Isoler** : `mimicctl mode <workload> mock --capture-inbound metadata [--selector k=v]`. Seules les dépendances sont mockées, depuis un snapshot ; l'entrant arrive toujours à l'application. Avec `metadata` (ou `off`), le sidecar ne copie plus les bodies entrants et n'en publie rien (§5.2) : son coût reste négligeable devant celui de l'application. Avec `--selector`, seuls les pods sélectionnés basculent (par exemple le ReplicaSet de la nouvelle version, par `pod-template-hash`), les autres restent dans le mode de leur configuration (§5.5.1).
+3. **Tirer** : attendre que `ALIGNED` soit complet, puis rejouer `mimicctl requests <workload> --format k6` contre le Service des pods sélectionnés.
+4. **Mesurer** : latence vue par l'appelant, `mimic_request_duration_seconds{direction="inbound"}` ; CPU et mémoire des conteneurs par les métriques du kubelet. Les métriques du sidecar portent le label `version` (§9.3), ce qui permet de comparer deux versions sur un même tableau de bord ou dans une analyse automatique (exemple d'`AnalysisTemplate` Argo Rollouts dans le guide, sans dépendance du code à Argo).
+5. **Revenir** : `mimicctl mode <workload> record` (sans `--selector` ni `--capture-inbound`, ce qui les retire).
+
+Dans un namespace labellisé `env=production`, l'étape 2 est refusée (garde-fou, §1) : le blue/green avec mock se joue dans un environnement de préproduction ou de perf, et la promotion en production se fait ensuite sans mock.
 
 ---
 
@@ -485,10 +514,10 @@ Le contrôleur doit être sûr de parler au bon sidecar, et le sidecar sûr de r
 - **Sidecar vers contrôleur** : le sidecar monte un jeton de ServiceAccount projeté, d'audience `mimic-controller` et de courte durée (`serviceAccountToken`, renouvelé par le kubelet), et l'envoie en `Authorization: Bearer` à chaque appel. Le contrôleur le valide par `TokenReview` (audience comprise), puis vérifie que :
   - le namespace du ServiceAccount est celui du chemin `/v1/workloads/{namespace}/…` ;
   - le pod lié au jeton (`authentication.kubernetes.io/pod-name`) existe, appartient à ce workload (§5.4) et correspond à l'instance déclarée.
-  Sinon : `401` (jeton absent ou invalide) ou `403` (jeton valide pour un autre namespace, pod ou workload). Un pod compromis ne peut donc ni lire, ni polluer les enregistrements d'un autre workload. Les validations sont gardées en cache 60 s, par empreinte du jeton.
+  Sinon : `401` (jeton absent ou invalide) ou `403` (jeton valide pour un autre namespace, pod ou workload). Un pod compromis ne peut donc ni lire, ni polluer les enregistrements d'un autre workload. Les validations sont gardées en cache 60 s, par empreinte du jeton, avec les labels du pod lus à cette occasion : ce sont eux que `spec.selector` compare (§5.5.1), jamais ce qu'annonce le sidecar. En authentification `static` (tests), chaque jeton déclare ses labels (`labels`).
 - **Contrôleur vers sidecar** : l'API des sidecars n'est servie qu'en HTTPS, avec un certificat signé par une CA dédiée (Secret géré par cert-manager). Le sidecar ne fait confiance qu'à cette CA (`share.ca_file`), pas aux racines système : un serveur qui se ferait passer pour le contrôleur est refusé. `http://` n'est accepté qu'avec `share.allow_insecure: true`, réservé aux tests.
 - **Humains** : aucun ordre ne passe par l'API HTTP du contrôleur. La bascule passe par `MimicWorkload` (RBAC et audit Kubernetes), la consultation par `kubectl port-forward` (RBAC `pods/portforward`).
-- **Droits du contrôleur** : `get`, `list`, `watch` sur `mimicworkloads` et `patch` sur leur `status` ; `create` sur `tokenreviews` ; `get` sur `pods`. Rien d'autre.
+- **Droits du contrôleur** : `get`, `list`, `watch` sur `mimicworkloads` et `patch` sur leur `status` ; `create` sur `tokenreviews` ; `get` sur `pods` ; `get`, `list`, `watch` sur `namespaces`, pour le garde-fou production (§5.5.1). Rien d'autre.
 
 ## 8. Stockage et export
 
@@ -527,6 +556,8 @@ capture:
   samples_per_operation: 20
   max_exchanges: 50000
   max_store_bytes: 67108864   # 64 MiB, budget mémoire du store (§5.2)
+  inbound: full               # full | metadata | off : capture de l'entrant (§5.2)
+version: v1.4.2               # label `version` des métriques (§9.3) ; MIMIC_VERSION l'emporte, MIMIC_POD_TEMPLATE_HASH à défaut
 store:
   dir: /var/lib/mimic          # absent : mémoire seule
   segment_bytes: 33554432      # 32 MiB par segment local-<n>.jsonl (§8)
@@ -604,7 +635,7 @@ Deux ports :
 | POST | `…/segments?instance=&segment=` | ingestion d'un segment JSONL de son propre pod ; `segment` (ULID) rend l'envoi idempotent : `201` à la première réception, `200` ensuite (§5.5.2) |
 | GET | `…/segments?since_ms=` | liste des segments encore dans la rétention (`key`, `instance`, `modified_ms`, `size`), du plus ancien au plus récent ; avec `since_ms`, seulement ceux datés d'au moins cette valeur (ms Unix) |
 | GET | `…/segments/{instance}/{file}` | contenu d'un segment |
-| POST | `…/heartbeat` | battement, réponse : état souhaité `{mode, snapshot}` |
+| POST | `…/heartbeat` | battement `{instance, mode, snapshot, capture_inbound}`, réponse : état souhaité du pod `{mode, snapshot, capture_inbound}` (§5.5) |
 | GET | `…/snapshots/{id}` | contenu JSONL d'un snapshot |
 | GET | `/healthz` | probe |
 
@@ -650,6 +681,8 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 
 `authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité.
 
+**Label `version`** : quand la version du pod est connue, toutes les métriques du sidecar portent le label constant `version`, pour comparer deux versions d'un workload (p99, débit, codes ; CPU et mémoire du kubelet par jointure sur `pod`, §5.8). La valeur vient, dans l'ordre, de `MIMIC_VERSION`, de `version` dans la configuration, puis de `MIMIC_POD_TEMPLATE_HASH` ; l'injecteur pose les deux variables depuis les labels du pod (§9.4). Valeur vide : pas de label. Elle est fixée au démarrage et tronquée à 63 caractères (taille maximale d'un label Kubernetes) : un pod n'a qu'une valeur, le label ne multiplie donc aucune série d'un pod, et le nombre de valeurs suit celui des versions déployées, pas le trafic.
+
 Logs JSON structurés (`tracing`). Propagation de `traceparent` inchangée.
 
 Sous charge, les logs d'erreurs répétitives sont limités en débit : au plus une ligne par seconde pour les échecs vers l'amont et pour les erreurs d'`accept`, avec le nombre de lignes omises depuis la précédente. Les compteurs restent exacts (`mimic_upstream_errors_total`). Une erreur d'`accept` (par exemple `EMFILE`, plus de descripteurs) suspend l'écoute concernée pendant 50 ms avant de réessayer, au lieu de boucler à 100 % de CPU au moment où l'on mesure le pod.
@@ -662,7 +695,7 @@ Webhook d'admission mutant (`MutatingWebhookConfiguration`), déployé dans `mim
 - **Fonction pure, sans appel à l'API** : la mutation ne dépend que du pod et de la configuration du webhook (`mimic-injector::inject`), et se teste sans cluster. `sideEffects: None` ; `failurePolicy: Ignore`, si bien qu'un webhook indisponible laisse créer le pod sans Mimic au lieu de le bloquer ; `timeoutSeconds: 5`.
 - **Ce qui est ajouté** (patch JSON) :
   - l'init container `mimic-init` (`NET_ADMIN`, `NET_RAW`), en tête. Ports entrants : annotation `mimic.platform.io/inbound-ports`, sinon les `containerPort` TCP des conteneurs de l'app, sinon `*`. CIDR sortants exclus : ceux de la configuration du webhook (API Kubernetes) puis l'annotation `mimic.platform.io/exclude-outbound-cidrs`. Ports sortants exclus : annotation `mimic.platform.io/exclude-outbound-ports` ;
-  - le native sidecar `mimic`, juste après `mimic-init` et donc avant les init containers de l'app, avec une `startupProbe` sur `/healthz` : l'app ne démarre qu'une fois le proxy prêt. Variables `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` (valeur figée à l'admission) et `MIMIC_REDACT_SALT` lue dans le Secret `<workload>-mimic`, clé `redact-salt`, facultatif ;
+  - le native sidecar `mimic`, juste après `mimic-init` et donc avant les init containers de l'app, avec une `startupProbe` sur `/healthz` : l'app ne démarre qu'une fois le proxy prêt. Variables `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` (valeur figée à l'admission), `MIMIC_REDACT_SALT` lue dans le Secret `<workload>-mimic`, clé `redact-salt`, facultatif, et, par l'API downward, `MIMIC_VERSION` (label `version_label` du pod, `app.kubernetes.io/version` par défaut) et `MIMIC_POD_TEMPLATE_HASH` (label `pod-template-hash`), vides si le label manque (label `version` des métriques, §9.3) ;
   - la configuration du sidecar : par défaut celle du webhook (`sidecar_config`), passée en ligne par `MIMIC_CONFIG_YAML` ; l'annotation `mimic.platform.io/config: <configmap>` monte ce ConfigMap (clé `mimic.yaml`) à la place ;
   - les volumes : store (`emptyDir`), jeton projeté d'audience `mimic-controller`, CA du contrôleur (ConfigMap `mimic-controller-ca`), répertoire de CA Mimic (`emptyDir`, `/var/run/mimic/ca`) ;
   - si l'annotation `mimic.platform.io/tls-intercept` liste des hôtes (séparés par des virgules) : `MIMIC_TLS_INTERCEPT` pour le sidecar, et dans chaque conteneur de l'app le répertoire de CA monté en lecture seule avec `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE` et `CURL_CA_BUNDLE` (§4.2). Une variable déjà définie par l'app n'est pas écrasée ;
@@ -686,6 +719,7 @@ sidecar_config: |                       # configuration par défaut des sidecars
 resources:
   requests: { cpu: 50m, memory: 64Mi }
   limits: { memory: 256Mi }
+version_label: app.kubernetes.io/version   # label du pod repris dans MIMIC_VERSION
 ```
 
 ### 9.5 CLI `mimicctl`
@@ -694,13 +728,15 @@ Outil des humains. Il parle à l'API Kubernetes avec le kubeconfig courant et n'
 
 | Commande | Effet |
 |----------|-------|
-| `mimicctl mode <workload> <mode> [--snapshot id] [-n ns]` | crée ou met à jour la `MimicWorkload` (server-side apply, gestionnaire `mimicctl`) |
+| `mimicctl mode <workload> <mode> [--snapshot id] [--selector k=v,…] [--capture-inbound full\|metadata\|off] [-n ns]` | crée ou met à jour la `MimicWorkload` (server-side apply, gestionnaire `mimicctl`) |
 | `mimicctl status [<workload>] [-n ns \| -A]` | mode souhaité, snapshot servi, pods alignés |
 | `mimicctl export <workload> (--inbound \| --outbound <authority>) [--openapi-version 3.1\|3.0] [-o fichier]` | document OpenAPI depuis l'interface du contrôleur |
 | `mimicctl requests <workload> [--format json\|jsonl\|k6] [--limit n]` | requêtes enregistrées (§5.7) |
 | `mimicctl diff <ancien> <nouveau> [--json] [--fail-on-breaking]` | différence entre deux documents OpenAPI (YAML ou JSON) |
 | `mimicctl report [<workload>] [-n ns \| -A] [--top n]` | rapport Markdown de ce que les sidecars ont découvert (ci-dessous) |
 
+- `mode` : `--selector` prend des égalités `clé=valeur` séparées par des virgules (`spec.selector.matchLabels`) ; `--capture-inbound` renseigne `spec.capture.inbound`. Un apply sans ces options les retire (server-side apply), donc `mimicctl mode checkout record` remet tout le workload dans le même état. Avant d'appliquer `mock` ou `mock-partial`, `mimicctl` lit les labels du namespace : s'il porte `env=production`, il refuse avec un message qui nomme le namespace et le label, et le code de sortie 2, sans rien appliquer. S'il ne peut pas lire le namespace (droit `get` absent), il le signale et applique : le contrôleur refuse de toute façon (§5.5.1).
+- `status` : `ALIGNED` ne compte que les pods sélectionnés (§5.5.1) ; un mode refusé par le garde-fou est affiché suivi de `(refusé)`.
 - `status` n'affiche le snapshot et les pods alignés que si le contrôleur a publié le statut de la génération courante (`status.observedGeneration` égal à `metadata.generation`) ; sinon ces colonnes valent `?` (par exemple `?/2`), car un statut antérieur décrit l'état souhaité d'avant la bascule.
 - `export` et `requests` ouvrent un port-forward vers le pod du contrôleur (port 8081), comme `kubectl port-forward` : même RBAC (`pods/portforward` dans `mimic-system`), aucun port exposé.
 - `--openapi-version 3.0` convertit le document 3.1 (`mimic-core::openapi::to_3_0`) : `type: [T, "null"]` devient `type: T` avec `nullable: true`, les `examples` d'un schéma deviennent `example` (le premier), `openapi` vaut `3.0.3`.
@@ -869,6 +905,9 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | CRD-04 | `spec.mode: record` après du mock | réconciliation | `status.snapshot` vidé, état souhaité `record` sans snapshot |
 | CRD-05 | ressource supprimée | réconciliation | état souhaité vide |
 | CRD-06 | deux pods, un seul aligné | calcul du statut | `pods: 2`, `aligned: 1`, `Aligned=False` |
+| CRD-07 | namespace labellisé `env=production` ; `spec.mode: mock` ou `mock-partial`, depuis `record` puis depuis `mock` | réconciliation, battement, statut | aucun snapshot construit ; état souhaité inchangé depuis `record`, `record` sans snapshot depuis `mock` ; raison `ProductionNamespace`, conditions `Aligned` et `Allowed` à `False` avec un message ; un pod qui annonce `mock` reçoit `record` ; label retiré, le mock est de nouveau accepté |
+| CRD-08 | `spec.selector.matchLabels: {version: v2}`, puis des `matchExpressions` ; pods `v1` et `v2` | réconciliation, battements, statut | le pod `v2` reçoit l'état souhaité, le pod `v1` un état vide ; `pods: 1` et `aligned` ne comptent que `v2` ; `In`, `NotIn`, `Exists`, `DoesNotExist` suivent la sémantique Kubernetes ; sélecteur vide : tous les pods ; opérateur inconnu : aucun |
+| CRD-09 | `spec.capture.inbound: metadata` | réconciliation, battement | état souhaité avec `capture_inbound: metadata` ; un pod qui annonce `full` diverge, un pod qui annonce `metadata` est aligné ; sans `spec.capture`, aucune capture imposée |
 
 **Sécurité (SEC)**
 
@@ -915,6 +954,8 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | CAP-06 | `store.dir`, `segment_bytes` et `max_segments` petits | trafic au-delà de plusieurs segments | au plus `max_segments` fichiers `local-<n>.jsonl`, chacun sous `segment_bytes` plus une ligne ; après redémarrage, les échanges les plus récents sont rechargés et les plus anciens ne le sont plus |
 | CAP-07 | file du journal local pleine | ajout d'échanges | l'ajout ne bloque pas, l'échange est en mémoire, la ligne non écrite est comptée (`reason="local_backlog"`) ; sans demande explicite, une ligne écrite est sur disque en moins d'une seconde |
 | CAP-08 | configuration par défaut du webhook (§9.4) | injection d'un pod | journal local au plus le quart de l'`emptyDir` du store ; budget du store et file de partage au plus le tiers de la limite mémoire du sidecar |
+| CAP-09 | `capture.inbound: metadata`, journal local et partage configurés | requête entrante `POST /orders?token=x` avec headers et body JSON, puis un appel sortant | un seul échange entrant en mémoire : méthode, chemin, code, durées et taille des bodies (`Skipped`), sans query, headers ni body ; aucune ligne entrante dans le journal local ni dans la file de publication ; l'appel sortant est enregistré en entier |
+| CAP-10 | `capture.inbound: off` | requêtes entrantes | aucun échange entrant ; `mimic_requests_total{direction="inbound"}` et les observations de `mimic_request_duration_seconds{direction="inbound"}` les comptent toutes |
 
 **Admin et métriques (ADM)**
 
@@ -923,6 +964,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ADM-01 | trafic enregistré sur `GET /users/{userId}` avec query `page` toujours présente | `GET /` | la page liste l'opération et marque `page` comme requis |
 | ADM-02 | trafic entrant et sortant, en record puis en mock | `GET /metrics` | les métriques du tableau §9.3 sont présentes avec les bons labels |
 | ADM-03 | `PUT /mode` avec `mock` | requête suivante | servie en mock, `mimic_mode{mode="mock"} 1` |
+| ADM-04 | `MIMIC_VERSION=v2` ; puis `MIMIC_VERSION` vide et `MIMIC_POD_TEMPLATE_HASH=7d9f` ; puis aucune version | trafic, `GET /metrics` | chaque métrique porte `version="v2"`, puis `version="7d9f"`, puis aucun label `version` ; valeur tronquée à 63 caractères |
 
 **Init (INI)**
 
@@ -966,6 +1008,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | INJ-07 | pod avec ses propres init containers | admission | `mimic-init` puis `mimic` passent avant eux, leur ordre est conservé |
 | INJ-08 | `AdmissionReview` d'un pod | `POST /mutate` en HTTPS | `allowed: true`, même `uid`, patch JSON qui s'applique au pod et donne le pod de INJ-01 |
 | INJ-09 | `MIMIC_CONFIG_YAML` et `MIMIC_TLS_INTERCEPT` définis, sans fichier | démarrage du sidecar | configuration lue comme depuis un fichier, puis surchargée par l'environnement |
+| INJ-10 | pod quelconque, puis `version_label: app.example.com/release` dans la configuration du webhook | admission | `MIMIC_VERSION` lu par l'API downward dans `metadata.labels['app.kubernetes.io/version']`, puis `['app.example.com/release']` ; `MIMIC_POD_TEMPLATE_HASH` dans `metadata.labels['pod-template-hash']` |
 
 **CLI (CLI)**
 
@@ -976,6 +1019,8 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | CLI-03 | export d'une dépendance, puis requêtes en k6 | construction du chemin | `/v1/workloads/shop/checkout/openapi/outbound/api.stripe.com`, `/v1/workloads/shop/checkout/requests?direction=inbound&format=k6&limit=100` |
 | CLI-04 | un workload avec 12 opérations (service et dépendance `quote:8080`), une requête enregistrée de `GET /items/{id}` | `mimicctl report --top 10` | les deux API avec leurs opérations et appels ; exactement 10 opérations, triées par appels décroissants ; les headers de la requête, `\|` échappé et valeurs longues tronquées ; une opération sans requête liste ses paramètres header |
 | CLI-05 | `MimicWorkload` en génération 5, statut publié pour la génération 4 (2/2 alignés, snapshot) | `mimicctl status` | snapshot `?` et pods alignés `?/2` ; une fois la génération 5 publiée, le snapshot et `2/2` |
+| CLI-06 | namespace labellisé `env=production` | `mimicctl mode checkout mock` (ou `mock-partial`) | refus avant l'apply, message qui nomme le namespace et `env=production`, code de sortie 2 ; `record` et `passthrough` acceptés ; labels illisibles : accepté |
+| CLI-07 | `mimicctl mode checkout mock --selector pod-template-hash=7d9f,track=green --capture-inbound metadata` ; puis `--selector track` ou `--capture-inbound fast` ; `status` d'une ressource refusée | construction de la requête, tableau | `spec.selector.matchLabels` à deux entrées et `spec.capture.inbound: metadata` ; sélecteur ou capture invalides refusés avant tout appel ; `MODE` suivi de `(refusé)` |
 
 **Conversion OpenAPI (OAS)**
 
@@ -999,7 +1044,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | E2E-01 | Pod demo (app + Mimic injecté) sur kind, app appelant un faux SaaS HTTPS ; mode record ; la spec inbound et la spec du SaaS sont exportées sur MinIO. |
 | E2E-02 | Même pod en mode mock avec NetworkPolicy deny-all egress : le tir k6 réussit à > 99,9 %, aucun paquet ne sort (vérifié par les compteurs du faux SaaS). |
 | E2E-03 | Changement d'annotation `record → mock` sans redémarrage du pod. |
-| E2E-04 | Namespace labellisé `env=production` : le mode mock est refusé. |
+| E2E-04 | Namespace labellisé `env=production` : `mimicctl mode … mock` est refusé (code 2) ; une `MimicWorkload` en `mock` créée avant le label passe à `Allowed=False` (raison `ProductionNamespace`) dès que le label est posé ; avec la `ValidatingAdmissionPolicy` de `deploy/controller/production-guard.yaml`, une `MimicWorkload` en mock y est refusée à l'admission. Vérifié en fin de `scripts/e2e-kind.sh` ; sans cluster, par CRD-07 et CLI-06. |
 | E2E-05 | Démo OpenTelemetry sur kind (`scripts/e2e-kind.sh`, à chaque PR vers `main`) : les services de la démo, sans la chaîne de télémétrie ni Kafka, avec son générateur de charge actif ; tous injectés par le webhook sauf `valkey-cart` (opt-out). Les requêtes du test passent par le frontend (`/api/shipping`), qui appelle shipping (2 réplicas) en gRPC, qui appelle quote en HTTP ; en record les deux API de shipping (gRPC entrant, quote sortant) sont découvertes par le contrôleur. Après cinq minutes de charge, `mimicctl report -A` est publié dans le résumé du job et les documents OpenAPI en artefact. Tous les workloads injectés passent ensuite en mock, sauf le générateur (le client) : une fois les pods alignés, pendant 60 s, `mimic_requests_total` des sidecars ne compte plus aucune requête entrante, sauf sur les services que le générateur appelle lui-même (frontend-proxy, et flagd pour ses feature flags) ; frontend-proxy reçoit son trafic et répond depuis le snapshot (`mimic_mock_responses_total`) ; le bilan est ajouté au résumé du job, puis retour en record. Après `mimicctl mode shipping mock`, les deux pods s'alignent sur un snapshot, quote est arrêté et toutes les requêtes réussissent ; retour en record. |
 
 **Performance (PRF)** : seuils bloquants en CI nightly : O1 et O2 mesurés avec `oha` à 1 000 req/s sur 60 s, comparés à une exécution sans sidecar.
@@ -1049,8 +1094,9 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
-| P6b | Chargement cross-environnement, garde-fou production | E2E-04 |
+| P6b | Chargement cross-environnement, garde-fou production (contrôleur, `mimicctl`, politique d'admission facultative) | E2E-04, CRD-07, CLI-06 |
 | P6c | Contrôleur à l'échelle : index des segments, liste incrémentale, verrous courts, GC et compaction, budget mémoire, ingestion idempotente | CTL-06 à 15, SHR-08, SHR-09 |
+| P6d | Parcours SRE de tir de charge : capture entrante réglable, bascule des seuls pods sélectionnés, label `version` des métriques, guide `docs/sre-load-test.md` | CAP-09, CAP-10, CRD-08, CRD-09, CLI-07, ADM-04, INJ-10 |
 | P7 | Webhook d'injection + `mimicctl` (dont le rapport) | INJ-*, CLI-*, OAS-*, DIF-*, E2E-05 |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 
