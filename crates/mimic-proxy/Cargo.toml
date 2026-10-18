@@ -15,7 +15,7 @@ http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["http1", "http2", "server", "client"] }
-hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "http1", "tls12", "native-tokio", "logging"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "http1", "http2", "tls12", "native-tokio", "logging"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2", "service"] }
 mimic-core = { version = "0.1.0", path = "../mimic-core" }
 nix = { version = "0.31.3", features = ["net", "socket"] }

@@ -533,6 +533,98 @@ async fn health_endpoints() {
     }
 }
 
+/// Amont gRPC factice : HTTP/2 seulement (h2c), réponse suivie de trailers.
+async fn fake_h2c_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body_util::{BodyExt, StreamBody};
+    use hyper::body::Frame;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    |req: hyper::Request<hyper::body::Incoming>| async move {
+                        let version = format!("{:?}", req.version());
+                        let te = req
+                            .headers()
+                            .get("te")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let mut trailers = hyper::HeaderMap::new();
+                        trailers.insert("grpc-status", "0".parse().unwrap());
+                        let frames = vec![
+                            Ok::<_, std::convert::Infallible>(Frame::data(body)),
+                            Ok(Frame::trailers(trailers)),
+                        ];
+                        let resp = hyper::Response::builder()
+                            .header("content-type", "application/grpc")
+                            .header("x-upstream-version", version)
+                            .header("x-upstream-te", te)
+                            .body(StreamBody::new(futures_util::stream::iter(frames)))
+                            .unwrap();
+                        Ok::<_, std::convert::Infallible>(resp)
+                    },
+                );
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn prx_03_grpc_h2c_relayed_end_to_end_with_trailers() {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    let (upstream, _server) = fake_h2c_server().await;
+    let p = proxy(config(Some(upstream), Mode::Record)).await;
+    // Client gRPC : HTTP/2 en connaissance préalable, comme un client h2c.
+    let stream = tokio::net::TcpStream::connect(p.inbound_addr())
+        .await
+        .unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+        TokioExecutor::new(),
+        TokioIo::new(stream),
+    )
+    .await
+    .unwrap();
+    tokio::spawn(conn);
+    let req = hyper::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "http://{}/oteldemo.ShippingService/GetQuote",
+            p.inbound_addr()
+        ))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::from_static(b"\0\0\0\0\x02ok")))
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.version(), http::Version::HTTP_2);
+    assert_eq!(resp.headers()["x-upstream-version"], "HTTP/2.0");
+    assert_eq!(resp.headers()["x-upstream-te"], "trailers");
+    let collected = resp.into_body().collect().await.unwrap();
+    let trailers = collected.trailers().cloned().expect("trailers relayés");
+    assert_eq!(trailers["grpc-status"], "0");
+    assert_eq!(&collected.to_bytes()[..], b"\0\0\0\0\x02ok");
+
+    let list = wait_exchanges(&p, "direction=inbound", 1).await;
+    let e = decode(&list[0]);
+    assert_eq!(e.method, "POST");
+    assert_eq!(e.status, 200);
+    assert_eq!(e.path, "/oteldemo.ShippingService/GetQuote");
+}
+
 /// MCK-08 pour `br` et `zstd` (spec §5.2) : body décodé à l'enregistrement, réencodé au rejeu.
 #[tokio::test]
 async fn mck_08_brotli_and_zstd_responses_are_replayed() {
