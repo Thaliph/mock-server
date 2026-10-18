@@ -1,10 +1,12 @@
-//! Critères CTL-16 et CTL-18 de la spec (§5.5.3) : sélection des exemples par endpoint, au
+//! Critères CTL-16, CTL-18 et CTL-22 de la spec (§5.5.3) : sélection des exemples par endpoint, au
 //! niveau de `mimic-core` (fonctions pures).
 
 mod common;
 
 use common::{ExchangeExt, exchange};
-use mimic_core::exemplar::{ExemplarOffer, Exemplars, endpoint_key, is_exemplar};
+use mimic_core::exemplar::{
+    ExemplarOffer, Exemplars, endpoint_key, is_exemplar, serialized_len,
+};
 use mimic_core::model::{Body, Direction, Exchange};
 use mimic_core::snapshot::{SnapshotOptions, build};
 use proptest::prelude::*;
@@ -159,6 +161,63 @@ fn ctl_16_changes_are_counted_for_persistence() {
     assert_eq!(x.version(), v1, "rien n'a changé");
     x.offer(&out("/a", 2, "new"));
     assert_ne!(x.version(), v1);
+}
+
+fn padded(path: &str, at: u64, id: &str, pad: usize) -> Exchange {
+    let mut e = exchange("GET", path).at(at, id);
+    e.direction = Direction::Outbound;
+    e.authority = "api.saas.io:443".into();
+    e.resp_json(json!({ "id": id, "pad": "x".repeat(pad) }))
+}
+
+#[test]
+fn ctl_22_examples_are_bounded_in_bytes() {
+    let a1 = padded("/a", 1, "a1", 1_000);
+    let max = serialized_len(&a1) + 100;
+    let mut x = Exemplars::with_limits(10, max);
+    assert_eq!(x.offer(&a1), ExemplarOffer::Added);
+    assert_eq!(x.bytes(), serialized_len(&a1));
+    // Nouvel endpoint qui ne tient pas : exemple sans body, visible mais pas rejouable.
+    assert_eq!(
+        x.offer(&padded("/b", 2, "b1", 1_000)),
+        ExemplarOffer::AddedWithoutBody
+    );
+    let b = x.iter().find(|e| e.path == "/b").unwrap();
+    assert!(!is_exemplar(b));
+    assert!(matches!(b.resp_body, Body::Skipped { .. }));
+    assert_eq!(x.refused_bytes(), 1);
+    // Remplacement plus récent mais trop gros : l'ancien reste.
+    assert_eq!(
+        x.offer(&padded("/a", 3, "a2", 5_000)),
+        ExemplarOffer::KeptOlder
+    );
+    assert_eq!(x.refused_bytes(), 2);
+    assert!(x.iter().any(|e| e.id == "a1"));
+    // Plus récent et plus petit : accepté.
+    assert_eq!(x.offer(&padded("/a", 4, "a3", 10)), ExemplarOffer::Replaced);
+    let full: u64 = x
+        .iter()
+        .filter(|e| is_exemplar(e))
+        .map(|e| serialized_len(e))
+        .sum();
+    assert!(full <= max, "{full} > {max}");
+    assert_eq!(x.bytes(), x.iter().map(|e| serialized_len(e)).sum::<u64>());
+    // L'exemple sans body redevient rejouable dès qu'un plus récent tient.
+    assert_eq!(x.offer(&padded("/b", 5, "b2", 10)), ExemplarOffer::Replaced);
+    assert!(is_exemplar(x.iter().find(|e| e.path == "/b").unwrap()));
+}
+
+#[test]
+fn ctl_22_a_global_room_also_bounds_the_examples() {
+    let mut x = Exemplars::with_limits(10, u64::MAX);
+    let a = padded("/a", 1, "a", 100);
+    assert_eq!(x.offer_within(&a, 10), ExemplarOffer::AddedWithoutBody);
+    assert_eq!(x.refused_bytes(), 1);
+    assert_eq!(
+        x.offer_within(&padded("/a", 2, "a2", 100), u64::MAX),
+        ExemplarOffer::Replaced
+    );
+    assert!(is_exemplar(x.iter().next().unwrap()));
 }
 
 /// Échange d'endpoint `p` (chemin de forme `/p{p}/{n}`), rejouable ou non, éventuellement

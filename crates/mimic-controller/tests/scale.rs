@@ -1,4 +1,4 @@
-//! Critères CTL-06 à CTL-19 de la spec (§5.5.2, §5.5.3) : tenue en charge du contrôleur,
+//! Critères CTL-06 à CTL-19 et CTL-22 de la spec (§5.5.2, §5.5.3) : tenue en charge du contrôleur,
 //! exemples par endpoint et historique court.
 
 use std::collections::BTreeMap;
@@ -1088,7 +1088,7 @@ async fn ctl_18_examples_are_bounded_and_counted() {
     let m = get_text(&c, "/metrics").await;
     assert_eq!(metric(&m, "mimic_controller_exemplars"), Some(2.0), "{m}");
     assert_eq!(
-        metric(&m, "mimic_controller_exemplars_refused_total"),
+        metric(&m, r#"mimic_controller_exemplars_refused_total{reason="count"}"#),
         Some(1.0),
         "{m}"
     );
@@ -1132,5 +1132,94 @@ async fn ctl_19_examples_never_mix_workloads() {
     assert_eq!(
         paths(mock_snapshot(&c, dir.path(), "web").await),
         ["/web-only"]
+    );
+}
+
+/// Échange sortant dont le body de réponse fait `4 * n` caractères base64.
+fn big(id: &str, path: &str, ms: u64, n: usize) -> Value {
+    let mut e = at(exchange(id, "outbound", path, 200, true), ms);
+    e["resp_body"]["data"] = json!("QUFB".repeat(n));
+    e
+}
+
+fn serialized(v: &Value) -> u64 {
+    let e: mimic_core::model::Exchange = serde_json::from_value(v.clone()).unwrap();
+    mimic_core::exemplar::serialized_len(&e)
+}
+
+#[tokio::test]
+async fn ctl_22_examples_are_bounded_in_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let a1 = big("checkout-a-1", "/a", 10, 500);
+    let max = serialized(&a1) + 200;
+    let c = start(ControllerConfig {
+        max_exemplar_bytes_per_workload: max,
+        max_exchanges_per_workload: 1,
+        ..config(dir.path())
+    })
+    .await
+    .unwrap();
+    // Workload déjà vu : ses échanges sont en mémoire dès l'ingestion.
+    assert!(request_ids(&c, "checkout", "outbound").await.is_empty());
+    push(&c, "checkout-a", &[a1]).await;
+    push(&c, "checkout-a", &[big("checkout-a-2", "/b", 20, 500)]).await;
+    push(&c, "checkout-a", &[big("checkout-a-3", "/a", 30, 2_000)]).await;
+    let m = get_text(&c, "/metrics").await;
+    assert_eq!(
+        metric(
+            &m,
+            r#"mimic_controller_exemplars_refused_total{reason="bytes"}"#
+        ),
+        Some(2.0),
+        "{m}"
+    );
+    assert_eq!(metric(&m, "mimic_controller_exemplars"), Some(2.0), "{m}");
+    push(&c, "checkout-a", &[big("checkout-a-4", "/a", 40, 1)]).await;
+    // `/b` n'est plus en mémoire : son exemple sans body le garde dans la découverte.
+    assert!(operation_paths(&c).await.contains(&"/b".to_string()));
+    c.state().maintain().await;
+    let mut ex = exemplars(dir.path(), "checkout");
+    ex.sort();
+    assert_eq!(
+        ex,
+        [
+            captured("checkout-a-4", "/a"),
+            ("checkout-a-2".into(), "/b".into(), "skipped".into()),
+        ]
+    );
+    let m = get_text(&c, "/metrics").await;
+    let kept = metric(&m, "mimic_controller_exemplars_bytes").unwrap();
+    assert!(kept <= max as f64, "{kept} > {max}");
+}
+
+#[tokio::test]
+async fn ctl_22_total_bound_spans_workloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let a1 = big("checkout-a-1", "/a", 10, 500);
+    let c = start(ControllerConfig {
+        max_exemplar_bytes_total: serialized(&a1) + 200,
+        ..config(dir.path())
+    })
+    .await
+    .unwrap();
+    push(&c, "checkout-a", &[a1]).await;
+    push(&c, "web-a", &[big("web-a-1", "/w", 20, 500)]).await;
+    let m = get_text(&c, "/metrics").await;
+    assert_eq!(
+        metric(
+            &m,
+            r#"mimic_controller_exemplars_refused_total{reason="bytes"}"#
+        ),
+        Some(1.0),
+        "{m}"
+    );
+    c.state().maintain().await;
+    assert_eq!(
+        exemplars(dir.path(), "checkout"),
+        [captured("checkout-a-1", "/a")]
+    );
+    assert_eq!(
+        exemplars(dir.path(), "web"),
+        [("web-a-1".to_string(), "/w".to_string(), "skipped".to_string())]
     );
 }

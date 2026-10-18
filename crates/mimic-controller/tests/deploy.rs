@@ -98,6 +98,8 @@ fn ctl_21_retention_defaults_to_24_hours() {
     let defaults = ControllerConfig::default();
     assert_eq!(defaults.retention, day);
     assert_eq!(defaults.max_exemplars_per_workload, 10_000);
+    assert_eq!(defaults.max_exemplar_bytes_per_workload, 64 << 20);
+    assert_eq!(defaults.max_exemplar_bytes_total, 512 << 20);
     let cm = docs(include_str!("../../../deploy/controller/controller.yaml"))
         .into_iter()
         .find(|d| d["kind"] == "ConfigMap")
@@ -106,6 +108,11 @@ fn ctl_21_retention_defaults_to_24_hours() {
     let raw: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
     assert_eq!(raw["retention"].as_u64(), Some(86_400));
     assert_eq!(raw["max_exemplars_per_workload"].as_u64(), Some(10_000));
+    assert_eq!(
+        raw["max_exemplar_bytes_per_workload"].as_u64(),
+        Some(64 << 20)
+    );
+    assert_eq!(raw["max_exemplar_bytes_total"].as_u64(), Some(512 << 20));
     let config: ControllerConfig = serde_yaml::from_str(text).unwrap();
     assert_eq!(config.retention, day);
 }
