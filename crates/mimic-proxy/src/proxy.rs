@@ -307,8 +307,8 @@ async fn forward(
             let kind = if e.is_connect() { "connect" } else { "request" };
             state
                 .metrics
-                .count_upstream_error(direction, &authority_label, kind);
-            count_request(&state, direction, mode, &authority_label, &method, 502);
+                .count_upstream_error(direction, authority_label, kind);
+            count_request(&state, direction, mode, authority_label, &method, 502);
             return text(StatusCode::BAD_GATEWAY, "mimic: amont injoignable");
         }
     };
@@ -317,10 +317,10 @@ async fn forward(
     let switched = websocket && resp_parts.status == StatusCode::SWITCHING_PROTOCOLS;
     strip_hop_by_hop(&mut resp_parts.headers, switched);
     let status = resp_parts.status.as_u16();
-    count_request(&state, direction, mode, &authority_label, &method, status);
+    count_request(&state, direction, mode, authority_label, &method, status);
 
     if switched || (req_capture.is_none() && record != Record::Timed) {
-        observe_duration(&state, direction, mode, &authority_label, ttfb);
+        observe_duration(&state, direction, mode, authority_label, ttfb);
     }
     if record == Record::Timed && !switched {
         // Durée jusqu'au dernier octet, comme en capture complète, sans rien garder.
@@ -328,7 +328,7 @@ async fn forward(
         tokio::spawn(async move {
             if let Ok(c) = done.await {
                 let total = c.ended.saturating_duration_since(started);
-                observe_duration(&state, direction, mode, &authority_label, total);
+                observe_duration(&state, direction, mode, authority_label, total);
             }
         });
         return Response::from_parts(resp_parts, boxed(tee));
@@ -492,7 +492,7 @@ struct Pending {
     ttfb: Duration,
     scheme: String,
     authority: String,
-    authority_label: Arc<str>,
+    authority_label: &'static str,
     method: String,
     uri: Uri,
     req_headers: Vec<Header>,
@@ -512,7 +512,7 @@ async fn finalize(
         return;
     };
     let total = resp.ended.saturating_duration_since(p.started);
-    observe_duration(&state, p.direction, p.mode, &p.authority_label, total);
+    observe_duration(&state, p.direction, p.mode, p.authority_label, total);
     if p.metadata {
         record_metadata(&state, p, req, resp, total);
         return;
@@ -652,18 +652,16 @@ async fn serve_mock(
     let method = request.method;
     match decision {
         MockDecision::Matched(r) => {
-            mock_metric(&state, &authority_label, r.kind.as_str());
+            mock_metric(&state, authority_label, r.kind.as_str());
             let latency = Duration::from_micros(r.latency_us);
-            state
-                .metrics
-                .observe_mock_latency(&authority_label, latency);
+            state.metrics.observe_mock_latency(authority_label, latency);
             // Réponse prête avant l'attente : sa préparation est prise sur la latence.
             let response = mock_response(&state, &set, &r);
             count_request(
                 &state,
                 Direction::Outbound,
                 mode,
-                &authority_label,
+                authority_label,
                 &method,
                 response.status().as_u16(),
             );
@@ -672,13 +670,13 @@ async fn serve_mock(
                 &state,
                 Direction::Outbound,
                 mode,
-                &authority_label,
+                authority_label,
                 started.elapsed(),
             );
             response
         }
         MockDecision::Unmatched => {
-            mock_metric(&state, &authority_label, "unmatched");
+            mock_metric(&state, authority_label, "unmatched");
             let passthrough =
                 mode == Mode::MockPartial || state.config.mock.unmatched == Unmatched::Passthrough;
             if passthrough {
@@ -696,7 +694,7 @@ async fn serve_mock(
                 &state,
                 Direction::Outbound,
                 mode,
-                &authority_label,
+                authority_label,
                 &method,
                 599,
             );
@@ -740,7 +738,7 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
     let mode = state.mode();
     let label = state.metrics.authority(&authority);
     if state.intercepts(&host) {
-        count_request(&state, Direction::Outbound, mode, &label, "CONNECT", 200);
+        count_request(&state, Direction::Outbound, mode, label, "CONNECT", 200);
         tokio::spawn(async move {
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
@@ -753,14 +751,14 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
         return Response::new(boxed(Empty::<Bytes>::new()));
     }
     if mode == Mode::Mock {
-        mock_metric(&state, &label, "unmatched");
-        count_request(&state, Direction::Outbound, mode, &label, "CONNECT", 403);
+        mock_metric(&state, label, "unmatched");
+        count_request(&state, Direction::Outbound, mode, label, "CONNECT", 403);
         return text(
             StatusCode::FORBIDDEN,
             "mimic: tunnel refusé en mode mock (TLS non intercepté)",
         );
     }
-    count_request(&state, Direction::Outbound, mode, &label, "CONNECT", 200);
+    count_request(&state, Direction::Outbound, mode, label, "CONNECT", 200);
     tokio::spawn(async move {
         let upgraded = match hyper::upgrade::on(req).await {
             Ok(u) => u,
@@ -780,7 +778,7 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
                 }
                 state
                     .metrics
-                    .count_upstream_error(Direction::Outbound, &label, "connect");
+                    .count_upstream_error(Direction::Outbound, label, "connect");
             }
         }
     });
@@ -946,7 +944,7 @@ fn count_request(
     state: &AppState,
     direction: Direction,
     mode: Mode,
-    authority: &Arc<str>,
+    authority: &'static str,
     method: &str,
     status: u16,
 ) {
@@ -959,7 +957,7 @@ fn observe_duration(
     state: &AppState,
     direction: Direction,
     mode: Mode,
-    authority: &Arc<str>,
+    authority: &'static str,
     d: Duration,
 ) {
     state
@@ -967,7 +965,7 @@ fn observe_duration(
         .observe_duration(direction, mode, authority, d);
 }
 
-fn mock_metric(state: &AppState, authority: &Arc<str>, kind: &'static str) {
+fn mock_metric(state: &AppState, authority: &'static str, kind: &'static str) {
     state.metrics.count_mock(authority, kind);
 }
 

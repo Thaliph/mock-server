@@ -1,12 +1,13 @@
 //! Métriques Prometheus (spec §9.3).
 //!
-//! Compter une requête n'alloue rien : les labels fixes sont des chaînes statiques, le code un
-//! entier, et l'authority une chaîne partagée (`Arc<str>`), résolue sous un verrou pris en
-//! lecture. Seule la première requête d'une série la crée.
+//! Compter une requête n'alloue rien et ne touche aucun compteur de références : les labels
+//! sont des chaînes statiques, le code un entier. Une authority est internée en chaîne statique
+//! à sa première apparition (au plus `MAX_AUTHORITIES`, la mémoire reste bornée), puis résolue
+//! sous un verrou pris en lecture. Seule la première requête d'une série la crée.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use mimic_core::model::Direction;
@@ -27,7 +28,7 @@ const MAX_AUTHORITIES: usize = 100;
 pub struct RequestLabels {
     pub direction: &'static str,
     pub mode: &'static str,
-    pub authority: Arc<str>,
+    pub authority: &'static str,
     pub method: Cow<'static, str>,
     pub status: u16,
 }
@@ -36,31 +37,31 @@ pub struct RequestLabels {
 pub struct DurationLabels {
     pub direction: &'static str,
     pub mode: &'static str,
-    pub authority: Arc<str>,
+    pub authority: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct UpstreamErrorLabels {
     pub direction: &'static str,
-    pub authority: Arc<str>,
+    pub authority: &'static str,
     pub kind: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct MockLabels {
-    pub authority: Arc<str>,
+    pub authority: &'static str,
     pub r#match: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct AuthorityLabel {
-    pub authority: Arc<str>,
+    pub authority: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DiscoveryLabels {
     pub direction: &'static str,
-    pub authority: Arc<str>,
+    pub authority: &'static str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -87,7 +88,7 @@ pub struct PassthroughLabels {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TlsFailureLabels {
-    pub authority: Arc<str>,
+    pub authority: &'static str,
     pub reason: &'static str,
 }
 
@@ -132,8 +133,8 @@ pub struct Metrics {
     pub passthrough: Family<PassthroughLabels, Counter>,
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
     pub websocket_connections: Family<DirectionLabel, Counter>,
-    authorities: RwLock<BTreeSet<Arc<str>>>,
-    other: Arc<str>,
+    /// Authorities internées : au plus `MAX_AUTHORITIES` chaînes, jamais libérées.
+    authorities: RwLock<BTreeSet<&'static str>>,
 }
 
 impl Metrics {
@@ -274,31 +275,32 @@ impl Metrics {
             tls_handshake_failures,
             websocket_connections,
             authorities: RwLock::new(BTreeSet::new()),
-            other: Arc::from("other"),
         }
     }
 
     /// Valeur de label d'authority à cardinalité bornée. Une authority déjà vue est lue sous le
-    /// verrou pris en lecture, sans copie.
-    pub fn authority(&self, authority: &str) -> Arc<str> {
+    /// verrou pris en lecture, sans copie ; une nouvelle est internée, dans la limite de
+    /// `MAX_AUTHORITIES`.
+    pub fn authority(&self, authority: &str) -> &'static str {
         {
             let seen = self.authorities.read().unwrap_or_else(|e| e.into_inner());
             if let Some(a) = seen.get(authority) {
-                return a.clone();
+                return a;
             }
             if seen.len() >= MAX_AUTHORITIES {
-                return self.other.clone();
+                return "other";
             }
         }
         let mut seen = self.authorities.write().unwrap_or_else(|e| e.into_inner());
         if let Some(a) = seen.get(authority) {
-            return a.clone();
+            return a;
         }
         if seen.len() >= MAX_AUTHORITIES {
-            return self.other.clone();
+            return "other";
         }
-        let a: Arc<str> = Arc::from(authority);
-        seen.insert(a.clone());
+        // Internée : bornée par `MAX_AUTHORITIES`, gardée toute la vie du processus.
+        let a: &'static str = Box::leak(authority.to_string().into_boxed_str());
+        seen.insert(a);
         a
     }
 
@@ -314,7 +316,7 @@ impl Metrics {
         &self,
         direction: Direction,
         mode: Mode,
-        authority: &Arc<str>,
+        authority: &'static str,
         method: &str,
         status: u16,
     ) {
@@ -322,7 +324,7 @@ impl Metrics {
             .get_or_create(&RequestLabels {
                 direction: direction_label(direction),
                 mode: mode.as_str(),
-                authority: authority.clone(),
+                authority,
                 method: method_label(method),
                 status,
             })
@@ -334,34 +336,32 @@ impl Metrics {
         &self,
         direction: Direction,
         mode: Mode,
-        authority: &Arc<str>,
+        authority: &'static str,
         d: Duration,
     ) {
         self.request_duration
             .get_or_create(&DurationLabels {
                 direction: direction_label(direction),
                 mode: mode.as_str(),
-                authority: authority.clone(),
+                authority,
             })
             .observe(d.as_secs_f64());
     }
 
     /// `mimic_mock_responses_total` : réponse du mock, par type de correspondance.
-    pub fn count_mock(&self, authority: &Arc<str>, kind: &'static str) {
+    pub fn count_mock(&self, authority: &'static str, kind: &'static str) {
         self.mock_responses
             .get_or_create(&MockLabels {
-                authority: authority.clone(),
+                authority,
                 r#match: kind,
             })
             .inc();
     }
 
     /// `mimic_mock_injected_latency_seconds` : latence injectée par le mock.
-    pub fn observe_mock_latency(&self, authority: &Arc<str>, d: Duration) {
+    pub fn observe_mock_latency(&self, authority: &'static str, d: Duration) {
         self.mock_latency
-            .get_or_create(&AuthorityLabel {
-                authority: authority.clone(),
-            })
+            .get_or_create(&AuthorityLabel { authority })
             .observe(d.as_secs_f64());
     }
 
@@ -369,13 +369,13 @@ impl Metrics {
     pub fn count_upstream_error(
         &self,
         direction: Direction,
-        authority: &Arc<str>,
+        authority: &'static str,
         kind: &'static str,
     ) {
         self.upstream_errors
             .get_or_create(&UpstreamErrorLabels {
                 direction: direction_label(direction),
-                authority: authority.clone(),
+                authority,
                 kind,
             })
             .inc();

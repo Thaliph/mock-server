@@ -21,12 +21,12 @@ fn count_one(m: &Metrics) {
         (Direction::Inbound, Mode::Record),
     ] {
         let a = m.authority("api.saas.io:443");
-        m.count_request(direction, mode, &a, "GET", 200);
-        m.count_request(direction, mode, &a, "POST", 503);
-        m.observe_duration(direction, mode, &a, Duration::from_micros(150));
-        m.count_mock(&a, "exact");
-        m.observe_mock_latency(&a, Duration::from_micros(150));
-        m.count_upstream_error(direction, &a, "connect");
+        m.count_request(direction, mode, a, "GET", 200);
+        m.count_request(direction, mode, a, "POST", 503);
+        m.observe_duration(direction, mode, a, Duration::from_micros(150));
+        m.count_mock(a, "exact");
+        m.observe_mock_latency(a, Duration::from_micros(150));
+        m.count_upstream_error(direction, a, "connect");
         m.count_dropped("sample_limit");
     }
 }
