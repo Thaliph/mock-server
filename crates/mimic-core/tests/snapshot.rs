@@ -1,11 +1,12 @@
-//! Critères SNP-01, SNP-02 et SNP-06 de la spec (§5.6) : construction des snapshots de mock.
+//! Critères SNP-01, SNP-02, SNP-06 et MCK-20 de la spec (§5.6) : construction des snapshots
+//! de mock et de leur forme de mock.
 
 mod common;
 
 use common::{ExchangeExt, exchange};
-use mimic_core::mock::{MockConfig, MockDecision, MockEngine, MockRequest};
-use mimic_core::model::{Body, Direction, Exchange};
-use mimic_core::snapshot::{Snapshot, SnapshotOptions, build};
+use mimic_core::mock::{MockConfig, MockDecision, MockEngine, MockRequest, Strategy};
+use mimic_core::model::{Body, Direction, Exchange, Header};
+use mimic_core::snapshot::{MockSnapshot, Snapshot, SnapshotOptions, build};
 use proptest::prelude::*;
 use serde_json::json;
 
@@ -128,5 +129,220 @@ proptest! {
         // Le contrôleur construit sur des références (§5.5.2) : même snapshot.
         prop_assert_eq!(build(&shuffled, &opts), build(recs.clone(), &opts));
         prop_assert_eq!(build(recs, &opts), build(shuffled, &opts));
+    }
+}
+
+/// Requête qui rejoue `e` : même authority, méthode, chemin, query, headers et body.
+fn request_of(e: &Exchange) -> MockRequest {
+    MockRequest {
+        authority: e.authority.clone(),
+        method: e.method.clone(),
+        path: e.path.clone(),
+        query: e.query.clone(),
+        headers: e.req_headers.clone(),
+        body: e.req_body.bytes().unwrap_or_default().to_vec(),
+    }
+}
+
+/// Requêtes jamais enregistrées telles quelles : même forme qu'un enregistrement, ou aucune.
+fn probes() -> Vec<MockRequest> {
+    let mut out = vec![];
+    for authority in ["api.saas.io:443", "stock.internal:8080"] {
+        for method in ["GET", "post"] {
+            for path in ["/users/97", "/users/2/cart", "/c/ch_zz", "/a", "/nope"] {
+                for page in [None, Some("1")] {
+                    out.push(MockRequest {
+                        authority: authority.into(),
+                        method: method.into(),
+                        path: path.into(),
+                        query: page
+                            .map(|p| ("page".into(), p.into()))
+                            .into_iter()
+                            .collect(),
+                        headers: vec![Header::new("accept", "a/1")],
+                        body: br#"{"q":1}"#.to_vec(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Échange sortant varié : chemins de même forme (`/users/{n}`), de forte cardinalité
+/// (`/c/ch_{n}`), deux authorities, codes `1xx` et d'erreur, bodies rejouables ou non.
+fn varied(item: &(u8, u8, u8, u8, u16, u64), n: usize) -> Exchange {
+    let (path, status, body, query, latency, at) = *item;
+    let path = match path % 5 {
+        0 => format!("/users/{}", path % 4),
+        1 => format!("/c/ch_{n}"),
+        2 => "/a".to_string(),
+        3 => "/A".to_string(),
+        _ => format!("/users/{}/cart", n % 3),
+    };
+    let mut e = out(&path, at, &format!("pod{}-{n:04}", n % 2));
+    if n % 3 == 0 {
+        e.authority = "stock.internal:8080".into();
+    }
+    if n % 4 == 1 {
+        e.method = "POST".into();
+        e = e.req_json(json!({ "q": query % 2 }));
+    }
+    e.status = [101, 200, 200, 404, 500][status as usize % 5];
+    e.resp_body = match body % 4 {
+        0 => Body::captured(format!("{{\"v\":{}}}", body % 3)),
+        1 => Body::Empty,
+        2 => Body::Skipped { size: 12 },
+        _ => Body::Truncated {
+            size: 2_000_000,
+            prefix: b"{\"big\":".to_vec(),
+        },
+    };
+    if query % 3 != 0 {
+        e.query = vec![("page".into(), (query % 3).to_string())];
+    }
+    e.req_headers
+        .push(Header::new("accept", ["a/1", "a/2"][n % 2]));
+    e.total_us = latency as u64;
+    e
+}
+
+#[test]
+fn mck_20_mock_form_keeps_replayable_records_and_latencies_only() {
+    let mut recs = vec![];
+    // Endpoint de forte cardinalité : 2 000 chemins distincts, deux seulement avec body.
+    for i in 0..2_000u64 {
+        let mut e = out(&format!("/v1/charges/ch_{i}"), i, &format!("a-{i:05}"));
+        if i >= 2 {
+            e.resp_body = Body::Skipped { size: 400 };
+        }
+        e.total_us = 1_000 + i;
+        recs.push(e);
+    }
+    let mut ws = out("/ws", 5_000, "a-ws");
+    ws.status = 101;
+    ws.resp_body = Body::Empty;
+    recs.push(ws);
+    let full = build(recs, &SnapshotOptions::default());
+    assert_eq!(full.exchanges.len(), 2_001);
+
+    let light = MockSnapshot::from_snapshot(&full);
+    assert_eq!(light.id, full.id);
+    assert_eq!(light.count, 2_001);
+    let ids: Vec<_> = light.records.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, ["a-00000", "a-00001"]);
+    assert_eq!(
+        light.records[0], full.exchanges[0],
+        "échange rejouable tel quel"
+    );
+    // Une opération par forme de chemin, désignée par son premier échange ; le `101` n'en
+    // est pas une (le moteur l'ignore).
+    assert_eq!(
+        light.operations.len(),
+        2_000,
+        "chemins non reconnus comme identifiants"
+    );
+    let op = &light.operations[0];
+    assert_eq!(
+        (op.authority.as_str(), op.method.as_str()),
+        ("api.saas.io:443", "GET")
+    );
+    let mut latencies: Vec<u64> = light
+        .operations
+        .iter()
+        .flat_map(|o| o.latencies_us.iter().copied())
+        .collect();
+    latencies.sort_unstable();
+    assert_eq!(
+        latencies,
+        (0..2_000).map(|i| 1_000 + i).collect::<Vec<u64>>()
+    );
+
+    let bytes = light.to_json();
+    assert!(
+        bytes.len() * 5 < full.to_jsonl().len(),
+        "{} octets contre {}",
+        bytes.len(),
+        full.to_jsonl().len()
+    );
+    assert_eq!(MockSnapshot::from_json(&bytes, &full.id).unwrap(), light);
+    // Un autre identifiant, ou un contenu altéré, est refusé.
+    assert!(MockSnapshot::from_json(&bytes, "0000000000000000").is_err());
+    assert!(MockSnapshot::from_json(&bytes[..bytes.len() - 2], &full.id).is_err());
+}
+
+#[test]
+fn mck_20_paths_of_the_same_shape_share_one_operation() {
+    let recs: Vec<_> = (0..100u64)
+        .map(|i| {
+            let mut e = out(&format!("/users/{i}"), i, &format!("u-{i:03}"));
+            if i >= 20 {
+                e.resp_body = Body::Skipped { size: 40 };
+            }
+            e.total_us = 10 * i;
+            e
+        })
+        .collect();
+    let full = build(recs, &SnapshotOptions::default());
+    let light = MockSnapshot::from_snapshot(&full);
+    assert_eq!(light.records.len(), 20);
+    assert_eq!(light.operations.len(), 1);
+    let op = &light.operations[0];
+    assert_eq!(op.path, "/users/0", "désignée par son premier échange");
+    assert_eq!(
+        op.latencies_us,
+        (0..100).map(|i| 10 * i).collect::<Vec<u64>>()
+    );
+}
+
+proptest! {
+    #[test]
+    fn mck_20_engine_on_the_mock_form_is_the_engine_on_the_snapshot(
+        items in proptest::collection::vec(
+            (0u8..10, 0u8..5, 0u8..4, 0u8..6, 0u16..5_000, 0u64..40), 0..60),
+        max_per_key in 1usize..4,
+        seed in any::<u64>(),
+        rotate in any::<usize>(),
+    ) {
+        let recs: Vec<Exchange> = items.iter().enumerate().map(|(n, it)| varied(it, n)).collect();
+        let opts = SnapshotOptions { max_per_key };
+        let full = build(&recs, &opts);
+        let light = MockSnapshot::from_snapshot(&full);
+        let bytes = light.to_json();
+        let relit = MockSnapshot::from_json(&bytes, &full.id).unwrap();
+        prop_assert_eq!(&relit, &light);
+        prop_assert!(relit.records.iter().all(|e| e.resp_body.is_replayable() && e.status >= 200));
+
+        // Mêmes octets quel que soit l'ordre d'arrivée des échanges.
+        let mut shuffled = recs.clone();
+        shuffled.rotate_left(rotate % recs.len().max(1));
+        prop_assert_eq!(MockSnapshot::from_snapshot(&build(&shuffled, &opts)).to_json(), bytes);
+
+        let mut requests: Vec<MockRequest> = recs.iter().map(request_of).collect();
+        requests.extend(probes());
+        for strategy in [
+            Strategy::Best,
+            Strategy::RoundRobin,
+            Strategy::Sequence,
+            Strategy::WeightedStatus,
+        ] {
+            let config = MockConfig {
+                strategy,
+                seed,
+                match_headers: vec!["accept".into()],
+                ..MockConfig::default()
+            };
+            let a = MockEngine::new(full.exchanges.iter(), config.clone());
+            let b = MockEngine::from_snapshot(&relit, config);
+            prop_assert_eq!(a.len(), b.len());
+            prop_assert_eq!(a.replayable(), b.replayable());
+            prop_assert_eq!(b.replayable(), relit.records.len());
+            prop_assert_eq!(a.authorities(), b.authorities());
+            // Deux passes : les curseurs de `round-robin` et `sequence` avancent pareil.
+            for req in requests.iter().chain(requests.iter()) {
+                prop_assert_eq!(a.candidates(req), b.candidates(req));
+                prop_assert_eq!(a.respond(req), b.respond(req), "{:?} {:?}", strategy, req);
+            }
+        }
     }
 }

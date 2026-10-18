@@ -675,3 +675,145 @@ async fn ctl_20_examples_hold_only_redacted_values() {
         assert!(data.contains("<redacted:"), "{data}");
     }
 }
+
+/// Contrôleur d'une version antérieure : battement et snapshot complet seulement (pas de
+/// `…/snapshots/{id}/mock`, donc `404`), comme avant la forme de mock (§5.6).
+async fn old_controller(snapshots: std::path::PathBuf, id: String) -> std::net::SocketAddr {
+    use axum::extract::Path as UrlPath;
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    let app = axum::Router::new()
+        .route(
+            "/v1/workloads/ns/api/heartbeat",
+            post(move || {
+                let id = id.clone();
+                async move { axum::Json(serde_json::json!({"mode": "mock", "snapshot": id})) }
+            }),
+        )
+        .route(
+            "/v1/workloads/ns/api/snapshots/{id}",
+            get(move |UrlPath(id): UrlPath<String>| {
+                let file = snapshots.join(format!("{id}.jsonl"));
+                async move { std::fs::read(file).map_err(|_| StatusCode::NOT_FOUND) }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+#[tokio::test]
+async fn shr_11_two_sidecars_load_the_same_mock_form_and_serve_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let with_store = |mut c: Config, store: &str| {
+        c.store.dir = Some(dir.path().join(store));
+        c
+    };
+    let a = proxy(with_store(
+        piloted(None, &ctl, dir.path(), "api-a"),
+        "store-a",
+    ))
+    .await;
+    let b = proxy(with_store(
+        piloted(None, &ctl, dir.path(), "api-b"),
+        "store-b",
+    ))
+    .await;
+
+    // A seul appelle la dépendance, sur 60 chemins de même forme : bien au-delà de
+    // samples_per_operation (20), les derniers n'ont plus de body.
+    let urls: Vec<String> = (0..60).map(|i| saas.url(&format!("/users/{i}"))).collect();
+    let mut recorded = vec![];
+    for u in &urls {
+        recorded.push(served(&a, u).await);
+    }
+    eventually("le contrôleur a reçu les 60 appels", || async {
+        ui_json(
+            &ctl,
+            "/v1/workloads/ns/api/requests?direction=outbound&limit=1000",
+        )
+        .await
+        .as_array()
+        .is_some_and(|l| l.len() == 60)
+    })
+    .await;
+    let s1 = apply(&ctl, "mock", None).await["snapshot"].clone();
+    converged(&[&a, &b], "mock", &s1).await;
+    let id = s1.as_str().unwrap().to_string();
+
+    // Même forme de mock, octet pour octet, sur les deux pods : celle du contrôleur.
+    let cached = |store: &str| {
+        std::fs::read(
+            dir.path()
+                .join(store)
+                .join("controller/snapshots")
+                .join(format!("{id}.mock.json")),
+        )
+        .unwrap()
+    };
+    let form = cached("store-a");
+    assert_eq!(cached("store-b"), form);
+    let from_ctl = client()
+        .get(format!(
+            "http://{}/v1/workloads/ns/api/snapshots/{id}/mock",
+            ctl.api_addr()
+        ))
+        .bearer_auth("tok-api-b")
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(from_ctl.to_vec(), form);
+    let full_file = dir
+        .path()
+        .join("ctl/ns/api/snapshots")
+        .join(format!("{id}.jsonl"));
+    let full = std::fs::read(&full_file).unwrap();
+    assert!(
+        form.len() < full.len(),
+        "{} contre {}",
+        form.len(),
+        full.len()
+    );
+
+    // Même réponse sur les deux pods, avec ou sans body enregistré pour ce chemin, et la
+    // réponse enregistrée là où elle a gardé son body.
+    let hits = saas.hits();
+    let mut replayed = 0;
+    let mut answers = vec![];
+    for (u, rec) in urls.iter().zip(&recorded) {
+        let ra = served(&a, u).await;
+        assert_eq!(ra.0, 200, "{u}");
+        assert_eq!(served(&b, u).await, ra, "{u}");
+        if ra == *rec {
+            replayed += 1;
+        }
+        answers.push(ra);
+    }
+    assert!(replayed >= 20, "{replayed} réponses enregistrées rejouées");
+    assert!(
+        replayed < 60,
+        "les chemins sans body sont servis par leur template"
+    );
+    assert_eq!(saas.hits(), hits, "rien n'est sorti");
+
+    // Contrôleur d'une version antérieure : le sidecar télécharge le snapshot complet et en
+    // déduit la même forme de mock.
+    let old = old_controller(full_file.parent().unwrap().to_path_buf(), id.clone()).await;
+    let mut cfg = with_store(piloted(None, &ctl, dir.path(), "api-c"), "store-c");
+    if let Some(share) = cfg.share.as_mut() {
+        share.url = format!("http://{old}");
+    }
+    let c = proxy(cfg).await;
+    converged(&[&c], "mock", &s1).await;
+    assert_eq!(cached("store-c"), form);
+    for (u, ra) in urls.iter().zip(&answers) {
+        assert_eq!(served(&c, u).await, *ra, "{u}");
+    }
+    assert_eq!(saas.hits(), hits, "rien n'est sorti");
+}
