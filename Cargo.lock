@@ -1864,6 +1864,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "flate2",
  "futures-util",
  "http",
  "hyper",
@@ -1887,6 +1888,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "zstd",
 ]
 
 [[package]]

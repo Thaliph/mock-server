@@ -682,12 +682,59 @@ async fn load_pod_join() {
         .await
         .unwrap();
     println!(
-        "snapshot construit en {:.1} s : {} échanges, {:.2} Mo téléchargés par le pod en mock",
+        "snapshot construit en {:.1} s : {} échanges, {:.2} Mo pour un sidecar d'une version antérieure (snapshot complet)",
         built.as_secs_f64(),
         snap.split(|b| *b == b'\n')
             .filter(|l| !l.is_empty())
             .count(),
         snap.len() as f64 / 1e6
+    );
+    // Sidecar à jour : forme de mock (§5.6), selon son encodage ; la première demande la
+    // calcule, les suivantes sont servies d'avance.
+    let form = |accept: Option<&'static str>| {
+        let url = ctl.api(&format!("/v1/workloads/{NS}/wl0/snapshots/{id}/mock"));
+        async move {
+            let mut req = client().get(url).bearer_auth("tok-wl0-new");
+            if let Some(a) = accept {
+                req = req.header("accept-encoding", a);
+            }
+            let t = Instant::now();
+            let b = req.send().await.unwrap().bytes().await.unwrap();
+            (b, t.elapsed())
+        }
+    };
+    let (zst, first) = form(Some("zstd, gzip")).await;
+    let (_, again) = form(Some("zstd, gzip")).await;
+    let (gz, _) = form(Some("gzip")).await;
+    let (plain, _) = form(None).await;
+    let light = mimic_core::snapshot::MockSnapshot::from_json(&plain, &id).unwrap();
+    assert_eq!(zstd::decode_all(&zst[..]).unwrap(), plain.to_vec());
+    let latencies: usize = light
+        .operations
+        .iter()
+        .flat_map(|o| &o.paths)
+        .map(|p| p.1.len())
+        .sum();
+    // Part de la compression seule : le snapshot complet compressé de même.
+    let full_zst = zstd::bulk::compress(&snap, 9).unwrap().len();
+    println!(
+        "snapshot complet compressé (pour comparer, non servi) : {:.3} Mo en zstd",
+        full_zst as f64 / 1e6
+    );
+    println!(
+        "forme de mock : {} rejouables, {} opérations, {latencies} durées ; {:.2} Mo sans compression, {:.3} Mo en gzip, {:.3} Mo en zstd (téléchargés par un sidecar à jour, {:.0}x moins) ; calculée en {:.2} s à la première demande, servie en {:.1} ms ensuite",
+        light.records.len(),
+        light
+            .operations
+            .iter()
+            .map(|o| o.paths.len())
+            .sum::<usize>(),
+        plain.len() as f64 / 1e6,
+        gz.len() as f64 / 1e6,
+        zst.len() as f64 / 1e6,
+        snap.len() as f64 / zst.len().max(1) as f64,
+        first.as_secs_f64(),
+        again.as_secs_f64() * 1000.0
     );
 }
 

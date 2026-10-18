@@ -8,6 +8,7 @@ pub mod config;
 pub mod crd;
 pub mod kube;
 pub mod metrics;
+pub mod mock_form;
 pub mod reconcile;
 pub mod state;
 pub mod ui;

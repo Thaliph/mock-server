@@ -588,3 +588,138 @@ async fn metrics_and_health() {
         "{m}"
     );
 }
+
+/// Forme de mock telle qu'un pod la télécharge : code, headers et body (non décodé).
+async fn mock_form(
+    c: &Running,
+    id: &str,
+    token: &str,
+    accept: Option<&str>,
+    if_none_match: Option<&str>,
+) -> (u16, reqwest::header::HeaderMap, Vec<u8>) {
+    let mut req = client()
+        .get(url(c, &format!("{WL}/snapshots/{id}/mock")))
+        .bearer_auth(token);
+    if let Some(a) = accept {
+        req = req.header("accept-encoding", a);
+    }
+    if let Some(e) = if_none_match {
+        req = req.header("if-none-match", e);
+    }
+    let r = req.send().await.unwrap();
+    let (status, headers) = (r.status().as_u16(), r.headers().clone());
+    (status, headers, r.bytes().await.unwrap().to_vec())
+}
+
+fn header<'a>(h: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    h.get(name).map(|v| v.to_str().unwrap())
+}
+
+#[tokio::test]
+async fn ctl_23_mock_form_is_light_compressed_and_identical_for_every_pod() {
+    use mimic_core::snapshot::{MockSnapshot, Snapshot};
+    use std::io::Read;
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    // 2 000 appels d'un même endpoint, sur des chemins distincts de même forme : seuls les
+    // premiers gardent leur body en mémoire (samples_per_operation), tous entrent dans le
+    // snapshot (un par chemin).
+    let calls: Vec<Value> = (0..2_000u64)
+        .map(|i| {
+            let mut e = exchange(
+                &format!("checkout-a-{i:05}"),
+                "outbound",
+                "GET",
+                &format!("/users/{i}"),
+                json!([["page", "1"]]),
+                1_000 + i,
+            );
+            e["total_us"] = json!(2_000 + i % 700);
+            e
+        })
+        .collect();
+    push(&c, "checkout-a", &calls).await;
+    let id = set_mode(&c, "mock", None).await["snapshot"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Chemin d'avant : snapshot complet, octet pour octet celui du support.
+    let full = client()
+        .get(url(&c, &format!("{WL}/snapshots/{id}")))
+        .bearer_auth("tok-a")
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    let stored = std::fs::read(
+        dir.path()
+            .join(format!("shop/checkout/snapshots/{id}.jsonl")),
+    )
+    .unwrap();
+    assert_eq!(full, stored);
+    let snapshot = Snapshot::from_jsonl(&full, &id).unwrap();
+    assert_eq!(snapshot.exchanges.len(), 2_000);
+    let expected = MockSnapshot::from_snapshot(&snapshot).to_json();
+
+    // Deux pods, trois encodages : mêmes octets, même ETag, même forme une fois décodée.
+    let (status, h, plain) = mock_form(&c, &id, "tok-a", None, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&h, "content-encoding"), None);
+    assert_eq!(header(&h, "content-type"), Some("application/json"));
+    assert_eq!(plain, expected);
+    let etag = header(&h, "etag").unwrap().to_string();
+    assert_eq!(
+        etag,
+        format!("\"{}\"", mimic_core::snapshot::digest(&expected))
+    );
+    assert!(
+        header(&h, "cache-control").is_some_and(|v| v.contains("immutable")),
+        "{h:?}"
+    );
+
+    let (_, hz, zst) = mock_form(&c, &id, "tok-a", Some("gzip, zstd"), None).await;
+    assert_eq!(header(&hz, "content-encoding"), Some("zstd"));
+    assert_eq!(header(&hz, "etag"), Some(etag.as_str()));
+    assert_eq!(zstd::decode_all(&zst[..]).unwrap(), expected);
+    let (_, hb, zst_b) = mock_form(&c, &id, "tok-b", Some("zstd"), None).await;
+    assert_eq!(zst_b, zst, "deux pods, mêmes octets");
+    assert_eq!(header(&hb, "etag"), Some(etag.as_str()));
+
+    let (_, hg, gz) = mock_form(&c, &id, "tok-b", Some("gzip;q=1, zstd;q=0"), None).await;
+    assert_eq!(header(&hg, "content-encoding"), Some("gzip"));
+    let mut decoded = vec![];
+    flate2::read::GzDecoder::new(&gz[..])
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, expected);
+
+    assert!(
+        zst.len() * 20 <= full.len(),
+        "forme de mock compressée : {} octets, snapshot complet : {}",
+        zst.len(),
+        full.len()
+    );
+    let relit = MockSnapshot::from_json(&plain, &id).unwrap();
+    assert_eq!(relit.count, 2_000);
+    assert!(relit.records.len() <= 30, "{}", relit.records.len());
+
+    // Déjà reçue : 304, sans body.
+    let (status, h304, body) = mock_form(&c, &id, "tok-b", Some("zstd"), Some(&etag)).await;
+    assert_eq!(status, 304);
+    assert!(body.is_empty());
+    assert_eq!(header(&h304, "etag"), Some(etag.as_str()));
+
+    // Sans jeton, ou snapshot inconnu.
+    let r = client()
+        .get(url(&c, &format!("{WL}/snapshots/{id}/mock")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let (status, _, _) = mock_form(&c, "0000000000000000", "tok-a", None, None).await;
+    assert_eq!(status, 404);
+}

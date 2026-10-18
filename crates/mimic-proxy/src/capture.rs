@@ -48,7 +48,7 @@ impl Captured {
 }
 
 /// Décode un body compressé, borné à `limit` octets décodés.
-fn decode(encoding: &str, data: &[u8], limit: usize) -> Option<Vec<u8>> {
+pub(crate) fn decode(encoding: &str, data: &[u8], limit: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let read = match encoding {
         "gzip" | "x-gzip" => flate2::read::GzDecoder::new(data)

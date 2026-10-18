@@ -22,7 +22,7 @@ use http::StatusCode;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use mimic_core::mock::{MockConfig, MockEngine, MockRequest, MockResponse, op_key};
 use mimic_core::model::Body;
-use mimic_core::snapshot::Snapshot;
+use mimic_core::snapshot::MockSnapshot;
 
 use crate::capture::encode;
 use crate::config::Mode;
@@ -241,7 +241,7 @@ impl AppState {
     /// le mock, les ajouts suivants du store sont indexés.
     fn build_locked(
         &self,
-        snapshot: Option<&Snapshot>,
+        snapshot: Option<&MockSnapshot>,
         trigger: Trigger,
         track: bool,
     ) -> Arc<MockSet> {
@@ -251,7 +251,7 @@ impl AppState {
                 self.store.stop_additions();
                 MockSet::new(
                     Source::Snapshot(s.id.clone()),
-                    MockEngine::new(s.exchanges.iter(), self.mock_config()),
+                    MockEngine::from_snapshot(s, self.mock_config()),
                 )
             }
             None => {
@@ -372,7 +372,7 @@ impl AppState {
     }
 
     /// Publie `snap` (ou son retrait) ; en mock, avec le moteur construit dessus.
-    pub(crate) fn publish_snapshot(&self, snap: Option<Arc<Snapshot>>) {
+    pub(crate) fn publish_snapshot(&self, snap: Option<Arc<MockSnapshot>>) {
         let _guard = self.engines.build.lock().unwrap_or_else(|e| e.into_inner());
         let unchanged = {
             let current = self.snapshot.lock().expect("verrou du snapshot");

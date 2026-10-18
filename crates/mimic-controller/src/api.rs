@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::auth::{AuthError, authorize, bearer};
 use crate::config::Identity;
 use crate::metrics::ReasonLabel;
+use crate::mock_form::{self, Encoding};
 use crate::reconcile::PodReport;
 use crate::state::{Ctl, IngestError, valid_name};
 
@@ -32,6 +33,10 @@ pub fn router(ctl: Arc<Ctl>) -> Router {
         )
         .route("/v1/workloads/{ns}/{wl}/heartbeat", post(heartbeat))
         .route("/v1/workloads/{ns}/{wl}/snapshots/{id}", get(get_snapshot))
+        .route(
+            "/v1/workloads/{ns}/{wl}/snapshots/{id}/mock",
+            get(get_mock_snapshot),
+        )
         .layer(DefaultBodyLimit::max(MAX_SEGMENT))
         .with_state(ctl)
 }
@@ -212,6 +217,54 @@ async fn get_snapshot(
         return *r;
     }
     snapshot_response(&ctl, &ns, &wl, &id).await
+}
+
+/// Forme de mock d'un snapshot (spec §5.6) : ce que télécharge un sidecar à jour, compressée
+/// selon `Accept-Encoding`, avec un `ETag`.
+async fn get_mock_snapshot(
+    State(ctl): State<Arc<Ctl>>,
+    Path((ns, wl, id)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = guard(&ctl, &headers, &ns, &wl, None).await {
+        return *r;
+    }
+    let Some(form) = ctl.mock_snapshot(&ns, &wl, &id).await else {
+        return (StatusCode::NOT_FOUND, "snapshot inconnu").into_response();
+    };
+    let text = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let etag = format!("\"{}\"", form.etag);
+    let out = Response::builder()
+        .header(header::ETAG, &etag)
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
+        .header(header::VARY, "accept-encoding");
+    if mock_form::not_modified(text(header::IF_NONE_MATCH), &etag) {
+        return out
+            .status(StatusCode::NOT_MODIFIED)
+            .body(axum::body::Body::empty())
+            .unwrap_or_default();
+    }
+    let encoding = mock_form::pick(text(header::ACCEPT_ENCODING));
+    let body = match encoding {
+        Encoding::Zstd => form.zstd.clone(),
+        Encoding::Gzip => form.gzip.clone(),
+        // Sans compression acceptée : décompressée hors des threads du serveur.
+        Encoding::Identity => match tokio::task::spawn_blocking(move || form.identity()).await {
+            Ok(Ok(b)) => Bytes::from(b),
+            _ => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "forme de mock illisible")
+                    .into_response();
+            }
+        },
+    };
+    let mut out = out.header(header::CONTENT_TYPE, "application/json");
+    if let Some(e) = encoding.header() {
+        out = out.header(header::CONTENT_ENCODING, e);
+    }
+    out.body(axum::body::Body::from(body)).unwrap_or_default()
 }
 
 pub async fn snapshot_response(ctl: &Ctl, ns: &str, wl: &str, id: &str) -> Response {
