@@ -227,3 +227,36 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn red_05_untouched_json_body_keeps_its_bytes() {
+    let raw = br#"{ "zeta": 1.0, "alpha": [ 2 , 3 ], "name" : "Ann" }"#.to_vec();
+    let mut e = exchange("POST", "/orders");
+    e.resp_headers
+        .push(Header::new("content-type", "application/json"));
+    e.resp_body = Body::captured(raw.clone());
+    e.req_headers.push(Header::new(
+        "content-type",
+        "application/x-www-form-urlencoded",
+    ));
+    e.req_body = Body::captured(b"b=2&a=1".to_vec());
+    let e = redacted(e);
+    assert_eq!(e.resp_body.bytes().unwrap(), raw.as_slice());
+    assert_eq!(e.req_body.bytes().unwrap(), b"b=2&a=1");
+    assert!(e.redactions.is_empty());
+
+    // Une valeur remplacée : le body est réécrit, avec sa marque.
+    let mut e = exchange("POST", "/orders");
+    e.resp_headers
+        .push(Header::new("content-type", "application/json"));
+    e.resp_body = Body::captured(br#"{ "zeta": 1.0, "mail": "ann@example.com" }"#.to_vec());
+    let e = redacted(e);
+    let text = String::from_utf8(e.resp_body.bytes().unwrap().to_vec()).unwrap();
+    assert!(!text.contains("ann@example.com"), "{text}");
+    assert!(is_marker(resp_json(&e)["mail"].as_str().unwrap()));
+    assert!(
+        e.redactions
+            .iter()
+            .any(|m| m.location == "response.body$.mail")
+    );
+}

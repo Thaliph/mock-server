@@ -42,7 +42,7 @@ fn matched(d: MockDecision) -> mimic_core::mock::MockResponse {
 }
 
 fn body_json(r: &mimic_core::mock::MockResponse) -> Value {
-    serde_json::from_slice(r.body.bytes().unwrap()).unwrap()
+    serde_json::from_slice(r.body().bytes().unwrap()).unwrap()
 }
 
 fn percentile(mut v: Vec<u64>, p: f64) -> u64 {
@@ -59,20 +59,20 @@ fn mck_01_exact_replay_of_status_headers_and_body() {
         .with_resp_header("connection", "keep-alive")
         .with_resp_header("transfer-encoding", "chunked")
         .with_resp_header("content-length", "11");
-    let mut m = engine(vec![rec.clone()], MockConfig::default());
+    let m = engine(vec![rec.clone()], MockConfig::default());
     let r = matched(m.respond(&req("GET", "/v1/a")));
     assert_eq!(r.status, 201);
-    assert_eq!(r.body, rec.resp_body);
+    assert_eq!(r.body(), &rec.resp_body);
     assert_eq!(r.kind, MatchKind::Exact);
     assert_eq!(r.score, 1.0);
-    let names: Vec<_> = r.headers.iter().map(|h| h.name.as_str()).collect();
+    let names: Vec<_> = r.headers().map(|h| h.name.as_str()).collect();
     assert_eq!(names, vec!["content-type", "x-request-id"]);
 }
 
 #[test]
 fn mck_02_identifier_segments_match_by_template() {
     let rec = out("GET", "/v1/customers/1").resp_json(json!({"id": 1}));
-    let mut m = engine(vec![rec], MockConfig::default());
+    let m = engine(vec![rec], MockConfig::default());
     let r = matched(m.respond(&req("GET", "/v1/customers/2")));
     assert_eq!(r.kind, MatchKind::Template);
     assert!(r.score < 1.0);
@@ -84,7 +84,7 @@ fn mck_02_identifier_segments_match_by_template() {
 
 #[test]
 fn mck_03_unknown_authority_is_unmatched() {
-    let mut m = engine(vec![out("GET", "/v1/a")], MockConfig::default());
+    let m = engine(vec![out("GET", "/v1/a")], MockConfig::default());
     let mut r = req("GET", "/v1/a");
     r.authority = "other.io:443".into();
     assert_eq!(m.respond(&r), MockDecision::Unmatched);
@@ -95,7 +95,7 @@ fn mck_04_latency_follows_recorded_distribution() {
     let recs = (50..=150)
         .map(|ms| out("GET", "/slow").latency_ms(ms))
         .collect();
-    let mut m = engine(recs, MockConfig::default());
+    let m = engine(recs, MockConfig::default());
     let lat: Vec<u64> = (0..1_000)
         .map(|_| matched(m.respond(&req("GET", "/slow"))).latency_us)
         .collect();
@@ -112,7 +112,7 @@ fn mck_05_latency_factor_scales_replay() {
         latency_factor: 2.0,
         ..MockConfig::default()
     };
-    let mut m = engine(recs, config);
+    let m = engine(recs, config);
     let lat: Vec<u64> = (0..1_000)
         .map(|_| matched(m.respond(&req("GET", "/slow"))).latency_us)
         .collect();
@@ -123,7 +123,7 @@ fn mck_05_latency_factor_scales_replay() {
         latency_factor: 0.0,
         ..MockConfig::default()
     };
-    let mut m = engine(vec![out("GET", "/slow").latency_ms(100)], config);
+    let m = engine(vec![out("GET", "/slow").latency_ms(100)], config);
     assert_eq!(matched(m.respond(&req("GET", "/slow"))).latency_us, 0);
 }
 
@@ -138,7 +138,7 @@ fn mck_06_sequence_replays_in_recording_order() {
         strategy: Strategy::Sequence,
         ..MockConfig::default()
     };
-    let mut m = engine(recs, config);
+    let m = engine(recs, config);
     let seen: Vec<Value> = (0..4)
         .map(|_| body_json(&matched(m.respond(&req("GET", "/cart"))))["items"].clone())
         .collect();
@@ -155,7 +155,7 @@ fn mck_06b_round_robin_rotates_over_equivalent_recordings() {
         strategy: Strategy::RoundRobin,
         ..MockConfig::default()
     };
-    let mut m = engine(recs, config);
+    let m = engine(recs, config);
     let seen: Vec<Value> = (0..3)
         .map(|_| body_json(&matched(m.respond(&req("GET", "/r"))))["n"].clone())
         .collect();
@@ -168,7 +168,7 @@ fn best_strategy_prefers_most_recent_among_equals() {
         out("GET", "/b").resp_json(json!({"v": "old"})),
         out("GET", "/b").resp_json(json!({"v": "new"})),
     ];
-    let mut m = engine(recs, MockConfig::default());
+    let m = engine(recs, MockConfig::default());
     assert_eq!(
         body_json(&matched(m.respond(&req("GET", "/b"))))["v"],
         "new"
@@ -185,7 +185,7 @@ fn mck_12_best_prefers_most_frequent_response_among_copies() {
             .status(500)
             .resp_json(json!({"error": "boom"})),
     ];
-    let mut m = engine(recs, MockConfig::default());
+    let m = engine(recs, MockConfig::default());
     let r = matched(m.respond(&req("GET", "/users/7")));
     assert_eq!(r.status, 200);
     assert_eq!(body_json(&r)["name"], "a");
@@ -201,7 +201,7 @@ fn mck_07_weighted_status_reproduces_error_rate() {
         strategy: Strategy::WeightedStatus,
         ..MockConfig::default()
     };
-    let mut m = engine(recs, config);
+    let m = engine(recs, config);
     let throttled = (0..10_000)
         .filter(|_| matched(m.respond(&req("POST", "/charge"))).status == 429)
         .count();
@@ -216,11 +216,10 @@ fn mck_08_content_encoding_is_kept() {
     let rec = out("GET", "/gz")
         .resp_json(json!({"a": 1}))
         .with_resp_header("content-encoding", "gzip");
-    let mut m = engine(vec![rec], MockConfig::default());
+    let m = engine(vec![rec], MockConfig::default());
     let r = matched(m.respond(&req("GET", "/gz")));
     assert!(
-        r.headers
-            .iter()
+        r.headers()
             .any(|h| h.name == "content-encoding" && h.value == "gzip")
     );
     assert_eq!(body_json(&r), json!({"a": 1}));
@@ -233,7 +232,7 @@ fn mck_09_query_values_drive_the_choice() {
         out("GET", "/list?page=2").resp_json(json!({"page": 2})),
         out("GET", "/list?page=3").resp_json(json!({"page": 3})),
     ];
-    let mut m = engine(recs, MockConfig::default());
+    let m = engine(recs, MockConfig::default());
     let r = matched(m.respond(&req("GET", "/list?page=2")));
     assert_eq!(body_json(&r)["page"], 2);
     assert_eq!(r.kind, MatchKind::Exact);
@@ -251,7 +250,7 @@ fn mck_09b_request_body_drives_the_choice() {
             .req_json(json!({"sku": "B"}))
             .resp_json(json!({"r": "B"})),
     ];
-    let mut m = engine(recs, MockConfig::default());
+    let m = engine(recs, MockConfig::default());
     let mut r = req("POST", "/q");
     r.headers = vec![Header::new("content-type", "application/json")];
     r.body = serde_json::to_vec(&json!({"sku": "A"})).unwrap();
@@ -272,7 +271,7 @@ fn match_headers_are_compared_when_configured() {
         match_headers: vec!["x-api-version".into()],
         ..MockConfig::default()
     };
-    let mut m = engine(recs, config);
+    let m = engine(recs, config);
     let mut r = req("GET", "/v");
     r.headers = vec![Header::new("X-Api-Version", "1")];
     assert_eq!(body_json(&matched(m.respond(&r)))["v"], 1);
@@ -280,7 +279,7 @@ fn match_headers_are_compared_when_configured() {
 
 #[test]
 fn mck_10_method_and_authority_are_mandatory() {
-    let mut m = engine(vec![out("GET", "/x")], MockConfig::default());
+    let m = engine(vec![out("GET", "/x")], MockConfig::default());
     assert_eq!(m.respond(&req("POST", "/x")), MockDecision::Unmatched);
     assert_eq!(m.respond(&req("GET", "/y")), MockDecision::Unmatched);
 }
@@ -300,7 +299,7 @@ fn mck_11_same_seed_same_decisions() {
         ..MockConfig::default()
     };
     let run = || {
-        let mut m = engine(recs.clone(), config.clone());
+        let m = engine(recs.clone(), config.clone());
         (0..50)
             .map(|_| {
                 let r = matched(m.respond(&req("GET", "/s")));
@@ -317,7 +316,7 @@ fn inbound_and_bodyless_recordings_are_not_served() {
     inbound.direction = Direction::Inbound;
     let mut skipped = out("GET", "/skip").resp_json(json!({}));
     skipped.resp_body = Body::Skipped { size: 10 };
-    let mut m = engine(vec![inbound, skipped], MockConfig::default());
+    let m = engine(vec![inbound, skipped], MockConfig::default());
     assert_eq!(m.respond(&req("GET", "/in")), MockDecision::Unmatched);
     assert_eq!(m.respond(&req("GET", "/skip")), MockDecision::Unmatched);
 }
@@ -330,7 +329,7 @@ fn bodyless_recordings_still_feed_latency() {
     let recs: Vec<_> = std::iter::once(full)
         .chain(std::iter::repeat_n(slow, 99))
         .collect();
-    let mut m = engine(recs, MockConfig::default());
+    let m = engine(recs, MockConfig::default());
     let lat: Vec<u64> = (0..200)
         .map(|_| matched(m.respond(&req("GET", "/l"))).latency_us)
         .collect();
@@ -345,4 +344,104 @@ fn engine_reports_its_content() {
     );
     assert_eq!(m.len(), 2);
     assert_eq!(m.authorities(), vec![API.to_string()]);
+}
+
+#[test]
+fn mck_13_only_replayable_records_of_the_operation_are_compared() {
+    let mut recs: Vec<Exchange> = (1..=3)
+        .map(|i| {
+            out("GET", &format!("/users/{i}"))
+                .resp_json(json!({"n": i}))
+                .latency_ms(1)
+        })
+        .collect();
+    for i in 0..10_000 {
+        let mut e = out("GET", &format!("/users/{}", 100 + i))
+            .resp_json(json!({}))
+            .latency_ms(50);
+        e.resp_body = Body::Skipped { size: 2 };
+        recs.push(e);
+    }
+    recs.extend((0..5_000).map(|i| out("GET", &format!("/orders/{i}/lines")).resp_json(json!({}))));
+    let m = engine(recs, MockConfig::default());
+    let r = req("GET", "/users/9");
+    assert_eq!(m.candidates(&r), 3);
+    let lat: Vec<u64> = (0..500)
+        .map(|_| matched(m.respond(&r)).latency_us)
+        .collect();
+    assert!(lat.contains(&50_000), "durées sans body ignorées");
+    assert_eq!(percentile(lat, 0.5), 50_000);
+    assert_eq!(m.candidates(&req("GET", "/orders/1/lines")), 5_000);
+    assert_eq!(m.candidates(&req("GET", "/users/me")), 0);
+    assert_eq!(m.respond(&req("GET", "/users/me")), MockDecision::Unmatched);
+}
+
+#[test]
+fn mck_14_engine_is_shared_between_threads() {
+    fn shared<T: Send + Sync>(_: &T) {}
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 1_000;
+    let mut recs: Vec<Exchange> = (0..4)
+        .map(|i| {
+            out("GET", "/rr")
+                .resp_json(json!({"n": i}))
+                .latency_ms(10 + i)
+        })
+        .collect();
+    recs.extend((0..20).map(|i| {
+        out("GET", "/w")
+            .status(if i % 5 == 0 { 503 } else { 200 })
+            .latency_ms(1 + i)
+    }));
+    recs.push(out("GET", "/best").resp_json(json!({"ok": 1})));
+    recs.push(
+        out("GET", "/best")
+            .resp_json(json!({"ok": 1}))
+            .latency_ms(9),
+    );
+    // Réponses servies (code, latence, échange), triées : l'ordre d'arrivée ne compte pas.
+    let run = |strategy: Strategy, path: &'static str, concurrent: bool| {
+        let config = MockConfig {
+            strategy,
+            seed: 7,
+            ..MockConfig::default()
+        };
+        let m = engine(recs.clone(), config);
+        shared(&m);
+        let one = |m: &MockEngine| {
+            let r = matched(m.respond(&req("GET", path)));
+            (r.status, r.latency_us, r.exchange_id.clone())
+        };
+        let mut served: Vec<(u16, u64, String)> = if concurrent {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| s.spawn(|| (0..PER_THREAD).map(|_| one(&m)).collect::<Vec<_>>()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            })
+        } else {
+            (0..THREADS * PER_THREAD).map(|_| one(&m)).collect()
+        };
+        served.sort();
+        served
+    };
+    assert_eq!(
+        run(Strategy::Best, "/best", true),
+        run(Strategy::Best, "/best", false)
+    );
+    let weighted = run(Strategy::WeightedStatus, "/w", true);
+    assert!(weighted.iter().any(|r| r.0 == 503));
+    assert_eq!(weighted, run(Strategy::WeightedStatus, "/w", false));
+    let mut per: std::collections::BTreeMap<String, usize> = Default::default();
+    for (_, _, id) in run(Strategy::RoundRobin, "/rr", true) {
+        *per.entry(id).or_default() += 1;
+    }
+    assert_eq!(per.len(), 4, "{per:?}");
+    assert!(
+        per.values().all(|n| *n == THREADS * PER_THREAD / 4),
+        "{per:?}"
+    );
 }

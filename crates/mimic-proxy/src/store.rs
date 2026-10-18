@@ -304,12 +304,14 @@ impl Store {
             .collect()
     }
 
-    pub fn snapshot_direction(&self, direction: Direction) -> Vec<Exchange> {
+    /// Échanges d'un sens, partagés avec le store (aucune copie) : de quoi construire le
+    /// moteur de mock hors du verrou.
+    pub fn shared_direction(&self, direction: Direction) -> Vec<Arc<Exchange>> {
         self.lock()
             .list
             .values()
             .filter(|en| en.e.direction == direction)
-            .map(|en| Exchange::clone(&en.e))
+            .map(|en| en.e.clone())
             .collect()
     }
 

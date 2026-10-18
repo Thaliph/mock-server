@@ -1,12 +1,19 @@
 //! Moteur du mode mock : choisit la réponse enregistrée à servir pour une requête sortante
 //! (spec §5.3). Pur et déterministe à graine égale ; l'attente et l'envoi sont faits par le proxy.
+//!
+//! Le moteur est immuable une fois construit et partageable entre threads (`respond(&self)`) :
+//! l'aléa avance par un pas atomique, seuls les curseurs de `round-robin` et `sequence` ont un
+//! verrou. Les enregistrements sont indexés par (authority, méthode, forme du chemin) : une
+//! requête ne compare que les candidats rejouables de son opération.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::infer::path::is_identifier;
 use crate::model::{Body, Direction, Exchange, Header, is_json, media_type};
+use crate::sample::push_path_shape;
 
 /// Headers à ne jamais rejouer : propres à une connexion, ou recalculés par le proxy.
 const HOP_BY_HOP: &[&str] = &[
@@ -26,6 +33,9 @@ const W_PATH: f64 = 0.4;
 const W_QUERY: f64 = 0.3;
 const W_HEADERS: f64 = 0.1;
 const W_BODY: f64 = 0.2;
+
+/// Pas de SplitMix64.
+const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Choix parmi plusieurs enregistrements candidats.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,14 +104,32 @@ impl MatchKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MockResponse {
     pub status: u16,
-    pub headers: Vec<Header>,
-    pub body: Body,
     /// Latence à appliquer avant de répondre, en microsecondes.
     pub latency_us: u64,
     pub kind: MatchKind,
     pub score: f64,
     /// Identifiant de l'échange rejoué.
     pub exchange_id: String,
+    /// Rang de l'enregistrement rejoué parmi les rejouables du moteur (`0..replayable()`) :
+    /// permet au proxy de préparer la réponse une fois par enregistrement.
+    pub record: usize,
+    /// Échange rejoué, partagé avec le moteur (aucune copie du body).
+    pub exchange: Arc<Exchange>,
+}
+
+impl MockResponse {
+    /// Headers à rejouer : ceux de la réponse enregistrée, hors headers propres à la connexion.
+    pub fn headers(&self) -> impl Iterator<Item = &Header> {
+        self.exchange
+            .resp_headers
+            .iter()
+            .filter(|h| !HOP_BY_HOP.contains(&h.name.as_str()))
+    }
+
+    /// Body enregistré (décodé ; l'encodage d'origine est dans `content-encoding`).
+    pub fn body(&self) -> &Body {
+        &self.exchange.resp_body
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,11 +138,45 @@ pub enum MockDecision {
     Unmatched,
 }
 
-/// Enregistrement indexé, avec ce que le score compare déjà calculé : une requête mockée
-/// parcourt tous les candidats de son opération, sans relire leurs bodies JSON.
+/// Source d'enregistrements pour le moteur : un échange, une référence ou un `Arc`. Seuls les
+/// enregistrements rejouables sont gardés (`into_shared`) ; un `Arc` n'est pas copié.
+pub trait Recording {
+    fn exchange(&self) -> &Exchange;
+    fn into_shared(self) -> Arc<Exchange>;
+}
+
+impl Recording for Exchange {
+    fn exchange(&self) -> &Exchange {
+        self
+    }
+    fn into_shared(self) -> Arc<Exchange> {
+        Arc::new(self)
+    }
+}
+
+impl Recording for Arc<Exchange> {
+    fn exchange(&self) -> &Exchange {
+        self
+    }
+    fn into_shared(self) -> Arc<Exchange> {
+        self
+    }
+}
+
+impl Recording for &Exchange {
+    fn exchange(&self) -> &Exchange {
+        self
+    }
+    fn into_shared(self) -> Arc<Exchange> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Enregistrement rejouable indexé, avec ce que le score compare déjà calculé : une requête
+/// mockée parcourt les candidats de son opération sans relire leurs bodies JSON.
 #[derive(Debug)]
 struct Recorded {
-    e: Exchange,
+    e: Arc<Exchange>,
     segments: Vec<String>,
     query: BTreeSet<String>,
     /// Content-type JSON déclaré, si la requête enregistrée en porte un.
@@ -160,7 +222,7 @@ fn json_parts(body: &[u8]) -> (Option<Value>, BTreeSet<String>) {
 }
 
 impl Recorded {
-    fn new(e: Exchange) -> Self {
+    fn new(e: Arc<Exchange>) -> Self {
         let (json, pairs) = json_parts(e.req_body.bytes().unwrap_or_default());
         Self {
             segments: segments(&e.path),
@@ -173,40 +235,96 @@ impl Recorded {
     }
 }
 
-/// Index des enregistrements sortants servables.
+/// Clé d'une opération : authority, méthode en majuscules et forme du chemin (§5.2), séparées
+/// par `\u{1}` (absent d'une authority, d'une méthode et d'une forme). Deux chemins sont égaux
+/// ou de même template si et seulement s'ils ont la même forme.
+fn op_key(authority: &str, method: &str, path: &str) -> String {
+    let mut key = String::with_capacity(authority.len() + method.len() + path.len() + 8);
+    key.push_str(authority);
+    key.push('\u{1}');
+    key.extend(method.chars().map(|c| c.to_ascii_uppercase()));
+    key.push('\u{1}');
+    push_path_shape(&mut key, path);
+    key
+}
+
+/// Enregistrements d'une opération.
+#[derive(Debug, Default)]
+struct Group {
+    /// Rangs des enregistrements rejouables, dans l'ordre chronologique.
+    records: Vec<usize>,
+    /// Durées de tous les enregistrements de l'opération, rejouables ou non, dans l'ordre
+    /// chronologique : la distribution où la latence est tirée.
+    latencies: Vec<u64>,
+}
+
+/// Index des enregistrements sortants servables, immuable et partageable entre threads.
 #[derive(Debug)]
 pub struct MockEngine {
     config: MockConfig,
-    /// Enregistrements triés chronologiquement, par (authority, méthode).
-    by_route: BTreeMap<(String, String), Vec<Recorded>>,
-    cursors: BTreeMap<String, usize>,
-    rng: SplitMix64,
+    /// Enregistrements rejouables ; `MockResponse::record` en est le rang.
+    records: Vec<Recorded>,
+    /// Par clé d'opération (`op_key`).
+    groups: BTreeMap<String, Group>,
+    authorities: BTreeSet<String>,
+    cursors: Mutex<BTreeMap<String, usize>>,
+    /// État de SplitMix64, avancé d'un pas atomique par réponse.
+    rng: AtomicU64,
     len: usize,
 }
 
 impl MockEngine {
-    pub fn new(exchanges: Vec<Exchange>, config: MockConfig) -> Self {
-        let mut by_route: BTreeMap<(String, String), Vec<Recorded>> = BTreeMap::new();
+    /// Construit le moteur ; les échanges entrants ou sans réponse sont ignorés, et seuls les
+    /// rejouables sont gardés (les autres ne laissent que leur durée).
+    pub fn new<R: Recording>(exchanges: impl IntoIterator<Item = R>, config: MockConfig) -> Self {
+        let mut by_op: BTreeMap<String, Vec<R>> = BTreeMap::new();
         let mut len = 0;
-        for e in exchanges {
+        for r in exchanges {
+            let e = r.exchange();
             if e.direction != Direction::Outbound || e.status == 0 {
                 continue;
             }
             len += 1;
-            by_route
-                .entry((e.authority.clone(), e.method.to_ascii_uppercase()))
-                .or_default()
-                .push(Recorded::new(e));
+            let key = op_key(&e.authority, &e.method, &e.path);
+            match by_op.get_mut(&key) {
+                Some(list) => list.push(r),
+                None => {
+                    by_op.insert(key, vec![r]);
+                }
+            }
         }
-        for list in by_route.values_mut() {
-            list.sort_by(|a, b| (a.e.started_at_ms, &a.e.id).cmp(&(b.e.started_at_ms, &b.e.id)));
+        let mut records = vec![];
+        let mut groups = BTreeMap::new();
+        let mut authorities = BTreeSet::new();
+        for (key, mut items) in by_op {
+            items.sort_by(|a, b| {
+                let (a, b) = (a.exchange(), b.exchange());
+                (a.started_at_ms, &a.id).cmp(&(b.started_at_ms, &b.id))
+            });
+            let mut g = Group {
+                records: vec![],
+                latencies: items.iter().map(|r| r.exchange().total_us).collect(),
+            };
+            for r in items {
+                if r.exchange().resp_body.is_replayable() {
+                    g.records.push(records.len());
+                    records.push(Recorded::new(r.into_shared()));
+                }
+            }
+            if let Some((authority, _)) = key.split_once('\u{1}')
+                && !authorities.contains(authority)
+            {
+                authorities.insert(authority.to_string());
+            }
+            groups.insert(key, g);
         }
-        let rng = SplitMix64(config.seed);
         Self {
+            rng: AtomicU64::new(config.seed),
             config,
-            by_route,
-            cursors: BTreeMap::new(),
-            rng,
+            records,
+            groups,
+            authorities,
+            cursors: Mutex::new(BTreeMap::new()),
             len,
         }
     }
@@ -220,31 +338,43 @@ impl MockEngine {
         self.len == 0
     }
 
-    /// Authorities pour lesquelles des enregistrements existent.
-    pub fn authorities(&self) -> Vec<String> {
-        let set: BTreeSet<&String> = self.by_route.keys().map(|(a, _)| a).collect();
-        set.into_iter().cloned().collect()
+    /// Nombre d'enregistrements rejouables : les valeurs possibles de `MockResponse::record`.
+    pub fn replayable(&self) -> usize {
+        self.records.len()
     }
 
-    pub fn respond(&mut self, req: &MockRequest) -> MockDecision {
-        let Self {
-            config,
-            by_route,
-            cursors,
-            rng,
-            ..
-        } = self;
-        let key = (req.authority.clone(), req.method.to_ascii_uppercase());
-        let Some(list) = by_route.get(&key) else {
+    /// Authorities pour lesquelles des enregistrements existent.
+    pub fn authorities(&self) -> Vec<String> {
+        self.authorities.iter().cloned().collect()
+    }
+
+    fn group(&self, req: &MockRequest) -> Option<&Group> {
+        self.groups
+            .get(&op_key(&req.authority, &req.method, &req.path))
+    }
+
+    /// Nombre d'enregistrements comparés à cette requête : les rejouables de son opération.
+    pub fn candidates(&self, req: &MockRequest) -> usize {
+        self.group(req).map_or(0, |g| g.records.len())
+    }
+
+    /// Deux tirages indépendants issus d'un seul pas du générateur : sous concurrence, chaque
+    /// réponse reçoit un état distinct, et l'ensemble des états est celui d'une exécution en
+    /// série de même graine.
+    fn draw(&self) -> (u64, u64) {
+        let s = self
+            .rng
+            .fetch_add(GAMMA, Ordering::Relaxed)
+            .wrapping_add(GAMMA);
+        (mix(s), mix(s ^ 0xD6E8_FEB8_6659_FD93))
+    }
+
+    pub fn respond(&self, req: &MockRequest) -> MockDecision {
+        let config = &self.config;
+        let Some(group) = self.group(req).filter(|g| !g.records.is_empty()) else {
             return MockDecision::Unmatched;
         };
-        // Candidats de même opération : chemin égal ou de même template.
         let requested = segments(&req.path);
-        let same_op: Vec<(&Recorded, PathMatch)> = list
-            .iter()
-            .filter_map(|r| path_match(&r.segments, &requested).map(|m| (r, m)))
-            .collect();
-        let latencies: Vec<u64> = same_op.iter().map(|(r, _)| r.e.total_us).collect();
         let (json, pairs) = json_parts(&req.body);
         let probe = Probe {
             query: query_pairs(&req.query),
@@ -252,35 +382,38 @@ impl MockEngine {
             json,
             pairs,
         };
-        let servable: Vec<(&Exchange, PathMatch, f64)> = same_op
-            .into_iter()
-            .filter(|(r, _)| r.e.resp_body.is_replayable())
-            .map(|(r, m)| (&r.e, m, score(config, r, m, req, &probe)))
+        // Même forme de chemin : égal, ou seulement de même template.
+        let servable: Vec<(usize, PathMatch, f64)> = group
+            .records
+            .iter()
+            .map(|&i| {
+                let r = &self.records[i];
+                let m = if r.segments == requested {
+                    PathMatch::Exact
+                } else {
+                    PathMatch::Template
+                };
+                (i, m, score(config, r, m, req, &probe))
+            })
             .collect();
-        if servable.is_empty() {
-            return MockDecision::Unmatched;
-        }
         let best = servable.iter().map(|(_, _, s)| *s).fold(f64::MIN, f64::max);
-        let top: Vec<&(&Exchange, PathMatch, f64)> =
+        let top: Vec<&(usize, PathMatch, f64)> =
             servable.iter().filter(|(_, _, s)| *s == best).collect();
-        let cursor_key = format!("{}|{}|{}", key.0, key.1, req.path);
+        let (pick, latency_draw) = self.draw();
 
         let chosen = match config.strategy {
-            Strategy::Best => most_frequent(&top),
+            Strategy::Best => self.most_frequent(&top),
             Strategy::RoundRobin => {
-                let i = next_cursor(cursors, cursor_key);
+                let i = self.next_cursor(req);
                 top[i % top.len()]
             }
             Strategy::Sequence => {
-                let i = next_cursor(cursors, cursor_key);
+                let i = self.next_cursor(req);
                 &servable[i % servable.len()]
             }
-            Strategy::WeightedStatus => {
-                let i = rng.below(top.len() as u64) as usize;
-                top[i]
-            }
+            Strategy::WeightedStatus => top[below(pick, top.len())],
         };
-        let (e, m, score) = (chosen.0, chosen.1, chosen.2);
+        let (record, m, score) = *chosen;
         let kind = if m == PathMatch::Template {
             MatchKind::Template
         } else if score >= 1.0 {
@@ -289,52 +422,68 @@ impl MockEngine {
             MatchKind::Fuzzy
         };
 
-        let sampled = latencies[rng.below(latencies.len() as u64) as usize];
+        let sampled = group.latencies[below(latency_draw, group.latencies.len())];
         let latency_us = (sampled as f64 * config.latency_factor.max(0.0)).round() as u64;
-
+        let e = &self.records[record].e;
         MockDecision::Matched(MockResponse {
             status: e.status,
-            headers: e
-                .resp_headers
-                .iter()
-                .filter(|h| !HOP_BY_HOP.contains(&h.name.as_str()))
-                .cloned()
-                .collect(),
-            body: e.resp_body.clone(),
             latency_us,
             kind,
             score: (score * 100.0).round() / 100.0,
             exchange_id: e.id.clone(),
+            record,
+            exchange: e.clone(),
         })
     }
-}
 
-/// Réponse la plus fréquente parmi des candidats triés chronologiquement ; à égalité,
-/// celle dont l'exemplaire est le plus récent. Renvoie l'exemplaire le plus récent.
-fn most_frequent<'a, T>(top: &[&'a (&'a Exchange, T, f64)]) -> &'a (&'a Exchange, T, f64) {
-    // Par réponse (code, body) : nombre d'exemplaires et index du plus récent.
-    let mut groups: BTreeMap<(u16, &[u8]), (usize, usize)> = BTreeMap::new();
-    for (i, c) in top.iter().enumerate() {
-        let e = c.0;
-        let g = groups
-            .entry((e.status, e.resp_body.bytes().unwrap_or_default()))
-            .or_default();
-        g.0 += 1;
-        g.1 = i;
+    /// Réponse la plus fréquente parmi des candidats triés chronologiquement ; à égalité,
+    /// celle dont l'exemplaire est le plus récent. Renvoie l'exemplaire le plus récent.
+    fn most_frequent<'a, T>(&self, top: &[&'a (usize, T, f64)]) -> &'a (usize, T, f64) {
+        // Par réponse (code, body) : nombre d'exemplaires et index du plus récent.
+        let mut groups: BTreeMap<(u16, &[u8]), (usize, usize)> = BTreeMap::new();
+        for (i, c) in top.iter().enumerate() {
+            let e = &self.records[c.0].e;
+            let g = groups
+                .entry((e.status, e.resp_body.bytes().unwrap_or_default()))
+                .or_default();
+            g.0 += 1;
+            g.1 = i;
+        }
+        let (_, last) = groups
+            .values()
+            .max_by_key(|(count, last)| (*count, *last))
+            .copied()
+            .expect("top non vide");
+        top[last]
     }
-    let (_, last) = groups
-        .values()
-        .max_by_key(|(count, last)| (*count, *last))
-        .copied()
-        .expect("top non vide");
-    top[last]
+
+    /// Curseur de `round-robin` et `sequence`, par chemin demandé ; seul verrou du moteur.
+    fn next_cursor(&self, req: &MockRequest) -> usize {
+        let key = format!(
+            "{}|{}|{}",
+            req.authority,
+            req.method.to_ascii_uppercase(),
+            req.path
+        );
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        let c = cursors.entry(key).or_default();
+        let i = *c;
+        *c += 1;
+        i
+    }
 }
 
-fn next_cursor(cursors: &mut BTreeMap<String, usize>, key: String) -> usize {
-    let c = cursors.entry(key).or_default();
-    let i = *c;
-    *c += 1;
-    i
+/// Finaliseur de SplitMix64 : rapide, reproductible, suffisant pour du tirage non
+/// cryptographique.
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Rang dans `0..n` tiré de `v`.
+fn below(v: u64, n: usize) -> usize {
+    if n <= 1 { 0 } else { (v % n as u64) as usize }
 }
 
 fn score(config: &MockConfig, r: &Recorded, m: PathMatch, req: &MockRequest, probe: &Probe) -> f64 {
@@ -362,26 +511,6 @@ fn score(config: &MockConfig, r: &Recorded, m: PathMatch, req: &MockRequest, pro
 enum PathMatch {
     Exact,
     Template,
-}
-
-/// Chemins égaux, ou de même forme : seuls diffèrent des segments identifiants de même nature.
-fn path_match(a: &[String], b: &[String]) -> Option<PathMatch> {
-    if a == b {
-        return Some(PathMatch::Exact);
-    }
-    if a.len() != b.len() {
-        return None;
-    }
-    let compatible = a
-        .iter()
-        .zip(b)
-        .all(|(x, y)| x == y || (is_identifier(x) && is_identifier(y) && same_shape(x, y)));
-    compatible.then_some(PathMatch::Template)
-}
-
-fn same_shape(a: &str, b: &str) -> bool {
-    use crate::infer::path::SegmentKind;
-    SegmentKind::of(a) == SegmentKind::of(b)
 }
 
 fn find<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
@@ -422,22 +551,4 @@ fn top_level_pairs(v: &Value) -> impl Iterator<Item = String> + '_ {
     v.as_object()
         .into_iter()
         .flat_map(|m| m.iter().map(|(k, v)| format!("{k}={v}")))
-}
-
-/// Générateur SplitMix64 : rapide, reproductible, suffisant pour du tirage non cryptographique.
-#[derive(Debug, Clone)]
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        if n <= 1 { 0 } else { self.next() % n }
-    }
 }
