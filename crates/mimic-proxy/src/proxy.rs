@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 
 use crate::capture::{Captured, TeeBody};
 use crate::config::{InboundCapture, Mode, Unmatched};
-use crate::engine::{MockSet, Trigger};
+use crate::engine::{Arrived, MockSet, Trigger};
 use crate::metrics::DirectionLabel;
 use crate::state::{AppState, BoxError, ProxyBody};
 use crate::store::{Added, Origin};
@@ -632,12 +632,21 @@ async fn serve_mock(
     let mut decision = set.engine.respond(&request);
     if state.is_stale(&set, seen) {
         if decision == MockDecision::Unmatched {
-            // Le store a changé : l'enregistrement cherché vient peut-être d'arriver.
-            set = state.fresh_engine(Trigger::Unmatched, seen).await;
-            decision = set.engine.respond(&request);
-        } else {
-            state.schedule_refresh();
+            // Le store a changé : l'enregistrement cherché vient peut-être d'arriver. Il est
+            // cherché parmi les ajouts de son opération, sans reconstruire le moteur.
+            match state.recent_engine(&set, &request) {
+                Arrived::Nothing => {}
+                Arrived::Engine(recent) => {
+                    decision = recent.engine.respond(&request);
+                    set = recent;
+                }
+                Arrived::Unknown => {
+                    set = state.fresh_engine(Trigger::Unmatched, seen).await;
+                    decision = set.engine.respond(&request);
+                }
+            }
         }
+        state.schedule_refresh();
     }
     let authority_label = state.metrics.authority(&target.authority);
     let method = request.method;

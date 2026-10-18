@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use mimic_core::mock::op_key;
 use mimic_core::model::{Body, Direction, Exchange};
 use mimic_core::sample::{Offer, Reservoir, priority, sample_key};
 use prometheus_client::metrics::counter::Counter;
@@ -23,6 +24,29 @@ pub enum Origin {
     Local,
     /// Importé d'un autre sidecar du workload.
     Peer,
+}
+
+/// Au-delà de ce nombre d'échanges sortants ajoutés sans publication d'un moteur de mock,
+/// l'index des ajouts est abandonné (spec §5.3).
+pub const MAX_ADDITIONS: usize = 4_096;
+
+/// Échanges sortants ajoutés depuis la construction du moteur de mock en service, par
+/// opération (`mimic_core::mock::op_key`) : une requête sans correspondance y cherche les
+/// enregistrements de son opération arrivés depuis, sans reconstruire le moteur (spec §5.3).
+struct Additions {
+    /// Numéro d'arrivée à partir duquel l'index est complet.
+    from: u64,
+    by_op: BTreeMap<String, Vec<(u64, Arc<Exchange>)>>,
+    len: usize,
+}
+
+/// Ce que l'index des ajouts sait d'une opération.
+#[derive(Debug)]
+pub enum Recent {
+    /// Échanges de l'opération arrivés depuis le numéro demandé (liste éventuellement vide).
+    Since(Vec<Arc<Exchange>>),
+    /// Index non tenu, abandonné ou plus récent que le numéro demandé.
+    Unknown,
 }
 
 /// Résultat d'un ajout.
@@ -110,6 +134,8 @@ struct Inner {
     /// Segment en cours de publication : les `count` premiers échanges de `unshared`, sous
     /// cet identifiant, jusqu'à ce que le support l'accepte.
     sealed: Option<Sealed>,
+    /// Index des échanges sortants ajoutés, tenu pendant le mock sans snapshot.
+    additions: Option<Additions>,
 }
 
 struct Sealed {
@@ -252,6 +278,9 @@ impl Store {
         }
         inner.bytes += bytes;
         inner.body_bytes += body_bytes;
+        if e.direction == Direction::Outbound {
+            inner.index_addition(seq, &e);
+        }
         let journal = (local && self.journal.get().is_some()).then(|| e.clone());
         inner.list.insert(
             seq,
@@ -319,6 +348,68 @@ impl Store {
             .filter(|en| en.e.direction == direction)
             .map(|en| en.e.clone())
             .collect()
+    }
+
+    /// Échanges sortants partagés et numéro d'arrivée du suivant (`watermark`) : de quoi
+    /// construire un moteur de mock hors du verrou. Avec `track`, les échanges sortants ajoutés
+    /// ensuite sont indexés par opération, au moins à partir de ce numéro.
+    pub fn outbound_for_engine(&self, track: bool) -> (u64, Vec<Arc<Exchange>>) {
+        let mut inner = self.lock();
+        let watermark = inner.next;
+        if !track {
+            inner.additions = None;
+        } else if inner.additions.is_none() {
+            inner.additions = Some(Additions {
+                from: watermark,
+                by_op: BTreeMap::new(),
+                len: 0,
+            });
+        }
+        let list = inner
+            .list
+            .values()
+            .filter(|en| en.e.direction == Direction::Outbound)
+            .map(|en| en.e.clone())
+            .collect();
+        (watermark, list)
+    }
+
+    /// Un moteur construit sur les échanges d'avant `watermark` est publié : les ajouts
+    /// antérieurs sont oubliés.
+    pub fn forget_additions_before(&self, watermark: u64) {
+        let mut inner = self.lock();
+        let Some(a) = inner.additions.as_mut() else {
+            return;
+        };
+        a.from = a.from.max(watermark);
+        a.by_op.retain(|_, list| {
+            list.retain(|(seq, _)| *seq >= watermark);
+            !list.is_empty()
+        });
+        a.len = a.by_op.values().map(Vec::len).sum();
+    }
+
+    /// N'indexe plus les ajouts (sortie du mock, ou mock sur un snapshot).
+    pub fn stop_additions(&self) {
+        self.lock().additions = None;
+    }
+
+    /// Échanges sortants de l'opération `op` (`mimic_core::mock::op_key`) arrivés à partir du
+    /// numéro `watermark`.
+    pub fn additions_since(&self, op: &str, watermark: u64) -> Recent {
+        let inner = self.lock();
+        match &inner.additions {
+            Some(a) if a.from <= watermark => Recent::Since(
+                a.by_op
+                    .get(op)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(seq, _)| *seq >= watermark)
+                    .map(|(_, e)| e.clone())
+                    .collect(),
+            ),
+            _ => Recent::Unknown,
+        }
     }
 
     /// Les plus récents d'abord.
@@ -470,6 +561,23 @@ impl Store {
 }
 
 impl Inner {
+    /// Indexe un échange sortant ajouté, si l'index est tenu ; au-delà de `MAX_ADDITIONS`,
+    /// l'index est abandonné.
+    fn index_addition(&mut self, seq: u64, e: &Arc<Exchange>) {
+        let Some(a) = self.additions.as_mut() else {
+            return;
+        };
+        if a.len >= MAX_ADDITIONS {
+            self.additions = None;
+            return;
+        }
+        a.by_op
+            .entry(op_key(&e.authority, &e.method, &e.path))
+            .or_default()
+            .push((seq, e.clone()));
+        a.len += 1;
+    }
+
     /// Retire les bodies d'un échange ; vrai s'il est sortant.
     fn strip(&mut self, seq: u64) -> bool {
         let Some(entry) = self.list.get_mut(&seq) else {
@@ -623,6 +731,48 @@ mod tests {
         assert_eq!(s.add(ex("1", "/a"), Origin::Local), Added::Stored);
         assert_eq!(s.add(ex("1", "/a"), Origin::Peer), Added::Duplicate);
         assert_eq!(s.len(), 1);
+    }
+
+    fn ids_since(s: &Store, path: &str, watermark: u64) -> Option<Vec<String>> {
+        match s.additions_since(&op_key("a:80", "GET", path), watermark) {
+            Recent::Since(list) => Some(list.iter().map(|e| e.id.clone()).collect()),
+            Recent::Unknown => None,
+        }
+    }
+
+    /// Index des ajouts de MCK-21 : par opération, oublié à la publication, abandonné au-delà
+    /// de sa borne.
+    #[test]
+    fn mck_21_additions_are_indexed_per_operation() {
+        let s = Store::new(10_000, 10);
+        s.add(ex("old", "/users/1"), Origin::Local);
+        assert_eq!(ids_since(&s, "/users/1", 0), None, "index non tenu");
+        let (w1, list) = s.outbound_for_engine(true);
+        assert_eq!(list.len(), 1);
+        s.add(ex("u2", "/users/2"), Origin::Local);
+        s.add(ex("o1", "/orders"), Origin::Peer);
+        let mut inbound = ex("in", "/users/3");
+        inbound.direction = Direction::Inbound;
+        s.add(inbound, Origin::Local);
+        // Même forme de chemin : même opération.
+        assert_eq!(ids_since(&s, "/users/9", w1), Some(vec!["u2".to_string()]));
+        assert_eq!(ids_since(&s, "/nothing", w1), Some(vec![]));
+        // Un moteur plus récent est publié : l'ancien numéro n'est plus couvert.
+        let (w2, _) = s.outbound_for_engine(true);
+        s.forget_additions_before(w2);
+        assert_eq!(ids_since(&s, "/users/9", w1), None);
+        assert_eq!(ids_since(&s, "/users/9", w2), Some(vec![]));
+        s.add(ex("u4", "/users/4"), Origin::Local);
+        assert_eq!(ids_since(&s, "/users/9", w2), Some(vec!["u4".to_string()]));
+        // Au-delà de la borne, l'index est abandonné jusqu'au prochain moteur.
+        for i in 0..MAX_ADDITIONS {
+            s.add(ex(&format!("x{i}"), "/x"), Origin::Local);
+        }
+        assert_eq!(ids_since(&s, "/users/9", w2), None);
+        let (w3, _) = s.outbound_for_engine(true);
+        assert_eq!(ids_since(&s, "/users/9", w3), Some(vec![]));
+        s.stop_additions();
+        assert_eq!(ids_since(&s, "/users/9", w3), None);
     }
 
     #[test]

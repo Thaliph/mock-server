@@ -5,8 +5,10 @@
 //!   les requêtes avec correspondance ne prennent jamais.
 //! - Il est construit à la bascule (mode ou snapshot). Sans snapshot, le store change encore :
 //!   un moteur périmé continue de servir et un moteur à jour est reconstruit en tâche de fond,
-//!   au plus une fois par seconde ; une requête sans correspondance dans un moteur périmé attend
-//!   un moteur à jour avant de conclure.
+//!   au plus une fois par seconde. Une requête sans correspondance dans un moteur périmé est
+//!   comparée aux échanges de son opération arrivés depuis sa construction (index des ajouts
+//!   du store) : un échange relayé en `mock-partial` ne reconstruit pas le moteur. Si l'index a
+//!   été abandonné, elle attend un moteur à jour avant de conclure.
 //! - La réponse de chaque enregistrement (headers, body réencodé) est préparée une seule fois.
 //! - L'attente de la latence rejouée est faite à la microseconde (timerfd).
 
@@ -18,14 +20,15 @@ use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use http::StatusCode;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
-use mimic_core::mock::{MockConfig, MockEngine, MockResponse};
-use mimic_core::model::{Body, Direction};
+use mimic_core::mock::{MockConfig, MockEngine, MockRequest, MockResponse, op_key};
+use mimic_core::model::Body;
 use mimic_core::snapshot::Snapshot;
 
 use crate::capture::encode;
 use crate::config::Mode;
 use crate::metrics::TriggerLabel;
 use crate::state::AppState;
+use crate::store::Recent;
 
 /// Intervalle minimal entre deux reconstructions en tâche de fond.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -37,7 +40,8 @@ pub enum Trigger {
     Switch,
     /// Reconstruction en tâche de fond après un changement du store.
     Refresh,
-    /// Requête sans correspondance dans un moteur périmé.
+    /// Requête sans correspondance dans un moteur périmé, quand l'index des ajouts a été
+    /// abandonné.
     Unmatched,
 }
 
@@ -56,8 +60,23 @@ impl Trigger {
 pub enum Source {
     /// Snapshot imposé par le contrôleur : figé, jamais périmé.
     Snapshot(String),
-    /// Échanges sortants du store, à cette `outbound_version`.
-    Store(u64),
+    /// Échanges sortants du store, à cette `outbound_version`, arrivés avant le numéro
+    /// `watermark`.
+    Store { version: u64, watermark: u64 },
+    /// Échanges d'une opération arrivés depuis le moteur en service : moteur d'une requête,
+    /// jamais publié.
+    Recent,
+}
+
+/// Échanges d'une opération arrivés depuis la construction du moteur en service.
+pub enum Arrived {
+    /// Aucun : la requête n'a pas de correspondance.
+    Nothing,
+    /// Moteur construit sur eux seuls, pour cette requête.
+    Engine(Arc<MockSet>),
+    /// L'index des ajouts ne remonte pas jusque-là (abandonné, ou un moteur plus récent a été
+    /// publié) : il faut un moteur à jour.
+    Unknown,
 }
 
 /// Réponse prête à servir : seuls le header `x-mimic-match` et la latence varient d'une
@@ -185,23 +204,62 @@ impl AppState {
     /// Vrai si ce moteur a été construit avant la version `seen` du store sortant (lue à
     /// l'arrivée d'une requête) : des enregistrements arrivés depuis lui manquent.
     pub fn is_stale(&self, set: &MockSet, seen: u64) -> bool {
-        matches!(set.source, Source::Store(v) if v < seen)
+        matches!(set.source, Source::Store { version, .. } if version < seen)
+    }
+
+    /// Échanges de l'opération de `req` arrivés depuis la construction de `set`, sans
+    /// reconstruire celui-ci.
+    pub fn recent_engine(&self, set: &MockSet, req: &MockRequest) -> Arrived {
+        let Source::Store { watermark, .. } = set.source else {
+            return Arrived::Nothing;
+        };
+        let op = op_key(&req.authority, &req.method, &req.path);
+        match self.store.additions_since(&op, watermark) {
+            Recent::Since(list) if list.is_empty() => Arrived::Nothing,
+            Recent::Since(list) => Arrived::Engine(Arc::new(MockSet::new(
+                Source::Recent,
+                MockEngine::new(list, self.mock_config()),
+            ))),
+            Recent::Unknown => Arrived::Unknown,
+        }
+    }
+
+    /// Publie un moteur ; les ajouts qu'il connaît sortent de l'index.
+    fn publish(&self, set: Arc<MockSet>) {
+        let watermark = match set.source {
+            Source::Store { watermark, .. } => Some(watermark),
+            _ => None,
+        };
+        self.engines.current.store(Some(set));
+        if let Some(w) = watermark {
+            self.store.forget_additions_before(w);
+        }
     }
 
     /// Construit un moteur sur `snapshot`, ou sur le store sans snapshot ; à appeler sous le
-    /// verrou de construction, qui sérialise aussi la publication.
-    fn build_locked(&self, snapshot: Option<&Snapshot>, trigger: Trigger) -> Arc<MockSet> {
+    /// verrou de construction, qui sérialise aussi la publication. `track` : le moteur servira
+    /// le mock, les ajouts suivants du store sont indexés.
+    fn build_locked(
+        &self,
+        snapshot: Option<&Snapshot>,
+        trigger: Trigger,
+        track: bool,
+    ) -> Arc<MockSet> {
         let set = match snapshot {
-            Some(s) => MockSet::new(
-                Source::Snapshot(s.id.clone()),
-                MockEngine::new(s.exchanges.iter(), self.mock_config()),
-            ),
+            Some(s) => {
+                // Un snapshot est figé : rien à indexer.
+                self.store.stop_additions();
+                MockSet::new(
+                    Source::Snapshot(s.id.clone()),
+                    MockEngine::new(s.exchanges.iter(), self.mock_config()),
+                )
+            }
             None => {
                 // Version lue avant les échanges : un ajout concurrent rend le moteur périmé.
                 let version = self.store.outbound_version();
-                let exchanges = self.store.shared_direction(Direction::Outbound);
+                let (watermark, exchanges) = self.store.outbound_for_engine(track);
                 MockSet::new(
-                    Source::Store(version),
+                    Source::Store { version, watermark },
                     MockEngine::new(exchanges, self.mock_config()),
                 )
             }
@@ -226,18 +284,19 @@ impl AppState {
         if let Some(set) = self.mock_engine() {
             let fresh = match (&set.source, &snapshot) {
                 (Source::Snapshot(id), Some(s)) => *id == s.id,
-                (Source::Store(_), None) => !self.is_stale(&set, seen),
+                (Source::Store { .. }, None) => !self.is_stale(&set, seen),
                 _ => false,
             };
             if fresh {
                 return set;
             }
         }
-        let set = self.build_locked(snapshot.as_deref(), trigger);
         // Une requête encore en vol après la sortie du mock est servie sans republier de
         // moteur : il resterait en mémoire hors du mock.
-        if mock_mode(self.mode()) {
-            self.engines.current.store(Some(set.clone()));
+        let mock = mock_mode(self.mode());
+        let set = self.build_locked(snapshot.as_deref(), trigger, mock);
+        if mock {
+            self.publish(set.clone());
         }
         set
     }
@@ -297,8 +356,8 @@ impl AppState {
         let _guard = self.engines.build.lock().unwrap_or_else(|e| e.into_inner());
         if self.mock_engine().is_none() {
             let snapshot = self.snapshot();
-            let set = blocking(|| self.build_locked(snapshot.as_deref(), Trigger::Switch));
-            self.engines.current.store(Some(set));
+            let set = blocking(|| self.build_locked(snapshot.as_deref(), Trigger::Switch, true));
+            self.publish(set);
         }
     }
 
@@ -308,6 +367,7 @@ impl AppState {
         let _guard = self.engines.build.lock().unwrap_or_else(|e| e.into_inner());
         if !mock_mode(self.mode()) {
             self.engines.current.store(None);
+            self.store.stop_additions();
         }
     }
 
@@ -320,8 +380,8 @@ impl AppState {
         };
         *self.snapshot.lock().expect("verrou du snapshot") = snap.clone();
         if mock_mode(self.mode()) && !unchanged {
-            let set = blocking(|| self.build_locked(snap.as_deref(), Trigger::Switch));
-            self.engines.current.store(Some(set));
+            let set = blocking(|| self.build_locked(snap.as_deref(), Trigger::Switch, true));
+            self.publish(set);
         }
     }
 
@@ -401,7 +461,7 @@ pub async fn sleep_until(deadline: Instant) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mimic_core::model::{Exchange, Header};
+    use mimic_core::model::{Direction, Exchange, Header};
 
     fn gzip_record() -> Exchange {
         Exchange {
@@ -432,7 +492,13 @@ mod tests {
     #[test]
     fn mck_18_encoded_body_is_prepared_once() {
         let engine = MockEngine::new(vec![gzip_record()], MockConfig::default());
-        let set = MockSet::new(Source::Store(0), engine);
+        let set = MockSet::new(
+            Source::Store {
+                version: 0,
+                watermark: 0,
+            },
+            engine,
+        );
         let req = mimic_core::mock::MockRequest {
             authority: "dep:80".into(),
             method: "GET".into(),
