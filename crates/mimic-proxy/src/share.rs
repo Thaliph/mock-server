@@ -4,7 +4,7 @@
 //! importe les segments des autres instances. Le support est le contrôleur (recommandé) ou un
 //! stockage objet partagé sous `<prefixe>/<namespace>/<workload>/exchanges/<instance>/`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +15,6 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::config::ShareConfig;
 use crate::control::ControllerClient;
-use crate::metrics::ReasonLabel;
 use crate::state::AppState;
 use crate::store::Origin;
 
@@ -40,108 +39,30 @@ struct Seen {
     modified_ms: i64,
 }
 
-/// Segment en attente de publication, avec son identifiant : une reprise renvoie le même.
-struct Pending {
-    id: String,
-    body: Vec<u8>,
-    count: usize,
-}
-
-/// File de publication bornée, du plus ancien au plus récent (spec §5.4).
-#[derive(Default)]
-pub struct Outbox {
-    segments: VecDeque<Pending>,
-    exchanges: usize,
-}
-
-impl Outbox {
-    /// Range de nouveaux échanges en segments d'au plus `max_bytes`, puis abandonne les plus
-    /// anciens au-delà de `max_pending` échanges. Rend le nombre d'échanges abandonnés.
-    fn enqueue(&mut self, list: Vec<Exchange>, max_pending: usize, max_bytes: usize) -> usize {
-        let mut dropped = 0;
-        let mut list = list.as_slice();
-        // Inutile de sérialiser ce qui serait abandonné aussitôt.
-        if list.len() > max_pending {
-            dropped += list.len() - max_pending;
-            list = &list[list.len() - max_pending..];
-        }
-        for (body, count) in split(list, max_bytes) {
-            self.exchanges += count;
-            self.segments.push_back(Pending {
-                id: ulid::Ulid::generate().to_string(),
-                body,
-                count,
-            });
-        }
-        while self.exchanges > max_pending {
-            let Some(front) = self.segments.front_mut() else {
-                break;
-            };
-            let over = self.exchanges - max_pending;
-            if front.count <= over {
-                self.exchanges -= front.count;
-                dropped += front.count;
-                self.segments.pop_front();
-            } else {
-                // Segment encore jamais accepté : on n'en garde que les plus récents, sous un
-                // nouvel identifiant.
-                let lines: Vec<&[u8]> = front
-                    .body
-                    .split(|b| *b == b'\n')
-                    .filter(|l| !l.is_empty())
-                    .collect();
-                let mut body = vec![];
-                for l in &lines[over..] {
-                    body.extend_from_slice(l);
-                    body.push(b'\n');
-                }
-                *front = Pending {
-                    id: ulid::Ulid::generate().to_string(),
-                    body,
-                    count: front.count - over,
-                };
-                self.exchanges -= over;
-                dropped += over;
-            }
-        }
-        dropped
-    }
-
-    fn pop(&mut self) -> Option<Pending> {
-        let p = self.segments.pop_front()?;
-        self.exchanges -= p.count;
-        Some(p)
-    }
-
-    /// Remet un segment refusé en tête : il sera renvoyé tel quel.
-    fn unpop(&mut self, p: Pending) {
-        self.exchanges += p.count;
-        self.segments.push_front(p);
-    }
-}
-
-/// Lignes JSONL des échanges, regroupées en segments d'au plus `max_bytes` (un échange plus
-/// gros forme son propre segment). Rend chaque segment avec son nombre d'échanges.
-fn split(list: &[Exchange], max_bytes: usize) -> Vec<(Vec<u8>, usize)> {
-    let mut out = vec![];
+/// Premier segment de `list` : lignes JSONL d'au plus `max_bytes` (un échange plus gros
+/// forme son propre segment), avec le nombre d'échanges qu'il couvre. Une ligne qui ne se
+/// sérialise pas compte sans être écrite.
+fn first_segment(list: &[Arc<Exchange>], max_bytes: usize) -> (Vec<u8>, usize) {
     let mut body = Vec::new();
     let mut count = 0;
     for e in list {
-        let Ok(mut line) = serde_json::to_vec(e) else {
+        let Ok(mut line) = serde_json::to_vec(e.as_ref()) else {
+            count += 1;
             continue;
         };
         line.push(b'\n');
         if count > 0 && body.len() + line.len() > max_bytes {
-            out.push((std::mem::take(&mut body), count));
-            count = 0;
+            break;
         }
         body.extend_from_slice(&line);
         count += 1;
     }
-    if count > 0 {
-        out.push((body, count));
-    }
-    out
+    (body, count)
+}
+
+/// Lignes JSONL d'un segment scellé.
+fn lines(list: &[Arc<Exchange>]) -> Vec<u8> {
+    first_segment(list, usize::MAX).0
 }
 
 /// Demande une synchronisation immédiate ; faux si le partage est désactivé.
@@ -281,8 +202,6 @@ impl Sharer {
     }
 
     async fn try_sync(&mut self, state: &AppState) -> Result<BTreeSet<String>, String> {
-        // La file bornée reçoit les nouveaux échanges même si le support est injoignable.
-        stage(state);
         let backend = self.backend()?;
         publish(state, &backend, &self.base).await?;
 
@@ -380,66 +299,41 @@ async fn get(backend: &Backend, key: &str) -> Result<bytes::Bytes, String> {
     }
 }
 
-/// Range les échanges locaux pas encore publiés dans la file d'envoi bornée.
-fn stage(state: &AppState) {
-    let max_pending = state
-        .config
-        .share
-        .as_ref()
-        .map_or(usize::MAX, |s| s.max_pending);
-    let pending = state.store.take_unshared();
-    if !pending.is_empty() {
-        let dropped = state
-            .share_outbox
-            .lock()
-            .expect("file de publication")
-            .enqueue(pending, max_pending, MAX_SEGMENT_BYTES);
-        if dropped > 0 {
-            tracing::warn!(dropped, "file de publication pleine : échanges abandonnés");
-            state
-                .metrics
-                .capture_dropped
-                .get_or_create(&ReasonLabel {
-                    reason: "share_backlog".into(),
-                })
-                .inc_by(dropped as u64);
+/// Prochain segment à publier : celui déjà scellé (renvoyé sous le même identifiant), sinon
+/// un nouveau, formé en tête de la file du store (spec §5.4).
+fn next_segment(state: &AppState) -> Option<(String, Vec<u8>)> {
+    loop {
+        if let Some((id, list)) = state.store.sealed_unshared() {
+            return Some((id, lines(&list)));
+        }
+        let head = state.store.unshared_head(MAX_SEGMENT_BYTES);
+        let first = head.first()?.id.clone();
+        // Sérialisation hors du verrou du store ; si la tête a bougé entre-temps (échanges
+        // jetés par la borne), on recommence.
+        let (body, count) = first_segment(&head, MAX_SEGMENT_BYTES);
+        if let Some(id) = state.store.seal_unshared(&first, count) {
+            return Some((id, body));
         }
     }
 }
 
-/// Publie la file d'envoi, du plus ancien au plus récent. Le premier segment refusé reste en
-/// tête de la file, avec son identifiant, et arrête la publication.
+/// Publie la file, du plus ancien au plus récent. Un segment refusé reste scellé en tête de
+/// la file, avec son identifiant, et arrête la publication.
 async fn publish(state: &AppState, backend: &Backend, base: &str) -> Result<(), String> {
-    stage(state);
-    loop {
-        let next = state
-            .share_outbox
-            .lock()
-            .expect("file de publication")
-            .pop();
-        let Some(p) = next else {
-            return Ok(());
-        };
-        let result = match backend {
-            Backend::Controller(c) => c.put_segment(&p.id, p.body.clone()).await,
+    while let Some((id, body)) = next_segment(state) {
+        match backend {
+            Backend::Controller(c) => c.put_segment(&id, body).await?,
             Backend::Object(store) => {
-                let path = Path::from(format!("{base}/{}/{}.jsonl", state.config.instance, p.id));
+                let path = Path::from(format!("{base}/{}/{id}.jsonl", state.config.instance));
                 store
-                    .put(&path, PutPayload::from(p.body.clone()))
+                    .put(&path, PutPayload::from(body))
                     .await
-                    .map(|_| ())
-                    .map_err(|e| format!("publication de {path}: {e}"))
+                    .map_err(|e| format!("publication de {path}: {e}"))?;
             }
-        };
-        if let Err(e) = result {
-            state
-                .share_outbox
-                .lock()
-                .expect("file de publication")
-                .unpop(p);
-            return Err(e);
         }
+        state.store.commit_unshared(&id);
     }
+    Ok(())
 }
 
 /// Instance qui a écrit un segment : premier segment du chemin après la base.
@@ -530,41 +424,16 @@ mod tests {
 
     #[test]
     fn shr_09_segments_are_split_at_the_size_limit() {
-        let list: Vec<Exchange> = (0..5).map(|i| ex(&i.to_string(), 300)).collect();
-        let line = serde_json::to_vec(&list[0]).unwrap().len() + 1;
-        let parts = split(&list, 2 * line);
-        assert_eq!(parts.iter().map(|(_, n)| *n).collect::<Vec<_>>(), [2, 2, 1]);
-        assert!(parts.iter().all(|(b, _)| b.len() <= 2 * line));
+        let list: Vec<Arc<Exchange>> = (0..5).map(|i| Arc::new(ex(&i.to_string(), 300))).collect();
+        let line = serde_json::to_vec(list[0].as_ref()).unwrap().len() + 1;
+        let (body, count) = first_segment(&list, 2 * line);
+        assert_eq!(count, 2);
+        assert_eq!(ids(&body), ["0", "1"]);
+        assert!(body.len() <= 2 * line);
         // Un échange plus gros que la limite forme son propre segment.
-        let big = split(&[ex("big", 4 * line), ex("small", 1)], line);
-        assert_eq!(big.len(), 2);
-    }
-
-    #[test]
-    fn shr_09_outbox_keeps_the_most_recent_and_its_identifiers() {
-        let mut o = Outbox::default();
-        assert_eq!(
-            o.enqueue(vec![ex("1", 1), ex("2", 1)], 3, MAX_SEGMENT_BYTES),
-            0
-        );
-        let first = o.pop().unwrap();
-        let id = first.id.clone();
-        o.unpop(first);
-        assert_eq!(o.segments[0].id, id, "renvoyé avec le même identifiant");
-        // Deux de plus : le plus ancien part, et le segment entamé change d'identifiant.
-        assert_eq!(
-            o.enqueue(vec![ex("3", 1), ex("4", 1)], 3, MAX_SEGMENT_BYTES),
-            1
-        );
-        assert_eq!(o.exchanges, 3);
-        let kept: Vec<String> = o.segments.iter().flat_map(|p| ids(&p.body)).collect();
-        assert_eq!(kept, ["2", "3", "4"]);
-        assert_ne!(o.segments[0].id, id);
-        // Lot plus gros que la file : seuls les plus récents entrent.
-        let mut o = Outbox::default();
-        let list: Vec<Exchange> = (0..5).map(|i| ex(&i.to_string(), 1)).collect();
-        assert_eq!(o.enqueue(list, 3, MAX_SEGMENT_BYTES), 2);
-        assert_eq!(ids(&o.pop().unwrap().body), ["2", "3", "4"]);
+        let big = [Arc::new(ex("big", 4 * line)), Arc::new(ex("small", 1))];
+        assert_eq!(first_segment(&big, line).1, 1);
+        assert_eq!(ids(&lines(&list)).len(), 5);
     }
 
     #[test]

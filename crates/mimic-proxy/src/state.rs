@@ -56,8 +56,6 @@ pub struct AppState {
     pub share_status: Mutex<ShareStatus>,
     /// Réveille la boucle de partage (`POST /share/sync`).
     pub share_notify: tokio::sync::Notify,
-    /// Segments en attente de publication, bornés par `share.max_pending`.
-    pub share_outbox: Mutex<crate::share::Outbox>,
     /// Adresse de l'application pour le trafic entrant, par port (spec §3.1).
     pub inbound_targets: crate::net::InboundTargets,
     /// Logs d'échec vers l'amont, limités en débit (spec §9.3).
@@ -130,6 +128,7 @@ impl AppState {
                 samples: config.capture.samples_per_operation,
                 max_bytes: config.capture.max_store_bytes,
                 share_backlog: config.share.as_ref().map(|s| s.max_backlog_bytes),
+                share_pending: config.share.as_ref().map_or(usize::MAX, |s| s.max_pending),
             },
             Drops {
                 store_budget: metrics.dropped("store_budget"),
@@ -165,7 +164,6 @@ impl AppState {
             discovery: Mutex::new(None),
             share_status: Mutex::new(share_status),
             share_notify: tokio::sync::Notify::new(),
-            share_outbox: Mutex::new(Default::default()),
             upstream_log: LogLimiter::per_second(),
             tls,
         }))
