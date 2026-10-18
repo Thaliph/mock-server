@@ -279,12 +279,14 @@ Un Deployment a souvent plusieurs réplicas, et chaque pod ne voit qu'une partie
 
 - **Identité du workload** : `namespace` + nom du workload, lus via l'API downward. Le nom vient de l'annotation `mimic.platform.io/workload`, sinon du label `app.kubernetes.io/name`, sinon du label `app`. Chaque sidecar a un identifiant d'instance (nom du pod).
 - **Support partagé** : un stockage objet (S3-compatible en production, répertoire local ou PVC `ReadWriteMany` en test). Aucun appel à l'API Kubernetes, aucune connexion entre pods.
-- **Disposition** : `<prefix>/<namespace>/<workload>/exchanges/<instance>/<segment>.jsonl`. Un segment ne contient que des échanges déjà redactés.
-- **Synchronisation** toutes les `share.interval` (10 s par défaut) : le sidecar publie un segment avec ses nouveaux échanges, liste les segments des autres instances et importe ceux qu'il n'a pas encore lus.
+- **Disposition** : `<prefix>/<namespace>/<workload>/exchanges/<instance>/<segment>.jsonl`, où `<segment>` est un ULID choisi par le sidecar. Un segment ne contient que des échanges déjà redactés. Avec un contrôleur, les segments d'une heure révolue sont fusionnés en un segment horaire `exchanges/_hour/<AAAAMMJJHH>.jsonl` (§5.5.2) : les noms d'instance qui commencent par `_` sont réservés et ne désignent jamais un pair.
+- **Synchronisation** toutes les `share.interval` (10 s par défaut) : le sidecar publie ses nouveaux échanges, liste les segments des autres instances et importe ceux qu'il n'a pas encore lus.
+- **Publication** : les échanges de la file de publication sont envoyés du plus ancien au plus récent, en segments d'au plus 8 MiB, chacun avec son identifiant. Un segment dont l'envoi échoue reste en tête de la file et sera renvoyé tel quel, avec le même identifiant : une reprise après un délai dépassé ne crée pas de doublon (§5.5.2). Seul un segment entamé par la borne de la file (ses plus anciens échanges jetés) repart sous un nouvel identifiant. Après un échec, la synchronisation suivante attend `share.interval` × 2ⁿ (n échecs consécutifs), plafonné à 5 minutes, avec une gigue de 50 % : les sidecars ne reviennent pas tous en même temps quand le support revient.
+- **Liste incrémentale** : après une première liste complète, le sidecar ne demande que les segments datés d'au moins la date du plus récent déjà listé moins 60 s, une marge qui couvre les écritures concurrentes (`?since_ms=` vers le contrôleur, filtre local sur un stockage objet ou un contrôleur qui ignore le paramètre). Ce curseur n'avance qu'après l'import réussi de tous les segments listés.
 - **Fusion** : dédoublonnage par identifiant d'échange (ULID préfixé par l'instance, donc unique dans le workload). Les plafonds de capture (§5.2) s'appliquent après fusion, ce qui borne la mémoire quel que soit le nombre de réplicas.
 - **Panne du support** : la synchronisation échoue sans bloquer le trafic ; le sidecar continue avec ses données locales et l'échec est compté en métrique.
-- **File de publication** : les échanges locaux pas encore publiés attendent dans une file bornée en octets (`share.max_backlog_bytes`, 16 MiB par défaut). Quand le support reste indisponible, les plus anciens sont jetés au profit des plus récents, et chaque échange jeté est compté (`mimic_capture_dropped_total{reason="share_backlog"}`) ; une publication échouée remet ses échanges en tête de file sans dépasser cette borne. Sans partage configuré, aucune file n'est tenue.
-- **Rétention** : les segments plus vieux que `share.retention` (7 jours par défaut) ne sont plus importés ; leur suppression est laissée à une règle de cycle de vie du bucket.
+- **File de publication** : les échanges locaux pas encore publiés attendent dans une file unique, bornée en octets (`share.max_backlog_bytes`, 16 MiB par défaut) et en nombre (`share.max_pending`, 50 000 échanges par défaut). Quand le support reste indisponible, les plus anciens sont jetés au profit des plus récents dès que l'une des deux bornes est dépassée, et chaque échange jeté est compté (`mimic_capture_dropped_total{reason="share_backlog"}`) ; une publication échouée laisse ses échanges en tête de file, sous ces mêmes bornes. Sans partage configuré, aucune file n'est tenue.
+- **Rétention** : les segments plus vieux que `share.retention` (7 jours par défaut) ne sont plus importés. Avec un contrôleur, c'est lui qui les supprime (§5.5.2) ; avec un stockage objet sans contrôleur, leur suppression est laissée à une règle de cycle de vie du bucket.
 - **Deux supports possibles** : `share.url` vaut soit l'URL du contrôleur (`https://mimic-controller.mimic-system:8443`, recommandé), soit un stockage objet partagé (`s3://…`, `file://…`) sans contrôleur. Sans contrôleur, il n'y a ni interface centrale, ni snapshot, ni bascule de workload.
 
 ### 5.5 Contrôleur
@@ -292,11 +294,12 @@ Un Deployment a souvent plusieurs réplicas, et chaque pod ne voit qu'une partie
 `mimic-controller` est le plan de contrôle, à la manière de Kiali pour Istio : un Deployment unique par cluster (namespace `mimic-system`), qui ne se trouve jamais dans le chemin des requêtes. Si le contrôleur tombe, le trafic continue dans le dernier état reçu ; seuls le partage et la bascule attendent son retour.
 
 - **Seule autorité** : le contrôleur est le seul à modifier le mode et le snapshot des sidecars. Il lit l'état souhaité dans les ressources `MimicWorkload` (§5.5.1), qu'il surveille par l'API Kubernetes.
-- **Ingestion** : chaque sidecar lui envoie ses segments d'échanges, déjà redactés, et lit ceux des autres instances (§5.4). Le contrôleur les range sur son support (`file://` sur un PVC, ou `s3://`) avec la même disposition qu'au §5.4.
+- **Ingestion** : chaque sidecar lui envoie ses segments d'échanges, déjà redactés, et lit ceux des autres instances (§5.4). Le contrôleur les range sur son support (`file://` sur un PVC, ou `s3://`) avec la même disposition qu'au §5.4. L'ingestion est idempotente (§5.5.2).
 - **Battement** : chaque sidecar envoie toutes les `share.mode_poll` (2 s par défaut) son instance, son mode et son snapshot chargé. La réponse porte l'état souhaité du workload : `{mode, snapshot}`, chacun pouvant être absent. Sans `MimicWorkload`, l'état souhaité est vide et chaque sidecar reste dans le mode de sa configuration.
 - **Authentification** : chaque appel d'un sidecar est authentifié par un jeton de ServiceAccount, et le contrôleur ne lui permet d'agir que pour son propre pod et son propre workload (§7.1).
 - **Interface de découverte centrale**, en lecture seule : la page du contrôleur liste les workloads, puis pour chacun les pods (mode, snapshot, dernier battement, aligné ou non), les opérations du service et de chaque dépendance avec leurs paramètres requis (même rendu que la page d'admin du sidecar, §9.2), les snapshots, les requêtes enregistrées (§5.7) et la commande `kubectl` qui bascule le workload. Elle est servie sur un port distinct lié à `127.0.0.1`, donc joignable seulement par `kubectl port-forward`, lui-même soumis au RBAC (`pods/portforward` dans `mimic-system`).
 - **Persistance** : segments, snapshots et snapshot courant de chaque workload (`<namespace>/<workload>/desired.json`) sont sur le support ; un redémarrage du contrôleur ne perd rien. L'état des pods est reconstruit par les battements.
+- **Tenue en charge** : 500 pods sur 100 workloads avec 7 jours d'historique, sur un seul réplica (§5.5.2).
 
 #### 5.5.1 Ressource `MimicWorkload`
 
@@ -326,6 +329,19 @@ Réconciliation (fonction pure dans le contrôleur, testée sans cluster) :
 - `spec.mode` en `record` ou `passthrough` : aucun snapshot, `status.snapshot` est vidé.
 - Ressource supprimée : l'état souhaité redevient vide.
 - `status` est mis à jour à chaque changement d'alignement des pods.
+
+#### 5.5.2 Tenue en charge
+
+Aucun coût du contrôleur ne grandit avec l'historique : ni la liste des segments, ni la mémoire, ni le disque, ni la durée d'un battement.
+
+- **Seul écrivant, index en mémoire** : le contrôleur est le seul processus qui écrit sur son support, et il tourne en un seul réplica (`Recreate`). Il tient en mémoire l'index des segments de chaque workload, construit par **une seule** liste du support au premier accès, puis mis à jour à chaque ingestion, compaction ou suppression. La date d'un segment brut est celle de son écriture ; celle d'un segment horaire est la fin de son heure moins une milliseconde, de sorte qu'un curseur `since_ms` antérieur à l'un de ses échanges le liste encore. `GET …/segments` répond depuis cet index sans relire le support : segments encore dans la rétention, du plus ancien au plus récent, et seulement ceux datés d'au moins `since_ms` s'il est donné. Un fichier déposé sur le support par un autre processus n'est vu qu'après un redémarrage. La liste des workloads suit la même règle : le support est listé une fois, puis un nouveau workload entre par son premier battement ou son premier segment.
+- **Ingestion idempotente** : le sidecar donne l'identifiant de son segment (`?segment=`, un ULID). Un segment déjà rangé sous cet identifiant n'est ni réécrit ni réimporté, et la réponse est `200` au lieu de `201` (`mimic_controller_segments_total{result="duplicate"}`). Sans identifiant (ancien sidecar), le contrôleur en génère un.
+- **Verrous courts** : les pods, l'état souhaité et la ressource d'un workload sont protégés par un verrou court, jamais tenu pendant une lecture ou une écriture du support, ni pendant un calcul. Les échanges en mémoire ont le leur, tenu le temps d'ajouter ou d'évincer des échanges. Un battement, la liste des workloads, le statut des ressources et `/metrics` n'attendent donc jamais une inférence, un snapshot ou un import.
+- **Calculs hors du serveur** : l'inférence, la construction d'un snapshot et les requêtes enregistrées (tri et mise en forme compris) s'exécutent hors des threads qui servent les requêtes, sur une vue figée des échanges en mémoire, sans les copier. L'ingestion continue pendant ce temps.
+- **Pods oubliés** : un pod sans battement depuis `pod_forget` (10 minutes par défaut) disparaît de l'interface, du statut et des métriques.
+- **Mémoire bornée** : un workload garde au plus `max_exchanges_per_workload` échanges, les plus récents, et l'ensemble des workloads au plus `max_exchanges_total` : au-delà, les plus anciens échanges du workload qui en a le plus sont évincés. Comme dans le sidecar (§5.2), avec la même clé `samples_per_operation` (20 par défaut) et le même couple (opération, code retour), l'opération étant (sens, authority, méthode, forme du chemin), seuls `samples_per_operation` échanges par couple gardent leurs bodies en mémoire : les premiers reçus, les suivants étant gardés sans body jusqu'à ce qu'une éviction libère une place. Après un redémarrage, les échanges d'un workload ne sont relus qu'à sa première vue (interface, requêtes, snapshot) : ingérer un segment ne relit pas l'historique, l'index suffit à dédoublonner. La relecture va du plus récent au plus ancien et s'arrête au plafond du workload.
+- **Découverte en tâche de fond** : les documents OpenAPI d'un workload sont recalculés au plus une fois par `discovery_interval` (30 s par défaut), en tâche de fond. Une vue sert le dernier document calculé, même si de nouveaux échanges sont arrivés depuis, et déclenche le recalcul si l'intervalle est écoulé ; seule la première vue d'un workload attend le calcul.
+- **Rétention et compaction** : toutes les minutes, le contrôleur supprime les segments plus vieux que `retention`, puis fusionne les segments bruts de chaque heure UTC révolue depuis plus de 10 minutes en un segment horaire `exchanges/_hour/<AAAAMMJJHH>.jsonl` : échanges dédoublonnés par identifiant, au plus `samples_per_operation` bodies par couple (opération, code retour) au sens du §5.2, choisis par le même réservoir déterministe, les autres gardés sans body. Le segment horaire ne dépend donc pas de l'ordre dans lequel les segments bruts sont relus. Le segment horaire est écrit avant la suppression des segments bruts : un arrêt entre les deux ne perd rien et la passe suivante refait la fusion. Les segments relus sont déjà redactés et la compaction ne fait qu'en retirer des données. Enfin, si les segments d'un workload dépassent `max_bytes_per_workload`, les plus anciens sont supprimés. Un workload garde ainsi au plus un fichier par heure de rétention, plus les segments bruts des 70 dernières minutes au plus, dans un volume borné. Les snapshots et `desired.json` ne sont jamais supprimés.
 
 ### 5.6 Cohérence du mock entre les pods : snapshots
 
@@ -501,6 +517,7 @@ share:
   retention: 604800  # secondes (7 jours)
   mode_poll: 2       # secondes, battement vers le contrôleur
   max_backlog_bytes: 16777216  # 16 MiB, file des échanges pas encore publiés (§5.4)
+  max_pending: 50000           # même file, en nombre d'échanges
 ```
 
 Configuration du contrôleur (`mimic-controller --config`) :
@@ -511,11 +528,16 @@ ui_listen: 127.0.0.1:8081       # interface, par port-forward
 tls: { cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key }
 auth: kubernetes                # TokenReview ; static pour les tests
 store: file:///var/lib/mimic-controller   # ou s3://bucket/prefixe
-retention: 604800
+retention: 604800                  # secondes : segments supprimés au-delà
 max_exchanges_per_workload: 200000
+max_exchanges_total: 1000000       # tous workloads confondus
+samples_per_operation: 20          # bodies gardés par (opération, code), en mémoire et après compaction
+max_bytes_per_workload: 268435456  # segments d'un workload sur le support (256 MiB)
+discovery_interval: 30             # secondes, au plus un recalcul de la découverte par intervalle
 snapshot:
   max_per_key: 50
 pod_timeout: 30   # un pod sans battement depuis ce délai est affiché absent
+pod_forget: 600   # un pod sans battement depuis ce délai est oublié
 ```
 
 La configuration est validée au démarrage ; une configuration invalide fait échouer le conteneur avec un message explicite (pas de démarrage en mode dégradé silencieux).
@@ -550,8 +572,8 @@ Deux ports :
 
 | Méthode | Chemin | Rôle |
 |---------|--------|------|
-| POST | `…/segments?instance=` | ingestion d'un segment JSONL de son propre pod |
-| GET | `…/segments` | liste des segments (`key`, `instance`, `modified_ms`, `size`) |
+| POST | `…/segments?instance=&segment=` | ingestion d'un segment JSONL de son propre pod ; `segment` (ULID) rend l'envoi idempotent : `201` à la première réception, `200` ensuite (§5.5.2) |
+| GET | `…/segments?since_ms=` | liste des segments encore dans la rétention (`key`, `instance`, `modified_ms`, `size`), du plus ancien au plus récent ; avec `since_ms`, seulement ceux datés d'au moins cette valeur (ms Unix) |
 | GET | `…/segments/{instance}/{file}` | contenu d'un segment |
 | POST | `…/heartbeat` | battement, réponse : état souhaité `{mode, snapshot}` |
 | GET | `…/snapshots/{id}` | contenu JSONL d'un snapshot |
@@ -571,7 +593,7 @@ Deux ports :
 | GET | `…/requests?direction=&limit=&format=` | requêtes enregistrées (§5.7) |
 | GET | `/metrics` | Prometheus |
 
-Métriques du contrôleur : `mimic_controller_segments_total{result}`, `mimic_controller_auth_failures_total{reason}`, `mimic_controller_workloads`, `mimic_controller_pods{state}` (`aligned`, `diverging`, `absent`), `mimic_controller_snapshots_total`.
+Métriques du contrôleur : `mimic_controller_segments_total{result}` (`ok`, `duplicate`, `error`), `mimic_controller_auth_failures_total{reason}`, `mimic_controller_workloads`, `mimic_controller_pods{state}` (`aligned`, `diverging`, `absent`), `mimic_controller_snapshots_total`, `mimic_controller_exchanges` (échanges en mémoire, tous workloads).
 
 ### 9.3 Observabilité
 
@@ -777,6 +799,21 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | CTL-04 | contrôleur sur `file://` avec segments, snapshot et état souhaité | redémarrage | tout est retrouvé |
 | CTL-05 | trafic enregistré avec une query toujours présente | `GET /ui/{ns}/{wl}` | la page liste l'opération, marque le paramètre requis, montre les pods et la commande de bascule |
 
+**Contrôleur à l'échelle (CTL, suite, §5.5.2)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| CTL-06 | segments et workloads rangés sur le support avant le démarrage du contrôleur | listes successives, puis ingestion d'un segment | les segments et workloads rangés sont listés ; le support n'est plus relu (un fichier déposé ensuite par un autre processus n'apparaît pas) ; le segment ingéré apparaît |
+| CTL-07 | segments datés d'il y a 8 jours, de 2 heures et de maintenant, rétention de 7 jours | `GET …/segments`, puis `?since_ms=` | le segment hors rétention n'est jamais listé ; avec `since_ms`, seuls les segments datés d'au moins cette valeur, du plus ancien au plus récent |
+| CTL-08 | lecture du support bloquée pendant le chargement des échanges d'un workload (vue de l'interface en cours) | battement de ce workload, `/v1/workloads`, `/metrics` | réponses immédiates, battement avec l'état souhaité courant |
+| CTL-09 | pod sans battement depuis plus de `pod_forget` | battement d'un nouveau pod, ou passe de maintenance | le pod disparu n'est plus listé ni compté |
+| CTL-10 | segments plus vieux que `retention`, un snapshot et un état souhaité | passe de maintenance | ces segments sont supprimés du support et de la liste ; snapshot et état souhaité sont gardés |
+| CTL-11 | segments bruts de deux instances dans une heure révolue, avec un échange en double et plus de `samples_per_operation` bodies pour une opération | passe de maintenance | un seul segment `_hour/<AAAAMMJJHH>.jsonl` pour cette heure, sans doublon, au plus `samples_per_operation` bodies par couple (opération, code), choisis par le réservoir du §5.2 : mêmes exemples quel que soit l'ordre des segments bruts ; segments bruts supprimés ; un pod qui liste sans curseur reçoit le segment horaire |
+| CTL-12 | plus de `samples_per_operation` échanges avec body pour une même opération, chemins de même forme (`/users/1`, `/users/2`) | ingestion | seuls `samples_per_operation` gardent leur body en mémoire, les autres sont gardés sans body ; une éviction libère une place |
+| CTL-13 | deux workloads dont le total dépasse `max_exchanges_total` ; workload dont le support dépasse `max_exchanges_per_workload` | ingestion ; redémarrage, ingestion, puis vue | total en mémoire ≤ `max_exchanges_total`, les plus anciens du plus gros workload évincés ; après le redémarrage, l'ingestion ne relit rien ; à la vue, seuls les `max_exchanges_per_workload` plus récents sont relus |
+| CTL-14 | découverte déjà calculée, puis nouveaux échanges | vue dans le `discovery_interval` du calcul ; vues après l'intervalle | même document servi sans recalcul ; recalcul en tâche de fond, puis les nouvelles opérations apparaissent |
+| CTL-15 | segment déjà reçu (délai dépassé côté sidecar) | même segment renvoyé avec le même identifiant | `200`, une seule copie sur le support et en mémoire, `segments_total{result="duplicate"}` |
+
 **Ressource MimicWorkload (CRD)**
 
 | ID | Étant donné | Quand | Alors |
@@ -818,6 +855,8 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | SHR-05 | support indisponible | synchronisation | le trafic n'est pas affecté, `mimic_share_sync_total{result="error"}` augmente |
 | SHR-06 | sidecar sans partage configuré | trafic enregistré | aucun échange n'est gardé pour publication |
 | SHR-07 | partage configuré, support indisponible, trafic au-delà de `share.max_backlog_bytes` | synchronisations échouées répétées | la file reste sous sa borne et garde les échanges les plus récents ; les échanges jetés sont comptés dans `mimic_capture_dropped_total{reason="share_backlog"}` |
+| SHR-08 | sidecar qui a déjà listé des segments | synchronisations suivantes | liste demandée avec `since_ms` = date du plus récent listé moins 60 s ; un import échoué ne fait pas avancer le curseur |
+| SHR-09 | contrôleur qui refuse les publications, puis revient ; trafic au-delà de `share.max_pending` | publications successives | même identifiant de segment à chaque reprise, attente croissante entre les tentatives ; la même file reste sous `share.max_pending`, garde les plus récents et compte les jetés dans `mimic_capture_dropped_total{reason="share_backlog"}` ; segments d'au plus 8 MiB |
 
 **Capture et store (CAP)**
 
@@ -961,6 +1000,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
 | P6b | Chargement cross-environnement, garde-fou production | E2E-04 |
+| P6c | Contrôleur à l'échelle : index des segments, liste incrémentale, verrous courts, GC et compaction, budget mémoire, ingestion idempotente | CTL-06 à 15, SHR-08, SHR-09 |
 | P7 | Webhook d'injection + `mimicctl` (dont le rapport) | INJ-*, CLI-*, OAS-*, DIF-*, E2E-05 |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 

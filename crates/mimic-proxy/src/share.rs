@@ -1,10 +1,10 @@
 //! Partage des enregistrements entre les sidecars d'un même workload (spec §5.4).
 //!
-//! Chaque sidecar publie ses nouveaux échanges (déjà redactés) dans un segment JSONL, puis
+//! Chaque sidecar publie ses nouveaux échanges (déjà redactés) dans des segments JSONL, puis
 //! importe les segments des autres instances. Le support est le contrôleur (recommandé) ou un
 //! stockage objet partagé sous `<prefixe>/<namespace>/<workload>/exchanges/<instance>/`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,13 @@ use crate::control::ControllerClient;
 use crate::state::AppState;
 use crate::store::Origin;
 
+/// Un segment publié ne dépasse pas cette taille (le contrôleur refuse au-delà de 64 MiB).
+const MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Marge de relecture de la liste incrémentale : couvre les écritures concurrentes.
+const LIST_OVERLAP_MS: i64 = 60_000;
+/// Attente maximale entre deux synchronisations après des échecs.
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
+
 /// Support du partage.
 #[derive(Clone)]
 enum Backend {
@@ -30,6 +37,32 @@ struct Seen {
     key: String,
     instance: String,
     modified_ms: i64,
+}
+
+/// Premier segment de `list` : lignes JSONL d'au plus `max_bytes` (un échange plus gros
+/// forme son propre segment), avec le nombre d'échanges qu'il couvre. Une ligne qui ne se
+/// sérialise pas compte sans être écrite.
+fn first_segment(list: &[Arc<Exchange>], max_bytes: usize) -> (Vec<u8>, usize) {
+    let mut body = Vec::new();
+    let mut count = 0;
+    for e in list {
+        let Ok(mut line) = serde_json::to_vec(e.as_ref()) else {
+            count += 1;
+            continue;
+        };
+        line.push(b'\n');
+        if count > 0 && body.len() + line.len() > max_bytes {
+            break;
+        }
+        body.extend_from_slice(&line);
+        count += 1;
+    }
+    (body, count)
+}
+
+/// Lignes JSONL d'un segment scellé.
+fn lines(list: &[Arc<Exchange>]) -> Vec<u8> {
+    first_segment(list, usize::MAX).0
 }
 
 /// Demande une synchronisation immédiate ; faux si le partage est désactivé.
@@ -53,15 +86,32 @@ pub fn spawn(
     let state = state.clone();
     Ok(Some(tokio::spawn(async move {
         let mut sharer = Sharer::new(config, base, controller);
+        let mut failures = 0;
         loop {
-            sharer.sync(&state).await;
-            let interval = sharer.config.interval;
+            failures = if sharer.sync(&state).await {
+                0
+            } else {
+                failures + 1
+            };
+            let wait = backoff(sharer.config.interval, failures);
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(wait) => {}
                 _ = state.share_notify.notified() => {}
             }
         }
     })))
+}
+
+/// Attente avant la prochaine synchronisation : `interval`, puis `interval` × 2ⁿ après n
+/// échecs consécutifs, plafonnée, avec une gigue de 50 % pour étaler les reprises.
+fn backoff(interval: Duration, failures: u32) -> Duration {
+    if failures == 0 {
+        return interval;
+    }
+    let max = MAX_BACKOFF.max(interval);
+    let wait = interval.saturating_mul(1 << failures.min(16)).min(max);
+    let jitter = (ulid::Ulid::generate().random() % 1_000) as f64 / 2_000.0;
+    wait.mul_f64(0.5 + jitter)
 }
 
 /// Dernière publication avant l'arrêt, bornée dans le temps.
@@ -93,7 +143,13 @@ struct Sharer {
     /// Chemin relatif au support, sans le préfixe de l'URL.
     base: String,
     backend: Option<Backend>,
-    imported: HashSet<String>,
+    /// Segments importés, avec leur date : ceux d'avant la fenêtre de la liste incrémentale
+    /// ne seront plus listés et sont oubliés.
+    imported: BTreeMap<String, i64>,
+    /// Date (ms) du segment le plus récent déjà listé ; n'avance qu'après un import réussi.
+    listed_upto_ms: Option<i64>,
+    /// Instances vues dans les listes successives.
+    peers: BTreeSet<String>,
 }
 
 impl Sharer {
@@ -102,7 +158,9 @@ impl Sharer {
             config,
             base,
             backend: controller.map(Backend::Controller),
-            imported: HashSet::new(),
+            imported: BTreeMap::new(),
+            listed_upto_ms: None,
+            peers: BTreeSet::new(),
         }
     }
 
@@ -116,14 +174,15 @@ impl Sharer {
         Ok(b)
     }
 
-    async fn sync(&mut self, state: &AppState) {
+    /// Une synchronisation ; vrai si elle a réussi.
+    async fn sync(&mut self, state: &AppState) -> bool {
         let result = self.try_sync(state).await;
-        let label = if result.is_ok() { "ok" } else { "error" };
+        let ok = result.is_ok();
         state
             .metrics
             .share_sync
             .get_or_create(&crate::metrics::ResultLabel {
-                result: label.into(),
+                result: if ok { "ok" } else { "error" }.into(),
             })
             .inc();
         let mut status = state.share_status.lock().expect("verrou du partage");
@@ -139,6 +198,7 @@ impl Sharer {
                 status.last_error = Some(e);
             }
         }
+        ok
     }
 
     async fn try_sync(&mut self, state: &AppState) -> Result<BTreeSet<String>, String> {
@@ -147,20 +207,26 @@ impl Sharer {
 
         let me = &state.config.instance;
         let oldest_ms = now_ms().saturating_sub(self.config.retention.as_millis() as u64) as i64;
-        let mut peers = BTreeSet::new();
+        let since = self.listed_upto_ms.map(|ms| ms - LIST_OVERLAP_MS);
+        let listed = list(&backend, &self.base, since).await?;
+        let newest = listed.iter().map(|s| s.modified_ms).max();
         let mut to_import = vec![];
-        for seg in list(&backend, &self.base).await? {
-            if seg.instance == *me {
+        for seg in listed {
+            // Filtre local : un stockage objet, ou un ancien contrôleur, liste tout.
+            if seg.instance == *me || since.is_some_and(|s| seg.modified_ms < s) {
                 continue;
             }
-            peers.insert(seg.instance.clone());
-            if seg.modified_ms < oldest_ms || self.imported.contains(&seg.key) {
+            // Instances réservées (`_hour`, segments horaires du contrôleur) : pas des pairs.
+            if !seg.instance.starts_with('_') {
+                self.peers.insert(seg.instance.clone());
+            }
+            if seg.modified_ms < oldest_ms || self.imported.contains_key(&seg.key) {
                 continue;
             }
-            to_import.push(seg.key);
+            to_import.push((seg.key, seg.modified_ms));
         }
         let mut imported = 0;
-        for key in to_import {
+        for (key, at) in to_import {
             let bytes = get(&backend, &key).await?;
             for line in bytes.split(|b| *b == b'\n') {
                 if line.is_empty() {
@@ -171,20 +237,26 @@ impl Sharer {
                     imported += 1;
                 }
             }
-            self.imported.insert(key);
+            self.imported.insert(key, at);
+        }
+        // Tout est importé : le curseur avance, la fenêtre suivante commence plus tard.
+        if let Some(max) = newest {
+            let upto = self.listed_upto_ms.map_or(max, |m| m.max(max));
+            self.listed_upto_ms = Some(upto);
+            self.imported.retain(|_, at| *at >= upto - LIST_OVERLAP_MS);
         }
         if imported > 0 {
             tracing::debug!(imported, "échanges importés des autres sidecars");
             state.refresh_store_metrics();
         }
-        Ok(peers)
+        Ok(self.peers.clone())
     }
 }
 
-async fn list(backend: &Backend, base: &str) -> Result<Vec<Seen>, String> {
+async fn list(backend: &Backend, base: &str, since_ms: Option<i64>) -> Result<Vec<Seen>, String> {
     match backend {
         Backend::Controller(c) => Ok(c
-            .segments()
+            .segments(since_ms)
             .await?
             .into_iter()
             .map(|s| Seen {
@@ -227,38 +299,41 @@ async fn get(backend: &Backend, key: &str) -> Result<bytes::Bytes, String> {
     }
 }
 
-/// Publie les nouveaux échanges locaux ; en cas d'échec ils restent en attente.
+/// Prochain segment à publier : celui déjà scellé (renvoyé sous le même identifiant), sinon
+/// un nouveau, formé en tête de la file du store (spec §5.4).
+fn next_segment(state: &AppState) -> Option<(String, Vec<u8>)> {
+    loop {
+        if let Some((id, list)) = state.store.sealed_unshared() {
+            return Some((id, lines(&list)));
+        }
+        let head = state.store.unshared_head(MAX_SEGMENT_BYTES);
+        let first = head.first()?.id.clone();
+        // Sérialisation hors du verrou du store ; si la tête a bougé entre-temps (échanges
+        // jetés par la borne), on recommence.
+        let (body, count) = first_segment(&head, MAX_SEGMENT_BYTES);
+        if let Some(id) = state.store.seal_unshared(&first, count) {
+            return Some((id, body));
+        }
+    }
+}
+
+/// Publie la file, du plus ancien au plus récent. Un segment refusé reste scellé en tête de
+/// la file, avec son identifiant, et arrête la publication.
 async fn publish(state: &AppState, backend: &Backend, base: &str) -> Result<(), String> {
-    let pending = state.store.take_unshared();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let mut body = Vec::new();
-    for e in &pending {
-        if let Ok(line) = serde_json::to_vec(e) {
-            body.extend_from_slice(&line);
-            body.push(b'\n');
+    while let Some((id, body)) = next_segment(state) {
+        match backend {
+            Backend::Controller(c) => c.put_segment(&id, body).await?,
+            Backend::Object(store) => {
+                let path = Path::from(format!("{base}/{}/{id}.jsonl", state.config.instance));
+                store
+                    .put(&path, PutPayload::from(body))
+                    .await
+                    .map_err(|e| format!("publication de {path}: {e}"))?;
+            }
         }
+        state.store.commit_unshared(&id);
     }
-    let result = match backend {
-        Backend::Controller(c) => c.put_segment(body).await,
-        Backend::Object(store) => {
-            let path = Path::from(format!(
-                "{base}/{}/{}.jsonl",
-                state.config.instance,
-                ulid::Ulid::generate()
-            ));
-            store
-                .put(&path, PutPayload::from(body))
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("publication de {path}: {e}"))
-        }
-    };
-    if result.is_err() {
-        state.store.restore_unshared(pending);
-    }
-    result
+    Ok(())
 }
 
 /// Instance qui a écrit un segment : premier segment du chemin après la base.
@@ -305,6 +380,36 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mimic_core::model::{Body, Direction};
+
+    fn ex(id: &str, body: usize) -> Exchange {
+        Exchange {
+            id: id.into(),
+            direction: Direction::Outbound,
+            started_at_ms: 0,
+            scheme: "http".into(),
+            authority: "a:80".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            query: vec![],
+            req_headers: vec![],
+            req_body: Body::Empty,
+            status: 200,
+            resp_headers: vec![],
+            resp_body: Body::captured(vec![b'x'; body]),
+            ttfb_us: 1,
+            total_us: 1,
+            trace_id: None,
+            redactions: vec![],
+        }
+    }
+
+    fn ids(body: &[u8]) -> Vec<String> {
+        body.split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_slice::<Exchange>(l).unwrap().id)
+            .collect()
+    }
 
     #[test]
     fn instances_from_paths() {
@@ -315,6 +420,32 @@ mod tests {
         );
         assert_eq!(instance_of(base, "ns/api/exchanges/api-a"), None);
         assert_eq!(instance_of(base, "ns/apix/exchanges/a/1.jsonl"), None);
+    }
+
+    #[test]
+    fn shr_09_segments_are_split_at_the_size_limit() {
+        let list: Vec<Arc<Exchange>> = (0..5).map(|i| Arc::new(ex(&i.to_string(), 300))).collect();
+        let line = serde_json::to_vec(list[0].as_ref()).unwrap().len() + 1;
+        let (body, count) = first_segment(&list, 2 * line);
+        assert_eq!(count, 2);
+        assert_eq!(ids(&body), ["0", "1"]);
+        assert!(body.len() <= 2 * line);
+        // Un échange plus gros que la limite forme son propre segment.
+        let big = [Arc::new(ex("big", 4 * line)), Arc::new(ex("small", 1))];
+        assert_eq!(first_segment(&big, line).1, 1);
+        assert_eq!(ids(&lines(&list)).len(), 5);
+    }
+
+    #[test]
+    fn shr_09_backoff_grows_and_is_capped() {
+        let i = Duration::from_secs(10);
+        assert_eq!(backoff(i, 0), i);
+        for n in 1..8 {
+            let w = backoff(i, n);
+            let full = (i * (1 << n)).min(MAX_BACKOFF);
+            assert!(w >= full / 2 && w <= full, "{n} : {w:?}");
+        }
+        assert!(backoff(i, 40) <= MAX_BACKOFF);
     }
 
     /// Deux fournisseurs rustls sont compilés (aws-lc-rs vient d'object_store) : le

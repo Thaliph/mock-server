@@ -42,8 +42,11 @@ pub struct Limits {
     pub samples: usize,
     /// Budget en octets estimés (`Exchange::approx_bytes`).
     pub max_bytes: usize,
-    /// Borne de la file de publication ; `None` sans partage : rien n'y est gardé.
+    /// Borne en octets estimés de la file de publication ; `None` sans partage : rien n'y
+    /// est gardé.
     pub share_backlog: Option<usize>,
+    /// Borne en nombre d'échanges de la même file (`share.max_pending`).
+    pub share_pending: usize,
 }
 
 impl Limits {
@@ -54,6 +57,7 @@ impl Limits {
             samples,
             max_bytes: usize::MAX,
             share_backlog: None,
+            share_pending: usize::MAX,
         }
     }
 }
@@ -103,6 +107,14 @@ struct Inner {
     /// Échanges locaux pas encore publiés aux autres sidecars, avec leur taille.
     unshared: VecDeque<(usize, Arc<Exchange>)>,
     unshared_bytes: usize,
+    /// Segment en cours de publication : les `count` premiers échanges de `unshared`, sous
+    /// cet identifiant, jusqu'à ce que le support l'accepte.
+    sealed: Option<Sealed>,
+}
+
+struct Sealed {
+    id: String,
+    count: usize,
 }
 
 impl Store {
@@ -220,7 +232,7 @@ impl Store {
         if local && let Some(max) = self.limits.share_backlog {
             inner.unshared_bytes += bytes;
             inner.unshared.push_back((bytes, e.clone()));
-            inner.trim_unshared(max, &self.drops.share_backlog);
+            inner.trim_unshared(max, self.limits.share_pending, &self.drops.share_backlog);
         }
         let seq = inner.next;
         inner.next += 1;
@@ -341,10 +353,16 @@ impl Store {
         self.lock().unshared_bytes
     }
 
-    /// Récupère les échanges locaux à publier.
+    /// Nombre d'échanges de la file de publication.
+    pub fn unshared_len(&self) -> usize {
+        self.lock().unshared.len()
+    }
+
+    /// Vide la file de publication et rend ses échanges.
     pub fn take_unshared(&self) -> Vec<Exchange> {
         let mut inner = self.lock();
         inner.unshared_bytes = 0;
+        inner.sealed = None;
         let list = std::mem::take(&mut inner.unshared);
         drop(inner);
         list.into_iter()
@@ -352,19 +370,75 @@ impl Store {
             .collect()
     }
 
-    /// Remet des échanges en tête de la file de publication (publication échouée), sans
-    /// dépasser sa borne : les plus anciens sont jetés.
-    pub fn restore_unshared(&self, list: Vec<Exchange>) {
-        let Some(max) = self.limits.share_backlog else {
+    /// Segment en cours de publication, s'il y en a un : identifiant et échanges, du plus
+    /// ancien au plus récent. Il reste en tête de la file, sous le même identifiant, tant que
+    /// `commit_unshared` ne l'a pas retiré (spec §5.4).
+    pub fn sealed_unshared(&self) -> Option<(String, Vec<Arc<Exchange>>)> {
+        let inner = self.lock();
+        let s = inner.sealed.as_ref()?;
+        let list = inner
+            .unshared
+            .iter()
+            .take(s.count)
+            .map(|(_, e)| e.clone())
+            .collect();
+        Some((s.id.clone(), list))
+    }
+
+    /// Premiers échanges de la file, jusqu'à `max_bytes` octets estimés (au moins un) : de
+    /// quoi former le prochain segment, hors du verrou.
+    pub fn unshared_head(&self, max_bytes: usize) -> Vec<Arc<Exchange>> {
+        let inner = self.lock();
+        let mut total = 0;
+        let mut out = vec![];
+        for (bytes, e) in &inner.unshared {
+            if !out.is_empty() && total + bytes > max_bytes {
+                break;
+            }
+            total += bytes;
+            out.push(e.clone());
+        }
+        out
+    }
+
+    /// Scelle les `count` premiers échanges de la file en un segment, sous un nouvel
+    /// identifiant. `None` si la tête a changé depuis `unshared_head` (échanges jetés) ou si
+    /// un segment est déjà scellé.
+    pub fn seal_unshared(&self, first_id: &str, count: usize) -> Option<String> {
+        let mut inner = self.lock();
+        let head = inner.unshared.front().map(|(_, e)| e.id.as_str());
+        if inner.sealed.is_some() || count == 0 || head != Some(first_id) {
+            return None;
+        }
+        if inner.unshared.len() < count {
+            return None;
+        }
+        let id = ulid::Ulid::generate().to_string();
+        inner.sealed = Some(Sealed {
+            id: id.clone(),
+            count,
+        });
+        Some(id)
+    }
+
+    /// Retire de la file le segment accepté par le support.
+    pub fn commit_unshared(&self, id: &str) {
+        let mut inner = self.lock();
+        let Some(count) = inner
+            .sealed
+            .as_ref()
+            .filter(|s| s.id == id)
+            .map(|s| s.count)
+        else {
             return;
         };
-        let mut inner = self.lock();
-        for e in list.into_iter().rev() {
-            let bytes = e.approx_bytes();
-            inner.unshared_bytes += bytes;
-            inner.unshared.push_front((bytes, Arc::new(e)));
+        inner.sealed = None;
+        for _ in 0..count {
+            let Some((bytes, _)) = inner.unshared.pop_front() else {
+                break;
+            };
+            inner.unshared_bytes -= bytes;
         }
-        inner.trim_unshared(max, &self.drops.share_backlog);
     }
 
     pub fn clear(&self) {
@@ -427,12 +501,16 @@ impl Inner {
         Some(entry.e.direction == Direction::Outbound)
     }
 
-    fn trim_unshared(&mut self, max: usize, dropped: &Counter) {
-        while self.unshared_bytes > max {
+    /// Jette les plus anciens échanges de la file au-delà de l'une ou l'autre borne. Un
+    /// segment scellé entamé n'est plus le même : le reste repartira sous un nouvel
+    /// identifiant.
+    fn trim_unshared(&mut self, max_bytes: usize, max_count: usize, dropped: &Counter) {
+        while self.unshared_bytes > max_bytes || self.unshared.len() > max_count {
             let Some((bytes, _)) = self.unshared.pop_front() else {
                 break;
             };
             self.unshared_bytes -= bytes;
+            self.sealed = None;
             dropped.inc();
         }
     }
@@ -691,16 +769,80 @@ mod tests {
         assert_eq!(ids.len(), 10);
         assert_eq!(ids.last(), Some(&"099"));
         assert!(!ids.contains(&"000"));
-        // Publication échouée, puis du trafic : la file reste bornée, les plus récents gagnent.
-        s.restore_unshared(pending);
-        for i in 100..105 {
+        assert_eq!(drops.share_backlog.get(), 90);
+        // Publication échouée (segment scellé, jamais accepté), puis du trafic : la file reste
+        // bornée, les plus récents gagnent.
+        for i in 100..110 {
+            s.add(ex(&format!("{i:03}"), "/a"), Origin::Local);
+        }
+        let head = s.unshared_head(usize::MAX);
+        assert!(s.seal_unshared(&head[0].id, head.len()).is_some());
+        for i in 110..115 {
             s.add(ex(&format!("{i:03}"), "/a"), Origin::Local);
         }
         assert!(s.unshared_bytes() <= max);
         let ids: Vec<String> = s.take_unshared().into_iter().map(|e| e.id).collect();
-        assert_eq!(ids.first().map(String::as_str), Some("095"));
-        assert_eq!(ids.last().map(String::as_str), Some("104"));
+        assert_eq!(ids.first().map(String::as_str), Some("105"));
+        assert_eq!(ids.last().map(String::as_str), Some("114"));
         assert_eq!(drops.share_backlog.get(), 95);
+    }
+
+    fn shared_store(max_bytes: usize, max_pending: usize) -> (Store, Drops) {
+        let drops = Drops::default();
+        let s = Store::with_limits(
+            Limits {
+                share_backlog: Some(max_bytes),
+                share_pending: max_pending,
+                ..Limits::new(1000, 20)
+            },
+            drops.clone(),
+        );
+        (s, drops)
+    }
+
+    #[test]
+    fn shr_09_pending_bound_applies_to_the_same_queue() {
+        let (s, drops) = shared_store(usize::MAX, 3);
+        for i in 0..5 {
+            s.add(ex(&format!("{i:03}"), "/a"), Origin::Local);
+        }
+        assert_eq!(s.unshared_len(), 3);
+        assert_eq!(drops.share_backlog.get(), 2);
+        let ids: Vec<String> = s.take_unshared().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["002", "003", "004"]);
+    }
+
+    #[test]
+    fn shr_09_failed_publication_keeps_the_segment_and_its_identifier() {
+        let (s, drops) = shared_store(usize::MAX, 4);
+        for i in 0..3 {
+            s.add(ex(&format!("{i:03}"), "/a"), Origin::Local);
+        }
+        let head = s.unshared_head(usize::MAX);
+        assert_eq!(head.len(), 3);
+        let id = s.seal_unshared("000", 2).unwrap();
+        // Un seul segment scellé à la fois, et une tête qui a changé est refusée.
+        assert!(s.seal_unshared("000", 2).is_none());
+        // Échec : rien n'est retiré, le segment est rendu sous le même identifiant, même
+        // après l'arrivée d'autres échanges.
+        s.add(ex("003", "/a"), Origin::Local);
+        let (again, list) = s.sealed_unshared().unwrap();
+        assert_eq!(again, id);
+        let ids: Vec<&str> = list.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["000", "001"]);
+        // Accepté : retiré de la file.
+        s.commit_unshared(&id);
+        assert!(s.sealed_unshared().is_none());
+        assert_eq!(s.unshared_len(), 2);
+        // Un segment entamé par la borne perd son identifiant.
+        let id = s.seal_unshared("002", 2).unwrap();
+        for i in 4..7 {
+            s.add(ex(&format!("{i:03}"), "/a"), Origin::Local);
+        }
+        assert!(s.sealed_unshared().is_none());
+        s.commit_unshared(&id);
+        assert_eq!(s.unshared_len(), 4, "un identifiant périmé ne retire rien");
+        assert_eq!(drops.share_backlog.get(), 1);
     }
 
     fn journal(dir: &std::path::Path, segment_bytes: u64, max_segments: usize) -> JournalConfig {

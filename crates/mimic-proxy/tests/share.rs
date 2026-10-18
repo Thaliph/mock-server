@@ -267,3 +267,171 @@ async fn sync_endpoint_reports_when_sharing_is_disabled() {
         .unwrap();
     assert_eq!(r.status(), 404);
 }
+
+/// Contrôleur factice : journalise les listes et les publications, refuse sur commande.
+#[derive(Default)]
+struct FakeController {
+    /// `since_ms` de chaque liste demandée.
+    lists: Vec<Option<i64>>,
+    /// Publications : identifiant de segment, nombre de lignes, date, acceptée ou non.
+    posts: Vec<(Option<String>, usize, Instant, bool)>,
+    /// Segments listés.
+    segments: Vec<Value>,
+    refuse_posts: bool,
+    /// Lectures de segment à refuser avant d'accepter.
+    failing_gets: usize,
+}
+
+type Fake = std::sync::Arc<std::sync::Mutex<FakeController>>;
+
+async fn fake_controller() -> (std::net::SocketAddr, Fake) {
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use std::collections::BTreeMap;
+
+    let fake = Fake::default();
+    let base = "/v1/workloads/ns/api";
+    let app =
+        axum::Router::new()
+            .route(
+                &format!("{base}/heartbeat"),
+                post(|| async { axum::Json(serde_json::json!({"mode": null, "snapshot": null})) }),
+            )
+            .route(
+                &format!("{base}/segments"),
+                get(
+                    |State(f): State<Fake>, Query(q): Query<BTreeMap<String, String>>| async move {
+                        let mut f = f.lock().unwrap();
+                        f.lists.push(q.get("since_ms").map(|v| v.parse().unwrap()));
+                        axum::Json(Value::Array(f.segments.clone()))
+                    },
+                )
+                .post(
+                    |State(f): State<Fake>,
+                     Query(q): Query<BTreeMap<String, String>>,
+                     body: String| async move {
+                        let mut f = f.lock().unwrap();
+                        let ok = !f.refuse_posts;
+                        let lines = body.lines().count();
+                        f.posts
+                            .push((q.get("segment").cloned(), lines, Instant::now(), ok));
+                        if ok {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    },
+                ),
+            )
+            .route(
+                &format!("{base}/segments/{{instance}}/{{file}}"),
+                get(|State(f): State<Fake>| async move {
+                    let mut f = f.lock().unwrap();
+                    if f.failing_gets > 0 {
+                        f.failing_gets -= 1;
+                        return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                    axum::http::StatusCode::OK
+                }),
+            )
+            .with_state(fake.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr, fake)
+}
+
+/// Sidecar `api-a` rattaché au contrôleur factice.
+fn piloted_by(app: Option<std::net::SocketAddr>, ctl: std::net::SocketAddr) -> Config {
+    let mut c = shared(app, Mode::Record, &format!("http://{ctl}"), "api-a", "api");
+    if let Some(s) = c.share.as_mut() {
+        s.allow_insecure = true;
+        s.mode_poll = Duration::from_secs(60);
+    }
+    c
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[tokio::test]
+async fn shr_08_listing_is_incremental_after_a_successful_import() {
+    let (ctl, fake) = fake_controller().await;
+    let at = unix_ms() - 1_000;
+    {
+        let mut f = fake.lock().unwrap();
+        f.segments = vec![serde_json::json!({
+            "key": "api-b/01A.jsonl", "instance": "api-b", "modified_ms": at, "size": 1
+        })];
+        f.failing_gets = 1;
+    }
+    let _a = proxy(piloted_by(None, ctl)).await;
+    eventually("trois listes", || async {
+        fake.lock().unwrap().lists.len() >= 3
+    })
+    .await;
+    let lists = fake.lock().unwrap().lists.clone();
+    // Import échoué : la liste suivante reste complète ; ensuite, le curseur moins 60 s.
+    assert_eq!(lists[0], None);
+    assert_eq!(lists[1], None);
+    assert_eq!(lists[2], Some(at - 60_000));
+}
+
+#[tokio::test]
+async fn shr_09_publication_is_retried_with_the_same_identifier_and_backoff() {
+    let (ctl, fake) = fake_controller().await;
+    fake.lock().unwrap().refuse_posts = true;
+    let app = fake_server().await;
+    let mut config = piloted_by(Some(app.addr), ctl);
+    if let Some(s) = config.share.as_mut() {
+        s.max_pending = 3;
+    }
+    let a = proxy(config).await;
+    for i in 0..5 {
+        client()
+            .get(inbound(&a, &format!("/users/{i}")))
+            .send()
+            .await
+            .unwrap();
+    }
+    eventually("quatre reprises du même segment", || async {
+        let f = fake.lock().unwrap();
+        let n = f.posts.len();
+        n >= 4 && f.posts[n - 4..].iter().all(|p| p.0 == f.posts[n - 1].0)
+    })
+    .await;
+    fake.lock().unwrap().refuse_posts = false;
+    // Les échanges ont pu être rangés en plusieurs segments : on compte toutes les lignes acceptées.
+    let accepted = || {
+        let f = fake.lock().unwrap();
+        f.posts.iter().filter(|p| p.3).map(|p| p.1).sum::<usize>()
+    };
+    eventually("publications acceptées", || async { accepted() >= 3 }).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(accepted(), 3, "seuls les 3 plus récents sont gardés");
+    let posts = fake.lock().unwrap().posts.clone();
+    let ok = posts.iter().position(|p| p.3).unwrap();
+    let id = posts[ok].0.clone();
+    assert!(id.is_some(), "identifiant de segment fourni");
+    let retries: Vec<Instant> = posts[..ok]
+        .iter()
+        .filter(|p| p.0 == id)
+        .map(|p| p.2)
+        .collect();
+    assert!(retries.len() >= 4, "{retries:?}");
+    let gaps: Vec<Duration> = retries.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        gaps[gaps.len() - 1] > gaps[0],
+        "attente croissante : {gaps:?}"
+    );
+    let dropped = metric_value(
+        &metrics(&a).await,
+        r#"mimic_capture_dropped_total{reason="share_backlog"}"#,
+    );
+    assert_eq!(dropped, Some(2.0));
+}

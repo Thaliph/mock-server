@@ -1,6 +1,7 @@
 //! Snapshots de mock (spec §5.6) : jeu figé d'échanges sortants, identique pour tous les pods
 //! d'un workload et identifié par l'empreinte de son contenu.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
@@ -27,38 +28,50 @@ pub struct Snapshot {
     pub exchanges: Vec<Exchange>,
 }
 
-/// Construit le snapshot : indépendant de l'ordre d'arrivée et des doublons.
-pub fn build(exchanges: impl IntoIterator<Item = Exchange>, opts: &SnapshotOptions) -> Snapshot {
-    // Tri total : date, identifiant, puis contenu sérialisé pour départager deux versions d'un même id.
-    let mut keyed: Vec<(u64, String, String, Exchange)> = exchanges
+/// Construit le snapshot : indépendant de l'ordre d'arrivée et des doublons. Accepte des
+/// échanges ou des références ; seuls les échanges gardés sont copiés.
+pub fn build<E: Borrow<Exchange>>(
+    exchanges: impl IntoIterator<Item = E>,
+    opts: &SnapshotOptions,
+) -> Snapshot {
+    // Tri total : date, identifiant, puis contenu sérialisé pour départager deux versions d'un
+    // même id. La sérialisation n'est faite qu'en cas d'égalité, rare.
+    let mut keyed: Vec<E> = exchanges
         .into_iter()
-        .filter(|e| e.direction == Direction::Outbound && e.status != 0)
-        .map(|e| {
-            let line = serde_json::to_string(&e).unwrap_or_default();
-            (e.started_at_ms, e.id.clone(), line, e)
+        .filter(|e| {
+            let e = e.borrow();
+            e.direction == Direction::Outbound && e.status != 0
         })
         .collect();
-    keyed.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
+    keyed.sort_by(|a, b| {
+        let (a, b) = (a.borrow(), b.borrow());
+        (a.started_at_ms, &a.id)
+            .cmp(&(b.started_at_ms, &b.id))
+            .then_with(|| {
+                let line = |e: &Exchange| serde_json::to_string(e).unwrap_or_default();
+                line(a).cmp(&line(b))
+            })
+    });
     let mut seen = BTreeSet::new();
-    let unique: Vec<Exchange> = keyed
-        .into_iter()
-        .filter(|(_, id, _, _)| seen.insert(id.clone()))
-        .map(|(.., e)| e)
+    let unique: Vec<&Exchange> = keyed
+        .iter()
+        .map(Borrow::borrow)
+        .filter(|e: &&Exchange| seen.insert(e.id.as_str()))
         .collect();
 
     // Plafond par clé, en partant des plus récents. Il est compté à part pour les réponses
     // rejouables : au-delà du plafond d'exemples du sidecar, les échanges récents d'un endpoint
     // très sollicité n'ont plus de body et ne doivent pas évincer ceux qui en ont un.
-    let mut per_key: BTreeMap<(String, String, String, u16, bool), usize> = BTreeMap::new();
+    let mut per_key: BTreeMap<(&str, String, &str, u16, bool), usize> = BTreeMap::new();
     let mut kept: Vec<Exchange> = unique
         .into_iter()
         .rev()
         .filter(|e| {
             let n = per_key
                 .entry((
-                    e.authority.clone(),
+                    e.authority.as_str(),
                     e.method.to_ascii_uppercase(),
-                    e.path.clone(),
+                    e.path.as_str(),
                     e.status,
                     e.resp_body.is_replayable(),
                 ))
@@ -66,6 +79,7 @@ pub fn build(exchanges: impl IntoIterator<Item = Exchange>, opts: &SnapshotOptio
             *n += 1;
             *n <= opts.max_per_key
         })
+        .cloned()
         .collect();
     kept.reverse();
     Snapshot::from_exchanges(kept)

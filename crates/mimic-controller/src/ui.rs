@@ -57,31 +57,33 @@ async fn metrics(State(ctl): State<Arc<Ctl>>) -> Response {
 }
 
 async fn workload_json(ctl: &Ctl, ns: &str, wl: &str) -> Value {
-    let w = ctl.workload(ns, wl).await;
-    let summary = ctl.summary(&w);
-    let pods: Vec<Value> = ctl
-        .pod_states(&w)
-        .into_iter()
-        .map(|(p, s)| {
-            json!({
-                "instance": p.instance,
-                "mode": p.report.mode,
-                "snapshot": p.report.snapshot,
-                "last_seen_ms": p.last_seen_ms,
-                "state": s.as_str(),
+    ctl.with_live(ns, wl, |w| {
+        let summary = ctl.summary(w);
+        let pods: Vec<Value> = ctl
+            .pod_states(w)
+            .into_iter()
+            .map(|(p, s)| {
+                json!({
+                    "instance": p.instance,
+                    "mode": p.report.mode,
+                    "snapshot": p.report.snapshot,
+                    "last_seen_ms": p.last_seen_ms,
+                    "state": s.as_str(),
+                })
             })
+            .collect();
+        json!({
+            "namespace": ns,
+            "name": wl,
+            "spec": w.spec,
+            "desired": w.desired,
+            "pods": pods,
+            "aligned": summary.aligned,
+            "ready": summary.ready,
+            "reason": summary.reason,
         })
-        .collect();
-    json!({
-        "namespace": ns,
-        "name": wl,
-        "spec": w.spec,
-        "desired": w.desired,
-        "pods": pods,
-        "aligned": summary.aligned,
-        "ready": summary.ready,
-        "reason": summary.reason,
     })
+    .await
 }
 
 async fn workloads(State(ctl): State<Arc<Ctl>>) -> Response {
@@ -96,7 +98,7 @@ async fn mode(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
     if !valid_name(&ns) || !valid_name(&wl) {
         return bad_name();
     }
-    axum::Json(ctl.workload(&ns, &wl).await.desired.clone()).into_response()
+    axum::Json(ctl.with_live(&ns, &wl, |w| w.desired.clone()).await).into_response()
 }
 
 async fn snapshots(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
@@ -120,8 +122,7 @@ async fn ops(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
     if !valid_name(&ns) || !valid_name(&wl) {
         return bad_name();
     }
-    let mut w = ctl.workload(&ns, &wl).await;
-    let d = ctl.discovery(&mut w).await;
+    let d = ctl.discovery(&ns, &wl).await;
     axum::Json(operations(&d.inbound, &d.outbound)).into_response()
 }
 
@@ -129,8 +130,7 @@ async fn openapi_inbound(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Res
     if !valid_name(&ns) || !valid_name(&wl) {
         return bad_name();
     }
-    let mut w = ctl.workload(&ns, &wl).await;
-    axum::Json(ctl.discovery(&mut w).await.inbound.clone()).into_response()
+    axum::Json(ctl.discovery(&ns, &wl).await.inbound.clone()).into_response()
 }
 
 async fn openapi_outbound(
@@ -140,8 +140,7 @@ async fn openapi_outbound(
     if !valid_name(&ns) || !valid_name(&wl) {
         return bad_name();
     }
-    let mut w = ctl.workload(&ns, &wl).await;
-    match ctl.discovery(&mut w).await.outbound.get(&authority) {
+    match ctl.discovery(&ns, &wl).await.outbound.get(&authority) {
         Some(doc) => axum::Json(doc.clone()).into_response(),
         None => (StatusCode::NOT_FOUND, "dépendance inconnue").into_response(),
     }
@@ -168,43 +167,50 @@ async fn requests(
         _ => return (StatusCode::BAD_REQUEST, "direction: inbound ou outbound").into_response(),
     };
     let limit = q.limit.unwrap_or(1_000).min(100_000);
-    let mut w = ctl.workload(&ns, &wl).await;
-    let list = ctl.requests(&mut w, direction, limit).await;
-    match q.format.as_deref().unwrap_or("json") {
-        "json" => {
-            let out: Vec<Value> = list
-                .into_iter()
-                .map(|(instance, e)| {
-                    let mut v = serde_json::to_value(e).unwrap_or_default();
-                    v["instance"] = json!(instance);
-                    v
-                })
-                .collect();
-            axum::Json(out).into_response()
-        }
-        "jsonl" => {
-            let mut body = String::new();
-            for (_, e) in &list {
-                if let Ok(line) = serde_json::to_string(e) {
-                    body.push_str(&line);
-                    body.push('\n');
-                }
-            }
-            ([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response()
-        }
-        "k6" => {
-            let exchanges: Vec<_> = list.into_iter().map(|(_, e)| e).collect();
-            (
-                [(
-                    header::CONTENT_TYPE,
-                    "application/javascript; charset=utf-8",
-                )],
-                mimic_core::replay::k6_script(&exchanges),
-            )
-                .into_response()
-        }
-        _ => (StatusCode::BAD_REQUEST, "format: json, jsonl ou k6").into_response(),
+    let format = q.format.unwrap_or_else(|| "json".into());
+    if !["json", "jsonl", "k6"].contains(&format.as_str()) {
+        return (StatusCode::BAD_REQUEST, "format: json, jsonl ou k6").into_response();
     }
+    // Jusqu'à 100 000 échanges triés et mis en forme hors des threads du serveur, sans copie.
+    ctl.with_requests(&ns, &wl, direction, limit, move |list| {
+        match format.as_str() {
+            "json" => {
+                let out: Vec<Value> = list
+                    .iter()
+                    .map(|t| {
+                        let mut v = serde_json::to_value(t.1).unwrap_or_default();
+                        v["instance"] = json!(t.0);
+                        v
+                    })
+                    .collect();
+                axum::Json(out).into_response()
+            }
+            "jsonl" => {
+                let mut body = String::new();
+                for t in &list {
+                    if let Ok(line) = serde_json::to_string(t.1) {
+                        body.push_str(&line);
+                        body.push('\n');
+                    }
+                }
+                ([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response()
+            }
+            _ => {
+                let exchanges: Vec<&mimic_core::model::Exchange> =
+                    list.iter().map(|t| t.1).collect();
+                (
+                    [(
+                        header::CONTENT_TYPE,
+                        "application/javascript; charset=utf-8",
+                    )],
+                    mimic_core::replay::k6_script(&exchanges),
+                )
+                    .into_response()
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 fn head(h: &mut String, title: &str) {
@@ -225,17 +231,18 @@ async fn home(State(ctl): State<Arc<Ctl>>) -> Html<String> {
     } else {
         h.push_str("<table><tr><th>Workload</th><th>Mode souhaité</th><th>Pods alignés</th><th>Échanges</th></tr>");
         for (ns, wl) in keys {
-            let w = ctl.workload(&ns, &wl).await;
-            let s = ctl.summary(&w);
+            let (mode, s) = ctl
+                .with_live(&ns, &wl, |w| (w.desired.mode.clone(), ctl.summary(w)))
+                .await;
             let _ = write!(
                 h,
                 "<tr><td><a href=\"/ui/{0}/{1}\">{0}/{1}</a></td><td>{2}</td><td>{3}/{4}</td><td>{5}</td></tr>",
                 esc(&ns),
                 esc(&wl),
-                esc(w.desired.mode.as_deref().unwrap_or("libre")),
+                esc(mode.as_deref().unwrap_or("libre")),
                 s.aligned,
                 s.pods,
-                w.exchange_count()
+                ctl.exchange_count(&ns, &wl)
             );
         }
         h.push_str("</table>");
@@ -248,12 +255,19 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
     if !valid_name(&ns) || !valid_name(&wl) {
         return bad_name();
     }
-    let mut w = ctl.workload(&ns, &wl).await;
-    let d = ctl.discovery(&mut w).await;
+    let d = ctl.discovery(&ns, &wl).await;
     let ops = operations(&d.inbound, &d.outbound);
-    let summary = ctl.summary(&w);
-    let pods = ctl.pod_states(&w);
-    let recent = ctl.requests(&mut w, Direction::Inbound, 50).await;
+    let (summary, pods, desired, has_spec) = ctl
+        .with_live(&ns, &wl, |w| {
+            (
+                ctl.summary(w),
+                ctl.pod_states(w),
+                w.desired.clone(),
+                w.spec.is_some(),
+            )
+        })
+        .await;
+    let recent = ctl.requests(&ns, &wl, Direction::Inbound, 50).await;
     let snaps = ctl.snapshots(&ns, &wl).await;
     let api = format!("/v1/workloads/{ns}/{wl}");
 
@@ -264,8 +278,8 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
         "<h1>{} / {}</h1><div class=\"meta\"><span>mode souhaité <span class=\"pill mode\">{}</span></span><span>snapshot {}</span><span>{} / {} pods alignés{}</span><span><a href=\"{api}/openapi/inbound\">OpenAPI du service</a></span></div>",
         esc(&ns),
         esc(&wl),
-        esc(w.desired.mode.as_deref().unwrap_or("libre")),
-        esc(w.desired.snapshot.as_deref().unwrap_or("aucun")),
+        esc(desired.mode.as_deref().unwrap_or("libre")),
+        esc(desired.snapshot.as_deref().unwrap_or("aucun")),
         summary.aligned,
         summary.pods,
         summary
@@ -285,7 +299,7 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
             m
         );
     }
-    if w.spec.is_none() {
+    if !has_spec {
         let _ = write!(
             h,
             "<p class=\"empty\">Aucune ressource MimicWorkload pour ce workload : créer d'abord <code>kubectl apply -f - &lt;&lt;&lt; '{{\"apiVersion\":\"mimic.platform.io/v1alpha1\",\"kind\":\"MimicWorkload\",\"metadata\":{{\"name\":\"{}\",\"namespace\":\"{}\"}},\"spec\":{{\"mode\":\"record\"}}}}'</code></p>",

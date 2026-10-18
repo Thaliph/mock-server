@@ -6,6 +6,7 @@
 pub mod path;
 pub mod schema;
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value, json};
@@ -77,16 +78,18 @@ impl InferOptions {
 }
 
 /// Regroupe les échanges sortants par authority : un document par dépendance.
-pub fn infer_outbound(exchanges: &[Exchange], version: &str) -> BTreeMap<String, Value> {
-    let mut by_authority: BTreeMap<&str, Vec<Exchange>> = BTreeMap::new();
+/// Accepte des échanges ou des références : rien n'est copié.
+pub fn infer_outbound<E: Borrow<Exchange>>(
+    exchanges: &[E],
+    version: &str,
+) -> BTreeMap<String, Value> {
+    let mut by_authority: BTreeMap<&str, Vec<&Exchange>> = BTreeMap::new();
     for e in exchanges
         .iter()
+        .map(Borrow::borrow)
         .filter(|e| e.direction == Direction::Outbound)
     {
-        by_authority
-            .entry(&e.authority)
-            .or_default()
-            .push(e.clone());
+        by_authority.entry(&e.authority).or_default().push(e);
     }
     by_authority
         .into_iter()
@@ -97,10 +100,11 @@ pub fn infer_outbound(exchanges: &[Exchange], version: &str) -> BTreeMap<String,
         .collect()
 }
 
-/// Produit un document OpenAPI 3.1.
-pub fn infer(exchanges: &[Exchange], opts: &InferOptions) -> Value {
+/// Produit un document OpenAPI 3.1, à partir d'échanges ou de références.
+pub fn infer<E: Borrow<Exchange>>(exchanges: &[E], opts: &InferOptions) -> Value {
     let mut selected: Vec<&Exchange> = exchanges
         .iter()
+        .map(Borrow::borrow)
         .filter(|e| e.direction == opts.direction)
         .collect();
     selected.sort_by(|a, b| (a.started_at_ms, &a.id).cmp(&(b.started_at_ms, &b.id)));

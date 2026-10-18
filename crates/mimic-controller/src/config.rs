@@ -21,10 +21,22 @@ pub struct ControllerConfig {
     #[serde(with = "duration_secs")]
     pub retention: Duration,
     pub max_exchanges_per_workload: usize,
+    /// Échanges gardés en mémoire, tous workloads confondus.
+    pub max_exchanges_total: usize,
+    /// Bodies gardés par couple (opération, code), en mémoire et après compaction.
+    pub samples_per_operation: usize,
+    /// Volume des segments d'un workload sur le support : au-delà, les plus anciens partent.
+    pub max_bytes_per_workload: u64,
+    /// Au plus un recalcul de la découverte d'un workload par intervalle.
+    #[serde(with = "duration_secs")]
+    pub discovery_interval: Duration,
     pub snapshot: SnapshotConfig,
     /// Un pod sans battement depuis ce délai est affiché absent.
     #[serde(with = "duration_secs")]
     pub pod_timeout: Duration,
+    /// Un pod sans battement depuis ce délai est oublié.
+    #[serde(with = "duration_secs")]
+    pub pod_forget: Duration,
 }
 
 impl Default for ControllerConfig {
@@ -37,8 +49,13 @@ impl Default for ControllerConfig {
             store: "file:///var/lib/mimic-controller".into(),
             retention: Duration::from_secs(7 * 24 * 3600),
             max_exchanges_per_workload: 200_000,
+            max_exchanges_total: 1_000_000,
+            samples_per_operation: 20,
+            max_bytes_per_workload: 256 * 1024 * 1024,
+            discovery_interval: Duration::from_secs(30),
             snapshot: SnapshotConfig::default(),
             pod_timeout: Duration::from_secs(30),
+            pod_forget: Duration::from_secs(600),
         }
     }
 }
@@ -100,6 +117,11 @@ impl ControllerConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !self.store.starts_with("file://") && !self.store.starts_with("s3://") {
             return Err(format!("store non supporté: {}", self.store));
+        }
+        if self.max_exchanges_per_workload == 0 || self.max_exchanges_total == 0 {
+            return Err(
+                "max_exchanges_per_workload et max_exchanges_total doivent être positifs".into(),
+            );
         }
         if self.snapshot.max_per_key == 0 {
             return Err("snapshot.max_per_key doit être positif".into());

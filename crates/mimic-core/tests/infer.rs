@@ -3,7 +3,7 @@
 mod common;
 
 use common::{ExchangeExt, exchange, openapi_violations, sequence};
-use mimic_core::infer::{InferOptions, infer};
+use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::model::{Direction, Exchange};
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -384,5 +384,17 @@ proptest! {
         }
         let opts = InferOptions::new("svc", "0.0.0");
         prop_assert_eq!(infer(&numbered, &opts), infer(&shuffled, &opts));
+    }
+
+    /// Le contrôleur infère sur des références (§5.5.2) : même document que sur des copies.
+    #[test]
+    fn inf_08_references_give_the_same_document(
+        exchanges in prop::collection::vec(arb_exchange(), 1..40),
+    ) {
+        let numbered = sequence(exchanges);
+        let refs: Vec<&Exchange> = numbered.iter().collect();
+        let opts = InferOptions::new("svc", "0.0.0");
+        prop_assert_eq!(infer(&numbered, &opts), infer(&refs, &opts));
+        prop_assert_eq!(infer_outbound(&numbered, "0"), infer_outbound(&refs, "0"));
     }
 }

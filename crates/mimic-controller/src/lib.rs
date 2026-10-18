@@ -28,6 +28,9 @@ use crate::config::{AuthConfig, ControllerConfig, TlsFiles};
 use crate::reconcile::MimicWorkloadSpec;
 use crate::state::Ctl;
 
+/// Rétention, compaction et oubli des pods (spec §5.5.2).
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct Running {
     ctl: Arc<Ctl>,
     api: SocketAddr,
@@ -79,9 +82,18 @@ pub fn install_crypto_provider() {
 }
 
 pub async fn start(config: ControllerConfig) -> Result<Running, String> {
-    install_crypto_provider();
     config.validate()?;
     let store = open(&config.store)?;
+    start_with(config, store).await
+}
+
+/// Comme `start`, sur un support déjà ouvert (tests).
+pub async fn start_with(
+    config: ControllerConfig,
+    store: Arc<dyn ObjectStore>,
+) -> Result<Running, String> {
+    install_crypto_provider();
+    config.validate()?;
     let (auth, client) = match &config.auth {
         AuthConfig::Static { tokens } => (Authenticator::Static(tokens.clone()), None),
         AuthConfig::Kubernetes => {
@@ -112,6 +124,7 @@ pub async fn start(config: ControllerConfig) -> Result<Running, String> {
         tokio::spawn(serve(api_listener, api::router(ctl.clone()), tls)),
         tokio::spawn(serve(ui_listener, ui::router(ctl.clone()), None)),
     ];
+    tasks.push(tokio::spawn(maintenance(ctl.clone())));
     if let Some(client) = client {
         tasks.push(tokio::spawn(crate::kube::watch(
             ctl.clone(),
@@ -129,6 +142,14 @@ pub async fn start(config: ControllerConfig) -> Result<Running, String> {
         ui,
         tasks,
     })
+}
+
+/// Passe de maintenance du support et des pods (spec §5.5.2), après chaque intervalle.
+async fn maintenance(ctl: Arc<Ctl>) {
+    loop {
+        tokio::time::sleep(MAINTENANCE_INTERVAL).await;
+        ctl.maintain().await;
+    }
 }
 
 async fn serve(listener: TcpListener, router: Router, tls: Option<tokio_rustls::TlsAcceptor>) {

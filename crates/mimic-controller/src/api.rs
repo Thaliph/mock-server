@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::auth::{AuthError, authorize, bearer};
 use crate::metrics::ReasonLabel;
 use crate::reconcile::PodReport;
-use crate::state::{Ctl, valid_name};
+use crate::state::{Ctl, IngestError, valid_name};
 
 /// Un segment ne dépasse pas cette taille.
 const MAX_SEGMENT: usize = 64 * 1024 * 1024;
@@ -87,22 +87,30 @@ async fn guard(
 }
 
 #[derive(Deserialize)]
-struct InstanceQuery {
+struct SegmentQuery {
     instance: String,
+    /// Identifiant choisi par le sidecar : un renvoi du même segment est sans effet.
+    segment: Option<String>,
 }
 
 async fn post_segment(
     State(ctl): State<Arc<Ctl>>,
     Path((ns, wl)): Path<(String, String)>,
-    Query(q): Query<InstanceQuery>,
+    Query(q): Query<SegmentQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if let Err(r) = guard(&ctl, &headers, &ns, &wl, Some(&q.instance)).await {
         return *r;
     }
-    let result = ctl.ingest(&ns, &wl, &q.instance, &body).await;
-    let label = if result.is_ok() { "ok" } else { "error" };
+    let result = ctl
+        .ingest(&ns, &wl, &q.instance, q.segment.as_deref(), body)
+        .await;
+    let label = match &result {
+        Ok(i) if i.duplicate => "duplicate",
+        Ok(_) => "ok",
+        Err(_) => "error",
+    };
     ctl.metrics
         .segments
         .get_or_create(&crate::metrics::ResultLabel {
@@ -110,20 +118,32 @@ async fn post_segment(
         })
         .inc();
     match result {
-        Ok(key) => (StatusCode::CREATED, key).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Ok(i) if i.duplicate => (StatusCode::OK, i.key).into_response(),
+        Ok(i) => (StatusCode::CREATED, i.key).into_response(),
+        Err(IngestError::Invalid(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(IngestError::Storage(e)) => {
+            tracing::warn!(error = %e, "ingestion d'un segment");
+            (StatusCode::SERVICE_UNAVAILABLE, "support indisponible").into_response()
+        }
     }
+}
+
+#[derive(Deserialize)]
+struct SegmentsQuery {
+    /// Seuls les segments datés d'au moins cette valeur (ms Unix) sont listés.
+    since_ms: Option<i64>,
 }
 
 async fn list_segments(
     State(ctl): State<Arc<Ctl>>,
     Path((ns, wl)): Path<(String, String)>,
+    Query(q): Query<SegmentsQuery>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = guard(&ctl, &headers, &ns, &wl, None).await {
         return *r;
     }
-    match ctl.segments(&ns, &wl).await {
+    match ctl.segments(&ns, &wl, q.since_ms).await {
         Ok(list) => axum::Json(list).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }

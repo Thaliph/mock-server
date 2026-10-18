@@ -33,6 +33,7 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 ulid = "3.0.0"
 
 [dev-dependencies]
+async-trait = "0.1.92"
 reqwest = { version = "0.13.5", features = ["json"] }
 tempfile = "3.27.0"
 

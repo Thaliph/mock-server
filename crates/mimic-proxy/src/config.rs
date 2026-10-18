@@ -300,6 +300,9 @@ pub struct ShareConfig {
     /// Borne en octets de la file des échanges pas encore publiés (spec §5.4).
     #[serde(default = "default_share_backlog")]
     pub max_backlog_bytes: usize,
+    /// Borne en nombre d'échanges de la même file (spec §5.4).
+    #[serde(default = "default_max_pending")]
+    pub max_pending: usize,
 }
 
 impl Default for ShareConfig {
@@ -313,6 +316,7 @@ impl Default for ShareConfig {
             token_file: None,
             allow_insecure: false,
             max_backlog_bytes: default_share_backlog(),
+            max_pending: default_max_pending(),
         }
     }
 }
@@ -333,6 +337,10 @@ impl Config {
 
 fn default_mode_poll() -> Duration {
     Duration::from_secs(2)
+}
+
+fn default_max_pending() -> usize {
+    50_000
 }
 
 fn default_share_interval() -> Duration {

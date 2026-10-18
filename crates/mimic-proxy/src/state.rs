@@ -128,6 +128,7 @@ impl AppState {
                 samples: config.capture.samples_per_operation,
                 max_bytes: config.capture.max_store_bytes,
                 share_backlog: config.share.as_ref().map(|s| s.max_backlog_bytes),
+                share_pending: config.share.as_ref().map_or(usize::MAX, |s| s.max_pending),
             },
             Drops {
                 store_budget: metrics.dropped("store_budget"),
