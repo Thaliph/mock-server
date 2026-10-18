@@ -72,7 +72,7 @@ fn snp_06_replayable_examples_survive_more_recent_bodyless_ones() {
     let ids: Vec<_> = s.exchanges.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, ["00", "01", "07", "08", "09"]);
 
-    let mut engine = MockEngine::new(s.exchanges, MockConfig::default());
+    let engine = MockEngine::new(s.exchanges, MockConfig::default());
     let req = MockRequest {
         authority: "api.saas.io:443".into(),
         method: "GET".into(),

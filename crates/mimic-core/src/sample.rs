@@ -20,6 +20,12 @@ use crate::model::Direction;
 /// un segment littéral ne se confond pas avec une nature.
 pub fn path_shape(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
+    push_path_shape(&mut out, path);
+    out
+}
+
+/// Ajoute la forme de `path` à `out`, sans allocation intermédiaire.
+pub fn push_path_shape(out: &mut String, path: &str) {
     for s in path.split('/').filter(|s| !s.is_empty()) {
         out.push('/');
         if is_identifier(s) {
@@ -34,7 +40,6 @@ pub fn path_shape(path: &str) -> String {
             out.push_str(s);
         }
     }
-    out
 }
 
 /// Clé d'échantillonnage d'un échange : (sens, authority, méthode, forme du chemin, code).

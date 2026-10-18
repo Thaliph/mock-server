@@ -6,6 +6,7 @@ pub mod admin;
 pub mod capture;
 pub mod config;
 pub mod control;
+pub mod engine;
 pub mod journal;
 pub mod metrics;
 pub mod net;
@@ -91,6 +92,8 @@ pub async fn start(config: Config) -> Result<Running, String> {
             .map_err(|e| format!("store {}: {e}", dir.display()))?;
         tracing::info!(loaded, dir = %dir.display(), "store local rechargé");
     }
+    // Démarrage en mock : moteur construit avant d'écouter (spec §5.3).
+    state.ensure_mock_engine();
     let mut tasks = vec![];
     let bind = |addr: SocketAddr, kind: Listener| {
         let state = state.clone();

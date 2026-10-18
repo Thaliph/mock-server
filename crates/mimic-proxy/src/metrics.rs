@@ -84,6 +84,11 @@ pub struct TlsFailureLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TriggerLabel {
+    pub trigger: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ModeLabel {
     pub mode: String,
 }
@@ -109,6 +114,7 @@ pub struct Metrics {
     pub share_sync: Family<ResultLabel, Counter>,
     pub share_peers: Gauge,
     pub mock_snapshot_exchanges: Gauge,
+    pub mock_engine_builds: Family<TriggerLabel, Counter>,
     pub mode: Family<ModeLabel, Gauge>,
     pub passthrough: Family<PassthroughLabels, Counter>,
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
@@ -132,6 +138,7 @@ impl Metrics {
         let share_sync = Family::default();
         let share_peers = Gauge::default();
         let mock_snapshot_exchanges = Gauge::default();
+        let mock_engine_builds = Family::default();
         let mode = Family::default();
         let passthrough = Family::default();
         let tls_handshake_failures = Family::default();
@@ -195,6 +202,11 @@ impl Metrics {
             "Échanges du snapshot imposé par le contrôleur (0 sans snapshot)",
             mock_snapshot_exchanges.clone(),
         );
+        registry.register(
+            "mimic_mock_engine_builds",
+            "Constructions du moteur de mock, par déclencheur (switch, refresh, unmatched)",
+            mock_engine_builds.clone(),
+        );
         registry.register("mimic_mode", "Mode courant (1)", mode.clone());
         registry.register(
             "mimic_passthrough_connections",
@@ -220,6 +232,7 @@ impl Metrics {
             share_sync,
             share_peers,
             mock_snapshot_exchanges,
+            mock_engine_builds,
             mode,
             passthrough,
             tls_handshake_failures,

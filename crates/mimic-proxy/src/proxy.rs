@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use http::header::{HeaderMap, HeaderName, HeaderValue};
+use http::header::{HeaderMap, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty, Full, Limited};
 use hyper::body::Incoming;
@@ -13,8 +13,9 @@ use mimic_core::mock::{MockDecision, MockRequest, MockResponse};
 use mimic_core::model::{Body, Direction, Exchange, Header};
 use tokio::sync::oneshot;
 
-use crate::capture::{Captured, TeeBody, encode};
+use crate::capture::{Captured, TeeBody};
 use crate::config::{Mode, Unmatched};
+use crate::engine::{MockSet, Trigger};
 use crate::metrics::{
     AuthorityLabel, DurationLabels, MockLabels, ReasonLabel, RequestLabels, UpstreamErrorLabels,
 };
@@ -371,7 +372,11 @@ async fn serve_mock(
     body: Incoming,
     target: Target,
 ) -> Response<ProxyBody> {
+    // Arrivée de la requête : la latence rejouée est comptée d'ici, comme la durée mesurée
+    // en record (spec §5.3).
     let started = Instant::now();
+    // Enregistrements sortants présents à l'arrivée : ceux qu'un moteur à jour doit connaître.
+    let seen = state.store.outbound_version();
     let mode = state.mode();
     let limit = state.config.capture.max_body_bytes;
     let body = match Limited::new(body, limit).collect().await {
@@ -391,9 +396,23 @@ async fn serve_mock(
         headers: to_headers(&parts.headers),
         body: body.to_vec(),
     };
-    let decision = state.with_engine(|engine| engine.respond(&request));
+    // Moteur courant, lu sans verrou ; construit ici seulement s'il n'y en a pas encore.
+    let mut set = match state.mock_engine() {
+        Some(set) => set,
+        None => state.fresh_engine(Trigger::Switch, seen).await,
+    };
+    let mut decision = set.engine.respond(&request);
+    if state.is_stale(&set, seen) {
+        if decision == MockDecision::Unmatched {
+            // Le store a changé : l'enregistrement cherché vient peut-être d'arriver.
+            set = state.fresh_engine(Trigger::Unmatched, seen).await;
+            decision = set.engine.respond(&request);
+        } else {
+            state.schedule_refresh();
+        }
+    }
     let authority_label = state.metrics.authority(&target.authority);
-    let method = request.method.clone();
+    let method = request.method;
     match decision {
         MockDecision::Matched(r) => {
             mock_metric(&state, &authority_label, r.kind.as_str());
@@ -405,8 +424,8 @@ async fn serve_mock(
                     authority: authority_label.clone(),
                 })
                 .observe(latency.as_secs_f64());
-            tokio::time::sleep(latency).await;
-            let response = mock_response(&state, r);
+            // Réponse prête avant l'attente : sa préparation est prise sur la latence.
+            let response = mock_response(&state, &set, &r);
             count_request(
                 &state,
                 Direction::Outbound,
@@ -415,6 +434,7 @@ async fn serve_mock(
                 &method,
                 response.status().as_u16(),
             );
+            crate::engine::sleep_until(started + latency).await;
             observe_duration(
                 &state,
                 Direction::Outbound,
@@ -450,42 +470,18 @@ async fn serve_mock(
     }
 }
 
-fn mock_response(state: &AppState, r: MockResponse) -> Response<ProxyBody> {
-    let mut headers = HeaderMap::new();
-    for h in &r.headers {
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(h.name.as_bytes()),
-            HeaderValue::from_str(&h.value),
-        ) {
-            headers.append(n, v);
-        }
-    }
-    let data = match &r.body {
-        Body::Captured { data } => data.clone(),
-        _ => vec![],
-    };
-    let encoding = headers
-        .get(http::header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let data = match encoding {
-        Some(enc) if !data.is_empty() => match encode(&enc, &data) {
-            Some(encoded) => encoded,
-            None => {
-                headers.remove(http::header::CONTENT_ENCODING);
-                data
-            }
-        },
-        _ => data,
-    };
+/// Réponse servie : celle préparée pour l'enregistrement (headers, body encodé, partagés), plus
+/// le header de correspondance propre à la requête.
+fn mock_response(state: &AppState, set: &MockSet, r: &MockResponse) -> Response<ProxyBody> {
+    let prepared = set.prepared(r);
+    let mut response = Response::new(full(prepared.body.clone()));
+    *response.status_mut() = prepared.status;
+    *response.headers_mut() = prepared.headers.clone();
     if state.config.mock.debug_header
         && let Ok(v) = HeaderValue::from_str(&format!("{};score={:.2}", r.kind.as_str(), r.score))
     {
-        headers.insert("x-mimic-match", v);
+        response.headers_mut().insert("x-mimic-match", v);
     }
-    let mut response = Response::new(full(data));
-    *response.status_mut() = StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK);
-    *response.headers_mut() = headers;
     response
 }
 

@@ -10,8 +10,6 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use mimic_core::infer::{InferOptions, infer, infer_outbound};
-use mimic_core::mock::{MockConfig, MockEngine};
-use mimic_core::model::Direction;
 use mimic_core::redact::{RedactConfig, Redactor};
 use mimic_core::snapshot::Snapshot;
 use serde_json::Value;
@@ -48,9 +46,10 @@ pub struct AppState {
     pub client_h2: Client<HttpsConnector<HttpConnector>, ProxyBody>,
     /// Interception TLS : CA et configuration serveur, si `tls.intercept` n'est pas vide.
     pub tls: Option<TlsState>,
-    engine: Mutex<Option<(EngineKey, MockEngine)>>,
+    /// Moteur de mock en service (spec §5.3).
+    pub(crate) engines: crate::engine::Engines,
     /// Snapshot imposé par le contrôleur : seule source du mock quand il est présent.
-    snapshot: Mutex<Option<Arc<Snapshot>>>,
+    pub(crate) snapshot: Mutex<Option<Arc<Snapshot>>>,
     pub controller_status: Mutex<crate::control::ControllerStatus>,
     discovery: Mutex<Option<(u64, Arc<Discovery>)>>,
     pub share_status: Mutex<ShareStatus>,
@@ -60,13 +59,6 @@ pub struct AppState {
     pub inbound_targets: crate::net::InboundTargets,
     /// Logs d'échec vers l'amont, limités en débit (spec §9.3).
     pub upstream_log: LogLimiter,
-}
-
-/// Source du moteur de mock en cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EngineKey {
-    Store(u64),
-    Snapshot(String),
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -155,7 +147,7 @@ impl AppState {
             redactor,
             client,
             client_h2,
-            engine: Mutex::new(None),
+            engines: crate::engine::Engines::default(),
             snapshot: Mutex::new(None),
             controller_status: Mutex::new(crate::control::ControllerStatus {
                 url: controller_url,
@@ -178,8 +170,17 @@ impl AppState {
         Mode::from_u8(self.mode.load(Ordering::SeqCst))
     }
 
+    /// Change de mode. Entrer en mock construit d'abord le moteur, de sorte que la première
+    /// requête mockée le trouve prêt ; quitter le mock le libère (spec §5.3).
     pub fn set_mode(&self, mode: Mode) {
+        let mock = crate::engine::mock_mode(mode);
+        if mock {
+            self.prepare_mock();
+        }
         let previous = Mode::from_u8(self.mode.swap(mode.to_u8(), Ordering::SeqCst));
+        if !mock {
+            self.release_mock();
+        }
         if previous != mode {
             tracing::info!(
                 from = previous.as_str(),
@@ -194,42 +195,13 @@ impl AppState {
         self.snapshot.lock().expect("verrou du snapshot").clone()
     }
 
+    /// Impose un snapshot (ou le retire) ; en mock, le moteur est reconstruit dessus avant
+    /// de servir.
     pub fn set_snapshot(&self, snap: Option<Arc<Snapshot>>) {
         self.metrics
             .mock_snapshot_exchanges
             .set(snap.as_ref().map_or(0, |s| s.exchanges.len() as i64));
-        *self.snapshot.lock().expect("verrou du snapshot") = snap;
-    }
-
-    /// Exécute `f` avec le moteur de mock : construit sur le snapshot imposé s'il y en a un,
-    /// sinon sur les derniers enregistrements sortants.
-    pub fn with_engine<R>(&self, f: impl FnOnce(&mut MockEngine) -> R) -> R {
-        let snapshot = self.snapshot();
-        let key = match &snapshot {
-            Some(s) => EngineKey::Snapshot(s.id.clone()),
-            None => EngineKey::Store(self.store.outbound_version()),
-        };
-        let mut guard = self.engine.lock().expect("verrou du moteur de mock");
-        let stale = guard.as_ref().is_none_or(|(k, _)| *k != key);
-        if stale {
-            let m = &self.config.mock;
-            let exchanges = match &snapshot {
-                Some(s) => s.exchanges.clone(),
-                None => self.store.snapshot_direction(Direction::Outbound),
-            };
-            let engine = MockEngine::new(
-                exchanges,
-                MockConfig {
-                    strategy: m.strategy.into(),
-                    latency_factor: m.latency_factor,
-                    match_headers: m.match_headers.clone(),
-                    seed: m.seed,
-                },
-            );
-            *guard = Some((key, engine));
-        }
-        let (_, engine) = guard.as_mut().expect("moteur initialisé");
-        f(engine)
+        self.publish_snapshot(snap);
     }
 
     /// Documents OpenAPI du workload, recalculés quand le store change.
