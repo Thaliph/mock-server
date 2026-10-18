@@ -104,6 +104,7 @@ fn run(args: &Args) -> Result<(), String> {
             }
             continue;
         }
+        println!("mimic-init: {tool}-restore --noflush\n{}", rules.restore);
         restore(&format!("{tool}-restore"), &rules.restore)?;
         let saved = save(tool)?;
         for j in &rules.jumps {

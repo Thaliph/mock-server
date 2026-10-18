@@ -79,6 +79,7 @@ Tout pod créé dans un namespace labellisé `mimic.platform.io/enabled=true` re
 | `mimic.platform.io/exclude-outbound-cidrs`, `…/exclude-outbound-ports` | destinations jamais redirigées |
 | `mimic.platform.io/tls-intercept` | hôtes HTTPS interceptés ; l'app reçoit la CA Mimic |
 | `mimic.platform.io/config` | ConfigMap de configuration du sidecar à la place de celle du webhook |
+| `mimic.platform.io/mesh` | `auto` (défaut), `none`, `istio`, `istio-ambient` ou `linkerd` (spec §3.3) |
 
 Le sidecar reçoit aussi `MIMIC_VERSION` (label `version_label` du pod,
 `app.kubernetes.io/version` par défaut) et `MIMIC_POD_TEMPLATE_HASH` : toutes ses métriques
@@ -86,6 +87,17 @@ portent alors le label `version`, pour comparer deux versions d'un workload.
 
 Le webhook est en `failurePolicy: Ignore` : s'il est indisponible, les pods sont créés
 sans mimic. Un pod laissé tel quel l'est avec un avertissement visible dans `kubectl`.
+
+### Pods dans un service mesh
+
+Istio (sidecar ou ambient) et Linkerd sont pris en charge (spec §3.3) : mimic se place entre
+l'application et le mesh et voit le HTTP en clair, le mesh garde son mTLS. Rien à
+configurer : le webhook met mimic après les conteneurs du mesh, et `mimic-init` reconnaît
+le mesh dans les règles iptables déjà posées (son log l'affiche : `mesh IstioSidecar …`).
+Sous un mTLS strict, les sondes du sidecar passent par `exec`. Un namespace mis dans le mesh
+(ou passé en ambient) après le démarrage de ses pods demande un `kubectl rollout restart`.
+Le sidecar utilise l'UID 1338 et les ports 15100 (admin), 15101 et 15106, hors de ceux des
+mesh.
 
 ## Application (`example/`)
 
