@@ -20,7 +20,7 @@ use http::StatusCode;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use mimic_core::mock::{MockConfig, MockEngine, MockResponse};
 use mimic_core::model::{Body, Direction};
-use mimic_core::snapshot::Snapshot;
+use mimic_core::snapshot::MockSnapshot;
 
 use crate::capture::encode;
 use crate::config::Mode;
@@ -190,11 +190,11 @@ impl AppState {
 
     /// Construit un moteur sur `snapshot`, ou sur le store sans snapshot ; à appeler sous le
     /// verrou de construction, qui sérialise aussi la publication.
-    fn build_locked(&self, snapshot: Option<&Snapshot>, trigger: Trigger) -> Arc<MockSet> {
+    fn build_locked(&self, snapshot: Option<&MockSnapshot>, trigger: Trigger) -> Arc<MockSet> {
         let set = match snapshot {
             Some(s) => MockSet::new(
                 Source::Snapshot(s.id.clone()),
-                MockEngine::new(s.exchanges.iter(), self.mock_config()),
+                MockEngine::from_snapshot(s, self.mock_config()),
             ),
             None => {
                 // Version lue avant les échanges : un ajout concurrent rend le moteur périmé.
@@ -312,7 +312,7 @@ impl AppState {
     }
 
     /// Publie `snap` (ou son retrait) ; en mock, avec le moteur construit dessus.
-    pub(crate) fn publish_snapshot(&self, snap: Option<Arc<Snapshot>>) {
+    pub(crate) fn publish_snapshot(&self, snap: Option<Arc<MockSnapshot>>) {
         let _guard = self.engines.build.lock().unwrap_or_else(|e| e.into_inner());
         let unchanged = {
             let current = self.snapshot.lock().expect("verrou du snapshot");

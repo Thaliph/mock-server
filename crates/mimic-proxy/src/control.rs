@@ -1,26 +1,42 @@
 //! Lien avec le contrôleur (spec §5.5 et §7.1) : seul canal par lequel le mode et le
-//! snapshot d'un sidecar piloté changent.
+//! snapshot d'un sidecar piloté changent. Le sidecar télécharge la forme de mock du snapshot
+//! (spec §5.6), compressée, et la garde sur disque si `store.dir` est configuré.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{Method, Request, StatusCode, header};
+use http::{HeaderMap, Method, Request, StatusCode, header};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use mimic_core::snapshot::Snapshot;
+use mimic_core::snapshot::{MockSnapshot, Snapshot, digest};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{InboundCapture, Mode, ShareConfig};
 use crate::state::AppState;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// Un snapshot ne dépasse pas cette taille.
+/// Un snapshot ne dépasse pas cette taille, compressé comme décompressé.
 const MAX_BODY: usize = 256 * 1024 * 1024;
+
+/// Réponse brute du contrôleur.
+struct Reply {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+/// Forme de mock chargée, et octets effectivement téléchargés pour l'obtenir.
+pub struct Fetched {
+    pub snapshot: MockSnapshot,
+    pub downloaded: usize,
+    /// Snapshot complet téléchargé : contrôleur d'une version antérieure (spec §5.6).
+    pub full: bool,
+}
 
 /// État souhaité reçu du contrôleur.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,15 +99,34 @@ impl ControllerClient {
         })
     }
 
+    /// Appel attendu en `200` ou `201`.
     async fn call(
         &self,
         method: Method,
         path: &str,
         body: Option<(Vec<u8>, &'static str)>,
     ) -> Result<Bytes, String> {
+        let r = self.send(method.clone(), path, body, None).await?;
+        if r.status != StatusCode::OK && r.status != StatusCode::CREATED {
+            return Err(rejected(&method, path, &r));
+        }
+        Ok(r.body)
+    }
+
+    /// Appel quel que soit le code de la réponse ; `accept` : `Accept-Encoding`.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<(Vec<u8>, &'static str)>,
+        accept: Option<&'static str>,
+    ) -> Result<Reply, String> {
         let mut req = Request::builder()
             .method(method.clone())
             .uri(format!("{}{path}", self.base));
+        if let Some(a) = accept {
+            req = req.header(header::ACCEPT_ENCODING, a);
+        }
         if let Some(file) = &self.token_file {
             // Relu à chaque appel : le kubelet renouvelle le jeton projeté.
             let token = tokio::fs::read_to_string(file)
@@ -110,8 +145,8 @@ impl ControllerClient {
             .await
             .map_err(|_| format!("{method} {path}: délai dépassé"))?
             .map_err(|e| format!("{method} {path}: {}", error_chain(&e)))?;
-        let status = resp.status();
-        let bytes = tokio::time::timeout(
+        let (status, headers) = (resp.status(), resp.headers().clone());
+        let body = tokio::time::timeout(
             TIMEOUT * 6,
             Limited::new(resp.into_body(), MAX_BODY).collect(),
         )
@@ -119,13 +154,11 @@ impl ControllerClient {
         .map_err(|_| format!("{method} {path}: délai dépassé"))?
         .map_err(|e| format!("{method} {path}: {e}"))?
         .to_bytes();
-        if status != StatusCode::OK && status != StatusCode::CREATED {
-            return Err(format!(
-                "{method} {path}: {status} {}",
-                String::from_utf8_lossy(&bytes[..bytes.len().min(200)])
-            ));
-        }
-        Ok(bytes)
+        Ok(Reply {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// Publie un segment sous son identifiant : une reprise du même segment est sans effet.
@@ -158,12 +191,67 @@ impl ControllerClient {
         serde_json::from_slice(&b).map_err(|e| format!("battement: {e}"))
     }
 
-    pub async fn snapshot(&self, id: &str) -> Result<Snapshot, String> {
-        let b = self
-            .call(Method::GET, &format!("/snapshots/{id}"), None)
+    /// Télécharge la forme de mock du snapshot (spec §5.6), compressée ; un contrôleur d'une
+    /// version antérieure (`404`) ne sert que le snapshot complet, dont elle est déduite ici.
+    pub async fn snapshot(&self, id: &str) -> Result<Fetched, String> {
+        let path = format!("/snapshots/{id}/mock");
+        let r = self
+            .send(Method::GET, &path, None, Some("zstd, gzip"))
             .await?;
-        Snapshot::from_jsonl(&b, id)
+        match r.status {
+            StatusCode::OK => Ok(Fetched {
+                snapshot: mock_form(&r, id)?,
+                downloaded: r.body.len(),
+                full: false,
+            }),
+            StatusCode::NOT_FOUND => {
+                let full = self
+                    .call(Method::GET, &format!("/snapshots/{id}"), None)
+                    .await?;
+                Ok(Fetched {
+                    snapshot: MockSnapshot::from_snapshot(&Snapshot::from_jsonl(&full, id)?),
+                    downloaded: full.len(),
+                    full: true,
+                })
+            }
+            _ => Err(rejected(&Method::GET, &path, &r)),
+        }
     }
+}
+
+fn rejected(method: &Method, path: &str, r: &Reply) -> String {
+    format!(
+        "{method} {path}: {} {}",
+        r.status,
+        String::from_utf8_lossy(&r.body[..r.body.len().min(200)])
+    )
+}
+
+/// Forme de mock reçue : décompressée (bornée), vérifiée contre son `ETag` et l'identifiant
+/// du snapshot demandé.
+fn mock_form(r: &Reply, id: &str) -> Result<MockSnapshot, String> {
+    let encoding = r
+        .headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("identity")
+        .trim()
+        .to_ascii_lowercase();
+    let json = match encoding.as_str() {
+        "identity" | "" => r.body.to_vec(),
+        e => crate::capture::decode(e, &r.body, MAX_BODY)
+            .ok_or_else(|| format!("forme de mock du snapshot {id}: encodage {e} illisible"))?,
+    };
+    if let Some(etag) = r.headers.get(header::ETAG).and_then(|v| v.to_str().ok()) {
+        let expected = etag.trim().trim_start_matches("W/").trim_matches('"');
+        let got = digest(&json);
+        if got != expected {
+            return Err(format!(
+                "forme de mock du snapshot {id} altérée (empreinte {got}, ETag {expected})"
+            ));
+        }
+    }
+    MockSnapshot::from_json(&json, id)
 }
 
 fn error_chain(e: &dyn std::error::Error) -> String {
@@ -199,8 +287,7 @@ pub fn restore(state: &AppState) {
         return;
     };
     if let Some(id) = &desired.snapshot
-        && let Ok(bytes) = std::fs::read(dir.join("snapshots").join(format!("{id}.jsonl")))
-        && let Ok(snap) = Snapshot::from_jsonl(&bytes, id)
+        && let Some(snap) = cached_snapshot(&dir.join("snapshots"), id)
     {
         state.set_snapshot(Some(Arc::new(snap)));
     }
@@ -222,16 +309,28 @@ pub fn restore(state: &AppState) {
         .desired = desired;
 }
 
-fn save(state: &AppState, desired: &Desired, snap: Option<&Snapshot>) {
+/// Forme de mock gardée sur disque ; à défaut, un snapshot complet gardé par une version
+/// antérieure du sidecar, dont elle est déduite.
+fn cached_snapshot(dir: &std::path::Path, id: &str) -> Option<MockSnapshot> {
+    if let Ok(bytes) = std::fs::read(dir.join(format!("{id}.mock.json"))) {
+        return MockSnapshot::from_json(&bytes, id).ok();
+    }
+    let bytes = std::fs::read(dir.join(format!("{id}.jsonl"))).ok()?;
+    let full = Snapshot::from_jsonl(&bytes, id).ok()?;
+    Some(MockSnapshot::from_snapshot(&full))
+}
+
+fn save(state: &AppState, desired: &Desired, snap: Option<&MockSnapshot>) {
     let Some(dir) = cache_dir(state) else {
         return;
     };
     let write = || -> std::io::Result<()> {
         std::fs::create_dir_all(dir.join("snapshots"))?;
         if let Some(s) = snap {
+            // Échanges du snapshot, déjà redactés par les sidecars qui les ont publiés (§7).
             std::fs::write(
-                dir.join("snapshots").join(format!("{}.jsonl", s.id)),
-                s.to_jsonl(),
+                dir.join("snapshots").join(format!("{}.mock.json", s.id)),
+                s.to_json(),
             )?;
         }
         let tmp = dir.join("desired.json.tmp");
@@ -291,9 +390,16 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
     let mut fetch_error = None;
     match &desired.snapshot {
         Some(id) if loaded.as_ref() != Some(id) => match client.snapshot(id).await {
-            Ok(snap) => {
-                let snap = Arc::new(snap);
-                tracing::info!(snapshot = %id, exchanges = snap.exchanges.len(), "snapshot chargé");
+            Ok(f) => {
+                let snap = Arc::new(f.snapshot);
+                tracing::info!(
+                    snapshot = %id,
+                    exchanges = snap.count,
+                    records = snap.records.len(),
+                    downloaded = f.downloaded,
+                    full = f.full,
+                    "snapshot chargé"
+                );
                 state.set_snapshot(Some(snap.clone()));
                 fetched = Some(snap);
             }

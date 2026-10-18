@@ -36,6 +36,7 @@ use tokio::sync::OnceCell;
 use crate::auth::Authenticator;
 use crate::config::ControllerConfig;
 use crate::metrics::{Metrics, StateLabel};
+use crate::mock_form::{EncodedMock, MAX_CACHE_BYTES, MockForms};
 use crate::reconcile::{
     Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, desired_for_pod, desired_of,
     guard_pod, is_production, pod_state, reconcile_guarded, selects, summarize,
@@ -65,6 +66,8 @@ pub struct Ctl {
     exemplar_room: Room,
     /// Namespaces labellisés `env=production` : le mock y est refusé (spec §5.5.1).
     production: Mutex<BTreeSet<String>>,
+    /// Formes de mock des snapshots déjà demandées (spec §5.6).
+    mock_forms: MockForms,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -592,6 +595,7 @@ impl Ctl {
             total: AtomicUsize::new(0),
             exemplar_room,
             production: Mutex::new(BTreeSet::new()),
+            mock_forms: MockForms::new(MAX_CACHE_BYTES),
         }
     }
 
@@ -1070,6 +1074,45 @@ impl Ctl {
             .bytes()
             .await
             .ok()
+    }
+
+    /// Forme de mock du snapshot (spec §5.6), calculée à la première demande hors des
+    /// threads du serveur, puis gardée ; `None` si le snapshot est inconnu ou illisible.
+    pub async fn mock_snapshot(&self, ns: &str, wl: &str, id: &str) -> Option<Arc<EncodedMock>> {
+        if !valid_name(id) {
+            return None;
+        }
+        self.mock_forms
+            .get(&format!("{}/{id}", base(ns, wl)), || async {
+                let full = self.snapshot_bytes(ns, wl, id).await?;
+                let (owned, full_bytes) = (id.to_string(), full.len());
+                match tokio::task::spawn_blocking(move || EncodedMock::from_full(&full, &owned))
+                    .await
+                {
+                    Ok(Ok(form)) => {
+                        tracing::info!(
+                            namespace = ns,
+                            workload = wl,
+                            snapshot = id,
+                            full = full_bytes,
+                            identity = form.identity_len,
+                            zstd = form.zstd.len(),
+                            gzip = form.gzip.len(),
+                            "forme de mock calculée"
+                        );
+                        Some(form)
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, snapshot = id, "forme de mock impossible");
+                        None
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, snapshot = id, "forme de mock impossible");
+                        None
+                    }
+                }
+            })
+            .await
     }
 
     pub async fn snapshots(&self, ns: &str, wl: &str) -> Vec<Value> {

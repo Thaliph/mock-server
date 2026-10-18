@@ -1,11 +1,14 @@
 //! Snapshots de mock (spec §5.6) : jeu figé d'échanges sortants, identique pour tous les pods
-//! d'un workload et identifié par l'empreinte de son contenu.
+//! d'un workload et identifié par l'empreinte de son contenu, et sa forme de mock, réduite à ce
+//! que le moteur du sidecar en garde.
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::mock::op_key;
 use crate::model::{Direction, Exchange};
 
 #[derive(Debug, Clone)]
@@ -123,6 +126,114 @@ impl Snapshot {
         }
         Ok(s)
     }
+}
+
+/// Version du format de la forme de mock.
+pub const MOCK_FORMAT: u32 = 1;
+
+/// Forme de mock d'un snapshot (spec §5.6) : ce que le moteur du sidecar en garde. Un moteur
+/// construit dessus (`MockEngine::from_snapshot`) est le même que sur le snapshot complet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MockSnapshot {
+    /// Version du format ([`MOCK_FORMAT`]).
+    pub format: u32,
+    /// Identifiant du snapshot dont elle est tirée.
+    pub id: String,
+    /// Nombre d'échanges du snapshot.
+    pub count: usize,
+    /// Durées des opérations, par (authority, méthode) puis forme du chemin croissantes.
+    pub operations: Vec<Operations>,
+    /// Échanges rejouables de code ≥ 200, tels quels, dans l'ordre du snapshot.
+    pub records: Vec<Exchange>,
+}
+
+/// Opérations d'une authority et d'une méthode (en majuscules).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Operations {
+    pub authority: String,
+    pub method: String,
+    /// Une entrée par forme de chemin.
+    pub paths: Vec<PathLatencies>,
+}
+
+/// Durées d'une opération, désignée par le chemin de son premier échange : la durée totale de
+/// chacun de ses échanges de code ≥ 200, rejouables ou non, dans l'ordre chronologique. C'est
+/// la distribution où le moteur tire la latence. Sérialisée en `["/chemin", [durées]]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathLatencies(pub String, pub Vec<u64>);
+
+impl MockSnapshot {
+    /// Déduit la forme de mock du snapshot ; ne dépend que de son contenu.
+    pub fn from_snapshot(snapshot: &Snapshot) -> Self {
+        // Mêmes échanges que ceux que le moteur indexe : sortants, de réponse finale.
+        let mut by_op: BTreeMap<String, (&Exchange, Vec<u64>)> = BTreeMap::new();
+        let mut records = vec![];
+        for e in &snapshot.exchanges {
+            if e.direction != Direction::Outbound || e.status < 200 {
+                continue;
+            }
+            // Le snapshot est trié par date puis identifiant, sans doublon : l'ordre
+            // chronologique d'une opération est celui du moteur.
+            by_op
+                .entry(op_key(&e.authority, &e.method, &e.path))
+                .or_insert_with(|| (e, vec![]))
+                .1
+                .push(e.total_us);
+            if e.resp_body.is_replayable() {
+                records.push(e.clone());
+            }
+        }
+        // La clé commence par l'authority et la méthode : leurs opérations se suivent.
+        let mut operations: Vec<Operations> = vec![];
+        for (first, latencies) in by_op.into_values() {
+            let method = first.method.to_ascii_uppercase();
+            let path = PathLatencies(first.path.clone(), latencies);
+            match operations.last_mut() {
+                Some(o) if o.authority == first.authority && o.method == method => {
+                    o.paths.push(path)
+                }
+                _ => operations.push(Operations {
+                    authority: first.authority.clone(),
+                    method,
+                    paths: vec![path],
+                }),
+            }
+        }
+        Self {
+            format: MOCK_FORMAT,
+            id: snapshot.id.clone(),
+            count: snapshot.exchanges.len(),
+            operations,
+            records,
+        }
+    }
+
+    /// Forme canonique : un document JSON, mêmes octets pour un même snapshot.
+    pub fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Relit une forme de mock et vérifie qu'elle est celle du snapshot attendu.
+    pub fn from_json(bytes: &[u8], expected_id: &str) -> Result<Self, String> {
+        let s: Self =
+            serde_json::from_slice(bytes).map_err(|e| format!("forme de mock illisible: {e}"))?;
+        if s.format != MOCK_FORMAT {
+            return Err(format!("format de forme de mock inconnu: {}", s.format));
+        }
+        if s.id != expected_id {
+            return Err(format!(
+                "forme de mock du snapshot {} au lieu de {expected_id}",
+                s.id
+            ));
+        }
+        Ok(s)
+    }
+}
+
+/// Empreinte d'un contenu : 16 caractères hexadécimaux de son sha256 (identifiant d'un
+/// snapshot, `ETag` de sa forme de mock).
+pub fn digest(bytes: &[u8]) -> String {
+    content_id(bytes)
 }
 
 fn jsonl(exchanges: &[Exchange]) -> Vec<u8> {

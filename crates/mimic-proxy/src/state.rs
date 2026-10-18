@@ -11,7 +11,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::redact::{RedactConfig, Redactor};
-use mimic_core::snapshot::Snapshot;
+use mimic_core::snapshot::MockSnapshot;
 use serde_json::Value;
 
 use crate::config::{Config, InboundCapture, Mode};
@@ -50,8 +50,9 @@ pub struct AppState {
     pub tls: Option<TlsState>,
     /// Moteur de mock en service (spec §5.3).
     pub(crate) engines: crate::engine::Engines,
-    /// Snapshot imposé par le contrôleur : seule source du mock quand il est présent.
-    pub(crate) snapshot: Mutex<Option<Arc<Snapshot>>>,
+    /// Forme de mock du snapshot imposé par le contrôleur (spec §5.6) : seule source du mock
+    /// quand elle est présente.
+    pub(crate) snapshot: Mutex<Option<Arc<MockSnapshot>>>,
     pub controller_status: Mutex<crate::control::ControllerStatus>,
     discovery: Mutex<Option<(u64, Arc<Discovery>)>>,
     pub share_status: Mutex<ShareStatus>,
@@ -211,16 +212,16 @@ impl AppState {
         }
     }
 
-    pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
+    pub fn snapshot(&self) -> Option<Arc<MockSnapshot>> {
         self.snapshot.lock().expect("verrou du snapshot").clone()
     }
 
     /// Impose un snapshot (ou le retire) ; en mock, le moteur est reconstruit dessus avant
     /// de servir.
-    pub fn set_snapshot(&self, snap: Option<Arc<Snapshot>>) {
+    pub fn set_snapshot(&self, snap: Option<Arc<MockSnapshot>>) {
         self.metrics
             .mock_snapshot_exchanges
-            .set(snap.as_ref().map_or(0, |s| s.exchanges.len() as i64));
+            .set(snap.as_ref().map_or(0, |s| s.count as i64));
         self.publish_snapshot(snap);
     }
 

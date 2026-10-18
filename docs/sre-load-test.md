@@ -6,7 +6,10 @@ dépendances, puis pour l'intégrer à un déploiement blue/green. Référence :
 Ce que fait mimic pendant le tir :
 
 - les **dépendances** du workload (appels sortants) sont servies depuis un snapshot des
-  réponses enregistrées, avec leur latence enregistrée ; rien ne sort du pod ;
+  réponses enregistrées, avec leur latence enregistrée ; rien ne sort du pod. Chaque pod n'en
+  télécharge que la forme de mock (spec §5.6) : les réponses rejouables et les durées par
+  opération, compressées, les mêmes octets sur tous les pods (sur le banc d'arrivée d'un pod,
+  0,29 Mo au lieu des 47,4 Mo du snapshot complet) ;
 - le **trafic entrant** arrive toujours à l'application : c'est elle qu'on mesure ;
 - avec `--capture-inbound metadata` (ou `off`), le sidecar ne copie plus les bodies entrants
   et n'en publie rien : son coût reste négligeable devant celui de l'application, et le store
