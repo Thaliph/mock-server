@@ -12,6 +12,9 @@
 //!   débit, p50, p99, CPU du sidecar ;
 //! - `mock_partial` : mock-partial avec 5 % de requêtes sans correspondance (relayées puis
 //!   enregistrées) ;
+//! - `record_throughput` : `BENCH_N` requêtes enregistrées à 1 puis 16 concurrentes ;
+//! - `mock_round_robin_unique_ids` : `round-robin`, `BENCH_N` requêtes sur des identifiants
+//!   jamais enregistrés (curseurs, RSS) ;
 //! - `mock_latency_fidelity` : dépendance sans délai, puis à `sleep(2 ms)` ; latence vue par le
 //!   client en record, durée enregistrée, puis latence rejouée (`latency_factor: 1`).
 
@@ -92,6 +95,11 @@ impl Drop for Sidecar {
 }
 
 async fn sidecar(mode: &str, latency_factor: f64) -> Sidecar {
+    sidecar_with(mode, latency_factor, "").await
+}
+
+/// `mock` : lignes ajoutées sous `mock:` dans la configuration (stratégie, par exemple).
+async fn sidecar_with(mode: &str, latency_factor: f64, mock: &str) -> Sidecar {
     let dir = tempfile::tempdir().unwrap();
     let (pi, po, pa) = (free_port(), free_port(), free_port());
     let yaml = format!(
@@ -99,7 +107,7 @@ async fn sidecar(mode: &str, latency_factor: f64) -> Sidecar {
          inbound:\n  listen: 127.0.0.1:{pi}\noutbound:\n  listen: 127.0.0.1:{po}\n\
          admin:\n  listen: 127.0.0.1:{pa}\nredact:\n  salt: bench\n\
          capture:\n  max_exchanges: 100000\n  max_store_bytes: 1073741824\n\
-         mock:\n  latency_factor: {latency_factor}\n"
+         mock:\n  latency_factor: {latency_factor}\n{mock}"
     );
     let path = dir.path().join("mimic.yaml");
     std::fs::write(&path, yaml).unwrap();
@@ -353,6 +361,36 @@ async fn mock_throughput() {
         let r = measured(&s, &format!("mock C={conc}"), &base, n, conc, users).await;
         assert_eq!(r.errors, 0);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "banc de charge, lancé à la main"]
+async fn record_throughput() {
+    pin_bench();
+    let app = upstream(0).await;
+    let base = format!("http://{app}");
+    let s = sidecar("record", 0.0).await;
+    let n = env("BENCH_N", 20_000);
+    let _ = load(&via(&s), &base, 1000, 16, users).await;
+    for conc in [1, 16] {
+        let r = measured(&s, &format!("record C={conc}"), &base, n, conc, users).await;
+        assert_eq!(r.errors, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "banc de charge, lancé à la main"]
+async fn mock_round_robin_unique_ids() {
+    pin_bench();
+    let app = upstream(0).await;
+    let base = format!("http://{app}");
+    let s = sidecar_with("record", 0.0, "  strategy: round-robin\n").await;
+    fill(&s, &base, env("BENCH_STORE", 2_000), "mock").await;
+    let n = env("BENCH_N", 200_000);
+    measured(&s, "mock round-robin, ids uniques", &base, n, 16, |i| {
+        format!("/users/{}", 1_000_000 + i)
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

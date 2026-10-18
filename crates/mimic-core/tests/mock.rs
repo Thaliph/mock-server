@@ -469,3 +469,52 @@ fn mck_19_websocket_handshake_is_never_replayed() {
     assert!(m.is_empty());
     assert_eq!(m.respond(&req("GET", "/ws")), MockDecision::Unmatched);
 }
+
+/// Curseurs de `round-robin` et `sequence` bornés : un par chemin enregistré, un par opération
+/// pour les chemins jamais enregistrés, quel que soit le nombre de chemins demandés (§5.3).
+#[test]
+fn mck_21_cursors_are_bounded_by_recorded_paths() {
+    let recs = vec![
+        out("GET", "/users/1").resp_json(json!({"u": 1, "v": "a"})),
+        out("GET", "/users/1").resp_json(json!({"u": 1, "v": "b"})),
+        out("GET", "/users/2").resp_json(json!({"u": 2, "v": "a"})),
+        out("GET", "/users/2").resp_json(json!({"u": 2, "v": "b"})),
+    ];
+    for strategy in [Strategy::RoundRobin, Strategy::Sequence] {
+        let config = MockConfig {
+            strategy,
+            ..MockConfig::default()
+        };
+        let m = engine(recs.clone(), config);
+        let mut per: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut order = vec![];
+        for i in 0..10_000 {
+            let r = matched(m.respond(&req("GET", &format!("/users/{}", 1_000 + i))));
+            order.push(r.exchange_id.clone());
+            *per.entry(r.exchange_id).or_default() += 1;
+        }
+        // Deux chemins enregistrés et une opération.
+        assert!(m.cursors() <= 3, "{strategy:?} : {} curseurs", m.cursors());
+        assert_eq!(per.len(), 4, "{strategy:?} : {per:?}");
+        assert!(per.values().all(|n| *n == 2_500), "{strategy:?} : {per:?}");
+        assert_eq!(
+            order[..8],
+            ["000000", "000001", "000002", "000003"].repeat(2),
+            "{strategy:?}"
+        );
+        if strategy == Strategy::RoundRobin {
+            // Chaque chemin enregistré garde sa propre rotation, même entrelacé avec un autre.
+            let mut served = vec![];
+            for _ in 0..50 {
+                for path in ["/users/1", "/users/2"] {
+                    served.push(matched(m.respond(&req("GET", path))).exchange_id);
+                }
+            }
+            assert_eq!(
+                served,
+                ["000000", "000002", "000001", "000003"].repeat(25),
+                "{served:?}"
+            );
+        }
+    }
+}

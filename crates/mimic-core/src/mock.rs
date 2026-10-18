@@ -2,13 +2,17 @@
 //! (spec §5.3). Pur et déterministe à graine égale ; l'attente et l'envoi sont faits par le proxy.
 //!
 //! Le moteur est immuable une fois construit et partageable entre threads (`respond(&self)`) :
-//! l'aléa avance par un pas atomique, seuls les curseurs de `round-robin` et `sequence` ont un
+//! l'aléa et les curseurs de `round-robin` et `sequence` avancent par pas atomiques, sans
 //! verrou. Les enregistrements sont indexés par (authority, méthode, forme du chemin) : une
 //! requête ne compare que les candidats rejouables de son opération.
+//!
+//! Les curseurs sont fixés à la construction : un par chemin enregistré, un par opération pour
+//! les chemins jamais enregistrés. Des identifiants uniques dans les chemins demandés ne les
+//! font donc pas grandir.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde_json::Value;
 
@@ -186,6 +190,9 @@ struct Recorded {
     json: Option<Value>,
     /// Couples (clé de premier niveau, valeur) de ce body JSON.
     pairs: BTreeSet<String>,
+    /// Curseur de son chemin (`round-robin`, `sequence`), commun aux enregistrements du même
+    /// chemin.
+    cursor: usize,
 }
 
 /// Mêmes éléments, calculés une fois pour la requête à servir.
@@ -232,14 +239,16 @@ impl Recorded {
             json,
             pairs,
             e,
+            cursor: 0,
         }
     }
 }
 
 /// Clé d'une opération : authority, méthode en majuscules et forme du chemin (§5.2), séparées
 /// par `\u{1}` (absent d'une authority, d'une méthode et d'une forme). Deux chemins sont égaux
-/// ou de même template si et seulement s'ils ont la même forme.
-pub(crate) fn op_key(authority: &str, method: &str, path: &str) -> String {
+/// ou de même template si et seulement s'ils ont la même forme : c'est la clé sous laquelle le
+/// moteur range les enregistrements, et sous laquelle le proxy indexe ceux arrivés depuis.
+pub fn op_key(authority: &str, method: &str, path: &str) -> String {
     let mut key = String::with_capacity(authority.len() + method.len() + path.len() + 8);
     key.push_str(authority);
     key.push('\u{1}');
@@ -265,6 +274,8 @@ struct Group {
     /// Durées de tous les enregistrements de l'opération, rejouables ou non, dans l'ordre
     /// chronologique : la distribution où la latence est tirée.
     latencies: Vec<u64>,
+    /// Curseur des requêtes dont le chemin n'a jamais été enregistré.
+    cursor: usize,
 }
 
 /// Index des enregistrements sortants servables, immuable et partageable entre threads.
@@ -276,7 +287,8 @@ pub struct MockEngine {
     /// Par clé d'opération (`op_key`).
     groups: BTreeMap<String, Group>,
     authorities: BTreeSet<String>,
-    cursors: Mutex<BTreeMap<String, usize>>,
+    /// Curseurs de `round-robin` et `sequence` : un par chemin enregistré et un par opération.
+    cursors: Vec<AtomicUsize>,
     /// État de SplitMix64, avancé d'un pas atomique par réponse.
     rng: AtomicU64,
     len: usize,
@@ -367,17 +379,31 @@ impl MockEngine {
         len: usize,
         config: MockConfig,
     ) -> Self {
-        let mut records = vec![];
+        let mut records: Vec<Recorded> = vec![];
         let mut groups = BTreeMap::new();
         let mut authorities = BTreeSet::new();
+        let mut cursors = 0;
         for (key, latencies, replayable) in ops {
             let mut g = Group {
                 records: vec![],
                 latencies,
+                cursor: cursors,
             };
+            cursors += 1;
+            // Curseur de chaque chemin enregistré de l'opération.
+            let mut paths: BTreeMap<Vec<String>, usize> = BTreeMap::new();
             for e in replayable {
+                let mut rec = Recorded::new(e);
+                rec.cursor = match paths.get(&rec.segments) {
+                    Some(c) => *c,
+                    None => {
+                        paths.insert(rec.segments.clone(), cursors);
+                        cursors += 1;
+                        cursors - 1
+                    }
+                };
                 g.records.push(records.len());
-                records.push(Recorded::new(e));
+                records.push(rec);
             }
             if let Some((authority, _)) = key.split_once('\u{1}')
                 && !authorities.contains(authority)
@@ -392,7 +418,7 @@ impl MockEngine {
             records,
             groups,
             authorities,
-            cursors: Mutex::new(BTreeMap::new()),
+            cursors: (0..cursors).map(|_| AtomicUsize::new(0)).collect(),
             len,
         }
     }
@@ -409,6 +435,12 @@ impl MockEngine {
     /// Nombre d'enregistrements rejouables : les valeurs possibles de `MockResponse::record`.
     pub fn replayable(&self) -> usize {
         self.records.len()
+    }
+
+    /// Nombre de curseurs de `round-robin` et `sequence` : un par chemin enregistré et un par
+    /// opération, fixé à la construction.
+    pub fn cursors(&self) -> usize {
+        self.cursors.len()
     }
 
     /// Authorities pour lesquelles des enregistrements existent.
@@ -472,11 +504,11 @@ impl MockEngine {
         let chosen = match config.strategy {
             Strategy::Best => self.most_frequent(&top),
             Strategy::RoundRobin => {
-                let i = self.next_cursor(req);
+                let i = self.next_cursor(group, &servable);
                 top[i % top.len()]
             }
             Strategy::Sequence => {
-                let i = self.next_cursor(req);
+                let i = self.next_cursor(group, &servable);
                 &servable[i % servable.len()]
             }
             Strategy::WeightedStatus => top[below(pick, top.len())],
@@ -525,19 +557,14 @@ impl MockEngine {
         top[last]
     }
 
-    /// Curseur de `round-robin` et `sequence`, par chemin demandé ; seul verrou du moteur.
-    fn next_cursor(&self, req: &MockRequest) -> usize {
-        let key = format!(
-            "{}|{}|{}",
-            req.authority,
-            req.method.to_ascii_uppercase(),
-            req.path
-        );
-        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
-        let c = cursors.entry(key).or_default();
-        let i = *c;
-        *c += 1;
-        i
+    /// Avance le curseur de `round-robin` et `sequence` : celui du chemin demandé s'il a été
+    /// enregistré, sinon celui de l'opération.
+    fn next_cursor(&self, group: &Group, servable: &[(usize, PathMatch, f64)]) -> usize {
+        let cursor = servable
+            .iter()
+            .find(|(_, m, _)| *m == PathMatch::Exact)
+            .map_or(group.cursor, |(i, _, _)| self.records[*i].cursor);
+        self.cursors[cursor].fetch_add(1, Ordering::Relaxed)
     }
 }
 

@@ -121,6 +121,32 @@ helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null
 helm upgrade --install trust-manager jetstack/trust-manager \
   --version "$TRUST_MANAGER" -n cert-manager --set app.trust.namespace=mimic-system --wait
 
+# cert-manager peut réémettre la CA juste après sa création : un certificat feuille
+# signé entre-temps par l'ancienne CA reste « Ready » mais n'est plus vérifiable par les
+# sidecars (invalid peer certificate: BadSignature). On compare la CA qui a signé la
+# feuille à la CA publiée et, si elles diffèrent, on supprime le Secret de la feuille
+# pour que cert-manager la réémette avec la CA courante.
+leaf_signed_by_current_ca() {
+  local ca leaf
+  ca=$(kubectl -n mimic-system get secret mimic-controller-ca -o jsonpath='{.data.tls\.crt}')
+  leaf=$(kubectl -n mimic-system get secret "$1" -o jsonpath='{.data.ca\.crt}')
+  [ -n "$ca" ] && [ "$ca" = "$leaf" ]
+}
+reissue_if_stale() {
+  local secret attempt
+  for secret in "$@"; do
+    for attempt in 1 2 3; do
+      kubectl -n mimic-system wait --for=condition=Ready certificate --all --timeout=120s >/dev/null
+      leaf_signed_by_current_ca "$secret" && break
+      echo "$secret signé par une ancienne CA : réémission ($attempt)"
+      kubectl -n mimic-system delete secret "$secret"
+      REISSUED=1
+      sleep 3
+    done
+    leaf_signed_by_current_ca "$secret" || fail "$secret n'est pas signé par la CA publiée"
+  done
+}
+
 # Les manifests livrés, avec l'image construite pour le test.
 manifest() { sed "s#registry.example.com/platform/mimic:0.1.0#$IMAGE#g" "$@"; }
 
@@ -128,11 +154,15 @@ log "contrôleur"
 kubectl apply -f deploy/controller/crd.yaml -f deploy/controller/rbac.yaml \
   -f deploy/controller/production-guard.yaml
 retry 60 kubectl apply -f deploy/controller/certificates.yaml
+reissue_if_stale mimic-controller-tls
 manifest deploy/controller/controller.yaml | kubectl apply -f -
 kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
 
 log "webhook d'injection"
 manifest deploy/injector/injector.yaml | kubectl apply -f -
+reissue_if_stale mimic-injector-tls
+# Le webhook lit son certificat au démarrage : le relancer si sa feuille a été réémise.
+[ -z "${REISSUED:-}" ] || kubectl -n mimic-system rollout restart deploy/mimic-injector
 kubectl -n mimic-system rollout status deploy/mimic-injector --timeout=180s
 # Le caBundle est posé par le cainjector : attendre qu'il le soit avant de créer des pods.
 retry 60 sh -c '[ -n "$(kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath="{.webhooks[0].clientConfig.caBundle}")" ]'

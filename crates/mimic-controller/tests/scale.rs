@@ -1230,3 +1230,93 @@ async fn ctl_22_total_bound_spans_workloads() {
         )]
     );
 }
+
+/// Un exemple gardé sans body, relu de `exemplars.jsonl` après un redémarrage, est repris tel
+/// quel : il ne prend pas la place d'un exemple complet, n'est pas compté une seconde fois
+/// dans les bornes, reste non rejouable, puis redevient rejouable avec un échange plus récent
+/// qui tient dans la borne.
+#[tokio::test]
+async fn ctl_22_example_without_body_is_restored_as_is_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    // `/z` tient dans la borne ; `/a`, ingéré ensuite, non : il est gardé sans body et le
+    // précède dans `exemplars.jsonl` (ordre des endpoints). Ses headers, gardés sans body,
+    // pèsent plus que la place laissée par `/z`. Un `/a` plus récent et léger (`a2`) tient
+    // à côté de `/z`.
+    let z = big("checkout-a-z1", "/z", 10, 500);
+    let mut a1 = big("checkout-a-a1", "/a", 20, 500);
+    a1["req_headers"] = json!([{"name": "x-trace", "value": "t".repeat(1_000)}]);
+    let a2 = big("checkout-a-a2", "/a", 30, 1);
+    let max = serialized(&z) + serialized(&a2) + 50;
+    let mut bare = a1.clone();
+    bare["resp_body"] = json!({"kind": "skipped", "size": 2000});
+    assert!(serialized(&bare) > serialized(&a2) + 50);
+    let config = || ControllerConfig {
+        max_exemplar_bytes_per_workload: max,
+        ..config(dir.path())
+    };
+    let c = start(config()).await.unwrap();
+    push(&c, "checkout-a", &[z]).await;
+    push(&c, "checkout-a", &[a1]).await;
+    c.state().maintain().await;
+    let skipped = (
+        "checkout-a-a1".to_string(),
+        "/a".to_string(),
+        "skipped".to_string(),
+    );
+    let expected = vec![skipped, captured("checkout-a-z1", "/z")];
+    assert_eq!(exemplars(dir.path(), "checkout"), expected);
+    let m = get_text(&c, "/metrics").await;
+    let kept = metric(&m, "mimic_controller_exemplars_bytes").unwrap();
+    c.shutdown().await;
+
+    // Segments sortis de la rétention : seuls restent les exemples.
+    std::fs::remove_dir_all(dir.path().join("shop/checkout/exchanges")).unwrap();
+    let file = dir.path().join("shop/checkout/exemplars.jsonl");
+    let written = std::fs::read(&file).unwrap();
+    let c = start(config()).await.unwrap();
+    // Relus au premier besoin : l'endpoint sans body reste dans la découverte.
+    assert_eq!(operation_paths(&c).await, ["/a", "/z"]);
+    let m = get_text(&c, "/metrics").await;
+    assert_eq!(metric(&m, "mimic_controller_exemplars"), Some(2.0), "{m}");
+    assert_eq!(
+        metric(&m, "mimic_controller_exemplars_bytes"),
+        Some(kept),
+        "{m}"
+    );
+    let refused = |m: &str| {
+        metric(
+            m,
+            r#"mimic_controller_exemplars_refused_total{reason="bytes"}"#,
+        )
+        .unwrap_or(0.0)
+    };
+    assert_eq!(refused(&m), 0.0, "{m}");
+    c.state().maintain().await;
+    assert_eq!(std::fs::read(&file).unwrap(), written, "repris tel quel");
+    // Non rejouable : le snapshot le porte sans body, `/z` garde le sien.
+    assert_eq!(mock_snapshot(&c, dir.path(), "checkout").await, expected);
+
+    // Un échange plus récent de `/a` qui tient dans la borne le rend rejouable.
+    push(&c, "checkout-a", &[a2]).await;
+    c.state().maintain().await;
+    let replayable = vec![
+        captured("checkout-a-a2", "/a"),
+        captured("checkout-a-z1", "/z"),
+    ];
+    assert_eq!(exemplars(dir.path(), "checkout"), replayable);
+    let m = get_text(&c, "/metrics").await;
+    assert_eq!(refused(&m), 0.0, "{m}");
+    let kept = metric(&m, "mimic_controller_exemplars_bytes").unwrap();
+    assert!(kept <= max as f64, "{kept} > {max}");
+    c.apply_spec(
+        "shop",
+        "checkout",
+        Some(MimicWorkloadSpec {
+            mode: "record".into(),
+            snapshot: None,
+            ..MimicWorkloadSpec::default()
+        }),
+    )
+    .await;
+    assert_eq!(mock_snapshot(&c, dir.path(), "checkout").await, replayable);
+}

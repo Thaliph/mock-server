@@ -226,7 +226,7 @@ impl Sharer {
             .metrics
             .share_sync
             .get_or_create(&crate::metrics::ResultLabel {
-                result: if ok { "ok" } else { "error" }.into(),
+                result: if ok { "ok" } else { "error" },
             })
             .inc();
         let mut status = state.share_status.lock().expect("verrou du partage");

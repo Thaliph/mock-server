@@ -271,7 +271,7 @@ impl AppState {
         self.metrics
             .discovered_operations
             .get_or_create(&DiscoveryLabels {
-                direction: "inbound".into(),
+                direction: "inbound",
                 authority: self.metrics.authority(&inbound_authority),
             })
             .set(count(&d.inbound));
@@ -279,7 +279,7 @@ impl AppState {
             self.metrics
                 .discovered_operations
                 .get_or_create(&DiscoveryLabels {
-                    direction: "outbound".into(),
+                    direction: "outbound",
                     authority: self.metrics.authority(authority),
                 })
                 .set(count(doc));
@@ -292,9 +292,7 @@ impl AppState {
         for (origin, n) in [("local", local), ("peer", peer)] {
             self.metrics
                 .store_exchanges
-                .get_or_create(&OriginLabel {
-                    origin: origin.into(),
-                })
+                .get_or_create(&OriginLabel { origin })
                 .set(n as i64);
         }
     }

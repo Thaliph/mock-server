@@ -545,6 +545,30 @@ async fn adm_02_metrics_cover_record_and_mock() {
     }
 }
 
+/// Les jauges du store ne sont pas tenues à chaque échange : calculées à la lecture de
+/// `/metrics`, elles y sont exactes (ADM-05).
+#[tokio::test]
+async fn adm_05_store_gauges_are_exact_at_scrape() {
+    let app = fake_server().await;
+    let p = proxy(config(Some(app.addr), Mode::Record)).await;
+    for i in 1..=5 {
+        app_client(&p)
+            .get(app.url(&format!("/users/{i}")))
+            .send()
+            .await
+            .unwrap();
+    }
+    wait_exchanges(&p, "", 5).await;
+    let m = metrics(&p).await;
+    assert_eq!(
+        metric_value(&m, r#"mimic_store_exchanges{origin="local"}"#),
+        Some(5.0),
+        "{m}"
+    );
+    let bytes = metric_value(&m, "mimic_store_bytes").unwrap();
+    assert_eq!(bytes, p.state().store.bytes() as f64, "{m}");
+}
+
 #[tokio::test]
 async fn adm_03_mode_api_switches_and_reports() {
     let p = proxy(config(None, Mode::Record)).await;
