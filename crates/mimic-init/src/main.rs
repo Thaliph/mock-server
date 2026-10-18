@@ -2,20 +2,22 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use clap::Parser;
-use mimic_init::{InboundPorts, RulesConfig, parse_list, parse_ports, render};
+use mimic_init::{
+    InboundPorts, MeshMode, RulesConfig, parse_list, parse_ports, plan_jump, render, resolve_mesh,
+};
 
 /// Pose les règles iptables qui redirigent le trafic du pod vers le sidecar mimic.
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Args {
     /// UID du sidecar, dont le trafic n'est jamais redirigé.
-    #[arg(long, env = "MIMIC_PROXY_UID", default_value_t = 1337)]
+    #[arg(long, env = "MIMIC_PROXY_UID", default_value_t = 1338)]
     proxy_uid: u32,
-    #[arg(long, env = "MIMIC_INBOUND_PORT", default_value_t = 15006)]
+    #[arg(long, env = "MIMIC_INBOUND_PORT", default_value_t = 15106)]
     inbound_port: u16,
-    #[arg(long, env = "MIMIC_OUTBOUND_PORT", default_value_t = 15001)]
+    #[arg(long, env = "MIMIC_OUTBOUND_PORT", default_value_t = 15101)]
     outbound_port: u16,
-    #[arg(long, env = "MIMIC_ADMIN_PORT", default_value_t = 15000)]
+    #[arg(long, env = "MIMIC_ADMIN_PORT", default_value_t = 15100)]
     admin_port: u16,
     /// Ports entrants à intercepter : `*`, liste `8080,9090`, ou vide pour aucun.
     #[arg(long, env = "MIMIC_INBOUND_PORTS", default_value = "*")]
@@ -35,6 +37,9 @@ struct Args {
     /// Binaire iptables : `iptables` (nft) ou `iptables-legacy`, selon le noyau des noeuds.
     #[arg(long, env = "MIMIC_IPTABLES", default_value = "iptables")]
     iptables: String,
+    /// Service mesh du pod (spec §3.3.3) : `auto`, `none`, `istio`, `istio-ambient`, `linkerd`.
+    #[arg(long, env = "MIMIC_MESH", default_value = "auto")]
+    mesh: String,
     /// Affiche les règles sans les appliquer.
     #[arg(long)]
     dry_run: bool,
@@ -49,6 +54,24 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<(), String> {
+    let mode = MeshMode::parse(&args.mesh)?;
+    // Règles déjà posées, par binaire : le mesh et la table où il les a mises.
+    let mut saves = vec![];
+    if mode != MeshMode::None {
+        for tool in [args.iptables.as_str(), "iptables-nft", "iptables-legacy"] {
+            if saves.iter().any(|(t, _)| t == tool) {
+                continue;
+            }
+            if let Ok(saved) = save(tool) {
+                saves.push((tool.to_string(), saved));
+            }
+        }
+    }
+    let resolved = resolve_mesh(mode, &args.iptables, &saves);
+    println!(
+        "mimic-init: mesh {:?}, binaire {}",
+        resolved.mesh, resolved.tool
+    );
     let base = RulesConfig {
         proxy_uid: args.proxy_uid,
         inbound_port: args.inbound_port,
@@ -60,9 +83,10 @@ fn run(args: &Args) -> Result<(), String> {
         exclude_outbound_cidrs: parse_list(&args.exclude_outbound_cidrs),
         exclude_outbound_ports: parse_ports(&args.exclude_outbound_ports)?,
         ipv6: false,
+        mesh: resolved.mesh,
     };
-    let ip6tables = args.iptables.replacen("iptables", "ip6tables", 1);
-    let mut families = vec![(args.iptables.as_str(), base.clone())];
+    let ip6tables = resolved.tool.replacen("iptables", "ip6tables", 1);
+    let mut families = vec![(resolved.tool.as_str(), base.clone())];
     if args.ipv6 {
         families.push((ip6tables.as_str(), RulesConfig { ipv6: true, ..base }));
     }
@@ -71,17 +95,38 @@ fn run(args: &Args) -> Result<(), String> {
         if args.dry_run {
             println!("# {tool}-restore --noflush\n{}", rules.restore);
             for j in &rules.jumps {
-                println!("# {tool} -t nat -A {}", j[2..].join(" "));
+                let at = if j.first {
+                    format!("-I {} 1", j.chain)
+                } else {
+                    format!("-A {}", j.chain)
+                };
+                println!("# {tool} -t nat {at} -p tcp -j {}", j.target);
             }
             continue;
         }
         restore(&format!("{tool}-restore"), &rules.restore)?;
+        let saved = save(tool)?;
         for j in &rules.jumps {
-            ensure_jump(tool, j)?;
+            for cmd in plan_jump(&saved, j) {
+                iptables(tool, &cmd)?;
+            }
         }
         println!("mimic-init: règles {tool} posées");
     }
     Ok(())
+}
+
+/// Table `nat` telle que `<binaire>-save` la donne.
+fn save(tool: &str) -> Result<String, String> {
+    let out = Command::new(format!("{tool}-save"))
+        .args(["-t", "nat"])
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("{tool}-save: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{tool}-save a échoué ({})", out.status));
+    }
+    String::from_utf8(out.stdout).map_err(|e| format!("{tool}-save: {e}"))
 }
 
 fn restore(tool: &str, input: &str) -> Result<(), String> {
@@ -103,32 +148,13 @@ fn restore(tool: &str, input: &str) -> Result<(), String> {
         .ok_or_else(|| format!("{tool} a échoué ({status})"))
 }
 
-/// Ajoute un saut vers une chaîne mimic s'il n'existe pas déjà.
-fn ensure_jump(tool: &str, jump: &[String]) -> Result<(), String> {
-    // jump = ["-t", "nat", CHAÎNE, règle...]
-    let (table, rest) = jump.split_at(2);
-    let (chain, rule) = rest.split_first().expect("chaîne présente");
-    let exists = Command::new(tool)
-        .args(table)
-        .arg("-C")
-        .arg(chain)
-        .args(rule)
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("{tool}: {e}"))?
-        .success();
-    if exists {
-        return Ok(());
-    }
+fn iptables(tool: &str, args: &[String]) -> Result<(), String> {
     let status = Command::new(tool)
-        .args(table)
-        .arg("-A")
-        .arg(chain)
-        .args(rule)
+        .args(args)
         .status()
         .map_err(|e| format!("{tool}: {e}"))?;
     status
         .success()
         .then_some(())
-        .ok_or_else(|| format!("{tool} -A {chain} a échoué ({status})"))
+        .ok_or_else(|| format!("{tool} {} a échoué ({status})", args.join(" ")))
 }
