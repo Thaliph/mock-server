@@ -555,6 +555,16 @@ mod tests {
         assert_eq!(c.capture.samples_per_operation, 20);
     }
 
+    /// Historique court par défaut (CTL-21) : `share.retention` de 24 heures, aussi quand
+    /// le YAML ne la donne pas.
+    #[test]
+    fn ctl_21_share_retention_defaults_to_24_hours() {
+        let day = Duration::from_secs(24 * 3600);
+        assert_eq!(ShareConfig::default().retention, day);
+        let s: ShareConfig = serde_yaml::from_str("url: s3://bucket/p\n").unwrap();
+        assert_eq!(s.retention, day);
+    }
+
     #[test]
     fn unknown_fields_are_rejected() {
         assert!(serde_yaml::from_str::<Config>("mood: mock\n").is_err());

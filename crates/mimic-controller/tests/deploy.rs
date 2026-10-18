@@ -90,3 +90,22 @@ fn crd_07_admission_policy_matches_the_guard() {
         .unwrap();
     assert_eq!(binding["spec"]["policyName"], vap["metadata"]["name"]);
 }
+
+/// Historique court par défaut (CTL-21) : 24 heures, dans le code comme dans le manifest.
+#[test]
+fn ctl_21_retention_defaults_to_24_hours() {
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let defaults = ControllerConfig::default();
+    assert_eq!(defaults.retention, day);
+    assert_eq!(defaults.max_exemplars_per_workload, 10_000);
+    let cm = docs(include_str!("../../../deploy/controller/controller.yaml"))
+        .into_iter()
+        .find(|d| d["kind"] == "ConfigMap")
+        .unwrap();
+    let text = cm["data"]["controller.yaml"].as_str().unwrap();
+    let raw: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
+    assert_eq!(raw["retention"].as_u64(), Some(86_400));
+    assert_eq!(raw["max_exemplars_per_workload"].as_u64(), Some(10_000));
+    let config: ControllerConfig = serde_yaml::from_str(text).unwrap();
+    assert_eq!(config.retention, day);
+}

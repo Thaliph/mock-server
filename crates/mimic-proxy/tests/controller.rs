@@ -1,5 +1,5 @@
-//! Critères CTL-*, SNP-03 à 05 et SEC-01, SEC-05 de la spec (§5.5, §5.6, §7.1) :
-//! sidecars réels pilotés par un contrôleur réel.
+//! Critères CTL-*, SNP-03 à 07, SHR-10 et SEC-01, SEC-05 de la spec (§5.4, §5.5, §5.6,
+//! §7.1) : sidecars réels pilotés par un contrôleur réel.
 
 mod common;
 
@@ -145,7 +145,7 @@ async fn served(p: &Running, url: &str) -> (u16, String, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn ctl_01_controller_aggregates_the_workload() {
+async fn ctl_01_shr_10_controller_aggregates_the_workload_pods_keep_their_own() {
     let dir = tempfile::tempdir().unwrap();
     let ctl = controller(dir.path(), None).await;
     let app = fake_server().await;
@@ -174,11 +174,30 @@ async fn ctl_01_controller_aggregates_the_workload() {
             .is_some_and(|p| p.len() == 2)
     })
     .await;
-    // Le partage passe aussi par le contrôleur : B documente le trafic de A.
-    eventually("B a importé l'échange de A", || async {
-        status(&b).await["store"]["peer"].as_u64() >= Some(1)
-    })
-    .await;
+    // SHR-10 : sous contrôleur, aucun pod n'importe le trafic de l'autre ; chacun ne
+    // documente que le sien, la vue du workload est celle du contrôleur.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (p, own, other) in [(&a, "/users/1", "/search"), (&b, "/search", "/users/1")] {
+        let s = status(p).await;
+        assert_eq!(s["store"]["peer"], 0);
+        assert_eq!(s["share"]["peers"], serde_json::json!([]));
+        let ops: Value = client()
+            .get(admin(p, "/api/operations"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let paths: Vec<&str> = ops
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["path"].as_str())
+            .collect();
+        assert!(paths.contains(&own), "{paths:?}");
+        assert!(!paths.contains(&other), "{paths:?}");
+    }
 }
 
 #[tokio::test]
@@ -569,9 +588,15 @@ async fn snp_07_unreachable_snapshot_still_switches_to_mock() {
     let dir = tempfile::tempdir().unwrap();
     let ctl = controller(dir.path(), None).await;
     let saas = fake_server().await;
-    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    // Sous contrôleur, les données locales d'un pod sont ce qu'il a vu lui-même (§5.4) :
+    // B enregistre l'appel dans son journal local, puis s'arrête.
+    let with_store = |mut c: Config| {
+        c.store.dir = Some(dir.path().join("store-b"));
+        c
+    };
     let url7 = saas.url("/users/7");
-    assert_eq!(served(&a, &url7).await.0, 200);
+    let b = proxy(with_store(piloted(None, &ctl, dir.path(), "api-b"))).await;
+    assert_eq!(served(&b, &url7).await.0, 200);
     eventually("appel reçu", || async {
         ui_json(&ctl, "/v1/workloads/ns/api/requests?direction=outbound")
             .await
@@ -579,27 +604,74 @@ async fn snp_07_unreachable_snapshot_still_switches_to_mock() {
             .is_some_and(|l| l.len() == 1)
     })
     .await;
+    b.shutdown().await;
     let s1 = apply(&ctl, "mock", None).await["snapshot"].clone();
-    converged(&[&a], "mock", &s1).await;
+    assert!(s1.is_string());
 
-    // Snapshot devenu illisible : un nouveau pod ne peut pas le télécharger.
+    // Snapshot devenu illisible : B, qui redémarre, ne peut pas le télécharger.
     let file = dir
         .path()
         .join("ctl/ns/api/snapshots")
         .join(format!("{}.jsonl", s1.as_str().unwrap()));
     std::fs::remove_file(&file).unwrap();
-    let b = proxy(piloted(None, &ctl, dir.path(), "api-b")).await;
+    let b = proxy(with_store(piloted(None, &ctl, dir.path(), "api-b"))).await;
     eventually("B en mock malgré l'échec", || async {
         let s = status(&b).await;
         s["mode"] == "mock" && s["controller"]["last_error"].is_string()
     })
     .await;
     assert_eq!(status(&b).await["snapshot"], Value::Null);
-    // Données locales : l'échange de A, importé par le partage.
+    // Données locales : l'échange que B a lui-même enregistré.
     let hits = saas.hits();
     eventually("servi depuis les données locales", || async {
         served(&b, &url7).await.0 == 200
     })
     .await;
     assert_eq!(saas.hits(), hits, "rien n'est sorti");
+}
+
+/// Les exemples par endpoint viennent de segments déjà redactés par le sidecar (§5.5.3).
+#[tokio::test]
+async fn ctl_20_examples_hold_only_redacted_values() {
+    use mimic_core::model::{Body, Exchange};
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    let secret = "s3cr3t-t0ken-ctl20";
+    let email = "alice.ctl20@example.com";
+    let r = app_client(&a)
+        .post(saas.url("/echo"))
+        .bearer_auth(secret)
+        .json(&serde_json::json!({"email": email, "n": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    eventually("le contrôleur a reçu l'appel", || async {
+        ui_json(&ctl, "/v1/workloads/ns/api/requests?direction=outbound")
+            .await
+            .as_array()
+            .is_some_and(|l| l.len() == 1)
+    })
+    .await;
+    ctl.state().maintain().await;
+    let raw = std::fs::read(dir.path().join("ctl/ns/api/exemplars.jsonl")).unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    assert!(!text.contains(secret), "{text}");
+    let lines: Vec<Exchange> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let e = lines.iter().find(|e| e.path == "/echo").expect("exemple");
+    let auth = e.req_header("authorization").unwrap();
+    assert!(auth.starts_with("<redacted:"), "{auth}");
+    for body in [&e.req_body, &e.resp_body] {
+        let Body::Captured { data } = body else {
+            panic!("body rejouable attendu : {body:?}");
+        };
+        let data = String::from_utf8_lossy(data);
+        assert!(!data.contains(email), "{data}");
+        assert!(data.contains("<redacted:"), "{data}");
+    }
 }

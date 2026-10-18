@@ -437,6 +437,30 @@ mod tests {
     }
 
     #[test]
+    fn shr_08_cursor_advances_only_after_a_complete_import() {
+        let t = 10_000_000;
+        let mut c = Cursor::default();
+        assert_eq!(c.since(), None);
+        assert!(c.wants("p/1", t, 0));
+        // Hors rétention : jamais importé.
+        assert!(!c.wants("p/0", t, t + 1));
+        // Import échoué : rien n'est marqué, le curseur ne bouge pas.
+        assert_eq!(c.since(), None);
+        assert!(c.wants("p/1", t, 0));
+        // Import complet : le segment n'est plus voulu, la fenêtre suit le plus récent.
+        c.imported("p/1", t);
+        c.complete(Some(t));
+        assert_eq!(c.since(), Some(t - LIST_OVERLAP_MS));
+        assert!(!c.wants("p/1", t, 0));
+        assert!(!c.wants("p/old", t - LIST_OVERLAP_MS - 1, 0));
+        assert!(c.wants("p/2", t - LIST_OVERLAP_MS, 0));
+        // Les segments sortis de la fenêtre sont oubliés.
+        c.imported("p/2", t - LIST_OVERLAP_MS);
+        c.complete(Some(t + 2 * LIST_OVERLAP_MS));
+        assert_eq!(c.remembered(), 0);
+    }
+
+    #[test]
     fn shr_09_backoff_grows_and_is_capped() {
         let i = Duration::from_secs(10);
         assert_eq!(backoff(i, 0), i);

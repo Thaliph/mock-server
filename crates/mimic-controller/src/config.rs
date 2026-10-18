@@ -27,6 +27,8 @@ pub struct ControllerConfig {
     pub samples_per_operation: usize,
     /// Volume des segments d'un workload sur le support : au-delà, les plus anciens partent.
     pub max_bytes_per_workload: u64,
+    /// Endpoints gardés avec un exemple, par workload (spec §5.5.3).
+    pub max_exemplars_per_workload: usize,
     /// Au plus un recalcul de la découverte d'un workload par intervalle.
     #[serde(with = "duration_secs")]
     pub discovery_interval: Duration,
@@ -52,6 +54,7 @@ impl Default for ControllerConfig {
             max_exchanges_total: 1_000_000,
             samples_per_operation: 20,
             max_bytes_per_workload: 256 * 1024 * 1024,
+            max_exemplars_per_workload: mimic_core::exemplar::DEFAULT_MAX_ENDPOINTS,
             discovery_interval: Duration::from_secs(30),
             snapshot: SnapshotConfig::default(),
             pod_timeout: Duration::from_secs(30),
