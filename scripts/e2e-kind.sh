@@ -285,7 +285,7 @@ cat "$REPORT_DIR/mock.md"
 echo "::group::métriques de frontend-proxy et du générateur"
 for w in frontend-proxy load-generator; do
   echo "-- $w"
-  grep -E '^mimic_(requests|upstream_errors|mock_responses)_total[{]' "$mdir/$w.after" || true
+  grep -E '^mimic_(requests|upstream_errors|mock_responses|passthrough_connections)_total[{]' "$mdir/$w.after" || true
   kubectl -n "$NS" logs "deploy/$w" -c mimic 2>/dev/null | grep '"WARN"\|"ERROR"' | tail -10 || true
 done
 echo "::endgroup::"
