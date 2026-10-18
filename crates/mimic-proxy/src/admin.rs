@@ -164,25 +164,32 @@ fn render_page(state: &AppState) -> String {
     );
     let _ = write!(
         h,
-        "<h1>API découvertes · {}/{}</h1><div class=\"meta\"><span>mode <span class=\"pill mode\">{}</span></span><span>instance {}</span><span>{} échanges locaux, {} importés</span>",
+        "<h1>API découvertes · {}/{}</h1><div class=\"meta\"><span>mode <span class=\"pill mode\">{}</span></span><span>instance {}</span>",
         esc(&state.config.workload.namespace),
         esc(&state.config.workload.name),
         state.mode().as_str(),
         esc(&state.config.instance),
-        local,
-        peer
     );
     if state.config.controlled() {
+        // Sous contrôleur, rien n'est importé des pairs (spec §5.4) : la page ne montre que ce
+        // pod, le workload entier est dans l'interface du contrôleur.
         let _ = write!(
             h,
-            "<span>piloté par le contrôleur · snapshot {}</span>",
+            "<span>{local} échanges vus par ce pod</span><span>piloté par le contrôleur · snapshot {}</span><span>publication vers le contrôleur{} · workload entier : interface du contrôleur</span>",
             esc(&state
                 .snapshot()
                 .map(|s| s.id.clone())
-                .unwrap_or_else(|| "aucun".into()))
+                .unwrap_or_else(|| "aucun".into())),
+            share
+                .last_error
+                .as_ref()
+                .map(|e| format!(", dernière erreur : {}", esc(e)))
+                .unwrap_or_default()
         );
+    } else {
+        let _ = write!(h, "<span>{local} échanges locaux, {peer} importés</span>");
     }
-    if share.enabled {
+    if share.enabled && !state.config.controlled() {
         let _ = write!(
             h,
             "<span>partage : {} pair(s){}</span>",

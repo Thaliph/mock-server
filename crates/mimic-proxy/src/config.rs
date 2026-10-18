@@ -328,6 +328,8 @@ pub struct ShareConfig {
     pub url: String,
     #[serde(default = "default_share_interval", with = "duration_secs")]
     pub interval: Duration,
+    /// Partage direct : âge au-delà duquel un segment de pair n'est plus importé (24 heures
+    /// par défaut). Sous contrôleur, rien n'est importé (spec §5.4).
     #[serde(default = "default_share_retention", with = "duration_secs")]
     pub retention: Duration,
     /// Période du battement vers le contrôleur.
@@ -411,7 +413,7 @@ fn default_share_backlog() -> usize {
 }
 
 fn default_share_retention() -> Duration {
-    Duration::from_secs(7 * 24 * 3600)
+    Duration::from_secs(24 * 3600)
 }
 
 /// Durées exprimées en secondes dans le YAML.
