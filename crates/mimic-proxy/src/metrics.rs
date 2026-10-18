@@ -129,7 +129,22 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
-        let mut registry = Registry::default();
+        Self::with_version(None)
+    }
+
+    /// Métriques dont chaque série porte le label constant `version`, s'il est donné
+    /// (spec §9.3) : une seule valeur par pod, aucune série en plus.
+    pub fn with_version(version: Option<String>) -> Self {
+        let mut registry = match version {
+            Some(v) => Registry::with_labels(
+                [(
+                    std::borrow::Cow::Borrowed("version"),
+                    std::borrow::Cow::Owned(v),
+                )]
+                .into_iter(),
+            ),
+            None => Registry::default(),
+        };
         let requests = Family::default();
         let request_duration: HistogramFamily<DurationLabels> =
             Family::new_with_constructor(latency_histogram);

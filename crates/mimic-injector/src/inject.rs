@@ -210,6 +210,15 @@ fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]
         field_env("POD_NAME", "metadata.name"),
         field_env("POD_NAMESPACE", "metadata.namespace"),
         env("MIMIC_WORKLOAD", workload),
+        // Label `version` des métriques ; vides si le pod n'a pas ces labels (spec §9.3).
+        field_env(
+            "MIMIC_VERSION",
+            &format!("metadata.labels['{}']", cfg.version_label),
+        ),
+        field_env(
+            "MIMIC_POD_TEMPLATE_HASH",
+            "metadata.labels['pod-template-hash']",
+        ),
         EnvVar {
             name: "MIMIC_REDACT_SALT".into(),
             value_from: Some(EnvVarSource {

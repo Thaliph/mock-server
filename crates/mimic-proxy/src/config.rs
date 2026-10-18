@@ -105,6 +105,8 @@ pub struct Config {
     pub share: Option<ShareConfig>,
     /// Fichier d'annotations du pod exposé par l'API downward, surveillé pour la bascule de mode.
     pub annotations_file: Option<PathBuf>,
+    /// Version du pod, label `version` de toutes les métriques (spec §9.3).
+    pub version: Option<String>,
 }
 
 impl Default for Config {
@@ -123,6 +125,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             share: None,
             annotations_file: None,
+            version: None,
         }
     }
 }
@@ -371,6 +374,20 @@ impl ShareConfig {
 }
 
 impl Config {
+    /// Valeur du label `version` des métriques : bornée à 63 caractères (taille maximale
+    /// d'un label Kubernetes), absente si vide.
+    pub fn metrics_version(&self) -> Option<String> {
+        let v = self.version.as_deref()?.trim();
+        let mut out = String::new();
+        for c in v.chars() {
+            if out.len() + c.len_utf8() > 63 {
+                break;
+            }
+            out.push(c);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Vrai si le sidecar est piloté par un contrôleur : il n'accepte alors aucun autre ordre.
     pub fn controlled(&self) -> bool {
         self.share.as_ref().is_some_and(ShareConfig::is_controller)
@@ -456,6 +473,18 @@ impl Config {
         }
         if let Some(v) = get("MIMIC_REDACT_SALT") {
             self.redact.salt = Some(v);
+        }
+        // Version : MIMIC_VERSION, puis la configuration, puis le hash du template ; une
+        // variable vide (label absent du pod) ne compte pas.
+        let non_empty = |k: &str| {
+            get(k)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        if let Some(v) = non_empty("MIMIC_VERSION") {
+            self.version = Some(v);
+        } else if self.version.as_deref().is_none_or(|v| v.trim().is_empty()) {
+            self.version = non_empty("MIMIC_POD_TEMPLATE_HASH");
         }
         if let Some(v) = get("MIMIC_TLS_INTERCEPT") {
             self.tls.intercept = v
@@ -580,6 +609,58 @@ mod tests {
             url: url.into(),
             ..ShareConfig::default()
         }
+    }
+
+    #[test]
+    fn adm_04_version_from_environment_then_config_then_template_hash() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let mut c = Config::default();
+        c.apply_env(env(&[
+            ("MIMIC_VERSION", "v2"),
+            ("MIMIC_POD_TEMPLATE_HASH", "7d9f"),
+        ]))
+        .unwrap();
+        assert_eq!(c.version.as_deref(), Some("v2"));
+        // Variable vide (label absent du pod) : celle de la configuration, puis le hash.
+        let mut c = Config {
+            version: Some("v1.4.2".into()),
+            ..Config::default()
+        };
+        c.apply_env(env(&[
+            ("MIMIC_VERSION", ""),
+            ("MIMIC_POD_TEMPLATE_HASH", "7d9f"),
+        ]))
+        .unwrap();
+        assert_eq!(c.version.as_deref(), Some("v1.4.2"));
+        let mut c = Config::default();
+        c.apply_env(env(&[
+            ("MIMIC_VERSION", ""),
+            ("MIMIC_POD_TEMPLATE_HASH", "7d9f"),
+        ]))
+        .unwrap();
+        assert_eq!(c.version.as_deref(), Some("7d9f"));
+        let mut c = Config::default();
+        c.apply_env(env(&[
+            ("MIMIC_VERSION", " "),
+            ("MIMIC_POD_TEMPLATE_HASH", ""),
+        ]))
+        .unwrap();
+        assert_eq!(c.version, None);
+        // Valeur bornée à 63 caractères.
+        let long = "é".repeat(40);
+        let c = Config {
+            version: Some(long),
+            ..Config::default()
+        };
+        let v = c.metrics_version().unwrap();
+        assert!(v.len() <= 63 && !v.is_empty(), "{v}");
     }
 
     #[test]

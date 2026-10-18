@@ -46,6 +46,11 @@ spec:
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
             - name: MIMIC_WORKLOAD
               valueFrom: {fieldRef: {fieldPath: "metadata.labels['app.kubernetes.io/name']"}}
+            # Label `version` des métriques, pour comparer deux versions (spec §9.3).
+            - name: MIMIC_VERSION
+              valueFrom: {fieldRef: {fieldPath: "metadata.labels['app.kubernetes.io/version']"}}
+            - name: MIMIC_POD_TEMPLATE_HASH
+              valueFrom: {fieldRef: {fieldPath: "metadata.labels['pod-template-hash']"}}
             # Sel commun aux réplicas pour des marqueurs de redaction cohérents.
             - name: MIMIC_REDACT_SALT
               valueFrom: {secretKeyRef: {name: checkout-mimic, key: redact-salt}}

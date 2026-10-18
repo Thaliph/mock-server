@@ -34,6 +34,9 @@ pub struct InjectorConfig {
     /// Audience du jeton projeté, vérifiée par le contrôleur (spec §7.1).
     #[serde(default = "default_audience")]
     pub token_audience: String,
+    /// Label du pod repris dans `MIMIC_VERSION`, label `version` des métriques (spec §9.3).
+    #[serde(default = "default_version_label")]
+    pub version_label: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +52,10 @@ fn default_listen() -> SocketAddr {
 
 fn default_controller_ca() -> String {
     "mimic-controller-ca".into()
+}
+
+fn default_version_label() -> String {
+    "app.kubernetes.io/version".into()
 }
 
 fn default_audience() -> String {

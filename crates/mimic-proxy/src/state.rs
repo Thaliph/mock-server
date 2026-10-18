@@ -114,7 +114,7 @@ impl AppState {
                 ca,
             })
         };
-        let metrics = Metrics::new();
+        let metrics = Metrics::with_version(config.metrics_version());
         metrics.set_mode(config.mode);
         let store = Store::with_limits(
             Limits {

@@ -33,6 +33,10 @@ Tout pod créé dans un namespace labellisé `mimic.platform.io/enabled=true` re
 | `mimic.platform.io/tls-intercept` | hôtes HTTPS interceptés ; l'app reçoit la CA Mimic |
 | `mimic.platform.io/config` | ConfigMap de configuration du sidecar à la place de celle du webhook |
 
+Le sidecar reçoit aussi `MIMIC_VERSION` (label `version_label` du pod,
+`app.kubernetes.io/version` par défaut) et `MIMIC_POD_TEMPLATE_HASH` : toutes ses métriques
+portent alors le label `version`, pour comparer deux versions d'un workload.
+
 Le webhook est en `failurePolicy: Ignore` : s'il est indisponible, les pods sont créés
 sans mimic. Un pod laissé tel quel l'est avec un avertissement visible dans `kubectl`.
 

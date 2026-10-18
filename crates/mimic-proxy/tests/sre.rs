@@ -157,3 +157,32 @@ async fn cap_10_off_keeps_nothing_but_metrics() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(exchanges(&p, "direction=inbound").await.is_empty());
 }
+
+/// Séries de l'exposition Prometheus (hors commentaires).
+fn series(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .collect()
+}
+
+#[tokio::test]
+async fn adm_04_every_metric_carries_the_version() {
+    let app = fake_server().await;
+    let mut cfg = config(Some(app.addr), Mode::Record);
+    cfg.apply_env(|k| (k == "MIMIC_VERSION").then(|| "v2".to_string()))
+        .unwrap();
+    let p = proxy(cfg).await;
+    client().get(inbound(&p, "/users/1")).send().await.unwrap();
+    let m = metrics(&p).await;
+    let lines = series(&m);
+    assert!(lines.iter().any(|l| l.starts_with("mimic_requests_total{")));
+    for l in lines {
+        assert!(l.contains("version=\"v2\""), "{l}");
+    }
+
+    // Sans version connue, aucun label `version`.
+    let p = proxy(config(Some(app.addr), Mode::Record)).await;
+    client().get(inbound(&p, "/users/1")).send().await.unwrap();
+    let m = metrics(&p).await;
+    assert!(!m.contains("version="), "{m}");
+}
