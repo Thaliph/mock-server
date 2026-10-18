@@ -12,6 +12,8 @@
 #    montrent que seules ses cibles (frontend-proxy, flagd) reçoivent encore du trafic,
 #    frontend-proxy répondant depuis le snapshot ;
 # 6. mock de shipping (mimicctl) : quote est arrêté, shipping répond depuis le snapshot ;
+#    bascule du contrôleur (E2E-06) : la réplique active est supprimée sous trafic, l'autre
+#    prend le relais en moins de FAILOVER_SECONDS, le mock et la découverte restent ;
 # 7. retour en record ;
 # 8. garde-fou production (E2E-04) : namespace labellisé env=production, mock refusé par le
 #    contrôleur, par mimicctl et par la politique d'admission ;
@@ -22,7 +24,8 @@
 #
 # Variables : CLUSTER (mimic), MIMIC_IMAGE (mimic:e2e), SKIP_BUILD=1 si l'image est déjà
 # construite, MIMICCTL (chemin du binaire, sinon construit par cargo), LOAD_SECONDS (300),
-# MOCK_WINDOW (60, secondes d'observation en mock global), REPORT_DIR (target/e2e-report).
+# MOCK_WINDOW (60, secondes d'observation en mock global), REPORT_DIR (target/e2e-report),
+# FAILOVER_SECONDS (30, délai de bascule du contrôleur toléré, spec §5.5.4).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -31,6 +34,9 @@ IMAGE=${MIMIC_IMAGE:-mimic:e2e}
 NS=otel-demo
 LOAD_SECONDS=${LOAD_SECONDS:-300}
 MOCK_WINDOW=${MOCK_WINDOW:-60}
+# Bascule du contrôleur : bail rendu, relu sous 2 s, rechargement, endpoints, battement sous
+# 2 s, soit moins de 10 s ; 30 s couvrent aussi un bail qui expire (15 s + 2 s) (§5.5.4).
+FAILOVER_SECONDS=${FAILOVER_SECONDS:-30}
 REPORT_DIR=${REPORT_DIR:-target/e2e-report}
 CERT_MANAGER=v1.21.1
 TRUST_MANAGER=v0.24.0
@@ -41,8 +47,12 @@ fail() { printf '\nÉCHEC : %s\n' "$*" >&2; exit 1; }
 diagnostics() {
   log "diagnostic"
   kubectl get pods -A -o wide || true
+  kubectl describe node | sed -n '/Allocated resources/,/Events/p' || true
   kubectl get mimicworkloads -A -o yaml || true
-  kubectl -n mimic-system logs deploy/mimic-controller --tail=100 || true
+  kubectl -n mimic-system get lease mimic-controller -o yaml || true
+  kubectl -n mimic-system get pods -l app.kubernetes.io/name=mimic-controller -o wide --show-labels || true
+  kubectl -n mimic-system get endpointslices -l kubernetes.io/service-name=mimic-controller -o wide || true
+  kubectl -n mimic-system logs -l app.kubernetes.io/name=mimic-controller --prefix --tail=100 || true
   kubectl -n mimic-system logs deploy/mimic-injector --tail=50 || true
   kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -40 || true
   # Confiance sidecars → contrôleur : la CA publiée doit avoir signé le certificat servi.
@@ -167,9 +177,24 @@ retry 60 kubectl apply -f deploy/controller/certificates.yaml
 reissue_if_stale mimic-controller-tls
 manifest deploy/controller/controller.yaml | kubectl apply -f -
 kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
+# Deux réplicas prêts, dont une seule active : celle qui porte la marque (spec §5.5.4).
+CTL_PODS=app.kubernetes.io/name=mimic-controller
+leader() {
+  kubectl -n mimic-system get pod -l "$CTL_PODS,mimic.platform.io/leader=true" \
+    -o jsonpath='{.items[*].metadata.name}'
+}
+has_leader() { [ "$(leader | wc -w)" -eq 1 ]; }
+retry 60 has_leader || fail "aucune réplique active du contrôleur"
+echo "réplique active : $(leader)"
 
 log "webhook d'injection"
-manifest deploy/injector/injector.yaml | kubectl apply -f -
+# kind n'a qu'un nœud : avec deux réplicas du contrôleur, les requêtes CPU des sidecars
+# (50m chacun, une vingtaine de pods) ne laissaient plus de place aux pods de test
+# ajoutés en fin de script (Insufficient cpu). Le test ne porte pas sur ces requêtes :
+# on les abaisse à 10m pour les sidecars injectés ici.
+manifest deploy/injector/injector.yaml \
+  | sed 's#requests: {cpu: 50m, memory: 64Mi}#requests: {cpu: 10m, memory: 64Mi}#' \
+  | kubectl apply -f -
 reissue_if_stale mimic-injector-tls
 # Le webhook lit son certificat au démarrage : le relancer si sa feuille a été réémise.
 [ -z "${REISSUED:-}" ] || kubectl -n mimic-system rollout restart deploy/mimic-injector
@@ -351,6 +376,117 @@ log "mock : quote arrêté, shipping répond depuis le snapshot"
 kubectl -n "$NS" scale deploy/quote --replicas=0
 kubectl -n "$NS" wait --for=delete pod -l app.kubernetes.io/name=quote --timeout=60s
 traffic 40 || fail "requêtes en échec en mock"
+
+log "bascule du contrôleur sous trafic (E2E-06)"
+# ctl_get <pod> <chemin> : GET sur l'interface d'un pod du contrôleur, liée à 127.0.0.1:8081.
+ctl_get() {
+  local port=$((20000 + RANDOM % 10000)) pid rc=1 i
+  kubectl -n mimic-system port-forward "pod/$1" "$port:8081" >/dev/null 2>&1 &
+  pid=$!
+  for i in $(seq 1 20); do
+    if curl -sf -m 20 "http://127.0.0.1:$port$2"; then rc=0; break; fi
+    sleep 0.5
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return $rc
+}
+# metric_of <nom> : valeur de la série, lue sur l'entrée standard (0 si absente) ; un nom
+# sans labels retient aussi la série qui ne porte que des labels constants (`version`).
+metric_of() { awk -v m="$1" '$1 == m || index($1, m "{") == 1 { v = $2 } END { printf "%d", v }'; }
+pod_ip() { kubectl -n mimic-system get pod "$1" -o jsonpath='{.status.podIP}'; }
+# Adresses prêtes du Service du contrôleur.
+service_ips() {
+  kubectl -n mimic-system get endpointslices -l kubernetes.io/service-name=mimic-controller \
+    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].addresses[*]}'
+}
+# État de shipping vu par une réplique : « alignés/sélectionnés snapshot ».
+shipping_seen_by() {
+  ctl_get "$1" /v1/workloads | jq -r --arg ns "$NS" \
+    '.[] | select(.namespace == $ns and .name == "shipping") | "\(.aligned)/\(.selected_pods) \(.desired.snapshot)"'
+}
+# Pour chaque pod de shipping : taille du snapshot servi et nombre de téléchargements.
+shipping_mock_state() {
+  local p
+  for p in $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -o name | sort); do
+    printf '%s %s %s\n' "${p#pod/}" \
+      "$(kubectl get --raw "/api/v1/namespaces/$NS/pods/${p#pod/}:15000/proxy/metrics" | metric_of mimic_mock_snapshot_exchanges)" \
+      "$(kubectl -n "$NS" logs "$p" -c mimic | grep -c 'snapshot chargé' || true)"
+  done
+}
+EXEMPLARS=/var/lib/mimic-controller/$NS/shipping/exemplars.jsonl
+old=$(leader)
+[ "$(service_ips)" = "$(pod_ip "$old")" ] || fail "le Service ne route pas vers la seule réplique active ($(service_ips))"
+snap=$(mimicctl status shipping -n "$NS" | tail -1 | awk '{ print $4 }')
+[ -n "$snap" ] && [ "$snap" != "-" ] || fail "shipping n'a pas de snapshot"
+# Exemples de shipping sur le PVC, écrits à chaque passe de maintenance (une minute).
+exemplar_count() { kubectl -n mimic-system exec "$1" -- cat "$EXEMPLARS" 2>/dev/null | wc -l; }
+has_exemplars() { [ "$(exemplar_count "$old")" -gt 0 ]; }
+retry 90 has_exemplars || fail "aucun exemple de shipping sur le PVC"
+exemplars_before=$(exemplar_count "$old")
+digest_before=$(ctl_get "$old" "/v1/workloads/$NS/shipping/snapshots/$snap" | sha256sum)
+mock_before=$(shipping_mock_state)
+echo "active $old, snapshot $snap, $exemplars_before exemples ; sidecars : $(echo $mock_before)"
+# Trafic continu pendant la bascule : quote est arrêté, shipping répond depuis son moteur.
+fdir=$REPORT_DIR/failover
+mkdir -p "$fdir"
+rm -f "$fdir/stop"
+( while [ ! -f "$fdir/stop" ]; do traffic 5 || echo "LOT EN ÉCHEC"; done ) > "$fdir/traffic.log" 2>&1 &
+traffic_pid=$!
+sleep 5
+started=$SECONDS
+kubectl -n mimic-system delete pod "$old" --wait=false
+# Relais : une autre réplique porte la marque, seul endpoint du Service, et les deux pods de
+# shipping s'y alignent de nouveau sur le même snapshot (battements repris).
+new="" seen=""
+until [ $((SECONDS - started)) -gt "$FAILOVER_SECONDS" ]; do
+  new=$(leader)
+  if [ "$(echo "$new" | wc -w)" -eq 1 ] && [ "$new" != "$old" ] &&
+    [ "$(service_ips)" = "$(pod_ip "$new")" ]; then
+    seen=$(shipping_seen_by "$new" || true)
+    [ "$seen" = "2/2 $snap" ] && break
+  fi
+  sleep 1
+done
+failover=$((SECONDS - started))
+[ "$seen" = "2/2 $snap" ] ||
+  fail "pas de relais en $FAILOVER_SECONDS s : active « $new », endpoints « $(service_ips) », shipping « $seen »"
+echo "relais par $new en ${failover} s"
+[ "$(kubectl -n mimic-system get lease mimic-controller -o jsonpath='{.spec.holderIdentity}')" = "$new" ] ||
+  fail "le bail n'est pas tenu par $new"
+digest_after=$(ctl_get "$new" "/v1/workloads/$NS/shipping/snapshots/$snap" | sha256sum)
+[ "$digest_after" = "$digest_before" ] || fail "snapshot $snap servi autrement par la nouvelle active"
+mock_after=$(shipping_mock_state)
+[ "$mock_after" = "$mock_before" ] ||
+  fail "les sidecars ont rechargé leur snapshot : avant « $(echo $mock_before) », après « $(echo $mock_after) »"
+retry 30 export_has '"/oteldemo.ShippingService/GetQuote"' shipping --inbound ||
+  fail "découverte de shipping perdue à la bascule"
+exemplars_after=$(exemplar_count "$new")
+[ "$exemplars_after" -ge "$exemplars_before" ] || fail "exemples perdus : $exemplars_before, puis $exemplars_after"
+[ "$(ctl_get "$new" /metrics | metric_of mimic_controller_exemplars)" -gt 0 ] ||
+  fail "la nouvelle active n'a pas rechargé les exemples"
+# La publication des sidecars reprend après son attente (10 à 40 s après une coupure brève).
+segments_ok() { [ "$(ctl_get "$new" /metrics | metric_of 'mimic_controller_segments_total{result="ok"}')" -gt 0 ]; }
+retry 90 segments_ok || fail "la nouvelle active ne reçoit pas de segments"
+touch "$fdir/stop"
+wait "$traffic_pid" || true
+if grep -q "LOT EN ÉCHEC" "$fdir/traffic.log"; then
+  cat "$fdir/traffic.log"
+  fail "requêtes en échec pendant la bascule du contrôleur"
+fi
+echo "trafic pendant la bascule : $(grep -c '^5/5$' "$fdir/traffic.log") lots de 5 requêtes, tous réussis"
+kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
+passive=$(kubectl -n mimic-system get pod -l "$CTL_PODS,!mimic.platform.io/leader" -o jsonpath='{.items[*].metadata.name}')
+[ "$(echo "$passive" | wc -w)" -eq 1 ] || fail "réplique passive attendue, trouvé « $passive »"
+passive_metrics=$(ctl_get "$passive" /metrics) || fail "métriques de la passive"
+echo "$passive_metrics" | grep -qx 'mimic_controller_leader 0' || fail "$passive ne se dit pas passive"
+takeover=$(ctl_get "$new" /metrics | awk '$1 == "mimic_controller_takeover_seconds" { print $2 }')
+{
+  echo
+  echo "## Bascule du contrôleur (E2E-06)"
+  echo
+  echo "Réplique active $old supprimée sous trafic : $new active et suivie par les deux pods de shipping en ${failover} s (borne $FAILOVER_SECONDS s), prise de relais ${takeover} s ; snapshot $snap servi à l'identique, $exemplars_after exemples, aucune requête en échec."
+} | tee -a "$REPORT_DIR/mock.md" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 log "retour en record"
 kubectl -n "$NS" scale deploy/quote --replicas=1

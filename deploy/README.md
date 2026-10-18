@@ -8,7 +8,7 @@
 | `crd.yaml` | CRD `MimicWorkload`, générée par `mimic-controller crd` |
 | `rbac.yaml` | droits du contrôleur, rôles `mimic-operator` (bascule) et `mimic-viewer` |
 | `certificates.yaml` | CA dédiée et certificat du contrôleur (cert-manager), CA publiée dans les namespaces (trust-manager) |
-| `controller.yaml` | configuration, PVC, Deployment, Service, NetworkPolicy |
+| `controller.yaml` | configuration, PVC, Deployment (deux réplicas, une active), Service, PodDisruptionBudget, NetworkPolicy |
 | `production-guard.yaml` | facultatif (Kubernetes ≥ 1.30) : `ValidatingAdmissionPolicy` qui refuse une `MimicWorkload` en `mock` ou `mock-partial` dans un namespace labellisé `env=production` |
 
 Prérequis : cert-manager et trust-manager, ce dernier avec `mimic-system` comme namespace
@@ -21,6 +21,46 @@ sidecars refusent alors le contrôleur (`invalid peer certificate: BadSignature`
 logs). Supprimer les Secrets `mimic-controller-tls` et `mimic-injector-tls`, ou lancer
 `cmctl renew`, les fait réémettre avec la CA courante. Le contrôleur et le webhook relisent
 leurs certificats au redémarrage : `kubectl -n mimic-system rollout restart deploy`.
+
+### Haute disponibilité du contrôleur
+
+Le contrôleur tourne en deux réplicas, dont **une seule est active** (spec §5.5.4). Elle est
+élue par le bail `mimic-system/mimic-controller` (`kubectl -n mimic-system get lease`),
+porte le label `mimic.platform.io/leader=true` et le Service ne route que vers elle. L'autre
+est passive : prête (`/healthz`), elle ne lit ni n'écrit le support et répond `503` aux
+sidecars et à l'interface. Les sidecars ne voient qu'une coupure de quelques secondes,
+pendant laquelle ils gardent leur mode et leur snapshot ; un pod en mock continue de servir.
+
+| Événement | Délai de bascule |
+|-----------|------------------|
+| arrêt propre (`kubectl delete pod`, mise à jour, drain) : bail rendu | moins de 10 s |
+| arrêt brutal (nœud perdu, processus tué) : le bail doit expirer | jusqu'à 17 s de plus (`lease_duration` 15 s + `retry_period` 2 s) |
+
+À la prise de relais, la nouvelle active recharge depuis le support l'état souhaité et le
+snapshot courant de chaque workload, l'index des segments et les exemples par endpoint, puis
+pose sa marque. **Ne se perd pas** : segments, snapshots, état souhaité, exemples, statut
+des `MimicWorkload`, mock servi par les sidecars. **Se reconstruit** : état des pods (au
+battement suivant, 2 s), découverte et formes de mock en cache (à la demande, identiques).
+Après un arrêt brutal seulement, les exemples changés depuis la dernière passe de
+maintenance (une minute) sont refaits depuis les segments, toujours sur le support.
+
+**Stockage** : une seule réplique écrit, mais les deux doivent monter le support.
+
+| Support | Ce qu'il faut |
+|---------|---------------|
+| `s3://…` (recommandé en production) | rien : supprimer le PVC et son montage, `store: s3://bucket/prefixe` |
+| PVC `ReadWriteMany` (EFS, Filestore, Azure Files, CephFS, NFS…) | `accessModes: ["ReadWriteMany"]` et la `storageClassName` du stockage partagé : les deux réplicas peuvent être sur deux nœuds |
+| PVC `ReadWriteOnce` (défaut des manifests) | suffit sur un nœud (kind) ou avec un volume local, qui garde les deux réplicas sur le même nœud : la passive couvre la perte du pod, pas celle du nœud. Avec un disque réseau sur plusieurs nœuds, une passive placée ailleurs reste en `ContainerCreating` (`Multi-Attach`) : passer à `ReadWriteMany` ou `s3://`, ou retirer l'anti-affinité |
+
+Le Deployment se met à jour sans coupure du service des sidecars (`RollingUpdate`,
+`maxUnavailable: 0`, l'active partant en dernier grâce à son `pod-deletion-cost`), le
+PodDisruptionBudget (`minAvailable: 1`) empêche un drain d'évincer les deux réplicas à la
+fois, et l'anti-affinité (préférentielle) les place sur deux nœuds quand c'est possible.
+Métriques : `mimic_controller_leader` (1 sur l'active) et `mimic_controller_takeover_seconds`.
+Droits ajoutés (`rbac.yaml`, Role dans `mimic-system`) : le bail, et `list`/`patch` sur les
+pods pour la marque. Revenir à une seule réplique sans bail : `replicas: 1`, retirer
+`leader_election` de la configuration et `mimic.platform.io/leader` du sélecteur du Service
+(sans élection, aucune réplique ne porte la marque).
 
 ## Webhook d'injection (`injector/`), une fois par cluster
 
@@ -94,7 +134,7 @@ Les sidecars refusent tout autre ordre (`PUT /mode` répond `403`, l'annotation 
 ## Voir ce que la découverte a trouvé
 
 ```sh
-kubectl port-forward -n mimic-system deploy/mimic-controller 8081
+kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081
 # puis http://127.0.0.1:8081/ : workloads, pods, API et paramètres requis,
 # snapshots, requêtes enregistrées et export k6
 ```

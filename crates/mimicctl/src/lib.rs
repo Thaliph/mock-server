@@ -510,3 +510,26 @@ fn html(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+/// Pod du contrôleur dont l'interface est lue (spec §5.5.4, §9.5) : la réplique active,
+/// marquée et en marche ; sinon (contrôleur d'une version antérieure, ou bascule en cours) le
+/// premier pod en marche, qu'une passive refuse alors par un `503` explicite.
+pub fn controller_pod(pods: &[k8s_openapi::api::core::v1::Pod]) -> Result<String, String> {
+    let (label, value) = mimic_controller::leader::LEADER_LABEL;
+    let running = |p: &&k8s_openapi::api::core::v1::Pod| {
+        p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+    };
+    let marked = |p: &&k8s_openapi::api::core::v1::Pod| {
+        p.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(label))
+            .is_some_and(|v| v == value)
+    };
+    pods.iter()
+        .filter(running)
+        .find(marked)
+        .or_else(|| pods.iter().find(running))
+        .and_then(|p| p.metadata.name.clone())
+        .ok_or_else(|| "aucun pod du contrôleur en marche".to_string())
+}

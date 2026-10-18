@@ -51,6 +51,8 @@ async fn main() {
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
+        // Bail perdu : la réplique a cessé de servir ; Kubernetes la relance en passive.
+        _ = running.lost() => std::process::exit(1),
     }
     running.shutdown().await;
 }

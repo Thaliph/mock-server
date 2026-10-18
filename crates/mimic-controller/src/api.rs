@@ -38,6 +38,10 @@ pub fn router(ctl: Arc<Ctl>) -> Router {
             get(get_mock_snapshot),
         )
         .layer(DefaultBodyLimit::max(MAX_SEGMENT))
+        .layer(axum::middleware::from_fn_with_state(
+            ctl.clone(),
+            crate::leader::passive_guard,
+        ))
         .with_state(ctl)
 }
 

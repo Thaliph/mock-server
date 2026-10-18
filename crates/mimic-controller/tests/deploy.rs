@@ -117,6 +117,132 @@ fn ctl_21_retention_defaults_to_24_hours() {
     assert_eq!(config.retention, day);
 }
 
+fn find<'a>(docs: &'a [serde_yaml::Value], kind: &str, name: &str) -> &'a serde_yaml::Value {
+    docs.iter()
+        .find(|d| d["kind"] == kind && d["metadata"]["name"] == name)
+        .unwrap_or_else(|| panic!("{kind} {name} absent"))
+}
+
+fn verbs(rule: &serde_yaml::Value) -> Vec<String> {
+    rule["verbs"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn rule_on<'a>(role: &'a serde_yaml::Value, resource: &str) -> Option<&'a serde_yaml::Value> {
+    role["rules"].as_sequence().unwrap().iter().find(|r| {
+        r["resources"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .any(|x| x == resource)
+    })
+}
+
+/// Haute disponibilité (CTL-28, spec §5.5.4) : deux réplicas, une seule routée.
+#[test]
+fn ctl_28_controller_runs_two_replicas_behind_the_active_one() {
+    use mimic_controller::leader::LEADER_LABEL;
+    let manifests = docs(include_str!("../../../deploy/controller/controller.yaml"));
+    let deploy = find(&manifests, "Deployment", "mimic-controller");
+    let spec = &deploy["spec"];
+    assert_eq!(spec["replicas"].as_u64(), Some(2));
+    assert_eq!(spec["strategy"]["type"], "RollingUpdate");
+    assert_eq!(
+        spec["strategy"]["rollingUpdate"]["maxUnavailable"].as_u64(),
+        Some(0)
+    );
+    let pod = &spec["template"]["spec"];
+    let anti =
+        &pod["affinity"]["podAntiAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"][0];
+    assert_eq!(
+        anti["podAffinityTerm"]["topologyKey"],
+        "kubernetes.io/hostname"
+    );
+    assert!(
+        pod["affinity"]["podAntiAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+            .is_null(),
+        "anti-affinité préférentielle : un nœud unique reste possible"
+    );
+    let container = &pod["containers"][0];
+    let env = container["env"].as_sequence().expect("env du contrôleur");
+    let pod_name = env
+        .iter()
+        .find(|e| e["name"] == "POD_NAME")
+        .expect("POD_NAME");
+    assert_eq!(
+        pod_name["valueFrom"]["fieldRef"]["fieldPath"],
+        "metadata.name"
+    );
+    assert!(container["livenessProbe"]["httpGet"]["path"].is_string());
+
+    // Le Service ne route que vers la réplique marquée.
+    let svc = find(&manifests, "Service", "mimic-controller");
+    assert_eq!(svc["spec"]["selector"][LEADER_LABEL.0], LEADER_LABEL.1);
+    assert_eq!(
+        svc["spec"]["selector"]["app.kubernetes.io/name"],
+        "mimic-controller"
+    );
+
+    let pdb = find(&manifests, "PodDisruptionBudget", "mimic-controller");
+    assert_eq!(pdb["spec"]["minAvailable"].as_u64(), Some(1));
+    assert_eq!(
+        pdb["spec"]["selector"]["matchLabels"]["app.kubernetes.io/name"],
+        "mimic-controller"
+    );
+
+    let cm = find(&manifests, "ConfigMap", "mimic-controller");
+    let config: ControllerConfig =
+        serde_yaml::from_str(cm["data"]["controller.yaml"].as_str().unwrap()).unwrap();
+    config.validate().unwrap();
+    let election = config.leader_election.expect("leader_election");
+    assert_eq!(election.lease, "mimic-controller");
+    assert_eq!(election.namespace, "mimic-system");
+    assert_eq!(election.identity, None, "identité lue dans POD_NAME");
+
+    // Droits : bail et marque dans mimic-system seulement.
+    let rbac = docs(include_str!("../../../deploy/controller/rbac.yaml"));
+    let role = find(&rbac, "Role", "mimic-controller");
+    assert_eq!(role["metadata"]["namespace"], "mimic-system");
+    let leases = rule_on(role, "leases").expect("droit sur les leases");
+    assert_eq!(leases["apiGroups"][0], "coordination.k8s.io");
+    let lease_verbs: Vec<String> = role["rules"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r["resources"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|x| x == "leases")
+        })
+        .flat_map(verbs)
+        .collect();
+    for verb in ["get", "create", "patch"] {
+        assert!(lease_verbs.iter().any(|v| v == verb), "leases : {verb}");
+    }
+    let pods = rule_on(role, "pods").expect("droit sur les pods");
+    for verb in ["list", "patch"] {
+        assert!(verbs(pods).iter().any(|v| v == verb), "pods : {verb}");
+    }
+    let binding = find(&rbac, "RoleBinding", "mimic-controller");
+    assert_eq!(binding["metadata"]["namespace"], "mimic-system");
+    assert_eq!(binding["roleRef"]["kind"], "Role");
+    assert_eq!(binding["subjects"][0]["name"], "mimic-controller");
+    let cluster = find(&rbac, "ClusterRole", "mimic-controller");
+    assert!(rule_on(cluster, "leases").is_none());
+    let cluster_pods = rule_on(cluster, "pods").unwrap();
+    assert_eq!(
+        verbs(cluster_pods),
+        ["get"],
+        "aucune écriture sur les pods du cluster"
+    );
+}
+
 /// Le schéma de la CRD livrée n'accepte que `relay` et `refuse` pour `spec.mock.websocket`
 /// (CRD-10).
 #[test]

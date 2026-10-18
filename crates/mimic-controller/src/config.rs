@@ -43,6 +43,60 @@ pub struct ControllerConfig {
     /// Un pod sans battement depuis ce délai est oublié.
     #[serde(with = "duration_secs")]
     pub pod_forget: Duration,
+    /// Deux réplicas, une seule active (spec §5.5.4) ; absent : une seule réplique, sans bail.
+    pub leader_election: Option<LeaderElection>,
+}
+
+/// Élection de la réplique active par un bail `coordination.k8s.io/v1` (spec §5.5.4).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeaderElection {
+    /// Nom du bail.
+    pub lease: String,
+    /// Namespace du bail et des pods du contrôleur.
+    pub namespace: String,
+    /// Identité de la réplique ; absente, `POD_NAME`, sinon `HOSTNAME`.
+    pub identity: Option<String>,
+    #[serde(with = "duration_secs")]
+    pub lease_duration: Duration,
+    #[serde(with = "duration_secs")]
+    pub renew_deadline: Duration,
+    #[serde(with = "duration_secs")]
+    pub retry_period: Duration,
+}
+
+impl Default for LeaderElection {
+    fn default() -> Self {
+        let t = mimic_core::lease::Timings::default();
+        Self {
+            lease: "mimic-controller".into(),
+            namespace: "mimic-system".into(),
+            identity: None,
+            lease_duration: Duration::from_millis(t.lease_duration_ms),
+            renew_deadline: Duration::from_millis(t.renew_deadline_ms),
+            retry_period: Duration::from_millis(t.retry_period_ms),
+        }
+    }
+}
+
+impl LeaderElection {
+    pub fn timings(&self) -> mimic_core::lease::Timings {
+        mimic_core::lease::Timings {
+            lease_duration_ms: self.lease_duration.as_millis() as u64,
+            renew_deadline_ms: self.renew_deadline.as_millis() as u64,
+            retry_period_ms: self.retry_period.as_millis() as u64,
+        }
+    }
+
+    /// Identité de la réplique : celle de la configuration, sinon le nom du pod.
+    pub fn identity(&self) -> Result<String, String> {
+        self.identity
+            .clone()
+            .or_else(|| std::env::var("POD_NAME").ok())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "leader_election : identité absente (POD_NAME)".to_string())
+    }
 }
 
 impl Default for ControllerConfig {
@@ -66,6 +120,7 @@ impl Default for ControllerConfig {
             snapshot: SnapshotConfig::default(),
             pod_timeout: Duration::from_secs(30),
             pod_forget: Duration::from_secs(600),
+            leader_election: None,
         }
     }
 }
@@ -147,6 +202,12 @@ impl ControllerConfig {
         }
         if self.snapshot.max_per_key == 0 {
             return Err("snapshot.max_per_key doit être positif".into());
+        }
+        if let Some(le) = &self.leader_election {
+            le.timings().validate()?;
+            if le.lease.is_empty() || le.namespace.is_empty() {
+                return Err("leader_election : lease et namespace requis".into());
+            }
         }
         if matches!(self.auth, AuthConfig::Kubernetes) && self.tls.is_none() {
             return Err(

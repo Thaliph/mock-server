@@ -42,6 +42,39 @@ subjects:
     name: mimic-controller
     namespace: mimic-system
 ---
+# Élection de la réplique active (spec §5.5.4), dans mimic-system seulement : le bail, et la
+# marque posée sur les pods du contrôleur.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["mimic-controller"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mimic-controller
+subjects:
+  - kind: ServiceAccount
+    name: mimic-controller
+    namespace: mimic-system
+---
 # Qui peut basculer un workload : à lier par namespace (RoleBinding) aux équipes autorisées.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

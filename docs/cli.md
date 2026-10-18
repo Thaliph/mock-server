@@ -20,7 +20,9 @@ compris) et n'a que les droits de son utilisateur :
 | `diff` | aucun : travaille sur deux fichiers |
 
 `export`, `requests` et `report` ouvrent un port-forward vers le pod du contrôleur (port
-8081), comme `kubectl port-forward` ; aucun port n'est exposé hors du cluster.
+8081), comme `kubectl port-forward` ; aucun port n'est exposé hors du cluster. Le pod choisi
+est la réplique active, marquée `mimic.platform.io/leader=true` ; pendant une bascule, la
+passive répond `503` et la commande est à relancer quelques secondes plus tard.
 
 Les options `-n/--namespace` prennent le namespace du contexte par défaut. Codes de sortie :
 `0` succès, `1` changement cassant détecté par `diff --fail-on-breaking`, `2` erreur
@@ -174,8 +176,10 @@ Ce que `export`, `requests` et `report` lisent est aussi visible dans l'interfac
 contrôleur :
 
 ```sh
-kubectl port-forward -n mimic-system deploy/mimic-controller 8081
+kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081
 ```
+
+(la réplique active : `deploy/mimic-controller` peut désigner la passive, qui répond `503`).
 
 `http://127.0.0.1:8081/` liste les workloads avec leur mode et leurs pods alignés ;
 `/ui/<namespace>/<workload>` détaille un workload : pods et battements, API découvertes

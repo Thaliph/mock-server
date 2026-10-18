@@ -35,6 +35,10 @@ pub fn router(ctl: Arc<Ctl>) -> Router {
             get(openapi_outbound),
         )
         .route("/v1/workloads/{ns}/{wl}/requests", get(requests))
+        .layer(axum::middleware::from_fn_with_state(
+            ctl.clone(),
+            crate::leader::passive_guard,
+        ))
         .with_state(ctl)
 }
 
@@ -45,7 +49,10 @@ fn bad_name() -> Response {
 }
 
 async fn metrics(State(ctl): State<Arc<Ctl>>) -> Response {
-    ctl.refresh_metrics().await;
+    // Une passive ne touche pas au support : ses jauges restent à zéro (spec §5.5.4).
+    if ctl.is_active() {
+        ctl.refresh_metrics().await;
+    }
     (
         [(
             header::CONTENT_TYPE,

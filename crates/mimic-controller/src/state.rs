@@ -68,6 +68,8 @@ pub struct Ctl {
     production: Mutex<BTreeSet<String>>,
     /// Formes de mock des snapshots déjà demandées (spec §5.6).
     mock_forms: MockForms,
+    /// Réplique active (spec §5.5.4) : seule à servir les sidecars et à toucher au support.
+    active: AtomicBool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -601,7 +603,36 @@ impl Ctl {
             exemplar_room,
             production: Mutex::new(BTreeSet::new()),
             mock_forms: MockForms::new(MAX_CACHE_BYTES),
+            active: AtomicBool::new(false),
         }
+    }
+
+    /// Vrai si cette réplique est active : elle sert les sidecars et l'interface.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
+        self.metrics.leader.set(i64::from(active));
+    }
+
+    /// Prise de relais (spec §5.5.4) : recharge ce qui sert les sidecars avant de les servir,
+    /// c'est-à-dire la liste des workloads, l'état souhaité de chacun, l'index de ses segments
+    /// et ses exemples. Les échanges restent relus à la première vue d'un workload.
+    pub async fn warm_up(&self) {
+        let keys = self.workload_keys().await;
+        for (ns, wl) in &keys {
+            let e = self.ready(ns, wl).await;
+            if let Err(err) = self.index_of(&e).await {
+                tracing::warn!(namespace = %ns, workload = %wl, error = %err, "index des segments");
+            }
+            if let Err(err) = self.exemplars_of(&e).await {
+                tracing::warn!(namespace = %ns, workload = %wl, error = %err, "relecture des exemples");
+            }
+        }
+        self.refresh_metrics().await;
+        tracing::info!(workloads = keys.len(), "état persisté rechargé");
     }
 
     /// Vrai si le namespace est labellisé `env=production`.
