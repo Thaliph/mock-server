@@ -728,6 +728,9 @@ async fn ctl_13_memory_is_bounded_globally_and_on_reload() {
     })
     .await
     .unwrap();
+    // Workloads déjà vus : leurs échanges sont en mémoire dès l'ingestion.
+    assert!(request_ids(&c, "checkout", "inbound").await.is_empty());
+    assert!(request_ids(&c, "web", "inbound").await.is_empty());
     for i in 1..=5 {
         let e = exchange(&format!("checkout-a-{i}"), "inbound", "/a", 200, false);
         push(&c, "checkout-a", &[e]).await;
@@ -748,16 +751,22 @@ async fn ctl_13_memory_is_bounded_globally_and_on_reload() {
     assert!(m.contains("mimic_controller_exchanges 6"), "{m}");
     c.shutdown().await;
 
-    // Au redémarrage, seuls les plus récents sont relus.
+    // Après le redémarrage, l'ingestion ne relit pas l'historique ; la première vue relit
+    // seulement les plus récents.
     let c = start(ControllerConfig {
         max_exchanges_per_workload: 2,
         ..config(dir.path())
     })
     .await
     .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let e = exchange("checkout-a-6", "inbound", "/a", 200, false);
+    push(&c, "checkout-a", &[e]).await;
+    let m = get_text(&c, "/metrics").await;
+    assert!(m.contains("mimic_controller_exchanges 0"), "{m}");
     assert_eq!(
         request_ids(&c, "checkout", "inbound").await,
-        ["checkout-a-5", "checkout-a-4"]
+        ["checkout-a-6", "checkout-a-5"]
     );
 }
 

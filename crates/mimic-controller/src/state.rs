@@ -12,7 +12,7 @@
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -359,6 +359,8 @@ pub struct Entry {
     index: Mutex<SegmentIndex>,
     /// Échanges relus du support au premier besoin.
     loaded: OnceCell<()>,
+    /// Vrai dès que la relecture a pris sa liste de segments, sous le verrou de l'index.
+    load_started: AtomicBool,
     data: Mutex<Data>,
     discovery: Mutex<DiscoveryCache>,
 }
@@ -496,6 +498,7 @@ impl Ctl {
                     indexed: OnceCell::new(),
                     index: Mutex::new(SegmentIndex::default()),
                     loaded: OnceCell::new(),
+                    load_started: AtomicBool::new(false),
                     data: Mutex::new(Data::new(self.config.samples_per_operation)),
                     discovery: Mutex::new(DiscoveryCache::default()),
                 })
@@ -625,7 +628,11 @@ impl Ctl {
             .loaded
             .get_or_try_init(|| async {
                 self.index_of(e).await?;
-                let keys = e.index().newest_first(self.oldest_ms());
+                let keys = {
+                    let index = e.index();
+                    e.load_started.store(true, Ordering::Relaxed);
+                    index.newest_first(self.oldest_ms())
+                };
                 let mut batch = vec![];
                 let mut size = 0;
                 for key in keys {
@@ -790,15 +797,22 @@ impl Ctl {
             }
             Err(err) => return Err(IngestError::Storage(format!("écriture de {path}: {err}"))),
         };
-        e.index().insert(key.clone(), now_ms() as i64, size);
-        // Les échanges relus d'abord : ceux du segment sont plus récents.
-        self.load(&e).await;
-        let (added, evicted) =
-            e.data()
-                .push_back(instance, parsed, self.config.max_exchanges_per_workload);
-        self.total.fetch_add(added, Ordering::Relaxed);
-        self.total.fetch_sub(evicted, Ordering::Relaxed);
-        self.enforce_budget();
+        // Relecture pas encore commencée : elle partira de l'index, qui contient désormais ce
+        // segment. Ingérer ne force donc pas la relecture de tout l'historique du workload.
+        // Commencée : ses segments, plus anciens, sont rangés devant ceux-ci.
+        let loading = {
+            let mut index = e.index();
+            index.insert(key.clone(), now_ms() as i64, size);
+            e.load_started.load(Ordering::Relaxed)
+        };
+        if loading {
+            let (added, evicted) =
+                e.data()
+                    .push_back(instance, parsed, self.config.max_exchanges_per_workload);
+            self.total.fetch_add(added, Ordering::Relaxed);
+            self.total.fetch_sub(evicted, Ordering::Relaxed);
+            self.enforce_budget();
+        }
         Ok(Ingested {
             key,
             duplicate: !written,
