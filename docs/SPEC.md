@@ -24,7 +24,7 @@ Mimic est un sidecar qui :
 |----|----------|
 | O1 | Surcoût de latence en mode `record` : p99 < 1 ms par requête (hors capture de body > 64 KiB). |
 | O2 | Empreinte : < 64 MiB RAM et < 100 m CPU au repos, < 250 m CPU à 1 000 req/s. |
-| O3 | En mode `mock`, **zéro** connexion sortante vers une destination enregistrée (vérifiable par NetworkPolicy deny-all egress). |
+| O3 | En mode `mock`, **zéro** connexion sortante vers une destination enregistrée (vérifiable par NetworkPolicy deny-all egress), hors connexions WebSocket, qui n'ont pas de réponse rejouable et sont relayées (§3.4). |
 | O4 | Le document OpenAPI généré passe un validateur OpenAPI 3.1 sans erreur. |
 | O5 | Fidélité du mock : code HTTP, headers (hors headers hop-by-hop) et body identiques à l'enregistrement ; latence rejouée à ±10 % de la distribution enregistrée. |
 | O6 | Basculer de mode sans redémarrer le pod. |
@@ -120,8 +120,18 @@ Seuls HTTP et HTTPS sont gérés (décision du 17/10, Q5). Le reste traverse Mim
 | HTTP/2 (h2c et h2 via ALPN) | record + mock |
 | HTTPS vers un hôte de `tls.intercept` | record + mock (§4.2) |
 | HTTPS vers un autre hôte | tunnel opaque en record, refusé en mock |
-| WebSocket / SSE | passthrough, métadonnées seulement (upgrade, durée) |
+| WebSocket (HTTP/1.1 `Upgrade: websocket`) | relayé dans tous les modes ; poignée de main enregistrée, jamais les trames (voir ci-dessous) |
+| SSE | réponse HTTP streamée, relayée sans être mise en mémoire (§5.2) |
 | TCP non HTTP | tunnel opaque, détecté par sniffing des premiers octets ; à exclure par port dans `mimic-init` si on veut le sortir du chemin |
+
+**WebSocket.** Une requête HTTP/1.1 avec `Upgrade: websocket` et le jeton `upgrade` dans `Connection` est relayée avec ces deux headers, en entrée comme en sortie et dans les quatre modes. Si l'amont répond `101 Switching Protocols`, le proxy renvoie ce `101` (headers `Sec-WebSocket-*` compris) à l'appelant, puis copie les octets dans les deux sens, sans les interpréter, jusqu'à ce que les deux côtés aient fermé. Toute autre réponse de l'amont (refus `400`, `401`, `426`…) est relayée comme une réponse HTTP ordinaire.
+
+- **Enregistrement** (record, mock, mock-partial ; jamais en passthrough) : un échange par connexion, écrit à la fermeture : méthode, chemin, query, code `101`, headers de requête et de réponse redactés (§7), bodies vides, `ttfb` = durée de la poignée de main, `total` = durée de la connexion. Les trames ne sont ni lues ni enregistrées.
+- **Mock** : faute de trames enregistrées, aucune connexion WebSocket n'a de réponse rejouable ; en `mock` comme en `mock-partial`, et quel que soit `mock.unmatched`, la poignée de main est relayée vers l'amont (§5.3). C'est la seule exception à « jamais relayé » du mode `mock` (O3). Un échange `101` enregistré n'est jamais rejoué, ni pour une poignée de main, ni pour une requête ordinaire sur le même chemin.
+- **Comptage** : chaque `101` relayé incrémente `mimic_websocket_connections_total{direction}` (§9.3), en plus de `mimic_requests_total` avec `status="101"`.
+- WebSocket sur HTTP/2 (`CONNECT` étendu, RFC 8441) : hors périmètre v1.
+
+Les headers propres à la connexion (`Connection`, `Keep-Alive`, `Proxy-Authorization`, `Proxy-Connection`, `Transfer-Encoding`, `Upgrade` hors WebSocket, et ceux que `Connection` nomme, RFC 9110 §7.6.1) ne sont jamais relayés.
 
 Le relais garde la version de la requête reçue : une requête HTTP/2 part en HTTP/2 vers l'amont (h2c en connaissance préalable, h2 via ALPN en HTTPS), trailers compris, car un serveur gRPC refuse HTTP/1.1 ; une requête HTTP/1.x part en HTTP/1.1.
 
@@ -157,7 +167,7 @@ C'est le cas central du mode `mock` (appels HTTPS vers des SaaS).
 |------|---------|---------|-------|
 | `passthrough` | relayé, métriques seulement | relayé, métriques seulement | désactivation à chaud |
 | `record` | relayé + enregistré | relayé + enregistré | découverte |
-| `mock` | relayé + enregistré | **servi depuis le store**, jamais relayé | tir de perf isolé |
+| `mock` | relayé + enregistré | **servi depuis le store**, jamais relayé (sauf WebSocket, §3.4) | tir de perf isolé |
 | `mock-partial` | relayé + enregistré | servi si correspondance, sinon relayé + enregistré | enrichir progressivement le store |
 
 Le mode `mock` ne touche jamais le trafic entrant : le tir de perf frappe la vraie application, ce sont ses dépendances qui sont simulées.
@@ -262,6 +272,8 @@ Le tirage aléatoire (latence, `weighted-status`) utilise un générateur à gra
 - **Données locales qui changent** : sans snapshot, le store évolue encore pendant le mock (imports des pairs, requêtes relayées puis enregistrées en `mock-partial`). Le moteur courant continue de servir, et un moteur à jour est reconstruit en tâche de fond, au plus une fois par seconde. Une requête sans correspondance dans un moteur construit avant son arrivée attend, avant de conclure, un moteur qui connaît tous les enregistrements présents à son arrivée ; les requêtes qui attendent ensemble partagent la même construction. En `mock-partial`, une requête relayée puis enregistrée est donc servie par le mock dès la suivante.
 - **Réponse préparée** : headers convertis et body réencodé dans son `Content-Encoding` d'origine (`gzip`, `deflate`, `br`, `zstd`) une seule fois par enregistrement, au premier rejeu, puis servis tels quels.
 - **Constructions comptées** : `mimic_mock_engine_builds_total{trigger}`, avec `switch` (bascule de mode ou de snapshot), `refresh` (reconstruction en tâche de fond) et `unmatched` (requête sans correspondance sur un moteur périmé).
+
+**WebSocket** : une poignée de main WebSocket n'est jamais servie depuis le store, puisque les trames ne sont pas enregistrées (§3.4). En `mock` comme en `mock-partial`, elle est relayée vers l'amont et enregistrée, quel que soit `mock.unmatched`, sans passer par le moteur (ni `mimic_mock_responses_total`, ni latence injectée). Le moteur ignore les échanges de code `1xx` : ils ne sont ni rejoués ni comptés dans la distribution de latence, dont la durée d'une connexion WebSocket fausserait le tirage.
 
 **Requête sans correspondance**, comportement configurable :
 
@@ -632,6 +644,7 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 | `mimic_mode` | jauge (1 pour le mode courant) | `mode` | tous |
 | `mimic_passthrough_connections_total` | compteur | `direction`, `kind` (`tls`, `tcp`), `result` (`relayed`, `refused`, `error`) | tous |
 | `mimic_tls_handshake_failures_total` | compteur | `authority`, `reason` | tous |
+| `mimic_websocket_connections_total` | compteur (connexions WebSocket établies : `101` de l'amont relayé, §3.4) | `direction` | tous |
 | `mimic_mock_snapshot_exchanges` | jauge (0 sans snapshot) | | mock |
 | `mimic_mock_engine_builds_total` | compteur | `trigger` (`switch`, `refresh`, `unmatched`, §5.3) | mock |
 
@@ -807,6 +820,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-16 | store de 2 000 échanges sortants, mode record | bascule en mock, puis 200 requêtes mockées concurrentes | moteur construit une fois, à la bascule : `mimic_mock_engine_builds_total{trigger="switch"}` vaut 1 avant la première requête et aucune requête n'en construit |
 | MCK-17 | moteur en service, puis nouvel échange sortant dans le store (import d'un pair) ; mode `mock-partial` | requêtes avec correspondance ; requête sur le nouvel échange ; requête relayée puis la même | les premières servies par le moteur courant, sans construction ; la deuxième servie depuis le nouvel échange, pas `599` ; la troisième mockée dès la seconde fois |
 | MCK-18 | enregistrement dont la réponse est en `gzip` | rejeux successifs | le body est encodé une seule fois : les mêmes octets, sans nouvel encodage, à chaque rejeu |
+| MCK-19 | poignée de main WebSocket enregistrée (`101`, body vide, durée de connexion de 60 s) et un `200` de 10 ms sur le même chemin | construction du moteur, requête sur ce chemin | le `101` n'est ni compté ni rejouable : le `200` est servi, avec une latence de 10 ms ; seul, le `101` donne une absence de correspondance |
 
 **Snapshots (SNP)**
 
@@ -935,6 +949,9 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | PRX-07 | hôte hors `tls.intercept` | requête HTTPS | tunnel opaque, seuls SNI et durée enregistrés |
 | PRX-10 | `accept` en échec répété (EMFILE) | boucle d'écoute | 50 ms au moins entre deux tentatives, au plus une ligne de log par seconde ; l'écoute reprend dès que l'erreur cesse |
 | PRX-11 | amont injoignable | rafale de 200 requêtes | 200 réponses `502` et `mimic_upstream_errors_total` à 200, mais au plus une ligne de log par seconde, la suivante indiquant le nombre de lignes omises |
+| PRX-12 | serveur WebSocket d'écho derrière le sidecar, en entrée et en sortie ; modes `passthrough`, `record`, `mock` et `mock-partial` | client WebSocket : messages texte et binaires, puis fermeture | `101` relayé, chaque message renvoyé à l'identique, fermeture propre des deux côtés ; `mimic_websocket_connections_total{direction}` compte chaque connexion |
+| PRX-13 | mode `record`, connexion WebSocket avec `Authorization: Bearer <secret>` et messages échangés | fermeture, puis lecture du store | un échange par connexion et par sens : `GET`, chemin, `101`, headers redactés (le secret n'apparaît pas), bodies vides (aucune trame), durée ≥ celle de la connexion ; rien n'est enregistré en `passthrough` |
+| PRX-14 | mode `mock` avec `unmatched: error` et store vide, puis `mock-partial` ; amont WebSocket joignable | poignée de main WebSocket sortante ; puis requête ordinaire `GET` sur le même chemin en `mock` | la connexion est relayée vers l'amont et fonctionne, sans `x-mimic-unmatched` ; la requête ordinaire n'est pas servie par le `101` enregistré (`599`) |
 
 **Injection (INJ)**
 
@@ -1028,7 +1045,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P3b | Partage entre sidecars d'un workload | SHR-* |
 | P3c | Sidecar borné : réservoir par opération, budget mémoire, journal local segmenté, file de partage bornée, logs limités | CAP-*, SHR-06, SHR-07, PRX-10, PRX-11 |
 | P3d | Mock fidèle et concurrent : moteur indexé par forme de chemin et sans verrou, construit à la bascule, latence comptée depuis l'arrivée avec un minuteur précis, réponse préparée une fois, redaction sans réécriture des bodies intacts | MCK-13 à 18, RED-05 |
-| P3e | Correctifs fonctionnels : énumérations inférées seulement sur un échantillon suffisant | INF-09 |
+| P3e | Correctifs fonctionnels : relais WebSocket dans tous les modes, poignée de main enregistrée, jamais rejouée ; énumérations inférées seulement sur un échantillon suffisant | PRX-12 à 14, MCK-19, INF-09 |
 | P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |

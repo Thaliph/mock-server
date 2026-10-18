@@ -89,6 +89,11 @@ pub struct TriggerLabel {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DirectionLabel {
+    pub direction: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ModeLabel {
     pub mode: String,
 }
@@ -118,6 +123,7 @@ pub struct Metrics {
     pub mode: Family<ModeLabel, Gauge>,
     pub passthrough: Family<PassthroughLabels, Counter>,
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
+    pub websocket_connections: Family<DirectionLabel, Counter>,
     authorities: Mutex<BTreeSet<String>>,
 }
 
@@ -142,6 +148,7 @@ impl Metrics {
         let mode = Family::default();
         let passthrough = Family::default();
         let tls_handshake_failures = Family::default();
+        let websocket_connections = Family::default();
         registry.register(
             "mimic_requests",
             "Requêtes traitées par le sidecar",
@@ -218,6 +225,11 @@ impl Metrics {
             "Poignées de main TLS interceptées refusées (CA non approuvée, épinglage)",
             tls_handshake_failures.clone(),
         );
+        registry.register(
+            "mimic_websocket_connections",
+            "Connexions WebSocket établies (101 de l'amont relayé)",
+            websocket_connections.clone(),
+        );
         Self {
             registry,
             requests,
@@ -236,6 +248,7 @@ impl Metrics {
             mode,
             passthrough,
             tls_handshake_failures,
+            websocket_connections,
             authorities: Mutex::new(BTreeSet::new()),
         }
     }

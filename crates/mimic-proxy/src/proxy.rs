@@ -9,6 +9,7 @@ use http::header::{HeaderMap, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty, Full, Limited};
 use hyper::body::Incoming;
+use hyper::upgrade::OnUpgrade;
 use mimic_core::mock::{MockDecision, MockRequest, MockResponse};
 use mimic_core::model::{Body, Direction, Exchange, Header};
 use tokio::sync::oneshot;
@@ -17,7 +18,8 @@ use crate::capture::{Captured, TeeBody};
 use crate::config::{Mode, Unmatched};
 use crate::engine::{MockSet, Trigger};
 use crate::metrics::{
-    AuthorityLabel, DurationLabels, MockLabels, ReasonLabel, RequestLabels, UpstreamErrorLabels,
+    AuthorityLabel, DirectionLabel, DurationLabels, MockLabels, ReasonLabel, RequestLabels,
+    UpstreamErrorLabels,
 };
 use crate::state::{AppState, BoxError, ProxyBody};
 use crate::store::{Added, Origin};
@@ -140,7 +142,22 @@ pub async fn outbound(
         );
     };
     let (parts, body) = req.into_parts();
-    match state.mode() {
+    let mode = state.mode();
+    // Les trames ne sont pas enregistrées, il n'y a donc rien à rejouer : une poignée de main
+    // WebSocket est relayée dans tous les modes, et enregistrée hors passthrough (spec §3.4).
+    if is_websocket_upgrade(&parts) {
+        let record = mode != Mode::Passthrough;
+        return forward(
+            state,
+            Direction::Outbound,
+            parts,
+            boxed(body),
+            record,
+            target,
+        )
+        .await;
+    }
+    match mode {
         Mode::Passthrough => {
             forward(
                 state,
@@ -193,7 +210,15 @@ async fn forward(
         Err(_) => return text(StatusCode::BAD_REQUEST, "mimic: URI invalide"),
     };
     let original_uri = std::mem::replace(&mut parts.uri, uri);
-    strip_hop_by_hop(&mut parts.headers);
+    // Côté appelant, la connexion qui basculera en WebSocket après le 101 ; sans elle (aucune
+    // bascule possible), la requête est relayée comme une requête ordinaire.
+    let client_upgrade = if is_websocket_upgrade(&parts) {
+        parts.extensions.remove::<OnUpgrade>()
+    } else {
+        None
+    };
+    let websocket = client_upgrade.is_some();
+    strip_hop_by_hop(&mut parts.headers, websocket);
     // Même version vers l'amont qu'en entrée : un serveur gRPC (h2c) refuse HTTP/1.1.
     let h2 = parts.version == http::Version::HTTP_2;
     if h2 {
@@ -255,32 +280,152 @@ async fn forward(
     };
     let ttfb = started.elapsed();
     let (mut resp_parts, resp_body) = response.into_parts();
-    strip_hop_by_hop(&mut resp_parts.headers);
+    let switched = websocket && resp_parts.status == StatusCode::SWITCHING_PROTOCOLS;
+    strip_hop_by_hop(&mut resp_parts.headers, switched);
     let status = resp_parts.status.as_u16();
     count_request(&state, direction, mode, &authority_label, &method, status);
 
-    let Some(req_capture) = req_capture else {
+    if switched || req_capture.is_none() {
         observe_duration(&state, direction, mode, &authority_label, ttfb);
+    }
+    let pending = req_capture.map(|rx| {
+        let pending = Pending {
+            direction,
+            mode,
+            started,
+            started_ms,
+            ttfb,
+            scheme: target.scheme,
+            authority: target.authority,
+            authority_label,
+            method,
+            uri: original_uri,
+            req_headers,
+            status,
+            resp_headers: to_headers(&resp_parts.headers),
+        };
+        (pending, rx)
+    });
+    if switched {
+        state
+            .metrics
+            .websocket_connections
+            .get_or_create(&DirectionLabel {
+                direction: dir_str(direction).into(),
+            })
+            .inc();
+        let upstream_upgrade = resp_parts.extensions.remove::<OnUpgrade>();
+        // Seule la poignée de main est enregistrée : le body de requête (vide) n'est pas attendu.
+        let pending = pending.map(|(p, _)| p);
+        tokio::spawn(relay_websocket(
+            state,
+            client_upgrade,
+            upstream_upgrade,
+            pending,
+        ));
+        return Response::from_parts(resp_parts, boxed(Empty::<Bytes>::new()));
+    }
+    let Some((pending, req_capture)) = pending else {
         return Response::from_parts(resp_parts, boxed(resp_body));
     };
     let (tee, resp_capture) = TeeBody::new(resp_body, limit);
-    let pending = Pending {
-        direction,
-        mode,
-        started,
-        started_ms,
-        ttfb,
-        scheme: target.scheme,
-        authority: target.authority,
-        authority_label,
-        method,
-        uri: original_uri,
-        req_headers,
-        status,
-        resp_headers: to_headers(&resp_parts.headers),
-    };
     tokio::spawn(finalize(state, pending, req_capture, resp_capture));
     Response::from_parts(resp_parts, boxed(tee))
+}
+
+/// Poignée de main WebSocket en HTTP/1.1 : `Upgrade: websocket` et le jeton `upgrade` dans
+/// `Connection` (spec §3.4).
+fn is_websocket_upgrade(parts: &http::request::Parts) -> bool {
+    parts.version == http::Version::HTTP_11
+        && parts
+            .headers
+            .get(http::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(',')
+                    .any(|p| p.trim().eq_ignore_ascii_case("websocket"))
+            })
+        && connection_tokens(&parts.headers).any(|t| t == "upgrade")
+}
+
+/// Jetons du header `Connection`, en minuscules.
+fn connection_tokens(headers: &HeaderMap) -> impl Iterator<Item = String> + '_ {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+}
+
+/// Copie les octets entre l'appelant et l'amont, sans interpréter les trames, jusqu'à ce que
+/// les deux côtés aient fermé ; puis enregistre la poignée de main (spec §3.4).
+async fn relay_websocket(
+    state: Arc<AppState>,
+    client: Option<OnUpgrade>,
+    upstream: Option<OnUpgrade>,
+    pending: Option<Pending>,
+) {
+    let (Some(client), Some(upstream)) = (client, upstream) else {
+        tracing::debug!("bascule WebSocket impossible : connexion non basculable");
+        return;
+    };
+    match tokio::join!(client, upstream) {
+        (Ok(client), Ok(upstream)) => {
+            let mut client = hyper_util::rt::TokioIo::new(client);
+            let mut upstream = hyper_util::rt::TokioIo::new(upstream);
+            if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                tracing::debug!(error = %e, "relais WebSocket interrompu");
+            }
+        }
+        (client, upstream) => {
+            tracing::debug!(
+                client = ?client.err(),
+                upstream = ?upstream.err(),
+                "bascule WebSocket échouée"
+            );
+        }
+    }
+    if let Some(p) = pending {
+        record_websocket(&state, p, Instant::now());
+    }
+}
+
+/// Échange d'une connexion WebSocket : la poignée de main, sans body ni trame ; `total` est la
+/// durée de la connexion.
+fn record_websocket(state: &AppState, p: Pending, ended: Instant) {
+    let total = ended.saturating_duration_since(p.started);
+    let mut exchange = Exchange {
+        id: format!("{}-{}", state.config.instance, ulid::Ulid::generate()),
+        direction: p.direction,
+        started_at_ms: p.started_ms,
+        scheme: p.scheme,
+        authority: p.authority,
+        method: p.method,
+        path: p.uri.path().to_string(),
+        query: parse_query(p.uri.query()),
+        trace_id: trace_id(&p.req_headers),
+        req_headers: p.req_headers,
+        req_body: Body::Empty,
+        status: p.status,
+        resp_headers: p.resp_headers,
+        resp_body: Body::Empty,
+        ttfb_us: p.ttfb.as_micros() as u64,
+        total_us: total.as_micros() as u64,
+        redactions: vec![],
+    };
+    // Headers redactés avant d'entrer dans le store, comme pour tout échange (RED-04).
+    state.redactor.redact(&mut exchange);
+    state.store.add(exchange, Origin::Local);
+    state.refresh_store_metrics();
+}
+
+/// Identifiant de trace W3C tiré de `traceparent`.
+fn trace_id(headers: &[Header]) -> Option<String> {
+    find(headers, "traceparent")
+        .and_then(|t| t.split('-').nth(1))
+        .map(String::from)
 }
 
 /// Ce qui est connu d'un échange avant la fin des bodies.
@@ -347,9 +492,7 @@ async fn finalize(
         method: p.method,
         path,
         query: parse_query(p.uri.query()),
-        trace_id: find(&p.req_headers, "traceparent")
-            .and_then(|t| t.split('-').nth(1))
-            .map(String::from),
+        trace_id: trace_id(&p.req_headers),
         req_headers: p.req_headers,
         req_body,
         status: p.status,
@@ -671,9 +814,23 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn strip_hop_by_hop(headers: &mut HeaderMap) {
+/// Retire les headers propres à la connexion, et ceux que `Connection` nomme (RFC 9110
+/// §7.6.1). Pour une poignée de main WebSocket, `Upgrade` et `Connection: upgrade` restent.
+fn strip_hop_by_hop(headers: &mut HeaderMap, websocket: bool) {
+    let named: Vec<String> = connection_tokens(headers).collect();
+    let upgrade = headers.get(http::header::UPGRADE).cloned();
     for name in HOP_BY_HOP {
         headers.remove(*name);
+    }
+    for name in &named {
+        headers.remove(name.as_str());
+    }
+    if websocket && let Some(upgrade) = upgrade {
+        headers.insert(http::header::UPGRADE, upgrade);
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
     }
 }
 
@@ -777,6 +934,24 @@ mod tests {
         );
         assert_eq!(normalize_authority("[::1]:81", "http"), "[::1]:81");
         assert_eq!(normalize_authority("[::1]", "http"), "[::1]:80");
+    }
+
+    #[test]
+    fn hop_by_hop_includes_headers_named_by_connection() {
+        let mut h = HeaderMap::new();
+        h.insert("connection", HeaderValue::from_static("Upgrade, X-Hop"));
+        h.insert("upgrade", HeaderValue::from_static("websocket"));
+        h.insert("x-hop", HeaderValue::from_static("1"));
+        h.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        h.insert("x-end", HeaderValue::from_static("2"));
+        let mut plain = h.clone();
+        strip_hop_by_hop(&mut plain, false);
+        let names: Vec<_> = plain.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, vec!["x-end"]);
+        strip_hop_by_hop(&mut h, true);
+        assert_eq!(h["upgrade"], "websocket");
+        assert_eq!(h["connection"], "upgrade");
+        assert!(!h.contains_key("x-hop") && !h.contains_key("keep-alive"));
     }
 
     #[test]

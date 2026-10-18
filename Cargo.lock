@@ -1968,6 +1968,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "ulid",
