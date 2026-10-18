@@ -348,9 +348,9 @@ fn controller_pod_of(name: &str, phase: &str, leader: bool) -> k8s_openapi::api:
     .unwrap()
 }
 
-/// L'interface est lue sur la réplique active du contrôleur (CLI-08, spec §5.5.4, §9.5).
+/// L'interface est lue sur la réplique active du contrôleur (CLI-09, spec §5.5.4, §9.5).
 #[test]
-fn cli_08_ui_is_read_on_the_active_replica() {
+fn cli_09_ui_is_read_on_the_active_replica() {
     use mimicctl::controller_pod;
     let passive = controller_pod_of("ctl-p", "Running", false);
     let active = controller_pod_of("ctl-a", "Running", true);
