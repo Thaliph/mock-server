@@ -21,6 +21,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P6 | Contrôleur, CRD `MimicWorkload`, snapshots, authentification, rejeu k6 | fait (non validé sur un vrai cluster) |
 | P7 | Webhook d'injection `mimic-injector` et CLI `mimicctl` | fait, validé sur kind avec la démo OpenTelemetry |
 | P6d | Parcours SRE : garde-fou production, `capture.inbound`, `selector`, label `version` des métriques | fait (étape kind E2E-04 ajoutée, non jouée en local) |
+| P6e | Mock centralisé : plus d'import entre sidecars sous contrôleur, un exemple rejouable par endpoint gardé hors rétention, historique de 24 heures par défaut | fait |
 
 ## Lancer le sidecar en local
 

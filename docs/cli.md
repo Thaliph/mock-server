@@ -174,5 +174,7 @@ kubectl port-forward -n mimic-system deploy/mimic-controller 8081
 (opérations, paramètres et leur caractère requis, codes, latences), liens vers les documents
 OpenAPI, snapshots, dernières requêtes et exports pour le rejeu (k6, JSONL, JSON).
 
-Chaque sidecar a aussi sa page d'admin, limitée à ce que ce pod a vu :
+Chaque sidecar a aussi sa page d'admin, limitée à ce que ce pod a vu (sous contrôleur, aucun
+sidecar n'importe le trafic des autres pods ; le workload entier est dans l'interface du
+contrôleur) :
 `kubectl port-forward -n shop pod/<pod> 15000` puis `http://127.0.0.1:15000/`.

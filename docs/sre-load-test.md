@@ -24,7 +24,10 @@ Ce que fait mimic pendant le tir :
 
 - Le workload tourne avec mimic injecté (`deploy/README.md`) dans un namespace hors
   production, ici `perf`, en `record` depuis assez longtemps pour avoir vu les appels de ses
-  dépendances (`mimicctl report checkout -n perf` les liste).
+  dépendances (`mimicctl report checkout -n perf` les liste). Le contrôleur ne garde que
+  24 heures d'historique, mais aussi un exemple de chaque endpoint au-delà (spec §5.5.3) : un
+  appel vu une seule fois, même il y a plusieurs jours, est encore rejoué en mock et figure
+  dans `mimicctl requests`.
 - Les métriques des sidecars sont collectées (`deploy/example/vmpodscrape.yaml`), avec les
   labels `namespace` et `pod` posés par le scraper, ainsi que celles du kubelet (cAdvisor :
   `container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`).
