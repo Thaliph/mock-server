@@ -4,9 +4,7 @@
 mod common;
 
 use common::{ExchangeExt, exchange};
-use mimic_core::exemplar::{
-    ExemplarOffer, Exemplars, endpoint_key, is_exemplar, serialized_len,
-};
+use mimic_core::exemplar::{ExemplarOffer, Exemplars, endpoint_key, is_exemplar, serialized_len};
 use mimic_core::model::{Body, Direction, Exchange};
 use mimic_core::snapshot::{SnapshotOptions, build};
 use proptest::prelude::*;

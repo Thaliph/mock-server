@@ -8,12 +8,17 @@
 //!   le résultat ne dépend donc pas de l'ordre d'arrivée.
 //! - Les échanges proposés sont déjà redactés (segments publiés par les sidecars) : rien n'est
 //!   ajouté, un exemple est une copie conforme.
+//! - Borne en octets : la taille sérialisée des exemples reste sous `max_bytes`, et sous la
+//!   place que laisse la borne globale (`room`). Un nouvel endpoint qui ne tient pas garde un
+//!   exemple sans body (toujours gardé, son poids est celui des métadonnées) ; un remplacement
+//!   qui ne tient pas n'a pas lieu.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::sync::Arc;
 
-use crate::compact::body_key;
+use crate::compact::{body_key, strip_bodies};
 use crate::model::{Direction, Exchange};
 
 /// Borne par défaut du nombre d'endpoints gardés avec un exemple, par workload.
@@ -28,8 +33,33 @@ pub enum ExemplarOffer {
     Replaced,
     /// Pas rejouable, ou pas plus récent que l'exemple en place.
     Ignored,
-    /// Nouvel endpoint au-delà de la borne : pas d'exemple.
+    /// Nouvel endpoint au-delà de la borne en nombre : pas d'exemple.
     Refused,
+    /// Nouvel endpoint au-delà d'une borne en octets : exemple gardé sans body, visible mais
+    /// pas rejouable.
+    AddedWithoutBody,
+    /// Plus récent que l'exemple en place, mais au-delà d'une borne en octets : l'ancien reste.
+    KeptOlder,
+}
+
+/// Taille sérialisée d'un échange : sa ligne dans `exemplars.jsonl`, saut de ligne compris.
+pub fn serialized_len(e: &Exchange) -> u64 {
+    /// Compte les octets écrits sans les garder.
+    struct Counter(u64);
+    impl Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Counter(0);
+    match serde_json::to_writer(&mut c, e) {
+        Ok(()) => c.0 + 1,
+        Err(_) => 0,
+    }
 }
 
 /// Endpoint d'un échange : (sens, authority, méthode, forme du chemin, code).
@@ -61,54 +91,154 @@ fn recency(a: &Exchange, b: &Exchange) -> Ordering {
         })
 }
 
+/// Exemple gardé, avec sa taille sérialisée.
+#[derive(Debug, Clone)]
+struct Kept {
+    e: Arc<Exchange>,
+    size: u64,
+    /// Faux pour un exemple gardé sans body (borne en octets).
+    full: bool,
+}
+
 /// Exemples d'un workload, un par endpoint, dans l'ordre des endpoints.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Exemplars {
     max: usize,
-    by_key: BTreeMap<String, Arc<Exchange>>,
+    max_bytes: u64,
+    by_key: BTreeMap<String, Kept>,
+    /// Taille sérialisée des exemples gardés, ceux sans body compris.
+    bytes: u64,
     /// Échanges refusés faute de place (borne `max`).
     refused: u64,
+    /// Exemples gardés sans body et remplacements refusés (bornes en octets).
+    refused_bytes: u64,
     /// Change à chaque ajout ou remplacement.
     version: u64,
 }
 
+impl Default for Exemplars {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_ENDPOINTS)
+    }
+}
+
 impl Exemplars {
-    /// Exemples d'au plus `max_endpoints` endpoints.
+    /// Exemples d'au plus `max_endpoints` endpoints, sans borne en octets.
     pub fn new(max_endpoints: usize) -> Self {
+        Self::with_limits(max_endpoints, u64::MAX)
+    }
+
+    /// Exemples d'au plus `max_endpoints` endpoints et `max_bytes` octets sérialisés.
+    pub fn with_limits(max_endpoints: usize, max_bytes: u64) -> Self {
         Self {
             max: max_endpoints,
-            ..Self::default()
+            max_bytes,
+            by_key: BTreeMap::new(),
+            bytes: 0,
+            refused: 0,
+            refused_bytes: 0,
+            version: 0,
         }
     }
 
     /// Propose un échange ; il n'est copié que s'il devient l'exemple de son endpoint.
     pub fn offer(&mut self, e: &Exchange) -> ExemplarOffer {
-        self.offer_with(e, || Arc::new(e.clone()))
+        self.offer_within(e, u64::MAX)
+    }
+
+    /// Comme `offer`, avec au plus `room` octets de plus (place laissée par la borne globale).
+    pub fn offer_within(&mut self, e: &Exchange, room: u64) -> ExemplarOffer {
+        self.offer_with(e, room, false, || Arc::new(e.clone()))
     }
 
     /// Comme `offer`, sans copie : l'échange partagé devient l'exemple tel quel.
     pub fn offer_shared(&mut self, e: Arc<Exchange>) -> ExemplarOffer {
-        let shared = e.clone();
-        self.offer_with(&e, move || shared)
+        self.offer_shared_within(e, u64::MAX)
     }
 
-    fn offer_with(&mut self, e: &Exchange, keep: impl FnOnce() -> Arc<Exchange>) -> ExemplarOffer {
-        if !is_exemplar(e) {
+    /// Comme `offer_within`, sans copie.
+    pub fn offer_shared_within(&mut self, e: Arc<Exchange>, room: u64) -> ExemplarOffer {
+        let shared = e.clone();
+        self.offer_with(&e, room, false, move || shared)
+    }
+
+    /// Reprend un exemple relu de `exemplars.jsonl` : comme `offer_shared_within`, mais un
+    /// exemple déjà gardé sans body est repris tel quel, sans être compté une seconde fois.
+    pub fn restore_within(&mut self, e: Arc<Exchange>, room: u64) -> ExemplarOffer {
+        let shared = e.clone();
+        self.offer_with(&e, room, true, move || shared)
+    }
+
+    fn offer_with(
+        &mut self,
+        e: &Exchange,
+        room: u64,
+        restore: bool,
+        keep: impl FnOnce() -> Arc<Exchange>,
+    ) -> ExemplarOffer {
+        let full = is_exemplar(e);
+        // Un exemple sans body n'est repris que du support, où il a déjà été compté.
+        if !full && !(restore && e.status >= 200) {
             return ExemplarOffer::Ignored;
         }
         let key = endpoint_key(e);
-        let offer = match self.by_key.get(&key) {
-            Some(current) if recency(e, current) != Ordering::Greater => {
+        let room = room.min(self.max_bytes.saturating_sub(self.bytes));
+        if let Some(current) = self.by_key.get(&key) {
+            // Le même échange, avec son body, peut remplacer sa version sans body.
+            let same = (e.started_at_ms, &e.id) == (current.e.started_at_ms, &current.e.id);
+            let upgrade = same && full && !current.full;
+            if !upgrade && recency(e, &current.e) != Ordering::Greater {
                 return ExemplarOffer::Ignored;
             }
-            Some(_) => ExemplarOffer::Replaced,
-            None if self.by_key.len() >= self.max => {
-                self.refused += 1;
-                return ExemplarOffer::Refused;
+            let size = serialized_len(e);
+            if full && size.saturating_sub(current.size) > room {
+                if upgrade {
+                    return ExemplarOffer::Ignored;
+                }
+                self.refused_bytes += 1;
+                return ExemplarOffer::KeptOlder;
             }
-            None => ExemplarOffer::Added,
+            self.bytes = self.bytes - current.size + size;
+            self.by_key.insert(
+                key,
+                Kept {
+                    e: keep(),
+                    size,
+                    full,
+                },
+            );
+            self.version += 1;
+            return ExemplarOffer::Replaced;
+        }
+        if self.by_key.len() >= self.max {
+            self.refused += 1;
+            return ExemplarOffer::Refused;
+        }
+        let size = serialized_len(e);
+        let kept = if !full || size <= room {
+            Kept {
+                e: keep(),
+                size,
+                full,
+            }
+        } else {
+            // Ne tient pas : gardé sans body, pour la découverte et la latence.
+            let mut bare = e.clone();
+            strip_bodies(&mut bare);
+            self.refused_bytes += 1;
+            Kept {
+                size: serialized_len(&bare),
+                full: false,
+                e: Arc::new(bare),
+            }
         };
-        self.by_key.insert(key, keep());
+        let offer = if kept.full {
+            ExemplarOffer::Added
+        } else {
+            ExemplarOffer::AddedWithoutBody
+        };
+        self.bytes += kept.size;
+        self.by_key.insert(key, kept);
         self.version += 1;
         offer
     }
@@ -126,6 +256,16 @@ impl Exemplars {
         self.refused
     }
 
+    /// Taille sérialisée des exemples gardés, ceux sans body compris.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Exemples gardés sans body et remplacements refusés (bornes en octets) depuis la création.
+    pub fn refused_bytes(&self) -> u64 {
+        self.refused_bytes
+    }
+
     /// Change à chaque ajout ou remplacement d'un exemple : sert à n'écrire que ce qui a changé.
     pub fn version(&self) -> u64 {
         self.version
@@ -133,12 +273,12 @@ impl Exemplars {
 
     /// Exemples, dans l'ordre des endpoints.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<Exchange>> {
-        self.by_key.values()
+        self.by_key.values().map(|k| &k.e)
     }
 
     /// Forme persistée : un exemple par ligne, dans l'ordre des endpoints.
     pub fn to_jsonl(&self) -> Vec<u8> {
-        jsonl(self.by_key.values())
+        jsonl(self.iter())
     }
 
     /// Relit des lignes JSONL ; une ligne illisible est ignorée.
