@@ -23,7 +23,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use mimic_core::compact::{BodySamples, Compactor, hour_of, hour_start};
-use mimic_core::exemplar::{Exemplars, best_per_endpoint, jsonl};
+use mimic_core::exemplar::{Exemplars, best_per_endpoint, is_exemplar, jsonl};
 use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::model::{Direction, Exchange};
 use mimic_core::snapshot::{Snapshot, SnapshotOptions, build};
@@ -251,7 +251,12 @@ impl Data {
     }
 
     /// Reprend les exemples relus de `exemplars.jsonl`, ceux sans body compris.
-    fn restore(&mut self, list: Vec<Arc<Exchange>>, room: &Room) -> Refused {
+    ///
+    /// Les exemples complets d'abord : leur taille tenait déjà sous la borne. Un exemple sans
+    /// body, toujours gardé et qui la dépasse souvent, ne doit pas leur prendre la place à cause
+    /// de l'ordre des endpoints dans le fichier.
+    fn restore(&mut self, mut list: Vec<Arc<Exchange>>, room: &Room) -> Refused {
+        list.sort_by_key(|e| !is_exemplar(e));
         self.propose(list, room, true)
     }
 
