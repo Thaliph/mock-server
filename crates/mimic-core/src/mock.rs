@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::model::{Body, Direction, Exchange, Header, is_json, media_type};
 use crate::sample::push_path_shape;
+use crate::snapshot::{MockSnapshot, PathLatencies};
 
 /// Headers à ne jamais rejouer : propres à une connexion, ou recalculés par le proxy.
 const HOP_BY_HOP: &[&str] = &[
@@ -238,7 +239,7 @@ impl Recorded {
 /// Clé d'une opération : authority, méthode en majuscules et forme du chemin (§5.2), séparées
 /// par `\u{1}` (absent d'une authority, d'une méthode et d'une forme). Deux chemins sont égaux
 /// ou de même template si et seulement s'ils ont la même forme.
-fn op_key(authority: &str, method: &str, path: &str) -> String {
+pub(crate) fn op_key(authority: &str, method: &str, path: &str) -> String {
     let mut key = String::with_capacity(authority.len() + method.len() + path.len() + 8);
     key.push_str(authority);
     key.push('\u{1}');
@@ -246,6 +247,14 @@ fn op_key(authority: &str, method: &str, path: &str) -> String {
     key.push('\u{1}');
     push_path_shape(&mut key, path);
     key
+}
+
+/// Trie des enregistrements par date, puis identifiant.
+fn sort_chronologically<R: Recording>(items: &mut [R]) {
+    items.sort_by(|a, b| {
+        let (a, b) = (a.exchange(), b.exchange());
+        (a.started_at_ms, &a.id).cmp(&(b.started_at_ms, &b.id))
+    });
 }
 
 /// Enregistrements d'une opération.
@@ -295,23 +304,80 @@ impl MockEngine {
                 }
             }
         }
+        let ops = by_op.into_iter().map(|(key, mut items)| {
+            sort_chronologically(&mut items);
+            let latencies = items.iter().map(|r| r.exchange().total_us).collect();
+            let replayable = items
+                .into_iter()
+                .filter(|r| r.exchange().resp_body.is_replayable())
+                .map(Recording::into_shared)
+                .collect();
+            (key, latencies, replayable)
+        });
+        Self::assemble(ops, len, config)
+    }
+
+    /// Construit le moteur sur la forme de mock d'un snapshot (spec §5.6) : le même moteur
+    /// que sur le snapshot complet. Les durées viennent des opérations de la forme ; les
+    /// enregistrements sont ses échanges rejouables.
+    pub fn from_snapshot(snapshot: &MockSnapshot, config: MockConfig) -> Self {
+        type Op<'a> = (Vec<u64>, Vec<&'a Exchange>);
+        let mut by_op: BTreeMap<String, Op<'_>> = BTreeMap::new();
+        for ops in &snapshot.operations {
+            for PathLatencies(path, latencies) in &ops.paths {
+                by_op
+                    .entry(op_key(&ops.authority, &ops.method, path))
+                    .or_default()
+                    .0
+                    .extend(latencies);
+            }
+        }
+        for e in &snapshot.records {
+            if e.direction != Direction::Outbound || e.status < 200 || !e.resp_body.is_replayable()
+            {
+                continue;
+            }
+            by_op
+                .entry(op_key(&e.authority, &e.method, &e.path))
+                .or_default()
+                .1
+                .push(e);
+        }
+        let mut len = 0;
+        let ops = by_op
+            .into_iter()
+            .map(|(key, (mut latencies, mut items))| {
+                sort_chronologically(&mut items);
+                // Forme incohérente (opération absente) : la distribution n'est jamais vide.
+                if latencies.is_empty() {
+                    latencies = items.iter().map(|e| e.total_us).collect();
+                }
+                len += latencies.len();
+                let replayable = items.into_iter().map(Recording::into_shared).collect();
+                (key, latencies, replayable)
+            })
+            .collect::<Vec<_>>();
+        Self::assemble(ops, len, config)
+    }
+
+    /// Index des opérations : pour chacune, les durées de tous ses enregistrements et ses
+    /// enregistrements rejouables, dans l'ordre chronologique, par clé croissante.
+    fn assemble(
+        ops: impl IntoIterator<Item = (String, Vec<u64>, Vec<Arc<Exchange>>)>,
+        len: usize,
+        config: MockConfig,
+    ) -> Self {
         let mut records = vec![];
         let mut groups = BTreeMap::new();
         let mut authorities = BTreeSet::new();
-        for (key, mut items) in by_op {
-            items.sort_by(|a, b| {
-                let (a, b) = (a.exchange(), b.exchange());
-                (a.started_at_ms, &a.id).cmp(&(b.started_at_ms, &b.id))
-            });
+        for (key, latencies, replayable) in ops {
             let mut g = Group {
                 records: vec![],
-                latencies: items.iter().map(|r| r.exchange().total_us).collect(),
+                latencies,
             };
-            for r in items {
-                if r.exchange().resp_body.is_replayable() {
-                    g.records.push(records.len());
-                    records.push(Recorded::new(r.into_shared()));
-                }
+            for e in replayable {
+                g.records.push(records.len());
+                records.push(Recorded::new(e));
             }
             if let Some((authority, _)) = key.split_once('\u{1}')
                 && !authorities.contains(authority)

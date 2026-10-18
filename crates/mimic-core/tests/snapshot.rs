@@ -181,7 +181,7 @@ fn varied(item: &(u8, u8, u8, u8, u16, u64), n: usize) -> Exchange {
         _ => format!("/users/{}/cart", n % 3),
     };
     let mut e = out(&path, at, &format!("pod{}-{n:04}", n % 2));
-    if n % 3 == 0 {
+    if n.is_multiple_of(3) {
         e.authority = "stock.internal:8080".into();
     }
     if n % 4 == 1 {
@@ -235,23 +235,20 @@ fn mck_20_mock_form_keeps_replayable_records_and_latencies_only() {
         light.records[0], full.exchanges[0],
         "échange rejouable tel quel"
     );
-    // Une opération par forme de chemin, désignée par son premier échange ; le `101` n'en
-    // est pas une (le moteur l'ignore).
+    // Une opération par forme de chemin, désignée par son premier échange, rangée sous son
+    // authority et sa méthode ; le `101` n'en est pas une (le moteur l'ignore).
+    assert_eq!(light.operations.len(), 1);
+    let ops = &light.operations[0];
     assert_eq!(
-        light.operations.len(),
+        (ops.authority.as_str(), ops.method.as_str()),
+        ("api.saas.io:443", "GET")
+    );
+    assert_eq!(
+        ops.paths.len(),
         2_000,
         "chemins non reconnus comme identifiants"
     );
-    let op = &light.operations[0];
-    assert_eq!(
-        (op.authority.as_str(), op.method.as_str()),
-        ("api.saas.io:443", "GET")
-    );
-    let mut latencies: Vec<u64> = light
-        .operations
-        .iter()
-        .flat_map(|o| o.latencies_us.iter().copied())
-        .collect();
+    let mut latencies: Vec<u64> = ops.paths.iter().flat_map(|p| p.1.iter().copied()).collect();
     latencies.sort_unstable();
     assert_eq!(
         latencies,
@@ -260,7 +257,7 @@ fn mck_20_mock_form_keeps_replayable_records_and_latencies_only() {
 
     let bytes = light.to_json();
     assert!(
-        bytes.len() * 5 < full.to_jsonl().len(),
+        bytes.len() * 10 < full.to_jsonl().len(),
         "{} octets contre {}",
         bytes.len(),
         full.to_jsonl().len()
@@ -287,12 +284,11 @@ fn mck_20_paths_of_the_same_shape_share_one_operation() {
     let light = MockSnapshot::from_snapshot(&full);
     assert_eq!(light.records.len(), 20);
     assert_eq!(light.operations.len(), 1);
-    let op = &light.operations[0];
-    assert_eq!(op.path, "/users/0", "désignée par son premier échange");
-    assert_eq!(
-        op.latencies_us,
-        (0..100).map(|i| 10 * i).collect::<Vec<u64>>()
-    );
+    let ops = &light.operations[0];
+    assert_eq!(ops.paths.len(), 1);
+    let op = &ops.paths[0];
+    assert_eq!(op.0, "/users/0", "désignée par son premier échange");
+    assert_eq!(op.1, (0..100).map(|i| 10 * i).collect::<Vec<u64>>());
 }
 
 proptest! {
