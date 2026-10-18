@@ -2,7 +2,7 @@
 
 `scripts/e2e-kind.sh` déploie mimic et la démo OpenTelemetry dans un cluster kind, laisse
 tourner le générateur de charge de la démo, publie le rapport de découverte, puis vérifie
-les bascules en mock (critère E2E-05 de la [spec](SPEC.md)). La CI le lance sur chaque PR
+les bascules en mock et celle du contrôleur (critères E2E-05 et E2E-06 de la [spec](SPEC.md)). La CI le lance sur chaque PR
 vers `main` (job `e2e-kind`) ; la même commande marche sur un poste.
 
 ## Prérequis
@@ -43,13 +43,15 @@ Variables utiles :
 | `LOAD_SECONDS` | `300` | durée de récolte sous la charge du générateur |
 | `MOCK_WINDOW` | `60` | durée d'observation du mock global, en secondes |
 | `REPORT_DIR` | `target/e2e-report` | rapport, bilan du mock et documents OpenAPI |
+| `FAILOVER_SECONDS` | `30` | délai toléré pour la bascule du contrôleur (E2E-06) |
 
 Relancer sans reconstruire : `SKIP_BUILD=1 ./scripts/e2e-kind.sh`. La démo est réappliquée
 à chaque passage ; pour repartir de zéro, `kind delete cluster --name mimic`.
 
 ## Ce que fait le scénario
 
-1. **Socle** : cert-manager, trust-manager, contrôleur (`deploy/controller/`) et webhook
+1. **Socle** : cert-manager, trust-manager, contrôleur (`deploy/controller/`, deux réplicas
+   dont une seule active, sur le PVC `ReadWriteOnce` du nœud unique) et webhook
    d'injection (`deploy/injector/`).
 2. **Démo** : namespace `otel-demo` labellisé `mimic.platform.io/enabled=true`. Le script
    attend que le webhook injecte réellement (pod sonde en `--dry-run=server`), applique
@@ -69,7 +71,18 @@ Relancer sans reconstruire : `SKIP_BUILD=1 ./scripts/e2e-kind.sh`. La démo est 
    frontend-proxy doit répondre depuis son snapshot. Bilan dans `REPORT_DIR/mock.md`, puis
    retour en record.
 6. **Mock de shipping** : `mimicctl mode shipping mock`, quote est arrêté, et 40 devis
-   doivent encore réussir ; retour en record, 10 devis de plus.
+   doivent encore réussir.
+7. **Bascule du contrôleur** (E2E-06) : des devis sont demandés en continu pendant que le
+   pod de la réplique active est supprimé (`kubectl delete pod`). En moins de
+   `FAILOVER_SECONDS`, l'autre réplique doit tenir le bail, porter la marque
+   `mimic.platform.io/leader=true`, être le seul endpoint prêt du Service, et les deux pods
+   de shipping doivent s'y aligner sur le même snapshot. Le snapshot est relu sur la
+   nouvelle active (même empreinte), les sidecars ne l'ont pas rechargé, la découverte de
+   shipping et son `exemplars.jsonl` sont toujours là, la nouvelle active reçoit des
+   segments, aucun devis n'a échoué, et le Deployment revient à deux réplicas dont une
+   passive. Le délai mesuré est ajouté au bilan (`REPORT_DIR/mock.md`).
+8. **Retour en record** : quote redémarre, shipping repasse en record, 10 devis de plus ;
+   puis garde-fou production (E2E-04).
 
 En CI, le rapport et le bilan du mock sont ajoutés au résumé du job et imprimés dans le log
 (groupe « rapport de découverte »), et `REPORT_DIR` est publié en artefact `e2e-report`.
@@ -79,8 +92,9 @@ En CI, le rapport et le bilan du mock sont ajoutés au résumé du job et imprim
 ```sh
 kubectl -n otel-demo get pods -w
 mimicctl status -n otel-demo                       # mode, snapshot, pods alignés
-kubectl port-forward -n mimic-system deploy/mimic-controller 8081
+kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081
 # puis http://127.0.0.1:8081/ : workloads, API découvertes, snapshots, requêtes
+kubectl -n mimic-system get lease mimic-controller   # réplique active
 kubectl port-forward -n otel-demo deploy/frontend 15000
 # puis http://127.0.0.1:15000/ : page d'admin d'un sidecar, /metrics pour ses métriques
 ```
