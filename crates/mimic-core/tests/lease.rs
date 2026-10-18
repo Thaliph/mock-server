@@ -190,7 +190,7 @@ fn ctl_24_timings_must_be_ordered() {
 
 // Simulation de deux répliques et du serveur du bail : chaque requête est appliquée après
 // un délai, sa réponse arrive après un autre, ou se perd. Une réplique peut aussi tomber,
-// puis repartir en passive. Propriété : jamais deux répliques ne se croient actives au
+// puis repartir en passive, ou être coupée du serveur un temps (ses requêtes se perdent). Propriété : jamais deux répliques ne se croient actives au
 // même instant.
 
 #[derive(Debug, Clone)]
@@ -246,7 +246,14 @@ fn believes(r: &Replica, now: u64, t: &Timings) -> bool {
     !r.down && r.leader && still_leading(r.last_ok, now, t)
 }
 
-fn simulate(nets: Vec<Net>, crashes: Vec<(usize, u64, u64)>, t: &Timings) -> u32 {
+/// Chute ou coupure : (réplique, début, durée).
+type Outage = (usize, u64, u64);
+
+fn simulate(nets: Vec<Net>, crashes: Vec<Outage>, cuts: Vec<Outage>, t: &Timings) -> u32 {
+    let cut = |r: usize, at: u64| {
+        cuts.iter()
+            .any(|&(c, from, d)| c == r && at >= from && at < from + d)
+    };
     const END: u64 = 120_000;
     let names = ["a", "b"];
     let mut server: Option<(Record, u64)> = None;
@@ -306,6 +313,7 @@ fn simulate(nets: Vec<Net>, crashes: Vec<(usize, u64, u64)>, t: &Timings) -> u32
                 reply_ms,
                 lost,
             } => {
+                let write = if cut(r, now) { None } else { write };
                 let result = match (req, write) {
                     (Req::Get, _) => Some(server.as_ref().map(|(rec, v)| Lease {
                         record: rec.clone(),
@@ -321,9 +329,9 @@ fn simulate(nets: Vec<Net>, crashes: Vec<(usize, u64, u64)>, t: &Timings) -> u32
                             None
                         }
                     }
-                    (Req::Write, None) => unreachable!(),
+                    (Req::Write, None) => None,
                 };
-                let result = if lost { None } else { result };
+                let result = if lost || cut(r, now) { None } else { result };
                 push(
                     &mut events,
                     now + reply_ms,
@@ -420,52 +428,71 @@ fn simulate(nets: Vec<Net>, crashes: Vec<(usize, u64, u64)>, t: &Timings) -> u32
     elections
 }
 
+/// Délai d'une requête : le plus souvent court, parfois de plusieurs secondes.
+fn delay() -> impl Strategy<Value = u64> {
+    prop_oneof![8 => 0u64..300, 2 => 0u64..6_000]
+}
+
 fn net() -> impl Strategy<Value = Net> {
-    (0u64..4_000, 0u64..4_000, prop::bool::weighted(0.1)).prop_map(|(apply_ms, reply_ms, lost)| {
-        Net {
-            apply_ms,
-            reply_ms,
-            lost,
-        }
+    (delay(), delay(), prop::bool::weighted(0.1)).prop_map(|(apply_ms, reply_ms, lost)| Net {
+        apply_ms,
+        reply_ms,
+        lost,
     })
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(512))]
 
     #[test]
     fn ctl_24_never_two_leaders(
         nets in prop::collection::vec(net(), 1..64),
-        crashes in prop::collection::vec((0usize..2, 0u64..120_000, 0u64..30_000), 0..4),
+        crashes in prop::collection::vec((0usize..2, 0u64..120_000, 0u64..30_000), 0..3),
+        cuts in prop::collection::vec((0usize..2, 0u64..120_000, 0u64..30_000), 1..5),
     ) {
-        simulate(nets, crashes, &Timings::default());
+        simulate(nets, crashes, cuts, &Timings::default());
     }
 }
 
-/// Sans délai ni perte, une réplique est élue, et l'autre la remplace après sa chute.
-#[test]
-fn ctl_24_a_replica_is_elected_and_replaced() {
-    let fast = vec![Net {
+fn fast() -> Vec<Net> {
+    vec![Net {
         apply_ms: 5,
         reply_ms: 5,
         lost: false,
-    }];
-    assert_eq!(simulate(fast.clone(), vec![], &Timings::default()), 1);
-    assert!(
-        simulate(
-            fast,
-            vec![(0, 30_000, 200_000), (1, 30_000, 200_000)],
-            &Timings::default()
-        ) >= 1
+    }]
+}
+
+/// Sans délai ni perte, une réplique est élue ; l'autre la remplace après sa chute, ou
+/// après une coupure qui dépasse `renew_deadline`.
+#[test]
+fn ctl_24_a_replica_is_elected_and_replaced() {
+    let t = Timings::default();
+    assert_eq!(simulate(fast(), vec![], vec![], &t), 1);
+    assert_eq!(
+        simulate(fast(), vec![(0, 30_000, 200_000)], vec![], &t),
+        2,
+        "a élue, puis b après la chute de a"
     );
-    let elections = simulate(
-        vec![Net {
-            apply_ms: 5,
-            reply_ms: 5,
-            lost: false,
-        }],
-        vec![(0, 30_000, 200_000)],
-        &Timings::default(),
+    assert_eq!(
+        simulate(fast(), vec![], vec![(0, 30_000, 5_000)], &t),
+        1,
+        "une coupure courte ne change rien"
     );
-    assert_eq!(elections, 2, "a élue, puis b après la chute de a");
+    assert_eq!(
+        simulate(fast(), vec![], vec![(0, 30_000, 20_000)], &t),
+        2,
+        "a abandonne à renew_deadline, b prend le bail expiré"
+    );
+}
+
+/// La simulation détecte deux actives quand `renew_deadline` dépasse `lease_duration`.
+#[test]
+#[should_panic(expected = "deux actives")]
+fn ctl_24_simulation_catches_a_late_renew_deadline() {
+    let t = Timings {
+        lease_duration_ms: 15_000,
+        renew_deadline_ms: 25_000,
+        retry_period_ms: 2_000,
+    };
+    simulate(fast(), vec![], vec![(0, 30_000, 20_000)], &t);
 }

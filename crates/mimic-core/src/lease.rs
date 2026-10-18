@@ -27,8 +27,19 @@ impl Default for Timings {
 }
 
 impl Timings {
+    /// `retry_period` < `renew_deadline` < `lease_duration` : l'active cesse d'écrire avant
+    /// qu'une autre puisse prendre le bail, et renouvelle plusieurs fois avant d'abandonner.
     pub fn validate(&self) -> Result<(), String> {
-        todo!()
+        if self.retry_period_ms == 0
+            || self.retry_period_ms >= self.renew_deadline_ms
+            || self.renew_deadline_ms >= self.lease_duration_ms
+        {
+            return Err(format!(
+                "élection : il faut 0 < retry_period ({} ms) < renew_deadline ({} ms) < lease_duration ({} ms)",
+                self.retry_period_ms, self.renew_deadline_ms, self.lease_duration_ms
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -71,29 +82,81 @@ pub enum Decision {
 }
 
 /// Met à jour l'observation : une nouvelle version repart de `now_ms`.
-pub fn observe(_prev: Option<Observed>, _lease: Option<&Lease>, _now_ms: u64) -> Option<Observed> {
-    todo!()
+pub fn observe(prev: Option<Observed>, lease: Option<&Lease>, now_ms: u64) -> Option<Observed> {
+    let lease = lease?;
+    match prev {
+        Some(o) if o.version == lease.version => Some(o),
+        _ => Some(Observed {
+            version: lease.version.clone(),
+            since_ms: now_ms,
+        }),
+    }
 }
 
 /// Décision de la réplique `me` sur le bail relu.
 pub fn decide(
-    _me: &str,
-    _lease: Option<&Lease>,
-    _observed: Option<&Observed>,
-    _timings: &Timings,
-    _now_ms: u64,
+    me: &str,
+    lease: Option<&Lease>,
+    observed: Option<&Observed>,
+    timings: &Timings,
+    now_ms: u64,
 ) -> Decision {
-    todo!()
+    let mine = |transitions| Record {
+        holder: Some(me.to_string()),
+        duration_ms: timings.lease_duration_ms,
+        transitions,
+    };
+    let Some(lease) = lease else {
+        return Decision::Write {
+            record: mine(0),
+            expected: None,
+            acquire: true,
+        };
+    };
+    let record = &lease.record;
+    if record.holder.as_deref() == Some(me) {
+        return Decision::Write {
+            record: mine(record.transitions),
+            expected: Some(lease.version.clone()),
+            acquire: false,
+        };
+    }
+    // Expiré : cette version-là, vue inchangée depuis la durée du bail, sur l'horloge locale.
+    let expired = observed.is_some_and(|o| {
+        o.version == lease.version && now_ms.saturating_sub(o.since_ms) >= record.duration_ms
+    });
+    if record.holder.is_none() || expired {
+        return Decision::Write {
+            record: mine(record.transitions.saturating_add(1)),
+            expected: Some(lease.version.clone()),
+            acquire: true,
+        };
+    }
+    Decision::Wait {
+        holder: record.holder.clone(),
+    }
 }
 
 /// Vrai tant que l'active peut se tenir pour active : son dernier renouvellement réussi a
 /// commencé à `last_renew_start_ms`.
-pub fn still_leading(_last_renew_start_ms: u64, _now_ms: u64, _timings: &Timings) -> bool {
-    todo!()
+pub fn still_leading(last_renew_start_ms: u64, now_ms: u64, timings: &Timings) -> bool {
+    now_ms.saturating_sub(last_renew_start_ms) < timings.renew_deadline_ms
 }
 
 /// Bail rendu par son détenteur à l'arrêt : contenu à écrire et version attendue. `None` si
 /// `me` ne le détient pas.
-pub fn release(_me: &str, _lease: &Lease) -> Option<(Record, String)> {
-    todo!()
+pub fn release(me: &str, lease: &Lease) -> Option<(Record, String)> {
+    (lease.record.holder.as_deref() == Some(me)).then(|| {
+        (
+            Record {
+                holder: None,
+                duration_ms: RELEASED_MS,
+                transitions: lease.record.transitions,
+            },
+            lease.version.clone(),
+        )
+    })
 }
+
+/// Durée écrite dans un bail rendu (sans détenteur, il est pris aussitôt de toute façon).
+const RELEASED_MS: u64 = 1_000;
