@@ -47,6 +47,7 @@ fail() { printf '\nÉCHEC : %s\n' "$*" >&2; exit 1; }
 diagnostics() {
   log "diagnostic"
   kubectl get pods -A -o wide || true
+  kubectl describe node | sed -n '/Allocated resources/,/Events/p' || true
   kubectl get mimicworkloads -A -o yaml || true
   kubectl -n mimic-system get lease mimic-controller -o yaml || true
   kubectl -n mimic-system get pods -l app.kubernetes.io/name=mimic-controller -o wide --show-labels || true
@@ -187,7 +188,13 @@ retry 60 has_leader || fail "aucune réplique active du contrôleur"
 echo "réplique active : $(leader)"
 
 log "webhook d'injection"
-manifest deploy/injector/injector.yaml | kubectl apply -f -
+# kind n'a qu'un nœud : avec deux réplicas du contrôleur, les requêtes CPU des sidecars
+# (50m chacun, une vingtaine de pods) ne laissaient plus de place aux pods de test
+# ajoutés en fin de script (Insufficient cpu). Le test ne porte pas sur ces requêtes :
+# on les abaisse à 10m pour les sidecars injectés ici.
+manifest deploy/injector/injector.yaml \
+  | sed 's#requests: {cpu: 50m, memory: 64Mi}#requests: {cpu: 10m, memory: 64Mi}#' \
+  | kubectl apply -f -
 reissue_if_stale mimic-injector-tls
 # Le webhook lit son certificat au démarrage : le relancer si sa feuille a été réémise.
 [ -z "${REISSUED:-}" ] || kubectl -n mimic-system rollout restart deploy/mimic-injector
