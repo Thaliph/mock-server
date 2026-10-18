@@ -26,7 +26,18 @@ data:
       max_per_key: 50
     pod_timeout: 30
     pod_forget: 600
+    # Deux réplicas, une seule active (spec §5.5.4) ; identité : POD_NAME.
+    leader_election:
+      lease: mimic-controller
+      namespace: mimic-system
+      lease_duration: 15
+      renew_deadline: 10
+      retry_period: 2
 ---
+# Monté par les deux réplicas, écrit par la seule active (spec §5.5.4). ReadWriteOnce
+# suffit sur un nœud (kind) ou avec un volume local, qui garde les deux réplicas sur le même
+# nœud. Sur plusieurs nœuds : ReadWriteMany (storageClassName d'un stockage partagé : EFS,
+# Filestore, Azure Files, CephFS, NFS…), ou `store: s3://…` et plus de PVC du tout.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -37,15 +48,21 @@ spec:
   resources:
     requests: {storage: 10Gi}
 ---
-# Un seul réplica : l'état des pods vit en mémoire, le reste sur le PVC.
+# Deux réplicas, une seule active, élue par le bail mimic-system/mimic-controller : elle porte
+# le label mimic.platform.io/leader=true, que le Service sélectionne (spec §5.5.4). Les deux
+# sont Ready ; la passive répond 503 et ne touche pas au support.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mimic-controller
   namespace: mimic-system
 spec:
-  replicas: 1
-  strategy: {type: Recreate}
+  replicas: 2
+  # Une nouvelle réplique est prête (passive) avant qu'une ancienne parte ; la marque
+  # porte un pod-deletion-cost : l'active part en dernier, d'où une seule bascule.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
   selector:
     matchLabels: {app.kubernetes.io/name: mimic-controller}
   template:
@@ -53,6 +70,17 @@ spec:
       labels: {app.kubernetes.io/name: mimic-controller}
     spec:
       serviceAccountName: mimic-controller
+      # Deux nœuds quand c'est possible, un seul sinon (kind, PVC ReadWriteOnce local).
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app.kubernetes.io/name: mimic-controller}
+      # Arrêt propre : marque retirée, exemples écrits, bail rendu.
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsUser: 1337
         runAsGroup: 1337
@@ -64,6 +92,11 @@ spec:
           image: registry.example.com/platform/mimic:0.1.0
           command: ["/usr/local/bin/mimic-controller"]
           args: ["--config", "/etc/mimic/controller.yaml"]
+          env:
+            # Identité dans l'élection, et pod qui porte la marque.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
           ports:
             - {name: api, containerPort: 8443}
           readinessProbe:
@@ -91,17 +124,31 @@ spec:
         - name: data
           persistentVolumeClaim: {claimName: mimic-controller}
 ---
-# Seule l'API des sidecars est exposée ; l'interface reste sur 127.0.0.1:8081 :
-#   kubectl port-forward -n mimic-system deploy/mimic-controller 8081
+# Seule l'API des sidecars est exposée, et seulement par la réplique active ; l'interface
+# reste sur 127.0.0.1:8081 :
+#   kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081
 apiVersion: v1
 kind: Service
 metadata:
   name: mimic-controller
   namespace: mimic-system
 spec:
-  selector: {app.kubernetes.io/name: mimic-controller}
+  selector:
+    app.kubernetes.io/name: mimic-controller
+    mimic.platform.io/leader: "true"
   ports:
     - {name: api, port: 8443, targetPort: api}
+---
+# Un drain n'évince jamais les deux réplicas à la fois ; la passive prend le relais.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: mimic-controller}
 ---
 # Seuls les pods porteurs d'un sidecar mimic joignent l'API.
 apiVersion: networking.k8s.io/v1

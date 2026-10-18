@@ -222,7 +222,7 @@ fn ctl_28_controller_runs_two_replicas_behind_the_active_one() {
         })
         .flat_map(verbs)
         .collect();
-    for verb in ["get", "create", "update"] {
+    for verb in ["get", "create", "patch"] {
         assert!(lease_verbs.iter().any(|v| v == verb), "leases : {verb}");
     }
     let pods = rule_on(role, "pods").expect("droit sur les pods");
