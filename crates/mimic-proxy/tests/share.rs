@@ -1,4 +1,5 @@
-//! Critères SHR-* de la spec (§5.4) : partage entre les sidecars d'un même workload.
+//! Critères SHR-* de la spec (§5.4) : partage entre les sidecars d'un même workload, en
+//! partage direct (stockage objet) et sous contrôleur (publication seule, SHR-10).
 
 mod common;
 
@@ -278,8 +279,8 @@ struct FakeController {
     /// Segments listés.
     segments: Vec<Value>,
     refuse_posts: bool,
-    /// Lectures de segment à refuser avant d'accepter.
-    failing_gets: usize,
+    /// Lectures de segment demandées.
+    gets: usize,
 }
 
 type Fake = std::sync::Arc<std::sync::Mutex<FakeController>>;
@@ -327,11 +328,7 @@ async fn fake_controller() -> (std::net::SocketAddr, Fake) {
             .route(
                 &format!("{base}/segments/{{instance}}/{{file}}"),
                 get(|State(f): State<Fake>| async move {
-                    let mut f = f.lock().unwrap();
-                    if f.failing_gets > 0 {
-                        f.failing_gets -= 1;
-                        return axum::http::StatusCode::INTERNAL_SERVER_ERROR;
-                    }
+                    f.lock().unwrap().gets += 1;
                     axum::http::StatusCode::OK
                 }),
             )
@@ -359,27 +356,115 @@ fn unix_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// Dépose le segment d'un pair sur le support partagé, comme écrit à `at_ms`.
+fn peer_segment(dir: &std::path::Path, name: &str, id: &str, at_ms: i64) {
+    use mimic_core::model::{Body, Direction, Exchange};
+    let e = Exchange {
+        id: id.into(),
+        direction: Direction::Outbound,
+        started_at_ms: at_ms as u64,
+        scheme: "http".into(),
+        authority: "api.saas.io:80".into(),
+        method: "GET".into(),
+        path: format!("/{id}"),
+        query: vec![],
+        req_headers: vec![],
+        req_body: Body::Empty,
+        status: 200,
+        resp_headers: vec![],
+        resp_body: Body::captured(b"{}".to_vec()),
+        ttfb_us: 1,
+        total_us: 1,
+        trace_id: None,
+        redactions: vec![],
+    };
+    let d = dir.join("ns/api/exchanges/api-p");
+    std::fs::create_dir_all(&d).unwrap();
+    let path = d.join(name);
+    let mut line = serde_json::to_vec(&e).unwrap();
+    line.push(b'\n');
+    std::fs::write(&path, line).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(at_ms as u64))
+        .unwrap();
+}
+
 #[tokio::test]
-async fn shr_08_listing_is_incremental_after_a_successful_import() {
-    let (ctl, fake) = fake_controller().await;
-    let at = unix_ms() - 1_000;
-    {
-        let mut f = fake.lock().unwrap();
-        f.segments = vec![serde_json::json!({
-            "key": "api-b/01A.jsonl", "instance": "api-b", "modified_ms": at, "size": 1
-        })];
-        f.failing_gets = 1;
-    }
-    let _a = proxy(piloted_by(None, ctl)).await;
-    eventually("trois listes", || async {
-        fake.lock().unwrap().lists.len() >= 3
+async fn shr_08_listing_window_follows_the_newest_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("file://{}", dir.path().display());
+    let t = unix_ms() - 1_000;
+    peer_segment(dir.path(), "01B.jsonl", "api-p-1", t);
+    let a = proxy(shared(None, Mode::Record, &url, "api-a", "api")).await;
+    eventually("premier import", || async {
+        status(&a).await["store"]["peer"] == 1
     })
     .await;
-    let lists = fake.lock().unwrap().lists.clone();
-    // Import échoué : la liste suivante reste complète ; ensuite, le curseur moins 60 s.
-    assert_eq!(lists[0], None);
-    assert_eq!(lists[1], None);
-    assert_eq!(lists[2], Some(at - 60_000));
+    // Déposés après coup : l'un avant la marge de 60 s, l'autre dedans.
+    peer_segment(dir.path(), "01A.jsonl", "api-p-0", t - 120_000);
+    peer_segment(dir.path(), "01C.jsonl", "api-p-2", t - 30_000);
+    eventually("segment de la marge importé", || async {
+        status(&a).await["store"]["peer"] == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ids: Vec<String> = exchanges(&a, "direction=outbound")
+        .await
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(ids.contains(&"api-p-2".to_string()), "{ids:?}");
+    assert!(
+        !ids.contains(&"api-p-0".to_string()),
+        "segment hors de la fenêtre importé : {ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn shr_10_controlled_sidecar_publishes_without_listing() {
+    let (ctl, fake) = fake_controller().await;
+    fake.lock().unwrap().segments = vec![serde_json::json!({
+        "key": "api-b/01A.jsonl", "instance": "api-b", "modified_ms": unix_ms() - 1_000, "size": 1
+    })];
+    let app = fake_server().await;
+    let a = proxy(piloted_by(Some(app.addr), ctl)).await;
+    client().get(inbound(&a, "/users/1")).send().await.unwrap();
+    eventually("segment publié", || async {
+        fake.lock().unwrap().posts.iter().any(|p| p.3)
+    })
+    .await;
+    // Plusieurs synchronisations plus tard : ni liste ni lecture de segment.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    trigger_sync(&a).await;
+    {
+        let f = fake.lock().unwrap();
+        assert!(f.lists.is_empty(), "listes demandées : {:?}", f.lists);
+        assert_eq!(f.gets, 0);
+    }
+    let s = status(&a).await;
+    assert_eq!(s["store"]["peer"], 0);
+    assert_eq!(s["share"]["peers"], serde_json::json!([]));
+    let html = client()
+        .get(admin(&a, "/"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("1 échanges vus par ce pod"), "{html}");
+    assert!(html.contains("interface du contrôleur"), "{html}");
+    assert!(!html.contains("pair(s)"), "{html}");
+    assert!(!html.contains("importés"), "{html}");
+}
+
+async fn trigger_sync(p: &Running) {
+    let r = client().post(admin(p, "/share/sync")).send().await.unwrap();
+    assert!(r.status().is_success(), "{}", r.status());
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 #[tokio::test]

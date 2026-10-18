@@ -19,7 +19,7 @@ use crate::config::{InboundCapture, Mode, ShareConfig};
 use crate::state::AppState;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// Un snapshot ou un segment ne dépasse pas cette taille.
+/// Un snapshot ne dépasse pas cette taille.
 const MAX_BODY: usize = 256 * 1024 * 1024;
 
 /// État souhaité reçu du contrôleur.
@@ -38,13 +38,6 @@ pub struct ControllerStatus {
     pub desired: Desired,
     pub last_ok_ms: Option<u64>,
     pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Segment {
-    pub key: String,
-    pub instance: String,
-    pub modified_ms: i64,
 }
 
 pub struct ControllerClient {
@@ -141,21 +134,6 @@ impl ControllerClient {
         self.call(Method::POST, &path, Some((body, "application/x-ndjson")))
             .await
             .map(|_| ())
-    }
-
-    /// Segments du workload ; avec `since_ms`, seulement ceux modifiés depuis.
-    pub async fn segments(&self, since_ms: Option<i64>) -> Result<Vec<Segment>, String> {
-        let path = match since_ms {
-            Some(ms) => format!("/segments?since_ms={ms}"),
-            None => "/segments".to_string(),
-        };
-        let b = self.call(Method::GET, &path, None).await?;
-        serde_json::from_slice(&b).map_err(|e| format!("liste des segments: {e}"))
-    }
-
-    pub async fn segment(&self, key: &str) -> Result<Bytes, String> {
-        self.call(Method::GET, &format!("/segments/{key}"), None)
-            .await
     }
 
     pub async fn heartbeat(

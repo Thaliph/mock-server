@@ -8,6 +8,7 @@
 pub mod catalog;
 pub mod compact;
 pub mod diff;
+pub mod exemplar;
 pub mod infer;
 pub mod mock;
 pub mod model;

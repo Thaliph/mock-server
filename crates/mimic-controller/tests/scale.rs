@@ -1,4 +1,5 @@
-//! Critères CTL-06 à CTL-15 de la spec (§5.5.2) : tenue en charge du contrôleur.
+//! Critères CTL-06 à CTL-19 et CTL-22 de la spec (§5.5.2, §5.5.3) : tenue en charge du contrôleur,
+//! exemples par endpoint et historique court.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -296,7 +297,8 @@ async fn ctl_06_segments_index_is_built_by_a_single_listing() {
 async fn ctl_07_listing_filters_by_retention_and_since() {
     let dir = tempfile::tempdir().unwrap();
     let now = now_ms();
-    let (old, mid, new) = (now - 8 * DAY_MS, now - 2 * 3600 * 1000, now - 1_000);
+    // Rétention par défaut : 24 heures (CTL-21).
+    let (old, mid, new) = (now - 2 * DAY_MS, now - 2 * 3600 * 1000, now - 1_000);
     let e = |id: &str| exchange(id, "inbound", "/a", 200, false);
     write_segment(
         dir.path(),
@@ -528,7 +530,7 @@ async fn ctl_10_retention_gc_removes_old_segments_only() {
         "checkout-a",
         "01O.jsonl",
         &[out("o1")],
-        now - 8 * DAY_MS,
+        now - 2 * DAY_MS,
     );
     write_segment(
         dir.path(),
@@ -536,7 +538,7 @@ async fn ctl_10_retention_gc_removes_old_segments_only() {
         "checkout-b",
         "01P.jsonl",
         &[out("o2")],
-        now - 9 * DAY_MS,
+        now - 3 * DAY_MS,
     );
     write_segment(
         dir.path(),
@@ -845,4 +847,386 @@ async fn ctl_15_republished_segment_is_stored_once() {
         let r = post_segment(&c, "checkout-a", Some(bad), &e).await;
         assert_eq!(r.status(), 400, "{bad}");
     }
+}
+
+/// Échange daté de `at_ms`.
+fn at(mut e: Value, at_ms: u64) -> Value {
+    e["started_at_ms"] = json!(at_ms);
+    e
+}
+
+/// (identifiant, chemin, nature du body de réponse) de chaque ligne JSONL.
+fn summarize(text: &str) -> Vec<(String, String, String)> {
+    text.lines()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            (
+                v["id"].as_str().unwrap().to_string(),
+                v["path"].as_str().unwrap().to_string(),
+                v["resp_body"]["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Lignes de `exemplars.jsonl` d'un workload.
+fn exemplars(dir: &Path, wl: &str) -> Vec<(String, String, String)> {
+    let path = dir.join(format!("shop/{wl}/exemplars.jsonl"));
+    summarize(&std::fs::read_to_string(path).unwrap_or_default())
+}
+
+/// Bascule le workload en mock et rend les lignes de son snapshot, triées.
+async fn mock_snapshot(c: &Running, dir: &Path, wl: &str) -> Vec<(String, String, String)> {
+    c.apply_spec(
+        "shop",
+        wl,
+        Some(MimicWorkloadSpec {
+            mode: "mock".into(),
+            snapshot: None,
+            ..MimicWorkloadSpec::default()
+        }),
+    )
+    .await;
+    let desired = get_json(c, &format!("/v1/workloads/shop/{wl}/mode")).await;
+    let id = desired["snapshot"].as_str().expect("snapshot construit");
+    let text =
+        std::fs::read_to_string(dir.join(format!("shop/{wl}/snapshots/{id}.jsonl"))).unwrap();
+    let mut out = summarize(&text);
+    out.sort();
+    out
+}
+
+fn metric(m: &str, name: &str) -> Option<f64> {
+    m.lines()
+        .find(|l| l.split_whitespace().next() == Some(name))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Deux identifiants : le second, plus récent, perd son body à la compaction avec
+/// `samples_per_operation: 1` (le réservoir garde la plus petite priorité, §5.2).
+fn compaction_pair() -> (String, String) {
+    use mimic_core::sample::priority;
+    for i in 0..1000 {
+        let (old, new) = (format!("checkout-b-h{i}"), format!("checkout-b-h{}", i + 1));
+        if priority(&old) < priority(&new) {
+            return (old, new);
+        }
+    }
+    unreachable!()
+}
+
+fn captured(id: &str, path: &str) -> (String, String, String) {
+    (id.to_string(), path.to_string(), "captured".to_string())
+}
+
+#[tokio::test]
+async fn ctl_17_examples_survive_retention_compaction_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = now_ms();
+    let out = |id: &str, path: &str, ms: u64| at(exchange(id, "outbound", path, 200, true), ms);
+    // Déposé avant le démarrage, hors rétention : jamais proposé aux exemples.
+    let old_at = now - 2 * DAY_MS;
+    write_segment(
+        dir.path(),
+        "checkout",
+        "checkout-b",
+        "01OLD.jsonl",
+        &[out("checkout-b-old", "/old", old_at)],
+        old_at,
+    );
+    // Heure révolue : le plus récent des deux appels perd son body à la compaction.
+    let (_, hour_start, _) = hour_of(now as i64 - 3 * 3600 * 1000);
+    let (h_old, h_new) = compaction_pair();
+    let t = hour_start as u64 + 1_000;
+    write_segment(
+        dir.path(),
+        "checkout",
+        "checkout-b",
+        "01HOUR.jsonl",
+        &[out(&h_old, "/hour", t), out(&h_new, "/hour", t + 1)],
+        t + 2,
+    );
+    let config = || ControllerConfig {
+        samples_per_operation: 1,
+        ..config(dir.path())
+    };
+    let c = start(config()).await.unwrap();
+    // `/rare` : appelé une seule fois, ingéré par ce processus.
+    push(
+        &c,
+        "checkout-a",
+        &[out("checkout-a-rare", "/rare", now - 5_000)],
+    )
+    .await;
+
+    c.state().maintain().await;
+    let files = exchange_files(dir.path(), "checkout");
+    assert!(
+        !files
+            .iter()
+            .any(|f| f.contains("01OLD") || f.contains("01HOUR")),
+        "segments supprimés et compactés : {files:?}"
+    );
+    let hour = files.iter().find(|f| f.starts_with("_hour/")).unwrap();
+    let compacted = summarize(
+        &std::fs::read_to_string(dir.path().join("shop/checkout/exchanges").join(hour)).unwrap(),
+    );
+    assert!(
+        compacted.contains(&(h_new.clone(), "/hour".into(), "skipped".into())),
+        "le plus récent a perdu son body dans le segment horaire : {compacted:?}"
+    );
+    let mut ex = exemplars(dir.path(), "checkout");
+    ex.sort();
+    let mut expected = vec![
+        captured(&h_new, "/hour"),
+        captured("checkout-b-old", "/old"),
+        captured("checkout-a-rare", "/rare"),
+    ];
+    expected.sort();
+    assert_eq!(ex, expected);
+
+    // Redémarrage : les exemples sont relus, le snapshot les sert.
+    c.shutdown().await;
+    let c = start(config()).await.unwrap();
+    let snap = mock_snapshot(&c, dir.path(), "checkout").await;
+    for e in &expected {
+        assert!(snap.contains(e), "{e:?} dans le snapshot : {snap:?}");
+    }
+    assert!(
+        request_ids(&c, "checkout", "outbound")
+            .await
+            .contains(&"checkout-a-rare".to_string())
+    );
+}
+
+#[tokio::test]
+async fn ctl_17_examples_survive_memory_eviction_and_volume_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = now_ms();
+    let c = start(ControllerConfig {
+        max_exchanges_per_workload: 3,
+        max_exchanges_total: 4,
+        max_bytes_per_workload: 2_000,
+        ..config(dir.path())
+    })
+    .await
+    .unwrap();
+    // Workloads déjà vus : leurs échanges sont en mémoire dès l'ingestion.
+    assert!(request_ids(&c, "checkout", "outbound").await.is_empty());
+    assert!(request_ids(&c, "web", "outbound").await.is_empty());
+    let out = |id: &str, path: &str, ms: u64| at(exchange(id, "outbound", path, 200, true), ms);
+    push(
+        &c,
+        "checkout-a",
+        &[out("checkout-a-rare", "/rare", now - 60_000)],
+    )
+    .await;
+    for i in 0..8 {
+        let id = format!("checkout-a-hot{i}");
+        push(
+            &c,
+            "checkout-a",
+            &[out(&id, &format!("/hot/{i}"), now - 50_000 + i)],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for i in 0..3 {
+        let id = format!("web-a-{i}");
+        push(&c, "web-a", &[out(&id, "/w", now - 40_000 + i)]).await;
+    }
+    // Évincé de la mémoire, l'échange reste listé grâce à son exemple.
+    assert!(c.state().exchange_count("shop", "checkout") <= 3);
+    let ids = request_ids(&c, "checkout", "outbound").await;
+    assert!(ids.contains(&"checkout-a-rare".to_string()), "{ids:?}");
+
+    // Plafond de volume : les plus anciens segments partent, l'exemple est écrit avant.
+    c.state().maintain().await;
+    let files = exchange_files(dir.path(), "checkout");
+    let volume: u64 = files
+        .iter()
+        .map(|f| {
+            std::fs::metadata(dir.path().join("shop/checkout/exchanges").join(f))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    assert!(volume <= 2_000, "{volume} octets");
+    assert!(files.len() < 9, "segments anciens supprimés : {files:?}");
+    let ex = exemplars(dir.path(), "checkout");
+    assert!(ex.contains(&captured("checkout-a-rare", "/rare")), "{ex:?}");
+    // Un seul exemple pour les chemins de même forme : le plus récent.
+    let hot: Vec<_> = ex
+        .iter()
+        .filter(|(_, p, _)| p.starts_with("/hot/"))
+        .collect();
+    assert_eq!(hot.len(), 1, "{ex:?}");
+    assert_eq!(hot[0].0, "checkout-a-hot7");
+
+    let snap = mock_snapshot(&c, dir.path(), "checkout").await;
+    assert!(
+        snap.contains(&captured("checkout-a-rare", "/rare")),
+        "{snap:?}"
+    );
+}
+
+#[tokio::test]
+async fn ctl_18_examples_are_bounded_and_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = start(ControllerConfig {
+        max_exemplars_per_workload: 2,
+        ..config(dir.path())
+    })
+    .await
+    .unwrap();
+    let out = |id: &str, path: &str, ms: u64| at(exchange(id, "outbound", path, 200, true), ms);
+    push(&c, "checkout-a", &[out("checkout-a-1", "/a", 10)]).await;
+    push(&c, "checkout-a", &[out("checkout-a-2", "/b", 20)]).await;
+    push(&c, "checkout-a", &[out("checkout-a-3", "/c", 30)]).await;
+    push(&c, "checkout-a", &[out("checkout-a-4", "/a", 40)]).await;
+    let m = get_text(&c, "/metrics").await;
+    assert_eq!(metric(&m, "mimic_controller_exemplars"), Some(2.0), "{m}");
+    assert_eq!(
+        metric(
+            &m,
+            r#"mimic_controller_exemplars_refused_total{reason="count"}"#
+        ),
+        Some(1.0),
+        "{m}"
+    );
+    c.state().maintain().await;
+    let ids: Vec<String> = exemplars(dir.path(), "checkout")
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert_eq!(ids, ["checkout-a-4", "checkout-a-2"]);
+}
+
+#[tokio::test]
+async fn ctl_19_examples_never_mix_workloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = start(config(dir.path())).await.unwrap();
+    let out = |id: &str, path: &str| exchange(id, "outbound", path, 200, true);
+    push(&c, "checkout-a", &[out("checkout-a-1", "/checkout-only")]).await;
+    push(&c, "web-a", &[out("web-a-1", "/web-only")]).await;
+    // Un pod de web ne publie pas pour checkout (SEC-03).
+    let r = client()
+        .post(url(
+            &c,
+            "/v1/workloads/shop/checkout/segments?instance=web-a",
+        ))
+        .bearer_auth("tok-web-a")
+        .body(jsonl(&[out("web-a-2", "/intrus")]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    c.state().maintain().await;
+    let paths = |list: Vec<(String, String, String)>| -> Vec<String> {
+        list.into_iter().map(|(_, p, _)| p).collect()
+    };
+    assert_eq!(paths(exemplars(dir.path(), "checkout")), ["/checkout-only"]);
+    assert_eq!(paths(exemplars(dir.path(), "web")), ["/web-only"]);
+    assert_eq!(
+        paths(mock_snapshot(&c, dir.path(), "checkout").await),
+        ["/checkout-only"]
+    );
+    assert_eq!(
+        paths(mock_snapshot(&c, dir.path(), "web").await),
+        ["/web-only"]
+    );
+}
+
+/// Échange sortant dont le body de réponse fait `4 * n` caractères base64.
+fn big(id: &str, path: &str, ms: u64, n: usize) -> Value {
+    let mut e = at(exchange(id, "outbound", path, 200, true), ms);
+    e["resp_body"]["data"] = json!("QUFB".repeat(n));
+    e
+}
+
+fn serialized(v: &Value) -> u64 {
+    let e: mimic_core::model::Exchange = serde_json::from_value(v.clone()).unwrap();
+    mimic_core::exemplar::serialized_len(&e)
+}
+
+#[tokio::test]
+async fn ctl_22_examples_are_bounded_in_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let a1 = big("checkout-a-1", "/a", 10, 500);
+    let max = serialized(&a1) + 200;
+    let c = start(ControllerConfig {
+        max_exemplar_bytes_per_workload: max,
+        max_exchanges_per_workload: 1,
+        ..config(dir.path())
+    })
+    .await
+    .unwrap();
+    // Workload déjà vu : ses échanges sont en mémoire dès l'ingestion.
+    assert!(request_ids(&c, "checkout", "outbound").await.is_empty());
+    push(&c, "checkout-a", &[a1]).await;
+    push(&c, "checkout-a", &[big("checkout-a-2", "/b", 20, 500)]).await;
+    push(&c, "checkout-a", &[big("checkout-a-3", "/a", 30, 2_000)]).await;
+    let m = get_text(&c, "/metrics").await;
+    assert_eq!(
+        metric(
+            &m,
+            r#"mimic_controller_exemplars_refused_total{reason="bytes"}"#
+        ),
+        Some(2.0),
+        "{m}"
+    );
+    assert_eq!(metric(&m, "mimic_controller_exemplars"), Some(2.0), "{m}");
+    push(&c, "checkout-a", &[big("checkout-a-4", "/a", 40, 1)]).await;
+    // `/b` n'est plus en mémoire : son exemple sans body le garde dans la découverte.
+    assert!(operation_paths(&c).await.contains(&"/b".to_string()));
+    c.state().maintain().await;
+    let mut ex = exemplars(dir.path(), "checkout");
+    ex.sort();
+    assert_eq!(
+        ex,
+        [
+            ("checkout-a-2".into(), "/b".into(), "skipped".into()),
+            captured("checkout-a-4", "/a"),
+        ]
+    );
+    let m = get_text(&c, "/metrics").await;
+    let kept = metric(&m, "mimic_controller_exemplars_bytes").unwrap();
+    assert!(kept <= max as f64, "{kept} > {max}");
+}
+
+#[tokio::test]
+async fn ctl_22_total_bound_spans_workloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let a1 = big("checkout-a-1", "/a", 10, 500);
+    let c = start(ControllerConfig {
+        max_exemplar_bytes_total: serialized(&a1) + 200,
+        ..config(dir.path())
+    })
+    .await
+    .unwrap();
+    push(&c, "checkout-a", &[a1]).await;
+    push(&c, "web-a", &[big("web-a-1", "/w", 20, 500)]).await;
+    let m = get_text(&c, "/metrics").await;
+    assert_eq!(
+        metric(
+            &m,
+            r#"mimic_controller_exemplars_refused_total{reason="bytes"}"#
+        ),
+        Some(1.0),
+        "{m}"
+    );
+    c.state().maintain().await;
+    assert_eq!(
+        exemplars(dir.path(), "checkout"),
+        [captured("checkout-a-1", "/a")]
+    );
+    assert_eq!(
+        exemplars(dir.path(), "web"),
+        [(
+            "web-a-1".to_string(),
+            "/w".to_string(),
+            "skipped".to_string()
+        )]
+    );
 }

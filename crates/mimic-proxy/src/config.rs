@@ -328,6 +328,8 @@ pub struct ShareConfig {
     pub url: String,
     #[serde(default = "default_share_interval", with = "duration_secs")]
     pub interval: Duration,
+    /// Partage direct : âge au-delà duquel un segment de pair n'est plus importé (24 heures
+    /// par défaut). Sous contrôleur, rien n'est importé (spec §5.4).
     #[serde(default = "default_share_retention", with = "duration_secs")]
     pub retention: Duration,
     /// Période du battement vers le contrôleur.
@@ -411,7 +413,7 @@ fn default_share_backlog() -> usize {
 }
 
 fn default_share_retention() -> Duration {
-    Duration::from_secs(7 * 24 * 3600)
+    Duration::from_secs(24 * 3600)
 }
 
 /// Durées exprimées en secondes dans le YAML.
@@ -553,6 +555,16 @@ mod tests {
         assert_eq!(c.mode, Mode::Mock);
         assert_eq!(c.mock.strategy, StrategyName::WeightedStatus);
         assert_eq!(c.capture.samples_per_operation, 20);
+    }
+
+    /// Historique court par défaut (CTL-21) : `share.retention` de 24 heures, aussi quand
+    /// le YAML ne la donne pas.
+    #[test]
+    fn ctl_21_share_retention_defaults_to_24_hours() {
+        let day = Duration::from_secs(24 * 3600);
+        assert_eq!(ShareConfig::default().retention, day);
+        let s: ShareConfig = serde_yaml::from_str("url: s3://bucket/p\n").unwrap();
+        assert_eq!(s.retention, day);
     }
 
     #[test]

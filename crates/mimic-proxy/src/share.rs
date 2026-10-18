@@ -1,8 +1,14 @@
 //! Partage des enregistrements entre les sidecars d'un même workload (spec §5.4).
 //!
-//! Chaque sidecar publie ses nouveaux échanges (déjà redactés) dans des segments JSONL, puis
-//! importe les segments des autres instances. Le support est le contrôleur (recommandé) ou un
-//! stockage objet partagé sous `<prefixe>/<namespace>/<workload>/exchanges/<instance>/`.
+//! Chaque sidecar publie ses nouveaux échanges (déjà redactés) dans des segments JSONL. Le
+//! support est le contrôleur (recommandé) ou un stockage objet partagé sous
+//! `<prefixe>/<namespace>/<workload>/exchanges/<instance>/`.
+//!
+//! - Sous contrôleur, le sidecar ne fait que publier : il ne liste ni n'importe les segments
+//!   de ses pairs. Son store ne contient que ce que son pod a vu, et son mock sert le snapshot
+//!   poussé par le contrôleur, le même sur tous les pods (§5.6).
+//! - En partage direct (stockage objet, sans contrôleur), il importe aussi les segments des
+//!   autres instances.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -29,6 +35,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 enum Backend {
     Object(Arc<dyn ObjectStore>),
+    /// Publication seule : les pairs ne sont ni listés ni importés.
     Controller(Arc<ControllerClient>),
 }
 
@@ -143,13 +150,51 @@ struct Sharer {
     /// Chemin relatif au support, sans le préfixe de l'URL.
     base: String,
     backend: Option<Backend>,
-    /// Segments importés, avec leur date : ceux d'avant la fenêtre de la liste incrémentale
-    /// ne seront plus listés et sont oubliés.
-    imported: BTreeMap<String, i64>,
-    /// Date (ms) du segment le plus récent déjà listé ; n'avance qu'après un import réussi.
-    listed_upto_ms: Option<i64>,
+    cursor: Cursor,
     /// Instances vues dans les listes successives.
     peers: BTreeSet<String>,
+}
+
+/// Fenêtre de la liste incrémentale du partage direct (spec §5.4).
+#[derive(Debug, Default)]
+struct Cursor {
+    /// Segments importés, avec leur date : ceux d'avant la fenêtre ne seront plus considérés
+    /// et sont oubliés.
+    imported: BTreeMap<String, i64>,
+    /// Date (ms) du segment le plus récent déjà listé ; n'avance qu'après un import complet.
+    listed_upto_ms: Option<i64>,
+}
+
+impl Cursor {
+    /// Début de la fenêtre : date du plus récent listé moins la marge.
+    fn since(&self) -> Option<i64> {
+        self.listed_upto_ms.map(|ms| ms - LIST_OVERLAP_MS)
+    }
+
+    /// Vrai si le segment est à importer : dans la fenêtre, dans la rétention et pas déjà lu.
+    fn wants(&self, key: &str, modified_ms: i64, oldest_ms: i64) -> bool {
+        !self.since().is_some_and(|s| modified_ms < s)
+            && modified_ms >= oldest_ms
+            && !self.imported.contains_key(key)
+    }
+
+    fn imported(&mut self, key: &str, at_ms: i64) {
+        self.imported.insert(key.to_string(), at_ms);
+    }
+
+    /// Tous les segments listés sont importés : la fenêtre suit le plus récent.
+    fn complete(&mut self, newest_ms: Option<i64>) {
+        if let Some(max) = newest_ms {
+            let upto = self.listed_upto_ms.map_or(max, |m| m.max(max));
+            self.listed_upto_ms = Some(upto);
+            self.imported.retain(|_, at| *at >= upto - LIST_OVERLAP_MS);
+        }
+    }
+
+    #[cfg(test)]
+    fn remembered(&self) -> usize {
+        self.imported.len()
+    }
 }
 
 impl Sharer {
@@ -158,8 +203,7 @@ impl Sharer {
             config,
             base,
             backend: controller.map(Backend::Controller),
-            imported: BTreeMap::new(),
-            listed_upto_ms: None,
+            cursor: Cursor::default(),
             peers: BTreeSet::new(),
         }
     }
@@ -204,30 +248,31 @@ impl Sharer {
     async fn try_sync(&mut self, state: &AppState) -> Result<BTreeSet<String>, String> {
         let backend = self.backend()?;
         publish(state, &backend, &self.base).await?;
+        let Backend::Object(store) = &backend else {
+            // Sous contrôleur : publication seule, aucun pair (spec §5.4).
+            return Ok(BTreeSet::new());
+        };
 
         let me = &state.config.instance;
         let oldest_ms = now_ms().saturating_sub(self.config.retention.as_millis() as u64) as i64;
-        let since = self.listed_upto_ms.map(|ms| ms - LIST_OVERLAP_MS);
-        let listed = list(&backend, &self.base, since).await?;
+        let listed = list(store, &self.base).await?;
         let newest = listed.iter().map(|s| s.modified_ms).max();
         let mut to_import = vec![];
         for seg in listed {
-            // Filtre local : un stockage objet, ou un ancien contrôleur, liste tout.
-            if seg.instance == *me || since.is_some_and(|s| seg.modified_ms < s) {
+            if seg.instance == *me {
                 continue;
             }
-            // Instances réservées (`_hour`, segments horaires du contrôleur) : pas des pairs.
+            // Instances réservées (`_hour`) : pas des pairs.
             if !seg.instance.starts_with('_') {
                 self.peers.insert(seg.instance.clone());
             }
-            if seg.modified_ms < oldest_ms || self.imported.contains_key(&seg.key) {
-                continue;
+            if self.cursor.wants(&seg.key, seg.modified_ms, oldest_ms) {
+                to_import.push((seg.key, seg.modified_ms));
             }
-            to_import.push((seg.key, seg.modified_ms));
         }
         let mut imported = 0;
         for (key, at) in to_import {
-            let bytes = get(&backend, &key).await?;
+            let bytes = get(store, &key).await?;
             for line in bytes.split(|b| *b == b'\n') {
                 if line.is_empty() {
                     continue;
@@ -237,14 +282,10 @@ impl Sharer {
                     imported += 1;
                 }
             }
-            self.imported.insert(key, at);
+            self.cursor.imported(&key, at);
         }
-        // Tout est importé : le curseur avance, la fenêtre suivante commence plus tard.
-        if let Some(max) = newest {
-            let upto = self.listed_upto_ms.map_or(max, |m| m.max(max));
-            self.listed_upto_ms = Some(upto);
-            self.imported.retain(|_, at| *at >= upto - LIST_OVERLAP_MS);
-        }
+        // Tout est importé : la fenêtre suivante commence plus tard.
+        self.cursor.complete(newest);
         if imported > 0 {
             tracing::debug!(imported, "échanges importés des autres sidecars");
             state.refresh_store_metrics();
@@ -253,50 +294,34 @@ impl Sharer {
     }
 }
 
-async fn list(backend: &Backend, base: &str, since_ms: Option<i64>) -> Result<Vec<Seen>, String> {
-    match backend {
-        Backend::Controller(c) => Ok(c
-            .segments(since_ms)
-            .await?
-            .into_iter()
-            .map(|s| Seen {
-                key: s.key,
-                instance: s.instance,
-                modified_ms: s.modified_ms,
-            })
-            .collect()),
-        Backend::Object(store) => {
-            let prefix = Path::from(base);
-            let mut listing = store.list(Some(&prefix));
-            let mut out = vec![];
-            while let Some(meta) = listing.next().await {
-                let meta = meta.map_err(|e| format!("liste du partage: {e}"))?;
-                let key = meta.location.to_string();
-                let Some(instance) = instance_of(base, &key) else {
-                    continue;
-                };
-                out.push(Seen {
-                    instance: instance.to_string(),
-                    modified_ms: meta.last_modified.timestamp_millis(),
-                    key,
-                });
-            }
-            Ok(out)
-        }
+/// Segments du stockage objet partagé (filtre local par la fenêtre du curseur).
+async fn list(store: &Arc<dyn ObjectStore>, base: &str) -> Result<Vec<Seen>, String> {
+    let prefix = Path::from(base);
+    let mut listing = store.list(Some(&prefix));
+    let mut out = vec![];
+    while let Some(meta) = listing.next().await {
+        let meta = meta.map_err(|e| format!("liste du partage: {e}"))?;
+        let key = meta.location.to_string();
+        let Some(instance) = instance_of(base, &key) else {
+            continue;
+        };
+        out.push(Seen {
+            instance: instance.to_string(),
+            modified_ms: meta.last_modified.timestamp_millis(),
+            key,
+        });
     }
+    Ok(out)
 }
 
-async fn get(backend: &Backend, key: &str) -> Result<bytes::Bytes, String> {
-    match backend {
-        Backend::Controller(c) => c.segment(key).await,
-        Backend::Object(store) => store
-            .get(&Path::from(key))
-            .await
-            .map_err(|e| format!("lecture de {key}: {e}"))?
-            .bytes()
-            .await
-            .map_err(|e| format!("lecture de {key}: {e}")),
-    }
+async fn get(store: &Arc<dyn ObjectStore>, key: &str) -> Result<bytes::Bytes, String> {
+    store
+        .get(&Path::from(key))
+        .await
+        .map_err(|e| format!("lecture de {key}: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("lecture de {key}: {e}"))
 }
 
 /// Prochain segment à publier : celui déjà scellé (renvoyé sous le même identifiant), sinon
@@ -434,6 +459,30 @@ mod tests {
         let big = [Arc::new(ex("big", 4 * line)), Arc::new(ex("small", 1))];
         assert_eq!(first_segment(&big, line).1, 1);
         assert_eq!(ids(&lines(&list)).len(), 5);
+    }
+
+    #[test]
+    fn shr_08_cursor_advances_only_after_a_complete_import() {
+        let t = 10_000_000;
+        let mut c = Cursor::default();
+        assert_eq!(c.since(), None);
+        assert!(c.wants("p/1", t, 0));
+        // Hors rétention : jamais importé.
+        assert!(!c.wants("p/0", t, t + 1));
+        // Import échoué : rien n'est marqué, le curseur ne bouge pas.
+        assert_eq!(c.since(), None);
+        assert!(c.wants("p/1", t, 0));
+        // Import complet : le segment n'est plus voulu, la fenêtre suit le plus récent.
+        c.imported("p/1", t);
+        c.complete(Some(t));
+        assert_eq!(c.since(), Some(t - LIST_OVERLAP_MS));
+        assert!(!c.wants("p/1", t, 0));
+        assert!(!c.wants("p/old", t - LIST_OVERLAP_MS - 1, 0));
+        assert!(c.wants("p/2", t - LIST_OVERLAP_MS, 0));
+        // Les segments sortis de la fenêtre sont oubliés.
+        c.imported("p/2", t - LIST_OVERLAP_MS);
+        c.complete(Some(t + 2 * LIST_OVERLAP_MS));
+        assert_eq!(c.remembered(), 0);
     }
 
     #[test]

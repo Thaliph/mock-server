@@ -8,7 +8,10 @@
 //!   prend une vue figée sans les copier et tourne hors des threads du serveur
 //!   (`spawn_blocking`), pendant que l'ingestion continue ;
 //! - le contrôleur est le seul écrivant de son support : l'index des segments est construit par
-//!   une seule liste, puis tenu à jour à chaque ingestion, compaction ou suppression.
+//!   une seule liste, puis tenu à jour à chaque ingestion, compaction ou suppression ;
+//! - chaque workload garde un exemple rejouable par endpoint (spec §5.5.3), hors des plafonds
+//!   et de la rétention : un segment n'est supprimé qu'une fois ses échanges proposés aux
+//!   exemples et ceux-ci écrits sur le support (`exemplars.jsonl`).
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -20,6 +23,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use mimic_core::compact::{BodySamples, Compactor, hour_of, hour_start};
+use mimic_core::exemplar::{Exemplars, best_per_endpoint, jsonl};
 use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::model::{Direction, Exchange};
 use mimic_core::snapshot::{Snapshot, SnapshotOptions, build};
@@ -57,6 +61,8 @@ pub struct Ctl {
     scanned: OnceCell<()>,
     /// Échanges en mémoire, tous workloads confondus.
     total: AtomicUsize,
+    /// Taille des exemples, tous workloads confondus (borne `max_exemplar_bytes_total`).
+    exemplar_room: Room,
     /// Namespaces labellisés `env=production` : le mock y est refusé (spec §5.5.1).
     production: Mutex<BTreeSet<String>>,
 }
@@ -125,7 +131,7 @@ impl Chunk {
         match &self.instance {
             Some(i) => i,
             // Identifiant `<instance>-<ULID>` (spec §5.4).
-            None => e.id.rsplit_once('-').map(|(i, _)| i).unwrap_or_default(),
+            None => instance_of_id(&e.id),
         }
     }
 }
@@ -137,24 +143,66 @@ struct Data {
     len: usize,
     ids: BTreeSet<String>,
     bodies: BodySamples,
-    /// Change à chaque ajout ou éviction.
+    /// Exemple de chaque endpoint (spec §5.5.3), hors des plafonds d'échanges.
+    exemplars: Exemplars,
+    /// Version des exemples déjà écrite sur le support.
+    flushed: u64,
+    /// Segments dont les échanges ont déjà été proposés aux exemples par ce processus.
+    offered: BTreeSet<String>,
+    /// Change à chaque ajout ou éviction, et à chaque changement d'exemple.
     version: u64,
 }
 
-/// Vue figée des échanges d'un workload, du plus ancien au plus récent.
+/// Place des exemples commune à tous les workloads.
+struct Room {
+    /// Octets tenus ; pris sous le verrou des échanges d'un workload, jamais l'inverse.
+    used: Mutex<u64>,
+    max: u64,
+}
+
+/// Exemples refusés : (borne en nombre, bornes en octets).
+type Refused = (u64, u64);
+
+/// Exemples ajoutés à une vue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Extra {
+    /// Tous : le snapshot garde, de deux versions d'un échange, celle qui est rejouable.
+    All,
+    /// Seulement ceux dont l'échange n'est plus en mémoire (découverte, requêtes).
+    Missing,
+}
+
+/// Vue figée des échanges d'un workload, du plus ancien au plus récent, suivis d'exemples.
 struct View {
     chunks: Vec<(Arc<Chunk>, usize)>,
+    extra: Vec<Arc<Exchange>>,
     version: u64,
 }
 
 impl View {
     fn iter(&self) -> impl Iterator<Item = Tagged<'_>> {
-        self.chunks.iter().flat_map(|(c, from)| {
-            c.exchanges[*from..]
-                .iter()
-                .map(move |e| Tagged(c.instance_of(e), e))
-        })
+        self.chunks
+            .iter()
+            .flat_map(|(c, from)| {
+                c.exchanges[*from..]
+                    .iter()
+                    .map(move |e| Tagged(c.instance_of(e), e))
+            })
+            .chain(self.extra.iter().map(|e| Tagged(instance_of_id(&e.id), e)))
     }
+}
+
+/// Instance d'un échange d'après son identifiant `<instance>-<ULID>` (spec §5.4).
+fn instance_of_id(id: &str) -> &str {
+    id.rsplit_once('-').map(|(i, _)| i).unwrap_or_default()
+}
+
+/// Copie des meilleurs candidats de `list` aux exemples, un par endpoint.
+fn winners(list: &[Exchange]) -> Vec<Arc<Exchange>> {
+    best_per_endpoint(list)
+        .into_values()
+        .map(|e| Arc::new(e.clone()))
+        .collect()
 }
 
 /// Échange vu avec l'instance qui l'a écrit, sans copie.
@@ -167,21 +215,64 @@ impl Borrow<Exchange> for Tagged<'_> {
 }
 
 impl Data {
-    fn new(samples: usize) -> Self {
+    fn new(samples: usize, max_exemplars: usize, max_exemplar_bytes: u64) -> Self {
         Self {
             chunks: VecDeque::new(),
             len: 0,
             ids: BTreeSet::new(),
             bodies: BodySamples::new(samples),
+            exemplars: Exemplars::with_limits(max_exemplars, max_exemplar_bytes),
+            flushed: 0,
+            offered: BTreeSet::new(),
             version: 0,
         }
     }
 
-    fn view(&self) -> View {
+    fn view(&self, extra: Extra) -> View {
         View {
             chunks: self.chunks.iter().cloned().collect(),
+            extra: self
+                .exemplars
+                .iter()
+                .filter(|x| extra == Extra::All || !self.ids.contains(&x.id))
+                .cloned()
+                .collect(),
             version: self.version,
         }
+    }
+
+    /// Propose des candidats aux exemples ; `key` est le segment d'où ils viennent. Rend les
+    /// candidats refusés faute de place.
+    fn offer(&mut self, key: Option<&str>, list: Vec<Arc<Exchange>>, room: &Room) -> Refused {
+        if let Some(k) = key {
+            self.offered.insert(k.to_string());
+        }
+        self.propose(list, room, false)
+    }
+
+    /// Reprend les exemples relus de `exemplars.jsonl`, ceux sans body compris.
+    fn restore(&mut self, list: Vec<Arc<Exchange>>, room: &Room) -> Refused {
+        self.propose(list, room, true)
+    }
+
+    fn propose(&mut self, list: Vec<Arc<Exchange>>, room: &Room, restore: bool) -> Refused {
+        let x = &mut self.exemplars;
+        let (version, refused, refused_bytes) = (x.version(), x.refused(), x.refused_bytes());
+        let mut used = room.used.lock().expect("verrou de la place des exemples");
+        for e in list {
+            let (before, left) = (x.bytes(), room.max.saturating_sub(*used));
+            if restore {
+                x.restore_within(e, left);
+            } else {
+                x.offer_shared_within(e, left);
+            }
+            *used = (*used + x.bytes()).saturating_sub(before);
+        }
+        drop(used);
+        if x.version() != version {
+            self.version += 1;
+        }
+        (x.refused() - refused, x.refused_bytes() - refused_bytes)
     }
 
     /// Garde les échanges inconnus de `list`, sans doublon.
@@ -365,6 +456,10 @@ pub struct Entry {
     loaded: OnceCell<()>,
     /// Vrai dès que la relecture a pris sa liste de segments, sous le verrou de l'index.
     load_started: AtomicBool,
+    /// Exemples relus du support avant le premier exemple proposé.
+    exemplars_loaded: OnceCell<()>,
+    /// Une seule écriture des exemples à la fois : la dernière écrite est la plus récente.
+    flush: tokio::sync::Mutex<()>,
     data: Mutex<Data>,
     discovery: Mutex<DiscoveryCache>,
 }
@@ -394,13 +489,17 @@ impl Entry {
         Path::from(format!("{}/exchanges/{key}", self.base()))
     }
 
+    fn exemplars_path(&self) -> Path {
+        Path::from(format!("{}/exemplars.jsonl", self.base()))
+    }
+
     /// Lance le calcul de la découverte en tâche de fond ; à appeler sous le verrou de
     /// `discovery`, qui reçoit le calcul avant que la tâche puisse le terminer.
     fn start_discovery(
         self: &Arc<Self>,
         cache: &mut DiscoveryCache,
     ) -> Shared<BoxFuture<'static, Option<Arc<Discovery>>>> {
-        let view = self.data().view();
+        let view = self.data().view(Extra::Missing);
         let entry = self.clone();
         let started = now_ms();
         let work = async move {
@@ -479,6 +578,10 @@ fn parse_lines(bytes: &[u8]) -> Vec<Exchange> {
 
 impl Ctl {
     pub fn new(config: ControllerConfig, store: Arc<dyn ObjectStore>, auth: Authenticator) -> Self {
+        let exemplar_room = Room {
+            used: Mutex::new(0),
+            max: config.max_exemplar_bytes_total,
+        };
         Self {
             config,
             store,
@@ -487,6 +590,7 @@ impl Ctl {
             workloads: Mutex::new(BTreeMap::new()),
             scanned: OnceCell::new(),
             total: AtomicUsize::new(0),
+            exemplar_room,
             production: Mutex::new(BTreeSet::new()),
         }
     }
@@ -544,7 +648,13 @@ impl Ctl {
                     index: Mutex::new(SegmentIndex::default()),
                     loaded: OnceCell::new(),
                     load_started: AtomicBool::new(false),
-                    data: Mutex::new(Data::new(self.config.samples_per_operation)),
+                    exemplars_loaded: OnceCell::new(),
+                    flush: tokio::sync::Mutex::new(()),
+                    data: Mutex::new(Data::new(
+                        self.config.samples_per_operation,
+                        self.config.max_exemplars_per_workload,
+                        self.config.max_exemplar_bytes_per_workload,
+                    )),
                     discovery: Mutex::new(DiscoveryCache::default()),
                 })
             })
@@ -669,6 +779,9 @@ impl Ctl {
     /// Relit les échanges du workload au premier besoin : segments de la rétention, du plus
     /// récent au plus ancien, jusqu'au plafond du workload (spec §5.5.2).
     async fn load(&self, e: &Entry) {
+        if let Err(err) = self.exemplars_of(e).await {
+            tracing::warn!(namespace = %e.namespace, workload = %e.name, error = %err, "relecture des exemples");
+        }
         let result = e
             .loaded
             .get_or_try_init(|| async {
@@ -723,20 +836,26 @@ impl Ctl {
                         .map(|(i, _)| i)
                         .filter(|i| *i != COMPACTED)
                         .map(String::from);
-                    (instance, parse_lines(&bytes))
+                    let list = parse_lines(&bytes);
+                    let best = winners(&list);
+                    (key, instance, list, best)
                 })
                 .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
         let max = self.config.max_exchanges_per_workload;
-        let mut added = 0;
+        let (mut added, mut refused) = (0, (0, 0));
         {
             let mut d = e.data();
-            for (instance, list) in parsed {
+            for (key, instance, list, best) in parsed {
+                // Proposés avant que le plafond de bodies ne retire les leurs.
+                let (count, bytes) = d.offer(Some(&key), best, &self.exemplar_room);
+                refused = (refused.0 + count, refused.1 + bytes);
                 added += d.push_front(instance, list, max);
             }
         }
+        self.metrics.refuse_exemplars(refused);
         self.total.fetch_add(added, Ordering::Relaxed);
     }
 
@@ -802,14 +921,18 @@ impl Ctl {
                     serde_json::from_slice(line).map_err(|e| format!("ligne {}: {e}", i + 1))?;
                 parsed.push(e);
             }
-            Ok::<_, String>(parsed)
+            let best = winners(&parsed);
+            Ok::<_, String>((parsed, best))
         })
         .await
         .map_err(|e| IngestError::Invalid(e.to_string()))?
         .map_err(IngestError::Invalid)?;
+        let (parsed, best) = parsed;
 
         let e = self.entry(ns, wl);
         self.index_of(&e).await.map_err(IngestError::Storage)?;
+        // Les exemples déjà rangés passent avant ceux de ce segment (borne, §5.5.3).
+        self.exemplars_of(&e).await.map_err(IngestError::Storage)?;
         let id = segment.map_or_else(|| ulid::Ulid::generate().to_string(), String::from);
         let key = format!("{instance}/{id}.jsonl");
         if e.index().contains(&key) {
@@ -850,6 +973,9 @@ impl Ctl {
             index.insert(key.clone(), now_ms() as i64, size);
             e.load_started.load(Ordering::Relaxed)
         };
+        // Exemples proposés tels que reçus, avant le plafond de bodies en mémoire.
+        let refused = e.data().offer(Some(&key), best, &self.exemplar_room);
+        self.metrics.refuse_exemplars(refused);
         if loading {
             let (added, evicted) =
                 e.data()
@@ -980,7 +1106,8 @@ impl Ctl {
     /// Construit et range un snapshot des échanges sortants du workload.
     async fn build_snapshot(&self, e: &Entry) -> Result<Snapshot, String> {
         self.load(e).await;
-        let view = e.data().view();
+        // Échanges en mémoire et exemples : un endpoint ancien reste mockable (§5.5.3).
+        let view = e.data().view(Extra::All);
         let opts = SnapshotOptions {
             max_per_key: self.config.snapshot.max_per_key,
         };
@@ -1139,7 +1266,7 @@ impl Ctl {
     {
         let e = self.entry(ns, wl);
         self.load(&e).await;
-        let view = e.data().view();
+        let view = e.data().view(Extra::Missing);
         tokio::task::spawn_blocking(move || {
             f(mimic_core::replay::recent_requests(
                 view.iter(),
@@ -1174,6 +1301,16 @@ impl Ctl {
         self.metrics
             .exchanges
             .set(self.total.load(Ordering::Relaxed) as i64);
+        let (exemplars, bytes) = self
+            .entries()
+            .iter()
+            .map(|e| {
+                let d = e.data();
+                (d.exemplars.len(), d.exemplars.bytes())
+            })
+            .fold((0, 0), |(n, b), (dn, db)| (n + dn, b + db));
+        self.metrics.exemplars.set(exemplars as i64);
+        self.metrics.exemplars_bytes.set(bytes as i64);
         let mut counts: BTreeMap<&'static str, i64> =
             [("aligned", 0), ("diverging", 0), ("absent", 0)].into();
         for (ns, wl) in keys {
@@ -1193,7 +1330,9 @@ impl Ctl {
     }
 
     /// Passe de maintenance (toutes les minutes) : pods oubliés, puis pour chaque workload
-    /// rétention, compaction des heures révolues et plafond de volume du support.
+    /// exemples écrits s'ils ont changé, rétention, compaction des heures révolues et plafond
+    /// de volume du support. Aucun segment n'est supprimé avant que ses échanges aient été
+    /// proposés aux exemples et que ceux-ci soient écrits (spec §5.5.3).
     pub async fn maintain(&self) {
         let now = now_ms();
         self.workload_keys().await;
@@ -1203,14 +1342,20 @@ impl Ctl {
                 tracing::warn!(namespace = %e.namespace, workload = %e.name, error = %err, "index des segments");
                 continue;
             }
+            if let Err(err) = self.flush_exemplars(&e).await {
+                tracing::warn!(namespace = %e.namespace, workload = %e.name, error = %err, "écriture des exemples : aucun segment supprimé");
+                continue;
+            }
             let expired: Vec<String> = e
                 .index()
                 .older_than(self.oldest_ms())
                 .into_iter()
                 .map(|(_, k)| k)
                 .collect();
-            for key in expired {
-                self.remove_segment(&e, &key).await;
+            if !expired.is_empty() && self.prepare_removal(&e, &expired).await {
+                for key in expired {
+                    self.remove_segment(&e, &key).await;
+                }
             }
             self.compact(&e, now as i64).await;
             loop {
@@ -1224,9 +1369,128 @@ impl Ctl {
                 let Some(key) = oldest else {
                     break;
                 };
-                if !self.remove_segment(&e, &key).await {
+                if !self.prepare_removal(&e, std::slice::from_ref(&key)).await
+                    || !self.remove_segment(&e, &key).await
+                {
                     break;
                 }
+            }
+        }
+    }
+
+    /// Écrit les exemples de chaque workload qui ont changé (arrêt du contrôleur).
+    pub async fn flush_all(&self) {
+        for e in self.entries() {
+            if e.exemplars_loaded.initialized()
+                && let Err(err) = self.flush_exemplars(&e).await
+            {
+                tracing::warn!(namespace = %e.namespace, workload = %e.name, error = %err, "écriture des exemples");
+            }
+        }
+    }
+
+    /// Relit une fois `exemplars.jsonl`, avant tout nouvel exemple : ceux d'avant le
+    /// redémarrage gardent leur place sous la borne.
+    async fn exemplars_of(&self, e: &Entry) -> Result<(), String> {
+        e.exemplars_loaded
+            .get_or_try_init(|| async {
+                let path = e.exemplars_path();
+                let bytes = match self.store.get(&path).await {
+                    Ok(r) => r
+                        .bytes()
+                        .await
+                        .map_err(|err| format!("lecture de {path}: {err}"))?,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(()),
+                    Err(err) => return Err(format!("lecture de {path}: {err}")),
+                };
+                let list = tokio::task::spawn_blocking(move || {
+                    Exemplars::parse(&bytes)
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .map_err(|err| format!("lecture de {path}: {err}"))?;
+                let refused = {
+                    let mut d = e.data();
+                    let refused = d.restore(list, &self.exemplar_room);
+                    // Relus du support : rien à réécrire.
+                    d.flushed = d.exemplars.version();
+                    refused
+                };
+                self.metrics.refuse_exemplars(refused);
+                Ok::<(), String>(())
+            })
+            .await
+            .map(|_| ())
+    }
+
+    /// Écrit `exemplars.jsonl` s'il a changé depuis la dernière écriture.
+    async fn flush_exemplars(&self, e: &Entry) -> Result<(), String> {
+        self.exemplars_of(e).await?;
+        let _one = e.flush.lock().await;
+        let (version, list) = {
+            let d = e.data();
+            if d.exemplars.version() == d.flushed {
+                return Ok(());
+            }
+            let list: Vec<Arc<Exchange>> = d.exemplars.iter().cloned().collect();
+            (d.exemplars.version(), list)
+        };
+        let path = e.exemplars_path();
+        let body = tokio::task::spawn_blocking(move || jsonl(&list))
+            .await
+            .map_err(|err| format!("écriture de {path}: {err}"))?;
+        self.store
+            .put(&path, PutPayload::from(body))
+            .await
+            .map_err(|err| format!("écriture de {path}: {err}"))?;
+        let mut d = e.data();
+        d.flushed = d.flushed.max(version);
+        Ok(())
+    }
+
+    /// Avant de supprimer `keys` : propose aux exemples les échanges des segments qui ne
+    /// l'ont pas encore été (rangés avant le démarrage), puis écrit les exemples. Faux si un
+    /// segment n'a pas pu être relu ou si l'écriture a échoué : rien ne doit alors être
+    /// supprimé.
+    async fn prepare_removal(&self, e: &Entry, keys: &[String]) -> bool {
+        if let Err(err) = self.exemplars_of(e).await {
+            tracing::warn!(namespace = %e.namespace, workload = %e.name, error = %err, "relecture des exemples");
+            return false;
+        }
+        let unseen: Vec<String> = {
+            let d = e.data();
+            keys.iter()
+                .filter(|k| !d.offered.contains(*k))
+                .cloned()
+                .collect()
+        };
+        for key in unseen {
+            let bytes = match self.store.get(&e.segment_path(&key)).await {
+                Ok(r) => r.bytes().await,
+                Err(err) => Err(err),
+            };
+            let bytes = match bytes {
+                Ok(b) => b,
+                // Déjà supprimé : plus rien à proposer.
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(err) => {
+                    tracing::warn!(segment = %key, error = %err, "relecture avant suppression");
+                    return false;
+                }
+            };
+            let best = tokio::task::spawn_blocking(move || winners(&parse_lines(&bytes)))
+                .await
+                .unwrap_or_default();
+            let refused = e.data().offer(Some(&key), best, &self.exemplar_room);
+            self.metrics.refuse_exemplars(refused);
+        }
+        match self.flush_exemplars(e).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(namespace = %e.namespace, workload = %e.name, error = %err, "écriture des exemples : segments gardés");
+                false
             }
         }
     }
@@ -1236,6 +1500,7 @@ impl Ctl {
         match self.store.delete(&e.segment_path(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {
                 e.index().remove(key);
+                e.data().offered.remove(key);
                 true
             }
             Err(err) => {
@@ -1247,7 +1512,9 @@ impl Ctl {
 
     /// Fusionne les segments bruts de chaque heure révolue depuis plus de `COMPACT_GRACE_MS`
     /// en un segment horaire. Celui-ci est écrit avant la suppression des segments bruts : un
-    /// arrêt entre les deux ne perd rien, la passe suivante refait la fusion.
+    /// arrêt entre les deux ne perd rien, la passe suivante refait la fusion. Les échanges
+    /// relus sont proposés aux exemples avant que la fusion ne retire des bodies, et les
+    /// exemples sont écrits avant la suppression.
     async fn compact(&self, e: &Entry, now: i64) {
         let mut hours: BTreeMap<i64, (String, Vec<String>)> = BTreeMap::new();
         for (at, key) in e.index().older_than(now - COMPACT_GRACE_MS) {
@@ -1279,22 +1546,30 @@ impl Ctl {
                 };
                 match bytes {
                     Ok(bytes) => {
+                        let unseen = !e.data().offered.contains(key);
                         // Analyse et sérialisation hors des threads du serveur.
                         let mut c = compactor;
-                        compactor = match tokio::task::spawn_blocking(move || {
+                        match tokio::task::spawn_blocking(move || {
                             c.push(&bytes);
-                            c
+                            let best = if unseen {
+                                winners(&parse_lines(&bytes))
+                            } else {
+                                vec![]
+                            };
+                            (c, best)
                         })
                         .await
                         {
-                            Ok(c) => c,
-                            Err(_) => {
-                                complete = false;
-                                Compactor::new(0)
+                            Ok((c, best)) => {
+                                compactor = c;
+                                let refused = e.data().offer(Some(key), best, &self.exemplar_room);
+                                self.metrics.refuse_exemplars(refused);
                             }
-                        };
-                        if !complete {
-                            break;
+                            Err(_) => {
+                                compactor = Compactor::new(0);
+                                complete = false;
+                                break;
+                            }
                         }
                     }
                     Err(object_store::Error::NotFound { .. }) => {}
@@ -1318,7 +1593,14 @@ impl Ctl {
                 tracing::warn!(segment = %target, error = %err, "compaction : écriture");
                 continue;
             }
-            e.index().insert(target, start + 3_600_000 - 1, size);
+            e.index()
+                .insert(target.clone(), start + 3_600_000 - 1, size);
+            // Ses échanges sont ceux des segments relus, déjà proposés.
+            e.data().offered.insert(target);
+            if let Err(err) = self.flush_exemplars(e).await {
+                tracing::warn!(namespace = %e.namespace, workload = %e.name, error = %err, "compaction : exemples non écrits, segments bruts gardés");
+                continue;
+            }
             for key in raw {
                 self.remove_segment(e, &key).await;
             }
