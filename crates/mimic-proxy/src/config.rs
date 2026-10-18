@@ -236,6 +236,38 @@ pub enum Unmatched {
     Passthrough,
 }
 
+/// Poignée de main WebSocket sortante en `mock` et `mock-partial` (spec §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MockWebsocket {
+    /// Relayée vers l'amont et enregistrée, comme en record.
+    #[default]
+    Relay,
+    /// Refusée en `503` par le sidecar, sans joindre la dépendance.
+    Refuse,
+}
+
+impl MockWebsocket {
+    pub const ALL: [MockWebsocket; 2] = [MockWebsocket::Relay, MockWebsocket::Refuse];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MockWebsocket::Relay => "relay",
+            MockWebsocket::Refuse => "refuse",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<MockWebsocket> {
+        MockWebsocket::ALL
+            .into_iter()
+            .find(|w| w.as_str() == s.trim())
+    }
+
+    pub(crate) fn from_u8(v: u8) -> MockWebsocket {
+        MockWebsocket::ALL[v as usize % MockWebsocket::ALL.len()]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MockSection {
@@ -246,6 +278,8 @@ pub struct MockSection {
     pub seed: u64,
     /// Ajoute `x-mimic-match` aux réponses mockées.
     pub debug_header: bool,
+    /// Poignée de main WebSocket sortante en mock ; le contrôleur peut l'imposer (spec §5.5.1).
+    pub websocket: MockWebsocket,
 }
 
 impl Default for MockSection {
@@ -257,6 +291,7 @@ impl Default for MockSection {
             match_headers: vec![],
             seed: 0x5EED,
             debug_header: true,
+            websocket: MockWebsocket::Relay,
         }
     }
 }

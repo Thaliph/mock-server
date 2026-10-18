@@ -437,7 +437,8 @@ async fn prx_17_websocket_refusal_from_the_workload_reaches_the_sidecar() {
         }),
         ..MimicWorkloadSpec::default()
     };
-    ctl.apply_spec("ns", "api", Some(spec(Some("refuse")))).await;
+    ctl.apply_spec("ns", "api", Some(spec(Some("refuse"))))
+        .await;
     eventually("refus appliqué en mock", || async {
         let s = status(&a).await;
         s["mode"] == "mock" && s["mock_websocket"] == "refuse"

@@ -15,9 +15,8 @@ use mimic_core::model::{Body, Direction, Exchange, Header};
 use tokio::sync::oneshot;
 
 use crate::capture::{Captured, TeeBody};
-use crate::config::{InboundCapture, Mode, Unmatched};
+use crate::config::{InboundCapture, MockWebsocket, Mode, Unmatched};
 use crate::engine::{Arrived, MockSet, Trigger};
-use crate::metrics::DirectionLabel;
 use crate::state::{AppState, BoxError, ProxyBody};
 use crate::store::{Added, Origin};
 
@@ -150,8 +149,12 @@ pub async fn outbound(
     let (parts, body) = req.into_parts();
     let mode = state.mode();
     // Les trames ne sont pas enregistrées, il n'y a donc rien à rejouer : une poignée de main
-    // WebSocket est relayée dans tous les modes, et enregistrée hors passthrough (spec §3.4).
+    // WebSocket est relayée dans tous les modes, et enregistrée hors passthrough, sauf en
+    // mock avec `mock.websocket: refuse` (spec §3.4).
     if is_websocket_upgrade(&parts) {
+        if crate::engine::mock_mode(mode) && state.mock_websocket() == MockWebsocket::Refuse {
+            return refuse_websocket(&state, mode, &parts, &target);
+        }
         let record = if mode == Mode::Passthrough {
             Record::No
         } else {
@@ -353,13 +356,7 @@ async fn forward(
         (pending, rx)
     });
     if switched {
-        state
-            .metrics
-            .websocket_connections
-            .get_or_create(&DirectionLabel {
-                direction: dir_str(direction),
-            })
-            .inc();
+        state.metrics.count_websocket(direction, "relayed");
         let upstream_upgrade = resp_parts.extensions.remove::<OnUpgrade>();
         // Seule la poignée de main est enregistrée : le body de requête (vide) n'est pas attendu.
         let pending = pending.map(|(p, _)| p);
@@ -377,6 +374,35 @@ async fn forward(
     let (tee, resp_capture) = TeeBody::new(resp_body, limit);
     tokio::spawn(finalize(state, pending, req_capture, resp_capture));
     Response::from_parts(resp_parts, boxed(tee))
+}
+
+/// Refus d'une poignée de main WebSocket sortante en mock (`mock.websocket: refuse`) : `503`
+/// sans joindre la dépendance, rien d'enregistré, sans passer par le moteur (spec §3.4).
+fn refuse_websocket(
+    state: &AppState,
+    mode: Mode,
+    parts: &http::request::Parts,
+    target: &Target,
+) -> Response<ProxyBody> {
+    let authority_label = state.metrics.authority(&target.authority);
+    state
+        .metrics
+        .count_websocket(Direction::Outbound, "refused");
+    count_request(
+        state,
+        Direction::Outbound,
+        mode,
+        authority_label,
+        parts.method.as_str(),
+        503,
+    );
+    let mut r = text(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "mimic: WebSocket sortant refusé en mock (mock.websocket: refuse)",
+    );
+    r.headers_mut()
+        .insert("x-mimic-websocket", HeaderValue::from_static("refused"));
+    r
 }
 
 /// Poignée de main WebSocket en HTTP/1.1 : `Upgrade: websocket` et le jeton `upgrade` dans

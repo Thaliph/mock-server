@@ -7,7 +7,7 @@ use std::time::Duration;
 use common::ws::*;
 use common::*;
 use mimic_core::model::{Body, Exchange};
-use mimic_proxy::config::{Mode, MockWebsocket, Unmatched};
+use mimic_proxy::config::{MockWebsocket, Mode, Unmatched};
 use serde_json::Value;
 
 const SECRET: &str = "s3cr3t-ws-token";
@@ -158,7 +158,10 @@ async fn prx_16_refuse_answers_503_without_reaching_the_dependency() {
         let (head, body) = outbound_refused(&p, &server, "/ws").await;
         let lower = head.to_ascii_lowercase();
         assert!(head.starts_with("HTTP/1.1 503"), "{case} : {head}");
-        assert!(lower.contains("x-mimic-websocket: refused"), "{case} : {head}");
+        assert!(
+            lower.contains("x-mimic-websocket: refused"),
+            "{case} : {head}"
+        );
         assert!(!lower.contains("x-mimic-unmatched"), "{case} : {head}");
         assert!(!lower.contains("sec-websocket-accept"), "{case} : {head}");
         assert!(body.contains("mock.websocket"), "{case} : {body}");

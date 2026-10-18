@@ -6,7 +6,8 @@ use std::fmt::Write as _;
 
 use kube::api::ObjectMeta;
 use mimic_controller::crd::{
-    CaptureSpec, INBOUND_CAPTURES, LabelSelector, MODES, MimicWorkload, MimicWorkloadSpec,
+    CaptureSpec, INBOUND_CAPTURES, LabelSelector, MOCK_WEBSOCKETS, MODES, MimicWorkload,
+    MimicWorkloadSpec, MockSpec,
 };
 use serde_json::Value;
 
@@ -50,6 +51,8 @@ pub struct ModeOptions {
     pub capture_inbound: Option<String>,
     /// Égalités `clé=valeur` séparées par des virgules (`spec.selector.matchLabels`).
     pub selector: Option<String>,
+    /// `relay` ou `refuse` (`spec.mock.websocket`, spec §3.4).
+    pub mock_websocket: Option<String>,
 }
 
 /// Caractères permis dans une clé de label (préfixe DNS compris) ou une valeur.
@@ -107,6 +110,14 @@ pub fn workload_apply_with(
             INBOUND_CAPTURES.join(", ")
         ));
     }
+    if let Some(w) = &opts.mock_websocket
+        && !MOCK_WEBSOCKETS.contains(&w.as_str())
+    {
+        return Err(format!(
+            "réglage WebSocket inconnu « {w} » ; valeurs valides : {}",
+            MOCK_WEBSOCKETS.join(", ")
+        ));
+    }
     let selector = opts.selector.as_deref().map(parse_selector).transpose()?;
     Ok(MimicWorkload {
         metadata: ObjectMeta {
@@ -120,6 +131,9 @@ pub fn workload_apply_with(
             selector,
             capture: opts.capture_inbound.as_ref().map(|c| CaptureSpec {
                 inbound: Some(c.clone()),
+            }),
+            mock: opts.mock_websocket.as_ref().map(|w| MockSpec {
+                websocket: Some(w.clone()),
             }),
         },
         status: None,

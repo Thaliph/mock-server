@@ -37,6 +37,10 @@ enum Command {
         /// les autres gardent le mode de leur configuration.
         #[arg(long)]
         selector: Option<String>,
+        /// Poignée de main WebSocket sortante en mock : relay (relayée vers la dépendance)
+        /// ou refuse (503, sans joindre la dépendance).
+        #[arg(long)]
+        mock_websocket: Option<String>,
         #[arg(short, long)]
         namespace: Option<String>,
     },
@@ -135,14 +139,16 @@ async fn run(command: Command) -> Result<i32, String> {
             snapshot,
             capture_inbound,
             selector,
+            mock_websocket,
             namespace: ns,
         } => {
             let opts = ModeOptions {
                 snapshot,
                 capture_inbound,
                 selector,
+                mock_websocket,
             };
-            // Validation avant toute connexion au cluster (CLI-02, CLI-07).
+            // Validation avant toute connexion au cluster (CLI-02, CLI-07, CLI-08).
             workload_apply_with(ns.as_deref().unwrap_or("default"), &workload, &mode, &opts)?;
             let client = client().await?;
             let ns = namespace(ns, &client).await;

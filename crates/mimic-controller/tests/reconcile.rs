@@ -401,7 +401,9 @@ fn crd_10_mock_websocket_is_part_of_the_desired_state() {
         }),
         ..spec(mode, Some(ID))
     };
-    let o = reconcile(Some(&with("mock", "refuse")), &Desired::default(), &|_| true);
+    let o = reconcile(Some(&with("mock", "refuse")), &Desired::default(), &|_| {
+        true
+    });
     assert_eq!(o.desired.mock_websocket.as_deref(), Some("refuse"));
     assert_eq!(o.desired.mode.as_deref(), Some("mock"));
     assert_eq!(o.error, None);
