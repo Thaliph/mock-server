@@ -1,16 +1,15 @@
 //! Plafond de bodies par opération (spec §5.2) et compaction des segments partagés
 //! (spec §5.5.2). Les échanges traités ici sont déjà redactés : on ne fait qu'en retirer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::model::{Body, Exchange};
+use crate::sample::{Offer, Reservoir, priority, sample_key};
 
-/// Clé du plafond de bodies : sens, authority, méthode, chemin et code retour.
+/// Clé du plafond de bodies, la même que dans le sidecar (§5.2) : sens, authority, méthode,
+/// forme du chemin et code retour.
 pub fn body_key(e: &Exchange) -> String {
-    format!(
-        "{:?}|{}|{}|{}|{}",
-        e.direction, e.authority, e.method, e.path, e.status
-    )
+    sample_key(e.direction, &e.authority, &e.method, &e.path, e.status)
 }
 
 /// Vrai si la requête ou la réponse porte un body, même tronqué.
@@ -79,21 +78,26 @@ impl BodySamples {
 }
 
 /// Fusion de segments JSONL en un seul : échanges dédoublonnés par identifiant (la première
-/// occurrence gagne), au plus `samples` bodies par couple (opération, code). Le résultat ne
-/// dépend que des segments et de leur ordre.
+/// occurrence gagne), au plus `samples` bodies par couple (opération, code), choisis par le
+/// réservoir déterministe du sidecar (§5.2). Les exemples gardés ne dépendent pas de l'ordre
+/// des segments ; l'ordre des lignes est celui de première arrivée.
 #[derive(Debug)]
 pub struct Compactor {
-    ids: BTreeSet<String>,
-    bodies: BodySamples,
-    out: Vec<u8>,
+    samples: usize,
+    /// Rang de chaque échange dans `lines`, par identifiant.
+    ids: BTreeMap<String, usize>,
+    /// Lignes reçues, telles quelles, et vrai si l'échange doit perdre ses bodies.
+    lines: Vec<(Vec<u8>, bool)>,
+    reservoirs: BTreeMap<String, Reservoir>,
 }
 
 impl Compactor {
     pub fn new(samples: usize) -> Self {
         Self {
-            ids: BTreeSet::new(),
-            bodies: BodySamples::new(samples),
-            out: Vec::new(),
+            samples,
+            ids: BTreeMap::new(),
+            lines: Vec::new(),
+            reservoirs: BTreeMap::new(),
         }
     }
 
@@ -102,35 +106,57 @@ impl Compactor {
     pub fn push(&mut self, segment: &[u8]) -> usize {
         let mut added = 0;
         for line in segment.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-            let Ok(mut e) = serde_json::from_slice::<Exchange>(line) else {
+            let Ok(e) = serde_json::from_slice::<Exchange>(line) else {
                 continue;
             };
-            if self.ids.contains(&e.id) {
+            if self.ids.contains_key(&e.id) {
                 continue;
             }
-            self.bodies.admit(&mut e);
-            let Ok(line) = serde_json::to_vec(&e) else {
-                continue;
-            };
-            self.ids.insert(e.id);
-            self.out.extend_from_slice(&line);
-            self.out.push(b'\n');
+            let mut strip = false;
+            if has_body(&e) {
+                let reservoir = self.reservoirs.entry(body_key(&e)).or_default();
+                match reservoir.offer(self.samples, priority(&e.id), &e.id) {
+                    Offer::Rejected => strip = true,
+                    Offer::Kept => {}
+                    Offer::Replaced(old) => {
+                        if let Some(&i) = self.ids.get(&old) {
+                            self.lines[i].1 = true;
+                        }
+                    }
+                }
+            }
+            self.ids.insert(e.id, self.lines.len());
+            self.lines.push((line.to_vec(), strip));
             added += 1;
         }
         added
     }
 
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.lines.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.lines.is_empty()
     }
 
-    /// Segment fusionné, un échange par ligne.
+    /// Segment fusionné, un échange par ligne : seuls les échanges sortis du réservoir sont
+    /// relus pour perdre leurs bodies.
     pub fn finish(self) -> Vec<u8> {
-        self.out
+        let mut out = Vec::new();
+        for (line, strip) in self.lines {
+            if strip && let Ok(mut e) = serde_json::from_slice::<Exchange>(&line) {
+                strip_bodies(&mut e);
+                if let Ok(l) = serde_json::to_vec(&e) {
+                    out.extend_from_slice(&l);
+                    out.push(b'\n');
+                }
+                continue;
+            }
+            out.extend_from_slice(&line);
+            out.push(b'\n');
+        }
+        out
     }
 }
 

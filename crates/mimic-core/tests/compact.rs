@@ -6,6 +6,7 @@ mod common;
 use common::{ExchangeExt, exchange};
 use mimic_core::compact::{BodySamples, Compactor, hour_of, hour_start};
 use mimic_core::model::{Body, Exchange};
+use mimic_core::sample::priority;
 use proptest::prelude::*;
 use serde_json::json;
 
@@ -85,11 +86,57 @@ fn ctl_11_compaction_dedupes_and_caps_bodies() {
     let out = parse(&c.finish());
     let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, ["pod-a-1", "pod-a-2", "pod-a-3", "pod-b-1"]);
-    let bodies: Vec<bool> = out
+    // Pour /a en 200, les deux exemples de plus petite priorité gardent leur body (§5.2).
+    let mut by_priority = ["pod-a-1", "pod-a-2", "pod-a-3"];
+    by_priority.sort_by_key(|id| priority(id));
+    let bodies: Vec<&str> = out
         .iter()
-        .map(|e| matches!(e.resp_body, Body::Captured { .. }))
+        .filter(|e| matches!(e.resp_body, Body::Captured { .. }))
+        .map(|e| e.id.as_str())
         .collect();
-    assert_eq!(bodies, [true, true, false, true]);
+    let mut expected = vec![by_priority[0], by_priority[1], "pod-b-1"];
+    expected.sort();
+    let mut bodies = bodies;
+    bodies.sort();
+    assert_eq!(bodies, expected);
+}
+
+#[test]
+fn ctl_11_compaction_keeps_the_same_sample_in_any_order() {
+    let list: Vec<Exchange> = (0..12)
+        .map(|i| with_body(&format!("/users/{i}"), 200, &format!("pod-a-{i}")))
+        .collect();
+    let compact = |list: &[Exchange]| {
+        let mut c = Compactor::new(3);
+        for chunk in list.chunks(5) {
+            c.push(&jsonl(chunk));
+        }
+        let mut kept: Vec<String> = parse(&c.finish())
+            .into_iter()
+            .filter(|e| matches!(e.resp_body, Body::Captured { .. }))
+            .map(|e| e.id)
+            .collect();
+        kept.sort();
+        kept
+    };
+    let mut reversed = list.clone();
+    reversed.reverse();
+    let kept = compact(&list);
+    assert_eq!(kept.len(), 3, "chemins de même forme : une seule opération");
+    assert_eq!(kept, compact(&reversed));
+    let mut smallest: Vec<String> = list.iter().map(|e| e.id.clone()).collect();
+    smallest.sort_by_key(|id| priority(id));
+    smallest.truncate(3);
+    smallest.sort();
+    assert_eq!(kept, smallest);
+}
+
+#[test]
+fn ctl_12_paths_of_the_same_shape_share_their_places() {
+    let mut samples = BodySamples::new(1);
+    assert!(samples.admit(&mut with_body("/users/1", 200, "1")));
+    assert!(!samples.admit(&mut with_body("/users/2", 200, "2")));
+    assert!(samples.admit(&mut with_body("/users/me", 200, "3")));
 }
 
 #[test]
