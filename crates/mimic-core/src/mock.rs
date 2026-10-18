@@ -110,12 +110,75 @@ pub enum MockDecision {
     Unmatched,
 }
 
+/// Enregistrement indexé, avec ce que le score compare déjà calculé : une requête mockée
+/// parcourt tous les candidats de son opération, sans relire leurs bodies JSON.
+#[derive(Debug)]
+struct Recorded {
+    e: Exchange,
+    segments: Vec<String>,
+    query: BTreeSet<String>,
+    /// Content-type JSON déclaré, si la requête enregistrée en porte un.
+    json_type: Option<bool>,
+    /// Body de requête lu comme JSON, s'il l'est.
+    json: Option<Value>,
+    /// Couples (clé de premier niveau, valeur) de ce body JSON.
+    pairs: BTreeSet<String>,
+}
+
+/// Mêmes éléments, calculés une fois pour la requête à servir.
+struct Probe {
+    query: BTreeSet<String>,
+    json_type: bool,
+    json: Option<Value>,
+    pairs: BTreeSet<String>,
+}
+
+/// Segments non vides d'un chemin.
+fn segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn json_type(content_type: &str) -> bool {
+    is_json(&media_type(content_type))
+}
+
+fn query_pairs(query: &[(String, String)]) -> BTreeSet<String> {
+    query.iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+fn json_parts(body: &[u8]) -> (Option<Value>, BTreeSet<String>) {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(v) => {
+            let pairs = top_level_pairs(&v).collect();
+            (Some(v), pairs)
+        }
+        Err(_) => (None, BTreeSet::new()),
+    }
+}
+
+impl Recorded {
+    fn new(e: Exchange) -> Self {
+        let (json, pairs) = json_parts(e.req_body.bytes().unwrap_or_default());
+        Self {
+            segments: segments(&e.path),
+            json_type: e.req_header("content-type").map(json_type),
+            query: query_pairs(&e.query),
+            json,
+            pairs,
+            e,
+        }
+    }
+}
+
 /// Index des enregistrements sortants servables.
 #[derive(Debug)]
 pub struct MockEngine {
     config: MockConfig,
     /// Enregistrements triés chronologiquement, par (authority, méthode).
-    by_route: BTreeMap<(String, String), Vec<Exchange>>,
+    by_route: BTreeMap<(String, String), Vec<Recorded>>,
     cursors: BTreeMap<String, usize>,
     rng: SplitMix64,
     len: usize,
@@ -123,7 +186,7 @@ pub struct MockEngine {
 
 impl MockEngine {
     pub fn new(exchanges: Vec<Exchange>, config: MockConfig) -> Self {
-        let mut by_route: BTreeMap<(String, String), Vec<Exchange>> = BTreeMap::new();
+        let mut by_route: BTreeMap<(String, String), Vec<Recorded>> = BTreeMap::new();
         let mut len = 0;
         for e in exchanges {
             if e.direction != Direction::Outbound || e.status == 0 {
@@ -133,10 +196,10 @@ impl MockEngine {
             by_route
                 .entry((e.authority.clone(), e.method.to_ascii_uppercase()))
                 .or_default()
-                .push(e);
+                .push(Recorded::new(e));
         }
         for list in by_route.values_mut() {
-            list.sort_by(|a, b| (a.started_at_ms, &a.id).cmp(&(b.started_at_ms, &b.id)));
+            list.sort_by(|a, b| (a.e.started_at_ms, &a.e.id).cmp(&(b.e.started_at_ms, &b.e.id)));
         }
         let rng = SplitMix64(config.seed);
         Self {
@@ -176,18 +239,23 @@ impl MockEngine {
             return MockDecision::Unmatched;
         };
         // Candidats de même opération : chemin égal ou de même template.
-        let same_op: Vec<(&Exchange, PathMatch)> = list
+        let requested = segments(&req.path);
+        let same_op: Vec<(&Recorded, PathMatch)> = list
             .iter()
-            .filter_map(|e| path_match(&e.path, &req.path).map(|m| (e, m)))
+            .filter_map(|r| path_match(&r.segments, &requested).map(|m| (r, m)))
             .collect();
-        let latencies: Vec<u64> = same_op.iter().map(|(e, _)| e.total_us).collect();
+        let latencies: Vec<u64> = same_op.iter().map(|(r, _)| r.e.total_us).collect();
+        let (json, pairs) = json_parts(&req.body);
+        let probe = Probe {
+            query: query_pairs(&req.query),
+            json_type: find(&req.headers, "content-type").is_some_and(json_type),
+            json,
+            pairs,
+        };
         let servable: Vec<(&Exchange, PathMatch, f64)> = same_op
             .into_iter()
-            .filter(|(e, _)| matches!(e.resp_body, Body::Empty | Body::Captured { .. }))
-            .map(|(e, m)| {
-                let s = score(config, e, m, req);
-                (e, m, s)
-            })
+            .filter(|(r, _)| r.e.resp_body.is_replayable())
+            .map(|(r, m)| (&r.e, m, score(config, r, m, req, &probe)))
             .collect();
         if servable.is_empty() {
             return MockDecision::Unmatched;
@@ -269,15 +337,13 @@ fn next_cursor(cursors: &mut BTreeMap<String, usize>, key: String) -> usize {
     i
 }
 
-fn score(config: &MockConfig, e: &Exchange, m: PathMatch, req: &MockRequest) -> f64 {
+fn score(config: &MockConfig, r: &Recorded, m: PathMatch, req: &MockRequest, probe: &Probe) -> f64 {
+    let e = &r.e;
     let path = match m {
         PathMatch::Exact => 1.0,
         PathMatch::Template => 0.5,
     };
-    let query = jaccard(
-        e.query.iter().map(|(k, v)| format!("{k}={v}")),
-        req.query.iter().map(|(k, v)| format!("{k}={v}")),
-    );
+    let query = jaccard(&r.query, &probe.query);
     let headers = if config.match_headers.is_empty() {
         1.0
     } else {
@@ -288,7 +354,7 @@ fn score(config: &MockConfig, e: &Exchange, m: PathMatch, req: &MockRequest) -> 
             .count();
         same as f64 / config.match_headers.len() as f64
     };
-    let body = body_similarity(e, req);
+    let body = body_similarity(r, req, probe);
     W_PATH * path + W_QUERY * query + W_HEADERS * headers + W_BODY * body
 }
 
@@ -299,9 +365,7 @@ enum PathMatch {
 }
 
 /// Chemins égaux, ou de même forme : seuls diffèrent des segments identifiants de même nature.
-fn path_match(recorded: &str, requested: &str) -> Option<PathMatch> {
-    let a: Vec<&str> = recorded.split('/').filter(|s| !s.is_empty()).collect();
-    let b: Vec<&str> = requested.split('/').filter(|s| !s.is_empty()).collect();
+fn path_match(a: &[String], b: &[String]) -> Option<PathMatch> {
     if a == b {
         return Some(PathMatch::Exact);
     }
@@ -310,7 +374,7 @@ fn path_match(recorded: &str, requested: &str) -> Option<PathMatch> {
     }
     let compatible = a
         .iter()
-        .zip(&b)
+        .zip(b)
         .all(|(x, y)| x == y || (is_identifier(x) && is_identifier(y) && same_shape(x, y)));
     compatible.then_some(PathMatch::Template)
 }
@@ -327,35 +391,25 @@ fn find<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
         .map(|h| h.value.as_str())
 }
 
-fn jaccard(a: impl Iterator<Item = String>, b: impl Iterator<Item = String>) -> f64 {
-    let a: BTreeSet<String> = a.collect();
-    let b: BTreeSet<String> = b.collect();
+fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 1.0;
     }
-    a.intersection(&b).count() as f64 / a.union(&b).count() as f64
+    let common = a.intersection(b).count();
+    common as f64 / (a.len() + b.len() - common) as f64
 }
 
-fn body_similarity(e: &Exchange, req: &MockRequest) -> f64 {
-    let recorded = e.req_body.bytes().unwrap_or_default();
+fn body_similarity(r: &Recorded, req: &MockRequest, probe: &Probe) -> f64 {
+    let recorded = r.e.req_body.bytes().unwrap_or_default();
     if recorded.is_empty() && req.body.is_empty() {
         return 1.0;
     }
-    let json = e
-        .req_header("content-type")
-        .or_else(|| find(&req.headers, "content-type"))
-        .map(|ct| is_json(&media_type(ct)))
-        .unwrap_or(false);
-    if json
-        && let (Ok(a), Ok(b)) = (
-            serde_json::from_slice::<Value>(recorded),
-            serde_json::from_slice::<Value>(&req.body),
-        )
-    {
+    let json = r.json_type.unwrap_or(probe.json_type);
+    if json && let (Some(a), Some(b)) = (&r.json, &probe.json) {
         if a == b {
             return 1.0;
         }
-        return jaccard(top_level_pairs(&a), top_level_pairs(&b));
+        return jaccard(&r.pairs, &probe.pairs);
     }
     if recorded == req.body.as_slice() {
         1.0

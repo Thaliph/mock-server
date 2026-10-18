@@ -35,13 +35,20 @@ jobs:
       - run: sudo -E env "PATH=$PATH" ./scripts/e2e-netns.sh
 
   e2e-kind:
-    # Démo OpenTelemetry (shipping → quote) sur kind : injection par le webhook, contrôleur,
-    # bascule en mock par mimicctl. Uniquement sur les PR vers main.
+    # Démo OpenTelemetry sur kind, générateur de charge compris : injection par le webhook,
+    # contrôleur, rapport de découverte dans le résumé du job, bascule en mock par mimicctl.
+    # Uniquement sur les PR vers main.
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      # Les images de la démo (le générateur de charge embarque Playwright) ne tiennent pas
+      # sur le disque du runner sans retirer les SDK préinstallés inutiles ici.
+      - name: Place disque pour les images de la démo
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: docker/setup-buildx-action@v3
@@ -64,3 +71,11 @@ jobs:
           MIMIC_IMAGE: mimic:e2e
           MIMICCTL: target/debug/mimicctl
           SKIP_BUILD: "1"
+          LOAD_SECONDS: "300"
+          REPORT_DIR: target/e2e-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-report
+          path: target/e2e-report/
+          if-no-files-found: ignore

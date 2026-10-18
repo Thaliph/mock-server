@@ -69,7 +69,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn prx_10_one_line_per_period_then_the_omitted_count() {
+    fn prx_11_one_line_per_period_then_the_omitted_count() {
         let l = LogLimiter::per_second();
         let t0 = Instant::now();
         assert_eq!(l.allow(t0), Some(0));
@@ -82,7 +82,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prx_09_accept_errors_pause_before_retrying() {
+    async fn prx_10_accept_errors_pause_before_retrying() {
         let calls = AtomicUsize::new(0);
         let log = LogLimiter::per_second();
         let started = Instant::now();

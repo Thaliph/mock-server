@@ -1,0 +1,13 @@
+# Client du test E2E-05 : appelle shipping directement, hors injection.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: otel-demo
+  annotations:
+    mimic.platform.io/inject: "false"
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "infinity"]

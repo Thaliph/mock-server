@@ -1,6 +1,6 @@
 //! Traitement du trafic entrant et sortant : relais, capture et mock (spec §5).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -70,10 +70,10 @@ pub async fn inbound(
     info: ConnInfo,
     req: Request<Incoming>,
 ) -> Response<ProxyBody> {
-    let target = state.config.inbound.upstream.or_else(|| {
-        info.original_dst
-            .map(|d| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), d.port()))
-    });
+    let target = match info.original_dst {
+        Some(dst) => Some(state.inbound_targets.resolve(dst).await),
+        None => state.config.inbound.upstream,
+    };
     let Some(target) = target else {
         return text(
             StatusCode::BAD_GATEWAY,
@@ -193,13 +193,26 @@ async fn forward(
     };
     let original_uri = std::mem::replace(&mut parts.uri, uri);
     strip_hop_by_hop(&mut parts.headers);
-    if !parts.headers.contains_key(http::header::HOST)
-        && let Ok(v) = HeaderValue::from_str(&target.authority)
-    {
-        parts.headers.insert(http::header::HOST, v);
+    // Même version vers l'amont qu'en entrée : un serveur gRPC (h2c) refuse HTTP/1.1.
+    let h2 = parts.version == http::Version::HTTP_2;
+    if h2 {
+        // En HTTP/2, l'authority voyage dans `:authority` ; seul `te: trailers` est permis.
+        parts.headers.remove(http::header::HOST);
+        if parts
+            .headers
+            .get(http::header::TE)
+            .is_some_and(|v| v != "trailers")
+        {
+            parts.headers.remove(http::header::TE);
+        }
+    } else {
+        parts.version = http::Version::HTTP_11;
+        if !parts.headers.contains_key(http::header::HOST)
+            && let Ok(v) = HeaderValue::from_str(&target.authority)
+        {
+            parts.headers.insert(http::header::HOST, v);
+        }
     }
-    // HTTP/1.1 vers l'amont : le client choisit le protocole selon la connexion.
-    parts.version = http::Version::HTTP_11;
     let req_headers = to_headers(&parts.headers);
     let method = parts.method.to_string();
 
@@ -212,11 +225,19 @@ async fn forward(
     };
 
     let authority_label = state.metrics.authority(&target.authority);
-    let response = match state.client.request(Request::from_parts(parts, body)).await {
+    let client = if h2 { &state.client_h2 } else { &state.client };
+    let response = match client.request(Request::from_parts(parts, body)).await {
         Ok(r) => r,
         Err(e) => {
             if let Some(omitted) = state.upstream_log.allow(Instant::now()) {
                 tracing::warn!(authority = %target.authority, error = %e, omitted, "échec vers l'amont");
+            }
+            // L'application a pu changer d'adresse d'écoute : refaire le choix (spec §3.1).
+            if direction == Direction::Inbound
+                && e.is_connect()
+                && let Ok(a) = target.connect.parse::<SocketAddr>()
+            {
+                state.inbound_targets.forget(a.port());
             }
             state
                 .metrics
@@ -561,9 +582,7 @@ pub async fn tunnel(
         return;
     }
     let target = if inbound {
-        state.config.inbound.upstream.unwrap_or_else(|| {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), original_dst.port())
-        })
+        state.inbound_targets.resolve(original_dst).await
     } else {
         original_dst
     };

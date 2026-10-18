@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.8** ; injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
+> Statut : **v0.9** ; rapport de découverte `mimicctl report` (§9.5) et démo OpenTelemetry complète, avec son générateur de charge, en validation des PR (E2E-05). v0.8 : injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS, hors service mesh.
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -91,6 +91,7 @@ Même mécanique qu'Istio, éprouvée :
   - autre protocole, ou rien reçu au bout de 300 ms (protocole où le serveur parle en premier, comme MySQL) : tunnel TCP opaque vers la destination d'origine.
   Chaque tunnel est compté dans `mimic_passthrough_connections_total`.
 - Le proxy récupère la destination d'origine avec `getsockopt(SO_ORIGINAL_DST)` (IPv4) et `IP6T_SO_ORIGINAL_DST` (IPv6).
+- **Relais entrant** : le trafic entrant est envoyé à sa destination d'origine (IP du pod et port), comme Istio depuis 1.10, pour qu'une application qui n'écoute que sur l'IP du pod reste joignable (Next.js en mode standalone écoute sur `$HOSTNAME`, résolu en IP du pod). Si rien n'y écoute pour ce port, le proxy se rabat sur `127.0.0.1` (application liée à la boucle locale). Le choix est mémorisé par port et réévalué après un échec de connexion ; `inbound.upstream` impose une adresse.
 - Sur K8s ≥ 1.29, le sidecar est déclaré en **native sidecar** (`initContainers` + `restartPolicy: Always`) pour démarrer avant l'app et s'arrêter après elle.
 
 Alternative sans privilège, configurable : **mode proxy explicite** (`HTTP_PROXY`/`HTTPS_PROXY` injectés dans l'app). Utile si `NET_ADMIN` est interdit, mais ne capture que les clients qui respectent ces variables.
@@ -121,6 +122,8 @@ Seuls HTTP et HTTPS sont gérés (décision du 17/10, Q5). Le reste traverse Mim
 | HTTPS vers un autre hôte | tunnel opaque en record, refusé en mock |
 | WebSocket / SSE | passthrough, métadonnées seulement (upgrade, durée) |
 | TCP non HTTP | tunnel opaque, détecté par sniffing des premiers octets ; à exclure par port dans `mimic-init` si on veut le sortir du chemin |
+
+Le relais garde la version de la requête reçue : une requête HTTP/2 part en HTTP/2 vers l'amont (h2c en connaissance préalable, h2 via ALPN en HTTPS), trailers compris, car un serveur gRPC refuse HTTP/1.1 ; une requête HTTP/1.x part en HTTP/1.1.
 
 ---
 
@@ -329,8 +332,8 @@ Réconciliation (fonction pure dans le contrôleur, testée sans cluster) :
 Plusieurs pods d'un même workload doivent répondre de la même manière en mock, y compris sur un endpoint qu'un pod n'a jamais vu passer. Le partage seul (§5.4) ne suffit pas : à un instant donné, deux pods n'ont pas forcément importé les mêmes segments, et leurs stores bornés n'évincent pas les mêmes échanges.
 
 - **Snapshot** : jeu figé d'échanges sortants d'un workload, construit par le contrôleur au moment de la bascule en mock à partir de tous les segments du workload. Il est immuable et identifié par une empreinte de son contenu (`sha256`, 16 caractères hexadécimaux) : mêmes échanges, même identifiant, quel que soit l'ordre d'arrivée.
-- **Construction** (`mimic-core::snapshot`, fonction pure) : échanges sortants terminés, dédoublonnés par identifiant, triés par date puis identifiant, au plus `snapshot.max_per_key` (50) par couple (authority, méthode, chemin, code), les plus récents gardés.
-- **Bascule** : passer `spec.mode` à `mock` construit un snapshot et le désigne comme état souhaité ; renseigner `spec.snapshot` réutilise un snapshot existant, ce qui permet de rejouer un tir de perf dans des conditions identiques d'une semaine à l'autre. Chaque sidecar télécharge le snapshot une fois, le garde en cache (sur disque si `store.dir` est configuré), puis construit son moteur de mock **uniquement** à partir du snapshot. Tant que le snapshot n'est pas chargé, le sidecar mocke avec ses données locales et le signale (`snapshot: null` dans son battement).
+- **Construction** (`mimic-core::snapshot`, fonction pure) : échanges sortants terminés, dédoublonnés par identifiant, triés par date puis identifiant, au plus `snapshot.max_per_key` (50) par couple (authority, méthode, chemin, code), les plus récents gardés. Le plafond est compté à part pour les échanges dont la réponse est rejouable (body capturé ou vide) et pour les autres (body tronqué ou écarté, notamment au-delà de `capture.samples_per_operation`, §5.2) : sur un endpoint très sollicité, les plus récents n'ont plus de body, et ils ne doivent pas évincer les exemples rejouables. Les seconds ne servent qu'à la distribution de latence.
+- **Bascule** : passer `spec.mode` à `mock` construit un snapshot et le désigne comme état souhaité ; renseigner `spec.snapshot` réutilise un snapshot existant, ce qui permet de rejouer un tir de perf dans des conditions identiques d'une semaine à l'autre. Chaque sidecar télécharge le snapshot une fois, le garde en cache (sur disque si `store.dir` est configuré), puis construit son moteur de mock **uniquement** à partir du snapshot. Tant que le snapshot n'est pas chargé, y compris quand son téléchargement échoue (il est retenté à chaque battement), le sidecar mocke avec ses données locales et le signale (`snapshot: null` dans son battement) : un passage en mock ne laisse jamais le trafic sortir.
 - **Même appel vu par plusieurs sidecars** : chaque pod enregistre son exemplaire, avec un identifiant propre ; rien n'est fusionné à tort. Au rejeu, ces exemplaires sont des candidats de même score. La stratégie `best` choisit alors la **réponse la plus fréquente** (même code et même body), puis la plus récente. Une erreur ponctuelle vue par un seul pod ne masque donc pas la réponse habituelle ; pour la reproduire en proportion, utiliser `weighted-status`. Toutes les durées des exemplaires alimentent la distribution de latence de l'opération.
 - **Ce qui est identique d'un pod à l'autre** : à requête égale, le code, les headers et le body servis (stratégie `best`). La latence suit la même distribution sur chaque pod, mais le tirage est propre à chaque pod. Les stratégies à état (`round-robin`, `sequence`) avancent indépendamment sur chaque pod.
 
@@ -643,9 +646,12 @@ Outil des humains. Il parle à l'API Kubernetes avec le kubeconfig courant et n'
 | `mimicctl export <workload> (--inbound \| --outbound <authority>) [--openapi-version 3.1\|3.0] [-o fichier]` | document OpenAPI depuis l'interface du contrôleur |
 | `mimicctl requests <workload> [--format json\|jsonl\|k6] [--limit n]` | requêtes enregistrées (§5.7) |
 | `mimicctl diff <ancien> <nouveau> [--json] [--fail-on-breaking]` | différence entre deux documents OpenAPI (YAML ou JSON) |
+| `mimicctl report [<workload>] [-n ns \| -A] [--top n]` | rapport Markdown de ce que les sidecars ont découvert (ci-dessous) |
 
+- `status` n'affiche le snapshot et les pods alignés que si le contrôleur a publié le statut de la génération courante (`status.observedGeneration` égal à `metadata.generation`) ; sinon ces colonnes valent `?` (par exemple `?/2`), car un statut antérieur décrit l'état souhaité d'avant la bascule.
 - `export` et `requests` ouvrent un port-forward vers le pod du contrôleur (port 8081), comme `kubectl port-forward` : même RBAC (`pods/portforward` dans `mimic-system`), aucun port exposé.
 - `--openapi-version 3.0` convertit le document 3.1 (`mimic-core::openapi::to_3_0`) : `type: [T, "null"]` devient `type: T` avec `nullable: true`, les `examples` d'un schéma deviennent `example` (le premier), `openapi` vaut `3.0.3`.
+- **Rapport** : pour chaque workload connu du contrôleur (filtré par nom ou namespace, ou tous avec `-A`), son mode et ses pods, la liste des API découvertes (le service, puis chaque dépendance par authority) avec leur nombre d'opérations et d'appels, puis les `n` opérations les plus appelées (10 par défaut) avec leurs codes, leur latence p50 et p99 et les headers d'une requête enregistrée de cette opération (même sens, même dépendance, même méthode, chemin conforme au template). Les headers sont ceux du store, donc déjà redactés (§7) ; une valeur est tronquée à 80 caractères. Sans requête enregistrée, les headers déclarés comme paramètres de l'opération sont listés. Tri par appels décroissants, puis sens, API, chemin et méthode : deux rapports sur les mêmes données sont identiques. Le Markdown est fait pour le résumé d'un job GitHub Actions (`>> $GITHUB_STEP_SUMMARY`).
 - **Diff** (`mimic-core::diff`, fonction pure) : opérations ajoutées et supprimées, puis pour chaque opération commune les paramètres ajoutés, supprimés ou devenus requis, et les codes de réponse ajoutés ou supprimés. Sont **cassants** : une opération supprimée, un paramètre devenu requis, un paramètre requis ajouté, un code 2xx supprimé. Sortie texte triée, `--json` pour une sortie machine. Avec `--fail-on-breaking`, le code de sortie vaut 1 s'il y a un changement cassant, ce qui sert en CI à comparer la découverte d'une semaine à l'autre.
 
 ---
@@ -738,7 +744,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-05 | `latency.factor: 2` | 1 000 requêtes | p50 entre 180 et 220 ms |
 | MCK-06 | stratégie `sequence`, enregistrement POST puis GET | rejeu | réponses servies dans l'ordre d'origine |
 | MCK-07 | distribution 98 % 200 / 2 % 429, `weighted-status` | 10 000 requêtes | 429 entre 1,5 % et 2,5 % |
-| MCK-08 | réponse enregistrée gzip | rejeu | `Content-Encoding: gzip` conservé, body identique |
+| MCK-08 | réponse enregistrée gzip, br ou zstd | rejeu | `Content-Encoding` conservé, body identique une fois décodé |
 
 **Moteur de mock, niveau `mimic-core` (MCK, suite)**
 
@@ -758,6 +764,8 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | SNP-03 | deux sidecars ; A a vu `GET /users/7` de la dépendance, B ne l'a jamais vu | bascule en mock par le contrôleur | A et B renvoient la même réponse, octet pour octet |
 | SNP-04 | snapshot existant, puis nouveaux enregistrements | `spec.snapshot: id` | les pods chargent ce snapshot, sans les nouveaux enregistrements |
 | SNP-05 | snapshot chargé, contrôleur arrêté | requêtes mockées | toujours servies depuis le snapshot |
+| SNP-06 | endpoint appelé bien plus de `samples_per_operation` + `max_per_key` fois en record (seuls les premiers exemples gardent leur body) | bascule en mock | la réponse enregistrée est rejouée, pas de `599` |
+| SNP-07 | état souhaité `mock` avec un snapshot que le sidecar ne peut pas télécharger | battement | le sidecar passe quand même en mock, sur ses données locales, et rien ne sort ; l'erreur est visible dans son statut et le téléchargement est retenté |
 
 **Contrôleur (CTL)**
 
@@ -847,15 +855,16 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 |----|-------------|-------|-------|
 | PRX-01 | mode record, upstream factice | 10 000 requêtes | toutes relayées sans altération, toutes enregistrées |
 | PRX-02 | réponse streamée de 500 MiB | relais | mémoire du proxy < 64 MiB, body tronqué dans le store |
-| PRX-03 | upstream HTTP/2 | relais | h2 négocié de bout en bout |
+| PRX-03 | client et upstream gRPC en h2c | relais | HTTP/2 de bout en bout, `te: trailers` et trailers (`grpc-status`) relayés, échange enregistré |
 | PRX-04 | trafic TCP non HTTP redirigé (client qui parle en premier, ou serveur qui parle en premier) | relais | tunnel transparent, octets identiques |
 | PRX-04b | connexion TLS redirigée | mode record / mode mock | tunnel opaque / connexion refusée, compteur `refused` |
+| PRX-09 | application à l'écoute sur l'IP du pod seulement, puis sur `127.0.0.1` seulement | relais entrant | la première est jointe sur l'IP du pod, la seconde par repli sur `127.0.0.1` ; sans aucune écoute, l'IP du pod est retenue et rien n'est mémorisé |
 | PRX-08 | règles iptables posées par `mimic-init` dans un namespace réseau, sidecar sous l'UID 1337 | l'application appelle une dépendance HTTP sans proxy configuré | l'appel est enregistré avec l'authority d'origine, puis servi en mock |
 | PRX-05 | bascule record → mock pendant une charge | bascule | aucune requête en erreur, nouvelles requêtes mockées |
 | PRX-06 | hôte dans `tls.intercept`, app faisant confiance à la CA | requête HTTPS | échange déchiffré et enregistré |
 | PRX-07 | hôte hors `tls.intercept` | requête HTTPS | tunnel opaque, seuls SNI et durée enregistrés |
-| PRX-09 | `accept` en échec répété (EMFILE) | boucle d'écoute | 50 ms au moins entre deux tentatives, au plus une ligne de log par seconde ; l'écoute reprend dès que l'erreur cesse |
-| PRX-10 | amont injoignable | rafale de 200 requêtes | 200 réponses `502` et `mimic_upstream_errors_total` à 200, mais au plus une ligne de log par seconde, la suivante indiquant le nombre de lignes omises |
+| PRX-10 | `accept` en échec répété (EMFILE) | boucle d'écoute | 50 ms au moins entre deux tentatives, au plus une ligne de log par seconde ; l'écoute reprend dès que l'erreur cesse |
+| PRX-11 | amont injoignable | rafale de 200 requêtes | 200 réponses `502` et `mimic_upstream_errors_total` à 200, mais au plus une ligne de log par seconde, la suivante indiquant le nombre de lignes omises |
 
 **Injection (INJ)**
 
@@ -878,6 +887,8 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | CLI-01 | `mimicctl mode checkout mock -n shop` | construction de la requête | apply d'une `MimicWorkload` `shop/checkout` avec `spec.mode: mock`, sans snapshot |
 | CLI-02 | mode inconnu | `mimicctl mode checkout fast` | refus avant tout appel, avec la liste des modes valides |
 | CLI-03 | export d'une dépendance, puis requêtes en k6 | construction du chemin | `/v1/workloads/shop/checkout/openapi/outbound/api.stripe.com`, `/v1/workloads/shop/checkout/requests?direction=inbound&format=k6&limit=100` |
+| CLI-04 | un workload avec 12 opérations (service et dépendance `quote:8080`), une requête enregistrée de `GET /items/{id}` | `mimicctl report --top 10` | les deux API avec leurs opérations et appels ; exactement 10 opérations, triées par appels décroissants ; les headers de la requête, `\|` échappé et valeurs longues tronquées ; une opération sans requête liste ses paramètres header |
+| CLI-05 | `MimicWorkload` en génération 5, statut publié pour la génération 4 (2/2 alignés, snapshot) | `mimicctl status` | snapshot `?` et pods alignés `?/2` ; une fois la génération 5 publiée, le snapshot et `2/2` |
 
 **Conversion OpenAPI (OAS)**
 
@@ -902,7 +913,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | E2E-02 | Même pod en mode mock avec NetworkPolicy deny-all egress : le tir k6 réussit à > 99,9 %, aucun paquet ne sort (vérifié par les compteurs du faux SaaS). |
 | E2E-03 | Changement d'annotation `record → mock` sans redémarrage du pod. |
 | E2E-04 | Namespace labellisé `env=production` : le mode mock est refusé. |
-| E2E-05 | Démo OpenTelemetry sur kind (`scripts/e2e-kind.sh`, à chaque PR vers `main`) : shipping, injecté par le webhook, appelle quote en HTTP ; en record les deux API sont découvertes par le contrôleur ; après `mimicctl mode shipping mock`, les deux pods s'alignent sur un snapshot, quote est arrêté et toutes les requêtes à shipping réussissent ; retour en record. |
+| E2E-05 | Démo OpenTelemetry sur kind (`scripts/e2e-kind.sh`, à chaque PR vers `main`) : les services de la démo, sans la chaîne de télémétrie ni Kafka, avec son générateur de charge actif ; tous injectés par le webhook sauf `valkey-cart` (opt-out). Les requêtes du test passent par le frontend (`/api/shipping`), qui appelle shipping (2 réplicas) en gRPC, qui appelle quote en HTTP ; en record les deux API de shipping (gRPC entrant, quote sortant) sont découvertes par le contrôleur. Après cinq minutes de charge, `mimicctl report -A` est publié dans le résumé du job et les documents OpenAPI en artefact. Tous les workloads injectés passent ensuite en mock, sauf le générateur (le client) : une fois les pods alignés, pendant 60 s, `mimic_requests_total` des sidecars ne compte plus aucune requête entrante, sauf sur les services que le générateur appelle lui-même (frontend-proxy, et flagd pour ses feature flags) ; frontend-proxy reçoit son trafic et répond depuis le snapshot (`mimic_mock_responses_total`) ; le bilan est ajouté au résumé du job, puis retour en record. Après `mimicctl mode shipping mock`, les deux pods s'alignent sur un snapshot, quote est arrêté et toutes les requêtes réussissent ; retour en record. |
 
 **Performance (PRF)** : seuils bloquants en CI nightly : O1 et O2 mesurés avec `oha` à 1 000 req/s sur 60 s, comparés à une exécution sans sidecar.
 
@@ -945,12 +956,12 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P2 | `mimic-core::mock` : matching, stratégies, latence | MCK-01 à 11 (niveau cœur) |
 | P3 | Proxy HTTP en clair : record et mock, store, API et page d'admin, métriques | PRX-01 à 05, MCK-* de bout en bout, ADM-* |
 | P3b | Partage entre sidecars d'un workload | SHR-* |
-| P3c | Sidecar borné : réservoir par opération, budget mémoire, journal local segmenté, file de partage bornée, logs limités | CAP-*, SHR-06, SHR-07, PRX-09, PRX-10 |
+| P3c | Sidecar borné : réservoir par opération, budget mémoire, journal local segmenté, file de partage bornée, logs limités | CAP-*, SHR-06, SHR-07, PRX-10, PRX-11 |
 | P4 | `mimic-init` iptables, détection de protocole, image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08 ; E2E kind ensuite |
 | P5 | TLS MITM sortant | PRX-06, 07 |
 | P6 | Contrôleur : ingestion, interface centrale, snapshots, CRD `MimicWorkload`, authentification, requêtes rejouables | MCK-12, SNP-*, CTL-*, CRD-*, SEC-*, RPL-* |
 | P6b | Chargement cross-environnement, garde-fou production | E2E-04 |
-| P7 | Webhook d'injection + `mimicctl` | INJ-*, CLI-*, OAS-*, DIF-* |
+| P7 | Webhook d'injection + `mimicctl` (dont le rapport) | INJ-*, CLI-*, OAS-*, DIF-*, E2E-05 |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 
 P1 et P3 sont du Rust pur sans I/O : c'est le meilleur point d'entrée pour Claude Code, qui peut avancer en TDD strict sur des fonctions déterministes avant de toucher au réseau.

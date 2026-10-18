@@ -1,4 +1,4 @@
-//! Critère PRX-09 de la spec (§9.3) : plus de descripteurs (EMFILE) sous un tir.
+//! Critère PRX-10 de la spec (§9.3) : plus de descripteurs (EMFILE) sous un tir.
 //!
 //! Seul test de ce binaire, car il abaisse la limite de descripteurs de tout le processus.
 
@@ -23,7 +23,7 @@ fn cpu_ticks(stat: &mut std::fs::File) -> u64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prx_09_accept_without_descriptors_does_not_spin() {
+async fn prx_10_accept_without_descriptors_does_not_spin() {
     let p = proxy(config(None, Mode::Record)).await;
     // Ouvert avant d'abaisser la limite : le relire ne demande plus de descripteur.
     let mut stat = std::fs::File::open("/proc/self/stat").unwrap();

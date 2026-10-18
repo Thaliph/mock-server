@@ -65,6 +65,11 @@ impl Body {
         }
     }
 
+    /// Vrai si le mock peut rejouer ce body à l'identique : capturé en entier, ou vide.
+    pub fn is_replayable(&self) -> bool {
+        matches!(self, Body::Empty | Body::Captured { .. })
+    }
+
     /// Octets conservés en mémoire (body complet ou préfixe).
     pub fn kept_bytes(&self) -> usize {
         match self {

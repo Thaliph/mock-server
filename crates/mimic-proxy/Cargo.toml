@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+brotli = "9.0.0"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 flate2 = "1.1.10"
@@ -14,7 +15,7 @@ http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["http1", "http2", "server", "client"] }
-hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "http1", "tls12", "native-tokio", "logging"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "http1", "http2", "tls12", "native-tokio", "logging"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2", "service"] }
 mimic-core = { version = "0.1.0", path = "../mimic-core" }
 nix = { version = "0.31.3", features = ["net", "socket"] }
@@ -32,6 +33,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 ulid = "3.0.0"
+zstd = "0.14.3"
 
 [lints]
 workspace = true
