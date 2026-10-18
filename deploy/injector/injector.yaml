@@ -147,7 +147,8 @@ webhooks:
     sideEffects: None
     failurePolicy: Ignore
     timeoutSeconds: 5
-    reinvocationPolicy: Never
+    # Rappelé si un webhook de mesh (Istio, Linkerd) injecte après lui (spec §9.4).
+    reinvocationPolicy: IfNeeded
     namespaceSelector:
       matchLabels: {mimic.platform.io/enabled: "true"}
     rules:

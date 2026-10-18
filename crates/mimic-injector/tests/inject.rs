@@ -1,8 +1,8 @@
-//! Mutation des pods par le webhook d'injection (spec §9.4, INJ-01 à 07).
+//! Mutation des pods par le webhook d'injection (spec §9.4, INJ-01 à 07, INJ-10 à 13).
 
 use k8s_openapi::api::core::v1::{Container, EnvVar, Pod};
 use mimic_injector::config::InjectorConfig;
-use mimic_injector::inject::{Outcome, mutate};
+use mimic_injector::inject::{Outcome, mesh_warning, mutate};
 use serde_json::json;
 
 fn config() -> InjectorConfig {
@@ -69,6 +69,7 @@ fn inj_01_pod_receives_init_container_and_native_sidecar() {
     let inits = spec.init_containers.as_ref().unwrap();
     assert_eq!(inits[0].name, "mimic-init");
     assert_eq!(env_value(&inits[0], "MIMIC_INBOUND_PORTS"), Some("8080"));
+    assert_eq!(env_value(&inits[0], "MIMIC_MESH"), Some("auto"));
     assert_eq!(
         env_value(&inits[0], "MIMIC_EXCLUDE_OUTBOUND_CIDRS"),
         Some("10.96.0.1/32")
@@ -93,9 +94,15 @@ fn inj_01_pod_receives_init_container_and_native_sidecar() {
         Some("registry.example.com/platform/mimic:0.1.0")
     );
     let sc = sidecar.security_context.as_ref().unwrap();
-    assert_eq!(sc.run_as_user, Some(1337));
+    assert_eq!(sc.run_as_user, Some(1338));
+    assert_eq!(sc.run_as_group, Some(1338));
     assert_eq!(sc.run_as_non_root, Some(true));
-    assert!(sidecar.startup_probe.is_some());
+    let startup = sidecar.startup_probe.as_ref().unwrap();
+    assert_eq!(
+        startup.http_get.as_ref().unwrap().path.as_deref(),
+        Some("/healthz")
+    );
+    assert_eq!(sidecar.ports.as_ref().unwrap()[0].container_port, 15100);
     assert_eq!(env_value(sidecar, "MIMIC_WORKLOAD"), Some("checkout"));
     assert!(
         env_value(sidecar, "MIMIC_CONFIG_YAML")
@@ -171,18 +178,10 @@ fn inj_02_already_injected_pod_is_left_alone() {
 }
 
 #[test]
-fn inj_03_opt_out_host_network_and_mesh_are_skipped() {
+fn inj_03_opt_out_and_host_network_are_skipped() {
     let cases = [
         pod(json!({"metadata": {"annotations": {"mimic.platform.io/inject": "false"}}})),
         pod(json!({"spec": {"hostNetwork": true}})),
-        {
-            let mut p = pod(json!({}));
-            p.spec.as_mut().unwrap().containers.push(Container {
-                name: "istio-proxy".into(),
-                ..Container::default()
-            });
-            p
-        },
     ];
     for p in cases {
         match mutate(&p, &config()) {
@@ -375,4 +374,224 @@ fn inj_10_version_labels_reach_the_sidecar() {
         field_path(&s, "MIMIC_VERSION"),
         Some("metadata.labels['app.example.com/release']")
     );
+}
+
+fn names(containers: Option<&Vec<Container>>) -> Vec<&str> {
+    containers
+        .into_iter()
+        .flatten()
+        .map(|c| c.name.as_str())
+        .collect()
+}
+
+fn container(name: &str) -> Container {
+    Container {
+        name: name.into(),
+        ..Container::default()
+    }
+}
+
+fn native(name: &str) -> Container {
+    Container {
+        restart_policy: Some("Always".into()),
+        ..container(name)
+    }
+}
+
+/// Pod tel que le webhook d'Istio le rend : `istio-init`, puis `istio-proxy` en native sidecar.
+fn istio_pod() -> Pod {
+    let mut p = pod(json!({}));
+    let spec = p.spec.as_mut().unwrap();
+    spec.init_containers = Some(vec![
+        container("istio-init"),
+        Container {
+            ports: Some(vec![k8s_openapi::api::core::v1::ContainerPort {
+                container_port: 15090,
+                ..Default::default()
+            }]),
+            ..native("istio-proxy")
+        },
+        container("migrate"),
+    ]);
+    p
+}
+
+/// Pod tel que le webhook de Linkerd le rend : `linkerd-init`, `linkerd-proxy` en conteneur.
+fn linkerd_pod() -> Pod {
+    let mut p = pod(json!({}));
+    let spec = p.spec.as_mut().unwrap();
+    spec.init_containers = Some(vec![container("linkerd-init"), container("migrate")]);
+    spec.containers.insert(
+        0,
+        Container {
+            ports: Some(vec![
+                k8s_openapi::api::core::v1::ContainerPort {
+                    container_port: 4143,
+                    ..Default::default()
+                },
+                k8s_openapi::api::core::v1::ContainerPort {
+                    container_port: 4191,
+                    ..Default::default()
+                },
+            ]),
+            ..container("linkerd-proxy")
+        },
+    );
+    p
+}
+
+/// Commande d'une sonde `exec` du sidecar.
+fn exec(probe: Option<&k8s_openapi::api::core::v1::Probe>) -> Vec<String> {
+    let probe = probe.expect("sonde présente");
+    assert!(probe.http_get.is_none(), "sonde HTTP dans un pod du mesh");
+    probe
+        .exec
+        .as_ref()
+        .and_then(|e| e.command.clone())
+        .unwrap_or_default()
+}
+
+fn assert_mesh_sidecar(p: &Pod, mesh: &str) {
+    let inits = p.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
+    let init = inits.iter().find(|c| c.name == "mimic-init").unwrap();
+    assert_eq!(env_value(init, "MIMIC_MESH"), Some(mesh));
+    assert_eq!(env_value(init, "MIMIC_INBOUND_PORTS"), Some("8080"));
+    let sidecar = inits.iter().find(|c| c.name == "mimic").unwrap();
+    assert_eq!(
+        exec(sidecar.startup_probe.as_ref()),
+        ["/usr/local/bin/mimic-proxy", "--probe", "/healthz"]
+    );
+    assert_eq!(
+        exec(sidecar.liveness_probe.as_ref()),
+        ["/usr/local/bin/mimic-proxy", "--probe", "/healthz"]
+    );
+    assert_eq!(
+        exec(sidecar.readiness_probe.as_ref()),
+        ["/usr/local/bin/mimic-proxy", "--probe", "/readyz"]
+    );
+}
+
+#[test]
+fn inj_11_mimic_runs_after_the_mesh_containers() {
+    let p = injected(&istio_pod());
+    assert_eq!(
+        names(p.spec.as_ref().unwrap().init_containers.as_ref()),
+        [
+            "istio-init",
+            "istio-proxy",
+            "mimic-init",
+            "mimic",
+            "migrate"
+        ]
+    );
+    assert_mesh_sidecar(&p, "istio");
+
+    let p = injected(&linkerd_pod());
+    assert_eq!(
+        names(p.spec.as_ref().unwrap().init_containers.as_ref()),
+        ["linkerd-init", "mimic-init", "mimic", "migrate"]
+    );
+    assert_mesh_sidecar(&p, "linkerd");
+
+    // Sonde exec avec la configuration montée par l'annotation.
+    let mut p = istio_pod();
+    p.metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert("mimic.platform.io/config".into(), "checkout-mimic".into());
+    let p = injected(&p);
+    let sidecar = sidecar_of(&p);
+    assert_eq!(
+        exec(sidecar.startup_probe.as_ref()),
+        [
+            "/usr/local/bin/mimic-proxy",
+            "--config",
+            "/etc/mimic/mimic.yaml",
+            "--probe",
+            "/healthz"
+        ]
+    );
+}
+
+#[test]
+fn inj_12_reinvocation_adapts_a_pod_meshed_after_mimic() {
+    let once = injected(&pod(json!({})));
+    let istio_init = container("istio-init");
+    let istio_proxy = native("istio-proxy");
+
+    // Istio a ajouté ses conteneurs en tête : seuls MIMIC_MESH et les sondes changent.
+    let mut front = once.clone();
+    let inits = front
+        .spec
+        .as_mut()
+        .unwrap()
+        .init_containers
+        .as_mut()
+        .unwrap();
+    inits.insert(0, istio_proxy.clone());
+    inits.insert(0, istio_init.clone());
+    let adapted = injected(&front);
+    assert_eq!(
+        names(adapted.spec.as_ref().unwrap().init_containers.as_ref()),
+        ["istio-init", "istio-proxy", "mimic-init", "mimic"]
+    );
+    assert_mesh_sidecar(&adapted, "istio");
+    assert!(
+        matches!(mutate(&adapted, &config()), Outcome::Skipped(_)),
+        "pod déjà adapté : aucun patch"
+    );
+
+    // Derrière ceux de Mimic : ils repassent devant.
+    let mut behind = once.clone();
+    let inits = behind
+        .spec
+        .as_mut()
+        .unwrap()
+        .init_containers
+        .as_mut()
+        .unwrap();
+    inits.push(istio_init);
+    inits.push(istio_proxy);
+    let adapted = injected(&behind);
+    assert_eq!(
+        names(adapted.spec.as_ref().unwrap().init_containers.as_ref()),
+        ["istio-init", "istio-proxy", "mimic-init", "mimic"]
+    );
+    assert_mesh_sidecar(&adapted, "istio");
+    assert!(matches!(mutate(&adapted, &config()), Outcome::Skipped(_)));
+}
+
+#[test]
+fn inj_13_mesh_annotation() {
+    let annotated = |mut p: Pod, value: &str| {
+        p.metadata
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert("mimic.platform.io/mesh".into(), value.into());
+        p
+    };
+    let init_env = |p: &Pod| {
+        let inits = p.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
+        env_value(
+            inits.iter().find(|c| c.name == "mimic-init").unwrap(),
+            "MIMIC_MESH",
+        )
+        .map(String::from)
+    };
+
+    let ambient = annotated(pod(json!({})), "istio-ambient");
+    let p = injected(&ambient);
+    assert_eq!(init_env(&p).as_deref(), Some("istio-ambient"));
+    // Pas de conteneur du mesh : les sondes HTTP passent par ztunnel (§3.3.4).
+    assert!(sidecar_of(&p).startup_probe.unwrap().http_get.is_some());
+    assert_eq!(mesh_warning(&ambient), None);
+
+    let p = injected(&annotated(istio_pod(), "none"));
+    assert_eq!(init_env(&p).as_deref(), Some("none"));
+
+    let unknown = annotated(pod(json!({})), "consul");
+    let p = injected(&unknown);
+    assert_eq!(init_env(&p).as_deref(), Some("auto"));
+    let warning = mesh_warning(&unknown).expect("avertissement");
+    assert!(warning.contains("consul"), "{warning}");
 }
