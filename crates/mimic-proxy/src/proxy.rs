@@ -695,49 +695,154 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
     Response::new(boxed(Empty::<Bytes>::new()))
 }
 
-/// Relais TCP opaque d'une connexion redirigée non HTTP (spec §3.1).
-pub async fn tunnel(
+/// Attente maximale, en sortie et en mock, qu'une connexion muette se mette à parler : rien
+/// n'est ouvert vers la dépendance pendant ce temps (O3).
+pub const MOCK_SILENCE_WAIT: Duration = Duration::from_secs(30);
+
+/// Issue d'une connexion restée muette au-delà du délai de détection (spec §3.1).
+pub enum Silent {
+    /// L'application a parlé la première : sa connexion, le protocole de ses premiers octets,
+    /// et la connexion déjà ouverte vers la destination quand elle peut servir à un tunnel.
+    Client(
+        tokio::net::TcpStream,
+        crate::net::Protocol,
+        Option<tokio::net::TcpStream>,
+    ),
+    /// Déjà traitée ici : tunnel vers un serveur qui a parlé le premier, ou abandon.
+    Done,
+}
+
+/// Tranche une connexion muette au premier octet. Un pool de connexions ouvre souvent une
+/// connexion avant d'en avoir l'usage : si l'application finit par y parler HTTP, elle doit
+/// être traitée en HTTP, et non relayée à l'aveugle. Un serveur qui parle en premier (MySQL,
+/// SMTP) attend, lui, qu'on le joigne : on ouvre donc la connexion vers la destination et le
+/// premier qui parle décide.
+pub async fn resolve_silent(
     state: Arc<AppState>,
-    mut stream: tokio::net::TcpStream,
+    stream: tokio::net::TcpStream,
     original_dst: SocketAddr,
-    protocol: crate::net::Protocol,
     inbound: bool,
-) {
-    let direction = if inbound { "inbound" } else { "outbound" };
-    let count = |result: &str| {
-        state
-            .metrics
-            .passthrough
-            .get_or_create(&crate::metrics::PassthroughLabels {
-                direction: direction.into(),
-                kind: protocol.as_str().into(),
-                result: result.into(),
-            })
-            .inc();
-    };
-    // En mock, aucun appel chiffré ne doit atteindre une dépendance (O3).
-    if !inbound && protocol == crate::net::Protocol::Tls && state.mode() == Mode::Mock {
-        count("refused");
-        return;
+) -> Silent {
+    let mode = state.mode();
+    if !inbound && matches!(mode, Mode::Mock | Mode::MockPartial) {
+        // En mock, joindre la dépendance pour savoir si elle parle la première la
+        // contacterait : on attend l'application, sans rien ouvrir.
+        return match tokio::time::timeout(MOCK_SILENCE_WAIT, stream.readable()).await {
+            Ok(Ok(())) => {
+                let protocol = crate::net::sniff(&stream).await;
+                Silent::Client(stream, protocol, None)
+            }
+            Ok(Err(_)) => Silent::Done,
+            Err(_) => Silent::Client(stream, crate::net::Protocol::Other, None),
+        };
     }
     let target = if inbound {
         state.inbound_targets.resolve(original_dst).await
     } else {
         original_dst
     };
-    match tokio::net::TcpStream::connect(target).await {
-        Ok(mut upstream) => {
-            count("relayed");
-            let _ = upstream.set_nodelay(true);
-            let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
-        }
+    let upstream = match tokio::net::TcpStream::connect(target).await {
+        Ok(u) => u,
         Err(e) => {
-            if let Some(omitted) = state.upstream_log.allow(Instant::now()) {
-                tracing::warn!(%target, error = %e, omitted, "tunnel impossible");
-            }
-            count("error");
+            tunnel_failed(&state, target, &e, inbound, crate::net::Protocol::Other);
+            return Silent::Done;
         }
+    };
+    let _ = upstream.set_nodelay(true);
+    let client_first = tokio::select! {
+        r = stream.readable() => {
+            if r.is_err() {
+                return Silent::Done;
+            }
+            true
+        }
+        _ = upstream.readable() => false,
+    };
+    if !client_first {
+        // Le serveur parle le premier : tunnel opaque, avec la connexion déjà ouverte.
+        let protocol = crate::net::Protocol::Other;
+        tunnel(
+            state,
+            stream,
+            original_dst,
+            protocol,
+            inbound,
+            Some(upstream),
+        )
+        .await;
+        return Silent::Done;
     }
+    match crate::net::sniff(&stream).await {
+        // La connexion ouverte vers la destination n'a pas servi : elle est refermée.
+        crate::net::Protocol::Http => Silent::Client(stream, crate::net::Protocol::Http, None),
+        p => Silent::Client(stream, p, Some(upstream)),
+    }
+}
+
+/// Relais TCP opaque d'une connexion redirigée non HTTP (spec §3.1). `upstream` est la
+/// connexion déjà ouverte vers la destination, s'il y en a une.
+pub async fn tunnel(
+    state: Arc<AppState>,
+    stream: tokio::net::TcpStream,
+    original_dst: SocketAddr,
+    protocol: crate::net::Protocol,
+    inbound: bool,
+    upstream: Option<tokio::net::TcpStream>,
+) {
+    // En mock, aucun appel chiffré ne doit atteindre une dépendance (O3).
+    if !inbound && protocol == crate::net::Protocol::Tls && state.mode() == Mode::Mock {
+        count_tunnel(&state, inbound, protocol, "refused");
+        return;
+    }
+    let upstream = match upstream {
+        Some(u) => u,
+        None => {
+            let target = if inbound {
+                state.inbound_targets.resolve(original_dst).await
+            } else {
+                original_dst
+            };
+            match tokio::net::TcpStream::connect(target).await {
+                Ok(u) => {
+                    let _ = u.set_nodelay(true);
+                    u
+                }
+                Err(e) => {
+                    tunnel_failed(&state, target, &e, inbound, protocol);
+                    return;
+                }
+            }
+        }
+    };
+    count_tunnel(&state, inbound, protocol, "relayed");
+    let mut stream = stream;
+    let mut upstream = upstream;
+    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+}
+
+fn count_tunnel(state: &AppState, inbound: bool, protocol: crate::net::Protocol, result: &str) {
+    state
+        .metrics
+        .passthrough
+        .get_or_create(&crate::metrics::PassthroughLabels {
+            direction: if inbound { "inbound" } else { "outbound" }.into(),
+            kind: protocol.as_str().into(),
+            result: result.into(),
+        })
+        .inc();
+}
+
+fn tunnel_failed(
+    state: &AppState,
+    target: SocketAddr,
+    e: &std::io::Error,
+    inbound: bool,
+    protocol: crate::net::Protocol,
+) {
+    if let Some(omitted) = state.upstream_log.allow(Instant::now()) {
+        tracing::warn!(%target, error = %e, omitted, "tunnel impossible");
+    }
+    count_tunnel(state, inbound, protocol, "error");
 }
 
 fn count_request(

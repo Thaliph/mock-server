@@ -1,4 +1,4 @@
-//! Interception transparente réelle (PRX-04, PRX-04b, PRX-08, INI-04).
+//! Interception transparente réelle (PRX-04, PRX-04b, PRX-08, PRX-15, INI-04).
 //!
 //! Exige root dans un namespace réseau jetable : lancer `scripts/e2e-netns.sh`.
 //! Sans `MIMIC_NETNS_E2E=1`, le test ne fait rien (il ne doit jamais toucher l'iptables de l'hôte).
@@ -68,6 +68,28 @@ fn tcp_server(greeting: Option<&'static [u8]>) -> u16 {
         }
     });
     port
+}
+
+/// Connexion ouverte d'avance, comme le fait un pool : muette au-delà du délai de détection,
+/// puis une requête HTTP. Renvoie la réponse brute. Hors du runtime, qui sert la dépendance.
+async fn silent_then_get(port: u16, path: &'static str) -> String {
+    tokio::task::spawn_blocking(move || silent_then_get_blocking(port, path))
+        .await
+        .unwrap()
+}
+
+fn silent_then_get_blocking(port: u16, path: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
 }
 
 async fn wait_admin() {
@@ -157,6 +179,29 @@ async fn transparent_interception_in_network_namespace() {
     );
     assert_eq!(recorded["path"], "/users/4");
 
+    // PRX-15 : connexion HTTP muette plus de 300 ms, traitée en HTTP et enregistrée.
+    let r = silent_then_get(saas.addr.port(), "/users/7").await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let list: Vec<Value> = client()
+            .get(format!("{ADMIN}/exchanges?direction=outbound"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if list.iter().any(|e| e["path"] == "/users/7") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connexion muette non traitée en HTTP"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     // PRX-06 en transparent : HTTPS intercepté d'après le SNI, sans proxy configuré.
     let ca = std::fs::read(ca_dir.join("ca.crt")).unwrap();
     let tls_app = reqwest::Client::builder()
@@ -238,6 +283,11 @@ async fn transparent_interception_in_network_namespace() {
     assert_eq!(r.json::<Value>().await.unwrap()["id"], 4);
     assert_eq!(saas.hits(), hits);
 
+    // PRX-15 en mock : connexion muette servie depuis le store, sans joindre la dépendance.
+    let r = silent_then_get(saas.addr.port(), "/users/4").await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    assert_eq!(saas.hits(), hits);
+
     // HTTPS intercepté servi en mock, sans joindre la dépendance.
     let https_hits = https.hits();
     https.stop();
@@ -255,5 +305,9 @@ async fn transparent_interception_in_network_namespace() {
         .await
         .unwrap();
     assert!(m.contains(r#"mimic_passthrough_connections_total{direction="outbound",kind="tls",result="refused"}"#), "{m}");
-    assert!(m.contains(r#"kind="tcp",result="relayed""#), "{m}");
+    // PRX-04 : deux tunnels (client puis serveur qui parle en premier) ; PRX-15 : aucun de plus.
+    assert!(
+        m.contains(r#"mimic_passthrough_connections_total{direction="outbound",kind="tcp",result="relayed"} 2"#),
+        "{m}"
+    );
 }

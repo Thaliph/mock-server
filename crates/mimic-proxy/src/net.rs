@@ -155,24 +155,44 @@ pub fn classify(head: &[u8]) -> Option<Protocol> {
 /// Délai au-delà duquel une connexion muette est relayée telle quelle.
 pub const SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Ce que montrent les premiers octets d'une connexion redirigée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detected {
+    Protocol(Protocol),
+    /// Rien reçu dans le délai : serveur qui parle en premier, ou connexion ouverte d'avance
+    /// par un pool et pas encore utilisée (spec §3.1).
+    Silent,
+}
+
 /// Lit sans consommer les premiers octets de la connexion pour en déduire le protocole.
-pub async fn sniff(stream: &TcpStream) -> Protocol {
+pub async fn detect(stream: &TcpStream) -> Detected {
     let deadline = tokio::time::Instant::now() + SNIFF_TIMEOUT;
     let mut buf = [0u8; 16];
+    let mut seen = false;
     loop {
         match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
-            Err(_) | Ok(Err(_)) | Ok(Ok(0)) => return Protocol::Other,
+            Err(_) if !seen => return Detected::Silent,
+            Err(_) | Ok(Err(_)) | Ok(Ok(0)) => return Detected::Protocol(Protocol::Other),
             Ok(Ok(n)) => {
+                seen = true;
                 if let Some(p) = classify(&buf[..n]) {
-                    return p;
+                    return Detected::Protocol(p);
                 }
                 // Début ambigu (« GE ») : on attend la suite sans boucler à vide.
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 if tokio::time::Instant::now() >= deadline {
-                    return Protocol::Other;
+                    return Detected::Protocol(Protocol::Other);
                 }
             }
         }
+    }
+}
+
+/// Comme [`detect`], une connexion muette comptant comme un autre protocole.
+pub async fn sniff(stream: &TcpStream) -> Protocol {
+    match detect(stream).await {
+        Detected::Protocol(p) => p,
+        Detected::Silent => Protocol::Other,
     }
 }
 
