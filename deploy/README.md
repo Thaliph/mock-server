@@ -15,6 +15,13 @@ Prérequis : cert-manager et trust-manager, ce dernier avec `mimic-system` comme
 de confiance (`--set app.trust.namespace=mimic-system`), car la CA du contrôleur y vit. Ordre : `namespace`, `crd`, `rbac`,
 `certificates`, puis `controller`.
 
+Si la CA `mimic-controller-ca` est réémise (rotation, ou réémission par cert-manager juste
+après sa création), cert-manager ne réémet pas les certificats qu'elle a déjà signés. Les
+sidecars refusent alors le contrôleur (`invalid peer certificate: BadSignature` dans leurs
+logs). Supprimer les Secrets `mimic-controller-tls` et `mimic-injector-tls`, ou lancer
+`cmctl renew`, les fait réémettre avec la CA courante. Le contrôleur et le webhook relisent
+leurs certificats au redémarrage : `kubectl -n mimic-system rollout restart deploy`.
+
 ## Webhook d'injection (`injector/`), une fois par cluster
 
 `injector.yaml` : configuration (image et configuration par défaut des sidecars),
