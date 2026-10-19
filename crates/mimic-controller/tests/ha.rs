@@ -558,3 +558,104 @@ async fn ctl_27_takeover_reloads_the_persisted_state_before_marking() {
     assert_eq!(after, before);
     b.shutdown().await;
 }
+
+/// `/metrics` est servi sans jeton sur le port de l'API, par la passive aussi (CTL-32).
+#[tokio::test]
+async fn ctl_32_passive_replica_serves_metrics_on_the_api_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let lease = Arc::new(MemoryLease::default());
+    lease
+        .write(
+            Record {
+                holder: Some("ailleurs".into()),
+                duration_ms: 60_000,
+                transitions: 0,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let p = start_elected(
+        config(dir.path(), "ctl-p"),
+        local(dir.path()),
+        Replica::new(&lease),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = client().get(url(&p, "/metrics")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.unwrap();
+    assert!(text.contains("mimic_controller_leader 0"), "{text}");
+    p.kill();
+}
+
+/// Une erreur du support à la lecture de `desired.json` n'est pas prise pour un état vide :
+/// `503`, puis l'état persisté dès que le support répond (CTL-33).
+#[tokio::test]
+async fn ctl_33_store_errors_on_the_desired_state_are_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let wl = dir.path().join("shop/checkout");
+    std::fs::create_dir_all(&wl).unwrap();
+    std::fs::write(
+        wl.join("desired.json"),
+        r#"{"mode":"mock","snapshot":"01SNAPSHOT"}"#,
+    )
+    .unwrap();
+    let fail = Arc::new(AtomicBool::new(true));
+    let store = Arc::new(Switch {
+        inner: local(dir.path()),
+        fail: fail.clone(),
+        refused: Arc::new(AtomicUsize::new(0)),
+    });
+    let single = ControllerConfig {
+        leader_election: None,
+        ..config(dir.path(), "seule")
+    };
+    let c = mimic_controller::start_with(single, store).await.unwrap();
+    assert_eq!(heartbeat(&c, "record", None).await.status(), 503);
+    // Ressource reçue pendant la panne : réappliquée à la maintenance.
+    c.apply_spec(
+        "shop",
+        "checkout",
+        Some(MimicWorkloadSpec {
+            mode: "record".into(),
+            ..MimicWorkloadSpec::default()
+        }),
+    )
+    .await;
+    assert_eq!(heartbeat(&c, "record", None).await.status(), 503);
+
+    fail.store(false, Ordering::SeqCst);
+    let r = heartbeat(&c, "record", None).await;
+    assert_eq!(r.status(), 200);
+    let desired: Value = r.json().await.unwrap();
+    assert_eq!(desired["mode"], "mock", "état persisté, pas un état vide");
+    assert_eq!(desired["snapshot"], "01SNAPSHOT");
+    c.state().maintain().await;
+    let desired: Value = heartbeat(&c, "record", None).await.json().await.unwrap();
+    assert_eq!(desired["mode"], "record", "ressource réappliquée");
+    c.kill();
+
+    // Absent : état vide ; illisible : état vide aussi (rien à retenter).
+    for content in [None, Some("pas du json")] {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(text) = content {
+            let wl = dir.path().join("shop/checkout");
+            std::fs::create_dir_all(&wl).unwrap();
+            std::fs::write(wl.join("desired.json"), text).unwrap();
+        }
+        let single = ControllerConfig {
+            leader_election: None,
+            ..config(dir.path(), "seule")
+        };
+        let c = mimic_controller::start_with(single, local(dir.path()))
+            .await
+            .unwrap();
+        let r = heartbeat(&c, "record", None).await;
+        assert_eq!(r.status(), 200, "{content:?}");
+        let desired: Value = r.json().await.unwrap();
+        assert!(desired["mode"].is_null(), "{content:?}: {desired}");
+        c.kill();
+    }
+}

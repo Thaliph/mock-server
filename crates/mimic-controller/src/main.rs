@@ -46,8 +46,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("signal SIGTERM");
+    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("signal SIGTERM: {e}");
+            std::process::exit(1);
+        }
+    };
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}

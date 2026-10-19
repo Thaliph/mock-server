@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
+pub use mimic_net::tls::TlsFiles;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,13 +126,6 @@ impl Default for ControllerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TlsFiles {
-    pub cert_file: PathBuf,
-    pub key_file: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SnapshotConfig {
     pub max_per_key: usize,
@@ -238,10 +231,7 @@ mod tests {
     fn kubernetes_auth_requires_tls() {
         assert!(ControllerConfig::default().validate().is_err());
         let c = ControllerConfig {
-            tls: Some(TlsFiles {
-                cert_file: "c".into(),
-                key_file: "k".into(),
-            }),
+            tls: Some(TlsFiles::new("c", "k")),
             ..ControllerConfig::default()
         };
         assert!(c.validate().is_ok());

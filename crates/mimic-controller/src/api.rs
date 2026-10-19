@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,10 +19,16 @@ use crate::state::{Ctl, IngestError, valid_name};
 
 /// Un segment ne dépasse pas cette taille.
 const MAX_SEGMENT: usize = 64 * 1024 * 1024;
+/// Un battement ne dépasse pas cette taille.
+const MAX_HEARTBEAT: usize = 64 * 1024;
 
+/// Les corps sont lus après `guard` : un appelant non authentifié ne fait rien lire ni
+/// garder en mémoire (spec §9.2b).
 pub fn router(ctl: Arc<Ctl>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        // Collecte Prometheus, sans jeton comme `/healthz` (spec §9.2b).
+        .route("/metrics", get(crate::ui::metrics))
         .route(
             "/v1/workloads/{ns}/{wl}/segments",
             post(post_segment).get(list_segments),
@@ -31,7 +37,10 @@ pub fn router(ctl: Arc<Ctl>) -> Router {
             "/v1/workloads/{ns}/{wl}/segments/{instance}/{file}",
             get(get_segment),
         )
-        .route("/v1/workloads/{ns}/{wl}/heartbeat", post(heartbeat))
+        .route(
+            "/v1/workloads/{ns}/{wl}/heartbeat",
+            post(heartbeat).layer(DefaultBodyLimit::max(MAX_HEARTBEAT)),
+        )
         .route("/v1/workloads/{ns}/{wl}/snapshots/{id}", get(get_snapshot))
         .route(
             "/v1/workloads/{ns}/{wl}/snapshots/{id}/mock",
@@ -104,16 +113,27 @@ struct SegmentQuery {
     segment: Option<String>,
 }
 
+/// Corps de la requête, lu jusqu'à la borne de la route (`DefaultBodyLimit`) : `413` au-delà.
+/// Refus boîté, comme pour `guard`.
+async fn body_of(req: Request) -> Result<Bytes, Box<Response>> {
+    Bytes::from_request(req, &())
+        .await
+        .map_err(|e| Box::new(e.into_response()))
+}
+
 async fn post_segment(
     State(ctl): State<Arc<Ctl>>,
     Path((ns, wl)): Path<(String, String)>,
     Query(q): Query<SegmentQuery>,
-    headers: HeaderMap,
-    body: Bytes,
+    req: Request,
 ) -> Response {
-    if let Err(r) = guard(&ctl, &headers, &ns, &wl, Some(&q.instance)).await {
+    if let Err(r) = guard(&ctl, req.headers(), &ns, &wl, Some(&q.instance)).await {
         return *r;
     }
+    let body = match body_of(req).await {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
     let result = ctl
         .ingest(&ns, &wl, &q.instance, q.segment.as_deref(), body)
         .await;
@@ -191,14 +211,31 @@ struct Heartbeat {
 async fn heartbeat(
     State(ctl): State<Arc<Ctl>>,
     Path((ns, wl)): Path<(String, String)>,
-    headers: HeaderMap,
-    axum::Json(hb): axum::Json<Heartbeat>,
+    req: Request,
 ) -> Response {
-    let id = match guard(&ctl, &headers, &ns, &wl, Some(&hb.instance)).await {
+    // L'instance est dans le corps : le jeton et le workload sont vérifiés avant de le lire,
+    // l'instance après.
+    let id = match guard(&ctl, req.headers(), &ns, &wl, None).await {
         Ok(id) => id,
         Err(r) => return *r,
     };
-    let desired = ctl
+    let body = match body_of(req).await {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
+    let hb: Heartbeat = match serde_json::from_slice(&body) {
+        Ok(hb) => hb,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("battement invalide: {e}")).into_response();
+        }
+    };
+    if !valid_name(&hb.instance) {
+        return (StatusCode::BAD_REQUEST, "nom invalide").into_response();
+    }
+    if let Err(e) = authorize(&id, &ns, &wl, Some(&hb.instance)) {
+        return refuse(&ctl, e);
+    }
+    let desired = match ctl
         .heartbeat(
             &ns,
             &wl,
@@ -211,7 +248,14 @@ async fn heartbeat(
             },
             id.labels,
         )
-        .await;
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(namespace = %ns, workload = %wl, error = %e, "état souhaité illisible sur le support");
+            return (StatusCode::SERVICE_UNAVAILABLE, "support indisponible").into_response();
+        }
+    };
     axum::Json(desired).into_response()
 }
 

@@ -7,7 +7,7 @@
 //! que le Service sélectionne. À la perte du bail, elle cesse aussitôt de servir et d'écrire.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::extract::{Request, State};
@@ -51,14 +51,17 @@ impl MemoryLease {
     pub fn holder(&self) -> Option<String> {
         self.lease
             .lock()
-            .expect("verrou du bail")
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .and_then(|(r, _)| r.holder.clone())
     }
 
     /// Pods qui portent la marque.
     pub fn marked(&self) -> BTreeSet<String> {
-        self.marked.lock().expect("verrou des marques").clone()
+        self.marked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -67,7 +70,7 @@ impl Coordination for MemoryLease {
         let lease = self
             .lease
             .lock()
-            .expect("verrou du bail")
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|(record, v)| Lease {
                 record: record.clone(),
@@ -78,7 +81,7 @@ impl Coordination for MemoryLease {
 
     fn write(&self, record: Record, expected: Option<String>) -> BoxFuture<'_, Result<(), String>> {
         let result = {
-            let mut lease = self.lease.lock().expect("verrou du bail");
+            let mut lease = self.lease.lock().unwrap_or_else(PoisonError::into_inner);
             let current = lease.as_ref().map(|(_, v)| v.to_string());
             if current == expected {
                 let version = lease.as_ref().map_or(1, |(_, v)| v + 1);
@@ -95,7 +98,7 @@ impl Coordination for MemoryLease {
 
     fn announce(&self, me: &str, active: bool) -> BoxFuture<'_, Result<(), String>> {
         {
-            let mut marked = self.marked.lock().expect("verrou des marques");
+            let mut marked = self.marked.lock().unwrap_or_else(PoisonError::into_inner);
             if active {
                 marked.clear();
                 marked.insert(me.to_string());
@@ -171,7 +174,7 @@ impl Election {
     /// Lance la campagne : attente du bail, prise de relais, renouvellement.
     pub fn spawn(self: &Arc<Self>, ctl: Arc<Ctl>, client: Option<kube::Client>) {
         let task = tokio::spawn(self.clone().campaign(ctl, client));
-        *self.campaign.lock().expect("verrou de la campagne") = Some(task);
+        *self.campaign.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
     }
 
     fn retry(&self) -> Duration {
@@ -179,7 +182,10 @@ impl Election {
     }
 
     fn push(&self, task: JoinHandle<()>) {
-        self.tasks.lock().expect("verrou des tâches").push(task);
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(task);
     }
 
     /// Arrête les tâches de l'active, y compris celles qu'une prise de relais lançait.
@@ -188,7 +194,7 @@ impl Election {
             let batch: Vec<_> = self
                 .tasks
                 .lock()
-                .expect("verrou des tâches")
+                .unwrap_or_else(PoisonError::into_inner)
                 .drain(..)
                 .collect();
             if batch.is_empty() {
@@ -205,17 +211,31 @@ impl Election {
 
     /// Arrêt brutal (tests) : plus rien ne tourne, rien n'est écrit ni rendu.
     pub fn kill(&self) {
-        if let Some(c) = self.campaign.lock().expect("verrou de la campagne").take() {
+        if let Some(c) = self
+            .campaign
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             c.abort();
         }
-        for t in self.tasks.lock().expect("verrou des tâches").drain(..) {
+        for t in self
+            .tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+        {
             t.abort();
         }
     }
 
     /// Arrêt propre : marque retirée, service arrêté, exemples écrits, bail rendu.
     pub async fn shutdown(&self, ctl: &Ctl) {
-        let campaign = self.campaign.lock().expect("verrou de la campagne").take();
+        let campaign = self
+            .campaign
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some(c) = campaign {
             c.abort();
             let _ = c.await;

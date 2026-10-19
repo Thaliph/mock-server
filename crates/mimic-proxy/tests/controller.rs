@@ -534,10 +534,10 @@ fn ca_and_cert(dir: &Path, name: &str) -> (std::path::PathBuf, TlsFiles) {
         .unwrap();
     let ca_file = dir.join(format!("{name}-ca.crt"));
     std::fs::write(&ca_file, ca.pem()).unwrap();
-    let files = TlsFiles {
-        cert_file: dir.join(format!("{name}.crt")),
-        key_file: dir.join(format!("{name}.key")),
-    };
+    let files = TlsFiles::new(
+        dir.join(format!("{name}.crt")),
+        dir.join(format!("{name}.key")),
+    );
     std::fs::write(&files.cert_file, cert.pem()).unwrap();
     std::fs::write(&files.key_file, key.serialize_pem()).unwrap();
     (ca_file, files)
