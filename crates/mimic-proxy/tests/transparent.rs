@@ -105,12 +105,17 @@ async fn wait_admin() {
     }
 }
 
+/// INI-04, PRX-04, PRX-04b, PRX-08 et PRX-15 : un seul scénario, qui pose de vraies règles
+/// iptables ; il ne tourne que dans le namespace jetable de `scripts/e2e-netns.sh`
+/// (`--ignored`, job CI `e2e-netns`).
 #[tokio::test]
-async fn transparent_interception_in_network_namespace() {
-    if std::env::var("MIMIC_NETNS_E2E").as_deref() != Ok("1") {
-        eprintln!("ignoré : lancer scripts/e2e-netns.sh");
-        return;
-    }
+#[ignore = "iptables réel : scripts/e2e-netns.sh"]
+async fn ini_04_prx_04_04b_08_15_transparent_interception_in_network_namespace() {
+    assert_eq!(
+        std::env::var("MIMIC_NETNS_E2E").as_deref(),
+        Ok("1"),
+        "à lancer par scripts/e2e-netns.sh, dans un namespace réseau jetable"
+    );
     // INI-04 : deux applications, aucune règle dupliquée.
     init_rules();
     let first = iptables_rules();

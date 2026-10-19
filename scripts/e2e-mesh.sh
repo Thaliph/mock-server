@@ -165,12 +165,15 @@ traffic() {
 }
 
 # Le serveur refuse un client hors mesh (mTLS exigé) : tout sauf un 200.
+# Refus du mesh : pas de 200, et le serveur a bien été résolu (curl 6 : DNS, test faussé).
+# Un `kubectl exec` en échec (pod outsider absent) fait échouer la vérification.
 refused_outside() {
-  local code
-  code=$(kubectl -n "$OUTSIDE" exec outsider -- curl -s -m 5 -o /dev/null -w '%{http_code}' \
-    "http://mesh-server.$1:8080/ping" 2>/dev/null) || true
-  echo "client hors mesh : ${code:-000}"
-  [ "${code:-000}" != 200 ]
+  local out code rc
+  out=$(kubectl -n "$OUTSIDE" exec outsider -- sh -c \
+    "curl -s -m 5 -o /dev/null -w '%{http_code}' http://mesh-server.$1:8080/ping; echo \" \$?\"") || return 1
+  code=${out% *} rc=${out##* }
+  echo "client hors mesh : HTTP $code, code de curl $rc"
+  [ "$code" != 200 ] && [ "$rc" != 6 ]
 }
 
 export_has() {
@@ -214,7 +217,7 @@ for c in $cases; do
   log "$c : trafic par le mesh"
   retry 60 traffic "$ns" 1 >/dev/null || traffic "$ns" 1 || fail "$c : le client n'atteint pas le serveur"
   traffic "$ns" 20 || fail "$c : appels en échec"
-  refused_outside "$ns" || fail "$c : le serveur accepte un client hors mesh, mTLS non exigé"
+  refused_outside "$ns" || fail "$c : le serveur accepte un client hors mesh (mTLS non exigé), ou le client témoin ne le joint pas"
 
   log "$c : enregistrement par mimic"
   retry 90 export_has '"/ping"' mesh-client "$ns" --outbound mesh-server:8080 ||

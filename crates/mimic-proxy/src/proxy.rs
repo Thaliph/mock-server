@@ -286,7 +286,7 @@ async fn forward(
         state.config.capture.max_body_bytes
     };
     let (body, req_capture) = if matches!(record, Record::Full | Record::Metadata) {
-        let (tee, rx) = TeeBody::new(body, limit);
+        let (tee, rx) = TeeBody::with_budget(body, limit, state.inflight.clone());
         (boxed(tee), Some(rx))
     } else {
         (body, None)
@@ -307,10 +307,23 @@ async fn forward(
             {
                 state.inbound_targets.forget(a.port());
             }
-            let kind = if e.is_connect() { "connect" } else { "request" };
+            // Connexion non établie dans le délai : 504, compté à part (spec §3.5).
+            let timed_out = e.is_connect() && crate::connect::is_timeout(&e);
+            let kind = match (timed_out, e.is_connect()) {
+                (true, _) => "connect_timeout",
+                (false, true) => "connect",
+                (false, false) => "request",
+            };
             state
                 .metrics
                 .count_upstream_error(direction, authority_label, kind);
+            if timed_out {
+                count_request(&state, direction, mode, authority_label, &method, 504);
+                return text(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "mimic: connexion vers l'amont non établie dans le délai (outbound.connect_timeout)",
+                );
+            }
             count_request(&state, direction, mode, authority_label, &method, 502);
             return text(StatusCode::BAD_GATEWAY, "mimic: amont injoignable");
         }
@@ -371,7 +384,7 @@ async fn forward(
     let Some((pending, req_capture)) = pending else {
         return Response::from_parts(resp_parts, boxed(resp_body));
     };
-    let (tee, resp_capture) = TeeBody::new(resp_body, limit);
+    let (tee, resp_capture) = TeeBody::with_budget(resp_body, limit, state.inflight.clone());
     tokio::spawn(finalize(state, pending, req_capture, resp_capture));
     Response::from_parts(resp_parts, boxed(tee))
 }
@@ -555,6 +568,8 @@ async fn finalize(
     if capture.bodies && !keep && (req.size > 0 || resp.size > 0) {
         dropped(&state, "sample_limit");
     }
+    // Bodies que le budget en vol n'a pas laissé copier en entier (spec §5.2).
+    let over_budget = [req.over_budget, resp.over_budget];
     let req_body = req.into_body(
         keep,
         capture.max_body_bytes,
@@ -565,9 +580,16 @@ async fn finalize(
         capture.max_body_bytes,
         find(&p.resp_headers, "content-encoding"),
     );
-    for b in [&req_body, &resp_body] {
+    for (b, over_budget) in [&req_body, &resp_body].into_iter().zip(over_budget) {
         if matches!(b, Body::Truncated { .. }) {
-            dropped(&state, "truncated");
+            dropped(
+                &state,
+                if over_budget {
+                    "inflight_budget"
+                } else {
+                    "truncated"
+                },
+            );
         }
     }
     let mut exchange = Exchange {
@@ -793,7 +815,8 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
                 return;
             }
         };
-        match tokio::net::TcpStream::connect(&authority).await {
+        let timeout = state.config.outbound.connect_timeout;
+        match crate::connect::tcp(authority.as_str(), timeout).await {
             Ok(mut upstream) => {
                 let mut client = hyper_util::rt::TokioIo::new(upgraded);
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
@@ -802,9 +825,14 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
                 if let Some(omitted) = state.upstream_log.allow(Instant::now()) {
                     tracing::warn!(%authority, error = %e, omitted, "tunnel vers l'amont impossible");
                 }
+                let kind = if e.kind() == std::io::ErrorKind::TimedOut {
+                    "connect_timeout"
+                } else {
+                    "connect"
+                };
                 state
                     .metrics
-                    .count_upstream_error(Direction::Outbound, label, "connect");
+                    .count_upstream_error(Direction::Outbound, label, kind);
             }
         }
     });
@@ -857,7 +885,8 @@ pub async fn resolve_silent(
     } else {
         original_dst
     };
-    let upstream = match tokio::net::TcpStream::connect(target).await {
+    let timeout = state.config.outbound.connect_timeout;
+    let upstream = match crate::connect::tcp(target, timeout).await {
         Ok(u) => u,
         Err(e) => {
             tunnel_failed(&state, target, &e, inbound, crate::net::Protocol::Other);
@@ -918,7 +947,7 @@ pub async fn tunnel(
             } else {
                 original_dst
             };
-            match tokio::net::TcpStream::connect(target).await {
+            match crate::connect::tcp(target, state.config.outbound.connect_timeout).await {
                 Ok(u) => {
                     let _ = u.set_nodelay(true);
                     u

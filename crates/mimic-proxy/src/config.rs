@@ -97,6 +97,8 @@ pub struct Config {
     pub inbound: InboundConfig,
     pub outbound: OutboundConfig,
     pub admin: AdminConfig,
+    /// Délais et plafonds des écoutes du sidecar (spec §3.5).
+    pub server: ServerConfig,
     pub capture: CaptureConfig,
     pub redact: RedactSection,
     pub mock: MockSection,
@@ -118,6 +120,7 @@ impl Default for Config {
             inbound: InboundConfig::default(),
             outbound: OutboundConfig::default(),
             admin: AdminConfig::default(),
+            server: ServerConfig::default(),
             capture: CaptureConfig::default(),
             redact: RedactSection::default(),
             mock: MockSection::default(),
@@ -163,6 +166,10 @@ pub struct OutboundConfig {
     pub enabled: bool,
     /// Accepte les requêtes de proxy explicite (`HTTP_PROXY`) et le trafic redirigé par iptables.
     pub listen: SocketAddr,
+    /// Établissement d'une connexion vers l'amont (DNS, TCP, TLS), dépendance ou application
+    /// (spec §3.5) ; une connexion établie n'a pas de délai.
+    #[serde(with = "duration_secs")]
+    pub connect_timeout: Duration,
 }
 
 impl Default for OutboundConfig {
@@ -170,6 +177,27 @@ impl Default for OutboundConfig {
         Self {
             enabled: true,
             listen: ([127, 0, 0, 1], 15101).into(),
+            connect_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Délai de lecture des en-têtes d'une requête HTTP/1, inactivité entre deux requêtes
+    /// d'une connexion persistante comprise (spec §3.5).
+    #[serde(with = "duration_secs")]
+    pub header_read_timeout: Duration,
+    /// Connexions simultanées de l'entrant et du sortant ensemble ; au-delà, refusées.
+    pub max_connections: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: Duration::from_secs(60),
+            max_connections: 2048,
         }
     }
 }
@@ -202,6 +230,8 @@ pub struct CaptureConfig {
     pub max_store_bytes: usize,
     /// Capture de l'entrant ; le contrôleur peut l'imposer (spec §5.5.1).
     pub inbound: InboundCapture,
+    /// Octets de bodies copiés en vol par le tee, tous échanges confondus (spec §5.2).
+    pub max_inflight_bytes: usize,
 }
 
 impl Default for CaptureConfig {
@@ -215,6 +245,7 @@ impl Default for CaptureConfig {
             // copie le sortant, la découverte le parcourt.
             max_store_bytes: 64 * 1024 * 1024,
             inbound: InboundCapture::Full,
+            max_inflight_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -385,6 +416,10 @@ pub struct ShareConfig {
     /// Borne en nombre d'échanges de la même file (spec §5.4).
     #[serde(default = "default_max_pending")]
     pub max_pending: usize,
+    /// Taille maximale de ce qui est téléchargé du contrôleur, forme de mock ou snapshot
+    /// complet, compressé comme décompressé (spec §5.6).
+    #[serde(default = "default_max_snapshot_bytes")]
+    pub max_snapshot_bytes: usize,
 }
 
 impl Default for ShareConfig {
@@ -399,6 +434,7 @@ impl Default for ShareConfig {
             allow_insecure: false,
             max_backlog_bytes: default_share_backlog(),
             max_pending: default_max_pending(),
+            max_snapshot_bytes: default_max_snapshot_bytes(),
         }
     }
 }
@@ -437,6 +473,10 @@ fn default_mode_poll() -> Duration {
 
 fn default_max_pending() -> usize {
     50_000
+}
+
+fn default_max_snapshot_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_share_interval() -> Duration {
@@ -546,6 +586,38 @@ impl Config {
         }
         if self.store.segment_bytes == 0 || self.store.max_segments == 0 {
             return Err("store.segment_bytes et store.max_segments doivent être positifs".into());
+        }
+        // Une période nulle ferait tourner une boucle sans attente (spec §9.1).
+        let mut durations = vec![
+            ("outbound.connect_timeout", self.outbound.connect_timeout),
+            (
+                "server.header_read_timeout",
+                self.server.header_read_timeout,
+            ),
+        ];
+        let mut caps = vec![
+            ("server.max_connections", self.server.max_connections),
+            (
+                "capture.max_inflight_bytes",
+                self.capture.max_inflight_bytes,
+            ),
+        ];
+        if let Some(share) = &self.share {
+            durations.push(("share.interval", share.interval));
+            durations.push(("share.mode_poll", share.mode_poll));
+            caps.push(("share.max_snapshot_bytes", share.max_snapshot_bytes));
+        }
+        if let Some((name, _)) = durations.iter().find(|(_, d)| d.is_zero()) {
+            return Err(format!("{name} doit être une durée positive (en secondes)"));
+        }
+        if let Some((name, _)) = caps.iter().find(|(_, v)| *v == 0) {
+            return Err(format!("{name} doit être positif"));
+        }
+        if self.server.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "server.max_connections ne peut dépasser {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            ));
         }
         if let Some(share) = &self.share {
             if self.workload.name.is_empty() {

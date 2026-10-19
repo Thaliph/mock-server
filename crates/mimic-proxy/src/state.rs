@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper_rustls::HttpsConnector;
@@ -15,12 +15,15 @@ use mimic_core::snapshot::MockSnapshot;
 use serde_json::Value;
 
 use crate::config::{Config, InboundCapture, MockWebsocket, Mode};
+use crate::connect::TimeoutConnector;
 use crate::metrics::{DiscoveryLabels, Metrics, OriginLabel};
 use crate::store::{Drops, Limits, Store};
 use crate::throttle::LogLimiter;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = UnsyncBoxBody<bytes::Bytes, BoxError>;
+/// Connecteur vers l'amont, borné par `outbound.connect_timeout` (spec §3.5).
+pub type Upstream = TimeoutConnector<HttpsConnector<HttpConnector>>;
 
 /// Documents OpenAPI calculés pour une version du store.
 #[derive(Debug, Clone)]
@@ -45,9 +48,9 @@ pub struct AppState {
     pub store: Store,
     pub metrics: Metrics,
     pub redactor: Redactor,
-    pub client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    pub client: Client<Upstream, ProxyBody>,
     /// Client HTTP/2 seulement (h2c en connaissance préalable, h2 via ALPN) : gRPC.
-    pub client_h2: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    pub client_h2: Client<Upstream, ProxyBody>,
     /// Interception TLS : CA et configuration serveur, si `tls.intercept` n'est pas vide.
     pub tls: Option<TlsState>,
     /// Moteur de mock en service (spec §5.3).
@@ -57,6 +60,8 @@ pub struct AppState {
     pub(crate) snapshot: Mutex<Option<Arc<MockSnapshot>>>,
     pub controller_status: Mutex<crate::control::ControllerStatus>,
     discovery: Mutex<Option<(u64, Arc<Discovery>)>>,
+    /// Pris pendant un calcul de la découverte : un seul à la fois, les autres l'attendent.
+    discovery_build: Mutex<()>,
     pub share_status: Mutex<ShareStatus>,
     /// Réveille la boucle de partage (`POST /share/sync`).
     pub share_notify: tokio::sync::Notify,
@@ -64,7 +69,18 @@ pub struct AppState {
     pub inbound_targets: crate::net::InboundTargets,
     /// Logs d'échec vers l'amont, limités en débit (spec §9.3).
     pub upstream_log: LogLimiter,
+    /// Places de connexion de l'entrant et du sortant ensemble (`server.max_connections`).
+    pub(crate) connections: Arc<tokio::sync::Semaphore>,
+    /// Places de connexion de l'admin, à part : l'application ne prive pas les sondes.
+    pub(crate) admin_connections: Arc<tokio::sync::Semaphore>,
+    /// Budget des bodies copiés en vol par la capture (`capture.max_inflight_bytes`).
+    pub(crate) inflight: Arc<crate::capture::InflightBudget>,
+    /// Logs de refus au plafond de connexions, limités en débit.
+    pub(crate) refused_log: LogLimiter,
 }
+
+/// Plafond fixe des connexions simultanées de l'admin (spec §3.5).
+pub const ADMIN_MAX_CONNECTIONS: usize = 64;
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ShareStatus {
@@ -78,7 +94,16 @@ impl AppState {
     pub fn new(config: Config) -> Result<Arc<Self>, String> {
         let salt = match &config.redact.salt {
             Some(s) => s.as_bytes().to_vec(),
-            None => ulid::Ulid::generate().to_string().into_bytes(),
+            None => {
+                // Sel propre au processus : les marqueurs ne se comparent plus entre pods (§7).
+                tracing::warn!(
+                    "aucun sel de redaction (redact.salt, MIMIC_REDACT_SALT) : sel aléatoire, \
+                     les marqueurs de redaction changent d'un pod et d'un redémarrage à l'autre \
+                     (dédoublonnage, snapshots et comparaisons entre pods faussés) ; fournir \
+                     MIMIC_REDACT_SALT par le Secret <workload>-mimic, clé redact-salt"
+                );
+                ulid::Ulid::generate().to_string().into_bytes()
+            }
         };
         let redactor = Redactor::new(
             RedactConfig {
@@ -96,7 +121,9 @@ impl AppState {
             .https_or_http()
             .enable_http1()
             .wrap_connector(http.clone());
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let connect_timeout = config.outbound.connect_timeout;
+        let client = Client::builder(TokioExecutor::new())
+            .build(TimeoutConnector::new(connector, connect_timeout));
         let connector_h2 = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls_client)
             .https_or_http()
@@ -104,7 +131,7 @@ impl AppState {
             .wrap_connector(http);
         let client_h2 = Client::builder(TokioExecutor::new())
             .http2_only(true)
-            .build(connector_h2);
+            .build(TimeoutConnector::new(connector_h2, connect_timeout));
         let tls = if config.tls.intercept.is_empty() {
             None
         } else {
@@ -143,6 +170,8 @@ impl AppState {
             .filter(|s| s.is_controller())
             .map(|s| s.url.clone())
             .unwrap_or_default();
+        let max_connections = config.server.max_connections;
+        let inflight = crate::capture::InflightBudget::new(config.capture.max_inflight_bytes);
         Ok(Arc::new(Self {
             mode: AtomicU8::new(config.mode.to_u8()),
             inbound_capture: AtomicU8::new(config.capture.inbound as u8),
@@ -161,9 +190,14 @@ impl AppState {
                 ..Default::default()
             }),
             discovery: Mutex::new(None),
+            discovery_build: Mutex::new(()),
             share_status: Mutex::new(share_status),
             share_notify: tokio::sync::Notify::new(),
             upstream_log: LogLimiter::per_second(),
+            connections: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+            admin_connections: Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONNECTIONS)),
+            refused_log: LogLimiter::per_second(),
+            inflight,
             tls,
         }))
     }
@@ -233,7 +267,10 @@ impl AppState {
     }
 
     pub fn snapshot(&self) -> Option<Arc<MockSnapshot>> {
-        self.snapshot.lock().expect("verrou du snapshot").clone()
+        self.snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Impose un snapshot (ou le retire) ; en mock, le moteur est reconstruit dessus avant
@@ -245,16 +282,46 @@ impl AppState {
         self.publish_snapshot(snap);
     }
 
-    /// Documents OpenAPI du workload, recalculés quand le store change.
-    pub fn discovery(&self) -> Arc<Discovery> {
-        let version = self.store.version();
-        let mut guard = self.discovery.lock().expect("verrou de la découverte");
-        if let Some((v, d)) = guard.as_ref()
-            && *v == version
-        {
-            return d.clone();
+    /// Documents OpenAPI du workload, recalculés quand le store change, sur le pool de
+    /// threads bloquants : un calcul long ne retient aucun worker du runtime (spec §9.2).
+    pub async fn discovery(self: &Arc<Self>) -> Arc<Discovery> {
+        if let Some(d) = self.cached_discovery(self.store.version()) {
+            return d;
         }
-        let exchanges = self.store.snapshot();
+        let state = self.clone();
+        let compute = move || state.compute_discovery();
+        match tokio::task::spawn_blocking(compute.clone()).await {
+            Ok(d) => d,
+            // Pool bloquant indisponible (arrêt du runtime) : calcul sur place.
+            Err(_) => compute(),
+        }
+    }
+
+    /// Découverte en cache, si elle correspond à cette version du store.
+    fn cached_discovery(&self, version: u64) -> Option<Arc<Discovery>> {
+        let guard = self
+            .discovery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        guard
+            .as_ref()
+            .filter(|(v, _)| *v == version)
+            .map(|(_, d)| d.clone())
+    }
+
+    /// Calcul de la découverte, hors du verrou du cache, sur des échanges partagés avec le
+    /// store (aucune copie sous son verrou).
+    fn compute_discovery(&self) -> Arc<Discovery> {
+        let _build = self
+            .discovery_build
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Version lue avant les échanges : un ajout pendant le calcul le fera refaire.
+        let version = self.store.version();
+        if let Some(d) = self.cached_discovery(version) {
+            return d;
+        }
+        let exchanges = self.store.shared();
         let title = if self.config.workload.name.is_empty() {
             self.config.instance.clone()
         } else {
@@ -266,7 +333,10 @@ impl AppState {
             outbound: infer_outbound(&exchanges, version_label),
         });
         self.update_discovery_metrics(&d);
-        *guard = Some((version, d.clone()));
+        *self
+            .discovery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((version, d.clone()));
         d
     }
 

@@ -261,6 +261,11 @@ for w in $mocked; do mimicctl mode "$w" record -n "$NS" >/dev/null; done
 retry 120 all_aligned record || { mimicctl status -n "$NS"; fail "retour en record"; }
 
 log "bascule en mock"
+# E2E-03 : la bascule ne redémarre aucun conteneur des pods de shipping (native sidecar compris).
+restarts() {
+  kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -o jsonpath='{range .items[*]}{.metadata.name}:{range .status.initContainerStatuses[*]}{.restartCount},{end}{range .status.containerStatuses[*]}{.restartCount},{end};{end}'
+}
+restarts_before=$(restarts)
 mimicctl mode shipping mock -n "$NS"
 aligned() {
   local line
@@ -274,6 +279,8 @@ log "mock : quote arrêté, shipping répond depuis le snapshot"
 kubectl -n "$NS" scale deploy/quote --replicas=0
 kubectl -n "$NS" wait --for=delete pod -l app.kubernetes.io/name=quote --timeout=60s
 traffic 40 || fail "requêtes en échec en mock"
+[ "$(restarts)" = "$restarts_before" ] ||
+  fail "E2E-03 : pods de shipping redémarrés par la bascule ($restarts_before, puis $(restarts))"
 
 log "bascule du contrôleur sous trafic (E2E-06)"
 # ctl_get <pod> <chemin> : GET sur l'interface d'un pod du contrôleur, liée à 127.0.0.1:8081.
@@ -409,8 +416,14 @@ retry 60 refused || fail "condition Allowed=False absente"
 code=0; mimicctl mode guard mock -n "$PROD" 2>/dev/null || code=$?
 [ "$code" -eq 2 ] || fail "mimicctl mode mock accepté en production (code $code)"
 # Politique d'admission : une ressource en mock y est refusée.
+# Refus attendu de la politique elle-même : un autre échec du patch (API, RBAC) ne compte pas.
 denied() {
-  ! kubectl -n "$PROD" patch mimicworkload guard --type merge -p '{"spec":{"mode":"mock-partial"}}' 2>/dev/null
+  local out
+  if out=$(kubectl -n "$PROD" patch mimicworkload guard --type merge -p '{"spec":{"mode":"mock-partial"}}' 2>&1); then
+    return 1
+  fi
+  echo "$out"
+  echo "$out" | grep -q mimic-production-guard
 }
 retry 30 denied || fail "politique d'admission inactive"
 kubectl delete namespace "$PROD" --wait=false
@@ -442,8 +455,10 @@ ws_metric() {
     total '/^mimic_websocket_connections_total[{]/ && /direction="outbound"/ && /result="'"$1"'"/'
 }
 # ws_applied <websocket> : le sidecar de ws-client est en mock, snapshot chargé, avec ce réglage.
+# Statut lu depuis le pod : hors sondes et /metrics, l'admin ne répond qu'à la boucle locale
+# (spec §9.2), pas au proxy de l'API Kubernetes.
 ws_applied() {
-  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15100/proxy/api/status" |
+  kubectl -n "$NS" exec "$ws_pod" -c curl -- curl -sS -m 5 http://127.0.0.1:15100/api/status |
     jq -e --arg w "$1" '.mode == "mock" and .snapshot != null and .mock_websocket == $w' >/dev/null
 }
 # ws_aligned : statut publié pour la génération courante, le pod aligné.

@@ -1,6 +1,6 @@
 # Mimic : sidecar de découverte d'API et de mock pour tirs de perf
 
-> Statut : **v0.15** ; cohabitation avec un service mesh (§3.3, phase P4b) : Istio en sidecar, Istio ambient et Linkerd ; Mimic se place entre l'application et le mesh, détecte le mesh dans les règles déjà posées et prend des ports et un UID hors de ceux des mesh (admin 15100, sortant 15101, entrant 15106, UID 1338). v0.14 : contrôleur en haute disponibilité (§5.5.4, phase P6g) : deux réplicas, une seule active, élue par un bail `Lease` ; la nouvelle active recharge l'état persisté avant de recevoir le trafic, que le Service ne route que vers elle, et les sidecars traversent la bascule sans intervention, le mock continuant d'être servi. v0.13 : WebSocket en mock réglable (§3.4, phase P3g) : `mock.websocket: relay` (défaut) relaie toujours la poignée de main sortante, `refuse` la refuse en `503` sans joindre la dépendance, ce qui rend O3 strict ; réglable par la configuration du sidecar, la `MimicWorkload` (`spec.mock.websocket`) et `mimicctl mode --mock-websocket`. v0.12 : snapshot de mock léger (§5.6) : un pod qui passe en mock ne télécharge plus le snapshot complet, mais sa forme de mock, réduite à ce que son moteur en garde (échanges rejouables et durées par opération), compressée et identique sur tous les pods, pour les mêmes réponses ; chemin chaud du sidecar (phase P3f) : métriques comptées sans allocation, curseurs de `round-robin` et `sequence` bornés, mock-partial sans reconstruction du moteur par échange relayé. v0.11 : mock centralisé (§5.4, §5.5.3) : sous contrôleur, les sidecars publient leurs segments sans plus importer ceux de leurs pairs, et le mock de chaque pod sert le snapshot poussé par le contrôleur ; le contrôleur garde au moins un exemple rejouable par endpoint de chaque workload, hors rétention ; l'historique par défaut passe de 7 jours à 24 heures. v0.10 : parcours SRE de tir de charge (§5.8) : garde-fou production côté contrôleur et `mimicctl`, capture entrante réglable pendant un tir (`capture.inbound`), bascule limitée aux pods sélectionnés (`spec.selector`) et métriques comparables par version. v0.9 : rapport de découverte `mimicctl report` (§9.5) et démo OpenTelemetry complète, avec son générateur de charge, en validation des PR (E2E-05). v0.8 : injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS.
+> Statut : **v0.16** ; tir de charge intégré (§5.9, phase P8b) : `mimicctl load` rejoue les requêtes enregistrées contre un workload en mock, à concurrence fixe ou croissante jusqu'à saturation, et en déduit une taille de CPU et de mémoire par pod. v0.15 : cohabitation avec un service mesh (§3.3, phase P4b) : Istio en sidecar, Istio ambient et Linkerd ; Mimic se place entre l'application et le mesh, détecte le mesh dans les règles déjà posées et prend des ports et un UID hors de ceux des mesh (admin 15100, sortant 15101, entrant 15106, UID 1338). v0.14 : contrôleur en haute disponibilité (§5.5.4, phase P6g) : deux réplicas, une seule active, élue par un bail `Lease` ; la nouvelle active recharge l'état persisté avant de recevoir le trafic, que le Service ne route que vers elle, et les sidecars traversent la bascule sans intervention, le mock continuant d'être servi. v0.13 : WebSocket en mock réglable (§3.4, phase P3g) : `mock.websocket: relay` (défaut) relaie toujours la poignée de main sortante, `refuse` la refuse en `503` sans joindre la dépendance, ce qui rend O3 strict ; réglable par la configuration du sidecar, la `MimicWorkload` (`spec.mock.websocket`) et `mimicctl mode --mock-websocket`. v0.12 : snapshot de mock léger (§5.6) : un pod qui passe en mock ne télécharge plus le snapshot complet, mais sa forme de mock, réduite à ce que son moteur en garde (échanges rejouables et durées par opération), compressée et identique sur tous les pods, pour les mêmes réponses ; chemin chaud du sidecar (phase P3f) : métriques comptées sans allocation, curseurs de `round-robin` et `sequence` bornés, mock-partial sans reconstruction du moteur par échange relayé. v0.11 : mock centralisé (§5.4, §5.5.3) : sous contrôleur, les sidecars publient leurs segments sans plus importer ceux de leurs pairs, et le mock de chaque pod sert le snapshot poussé par le contrôleur ; le contrôleur garde au moins un exemple rejouable par endpoint de chaque workload, hors rétention ; l'historique par défaut passe de 7 jours à 24 heures. v0.10 : parcours SRE de tir de charge (§5.8) : garde-fou production côté contrôleur et `mimicctl`, capture entrante réglable pendant un tir (`capture.inbound`), bascule limitée aux pods sélectionnés (`spec.selector`) et métriques comparables par version. v0.9 : rapport de découverte `mimicctl report` (§9.5) et démo OpenTelemetry complète, avec son générateur de charge, en validation des PR (E2E-05). v0.8 : injection automatique par webhook d'admission et CLI `mimicctl` (§9.4, §9.5). v0.7 : le contrôleur devient la seule autorité de bascule, pilotée par la ressource `MimicWorkload`, avec authentification des sidecars (§5.5, §7.1). v0.6 : ajout du contrôleur (§5.5), des snapshots de mock identiques sur tous les pods (§5.6) et de la liste des requêtes rejouables (§5.7). Périmètre réduit à HTTP et HTTPS.
 > Langage : Rust. Développement avec Claude Code sur dépôt git privé.
 > Nom de travail : `mimic` (à renommer librement).
 
@@ -195,6 +195,21 @@ Les headers propres à la connexion (`Connection`, `Keep-Alive`, `Proxy-Authoriz
 
 Le relais garde la version de la requête reçue : une requête HTTP/2 part en HTTP/2 vers l'amont (h2c en connaissance préalable, h2 via ALPN en HTTPS), trailers compris, car un serveur gRPC refuse HTTP/1.1 ; une requête HTTP/1.x part en HTTP/1.1.
 
+### 3.5 Délais et plafonds du sidecar
+
+Le sidecar est dans le chemin de tout le trafic du pod : une dépendance muette ou un client lent ne doivent pas lui faire garder indéfiniment des connexions, des tâches et de la mémoire.
+
+- **Connexion vers l'amont** : toute connexion que le sidecar ouvre vers une dépendance ou vers l'application est bornée par `outbound.connect_timeout` (10 s par défaut) : client HTTP (résolution DNS, TCP et poignée de main TLS compris), tunnel `CONNECT`, tunnels des connexions redirigées (§3.1). Une dépendance dont le SYN reste sans réponse (NetworkPolicy qui jette les paquets, hôte disparu) libère ainsi l'application en 10 s, et non au délai TCP du système (plusieurs minutes). Au-delà du délai :
+  - une requête HTTP reçoit `504 Gateway Timeout`, avec un body texte qui nomme l'option, et l'échec est compté dans `mimic_upstream_errors_total{kind="connect_timeout"}` (les autres échecs de connexion restent `502`, `kind="connect"`) ;
+  - un tunnel `CONNECT` est refermé et compté de même (`kind="connect_timeout"`) ;
+  - le tunnel d'une connexion redirigée est refermé et compté dans `mimic_passthrough_connections_total{result="error"}`, comme les autres échecs de tunnel.
+
+  **Aucun délai ne borne une connexion établie** : ni la durée d'une réponse, ni celle d'un flux (SSE, gRPC en streaming, gros téléchargement), d'une connexion WebSocket ou d'un tunnel. Ils durent ce que l'application et la dépendance décident. Les sondes qui choisissent l'adresse de l'application (§3.1) gardent leur délai d'une seconde.
+- **Lecture des en-têtes** : sur les trois écoutes (entrant, sortant, admin), une connexion HTTP/1 doit transmettre les en-têtes complets d'une requête en moins de `server.header_read_timeout` (60 s par défaut), sinon le sidecar la ferme sans réponse : un client lent (slowloris) ne garde pas une connexion ouverte. Le délai court dès que la connexion attend une requête, donc aussi entre deux requêtes d'une connexion persistante : une connexion keep-alive inactive plus longtemps est refermée par le sidecar, comme le fait un serveur (nginx ferme au bout de 75 s, un ALB au bout de 60 s), et les pools de connexions des clients HTTP le gèrent. Le délai ne touche ni la lecture d'un body de requête, ni l'écriture d'une réponse, ni une connexion basculée en WebSocket. La poignée de main TLS d'un hôte intercepté (§4.2) est bornée par le même délai. HTTP/2 n'est pas concerné.
+- **Connexions simultanées** : `server.max_connections` (2 048 par défaut) borne ensemble les connexions ouvertes sur l'entrant et le sortant, tunnels et WebSocket compris. Au-delà, une nouvelle connexion est acceptée puis refermée aussitôt, sans être lue, et comptée dans `mimic_connections_refused_total{listener}`, avec au plus une ligne de log par seconde. L'admin a son propre plafond, fixe, de 64 connexions : le trafic de l'application ne peut pas priver le kubelet de ses sondes.
+  - **Refus plutôt qu'attente** : un sidecar qui cesserait d'accepter laisserait les connexions dans la file du noyau, sans délai. Et comme l'entrant et le sortant partagent le plafond, une requête entrante qui attend un appel sortant jamais accepté bloquerait jusqu'aux délais des clients. Un refus échoue vite, comme une dépendance indisponible, et le reste du trafic continue.
+  - **Dimensionnement** : une connexion coûte de l'ordre de quelques dizaines de KiB (tampons HTTP, état TLS), soit quelques dizaines de MiB au plafond, dans la limite de 256 Mi posée par l'injecteur (§9.4).
+
 ---
 
 ## 4. TLS
@@ -282,8 +297,10 @@ Règles de capture :
   - le réservoir est déterministe : chaque échange reçoit une priorité, hachage stable de son identifiant, et le réservoir garde les `N` échanges de plus petite priorité. Chaque échange du flux a la même chance d'être gardé, qu'il arrive pendant le warm-up ou à la fin du tir, et le résultat ne dépend pas de l'ordre d'arrivée (fusion entre sidecars comprise, §5.4). Un exemple remplacé perd ses bodies et garde ses métadonnées ;
   - la décision est prise **avant** tout décodage, parsing JSON et redaction du body : un body qui ne serait pas gardé n'est pas traité (compté `reason="sample_limit"`) ; les headers et la query sont redactés dans tous les cas ;
   - les compteurs d'un couple disparaissent avec son dernier exemple : leur nombre est borné par celui des bodies gardés ;
-- mémoire : en plus de `capture.max_exchanges` (50 000), le store a un budget en octets estimés, `capture.max_store_bytes` (64 MiB par défaut). Les bodies gardés en occupent au plus la moitié : au-delà, les bodies des échanges les plus anciens sont retirés en premier. Au-delà du budget, les échanges les plus anciens sont évincés. Un nouvel échange garde donc ses bodies, même quand les métadonnées remplissent le budget. Chaque retrait est compté (`reason="store_budget"`). Les défauts tiennent dans la limite mémoire de 256 Mi posée par l'injecteur (§9.4) : store et file de partage (§5.4) en occupent au plus un tiers, le reste couvre l'index du moteur de mock (§5.3), la découverte et les bodies en vol ;
+- mémoire : en plus de `capture.max_exchanges` (50 000), le store a un budget en octets estimés, `capture.max_store_bytes` (64 MiB par défaut). Les bodies gardés en occupent au plus la moitié : au-delà, les bodies des échanges les plus anciens sont retirés en premier. Au-delà du budget, les échanges les plus anciens sont évincés. Un nouvel échange garde donc ses bodies, même quand les métadonnées remplissent le budget. Chaque retrait est compté (`reason="store_budget"`). Les défauts tiennent dans la limite mémoire de 256 Mi posée par l'injecteur (§9.4) : store et file de partage (§5.4) en occupent au plus un tiers, le reste couvre l'index du moteur de mock (§5.3), la découverte, les bodies en vol (ci-dessous) et le téléchargement d'un snapshot (§5.6) ;
 - taille max capturée : 1 MiB par body ; au-delà, préfixe + taille ;
+- bodies en vol : avant la décision du réservoir, le tee copie jusqu'à `max_body_bytes` de chaque body de requête et de réponse en cours. Ces copies comptent dans un budget global, `capture.max_inflight_bytes` (64 MiB par défaut) : sans lui, 200 requêtes concurrentes de 1 MiB feraient 400 MiB. Un fragment qui ne tient plus dans le budget n'est pas copié, ni aucun des suivants de ce body : s'il est gardé, le body l'est tronqué (`Truncated`, avec le préfixe déjà copié), et il est compté `reason="inflight_budget"` (et non `truncated`). Le budget est rendu dès que l'échange est enregistré ou abandonné. Le relais n'attend jamais le budget : seule la copie est sautée, le trafic de l'application n'est ni bloqué ni ralenti ;
+- dimensionnement de la limite mémoire du sidecar : au moins `max_store_bytes` + `share.max_backlog_bytes` + `max_inflight_bytes`, plus, au téléchargement d'un snapshot, environ deux fois `share.max_snapshot_bytes` (document décompressé et forme chargée) et le moteur de mock construit dessus. Les défauts (64 + 16 + 64 MiB) laissent un peu plus de 100 MiB sous 256 Mi : de quoi charger une forme de mock de quelques dizaines de MiB. Au-delà, relever la limite (`resources` de l'injecteur) ou abaisser les budgets ;
 - content-encoding (`gzip`, `br`, `zstd`) décodé pour l'inférence, encodage d'origine conservé pour le rejeu ;
 - streaming : le proxy ne bufferise jamais la réponse complète avant de la relayer ; la capture se fait en tee ;
 - **capture de l'entrant** (`capture.inbound`, que la `MimicWorkload` peut imposer, §5.5.1 et §5.8) : pendant un tir de charge, on mesure le pod, pas le sidecar. Le sortant n'est jamais concerné, et en `passthrough` rien n'est enregistré quel que soit le réglage.
@@ -327,7 +344,7 @@ Le type de correspondance vaut `exact` si le score est 1, `template` si le chemi
 | `sequence` | rejoue dans l'ordre d'enregistrement (scénarios à état : création puis lecture) |
 | `weighted-status` | respecte la distribution des codes observés (ex. 2 % de 429) pour reproduire les erreurs réelles |
 
-**Latence rejouée** : la latence n'est pas copiée d'un exemple unique, elle est tirée dans la distribution empirique des durées enregistrées pour l'opération (même authority, méthode et template), avec un multiplicateur configurable (`latency.factor: 1.0`, `0` pour la désactiver, `2.0` pour simuler une dépendance dégradée). La durée tirée est comptée depuis l'arrivée de la requête (fin de ses headers) : la réponse part à arrivée + latence, et la lecture du body de requête, le choix de l'enregistrement et la préparation de la réponse sont pris sur cette attente au lieu de s'y ajouter, comme pour la durée mesurée en record. L'attente est faite par un minuteur à la microseconde : le temporisateur de tokio arrondit à la milliseconde supérieure, ce qui rejouerait une dépendance de 140 µs à plus d'une milliseconde. Le minuteur est armé en avance de son retard moyen de réveil, mesuré en continu (plafonné à 1 ms), pour que les réponses partent en moyenne à l'heure. Une latence nulle (ou déjà écoulée) n'attend pas. En v1, la durée totale est appliquée avant l'envoi de la réponse ; le rejeu séparé du TTFB et du temps de transfert viendra avec le streaming des réponses mockées.
+**Latence rejouée** : la latence n'est pas copiée d'un exemple unique, elle est tirée dans la distribution empirique des durées enregistrées pour l'opération (même authority, méthode et template), avec un multiplicateur configurable (`mock.latency_factor: 1.0`, `0` pour la désactiver, `2.0` pour simuler une dépendance dégradée). La durée tirée est comptée depuis l'arrivée de la requête (fin de ses headers) : la réponse part à arrivée + latence, et la lecture du body de requête, le choix de l'enregistrement et la préparation de la réponse sont pris sur cette attente au lieu de s'y ajouter, comme pour la durée mesurée en record. L'attente est faite par un minuteur à la microseconde : le temporisateur de tokio arrondit à la milliseconde supérieure, ce qui rejouerait une dépendance de 140 µs à plus d'une milliseconde. Le minuteur est armé en avance de son retard moyen de réveil, mesuré en continu (plafonné à 1 ms), pour que les réponses partent en moyenne à l'heure. Une latence nulle (ou déjà écoulée) n'attend pas. En v1, la durée totale est appliquée avant l'envoi de la réponse ; le rejeu séparé du TTFB et du temps de transfert viendra avec le streaming des réponses mockées.
 
 Le tirage aléatoire (latence, `weighted-status`) utilise un générateur à graine (`mock.seed`) : un même tir rejoué en série avec la même graine produit la même séquence. Sous concurrence, le générateur avance d'un pas atomique par tirage : la même graine donne le même ensemble de tirages, distribué aux requêtes dans leur ordre d'arrivée.
 
@@ -488,7 +505,8 @@ Plusieurs pods d'un même workload doivent répondre de la même manière en moc
 - **Bascule** : passer `spec.mode` à `mock` construit un snapshot et le désigne comme état souhaité ; renseigner `spec.snapshot` réutilise un snapshot existant, ce qui permet de rejouer un tir de perf dans des conditions identiques d'une semaine à l'autre. Chaque sidecar télécharge une fois la **forme de mock** du snapshot (ci-dessous), la garde en cache (sur disque si `store.dir` est configuré), puis construit son moteur de mock **uniquement** à partir d'elle. Tant que le snapshot n'est pas chargé, y compris quand son téléchargement échoue (il est retenté à chaque battement), le sidecar mocke avec ses données locales, c'est-à-dire ce que son pod a vu (§5.4), et le signale (`snapshot: null` dans son battement) : un passage en mock ne laisse jamais le trafic sortir.
 - **Forme de mock** (`mimic-core::snapshot::MockSnapshot`, fonction pure du snapshot) : ce que le moteur du sidecar (§5.3) garde du snapshot, et rien d'autre. Le moteur ne compare à une requête que les échanges rejouables de son opération ; des autres, il ne garde que la durée, dans la distribution de latence de l'opération. La forme de mock contient donc l'identifiant du snapshot, son nombre d'échanges, ses échanges rejouables de code ≥ 200 **tels quels**, dans l'ordre du snapshot, et, pour chaque opération (authority, méthode, forme du chemin, §5.2) désignée par son premier échange, la liste des durées de tous ses échanges de code ≥ 200, dans l'ordre chronologique. Un moteur construit sur la forme de mock est le même qu'un moteur construit sur le snapshot : mêmes candidats et mêmes réponses pour toute requête, avec toute stratégie, et, à graine égale, mêmes latences tirées. Déduite du seul contenu du snapshot et sérialisée sous une forme canonique (un document JSON), elle donne les mêmes octets à tous les pods.
   - **Pourquoi pas les plafonds du store du sidecar** (`capture.samples_per_operation` par opération et code) : le moteur bâti sur un snapshot n'en applique aucun, tous les échanges rejouables du snapshot sont des candidats, et en retirer changerait des réponses (un chemin exact servi par un autre de même template). Ce qui pèse dans un snapshot, ce sont les échanges sans body : au-delà du plafond de bodies (§5.2, §5.5.2) presque tous les échanges d'un endpoint très sollicité en sont, et un chemin de forte cardinalité (`/v1/charges/ch_…`, un segment non reconnu comme identifiant) en garde jusqu'à `snapshot.max_per_key` par chemin. Chacun ne compte que par sa durée.
-  - **Téléchargement** : `GET …/snapshots/{id}/mock` (§9.2b), compressée selon l'`Accept-Encoding` de la requête (`zstd` de préférence, puis `gzip`, sinon telle quelle), avec un `ETag` (empreinte `sha256` de la forme sérialisée, 16 caractères hexadécimaux) et `Cache-Control: immutable` ; `If-None-Match` sur cet `ETag` répond `304`. Le sidecar vérifie l'identifiant du snapshot et l'`ETag` de ce qu'il reçoit, une fois décompressé (au plus 256 MiB), et ne retélécharge jamais un snapshot déjà chargé : son identifiant, empreinte du contenu, suffit à le reconnaître. Le contrôleur calcule la forme de mock d'un snapshot une seule fois, à la première demande, hors des threads du serveur, puis n'en garde en mémoire que les versions compressées (128 MiB au plus pour l'ensemble, les plus anciennes calculées évincées d'abord ; la forme sans compression est décompressée à la demande) : des pods qui la demandent ensemble attendent le même calcul.
+  - **Téléchargement** : `GET …/snapshots/{id}/mock` (§9.2b), compressée selon l'`Accept-Encoding` de la requête (`zstd` de préférence, puis `gzip`, sinon telle quelle), avec un `ETag` (empreinte `sha256` de la forme sérialisée, 16 caractères hexadécimaux) et `Cache-Control: immutable` ; `If-None-Match` sur cet `ETag` répond `304`. Le sidecar vérifie l'identifiant du snapshot et l'`ETag` de ce qu'il reçoit, une fois décompressé, et ne retélécharge jamais un snapshot déjà chargé : son identifiant, empreinte du contenu, suffit à le reconnaître. Le contrôleur calcule la forme de mock d'un snapshot une seule fois, à la première demande, hors des threads du serveur, puis n'en garde en mémoire que les versions compressées (128 MiB au plus pour l'ensemble, les plus anciennes calculées évincées d'abord ; la forme sans compression est décompressée à la demande) : des pods qui la demandent ensemble attendent le même calcul.
+  - **Taille bornée** : ce que le sidecar reçoit du contrôleur, forme de mock ou snapshot complet, ne dépasse pas `share.max_snapshot_bytes` (64 MiB par défaut), compressé comme décompressé ; le corps compressé est libéré avant la lecture du document. Au-delà, le téléchargement est abandonné sans rien garder et traité comme un snapshot indisponible (SNP-07) : le sidecar mocke sur ses données locales, l'erreur nomme l'option dans son statut, et le téléchargement est retenté au battement suivant. La borne protège le sidecar d'un arrêt par manque de mémoire, qui couperait tout le réseau du pod (les règles iptables restent posées) jusqu'à son redémarrage.
   - **Compatibilité** : `GET …/snapshots/{id}` sert toujours le snapshot complet, inchangé, aux sidecars d'une version antérieure. Un sidecar à jour face à un contrôleur d'une version antérieure (`404` sur `…/mock`) télécharge le snapshot complet, vérifie son empreinte, et en déduit lui-même la même forme de mock. Le cache sur disque du sidecar (`<store.dir>/controller/snapshots/<id>.mock.json`) garde la forme de mock ; un cache d'une version antérieure (`<id>.jsonl`) est encore relu. Elle ne contient que des échanges du snapshot, déjà redactés (§7).
 - **Même appel vu par plusieurs sidecars** : chaque pod enregistre son exemplaire, avec un identifiant propre ; rien n'est fusionné à tort. Au rejeu, ces exemplaires sont des candidats de même score. La stratégie `best` choisit alors la **réponse la plus fréquente** (même code et même body), puis la plus récente. Une erreur ponctuelle vue par un seul pod ne masque donc pas la réponse habituelle ; pour la reproduire en proportion, utiliser `weighted-status`. Toutes les durées des exemplaires alimentent la distribution de latence de l'opération.
 - **Ce qui est identique d'un pod à l'autre** : à requête égale, le code, les headers et le body servis (stratégie `best`). La latence suit la même distribution sur chaque pod, mais le tirage est propre à chaque pod. Les stratégies à état (`round-robin`, `sequence`) avancent indépendamment sur chaque pod.
@@ -512,6 +530,32 @@ But : mesurer la latence et la consommation d'un pod sous charge, isolé de ses 
 5. **Revenir** : `mimicctl mode <workload> record` (sans `--selector` ni `--capture-inbound`, ce qui les retire).
 
 Dans un namespace labellisé `env=production`, l'étape 2 est refusée (garde-fou, §1) : le blue/green avec mock se joue dans un environnement de préproduction ou de perf, et la promotion en production se fait ensuite sans mock.
+
+
+### 5.9 Tir de charge intégré : `mimicctl load`
+
+But : rejouer les requêtes entrantes enregistrées contre un workload isolé (§5.8), à une concurrence fixe ou croissante, pour mesurer sa capacité et en déduire une taille de CPU et de mémoire, sans outil externe. Le rejeu k6 (§5.7) reste disponible.
+
+**Requêtes.** Le corpus vient du contrôleur (`…/requests?direction=inbound&format=jsonl&limit=`, comme `mimicctl requests`) ou d'un fichier JSONL d'échanges (`--from`, sortie de `mimicctl requests --format jsonl`), ce qui permet un tir depuis un Job sans port-forward. Chaque requête rejoue la méthode, le chemin, la query et le body de l'échange ; les headers propres à la connexion ne sont pas rejoués, ni les headers redactés (§7), comme pour k6 (§5.7). `--header 'nom: valeur'`, répétable, ajoute ou remplace un header (un jeton valide par exemple). Un échange dont le body de requête est tronqué ou non capturé (§5.2) est écarté : le rejouer enverrait une requête incomplète ; le rapport compte les échanges écartés. Les requêtes sont jouées dans l'ordre d'enregistrement, en boucle, et partagées entre les connexions : la n-ième requête lancée est la requête `n mod taille` du corpus. Le `Host` est celui de la cible. `--http2` parle HTTP/2 sans TLS (prior knowledge), pour un service gRPC ; une cible `https://` est refusée en v1.
+
+**Charge.** Boucle fermée : `C` tâches envoient chacune une requête, attendent la réponse, puis la suivante, chacune sur sa connexion persistante ; au plus `C` requêtes sont donc en cours.
+
+- **Fixe** : `--concurrency C` (défaut 8) avec `--requests N` (exactement `N` requêtes lancées) ou `--duration D` (défaut 60 s).
+- **Montée** : `--ramp` enchaîne des paliers de concurrence `--start` (défaut 1), puis multipliée par `--factor` (défaut 2), jusqu'à `--max` (défaut 256, toujours joué en dernier s'il n'est pas atteint par la multiplication), chacun pendant `--step-duration` (défaut 60 s). La montée s'arrête au premier palier saturé.
+
+Une requête qui n'aboutit pas dans `--timeout` (défaut 10 s), une erreur de connexion ou une réponse 5xx est une erreur ; les autres codes sont des succès. Par palier : concurrence, durée, requêtes, débit (succès par seconde), taux d'erreur, latence p50, p95, p99 et maximum (histogramme log-linéaire, précision relative meilleure que 1 %, fusionnable entre tâches).
+
+**Saturation.** Un palier est saturé si son taux d'erreur dépasse `--max-error-rate` (défaut 1 %), si son p99 dépasse `--max-p99` (facultatif), ou si, la concurrence ayant augmenté par rapport au palier précédent, son débit progresse de moins de `--plateau` (défaut 10 %) de cette hausse : en doublant la concurrence, moins de 10 % de débit en plus. Le seuil suit la hausse de concurrence, ce qui rend le critère indépendant de `--factor`. La **capacité** est le palier non saturé de plus haut débit ; si aucun palier ne l'est, il n'y a pas de capacité et le rapport le dit. Saturé par plateau, le palier montre que le workload ne sert pas plus vite avec plus de concurrence : sa ressource limitante (CPU limité, pool, verrou) est atteinte.
+
+**Ressources.** Avec un workload nommé, `mimicctl` relève pendant chaque palier la consommation des pods du workload par l'API `metrics.k8s.io` (metrics-server), toutes les `--sample-interval` (défaut 15 s) ; les pods sont ceux que le contrôleur connaît pour le workload (sélectionnés, §5.5.1), ou ceux de `--pod-selector`. Les conteneurs `mimic` et ceux des mesh (§3.3) sont exclus : seuls ceux de l'application comptent. Les relevés du premier tiers de chaque palier (montée en température) sont ignorés. Par palier : CPU moyen et mémoire maximale (working set) par pod. Sans accès à `metrics.k8s.io` (API absente ou droit refusé), le tir continue et le rapport le signale.
+
+**Recommandation.** Au palier de capacité, par pod : `requests.cpu` = CPU moyen × (1 + `--cpu-headroom`, défaut 30 %), arrondi au millicœur supérieur ; `requests.memory` = mémoire maximale × (1 + `--memory-headroom`, défaut 20 %), arrondie au MiB supérieur, à reprendre comme limite mémoire ; débit par pod et débit par cœur. Elle suppose une répartition égale entre les pods (le Service). Une capacité atteinte par un CPU limité (`limits.cpu`) se voit à un CPU moyen proche de la limite : relever la limite et refaire le tir.
+
+**Isolement.** Avec un workload nommé, `mimicctl load` refuse (code 2) si son mode souhaité n'est pas `mock` ou si ses pods sélectionnés ne sont pas tous alignés : un tir en `record` ou `passthrough` frapperait les vraies dépendances. `--allow-live-dependencies` lève ce refus. Sans workload (`--from` seul), aucune vérification n'est possible : le rapport le rappelle.
+
+**Rapport.** Texte (défaut), `--format markdown` (résumé d'un job GitHub Actions) ou `--format json`. Il liste les paliers, le verdict (palier de capacité, palier et raison de la saturation) et la recommandation. Mêmes mesures, même rapport (déterministe).
+
+Le cœur (requêtes à rejouer, paliers, histogramme, saturation, lecture des quantités Kubernetes, agrégation des relevés, recommandation, rapport) est dans `mimic-core::load`, pur ; `mimicctl` n'y ajoute que le client HTTP, les minuteries et les appels au cluster. Depuis un Job (`deploy/load/job.yaml`), l'image de Mimic contient `mimicctl`.
 
 ---
 
@@ -597,7 +641,7 @@ Redaction appliquée **avant** toute écriture sur disque (dans `mimic-core::red
 | Body JSON | clés correspondant aux mêmes motifs ; valeurs détectées comme e-mail, numéro de carte (contrôle de Luhn), IBAN, JWT |
 | Règles projet | JSONPath et regex additionnels déclarés par service |
 
-Le hash est calculé sur `sel || valeur`, avec un sel propre à l'installation, puis tronqué à 8 caractères hexadécimaux. Il garde la cohérence (deux requêtes avec le même token portent le même marqueur) sans permettre de retrouver une valeur courte par dictionnaire. La redaction est idempotente : un marqueur n'est jamais re-hashé.
+Le hash est calculé sur `sel || valeur`, avec un sel propre à l'installation, puis tronqué à 8 caractères hexadécimaux. Le sel vient de `redact.salt`, ou de `MIMIC_REDACT_SALT` (Secret `<workload>-mimic`, §9.4). À défaut, il est tiré au hasard au démarrage et le sidecar l'annonce par un avertissement dans ses logs, qui nomme `MIMIC_REDACT_SALT` : les marqueurs diffèrent alors d'un pod à l'autre et à chaque redémarrage, ce qui fausse le dédoublonnage, les snapshots et les comparaisons entre pods. Il garde la cohérence (deux requêtes avec le même token portent le même marqueur) sans permettre de retrouver une valeur courte par dictionnaire. La redaction est idempotente : un marqueur n'est jamais re-hashé.
 
 Bodies que la redaction ne peut pas analyser : un body JSON ou formulaire tronqué, ou un JSON invalide, est remplacé par `Skipped { size }`, car on ne peut pas garantir qu'il ne contient pas de secret. Les bodies binaires ne sont pas modifiés.
 
@@ -647,6 +691,10 @@ inbound:
   ports: [8080]
 outbound:
   exclude_cidrs: [10.96.0.10/32]
+  connect_timeout: 10          # secondes : établissement d'une connexion vers l'amont (§3.5)
+server:
+  header_read_timeout: 60      # secondes : en-têtes HTTP/1 d'une requête, inactivité keep-alive comprise (§3.5)
+  max_connections: 2048        # connexions simultanées, entrant et sortant ensemble (§3.5)
 tls:
   intercept: ["api.stripe.com", "*.salesforce.com"]
   ca_dir: /var/run/mimic/ca            # ca.crt et ca-bundle.crt publiés pour l'app
@@ -658,6 +706,7 @@ capture:
   samples_per_operation: 20
   max_exchanges: 50000
   max_store_bytes: 67108864   # 64 MiB, budget mémoire du store (§5.2)
+  max_inflight_bytes: 67108864  # 64 MiB, bodies copiés en vol par la capture (§5.2)
   inbound: full               # full | metadata | off : capture de l'entrant (§5.2)
 version: v1.4.2               # label `version` des métriques (§9.3) ; MIMIC_VERSION l'emporte, MIMIC_POD_TEMPLATE_HASH à défaut
 store:
@@ -669,7 +718,7 @@ redact:
 mock:
   strategy: best
   unmatched: error
-  latency: { factor: 1.0 }
+  latency_factor: 1.0        # multiplicateur de la latence rejouée (0 à 100)
   match_headers: ["accept", "x-api-version"]
   websocket: relay            # relay | refuse : poignée de main WebSocket sortante en mock (§3.4)
 share:
@@ -681,6 +730,7 @@ share:
   mode_poll: 2       # secondes, battement vers le contrôleur
   max_backlog_bytes: 16777216  # 16 MiB, file des échanges pas encore publiés (§5.4)
   max_pending: 50000           # même file, en nombre d'échanges
+  max_snapshot_bytes: 67108864 # 64 MiB, forme de mock téléchargée, compressée comme décompressée (§5.6)
 ```
 
 Configuration du contrôleur (`mimic-controller --config`) :
@@ -689,7 +739,7 @@ Configuration du contrôleur (`mimic-controller --config`) :
 listen: 0.0.0.0:8443            # API des sidecars
 ui_listen: 127.0.0.1:8081       # interface, par port-forward
 tls: { cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key, reload_interval: 10 }   # relus à chaud (§9.2b)
-auth: kubernetes                # TokenReview ; static pour les tests
+auth: { kind: kubernetes }      # TokenReview ; { kind: static, tokens: … } pour les tests
 store: file:///var/lib/mimic-controller   # ou s3://bucket/prefixe
 retention: 86400                   # secondes (24 heures) : segments supprimés au-delà
 max_exchanges_per_workload: 200000
@@ -714,9 +764,15 @@ leader_election:  # absent : une seule réplique, sans bail (§5.5.4)
 
 L'identité d'une réplique dans l'élection est le nom de son pod, lu dans `POD_NAME` (API downward), sinon `HOSTNAME`.
 
-La configuration est validée au démarrage ; une configuration invalide fait échouer le conteneur avec un message explicite (pas de démarrage en mode dégradé silencieux).
+La configuration est validée au démarrage ; une configuration invalide fait échouer le conteneur avec un message explicite (pas de démarrage en mode dégradé silencieux). Côté sidecar, une période ou un délai nul (`share.interval`, `share.mode_poll`, `outbound.connect_timeout`, `server.header_read_timeout`) est refusé, avec un message qui nomme le champ : une période nulle ferait tourner la boucle de partage ou de battement sans attente, et inonderait le contrôleur ou le support. Un plafond nul (`server.max_connections`, `capture.max_inflight_bytes`, `share.max_snapshot_bytes`) l'est aussi.
 
 ### 9.2 API admin (port 15100, localhost + port-forward)
+
+**Accès** : l'API admin écoute sur toutes les adresses (`0.0.0.0:15100`) pour que le kubelet (sondes) et Prometheus la joignent, mais seules `/healthz`, `/readyz` et `/metrics` répondent à toute adresse. Toutes les autres routes (la page, `/api/*`, `/openapi/*`, `/exchanges`, `/mode` en lecture comme en écriture, `/store`, `/share/sync`, et les chemins inconnus) ne répondent qu'aux connexions venues de la boucle locale, `127.0.0.1` ou `::1` (adresse IPv4 mappée en IPv6 comprise) : un conteneur du pod, `kubectl port-forward` (soumis au RBAC `pods/portforward`) ou `kubectl exec`. Les autres reçoivent `403` sans que la requête soit traitée.
+
+- Seules ces deux adresses comptent comme locales : Istio en mode sidecar relaie vers l'application les connexions des autres pods depuis `127.0.0.6` (§3.3.2), qui est donc refusée comme une adresse distante. Un mesh qui relaierait des connexions distantes depuis `127.0.0.1` les ferait passer pour locales : il faut alors exclure le port 15100 de son interception entrante.
+- `/share/sync` n'a pas d'appelant distant : le partage passe par le support ou par le contrôleur, jamais par une connexion entre pods (§5.4). Ni le contrôleur ni `mimicctl` n'appellent l'admin des sidecars ; la route sert aux opérateurs, par port-forward, et aux tests.
+- Le proxy de l'API Kubernetes (`kubectl get --raw /api/v1/namespaces/<ns>/pods/<pod>:15100/proxy/…`) se connecte depuis l'API server : il n'obtient que les sondes et `/metrics`.
 
 | Méthode | Chemin | Rôle |
 |---------|--------|------|
@@ -737,6 +793,8 @@ La configuration est validée au démarrage ; une configuration invalide fait é
 - pour le service puis pour chaque dépendance : la liste des opérations (méthode, template, nombre d'appels, répartition des codes, latences p50/p99) ;
 - pour chaque opération, dépliable : les paramètres (chemin, query, headers) avec leur type et un marqueur **requis**, le schéma du body de requête, les codes de réponse avec schéma et exemples ;
 - des liens de téléchargement des documents OpenAPI.
+
+Les documents OpenAPI de la page, de `/api/operations` et de `/openapi/*` sont recalculés quand le store a changé, sur le pool de threads bloquants du runtime et hors du verrou de leur cache : un calcul long ne retient aucun worker, donc ni le trafic, ni les sondes, ni le battement. Des requêtes simultanées attendent le même calcul.
 
 ### 9.2b API du contrôleur
 
@@ -794,13 +852,13 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 |----------|------|--------|------|
 | `mimic_requests_total` | compteur | `direction`, `mode`, `authority`, `method`, `status` | tous |
 | `mimic_request_duration_seconds` | histogramme | `direction`, `mode`, `authority` | tous |
-| `mimic_upstream_errors_total` | compteur | `direction`, `authority`, `kind` | record |
+| `mimic_upstream_errors_total` | compteur | `direction`, `authority`, `kind` (`connect`, `connect_timeout`, `request`, §3.5) | record |
 | `mimic_mock_responses_total` | compteur | `authority`, `match` (`exact`, `template`, `fuzzy`, `unmatched`) | mock |
 | `mimic_mock_injected_latency_seconds` | histogramme | `authority` | mock |
 | `mimic_discovered_operations` | jauge | `direction`, `authority` | tous |
 | `mimic_store_exchanges` | jauge | `origin` (`local`, `peer` : toujours 0 sous contrôleur, §5.4) | tous |
 | `mimic_store_bytes` | jauge (octets estimés des échanges en mémoire, §5.2) | | tous |
-| `mimic_capture_dropped_total` | compteur | `reason` (`truncated`, `sample_limit`, `store_budget`, `share_backlog`, `local_backlog`) | tous |
+| `mimic_capture_dropped_total` | compteur | `reason` (`truncated`, `sample_limit`, `store_budget`, `share_backlog`, `local_backlog`, `inflight_budget`) | tous |
 | `mimic_share_sync_total` | compteur | `result` (`ok`, `error`) | tous |
 | `mimic_share_peers` | jauge (toujours 0 sous contrôleur, §5.4) | | tous |
 | `mimic_mode` | jauge (1 pour le mode courant) | `mode` | tous |
@@ -809,8 +867,9 @@ Métriques Prometheus sur `/metrics` (scrapables par VictoriaMetrics), actives d
 | `mimic_websocket_connections_total` | compteur (poignées de main WebSocket, §3.4 : `relayed`, `101` de l'amont relayé ; `refused`, sortante refusée en mock par `mock.websocket: refuse`) | `direction`, `result` (`relayed`, `refused`) | tous |
 | `mimic_mock_snapshot_exchanges` | jauge (0 sans snapshot) | | mock |
 | `mimic_mock_engine_builds_total` | compteur | `trigger` (`switch`, `refresh`, `unmatched`, §5.3) | mock |
+| `mimic_connections_refused_total` | compteur (connexions refermées au plafond, §3.5) | `listener` (`inbound`, `outbound`, `admin`) | tous |
 
-`authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité.
+`authority` est borné : au-delà de 100 valeurs distinctes, les suivantes sont regroupées sous `other` pour protéger la cardinalité. `method` aussi : il ne prend que les neuf méthodes standard (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `CONNECT`, `TRACE`), toute autre méthode est comptée sous `other`, si bien qu'un client qui invente des méthodes ne crée aucune série.
 
 **Coût sur le chemin des requêtes** : compter une requête n'alloue rien et ne touche aucun compteur de références partagé entre les requêtes. Les labels fixes (`direction`, `mode`, `match`, `kind`, `reason`, méthodes standard) sont des chaînes statiques et le code est un entier ; une authority est internée à sa première apparition (au plus 100, la mémoire reste bornée), puis résolue sous un verrou pris en lecture. Les jauges du store (`mimic_store_exchanges`, `mimic_store_bytes`) sont calculées à la lecture de `/metrics`, et non à chaque échange enregistré.
 
@@ -875,6 +934,7 @@ Outil des humains. Il parle à l'API Kubernetes avec le kubeconfig courant et n'
 | `mimicctl requests <workload> [--format json\|jsonl\|k6] [--limit n]` | requêtes enregistrées (§5.7) |
 | `mimicctl diff <ancien> <nouveau> [--json] [--fail-on-breaking]` | différence entre deux documents OpenAPI (YAML ou JSON) |
 | `mimicctl report [<workload>] [-n ns \| -A] [--top n]` | rapport Markdown de ce que les sidecars ont découvert (ci-dessous) |
+| `mimicctl load [<workload>] --target URL [--from fichier] [--concurrency C (--requests N \| --duration D) \| --ramp …] [-n ns]` | tir de charge par rejeu des requêtes enregistrées, palier fixe ou montée jusqu'à saturation, avec recommandation de CPU et de mémoire (§5.9) |
 
 - `mode` : `--selector` prend des égalités `clé=valeur` séparées par des virgules (`spec.selector.matchLabels`) ; `--capture-inbound` renseigne `spec.capture.inbound` ; `--mock-websocket` renseigne `spec.mock.websocket` (§3.4). Une valeur invalide est refusée avant tout appel. Un apply sans ces options les retire (server-side apply), donc `mimicctl mode checkout record` remet tout le workload dans le même état. Avant d'appliquer `mock` ou `mock-partial`, `mimicctl` lit les labels du namespace : s'il porte `env=production`, il refuse avec un message qui nomme le namespace et le label, et le code de sortie 2, sans rien appliquer. S'il ne peut pas lire le namespace (droit `get` absent), il le signale et applique : le contrôleur refuse de toute façon (§5.5.1).
 - `status` : `ALIGNED` ne compte que les pods sélectionnés (§5.5.1) ; un mode refusé par le garde-fou est affiché suivi de `(refusé)`.
@@ -951,6 +1011,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | INF-04 | bodies où `email` est toujours présent, `phone` dans 50 % | inférence | `required: [email]`, `phone` optionnel |
 | INF-05 | champ valant tantôt `"x"`, tantôt `null` | inférence | `type: [string, "null"]` |
 | INF-06 | champ `status` avec 3 valeurs sur 100 observations | inférence | `enum` de 3 valeurs |
+| INF-06b | champ `status` toujours `paid` sur 10 observations | inférence | pas d'`enum` : l'échantillon ne suffit pas |
 | INF-07 | n'importe quel corpus (proptest) | inférence | la spec produite est un OpenAPI 3.1 valide |
 | INF-08 | même corpus, ordre des échanges permuté (proptest) | inférence | spec identique (déterminisme) |
 | INF-09 | champs texte de réponse sur 60 appels : `name` ∈ `user0`…`user6` ; `status` à 3 valeurs sur 20 observations, chacune vue au moins deux fois ; `kind` à 3 valeurs dont une vue une seule fois ; `tier` à 2 valeurs sur 19 observations ; `plan` toujours `basic` ; puis les mêmes `tier` avec `min_observations: 10` | inférence | `enum` seulement pour `status` (et `tier` avec le seuil abaissé) ; `name`, `kind`, `tier` et `plan` restent `type: string` sans `enum` |
@@ -960,10 +1021,13 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ID | Étant donné | Quand | Alors |
 |----|-------------|-------|-------|
 | RED-01 | header `Authorization: Bearer abc` | capture | valeur stockée `<redacted:sha256:…>`, jamais `abc` |
+| RED-01b | headers `Cookie`, `X-Api-Key`, `X-Session-Id`, `Set-Cookie` et `Accept` | capture | les quatre premiers redactés, `Accept` intact |
 | RED-02 | deux requêtes avec le même token | capture | même marqueur de redaction |
 | RED-03 | body avec un numéro de carte valide (Luhn) | capture | remplacé ; un numéro invalide de même longueur ne l'est pas |
+| RED-03b | body avec une adresse e-mail, un JWT, un IBAN, dans un objet et dans une liste | capture | remplacés, les autres valeurs intactes, chaque marque située (`response.body$.contact`) |
 | RED-04 | n'importe quel body contenant une valeur secrète injectée (proptest) | capture puis lecture du store brut | la valeur n'apparaît dans aucun octet du store |
 | RED-05 | body JSON sans valeur à redacter, aux clés non triées, avec espaces et `1.0` ; même body avec une adresse e-mail | capture, puis rejeu en mock | le premier est stocké et rejoué octet pour octet ; le second est réécrit avec sa marque |
+| RED-06 | aucun sel (ni `redact.salt`, ni `MIMIC_REDACT_SALT`) ; puis un sel fourni | démarrage du sidecar | un avertissement dans les logs explique que les marqueurs changent d'un pod et d'un redémarrage à l'autre et nomme `MIMIC_REDACT_SALT` ; avec un sel, aucun avertissement |
 
 **Matching et mock (MCK)**
 
@@ -973,8 +1037,9 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-02 | enregistrement sur `/v1/c/1` | requête `/v1/c/2` | réponse issue du template, `x-mimic-match: template` |
 | MCK-03 | aucun enregistrement pour l'hôte | requête | `599`, `x-mimic-unmatched: true`, compteur incrémenté |
 | MCK-04 | latences enregistrées p50 = 100 ms | 1 000 requêtes mockées | p50 rejoué entre 90 et 110 ms |
-| MCK-05 | `latency.factor: 2` | 1 000 requêtes | p50 entre 180 et 220 ms |
+| MCK-05 | `mock.latency_factor: 2` | 1 000 requêtes | p50 entre 180 et 220 ms |
 | MCK-06 | stratégie `sequence`, enregistrement POST puis GET | rejeu | réponses servies dans l'ordre d'origine |
+| MCK-06b | stratégie `round-robin`, deux enregistrements équivalents | trois requêtes | 0, 1, 0 : rotation entre les enregistrements |
 | MCK-07 | distribution 98 % 200 / 2 % 429, `weighted-status` | 10 000 requêtes | 429 entre 1,5 % et 2,5 % |
 | MCK-08 | réponse enregistrée gzip, br ou zstd | rejeu | `Content-Encoding` conservé, body identique une fois décodé |
 
@@ -983,6 +1048,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ID | Étant donné | Quand | Alors |
 |----|-------------|-------|-------|
 | MCK-09 | deux enregistrements de même chemin, query `?page=1` et `?page=2` | requête `?page=2` | l'enregistrement `page=2` est choisi |
+| MCK-09b | deux enregistrements POST de même chemin, bodies JSON `{"sku":"A"}` et `{"sku":"B"}` | requête au body `{"sku":"A"}` | l'enregistrement `A` est choisi |
 | MCK-10 | enregistrement sur une autre méthode ou une autre authority | requête | aucune correspondance |
 | MCK-11 | même graine, mêmes requêtes | deux exécutions | décisions et latences identiques |
 | MCK-12 | trois exemplaires du même appel, deux en `200 {a}` et un en `500`, le `500` le plus récent | stratégie `best` | `200 {a}` |
@@ -993,7 +1059,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 |----|-------------|-------|-------|
 | MCK-13 | 3 enregistrements rejouables de `GET /users/{id}`, 10 000 sans body de la même opération et 5 000 sur d'autres chemins de la même authority | requête `GET /users/9` | seuls les 3 rejouables sont comparés à la requête ; la latence est tirée parmi les 10 003 durées de l'opération |
 | MCK-14 | un moteur partagé par 8 threads, même graine qu'une exécution en série | 8 000 requêtes concurrentes, stratégies `best`, `weighted-status` et `round-robin` | `best` : mêmes réponses qu'en série ; `weighted-status` : même ensemble de latences tirées qu'en série ; `round-robin` sur 4 candidats : chacun servi 2 000 fois |
-| MCK-15 | une dépendance réelle d'environ 3,5 ms et une sans délai, enregistrées ; un sidecar en mock sur ces enregistrements (`latency.factor: 1`), un autre sans latence (`latency.factor: 0`) | appels en série entrelacés via le sidecar en record (dépendance réelle) et via les sidecars en mock, durée vue par l'application | 3,5 ms : p50 rejoué à ±10 % de celui de la dépendance ; sans délai : p50 rejoué au plus 1,5 fois celui de la dépendance ; sans latence : p50 sous 1 ms |
+| MCK-15 | une dépendance réelle d'environ 3,5 ms et une sans délai, enregistrées ; un sidecar en mock sur ces enregistrements (`mock.latency_factor: 1`), un autre sans latence (`mock.latency_factor: 0`) | appels en série entrelacés via le sidecar en record (dépendance réelle) et via les sidecars en mock, durée vue par l'application | 3,5 ms : p50 rejoué à ±10 % de celui de la dépendance ; sans délai : p50 rejoué au plus 1,5 fois celui de la dépendance ; sans latence : p50 sous 1 ms |
 | MCK-16 | store de 2 000 échanges sortants, mode record | bascule en mock, puis 200 requêtes mockées concurrentes | moteur construit une fois, à la bascule : `mimic_mock_engine_builds_total{trigger="switch"}` vaut 1 avant la première requête et aucune requête n'en construit |
 | MCK-17 | moteur en service, puis nouvel échange sortant dans le store (import d'un pair) ; mode `mock-partial` | requêtes avec correspondance ; requête sur le nouvel échange ; requête relayée puis la même | les premières servies par le moteur courant, sans construction ; la deuxième servie depuis le nouvel échange, pas `599` ; la troisième mockée dès la seconde fois |
 | MCK-18 | enregistrement dont la réponse est en `gzip` | rejeux successifs | le body est encodé une seule fois : les mêmes octets, sans nouvel encodage, à chaque rejeu |
@@ -1014,6 +1080,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | SNP-05 | snapshot chargé, contrôleur arrêté | requêtes mockées | toujours servies depuis le snapshot |
 | SNP-06 | endpoint appelé bien plus de `samples_per_operation` + `max_per_key` fois en record (seuls les premiers exemples gardent leur body) | bascule en mock | la réponse enregistrée est rejouée, pas de `599` |
 | SNP-07 | état souhaité `mock` avec un snapshot que le sidecar ne peut pas télécharger | battement | le sidecar passe quand même en mock, sur ses données locales, et rien ne sort ; l'erreur est visible dans son statut et le téléchargement est retenté |
+| SNP-08 | forme de mock plus grosse que `share.max_snapshot_bytes`, telle quelle, ou compressée sous la borne mais au-delà une fois décompressée ; puis sous la borne | téléchargement | refusée sans rien charger, erreur qui nomme `share.max_snapshot_bytes` ; sous la borne : chargée. Par défaut, `share.max_snapshot_bytes` vaut 64 MiB |
 
 **Contrôleur (CTL)**
 
@@ -1105,6 +1172,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | SEC-04 | `share.url` en `http://` sans `allow_insecure` | démarrage du sidecar | configuration refusée |
 | SEC-05 | contrôleur servi avec un certificat d'une autre CA que `share.ca_file` | battement | refusé, mode inchangé, erreur visible dans le statut |
 | SEC-06 | interface du contrôleur | écoute | liée à `127.0.0.1` uniquement |
+| SEC-07 | admin du sidecar à l'écoute sur toutes les adresses | requêtes depuis `127.0.0.1`, puis depuis une autre adresse (`127.0.0.6`, d'où Istio relaie les autres pods) : `/`, `/api/status`, `/api/operations`, `/openapi/inbound`, `/openapi/outbound`, `/exchanges`, `GET` et `PUT /mode`, `DELETE /store`, `POST /share/sync`, chemin inconnu ; puis `/healthz`, `/readyz`, `/metrics` | depuis `127.0.0.1` : servies ; depuis l'autre adresse : `403`, mode et store inchangés, aucune synchronisation demandée ; sondes et `/metrics` : `200` depuis toute adresse |
 
 **Rejeu (RPL)**
 
@@ -1144,6 +1212,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | CAP-08 | configuration par défaut du webhook (§9.4) | injection d'un pod | journal local au plus le quart de l'`emptyDir` du store ; budget du store et file de partage au plus le tiers de la limite mémoire du sidecar |
 | CAP-09 | `capture.inbound: metadata`, journal local et partage configurés | requête entrante `POST /orders?token=x` avec headers et body JSON, puis un appel sortant | un seul échange entrant en mémoire : méthode, chemin, code, durées et taille des bodies (`Skipped`), sans query, headers ni body ; aucune ligne entrante dans le journal local ni dans la file de publication ; l'appel sortant est enregistré en entier |
 | CAP-10 | `capture.inbound: off` | requêtes entrantes | aucun échange entrant ; `mimic_requests_total{direction="inbound"}` et les observations de `mimic_request_duration_seconds{direction="inbound"}` les comptent toutes |
+| CAP-11 | `capture.max_inflight_bytes` qui tient le body d'une réponse mais pas celui de deux, `max_body_bytes` plus grand ; dépendance qui garde sa réponse ouverte après l'avoir envoyée | deux requêtes concurrentes, puis une requête seule après leur fin | réponses relayées en entier, sans attente ; au moins un body au-delà du budget gardé tronqué (`Truncated`) et compté `reason="inflight_budget"` ; budget rendu : la requête seule est capturée en entier. Par défaut, `capture.max_inflight_bytes` vaut 64 MiB |
 
 **Admin et métriques (ADM)**
 
@@ -1154,6 +1223,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ADM-03 | `PUT /mode` avec `mock` | requête suivante | servie en mock, `mimic_mode{mode="mock"} 1` |
 | ADM-04 | `MIMIC_VERSION=v2` ; puis `MIMIC_VERSION` vide et `MIMIC_POD_TEMPLATE_HASH=7d9f` ; puis aucune version | trafic, `GET /metrics` | chaque métrique porte `version="v2"`, puis `version="7d9f"`, puis aucun label `version` ; valeur tronquée à 63 caractères |
 | ADM-05 | authority et séries déjà vues | comptage d'une requête : `mimic_requests_total`, durée, réponse et latence injectée du mock, erreur amont, capture abandonnée | aucune allocation mémoire ; l'authority est résolue sans verrou exclusif ; après du trafic, `/metrics` donne des jauges du store exactes, calculées à la lecture |
+| ADM-06 | requêtes entrantes de méthodes non standard (`PROPFIND`, puis 20 méthodes inventées) | `GET /metrics` | toutes comptées sous `method="other"` dans `mimic_requests_total` ; aucune série ne porte une méthode inventée |
 
 **Init (INI)**
 
@@ -1176,6 +1246,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ID | Étant donné | Quand | Alors |
 |----|-------------|-------|-------|
 | PRX-01 | mode record, upstream factice | 10 000 requêtes | toutes relayées sans altération, toutes enregistrées |
+| PRX-01b | mode record, body JSON avec accents, query encodée `q=a%20b&page=2` | requêtes | body et query relayés à l'identique, query décodée dans l'échange enregistré |
 | PRX-02 | réponse streamée de 500 MiB | relais | mémoire du proxy < 64 MiB, body tronqué dans le store |
 | PRX-03 | client et upstream gRPC en h2c | relais | HTTP/2 de bout en bout, `te: trailers` et trailers (`grpc-status`) relayés, échange enregistré |
 | PRX-04 | trafic TCP non HTTP redirigé (client qui parle en premier, ou serveur qui parle en premier) | relais | tunnel transparent, octets identiques |
@@ -1194,6 +1265,10 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | PRX-16 | `mock.websocket: refuse` ; modes `mock` (avec `unmatched: error`, puis `passthrough`) et `mock-partial` ; serveur WebSocket joignable qui compte les connexions TCP acceptées | poignée de main WebSocket sortante, puis entrante ; mêmes poignées de main en `record` et `passthrough` | sortante en mock : `503`, `x-mimic-websocket: refused`, aucune connexion acceptée par le serveur, rien d'enregistré, `mimic_websocket_connections_total{direction="outbound",result="refused"}` à 1, `mimic_requests_total` avec `status="503"`, aucun `mimic_mock_responses_total` ; entrante : relayée (`101`, écho) ; en `record` et `passthrough`, relayées (`101`) |
 | PRX-17 | sidecar piloté par le contrôleur, configuré en `relay` ; `MimicWorkload` en `mock` avec `spec.mock.websocket: refuse`, puis sans `spec.mock` | battements, poignée de main WebSocket sortante | le sidecar applique `refuse`, l'annonce dans son battement et son statut (`mock_websocket`), le pod est aligné ; la poignée de main reçoit `503` sans joindre le serveur ; sans `spec.mock`, retour au `relay` de sa configuration et `101` |
 | PRX-18 | sidecar démarré, API admin sur un port quelconque de la configuration | `mimic-proxy --probe /healthz` avec la même configuration, puis sidecar arrêté | code 0 ; puis code 1 avec un message, sans attendre plus de 2 s |
+| PRX-19 | dépendance dont la file d'acceptation est pleine (le SYN reste sans réponse), `outbound.connect_timeout` court ; puis dépendance qui accepte mais finit sa réponse bien après ce délai | requête HTTP sortante, tunnel `CONNECT`, tunnel d'une connexion redirigée vers cette destination ; puis requête vers la dépendance lente | `504` dans le délai et non au délai TCP du système, `mimic_upstream_errors_total{kind="connect_timeout"}` compté pour la requête et le `CONNECT`, tunnel refermé et compté `result="error"` ; la réponse lente est relayée en entier, sans délai sur sa durée. Par défaut, `outbound.connect_timeout` vaut 10 s |
+| PRX-20 | `server.header_read_timeout` court | connexion qui envoie une partie des en-têtes puis se tait ; connexion keep-alive restée inactive après une réponse ; réponse streamée plus longue que le délai | les deux premières fermées par le sidecar après le délai ; la réponse streamée est relayée en entier. Par défaut, `server.header_read_timeout` vaut 60 s |
+| PRX-21 | `server.max_connections: 2`, deux connexions ouvertes sur l'entrant | troisième connexion, sur l'entrant puis sur le sortant ; `/healthz` ; puis fermeture d'une des deux | la troisième est refermée sans réponse et comptée dans `mimic_connections_refused_total{listener}` ; `/healthz` répond ; une nouvelle connexion est ensuite servie. Par défaut, `server.max_connections` vaut 2 048 |
+| PRX-22 | `share.interval`, `share.mode_poll`, `outbound.connect_timeout` ou `server.header_read_timeout` à 0 ; `server.max_connections`, `capture.max_inflight_bytes` ou `share.max_snapshot_bytes` à 0 | démarrage | configuration refusée, avec un message qui nomme le champ |
 
 **Injection (INJ)**
 
@@ -1249,13 +1324,30 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | DIF-03 | paramètre de query devenu requis, paramètre facultatif ajouté | diff | le premier cassant, le second non |
 | DIF-04 | code 404 ajouté, code 200 supprimé | diff | l'ajout n'est pas cassant, la suppression du 200 l'est |
 
+**Tir de charge (LOD)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| LOD-01 | échange entrant avec query, body binaire, `authorization` redacté, `connection` et `host` ; `--header 'authorization: Bearer t'` | requête à rejouer | méthode, chemin, query et body identiques ; ni `connection`, ni `host`, ni la valeur redactée ; `authorization: Bearer t` ; les échanges sortants sont ignorés, un body tronqué écarte l'échange et est compté |
+| LOD-02 | corpus de trois requêtes enregistrées dans le désordre | requêtes 0 à 6 | ordre d'enregistrement, en boucle : 0, 1, 2, 0, 1, 2, 0 |
+| LOD-03 | `--start 1 --factor 2 --max 20` ; `--start 4 --factor 3 --max 4` ; `--factor 1` | paliers | `1, 2, 4, 8, 16, 20` ; `4` ; refus (facteur > 1 exigé) |
+| LOD-04 | latences de 1 µs à 60 s, deux histogrammes fusionnés | p50, p95, p99, max | à moins de 1 % des valeurs exactes ; la fusion vaut l'histogramme de toutes les mesures |
+| LOD-05 | paliers 1, 2, 4 : débits 100, 190, 370, erreurs 0 %, 0 %, 3 % | verdict | palier 4 saturé (erreurs), capacité au palier 2 |
+| LOD-06 | `--max-p99 200ms`, p99 de 50, 120, 400 ms | verdict | saturé au troisième palier (p99), capacité au deuxième |
+| LOD-07 | débits 100, 195, 200 pour les concurrences 1, 2, 4 | verdict | troisième palier saturé (plateau : +2,6 % de débit pour une concurrence doublée, seuil 10 %), capacité au deuxième, le plus haut débit non saturé |
+| LOD-08 | quantités `250m`, `1`, `1500000n`, `128Mi`, `1Gi`, `500k`, `12345` ; relevés d'un pod avec les conteneurs `app`, `mimic`, `istio-proxy`, dont un au premier tiers du palier | lecture, agrégation, recommandation à 30 % / 20 % | 0,25, 1, 0,0015 cœur ; 134217728, 1073741824, 500000, 12345 octets ; seul `app` compte, relevé précoce ignoré ; CPU et mémoire arrondis au millicœur et au MiB supérieurs |
+| LOD-09 | serveur local qui compte les requêtes en cours | `--concurrency 4 --requests 200` | exactement 200 requêtes reçues, jamais plus de 4 en cours, 4 atteint ; rapport d'un palier sans erreur |
+| LOD-10 | workload en `record` ; en `mock` avec 1 pod aligné sur 2 ; en `mock` aligné | `mimicctl load <workload>` | refus code 2 dans les deux premiers cas, avec la raison ; tir dans le dernier ; `--allow-live-dependencies` lève le refus |
+| LOD-11 | serveur local qui traite au plus 4 requêtes à la fois (5 ms chacune) | `--ramp --start 1 --factor 2 --max 64` | montée arrêtée au palier 8, saturé (plateau), sans jouer les suivants ; capacité au palier 4 |
+| LOD-12 | mêmes paliers mesurés | rapport texte, Markdown, JSON | identiques d'une exécution à l'autre ; le JSON se relit |
+
 **E2E (E2E)**
 
 | ID | Scénario |
 |----|----------|
-| E2E-01 | Pod demo (app + Mimic injecté) sur kind, app appelant un faux SaaS HTTPS ; mode record ; la spec inbound et la spec du SaaS sont exportées sur MinIO. |
-| E2E-02 | Même pod en mode mock avec NetworkPolicy deny-all egress : le tir k6 réussit à > 99,9 %, aucun paquet ne sort (vérifié par les compteurs du faux SaaS). |
-| E2E-03 | Changement d'annotation `record → mock` sans redémarrage du pod. |
+| E2E-01 | *Non automatisé : la démo OpenTelemetry (E2E-05) couvre la découverte et l'export ; le stockage MinIO reste à scénariser.* Pod demo (app + Mimic injecté) sur kind, app appelant un faux SaaS HTTPS ; mode record ; la spec inbound et la spec du SaaS sont exportées sur MinIO. |
+| E2E-02 | *Couvert en partie par E2E-05 (dépendance arrêtée, toutes les requêtes réussissent) et E2E-07 (NetworkPolicy qui ne laisse sortir que le DNS et le contrôleur).* Même pod en mode mock avec NetworkPolicy deny-all egress : le tir k6 réussit à > 99,9 %, aucun paquet ne sort (vérifié par les compteurs du faux SaaS). |
+| E2E-03 | Bascule `record → mock` par la `MimicWorkload` (`mimicctl mode`), sans redémarrage du pod : les sidecars s'alignent et le nombre de redémarrages des pods ne change pas. Sous contrôleur, l'annotation de mode est ignorée (§5.1). Vérifié dans `scripts/e2e-kind.sh` lors de la bascule de shipping (E2E-05). |
 | E2E-04 | Namespace labellisé `env=production` : `mimicctl mode … mock` est refusé (code 2) ; une `MimicWorkload` en `mock` créée avant le label passe à `Allowed=False` (raison `ProductionNamespace`) dès que le label est posé ; avec la `ValidatingAdmissionPolicy` de `deploy/controller/production-guard.yaml`, une `MimicWorkload` en mock y est refusée à l'admission. Vérifié en fin de `scripts/e2e-kind.sh` ; sans cluster, par CRD-07 et CLI-06. |
 | E2E-05 | Démo OpenTelemetry sur kind (`scripts/e2e-kind.sh`, à chaque PR vers `main`) : les services de la démo, sans la chaîne de télémétrie ni Kafka, avec son générateur de charge actif ; tous injectés par le webhook sauf `valkey-cart` (opt-out). Les requêtes du test passent par le frontend (`/api/shipping`), qui appelle shipping (2 réplicas) en gRPC, qui appelle quote en HTTP ; en record les deux API de shipping (gRPC entrant, quote sortant) sont découvertes par le contrôleur. Après cinq minutes de charge, `mimicctl report -A` est publié dans le résumé du job et les documents OpenAPI en artefact. Tous les workloads injectés passent ensuite en mock, sauf le générateur (le client) : une fois les pods alignés, pendant 60 s, `mimic_requests_total` des sidecars ne compte plus aucune requête entrante, sauf sur les services que le générateur appelle lui-même (frontend-proxy, et flagd pour ses feature flags) ; frontend-proxy reçoit son trafic et répond depuis le snapshot (`mimic_mock_responses_total`) ; le bilan est ajouté au résumé du job, puis retour en record. Après `mimicctl mode shipping mock`, les deux pods s'alignent sur un snapshot, quote est arrêté et toutes les requêtes réussissent ; retour en record. |
 | E2E-07 | WebSocket en mock, en fin de `scripts/e2e-kind.sh` (`tests/e2e/websocket.yaml`) : un pod injecté `ws-client` (curl) et un serveur WebSocket non injecté `ws-echo`, qui compte les connexions et les poignées de main reçues. Avec `mimicctl mode ws-client mock` (`relay`, le défaut), la poignée de main sortante de `ws-client` aboutit (`101`), le serveur la compte et `mimic_websocket_connections_total{direction="outbound",result="relayed"}` augmente. Puis, sous une NetworkPolicy qui ne laisse sortir de `ws-client` que le DNS et le contrôleur, `mimicctl mode ws-client mock --mock-websocket refuse` : une fois le sidecar sur `refuse` et le pod aligné, la poignée de main reçoit `503` avec `x-mimic-websocket: refused`, le serveur ne voit aucune nouvelle connexion et `result="refused"` augmente. |
@@ -1309,6 +1401,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P3e | Correctifs fonctionnels : relais WebSocket dans tous les modes, poignée de main enregistrée, jamais rejouée ; énumérations inférées seulement sur un échantillon suffisant | PRX-12 à 14, MCK-19, INF-09 |
 | P3f | Chemin chaud du sidecar : métriques sans allocation, curseurs de `round-robin` et `sequence` bornés, mock-partial sans reconstruction du moteur par échange relayé | MCK-21, MCK-22, ADM-05 |
 | P3g | WebSocket en mock réglable : `mock.websocket: relay \| refuse` dans la configuration du sidecar, la `MimicWorkload` (`spec.mock.websocket`) et `mimicctl mode --mock-websocket` ; refus en `503` compté par `mimic_websocket_connections_total{result="refused"}` | MCK-23, PRX-16, PRX-17, CRD-10, CLI-08, E2E-07 |
+| P3h | Sidecar durci pour la production : délai de connexion vers l'amont, délai de lecture des en-têtes, plafond de connexions, admin réservé à la boucle locale hors sondes et métriques, budget des bodies en vol, taille des snapshots bornée, cardinalité de `method`, validation des périodes, avertissement sans sel de redaction (§3.5, §5.2, §5.6, §9.2) | PRX-19 à 22, SEC-07, CAP-11, SNP-08, ADM-06, RED-06 |
 | P4 | `mimic-init` iptables, détection de protocole (connexions muettes comprises), image, manifests d'exemple, E2E en namespace réseau | INI-*, PRX-04, PRX-08, PRX-15 ; E2E kind ensuite |
 | P4b | Service mesh : Istio sidecar, Istio ambient et Linkerd ; détection dans les règles posées, Mimic entre l'application et le mesh, ports et UID hors de ceux des mesh, injection après le mesh et réinvocation, sondes `exec` | INI-05 à INI-10, PRX-18, INJ-11 à INJ-13, E2E-08, E2E-09 |
 | P5 | TLS MITM sortant | PRX-06, 07 |
@@ -1321,6 +1414,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P6g | Contrôleur en haute disponibilité : deux réplicas actif/passif élues par un bail `Lease`, prise de relais après rechargement de l'état persisté, Service vers la seule active, PodDisruptionBudget, anti-affinité, stockage partagé (`s3://` ou PVC `ReadWriteMany` sur plusieurs nœuds) | CTL-24 à CTL-28, CLI-09, E2E-06 |
 | P7 | Webhook d'injection + `mimicctl` (dont le rapport) | INJ-*, CLI-*, OAS-*, DIF-*, E2E-05 |
 | P7b | Plan de contrôle en production : certificats relus à chaud, serveurs bornés (poignée de main, en-têtes, `accept`), arrêt propre du webhook, authentification avant le corps, `/metrics` du contrôleur collectable, erreurs du support distinguées de l'absence, valeurs iptables validées dans le webhook et `mimic-init`, IP de l'API Kubernetes exclue d'office, Pod Security, manifests de production | INI-11, INJ-14 à INJ-20, CTL-29 à CTL-35 |
+| P8b | Tir de charge intégré `mimicctl load` : rejeu en boucle fermée, palier fixe ou montée jusqu'à saturation, relevé CPU et mémoire par `metrics.k8s.io`, recommandation de taille, Job d'exemple | LOD-01 à LOD-12 |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 
 P1 et P3 sont du Rust pur sans I/O : c'est le meilleur point d'entrée pour Claude Code, qui peut avancer en TDD strict sur des fonctions déterministes avant de toucher au réseau.

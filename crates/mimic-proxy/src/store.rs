@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use mimic_core::mock::op_key;
 use mimic_core::model::{Body, Direction, Exchange};
@@ -339,6 +339,12 @@ impl Store {
             .collect()
     }
 
+    /// Tous les échanges, partagés avec le store (aucune copie) : de quoi calculer la
+    /// découverte hors du verrou.
+    pub fn shared(&self) -> Vec<Arc<Exchange>> {
+        self.lock().list.values().map(|en| en.e.clone()).collect()
+    }
+
     /// Échanges d'un sens, partagés avec le store (aucune copie) : de quoi construire le
     /// moteur de mock hors du verrou.
     pub fn shared_direction(&self, direction: Direction) -> Vec<Arc<Exchange>> {
@@ -556,7 +562,7 @@ impl Store {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().expect("verrou du store")
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

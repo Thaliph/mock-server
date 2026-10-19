@@ -220,7 +220,31 @@ kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic
 ```
 
 La page d'admin d'un sidecar reste disponible pour déboguer un pod :
-`kubectl port-forward deploy/checkout 15100:15100`.
+`kubectl port-forward deploy/checkout 15100:15100`. Hors `/healthz`, `/readyz` et `/metrics`,
+ouverts au kubelet et à Prometheus, l'admin ne répond qu'aux connexions venues de
+`127.0.0.1` ou `::1` (port-forward, `kubectl exec`) : `403` pour les autres pods, y compris
+par le proxy de l'API Kubernetes (`kubectl get --raw …/pods/<pod>:15100/proxy/…`), qui n'obtient
+que les métriques (spec §9.2).
+
+### Limites du sidecar
+
+Réglables dans la configuration du sidecar (`sidecar_config` du webhook, ou le ConfigMap monté
+par l'annotation `mimic.platform.io/config`), spec §3.5 et §5.2 :
+
+| Champ | Défaut | Effet |
+|-------|--------|-------|
+| `outbound.connect_timeout` | 10 s | établissement d'une connexion vers l'amont (DNS, TCP, TLS) ; au-delà, `504` et `mimic_upstream_errors_total{kind="connect_timeout"}`. Aucune limite sur la durée d'une réponse ou d'un flux |
+| `server.header_read_timeout` | 60 s | en-têtes HTTP/1 d'une requête ; une connexion keep-alive inactive plus longtemps est refermée |
+| `server.max_connections` | 2048 | connexions simultanées, entrant et sortant ensemble ; au-delà, refermées aussitôt et comptées dans `mimic_connections_refused_total` (l'admin a son propre plafond de 64) |
+| `capture.max_inflight_bytes` | 64 MiB | bodies copiés en vol par la capture ; au-delà, bodies gardés tronqués (`reason="inflight_budget"`), sans effet sur le trafic |
+| `share.max_snapshot_bytes` | 64 MiB | forme de mock téléchargée du contrôleur, compressée comme décompressée ; au-delà, le pod mocke sur ses données locales et l'erreur est dans son statut |
+
+Une période nulle (`share.interval`, `share.mode_poll`) ou l'un de ces champs à 0 est refusé
+au démarrage. La limite mémoire du sidecar doit couvrir au moins `capture.max_store_bytes` +
+`share.max_backlog_bytes` + `capture.max_inflight_bytes` (144 MiB par défaut), plus environ
+deux fois la forme de mock chargée : sous la limite de 256 Mi, une forme de quelques dizaines de
+MiB. Sans Secret `<workload>-mimic` (clé `redact-salt`), le sidecar tire un sel au hasard et
+l'annonce dans ses logs : les marqueurs de redaction diffèrent alors d'un pod à l'autre.
 
 Si les noeuds utilisent iptables en mode legacy, ajouter `MIMIC_IPTABLES=iptables-legacy`
 à l'init container.

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
@@ -123,7 +123,12 @@ impl Ca {
     /// Certificat feuille pour `host`, signé par la CA, mis en cache.
     pub fn leaf(&self, host: &str) -> Result<Arc<CertifiedKey>, String> {
         let host = host.to_ascii_lowercase();
-        if let Some(c) = self.cache.lock().expect("verrou du cache TLS").get(&host) {
+        if let Some(c) = self
+            .cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&host)
+        {
             return Ok(c.clone());
         }
         let mut params = CertificateParams::new(vec![host.clone()]).map_err(err)?;
@@ -144,7 +149,7 @@ impl Ca {
             vec![cert.der().clone(), self.cert_der.clone()],
             signing,
         ));
-        let mut cache = self.cache.lock().expect("verrou du cache TLS");
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
         if cache.len() >= MAX_CACHED {
             cache.clear();
         }

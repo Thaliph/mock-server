@@ -2,7 +2,9 @@
 
 `scripts/e2e-kind.sh` déploie mimic et la démo OpenTelemetry dans un cluster kind, laisse
 tourner le générateur de charge de la démo, publie le rapport de découverte, puis vérifie
-les bascules en mock et celle du contrôleur (critères E2E-05 et E2E-06 de la [spec](SPEC.md)). La CI le lance sur chaque PR
+les bascules en mock sans redémarrage des pods, celle du contrôleur, le garde-fou production et
+le WebSocket en mock (critères E2E-03 à E2E-07 de la [spec](SPEC.md)). Le service mesh a son
+propre script, `scripts/e2e-mesh.sh` (E2E-08 et E2E-09, voir plus bas). La CI le lance sur chaque PR
 vers `main` (job `e2e-kind`) ; la même commande marche sur un poste.
 
 ## Prérequis

@@ -1,4 +1,4 @@
-//! Critères CTL-*, SNP-03 à 07, SHR-10 et SEC-01, SEC-05 de la spec (§5.4, §5.5, §5.6,
+//! Critères CTL-*, SNP-03 à 08, SHR-10 et SEC-01, SEC-05 de la spec (§5.4, §5.5, §5.6,
 //! §7.1) : sidecars réels pilotés par un contrôleur réel.
 
 mod common;
@@ -672,6 +672,63 @@ async fn snp_07_unreachable_snapshot_still_switches_to_mock() {
     })
     .await;
     assert_eq!(saas.hits(), hits, "rien n'est sorti");
+}
+
+/// Forme de mock au-delà de `share.max_snapshot_bytes`, telle quelle ou une fois
+/// décompressée : refusée sans rien charger ; sous la borne, chargée (SNP-08).
+#[tokio::test]
+async fn snp_08_mock_form_beyond_the_bound_is_refused() {
+    assert_eq!(ShareConfig::default().max_snapshot_bytes, 64 * 1024 * 1024);
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let bounded = |instance: &str, max: usize| {
+        let mut c = piloted(None, &ctl, dir.path(), instance);
+        if let Some(s) = c.share.as_mut() {
+            s.max_snapshot_bytes = max;
+        }
+        c
+    };
+    // Réponse très compressible : la forme compressée tient sous 20 000 octets, pas la
+    // forme décompressée.
+    let a = proxy(bounded("api-a", 20_000)).await;
+    let b = proxy(bounded("api-b", 64)).await;
+    let r = app_client(&a)
+        .post(saas.url("/echo"))
+        .body(vec![b'x'; 100 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    eventually("appel reçu", || async {
+        ui_json(&ctl, "/v1/workloads/ns/api/requests?direction=outbound")
+            .await
+            .as_array()
+            .is_some_and(|l| l.len() == 1)
+    })
+    .await;
+    let s1 = apply(&ctl, "mock", None).await["snapshot"].clone();
+    assert!(s1.is_string());
+    for p in [&a, &b] {
+        eventually("forme de mock refusée", || async {
+            let s = status(p).await;
+            s["mode"] == "mock"
+                && s["controller"]["last_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("share.max_snapshot_bytes"))
+        })
+        .await;
+        assert_eq!(status(p).await["snapshot"], Value::Null);
+    }
+    // A reçoit la forme compressée sous la borne, B la refuse dès le téléchargement.
+    let error = |s: Value| s["controller"]["last_error"].as_str().unwrap().to_string();
+    let (ea, eb) = (error(status(&a).await), error(status(&b).await));
+    assert!(ea.contains("une fois décompressée"), "{ea}");
+    assert!(eb.contains("réponse au-delà"), "{eb}");
+    // Sous la borne : chargée.
+    a.shutdown().await;
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    converged(&[&a], "mock", &s1).await;
 }
 
 /// Les exemples par endpoint viennent de segments déjà redactés par le sidecar (§5.5.3).
