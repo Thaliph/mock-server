@@ -1,28 +1,151 @@
-Le guide complet du tir de charge d'un workload isolé de ses dépendances est
-**`docs/sre-load-test.md`** dans le dépôt : prérequis, préparation du rejeu, isolement,
-tir, mesure, retour en `record`, et exemple blue/green avec Argo Rollouts.
+Mesurer la capacité d'un workload et dimensionner ses pods, sans toucher à ses dépendances :
+on bascule le workload en `mock`, puis `mimicctl load` rejoue contre lui les requêtes
+entrantes enregistrées, à concurrence fixe ou croissante jusqu'à saturation, et en déduit une
+recommandation `requests`/`limits` CPU et mémoire. Référence : spec §5.8 et §5.9.
 
-> Cette page sera complétée par l'équipe SRE.
+Le guide SRE détaillé (préparation, blue/green avec Argo Rollouts, tir k6) reste
+`docs/sre-load-test.md` dans le dépôt.
 
-## Le parcours en bref
+## Principe
 
-| Étape | Commande | Page de référence |
-|-------|----------|-------------------|
-| 1. préparer le rejeu | `mimicctl requests checkout -n perf --format k6 --limit 2000 > replay.js` | [CLI mimicctl](CLI-mimicctl#requests) |
-| 2. isoler le workload | `mimicctl mode checkout mock --capture-inbound metadata -n perf` | [Basculer en mock](Basculer-en-mock) |
-| 3. attendre l'alignement | `until mimicctl status checkout -n perf \| tail -1 \| grep -qE ' ([0-9]+)/\1$'; do sleep 2; done` | [Basculer en mock](Basculer-en-mock#vérifier-lalignement) |
-| 4. tirer | `k6 run -e TARGET=http://checkout.perf:8080 -e VUS=20 -e ITERATIONS=5000 replay.js` | `docs/sre-load-test.md` |
-| 5. mesurer | latences entrantes, `599`, CPU et mémoire | [Métriques](Metriques#requêtes-promql-utiles) |
-| 6. revenir | `mimicctl mode checkout record -n perf` | [Basculer en mock](Basculer-en-mock#revenir) |
+- **Les dépendances sont mockées** : les appels sortants HTTP du workload sont servis depuis
+  le snapshot, avec leur latence enregistrée. Le tir mesure donc l'application seule.
+- **Le trafic du tir est réel** : `mimicctl load` envoie les requêtes entrantes enregistrées
+  (méthode, chemin, headers non redactés, body) au Service ou au pod.
+- **Boucle fermée** : `C` connexions persistantes ; chacune attend sa réponse avant d'envoyer
+  la suivante. La concurrence est donc exactement `C` requêtes en vol.
+- **Ressources** : pendant le tir, `mimicctl` relève CPU et mémoire des pods par
+  `metrics.k8s.io` (metrics-server requis), conteneurs `mimic`, `istio-proxy` et
+  `linkerd-proxy` exclus. Le premier tiers de chaque palier est ignoré (montée en régime).
 
-## À vérifier avant de tirer
+## Préparer
 
-- `ALIGNED` à `n/n` et `mimic_mock_snapshot_exchanges > 0` sur chaque pod.
-- Taux de `599` (`mimic_mock_responses_total{match="unmatched"}`) proche de zéro.
-- Les dépendances non HTTP (bases, files de messages) et les HTTPS non interceptés : les
-  premières restent jointes réellement, les seconds sont coupés en `mock` (voir
-  [Modes](Modes#trafic-sortant)).
-- Pas de redéploiement ni d'autoscaling pendant le tir : un pod neuf démarre en `record`
-  jusqu'à son premier battement (voir [Exploiter en production](Exploiter-en-production#pannes)).
-- Pour rejouer exactement le même jeu au tir suivant : noter `status.snapshot` et le passer en
-  `--snapshot` (voir [Basculer en mock](Basculer-en-mock#rejouer-exactement-le-même-jeu)).
+```sh
+# 1. le workload a enregistré assez de trafic (record), puis on l'isole
+mimicctl mode checkout mock --capture-inbound metadata -n perf
+
+# 2. attendre que tous les pods sélectionnés soient alignés
+mimicctl status checkout -n perf        # ALIGNED doit afficher n/n
+```
+
+`mimicctl load` vérifie lui-même l'isolement : si le workload n'est pas en `mock` ou si un pod
+n'est pas aligné, il refuse avec le code de sortie `2`, car le tir frapperait les vraies
+dépendances. `--allow-live-dependencies` lève ce refus, en connaissance de cause.
+
+À savoir avant de tirer (voir [Modes](Modes#trafic-sortant)) :
+
+- les connexions TCP non HTTP (bases, files de messages) sont **relayées** même en `mock` :
+  elles reçoivent la charge du tir ;
+- un HTTPS sortant non intercepté est coupé en `mock` ;
+- une connexion WebSocket sortante est relayée, sauf `--mock-websocket refuse` ;
+- `mimic_mock_responses_total{match="unmatched"}` (réponses `599`) doit rester proche de zéro :
+  sinon le snapshot ne couvre pas le trafic rejoué et les latences mesurées sont fausses ;
+- pas d'autoscaling ni de redéploiement pendant le tir : un pod neuf démarre en `record`
+  jusqu'à son premier battement (voir [Exploiter en production](Exploiter-en-production)).
+
+## Tirer
+
+### Palier fixe : N appels à une concurrence cible
+
+```sh
+mimicctl load checkout -n perf --target http://checkout.perf:8080 \
+  --concurrency 32 --requests 10000
+```
+
+`--requests N` envoie exactement `N` requêtes ; `--duration 5m` tire pendant une durée. Les
+requêtes enregistrées sont rejouées en boucle si `N` dépasse leur nombre (`--limit`, 1000 par
+défaut, en lit davantage sur le contrôleur).
+
+### Montée progressive jusqu'à saturation
+
+```sh
+mimicctl load checkout -n perf --target http://checkout.perf:8080 \
+  --ramp --start 1 --factor 2 --max 256 --step-duration 60s --max-p99 500ms
+```
+
+Les paliers de concurrence sont `start`, ×`factor`, …, jusqu'à `max` (ici 1, 2, 4… 256). Le
+tir s'arrête au **premier palier saturé**. Un palier est saturé quand :
+
+| Raison | Condition | Défaut |
+|--------|-----------|--------|
+| erreurs | taux d'erreurs (5xx, délai dépassé, échec de connexion) au-delà de `--max-error-rate` | 1 % |
+| latence | p99 au-delà de `--max-p99` (votre SLO) | aucun |
+| plateau | le débit gagne moins que `--plateau` de la hausse de concurrence | 10 % (moins de +10 % en doublant) |
+
+La **capacité** est le palier non saturé de plus haut débit.
+
+### Depuis le cluster
+
+La cible doit être joignable depuis l'endroit où tourne `mimicctl`. Le plus simple est de
+lancer le tir dans le cluster avec `deploy/load/job.yaml` : l'image `ghcr.io/thaliph/mimic`
+contient `mimicctl`, le Job a les droits de lecture `metrics.k8s.io` dans le namespace du
+workload et le port-forward vers le contrôleur. Adapter le nom du workload, le namespace et la
+cible dans `args`, puis :
+
+```sh
+kubectl apply -f deploy/load/job.yaml
+kubectl logs -n perf job/checkout-load -f
+```
+
+Depuis un poste, passer par `kubectl port-forward svc/checkout 8080 -n perf` et
+`--target http://localhost:8080`.
+
+### Sans cluster
+
+```sh
+mimicctl requests checkout -n perf --format jsonl --limit 5000 > reqs.jsonl
+mimicctl load --from reqs.jsonl --target http://localhost:8080 -H 'authorization: Bearer …'
+```
+
+Ni vérification d'isolement ni relevé de ressources : seulement débit et latences. `-H`
+ajoute ou remplace un header, utile pour les headers redactés (jamais rejoués tels quels).
+
+## Lire le rapport
+
+```text
+palier  concurrence  durée   requêtes  débit/s  erreurs  p50      p95      p99      max      CPU/pod  mémoire/pod
+1       1            60.0 s  9912      165.2    0.0 %    6.0 ms   6.9 ms   7.4 ms   21.1 ms  210m     182Mi
+2       2            60.0 s  19604     326.7    0.0 %    6.1 ms   7.1 ms   7.9 ms   24.3 ms  395m     184Mi
+3       4            60.0 s  36210     603.5    0.0 %    6.6 ms   8.0 ms   9.2 ms   30.2 ms  760m     187Mi
+4       8            60.0 s  38001     633.4    0.0 %    12.6 ms  14.0 ms  15.1 ms  41.0 ms  795m     190Mi
+
+Capacité : palier 3, concurrence 4, 603.5 req/s, p99 9.2 ms.
+Saturation : palier 4, concurrence 8 : plateau, débit +5.0 % (seuil 10.0 %) pour une concurrence de 8 au lieu de 4.
+Recommandation par pod (marges CPU 30.0 %, mémoire 20.0 %) : requests.cpu 988m, requests.memory et limits.memory 225Mi ; 301.8 req/s par pod, 397 req/s par cœur.
+```
+
+(Valeurs illustratives, deux pods derrière le Service.)
+
+- **Entre les paliers 3 et 4**, la concurrence double mais le débit ne gagne que 5 % et la
+  latence double : les requêtes font la queue. Les deux pods plafonnent vers 600 req/s,
+  soit 300 par pod.
+- **Recommandation** : `requests.cpu` = CPU moyen du palier de capacité + 30 %, arrondi au
+  millicœur ; `requests.memory` = `limits.memory` = mémoire maximale + 20 %, arrondie au MiB.
+  Les marges se règlent par `--cpu-headroom` et `--memory-headroom`.
+- **Débit par pod et par cœur** : pour dimensionner le nombre de réplicas
+  (`débit cible / débit par pod`) ou un HPA.
+
+Pièges de lecture :
+
+- si le CPU du palier de capacité est proche de `limits.cpu`, c'est le throttling qui sature :
+  relever la limite et refaire le tir ;
+- metrics-server donne des moyennes glissantes de 15 à 30 s : garder des paliers d'au moins
+  60 s, sinon les chiffres de CPU sont sous-estimés ;
+- une saturation par **erreurs** dès les premiers paliers signale plutôt un problème
+  fonctionnel (headers d'authentification redactés, `599` du mock) qu'une limite de capacité :
+  regarder les codes dans les logs de l'application.
+
+## Intégrer à une CI
+
+`--format markdown` produit un tableau à coller dans le résumé d'un job GitHub
+(`>> "$GITHUB_STEP_SUMMARY"`), `--format json` le rapport complet pour un traitement
+automatique. Codes de sortie : `0` tir terminé, `2` erreur ou workload non isolé.
+
+## Revenir
+
+```sh
+mimicctl mode checkout record -n perf
+```
+
+Avec `--capture-inbound metadata`, le tir n'a rien ajouté au store : le snapshot suivant reste
+représentatif du trafic réel.
