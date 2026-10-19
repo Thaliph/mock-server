@@ -18,6 +18,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P3b | Partage entre sidecars d'un workload | fait |
 | P3g | WebSocket en mock réglable : `mock.websocket: relay` (défaut) ou `refuse` (`503` sans joindre la dépendance), par la configuration, la `MimicWorkload` et `mimicctl mode --mock-websocket` | fait (étape kind E2E-07 ajoutée, jouée par la CI) |
 | P4 | `mimic-init` (iptables), détection de protocole, image, manifests | fait |
+| P4b | Service mesh : Istio sidecar, Istio ambient, Linkerd ; Mimic entre l'application et le mesh | fait, validé sur kind (E2E-08, E2E-09) |
 | P5 | Interception TLS sortante | fait |
 | P6 | Contrôleur, CRD `MimicWorkload`, snapshots, authentification, rejeu k6 | fait (non validé sur un vrai cluster) |
 | P7 | Webhook d'injection `mimic-injector` et CLI `mimicctl` | fait, validé sur kind avec la démo OpenTelemetry |

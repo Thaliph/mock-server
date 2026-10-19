@@ -326,7 +326,7 @@ Le type de correspondance vaut `exact` si le score est 1, `template` si le chemi
 | `sequence` | rejoue dans l'ordre d'enregistrement (scénarios à état : création puis lecture) |
 | `weighted-status` | respecte la distribution des codes observés (ex. 2 % de 429) pour reproduire les erreurs réelles |
 
-**Latence rejouée** : la latence n'est pas copiée d'un exemple unique, elle est tirée dans la distribution empirique des durées enregistrées pour l'opération (même authority, méthode et template), avec un multiplicateur configurable (`latency.factor: 1.0`, `0` pour la désactiver, `2.0` pour simuler une dépendance dégradée). La durée tirée est comptée depuis l'arrivée de la requête (fin de ses headers) : la réponse part à arrivée + latence, et la lecture du body de requête, le choix de l'enregistrement et la préparation de la réponse sont pris sur cette attente au lieu de s'y ajouter, comme pour la durée mesurée en record. L'attente est faite par un minuteur à la microseconde : le temporisateur de tokio arrondit à la milliseconde supérieure, ce qui rejouerait une dépendance de 140 µs à plus d'une milliseconde. Le minuteur est armé en avance de son retard moyen de réveil, mesuré en continu (plafonné à 1 ms), pour que les réponses partent en moyenne à l'heure. Une latence nulle (ou déjà écoulée) n'attend pas. En v1, la durée totale est appliquée avant l'envoi de la réponse ; le rejeu séparé du TTFB et du temps de transfert viendra avec le streaming des réponses mockées.
+**Latence rejouée** : la latence n'est pas copiée d'un exemple unique, elle est tirée dans la distribution empirique des durées enregistrées pour l'opération (même authority, méthode et template), avec un multiplicateur configurable (`mock.latency_factor: 1.0`, `0` pour la désactiver, `2.0` pour simuler une dépendance dégradée). La durée tirée est comptée depuis l'arrivée de la requête (fin de ses headers) : la réponse part à arrivée + latence, et la lecture du body de requête, le choix de l'enregistrement et la préparation de la réponse sont pris sur cette attente au lieu de s'y ajouter, comme pour la durée mesurée en record. L'attente est faite par un minuteur à la microseconde : le temporisateur de tokio arrondit à la milliseconde supérieure, ce qui rejouerait une dépendance de 140 µs à plus d'une milliseconde. Le minuteur est armé en avance de son retard moyen de réveil, mesuré en continu (plafonné à 1 ms), pour que les réponses partent en moyenne à l'heure. Une latence nulle (ou déjà écoulée) n'attend pas. En v1, la durée totale est appliquée avant l'envoi de la réponse ; le rejeu séparé du TTFB et du temps de transfert viendra avec le streaming des réponses mockées.
 
 Le tirage aléatoire (latence, `weighted-status`) utilise un générateur à graine (`mock.seed`) : un même tir rejoué en série avec la même graine produit la même séquence. Sous concurrence, le générateur avance d'un pas atomique par tirage : la même graine donne le même ensemble de tirages, distribué aux requêtes dans leur ordre d'arrivée.
 
@@ -668,7 +668,7 @@ redact:
 mock:
   strategy: best
   unmatched: error
-  latency: { factor: 1.0 }
+  latency_factor: 1.0        # multiplicateur de la latence rejouée (0 à 100)
   match_headers: ["accept", "x-api-version"]
   websocket: relay            # relay | refuse : poignée de main WebSocket sortante en mock (§3.4)
 share:
@@ -688,7 +688,7 @@ Configuration du contrôleur (`mimic-controller --config`) :
 listen: 0.0.0.0:8443            # API des sidecars
 ui_listen: 127.0.0.1:8081       # interface, par port-forward
 tls: { cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key }
-auth: kubernetes                # TokenReview ; static pour les tests
+auth: { kind: kubernetes }      # TokenReview ; { kind: static, tokens: … } pour les tests
 store: file:///var/lib/mimic-controller   # ou s3://bucket/prefixe
 retention: 86400                   # secondes (24 heures) : segments supprimés au-delà
 max_exchanges_per_workload: 200000
@@ -929,6 +929,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | INF-04 | bodies où `email` est toujours présent, `phone` dans 50 % | inférence | `required: [email]`, `phone` optionnel |
 | INF-05 | champ valant tantôt `"x"`, tantôt `null` | inférence | `type: [string, "null"]` |
 | INF-06 | champ `status` avec 3 valeurs sur 100 observations | inférence | `enum` de 3 valeurs |
+| INF-06b | champ `status` toujours `paid` sur 10 observations | inférence | pas d'`enum` : l'échantillon ne suffit pas |
 | INF-07 | n'importe quel corpus (proptest) | inférence | la spec produite est un OpenAPI 3.1 valide |
 | INF-08 | même corpus, ordre des échanges permuté (proptest) | inférence | spec identique (déterminisme) |
 | INF-09 | champs texte de réponse sur 60 appels : `name` ∈ `user0`…`user6` ; `status` à 3 valeurs sur 20 observations, chacune vue au moins deux fois ; `kind` à 3 valeurs dont une vue une seule fois ; `tier` à 2 valeurs sur 19 observations ; `plan` toujours `basic` ; puis les mêmes `tier` avec `min_observations: 10` | inférence | `enum` seulement pour `status` (et `tier` avec le seuil abaissé) ; `name`, `kind`, `tier` et `plan` restent `type: string` sans `enum` |
@@ -938,8 +939,10 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ID | Étant donné | Quand | Alors |
 |----|-------------|-------|-------|
 | RED-01 | header `Authorization: Bearer abc` | capture | valeur stockée `<redacted:sha256:…>`, jamais `abc` |
+| RED-01b | headers `Cookie`, `X-Api-Key`, `X-Session-Id`, `Set-Cookie` et `Accept` | capture | les quatre premiers redactés, `Accept` intact |
 | RED-02 | deux requêtes avec le même token | capture | même marqueur de redaction |
 | RED-03 | body avec un numéro de carte valide (Luhn) | capture | remplacé ; un numéro invalide de même longueur ne l'est pas |
+| RED-03b | body avec une adresse e-mail, un JWT, un IBAN, dans un objet et dans une liste | capture | remplacés, les autres valeurs intactes, chaque marque située (`response.body$.contact`) |
 | RED-04 | n'importe quel body contenant une valeur secrète injectée (proptest) | capture puis lecture du store brut | la valeur n'apparaît dans aucun octet du store |
 | RED-05 | body JSON sans valeur à redacter, aux clés non triées, avec espaces et `1.0` ; même body avec une adresse e-mail | capture, puis rejeu en mock | le premier est stocké et rejoué octet pour octet ; le second est réécrit avec sa marque |
 
@@ -951,8 +954,9 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | MCK-02 | enregistrement sur `/v1/c/1` | requête `/v1/c/2` | réponse issue du template, `x-mimic-match: template` |
 | MCK-03 | aucun enregistrement pour l'hôte | requête | `599`, `x-mimic-unmatched: true`, compteur incrémenté |
 | MCK-04 | latences enregistrées p50 = 100 ms | 1 000 requêtes mockées | p50 rejoué entre 90 et 110 ms |
-| MCK-05 | `latency.factor: 2` | 1 000 requêtes | p50 entre 180 et 220 ms |
+| MCK-05 | `mock.latency_factor: 2` | 1 000 requêtes | p50 entre 180 et 220 ms |
 | MCK-06 | stratégie `sequence`, enregistrement POST puis GET | rejeu | réponses servies dans l'ordre d'origine |
+| MCK-06b | stratégie `round-robin`, deux enregistrements équivalents | trois requêtes | 0, 1, 0 : rotation entre les enregistrements |
 | MCK-07 | distribution 98 % 200 / 2 % 429, `weighted-status` | 10 000 requêtes | 429 entre 1,5 % et 2,5 % |
 | MCK-08 | réponse enregistrée gzip, br ou zstd | rejeu | `Content-Encoding` conservé, body identique une fois décodé |
 
@@ -961,6 +965,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ID | Étant donné | Quand | Alors |
 |----|-------------|-------|-------|
 | MCK-09 | deux enregistrements de même chemin, query `?page=1` et `?page=2` | requête `?page=2` | l'enregistrement `page=2` est choisi |
+| MCK-09b | deux enregistrements POST de même chemin, bodies JSON `{"sku":"A"}` et `{"sku":"B"}` | requête au body `{"sku":"A"}` | l'enregistrement `A` est choisi |
 | MCK-10 | enregistrement sur une autre méthode ou une autre authority | requête | aucune correspondance |
 | MCK-11 | même graine, mêmes requêtes | deux exécutions | décisions et latences identiques |
 | MCK-12 | trois exemplaires du même appel, deux en `200 {a}` et un en `500`, le `500` le plus récent | stratégie `best` | `200 {a}` |
@@ -971,7 +976,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 |----|-------------|-------|-------|
 | MCK-13 | 3 enregistrements rejouables de `GET /users/{id}`, 10 000 sans body de la même opération et 5 000 sur d'autres chemins de la même authority | requête `GET /users/9` | seuls les 3 rejouables sont comparés à la requête ; la latence est tirée parmi les 10 003 durées de l'opération |
 | MCK-14 | un moteur partagé par 8 threads, même graine qu'une exécution en série | 8 000 requêtes concurrentes, stratégies `best`, `weighted-status` et `round-robin` | `best` : mêmes réponses qu'en série ; `weighted-status` : même ensemble de latences tirées qu'en série ; `round-robin` sur 4 candidats : chacun servi 2 000 fois |
-| MCK-15 | une dépendance réelle d'environ 3,5 ms et une sans délai, enregistrées ; un sidecar en mock sur ces enregistrements (`latency.factor: 1`), un autre sans latence (`latency.factor: 0`) | appels en série entrelacés via le sidecar en record (dépendance réelle) et via les sidecars en mock, durée vue par l'application | 3,5 ms : p50 rejoué à ±10 % de celui de la dépendance ; sans délai : p50 rejoué au plus 1,5 fois celui de la dépendance ; sans latence : p50 sous 1 ms |
+| MCK-15 | une dépendance réelle d'environ 3,5 ms et une sans délai, enregistrées ; un sidecar en mock sur ces enregistrements (`mock.latency_factor: 1`), un autre sans latence (`mock.latency_factor: 0`) | appels en série entrelacés via le sidecar en record (dépendance réelle) et via les sidecars en mock, durée vue par l'application | 3,5 ms : p50 rejoué à ±10 % de celui de la dépendance ; sans délai : p50 rejoué au plus 1,5 fois celui de la dépendance ; sans latence : p50 sous 1 ms |
 | MCK-16 | store de 2 000 échanges sortants, mode record | bascule en mock, puis 200 requêtes mockées concurrentes | moteur construit une fois, à la bascule : `mimic_mock_engine_builds_total{trigger="switch"}` vaut 1 avant la première requête et aucune requête n'en construit |
 | MCK-17 | moteur en service, puis nouvel échange sortant dans le store (import d'un pair) ; mode `mock-partial` | requêtes avec correspondance ; requête sur le nouvel échange ; requête relayée puis la même | les premières servies par le moteur courant, sans construction ; la deuxième servie depuis le nouvel échange, pas `599` ; la troisième mockée dès la seconde fois |
 | MCK-18 | enregistrement dont la réponse est en `gzip` | rejeux successifs | le body est encodé une seule fois : les mêmes octets, sans nouvel encodage, à chaque rejeu |
@@ -1141,6 +1146,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | ID | Étant donné | Quand | Alors |
 |----|-------------|-------|-------|
 | PRX-01 | mode record, upstream factice | 10 000 requêtes | toutes relayées sans altération, toutes enregistrées |
+| PRX-01b | mode record, body JSON avec accents, query encodée `q=a%20b&page=2` | requêtes | body et query relayés à l'identique, query décodée dans l'échange enregistré |
 | PRX-02 | réponse streamée de 500 MiB | relais | mémoire du proxy < 64 MiB, body tronqué dans le store |
 | PRX-03 | client et upstream gRPC en h2c | relais | HTTP/2 de bout en bout, `te: trailers` et trailers (`grpc-status`) relayés, échange enregistré |
 | PRX-04 | trafic TCP non HTTP redirigé (client qui parle en premier, ou serveur qui parle en premier) | relais | tunnel transparent, octets identiques |
@@ -1211,9 +1217,9 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 
 | ID | Scénario |
 |----|----------|
-| E2E-01 | Pod demo (app + Mimic injecté) sur kind, app appelant un faux SaaS HTTPS ; mode record ; la spec inbound et la spec du SaaS sont exportées sur MinIO. |
-| E2E-02 | Même pod en mode mock avec NetworkPolicy deny-all egress : le tir k6 réussit à > 99,9 %, aucun paquet ne sort (vérifié par les compteurs du faux SaaS). |
-| E2E-03 | Changement d'annotation `record → mock` sans redémarrage du pod. |
+| E2E-01 | *Non automatisé : la démo OpenTelemetry (E2E-05) couvre la découverte et l'export ; le stockage MinIO reste à scénariser.* Pod demo (app + Mimic injecté) sur kind, app appelant un faux SaaS HTTPS ; mode record ; la spec inbound et la spec du SaaS sont exportées sur MinIO. |
+| E2E-02 | *Couvert en partie par E2E-05 (dépendance arrêtée, toutes les requêtes réussissent) et E2E-07 (NetworkPolicy qui ne laisse sortir que le DNS et le contrôleur).* Même pod en mode mock avec NetworkPolicy deny-all egress : le tir k6 réussit à > 99,9 %, aucun paquet ne sort (vérifié par les compteurs du faux SaaS). |
+| E2E-03 | Bascule `record → mock` par la `MimicWorkload` (`mimicctl mode`), sans redémarrage du pod : les sidecars s'alignent et le nombre de redémarrages des pods ne change pas. Sous contrôleur, l'annotation de mode est ignorée (§5.1). Vérifié dans `scripts/e2e-kind.sh` lors de la bascule de shipping (E2E-05). |
 | E2E-04 | Namespace labellisé `env=production` : `mimicctl mode … mock` est refusé (code 2) ; une `MimicWorkload` en `mock` créée avant le label passe à `Allowed=False` (raison `ProductionNamespace`) dès que le label est posé ; avec la `ValidatingAdmissionPolicy` de `deploy/controller/production-guard.yaml`, une `MimicWorkload` en mock y est refusée à l'admission. Vérifié en fin de `scripts/e2e-kind.sh` ; sans cluster, par CRD-07 et CLI-06. |
 | E2E-05 | Démo OpenTelemetry sur kind (`scripts/e2e-kind.sh`, à chaque PR vers `main`) : les services de la démo, sans la chaîne de télémétrie ni Kafka, avec son générateur de charge actif ; tous injectés par le webhook sauf `valkey-cart` (opt-out). Les requêtes du test passent par le frontend (`/api/shipping`), qui appelle shipping (2 réplicas) en gRPC, qui appelle quote en HTTP ; en record les deux API de shipping (gRPC entrant, quote sortant) sont découvertes par le contrôleur. Après cinq minutes de charge, `mimicctl report -A` est publié dans le résumé du job et les documents OpenAPI en artefact. Tous les workloads injectés passent ensuite en mock, sauf le générateur (le client) : une fois les pods alignés, pendant 60 s, `mimic_requests_total` des sidecars ne compte plus aucune requête entrante, sauf sur les services que le générateur appelle lui-même (frontend-proxy, et flagd pour ses feature flags) ; frontend-proxy reçoit son trafic et répond depuis le snapshot (`mimic_mock_responses_total`) ; le bilan est ajouté au résumé du job, puis retour en record. Après `mimicctl mode shipping mock`, les deux pods s'alignent sur un snapshot, quote est arrêté et toutes les requêtes réussissent ; retour en record. |
 | E2E-07 | WebSocket en mock, en fin de `scripts/e2e-kind.sh` (`tests/e2e/websocket.yaml`) : un pod injecté `ws-client` (curl) et un serveur WebSocket non injecté `ws-echo`, qui compte les connexions et les poignées de main reçues. Avec `mimicctl mode ws-client mock` (`relay`, le défaut), la poignée de main sortante de `ws-client` aboutit (`101`), le serveur la compte et `mimic_websocket_connections_total{direction="outbound",result="relayed"}` augmente. Puis, sous une NetworkPolicy qui ne laisse sortir de `ws-client` que le DNS et le contrôleur, `mimicctl mode ws-client mock --mock-websocket refuse` : une fois le sidecar sur `refuse` et le pod aligné, la poignée de main reçoit `503` avec `x-mimic-websocket: refused`, le serveur ne voit aucune nouvelle connexion et `result="refused"` augmente. |
