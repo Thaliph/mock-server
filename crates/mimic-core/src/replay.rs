@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::model::{Body, Direction, Exchange};
 
 /// Headers jamais rejoués : propres à la connexion ou recalculés par le client.
-const NOT_REPLAYED: &[&str] = &[
+pub(crate) const NOT_REPLAYED: &[&str] = &[
     "connection",
     "content-length",
     "host",
