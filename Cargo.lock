@@ -1938,6 +1938,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimic-net"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hyper-util",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "mimic-proxy"
 version = "0.1.0"
 dependencies = [
