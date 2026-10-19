@@ -85,6 +85,7 @@ Même mécanique qu'Istio, éprouvée :
   - **entrant** : `PREROUTING` → `REDIRECT --to-ports 15106` pour les ports déclarés de l'app (ou tous les ports, `*`), sauf les ports du sidecar ;
   - **sortant** : `OUTPUT` → `REDIRECT --to-ports 15101` pour tout TCP, sauf : le trafic de l'UID du sidecar (`-m owner --uid-owner 1338 -j RETURN`, ce qui évite les boucles), le trafic vers l'IP du pod via `lo`, les CIDR et ports exclus (ex. API Kubernetes, bases de données si on préfère ne pas les faire transiter).
 - Les règles sont générées par une fonction pure (testée) et appliquées en une fois par `iptables-restore --noflush` ; une deuxième exécution ne duplique rien.
+- Chaque valeur reprise dans une règle est analysée avant toute commande : CIDR sortants exclus (adresse IPv4 ou IPv6, avec un préfixe d'au plus 32 ou 128 bits ; une adresse seule vaut `/32` ou `/128`), ports (entier de 1 à 65535) et IP du pod (`POD_IP`). Une valeur invalide fait échouer `mimic-init` avant toute commande `iptables`, avec un message qui nomme la variable et la valeur, et le code de sortie 2 (1 : échec d'`iptables`). Les CIDR sont écrits sous leur forme canonique `adresse/préfixe` : aucune valeur n'est recopiée telle quelle dans l'entrée de `iptables-restore`.
 - **Détection du protocole** : le trafic redirigé n'est pas forcément HTTP. Pour chaque connexion redirigée, le proxy lit sans les consommer les premiers octets (`peek`) :
   - méthode HTTP/1 ou préface HTTP/2 : traitement HTTP (record, mock) ;
   - enregistrement TLS (`0x16`) : tunnel TCP opaque tant que l'interception TLS (§4.2) n'est pas activée ; **refusé en mode `mock`** pour garantir qu'aucun appel ne sort (O3) ;
@@ -617,7 +618,7 @@ Le contrôleur doit être sûr de parler au bon sidecar, et le sidecar sûr de r
   - le pod lié au jeton (`authentication.kubernetes.io/pod-name`) existe, appartient à ce workload (§5.4) et correspond à l'instance déclarée.
   Sinon : `401` (jeton absent ou invalide) ou `403` (jeton valide pour un autre namespace, pod ou workload). Un pod compromis ne peut donc ni lire, ni polluer les enregistrements d'un autre workload. Les validations sont gardées en cache 60 s, par empreinte du jeton, avec les labels du pod lus à cette occasion : ce sont eux que `spec.selector` compare (§5.5.1), jamais ce qu'annonce le sidecar. En authentification `static` (tests), chaque jeton déclare ses labels (`labels`).
 - **Contrôleur vers sidecar** : l'API des sidecars n'est servie qu'en HTTPS, avec un certificat signé par une CA dédiée (Secret géré par cert-manager). Le sidecar ne fait confiance qu'à cette CA (`share.ca_file`), pas aux racines système : un serveur qui se ferait passer pour le contrôleur est refusé. `http://` n'est accepté qu'avec `share.allow_insecure: true`, réservé aux tests.
-- **Humains** : aucun ordre ne passe par l'API HTTP du contrôleur. La bascule passe par `MimicWorkload` (RBAC et audit Kubernetes), la consultation par `kubectl port-forward` (RBAC `pods/portforward`).
+- **Humains** : aucun ordre ne passe par l'API HTTP du contrôleur. La bascule passe par `MimicWorkload` (RBAC et audit Kubernetes), la consultation par `kubectl port-forward` (RBAC `pods/portforward`). Le Role `mimic-cli` fourni (`deploy/controller/rbac.yaml`, dans `mimic-system`) accorde exactement ce qu'il faut à `mimicctl export`, `requests` et `report` : `get` et `list` sur `pods`, `create` sur `pods/portforward` ; il se lie par RoleBinding aux utilisateurs concernés.
 - **Droits du contrôleur** : `get`, `list`, `watch` sur `mimicworkloads` et `patch` sur leur `status` ; `create` sur `tokenreviews` ; `get` sur `pods` ; `get`, `list`, `watch` sur `namespaces`, pour le garde-fou production (§5.5.1) ; dans `mimic-system` seulement (Role), `create` sur `leases`, `get` et `patch` sur le bail `leases/mimic-controller` (écriture conditionnelle par `resourceVersion`), `list` et `patch` sur `pods`, pour l'élection et la marque de la réplique active (§5.5.4). Rien d'autre.
 
 ## 8. Stockage et export
@@ -687,7 +688,7 @@ Configuration du contrôleur (`mimic-controller --config`) :
 ```yaml
 listen: 0.0.0.0:8443            # API des sidecars
 ui_listen: 127.0.0.1:8081       # interface, par port-forward
-tls: { cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key }
+tls: { cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key, reload_interval: 10 }   # relus à chaud (§9.2b)
 auth: kubernetes                # TokenReview ; static pour les tests
 store: file:///var/lib/mimic-controller   # ou s3://bucket/prefixe
 retention: 86400                   # secondes (24 heures) : segments supprimés au-delà
@@ -752,6 +753,20 @@ Deux ports :
 | GET | `…/snapshots/{id}` | contenu JSONL d'un snapshot complet, inchangé : gardé pour les sidecars d'une version antérieure (§5.6) |
 | GET | `…/snapshots/{id}/mock` | forme de mock du snapshot (§5.6), un document JSON, compressé selon `Accept-Encoding` (`zstd`, `gzip`), avec `ETag` ; `If-None-Match` : `304` |
 | GET | `/healthz` | probe |
+| GET | `/metrics` | métriques Prometheus du contrôleur (ci-dessous), **sans jeton**, comme `/healthz` : collectées sur chaque réplique, active ou passive (§5.5.4) |
+
+Sur les routes `…`, le jeton est validé et l'appelant rattaché au namespace et au workload du chemin **avant** que le corps de la requête ne soit lu : une requête sans jeton valide reçoit `401` ou `403` sans qu'un octet de son corps soit attendu ni gardé en mémoire. L'instance déclarée dans le corps du battement est vérifiée ensuite ; le corps d'un battement est limité à 64 KiB, celui d'un segment à 64 MiB.
+
+L'état souhaité d'un workload (`desired.json` sur le support) est relu à son premier usage. Absent : état vide. Illisible (JSON invalide) : état vide, avec une erreur au journal. Si le support échoue (erreur autre que l'absence du fichier), rien n'est retenu : l'appel répond `503`, l'erreur est journalisée et la lecture est retentée à l'appel suivant ; une `MimicWorkload` reçue entre-temps est réappliquée à la passe de maintenance suivante. Une erreur passagère du support ne fait donc jamais oublier l'état souhaité ni construire un nouveau snapshot à la place du snapshot courant.
+
+La NetworkPolicy fournie ouvre le port 8443 aux sidecars (label `mimic.platform.io/sidecar: "true"`) et aux pods des namespaces labellisés `mimic.platform.io/monitoring: "true"` (collecteur Prometheus ou VictoriaMetrics) ; `deploy/example/vmpodscrape-controller.yaml` collecte le contrôleur et le webhook (HTTPS, CA `mimic-controller-ca`).
+
+**Serveurs HTTPS du plan de contrôle** (API du contrôleur, webhook §9.4), même code (`mimic-net`) :
+
+- le certificat et la clé (`tls.cert_file`, `tls.key_file`) sont relus toutes les `tls.reload_interval` secondes (10 par défaut) ; un contenu changé est chargé et sert dès la poignée de main suivante, sans redémarrage, ce qui suit le renouvellement de cert-manager. Un nouveau contenu illisible (PEM invalide, clé qui ne correspond pas au certificat) est ignoré avec un avertissement au journal, une fois par contenu : l'ancien certificat reste servi. Au démarrage, un certificat illisible fait échouer le processus ;
+- une poignée de main TLS non terminée en 10 s, ou des en-têtes HTTP/1 non reçus en 10 s, ferment la connexion ;
+- une erreur d'`accept` (par exemple `EMFILE`) suspend l'écoute 50 ms avant de réessayer, journalisée au plus une fois par seconde (comme le sidecar, §9.3) ;
+- à l'arrêt (`SIGTERM`), l'écoute cesse, les connexions en cours terminent leur requête (au plus 10 s) puis le processus sort avec le code 0.
 
 - **8081, interface en lecture seule**, liée à `127.0.0.1`, joignable par un port-forward vers la réplique active (§5.5.4) : `kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081`.
 
@@ -809,19 +824,22 @@ Sous charge, les logs d'erreurs répétitives sont limités en débit : au plus 
 
 Webhook d'admission mutant (`MutatingWebhookConfiguration`), déployé dans `mimic-system`, qui ajoute à la création d'un pod ce que `deploy/example/deployment.yaml` écrit à la main.
 
-- **Portée** : les pods des namespaces labellisés `mimic.platform.io/enabled=true`, le label qui leur fait déjà recevoir la CA du contrôleur. Un pod s'en retire par l'annotation `mimic.platform.io/inject: "false"`.
+- **Portée** : les pods des namespaces labellisés `mimic.platform.io/enabled=true`, le label qui leur fait déjà recevoir la CA du contrôleur, sauf `kube-system` et `mimic-system`, exclus par leur nom (`kubernetes.io/metadata.name`) même s'ils portent le label. Un pod s'en retire par l'annotation `mimic.platform.io/inject: "false"`.
+- **Pod Security** : `mimic-init` tourne en root avec `NET_ADMIN` et `NET_RAW`, ce que seul le niveau `privileged` de Pod Security Admission accepte (comme `istio-init`) : le namespace doit porter `pod-security.kubernetes.io/enforce: privileged`, ou être exempté. Dans un namespace `baseline` ou `restricted`, le pod muté est refusé par l'API : le workload ne démarre pas.
 - **Fonction pure, sans appel à l'API** : la mutation ne dépend que du pod et de la configuration du webhook (`mimic-injector::inject`), et se teste sans cluster. `sideEffects: None` ; `failurePolicy: Ignore`, si bien qu'un webhook indisponible laisse créer le pod sans Mimic au lieu de le bloquer ; `timeoutSeconds: 5`.
 - **Ce qui est ajouté** (patch JSON) :
-  - l'init container `mimic-init` (`NET_ADMIN`, `NET_RAW`), en tête, ou juste après ceux du mesh si le pod en a déjà (`istio-init`, `istio-validation`, `istio-proxy`, `linkerd-init`, `linkerd-network-validator`, `linkerd-proxy`), pour que les règles du mesh soient posées avant les siennes (§3.3.3). `MIMIC_MESH` : annotation `mimic.platform.io/mesh`, sinon `istio` ou `linkerd` si leurs conteneurs sont là, sinon `auto` ; `POD_IP` par l'API downward (§3.3.2). Ports entrants : annotation `mimic.platform.io/inbound-ports`, sinon les `containerPort` TCP des conteneurs de l'app, sinon `*`. CIDR sortants exclus : ceux de la configuration du webhook (API Kubernetes) puis l'annotation `mimic.platform.io/exclude-outbound-cidrs`. Ports sortants exclus : annotation `mimic.platform.io/exclude-outbound-ports` ;
-  - le native sidecar `mimic`, juste après `mimic-init` et donc avant les init containers de l'app, sous l'UID et le GID 1338, avec une `startupProbe` sur `/healthz` : l'app ne démarre qu'une fois le proxy prêt. Sondes HTTP sur le port `mimic-admin` (15100), ou sondes `exec` (`mimic-proxy --probe <chemin>`) quand un conteneur du mesh est présent (§3.3.4). Variables `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` (valeur figée à l'admission), `MIMIC_REDACT_SALT` lue dans le Secret `<workload>-mimic`, clé `redact-salt`, facultatif, et, par l'API downward, `MIMIC_VERSION` (label `version_label` du pod, `app.kubernetes.io/version` par défaut) et `MIMIC_POD_TEMPLATE_HASH` (label `pod-template-hash`), vides si le label manque (label `version` des métriques, §9.3) ;
+  - l'init container `mimic-init` (root, seules capacités `NET_ADMIN` et `NET_RAW`, `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, ressources `init_resources` : par défaut `10m` et `16Mi` demandés, `64Mi` au plus), en tête, ou juste après ceux du mesh si le pod en a déjà (`istio-init`, `istio-validation`, `istio-proxy`, `linkerd-init`, `linkerd-network-validator`, `linkerd-proxy`), pour que les règles du mesh soient posées avant les siennes (§3.3.3). `MIMIC_MESH` : annotation `mimic.platform.io/mesh`, sinon `istio` ou `linkerd` si leurs conteneurs sont là, sinon `auto` ; `POD_IP` par l'API downward (§3.3.2). Ports entrants : annotation `mimic.platform.io/inbound-ports`, sinon les `containerPort` TCP des conteneurs de l'app, sinon `*`. CIDR sortants exclus : l'IP du Service `kubernetes` (API Kubernetes), lue dans `KUBERNETES_SERVICE_HOST` au démarrage du webhook (`/32` ou `/128`), puis ceux de la configuration du webhook (`exclude_outbound_cidrs`), puis l'annotation `mimic.platform.io/exclude-outbound-cidrs`, sans doublon. Ports sortants exclus : annotation `mimic.platform.io/exclude-outbound-ports`. Avec `ipv6: true` dans la configuration du webhook, `MIMIC_IPV6=true` : `mimic-init` pose aussi les règles `ip6tables` (cluster double pile) ;
+  - **validation des annotations** reprises dans les règles iptables (`inbound-ports`, `exclude-outbound-cidrs`, `exclude-outbound-ports`) : chaque élément est analysé comme le fait `mimic-init` (§3.1) et réécrit sous sa forme canonique ; un élément invalide est ignoré, avec un avertissement d'admission qui nomme l'annotation et la valeur, et n'atteint jamais le pod. `inbound-ports` vaut `*` (tout), `-` (aucun) ou une liste de ports ; si aucun port de la liste n'est valide, l'annotation est ignorée (ports déclarés). Les CIDR de `exclude_outbound_cidrs` sont validés au démarrage du webhook ;
+  - le native sidecar `mimic`, juste après `mimic-init` et donc avant les init containers de l'app, sous l'UID et le GID 1338, `seccompProfile: RuntimeDefault`, avec une `startupProbe` sur `/healthz` : l'app ne démarre qu'une fois le proxy prêt. Sondes HTTP sur le port `mimic-admin` (15100), ou sondes `exec` (`mimic-proxy --probe <chemin>`) quand un conteneur du mesh est présent (§3.3.4). Variables `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` (valeur figée à l'admission), `MIMIC_REDACT_SALT` lue dans le Secret `<workload>-mimic`, clé `redact-salt`, facultatif, et, par l'API downward, `MIMIC_VERSION` (label `version_label` du pod, `app.kubernetes.io/version` par défaut) et `MIMIC_POD_TEMPLATE_HASH` (label `pod-template-hash`), vides si le label manque (label `version` des métriques, §9.3) ;
   - la configuration du sidecar : par défaut celle du webhook (`sidecar_config`), passée en ligne par `MIMIC_CONFIG_YAML` ; l'annotation `mimic.platform.io/config: <configmap>` monte ce ConfigMap (clé `mimic.yaml`) à la place ;
-  - les volumes : store (`emptyDir`), jeton projeté d'audience `mimic-controller`, CA du contrôleur (ConfigMap `mimic-controller-ca`), répertoire de CA Mimic (`emptyDir`, `/var/run/mimic/ca`) ;
+  - les volumes : store (`emptyDir`), jeton projeté d'audience `mimic-controller`, CA du contrôleur (ConfigMap `mimic-controller-ca`, `optional: true` : le pod démarre même si trust-manager ne l'a pas encore publié, le sidecar signale alors le contrôleur injoignable), répertoire de CA Mimic (`emptyDir`, `/var/run/mimic/ca`) ;
   - si l'annotation `mimic.platform.io/tls-intercept` liste des hôtes (séparés par des virgules) : `MIMIC_TLS_INTERCEPT` pour le sidecar, et dans chaque conteneur de l'app le répertoire de CA monté en lecture seule avec `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE` et `CURL_CA_BUNDLE` (§4.2). Une variable déjà définie par l'app n'est pas écrasée ;
   - l'annotation `mimic.platform.io/status: injected` et le label `mimic.platform.io/sidecar: "true"` (NetworkPolicy du contrôleur).
 - **Nom du workload** : annotation `mimic.platform.io/workload`, sinon label `app.kubernetes.io/name`, sinon label `app` (§5.4).
 - **Pods laissés tels quels**, admis avec un avertissement d'admission visible par `kubectl` : pod déjà injecté (idempotence), `hostNetwork: true`, aucun nom de workload trouvé.
 - **Réinvocation** (`reinvocationPolicy: IfNeeded`) : les webhooks sont appelés dans l'ordre des noms de leurs configurations, si bien que ceux d'Istio et de Linkerd passent d'habitude avant `mimic-injector`. Si le mesh injecte après Mimic, le webhook est rappelé et adapte le pod déjà injecté : `mimic-init` et `mimic` repassent après les conteneurs du mesh, `MIMIC_MESH` et les sondes suivent la règle ci-dessus. Un pod déjà adapté ne reçoit aucun patch.
-- Le webhook est servi en HTTPS (certificat cert-manager, `caBundle` posé par le cainjector). Métrique `mimic_injector_admissions_total{result}` (`injected`, `skipped`, `error`).
+- Le webhook est servi en HTTPS (certificat cert-manager relu à chaud, `caBundle` posé par le cainjector ; serveur décrit au §9.2b). Métrique `mimic_injector_admissions_total{result}` (`injected`, `skipped`, `error`). À `SIGTERM`, il termine les admissions en cours puis sort.
+- **Déploiement** (`deploy/injector/injector.yaml`) : deux réplicas sous l'UID et le GID 1338 (jamais 1337, l'UID d'istio-proxy), anti-affinité préférentielle par nœud, `priorityClassName: mimic-control-plane` (PriorityClass fournie, comme pour le contrôleur), image `ghcr.io/thaliph/mimic:0.1.0`.
 
 Côté sidecar, `MIMIC_CONFIG_YAML` contient le YAML de la configuration quand aucun fichier n'est donné (`--config` ou `MIMIC_CONFIG` l'emportent) ; `MIMIC_TLS_INTERCEPT` remplace `tls.intercept`.
 
@@ -829,9 +847,13 @@ Configuration du webhook (`mimic-injector --config`) :
 
 ```yaml
 listen: 0.0.0.0:8443
-tls: { cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key }
-image: registry.example.com/platform/mimic:0.1.0
-exclude_outbound_cidrs: [10.96.0.1/32]   # API Kubernetes
+tls: { cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key, reload_interval: 10 }
+image: ghcr.io/thaliph/mimic:0.1.0
+exclude_outbound_cidrs: []               # en plus de l'IP du Service kubernetes, ajoutée d'office
+ipv6: false                              # true : MIMIC_IPV6=true, règles ip6tables aussi
+init_resources:                          # ressources de mimic-init
+  requests: { cpu: 10m, memory: 16Mi }
+  limits: { memory: 64Mi }
 sidecar_config: |                       # configuration par défaut des sidecars (§9.1)
   mode: record
   share: { url: https://mimic-controller.mimic-system.svc:8443, ... }
@@ -1046,6 +1068,18 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | CTL-27 | active A avec segments, exemples, snapshot de mock et état souhaité ; passive B sur le même support | arrêt propre de A ; puis, dès la marque de B posée, support coupé : battement, segment déjà reçu, `/metrics` ; support rétabli : `GET …/snapshots/{id}/mock` | A a écrit ses exemples puis rendu le bail ; B a rechargé l'état souhaité, l'index et les exemples avant de poser sa marque : le battement répond le même snapshot, le segment renvoyé est un doublon (`200`), `mimic_controller_exemplars` compte les exemples de A ; même forme de mock, mêmes octets, même `ETag` qu'avant la bascule |
 | CTL-28 | manifests de `deploy/controller/` | lecture | Deployment à 2 réplicas, `RollingUpdate` avec `maxUnavailable: 0`, anti-affinité préférentielle par nœud, `POD_NAME` par l'API downward, probe de vivacité ; Service qui sélectionne `mimic.platform.io/leader: "true"` ; PodDisruptionBudget `minAvailable: 1` sur les pods du contrôleur ; configuration avec `leader_election` valide, bail `mimic-controller` dans `mimic-system` ; Role dans `mimic-system` : `create`, `get`, `patch` sur `leases`, `list`, `patch` sur `pods`, et le ClusterRole sans droit sur les leases ni écriture sur les pods |
 
+**Contrôleur en production (CTL, suite, §9.2b)**
+
+| ID | Étant donné | Quand | Alors |
+|----|-------------|-------|-------|
+| CTL-29 | contrôleur en HTTPS, `tls.reload_interval` court ; certificat remplacé sur disque, puis contenu illisible | poignées de main suivantes | nouveau certificat présenté sans redémarrage ; contenu illisible ignoré, l'ancien reste servi |
+| CTL-30 | API du contrôleur | client qui ouvre une connexion TLS sans envoyer d'en-têtes ; client TCP muet | la connexion est fermée après le délai des en-têtes, ou de la poignée de main (mêmes délais que INJ-15) |
+| CTL-31 | requête `POST …/segments` puis `POST …/heartbeat` qui annonce un corps de 64 MiB (`Content-Length`) sans l'envoyer, sans jeton puis avec le jeton d'un autre workload | envoi des seuls en-têtes | `401`, puis `403`, aussitôt, sans attendre le corps ; un battement de plus de 64 KiB est refusé (`413`) |
+| CTL-32 | contrôleur actif, puis passif ; manifests de `deploy/controller/` et `deploy/example/` | `GET /metrics` sur le port de l'API, sans jeton ; lecture | `200` avec `mimic_controller_leader` (1, puis 0) ; la NetworkPolicy ouvre 8443 aux namespaces labellisés `mimic.platform.io/monitoring: "true"` ; un exemple de collecte vise `/metrics` du contrôleur en HTTPS |
+| CTL-33 | `desired.json` d'un workload en `mock` sur un support qui échoue à la première lecture ; puis support rétabli ; `desired.json` absent ; `desired.json` illisible | battements | premier battement `503`, l'erreur journalisée ; battement suivant : l'état souhaité persisté (même snapshot) ; absent ou illisible : état vide |
+| CTL-34 | pod annoté `mimic.platform.io/workload: " checkout "`, ou annotation vide avec le label `app.kubernetes.io/name: web` | rattachement au workload (`workload_of`) | `checkout`, puis `web` : même règle que l'injecteur (§5.4) |
+| CTL-35 | manifests de `deploy/controller/` | lecture | image `ghcr.io/thaliph/mimic:0.1.0` ; UID et GID 1338 ; `priorityClassName: mimic-control-plane` ; mémoire demandée d'au moins 1Gi ; Role `mimic-cli` dans `mimic-system` : `get` et `list` sur `pods`, `create` sur `pods/portforward`, rien d'autre |
+
 **Ressource MimicWorkload (CRD)**
 
 | ID | Étant donné | Quand | Alors |
@@ -1135,6 +1169,7 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | INI-08 | mesh Linkerd | génération | trajet entrant `-o lo -m owner --uid-owner 2102` ; `RETURN` de l'UID 2102 |
 | INI-09 | règles du mesh posées, saut de Mimic absent, puis présent mais derrière celui du mesh | plan d'application | saut inséré en position 1 ; s'il est déjà en tête, rien ; sinon retiré puis réinséré en tête, une seule fois |
 | INI-10 | `MIMIC_MESH` `auto`, `none`, `linkerd` ; règles Linkerd visibles seulement par `iptables-legacy` | choix | `auto` : Linkerd, binaire `iptables-legacy` ; `none` : aucun mesh, binaire configuré ; `linkerd` sans règles trouvées : UID 2102 par défaut ; valeur inconnue refusée |
+| INI-11 | `MIMIC_EXCLUDE_OUTBOUND_CIDRS` avec `10.0.0.0/8`, `fd00::/8` et `10.96.0.1` ; puis une valeur `10.0.0.0/33`, `example.com`, ou une valeur qui contient un saut de ligne suivi d'une règle ; ports `0`, `70000` ou `http` ; `POD_IP` invalide | analyse ; `mimic-init --dry-run` | CIDR canoniques (`10.96.0.1/32`) ; valeur invalide refusée : message qui nomme la variable et la valeur, code de sortie 2, aucune règle affichée ni posée |
 
 **Proxy (PRX)**
 
@@ -1177,6 +1212,13 @@ Les tests sont écrits **avant** l'implémentation de chaque phase. Chaque crit�
 | INJ-11 | pod déjà injecté par Istio (`istio-init`, `istio-proxy` en native sidecar) ; pod injecté par Linkerd (`linkerd-init`, `linkerd-proxy` dans les conteneurs) | admission | injecté ; `mimic-init` et `mimic` juste après les init containers du mesh, les autres init containers ensuite ; `MIMIC_MESH` `istio` ou `linkerd` ; sondes `exec` `mimic-proxy --probe` |
 | INJ-12 | pod injecté par Mimic sans mesh, puis Istio ajoute ses conteneurs en tête ; ou les ajoute derrière ceux de Mimic | réinvocation | patch : `MIMIC_MESH=istio`, sondes `exec`, conteneurs du mesh avant ceux de Mimic ; nouvelle réinvocation : aucun patch |
 | INJ-13 | annotation `mimic.platform.io/mesh: istio-ambient`, puis `none` sur un pod Istio, puis une valeur inconnue | admission | `MIMIC_MESH` reprend l'annotation ; valeur inconnue : pod injecté en `auto`, avec un avertissement |
+| INJ-14 | webhook servi en HTTPS, `tls.reload_interval` court ; certificat et clé remplacés sur disque (renouvellement) ; puis remplacés par un contenu illisible | poignées de main suivantes | le nouveau certificat est présenté sans redémarrage ; le contenu illisible est ignoré, l'ancien certificat reste servi ; au démarrage, un certificat illisible est refusé |
+| INJ-15 | serveur du plan de contrôle (`mimic-net`) en HTTPS ; client TCP qui n'envoie rien ; client TLS qui n'envoie pas d'en-têtes ; `accept` en échec répété | délais de 10 s (ici raccourcis) | connexion fermée après le délai de poignée de main, puis après celui des en-têtes ; 50 ms au moins entre deux `accept` en échec, une ligne de journal au plus par seconde |
+| INJ-16 | binaire `mimic-injector` démarré | `SIGTERM` | sortie en code 0 en moins de 5 s |
+| INJ-17 | `KUBERNETES_SERVICE_HOST=10.100.0.1` au chargement de la configuration, `exclude_outbound_cidrs: [10.0.0.0/8]`, annotation `exclude-outbound-cidrs: 10.100.0.1/32,192.168.0.0/16` ; puis `KUBERNETES_SERVICE_HOST=fd00::1` ; puis `ipv6: true` | admission | `MIMIC_EXCLUDE_OUTBOUND_CIDRS=10.100.0.1/32,10.0.0.0/8,192.168.0.0/16` ; puis `fd00::1/128` en tête ; `MIMIC_IPV6=true` seulement avec `ipv6: true` ; CIDR invalide dans la configuration refusé au démarrage |
+| INJ-18 | annotations `inbound-ports: 8080,http,70000`, `exclude-outbound-cidrs: 10.0.0.0/8,bad,10.1.0.0/33`, `exclude-outbound-ports: 5432,x`, une valeur avec un saut de ligne suivi d'une règle ; puis `inbound-ports: http` | admission | `MIMIC_INBOUND_PORTS=8080`, `MIMIC_EXCLUDE_OUTBOUND_CIDRS` sans les valeurs invalides, `MIMIC_EXCLUDE_OUTBOUND_PORTS=5432` ; un avertissement d'admission par valeur ignorée, aucune n'atteint le pod ; `inbound-ports` sans port valide : ports déclarés |
+| INJ-19 | pod injecté | admission | `mimic-init` : root, `NET_ADMIN` et `NET_RAW` seules, `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`, `resources` (`init_resources`) ; sidecar : `seccompProfile: RuntimeDefault` ; volume `mimic-controller-ca` en `optional: true`, de même dans `deploy/example/deployment.yaml` |
+| INJ-20 | manifests de `deploy/injector/` et de `deploy/example/` | lecture | image `ghcr.io/thaliph/mimic:0.1.0` partout (aucune `registry.example.com/platform`) ; injecteur en UID et GID 1338 ; anti-affinité préférentielle par nœud et `priorityClassName: mimic-control-plane`, PriorityClass fournie ; webhook limité au label `mimic.platform.io/enabled` et excluant `kube-system` et `mimic-system` par `kubernetes.io/metadata.name` ; aucun CIDR codé en dur dans la configuration du webhook |
 
 **CLI (CLI)**
 
@@ -1278,6 +1320,7 @@ Chaque phase commence par l'écriture de ses tests (en rouge), puis de l'implém
 | P6f | Snapshot de mock léger : forme de mock du snapshot, compressée, avec `ETag`, identique sur tous les pods ; snapshot complet gardé pour les anciens sidecars, repli d'un sidecar à jour sur un ancien contrôleur | MCK-20, CTL-23, SHR-11 |
 | P6g | Contrôleur en haute disponibilité : deux réplicas actif/passif élues par un bail `Lease`, prise de relais après rechargement de l'état persisté, Service vers la seule active, PodDisruptionBudget, anti-affinité, stockage partagé (`s3://` ou PVC `ReadWriteMany` sur plusieurs nœuds) | CTL-24 à CTL-28, CLI-09, E2E-06 |
 | P7 | Webhook d'injection + `mimicctl` (dont le rapport) | INJ-*, CLI-*, OAS-*, DIF-*, E2E-05 |
+| P7b | Plan de contrôle en production : certificats relus à chaud, serveurs bornés (poignée de main, en-têtes, `accept`), arrêt propre du webhook, authentification avant le corps, `/metrics` du contrôleur collectable, erreurs du support distinguées de l'absence, valeurs iptables validées dans le webhook et `mimic-init`, IP de l'API Kubernetes exclue d'office, Pod Security, manifests de production | INI-11, INJ-14 à INJ-20, CTL-29 à CTL-35 |
 | P8 | Génération de scénarios k6 depuis OpenAPI + `x-mimic-stats` | scénario généré exécutable |
 
 P1 et P3 sont du Rust pur sans I/O : c'est le meilleur point d'entrée pour Claude Code, qui peut avancer en TDD strict sur des fonctions déterministes avant de toucher au réseau.
