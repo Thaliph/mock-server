@@ -2,6 +2,8 @@
 
 use std::io::Read;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -9,6 +11,53 @@ use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use mimic_core::model::Body;
 use tokio::sync::oneshot;
+
+/// Budget global des octets de bodies copiés en vol par les tee (spec §5.2). Une
+/// réservation n'attend jamais : faute de place, la copie est sautée, pas le relais.
+#[derive(Debug)]
+pub struct InflightBudget {
+    available: AtomicUsize,
+}
+
+impl InflightBudget {
+    pub fn new(bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
+            available: AtomicUsize::new(bytes),
+        })
+    }
+
+    /// Octets encore disponibles.
+    pub fn available(&self) -> usize {
+        self.available.load(Ordering::Relaxed)
+    }
+
+    fn try_reserve(&self, n: usize) -> bool {
+        self.available
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |a| a.checked_sub(n))
+            .is_ok()
+    }
+
+    fn release(&self, n: usize) {
+        self.available.fetch_add(n, Ordering::AcqRel);
+    }
+}
+
+/// Octets du budget tenus par la copie d'un body, rendus quand elle est consommée ou jetée.
+#[derive(Debug, Default)]
+pub struct Lease {
+    budget: Option<Arc<InflightBudget>>,
+    bytes: usize,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budget
+            && self.bytes > 0
+        {
+            b.release(self.bytes);
+        }
+    }
+}
 
 /// Ce que la capture a vu d'un body.
 #[derive(Debug)]
@@ -18,21 +67,25 @@ pub struct Captured {
     /// Faux si le flux a été interrompu (erreur, client parti).
     pub complete: bool,
     pub ended: Instant,
+    /// Vrai si une partie du body n'a pas été copiée, faute de budget en vol.
+    pub over_budget: bool,
+    /// Part du budget en vol tenue par `prefix`, rendue avec lui.
+    pub lease: Lease,
 }
 
 impl Captured {
     /// Conversion vers le modèle, en décodant `gzip`, `deflate`, `br` ou `zstd` si nécessaire.
-    pub fn into_body(self, keep: bool, limit: usize, content_encoding: Option<&str>) -> Body {
+    pub fn into_body(mut self, keep: bool, limit: usize, content_encoding: Option<&str>) -> Body {
         if self.size == 0 {
             return Body::Empty;
         }
         if !keep {
             return Body::Skipped { size: self.size };
         }
-        if !self.complete || self.size > self.prefix.len() as u64 {
+        if !self.complete || self.over_budget || self.size > self.prefix.len() as u64 {
             return Body::Truncated {
                 size: self.size,
-                prefix: self.prefix,
+                prefix: std::mem::take(&mut self.prefix),
             };
         }
         match content_encoding.map(|c| c.trim().to_ascii_lowercase()) {
@@ -95,23 +148,45 @@ pub fn encode(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Body qui relaie `inner` et en garde une copie des `limit` premiers octets.
+/// Body qui relaie `inner` et en garde une copie des `limit` premiers octets, dans la
+/// limite du budget en vol s'il y en a un.
 pub struct TeeBody<B> {
     inner: B,
     limit: usize,
     prefix: Vec<u8>,
     size: u64,
+    lease: Lease,
+    over_budget: bool,
     tx: Option<oneshot::Sender<Captured>>,
 }
 
 impl<B: HttpBody<Data = Bytes> + Unpin> TeeBody<B> {
     pub fn new(inner: B, limit: usize) -> (Self, oneshot::Receiver<Captured>) {
+        Self::build(inner, limit, None)
+    }
+
+    /// Comme [`TeeBody::new`], les octets copiés étant pris sur `budget` (spec §5.2).
+    pub fn with_budget(
+        inner: B,
+        limit: usize,
+        budget: Arc<InflightBudget>,
+    ) -> (Self, oneshot::Receiver<Captured>) {
+        Self::build(inner, limit, Some(budget))
+    }
+
+    fn build(
+        inner: B,
+        limit: usize,
+        budget: Option<Arc<InflightBudget>>,
+    ) -> (Self, oneshot::Receiver<Captured>) {
         let (tx, rx) = oneshot::channel();
         let mut tee = Self {
             inner,
             limit,
             prefix: vec![],
             size: 0,
+            lease: Lease { budget, bytes: 0 },
+            over_budget: false,
             tx: Some(tx),
         };
         // Un body vide peut ne jamais être lu : on le déclare terminé tout de suite.
@@ -123,13 +198,39 @@ impl<B: HttpBody<Data = Bytes> + Unpin> TeeBody<B> {
 
     fn finish(&mut self, complete: bool) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(Captured {
-                prefix: std::mem::take(&mut self.prefix),
-                size: self.size,
-                complete,
-                ended: Instant::now(),
-            });
+            let _ = tx.send(self.captured(complete));
         }
+    }
+}
+
+impl<B> TeeBody<B> {
+    fn captured(&mut self, complete: bool) -> Captured {
+        Captured {
+            prefix: std::mem::take(&mut self.prefix),
+            size: self.size,
+            complete,
+            ended: Instant::now(),
+            over_budget: self.over_budget,
+            lease: std::mem::take(&mut self.lease),
+        }
+    }
+
+    /// Copie le fragment dans la limite de `limit` et du budget ; un fragment refusé par le
+    /// budget arrête la copie de ce body, sans jamais retarder le relais.
+    fn copy(&mut self, data: &[u8]) {
+        let room = self.limit.saturating_sub(self.prefix.len());
+        let take = room.min(data.len());
+        if take == 0 || self.over_budget {
+            return;
+        }
+        if let Some(budget) = &self.lease.budget {
+            if !budget.try_reserve(take) {
+                self.over_budget = true;
+                return;
+            }
+            self.lease.bytes += take;
+        }
+        self.prefix.extend_from_slice(&data[..take]);
     }
 }
 
@@ -146,8 +247,7 @@ impl<B: HttpBody<Data = Bytes> + Unpin> HttpBody for TeeBody<B> {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     this.size += data.len() as u64;
-                    let room = this.limit.saturating_sub(this.prefix.len());
-                    this.prefix.extend_from_slice(&data[..room.min(data.len())]);
+                    this.copy(data);
                 }
                 if this.inner.is_end_stream() {
                     this.finish(true);
@@ -178,12 +278,7 @@ impl<B: HttpBody<Data = Bytes> + Unpin> HttpBody for TeeBody<B> {
 impl<B> Drop for TeeBody<B> {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(Captured {
-                prefix: std::mem::take(&mut self.prefix),
-                size: self.size,
-                complete: false,
-                ended: Instant::now(),
-            });
+            let _ = tx.send(self.captured(false));
         }
     }
 }
@@ -208,6 +303,35 @@ mod tests {
         ));
     }
 
+    /// Budget en vol (CAP-11) : au-delà, le body n'est plus copié mais reste relayé en
+    /// entier ; le budget est rendu quand la copie est consommée.
+    #[tokio::test]
+    async fn cap_11_budget_bounds_copies_and_is_released() {
+        let budget = InflightBudget::new(150);
+        let (a, ra) =
+            TeeBody::with_budget(Full::new(Bytes::from(vec![1u8; 100])), 1000, budget.clone());
+        let (b, rb) =
+            TeeBody::with_budget(Full::new(Bytes::from(vec![2u8; 100])), 1000, budget.clone());
+        assert_eq!(a.collect().await.unwrap().to_bytes().len(), 100);
+        assert_eq!(b.collect().await.unwrap().to_bytes().len(), 100);
+        let (ca, cb) = (ra.await.unwrap(), rb.await.unwrap());
+        assert!(!ca.over_budget && ca.prefix.len() == 100);
+        assert!(cb.over_budget && cb.prefix.is_empty());
+        assert_eq!(budget.available(), 50);
+        assert!(matches!(
+            cb.into_body(true, 1000, None),
+            Body::Truncated { size: 100, .. }
+        ));
+        assert_eq!(budget.available(), 50);
+        assert_eq!(
+            ca.into_body(true, 1000, None),
+            Body::Captured {
+                data: vec![1u8; 100]
+            }
+        );
+        assert_eq!(budget.available(), 150);
+    }
+
     #[tokio::test]
     async fn empty_body_finishes_immediately() {
         let (_tee, rx) = TeeBody::new(http_body_util::Empty::<Bytes>::new(), 10);
@@ -224,6 +348,8 @@ mod tests {
             prefix: gz,
             complete: true,
             ended: Instant::now(),
+            over_budget: false,
+            lease: Lease::default(),
         };
         assert_eq!(
             c.into_body(true, 100, Some("gzip")),

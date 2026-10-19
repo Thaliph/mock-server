@@ -286,7 +286,7 @@ async fn forward(
         state.config.capture.max_body_bytes
     };
     let (body, req_capture) = if matches!(record, Record::Full | Record::Metadata) {
-        let (tee, rx) = TeeBody::new(body, limit);
+        let (tee, rx) = TeeBody::with_budget(body, limit, state.inflight.clone());
         (boxed(tee), Some(rx))
     } else {
         (body, None)
@@ -384,7 +384,7 @@ async fn forward(
     let Some((pending, req_capture)) = pending else {
         return Response::from_parts(resp_parts, boxed(resp_body));
     };
-    let (tee, resp_capture) = TeeBody::new(resp_body, limit);
+    let (tee, resp_capture) = TeeBody::with_budget(resp_body, limit, state.inflight.clone());
     tokio::spawn(finalize(state, pending, req_capture, resp_capture));
     Response::from_parts(resp_parts, boxed(tee))
 }
@@ -568,6 +568,8 @@ async fn finalize(
     if capture.bodies && !keep && (req.size > 0 || resp.size > 0) {
         dropped(&state, "sample_limit");
     }
+    // Bodies que le budget en vol n'a pas laissé copier en entier (spec §5.2).
+    let over_budget = [req.over_budget, resp.over_budget];
     let req_body = req.into_body(
         keep,
         capture.max_body_bytes,
@@ -578,9 +580,16 @@ async fn finalize(
         capture.max_body_bytes,
         find(&p.resp_headers, "content-encoding"),
     );
-    for b in [&req_body, &resp_body] {
+    for (b, over_budget) in [&req_body, &resp_body].into_iter().zip(over_budget) {
         if matches!(b, Body::Truncated { .. }) {
-            dropped(&state, "truncated");
+            dropped(
+                &state,
+                if over_budget {
+                    "inflight_budget"
+                } else {
+                    "truncated"
+                },
+            );
         }
     }
     let mut exchange = Exchange {

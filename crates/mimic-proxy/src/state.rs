@@ -73,6 +73,8 @@ pub struct AppState {
     pub(crate) connections: Arc<tokio::sync::Semaphore>,
     /// Places de connexion de l'admin, à part : l'application ne prive pas les sondes.
     pub(crate) admin_connections: Arc<tokio::sync::Semaphore>,
+    /// Budget des bodies copiés en vol par la capture (`capture.max_inflight_bytes`).
+    pub(crate) inflight: Arc<crate::capture::InflightBudget>,
     /// Logs de refus au plafond de connexions, limités en débit.
     pub(crate) refused_log: LogLimiter,
 }
@@ -169,6 +171,7 @@ impl AppState {
             .map(|s| s.url.clone())
             .unwrap_or_default();
         let max_connections = config.server.max_connections;
+        let inflight = crate::capture::InflightBudget::new(config.capture.max_inflight_bytes);
         Ok(Arc::new(Self {
             mode: AtomicU8::new(config.mode.to_u8()),
             inbound_capture: AtomicU8::new(config.capture.inbound as u8),
@@ -194,6 +197,7 @@ impl AppState {
             connections: Arc::new(tokio::sync::Semaphore::new(max_connections)),
             admin_connections: Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONNECTIONS)),
             refused_log: LogLimiter::per_second(),
+            inflight,
             tls,
         }))
     }
