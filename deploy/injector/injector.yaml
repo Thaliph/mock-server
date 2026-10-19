@@ -48,10 +48,16 @@ data:
         listen: 0.0.0.0:15106
       outbound:
         listen: 127.0.0.1:15101
+        connect_timeout: 10        # secondes : connexion vers l'amont, puis 504 (spec §3.5)
+      # Toutes adresses pour les sondes et /metrics ; le reste ne répond qu'à 127.0.0.1 (spec §9.2).
       admin:
         listen: 0.0.0.0:15100
+      server:
+        header_read_timeout: 60    # secondes : en-têtes HTTP/1, inactivité keep-alive comprise
+        max_connections: 2048      # entrant et sortant ensemble ; au-delà, refusées
       capture:
         samples_per_operation: 20
+        max_inflight_bytes: 67108864   # 64 MiB de bodies copiés en vol (spec §5.2)
       mock:
         strategy: best
         unmatched: error
@@ -66,6 +72,7 @@ data:
         token_file: /var/run/secrets/mimic/token
         interval: 10
         mode_poll: 2
+        max_snapshot_bytes: 67108864   # 64 MiB : forme de mock téléchargée (spec §5.6)
 ---
 apiVersion: apps/v1
 kind: Deployment
