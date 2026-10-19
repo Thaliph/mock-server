@@ -1,0 +1,197 @@
+name: release
+
+# Publication d'une version : image multi-architecture sur ghcr.io et binaires de mimicctl
+# pour Linux, macOS et Windows, attachés à la release GitHub du tag.
+# Sur une PR qui touche à la chaîne de publication, tout est construit sans rien publier.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Dockerfile
+      - Cargo.lock
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image: ${{ steps.v.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      # Le tag doit correspondre à la version du workspace : une image 0.1.0 contient le code 0.1.0.
+      - id: v
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # ghcr.io n'accepte que des noms en minuscules.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mimic" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME}, version du workspace $version"
+            exit 1
+          fi
+
+  cli:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true}
+          - {target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true}
+          - {target: x86_64-apple-darwin, os: macos-latest}
+          - {target: aarch64-apple-darwin, os: macos-latest}
+          - {target: x86_64-pc-windows-msvc, os: windows-latest}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      # Windows : NASM sert à l'assembleur d'aws-lc (TLS du client Kubernetes).
+      - if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+      - run: cargo build --release --locked -p mimicctl --target ${{ matrix.target }}
+      - name: Archive et somme de contrôle
+        shell: bash
+        run: |
+          name=mimicctl-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          mkdir -p dist "$name"
+          cp README.md docs/cli.md "$name"/
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/${{ matrix.target }}/release/mimicctl.exe "$name"/
+            7z a -tzip "dist/$name.zip" "$name" >/dev/null
+          else
+            cp target/${{ matrix.target }}/release/mimicctl "$name"/
+            tar -czf "dist/$name.tar.gz" "$name"
+          fi
+          cd dist
+          for f in *; do
+            if command -v sha256sum >/dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi > "$f.sha256"
+          done
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*
+
+  image:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: linux/amd64, os: ubuntu-latest}
+          - {platform: linux/arm64, os: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Chaque architecture est construite sur un runner natif, sans émulation, puis poussée
+      # par son digest ; le job manifest les réunit sous les tags de la version.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=mimic : sidecar, init container, contrôleur, webhook d'injection et mimicctl
+          outputs: ${{ github.event_name == 'push' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.version.outputs.image) || 'type=cacheonly' }}
+      - if: github.event_name == 'push'
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: digests/*
+
+  manifest:
+    if: github.event_name == 'push'
+    needs: [version, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tags de la version
+        working-directory: digests
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+        run: |
+          v=${{ needs.version.outputs.version }}
+          docker buildx imagetools create -t "$IMAGE:$v" -t "$IMAGE:${v%.*}" \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$v"
+
+  release:
+    if: github.event_name == 'push'
+    needs: [version, cli, manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+      - name: Release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.version.outputs.image }}
+        run: |
+          v=${{ needs.version.outputs.version }}
+          cat > notes.md <<EOF
+          Image : \`$IMAGE:$v\` (linux/amd64, linux/arm64).
+
+          \`\`\`sh
+          docker pull $IMAGE:$v
+          \`\`\`
+
+          Binaires de \`mimicctl\` ci-dessous, avec leur somme SHA-256. Installation et
+          déploiement : \`docs/wiki/Installer.md\`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* --title "mimic $v" --notes-file notes.md --verify-tag
