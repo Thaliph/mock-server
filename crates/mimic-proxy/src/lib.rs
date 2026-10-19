@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod capture;
 pub mod config;
+pub mod connect;
 pub mod control;
 pub mod engine;
 pub mod journal;

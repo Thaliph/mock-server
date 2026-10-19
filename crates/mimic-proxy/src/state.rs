@@ -15,12 +15,15 @@ use mimic_core::snapshot::MockSnapshot;
 use serde_json::Value;
 
 use crate::config::{Config, InboundCapture, MockWebsocket, Mode};
+use crate::connect::TimeoutConnector;
 use crate::metrics::{DiscoveryLabels, Metrics, OriginLabel};
 use crate::store::{Drops, Limits, Store};
 use crate::throttle::LogLimiter;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = UnsyncBoxBody<bytes::Bytes, BoxError>;
+/// Connecteur vers l'amont, borné par `outbound.connect_timeout` (spec §3.5).
+pub type Upstream = TimeoutConnector<HttpsConnector<HttpConnector>>;
 
 /// Documents OpenAPI calculés pour une version du store.
 #[derive(Debug, Clone)]
@@ -45,9 +48,9 @@ pub struct AppState {
     pub store: Store,
     pub metrics: Metrics,
     pub redactor: Redactor,
-    pub client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    pub client: Client<Upstream, ProxyBody>,
     /// Client HTTP/2 seulement (h2c en connaissance préalable, h2 via ALPN) : gRPC.
-    pub client_h2: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    pub client_h2: Client<Upstream, ProxyBody>,
     /// Interception TLS : CA et configuration serveur, si `tls.intercept` n'est pas vide.
     pub tls: Option<TlsState>,
     /// Moteur de mock en service (spec §5.3).
@@ -105,7 +108,9 @@ impl AppState {
             .https_or_http()
             .enable_http1()
             .wrap_connector(http.clone());
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let connect_timeout = config.outbound.connect_timeout;
+        let client = Client::builder(TokioExecutor::new())
+            .build(TimeoutConnector::new(connector, connect_timeout));
         let connector_h2 = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls_client)
             .https_or_http()
@@ -113,7 +118,7 @@ impl AppState {
             .wrap_connector(http);
         let client_h2 = Client::builder(TokioExecutor::new())
             .http2_only(true)
-            .build(connector_h2);
+            .build(TimeoutConnector::new(connector_h2, connect_timeout));
         let tls = if config.tls.intercept.is_empty() {
             None
         } else {
