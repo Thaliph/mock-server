@@ -5,7 +5,6 @@
 //! à sa première apparition (au plus `MAX_AUTHORITIES`, la mémoire reste bornée), puis résolue
 //! sous un verrou pris en lecture. Seule la première requête d'une série la crée.
 
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -29,7 +28,8 @@ pub struct RequestLabels {
     pub direction: &'static str,
     pub mode: &'static str,
     pub authority: &'static str,
-    pub method: Cow<'static, str>,
+    /// Méthode standard, sinon `other` (spec §9.3).
+    pub method: &'static str,
     pub status: u16,
 }
 
@@ -87,6 +87,12 @@ pub struct PassthroughLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ListenerLabel {
+    /// `inbound`, `outbound` ou `admin`.
+    pub listener: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TlsFailureLabels {
     pub authority: &'static str,
     pub reason: &'static str,
@@ -135,6 +141,7 @@ pub struct Metrics {
     pub passthrough: Family<PassthroughLabels, Counter>,
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
     pub websocket_connections: Family<WebsocketLabels, Counter>,
+    pub connections_refused: Family<ListenerLabel, Counter>,
     /// Authorities internées : au plus `MAX_AUTHORITIES` chaînes, jamais libérées.
     authorities: RwLock<BTreeSet<&'static str>>,
 }
@@ -176,6 +183,7 @@ impl Metrics {
         let passthrough = Family::default();
         let tls_handshake_failures = Family::default();
         let websocket_connections = Family::default();
+        let connections_refused = Family::default();
         registry.register(
             "mimic_requests",
             "Requêtes traitées par le sidecar",
@@ -257,6 +265,11 @@ impl Metrics {
             "Poignées de main WebSocket : 101 de l'amont relayé, ou refus en mock",
             websocket_connections.clone(),
         );
+        registry.register(
+            "mimic_connections_refused",
+            "Connexions refermées au plafond de connexions simultanées (spec §3.5)",
+            connections_refused.clone(),
+        );
         Self {
             registry,
             requests,
@@ -276,6 +289,7 @@ impl Metrics {
             passthrough,
             tls_handshake_failures,
             websocket_connections,
+            connections_refused,
             authorities: RwLock::new(BTreeSet::new()),
         }
     }
@@ -425,15 +439,17 @@ pub fn direction_label(d: Direction) -> &'static str {
     }
 }
 
-/// Label `method` : statique pour les méthodes standard, copié pour les autres.
-fn method_label(method: &str) -> Cow<'static, str> {
+/// Label `method` : une des méthodes standard, sinon `other`, pour que la cardinalité ne
+/// dépende pas des clients (spec §9.3).
+fn method_label(method: &str) -> &'static str {
     const STANDARD: [&str; 9] = [
         "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE",
     ];
-    match STANDARD.iter().find(|m| **m == method) {
-        Some(m) => Cow::Borrowed(m),
-        None => Cow::Owned(method.to_string()),
-    }
+    STANDARD
+        .iter()
+        .find(|m| **m == method)
+        .copied()
+        .unwrap_or("other")
 }
 
 impl Default for Metrics {

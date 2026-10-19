@@ -455,8 +455,10 @@ ws_metric() {
     total '/^mimic_websocket_connections_total[{]/ && /direction="outbound"/ && /result="'"$1"'"/'
 }
 # ws_applied <websocket> : le sidecar de ws-client est en mock, snapshot chargé, avec ce réglage.
+# Statut lu depuis le pod : hors sondes et /metrics, l'admin ne répond qu'à la boucle locale
+# (spec §9.2), pas au proxy de l'API Kubernetes.
 ws_applied() {
-  kubectl get --raw "/api/v1/namespaces/$NS/pods/$ws_pod:15100/proxy/api/status" |
+  kubectl -n "$NS" exec "$ws_pod" -c curl -- curl -sS -m 5 http://127.0.0.1:15100/api/status |
     jq -e --arg w "$1" '.mode == "mock" and .snapshot != null and .mock_websocket == $w' >/dev/null
 }
 # ws_aligned : statut publié pour la génération courante, le pod aligné.
