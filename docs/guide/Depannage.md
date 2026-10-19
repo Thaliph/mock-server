@@ -1,3 +1,7 @@
+# Dépannage
+
+[← Sommaire](README.md)
+
 Symptômes, diagnostics et messages réels, composant par composant. Les logs du sidecar et du
 contrôleur sont en JSON (filtre `MIMIC_LOG`, `info` par défaut) ; ceux du webhook suivent
 `RUST_LOG`. Les messages cités ici sont ceux du code : les chercher tels quels.
@@ -75,7 +79,7 @@ d'erreur, préfixé `mimic: `.
 | `502 mimic: aucune destination pour le trafic entrant` | | connexion arrivée sur 15106 sans redirection iptables | appeler l'application par son port, pas 15106 |
 | l'application reçoit `502 mimic: amont injoignable` vers une dépendance | `mimic_upstream_errors_total{direction="outbound"}` | dépendance injoignable (vraie panne, DNS, NetworkPolicy) | comme sans mimic |
 | `400 mimic: requête sans destination (ni proxy explicite, ni redirection)` | | requête envoyée directement à 15101 sans URI absolue | |
-| tout le trafic du pod échoue | sidecar arrêté (`kubectl describe pod`) | règles iptables actives sans proxy | voir [Alertes et supervision](Alertes-et-supervision#conduite-à-tenir) |
+| tout le trafic du pod échoue | sidecar arrêté (`kubectl describe pod`) | règles iptables actives sans proxy | voir [Alertes et supervision](Alertes-et-supervision.md#conduite-à-tenir) |
 | appels vers l'API Kubernetes en échec | | CIDR de l'API absent de `exclude_outbound_cidrs` | compléter `exclude_outbound_cidrs` du webhook ou l'annotation `exclude-outbound-cidrs` |
 | connexions MySQL / SMTP lentes (30 s) en mock | | protocoles où le serveur parle d'abord : en mock, mimic attend l'application 30 s | exclure leurs ports (`exclude-outbound-ports`) |
 | trafic IPv6 non vu | | le webhook ne pose pas `MIMIC_IPV6` | IPv4 seulement |
@@ -104,7 +108,7 @@ de `/api/status`, sous la forme `<méthode> <chemin>: <code> <motif> <body>`.
 | `… 503 Service Unavailable réplique passive du contrôleur : la réplique active sert les sidecars` | le Service route vers la passive | transitoire pendant une bascule ; sinon vérifier le label `mimic.platform.io/leader` des pods |
 | `POST /segments?…: 503 Service Unavailable support indisponible` | support plein ou injoignable | PVC, droits S3 |
 | `POST /heartbeat: délai dépassé` | NetworkPolicy, Service sans endpoint, contrôleur arrêté | `kubectl -n mimic-system get endpoints mimic-controller` ; le pod porte-t-il `mimic.platform.io/sidecar=true` ? |
-| `… invalid peer certificate: BadSignature` | CA réémise sans réémission du certificat du contrôleur, ou sidecar démarré avec l'ancienne CA | procédure de [rotation de la CA](Exploiter-en-production#certificats) |
+| `… invalid peer certificate: BadSignature` | CA réémise sans réémission du certificat du contrôleur, ou sidecar démarré avec l'ancienne CA | procédure de [rotation de la CA](Exploiter-en-production.md#certificats) |
 | `… invalid peer certificate: …` mentionnant l'expiration | certificat renouvelé par cert-manager mais contrôleur pas redémarré (il ne recharge pas son certificat) | `kubectl -n mimic-system rollout restart deploy/mimic-controller` |
 | `jeton /var/run/secrets/mimic/token: …` | fichier de jeton illisible | volume `mimic-token` |
 | `snapshot <id>: …` | téléchargement du snapshot en échec ; le pod est passé en mock sur ses données locales et retente | voir la cause qui suit |
@@ -121,7 +125,7 @@ de `/api/status`, sous la forme `<méthode> <chemin>: <code> <motif> <body>`.
 | `503` avec `x-mimic-websocket: refused` | | `mock.websocket: refuse` (ou `spec.mock.websocket`) |
 | latences rejouées plus courtes ou plus longues | `mimic_mock_injected_latency_seconds` vs `mimic_request_duration_seconds{mode="record"}` | `mock.latency_factor` ; distribution tirée de l'enregistrement |
 | tous les pods ne servent pas la même chose | `mimic_mock_snapshot_exchanges` par pod, `mimicctl status` | pod sans snapshot (téléchargement en échec) ; sidecar sans contrôleur |
-| `Aligned=False` | raison de la condition | voir [Basculer en mock](Basculer-en-mock#vérifier-lalignement) |
+| `Aligned=False` | raison de la condition | voir [Basculer en mock](Basculer-en-mock.md#vérifier-lalignement) |
 | `mimicctl mode` refusé en production | `le namespace X est labellisé env=production : …` | voulu |
 
 ## Contrôleur
@@ -132,7 +136,7 @@ de `/api/status`, sous la forme `<méthode> <chemin>: <code> <motif> <body>`.
 | sort en code 1 en marche | `bail non renouvelé à temps : la réplique cesse de servir`, `bail tenu par une autre réplique : la réplique cesse de servir` | API server lente, réseau, horloge | normal si isolé : la passive a pris le relais ; récurrent : API server |
 | répétition de `renouvellement du bail` / `lecture du bail` | | droits sur `leases/mimic-controller`, API server | RBAC (Role `mimic-controller` dans `mimic-system`) |
 | prise de relais lente | `prise de relais` (liste des namespaces en échec, retentée), `liste initiale des MimicWorkload non reçue : l'état persisté sert` | API server, droits `namespaces` / `mimicworkloads` | `mimic_controller_takeover_seconds` |
-| passive en `ContainerCreating` | événement `Multi-Attach error` | PVC `ReadWriteOnce` sur deux nœuds | [stockage du contrôleur](Exploiter-en-production#stockage-du-contrôleur) |
+| passive en `ContainerCreating` | événement `Multi-Attach error` | PVC `ReadWriteOnce` sur deux nœuds | [stockage du contrôleur](Exploiter-en-production.md#stockage-du-contrôleur) |
 | statut des `MimicWorkload` figé | `statut non publié` | droit `patch` sur `mimicworkloads/status`, CRD absente | RBAC, `kubectl apply -f deploy/controller/crd.yaml` |
 | surveillance en échec | `surveillance des MimicWorkload`, `surveillance des namespaces` | CRD absente, RBAC | idem |
 | snapshot non construit | `construction du snapshot échouée`, raison `SnapshotFailed` | support | espace, droits |
@@ -150,7 +154,7 @@ de `/api/status`, sous la forme `<méthode> <chemin>: <code> <motif> <body>`.
 | `mimicctl: --inbound ou --outbound <authority> requis` | `export` sans sens |
 | `mimicctl: mise à jour de ns/wl: …` | droits sur `mimicworkloads`, conflit de server-side apply avec un autre gestionnaire |
 
-Autres messages : [CLI mimicctl](CLI-mimicctl).
+Autres messages : [CLI mimicctl](CLI-mimicctl.md).
 
 ## Service mesh
 

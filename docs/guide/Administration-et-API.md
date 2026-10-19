@@ -1,3 +1,7 @@
+# Administration et API
+
+[← Sommaire](README.md)
+
 mimic a trois surfaces d'administration : la page et l'API de chaque sidecar, l'interface en
 lecture seule du contrôleur, et l'API du contrôleur réservée aux sidecars. Sources :
 `crates/mimic-proxy/src/admin.rs`, `crates/mimic-controller/src/{ui,api,auth,leader}.rs`.
@@ -86,7 +90,7 @@ Toutes en `GET`, JSON sauf mention contraire. `{ns}` et `{wl}` doivent être des
 | Route | Réponse |
 |-------|---------|
 | `/healthz` | `ok` |
-| `/metrics` | métriques du contrôleur (voir [Métriques](Metriques#contrôleur)) |
+| `/metrics` | métriques du contrôleur (voir [Métriques](Metriques.md#contrôleur)) |
 | `/v1/workloads` | pour chaque workload : `namespace`, `name`, `spec`, `desired`, `pods` (`instance`, `mode`, `snapshot`, `capture_inbound`, `mock_websocket`, `last_seen_ms`, `state`, `selected`), `selected_pods`, `aligned`, `ready`, `reason` |
 | `/v1/workloads/{ns}/{wl}/mode` | état souhaité courant (`mode`, `snapshot`, `capture_inbound`, `mock_websocket`, `selector`) |
 | `/v1/workloads/{ns}/{wl}/snapshots` | snapshots sur le support : `id`, `size`, `modified_ms`, du plus récent au plus ancien |

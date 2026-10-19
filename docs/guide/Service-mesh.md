@@ -1,3 +1,7 @@
+# Service mesh
+
+[← Sommaire](README.md)
+
 mimic cohabite avec Istio (mode sidecar et mode ambient) et Linkerd. Dans les trois cas, il se
 place **entre l'application et le mesh** : il voit le HTTP en clair, avant le mTLS.
 
@@ -113,4 +117,4 @@ mesh n'est dans le pod et le kubelet est reconnu par ztunnel : les sondes resten
 | autres mesh (Consul, Kuma, Cilium) | non pris en charge ; `MIMIC_MESH=none` pose les règles classiques, sans garantie d'ordre avec les leurs |
 | IPv6 | le webhook ne pose pas `MIMIC_IPV6` : seul l'IPv4 est intercepté |
 
-Diagnostic des cas fréquents : [Dépannage](Depannage#service-mesh).
+Diagnostic des cas fréquents : [Dépannage](Depannage.md#service-mesh).
