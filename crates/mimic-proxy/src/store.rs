@@ -339,6 +339,12 @@ impl Store {
             .collect()
     }
 
+    /// Tous les échanges, partagés avec le store (aucune copie) : de quoi calculer la
+    /// découverte hors du verrou.
+    pub fn shared(&self) -> Vec<Arc<Exchange>> {
+        self.lock().list.values().map(|en| en.e.clone()).collect()
+    }
+
     /// Échanges d'un sens, partagés avec le store (aucune copie) : de quoi construire le
     /// moteur de mock hors du verrou.
     pub fn shared_direction(&self, direction: Direction) -> Vec<Arc<Exchange>> {

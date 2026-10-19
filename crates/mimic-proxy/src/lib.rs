@@ -326,7 +326,7 @@ pub(crate) async fn serve_http<IO>(
             let resp = match kind {
                 Listener::Inbound => proxy::inbound(state, info, req).await,
                 Listener::Outbound => proxy::outbound(state, info, req).await,
-                Listener::Admin => admin::handle(state, req).await,
+                Listener::Admin => admin::handle(state, info.peer, req).await,
             };
             Ok::<_, Infallible>(resp)
         }

@@ -60,6 +60,8 @@ pub struct AppState {
     pub(crate) snapshot: Mutex<Option<Arc<MockSnapshot>>>,
     pub controller_status: Mutex<crate::control::ControllerStatus>,
     discovery: Mutex<Option<(u64, Arc<Discovery>)>>,
+    /// Pris pendant un calcul de la découverte : un seul à la fois, les autres l'attendent.
+    discovery_build: Mutex<()>,
     pub share_status: Mutex<ShareStatus>,
     /// Réveille la boucle de partage (`POST /share/sync`).
     pub share_notify: tokio::sync::Notify,
@@ -185,6 +187,7 @@ impl AppState {
                 ..Default::default()
             }),
             discovery: Mutex::new(None),
+            discovery_build: Mutex::new(()),
             share_status: Mutex::new(share_status),
             share_notify: tokio::sync::Notify::new(),
             upstream_log: LogLimiter::per_second(),
@@ -275,19 +278,46 @@ impl AppState {
         self.publish_snapshot(snap);
     }
 
-    /// Documents OpenAPI du workload, recalculés quand le store change.
-    pub fn discovery(&self) -> Arc<Discovery> {
-        let version = self.store.version();
-        let mut guard = self
+    /// Documents OpenAPI du workload, recalculés quand le store change, sur le pool de
+    /// threads bloquants : un calcul long ne retient aucun worker du runtime (spec §9.2).
+    pub async fn discovery(self: &Arc<Self>) -> Arc<Discovery> {
+        if let Some(d) = self.cached_discovery(self.store.version()) {
+            return d;
+        }
+        let state = self.clone();
+        let compute = move || state.compute_discovery();
+        match tokio::task::spawn_blocking(compute.clone()).await {
+            Ok(d) => d,
+            // Pool bloquant indisponible (arrêt du runtime) : calcul sur place.
+            Err(_) => compute(),
+        }
+    }
+
+    /// Découverte en cache, si elle correspond à cette version du store.
+    fn cached_discovery(&self, version: u64) -> Option<Arc<Discovery>> {
+        let guard = self
             .discovery
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some((v, d)) = guard.as_ref()
-            && *v == version
-        {
-            return d.clone();
+        guard
+            .as_ref()
+            .filter(|(v, _)| *v == version)
+            .map(|(_, d)| d.clone())
+    }
+
+    /// Calcul de la découverte, hors du verrou du cache, sur des échanges partagés avec le
+    /// store (aucune copie sous son verrou).
+    fn compute_discovery(&self) -> Arc<Discovery> {
+        let _build = self
+            .discovery_build
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Version lue avant les échanges : un ajout pendant le calcul le fera refaire.
+        let version = self.store.version();
+        if let Some(d) = self.cached_discovery(version) {
+            return d;
         }
-        let exchanges = self.store.snapshot();
+        let exchanges = self.store.shared();
         let title = if self.config.workload.name.is_empty() {
             self.config.instance.clone()
         } else {
@@ -299,7 +329,10 @@ impl AppState {
             outbound: infer_outbound(&exchanges, version_label),
         });
         self.update_discovery_metrics(&d);
-        *guard = Some((version, d.clone()));
+        *self
+            .discovery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((version, d.clone()));
         d
     }
 

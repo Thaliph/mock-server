@@ -1,6 +1,7 @@
 //! API et page d'admin (spec §9.2).
 
 use std::fmt::Write as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, PoisonError};
 
 use bytes::Bytes;
@@ -17,27 +18,55 @@ use crate::config::Mode;
 use crate::proxy::{boxed, parse_query};
 use crate::state::{AppState, Discovery, ProxyBody};
 
-pub async fn handle(state: Arc<AppState>, req: Request<Incoming>) -> Response<ProxyBody> {
+/// Routes ouvertes à toute adresse : sondes du kubelet et collecte Prometheus (spec §9.2).
+fn open_to_all(method: &Method, path: &str) -> bool {
+    method == Method::GET && matches!(path, "/healthz" | "/readyz" | "/metrics")
+}
+
+/// Connexion venue de la boucle locale : `127.0.0.1` ou `::1` (IPv4 mappée comprise).
+/// `127.0.0.6`, d'où Istio relaie les autres pods vers l'application, n'en est pas.
+pub fn from_loopback(peer: IpAddr) -> bool {
+    match peer {
+        IpAddr::V4(v4) => v4 == Ipv4Addr::LOCALHOST,
+        IpAddr::V6(v6) => {
+            v6 == Ipv6Addr::LOCALHOST || v6.to_ipv4_mapped() == Some(Ipv4Addr::LOCALHOST)
+        }
+    }
+}
+
+pub async fn handle(
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    req: Request<Incoming>,
+) -> Response<ProxyBody> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // Données du pod et ordres : boucle locale seulement (port-forward, conteneur du pod).
+    if !open_to_all(&method, &path) && !from_loopback(peer.ip()) {
+        return text(
+            StatusCode::FORBIDDEN,
+            "admin mimic : route réservée à la boucle locale (kubectl port-forward)",
+        );
+    }
     let query = parse_query(req.uri().query());
     match (&method, path.as_str()) {
         (&Method::GET, "/healthz") | (&Method::GET, "/readyz") => text(StatusCode::OK, "ok"),
         (&Method::GET, "/") => {
-            let html = render_page(&state);
+            let d = state.discovery().await;
+            let html = render_page(&state, &d);
             respond(StatusCode::OK, "text/html; charset=utf-8", html)
         }
-        (&Method::GET, "/api/operations") => json_response(&operations(&state.discovery())),
+        (&Method::GET, "/api/operations") => json_response(&operations(&*state.discovery().await)),
         (&Method::GET, "/api/status") => json_response(&status(&state)),
-        (&Method::GET, "/openapi/inbound") => json_response(&state.discovery().inbound),
+        (&Method::GET, "/openapi/inbound") => json_response(&state.discovery().await.inbound),
         (&Method::GET, "/openapi/outbound") => {
-            let d = state.discovery();
+            let d = state.discovery().await;
             let list: Vec<&String> = d.outbound.keys().collect();
             json_response(&json!(list))
         }
         (&Method::GET, p) if p.starts_with("/openapi/outbound/") => {
             let authority = &p["/openapi/outbound/".len()..];
-            match state.discovery().outbound.get(authority) {
+            match state.discovery().await.outbound.get(authority) {
                 Some(doc) => json_response(doc),
                 None => text(StatusCode::NOT_FOUND, "dépendance inconnue"),
             }
@@ -148,9 +177,8 @@ pub fn operations(d: &Discovery) -> Vec<Operation> {
     mimic_core::catalog::operations(&d.inbound, &d.outbound)
 }
 
-fn render_page(state: &AppState) -> String {
-    let d = state.discovery();
-    let ops = operations(&d);
+fn render_page(state: &AppState, d: &Discovery) -> String {
+    let ops = operations(d);
     let share = state
         .share_status
         .lock()
@@ -207,4 +235,30 @@ fn render_page(state: &AppState) -> String {
     mimic_core::catalog::render_operations(&mut h, &ops, &|a| format!("/openapi/outbound/{a}"));
     h.push_str("</main></body></html>");
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Boucle locale au sens de l'admin (SEC-07) : 127.0.0.1 et ::1, pas le reste de
+    /// 127.0.0.0/8 (Istio relaie depuis 127.0.0.6).
+    #[test]
+    fn sec_07_only_127_0_0_1_and_ipv6_loopback_are_local() {
+        for local in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert!(from_loopback(local.parse().unwrap()), "{local}");
+        }
+        for remote in [
+            "127.0.0.6",
+            "10.244.0.20",
+            "::6",
+            "::ffff:10.0.0.1",
+            "fe80::1",
+        ] {
+            assert!(!from_loopback(remote.parse().unwrap()), "{remote}");
+        }
+        assert!(open_to_all(&Method::GET, "/metrics"));
+        assert!(!open_to_all(&Method::PUT, "/healthz"));
+        assert!(!open_to_all(&Method::GET, "/api/status"));
+    }
 }
