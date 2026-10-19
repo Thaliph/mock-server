@@ -720,6 +720,11 @@ async fn snp_08_mock_form_beyond_the_bound_is_refused() {
         .await;
         assert_eq!(status(p).await["snapshot"], Value::Null);
     }
+    // A reçoit la forme compressée sous la borne, B la refuse dès le téléchargement.
+    let error = |s: Value| s["controller"]["last_error"].as_str().unwrap().to_string();
+    let (ea, eb) = (error(status(&a).await), error(status(&b).await));
+    assert!(ea.contains("une fois décompressée"), "{ea}");
+    assert!(eb.contains("réponse au-delà"), "{eb}");
     // Sous la borne : chargée.
     a.shutdown().await;
     let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;

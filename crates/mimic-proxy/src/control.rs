@@ -20,8 +20,6 @@ use crate::config::{InboundCapture, MockWebsocket, Mode, ShareConfig};
 use crate::state::AppState;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// Un snapshot ne dépasse pas cette taille, compressé comme décompressé.
-const MAX_BODY: usize = 256 * 1024 * 1024;
 
 /// Réponse brute du contrôleur.
 struct Reply {
@@ -65,6 +63,9 @@ pub struct ControllerClient {
     instance: String,
     token_file: Option<PathBuf>,
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    /// Taille maximale d'une réponse, compressée comme décompressée
+    /// (`share.max_snapshot_bytes`, spec §5.6).
+    max_body: usize,
 }
 
 impl ControllerClient {
@@ -100,6 +101,7 @@ impl ControllerClient {
             instance: state.config.instance.clone(),
             token_file: share.token_file.clone(),
             client: Client::builder(TokioExecutor::new()).build(connector),
+            max_body: share.max_snapshot_bytes,
         })
     }
 
@@ -150,13 +152,20 @@ impl ControllerClient {
             .map_err(|_| format!("{method} {path}: délai dépassé"))?
             .map_err(|e| format!("{method} {path}: {}", error_chain(&e)))?;
         let (status, headers) = (resp.status(), resp.headers().clone());
+        let max = self.max_body;
         let body = tokio::time::timeout(
             TIMEOUT * 6,
-            Limited::new(resp.into_body(), MAX_BODY).collect(),
+            Limited::new(resp.into_body(), max).collect(),
         )
         .await
         .map_err(|_| format!("{method} {path}: délai dépassé"))?
-        .map_err(|e| format!("{method} {path}: {e}"))?
+        .map_err(|e| {
+            if e.is::<http_body_util::LengthLimitError>() {
+                format!("{method} {path}: réponse au-delà de share.max_snapshot_bytes ({max} octets)")
+            } else {
+                format!("{method} {path}: {e}")
+            }
+        })?
         .to_bytes();
         Ok(Reply {
             status,
@@ -206,8 +215,8 @@ impl ControllerClient {
             .await?;
         match r.status {
             StatusCode::OK => Ok(Fetched {
-                snapshot: mock_form(&r, id)?,
                 downloaded: r.body.len(),
+                snapshot: mock_form(r, id, self.max_body)?,
                 full: false,
             }),
             StatusCode::NOT_FOUND => {
@@ -233,9 +242,9 @@ fn rejected(method: &Method, path: &str, r: &Reply) -> String {
     )
 }
 
-/// Forme de mock reçue : décompressée (bornée), vérifiée contre son `ETag` et l'identifiant
-/// du snapshot demandé.
-fn mock_form(r: &Reply, id: &str) -> Result<MockSnapshot, String> {
+/// Forme de mock reçue : décompressée (bornée à `max` octets), vérifiée contre son `ETag` et
+/// l'identifiant du snapshot demandé. Le corps compressé est libéré avant la lecture.
+fn mock_form(r: Reply, id: &str, max: usize) -> Result<MockSnapshot, String> {
     let encoding = r
         .headers
         .get(header::CONTENT_ENCODING)
@@ -244,9 +253,15 @@ fn mock_form(r: &Reply, id: &str) -> Result<MockSnapshot, String> {
         .trim()
         .to_ascii_lowercase();
     let json = match encoding.as_str() {
-        "identity" | "" => r.body.to_vec(),
-        e => crate::capture::decode(e, &r.body, MAX_BODY)
-            .ok_or_else(|| format!("forme de mock du snapshot {id}: encodage {e} illisible"))?,
+        "identity" | "" => r.body,
+        e => {
+            let decoded = crate::capture::decode(e, &r.body, max).ok_or_else(|| {
+                format!(
+                    "forme de mock du snapshot {id}: illisible en {e}, ou au-delà de share.max_snapshot_bytes ({max} octets) une fois décompressée"
+                )
+            })?;
+            Bytes::from(decoded)
+        }
     };
     if let Some(etag) = r.headers.get(header::ETAG).and_then(|v| v.to_str().ok()) {
         let expected = etag.trim().trim_start_matches("W/").trim_matches('"');
