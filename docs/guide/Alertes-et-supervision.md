@@ -1,5 +1,9 @@
+# Alertes et supervision
+
+[← Sommaire](README.md)
+
 Comment savoir si mimic va bien, et quoi faire quand il ne va pas. Les règles ci-dessous
-n'utilisent que les métriques de mimic (voir [Métriques](Metriques)) et des métriques
+n'utilisent que les métriques de mimic (voir [Métriques](Metriques.md)) et des métriques
 standard de kube-state-metrics, de cAdvisor et du kubelet.
 
 ## Sondes de santé
@@ -55,7 +59,7 @@ EndpointSlice périmée) les envoie à la passive, ce qui ne dure normalement qu
 bascule.
 
 Rappel : avec les manifests livrés, `/metrics` du contrôleur n'est joignable que par
-port-forward (voir [Métriques](Metriques#où-les-collecter)). Les règles « contrôleur
+port-forward (voir [Métriques](Metriques.md#où-les-collecter)). Les règles « contrôleur
 (métriques mimic) » ci-dessous ne servent que si vous l'avez rendu collectable ; sinon,
 utilisez les règles kube-state-metrics et les signaux des sidecars.
 
@@ -275,16 +279,16 @@ Notes sur ces règles :
 | Alerte | Diagnostic | Action |
 |--------|------------|--------|
 | `MimicSidecarRestarting` | `kubectl -n <ns> describe pod <pod>` (raison `OOMKilled` ?), `kubectl -n <ns> logs <pod> -c mimic --previous` (code 2 : configuration invalide, message `mimic: …` ; code 1 : écoute impossible) | OOM : monter `resources` du webhook ou baisser `capture.max_store_bytes` ; configuration : corriger la ConfigMap `mimic.platform.io/config` ou `sidecar_config`. En urgence, `mimic.platform.io/inject: "false"` sur le template et redéploiement |
-| `MimicSidecarNotReady` | `kubectl -n <ns> logs <pod> -c mimic`, état de `mimic-init` (`kubectl -n <ns> logs <pod> -c mimic-init`) | voir [Dépannage](Depannage) |
+| `MimicSidecarNotReady` | `kubectl -n <ns> logs <pod> -c mimic`, état de `mimic-init` (`kubectl -n <ns> logs <pod> -c mimic-init`) | voir [Dépannage](Depannage.md) |
 | `MimicSidecarMemoryHigh` | `mimic_store_bytes`, `mimic_store_exchanges` ; nombre d'authorities | le store est borné par `capture.max_store_bytes` (64 MiB) ; le reste vient des requêtes en vol et des bodies (1 MiB chacun au plus). Monter la limite ou baisser `max_store_bytes` / `max_body_bytes` |
-| `MimicControllerUnreachableFromSidecars` | logs du sidecar (`synchronisation du partage échouée`, `battement vers le contrôleur échoué` avec le code et le motif) ; `curl http://127.0.0.1:15100/api/status` par port-forward | `401` : jeton (volume `mimic-token`, audience) ; `403` : pod d'un autre workload ; `503` : passive ou support ; `délai dépassé` : NetworkPolicy (label `mimic.platform.io/sidecar=true`), Service sans endpoint ; `invalid peer certificate` : CA (voir [Dépannage](Depannage)) |
+| `MimicControllerUnreachableFromSidecars` | logs du sidecar (`synchronisation du partage échouée`, `battement vers le contrôleur échoué` avec le code et le motif) ; `curl http://127.0.0.1:15100/api/status` par port-forward | `401` : jeton (volume `mimic-token`, audience) ; `403` : pod d'un autre workload ; `503` : passive ou support ; `délai dépassé` : NetworkPolicy (label `mimic.platform.io/sidecar=true`), Service sans endpoint ; `invalid peer certificate` : CA (voir [Dépannage](Depannage.md)) |
 | `MimicShareBacklogLoss` | durée de l'indisponibilité du contrôleur | rétablir le contrôleur ; si la perte est structurelle (débit très élevé), monter `share.max_backlog_bytes` ou passer l'entrant en `metadata` |
 | `MimicMockUnmatched` | `/ui/<ns>/<wl>` : opérations découvertes ; `kubectl logs` de l'application pour les `599` ; `mimicctl report` | enregistrer plus longtemps (opérations rares), vérifier `tls.intercept`, utiliser `mock-partial` pour compléter, ou `mock.unmatched: passthrough` |
 | `MimicMockWithoutSnapshot` | logs du sidecar : `battement vers le contrôleur échoué` avec `snapshot <id>: …` ; `forme de mock du snapshot … altérée` | rétablir l'accès au contrôleur ; le téléchargement est retenté à chaque battement |
 | `MimicMockTlsRefused` | `mimic_passthrough_connections_total` par pod, logs de l'application | ajouter l'hôte à `mimic.platform.io/tls-intercept`, ré-enregistrer, ou l'exclure (`exclude-outbound-cidrs`) s'il doit rester réel |
 | `MimicTlsInterceptRejected` | log `poignée de main TLS refusée par l'application` avec l'authority | l'application ne lit pas `SSL_CERT_FILE` & co : ajouter `/var/run/mimic/ca/ca.crt` à son magasin (JVM : `keytool`), ou retirer l'hôte de l'interception |
 | `MimicInboundUpstreamErrors` | port d'écoute de l'application, adresse (le sidecar essaie l'IP du pod puis `127.0.0.1`) | application pas encore prête (démarrage lent) ou qui écoute ailleurs : `inbound.upstream` ou `mimic.platform.io/inbound-ports` |
-| `MimicControllerDown` | `kubectl -n mimic-system get pods -l app.kubernetes.io/name=mimic-controller -L mimic.platform.io/leader`, `describe`, logs | PVC non attaché (multi-attach `ReadWriteOnce`), certificat absent, configuration invalide (code 2) ; voir [Exploiter en production](Exploiter-en-production) |
+| `MimicControllerDown` | `kubectl -n mimic-system get pods -l app.kubernetes.io/name=mimic-controller -L mimic.platform.io/leader`, `describe`, logs | PVC non attaché (multi-attach `ReadWriteOnce`), certificat absent, configuration invalide (code 2) ; voir [Exploiter en production](Exploiter-en-production.md) |
 | `MimicControllerNotRedundant` | réplique `Pending` ou `ContainerCreating` | souvent un PVC `ReadWriteOnce` monté sur un autre nœud : `ReadWriteMany` ou S3 |
 | `MimicControllerRestarting` | `kubectl logs --previous` : `bail non renouvelé à temps`, `bail tenu par une autre réplique`, OOM | API server lente ou réseau (bail) ; mémoire : `max_exchanges_total` ou limite |
 | `MimicControllerMemoryHigh` | `mimic_controller_exchanges`, `mimic_controller_exemplars_bytes` | baisser `max_exchanges_total` (environ 2 Ko par échange) ou monter la limite (4 Gi par défaut) |
@@ -295,6 +299,6 @@ Notes sur ces règles :
 | `MimicControllerSegmentErrors` | log `ingestion d'un segment` | support plein ou en lecture seule, droits S3 |
 | `MimicControllerAuthUnavailable` | log `authentification impossible` | API server, droits `tokenreviews` `create` et `pods` `get` du ClusterRole `mimic-controller` |
 | `MimicControllerAuthRejected` | `reason` : `missing`/`invalid` (jeton, audience `mimic-controller`), `forbidden` (pod sans nom de workload, workload d'un autre) | vérifier le volume `mimic-token` et l'annotation `mimic.platform.io/workload` |
-| `MimicPodsDiverging` | `/ui/<ns>/<wl>` : état de chaque pod ; logs des pods concernés | voir [Basculer en mock](Basculer-en-mock#vérifier-lalignement) |
+| `MimicPodsDiverging` | `/ui/<ns>/<wl>` : état de chaque pod ; logs des pods concernés | voir [Basculer en mock](Basculer-en-mock.md#vérifier-lalignement) |
 | `MimicExemplarsRefused` | `reason` | `count` : monter `max_exemplars_per_workload` ; `bytes` : monter `max_exemplar_bytes_per_workload` / `_total` |
 | `MimicInjectorErrors` | log `revue d'admission invalide` | version d'API server, autre webhook qui modifie la revue |

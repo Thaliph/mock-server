@@ -1,3 +1,7 @@
+# Métriques
+
+[← Sommaire](README.md)
+
 Toutes les métriques exposées par mimic, d'après `crates/mimic-proxy/src/metrics.rs`,
 `crates/mimic-controller/src/metrics.rs` et `crates/mimic-injector/src/server.rs`. Format
 OpenMetrics (`prometheus_client`) : un compteur déclaré `mimic_requests` est exposé
@@ -17,7 +21,7 @@ Deployment et ouvrir la NetworkPolicy `mimic-controller` au scraper ; mais ce po
 aussi l'interface et l'API de lecture, **sans authentification** (échanges redactés, OpenAPI,
 requêtes enregistrées). À ne faire qu'avec une NetworkPolicy qui n'admet que le scraper. À
 défaut, la santé du contrôleur se suit par les métriques des sidecars et kube-state-metrics
-(voir [Alertes et supervision](Alertes-et-supervision)).
+(voir [Alertes et supervision](Alertes-et-supervision.md)).
 
 Exemple de collecte des sidecars (opérateur VictoriaMetrics, `deploy/example/vmpodscrape.yaml`) :
 

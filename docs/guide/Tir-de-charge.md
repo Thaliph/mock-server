@@ -1,3 +1,7 @@
+# Tir de charge
+
+[← Sommaire](README.md)
+
 Mesurer la capacité d'un workload et dimensionner ses pods, sans toucher à ses dépendances :
 on bascule le workload en `mock`, puis `mimicctl load` rejoue contre lui les requêtes
 entrantes enregistrées, à concurrence fixe ou croissante jusqu'à saturation, et en déduit une
@@ -32,7 +36,7 @@ mimicctl status checkout -n perf        # ALIGNED doit afficher n/n
 n'est pas aligné, il refuse avec le code de sortie `2`, car le tir frapperait les vraies
 dépendances. `--allow-live-dependencies` lève ce refus, en connaissance de cause.
 
-À savoir avant de tirer (voir [Modes](Modes#trafic-sortant)) :
+À savoir avant de tirer (voir [Modes](Modes.md#trafic-sortant)) :
 
 - les connexions TCP non HTTP (bases, files de messages) sont **relayées** même en `mock` :
   elles reçoivent la charge du tir ;
@@ -41,7 +45,7 @@ dépendances. `--allow-live-dependencies` lève ce refus, en connaissance de cau
 - `mimic_mock_responses_total{match="unmatched"}` (réponses `599`) doit rester proche de zéro :
   sinon le snapshot ne couvre pas le trafic rejoué et les latences mesurées sont fausses ;
 - pas d'autoscaling ni de redéploiement pendant le tir : un pod neuf démarre en `record`
-  jusqu'à son premier battement (voir [Exploiter en production](Exploiter-en-production)).
+  jusqu'à son premier battement (voir [Exploiter en production](Exploiter-en-production.md)).
 
 ## Tirer
 

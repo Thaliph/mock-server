@@ -1,3 +1,7 @@
+# Modes
+
+[← Sommaire](README.md)
+
 Le mode d'un sidecar décide de ce qu'il fait du trafic **sortant** (appels de l'application
 vers ses dépendances). Le trafic **entrant** est toujours relayé vers l'application, dans tous
 les modes : on mesure le vrai service.
@@ -15,9 +19,9 @@ Sources : `crates/mimic-proxy/src/proxy.rs`, `engine.rs`, `crates/mimic-core/src
 
 Le mode de démarrage est `mode` de la configuration (`record` avec l'injecteur). Il change :
 
-- sous contrôleur : par la ressource `MimicWorkload` (voir [Basculer en mock](Basculer-en-mock)) ;
+- sous contrôleur : par la ressource `MimicWorkload` (voir [Basculer en mock](Basculer-en-mock.md)) ;
 - sans contrôleur : par `PUT /mode` de l'API d'admin (voir
-  [Administration et API](Administration-et-API)) ou par l'annotation `mimic.platform.io/mode`
+  [Administration et API](Administration-et-API.md)) ou par l'annotation `mimic.platform.io/mode`
   quand `annotations_file` est configuré.
 
 Le changement est immédiat, sans redémarrage ; chaque requête prend le mode courant à son
@@ -165,7 +169,7 @@ rouvre un TLS vers la vraie dépendance (racines système, plus `tls.upstream_ca
 
 L'application doit faire confiance à la CA mimic : le webhook monte `ca.crt` et
 `ca-bundle.crt` dans `/var/run/mimic/ca` et pose `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
-`CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` (voir [Configurer](Configurer#annotations-de-pod)).
+`CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` (voir [Configurer](Configurer.md#annotations-de-pod)).
 Une JVM ou une application qui épingle ses certificats ne lit pas ces variables : il faut
 ajouter la CA à son magasin. Un refus par l'application se voit dans
 `mimic_tls_handshake_failures_total{reason="client_rejected"}` et le log

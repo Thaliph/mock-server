@@ -1,3 +1,7 @@
+# Collecte et stockage
+
+[← Sommaire](README.md)
+
 Ce que mimic garde du trafic, où, combien de temps, et comment il en tire l'OpenAPI et les
 snapshots. Sources : `crates/mimic-proxy/src/{proxy,capture,store,journal,share}.rs`,
 `crates/mimic-core/src/{redact,sample,compact,exemplar,snapshot}.rs`,
@@ -109,7 +113,7 @@ qu'il a importé, sans garantie que tous les pods servent les mêmes données.
 
 ## Stockage côté contrôleur
 
-Support : `file:///var/lib/mimic-controller` (PVC `mimic-controller`, 10 Gi, `ReadWriteOnce` dans les manifests : voir [Exploiter en production](Exploiter-en-production#stockage-du-contrôleur) pour plusieurs nœuds)
+Support : `file:///var/lib/mimic-controller` (PVC `mimic-controller`, 10 Gi, `ReadWriteOnce` dans les manifests : voir [Exploiter en production](Exploiter-en-production.md#stockage-du-contrôleur) pour plusieurs nœuds)
 ou `s3://bucket/prefixe` (identifiants `AWS_*`, IRSA par exemple). Seule la réplique active
 y écrit. Arborescence par workload :
 
@@ -158,12 +162,12 @@ Un snapshot est construit par la réplique active quand une `MimicWorkload` entr
 
 Le snapshot reste celui du workload tant qu'il ne quitte pas le mock. Pour rejouer exactement
 le même jeu d'un tir à l'autre, noter `status.snapshot` et le reporter dans `spec.snapshot`
-(voir [Basculer en mock](Basculer-en-mock)). Lister les snapshots d'un workload :
+(voir [Basculer en mock](Basculer-en-mock.md)). Lister les snapshots d'un workload :
 `/v1/workloads/<ns>/<wl>/snapshots` sur l'interface du contrôleur (voir
-[Administration et API](Administration-et-API)).
+[Administration et API](Administration-et-API.md)).
 
 Les snapshots ne sont jamais purgés automatiquement : surveiller le volume du support (voir
-[Exploiter en production](Exploiter-en-production#stockage-du-contrôleur)).
+[Exploiter en production](Exploiter-en-production.md#stockage-du-contrôleur)).
 
 ## Découverte OpenAPI
 

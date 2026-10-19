@@ -1,10 +1,12 @@
+# Guide d'exploitation de mimic
+
 **mimic** est un sidecar Kubernetes qui observe le trafic HTTP d'un pod, en déduit l'API
 (OpenAPI 3.1, avec exemples et latences), puis remplace les dépendances du pod par leurs
 réponses enregistrées pour lancer des tirs de performance isolés. Le service mesuré reçoit
 toujours son vrai trafic entrant ; ce sont ses appels sortants (SaaS, autres services) qui sont
 rejoués.
 
-Ce wiki est la documentation d'exploitation. La spécification qui fait foi est
+Ce guide est la documentation d'exploitation. La spécification qui fait foi est
 `docs/SPEC.md` ; en cas d'écart, le comportement décrit ici est celui du code (les écarts
 connus sont signalés dans les pages concernées).
 
@@ -18,7 +20,7 @@ connus sont signalés dans les pages concernées).
 
 mimic est conçu pour les environnements **hors production** : les modes `mock` et
 `mock-partial` sont refusés dans un namespace labellisé `env=production` (voir
-[Basculer en mock](Basculer-en-mock)).
+[Basculer en mock](Basculer-en-mock.md)).
 
 ## Composants en une phrase
 
@@ -31,24 +33,24 @@ mimic est conçu pour les environnements **hors production** : les modes `mock` 
 | `MimicWorkload` | ressource Kubernetes (CRD) qui déclare le mode souhaité d'un workload |
 | `mimicctl` | CLI : bascule, statut, export OpenAPI, rejeu k6, rapport, diff |
 
-## Plan du wiki
+## Plan du guide
 
 | Page | Contenu |
 |------|---------|
-| [Architecture](Architecture) | composants, flux entrant, sortant, contrôleur et snapshots, ports, schéma |
-| [Installer](Installer) | prérequis, ordre d'installation, image, activation de l'injection, vérification, désinstallation |
-| [Configurer](Configurer) | sidecar, annotations, webhook, contrôleur, `mimic-init`, CRD `MimicWorkload` champ par champ |
-| [Modes](Modes) | `passthrough`, `record`, `mock`, `mock-partial` : entrant, sortant, TLS, WebSocket, TCP |
-| [Collecte et stockage](Collecte-et-stockage) | ce qui est capturé, redaction, plafonds, rétention, exemples par endpoint, snapshots, inférence |
-| [Basculer en mock](Basculer-en-mock) | par `mimicctl` ou la CRD, sélection de pods, garde-fou production, alignement, retour |
-| [Métriques](Metriques) | toutes les métriques du sidecar, du contrôleur et du webhook, PromQL utiles |
-| [Alertes et supervision](Alertes-et-supervision) | sondes, signaux de panne et de dégradation, règles `PrometheusRule` et conduite à tenir |
-| [Administration et API](Administration-et-API) | page d'admin du sidecar, interface et API du contrôleur, droits |
-| [Service mesh](Service-mesh) | Istio sidecar, Istio ambient, Linkerd : ce qui change, limites |
-| [CLI mimicctl](CLI-mimicctl) | installation, chaque commande et option, exemples |
-| [Exploiter en production](Exploiter-en-production) | dimensionnement, haute disponibilité, mises à jour, certificats, pannes, sécurité, sauvegarde |
-| [Dépannage](Depannage) | symptômes, diagnostics et messages d'erreur réels |
-| [Tir de charge](Tir-de-charge) | renvoi vers le guide SRE `docs/sre-load-test.md` |
+| [Architecture](Architecture.md) | composants, flux entrant, sortant, contrôleur et snapshots, ports, schéma |
+| [Installer](Installer.md) | prérequis, ordre d'installation, image, activation de l'injection, vérification, désinstallation |
+| [Configurer](Configurer.md) | sidecar, annotations, webhook, contrôleur, `mimic-init`, CRD `MimicWorkload` champ par champ |
+| [Modes](Modes.md) | `passthrough`, `record`, `mock`, `mock-partial` : entrant, sortant, TLS, WebSocket, TCP |
+| [Collecte et stockage](Collecte-et-stockage.md) | ce qui est capturé, redaction, plafonds, rétention, exemples par endpoint, snapshots, inférence |
+| [Basculer en mock](Basculer-en-mock.md) | par `mimicctl` ou la CRD, sélection de pods, garde-fou production, alignement, retour |
+| [Métriques](Metriques.md) | toutes les métriques du sidecar, du contrôleur et du webhook, PromQL utiles |
+| [Alertes et supervision](Alertes-et-supervision.md) | sondes, signaux de panne et de dégradation, règles `PrometheusRule` et conduite à tenir |
+| [Administration et API](Administration-et-API.md) | page d'admin du sidecar, interface et API du contrôleur, droits |
+| [Service mesh](Service-mesh.md) | Istio sidecar, Istio ambient, Linkerd : ce qui change, limites |
+| [CLI mimicctl](CLI-mimicctl.md) | installation, chaque commande et option, exemples |
+| [Exploiter en production](Exploiter-en-production.md) | dimensionnement, haute disponibilité, mises à jour, certificats, pannes, sécurité, sauvegarde |
+| [Dépannage](Depannage.md) | symptômes, diagnostics et messages d'erreur réels |
+| [Tir de charge](Tir-de-charge.md) | `mimicctl load` : palier fixe ou montée jusqu'à saturation, lecture du rapport, dimensionnement CPU et mémoire |
 
 ## Démarrage rapide
 

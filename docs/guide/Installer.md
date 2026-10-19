@@ -1,3 +1,7 @@
+# Installer
+
+[← Sommaire](README.md)
+
 Installation du contrôleur et du webhook (une fois par cluster), puis activation par namespace.
 Les manifests sont dans `deploy/` ; leur rôle est résumé dans `deploy/README.md`.
 
@@ -11,9 +15,9 @@ Les manifests sont dans `deploy/` ; leur rôle est résumé dans `deploy/README.
 | trust-manager | installé avec `app.trust.namespace=mimic-system` (testé en v0.24.0) | publie la CA du contrôleur (ConfigMap `mimic-controller-ca`) dans les namespaces labellisés `mimic.platform.io/enabled=true` |
 | Helm 3 | pour trust-manager | |
 | Capacités | `mimic-init` tourne en root avec `NET_ADMIN` et `NET_RAW` | règles iptables du pod. Le niveau `baseline` des Pod Security Standards n'autorise pas `NET_ADMIN` : les namespaces activés doivent l'admettre |
-| Nœuds | `iptables` nft par défaut ; `iptables-legacy` réglable | voir `iptables` dans la [configuration de l'injecteur](Configurer#webhook-mimic-injector) |
+| Nœuds | `iptables` nft par défaut ; `iptables-legacy` réglable | voir `iptables` dans la [configuration de l'injecteur](Configurer.md#webhook-mimic-injector) |
 | Stockage du contrôleur | PVC (10Gi dans le manifest, `ReadWriteOnce`) ou bucket S3 | segments, snapshots, état souhaité, exemples |
-| Prometheus ou VictoriaMetrics | facultatif | voir [Métriques](Metriques) |
+| Prometheus ou VictoriaMetrics | facultatif | voir [Métriques](Metriques.md) |
 
 Versions vérifiées par la CI (`scripts/e2e-lib.sh`, `docs/e2e-kind.md`) : nœud kind
 `kindest/node:v1.32.2`, cert-manager v1.21.1, trust-manager v0.24.0, Istio 1.30.6,
@@ -79,7 +83,7 @@ leaf=$(kubectl -n mimic-system get secret mimic-controller-tls -o jsonpath='{.da
 ```
 
 Avant d'appliquer `controller.yaml`, choisir le support (voir
-[Exploiter en production](Exploiter-en-production#stockage-du-contrôleur)) :
+[Exploiter en production](Exploiter-en-production.md#stockage-du-contrôleur)) :
 
 | Support | Modification de `controller.yaml` |
 |---------|-----------------------------------|
@@ -104,7 +108,7 @@ ConfigMap `mimic-injector` :
   `10.96.0.1/32`) et toute destination qui ne doit jamais passer par le sidecar :
   `kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}'` ;
 - `iptables: iptables-legacy` si les nœuds sont en iptables legacy ;
-- `sidecar_config` : configuration par défaut des sidecars (voir [Configurer](Configurer)).
+- `sidecar_config` : configuration par défaut des sidecars (voir [Configurer](Configurer.md)).
 
 ```sh
 kubectl apply -f deploy/injector/injector.yaml
@@ -148,7 +152,7 @@ Réglages par pod (annotations du **template** de pod, lues à l'admission) :
 | `mimic.platform.io/config` | nom d'une ConfigMap (clé `mimic.yaml`) montée à la place de la configuration de l'injecteur |
 | `mimic.platform.io/mesh` | `auto`, `none`, `istio`, `istio-ambient`, `linkerd` |
 
-Référence complète : [Configurer](Configurer#annotations-de-pod).
+Référence complète : [Configurer](Configurer.md#annotations-de-pod).
 
 Exemple minimal (`deploy/example/deployment-injected.yaml`) : le template reste celui de
 l'application, avec au plus des annotations. `deploy/example/deployment.yaml` montre ce que le
@@ -178,7 +182,7 @@ mimicctl report checkout -n shop
 La page `http://127.0.0.1:15100/` du sidecar et l'interface du contrôleur
 (`kubectl port-forward -n mimic-system "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081`,
 puis `http://127.0.0.1:8081/`) montrent ensuite les opérations découvertes. Un pod non injecté
-porte un avertissement d'admission `mimic non injecté : <raison>` : voir [Dépannage](Depannage).
+porte un avertissement d'admission `mimic non injecté : <raison>` : voir [Dépannage](Depannage.md).
 
 Pour piloter le workload, créer sa `MimicWorkload` (`deploy/example/mimicworkload.yaml`, ou
 `mimicctl mode checkout record -n shop`).
@@ -210,7 +214,7 @@ kubectl delete -f deploy/controller/namespace.yaml
 ```
 
 - Sauvegarder d'abord le support si les snapshots ou les exemples doivent être gardés (voir
-  [Exploiter en production](Exploiter-en-production#sauvegarde)).
+  [Exploiter en production](Exploiter-en-production.md#sauvegarde)).
 - Les règles iptables vivent dans le namespace réseau du pod : elles disparaissent avec le pod,
   rien n'est à nettoyer sur les nœuds.
 - Un pod encore injecté après le retrait du contrôleur continue de fonctionner dans son dernier

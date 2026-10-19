@@ -192,6 +192,6 @@ jobs:
           \`\`\`
 
           Binaires de \`mimicctl\` ci-dessous, avec leur somme SHA-256. Installation et
-          déploiement : \`docs/wiki/Installer.md\`.
+          déploiement : \`docs/guide/Installer.md\`.
           EOF
           gh release create "$GITHUB_REF_NAME" dist/* --title "mimic $v" --notes-file notes.md --verify-tag

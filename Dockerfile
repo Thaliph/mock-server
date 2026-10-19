@@ -6,6 +6,8 @@ COPY . .
 RUN cargo build --release --locked -p mimic-proxy -p mimic-init -p mimic-controller -p mimic-injector -p mimicctl
 
 FROM debian:bookworm-slim
+LABEL org.opencontainers.image.source="https://github.com/Thaliph/mock-server" \
+      org.opencontainers.image.licenses="Apache-2.0"
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates iptables \
  && rm -rf /var/lib/apt/lists/*

@@ -5,7 +5,8 @@ puis rejoue les réponses des dépendances en mode mock pour lancer des tirs de 
 sans toucher aux services réels.
 
 La spécification complète, les critères d'acceptation et le plan de livraison sont dans
-[docs/SPEC.md](docs/SPEC.md).
+[docs/SPEC.md](docs/SPEC.md). Pour installer, configurer, superviser et exploiter mimic : le
+[guide d'exploitation](docs/guide/README.md).
 
 ## État
 
@@ -80,3 +81,7 @@ Reproduire et lire le test sur kind : [docs/e2e-kind.md](docs/e2e-kind.md).
 
 Les tests portent l'identifiant du critère d'acceptation qu'ils couvrent
 (`inf_01_…`, `red_04_…`), voir la section 11 de la spec.
+
+## Licence
+
+[Apache 2.0](LICENSE).

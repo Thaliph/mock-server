@@ -1,5 +1,9 @@
+# Basculer en mock
+
+[← Sommaire](README.md)
+
 Isoler un workload de ses dépendances, vérifier que tous ses pods servent le même jeu, puis
-revenir. Le comportement de chaque mode est décrit dans [Modes](Modes).
+revenir. Le comportement de chaque mode est décrit dans [Modes](Modes.md).
 
 ## Avant de basculer
 
@@ -64,7 +68,7 @@ basculer ; `mimic-viewer`, agrégé à `view`, pour lire.
 ### Sans contrôleur
 
 Un sidecar sans `share` vers un contrôleur se bascule par son API d'admin (voir
-[Administration et API](Administration-et-API)) :
+[Administration et API](Administration-et-API.md)) :
 
 ```sh
 kubectl -n shop port-forward pod/checkout-7d9f8c6b5-abcde 15100
@@ -126,7 +130,7 @@ kubectl -n shop get mw checkout -o jsonpath='{range .status.conditions[*]}{.type
 
 Côté métriques, pendant le tir : `mimic_mode{mode="mock"} == 1` sur chaque pod,
 `mimic_mock_snapshot_exchanges > 0`, et le ratio de `mimic_mock_responses_total{match="unmatched"}`
-(voir [Métriques](Metriques)).
+(voir [Métriques](Metriques.md)).
 
 ## Basculer une partie des pods
 
@@ -189,7 +193,7 @@ données du moment (identifiant différent si les données ont changé).
   contrôleur.
 - **Contrôleur indisponible pendant un tir.** Les pods gardent leur dernier état ; aucune
   bascule n'est possible tant qu'il n'est pas revenu (voir
-  [Exploiter en production](Exploiter-en-production)).
+  [Exploiter en production](Exploiter-en-production.md)).
 - **`mock-partial` avec snapshot.** Une requête sans correspondance est relayée à chaque fois :
   le moteur ne s'enrichit pas pendant le tir. Les échanges relayés sont publiés et entreront
   dans le prochain snapshot.

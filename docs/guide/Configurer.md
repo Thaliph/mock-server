@@ -1,3 +1,7 @@
+# Configurer
+
+[← Sommaire](README.md)
+
 Référence de configuration de chaque composant, d'après le code
 (`crates/mimic-proxy/src/config.rs`, `crates/mimic-injector/src/{config,inject}.rs`,
 `crates/mimic-init/src/main.rs`, `crates/mimic-controller/src/{config,main,crd}.rs`).
@@ -31,7 +35,7 @@ annotation `mimic.platform.io/config: <nom>`, clé `mimic.yaml`, montée dans `/
 
 | Champ | Défaut | Valeurs, effet |
 |-------|--------|----------------|
-| `mode` | `record` | `passthrough`, `record`, `mock`, `mock-partial` : mode de démarrage (voir [Modes](Modes)). Sous contrôleur, le dernier état souhaité gardé dans `store.dir` l'emporte au démarrage |
+| `mode` | `record` | `passthrough`, `record`, `mock`, `mock-partial` : mode de démarrage (voir [Modes](Modes.md)). Sous contrôleur, le dernier état souhaité gardé dans `store.dir` l'emporte au démarrage |
 | `instance` | `local` | identifiant de l'instance ; en pratique le nom du pod (`POD_NAME`). Caractères permis : lettres, chiffres, `-`, `.`, `_` |
 | `workload.namespace` | vide | namespace du workload (`POD_NAMESPACE`) ; vide, `default` dans les URL du contrôleur |
 | `workload.name` | vide | nom du workload (`MIMIC_WORKLOAD`) ; **obligatoire** si `share` est renseigné |
@@ -49,7 +53,7 @@ annotation `mimic.platform.io/config: <nom>`, clé `mimic.yaml`, montée dans `/
 | `capture.inbound` | `full` | `full`, `metadata` (méthode, chemin, code, durées, tailles ; en mémoire seulement), `off` (métriques seules). Le contrôleur peut l'imposer |
 | `redact.extra_json_paths` | `[]` | chemins JSON supplémentaires à redacter, forme `$.a.b` (sans index de tableau) |
 | `redact.salt` | absent | sel des marques de redaction (`MIMIC_REDACT_SALT`). Absent : sel aléatoire par processus, les marques changent à chaque redémarrage et d'un pod à l'autre |
-| `mock.strategy` | `best` | `best`, `round-robin`, `sequence`, `weighted-status` (voir [Modes](Modes#choix-de-la-réponse)) |
+| `mock.strategy` | `best` | `best`, `round-robin`, `sequence`, `weighted-status` (voir [Modes](Modes.md#choix-de-la-réponse)) |
 | `mock.unmatched` | `error` | `error` : `599` et `x-mimic-unmatched: true` ; `passthrough` : relayée et enregistrée |
 | `mock.latency_factor` | `1.0` | multiplicateur de la latence rejouée, entre 0 et 100 ; `0` : aucune attente |
 | `mock.match_headers` | `[]` | headers discriminants comparés pour choisir la réponse (`accept`, `x-api-version`…) |

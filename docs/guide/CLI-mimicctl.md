@@ -1,3 +1,7 @@
+# CLI mimicctl
+
+[← Sommaire](README.md)
+
 `mimicctl` pilote mimic depuis un poste ou une CI : bascule, statut, export OpenAPI, rejeu,
 rapport et diff d'API. Source : `crates/mimicctl/src/{main,lib}.rs` ; guide d'origine :
 `docs/cli.md`.
@@ -178,5 +182,5 @@ mimicctl diff semaine-derniere.json cette-semaine.json --fail-on-breaking
 | `aucun pod du contrôleur en marche dans mimic-system` | contrôleur arrêté, ou pas de droit `list` sur les pods de `mimic-system` | `kubectl -n mimic-system get pods` |
 | `contrôleur : 503 Service Unavailable réplique passive du contrôleur : …` | bascule de réplique en cours | relancer dans quelques secondes |
 | `contrôleur : 404 Not Found dépendance inconnue` | authority absente des API découvertes | vérifier l'authority exacte (`hôte:port`) dans `/ui/<ns>/<wl>` ou `mimicctl report` |
-| `contrôleur : <code> <body>` | autre réponse du contrôleur | voir [Administration et API](Administration-et-API) |
+| `contrôleur : <code> <body>` | autre réponse du contrôleur | voir [Administration et API](Administration-et-API.md) |
 | `pods du contrôleur: …`, `port-forward vers <pod>: …` | droits `pods` `list` ou `pods/portforward` `create` manquants dans `mimic-system`, API injoignable | `kubectl auth can-i create pods/portforward -n mimic-system` |

@@ -1,3 +1,7 @@
+# Architecture
+
+[← Sommaire](README.md)
+
 ## Vue d'ensemble
 
 ```
@@ -55,7 +59,7 @@ est `mimic-proxy` et l'utilisateur par défaut `1338:1338`.
 
 Ces valeurs sont choisies hors de celles des mesh : Istio utilise l'UID 1337 et les ports
 15000, 15001, 15006, 15008, 15020, 15021, 15053, 15090 ; Linkerd l'UID 2102 et les ports 4140,
-4143, 4190, 4191 (voir [Service mesh](Service-mesh)). Les ports 15100, 15101 et 15106 sont
+4143, 4190, 4191 (voir [Service mesh](Service-mesh.md)). Les ports 15100, 15101 et 15106 sont
 toujours exclus des redirections par `mimic-init`.
 
 ## Flux
@@ -82,7 +86,7 @@ toujours exclus des redirections par `mimic-init`.
    Autre TCP : tunnel opaque.
 3. Les headers propres à la connexion ne sont jamais relayés ; HTTP/2 repart en HTTP/2 (gRPC).
 
-Détail par mode : [Modes](Modes).
+Détail par mode : [Modes](Modes.md).
 
 ### Sidecar ↔ contrôleur
 
@@ -124,7 +128,7 @@ contient que ce que son pod a vu ; le workload entier est vu par le contrôleur.
 
 Le snapshot reste le même tant que le workload ne quitte pas le mock ; `spec.snapshot`
 permet de rejouer un snapshot précis d'un tir à l'autre. Voir
-[Collecte et stockage](Collecte-et-stockage).
+[Collecte et stockage](Collecte-et-stockage.md).
 
 ## Haute disponibilité du contrôleur en bref
 
@@ -132,4 +136,4 @@ Deux réplicas, une seule active, élue par le bail `mimic-system/mimic-controll
 porte le label `mimic.platform.io/leader: "true"`, que le Service sélectionne ; la passive est
 `Ready` mais répond `503` (`Retry-After: 2`) à tout sauf `/healthz` et `/metrics`. Le contrôleur
 n'est jamais dans le chemin des requêtes : s'il tombe, le trafic continue dans le dernier état
-reçu. Détails : [Exploiter en production](Exploiter-en-production).
+reçu. Détails : [Exploiter en production](Exploiter-en-production.md).
