@@ -53,7 +53,7 @@ reissue_if_stale() {
 }
 
 # Les manifests livrés, avec l'image construite pour le test.
-manifest() { sed "s#registry.example.com/platform/mimic:0.1.0#$IMAGE#g" "$@"; }
+manifest() { sed "s#ghcr.io/thaliph/mimic:0.1.0#$IMAGE#g" "$@"; }
 
 # Deux réplicas prêts, dont une seule active : celle qui porte la marque (spec §5.5.4).
 CTL_PODS=app.kubernetes.io/name=mimic-controller
@@ -91,7 +91,11 @@ install_mimic() {
     -f deploy/controller/production-guard.yaml
   retry 60 kubectl apply -f deploy/controller/certificates.yaml
   reissue_if_stale mimic-controller-tls
-  manifest deploy/controller/controller.yaml | kubectl apply -f -
+  # Même raison que pour les sidecars ci-dessous : sur l'unique nœud de kind, trois
+  # réplicas (deux plus celle du rollout) demandant 1Gi chacune laissent trop peu de place.
+  manifest deploy/controller/controller.yaml \
+    | sed 's#requests: {cpu: 100m, memory: 1Gi}#requests: {cpu: 100m, memory: 256Mi}#' \
+    | kubectl apply -f -
   kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
   retry 60 has_leader || fail "aucune réplique active du contrôleur"
   echo "réplique active : $(leader)"
@@ -105,7 +109,8 @@ install_mimic() {
     | sed 's#requests: {cpu: 50m, memory: 64Mi}#requests: {cpu: 10m, memory: 64Mi}#' \
     | kubectl apply -f -
   reissue_if_stale mimic-injector-tls
-  # Le webhook lit son certificat au démarrage : le relancer si sa feuille a été réémise.
+  # Le webhook relit son certificat toutes les 10 s ; relancé si sa feuille a été réémise,
+  # pour ne pas attendre cette relecture.
   [ -z "${REISSUED:-}" ] || kubectl -n mimic-system rollout restart deploy/mimic-injector
   kubectl -n mimic-system rollout status deploy/mimic-injector --timeout=180s
   # Le caBundle est posé par le cainjector : attendre qu'il le soit avant de créer des pods.

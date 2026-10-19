@@ -90,6 +90,22 @@ rules:
     resources: ["namespaces"]
     verbs: ["get"]
 ---
+# `mimicctl export`, `requests` et `report` ouvrent un port-forward vers la réplique active
+# du contrôleur (spec §9.5) : à lier par RoleBinding dans mimic-system aux utilisateurs, par
+# exemple `kubectl -n mimic-system create rolebinding mimic-cli --role=mimic-cli --group=sre`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mimic-cli
+  namespace: mimic-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+---
 # Lecture seule, agrégée au rôle standard `view`.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

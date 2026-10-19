@@ -510,8 +510,8 @@ fn volumes(pod: &Pod, cfg: &InjectorConfig) -> Vec<Volume> {
         },
         Volume {
             name: "mimic-controller-ca".into(),
-            // Pas encore publié par trust-manager : le pod démarre, le sidecar signale le
-            // contrôleur injoignable (spec §9.4).
+            // Pas encore publié par trust-manager : le pod est créé, le sidecar est relancé
+            // jusqu'à ce que le ConfigMap apparaisse dans le volume (spec §9.4).
             config_map: Some(ConfigMapVolumeSource {
                 name: cfg.controller_ca_configmap.clone(),
                 optional: Some(true),

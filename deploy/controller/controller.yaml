@@ -81,15 +81,17 @@ spec:
                   matchLabels: {app.kubernetes.io/name: mimic-controller}
       # Arrêt propre : marque retirée, exemples écrits, bail rendu.
       terminationGracePeriodSeconds: 30
+      priorityClassName: mimic-control-plane
+      # UID 1338 comme le sidecar ; jamais 1337, l'UID d'istio-proxy.
       securityContext:
-        runAsUser: 1337
-        runAsGroup: 1337
-        fsGroup: 1337
+        runAsUser: 1338
+        runAsGroup: 1338
+        fsGroup: 1338
         runAsNonRoot: true
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: controller
-          image: registry.example.com/platform/mimic:0.1.0
+          image: ghcr.io/thaliph/mimic:0.1.0
           command: ["/usr/local/bin/mimic-controller"]
           args: ["--config", "/etc/mimic/controller.yaml"]
           env:
@@ -104,9 +106,11 @@ spec:
           livenessProbe:
             httpGet: {path: /healthz, port: api, scheme: HTTPS}
           # Environ 2 Ko par échange gardé : max_exchanges_total (1 000 000), plus le pic
-          # d'une inférence sur le plus gros workload.
+          # d'une inférence sur le plus gros workload. La demande suit l'usage d'un
+          # contrôleur chargé (quelques centaines de milliers d'échanges, exemples compris),
+          # pour ne pas être le premier évincé sous pression mémoire.
           resources:
-            requests: {cpu: 100m, memory: 256Mi}
+            requests: {cpu: 100m, memory: 1Gi}
             limits: {memory: 4Gi}
           securityContext:
             readOnlyRootFilesystem: true
@@ -150,7 +154,10 @@ spec:
   selector:
     matchLabels: {app.kubernetes.io/name: mimic-controller}
 ---
-# Seuls les pods porteurs d'un sidecar mimic joignent l'API.
+# Seuls les pods porteurs d'un sidecar mimic joignent l'API ; la collecte des métriques
+# (/metrics sur le même port, sans jeton) vient des namespaces labellisés
+# mimic.platform.io/monitoring=true : `kubectl label namespace monitoring
+# mimic.platform.io/monitoring=true` pour celui de Prometheus ou VictoriaMetrics.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -165,5 +172,10 @@ spec:
         - namespaceSelector: {}
           podSelector:
             matchLabels: {mimic.platform.io/sidecar: "true"}
+      ports:
+        - {port: 8443, protocol: TCP}
+    - from:
+        - namespaceSelector:
+            matchLabels: {mimic.platform.io/monitoring: "true"}
       ports:
         - {port: 8443, protocol: TCP}

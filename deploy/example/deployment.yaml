@@ -104,6 +104,7 @@ spec:
                   audience: mimic-controller
                   expirationSeconds: 3600
                   path: token
-        # Facultatif : le pod démarre avant que trust-manager ait publié la CA.
+        # Facultatif : le pod est créé avant que trust-manager ait publié la CA ; le sidecar
+        # est relancé jusqu'à ce qu'elle apparaisse dans le volume.
         - name: mimic-controller-ca
           configMap: {name: mimic-controller-ca, optional: true}

@@ -259,3 +259,65 @@ fn crd_10_schema_restricts_mock_websocket() {
     assert_eq!(values, ["relay", "refuse"]);
     assert_eq!(mimic_controller::crd::MOCK_WEBSOCKETS, ["relay", "refuse"]);
 }
+
+/// Manifests de production du contrôleur (CTL-35) et collecte de ses métriques (CTL-32).
+#[test]
+fn ctl_35_production_manifests() {
+    let manifests = docs(include_str!("../../../deploy/controller/controller.yaml"));
+    let deploy = find(&manifests, "Deployment", "mimic-controller");
+    let pod = &deploy["spec"]["template"]["spec"];
+    assert_eq!(pod["containers"][0]["image"], "ghcr.io/thaliph/mimic:0.1.0");
+    for key in ["runAsUser", "runAsGroup", "fsGroup"] {
+        assert_eq!(pod["securityContext"][key].as_u64(), Some(1338), "{key}");
+    }
+    assert_eq!(pod["priorityClassName"], "mimic-control-plane");
+    let memory = pod["containers"][0]["resources"]["requests"]["memory"]
+        .as_str()
+        .unwrap();
+    let gib = memory
+        .strip_suffix("Gi")
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(gib >= 1, "mémoire demandée : {memory}");
+
+    let rbac = docs(include_str!("../../../deploy/controller/rbac.yaml"));
+    let cli = find(&rbac, "Role", "mimic-cli");
+    assert_eq!(cli["metadata"]["namespace"], "mimic-system");
+    let rules = cli["rules"].as_sequence().unwrap();
+    assert_eq!(rules.len(), 2, "rien d'autre : {rules:?}");
+    let pods = rule_on(cli, "pods").expect("pods");
+    assert_eq!(verbs(pods), ["get", "list"]);
+    let forward = rule_on(cli, "pods/portforward").expect("pods/portforward");
+    assert_eq!(verbs(forward), ["create"]);
+}
+
+#[test]
+fn ctl_32_metrics_are_reachable_by_the_monitoring_namespace() {
+    let manifests = docs(include_str!("../../../deploy/controller/controller.yaml"));
+    let policy = find(&manifests, "NetworkPolicy", "mimic-controller");
+    let ingress = policy["spec"]["ingress"].as_sequence().unwrap();
+    let monitoring = ingress
+        .iter()
+        .find(|rule| {
+            rule["from"].as_sequence().unwrap().iter().any(|f| {
+                f["namespaceSelector"]["matchLabels"]["mimic.platform.io/monitoring"] == "true"
+            })
+        })
+        .expect("entrée depuis le namespace de monitoring");
+    assert_eq!(monitoring["ports"][0]["port"].as_u64(), Some(8443));
+
+    let scrape = docs(include_str!(
+        "../../../deploy/example/vmpodscrape-controller.yaml"
+    ));
+    let controller = scrape
+        .iter()
+        .find(|d| {
+            d["spec"]["selector"]["matchLabels"]["app.kubernetes.io/name"] == "mimic-controller"
+        })
+        .expect("collecte du contrôleur");
+    assert_eq!(controller["metadata"]["namespace"], "mimic-system");
+    let endpoint = &controller["spec"]["podMetricsEndpoints"][0];
+    assert_eq!(endpoint["port"], "api");
+    assert_eq!(endpoint["path"], "/metrics");
+    assert_eq!(endpoint["scheme"], "https");
+}
