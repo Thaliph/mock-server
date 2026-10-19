@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -41,6 +41,16 @@ pub(crate) enum Listener {
     Inbound,
     Outbound,
     Admin,
+}
+
+impl Listener {
+    fn as_str(self) -> &'static str {
+        match self {
+            Listener::Inbound => "inbound",
+            Listener::Outbound => "outbound",
+            Listener::Admin => "admin",
+        }
+    }
 }
 
 /// Sidecar démarré.
@@ -173,6 +183,17 @@ async fn serve(listener: TcpListener, state: Arc<AppState>, kind: Listener) {
     let errors = throttle::LogLimiter::per_second();
     loop {
         let (stream, peer) = throttle::accept_with_backoff(|| listener.accept(), &errors).await;
+        // Plafond de connexions (spec §3.5) : au-delà, la connexion est refermée aussitôt,
+        // sans être lue ; attendre une place pourrait bloquer une requête entrante qui
+        // attend elle-même un appel sortant.
+        let places = match kind {
+            Listener::Admin => &state.admin_connections,
+            Listener::Inbound | Listener::Outbound => &state.connections,
+        };
+        let Ok(place) = places.clone().try_acquire_owned() else {
+            refuse(&state, kind, stream);
+            continue;
+        };
         let _ = stream.set_nodelay(true);
         let info = ConnInfo {
             listen,
@@ -182,6 +203,8 @@ async fn serve(listener: TcpListener, state: Arc<AppState>, kind: Listener) {
         };
         let state = state.clone();
         tokio::spawn(async move {
+            // Place rendue à la fin de la connexion, tunnels et WebSocket compris.
+            let _place = place;
             // Le trafic redirigé par iptables n'est pas forcément HTTP.
             let mut stream = stream;
             if let (Some(dst), Listener::Inbound | Listener::Outbound) = (info.original_dst, kind) {
@@ -217,6 +240,25 @@ async fn serve(listener: TcpListener, state: Arc<AppState>, kind: Listener) {
     }
 }
 
+/// Connexion au-delà du plafond : refermée sans être lue, comptée.
+fn refuse(state: &AppState, kind: Listener, stream: tokio::net::TcpStream) {
+    drop(stream);
+    state
+        .metrics
+        .connections_refused
+        .get_or_create(&metrics::ListenerLabel {
+            listener: kind.as_str(),
+        })
+        .inc();
+    if let Some(omitted) = state.refused_log.allow(std::time::Instant::now()) {
+        tracing::warn!(
+            listener = kind.as_str(),
+            omitted,
+            "plafond de connexions simultanées atteint, connexion refusée"
+        );
+    }
+}
+
 /// Termine le TLS côté application avec un certificat forgé, puis traite le HTTP déchiffré.
 pub(crate) async fn tls_serve<IO>(
     state: Arc<AppState>,
@@ -228,7 +270,26 @@ pub(crate) async fn tls_serve<IO>(
 {
     let Some(tls) = &state.tls else { return };
     let acceptor = tokio_rustls::TlsAcceptor::from(tls.server.clone());
-    match acceptor.accept(io).await {
+    // Poignée de main bornée comme la lecture des en-têtes (spec §3.5).
+    let handshake =
+        tokio::time::timeout(state.config.server.header_read_timeout, acceptor.accept(io));
+    let accepted = match handshake.await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::debug!(%authority, "poignée de main TLS interceptée hors délai");
+            let label = state.metrics.authority(&authority);
+            state
+                .metrics
+                .tls_handshake_failures
+                .get_or_create(&metrics::TlsFailureLabels {
+                    authority: label,
+                    reason: "timeout",
+                })
+                .inc();
+            return;
+        }
+    };
+    match accepted {
         Ok(stream) => {
             info.tls_authority = Some(authority);
             serve_http(TokioIo::new(stream), state, Listener::Outbound, info).await;
@@ -257,6 +318,7 @@ pub(crate) async fn serve_http<IO>(
 ) where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let header_read_timeout = state.config.server.header_read_timeout;
     let svc = service_fn(move |req| {
         let state = state.clone();
         let info = info.clone();
@@ -269,7 +331,11 @@ pub(crate) async fn serve_http<IO>(
             Ok::<_, Infallible>(resp)
         }
     });
-    let _ = auto::Builder::new(TokioExecutor::new())
-        .serve_connection_with_upgrades(io, svc)
-        .await;
+    // Délai de lecture des en-têtes HTTP/1, inactivité keep-alive comprise (spec §3.5).
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    let _ = builder.serve_connection_with_upgrades(io, svc).await;
 }

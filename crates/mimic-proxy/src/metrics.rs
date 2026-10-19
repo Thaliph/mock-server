@@ -87,6 +87,12 @@ pub struct PassthroughLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ListenerLabel {
+    /// `inbound`, `outbound` ou `admin`.
+    pub listener: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TlsFailureLabels {
     pub authority: &'static str,
     pub reason: &'static str,
@@ -135,6 +141,7 @@ pub struct Metrics {
     pub passthrough: Family<PassthroughLabels, Counter>,
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
     pub websocket_connections: Family<WebsocketLabels, Counter>,
+    pub connections_refused: Family<ListenerLabel, Counter>,
     /// Authorities internées : au plus `MAX_AUTHORITIES` chaînes, jamais libérées.
     authorities: RwLock<BTreeSet<&'static str>>,
 }
@@ -176,6 +183,7 @@ impl Metrics {
         let passthrough = Family::default();
         let tls_handshake_failures = Family::default();
         let websocket_connections = Family::default();
+        let connections_refused = Family::default();
         registry.register(
             "mimic_requests",
             "Requêtes traitées par le sidecar",
@@ -257,6 +265,11 @@ impl Metrics {
             "Poignées de main WebSocket : 101 de l'amont relayé, ou refus en mock",
             websocket_connections.clone(),
         );
+        registry.register(
+            "mimic_connections_refused",
+            "Connexions refermées au plafond de connexions simultanées (spec §3.5)",
+            connections_refused.clone(),
+        );
         Self {
             registry,
             requests,
@@ -276,6 +289,7 @@ impl Metrics {
             passthrough,
             tls_handshake_failures,
             websocket_connections,
+            connections_refused,
             authorities: RwLock::new(BTreeSet::new()),
         }
     }

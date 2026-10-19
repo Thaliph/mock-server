@@ -67,7 +67,16 @@ pub struct AppState {
     pub inbound_targets: crate::net::InboundTargets,
     /// Logs d'échec vers l'amont, limités en débit (spec §9.3).
     pub upstream_log: LogLimiter,
+    /// Places de connexion de l'entrant et du sortant ensemble (`server.max_connections`).
+    pub(crate) connections: Arc<tokio::sync::Semaphore>,
+    /// Places de connexion de l'admin, à part : l'application ne prive pas les sondes.
+    pub(crate) admin_connections: Arc<tokio::sync::Semaphore>,
+    /// Logs de refus au plafond de connexions, limités en débit.
+    pub(crate) refused_log: LogLimiter,
 }
+
+/// Plafond fixe des connexions simultanées de l'admin (spec §3.5).
+pub const ADMIN_MAX_CONNECTIONS: usize = 64;
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ShareStatus {
@@ -157,6 +166,7 @@ impl AppState {
             .filter(|s| s.is_controller())
             .map(|s| s.url.clone())
             .unwrap_or_default();
+        let max_connections = config.server.max_connections;
         Ok(Arc::new(Self {
             mode: AtomicU8::new(config.mode.to_u8()),
             inbound_capture: AtomicU8::new(config.capture.inbound as u8),
@@ -178,6 +188,9 @@ impl AppState {
             share_status: Mutex::new(share_status),
             share_notify: tokio::sync::Notify::new(),
             upstream_log: LogLimiter::per_second(),
+            connections: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+            admin_connections: Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONNECTIONS)),
+            refused_log: LogLimiter::per_second(),
             tls,
         }))
     }

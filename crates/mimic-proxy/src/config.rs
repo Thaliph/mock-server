@@ -613,6 +613,12 @@ impl Config {
         if let Some((name, _)) = caps.iter().find(|(_, v)| *v == 0) {
             return Err(format!("{name} doit être positif"));
         }
+        if self.server.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "server.max_connections ne peut dépasser {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            ));
+        }
         if let Some(share) = &self.share {
             if self.workload.name.is_empty() {
                 return Err("share exige un nom de workload (MIMIC_WORKLOAD)".into());
