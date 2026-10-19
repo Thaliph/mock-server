@@ -1,7 +1,7 @@
 //! Logique métier du sidecar mimic, sans I/O : modèle des échanges capturés,
 //! inférence OpenAPI, moteur de mock, redaction des données sensibles, échantillonnage des
 //! bodies, snapshots, rejeu, compaction des segments partagés, conversion OpenAPI 3.0 et
-//! diff de specs, élection de la réplique active du contrôleur.
+//! diff de specs, élection de la réplique active du contrôleur, tir de charge.
 //!
 //! Voir `docs/SPEC.md` pour la spécification et les critères d'acceptation.
 
@@ -11,6 +11,7 @@ pub mod diff;
 pub mod exemplar;
 pub mod infer;
 pub mod lease;
+pub mod load;
 pub mod mock;
 pub mod model;
 pub mod openapi;

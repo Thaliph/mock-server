@@ -46,6 +46,11 @@ Ce que fait mimic pendant le tir :
   version. Toutes les métriques du sidecar portent alors `version="…"`.
 - `k6` sur le poste ou dans un Job, et les droits du rôle `mimic-operator` sur le namespace.
 
+> **Sans k6.** `mimicctl load` rejoue les mêmes requêtes, à concurrence fixe ou en montée
+> jusqu'à saturation, relève CPU et mémoire des pods et recommande une taille : voir
+> [cli.md](cli.md#load--tir-de-charge-et-dimensionnement) et `deploy/load/job.yaml`. La suite de
+> ce guide décrit le parcours avec k6.
+
 ## 1. Préparer le rejeu
 
 ```sh

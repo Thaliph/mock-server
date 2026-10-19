@@ -5,14 +5,14 @@ use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
-use kube::api::{Api, ListParams, Patch, PatchParams};
+use kube::api::{Api, ApiResource, DynamicObject, ListParams, Patch, PatchParams};
 use mimic_controller::crd::MimicWorkload;
 use mimicctl::{
-    ModeOptions, Target, WorkloadData, check_namespace, export_path, operations_path,
+    ModeOptions, Target, WorkloadData, check_namespace, export_path, load, operations_path,
     report_markdown, requests_path, sample_requests_path, status_table, workload_apply_with,
 };
 
-/// Pilote mimic depuis le poste : bascule, statut, export et diff (spec §9.5).
+/// Pilote mimic depuis le poste : bascule, statut, export, diff et tir de charge (spec §9.5).
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -90,6 +90,10 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         top: usize,
     },
+    /// Tir de charge : rejoue les requêtes enregistrées contre le workload isolé, à
+    /// concurrence fixe ou croissante jusqu'à saturation, et recommande CPU et mémoire
+    /// (spec §5.9).
+    Load(Box<LoadArgs>),
     /// Différence entre deux documents OpenAPI (YAML ou JSON).
     Diff {
         old: PathBuf,
@@ -100,6 +104,86 @@ enum Command {
         #[arg(long)]
         fail_on_breaking: bool,
     },
+}
+
+/// Options de `mimicctl load`.
+#[derive(clap::Args)]
+struct LoadArgs {
+    /// Workload : requêtes lues sur le contrôleur, isolement vérifié, CPU et mémoire de
+    /// ses pods relevés. Facultatif avec --from.
+    workload: Option<String>,
+    #[arg(short, long)]
+    namespace: Option<String>,
+    /// URL du service visé : http://hôte[:port][/préfixe].
+    #[arg(long)]
+    target: String,
+    /// Fichier JSONL d'échanges (`mimicctl requests --format jsonl`) au lieu du contrôleur.
+    #[arg(long)]
+    from: Option<PathBuf>,
+    /// Requêtes lues sur le contrôleur.
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+    /// Header ajouté ou remplacé (`nom: valeur`), répétable.
+    #[arg(long = "header", short = 'H')]
+    headers: Vec<String>,
+    /// HTTP/2 sans TLS (gRPC).
+    #[arg(long)]
+    http2: bool,
+    /// Concurrence du palier fixe.
+    #[arg(long, default_value_t = 8, conflicts_with = "ramp")]
+    concurrency: u32,
+    /// Nombre exact de requêtes du palier fixe.
+    #[arg(long, conflicts_with_all = ["duration", "ramp"])]
+    requests: Option<u64>,
+    /// Durée du palier fixe.
+    #[arg(long, default_value = "60s", conflicts_with = "ramp")]
+    duration: String,
+    /// Montée par paliers jusqu'à saturation.
+    #[arg(long)]
+    ramp: bool,
+    /// Concurrence du premier palier de la montée.
+    #[arg(long, default_value_t = 1, requires = "ramp")]
+    start: u32,
+    /// Facteur de concurrence d'un palier au suivant (> 1).
+    #[arg(long, default_value_t = 2.0, requires = "ramp")]
+    factor: f64,
+    /// Concurrence du dernier palier.
+    #[arg(long, default_value_t = 256, requires = "ramp")]
+    max: u32,
+    /// Durée de chaque palier de la montée.
+    #[arg(long, default_value = "60s", requires = "ramp")]
+    step_duration: String,
+    /// Taux d'erreur au-delà duquel un palier est saturé (0.01 ou 1%).
+    #[arg(long, default_value = "1%")]
+    max_error_rate: String,
+    /// p99 au-delà duquel un palier est saturé (500ms, 2s).
+    #[arg(long)]
+    max_p99: Option<String>,
+    /// Hausse de débit minimale, en part de la hausse de concurrence (10% : +10 % de
+    /// débit pour une concurrence doublée).
+    #[arg(long, default_value = "10%")]
+    plateau: String,
+    /// Délai d'une requête, réponse complète comprise.
+    #[arg(long, default_value = "10s")]
+    timeout: String,
+    /// Intervalle des relevés de metrics.k8s.io.
+    #[arg(long, default_value = "15s")]
+    sample_interval: String,
+    /// Marge ajoutée au CPU moyen mesuré pour `requests.cpu`.
+    #[arg(long, default_value = "30%")]
+    cpu_headroom: String,
+    /// Marge ajoutée à la mémoire maximale mesurée pour `requests.memory`.
+    #[arg(long, default_value = "20%")]
+    memory_headroom: String,
+    /// Pods dont relever CPU et mémoire (`clé=valeur[,…]`), au lieu de ceux du contrôleur.
+    #[arg(long)]
+    pod_selector: Option<String>,
+    /// Format du rapport sur la sortie standard.
+    #[arg(long, default_value = "text", value_parser = ["text", "markdown", "json"])]
+    format: String,
+    /// Tire même si le workload n'est pas en mock, pods alignés.
+    #[arg(long)]
+    allow_live_dependencies: bool,
 }
 
 const CONTROLLER_NAMESPACE: &str = "mimic-system";
@@ -274,6 +358,158 @@ async fn run(command: Command) -> Result<i32, String> {
             print!("{}", report_markdown(&workloads, top));
             Ok(0)
         }
+        Command::Load(args) => {
+            let LoadArgs {
+                workload,
+                namespace: ns,
+                target,
+                from,
+                limit,
+                headers,
+                http2,
+                concurrency,
+                requests,
+                duration,
+                ramp,
+                start,
+                factor,
+                max,
+                step_duration,
+                max_error_rate,
+                max_p99,
+                plateau,
+                timeout,
+                sample_interval,
+                cpu_headroom,
+                memory_headroom,
+                pod_selector,
+                format,
+                allow_live_dependencies,
+            } = *args;
+            // Validation avant toute connexion au cluster.
+            let target = load::Target::parse(&target, http2)?;
+            let extra = headers
+                .iter()
+                .map(|h| mimic_core::load::parse_header(h))
+                .collect::<Result<Vec<_>, _>>()?;
+            let plan = if ramp {
+                load::Plan::Ramp {
+                    steps: mimic_core::load::ramp(start, factor, max)?,
+                    step_duration: load::parse_duration(&step_duration)?,
+                }
+            } else {
+                if concurrency == 0 {
+                    return Err("--concurrency : au moins 1".into());
+                }
+                let stop = match requests {
+                    Some(0) => return Err("--requests : au moins 1".into()),
+                    Some(n) => load::Stop::Requests(n),
+                    None => load::Stop::Duration(load::parse_duration(&duration)?),
+                };
+                load::Plan::Fixed { concurrency, stop }
+            };
+            let criteria = mimic_core::load::Criteria {
+                max_error_rate: load::parse_ratio(&max_error_rate)?,
+                max_p99_us: max_p99
+                    .as_deref()
+                    .map(load::parse_duration)
+                    .transpose()?
+                    .map(|d| d.as_micros() as u64),
+                plateau: load::parse_ratio(&plateau)?,
+            };
+            let (cpu_headroom, memory_headroom) = (
+                load::parse_ratio(&cpu_headroom)?,
+                load::parse_ratio(&memory_headroom)?,
+            );
+            let pod_selector = pod_selector
+                .as_deref()
+                .map(|s| mimicctl::parse_selector(s).map(|_| s.to_string()))
+                .transpose()?;
+            if workload.is_none() && from.is_none() {
+                return Err("un workload ou --from requis".into());
+            }
+            let mut notes = vec![];
+            let mut exchanges = vec![];
+            if let Some(path) = &from {
+                exchanges = read_exchanges(path)?;
+            }
+            let mut sampler = None;
+            if let Some(name) = &workload {
+                let client = client().await?;
+                let ns = namespace(ns, &client).await;
+                let known = controller_json(client.clone(), "/v1/workloads").await?;
+                let w = known
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|w| w["namespace"] == ns.as_str() && w["name"] == name.as_str())
+                    .cloned()
+                    .ok_or_else(|| format!("{ns}/{name} inconnu du contrôleur"))?;
+                match load::isolation(&w) {
+                    Ok(()) => {}
+                    Err(e) if allow_live_dependencies => {
+                        notes.push(format!(
+                            "isolement non vérifié (--allow-live-dependencies) : {e}"
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("mimicctl: {ns}/{name} : {e}");
+                        return Ok(2);
+                    }
+                }
+                if from.is_none() {
+                    let path = requests_path(&ns, name, "jsonl", limit);
+                    let body = controller_get(client.clone(), &path).await?;
+                    exchanges = parse_exchanges(&String::from_utf8_lossy(&body))?;
+                }
+                let pods = load::selected_pods(&w);
+                sampler = Some(metrics_sampler(client, ns, pod_selector, pods));
+            } else {
+                notes.push(
+                    "sans workload : isolement des dépendances non vérifié, CPU et mémoire non relevés"
+                        .into(),
+                );
+            }
+            let corpus = mimic_core::load::Corpus::new(&exchanges, &extra);
+            if corpus.is_empty() {
+                return Err("aucune requête entrante enregistrée à rejouer".into());
+            }
+            let opts = load::Options {
+                timeout: load::parse_duration(&timeout)?,
+                criteria: criteria.clone(),
+                sample_interval: load::parse_duration(&sample_interval)?,
+                sampler,
+                progress: true,
+            };
+            let target_text = format!(
+                "http://{}{}{}",
+                target.authority,
+                target.prefix,
+                if http2 { " (HTTP/2)" } else { "" }
+            );
+            let (len, discarded) = (corpus.len(), corpus.truncated());
+            let out = load::run(std::sync::Arc::new(corpus), &target, &plan, &opts).await;
+            notes.extend(out.notes);
+            let report = mimic_core::load::Report::new(
+                &target_text,
+                len,
+                discarded,
+                out.steps,
+                &criteria,
+                cpu_headroom,
+                memory_headroom,
+                notes,
+            );
+            match format.as_str() {
+                "json" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                ),
+                "markdown" => print!("{}", mimic_core::load::render_markdown(&report)),
+                _ => print!("{}", mimic_core::load::render_text(&report)),
+            }
+            Ok(0)
+        }
         Command::Diff {
             old,
             new,
@@ -341,6 +577,59 @@ fn write_doc(doc: &serde_json::Value, output: Option<&Path>) -> Result<(), Strin
             Ok(())
         }
     }
+}
+
+/// Échanges d'un fichier JSONL (`mimicctl requests --format jsonl`).
+fn read_exchanges(path: &Path) -> Result<Vec<mimic_core::model::Exchange>, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("lecture de {}: {e}", path.display()))?;
+    parse_exchanges(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_exchanges(text: &str) -> Result<Vec<mimic_core::model::Exchange>, String> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .map(|(i, l)| serde_json::from_str(l).map_err(|e| format!("ligne {}: {e}", i + 1)))
+        .collect()
+}
+
+/// Relevés `metrics.k8s.io` des pods du workload : ceux de `selector`, sinon ceux que le
+/// contrôleur connaît.
+fn metrics_sampler(
+    client: kube::Client,
+    ns: String,
+    selector: Option<String>,
+    pods: Vec<String>,
+) -> load::Sampler {
+    let resource = ApiResource {
+        group: "metrics.k8s.io".into(),
+        version: "v1beta1".into(),
+        api_version: "metrics.k8s.io/v1beta1".into(),
+        kind: "PodMetrics".into(),
+        plural: "pods".into(),
+    };
+    std::sync::Arc::new(move || {
+        let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), &ns, &resource);
+        let (selector, pods) = (selector.clone(), pods.clone());
+        Box::pin(async move {
+            let params = match &selector {
+                Some(s) => ListParams::default().labels(s),
+                None => ListParams::default(),
+            };
+            let list = api
+                .list(&params)
+                .await
+                .map_err(|e| format!("metrics.k8s.io: {e}"))?;
+            Ok(list
+                .items
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .filter_map(|m| load::pod_usage(&m))
+                .filter(|(pod, _)| selector.is_some() || pods.contains(pod))
+                .collect())
+        })
+    })
 }
 
 async fn controller_json(client: kube::Client, path: &str) -> Result<serde_json::Value, String> {
