@@ -1,6 +1,7 @@
 # Exemple d'application avec le sidecar mimic injecté à la main, pour voir ce qu'ajoute
 # le webhook d'injection (deploy/injector/, voir deployment-injected.yaml). Kubernetes >= 1.29 pour les native sidecars.
-# Le namespace porte le label mimic.platform.io/enabled=true (CA publiée par trust-manager).
+# Le namespace porte le label mimic.platform.io/enabled=true (CA publiée par trust-manager)
+# et autorise NET_ADMIN pour mimic-init (Pod Security `privileged`, voir deploy/README.md).
 # Bascule : ressource MimicWorkload (example/mimicworkload.yaml), jamais ce template.
 apiVersion: apps/v1
 kind: Deployment
@@ -20,23 +21,32 @@ spec:
     spec:
       initContainers:
         - name: mimic-init
-          image: registry.example.com/platform/mimic:0.1.0
+          image: ghcr.io/thaliph/mimic:0.1.0
           command: ["/usr/local/bin/mimic-init"]
           env:
             - name: MIMIC_INBOUND_PORTS
               value: "8080"
-            # API Kubernetes et autres destinations qui ne doivent pas transiter par mimic.
+            # API Kubernetes et autres destinations qui ne doivent pas transiter par mimic :
+            # l'IP du Service kubernetes (`kubectl get svc kubernetes -n default`), que le
+            # webhook ajoute d'office ; 10.96.0.1 sous kind et kubeadm.
             - name: MIMIC_EXCLUDE_OUTBOUND_CIDRS
               value: "10.96.0.1/32"
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+          # Root avec NET_ADMIN et NET_RAW seules ; allowPrivilegeEscalation: false ne les
+          # retire pas.
           securityContext:
             runAsUser: 0
             runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            seccompProfile: {type: RuntimeDefault}
             capabilities:
               drop: ["ALL"]
               add: ["NET_ADMIN", "NET_RAW"]
         # Native sidecar : démarre avant l'application et s'arrête après elle.
         - name: mimic
-          image: registry.example.com/platform/mimic:0.1.0
+          image: ghcr.io/thaliph/mimic:0.1.0
           restartPolicy: Always
           args: ["--config", "/etc/mimic/mimic.yaml"]
           env:
@@ -69,6 +79,7 @@ spec:
             runAsNonRoot: true
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
+            seccompProfile: {type: RuntimeDefault}
             capabilities: {drop: ["ALL"]}
           volumeMounts:
             - {name: mimic-config, mountPath: /etc/mimic}
@@ -93,5 +104,6 @@ spec:
                   audience: mimic-controller
                   expirationSeconds: 3600
                   path: token
+        # Facultatif : le pod démarre avant que trust-manager ait publié la CA.
         - name: mimic-controller-ca
-          configMap: {name: mimic-controller-ca}
+          configMap: {name: mimic-controller-ca, optional: true}

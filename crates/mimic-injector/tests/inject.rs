@@ -8,7 +8,7 @@ use serde_json::json;
 fn config() -> InjectorConfig {
     serde_yaml::from_str(
         r#"
-image: registry.example.com/platform/mimic:0.1.0
+image: ghcr.io/thaliph/mimic:0.1.0
 exclude_outbound_cidrs: [10.96.0.1/32]
 sidecar_config: |
   mode: record
@@ -101,7 +101,7 @@ fn inj_01_pod_receives_init_container_and_native_sidecar() {
     assert_eq!(sidecar.restart_policy.as_deref(), Some("Always"));
     assert_eq!(
         sidecar.image.as_deref(),
-        Some("registry.example.com/platform/mimic:0.1.0")
+        Some("ghcr.io/thaliph/mimic:0.1.0")
     );
     let sc = sidecar.security_context.as_ref().unwrap();
     assert_eq!(sc.run_as_user, Some(1338));

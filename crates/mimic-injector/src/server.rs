@@ -20,7 +20,7 @@ use prometheus_client::registry::Registry;
 use tokio::net::TcpListener;
 
 use crate::config::InjectorConfig;
-use crate::inject::{Outcome, mesh_warning, mutate};
+use crate::inject::{Outcome, mutate, warnings};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct ResultLabel {
@@ -61,7 +61,8 @@ pub fn review(
             };
             match resp.clone().with_patch(json_patch::diff(&before, &after)) {
                 Ok(mut r) => {
-                    r.warnings = mesh_warning(pod).map(|w| vec![w]);
+                    let w = warnings(pod);
+                    r.warnings = (!w.is_empty()).then_some(w);
                     ("injected", r.into_review())
                 }
                 Err(e) => {
