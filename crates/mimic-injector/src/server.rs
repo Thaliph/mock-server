@@ -8,20 +8,18 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::service::TowerToHyperService;
 use k8s_openapi::api::core::v1::Pod;
 use kube::core::DynamicObject;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview};
+use mimic_net::serve::{ServeOptions, serve};
+use mimic_net::tls::Tls;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 
-use crate::config::{InjectorConfig, TlsFiles};
+use crate::config::InjectorConfig;
 use crate::inject::{Outcome, mesh_warning, mutate};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -133,6 +131,7 @@ pub fn router(config: InjectorConfig) -> Router {
 pub struct Running {
     pub addr: std::net::SocketAddr,
     task: tokio::task::JoinHandle<()>,
+    stop: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Running {
@@ -140,72 +139,33 @@ impl Running {
         let _ = self.task.await;
     }
 
+    /// Arrêt brutal (tests) : les connexions sont coupées.
     pub fn shutdown(self) {
         self.task.abort();
+    }
+
+    /// Arrêt propre (`SIGTERM`) : l'écoute cesse, les admissions en cours finissent.
+    pub async fn stop(self) {
+        let _ = self.stop.send(());
+        let _ = self.task.await;
     }
 }
 
 pub async fn start(config: InjectorConfig) -> Result<Running, String> {
-    let tls = config.tls.as_ref().map(tls_acceptor).transpose()?;
+    let tls = config
+        .tls
+        .as_ref()
+        .map(|files| Tls::new(files, &[]))
+        .transpose()?;
     let listener = TcpListener::bind(config.listen)
         .await
         .map_err(|e| format!("écoute sur {}: {e}", config.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let app = router(config);
     tracing::info!(%addr, tls = tls.is_some(), "webhook d'injection démarré");
-    Ok(Running {
-        addr,
-        task: tokio::spawn(serve(listener, app, tls)),
-    })
-}
-
-async fn serve(listener: TcpListener, router: Router, tls: Option<tokio_rustls::TlsAcceptor>) {
-    let mut connections = tokio::task::JoinSet::new();
-    loop {
-        let accepted = tokio::select! {
-            a = listener.accept() => a,
-            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
-        };
-        let Ok((stream, _)) = accepted else {
-            continue;
-        };
-        let service = TowerToHyperService::new(router.clone());
-        let tls = tls.clone();
-        connections.spawn(async move {
-            let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-            let result = match tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(s) => builder.serve_connection(TokioIo::new(s), service).await,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "poignée de main TLS refusée");
-                        return;
-                    }
-                },
-                None => {
-                    builder
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                }
-            };
-            if let Err(e) = result {
-                tracing::debug!(error = %e, "connexion terminée");
-            }
-        });
-    }
-}
-
-fn tls_acceptor(files: &TlsFiles) -> Result<tokio_rustls::TlsAcceptor, String> {
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&files.cert_file)
-        .and_then(|it| it.collect())
-        .map_err(|e| format!("certificat {}: {e}", files.cert_file.display()))?;
-    let key = PrivateKeyDer::from_pem_file(&files.key_file)
-        .map_err(|e| format!("clé {}: {e}", files.key_file.display()))?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let server = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("certificat du webhook: {e}"))?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server)))
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(serve(listener, app, tls, ServeOptions::default(), async {
+        let _ = stopped.await;
+    }));
+    Ok(Running { addr, task, stop })
 }

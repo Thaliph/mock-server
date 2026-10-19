@@ -1,9 +1,9 @@
 //! Configuration du webhook (`mimic-injector --config`, spec §9.4).
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use k8s_openapi::api::core::v1::ResourceRequirements;
+pub use mimic_net::tls::TlsFiles;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,13 +37,6 @@ pub struct InjectorConfig {
     /// Label du pod repris dans `MIMIC_VERSION`, label `version` des métriques (spec §9.3).
     #[serde(default = "default_version_label")]
     pub version_label: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TlsFiles {
-    pub cert_file: PathBuf,
-    pub key_file: PathBuf,
 }
 
 fn default_listen() -> SocketAddr {
