@@ -17,16 +17,13 @@ pub mod ui;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::service::TowerToHyperService;
+use mimic_net::serve::{ServeOptions, serve};
+use mimic_net::tls::Tls;
 use object_store::ObjectStore;
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 
 use crate::auth::{Authenticator, KubeAuth};
-use crate::config::{AuthConfig, ControllerConfig, TlsFiles};
+use crate::config::{AuthConfig, ControllerConfig};
 use crate::leader::{Coordination, Election, Role};
 use crate::reconcile::MimicWorkloadSpec;
 use crate::state::Ctl;
@@ -183,7 +180,7 @@ async fn launch(
         }
     };
     let tls = match &config.tls {
-        Some(files) => Some(tls_acceptor(files)?),
+        Some(files) => Some(Tls::new(files, &[b"h2", b"http/1.1"])?),
         None => None,
     };
     let election = match &config.leader_election {
@@ -222,9 +219,22 @@ async fn launch(
         .map_err(|e| format!("écoute sur {}: {e}", ctl.config.ui_listen))?;
     let api = api_listener.local_addr().map_err(|e| e.to_string())?;
     let ui = ui_listener.local_addr().map_err(|e| e.to_string())?;
+    // Les serveurs s'arrêtent avec leurs tâches (`shutdown`, `kill`).
     let mut tasks = vec![
-        tokio::spawn(serve(api_listener, api::router(ctl.clone()), tls)),
-        tokio::spawn(serve(ui_listener, ui::router(ctl.clone()), None)),
+        tokio::spawn(serve(
+            api_listener,
+            api::router(ctl.clone()),
+            tls,
+            ServeOptions::default(),
+            std::future::pending(),
+        )),
+        tokio::spawn(serve(
+            ui_listener,
+            ui::router(ctl.clone()),
+            None,
+            ServeOptions::default(),
+            std::future::pending(),
+        )),
     ];
     match &election {
         // La passive n'a ni maintenance ni surveillance : la prise de relais les lance.
@@ -264,60 +274,6 @@ pub(crate) async fn maintenance(ctl: Arc<Ctl>) {
         tokio::time::sleep(MAINTENANCE_INTERVAL).await;
         ctl.maintain().await;
     }
-}
-
-async fn serve(listener: TcpListener, router: Router, tls: Option<tokio_rustls::TlsAcceptor>) {
-    // Les connexions appartiennent à cette tâche : l'arrêter les ferme aussi.
-    let mut connections = tokio::task::JoinSet::new();
-    loop {
-        let accepted = tokio::select! {
-            a = listener.accept() => a,
-            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
-        };
-        let Ok((stream, _)) = accepted else {
-            continue;
-        };
-        let _ = stream.set_nodelay(true);
-        let service = TowerToHyperService::new(router.clone());
-        let tls = tls.clone();
-        connections.spawn(async move {
-            let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-            let result = match tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(s) => builder.serve_connection(TokioIo::new(s), service).await,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "poignée de main TLS refusée");
-                        return;
-                    }
-                },
-                None => {
-                    builder
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await
-                }
-            };
-            if let Err(e) = result {
-                tracing::debug!(error = %e, "connexion terminée");
-            }
-        });
-    }
-}
-
-fn tls_acceptor(files: &TlsFiles) -> Result<tokio_rustls::TlsAcceptor, String> {
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&files.cert_file)
-        .and_then(|it| it.collect())
-        .map_err(|e| format!("certificat {}: {e}", files.cert_file.display()))?;
-    let key = PrivateKeyDer::from_pem_file(&files.key_file)
-        .map_err(|e| format!("clé {}: {e}", files.key_file.display()))?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut server = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("certificat du contrôleur: {e}"))?;
-    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server)))
 }
 
 fn open(url: &str) -> Result<Arc<dyn ObjectStore>, String> {

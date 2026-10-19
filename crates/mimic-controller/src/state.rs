@@ -16,7 +16,7 @@
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -268,7 +268,7 @@ impl Data {
     fn propose(&mut self, list: Vec<Arc<Exchange>>, room: &Room, restore: bool) -> Refused {
         let x = &mut self.exemplars;
         let (version, refused, refused_bytes) = (x.version(), x.refused(), x.refused_bytes());
-        let mut used = room.used.lock().expect("verrou de la place des exemples");
+        let mut used = room.used.lock().unwrap_or_else(PoisonError::into_inner);
         for e in list {
             let (before, left) = (x.bytes(), room.max.saturating_sub(*used));
             if restore {
@@ -456,8 +456,12 @@ struct DiscoveryCache {
 pub struct Entry {
     pub namespace: String,
     pub name: String,
-    /// État souhaité relu du support au premier accès.
+    /// État souhaité relu du support au premier accès ; une erreur du support n'initialise
+    /// rien et la lecture est retentée à l'accès suivant.
     desired_loaded: OnceCell<()>,
+    /// Ressource reçue pendant que l'état souhaité était illisible : réappliquée à la
+    /// prochaine passe de maintenance (spec §9.2b).
+    reapply: AtomicBool,
     live: Mutex<Live>,
     /// Index construit par une seule liste du support.
     indexed: OnceCell<()>,
@@ -476,19 +480,21 @@ pub struct Entry {
 
 impl Entry {
     fn live(&self) -> MutexGuard<'_, Live> {
-        self.live.lock().expect("verrou de l'état du workload")
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn index(&self) -> MutexGuard<'_, SegmentIndex> {
-        self.index.lock().expect("verrou de l'index des segments")
+        self.index.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn data(&self) -> MutexGuard<'_, Data> {
-        self.data.lock().expect("verrou des échanges")
+        self.data.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn discovery(&self) -> MutexGuard<'_, DiscoveryCache> {
-        self.discovery.lock().expect("verrou de la découverte")
+        self.discovery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn base(&self) -> String {
@@ -623,7 +629,10 @@ impl Ctl {
     pub async fn warm_up(&self) {
         let keys = self.workload_keys().await;
         for (ns, wl) in &keys {
-            let e = self.ready(ns, wl).await;
+            // Erreur journalisée par `ready` ; l'état souhaité sera relu au premier appel.
+            let Ok(e) = self.ready(ns, wl).await else {
+                continue;
+            };
             if let Err(err) = self.index_of(&e).await {
                 tracing::warn!(namespace = %ns, workload = %wl, error = %err, "index des segments");
             }
@@ -639,7 +648,7 @@ impl Ctl {
     pub fn is_production(&self, ns: &str) -> bool {
         self.production
             .lock()
-            .expect("verrou des namespaces")
+            .unwrap_or_else(PoisonError::into_inner)
             .contains(ns)
     }
 
@@ -648,7 +657,10 @@ impl Ctl {
     pub async fn set_namespace_labels(&self, ns: &str, labels: &BTreeMap<String, String>) {
         let production = is_production(labels);
         let changed = {
-            let mut set = self.production.lock().expect("verrou des namespaces");
+            let mut set = self
+                .production
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if production {
                 set.insert(ns.to_string())
             } else {
@@ -676,13 +688,17 @@ impl Ctl {
     }
 
     fn entry(&self, ns: &str, wl: &str) -> Arc<Entry> {
-        let mut map = self.workloads.lock().expect("verrou des workloads");
+        let mut map = self
+            .workloads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         map.entry((ns.to_string(), wl.to_string()))
             .or_insert_with(|| {
                 Arc::new(Entry {
                     namespace: ns.into(),
                     name: wl.into(),
                     desired_loaded: OnceCell::new(),
+                    reapply: AtomicBool::new(false),
                     live: Mutex::new(Live::default()),
                     indexed: OnceCell::new(),
                     index: Mutex::new(SegmentIndex::default()),
@@ -704,7 +720,7 @@ impl Ctl {
     fn entries(&self) -> Vec<Arc<Entry>> {
         self.workloads
             .lock()
-            .expect("verrou des workloads")
+            .unwrap_or_else(PoisonError::into_inner)
             .values()
             .cloned()
             .collect()
@@ -715,28 +731,48 @@ impl Ctl {
         now_ms().saturating_sub(self.config.retention.as_millis() as u64) as i64
     }
 
-    /// Workload dont l'état souhaité a été relu du support.
-    async fn ready(&self, ns: &str, wl: &str) -> Arc<Entry> {
+    /// Workload dont l'état souhaité a été relu du support. Absent ou illisible : état
+    /// vide. Erreur du support : rien n'est retenu, l'appel suivant relit (spec §9.2b).
+    async fn ready(&self, ns: &str, wl: &str) -> Result<Arc<Entry>, String> {
         let e = self.entry(ns, wl);
         e.desired_loaded
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let path = Path::from(format!("{}/desired.json", base(ns, wl)));
-                if let Ok(r) = self.store.get(&path).await
-                    && let Ok(bytes) = r.bytes().await
-                    && let Ok(d) = serde_json::from_slice::<Desired>(&bytes)
-                {
-                    e.live().desired = d;
+                let bytes = match self.store.get(&path).await {
+                    Ok(r) => r.bytes().await,
+                    Err(err) => Err(err),
+                };
+                match bytes {
+                    Ok(bytes) => match serde_json::from_slice::<Desired>(&bytes) {
+                        Ok(d) => e.live().desired = d,
+                        // Le relire ne le réparerait pas : état vide, signalé.
+                        Err(err) => {
+                            tracing::error!(namespace = ns, workload = wl, error = %err, "desired.json illisible : état souhaité vide");
+                        }
+                    },
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(err) => {
+                        tracing::warn!(namespace = ns, workload = wl, error = %err, "lecture de l'état souhaité, retentée au prochain appel");
+                        return Err(format!("lecture de {path}: {err}"));
+                    }
                 }
+                Ok(())
             })
-            .await;
-        e
+            .await?;
+        Ok(e)
     }
 
     /// Lecture de l'état court d'un workload ; le verrou n'est tenu que pendant `f`.
-    pub async fn with_live<R>(&self, ns: &str, wl: &str, f: impl FnOnce(&Live) -> R) -> R {
-        let e = self.ready(ns, wl).await;
+    /// Erreur si l'état souhaité n'a pas pu être relu du support.
+    pub async fn with_live<R>(
+        &self,
+        ns: &str,
+        wl: &str,
+        f: impl FnOnce(&Live) -> R,
+    ) -> Result<R, String> {
+        let e = self.ready(ns, wl).await?;
         let live = e.live();
-        f(&live)
+        Ok(f(&live))
     }
 
     /// Échanges en mémoire d'un workload.
@@ -775,7 +811,7 @@ impl Ctl {
         }
         self.workloads
             .lock()
-            .expect("verrou des workloads")
+            .unwrap_or_else(PoisonError::into_inner)
             .keys()
             .cloned()
             .collect()
@@ -1062,8 +1098,8 @@ impl Ctl {
         instance: &str,
         report: PodReport,
         labels: BTreeMap<String, String>,
-    ) -> Desired {
-        let e = self.ready(ns, wl).await;
+    ) -> Result<Desired, String> {
+        let e = self.ready(ns, wl).await?;
         let now = now_ms();
         let production = self.is_production(ns);
         let mut live = e.live();
@@ -1086,7 +1122,7 @@ impl Ctl {
                 labels,
             },
         );
-        desired
+        Ok(desired)
     }
 
     fn forget_pods(&self, live: &mut Live, now: u64) {
@@ -1212,7 +1248,22 @@ impl Ctl {
         spec: Option<MimicWorkloadSpec>,
         generation: Option<i64>,
     ) {
-        let e = self.ready(ns, wl).await;
+        let e = match self.ready(ns, wl).await {
+            Ok(e) => {
+                e.reapply.store(false, Ordering::SeqCst);
+                e
+            }
+            Err(err) => {
+                // Gardée pour la passe de maintenance, qui la réappliquera.
+                tracing::warn!(namespace = ns, workload = wl, error = %err, "ressource réappliquée à la prochaine maintenance");
+                let e = self.entry(ns, wl);
+                let mut live = e.live();
+                live.spec = spec;
+                live.generation = generation;
+                e.reapply.store(true, Ordering::SeqCst);
+                return;
+            }
+        };
         let current = {
             let mut live = e.live();
             live.spec = spec.clone();
@@ -1393,7 +1444,9 @@ impl Ctl {
         let mut counts: BTreeMap<&'static str, i64> =
             [("aligned", 0), ("diverging", 0), ("absent", 0)].into();
         for (ns, wl) in keys {
-            let states = self.with_live(&ns, &wl, |l| self.pod_states(l)).await;
+            let Ok(states) = self.with_live(&ns, &wl, |l| self.pod_states(l)).await else {
+                continue;
+            };
             for (_, s, _) in states {
                 *counts.entry(s.as_str()).or_default() += 1;
             }
@@ -1416,6 +1469,14 @@ impl Ctl {
         let now = now_ms();
         self.workload_keys().await;
         for e in self.entries() {
+            if e.reapply.load(Ordering::SeqCst) {
+                let (spec, generation) = {
+                    let live = e.live();
+                    (live.spec.clone(), live.generation)
+                };
+                self.apply_spec(&e.namespace, &e.name, spec, generation)
+                    .await;
+            }
             self.forget_pods(&mut e.live(), now);
             if let Err(err) = self.index_of(&e).await {
                 tracing::warn!(namespace = %e.namespace, workload = %e.name, error = %err, "index des segments");

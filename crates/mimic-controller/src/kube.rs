@@ -2,7 +2,7 @@
 //! tient le bail de la réplique active et sa marque (spec §5.5.4).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -109,7 +109,9 @@ pub async fn publish_status(ctl: Arc<Ctl>, client: kube::Client) {
                     w.spec.as_ref()?;
                     Some(status_of(&w.desired, &ctl.summary(w), w.generation))
                 })
-                .await;
+                .await
+                .ok()
+                .flatten();
             let Some(status) = status else {
                 continue;
             };
@@ -154,7 +156,9 @@ impl KubeLease {
     }
 
     fn last_holder(&self) -> std::sync::MutexGuard<'_, Option<String>> {
-        self.last_holder.lock().expect("verrou du bail")
+        self.last_holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Pose (ou retire) la marque de la réplique active sur un pod.

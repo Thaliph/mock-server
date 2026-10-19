@@ -2,3 +2,15 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: mimic-system
+---
+# Priorité du webhook et du contrôleur : au-dessus des workloads (priorité 0 par défaut),
+# pour ne pas être évincés ni attendre derrière eux, mais sous les classes system-* :
+# mimic n'est pas nécessaire au fonctionnement du cluster, et system-cluster-critical est
+# refusé hors de kube-system sur certains clusters (quota par défaut de GKE).
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: mimic-control-plane
+value: 1000000
+globalDefault: false
+description: "Plan de contrôle de mimic : webhook d'injection et contrôleur."

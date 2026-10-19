@@ -31,10 +31,20 @@ metadata:
 data:
   injector.yaml: |
     listen: 0.0.0.0:8443
+    # Relus toutes les 10 s : le certificat renouvelé par cert-manager sert sans redémarrage.
     tls: {cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key}
-    image: registry.example.com/platform/mimic:0.1.0
-    # API Kubernetes : jamais redirigée vers le sidecar.
-    exclude_outbound_cidrs: [10.96.0.1/32]
+    image: ghcr.io/thaliph/mimic:0.1.0
+    # L'IP du Service kubernetes (KUBERNETES_SERVICE_HOST du webhook) est toujours exclue :
+    # l'API Kubernetes n'est jamais redirigée vers le sidecar. Autres destinations à exclure
+    # de tous les pods, par exemple un endpoint privé de l'API (EKS) ou une base :
+    #   exclude_outbound_cidrs: [10.96.0.1/32, 10.20.0.0/16]
+    exclude_outbound_cidrs: []
+    # Cluster double pile : règles ip6tables aussi (MIMIC_IPV6=true dans mimic-init).
+    ipv6: false
+    # mimic-init : quelques commandes iptables.
+    init_resources:
+      requests: {cpu: 10m, memory: 16Mi}
+      limits: {memory: 64Mi}
     resources:
       requests: {cpu: 50m, memory: 64Mi}
       limits: {memory: 256Mi}
@@ -88,14 +98,31 @@ spec:
       labels: {app.kubernetes.io/name: mimic-injector}
     spec:
       serviceAccountName: mimic-injector
+      # Webhook en failurePolicy Ignore : s'il n'a plus de réplique, les pods sont créés sans
+      # mimic. Priorité au-dessus des workloads, sans être critique pour le cluster
+      # (PriorityClass de controller/namespace.yaml).
+      priorityClassName: mimic-control-plane
+      # Deux nœuds quand c'est possible : la perte d'un nœud ne coupe pas l'injection.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app.kubernetes.io/name: mimic-injector}
+      # SIGTERM : admissions en cours terminées (10 s au plus), puis sortie.
+      terminationGracePeriodSeconds: 15
+      # UID 1338 comme le sidecar ; jamais 1337, l'UID d'istio-proxy, que le mesh ne
+      # redirigerait pas.
       securityContext:
-        runAsUser: 1337
-        runAsGroup: 1337
+        runAsUser: 1338
+        runAsGroup: 1338
         runAsNonRoot: true
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: injector
-          image: registry.example.com/platform/mimic:0.1.0
+          image: ghcr.io/thaliph/mimic:0.1.0
           command: ["/usr/local/bin/mimic-injector"]
           args: ["--config", "/etc/mimic/injector.yaml"]
           ports:
@@ -156,8 +183,13 @@ webhooks:
     timeoutSeconds: 5
     # Rappelé si un webhook de mesh (Istio, Linkerd) injecte après lui (spec §9.4).
     reinvocationPolicy: IfNeeded
+    # Le plan de contrôle n'est jamais injecté, même labellisé par erreur.
     namespaceSelector:
       matchLabels: {mimic.platform.io/enabled: "true"}
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, mimic-system]
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]

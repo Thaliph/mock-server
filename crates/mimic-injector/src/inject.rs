@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use k8s_openapi::api::core::v1::{
     Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EmptyDirVolumeSource, EnvVar,
     EnvVarSource, ExecAction, HTTPGetAction, ObjectFieldSelector, Pod, Probe,
-    ProjectedVolumeSource, SecretKeySelector, SecurityContext, ServiceAccountTokenProjection,
-    Volume, VolumeMount, VolumeProjection,
+    ProjectedVolumeSource, SeccompProfile, SecretKeySelector, SecurityContext,
+    ServiceAccountTokenProjection, Volume, VolumeMount, VolumeProjection,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -143,11 +143,93 @@ fn skip_reason(pod: &Pod) -> Option<String> {
     None
 }
 
-/// Ports entrants à intercepter : annotation, sinon ports TCP déclarés, sinon tous.
-fn inbound_ports(pod: &Pod) -> String {
-    if let Some(a) = annotation(pod, ANNOTATION_INBOUND_PORTS) {
-        return a.replace(' ', "");
+/// Valeurs d'annotations reprises dans les règles de `mimic-init`, analysées comme il le
+/// fait et réécrites sous forme canonique (spec §9.4) : une valeur invalide est écartée avec
+/// un avertissement d'admission, jamais recopiée dans le pod.
+struct Checked {
+    /// `MIMIC_INBOUND_PORTS`.
+    inbound_ports: String,
+    exclude_cidrs: Vec<String>,
+    /// `None` sans annotation.
+    exclude_ports: Option<Vec<String>>,
+    warnings: Vec<String>,
+}
+
+/// Éléments valides de la liste, et un avertissement par élément écarté.
+fn checked_list<T: ToString>(
+    key: &str,
+    value: &str,
+    parse: impl Fn(&str) -> Result<T, String>,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let mut out = vec![];
+    for item in split_list(value) {
+        match parse(&item) {
+            Ok(v) => out.push(v.to_string()),
+            Err(e) => warnings.push(format!("{key} : {e}, valeur ignorée")),
+        }
     }
+    out
+}
+
+fn checked(pod: &Pod) -> Checked {
+    let mut warnings = vec![];
+    let inbound_ports = match annotation(pod, ANNOTATION_INBOUND_PORTS) {
+        Some(a @ ("*" | "-")) => a.to_string(),
+        Some(a) => {
+            let ports = checked_list(
+                ANNOTATION_INBOUND_PORTS,
+                a,
+                mimic_init::parse_port,
+                &mut warnings,
+            );
+            if ports.is_empty() {
+                warnings.push(format!(
+                    "{ANNOTATION_INBOUND_PORTS} : aucun port valide, ports déclarés interceptés"
+                ));
+                declared_ports(pod)
+            } else {
+                ports.join(",")
+            }
+        }
+        None => declared_ports(pod),
+    };
+    let exclude_cidrs = annotation(pod, ANNOTATION_EXCLUDE_CIDRS)
+        .map(|a| {
+            checked_list(
+                ANNOTATION_EXCLUDE_CIDRS,
+                a,
+                mimic_init::parse_cidr,
+                &mut warnings,
+            )
+        })
+        .unwrap_or_default();
+    let exclude_ports = annotation(pod, ANNOTATION_EXCLUDE_PORTS).map(|a| {
+        checked_list(
+            ANNOTATION_EXCLUDE_PORTS,
+            a,
+            mimic_init::parse_port,
+            &mut warnings,
+        )
+    });
+    Checked {
+        inbound_ports,
+        exclude_cidrs,
+        exclude_ports,
+        warnings,
+    }
+}
+
+/// Avertissements d'admission d'un pod injecté : mesh inconnu, valeurs d'annotations
+/// écartées.
+pub fn warnings(pod: &Pod) -> Vec<String> {
+    let mut out: Vec<String> = mesh_warning(pod).into_iter().collect();
+    out.extend(checked(pod).warnings);
+    out
+}
+
+/// Ports entrants sans annotation : ports TCP déclarés, sinon tous.
+fn declared_ports(pod: &Pod) -> String {
     let ports: BTreeSet<i32> = pod
         .spec
         .iter()
@@ -228,20 +310,61 @@ fn probe(pod: &Pod, path: &str, period: i32, failures: i32) -> Probe {
     }
 }
 
-fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
-    let mut cidrs = cfg.exclude_outbound_cidrs.clone();
-    if let Some(a) = annotation(pod, ANNOTATION_EXCLUDE_CIDRS) {
-        cidrs.extend(split_list(a));
+/// CIDR sortants exclus : API Kubernetes, configuration, puis annotation, sans doublon.
+fn excluded_cidrs(cfg: &InjectorConfig, annotated: Vec<String>) -> Vec<String> {
+    let api = cfg.kubernetes_service_host.map(|ip| match ip {
+        std::net::IpAddr::V4(_) => format!("{ip}/32"),
+        std::net::IpAddr::V6(_) => format!("{ip}/128"),
+    });
+    // Ceux de la configuration sont validés au démarrage.
+    let configured = cfg
+        .exclude_outbound_cidrs
+        .iter()
+        .filter_map(|c| mimic_init::parse_cidr(c).ok());
+    let mut seen = BTreeSet::new();
+    api.into_iter()
+        .chain(configured)
+        .chain(annotated)
+        .filter(|c| seen.insert(c.clone()))
+        .collect()
+}
+
+/// Ressources par défaut de `mimic-init` : quelques commandes `iptables`.
+fn init_resources() -> k8s_openapi::api::core::v1::ResourceRequirements {
+    let q = |s: &str| Quantity(s.into());
+    k8s_openapi::api::core::v1::ResourceRequirements {
+        requests: Some(BTreeMap::from([
+            ("cpu".into(), q("10m")),
+            ("memory".into(), q("16Mi")),
+        ])),
+        limits: Some(BTreeMap::from([("memory".into(), q("64Mi"))])),
+        ..Default::default()
     }
+}
+
+/// Profil seccomp par défaut du runtime (Pod Security `baseline` et `restricted`).
+fn runtime_default() -> Option<SeccompProfile> {
+    Some(SeccompProfile {
+        type_: "RuntimeDefault".into(),
+        ..SeccompProfile::default()
+    })
+}
+
+fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
+    let checked = checked(pod);
+    let cidrs = excluded_cidrs(cfg, checked.exclude_cidrs);
     let mut envs = vec![
         env("MIMIC_MESH", mesh_mode(pod)),
         // Cible du trajet entrant en ambient (spec §3.3.2).
         field_env("POD_IP", "status.podIP"),
-        env("MIMIC_INBOUND_PORTS", inbound_ports(pod)),
+        env("MIMIC_INBOUND_PORTS", checked.inbound_ports),
         env("MIMIC_EXCLUDE_OUTBOUND_CIDRS", cidrs.join(",")),
     ];
-    if let Some(a) = annotation(pod, ANNOTATION_EXCLUDE_PORTS) {
-        envs.push(env("MIMIC_EXCLUDE_OUTBOUND_PORTS", split_list(a).join(",")));
+    if let Some(ports) = checked.exclude_ports.filter(|p| !p.is_empty()) {
+        envs.push(env("MIMIC_EXCLUDE_OUTBOUND_PORTS", ports.join(",")));
+    }
+    if cfg.ipv6 {
+        envs.push(env("MIMIC_IPV6", "true"));
     }
     if let Some(bin) = &cfg.iptables {
         envs.push(env("MIMIC_IPTABLES", bin.clone()));
@@ -252,9 +375,14 @@ fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
         image_pull_policy: cfg.image_pull_policy.clone(),
         command: Some(vec!["/usr/local/bin/mimic-init".into()]),
         env: Some(envs),
+        resources: Some(cfg.init_resources.clone().unwrap_or_else(init_resources)),
+        // Root avec NET_ADMIN et NET_RAW seules : `allowPrivilegeEscalation: false` ne retire
+        // pas ces capacités, accordées au lancement (spec §9.4).
         security_context: Some(SecurityContext {
             run_as_user: Some(0),
             run_as_non_root: Some(false),
+            allow_privilege_escalation: Some(false),
+            seccomp_profile: runtime_default(),
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".into()]),
                 add: Some(vec!["NET_ADMIN".into(), "NET_RAW".into()]),
@@ -343,6 +471,7 @@ fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]
             run_as_non_root: Some(true),
             read_only_root_filesystem: Some(true),
             allow_privilege_escalation: Some(false),
+            seccomp_profile: runtime_default(),
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".into()]),
                 add: None,
@@ -381,8 +510,11 @@ fn volumes(pod: &Pod, cfg: &InjectorConfig) -> Vec<Volume> {
         },
         Volume {
             name: "mimic-controller-ca".into(),
+            // Pas encore publié par trust-manager : le pod est créé, le sidecar est relancé
+            // jusqu'à ce que le ConfigMap apparaisse dans le volume (spec §9.4).
             config_map: Some(ConfigMapVolumeSource {
                 name: cfg.controller_ca_configmap.clone(),
+                optional: Some(true),
                 ..ConfigMapVolumeSource::default()
             }),
             ..Volume::default()

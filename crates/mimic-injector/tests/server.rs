@@ -1,4 +1,7 @@
-//! Webhook servi en HTTPS, de la revue d'admission au pod patché (spec §9.4, INJ-08).
+//! Webhook servi en HTTPS, de la revue d'admission au pod patché (spec §9.4, INJ-08), avec
+//! un certificat relu à chaud (INJ-14) et un arrêt propre sur `SIGTERM` (INJ-16).
+
+use std::time::{Duration, Instant};
 
 use mimic_injector::config::{InjectorConfig, TlsFiles};
 use mimic_injector::inject::{Outcome, mutate};
@@ -41,32 +44,43 @@ struct Webhook {
     running: mimic_injector::server::Running,
 }
 
-async fn webhook() -> Webhook {
-    let dir = tempfile::tempdir().unwrap();
+/// Certificat auto-signé pour `localhost` : (certificat PEM, clé PEM).
+fn self_signed() -> (String, String) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
         .unwrap()
         .self_signed(&key)
         .unwrap();
+    (cert.pem(), key.serialize_pem())
+}
+
+/// Client qui ne fait confiance qu'à `cert`.
+fn client_trusting(cert: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .tls_certs_only([reqwest::Certificate::from_pem(cert.as_bytes()).unwrap()])
+        .build()
+        .unwrap()
+}
+
+async fn webhook() -> Webhook {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = self_signed();
     let cert_file = dir.path().join("tls.crt");
     let key_file = dir.path().join("tls.key");
-    std::fs::write(&cert_file, cert.pem()).unwrap();
-    std::fs::write(&key_file, key.serialize_pem()).unwrap();
+    std::fs::write(&cert_file, &cert).unwrap();
+    std::fs::write(&key_file, key).unwrap();
     let mut config: InjectorConfig = serde_yaml::from_str(
         "listen: 127.0.0.1:0\nimage: mimic:test\nsidecar_config: \"mode: record\\n\"\n",
     )
     .unwrap();
-    config.tls = Some(TlsFiles {
-        cert_file,
-        key_file,
-    });
+    let mut tls = TlsFiles::new(cert_file, key_file);
+    tls.reload_interval = Duration::from_millis(100);
+    config.tls = Some(tls);
     config.validate().unwrap();
     let running = mimic_injector::server::start(config.clone()).await.unwrap();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .tls_certs_only([reqwest::Certificate::from_pem(cert.pem().as_bytes()).unwrap()])
-        .build()
-        .unwrap();
+    let client = client_trusting(&cert);
     Webhook {
         url: format!("https://localhost:{}", running.addr.port()),
         client,
@@ -155,4 +169,91 @@ fn invalid_sidecar_config_is_refused_at_startup() {
     let config: InjectorConfig =
         serde_yaml::from_str("image: mimic:test\nsidecar_config: \"mood: record\\n\"\n").unwrap();
     assert!(config.validate().unwrap_err().contains("sidecar_config"));
+}
+
+#[tokio::test]
+async fn inj_14_renewed_certificate_is_served_without_restart() {
+    let w = webhook().await;
+    let healthz = format!("{}/healthz", w.url);
+    assert!(w.client.get(&healthz).send().await.is_ok());
+    let tls = w.config.tls.clone().unwrap();
+    let (cert, key) = self_signed();
+    std::fs::write(&tls.cert_file, &cert).unwrap();
+    std::fs::write(&tls.key_file, key).unwrap();
+    let renewed = client_trusting(&cert);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while renewed.get(&healthz).send().await.is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "certificat renouvelé jamais servi"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Contenu illisible : le certificat renouvelé reste servi.
+    std::fs::write(&tls.cert_file, "illisible").unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(renewed.get(&healthz).send().await.is_ok());
+    w.running.shutdown();
+}
+
+#[tokio::test]
+async fn inj_14_unreadable_certificate_is_refused_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tls.crt"), "x").unwrap();
+    std::fs::write(dir.path().join("tls.key"), "y").unwrap();
+    let mut config: InjectorConfig =
+        serde_yaml::from_str("listen: 127.0.0.1:0\nimage: mimic:test\nsidecar_config: \"{}\"\n")
+            .unwrap();
+    config.tls = Some(TlsFiles::new(
+        dir.path().join("tls.crt"),
+        dir.path().join("tls.key"),
+    ));
+    assert!(mimic_injector::server::start(config).await.is_err());
+}
+
+#[test]
+fn inj_16_sigterm_stops_the_webhook_cleanly() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("injector.yaml");
+    std::fs::write(
+        &path,
+        "listen: 127.0.0.1:0\nimage: mimic:test\nsidecar_config: \"mode: record\\n\"\n",
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mimic-injector"))
+        .arg("--config")
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Les logs sont lus jusqu'au bout : le journal de l'arrêt ne trouve pas un tube fermé.
+    let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in stdout.lines().map_while(Result::ok) {
+            if line.contains("webhook d'injection démarré") {
+                let _ = tx.send(());
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("webhook jamais démarré");
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("webhook toujours là 5 s après SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status}");
 }

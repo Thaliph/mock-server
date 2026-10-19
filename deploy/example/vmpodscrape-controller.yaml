@@ -1,0 +1,44 @@
+# Collecte des métriques du plan de contrôle par l'opérateur VictoriaMetrics : /metrics du
+# contrôleur (port api, 8443, sans jeton, sur les deux réplicas : mimic_controller_leader
+# vaut 1 sur l'active) et du webhook. HTTPS, certificats signés par la CA de mimic.
+#
+# Prérequis :
+# - le namespace du collecteur porte le label mimic.platform.io/monitoring=true, ouvert par
+#   la NetworkPolicy du contrôleur (deploy/controller/controller.yaml) ;
+# - vmagent lit les VMPodScrape de mimic-system (selectAllByDefault, ou son sélecteur).
+# Avec Prometheus Operator : même contenu en PodMonitor (monitoring.coreos.com/v1), avec
+# `tlsConfig.ca.secret` et `tlsConfig.serverName`.
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: mimic-controller}
+  podMetricsEndpoints:
+    - port: api
+      path: /metrics
+      scheme: https
+      tlsConfig:
+        ca:
+          secret: {name: mimic-controller-ca, key: ca.crt}
+        # Le pod est joint par son IP : le nom vérifié est celui du certificat.
+        serverName: mimic-controller.mimic-system.svc
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: mimic-injector
+  namespace: mimic-system
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: mimic-injector}
+  podMetricsEndpoints:
+    - port: webhook
+      path: /metrics
+      scheme: https
+      tlsConfig:
+        ca:
+          secret: {name: mimic-controller-ca, key: ca.crt}
+        serverName: mimic-injector.mimic-system.svc

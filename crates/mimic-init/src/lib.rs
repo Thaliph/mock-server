@@ -3,6 +3,7 @@
 //! La génération est pure et testée ; l'application est faite par le binaire `mimic-init`.
 
 use std::fmt::Write as _;
+use std::net::IpAddr;
 
 /// Chaîne des règles entrantes.
 pub const INBOUND_CHAIN: &str = "MIMIC_INBOUND";
@@ -504,20 +505,58 @@ fn jump(chain: &'static str, target: &'static str) -> Jump {
     }
 }
 
-pub fn parse_ports(s: &str) -> Result<Vec<u16>, String> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| p.parse::<u16>().map_err(|_| format!("port invalide: {p}")))
-        .collect()
+/// Éléments non vides d'une liste séparée par des virgules.
+fn items(s: &str) -> impl Iterator<Item = &str> {
+    s.split(',').map(str::trim).filter(|p| !p.is_empty())
 }
 
-pub fn parse_list(s: &str) -> Vec<String> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(String::from)
-        .collect()
+/// Port TCP, de 1 à 65535.
+pub fn parse_port(s: &str) -> Result<u16, String> {
+    match s.trim().parse::<u16>() {
+        Ok(p) if p > 0 => Ok(p),
+        _ => Err(format!("port invalide: {s:?} (entier de 1 à 65535)")),
+    }
+}
+
+pub fn parse_ports(s: &str) -> Result<Vec<u16>, String> {
+    items(s).map(parse_port).collect()
+}
+
+/// CIDR IPv4 ou IPv6 (`10.0.0.0/8`, `fd00::/8`) ; une adresse seule vaut `/32` ou `/128`.
+/// Rendu sous la forme canonique `adresse/préfixe` : rien n'est recopié tel quel dans les
+/// règles (spec §3.1).
+pub fn parse_cidr(s: &str) -> Result<String, String> {
+    let invalid = || format!("CIDR invalide: {s:?} (adresse IPv4 ou IPv6, /préfixe facultatif)");
+    let (addr, prefix) = match s.trim().split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s.trim(), None),
+    };
+    let ip: IpAddr = addr.parse().map_err(|_| invalid())?;
+    let max = if ip.is_ipv6() { 128 } else { 32 };
+    let len = match prefix {
+        None => max,
+        // Des chiffres seulement : ni signe, ni espace, ni second `/`.
+        Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            p.parse::<u8>().map_err(|_| invalid())?
+        }
+        Some(_) => return Err(invalid()),
+    };
+    if len > max {
+        return Err(invalid());
+    }
+    Ok(format!("{ip}/{len}"))
+}
+
+pub fn parse_cidrs(s: &str) -> Result<Vec<String>, String> {
+    items(s).map(parse_cidr).collect()
+}
+
+/// IP du pod (`POD_IP`), cible du DNAT en ambient.
+pub fn parse_pod_ip(s: &str) -> Result<String, String> {
+    s.trim()
+        .parse::<IpAddr>()
+        .map(|ip| ip.to_string())
+        .map_err(|_| format!("adresse IP invalide: {s:?}"))
 }
 
 #[cfg(test)]

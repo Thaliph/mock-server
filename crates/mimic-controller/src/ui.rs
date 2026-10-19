@@ -48,7 +48,7 @@ fn bad_name() -> Response {
     (StatusCode::BAD_REQUEST, "nom invalide").into_response()
 }
 
-async fn metrics(State(ctl): State<Arc<Ctl>>) -> Response {
+pub(crate) async fn metrics(State(ctl): State<Arc<Ctl>>) -> Response {
     // Une passive ne touche pas au support : ses jauges restent à zéro (spec §5.5.4).
     if ctl.is_active() {
         ctl.refresh_metrics().await;
@@ -95,6 +95,13 @@ async fn workload_json(ctl: &Ctl, ns: &str, wl: &str) -> Value {
         })
     })
     .await
+    // État souhaité illisible sur le support : le workload reste listé, avec l'erreur.
+    .unwrap_or_else(|e| json!({"namespace": ns, "name": wl, "error": e}))
+}
+
+fn unavailable(e: String) -> Response {
+    tracing::warn!(error = %e, "état souhaité illisible sur le support");
+    (StatusCode::SERVICE_UNAVAILABLE, "support indisponible").into_response()
 }
 
 async fn workloads(State(ctl): State<Arc<Ctl>>) -> Response {
@@ -109,7 +116,10 @@ async fn mode(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
     if !valid_name(&ns) || !valid_name(&wl) {
         return bad_name();
     }
-    axum::Json(ctl.with_live(&ns, &wl, |w| w.desired.clone()).await).into_response()
+    match ctl.with_live(&ns, &wl, |w| w.desired.clone()).await {
+        Ok(d) => axum::Json(d).into_response(),
+        Err(e) => unavailable(e),
+    }
 }
 
 async fn snapshots(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
@@ -242,9 +252,18 @@ async fn home(State(ctl): State<Arc<Ctl>>) -> Html<String> {
     } else {
         h.push_str("<table><tr><th>Workload</th><th>Mode souhaité</th><th>Pods alignés</th><th>Échanges</th></tr>");
         for (ns, wl) in keys {
-            let (mode, s) = ctl
+            let Ok((mode, s)) = ctl
                 .with_live(&ns, &wl, |w| (w.desired.mode.clone(), ctl.summary(w)))
-                .await;
+                .await
+            else {
+                let _ = write!(
+                    h,
+                    "<tr><td>{}/{}</td><td colspan=\"3\">support indisponible</td></tr>",
+                    esc(&ns),
+                    esc(&wl)
+                );
+                continue;
+            };
             let _ = write!(
                 h,
                 "<tr><td><a href=\"/ui/{0}/{1}\">{0}/{1}</a></td><td>{2}</td><td>{3}/{4}</td><td>{5}</td></tr>",
@@ -268,7 +287,7 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
     }
     let d = ctl.discovery(&ns, &wl).await;
     let ops = operations(&d.inbound, &d.outbound);
-    let (summary, pods, desired, has_spec) = ctl
+    let live = ctl
         .with_live(&ns, &wl, |w| {
             (
                 ctl.summary(w),
@@ -278,6 +297,10 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
             )
         })
         .await;
+    let (summary, pods, desired, has_spec) = match live {
+        Ok(l) => l,
+        Err(e) => return unavailable(e),
+    };
     let recent = ctl.requests(&ns, &wl, Direction::Inbound, 50).await;
     let snaps = ctl.snapshots(&ns, &wl).await;
     let api = format!("/v1/workloads/{ns}/{wl}");

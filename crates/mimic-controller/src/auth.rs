@@ -1,7 +1,7 @@
 //! Authentification des sidecars par jeton de ServiceAccount (spec §7.1).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
@@ -93,10 +93,7 @@ impl KubeAuth {
     async fn authenticate(&self, token: &str) -> Result<Identity, AuthError> {
         let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         {
-            let mut cache = self
-                .cache
-                .lock()
-                .expect("verrou du cache d'authentification");
+            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
             cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
             if let Some((_, id)) = cache.get(&key) {
                 return Ok(id.clone());
@@ -151,25 +148,34 @@ impl KubeAuth {
         };
         self.cache
             .lock()
-            .expect("verrou du cache d'authentification")
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(key, (Instant::now(), id.clone()));
         Ok(id)
     }
 }
 
-/// Nom du workload d'un pod (spec §5.4) : annotation, puis labels usuels.
+/// Nom du workload d'un pod (spec §5.4) : annotation, puis labels usuels. Même règle que
+/// l'injecteur, qui fige ce nom dans `MIMIC_WORKLOAD` : annotation sans les espaces qui
+/// l'entourent, valeurs vides ignorées.
 pub fn workload_of(pod: &Pod) -> Option<String> {
     let meta = &pod.metadata;
-    meta.annotations
+    let annotation = meta
+        .annotations
         .as_ref()
         .and_then(|a| a.get("mimic.platform.io/workload"))
-        .or_else(|| {
-            let labels = meta.labels.as_ref()?;
-            labels
-                .get("app.kubernetes.io/name")
-                .or_else(|| labels.get("app"))
-        })
-        .cloned()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty());
+    let label = |key: &str| {
+        meta.labels
+            .as_ref()?
+            .get(key)
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    annotation
+        .or_else(|| label("app.kubernetes.io/name"))
+        .or_else(|| label("app"))
+        .map(String::from)
 }
 
 #[cfg(test)]
@@ -218,6 +224,37 @@ mod tests {
         pod.metadata.annotations =
             Some([("mimic.platform.io/workload".to_string(), "c".to_string())].into());
         assert_eq!(workload_of(&pod).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn ctl_34_workload_name_is_trimmed_and_empty_values_skipped() {
+        let mut pod = Pod::default();
+        pod.metadata.annotations = Some(
+            [(
+                "mimic.platform.io/workload".to_string(),
+                " checkout ".to_string(),
+            )]
+            .into(),
+        );
+        assert_eq!(workload_of(&pod).as_deref(), Some("checkout"));
+        pod.metadata.annotations =
+            Some([("mimic.platform.io/workload".to_string(), "  ".to_string())].into());
+        pod.metadata.labels = Some(
+            [
+                ("app.kubernetes.io/name".to_string(), "web".to_string()),
+                ("app".to_string(), "autre".to_string()),
+            ]
+            .into(),
+        );
+        assert_eq!(workload_of(&pod).as_deref(), Some("web"));
+        pod.metadata.labels = Some(
+            [
+                ("app.kubernetes.io/name".to_string(), String::new()),
+                ("app".to_string(), "autre".to_string()),
+            ]
+            .into(),
+        );
+        assert_eq!(workload_of(&pod).as_deref(), Some("autre"));
     }
 
     #[test]

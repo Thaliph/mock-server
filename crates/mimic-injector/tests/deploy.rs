@@ -129,3 +129,85 @@ fn cap_08_default_limits_fit_in_the_injected_pod() {
         "store {store} + partage {share} pour une limite de {memory}"
     );
 }
+
+/// Manifests de production (INJ-20).
+#[test]
+fn inj_20_production_manifests() {
+    const IMAGE: &str = "ghcr.io/thaliph/mimic:0.1.0";
+    for (name, text) in [
+        (
+            "injector.yaml",
+            include_str!("../../../deploy/injector/injector.yaml"),
+        ),
+        (
+            "controller.yaml",
+            include_str!("../../../deploy/controller/controller.yaml"),
+        ),
+        (
+            "deployment.yaml",
+            include_str!("../../../deploy/example/deployment.yaml"),
+        ),
+    ] {
+        assert!(
+            !text.contains("registry.example.com/platform"),
+            "{name} : image factice"
+        );
+        assert!(text.contains(IMAGE), "{name} : {IMAGE}");
+    }
+
+    let cm = kind("ConfigMap");
+    let config: InjectorConfig =
+        serde_yaml::from_str(cm["data"]["injector.yaml"].as_str().unwrap()).unwrap();
+    assert_eq!(config.image, IMAGE);
+    assert!(
+        config.exclude_outbound_cidrs.is_empty(),
+        "IP de l'API Kubernetes lue au démarrage, rien de codé en dur : {:?}",
+        config.exclude_outbound_cidrs
+    );
+
+    let deploy = kind("Deployment");
+    let pod = &deploy["spec"]["template"]["spec"];
+    assert_eq!(pod["containers"][0]["image"], IMAGE);
+    assert_eq!(pod["securityContext"]["runAsUser"].as_u64(), Some(1338));
+    assert_eq!(pod["securityContext"]["runAsGroup"].as_u64(), Some(1338));
+    let anti =
+        &pod["affinity"]["podAntiAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"][0];
+    assert_eq!(
+        anti["podAffinityTerm"]["topologyKey"],
+        "kubernetes.io/hostname"
+    );
+    assert_eq!(
+        anti["podAffinityTerm"]["labelSelector"]["matchLabels"]["app.kubernetes.io/name"],
+        "mimic-injector"
+    );
+    assert_eq!(pod["priorityClassName"], "mimic-control-plane");
+    let classes: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(include_str!(
+        "../../../deploy/controller/namespace.yaml"
+    ))
+    .map(|d| serde::Deserialize::deserialize(d).unwrap())
+    .collect();
+    assert!(
+        classes
+            .iter()
+            .any(|d| d["kind"] == "PriorityClass" && d["metadata"]["name"] == "mimic-control-plane"),
+        "PriorityClass fournie"
+    );
+
+    let hook = &kind("MutatingWebhookConfiguration")["webhooks"][0];
+    let selector = &hook["namespaceSelector"];
+    assert_eq!(selector["matchLabels"]["mimic.platform.io/enabled"], "true");
+    let excluded = selector["matchExpressions"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "kubernetes.io/metadata.name")
+        .expect("exclusion par nom de namespace");
+    assert_eq!(excluded["operator"], "NotIn");
+    let names: Vec<&str> = excluded["values"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"kube-system") && names.contains(&"mimic-system"));
+}
