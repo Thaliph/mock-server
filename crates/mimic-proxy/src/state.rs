@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper_rustls::HttpsConnector;
@@ -78,7 +78,16 @@ impl AppState {
     pub fn new(config: Config) -> Result<Arc<Self>, String> {
         let salt = match &config.redact.salt {
             Some(s) => s.as_bytes().to_vec(),
-            None => ulid::Ulid::generate().to_string().into_bytes(),
+            None => {
+                // Sel propre au processus : les marqueurs ne se comparent plus entre pods (§7).
+                tracing::warn!(
+                    "aucun sel de redaction (redact.salt, MIMIC_REDACT_SALT) : sel aléatoire, \
+                     les marqueurs de redaction changent d'un pod et d'un redémarrage à l'autre \
+                     (dédoublonnage, snapshots et comparaisons entre pods faussés) ; fournir \
+                     MIMIC_REDACT_SALT par le Secret <workload>-mimic, clé redact-salt"
+                );
+                ulid::Ulid::generate().to_string().into_bytes()
+            }
         };
         let redactor = Redactor::new(
             RedactConfig {
@@ -233,7 +242,10 @@ impl AppState {
     }
 
     pub fn snapshot(&self) -> Option<Arc<MockSnapshot>> {
-        self.snapshot.lock().expect("verrou du snapshot").clone()
+        self.snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Impose un snapshot (ou le retire) ; en mock, le moteur est reconstruit dessus avant
@@ -248,7 +260,10 @@ impl AppState {
     /// Documents OpenAPI du workload, recalculés quand le store change.
     pub fn discovery(&self) -> Arc<Discovery> {
         let version = self.store.version();
-        let mut guard = self.discovery.lock().expect("verrou de la découverte");
+        let mut guard = self
+            .discovery
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some((v, d)) = guard.as_ref()
             && *v == version
         {

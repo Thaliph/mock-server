@@ -3,7 +3,7 @@
 //! (spec §5.6), compressée, et la garde sur disque si `store.dir` est configuré.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -318,7 +318,7 @@ pub fn restore(state: &AppState) {
     state
         .controller_status
         .lock()
-        .expect("verrou du contrôleur")
+        .unwrap_or_else(PoisonError::into_inner)
         .desired = desired;
 }
 
@@ -368,7 +368,7 @@ pub fn spawn(
                 let mut status = state
                     .controller_status
                     .lock()
-                    .expect("verrou du contrôleur");
+                    .unwrap_or_else(PoisonError::into_inner);
                 match result {
                     Ok(()) => {
                         status.last_ok_ms = Some(crate::share::now_ms());
@@ -398,7 +398,7 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
     let previous = state
         .controller_status
         .lock()
-        .expect("verrou du contrôleur")
+        .unwrap_or_else(PoisonError::into_inner)
         .desired
         .clone();
     // Le snapshot d'abord : un passage en mock sert ainsi directement le bon jeu. S'il ne
@@ -456,7 +456,7 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
         state
             .controller_status
             .lock()
-            .expect("verrou du contrôleur")
+            .unwrap_or_else(PoisonError::into_inner)
             .desired = desired;
     }
     fetch_error.map_or(Ok(()), Err)

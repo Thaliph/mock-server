@@ -587,6 +587,32 @@ impl Config {
         if self.store.segment_bytes == 0 || self.store.max_segments == 0 {
             return Err("store.segment_bytes et store.max_segments doivent être positifs".into());
         }
+        // Une période nulle ferait tourner une boucle sans attente (spec §9.1).
+        let mut durations = vec![
+            ("outbound.connect_timeout", self.outbound.connect_timeout),
+            (
+                "server.header_read_timeout",
+                self.server.header_read_timeout,
+            ),
+        ];
+        let mut caps = vec![
+            ("server.max_connections", self.server.max_connections),
+            (
+                "capture.max_inflight_bytes",
+                self.capture.max_inflight_bytes,
+            ),
+        ];
+        if let Some(share) = &self.share {
+            durations.push(("share.interval", share.interval));
+            durations.push(("share.mode_poll", share.mode_poll));
+            caps.push(("share.max_snapshot_bytes", share.max_snapshot_bytes));
+        }
+        if let Some((name, _)) = durations.iter().find(|(_, d)| d.is_zero()) {
+            return Err(format!("{name} doit être une durée positive (en secondes)"));
+        }
+        if let Some((name, _)) = caps.iter().find(|(_, v)| *v == 0) {
+            return Err(format!("{name} doit être positif"));
+        }
         if let Some(share) = &self.share {
             if self.workload.name.is_empty() {
                 return Err("share exige un nom de workload (MIMIC_WORKLOAD)".into());

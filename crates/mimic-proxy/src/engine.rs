@@ -13,7 +13,7 @@
 //! - L'attente de la latence rejouée est faite à la microseconde (timerfd).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
@@ -375,10 +375,10 @@ impl AppState {
     pub(crate) fn publish_snapshot(&self, snap: Option<Arc<MockSnapshot>>) {
         let _guard = self.engines.build.lock().unwrap_or_else(|e| e.into_inner());
         let unchanged = {
-            let current = self.snapshot.lock().expect("verrou du snapshot");
+            let current = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
             current.as_ref().map(|s| &s.id) == snap.as_ref().map(|s| &s.id)
         };
-        *self.snapshot.lock().expect("verrou du snapshot") = snap.clone();
+        *self.snapshot.lock().unwrap_or_else(PoisonError::into_inner) = snap.clone();
         if mock_mode(self.mode()) && !unchanged {
             let set = blocking(|| self.build_locked(snap.as_deref(), Trigger::Switch, true));
             self.publish(set);

@@ -1,7 +1,7 @@
 //! API et page d'admin (spec §9.2).
 
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, header};
@@ -135,10 +135,10 @@ fn status(state: &AppState) -> Value {
             "name": state.config.workload.name,
         },
         "store": {"local": local, "peer": peer},
-        "share": *state.share_status.lock().expect("verrou du partage"),
+        "share": *state.share_status.lock().unwrap_or_else(PoisonError::into_inner),
         "snapshot": state.snapshot().map(|s| s.id.clone()),
         "controller": state.config.controlled().then(|| {
-            state.controller_status.lock().expect("verrou du contrôleur").clone()
+            state.controller_status.lock().unwrap_or_else(PoisonError::into_inner).clone()
         }),
     })
 }
@@ -154,7 +154,7 @@ fn render_page(state: &AppState) -> String {
     let share = state
         .share_status
         .lock()
-        .expect("verrou du partage")
+        .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let (local, peer) = state.store.counts();
     let mut h = String::new();

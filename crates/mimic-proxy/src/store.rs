@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use mimic_core::mock::op_key;
 use mimic_core::model::{Body, Direction, Exchange};
@@ -556,7 +556,7 @@ impl Store {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().expect("verrou du store")
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

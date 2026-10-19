@@ -5,7 +5,6 @@
 //! à sa première apparition (au plus `MAX_AUTHORITIES`, la mémoire reste bornée), puis résolue
 //! sous un verrou pris en lecture. Seule la première requête d'une série la crée.
 
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -29,7 +28,8 @@ pub struct RequestLabels {
     pub direction: &'static str,
     pub mode: &'static str,
     pub authority: &'static str,
-    pub method: Cow<'static, str>,
+    /// Méthode standard, sinon `other` (spec §9.3).
+    pub method: &'static str,
     pub status: u16,
 }
 
@@ -425,15 +425,17 @@ pub fn direction_label(d: Direction) -> &'static str {
     }
 }
 
-/// Label `method` : statique pour les méthodes standard, copié pour les autres.
-fn method_label(method: &str) -> Cow<'static, str> {
+/// Label `method` : une des méthodes standard, sinon `other`, pour que la cardinalité ne
+/// dépende pas des clients (spec §9.3).
+fn method_label(method: &str) -> &'static str {
     const STANDARD: [&str; 9] = [
         "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE",
     ];
-    match STANDARD.iter().find(|m| **m == method) {
-        Some(m) => Cow::Borrowed(m),
-        None => Cow::Owned(method.to_string()),
-    }
+    STANDARD
+        .iter()
+        .find(|m| **m == method)
+        .copied()
+        .unwrap_or("other")
 }
 
 impl Default for Metrics {

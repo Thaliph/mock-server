@@ -11,7 +11,7 @@
 //!   autres instances.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -229,7 +229,10 @@ impl Sharer {
                 result: if ok { "ok" } else { "error" },
             })
             .inc();
-        let mut status = state.share_status.lock().expect("verrou du partage");
+        let mut status = state
+            .share_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         match result {
             Ok(peers) => {
                 state.metrics.share_peers.set(peers.len() as i64);
