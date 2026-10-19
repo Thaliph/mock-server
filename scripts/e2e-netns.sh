@@ -7,5 +7,5 @@ cargo build --workspace --bins
 cargo test -p mimic-proxy --test transparent --no-run
 exec unshare --net -- sh -c '
   python3 scripts/lo-up.py
-  MIMIC_NETNS_E2E=1 cargo test --offline -p mimic-proxy --test transparent -- --nocapture
+  MIMIC_NETNS_E2E=1 cargo test --offline -p mimic-proxy --test transparent -- --ignored --nocapture
 '
