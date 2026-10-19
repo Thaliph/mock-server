@@ -17,15 +17,17 @@ compris) et n'a que les droits de son utilisateur :
 | `mode` | `patch` et `create` sur `mimicworkloads` du namespace (rôle `mimic-operator`) |
 | `status` | `list` sur `mimicworkloads` (rôle `mimic-viewer`, agrégé à `view`) |
 | `export`, `requests`, `report` | `list` sur les pods et `create` sur `pods/portforward` dans `mimic-system` |
+| `load <workload>` | ceux de `requests`, plus `get`/`list` sur `pods` de `metrics.k8s.io` dans le namespace du workload (relevés CPU et mémoire) ; aucun avec `--from` sans workload |
 | `diff` | aucun : travaille sur deux fichiers |
 
-`export`, `requests` et `report` ouvrent un port-forward vers le pod du contrôleur (port
+`export`, `requests`, `report` et `load` ouvrent un port-forward vers le pod du contrôleur (port
 8081), comme `kubectl port-forward` ; aucun port n'est exposé hors du cluster. Le pod choisi
 est la réplique active, marquée `mimic.platform.io/leader=true` ; pendant une bascule, la
 passive répond `503` et la commande est à relancer quelques secondes plus tard.
 
 Les options `-n/--namespace` prennent le namespace du contexte par défaut. Codes de sortie :
-`0` succès, `1` changement cassant détecté par `diff --fail-on-breaking`, `2` erreur
+`0` succès, `1` changement cassant détecté par `diff --fail-on-breaking`, `2` erreur ou refus
+(garde-fou production de `mode`, isolement de `load`)
 (message sur la sortie d'erreur, préfixé `mimicctl:`).
 
 ## Commandes
@@ -154,6 +156,75 @@ le résumé d'un job GitHub Actions :
 ```sh
 mimicctl report -n shop >> "$GITHUB_STEP_SUMMARY"
 ```
+
+### `load` : tir de charge et dimensionnement
+
+Rejoue les requêtes entrantes enregistrées contre le workload isolé (spec §5.9), sans k6.
+Le workload doit être en `mock`, tous ses pods sélectionnés alignés (`mimicctl status`) :
+sinon `load` refuse (code 2), car le tir frapperait les vraies dépendances.
+
+```sh
+# Palier fixe : 10 000 requêtes à une concurrence de 32.
+mimicctl load checkout -n perf --target http://checkout.perf:8080 --concurrency 32 --requests 10000
+
+# Montée 1, 2, 4… 256, 60 s par palier, arrêtée au premier palier saturé ; SLO p99 500 ms.
+mimicctl load checkout -n perf --target http://checkout.perf:8080 --ramp --max-p99 500ms
+
+# Depuis un fichier, sans cluster (aucune vérification, aucun relevé de ressources).
+mimicctl requests checkout -n perf --format jsonl --limit 5000 > reqs.jsonl
+mimicctl load --from reqs.jsonl --target http://localhost:8080 -H 'authorization: Bearer …'
+```
+
+La cible doit être joignable depuis le poste : un Service par `kubectl port-forward`, ou le
+tir lancé depuis le cluster par le Job de `deploy/load/job.yaml` (l'image contient
+`mimicctl`). Les requêtes partent en boucle fermée : `C` connexions persistantes, chacune
+attend sa réponse avant la suivante. `--http2` parle HTTP/2 sans TLS, pour un service gRPC.
+
+| Option | Défaut | Effet |
+|--------|--------|-------|
+| `--target URL` | requis | `http://hôte[:port][/préfixe]` ; `https` refusé |
+| `--from fichier` | | échanges JSONL au lieu du contrôleur |
+| `--limit n` | 1000 | requêtes lues sur le contrôleur |
+| `-H, --header 'nom: valeur'` | | header ajouté ou remplacé, répétable (les headers redactés ne sont pas rejoués) |
+| `--concurrency C` | 8 | palier fixe |
+| `--requests N` / `--duration D` | 60s | fin du palier fixe : exactement `N` requêtes, ou une durée |
+| `--ramp` | | montée par paliers |
+| `--start`, `--factor`, `--max` | 1, 2, 256 | concurrences de la montée : `start`, ×`factor`, …, `max` |
+| `--step-duration D` | 60s | durée d'un palier de la montée |
+| `--max-error-rate` | 1% | saturé au-delà (erreurs : 5xx, délai, connexion) |
+| `--max-p99 D` | | saturé au-delà |
+| `--plateau` | 10% | saturé si le débit gagne moins que cette part de la hausse de concurrence (moins de +10 % en doublant) |
+| `--timeout D` | 10s | délai d'une requête, réponse lue en entier |
+| `--sample-interval D` | 15s | relevés `metrics.k8s.io` |
+| `--pod-selector k=v` | | pods relevés, au lieu de ceux du contrôleur |
+| `--cpu-headroom`, `--memory-headroom` | 30%, 20% | marges de la recommandation |
+| `--format` | text | `text`, `markdown` (résumé de job GitHub) ou `json` |
+| `--allow-live-dependencies` | | lève le refus hors mock |
+
+Le rapport donne, par palier, le débit, les erreurs, p50/p95/p99/max, le CPU moyen et la
+mémoire maximale des conteneurs de l'application (sans `mimic` ni les proxys des mesh), puis
+le palier de capacité (le plus haut débit non saturé), la raison de la saturation et une
+recommandation par pod : `requests.cpu` (CPU mesuré + marge, au millicœur), `requests.memory`
+et `limits.memory` (mémoire maximale + marge, au MiB), débit par pod et par cœur. Exemple de
+rapport (valeurs illustratives, deux pods derrière le Service) :
+
+```text
+palier  concurrence  durée   requêtes  débit/s  erreurs  p50      p95      p99      max      CPU/pod  mémoire/pod
+1       1            60.0 s  9912      165.2    0.0 %    6.0 ms   6.9 ms   7.4 ms   21.1 ms  210m     182Mi
+2       2            60.0 s  19604     326.7    0.0 %    6.1 ms   7.1 ms   7.9 ms   24.3 ms  395m     184Mi
+3       4            60.0 s  36210     603.5    0.0 %    6.6 ms   8.0 ms   9.2 ms   30.2 ms  760m     187Mi
+4       8            60.0 s  38001     633.4    0.0 %    12.6 ms  14.0 ms  15.1 ms  41.0 ms  795m     190Mi
+
+Capacité : palier 3, concurrence 4, 603.5 req/s, p99 9.2 ms.
+Saturation : palier 4, concurrence 8 : plateau, débit +5.0 % (seuil 10.0 %) pour une concurrence de 8 au lieu de 4.
+Recommandation par pod (marges CPU 30.0 %, mémoire 20.0 %) : requests.cpu 988m, requests.memory et limits.memory 225Mi ; 301.8 req/s par pod, 397 req/s par cœur.
+```
+
+Lecture : entre 4 et 8 requêtes simultanées, la latence double et le débit ne bouge plus ; les
+deux pods sont saturés vers 600 req/s, soit 300 par pod. Si le CPU moyen du palier de capacité
+est proche de `limits.cpu`, c'est la limite qui sature : la relever et refaire le tir. Les
+relevés de metrics-server sont des moyennes glissantes (15 à 30 s) : garder des paliers d'au
+moins 60 s pour des chiffres de CPU fiables.
 
 ### `diff` : comparer deux découvertes
 

@@ -352,11 +352,20 @@ pub fn saturation(
         return Some(Saturation::Latency);
     }
     match prev {
-        Some(p) if cur.concurrency > p.concurrency && cur.rps < p.rps * (1.0 + c.plateau) => {
+        Some(p)
+            if cur.concurrency > p.concurrency && cur.rps < p.rps * (1.0 + plateau(p, cur, c)) =>
+        {
             Some(Saturation::Plateau)
         }
         _ => None,
     }
+}
+
+/// Hausse de débit minimale d'un palier à l'autre : `plateau` fois la hausse relative de
+/// la concurrence (10 % de débit en plus pour une concurrence doublée, par défaut).
+fn plateau(prev: &StepSummary, cur: &StepSummary, c: &Criteria) -> f64 {
+    let growth = f64::from(cur.concurrency) / f64::from(prev.concurrency.max(1)) - 1.0;
+    c.plateau * growth
 }
 
 /// Palier de capacité et premier palier saturé, par leur rang.
@@ -573,7 +582,7 @@ fn rows(r: &Report) -> Vec<[String; 12]> {
             [
                 (i + 1).to_string(),
                 s.concurrency.to_string(),
-                format!("{:.0} s", s.duration_s),
+                format!("{:.1} s", s.duration_s),
                 s.requests.to_string(),
                 format!("{:.1}", s.rps),
                 percent(s.error_rate),
@@ -611,7 +620,7 @@ fn criteria_line(c: &Criteria) -> String {
     }
     let _ = write!(
         line,
-        ", débit en hausse de moins de {}.",
+        ", débit en hausse de moins de {} de la hausse de concurrence.",
         percent(c.plateau)
     );
     line
@@ -654,9 +663,9 @@ fn verdict_lines(r: &Report) -> Vec<String> {
                         0.0
                     };
                     format!(
-                        "plateau, débit {:+.1} % < {} avec une concurrence de {} au lieu de {}",
+                        "plateau, débit {:+.1} % (seuil {}) pour une concurrence de {} au lieu de {}",
                         gain * 100.0,
-                        percent(r.criteria.plateau),
+                        percent(plateau(prev, s, &r.criteria)),
                         s.concurrency,
                         prev.concurrency
                     )

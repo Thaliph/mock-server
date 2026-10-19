@@ -135,7 +135,7 @@ fn criteria() -> Criteria {
     Criteria {
         max_error_rate: 0.01,
         max_p99_us: None,
-        plateau: 0.05,
+        plateau: 0.1,
     }
 }
 

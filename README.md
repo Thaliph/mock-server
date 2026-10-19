@@ -23,6 +23,7 @@ La spécification complète, les critères d'acceptation et le plan de livraison
 | P7 | Webhook d'injection `mimic-injector` et CLI `mimicctl` | fait, validé sur kind avec la démo OpenTelemetry |
 | P6d | Parcours SRE : garde-fou production, `capture.inbound`, `selector`, label `version` des métriques | fait (étape kind E2E-04 ajoutée, non jouée en local) |
 | P6e | Mock centralisé : plus d'import entre sidecars sous contrôleur, un exemple rejouable par endpoint gardé hors rétention, historique de 24 heures par défaut | fait |
+| P8b | Tir de charge intégré `mimicctl load` : rejeu des requêtes enregistrées, concurrence fixe ou montée jusqu'à saturation, recommandation de CPU et de mémoire | fait |
 | P6f | Snapshot de mock léger : un pod en mock télécharge la forme de mock du snapshot (rejouables et durées par opération), compressée, identique sur tous les pods ; 47,4 Mo → 0,29 Mo sur le banc d'arrivée d'un pod | fait |
 
 ## Lancer le sidecar en local
@@ -58,6 +59,7 @@ mimicctl mode checkout mock -n shop          # bascule tous les pods du workload
 mimicctl status -A                           # mode souhaité, snapshot, pods alignés
 mimicctl export checkout -n shop --inbound --openapi-version 3.0 -o checkout.yaml
 mimicctl requests checkout -n shop --format k6 > replay.js
+mimicctl load checkout -n perf --target http://checkout.perf:8080 --ramp   # capacité et taille
 mimicctl diff semaine-1.yaml semaine-2.yaml --fail-on-breaking
 mimicctl report -n shop > decouverte.md      # API, top 10 des appels et leurs headers (Markdown)
 ```
