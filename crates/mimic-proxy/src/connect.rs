@@ -83,9 +83,15 @@ pub async fn tcp(addr: impl ToSocketAddrs, timeout: Duration) -> std::io::Result
 pub fn is_timeout(e: &(dyn std::error::Error + 'static)) -> bool {
     let mut cur = Some(e);
     while let Some(e) = cur {
-        if e.is::<ConnectTimeout>()
-            || e.downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        if e.is::<ConnectTimeout>() {
+            return true;
+        }
+        // `source` d'une `io::Error` saute l'erreur qu'elle enveloppe : elle est lue ici.
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && (io.kind() == std::io::ErrorKind::TimedOut
+                || io
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<ConnectTimeout>()))
         {
             return true;
         }
