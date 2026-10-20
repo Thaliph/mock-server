@@ -10,17 +10,15 @@ lecture seule du contrôleur, et l'API du contrôleur réservée aux sidecars. S
 
 | Surface | Écoute | Protocole | Authentification | Qui y accède |
 |---------|--------|-----------|------------------|--------------|
-| admin du sidecar | `0.0.0.0:15100` (port `mimic-admin`) | HTTP | **aucune** | sondes du kubelet, scraper, opérateurs par port-forward ; **tout pod du cluster** qui peut joindre l'IP du pod |
+| admin du sidecar | `0.0.0.0:15100` (port `mimic-admin`) | HTTP | aucune ; hors `/healthz`, `/readyz` et `/metrics`, seules les connexions de la boucle locale (`127.0.0.1`, `::1`) sont servies, les autres reçoivent `403` | sondes du kubelet et scraper (`/healthz`, `/readyz`, `/metrics`) ; opérateurs par `kubectl port-forward` ou `kubectl exec` pour le reste |
 | interface du contrôleur | `127.0.0.1:8081` | HTTP | aucune ; l'accès passe par `kubectl port-forward` (RBAC `pods/portforward` `create` dans `mimic-system`) | opérateurs, `mimicctl export/requests/report` |
 | API du contrôleur | `0.0.0.0:8443`, Service `mimic-controller:8443` | HTTPS | jeton de ServiceAccount projeté, validé par TokenReview (audience `mimic-controller`) | sidecars uniquement (NetworkPolicy : pods labellisés `mimic.platform.io/sidecar=true`) |
 
-> **Écart avec la spec.** La spec (§9.2) place l'admin du sidecar sur localhost, joignable par
-> port-forward. L'injecteur la configure sur `0.0.0.0:15100`, ce qu'exigent les sondes HTTP du
-> kubelet et la collecte des métriques. `PUT /mode` et `DELETE /store` ne sont pas
-> authentifiés : sur un sidecar **sans** contrôleur, n'importe quel pod qui joint le port
-> peut changer son mode ou purger son store. Sous contrôleur, les deux sont refusés (`403`).
-> Restreindre le port 15100 par NetworkPolicy au scraper si besoin (les sondes du kubelet ne
-> sont pas concernées par les NetworkPolicy sur la plupart des CNI).
+> L'admin écoute sur `0.0.0.0:15100`, ce qu'exigent les sondes HTTP du kubelet et la collecte
+> des métriques ; les pages, l'API et les ordres (`PUT /mode`, `DELETE /store`,
+> `/share/sync`) ne répondent qu'à la boucle locale (spec §9.2, SEC-07). `127.0.0.6`, d'où
+> Istio en mode sidecar relaie les autres pods, est refusée. Le proxy de l'API Kubernetes
+> (`kubectl get --raw …/proxy/…`) n'atteint donc que les sondes et `/metrics`.
 
 ## Admin du sidecar
 

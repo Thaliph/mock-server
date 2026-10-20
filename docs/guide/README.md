@@ -54,6 +54,9 @@ mimic est conçu pour les environnements **hors production** : les modes `mock` 
 
 ## Démarrage rapide
 
+Pour un premier essai sur un poste, la [démo locale sur kind](../demo-kind.md) déroule tout
+le parcours pas à pas, de la création du cluster au retour en `record`.
+
 ```sh
 # 1. Socle (une fois par cluster) : voir Installer pour le détail
 kubectl apply -f deploy/controller/namespace.yaml -f deploy/controller/crd.yaml -f deploy/controller/rbac.yaml
