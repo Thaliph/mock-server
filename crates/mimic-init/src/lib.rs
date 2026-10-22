@@ -609,7 +609,7 @@ mod tests {
         let l = lines(&r);
         let expected = [
             "-A MIMIC_OUTBOUND -m owner --uid-owner 1338 -j RETURN",
-            "-A MIMIC_OUTBOUND -o lo ! -d 127.0.0.1/32 -j RETURN",
+            "-A MIMIC_OUTBOUND -o lo -j RETURN",
             "-A MIMIC_OUTBOUND -d 10.96.0.1/32 -j RETURN",
             "-A MIMIC_OUTBOUND -p tcp --dport 53 -j RETURN",
             "-A MIMIC_OUTBOUND -p tcp --dport 5432 -j RETURN",
@@ -638,7 +638,14 @@ mod tests {
             exclude_outbound_cidrs: vec!["10.0.0.0/8".into(), "fd00::/8".into()],
             ..RulesConfig::default()
         });
-        assert!(r.restore.contains("! -d ::1/128"));
+        assert!(!r.restore.contains("! -d ::1/128"));
+        assert!(r.restore.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"));
+        let r = render(&RulesConfig {
+            ipv6: true,
+            intercept_loopback: true,
+            ..RulesConfig::default()
+        });
+        assert!(r.restore.contains("-o lo ! -d ::1/128 -j RETURN"));
         assert!(r.restore.contains("-d fd00::/8 -j RETURN"));
         assert!(!r.restore.contains("10.0.0.0/8"));
     }

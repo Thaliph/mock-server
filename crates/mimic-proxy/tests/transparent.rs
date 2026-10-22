@@ -1,4 +1,4 @@
-//! Interception transparente réelle (PRX-04, PRX-04b, PRX-08, PRX-15, INI-04).
+//! Interception transparente réelle (PRX-04, PRX-04b, PRX-08, PRX-15, PRX-23, INI-04, INI-12).
 //!
 //! Exige root dans un namespace réseau jetable : lancer `scripts/e2e-netns.sh`.
 //! Sans `MIMIC_NETNS_E2E=1`, le test ne fait rien (il ne doit jamais toucher l'iptables de l'hôte).
@@ -29,9 +29,15 @@ fn bin(name: &str) -> PathBuf {
     proxy.with_file_name(name)
 }
 
-fn init_rules() {
-    let status = Command::new(bin("mimic-init"))
-        .args(["--inbound-ports", ""])
+/// Pose les règles. Les dépendances factices écoutent sur la boucle locale : sans
+/// `loopback`, rien n'est intercepté (spec §3.1, INI-12).
+fn init_rules(loopback: bool) {
+    let mut cmd = Command::new(bin("mimic-init"));
+    cmd.args(["--inbound-ports", ""]);
+    if loopback {
+        cmd.arg("--intercept-loopback");
+    }
+    let status = cmd
         .status()
         .expect("mimic-init (cargo build --workspace d'abord)");
     assert!(status.success());
@@ -105,21 +111,21 @@ async fn wait_admin() {
     }
 }
 
-/// INI-04, PRX-04, PRX-04b, PRX-08 et PRX-15 : un seul scénario, qui pose de vraies règles
-/// iptables ; il ne tourne que dans le namespace jetable de `scripts/e2e-netns.sh`
-/// (`--ignored`, job CI `e2e-netns`).
+/// INI-04, INI-12, PRX-04, PRX-04b, PRX-08, PRX-15 et PRX-23 : un seul scénario, qui pose de
+/// vraies règles iptables ; il ne tourne que dans le namespace jetable de
+/// `scripts/e2e-netns.sh` (`--ignored`, job CI `e2e-netns`).
 #[tokio::test]
 #[ignore = "iptables réel : scripts/e2e-netns.sh"]
-async fn ini_04_prx_04_04b_08_15_transparent_interception_in_network_namespace() {
+async fn ini_04_12_prx_04_04b_08_15_23_transparent_interception_in_network_namespace() {
     assert_eq!(
         std::env::var("MIMIC_NETNS_E2E").as_deref(),
         Ok("1"),
         "à lancer par scripts/e2e-netns.sh, dans un namespace réseau jetable"
     );
     // INI-04 : deux applications, aucune règle dupliquée.
-    init_rules();
+    init_rules(true);
     let first = iptables_rules();
-    init_rules();
+    init_rules(true);
     assert_eq!(first, iptables_rules());
     assert_eq!(first.matches("-j MIMIC_OUTBOUND").count(), 1, "{first}");
 
@@ -281,6 +287,17 @@ async fn ini_04_prx_04_04b_08_15_transparent_interception_in_network_namespace()
         "connexion TLS fermée en mock"
     );
 
+    // PRX-23 : TCP non HTTP refusé en mock (`mock.tcp` absent), sans écho de la dépendance.
+    let mut s = TcpStream::connect(("127.0.0.1", echo)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"\x00\x00\x00\x08\x04\xd2\x16\x2fbinary")
+        .unwrap();
+    let mut buf = [0u8; 14];
+    assert!(
+        matches!(s.read(&mut buf), Ok(0) | Err(_)),
+        "connexion TCP fermée en mock"
+    );
+
     let hits = saas.hits();
     saas.stop();
     let r = client().get(&url).send().await.unwrap();
@@ -315,4 +332,29 @@ async fn ini_04_prx_04_04b_08_15_transparent_interception_in_network_namespace()
         m.contains(r#"mimic_passthrough_connections_total{direction="outbound",kind="tcp",result="relayed"} 2"#),
         "{m}"
     );
+    let refused = r#"mimic_passthrough_connections_total{direction="outbound",kind="tcp",result="refused"} 1"#;
+    assert!(m.contains(refused), "{m}");
+
+    // INI-12 : règles par défaut, la boucle locale n'est plus interceptée. Le sidecar reste en
+    // mock, et la même connexion TCP arrive à son serveur sans passer par lui.
+    init_rules(false);
+    let rules = iptables_rules();
+    assert!(rules.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"), "{rules}");
+    assert!(!rules.contains("! -d 127.0.0.1/32"), "{rules}");
+    let mut s = TcpStream::connect(("127.0.0.1", echo)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"\x00\x00\x00\x08\x04\xd2\x16\x2fbinary")
+        .unwrap();
+    let mut buf = [0u8; 14];
+    s.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"\x00\x00\x00\x08\x04\xd2\x16\x2fbinary");
+    let m = client()
+        .get(format!("{ADMIN}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(m.contains(refused), "aucun refus de plus : {m}");
 }
