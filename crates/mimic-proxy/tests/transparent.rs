@@ -339,7 +339,10 @@ async fn ini_04_12_prx_04_04b_08_15_23_transparent_interception_in_network_names
     // mock, et la même connexion TCP arrive à son serveur sans passer par lui.
     init_rules(false);
     let rules = iptables_rules();
-    assert!(rules.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"), "{rules}");
+    assert!(
+        rules.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"),
+        "{rules}"
+    );
     assert!(!rules.contains("! -d 127.0.0.1/32"), "{rules}");
     let mut s = TcpStream::connect(("127.0.0.1", echo)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

@@ -52,7 +52,10 @@ fn ini_12_loopback_is_not_intercepted_by_default() {
                 pod_ip: Some("10.244.0.20".into()),
                 ..RulesConfig::default()
             };
-            assert!(!c.intercept_loopback, "défaut : boucle locale non interceptée");
+            assert!(
+                !c.intercept_loopback,
+                "défaut : boucle locale non interceptée"
+            );
             let out = outbound(&c);
             let lo = position(&out, "-A MIMIC_OUTBOUND -o lo -j RETURN");
             // Après les RETURN de Mimic (et du mesh), donc après le trajet entrant du mesh.
@@ -117,7 +120,10 @@ fn ini_12_intercept_loopback_restores_the_loopback_redirect() {
 fn ini_12_intercept_loopback_from_environment_and_flag() {
     let run = |args: &[&str], env: &[(&str, &str)]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mimic-init"));
-        cmd.arg("--dry-run").args(args).env_clear().env("MIMIC_MESH", "none");
+        cmd.arg("--dry-run")
+            .args(args)
+            .env_clear()
+            .env("MIMIC_MESH", "none");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -126,9 +132,15 @@ fn ini_12_intercept_loopback_from_environment_and_flag() {
         String::from_utf8(out.stdout).unwrap()
     };
     let default = run(&[], &[]);
-    assert!(default.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"), "{default}");
+    assert!(
+        default.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"),
+        "{default}"
+    );
     let false_env = run(&[], &[("MIMIC_INTERCEPT_LOOPBACK", "false")]);
-    assert!(false_env.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"), "{false_env}");
+    assert!(
+        false_env.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"),
+        "{false_env}"
+    );
     for out in [
         run(&["--intercept-loopback"], &[]),
         run(&[], &[("MIMIC_INTERCEPT_LOOPBACK", "true")]),

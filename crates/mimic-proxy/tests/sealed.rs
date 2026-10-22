@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use mimic_proxy::Running;
-use mimic_proxy::config::{Config, Mode, MockTcp};
+use mimic_proxy::config::{Config, MockTcp, Mode};
 use mimic_proxy::net::Protocol;
 use mimic_proxy::proxy::{Silent, resolve_silent_within, tunnel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -80,8 +80,7 @@ async fn client_first(p: &Running, dst: SocketAddr, inbound: bool, protocol: Pro
     let state = p.state().clone();
     let relay = tokio::spawn(tunnel(state, sidecar, dst, protocol, inbound, None));
     let mut back = vec![0u8; payload.len()];
-    let got = match tokio::time::timeout(Duration::from_secs(5), app.read_exact(&mut back)).await
-    {
+    let got = match tokio::time::timeout(Duration::from_secs(5), app.read_exact(&mut back)).await {
         Ok(Ok(_)) => back,
         Ok(Err(_)) => vec![],
         Err(_) => panic!("ni écho ni fermeture"),
@@ -153,7 +152,10 @@ async fn prx_23_non_http_tcp_is_refused_in_mock_by_default() {
 
     // record : relayée, octets identiques.
     let p = proxy(config(None, Mode::Record)).await;
-    assert_eq!(client_first(&p, dep.addr, false, Protocol::Other).await, echo);
+    assert_eq!(
+        client_first(&p, dep.addr, false, Protocol::Other).await,
+        echo
+    );
     assert_eq!(dep.accepted(), 1);
 
     // mock, `mock.tcp` absent : refusée sans joindre la dépendance.
@@ -184,13 +186,19 @@ async fn prx_23_non_http_tcp_is_refused_in_mock_by_default() {
 
     // L'entrant n'est jamais concerné : relayé en mock (la sonde de l'adresse de
     // l'application compte aussi une connexion, §3.1).
-    assert_eq!(client_first(&p, dep.addr, true, Protocol::Other).await, echo);
+    assert_eq!(
+        client_first(&p, dep.addr, true, Protocol::Other).await,
+        echo
+    );
     assert!(dep.accepted() > 1);
 
     // mock-partial : relayée.
     set_mode(&p, "mock-partial").await;
     let before = dep.accepted();
-    assert_eq!(client_first(&p, dep.addr, false, Protocol::Other).await, echo);
+    assert_eq!(
+        client_first(&p, dep.addr, false, Protocol::Other).await,
+        echo
+    );
     assert_eq!(dep.accepted(), before + 1);
 
     // Rafale en mock : tous les refus comptés, au plus une ligne de log par seconde.
@@ -226,7 +234,10 @@ async fn prx_23_non_http_tcp_is_refused_in_mock_by_default() {
 
     // `mock.tcp: relay` : relayée en mock, mais le TLS non intercepté reste refusé.
     let p = proxy(mock_config(Some(MockTcp::Relay))).await;
-    assert_eq!(client_first(&p, dep.addr, false, Protocol::Other).await, echo);
+    assert_eq!(
+        client_first(&p, dep.addr, false, Protocol::Other).await,
+        echo
+    );
     assert_eq!(dep.accepted(), before + 2);
     assert!(
         client_first(&p, dep.addr, false, Protocol::Tls)
