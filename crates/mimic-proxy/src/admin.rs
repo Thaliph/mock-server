@@ -9,6 +9,7 @@ use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use mimic_core::model::Direction;
+use mimic_core::unmatched::UnmatchedReport;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -58,6 +59,7 @@ pub async fn handle(
         }
         (&Method::GET, "/api/operations") => json_response(&operations(&*state.discovery().await)),
         (&Method::GET, "/api/status") => json_response(&status(&state)),
+        (&Method::GET, "/api/unmatched") => json_response(&unmatched(&state, &query)),
         (&Method::GET, "/openapi/inbound") => json_response(&state.discovery().await.inbound),
         (&Method::GET, "/openapi/outbound") => {
             let d = state.discovery().await;
@@ -170,6 +172,18 @@ fn status(state: &AppState) -> Value {
             state.controller_status.lock().unwrap_or_else(PoisonError::into_inner).clone()
         }),
     })
+}
+
+/// Relevé des requêtes sans réponse du mock (spec §5.3, §9.2).
+fn unmatched(state: &AppState, query: &[(String, String)]) -> UnmatchedReport {
+    use mimic_core::unmatched::MAX_TRACKED;
+    let limit = query
+        .iter()
+        .find(|(n, _)| n == "limit")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(MAX_TRACKED)
+        .min(MAX_TRACKED);
+    state.unmatched_report(limit)
 }
 
 /// Catalogue des opérations de la découverte courante.
