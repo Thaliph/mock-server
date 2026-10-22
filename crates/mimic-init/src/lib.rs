@@ -51,6 +51,10 @@ pub struct RulesConfig {
     pub mesh: Mesh,
     /// IP du pod (`POD_IP`), cible du trajet entrant en ambient (spec §3.3.2).
     pub pod_ip: Option<String>,
+    /// Redirige aussi le trafic vers `127.0.0.1` et `::1` (spec §3.1) : tests en namespace
+    /// réseau, où les dépendances factices écoutent sur la boucle locale. Faux par défaut :
+    /// le trafic local du pod n'est pas intercepté, comme sous Istio.
+    pub intercept_loopback: bool,
 }
 
 impl Default for RulesConfig {
@@ -68,6 +72,7 @@ impl Default for RulesConfig {
             ipv6: false,
             mesh: Mesh::None,
             pod_ip: None,
+            intercept_loopback: false,
         }
     }
 }
@@ -469,9 +474,15 @@ fn render_mesh(c: &RulesConfig) -> Rules {
 
 /// Règles sortantes communes, après le `RETURN` des UID exclus (spec §3.1).
 fn outbound_rules(c: &RulesConfig, r: &mut String) {
-    let loopback = if c.ipv6 { "::1/128" } else { "127.0.0.1/32" };
-    // Appel de l'application vers l'IP du pod : c'est du trafic entrant, pas une dépendance.
-    let _ = writeln!(r, "-A {OUTBOUND_CHAIN} -o lo ! -d {loopback} -j RETURN");
+    // Trafic local du pod : un conteneur voisin (agent OTel, Dapr, cloud-sql-proxy) ou
+    // l'application elle-même par l'IP du pod, pas une dépendance. Les connexions que le
+    // voisin ouvre ensuite vers l'extérieur passent, elles, par cette chaîne.
+    if c.intercept_loopback {
+        let loopback = if c.ipv6 { "::1/128" } else { "127.0.0.1/32" };
+        let _ = writeln!(r, "-A {OUTBOUND_CHAIN} -o lo ! -d {loopback} -j RETURN");
+    } else {
+        let _ = writeln!(r, "-A {OUTBOUND_CHAIN} -o lo -j RETURN");
+    }
     for cidr in c
         .exclude_outbound_cidrs
         .iter()
@@ -640,14 +651,14 @@ mod tests {
         });
         assert!(!r.restore.contains("! -d ::1/128"));
         assert!(r.restore.contains("-A MIMIC_OUTBOUND -o lo -j RETURN"));
-        let r = render(&RulesConfig {
+        assert!(r.restore.contains("-d fd00::/8 -j RETURN"));
+        assert!(!r.restore.contains("10.0.0.0/8"));
+        let lo = render(&RulesConfig {
             ipv6: true,
             intercept_loopback: true,
             ..RulesConfig::default()
         });
-        assert!(r.restore.contains("-o lo ! -d ::1/128 -j RETURN"));
-        assert!(r.restore.contains("-d fd00::/8 -j RETURN"));
-        assert!(!r.restore.contains("10.0.0.0/8"));
+        assert!(lo.restore.contains("-o lo ! -d ::1/128 -j RETURN"));
     }
 
     #[test]
