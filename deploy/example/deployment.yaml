@@ -66,6 +66,12 @@ spec:
               valueFrom: {secretKeyRef: {name: checkout-mimic, key: redact-salt}}
           ports:
             - {name: mimic-admin, containerPort: 15100}
+          # L'application ne démarre qu'une fois l'état souhaité connu (spec §5.5.5) :
+          # share.startup.timeout (configmap.yaml) + 30 s de marge.
+          startupProbe:
+            httpGet: {path: /readyz, port: mimic-admin}
+            periodSeconds: 1
+            failureThreshold: 60
           readinessProbe:
             httpGet: {path: /readyz, port: mimic-admin}
           livenessProbe:

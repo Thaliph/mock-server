@@ -1,4 +1,4 @@
-//! Mutation des pods par le webhook d'injection (spec §9.4, INJ-01 à 07, INJ-10 à 13).
+//! Mutation des pods par le webhook d'injection (spec §9.4, INJ-01 à 07, INJ-10 à 13, INJ-21).
 
 use k8s_openapi::api::core::v1::{Container, EnvVar, Pod};
 use mimic_injector::config::InjectorConfig;
@@ -110,7 +110,7 @@ fn inj_01_pod_receives_init_container_and_native_sidecar() {
     let startup = sidecar.startup_probe.as_ref().unwrap();
     assert_eq!(
         startup.http_get.as_ref().unwrap().path.as_deref(),
-        Some("/healthz")
+        Some("/readyz")
     );
     assert_eq!(sidecar.ports.as_ref().unwrap()[0].container_port, 15100);
     assert_eq!(env_value(sidecar, "MIMIC_WORKLOAD"), Some("checkout"));
@@ -469,7 +469,7 @@ fn assert_mesh_sidecar(p: &Pod, mesh: &str) {
     let sidecar = inits.iter().find(|c| c.name == "mimic").unwrap();
     assert_eq!(
         exec(sidecar.startup_probe.as_ref()),
-        ["/usr/local/bin/mimic-proxy", "--probe", "/healthz"]
+        ["/usr/local/bin/mimic-proxy", "--probe", "/readyz"]
     );
     assert_eq!(
         exec(sidecar.liveness_probe.as_ref()),
@@ -518,7 +518,7 @@ fn inj_11_mimic_runs_after_the_mesh_containers() {
             "--config",
             "/etc/mimic/mimic.yaml",
             "--probe",
-            "/healthz"
+            "/readyz"
         ]
     );
 }
@@ -604,4 +604,91 @@ fn inj_13_mesh_annotation() {
     assert_eq!(init_env(&p).as_deref(), Some("auto"));
     let warning = mesh_warning(&unknown).expect("avertissement");
     assert!(warning.contains("consul"), "{warning}");
+}
+
+/// Seuils d'une sonde : chemin (HTTP ou `exec`), période, échecs tolérés.
+fn thresholds(probe: Option<&k8s_openapi::api::core::v1::Probe>) -> (String, i32, i32) {
+    let probe = probe.expect("sonde présente");
+    let path = match (&probe.http_get, &probe.exec) {
+        (Some(h), _) => h.path.clone().unwrap_or_default(),
+        (None, Some(e)) => e
+            .command
+            .clone()
+            .unwrap_or_default()
+            .last()
+            .cloned()
+            .unwrap(),
+        (None, None) => panic!("sonde sans action"),
+    };
+    (
+        path,
+        probe.period_seconds.unwrap(),
+        probe.failure_threshold.unwrap(),
+    )
+}
+
+/// La `startupProbe` du sidecar attend la barrière de démarrage (`/readyz`) pendant
+/// `share.startup.timeout` + 30 s ; la vivacité reste sur `/healthz` (INJ-21, spec §5.5.5).
+#[test]
+fn inj_21_startup_probe_waits_for_the_startup_gate() {
+    let sidecar = sidecar_of(&injected(&pod(json!({}))));
+    assert_eq!(
+        thresholds(sidecar.startup_probe.as_ref()),
+        ("/readyz".into(), 1, 60)
+    );
+    assert_eq!(
+        thresholds(sidecar.readiness_probe.as_ref()),
+        ("/readyz".into(), 10, 3)
+    );
+    assert_eq!(
+        thresholds(sidecar.liveness_probe.as_ref()),
+        ("/healthz".into(), 10, 3)
+    );
+
+    // Délai lu dans la configuration en ligne des sidecars.
+    let mut cfg = config();
+    cfg.sidecar_config = "mode: record\nshare:\n  url: https://ctl:8443\n  ca_file: /ca.crt\n  startup: {timeout: 90, fallback: fail}\n".into();
+    let p = match mutate(&pod(json!({})), &cfg) {
+        Outcome::Injected(p) => *p,
+        Outcome::Skipped(r) => panic!("{r}"),
+    };
+    assert_eq!(
+        thresholds(sidecar_of(&p).startup_probe.as_ref()),
+        ("/readyz".into(), 1, 120)
+    );
+
+    // Configuration montée par ConfigMap, que le webhook ne lit pas : délai maximal.
+    let mounted = pod(json!({"metadata": {"annotations": {
+        "mimic.platform.io/config": "checkout-mimic"
+    }}}));
+    assert_eq!(
+        thresholds(sidecar_of(&injected(&mounted)).startup_probe.as_ref()),
+        ("/readyz".into(), 1, 330)
+    );
+
+    // Dans un mesh, sondes `exec` avec les mêmes seuils, y compris après réinvocation.
+    let meshed = sidecar_of(&injected(&istio_pod()));
+    assert_eq!(
+        thresholds(meshed.startup_probe.as_ref()),
+        ("/readyz".into(), 1, 60)
+    );
+    let mut later = injected(&pod(json!({})));
+    later
+        .spec
+        .as_mut()
+        .unwrap()
+        .init_containers
+        .as_mut()
+        .unwrap()
+        .insert(0, native("istio-proxy"));
+    let adapted = sidecar_of(&injected(&later));
+    assert!(adapted.startup_probe.as_ref().unwrap().exec.is_some());
+    assert_eq!(
+        thresholds(adapted.startup_probe.as_ref()),
+        ("/readyz".into(), 1, 60)
+    );
+    assert_eq!(
+        thresholds(adapted.liveness_probe.as_ref()),
+        ("/healthz".into(), 10, 3)
+    );
 }

@@ -106,6 +106,11 @@ pub async fn start(config: Config) -> Result<Running, String> {
             .map_err(|e| format!("store {}: {e}", dir.display()))?;
         tracing::info!(loaded, dir = %dir.display(), "store local rechargé");
     }
+    // Sous contrôleur, le dernier état souhaité gardé (ou l'attente en mock) s'applique avant
+    // la première connexion : rien de ce qui arrive ne sort s'il s'agit d'un mock (§5.5.5).
+    if state.config.controlled() {
+        control::prepare_startup(&state).await;
+    }
     // Démarrage en mock : moteur construit avant d'écouter (spec §5.3).
     state.ensure_mock_engine();
     let mut tasks = vec![];
@@ -138,12 +143,15 @@ pub async fn start(config: Config) -> Result<Running, String> {
     // Un sidecar piloté n'obéit qu'au contrôleur : l'annotation de mode est ignorée.
     let controller = match &state.config.share {
         Some(share) if share.is_controller() => {
-            control::restore(&state);
             let client = Arc::new(control::ControllerClient::new(&state, share)?);
             tasks.push(control::spawn(
                 state.clone(),
                 client.clone(),
                 share.mode_poll,
+            ));
+            tasks.push(control::spawn_startup_deadline(
+                state.clone(),
+                share.startup.timeout,
             ));
             Some(client)
         }

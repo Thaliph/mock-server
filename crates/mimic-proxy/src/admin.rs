@@ -50,7 +50,8 @@ pub async fn handle(
     }
     let query = parse_query(req.uri().query());
     match (&method, path.as_str()) {
-        (&Method::GET, "/healthz") | (&Method::GET, "/readyz") => text(StatusCode::OK, "ok"),
+        (&Method::GET, "/healthz") => text(StatusCode::OK, "ok"),
+        (&Method::GET, "/readyz") => readyz(&state),
         (&Method::GET, "/") => {
             let d = state.discovery().await;
             let html = render_page(&state, &d);
@@ -152,6 +153,44 @@ fn json_response<T: Serialize>(v: &T) -> Response<ProxyBody> {
     }
 }
 
+/// Barrière de démarrage (spec §5.5.5) : `503` tant qu'elle est fermée, ce qui retient la
+/// `startupProbe` du native sidecar, donc l'application ; `200` ensuite, quel que soit l'état
+/// du contrôleur. La vivacité (`/healthz`) n'en dépend pas.
+fn readyz(state: &AppState) -> Response<ProxyBody> {
+    if !state.config.controlled() {
+        return text(StatusCode::OK, "ok");
+    }
+    let phase = state.startup_phase();
+    let code = if phase.is_open() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    text(code, phase.as_str())
+}
+
+/// État du lien avec le contrôleur, barrière de démarrage comprise.
+fn controller_status(state: &AppState) -> Value {
+    let status = state
+        .controller_status
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let mut v = serde_json::to_value(status).unwrap_or_else(|_| json!({}));
+    let startup = state
+        .config
+        .share
+        .as_ref()
+        .map(|s| s.startup.clone())
+        .unwrap_or_default();
+    v["startup"] = json!({
+        "state": state.startup_phase().as_str(),
+        "fallback": startup.fallback.as_str(),
+        "timeout": startup.timeout.as_secs_f64(),
+    });
+    v
+}
+
 fn status(state: &AppState) -> Value {
     let (local, peer) = state.store.counts();
     json!({
@@ -166,9 +205,7 @@ fn status(state: &AppState) -> Value {
         "store": {"local": local, "peer": peer},
         "share": *state.share_status.lock().unwrap_or_else(PoisonError::into_inner),
         "snapshot": state.snapshot().map(|s| s.id.clone()),
-        "controller": state.config.controlled().then(|| {
-            state.controller_status.lock().unwrap_or_else(PoisonError::into_inner).clone()
-        }),
+        "controller": state.config.controlled().then(|| controller_status(state)),
     })
 }
 

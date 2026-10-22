@@ -447,7 +447,7 @@ fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]
             ..Default::default()
         }
     });
-    Container {
+    let mut side = Container {
         name: "mimic".into(),
         image: Some(cfg.image.clone()),
         image_pull_policy: cfg.image_pull_policy.clone(),
@@ -460,10 +460,6 @@ fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]
             container_port: ADMIN_PORT,
             ..ContainerPort::default()
         }]),
-        // L'application ne démarre qu'une fois le proxy prêt (et la CA publiée).
-        startup_probe: Some(probe(pod, "/healthz", 1, 30)),
-        readiness_probe: Some(probe(pod, "/readyz", 10, 3)),
-        liveness_probe: Some(probe(pod, "/healthz", 10, 3)),
         resources: Some(resources),
         security_context: Some(SecurityContext {
             run_as_user: Some(SIDECAR_UID),
@@ -480,7 +476,40 @@ fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]
         }),
         volume_mounts: Some(mounts),
         ..Container::default()
-    }
+    };
+    set_probes(&mut side, pod, cfg);
+    side
+}
+
+/// Marge de la `startupProbe` au-delà du délai de démarrage du sidecar : démarrage du
+/// processus, chargement du snapshot et construction du moteur de mock (spec §5.5.5).
+const STARTUP_MARGIN_SECS: i32 = 30;
+
+/// Sondes du sidecar (spec §5.5.5, §9.4). La `startupProbe` attend la barrière de démarrage
+/// (`/readyz`) : le kubelet ne démarre l'application qu'après son succès. Elle tolère le délai
+/// de démarrage plus une marge, pour que le sidecar ouvre sa barrière (état connu ou repli)
+/// avant d'être relancé. La vivacité (`/healthz`) ne dépend ni du contrôleur ni de la barrière.
+fn set_probes(side: &mut Container, pod: &Pod, cfg: &InjectorConfig) {
+    side.startup_probe = Some(probe(pod, "/readyz", 1, startup_failures(pod, cfg)));
+    side.readiness_probe = Some(probe(pod, "/readyz", 10, 3));
+    side.liveness_probe = Some(probe(pod, "/healthz", 10, 3));
+}
+
+/// Échecs tolérés par la `startupProbe` (période 1 s) : `share.startup.timeout` de la
+/// configuration en ligne, plus la marge ; une configuration montée par ConfigMap n'est pas
+/// lue (aucun appel à l'API), le délai maximal s'applique alors.
+fn startup_failures(pod: &Pod, cfg: &InjectorConfig) -> i32 {
+    use mimic_proxy::config::{Config, MAX_STARTUP_TIMEOUT, StartupConfig};
+    let timeout = if annotation(pod, ANNOTATION_CONFIG).is_some() {
+        MAX_STARTUP_TIMEOUT
+    } else {
+        serde_yaml::from_str::<Config>(&cfg.sidecar_config)
+            .ok()
+            .and_then(|c| c.share)
+            .map_or_else(|| StartupConfig::default().timeout, |s| s.startup.timeout)
+            .min(MAX_STARTUP_TIMEOUT)
+    };
+    timeout.as_secs_f64().ceil() as i32 + STARTUP_MARGIN_SECS
 }
 
 fn volumes(pod: &Pod, cfg: &InjectorConfig) -> Vec<Volume> {
@@ -573,7 +602,7 @@ fn place(mut inits: Vec<Container>, mimic: [Container; 2]) -> Vec<Container> {
 
 /// Réinvocation (spec §9.4) : un pod injecté avant le webhook du mesh repasse derrière ses
 /// conteneurs, avec `MIMIC_MESH` et les sondes d'un pod du mesh.
-fn adapt(pod: &Pod) -> Outcome {
+fn adapt(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
     let skipped = || Outcome::Skipped("mimic déjà injecté".into());
     if mesh_of(pod).is_none() {
         return skipped();
@@ -597,9 +626,7 @@ fn adapt(pod: &Pod) -> Outcome {
         Some(e) => e.value = Some(mesh_mode(pod)),
         None => envs.insert(0, env("MIMIC_MESH", mesh_mode(pod))),
     }
-    side.startup_probe = Some(probe(pod, "/healthz", 1, 30));
-    side.readiness_probe = Some(probe(pod, "/readyz", 10, 3));
-    side.liveness_probe = Some(probe(pod, "/healthz", 10, 3));
+    set_probes(&mut side, pod, cfg);
     spec.init_containers = Some(place(inits, [init, side]));
     if out == *pod {
         return skipped();
@@ -613,7 +640,7 @@ pub fn mutate(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
         return Outcome::Skipped("pod sans spec".into());
     }
     if already_injected(pod) {
-        return adapt(pod);
+        return adapt(pod, cfg);
     }
     if let Some(reason) = skip_reason(pod) {
         return Outcome::Skipped(reason);

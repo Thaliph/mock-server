@@ -1,10 +1,11 @@
 //! Lien avec le contrôleur (spec §5.5 et §7.1) : seul canal par lequel le mode et le
 //! snapshot d'un sidecar piloté changent. Le sidecar télécharge la forme de mock du snapshot
-//! (spec §5.6), compressée, et la garde sur disque si `store.dir` est configuré.
+//! (spec §5.6), compressée, et la garde sur disque si `store.dir` est configuré. Le premier
+//! état souhaité appliqué ouvre la barrière de démarrage de l'application (spec §5.5.5).
 
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, StatusCode, header};
@@ -14,10 +15,12 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use mimic_core::snapshot::{MockSnapshot, Snapshot, digest};
+use mimic_core::startup::Phase;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{InboundCapture, MockWebsocket, Mode, ShareConfig};
+use crate::config::{InboundCapture, MockWebsocket, Mode, ShareConfig, StartupFallback};
 use crate::state::AppState;
+use crate::throttle::LogLimiter;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -296,16 +299,17 @@ fn cache_dir(state: &AppState) -> Option<PathBuf> {
         .map(|d| d.join("controller"))
 }
 
-/// Recharge le dernier état souhaité et son snapshot depuis `store.dir`.
-pub fn restore(state: &AppState) {
+/// Recharge le dernier état souhaité et son snapshot depuis `store.dir` ; vrai si un état
+/// a été rechargé.
+pub fn restore(state: &AppState) -> bool {
     let Some(dir) = cache_dir(state) else {
-        return;
+        return false;
     };
     let Ok(text) = std::fs::read(dir.join("desired.json")) else {
-        return;
+        return false;
     };
     let Ok(desired) = serde_json::from_slice::<Desired>(&text) else {
-        return;
+        return false;
     };
     if let Some(id) = &desired.snapshot
         && let Some(snap) = cached_snapshot(&dir.join("snapshots"), id)
@@ -335,6 +339,25 @@ pub fn restore(state: &AppState) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .desired = desired;
+    true
+}
+
+/// Avant les écoutes (spec §5.5.5) : dernier état souhaité rechargé, sinon attente en mock
+/// sur les données locales si le repli ne doit rien laisser sortir.
+pub async fn prepare_startup(state: &AppState) {
+    let restored = restore(state);
+    let mut gate = state.startup.lock().await;
+    if restored {
+        gate.received();
+    }
+    if gate.waits_in_mock() {
+        tracing::info!(
+            fallback = gate.fallback().as_str(),
+            "aucun état souhaité connu : attente du contrôleur en mock, rien ne sort"
+        );
+        state.set_mode(Mode::Mock);
+    }
+    state.publish_startup(&gate);
 }
 
 /// Forme de mock gardée sur disque ; à défaut, un snapshot complet gardé par une version
@@ -370,6 +393,9 @@ fn save(state: &AppState, desired: &Desired, snap: Option<&MockSnapshot>) {
     }
 }
 
+/// Au plus une ligne de journal par période pour les battements en échec (spec §9.3).
+const FAILURE_LOG_PERIOD: Duration = Duration::from_secs(30);
+
 /// Battement : annonce l'état du sidecar et applique l'état souhaité en retour.
 pub fn spawn(
     state: Arc<AppState>,
@@ -377,52 +403,201 @@ pub fn spawn(
     poll: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let log = LogLimiter::new(FAILURE_LOG_PERIOD);
+        let mut failures = 0u64;
         loop {
-            let result = beat(&state, &client).await;
+            let outcome = beat(&state, &client).await;
+            state
+                .metrics
+                .count_heartbeat(!matches!(outcome, Beat::Failed(_)), unix_secs());
+            let error = match outcome {
+                Beat::Aligned => None,
+                Beat::Incomplete(e) | Beat::Failed(e) => Some(e),
+            };
+            match &error {
+                None if failures > 0 => {
+                    tracing::info!(failures, "battement vers le contrôleur rétabli");
+                    failures = 0;
+                }
+                None => {}
+                Some(e) => {
+                    failures += 1;
+                    if let Some(omitted) = log.allow(Instant::now()) {
+                        tracing::warn!(error = %e, omitted, "battement vers le contrôleur échoué");
+                    }
+                }
+            }
             {
                 let mut status = state
                     .controller_status
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                match result {
-                    Ok(()) => {
-                        status.last_ok_ms = Some(crate::share::now_ms());
-                        status.last_error = None;
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "battement vers le contrôleur échoué");
-                        status.last_error = Some(e);
-                    }
+                if error.is_none() {
+                    status.last_ok_ms = Some(crate::share::now_ms());
                 }
+                status.last_error = error;
             }
             tokio::time::sleep(poll).await;
         }
     })
 }
 
-async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String> {
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Échéance de `share.startup.timeout` (spec §5.5.5) : la barrière s'ouvre sur l'état connu,
+/// sinon sur le repli ; avec `fail` sans état connu, elle reste fermée.
+pub fn spawn_startup_deadline(
+    state: Arc<AppState>,
+    timeout: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let mut gate = state.startup.lock().await;
+        let was_open = gate.is_open();
+        let fallback = gate.timeout();
+        if let Some(f) = fallback {
+            state.set_mode(fallback_mode(f));
+        }
+        state.publish_startup(&gate);
+        if was_open {
+            return;
+        }
+        let timeout_s = timeout.as_secs_f64();
+        let mode = state.mode().as_str();
+        match (gate.phase(), fallback) {
+            (Phase::Fallback, Some(f)) => tracing::warn!(
+                timeout_s,
+                fallback = f.as_str(),
+                mode,
+                "contrôleur injoignable au démarrage : repli share.startup.fallback appliqué, l'application démarre"
+            ),
+            (Phase::LastKnown, _) => tracing::warn!(
+                timeout_s,
+                mode,
+                "pas aligné à l'échéance du démarrage : dernier état souhaité connu appliqué, l'application démarre"
+            ),
+            _ => tracing::error!(
+                timeout_s,
+                "contrôleur injoignable au démarrage avec share.startup.fallback: fail : l'application attend sa réponse"
+            ),
+        }
+    })
+}
+
+/// Mode d'un repli de démarrage.
+fn fallback_mode(f: StartupFallback) -> Mode {
+    match f {
+        StartupFallback::Record => Mode::Record,
+        StartupFallback::Passthrough => Mode::Passthrough,
+        StartupFallback::MockLocal | StartupFallback::Fail => Mode::Mock,
+    }
+}
+
+/// Issue d'un battement.
+enum Beat {
+    /// État souhaité reçu et appliqué en entier, snapshot compris.
+    Aligned,
+    /// État reçu mais pas appliqué en entier : snapshot non téléchargé, valeur inconnue.
+    Incomplete(String),
+    /// Pas de réponse exploitable du contrôleur.
+    Failed(String),
+}
+
+/// État souhaité traduit ; un champ absent prend la valeur de la configuration (ressource
+/// supprimée, réglage plus imposé).
+struct Wanted {
+    mode: Mode,
+    capture: InboundCapture,
+    websocket: MockWebsocket,
+}
+
+impl Wanted {
+    fn parse(state: &AppState, d: &Desired) -> Result<Self, String> {
+        let mode = match d.mode.as_deref() {
+            Some(m) => Mode::parse(m).ok_or_else(|| format!("mode souhaité inconnu: {m}"))?,
+            None => state.config.mode,
+        };
+        let capture = match d.capture_inbound.as_deref() {
+            Some(c) => InboundCapture::parse(c)
+                .ok_or_else(|| format!("capture de l'entrant inconnue: {c}"))?,
+            None => state.config.capture.inbound,
+        };
+        let websocket = match d.mock_websocket.as_deref() {
+            Some(w) => {
+                MockWebsocket::parse(w).ok_or_else(|| format!("réglage WebSocket inconnu: {w}"))?
+            }
+            None => state.config.mock.websocket,
+        };
+        Ok(Self {
+            mode,
+            capture,
+            websocket,
+        })
+    }
+
+    /// Le snapshot d'abord (`Some`, son retrait compris) : un passage en mock sert ainsi
+    /// directement le bon jeu.
+    fn apply(&self, state: &AppState, snapshot: Option<Option<Arc<MockSnapshot>>>) {
+        if let Some(s) = snapshot {
+            state.set_snapshot(s);
+        }
+        state.set_mode(self.mode);
+        state.set_inbound_capture(self.capture);
+        state.set_mock_websocket(self.websocket);
+    }
+}
+
+async fn beat(state: &AppState, client: &ControllerClient) -> Beat {
     let loaded = state.snapshot().map(|s| s.id.clone());
-    let desired = client
+    let desired = match client
         .heartbeat(
             state.mode(),
             loaded.clone(),
             state.inbound_capture(),
             state.mock_websocket(),
         )
-        .await?;
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => return Beat::Failed(e),
+    };
+    let wanted = match Wanted::parse(state, &desired) {
+        Ok(w) => w,
+        Err(e) => return Beat::Incomplete(e),
+    };
     let previous = state
         .controller_status
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .desired
         .clone();
-    // Le snapshot d'abord : un passage en mock sert ainsi directement le bon jeu. S'il ne
-    // peut pas être téléchargé, le mode est appliqué quand même (le mock sert alors les
-    // données locales, rien ne sort) et le téléchargement est retenté au battement suivant.
+    let fetch = desired
+        .snapshot
+        .as_ref()
+        .filter(|id| loaded.as_ref() != Some(*id));
+    let unsaved = {
+        let mut gate = state.startup.lock().await;
+        // Un état connu avant ce battement est déjà sur disque (rechargé, ou reçu et écrit).
+        let unsaved = !gate.known();
+        if fetch.is_some() && !gate.is_open() {
+            // Barrière fermée : l'application n'a pas démarré, l'état reçu s'applique dès la
+            // réponse, en mock sur les données locales le temps du téléchargement (§5.5.5).
+            wanted.apply(state, None);
+            gate.received();
+            state.publish_startup(&gate);
+        }
+        unsaved
+    };
+    // S'il ne peut pas être téléchargé, le mode est appliqué quand même (le mock sert alors
+    // les données locales, rien ne sort) et le téléchargement est retenté au battement suivant.
     let mut fetched = None;
     let mut fetch_error = None;
-    match &desired.snapshot {
-        Some(id) if loaded.as_ref() != Some(id) => match client.snapshot(id).await {
+    if let Some(id) = fetch {
+        match client.snapshot(id).await {
             Ok(f) => {
                 let snap = Arc::new(f.snapshot);
                 tracing::info!(
@@ -433,40 +608,27 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
                     full = f.full,
                     "snapshot chargé"
                 );
-                state.set_snapshot(Some(snap.clone()));
                 fetched = Some(snap);
             }
             Err(e) => fetch_error = Some(format!("snapshot {id}: {e}")),
-        },
-        None if loaded.is_some() => state.set_snapshot(None),
-        _ => {}
+        }
     }
-    match desired.mode.as_deref() {
-        Some(m) => match Mode::parse(m) {
-            Some(mode) => state.set_mode(mode),
-            None => return Err(format!("mode souhaité inconnu: {m}")),
-        },
-        // Ressource supprimée : retour au mode de la configuration.
-        None if previous.mode.is_some() => state.set_mode(state.config.mode),
-        None => {}
+    let snapshot = match &fetched {
+        Some(s) => Some(Some(s.clone())),
+        None if desired.snapshot.is_none() && loaded.is_some() => Some(None),
+        None => None,
+    };
+    {
+        let mut gate = state.startup.lock().await;
+        wanted.apply(state, snapshot);
+        if fetch_error.is_none() {
+            gate.aligned();
+        } else {
+            gate.received();
+        }
+        state.publish_startup(&gate);
     }
-    match desired.capture_inbound.as_deref() {
-        Some(c) => match InboundCapture::parse(c) {
-            Some(c) => state.set_inbound_capture(c),
-            None => return Err(format!("capture de l'entrant inconnue: {c}")),
-        },
-        // Plus de capture imposée : celle de la configuration.
-        None => state.set_inbound_capture(state.config.capture.inbound),
-    }
-    match desired.mock_websocket.as_deref() {
-        Some(w) => match MockWebsocket::parse(w) {
-            Some(w) => state.set_mock_websocket(w),
-            None => return Err(format!("réglage WebSocket inconnu: {w}")),
-        },
-        // Plus de réglage imposé : celui de la configuration.
-        None => state.set_mock_websocket(state.config.mock.websocket),
-    }
-    if desired != previous || fetched.is_some() {
+    if desired != previous || fetched.is_some() || unsaved {
         save(state, &desired, fetched.as_deref());
         state
             .controller_status
@@ -474,5 +636,5 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Result<(), String>
             .unwrap_or_else(PoisonError::into_inner)
             .desired = desired;
     }
-    fetch_error.map_or(Ok(()), Err)
+    fetch_error.map_or(Beat::Aligned, Beat::Incomplete)
 }

@@ -34,3 +34,8 @@ data:
       interval: 10
       mode_poll: 2
       max_snapshot_bytes: 67108864   # 64 MiB : forme de mock téléchargée (spec §5.6)
+      # L'application attend le premier état souhaité (spec §5.5.5) : la startupProbe du
+      # sidecar (deployment.yaml) tolère timeout + 30 échecs à 1 s d'intervalle.
+      startup:
+        timeout: 30          # secondes, au plus 300
+        fallback: record     # record | passthrough | mock-local | fail : contrôleur injoignable
