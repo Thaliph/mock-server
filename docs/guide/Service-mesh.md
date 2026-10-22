@@ -65,7 +65,8 @@ Dans un mesh :
   2. le trafic de mimic (UID 1338) : `RETURN`, il continue vers les chaînes du mesh, qui
      l'envoient à leur proxy comme celui de l'application ;
   3. le trafic propre du mesh : `RETURN` ;
-  4. les règles sortantes : IP du pod par `lo`, CIDR et ports exclus, puis redirection vers 15101.
+  4. les règles sortantes : trafic local (`-o lo` : autres conteneurs du pod, IP du pod) laissé
+     passer, comme le fait le mesh, CIDR et ports exclus, puis redirection vers 15101.
 
 | Mesh | Détecté par (table `nat`) | Trajet entrant reconnu par | Trafic du mesh reconnu par |
 |------|---------------------------|----------------------------|----------------------------|

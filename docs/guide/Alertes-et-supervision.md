@@ -34,6 +34,7 @@ dans le pod ; en Istio ambient, les sondes restent HTTP.
 | mock incomplet | `599` à l'application | `mimic_mock_responses_total{match="unmatched"}` |
 | mock sans snapshot | le pod sert ses seules données locales | `mimic_mode{mode="mock"} == 1` et `mimic_mock_snapshot_exchanges == 0` |
 | HTTPS coupé en mock | connexions fermées par mimic | `mimic_passthrough_connections_total{kind="tls",result="refused"}` |
+| TCP non HTTP coupé en mock (base, broker, cache) | connexions fermées par mimic (`mock.tcp: refuse`) | `mimic_passthrough_connections_total{kind="tcp",result="refused"}` ; log `… refusée en mode mock` avec `destination` |
 | interception TLS refusée par l'application | appels HTTPS de la dépendance en échec | `mimic_tls_handshake_failures_total` |
 
 ### Contrôleur et élection
@@ -150,6 +151,11 @@ spec:
           labels: {severity: info}
           annotations:
             summary: "Connexions HTTPS non interceptées coupées en mock ({{ $labels.namespace }}/{{ $labels.pod }})"
+        - alert: MimicMockTcpRefused
+          expr: sum by (namespace, pod) (increase(mimic_passthrough_connections_total{direction="outbound", kind="tcp", result="refused"}[10m])) > 0
+          labels: {severity: info}
+          annotations:
+            summary: "Connexions TCP non HTTP coupées en mock ({{ $labels.namespace }}/{{ $labels.pod }})"
         - alert: MimicTlsInterceptRejected
           expr: sum by (namespace, pod, authority) (increase(mimic_tls_handshake_failures_total[10m])) > 0
           labels: {severity: warning}
@@ -286,6 +292,7 @@ Notes sur ces règles :
 | `MimicMockUnmatched` | `/ui/<ns>/<wl>` : opérations découvertes ; `kubectl logs` de l'application pour les `599` ; `mimicctl report` | enregistrer plus longtemps (opérations rares), vérifier `tls.intercept`, utiliser `mock-partial` pour compléter, ou `mock.unmatched: passthrough` |
 | `MimicMockWithoutSnapshot` | logs du sidecar : `battement vers le contrôleur échoué` avec `snapshot <id>: …` ; `forme de mock du snapshot … altérée` | rétablir l'accès au contrôleur ; le téléchargement est retenté à chaque battement |
 | `MimicMockTlsRefused` | `mimic_passthrough_connections_total` par pod, logs de l'application | ajouter l'hôte à `mimic.platform.io/tls-intercept`, ré-enregistrer, ou l'exclure (`exclude-outbound-cidrs`) s'il doit rester réel |
+| `MimicMockTcpRefused` | log du sidecar `connexion TCP sortante refusée en mode mock` : `destination` (adresse et port) | attendu si la dépendance doit être coupée pendant le tir ; sinon l'exclure (`exclude-outbound-ports` ou `-cidrs`), elle recevra alors la charge |
 | `MimicTlsInterceptRejected` | log `poignée de main TLS refusée par l'application` avec l'authority | l'application ne lit pas `SSL_CERT_FILE` & co : ajouter `/var/run/mimic/ca/ca.crt` à son magasin (JVM : `keytool`), ou retirer l'hôte de l'interception |
 | `MimicInboundUpstreamErrors` | port d'écoute de l'application, adresse (le sidecar essaie l'IP du pod puis `127.0.0.1`) | application pas encore prête (démarrage lent) ou qui écoute ailleurs : `inbound.upstream` ou `mimic.platform.io/inbound-ports` |
 | `MimicControllerDown` | `kubectl -n mimic-system get pods -l app.kubernetes.io/name=mimic-controller -L mimic.platform.io/leader`, `describe`, logs | PVC non attaché (multi-attach `ReadWriteOnce`), certificat absent, configuration invalide (code 2) ; voir [Exploiter en production](Exploiter-en-production.md) |

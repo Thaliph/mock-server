@@ -5,8 +5,8 @@ dépendances, puis pour l'intégrer à un déploiement blue/green. Référence :
 
 Ce que fait mimic pendant le tir :
 
-- les **dépendances** du workload (appels sortants) sont servies depuis un snapshot des
-  réponses enregistrées, avec leur latence enregistrée ; rien ne sort du pod. Chaque pod n'en
+- les **dépendances HTTP** du workload (appels sortants) sont servies depuis un snapshot des
+  réponses enregistrées, avec leur latence enregistrée, sans être jointes. Chaque pod n'en
   télécharge que la forme de mock (spec §5.6) : les réponses rejouables et les durées par
   opération, compressées, les mêmes octets sur tous les pods (sur le banc d'arrivée d'un pod,
   0,29 Mo au lieu des 47,4 Mo du snapshot complet) ;
@@ -15,11 +15,24 @@ Ce que fait mimic pendant le tir :
   et n'en publie rien : son coût reste négligeable devant celui de l'application, et le store
   ne grossit pas avec le trafic du tir ;
 - avec `--selector`, seuls les pods choisis basculent (par exemple le nouveau ReplicaSet) ;
+- les **dépendances TCP non HTTP** (bases, brokers, caches) ne sont pas simulées : en mock, le
+  sidecar referme ces connexions sans les joindre (`mock.tcp: refuse`, le défaut), et chaque
+  refus se compte dans
+  `mimic_passthrough_connections_total{direction="outbound",kind="tcp",result="refused"}`,
+  avec un log `connexion TCP sortante refusée en mode mock` qui nomme la destination. Une
+  dépendance TCP qui doit rester réelle pendant le tir s'exclut de l'interception
+  (`mimic.platform.io/exclude-outbound-ports` ou `exclude-outbound-cidrs`) : elle reçoit alors
+  la charge du tir. Le HTTPS non intercepté (hors `tls.intercept`) est refusé de même
+  (`kind="tls"`) ;
 - exception : une connexion WebSocket sortante n'a pas de réponse rejouable (les trames ne
   sont pas enregistrées) et reste relayée vers la vraie dépendance. Avec
-  `--mock-websocket refuse`, le sidecar la refuse en `503` (`x-mimic-websocket: refused`) et
-  plus rien ne sort du pod ; les refus se comptent dans
-  `mimic_websocket_connections_total{result="refused"}`.
+  `--mock-websocket refuse`, le sidecar la refuse en `503` (`x-mimic-websocket: refused`) ;
+  les refus se comptent dans `mimic_websocket_connections_total{result="refused"}` ;
+- ce que mimic n'intercepte pas sort toujours du pod : l'UDP (DNS compris) et les ports et
+  CIDR exclus (dont l'IP de l'API Kubernetes, exclue d'office par l'injecteur). Le trafic
+  entre conteneurs du pod (`127.0.0.1`) n'est pas intercepté non plus, mais reste dans le
+  pod : les connexions que ces conteneurs ouvrent vers l'extérieur passent, elles, par mimic.
+  Pour garantir que rien d'autre ne sort, appliquer en plus la NetworkPolicy de l'étape 2.
 
 > **Garde-fou production.** Dans un namespace labellisé `env=production`, `mock` et
 > `mock-partial` sont refusés : par `mimicctl` (code de sortie 2), par le contrôleur
@@ -66,10 +79,12 @@ le prochain `replay.js` sera toujours tiré du trafic réel.
 
 ```sh
 mimicctl mode checkout mock --capture-inbound metadata -n perf
-kubectl apply -n perf -f deploy/example/networkpolicy-mock.yaml   # facultatif : rien ne sort
+kubectl apply -n perf -f deploy/example/networkpolicy-mock.yaml   # facultatif : seuls DNS et contrôleur sortent
 # Le workload ouvre des WebSockets vers ses dépendances ? Les refuser aussi, sinon la
 # NetworkPolicy les fait échouer en 502 :
 #   mimicctl mode checkout mock --capture-inbound metadata --mock-websocket refuse -n perf
+# Une dépendance TCP exclue de l'interception pour rester réelle doit aussi être ouverte
+# dans la NetworkPolicy (règle egress vers son adresse et son port).
 until mimicctl status checkout -n perf | tail -1 | grep -qE ' ([0-9]+)/\1$'; do sleep 2; done
 ```
 
