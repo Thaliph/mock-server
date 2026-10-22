@@ -68,25 +68,6 @@ async fn redirected() -> (TcpStream, TcpStream) {
     (app, sidecar)
 }
 
-/// Lit jusqu'à la fermeture par le sidecar ; `None` si la connexion reste ouverte.
-async fn closed(stream: &mut TcpStream, wait: Duration) -> Option<Vec<u8>> {
-    let mut data = vec![];
-    let mut buf = [0u8; 1024];
-    let deadline = Instant::now() + wait;
-    loop {
-        match tokio::time::timeout(
-            deadline.saturating_duration_since(Instant::now()),
-            stream.read(&mut buf),
-        )
-        .await
-        {
-            Err(_) => return None,
-            Ok(Ok(0)) | Ok(Err(_)) => return Some(data),
-            Ok(Ok(n)) => data.extend_from_slice(&buf[..n]),
-        }
-    }
-}
-
 /// Connexion TCP sortante où l'application parle la première : renvoie ce que l'application
 /// reçoit en retour (vide si le sidecar a refermé la connexion).
 async fn client_first(p: &Running, dst: SocketAddr, inbound: bool, protocol: Protocol) -> Vec<u8> {
