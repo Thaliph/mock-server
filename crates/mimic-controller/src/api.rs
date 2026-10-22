@@ -8,6 +8,7 @@ use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use mimic_core::unmatched::{MAX_REPORTED, UnmatchedReport};
 use serde::Deserialize;
 
 use crate::auth::{AuthError, authorize, bearer};
@@ -206,6 +207,15 @@ struct Heartbeat {
     capture_inbound: Option<String>,
     #[serde(default)]
     mock_websocket: Option<String>,
+    /// Facultatif (sidecar d'une version antérieure) ; illisible, il est ignoré plutôt que de
+    /// faire refuser le battement.
+    #[serde(default, deserialize_with = "lenient")]
+    unmatched: Option<UnmatchedReport>,
+}
+
+fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<UnmatchedReport>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
 }
 
 async fn heartbeat(
@@ -245,6 +255,8 @@ async fn heartbeat(
                 snapshot: hb.snapshot,
                 capture_inbound: hb.capture_inbound,
                 mock_websocket: hb.mock_websocket,
+                // Borné quoi qu'annonce le sidecar (spec §9.2b).
+                unmatched: hb.unmatched.map(|u| u.truncated(MAX_REPORTED)),
             },
             id.labels,
         )

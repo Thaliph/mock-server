@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use mimic_core::unmatched::UnmatchedReport;
 use serde::{Deserialize, Serialize};
 
 pub use crate::crd::MimicWorkloadSpec;
@@ -204,6 +205,9 @@ pub struct PodReport {
     /// WebSocket sortant en mock appliqué ; absent chez un ancien sidecar.
     #[serde(default)]
     pub mock_websocket: Option<String>,
+    /// Relevé des requêtes sans réponse du mock (spec §5.3) ; absent chez un ancien sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmatched: Option<UnmatchedReport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
