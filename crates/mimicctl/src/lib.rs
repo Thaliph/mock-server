@@ -11,6 +11,7 @@ use mimic_controller::crd::{
     CaptureSpec, INBOUND_CAPTURES, LabelSelector, MOCK_WEBSOCKETS, MODES, MimicWorkload,
     MimicWorkloadSpec, MockSpec,
 };
+use mimic_core::unmatched::UnmatchedReport;
 use serde_json::Value;
 
 /// Document OpenAPI à exporter.
@@ -173,6 +174,18 @@ pub fn export_path(namespace: &str, workload: &str, target: &Target) -> String {
     }
 }
 
+/// Authorities des dépendances connues, d'après `…/operations`, triées.
+pub fn outbound_authorities(operations: &[Value]) -> Vec<String> {
+    let _ = operations;
+    vec![]
+}
+
+/// Authority à exporter : `hôte:port` connu, ou l'hôte seul s'il n'a qu'une authority connue.
+pub fn resolve_authority(arg: &str, known: &[String]) -> Result<String, String> {
+    let _ = known;
+    Ok(arg.to_string())
+}
+
 pub fn requests_path(namespace: &str, workload: &str, format: &str, limit: usize) -> String {
     format!(
         "{}/requests?direction=inbound&format={format}&limit={limit}",
@@ -264,6 +277,9 @@ pub struct WorkloadData {
     pub aligned: usize,
     pub operations: Vec<Value>,
     pub requests: Vec<Value>,
+    /// Relevé agrégé des requêtes sans réponse du mock (`unmatched` de `/v1/workloads`) ;
+    /// vide pour un contrôleur d'une version antérieure.
+    pub unmatched: UnmatchedReport,
 }
 
 /// Longueur maximale d'une valeur de header dans le rapport.

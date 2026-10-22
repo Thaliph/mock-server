@@ -125,6 +125,10 @@ pub struct MimicWorkloadStatus {
     pub snapshot: Option<String>,
     pub pods: u32,
     pub aligned: u32,
+    /// Requêtes sans réponse du mock relevées par les pods sélectionnés (spec §5.3). Toujours
+    /// publié, 0 compris : un patch de fusion le remet ainsi à zéro.
+    #[serde(default)]
+    pub unmatched: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
     #[serde(default)]

@@ -262,6 +262,8 @@ pub struct Summary {
     /// Condition `Aligned`.
     pub ready: bool,
     pub reason: Option<String>,
+    /// Requêtes sans réponse du mock relevées par les pods sélectionnés (spec §5.3).
+    pub unmatched: u64,
 }
 
 pub fn summarize(states: &[PodState], error: Option<&str>) -> Summary {
@@ -278,6 +280,7 @@ pub fn summarize(states: &[PodState], error: Option<&str>) -> Summary {
         aligned,
         ready: reason.is_none(),
         reason,
+        unmatched: 0,
     }
 }
 
@@ -311,6 +314,7 @@ pub fn status_of(
         snapshot: desired.snapshot.clone(),
         pods: summary.pods,
         aligned: summary.aligned,
+        unmatched: summary.unmatched,
         observed_generation: generation,
         conditions: vec![
             StatusCondition {

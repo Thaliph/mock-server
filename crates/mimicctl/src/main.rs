@@ -353,6 +353,8 @@ async fn run(command: Command) -> Result<i32, String> {
                     aligned: w["aligned"].as_u64().unwrap_or(0) as usize,
                     operations: operations.as_array().cloned().unwrap_or_default(),
                     requests,
+                    // Contrôleur d'une version antérieure : pas de relevé.
+                    unmatched: serde_json::from_value(w["unmatched"].clone()).unwrap_or_default(),
                 });
             }
             print!("{}", report_markdown(&workloads, top));
