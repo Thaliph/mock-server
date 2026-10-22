@@ -920,7 +920,7 @@ async fn shr_11_two_sidecars_load_the_same_mock_form_and_serve_the_same() {
 }
 
 /// Le relevé des requêtes sans réponse voyage dans le battement jusqu'à la vue du workload
-/// (MCK-27, CTL-36 de bout en bout).
+/// (MCK-27, CTL-42 de bout en bout).
 #[tokio::test]
 async fn mck_27_heartbeat_carries_the_unmatched_requests() {
     let dir = tempfile::tempdir().unwrap();

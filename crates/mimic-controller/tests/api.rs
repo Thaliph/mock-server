@@ -751,7 +751,7 @@ async fn beat(c: &Running, instance: &str, body: Value) -> reqwest::StatusCode {
 }
 
 #[tokio::test]
-async fn ctl_36_unmatched_requests_reach_the_workload_views_and_status() {
+async fn ctl_42_unmatched_requests_reach_the_workload_views_and_status() {
     let dir = tempfile::tempdir().unwrap();
     let c = controller(dir.path()).await;
     let a = json!({
