@@ -88,14 +88,15 @@ mimicctl status [<workload>] [-n ns | -A]
 ```
 
 ```
-NAMESPACE   WORKLOAD   MODE   SNAPSHOT           ALIGNED
-shop        checkout   mock   3f9a0c1e5b7d2a46   3/3
+NAMESPACE   WORKLOAD   MODE   SNAPSHOT           UNMATCHED   ALIGNED
+shop        checkout   mock   3f9a0c1e5b7d2a46   12          3/3
 ```
 
 | Colonne | Contenu |
 |---------|---------|
 | `MODE` | `spec.mode` ; suivi de `(refusé)` si `Allowed=False` |
 | `SNAPSHOT` | `status.snapshot` ; `?` si le statut décrit une génération antérieure de la `spec` |
+| `UNMATCHED` | `status.unmatched` : requêtes refusées par le mock (`599`, `413`) depuis l'entrée en mock, sommées sur les pods sélectionnés connus ; `0` avec un contrôleur qui ne le publie pas. Le détail est dans `mimicctl report` |
 | `ALIGNED` | `status.aligned/status.pods` (pods sélectionnés vus récemment) ; `?/n` tant que le statut n'est pas à jour |
 
 Attendre l'alignement avant un tir :
@@ -113,13 +114,17 @@ mimicctl export <workload> (--inbound | --outbound <authority>) \
 
 Document OpenAPI découvert par le contrôleur (workload entier). `--inbound` : API du service ;
 `--outbound <authority>` : celle d'une dépendance, telle qu'elle apparaît dans les API
-découvertes (`api.stripe.com:443`, `quote:8080`). L'un des deux est requis
-(`--inbound ou --outbound <authority> requis`). `-o` : `.yaml`/`.yml` en YAML, sinon JSON ;
+découvertes (`api.stripe.com:443`, `quote:8080`). L'hôte seul (`api.stripe.com`) suffit s'il
+ne correspond qu'à une authority connue du workload ; sinon `mimicctl` sort en erreur (code 2)
+avec la liste des authorities connues (`dépendance api.stripe.com inconnue ; authorities
+connues : …`, ou `plusieurs dépendances pour l'hôte quote : quote:8080, quote:9090`). L'un des
+deux est requis (`--inbound ou --outbound <authority> requis`). `-o` : `.yaml`/`.yml` en YAML, sinon JSON ;
 sans `-o`, JSON sur la sortie standard. `--openapi-version 3.0` convertit (défaut `3.1`).
 
 ```sh
 mimicctl export checkout -n shop --inbound --openapi-version 3.0 -o checkout.yaml
 mimicctl export checkout -n shop --outbound quote:8080 -o quote.json
+mimicctl export checkout -n shop --outbound api.stripe.com -o stripe.json   # seul port connu : 443
 ```
 
 ## `requests`
@@ -152,7 +157,11 @@ mimicctl report [<workload>] [-n ns | -A] [--top n]
 Rapport Markdown : par workload, mode et pods, API découvertes (le service puis chaque
 dépendance) avec opérations et appels, et les `n` opérations les plus appelées (10 par
 défaut) avec codes, latences p50/p99 et headers d'une requête enregistrée (lus sur 500
-requêtes par sens). Pour un résumé de job GitHub Actions :
+requêtes par sens). Le tableau récapitulatif donne aussi le total des requêtes sans réponse du
+mock, et chaque workload a une section **Requêtes sans réponse du mock** : méthode, API, forme
+du chemin (sans valeur), code (`599` ou `413`), occurrences et dernière occurrence (UTC), au
+plus 50 clés, de la plus récente à la plus ancienne. C'est la première chose à lire après un
+tir qui a reçu des `599`. Pour un résumé de job GitHub Actions :
 
 ```sh
 mimicctl report -n shop >> "$GITHUB_STEP_SUMMARY"
@@ -181,6 +190,8 @@ mimicctl diff semaine-derniere.json cette-semaine.json --fail-on-breaking
 |---------|-------|--------|
 | `aucun pod du contrôleur en marche dans mimic-system` | contrôleur arrêté, ou pas de droit `list` sur les pods de `mimic-system` | `kubectl -n mimic-system get pods` |
 | `contrôleur : 503 Service Unavailable réplique passive du contrôleur : …` | bascule de réplique en cours | relancer dans quelques secondes |
-| `contrôleur : 404 Not Found dépendance inconnue` | authority absente des API découvertes | vérifier l'authority exacte (`hôte:port`) dans `/ui/<ns>/<wl>` ou `mimicctl report` |
+| `dépendance <x> inconnue ; authorities connues : …` | `export --outbound` : ni authority connue, ni hôte d'une seule authority | reprendre une des authorities listées |
+| `plusieurs dépendances pour l'hôte <x> : …` | `export --outbound` avec un hôte qui a plusieurs ports | préciser `hôte:port` |
+| `contrôleur : 404 Not Found dépendance inconnue` | authority absente des API découvertes (contrôleur qui a perdu la dépendance entre la liste et l'export) | vérifier l'authority exacte (`hôte:port`) dans `/ui/<ns>/<wl>` ou `mimicctl report` |
 | `contrôleur : <code> <body>` | autre réponse du contrôleur | voir [Administration et API](Administration-et-API.md) |
 | `pods du contrôleur: …`, `port-forward vers <pod>: …` | droits `pods` `list` ou `pods/portforward` `create` manquants dans `mimic-system`, API injoignable | `kubectl auth can-i create pods/portforward -n mimic-system` |

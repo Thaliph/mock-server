@@ -132,6 +132,24 @@ Côté métriques, pendant le tir : `mimic_mode{mode="mock"} == 1` sur chaque po
 `mimic_mock_snapshot_exchanges > 0`, et le ratio de `mimic_mock_responses_total{match="unmatched"}`
 (voir [Métriques](Metriques.md)).
 
+## Requêtes sans réponse
+
+Une opération jamais enregistrée répond `599` (`x-mimic-unmatched: true`), un body au-delà de
+`capture.max_body_bytes` répond `413`. Pour savoir **lesquelles** :
+
+```sh
+mimicctl status checkout -n shop        # colonne UNMATCHED : le total du tir
+mimicctl report checkout -n shop        # section « Requêtes sans réponse du mock »
+```
+
+Le rapport liste méthode, dépendance, forme du chemin (`/v1/customers/{id}`, jamais les
+valeurs), code, occurrences et dernière occurrence ; la page `/ui/<ns>/<wl>` du contrôleur
+montre la même chose, et `GET /api/unmatched` sur l'admin d'un pod donne son seul relevé
+([Administration](Administration-et-API.md#requêtes-sans-réponse-du-mock)). Le relevé repart de
+zéro à chaque entrée en mock et reste lisible après le retour en `record`. Remède : enregistrer
+ces opérations (retour en `record`, trafic qui les appelle, nouvelle bascule), ou les laisser
+relayer avec `mock-partial`.
+
 ## Basculer une partie des pods
 
 ```sh
