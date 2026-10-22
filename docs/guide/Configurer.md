@@ -77,6 +77,8 @@ annotation `mimic.platform.io/config: <nom>`, clé `mimic.yaml`, montée dans `/
 | `share.allow_insecure` | `false` | autorise `http://` vers le contrôleur (tests uniquement) |
 | `share.max_backlog_bytes` | `16777216` (16 MiB) | borne en octets de la file des échanges pas encore publiés |
 | `share.max_pending` | `50000` | borne en nombre de la même file |
+| `share.startup.timeout` | `30` | sous contrôleur : attente du premier état souhaité avant d'ouvrir la barrière de démarrage (l'application ne démarre qu'après, voir [Basculer en mock](Basculer-en-mock.md#pods-neufs-pendant-un-mock)). Entre 0 (exclu) et 300 ; la `startupProbe` posée par le webhook tolère ce délai + 30 s |
+| `share.startup.fallback` | `record` | sans état souhaité connu à l'échéance : `record`, `passthrough`, `mock-local` (mock sur les données locales, rien ne sort ; un pod neuf répond `599`) ou `fail` (l'application ne démarre pas tant que le contrôleur n'a pas répondu). Avec `mock-local` et `fail`, le sidecar attend aussi en mock |
 | `annotations_file` | absent | fichier d'annotations du pod (API downward) surveillé chaque seconde pour `mimic.platform.io/mode` ; ignoré sous contrôleur. Le webhook ne le pose pas |
 | `version` | absent | valeur du label `version` des métriques (voir ci-dessous) |
 
@@ -97,6 +99,7 @@ share:
   token_file: /var/run/secrets/mimic/token
   interval: 10
   mode_poll: 2
+  startup: {timeout: 30, fallback: record}
 ```
 
 > **Écart avec la spec.** Le multiplicateur de latence s'écrit `mock.latency_factor`. La forme
@@ -151,7 +154,7 @@ configuration renseigne `annotations_file` ; un sidecar piloté l'ignore.
 |---------|--------|
 | init container `mimic-init` | en tête des init containers, ou juste après ceux du mesh ; root, `NET_ADMIN` et `NET_RAW`, toutes les autres capacités retirées ; variables `MIMIC_MESH`, `POD_IP` (`status.podIP`), `MIMIC_INBOUND_PORTS`, `MIMIC_EXCLUDE_OUTBOUND_CIDRS`, et si besoin `MIMIC_EXCLUDE_OUTBOUND_PORTS`, `MIMIC_IPTABLES` |
 | native sidecar `mimic` | juste après `mimic-init`, `restartPolicy: Always`, UID et GID 1338, racine en lecture seule, port `mimic-admin` (15100) ; variables `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` (figée à l'admission), `MIMIC_VERSION` (label `version_label`), `MIMIC_POD_TEMPLATE_HASH` (label `pod-template-hash`), `MIMIC_REDACT_SALT` (Secret `<workload>-mimic`, clé `redact-salt`, facultatif), `MIMIC_CONFIG_YAML` ou `--config` |
-| sondes du sidecar | `startupProbe` `/healthz` (période 1 s, 30 échecs), `readinessProbe` `/readyz` et `livenessProbe` `/healthz` (période 10 s, 3 échecs) ; HTTP sur `mimic-admin`, ou `exec` `mimic-proxy --probe <chemin>` si un conteneur du mesh est présent |
+| sondes du sidecar | `startupProbe` `/readyz` (période 1 s, `share.startup.timeout` + 30 échecs : 60 avec `sidecar_config` par défaut, 330 avec l'annotation `config`, que le webhook ne lit pas), `readinessProbe` `/readyz` et `livenessProbe` `/healthz` (période 10 s, 3 échecs) ; HTTP sur `mimic-admin`, ou `exec` `mimic-proxy --probe <chemin>` si un conteneur du mesh est présent |
 | ressources du sidecar | celles de `resources` du webhook, sinon requêtes `cpu: 50m`, `memory: 64Mi`, limite `memory: 256Mi` |
 | volumes | `mimic-store` (`emptyDir`, `sizeLimit: 512Mi`, sur `/var/lib/mimic`), `mimic-token` (jeton projeté d'audience `mimic-controller`, 3600 s, sur `/var/run/secrets/mimic`), `mimic-controller-ca` (ConfigMap, sur `/etc/mimic-ca`), `mimic-ca` (`emptyDir`, sur `/var/run/mimic/ca`), `mimic-config` (avec l'annotation `config`) |
 

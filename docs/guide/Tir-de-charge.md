@@ -44,8 +44,11 @@ dépendances. `--allow-live-dependencies` lève ce refus, en connaissance de cau
 - une connexion WebSocket sortante est relayée, sauf `--mock-websocket refuse` ;
 - `mimic_mock_responses_total{match="unmatched"}` (réponses `599`) doit rester proche de zéro :
   sinon le snapshot ne couvre pas le trafic rejoué et les latences mesurées sont fausses ;
-- pas d'autoscaling ni de redéploiement pendant le tir : un pod neuf démarre en `record`
-  jusqu'à son premier battement (voir [Exploiter en production](Exploiter-en-production.md)).
+- un pod neuf pendant le tir (autoscaling, redéploiement) démarre en mock sur le snapshot :
+  son application attend l'état souhaité. Seul un contrôleur injoignable plus de
+  `share.startup.timeout` le fait démarrer dans le repli, `record` par défaut (voir
+  [Basculer en mock](Basculer-en-mock.md#pods-neufs-pendant-un-mock)) ; le pod reste quelques
+  secondes en `Init`, ce qui retarde d'autant sa prise de charge par l'autoscaling.
 
 ## Tirer
 

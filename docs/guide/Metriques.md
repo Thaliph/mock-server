@@ -83,6 +83,16 @@ Au-delà de **100** authorities distinctes par processus, les suivantes sont reg
 | `mimic_share_peers` | jauge | | autres instances vues au dernier partage ; toujours 0 sous contrôleur |
 | `mimic_discovered_operations` | jauge | `direction`, `authority` (`inbound.upstream` ou `app` pour l'entrant) | opérations découvertes ; **mise à jour seulement** quand la découverte est calculée (page d'admin, `/api/operations`, `/openapi/*`) : peut être périmée |
 
+### Lien avec le contrôleur
+
+Exposées par les sidecars pilotés (`share.url` vers le contrôleur) seulement.
+
+| Métrique | Type | Labels | Signification |
+|----------|------|--------|---------------|
+| `mimic_heartbeats_total` | compteur | `result` (`ok`, `error`) | battements toutes les `share.mode_poll` (2 s) ; `ok` : le contrôleur a répondu un état souhaité (même si son snapshot n'a pas pu être téléchargé : voir `last_error` dans `/api/status`) ; `error` : réseau, délai, code autre que `200`, corps illisible |
+| `mimic_heartbeat_last_success_timestamp_seconds` | jauge | | date Unix du dernier battement `ok` ; 0 avant le premier |
+| `mimic_startup` | jauge | `state` (`waiting`, `aligned`, `last-known`, `fallback`) | 1 pour l'état courant de la barrière de démarrage ([Basculer en mock](Basculer-en-mock.md#pods-neufs-pendant-un-mock)) : `waiting`, application pas encore démarrée ; `aligned`, état souhaité appliqué ; `last-known`, délai écoulé, dernier état connu appliqué ; `fallback`, délai écoulé sans état connu, repli `share.startup.fallback` appliqué |
+
 | `reason` de `mimic_capture_dropped_total` | Signification | Gravité |
 |-------------------------------------------|---------------|---------|
 | `truncated` | body au-delà de `capture.max_body_bytes`, gardé en préfixe (non rejouable) | informatif ; monter la limite si l'opération doit être mockée |
@@ -166,6 +176,14 @@ Mode de chaque pod :
 
 ```promql
 max by (namespace, pod, mode) (mimic_mode == 1)
+```
+
+Pods qui n'ont pas eu de réponse du contrôleur depuis plus d'une minute, et pods démarrés
+sans état souhaité (repli) ou dont l'application attend encore :
+
+```promql
+time() - mimic_heartbeat_last_success_timestamp_seconds > 60
+max by (namespace, pod, state) (mimic_startup{state=~"fallback|waiting"} == 1)
 ```
 
 Échec de publication vers le contrôleur (pods qui ont quelque chose à publier) :

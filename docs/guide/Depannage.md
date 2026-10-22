@@ -70,6 +70,10 @@ d'erreur, préfixé `mimic: `.
 | `mimic: écoute Inbound sur 0.0.0.0:15106: Address already in use` (ou `Outbound`, `Admin`) | port pris par un autre conteneur du pod |
 | pod bloqué en `ContainerCreating`, événement `configmap "mimic-controller-ca" not found` | trust-manager n'a pas (encore) publié la CA dans le namespace : namespace labellisé après coup, trust-manager sans `app.trust.namespace=mimic-system` |
 | sonde en échec : `mimic: sonde /healthz : connexion à 127.0.0.1:15100 : …` ou `mimic: sonde /readyz : statut …` | sidecar pas encore à l'écoute, ou `admin.listen` modifié |
+| `mimic: share.startup.timeout ne peut dépasser 300 s : …`, `mimic: share.startup.timeout doit être une durée positive (en secondes)` | délai de démarrage hors de ]0, 300] |
+| `… share.startup.fallback … unknown variant …` | repli inconnu : `record`, `passthrough`, `mock-local` ou `fail` |
+| pod bloqué en `Init:1/2` (ou plus), événements `Startup probe failed: HTTP probe failed with statuscode: 503` du conteneur `mimic` | barrière de démarrage fermée : le sidecar attend le premier état souhaité du contrôleur. Normal quelques secondes (snapshot en cours de téléchargement) ; au-delà de `share.startup.timeout` (30 s), seulement avec `share.startup.fallback: fail` et un contrôleur injoignable (voir [Lien sidecar → contrôleur](#lien-sidecar--contrôleur)). `curl http://127.0.0.1:15100/readyz` par port-forward répond `waiting` |
+| log `contrôleur injoignable au démarrage : repli share.startup.fallback appliqué, l'application démarre` | pod neuf démarré sans état souhaité : il tourne dans le repli (`record` par défaut) et s'aligne dès que le contrôleur répond ; si son workload est en mock, il a pu joindre les vraies dépendances. Rétablir le contrôleur puis recréer le pod |
 
 ## Trafic
 

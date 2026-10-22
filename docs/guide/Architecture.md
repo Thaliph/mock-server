@@ -126,6 +126,13 @@ contient que ce que son pod a vu ; le workload entier est vu par le contrôleur.
 4. Le pod annonce le snapshot chargé : quand tous les pods sélectionnés annoncent mode,
    snapshot et réglages demandés, la condition `Aligned` passe à `True`.
 
+Un pod créé pendant le mock suit les mêmes étapes **avant** que son application ne démarre :
+la `startupProbe` du sidecar (`/readyz`) échoue tant que l'état souhaité et son snapshot ne
+sont pas appliqués, et le kubelet ne lance l'application qu'après son succès. Sans réponse du
+contrôleur dans `share.startup.timeout` (30 s), le pod démarre dans le repli
+`share.startup.fallback` (`record` par défaut ; voir
+[Basculer en mock](Basculer-en-mock.md#pods-neufs-pendant-un-mock)).
+
 Le snapshot reste le même tant que le workload ne quitte pas le mock ; `spec.snapshot`
 permet de rejouer un snapshot précis d'un tir à l'autre. Voir
 [Collecte et stockage](Collecte-et-stockage.md).

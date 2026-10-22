@@ -142,7 +142,50 @@ Seuls les pods portant ces labels basculent ; les autres reçoivent un état vid
 au mode de **leur configuration** (`record` avec l'injecteur). Les labels comparés sont ceux
 que le contrôleur lit dans l'API Kubernetes (gardés 60 s), jamais ce qu'annonce le sidecar.
 `ALIGNED` ne compte que les pods sélectionnés. Un pod créé pendant le mock (mise à l'échelle,
-redémarrage) qui porte les labels bascule à son premier battement.
+redémarrage) qui porte les labels démarre directement en mock (voir ci-dessous).
+
+## Pods neufs pendant un mock
+
+Un pod créé pendant un tir (HPA, éviction, OOM, rollout) n'a aucun état souhaité dans son
+`emptyDir`. Son application ne démarre donc qu'une fois que le sidecar le connaît : la
+`startupProbe` du sidecar (`/readyz`) échoue tant que le premier battement n'a pas reçu
+l'état souhaité **et** chargé son snapshot, et le kubelet ne lance les conteneurs de
+l'application qu'après le succès de cette sonde (native sidecar). Le pod reste en `Init`
+quelques secondes, puis démarre en mock sur le snapshot du workload : aucun de ses appels
+n'atteint les vraies dépendances.
+
+Si le contrôleur ne répond pas dans `share.startup.timeout` (30 s par défaut, ce qui couvre
+une bascule entre ses deux répliques) :
+
+| `share.startup.fallback` | L'application… |
+|--------------------------|----------------|
+| `record` (défaut) | démarre en `record` : elle **appelle les vraies dépendances**, même si son workload est en mock, jusqu'à ce que le contrôleur réponde |
+| `passthrough` | démarre en `passthrough` (relayé sans enregistrement) |
+| `mock-local` | démarre en mock sur les données locales du pod : rien ne sort, mais un pod neuf n'a rien enregistré et répond `599` |
+| `fail` | ne démarre pas : le pod reste en `Init` (le kubelet relance le sidecar à chaque fin de fenêtre de la sonde) jusqu'à la première réponse du contrôleur |
+
+Le défaut `record` est voulu : mimic est aussi injecté hors des tirs, en production
+notamment, où une panne du contrôleur ne doit ni bloquer les déploiements ni faire répondre
+`599`. Pour un workload dont les dépendances ne doivent jamais recevoir de tir, choisir
+`mock-local` ou `fail` dans sa configuration (annotation `mimic.platform.io/config`) :
+
+```yaml
+share:
+  # … url, ca_file, token_file comme dans la configuration du webhook
+  startup: {timeout: 30, fallback: fail}
+```
+
+Si l'état souhaité est reçu mais que son snapshot ne se télécharge pas dans le délai,
+l'application démarre quand même en mock, sur les données locales (aucun repli), et le
+snapshot est retenté à chaque battement. Où en est un pod :
+
+```sh
+kubectl -n shop port-forward pod/<pod> 15100:15100 &
+curl -s localhost:15100/readyz            # waiting | aligned | last-known | fallback
+curl -s localhost:15100/api/status | jq .controller.startup
+```
+
+`mimic_startup{state}` donne la même chose dans les [métriques](Metriques.md#lien-avec-le-contrôleur).
 
 ## Garde-fou production
 
@@ -183,14 +226,13 @@ données du moment (identifiant différent si les données ont changé).
 
 ## Points d'attention
 
-- **Pods recréés pendant le mock.** Un pod neuf démarre dans le mode de sa configuration
-  (`record`) jusqu'à son premier battement : les tout premiers appels de l'application peuvent
-  atteindre les vraies dépendances. Si le contrôleur est injoignable à ce moment, le pod reste
-  en `record` (son `emptyDir` ne contient aucun état souhaité). Éviter les redémarrages pendant
-  un tir, ou vérifier `ALIGNED` après chacun.
+- **Pods recréés pendant le mock.** Leur application attend l'état souhaité et le snapshot
+  ([ci-dessus](#pods-neufs-pendant-un-mock)) ; seul un contrôleur injoignable plus de
+  `share.startup.timeout` les fait démarrer dans le repli (`record` par défaut, alerte
+  `MimicStartedWithoutDesiredState`).
 - **Pod redémarré (conteneur seulement).** Le sidecar recharge du disque le dernier état
-  souhaité et le snapshot (`dernier état souhaité rechargé`) : il reprend le mock même sans
-  contrôleur.
+  souhaité et le snapshot (`dernier état souhaité rechargé`) avant d'accepter la première
+  connexion : il reprend le mock même sans contrôleur, rien ne sort entre-temps.
 - **Contrôleur indisponible pendant un tir.** Les pods gardent leur dernier état ; aucune
   bascule n'est possible tant qu'il n'est pas revenu (voir
   [Exploiter en production](Exploiter-en-production.md)).

@@ -10,8 +10,8 @@ standard de kube-state-metrics, de cAdvisor et du kubelet.
 
 | Composant | Sonde | Ce qu'elle vérifie | Ce qu'elle ne vérifie pas |
 |-----------|-------|--------------------|---------------------------|
-| sidecar | `startupProbe` `GET /healthz` (période 1 s, 30 échecs) ; `readinessProbe` `GET /readyz` et `livenessProbe` `GET /healthz` (période 10 s, 3 échecs), sur `mimic-admin` | l'API d'admin répond (`ok`) ; les deux routes sont identiques | le lien avec le contrôleur, le partage, le moteur de mock |
-| sidecar dans un mesh | mêmes sondes en `exec` : `mimic-proxy --probe /healthz` (ou `/readyz`) | la même chose, depuis le conteneur : en mTLS strict, le mesh refuserait une sonde HTTP du kubelet | idem |
+| sidecar | `startupProbe` `GET /readyz` (période 1 s, `share.startup.timeout` + 30 échecs : 60 par défaut, 330 avec une configuration montée par ConfigMap) ; `readinessProbe` `GET /readyz` et `livenessProbe` `GET /healthz` (période 10 s, 3 échecs), sur `mimic-admin` | `/healthz` : l'API d'admin répond. `/readyz` : la barrière de démarrage est ouverte (`503 waiting` tant que le sidecar piloté n'a pas appliqué l'état souhaité, snapshot compris, ou atteint son délai) ; le kubelet ne démarre l'application qu'après le succès de la `startupProbe` | après le démarrage, le lien avec le contrôleur (`/readyz` reste `200` pendant une panne du contrôleur, pour ne pas vider les Services), le partage, le moteur de mock |
+| sidecar dans un mesh | mêmes sondes en `exec` : `mimic-proxy --probe /readyz` (ou `/healthz`) | la même chose, depuis le conteneur : en mTLS strict, le mesh refuserait une sonde HTTP du kubelet | idem |
 | contrôleur | `readinessProbe` et `livenessProbe` `GET /healthz` en HTTPS sur `api` (8443) | le serveur répond ; **la passive répond aussi** (`/healthz` n'est pas soumis à l'élection) | quelle réplique est active, l'état du support |
 | webhook | `readinessProbe` et `livenessProbe` `GET /healthz` en HTTPS sur `webhook` (8443) | le serveur répond | la validité du `caBundle` côté API server |
 
@@ -29,7 +29,8 @@ dans le pod ; en Istio ambient, les sondes restent HTTP.
 |-----------|-------|--------|
 | conteneur `mimic` arrêté ou en redémarrage | les règles iptables restent : le trafic entrant et sortant redirigé du pod n'a plus d'écoute et **échoue** jusqu'au redémarrage | `kube_pod_init_container_status_restarts_total{container="mimic"}` (native sidecar : compté comme init container), `kube_pod_init_container_status_ready{container="mimic"} == 0`, pod non `Ready` |
 | mémoire proche de la limite (256 Mi par défaut) | risque d'OOMKill, donc de coupure | `container_memory_working_set_bytes{container="mimic"}` rapporté à `kube_pod_init_container_resource_limits{container="mimic",resource="memory"}` |
-| contrôleur injoignable | le pod garde son dernier état, les échanges s'accumulent dans la file de publication puis sont perdus | `mimic_share_sync_total{result="error"}` (seulement s'il y a quelque chose à publier), puis `mimic_capture_dropped_total{reason="share_backlog"}` ; logs `battement vers le contrôleur échoué`, `synchronisation du partage échouée` ; `controller.last_error` de `/api/status` |
+| contrôleur injoignable | le pod garde son dernier état, les échanges s'accumulent dans la file de publication puis sont perdus | `mimic_heartbeats_total{result="error"}`, `time() - mimic_heartbeat_last_success_timestamp_seconds` ; `mimic_share_sync_total{result="error"}` (seulement s'il y a quelque chose à publier), puis `mimic_capture_dropped_total{reason="share_backlog"}` ; logs `battement vers le contrôleur échoué` (au plus un toutes les 30 s, avec `omitted`), `synchronisation du partage échouée` ; `controller.last_error` de `/api/status` |
+| contrôleur injoignable au démarrage d'un pod neuf | l'application attend jusqu'à `share.startup.timeout` (30 s), puis démarre dans le repli (`record` par défaut) ; avec `fail`, le pod reste en `Init` | `mimic_startup{state="waiting"}` puis `{state="fallback"}` ; log `contrôleur injoignable au démarrage : repli share.startup.fallback appliqué` ; événements `Startup probe failed` du sidecar |
 | application injoignable par le sidecar | `502 mimic: amont injoignable` aux clients | `mimic_upstream_errors_total{direction="inbound"}` |
 | mock incomplet | `599` à l'application | `mimic_mock_responses_total{match="unmatched"}` |
 | mock sans snapshot | le pod sert ses seules données locales | `mimic_mode{mode="mock"} == 1` et `mimic_mock_snapshot_exchanges == 0` |
@@ -125,6 +126,27 @@ spec:
           labels: {severity: warning}
           annotations:
             summary: "Les sidecars de {{ $labels.namespace }} n'arrivent plus à publier au contrôleur"
+        - alert: MimicHeartbeatsFailing
+          expr: |
+            time() - max by (namespace, pod) (mimic_heartbeat_last_success_timestamp_seconds) > 120
+              and on (namespace, pod) increase(mimic_heartbeats_total{result="error"}[5m]) > 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Le sidecar de {{ $labels.namespace }}/{{ $labels.pod }} n'a plus de réponse du contrôleur"
+            description: "Aucune bascule ne l'atteint ; un pod neuf démarre dans le repli share.startup.fallback."
+        - alert: MimicStartedWithoutDesiredState
+          expr: max by (namespace, pod) (mimic_startup{state="fallback"}) == 1
+          labels: {severity: warning}
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }} a démarré sans état souhaité (repli)"
+            description: "Contrôleur injoignable au démarrage : l'application tourne dans le repli (record par défaut) et peut joindre ses vraies dépendances même si son workload est en mock."
+        - alert: MimicStartupBlocked
+          expr: max by (namespace, pod) (mimic_startup{state="waiting"}) == 1
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "L'application de {{ $labels.namespace }}/{{ $labels.pod }} attend le contrôleur (share.startup.fallback: fail)"
         - alert: MimicShareBacklogLoss
           expr: sum by (namespace, pod) (increase(mimic_capture_dropped_total{reason="share_backlog"}[15m])) > 0
           labels: {severity: warning}
@@ -266,7 +288,16 @@ Notes sur ces règles :
 - `MimicControllerUnreachableFromSidecars` ne voit que les pods qui ont quelque chose à
   publier : un cycle sans nouvel échange compte `ok` sans appeler le contrôleur. Un pod en
   mock avec `capture.inbound: off` ne publie rien et ne déclenche donc jamais cette alerte.
-  Les battements en échec ne sont visibles que dans les logs et `/api/status`.
+  Les battements en échec se suivent par `MimicHeartbeatsFailing`, qui voit tous les pods
+  pilotés, qu'ils publient ou non.
+- `MimicStartedWithoutDesiredState` reste active tant que le pod n'a pas eu de réponse du
+  contrôleur : dès la première, `mimic_startup` passe à `aligned` (ou `last-known` si le
+  snapshot manque encore).
+- `MimicStartupBlocked` ne concerne que le repli `fail` : avec les autres, la barrière s'ouvre
+  au plus tard à `share.startup.timeout`. Le sidecar sert `/metrics` pendant que le pod est
+  en `Init`, mais seul un scraper qui collecte aussi les pods `Pending` le voit ; à défaut,
+  `MimicSidecarNotReady` (`kube_pod_init_container_status_ready{container="mimic"} == 0`)
+  couvre ce cas.
 - `MimicMockWithoutSnapshot` se déclenche aussi pour un sidecar sans contrôleur basculé en
   mock par son API d'admin (cas voulu) : filtrer par namespace si vous utilisez ce mode.
 - `mimic_controller_pods{state="absent"}` n'est pas une bonne alerte : un pod supprimé reste
@@ -282,6 +313,9 @@ Notes sur ces règles :
 | `MimicSidecarNotReady` | `kubectl -n <ns> logs <pod> -c mimic`, état de `mimic-init` (`kubectl -n <ns> logs <pod> -c mimic-init`) | voir [Dépannage](Depannage.md) |
 | `MimicSidecarMemoryHigh` | `mimic_store_bytes`, `mimic_store_exchanges` ; nombre d'authorities | le store est borné par `capture.max_store_bytes` (64 MiB) ; le reste vient des requêtes en vol et des bodies (1 MiB chacun au plus). Monter la limite ou baisser `max_store_bytes` / `max_body_bytes` |
 | `MimicControllerUnreachableFromSidecars` | logs du sidecar (`synchronisation du partage échouée`, `battement vers le contrôleur échoué` avec le code et le motif) ; `curl http://127.0.0.1:15100/api/status` par port-forward | `401` : jeton (volume `mimic-token`, audience) ; `403` : pod d'un autre workload ; `503` : passive ou support ; `délai dépassé` : NetworkPolicy (label `mimic.platform.io/sidecar=true`), Service sans endpoint ; `invalid peer certificate` : CA (voir [Dépannage](Depannage.md)) |
+| `MimicHeartbeatsFailing` | comme `MimicControllerUnreachableFromSidecars` ; `controller.last_error` de `/api/status` | mêmes actions |
+| `MimicStartedWithoutDesiredState` | logs du sidecar au démarrage (`contrôleur injoignable au démarrage`), puis comme `MimicHeartbeatsFailing` | rétablir le contrôleur : le pod s'aligne au battement suivant. Si le workload est en mock, ce pod a pu joindre les vraies dépendances : le recréer une fois le contrôleur revenu (`kubectl delete pod`), ou choisir `share.startup.fallback: mock-local` ou `fail` pour ce workload |
+| `MimicStartupBlocked` | `kubectl -n <ns> describe pod <pod>` (`Startup probe failed`), logs du sidecar | rétablir le contrôleur : l'application démarre dès sa première réponse (le kubelet relance le sidecar à chaque fin de fenêtre, avec une attente croissante) |
 | `MimicShareBacklogLoss` | durée de l'indisponibilité du contrôleur | rétablir le contrôleur ; si la perte est structurelle (débit très élevé), monter `share.max_backlog_bytes` ou passer l'entrant en `metadata` |
 | `MimicMockUnmatched` | `/ui/<ns>/<wl>` : opérations découvertes ; `kubectl logs` de l'application pour les `599` ; `mimicctl report` | enregistrer plus longtemps (opérations rares), vérifier `tls.intercept`, utiliser `mock-partial` pour compléter, ou `mock.unmatched: passthrough` |
 | `MimicMockWithoutSnapshot` | logs du sidecar : `battement vers le contrôleur échoué` avec `snapshot <id>: …` ; `forme de mock du snapshot … altérée` | rétablir l'accès au contrôleur ; le téléchargement est retenté à chaque battement |
