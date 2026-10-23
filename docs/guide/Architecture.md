@@ -78,12 +78,13 @@ toujours exclus des redirections par `mimic-init`.
 ### Sortant (application → dépendance)
 
 1. La chaîne `MIMIC_OUTBOUND` (sautée depuis `OUTPUT`) laisse passer le trafic de l'UID 1338,
-   le trafic vers l'IP du pod par `lo`, les CIDR et ports exclus, puis redirige le reste du
+   le trafic local du pod (`-o lo` : `127.0.0.1`, `::1`, IP du pod, donc les autres
+   conteneurs du pod, comme sous Istio), les CIDR et ports exclus, puis redirige le reste du
    TCP vers `:15101`.
 2. Le sidecar détecte le protocole. HTTP : traité selon le mode (relayé et enregistré, ou servi
    par le moteur de mock). TLS vers un hôte de `tls.intercept` : terminé par le sidecar avec un
    certificat forgé, puis traité comme HTTP. Autre TLS : tunnel opaque (refusé en `mock`).
-   Autre TCP : tunnel opaque.
+   Autre TCP : tunnel opaque (refusé en `mock`, sauf `mock.tcp: relay`).
 3. Les headers propres à la connexion ne sont jamais relayés ; HTTP/2 repart en HTTP/2 (gRPC).
 
 Détail par mode : [Modes](Modes.md).

@@ -75,7 +75,8 @@ Pour un tir de charge (guide : [sre-load-test.md](sre-load-test.md)) :
   WebSocket sortante est relayée vers la vraie dépendance (`relay`, le défaut : les trames ne
   sont pas enregistrées, il n'y a rien à rejouer), ou refusée par le sidecar (`refuse`) :
   réponse `503` avec le header `x-mimic-websocket: refused`, sans aucune connexion vers la
-  dépendance. Avec `refuse`, plus rien ne sort du pod en mock. L'entrant n'est pas touché :
+  dépendance. Avec `refuse`, plus aucune connexion interceptée ne sort du pod en mock (le TCP
+  non HTTP est déjà refusé par `mock.tcp`, réglage du sidecar). L'entrant n'est pas touché :
   l'application reçoit toujours ses WebSockets.
 
 Un apply sans ces options les retire : `mimicctl mode checkout record` remet tout le

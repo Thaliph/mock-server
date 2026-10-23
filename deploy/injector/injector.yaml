@@ -72,6 +72,7 @@ data:
         strategy: best
         unmatched: error
         latency_factor: 1.0
+        tcp: refuse          # refuse | relay : TCP sortant non HTTP en mock (spec §3.4)
       store:
         dir: /var/lib/mimic
       tls:

@@ -38,7 +38,7 @@ Options (toutes facultatives) ; un apply qui ne les reprend pas les retire :
 | `--snapshot <id>` | `spec.snapshot` | rejoue ce snapshot au lieu d'en construire un |
 | `--selector k=v[,k=v…]` | `spec.selector.matchLabels` | seuls ces pods basculent |
 | `--capture-inbound full\|metadata\|off` | `spec.capture.inbound` | allège la capture de l'entrant pendant le tir |
-| `--mock-websocket relay\|refuse` | `spec.mock.websocket` | `refuse` : plus rien ne sort du pod en HTTP, WebSockets compris |
+| `--mock-websocket relay\|refuse` | `spec.mock.websocket` | `refuse` : plus aucune connexion interceptée ne sort du pod, WebSockets compris (le TCP non HTTP est déjà refusé, `mock.tcp`) |
 
 ### Avec la ressource
 

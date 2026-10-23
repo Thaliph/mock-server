@@ -252,7 +252,7 @@ impl Metrics {
         registry.register("mimic_mode", "Mode courant (1)", mode.clone());
         registry.register(
             "mimic_passthrough_connections",
-            "Connexions redirigées non HTTP relayées en tunnel",
+            "Connexions redirigées non HTTP : relayées en tunnel, refusées en mock, en échec",
             passthrough.clone(),
         );
         registry.register(

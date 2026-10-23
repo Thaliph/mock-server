@@ -15,7 +15,7 @@ use mimic_core::model::{Body, Direction, Exchange, Header};
 use tokio::sync::oneshot;
 
 use crate::capture::{Captured, TeeBody};
-use crate::config::{InboundCapture, MockWebsocket, Mode, Unmatched};
+use crate::config::{InboundCapture, MockTcp, MockWebsocket, Mode, Unmatched};
 use crate::engine::{Arrived, MockSet, Trigger};
 use crate::state::{AppState, BoxError, ProxyBody};
 use crate::store::{Added, Origin};
@@ -840,7 +840,8 @@ fn connect(state: Arc<AppState>, info: ConnInfo, req: Request<Incoming>) -> Resp
 }
 
 /// Attente maximale, en sortie et en mock, qu'une connexion muette se mette à parler : rien
-/// n'est ouvert vers la dépendance pendant ce temps (O3).
+/// n'est ouvert vers la dépendance pendant ce temps (O3). Au-delà, elle est traitée comme un
+/// protocole inconnu : refusée en `mock` (sauf `mock.tcp: relay`), relayée en `mock-partial`.
 pub const MOCK_SILENCE_WAIT: Duration = Duration::from_secs(30);
 
 /// Issue d'une connexion restée muette au-delà du délai de détection (spec §3.1).
@@ -852,7 +853,8 @@ pub enum Silent {
         crate::net::Protocol,
         Option<tokio::net::TcpStream>,
     ),
-    /// Déjà traitée ici : tunnel vers un serveur qui a parlé le premier, ou abandon.
+    /// Déjà traitée ici : tunnel vers un serveur qui a parlé le premier, refus en mock, ou
+    /// abandon.
     Done,
 }
 
@@ -867,16 +869,37 @@ pub async fn resolve_silent(
     original_dst: SocketAddr,
     inbound: bool,
 ) -> Silent {
+    resolve_silent_within(state, stream, original_dst, inbound, MOCK_SILENCE_WAIT).await
+}
+
+/// `resolve_silent`, avec une attente de l'application en mock réglable (tests).
+pub async fn resolve_silent_within(
+    state: Arc<AppState>,
+    stream: tokio::net::TcpStream,
+    original_dst: SocketAddr,
+    inbound: bool,
+    mock_wait: Duration,
+) -> Silent {
     let mode = state.mode();
     if !inbound && matches!(mode, Mode::Mock | Mode::MockPartial) {
         // En mock, joindre la dépendance pour savoir si elle parle la première la
         // contacterait : on attend l'application, sans rien ouvrir.
-        return match tokio::time::timeout(MOCK_SILENCE_WAIT, stream.readable()).await {
+        return match tokio::time::timeout(mock_wait, stream.readable()).await {
             Ok(Ok(())) => {
                 let protocol = crate::net::sniff(&stream).await;
                 Silent::Client(stream, protocol, None)
             }
             Ok(Err(_)) => Silent::Done,
+            // Toujours muette : protocole inconnu, refusé en mock selon `mock.tcp` (§3.4).
+            Err(_) if refuses_tcp(&state) => {
+                refuse_tunnel(
+                    &state,
+                    original_dst,
+                    crate::net::Protocol::Other,
+                    "connexion sortante muette refusée en mode mock (mock.tcp: refuse)",
+                );
+                Silent::Done
+            }
             Err(_) => Silent::Client(stream, crate::net::Protocol::Other, None),
         };
     }
@@ -934,10 +957,30 @@ pub async fn tunnel(
     inbound: bool,
     upstream: Option<tokio::net::TcpStream>,
 ) {
-    // En mock, aucun appel chiffré ne doit atteindre une dépendance (O3).
-    if !inbound && protocol == crate::net::Protocol::Tls && state.mode() == Mode::Mock {
-        count_tunnel(&state, inbound, protocol, "refused");
-        return;
+    // En mock, ni un appel chiffré non intercepté, ni un protocole que le mock ne sait pas
+    // rejouer ne doivent atteindre une dépendance (O3, spec §3.4).
+    if !inbound && state.mode() == Mode::Mock {
+        match protocol {
+            crate::net::Protocol::Tls => {
+                refuse_tunnel(
+                    &state,
+                    original_dst,
+                    protocol,
+                    "connexion TLS sortante refusée en mode mock (hôte hors de tls.intercept)",
+                );
+                return;
+            }
+            crate::net::Protocol::Other if refuses_tcp(&state) => {
+                refuse_tunnel(
+                    &state,
+                    original_dst,
+                    protocol,
+                    "connexion TCP sortante refusée en mode mock (mock.tcp: refuse)",
+                );
+                return;
+            }
+            _ => {}
+        }
     }
     let upstream = match upstream {
         Some(u) => u,
@@ -963,6 +1006,31 @@ pub async fn tunnel(
     let mut stream = stream;
     let mut upstream = upstream;
     let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+}
+
+/// Vrai si le TCP sortant non HTTP est refusé : `mock` avec `mock.tcp: refuse` (spec §3.4).
+/// `mock-partial` relaie ce qu'il ne sait pas servir.
+fn refuses_tcp(state: &AppState) -> bool {
+    state.mode() == Mode::Mock && state.config.mock.tcp == MockTcp::Refuse
+}
+
+/// Connexion sortante refermée en mock sans rien ouvrir vers sa destination : comptée, et
+/// journalisée au plus une fois par seconde avec la destination d'origine (spec §3.1).
+fn refuse_tunnel(
+    state: &AppState,
+    original_dst: SocketAddr,
+    protocol: crate::net::Protocol,
+    message: &'static str,
+) {
+    count_tunnel(state, false, protocol, "refused");
+    if let Some(omitted) = state.tunnel_refused_log.allow(Instant::now()) {
+        tracing::warn!(
+            destination = %original_dst,
+            kind = protocol.as_str(),
+            omitted,
+            "{message}"
+        );
+    }
 }
 
 fn count_tunnel(

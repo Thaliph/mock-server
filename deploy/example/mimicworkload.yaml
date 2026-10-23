@@ -15,6 +15,7 @@ spec:
   #     pod-template-hash: 7d9f8c6b5
   # capture:
   #   inbound: metadata
-  # En mock, refuser en 503 les WebSockets sortants au lieu de les relayer : plus rien ne sort.
+  # En mock, refuser en 503 les WebSockets sortants au lieu de les relayer : plus aucune
+  # connexion interceptée ne sort (le TCP non HTTP est déjà refusé, mock.tcp du sidecar).
   # mock:
   #   websocket: refuse
