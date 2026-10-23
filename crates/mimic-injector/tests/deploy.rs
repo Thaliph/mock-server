@@ -1,4 +1,4 @@
-//! Le manifest du webhook reste cohérent avec le code (spec §9.4).
+//! Le manifest du webhook reste cohérent avec le code (spec §5.5.5, §9.4).
 
 use mimic_injector::config::InjectorConfig;
 use mimic_injector::inject::{CA_DIR, CONTROLLER_CA_DIR, STORE_DIR, TOKEN_DIR};
@@ -210,4 +210,43 @@ fn inj_20_production_manifests() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert!(names.contains(&"kube-system") && names.contains(&"mimic-system"));
+}
+
+/// Barrière de démarrage dans les manifests (CTL-41, INJ-21, spec §5.5.5) : `share.startup`
+/// explicite, et `startupProbe` du sidecar écrit à la main cohérente avec son délai.
+#[test]
+fn ctl_41_inj_21_manifests_give_the_startup_gate() {
+    use mimic_proxy::config::StartupFallback;
+    let cm = kind("ConfigMap");
+    let config: InjectorConfig =
+        serde_yaml::from_str(cm["data"]["injector.yaml"].as_str().unwrap()).unwrap();
+    let raw: serde_yaml::Value = serde_yaml::from_str(&config.sidecar_config).unwrap();
+    assert_eq!(raw["share"]["startup"]["timeout"].as_u64(), Some(30));
+    assert_eq!(raw["share"]["startup"]["fallback"], "record");
+
+    let example: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../deploy/example/configmap.yaml")).unwrap();
+    let text = example["data"]["mimic.yaml"].as_str().unwrap();
+    let raw: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
+    assert_eq!(raw["share"]["startup"]["fallback"], "record");
+    let sidecar: Config = serde_yaml::from_str(text).unwrap();
+    let startup = sidecar.share.unwrap().startup;
+    assert_eq!(startup.fallback, StartupFallback::Record);
+
+    let deployment: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../../../deploy/example/deployment.yaml")).unwrap();
+    let inits = deployment["spec"]["template"]["spec"]["initContainers"]
+        .as_sequence()
+        .unwrap();
+    let mimic = inits.iter().find(|c| c["name"] == "mimic").unwrap();
+    let probe = &mimic["startupProbe"];
+    assert_eq!(probe["httpGet"]["path"], "/readyz");
+    assert_eq!(probe["periodSeconds"].as_u64(), Some(1));
+    assert_eq!(
+        probe["failureThreshold"].as_u64(),
+        Some(startup.timeout.as_secs() + 30),
+        "fenêtre de la sonde : share.startup.timeout + 30 s"
+    );
+    assert_eq!(mimic["readinessProbe"]["httpGet"]["path"], "/readyz");
+    assert_eq!(mimic["livenessProbe"]["httpGet"]["path"], "/healthz");
 }

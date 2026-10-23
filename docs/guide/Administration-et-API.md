@@ -32,10 +32,11 @@ Le workload entier est dans l'interface du contrôleur.
 
 | Méthode, route | Réponse | Erreurs |
 |----------------|---------|---------|
-| `GET /healthz`, `GET /readyz` | `ok` | |
+| `GET /healthz` | `ok` : vivacité, ne dépend ni du contrôleur ni du démarrage | |
+| `GET /readyz` | sous contrôleur, état de la barrière de démarrage : `aligned`, `last-known` ou `fallback` (`200`) ; sans contrôleur, `ok` | `503` `waiting` : l'application ne doit pas encore démarrer (premier état souhaité ou son snapshot attendu) |
 | `GET /` | page HTML : mode, instance ; sous contrôleur, `N échanges vus par ce pod`, `piloté par le contrôleur · snapshot <id>`, état de la publication et dernière erreur ; sans contrôleur, échanges locaux et importés, pairs ; catalogue des opérations ; liens OpenAPI et métriques | |
 | `GET /api/operations` | catalogue JSON des opérations découvertes | |
-| `GET /api/status` | JSON : `mode`, `capture_inbound`, `mock_websocket`, `instance`, `workload` (`namespace`, `name`), `store` (`local`, `peer`), `share` (`enabled`, `peers`, `last_sync_ms`, `last_error`), `snapshot`, `controller` (`url`, `desired`, `last_ok_ms`, `last_error`, ou `null` sans contrôleur) | |
+| `GET /api/status` | JSON : `mode`, `capture_inbound`, `mock_websocket`, `instance`, `workload` (`namespace`, `name`), `store` (`local`, `peer`), `share` (`enabled`, `peers`, `last_sync_ms`, `last_error`), `snapshot`, `controller` (`url`, `desired`, `last_ok_ms`, `last_error`, `startup` : `state`, `fallback`, `timeout` en secondes ; ou `null` sans contrôleur) | |
 | `GET /openapi/inbound` | OpenAPI de l'API du service, vue par ce pod | |
 | `GET /openapi/outbound` | liste des authorities sortantes découvertes | |
 | `GET /openapi/outbound/{authority}` | OpenAPI d'une dépendance (`api.stripe.com:443`) | `404 dépendance inconnue` |

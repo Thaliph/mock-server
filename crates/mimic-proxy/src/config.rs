@@ -5,7 +5,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use mimic_core::mock::Strategy;
+pub use mimic_core::startup::Fallback as StartupFallback;
 use serde::{Deserialize, Serialize};
+
+/// Délai de démarrage maximal (`share.startup.timeout`) : la `startupProbe` posée par
+/// l'injecteur tolère ce délai plus une marge quand elle ne peut pas lire la configuration
+/// (spec §5.5.5).
+pub const MAX_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Mode de fonctionnement (spec §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -444,6 +450,29 @@ pub struct ShareConfig {
     /// complet, compressé comme décompressé (spec §5.6).
     #[serde(default = "default_max_snapshot_bytes")]
     pub max_snapshot_bytes: usize,
+    /// Barrière de démarrage sous contrôleur (spec §5.5.5).
+    #[serde(default)]
+    pub startup: StartupConfig,
+}
+
+/// Démarrage d'un sidecar piloté (spec §5.5.5) : attente du premier état souhaité.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StartupConfig {
+    /// Délai au-delà duquel la barrière s'ouvre sur l'état connu, ou sur le repli.
+    #[serde(with = "duration_secs")]
+    pub timeout: Duration,
+    /// Repli quand aucun état souhaité n'est connu à l'échéance.
+    pub fallback: StartupFallback,
+}
+
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            fallback: StartupFallback::Record,
+        }
+    }
 }
 
 impl Default for ShareConfig {
@@ -459,6 +488,7 @@ impl Default for ShareConfig {
             max_backlog_bytes: default_share_backlog(),
             max_pending: default_max_pending(),
             max_snapshot_bytes: default_max_snapshot_bytes(),
+            startup: StartupConfig::default(),
         }
     }
 }
@@ -629,6 +659,7 @@ impl Config {
         if let Some(share) = &self.share {
             durations.push(("share.interval", share.interval));
             durations.push(("share.mode_poll", share.mode_poll));
+            durations.push(("share.startup.timeout", share.startup.timeout));
             caps.push(("share.max_snapshot_bytes", share.max_snapshot_bytes));
         }
         if let Some((name, _)) = durations.iter().find(|(_, d)| d.is_zero()) {
@@ -636,6 +667,14 @@ impl Config {
         }
         if let Some((name, _)) = caps.iter().find(|(_, v)| *v == 0) {
             return Err(format!("{name} doit être positif"));
+        }
+        if let Some(share) = &self.share
+            && share.startup.timeout > MAX_STARTUP_TIMEOUT
+        {
+            return Err(format!(
+                "share.startup.timeout ne peut dépasser {} s : la startupProbe du sidecar ne l'attendrait pas",
+                MAX_STARTUP_TIMEOUT.as_secs()
+            ));
         }
         if self.server.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(format!(
@@ -721,6 +760,48 @@ mod tests {
         assert_eq!(MockWebsocket::parse("drop"), None);
     }
 
+    /// Barrière de démarrage (CTL-41) : 30 s et `record` par défaut, délai borné, repli
+    /// inconnu refusé avec les valeurs admises.
+    #[test]
+    fn ctl_41_startup_defaults_and_bounds() {
+        let d = ShareConfig::default().startup;
+        assert_eq!(d.timeout, Duration::from_secs(30));
+        assert_eq!(d.fallback, StartupFallback::Record);
+        let s: ShareConfig = serde_yaml::from_str("url: https://ctl:8443\n").unwrap();
+        assert_eq!(s.startup.timeout, Duration::from_secs(30));
+        assert_eq!(s.startup.fallback, StartupFallback::Record);
+        let load = |startup: &str| {
+            Config::load_with(None, |k| match k {
+                "MIMIC_CONFIG_YAML" => Some(format!(
+                    "share:\n  url: http://ctl:8443\n  allow_insecure: true\n  startup: {startup}\n"
+                )),
+                "MIMIC_WORKLOAD" => Some("api".into()),
+                _ => None,
+            })
+        };
+        let c = load("{timeout: 90, fallback: mock-local}").unwrap();
+        let s = c.share.unwrap().startup;
+        assert_eq!(s.timeout, Duration::from_secs(90));
+        assert_eq!(s.fallback, StartupFallback::MockLocal);
+        assert_eq!(
+            load("{fallback: fail}")
+                .unwrap()
+                .share
+                .unwrap()
+                .startup
+                .fallback,
+            StartupFallback::Fail
+        );
+        for bad in ["{timeout: 0}", "{timeout: 301}"] {
+            let err = load(bad).unwrap_err();
+            assert!(err.contains("share.startup.timeout"), "{bad} : {err}");
+        }
+        assert!(load("{timeout: 300}").is_ok());
+        let err = load("{fallback: drop}").unwrap_err();
+        for v in ["drop", "record", "passthrough", "mock-local", "fail"] {
+            assert!(err.contains(v), "{err}");
+        }
+        assert!(load("{timeout: 5, retries: 2}").is_err());
     /// `mock.tcp` : `refuse` par défaut, `relay` accepté, valeur inconnue refusée au
     /// démarrage (MCK-24).
     #[test]
