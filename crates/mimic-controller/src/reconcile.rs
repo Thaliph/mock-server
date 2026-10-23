@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use mimic_core::unmatched::UnmatchedReport;
 use serde::{Deserialize, Serialize};
 
 pub use crate::crd::MimicWorkloadSpec;
@@ -204,6 +205,9 @@ pub struct PodReport {
     /// WebSocket sortant en mock appliqué ; absent chez un ancien sidecar.
     #[serde(default)]
     pub mock_websocket: Option<String>,
+    /// Relevé des requêtes sans réponse du mock (spec §5.3) ; absent chez un ancien sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmatched: Option<UnmatchedReport>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -262,6 +266,8 @@ pub struct Summary {
     /// Condition `Aligned`.
     pub ready: bool,
     pub reason: Option<String>,
+    /// Requêtes sans réponse du mock relevées par les pods sélectionnés (spec §5.3).
+    pub unmatched: u64,
 }
 
 pub fn summarize(states: &[PodState], error: Option<&str>) -> Summary {
@@ -278,6 +284,7 @@ pub fn summarize(states: &[PodState], error: Option<&str>) -> Summary {
         aligned,
         ready: reason.is_none(),
         reason,
+        unmatched: 0,
     }
 }
 
@@ -311,6 +318,7 @@ pub fn status_of(
         snapshot: desired.snapshot.clone(),
         pods: summary.pods,
         aligned: summary.aligned,
+        unmatched: summary.unmatched,
         observed_generation: generation,
         conditions: vec![
             StatusCondition {

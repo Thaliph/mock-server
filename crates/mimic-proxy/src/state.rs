@@ -12,6 +12,7 @@ use hyper_util::rt::TokioExecutor;
 use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::redact::{RedactConfig, Redactor};
 use mimic_core::snapshot::MockSnapshot;
+use mimic_core::unmatched::{Reason, Unmatched, UnmatchedLog, UnmatchedReport};
 use serde_json::Value;
 
 use crate::config::{Config, InboundCapture, MockWebsocket, Mode};
@@ -80,6 +81,11 @@ pub struct AppState {
     /// Logs des connexions refusées en mock (TLS non intercepté, TCP non HTTP), limités en
     /// débit (spec §3.1).
     pub(crate) tunnel_refused_log: LogLimiter,
+    /// Requêtes refusées par le mock (`599`, `413`) du tir en cours (spec §5.3).
+    unmatched: Mutex<UnmatchedLog>,
+    /// Logs de ces refus, limités en débit, un par raison (spec §9.3).
+    unmatched_log: LogLimiter,
+    too_large_log: LogLimiter,
 }
 
 /// Plafond fixe des connexions simultanées de l'admin (spec §3.5).
@@ -201,6 +207,9 @@ impl AppState {
             admin_connections: Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONNECTIONS)),
             refused_log: LogLimiter::per_second(),
             tunnel_refused_log: LogLimiter::per_second(),
+            unmatched: Mutex::new(UnmatchedLog::default()),
+            unmatched_log: LogLimiter::per_second(),
+            too_large_log: LogLimiter::per_second(),
             inflight,
             tls,
         }))
@@ -225,6 +234,9 @@ impl AppState {
         let previous = Mode::from_u8(self.mode.swap(mode.to_u8(), Ordering::SeqCst));
         if !mock {
             self.release_mock();
+        } else if !crate::engine::mock_mode(previous) {
+            // Nouveau tir : le relevé des requêtes sans réponse repart de zéro (spec §5.3).
+            self.unmatched_lock().clear();
         }
         if previous != mode {
             tracing::info!(
@@ -280,10 +292,52 @@ impl AppState {
     /// Impose un snapshot (ou le retire) ; en mock, le moteur est reconstruit dessus avant
     /// de servir.
     pub fn set_snapshot(&self, snap: Option<Arc<MockSnapshot>>) {
+        if let Some(new) = &snap
+            && self.snapshot().is_none_or(|old| old.id != new.id)
+        {
+            // Autre jeu de données : les requêtes sans réponse d'avant ne disent plus rien.
+            self.unmatched_lock().clear();
+        }
         self.metrics
             .mock_snapshot_exchanges
             .set(snap.as_ref().map_or(0, |s| s.count as i64));
         self.publish_snapshot(snap);
+    }
+
+    fn unmatched_lock(&self) -> std::sync::MutexGuard<'_, UnmatchedLog> {
+        self.unmatched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Relevé des requêtes sans réponse, au plus `limit` clés (spec §5.3).
+    pub fn unmatched_report(&self, limit: usize) -> UnmatchedReport {
+        self.unmatched_lock().report(limit)
+    }
+
+    /// Requête refusée par le mock : relevée et journalisée en débit limité, avec la forme
+    /// de son chemin seulement (spec §5.3, §9.3).
+    pub(crate) fn note_unmatched(&self, u: &Unmatched, trace_id: Option<&str>) {
+        self.unmatched_lock().record(u, crate::share::now_ms());
+        let (limiter, message) = match u.reason {
+            Reason::Unmatched => (
+                &self.unmatched_log,
+                "mock : requête sans réponse enregistrée",
+            ),
+            Reason::TooLarge => (&self.too_large_log, "mock : body de requête trop gros"),
+        };
+        if let Some(omitted) = limiter.allow(std::time::Instant::now()) {
+            tracing::warn!(
+                method = %u.method,
+                authority = %u.authority,
+                path = %u.path,
+                trace_id = trace_id.unwrap_or_default(),
+                reason = u.reason.as_str(),
+                status = u.reason.status(),
+                omitted,
+                "{message}"
+            );
+        }
     }
 
     /// Documents OpenAPI du workload, recalculés quand le store change, sur le pool de

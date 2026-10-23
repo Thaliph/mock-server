@@ -23,7 +23,8 @@ pub const MOCK_WEBSOCKETS: &[&str] = &["relay", "refuse"];
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Snapshot","type":"string","jsonPath":".status.snapshot"}"#,
     printcolumn = r#"{"name":"Aligned","type":"integer","jsonPath":".status.aligned"}"#,
-    printcolumn = r#"{"name":"Pods","type":"integer","jsonPath":".status.pods"}"#
+    printcolumn = r#"{"name":"Pods","type":"integer","jsonPath":".status.pods"}"#,
+    printcolumn = r#"{"name":"Unmatched","type":"integer","jsonPath":".status.unmatched"}"#
 )]
 pub struct MimicWorkloadSpec {
     /// Mode souhaité pour tous les pods du workload.
@@ -125,6 +126,10 @@ pub struct MimicWorkloadStatus {
     pub snapshot: Option<String>,
     pub pods: u32,
     pub aligned: u32,
+    /// Requêtes sans réponse du mock (599, 413) relevées par les pods sélectionnés.
+    // Toujours publié, 0 compris : un patch de fusion le remet ainsi à zéro (spec §5.5.1).
+    #[serde(default)]
+    pub unmatched: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
     #[serde(default)]

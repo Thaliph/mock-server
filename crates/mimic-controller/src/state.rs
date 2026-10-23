@@ -27,6 +27,7 @@ use mimic_core::exemplar::{Exemplars, best_per_endpoint, is_exemplar, jsonl};
 use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::model::{Direction, Exchange};
 use mimic_core::snapshot::{Snapshot, SnapshotOptions, build};
+use mimic_core::unmatched::{MAX_MERGED, UnmatchedReport};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::Serialize;
@@ -1346,7 +1347,21 @@ impl Ctl {
             .filter(|(_, _, selected)| *selected)
             .map(|(_, s, _)| s)
             .collect();
-        summarize(&states, live.error.as_deref())
+        let mut summary = summarize(&states, live.error.as_deref());
+        summary.unmatched = self.unmatched(live).total;
+        summary
+    }
+
+    /// Relevé des requêtes sans réponse du workload (spec §5.3, §9.2b) : celui des pods
+    /// sélectionnés encore connus, fusionné et borné.
+    pub fn unmatched(&self, live: &Live) -> UnmatchedReport {
+        UnmatchedReport::merge(
+            live.pods
+                .values()
+                .filter(|p| selects(&live.desired, &p.labels))
+                .filter_map(|p| p.report.unmatched.as_ref()),
+            MAX_MERGED,
+        )
     }
 
     /// Documents OpenAPI du workload : le dernier calcul, recalculé en tâche de fond au plus

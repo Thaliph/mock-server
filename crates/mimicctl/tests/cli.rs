@@ -2,8 +2,8 @@
 
 use mimicctl::{
     ModeOptions, Target, WorkloadData, check_namespace, export_path, operations_path,
-    report_markdown, requests_path, sample_requests_path, status_table, workload_apply,
-    workload_apply_with,
+    outbound_authorities, report_markdown, requests_path, resolve_authority, sample_requests_path,
+    status_table, workload_apply, workload_apply_with,
 };
 use serde_json::{Value, json};
 
@@ -113,6 +113,7 @@ fn checkout() -> WorkloadData {
         aligned: 2,
         operations,
         requests,
+        ..WorkloadData::default()
     }
 }
 
@@ -376,4 +377,145 @@ fn cli_09_ui_is_read_on_the_active_replica() {
     );
     assert!(controller_pod(&[pending]).is_err());
     assert!(controller_pod(&[]).is_err());
+}
+
+/// `--outbound` : `hôte:port`, ou l'hôte seul s'il n'a qu'une authority connue (CLI-10).
+#[test]
+fn cli_10_outbound_host_without_port_is_resolved() {
+    let ops = vec![
+        op("outbound", "quote:9090", "GET", "/q", 1),
+        op("outbound", "api.stripe.com:443", "POST", "/v1/charges", 3),
+        op("outbound", "quote:8080", "POST", "/getquote", 2),
+        op("outbound", "quote:8080", "GET", "/health", 2),
+        op("inbound", "checkout", "GET", "/items/{id}", 9),
+    ];
+    let known = outbound_authorities(&ops);
+    assert_eq!(known, ["api.stripe.com:443", "quote:8080", "quote:9090"]);
+    assert_eq!(
+        resolve_authority("api.stripe.com:443", &known).unwrap(),
+        "api.stripe.com:443"
+    );
+    assert_eq!(
+        resolve_authority("api.stripe.com", &known).unwrap(),
+        "api.stripe.com:443"
+    );
+    let err = resolve_authority("quote", &known).unwrap_err();
+    assert!(
+        err.contains("quote:8080") && err.contains("quote:9090"),
+        "{err}"
+    );
+    assert!(!err.contains("api.stripe.com"), "{err}");
+    let err = resolve_authority("inconnu.io", &known).unwrap_err();
+    for a in &known {
+        assert!(err.contains(a.as_str()), "{err}");
+    }
+    let err = resolve_authority("quote:7070", &known).unwrap_err();
+    assert!(err.contains("quote:8080"), "{err}");
+    assert!(resolve_authority("api.stripe.com", &[]).is_err());
+
+    // L'aide cite un exemple hôte:port.
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_mimicctl"))
+        .args(["export", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("api.stripe.com:443"), "{help}");
+}
+
+fn unmatched_entry(method: &str, path: &str, reason: &str, count: u64, last: u64) -> Value {
+    json!({
+        "authority": "api.saas.io:443", "method": method, "path": path, "reason": reason,
+        "count": count, "first_ms": 0, "last_ms": last,
+    })
+}
+
+/// Requêtes sans réponse du mock dans `status` et `report` (CLI-11).
+#[test]
+fn cli_11_status_and_report_show_unmatched_requests() {
+    let mut mw = workload_apply("shop", "checkout", "mock", None).unwrap();
+    mw.status = Some(mimic_controller::crd::MimicWorkloadStatus {
+        pods: 2,
+        aligned: 2,
+        unmatched: 7,
+        ..Default::default()
+    });
+    let table = status_table(std::slice::from_ref(&mw));
+    let lines: Vec<&str> = table.lines().collect();
+    let header: Vec<&str> = lines[0].split_whitespace().collect();
+    assert_eq!(
+        header,
+        [
+            "NAMESPACE",
+            "WORKLOAD",
+            "MODE",
+            "SNAPSHOT",
+            "UNMATCHED",
+            "ALIGNED"
+        ]
+    );
+    let row: Vec<&str> = lines[1].split_whitespace().collect();
+    assert_eq!(row[4], "7", "{table}");
+    assert_eq!(row[5], "2/2", "{table}");
+    // Statut publié par un contrôleur d'une version antérieure : pas de champ.
+    let old: mimic_controller::crd::MimicWorkloadStatus =
+        serde_json::from_value(json!({"pods": 1, "aligned": 1})).unwrap();
+    assert_eq!(old.unmatched, 0);
+    mw.status = Some(old);
+    let table = status_table(&[mw]);
+    let row: Vec<&str> = table.lines().nth(1).unwrap().split_whitespace().collect();
+    assert_eq!(row[4], "0", "{table}");
+
+    let mut w = checkout();
+    w.unmatched = serde_json::from_value(json!({
+        "total": 9,
+        "entries": [
+            unmatched_entry("GET", "/users/{int}", "unmatched", 8, 1_792_677_787_000),
+            unmatched_entry("POST", "/upload", "too_large", 1, 1_792_677_000_000),
+        ],
+    }))
+    .unwrap();
+    let md = report_markdown(std::slice::from_ref(&w), 10);
+    assert!(md.contains("| Sans réponse |"), "{md}");
+    let summary = md
+        .lines()
+        .find(|l| l.contains("[shop/checkout]"))
+        .expect(&md);
+    assert!(summary.ends_with("| 9 |"), "{summary}");
+    let section = md
+        .split("### Requêtes sans réponse du mock")
+        .nth(1)
+        .expect(&md);
+    let rows: Vec<&str> = section
+        .lines()
+        .filter(|l| l.starts_with("| GET") || l.starts_with("| POST"))
+        .collect();
+    assert_eq!(rows.len(), 2, "{section}");
+    for cell in [
+        "`api.saas.io:443`",
+        "`/users/{int}`",
+        "599",
+        "| 8 |",
+        "2026-10-22T14:03:07Z",
+    ] {
+        assert!(rows[0].contains(cell), "{cell} : {}", rows[0]);
+    }
+    assert!(
+        rows[1].contains("`/upload`") && rows[1].contains("413"),
+        "{}",
+        rows[1]
+    );
+    assert_eq!(md, report_markdown(&[w], 10), "déterministe");
+
+    // Sans relevé (aucune requête, ou contrôleur antérieur) : la section le dit.
+    let md = report_markdown(&[checkout()], 10);
+    let section = md
+        .split("### Requêtes sans réponse du mock")
+        .nth(1)
+        .expect(&md);
+    assert!(section.contains("Aucune requête sans réponse"), "{section}");
+    let summary = md
+        .lines()
+        .find(|l| l.contains("[shop/checkout]"))
+        .expect(&md);
+    assert!(summary.ends_with("| 0 |"), "{summary}");
 }

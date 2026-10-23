@@ -10,6 +10,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use mimic_core::catalog::{STYLE, esc, operations, render_operations};
 use mimic_core::model::Direction;
+use mimic_core::unmatched::UnmatchedReport;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -76,6 +77,7 @@ async fn workload_json(ctl: &Ctl, ns: &str, wl: &str) -> Value {
                     "snapshot": p.report.snapshot,
                     "capture_inbound": p.report.capture_inbound,
                     "mock_websocket": p.report.mock_websocket,
+                    "unmatched": p.report.unmatched,
                     "last_seen_ms": p.last_seen_ms,
                     "state": s.as_str(),
                     "selected": selected,
@@ -92,6 +94,7 @@ async fn workload_json(ctl: &Ctl, ns: &str, wl: &str) -> Value {
             "aligned": summary.aligned,
             "ready": summary.ready,
             "reason": summary.reason,
+            "unmatched": ctl.unmatched(w),
         })
     })
     .await
@@ -234,6 +237,34 @@ async fn requests(
     .unwrap_or_else(|| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// Requêtes sans réponse du mock, agrégées sur les pods sélectionnés (spec §5.3).
+fn render_unmatched(h: &mut String, u: &UnmatchedReport, now: u64) {
+    let _ = write!(
+        h,
+        "<h2>Requêtes sans réponse du mock</h2><p>{} requête(s) refusée(s) par le mock (599 sans enregistrement, 413 body trop gros) depuis l'entrée en mock, d'après le dernier battement de chaque pod sélectionné.</p>",
+        u.total
+    );
+    if u.entries.is_empty() {
+        h.push_str("<p class=\"empty\">Aucune.</p>");
+        return;
+    }
+    h.push_str("<table><tr><th>Méthode</th><th>Dépendance</th><th>Chemin</th><th>Code</th><th>Occurrences</th><th>Dernière</th></tr>");
+    for e in &u.entries {
+        let _ = write!(
+            h,
+            "<tr><td class=\"m\">{}</td><td>{}</td><td class=\"p\">{}</td><td class=\"c{}\">{}</td><td>{}</td><td>il y a {} s</td></tr>",
+            esc(&e.method),
+            esc(&e.authority),
+            esc(&e.path),
+            e.reason.status() / 100,
+            e.reason.status(),
+            e.count,
+            now.saturating_sub(e.last_ms) / 1000
+        );
+    }
+    h.push_str("</table>");
+}
+
 fn head(h: &mut String, title: &str) {
     let _ = write!(
         h,
@@ -294,10 +325,11 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
                 ctl.pod_states(w),
                 w.desired.clone(),
                 w.spec.is_some(),
+                ctl.unmatched(w),
             )
         })
         .await;
-    let (summary, pods, desired, has_spec) = match live {
+    let (summary, pods, desired, has_spec, unmatched) = match live {
         Ok(l) => l,
         Err(e) => return unavailable(e),
     };
@@ -346,15 +378,16 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
     if pods.is_empty() {
         h.push_str("<p class=\"empty\">Aucun battement reçu.</p>");
     } else {
-        h.push_str("<table><tr><th>Instance</th><th>Mode</th><th>Snapshot</th><th>Dernier battement</th><th>État</th></tr>");
+        h.push_str("<table><tr><th>Instance</th><th>Mode</th><th>Snapshot</th><th>Sans réponse</th><th>Dernier battement</th><th>État</th></tr>");
         let now = now_ms();
         for (p, s, selected) in &pods {
             let _ = write!(
                 h,
-                "<tr><td class=\"p\">{}</td><td>{}</td><td>{}</td><td>il y a {} s</td><td>{}</td></tr>",
+                "<tr><td class=\"p\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>il y a {} s</td><td>{}</td></tr>",
                 esc(&p.instance),
                 esc(&p.report.mode),
                 esc(p.report.snapshot.as_deref().unwrap_or("-")),
+                p.report.unmatched.as_ref().map_or(0, |u| u.total),
                 now.saturating_sub(p.last_seen_ms) / 1000,
                 match s.as_str() {
                     _ if !selected => "<span class=\"c5\">non sélectionné</span>",
@@ -366,6 +399,8 @@ async fn page(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
         }
         h.push_str("</table>");
     }
+
+    render_unmatched(&mut h, &unmatched, now_ms());
 
     h.push_str("<h2>API découvertes</h2>");
     if ops.is_empty() {
