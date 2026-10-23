@@ -1,5 +1,9 @@
 # Garde-fou du mode mock (objectif O3) : le pod ne peut plus joindre que le DNS et le
-# contrôleur mimic. Toute requête non mockée échoue au lieu d'atteindre un SaaS.
+# contrôleur mimic. En mock, le sidecar refuse déjà le TCP non HTTP et le HTTPS non
+# intercepté ; la NetworkPolicy borne en plus ce qui ne passe pas par lui : l'UDP, les ports
+# et CIDR exclus de l'interception (dont l'API Kubernetes) et les WebSockets relayés
+# (mock.websocket: relay). Une dépendance exclue pour rester réelle pendant le tir doit être
+# ajoutée ici (règle egress vers son adresse et son port).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

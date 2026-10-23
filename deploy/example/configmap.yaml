@@ -24,6 +24,7 @@ data:
       unmatched: error
       latency_factor: 1.0
       websocket: relay     # relay | refuse : WebSocket sortant en mock (spec §3.4)
+      tcp: refuse          # refuse | relay : TCP sortant non HTTP en mock (spec §3.4)
     store:
       dir: /var/lib/mimic
     # Partage, bascule et snapshots passent par le contrôleur (spec §5.5, §7.1).

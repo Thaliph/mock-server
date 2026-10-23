@@ -84,6 +84,9 @@ pub struct AppState {
     pub(crate) inflight: Arc<crate::capture::InflightBudget>,
     /// Logs de refus au plafond de connexions, limités en débit.
     pub(crate) refused_log: LogLimiter,
+    /// Logs des connexions refusées en mock (TLS non intercepté, TCP non HTTP), limités en
+    /// débit (spec §3.1).
+    pub(crate) tunnel_refused_log: LogLimiter,
 }
 
 /// Plafond fixe des connexions simultanées de l'admin (spec §3.5).
@@ -218,6 +221,7 @@ impl AppState {
             connections: Arc::new(tokio::sync::Semaphore::new(max_connections)),
             admin_connections: Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONNECTIONS)),
             refused_log: LogLimiter::per_second(),
+            tunnel_refused_log: LogLimiter::per_second(),
             inflight,
             tls,
         }))

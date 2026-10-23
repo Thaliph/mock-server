@@ -44,6 +44,10 @@ struct Args {
     /// IP du pod (`status.podIP`) : cible du trajet entrant en ambient (spec §3.3.2).
     #[arg(long, env = "POD_IP")]
     pod_ip: Option<String>,
+    /// Redirige aussi le trafic vers `127.0.0.1` et `::1` (tests en namespace réseau) ; par
+    /// défaut, le trafic local du pod n'est pas intercepté (spec §3.1).
+    #[arg(long, env = "MIMIC_INTERCEPT_LOOPBACK")]
+    intercept_loopback: bool,
     /// Affiche les règles sans les appliquer.
     #[arg(long)]
     dry_run: bool,
@@ -144,6 +148,7 @@ fn run(args: &Args) -> Result<(), Failure> {
         ipv6: false,
         mesh: resolved.mesh,
         pod_ip: parsed.pod_ip,
+        intercept_loopback: args.intercept_loopback,
     };
     let ip6tables = resolved.tool.replacen("iptables", "ip6tables", 1);
     let mut families = vec![(resolved.tool.as_str(), base.clone())];

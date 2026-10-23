@@ -60,6 +60,7 @@ annotation `mimic.platform.io/config: <nom>`, clé `mimic.yaml`, montée dans `/
 | `mock.seed` | `24301` (`0x5EED`) | graine du tirage (latence, `weighted-status`) |
 | `mock.debug_header` | `true` | ajoute `x-mimic-match: <exact\|template\|fuzzy>;score=<s>` aux réponses mockées |
 | `mock.websocket` | `relay` | poignée de main WebSocket sortante en mock : `relay` (relayée) ou `refuse` (`503`). Le contrôleur peut l'imposer |
+| `mock.tcp` | `refuse` | connexion TCP sortante non HTTP en `mock`, connexions restées muettes 30 s comprises : `refuse` (refermée sans joindre la dépendance, comptée dans `mimic_passthrough_connections_total{result="refused"}`) ou `relay` (tunnel vers la vraie dépendance, qui reçoit la charge). Sans effet en `mock-partial` (toujours relayé) et sur l'entrant. Ni le contrôleur ni l'injecteur ne le transmettent : pour garder une seule dépendance réelle, préférer `mimic.platform.io/exclude-outbound-ports` (voir [Modes](Modes.md#trafic-sortant)) |
 | `store.dir` | absent | répertoire du journal local et du cache des snapshots ; absent : mémoire seule |
 | `store.segment_bytes` | `33554432` (32 MiB) | taille d'un segment `local-<n>.jsonl` avant rotation. Doit être positif |
 | `store.max_segments` | `4` | segments gardés ; le plus ancien est supprimé. Doit être positif |
@@ -205,12 +206,14 @@ Chaque option a sa variable d'environnement ; le webhook ne pose que celles marq
 | `--iptables` | `MIMIC_IPTABLES` ✓ | `iptables` | binaire iptables (`iptables-legacy` selon les nœuds) |
 | `--mesh` | `MIMIC_MESH` ✓ | `auto` | `auto`, `none`, `istio`, `istio-ambient`, `linkerd` |
 | `--pod-ip` | `POD_IP` ✓ | absent | IP du pod, cible du trajet entrant en Istio ambient |
+| `--intercept-loopback` | `MIMIC_INTERCEPT_LOOPBACK` | faux | redirige aussi le trafic vers `127.0.0.1` et `::1`. Par défaut, le trafic local du pod (`-o lo` : autres conteneurs, IP du pod) n'est pas intercepté, comme sous Istio. Sert aux tests en namespace réseau ; à ne pas poser dans un pod (un agent OTel ou un `cloud-sql-proxy` voisin recevrait des `599` en mock) |
 | `--dry-run` | | | affiche les règles sans les appliquer |
 
 Les ports du sidecar (15100, 15101, 15106) sont toujours exclus. Si on change
 `MIMIC_INBOUND_PORT`, `MIMIC_OUTBOUND_PORT` ou `MIMIC_ADMIN_PORT`, adapter la configuration du
 sidecar en conséquence : le webhook ne le fait pas. Le webhook ne pose pas `MIMIC_IPV6` : le
-trafic IPv6 d'un pod injecté n'est pas intercepté.
+trafic IPv6 d'un pod injecté n'est pas intercepté. Il ne pose pas non plus
+`MIMIC_INTERCEPT_LOOPBACK`.
 
 ## Contrôleur (`mimic-controller`)
 

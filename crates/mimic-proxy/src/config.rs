@@ -305,6 +305,26 @@ impl MockWebsocket {
     }
 }
 
+/// Connexion TCP sortante non HTTP en `mock`, connexions muettes comprises (spec §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MockTcp {
+    /// Refermée par le sidecar, sans rien ouvrir vers la destination (O3).
+    #[default]
+    Refuse,
+    /// Relayée en tunnel vers la destination d'origine, comme en record.
+    Relay,
+}
+
+impl MockTcp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MockTcp::Refuse => "refuse",
+            MockTcp::Relay => "relay",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MockSection {
@@ -317,6 +337,9 @@ pub struct MockSection {
     pub debug_header: bool,
     /// Poignée de main WebSocket sortante en mock ; le contrôleur peut l'imposer (spec §5.5.1).
     pub websocket: MockWebsocket,
+    /// TCP sortant non HTTP en `mock` (spec §3.4) ; `mock-partial` relaie toujours. Réglage
+    /// du sidecar seulement : le contrôleur ne le transmet pas.
+    pub tcp: MockTcp,
 }
 
 impl Default for MockSection {
@@ -329,6 +352,7 @@ impl Default for MockSection {
             seed: 0x5EED,
             debug_header: true,
             websocket: MockWebsocket::Relay,
+            tcp: MockTcp::Refuse,
         }
     }
 }
@@ -778,6 +802,26 @@ mod tests {
             assert!(err.contains(v), "{err}");
         }
         assert!(load("{timeout: 5, retries: 2}").is_err());
+    /// `mock.tcp` : `refuse` par défaut, `relay` accepté, valeur inconnue refusée au
+    /// démarrage (MCK-24).
+    #[test]
+    fn mck_24_mock_tcp_defaults_to_refuse() {
+        assert_eq!(Config::default().mock.tcp, MockTcp::Refuse);
+        let c: Config = serde_yaml::from_str("mode: mock\n").unwrap();
+        assert_eq!(c.mock.tcp, MockTcp::Refuse);
+        let c = Config::load_with(None, |k| {
+            (k == "MIMIC_CONFIG_YAML").then(|| "mode: mock\nmock:\n  tcp: relay\n".into())
+        })
+        .unwrap();
+        assert_eq!(c.mock.tcp, MockTcp::Relay);
+        assert_eq!(MockTcp::Refuse.as_str(), "refuse");
+        assert_eq!(MockTcp::Relay.as_str(), "relay");
+        let err = Config::load_with(None, |k| {
+            (k == "MIMIC_CONFIG_YAML").then(|| "mock:\n  tcp: drop\n".into())
+        })
+        .unwrap_err();
+        assert!(err.contains("tcp") && err.contains("drop"), "{err}");
+        assert!(err.contains("refuse") && err.contains("relay"), "{err}");
     }
 
     #[test]

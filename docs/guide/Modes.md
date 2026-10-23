@@ -14,7 +14,7 @@ Sources : `crates/mimic-proxy/src/proxy.rs`, `engine.rs`, `crates/mimic-core/src
 |------|---------|--------------|----------------|-------|
 | `passthrough` | relayé | relayé | aucun : métriques seules (durée jusqu'au premier octet) | coût minimal, désactiver mimic sans retirer le sidecar |
 | `record` (défaut) | relayé | relayé | entrant selon `capture.inbound`, sortant complet | découverte de l'API, constitution des enregistrements |
-| `mock` | relayé | **servi par mimic** depuis les enregistrements ; jamais envoyé à la dépendance | entrant selon `capture.inbound` ; sortant : rien (sauf `mock.unmatched: passthrough`) | tir de charge isolé des dépendances |
+| `mock` | relayé | **servi par mimic** depuis les enregistrements ; jamais envoyé à la dépendance ; TCP non HTTP refusé (`mock.tcp`) | entrant selon `capture.inbound` ; sortant : rien (sauf `mock.unmatched: passthrough`) | tir de charge isolé des dépendances |
 | `mock-partial` | relayé | servi par mimic si un enregistrement correspond, **sinon relayé** et enregistré | entrant selon `capture.inbound`, sortant relayé enregistré | compléter les enregistrements pendant un tir, migrer progressivement |
 
 Le mode de démarrage est `mode` de la configuration (`record` avec l'injecteur). Il change :
@@ -38,20 +38,37 @@ arrivée. Log : `changement de mode`, métrique `mimic_mode{mode}`.
 | HTTPS non intercepté (redirigé) | tunnel opaque | tunnel opaque | **connexion fermée** (`mimic_passthrough_connections_total{kind="tls",result="refused"}`) | tunnel opaque |
 | `CONNECT` (proxy explicite) non intercepté | tunnel | tunnel | **`403`** `mimic: tunnel refusé en mode mock (TLS non intercepté)` | tunnel |
 | Poignée de main WebSocket | relayée | relayée, enregistrée | relayée et enregistrée, ou `503` avec `mock.websocket: refuse` | idem `mock` |
-| TCP non HTTP (Redis, PostgreSQL, Kafka…) | tunnel opaque | tunnel opaque | **tunnel opaque** (la dépendance est jointe) | tunnel opaque |
-| Connexion muette (l'application n'écrit rien) | après 300 ms, le premier qui parle décide (serveur d'abord : tunnel) | idem | attend l'application **30 s** sans rien ouvrir, puis tunnel | idem `mock` |
+| TCP non HTTP (Redis, PostgreSQL, Kafka…) | tunnel opaque | tunnel opaque | **connexion fermée** (`mimic_passthrough_connections_total{kind="tcp",result="refused"}`) ; tunnel opaque avec `mock.tcp: relay` | tunnel opaque |
+| Connexion muette (l'application n'écrit rien) | après 300 ms, le premier qui parle décide (serveur d'abord : tunnel) | idem | attend l'application **30 s** sans rien ouvrir ; HTTP : moteur de mock ; sinon, ou toujours muette, **connexion fermée** (tunnel avec `mock.tcp: relay`) | attend 30 s sans rien ouvrir, puis tunnel |
+| Vers un autre conteneur du pod (`127.0.0.1`, `::1`) ou l'IP du pod | non intercepté | non intercepté | non intercepté | non intercepté |
 
 À retenir pour un tir en `mock` :
 
-- **Seul le HTTP est mocké.** Les bases de données, files de messages et autres protocoles TCP
-  restent joints réellement. Les exclure de la mesure (ou les fournir) relève du plan de tir.
+- **Seul le HTTP est mocké, et rien d'autre ne sort.** Une connexion TCP non HTTP (base de
+  données, file de messages, cache) est refermée par mimic sans joindre la dépendance
+  (`mock.tcp: refuse`, le défaut) : l'application voit une connexion coupée, comme une
+  dépendance indisponible. Chaque refus est compté dans
+  `mimic_passthrough_connections_total{direction="outbound",kind="tcp",result="refused"}` et
+  journalisé (`connexion TCP sortante refusée en mode mock`, avec `destination`, au plus une
+  ligne par seconde).
+- **Garder une dépendance TCP réelle** pendant le tir : exclure son port ou son adresse de
+  l'interception (`mimic.platform.io/exclude-outbound-ports`, `exclude-outbound-cidrs`) ; son
+  trafic ne passe plus par mimic, dans aucun mode. `mock.tcp: relay` dans la configuration du
+  sidecar relaie au contraire **tout** le TCP non HTTP, comme les versions antérieures : la
+  base et les brokers reçoivent alors la charge du tir. `mock-partial` relaie toujours le TCP.
+- **Les conteneurs du pod se joignent directement.** Un appel vers `127.0.0.1` ou `::1` (agent
+  OpenTelemetry, Dapr, `cloud-sql-proxy`) n'est pas intercepté, comme sous Istio ; les
+  connexions que ce conteneur ouvre à son tour vers l'extérieur passent, elles, par mimic (un
+  `cloud-sql-proxy` est donc coupé en mock comme le serait l'application).
 - **Un HTTPS non listé dans `tls.intercept` est coupé.** L'application voit une connexion
   fermée (ou un `403` sur `CONNECT`). Ajouter l'hôte à `mimic.platform.io/tls-intercept` avant
   l'enregistrement, pas seulement avant le mock : sans interception, rien n'a été enregistré.
 - **Les protocoles où le serveur parle en premier** (MySQL, SMTP) attendent 30 s en `mock` et
-  `mock-partial` avant d'être relayés : en mock, mimic ne joint pas la dépendance pour savoir
-  qui parle d'abord. Exclure leurs ports (`mimic.platform.io/exclude-outbound-ports`) si ces
-  connexions doivent rester rapides.
+  `mock-partial` : en mock, mimic ne joint pas la dépendance pour savoir qui parle d'abord.
+  Au bout de l'attente, la connexion est fermée en `mock` (relayée avec `mock.tcp: relay` et
+  en `mock-partial`). Exclure leurs ports (`mimic.platform.io/exclude-outbound-ports`) si ces
+  connexions doivent rester réelles et rapides. Une connexion de pool HTTP ouverte d'avance et
+  inutilisée plus de 30 s est fermée de même : le client en ouvre une nouvelle.
 
 ### Trafic entrant
 

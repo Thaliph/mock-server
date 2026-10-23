@@ -38,8 +38,12 @@ dépendances. `--allow-live-dependencies` lève ce refus, en connaissance de cau
 
 À savoir avant de tirer (voir [Modes](Modes.md#trafic-sortant)) :
 
-- les connexions TCP non HTTP (bases, files de messages) sont **relayées** même en `mock` :
-  elles reçoivent la charge du tir ;
+- les connexions TCP non HTTP (bases, files de messages) sont **refusées** en `mock`
+  (`mock.tcp: refuse`, le défaut) : l'application les voit coupées. Un service qui ne répond
+  plus sans sa base fausse le tir : soit l'exclure de l'interception
+  (`mimic.platform.io/exclude-outbound-ports`) pour qu'elle reste réelle et reçoive la charge,
+  soit accepter l'erreur. `mimic_passthrough_connections_total{kind="tcp",result="refused"}`
+  doit rester à zéro si le service n'est pas censé en ouvrir ;
 - un HTTPS sortant non intercepté est coupé en `mock` ;
 - une connexion WebSocket sortante est relayée, sauf `--mock-websocket refuse` ;
 - `mimic_mock_responses_total{match="unmatched"}` (réponses `599`) doit rester proche de zéro :
