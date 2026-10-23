@@ -146,6 +146,7 @@ passive, qui ne touche pas au support.
 | `mimic_controller_workloads` | jauge | | workloads connus |
 | `mimic_controller_pods` | jauge | `state` (`aligned`, `diverging`, `absent`) | pods vus depuis moins de `pod_forget` ; les pods non sélectionnés par un `selector` comptent `aligned` |
 | `mimic_controller_snapshots_total` | compteur | | snapshots construits et écrits |
+| `mimic_controller_snapshots_deleted_total` | compteur | | snapshots purgés (cycle de vie, `snapshot.keep_last`) : hors référencés (`spec.snapshot`, `status.snapshot`) et épinglés (`mimicctl snapshot pin`) |
 | `mimic_controller_exchanges` | jauge | | échanges en mémoire, tous workloads (borne `max_exchanges_total`) |
 | `mimic_controller_exemplars` | jauge | | exemples par endpoint gardés, tous workloads |
 | `mimic_controller_exemplars_bytes` | jauge | | taille sérialisée des exemples (borne `max_exemplar_bytes_total`) |

@@ -143,6 +143,14 @@ spec:
               snapshot:
                 nullable: true
                 type: string
+              snapshotExchanges:
+                description: |-
+                  Échanges du snapshot servi (CTL-45, cycle de vie des snapshots) ; absent sans
+                  snapshot ou si son nombre d'échanges n'a pas pu être lu.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
               unmatched:
                 default: 0
                 description: Requêtes sans réponse du mock (599, 413) relevées par les pods sélectionnés.

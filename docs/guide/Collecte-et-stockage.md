@@ -91,7 +91,7 @@ Conséquences pour l'exploitation :
 | mémoire | échanges du pod (et, en partage direct, ceux des pairs) | `capture.max_exchanges` (50 000), `capture.max_store_bytes` (64 MiB, bodies au plus pour moitié) ; au-delà, bodies retirés puis échanges évincés, du plus ancien au plus récent (`mimic_capture_dropped_total{reason="store_budget"}`) | au redémarrage du conteneur, sauf rechargement du journal |
 | journal local | segments `local-<n>.jsonl` dans `store.dir` (`/var/lib/mimic`, `emptyDir` de 512 Mi avec l'injecteur), rechargés au démarrage (`store local rechargé`) | `store.segment_bytes` (32 MiB) × `store.max_segments` (4) ; file d'écriture bornée, pleine : ligne abandonnée (`reason="local_backlog"`) | à la suppression du pod |
 | file de publication | échanges pas encore publiés au contrôleur | `share.max_backlog_bytes` (16 MiB), `share.max_pending` (50 000) ; au-delà, les plus anciens sont abandonnés (`reason="share_backlog"`) | **perte définitive** pour le contrôleur |
-| cache contrôleur | `controller/desired.json` (dernier état souhaité), `controller/snapshots/<id>.mock.json` (formes de mock) dans `store.dir` | un fichier par snapshot reçu | à la suppression du pod |
+| cache contrôleur | `controller/desired.json` (dernier état souhaité), `controller/snapshots/<id>.mock.json` (formes de mock) dans `store.dir` | `store.max_cached_snapshots` (5) ; au-delà, les formes les plus anciennes sont supprimées, jamais celle active (SNP-12) | à la suppression du pod, ou plus tôt si purgé |
 
 Le store mémoire est une fenêtre glissante : `store_budget` monte normalement dès qu'il est
 plein, ce n'est pas un signal d'alerte. `share_backlog`, lui, signifie que des échanges
@@ -122,7 +122,7 @@ y écrit. Arborescence par workload :
 | `<ns>/<wl>/exchanges/<instance>/<segment>.jsonl` | segments reçus des sidecars | `retention` (24 h) ; plafond `max_bytes_per_workload` (256 MiB), les plus anciens supprimés au-delà |
 | `<ns>/<wl>/exchanges/_hour/<AAAAMMJJHH>.jsonl` | segments d'une heure compactés en un seul, une fois l'heure révolue depuis 10 min, avec au plus `samples_per_operation` bodies par (opération, code) | idem |
 | `<ns>/<wl>/exemplars.jsonl` | un **exemple** rejouable par endpoint (opération, code) | **hors rétention** |
-| `<ns>/<wl>/snapshots/<id>.jsonl` | snapshots construits | **jamais supprimés** par le contrôleur |
+| `<ns>/<wl>/snapshots/<id>.jsonl`, `<id>.meta.json` | snapshots construits ou importés, et leurs métadonnées (date, échanges, épinglé) | purgés au-delà de `snapshot.keep_last` (5), hors référencés et épinglés (§5.6) |
 | `<ns>/<wl>/desired.json` | dernier état souhaité | permanent |
 
 Passe de maintenance toutes les 60 s : exemples, rétention, compaction, plafond de volume. Un
@@ -163,11 +163,16 @@ Un snapshot est construit par la réplique active quand une `MimicWorkload` entr
 Le snapshot reste celui du workload tant qu'il ne quitte pas le mock. Pour rejouer exactement
 le même jeu d'un tir à l'autre, noter `status.snapshot` et le reporter dans `spec.snapshot`
 (voir [Basculer en mock](Basculer-en-mock.md)). Lister les snapshots d'un workload :
-`/v1/workloads/<ns>/<wl>/snapshots` sur l'interface du contrôleur (voir
-[Administration et API](Administration-et-API.md)).
+`mimicctl snapshot ls` (ou `/v1/workloads/<ns>/<wl>/snapshots` sur l'interface du contrôleur,
+voir [Administration et API](Administration-et-API.md)).
 
-Les snapshots ne sont jamais purgés automatiquement : surveiller le volume du support (voir
-[Exploiter en production](Exploiter-en-production.md#stockage-du-contrôleur)).
+**Cycle de vie.** À chaque passe de maintenance (toutes les minutes), les snapshots au-delà de
+`snapshot.keep_last` (5 par défaut) sont purgés, sauf les **référencés** (`spec.snapshot` ou
+`status.snapshot` courants d'une `MimicWorkload`) et les **épinglés**
+(`mimicctl snapshot pin`), jamais purgés quel que soit leur âge. `mimicctl snapshot gc`
+déclenche la même purge immédiatement ; `mimicctl snapshot import` recharge un snapshot
+exporté ailleurs, épinglé par défaut. Voir
+[Exploiter en production](Exploiter-en-production.md#stockage-du-contrôleur).
 
 ## Découverte OpenAPI
 

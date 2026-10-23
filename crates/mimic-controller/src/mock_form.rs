@@ -194,6 +194,17 @@ impl MockForms {
         let inner = self.lock();
         (inner.order.len(), inner.bytes)
     }
+
+    /// Retire la forme gardée sous `key`, si elle existe (CTL-44, snapshot purgé : sa forme
+    /// en cache ne doit plus être servie une fois le contenu supprimé).
+    pub fn evict(&self, key: &str) {
+        let mut inner = self.lock();
+        inner.cells.remove(key);
+        if let Some(pos) = inner.order.iter().position(|(k, _)| k == key) {
+            let (_, size) = inner.order.remove(pos).expect("position valide");
+            inner.bytes -= size;
+        }
+    }
 }
 
 #[cfg(test)]

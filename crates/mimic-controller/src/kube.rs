@@ -107,7 +107,12 @@ pub async fn publish_status(ctl: Arc<Ctl>, client: kube::Client) {
             let status = ctl
                 .with_live(&ns, &name, |w| {
                     w.spec.as_ref()?;
-                    Some(status_of(&w.desired, &ctl.summary(w), w.generation))
+                    Some(status_of(
+                        &w.desired,
+                        &ctl.summary(w),
+                        w.generation,
+                        w.snapshot_exchanges,
+                    ))
                 })
                 .await
                 .ok()

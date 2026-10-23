@@ -387,6 +387,10 @@ pub struct StoreConfig {
     pub segment_bytes: u64,
     /// Segments gardés ; le plus ancien est supprimé au-delà.
     pub max_segments: usize,
+    /// Formes de mock gardées dans `<dir>/controller/snapshots/` ; au-delà, les plus
+    /// anciennes sont supprimées (par date de dernière écriture), jamais celle du snapshot
+    /// actif (SNP-12, cycle de vie des snapshots).
+    pub max_cached_snapshots: usize,
 }
 
 impl Default for StoreConfig {
@@ -397,6 +401,7 @@ impl Default for StoreConfig {
             // étant laissé aux snapshots imposés.
             segment_bytes: 32 * 1024 * 1024,
             max_segments: 4,
+            max_cached_snapshots: 5,
         }
     }
 }
@@ -640,6 +645,9 @@ impl Config {
         }
         if self.store.segment_bytes == 0 || self.store.max_segments == 0 {
             return Err("store.segment_bytes et store.max_segments doivent être positifs".into());
+        }
+        if self.store.max_cached_snapshots == 0 {
+            return Err("store.max_cached_snapshots doit être positif".into());
         }
         // Une période nulle ferait tourner une boucle sans attente (spec §9.1).
         let mut durations = vec![

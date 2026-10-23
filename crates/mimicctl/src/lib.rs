@@ -12,7 +12,7 @@ use mimic_controller::crd::{
     MimicWorkloadSpec, MockSpec,
 };
 use mimic_core::unmatched::{UnmatchedReport, format_utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Document OpenAPI à exporter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +254,105 @@ pub fn sample_requests_path(
         "{}/requests?direction={direction}&format=json&limit={limit}",
         base(namespace, workload)
     )
+}
+
+// Cycle de vie des snapshots (spec §5.6, §9.5) : `mimicctl snapshot ls|pin|export|import|gc`.
+
+pub fn snapshots_path(namespace: &str, workload: &str) -> String {
+    format!("{}/snapshots", base(namespace, workload))
+}
+
+/// `GET …/snapshots/{id}` (`export`) ou `POST …/snapshots/{id}/pin` (`pin`) : un identifiant
+/// mal formé est refusé avant tout appel (CLI-13, CLI-14).
+fn snapshot_path(
+    namespace: &str,
+    workload: &str,
+    id: &str,
+    suffix: &str,
+) -> Result<String, String> {
+    if !valid_name(id) {
+        return Err(format!("identifiant de snapshot invalide : « {id} »"));
+    }
+    Ok(format!(
+        "{}/snapshots/{id}{suffix}",
+        base(namespace, workload)
+    ))
+}
+
+pub fn snapshot_export_path(namespace: &str, workload: &str, id: &str) -> Result<String, String> {
+    snapshot_path(namespace, workload, id, "")
+}
+
+pub fn snapshot_pin_path(namespace: &str, workload: &str, id: &str) -> Result<String, String> {
+    snapshot_path(namespace, workload, id, "/pin")
+}
+
+/// Corps de `POST …/snapshots/{id}/pin` (CLI-13).
+pub fn snapshot_pin_body(pinned: bool) -> Value {
+    json!({ "pinned": pinned })
+}
+
+pub fn snapshot_gc_path(namespace: &str, workload: &str) -> String {
+    format!("{}/snapshots/gc", base(namespace, workload))
+}
+
+/// Identifiants supprimés par `mimicctl snapshot gc` (CLI-16), triés : `{"deleted": […]}`.
+pub fn snapshot_gc_deleted(report: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = report["deleted"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Tableau `mimicctl snapshot ls` (CLI-12) : identifiant, date, échanges, épinglé, et
+/// référencé si `current` (le `spec.snapshot`/`status.snapshot` du workload) le désigne.
+/// `snaps` vient de `GET …/snapshots`, du plus récent au plus ancien.
+pub fn snapshot_table(snaps: &[Value], current: Option<&str>) -> String {
+    let cell = |v: &Value, dash: &str| {
+        if v.is_null() {
+            dash.to_string()
+        } else if let Some(b) = v.as_bool() {
+            b.to_string()
+        } else {
+            v.as_str()
+                .map(String::from)
+                .unwrap_or_else(|| v.to_string())
+        }
+    };
+    let mut rows = vec![[
+        "ID".to_string(),
+        "CREATED_MS".into(),
+        "EXCHANGES".into(),
+        "PINNED".into(),
+        "REFERENCED".into(),
+    ]];
+    for s in snaps {
+        let id = s["id"].as_str().unwrap_or_default();
+        rows.push([
+            id.to_string(),
+            cell(&s["created_ms"], "?"),
+            cell(&s["exchanges"], "?"),
+            cell(&s["pinned"], "false"),
+            (current == Some(id)).to_string(),
+        ]);
+    }
+    let widths: Vec<usize> = (0..5)
+        .map(|i| rows.iter().map(|r| r[i].len()).max().unwrap_or(0))
+        .collect();
+    rows.iter()
+        .map(|r| {
+            let cells: Vec<String> = r
+                .iter()
+                .zip(&widths)
+                .map(|(c, w)| format!("{c:<w$}"))
+                .collect();
+            format!("{}\n", cells.join("   ").trim_end())
+        })
+        .collect()
 }
 
 /// Tableau `kubectl get` : mode souhaité, snapshot servi, pods alignés.

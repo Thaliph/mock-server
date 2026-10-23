@@ -30,6 +30,8 @@ pub struct Metrics {
     pub workloads: Gauge,
     pub pods: Family<StateLabel, Gauge>,
     pub snapshots: Counter,
+    /// Snapshots supprimés par la purge (CTL-44, cycle de vie des snapshots).
+    pub snapshots_deleted: Counter,
     pub exchanges: Gauge,
     /// Exemples par endpoint gardés, tous workloads (spec §5.5.3).
     pub exemplars: Gauge,
@@ -51,6 +53,7 @@ impl Default for Metrics {
         let workloads = Gauge::default();
         let pods = Family::<StateLabel, Gauge>::default();
         let snapshots = Counter::default();
+        let snapshots_deleted = Counter::default();
         let exchanges = Gauge::default();
         let exemplars = Gauge::default();
         let exemplars_bytes = Gauge::default();
@@ -89,6 +92,11 @@ impl Default for Metrics {
             snapshots.clone(),
         );
         registry.register(
+            "mimic_controller_snapshots_deleted",
+            "Snapshots supprimés par la purge (keep_last, hors référencés et épinglés)",
+            snapshots_deleted.clone(),
+        );
+        registry.register(
             "mimic_controller_exchanges",
             "Échanges en mémoire, tous workloads",
             exchanges.clone(),
@@ -125,6 +133,7 @@ impl Default for Metrics {
             workloads,
             pods,
             snapshots,
+            snapshots_deleted,
             exchanges,
             exemplars,
             exemplars_bytes,
