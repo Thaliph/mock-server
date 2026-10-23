@@ -321,3 +321,143 @@ fn ctl_32_metrics_are_reachable_by_the_monitoring_namespace() {
     assert_eq!(endpoint["path"], "/metrics");
     assert_eq!(endpoint["scheme"], "https");
 }
+
+const PRODUCTION_DOC: &str = include_str!("../../../docs/guide/Exploiter-en-production.md");
+const METRICS_DOC: &str = include_str!("../../../docs/guide/Metriques.md");
+const ALERTS_DOC: &str = include_str!("../../../docs/guide/Alertes-et-supervision.md");
+
+/// Valeurs entre accents graves d'une ligne de tableau du guide.
+fn quoted(line: &str) -> Vec<&str> {
+    line.split('`').skip(1).step_by(2).collect()
+}
+
+/// Ligne de tableau d'une page du guide dont la première colonne vaut `cell`, dans la
+/// section `section`.
+fn row<'a>(page: &'a str, section: &str, cell: &str) -> &'a str {
+    let from = page
+        .find(section)
+        .unwrap_or_else(|| panic!("section « {section} » absente"));
+    page[from..]
+        .lines()
+        .find(|l| l.starts_with(&format!("| {cell} |")))
+        .unwrap_or_else(|| panic!("ligne « {cell} » absente de « {section} »"))
+}
+
+/// Le dimensionnement et l'UID du contrôleur donnés par le guide sont ceux du manifest
+/// livré (DOC-03).
+#[test]
+fn doc_03_controller_sizing_matches_the_manifest() {
+    let manifests = docs(include_str!("../../../deploy/controller/controller.yaml"));
+    let pod = &find(&manifests, "Deployment", "mimic-controller")["spec"]["template"]["spec"];
+    let resources = &pod["containers"][0]["resources"];
+    let request = resources["requests"]["memory"].as_str().unwrap();
+    let limit = resources["limits"]["memory"].as_str().unwrap();
+    let cpu = resources["requests"]["cpu"].as_str().unwrap();
+
+    // « ### Contrôleur » du dimensionnement : la ligne mémoire ne cite que les deux valeurs
+    // du manifest, dans l'ordre requête puis limite.
+    let memory = row(PRODUCTION_DOC, "### Contrôleur", "mémoire");
+    let (head, _) = memory.split_once(" | environ").expect("ligne mémoire");
+    assert_eq!(
+        quoted(head),
+        [request, limit],
+        "mémoire du contrôleur dans le guide : {head}"
+    );
+    assert_eq!(quoted(row(PRODUCTION_DOC, "### Contrôleur", "CPU"))[0], cpu);
+
+    // Sécurité : l'UID du plan de contrôle est celui du manifest, et 1337 (istio-proxy)
+    // n'apparaît dans le guide que là où il est question d'un mesh.
+    let uid = pod["securityContext"]["runAsUser"].as_u64().unwrap();
+    let security = row(PRODUCTION_DOC, "## Sécurité", "contrôleur et webhook");
+    assert!(
+        security.contains(&format!("UID et GID {uid}")),
+        "UID du contrôleur dans le guide : {security}"
+    );
+    for (n, line) in PRODUCTION_DOC.lines().enumerate() {
+        let mesh = ["istio", "linkerd", "mesh"]
+            .iter()
+            .any(|m| line.to_lowercase().contains(m));
+        assert!(
+            !line.contains("1337") || mesh,
+            "Exploiter-en-production.md:{} cite l'UID 1337 hors mesh : {line}",
+            n + 1
+        );
+    }
+}
+
+/// Le guide donne le port de collecte du contrôleur ouvert par la NetworkPolicy livrée, et
+/// ne le déclare plus non collectable (DOC-04).
+#[test]
+fn doc_04_controller_metrics_port_matches_the_network_policy() {
+    let manifests = docs(include_str!("../../../deploy/controller/controller.yaml"));
+    let policy = find(&manifests, "NetworkPolicy", "mimic-controller");
+    let monitoring = policy["spec"]["ingress"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|rule| {
+            rule["from"].as_sequence().unwrap().iter().any(|f| {
+                f["namespaceSelector"]["matchLabels"]["mimic.platform.io/monitoring"] == "true"
+            })
+        })
+        .expect("entrée depuis le namespace de monitoring");
+    let port = monitoring["ports"][0]["port"].as_u64().unwrap();
+    let label = "mimic.platform.io/monitoring";
+
+    let controller = row(METRICS_DOC, "## Où les collecter", "contrôleur");
+    assert!(
+        controller.contains(&port.to_string()),
+        "port de collecte du contrôleur dans le guide : {controller}"
+    );
+    assert!(
+        !controller.contains("non collectable"),
+        "le contrôleur est collectable : {controller}"
+    );
+    for page in [METRICS_DOC, ALERTS_DOC] {
+        assert!(page.contains(label), "label {label} attendu");
+    }
+
+    // L'exemple de collecte livré vise ce port, par son nom dans le Deployment.
+    let scrape = docs(include_str!(
+        "../../../deploy/example/vmpodscrape-controller.yaml"
+    ));
+    let endpoint = &scrape[0]["spec"]["podMetricsEndpoints"][0];
+    let name = endpoint["port"].as_str().unwrap();
+    assert!(
+        METRICS_DOC.contains(&format!("port `{name}` ({port})")),
+        "le guide doit nommer le port de collecte « {name} » ({port})"
+    );
+    let ports = find(&manifests, "Deployment", "mimic-controller")["spec"]["template"]["spec"]
+        ["containers"][0]["ports"]
+        .as_sequence()
+        .unwrap();
+    assert!(
+        ports
+            .iter()
+            .any(|p| p["name"] == name && p["containerPort"].as_u64() == Some(port)),
+        "port {name} ({port}) absent du Deployment : {ports:?}"
+    );
+}
+
+/// Chaque alerte des règles `PrometheusRule` du guide a une ligne dans « Conduite à tenir »,
+/// et réciproquement (DOC-06).
+#[test]
+fn doc_06_every_alert_has_a_runbook_row() {
+    let mut declared: Vec<&str> = ALERTS_DOC
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- alert: "))
+        .collect();
+    let runbook = ALERTS_DOC
+        .split_once("## Conduite à tenir")
+        .expect("section « Conduite à tenir »")
+        .1;
+    let mut documented: Vec<&str> = runbook
+        .lines()
+        .filter_map(|l| l.strip_prefix("| `")?.split_once('`'))
+        .map(|(name, _)| name)
+        .collect();
+    assert!(declared.len() > 25, "alertes : {declared:?}");
+    declared.sort_unstable();
+    documented.sort_unstable();
+    assert_eq!(declared, documented);
+}
