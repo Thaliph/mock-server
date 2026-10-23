@@ -102,9 +102,10 @@ n'existaient pas encore (ordre des init containers, CNI), ou `MIMIC_MESH=none`.
 
 Avec mTLS strict (`PeerAuthentication` `STRICT`, Linkerd `all-authenticated`), le mesh
 refuserait les sondes HTTP du kubelet vers 15100. Quand le webhook voit des conteneurs du mesh
-dans le pod, les sondes du sidecar deviennent `exec` : `mimic-proxy --probe /healthz` (et
-`/readyz`), qui interrogent l'API admin depuis le conteneur. En ambient, aucun conteneur du
-mesh n'est dans le pod et le kubelet est reconnu par ztunnel : les sondes restent HTTP.
+dans le pod, les sondes du sidecar deviennent `exec` : `mimic-proxy --probe /readyz`
+(démarrage et disponibilité) et `mimic-proxy --probe /healthz` (vivacité), qui interrogent
+l'API admin depuis le conteneur. En ambient, aucun conteneur du mesh n'est dans le pod et le
+kubelet est reconnu par ztunnel : les sondes restent HTTP.
 
 ## Effets et limites
 

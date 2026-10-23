@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use mimic_core::model::Direction;
@@ -115,6 +116,12 @@ pub struct ModeLabel {
     pub mode: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StateLabel {
+    /// État de la barrière de démarrage (spec §5.5.5).
+    pub state: &'static str,
+}
+
 type HistogramFamily<L> = Family<L, Histogram, fn() -> Histogram>;
 
 fn latency_histogram() -> Histogram {
@@ -142,6 +149,12 @@ pub struct Metrics {
     pub tls_handshake_failures: Family<TlsFailureLabels, Counter>,
     pub websocket_connections: Family<WebsocketLabels, Counter>,
     pub connections_refused: Family<ListenerLabel, Counter>,
+    /// Battements vers le contrôleur, par résultat (`ok`, `error`).
+    pub heartbeats: Family<ResultLabel, Counter>,
+    /// Date Unix, en secondes, du dernier battement auquel le contrôleur a répondu.
+    pub heartbeat_last_success: Gauge<f64, AtomicU64>,
+    /// État de la barrière de démarrage : 1 pour l'état courant (spec §5.5.5).
+    pub startup: Family<StateLabel, Gauge>,
     /// Authorities internées : au plus `MAX_AUTHORITIES` chaînes, jamais libérées.
     authorities: RwLock<BTreeSet<&'static str>>,
 }
@@ -184,6 +197,9 @@ impl Metrics {
         let tls_handshake_failures = Family::default();
         let websocket_connections = Family::default();
         let connections_refused = Family::default();
+        let heartbeats = Family::default();
+        let heartbeat_last_success = Gauge::<f64, AtomicU64>::default();
+        let startup = Family::default();
         registry.register(
             "mimic_requests",
             "Requêtes traitées par le sidecar",
@@ -270,6 +286,21 @@ impl Metrics {
             "Connexions refermées au plafond de connexions simultanées (spec §3.5)",
             connections_refused.clone(),
         );
+        registry.register(
+            "mimic_heartbeats",
+            "Battements vers le contrôleur, par résultat (ok : état souhaité reçu)",
+            heartbeats.clone(),
+        );
+        registry.register(
+            "mimic_heartbeat_last_success_timestamp_seconds",
+            "Date Unix du dernier battement auquel le contrôleur a répondu (0 avant le premier)",
+            heartbeat_last_success.clone(),
+        );
+        registry.register(
+            "mimic_startup",
+            "État de la barrière de démarrage sous contrôleur (1 pour l'état courant)",
+            startup.clone(),
+        );
         Self {
             registry,
             requests,
@@ -290,6 +321,9 @@ impl Metrics {
             tls_handshake_failures,
             websocket_connections,
             connections_refused,
+            heartbeats,
+            heartbeat_last_success,
+            startup,
             authorities: RwLock::new(BTreeSet::new()),
         }
     }
@@ -420,6 +454,24 @@ impl Metrics {
             self.mode
                 .get_or_create(&ModeLabel { mode: m.as_str() })
                 .set(i64::from(m == current));
+        }
+    }
+
+    /// `mimic_heartbeats_total` et, pour un succès, la date du dernier.
+    pub fn count_heartbeat(&self, ok: bool, unix_secs: f64) {
+        let result = if ok { "ok" } else { "error" };
+        self.heartbeats.get_or_create(&ResultLabel { result }).inc();
+        if ok {
+            self.heartbeat_last_success.set(unix_secs);
+        }
+    }
+
+    /// `mimic_startup{state}` : 1 pour l'état courant de la barrière, 0 pour les autres.
+    pub fn set_startup(&self, current: mimic_core::startup::Phase) {
+        for p in mimic_core::startup::Phase::ALL {
+            self.startup
+                .get_or_create(&StateLabel { state: p.as_str() })
+                .set(i64::from(p == current));
         }
     }
 

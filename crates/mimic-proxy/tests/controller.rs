@@ -1,5 +1,6 @@
-//! Critères CTL-*, SNP-03 à 08, SHR-10 et SEC-01, SEC-05 de la spec (§5.4, §5.5, §5.6,
-//! §7.1) : sidecars réels pilotés par un contrôleur réel.
+//! Critères CTL-*, SNP-03 à 08, SHR-10 et SEC-01, SEC-05 de la spec (§5.4, §5.5, §5.5.5,
+//! §5.6, §7.1) : sidecars réels pilotés par un contrôleur réel (ou factice, pour un
+//! contrôleur qui ne répond pas).
 
 mod common;
 
@@ -10,8 +11,9 @@ use std::time::{Duration, Instant};
 use common::*;
 use mimic_controller::config::{AuthConfig, ControllerConfig, Identity, TlsFiles};
 use mimic_controller::reconcile::MimicWorkloadSpec;
+use mimic_core::startup::Fallback;
 use mimic_proxy::Running;
-use mimic_proxy::config::{Config, Mode, ShareConfig};
+use mimic_proxy::config::{Config, Mode, ShareConfig, StartupConfig};
 use serde_json::Value;
 
 const PODS: [&str; 2] = ["api-a", "api-b"];
@@ -948,4 +950,325 @@ async fn mck_27_heartbeat_carries_the_unmatched_requests() {
         "{wl}"
     );
     assert_eq!(saas.hits(), 0, "rien n'est sorti");
+}
+
+/// `/readyz` : code et texte (état de la barrière de démarrage, §5.5.5).
+async fn readyz(p: &Running) -> (u16, String) {
+    let r = client().get(admin(p, "/readyz")).send().await.unwrap();
+    (r.status().as_u16(), r.text().await.unwrap())
+}
+
+/// Délai et repli de démarrage.
+fn startup(mut c: Config, timeout: Duration, fallback: Fallback) -> Config {
+    if let Some(s) = c.share.as_mut() {
+        s.startup = StartupConfig { timeout, fallback };
+    }
+    c
+}
+
+/// Contrôleur factice : `503` tant qu'aucun état souhaité n'est fixé, puis celui-ci.
+struct FakeController {
+    addr: std::net::SocketAddr,
+    answer: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
+}
+
+impl FakeController {
+    fn answer(&self, desired: Option<Value>) {
+        *self.answer.lock().unwrap() = desired;
+    }
+
+    /// Sidecar `instance` qui bat vers ce contrôleur, avec son propre store.
+    fn piloted(&self, dir: &Path, instance: &str) -> Config {
+        let mut c = config(None, Mode::Record);
+        c.instance = instance.into();
+        c.store.dir = Some(dir.join(format!("store-{instance}")));
+        c.share = Some(ShareConfig {
+            url: format!("http://{}", self.addr),
+            interval: Duration::from_millis(100),
+            mode_poll: Duration::from_millis(100),
+            allow_insecure: true,
+            ..ShareConfig::default()
+        });
+        c
+    }
+}
+
+async fn fake_controller() -> FakeController {
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    let answer = std::sync::Arc::new(std::sync::Mutex::new(None::<Value>));
+    let shared = answer.clone();
+    let app = axum::Router::new().route(
+        "/v1/workloads/ns/api/heartbeat",
+        post(move || {
+            let desired = shared.lock().unwrap().clone();
+            async move {
+                match desired {
+                    Some(d) => Ok(axum::Json(d)),
+                    None => Err(StatusCode::SERVICE_UNAVAILABLE),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    FakeController { addr, answer }
+}
+
+/// Un pod neuf d'un workload en mock : barrière fermée tant que le snapshot n'est pas
+/// chargé, rien ne sort entre-temps, puis ouverte en mock sur le snapshot (CTL-37).
+#[tokio::test]
+async fn ctl_37_new_pod_waits_for_its_snapshot_before_the_app_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let url7 = saas.url("/users/7");
+    // A enregistre la dépendance puis s'arrête : la forme de mock n'est jamais calculée.
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    let recorded = served(&a, &url7).await;
+    eventually("appel reçu", || async {
+        ui_json(&ctl, "/v1/workloads/ns/api/requests?direction=outbound")
+            .await
+            .as_array()
+            .is_some_and(|l| l.len() == 1)
+    })
+    .await;
+    a.shutdown().await;
+    let s1 = apply(&ctl, "mock", None).await["snapshot"].clone();
+    let id = s1.as_str().unwrap().to_string();
+    let file = dir
+        .path()
+        .join("ctl/ns/api/snapshots")
+        .join(format!("{id}.jsonl"));
+    let aside = dir.path().join("snapshot.aside");
+    std::fs::rename(&file, &aside).unwrap();
+
+    // Pod neuf : store vide, délai par défaut (30 s, bien au-delà du test).
+    let mut cfg = piloted(None, &ctl, dir.path(), "api-b");
+    cfg.store.dir = Some(dir.path().join("store-b"));
+    let b = proxy(cfg).await;
+    let health = client().get(admin(&b, "/healthz")).send().await.unwrap();
+    assert_eq!(health.status(), 200, "vivacité indépendante du contrôleur");
+    eventually("état reçu, snapshot indisponible", || async {
+        let s = status(&b).await;
+        s["mode"] == "mock" && s["controller"]["last_error"].is_string()
+    })
+    .await;
+    assert_eq!(readyz(&b).await, (503, "waiting".to_string()));
+    let s = status(&b).await;
+    assert_eq!(s["controller"]["startup"]["state"], "waiting", "{s}");
+    assert_eq!(s["controller"]["startup"]["fallback"], "record", "{s}");
+    assert_eq!(s["controller"]["startup"]["timeout"], 30.0, "{s}");
+    // Ce qui arriverait malgré la barrière ne sort pas : mock sur les données locales.
+    let hits = saas.hits();
+    assert_eq!(served(&b, &url7).await.0, 599);
+    assert_eq!(saas.hits(), hits, "rien n'est sorti");
+
+    // Forme de mock rétablie : barrière ouverte, en mock sur le snapshot.
+    std::fs::rename(&aside, &file).unwrap();
+    eventually("barrière ouverte", || async {
+        readyz(&b).await == (200, "aligned".to_string())
+    })
+    .await;
+    let s = status(&b).await;
+    assert_eq!(s["mode"], "mock");
+    assert_eq!(s["snapshot"], s1);
+    assert_eq!(s["controller"]["startup"]["state"], "aligned", "{s}");
+    assert_eq!(served(&b, &url7).await.2, recorded.2);
+    assert_eq!(saas.hits(), hits, "rien n'est sorti");
+    let desired: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join("store-b/controller/desired.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(desired["mode"], "mock");
+    assert_eq!(desired["snapshot"], s1);
+}
+
+/// Contrôleur qui ne répond pas à un pod neuf : barrière fermée jusqu'à l'échéance, puis
+/// repli ; `fail` garde la barrière fermée jusqu'à la première réponse (CTL-38).
+#[tokio::test]
+async fn ctl_38_unreachable_controller_applies_the_startup_fallback() {
+    // Hors contrôleur, rien à attendre.
+    let alone = proxy(config(None, Mode::Record)).await;
+    assert_eq!(readyz(&alone).await, (200, "ok".to_string()));
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake_controller().await;
+    let saas = fake_server().await;
+    let timeout = Duration::from_secs(1);
+    let mut sidecars = vec![];
+    for (fallback, waiting, applied) in [
+        (Fallback::Record, "record", "record"),
+        (Fallback::Passthrough, "record", "passthrough"),
+        (Fallback::MockLocal, "mock", "mock"),
+        (Fallback::Fail, "mock", "mock"),
+    ] {
+        let name = format!("api-{}", fallback.as_str());
+        let p = proxy(startup(fake.piloted(dir.path(), &name), timeout, fallback)).await;
+        assert_eq!(readyz(&p).await, (503, "waiting".to_string()), "{name}");
+        assert_eq!(status(&p).await["mode"], waiting, "{name}");
+        tokio::time::sleep(timeout + Duration::from_millis(500)).await;
+        let hits = saas.hits();
+        let (code, _, _) = served(&p, &saas.url("/users/7")).await;
+        let s = status(&p).await;
+        assert_eq!(s["mode"], applied, "{name} : {s}");
+        match fallback {
+            Fallback::Record | Fallback::Passthrough => {
+                assert_eq!(readyz(&p).await, (200, "fallback".to_string()), "{name}");
+                assert_eq!(code, 200, "{name}");
+                assert_eq!(saas.hits(), hits + 1, "{name} : la dépendance est jointe");
+            }
+            Fallback::MockLocal => {
+                assert_eq!(readyz(&p).await, (200, "fallback".to_string()), "{name}");
+                assert_eq!(code, 599, "{name}");
+                assert_eq!(saas.hits(), hits, "{name} : rien n'est sorti");
+            }
+            Fallback::Fail => {
+                assert_eq!(readyz(&p).await, (503, "waiting".to_string()), "{name}");
+                assert_eq!(code, 599, "{name}");
+                assert_eq!(saas.hits(), hits, "{name} : rien n'est sorti");
+                assert_eq!(s["controller"]["startup"]["state"], "waiting", "{s}");
+            }
+        }
+        sidecars.push((name, p));
+    }
+
+    // Le contrôleur répond enfin un état vide : alignés, dans le mode de la configuration,
+    // et l'état vide est gardé sur disque.
+    fake.answer(Some(serde_json::json!({})));
+    for (name, p) in &sidecars {
+        eventually("aligné", || async {
+            readyz(p).await == (200, "aligned".to_string())
+        })
+        .await;
+        assert_eq!(status(p).await["mode"], "record", "{name}");
+        let saved = dir
+            .path()
+            .join(format!("store-{name}/controller/desired.json"));
+        assert!(saved.exists(), "{name} : état vide non gardé");
+    }
+}
+
+/// Redémarrage du seul sidecar : l'état gardé sur disque est appliqué dès le démarrage et
+/// ouvre la barrière à l'échéance, même avec `fail` ; un état vide gardé n'est pas un mock
+/// (CTL-39).
+#[tokio::test]
+async fn ctl_39_restarted_sidecar_reloads_its_last_state_before_listening() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let url7 = saas.url("/users/7");
+    let mut cfg = piloted(None, &ctl, dir.path(), "api-a");
+    cfg.store.dir = Some(dir.path().join("store-a"));
+    let a = proxy(cfg.clone()).await;
+    let recorded = served(&a, &url7).await;
+    eventually("appel reçu", || async {
+        ui_json(&ctl, "/v1/workloads/ns/api/requests?direction=outbound")
+            .await
+            .as_array()
+            .is_some_and(|l| l.len() == 1)
+    })
+    .await;
+    let s1 = apply(&ctl, "mock", None).await["snapshot"].clone();
+    converged(&[&a], "mock", &s1).await;
+    a.shutdown().await;
+    ctl.shutdown().await;
+
+    // Seul le sidecar redémarre, cette fois avec `fail` : l'état gardé l'emporte.
+    let a = proxy(startup(cfg, Duration::from_secs(1), Fallback::Fail)).await;
+    let s = status(&a).await;
+    assert_eq!(s["mode"], "mock");
+    assert_eq!(s["snapshot"], s1);
+    assert_eq!(readyz(&a).await, (503, "waiting".to_string()));
+    let hits = saas.hits();
+    assert_eq!(served(&a, &url7).await.2, recorded.2);
+    assert_eq!(saas.hits(), hits, "rien n'est sorti");
+    eventually("dernier état connu à l'échéance", || async {
+        readyz(&a).await == (200, "last-known".to_string())
+    })
+    .await;
+    assert_eq!(status(&a).await["mode"], "mock");
+
+    // État vide reçu au premier battement, gardé : au redémarrage, pas de mock d'attente.
+    let fake = fake_controller().await;
+    fake.answer(Some(serde_json::json!({})));
+    let cfg = startup(
+        fake.piloted(dir.path(), "api-b"),
+        Duration::from_secs(1),
+        Fallback::MockLocal,
+    );
+    let b = proxy(cfg.clone()).await;
+    eventually("aligné", || async {
+        readyz(&b).await == (200, "aligned".to_string())
+    })
+    .await;
+    b.shutdown().await;
+    fake.answer(None);
+    let b = proxy(cfg).await;
+    assert_eq!(status(&b).await["mode"], "record");
+    eventually("dernier état connu à l'échéance", || async {
+        readyz(&b).await == (200, "last-known".to_string())
+    })
+    .await;
+    assert_eq!(status(&b).await["mode"], "record");
+}
+
+/// Battements comptés par résultat, date du dernier succès, état de la barrière (CTL-40).
+#[tokio::test]
+async fn ctl_40_heartbeats_and_startup_are_measured() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake_controller().await;
+    let p = proxy(fake.piloted(dir.path(), "api-a")).await;
+    eventually("battements en échec comptés", || async {
+        metric_value(
+            &metrics(&p).await,
+            "mimic_heartbeats_total{result=\"error\"}",
+        )
+        .is_some_and(|n| n >= 2.0)
+    })
+    .await;
+    let m = metrics(&p).await;
+    assert_eq!(
+        metric_value(&m, "mimic_heartbeat_last_success_timestamp_seconds"),
+        Some(0.0),
+        "{m}"
+    );
+    assert_eq!(
+        metric_value(&m, "mimic_startup{state=\"waiting\"}"),
+        Some(1.0)
+    );
+    assert_eq!(
+        metric_value(&m, "mimic_startup{state=\"aligned\"}"),
+        Some(0.0)
+    );
+
+    let unix = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    };
+    let before = unix();
+    fake.answer(Some(serde_json::json!({})));
+    eventually("battement réussi compté", || async {
+        metric_value(&metrics(&p).await, "mimic_heartbeats_total{result=\"ok\"}")
+            .is_some_and(|n| n >= 1.0)
+    })
+    .await;
+    let m = metrics(&p).await;
+    let last = metric_value(&m, "mimic_heartbeat_last_success_timestamp_seconds").unwrap();
+    let now = unix();
+    assert!(
+        before - 1.0 <= last && last <= now + 1.0,
+        "{last} hors de [{before}, {now}]"
+    );
+    assert_eq!(
+        metric_value(&m, "mimic_startup{state=\"aligned\"}"),
+        Some(1.0)
+    );
+    assert_eq!(
+        metric_value(&m, "mimic_startup{state=\"waiting\"}"),
+        Some(0.0)
+    );
 }

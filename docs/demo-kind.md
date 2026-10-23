@@ -424,6 +424,24 @@ redémarré.
   du trafic ; tout le reste répond depuis les snapshots. Revenir avec la même boucle et
   `record`.
 
+- **Pod neuf pendant le mock** : repasser `shipping` en mock et arrêter `quote` (étapes 6.2
+  et 6.3), puis ajouter un réplica. Le nouveau pod reste quelques secondes en `Init:1/2` : son
+  application n'est lancée qu'une fois que le sidecar a reçu l'état souhaité et chargé le
+  snapshot (`startupProbe` sur `/readyz`).
+
+  ```sh
+  kubectl -n "$NS" scale deploy/shipping --replicas=3
+  kubectl -n "$NS" get pods -l app.kubernetes.io/name=shipping -w   # Ctrl-C une fois Running
+  until mimicctl status shipping -n "$NS" | tail -1 | grep -qE 'mock +[0-9a-f]+ +3/3$'; do sleep 2; done
+  devis 40
+  kubectl -n "$NS" scale deploy/shipping --replicas=2
+  ```
+
+  À voir : `ALIGNED` à `3/3` dès que le pod est `Running`, et `40/40 devis OK` alors que
+  `quote` n'existe plus : le nouveau pod répond depuis le snapshot comme les deux autres
+  (`metrics mimic_mock_responses_total`, étape 6.4). Revenir ensuite en `record` comme à
+  l'étape 7.
+
 - **Tir de charge** contre `shipping` en mock, avec dimensionnement CPU et mémoire :
   [guide/Tir-de-charge.md](guide/Tir-de-charge.md).
 

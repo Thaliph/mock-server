@@ -13,6 +13,7 @@ use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::redact::{RedactConfig, Redactor};
 use mimic_core::snapshot::MockSnapshot;
 use mimic_core::unmatched::{Reason, Unmatched, UnmatchedLog, UnmatchedReport};
+use mimic_core::startup::{Gate, Phase};
 use serde_json::Value;
 
 use crate::config::{Config, InboundCapture, MockWebsocket, Mode};
@@ -60,6 +61,12 @@ pub struct AppState {
     /// quand elle est présente.
     pub(crate) snapshot: Mutex<Option<Arc<MockSnapshot>>>,
     pub controller_status: Mutex<crate::control::ControllerStatus>,
+    /// Barrière de démarrage sous contrôleur (spec §5.5.5). Ses transitions et l'application
+    /// de l'état souhaité se font sous ce verrou : l'échéance du délai et un battement ne
+    /// s'entrecroisent pas.
+    pub(crate) startup: tokio::sync::Mutex<Gate>,
+    /// État de la barrière, lu sans verrou par `/readyz`.
+    startup_phase: AtomicU8,
     discovery: Mutex<Option<(u64, Arc<Discovery>)>>,
     /// Pris pendant un calcul de la découverte : un seul à la fois, les autres l'attendent.
     discovery_build: Mutex<()>,
@@ -155,6 +162,18 @@ impl AppState {
         };
         let metrics = Metrics::with_version(config.metrics_version());
         metrics.set_mode(config.mode);
+        // Hors contrôleur, aucun état souhaité à attendre : barrière ouverte d'emblée.
+        let startup_phase = if config.controlled() {
+            metrics.set_startup(Phase::Waiting);
+            Phase::Waiting
+        } else {
+            Phase::Aligned
+        };
+        let fallback = config
+            .share
+            .as_ref()
+            .map(|s| s.startup.fallback)
+            .unwrap_or_default();
         let store = Store::with_limits(
             Limits {
                 max_exchanges: config.capture.max_exchanges,
@@ -198,6 +217,8 @@ impl AppState {
                 url: controller_url,
                 ..Default::default()
             }),
+            startup: tokio::sync::Mutex::new(Gate::new(fallback)),
+            startup_phase: AtomicU8::new(startup_phase.to_u8()),
             discovery: Mutex::new(None),
             discovery_build: Mutex::new(()),
             share_status: Mutex::new(share_status),
@@ -246,6 +267,18 @@ impl AppState {
             );
         }
         self.metrics.set_mode(mode);
+    }
+
+    /// État de la barrière de démarrage (spec §5.5.5).
+    pub fn startup_phase(&self) -> Phase {
+        Phase::from_u8(self.startup_phase.load(Ordering::SeqCst))
+    }
+
+    /// Publie l'état de la barrière, tenue sous le verrou `startup`.
+    pub(crate) fn publish_startup(&self, gate: &Gate) {
+        let phase = gate.phase();
+        self.startup_phase.store(phase.to_u8(), Ordering::SeqCst);
+        self.metrics.set_startup(phase);
     }
 
     pub fn inbound_capture(&self) -> InboundCapture {
