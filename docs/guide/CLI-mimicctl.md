@@ -228,6 +228,73 @@ Durées : `500ms`, `60s`, `2m`, `1h`. Proportions : `0.3` ou `30%`. La cible doi
 depuis l'endroit où tourne `mimicctl` (`kubectl port-forward svc/checkout 8080`, ou le Job de
 `deploy/load/job.yaml`, dont l'image contient `mimicctl`).
 
+## `snapshot`
+
+Cycle de vie des snapshots (spec §5.6) : écrits une fois (contenu immuable, métadonnées
+versionnées), purgés au-delà de `snapshot.keep_last` sauf référencés et épinglés. Les cinq
+sous-commandes écrivent sur l'interface du contrôleur (port-forward, même RBAC que `export`,
+`requests` et `report`), jamais sur le mode ni le trafic, qui restent pilotés par la ressource
+`MimicWorkload`.
+
+```sh
+mimicctl snapshot ls checkout -n shop
+mimicctl snapshot pin checkout 3f9a0c1e5b7d2a46 -n shop
+mimicctl snapshot pin checkout 3f9a0c1e5b7d2a46 --unpin -n shop
+mimicctl snapshot export checkout 3f9a0c1e5b7d2a46 -o snapshot.jsonl -n shop
+mimicctl snapshot import checkout snapshot.jsonl -n shop
+mimicctl snapshot gc checkout -n shop
+```
+
+### `snapshot ls`
+
+```sh
+mimicctl snapshot ls <workload> [-n ns]
+```
+
+Tableau des snapshots du workload, du plus récent au plus ancien : `ID`, `CREATED_MS`,
+`EXCHANGES`, `PINNED` (métadonnées, `?` si inconnues — snapshot d'une version antérieure du
+contrôleur) et `REFERENCED` (vrai pour le `status.snapshot`, ou `spec.snapshot` à défaut, de
+la `MimicWorkload` du workload).
+
+### `snapshot pin`
+
+```sh
+mimicctl snapshot pin <workload> <id> [--unpin] [-n ns]
+```
+
+Épingle (protège de la purge, quel que soit son âge) ou, avec `--unpin`, désépingle un
+snapshot. Identifiant invalide refusé avant tout appel. `404` si le snapshot n'existe pas.
+
+### `snapshot export`
+
+```sh
+mimicctl snapshot export <workload> <id> [-o fichier] [-n ns]
+```
+
+Contenu JSONL complet du snapshot (même route que `GET …/snapshots/{id}`, lue par les
+sidecars). Avec `-o`, écrit dans le fichier ; sans, sur la sortie standard.
+
+### `snapshot import`
+
+```sh
+mimicctl snapshot import <workload> <fichier> [-n ns]
+```
+
+Importe un snapshot exporté ailleurs (par exemple d'un autre cluster ou d'une sauvegarde) :
+contenu canonicalisé, **épinglé par défaut**, car il n'est référencé par aucun workload et
+serait sinon purgé à la prochaine passe de maintenance. Fichier illisible refusé avant tout
+appel ; contenu invalide refusé par le contrôleur (`400`).
+
+### `snapshot gc`
+
+```sh
+mimicctl snapshot gc <workload> [-n ns]
+```
+
+Purge immédiate, hors des référencés, des épinglés et des `snapshot.keep_last` plus récents,
+sans attendre la passe de maintenance (toutes les minutes). Affiche les identifiants
+supprimés, un par ligne, ou « rien à purger ».
+
 ## `diff`
 
 ```sh

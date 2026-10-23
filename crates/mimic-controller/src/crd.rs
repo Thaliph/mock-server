@@ -124,6 +124,10 @@ fn mode_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 pub struct MimicWorkloadStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    /// Échanges du snapshot servi (CTL-45, cycle de vie des snapshots) ; absent sans
+    /// snapshot ou si son nombre d'échanges n'a pas pu être lu.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_exchanges: Option<u64>,
     pub pods: u32,
     pub aligned: u32,
     /// Requêtes sans réponse du mock (599, 413) relevées par les pods sélectionnés.

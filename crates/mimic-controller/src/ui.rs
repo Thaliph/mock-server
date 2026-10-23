@@ -1,13 +1,16 @@
-//! Interface en lecture seule (spec §5.5 et §9.2b), joignable par `kubectl port-forward`.
+//! Interface du contrôleur (spec §5.5 et §9.2b), joignable par `kubectl port-forward` : en
+//! lecture, et en écriture pour le cycle de vie des snapshots (`pin`, import, purge à la
+//! demande, CTL-46), protégée comme le reste par le seul RBAC `pods/portforward`.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use mimic_core::catalog::{STYLE, esc, operations, render_operations};
 use mimic_core::model::Direction;
 use mimic_core::unmatched::UnmatchedReport;
@@ -15,6 +18,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::state::{Ctl, now_ms, valid_name};
+
+/// Un snapshot importé ne dépasse pas cette taille (comme `MAX_SEGMENT`, spec §9.2b).
+const MAX_IMPORT: usize = 64 * 1024 * 1024;
 
 pub fn router(ctl: Arc<Ctl>) -> Router {
     Router::new()
@@ -24,8 +30,18 @@ pub fn router(ctl: Arc<Ctl>) -> Router {
         .route("/ui/{ns}/{wl}", get(page))
         .route("/v1/workloads", get(workloads))
         .route("/v1/workloads/{ns}/{wl}/mode", get(mode))
-        .route("/v1/workloads/{ns}/{wl}/snapshots", get(snapshots))
+        .route(
+            "/v1/workloads/{ns}/{wl}/snapshots",
+            get(snapshots)
+                .post(import_snapshot)
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_IMPORT)),
+        )
         .route("/v1/workloads/{ns}/{wl}/snapshots/{id}", get(snapshot))
+        .route(
+            "/v1/workloads/{ns}/{wl}/snapshots/{id}/pin",
+            post(pin_snapshot),
+        )
+        .route("/v1/workloads/{ns}/{wl}/snapshots/gc", post(gc_snapshots))
         .route("/v1/workloads/{ns}/{wl}/operations", get(ops))
         .route(
             "/v1/workloads/{ns}/{wl}/openapi/inbound",
@@ -140,6 +156,49 @@ async fn snapshot(
         return bad_name();
     }
     crate::api::snapshot_response(&ctl, &ns, &wl, &id).await
+}
+
+#[derive(Deserialize)]
+struct Pin {
+    pinned: bool,
+}
+
+/// `mimicctl snapshot pin`/`--unpin` (CTL-46) : protège ou non le snapshot de la purge.
+async fn pin_snapshot(
+    State(ctl): State<Arc<Ctl>>,
+    Path((ns, wl, id)): Path<(String, String, String)>,
+    axum::Json(body): axum::Json<Pin>,
+) -> Response {
+    if !valid_name(&ns) || !valid_name(&wl) || !valid_name(&id) {
+        return bad_name();
+    }
+    match ctl.pin_snapshot(&ns, &wl, &id, body.pinned).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e == "snapshot inconnu" => (StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// `mimicctl snapshot import` (CTL-46) : contenu JSONL canonicalisé, épinglé par défaut.
+async fn import_snapshot(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl, body: Bytes) -> Response {
+    if !valid_name(&ns) || !valid_name(&wl) {
+        return bad_name();
+    }
+    match ctl.import_snapshot(&ns, &wl, &body).await {
+        Ok(snap) => {
+            axum::Json(json!({"id": snap.id, "exchanges": snap.exchanges.len()})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// `mimicctl snapshot gc` (CTL-46) : purge immédiate, hors de la passe de maintenance.
+async fn gc_snapshots(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {
+    if !valid_name(&ns) || !valid_name(&wl) {
+        return bad_name();
+    }
+    let deleted: Vec<String> = ctl.gc_snapshots(&ns, &wl).await.into_iter().collect();
+    axum::Json(json!({ "deleted": deleted })).into_response()
 }
 
 async fn ops(State(ctl): State<Arc<Ctl>>, Path((ns, wl)): Wl) -> Response {

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use k8s_openapi::api::core::v1::{Namespace, Pod};
@@ -96,6 +96,8 @@ enum Command {
     /// concurrence fixe ou croissante jusqu'à saturation, et recommande CPU et mémoire
     /// (spec §5.9).
     Load(Box<LoadArgs>),
+    /// Cycle de vie des snapshots : liste, épingle, exporte, importe ou purge (spec §5.6).
+    Snapshot(SnapshotArgs),
     /// Différence entre deux documents OpenAPI (YAML ou JSON).
     Diff {
         old: PathBuf,
@@ -105,6 +107,58 @@ enum Command {
         /// Code de sortie 1 s'il y a un changement cassant.
         #[arg(long)]
         fail_on_breaking: bool,
+    },
+}
+
+/// Options de `mimicctl snapshot`.
+#[derive(clap::Args)]
+struct SnapshotArgs {
+    #[command(subcommand)]
+    command: SnapshotCommand,
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommand {
+    /// Liste les snapshots du workload, du plus récent au plus ancien.
+    Ls {
+        workload: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Épingle (ou désépingle) un snapshot, le protégeant de la purge.
+    Pin {
+        workload: String,
+        id: String,
+        /// Désépingle au lieu d'épingler.
+        #[arg(long)]
+        unpin: bool,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Exporte le contenu JSONL complet d'un snapshot.
+    Export {
+        workload: String,
+        id: String,
+        /// Fichier de sortie ; absent, la sortie standard.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Importe un snapshot exporté ailleurs (`mimicctl snapshot export`) ; épinglé par
+    /// défaut, pour ne pas être purgé aussitôt faute d'être référencé.
+    Import {
+        workload: String,
+        file: PathBuf,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Purge immédiate, hors des référencés, des épinglés et des `snapshot.keep_last` plus
+    /// récents, sans attendre la passe de maintenance.
+    Gc {
+        workload: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
     },
 }
 
@@ -523,6 +577,118 @@ async fn run(command: Command) -> Result<i32, String> {
             }
             Ok(0)
         }
+        Command::Snapshot(args) => match args.command {
+            SnapshotCommand::Ls {
+                workload,
+                namespace: ns,
+            } => {
+                let client = client().await?;
+                let ns = namespace(ns, &client).await;
+                let snaps =
+                    controller_json(client.clone(), &mimicctl::snapshots_path(&ns, &workload))
+                        .await?;
+                let api: Api<MimicWorkload> = Api::namespaced(client, &ns);
+                let current = api
+                    .get_opt(&workload)
+                    .await
+                    .map_err(|e| format!("MimicWorkload {ns}/{workload}: {e}"))?
+                    .and_then(|mw| {
+                        mw.status
+                            .and_then(|s| s.snapshot)
+                            .or_else(|| mw.spec.snapshot.clone())
+                    });
+                print!(
+                    "{}",
+                    mimicctl::snapshot_table(
+                        snaps.as_array().map_or(&[][..], |v| v),
+                        current.as_deref()
+                    )
+                );
+                Ok(0)
+            }
+            SnapshotCommand::Pin {
+                workload,
+                id,
+                unpin,
+                namespace: ns,
+            } => {
+                // Validation avant tout appel au cluster (CLI-13).
+                mimicctl::snapshot_pin_path("default", &workload, &id)?;
+                let client = client().await?;
+                let ns = namespace(ns, &client).await;
+                let path = mimicctl::snapshot_pin_path(&ns, &workload, &id)?;
+                let body = serde_json::to_vec(&mimicctl::snapshot_pin_body(!unpin))
+                    .map_err(|e| e.to_string())?;
+                controller_post(client, &path, Bytes::from(body), Some("application/json")).await?;
+                println!(
+                    "{ns}/{workload} : snapshot {id} {}",
+                    if unpin { "désépinglé" } else { "épinglé" }
+                );
+                Ok(0)
+            }
+            SnapshotCommand::Export {
+                workload,
+                id,
+                output,
+                namespace: ns,
+            } => {
+                // Validation avant tout appel au cluster (CLI-14).
+                mimicctl::snapshot_export_path("default", &workload, &id)?;
+                let client = client().await?;
+                let ns = namespace(ns, &client).await;
+                let path = mimicctl::snapshot_export_path(&ns, &workload, &id)?;
+                let body = controller_get(client, &path).await?;
+                write_raw(&body, output.as_deref())?;
+                Ok(0)
+            }
+            SnapshotCommand::Import {
+                workload,
+                file,
+                namespace: ns,
+            } => {
+                // Fichier lu avant tout appel au cluster (CLI-15).
+                let body = std::fs::read(&file)
+                    .map_err(|e| format!("lecture de {}: {e}", file.display()))?;
+                let client = client().await?;
+                let ns = namespace(ns, &client).await;
+                let path = mimicctl::snapshots_path(&ns, &workload);
+                let resp = controller_post(
+                    client,
+                    &path,
+                    Bytes::from(body),
+                    Some("application/x-ndjson"),
+                )
+                .await?;
+                let imported: serde_json::Value =
+                    serde_json::from_slice(&resp).map_err(|e| e.to_string())?;
+                println!(
+                    "{ns}/{workload} : snapshot {} importé ({} échanges)",
+                    imported["id"].as_str().unwrap_or("?"),
+                    imported["exchanges"]
+                );
+                Ok(0)
+            }
+            SnapshotCommand::Gc {
+                workload,
+                namespace: ns,
+            } => {
+                let client = client().await?;
+                let ns = namespace(ns, &client).await;
+                let path = mimicctl::snapshot_gc_path(&ns, &workload);
+                let resp = controller_post(client, &path, Bytes::new(), None).await?;
+                let report: serde_json::Value =
+                    serde_json::from_slice(&resp).map_err(|e| e.to_string())?;
+                let deleted = mimicctl::snapshot_gc_deleted(&report);
+                if deleted.is_empty() {
+                    println!("rien à purger");
+                } else {
+                    for id in deleted {
+                        println!("{id}");
+                    }
+                }
+                Ok(0)
+            }
+        },
         Command::Diff {
             old,
             new,
@@ -592,6 +758,21 @@ fn write_doc(doc: &serde_json::Value, output: Option<&Path>) -> Result<(), Strin
     }
 }
 
+/// Écrit un contenu brut (`mimicctl snapshot export`, JSONL) : fichier, ou sortie standard.
+fn write_raw(bytes: &[u8], output: Option<&Path>) -> Result<(), String> {
+    match output {
+        Some(p) => {
+            std::fs::write(p, bytes).map_err(|e| format!("écriture de {}: {e}", p.display()))
+        }
+        None => {
+            use std::io::Write;
+            std::io::stdout()
+                .write_all(bytes)
+                .map_err(|e| format!("écriture sur la sortie standard: {e}"))
+        }
+    }
+}
+
 /// Échanges d'un fichier JSONL (`mimicctl requests --format jsonl`).
 fn read_exchanges(path: &Path) -> Result<Vec<mimic_core::model::Exchange>, String> {
     let text =
@@ -654,6 +835,26 @@ async fn controller_json(client: kube::Client, path: &str) -> Result<serde_json:
 /// `GET` sur l'interface du contrôleur, liée à 127.0.0.1 dans son pod : on y passe par
 /// un port-forward, comme `kubectl port-forward` (même RBAC).
 async fn controller_get(client: kube::Client, path: &str) -> Result<Bytes, String> {
+    controller_request(client, hyper::Method::GET, path, Bytes::new(), None).await
+}
+
+/// Comme `controller_get`, en écriture (`pin`, import, `gc` des snapshots, CTL-46).
+async fn controller_post(
+    client: kube::Client,
+    path: &str,
+    body: Bytes,
+    content_type: Option<&str>,
+) -> Result<Bytes, String> {
+    controller_request(client, hyper::Method::POST, path, body, content_type).await
+}
+
+async fn controller_request(
+    client: kube::Client,
+    method: hyper::Method,
+    path: &str,
+    body: Bytes,
+    content_type: Option<&str>,
+) -> Result<Bytes, String> {
     let pods: Api<Pod> = Api::namespaced(client, CONTROLLER_NAMESPACE);
     let list = pods
         .list(&ListParams::default().labels(CONTROLLER_SELECTOR))
@@ -670,10 +871,14 @@ async fn controller_get(client: kube::Client, path: &str) -> Result<Bytes, Strin
         .await
         .map_err(|e| format!("connexion au contrôleur: {e}"))?;
     let conn = tokio::spawn(conn);
-    let req = hyper::Request::get(path)
-        .header("host", "127.0.0.1")
-        .body(Empty::<Bytes>::new())
-        .map_err(|e| e.to_string())?;
+    let mut builder = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "127.0.0.1");
+    if let Some(ct) = content_type {
+        builder = builder.header("content-type", ct);
+    }
+    let req = builder.body(Full::new(body)).map_err(|e| e.to_string())?;
     let resp = sender
         .send_request(req)
         .await

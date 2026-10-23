@@ -288,14 +288,28 @@ pub fn summarize(states: &[PodState], error: Option<&str>) -> Summary {
     }
 }
 
-/// Statut publié sur la ressource : snapshot servi, pods alignés et conditions `Aligned` et
-/// `Allowed` (spec §5.5.1).
+/// Statut publié sur la ressource : snapshot servi, pods alignés et conditions `Aligned`,
+/// `Allowed` et `SnapshotEmpty` (spec §5.5.1, cycle de vie des snapshots). `snapshot_exchanges`
+/// est résolu par l'appelant, hors du verrou court (CTL-45).
 pub fn status_of(
     desired: &Desired,
     summary: &Summary,
     generation: Option<i64>,
+    snapshot_exchanges: Option<u64>,
 ) -> MimicWorkloadStatus {
     let refused = summary.reason.as_deref() == Some(PRODUCTION_REASON);
+    // Mock sans aucun échange sortant rejouable : le pod ne sert rien, c'est un signal fort
+    // d'un snapshot construit sans trafic sortant encore enregistré (CTL-45).
+    let empty = desired.snapshot.is_some()
+        && snapshot_exchanges == Some(0)
+        && matches!(desired.mode.as_deref(), Some("mock") | Some("mock-partial"));
+    let snapshot_empty = StatusCondition {
+        type_: "SnapshotEmpty".into(),
+        status: if empty { "True" } else { "False" }.into(),
+        reason: empty.then(|| "Empty".to_string()),
+        message: empty
+            .then(|| "le snapshot servi ne contient aucun échange sortant rejouable".to_string()),
+    };
     let allowed = if refused {
         StatusCondition {
             type_: "Allowed".into(),
@@ -316,6 +330,7 @@ pub fn status_of(
     };
     MimicWorkloadStatus {
         snapshot: desired.snapshot.clone(),
+        snapshot_exchanges,
         pods: summary.pods,
         aligned: summary.aligned,
         unmatched: summary.unmatched,
@@ -328,6 +343,7 @@ pub fn status_of(
                 message: None,
             },
             allowed,
+            snapshot_empty,
         ],
     }
 }

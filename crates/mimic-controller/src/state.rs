@@ -26,7 +26,9 @@ use mimic_core::compact::{BodySamples, Compactor, hour_of, hour_start};
 use mimic_core::exemplar::{Exemplars, best_per_endpoint, is_exemplar, jsonl};
 use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::model::{Direction, Exchange};
-use mimic_core::snapshot::{Snapshot, SnapshotOptions, build};
+use mimic_core::snapshot::{
+    SNAPSHOT_META_FORMAT, Snapshot, SnapshotEntry, SnapshotMeta, SnapshotOptions, build, to_purge,
+};
 use mimic_core::unmatched::{MAX_MERGED, UnmatchedReport};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
@@ -93,6 +95,10 @@ pub struct Discovery {
 pub struct Live {
     pub pods: BTreeMap<String, Pod>,
     pub desired: Desired,
+    /// Échanges du snapshot servi (`desired.snapshot`), résolu hors du verrou court lors de
+    /// la réconciliation ; `None` sans snapshot ou s'il n'a pas pu être lu (CTL-45,
+    /// `status.snapshotExchanges`).
+    pub snapshot_exchanges: Option<u64>,
     /// Ressource `MimicWorkload` courante, si elle existe.
     pub spec: Option<MimicWorkloadSpec>,
     pub generation: Option<i64>,
@@ -1188,22 +1194,29 @@ impl Ctl {
             .await
     }
 
+    /// Snapshots du workload : identifiant, taille, date, échanges et `pinned` quand
+    /// connus (métadonnées, CTL-43), du plus récent au plus ancien (`mimicctl snapshot ls`,
+    /// CLI-12).
     pub async fn snapshots(&self, ns: &str, wl: &str) -> Vec<Value> {
         let prefix = Path::from(format!("{}/snapshots", base(ns, wl)));
         let mut out = vec![];
         let mut listing = self.store.list(Some(&prefix));
-        while let Some(Ok(meta)) = listing.next().await {
-            let Some(id) = meta
+        while let Some(Ok(entry)) = listing.next().await {
+            let Some(id) = entry
                 .location
                 .filename()
                 .and_then(|f| f.strip_suffix(".jsonl"))
             else {
                 continue;
             };
+            let meta = self.snapshot_meta(ns, wl, id).await;
             out.push(serde_json::json!({
                 "id": id,
-                "size": meta.size,
-                "modified_ms": meta.last_modified.timestamp_millis(),
+                "size": entry.size,
+                "modified_ms": entry.last_modified.timestamp_millis(),
+                "created_ms": meta.map(|m| m.created_ms),
+                "exchanges": meta.map(|m| m.exchanges),
+                "pinned": meta.map(|m| m.pinned).unwrap_or(false),
             }));
         }
         out.sort_by_key(|v| std::cmp::Reverse(v["modified_ms"].as_i64()));
@@ -1230,15 +1243,194 @@ impl Ctl {
         let snap = tokio::task::spawn_blocking(move || build(view.iter().map(|t| t.1), &opts))
             .await
             .map_err(|err| format!("construction du snapshot: {err}"))?;
-        let path = Self::snapshot_path(&e.namespace, &e.name, &snap.id);
+        self.write_snapshot(&e.namespace, &e.name, &snap, false)
+            .await?;
+        Ok(snap)
+    }
+
+    fn snapshot_meta_path(ns: &str, wl: &str, id: &str) -> Path {
+        Path::from(format!("{}/snapshots/{id}.meta.json", base(ns, wl)))
+    }
+
+    /// Métadonnées du snapshot (CTL-43, cycle de vie) ; `None` s'il n'y en a pas (snapshot
+    /// gardé par une version antérieure, ou disparu).
+    pub async fn snapshot_meta(&self, ns: &str, wl: &str, id: &str) -> Option<SnapshotMeta> {
+        if !valid_name(id) {
+            return None;
+        }
+        let bytes = self
+            .store
+            .get(&Self::snapshot_meta_path(ns, wl, id))
+            .await
+            .ok()?
+            .bytes()
+            .await
+            .ok()?;
+        SnapshotMeta::from_json(&bytes).ok()
+    }
+
+    /// Écrit le contenu et les métadonnées d'un snapshot, si son contenu n'existe pas déjà
+    /// (immuable, content-addressed) : jamais de métadonnées réécrites sur un snapshot déjà
+    /// connu, pour ne jamais effacer un `pinned` posé par `mimicctl snapshot pin` (CTL-43).
+    async fn write_snapshot(
+        &self,
+        ns: &str,
+        wl: &str,
+        snap: &Snapshot,
+        pinned: bool,
+    ) -> Result<(), String> {
+        let path = Self::snapshot_path(ns, wl, &snap.id);
         if self.store.head(&path).await.is_err() {
             self.store
                 .put(&path, PutPayload::from(snap.to_jsonl()))
                 .await
                 .map_err(|err| format!("écriture du snapshot {}: {err}", snap.id))?;
+            let meta = SnapshotMeta {
+                format: SNAPSHOT_META_FORMAT,
+                created_ms: now_ms() as i64,
+                exchanges: snap.exchanges.len(),
+                pinned,
+            };
+            self.store
+                .put(
+                    &Self::snapshot_meta_path(ns, wl, &snap.id),
+                    PutPayload::from(meta.to_json()),
+                )
+                .await
+                .map_err(|err| format!("métadonnées du snapshot {}: {err}", snap.id))?;
             self.metrics.snapshots.inc();
         }
+        Ok(())
+    }
+
+    /// Importe un snapshot (`mimicctl snapshot import`, CTL-46) : contenu canonicalisé,
+    /// épinglé par défaut pour survivre à la purge d'un contrôleur sans trafic qui le
+    /// référence.
+    pub async fn import_snapshot(
+        &self,
+        ns: &str,
+        wl: &str,
+        bytes: &[u8],
+    ) -> Result<Snapshot, String> {
+        let snap = Snapshot::parse(bytes)?;
+        self.write_snapshot(ns, wl, &snap, true).await?;
         Ok(snap)
+    }
+
+    /// Change le drapeau `pinned` d'un snapshot déjà construit ou importé (CTL-46). Recrée
+    /// des métadonnées par défaut si le snapshot n'en avait pas encore (version antérieure).
+    pub async fn pin_snapshot(
+        &self,
+        ns: &str,
+        wl: &str,
+        id: &str,
+        pinned: bool,
+    ) -> Result<(), String> {
+        if self.snapshot_bytes(ns, wl, id).await.is_none() {
+            return Err("snapshot inconnu".into());
+        }
+        let existing = self.snapshot_meta(ns, wl, id).await;
+        let meta = SnapshotMeta {
+            format: SNAPSHOT_META_FORMAT,
+            created_ms: match existing {
+                Some(m) => m.created_ms,
+                None => now_ms() as i64,
+            },
+            exchanges: match existing {
+                Some(m) => m.exchanges,
+                None => self.exchanges_count(ns, wl, id).await,
+            },
+            pinned,
+        };
+        self.store
+            .put(
+                &Self::snapshot_meta_path(ns, wl, id),
+                PutPayload::from(meta.to_json()),
+            )
+            .await
+            .map_err(|err| format!("métadonnées du snapshot {id}: {err}"))?;
+        Ok(())
+    }
+
+    /// Échanges d'un snapshot sans métadonnées (version antérieure), en relisant son
+    /// contenu : secours rare, seulement au premier accès d'épinglage ou de purge.
+    async fn exchanges_count(&self, ns: &str, wl: &str, id: &str) -> usize {
+        self.snapshot_bytes(ns, wl, id)
+            .await
+            .map(|b| b.split(|c| *c == b'\n').filter(|l| !l.is_empty()).count())
+            .unwrap_or(0)
+    }
+
+    /// Référencés : jamais purgés, quel que soit leur âge (CTL-44).
+    fn referenced_snapshots(live: &Live) -> BTreeSet<String> {
+        [
+            live.spec.as_ref().and_then(|s| s.snapshot.clone()),
+            live.desired.snapshot.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// Purge les snapshots du workload au-delà de `snapshot.keep_last`, hors référencés et
+    /// épinglés (CTL-44) ; contenu, métadonnées et forme de mock en cache supprimés
+    /// ensemble. Retourne les identifiants supprimés.
+    async fn purge_snapshots(&self, e: &Entry) -> BTreeSet<String> {
+        let referenced = Self::referenced_snapshots(&e.live());
+        let listing = self.snapshots(&e.namespace, &e.name).await;
+        let mut candidates = Vec::with_capacity(listing.len());
+        for v in &listing {
+            let Some(id) = v["id"].as_str() else { continue };
+            let (created_ms, pinned) = match self.snapshot_meta(&e.namespace, &e.name, id).await {
+                Some(m) => (m.created_ms, m.pinned),
+                // Snapshot d'avant cette fonctionnalité : métadonnées comblées une fois,
+                // non épinglé, datées de la dernière écriture connue du support.
+                None => {
+                    let created_ms = v["modified_ms"].as_i64().unwrap_or(0);
+                    let exchanges = self.exchanges_count(&e.namespace, &e.name, id).await;
+                    let meta = SnapshotMeta {
+                        format: SNAPSHOT_META_FORMAT,
+                        created_ms,
+                        exchanges,
+                        pinned: false,
+                    };
+                    let _ = self
+                        .store
+                        .put(
+                            &Self::snapshot_meta_path(&e.namespace, &e.name, id),
+                            PutPayload::from(meta.to_json()),
+                        )
+                        .await;
+                    (created_ms, false)
+                }
+            };
+            candidates.push(SnapshotEntry {
+                id: id.to_string(),
+                created_ms,
+                pinned,
+            });
+        }
+        let purge = to_purge(&candidates, &referenced, self.config.snapshot.keep_last);
+        for id in &purge {
+            let _ = self
+                .store
+                .delete(&Self::snapshot_path(&e.namespace, &e.name, id))
+                .await;
+            let _ = self
+                .store
+                .delete(&Self::snapshot_meta_path(&e.namespace, &e.name, id))
+                .await;
+            self.mock_forms
+                .evict(&format!("{}/{id}", base(&e.namespace, &e.name)));
+            self.metrics.snapshots_deleted.inc();
+            tracing::info!(namespace = %e.namespace, workload = %e.name, snapshot = %id, "snapshot purgé");
+        }
+        purge
+    }
+
+    /// Purge immédiate (`mimicctl snapshot gc`), hors de la passe de maintenance minute.
+    pub async fn gc_snapshots(&self, ns: &str, wl: &str) -> BTreeSet<String> {
+        self.purge_snapshots(&self.entry(ns, wl)).await
     }
 
     /// Applique la ressource `MimicWorkload` (ou son absence) au workload.
@@ -1291,12 +1483,15 @@ impl Ctl {
             &|id| known.contains(id),
             production,
         );
+        // Échanges du snapshot construit ici, s'il y en a un : connus sans relecture.
+        let mut built_exchanges = None;
         if outcome.action == Action::BuildSnapshot
             && let Some(spec) = &spec
         {
             match self.build_snapshot(&e).await {
                 Ok(snap) => {
                     tracing::info!(namespace = ns, workload = wl, snapshot = %snap.id, exchanges = snap.exchanges.len(), "snapshot construit");
+                    built_exchanges = Some(snap.exchanges.len() as u64);
                     outcome.desired = desired_of(spec, Some(snap.id));
                 }
                 Err(err) => {
@@ -1305,6 +1500,19 @@ impl Ctl {
                 }
             }
         }
+        // Résolu avant le verrou court (CTL-45) : une relecture des métadonnées, voire du
+        // contenu, est une I/O qui ne doit jamais s'y trouver.
+        let snapshot_exchanges = match &outcome.desired.snapshot {
+            Some(_) if built_exchanges.is_some() => built_exchanges,
+            Some(id) => match self.snapshot_meta(ns, wl, id).await {
+                Some(meta) => Some(meta.exchanges as u64),
+                None => self
+                    .snapshot_bytes(ns, wl, id)
+                    .await
+                    .map(|b| b.split(|c| *c == b'\n').filter(|l| !l.is_empty()).count() as u64),
+            },
+            None => None,
+        };
         let changed = {
             let mut live = e.live();
             live.error = outcome.error;
@@ -1312,6 +1520,7 @@ impl Ctl {
             if changed {
                 live.desired = outcome.desired.clone();
             }
+            live.snapshot_exchanges = snapshot_exchanges;
             changed
         };
         if changed {
@@ -1477,9 +1686,10 @@ impl Ctl {
     }
 
     /// Passe de maintenance (toutes les minutes) : pods oubliés, puis pour chaque workload
-    /// exemples écrits s'ils ont changé, rétention, compaction des heures révolues et plafond
-    /// de volume du support. Aucun segment n'est supprimé avant que ses échanges aient été
-    /// proposés aux exemples et que ceux-ci soient écrits (spec §5.5.3).
+    /// exemples écrits s'ils ont changé, rétention, compaction des heures révolues, plafond
+    /// de volume du support et purge des snapshots au-delà de `snapshot.keep_last` (CTL-44).
+    /// Aucun segment n'est supprimé avant que ses échanges aient été proposés aux exemples et
+    /// que ceux-ci soient écrits (spec §5.5.3).
     pub async fn maintain(&self) {
         let now = now_ms();
         self.workload_keys().await;
@@ -1513,6 +1723,7 @@ impl Ctl {
                 }
             }
             self.compact(&e, now as i64).await;
+            self.purge_snapshots(&e).await;
             loop {
                 let oldest = {
                     let index = e.index();

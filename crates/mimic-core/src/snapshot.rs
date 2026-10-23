@@ -106,8 +106,10 @@ impl Snapshot {
         jsonl(&self.exchanges)
     }
 
-    /// Relit un snapshot et vérifie que son contenu correspond à l'identifiant attendu.
-    pub fn from_jsonl(bytes: &[u8], expected_id: &str) -> Result<Self, String> {
+    /// Relit un contenu JSONL sans identifiant attendu (import, SNP-11) : canonicalise
+    /// l'ordre et recalcule l'identifiant à partir du contenu. Une ligne invalide est
+    /// refusée avec son numéro.
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let mut exchanges = vec![];
         for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
             if line.is_empty() {
@@ -117,7 +119,12 @@ impl Snapshot {
                 serde_json::from_slice(line).map_err(|e| format!("ligne {}: {e}", i + 1))?;
             exchanges.push(e);
         }
-        let s = Self::from_exchanges(exchanges);
+        Ok(Self::from_exchanges(exchanges))
+    }
+
+    /// Relit un snapshot et vérifie que son contenu correspond à l'identifiant attendu.
+    pub fn from_jsonl(bytes: &[u8], expected_id: &str) -> Result<Self, String> {
+        let s = Self::parse(bytes)?;
         if s.id != expected_id {
             return Err(format!(
                 "contenu du snapshot {expected_id} altéré (empreinte {})",
@@ -234,6 +241,83 @@ impl MockSnapshot {
 /// snapshot, `ETag` de sa forme de mock).
 pub fn digest(bytes: &[u8]) -> String {
     content_id(bytes)
+}
+
+/// Version du format des métadonnées d'un snapshot.
+pub const SNAPSHOT_META_FORMAT: u32 = 1;
+
+/// Métadonnées d'un snapshot (spec §5.6, cycle de vie) : écrites une seule fois à sa
+/// construction ou à son import, à côté du contenu immuable (`<id>.jsonl`). `pinned` est la
+/// seule à changer ensuite (`mimicctl snapshot pin`), ce qui le protège de la purge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotMeta {
+    /// Version du format ([`SNAPSHOT_META_FORMAT`]).
+    pub format: u32,
+    /// Date de construction ou d'import, en millisecondes Unix.
+    pub created_ms: i64,
+    /// Nombre d'échanges du snapshot.
+    pub exchanges: usize,
+    /// Protégé de la purge (CTL-44), quel que soit son âge ou sa référence.
+    pub pinned: bool,
+}
+
+impl SnapshotMeta {
+    pub fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    /// Refuse un format inconnu ou un champ qui ne correspond pas aux métadonnées
+    /// attendues, plutôt que de l'accepter silencieusement.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        let m: Self =
+            serde_json::from_slice(bytes).map_err(|e| format!("métadonnées illisibles: {e}"))?;
+        if m.format != SNAPSHOT_META_FORMAT {
+            return Err(format!(
+                "format de métadonnées inconnu: {} (attendu {SNAPSHOT_META_FORMAT})",
+                m.format
+            ));
+        }
+        Ok(m)
+    }
+}
+
+/// Un snapshot candidat à la purge, avec ce qu'il faut pour en décider (spec §5.6, cycle de
+/// vie) : son identifiant, sa date (construction, import, ou dernier accès pour un cache de
+/// sidecar) et s'il est épinglé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    pub id: String,
+    pub created_ms: i64,
+    pub pinned: bool,
+}
+
+/// Identifiants à purger (CTL-44, SNP-12) : jamais un `referenced` ni un `pinned`, jamais
+/// l'un des `keep_last` plus récents (par `created_ms` puis `id`, pour départager une égalité
+/// de date). Déterministe (INF-08) : indépendant de l'ordre de `candidates`.
+pub fn to_purge(
+    candidates: &[SnapshotEntry],
+    referenced: &BTreeSet<String>,
+    keep_last: usize,
+) -> BTreeSet<String> {
+    let mut sorted: Vec<&SnapshotEntry> = candidates.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.created_ms
+            .cmp(&a.created_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let kept_recent: BTreeSet<&str> = sorted
+        .into_iter()
+        .take(keep_last)
+        .map(|e| e.id.as_str())
+        .collect();
+    candidates
+        .iter()
+        .filter(|e| {
+            !e.pinned && !referenced.contains(&e.id) && !kept_recent.contains(e.id.as_str())
+        })
+        .map(|e| e.id.clone())
+        .collect()
 }
 
 fn jsonl(exchanges: &[Exchange]) -> Vec<u8> {

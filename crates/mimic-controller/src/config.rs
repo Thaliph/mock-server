@@ -129,11 +129,18 @@ impl Default for ControllerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SnapshotConfig {
     pub max_per_key: usize,
+    /// Snapshots gardés par workload au-delà des référencés et des épinglés (CTL-44,
+    /// cycle de vie des snapshots) : les plus récents, par date de construction ou
+    /// d'import.
+    pub keep_last: usize,
 }
 
 impl Default for SnapshotConfig {
     fn default() -> Self {
-        Self { max_per_key: 50 }
+        Self {
+            max_per_key: 50,
+            keep_last: 5,
+        }
     }
 }
 

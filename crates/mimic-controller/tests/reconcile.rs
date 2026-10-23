@@ -224,7 +224,7 @@ fn crd_07_production_namespace_refuses_mock() {
 
     // Statut : conditions Aligned et Allowed explicites.
     let s = summarize(&[PodState::Aligned], Some(PRODUCTION_REASON));
-    let st = status_of(&desired("record", None), &s, Some(3));
+    let st = status_of(&desired("record", None), &s, Some(3), None);
     assert_eq!(st.observed_generation, Some(3));
     let cond = |t: &str| st.conditions.iter().find(|c| c.type_ == t).unwrap().clone();
     assert_eq!(cond("Aligned").status, "False");
@@ -244,10 +244,37 @@ fn crd_07_production_namespace_refuses_mock() {
         &desired("mock", Some(ID)),
         &summarize(&[PodState::Aligned], None),
         Some(4),
+        Some(3),
     );
     assert_eq!(ok.snapshot.as_deref(), Some(ID));
+    assert_eq!(ok.snapshot_exchanges, Some(3));
     let allowed = ok.conditions.iter().find(|c| c.type_ == "Allowed").unwrap();
     assert_eq!(allowed.status, "True");
+}
+
+/// `SnapshotEmpty` (CTL-45) : vraie seulement en mock avec un snapshot sans aucun échange ;
+/// fausse hors mock, sans snapshot, ou si le compte est inconnu (`None`, jamais pris pour 0).
+#[test]
+fn ctl_45_snapshot_empty_condition() {
+    let empty = |mode: &str, snapshot: Option<&str>, exchanges: Option<u64>| {
+        status_of(
+            &desired(mode, snapshot),
+            &summarize(&[PodState::Aligned], None),
+            None,
+            exchanges,
+        )
+        .conditions
+        .into_iter()
+        .find(|c| c.type_ == "SnapshotEmpty")
+        .unwrap()
+        .status
+    };
+    assert_eq!(empty("mock", Some(ID), Some(0)), "True");
+    assert_eq!(empty("mock-partial", Some(ID), Some(0)), "True");
+    assert_eq!(empty("mock", Some(ID), Some(1)), "False");
+    assert_eq!(empty("mock", Some(ID), None), "False");
+    assert_eq!(empty("record", Some(ID), Some(0)), "False");
+    assert_eq!(empty("mock", None, Some(0)), "False");
 }
 
 #[test]

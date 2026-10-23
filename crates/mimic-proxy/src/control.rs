@@ -14,7 +14,7 @@ use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use mimic_core::snapshot::{MockSnapshot, Snapshot, digest};
+use mimic_core::snapshot::{MockSnapshot, Snapshot, SnapshotEntry, digest, to_purge};
 use mimic_core::startup::Phase;
 use mimic_core::unmatched::{MAX_REPORTED, UnmatchedReport};
 use serde::{Deserialize, Serialize};
@@ -394,6 +394,52 @@ fn save(state: &AppState, desired: &Desired, snap: Option<&MockSnapshot>) {
     };
     if let Err(e) = write() {
         tracing::warn!(error = %e, "état souhaité non gardé sur disque");
+        return;
+    }
+    // L'actif est celui de l'état souhaité, pas seulement celui qui vient d'être
+    // téléchargé : un `save` déclenché par un autre changement garde le même protégé.
+    purge_cache(
+        &dir.join("snapshots"),
+        desired.snapshot.as_deref(),
+        state.config.store.max_cached_snapshots,
+    );
+}
+
+/// Identifiant et date de dernière écriture (millisecondes Unix) de chaque forme de mock
+/// gardée sur disque.
+fn cache_entries(dir: &std::path::Path) -> Vec<SnapshotEntry> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    read.flatten()
+        .filter_map(|entry| {
+            let id = entry
+                .file_name()
+                .to_str()?
+                .strip_suffix(".mock.json")?
+                .to_string();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            let created_ms = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            Some(SnapshotEntry {
+                id,
+                created_ms,
+                pinned: false,
+            })
+        })
+        .collect()
+}
+
+/// Purge le cache des formes de mock au-delà de `store.max_cached_snapshots` (SNP-12) : le
+/// snapshot actif, s'il y en a un, n'est jamais supprimé, même le plus ancien.
+fn purge_cache(dir: &std::path::Path, active: Option<&str>, max: usize) {
+    let candidates = cache_entries(dir);
+    let referenced: std::collections::BTreeSet<String> =
+        active.map(String::from).into_iter().collect();
+    for id in to_purge(&candidates, &referenced, max) {
+        let _ = std::fs::remove_file(dir.join(format!("{id}.mock.json")));
     }
 }
 
@@ -642,4 +688,65 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Beat {
             .desired = desired;
     }
     fetch_error.map_or(Beat::Aligned, Beat::Incomplete)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    fn touch(dir: &std::path::Path, id: &str, age: Duration) {
+        let path = dir.join(format!("{id}.mock.json"));
+        fs::write(&path, b"{}").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    /// SNP-12 : au-delà de `max`, les plus anciennes formes de mock sont supprimées,
+    /// jamais celle du snapshot actif, même la plus ancienne.
+    #[test]
+    fn snp_12_purge_keeps_the_active_and_the_most_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "oldest", Duration::from_secs(40));
+        touch(dir.path(), "middle", Duration::from_secs(30));
+        touch(dir.path(), "recent", Duration::from_secs(10));
+        touch(dir.path(), "newest", Duration::from_secs(0));
+
+        purge_cache(dir.path(), Some("oldest"), 2);
+
+        let remaining: std::collections::BTreeSet<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()?
+                    .strip_suffix(".mock.json")
+                    .map(String::from)
+            })
+            .collect();
+        assert_eq!(
+            remaining,
+            ["oldest", "recent", "newest"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            "{remaining:?}"
+        );
+    }
+
+    /// Sans snapshot actif (pod hors mock), seules les `max` plus récentes survivent.
+    #[test]
+    fn snp_12_purge_without_an_active_snapshot_keeps_only_the_most_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a", Duration::from_secs(20));
+        touch(dir.path(), "b", Duration::from_secs(10));
+        touch(dir.path(), "c", Duration::from_secs(0));
+
+        purge_cache(dir.path(), None, 1);
+
+        let remaining: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(remaining.len(), 1, "{remaining:?}");
+        assert!(dir.path().join("c.mock.json").exists());
+    }
 }
