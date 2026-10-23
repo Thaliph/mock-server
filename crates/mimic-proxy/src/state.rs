@@ -12,8 +12,8 @@ use hyper_util::rt::TokioExecutor;
 use mimic_core::infer::{InferOptions, infer, infer_outbound};
 use mimic_core::redact::{RedactConfig, Redactor};
 use mimic_core::snapshot::MockSnapshot;
-use mimic_core::unmatched::{Reason, Unmatched, UnmatchedLog, UnmatchedReport};
 use mimic_core::startup::{Gate, Phase};
+use mimic_core::unmatched::{Reason, Unmatched, UnmatchedLog, UnmatchedReport};
 use serde_json::Value;
 
 use crate::config::{Config, InboundCapture, MockWebsocket, Mode};
