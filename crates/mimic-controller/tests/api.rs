@@ -1,9 +1,9 @@
 //! Critères CTL-*, SEC-02, SEC-03, SEC-06 et RPL-* de la spec (§5.5 à §5.7, §7.1),
 //! au niveau de l'API du contrôleur.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use mimic_controller::config::{AuthConfig, ControllerConfig, Identity};
+use mimic_controller::config::{AuthConfig, ControllerConfig, Identity, SnapshotConfig};
 use mimic_controller::reconcile::MimicWorkloadSpec;
 use mimic_controller::{Running, start};
 use serde_json::{Value, json};
@@ -19,8 +19,8 @@ fn identity(ns: &str, pod: &str, workload: &str) -> Identity {
     }
 }
 
-async fn controller(dir: &std::path::Path) -> Running {
-    let tokens = BTreeMap::from([
+fn tokens() -> BTreeMap<String, Identity> {
+    BTreeMap::from([
         (
             "tok-a".to_string(),
             identity("shop", "checkout-a", "checkout"),
@@ -34,12 +34,32 @@ async fn controller(dir: &std::path::Path) -> Running {
             "tok-other-ns".to_string(),
             identity("bank", "checkout-a", "checkout"),
         ),
-    ]);
+    ])
+}
+
+async fn controller(dir: &std::path::Path) -> Running {
     start(ControllerConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         ui_listen: "127.0.0.1:0".parse().unwrap(),
         store: format!("file://{}", dir.display()),
-        auth: AuthConfig::Static { tokens },
+        auth: AuthConfig::Static { tokens: tokens() },
+        ..ControllerConfig::default()
+    })
+    .await
+    .unwrap()
+}
+
+/// Comme `controller`, avec `snapshot.keep_last` réglé (CTL-44).
+async fn controller_with_keep_last(dir: &std::path::Path, keep_last: usize) -> Running {
+    start(ControllerConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        ui_listen: "127.0.0.1:0".parse().unwrap(),
+        store: format!("file://{}", dir.display()),
+        auth: AuthConfig::Static { tokens: tokens() },
+        snapshot: SnapshotConfig {
+            keep_last,
+            ..SnapshotConfig::default()
+        },
         ..ControllerConfig::default()
     })
     .await
@@ -200,7 +220,8 @@ async fn without_resource_sidecars_are_free() {
         heartbeat(&c, "checkout-a", "record", None).await,
         json!({"mode": null, "snapshot": null})
     );
-    // L'interface ne permet aucune écriture.
+    // L'interface ne permet aucune écriture sur le mode (CTL-46 n'ouvre que pin, import
+    // et purge des snapshots, jamais le mode, qui reste piloté par la ressource).
     let r = client()
         .put(ui(&c, &format!("{WL}/mode")))
         .json(&json!({"mode": "mock"}))
@@ -825,8 +846,13 @@ async fn ctl_42_unmatched_requests_reach_the_workload_views_and_status() {
         let ctl = ctl.clone();
         async move {
             ctl.with_live("shop", "checkout", |w| {
-                mimic_controller::reconcile::status_of(&w.desired, &ctl.summary(w), w.generation)
-                    .unmatched
+                mimic_controller::reconcile::status_of(
+                    &w.desired,
+                    &ctl.summary(w),
+                    w.generation,
+                    w.snapshot_exchanges,
+                )
+                .unmatched
             })
             .await
             .unwrap()
@@ -856,4 +882,200 @@ async fn ctl_42_unmatched_requests_reach_the_workload_views_and_status() {
         .clone();
     assert_eq!(kept.len(), 20, "{wl}");
     assert_eq!(kept[0]["path"], "/p0");
+}
+
+// Cycle de vie des snapshots (spec §5.6, point 5) : métadonnées, purge et API d'écriture.
+
+/// Métadonnées écrites à la construction, jamais réécrites : `pinned` posé par
+/// `mimicctl snapshot pin` survit à une reconstruction du même contenu (même identifiant,
+/// CTL-43).
+#[tokio::test]
+async fn ctl_43_snapshot_metadata_is_written_once_and_pinned_survives_a_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    push(
+        &c,
+        "checkout-a",
+        &[exchange("o1", "outbound", "GET", "/users/7", json!([]), 1)],
+    )
+    .await;
+    let desired = set_mode(&c, "mock", None).await;
+    let id = desired["snapshot"].as_str().unwrap().to_string();
+
+    let find = |snaps: &Value, id: &str| {
+        snaps
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let snaps = get_json(&c, &format!("{WL}/snapshots")).await;
+    let meta = find(&snaps, &id);
+    assert_eq!(meta["pinned"], false, "{meta}");
+    assert_eq!(meta["exchanges"], 1, "{meta}");
+    assert!(meta["created_ms"].is_i64(), "{meta}");
+
+    let r = client()
+        .post(ui(&c, &format!("{WL}/snapshots/{id}/pin")))
+        .json(&json!({"pinned": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+
+    // Même contenu, pas de nouveau trafic : la reconstruction retombe sur le même
+    // identifiant sans toucher aux métadonnées.
+    set_mode(&c, "record", None).await;
+    let desired = set_mode(&c, "mock", None).await;
+    assert_eq!(desired["snapshot"], id.as_str());
+
+    let snaps = get_json(&c, &format!("{WL}/snapshots")).await;
+    let meta = find(&snaps, &id);
+    assert_eq!(meta["pinned"], true, "{meta}");
+}
+
+/// Purge (CTL-44, spec §5.6) : au-delà de `snapshot.keep_last`, seuls les référencés et les
+/// `keep_last` plus récents survivent.
+#[tokio::test]
+async fn ctl_44_purge_keeps_referenced_and_the_keep_last_most_recent() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller_with_keep_last(dir.path(), 1).await;
+    let mut ids = vec![];
+    for i in 1..=4u64 {
+        push(
+            &c,
+            "checkout-a",
+            &[exchange(
+                &format!("o{i}"),
+                "outbound",
+                "GET",
+                &format!("/p{i}"),
+                json!([]),
+                i,
+            )],
+        )
+        .await;
+        let desired = set_mode(&c, "mock", None).await;
+        ids.push(desired["snapshot"].as_str().unwrap().to_string());
+        set_mode(&c, "record", None).await;
+    }
+    // Le plus ancien reste référencé explicitement (`--snapshot`) malgré son âge.
+    set_mode(&c, "mock", Some(&ids[0])).await;
+    c.state().maintain().await;
+
+    let snaps = get_json(&c, &format!("{WL}/snapshots")).await;
+    let remaining: BTreeSet<String> = snaps
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        remaining,
+        BTreeSet::from([ids[0].clone(), ids[3].clone()]),
+        "{snaps}"
+    );
+}
+
+/// API d'écriture des snapshots (CTL-46) : `pin` d'un inconnu refusé, import d'un contenu
+/// invalide refusé, import valide épinglé par défaut, purge manuelle immédiate.
+#[tokio::test]
+async fn ctl_46_pin_import_and_manual_gc_over_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller_with_keep_last(dir.path(), 0).await;
+
+    let r = client()
+        .post(ui(&c, &format!("{WL}/snapshots/absent/pin")))
+        .json(&json!({"pinned": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+
+    let r = client()
+        .post(ui(&c, &format!("{WL}/snapshots")))
+        .body("ceci ne va pas\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    let body: String = [exchange(
+        "imp-1",
+        "outbound",
+        "GET",
+        "/imported",
+        json!([]),
+        1,
+    )]
+    .iter()
+    .map(|e| format!("{e}\n"))
+    .collect();
+    let r = client()
+        .post(ui(&c, &format!("{WL}/snapshots")))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    let imported: Value = client()
+        .post(ui(&c, &format!("{WL}/snapshots")))
+        .body(
+            [exchange(
+                "imp-1",
+                "outbound",
+                "GET",
+                "/imported",
+                json!([]),
+                1,
+            )]
+            .iter()
+            .map(|e| format!("{e}\n"))
+            .collect::<String>(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let imported_id = imported["id"].as_str().unwrap().to_string();
+    assert_eq!(imported["exchanges"], 1);
+
+    // Un snapshot construit par le trafic, non épinglé, non référencé : purgé.
+    push(
+        &c,
+        "checkout-a",
+        &[exchange("o1", "outbound", "GET", "/users/7", json!([]), 1)],
+    )
+    .await;
+    let desired = set_mode(&c, "mock", None).await;
+    let other = desired["snapshot"].as_str().unwrap().to_string();
+    set_mode(&c, "record", None).await;
+
+    let r = client()
+        .post(ui(&c, &format!("{WL}/snapshots/gc")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let report: Value = r.json().await.unwrap();
+    let deleted: Vec<String> = report["deleted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(deleted, vec![other]);
+
+    let snaps = get_json(&c, &format!("{WL}/snapshots")).await;
+    let remaining: BTreeSet<String> = snaps
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(remaining, BTreeSet::from([imported_id]), "{snaps}");
 }

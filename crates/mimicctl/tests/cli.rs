@@ -3,7 +3,9 @@
 use mimicctl::{
     ModeOptions, Target, WorkloadData, check_namespace, export_path, operations_path,
     outbound_authorities, report_markdown, requests_path, resolve_authority, sample_requests_path,
-    status_table, workload_apply, workload_apply_with,
+    snapshot_export_path, snapshot_gc_deleted, snapshot_gc_path, snapshot_pin_body,
+    snapshot_pin_path, snapshot_table, snapshots_path, status_table, workload_apply,
+    workload_apply_with,
 };
 use serde_json::{Value, json};
 
@@ -520,35 +522,61 @@ fn cli_11_status_and_report_show_unmatched_requests() {
     assert!(summary.ends_with("| 0 |"), "{summary}");
 }
 
-/// Sous-commandes et options longues déclarées dans `main.rs`, lues dans la source :
-/// clap les construit par `derive`, les champs et les `#[arg(long …)]` sont donc la
-/// référence.
-fn declared() -> (Vec<String>, Vec<String>) {
-    let src = include_str!("../src/main.rs");
-    let (commands, args) = src
-        .split_once("struct LoadArgs")
-        .map(|(before, after)| (before, [before, after].concat()))
-        .expect("LoadArgs");
+/// Corps d'une énumération ou structure `name {`, par comptage d'accolades (robuste à ce
+/// qu'il y ait, ou pas, autre chose entre deux définitions).
+fn brace_body<'a>(src: &'a str, marker: &str) -> &'a str {
+    let start = src
+        .find(marker)
+        .unwrap_or_else(|| panic!("{marker} absent"))
+        + marker.len();
+    let mut depth = 1i32;
+    for (i, c) in src[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[start..start + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("accolade fermante de {marker} absente")
+}
 
-    // Sous-commandes : variantes de l'énumération `Command`, en kebab-case.
-    let body = commands
-        .split_once("enum Command {")
-        .expect("enum Command")
-        .1;
-    let subcommands: Vec<String> = body
-        .lines()
+/// Variantes d'une énumération de sous-commandes clap, en kebab-case ; `prefix` compose un
+/// nom pour une sous-commande imbriquée (`snapshot ls`).
+fn variants(body: &str, prefix: &str) -> Vec<String> {
+    body.lines()
         .filter_map(|l| {
-            let name = l.strip_prefix("    ")?;
+            let name = l.trim();
             let name = name
                 .strip_suffix(" {")
                 .or_else(|| name.strip_suffix("(Box<LoadArgs>),"))?;
-            (!name.starts_with(['/', '#', ' '])).then(|| kebab(name))
+            (!name.starts_with(['/', '#'])).then(|| format!("{prefix}{}", kebab(name)))
         })
-        .collect();
+        .collect()
+}
+
+/// Sous-commandes et options longues déclarées dans `main.rs`, lues dans la source :
+/// clap les construit par `derive`, les champs et les `#[arg(long …)]` sont donc la
+/// référence. `Command::Snapshot` imbrique `SnapshotCommand` : ses variantes sont
+/// documentées comme `snapshot <variante>`, pas comme une sous-commande à part.
+fn declared() -> (Vec<String>, Vec<String>) {
+    let src = include_str!("../src/main.rs");
+
+    // `Snapshot(SnapshotArgs),` ne correspond à aucun des deux suffixes reconnus : sa
+    // propre variante n'est jamais comptée, seules celles de `SnapshotCommand` le sont.
+    let mut subcommands = variants(brace_body(src, "enum Command {"), "");
+    subcommands.extend(variants(
+        brace_body(src, "enum SnapshotCommand {"),
+        "snapshot ",
+    ));
 
     // Options longues : `#[arg(long)]` prend le nom du champ qui suit, `long = "x"` le sien.
     let mut longs = Vec::new();
-    let mut lines = args.lines().peekable();
+    let mut lines = src.lines().peekable();
     while let Some(line) = lines.next() {
         let Some(arg) = line.trim().strip_prefix("#[arg(") else {
             continue;
@@ -613,4 +641,102 @@ fn doc_07_every_subcommand_and_option_is_documented() {
             "option --{long} absente de docs/guide/CLI-mimicctl.md"
         );
     }
+}
+
+// Cycle de vie des snapshots (spec §5.6, §9.5, point 5) : `mimicctl snapshot ls|pin|export|import|gc`.
+
+fn snap(id: &str, created_ms: i64, exchanges: u64, pinned: bool) -> Value {
+    json!({"id": id, "size": 42, "modified_ms": created_ms, "created_ms": created_ms, "exchanges": exchanges, "pinned": pinned})
+}
+
+/// `ls` : tableau du plus récent au plus ancien, `REFERENCED` d'après le snapshot courant,
+/// `PINNED` d'après le listing (CLI-12).
+#[test]
+fn cli_12_snapshot_ls_table() {
+    let snaps = vec![snap("b2", 20, 3, true), snap("a1", 10, 1, false)];
+    let table = snapshot_table(&snaps, Some("a1"));
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines[0].split_whitespace().collect::<Vec<_>>(),
+        ["ID", "CREATED_MS", "EXCHANGES", "PINNED", "REFERENCED"]
+    );
+    let row = |id: &str| {
+        lines
+            .iter()
+            .find(|l| l.starts_with(id))
+            .map(|l| l.split_whitespace().collect::<Vec<_>>())
+            .unwrap()
+    };
+    assert_eq!(row("b2"), ["b2", "20", "3", "true", "false"]);
+    assert_eq!(row("a1"), ["a1", "10", "1", "false", "true"]);
+
+    // Métadonnées inconnues (contrôleur antérieur ou snapshot sans métadonnées) : `?`.
+    let unknown = vec![
+        json!({"id": "x", "size": 1, "modified_ms": 1, "created_ms": null, "exchanges": null, "pinned": false}),
+    ];
+    let table = snapshot_table(&unknown, None);
+    assert_eq!(
+        table
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["x", "?", "?", "false", "false"]
+    );
+}
+
+/// `pin`/`--unpin` : requête construite avant tout appel ; identifiant invalide refusé
+/// (CLI-13).
+#[test]
+fn cli_13_snapshot_pin_path_and_body() {
+    assert_eq!(
+        snapshot_pin_path("shop", "checkout", "abc123").unwrap(),
+        "/v1/workloads/shop/checkout/snapshots/abc123/pin"
+    );
+    assert_eq!(snapshot_pin_body(true), json!({"pinned": true}));
+    assert_eq!(snapshot_pin_body(false), json!({"pinned": false}));
+
+    let err = snapshot_pin_path("shop", "checkout", "../x").unwrap_err();
+    assert!(err.contains("../x"), "{err}");
+    assert!(snapshot_pin_path("shop", "checkout", "").is_err());
+}
+
+/// `export` : même route que la lecture d'un snapshot complet ; identifiant invalide
+/// refusé avant tout appel (CLI-14).
+#[test]
+fn cli_14_snapshot_export_path() {
+    assert_eq!(
+        snapshot_export_path("shop", "checkout", "abc123").unwrap(),
+        "/v1/workloads/shop/checkout/snapshots/abc123"
+    );
+    assert!(snapshot_export_path("shop", "checkout", "/abs").is_err());
+}
+
+/// `ls` sans identifiant (import s'appuie sur le même chemin que la liste, en `POST`) :
+/// vérifie le chemin de la collection, utilisé aussi pour l'import (CLI-15).
+#[test]
+fn cli_15_snapshots_collection_path_is_shared_by_ls_and_import() {
+    assert_eq!(
+        snapshots_path("shop", "checkout"),
+        "/v1/workloads/shop/checkout/snapshots"
+    );
+}
+
+/// `gc` : chemin de la purge immédiate, et lecture des identifiants supprimés, triés
+/// (CLI-16).
+#[test]
+fn cli_16_snapshot_gc_path_and_report() {
+    assert_eq!(
+        snapshot_gc_path("shop", "checkout"),
+        "/v1/workloads/shop/checkout/snapshots/gc"
+    );
+    assert_eq!(
+        snapshot_gc_deleted(&json!({"deleted": ["b", "a"]})),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert_eq!(
+        snapshot_gc_deleted(&json!({"deleted": []})),
+        Vec::<String>::new()
+    );
 }

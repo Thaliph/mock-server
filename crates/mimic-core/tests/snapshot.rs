@@ -342,3 +342,126 @@ proptest! {
         }
     }
 }
+
+// Cycle de vie des snapshots (spec §5.6, point 5) : métadonnées versionnées, purge et
+// import, en fonctions pures.
+
+use mimic_core::snapshot::{SnapshotEntry, SnapshotMeta};
+use std::collections::BTreeSet;
+
+/// Métadonnées versionnées d'un snapshot : aller-retour JSON, format inconnu refusé
+/// (SNP-09).
+#[test]
+fn snp_09_snapshot_meta_round_trips_and_checks_its_format() {
+    let meta = SnapshotMeta {
+        format: mimic_core::snapshot::SNAPSHOT_META_FORMAT,
+        created_ms: 1_700_000_000_000,
+        exchanges: 42,
+        pinned: false,
+    };
+    let bytes = meta.to_json();
+    assert_eq!(SnapshotMeta::from_json(&bytes).unwrap(), meta);
+
+    let future = br#"{"format":9999,"created_ms":0,"exchanges":0,"pinned":false}"#;
+    let err = SnapshotMeta::from_json(future).unwrap_err();
+    assert!(err.contains("9999"), "{err}");
+
+    // Champ inconnu refusé : une métadonnée mal formée ne doit pas être prise pour une
+    // version future silencieusement acceptée.
+    let unknown = br#"{"format":1,"created_ms":0,"exchanges":0,"pinned":false,"extra":true}"#;
+    assert!(SnapshotMeta::from_json(unknown).is_err());
+}
+
+/// Purge (SNP-10) : les référencés et les épinglés ne sont jamais supprimés ; au-delà
+/// d'eux, seuls les `keep_last` plus récents survivent.
+#[test]
+fn snp_10_purge_keeps_referenced_pinned_and_the_most_recent() {
+    let entries = vec![
+        SnapshotEntry {
+            id: "old-pinned".into(),
+            created_ms: 1,
+            pinned: true,
+        },
+        SnapshotEntry {
+            id: "old-referenced".into(),
+            created_ms: 2,
+            pinned: false,
+        },
+        SnapshotEntry {
+            id: "old-plain".into(),
+            created_ms: 3,
+            pinned: false,
+        },
+        SnapshotEntry {
+            id: "recent-a".into(),
+            created_ms: 10,
+            pinned: false,
+        },
+        SnapshotEntry {
+            id: "recent-b".into(),
+            created_ms: 11,
+            pinned: false,
+        },
+    ];
+    let referenced: BTreeSet<String> = ["old-referenced".to_string()].into();
+    let purge = mimic_core::snapshot::to_purge(&entries, &referenced, 2);
+    assert_eq!(
+        purge,
+        BTreeSet::from(["old-plain".to_string()]),
+        "{purge:?}"
+    );
+
+    // keep_last = 0 : seuls les référencés et les épinglés survivent.
+    let purge0 = mimic_core::snapshot::to_purge(&entries, &referenced, 0);
+    assert_eq!(
+        purge0,
+        BTreeSet::from([
+            "old-plain".to_string(),
+            "recent-a".to_string(),
+            "recent-b".to_string(),
+        ])
+    );
+
+    // Rien à purger si tout est référencé ou épinglé ou dans les `keep_last`.
+    let all_known: BTreeSet<String> = entries.iter().map(|e| e.id.clone()).collect();
+    assert!(mimic_core::snapshot::to_purge(&entries, &all_known, 0).is_empty());
+}
+
+proptest! {
+    // Déterminisme (INF-08) : même ensemble d'entrées, ordre permuté, même résultat.
+    #[test]
+    fn snp_10_purge_is_order_independent(seed: u8) {
+        let mut entries = vec![
+            SnapshotEntry { id: "a".into(), created_ms: 1, pinned: false },
+            SnapshotEntry { id: "b".into(), created_ms: 2, pinned: true },
+            SnapshotEntry { id: "c".into(), created_ms: 3, pinned: false },
+            SnapshotEntry { id: "d".into(), created_ms: 4, pinned: false },
+        ];
+        let expected = mimic_core::snapshot::to_purge(&entries, &BTreeSet::new(), 1);
+        let rotate = (seed as usize) % entries.len();
+        entries.rotate_left(rotate);
+        prop_assert_eq!(mimic_core::snapshot::to_purge(&entries, &BTreeSet::new(), 1), expected);
+    }
+}
+
+/// Import (SNP-11) : un contenu importé est canonicalisé, son identifiant recalculé ; une
+/// ligne invalide est refusée avec son numéro.
+#[test]
+fn snp_11_parse_canonicalizes_an_imported_snapshot() {
+    let a = out("/a", 1, "a");
+    let b = out("/b", 2, "b");
+    let built = build([a.clone(), b.clone()], &SnapshotOptions::default());
+    let bytes = built.to_jsonl();
+
+    let parsed = Snapshot::parse(&bytes).unwrap();
+    assert_eq!(parsed.id, built.id);
+    assert_eq!(parsed.exchanges, built.exchanges);
+
+    let err = Snapshot::parse(b"{invalide}\n").unwrap_err();
+    assert!(err.contains("ligne 1"), "{err}");
+
+    let mut valid_then_broken = serde_json::to_vec(&a).unwrap();
+    valid_then_broken.extend_from_slice(b"\nceci ne va pas\n");
+    let err2 = Snapshot::parse(&valid_then_broken).unwrap_err();
+    assert!(err2.contains("ligne 2"), "{err2}");
+}
