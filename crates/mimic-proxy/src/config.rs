@@ -760,6 +760,28 @@ mod tests {
         assert_eq!(MockWebsocket::parse("drop"), None);
     }
 
+    /// `mock.tcp` : `refuse` par défaut, `relay` accepté, valeur inconnue refusée au
+    /// démarrage (MCK-24).
+    #[test]
+    fn mck_24_mock_tcp_defaults_to_refuse() {
+        assert_eq!(Config::default().mock.tcp, MockTcp::Refuse);
+        let c: Config = serde_yaml::from_str("mode: mock\n").unwrap();
+        assert_eq!(c.mock.tcp, MockTcp::Refuse);
+        let c = Config::load_with(None, |k| {
+            (k == "MIMIC_CONFIG_YAML").then(|| "mode: mock\nmock:\n  tcp: relay\n".into())
+        })
+        .unwrap();
+        assert_eq!(c.mock.tcp, MockTcp::Relay);
+        assert_eq!(MockTcp::Refuse.as_str(), "refuse");
+        assert_eq!(MockTcp::Relay.as_str(), "relay");
+        let err = Config::load_with(None, |k| {
+            (k == "MIMIC_CONFIG_YAML").then(|| "mock:\n  tcp: drop\n".into())
+        })
+        .unwrap_err();
+        assert!(err.contains("tcp") && err.contains("drop"), "{err}");
+        assert!(err.contains("refuse") && err.contains("relay"), "{err}");
+    }
+
     /// Barrière de démarrage (CTL-41) : 30 s et `record` par défaut, délai borné, repli
     /// inconnu refusé avec les valeurs admises.
     #[test]
@@ -802,26 +824,6 @@ mod tests {
             assert!(err.contains(v), "{err}");
         }
         assert!(load("{timeout: 5, retries: 2}").is_err());
-    /// `mock.tcp` : `refuse` par défaut, `relay` accepté, valeur inconnue refusée au
-    /// démarrage (MCK-24).
-    #[test]
-    fn mck_24_mock_tcp_defaults_to_refuse() {
-        assert_eq!(Config::default().mock.tcp, MockTcp::Refuse);
-        let c: Config = serde_yaml::from_str("mode: mock\n").unwrap();
-        assert_eq!(c.mock.tcp, MockTcp::Refuse);
-        let c = Config::load_with(None, |k| {
-            (k == "MIMIC_CONFIG_YAML").then(|| "mode: mock\nmock:\n  tcp: relay\n".into())
-        })
-        .unwrap();
-        assert_eq!(c.mock.tcp, MockTcp::Relay);
-        assert_eq!(MockTcp::Refuse.as_str(), "refuse");
-        assert_eq!(MockTcp::Relay.as_str(), "relay");
-        let err = Config::load_with(None, |k| {
-            (k == "MIMIC_CONFIG_YAML").then(|| "mock:\n  tcp: drop\n".into())
-        })
-        .unwrap_err();
-        assert!(err.contains("tcp") && err.contains("drop"), "{err}");
-        assert!(err.contains("refuse") && err.contains("relay"), "{err}");
     }
 
     #[test]
