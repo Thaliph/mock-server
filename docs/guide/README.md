@@ -31,7 +31,7 @@ mimic est conçu pour les environnements **hors production** : les modes `mock` 
 | `mimic-controller` | plan de contrôle : agrégation par workload, snapshots, bascule, interface web |
 | `mimic-injector` | webhook d'admission qui ajoute `mimic-init` et le sidecar aux pods |
 | `MimicWorkload` | ressource Kubernetes (CRD) qui déclare le mode souhaité d'un workload |
-| `mimicctl` | CLI : bascule, statut, export OpenAPI, rejeu k6, rapport, diff |
+| `mimicctl` | CLI : bascule, statut, export OpenAPI, rejeu k6, tir de charge, rapport, diff |
 
 ## Plan du guide
 
@@ -47,7 +47,7 @@ mimic est conçu pour les environnements **hors production** : les modes `mock` 
 | [Alertes et supervision](Alertes-et-supervision.md) | sondes, signaux de panne et de dégradation, règles `PrometheusRule` et conduite à tenir |
 | [Administration et API](Administration-et-API.md) | page d'admin du sidecar, interface et API du contrôleur, droits |
 | [Service mesh](Service-mesh.md) | Istio sidecar, Istio ambient, Linkerd : ce qui change, limites |
-| [CLI mimicctl](CLI-mimicctl.md) | installation, chaque commande et option, exemples |
+| [CLI mimicctl](CLI-mimicctl.md) | référence unique de la CLI : installation, droits, chaque commande et option, interface web du contrôleur |
 | [Exploiter en production](Exploiter-en-production.md) | dimensionnement, haute disponibilité, mises à jour, certificats, pannes, sécurité, sauvegarde |
 | [Dépannage](Depannage.md) | symptômes, diagnostics et messages d'erreur réels |
 | [Tir de charge](Tir-de-charge.md) | `mimicctl load` : palier fixe ou montée jusqu'à saturation, lecture du rapport, dimensionnement CPU et mémoire |

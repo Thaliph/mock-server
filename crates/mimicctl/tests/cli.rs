@@ -519,3 +519,98 @@ fn cli_11_status_and_report_show_unmatched_requests() {
         .expect(&md);
     assert!(summary.ends_with("| 0 |"), "{summary}");
 }
+
+/// Sous-commandes et options longues déclarées dans `main.rs`, lues dans la source :
+/// clap les construit par `derive`, les champs et les `#[arg(long …)]` sont donc la
+/// référence.
+fn declared() -> (Vec<String>, Vec<String>) {
+    let src = include_str!("../src/main.rs");
+    let (commands, args) = src
+        .split_once("struct LoadArgs")
+        .map(|(before, after)| (before, [before, after].concat()))
+        .expect("LoadArgs");
+
+    // Sous-commandes : variantes de l'énumération `Command`, en kebab-case.
+    let body = commands
+        .split_once("enum Command {")
+        .expect("enum Command")
+        .1;
+    let subcommands: Vec<String> = body
+        .lines()
+        .filter_map(|l| {
+            let name = l.strip_prefix("    ")?;
+            let name = name
+                .strip_suffix(" {")
+                .or_else(|| name.strip_suffix("(Box<LoadArgs>),"))?;
+            (!name.starts_with(['/', '#', ' '])).then(|| kebab(name))
+        })
+        .collect();
+
+    // Options longues : `#[arg(long)]` prend le nom du champ qui suit, `long = "x"` le sien.
+    let mut longs = Vec::new();
+    let mut lines = args.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(arg) = line.trim().strip_prefix("#[arg(") else {
+            continue;
+        };
+        if let Some(rest) = arg.split_once("long = \"") {
+            longs.push(rest.1.split('"').next().unwrap().to_string());
+            continue;
+        }
+        if !arg.split(['(', ')', ',', ' ']).any(|t| t == "long") {
+            continue;
+        }
+        let field = lines
+            .peek()
+            .and_then(|l| l.trim().split_once(':'))
+            .expect("champ après #[arg(long)]")
+            .0;
+        longs.push(kebab(field));
+    }
+    longs.sort();
+    longs.dedup();
+    (subcommands, longs)
+}
+
+fn kebab(ident: &str) -> String {
+    let mut out = String::new();
+    for c in ident.trim().chars() {
+        if c.is_ascii_uppercase() {
+            if !out.is_empty() {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(if c == '_' { '-' } else { c });
+        }
+    }
+    out
+}
+
+/// La page `mimicctl` du guide documente chaque sous-commande et chaque option longue, et
+/// c'est la seule référence : `docs/cli.md` a été fusionnée dedans (DOC-07).
+#[test]
+fn doc_07_every_subcommand_and_option_is_documented() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(
+        !root.join("docs/cli.md").exists(),
+        "docs/cli.md fait doublon avec docs/guide/CLI-mimicctl.md"
+    );
+    let page = std::fs::read_to_string(root.join("docs/guide/CLI-mimicctl.md")).unwrap();
+
+    let (subcommands, longs) = declared();
+    assert!(subcommands.len() >= 7, "{subcommands:?}");
+    assert!(longs.len() >= 25, "{longs:?}");
+    for name in &subcommands {
+        assert!(
+            page.contains(&format!("## `{name}`")),
+            "sous-commande {name} sans section dans docs/guide/CLI-mimicctl.md"
+        );
+    }
+    for long in &longs {
+        assert!(
+            page.contains(&format!("--{long}")),
+            "option --{long} absente de docs/guide/CLI-mimicctl.md"
+        );
+    }
+}

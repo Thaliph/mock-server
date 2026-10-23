@@ -52,7 +52,8 @@ Déploiement dans Kubernetes : voir [deploy/README.md](deploy/README.md).
 
 ## mimicctl
 
-Référence complète, droits nécessaires et interface web du contrôleur : [docs/cli.md](docs/cli.md).
+Référence complète, droits nécessaires et interface web du contrôleur :
+[docs/guide/CLI-mimicctl.md](docs/guide/CLI-mimicctl.md).
 Tir de charge d'un workload isolé, métriques à suivre et exemple blue/green avec Argo Rollouts :
 [docs/sre-load-test.md](docs/sre-load-test.md).
 

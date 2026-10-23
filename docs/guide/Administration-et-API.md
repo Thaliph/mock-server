@@ -12,7 +12,7 @@ lecture seule du contrôleur, et l'API du contrôleur réservée aux sidecars. S
 |---------|--------|-----------|------------------|--------------|
 | admin du sidecar | `0.0.0.0:15100` (port `mimic-admin`) | HTTP | aucune ; hors `/healthz`, `/readyz` et `/metrics`, seules les connexions de la boucle locale (`127.0.0.1`, `::1`) sont servies, les autres reçoivent `403` | sondes du kubelet et scraper (`/healthz`, `/readyz`, `/metrics`) ; opérateurs par `kubectl port-forward` ou `kubectl exec` pour le reste |
 | interface du contrôleur | `127.0.0.1:8081` | HTTP | aucune ; l'accès passe par `kubectl port-forward` (RBAC `pods/portforward` `create` dans `mimic-system`) | opérateurs, `mimicctl export/requests/report` |
-| API du contrôleur | `0.0.0.0:8443`, Service `mimic-controller:8443` | HTTPS | jeton de ServiceAccount projeté, validé par TokenReview (audience `mimic-controller`) | sidecars uniquement (NetworkPolicy : pods labellisés `mimic.platform.io/sidecar=true`) |
+| API du contrôleur | `0.0.0.0:8443` (port `api`), Service `mimic-controller:8443` | HTTPS | jeton de ServiceAccount projeté, validé par TokenReview (audience `mimic-controller`) ; **sauf `/healthz` et `/metrics`**, servis sans jeton par les deux répliques | sidecars (NetworkPolicy : pods labellisés `mimic.platform.io/sidecar=true`) ; scraper de métriques (namespace labellisé `mimic.platform.io/monitoring=true`) |
 
 > L'admin écoute sur `0.0.0.0:15100`, ce qu'exigent les sondes HTTP du kubelet et la collecte
 > des métriques ; les pages, l'API et les ordres (`PUT /mode`, `DELETE /store`,
@@ -148,14 +148,15 @@ un accès à ces données.
 ## API du contrôleur pour les sidecars
 
 Réservée aux sidecars ; à connaître pour le diagnostic. Chaque appel porte
-`Authorization: Bearer <jeton projeté>`. Le contrôleur valide le jeton par TokenReview
+`Authorization: Bearer <jeton projeté>`, sauf `/healthz` et `/metrics`. Le contrôleur valide le jeton par TokenReview
 (audience `mimic-controller`, résultat gardé 60 s), lit le pod correspondant et vérifie que
 le namespace, le workload (annotation `mimic.platform.io/workload` ou labels) et l'instance
 (nom du pod) de l'URL sont **les siens**.
 
 | Méthode, route | Usage | Réponses |
 |----------------|-------|----------|
-| `GET /healthz` | sondes | `ok` |
+| `GET /healthz` | sondes du kubelet, sur les deux répliques, sans jeton | `ok` |
+| `GET /metrics` | collecte Prometheus, sans jeton, sur les deux répliques (voir [Métriques](Metriques.md#où-les-collecter)) | métriques du contrôleur |
 | `POST /v1/workloads/{ns}/{wl}/heartbeat` | battement : `{instance, mode, snapshot, capture_inbound, mock_websocket, unmatched}` → état souhaité du pod. `unmatched` (relevé des 20 clés les plus récentes) est facultatif : un contrôleur d'une version antérieure l'ignore, un relevé illisible est ignoré sans refuser le battement, et le contrôleur n'en garde que 20 clés | `200` ; `413` au-delà de 64 KiB |
 | `POST /v1/workloads/{ns}/{wl}/segments?instance=&segment=` | segment JSONL (64 MiB au plus) | `201` nouveau, `200` doublon ; `400 identifiant de segment invalide: …`, `400 instance réservée: …`, `400 ligne <n>: …` ; `503 support indisponible` |
 | `GET /v1/workloads/{ns}/{wl}/segments`, `GET …/segments/{instance}/{file}` | lecture des segments | `404 segment inconnu` |

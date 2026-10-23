@@ -37,7 +37,7 @@ kubectl -n mimic-system logs deploy/mimic-controller --all-containers --prefix |
 | | `mimic.platform.io/mesh inconnue : X (auto, none, istio, istio-ambient, linkerd) ; mesh détecté par mimic-init` | valeur d'annotation fausse ; pod injecté en `auto` | corriger l'annotation |
 | erreur d'admission dans les logs du webhook | `revue d'admission invalide: …` | revue mal formée | version de l'API server, autre webhook |
 | webhook en échec au démarrage | `mimic-injector: sidecar_config invalide: …`, `mimic-injector: configuration … invalide: …` | ConfigMap `mimic-injector` incorrecte | corriger, `rollout restart deploy/mimic-injector` |
-| API server : `failed calling webhook` dans les événements | | `caBundle` pas encore posé par le cainjector, certificat expiré ou non rechargé | `kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath='{.webhooks[0].clientConfig.caBundle}'` ; redémarrer le webhook après un renouvellement |
+| API server : `failed calling webhook` dans les événements | | `caBundle` pas encore posé par le cainjector, ou webhook injoignable | `kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath='{.webhooks[0].clientConfig.caBundle}'` ; `kubectl -n mimic-system get endpoints mimic-injector`. Le certificat du webhook est relu à chaud (10 s) : un renouvellement ne demande pas de redémarrage |
 | pod rejeté par Pod Security | `violates PodSecurity "baseline"…` (capacités `NET_ADMIN`, `NET_RAW`) | `mimic-init` a besoin de ces capacités | namespace en `privileged` ou exemption |
 
 ## `mimic-init`
@@ -115,7 +115,7 @@ de `/api/status`, sous la forme `<méthode> <chemin>: <code> <motif> <body>`.
 | `POST /segments?…: 503 Service Unavailable support indisponible` | support plein ou injoignable | PVC, droits S3 |
 | `POST /heartbeat: délai dépassé` | NetworkPolicy, Service sans endpoint, contrôleur arrêté | `kubectl -n mimic-system get endpoints mimic-controller` ; le pod porte-t-il `mimic.platform.io/sidecar=true` ? |
 | `… invalid peer certificate: BadSignature` | CA réémise sans réémission du certificat du contrôleur, ou sidecar démarré avec l'ancienne CA | procédure de [rotation de la CA](Exploiter-en-production.md#certificats) |
-| `… invalid peer certificate: …` mentionnant l'expiration | certificat renouvelé par cert-manager mais contrôleur pas redémarré (il ne recharge pas son certificat) | `kubectl -n mimic-system rollout restart deploy/mimic-controller` |
+| `… invalid peer certificate: …` mentionnant l'expiration | certificat du contrôleur expiré : renouvellement de cert-manager en échec, ou nouveau contenu refusé à la relecture (`nouveau certificat illisible : l'ancien reste servi` au journal du contrôleur) | `kubectl -n mimic-system get certificate` ; `kubectl -n mimic-system logs deploy/mimic-controller \| grep certificat`. Le certificat est relu toutes les `tls.reload_interval` secondes (10) : un redémarrage ne sert qu'à lever un doute |
 | `jeton /var/run/secrets/mimic/token: …` | fichier de jeton illisible | volume `mimic-token` |
 | `snapshot <id>: …` | téléchargement du snapshot en échec ; le pod est passé en mock sur ses données locales et retente | voir la cause qui suit |
 | `forme de mock du snapshot <id> altérée (empreinte …, ETag …)` | contenu reçu différent de son empreinte (proxy intermédiaire, corruption) | retenté au battement suivant |

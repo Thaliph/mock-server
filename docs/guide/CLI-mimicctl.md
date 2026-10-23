@@ -3,8 +3,8 @@
 [← Sommaire](README.md)
 
 `mimicctl` pilote mimic depuis un poste ou une CI : bascule, statut, export OpenAPI, rejeu,
-rapport et diff d'API. Source : `crates/mimicctl/src/{main,lib}.rs` ; guide d'origine :
-`docs/cli.md`.
+tir de charge, rapport et diff d'API. C'est la **référence unique** de la CLI (spec §9.5) ;
+source : `crates/mimicctl/src/{main,lib,load}.rs`.
 
 ## Installation et accès
 
@@ -21,20 +21,24 @@ les droits de son utilisateur :
 | `mode` | `create` et `patch` sur `mimicworkloads` du namespace, `get` sur le namespace (rôle `mimic-operator`) |
 | `status` | `list` sur `mimicworkloads` (rôle `mimic-viewer`, agrégé à `view`) |
 | `export`, `requests`, `report` | `list` sur `pods` et `create` sur `pods/portforward` dans `mimic-system` (`report` lit aussi `mimicworkloads`) |
+| `load <workload>` | ceux de `requests` (l'isolement et les pods sont lus sur le contrôleur, pas dans l'API Kubernetes), plus `get`/`list` sur `pods` de `metrics.k8s.io` dans le namespace du workload (relevés CPU et mémoire) |
+| `load --from <fichier>` sans workload | aucun : ni cluster, ni vérification, ni relevé |
 | `diff` | aucun : deux fichiers locaux |
 
-`export`, `requests` et `report` ouvrent un port-forward vers le port 8081 d'un pod du
+`export`, `requests`, `report` et `load` ouvrent un port-forward vers le port 8081 d'un pod du
 contrôleur : celui qui est en marche et porte `mimic.platform.io/leader=true`, sinon le
-premier en marche. Pendant une bascule de réplique, la passive répond `503` : relancer la
-commande quelques secondes plus tard.
+premier en marche. Comme `kubectl port-forward`, aucun port n'est exposé hors du cluster.
+Pendant une bascule de réplique, la passive répond `503` : relancer la commande quelques
+secondes plus tard.
 
-`-n/--namespace` vaut par défaut le namespace du contexte. Codes de sortie :
+`-n/--namespace` vaut par défaut le namespace du contexte ; `-A/--all-namespaces` couvre
+tous les namespaces (`status` et `report`). Codes de sortie :
 
 | Code | Sens |
 |------|------|
 | `0` | succès |
 | `1` | `diff --fail-on-breaking` a trouvé un changement cassant |
-| `2` | erreur ; message sur la sortie d'erreur, préfixé `mimicctl: ` |
+| `2` | erreur ou refus (garde-fou production de `mode`, workload non isolé pour `load`) ; message sur la sortie d'erreur, préfixé `mimicctl: ` |
 
 ## `mode`
 
@@ -118,8 +122,9 @@ découvertes (`api.stripe.com:443`, `quote:8080`). L'hôte seul (`api.stripe.com
 ne correspond qu'à une authority connue du workload ; sinon `mimicctl` sort en erreur (code 2)
 avec la liste des authorities connues (`dépendance api.stripe.com inconnue ; authorities
 connues : …`, ou `plusieurs dépendances pour l'hôte quote : quote:8080, quote:9090`). L'un des
-deux est requis (`--inbound ou --outbound <authority> requis`). `-o` : `.yaml`/`.yml` en YAML, sinon JSON ;
-sans `-o`, JSON sur la sortie standard. `--openapi-version 3.0` convertit (défaut `3.1`).
+deux est requis (`--inbound ou --outbound <authority> requis`). `-o/--output` : `.yaml`/`.yml`
+en YAML, sinon JSON ; sans `-o`, JSON sur la sortie standard. `--openapi-version 3.0`
+convertit (défaut `3.1`).
 
 ```sh
 mimicctl export checkout -n shop --inbound --openapi-version 3.0 -o checkout.yaml
@@ -167,6 +172,62 @@ tir qui a reçu des `599`. Pour un résumé de job GitHub Actions :
 mimicctl report -n shop >> "$GITHUB_STEP_SUMMARY"
 ```
 
+## `load`
+
+```sh
+mimicctl load [<workload>] --target <url> [--from <fichier>] [--limit n] [-H 'nom: valeur']
+  [--http2] [--concurrency C | --ramp] [--requests N | --duration D]
+  [--start s] [--factor f] [--max m] [--step-duration D]
+  [--max-error-rate r] [--max-p99 D] [--plateau r] [--timeout D]
+  [--sample-interval D] [--pod-selector k=v] [--cpu-headroom r] [--memory-headroom r]
+  [--format text|markdown|json] [--allow-live-dependencies] [-n ns]
+```
+
+Rejoue les requêtes entrantes enregistrées contre le workload **isolé de ses dépendances**
+(spec §5.9), sans k6, et en déduit une taille de CPU et de mémoire par pod. Le workload doit
+être en `mock` avec tous ses pods sélectionnés alignés : sinon `load` refuse (code 2), car le
+tir frapperait les vraies dépendances. La conduite du tir et la lecture du rapport sont dans
+[Tir de charge](Tir-de-charge.md) ; cette page ne liste que les options.
+
+```sh
+# Palier fixe : 10 000 requêtes à une concurrence de 32.
+mimicctl load checkout -n perf --target http://checkout.perf:8080 --concurrency 32 --requests 10000
+
+# Montée 1, 2, 4… 256, 60 s par palier, arrêtée au premier palier saturé ; SLO p99 500 ms.
+mimicctl load checkout -n perf --target http://checkout.perf:8080 --ramp --max-p99 500ms
+
+# Depuis un fichier, sans cluster (aucune vérification, aucun relevé de ressources).
+mimicctl requests checkout -n perf --format jsonl --limit 5000 > reqs.jsonl
+mimicctl load --from reqs.jsonl --target http://localhost:8080 -H 'authorization: Bearer …'
+```
+
+| Option | Défaut | Effet |
+|--------|--------|-------|
+| `--target URL` | requis | `http://hôte[:port][/préfixe]` ; `https` refusé |
+| `--from fichier` | | échanges JSONL (`requests --format jsonl`) au lieu du contrôleur ; le workload devient facultatif |
+| `--limit n` | 1000 | requêtes lues sur le contrôleur |
+| `-H, --header 'nom: valeur'` | | header ajouté ou remplacé, répétable (les headers redactés ne sont jamais rejoués tels quels) |
+| `--http2` | | HTTP/2 sans TLS, pour un service gRPC |
+| `--concurrency C` | 8 | concurrence du palier fixe (exclusif avec `--ramp`) |
+| `--requests N` | | fin du palier fixe : exactement `N` requêtes (exclusif avec `--duration` et `--ramp`) |
+| `--duration D` | 60s | fin du palier fixe : une durée (exclusif avec `--ramp`) |
+| `--ramp` | | montée par paliers jusqu'à saturation |
+| `--start`, `--factor`, `--max` | 1, 2, 256 | concurrences de la montée : `start`, ×`factor`, …, `max` (demandent `--ramp`) |
+| `--step-duration D` | 60s | durée d'un palier de la montée (demande `--ramp`) |
+| `--max-error-rate r` | 1% | palier saturé au-delà (erreurs : 5xx, délai dépassé, échec de connexion) |
+| `--max-p99 D` | aucun | palier saturé au-delà (votre SLO) |
+| `--plateau r` | 10% | palier saturé si le débit gagne moins que cette part de la hausse de concurrence (moins de +10 % en doublant) |
+| `--timeout D` | 10s | délai d'une requête, réponse lue en entier |
+| `--sample-interval D` | 15s | intervalle des relevés `metrics.k8s.io` |
+| `--pod-selector k=v` | | pods dont relever CPU et mémoire, au lieu de ceux du contrôleur |
+| `--cpu-headroom r`, `--memory-headroom r` | 30%, 20% | marges de la recommandation |
+| `--format` | text | `text`, `markdown` (résumé de job GitHub) ou `json` |
+| `--allow-live-dependencies` | | lève le refus hors mock, en connaissance de cause |
+
+Durées : `500ms`, `60s`, `2m`, `1h`. Proportions : `0.3` ou `30%`. La cible doit être joignable
+depuis l'endroit où tourne `mimicctl` (`kubectl port-forward svc/checkout 8080`, ou le Job de
+`deploy/load/job.yaml`, dont l'image contient `mimicctl`).
+
 ## `diff`
 
 ```sh
@@ -195,3 +256,28 @@ mimicctl diff semaine-derniere.json cette-semaine.json --fail-on-breaking
 | `contrôleur : 404 Not Found dépendance inconnue` | authority absente des API découvertes (contrôleur qui a perdu la dépendance entre la liste et l'export) | vérifier l'authority exacte (`hôte:port`) dans `/ui/<ns>/<wl>` ou `mimicctl report` |
 | `contrôleur : <code> <body>` | autre réponse du contrôleur | voir [Administration et API](Administration-et-API.md) |
 | `pods du contrôleur: …`, `port-forward vers <pod>: …` | droits `pods` `list` ou `pods/portforward` `create` manquants dans `mimic-system`, API injoignable | `kubectl auth can-i create pods/portforward -n mimic-system` |
+
+## Interface web du contrôleur
+
+Ce que `export`, `requests`, `report` et `load` lisent est aussi visible dans l'interface du
+contrôleur, sur `ui_listen` (`127.0.0.1:8081`, port-forward seulement) :
+
+```sh
+kubectl port-forward -n mimic-system \
+  "$(kubectl -n mimic-system get pod -l mimic.platform.io/leader=true -o name)" 8081
+```
+
+Viser la réplique **active** : `deploy/mimic-controller` peut désigner la passive, qui répond
+`503`. `http://127.0.0.1:8081/` liste les workloads avec leur mode et leurs pods alignés ;
+`/ui/<namespace>/<workload>` détaille un workload : pods et battements, API découvertes
+(opérations, paramètres et leur caractère requis, codes, latences), liens vers les documents
+OpenAPI, snapshots, requêtes sans réponse du mock, dernières requêtes et exports pour le rejeu
+(k6, JSONL, JSON). Détail des routes : [Administration et API](Administration-et-API.md).
+
+Chaque sidecar a aussi sa page d'admin, limitée à ce que **ce pod** a vu (sous contrôleur,
+aucun sidecar n'importe le trafic des autres ; le workload entier est dans l'interface du
+contrôleur) :
+
+```sh
+kubectl port-forward -n shop pod/<pod> 15100   # puis http://127.0.0.1:15100/
+```

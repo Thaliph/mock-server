@@ -60,10 +60,13 @@ Une passive répond `503` (`Retry-After: 2`, body
 EndpointSlice périmée) les envoie à la passive, ce qui ne dure normalement que le temps d'une
 bascule.
 
-Rappel : avec les manifests livrés, `/metrics` du contrôleur n'est joignable que par
-port-forward (voir [Métriques](Metriques.md#où-les-collecter)). Les règles « contrôleur
-(métriques mimic) » ci-dessous ne servent que si vous l'avez rendu collectable ; sinon,
-utilisez les règles kube-state-metrics et les signaux des sidecars.
+Rappel : `/metrics` du contrôleur est servi sur le port `api` (8443, HTTPS, sans jeton) et la
+NetworkPolicy livrée l'ouvre aux namespaces labellisés `mimic.platform.io/monitoring: "true"`
+(voir [Métriques](Metriques.md#où-les-collecter)). Les règles « contrôleur (métriques mimic) »
+ci-dessous marchent donc avec les manifests du dépôt, dès que le namespace du collecteur porte
+le label et qu'un `VMPodScrape` ou `PodMonitor` vise le port `api`
+(`deploy/example/vmpodscrape-controller.yaml`). Sans ce collecteur, s'en tenir aux règles
+kube-state-metrics et aux signaux des sidecars.
 
 ### Webhook
 
@@ -154,14 +157,21 @@ spec:
           annotations:
             summary: "Échanges perdus avant publication sur {{ $labels.namespace }}/{{ $labels.pod }}"
         - alert: MimicMockUnmatched
+          # En mock-partial, un appel sans enregistrement est relayé à la vraie dépendance :
+          # c'est le but du mode, pas une panne. L'alerte est donc limitée au mode mock,
+          # où un appel sans enregistrement devient un 599 pour l'application.
           expr: |
-            sum by (namespace, pod) (rate(mimic_mock_responses_total{match="unmatched"}[5m]))
-              / sum by (namespace, pod) (rate(mimic_mock_responses_total[5m]))
-              > 0.05
+            (
+              sum by (namespace, pod) (rate(mimic_mock_responses_total{match="unmatched"}[5m]))
+                / sum by (namespace, pod) (rate(mimic_mock_responses_total[5m]))
+                > 0.05
+            )
+            and on (namespace, pod) (mimic_mode{mode="mock"} == 1)
           for: 10m
           labels: {severity: warning}
           annotations:
-            summary: "Plus de 5 % des appels sortants sans enregistrement en mock ({{ $labels.namespace }}/{{ $labels.pod }})"
+            summary: "Plus de 5 % des appels sortants sans réponse enregistrée en mock ({{ $labels.namespace }}/{{ $labels.pod }})"
+            description: "Ces appels reçoivent un 599 : le snapshot ne couvre pas le trafic. Détail dans mimicctl report."
         - alert: MimicMockWithoutSnapshot
           expr: (mimic_mode{mode="mock"} == 1) and on (namespace, pod) (mimic_mock_snapshot_exchanges == 0)
           for: 5m
@@ -234,7 +244,7 @@ spec:
           annotations:
             summary: "Webhook mimic indisponible : les nouveaux pods sont créés sans mimic"
 
-    # Seulement si /metrics du contrôleur et du webhook sont collectés.
+    # Nécessite la collecte de /metrics du contrôleur et du webhook (port api, 8443, HTTPS).
     - name: mimic-controller-metrics
       rules:
         - alert: MimicControllerNoLeader
@@ -304,6 +314,11 @@ Notes sur ces règles :
   en `Init`, mais seul un scraper qui collecte aussi les pods `Pending` le voit ; à défaut,
   `MimicSidecarNotReady` (`kube_pod_init_container_status_ready{container="mimic"} == 0`)
   couvre ce cas.
+- `MimicMockUnmatched` ne vaut qu'en `mock` : en `mock-partial`, `match="unmatched"` compte
+  les requêtes **relayées faute d'enregistrement**, ce qui est le fonctionnement voulu du mode
+  et ferait sonner l'alerte en permanence. Le `and on (namespace, pod) mimic_mode{mode="mock"}`
+  l'écarte. Pour suivre quand même la couverture du snapshot en `mock-partial`, regarder la
+  part de `match="unmatched"` comme un indicateur, sans alerte.
 - `MimicMockWithoutSnapshot` se déclenche aussi pour un sidecar sans contrôleur basculé en
   mock par son API d'admin (cas voulu) : filtrer par namespace si vous utilisez ce mode.
 - `mimic_controller_pods{state="absent"}` n'est pas une bonne alerte : un pod supprimé reste
@@ -338,6 +353,7 @@ Notes sur ces règles :
 | `MimicControllerNoLeader` | logs : `lecture du bail`, `renouvellement du bail` ; `kubectl -n mimic-system get lease mimic-controller -o yaml` | droits RBAC sur `leases`, API server ; la prise de relais attend aussi la liste des namespaces (`prise de relais`) |
 | `MimicControllerTwoLeaders` | labels `mimic.platform.io/leader` des deux pods | doit se résorber seul (la réplique qui perd le bail sort) ; sinon redémarrer l'ancienne active |
 | `MimicControllerSegmentErrors` | log `ingestion d'un segment` | support plein ou en lecture seule, droits S3 |
+| `MimicControllerSlowTakeover` | `mimic_controller_takeover_seconds` ; logs de la nouvelle active (`prise de relais`) | le rechargement de l'état persisté est long : support lent (S3 distant, PVC saturé) ou beaucoup d'exemples. Informatif ; si c'est régulier, réduire `max_exemplars_per_workload` ou rapprocher le support |
 | `MimicControllerAuthUnavailable` | log `authentification impossible` | API server, droits `tokenreviews` `create` et `pods` `get` du ClusterRole `mimic-controller` |
 | `MimicControllerAuthRejected` | `reason` : `missing`/`invalid` (jeton, audience `mimic-controller`), `forbidden` (pod sans nom de workload, workload d'un autre) | vérifier le volume `mimic-token` et l'annotation `mimic.platform.io/workload` |
 | `MimicPodsDiverging` | `/ui/<ns>/<wl>` : état de chaque pod ; logs des pods concernés | voir [Basculer en mock](Basculer-en-mock.md#vérifier-lalignement) |

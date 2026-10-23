@@ -33,16 +33,20 @@ docker build -t registry.interne/platform/mimic:0.1.0 .
 docker push registry.interne/platform/mimic:0.1.0
 ```
 
-Les manifests référencent `registry.example.com/platform/mimic:0.1.0` à **trois** endroits :
-l'image du Deployment du contrôleur, celle du Deployment du webhook et le champ `image` de la
-configuration du webhook (image injectée dans les pods). Les remplacer ensemble :
+Les manifests visent l'image publiée **`ghcr.io/thaliph/mimic:0.1.0`**, à quatre endroits :
+l'image du Deployment du contrôleur, celle du Deployment du webhook, le champ `image` de la
+configuration du webhook (image injectée dans les pods) et le Job de tir de charge. Pour
+pointer vers un registre interne, les remplacer ensemble :
 
 ```sh
 IMAGE=registry.interne/platform/mimic:0.1.0
-for f in deploy/controller/controller.yaml deploy/injector/injector.yaml; do
-  sed -i "s#registry.example.com/platform/mimic:0.1.0#$IMAGE#g" "$f"
+for f in deploy/controller/controller.yaml deploy/injector/injector.yaml deploy/load/job.yaml; do
+  sed -i "s#ghcr.io/thaliph/mimic:0.1.0#$IMAGE#g" "$f"
 done
 ```
+
+Même substitution sans modifier les fichiers (`manifest … | kubectl apply -f -`) : voir la
+[démo locale sur kind](../demo-kind.md), qui charge une image construite localement.
 
 ## Ordre d'installation
 
@@ -104,9 +108,12 @@ Une seule réplique doit porter `mimic.platform.io/leader=true`.
 À appliquer après `controller/`, dont il réutilise l'Issuer `mimic-ca`. Avant, adapter la
 ConfigMap `mimic-injector` :
 
-- `exclude_outbound_cidrs` : l'IP du Service `kubernetes` du cluster (le manifest suppose
-  `10.96.0.1/32`) et toute destination qui ne doit jamais passer par le sidecar :
-  `kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}'` ;
+- `exclude_outbound_cidrs` : **vide** dans le manifest livré, et c'est le cas courant. L'IP du
+  Service `kubernetes` est exclue d'office : le webhook lit son propre
+  `KUBERNETES_SERVICE_HOST` au démarrage et l'ajoute à la liste, l'API Kubernetes n'est donc
+  jamais redirigée vers le sidecar. N'y mettre que ce qui doit rester réel pour **tous** les
+  pods : un endpoint privé de l'API (EKS), une base de données partagée… Par pod, l'annotation
+  `mimic.platform.io/exclude-outbound-cidrs` s'ajoute à cette liste ;
 - `iptables: iptables-legacy` si les nœuds sont en iptables legacy ;
 - `sidecar_config` : configuration par défaut des sidecars (voir [Configurer](Configurer.md)).
 
@@ -114,15 +121,18 @@ ConfigMap `mimic-injector` :
 kubectl apply -f deploy/injector/injector.yaml
 ca=$(kubectl -n mimic-system get secret mimic-controller-ca -o jsonpath='{.data.tls\.crt}')
 leaf=$(kubectl -n mimic-system get secret mimic-injector-tls -o jsonpath='{.data.ca\.crt}')
-[ "$ca" = "$leaf" ] || { kubectl -n mimic-system delete secret mimic-injector-tls; sleep 5;
-                         kubectl -n mimic-system rollout restart deploy/mimic-injector; }
+[ "$ca" = "$leaf" ] || kubectl -n mimic-system delete secret mimic-injector-tls   # cert-manager le réémet
 kubectl -n mimic-system rollout status deploy/mimic-injector --timeout=180s
 # Le caBundle est posé par le cainjector : attendre qu'il soit là avant de créer des pods.
 kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath='{.webhooks[0].clientConfig.caBundle}' | head -c 16; echo
 ```
 
-Le webhook lit son certificat au démarrage : après une réémission de `mimic-injector-tls`, le
-redémarrer (`rollout restart`).
+Le webhook relit son certificat sur disque toutes les `tls.reload_interval` secondes (10 par
+défaut) : une réémission de `mimic-injector-tls` est prise en compte sans redémarrage, le
+temps que le kubelet rafraîchisse le volume (voir
+[Exploiter en production](Exploiter-en-production.md#certificats)). En revanche sa
+**configuration** (ConfigMap `mimic-injector`) est lue au démarrage : la modifier demande un
+`rollout restart`.
 
 ## Activer l'injection
 

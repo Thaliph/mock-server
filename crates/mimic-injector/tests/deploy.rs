@@ -250,3 +250,58 @@ fn ctl_41_inj_21_manifests_give_the_startup_gate() {
     assert_eq!(mimic["readinessProbe"]["httpGet"]["path"], "/readyz");
     assert_eq!(mimic["livenessProbe"]["httpGet"]["path"], "/healthz");
 }
+
+/// Fichiers Markdown de `docs/`, récursivement.
+fn doc_pages() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{} : {e}", dir.display()))
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                out.push((name, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let mut out = Vec::new();
+    walk(&docs, &mut out);
+    assert!(out.len() > 15, "pages trouvées : {}", out.len());
+    out
+}
+
+/// La documentation cite l'image des manifests, et plus l'image factice (DOC-05).
+#[test]
+fn doc_05_documentation_cites_the_shipped_image() {
+    let cm = kind("ConfigMap");
+    let config: InjectorConfig =
+        serde_yaml::from_str(cm["data"]["injector.yaml"].as_str().unwrap()).unwrap();
+    let image = &config.image;
+    let host = image.split_once(':').unwrap().0;
+    let pages = doc_pages();
+
+    for (name, text) in &pages {
+        assert!(
+            !text.contains("registry.example.com/platform/mimic:"),
+            "docs/{name} : image factice au lieu de {image}"
+        );
+    }
+
+    // Les pages qui disent comment déployer et mettre à jour donnent l'image livrée.
+    let page = |name: &str| {
+        &pages
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("docs/guide/{name} absente"))
+            .1
+    };
+    assert!(page("Installer.md").contains(image.as_str()));
+    for name in ["Installer.md", "Exploiter-en-production.md"] {
+        assert!(page(name).contains(host), "docs/guide/{name} : {host}");
+    }
+}
