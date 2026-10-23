@@ -61,7 +61,8 @@ Ce que fait mimic pendant le tir :
 
 > **Sans k6.** `mimicctl load` rejoue les mêmes requêtes, à concurrence fixe ou en montée
 > jusqu'à saturation, relève CPU et mémoire des pods et recommande une taille : voir
-> [cli.md](cli.md#load--tir-de-charge-et-dimensionnement) et `deploy/load/job.yaml`. La suite de
+> [guide/CLI-mimicctl.md](guide/CLI-mimicctl.md#load), [guide/Tir-de-charge.md](guide/Tir-de-charge.md)
+> et `deploy/load/job.yaml`. La suite de
 > ce guide décrit le parcours avec k6.
 
 ## 1. Préparer le rejeu

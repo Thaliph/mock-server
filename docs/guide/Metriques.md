@@ -12,16 +12,45 @@ OpenMetrics (`prometheus_client`) : un compteur déclaré `mimic_requests` est e
 | Composant | Endpoint | Accès |
 |-----------|----------|-------|
 | sidecar | `GET /metrics` sur le port `mimic-admin` (15100) de chaque pod injecté, HTTP | depuis le réseau du cluster (écoute `0.0.0.0`) |
-| webhook | `GET /metrics` sur le port `webhook` (8443), **HTTPS** | certificat `mimic-injector-tls` (CA `mimic-ca`) ; pas de NetworkPolicy livrée |
-| contrôleur | `GET /metrics` sur `ui_listen`, **`127.0.0.1:8081`** par défaut, HTTP | port-forward seulement : **non collectable** avec les manifests livrés |
+| webhook | `GET /metrics` sur le port `webhook` (8443), **HTTPS**, sans jeton | certificat `mimic-injector-tls` (CA `mimic-ca`) ; aucune NetworkPolicy livrée pour le webhook : tout le cluster peut le joindre |
+| contrôleur | `GET /metrics` sur le port `api` (8443) de chaque réplique, **HTTPS**, sans jeton | depuis un namespace labellisé `mimic.platform.io/monitoring: "true"` : la NetworkPolicy `mimic-controller` lui ouvre 8443 |
 
-Le port 8443 du contrôleur (API des sidecars) **n'a pas** de `/metrics`. Pour collecter le
-contrôleur, il faut changer `ui_listen` en `0.0.0.0:8081`, déclarer le port dans le
-Deployment et ouvrir la NetworkPolicy `mimic-controller` au scraper ; mais ce port sert
-aussi l'interface et l'API de lecture, **sans authentification** (échanges redactés, OpenAPI,
-requêtes enregistrées). À ne faire qu'avec une NetworkPolicy qui n'admet que le scraper. À
-défaut, la santé du contrôleur se suit par les métriques des sidecars et kube-state-metrics
-(voir [Alertes et supervision](Alertes-et-supervision.md)).
+Le port 8443 du contrôleur est celui de l'API des sidecars : `/metrics` et `/healthz` y
+répondent **sans jeton**, sur les deux répliques — l'active comme la passive, qui donne
+`mimic_controller_leader 0` et des jauges d'état à 0. Il n'expose ni l'interface ni l'API de lecture, qui vivent sur
+`ui_listen` (`127.0.0.1:8081` par défaut, port-forward seulement) : collecter le contrôleur
+ne publie donc aucun échange enregistré. Le certificat est celui de `mimic-controller-tls`
+(CA `mimic-ca`) : le scraper doit l'approuver, ou ignorer la vérification.
+
+`deploy/example/vmpodscrape-controller.yaml` livre la collecte du contrôleur **et** celle du
+webhook (opérateur VictoriaMetrics) :
+
+```yaml
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata: {name: mimic-controller, namespace: mimic-system}
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: mimic-controller}
+  podMetricsEndpoints:
+    - port: api
+      path: /metrics
+      scheme: https
+      tlsConfig:
+        ca:
+          secret: {name: mimic-controller-ca, key: ca.crt}
+        # Le pod est joint par son IP : le nom vérifié est celui du certificat.
+        serverName: mimic-controller.mimic-system.svc
+```
+
+Équivalent Prometheus Operator : le même contenu en `PodMonitor`
+(`monitoring.coreos.com/v1`), avec `tlsConfig.ca.secret` et `tlsConfig.serverName`. Le
+namespace du collecteur doit porter le label qu'attend la NetworkPolicy, et `vmagent` lire
+les `VMPodScrape` de `mimic-system` (`selectAllByDefault`, ou son sélecteur) :
+
+```sh
+kubectl label namespace monitoring mimic.platform.io/monitoring=true
+```
 
 Exemple de collecte des sidecars (opérateur VictoriaMetrics, `deploy/example/vmpodscrape.yaml`) :
 
@@ -61,6 +90,7 @@ Au-delà de **100** authorities distinctes par processus, les suivantes sont reg
 | `mimic_passthrough_connections_total` | compteur | `direction`, `kind` (`tls`, `tcp`), `result` (`relayed`, `refused`, `error`) | connexions redirigées non HTTP : `relayed`, tunnel ouvert ; `refused`, refermée en `mock` sans joindre la destination : TLS non intercepté, ou TCP non HTTP et connexion restée muette avec `mock.tcp: refuse` (le défaut) ; `error`, destination injoignable. Chaque refus donne aussi un log `warn` (`… refusée en mode mock`, champs `destination` et `kind`), au plus une ligne par seconde avec `omitted` |
 | `mimic_websocket_connections_total` | compteur | `direction`, `result` (`relayed`, `refused`) | poignées de main WebSocket : `101` relayé, ou refus en mock |
 | `mimic_tls_handshake_failures_total` | compteur | `authority`, `reason` (`client_rejected`) | poignées de main TLS interceptées refusées par l'application (CA mimic non approuvée, épinglage) |
+| `mimic_connections_refused_total` | compteur | `listener` (`inbound`, `outbound`, `admin`) | connexions acceptées puis refermées sans être lues, au plafond `server.max_connections` (2 048 par défaut, commun à l'entrant et au sortant, tunnels et WebSocket compris ; l'admin a son propre plafond fixe de 64). Chaque refus donne un log `warn` (`plafond de connexions simultanées atteint, connexion refusée`), au plus une ligne par seconde avec `omitted` |
 
 ### Mock
 
@@ -145,12 +175,25 @@ histogram_quantile(0.99,
   sum by (le, authority, mode) (rate(mimic_request_duration_seconds_bucket{direction="outbound"}[5m])))
 ```
 
-Écart entre latence servie en mock et latence injectée (coût propre du sidecar) :
+Écart entre latence servie en mock et latence injectée (coût propre du sidecar). Les deux
+histogrammes partagent les mêmes seaux, de 0,5 ms à ~16 s : une **différence de quantiles**
+n'y mesure rien, car le surcoût du sidecar (quelques dizaines de microsecondes) est bien en
+dessous du premier seau et les deux p99 tombent dans le même. Il faut comparer les
+**moyennes**, qui sont exactes (`_sum` / `_count`) :
 
 ```promql
-histogram_quantile(0.99, sum by (le, authority) (rate(mimic_request_duration_seconds_bucket{direction="outbound",mode="mock"}[5m])))
-- histogram_quantile(0.99, sum by (le, authority) (rate(mimic_mock_injected_latency_seconds_bucket[5m])))
+  sum by (namespace, pod) (rate(mimic_request_duration_seconds_sum{direction="outbound",mode="mock"}[5m]))
+/ sum by (namespace, pod) (rate(mimic_request_duration_seconds_count{direction="outbound",mode="mock"}[5m]))
+-
+  sum by (namespace, pod) (rate(mimic_mock_injected_latency_seconds_sum[5m]))
+/ sum by (namespace, pod) (rate(mimic_mock_injected_latency_seconds_count[5m]))
 ```
+
+À lire seulement quand le mock répond à tout : `mimic_mock_injected_latency_seconds` ne
+compte que les réponses servies depuis un enregistrement, alors que
+`mimic_request_duration_seconds{mode="mock"}` compte aussi les `599`, les `413` et les
+`CONNECT` refusés. Vérifier d'abord que `mimic_mock_responses_total{match="unmatched"}` reste
+à zéro (requête ci-dessous).
 
 Part de requêtes sans correspondance pendant un tir, par dépendance :
 
