@@ -44,7 +44,7 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
-    /// Mode souhaité, snapshot servi et pods alignés.
+    /// Mode souhaité, snapshot servi, requêtes sans réponse du mock et pods alignés.
     Status {
         workload: Option<String>,
         #[arg(short, long)]
@@ -60,7 +60,8 @@ enum Command {
         /// API du service.
         #[arg(long, conflicts_with = "outbound")]
         inbound: bool,
-        /// API d'une dépendance, par authority (`api.stripe.com`).
+        /// API d'une dépendance, par authority `hôte:port` (`api.stripe.com:443`) ; l'hôte
+        /// seul suffit s'il n'a qu'une authority connue.
         #[arg(long)]
         outbound: Option<String>,
         #[arg(long, default_value = "3.1", value_parser = ["3.1", "3.0"])]
@@ -79,7 +80,8 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
-    /// Rapport Markdown de la découverte : API, opérations les plus appelées et headers.
+    /// Rapport Markdown de la découverte : API, requêtes sans réponse du mock, opérations les
+    /// plus appelées et headers.
     Report {
         workload: Option<String>,
         #[arg(short, long)]
@@ -280,13 +282,22 @@ async fn run(command: Command) -> Result<i32, String> {
             openapi_version,
             output,
         } => {
-            let target = match (inbound, outbound) {
-                (_, Some(a)) => Target::Outbound(a),
-                (true, None) => Target::Inbound,
-                (false, None) => return Err("--inbound ou --outbound <authority> requis".into()),
-            };
+            if !inbound && outbound.is_none() {
+                return Err("--inbound ou --outbound <authority> requis".into());
+            }
             let client = client().await?;
             let ns = namespace(ns, &client).await;
+            let target = match outbound {
+                // Les clés de la découverte sont `hôte:port` : l'hôte seul est résolu sur
+                // les dépendances connues, ou refusé avec leur liste (spec §9.5).
+                Some(a) => {
+                    let ops =
+                        controller_json(client.clone(), &operations_path(&ns, &workload)).await?;
+                    let known = mimicctl::outbound_authorities(ops.as_array().map_or(&[], |v| v));
+                    Target::Outbound(mimicctl::resolve_authority(&a, &known)?)
+                }
+                None => Target::Inbound,
+            };
             let body = controller_get(client, &export_path(&ns, &workload, &target)).await?;
             let mut doc: serde_json::Value = serde_json::from_slice(&body)
                 .map_err(|e| format!("réponse du contrôleur illisible: {e}"))?;
@@ -353,6 +364,8 @@ async fn run(command: Command) -> Result<i32, String> {
                     aligned: w["aligned"].as_u64().unwrap_or(0) as usize,
                     operations: operations.as_array().cloned().unwrap_or_default(),
                     requests,
+                    // Contrôleur d'une version antérieure : pas de relevé.
+                    unmatched: serde_json::from_value(w["unmatched"].clone()).unwrap_or_default(),
                 });
             }
             print!("{}", report_markdown(&workloads, top));

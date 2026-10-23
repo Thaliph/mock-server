@@ -26,6 +26,9 @@ spec:
     - jsonPath: .status.pods
       name: Pods
       type: integer
+    - jsonPath: .status.unmatched
+      name: Unmatched
+      type: integer
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -140,6 +143,12 @@ spec:
               snapshot:
                 nullable: true
                 type: string
+              unmatched:
+                default: 0
+                description: Requêtes sans réponse du mock (599, 413) relevées par les pods sélectionnés.
+                format: uint64
+                minimum: 0.0
+                type: integer
             required:
             - aligned
             - pods

@@ -36,6 +36,7 @@ Le workload entier est dans l'interface du contrôleur.
 | `GET /readyz` | sous contrôleur, état de la barrière de démarrage : `aligned`, `last-known` ou `fallback` (`200`) ; sans contrôleur, `ok` | `503` `waiting` : l'application ne doit pas encore démarrer (premier état souhaité ou son snapshot attendu) |
 | `GET /` | page HTML : mode, instance ; sous contrôleur, `N échanges vus par ce pod`, `piloté par le contrôleur · snapshot <id>`, état de la publication et dernière erreur ; sans contrôleur, échanges locaux et importés, pairs ; catalogue des opérations ; liens OpenAPI et métriques | |
 | `GET /api/operations` | catalogue JSON des opérations découvertes | |
+| `GET /api/unmatched?limit=n` | requêtes sans réponse du mock depuis l'entrée en mock (ci-dessous) : `total` et `entries` (100 clés par défaut et au plus) | |
 | `GET /api/status` | JSON : `mode`, `capture_inbound`, `mock_websocket`, `instance`, `workload` (`namespace`, `name`), `store` (`local`, `peer`), `share` (`enabled`, `peers`, `last_sync_ms`, `last_error`), `snapshot`, `controller` (`url`, `desired`, `last_ok_ms`, `last_error`, `startup` : `state`, `fallback`, `timeout` en secondes ; ou `null` sans contrôleur) | |
 | `GET /openapi/inbound` | OpenAPI de l'API du service, vue par ce pod | |
 | `GET /openapi/outbound` | liste des authorities sortantes découvertes | |
@@ -56,8 +57,42 @@ Exemples :
 curl -s http://127.0.0.1:15100/api/status | jq '{mode, snapshot, controller}'
 curl -s 'http://127.0.0.1:15100/exchanges?direction=outbound&limit=5' | jq '.[].path'
 curl -s http://127.0.0.1:15100/openapi/outbound | jq .
+curl -s 'http://127.0.0.1:15100/api/unmatched?limit=10' | jq '.entries[] | "\(.method) \(.authority)\(.path) ×\(.count)"'
 curl -X POST http://127.0.0.1:15100/share/sync
 ```
+
+### Requêtes sans réponse du mock
+
+`GET /api/unmatched` répond à la question « pourquoi ce `599` ? » : chaque requête que le mock
+refuse (`599` sans enregistrement correspondant avec `mock.unmatched: error`, `413` body au-delà
+de `capture.max_body_bytes`) y est agrégée par clé (authority, méthode, forme du chemin,
+raison).
+
+```json
+{
+  "total": 53,
+  "entries": [
+    {"authority": "api.stripe.com:443", "method": "GET", "path": "/v1/customers/{id}",
+     "reason": "unmatched", "count": 52, "first_ms": 1792677780000, "last_ms": 1792677787000},
+    {"authority": "quote:8080", "method": "POST", "path": "/upload",
+     "reason": "too_large", "count": 1, "first_ms": 1792677781000, "last_ms": 1792677781000}
+  ]
+}
+```
+
+| Champ | Sens |
+|-------|------|
+| `total` | requêtes refusées depuis l'entrée en mock, y compris celles des clés évincées |
+| `path` | **forme** du chemin, jamais ses valeurs : identifiants en `{int}`, `{uuid}`, `{id}` ; e-mail, carte, JWT, IBAN ou marqueur en `{redacted}` ; jeton ou segment long en `{opaque}` ; ni query, ni headers, ni body ; 256 caractères au plus |
+| `reason` | `unmatched` (`599`) ou `too_large` (`413`) |
+| `count`, `first_ms`, `last_ms` | occurrences, première et dernière (ms Unix) |
+
+Bornes : 100 clés en mémoire ; une clé nouvelle évince la moins récemment vue. Tri : la plus
+récemment vue d'abord. Le relevé repart de zéro quand le sidecar entre en `mock` ou
+`mock-partial` depuis un autre mode, ou charge un autre snapshot ; il reste lisible après le
+retour en `record`. Une requête relayée faute de correspondance (`mock-partial`,
+`mock.unmatched: passthrough`) n'y figure pas. Sous contrôleur, les 20 clés les plus récentes
+remontent dans le battement : voir `/v1/workloads` et `mimicctl report` pour le workload entier.
 
 > **Écart avec la spec.** Le filtre `GET /exchanges?path=…` de la spec (§9.2) n'existe pas ;
 > `GET /api/status` et `GET /openapi/outbound` (liste) existent mais ne sont pas dans la spec.
@@ -79,7 +114,7 @@ peut désigner la passive, qui répond `503 réplique passive du contrôleur : l
 | Route | Contenu |
 |-------|---------|
 | `/` | « Workloads observés » : namespace, workload, mode souhaité (ou `libre` sans `MimicWorkload`), pods alignés, échanges en mémoire ; lien vers `/metrics` |
-| `/ui/{ns}/{wl}` | mode souhaité, snapshot, alignement et raison ; commandes `kubectl patch` prêtes à copier (et la commande `kubectl apply` si la ressource n'existe pas) ; pods avec leur dernier battement et leur état (`aligné`, `en cours d'alignement`, `absent`, `non sélectionné`) ; API découvertes (service et dépendances) ; snapshots ; 50 dernières requêtes et liens d'export k6, JSONL, JSON |
+| `/ui/{ns}/{wl}` | mode souhaité, snapshot, alignement et raison ; commandes `kubectl patch` prêtes à copier (et la commande `kubectl apply` si la ressource n'existe pas) ; pods avec leurs requêtes sans réponse, leur dernier battement et leur état (`aligné`, `en cours d'alignement`, `absent`, `non sélectionné`) ; requêtes sans réponse du mock agrégées sur les pods sélectionnés (méthode, dépendance, forme du chemin, `599` ou `413`, occurrences, dernière) ; API découvertes (service et dépendances) ; snapshots ; 50 dernières requêtes et liens d'export k6, JSONL, JSON |
 
 ### API de lecture
 
@@ -90,7 +125,7 @@ Toutes en `GET`, JSON sauf mention contraire. `{ns}` et `{wl}` doivent être des
 |-------|---------|
 | `/healthz` | `ok` |
 | `/metrics` | métriques du contrôleur (voir [Métriques](Metriques.md#contrôleur)) |
-| `/v1/workloads` | pour chaque workload : `namespace`, `name`, `spec`, `desired`, `pods` (`instance`, `mode`, `snapshot`, `capture_inbound`, `mock_websocket`, `last_seen_ms`, `state`, `selected`), `selected_pods`, `aligned`, `ready`, `reason` |
+| `/v1/workloads` | pour chaque workload : `namespace`, `name`, `spec`, `desired`, `pods` (`instance`, `mode`, `snapshot`, `capture_inbound`, `mock_websocket`, `unmatched` tel qu'annoncé, absent pour un sidecar antérieur, `last_seen_ms`, `state`, `selected`), `selected_pods`, `aligned`, `ready`, `reason`, `unmatched` (relevé fusionné des pods sélectionnés : totaux additionnés, occurrences des mêmes clés additionnées, 50 clés au plus, même format que `/api/unmatched` du sidecar) |
 | `/v1/workloads/{ns}/{wl}/mode` | état souhaité courant (`mode`, `snapshot`, `capture_inbound`, `mock_websocket`, `selector`) |
 | `/v1/workloads/{ns}/{wl}/snapshots` | snapshots sur le support : `id`, `size`, `modified_ms`, du plus récent au plus ancien |
 | `/v1/workloads/{ns}/{wl}/snapshots/{id}` | snapshot complet, JSONL (`404 snapshot inconnu`) |
@@ -101,6 +136,7 @@ Toutes en `GET`, JSON sauf mention contraire. `{ns}` et `{wl}` doivent être des
 
 ```sh
 curl -s http://127.0.0.1:8081/v1/workloads | jq '.[] | {namespace, name, aligned, reason}'
+curl -s http://127.0.0.1:8081/v1/workloads | jq '.[] | select(.unmatched.total > 0) | {name, unmatched}'
 curl -s http://127.0.0.1:8081/v1/workloads/shop/checkout/snapshots | jq '.[0]'
 curl -s 'http://127.0.0.1:8081/v1/workloads/shop/checkout/requests?format=k6&limit=2000' > replay.js
 ```
@@ -120,7 +156,7 @@ le namespace, le workload (annotation `mimic.platform.io/workload` ou labels) et
 | Méthode, route | Usage | Réponses |
 |----------------|-------|----------|
 | `GET /healthz` | sondes | `ok` |
-| `POST /v1/workloads/{ns}/{wl}/heartbeat` | battement : `{instance, mode, snapshot, capture_inbound, mock_websocket}` → état souhaité du pod | `200` |
+| `POST /v1/workloads/{ns}/{wl}/heartbeat` | battement : `{instance, mode, snapshot, capture_inbound, mock_websocket, unmatched}` → état souhaité du pod. `unmatched` (relevé des 20 clés les plus récentes) est facultatif : un contrôleur d'une version antérieure l'ignore, un relevé illisible est ignoré sans refuser le battement, et le contrôleur n'en garde que 20 clés | `200` ; `413` au-delà de 64 KiB |
 | `POST /v1/workloads/{ns}/{wl}/segments?instance=&segment=` | segment JSONL (64 MiB au plus) | `201` nouveau, `200` doublon ; `400 identifiant de segment invalide: …`, `400 instance réservée: …`, `400 ligne <n>: …` ; `503 support indisponible` |
 | `GET /v1/workloads/{ns}/{wl}/segments`, `GET …/segments/{instance}/{file}` | lecture des segments | `404 segment inconnu` |
 | `GET /v1/workloads/{ns}/{wl}/snapshots/{id}` | snapshot complet (sidecars d'une version antérieure) | `404 snapshot inconnu` |

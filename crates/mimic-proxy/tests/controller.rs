@@ -921,6 +921,37 @@ async fn shr_11_two_sidecars_load_the_same_mock_form_and_serve_the_same() {
     assert_eq!(saas.hits(), hits, "rien n'est sorti");
 }
 
+/// Le relevé des requêtes sans réponse voyage dans le battement jusqu'à la vue du workload
+/// (MCK-27, CTL-42 de bout en bout).
+#[tokio::test]
+async fn mck_27_heartbeat_carries_the_unmatched_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctl = controller(dir.path(), None).await;
+    let saas = fake_server().await;
+    let a = proxy(piloted(None, &ctl, dir.path(), "api-a")).await;
+    let desired = apply(&ctl, "mock", None).await;
+    converged(&[&a], "mock", &desired["snapshot"]).await;
+    for n in 0..25 {
+        assert_eq!(served(&a, &saas.url(&format!("/p{n}/1"))).await.0, 599);
+    }
+    eventually("relevé reçu par le contrôleur", || async {
+        ui_json(&ctl, "/v1/workloads").await[0]["unmatched"]["total"] == 25
+    })
+    .await;
+    let wl = ui_json(&ctl, "/v1/workloads").await;
+    let pod = &wl[0]["pods"][0];
+    assert_eq!(pod["unmatched"]["total"], 25, "{wl}");
+    let entries = pod["unmatched"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 20, "au plus 20 clés dans le battement");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e["path"].as_str().unwrap().ends_with("/{int}")),
+        "{wl}"
+    );
+    assert_eq!(saas.hits(), 0, "rien n'est sorti");
+}
+
 /// `/readyz` : code et texte (état de la barrière de démarrage, §5.5.5).
 async fn readyz(p: &Running) -> (u16, String) {
     let r = client().get(admin(p, "/readyz")).send().await.unwrap();

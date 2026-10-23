@@ -200,7 +200,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 
 /// Date grégorienne d'un nombre de jours depuis le 1er janvier 1970 (algorithme de
 /// H. Hinnant, `civil_from_days`).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

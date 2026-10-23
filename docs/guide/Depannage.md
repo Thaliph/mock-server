@@ -125,9 +125,9 @@ de `/api/status`, sous la forme `<méthode> <chemin>: <code> <motif> <body>`.
 
 | Symptôme | Diagnostic | Cause probable |
 |----------|------------|----------------|
-| `599` avec `x-mimic-unmatched: true` | `mimic_mock_responses_total{match="unmatched"}` par authority | opération (authority `hôte:port`, méthode, forme du chemin) jamais enregistrée, ou enregistrée sans body rejouable (tronqué, JSON illisible) ; authority différente (port, nom) |
+| `599` avec `x-mimic-unmatched: true` | **quelle requête** : `mimicctl report <wl> -n <ns>` (section « Requêtes sans réponse du mock »), `/ui/<ns>/<wl>`, ou `GET /api/unmatched` sur l'admin du pod (`kubectl port-forward pod/<pod> 15100`) ; log `warn` `mock : requête sans réponse enregistrée` du sidecar (`method`, `authority`, `path`, `trace_id`, une ligne par seconde au plus) ; volume : `mimic_mock_responses_total{match="unmatched"}` par authority | opération (authority `hôte:port`, méthode, forme du chemin) jamais enregistrée, ou enregistrée sans body rejouable (tronqué, JSON illisible) ; authority différente (port, nom) : comparer le `path` et l'`authority` relevés avec `mimicctl report` (opérations découvertes) |
 | réponses incohérentes avec la requête | header `x-mimic-match` (`template`, `fuzzy` et score) | body ou query différents : `mock.match_headers`, stratégie `best` vs `round-robin` |
-| `413 mimic: body trop gros pour le mode mock` | | requête au-delà de `capture.max_body_bytes` |
+| `413 mimic: body trop gros pour le mode mock` | `mimic_mock_responses_total{match="too_large"}` ; `reason: too_large` dans `/api/unmatched` et `mimicctl report` ; log `warn` `mock : body de requête trop gros` | requête au-delà de `capture.max_body_bytes` |
 | `503` avec `x-mimic-websocket: refused` | | `mock.websocket: refuse` (ou `spec.mock.websocket`) |
 | latences rejouées plus courtes ou plus longues | `mimic_mock_injected_latency_seconds` vs `mimic_request_duration_seconds{mode="record"}` | `mock.latency_factor` ; distribution tirée de l'enregistrement |
 | tous les pods ne servent pas la même chose | `mimic_mock_snapshot_exchanges` par pod, `mimicctl status` | pod sans snapshot (téléchargement en échec) ; sidecar sans contrôleur |

@@ -12,6 +12,7 @@ use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 use mimic_core::mock::{MockDecision, MockRequest, MockResponse};
 use mimic_core::model::{Body, Direction, Exchange, Header};
+use mimic_core::unmatched::{self, Reason};
 use tokio::sync::oneshot;
 
 use crate::capture::{Captured, TeeBody};
@@ -658,6 +659,18 @@ async fn serve_mock(
     let body = match Limited::new(body, limit).collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => {
+            // Refus du mock, compté et relevé comme une requête sans correspondance (§5.3).
+            let label = state.metrics.authority(&target.authority);
+            mock_metric(&state, label, "too_large");
+            count_request(
+                &state,
+                Direction::Outbound,
+                mode,
+                label,
+                parts.method.as_str(),
+                413,
+            );
+            refused(&state, Reason::TooLarge, &target.authority, &parts);
             return text(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "mimic: body trop gros pour le mode mock",
@@ -746,6 +759,7 @@ async fn serve_mock(
                 &method,
                 599,
             );
+            refused(&state, Reason::Unmatched, &target.authority, &parts);
             let mut r = text(
                 StatusCode::from_u16(599).expect("599 est un code valide"),
                 "mimic: aucun enregistrement ne correspond à cette requête",
@@ -755,6 +769,20 @@ async fn serve_mock(
             r
         }
     }
+}
+
+/// Requête à laquelle le mock ne répond pas : relevée et journalisée par sa forme, sans
+/// valeur (spec §5.3).
+fn refused(state: &AppState, reason: Reason, authority: &str, parts: &http::request::Parts) {
+    let u = unmatched::Unmatched::new(reason, authority, parts.method.as_str(), parts.uri.path());
+    let trace = parts
+        .headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|t| t.split('-').nth(1))
+        // Identifiant de trace W3C seulement : rien d'autre du header n'atteint le journal.
+        .filter(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()));
+    state.note_unmatched(&u, trace);
 }
 
 /// Réponse servie : celle préparée pour l'enregistrement (headers, body encodé, partagés), plus

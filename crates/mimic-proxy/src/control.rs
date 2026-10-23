@@ -16,6 +16,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use mimic_core::snapshot::{MockSnapshot, Snapshot, digest};
 use mimic_core::startup::Phase;
+use mimic_core::unmatched::{MAX_REPORTED, UnmatchedReport};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{InboundCapture, MockWebsocket, Mode, ShareConfig, StartupFallback};
@@ -191,6 +192,7 @@ impl ControllerClient {
         snapshot: Option<String>,
         capture: InboundCapture,
         websocket: MockWebsocket,
+        unmatched: &UnmatchedReport,
     ) -> Result<Desired, String> {
         let body = serde_json::json!({
             "instance": self.instance,
@@ -198,6 +200,8 @@ impl ControllerClient {
             "snapshot": snapshot,
             "capture_inbound": capture.as_str(),
             "mock_websocket": websocket.as_str(),
+            // Ignoré par un contrôleur d'une version antérieure (spec §9.2b).
+            "unmatched": unmatched,
         });
         let b = self
             .call(
@@ -559,6 +563,7 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Beat {
             loaded.clone(),
             state.inbound_capture(),
             state.mock_websocket(),
+            &state.unmatched_report(MAX_REPORTED),
         )
         .await
     {

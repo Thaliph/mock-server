@@ -3,7 +3,7 @@
 
 pub mod load;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use kube::api::ObjectMeta;
@@ -11,6 +11,7 @@ use mimic_controller::crd::{
     CaptureSpec, INBOUND_CAPTURES, LabelSelector, MOCK_WEBSOCKETS, MODES, MimicWorkload,
     MimicWorkloadSpec, MockSpec,
 };
+use mimic_core::unmatched::{UnmatchedReport, format_utc};
 use serde_json::Value;
 
 /// Document OpenAPI à exporter.
@@ -173,6 +174,64 @@ pub fn export_path(namespace: &str, workload: &str, target: &Target) -> String {
     }
 }
 
+/// Authorities des dépendances connues, d'après `…/operations`, triées.
+pub fn outbound_authorities(operations: &[Value]) -> Vec<String> {
+    operations
+        .iter()
+        .filter(|o| o["direction"] == "outbound")
+        .filter_map(|o| o["authority"].as_str())
+        .map(String::from)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Hôte d'une authority `hôte:port` (`[::1]:443` compris) ; l'authority entière sans port.
+fn host_of(authority: &str) -> &str {
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && (!host.contains(':') || host.ends_with(']')) =>
+        {
+            host
+        }
+        _ => authority,
+    }
+}
+
+/// Authority à exporter (spec §9.5) : `hôte:port` connu, ou l'hôte seul s'il n'a qu'une
+/// authority connue ; sinon une erreur qui liste les authorities connues.
+pub fn resolve_authority(arg: &str, known: &[String]) -> Result<String, String> {
+    if known.iter().any(|a| a == arg) {
+        return Ok(arg.to_string());
+    }
+    let list = |l: &[&String]| l.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ");
+    let all: Vec<&String> = known.iter().collect();
+    if host_of(arg) == arg {
+        let same: Vec<&String> = known.iter().filter(|a| host_of(a) == arg).collect();
+        match same.as_slice() {
+            [one] => return Ok((*one).clone()),
+            [] => {}
+            several => {
+                return Err(format!(
+                    "plusieurs dépendances pour l'hôte {arg} : {} ; préciser le port (--outbound hôte:port)",
+                    list(several)
+                ));
+            }
+        }
+    }
+    if all.is_empty() {
+        return Err(format!(
+            "dépendance {arg} inconnue : aucune dépendance découverte pour ce workload"
+        ));
+    }
+    Err(format!(
+        "dépendance {arg} inconnue ; authorities connues : {}",
+        list(&all)
+    ))
+}
+
 pub fn requests_path(namespace: &str, workload: &str, format: &str, limit: usize) -> String {
     format!(
         "{}/requests?direction=inbound&format={format}&limit={limit}",
@@ -204,6 +263,7 @@ pub fn status_table(items: &[MimicWorkload]) -> String {
         "WORKLOAD".into(),
         "MODE".into(),
         "SNAPSHOT".into(),
+        "UNMATCHED".into(),
         "ALIGNED".into(),
     ]];
     for mw in items {
@@ -234,10 +294,12 @@ pub fn status_table(items: &[MimicWorkload]) -> String {
             mw.metadata.name.clone().unwrap_or_default(),
             mode,
             snapshot,
+            // Relevé des battements, indépendant de la génération (spec §5.5.1).
+            status.unmatched.to_string(),
             format!("{aligned}/{}", status.pods),
         ]);
     }
-    let widths: Vec<usize> = (0..5)
+    let widths: Vec<usize> = (0..6)
         .map(|i| rows.iter().map(|r| r[i].len()).max().unwrap_or(0))
         .collect();
     rows.iter()
@@ -264,6 +326,9 @@ pub struct WorkloadData {
     pub aligned: usize,
     pub operations: Vec<Value>,
     pub requests: Vec<Value>,
+    /// Relevé agrégé des requêtes sans réponse du mock (`unmatched` de `/v1/workloads`) ;
+    /// vide pour un contrôleur d'une version antérieure.
+    pub unmatched: UnmatchedReport,
 }
 
 /// Longueur maximale d'une valeur de header dans le rapport.
@@ -277,18 +342,19 @@ pub fn report_markdown(workloads: &[WorkloadData], top: usize) -> String {
         md.push_str("Aucun workload connu du contrôleur.\n");
         return md;
     }
-    md.push_str("| Workload | Mode | Pods alignés | API | Opérations | Appels |\n|---|---|---:|---:|---:|---:|\n");
+    md.push_str("| Workload | Mode | Pods alignés | API | Opérations | Appels | Sans réponse |\n|---|---|---:|---:|---:|---:|---:|\n");
     for w in workloads {
         let apis = apis(&w.operations);
         let _ = writeln!(
             md,
-            "| [{ns}/{name}](#{ns}{name}) | {} | {}/{} | {} | {} | {} |",
+            "| [{ns}/{name}](#{ns}{name}) | {} | {}/{} | {} | {} | {} | {} |",
             w.mode.as_deref().unwrap_or("libre"),
             w.aligned,
             w.pods,
             apis.len(),
             w.operations.len(),
             apis.values().map(|a| a.1).sum::<u64>(),
+            w.unmatched.total,
             ns = w.namespace,
             name = w.name,
         );
@@ -334,6 +400,7 @@ fn workload_section(md: &mut String, w: &WorkloadData, top: usize) {
         w.aligned,
         w.pods
     );
+    unmatched_section(md, &w.unmatched);
     if w.operations.is_empty() {
         md.push_str("Aucun trafic observé.\n");
         return;
@@ -389,6 +456,33 @@ fn workload_section(md: &mut String, w: &WorkloadData, top: usize) {
     for (i, op) in ops.iter().enumerate() {
         headers_section(md, i + 1, op, &w.requests);
     }
+}
+
+/// Requêtes sans réponse du mock, dans l'ordre du relevé (spec §5.3, §9.5).
+fn unmatched_section(md: &mut String, u: &UnmatchedReport) {
+    let _ = write!(
+        md,
+        "### Requêtes sans réponse du mock\n\n{} requête(s) refusée(s) par le mock (`599` sans enregistrement, `413` body trop gros).\n\n",
+        u.total
+    );
+    if u.entries.is_empty() {
+        md.push_str("Aucune requête sans réponse relevée.\n\n");
+        return;
+    }
+    md.push_str("| Méthode | API | Chemin | Code | Occurrences | Dernière (UTC) |\n|---|---|---|---:|---:|---|\n");
+    for e in &u.entries {
+        let _ = writeln!(
+            md,
+            "| {} | `{}` | `{}` | {} | {} | {} |",
+            cell(&e.method),
+            cell(&e.authority),
+            cell(&e.path),
+            e.reason.status(),
+            e.count,
+            format_utc(e.last_ms)
+        );
+    }
+    md.push('\n');
 }
 
 fn headers_section(md: &mut String, rank: usize, op: &Value, requests: &[Value]) {

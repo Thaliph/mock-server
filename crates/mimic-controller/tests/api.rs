@@ -723,3 +723,137 @@ async fn ctl_23_mock_form_is_light_compressed_and_identical_for_every_pod() {
     let (status, _, _) = mock_form(&c, "0000000000000000", "tok-a", None, None).await;
     assert_eq!(status, 404);
 }
+
+/// Relevé de requêtes sans réponse tel qu'un sidecar l'annonce (spec §5.3).
+fn unmatched_entry(
+    method: &str,
+    path: &str,
+    reason: &str,
+    count: u64,
+    first: u64,
+    last: u64,
+) -> Value {
+    json!({
+        "authority": "api.saas.io:443", "method": method, "path": path, "reason": reason,
+        "count": count, "first_ms": first, "last_ms": last,
+    })
+}
+
+async fn beat(c: &Running, instance: &str, body: Value) -> reqwest::StatusCode {
+    client()
+        .post(url(c, &format!("{WL}/heartbeat")))
+        .bearer_auth(token_of(instance))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn ctl_42_unmatched_requests_reach_the_workload_views_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    let a = json!({
+        "total": 3,
+        "entries": [
+            unmatched_entry("POST", "/orders", "unmatched", 1, 2_000, 2_000),
+            unmatched_entry("GET", "/users/{int}", "unmatched", 2, 1_000, 1_500),
+        ],
+    });
+    let b = json!({
+        "total": 5,
+        "entries": [
+            unmatched_entry("GET", "/users/{int}", "unmatched", 4, 500, 3_000),
+            unmatched_entry("POST", "/upload", "too_large", 1, 2_500, 2_500),
+        ],
+    });
+    let hb = |instance: &str, unmatched: Option<&Value>| {
+        let mut v = json!({"instance": instance, "mode": "mock", "snapshot": null});
+        if let Some(u) = unmatched {
+            v["unmatched"] = u.clone();
+        }
+        v
+    };
+    assert_eq!(
+        beat(&c, "checkout-a", hb("checkout-a", Some(&a))).await,
+        200
+    );
+    // Champ inconnu (sidecar d'une version ultérieure) : ignoré.
+    let mut future = hb("checkout-b", Some(&b));
+    future["future"] = json!(1);
+    assert_eq!(beat(&c, "checkout-b", future).await, 200);
+
+    let list = get_json(&c, "/v1/workloads").await;
+    let wl = &list[0];
+    let pod = |wl: &Value, name: &str| {
+        wl["pods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["instance"] == name)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(pod(wl, "checkout-a")["unmatched"], a);
+    assert_eq!(pod(wl, "checkout-b")["unmatched"], b);
+    assert_eq!(wl["unmatched"]["total"], 8, "{wl}");
+    assert_eq!(
+        wl["unmatched"]["entries"],
+        json!([
+            unmatched_entry("GET", "/users/{int}", "unmatched", 6, 500, 3_000),
+            unmatched_entry("POST", "/upload", "too_large", 1, 2_500, 2_500),
+            unmatched_entry("POST", "/orders", "unmatched", 1, 2_000, 2_000),
+        ]),
+        "{wl}"
+    );
+
+    let html = client()
+        .get(ui(&c, "/ui/shop/checkout"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("Requêtes sans réponse du mock"), "{html}");
+    assert!(html.contains("/users/{int}"), "{html}");
+    assert!(html.contains("api.saas.io:443"), "{html}");
+
+    let ctl = c.state().clone();
+    let unmatched_status = || {
+        let ctl = ctl.clone();
+        async move {
+            ctl.with_live("shop", "checkout", |w| {
+                mimic_controller::reconcile::status_of(&w.desired, &ctl.summary(w), w.generation)
+                    .unmatched
+            })
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(unmatched_status().await, 8);
+
+    // Sidecar d'une version antérieure : pas de relevé, il compte pour 0.
+    assert_eq!(beat(&c, "checkout-a", hb("checkout-a", None)).await, 200);
+    let wl = &get_json(&c, "/v1/workloads").await[0];
+    assert_eq!(wl["unmatched"]["total"], 5, "{wl}");
+    assert_eq!(unmatched_status().await, 5);
+
+    // Un relevé trop long est borné à 20 clés par pod.
+    let entries: Vec<Value> = (0..30)
+        .map(|i| unmatched_entry("GET", &format!("/p{i}"), "unmatched", 1, i, i))
+        .collect();
+    let long = json!({"total": 30, "entries": entries});
+    assert_eq!(
+        beat(&c, "checkout-a", hb("checkout-a", Some(&long))).await,
+        200
+    );
+    let wl = &get_json(&c, "/v1/workloads").await[0];
+    let kept = pod(wl, "checkout-a")["unmatched"]["entries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(kept.len(), 20, "{wl}");
+    assert_eq!(kept[0]["path"], "/p0");
+}

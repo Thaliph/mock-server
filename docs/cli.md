@@ -95,11 +95,13 @@ mimicctl status [<workload>] [-n ns | -A]
 ```
 
 ```
-NAMESPACE   WORKLOAD   MODE   SNAPSHOT           ALIGNED
-shop        checkout   mock   3f9a0c1e5b7d2a46   3/3
+NAMESPACE   WORKLOAD   MODE   SNAPSHOT           UNMATCHED   ALIGNED
+shop        checkout   mock   3f9a0c1e5b7d2a46   12          3/3
 ```
 
-`ALIGNED` compte les pods qui appliquent l'état souhaité (mode, snapshot et capture) sur les
+`UNMATCHED` compte les requêtes refusées par le mock (`599` sans enregistrement, `413` body
+trop gros) depuis l'entrée en mock, sur les pods sélectionnés ; le détail est dans
+`mimicctl report`. `ALIGNED` compte les pods qui appliquent l'état souhaité (mode, snapshot et capture) sur les
 pods vus récemment, parmi les seuls pods sélectionnés quand la ressource a un `selector`. Un
 mode refusé par le garde-fou production est affiché `mock (refusé)`. Juste
 après une bascule, tant que le contrôleur n'a pas publié le statut de la nouvelle
@@ -116,7 +118,10 @@ mimicctl export <workload> (--inbound | --outbound <authority>) \
   [--openapi-version 3.1|3.0] [-o fichier] [-n ns]
 ```
 
-`--inbound` donne l'API du service, `--outbound api.stripe.com` celle d'une dépendance.
+`--inbound` donne l'API du service, `--outbound api.stripe.com:443` celle d'une dépendance,
+par son authority `hôte:port` telle que la découverte la nomme. L'hôte seul
+(`--outbound api.stripe.com`) suffit s'il n'a qu'une authority connue ; sinon la commande
+échoue en listant les authorities connues.
 Avec `-o`, l'extension choisit le format (`.yaml`/`.yml` : YAML, sinon JSON) ; sans `-o`,
 JSON sur la sortie standard. `--openapi-version 3.0` convertit pour les outils qui ne lisent
 pas encore 3.1.
@@ -151,8 +156,9 @@ mimicctl report [<workload>] [-n ns | -A] [--top n]
 
 Markdown : pour chaque workload, son mode et ses pods, les API découvertes (le service puis
 chaque dépendance) avec leurs opérations et appels, et les `n` opérations les plus appelées
-(10 par défaut) avec codes, latences p50/p99 et headers d'une requête enregistrée. Fait pour
-le résumé d'un job GitHub Actions :
+(10 par défaut) avec codes, latences p50/p99 et headers d'une requête enregistrée, et les
+requêtes sans réponse du mock (méthode, API, forme du chemin, `599` ou `413`, occurrences,
+dernière occurrence). Fait pour le résumé d'un job GitHub Actions :
 
 ```sh
 mimicctl report -n shop >> "$GITHUB_STEP_SUMMARY"
