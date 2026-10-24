@@ -6,7 +6,7 @@
 |---------|------|
 | `namespace.yaml` | namespace `mimic-system`, PriorityClass `mimic-control-plane` du webhook et du contrôleur |
 | `crd.yaml` | CRD `MimicWorkload`, générée par `mimic-controller crd` |
-| `rbac.yaml` | droits du contrôleur, rôles `mimic-operator` (bascule), `mimic-viewer` et `mimic-cli` (port-forward de `mimicctl`) |
+| `rbac.yaml` | droits du contrôleur, rôles `mimic-operator` (bascule), `mimic-viewer`, `mimic-data-viewer` (lecture des données d'un namespace par l'API agrégée) et `mimic-cli` (port-forward des exploitants) |
 | `certificates.yaml` | CA dédiée et certificat du contrôleur (cert-manager), CA publiée dans les namespaces (trust-manager) |
 | `controller.yaml` | configuration, PVC, Deployment (deux réplicas, une active), Service, PodDisruptionBudget, NetworkPolicy |
 | `production-guard.yaml` | facultatif (Kubernetes ≥ 1.30) : `ValidatingAdmissionPolicy` qui refuse une `MimicWorkload` en `mock` ou `mock-partial` dans un namespace labellisé `env=production` |
@@ -31,10 +31,14 @@ d'aucune intervention. Un fichier illisible pendant l'échange du Secret est ign
 le webhook et le contrôleur. Le webhook et le contrôleur tournent sous l'UID et le GID
 1338, comme le sidecar (jamais 1337, l'UID d'istio-proxy, que le mesh ne redirige pas).
 
-**Accès de `mimicctl`** : `export`, `requests` et `report` ouvrent un port-forward vers la
-réplique active ; le Role `mimic-cli` (`rbac.yaml`) en donne les droits dans `mimic-system`
-(`get`, `list` sur les pods, `create` sur `pods/portforward`) :
-`kubectl -n mimic-system create rolebinding mimic-cli --role=mimic-cli --group=<équipe>`.
+**Accès de `mimicctl`** : `export`, `requests`, `report` et `snapshot ls|export` lisent par
+l'API agrégée `data.mimic.platform.io` (`APIService` de `controller.yaml`, CA injectée par
+cert-manager) ; une équipe y a accès dans son namespace par le ClusterRole `mimic-data-viewer` :
+`kubectl -n <ns> create rolebinding mimic-data --clusterrole=mimic-data-viewer --group=<équipe>`.
+Prérequis : l'agrégation de l'API server (front proxy, `--requestheader-*`), active sur kubeadm,
+kind et les offres managées. Les écritures de snapshots (`snapshot pin|import|gc`) ouvrent un
+port-forward vers la réplique active, avec le Role `mimic-cli` (tous namespaces, exploitants) :
+`kubectl -n mimic-system create rolebinding mimic-cli --role=mimic-cli --group=<exploitants>`.
 
 **Priorité** : le webhook et le contrôleur portent la PriorityClass `mimic-control-plane`
 (1 000 000, `namespace.yaml`), au-dessus des workloads, sous les classes `system-*` : mimic

@@ -18,18 +18,27 @@ les droits de son utilisateur :
 
 | Commandes | Droits nécessaires |
 |-----------|--------------------|
-| `mode` | `create` et `patch` sur `mimicworkloads` du namespace, `get` sur le namespace (rôle `mimic-operator`) |
+| `mode` | `create` et `patch` sur `mimicworkloads` du namespace, `get` sur le namespace (rôle `mimic-operator`) ; `list` sur `pods` du namespace pour vérifier que le workload existe |
 | `status` | `list` sur `mimicworkloads` (rôle `mimic-viewer`, agrégé à `view`) |
-| `export`, `requests`, `report` | `list` sur `pods` et `create` sur `pods/portforward` dans `mimic-system` (`report` lit aussi `mimicworkloads`) |
-| `load <workload>` | ceux de `requests` (l'isolement et les pods sont lus sur le contrôleur, pas dans l'API Kubernetes), plus `get`/`list` sur `pods` de `metrics.k8s.io` dans le namespace du workload (relevés CPU et mémoire) |
+| `export`, `requests`, `report`, `snapshot ls`, `snapshot export` | `get` et `list` sur `workloads` et ses sous-ressources du groupe `data.mimic.platform.io`, **dans le namespace du workload** (ClusterRole `mimic-data-viewer` lié par RoleBinding) ; `report -A` : le même droit sur tout le cluster (ClusterRoleBinding) |
+| `snapshot pin`, `snapshot import`, `snapshot gc` | `list` sur `pods` et `create` sur `pods/portforward` dans `mimic-system` (Role `mimic-cli`, exploitants) |
+| `load <workload>` | ceux de `requests`, plus `get`/`list` sur `pods` de `metrics.k8s.io` dans le namespace du workload (relevés CPU et mémoire) |
 | `load --from <fichier>` sans workload | aucun : ni cluster, ni vérification, ni relevé |
 | `diff` | aucun : deux fichiers locaux |
 
-`export`, `requests`, `report` et `load` ouvrent un port-forward vers le port 8081 d'un pod du
-contrôleur : celui qui est en marche et porte `mimic.platform.io/leader=true`, sinon le
-premier en marche. Comme `kubectl port-forward`, aucun port n'est exposé hors du cluster.
-Pendant une bascule de réplique, la passive répond `503` : relancer la commande quelques
-secondes plus tard.
+**Lectures** (`export`, `requests`, `report`, `load`, `snapshot ls`, `snapshot export`) : par
+l'API agrégée `data.mimic.platform.io/v1alpha1` (spec §9.2c), comme `kubectl top` passe par
+metrics-server. L'API server authentifie l'utilisateur avec le kubeconfig (certificat, OIDC,
+plugin `exec`…), le contrôleur vérifie ses droits sur le namespace et le workload demandés :
+une équipe lit ses workloads, et rien d'autre. Si le groupe n'est pas servi (APIService
+absente, cluster plus ancien), `mimicctl` se replie sur le port-forward.
+
+**Écritures** (`snapshot pin|import|gc`) et repli : un port-forward vers le port 8081 d'un pod
+du contrôleur, celui qui est en marche et porte `mimic.platform.io/leader=true`, sinon le
+premier en marche. Comme `kubectl port-forward`, aucun port n'est exposé hors du cluster ;
+l'interface ainsi ouverte voit **tous** les namespaces, d'où le Role `mimic-cli` réservé aux
+exploitants. Pendant une bascule de réplique, la passive répond `503` : relancer la commande
+quelques secondes plus tard.
 
 `-n/--namespace` vaut par défaut le namespace du contexte ; `-A/--all-namespaces` couvre
 tous les namespaces (`status` et `report`). Codes de sortie :
@@ -45,7 +54,7 @@ tous les namespaces (`status` et `report`). Codes de sortie :
 ```sh
 mimicctl mode <workload> <passthrough|record|mock|mock-partial> \
   [--snapshot <id>] [--selector k=v[,k=v…]] \
-  [--capture-inbound full|metadata|off] [--mock-websocket relay|refuse] [-n ns]
+  [--capture-inbound full|metadata|off] [--mock-websocket relay|refuse] [--force] [-n ns]
 ```
 
 Crée ou met à jour la `MimicWorkload` du workload par server-side apply (gestionnaire
@@ -58,6 +67,14 @@ reprend pas une option la retire (`mimicctl mode checkout record` remet tout à 
 | `--selector k=v[,k=v…]` | `spec.selector.matchLabels` | seuls ces pods basculent ; les autres gardent le mode de leur configuration |
 | `--capture-inbound` | `spec.capture.inbound` | capture de l'entrant pendant le tir |
 | `--mock-websocket` | `spec.mock.websocket` | `refuse` : poignée de main WebSocket sortante refusée (`503`) en mock |
+| `--force` | | applique même sans pod injecté du workload (voir ci-dessous) |
+
+Existence du workload : sans `MimicWorkload` de ce nom, `mimicctl` cherche dans le namespace
+un pod injecté dont le sidecar porte `MIMIC_WORKLOAD=<workload>` (le nom retenu par le
+webhook : annotation `mimic.platform.io/workload`, sinon label `app.kubernetes.io/name`, sinon
+`app`). S'il n'y en a aucun, il refuse et liste les workloads injectés du namespace : une faute
+de frappe ne crée plus une ressource qui ne pilote rien. `--force` passe outre (workload pas
+encore déployé, ou à zéro réplica). Une `MimicWorkload` existante est toujours mise à jour.
 
 Garde-fou production : `mimicctl` lit les labels du namespace et refuse `mock`/`mock-partial`
 dans un namespace `env=production`, sans rien appliquer. S'il ne peut pas les lire, il avertit
@@ -82,6 +99,9 @@ Succès : `shop/checkout : mode souhaité mock`. Messages d'erreur :
 | `namespace invalide : « X »` | nom de namespace |
 | `le namespace X est labellisé env=production : le mode mock y est refusé (garde-fou production)` | garde-fou |
 | `labels du namespace X illisibles (…) ; le contrôleur appliquera le garde-fou production` | avertissement : pas de droit `get` sur le namespace |
+| `ns/wl : ni MimicWorkload, ni pod injecté de ce workload ; workloads injectés de ns : …. --force pour appliquer quand même (workload pas encore déployé)` | nom mal écrit, ou workload pas encore déployé |
+| `… aucun pod injecté dans ns (label mimic.platform.io/enabled=true du namespace ?)` | namespace sans injection, ou mauvais namespace (`-n`) |
+| `pods de ns illisibles : existence de wl non vérifiée` | avertissement : pas de droit `list` sur les pods ; appliqué quand même |
 | `mise à jour de ns/wl: …` | refus de l'API (droits, conflit de server-side apply avec un autre gestionnaire) |
 | `kubeconfig: …` | pas de kubeconfig valide |
 
@@ -135,10 +155,13 @@ mimicctl export checkout -n shop --outbound api.stripe.com -o stripe.json   # se
 ## `requests`
 
 ```sh
-mimicctl requests <workload> [--format json|jsonl|k6] [--limit n] [-n ns]
+mimicctl requests <workload> [--direction inbound|outbound] [--format json|jsonl|k6] [--limit n] [-n ns]
 ```
 
-Requêtes **entrantes** enregistrées (capture `full`), redactées ; 1000 par défaut. `k6`
+Requêtes enregistrées, redactées ; 1000 par défaut. `--direction inbound` (défaut) : les
+requêtes **reçues** par le service (capture `full`), à rejouer contre lui. `--direction
+outbound` : les appels du service **à ses dépendances**, avec leurs réponses, tels que le mock
+les rejouera : pour vérifier qu'un appel a bien été enregistré avant de basculer. `k6`
 produit un script de rejeu, réglable par variables d'environnement :
 
 | Variable k6 | Défaut | Effet |
@@ -149,6 +172,7 @@ produit un script de rejeu, réglable par variables d'environnement :
 | `ITERATIONS` | nombre de requêtes | itérations au total |
 
 ```sh
+mimicctl requests checkout -n shop --direction outbound --limit 20
 mimicctl requests checkout -n shop --format k6 --limit 2000 > replay.js
 k6 run -e TARGET=http://checkout.shop:8080 -e VUS=20 -e ITERATIONS=5000 -e AUTHORIZATION="Bearer …" replay.js
 ```
@@ -231,10 +255,10 @@ depuis l'endroit où tourne `mimicctl` (`kubectl port-forward svc/checkout 8080`
 ## `snapshot`
 
 Cycle de vie des snapshots (spec §5.6) : écrits une fois (contenu immuable, métadonnées
-versionnées), purgés au-delà de `snapshot.keep_last` sauf référencés et épinglés. Les cinq
-sous-commandes écrivent sur l'interface du contrôleur (port-forward, même RBAC que `export`,
-`requests` et `report`), jamais sur le mode ni le trafic, qui restent pilotés par la ressource
-`MimicWorkload`.
+versionnées), purgés au-delà de `snapshot.keep_last` sauf référencés et épinglés. `ls` et
+`export` lisent par l'API agrégée, comme `export` et `requests` ; `pin`, `import` et `gc`
+écrivent sur l'interface du contrôleur (port-forward, Role `mimic-cli`), jamais sur le mode ni
+le trafic, qui restent pilotés par la ressource `MimicWorkload`.
 
 ```sh
 mimicctl snapshot ls checkout -n shop
@@ -320,9 +344,11 @@ mimicctl diff semaine-derniere.json cette-semaine.json --fail-on-breaking
 | `contrôleur : 503 Service Unavailable réplique passive du contrôleur : …` | bascule de réplique en cours | relancer dans quelques secondes |
 | `dépendance <x> inconnue ; authorities connues : …` | `export --outbound` : ni authority connue, ni hôte d'une seule authority | reprendre une des authorities listées |
 | `plusieurs dépendances pour l'hôte <x> : …` | `export --outbound` avec un hôte qui a plusieurs ports | préciser `hôte:port` |
-| `contrôleur : 404 Not Found dépendance inconnue` | authority absente des API découvertes (contrôleur qui a perdu la dépendance entre la liste et l'export) | vérifier l'authority exacte (`hôte:port`) dans `/ui/<ns>/<wl>` ou `mimicctl report` |
-| `contrôleur : <code> <body>` | autre réponse du contrôleur | voir [Administration et API](Administration-et-API.md) |
-| `pods du contrôleur: …`, `port-forward vers <pod>: …` | droits `pods` `list` ou `pods/portforward` `create` manquants dans `mimic-system`, API injoignable | `kubectl auth can-i create pods/portforward -n mimic-system` |
+| `API server : 404 dépendance inconnue` (`contrôleur : 404 Not Found dépendance inconnue` en repli) | authority absente des API découvertes (contrôleur qui a perdu la dépendance entre la liste et l'export) | vérifier l'authority exacte (`hôte:port`) dans `mimicctl report` |
+| `API server : 403 <utilisateur> ne peut pas get workloads/<sous-ressource> <ns>/<wl> (data.mimic.platform.io) : …` | pas de RoleBinding de `mimic-data-viewer` dans ce namespace | le demander à l'équipe plateforme ; `kubectl auth can-i get workloads.data.mimic.platform.io/requests -n <ns>` |
+| `API server : 503 …` | APIService indisponible (contrôleur arrêté, certificat), ou `SubjectAccessReview` impossible | `kubectl get apiservice v1alpha1.data.mimic.platform.io` (condition `Available`) |
+| `contrôleur : <code> <body>`, `API server : <code> <message>` | autre réponse du contrôleur | voir [Administration et API](Administration-et-API.md) |
+| `pods du contrôleur: …`, `port-forward vers <pod>: …` | écriture de snapshot, ou repli sans API agrégée : droits `pods` `list` ou `pods/portforward` `create` manquants dans `mimic-system`, API injoignable | `kubectl auth can-i create pods/portforward -n mimic-system` |
 
 ## Interface web du contrôleur
 

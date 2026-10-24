@@ -240,7 +240,7 @@ spec:
             backoffLimit: 0
             template:
               spec:
-                serviceAccountName: mimic-load-test   # rôle mimic-operator + pods/portforward dans mimic-system
+                serviceAccountName: mimic-load-test   # rôles mimic-operator et mimic-data-viewer dans ce namespace
                 restartPolicy: Never
                 containers:
                   - name: k6

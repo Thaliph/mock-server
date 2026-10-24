@@ -2,6 +2,7 @@
 //! workload, sert l'interface de découverte, construit les snapshots et porte l'état souhaité
 //! lu dans les ressources `MimicWorkload`. Seule autorité de bascule des sidecars.
 
+pub mod aggregated;
 pub mod api;
 pub mod auth;
 pub mod config;
@@ -22,6 +23,7 @@ use mimic_net::tls::Tls;
 use object_store::ObjectStore;
 use tokio::net::TcpListener;
 
+use crate::aggregated::{Authorizer, KubeAuthorizer};
 use crate::auth::{Authenticator, KubeAuth};
 use crate::config::{AuthConfig, ControllerConfig};
 use crate::leader::{Coordination, Election, Role};
@@ -35,6 +37,8 @@ pub struct Running {
     ctl: Arc<Ctl>,
     api: SocketAddr,
     ui: SocketAddr,
+    /// API agrégée de lecture (spec §9.2c), si configurée.
+    aggregated: Option<SocketAddr>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Élection de la réplique active ; absente : une seule réplique, toujours active.
     election: Option<Arc<Election>>,
@@ -47,6 +51,10 @@ impl Running {
 
     pub fn ui_addr(&self) -> SocketAddr {
         self.ui
+    }
+
+    pub fn aggregated_addr(&self) -> Option<SocketAddr> {
+        self.aggregated
     }
 
     pub fn state(&self) -> &Arc<Ctl> {
@@ -145,7 +153,18 @@ pub async fn start_with(
     config: ControllerConfig,
     store: Arc<dyn ObjectStore>,
 ) -> Result<Running, String> {
-    launch(config, store, None).await
+    launch(config, store, None, None).await
+}
+
+/// Comme `start`, avec l'API agrégée autorisée par `authorizer` au lieu de
+/// `SubjectAccessReview` (tests, hors cluster) ; `aggregated.client_ca_file` est requis.
+pub async fn start_authorized(
+    config: ControllerConfig,
+    authorizer: Arc<dyn Authorizer>,
+) -> Result<Running, String> {
+    config.validate()?;
+    let store = open(&config.store)?;
+    launch(config, store, None, Some(authorizer)).await
 }
 
 /// Réplique élue sur un bail donné (tests, hors cluster) ; `leader_election` est requis.
@@ -157,13 +176,14 @@ pub async fn start_elected(
     if config.leader_election.is_none() {
         return Err("start_elected exige leader_election".into());
     }
-    launch(config, store, Some(coord)).await
+    launch(config, store, Some(coord), None).await
 }
 
 async fn launch(
     config: ControllerConfig,
     store: Arc<dyn ObjectStore>,
     coord: Option<Arc<dyn Coordination>>,
+    authorizer: Option<Arc<dyn Authorizer>>,
 ) -> Result<Running, String> {
     install_crypto_provider();
     config.validate()?;
@@ -182,6 +202,39 @@ async fn launch(
     let tls = match &config.tls {
         Some(files) => Some(Tls::new(files, &[b"h2", b"http/1.1"])?),
         None => None,
+    };
+    // API agrégée : CA du front proxy et autorisation, avant d'écouter (spec §9.2c).
+    let aggregated = match (&config.aggregated, &config.tls) {
+        (Some(agg), Some(files)) => {
+            let (ca, names) = match &agg.client_ca_file {
+                Some(path) => (
+                    std::fs::read_to_string(path).map_err(|e| {
+                        format!("aggregated.client_ca_file {}: {e}", path.display())
+                    })?,
+                    agg.allowed_names.clone(),
+                ),
+                None => {
+                    let client = client
+                        .as_ref()
+                        .ok_or("aggregated sans client_ca_file exige auth kubernetes")?;
+                    let (ca, names) = aggregated::front_proxy_ca(client).await?;
+                    let names = if agg.allowed_names.is_empty() {
+                        names
+                    } else {
+                        agg.allowed_names.clone()
+                    };
+                    (ca, names)
+                }
+            };
+            let authorizer = match (authorizer, &client) {
+                (Some(a), _) => a,
+                (None, Some(client)) => Arc::new(KubeAuthorizer::new(client.clone())),
+                (None, None) => return Err("aggregated exige auth kubernetes".into()),
+            };
+            let tls = Tls::with_client_ca(files, &[b"h2", b"http/1.1"], ca.as_bytes(), names)?;
+            Some((agg.listen, tls, authorizer))
+        }
+        _ => None,
     };
     let election = match &config.leader_election {
         None => None,
@@ -222,6 +275,19 @@ async fn launch(
         .map_err(|e| format!("écoute sur {}: {e}", ctl.config.ui_listen))?;
     let api = api_listener.local_addr().map_err(|e| e.to_string())?;
     let ui = ui_listener.local_addr().map_err(|e| e.to_string())?;
+    let aggregated = match aggregated {
+        Some((listen, tls, authorizer)) => {
+            let listener = TcpListener::bind(listen)
+                .await
+                .map_err(|e| format!("écoute sur {listen}: {e}"))?;
+            Some((listener, tls, authorizer))
+        }
+        None => None,
+    };
+    let aggregated_addr = match &aggregated {
+        Some((l, _, _)) => Some(l.local_addr().map_err(|e| e.to_string())?),
+        None => None,
+    };
     // Les serveurs s'arrêtent avec leurs tâches (`shutdown`, `kill`).
     let mut tasks = vec![
         tokio::spawn(serve(
@@ -239,6 +305,15 @@ async fn launch(
             std::future::pending(),
         )),
     ];
+    if let Some((listener, tls, authorizer)) = aggregated {
+        tasks.push(tokio::spawn(serve(
+            listener,
+            aggregated::router(ctl.clone(), authorizer),
+            Some(tls),
+            ServeOptions::default(),
+            std::future::pending(),
+        )));
+    }
     match &election {
         // La passive n'a ni maintenance ni surveillance : la prise de relais les lance.
         Some(e) => e.spawn(ctl.clone(), client),
@@ -266,6 +341,7 @@ async fn launch(
         ctl,
         api,
         ui,
+        aggregated: aggregated_addr,
         tasks,
         election,
     })

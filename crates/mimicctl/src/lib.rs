@@ -232,11 +232,89 @@ pub fn resolve_authority(arg: &str, known: &[String]) -> Result<String, String> 
     ))
 }
 
-pub fn requests_path(namespace: &str, workload: &str, format: &str, limit: usize) -> String {
+/// Requêtes enregistrées dans un sens (`inbound`, `outbound`), pour le rejeu (spec §5.7).
+pub fn requests_path(
+    namespace: &str,
+    workload: &str,
+    direction: &str,
+    format: &str,
+    limit: usize,
+) -> String {
     format!(
-        "{}/requests?direction=inbound&format={format}&limit={limit}",
+        "{}/requests?direction={direction}&format={format}&limit={limit}",
         base(namespace, workload)
     )
+}
+
+pub use mimic_controller::aggregated::aggregated_path;
+
+/// Liste des workloads connus du contrôleur : tous, ou ceux d'un namespace. Sur l'interface,
+/// le filtre est ignoré (liste complète) ; l'API agrégée l'autorise et l'applique.
+pub fn workloads_path(namespace: Option<&str>) -> String {
+    match namespace {
+        Some(ns) => format!("/v1/workloads?namespace={ns}"),
+        None => "/v1/workloads".into(),
+    }
+}
+
+/// Une réponse de l'API server à une lecture par l'API agrégée appelle le repli sur le
+/// port-forward : seulement `404`, le groupe n'étant pas servi (APIService absente).
+pub fn falls_back(status: u16) -> bool {
+    status == 404
+}
+
+/// Workloads des pods injectés : `MIMIC_WORKLOAD` du sidecar `mimic`, figée à l'admission.
+pub fn injected_workloads(pods: &[k8s_openapi::api::core::v1::Pod]) -> BTreeSet<String> {
+    pods.iter()
+        .filter(|p| {
+            p.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("mimic.platform.io/sidecar"))
+                .is_some_and(|v| v == "true")
+        })
+        .filter_map(|p| p.spec.as_ref())
+        .flat_map(|s| s.init_containers.iter().flatten())
+        .filter(|c| c.name == "mimic")
+        .flat_map(|c| c.env.iter().flatten())
+        .filter(|e| e.name == "MIMIC_WORKLOAD")
+        .filter_map(|e| e.value.clone())
+        .collect()
+}
+
+/// Avant `mimicctl mode` : le workload doit avoir une `MimicWorkload` ou un pod injecté
+/// (spec §9.5). `injected` : `None` si les pods n'ont pas pu être lus, ce qui est signalé
+/// (`Ok(Some(avertissement))`) sans empêcher d'appliquer.
+pub fn check_workload(
+    namespace: &str,
+    workload: &str,
+    resource_exists: bool,
+    injected: Option<&BTreeSet<String>>,
+    force: bool,
+) -> Result<Option<String>, String> {
+    if resource_exists || force {
+        return Ok(None);
+    }
+    let Some(injected) = injected else {
+        return Ok(Some(format!(
+            "pods de {namespace} illisibles : existence de {workload} non vérifiée"
+        )));
+    };
+    if injected.contains(workload) {
+        return Ok(None);
+    }
+    let known = if injected.is_empty() {
+        format!(
+            "aucun pod injecté dans {namespace} (label mimic.platform.io/enabled=true du namespace ?)"
+        )
+    } else {
+        let names: Vec<&str> = injected.iter().map(String::as_str).collect();
+        format!("workloads injectés de {namespace} : {}", names.join(", "))
+    };
+    Err(format!(
+        "{namespace}/{workload} : ni MimicWorkload, ni pod injecté de ce workload ; {known}. \
+         --force pour appliquer quand même (workload pas encore déployé)"
+    ))
 }
 
 pub fn operations_path(namespace: &str, workload: &str) -> String {

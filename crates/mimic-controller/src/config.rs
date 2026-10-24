@@ -45,6 +45,24 @@ pub struct ControllerConfig {
     pub pod_forget: Duration,
     /// Deux réplicas, une seule active (spec §5.5.4) ; absent : une seule réplique, sans bail.
     pub leader_election: Option<LeaderElection>,
+    /// API agrégée de lecture `data.mimic.platform.io/v1alpha1` (spec §9.2c) ; absente,
+    /// pas d'API agrégée.
+    pub aggregated: Option<AggregatedConfig>,
+}
+
+/// API agrégée de lecture (spec §9.2c).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AggregatedConfig {
+    pub listen: SocketAddr,
+    /// CA des certificats clients du front proxy ; absente, `requestheader-client-ca-file`
+    /// du ConfigMap `kube-system/extension-apiserver-authentication`.
+    #[serde(default)]
+    pub client_ca_file: Option<std::path::PathBuf>,
+    /// Noms communs acceptés ; vide, ceux du ConfigMap (`requestheader-allowed-names`),
+    /// ou tout nom si `client_ca_file` est donné.
+    #[serde(default)]
+    pub allowed_names: Vec<String>,
 }
 
 /// Élection de la réplique active par un bail `coordination.k8s.io/v1` (spec §5.5.4).
@@ -121,6 +139,7 @@ impl Default for ControllerConfig {
             pod_timeout: Duration::from_secs(30),
             pod_forget: Duration::from_secs(600),
             leader_election: None,
+            aggregated: None,
         }
     }
 }
@@ -183,6 +202,9 @@ impl ControllerConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.aggregated.is_some() && self.tls.is_none() {
+            return Err("aggregated exige tls (l'API server joint le contrôleur en HTTPS)".into());
+        }
         if !self.store.starts_with("file://") && !self.store.starts_with("s3://") {
             return Err(format!("store non supporté: {}", self.store));
         }

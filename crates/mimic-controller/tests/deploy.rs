@@ -570,7 +570,11 @@ fn sec_08_aggregated_read_api_manifests() {
         .unwrap()
         .iter()
         .any(|r| {
-            r.get("from").is_none()
+            r["from"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|f| f["ipBlock"]["cidr"] == "0.0.0.0/0")
                 && r["ports"]
                     .as_sequence()
                     .unwrap()

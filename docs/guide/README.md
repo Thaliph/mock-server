@@ -16,7 +16,7 @@ connus sont signalés dans les pages concernées).
 |--------|-------------------|
 | Équipes SRE / performance | découverte de l'API d'un service et de ses dépendances sans documentation préalable ; tir de charge d'un pod isolé de ses dépendances (quotas SaaS, environnements hors production) |
 | Équipes plateforme | installation du contrôleur et du webhook, supervision, mises à jour, sécurité |
-| Équipes applicatives | liste des appels réellement faits et reçus, documents OpenAPI exportables, diff d'API d'une semaine à l'autre |
+| Équipes applicatives | liste des appels réellement faits et reçus, documents OpenAPI exportables, diff d'API d'une semaine à l'autre ; commencer par [Développeur applicatif](Developpeur-applicatif.md) |
 
 mimic est conçu pour les environnements **hors production** : les modes `mock` et
 `mock-partial` sont refusés dans un namespace labellisé `env=production` (voir
@@ -37,6 +37,7 @@ mimic est conçu pour les environnements **hors production** : les modes `mock` 
 
 | Page | Contenu |
 |------|---------|
+| [Développeur applicatif](Developpeur-applicatif.md) | pour l'équipe d'un service injecté : glossaire, ce que la plateforme doit fournir, lecture des données, headers `x-mimic-*` et réponses du sidecar (`599`, `502`, `504`, `413`…) |
 | [Architecture](Architecture.md) | composants, flux entrant, sortant, contrôleur et snapshots, ports, schéma |
 | [Installer](Installer.md) | prérequis, ordre d'installation, image, activation de l'injection, vérification, désinstallation |
 | [Configurer](Configurer.md) | sidecar, annotations, webhook, contrôleur, `mimic-init`, CRD `MimicWorkload` champ par champ |

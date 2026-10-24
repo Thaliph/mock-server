@@ -6,11 +6,14 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
+use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::CryptoProvider;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use serde::Deserialize;
 
 /// Relecture par défaut des fichiers du certificat.
@@ -221,12 +224,52 @@ pub struct Tls {
 impl Tls {
     /// `alpn` : protocoles annoncés (`h2`, `http/1.1`), aucun si vide.
     pub fn new(files: &TlsFiles, alpn: &[&[u8]]) -> Result<Self, String> {
+        Self::build(files, alpn, None)
+    }
+
+    /// Comme `new`, avec un certificat client exigé : signé par une CA de `ca_pem` et, si
+    /// `allowed_names` n'est pas vide, de nom commun dans la liste (front proxy de l'API
+    /// server, spec §9.2c). Sinon, la poignée de main échoue.
+    pub fn with_client_ca(
+        files: &TlsFiles,
+        alpn: &[&[u8]],
+        ca_pem: &[u8],
+        allowed_names: Vec<String>,
+    ) -> Result<Self, String> {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(ca_pem) {
+            let cert = cert.map_err(|e| format!("CA cliente: {e}"))?;
+            roots.add(cert).map_err(|e| format!("CA cliente: {e}"))?;
+        }
+        if roots.is_empty() {
+            return Err("CA cliente: aucun certificat".into());
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let inner =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|e| format!("CA cliente: {e}"))?;
+        let verifier = Arc::new(NamedClients {
+            inner,
+            allowed_names,
+        });
+        Self::build(files, alpn, Some(verifier))
+    }
+
+    fn build(
+        files: &TlsFiles,
+        alpn: &[&[u8]],
+        clients: Option<Arc<dyn ClientCertVerifier>>,
+    ) -> Result<Self, String> {
         let reloader = CertReloader::load(files)?;
-        let mut server = rustls::ServerConfig::builder_with_provider(reloader.provider.clone())
+        let builder = rustls::ServerConfig::builder_with_provider(reloader.provider.clone())
             .with_safe_default_protocol_versions()
-            .map_err(|e| e.to_string())?
-            .with_no_client_auth()
-            .with_cert_resolver(reloader.clone());
+            .map_err(|e| e.to_string())?;
+        let builder = match clients {
+            Some(v) => builder.with_client_cert_verifier(v),
+            None => builder.with_no_client_auth(),
+        };
+        let mut server = builder.with_cert_resolver(reloader.clone());
         server.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(Self {
             reloader,
@@ -236,5 +279,73 @@ impl Tls {
 
     pub fn reloader(&self) -> &Arc<CertReloader> {
         &self.reloader
+    }
+}
+
+/// Certificats clients d'une CA, restreints à des noms communs (`requestheader-allowed-names`).
+#[derive(Debug)]
+struct NamedClients {
+    inner: Arc<dyn ClientCertVerifier>,
+    /// Vide : tout nom accepté.
+    allowed_names: Vec<String>,
+}
+
+/// Noms communs du sujet d'un certificat.
+fn common_names(der: &CertificateDer<'_>) -> Vec<String> {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
+        return vec![];
+    };
+    cert.subject()
+        .iter_common_name()
+        .filter_map(|cn| cn.as_str().ok().map(String::from))
+        .collect()
+}
+
+impl ClientCertVerifier for NamedClients {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        if self.allowed_names.is_empty()
+            || common_names(end_entity)
+                .iter()
+                .any(|cn| self.allowed_names.contains(cn))
+        {
+            return Ok(verified);
+        }
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
