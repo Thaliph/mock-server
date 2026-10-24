@@ -137,7 +137,7 @@ le **template** du pod (Deployment, StatefulSet…).
 
 | Annotation | Valeur | Effet |
 |------------|--------|-------|
-| `mimic.platform.io/inject` | `"false"` | pas d'injection ; avertissement `mimic non injecté : injection désactivée par mimic.platform.io/inject` |
+| `mimic.platform.io/inject` | `"false"` | pas d'injection ; avertissement `mimic non injecté : injection désactivée par mimic.platform.io/inject`. En **label** du pod : `"false"` le soustrait au webhook d'un namespace `enabled=true`, `"true"` le désigne dans un namespace `enabled=opt-in` |
 | `mimic.platform.io/workload` | nom | nom du workload (`MIMIC_WORKLOAD`) ; sinon label `app.kubernetes.io/name`, sinon label `app`. Sans nom : pas d'injection |
 | `mimic.platform.io/inbound-ports` | `8080,9090`, `*`, `-` | `MIMIC_INBOUND_PORTS` ; défaut : ports `containerPort` TCP des conteneurs de l'app (hors conteneurs du mesh), sinon `*` ; `-` : aucune interception entrante |
 | `mimic.platform.io/exclude-outbound-cidrs` | liste de CIDR | ajoutés à `exclude_outbound_cidrs` du webhook dans `MIMIC_EXCLUDE_OUTBOUND_CIDRS` |

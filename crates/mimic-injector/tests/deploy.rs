@@ -305,3 +305,77 @@ fn doc_05_documentation_cites_the_shipped_image() {
         assert!(page(name).contains(host), "docs/guide/{name} : {host}");
     }
 }
+
+/// Deux webhooks : tout le namespace (`enabled=true`) ou les pods volontaires
+/// (`enabled=opt-in`) ; jamais le plan de contrôle ni un namespace en arrêt d'urgence (INJ-22).
+#[test]
+fn inj_22_injection_scope_is_chosen_by_the_api_server() {
+    let config = kind("MutatingWebhookConfiguration");
+    let hooks = config["webhooks"].as_sequence().unwrap();
+    let hook = |name: &str| {
+        hooks
+            .iter()
+            .find(|h| h["name"] == name)
+            .unwrap_or_else(|| panic!("webhook {name} absent"))
+    };
+    let all = hook("inject.mimic.platform.io");
+    let opt_in = hook("opt-in.inject.mimic.platform.io");
+    assert_eq!(hooks.len(), 2);
+    let expr = |sel: &serde_yaml::Value, key: &str| {
+        sel["matchExpressions"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("expression {key} absente : {sel:?}"))
+    };
+    for (h, enabled) in [(all, "true"), (opt_in, "opt-in")] {
+        let ns = &h["namespaceSelector"];
+        assert_eq!(ns["matchLabels"]["mimic.platform.io/enabled"], enabled);
+        let names = expr(ns, "kubernetes.io/metadata.name");
+        assert_eq!(names["operator"], "NotIn");
+        for n in ["kube-system", "mimic-system"] {
+            assert!(
+                names["values"]
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == n)
+            );
+        }
+        let stop = expr(ns, "mimic.platform.io/emergency-stop");
+        assert_eq!(stop["operator"], "NotIn");
+        assert_eq!(stop["values"][0], "true");
+        assert_eq!(h["failurePolicy"], "Ignore");
+        assert_eq!(h["reinvocationPolicy"], "IfNeeded");
+        assert_eq!(h["timeoutSeconds"].as_u64(), Some(5));
+        assert_eq!(h["clientConfig"]["service"]["path"], "/mutate");
+        assert_eq!(h["clientConfig"]["service"]["name"], "mimic-injector");
+    }
+    let opt_out = expr(&all["objectSelector"], "mimic.platform.io/inject");
+    assert_eq!(opt_out["operator"], "NotIn");
+    assert_eq!(opt_out["values"][0], "false");
+    assert_eq!(
+        opt_in["objectSelector"]["matchLabels"]["mimic.platform.io/inject"],
+        "true"
+    );
+
+    // La CA du contrôleur atteint les deux sortes de namespaces.
+    let certs: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(include_str!(
+        "../../../deploy/controller/certificates.yaml"
+    ))
+    .map(|d| serde::Deserialize::deserialize(d).unwrap())
+    .collect();
+    let bundle = certs.iter().find(|d| d["kind"] == "Bundle").unwrap();
+    let sel = &bundle["spec"]["target"]["namespaceSelector"];
+    let enabled = expr(sel, "mimic.platform.io/enabled");
+    assert_eq!(enabled["operator"], "In");
+    let values: Vec<&str> = enabled["values"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(values, ["true", "opt-in"]);
+}

@@ -197,13 +197,58 @@ webhooks:
     timeoutSeconds: 5
     # Rappelé si un webhook de mesh (Istio, Linkerd) injecte après lui (spec §9.4).
     reinvocationPolicy: IfNeeded
-    # Le plan de contrôle n'est jamais injecté, même labellisé par erreur.
+    # Tous les pods du namespace, sauf ceux labellisés mimic.platform.io/inject=false.
+    # Le plan de contrôle n'est jamais injecté, même labellisé par erreur, ni un namespace en
+    # arrêt d'urgence (spec §5.5.1).
     namespaceSelector:
       matchLabels: {mimic.platform.io/enabled: "true"}
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
           values: [kube-system, mimic-system]
+        - key: mimic.platform.io/emergency-stop
+          operator: NotIn
+          values: ["true"]
+    # Choisi par l'API server : un pod non concerné n'atteint jamais le webhook.
+    objectSelector:
+      matchExpressions:
+        - key: mimic.platform.io/inject
+          operator: NotIn
+          values: ["false"]
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: mimic-injector
+        namespace: mimic-system
+        path: /mutate
+        port: 443
+  - name: opt-in.inject.mimic.platform.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    # Rappelé si un webhook de mesh (Istio, Linkerd) injecte après lui (spec §9.4).
+    reinvocationPolicy: IfNeeded
+    # Injection par pod : seuls les pods labellisés mimic.platform.io/inject=true.
+    # Le plan de contrôle n'est jamais injecté, même labellisé par erreur, ni un namespace en
+    # arrêt d'urgence (spec §5.5.1).
+    namespaceSelector:
+      matchLabels: {mimic.platform.io/enabled: "opt-in"}
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, mimic-system]
+        - key: mimic.platform.io/emergency-stop
+          operator: NotIn
+          values: ["true"]
+    # Choisi par l'API server : un pod non concerné n'atteint jamais le webhook.
+    objectSelector:
+      matchLabels: {mimic.platform.io/inject: "true"}
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]

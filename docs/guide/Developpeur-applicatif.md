@@ -33,7 +33,7 @@ enregistré, et comment interpréter les réponses que le sidecar fabrique lui-m
 
 | Besoin | Ce que la plateforme fait | Vérifier |
 |--------|---------------------------|----------|
-| injection dans le namespace | label `mimic.platform.io/enabled=true`, et Pod Security `privileged` (l'init container pose des règles iptables avec `NET_ADMIN`) ; puis vos pods sont recréés | `kubectl get pod <pod> -o jsonpath='{.metadata.annotations.mimic\.platform\.io/status}'` vaut `injected` |
+| injection dans le namespace | label `mimic.platform.io/enabled=true` (tous les pods), ou `=opt-in` (seulement vos pods labellisés `mimic.platform.io/inject: "true"`), et Pod Security `privileged` (l'init container pose des règles iptables avec `NET_ADMIN`) ; puis vos pods sont recréés | `kubectl get pod <pod> -o jsonpath='{.metadata.annotations.mimic\.platform\.io/status}'` vaut `injected` |
 | lire vos données (`export`, `requests`, `report`, `snapshot ls`) | RoleBinding du ClusterRole `mimic-data-viewer` dans **votre** namespace : vous lisez vos workloads, rien d'autre | `kubectl auth can-i get workloads.data.mimic.platform.io/requests -n <ns>` |
 | voir le mode et l'alignement (`mimicctl status`) | ClusterRole `mimic-viewer`, déjà agrégé au rôle standard `view` | `kubectl auth can-i list mimicworkloads -n <ns>` |
 | basculer (`mimicctl mode`) | RoleBinding du ClusterRole `mimic-operator` dans votre namespace | `kubectl auth can-i patch mimicworkloads -n <ns>` |

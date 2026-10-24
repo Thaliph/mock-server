@@ -47,6 +47,18 @@ enum Command {
         #[arg(short, long)]
         namespace: Option<String>,
     },
+    /// Arrêt d'urgence : tous les pods du namespace (ou du cluster avec -A) en passthrough
+    /// au prochain battement, plus d'injection (spec §5.5.1).
+    EmergencyStop {
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Tout le cluster : label posé sur mimic-system.
+        #[arg(short = 'A', long, conflicts_with = "namespace")]
+        all_namespaces: bool,
+        /// Lève l'arrêt d'urgence.
+        #[arg(long)]
+        off: bool,
+    },
     /// Mode souhaité, snapshot servi, requêtes sans réponse du mock et pods alignés.
     Status {
         workload: Option<String>,
@@ -330,6 +342,25 @@ async fn run(command: Command) -> Result<i32, String> {
             .await
             .map_err(|e| format!("mise à jour de {ns}/{workload}: {e}"))?;
             println!("{ns}/{workload} : mode souhaité {mode}");
+            Ok(0)
+        }
+        Command::EmergencyStop {
+            namespace: ns,
+            all_namespaces,
+            off,
+        } => {
+            let client = client().await?;
+            let default_ns = client.default_namespace().to_string();
+            let target = mimicctl::emergency_target(ns.as_deref(), all_namespaces, &default_ns);
+            let api: Api<Namespace> = Api::all(client);
+            api.patch(
+                &target,
+                &PatchParams::default(),
+                &Patch::Merge(&mimicctl::emergency_patch(!off)),
+            )
+            .await
+            .map_err(|e| format!("label du namespace {target}: {e}"))?;
+            println!("{}", mimicctl::emergency_message(&target, !off));
             Ok(0)
         }
         Command::Status {

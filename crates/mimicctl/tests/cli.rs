@@ -881,3 +881,27 @@ fn cli_19_requests_direction() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("inbound") && err.contains("outbound"), "{err}");
 }
+
+#[test]
+fn cli_20_emergency_stop_labels_the_namespace() {
+    use mimicctl::{emergency_message, emergency_patch, emergency_target};
+    assert_eq!(
+        emergency_patch(true),
+        json!({"metadata": {"labels": {"mimic.platform.io/emergency-stop": "true"}}})
+    );
+    assert_eq!(
+        emergency_patch(false),
+        json!({"metadata": {"labels": {"mimic.platform.io/emergency-stop": null}}})
+    );
+    assert_eq!(emergency_target(Some("shop"), false, "default"), "shop");
+    assert_eq!(emergency_target(None, false, "team-a"), "team-a");
+    assert_eq!(emergency_target(None, true, "team-a"), "mimic-system");
+
+    let on = emergency_message("shop", true);
+    assert!(on.contains("passthrough"), "{on}");
+    assert!(on.contains("kubectl -n shop rollout restart"), "{on}");
+    let all = emergency_message("mimic-system", true);
+    assert!(all.contains("tous les namespaces"), "{all}");
+    let off = emergency_message("shop", false);
+    assert!(off.contains("levé"), "{off}");
+}

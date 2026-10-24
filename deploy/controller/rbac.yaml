@@ -145,6 +145,18 @@ rules:
     resources: ["pods/portforward"]
     verbs: ["create"]
 ---
+# Arrêt d'urgence (`mimicctl emergency-stop`, spec §5.5.1) : label du namespace. Lié par
+# RoleBinding, ne porte que sur le namespace du RoleBinding ; par ClusterRoleBinding pour -A
+# (label sur mimic-system).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mimic-emergency
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "patch"]
+---
 # Lecture seule, agrégée au rôle standard `view`.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

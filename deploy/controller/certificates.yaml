@@ -56,6 +56,9 @@ spec:
     - secret: {name: mimic-controller-ca, key: ca.crt}
   target:
     configMap: {key: ca.crt}
+    # Namespaces injectés, en entier (true) ou pod par pod (opt-in).
     namespaceSelector:
-      matchLabels:
-        mimic.platform.io/enabled: "true"
+      matchExpressions:
+        - key: mimic.platform.io/enabled
+          operator: In
+          values: ["true", "opt-in"]

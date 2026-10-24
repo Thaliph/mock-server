@@ -1201,3 +1201,108 @@ fn base64(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
+
+/// Battement d'un pod d'un namespace donné, réponse sans le sel.
+async fn beat_in(c: &Running, ns: &str, instance: &str, token: &str, mode: &str) -> Value {
+    client()
+        .post(url(c, &format!("/v1/workloads/{ns}/checkout/heartbeat")))
+        .bearer_auth(token)
+        .json(&json!({"instance": instance, "mode": mode, "snapshot": null}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .map(without_salt)
+        .unwrap()
+}
+
+/// Conditions `Aligned` et `Allowed` publiées pour un workload.
+async fn conditions(c: &Running, ns: &str) -> (String, String, Option<String>) {
+    use mimic_controller::reconcile::status_of;
+    let ctl = c.state().clone();
+    let status = ctl
+        .with_live(ns, "checkout", |w| {
+            status_of(
+                &w.desired,
+                &ctl.summary(w),
+                w.generation,
+                w.snapshot_exchanges,
+            )
+        })
+        .await
+        .unwrap();
+    let get = |t: &str| {
+        status
+            .conditions
+            .iter()
+            .find(|x| x.type_ == t)
+            .cloned()
+            .unwrap()
+    };
+    let (aligned, allowed) = (get("Aligned"), get("Allowed"));
+    (aligned.status, allowed.status, allowed.reason)
+}
+
+/// Arrêt d'urgence par label de namespace, puis global par `mimic-system` (CTL-51).
+#[tokio::test]
+async fn ctl_51_emergency_stop_forces_passthrough_until_lifted() {
+    use std::collections::BTreeMap;
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    push(
+        &c,
+        "checkout-a",
+        &[exchange(
+            "checkout-a-1",
+            "outbound",
+            "GET",
+            "/a",
+            json!([]),
+            1,
+        )],
+    )
+    .await;
+    let mock = set_mode(&c, "mock", None).await;
+    let snapshot = mock["snapshot"].as_str().unwrap().to_string();
+    c.apply_spec(
+        "bank",
+        "checkout",
+        Some(MimicWorkloadSpec {
+            mode: "record".into(),
+            ..MimicWorkloadSpec::default()
+        }),
+    )
+    .await;
+    let shop = || beat_in(&c, "shop", "checkout-a", "tok-a", "mock");
+    let bank = || beat_in(&c, "bank", "checkout-a", "tok-other-ns", "record");
+    assert_eq!(shop().await, json!({"mode": "mock", "snapshot": snapshot}));
+    assert_eq!(bank().await, json!({"mode": "record", "snapshot": null}));
+
+    let stop = BTreeMap::from([(
+        "mimic.platform.io/emergency-stop".to_string(),
+        "true".to_string(),
+    )]);
+    c.set_namespace_labels("shop", &stop).await;
+    let passthrough = json!({"mode": "passthrough", "snapshot": null});
+    assert_eq!(shop().await, passthrough);
+    assert_eq!(bank().await, json!({"mode": "record", "snapshot": null}));
+    beat_in(&c, "shop", "checkout-a", "tok-a", "passthrough").await;
+    let (aligned, allowed, reason) = conditions(&c, "shop").await;
+    assert_eq!((aligned.as_str(), allowed.as_str()), ("False", "False"));
+    assert_eq!(reason.as_deref(), Some("EmergencyStop"));
+
+    c.set_namespace_labels("shop", &BTreeMap::new()).await;
+    assert_eq!(shop().await, json!({"mode": "mock", "snapshot": snapshot}));
+    let (_, allowed, _) = conditions(&c, "shop").await;
+    assert_eq!(allowed, "True");
+
+    // Sur le namespace du contrôleur : tout le cluster.
+    c.set_namespace_labels("mimic-system", &stop).await;
+    assert_eq!(shop().await, passthrough);
+    assert_eq!(bank().await, passthrough);
+    c.set_namespace_labels("mimic-system", &BTreeMap::new())
+        .await;
+    assert_eq!(shop().await, json!({"mode": "mock", "snapshot": snapshot}));
+    assert_eq!(bank().await, json!({"mode": "record", "snapshot": null}));
+}
