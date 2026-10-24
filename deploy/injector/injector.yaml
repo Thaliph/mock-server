@@ -50,6 +50,9 @@ data:
       limits: {memory: 256Mi}
     # Label du pod repris en label `version` des métriques (sinon pod-template-hash).
     version_label: app.kubernetes.io/version
+    # Filtre des logs des sidecars (MIMIC_LOG) ; un pod le remplace par l'annotation
+    # mimic.platform.io/log. Absent : info.
+    # sidecar_log: info
     # Configuration par défaut des sidecars (spec §9.1). Un pod peut monter la sienne
     # avec l'annotation mimic.platform.io/config: <configmap>.
     sidecar_config: |

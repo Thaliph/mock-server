@@ -64,6 +64,7 @@ annotation `mimic.platform.io/config: <nom>`, clé `mimic.yaml`, montée dans `/
 | `store.dir` | absent | répertoire du journal local et du cache des snapshots ; absent : mémoire seule |
 | `store.segment_bytes` | `33554432` (32 MiB) | taille d'un segment `local-<n>.jsonl` avant rotation. Doit être positif |
 | `store.max_segments` | `4` | segments gardés ; le plus ancien est supprimé. Doit être positif |
+| `store.size_limit_bytes` | absent | taille de l'`emptyDir` de `store.dir`, exposée par `mimic_store_disk_limit_bytes` (alerte `MimicStoreDiskHigh`) ; le webhook la pose par `MIMIC_STORE_SIZE_LIMIT_BYTES` (512 Mi) |
 | `tls.intercept` | `[]` | hôtes HTTPS sortants interceptés : `api.stripe.com`, `*.salesforce.com`, ou `*`. Remplacé par `MIMIC_TLS_INTERCEPT` |
 | `tls.ca_cert_file`, `tls.ca_key_file` | absents | CA fournie (les deux ensemble) ; absents : CA éphémère générée au démarrage |
 | `tls.ca_dir` | absent | répertoire où publier `ca.crt` (CA mimic) et `ca-bundle.crt` (racines système + CA mimic) pour l'application |
@@ -119,7 +120,8 @@ share:
 | `MIMIC_REDACT_SALT` | remplace `redact.salt` |
 | `MIMIC_VERSION`, `MIMIC_POD_TEMPLATE_HASH` | label `version` : `MIMIC_VERSION` non vide, sinon `version` de la configuration, sinon `MIMIC_POD_TEMPLATE_HASH` ; tronqué à 63 caractères ; vide : pas de label |
 | `MIMIC_TLS_INTERCEPT` | remplace `tls.intercept` (liste séparée par des virgules) |
-| `MIMIC_LOG` | filtre des logs JSON (`info` par défaut ; par exemple `debug`, `mimic_proxy=debug`) |
+| `MIMIC_LOG` | filtre des logs JSON (`info` par défaut ; par exemple `debug`, `mimic_proxy=debug`). Posée par le webhook depuis l'annotation `mimic.platform.io/log` ou `sidecar_log` |
+| `MIMIC_STORE_SIZE_LIMIT_BYTES` | remplace `store.size_limit_bytes` (taille de l'`emptyDir` du store, en octets), posée par le webhook ; valeur non numérique : erreur au démarrage |
 | `AWS_*` | identifiants, région, endpoint du partage direct `s3://` |
 
 Options de la ligne de commande : `--config <fichier>`, `--probe <chemin>` (sonde `exec` :
@@ -141,6 +143,7 @@ le **template** du pod (Deployment, StatefulSet…).
 | `mimic.platform.io/tls-intercept` | liste d'hôtes | `MIMIC_TLS_INTERCEPT` pour le sidecar ; dans chaque conteneur de l'app, volume `mimic-ca` monté en lecture seule sur `/var/run/mimic/ca`, et `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (`ca-bundle.crt`), `NODE_EXTRA_CA_CERTS` (`ca.crt`), sans écraser une variable déjà définie |
 | `mimic.platform.io/config` | nom de ConfigMap | ConfigMap (clé `mimic.yaml`) montée sur `/etc/mimic`, sidecar lancé avec `--config /etc/mimic/mimic.yaml` au lieu de `MIMIC_CONFIG_YAML` |
 | `mimic.platform.io/mesh` | `auto`, `none`, `istio`, `istio-ambient`, `linkerd` | `MIMIC_MESH` ; sinon `istio` ou `linkerd` si leurs conteneurs sont déjà dans le pod, sinon `auto`. Valeur inconnue : injecté en `auto` avec un avertissement |
+| `mimic.platform.io/log` | filtre `EnvFilter` (`debug`, `warn,mimic_proxy=debug`) | `MIMIC_LOG` du sidecar, à la place de `sidecar_log` ; pris en compte à la création du pod (redéployer pour changer). Filtre invalide : ignoré avec un avertissement d'admission |
 
 Posées **par** le webhook : annotation `mimic.platform.io/status: injected` et label
 `mimic.platform.io/sidecar: "true"` (ce label ouvre l'accès à l'API du contrôleur par sa
@@ -154,7 +157,7 @@ configuration renseigne `annotations_file` ; un sidecar piloté l'ignore.
 | Élément | Détail |
 |---------|--------|
 | init container `mimic-init` | en tête des init containers, ou juste après ceux du mesh ; root, `NET_ADMIN` et `NET_RAW`, toutes les autres capacités retirées ; variables `MIMIC_MESH`, `POD_IP` (`status.podIP`), `MIMIC_INBOUND_PORTS`, `MIMIC_EXCLUDE_OUTBOUND_CIDRS`, et si besoin `MIMIC_EXCLUDE_OUTBOUND_PORTS`, `MIMIC_IPTABLES` |
-| native sidecar `mimic` | juste après `mimic-init`, `restartPolicy: Always`, UID et GID 1338, racine en lecture seule, port `mimic-admin` (15100) ; variables `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` (figée à l'admission), `MIMIC_VERSION` (label `version_label`), `MIMIC_POD_TEMPLATE_HASH` (label `pod-template-hash`), `MIMIC_REDACT_SALT` (Secret `<workload>-mimic`, clé `redact-salt`, facultatif), `MIMIC_CONFIG_YAML` ou `--config` |
+| native sidecar `mimic` | juste après `mimic-init`, `restartPolicy: Always`, UID et GID 1338, racine en lecture seule, port `mimic-admin` (15100) ; variables `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` (figée à l'admission), `MIMIC_VERSION` (label `version_label`), `MIMIC_POD_TEMPLATE_HASH` (label `pod-template-hash`), `MIMIC_REDACT_SALT` (Secret `<workload>-mimic`, clé `redact-salt`, facultatif), `MIMIC_STORE_SIZE_LIMIT_BYTES` (taille de l'`emptyDir` du store), `MIMIC_LOG` (annotation `log` ou `sidecar_log`, sinon absente), `MIMIC_CONFIG_YAML` ou `--config` |
 | sondes du sidecar | `startupProbe` `/readyz` (période 1 s, `share.startup.timeout` + 30 échecs : 60 avec `sidecar_config` par défaut, 330 avec l'annotation `config`, que le webhook ne lit pas), `readinessProbe` `/readyz` et `livenessProbe` `/healthz` (période 10 s, 3 échecs) ; HTTP sur `mimic-admin`, ou `exec` `mimic-proxy --probe <chemin>` si un conteneur du mesh est présent |
 | ressources du sidecar | celles de `resources` du webhook, sinon requêtes `cpu: 50m`, `memory: 64Mi`, limite `memory: 256Mi` |
 | volumes | `mimic-store` (`emptyDir`, `sizeLimit: 512Mi`, sur `/var/lib/mimic`), `mimic-token` (jeton projeté d'audience `mimic-controller`, 3600 s, sur `/var/run/secrets/mimic`), `mimic-controller-ca` (ConfigMap, sur `/etc/mimic-ca`), `mimic-ca` (`emptyDir`, sur `/var/run/mimic/ca`), `mimic-config` (avec l'annotation `config`) |
@@ -181,6 +184,7 @@ Fichier passé par `--config` (ou `-c`, ou `MIMIC_INJECTOR_CONFIG`), obligatoire
 | `controller_ca_configmap` | `mimic-controller-ca` | ConfigMap de la CA du contrôleur, publiée par trust-manager |
 | `token_audience` | `mimic-controller` | audience du jeton projeté ; le contrôleur vérifie `mimic-controller` |
 | `version_label` | `app.kubernetes.io/version` | label du pod repris dans `MIMIC_VERSION` (`rollouts-pod-template-hash` avec Argo Rollouts, par exemple) |
+| `sidecar_log` | absent | `MIMIC_LOG` des sidecars (filtre `EnvFilter`), sauf annotation `mimic.platform.io/log` ; absent : `info`. Filtre invalide : refusé au démarrage (`sidecar_log: …`) |
 
 `MutatingWebhookConfiguration` livrée : `failurePolicy: Ignore`, `timeoutSeconds: 5`,
 `sideEffects: None`, `reinvocationPolicy: IfNeeded`, opérations `CREATE` sur `pods`,

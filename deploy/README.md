@@ -96,6 +96,17 @@ kubectl apply -f example/vmpodscrape-controller.yaml   # contrôleur et webhook
 Le collecteur vérifie le certificat avec la CA de mimic (Secret `mimic-controller-ca`) et le
 nom du Service (`serverName`), puisqu'il joint chaque pod par son IP.
 
+### Règles d'alerte (`monitoring/`)
+
+```sh
+kubectl apply -f monitoring/prometheus-rule.yaml   # PrometheusRule mimic-system/mimic
+../scripts/check-monitoring.sh                     # promtool check rules et test rules
+```
+
+`monitoring/rules.yaml` porte les mêmes groupes au format brut (vmalert, Prometheus sans
+opérateur) ; `monitoring/tests.yaml`, leurs tests `promtool`. Conduite à tenir pour chaque
+alerte : `docs/guide/Alertes-et-supervision.md`.
+
 ## Webhook d'injection (`injector/`), une fois par cluster
 
 `injector.yaml` : configuration (image et configuration par défaut des sidecars),

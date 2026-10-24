@@ -24,6 +24,15 @@ jobs:
         env:
           INSTA_UPDATE: "no"
 
+  monitoring:
+    # Règles d'alerte livrées : promtool check rules et test rules (spec §9.6, MON-07).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: >-
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint /bin/sh
+          prom/prometheus:v3.5.0 scripts/check-monitoring.sh
+
   e2e-netns:
     # Interception transparente réelle (iptables + SO_ORIGINAL_DST) dans un namespace jetable.
     runs-on: ubuntu-latest

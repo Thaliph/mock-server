@@ -28,6 +28,7 @@ dans le pod ; en Istio ambient, les sondes restent HTTP.
 | Situation | Effet | Signal |
 |-----------|-------|--------|
 | conteneur `mimic` arrêté ou en redémarrage | les règles iptables restent : le trafic entrant et sortant redirigé du pod n'a plus d'écoute et **échoue** jusqu'au redémarrage | `kube_pod_init_container_status_restarts_total{container="mimic"}` (native sidecar : compté comme init container), `kube_pod_init_container_status_ready{container="mimic"} == 0`, pod non `Ready` |
+| store sur disque proche de la taille de son `emptyDir` (512 Mi) | au-delà, le kubelet **évince le pod** | `mimic_store_disk_bytes` rapporté à `mimic_store_disk_limit_bytes` ; puis `kube_pod_status_reason{reason="Evicted"}` |
 | mémoire proche de la limite (256 Mi par défaut) | risque d'OOMKill, donc de coupure | `container_memory_working_set_bytes{container="mimic"}` rapporté à `kube_pod_init_container_resource_limits{container="mimic",resource="memory"}` |
 | contrôleur injoignable | le pod garde son dernier état, les échanges s'accumulent dans la file de publication puis sont perdus | `mimic_heartbeats_total{result="error"}`, `time() - mimic_heartbeat_last_success_timestamp_seconds` ; `mimic_share_sync_total{result="error"}` (seulement s'il y a quelque chose à publier), puis `mimic_capture_dropped_total{reason="share_backlog"}` ; logs `battement vers le contrôleur échoué` (au plus un toutes les 30 s, avec `omitted`), `synchronisation du partage échouée` ; `controller.last_error` de `/api/status` |
 | contrôleur injoignable au démarrage d'un pod neuf | l'application attend jusqu'à `share.startup.timeout` (30 s), puis démarre dans le repli (`record` par défaut) ; avec `fail`, le pod reste en `Init` | `mimic_startup{state="waiting"}` puis `{state="fallback"}` ; log `contrôleur injoignable au démarrage : repli share.startup.fallback appliqué` ; événements `Startup probe failed` du sidecar |
@@ -51,6 +52,7 @@ Deux réplicas, une seule active (bail `mimic-system/mimic-controller`, `lease_d
 | active qui ne renouvelle plus à temps | elle cesse de servir et **sort en code 1** (`bail non renouvelé à temps : la réplique cesse de servir`) ; Kubernetes la relance en passive | `kube_pod_container_status_restarts_total{namespace="mimic-system",container="controller"}` |
 | aucune réplique prête | sidecars sans bascule ni publication ; le trafic des pods continue dans le dernier état | `kube_deployment_status_replicas_available{deployment="mimic-controller"} == 0` |
 | support plein ou injoignable | segments refusés (`503 support indisponible`), sidecars en reprise exponentielle | `mimic_controller_segments_total{result="error"}`, log `ingestion d'un segment` ; `kubelet_volume_stats_used_bytes` du PVC |
+| certificat servi proche de l'expiration (renouvellement cert-manager en échec, ou nouveau certificat refusé) | une fois expiré, les sidecars refusent la connexion au contrôleur (`invalid peer certificate`) et l'API server celle du webhook | `mimic_controller_certificate_expiry_timestamp_seconds`, `mimic_injector_certificate_expiry_timestamp_seconds` ; log `nouveau certificat illisible : l'ancien reste servi` |
 | TokenReview ou API indisponible | `503 authentification indisponible` aux sidecars | `mimic_controller_auth_failures_total{reason="unavailable"}`, log `authentification impossible` |
 | pods qui ne s'alignent pas | bascule incomplète | `mimic_controller_pods{state="diverging"}`, condition `Aligned=False` |
 
@@ -87,217 +89,22 @@ done
 
 ## Règles `PrometheusRule`
 
-Seuils de départ, à ajuster à votre trafic. Le label `namespace` et `pod` des métriques des
-sidecars est celui posé par le scraper.
+Les règles sont livrées dans `deploy/monitoring/`, testées en CI par `promtool`
+(`scripts/check-monitoring.sh`) :
 
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: PrometheusRule
-metadata:
-  name: mimic
-  namespace: mimic-system
-spec:
-  groups:
-    - name: mimic-sidecar
-      rules:
-        - alert: MimicSidecarRestarting
-          expr: increase(kube_pod_init_container_status_restarts_total{container="mimic"}[15m]) > 2
-          labels: {severity: critical}
-          annotations:
-            summary: "Sidecar mimic de {{ $labels.namespace }}/{{ $labels.pod }} redémarre en boucle"
-            description: "Pendant chaque redémarrage, le trafic redirigé du pod échoue."
-        - alert: MimicSidecarNotReady
-          expr: kube_pod_init_container_status_ready{container="mimic"} == 0
-          for: 5m
-          labels: {severity: warning}
-          annotations:
-            summary: "Sidecar mimic non prêt sur {{ $labels.namespace }}/{{ $labels.pod }}"
-        - alert: MimicSidecarMemoryHigh
-          expr: |
-            max by (namespace, pod) (container_memory_working_set_bytes{container="mimic"})
-              / max by (namespace, pod) (kube_pod_init_container_resource_limits{container="mimic", resource="memory"})
-              > 0.85
-          for: 15m
-          labels: {severity: warning}
-          annotations:
-            summary: "Sidecar mimic à plus de 85 % de sa limite mémoire ({{ $labels.namespace }}/{{ $labels.pod }})"
-        - alert: MimicControllerUnreachableFromSidecars
-          expr: |
-            sum by (namespace) (rate(mimic_share_sync_total{result="error"}[10m]))
-              / sum by (namespace) (rate(mimic_share_sync_total[10m]))
-              > 0.5
-          for: 10m
-          labels: {severity: warning}
-          annotations:
-            summary: "Les sidecars de {{ $labels.namespace }} n'arrivent plus à publier au contrôleur"
-        - alert: MimicHeartbeatsFailing
-          expr: |
-            time() - max by (namespace, pod) (mimic_heartbeat_last_success_timestamp_seconds) > 120
-              and on (namespace, pod) increase(mimic_heartbeats_total{result="error"}[5m]) > 0
-          for: 5m
-          labels: {severity: warning}
-          annotations:
-            summary: "Le sidecar de {{ $labels.namespace }}/{{ $labels.pod }} n'a plus de réponse du contrôleur"
-            description: "Aucune bascule ne l'atteint ; un pod neuf démarre dans le repli share.startup.fallback."
-        - alert: MimicStartedWithoutDesiredState
-          expr: max by (namespace, pod) (mimic_startup{state="fallback"}) == 1
-          labels: {severity: warning}
-          annotations:
-            summary: "{{ $labels.namespace }}/{{ $labels.pod }} a démarré sans état souhaité (repli)"
-            description: "Contrôleur injoignable au démarrage : l'application tourne dans le repli (record par défaut) et peut joindre ses vraies dépendances même si son workload est en mock."
-        - alert: MimicStartupBlocked
-          expr: max by (namespace, pod) (mimic_startup{state="waiting"}) == 1
-          for: 10m
-          labels: {severity: warning}
-          annotations:
-            summary: "L'application de {{ $labels.namespace }}/{{ $labels.pod }} attend le contrôleur (share.startup.fallback: fail)"
-        - alert: MimicShareBacklogLoss
-          expr: sum by (namespace, pod) (increase(mimic_capture_dropped_total{reason="share_backlog"}[15m])) > 0
-          labels: {severity: warning}
-          annotations:
-            summary: "Échanges perdus avant publication sur {{ $labels.namespace }}/{{ $labels.pod }}"
-        - alert: MimicMockUnmatched
-          # En mock-partial, un appel sans enregistrement est relayé à la vraie dépendance :
-          # c'est le but du mode, pas une panne. L'alerte est donc limitée au mode mock,
-          # où un appel sans enregistrement devient un 599 pour l'application.
-          expr: |
-            (
-              sum by (namespace, pod) (rate(mimic_mock_responses_total{match="unmatched"}[5m]))
-                / sum by (namespace, pod) (rate(mimic_mock_responses_total[5m]))
-                > 0.05
-            )
-            and on (namespace, pod) (mimic_mode{mode="mock"} == 1)
-          for: 10m
-          labels: {severity: warning}
-          annotations:
-            summary: "Plus de 5 % des appels sortants sans réponse enregistrée en mock ({{ $labels.namespace }}/{{ $labels.pod }})"
-            description: "Ces appels reçoivent un 599 : le snapshot ne couvre pas le trafic. Détail dans mimicctl report."
-        - alert: MimicMockWithoutSnapshot
-          expr: (mimic_mode{mode="mock"} == 1) and on (namespace, pod) (mimic_mock_snapshot_exchanges == 0)
-          for: 5m
-          labels: {severity: warning}
-          annotations:
-            summary: "{{ $labels.namespace }}/{{ $labels.pod }} est en mock sans snapshot du contrôleur"
-        - alert: MimicMockTlsRefused
-          expr: sum by (namespace, pod) (increase(mimic_passthrough_connections_total{direction="outbound", kind="tls", result="refused"}[10m])) > 0
-          labels: {severity: info}
-          annotations:
-            summary: "Connexions HTTPS non interceptées coupées en mock ({{ $labels.namespace }}/{{ $labels.pod }})"
-        - alert: MimicMockTcpRefused
-          expr: sum by (namespace, pod) (increase(mimic_passthrough_connections_total{direction="outbound", kind="tcp", result="refused"}[10m])) > 0
-          labels: {severity: info}
-          annotations:
-            summary: "Connexions TCP non HTTP coupées en mock ({{ $labels.namespace }}/{{ $labels.pod }})"
-        - alert: MimicTlsInterceptRejected
-          expr: sum by (namespace, pod, authority) (increase(mimic_tls_handshake_failures_total[10m])) > 0
-          labels: {severity: warning}
-          annotations:
-            summary: "L'application refuse le certificat mimic pour {{ $labels.authority }} ({{ $labels.namespace }}/{{ $labels.pod }})"
-        - alert: MimicInboundUpstreamErrors
-          expr: sum by (namespace, pod) (rate(mimic_upstream_errors_total{direction="inbound", kind="connect"}[5m])) > 0
-          for: 5m
-          labels: {severity: warning}
-          annotations:
-            summary: "Le sidecar n'arrive pas à joindre l'application de {{ $labels.namespace }}/{{ $labels.pod }}"
+| Fichier | Contenu |
+|---------|---------|
+| `deploy/monitoring/prometheus-rule.yaml` | la `PrometheusRule` `mimic-system/mimic`, à appliquer telle quelle (`kubectl apply -f`) ; VictoriaMetrics operator la convertit en `VMRule` |
+| `deploy/monitoring/rules.yaml` | les mêmes groupes au format Prometheus brut, pour vmalert ou un Prometheus sans opérateur |
+| `deploy/monitoring/tests.yaml` | tests unitaires `promtool test rules` des expressions à piège |
 
-    - name: mimic-controller-kube
-      rules:
-        - alert: MimicControllerDown
-          expr: kube_deployment_status_replicas_available{namespace="mimic-system", deployment="mimic-controller"} < 1
-          for: 2m
-          labels: {severity: critical}
-          annotations:
-            summary: "Aucune réplique du contrôleur mimic disponible"
-        - alert: MimicControllerNotRedundant
-          expr: kube_deployment_status_replicas_available{namespace="mimic-system", deployment="mimic-controller"} < 2
-          for: 30m
-          labels: {severity: warning}
-          annotations:
-            summary: "Une seule réplique du contrôleur mimic : pas de relais possible"
-        - alert: MimicControllerRestarting
-          expr: increase(kube_pod_container_status_restarts_total{namespace="mimic-system", container="controller"}[30m]) > 2
-          labels: {severity: warning}
-          annotations:
-            summary: "Le contrôleur mimic redémarre souvent (bail perdu, OOM, échec de démarrage)"
-        - alert: MimicControllerMemoryHigh
-          expr: |
-            max by (pod) (container_memory_working_set_bytes{namespace="mimic-system", container="controller"})
-              / max by (pod) (kube_pod_container_resource_limits{namespace="mimic-system", container="controller", resource="memory"})
-              > 0.85
-          for: 15m
-          labels: {severity: warning}
-          annotations:
-            summary: "Contrôleur mimic à plus de 85 % de sa limite mémoire ({{ $labels.pod }})"
-        - alert: MimicControllerStorageFull
-          expr: |
-            kubelet_volume_stats_used_bytes{namespace="mimic-system", persistentvolumeclaim="mimic-controller"}
-              / kubelet_volume_stats_capacity_bytes{namespace="mimic-system", persistentvolumeclaim="mimic-controller"}
-              > 0.8
-          for: 15m
-          labels: {severity: warning}
-          annotations:
-            summary: "Support du contrôleur mimic rempli à plus de 80 %"
-        - alert: MimicInjectorDown
-          expr: kube_deployment_status_replicas_available{namespace="mimic-system", deployment="mimic-injector"} < 1
-          for: 2m
-          labels: {severity: critical}
-          annotations:
-            summary: "Webhook mimic indisponible : les nouveaux pods sont créés sans mimic"
-
-    # Nécessite la collecte de /metrics du contrôleur et du webhook (port api, 8443, HTTPS).
-    - name: mimic-controller-metrics
-      rules:
-        - alert: MimicControllerNoLeader
-          expr: sum(mimic_controller_leader) < 1 or absent(mimic_controller_leader)
-          for: 1m
-          labels: {severity: critical}
-          annotations:
-            summary: "Aucune réplique active du contrôleur mimic"
-        - alert: MimicControllerTwoLeaders
-          expr: sum(mimic_controller_leader) > 1
-          for: 1m
-          labels: {severity: critical}
-          annotations:
-            summary: "Deux répliques du contrôleur mimic se disent actives"
-        - alert: MimicControllerSegmentErrors
-          expr: sum(rate(mimic_controller_segments_total{result="error"}[5m])) > 0
-          for: 10m
-          labels: {severity: warning}
-          annotations:
-            summary: "Le contrôleur mimic refuse ou ne range pas des segments"
-        - alert: MimicControllerAuthUnavailable
-          expr: sum(increase(mimic_controller_auth_failures_total{reason="unavailable"}[5m])) > 0
-          for: 5m
-          labels: {severity: warning}
-          annotations:
-            summary: "Le contrôleur mimic ne peut plus valider les jetons (TokenReview, lecture des pods)"
-        - alert: MimicControllerAuthRejected
-          expr: sum by (reason) (increase(mimic_controller_auth_failures_total{reason=~"missing|invalid|forbidden"}[15m])) > 10
-          labels: {severity: warning}
-          annotations:
-            summary: "Appels de sidecars refusés par le contrôleur ({{ $labels.reason }})"
-        - alert: MimicPodsDiverging
-          expr: max(mimic_controller_pods{state="diverging"}) > 0
-          for: 5m
-          labels: {severity: warning}
-          annotations:
-            summary: "Des pods n'appliquent pas l'état souhaité depuis 5 minutes"
-        - alert: MimicExemplarsRefused
-          expr: sum by (reason) (increase(mimic_controller_exemplars_refused_total[1h])) > 0
-          labels: {severity: info}
-          annotations:
-            summary: "Exemples par endpoint refusés ({{ $labels.reason }}) : certains endpoints ne seront plus mockables après la rétention"
-        - alert: MimicControllerSlowTakeover
-          expr: max(mimic_controller_takeover_seconds) > 30
-          labels: {severity: info}
-          annotations:
-            summary: "La dernière prise de relais du contrôleur a pris plus de 30 s"
-        - alert: MimicInjectorErrors
-          expr: sum(increase(mimic_injector_admissions_total{result="error"}[10m])) > 0
-          labels: {severity: warning}
-          annotations:
-            summary: "Revues d'admission invalides : des pods sont créés sans mimic"
-```
+Trois groupes : `mimic-sidecar` (métriques des sidecars et de kube-state-metrics sur les pods
+injectés), `mimic-controller-kube` (kube-state-metrics, cAdvisor et kubelet sur
+`mimic-system`, sans collecte de mimic) et `mimic-controller-metrics` (`/metrics` du
+contrôleur et du webhook, port `api`, 8443). Les seuils sont des valeurs de départ, à ajuster à
+votre trafic : modifier `rules.yaml` et `prometheus-rule.yaml` ensemble (un test vérifie qu'ils
+sont identiques). Les labels `namespace` et `pod` des métriques des sidecars sont ceux posés par
+le collecteur.
 
 Notes sur ces règles :
 
@@ -321,6 +128,20 @@ Notes sur ces règles :
   part de `match="unmatched"` comme un indicateur, sans alerte.
 - `MimicMockWithoutSnapshot` se déclenche aussi pour un sidecar sans contrôleur basculé en
   mock par son API d'admin (cas voulu) : filtrer par namespace si vous utilisez ce mode.
+- `MimicStoreDiskHigh` ne vaut que pour les sidecars injectés par le webhook, qui leur donne
+  la taille de leur `emptyDir` (`mimic_store_disk_limit_bytes`) ; sans elle, la limite vaut 0
+  et l'alerte ne rend rien. Avec la configuration par défaut, le journal (128 MiB) et les
+  formes de mock gardées tiennent dans les 512 Mi : l'alerte signale une configuration qui
+  agrandit `store.max_segments`, `store.segment_bytes` ou `store.max_cached_snapshots`.
+- `MimicPodEvicted` sonne pour toute éviction d'un pod injecté, que mimic en soit la cause ou
+  non : le message de l'éviction le dit (`ephemeral local storage usage exceeds the total limit
+  of containers` ou `Usage of EmptyDir volume "mimic-store" exceeds the limit` si c'est le
+  store).
+- `MimicVersionSkew` est normale pendant une mise à jour : un sidecar garde sa version jusqu'au
+  redémarrage de son pod, d'où les 24 h. Elle compte les valeurs de `mimic_version`, pas celles
+  du label `version`, qui est la version de l'application.
+- Les alertes d'expiration de certificat ignorent la valeur 0 (serveur sans TLS) ; elles
+  sonnent à 7 jours de l'expiration, alors que cert-manager renouvelle à 15 jours.
 - `mimic_controller_pods{state="absent"}` n'est pas une bonne alerte : un pod supprimé reste
   `absent` jusqu'à `pod_forget` (10 min), ce qui arrive à chaque déploiement.
 - `MimicSidecarNotReady` peut se déclencher pendant l'arrêt d'un pod ; le `for: 5m` absorbe
@@ -343,6 +164,9 @@ Notes sur ces règles :
 | `MimicMockTlsRefused` | `mimic_passthrough_connections_total` par pod, logs de l'application | ajouter l'hôte à `mimic.platform.io/tls-intercept`, ré-enregistrer, ou l'exclure (`exclude-outbound-cidrs`) s'il doit rester réel |
 | `MimicMockTcpRefused` | log du sidecar `connexion TCP sortante refusée en mode mock` : `destination` (adresse et port) | attendu si la dépendance doit être coupée pendant le tir ; sinon l'exclure (`exclude-outbound-ports` ou `-cidrs`), elle recevra alors la charge |
 | `MimicTlsInterceptRejected` | log `poignée de main TLS refusée par l'application` avec l'authority | l'application ne lit pas `SSL_CERT_FILE` & co : ajouter `/var/run/mimic/ca/ca.crt` à son magasin (JVM : `keytool`), ou retirer l'hôte de l'interception |
+| `MimicStoreDiskHigh` | `kubectl -n <ns> exec <pod> -c mimic -- du -a /var/lib/mimic` ; configuration du store (`store.segment_bytes` × `store.max_segments`, `store.max_cached_snapshots`) | revenir aux bornes par défaut, ou agrandir l'`emptyDir` ; un pod évincé repart d'un store vide (le contrôleur garde ce qui a été publié) |
+| `MimicPodEvicted` | `kubectl -n <ns> describe pod <pod>` : message de l'éviction (volume `mimic-store`, mémoire, disque du nœud) | store : comme `MimicStoreDiskHigh` ; nœud saturé : hors de mimic |
+| `MimicVersionSkew` | `count by (mimic_version) (mimic_build_info)`, puis les pods de l'ancienne version | `kubectl rollout restart` des workloads concernés pour qu'ils reçoivent le sidecar à jour |
 | `MimicInboundUpstreamErrors` | port d'écoute de l'application, adresse (le sidecar essaie l'IP du pod puis `127.0.0.1`) | application pas encore prête (démarrage lent) ou qui écoute ailleurs : `inbound.upstream` ou `mimic.platform.io/inbound-ports` |
 | `MimicControllerDown` | `kubectl -n mimic-system get pods -l app.kubernetes.io/name=mimic-controller -L mimic.platform.io/leader`, `describe`, logs | PVC non attaché (multi-attach `ReadWriteOnce`), certificat absent, configuration invalide (code 2) ; voir [Exploiter en production](Exploiter-en-production.md) |
 | `MimicControllerNotRedundant` | réplique `Pending` ou `ContainerCreating` | souvent un PVC `ReadWriteOnce` monté sur un autre nœud : `ReadWriteMany` ou S3 |
@@ -356,6 +180,8 @@ Notes sur ces règles :
 | `MimicControllerSlowTakeover` | `mimic_controller_takeover_seconds` ; logs de la nouvelle active (`prise de relais`) | le rechargement de l'état persisté est long : support lent (S3 distant, PVC saturé) ou beaucoup d'exemples. Informatif ; si c'est régulier, réduire `max_exemplars_per_workload` ou rapprocher le support |
 | `MimicControllerAuthUnavailable` | log `authentification impossible` | API server, droits `tokenreviews` `create` et `pods` `get` du ClusterRole `mimic-controller` |
 | `MimicControllerAuthRejected` | `reason` : `missing`/`invalid` (jeton, audience `mimic-controller`), `forbidden` (pod sans nom de workload, workload d'un autre) | vérifier le volume `mimic-token` et l'annotation `mimic.platform.io/workload` |
-| `MimicPodsDiverging` | `/ui/<ns>/<wl>` : état de chaque pod ; logs des pods concernés | voir [Basculer en mock](Basculer-en-mock.md#vérifier-lalignement) |
+| `MimicPodsDiverging` | le label `workload` (`<namespace>/<nom>`), puis `/ui/<ns>/<wl>` : état de chaque pod ; logs des pods concernés | voir [Basculer en mock](Basculer-en-mock.md#vérifier-lalignement) |
 | `MimicExemplarsRefused` | `reason` | `count` : monter `max_exemplars_per_workload` ; `bytes` : monter `max_exemplar_bytes_per_workload` / `_total` |
+| `MimicControllerCertificateExpiring` | `kubectl -n mimic-system get certificate mimic-controller-tls` (condition `Ready`, `renewalTime`), logs de cert-manager ; log du contrôleur `nouveau certificat illisible : l'ancien reste servi` | réparer l'émetteur `mimic-ca` ou le Secret ; un nouveau certificat est relu à chaud, sans redémarrage |
+| `MimicInjectorCertificateExpiring` | `kubectl -n mimic-system get certificate mimic-injector-tls`, logs de cert-manager et du webhook | idem ; une fois expiré, l'API server ne joint plus le webhook et les pods sont créés sans mimic (`failurePolicy: Ignore`) |
 | `MimicInjectorErrors` | log `revue d'admission invalide` | version d'API server, autre webhook qui modifie la revue |

@@ -180,9 +180,10 @@ async fn adm_04_every_metric_carries_the_version() {
         assert!(l.contains("version=\"v2\""), "{l}");
     }
 
-    // Sans version connue, aucun label `version`.
+    // Sans version connue, aucun label `version` (`mimic_version` de `mimic_build_info` est
+    // un autre label).
     let p = proxy(config(Some(app.addr), Mode::Record)).await;
     client().get(inbound(&p, "/users/1")).send().await.unwrap();
     let m = metrics(&p).await;
-    assert!(!m.contains("version="), "{m}");
+    assert!(!m.contains("{version=") && !m.contains(",version="), "{m}");
 }

@@ -2,6 +2,7 @@
 //! bien avant l'expiration, le serveur suit sans redémarrer.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -80,6 +81,8 @@ pub struct CertReloader {
     files: TlsFiles,
     provider: Arc<CryptoProvider>,
     current: RwLock<Arc<CertifiedKey>>,
+    /// Date Unix d'expiration du certificat servi (spec §9.2b).
+    not_after: AtomicI64,
     seen: Mutex<Seen>,
 }
 
@@ -125,6 +128,14 @@ fn parse(
     })
 }
 
+/// Date Unix d'expiration du premier certificat de la chaîne ; 0 s'il ne se lit pas.
+fn not_after(key: &CertifiedKey) -> i64 {
+    key.cert
+        .first()
+        .and_then(|der| x509_parser::parse_x509_certificate(der).ok())
+        .map_or(0, |(_, cert)| cert.validity().not_after.timestamp())
+}
+
 impl CertReloader {
     /// Charge le certificat ; illisible, le démarrage échoue.
     pub fn load(files: &TlsFiles) -> Result<Arc<Self>, String> {
@@ -134,6 +145,7 @@ impl CertReloader {
         Ok(Arc::new(Self {
             files: files.clone(),
             provider,
+            not_after: AtomicI64::new(not_after(&key)),
             current: RwLock::new(Arc::new(key)),
             seen: Mutex::new(Seen {
                 served: contents,
@@ -154,6 +166,11 @@ impl CertReloader {
             .clone()
     }
 
+    /// Date Unix d'expiration du certificat servi (feuille de la chaîne) ; 0 si illisible.
+    pub fn not_after_unix(&self) -> i64 {
+        self.not_after.load(Ordering::Relaxed)
+    }
+
     /// Relit les fichiers ; charge un contenu changé et lisible. Un refus est journalisé
     /// une fois par contenu (ou par erreur de lecture), pas à chaque relecture.
     pub fn reload(&self) -> Reload {
@@ -170,6 +187,7 @@ impl CertReloader {
             .and_then(|c| parse(&self.files, &c, &self.provider).map(|k| (c, k)));
         match parsed {
             Ok((contents, key)) => {
+                self.not_after.store(not_after(&key), Ordering::Relaxed);
                 *self.current.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(key);
                 seen.served = contents;
                 seen.refused = None;

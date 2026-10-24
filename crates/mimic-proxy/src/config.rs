@@ -391,6 +391,9 @@ pub struct StoreConfig {
     /// anciennes sont supprimées (par date de dernière écriture), jamais celle du snapshot
     /// actif (SNP-12, cycle de vie des snapshots).
     pub max_cached_snapshots: usize,
+    /// Taille de l'`emptyDir` de `dir`, en octets (`mimic_store_disk_limit_bytes`) ;
+    /// absente, inconnue. `MIMIC_STORE_SIZE_LIMIT_BYTES` l'emporte (posée par le webhook).
+    pub size_limit_bytes: Option<u64>,
 }
 
 impl Default for StoreConfig {
@@ -402,6 +405,7 @@ impl Default for StoreConfig {
             segment_bytes: 32 * 1024 * 1024,
             max_segments: 4,
             max_cached_snapshots: 5,
+            size_limit_bytes: None,
         }
     }
 }
@@ -621,6 +625,13 @@ impl Config {
             self.version = Some(v);
         } else if self.version.as_deref().is_none_or(|v| v.trim().is_empty()) {
             self.version = non_empty("MIMIC_POD_TEMPLATE_HASH");
+        }
+        if let Some(v) = get("MIMIC_STORE_SIZE_LIMIT_BYTES") {
+            let bytes = v
+                .trim()
+                .parse()
+                .map_err(|_| format!("MIMIC_STORE_SIZE_LIMIT_BYTES invalide (octets) : {v}"))?;
+            self.store.size_limit_bytes = Some(bytes);
         }
         if let Some(v) = get("MIMIC_TLS_INTERCEPT") {
             self.tls.intercept = v

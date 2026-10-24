@@ -1,6 +1,9 @@
 //! Métriques du contrôleur (spec §9.2b).
 
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, OnceLock};
+
+use mimic_net::tls::CertReloader;
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -18,9 +21,17 @@ pub struct ReasonLabel {
     pub reason: String,
 }
 
+/// Pods d'un workload (`<namespace>/<nom>`) dans un état d'alignement.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-pub struct StateLabel {
+pub struct PodLabels {
+    pub workload: String,
     pub state: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BuildLabels {
+    mimic_version: &'static str,
+    revision: &'static str,
 }
 
 pub struct Metrics {
@@ -28,7 +39,7 @@ pub struct Metrics {
     pub segments: Family<ResultLabel, Counter>,
     pub auth_failures: Family<ReasonLabel, Counter>,
     pub workloads: Gauge,
-    pub pods: Family<StateLabel, Gauge>,
+    pub pods: Family<PodLabels, Gauge>,
     pub snapshots: Counter,
     /// Snapshots supprimés par la purge (CTL-44, cycle de vie des snapshots).
     pub snapshots_deleted: Counter,
@@ -43,6 +54,9 @@ pub struct Metrics {
     pub leader: Gauge,
     /// Durée de la dernière prise de relais, en secondes.
     pub takeover_seconds: Gauge<f64, AtomicU64>,
+    /// Date Unix d'expiration du certificat servi, relue à chaque lecture (0 sans TLS).
+    certificate_expiry: Gauge,
+    certificate: OnceLock<Arc<CertReloader>>,
 }
 
 impl Default for Metrics {
@@ -51,7 +65,7 @@ impl Default for Metrics {
         let segments = Family::<ResultLabel, Counter>::default();
         let auth_failures = Family::<ReasonLabel, Counter>::default();
         let workloads = Gauge::default();
-        let pods = Family::<StateLabel, Gauge>::default();
+        let pods = Family::<PodLabels, Gauge>::default();
         let snapshots = Counter::default();
         let snapshots_deleted = Counter::default();
         let exchanges = Gauge::default();
@@ -60,6 +74,14 @@ impl Default for Metrics {
         let exemplars_refused = Family::<ReasonLabel, Counter>::default();
         let leader = Gauge::default();
         let takeover_seconds = Gauge::<f64, AtomicU64>::default();
+        let certificate_expiry = Gauge::default();
+        let build = Family::<BuildLabels, Gauge>::default();
+        build
+            .get_or_create(&BuildLabels {
+                mimic_version: mimic_core::build::VERSION,
+                revision: mimic_core::build::REVISION,
+            })
+            .set(1);
         // Les deux raisons sont exposées dès le départ, à zéro.
         for reason in ["count", "bytes"] {
             let _ = exemplars_refused.get_or_create(&ReasonLabel {
@@ -83,7 +105,7 @@ impl Default for Metrics {
         );
         registry.register(
             "mimic_controller_pods",
-            "Pods par état d'alignement",
+            "Pods par workload et par état d'alignement",
             pods.clone(),
         );
         registry.register(
@@ -126,6 +148,16 @@ impl Default for Metrics {
             "Durée de la dernière prise de relais : rechargement de l'état persisté jusqu'à la marque",
             takeover_seconds.clone(),
         );
+        registry.register(
+            "mimic_controller_certificate_expiry_timestamp_seconds",
+            "Date Unix d'expiration du certificat servi (0 sans TLS)",
+            certificate_expiry.clone(),
+        );
+        registry.register(
+            "mimic_build_info",
+            "Version et commit du binaire (toujours 1)",
+            build,
+        );
         Self {
             registry,
             segments,
@@ -140,6 +172,8 @@ impl Default for Metrics {
             exemplars_refused,
             leader,
             takeover_seconds,
+            certificate_expiry,
+            certificate: OnceLock::new(),
         }
     }
 }
@@ -158,7 +192,29 @@ impl Metrics {
         }
     }
 
+    /// Certificat servi, dont la date d'expiration est exposée.
+    pub fn watch_certificate(&self, reloader: Arc<CertReloader>) {
+        let _ = self.certificate.set(reloader);
+    }
+
+    /// Pods par état de chaque workload : les trois états de chacun, à zéro s'il le faut.
+    pub fn set_pods(&self, counts: &std::collections::BTreeMap<String, [i64; 3]>) {
+        for (workload, values) in counts {
+            for (state, n) in ["aligned", "diverging", "absent"].iter().zip(values) {
+                self.pods
+                    .get_or_create(&PodLabels {
+                        workload: workload.clone(),
+                        state: (*state).into(),
+                    })
+                    .set(*n);
+            }
+        }
+    }
+
     pub fn encode(&self) -> String {
+        if let Some(c) = self.certificate.get() {
+            self.certificate_expiry.set(c.not_after_unix());
+        }
         let mut out = String::new();
         let _ = prometheus_client::encoding::text::encode(&mut out, &self.registry);
         out

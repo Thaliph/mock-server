@@ -4,7 +4,9 @@
 
 Symptômes, diagnostics et messages réels, composant par composant. Les logs du sidecar et du
 contrôleur sont en JSON (filtre `MIMIC_LOG`, `info` par défaut) ; ceux du webhook suivent
-`RUST_LOG`. Les messages cités ici sont ceux du code : les chercher tels quels.
+`RUST_LOG`. Pour un sidecar plus bavard, annoter le template du pod
+(`mimic.platform.io/log: debug`, ou `warn,mimic_proxy=debug`) puis redéployer : le webhook
+pose `MIMIC_LOG` à la création du pod. Les messages cités ici sont ceux du code : les chercher tels quels.
 
 ## Premiers réflexes
 
