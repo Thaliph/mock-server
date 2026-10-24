@@ -146,11 +146,13 @@ async fn lod_09_fixed_concurrency_sends_exactly_n_requests_with_at_most_c_in_fli
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lod_11_ramp_stops_at_the_first_saturated_step() {
-    let (addr, _) = server(4, Duration::from_millis(5)).await;
+    // 50 ms par requête : l'aller-retour du client entre deux requêtes d'une connexion
+    // (environ 1 ms en debug) n'empêche plus la concurrence 4 d'occuper les 4 places.
+    let (addr, _) = server(4, Duration::from_millis(50)).await;
     let target = Target::parse(&format!("http://{addr}/"), false).unwrap();
     let plan = Plan::Ramp {
         steps: mimic_core::load::ramp(1, 2.0, 64).unwrap(),
-        step_duration: Duration::from_millis(400),
+        step_duration: Duration::from_secs(1),
     };
     let out = run(corpus(), &target, &plan, &options()).await;
     let concurrency: Vec<u32> = out.steps.iter().map(|s| s.concurrency).collect();
