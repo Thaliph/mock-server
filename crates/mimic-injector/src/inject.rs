@@ -25,6 +25,8 @@ pub const ANNOTATION_MESH: &str = "mimic.platform.io/mesh";
 /// Bodies non analysables gardés pour ces hôtes, `inbound` pour l'entrant
 /// (`MIMIC_REDACT_RAW_BODIES`, spec §7).
 pub const ANNOTATION_RAW_BODIES: &str = "mimic.platform.io/capture-raw-bodies";
+/// Réglages de `mimic-init` pour le plugin CNI (`cni: true`, spec §3.1b).
+pub const ANNOTATION_CNI_RULES: &str = "mimic.platform.io/cni-rules";
 /// Filtre des logs du sidecar (`MIMIC_LOG`, spec §9.4).
 pub const ANNOTATION_LOG: &str = "mimic.platform.io/log";
 /// Taille de l'`emptyDir` du store, et la même en octets pour le sidecar
@@ -631,7 +633,7 @@ fn trust_ca(c: &mut Container) {
 
 /// Place `mimic` (`mimic-init` puis le sidecar) en tête des init containers, ou juste
 /// après le dernier conteneur du mesh (spec §9.4).
-fn place(mut inits: Vec<Container>, mimic: [Container; 2]) -> Vec<Container> {
+fn place(mut inits: Vec<Container>, mimic: Vec<Container>) -> Vec<Container> {
     let at = inits
         .iter()
         .rposition(|c| mesh_container(c).is_some())
@@ -656,18 +658,37 @@ fn adapt(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
             .position(|c| c.name == name)
             .map(|i| inits.remove(i))
     };
-    let (Some(mut init), Some(mut side)) =
-        (take(&mut inits, "mimic-init"), take(&mut inits, "mimic"))
-    else {
+    let Some(mut side) = take(&mut inits, "mimic") else {
         return skipped();
     };
-    let envs = init.env.get_or_insert_with(Vec::new);
-    match envs.iter_mut().find(|e| e.name == "MIMIC_MESH") {
-        Some(e) => e.value = Some(mesh_mode(pod)),
-        None => envs.insert(0, env("MIMIC_MESH", mesh_mode(pod))),
+    let mut mimic = vec![];
+    match take(&mut inits, "mimic-init") {
+        Some(mut init) => {
+            let envs = init.env.get_or_insert_with(Vec::new);
+            match envs.iter_mut().find(|e| e.name == "MIMIC_MESH") {
+                Some(e) => e.value = Some(mesh_mode(pod)),
+                None => envs.insert(0, env("MIMIC_MESH", mesh_mode(pod))),
+            }
+            mimic.push(init);
+        }
+        // Variante CNI : le mesh vit dans l'annotation lue par le plugin.
+        None => {
+            let annotations = out.metadata.annotations.get_or_insert_with(BTreeMap::new);
+            let Some(rules) = annotations.get(ANNOTATION_CNI_RULES) else {
+                return skipped();
+            };
+            let mut map: BTreeMap<String, String> = serde_json::from_str(rules).unwrap_or_default();
+            map.insert("MIMIC_MESH".into(), mesh_mode(pod));
+            annotations.insert(
+                ANNOTATION_CNI_RULES.into(),
+                serde_json::to_string(&map).unwrap_or_default(),
+            );
+        }
     }
     set_probes(&mut side, pod, cfg);
-    spec.init_containers = Some(place(inits, [init, side]));
+    mimic.push(side);
+    let spec = out.spec.get_or_insert_with(Default::default);
+    spec.init_containers = Some(place(inits, mimic));
     if out == *pod {
         return skipped();
     }
@@ -698,10 +719,31 @@ pub fn mutate(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
     let init = init_container(pod, cfg);
     let side = sidecar(pod, cfg, &workload, &intercept);
     let new_volumes = volumes(pod, cfg);
+    // Variante CNI (spec §3.1b) : pas de mimic-init privilégié ; ses variables passent au
+    // plugin par une annotation.
+    let mimic = if cfg.cni {
+        let rules: BTreeMap<String, String> = init
+            .env
+            .iter()
+            .flatten()
+            .filter(|e| e.name.starts_with("MIMIC_"))
+            .map(|e| (e.name.clone(), e.value.clone().unwrap_or_default()))
+            .collect();
+        out.metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(
+                ANNOTATION_CNI_RULES.into(),
+                serde_json::to_string(&rules).unwrap_or_default(),
+            );
+        vec![side]
+    } else {
+        vec![init, side]
+    };
     let spec = out.spec.get_or_insert_with(Default::default);
     spec.init_containers = Some(place(
         spec.init_containers.take().unwrap_or_default(),
-        [init, side],
+        mimic,
     ));
     spec.volumes
         .get_or_insert_with(Vec::new)

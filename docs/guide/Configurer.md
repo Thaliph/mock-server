@@ -186,6 +186,7 @@ Fichier passé par `--config` (ou `-c`, ou `MIMIC_INJECTOR_CONFIG`), obligatoire
 | `resources` | absent | `resources` du sidecar (format Kubernetes) ; absent : 50m / 64Mi, limite 256Mi |
 | `controller_ca_configmap` | `mimic-controller-ca` | ConfigMap de la CA du contrôleur, publiée par trust-manager |
 | `token_audience` | `mimic-controller` | audience du jeton projeté ; le contrôleur vérifie `mimic-controller` |
+| `cni` | `false` | `true` : pas de `mimic-init` ; réglages passés au plugin `mimic-cni` par l'annotation `mimic.platform.io/cni-rules` (exige le DaemonSet de `deploy/cni/`) |
 | `version_label` | `app.kubernetes.io/version` | label du pod repris dans `MIMIC_VERSION` (`rollouts-pod-template-hash` avec Argo Rollouts, par exemple) |
 | `sidecar_log` | absent | `MIMIC_LOG` des sidecars (filtre `EnvFilter`), sauf annotation `mimic.platform.io/log` ; absent : `info`. Filtre invalide : refusé au démarrage (`sidecar_log: …`) |
 

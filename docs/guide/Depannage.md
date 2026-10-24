@@ -40,7 +40,7 @@ kubectl -n mimic-system logs deploy/mimic-controller --all-containers --prefix |
 | erreur d'admission dans les logs du webhook | `revue d'admission invalide: …` | revue mal formée | version de l'API server, autre webhook |
 | webhook en échec au démarrage | `mimic-injector: sidecar_config invalide: …`, `mimic-injector: configuration … invalide: …` | ConfigMap `mimic-injector` incorrecte | corriger, `rollout restart deploy/mimic-injector` |
 | API server : `failed calling webhook` dans les événements | | `caBundle` pas encore posé par le cainjector, ou webhook injoignable | `kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath='{.webhooks[0].clientConfig.caBundle}'` ; `kubectl -n mimic-system get endpoints mimic-injector`. Le certificat du webhook est relu à chaud (10 s) : un renouvellement ne demande pas de redémarrage |
-| pod rejeté par Pod Security | `violates PodSecurity "baseline"…` (capacités `NET_ADMIN`, `NET_RAW`) | `mimic-init` a besoin de ces capacités | namespace en `privileged` ou exemption |
+| pod rejeté par Pod Security | `violates PodSecurity "baseline"…` (capacités `NET_ADMIN`, `NET_RAW`) | `mimic-init` a besoin de ces capacités | namespace en `privileged` ou exemption, ou variante CNI (`deploy/cni/`, `cni: true` du webhook) qui retire `mimic-init` |
 
 ## `mimic-init`
 

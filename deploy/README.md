@@ -135,7 +135,8 @@ démarre plus. Le namespace injecté doit donc autoriser ces capacités :
 kubectl label namespace shop pod-security.kubernetes.io/enforce=privileged --overwrite
 ```
 
-ou être exempté dans la configuration de l'admission (`exemptions.namespaces`). Hors de ces
+ou être exempté dans la configuration de l'admission (`exemptions.namespaces`), ou passer à
+la **variante CNI** (ci-dessous), qui retire `mimic-init` des pods. Hors de ces
 capacités, les conteneurs injectés suivent `restricted` : `allowPrivilegeEscalation: false`,
 `seccompProfile: RuntimeDefault`, toutes les autres capacités retirées, et le sidecar sans
 root, en lecture seule.
@@ -266,3 +267,24 @@ l'annonce dans ses logs : les marqueurs de redaction diffèrent alors d'un pod �
 
 Si les noeuds utilisent iptables en mode legacy, ajouter `MIMIC_IPTABLES=iptables-legacy`
 à l'init container.
+
+## Variante CNI (`cni/`), facultative
+
+Pour garder les namespaces injectés en Pod Security `baseline` ou `restricted` : un plugin CNI
+chaîné, `mimic-cni`, pose les règles de redirection dans le namespace réseau de chaque pod
+injecté, à sa création, à la place de l'init container privilégié `mimic-init` (spec §3.1b).
+
+```sh
+kubectl apply -f cni/mimic-cni.yaml          # DaemonSet : plugin installé sur chaque nœud
+kubectl -n mimic-system rollout status ds/mimic-cni
+# Puis, dans la configuration du webhook (injector/injector.yaml) : cni: true
+kubectl -n shop rollout restart deploy/<workload>
+```
+
+Le DaemonSet copie le binaire dans `/opt/cni/bin`, ajoute `mimic-cni` en fin de chaîne du
+premier fichier de `/etc/cni/net.d` (le réajoute si le fournisseur réseau le réécrit) et le
+retire à son arrêt. Le plugin lit l'annotation `mimic.platform.io/cni-rules` du pod (droit
+`get` sur les pods, rien d'autre) ; sans elle, il ne fait rien. Un pod créé sur un nœud où le
+plugin n'est pas encore installé démarre sans règles : installer le DaemonSet avant de passer
+le webhook en `cni: true`.
+

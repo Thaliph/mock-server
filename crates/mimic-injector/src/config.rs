@@ -50,6 +50,10 @@ pub struct InjectorConfig {
     /// l'emporte. Absent : `info`.
     #[serde(default)]
     pub sidecar_log: Option<String>,
+    /// Variante CNI (spec §3.1b) : règles posées par le plugin `mimic-cni`, plus de
+    /// `mimic-init` privilégié dans les pods.
+    #[serde(default)]
+    pub cni: bool,
 }
 
 fn default_listen() -> SocketAddr {

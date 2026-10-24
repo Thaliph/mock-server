@@ -1857,6 +1857,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "mimic-cni"
+version = "0.1.0"
+dependencies = [
+ "k8s-openapi",
+ "kube",
+ "mimic-init",
+ "nix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "mimic-controller"
 version = "0.1.0"
 dependencies = [
