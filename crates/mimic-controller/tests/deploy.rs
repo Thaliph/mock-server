@@ -527,3 +527,115 @@ fn mon_06_prometheus_rule_is_the_tested_rules() {
         assert!(ALERTS_DOC.contains(file), "{file} non cité par le guide");
     }
 }
+
+/// L'API agrégée de lecture est déclarée, joignable et bornée aux lectures (SEC-08).
+#[test]
+fn sec_08_aggregated_read_api_manifests() {
+    let manifests = docs(include_str!("../../../deploy/controller/controller.yaml"));
+    let rbac = docs(include_str!("../../../deploy/controller/rbac.yaml"));
+
+    let api = find(&manifests, "APIService", "v1alpha1.data.mimic.platform.io");
+    assert_eq!(api["spec"]["group"], "data.mimic.platform.io");
+    assert_eq!(api["spec"]["version"], "v1alpha1");
+    assert_eq!(api["spec"]["service"]["name"], "mimic-controller");
+    assert_eq!(api["spec"]["service"]["namespace"], "mimic-system");
+    assert_eq!(
+        api["metadata"]["annotations"]["cert-manager.io/inject-ca-from"],
+        "mimic-system/mimic-controller-tls"
+    );
+    let port = api["spec"]["service"]["port"].as_u64().unwrap();
+
+    let service = find(&manifests, "Service", "mimic-controller");
+    let svc_port = service["spec"]["ports"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|p| p["port"].as_u64() == Some(port))
+        .expect("port de l'APIService sur le Service");
+    assert_eq!(svc_port["name"], "aggregated");
+    assert_eq!(svc_port["targetPort"], "aggregated");
+    let deployment = find(&manifests, "Deployment", "mimic-controller");
+    let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+    let container_port = container["ports"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "aggregated")
+        .expect("port aggregated du conteneur")["containerPort"]
+        .as_u64()
+        .unwrap();
+    let policy = find(&manifests, "NetworkPolicy", "mimic-controller");
+    let open = policy["spec"]["ingress"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .any(|r| {
+            r["from"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|f| f["ipBlock"]["cidr"] == "0.0.0.0/0")
+                && r["ports"]
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["port"].as_u64() == Some(container_port))
+        });
+    assert!(
+        open,
+        "NetworkPolicy : {container_port} ouvert à toute source"
+    );
+
+    // La configuration du contrôleur sert l'API agrégée sur ce port.
+    let cm = manifests.iter().find(|d| d["kind"] == "ConfigMap").unwrap();
+    let config: ControllerConfig =
+        serde_yaml::from_str(cm["data"]["controller.yaml"].as_str().unwrap()).unwrap();
+    config.validate().unwrap();
+    let aggregated = config.aggregated.expect("aggregated configuré");
+    assert_eq!(u64::from(aggregated.listen.port()), container_port);
+    assert!(
+        aggregated.client_ca_file.is_none(),
+        "CA lue dans kube-system"
+    );
+
+    // Droits du contrôleur : SubjectAccessReview, ConfigMap de kube-system.
+    let role = find(&rbac, "ClusterRole", "mimic-controller");
+    let sar = rule_on(role, "subjectaccessreviews").expect("subjectaccessreviews");
+    assert_eq!(verbs(sar), ["create"]);
+    let binding = rbac
+        .iter()
+        .find(|d| {
+            d["kind"] == "RoleBinding"
+                && d["metadata"]["namespace"] == "kube-system"
+                && d["roleRef"]["name"] == "extension-apiserver-authentication-reader"
+        })
+        .expect("RoleBinding extension-apiserver-authentication-reader");
+    assert_eq!(binding["subjects"][0]["name"], "mimic-controller");
+    assert_eq!(binding["subjects"][0]["namespace"], "mimic-system");
+
+    // Le rôle des équipes : lecture seule du groupe agrégé.
+    let viewer = find(&rbac, "ClusterRole", "mimic-data-viewer");
+    let rules = viewer["rules"].as_sequence().unwrap();
+    assert_eq!(rules.len(), 1, "{rules:?}");
+    assert_eq!(rules[0]["apiGroups"][0], "data.mimic.platform.io");
+    let mut resources: Vec<&str> = rules[0]["resources"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    resources.sort_unstable();
+    assert_eq!(
+        resources,
+        [
+            "workloads",
+            "workloads/openapi",
+            "workloads/operations",
+            "workloads/requests",
+            "workloads/snapshots"
+        ]
+    );
+    let mut granted = verbs(&rules[0]);
+    granted.sort_unstable();
+    assert_eq!(granted, ["get", "list"]);
+}

@@ -90,7 +90,7 @@ La **capacité** est le palier non saturé de plus haut débit.
 La cible doit être joignable depuis l'endroit où tourne `mimicctl`. Le plus simple est de
 lancer le tir dans le cluster avec `deploy/load/job.yaml` : l'image `ghcr.io/thaliph/mimic`
 contient `mimicctl`, le Job a les droits de lecture `metrics.k8s.io` dans le namespace du
-workload et le port-forward vers le contrôleur. Adapter le nom du workload, le namespace et la
+workload et la lecture de ses données (`mimic-data-viewer`, lié dans ce seul namespace). Adapter le nom du workload, le namespace et la
 cible dans `args`, puis :
 
 ```sh

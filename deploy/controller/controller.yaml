@@ -7,6 +7,10 @@ data:
   controller.yaml: |
     listen: 0.0.0.0:8443
     ui_listen: 127.0.0.1:8081
+    # API agrégée de lecture data.mimic.platform.io (spec §9.2c) : CA du front proxy lue
+    # dans kube-system/extension-apiserver-authentication.
+    aggregated:
+      listen: 0.0.0.0:8444
     tls:
       cert_file: /etc/mimic/tls/tls.crt
       key_file: /etc/mimic/tls/tls.key
@@ -101,6 +105,7 @@ spec:
                 fieldRef: {fieldPath: metadata.name}
           ports:
             - {name: api, containerPort: 8443}
+            - {name: aggregated, containerPort: 8444}
           readinessProbe:
             httpGet: {path: /healthz, port: api, scheme: HTTPS}
           livenessProbe:
@@ -142,6 +147,27 @@ spec:
     mimic.platform.io/leader: "true"
   ports:
     - {name: api, port: 8443, targetPort: api}
+    - {name: aggregated, port: 8444, targetPort: aggregated}
+---
+# Lecture des données par namespace (spec §9.2c) : l'API server relaie
+# /apis/data.mimic.platform.io/v1alpha1 vers la réplique active, avec l'identité de
+# l'utilisateur ; le contrôleur l'autorise par SubjectAccessReview (ClusterRole
+# mimic-data-viewer). caBundle : la CA du certificat du contrôleur, posée par cert-manager.
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1alpha1.data.mimic.platform.io
+  annotations:
+    cert-manager.io/inject-ca-from: mimic-system/mimic-controller-tls
+spec:
+  group: data.mimic.platform.io
+  version: v1alpha1
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  service:
+    name: mimic-controller
+    namespace: mimic-system
+    port: 8444
 ---
 # Un drain n'évince jamais les deux réplicas à la fois ; la passive prend le relais.
 apiVersion: policy/v1
@@ -174,6 +200,13 @@ spec:
             matchLabels: {mimic.platform.io/sidecar: "true"}
       ports:
         - {port: 8443, protocol: TCP}
+    # API agrégée : l'API server n'est pas un pod (pas de sélecteur possible), d'où toute
+    # adresse ; le port exige le certificat client du front proxy.
+    - from:
+        - ipBlock: {cidr: 0.0.0.0/0}
+        - ipBlock: {cidr: "::/0"}
+      ports:
+        - {port: 8444, protocol: TCP}
     - from:
         - namespaceSelector:
             matchLabels: {mimic.platform.io/monitoring: "true"}

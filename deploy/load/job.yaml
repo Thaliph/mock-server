@@ -4,8 +4,8 @@
 # Rapport : `kubectl logs -n perf job/checkout-load`.
 #
 # Droits du Job :
-# - lire la fiche du workload et ses requêtes sur l'interface du contrôleur, par port-forward
-#   (pods et pods/portforward dans mimic-system) ;
+# - lire la fiche du workload et ses requêtes par l'API agrégée data.mimic.platform.io
+#   (ClusterRole mimic-data-viewer, lié dans perf seulement, spec §9.2c) ;
 # - relever CPU et mémoire des pods du workload (metrics.k8s.io, metrics-server requis).
 apiVersion: v1
 kind: ServiceAccount
@@ -38,27 +38,14 @@ subjects:
     namespace: perf
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: mimic-load-controller-ui
-  namespace: mimic-system
-rules:
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["list"]
-  - apiGroups: [""]
-    resources: ["pods/portforward"]
-    verbs: ["create"]
----
-apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: mimic-load-controller-ui-perf
-  namespace: mimic-system
+  name: mimic-load-data
+  namespace: perf
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: mimic-load-controller-ui
+  kind: ClusterRole
+  name: mimic-data-viewer
 subjects:
   - kind: ServiceAccount
     name: mimic-load

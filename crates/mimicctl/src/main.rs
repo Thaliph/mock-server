@@ -41,6 +41,9 @@ enum Command {
         /// ou refuse (503, sans joindre la dépendance).
         #[arg(long)]
         mock_websocket: Option<String>,
+        /// Applique même sans pod injecté de ce workload (pas encore déployé, zéro réplica).
+        #[arg(long)]
+        force: bool,
         #[arg(short, long)]
         namespace: Option<String>,
     },
@@ -70,11 +73,14 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    /// Requêtes entrantes enregistrées, pour le rejeu (spec §5.7).
+    /// Requêtes enregistrées, pour le rejeu (spec §5.7) : entrantes, ou appels sortants de
+    /// l'application à ses dépendances.
     Requests {
         workload: String,
         #[arg(short, long)]
         namespace: Option<String>,
+        #[arg(long, default_value = "inbound", value_parser = ["inbound", "outbound"])]
+        direction: String,
         #[arg(long, default_value = "json", value_parser = ["json", "jsonl", "k6"])]
         format: String,
         #[arg(long, default_value_t = 1000)]
@@ -280,6 +286,7 @@ async fn run(command: Command) -> Result<i32, String> {
             capture_inbound,
             selector,
             mock_websocket,
+            force,
             namespace: ns,
         } => {
             let opts = ModeOptions {
@@ -294,7 +301,27 @@ async fn run(command: Command) -> Result<i32, String> {
             let ns = namespace(ns, &client).await;
             let mw = workload_apply_with(&ns, &workload, &mode, &opts)?;
             check_namespace(&ns, &mode, namespace_labels(&client, &ns).await.as_ref())?;
-            let api: Api<MimicWorkload> = Api::namespaced(client, &ns);
+            let api: Api<MimicWorkload> = Api::namespaced(client.clone(), &ns);
+            // Une faute de frappe ne crée pas une MimicWorkload qui ne pilote rien (spec §9.5).
+            let exists = api
+                .get_opt(&workload)
+                .await
+                .map_err(|e| format!("lecture de {ns}/{workload}: {e}"))?
+                .is_some();
+            let injected = if exists || force {
+                None
+            } else {
+                Api::<Pod>::namespaced(client, &ns)
+                    .list(&ListParams::default().labels("mimic.platform.io/sidecar=true"))
+                    .await
+                    .ok()
+                    .map(|l| mimicctl::injected_workloads(&l.items))
+            };
+            if let Some(warning) =
+                mimicctl::check_workload(&ns, &workload, exists, injected.as_ref(), force)?
+            {
+                eprintln!("mimicctl: {warning}");
+            }
             api.patch(
                 &workload,
                 &PatchParams::apply("mimicctl"),
@@ -364,13 +391,14 @@ async fn run(command: Command) -> Result<i32, String> {
         Command::Requests {
             workload,
             namespace: ns,
+            direction,
             format,
             limit,
         } => {
             let client = client().await?;
             let ns = namespace(ns, &client).await;
-            let body =
-                controller_get(client, &requests_path(&ns, &workload, &format, limit)).await?;
+            let path = requests_path(&ns, &workload, &direction, &format, limit);
+            let body = controller_get(client, &path).await?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(0)
         }
@@ -386,7 +414,8 @@ async fn run(command: Command) -> Result<i32, String> {
             } else {
                 Some(namespace(ns, &client).await)
             };
-            let known = controller_json(client.clone(), "/v1/workloads").await?;
+            let known =
+                controller_json(client.clone(), &mimicctl::workloads_path(ns.as_deref())).await?;
             let mut workloads = vec![];
             for w in known.as_array().into_iter().flatten() {
                 let (wns, name) = (w["namespace"].as_str(), w["name"].as_str());
@@ -504,7 +533,8 @@ async fn run(command: Command) -> Result<i32, String> {
             if let Some(name) = &workload {
                 let client = client().await?;
                 let ns = namespace(ns, &client).await;
-                let known = controller_json(client.clone(), "/v1/workloads").await?;
+                let known =
+                    controller_json(client.clone(), &mimicctl::workloads_path(Some(&ns))).await?;
                 let w = known
                     .as_array()
                     .into_iter()
@@ -525,7 +555,7 @@ async fn run(command: Command) -> Result<i32, String> {
                     }
                 }
                 if from.is_none() {
-                    let path = requests_path(&ns, name, "jsonl", limit);
+                    let path = requests_path(&ns, name, "inbound", "jsonl", limit);
                     let body = controller_get(client.clone(), &path).await?;
                     exchanges = parse_exchanges(&String::from_utf8_lossy(&body))?;
                 }
@@ -832,10 +862,66 @@ async fn controller_json(client: kube::Client, path: &str) -> Result<serde_json:
         .map_err(|e| format!("réponse du contrôleur illisible ({path}): {e}"))
 }
 
-/// `GET` sur l'interface du contrôleur, liée à 127.0.0.1 dans son pod : on y passe par
-/// un port-forward, comme `kubectl port-forward` (même RBAC).
+/// Lecture d'un chemin de l'interface du contrôleur : par l'API agrégée (spec §9.2c), avec
+/// les droits du kubeconfig dans le namespace du workload ; sinon, si le groupe n'est pas
+/// servi, par un port-forward vers l'interface, liée à 127.0.0.1 dans son pod (même RBAC
+/// que `kubectl port-forward`).
 async fn controller_get(client: kube::Client, path: &str) -> Result<Bytes, String> {
+    if let Some(aggregated) = mimicctl::aggregated_path(path)
+        && aggregated_served(&client).await?
+    {
+        let (status, body) = api_get(&client, &aggregated).await?;
+        if !(200..300).contains(&status) {
+            return Err(api_error(status, &body));
+        }
+        return Ok(body);
+    }
     controller_request(client, hyper::Method::GET, path, Bytes::new(), None).await
+}
+
+/// `GET` brut sur l'API server : code et corps.
+async fn api_get(client: &kube::Client, path: &str) -> Result<(u16, Bytes), String> {
+    let req = hyper::Request::get(path)
+        .body(kube::client::Body::empty())
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .send(req)
+        .await
+        .map_err(|e| format!("API server ({path}): {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .into_body()
+        .collect_bytes()
+        .await
+        .map_err(|e| format!("API server ({path}): {e}"))?;
+    Ok((status, body))
+}
+
+/// Le groupe `data.mimic.platform.io` est servi : découverte lue une fois par exécution.
+async fn aggregated_served(client: &kube::Client) -> Result<bool, String> {
+    static SERVED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    SERVED
+        .get_or_try_init(|| async {
+            let (status, body) = api_get(client, mimic_controller::aggregated::PREFIX).await?;
+            if mimicctl::falls_back(status) {
+                return Ok(false);
+            }
+            if !(200..300).contains(&status) {
+                return Err(api_error(status, &body));
+            }
+            Ok(true)
+        })
+        .await
+        .copied()
+}
+
+/// Message d'une réponse d'erreur de l'API server (`Status`), ou son corps.
+fn api_error(status: u16, body: &[u8]) -> String {
+    let message = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(String::from))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
+    format!("API server : {status} {message}")
 }
 
 /// Comme `controller_get`, en écriture (`pin`, import, `gc` des snapshots, CTL-46).

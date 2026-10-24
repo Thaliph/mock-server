@@ -28,6 +28,26 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
+  # API agrégée : autorisation de chaque lecture (spec §9.2c).
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+# API agrégée : CA du front proxy de l'API server (ConfigMap
+# kube-system/extension-apiserver-authentication), par le Role standard.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mimic-controller-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: mimic-controller
+    namespace: mimic-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -90,9 +110,28 @@ rules:
     resources: ["namespaces"]
     verbs: ["get"]
 ---
-# `mimicctl export`, `requests` et `report` ouvrent un port-forward vers la réplique active
-# du contrôleur (spec §9.5) : à lier par RoleBinding dans mimic-system aux utilisateurs, par
-# exemple `kubectl -n mimic-system create rolebinding mimic-cli --role=mimic-cli --group=sre`.
+# Lecture des données enregistrées d'un namespace (export, requêtes, rapport, snapshots) par
+# l'API agrégée (spec §9.2c) : à lier par RoleBinding dans le namespace d'une équipe, par
+# exemple `kubectl -n shop create rolebinding mimic-data --clusterrole=mimic-data-viewer
+# --group=shop-devs`. Ne donne rien sur les autres namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mimic-data-viewer
+rules:
+  - apiGroups: ["data.mimic.platform.io"]
+    resources:
+      - workloads
+      - workloads/operations
+      - workloads/openapi
+      - workloads/requests
+      - workloads/snapshots
+    verbs: ["get", "list"]
+---
+# Port-forward vers la réplique active du contrôleur (spec §9.5) : écritures du cycle de vie
+# des snapshots (`mimicctl snapshot pin|import|gc`), et lectures sur un cluster sans l'API
+# agrégée. Ouvre l'interface sur TOUS les namespaces : réservé aux exploitants, par exemple
+# `kubectl -n mimic-system create rolebinding mimic-cli --role=mimic-cli --group=sre`.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

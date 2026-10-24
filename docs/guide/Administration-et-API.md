@@ -11,7 +11,8 @@ lecture seule du contrôleur, et l'API du contrôleur réservée aux sidecars. S
 | Surface | Écoute | Protocole | Authentification | Qui y accède |
 |---------|--------|-----------|------------------|--------------|
 | admin du sidecar | `0.0.0.0:15100` (port `mimic-admin`) | HTTP | aucune ; hors `/healthz`, `/readyz` et `/metrics`, seules les connexions de la boucle locale (`127.0.0.1`, `::1`) sont servies, les autres reçoivent `403` | sondes du kubelet et scraper (`/healthz`, `/readyz`, `/metrics`) ; opérateurs par `kubectl port-forward` ou `kubectl exec` pour le reste |
-| interface du contrôleur | `127.0.0.1:8081` | HTTP | aucune ; l'accès passe par `kubectl port-forward` (RBAC `pods/portforward` `create` dans `mimic-system`) | opérateurs, `mimicctl export/requests/report` |
+| interface du contrôleur | `127.0.0.1:8081` | HTTP | aucune ; l'accès passe par `kubectl port-forward` (RBAC `pods/portforward` `create` dans `mimic-system`) | exploitants ; `mimicctl snapshot pin/import/gc`, et les lectures de `mimicctl` sur un cluster sans l'API agrégée |
+| API agrégée de lecture | `0.0.0.0:8444` (port `aggregated`), par l'API server : `/apis/data.mimic.platform.io/v1alpha1` | HTTPS | certificat client du front proxy de l'API server ; utilisateur des en-têtes `X-Remote-*`, autorisé par `SubjectAccessReview` | `mimicctl export/requests/report/snapshot ls/snapshot export`, `kubectl get --raw` ; équipes ayant `mimic-data-viewer` dans leur namespace |
 | API du contrôleur | `0.0.0.0:8443` (port `api`), Service `mimic-controller:8443` | HTTPS | jeton de ServiceAccount projeté, validé par TokenReview (audience `mimic-controller`) ; **sauf `/healthz` et `/metrics`**, servis sans jeton par les deux répliques | sidecars (NetworkPolicy : pods labellisés `mimic.platform.io/sidecar=true`) ; scraper de métriques (namespace labellisé `mimic.platform.io/monitoring=true`) |
 
 > L'admin écoute sur `0.0.0.0:15100`, ce qu'exigent les sondes HTTP du kubelet et la collecte
@@ -143,7 +144,34 @@ curl -s 'http://127.0.0.1:8081/v1/workloads/shop/checkout/requests?format=k6&lim
 
 Les données servies sont déjà redactées, mais restent des échanges réels (chemins, paramètres
 non sensibles, bodies non JSON). Traiter l'accès `pods/portforward` sur `mimic-system` comme
-un accès à ces données.
+un accès à ces données, pour **tous** les namespaces.
+
+## API agrégée de lecture
+
+Les mêmes lectures, namespace par namespace, passent par l'API server (spec §9.2c) :
+l'`APIService` `v1alpha1.data.mimic.platform.io` renvoie le groupe vers le port `aggregated`
+(8444) de la réplique active. Le contrôleur n'accepte que le certificat client du front proxy
+de l'API server (CA et noms lus dans `kube-system/extension-apiserver-authentication` au
+démarrage), puis autorise chaque requête par `SubjectAccessReview` (décision gardée 10 s).
+
+| Chemin (préfixe `/apis/data.mimic.platform.io/v1alpha1`) | Droit vérifié | Route de l'interface |
+|-----------------------------------------------------------|---------------|----------------------|
+| `/workloads` | `list workloads` sur le cluster | `/v1/workloads` |
+| `/namespaces/<ns>/workloads` | `list workloads` dans `<ns>` | `/v1/workloads`, réduit à `<ns>` |
+| `/namespaces/<ns>/workloads/<wl>/operations` | `get workloads/operations` | `…/operations` |
+| `/namespaces/<ns>/workloads/<wl>/openapi/inbound`, `…/openapi/outbound/<authority>` | `get workloads/openapi` | `…/openapi/…` |
+| `/namespaces/<ns>/workloads/<wl>/requests?direction=&format=&limit=` | `get workloads/requests` | `…/requests` |
+| `/namespaces/<ns>/workloads/<wl>/snapshots`, `…/snapshots/<id>` | `get workloads/snapshots` | `…/snapshots…` |
+
+```sh
+kubectl get --raw /apis/data.mimic.platform.io/v1alpha1/namespaces/shop/workloads/checkout/operations | jq
+kubectl -n shop create rolebinding shop-mimic-data --clusterrole=mimic-data-viewer --group=shop-devs
+```
+
+Refus : `403` avec un `Status` Kubernetes qui nomme l'utilisateur et l'accès ;
+`SubjectAccessReview` impossible : `503`. Lecture seule : toute autre méthode que `GET` reçoit
+`405`. État de l'APIService : `kubectl get apiservice v1alpha1.data.mimic.platform.io`
+(condition `Available`).
 
 ## API du contrôleur pour les sidecars
 
@@ -176,13 +204,17 @@ la passive.
 
 | Rôle livré (`deploy/controller/rbac.yaml`) | Portée | Droits |
 |--------------------------------------------|--------|--------|
-| `mimic-controller` (ClusterRole) | contrôleur | `mimicworkloads` `get`, `list`, `watch` ; `mimicworkloads/status` `patch` ; `tokenreviews` `create` ; `pods` `get` ; `namespaces` `get`, `list`, `watch` |
+| `mimic-controller` (ClusterRole) | contrôleur | `mimicworkloads` `get`, `list`, `watch` ; `mimicworkloads/status` `patch` ; `tokenreviews` `create` ; `subjectaccessreviews` `create` ; `pods` `get` ; `namespaces` `get`, `list`, `watch` |
+| `extension-apiserver-authentication-reader` (Role standard de `kube-system`, RoleBinding `mimic-controller-auth-reader`) | contrôleur | lecture du ConfigMap de la CA du front proxy |
 | `mimic-controller` (Role dans `mimic-system`) | contrôleur | `leases` `create` ; `leases/mimic-controller` `get`, `patch` ; `pods` `list`, `patch` (label de la réplique active) |
 | `mimic-operator` (ClusterRole, à lier par namespace) | équipes qui basculent | tous les verbes sur `mimicworkloads` ; `namespaces` `get` (garde-fou de `mimicctl`) |
 | `mimic-viewer` (ClusterRole, agrégé à `view`) | lecture | `mimicworkloads` en lecture |
+| `mimic-data-viewer` (ClusterRole, à lier par namespace) | équipes qui lisent leurs données | `workloads` et `workloads/{operations,openapi,requests,snapshots}` du groupe `data.mimic.platform.io` en `get`, `list` |
+| `mimic-cli` (Role dans `mimic-system`) | exploitants | `pods` `get`, `list` ; `pods/portforward` `create` : interface du contrôleur, tous namespaces |
 
-Pour `mimicctl export`, `requests` et `report` (et l'interface) : `pods` `list` et
-`pods/portforward` `create` dans `mimic-system`, à accorder séparément.
+`mimicctl export`, `requests`, `report` et `snapshot ls|export` n'ont besoin que de
+`mimic-data-viewer` dans le namespace du workload ; `snapshot pin|import|gc` et l'interface web,
+de `mimic-cli`.
 
 ```sh
 kubectl -n shop create rolebinding perf-mimic-operator \

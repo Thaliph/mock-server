@@ -99,6 +99,9 @@ install_mimic() {
   kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
   retry 60 has_leader || fail "aucune réplique active du contrôleur"
   echo "réplique active : $(leader)"
+  # Lectures de mimicctl par l'API agrégée (spec §9.2c) : caBundle injecté, réplique active
+  # joignable par l'API server.
+  kubectl wait --for=condition=Available apiservice/v1alpha1.data.mimic.platform.io --timeout=180s
 
   log "webhook d'injection"
   # kind n'a qu'un nœud : avec deux réplicas du contrôleur, les requêtes CPU des sidecars
