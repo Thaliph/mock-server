@@ -158,6 +158,8 @@ async fn ini_04_12_prx_04_04b_08_15_23_transparent_interception_in_network_names
             .arg(env!("CARGO_BIN_EXE_mimic-proxy"))
             .arg("--config")
             .arg(&config)
+            // Sel obligatoire sans contrôleur (spec §7, RED-08).
+            .env("MIMIC_REDACT_SALT", "sel-e2e-netns")
             .spawn()
             .unwrap(),
     );
