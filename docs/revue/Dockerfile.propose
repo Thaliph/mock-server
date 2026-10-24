@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1.10
+# Deux cibles : `runtime` (sidecar, contrôleur, webhook, mimicctl, plugin CNI ; sans shell ni
+# gestionnaire de paquets) et `init` (mimic-init + iptables). Binaires statiques musl : le
+# plugin CNI est copié sur l'hôte et doit y tourner quelle que soit sa glibc.
+ARG RUST_IMAGE=rust:1.99.1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc
+ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99
+ARG INIT_IMAGE=debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+
+FROM ${RUST_IMAGE} AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends musl-tools \
+ && rm -rf /var/lib/apt/lists/*
+# La chaîne de l'image fait foi, pas le `channel = "stable"` de rust-toolchain.toml.
+ENV RUSTUP_TOOLCHAIN=1.99.1 \
+    CARGO_PROFILE_RELEASE_STRIP=symbols \
+    CARGO_INCREMENTAL=0
+RUN rustup target add "$(uname -m)-unknown-linux-musl"
+WORKDIR /src
+COPY . .
+ARG MIMIC_REVISION=unknown
+ENV MIMIC_REVISION=${MIMIC_REVISION}
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    t="$(uname -m)-unknown-linux-musl" \
+ && cargo build --release --locked --target "$t" \
+      -p mimic-proxy -p mimic-init -p mimic-cni -p mimic-controller -p mimic-injector -p mimicctl \
+ && mkdir -p /out \
+ && cd "target/$t/release" \
+ && install -m 0555 mimic-proxy mimic-init mimic-cni mimic-controller mimic-injector mimicctl /out/
+
+# mimic-init : root + NET_ADMIN/NET_RAW le temps de poser les règles (securityContext du webhook).
+FROM ${INIT_IMAGE} AS init
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iptables \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/*
+COPY --from=build --chown=0:0 /out/mimic-init /usr/local/bin/
+USER 1338:1338
+ENTRYPOINT ["/usr/local/bin/mimic-init"]
+
+# Cible par défaut (dernière) : sans shell, binaires possédés par root et non inscriptibles.
+FROM ${RUNTIME_IMAGE} AS runtime
+COPY --from=build --chown=0:0 /out/mimic-proxy /out/mimic-cni /out/mimic-controller \
+     /out/mimic-injector /out/mimicctl /usr/local/bin/
+# Jamais 1337 (UID d'istio-proxy, exclu par le mesh) ; 1338 est exclu des redirections mimic.
+USER 1338:1338
+EXPOSE 15100 15101 15106
+ENTRYPOINT ["/usr/local/bin/mimic-proxy"]
