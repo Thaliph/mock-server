@@ -260,9 +260,13 @@ impl Default for CaptureConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RedactSection {
     pub extra_json_paths: Vec<String>,
-    /// Sel des marqueurs de redaction. À partager entre les réplicas d'un workload (Secret)
-    /// pour que les marqueurs restent cohérents ; absent : sel aléatoire par processus.
+    /// Sel des marqueurs de redaction (Secret `<workload>-mimic`). Absent sous contrôleur :
+    /// sel du workload reçu par le battement ; absent sans contrôleur : refus de démarrer
+    /// (spec §7).
     pub salt: Option<String>,
+    /// Bodies non analysables par la redaction gardés tels quels : hôtes de dépendances
+    /// (`api.partner.io`, `*.partner.io`, `*`) et `inbound` pour le trafic reçu (spec §7).
+    pub raw_bodies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -633,6 +637,14 @@ impl Config {
                 .map_err(|_| format!("MIMIC_STORE_SIZE_LIMIT_BYTES invalide (octets) : {v}"))?;
             self.store.size_limit_bytes = Some(bytes);
         }
+        if let Some(v) = get("MIMIC_REDACT_RAW_BODIES") {
+            self.redact.raw_bodies = v
+                .split(',')
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(String::from)
+                .collect();
+        }
         if let Some(v) = get("MIMIC_TLS_INTERCEPT") {
             self.tls.intercept = v
                 .split(',')
@@ -645,6 +657,15 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        // Sans sel, les marqueurs changeraient d'un pod et d'un redémarrage à l'autre ; sous
+        // contrôleur, le sel du workload arrive par le battement (spec §7).
+        if self.redact.salt.is_none() && !self.share.as_ref().is_some_and(|s| s.is_controller()) {
+            return Err(
+                "redact.salt requis sans contrôleur : fournir MIMIC_REDACT_SALT (Secret \
+                 <workload>-mimic, clé redact-salt) ou redact.salt"
+                    .into(),
+            );
+        }
         if !(0.0..=100.0).contains(&self.mock.latency_factor) {
             return Err("mock.latency_factor doit être entre 0 et 100".into());
         }
@@ -764,7 +785,9 @@ mod tests {
         let c: Config = serde_yaml::from_str("mode: mock\n").unwrap();
         assert_eq!(c.mock.websocket, MockWebsocket::Relay);
         let c = Config::load_with(None, |k| {
-            (k == "MIMIC_CONFIG_YAML").then(|| "mode: mock\nmock:\n  websocket: refuse\n".into())
+            (k == "MIMIC_CONFIG_YAML")
+                .then(|| "mode: mock\nmock:\n  websocket: refuse\n".into())
+                .or_else(|| (k == "MIMIC_REDACT_SALT").then(|| "sel".into()))
         })
         .unwrap();
         assert_eq!(c.mock.websocket, MockWebsocket::Refuse);
@@ -787,7 +810,9 @@ mod tests {
         let c: Config = serde_yaml::from_str("mode: mock\n").unwrap();
         assert_eq!(c.mock.tcp, MockTcp::Refuse);
         let c = Config::load_with(None, |k| {
-            (k == "MIMIC_CONFIG_YAML").then(|| "mode: mock\nmock:\n  tcp: relay\n".into())
+            (k == "MIMIC_CONFIG_YAML")
+                .then(|| "mode: mock\nmock:\n  tcp: relay\n".into())
+                .or_else(|| (k == "MIMIC_REDACT_SALT").then(|| "sel".into()))
         })
         .unwrap();
         assert_eq!(c.mock.tcp, MockTcp::Relay);
@@ -872,6 +897,7 @@ mod tests {
             }
             "MIMIC_TLS_INTERCEPT" => Some("api.stripe.com, *.salesforce.com".into()),
             "POD_NAME" => Some("checkout-1".into()),
+            "MIMIC_REDACT_SALT" => Some("sel".into()),
             _ => None,
         })
         .unwrap();

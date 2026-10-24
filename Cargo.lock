@@ -1862,10 +1862,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "flate2",
  "futures-util",
+ "getrandom 0.3.4",
  "http",
  "k8s-openapi",
  "kube",

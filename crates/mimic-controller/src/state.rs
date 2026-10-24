@@ -483,6 +483,8 @@ pub struct Entry {
     flush: tokio::sync::Mutex<()>,
     data: Mutex<Data>,
     discovery: Mutex<DiscoveryCache>,
+    /// Sel de redaction du workload, tiré une fois et gardé sur le support (spec §7).
+    salt: OnceCell<String>,
 }
 
 impl Entry {
@@ -506,6 +508,10 @@ impl Entry {
 
     fn base(&self) -> String {
         base(&self.namespace, &self.name)
+    }
+
+    fn salt_path(&self) -> Path {
+        Path::from(format!("{}/redact-salt", self.base()))
     }
 
     fn segment_path(&self, key: &str) -> Path {
@@ -713,6 +719,7 @@ impl Ctl {
                     load_started: AtomicBool::new(false),
                     exemplars_loaded: OnceCell::new(),
                     flush: tokio::sync::Mutex::new(()),
+                    salt: OnceCell::new(),
                     data: Mutex::new(Data::new(
                         self.config.samples_per_operation,
                         self.config.max_exemplars_per_workload,
@@ -973,6 +980,63 @@ impl Ctl {
 
     /// Range un segment reçu d'un sidecar. Avec `segment`, l'envoi est idempotent : un
     /// segment déjà rangé sous cet identifiant n'est ni réécrit ni réimporté.
+    /// Sel de redaction du workload (spec §7) : relu du support, sinon tiré au hasard et
+    /// écrit par une écriture conditionnelle, si bien que deux pods ou deux répliques
+    /// simultanés obtiennent le même. Une erreur du support n'initialise rien.
+    pub async fn workload_salt(&self, ns: &str, wl: &str) -> Result<String, String> {
+        let e = self.entry(ns, wl);
+        let path = e.salt_path();
+        e.salt
+            .get_or_try_init(|| async {
+                let read = |bytes: Bytes| {
+                    let salt = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if salt.is_empty() {
+                        Err(format!("{path} vide"))
+                    } else {
+                        Ok(salt)
+                    }
+                };
+                match self.store.get(&path).await {
+                    Ok(r) => return read(r.bytes().await.map_err(|e| e.to_string())?),
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(err) => return Err(format!("lecture de {path}: {err}")),
+                }
+                let mut raw = [0u8; 32];
+                getrandom::fill(&mut raw).map_err(|e| format!("tirage du sel: {e}"))?;
+                let salt: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+                let create = PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                };
+                match self
+                    .store
+                    .put_opts(&path, PutPayload::from(salt.clone().into_bytes()), create)
+                    .await
+                {
+                    Ok(_) => Ok(salt),
+                    // Écrit entre-temps par un autre : c'est le sien qui vaut.
+                    Err(object_store::Error::AlreadyExists { .. }) => {
+                        let r = self
+                            .store
+                            .get(&path)
+                            .await
+                            .map_err(|err| format!("lecture de {path}: {err}"))?;
+                        read(r.bytes().await.map_err(|e| e.to_string())?)
+                    }
+                    Err(object_store::Error::NotImplemented { .. }) => {
+                        self.store
+                            .put(&path, PutPayload::from(salt.clone().into_bytes()))
+                            .await
+                            .map_err(|err| format!("écriture de {path}: {err}"))?;
+                        Ok(salt)
+                    }
+                    Err(err) => Err(format!("écriture de {path}: {err}")),
+                }
+            })
+            .await
+            .cloned()
+    }
+
     pub async fn ingest(
         &self,
         ns: &str,
@@ -1004,13 +1068,11 @@ impl Ctl {
                     serde_json::from_slice(line).map_err(|e| format!("ligne {}: {e}", i + 1))?;
                 parsed.push(e);
             }
-            let best = winners(&parsed);
-            Ok::<_, String>((parsed, best))
+            Ok::<_, String>(parsed)
         })
         .await
         .map_err(|e| IngestError::Invalid(e.to_string()))?
         .map_err(IngestError::Invalid)?;
-        let (parsed, best) = parsed;
 
         let e = self.entry(ns, wl);
         self.index_of(&e).await.map_err(IngestError::Storage)?;
@@ -1024,6 +1086,43 @@ impl Ctl {
                 duplicate: true,
             });
         }
+        // Redaction de nouveau, avec le sel du workload (spec §7) : un sidecar d'une version
+        // antérieure ou mal configuré ne fait rien écrire de sensible. Après le contrôle de
+        // doublon, qui n'a pas besoin du support.
+        let salt = self
+            .workload_salt(ns, wl)
+            .await
+            .map_err(IngestError::Storage)?;
+        let redactor = mimic_core::redact::Redactor::new(
+            mimic_core::redact::RedactConfig::default(),
+            salt.into_bytes(),
+        );
+        let (parsed, best, body) = tokio::task::spawn_blocking(move || {
+            let mut parsed = parsed;
+            let mut rewritten = false;
+            for e in &mut parsed {
+                let before = e.redactions.len();
+                // Bodies non analysables : laissés tels que le sidecar les a choisis.
+                redactor.redact_with(e, true);
+                rewritten |= e.redactions.len() > before;
+            }
+            // Réécrit seulement si une valeur a été remplacée : sinon octet pour octet.
+            let body = if rewritten {
+                let mut out = Vec::with_capacity(body.len());
+                for e in &parsed {
+                    serde_json::to_writer(&mut out, e).map_err(|e| e.to_string())?;
+                    out.push(b'\n');
+                }
+                Bytes::from(out)
+            } else {
+                body
+            };
+            let best = winners(&parsed);
+            Ok::<_, String>((parsed, best, body))
+        })
+        .await
+        .map_err(|e| IngestError::Invalid(e.to_string()))?
+        .map_err(IngestError::Invalid)?;
         let path = e.segment_path(&key);
         let create = PutOptions {
             mode: PutMode::Create,

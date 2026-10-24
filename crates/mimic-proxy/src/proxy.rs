@@ -511,8 +511,9 @@ fn record_websocket(state: &AppState, mut p: Pending, ended: Instant) {
         state.store.add_ephemeral(exchange);
     } else {
         // Headers redactés avant d'entrer dans le store, comme pour tout échange (RED-04).
-        state.redactor.redact(&mut exchange);
-        state.store.add(exchange, Origin::Local);
+        if state.redact(&mut exchange) {
+            state.store.add(exchange, Origin::Local);
+        }
     }
 }
 
@@ -612,7 +613,9 @@ async fn finalize(
         total_us: total.as_micros() as u64,
         redactions: vec![],
     };
-    state.redactor.redact(&mut exchange);
+    if !state.redact(&mut exchange) {
+        return;
+    }
     if state.store.add(exchange, Origin::Local) == Added::StoredWithoutBodies {
         dropped(&state, "sample_limit");
     }
@@ -677,7 +680,7 @@ async fn serve_mock(
             );
         }
     };
-    let request = MockRequest {
+    let mut request = MockRequest {
         authority: target.authority.clone(),
         method: parts.method.to_string(),
         path: parts.uri.path().to_string(),
@@ -685,6 +688,9 @@ async fn serve_mock(
         headers: to_headers(&parts.headers),
         body: body.to_vec(),
     };
+    // Comparée aux enregistrements redactés : redactée de même (spec §7). La requête relayée
+    // en mock-partial part des `parts` et du `body` d'origine.
+    state.redact_mock_request(&mut request);
     // Moteur courant, lu sans verrou ; construit ici seulement s'il n'y en a pas encore.
     let mut set = match state.mock_engine() {
         Some(set) => set,

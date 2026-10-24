@@ -82,6 +82,8 @@ async fn prx_02_large_streamed_body_is_relayed_and_truncated_in_store() {
     let app = fake_server().await;
     let mut cfg = config(Some(app.addr), Mode::Record);
     cfg.capture.max_body_bytes = 1024;
+    // Body binaire : gardé (tronqué) seulement par exception (spec §7).
+    cfg.redact.raw_bodies = vec!["inbound".into()];
     let p = proxy(cfg).await;
     let bytes = client()
         .get(inbound(&p, "/big"))

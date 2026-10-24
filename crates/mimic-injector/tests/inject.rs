@@ -692,3 +692,17 @@ fn inj_21_startup_probe_waits_for_the_startup_gate() {
         ("/healthz".into(), 10, 3)
     );
 }
+
+/// Bodies non analysables gardés pour ces hôtes : annotation reprise par le sidecar (RED-10).
+#[test]
+fn red_10_raw_bodies_annotation_reaches_the_sidecar() {
+    let p = injected(&pod(json!({"metadata": {"annotations": {
+        "mimic.platform.io/capture-raw-bodies": "api.partner.io, inbound"
+    }}})));
+    assert_eq!(
+        env_value(&sidecar_of(&p), "MIMIC_REDACT_RAW_BODIES"),
+        Some("api.partner.io,inbound")
+    );
+    let p = injected(&pod(json!({})));
+    assert_eq!(env_value(&sidecar_of(&p), "MIMIC_REDACT_RAW_BODIES"), None);
+}

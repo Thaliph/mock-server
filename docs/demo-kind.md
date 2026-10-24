@@ -115,11 +115,14 @@ apparaisse.
 
 ### 3.3 Webhook d'injection
 
-Même raison que plus haut : on abaisse la requête CPU de chaque sidecar injecté à 10m.
+Même raison que plus haut : on abaisse la requête CPU de chaque sidecar injecté à 10m. Et
+la démo parle gRPC et texte : ces bodies, que la redaction ne sait pas lire, ne sont capturés
+(et donc mockables) que par exception (`redact.raw_bodies`, ici pour tout).
 
 ```sh
 manifest deploy/injector/injector.yaml \
   | sed 's#requests: {cpu: 50m, memory: 64Mi}#requests: {cpu: 10m, memory: 64Mi}#' \
+  | sed 's#^      mock:$#      redact:\n        raw_bodies: ["*", inbound]\n      mock:#' \
   | kubectl apply -f -
 kubectl -n mimic-system rollout status deploy/mimic-injector --timeout=180s
 ```

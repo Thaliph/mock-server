@@ -218,6 +218,9 @@ fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<UnmatchedRep
     Ok(serde_json::from_value(v).ok())
 }
 
+/// Attente maximale du sel du workload par un battement.
+const SALT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 async fn heartbeat(
     State(ctl): State<Arc<Ctl>>,
     Path((ns, wl)): Path<(String, String)>,
@@ -268,7 +271,23 @@ async fn heartbeat(
             return (StatusCode::SERVICE_UNAVAILABLE, "support indisponible").into_response();
         }
     };
-    axum::Json(desired).into_response()
+    // Sel du workload (spec §7) : à côté de l'état souhaité, pour ses seuls pods. Support en
+    // échec : le battement répond sans, le sidecar garde le sien ou n'enregistre pas.
+    // Le battement n'attend jamais le support plus de `SALT_WAIT` (CTL-08) : la lecture se
+    // poursuit en tâche de fond, un battement suivant portera le sel.
+    let mut reply = serde_json::to_value(&desired).unwrap_or_default();
+    let read = {
+        let (ctl, ns, wl) = (ctl.clone(), ns.clone(), wl.clone());
+        tokio::spawn(async move { ctl.workload_salt(&ns, &wl).await })
+    };
+    match tokio::time::timeout(SALT_WAIT, read).await {
+        Ok(Ok(Ok(salt))) => reply["redact_salt"] = serde_json::Value::String(salt),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(namespace = %ns, workload = %wl, error = %e, "sel du workload illisible sur le support");
+        }
+        Ok(Err(_)) | Err(_) => {}
+    }
+    axum::Json(reply).into_response()
 }
 
 async fn get_snapshot(

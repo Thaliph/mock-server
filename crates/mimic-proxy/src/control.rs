@@ -54,6 +54,16 @@ pub struct Desired {
     pub mock_websocket: Option<String>,
 }
 
+/// Réponse d'un battement : l'état souhaité, et le sel du workload (spec §7), gardé à part
+/// pour n'être ni écrit ni affiché avec l'état souhaité.
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatReply {
+    #[serde(flatten)]
+    pub desired: Desired,
+    #[serde(default)]
+    pub redact_salt: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ControllerStatus {
     pub url: String,
@@ -61,6 +71,10 @@ pub struct ControllerStatus {
     pub last_ok_ms: Option<u64>,
     pub last_error: Option<String>,
 }
+
+/// Taille minimale acceptée d'une réponse de battement (celle d'un battement côté
+/// contrôleur, spec §9.2b).
+const HEARTBEAT_REPLY: usize = 64 * 1024;
 
 pub struct ControllerClient {
     base: String,
@@ -109,14 +123,25 @@ impl ControllerClient {
         })
     }
 
-    /// Appel attendu en `200` ou `201`.
+    /// Appel attendu en `200` ou `201`, réponse bornée à `share.max_snapshot_bytes`.
     async fn call(
         &self,
         method: Method,
         path: &str,
         body: Option<(Vec<u8>, &'static str)>,
     ) -> Result<Bytes, String> {
-        let r = self.send(method.clone(), path, body, None).await?;
+        self.call_within(method, path, body, self.max_body).await
+    }
+
+    /// Comme `call`, réponse bornée à `max` octets.
+    async fn call_within(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<(Vec<u8>, &'static str)>,
+        max: usize,
+    ) -> Result<Bytes, String> {
+        let r = self.send(method.clone(), path, body, None, max).await?;
         if r.status != StatusCode::OK && r.status != StatusCode::CREATED {
             return Err(rejected(&method, path, &r));
         }
@@ -130,6 +155,7 @@ impl ControllerClient {
         path: &str,
         body: Option<(Vec<u8>, &'static str)>,
         accept: Option<&'static str>,
+        max: usize,
     ) -> Result<Reply, String> {
         let mut req = Request::builder()
             .method(method.clone())
@@ -156,7 +182,6 @@ impl ControllerClient {
             .map_err(|_| format!("{method} {path}: délai dépassé"))?
             .map_err(|e| format!("{method} {path}: {}", error_chain(&e)))?;
         let (status, headers) = (resp.status(), resp.headers().clone());
-        let max = self.max_body;
         let body = tokio::time::timeout(
             TIMEOUT * 6,
             Limited::new(resp.into_body(), max).collect(),
@@ -193,7 +218,7 @@ impl ControllerClient {
         capture: InboundCapture,
         websocket: MockWebsocket,
         unmatched: &UnmatchedReport,
-    ) -> Result<Desired, String> {
+    ) -> Result<HeartbeatReply, String> {
         let body = serde_json::json!({
             "instance": self.instance,
             "mode": mode.as_str(),
@@ -203,11 +228,14 @@ impl ControllerClient {
             // Ignoré par un contrôleur d'une version antérieure (spec §9.2b).
             "unmatched": unmatched,
         });
+        // Une réponse de battement n'est pas un snapshot : au moins `HEARTBEAT_REPLY`
+        // octets, quelle que soit `share.max_snapshot_bytes`.
         let b = self
-            .call(
+            .call_within(
                 Method::POST,
                 "/heartbeat",
                 Some((body.to_string().into_bytes(), "application/json")),
+                self.max_body.max(HEARTBEAT_REPLY),
             )
             .await?;
         serde_json::from_slice(&b).map_err(|e| format!("battement: {e}"))
@@ -218,7 +246,7 @@ impl ControllerClient {
     pub async fn snapshot(&self, id: &str) -> Result<Fetched, String> {
         let path = format!("/snapshots/{id}/mock");
         let r = self
-            .send(Method::GET, &path, None, Some("zstd, gzip"))
+            .send(Method::GET, &path, None, Some("zstd, gzip"), self.max_body)
             .await?;
         match r.status {
             StatusCode::OK => Ok(Fetched {
@@ -613,7 +641,12 @@ async fn beat(state: &AppState, client: &ControllerClient) -> Beat {
         )
         .await
     {
-        Ok(d) => d,
+        Ok(reply) => {
+            if let Some(salt) = &reply.redact_salt {
+                state.set_workload_salt(salt);
+            }
+            reply.desired
+        }
         Err(e) => return Beat::Failed(e),
     };
     let wanted = match Wanted::parse(state, &desired) {

@@ -357,6 +357,7 @@ fn prx_22_zero_periods_and_caps_are_rejected() {
         Config::load_with(None, move |k| match k {
             "MIMIC_CONFIG_YAML" => Some(yaml.clone()),
             "MIMIC_WORKLOAD" => Some("api".into()),
+            "MIMIC_REDACT_SALT" => Some("sel".into()),
             _ => None,
         })
     };
@@ -495,6 +496,8 @@ async fn cap_11_inflight_copies_are_bounded_without_slowing_traffic() {
     // Tient une réponse de 600 KiB, pas deux.
     c.capture.max_inflight_bytes = 1024 * 1024;
     c.capture.max_body_bytes = 2 * 1024 * 1024;
+    // Body binaire : gardé, pour que le budget des copies en vol soit en jeu (spec §7).
+    c.redact.raw_bodies = vec!["inbound".into()];
     let p = proxy(c).await;
     let get = |n: u32| {
         let url = inbound(&p, &format!("/hold/{n}"));
@@ -534,42 +537,4 @@ async fn cap_11_inflight_copies_are_bounded_without_slowing_traffic() {
     let list = wait_exchanges(&p, "direction=inbound", 3).await;
     let third = list.iter().find(|e| e["path"] == "/hold/3").unwrap();
     assert_eq!(third["resp_body"]["kind"], "captured", "{third}");
-}
-
-/// Journal capturé par un abonné `tracing` de test.
-#[derive(Clone, Default)]
-struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Logs {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn red_06_missing_salt_is_announced_at_startup() {
-    for salt in [None, Some("sel-du-workload".to_string())] {
-        let logs = Logs::default();
-        let sink = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || sink.clone())
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let mut c = config(None, Mode::Record);
-        c.redact.salt = salt.clone();
-        let p = proxy(c).await;
-        drop(guard);
-        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        let warned = text
-            .lines()
-            .any(|l| l.contains("WARN") && l.contains("MIMIC_REDACT_SALT"));
-        assert_eq!(warned, salt.is_none(), "sel {salt:?} : {text}");
-        p.shutdown().await;
-    }
 }

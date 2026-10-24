@@ -74,8 +74,15 @@ impl Redactor {
     }
 
     /// Redacte l'échange en place et ajoute une [`RedactionMark`] par valeur remplacée.
-    /// L'opération est idempotente.
+    /// L'opération est idempotente. Les bodies non analysables ne sont pas gardés.
     pub fn redact(&self, e: &mut Exchange) {
+        self.redact_with(e, false);
+    }
+
+    /// Comme [`Redactor::redact`] ; `keep_raw` garde tels quels les bodies que la redaction ne
+    /// sait pas analyser (`redact.raw_bodies`, spec §7), sinon réduits à leur taille. Rend le
+    /// nombre de bodies ainsi réduits.
+    pub fn redact_with(&self, e: &mut Exchange, keep_raw: bool) -> usize {
         let mut marks = vec![];
         self.redact_headers(&mut e.req_headers, "request", &mut marks);
         self.redact_headers(&mut e.resp_headers, "response", &mut marks);
@@ -87,9 +94,53 @@ impl Redactor {
         }
         let req_ct = e.req_header("content-type").map(media_type);
         let resp_ct = e.resp_header("content-type").map(media_type);
-        self.redact_body(&mut e.req_body, req_ct.as_deref(), "request", &mut marks);
-        self.redact_body(&mut e.resp_body, resp_ct.as_deref(), "response", &mut marks);
+        let mut dropped = 0;
+        for (body, media, side) in [
+            (&mut e.req_body, req_ct.as_deref(), "request"),
+            (&mut e.resp_body, resp_ct.as_deref(), "response"),
+        ] {
+            if !self.redact_body(body, media, side, &mut marks)
+                && !keep_raw
+                && let Some(size) = raw_size(body)
+            {
+                *body = Body::Skipped { size };
+                dropped += 1;
+            }
+        }
         e.redactions.extend(marks);
+        dropped
+    }
+
+    /// Redacte une requête reçue par le mock comme l'échange enregistré, pour qu'elle se
+    /// compare aux enregistrements (spec §7). Un body illisible est gardé : il ne sera pas
+    /// écrit, seulement comparé.
+    pub fn redact_mock_request(&self, r: &mut crate::mock::MockRequest) {
+        let mut marks = vec![];
+        self.redact_headers(&mut r.headers, "request", &mut marks);
+        for (name, value) in &mut r.query {
+            if self.is_sensitive_name(name) && !is_marker(value) {
+                *value = self.marker(value.as_bytes());
+            }
+        }
+        let media = r
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+            .map(|h| media_type(&h.value));
+        let Some(media) = media else { return };
+        let before = marks.len();
+        let rewritten = if is_json(&media) {
+            self.redact_json_bytes(&r.body, "request", &mut marks)
+        } else if media == "application/x-www-form-urlencoded" {
+            Some(self.redact_form(&r.body, "request", &mut marks))
+        } else {
+            None
+        };
+        if let Some(bytes) = rewritten
+            && marks.len() > before
+        {
+            r.body = bytes;
+        }
     }
 
     fn redact_headers(&self, headers: &mut [Header], side: &str, marks: &mut Vec<RedactionMark>) {
@@ -103,17 +154,19 @@ impl Redactor {
         }
     }
 
+    /// Redacte un body JSON ou formulaire ; faux pour un body que la redaction ne sait pas
+    /// analyser (autre type, ou pas de type), laissé à l'appelant.
     fn redact_body(
         &self,
         body: &mut Body,
         media: Option<&str>,
         side: &str,
         marks: &mut Vec<RedactionMark>,
-    ) {
-        let Some(media) = media else { return };
+    ) -> bool {
+        let Some(media) = media else { return false };
         let textual = is_json(media) || media == "application/x-www-form-urlencoded";
         if !textual {
-            return;
+            return false;
         }
         match body {
             Body::Captured { data } => {
@@ -140,6 +193,7 @@ impl Redactor {
             Body::Truncated { size, .. } => *body = Body::Skipped { size: *size },
             Body::Empty | Body::Skipped { .. } => {}
         }
+        true
     }
 
     fn redact_json_bytes(
@@ -240,6 +294,15 @@ impl Redactor {
         let digest = h.finalize();
         let hex: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
         format!("{MARKER_PREFIX}{hex}>")
+    }
+}
+
+/// Taille d'un body gardé (complet ou préfixe), `None` s'il n'y a rien à retirer.
+fn raw_size(body: &Body) -> Option<u64> {
+    match body {
+        Body::Captured { data } if !data.is_empty() => Some(data.len() as u64),
+        Body::Truncated { size, .. } => Some(*size),
+        _ => None,
     }
 }
 

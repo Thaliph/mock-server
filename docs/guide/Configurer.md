@@ -52,7 +52,8 @@ annotation `mimic.platform.io/config: <nom>`, clé `mimic.yaml`, montée dans `/
 | `capture.max_store_bytes` | `67108864` (64 MiB) | budget mémoire du store (octets estimés), bodies au plus pour moitié. Doit être positif |
 | `capture.inbound` | `full` | `full`, `metadata` (méthode, chemin, code, durées, tailles ; en mémoire seulement), `off` (métriques seules). Le contrôleur peut l'imposer |
 | `redact.extra_json_paths` | `[]` | chemins JSON supplémentaires à redacter, forme `$.a.b` (sans index de tableau) |
-| `redact.salt` | absent | sel des marques de redaction (`MIMIC_REDACT_SALT`). Absent : sel aléatoire par processus, les marques changent à chaque redémarrage et d'un pod à l'autre |
+| `redact.salt` | absent | sel des marques de redaction (`MIMIC_REDACT_SALT`). Absent sous contrôleur : sel du workload reçu à chaque battement ; absent sans contrôleur : refus de démarrer (`redact.salt requis sans contrôleur`) |
+| `redact.raw_bodies` | `[]` | bodies que la redaction ne sait pas lire (XML, texte, `multipart`, gRPC, binaire, sans `Content-Type`) gardés tels quels, sans redaction, pour ces hôtes (`api.partner.io`, `*.partner.io`, `*`) et `inbound` pour l'entrant ; ailleurs, non capturés et donc non rejouables (`599` en mock) |
 | `mock.strategy` | `best` | `best`, `round-robin`, `sequence`, `weighted-status` (voir [Modes](Modes.md#choix-de-la-réponse)) |
 | `mock.unmatched` | `error` | `error` : `599` et `x-mimic-unmatched: true` ; `passthrough` : relayée et enregistrée |
 | `mock.latency_factor` | `1.0` | multiplicateur de la latence rejouée, entre 0 et 100 ; `0` : aucune attente |
@@ -118,6 +119,7 @@ share:
 | `MIMIC_MODE` | remplace `mode` (valeur inconnue : `MIMIC_MODE inconnu: …`) |
 | `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` | remplacent `instance`, `workload.namespace`, `workload.name` |
 | `MIMIC_REDACT_SALT` | remplace `redact.salt` |
+| `MIMIC_REDACT_RAW_BODIES` | remplace `redact.raw_bodies` (liste séparée par des virgules) |
 | `MIMIC_VERSION`, `MIMIC_POD_TEMPLATE_HASH` | label `version` : `MIMIC_VERSION` non vide, sinon `version` de la configuration, sinon `MIMIC_POD_TEMPLATE_HASH` ; tronqué à 63 caractères ; vide : pas de label |
 | `MIMIC_TLS_INTERCEPT` | remplace `tls.intercept` (liste séparée par des virgules) |
 | `MIMIC_LOG` | filtre des logs JSON (`info` par défaut ; par exemple `debug`, `mimic_proxy=debug`). Posée par le webhook depuis l'annotation `mimic.platform.io/log` ou `sidecar_log` |
@@ -143,6 +145,7 @@ le **template** du pod (Deployment, StatefulSet…).
 | `mimic.platform.io/tls-intercept` | liste d'hôtes | `MIMIC_TLS_INTERCEPT` pour le sidecar ; dans chaque conteneur de l'app, volume `mimic-ca` monté en lecture seule sur `/var/run/mimic/ca`, et `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (`ca-bundle.crt`), `NODE_EXTRA_CA_CERTS` (`ca.crt`), sans écraser une variable déjà définie |
 | `mimic.platform.io/config` | nom de ConfigMap | ConfigMap (clé `mimic.yaml`) montée sur `/etc/mimic`, sidecar lancé avec `--config /etc/mimic/mimic.yaml` au lieu de `MIMIC_CONFIG_YAML` |
 | `mimic.platform.io/mesh` | `auto`, `none`, `istio`, `istio-ambient`, `linkerd` | `MIMIC_MESH` ; sinon `istio` ou `linkerd` si leurs conteneurs sont déjà dans le pod, sinon `auto`. Valeur inconnue : injecté en `auto` avec un avertissement |
+| `mimic.platform.io/capture-raw-bodies` | hôtes séparés par des virgules, `inbound` | `MIMIC_REDACT_RAW_BODIES` : bodies non analysables gardés en clair pour ces dépendances, pour pouvoir les mocker |
 | `mimic.platform.io/log` | filtre `EnvFilter` (`debug`, `warn,mimic_proxy=debug`) | `MIMIC_LOG` du sidecar, à la place de `sidecar_log` ; pris en compte à la création du pod (redéployer pour changer). Filtre invalide : ignoré avec un avertissement d'admission |
 
 Posées **par** le webhook : annotation `mimic.platform.io/status: injected` et label

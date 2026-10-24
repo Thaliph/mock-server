@@ -49,7 +49,11 @@ pub struct AppState {
     mock_websocket: AtomicU8,
     pub store: Store,
     pub metrics: Metrics,
-    pub redactor: Redactor,
+    /// Redaction : sel de la configuration, sinon celui du workload reçu du contrôleur ;
+    /// absente tant qu'aucun sel n'est connu (spec §7).
+    redactor: arc_swap::ArcSwapOption<Redactor>,
+    /// Sel du workload appliqué ; jamais affiché ni écrit.
+    workload_salt: Mutex<Option<String>>,
     pub client: Client<Upstream, ProxyBody>,
     /// Client HTTP/2 seulement (h2c en connaissance préalable, h2 via ALPN) : gRPC.
     pub client_h2: Client<Upstream, ProxyBody>,
@@ -106,27 +110,85 @@ pub struct ShareStatus {
     pub last_error: Option<String>,
 }
 
+/// Redaction de la configuration avec ce sel.
+fn redactor(config: &Config, salt: &str) -> Redactor {
+    Redactor::new(
+        RedactConfig {
+            extra_json_paths: config.redact.extra_json_paths.clone(),
+            ..RedactConfig::default()
+        },
+        salt.as_bytes().to_vec(),
+    )
+}
+
+/// Hôte d'une authority `hôte[:port]` ou `[ipv6]:port`.
+fn host_of(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+}
+
 impl AppState {
-    pub fn new(config: Config) -> Result<Arc<Self>, String> {
-        let salt = match &config.redact.salt {
-            Some(s) => s.as_bytes().to_vec(),
-            None => {
-                // Sel propre au processus : les marqueurs ne se comparent plus entre pods (§7).
-                tracing::warn!(
-                    "aucun sel de redaction (redact.salt, MIMIC_REDACT_SALT) : sel aléatoire, \
-                     les marqueurs de redaction changent d'un pod et d'un redémarrage à l'autre \
-                     (dédoublonnage, snapshots et comparaisons entre pods faussés) ; fournir \
-                     MIMIC_REDACT_SALT par le Secret <workload>-mimic, clé redact-salt"
-                );
-                ulid::Ulid::generate().to_string().into_bytes()
+    /// Redacte un échange avant le store (RED-04, spec §7) ; faux s'il doit être abandonné
+    /// faute de sel (sous contrôleur, avant le premier battement), ce qui est compté.
+    pub fn redact(&self, e: &mut mimic_core::model::Exchange) -> bool {
+        let Some(redactor) = self.redactor.load_full() else {
+            self.metrics.count_dropped("no_salt");
+            return false;
+        };
+        let raw = &self.config.redact.raw_bodies;
+        let keep_raw = match e.direction {
+            mimic_core::model::Direction::Inbound => raw.iter().any(|p| p == "inbound"),
+            mimic_core::model::Direction::Outbound => {
+                crate::tls::intercepted(raw, host_of(&e.authority))
             }
         };
-        let redactor = Redactor::new(
-            RedactConfig {
-                extra_json_paths: config.redact.extra_json_paths.clone(),
-                ..RedactConfig::default()
-            },
-            salt,
+        for _ in 0..redactor.redact_with(e, keep_raw) {
+            self.metrics.count_dropped("unredactable");
+        }
+        true
+    }
+
+    /// Redacte la requête reçue par le mock comme les enregistrements (spec §7) ; sans sel
+    /// connu, elle est comparée telle quelle.
+    pub fn redact_mock_request(&self, r: &mut mimic_core::mock::MockRequest) {
+        if let Some(redactor) = self.redactor.load_full() {
+            redactor.redact_mock_request(r);
+        }
+    }
+
+    /// Sel du workload reçu du contrôleur : pris si la configuration n'en fixe pas (le
+    /// Secret l'emporte), gardé en mémoire seulement (spec §7).
+    pub fn set_workload_salt(&self, salt: &str) {
+        if self.config.redact.salt.is_some() || salt.is_empty() {
+            return;
+        }
+        if self
+            .workload_salt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            == Some(salt)
+        {
+            return;
+        }
+        self.redactor
+            .store(Some(Arc::new(redactor(&self.config, salt))));
+        *self
+            .workload_salt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(salt.to_string());
+    }
+
+    pub fn new(config: Config) -> Result<Arc<Self>, String> {
+        config.validate()?;
+        let redactor = arc_swap::ArcSwapOption::from(
+            config
+                .redact
+                .salt
+                .as_ref()
+                .map(|s| Arc::new(redactor(&config, s))),
         );
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
@@ -209,6 +271,7 @@ impl AppState {
             store,
             metrics,
             redactor,
+            workload_salt: Mutex::new(None),
             client,
             client_h2,
             engines: crate::engine::Engines::default(),
