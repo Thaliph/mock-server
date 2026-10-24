@@ -60,6 +60,7 @@ annotation `mimic.platform.io/config: <nom>`, clé `mimic.yaml`, montée dans `/
 | `mock.match_headers` | `[]` | headers discriminants comparés pour choisir la réponse (`accept`, `x-api-version`…) |
 | `mock.seed` | `24301` (`0x5EED`) | graine du tirage (latence, `weighted-status`) |
 | `mock.debug_header` | `true` | ajoute `x-mimic-match: <exact\|template\|fuzzy>;score=<s>` aux réponses mockées |
+| `mock.from` | absent | mock local (sans contrôleur) : snapshot JSONL servi au démarrage (`mimicctl pull`), mode `mock` (ou `mock-partial` si demandé) ; incompatible avec `share` ; sel facultatif. Voir `deploy/local/` |
 | `mock.websocket` | `relay` | poignée de main WebSocket sortante en mock : `relay` (relayée) ou `refuse` (`503`). Le contrôleur peut l'imposer |
 | `mock.tcp` | `refuse` | connexion TCP sortante non HTTP en `mock`, connexions restées muettes 30 s comprises : `refuse` (refermée sans joindre la dépendance, comptée dans `mimic_passthrough_connections_total{result="refused"}`) ou `relay` (tunnel vers la vraie dépendance, qui reçoit la charge). Sans effet en `mock-partial` (toujours relayé) et sur l'entrant. Ni le contrôleur ni l'injecteur ne le transmettent : pour garder une seule dépendance réelle, préférer `mimic.platform.io/exclude-outbound-ports` (voir [Modes](Modes.md#trafic-sortant)) |
 | `store.dir` | absent | répertoire du journal local et du cache des snapshots ; absent : mémoire seule |
@@ -119,6 +120,7 @@ share:
 | `MIMIC_MODE` | remplace `mode` (valeur inconnue : `MIMIC_MODE inconnu: …`) |
 | `POD_NAME`, `POD_NAMESPACE`, `MIMIC_WORKLOAD` | remplacent `instance`, `workload.namespace`, `workload.name` |
 | `MIMIC_REDACT_SALT` | remplace `redact.salt` |
+| `MIMIC_MOCK_FROM` | remplace `mock.from` (comme `--mock-from`) |
 | `MIMIC_REDACT_RAW_BODIES` | remplace `redact.raw_bodies` (liste séparée par des virgules) |
 | `MIMIC_VERSION`, `MIMIC_POD_TEMPLATE_HASH` | label `version` : `MIMIC_VERSION` non vide, sinon `version` de la configuration, sinon `MIMIC_POD_TEMPLATE_HASH` ; tronqué à 63 caractères ; vide : pas de label |
 | `MIMIC_TLS_INTERCEPT` | remplace `tls.intercept` (liste séparée par des virgules) |
@@ -126,7 +128,8 @@ share:
 | `MIMIC_STORE_SIZE_LIMIT_BYTES` | remplace `store.size_limit_bytes` (taille de l'`emptyDir` du store, en octets), posée par le webhook ; valeur non numérique : erreur au démarrage |
 | `AWS_*` | identifiants, région, endpoint du partage direct `s3://` |
 
-Options de la ligne de commande : `--config <fichier>`, `--probe <chemin>` (sonde `exec` :
+Options de la ligne de commande : `--config <fichier>`, `--mock-from <fichier>` (mock local,
+comme `mock.from`), `--probe <chemin>` (sonde `exec` :
 interroge l'API admin locale et sort en 0 sur une réponse 2xx, en 1 sinon, en moins de 2 s),
 `--version`.
 

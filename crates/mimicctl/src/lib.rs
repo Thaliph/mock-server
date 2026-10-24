@@ -852,3 +852,34 @@ pub fn emergency_message(target: &str, stop: bool) -> String {
         }
     )
 }
+
+/// Snapshot à télécharger pour le mock local (spec §9.7) : celui demandé, sinon celui que
+/// sert le workload (`desired.snapshot` de sa fiche), sinon le plus récent.
+pub fn pull_choice(
+    requested: Option<&str>,
+    workload: &Value,
+    snapshots: &Value,
+) -> Result<String, String> {
+    if let Some(id) = requested {
+        return Ok(id.to_string());
+    }
+    if let Some(id) = workload["desired"]["snapshot"].as_str() {
+        return Ok(id.to_string());
+    }
+    snapshots
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((s["created_ms"].as_i64().unwrap_or(0), s["id"].as_str()?)))
+        .max()
+        .map(|(_, id)| id.to_string())
+        .ok_or_else(|| {
+            "aucun snapshot pour ce workload : en construire un (mimicctl mode <workload> mock)"
+                .into()
+        })
+}
+
+/// Fichier écrit par défaut par `mimicctl pull`.
+pub fn pull_file(workload: &str, id: &str) -> String {
+    format!("{workload}-{id}.jsonl")
+}

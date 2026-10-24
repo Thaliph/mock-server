@@ -281,6 +281,24 @@ Durées : `500ms`, `60s`, `2m`, `1h`. Proportions : `0.3` ou `30%`. La cible doi
 depuis l'endroit où tourne `mimicctl` (`kubectl port-forward svc/checkout 8080`, ou le Job de
 `deploy/load/job.yaml`, dont l'image contient `mimicctl`).
 
+## `pull`
+
+```sh
+mimicctl pull <workload> [--snapshot <id>] [-o fichier] [-n ns]
+```
+
+Télécharge un snapshot pour le mock local (spec §9.7) : celui demandé, sinon celui que sert le
+workload, sinon le plus récent. Écrit `<workload>-<id>.jsonl` par défaut (échanges redactés,
+format de `snapshot export`), puis rappelle la commande qui le sert sans cluster. Mêmes droits
+que `snapshot ls` et `snapshot export`.
+
+```sh
+mimicctl pull checkout -n shop
+mimic-proxy --mock-from checkout-3f9a0c1e5b7d2a46.jsonl   # puis HTTP_PROXY=http://127.0.0.1:15101
+```
+
+Exemple complet, avec docker-compose : `deploy/local/`.
+
 ## `snapshot`
 
 Cycle de vie des snapshots (spec §5.6) : écrits une fois (contenu immuable, métadonnées

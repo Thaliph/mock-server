@@ -91,9 +91,20 @@ impl Running {
 }
 
 /// Démarre les listeners et les tâches de fond.
-pub async fn start(config: Config) -> Result<Running, String> {
+pub async fn start(mut config: Config) -> Result<Running, String> {
+    config.local_mode();
     config.validate()?;
     let state = AppState::new(config)?;
+    // Mock local (spec §9.7) : le snapshot du fichier, relu et vérifié comme un import.
+    if let Some(path) = &state.config.mock.from {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let snapshot = mimic_core::snapshot::Snapshot::parse(&bytes)
+            .map_err(|e| format!("snapshot {}: {e}", path.display()))?;
+        tracing::info!(file = %path.display(), snapshot = %snapshot.id, exchanges = snapshot.exchanges.len(), "mock local");
+        state.set_snapshot(Some(std::sync::Arc::new(
+            mimic_core::snapshot::MockSnapshot::from_snapshot(&snapshot),
+        )));
+    }
     if let Some(dir) = &state.config.store.dir {
         let journal = journal::JournalConfig::new(
             dir,

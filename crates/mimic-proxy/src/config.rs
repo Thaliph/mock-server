@@ -344,6 +344,8 @@ pub struct MockSection {
     /// TCP sortant non HTTP en `mock` (spec §3.4) ; `mock-partial` relaie toujours. Réglage
     /// du sidecar seulement : le contrôleur ne le transmet pas.
     pub tcp: MockTcp,
+    /// Mock local (spec §9.7) : snapshot JSONL servi au démarrage, sans contrôleur.
+    pub from: Option<PathBuf>,
 }
 
 impl Default for MockSection {
@@ -357,6 +359,7 @@ impl Default for MockSection {
             debug_header: true,
             websocket: MockWebsocket::Relay,
             tcp: MockTcp::Refuse,
+            from: None,
         }
     }
 }
@@ -637,6 +640,10 @@ impl Config {
                 .map_err(|_| format!("MIMIC_STORE_SIZE_LIMIT_BYTES invalide (octets) : {v}"))?;
             self.store.size_limit_bytes = Some(bytes);
         }
+        if let Some(v) = get("MIMIC_MOCK_FROM").filter(|v| !v.trim().is_empty()) {
+            self.mock.from = Some(PathBuf::from(v.trim()));
+        }
+        self.local_mode();
         if let Some(v) = get("MIMIC_REDACT_RAW_BODIES") {
             self.redact.raw_bodies = v
                 .split(',')
@@ -656,10 +663,27 @@ impl Config {
         Ok(())
     }
 
+    /// Mock local (spec §9.7) : démarre en `mock`, sauf `mock-partial` demandé.
+    pub fn local_mode(&mut self) {
+        if self.mock.from.is_some() && self.mode != Mode::MockPartial {
+            self.mode = Mode::Mock;
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
+        if self.mock.from.is_some() && self.share.is_some() {
+            return Err(
+                "mock.from (mock local) et share sont incompatibles : le mock local se passe de contrôleur"
+                    .into(),
+            );
+        }
         // Sans sel, les marqueurs changeraient d'un pod et d'un redémarrage à l'autre ; sous
-        // contrôleur, le sel du workload arrive par le battement (spec §7).
-        if self.redact.salt.is_none() && !self.share.as_ref().is_some_and(|s| s.is_controller()) {
+        // contrôleur, le sel du workload arrive par le battement (spec §7). Le mock local ne
+        // publie rien : un sel du processus suffit.
+        if self.redact.salt.is_none()
+            && self.mock.from.is_none()
+            && !self.share.as_ref().is_some_and(|s| s.is_controller())
+        {
             return Err(
                 "redact.salt requis sans contrôleur : fournir MIMIC_REDACT_SALT (Secret \
                  <workload>-mimic, clé redact-salt) ou redact.salt"

@@ -86,6 +86,21 @@ que chaque appel que fera le test a été enregistré : un appel jamais vu en `r
 Le sidecar a aussi sa page, pour **ce pod** seulement :
 `kubectl -n shop port-forward pod/<pod> 15100`, puis `http://127.0.0.1:15100/`.
 
+## Mocker vos dépendances sur votre poste ou en CI
+
+Le snapshot de votre workload sert aussi hors du cluster : `mimicctl pull` le télécharge,
+`mimic-proxy --mock-from` le sert, et votre application passe par lui en proxy explicite.
+
+```sh
+mimicctl pull checkout -n shop -o snapshot.jsonl
+mimic-proxy --mock-from snapshot.jsonl &                    # écoute 127.0.0.1:15101
+HTTP_PROXY=http://127.0.0.1:15101 HTTPS_PROXY=http://127.0.0.1:15101 ./mon-service
+```
+
+Les appels enregistrés reçoivent leur réponse, les autres `599`. Une dépendance HTTPS doit
+être dans `tls.intercept` (et l'application faire confiance à la CA publiée dans
+`tls.ca_dir`). Exemple docker-compose prêt à l'emploi : `deploy/local/`.
+
 ## Headers ajoutés par le sidecar
 
 | Header | Sur | Valeur | Sens |

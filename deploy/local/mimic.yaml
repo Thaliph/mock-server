@@ -1,0 +1,14 @@
+# Sidecar en mock local (spec §9.7) : pas de contrôleur, pas d'iptables. L'application passe
+# par le sidecar en proxy explicite (HTTP_PROXY) ; le snapshot est donné par --mock-from.
+inbound:
+  enabled: false
+# Joignable depuis le conteneur de l'application, pas seulement de la boucle locale.
+outbound:
+  listen: 0.0.0.0:15101
+# /healthz et /metrics depuis l'hôte (le reste ne répond qu'à la boucle locale du conteneur).
+admin:
+  listen: 0.0.0.0:15100
+# Pour une dépendance HTTPS : l'intercepter, et faire confiance à /ca/ca.crt dans l'application.
+# tls:
+#   intercept: [api.partner.io]
+#   ca_dir: /ca

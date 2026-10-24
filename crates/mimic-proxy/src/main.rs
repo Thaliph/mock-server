@@ -13,6 +13,9 @@ struct Args {
     /// Interroge l'API admin du sidecar (`/healthz`…) et sort : sonde `exec` (spec §3.3.4).
     #[arg(long, value_name = "CHEMIN")]
     probe: Option<String>,
+    /// Mock local (spec §9.7) : sert ce snapshot JSONL (`mimicctl pull`), sans contrôleur.
+    #[arg(long, value_name = "FICHIER")]
+    mock_from: Option<PathBuf>,
 }
 
 fn main() {
@@ -39,7 +42,12 @@ async fn run(args: Args) {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let config = match Config::load(args.config.as_deref()) {
+    // `--mock-from` vaut `MIMIC_MOCK_FROM`, avant la validation (sel facultatif en local).
+    let mock_from = args.mock_from.as_ref().map(|p| p.display().to_string());
+    let config = match Config::load_with(args.config.as_deref(), |k| match (k, &mock_from) {
+        ("MIMIC_MOCK_FROM", Some(file)) => Some(file.clone()),
+        _ => std::env::var(k).ok(),
+    }) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("mimic: {e}");
