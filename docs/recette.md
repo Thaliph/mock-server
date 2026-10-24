@@ -361,10 +361,11 @@ rm -f shipping-*.jsonl rapport.md /tmp/rwo.yaml /tmp/s3.yaml
 
 ## Recette du 24 octobre 2026
 
-Faite sans kind (Docker indisponible) : poste, puis un vrai `kube-apiserver` 1.32 et etcd
+D'abord sans kind : poste, puis un vrai `kube-apiserver` 1.32 et etcd
 lancés en utilisateur (front proxy, RBAC, Pod Security), le contrôleur, le webhook et un
 sidecar en processus, rattachés à de vrais objets (pods sans nœud, jetons liés aux pods), et
-le plugin CNI dans un namespace réseau sans privilège (`unshare --map-auto -rn`).
+le plugin CNI dans un namespace réseau sans privilège (`unshare --map-auto -rn`). Puis sur
+kind (kind 0.27, Kubernetes 1.32) : `scripts/e2e-kind.sh` complet, puis C6, C9 et A5.
 
 | Étape | Résultat |
 |-------|----------|
@@ -372,14 +373,16 @@ le plugin CNI dans un namespace réseau sans privilège (`unshare --map-auto -rn
 | A2 | **KO puis OK** : test promtool de `MimicVersionSkew` faux (points espacés de 10 min) ; corrigé |
 | A3 | **KO puis OK** : variantes imbriquées dans la base, refusées par kustomize ; déplacées en `deploy/controller-rwo` et `deploy/controller-s3` |
 | A4 | OK |
-| A5 | non fait (Docker) |
-| C1, C6 | non faits (pas de nœud) ; couverts par CTL-28 et MCK-28 |
+| A5 | OK : `200`, `x-mimic-match: exact` toutes les 5 s, `mimic_mode{mode="mock"} 1` |
+| B (`e2e-kind.sh`) | **KO puis OK** : le script lisait `ALIGNED` en 5e colonne de `mimicctl status`, devenue la 6e avec `UNMATCHED` (v0.19) ; corrigé (dernière colonne). Puis démo complète réussie |
+| C1 | OK (E2E-06) : réplique active supprimée sous trafic, relais en 2 s, 25 lots de requêtes tous réussis |
+| C6 | OK : `frontend` en mock, `shipping` arrêté : 20/20 devis (réponses gRPC rejouées avec leurs trailers) |
 | C2 | OK : `mimic_build_info`, `mimic_controller_pods{workload}`, expiration du certificat, disque du store |
 | C3 | OK : APIService `Available`, compte limité à `mimic-data-viewer` : `export`, `requests`, `report` sans port-forward ; autre namespace et cluster refusés |
 | C4 | OK |
 | C5 | OK : sel du workload sur le support, absent du sidecar ; marqueurs recalculés à l'identique |
 | C7 | OK : namespace et global, condition `EmergencyStop`, injection coupée, levée sur le même snapshot |
 | C8, C11 | OK ; **bug trouvé** : chaque pod injecté recevait l'avertissement « mimic non injecté : mimic déjà injecté » (réinvocation du webhook par l'API server) ; corrigé (INJ-02) |
-| C9 | OK hors runtime réel : pod refusé en `baseline` sans CNI, admis avec ; installateur (chaînage, kubeconfig, retrait) ; `ADD` pose les règles dans le namespace du pod |
+| C9 | OK, sur kind aussi : plugin chaîné après kindnet, pod `nginx` admis en `baseline` sans `mimic-init`, règles posées par containerd via `mimic-cni`, requête entrante comptée par le sidecar, plugin retiré à la suppression du DaemonSet |
 | C10 | OK, avec le compte limité |
 

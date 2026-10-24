@@ -185,12 +185,13 @@ log "mock global : seules les cibles du générateur reçoivent du trafic"
 mocked=$(kubectl -n "$NS" get deploy -o name | sed 's|.*/||' | grep -vxE 'load-generator|valkey-cart')
 for w in $mocked; do mimicctl mode "$w" mock -n "$NS" >/dev/null; done
 # all_aligned <mode> : chaque workload de $mocked a tous ses pods sur <mode> (et un snapshot en mock).
+# ALIGNED est la dernière colonne de `mimicctl status`.
 all_aligned() {
   local out w
   out=$(mimicctl status -n "$NS")
   for w in $mocked; do
     echo "$out" | awk -v w="$w" -v m="$1" '
-      $2 == w && $3 == m && (m != "mock" || $4 != "-") { split($5, a, "/"); if (a[2] > 0 && a[1] == a[2]) ok = 1 }
+      $2 == w && $3 == m && (m != "mock" || $4 != "-") { split($NF, a, "/"); if (a[2] > 0 && a[1] == a[2]) ok = 1 }
       END { exit !ok }' || return 1
   done
 }
