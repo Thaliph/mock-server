@@ -8,7 +8,9 @@
 | `crd.yaml` | CRD `MimicWorkload`, générée par `mimic-controller crd` |
 | `rbac.yaml` | droits du contrôleur, rôles `mimic-operator` (bascule), `mimic-viewer`, `mimic-data-viewer` (lecture des données d'un namespace par l'API agrégée) et `mimic-cli` (port-forward des exploitants) |
 | `certificates.yaml` | CA dédiée et certificat du contrôleur (cert-manager), CA publiée dans les namespaces (trust-manager) |
-| `controller.yaml` | configuration, PVC, Deployment (deux réplicas, une active), Service, PodDisruptionBudget, NetworkPolicy |
+| `controller.yaml` | configuration, PVC `ReadWriteMany`, Deployment (deux réplicas, une active), Service, PodDisruptionBudget, NetworkPolicy, APIService |
+| `kustomization.yaml` | `kubectl apply -k deploy/controller` : namespace, CRD, RBAC, certificats, contrôleur |
+| `overlays/s3/`, `overlays/rwo/` | variantes de stockage : bucket S3 sans PVC ; PVC `ReadWriteOnce`, répliques sur un même nœud, sans PodDisruptionBudget |
 | `production-guard.yaml` | facultatif (Kubernetes ≥ 1.30) : `ValidatingAdmissionPolicy` qui refuse une `MimicWorkload` en `mock` ou `mock-partial` dans un namespace labellisé `env=production` |
 
 Prérequis : cert-manager et trust-manager, ce dernier avec `mimic-system` comme namespace
@@ -69,16 +71,17 @@ maintenance (une minute) sont refaits depuis les segments, toujours sur le suppo
 
 **Stockage** : une seule réplique écrit, mais les deux doivent monter le support.
 
-| Support | Ce qu'il faut |
-|---------|---------------|
-| `s3://…` (recommandé en production) | rien : supprimer le PVC et son montage, `store: s3://bucket/prefixe` |
-| PVC `ReadWriteMany` (EFS, Filestore, Azure Files, CephFS, NFS…) | `accessModes: ["ReadWriteMany"]` et la `storageClassName` du stockage partagé : les deux réplicas peuvent être sur deux nœuds |
-| PVC `ReadWriteOnce` (défaut des manifests) | suffit sur un nœud (kind) ou avec un volume local, qui garde les deux réplicas sur le même nœud : la passive couvre la perte du pod, pas celle du nœud. Avec un disque réseau sur plusieurs nœuds, une passive placée ailleurs reste en `ContainerCreating` (`Multi-Attach`) : passer à `ReadWriteMany` ou `s3://`, ou retirer l'anti-affinité |
+| Variante | Commande | Quand | Ce qui change |
+|----------|----------|-------|---------------|
+| défaut | `kubectl apply -k deploy/controller` | stockage partagé disponible (EFS, Filestore, Azure Files, CephFS, NFS) | PVC `ReadWriteMany` ; poser sa `storageClassName` si la classe par défaut du cluster n'est pas partagée (sinon le PVC reste `Pending`) ; les deux réplicas sur deux nœuds |
+| `overlays/s3` | `kubectl apply -k deploy/controller/overlays/s3` | recommandé en production, plusieurs nœuds | `store: s3://…` (bucket à adapter dans l'overlay), plus de PVC ; identifiants `AWS_*` du Secret facultatif `mimic-controller-s3`, ou identité de pod (IRSA, Workload Identity) |
+| `overlays/rwo` | `kubectl apply -k deploy/controller/overlays/rwo` | pas de stockage partagé (kind, disque réseau `ReadWriteOnce`) | PVC `ReadWriteOnce` ; les deux réplicas et celle d'un rollout sur le nœud du volume (affinité requise), jamais en `Multi-Attach` ; pas de PodDisruptionBudget, pour qu'un drain puisse déplacer le volume : la passive couvre la perte du pod, pas celle du nœud, et le contrôleur est indisponible pendant un drain (les sidecars gardent leur dernier état) |
 
 Le Deployment se met à jour sans coupure du service des sidecars (`RollingUpdate`,
 `maxUnavailable: 0`, l'active partant en dernier grâce à son `pod-deletion-cost`), le
 PodDisruptionBudget (`minAvailable: 1`) empêche un drain d'évincer les deux réplicas à la
-fois, et l'anti-affinité (préférentielle) les place sur deux nœuds quand c'est possible.
+fois, et l'anti-affinité (préférentielle) les place sur deux nœuds quand c'est possible
+(`overlays/rwo` : même nœud, sans PodDisruptionBudget).
 Métriques : `mimic_controller_leader` (1 sur l'active) et `mimic_controller_takeover_seconds`
 (collecte : ci-dessous).
 Droits ajoutés (`rbac.yaml`, Role dans `mimic-system`) : le bail, et `list`/`patch` sur les

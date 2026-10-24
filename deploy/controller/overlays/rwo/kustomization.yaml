@@ -1,0 +1,47 @@
+# Contrôleur sur un PVC ReadWriteOnce, sans stockage partagé (spec §5.5.4) :
+#   kubectl apply -k deploy/controller/overlays/rwo
+# Le volume ne s'attache qu'à un nœud : les deux répliques, et celle d'un rollout, y sont
+# placées par une affinité requise. Plus de PodDisruptionBudget : un drain doit pouvoir
+# déplacer les deux répliques avec leur volume (le contrôleur est indisponible le temps de
+# repartir ; les sidecars gardent leur dernier état). La passive couvre la perte du processus
+# ou du pod, pas celle du nœud.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../..
+patches:
+  - target: {kind: PersistentVolumeClaim, name: mimic-controller}
+    patch: |
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: mimic-controller
+        namespace: mimic-system
+      spec:
+        accessModes: ["ReadWriteOnce"]
+  - target: {kind: Deployment, name: mimic-controller}
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mimic-controller
+        namespace: mimic-system
+      spec:
+        template:
+          spec:
+            affinity:
+              podAntiAffinity:
+                $patch: delete
+              podAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - topologyKey: kubernetes.io/hostname
+                    labelSelector:
+                      matchLabels: {app.kubernetes.io/name: mimic-controller}
+  - target: {kind: PodDisruptionBudget, name: mimic-controller}
+    patch: |
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: mimic-controller
+        namespace: mimic-system

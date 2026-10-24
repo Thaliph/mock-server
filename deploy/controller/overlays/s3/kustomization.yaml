@@ -1,0 +1,74 @@
+# Contrôleur sur un stockage objet S3-compatible, recommandé en production (spec §5.5.4) :
+#   kubectl -n mimic-system create secret generic mimic-controller-s3 \
+#     --from-literal=AWS_REGION=eu-west-3 --from-literal=AWS_ACCESS_KEY_ID=… \
+#     --from-literal=AWS_SECRET_ACCESS_KEY=…     # ou une identité de pod (IRSA, Workload Identity)
+#   kubectl apply -k deploy/controller/overlays/s3
+# Configuration identique au défaut hors `store` (vérifié par CTL-50) : à adapter ensemble.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../..
+patches:
+  - target: {kind: ConfigMap, name: mimic-controller}
+    patch: |
+      - op: replace
+        path: /data/controller.yaml
+        value: |
+          listen: 0.0.0.0:8443
+          ui_listen: 127.0.0.1:8081
+          # API agrégée de lecture data.mimic.platform.io (spec §9.2c) : CA du front proxy lue
+          # dans kube-system/extension-apiserver-authentication.
+          aggregated:
+            listen: 0.0.0.0:8444
+          tls:
+            cert_file: /etc/mimic/tls/tls.crt
+            key_file: /etc/mimic/tls/tls.key
+          auth:
+            kind: kubernetes
+          store: s3://mimic-controller/   # à adapter : bucket et préfixe ; AWS_* du Secret mimic-controller-s3
+          retention: 86400                   # 24 heures ; les exemples par endpoint couvrent le reste
+          max_exchanges_per_workload: 200000
+          max_exchanges_total: 1000000
+          samples_per_operation: 20
+          max_bytes_per_workload: 268435456
+          max_exemplars_per_workload: 10000
+          max_exemplar_bytes_per_workload: 67108864  # 64 MiB d'exemples sérialisés par workload
+          max_exemplar_bytes_total: 536870912        # 512 MiB tous workloads confondus
+          discovery_interval: 30
+          snapshot:
+            max_per_key: 50
+          pod_timeout: 30
+          pod_forget: 600
+          # Deux réplicas, une seule active (spec §5.5.4) ; identité : POD_NAME.
+          leader_election:
+            lease: mimic-controller
+            namespace: mimic-system
+            lease_duration: 15
+            renew_deadline: 10
+            retry_period: 2
+  - target: {kind: PersistentVolumeClaim, name: mimic-controller}
+    patch: |
+      $patch: delete
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: mimic-controller
+        namespace: mimic-system
+  - target: {kind: Deployment, name: mimic-controller}
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mimic-controller
+        namespace: mimic-system
+      spec:
+        template:
+          spec:
+            containers:
+              - name: controller
+                envFrom:
+                  - secretRef: {name: mimic-controller-s3, optional: true}
+            volumes:
+              - name: data
+                persistentVolumeClaim: null
+                emptyDir: {}

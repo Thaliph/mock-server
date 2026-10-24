@@ -127,7 +127,7 @@ qu'il a importé, sans garantie que tous les pods servent les mêmes données.
 
 ## Stockage côté contrôleur
 
-Support : `file:///var/lib/mimic-controller` (PVC `mimic-controller`, 10 Gi, `ReadWriteOnce` dans les manifests : voir [Exploiter en production](Exploiter-en-production.md#stockage-du-contrôleur) pour plusieurs nœuds)
+Support : `file:///var/lib/mimic-controller` (PVC `mimic-controller`, 10 Gi, `ReadWriteMany` par défaut, `ReadWriteOnce` avec `overlays/rwo` : voir [Exploiter en production](Exploiter-en-production.md#stockage-du-contrôleur) pour plusieurs nœuds)
 ou `s3://bucket/prefixe` (identifiants `AWS_*`, IRSA par exemple). Seule la réplique active
 y écrit. Arborescence par workload :
 
