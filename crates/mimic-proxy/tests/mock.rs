@@ -31,6 +31,7 @@ fn recorded(path: &str, id: &str, body: &str) -> Exchange {
         ttfb_us: 100,
         total_us: 100,
         trace_id: None,
+        resp_trailers: vec![],
         redactions: vec![],
     }
 }

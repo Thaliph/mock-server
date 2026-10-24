@@ -243,6 +243,7 @@ async fn call_through(p: &Running, ca_pem: &[u8], port: u16, alpn: &[&[u8]]) -> 
         String::from_utf8_lossy(&head)
     );
     let mut roots = rustls::RootCertStore::empty();
+    use rustls_pki_types::pem::PemObject;
     for c in rustls_pki_types::CertificateDer::pem_slice_iter(ca_pem) {
         roots.add(c.unwrap()).unwrap();
     }

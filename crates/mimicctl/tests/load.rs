@@ -38,6 +38,7 @@ fn exchange(path: &str, at: u64) -> Exchange {
         ttfb_us: 1,
         total_us: 1,
         trace_id: None,
+        resp_trailers: vec![],
         redactions: vec![],
     }
 }

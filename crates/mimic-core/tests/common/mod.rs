@@ -35,6 +35,7 @@ pub fn exchange(method: &str, path_and_query: &str) -> Exchange {
         ttfb_us: 1_000,
         total_us: 1_000,
         trace_id: None,
+        resp_trailers: vec![],
         redactions: vec![],
     }
 }

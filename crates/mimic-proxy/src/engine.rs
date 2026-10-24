@@ -86,6 +86,8 @@ pub struct Prepared {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
+    /// Trailers enregistrés (gRPC), rejoués après le body ; `None` s'il n'y en a pas.
+    pub trailers: Option<HeaderMap>,
 }
 
 /// Moteur publié, avec la réponse préparée de chaque enregistrement rejouable.
@@ -140,10 +142,20 @@ fn prepare(r: &MockResponse) -> Prepared {
         },
         _ => Bytes::copy_from_slice(data),
     };
+    let mut trailers = HeaderMap::new();
+    for h in &r.exchange.resp_trailers {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(h.name.as_bytes()),
+            HeaderValue::from_str(&h.value),
+        ) {
+            trailers.append(n, v);
+        }
+    }
     Prepared {
         status: StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK),
         headers,
         body,
+        trailers: (!trailers.is_empty()).then_some(trailers),
     }
 }
 
@@ -485,6 +497,7 @@ mod tests {
             ttfb_us: 10,
             total_us: 10,
             trace_id: None,
+            resp_trailers: vec![],
             redactions: vec![],
         }
     }

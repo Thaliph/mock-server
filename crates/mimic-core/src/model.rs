@@ -108,6 +108,10 @@ pub struct Exchange {
     pub status: u16,
     pub resp_headers: Vec<Header>,
     pub resp_body: Body,
+    /// Trailers de la réponse (HTTP/2 : `grpc-status`, `grpc-message`), rejoués par le mock ;
+    /// absents de la sérialisation s'il n'y en a pas (identifiants de snapshot inchangés).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resp_trailers: Vec<Header>,
     /// Temps jusqu'au premier octet de réponse, en microsecondes.
     pub ttfb_us: u64,
     /// Durée totale de l'échange, en microsecondes.
