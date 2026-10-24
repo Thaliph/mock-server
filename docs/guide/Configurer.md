@@ -182,7 +182,8 @@ Fichier passé par `--config` (ou `-c`, ou `MIMIC_INJECTOR_CONFIG`), obligatoire
 |-------|--------|-------|
 | `listen` | `0.0.0.0:8443` | écoute du webhook |
 | `tls.cert_file`, `tls.key_file` | absent | certificat servi à l'API server ; absent, HTTP en clair (tests uniquement) |
-| `image` | **requis** | image de `mimic-init` et du sidecar injectés |
+| `image` | **requis** | image du sidecar injecté (`ghcr.io/thaliph/mimic`) |
+| `init_image` | **requis** sauf `cni: true` | image de `mimic-init` (`ghcr.io/thaliph/mimic-init`, avec iptables) |
 | `image_pull_policy` | absent | `imagePullPolicy` des conteneurs injectés |
 | `exclude_outbound_cidrs` | `[]` | CIDR jamais redirigés (API Kubernetes en tête) |
 | `iptables` | absent | `MIMIC_IPTABLES` de `mimic-init` (`iptables-legacy` selon les nœuds) |

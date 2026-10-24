@@ -68,6 +68,13 @@ jobs:
           tags: mimic:e2e
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: init
+          load: true
+          tags: mimic-init:e2e
+          cache-from: type=gha
       - uses: helm/kind-action@v1
         with:
           version: v0.27.0
@@ -111,6 +118,13 @@ jobs:
           tags: mimic:e2e
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: init
+          load: true
+          tags: mimic-init:e2e
+          cache-from: type=gha
       - uses: helm/kind-action@v1
         with:
           version: v0.27.0

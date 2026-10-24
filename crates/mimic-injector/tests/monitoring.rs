@@ -7,7 +7,7 @@ use serde_json::json;
 
 fn config(extra: &str) -> InjectorConfig {
     let config: InjectorConfig = serde_yaml::from_str(&format!(
-        "image: ghcr.io/thaliph/mimic:0.1.0\nsidecar_config: \"mode: record\\n\"\n{extra}"
+        "image: ghcr.io/thaliph/mimic:0.1.0\ninit_image: ghcr.io/thaliph/mimic-init:0.1.0\nsidecar_config: \"mode: record\\n\"\n{extra}"
     ))
     .unwrap();
     config.validate().unwrap();
@@ -90,7 +90,7 @@ fn mon_03_invalid_log_annotation_is_ignored_with_a_warning() {
 #[test]
 fn mon_03_invalid_sidecar_log_is_refused_at_startup() {
     let config: InjectorConfig = serde_yaml::from_str(
-        "image: mimic:test\nsidecar_config: \"mode: record\\n\"\nsidecar_log: \"mimic_proxy=bavard\"\n",
+        "image: mimic:test\ninit_image: mimic-init:test\nsidecar_config: \"mode: record\\n\"\nsidecar_log: \"mimic_proxy=bavard\"\n",
     )
     .unwrap();
     assert!(config.validate().unwrap_err().contains("sidecar_log"));

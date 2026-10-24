@@ -23,30 +23,47 @@ Versions vérifiées par la CI (`scripts/e2e-lib.sh`, `docs/e2e-kind.md`) : nœu
 `kindest/node:v1.32.2`, cert-manager v1.21.1, trust-manager v0.24.0, Istio 1.30.6,
 Linkerd `edge-26.10.1`.
 
-## Image
+## Images
 
-Une seule image porte les quatre binaires (`mimic-proxy`, point d'entrée, `mimic-init`,
-`mimic-controller`, `mimic-injector`) et tourne par défaut sous `1338:1338`.
+Deux images, toutes deux sous l'utilisateur `1338:1338` (détail : spec §9.4b) :
+
+| Image | Contenu | Base |
+|-------|---------|------|
+| **`ghcr.io/thaliph/mimic:0.1.0`** | sidecar `mimic-proxy` (point d'entrée), `mimic-controller`, `mimic-injector`, `mimicctl`, plugin `mimic-cni` | distroless (`gcr.io/distroless/cc-debian13:nonroot`) : ni shell ni gestionnaire de paquets |
+| **`ghcr.io/thaliph/mimic-init:0.1.0`** | `mimic-init` et `iptables` (nft et legacy) | `debian:trixie-slim` |
+
+Les images publiées sont multi-architecture (amd64, arm64) et signées par cosign, avec SBOM et
+provenance. Vérifier une image avant de la déployer :
 
 ```sh
+cosign verify ghcr.io/thaliph/mimic:0.1.0 \
+  --certificate-identity-regexp 'https://github.com/Thaliph/mock-server/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Construire les deux images pour un registre interne (cible `init`, puis la cible par défaut) :
+
+```sh
+docker build --target init -t registry.interne/platform/mimic-init:0.1.0 .
 docker build -t registry.interne/platform/mimic:0.1.0 .
+docker push registry.interne/platform/mimic-init:0.1.0
 docker push registry.interne/platform/mimic:0.1.0
 ```
 
-Les manifests visent l'image publiée **`ghcr.io/thaliph/mimic:0.1.0`**, à quatre endroits :
-l'image du Deployment du contrôleur, celle du Deployment du webhook, le champ `image` de la
-configuration du webhook (image injectée dans les pods) et le Job de tir de charge. Pour
-pointer vers un registre interne, les remplacer ensemble :
+Les manifests visent `ghcr.io/thaliph/mimic:0.1.0` dans le Deployment du contrôleur, celui du
+webhook, le champ `image` de la configuration du webhook (sidecar injecté), le DaemonSet CNI et
+le Job de tir de charge ; `ghcr.io/thaliph/mimic-init:0.1.0` dans le champ `init_image` de la
+configuration du webhook. Pour un registre interne, les remplacer ensemble :
 
 ```sh
-IMAGE=registry.interne/platform/mimic:0.1.0
-for f in deploy/controller/controller.yaml deploy/injector/injector.yaml deploy/load/job.yaml; do
-  sed -i "s#ghcr.io/thaliph/mimic:0.1.0#$IMAGE#g" "$f"
+for f in deploy/controller/controller.yaml deploy/injector/injector.yaml deploy/cni/mimic-cni.yaml deploy/load/job.yaml; do
+  sed -i -e "s#ghcr.io/thaliph/mimic-init:0.1.0#registry.interne/platform/mimic-init:0.1.0#g" \
+         -e "s#ghcr.io/thaliph/mimic:0.1.0#registry.interne/platform/mimic:0.1.0#g" "$f"
 done
 ```
 
 Même substitution sans modifier les fichiers (`manifest … | kubectl apply -f -`) : voir la
-[démo locale sur kind](../demo-kind.md), qui charge une image construite localement.
+[démo locale sur kind](../demo-kind.md), qui charge des images construites localement.
 
 ## Ordre d'installation
 

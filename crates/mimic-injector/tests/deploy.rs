@@ -159,6 +159,15 @@ fn inj_20_production_manifests() {
     let config: InjectorConfig =
         serde_yaml::from_str(cm["data"]["injector.yaml"].as_str().unwrap()).unwrap();
     assert_eq!(config.image, IMAGE);
+    assert_eq!(
+        config.init_image.as_deref(),
+        Some("ghcr.io/thaliph/mimic-init:0.1.0")
+    );
+    assert!(
+        include_str!("../../../deploy/example/deployment.yaml")
+            .contains("image: ghcr.io/thaliph/mimic-init:0.1.0"),
+        "exemple : mimic-init sur son image"
+    );
     assert!(
         config.exclude_outbound_cidrs.is_empty(),
         "IP de l'API Kubernetes lue au démarrage, rien de codé en dur : {:?}",
