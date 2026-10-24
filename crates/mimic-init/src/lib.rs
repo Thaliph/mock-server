@@ -564,6 +564,18 @@ pub fn parse_cidrs(s: &str) -> Result<Vec<String>, String> {
     items(s).map(parse_cidr).collect()
 }
 
+/// Binaires iptables admis (`MIMIC_IPTABLES`) : la valeur devient le nom d'un programme
+/// lancé, en root sur le nœud pour `mimic-cni`, qui la lit dans une annotation du pod.
+pub const IPTABLES_TOOLS: [&str; 3] = ["iptables", "iptables-nft", "iptables-legacy"];
+
+/// Binaire iptables (`MIMIC_IPTABLES`), parmi `IPTABLES_TOOLS`.
+pub fn parse_iptables(s: &str) -> Result<String, String> {
+    IPTABLES_TOOLS
+        .contains(&s)
+        .then(|| s.to_string())
+        .ok_or_else(|| format!("{s:?} : attendu {}", IPTABLES_TOOLS.join(", ")))
+}
+
 /// IP du pod (`POD_IP`), cible du DNAT en ambient.
 pub fn parse_pod_ip(s: &str) -> Result<String, String> {
     s.trim()

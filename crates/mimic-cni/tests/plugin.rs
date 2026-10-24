@@ -148,6 +148,11 @@ fn cni_01_errors_are_reported_in_cni_format() {
     for (bad, needle) in [
         (json!("pas un objet"), RULES_ANNOTATION),
         (json!({"MIMIC_OOPS": "1"}), "MIMIC_OOPS"),
+        // Le plugin tourne en root sur le nœud : jamais un programme choisi par le pod.
+        (
+            json!({"MIMIC_IPTABLES": "/proc/1/root/tmp/x"}),
+            "MIMIC_IPTABLES",
+        ),
     ] {
         let host = Fake {
             annotations: Some(rules(bad)),

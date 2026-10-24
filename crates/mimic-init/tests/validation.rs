@@ -68,6 +68,8 @@ fn ini_11_invalid_values_stop_mimic_init_with_code_2() {
         ("MIMIC_EXCLUDE_INBOUND_PORTS", "0"),
         ("MIMIC_INBOUND_PORTS", "http"),
         ("POD_IP", "10.0.0.1 -j ACCEPT"),
+        ("MIMIC_IPTABLES", "/tmp/x"),
+        ("MIMIC_IPTABLES", "iptables -w"),
     ] {
         let out = dry_run(&[(var, value)]);
         assert_eq!(out.status.code(), Some(2), "{var}={value:?}");

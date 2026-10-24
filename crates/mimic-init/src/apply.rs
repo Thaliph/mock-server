@@ -5,8 +5,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use crate::{
-    InboundPorts, MeshMode, RulesConfig, parse_cidrs, parse_pod_ip, parse_ports, plan_jump, render,
-    resolve_mesh,
+    InboundPorts, MeshMode, RulesConfig, parse_cidrs, parse_iptables, parse_pod_ip, parse_ports,
+    plan_jump, render, resolve_mesh,
 };
 
 /// Réglages de `mimic-init`, tels que reçus (variables d'environnement ou annotation CNI).
@@ -85,6 +85,7 @@ impl From<String> for Failure {
 /// Valeurs analysées avant toute commande (spec §3.1) ; l'erreur nomme la variable.
 struct Parsed {
     mode: MeshMode,
+    iptables: String,
     inbound_ports: InboundPorts,
     exclude_inbound_ports: Vec<u16>,
     exclude_outbound_cidrs: Vec<String>,
@@ -96,6 +97,7 @@ fn parse(args: &Settings) -> Result<Parsed, String> {
     let named = |var: &'static str| move |e: String| format!("{var}: {e}");
     Ok(Parsed {
         mode: MeshMode::parse(&args.mesh).map_err(named("MIMIC_MESH"))?,
+        iptables: parse_iptables(&args.iptables).map_err(named("MIMIC_IPTABLES"))?,
         inbound_ports: InboundPorts::parse(&args.inbound_ports)
             .map_err(named("MIMIC_INBOUND_PORTS"))?,
         exclude_inbound_ports: parse_ports(&args.exclude_inbound_ports)
@@ -124,7 +126,7 @@ pub fn apply(args: &Settings, log: &mut dyn Write) -> Result<(), Failure> {
     // Règles déjà posées, par binaire : le mesh et la table où il les a mises.
     let mut saves = vec![];
     if mode != MeshMode::None {
-        for tool in [args.iptables.as_str(), "iptables-nft", "iptables-legacy"] {
+        for tool in [parsed.iptables.as_str(), "iptables-nft", "iptables-legacy"] {
             if saves.iter().any(|(t, _)| t == tool) {
                 continue;
             }
@@ -133,7 +135,7 @@ pub fn apply(args: &Settings, log: &mut dyn Write) -> Result<(), Failure> {
             }
         }
     }
-    let resolved = resolve_mesh(mode, &args.iptables, &saves);
+    let resolved = resolve_mesh(mode, &parsed.iptables, &saves);
     say!(
         log,
         "mimic-init: mesh {:?}, binaire {}",
