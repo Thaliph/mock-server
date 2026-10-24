@@ -98,12 +98,14 @@ Si `certificates.yaml` est refusé juste après l'installation de cert-manager (
 webhook "webhook.cert-manager.io"`), son webhook n'est pas encore prêt : relancer la commande
 quelques secondes plus tard.
 
-Le nœud kind est seul : on ramène la mémoire demandée par chaque réplique du contrôleur de
-1Gi à 256Mi pour que tout tienne.
+Le nœud kind est seul et n'a pas de stockage partagé : on prend la variante `overlays/rwo`
+(PVC `ReadWriteOnce`, les deux répliques sur le nœud du volume), et on ramène la mémoire
+demandée par chaque réplique de 1Gi à 256Mi pour que tout tienne.
 
 ```sh
-manifest deploy/controller/controller.yaml \
-  | sed 's#requests: {cpu: 100m, memory: 1Gi}#requests: {cpu: 100m, memory: 256Mi}#' \
+kubectl kustomize deploy/controller/overlays/rwo \
+  | manifest \
+  | sed 's#memory: 1Gi$#memory: 256Mi#' \
   | kubectl apply -f -
 kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
 kubectl -n mimic-system get pods -l app.kubernetes.io/name=mimic-controller -L mimic.platform.io/leader

@@ -93,8 +93,11 @@ install_mimic() {
   reissue_if_stale mimic-controller-tls
   # Même raison que pour les sidecars ci-dessous : sur l'unique nœud de kind, trois
   # réplicas (deux plus celle du rollout) demandant 1Gi chacune laissent trop peu de place.
-  manifest deploy/controller/controller.yaml \
-    | sed 's#requests: {cpu: 100m, memory: 1Gi}#requests: {cpu: 100m, memory: 256Mi}#' \
+  # kind n'a pas de stockage partagé : variante ReadWriteOnce, répliques sur le nœud du
+  # volume (spec §5.5.4). kustomize écrit les ressources en blocs : seule la demande vaut 1Gi.
+  kubectl kustomize deploy/controller/overlays/rwo \
+    | manifest \
+    | sed 's#memory: 1Gi$#memory: 256Mi#' \
     | kubectl apply -f -
   kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
   retry 60 has_leader || fail "aucune réplique active du contrôleur"

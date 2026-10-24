@@ -38,17 +38,17 @@ data:
       renew_deadline: 10
       retry_period: 2
 ---
-# Monté par les deux réplicas, écrit par la seule active (spec §5.5.4). ReadWriteOnce
-# suffit sur un nœud (kind) ou avec un volume local, qui garde les deux réplicas sur le même
-# nœud. Sur plusieurs nœuds : ReadWriteMany (storageClassName d'un stockage partagé : EFS,
-# Filestore, Azure Files, CephFS, NFS…), ou `store: s3://…` et plus de PVC du tout.
+# Monté par les deux réplicas, écrit par la seule active (spec §5.5.4) : ReadWriteMany, pour
+# qu'elles tournent sur deux nœuds. Classe de stockage partagé du cluster, ou à poser
+# (storageClassName : EFS, Filestore, Azure Files, CephFS, NFS…). Sans stockage partagé :
+# overlays/s3 (plus de PVC) ou overlays/rwo (ReadWriteOnce, répliques sur un même nœud).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: mimic-controller
   namespace: mimic-system
 spec:
-  accessModes: ["ReadWriteOnce"]
+  accessModes: ["ReadWriteMany"]
   resources:
     requests: {storage: 10Gi}
 ---
@@ -74,7 +74,7 @@ spec:
       labels: {app.kubernetes.io/name: mimic-controller}
     spec:
       serviceAccountName: mimic-controller
-      # Deux nœuds quand c'est possible, un seul sinon (kind, PVC ReadWriteOnce local).
+      # Deux nœuds quand c'est possible, un seul sinon (overlays/rwo l'impose).
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

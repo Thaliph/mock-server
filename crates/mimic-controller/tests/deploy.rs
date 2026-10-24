@@ -639,3 +639,115 @@ fn sec_08_aggregated_read_api_manifests() {
     granted.sort_unstable();
     assert_eq!(granted, ["get", "list"]);
 }
+
+/// Correctif d'un overlay qui vise `kind`/`name`.
+fn patch_for<'a>(k: &'a serde_yaml::Value, kind: &str, name: &str) -> &'a serde_yaml::Value {
+    k["patches"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|p| p["target"]["kind"] == kind && p["target"]["name"] == name)
+        .unwrap_or_else(|| panic!("correctif {kind} {name} absent"))
+}
+
+/// Contenu d'un correctif en ligne (`patch: |`).
+fn inline(p: &serde_yaml::Value) -> serde_yaml::Value {
+    serde_yaml::from_str(p["patch"].as_str().unwrap()).unwrap()
+}
+
+/// Stockage partagé par défaut, variantes S3 et `ReadWriteOnce` (CTL-50).
+#[test]
+fn ctl_50_storage_variants_keep_both_replicas_schedulable() {
+    let base = docs(include_str!("../../../deploy/controller/controller.yaml"));
+    let pvc = find(&base, "PersistentVolumeClaim", "mimic-controller");
+    assert_eq!(pvc["spec"]["accessModes"][0], "ReadWriteMany");
+    let deploy = find(&base, "Deployment", "mimic-controller");
+    let pod = &deploy["spec"]["template"]["spec"];
+    assert!(pod["affinity"]["podAntiAffinity"].is_mapping());
+    let labels = &pod["affinity"]["podAntiAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"]
+        [0]["podAffinityTerm"]["labelSelector"]["matchLabels"];
+    assert_eq!(
+        find(&base, "PodDisruptionBudget", "mimic-controller")["spec"]["minAvailable"].as_u64(),
+        Some(1)
+    );
+
+    // Base kustomize : des fichiers qui existent, contrôleur compris.
+    let k: serde_yaml::Value = serde_yaml::from_str(include_str!(
+        "../../../deploy/controller/kustomization.yaml"
+    ))
+    .unwrap();
+    let files: Vec<&str> = k["resources"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    for f in &files {
+        let path = format!("{}/../../deploy/controller/{f}", env!("CARGO_MANIFEST_DIR"));
+        assert!(std::path::Path::new(&path).exists(), "{f} absent");
+    }
+    assert!(files.contains(&"controller.yaml"), "{files:?}");
+
+    // ReadWriteOnce : tout sur le nœud du volume, sans PodDisruptionBudget.
+    let rwo: serde_yaml::Value = serde_yaml::from_str(include_str!(
+        "../../../deploy/controller/overlays/rwo/kustomization.yaml"
+    ))
+    .unwrap();
+    assert_eq!(rwo["resources"][0], "../..");
+    let pvc = inline(patch_for(&rwo, "PersistentVolumeClaim", "mimic-controller"));
+    assert_eq!(pvc["spec"]["accessModes"][0], "ReadWriteOnce");
+    let affinity = &inline(patch_for(&rwo, "Deployment", "mimic-controller"))["spec"]["template"]["spec"]
+        ["affinity"];
+    assert_eq!(affinity["podAntiAffinity"]["$patch"], "delete");
+    let term = &affinity["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"][0];
+    assert_eq!(term["topologyKey"], "kubernetes.io/hostname");
+    assert_eq!(&term["labelSelector"]["matchLabels"], labels);
+    let pdb = inline(patch_for(&rwo, "PodDisruptionBudget", "mimic-controller"));
+    assert_eq!(pdb["$patch"], "delete");
+    assert_eq!(
+        deploy["spec"]["strategy"]["rollingUpdate"]["maxSurge"].as_u64(),
+        Some(1),
+        "la réplique du rollout rejoint le nœud du volume"
+    );
+
+    // S3 : même configuration hors `store`, plus de PVC.
+    let s3: serde_yaml::Value = serde_yaml::from_str(include_str!(
+        "../../../deploy/controller/overlays/s3/kustomization.yaml"
+    ))
+    .unwrap();
+    assert_eq!(s3["resources"][0], "../..");
+    let ops: serde_yaml::Value = serde_yaml::from_str(
+        patch_for(&s3, "ConfigMap", "mimic-controller")["patch"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let op = &ops[0];
+    assert_eq!(op["op"], "replace");
+    assert_eq!(op["path"], "/data/controller.yaml");
+    let text = op["value"].as_str().unwrap();
+    let s3_config: ControllerConfig = serde_yaml::from_str(text).unwrap();
+    s3_config.validate().unwrap();
+    assert!(s3_config.store.starts_with("s3://"), "{}", s3_config.store);
+    let cm = find(&base, "ConfigMap", "mimic-controller");
+    let mut base_yaml: serde_yaml::Value =
+        serde_yaml::from_str(cm["data"]["controller.yaml"].as_str().unwrap()).unwrap();
+    let mut s3_yaml: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
+    base_yaml.as_mapping_mut().unwrap().remove("store");
+    s3_yaml.as_mapping_mut().unwrap().remove("store");
+    assert_eq!(base_yaml, s3_yaml, "configuration S3 = défaut hors store");
+    let pvc = inline(patch_for(&s3, "PersistentVolumeClaim", "mimic-controller"));
+    assert_eq!(pvc["$patch"], "delete");
+    let pod = &inline(patch_for(&s3, "Deployment", "mimic-controller"))["spec"]["template"]["spec"];
+    let data = pod["volumes"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "data")
+        .unwrap();
+    assert!(data["emptyDir"].is_mapping());
+    assert!(data["persistentVolumeClaim"].is_null());
+    let env_from = &pod["containers"][0]["envFrom"][0]["secretRef"];
+    assert_eq!(env_from["name"], "mimic-controller-s3");
+    assert_eq!(env_from["optional"], true);
+}
