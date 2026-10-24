@@ -145,7 +145,11 @@ pub fn settings(annotation: &str, pod_ip: Option<String>) -> Result<Settings, St
             "MIMIC_EXCLUDE_OUTBOUND_PORTS" => s.exclude_outbound_ports = v,
             "MIMIC_MESH" => s.mesh = v,
             "MIMIC_IPV6" => s.ipv6 = v == "true",
-            "MIMIC_IPTABLES" => s.iptables = v,
+            // Lancé en root sur le nœud : jamais un programme choisi par le pod.
+            "MIMIC_IPTABLES" => {
+                s.iptables = mimic_init::parse_iptables(&v)
+                    .map_err(|e| format!("annotation {RULES_ANNOTATION} : MIMIC_IPTABLES {e}"))?;
+            }
             other => {
                 return Err(format!(
                     "annotation {RULES_ANNOTATION} : variable inconnue {other}"
