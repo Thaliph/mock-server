@@ -2,6 +2,8 @@
 //!
 //! La génération est pure et testée ; l'application est faite par le binaire `mimic-init`.
 
+pub mod apply;
+
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
