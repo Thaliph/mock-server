@@ -253,11 +253,14 @@ jobs:
           # La release peut déjà exister si le tag a été créé depuis l'interface GitHub
           # (« Draft a new release ») : on y ajoute alors les binaires, sans toucher à ses
           # notes si elles sont déjà rédigées.
+          # Versions 0.x et suffixées (-rc.1…) : pré-version, pas encore stable.
+          pre=()
+          case "$VERSION" in 0.*|*-*) pre=(--prerelease) ;; esac
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
             if [ -z "$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)" ]; then
               gh release edit "$GITHUB_REF_NAME" --title "mimic $VERSION" --notes-file notes.md
             fi
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --title "mimic $VERSION" --notes-file notes.md --verify-tag
+            gh release create "$GITHUB_REF_NAME" dist/* --title "mimic $VERSION" --notes-file notes.md --verify-tag "${pre[@]}"
           fi
