@@ -514,7 +514,7 @@ async fn ctl_09_vanished_pods_are_forgotten() {
     assert!(pods(&c).await.is_empty());
     let m = get_text(&c, "/metrics").await;
     assert!(
-        m.contains(r#"mimic_controller_pods{state="absent"} 0"#),
+        m.contains(r#"mimic_controller_pods{workload="shop/checkout",state="absent"} 0"#),
         "{m}"
     );
 }

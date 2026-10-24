@@ -469,6 +469,12 @@ impl AppState {
 
     pub fn refresh_store_metrics(&self) {
         self.metrics.store_bytes.set(self.store.bytes() as i64);
+        let store = &self.config.store;
+        let disk = store.dir.as_deref().map_or(0, disk_bytes);
+        self.metrics.store_disk_bytes.set(disk as i64);
+        self.metrics
+            .store_disk_limit_bytes
+            .set(store.size_limit_bytes.unwrap_or(0) as i64);
         let (local, peer) = self.store.counts();
         for (origin, n) in [("local", local), ("peer", peer)] {
             self.metrics
@@ -477,4 +483,20 @@ impl AppState {
                 .set(n as i64);
         }
     }
+}
+
+/// Octets des fichiers sous `dir`, sous-répertoires compris ; un fichier qui disparaît
+/// pendant le parcours (rotation, purge) ne compte pas.
+fn disk_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => disk_bytes(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }

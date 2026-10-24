@@ -38,7 +38,7 @@ use tokio::sync::OnceCell;
 
 use crate::auth::Authenticator;
 use crate::config::ControllerConfig;
-use crate::metrics::{Metrics, StateLabel};
+use crate::metrics::Metrics;
 use crate::mock_form::{EncodedMock, MAX_CACHE_BYTES, MockForms};
 use crate::reconcile::{
     Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, desired_for_pod, desired_of,
@@ -1665,24 +1665,23 @@ impl Ctl {
             .fold((0, 0), |(n, b), (dn, db)| (n + dn, b + db));
         self.metrics.exemplars.set(exemplars as i64);
         self.metrics.exemplars_bytes.set(bytes as i64);
-        let mut counts: BTreeMap<&'static str, i64> =
-            [("aligned", 0), ("diverging", 0), ("absent", 0)].into();
+        let mut counts: BTreeMap<String, [i64; 3]> = BTreeMap::new();
         for (ns, wl) in keys {
+            let slot = counts.entry(format!("{ns}/{wl}")).or_default();
             let Ok(states) = self.with_live(&ns, &wl, |l| self.pod_states(l)).await else {
                 continue;
             };
             for (_, s, _) in states {
-                *counts.entry(s.as_str()).or_default() += 1;
+                // Dans l'ordre de `Metrics::set_pods`.
+                let i = match s {
+                    PodState::Aligned => 0,
+                    PodState::Diverging => 1,
+                    PodState::Absent => 2,
+                };
+                slot[i] += 1;
             }
         }
-        for (state, n) in counts {
-            self.metrics
-                .pods
-                .get_or_create(&StateLabel {
-                    state: state.into(),
-                })
-                .set(n);
-        }
+        self.metrics.set_pods(&counts);
     }
 
     /// Passe de maintenance (toutes les minutes) : pods oubliés, puis pour chaque workload

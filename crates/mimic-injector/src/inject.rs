@@ -22,6 +22,12 @@ pub const ANNOTATION_EXCLUDE_CIDRS: &str = "mimic.platform.io/exclude-outbound-c
 pub const ANNOTATION_EXCLUDE_PORTS: &str = "mimic.platform.io/exclude-outbound-ports";
 pub const ANNOTATION_TLS_INTERCEPT: &str = "mimic.platform.io/tls-intercept";
 pub const ANNOTATION_MESH: &str = "mimic.platform.io/mesh";
+/// Filtre des logs du sidecar (`MIMIC_LOG`, spec §9.4).
+pub const ANNOTATION_LOG: &str = "mimic.platform.io/log";
+/// Taille de l'`emptyDir` du store, et la même en octets pour le sidecar
+/// (`MIMIC_STORE_SIZE_LIMIT_BYTES`, `mimic_store_disk_limit_bytes`).
+const STORE_SIZE_LIMIT: &str = "512Mi";
+const STORE_SIZE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 pub const LABEL_SIDECAR: &str = "mimic.platform.io/sidecar";
 
 /// Hors de l'UID et des ports des mesh (spec §3.3.1).
@@ -152,6 +158,8 @@ struct Checked {
     exclude_cidrs: Vec<String>,
     /// `None` sans annotation.
     exclude_ports: Option<Vec<String>>,
+    /// Filtre de logs de l'annotation, s'il est valide.
+    log: Option<String>,
     warnings: Vec<String>,
 }
 
@@ -212,12 +220,27 @@ fn checked(pod: &Pod) -> Checked {
             &mut warnings,
         )
     });
+    let log = annotation(pod, ANNOTATION_LOG).and_then(|a| match valid_log_filter(a) {
+        Ok(()) => Some(a.trim().to_string()),
+        Err(e) => {
+            warnings.push(format!("{ANNOTATION_LOG} : {a} : {e}, valeur ignorée"));
+            None
+        }
+    });
     Checked {
         inbound_ports,
         exclude_cidrs,
         exclude_ports,
+        log,
         warnings,
     }
+}
+
+/// Filtre de logs accepté par le sidecar (syntaxe `EnvFilter`, spec §9.3).
+pub fn valid_log_filter(filter: &str) -> Result<(), String> {
+    tracing_subscriber::EnvFilter::try_new(filter.trim())
+        .map(drop)
+        .map_err(|e| e.to_string())
 }
 
 /// Avertissements d'admission d'un pod injecté : mesh inconnu, valeurs d'annotations
@@ -394,6 +417,7 @@ fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
 }
 
 fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]) -> Container {
+    let log = checked(pod).log.or_else(|| cfg.sidecar_log.clone());
     let mut envs = vec![
         field_env("POD_NAME", "metadata.name"),
         field_env("POD_NAMESPACE", "metadata.namespace"),
@@ -419,7 +443,14 @@ fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]
             }),
             ..EnvVar::default()
         },
+        env(
+            "MIMIC_STORE_SIZE_LIMIT_BYTES",
+            STORE_SIZE_LIMIT_BYTES.to_string(),
+        ),
     ];
+    if let Some(log) = log {
+        envs.push(env("MIMIC_LOG", log));
+    }
     let mut mounts = vec![
         mount("mimic-store", STORE_DIR, false),
         mount("mimic-token", TOKEN_DIR, true),
@@ -517,7 +548,7 @@ fn volumes(pod: &Pod, cfg: &InjectorConfig) -> Vec<Volume> {
         Volume {
             name: "mimic-store".into(),
             empty_dir: Some(EmptyDirVolumeSource {
-                size_limit: Some(Quantity("512Mi".into())),
+                size_limit: Some(Quantity(STORE_SIZE_LIMIT.into())),
                 ..EmptyDirVolumeSource::default()
             }),
             ..Volume::default()

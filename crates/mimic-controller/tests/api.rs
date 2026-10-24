@@ -605,7 +605,7 @@ async fn metrics_and_health() {
     );
     assert!(m.contains("mimic_controller_workloads 1"), "{m}");
     assert!(
-        m.contains(r#"mimic_controller_pods{state="aligned"} 1"#),
+        m.contains(r#"mimic_controller_pods{workload="shop/checkout",state="aligned"} 1"#),
         "{m}"
     );
 }

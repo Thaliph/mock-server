@@ -129,6 +129,13 @@ fn latency_histogram() -> Histogram {
     Histogram::new(exponential_buckets(0.0005, 2.0, 16))
 }
 
+/// Version et commit du binaire (`mimic_build_info`, spec §9.3).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BuildLabels {
+    mimic_version: &'static str,
+    revision: &'static str,
+}
+
 pub struct Metrics {
     registry: Registry,
     pub requests: Family<RequestLabels, Counter>,
@@ -139,6 +146,10 @@ pub struct Metrics {
     pub discovered_operations: Family<DiscoveryLabels, Gauge>,
     pub store_exchanges: Family<OriginLabel, Gauge>,
     pub store_bytes: Gauge,
+    /// Octets des fichiers sous `store.dir`, calculés à la lecture de `/metrics`.
+    pub store_disk_bytes: Gauge,
+    /// Taille de l'`emptyDir` du store (`store.size_limit_bytes`), 0 si inconnue.
+    pub store_disk_limit_bytes: Gauge,
     pub capture_dropped: Family<ReasonLabel, Counter>,
     pub share_sync: Family<ResultLabel, Counter>,
     pub share_peers: Gauge,
@@ -187,6 +198,15 @@ impl Metrics {
         let discovered_operations = Family::default();
         let store_exchanges = Family::default();
         let store_bytes = Gauge::default();
+        let store_disk_bytes = Gauge::default();
+        let store_disk_limit_bytes = Gauge::default();
+        let build = Family::<BuildLabels, Gauge>::default();
+        build
+            .get_or_create(&BuildLabels {
+                mimic_version: mimic_core::build::VERSION,
+                revision: mimic_core::build::REVISION,
+            })
+            .set(1);
         let capture_dropped = Family::default();
         let share_sync = Family::default();
         let share_peers = Gauge::default();
@@ -239,6 +259,21 @@ impl Metrics {
             "mimic_store_bytes",
             "Octets estimés des échanges en mémoire",
             store_bytes.clone(),
+        );
+        registry.register(
+            "mimic_store_disk_bytes",
+            "Octets des fichiers du store sur disque (journal, état souhaité, snapshots)",
+            store_disk_bytes.clone(),
+        );
+        registry.register(
+            "mimic_store_disk_limit_bytes",
+            "Taille de l'emptyDir du store (0 si inconnue)",
+            store_disk_limit_bytes.clone(),
+        );
+        registry.register(
+            "mimic_build_info",
+            "Version et commit du binaire (toujours 1)",
+            build,
         );
         registry.register(
             "mimic_capture_dropped",
@@ -311,6 +346,8 @@ impl Metrics {
             discovered_operations,
             store_exchanges,
             store_bytes,
+            store_disk_bytes,
+            store_disk_limit_bytes,
             capture_dropped,
             share_sync,
             share_peers,

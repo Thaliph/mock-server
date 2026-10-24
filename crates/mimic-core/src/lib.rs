@@ -6,6 +6,7 @@
 //!
 //! Voir `docs/SPEC.md` pour la spécification et les critères d'acceptation.
 
+pub mod build;
 pub mod catalog;
 pub mod compact;
 pub mod diff;

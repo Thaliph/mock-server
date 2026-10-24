@@ -12,10 +12,11 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::core::DynamicObject;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse, AdmissionReview};
 use mimic_net::serve::{ServeOptions, serve};
-use mimic_net::tls::Tls;
+use mimic_net::tls::{CertReloader, Tls};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use tokio::net::TcpListener;
 
@@ -27,9 +28,18 @@ struct ResultLabel {
     result: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BuildLabels {
+    mimic_version: &'static str,
+    revision: &'static str,
+}
+
 struct Injector {
     config: InjectorConfig,
     admissions: Family<ResultLabel, Counter<u64, AtomicU64>>,
+    /// Certificat servi, relu à chaud ; absent en HTTP (tests).
+    certificate: Option<Arc<CertReloader>>,
+    certificate_expiry: Gauge,
     registry: Registry,
 }
 
@@ -102,6 +112,9 @@ async fn mutate_handler(
 }
 
 async fn metrics(State(inj): State<Arc<Injector>>) -> Response {
+    if let Some(c) = &inj.certificate {
+        inj.certificate_expiry.set(c.not_after_unix());
+    }
     let mut out = String::new();
     match prometheus_client::encoding::text::encode(&mut out, &inj.registry) {
         Ok(()) => ([("content-type", "text/plain; version=0.0.4")], out).into_response(),
@@ -110,16 +123,41 @@ async fn metrics(State(inj): State<Arc<Injector>>) -> Response {
 }
 
 pub fn router(config: InjectorConfig) -> Router {
+    router_with(config, None)
+}
+
+/// Routeur dont `/metrics` expose la date d'expiration du certificat servi.
+fn router_with(config: InjectorConfig, certificate: Option<Arc<CertReloader>>) -> Router {
     let admissions = Family::<ResultLabel, Counter<u64, AtomicU64>>::default();
+    let certificate_expiry = Gauge::default();
+    let build = Family::<BuildLabels, Gauge>::default();
+    build
+        .get_or_create(&BuildLabels {
+            mimic_version: mimic_core::build::VERSION,
+            revision: mimic_core::build::REVISION,
+        })
+        .set(1);
     let mut registry = Registry::default();
     registry.register(
         "mimic_injector_admissions",
         "Admissions de pods traitées",
         admissions.clone(),
     );
+    registry.register(
+        "mimic_injector_certificate_expiry_timestamp_seconds",
+        "Date Unix d'expiration du certificat servi (0 sans TLS)",
+        certificate_expiry.clone(),
+    );
+    registry.register(
+        "mimic_build_info",
+        "Version et commit du binaire (toujours 1)",
+        build,
+    );
     let inj = Arc::new(Injector {
         config,
         admissions,
+        certificate,
+        certificate_expiry,
         registry,
     });
     Router::new()
@@ -162,7 +200,7 @@ pub async fn start(config: InjectorConfig) -> Result<Running, String> {
         .await
         .map_err(|e| format!("écoute sur {}: {e}", config.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
-    let app = router(config);
+    let app = router_with(config, tls.as_ref().map(|t| t.reloader().clone()));
     tracing::info!(%addr, tls = tls.is_some(), "webhook d'injection démarré");
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(serve(listener, app, tls, ServeOptions::default(), async {

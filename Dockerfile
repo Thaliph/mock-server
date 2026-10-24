@@ -3,6 +3,9 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
+# Commit de la construction, label revision de mimic_build_info (spec §9.3).
+ARG MIMIC_REVISION=unknown
+ENV MIMIC_REVISION=${MIMIC_REVISION}
 RUN cargo build --release --locked -p mimic-proxy -p mimic-init -p mimic-controller -p mimic-injector -p mimicctl
 
 FROM debian:bookworm-slim

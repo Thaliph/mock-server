@@ -201,6 +201,9 @@ async fn launch(
         }
     };
     let ctl = Arc::new(Ctl::new(config, store, auth));
+    if let Some(t) = &tls {
+        ctl.metrics.watch_certificate(t.reloader().clone());
+    }
     // Garde-fou production : les labels des namespaces sont connus avant de servir un
     // sidecar ou de réconcilier une ressource (spec §5.5.1). Avec élection, la prise de
     // relais s'en charge.

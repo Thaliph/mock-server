@@ -108,6 +108,8 @@ Au-delà de **100** authorities distinctes par processus, les suivantes sont reg
 |----------|------|--------|---------------|
 | `mimic_store_exchanges` | jauge | `origin` (`local`, `peer`) | échanges en mémoire, calculé à la lecture de `/metrics` ; `peer` seulement en partage direct |
 | `mimic_store_bytes` | jauge | | octets estimés du store, à comparer à `capture.max_store_bytes` |
+| `mimic_store_disk_bytes` | jauge | | octets des fichiers sous `store.dir` (journal `local-<n>.jsonl`, état souhaité, formes de mock gardées), calculé à la lecture de `/metrics` ; 0 sans `store.dir` |
+| `mimic_store_disk_limit_bytes` | jauge | | taille de l'`emptyDir` du store, posée par le webhook (`MIMIC_STORE_SIZE_LIMIT_BYTES`, 512 Mi) ; 0 si inconnue. Au-delà, le kubelet évince le pod |
 | `mimic_capture_dropped_total` | compteur | `reason` | voir ci-dessous |
 | `mimic_share_sync_total` | compteur | `result` (`ok`, `error`) | cycles de publication (et d'import en partage direct) ; un cycle sans rien à publier compte `ok` sans appeler le contrôleur |
 | `mimic_share_peers` | jauge | | autres instances vues au dernier partage ; toujours 0 sous contrôleur |
@@ -131,6 +133,12 @@ Exposées par les sidecars pilotés (`share.url` vers le contrôleur) seulement.
 | `local_backlog` | ligne non écrite dans le journal local (file d'écriture pleine) | disque lent ou plein |
 | `share_backlog` | échange abandonné avant publication (`share.max_backlog_bytes` ou `max_pending`) | **perte de données** pour le contrôleur |
 
+### Version
+
+| Métrique | Type | Labels | Signification |
+|----------|------|--------|---------------|
+| `mimic_build_info` | jauge | `mimic_version`, `revision` | toujours 1 : version de mimic et commit de l'image (`unknown` hors image). Exposée aussi par le contrôleur et le webhook. Le label s'appelle `mimic_version` parce que `version` est déjà celui de l'application sur les séries du sidecar |
+
 ## Contrôleur
 
 Exposées par chaque réplique. Les jauges d'état (`workloads`, `pods`, `exchanges`, `exemplars*`)
@@ -144,19 +152,21 @@ passive, qui ne touche pas au support.
 | `mimic_controller_segments_total` | compteur | `result` (`ok`, `duplicate`, `error`) | segments reçus ; `duplicate` : renvoi d'un segment déjà rangé (reprise après erreur réseau, normal) ; `error` : segment illisible ou identifiant invalide (`400`), ou support en échec (`503`, log `ingestion d'un segment`) ; les refus d'authentification n'y sont pas comptés |
 | `mimic_controller_auth_failures_total` | compteur | `reason` (`missing`, `invalid`, `forbidden`, `unavailable`) | appels de sidecars refusés : jeton absent, jeton invalide, jeton d'un autre pod ou workload, TokenReview ou lecture du pod impossible (`503`) |
 | `mimic_controller_workloads` | jauge | | workloads connus |
-| `mimic_controller_pods` | jauge | `state` (`aligned`, `diverging`, `absent`) | pods vus depuis moins de `pod_forget` ; les pods non sélectionnés par un `selector` comptent `aligned` |
+| `mimic_controller_pods` | jauge | `workload` (`<namespace>/<nom>`), `state` (`aligned`, `diverging`, `absent`) | pods de chaque workload vus depuis moins de `pod_forget` ; les pods non sélectionnés par un `selector` comptent `aligned`. Les trois états de chaque workload connu existent, à 0 s'il le faut. Le namespace du workload est dans `workload`, pas dans `namespace`, qui est celui du pod du contrôleur |
 | `mimic_controller_snapshots_total` | compteur | | snapshots construits et écrits |
 | `mimic_controller_snapshots_deleted_total` | compteur | | snapshots purgés (cycle de vie, `snapshot.keep_last`) : hors référencés (`spec.snapshot`, `status.snapshot`) et épinglés (`mimicctl snapshot pin`) |
 | `mimic_controller_exchanges` | jauge | | échanges en mémoire, tous workloads (borne `max_exchanges_total`) |
 | `mimic_controller_exemplars` | jauge | | exemples par endpoint gardés, tous workloads |
 | `mimic_controller_exemplars_bytes` | jauge | | taille sérialisée des exemples (borne `max_exemplar_bytes_total`) |
 | `mimic_controller_exemplars_refused_total` | compteur | `reason` (`count`, `bytes`) | nouvel endpoint sans exemple (`count`), ou exemple gardé sans body (`bytes`) ; les deux séries existent dès le départ, à 0 |
+| `mimic_controller_certificate_expiry_timestamp_seconds` | jauge | | date Unix d'expiration du certificat servi sur le port `api`, suivie à chaque rechargement à chaud ; 0 sans TLS. Exposée aussi par la passive |
 
 ## Webhook
 
 | Métrique | Type | Labels | Signification |
 |----------|------|--------|---------------|
 | `mimic_injector_admissions_total` | compteur | `result` (`injected`, `skipped`, `error`) | revues d'admission : pod modifié, laissé tel quel (avec un avertissement `mimic non injecté : …`), ou revue invalide |
+| `mimic_injector_certificate_expiry_timestamp_seconds` | jauge | | date Unix d'expiration du certificat servi à l'API server ; 0 sans TLS |
 
 ## Requêtes PromQL utiles
 
@@ -242,6 +252,18 @@ Pertes de données et remplissage du store :
 ```promql
 sum by (namespace, pod) (increase(mimic_capture_dropped_total{reason="share_backlog"}[15m]))
 max by (namespace, pod) (mimic_store_bytes)
+```
+
+Workloads dont des pods n'appliquent pas l'état souhaité (contrôleur) :
+
+```promql
+max by (workload) (mimic_controller_pods{state="diverging"}) > 0
+```
+
+Pods par version de mimic, après une mise à jour (sidecars pas encore redémarrés) :
+
+```promql
+count by (mimic_version) (mimic_build_info)
 ```
 
 Comparaison de versions (label `version`) :

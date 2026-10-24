@@ -15,6 +15,7 @@ serde = { workspace = true, features = ["derive"] }
 tokio = { version = "1.53.3", features = ["full"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = "0.1.44"
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }

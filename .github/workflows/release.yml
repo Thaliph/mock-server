@@ -118,6 +118,9 @@ jobs:
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          # Label revision de mimic_build_info (spec §9.3).
+          build-args: |
+            MIMIC_REVISION=${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}

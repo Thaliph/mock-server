@@ -46,6 +46,10 @@ pub struct InjectorConfig {
     /// Label du pod repris dans `MIMIC_VERSION`, label `version` des métriques (spec §9.3).
     #[serde(default = "default_version_label")]
     pub version_label: String,
+    /// Filtre de logs des sidecars (`MIMIC_LOG`) ; l'annotation `mimic.platform.io/log`
+    /// l'emporte. Absent : `info`.
+    #[serde(default)]
+    pub sidecar_log: Option<String>,
 }
 
 fn default_listen() -> SocketAddr {
@@ -96,6 +100,9 @@ impl InjectorConfig {
         }
         serde_yaml::from_str::<mimic_proxy::config::Config>(&self.sidecar_config)
             .map_err(|e| format!("sidecar_config invalide: {e}"))?;
+        if let Some(log) = &self.sidecar_log {
+            crate::inject::valid_log_filter(log).map_err(|e| format!("sidecar_log: {e}"))?;
+        }
         for cidr in &self.exclude_outbound_cidrs {
             mimic_init::parse_cidr(cidr).map_err(|e| format!("exclude_outbound_cidrs: {e}"))?;
         }
