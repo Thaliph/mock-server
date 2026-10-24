@@ -51,6 +51,7 @@ fn injected(pod: &Pod) -> Pod {
     match mutate(pod, &config()) {
         Outcome::Injected(p) => *p,
         Outcome::Skipped(reason) => panic!("non injecté : {reason}"),
+        Outcome::Unchanged => panic!("non injecté : déjà injecté"),
     }
 }
 
@@ -184,7 +185,8 @@ fn inj_01_without_tcp_ports_all_inbound_is_intercepted() {
 #[test]
 fn inj_02_already_injected_pod_is_left_alone() {
     let once = injected(&pod(json!({})));
-    assert!(matches!(mutate(&once, &config()), Outcome::Skipped(_)));
+    // Réinvocation par l'API server : ni patch, ni avertissement « non injecté ».
+    assert!(matches!(mutate(&once, &config()), Outcome::Unchanged));
 }
 
 #[test]
@@ -197,6 +199,7 @@ fn inj_03_opt_out_and_host_network_are_skipped() {
         match mutate(&p, &config()) {
             Outcome::Skipped(reason) => assert!(!reason.is_empty()),
             Outcome::Injected(_) => panic!("pod injecté à tort : {:?}", p.metadata),
+            Outcome::Unchanged => panic!("pod pris pour déjà injecté : {:?}", p.metadata),
         }
     }
 }
@@ -208,6 +211,7 @@ fn inj_04_pod_without_workload_name_is_skipped() {
     match mutate(&p, &config()) {
         Outcome::Skipped(reason) => assert!(reason.contains("workload"), "{reason}"),
         Outcome::Injected(_) => panic!("pod injecté sans workload"),
+        Outcome::Unchanged => panic!("pod pris pour déjà injecté"),
     }
 }
 
@@ -379,6 +383,7 @@ fn inj_10_version_labels_reach_the_sidecar() {
     let s = match mutate(&pod(json!({})), &cfg) {
         Outcome::Injected(p) => sidecar_of(&p),
         Outcome::Skipped(r) => panic!("{r}"),
+        Outcome::Unchanged => panic!("déjà injecté"),
     };
     assert_eq!(
         field_path(&s, "MIMIC_VERSION"),
@@ -547,7 +552,7 @@ fn inj_12_reinvocation_adapts_a_pod_meshed_after_mimic() {
     );
     assert_mesh_sidecar(&adapted, "istio");
     assert!(
-        matches!(mutate(&adapted, &config()), Outcome::Skipped(_)),
+        matches!(mutate(&adapted, &config()), Outcome::Unchanged),
         "pod déjà adapté : aucun patch"
     );
 
@@ -568,7 +573,7 @@ fn inj_12_reinvocation_adapts_a_pod_meshed_after_mimic() {
         ["istio-init", "istio-proxy", "mimic-init", "mimic"]
     );
     assert_mesh_sidecar(&adapted, "istio");
-    assert!(matches!(mutate(&adapted, &config()), Outcome::Skipped(_)));
+    assert!(matches!(mutate(&adapted, &config()), Outcome::Unchanged));
 }
 
 #[test]
@@ -651,6 +656,7 @@ fn inj_21_startup_probe_waits_for_the_startup_gate() {
     let p = match mutate(&pod(json!({})), &cfg) {
         Outcome::Injected(p) => *p,
         Outcome::Skipped(r) => panic!("{r}"),
+        Outcome::Unchanged => panic!("déjà injecté"),
     };
     assert_eq!(
         thresholds(sidecar_of(&p).startup_probe.as_ref()),

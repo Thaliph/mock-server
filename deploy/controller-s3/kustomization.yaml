@@ -2,12 +2,12 @@
 #   kubectl -n mimic-system create secret generic mimic-controller-s3 \
 #     --from-literal=AWS_REGION=eu-west-3 --from-literal=AWS_ACCESS_KEY_ID=… \
 #     --from-literal=AWS_SECRET_ACCESS_KEY=…     # ou une identité de pod (IRSA, Workload Identity)
-#   kubectl apply -k deploy/controller/overlays/s3
+#   kubectl apply -k deploy/controller-s3
 # Configuration identique au défaut hors `store` (vérifié par CTL-50) : à adapter ensemble.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - ../..
+  - ../controller
 patches:
   - target: {kind: ConfigMap, name: mimic-controller}
     patch: |

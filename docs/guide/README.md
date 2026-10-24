@@ -60,7 +60,7 @@ le parcours pas à pas, de la création du cluster au retour en `record`.
 
 ```sh
 # 1. Socle (une fois par cluster) : voir Installer pour le détail
-kubectl apply -k deploy/controller          # stockage partagé ; sinon overlays/s3 ou overlays/rwo
+kubectl apply -k deploy/controller          # stockage partagé ; sinon controller-s3 ou controller-rwo
 kubectl apply -f deploy/injector/injector.yaml
 
 # 2. Activer un namespace, puis recréer ses pods

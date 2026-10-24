@@ -86,6 +86,8 @@ pub fn review(
             resp.warnings = Some(vec![format!("mimic non injecté : {reason}")]);
             ("skipped", resp.into_review())
         }
+        // Rappel de l'API server sur un pod déjà injecté : rien à dire.
+        Outcome::Unchanged => ("skipped", resp.into_review()),
     }
 }
 

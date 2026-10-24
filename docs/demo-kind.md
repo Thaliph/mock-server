@@ -98,12 +98,12 @@ Si `certificates.yaml` est refusé juste après l'installation de cert-manager (
 webhook "webhook.cert-manager.io"`), son webhook n'est pas encore prêt : relancer la commande
 quelques secondes plus tard.
 
-Le nœud kind est seul et n'a pas de stockage partagé : on prend la variante `overlays/rwo`
+Le nœud kind est seul et n'a pas de stockage partagé : on prend la variante `controller-rwo`
 (PVC `ReadWriteOnce`, les deux répliques sur le nœud du volume), et on ramène la mémoire
 demandée par chaque réplique de 1Gi à 256Mi pour que tout tienne.
 
 ```sh
-kubectl kustomize deploy/controller/overlays/rwo \
+kubectl kustomize deploy/controller-rwo \
   | manifest \
   | sed 's#memory: 1Gi$#memory: 256Mi#' \
   | kubectl apply -f -

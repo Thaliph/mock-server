@@ -1,5 +1,5 @@
 # Contrôleur sur un PVC ReadWriteOnce, sans stockage partagé (spec §5.5.4) :
-#   kubectl apply -k deploy/controller/overlays/rwo
+#   kubectl apply -k deploy/controller-rwo
 # Le volume ne s'attache qu'à un nœud : les deux répliques, et celle d'un rollout, y sont
 # placées par une affinité requise. Plus de PodDisruptionBudget : un drain doit pouvoir
 # déplacer les deux répliques avec leur volume (le contrôleur est indisponible le temps de
@@ -8,7 +8,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - ../..
+  - ../controller
 patches:
   - target: {kind: PersistentVolumeClaim, name: mimic-controller}
     patch: |

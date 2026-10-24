@@ -99,6 +99,8 @@ pub enum Outcome {
     Injected(Box<Pod>),
     /// Pod admis tel quel ; la raison devient un avertissement d'admission.
     Skipped(String),
+    /// Pod déjà injecté, admis tel quel sans avertissement (réinvocation, idempotence).
+    Unchanged,
 }
 
 fn annotation<'a>(pod: &'a Pod, key: &str) -> Option<&'a str> {
@@ -645,7 +647,7 @@ fn place(mut inits: Vec<Container>, mimic: Vec<Container>) -> Vec<Container> {
 /// Réinvocation (spec §9.4) : un pod injecté avant le webhook du mesh repasse derrière ses
 /// conteneurs, avec `MIMIC_MESH` et les sondes d'un pod du mesh.
 fn adapt(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
-    let skipped = || Outcome::Skipped("mimic déjà injecté".into());
+    let skipped = || Outcome::Unchanged;
     if mesh_of(pod).is_none() {
         return skipped();
     }
