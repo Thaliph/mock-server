@@ -46,11 +46,11 @@ fichier `deploy/monitoring/tests.yaml` qu'il faudra corriger.
 
 ```sh
 kubectl kustomize deploy/controller | grep -A3 "kind: PersistentVolumeClaim" | grep -A1 accessModes
-kubectl kustomize deploy/controller/overlays/rwo > /tmp/rwo.yaml
+kubectl kustomize deploy/controller-rwo > /tmp/rwo.yaml
 grep -c "kind: PodDisruptionBudget" /tmp/rwo.yaml
 grep -A6 "podAffinity:" /tmp/rwo.yaml
 grep -A1 accessModes /tmp/rwo.yaml
-kubectl kustomize deploy/controller/overlays/s3 > /tmp/s3.yaml
+kubectl kustomize deploy/controller-s3 > /tmp/s3.yaml
 grep "store:" /tmp/s3.yaml; grep -c "kind: PersistentVolumeClaim" /tmp/s3.yaml
 grep -B1 -A2 "name: data" /tmp/s3.yaml | grep -E "emptyDir|persistentVolumeClaim"
 ```
@@ -95,7 +95,7 @@ depuis l'hôte : une ligne `mimic_build_info{mimic_version="0.1.0",…} 1`.
 Suivre la [démo kind](demo-kind.md), **sections 0 à 5** (cluster, image, cert-manager,
 contrôleur, webhook, démo OpenTelemetry, trafic, découverte). Deux choses ont changé et sont
 déjà dans la démo :
-- le contrôleur s'installe avec `kubectl kustomize deploy/controller/overlays/rwo` (kind n'a
+- le contrôleur s'installe avec `kubectl kustomize deploy/controller-rwo` (kind n'a
   pas de stockage partagé) ;
 - le webhook reçoit `redact.raw_bodies: ["*", inbound]` (la démo parle gRPC, dont les bodies
   ne seraient sinon pas capturés).

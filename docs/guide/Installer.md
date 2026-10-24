@@ -16,7 +16,7 @@ Les manifests sont dans `deploy/` ; leur rôle est résumé dans `deploy/README.
 | Helm 3 | pour trust-manager | |
 | Capacités | `mimic-init` tourne en root avec `NET_ADMIN` et `NET_RAW` | règles iptables du pod. Le niveau `baseline` des Pod Security Standards n'autorise pas `NET_ADMIN` : les namespaces activés doivent l'admettre |
 | Nœuds | `iptables` nft par défaut ; `iptables-legacy` réglable | voir `iptables` dans la [configuration de l'injecteur](Configurer.md#webhook-mimic-injector) |
-| Stockage du contrôleur | PVC partagé (10Gi, `ReadWriteMany`), bucket S3 (`overlays/s3`) ou PVC `ReadWriteOnce` (`overlays/rwo`) | segments, snapshots, état souhaité, exemples |
+| Stockage du contrôleur | PVC partagé (10Gi, `ReadWriteMany`), bucket S3 (`controller-s3`) ou PVC `ReadWriteOnce` (`controller-rwo`) | segments, snapshots, état souhaité, exemples |
 | Prometheus ou VictoriaMetrics | facultatif | voir [Métriques](Metriques.md) |
 
 Versions vérifiées par la CI (`scripts/e2e-lib.sh`, `docs/e2e-kind.md`) : nœud kind
@@ -92,11 +92,11 @@ Choisir la variante selon le stockage disponible (détail :
 | Variante | Commande | Quand | Ce qui change |
 |----------|----------|-------|---------------|
 | défaut | `kubectl apply -k deploy/controller` | stockage partagé disponible (EFS, Filestore, Azure Files, CephFS, NFS) | PVC `ReadWriteMany` ; poser sa `storageClassName` si la classe par défaut du cluster n'est pas partagée (sinon le PVC reste `Pending`) ; les deux réplicas sur deux nœuds |
-| `overlays/s3` | `kubectl apply -k deploy/controller/overlays/s3` | recommandé en production, plusieurs nœuds | `store: s3://…` (bucket à adapter dans l'overlay), plus de PVC ; identifiants `AWS_*` du Secret facultatif `mimic-controller-s3`, ou identité de pod (IRSA, Workload Identity) |
-| `overlays/rwo` | `kubectl apply -k deploy/controller/overlays/rwo` | pas de stockage partagé (kind, disque réseau `ReadWriteOnce`) | PVC `ReadWriteOnce` ; les deux réplicas et celle d'un rollout sur le nœud du volume (affinité requise), jamais en `Multi-Attach` ; pas de PodDisruptionBudget, pour qu'un drain puisse déplacer le volume : la passive couvre la perte du pod, pas celle du nœud, et le contrôleur est indisponible pendant un drain (les sidecars gardent leur dernier état) |
+| `controller-s3` | `kubectl apply -k deploy/controller-s3` | recommandé en production, plusieurs nœuds | `store: s3://…` (bucket à adapter dans l'overlay), plus de PVC ; identifiants `AWS_*` du Secret facultatif `mimic-controller-s3`, ou identité de pod (IRSA, Workload Identity) |
+| `controller-rwo` | `kubectl apply -k deploy/controller-rwo` | pas de stockage partagé (kind, disque réseau `ReadWriteOnce`) | PVC `ReadWriteOnce` ; les deux réplicas et celle d'un rollout sur le nœud du volume (affinité requise), jamais en `Multi-Attach` ; pas de PodDisruptionBudget, pour qu'un drain puisse déplacer le volume : la passive couvre la perte du pod, pas celle du nœud, et le contrôleur est indisponible pendant un drain (les sidecars gardent leur dernier état) |
 
 ```sh
-kubectl apply -k deploy/controller                 # ou overlays/s3, overlays/rwo
+kubectl apply -k deploy/controller                 # ou controller-s3, controller-rwo
 kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=180s
 kubectl -n mimic-system get pods -l app.kubernetes.io/name=mimic-controller -L mimic.platform.io/leader
 ```

@@ -95,7 +95,7 @@ install_mimic() {
   # réplicas (deux plus celle du rollout) demandant 1Gi chacune laissent trop peu de place.
   # kind n'a pas de stockage partagé : variante ReadWriteOnce, répliques sur le nœud du
   # volume (spec §5.5.4). kustomize écrit les ressources en blocs : seule la demande vaut 1Gi.
-  kubectl kustomize deploy/controller/overlays/rwo \
+  kubectl kustomize deploy/controller-rwo \
     | manifest \
     | sed 's#memory: 1Gi$#memory: 256Mi#' \
     | kubectl apply -f -

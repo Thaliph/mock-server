@@ -1,5 +1,5 @@
 # Contrôleur (spec §5.5) : `kubectl apply -k deploy/controller`, après cert-manager et
-# trust-manager. Stockage par défaut : PVC ReadWriteMany ; variantes dans overlays/ (s3, rwo).
+# trust-manager. Stockage par défaut : PVC ReadWriteMany ; variantes dans ../controller-s3, ../controller-rwo.
 # production-guard.yaml (facultatif) s'applique à part.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

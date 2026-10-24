@@ -41,7 +41,7 @@ data:
 # Monté par les deux réplicas, écrit par la seule active (spec §5.5.4) : ReadWriteMany, pour
 # qu'elles tournent sur deux nœuds. Classe de stockage partagé du cluster, ou à poser
 # (storageClassName : EFS, Filestore, Azure Files, CephFS, NFS…). Sans stockage partagé :
-# overlays/s3 (plus de PVC) ou overlays/rwo (ReadWriteOnce, répliques sur un même nœud).
+# controller-s3 (plus de PVC) ou controller-rwo (ReadWriteOnce, répliques sur un même nœud).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -74,7 +74,7 @@ spec:
       labels: {app.kubernetes.io/name: mimic-controller}
     spec:
       serviceAccountName: mimic-controller
-      # Deux nœuds quand c'est possible, un seul sinon (overlays/rwo l'impose).
+      # Deux nœuds quand c'est possible, un seul sinon (controller-rwo l'impose).
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

@@ -138,14 +138,16 @@ tests:
               description: "Le message de l'éviction dit quel volume ou quelle ressource a débordé (kubectl describe pod)."
 
   # Deux versions de mimic pendant plus de 24 h ; le label version (application) ne compte pas.
-  - interval: 10m
+  # Un point par minute : plus espacés que le délai de recherche (5 min), les points
+  # laisseraient des trous qui remettent le `for` à zéro.
+  - interval: 1m
     input_series:
       - series: 'mimic_build_info{namespace="shop",pod="checkout-a",mimic_version="0.1.0",revision="a",version="1.4.2"}'
-        values: '1x160'
+        values: '1x1560'
       - series: 'mimic_build_info{namespace="shop",pod="checkout-b",mimic_version="0.1.0",revision="a",version="1.4.3"}'
-        values: '1x160'
+        values: '1x1560'
       - series: 'mimic_build_info{namespace="mimic-system",pod="mimic-controller-0",mimic_version="0.2.0",revision="b"}'
-        values: '1x160'
+        values: '1x1560'
     alert_rule_test:
       - eval_time: 12h
         alertname: MimicVersionSkew

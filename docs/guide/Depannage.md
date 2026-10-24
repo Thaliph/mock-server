@@ -144,7 +144,7 @@ de `/api/status`, sous la forme `<méthode> <chemin>: <code> <motif> <body>`.
 | sort en code 1 en marche | `bail non renouvelé à temps : la réplique cesse de servir`, `bail tenu par une autre réplique : la réplique cesse de servir` | API server lente, réseau, horloge | normal si isolé : la passive a pris le relais ; récurrent : API server |
 | répétition de `renouvellement du bail` / `lecture du bail` | | droits sur `leases/mimic-controller`, API server | RBAC (Role `mimic-controller` dans `mimic-system`) |
 | prise de relais lente | `prise de relais` (liste des namespaces en échec, retentée), `liste initiale des MimicWorkload non reçue : l'état persisté sert` | API server, droits `namespaces` / `mimicworkloads` | `mimic_controller_takeover_seconds` |
-| passive en `ContainerCreating` | événement `Multi-Attach error` | PVC `ReadWriteOnce` sur deux nœuds : appliquer `overlays/rwo` (ou `overlays/s3`) | [stockage du contrôleur](Exploiter-en-production.md#stockage-du-contrôleur) |
+| passive en `ContainerCreating` | événement `Multi-Attach error` | PVC `ReadWriteOnce` sur deux nœuds : appliquer `controller-rwo` (ou `controller-s3`) | [stockage du contrôleur](Exploiter-en-production.md#stockage-du-contrôleur) |
 | statut des `MimicWorkload` figé | `statut non publié` | droit `patch` sur `mimicworkloads/status`, CRD absente | RBAC, `kubectl apply -f deploy/controller/crd.yaml` |
 | surveillance en échec | `surveillance des MimicWorkload`, `surveillance des namespaces` | CRD absente, RBAC | idem |
 | snapshot non construit | `construction du snapshot échouée`, raison `SnapshotFailed` | support | espace, droits |

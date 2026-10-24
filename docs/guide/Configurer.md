@@ -168,9 +168,10 @@ configuration renseigne `annotations_file` ; un sidecar piloté l'ignore.
 | ressources du sidecar | celles de `resources` du webhook, sinon requêtes `cpu: 50m`, `memory: 64Mi`, limite `memory: 256Mi` |
 | volumes | `mimic-store` (`emptyDir`, `sizeLimit: 512Mi`, sur `/var/lib/mimic`), `mimic-token` (jeton projeté d'audience `mimic-controller`, 3600 s, sur `/var/run/secrets/mimic`), `mimic-controller-ca` (ConfigMap, sur `/etc/mimic-ca`), `mimic-ca` (`emptyDir`, sur `/var/run/mimic/ca`), `mimic-config` (avec l'annotation `config`) |
 
-Pods laissés tels quels, avec un avertissement d'admission `mimic non injecté : <raison>` : déjà
-injectés (`mimic déjà injecté`, sauf adaptation à un mesh injecté après), `hostNetwork: true`,
-sans nom de workload, `inject: "false"`.
+Pods laissés tels quels, avec un avertissement d'admission `mimic non injecté : <raison>` :
+`hostNetwork: true`, sans nom de workload, `inject: "false"`. Un pod déjà injecté (rappel du
+webhook par l'API server, sauf adaptation à un mesh injecté après) est admis sans patch ni
+avertissement.
 
 ## Webhook (`mimic-injector`)
 

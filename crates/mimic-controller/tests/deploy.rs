@@ -690,10 +690,10 @@ fn ctl_50_storage_variants_keep_both_replicas_schedulable() {
 
     // ReadWriteOnce : tout sur le nœud du volume, sans PodDisruptionBudget.
     let rwo: serde_yaml::Value = serde_yaml::from_str(include_str!(
-        "../../../deploy/controller/overlays/rwo/kustomization.yaml"
+        "../../../deploy/controller-rwo/kustomization.yaml"
     ))
     .unwrap();
-    assert_eq!(rwo["resources"][0], "../..");
+    assert_eq!(rwo["resources"][0], "../controller");
     let pvc = inline(patch_for(&rwo, "PersistentVolumeClaim", "mimic-controller"));
     assert_eq!(pvc["spec"]["accessModes"][0], "ReadWriteOnce");
     let affinity = &inline(patch_for(&rwo, "Deployment", "mimic-controller"))["spec"]["template"]["spec"]
@@ -712,10 +712,10 @@ fn ctl_50_storage_variants_keep_both_replicas_schedulable() {
 
     // S3 : même configuration hors `store`, plus de PVC.
     let s3: serde_yaml::Value = serde_yaml::from_str(include_str!(
-        "../../../deploy/controller/overlays/s3/kustomization.yaml"
+        "../../../deploy/controller-s3/kustomization.yaml"
     ))
     .unwrap();
-    assert_eq!(s3["resources"][0], "../..");
+    assert_eq!(s3["resources"][0], "../controller");
     let ops: serde_yaml::Value = serde_yaml::from_str(
         patch_for(&s3, "ConfigMap", "mimic-controller")["patch"]
             .as_str()

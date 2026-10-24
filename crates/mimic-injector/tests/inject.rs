@@ -184,7 +184,8 @@ fn inj_01_without_tcp_ports_all_inbound_is_intercepted() {
 #[test]
 fn inj_02_already_injected_pod_is_left_alone() {
     let once = injected(&pod(json!({})));
-    assert!(matches!(mutate(&once, &config()), Outcome::Skipped(_)));
+    // Réinvocation par l'API server : ni patch, ni avertissement « non injecté ».
+    assert!(matches!(mutate(&once, &config()), Outcome::Unchanged));
 }
 
 #[test]
