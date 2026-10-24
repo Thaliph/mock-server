@@ -83,6 +83,9 @@ root sur le nœud (#55) ; tests instables MCK-15, LOD-11, PRX-11 (#53, #54).
 
 ## P1 — image et chaîne de publication
 
+- [ ] Chart Helm (OCI), en plus de `mimicctl install` (décision du 25 octobre).
+- [ ] Documentation des consommateurs en anglais : README, guide.
+
 - [ ] Deux images : `runtime` sur distroless static (sans shell, ni apt, ni perl) et `init`
   (iptables) sur `debian:trixie-slim` ; images de base épinglées par digest ; bookworm est en
   fin de vie. Proposition construite et vérifiée :
@@ -131,10 +134,39 @@ root sur le nœud (#55) ; tests instables MCK-15, LOD-11, PRX-11 (#53, #54).
 - [ ] Validation sur un vrai cluster géré (EKS ou GKE, plusieurs nœuds), chiffres de surcoût du
   sidecar en release (latence, CPU, mémoire) publiés.
 - [ ] Mise à jour et retour arrière testés (versions mêlées, CRD `v1alpha1` sans conversion).
-- [ ] Chart Helm (OCI) si les équipes plateforme l'attendent.
-- [ ] Documentation en anglais si des équipes non francophones consomment mimic.
 
-## Questions à trancher avant d'implémenter
+## Décisions (25 octobre 2026)
+
+- **Versions** : base kind actuelle (Kubernetes 1.32), puis compatibilité vérifiée version par
+  version jusqu'à la dernière (1.37). Matrice de test : voir « Tests de versions » ci-dessous.
+- **Dépôt** : public à terme ; privé pendant le développement (choix du passage en public en
+  attente, voir avantages dans la discussion).
+- **cert-manager et trust-manager** restent des prérequis : commandes d'installation dans la
+  partie installation, **namespace `mimic-system` créé avant trust-manager**.
+- **Sidecar arrêté** : le trafic doit aller vers le vrai backend si possible (faisabilité avec
+  iptables et les mesh à étudier, voir discussion).
+- **Installation** : `mimicctl install` **et** un chart Helm.
+- **Isolation** : par namespace, suffisante. Corriger la spec §7.1 en conséquence.
+- **Documentation** : en anglais.
+- **mimicctl** : distribué en binaires sur les releases GitHub (aucun publié à ce jour).
+
+## Tests de versions
+
+- [ ] e2e kind en matrice : 1.32 (base), puis chaque version mineure suivante disponible en
+  image `kindest/node` (1.33 à 1.37 aujourd'hui), avec la version de kind qui la publie.
+- [ ] Contrôle statique des manifests contre chaque version (API retirées ou dépréciées).
+- [ ] Job planifié chaque semaine sur la dernière image kind publiée : une nouvelle version
+  casse le job avant de casser un utilisateur.
+- [ ] Version minimale déclarée (aujourd'hui 1.29) testée, ou relevée à 1.32.
+
+## Questions restantes
+
+1. Passer le dépôt en public maintenant ?
+2. Repli vers `127.0.0.1` (Q4) : le retirer, avec une annotation pour les applications qui en
+   ont besoin ?
+3. Découverte d'API (Q6) : produit à part entière ou bonus ?
+
+## Questions posées le 25 octobre (historique)
 
 1. **Qui installe, et sur quoi ?** Clusters gérés (lesquels), versions, OS des nœuds, Pod
    Security en place : décide CNI ou init, musl, images.
