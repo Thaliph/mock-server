@@ -7,7 +7,8 @@ sans toucher aux services réels.
 La spécification complète, les critères d'acceptation et le plan de livraison sont dans
 [docs/SPEC.md](docs/SPEC.md). Pour installer, configurer, superviser et exploiter mimic : le
 [guide d'exploitation](docs/guide/README.md). Pour l'essayer sur un poste, pas à pas : la
-[démo locale sur kind](docs/demo-kind.md).
+[démo locale sur kind](docs/demo-kind.md). Pour recetter les dernières livraisons : la
+[recette pas à pas](docs/recette.md).
 
 ## État
 
