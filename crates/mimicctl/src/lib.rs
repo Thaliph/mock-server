@@ -806,3 +806,49 @@ pub fn controller_pod(pods: &[k8s_openapi::api::core::v1::Pod]) -> Result<String
         .and_then(|p| p.metadata.name.clone())
         .ok_or_else(|| "aucun pod du contrôleur en marche".to_string())
 }
+
+/// Correctif de labels qui pose (`stop`) ou retire l'arrêt d'urgence (spec §5.5.1).
+pub fn emergency_patch(stop: bool) -> Value {
+    let value = if stop { json!("true") } else { Value::Null };
+    json!({"metadata": {"labels": {mimic_controller::reconcile::EMERGENCY_LABEL: value}}})
+}
+
+/// Namespace qui porte le label : celui demandé, celui du contexte, ou celui du contrôleur
+/// pour tout le cluster (`-A`).
+pub fn emergency_target(namespace: Option<&str>, all: bool, default_ns: &str) -> String {
+    if all {
+        return mimic_controller::reconcile::CONTROL_NAMESPACE.into();
+    }
+    namespace.unwrap_or(default_ns).to_string()
+}
+
+/// Ce que l'arrêt d'urgence change, et comment aller plus loin.
+pub fn emergency_message(target: &str, stop: bool) -> String {
+    let all = target == mimic_controller::reconcile::CONTROL_NAMESPACE;
+    let scope = if all {
+        "tous les namespaces".to_string()
+    } else {
+        format!("le namespace {target}")
+    };
+    if !stop {
+        return format!(
+            "arrêt d'urgence levé pour {scope} : chaque workload reprend son mode souhaité au \
+             prochain battement, et les nouveaux pods sont de nouveau injectés"
+        );
+    }
+    let restart = if all {
+        "kubectl -n <namespace> rollout restart deploy/<workload>".to_string()
+    } else {
+        format!("kubectl -n {target} rollout restart deploy/<workload>")
+    };
+    format!(
+        "arrêt d'urgence pour {scope} : les pods passent en passthrough au prochain battement \
+         (2 s), plus de mock ni d'enregistrement ; les nouveaux pods{} ne sont plus injectés. \
+         Pour retirer aussi le sidecar des pods existants : {restart}",
+        if all {
+            " des namespaces arrêtés (label posé sur chacun)"
+        } else {
+            ""
+        }
+    )
+}

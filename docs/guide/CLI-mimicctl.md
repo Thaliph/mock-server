@@ -20,6 +20,7 @@ les droits de son utilisateur :
 |-----------|--------------------|
 | `mode` | `create` et `patch` sur `mimicworkloads` du namespace, `get` sur le namespace (rôle `mimic-operator`) ; `list` sur `pods` du namespace pour vérifier que le workload existe |
 | `status` | `list` sur `mimicworkloads` (rôle `mimic-viewer`, agrégé à `view`) |
+| `emergency-stop` | `patch` sur le namespace visé, `mimic-system` avec `-A` (ClusterRole `mimic-emergency`) |
 | `export`, `requests`, `report`, `snapshot ls`, `snapshot export` | `get` et `list` sur `workloads` et ses sous-ressources du groupe `data.mimic.platform.io`, **dans le namespace du workload** (ClusterRole `mimic-data-viewer` lié par RoleBinding) ; `report -A` : le même droit sur tout le cluster (ClusterRoleBinding) |
 | `snapshot pin`, `snapshot import`, `snapshot gc` | `list` sur `pods` et `create` sur `pods/portforward` dans `mimic-system` (Role `mimic-cli`, exploitants) |
 | `load <workload>` | ceux de `requests`, plus `get`/`list` sur `pods` de `metrics.k8s.io` dans le namespace du workload (relevés CPU et mémoire) |
@@ -104,6 +105,34 @@ Succès : `shop/checkout : mode souhaité mock`. Messages d'erreur :
 | `pods de ns illisibles : existence de wl non vérifiée` | avertissement : pas de droit `list` sur les pods ; appliqué quand même |
 | `mise à jour de ns/wl: …` | refus de l'API (droits, conflit de server-side apply avec un autre gestionnaire) |
 | `kubeconfig: …` | pas de kubeconfig valide |
+
+## `emergency-stop`
+
+```sh
+mimicctl emergency-stop [-n ns | -A] [--off]
+```
+
+Arrêt d'urgence (spec §5.5.1) : pose le label `mimic.platform.io/emergency-stop=true` sur le
+namespace (celui du contexte par défaut), ou avec `-A` sur `mimic-system`, ce qui vaut pour
+tout le cluster. `--off` retire le label.
+
+| Effet | Délai |
+|-------|-------|
+| chaque pod concerné reçoit `passthrough` du contrôleur, quoi que demande sa `MimicWorkload` : plus de mock, plus d'enregistrement, trafic relayé tel quel | prochain battement (2 s) |
+| conditions `Aligned` et `Allowed` à `False`, raison `EmergencyStop` (`mimicctl status`) | publication suivante du statut |
+| nouveaux pods du namespace non injectés (le webhook l'exclut) ; avec `-A`, seuls les namespaces qui portent eux-mêmes le label | immédiat |
+| `--off` : chaque workload reprend son mode souhaité, inchangé entre-temps | prochain battement |
+
+Pour retirer aussi le sidecar des pods existants : `kubectl -n <ns> rollout restart
+deploy/<workload>` après l'arrêt (les nouveaux pods ne sont plus injectés). Droit nécessaire :
+`patch` sur le namespace visé (ClusterRole `mimic-emergency`, lié par RoleBinding dans le
+namespace, ou par ClusterRoleBinding pour `-A`).
+
+```sh
+mimicctl emergency-stop -n shop
+mimicctl emergency-stop -n shop --off
+mimicctl emergency-stop -A
+```
 
 ## `status`
 

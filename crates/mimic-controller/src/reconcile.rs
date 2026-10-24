@@ -16,6 +16,26 @@ pub const PRODUCTION_LABEL: (&str, &str) = ("env", "production");
 pub const PRODUCTION_REASON: &str = "ProductionNamespace";
 /// Mode imposé à la place d'un mock refusé.
 const FALLBACK_MODE: &str = "record";
+/// Label de namespace de l'arrêt d'urgence (spec §5.5.1) ; sur [`CONTROL_NAMESPACE`], il
+/// vaut pour tous les namespaces.
+pub const EMERGENCY_LABEL: &str = "mimic.platform.io/emergency-stop";
+/// Raison reprise dans les conditions `Aligned` et `Allowed` pendant un arrêt d'urgence.
+pub const EMERGENCY_REASON: &str = "EmergencyStop";
+/// Namespace du contrôleur : l'arrêt d'urgence qui y est posé arrête tout.
+pub const CONTROL_NAMESPACE: &str = "mimic-system";
+
+/// Vrai si les labels d'un namespace demandent l'arrêt d'urgence.
+pub fn is_stopped(labels: &BTreeMap<String, String>) -> bool {
+    labels.get(EMERGENCY_LABEL).map(String::as_str) == Some("true")
+}
+
+/// État souhaité de tout pod en arrêt d'urgence : `passthrough`, rien d'autre.
+pub fn emergency_desired() -> Desired {
+    Desired {
+        mode: Some("passthrough".into()),
+        ..Desired::default()
+    }
+}
 
 /// État souhaité transmis aux sidecars ; vide, chaque sidecar garde le mode et la capture
 /// de sa configuration.
@@ -310,7 +330,17 @@ pub fn status_of(
         message: empty
             .then(|| "le snapshot servi ne contient aucun échange sortant rejouable".to_string()),
     };
-    let allowed = if refused {
+    let stopped = summary.reason.as_deref() == Some(EMERGENCY_REASON);
+    let allowed = if stopped {
+        StatusCondition {
+            type_: "Allowed".into(),
+            status: "False".into(),
+            reason: Some(EMERGENCY_REASON.into()),
+            message: Some(format!(
+                "arrêt d'urgence : label {EMERGENCY_LABEL}=true sur le namespace ou sur {CONTROL_NAMESPACE}, pods en passthrough"
+            )),
+        }
+    } else if refused {
         StatusCondition {
             type_: "Allowed".into(),
             status: "False".into(),

@@ -136,10 +136,19 @@ temps que le kubelet rafraîchisse le volume (voir
 
 ## Activer l'injection
 
-L'injection porte sur **les namespaces** labellisés `mimic.platform.io/enabled=true` (le
-`namespaceSelector` du webhook). Le même label fait recevoir au namespace la ConfigMap
-`mimic-controller-ca` (trust-manager), indispensable au sidecar. Il n'y a pas d'opt-in par pod
-dans un namespace non labellisé.
+L'injection porte sur les namespaces labellisés `mimic.platform.io/enabled` (le même label
+leur fait recevoir la ConfigMap `mimic-controller-ca` de trust-manager, indispensable au
+sidecar) :
+
+| Label du namespace | Pods injectés |
+|--------------------|---------------|
+| `mimic.platform.io/enabled=true` | tous, sauf ceux labellisés `mimic.platform.io/inject=false` (ou annotés de même) |
+| `mimic.platform.io/enabled=opt-in` | seulement ceux labellisés `mimic.platform.io/inject=true` |
+
+Le choix est fait par l'API server (`namespaceSelector` et `objectSelector` des deux webhooks) :
+un pod non concerné n'atteint jamais le webhook, ce qui limite l'effet d'une panne de celui-ci
+aux seuls pods concernés. Un namespace labellisé `mimic.platform.io/emergency-stop=true`
+n'est plus injecté (voir [arrêt d'urgence](Exploiter-en-production.md#arrêt-durgence)).
 
 ```sh
 kubectl label namespace shop mimic.platform.io/enabled=true
@@ -154,7 +163,7 @@ Réglages par pod (annotations du **template** de pod, lues à l'admission) :
 
 | Annotation | Effet |
 |------------|-------|
-| `mimic.platform.io/inject: "false"` | pod laissé tel quel (opt-out) |
+| `mimic.platform.io/inject: "false"` | pod laissé tel quel (opt-out) ; en **label**, le pod n'atteint même pas le webhook |
 | `mimic.platform.io/workload` | nom du workload ; sinon label `app.kubernetes.io/name`, sinon `app` ; sans aucun des trois, le pod n'est pas injecté |
 | `mimic.platform.io/inbound-ports` | ports entrants interceptés (`8080,9090`, `*`, ou `-` pour aucun) ; défaut : ports TCP déclarés des conteneurs, sinon `*` |
 | `mimic.platform.io/exclude-outbound-cidrs` | CIDR sortants jamais redirigés, ajoutés à ceux de l'injecteur |

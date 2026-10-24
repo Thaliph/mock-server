@@ -41,8 +41,9 @@ use crate::config::ControllerConfig;
 use crate::metrics::Metrics;
 use crate::mock_form::{EncodedMock, MAX_CACHE_BYTES, MockForms};
 use crate::reconcile::{
-    Action, Desired, MimicWorkloadSpec, PodReport, PodState, Summary, desired_for_pod, desired_of,
-    guard_pod, is_production, pod_state, reconcile_guarded, selects, summarize,
+    Action, CONTROL_NAMESPACE, Desired, EMERGENCY_REASON, MimicWorkloadSpec, PodReport, PodState,
+    Summary, desired_for_pod, desired_of, emergency_desired, guard_pod, is_production, is_stopped,
+    pod_state, reconcile_guarded, selects, summarize,
 };
 
 pub type Key = (String, String);
@@ -69,6 +70,8 @@ pub struct Ctl {
     exemplar_room: Room,
     /// Namespaces labellisés `env=production` : le mock y est refusé (spec §5.5.1).
     production: Mutex<BTreeSet<String>>,
+    /// Namespaces en arrêt d'urgence ([`CONTROL_NAMESPACE`] : tous).
+    stopped: Mutex<BTreeSet<String>>,
     /// Formes de mock des snapshots déjà demandées (spec §5.6).
     mock_forms: MockForms,
     /// Réplique active (spec §5.5.4) : seule à servir les sidecars et à toucher au support.
@@ -103,6 +106,8 @@ pub struct Live {
     pub spec: Option<MimicWorkloadSpec>,
     pub generation: Option<i64>,
     pub error: Option<String>,
+    /// Arrêt d'urgence en cours pour ce namespace, ou pour tous (spec §5.5.1).
+    pub stopped: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -621,6 +626,7 @@ impl Ctl {
             total: AtomicUsize::new(0),
             exemplar_room,
             production: Mutex::new(BTreeSet::new()),
+            stopped: Mutex::new(BTreeSet::new()),
             mock_forms: MockForms::new(MAX_CACHE_BYTES),
             active: AtomicBool::new(false),
         }
@@ -665,9 +671,34 @@ impl Ctl {
             .contains(ns)
     }
 
-    /// Labels courants d'un namespace (création, modification) ; un changement du garde-fou
-    /// réconcilie aussitôt les ressources du namespace.
+    /// Vrai si le namespace est en arrêt d'urgence, lui ou tous (spec §5.5.1).
+    pub fn is_stopped(&self, ns: &str) -> bool {
+        let set = self.stopped.lock().unwrap_or_else(PoisonError::into_inner);
+        set.contains(ns) || set.contains(CONTROL_NAMESPACE)
+    }
+
+    /// Labels courants d'un namespace (création, modification) : arrêt d'urgence, appliqué
+    /// au battement suivant, puis garde-fou production, qui réconcilie aussitôt les
+    /// ressources du namespace.
     pub async fn set_namespace_labels(&self, ns: &str, labels: &BTreeMap<String, String>) {
+        let stop = is_stopped(labels);
+        let stop_changed = {
+            let mut set = self.stopped.lock().unwrap_or_else(PoisonError::into_inner);
+            if stop {
+                set.insert(ns.to_string())
+            } else {
+                set.remove(ns)
+            }
+        };
+        if stop_changed {
+            tracing::warn!(namespace = ns, stop, "arrêt d'urgence");
+            for e in self.entries() {
+                if ns == CONTROL_NAMESPACE || e.namespace == ns {
+                    let stopped = self.is_stopped(&e.namespace);
+                    e.live().stopped = stopped;
+                }
+            }
+        }
         let production = is_production(labels);
         let changed = {
             let mut set = self
@@ -712,7 +743,10 @@ impl Ctl {
                     name: wl.into(),
                     desired_loaded: OnceCell::new(),
                     reapply: AtomicBool::new(false),
-                    live: Mutex::new(Live::default()),
+                    live: Mutex::new(Live {
+                        stopped: self.is_stopped(ns),
+                        ..Live::default()
+                    }),
                     indexed: OnceCell::new(),
                     index: Mutex::new(SegmentIndex::default()),
                     loaded: OnceCell::new(),
@@ -1213,12 +1247,17 @@ impl Ctl {
             // Un nouveau pod remplace souvent un ancien (déploiement) : on oublie les disparus.
             self.forget_pods(&mut live, now);
         }
-        // État propre au pod : sélection (spec.selector), puis garde-fou production.
-        let desired = guard_pod(
-            desired_for_pod(&live.desired, &labels),
-            production,
-            &report.mode,
-        );
+        // État propre au pod : arrêt d'urgence, sinon sélection (spec.selector), puis
+        // garde-fou production.
+        let desired = if live.stopped {
+            emergency_desired()
+        } else {
+            guard_pod(
+                desired_for_pod(&live.desired, &labels),
+                production,
+                &report.mode,
+            )
+        };
         live.pods.insert(
             instance.into(),
             Pod {
@@ -1640,7 +1679,11 @@ impl Ctl {
         live.pods
             .values()
             .map(|p| {
-                let want = desired_for_pod(&live.desired, &p.labels);
+                let want = if live.stopped {
+                    emergency_desired()
+                } else {
+                    desired_for_pod(&live.desired, &p.labels)
+                };
                 let s = pod_state(&p.report, p.last_seen_ms, now, timeout, &want);
                 (p.clone(), s, selects(&live.desired, &p.labels))
             })
@@ -1655,7 +1698,12 @@ impl Ctl {
             .filter(|(_, _, selected)| *selected)
             .map(|(_, s, _)| s)
             .collect();
-        let mut summary = summarize(&states, live.error.as_deref());
+        let error = if live.stopped {
+            Some(EMERGENCY_REASON)
+        } else {
+            live.error.as_deref()
+        };
+        let mut summary = summarize(&states, error);
         summary.unmatched = self.unmatched(live).total;
         summary
     }
