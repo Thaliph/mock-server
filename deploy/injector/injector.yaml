@@ -50,6 +50,9 @@ data:
       limits: {memory: 256Mi}
     # Label du pod repris en label `version` des métriques (sinon pod-template-hash).
     version_label: app.kubernetes.io/version
+    # Variante CNI (deploy/cni/) : règles posées par le plugin mimic-cni, plus de mimic-init
+    # privilégié dans les pods (spec §3.1b).
+    # cni: true
     # Filtre des logs des sidecars (MIMIC_LOG) ; un pod le remplace par l'annotation
     # mimic.platform.io/log. Absent : info.
     # sidecar_log: info

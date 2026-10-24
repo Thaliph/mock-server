@@ -706,3 +706,83 @@ fn red_10_raw_bodies_annotation_reaches_the_sidecar() {
     let p = injected(&pod(json!({})));
     assert_eq!(env_value(&sidecar_of(&p), "MIMIC_REDACT_RAW_BODIES"), None);
 }
+
+/// Variante CNI : pas de `mimic-init`, réglages en annotation, rien de privilégié (INJ-23).
+#[test]
+fn inj_23_cni_mode_replaces_mimic_init_with_an_annotation() {
+    let mut cni = config();
+    cni.cni = true;
+    for p in [
+        pod(json!({})),
+        pod(json!({"metadata": {"annotations": {
+            "mimic.platform.io/inbound-ports": "8080, nope",
+            "mimic.platform.io/exclude-outbound-cidrs": "10.0.0.0/8",
+            "mimic.platform.io/exclude-outbound-ports": "5432"
+        }}})),
+        istio_pod(),
+    ] {
+        let classic = injected(&p);
+        let Outcome::Injected(with_cni) = mutate(&p, &cni) else {
+            panic!("non injecté");
+        };
+        let spec = with_cni.spec.as_ref().unwrap();
+        let inits = spec.init_containers.as_deref().unwrap_or_default();
+        assert!(
+            inits.iter().all(|c| c.name != "mimic-init"),
+            "{:?}",
+            names(Some(&inits.to_vec()))
+        );
+        for c in inits.iter().chain(spec.containers.iter()) {
+            let sc = c.security_context.as_ref();
+            assert_ne!(
+                sc.and_then(|s| s.run_as_user),
+                Some(0),
+                "{} en root",
+                c.name
+            );
+            let added = sc
+                .and_then(|s| s.capabilities.as_ref())
+                .and_then(|c| c.add.clone())
+                .unwrap_or_default();
+            assert!(added.is_empty(), "{} : capacités {added:?}", c.name);
+        }
+        // Mêmes réglages que ceux que mimic-init aurait reçus.
+        let init = classic
+            .spec
+            .as_ref()
+            .unwrap()
+            .init_containers
+            .iter()
+            .flatten()
+            .find(|c| c.name == "mimic-init")
+            .unwrap();
+        let expected: serde_json::Map<String, serde_json::Value> = init
+            .env
+            .iter()
+            .flatten()
+            .filter(|e| e.name.starts_with("MIMIC_"))
+            .map(|e| (e.name.clone(), json!(e.value.clone().unwrap_or_default())))
+            .collect();
+        let annotation = with_cni
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("mimic.platform.io/cni-rules"))
+            .expect("annotation cni-rules");
+        let got: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(annotation).unwrap();
+        assert_eq!(got, expected);
+        // Le sidecar et les volumes ne changent pas.
+        assert_eq!(sidecar_of(&with_cni), sidecar_of(&classic));
+        assert_eq!(spec.volumes, classic.spec.as_ref().unwrap().volumes);
+    }
+    // Sans CNI : pas d'annotation.
+    let classic = injected(&pod(json!({})));
+    assert!(
+        classic
+            .metadata
+            .annotations
+            .as_ref()
+            .is_none_or(|a| !a.contains_key("mimic.platform.io/cni-rules"))
+    );
+}

@@ -60,6 +60,13 @@ impl Default for Settings {
     }
 }
 
+/// Écrit une ligne du déroulé ; une sortie fermée n'arrête pas l'application des règles.
+macro_rules! say {
+    ($log:expr, $($arg:tt)*) => {
+        let _ = writeln!($log, $($arg)*);
+    };
+}
+
 /// Échec de `mimic-init`.
 #[derive(Debug)]
 pub enum Failure {
@@ -109,7 +116,9 @@ fn parse(args: &Settings) -> Result<Parsed, String> {
 
 /// Pose les règles du pod (spec §3.1) : celles de `mimic-init`, et de `mimic-cni` dans le
 /// namespace réseau du pod.
-pub fn apply(args: &Settings) -> Result<(), Failure> {
+/// Le déroulé est écrit sur `log` : la sortie standard pour `mimic-init`, la sortie d'erreur
+/// pour le plugin CNI, dont la sortie standard est réservée à son résultat.
+pub fn apply(args: &Settings, log: &mut dyn Write) -> Result<(), Failure> {
     let parsed = parse(args).map_err(Failure::Config)?;
     let mode = parsed.mode;
     // Règles déjà posées, par binaire : le mesh et la table où il les a mises.
@@ -125,9 +134,11 @@ pub fn apply(args: &Settings) -> Result<(), Failure> {
         }
     }
     let resolved = resolve_mesh(mode, &args.iptables, &saves);
-    println!(
+    say!(
+        log,
         "mimic-init: mesh {:?}, binaire {}",
-        resolved.mesh, resolved.tool
+        resolved.mesh,
+        resolved.tool
     );
     let base = RulesConfig {
         proxy_uid: args.proxy_uid,
@@ -152,18 +163,22 @@ pub fn apply(args: &Settings) -> Result<(), Failure> {
     for (tool, config) in families {
         let rules = render(&config);
         if args.dry_run {
-            println!("# {tool}-restore --noflush\n{}", rules.restore);
+            say!(log, "# {tool}-restore --noflush\n{}", rules.restore);
             for j in &rules.jumps {
                 let at = if j.first {
                     format!("-I {} 1", j.chain)
                 } else {
                     format!("-A {}", j.chain)
                 };
-                println!("# {tool} -t nat {at} -p tcp -j {}", j.target);
+                say!(log, "# {tool} -t nat {at} -p tcp -j {}", j.target);
             }
             continue;
         }
-        println!("mimic-init: {tool}-restore --noflush\n{}", rules.restore);
+        say!(
+            log,
+            "mimic-init: {tool}-restore --noflush\n{}",
+            rules.restore
+        );
         restore(&format!("{tool}-restore"), &rules.restore)?;
         let saved = save(tool)?;
         for j in &rules.jumps {
@@ -171,7 +186,7 @@ pub fn apply(args: &Settings) -> Result<(), Failure> {
                 iptables(tool, &cmd)?;
             }
         }
-        println!("mimic-init: règles {tool} posées");
+        say!(log, "mimic-init: règles {tool} posées");
     }
     Ok(())
 }

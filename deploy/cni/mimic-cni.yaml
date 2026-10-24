@@ -1,0 +1,81 @@
+# Variante CNI (spec §3.1b) : les règles de redirection sont posées par un plugin CNI chaîné,
+# au lieu de l'init container privilégié mimic-init. Les namespaces injectés peuvent alors
+# rester en Pod Security baseline ou restricted ; le privilège reste dans mimic-system.
+#   kubectl apply -f deploy/cni/mimic-cni.yaml
+#   puis `cni: true` dans la configuration du webhook (deploy/injector/injector.yaml).
+# Le plugin ne voit que les pods créés après son installation sur le nœud.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mimic-cni
+  namespace: mimic-system
+---
+# Le plugin lit l'annotation mimic.platform.io/cni-rules du pod qu'il configure ; rien d'autre.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mimic-cni
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mimic-cni
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mimic-cni
+subjects:
+  - kind: ServiceAccount
+    name: mimic-cni
+    namespace: mimic-system
+---
+# Sur chaque nœud : copie le binaire dans /opt/cni/bin, écrit /etc/cni/net.d/mimic-cni.d/
+# (kubeconfig, jeton et CA rafraîchis toutes les 30 s) et ajoute mimic-cni en fin de chaîne
+# du premier fichier de configuration ; le retire à l'arrêt.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mimic-cni
+  namespace: mimic-system
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: mimic-cni}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: mimic-cni}
+    spec:
+      serviceAccountName: mimic-cni
+      priorityClassName: system-node-critical
+      # Sur tous les nœuds, y compris ceux réservés par un taint : sans le plugin, un pod
+      # injecté y démarrerait sans règles.
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: install
+          image: ghcr.io/thaliph/mimic:0.1.0
+          command: ["/usr/local/bin/mimic-cni"]
+          args: ["install", "--bin-dir", "/host/opt/cni/bin", "--conf-dir", "/host/etc/cni/net.d", "--host-conf-dir", "/etc/cni/net.d"]
+          # Écrit dans des répertoires de l'hôte possédés par root.
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            privileged: true
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - {name: cni-bin, mountPath: /host/opt/cni/bin}
+            - {name: cni-conf, mountPath: /host/etc/cni/net.d}
+      volumes:
+        - name: cni-bin
+          hostPath: {path: /opt/cni/bin, type: DirectoryOrCreate}
+        - name: cni-conf
+          hostPath: {path: /etc/cni/net.d, type: DirectoryOrCreate}

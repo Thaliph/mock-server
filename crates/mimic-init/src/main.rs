@@ -66,7 +66,7 @@ fn main() {
         intercept_loopback: a.intercept_loopback,
         dry_run: a.dry_run,
     };
-    let code = match apply(&settings) {
+    let code = match apply(&settings, &mut std::io::stdout()) {
         Ok(()) => return,
         Err(Failure::Config(e)) => {
             eprintln!("mimic-init: {e}");
