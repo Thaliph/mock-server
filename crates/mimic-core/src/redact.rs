@@ -84,8 +84,9 @@ impl Redactor {
     /// nombre de bodies ainsi réduits.
     pub fn redact_with(&self, e: &mut Exchange, keep_raw: bool) -> usize {
         let mut marks = vec![];
-        self.redact_headers(&mut e.req_headers, "request", &mut marks);
-        self.redact_headers(&mut e.resp_headers, "response", &mut marks);
+        self.redact_headers(&mut e.req_headers, "request.header", &mut marks);
+        self.redact_headers(&mut e.resp_headers, "response.header", &mut marks);
+        self.redact_headers(&mut e.resp_trailers, "response.trailer", &mut marks);
         for (name, value) in &mut e.query {
             if self.is_sensitive_name(name) && !is_marker(value) {
                 *value = self.marker(value.as_bytes());
@@ -116,7 +117,7 @@ impl Redactor {
     /// écrit, seulement comparé.
     pub fn redact_mock_request(&self, r: &mut crate::mock::MockRequest) {
         let mut marks = vec![];
-        self.redact_headers(&mut r.headers, "request", &mut marks);
+        self.redact_headers(&mut r.headers, "request.header", &mut marks);
         for (name, value) in &mut r.query {
             if self.is_sensitive_name(name) && !is_marker(value) {
                 *value = self.marker(value.as_bytes());
@@ -143,13 +144,13 @@ impl Redactor {
         }
     }
 
-    fn redact_headers(&self, headers: &mut [Header], side: &str, marks: &mut Vec<RedactionMark>) {
+    fn redact_headers(&self, headers: &mut [Header], place: &str, marks: &mut Vec<RedactionMark>) {
         for h in headers {
             let sensitive =
                 self.config.headers.iter().any(|n| n == &h.name) || self.is_sensitive_name(&h.name);
             if sensitive && !is_marker(&h.value) {
                 h.value = self.marker(h.value.as_bytes());
-                marks.push(mark(format!("{side}.header.{}", h.name)));
+                marks.push(mark(format!("{place}.{}", h.name)));
             }
         }
     }

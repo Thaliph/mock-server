@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use mimic_core::model::Body;
+use mimic_core::model::{Body, Header};
 use tokio::sync::oneshot;
 
 /// Budget global des octets de bodies copiés en vol par les tee (spec §5.2). Une
@@ -71,6 +71,8 @@ pub struct Captured {
     pub over_budget: bool,
     /// Part du budget en vol tenue par `prefix`, rendue avec lui.
     pub lease: Lease,
+    /// Trailers du body (HTTP/2 : `grpc-status`), vides s'il n'y en a pas.
+    pub trailers: Vec<Header>,
 }
 
 impl Captured {
@@ -157,6 +159,7 @@ pub struct TeeBody<B> {
     size: u64,
     lease: Lease,
     over_budget: bool,
+    trailers: Vec<Header>,
     tx: Option<oneshot::Sender<Captured>>,
 }
 
@@ -187,6 +190,7 @@ impl<B: HttpBody<Data = Bytes> + Unpin> TeeBody<B> {
             size: 0,
             lease: Lease { budget, bytes: 0 },
             over_budget: false,
+            trailers: vec![],
             tx: Some(tx),
         };
         // Un body vide peut ne jamais être lu : on le déclare terminé tout de suite.
@@ -212,6 +216,7 @@ impl<B> TeeBody<B> {
             ended: Instant::now(),
             over_budget: self.over_budget,
             lease: std::mem::take(&mut self.lease),
+            trailers: std::mem::take(&mut self.trailers),
         }
     }
 
@@ -248,6 +253,14 @@ impl<B: HttpBody<Data = Bytes> + Unpin> HttpBody for TeeBody<B> {
                 if let Some(data) = frame.data_ref() {
                     this.size += data.len() as u64;
                     this.copy(data);
+                }
+                if let Some(trailers) = frame.trailers_ref() {
+                    this.trailers = trailers
+                        .iter()
+                        .map(|(n, v)| {
+                            Header::new(n.as_str(), String::from_utf8_lossy(v.as_bytes()))
+                        })
+                        .collect();
                 }
                 if this.inner.is_end_stream() {
                     this.finish(true);
@@ -350,6 +363,7 @@ mod tests {
             ended: Instant::now(),
             over_budget: false,
             lease: Lease::default(),
+            trailers: vec![],
         };
         assert_eq!(
             c.into_body(true, 100, Some("gzip")),

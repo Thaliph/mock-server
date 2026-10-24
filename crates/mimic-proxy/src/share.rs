@@ -428,6 +428,7 @@ mod tests {
             ttfb_us: 1,
             total_us: 1,
             trace_id: None,
+            resp_trailers: vec![],
             redactions: vec![],
         }
     }

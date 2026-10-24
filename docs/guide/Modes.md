@@ -34,7 +34,7 @@ arrivée. Log : `changement de mode`, métrique `mimic_mode{mode}`.
 | Trafic sortant | `passthrough` | `record` | `mock` | `mock-partial` |
 |----------------|---------------|----------|--------|----------------|
 | HTTP/1, HTTP/2, gRPC en clair | relayé | relayé, enregistré | moteur de mock | moteur, sinon relayé et enregistré |
-| HTTPS d'un hôte de `tls.intercept` | déchiffré, relayé | déchiffré, relayé, enregistré | déchiffré, moteur de mock | déchiffré, moteur, sinon relayé |
+| HTTPS d'un hôte de `tls.intercept` (HTTP/1.1, HTTP/2, gRPC : le certificat forgé annonce `h2`) | déchiffré, relayé | déchiffré, relayé, enregistré (trailers gRPC compris) | déchiffré, moteur de mock (trailers rejoués) | déchiffré, moteur, sinon relayé |
 | HTTPS non intercepté (redirigé) | tunnel opaque | tunnel opaque | **connexion fermée** (`mimic_passthrough_connections_total{kind="tls",result="refused"}`) | tunnel opaque |
 | `CONNECT` (proxy explicite) non intercepté | tunnel | tunnel | **`403`** `mimic: tunnel refusé en mode mock (TLS non intercepté)` | tunnel |
 | Poignée de main WebSocket | relayée | relayée, enregistrée | relayée et enregistrée, ou `503` avec `mock.websocket: refuse` | idem `mock` |

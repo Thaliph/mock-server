@@ -256,8 +256,15 @@ async fn forward(
     };
     let websocket = client_upgrade.is_some();
     strip_hop_by_hop(&mut parts.headers, websocket);
-    // Même version vers l'amont qu'en entrée : un serveur gRPC (h2c) refuse HTTP/1.1.
-    let h2 = parts.version == http::Version::HTTP_2;
+    // HTTP/2 vers l'amont : en clair (h2c, connaissance préalable), ou en HTTPS pour gRPC,
+    // qui l'exige ; une autre requête HTTP/2 déchiffrée part en HTTP/1.1, que toute
+    // destination accepte (le client a négocié `h2` avec le serveur forgé, spec §4.2).
+    let grpc = parts
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/grpc"));
+    let h2 = parts.version == http::Version::HTTP_2 && (target.scheme != "https" || grpc);
     if h2 {
         // En HTTP/2, l'authority voyage dans `:authority` ; seul `te: trailers` est permis.
         parts.headers.remove(http::header::HOST);
@@ -505,6 +512,7 @@ fn record_websocket(state: &AppState, mut p: Pending, ended: Instant) {
         resp_body: Body::Empty,
         ttfb_us: p.ttfb.as_micros() as u64,
         total_us: total.as_micros() as u64,
+        resp_trailers: vec![],
         redactions: vec![],
     };
     if metadata {
@@ -549,9 +557,10 @@ async fn finalize(
     req: oneshot::Receiver<Captured>,
     resp: oneshot::Receiver<Captured>,
 ) {
-    let (Ok(req), Ok(resp)) = (req.await, resp.await) else {
+    let (Ok(req), Ok(mut resp)) = (req.await, resp.await) else {
         return;
     };
+    let resp_trailers = std::mem::take(&mut resp.trailers);
     let total = resp.ended.saturating_duration_since(p.started);
     observe_duration(&state, p.direction, p.mode, p.authority_label, total);
     if p.metadata {
@@ -611,6 +620,7 @@ async fn finalize(
         resp_body,
         ttfb_us: p.ttfb.as_micros() as u64,
         total_us: total.as_micros() as u64,
+        resp_trailers,
         redactions: vec![],
     };
     if !state.redact(&mut exchange) {
@@ -641,6 +651,7 @@ fn record_metadata(state: &AppState, p: Pending, req: Captured, resp: Captured, 
         resp_body: resp.into_body(false, 0, None),
         ttfb_us: p.ttfb.as_micros() as u64,
         total_us: total.as_micros() as u64,
+        resp_trailers: vec![],
         redactions: vec![],
     };
     state.store.add_ephemeral(exchange);
@@ -795,7 +806,17 @@ fn refused(state: &AppState, reason: Reason, authority: &str, parts: &http::requ
 /// le header de correspondance propre à la requête.
 fn mock_response(state: &AppState, set: &MockSet, r: &MockResponse) -> Response<ProxyBody> {
     let prepared = set.prepared(r);
-    let mut response = Response::new(full(prepared.body.clone()));
+    // Trailers enregistrés (gRPC) : rejoués après le body, sans quoi le client échoue.
+    let body = match &prepared.trailers {
+        Some(trailers) => boxed(http_body_util::StreamBody::new(futures_util::stream::iter(
+            [
+                Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(prepared.body.clone())),
+                Ok(hyper::body::Frame::trailers(trailers.clone())),
+            ],
+        ))),
+        None => full(prepared.body.clone()),
+    };
+    let mut response = Response::new(body);
     *response.status_mut() = prepared.status;
     *response.headers_mut() = prepared.headers.clone();
     if state.config.mock.debug_header

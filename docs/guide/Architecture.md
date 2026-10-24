@@ -85,7 +85,10 @@ toujours exclus des redirections par `mimic-init`.
    par le moteur de mock). TLS vers un hôte de `tls.intercept` : terminé par le sidecar avec un
    certificat forgé, puis traité comme HTTP. Autre TLS : tunnel opaque (refusé en `mock`).
    Autre TCP : tunnel opaque (refusé en `mock`, sauf `mock.tcp: relay`).
-3. Les headers propres à la connexion ne sont jamais relayés ; HTTP/2 repart en HTTP/2 (gRPC).
+3. Les headers propres à la connexion ne sont jamais relayés. HTTP/2 en clair repart en HTTP/2 ;
+   déchiffré (le certificat forgé annonce `h2`), il repart en HTTP/2 pour gRPC, en HTTP/1.1
+   sinon. Les trailers de réponse (`grpc-status`) sont relayés, enregistrés et rejoués par le
+   mock.
 
 Détail par mode : [Modes](Modes.md).
 

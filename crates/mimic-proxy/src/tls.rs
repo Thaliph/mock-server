@@ -164,7 +164,8 @@ impl Ca {
             .map_err(err)?
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(Resolver(self.clone())));
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // `h2` d'abord : un client gRPC garde HTTP/2, qui part de même vers l'amont (spec §4.2).
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Arc::new(config))
     }
 }

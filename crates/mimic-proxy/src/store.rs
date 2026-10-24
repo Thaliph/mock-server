@@ -687,6 +687,7 @@ fn without_bodies(e: &Exchange) -> Exchange {
         ttfb_us: e.ttfb_us,
         total_us: e.total_us,
         trace_id: e.trace_id.clone(),
+        resp_trailers: e.resp_trailers.clone(),
         redactions: e.redactions.clone(),
     }
 }
@@ -713,6 +714,7 @@ mod tests {
             ttfb_us: 1,
             total_us: 1,
             trace_id: None,
+            resp_trailers: vec![],
             redactions: vec![],
         }
     }

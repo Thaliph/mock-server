@@ -376,6 +376,7 @@ fn peer_segment(dir: &std::path::Path, name: &str, id: &str, at_ms: i64) {
         ttfb_us: 1,
         total_us: 1,
         trace_id: None,
+        resp_trailers: vec![],
         redactions: vec![],
     };
     let d = dir.join("ns/api/exchanges/api-p");
