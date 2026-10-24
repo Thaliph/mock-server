@@ -89,7 +89,7 @@ async fn mck_15_replayed_latency_matches_the_dependency() {
             seen[i][0].push(call(&via_record, url).await);
             seen[i][1].push(call(&via_mock, url).await);
         }
-        without.push(call(&via_none, &paths[1]).await);
+        without.push(call(&via_none, &paths[0]).await);
     }
     let [[rec_slow, mock_slow], [rec_fast, mock_fast]] = seen.map(|s| s.map(p50));
     let without = p50(without);
@@ -103,9 +103,10 @@ async fn mck_15_replayed_latency_matches_the_dependency() {
             .map(|e| e.total_us)
             .collect())
     };
-    eprintln!("enregistré : {} / {} µs", stored("/slow"), stored("/fast"));
+    let stored_slow = stored("/slow");
+    eprintln!("enregistré : {stored_slow} / {} µs", stored("/fast"));
     eprintln!(
-        "p50 vu par l'application : dépendance {rec_slow} / {rec_fast} µs, rejouée {mock_slow} / {mock_fast} µs, sans latence {without} µs"
+        "p50 vu par l'application : dépendance {rec_slow} / {rec_fast} µs, rejouée {mock_slow} / {mock_fast} µs, sans latence {without} µs sur /slow"
     );
 
     let ratio = mock_slow as f64 / rec_slow as f64;
@@ -113,7 +114,12 @@ async fn mck_15_replayed_latency_matches_the_dependency() {
         (0.9..=1.1).contains(&ratio),
         "dépendance de {rec_slow} µs rejouée en {mock_slow} µs"
     );
-    assert!(without < 1_000, "sans latence : {without} µs");
+    // Sans latence, seul reste le coût du sidecar, celui du rejeu avec latence : un seuil
+    // absolu dépendrait de la machine et du profil de compilation.
+    assert!(
+        without + stored_slow / 2 <= mock_slow,
+        "sans latence : {without} µs, rejeu avec latence de {stored_slow} µs : {mock_slow} µs"
+    );
     assert!(
         mock_fast <= rec_fast + rec_fast / 2,
         "dépendance de {rec_fast} µs rejouée en {mock_fast} µs"
