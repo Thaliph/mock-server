@@ -37,7 +37,7 @@ enregistré, et comment interpréter les réponses que le sidecar fabrique lui-m
 | lire vos données (`export`, `requests`, `report`, `snapshot ls`) | RoleBinding du ClusterRole `mimic-data-viewer` dans **votre** namespace : vous lisez vos workloads, rien d'autre | `kubectl auth can-i get workloads.data.mimic.platform.io/requests -n <ns>` |
 | voir le mode et l'alignement (`mimicctl status`) | ClusterRole `mimic-viewer`, déjà agrégé au rôle standard `view` | `kubectl auth can-i list mimicworkloads -n <ns>` |
 | basculer (`mimicctl mode`) | RoleBinding du ClusterRole `mimic-operator` dans votre namespace | `kubectl auth can-i patch mimicworkloads -n <ns>` |
-| marques de redaction stables | Secret `<workload>-mimic`, clé `redact-salt` ; sans lui, les valeurs redactées changent à chaque redémarrage | `kubectl -n <ns> get secret <workload>-mimic` |
+| sel de redaction partagé entre clusters (facultatif) | Secret `<workload>-mimic`, clé `redact-salt` ; sans lui, le contrôleur fournit un sel propre au workload | `kubectl -n <ns> get secret <workload>-mimic` |
 
 Vous n'avez besoin d'**aucun** droit dans `mimic-system` : les lectures passent par l'API
 Kubernetes (`kubectl get --raw /apis/data.mimic.platform.io/v1alpha1/namespaces/<ns>/workloads/<wl>/operations`
@@ -62,8 +62,11 @@ fonctionne aussi), qui vérifie vos droits sur votre namespace.
 Les headers d'authentification, cookies, paramètres et champs JSON dont le nom contient
 `token`, `secret`, `key`, `session`, `password`, et les e-mails, numéros de carte, IBAN et JWT
 des bodies JSON, sont **redactés avant d'être enregistrés** (`<redacted:sha256:…>`). Les bodies
-qui ne sont ni JSON ni formulaire (XML, multipart, binaire) sont gardés tels quels : n'y faites
-pas transiter de secret. Détail : [Collecte et stockage](Collecte-et-stockage.md#redaction).
+qui ne sont ni JSON ni formulaire (XML, texte, multipart, gRPC, binaire, ou sans
+`Content-Type`) ne sont **pas enregistrés** : une dépendance qui répond ainsi n'est pas
+mockable (`599`) sauf exception, `mimic.platform.io/capture-raw-bodies: api.partner.io`
+(et `inbound` pour vos propres requêtes, à rejouer en tir de charge), qui les enregistre en
+clair. Détail : [Collecte et stockage](Collecte-et-stockage.md#redaction).
 
 ## Lire ce que mimic a enregistré
 
@@ -103,7 +106,7 @@ Le sidecar répond lui-même dans les cas suivants, avec un body texte qui comme
 
 | Code | Body | Quand | Que faire |
 |------|------|-------|-----------|
-| `599` | `mimic: aucun enregistrement ne correspond à cette requête` | `mock` : aucun échange enregistré pour cet appel sortant (header `x-mimic-unmatched: true`). Compté dans `mimicctl status` (`UNMATCHED`) et listé dans `mimicctl report` | enregistrer plus longtemps pour couvrir l'appel, passer en `mock-partial`, ou vérifier que l'hôte HTTPS est dans `tls-intercept` |
+| `599` | `mimic: aucun enregistrement ne correspond à cette requête` | `mock` : aucun échange rejouable pour cet appel sortant (header `x-mimic-unmatched: true`). Compté dans `mimicctl status` (`UNMATCHED`) et listé dans `mimicctl report` | enregistrer plus longtemps pour couvrir l'appel, passer en `mock-partial`, vérifier que l'hôte HTTPS est dans `tls-intercept`, ou, pour une réponse XML, texte ou gRPC, l'ajouter à `capture-raw-bodies` |
 | `413` | `mimic: body trop gros pour le mode mock` | `mock` : body de requête au-delà de `capture.max_body_bytes` (1 MiB), qui ne peut pas être comparé aux enregistrements | réduire le body, ou demander une limite plus haute |
 | `502` | `mimic: amont injoignable` | `record`/`passthrough`/`mock-partial` : la dépendance (sortant) ou votre application (entrant) ne répond pas : connexion refusée, coupée, réponse illisible | c'est la vraie dépendance qui est en panne, ou votre application qui n'écoute pas encore (démarrage lent) ou sur un autre port |
 | `504` | `mimic: connexion vers l'amont non établie dans le délai (outbound.connect_timeout)` | la connexion vers la dépendance ou l'application n'a pas abouti dans le délai | vraie dépendance lente ou filtrée (NetworkPolicy, pare-feu) |

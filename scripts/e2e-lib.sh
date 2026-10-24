@@ -108,8 +108,11 @@ install_mimic() {
   # (50m chacun, une vingtaine de pods) ne laissaient plus de place aux pods de test
   # ajoutés en fin de script (Insufficient cpu). Le test ne porte pas sur ces requêtes :
   # on les abaisse à 10m pour les sidecars injectés ici.
+  # La démo parle gRPC et texte : ces bodies, que la redaction ne sait pas lire, ne sont
+  # capturés (et mockables) que par exception (spec §7).
   manifest deploy/injector/injector.yaml \
     | sed 's#requests: {cpu: 50m, memory: 64Mi}#requests: {cpu: 10m, memory: 64Mi}#' \
+    | sed 's#^      mock:$#      redact:\n        raw_bodies: ["*", inbound]\n      mock:#' \
     | kubectl apply -f -
   reissue_if_stale mimic-injector-tls
   # Le webhook relit son certificat toutes les 10 s ; relancé si sa feuille a été réémise,

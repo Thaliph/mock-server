@@ -476,10 +476,10 @@ async fn ctl_08_heartbeats_never_wait_for_storage_or_computation() {
     let hb = tokio::time::timeout(quick, heartbeat(&c, "checkout-a"))
         .await
         .expect("battement pendant la lecture du support");
-    assert_eq!(
-        hb.json::<Value>().await.unwrap(),
-        json!({"mode": "record", "snapshot": null})
-    );
+    // Le sel du workload n'y est que s'il a pu être lu à temps (au plus 250 ms, CTL-49).
+    let mut reply = hb.json::<Value>().await.unwrap();
+    reply.as_object_mut().unwrap().remove("redact_salt");
+    assert_eq!(reply, json!({"mode": "record", "snapshot": null}));
     tokio::time::timeout(quick, get_json(&c, "/v1/workloads"))
         .await
         .expect("liste des workloads pendant la lecture du support");

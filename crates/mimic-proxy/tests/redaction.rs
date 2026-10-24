@@ -88,9 +88,10 @@ async fn red_08_mock_matches_the_redacted_request() {
     assert!(!matched(&r).starts_with("exact"), "{:?}", r.headers());
     assert_eq!(saas.hits(), hits, "rien n'est sorti en mock");
 
-    // mock-partial : la requête relayée à la vraie dépendance part intacte.
+    // mock-partial : une requête sans enregistrement (autre dépendance) est relayée intacte.
     set_mode(&p, "mock-partial").await;
-    let r = post(&p, &url, "k9", "e@f.io").await;
+    let other = fake_server().await;
+    let r = post(&p, &other.url("/echo"), "k9", "e@f.io").await;
     assert_eq!(r.status(), 200);
     let echoed: Value = r.json().await.unwrap();
     assert_eq!(echoed["email"], "e@f.io");

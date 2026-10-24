@@ -59,26 +59,40 @@ reconnaissables entre elles sans que la valeur soit retrouvable.
 | bodies JSON | clés contenant ces sous-chaînes (la valeur entière, objet compris, est remplacée) ; chemins de `redact.extra_json_paths` (`$.customer.ssn`, sans index de tableau) ; toute chaîne qui ressemble à un e-mail, un numéro de carte (13 à 19 chiffres valides au contrôle de Luhn), un IBAN valide ou un JWT, quel que soit le nom du champ |
 | bodies `application/x-www-form-urlencoded` | mêmes règles de nom et de valeur, paramètre par paramètre |
 | body JSON ou formulaire tronqué ou illisible | remplacé par sa seule taille (`Skipped`) : on ne peut pas garantir qu'il ne contient pas de secret |
-| **autres bodies** (texte, XML, `multipart/form-data`, binaire, protobuf/gRPC) | **gardés tels quels**, sans redaction |
+| **autres bodies** (texte, XML, `multipart/form-data`, binaire, protobuf/gRPC, sans `Content-Type`) | **non capturés** : seule leur taille est gardée (`mimic_capture_dropped_total{reason="unredactable"}`), sauf pour les hôtes de `redact.raw_bodies` (et `inbound` pour l'entrant), gardés tels quels sans redaction |
 
 Un body où rien n'a été remplacé est gardé octet pour octet (ordre des clés, espaces) : le mock
 le rejoue à l'identique.
 
 Conséquences pour l'exploitation :
 
-- Un service qui échange des données sensibles en XML, en `multipart` ou en gRPC voit ces
-  bodies stockés en clair. Mettre `capture.bodies: false` (ConfigMap
-  `mimic.platform.io/config`) ou ne pas l'injecter.
+- Une réponse dont le body n'est pas capturé **n'est pas rejouable** : en `mock`, l'appel
+  reçoit `599`, comme un appel jamais enregistré. Pour mocker une dépendance XML, texte ou gRPC,
+  la lister dans `redact.raw_bodies` (annotation `mimic.platform.io/capture-raw-bodies:
+  api.partner.io,inbound`) : ses bodies sont alors stockés **en clair**, en connaissance de
+  cause.
+- **Requête du mock.** En `mock` et `mock-partial`, la requête de l'application est redactée
+  avec le même sel avant d'être comparée aux enregistrements : une requête qui porte un e-mail
+  ou un jeton correspond à son enregistrement. Celle qui est relayée à la vraie dépendance
+  (`mock-partial`) part intacte.
+- **Contrôleur.** Chaque segment reçu est redacté de nouveau avec le sel du workload : un
+  sidecar d'une version antérieure ne fait rien écrire de sensible sur le support.
 - La sous-chaîne `key` rend sensibles des noms comme `keywords` ou `monkey` : leurs valeurs sont
   remplacées, ce qui peut appauvrir les schémas ou les exemples.
-- **Sel.** Lu dans le Secret `<workload>-mimic`, clé `redact-salt` (`MIMIC_REDACT_SALT`). Sans
-  ce Secret, chaque processus tire un sel aléatoire : les marques diffèrent d'un pod à l'autre et
-  après chaque redémarrage. Les créer avant l'injection :
+- **Sel, obligatoire.** Dans l'ordre : le Secret `<workload>-mimic`, clé `redact-salt`
+  (`MIMIC_REDACT_SALT`) ; sinon, sous contrôleur, le **sel du workload**, que le contrôleur tire
+  une fois, garde sur son support (`<ns>/<wl>/redact-salt`) et donne à chaque battement aux seuls
+  pods du workload (le sidecar le garde en mémoire, jamais sur disque). Sans contrôleur ni sel,
+  le sidecar refuse de démarrer. Le Secret reste utile pour partager un sel entre clusters
+  (enregistrer en A, mocker en B) :
 
   ```sh
   kubectl -n shop create secret generic checkout-mimic \
     --from-literal=redact-salt="$(openssl rand -hex 32)"
   ```
+
+  Un pod démarré par repli, sans réponse du contrôleur, n'enregistre rien tant qu'il n'a pas
+  reçu le sel (`mimic_capture_dropped_total{reason="no_salt"}`).
 
 > **Écart avec la spec.** La spec (§7) prévoit des « regex additionnels » par projet : seuls
 > `redact.extra_json_paths` (sans index de tableau) existent. Le code ajoute `passwd` aux motifs

@@ -143,7 +143,8 @@ dans un namespace non labellisé.
 
 ```sh
 kubectl label namespace shop mimic.platform.io/enabled=true
-# Sel de redaction commun aux réplicas du workload (facultatif mais recommandé, voir Collecte et stockage)
+# Sel de redaction : facultatif sous contrôleur (il en tire un par workload) ; utile pour
+# partager le sel entre clusters (voir Collecte et stockage)
 kubectl -n shop create secret generic checkout-mimic --from-literal=redact-salt="$(openssl rand -hex 32)"
 # Seuls les pods créés après le label sont injectés
 kubectl -n shop rollout restart deploy/checkout

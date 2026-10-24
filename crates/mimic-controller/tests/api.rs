@@ -144,9 +144,24 @@ async fn heartbeat(c: &Running, instance: &str, mode: &str, snapshot: Option<&st
         .send()
         .await
         .unwrap()
-        .json()
+        .json::<Value>()
         .await
+        .map(without_salt)
         .unwrap()
+}
+
+/// Réponse de battement sans le sel du workload, vérifié à part (CTL-49).
+fn without_salt(mut v: Value) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        let salt = o.remove("redact_salt");
+        assert!(
+            salt.as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.len() == 64),
+            "{salt:?}"
+        );
+    }
+    v
 }
 
 #[tokio::test]
@@ -1179,7 +1194,7 @@ async fn red_11_segments_are_redacted_again_at_ingestion() {
     let auth = e["req_headers"][0]["value"].as_str().unwrap();
     assert!(auth.starts_with("<redacted:sha256:"), "{auth}");
     // Segment sans valeur à remplacer : écrit octet pour octet.
-    assert!(all.iter().any(|t| *t == clean_line), "{all:?}");
+    assert!(all.contains(&clean_line), "{all:?}");
 }
 
 fn base64(bytes: &[u8]) -> String {

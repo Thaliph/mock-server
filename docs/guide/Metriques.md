@@ -132,6 +132,8 @@ Exposées par les sidecars pilotés (`share.url` vers le contrôleur) seulement.
 | `store_budget` | body retiré ou échange évincé de la mémoire (`max_store_bytes`, bodies au plus pour moitié) | normal une fois le store plein (fenêtre glissante) |
 | `local_backlog` | ligne non écrite dans le journal local (file d'écriture pleine) | disque lent ou plein |
 | `share_backlog` | échange abandonné avant publication (`share.max_backlog_bytes` ou `max_pending`) | **perte de données** pour le contrôleur |
+| `unredactable` | body que la redaction ne sait pas lire (XML, texte, gRPC, binaire, sans type), réduit à sa taille faute d'exception `redact.raw_bodies` | normal ; la réponse n'est pas rejouable en mock |
+| `no_salt` | échange abandonné : aucun sel connu (sidecar démarré par repli, contrôleur pas encore joint) | transitoire ; durable, voir le lien avec le contrôleur |
 
 ### Version
 

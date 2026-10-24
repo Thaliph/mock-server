@@ -22,6 +22,9 @@ pub const ANNOTATION_EXCLUDE_CIDRS: &str = "mimic.platform.io/exclude-outbound-c
 pub const ANNOTATION_EXCLUDE_PORTS: &str = "mimic.platform.io/exclude-outbound-ports";
 pub const ANNOTATION_TLS_INTERCEPT: &str = "mimic.platform.io/tls-intercept";
 pub const ANNOTATION_MESH: &str = "mimic.platform.io/mesh";
+/// Bodies non analysables gardés pour ces hôtes, `inbound` pour l'entrant
+/// (`MIMIC_REDACT_RAW_BODIES`, spec §7).
+pub const ANNOTATION_RAW_BODIES: &str = "mimic.platform.io/capture-raw-bodies";
 /// Filtre des logs du sidecar (`MIMIC_LOG`, spec §9.4).
 pub const ANNOTATION_LOG: &str = "mimic.platform.io/log";
 /// Taille de l'`emptyDir` du store, et la même en octets pour le sidecar
@@ -466,6 +469,12 @@ fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]
     }
     if !intercept.is_empty() {
         envs.push(env("MIMIC_TLS_INTERCEPT", intercept.join(",")));
+    }
+    let raw = annotation(pod, ANNOTATION_RAW_BODIES)
+        .map(split_list)
+        .unwrap_or_default();
+    if !raw.is_empty() {
+        envs.push(env("MIMIC_REDACT_RAW_BODIES", raw.join(",")));
     }
     let resources = cfg.resources.clone().unwrap_or_else(|| {
         let q = |s: &str| Quantity(s.into());

@@ -18,7 +18,10 @@ use tokio::net::TcpListener;
 /// Dépendance réelle : `/fast` répond aussitôt, `/slow` après environ 3,5 ms.
 async fn dependency() -> SocketAddr {
     let app = Router::new()
-        .route("/fast", get(|| async { r#"{"ok":true}"# }))
+        .route(
+            "/fast",
+            get(|| async { axum::Json(serde_json::json!({"ok": true})) }),
+        )
         .route(
             "/slow",
             get(|| async {
@@ -26,7 +29,7 @@ async fn dependency() -> SocketAddr {
                 // la dépendance garde la même distribution d'un bout à l'autre du test.
                 let wait = || std::thread::sleep(Duration::from_micros(3_300));
                 tokio::task::spawn_blocking(wait).await.unwrap();
-                r#"{"ok":true}"#
+                axum::Json(serde_json::json!({"ok": true}))
             }),
         );
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -71,6 +71,11 @@ data:
       capture:
         samples_per_operation: 20
         max_inflight_bytes: 67108864   # 64 MiB de bodies copiés en vol (spec §5.2)
+      # Bodies que la redaction ne sait pas lire (XML, texte, gRPC, binaire, sans type) : non
+      # capturés, donc non mockables, sauf pour ces hôtes et `inbound` (spec §7). Par pod :
+      # annotation mimic.platform.io/capture-raw-bodies.
+      # redact:
+      #   raw_bodies: [api.partner.io, inbound]
       mock:
         strategy: best
         unmatched: error

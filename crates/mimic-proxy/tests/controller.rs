@@ -689,6 +689,8 @@ async fn snp_08_mock_form_beyond_the_bound_is_refused() {
         if let Some(s) = c.share.as_mut() {
             s.max_snapshot_bytes = max;
         }
+        // Body sans type : gardé, pour qu'il pèse sur la forme de mock (spec §7).
+        c.redact.raw_bodies = vec!["*".into()];
         c
     };
     // Réponse très compressible : la forme compressée tient sous 20 000 octets, pas la
