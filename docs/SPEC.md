@@ -1544,7 +1544,7 @@ La documentation d'exploitation (`docs/guide/`, `docs/`) décrit le comportement
 | DOC-05 | manifests de `deploy/`, `docs/` | lecture | aucune image `registry.example.com/platform/mimic` ; l'image mimic citée par la documentation est celle des manifests |
 | DOC-06 | règles de `deploy/monitoring/rules.yaml`, `docs/guide/Alertes-et-supervision.md` | lecture | chaque alerte a une ligne dans « Conduite à tenir », et réciproquement |
 | DOC-07 | `crates/mimicctl/src/main.rs`, `docs/guide/CLI-mimicctl.md` | lecture | chaque sous-commande et chaque option longue de `mimicctl` y figure ; `docs/cli.md` n'existe plus (une seule page de référence) |
-| DOC-08 | `docs/guide/Developpeur-applicatif.md`, code du sidecar, `deploy/controller/rbac.yaml` | lecture | la page existe et le sommaire la cite ; elle a un glossaire et une section « Ce que la plateforme doit fournir » qui nomme le ClusterRole `mimic-data-viewer` livré ; chaque en-tête `x-mimic-*` posé par le sidecar sur une réponse et chaque corps `mimic: …` d'une réponse d'erreur du sidecar y figurent, avec son code (`599`, `502`, `504`, `413`, `503`, `400`) |
+| DOC-08 | `docs/guide/Developpeur-applicatif.md`, code du sidecar, `deploy/controller/rbac.yaml` | lecture | la page existe et le sommaire la cite ; elle a un glossaire et une section « Ce que la plateforme doit fournir » qui nomme le ClusterRole `mimic-data-viewer` livré ; chaque en-tête `x-mimic-*` posé par le sidecar sur une réponse et chaque corps `mimic: …` d'une réponse d'erreur du sidecar y figurent, avec son code (`599`, `502`, `504`, `413`, `503`, `403`, `400`), sur une même ligne |
 
 **Supervision (MON)** (§9.3, §9.6) :
 

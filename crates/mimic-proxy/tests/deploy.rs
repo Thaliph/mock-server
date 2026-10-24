@@ -159,3 +159,81 @@ fn cited_metrics(page: &str) -> Vec<String> {
     out.dedup();
     out
 }
+
+const PROXY: &str = include_str!("../src/proxy.rs");
+const DEV_DOC: &str = include_str!("../../../docs/guide/Developpeur-applicatif.md");
+
+/// Code HTTP d'un nom de `StatusCode` employé par le sidecar.
+fn code(name: &str) -> u16 {
+    match name {
+        "BAD_REQUEST" => 400,
+        "FORBIDDEN" => 403,
+        "PAYLOAD_TOO_LARGE" => 413,
+        "BAD_GATEWAY" => 502,
+        "SERVICE_UNAVAILABLE" => 503,
+        "GATEWAY_TIMEOUT" => 504,
+        other => panic!("StatusCode::{other} non répertorié par DOC-08"),
+    }
+}
+
+/// Réponses d'erreur du sidecar : (code, corps `mimic: …`), lues dans le source.
+fn error_responses() -> Vec<(u16, String)> {
+    let mut out = vec![];
+    let mut rest = PROXY;
+    while let Some(at) = rest.find("\"mimic: ") {
+        let mut start = at.saturating_sub(160);
+        while !rest.is_char_boundary(start) {
+            start -= 1;
+        }
+        let before = &rest[start..at];
+        let body_start = &rest[at + 1..];
+        let body = &body_start[..body_start.find('"').unwrap()];
+        let code = if before.contains("from_u16(599)") {
+            599
+        } else {
+            let name = before.rsplit("StatusCode::").next().unwrap();
+            let name: String = name
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                .collect();
+            code(&name)
+        };
+        out.push((code, body.to_string()));
+        rest = &rest[at + 1 + body.len()..];
+    }
+    out
+}
+
+/// La page des équipes applicatives existe, et décrit tout ce que le sidecar leur renvoie :
+/// en-têtes `x-mimic-*` et réponses d'erreur, avec leur code (DOC-08).
+#[test]
+fn doc_08_application_developer_page() {
+    let readme = include_str!("../../../docs/guide/README.md");
+    assert!(readme.contains("(Developpeur-applicatif.md)"), "sommaire");
+    for section in ["## Glossaire", "## Ce que la plateforme doit fournir"] {
+        assert!(DEV_DOC.contains(section), "{section} absente");
+    }
+    let rbac = include_str!("../../../deploy/controller/rbac.yaml");
+    assert!(rbac.contains("name: mimic-data-viewer"));
+    assert!(DEV_DOC.contains("`mimic-data-viewer`"));
+
+    let headers: Vec<&str> = PROXY
+        .split('"')
+        .filter(|t| t.starts_with("x-mimic-") && !t.contains(' '))
+        .collect();
+    assert!(headers.len() >= 3, "{headers:?}");
+    for h in headers {
+        assert!(DEV_DOC.contains(&format!("`{h}`")), "{h} absent de la page");
+    }
+
+    let errors = error_responses();
+    assert!(errors.len() >= 9, "{errors:?}");
+    for (code, body) in errors {
+        assert!(
+            DEV_DOC
+                .lines()
+                .any(|l| l.contains(&format!("`{code}`")) && l.contains(&body)),
+            "« {body} » ({code}) absent de la page, ou sans son code sur la même ligne"
+        );
+    }
+}

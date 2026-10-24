@@ -48,7 +48,7 @@ fn cli_03_controller_paths() {
         "/v1/workloads/shop/checkout/openapi/inbound"
     );
     assert_eq!(
-        requests_path("shop", "checkout", "k6", 100),
+        requests_path("shop", "checkout", "inbound", "k6", 100),
         "/v1/workloads/shop/checkout/requests?direction=inbound&format=k6&limit=100"
     );
 }
@@ -739,4 +739,145 @@ fn cli_16_snapshot_gc_path_and_report() {
         snapshot_gc_deleted(&json!({"deleted": []})),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn cli_17_reads_go_through_the_aggregated_api() {
+    use mimicctl::{aggregated_path, falls_back, workloads_path};
+    let prefix = "/apis/data.mimic.platform.io/v1alpha1";
+    for (ui, aggregated) in [
+        (
+            "/v1/workloads/shop/checkout/openapi/outbound/api.stripe.com:443".to_string(),
+            format!(
+                "{prefix}/namespaces/shop/workloads/checkout/openapi/outbound/api.stripe.com:443"
+            ),
+        ),
+        (
+            export_path("shop", "checkout", &Target::Inbound),
+            format!("{prefix}/namespaces/shop/workloads/checkout/openapi/inbound"),
+        ),
+        (
+            requests_path("shop", "checkout", "outbound", "jsonl", 10),
+            format!(
+                "{prefix}/namespaces/shop/workloads/checkout/requests?direction=outbound&format=jsonl&limit=10"
+            ),
+        ),
+        (
+            operations_path("shop", "checkout"),
+            format!("{prefix}/namespaces/shop/workloads/checkout/operations"),
+        ),
+        (
+            snapshots_path("shop", "checkout"),
+            format!("{prefix}/namespaces/shop/workloads/checkout/snapshots"),
+        ),
+        (
+            snapshot_export_path("shop", "checkout", "3f9a").unwrap(),
+            format!("{prefix}/namespaces/shop/workloads/checkout/snapshots/3f9a"),
+        ),
+        (workloads_path(None), format!("{prefix}/workloads")),
+        (
+            workloads_path(Some("shop")),
+            format!("{prefix}/namespaces/shop/workloads"),
+        ),
+    ] {
+        assert_eq!(
+            aggregated_path(&ui).as_deref(),
+            Some(aggregated.as_str()),
+            "{ui}"
+        );
+    }
+    // Les écritures restent sur l'interface.
+    assert_eq!(aggregated_path(&snapshot_gc_path("shop", "checkout")), None);
+    assert_eq!(
+        aggregated_path(&snapshot_pin_path("shop", "checkout", "3f9a").unwrap()),
+        None
+    );
+
+    // Repli sur le port-forward : seulement si le groupe n'est pas servi.
+    assert!(falls_back(404));
+    for status in [401, 403, 500, 503] {
+        assert!(!falls_back(status), "{status}");
+    }
+}
+
+fn app_pod(name: &str, workload: Option<&str>) -> k8s_openapi::api::core::v1::Pod {
+    let injected = workload.is_some();
+    let mut v = json!({
+        "metadata": {"name": name, "labels": {"app": name.rsplit_once('-').unwrap().0}},
+        "spec": {"containers": [{"name": "app"}]}
+    });
+    if let Some(wl) = workload {
+        v["metadata"]["labels"]["mimic.platform.io/sidecar"] = json!("true");
+        v["spec"]["initContainers"] = json!([
+            {"name": "mimic-init"},
+            {"name": "mimic", "env": [
+                {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
+                {"name": "MIMIC_WORKLOAD", "value": wl}
+            ]}
+        ]);
+    }
+    assert_eq!(injected, v["spec"].get("initContainers").is_some());
+    serde_json::from_value(v).unwrap()
+}
+
+#[test]
+fn cli_18_mode_checks_that_the_workload_exists() {
+    use mimicctl::{check_workload, injected_workloads};
+    let pods = [
+        app_pod("checkout-7d9f-a", Some("checkout")),
+        app_pod("checkout-7d9f-b", Some("checkout")),
+        app_pod("web-55c4-a", Some("web")),
+        app_pod("batch-1-a", None),
+    ];
+    let injected = injected_workloads(&pods);
+    assert_eq!(
+        injected.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["checkout", "web"]
+    );
+
+    let err = check_workload("shop", "chekout", false, Some(&injected), false).unwrap_err();
+    assert!(err.contains("shop/chekout"), "{err}");
+    assert!(err.contains("checkout") && err.contains("web"), "{err}");
+    assert!(err.contains("--force"), "{err}");
+    assert_eq!(
+        check_workload("shop", "checkout", false, Some(&injected), false),
+        Ok(None)
+    );
+    let err = check_workload("shop", "batch", false, Some(&injected), false).unwrap_err();
+    assert!(err.contains("shop/batch"), "{err}");
+    assert_eq!(
+        check_workload("shop", "chekout", false, Some(&injected), true),
+        Ok(None)
+    );
+    // Une MimicWorkload existante est toujours mise à jour.
+    assert_eq!(
+        check_workload("shop", "legacy", true, Some(&injected), false),
+        Ok(None)
+    );
+    // Namespace sans pod injecté : le message le dit.
+    let none = std::collections::BTreeSet::new();
+    let err = check_workload("shop", "checkout", false, Some(&none), false).unwrap_err();
+    assert!(err.contains("aucun"), "{err}");
+    // Pods illisibles : signalé, puis appliqué.
+    let warning = check_workload("shop", "checkout", false, None, false)
+        .unwrap()
+        .unwrap();
+    assert!(warning.contains("shop"), "{warning}");
+}
+
+#[test]
+fn cli_19_requests_direction() {
+    assert_eq!(
+        requests_path("shop", "checkout", "outbound", "jsonl", 1000),
+        "/v1/workloads/shop/checkout/requests?direction=outbound&format=jsonl&limit=1000"
+    );
+    // Sens inconnu : refusé par la ligne de commande, avant toute connexion au cluster.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mimicctl"))
+        .args(["requests", "checkout", "--direction", "sideways"])
+        .env("KUBECONFIG", "/nonexistent")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("inbound") && err.contains("outbound"), "{err}");
 }
