@@ -1,4 +1,4 @@
-//! Adaptateur HTTPS du webhook : `POST /mutate`, `/healthz`, `/metrics`.
+//! Adaptateur HTTPS du webhook : `POST /mutate`, `POST /mutate/inbound`, `/healthz`, `/metrics`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -36,6 +36,9 @@ struct BuildLabels {
 
 struct Injector {
     config: InjectorConfig,
+    /// Même configuration avec l'interception entrante : `/mutate/inbound`, appelé pour les
+    /// namespaces `mimic.platform.io/inbound=true` (spec §9.4).
+    inbound: InjectorConfig,
     admissions: Family<ResultLabel, Counter<u64, AtomicU64>>,
     /// Certificat servi, relu à chaud ; absent en HTTP (tests).
     certificate: Option<Arc<CertReloader>>,
@@ -107,7 +110,18 @@ async fn mutate_handler(
     State(inj): State<Arc<Injector>>,
     axum::Json(body): axum::Json<AdmissionReview<Pod>>,
 ) -> Response {
-    let (result, out) = review(body, &inj.config);
+    admit(&inj, body, &inj.config)
+}
+
+async fn mutate_inbound_handler(
+    State(inj): State<Arc<Injector>>,
+    axum::Json(body): axum::Json<AdmissionReview<Pod>>,
+) -> Response {
+    admit(&inj, body, &inj.inbound)
+}
+
+fn admit(inj: &Injector, body: AdmissionReview<Pod>, config: &InjectorConfig) -> Response {
+    let (result, out) = review(body, config);
     inj.admissions.get_or_create(&ResultLabel { result }).inc();
     tracing::info!(result, "admission");
     axum::Json(to_json(&out)).into_response()
@@ -156,6 +170,10 @@ fn router_with(config: InjectorConfig, certificate: Option<Arc<CertReloader>>) -
         build,
     );
     let inj = Arc::new(Injector {
+        inbound: InjectorConfig {
+            inbound: true,
+            ..config.clone()
+        },
         config,
         admissions,
         certificate,
@@ -164,6 +182,7 @@ fn router_with(config: InjectorConfig, certificate: Option<Arc<CertReloader>>) -
     });
     Router::new()
         .route("/mutate", post(mutate_handler))
+        .route("/mutate/inbound", post(mutate_inbound_handler))
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
         .with_state(inj)

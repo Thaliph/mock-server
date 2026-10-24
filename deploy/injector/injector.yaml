@@ -36,6 +36,10 @@ data:
     image: ghcr.io/thaliph/mimic:0.1.0
     # mimic-init (iptables) : image à part, inutile avec cni: true (spec §9.4b).
     init_image: ghcr.io/thaliph/mimic-init:0.1.0
+    # Interception entrante (découverte de l'API du service, mimicctl load) pour tous les
+    # pods ; sinon par namespace (label mimic.platform.io/inbound=true) ou par pod (annotation
+    # mimic.platform.io/inbound-ports). Le mock ne sert que le sortant (spec §3.1).
+    inbound: false
     # L'IP du Service kubernetes (KUBERNETES_SERVICE_HOST du webhook) est toujours exclue :
     # l'API Kubernetes n'est jamais redirigée vers le sidecar. Autres destinations à exclure
     # de tous les pods, par exemple un endpoint privé de l'API (EKS) ou une base :
@@ -214,6 +218,10 @@ webhooks:
         - key: mimic.platform.io/emergency-stop
           operator: NotIn
           values: ["true"]
+        # Interception entrante demandée : webhook inbound.… ci-dessous.
+        - key: mimic.platform.io/inbound
+          operator: NotIn
+          values: ["true"]
     # Choisi par l'API server : un pod non concerné n'atteint jamais le webhook.
     objectSelector:
       matchExpressions:
@@ -251,6 +259,10 @@ webhooks:
         - key: mimic.platform.io/emergency-stop
           operator: NotIn
           values: ["true"]
+        # Interception entrante demandée : webhook inbound.… ci-dessous.
+        - key: mimic.platform.io/inbound
+          operator: NotIn
+          values: ["true"]
     # Choisi par l'API server : un pod non concerné n'atteint jamais le webhook.
     objectSelector:
       matchLabels: {mimic.platform.io/inject: "true"}
@@ -265,4 +277,79 @@ webhooks:
         name: mimic-injector
         namespace: mimic-system
         path: /mutate
+        port: 443
+  - name: inbound.inject.mimic.platform.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    # Rappelé si un webhook de mesh (Istio, Linkerd) injecte après lui (spec §9.4).
+    reinvocationPolicy: IfNeeded
+    # Tous les pods du namespace, sauf ceux labellisés mimic.platform.io/inject=false.
+    # Le plan de contrôle n'est jamais injecté, même labellisé par erreur, ni un namespace en
+    # arrêt d'urgence (spec §5.5.1).
+    namespaceSelector:
+      # Même portée, namespaces mimic.platform.io/inbound=true : entrant intercepté aussi
+      # (spec §3.1, §9.4) ; le chemin le dit au webhook, qui ne lit jamais l'API.
+      matchLabels: {mimic.platform.io/inbound: "true", mimic.platform.io/enabled: "true"}
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, mimic-system]
+        - key: mimic.platform.io/emergency-stop
+          operator: NotIn
+          values: ["true"]
+    # Choisi par l'API server : un pod non concerné n'atteint jamais le webhook.
+    objectSelector:
+      matchExpressions:
+        - key: mimic.platform.io/inject
+          operator: NotIn
+          values: ["false"]
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: mimic-injector
+        namespace: mimic-system
+        path: /mutate/inbound
+        port: 443
+  - name: inbound.opt-in.inject.mimic.platform.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    # Rappelé si un webhook de mesh (Istio, Linkerd) injecte après lui (spec §9.4).
+    reinvocationPolicy: IfNeeded
+    # Injection par pod : seuls les pods labellisés mimic.platform.io/inject=true.
+    # Le plan de contrôle n'est jamais injecté, même labellisé par erreur, ni un namespace en
+    # arrêt d'urgence (spec §5.5.1).
+    namespaceSelector:
+      # Même portée, namespaces mimic.platform.io/inbound=true : entrant intercepté aussi
+      # (spec §3.1, §9.4) ; le chemin le dit au webhook, qui ne lit jamais l'API.
+      matchLabels: {mimic.platform.io/inbound: "true", mimic.platform.io/enabled: "opt-in"}
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, mimic-system]
+        - key: mimic.platform.io/emergency-stop
+          operator: NotIn
+          values: ["true"]
+    # Choisi par l'API server : un pod non concerné n'atteint jamais le webhook.
+    objectSelector:
+      matchLabels: {mimic.platform.io/inject: "true"}
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: mimic-injector
+        namespace: mimic-system
+        path: /mutate/inbound
         port: 443

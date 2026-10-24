@@ -71,7 +71,7 @@ pub async fn inbound(
     req: Request<Incoming>,
 ) -> Response<ProxyBody> {
     let target = match info.original_dst {
-        Some(dst) => Some(state.inbound_targets.resolve(dst).await),
+        Some(dst) => Some(state.inbound_targets.resolve(dst)),
         None => state.config.inbound.upstream,
     };
     let Some(target) = target else {
@@ -307,13 +307,6 @@ async fn forward(
         Err(e) => {
             if let Some(omitted) = state.upstream_log.allow(Instant::now()) {
                 tracing::warn!(authority = %target.authority, error = %e, omitted, "échec vers l'amont");
-            }
-            // L'application a pu changer d'adresse d'écoute : refaire le choix (spec §3.1).
-            if direction == Direction::Inbound
-                && e.is_connect()
-                && let Ok(a) = target.connect.parse::<SocketAddr>()
-            {
-                state.inbound_targets.forget(a.port());
             }
             // Connexion non établie dans le délai : 504, compté à part (spec §3.5).
             let timed_out = e.is_connect() && crate::connect::is_timeout(&e);
@@ -959,7 +952,7 @@ pub async fn resolve_silent_within(
         };
     }
     let target = if inbound {
-        state.inbound_targets.resolve(original_dst).await
+        state.inbound_targets.resolve(original_dst)
     } else {
         original_dst
     };
@@ -1041,7 +1034,7 @@ pub async fn tunnel(
         Some(u) => u,
         None => {
             let target = if inbound {
-                state.inbound_targets.resolve(original_dst).await
+                state.inbound_targets.resolve(original_dst)
             } else {
                 original_dst
             };

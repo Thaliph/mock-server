@@ -167,6 +167,23 @@ un pod non concerné n'atteint jamais le webhook, ce qui limite l'effet d'une pa
 aux seuls pods concernés. Un namespace labellisé `mimic.platform.io/emergency-stop=true`
 n'est plus injecté (voir [arrêt d'urgence](Exploiter-en-production.md#arrêt-durgence)).
 
+**Interception entrante, désactivée par défaut.** mimic mocke les dépendances : seul le
+trafic **sortant** des pods passe par le sidecar, et le mock ne sert que le sortant. Le trafic
+entrant (clients, sondes du kubelet) atteint l'application directement, même si le sidecar est
+arrêté. Pour découvrir l'API du service lui-même ou rejouer ses requêtes avec `mimicctl load`,
+activer l'entrant :
+
+| Portée | Comment |
+|--------|---------|
+| un namespace | `kubectl label namespace shop mimic.platform.io/inbound=true` (pods créés ensuite) |
+| un workload | annotation `mimic.platform.io/inbound-ports: "*"` (ou `8080,9090`) sur le template de pod |
+| tout le cluster | `inbound: true` dans la configuration du webhook (ConfigMap `mimic-injector`) |
+
+L'annotation l'emporte : `mimic.platform.io/inbound-ports: "-"` désactive l'entrant d'un pod
+même dans un namespace `inbound=true`. Une application interceptée en entrée doit écouter sur
+l'IP du pod ou sur `0.0.0.0` : le sidecar ne relaie jamais vers `127.0.0.1`, pour qu'un service
+lié à la boucle locale (proxy de base de données, port de débogage) reste privé.
+
 ```sh
 kubectl label namespace shop mimic.platform.io/enabled=true
 # Sel de redaction : facultatif sous contrôleur (il en tire un par workload) ; utile pour
@@ -182,7 +199,7 @@ Réglages par pod (annotations du **template** de pod, lues à l'admission) :
 |------------|-------|
 | `mimic.platform.io/inject: "false"` | pod laissé tel quel (opt-out) ; en **label**, le pod n'atteint même pas le webhook |
 | `mimic.platform.io/workload` | nom du workload ; sinon label `app.kubernetes.io/name`, sinon `app` ; sans aucun des trois, le pod n'est pas injecté |
-| `mimic.platform.io/inbound-ports` | ports entrants interceptés (`8080,9090`, `*`, ou `-` pour aucun) ; défaut : ports TCP déclarés des conteneurs, sinon `*` |
+| `mimic.platform.io/inbound-ports` | ports entrants interceptés (`8080,9090`, `*`, ou `-` pour aucun), l'emporte sur le namespace et la configuration ; défaut : aucun, sauf interception entrante activée (ci-dessous) |
 | `mimic.platform.io/exclude-outbound-cidrs` | CIDR sortants jamais redirigés, ajoutés à ceux de l'injecteur |
 | `mimic.platform.io/exclude-outbound-ports` | ports sortants jamais redirigés |
 | `mimic.platform.io/tls-intercept` | hôtes HTTPS interceptés (`api.stripe.com,*.salesforce.com`) ; l'app reçoit la CA mimic |

@@ -169,11 +169,13 @@ kubectl -n mimic-system delete secret mimic-controller-tls   # ou mimic-injector
 ## 4. Déployer la démo
 
 Le label `mimic.platform.io/enabled=true` sur le namespace active l'injection pour tous ses
-pods. Il faut le poser **avant** de déployer.
+pods ; `mimic.platform.io/inbound=true` y ajoute l'interception entrante (désactivée par
+défaut), dont la démo a besoin pour découvrir l'API des services et rejouer leurs requêtes. Il
+faut les poser **avant** de déployer.
 
 ```sh
 kubectl create namespace "$NS"
-kubectl label namespace "$NS" mimic.platform.io/enabled=true
+kubectl label namespace "$NS" mimic.platform.io/enabled=true mimic.platform.io/inbound=true
 ```
 
 Vérifier que le webhook injecte, sans rien créer (pod sonde en dry-run côté serveur) :

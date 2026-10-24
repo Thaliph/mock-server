@@ -260,3 +260,47 @@ fn inj_16_sigterm_stops_the_webhook_cleanly() {
     };
     assert!(status.success(), "{status}");
 }
+
+/// INJ-25 : `/mutate` sans interception entrante, `/mutate/inbound` (namespaces
+/// `mimic.platform.io/inbound=true`) avec les ports déclarés.
+#[tokio::test]
+async fn inj_25_inbound_path_turns_inbound_interception_on() {
+    let w = webhook().await;
+    let inbound_ports = |path: &'static str| {
+        let w = &w;
+        async move {
+            let resp: Value = w
+                .client
+                .post(format!("{}{path}", w.url))
+                .json(&review(pod()))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            use base64::Engine;
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(resp["response"]["patch"].as_str().unwrap())
+                .unwrap();
+            let patch: json_patch::Patch = serde_json::from_slice(&raw).unwrap();
+            let mut patched = pod();
+            json_patch::patch(&mut patched, &patch).unwrap();
+            let init = &patched["spec"]["initContainers"][0];
+            assert_eq!(init["name"], "mimic-init");
+            init["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == "MIMIC_INBOUND_PORTS")
+                .map(|e| e["value"].as_str().unwrap().to_string())
+        }
+    };
+    assert_eq!(inbound_ports("/mutate").await.as_deref(), Some("-"));
+    assert_eq!(
+        inbound_ports("/mutate/inbound").await.as_deref(),
+        Some("8080")
+    );
+}

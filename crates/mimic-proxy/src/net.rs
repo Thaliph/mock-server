@@ -1,9 +1,6 @@
 //! Destination d'origine d'une connexion redirigée par iptables (`SO_ORIGINAL_DST`).
 
-use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::net::SocketAddr;
 
 use tokio::net::TcpStream;
 
@@ -42,56 +39,20 @@ fn lookup(_stream: &TcpStream, _local: SocketAddr) -> Option<SocketAddr> {
     None
 }
 
-/// Délai d'une sonde de connexion vers l'application.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-
 /// Adresse de l'application pour le trafic entrant (spec §3.1) : la destination d'origine
-/// (IP du pod), sinon `127.0.0.1` sur le même port. Le choix est mémorisé par port.
+/// (IP du pod et port), jamais `127.0.0.1` à sa place, pour qu'un service lié à la boucle
+/// locale reste injoignable depuis les autres pods ; `inbound.upstream` l'impose.
 pub struct InboundTargets {
     upstream: Option<SocketAddr>,
-    cache: Mutex<BTreeMap<u16, SocketAddr>>,
 }
 
 impl InboundTargets {
     pub fn new(upstream: Option<SocketAddr>) -> Self {
-        Self {
-            upstream,
-            cache: Mutex::new(BTreeMap::new()),
-        }
+        Self { upstream }
     }
 
-    pub async fn resolve(&self, dst: SocketAddr) -> SocketAddr {
-        if let Some(u) = self.upstream {
-            return u;
-        }
-        if let Some(t) = self.cached(dst.port()) {
-            return t;
-        }
-        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), dst.port());
-        let mut candidates = vec![dst];
-        if dst != loopback {
-            candidates.push(loopback);
-        }
-        for c in candidates {
-            if let Ok(Ok(_)) = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(c)).await {
-                self.lock().insert(dst.port(), c);
-                return c;
-            }
-        }
-        dst
-    }
-
-    /// À appeler après un échec de connexion : le prochain relais refait le choix.
-    pub fn forget(&self, port: u16) {
-        self.lock().remove(&port);
-    }
-
-    pub fn cached(&self, port: u16) -> Option<SocketAddr> {
-        self.lock().get(&port).copied()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u16, SocketAddr>> {
-        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn resolve(&self, dst: SocketAddr) -> SocketAddr {
+        self.upstream.unwrap_or(dst)
     }
 }
 
@@ -247,32 +208,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prx_09_inbound_relay_targets_the_pod_ip_then_loopback() {
+    async fn prx_09_inbound_relay_targets_the_original_destination_only() {
         // 127.0.0.2 joue l'IP du pod : sur Linux, tout 127.0.0.0/8 est local.
         let targets = InboundTargets::new(None);
 
         // Application liée à l'IP du pod seulement.
         let (_pod_only, port) = listen("127.0.0.2").await;
         let dst: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
-        assert_eq!(targets.resolve(dst).await, dst);
+        assert_eq!(targets.resolve(dst), dst);
 
-        // Application liée à la boucle locale seulement : repli, mémorisé.
-        let (loopback_only, port) = listen("127.0.0.1").await;
+        // Service lié à la boucle locale seulement : jamais exposé aux autres pods, aucun
+        // repli sur 127.0.0.1 (le relais vers l'IP du pod échouera : 502).
+        let (_loopback_only, port) = listen("127.0.0.1").await;
         let dst: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
-        let local: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        assert_eq!(targets.resolve(dst).await, local);
-        drop(loopback_only);
-        assert_eq!(targets.resolve(dst).await, local, "choix mémorisé par port");
-        // Après un échec, le choix est réévalué : plus rien n'écoute, l'IP du pod est retenue.
-        targets.forget(port);
-        assert_eq!(targets.resolve(dst).await, dst);
-        assert!(
-            targets.cached(port).is_none(),
-            "rien n'est mémorisé sans écoute"
-        );
+        assert_eq!(targets.resolve(dst), dst);
 
         // `inbound.upstream` impose l'adresse.
         let forced: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        assert_eq!(InboundTargets::new(Some(forced)).resolve(dst).await, forced);
+        assert_eq!(InboundTargets::new(Some(forced)).resolve(dst), forced);
     }
 }

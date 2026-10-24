@@ -100,7 +100,7 @@ setup_ns() {
   local ns
   ns=$(ns_of "$1")
   kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f -
-  kubectl label namespace "$ns" mimic.platform.io/enabled=true --overwrite
+  kubectl label namespace "$ns" mimic.platform.io/enabled=true mimic.platform.io/inbound=true --overwrite
   case "$1" in
     sidecar) kubectl label namespace "$ns" istio-injection=enabled --overwrite ;;
     ambient) kubectl label namespace "$ns" istio.io/dataplane-mode=ambient --overwrite ;;

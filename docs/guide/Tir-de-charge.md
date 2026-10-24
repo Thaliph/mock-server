@@ -15,7 +15,10 @@ Le guide SRE détaillé (préparation, blue/green avec Argo Rollouts, tir k6) re
 - **Les dépendances sont mockées** : les appels sortants HTTP du workload sont servis depuis
   le snapshot, avec leur latence enregistrée. Le tir mesure donc l'application seule.
 - **Le trafic du tir est réel** : `mimicctl load` envoie les requêtes entrantes enregistrées
-  (méthode, chemin, headers non redactés, body) au Service ou au pod.
+  (méthode, chemin, headers non redactés, body) au Service ou au pod. L'entrant n'est
+  enregistré que si l'interception entrante est activée pour le workload (désactivée par
+  défaut) : `kubectl label namespace perf mimic.platform.io/inbound=true`, puis recréer les
+  pods (voir [Installer](Installer.md#activer-linjection)).
 - **Boucle fermée** : `C` connexions persistantes ; chacune attend sa réponse avant d'envoyer
   la suivante. La concurrence est donc exactement `C` requêtes en vol.
 - **Ressources** : pendant le tir, `mimicctl` relève CPU et mémoire des pods par
