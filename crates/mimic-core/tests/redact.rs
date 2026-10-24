@@ -174,13 +174,107 @@ fn truncated_and_unparseable_bodies_are_dropped_when_they_may_leak() {
     assert_eq!(e.resp_body, Body::Skipped { size: 22 });
 }
 
+/// Bodies que la redaction ne sait pas lire : seule leur taille est gardée, sauf exception
+/// (`redact.raw_bodies`), auquel cas ils sont gardés tels quels (RED-10).
 #[test]
-fn binary_bodies_are_left_untouched() {
-    let mut e = exchange("GET", "/img").with_resp_header("Content-Type", "image/png");
-    e.resp_body = Body::captured(vec![0x89, b'P', b'N', b'G']);
-    let before = e.resp_body.clone();
-    let e = redacted(e);
-    assert_eq!(e.resp_body, before);
+fn red_10_unredactable_bodies_are_skipped_unless_allowed() {
+    let cases: [(Option<&str>, &[u8]); 6] = [
+        (Some("image/png"), &[0x89, b'P', b'N', b'G']),
+        (Some("application/xml"), b"<a><token>t</token></a>"),
+        (
+            Some("multipart/form-data; boundary=x"),
+            b"--x\r\nsecret\r\n--x--",
+        ),
+        (Some("application/grpc"), &[0, 0, 0, 0, 2, 8, 1]),
+        (Some("text/plain"), b"password=hunter2"),
+        (None, b"sans type"),
+    ];
+    for (ct, bytes) in cases {
+        let mut e = exchange("POST", "/x");
+        if let Some(ct) = ct {
+            e = e
+                .with_req_header("Content-Type", ct)
+                .with_resp_header("Content-Type", ct);
+        }
+        e.req_body = Body::captured(bytes.to_vec());
+        e.resp_body = Body::captured(bytes.to_vec());
+
+        let mut skipped = e.clone();
+        assert_eq!(redactor().redact_with(&mut skipped, false), 2, "{ct:?}");
+        let size = bytes.len() as u64;
+        assert_eq!(skipped.req_body, Body::Skipped { size }, "{ct:?}");
+        assert_eq!(skipped.resp_body, Body::Skipped { size }, "{ct:?}");
+        // `redact` applique la règle par défaut.
+        let mut default = e.clone();
+        redactor().redact(&mut default);
+        assert_eq!(default.resp_body, Body::Skipped { size }, "{ct:?}");
+
+        let mut kept = e.clone();
+        assert_eq!(redactor().redact_with(&mut kept, true), 0, "{ct:?}");
+        assert_eq!(kept.req_body, e.req_body, "{ct:?}");
+        assert_eq!(kept.resp_body, e.resp_body, "{ct:?}");
+    }
+
+    // JSON et formulaire : redactés comme avant, jamais comptés comme non analysables.
+    let mut e = exchange("POST", "/login")
+        .req_json(json!({"password": "p"}))
+        .resp_json(json!({"ok": true}));
+    assert_eq!(redactor().redact_with(&mut e, false), 0);
+    assert!(is_marker(req_json(&e)["password"].as_str().unwrap()));
+    assert_eq!(resp_json(&e), json!({"ok": true}));
+    // Body vide : rien à cacher, rien de compté.
+    let mut e = exchange("GET", "/x").with_resp_header("Content-Type", "application/xml");
+    assert_eq!(redactor().redact_with(&mut e, false), 0);
+    assert_eq!(e.resp_body, Body::Empty);
+}
+
+/// La requête reçue par le mock est redactée comme l'échange enregistré : mêmes headers,
+/// même query, même body (RED-08).
+#[test]
+fn red_08_mock_request_is_redacted_like_the_recording() {
+    use mimic_core::mock::MockRequest;
+    let body = json!({"email": "a@b.io", "n": 1});
+    let recorded = redacted(
+        exchange("POST", "/users?api_key=q1&page=2")
+            .with_req_header("Content-Type", "application/json")
+            .with_req_header("X-Api-Key", "k1")
+            .with_req_header("Accept", "application/json")
+            .req_json(body.clone()),
+    );
+    let mut live = MockRequest {
+        authority: "api.saas.io:443".into(),
+        method: "POST".into(),
+        path: "/users".into(),
+        query: vec![("api_key".into(), "q1".into()), ("page".into(), "2".into())],
+        headers: vec![
+            Header::new("content-type", "application/json"),
+            Header::new("x-api-key", "k1"),
+            Header::new("accept", "application/json"),
+        ],
+        body: serde_json::to_vec(&body).unwrap(),
+    };
+    redactor().redact_mock_request(&mut live);
+    assert_eq!(live.query, recorded.query);
+    let value = |h: &[Header], n: &str| {
+        h.iter()
+            .find(|x| x.name.eq_ignore_ascii_case(n))
+            .map(|x| x.value.clone())
+    };
+    for name in ["x-api-key", "accept"] {
+        assert_eq!(
+            value(&live.headers, name),
+            value(&recorded.req_headers, name),
+            "{name}"
+        );
+    }
+    assert_eq!(&live.body[..], recorded.req_body.bytes().unwrap());
+    assert!(!String::from_utf8_lossy(&live.body).contains("a@b.io"));
+
+    // Body illisible : gardé tel quel pour le matching (rien n'est écrit).
+    let mut broken = live.clone();
+    broken.body = b"{pas du json".to_vec();
+    redactor().redact_mock_request(&mut broken);
+    assert_eq!(broken.body, b"{pas du json");
 }
 
 #[test]

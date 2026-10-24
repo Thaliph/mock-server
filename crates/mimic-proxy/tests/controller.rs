@@ -1272,3 +1272,140 @@ async fn ctl_40_heartbeats_and_startup_are_measured() {
         Some(0.0)
     );
 }
+
+/// Marqueur que pose un `Redactor` de sel `salt` sur un header `authorization`.
+fn marker_of(salt: &str, value: &str) -> String {
+    use mimic_core::redact::{RedactConfig, Redactor};
+    let mut e: mimic_core::model::Exchange = serde_json::from_value(serde_json::json!({
+        "id": "x", "direction": "outbound", "started_at_ms": 1, "scheme": "http",
+        "authority": "a:80", "method": "GET", "path": "/", "query": [],
+        "req_headers": [{"name": "authorization", "value": value}],
+        "req_body": {"kind": "empty"}, "status": 200, "resp_headers": [],
+        "resp_body": {"kind": "empty"}, "ttfb_us": 0, "total_us": 0, "trace_id": null
+    }))
+    .unwrap();
+    Redactor::new(RedactConfig::default(), salt.as_bytes().to_vec()).redact(&mut e);
+    e.req_headers[0].value.clone()
+}
+
+/// Tous les octets des fichiers sous `dir`.
+fn all_bytes(dir: &Path) -> Vec<u8> {
+    let mut out = vec![];
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(all_bytes(&path));
+        } else {
+            out.extend(std::fs::read(&path).unwrap_or_default());
+        }
+    }
+    out
+}
+
+fn contains(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
+}
+
+/// Sans sel propre, le sidecar piloté redacte avec le sel du workload reçu du contrôleur ;
+/// rien n'est gardé avant de le connaître, et le sel n'est jamais écrit (RED-09).
+#[tokio::test]
+async fn red_09_workload_salt_comes_from_the_controller() {
+    const SALT: &str = "sel-du-controleur-0123456789";
+    let dir = tempfile::tempdir().unwrap();
+    let fake = fake_controller().await;
+    let saas = fake_server().await;
+    let url = saas.url("/users/7");
+    let mut c = startup(
+        fake.piloted(dir.path(), "api-a"),
+        Duration::from_millis(200),
+        Fallback::Record,
+    );
+    c.redact.salt = None;
+    let store = c.store.dir.clone().unwrap();
+    let p = proxy(c).await;
+
+    // Repli sans réponse du contrôleur : capturé avant tout sel, abandonné.
+    eventually("barrière ouverte", || async { readyz(&p).await.0 == 200 }).await;
+    let r = app_client(&p)
+        .get(&url)
+        .header("authorization", "Bearer avant")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    eventually("abandon compté", || async {
+        metric_value(
+            &metrics(&p).await,
+            r#"mimic_capture_dropped_total{reason="no_salt"}"#,
+        )
+        .is_some_and(|n| n >= 1.0)
+    })
+    .await;
+    assert!(exchanges(&p, "direction=outbound").await.is_empty());
+
+    // Le contrôleur répond : le sel du workload sert à redacter.
+    fake.answer(Some(serde_json::json!({
+        "mode": "record", "snapshot": null, "redact_salt": SALT
+    })));
+    eventually("battement accepté", || async {
+        status(&p).await["controller"]["last_ok_ms"].is_number()
+    })
+    .await;
+    app_client(&p)
+        .get(&url)
+        .header("authorization", "Bearer apres")
+        .send()
+        .await
+        .unwrap();
+    let list = wait_exchanges(&p, "direction=outbound", 1).await;
+    let header = list[0]["req_headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["name"] == "authorization")
+        .unwrap()["value"]
+        .clone();
+    assert_eq!(header, marker_of(SALT, "Bearer apres"));
+
+    // Jamais écrit, jamais affiché.
+    p.shutdown().await;
+    assert!(
+        !contains(&all_bytes(&store), SALT),
+        "sel écrit dans store.dir"
+    );
+
+    // Le sel du Secret l'emporte sur celui du contrôleur.
+    let mut c = fake.piloted(dir.path(), "api-b");
+    c.redact.salt = Some("sel-du-secret".into());
+    let p = proxy(c).await;
+    eventually("battement accepté", || async {
+        status(&p).await["controller"]["last_ok_ms"].is_number()
+    })
+    .await;
+    let text = client()
+        .get(admin(&p, "/api/status"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!text.contains(SALT), "{text}");
+    app_client(&p)
+        .get(&url)
+        .header("authorization", "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    let list = wait_exchanges(&p, "direction=outbound", 1).await;
+    let header = list[0]["req_headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["name"] == "authorization")
+        .unwrap()["value"]
+        .clone();
+    assert_eq!(header, marker_of("sel-du-secret", "Bearer secret"));
+}

@@ -34,6 +34,7 @@ zstd = "0.14.3"
 
 [dev-dependencies]
 async-trait = "0.1.92"
+base64.workspace = true
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 tempfile = "3.27.0"

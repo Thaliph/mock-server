@@ -1079,3 +1079,110 @@ async fn ctl_46_pin_import_and_manual_gc_over_http() {
         .collect();
     assert_eq!(remaining, BTreeSet::from([imported_id]), "{snaps}");
 }
+
+/// Sel de redaction rendu par un battement.
+async fn salt_of(c: &Running, wl: &str, instance: &str, token: &str) -> String {
+    let v: Value = client()
+        .post(url(c, &format!("/v1/workloads/shop/{wl}/heartbeat")))
+        .bearer_auth(token)
+        .json(&json!({"instance": instance, "mode": "record", "snapshot": null}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    v["redact_salt"].as_str().unwrap_or_default().to_string()
+}
+
+/// Le sel du workload : tiré une fois, gardé, le même pour tous ses pods, propre à chaque
+/// workload (CTL-49).
+#[tokio::test]
+async fn ctl_49_workload_salt_is_drawn_once_and_shared_by_its_pods() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    let a = salt_of(&c, "checkout", "checkout-a", "tok-a").await;
+    assert_eq!(a.len(), 64, "{a}");
+    assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()), "{a}");
+    assert_eq!(salt_of(&c, "checkout", "checkout-b", "tok-b").await, a);
+    let web = salt_of(&c, "web", "web-a", "tok-web").await;
+    assert_eq!(web.len(), 64);
+    assert_ne!(web, a);
+    c.shutdown().await;
+
+    let c = controller(dir.path()).await;
+    assert_eq!(salt_of(&c, "checkout", "checkout-a", "tok-a").await, a);
+    c.shutdown().await;
+
+    // Deux premiers battements simultanés d'un workload neuf : un seul sel.
+    let fresh = tempfile::tempdir().unwrap();
+    let c = controller(fresh.path()).await;
+    let (x, y) = tokio::join!(
+        salt_of(&c, "checkout", "checkout-a", "tok-a"),
+        salt_of(&c, "checkout", "checkout-b", "tok-b")
+    );
+    assert_eq!(x.len(), 64);
+    assert_eq!(x, y);
+}
+
+/// Fichiers `.jsonl` de segments écrits sous `dir`.
+fn segment_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![];
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(segment_files(&path));
+        } else if path.extension().is_some_and(|e| e == "jsonl")
+            && path.to_string_lossy().contains("/exchanges/")
+        {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Le contrôleur redacte de nouveau chaque segment reçu (RED-11).
+#[tokio::test]
+async fn red_11_segments_are_redacted_again_at_ingestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = controller(dir.path()).await;
+    let mut leaky = exchange("checkout-a-1", "outbound", "POST", "/login", json!([]), 1);
+    leaky["req_headers"] = json!([
+        {"name": "authorization", "value": "Bearer jeton-en-clair"},
+        {"name": "content-type", "value": "application/json"},
+        {"name": "x-session", "value": "<redacted:sha256:0123abcd>"}
+    ]);
+    leaky["req_body"] =
+        json!({"kind": "captured", "data": base64(br#"{"email":"fuite@exemple.fr"}"#)});
+    leaky["resp_headers"] = json!([{"name": "content-type", "value": "application/xml"}]);
+    leaky["resp_body"] = json!({"kind": "captured", "data": base64(b"<a>brut</a>")});
+    push(&c, "checkout-a", &[leaky]).await;
+    let clean = exchange("checkout-a-2", "inbound", "GET", "/a", json!([]), 2);
+    let clean_line = format!("{clean}\n");
+    push(&c, "checkout-a", &[clean]).await;
+
+    let files = segment_files(dir.path());
+    assert_eq!(files.len(), 2, "{files:?}");
+    let all: Vec<String> = files
+        .iter()
+        .map(|f| std::fs::read_to_string(f).unwrap())
+        .collect();
+    let leaky_file = all.iter().find(|t| t.contains("checkout-a-1")).unwrap();
+    assert!(!leaky_file.contains("jeton-en-clair"), "{leaky_file}");
+    assert!(!leaky_file.contains(&base64(br#"{"email":"fuite@exemple.fr"}"#)));
+    assert!(leaky_file.contains("<redacted:sha256:0123abcd>"));
+    assert!(
+        leaky_file.contains(&base64(b"<a>brut</a>")),
+        "body XML gardé"
+    );
+    let e: Value = serde_json::from_str(leaky_file.lines().next().unwrap()).unwrap();
+    let auth = e["req_headers"][0]["value"].as_str().unwrap();
+    assert!(auth.starts_with("<redacted:sha256:"), "{auth}");
+    // Segment sans valeur à remplacer : écrit octet pour octet.
+    assert!(all.iter().any(|t| *t == clean_line), "{all:?}");
+}
+
+fn base64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
