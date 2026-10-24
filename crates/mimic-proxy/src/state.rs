@@ -183,13 +183,16 @@ impl AppState {
 
     pub fn new(config: Config) -> Result<Arc<Self>, String> {
         config.validate()?;
-        let redactor = arc_swap::ArcSwapOption::from(
+        // Mock local sans sel : un sel du processus, rien n'est publié (spec §9.7).
+        let salt = config.redact.salt.clone().or_else(|| {
             config
-                .redact
-                .salt
+                .mock
+                .from
                 .as_ref()
-                .map(|s| Arc::new(redactor(&config, s))),
-        );
+                .map(|_| ulid::Ulid::generate().to_string())
+        });
+        let redactor =
+            arc_swap::ArcSwapOption::from(salt.as_ref().map(|s| Arc::new(redactor(&config, s))));
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
         http.enforce_http(false);

@@ -288,3 +288,9 @@ retire à son arrêt. Le plugin lit l'annotation `mimic.platform.io/cni-rules` d
 plugin n'est pas encore installé démarre sans règles : installer le DaemonSet avant de passer
 le webhook en `cni: true`.
 
+## Mock local (`local/`)
+
+`docker compose up` dans `deploy/local/` : le sidecar sert `snapshot.jsonl` sans cluster
+(`mimic-proxy --mock-from`, spec §9.7), et une application d'exemple appelle par lui une
+dépendance qui n'existe pas. Un snapshot réel : `mimicctl pull <workload> -n <ns>`.
+

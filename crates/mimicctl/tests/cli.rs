@@ -905,3 +905,21 @@ fn cli_20_emergency_stop_labels_the_namespace() {
     let off = emergency_message("shop", false);
     assert!(off.contains("levé"), "{off}");
 }
+
+#[test]
+fn cli_21_pull_picks_the_served_then_latest_snapshot() {
+    use mimicctl::{pull_choice, pull_file};
+    let snaps = json!([
+        {"id": "aaa", "created_ms": 10},
+        {"id": "ccc", "created_ms": 30},
+        {"id": "bbb", "created_ms": 20}
+    ]);
+    let serving = json!({"name": "checkout", "desired": {"mode": "mock", "snapshot": "bbb"}});
+    let idle = json!({"name": "checkout", "desired": {"mode": "record", "snapshot": null}});
+    assert_eq!(pull_choice(Some("aaa"), &serving, &snaps).unwrap(), "aaa");
+    assert_eq!(pull_choice(None, &serving, &snaps).unwrap(), "bbb");
+    assert_eq!(pull_choice(None, &idle, &snaps).unwrap(), "ccc");
+    let err = pull_choice(None, &idle, &json!([])).unwrap_err();
+    assert!(err.contains("aucun snapshot"), "{err}");
+    assert_eq!(pull_file("checkout", "ccc"), "checkout-ccc.jsonl");
+}

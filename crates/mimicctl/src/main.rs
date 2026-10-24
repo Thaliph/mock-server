@@ -116,6 +116,19 @@ enum Command {
     Load(Box<LoadArgs>),
     /// Cycle de vie des snapshots : liste, épingle, exporte, importe ou purge (spec §5.6).
     Snapshot(SnapshotArgs),
+    /// Télécharge le snapshot servi par le workload (sinon le plus récent) pour le mock local
+    /// (`mimic-proxy --mock-from`, spec §9.7).
+    Pull {
+        workload: String,
+        /// Ce snapshot plutôt que celui servi.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Fichier écrit ; par défaut `<workload>-<id>.jsonl`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
     /// Différence entre deux documents OpenAPI (YAML ou JSON).
     Diff {
         old: PathBuf,
@@ -361,6 +374,48 @@ async fn run(command: Command) -> Result<i32, String> {
             .await
             .map_err(|e| format!("label du namespace {target}: {e}"))?;
             println!("{}", mimicctl::emergency_message(&target, !off));
+            Ok(0)
+        }
+        Command::Pull {
+            workload,
+            snapshot,
+            output,
+            namespace: ns,
+        } => {
+            let client = client().await?;
+            let ns = namespace(ns, &client).await;
+            let id = match &snapshot {
+                Some(id) => id.clone(),
+                None => {
+                    let known =
+                        controller_json(client.clone(), &mimicctl::workloads_path(Some(&ns)))
+                            .await?;
+                    let entry = known
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|w| w["namespace"] == ns.as_str() && w["name"] == workload.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    let snaps =
+                        controller_json(client.clone(), &mimicctl::snapshots_path(&ns, &workload))
+                            .await?;
+                    mimicctl::pull_choice(None, &entry, &snaps)?
+                }
+            };
+            let path = mimicctl::snapshot_export_path(&ns, &workload, &id)?;
+            let body = controller_get(client, &path).await?;
+            let file = output.unwrap_or_else(|| PathBuf::from(mimicctl::pull_file(&workload, &id)));
+            std::fs::write(&file, &body).map_err(|e| format!("{}: {e}", file.display()))?;
+            let lines = body
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count();
+            println!(
+                "snapshot {id} ({lines} échanges) écrit dans {} ; mock local : mimic-proxy --mock-from {}",
+                file.display(),
+                file.display()
+            );
             Ok(0)
         }
         Command::Status {
