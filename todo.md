@@ -83,6 +83,8 @@ root sur le nœud (#55) ; tests instables MCK-15, LOD-11, PRX-11 (#53, #54).
 
 ## P1 — image et chaîne de publication
 
+- [ ] Remplacer `serde_yaml` 0.9 (déprécié, dépend d'`unsafe-libyaml` non maintenu, exception RUSTSEC-2024-0449 dans `deny.toml`) par un fork maintenu.
+
 - [ ] Chart Helm (OCI), en plus de `mimicctl install` (décision du 25 octobre).
 - [ ] Documentation des consommateurs en anglais : README, guide.
 
