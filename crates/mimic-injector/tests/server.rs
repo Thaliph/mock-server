@@ -122,6 +122,7 @@ async fn inj_08_admission_review_returns_a_patch_that_injects_the_pod() {
     let expected = match mutate(&serde_json::from_value(pod()).unwrap(), &w.config) {
         Outcome::Injected(p) => serde_json::to_value(*p).unwrap(),
         Outcome::Skipped(r) => panic!("{r}"),
+        Outcome::Unchanged => panic!("déjà injecté"),
     };
     assert_eq!(patched, expected);
     assert_eq!(patched["spec"]["initContainers"][1]["name"], "mimic");

@@ -358,3 +358,28 @@ rm -f shipping-*.jsonl rapport.md /tmp/rwo.yaml /tmp/s3.yaml
 | C9 | CNI-01 à CNI-03, INJ-23 | |
 | C10 | CLI-21 | |
 | C11 | MON-03 | |
+
+## Recette du 24 octobre 2026
+
+Faite sans kind (Docker indisponible) : poste, puis un vrai `kube-apiserver` 1.32 et etcd
+lancés en utilisateur (front proxy, RBAC, Pod Security), le contrôleur, le webhook et un
+sidecar en processus, rattachés à de vrais objets (pods sans nœud, jetons liés aux pods), et
+le plugin CNI dans un namespace réseau sans privilège (`unshare --map-auto -rn`).
+
+| Étape | Résultat |
+|-------|----------|
+| A1 | OK (MCK-15, LOD-11 instables sur machine chargée, aussi sur `main`) |
+| A2 | **KO puis OK** : test promtool de `MimicVersionSkew` faux (points espacés de 10 min) ; corrigé |
+| A3 | **KO puis OK** : variantes imbriquées dans la base, refusées par kustomize ; déplacées en `deploy/controller-rwo` et `deploy/controller-s3` |
+| A4 | OK |
+| A5 | non fait (Docker) |
+| C1, C6 | non faits (pas de nœud) ; couverts par CTL-28 et MCK-28 |
+| C2 | OK : `mimic_build_info`, `mimic_controller_pods{workload}`, expiration du certificat, disque du store |
+| C3 | OK : APIService `Available`, compte limité à `mimic-data-viewer` : `export`, `requests`, `report` sans port-forward ; autre namespace et cluster refusés |
+| C4 | OK |
+| C5 | OK : sel du workload sur le support, absent du sidecar ; marqueurs recalculés à l'identique |
+| C7 | OK : namespace et global, condition `EmergencyStop`, injection coupée, levée sur le même snapshot |
+| C8, C11 | OK ; **bug trouvé** : chaque pod injecté recevait l'avertissement « mimic non injecté : mimic déjà injecté » (réinvocation du webhook par l'API server) ; corrigé (INJ-02) |
+| C9 | OK hors runtime réel : pod refusé en `baseline` sans CNI, admis avec ; installateur (chaînage, kubeconfig, retrait) ; `ADD` pose les règles dans le namespace du pod |
+| C10 | OK, avec le compte limité |
+
