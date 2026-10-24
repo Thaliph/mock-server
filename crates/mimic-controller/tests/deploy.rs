@@ -439,14 +439,25 @@ fn doc_04_controller_metrics_port_matches_the_network_policy() {
     );
 }
 
-/// Chaque alerte des règles `PrometheusRule` du guide a une ligne dans « Conduite à tenir »,
-/// et réciproquement (DOC-06).
+const RULES: &str = include_str!("../../../deploy/monitoring/rules.yaml");
+
+/// Noms des alertes des règles livrées.
+fn alerts() -> Vec<String> {
+    let rules: serde_yaml::Value = serde_yaml::from_str(RULES).unwrap();
+    rules["groups"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["rules"].as_sequence().unwrap())
+        .filter_map(|r| r["alert"].as_str().map(String::from))
+        .collect()
+}
+
+/// Chaque alerte des règles livrées (`deploy/monitoring/rules.yaml`) a une ligne dans
+/// « Conduite à tenir » du guide, et réciproquement (DOC-06).
 #[test]
 fn doc_06_every_alert_has_a_runbook_row() {
-    let mut declared: Vec<&str> = ALERTS_DOC
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("- alert: "))
-        .collect();
+    let mut declared = alerts();
     let runbook = ALERTS_DOC
         .split_once("## Conduite à tenir")
         .expect("section « Conduite à tenir »")
@@ -460,4 +471,59 @@ fn doc_06_every_alert_has_a_runbook_row() {
     declared.sort_unstable();
     documented.sort_unstable();
     assert_eq!(declared, documented);
+}
+
+/// La `PrometheusRule` livrée porte exactement les règles brutes testées par `promtool`, les
+/// règles sur `mimic_controller_pods` agrègent par workload, et le guide renvoie aux fichiers
+/// au lieu de recopier les règles (MON-06).
+#[test]
+fn mon_06_prometheus_rule_is_the_tested_rules() {
+    let rule = docs(include_str!(
+        "../../../deploy/monitoring/prometheus-rule.yaml"
+    ));
+    let rule = find(&rule, "PrometheusRule", "mimic");
+    assert_eq!(rule["apiVersion"], "monitoring.coreos.com/v1");
+    assert_eq!(rule["metadata"]["namespace"], "mimic-system");
+    let raw: serde_yaml::Value = serde_yaml::from_str(RULES).unwrap();
+    assert_eq!(
+        rule["spec"]["groups"], raw["groups"],
+        "prometheus-rule.yaml et rules.yaml divergent"
+    );
+
+    let rules: Vec<&serde_yaml::Value> = raw["groups"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["rules"].as_sequence().unwrap())
+        .collect();
+    let pods: Vec<&str> = rules
+        .iter()
+        .filter_map(|r| r["expr"].as_str())
+        .filter(|e| e.contains("mimic_controller_pods"))
+        .collect();
+    assert!(!pods.is_empty());
+    for expr in pods {
+        assert!(expr.contains("by (workload)"), "{expr}");
+    }
+    for name in [
+        "MimicControllerCertificateExpiring",
+        "MimicInjectorCertificateExpiring",
+        "MimicStoreDiskHigh",
+        "MimicPodEvicted",
+        "MimicVersionSkew",
+    ] {
+        assert!(alerts().iter().any(|a| a == name), "{name} absente");
+    }
+
+    assert!(
+        !ALERTS_DOC.contains("kind: PrometheusRule"),
+        "règles recopiées"
+    );
+    assert!(!ALERTS_DOC.contains("- alert: "), "règles recopiées");
+    for file in [
+        "deploy/monitoring/rules.yaml",
+        "deploy/monitoring/prometheus-rule.yaml",
+    ] {
+        assert!(ALERTS_DOC.contains(file), "{file} non cité par le guide");
+    }
 }

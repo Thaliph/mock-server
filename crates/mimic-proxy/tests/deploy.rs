@@ -43,6 +43,9 @@ const CONTROLLER_METRICS: &str = include_str!("../../mimic-controller/src/metric
 const INJECTOR_METRICS: &str = include_str!("../../mimic-injector/src/server.rs");
 const METRICS_DOC: &str = include_str!("../../../docs/guide/Metriques.md");
 
+/// Labels nommés `mimic_…`, cités à côté des métriques (`mimic_build_info`).
+const LABELS: [&str; 1] = ["mimic_version"];
+
 /// Pages du guide qui citent des métriques.
 const GUIDE: [&str; 5] = [
     METRICS_DOC,
@@ -104,10 +107,33 @@ fn doc_02_control_plane_metrics_are_documented_both_ways() {
                 .find_map(|s| cited.strip_suffix(s))
                 .unwrap_or(cited.as_str());
             assert!(
-                known.contains(&base) || known.contains(&cited.as_str()) || crates.contains(&base),
+                known.contains(&base)
+                    || known.contains(&cited.as_str())
+                    || crates.contains(&base)
+                    || LABELS.contains(&base),
                 "{cited} : citée par le guide, enregistrée par personne"
             );
         }
+    }
+}
+
+/// Les règles d'alerte livrées ne citent que des métriques enregistrées (MON-06).
+#[test]
+fn mon_06_rules_cite_only_registered_metrics() {
+    let mut known = registered(SIDECAR_METRICS);
+    known.extend(registered(CONTROLLER_METRICS));
+    known.extend(registered(INJECTOR_METRICS));
+    let cited = cited_metrics(include_str!("../../../deploy/monitoring/rules.yaml"));
+    assert!(cited.len() > 20, "{cited:?}");
+    for name in cited {
+        let base = ["_total", "_bucket", "_sum", "_count"]
+            .iter()
+            .find_map(|s| name.strip_suffix(s))
+            .unwrap_or(name.as_str());
+        assert!(
+            known.contains(&base) || known.contains(&name.as_str()) || LABELS.contains(&base),
+            "{name} : citée par les règles, enregistrée par personne"
+        );
     }
 }
 
