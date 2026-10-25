@@ -637,9 +637,18 @@ impl Ctl {
         self.active.load(Ordering::SeqCst)
     }
 
+    /// Sert ou cesse de servir. Cesser remet aussi la jauge `mimic_controller_leader` à 0 ;
+    /// servir ne la passe pas à 1, ce que fait `set_leader` une fois la marque posée (CTL-52).
     pub fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::SeqCst);
-        self.metrics.leader.set(i64::from(active));
+        if !active {
+            self.metrics.leader.set(0);
+        }
+    }
+
+    /// Jauge `mimic_controller_leader` à 1 : la réplique sert et le Service la route (CTL-52).
+    pub fn set_leader(&self) {
+        self.metrics.leader.set(1);
     }
 
     /// Prise de relais (spec §5.5.4) : recharge ce qui sert les sidecars avant de les servir,
