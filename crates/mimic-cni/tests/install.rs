@@ -81,6 +81,18 @@ fn cni_02_plugin_is_chained_last_once_and_removed_on_stop() {
     // Jeton renouvelé : recopié à l'installation suivante.
     std::fs::write(d.service_account_dir.join("token"), "jeton-2").unwrap();
     install(&d).unwrap();
+    // Le jeton donne `get` sur tous les pods : lisible par root seul, sur l'hôte.
+    let mode = |f: &str| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(d.conf_dir.join(f))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode("mimic-cni.d"), 0o700);
+    assert_eq!(mode("mimic-cni.d/token"), 0o600);
+    assert_eq!(mode("mimic-cni.d/kubeconfig"), 0o600);
     assert_eq!(
         std::fs::read_to_string(d.conf_dir.join("mimic-cni.d/token")).unwrap(),
         "jeton-2"
