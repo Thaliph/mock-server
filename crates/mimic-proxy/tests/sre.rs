@@ -31,6 +31,36 @@ fn jsonl_lines(dir: &Path) -> Vec<serde_json::Value> {
     out
 }
 
+/// Contrôleur factice du workload `ns/api` : garde le corps de chaque segment publié.
+async fn recording_controller() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use axum::extract::State;
+    use axum::routing::post;
+    type Published = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    let published = Published::default();
+    let base = "/v1/workloads/ns/api";
+    let app = axum::Router::new()
+        .route(
+            &format!("{base}/heartbeat"),
+            post(|| async { axum::Json(serde_json::json!({"mode": null, "snapshot": null})) }),
+        )
+        .route(
+            &format!("{base}/segments"),
+            post(|State(p): State<Published>, body: String| async move {
+                p.lock().unwrap().push(body);
+                axum::http::StatusCode::CREATED
+            }),
+        )
+        .with_state(published.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (addr, published)
+}
+
 #[tokio::test]
 async fn cap_09_metadata_keeps_only_metadata_in_memory() {
     let dir = tempfile::tempdir().unwrap();
@@ -39,9 +69,12 @@ async fn cap_09_metadata_keeps_only_metadata_in_memory() {
     let mut cfg = config(Some(app.addr), Mode::Record);
     cfg.capture.inbound = InboundCapture::Metadata;
     cfg.store.dir = Some(dir.path().join("store"));
+    let (ctl, published) = recording_controller().await;
     cfg.share = Some(ShareConfig {
-        url: format!("file://{}", dir.path().join("shared").display()),
+        url: format!("http://{ctl}"),
+        allow_insecure: true,
         interval: Duration::from_millis(100),
+        mode_poll: Duration::from_secs(60),
         ..ShareConfig::default()
     });
     let p = proxy(cfg).await;
@@ -94,7 +127,12 @@ async fn cap_09_metadata_keeps_only_metadata_in_memory() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let journal = jsonl_lines(&dir.path().join("store"));
-        let shared = jsonl_lines(&dir.path().join("shared"));
+        let shared: Vec<serde_json::Value> = published
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|body| body.lines().map(|l| serde_json::from_str(l).unwrap()))
+            .collect();
         let outbound = |l: &[serde_json::Value]| l.iter().any(|e| e["direction"] == "outbound");
         if outbound(&journal) && outbound(&shared) {
             for e in journal.iter().chain(&shared) {

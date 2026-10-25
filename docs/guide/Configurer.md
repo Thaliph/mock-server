@@ -72,9 +72,9 @@ annotation `mimic.platform.io/config: <nom>`, clé `mimic.yaml`, montée dans `/
 | `tls.ca_dir` | absent | répertoire où publier `ca.crt` (CA mimic) et `ca-bundle.crt` (racines système + CA mimic) pour l'application |
 | `tls.upstream_ca_file` | absent | CA supplémentaire de confiance vers les dépendances (CA d'entreprise) |
 | `share` | absent | aucun partage : sidecar isolé, bascule par l'API admin ou l'annotation de mode |
-| `share.url` | requis | `https://…` (contrôleur), `http://…` (avec `allow_insecure`), `file:///chemin` ou `s3://bucket/prefixe` (partage direct) |
-| `share.interval` | `10` | période de publication (et d'import en partage direct) ; après n échecs, `interval` × 2ⁿ plafonné à 300 s, gigue de 50 % |
-| `share.retention` | `86400` (24 h) | partage direct seulement : âge au-delà duquel un segment de pair n'est plus importé |
+| `share.url` | requis | URL du contrôleur : `https://…`, ou `http://…` avec `allow_insecure`. Toute autre valeur, dont `s3://…` et `file://…` (partage direct, retiré), arrête le sidecar au démarrage (code 2) avec `share.url "…" refusée : un sidecar ne partage que par le contrôleur …`. Sans cluster, servir un snapshot avec `mimic-proxy --mock-from <fichier>` |
+| `share.interval` | `10` | période de publication ; après n échecs, `interval` × 2ⁿ plafonné à 300 s, gigue de 50 % |
+| `share.retention` | absent | sans effet : accepté pour les configurations existantes, avec un WARN `share.retention ignoré : la rétention est celle du contrôleur` au démarrage. La rétention est la `retention` du contrôleur |
 | `share.mode_poll` | `2` | période du battement vers le contrôleur |
 | `share.ca_file` | absent | **seule** CA de confiance pour le contrôleur ; requise avec `https://` |
 | `share.token_file` | absent | jeton de ServiceAccount projeté, relu à chaque appel |
@@ -126,7 +126,6 @@ share:
 | `MIMIC_TLS_INTERCEPT` | remplace `tls.intercept` (liste séparée par des virgules) |
 | `MIMIC_LOG` | filtre des logs JSON (`info` par défaut ; par exemple `debug`, `mimic_proxy=debug`). Posée par le webhook depuis l'annotation `mimic.platform.io/log` ou `sidecar_log` |
 | `MIMIC_STORE_SIZE_LIMIT_BYTES` | remplace `store.size_limit_bytes` (taille de l'`emptyDir` du store, en octets), posée par le webhook ; valeur non numérique : erreur au démarrage |
-| `AWS_*` | identifiants, région, endpoint du partage direct `s3://` |
 
 Options de la ligne de commande : `--config <fichier>`, `--mock-from <fichier>` (mock local,
 comme `mock.from`), `--probe <chemin>` (sonde `exec` :
