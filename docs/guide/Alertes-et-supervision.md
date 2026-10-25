@@ -76,7 +76,7 @@ kube-state-metrics et aux signaux des sidecars.
 |-----------|-------|--------|
 | webhook indisponible | `failurePolicy: Ignore` : les pods sont **créés sans mimic**, sans erreur visible pour l'équipe applicative | `kube_deployment_status_replicas_available{deployment="mimic-injector"} == 0` ; pods sans l'annotation `mimic.platform.io/status: injected` dans un namespace activé |
 | pod ignoré volontairement | avertissement d'admission `mimic non injecté : <raison>` | `mimic_injector_admissions_total{result="skipped"}` (informatif) |
-| revue invalide | pod créé sans mimic | `mimic_injector_admissions_total{result="error"}`, log `revue d'admission invalide` |
+| revue invalide | pod créé sans mimic | `mimic_injector_admissions_total{result="error"}` (la réponse d'admission porte `revue d'admission invalide: …`, le log n'a que `admission` avec `result="error"`) |
 
 Pods d'un namespace activé créés sans mimic :
 
@@ -184,4 +184,4 @@ Notes sur ces règles :
 | `MimicExemplarsRefused` | `reason` | `count` : monter `max_exemplars_per_workload` ; `bytes` : monter `max_exemplar_bytes_per_workload` / `_total` |
 | `MimicControllerCertificateExpiring` | `kubectl -n mimic-system get certificate mimic-controller-tls` (condition `Ready`, `renewalTime`), logs de cert-manager ; log du contrôleur `nouveau certificat illisible : l'ancien reste servi` | réparer l'émetteur `mimic-ca` ou le Secret ; un nouveau certificat est relu à chaud, sans redémarrage |
 | `MimicInjectorCertificateExpiring` | `kubectl -n mimic-system get certificate mimic-injector-tls`, logs de cert-manager et du webhook | idem ; une fois expiré, l'API server ne joint plus le webhook et les pods sont créés sans mimic (`failurePolicy: Ignore`) |
-| `MimicInjectorErrors` | log `revue d'admission invalide` | version d'API server, autre webhook qui modifie la revue |
+| `MimicInjectorErrors` | logs du webhook : `admission` avec `result="error"` (le texte `revue d'admission invalide` est dans la réponse d'admission) | version d'API server, autre webhook qui modifie la revue |

@@ -37,7 +37,7 @@ kubectl -n mimic-system logs deploy/mimic-controller --all-containers --prefix |
 | | `mimic non injecté : hostNetwork : les règles iptables toucheraient le noeud` | pod `hostNetwork: true` | non pris en charge |
 | | `mimic non injecté : aucun nom de workload : poser mimic.platform.io/workload ou le label app.kubernetes.io/name` | ni annotation, ni label `app.kubernetes.io/name`, ni `app` | poser l'un d'eux sur le template |
 | | `mimic.platform.io/mesh inconnue : X (auto, none, istio, istio-ambient, linkerd) ; mesh détecté par mimic-init` | valeur d'annotation fausse ; pod injecté en `auto` | corriger l'annotation |
-| erreur d'admission dans les logs du webhook | `revue d'admission invalide: …` | revue mal formée | version de l'API server, autre webhook |
+| `admission` avec `result="error"` dans les logs du webhook | `revue d'admission invalide: …` (message de la réponse d'admission `allowed: false`, pas une ligne de log) | revue mal formée ; avec `failurePolicy: Ignore` le pod est créé sans mimic | version de l'API server, autre webhook |
 | webhook en échec au démarrage | `mimic-injector: sidecar_config invalide: …`, `mimic-injector: configuration … invalide: …` | ConfigMap `mimic-injector` incorrecte | corriger, `rollout restart deploy/mimic-injector` |
 | API server : `failed calling webhook` dans les événements | | `caBundle` pas encore posé par le cainjector, ou webhook injoignable | `kubectl get mutatingwebhookconfiguration mimic-injector -o jsonpath='{.webhooks[0].clientConfig.caBundle}'` ; `kubectl -n mimic-system get endpoints mimic-injector`. Le certificat du webhook est relu à chaud (10 s) : un renouvellement ne demande pas de redémarrage |
 | pod rejeté par Pod Security | `violates PodSecurity "baseline"…` (capacités `NET_ADMIN`, `NET_RAW`) | `mimic-init` a besoin de ces capacités | namespace en `privileged` ou exemption, ou variante CNI (`deploy/cni/`, `cni: true` du webhook) qui retire `mimic-init` |
@@ -48,8 +48,8 @@ Ses logs : `mimic-init: mesh <…>, binaire <…>`, les règles, puis `mimic-ini
 
 | Message | Cause | Correction |
 |---------|-------|------------|
-| `mimic-init: mesh inconnu: X (auto, none, istio, istio-ambient, linkerd)` | `MIMIC_MESH` invalide (ConfigMap ou pod modifié à la main) | corriger |
-| `mimic-init: port invalide: X` | annotation `inbound-ports` ou `exclude-outbound-ports` mal formée | liste de ports séparés par des virgules, `*` ou `-` |
+| `mimic-init: MIMIC_MESH: mesh inconnu: X (auto, none, istio, istio-ambient, linkerd)` | `MIMIC_MESH` invalide (ConfigMap ou pod modifié à la main) | corriger |
+| `mimic-init: MIMIC_INBOUND_PORTS: port invalide: "X" (entier de 1 à 65535)` (idem avec `MIMIC_EXCLUDE_INBOUND_PORTS`, `MIMIC_EXCLUDE_OUTBOUND_PORTS`) | variable posée à la main (le webhook écarte déjà les éléments invalides des annotations `inbound-ports` et `exclude-outbound-ports`, avec un avertissement) | liste de ports séparés par des virgules, `*` ou `-` |
 | `mimic-init: iptables-save a échoué (…)`, `mimic-init: iptables-restore a échoué (…)`, `mimic-init: iptables: <erreur>` | binaire absent, nœud en `iptables-legacy`, capacités manquantes | `iptables` du webhook (`iptables-legacy`), vérifier `NET_ADMIN` |
 | `mimic-init: mesh None` dans un pod du mesh | règles du mesh pas encore posées, ou `MIMIC_MESH=none` | voir [Service mesh](#service-mesh) |
 
@@ -57,6 +57,8 @@ Ses logs : `mimic-init: mesh <…>, binaire <…>`, les règles, puis `mimic-ini
 
 Code 2 : configuration invalide ; code 1 : échec au démarrage. Message sur la sortie
 d'erreur, préfixé `mimic: `.
+
+Chaque message du sidecar, avec sa cause, son effet sur l'application et sa correction, est dans le [runbook du sidecar](../runbook/sidecar.md) (en anglais). Ci-dessous, les cas les plus fréquents.
 
 | Message | Cause |
 |---------|-------|
