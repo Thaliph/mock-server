@@ -59,7 +59,9 @@ product owner).
 2. **Spec and red tests** — `tester` (isolation `worktree`) creates branch
    `t/<issue>-<slug>`, writes the spec change and the failing tests (with the
    security engineer's cases when labelled `type:security`), pushes the branch.
-3. **Implementation** — `developer` (isolation `worktree`) on the same branch: tests green,
+3. **Implementation** — first remove the tester's finished worktree (`git worktree list`; a
+   branch can be checked out in one worktree only, and its work is pushed), then `developer`
+   (isolation `worktree`) on the same branch: tests green,
    `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo test --workspace`, then opens the PR with `Closes #<issue>`.
 4. **Reviews** — in parallel, read-only, each posts one PR comment with the verdict block
@@ -74,8 +76,9 @@ product owner).
    separate one. If CI fails, read the failing job's log and brief the right agent; re-run a job
    only when the log shows a known flaky test.
 
-Independent tickets can run in parallel (different branches, worktrees). Never brief two
-implementers on the same files at once.
+Independent tickets run in parallel (product owner, 2026-10-25) when they share neither a
+branch nor files: check the files each ticket will touch before briefing. Two tickets that both
+edit `docs/SPEC.md` may run together; the second resolves the conflict when it rebases.
 
 ### Review verdict block
 

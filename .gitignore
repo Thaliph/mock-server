@@ -1,3 +1,6 @@
 /target
 *.snap.new
 *.pending-snap
+
+# Worktrees des agents Claude Code (isolation par ticket).
+/.claude/worktrees/
