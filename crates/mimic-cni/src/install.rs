@@ -46,11 +46,20 @@ fn read_json(path: &Path) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Écrit d'abord dans un fichier voisin, puis le renomme : le runtime ne lit jamais un
-/// fichier à moitié écrit.
-fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+/// Écrit d'abord dans un fichier voisin, créé avec `mode`, puis le renomme : le runtime ne
+/// lit jamais un fichier à moitié écrit.
+fn write_atomic(path: &Path, content: &[u8], mode: u32) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("mimic-tmp");
-    std::fs::write(&tmp, content).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(content))
+        .map_err(|e| format!("{}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -101,10 +110,16 @@ pub fn kubeconfig(server: &str, ca: &str, token: &str) -> String {
 pub fn install(d: &Dirs) -> Result<(), String> {
     let own = d.conf_dir.join(OWN_DIR);
     std::fs::create_dir_all(&own).map_err(|e| format!("{}: {e}", own.display()))?;
-    for file in ["token", "ca.crt"] {
+    // Le jeton donne `get` sur tous les pods du cluster : lisible par root seul.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("{}: {e}", own.display()))?;
+    }
+    for (file, mode) in [("token", 0o600), ("ca.crt", 0o644)] {
         let content = std::fs::read(d.service_account_dir.join(file))
             .map_err(|e| format!("{file} du ServiceAccount: {e}"))?;
-        write_atomic(&own.join(file), &content)?;
+        write_atomic(&own.join(file), &content, mode)?;
     }
     let host_own = format!("{}/{OWN_DIR}", d.host_conf_dir.trim_end_matches('/'));
     let kubeconfig_path = format!("{host_own}/kubeconfig");
@@ -116,6 +131,7 @@ pub fn install(d: &Dirs) -> Result<(), String> {
             &format!("{host_own}/token"),
         )
         .as_bytes(),
+        0o600,
     )?;
     let Some(path) = primary(&d.conf_dir)? else {
         return Err(format!(
@@ -133,7 +149,7 @@ pub fn install(d: &Dirs) -> Result<(), String> {
         path.with_extension("conflist")
     };
     let text = serde_json::to_vec_pretty(&new).map_err(|e| e.to_string())?;
-    write_atomic(&target, &text)?;
+    write_atomic(&target, &text, 0o644)?;
     if target != path {
         std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     }
@@ -148,7 +164,7 @@ pub fn uninstall(d: &Dirs) -> Result<(), String> {
     let conf = read_json(&path)?;
     if let Some(new) = unchained(&conf) {
         let text = serde_json::to_vec_pretty(&new).map_err(|e| e.to_string())?;
-        write_atomic(&path, &text)?;
+        write_atomic(&path, &text, 0o644)?;
     }
     Ok(())
 }
