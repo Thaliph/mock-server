@@ -4,8 +4,11 @@ name: security
 # publiées sur du code inchangé) :
 #   - cargo-deny : vulnérabilités RustSec des dépendances, licences, sources ;
 #   - CodeQL : analyse statique du code Rust et des workflows ;
-#   - zizmor : failles des workflows GitHub Actions (injection, droits, actions non épinglées) ;
-#   - Trivy : mauvaises configurations du Dockerfile et des manifests Kubernetes ;
+#   - zizmor : failles des workflows GitHub Actions (injection, droits, actions non épinglées),
+#     bloquant ;
+#   - Trivy : mauvaises configurations du Dockerfile et des manifests Kubernetes, bloquant sur
+#     HIGH et CRITICAL ;
+#   - ignores : raison et échéance de chaque constat accepté (.trivyignore.yaml, zizmor) ;
 #   - OpenSSF Scorecard : pratiques du dépôt (sur main seulement).
 # Les résultats SARIF arrivent dans l'onglet Security du dépôt.
 
@@ -104,10 +107,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Premier passage : SARIF vers l'onglet Security (ne fait jamais échouer le job).
       - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+      # Second passage, bloquant : tout nouveau constat non ignoré fait échouer le job.
+      # Les ignores sont des commentaires `# zizmor: ignore[règle] raison, revue AAAA-MM-JJ`
+      # (vérifiés par le job `ignores`).
+      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          advanced-security: false
 
   trivy-config:
     # Dockerfile et manifests : utilisateur root, capacités, sondes, images non épinglées…
+    # Rapport SARIF complet (MEDIUM compris, sans échec), puis passage bloquant sur HIGH et
+    # CRITICAL. Les constats acceptés sont dans .trivyignore.yaml, avec raison et échéance.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -124,11 +136,31 @@ jobs:
           format: sarif
           output: trivy-config.sarif
           severity: CRITICAL,HIGH,MEDIUM
+          trivyignores: .trivyignore.yaml
+          exit-code: "0"
       - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         if: always()
         with:
           sarif_file: trivy-config.sarif
           category: trivy-config
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          trivyignores: .trivyignore.yaml
+          exit-code: "1"
+
+  ignores:
+    # Chaque ignore (Trivy, zizmor) porte une raison et une échéance non dépassée.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ./scripts/check-ignores.sh
 
   scorecard:
     if: github.event_name != 'pull_request'
@@ -155,7 +187,7 @@ jobs:
   security-ok:
     # Unique contrôle à rendre obligatoire (scorecard est ignoré sur PR, par construction).
     if: always()
-    needs: [changes, cargo-deny, codeql-rust, codeql-actions, zizmor, trivy-config, scorecard]
+    needs: [changes, cargo-deny, codeql-rust, codeql-actions, zizmor, trivy-config, ignores, scorecard]
     runs-on: ubuntu-latest
     permissions: {}
     timeout-minutes: 2
