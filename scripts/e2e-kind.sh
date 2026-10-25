@@ -320,14 +320,25 @@ shipping_mock_state() {
       "$(kubectl -n "$NS" logs "$p" -c mimic | grep -c 'snapshot chargé' || true)"
   done
 }
-EXEMPLARS=/var/lib/mimic-controller/$NS/shipping/exemplars.jsonl
+EXEMPLARS=$NS/shipping/exemplars.jsonl
 old=$(leader)
 [ "$(service_ips)" = "$(pod_ip "$old")" ] || fail "le Service ne route pas vers la seule réplique active ($(service_ips))"
 snap=$(mimicctl status shipping -n "$NS" | tail -1 | awk '{ print $4 }')
 [ -n "$snap" ] && [ "$snap" != "-" ] || fail "shipping n'a pas de snapshot"
 # Exemples de shipping sur le PVC, écrits à chaque passe de maintenance (une minute).
-exemplar_count() { kubectl -n mimic-system exec "$1" -- cat "$EXEMPLARS" 2>/dev/null | wc -l; }
-has_exemplars() { [ "$(exemplar_count "$old")" -gt 0 ]; }
+# L'image du contrôleur n'a pas de shell (distroless) : le PVC est lu par un pod jetable qui
+# le monte en lecture seule (un seul nœud : ReadWriteOnce l'autorise). Le support est commun
+# aux deux réplicas, l'argument (réplique) n'est gardé que pour la lisibilité.
+exemplar_count() {
+  kubectl -n mimic-system run "pvc-reader-$RANDOM" --rm -i --quiet --restart=Never \
+    --image=busybox:1.37 --overrides='{"spec": {
+      "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "mimic-controller", "readOnly": true}}],
+      "containers": [{"name": "reader", "image": "busybox:1.37",
+        "command": ["sh", "-c", "cat /data/'"$EXEMPLARS"' 2>/dev/null | wc -l"],
+        "volumeMounts": [{"name": "data", "mountPath": "/data", "readOnly": true}]}]}}' </dev/null 2>/dev/null |
+    tr -dc '0-9' || true
+}
+has_exemplars() { [ "$(exemplar_count "$old")" -gt 0 ] 2>/dev/null; }
 retry 90 has_exemplars || fail "aucun exemple de shipping sur le PVC"
 exemplars_before=$(exemplar_count "$old")
 digest_before=$(ctl_get "$old" "/v1/workloads/$NS/shipping/snapshots/$snap" | sha256sum)

@@ -401,7 +401,8 @@ fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
     }
     Container {
         name: "mimic-init".into(),
-        image: Some(cfg.image.clone()),
+        // Validée au démarrage : présente hors variante CNI, seule à poser mimic-init.
+        image: cfg.init_image.clone().or_else(|| Some(cfg.image.clone())),
         image_pull_policy: cfg.image_pull_policy.clone(),
         command: Some(vec!["/usr/local/bin/mimic-init".into()]),
         env: Some(envs),

@@ -29,8 +29,8 @@ renouvellement normal de cert-manager (à 75 jours pour des certificats de 90) n
 d'aucune intervention. Un fichier illisible pendant l'échange du Secret est ignoré (log
 `nouveau certificat illisible`), l'ancien certificat reste servi.
 
-**Images** : `ghcr.io/thaliph/mimic:0.1.0`, une seule image pour le sidecar, `mimic-init`,
-le webhook et le contrôleur. Le webhook et le contrôleur tournent sous l'UID et le GID
+**Images** : `ghcr.io/thaliph/mimic:0.1.0` (distroless) pour le sidecar, et `ghcr.io/thaliph/mimic-init:0.1.0` (iptables) pour `mimic-init` ; la première sert aussi
+au webhook, au contrôleur, au plugin CNI et au Job de charge. Le webhook et le contrôleur tournent sous l'UID et le GID
 1338, comme le sidecar (jamais 1337, l'UID d'istio-proxy, que le mesh ne redirige pas).
 
 **Accès de `mimicctl`** : `export`, `requests`, `report` et `snapshot ls|export` lisent par

@@ -14,8 +14,11 @@ pub struct InjectorConfig {
     /// Certificat servi à l'API server ; absent, HTTP en clair (tests uniquement).
     #[serde(default)]
     pub tls: Option<TlsFiles>,
-    /// Image unique qui porte `mimic-proxy` et `mimic-init`.
+    /// Image du sidecar (`mimic-proxy`), sans shell ni iptables (spec §9.4b).
     pub image: String,
+    /// Image de `mimic-init` (iptables) ; requise sauf en variante CNI.
+    #[serde(default)]
+    pub init_image: Option<String>,
     #[serde(default)]
     pub image_pull_policy: Option<String>,
     /// CIDR jamais redirigés vers le sidecar, en plus de l'API Kubernetes.
@@ -101,6 +104,16 @@ impl InjectorConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.image.trim().is_empty() {
             return Err("image requise".into());
+        }
+        if !self.cni
+            && self
+                .init_image
+                .as_deref()
+                .is_none_or(|i| i.trim().is_empty())
+        {
+            return Err(
+                "init_image requise : image de mimic-init (iptables), sauf avec cni: true".into(),
+            );
         }
         serde_yaml::from_str::<mimic_proxy::config::Config>(&self.sidecar_config)
             .map_err(|e| format!("sidecar_config invalide: {e}"))?;

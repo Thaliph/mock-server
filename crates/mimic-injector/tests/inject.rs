@@ -9,6 +9,7 @@ fn config() -> InjectorConfig {
     serde_yaml::from_str(
         r#"
 image: ghcr.io/thaliph/mimic:0.1.0
+init_image: ghcr.io/thaliph/mimic-init:0.1.0
 exclude_outbound_cidrs: [10.96.0.1/32]
 sidecar_config: |
   mode: record
@@ -791,4 +792,34 @@ fn inj_23_cni_mode_replaces_mimic_init_with_an_annotation() {
             .as_ref()
             .is_none_or(|a| !a.contains_key("mimic.platform.io/cni-rules"))
     );
+}
+
+/// INJ-24 : `mimic-init` tourne sur son image (iptables), le sidecar sur l'image distroless.
+#[test]
+fn inj_24_mimic_init_runs_on_its_own_image() {
+    let out = injected(&pod(json!({})));
+    let spec = out.spec.as_ref().unwrap();
+    let image = |name: &str| {
+        spec.init_containers
+            .iter()
+            .flatten()
+            .find(|c| c.name == name)
+            .and_then(|c| c.image.clone())
+    };
+    assert_eq!(
+        image("mimic-init").as_deref(),
+        Some("ghcr.io/thaliph/mimic-init:0.1.0")
+    );
+    assert_eq!(
+        image("mimic").as_deref(),
+        Some("ghcr.io/thaliph/mimic:0.1.0")
+    );
+
+    // Sans init_image : refusé, sauf en variante CNI (aucun mimic-init).
+    let mut missing = config();
+    missing.init_image = None;
+    let err = missing.validate().unwrap_err();
+    assert!(err.contains("init_image"), "{err}");
+    missing.cni = true;
+    missing.validate().unwrap();
 }

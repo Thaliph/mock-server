@@ -72,7 +72,7 @@ async fn webhook() -> Webhook {
     std::fs::write(&cert_file, &cert).unwrap();
     std::fs::write(&key_file, key).unwrap();
     let mut config: InjectorConfig = serde_yaml::from_str(
-        "listen: 127.0.0.1:0\nimage: mimic:test\nsidecar_config: \"mode: record\\n\"\n",
+        "listen: 127.0.0.1:0\nimage: mimic:test\ninit_image: mimic-init:test\nsidecar_config: \"mode: record\\n\"\n",
     )
     .unwrap();
     let mut tls = TlsFiles::new(cert_file, key_file);
@@ -167,8 +167,10 @@ async fn inj_08_skipped_pod_is_allowed_with_a_warning() {
 
 #[test]
 fn invalid_sidecar_config_is_refused_at_startup() {
-    let config: InjectorConfig =
-        serde_yaml::from_str("image: mimic:test\nsidecar_config: \"mood: record\\n\"\n").unwrap();
+    let config: InjectorConfig = serde_yaml::from_str(
+        "image: mimic:test\ninit_image: mimic-init:test\nsidecar_config: \"mood: record\\n\"\n",
+    )
+    .unwrap();
     assert!(config.validate().unwrap_err().contains("sidecar_config"));
 }
 
@@ -203,7 +205,7 @@ async fn inj_14_unreadable_certificate_is_refused_at_startup() {
     std::fs::write(dir.path().join("tls.crt"), "x").unwrap();
     std::fs::write(dir.path().join("tls.key"), "y").unwrap();
     let mut config: InjectorConfig =
-        serde_yaml::from_str("listen: 127.0.0.1:0\nimage: mimic:test\nsidecar_config: \"{}\"\n")
+        serde_yaml::from_str("listen: 127.0.0.1:0\nimage: mimic:test\ninit_image: mimic-init:test\nsidecar_config: \"{}\"\n")
             .unwrap();
     config.tls = Some(TlsFiles::new(
         dir.path().join("tls.crt"),
@@ -219,7 +221,7 @@ fn inj_16_sigterm_stops_the_webhook_cleanly() {
     let path = dir.path().join("injector.yaml");
     std::fs::write(
         &path,
-        "listen: 127.0.0.1:0\nimage: mimic:test\nsidecar_config: \"mode: record\\n\"\n",
+        "listen: 127.0.0.1:0\nimage: mimic:test\ninit_image: mimic-init:test\nsidecar_config: \"mode: record\\n\"\n",
     )
     .unwrap();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mimic-injector"))

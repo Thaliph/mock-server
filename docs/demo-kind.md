@@ -43,8 +43,10 @@ kubectl cluster-info --context "kind-$CLUSTER"
 Une seule image porte les cinq binaires (sidecar, init, contrôleur, webhook, `mimicctl`).
 
 ```sh
+INIT_IMAGE=mimic-init:dev
+docker build --target init -t "$INIT_IMAGE" .
 docker build -t "$IMAGE" .
-kind load docker-image "$IMAGE" --name "$CLUSTER"
+kind load docker-image "$IMAGE" "$INIT_IMAGE" --name "$CLUSTER"
 ```
 
 À voir : `Image: "mimic:dev" … loading…`. Vérifier qu'elle est bien sur le nœud :
@@ -61,11 +63,15 @@ export PATH="$PWD/target/release:$PATH"
 mimicctl --version
 ```
 
-Les manifests de `deploy/` visent l'image publiée `ghcr.io/thaliph/mimic:0.1.0`. On les
-applique en remplaçant ce nom par l'image locale :
+Les manifests de `deploy/` visent les images publiées `ghcr.io/thaliph/mimic:0.1.0` et
+`ghcr.io/thaliph/mimic-init:0.1.0`. On les applique en remplaçant ces noms par les images
+locales :
 
 ```sh
-manifest() { sed "s#ghcr.io/thaliph/mimic:0.1.0#$IMAGE#g" "$@"; }
+manifest() {
+  sed -e "s#ghcr.io/thaliph/mimic-init:0.1.0#$INIT_IMAGE#g" \
+      -e "s#ghcr.io/thaliph/mimic:0.1.0#$IMAGE#g" "$@"
+}
 ```
 
 ## 3. Installer le socle : cert-manager, trust-manager, contrôleur, webhook

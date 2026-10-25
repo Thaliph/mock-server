@@ -9,6 +9,7 @@ use serde_json::json;
 
 const YAML: &str = r#"
 image: ghcr.io/thaliph/mimic:0.1.0
+init_image: ghcr.io/thaliph/mimic-init:0.1.0
 exclude_outbound_cidrs: [10.0.0.0/8]
 sidecar_config: |
   mode: record

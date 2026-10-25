@@ -21,7 +21,7 @@ spec:
     spec:
       initContainers:
         - name: mimic-init
-          image: ghcr.io/thaliph/mimic:0.1.0
+          image: ghcr.io/thaliph/mimic-init:0.1.0
           command: ["/usr/local/bin/mimic-init"]
           env:
             - name: MIMIC_INBOUND_PORTS
