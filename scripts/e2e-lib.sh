@@ -2,8 +2,9 @@
 # Fonctions communes aux tests de bout en bout sur kind (scripts/e2e-kind.sh,
 # scripts/e2e-mesh.sh) : cluster, installation de mimic, attentes.
 #
-# Variables lues : CLUSTER, IMAGE, MIMICCTL (chemin du binaire, sinon construit par cargo),
-# SKIP_BUILD=1 si l'image est déjà construite.
+# Variables lues : CLUSTER, IMAGE, INIT_IMAGE (image de mimic-init ; par défaut celle de IMAGE
+# suffixée de -init : mimic:e2e → mimic-init:e2e), MIMICCTL (chemin du binaire, sinon construit
+# par cargo), SKIP_BUILD=1 si les images sont déjà construites.
 
 CERT_MANAGER=v1.21.1
 TRUST_MANAGER=v0.24.0
@@ -53,7 +54,11 @@ reissue_if_stale() {
 }
 
 # Les manifests livrés, avec l'image construite pour le test.
-manifest() { sed "s#ghcr.io/thaliph/mimic:0.1.0#$IMAGE#g" "$@"; }
+INIT_IMAGE=${INIT_IMAGE:-${IMAGE%:*}-init:${IMAGE##*:}}
+manifest() {
+  sed -e "s#ghcr.io/thaliph/mimic-init:0.1.0#$INIT_IMAGE#g" \
+      -e "s#ghcr.io/thaliph/mimic:0.1.0#$IMAGE#g" "$@"
+}
 
 # Deux réplicas prêts, dont une seule active : celle qui porte la marque (spec §5.5.4).
 CTL_PODS=app.kubernetes.io/name=mimic-controller
@@ -68,9 +73,10 @@ kind_cluster() {
   log "cluster kind $CLUSTER"
   kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --config tests/e2e/kind.yaml
   if [ -z "${SKIP_BUILD:-}" ]; then
+    docker build --target init -t "$INIT_IMAGE" .
     docker build -t "$IMAGE" .
   fi
-  kind load docker-image "$IMAGE" --name "$CLUSTER"
+  kind load docker-image "$IMAGE" "$INIT_IMAGE" --name "$CLUSTER"
 }
 
 # cert-manager, trust-manager, contrôleur et webhook d'injection ; rend la main quand le

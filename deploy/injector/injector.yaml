@@ -34,6 +34,8 @@ data:
     # Relus toutes les 10 s : le certificat renouvelé par cert-manager sert sans redémarrage.
     tls: {cert_file: /etc/mimic/tls/tls.crt, key_file: /etc/mimic/tls/tls.key}
     image: ghcr.io/thaliph/mimic:0.1.0
+    # mimic-init (iptables) : image à part, inutile avec cni: true (spec §9.4b).
+    init_image: ghcr.io/thaliph/mimic-init:0.1.0
     # L'IP du Service kubernetes (KUBERNETES_SERVICE_HOST du webhook) est toujours exclue :
     # l'API Kubernetes n'est jamais redirigée vers le sidecar. Autres destinations à exclure
     # de tous les pods, par exemple un endpoint privé de l'API (EKS) ou une base :

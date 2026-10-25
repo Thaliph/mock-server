@@ -47,7 +47,7 @@ fn cni_03_daemonset_and_rights() {
     let dockerfile = include_str!("../../../Dockerfile");
     assert!(dockerfile.contains("-p mimic-cni"), "binaire construit");
     assert!(
-        dockerfile.contains("/src/target/release/mimic-cni"),
+        dockerfile.contains("release/mimic-cni") && dockerfile.contains("/out/mimic-cni"),
         "binaire copié dans l'image"
     );
 }
