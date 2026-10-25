@@ -931,13 +931,16 @@ pub async fn resolve_silent_within(
     let mode = state.mode();
     if !inbound && matches!(mode, Mode::Mock | Mode::MockPartial) {
         // En mock, joindre la dépendance pour savoir si elle parle la première la
-        // contacterait : on attend l'application, sans rien ouvrir.
-        return match tokio::time::timeout(mock_wait, stream.readable()).await {
-            Ok(Ok(())) => {
+        // contacterait : on attend l'application, sans rien ouvrir. On attend un octet, pas
+        // la disponibilité en lecture : `readable()` peut se réveiller sans rien à lire, et
+        // ce réveil à vide ne doit pas abréger l'attente (PRX-24).
+        return match tokio::time::timeout(mock_wait, first_byte(&stream)).await {
+            Ok(Ok(n)) if n > 0 => {
                 let protocol = crate::net::sniff(&stream).await;
                 Silent::Client(stream, protocol, None)
             }
-            Ok(Err(_)) => Silent::Done,
+            // Fermée par l'application sans avoir rien dit, ou en erreur.
+            Ok(_) => Silent::Done,
             // Toujours muette : protocole inconnu, refusé en mock selon `mock.tcp` (§3.4).
             Err(_) if refuses_tcp(&state) => {
                 refuse_tunnel(
@@ -965,14 +968,16 @@ pub async fn resolve_silent_within(
         }
     };
     let _ = upstream.set_nodelay(true);
+    // Le premier octet, pas la disponibilité en lecture, désigne qui parle le premier : un
+    // réveil à vide ne doit pas trancher (PRX-24).
     let client_first = tokio::select! {
-        r = stream.readable() => {
-            if r.is_err() {
+        r = first_byte(&stream) => {
+            if !matches!(r, Ok(n) if n > 0) {
                 return Silent::Done;
             }
             true
         }
-        _ = upstream.readable() => false,
+        _ = first_byte(&upstream) => false,
     };
     if !client_first {
         // Le serveur parle le premier : tunnel opaque, avec la connexion déjà ouverte.
@@ -993,6 +998,12 @@ pub async fn resolve_silent_within(
         crate::net::Protocol::Http => Silent::Client(stream, crate::net::Protocol::Http, None),
         p => Silent::Client(stream, p, Some(upstream)),
     }
+}
+
+/// Attend le premier octet de la connexion sans le consommer : `0` à la fermeture. Contrairement
+/// à `readable()`, ne rend jamais la main sur un réveil à vide.
+async fn first_byte(stream: &tokio::net::TcpStream) -> std::io::Result<usize> {
+    stream.peek(&mut [0u8; 1]).await
 }
 
 /// Relais TCP opaque d'une connexion redirigée non HTTP (spec §3.1). `upstream` est la
