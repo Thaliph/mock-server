@@ -163,7 +163,7 @@ Elles arrivent au sidecar sous la forme `<METHODE> <chemin>: <code> <motif> <bod
 | C114 | `mimic_controller_auth_failures_total{reason}` | metrics.rs:97 | C72-C74 | Alr |
 | C115 | `mimic_controller_segments_total{result="error"}` | metrics.rs:92 | ingestion refusée (400 ou 503) | Alr |
 | C116 | `mimic_controller_exemplars_refused_total{reason="count"\|"bytes"}` | metrics.rs:132 | exemples refusés par la borne : **aucun log ne l'accompagne** | Alr |
-| C117 | `mimic_controller_leader` | metrics.rs:142 | 1 sur l'active | partiel : Alr (alertes NoLeader/TwoLeaders, sans le nom de la métrique) |
+| C117 | `mimic_controller_leader` | metrics.rs:142 | 1 sur l'active une fois la marque posée, 0 sinon (CTL-52) | Alr (NoLeader/TwoLeaders, causes bail et marque) ; alerte NoLeader couverte par MON-08 (`deploy/monitoring/tests.yaml`) |
 | C118 | `mimic_controller_takeover_seconds` | metrics.rs:147 | durée de la dernière prise de relais | Dep, Alr |
 | C119 | `mimic_controller_certificate_expiry_timestamp_seconds` | metrics.rs:152 | expiration du certificat servi | Alr |
 | C120 | `mimic_controller_pods{state="diverging"\|"absent"}` | metrics.rs:107 | alignement | Alr |
