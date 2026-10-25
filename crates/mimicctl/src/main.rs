@@ -139,6 +139,29 @@ enum Command {
         #[arg(long)]
         fail_on_breaking: bool,
     },
+    /// Manifests du socle (contrôleur puis webhook) sur la sortie standard, à appliquer par
+    /// `kubectl apply -f -` (spec §9.5b).
+    Install {
+        /// Store du contrôleur : rwo (PVC ReadWriteOnce), shared (PVC ReadWriteMany) ou s3.
+        #[arg(long, default_value = "rwo")]
+        storage: String,
+        /// `storageClassName` du PVC (rwo et shared) ; sans elle, la StorageClass par défaut.
+        #[arg(long)]
+        storage_class: Option<String>,
+        /// Store `s3://<bucket>/<préfixe>/`, obligatoire avec `--storage s3`.
+        #[arg(long)]
+        s3_url: Option<String>,
+        /// Image `<registre>/mimic:<tag>` ; l'image d'init `<registre>/mimic-init:<tag>` en
+        /// est déduite.
+        #[arg(long)]
+        image: Option<String>,
+        /// Variante CNI : DaemonSet mimic-cni et `cni: true` dans la configuration du webhook.
+        #[arg(long)]
+        cni: bool,
+        /// Garde-fou production à l'admission (ValidatingAdmissionPolicy, Kubernetes >= 1.30).
+        #[arg(long)]
+        production_guard: bool,
+    },
 }
 
 /// Options de `mimicctl snapshot`.
@@ -304,6 +327,25 @@ async fn namespace(ns: Option<String>, client: &kube::Client) -> String {
 
 async fn run(command: Command) -> Result<i32, String> {
     match command {
+        Command::Install {
+            storage,
+            storage_class,
+            s3_url,
+            image,
+            cni,
+            production_guard,
+        } => {
+            let options = mimicctl::install::InstallOptions {
+                storage: mimicctl::install::Storage::parse(&storage)?,
+                storage_class,
+                s3_url,
+                image,
+                cni,
+                production_guard,
+            };
+            print!("{}", mimicctl::install::manifests(&options)?);
+            Ok(0)
+        }
         Command::Mode {
             workload,
             mode,

@@ -4,7 +4,7 @@
 
 `mimicctl` pilote mimic depuis un poste ou une CI : bascule, statut, export OpenAPI, rejeu,
 tir de charge, rapport et diff d'API. C'est la **référence unique** de la CLI (spec §9.5) ;
-source : `crates/mimicctl/src/{main,lib,load}.rs`.
+source : `crates/mimicctl/src/{main,lib,load,install}.rs`.
 
 ## Installation et accès
 
@@ -26,6 +26,7 @@ les droits de son utilisateur :
 | `load <workload>` | ceux de `requests`, plus `get`/`list` sur `pods` de `metrics.k8s.io` dans le namespace du workload (relevés CPU et mémoire) |
 | `load --from <fichier>` sans workload | aucun : ni cluster, ni vérification, ni relevé |
 | `diff` | aucun : deux fichiers locaux |
+| `install` | aucun pour écrire les manifests ; les appliquer demande les droits d'un administrateur du cluster (CRD, ClusterRole, webhook) |
 
 **Lectures** (`export`, `requests`, `report`, `load`, `snapshot ls`, `snapshot export`) : par
 l'API agrégée `data.mimic.platform.io/v1alpha1` (spec §9.2c), comme `kubectl top` passe par
@@ -49,6 +50,108 @@ tous les namespaces (`status` et `report`). Codes de sortie :
 | `0` | succès |
 | `1` | `diff --fail-on-breaking` a trouvé un changement cassant |
 | `2` | erreur ou refus (garde-fou production de `mode`, workload non isolé pour `load`) ; message sur la sortie d'erreur, préfixé `mimicctl: ` |
+
+## `install`
+
+```sh
+mimicctl install [--storage rwo|shared|s3] [--storage-class <nom>] [--s3-url s3://<bucket>/<préfixe>/] \
+  [--image <registre>/mimic:<tag>] [--cni] [--production-guard]
+```
+
+Écrit sur la sortie standard les manifests du socle de la version de `mimicctl` (spec §9.5b),
+embarqués dans le binaire : ni dépôt ni Rust nécessaires. Rien n'est appliqué : la sortie se
+relit, se versionne (GitOps) ou se pipe dans `kubectl apply -f -`.
+
+```sh
+mimicctl install | kubectl apply -f -
+mimicctl install --storage s3 --s3-url s3://acme-mimic/prod/ \
+  --image registry.example.com/team/mimic:1.2 > mimic.yaml
+```
+
+### Prérequis
+
+cert-manager et trust-manager, ce dernier avec `mimic-system` comme namespace de confiance :
+sans lui, la ConfigMap `mimic-controller-ca` n'apparaît jamais et les pods injectés restent en
+`ContainerCreating`. Le chart de trust-manager exige que ce namespace existe : le créer
+**avant** de l'installer.
+
+```sh
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml
+kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
+kubectl create namespace mimic-system
+helm repo add jetstack https://charts.jetstack.io --force-update
+helm upgrade --install trust-manager jetstack/trust-manager \
+  --version v0.24.0 -n cert-manager --set app.trust.namespace=mimic-system --wait
+```
+
+Le webhook de cert-manager doit répondre avant l'`apply` (le `wait` ci-dessus) : sinon les
+`Certificate` et `Issuer` sont refusés pendant que le reste s'applique. Il suffit alors de
+relancer la même commande `mimicctl install … | kubectl apply -f -`.
+
+Les images `ghcr.io/thaliph/*` sont publiques. Pour les recopier dans un registre privé
+(`--image`), ajouter ses pull secrets (`imagePullSecrets`) aux ServiceAccounts `mimic-controller`,
+`mimic-injector` et `mimic-cni` (avec `--cni`), ainsi qu'à ceux des pods injectés, qui tirent le sidecar et
+l'image d'init avec leurs propres pull secrets.
+
+### Après l'`apply` : vérifier la CA
+
+La CA, son `Issuer` et les feuilles arrivent dans le même `apply` : cert-manager peut réémettre
+la CA juste après avoir signé une feuille, qui reste `Ready` mais que les sidecars refusent
+(`invalid peer certificate: BadSignature`). Attendre les certificats, puis comparer la CA qui
+a signé chaque feuille à la CA courante ; supprimer le Secret d'une feuille qui diffère
+(cert-manager la réémet) :
+
+```sh
+kubectl -n mimic-system wait --for=condition=Ready certificate --all --timeout=120s
+ca=$(kubectl -n mimic-system get secret mimic-controller-ca -o jsonpath='{.data.tls\.crt}')
+for leaf in mimic-controller-tls mimic-injector-tls; do
+  [ "$ca" = "$(kubectl -n mimic-system get secret "$leaf" -o jsonpath='{.data.ca\.crt}')" ] \
+    || kubectl -n mimic-system delete secret "$leaf"
+done
+```
+
+**Une API agrégée indisponible gêne tout le cluster.** Tant que le contrôleur n'est pas prêt
+(PVC `Pending` faute de StorageClass adaptée, image introuvable…), l'`APIService`
+`v1alpha1.data.mimic.platform.io` est `Available=False` : chaque `kubectl` affiche un
+avertissement de découverte et **aucun namespace du cluster ne peut être supprimé**
+(condition `NamespaceDeletionDiscoveryFailure`). Vérifier
+`kubectl get apiservice v1alpha1.data.mimic.platform.io` après l'installation ; si le PVC reste
+`Pending`, relancer avec `--storage-class` (ou `--storage s3`).
+
+### Mise à jour et désinstallation
+
+Mettre à jour, c'est relancer la commande avec la nouvelle version de `mimicctl` et les
+**mêmes options**. L'`apply` remet les manifests livrés : toute modification faite dans le
+cluster aux ConfigMaps (`mimic-controller`, `mimic-injector` : `exclude_outbound_cidrs`,
+rétention…) est écrasée. Pour personnaliser durablement, versionner la sortie
+(`mimicctl install … > base.yaml`) et la modifier par un overlay kustomize.
+
+```sh
+mimicctl install <mêmes options> | kubectl delete -f -
+```
+
+La désinstallation supprime la CRD, donc **toutes les `MimicWorkload` du cluster**, ainsi que
+le namespace `mimic-system` et le store qu'il contient (PVC).
+
+### Sortie et options
+
+Ordre de la sortie, documents séparés par `---` : le contrôleur de la variante choisie
+(`deploy/install/controller*.yaml`, rendus de `kubectl kustomize deploy/controller*` par
+`scripts/render-install.sh`), le webhook (`deploy/injector/injector.yaml`, `inbound: false`
+et ses quatre webhooks), puis, sur demande, le plugin CNI et le garde-fou production.
+
+| Option | Effet |
+|--------|-------|
+| `--storage rwo` | défaut : PVC `ReadWriteOnce`, fonctionne sur tout cluster doté d'une StorageClass par défaut ; répliques placées sur le nœud du volume, sans PodDisruptionBudget |
+| `--storage shared` | PVC `ReadWriteMany`, les deux répliques sur deux nœuds (haute disponibilité). Les classes par défaut d'EKS, GKE et AKS ne fournissent pas de RWX : passer `--storage-class` (EFS, Filestore, Azure Files…) |
+| `--storage s3` | store `s3://`, sans PVC (haute disponibilité) ; exige `--s3-url`. Identifiants `AWS_*` du Secret facultatif `mimic-controller-s3`, ou identité de pod (IRSA, Workload Identity) |
+| `--storage-class <nom>` | pose `storageClassName` sur le PVC de `rwo` et de `shared` ; sans l'option, la StorageClass par défaut du cluster. Refusée avec `s3` et si ce n'est pas un nom DNS (code 2) |
+| `--s3-url s3://<bucket>/<préfixe>/` | obligatoire avec `--storage s3`, refusée sinon : devient le `store` du contrôleur. Refusée sans schéma `s3://`, sans bucket, ou avec un espace ou un caractère de contrôle (code 2) |
+| `--image <registre>/mimic:<tag>` | remplace `ghcr.io/thaliph/mimic:<version>` partout (contrôleur, webhook, DaemonSet CNI) ; l'image d'init devient `<registre>/mimic-init:<tag>`. Une image sans tag, ou dont le nom n'est pas `mimic`, est refusée (code 2) |
+| `--cni` | ajoute `deploy/cni/mimic-cni.yaml` (DaemonSet `mimic-cni`) et `cni: true` dans la configuration du webhook (spec §3.1b) |
+| `--production-guard` | ajoute `deploy/controller/production-guard.yaml` (`ValidatingAdmissionPolicy`, Kubernetes 1.30 ou plus) |
+
+Une variante de `--storage` inconnue est refusée (code 2) en citant les variantes valides.
 
 ## `mode`
 
