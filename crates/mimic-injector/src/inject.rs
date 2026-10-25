@@ -187,7 +187,16 @@ fn checked_list<T: ToString>(
     out
 }
 
-fn checked(pod: &Pod) -> Checked {
+/// Ports entrants interceptés sans annotation : aucun, sauf interception entrante demandée.
+fn default_inbound_ports(pod: &Pod, inbound: bool) -> String {
+    if inbound {
+        declared_ports(pod)
+    } else {
+        "-".into()
+    }
+}
+
+fn checked(pod: &Pod, inbound: bool) -> Checked {
     let mut warnings = vec![];
     let inbound_ports = match annotation(pod, ANNOTATION_INBOUND_PORTS) {
         Some(a @ ("*" | "-")) => a.to_string(),
@@ -200,14 +209,14 @@ fn checked(pod: &Pod) -> Checked {
             );
             if ports.is_empty() {
                 warnings.push(format!(
-                    "{ANNOTATION_INBOUND_PORTS} : aucun port valide, ports déclarés interceptés"
+                    "{ANNOTATION_INBOUND_PORTS} : aucun port valide, valeur ignorée"
                 ));
-                declared_ports(pod)
+                default_inbound_ports(pod, inbound)
             } else {
                 ports.join(",")
             }
         }
-        None => declared_ports(pod),
+        None => default_inbound_ports(pod, inbound),
     };
     let exclude_cidrs = annotation(pod, ANNOTATION_EXCLUDE_CIDRS)
         .map(|a| {
@@ -254,7 +263,7 @@ pub fn valid_log_filter(filter: &str) -> Result<(), String> {
 /// écartées.
 pub fn warnings(pod: &Pod) -> Vec<String> {
     let mut out: Vec<String> = mesh_warning(pod).into_iter().collect();
-    out.extend(checked(pod).warnings);
+    out.extend(checked(pod, false).warnings);
     out
 }
 
@@ -381,7 +390,7 @@ fn runtime_default() -> Option<SeccompProfile> {
 }
 
 fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
-    let checked = checked(pod);
+    let checked = checked(pod, cfg.inbound);
     let cidrs = excluded_cidrs(cfg, checked.exclude_cidrs);
     let mut envs = vec![
         env("MIMIC_MESH", mesh_mode(pod)),
@@ -425,7 +434,9 @@ fn init_container(pod: &Pod, cfg: &InjectorConfig) -> Container {
 }
 
 fn sidecar(pod: &Pod, cfg: &InjectorConfig, workload: &str, intercept: &[String]) -> Container {
-    let log = checked(pod).log.or_else(|| cfg.sidecar_log.clone());
+    let log = checked(pod, cfg.inbound)
+        .log
+        .or_else(|| cfg.sidecar_log.clone());
     let mut envs = vec![
         field_env("POD_NAME", "metadata.name"),
         field_env("POD_NAMESPACE", "metadata.namespace"),

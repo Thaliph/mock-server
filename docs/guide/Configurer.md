@@ -142,7 +142,7 @@ le **template** du pod (Deployment, StatefulSet…).
 |------------|--------|-------|
 | `mimic.platform.io/inject` | `"false"` | pas d'injection ; avertissement `mimic non injecté : injection désactivée par mimic.platform.io/inject`. En **label** du pod : `"false"` le soustrait au webhook d'un namespace `enabled=true`, `"true"` le désigne dans un namespace `enabled=opt-in` |
 | `mimic.platform.io/workload` | nom | nom du workload (`MIMIC_WORKLOAD`) ; sinon label `app.kubernetes.io/name`, sinon label `app`. Sans nom : pas d'injection |
-| `mimic.platform.io/inbound-ports` | `8080,9090`, `*`, `-` | `MIMIC_INBOUND_PORTS` ; défaut : ports `containerPort` TCP des conteneurs de l'app (hors conteneurs du mesh), sinon `*` ; `-` : aucune interception entrante |
+| `mimic.platform.io/inbound-ports` | `8080,9090`, `*`, `-` | `MIMIC_INBOUND_PORTS`, l'emporte sur tout le reste ; défaut : aucune interception entrante (`-`), sauf `inbound: true` dans la configuration du webhook ou namespace labellisé `mimic.platform.io/inbound=true` : ports `containerPort` TCP des conteneurs de l'app (hors conteneurs du mesh), sinon `*` ; `-` : aucune interception entrante, même dans ces cas |
 | `mimic.platform.io/exclude-outbound-cidrs` | liste de CIDR | ajoutés à `exclude_outbound_cidrs` du webhook dans `MIMIC_EXCLUDE_OUTBOUND_CIDRS` |
 | `mimic.platform.io/exclude-outbound-ports` | liste de ports | `MIMIC_EXCLUDE_OUTBOUND_PORTS` |
 | `mimic.platform.io/tls-intercept` | liste d'hôtes | `MIMIC_TLS_INTERCEPT` pour le sidecar ; dans chaque conteneur de l'app, volume `mimic-ca` monté en lecture seule sur `/var/run/mimic/ca`, et `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (`ca-bundle.crt`), `NODE_EXTRA_CA_CERTS` (`ca.crt`), sans écraser une variable déjà définie |
@@ -191,6 +191,7 @@ Fichier passé par `--config` (ou `-c`, ou `MIMIC_INJECTOR_CONFIG`), obligatoire
 | `resources` | absent | `resources` du sidecar (format Kubernetes) ; absent : 50m / 64Mi, limite 256Mi |
 | `controller_ca_configmap` | `mimic-controller-ca` | ConfigMap de la CA du contrôleur, publiée par trust-manager |
 | `token_audience` | `mimic-controller` | audience du jeton projeté ; le contrôleur vérifie `mimic-controller` |
+| `inbound` | `false` | `true` : interception entrante de tous les pods injectés (découverte de l'API du service, `mimicctl load`) ; sinon par namespace (label `mimic.platform.io/inbound=true`) ou par pod (annotation `inbound-ports`). Le mock ne sert jamais que le sortant |
 | `cni` | `false` | `true` : pas de `mimic-init` ; réglages passés au plugin `mimic-cni` par l'annotation `mimic.platform.io/cni-rules` (exige le DaemonSet de `deploy/cni/`) |
 | `version_label` | `app.kubernetes.io/version` | label du pod repris dans `MIMIC_VERSION` (`rollouts-pod-template-hash` avec Argo Rollouts, par exemple) |
 | `sidecar_log` | absent | `MIMIC_LOG` des sidecars (filtre `EnvFilter`), sauf annotation `mimic.platform.io/log` ; absent : `info`. Filtre invalide : refusé au démarrage (`sidecar_log: …`) |

@@ -57,6 +57,11 @@ pub struct InjectorConfig {
     /// `mimic-init` privilégié dans les pods.
     #[serde(default)]
     pub cni: bool,
+    /// Interception entrante pour tous les pods (spec §3.1, §9.4) ; sinon seulement ceux des
+    /// namespaces `mimic.platform.io/inbound=true` (`/mutate/inbound`) ou annotés
+    /// `mimic.platform.io/inbound-ports`.
+    #[serde(default)]
+    pub inbound: bool,
 }
 
 fn default_listen() -> SocketAddr {

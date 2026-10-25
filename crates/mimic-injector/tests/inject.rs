@@ -10,6 +10,8 @@ fn config() -> InjectorConfig {
         r#"
 image: ghcr.io/thaliph/mimic:0.1.0
 init_image: ghcr.io/thaliph/mimic-init:0.1.0
+# Ces tests portent sur le choix des ports : interception entrante active (INJ-25).
+inbound: true
 exclude_outbound_cidrs: [10.96.0.1/32]
 sidecar_config: |
   mode: record
@@ -822,4 +824,38 @@ fn inj_24_mimic_init_runs_on_its_own_image() {
     assert!(err.contains("init_image"), "{err}");
     missing.cni = true;
     missing.validate().unwrap();
+}
+
+/// INJ-25 : sans demande, aucun port entrant n'est intercepté ; la configuration, le chemin
+/// `/mutate/inbound` (namespace `inbound=true`) ou l'annotation du pod l'activent.
+#[test]
+fn inj_25_inbound_interception_is_off_by_default() {
+    let mut default = config();
+    default.inbound = false;
+    let ports = |p: &Pod, cfg: &InjectorConfig| {
+        let Outcome::Injected(out) = mutate(p, cfg) else {
+            panic!("non injecté");
+        };
+        let inits = out.spec.unwrap().init_containers.unwrap();
+        let init = inits.iter().find(|c| c.name == "mimic-init").unwrap();
+        env_value(init, "MIMIC_INBOUND_PORTS").map(String::from)
+    };
+    let plain = pod(json!({}));
+    assert_eq!(ports(&plain, &default).as_deref(), Some("-"));
+    assert_eq!(ports(&plain, &config()).as_deref(), Some("8080"));
+
+    let annotated =
+        |v: &str| pod(json!({"metadata": {"annotations": {"mimic.platform.io/inbound-ports": v}}}));
+    assert_eq!(ports(&annotated("9090"), &default).as_deref(), Some("9090"));
+    assert_eq!(ports(&annotated("-"), &config()).as_deref(), Some("-"));
+
+    // Variante CNI : même choix dans l'annotation des règles.
+    let mut cni = default.clone();
+    cni.cni = true;
+    let Outcome::Injected(out) = mutate(&plain, &cni) else {
+        panic!("non injecté");
+    };
+    let rules = out.metadata.annotations.unwrap()["mimic.platform.io/cni-rules"].clone();
+    let rules: serde_json::Value = serde_json::from_str(&rules).unwrap();
+    assert_eq!(rules["MIMIC_INBOUND_PORTS"], "-");
 }
