@@ -1,0 +1,55 @@
+name: Ticket
+description: One deliverable, the size of one pull request (created by the product manager).
+labels: ["status:ready"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What changes for the user, in one or two sentences.
+    validations: {required: true}
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Paths, spec sections, links. Agents read only this issue and what it points to.
+    validations: {required: true}
+  - type: textarea
+    id: decisions
+    attributes:
+      label: Decisions
+      description: Product owner answers that apply, with their date.
+  - type: textarea
+    id: spec
+    attributes:
+      label: Spec impact
+      description: Criteria of docs/SPEC.md §11.2 to add or change (e.g. INJ-26), sections touched.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checkable outcomes; each one becomes a test.
+      value: |
+        - [ ] 
+    validations: {required: true}
+  - type: textarea
+    id: tasks
+    attributes:
+      label: Tasks
+      description: One line per persona step that applies.
+      value: |
+        - [ ] app-architect: design gate
+        - [ ] k8s-architect: design gate
+        - [ ] security-engineer: threat model and security test cases
+        - [ ] tester: spec criteria and red tests
+        - [ ] developer: implementation and PR
+        - [ ] reviews: security-engineer, devops, sre, k8s-architect, tester
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+  - type: input
+    id: depends
+    attributes:
+      label: Depends on
+      placeholder: "#12, #15"
