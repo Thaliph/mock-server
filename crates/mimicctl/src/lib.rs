@@ -1,6 +1,7 @@
 //! Construction des requêtes de `mimicctl` (spec §9.5) : fonctions pures, testées sans
 //! cluster. `main.rs` les envoie à l'API Kubernetes ou au contrôleur.
 
+pub mod install;
 pub mod load;
 
 use std::collections::{BTreeMap, BTreeSet};

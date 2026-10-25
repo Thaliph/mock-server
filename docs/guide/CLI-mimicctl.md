@@ -4,7 +4,7 @@
 
 `mimicctl` pilote mimic depuis un poste ou une CI : bascule, statut, export OpenAPI, rejeu,
 tir de charge, rapport et diff d'API. C'est la **référence unique** de la CLI (spec §9.5) ;
-source : `crates/mimicctl/src/{main,lib,load}.rs`.
+source : `crates/mimicctl/src/{main,lib,load,install}.rs`.
 
 ## Installation et accès
 
@@ -26,6 +26,7 @@ les droits de son utilisateur :
 | `load <workload>` | ceux de `requests`, plus `get`/`list` sur `pods` de `metrics.k8s.io` dans le namespace du workload (relevés CPU et mémoire) |
 | `load --from <fichier>` sans workload | aucun : ni cluster, ni vérification, ni relevé |
 | `diff` | aucun : deux fichiers locaux |
+| `install` | aucun pour écrire les manifests ; les appliquer demande les droits d'un administrateur du cluster (CRD, ClusterRole, webhook) |
 
 **Lectures** (`export`, `requests`, `report`, `load`, `snapshot ls`, `snapshot export`) : par
 l'API agrégée `data.mimic.platform.io/v1alpha1` (spec §9.2c), comme `kubectl top` passe par
@@ -49,6 +50,38 @@ tous les namespaces (`status` et `report`). Codes de sortie :
 | `0` | succès |
 | `1` | `diff --fail-on-breaking` a trouvé un changement cassant |
 | `2` | erreur ou refus (garde-fou production de `mode`, workload non isolé pour `load`) ; message sur la sortie d'erreur, préfixé `mimicctl: ` |
+
+## `install`
+
+```sh
+mimicctl install [--storage shared|rwo|s3] [--image <registre>/mimic:<tag>] [--cni] [--production-guard]
+```
+
+Écrit sur la sortie standard les manifests du socle de la version de `mimicctl` (spec §9.5b),
+embarqués dans le binaire : ni dépôt ni Rust nécessaires. Rien n'est appliqué : la sortie se
+relit, se versionne (GitOps) ou se pipe dans `kubectl apply -f -`. Prérequis : cert-manager
+et trust-manager installés.
+
+```sh
+mimicctl install | kubectl apply -f -
+mimicctl install --storage s3 --image registry.example.com/team/mimic:1.2 > mimic.yaml
+```
+
+Ordre de la sortie, documents séparés par `---` : le contrôleur de la variante choisie
+(`deploy/install/controller*.yaml`, rendus de `kubectl kustomize deploy/controller*` par
+`scripts/render-install.sh`), le webhook (`deploy/injector/injector.yaml`, `inbound: false`
+et ses quatre webhooks), puis, sur demande, le plugin CNI et le garde-fou production.
+
+| Option | Effet |
+|--------|-------|
+| `--storage shared` | défaut : store sur un PVC `ReadWriteMany`, les deux répliques sur deux nœuds |
+| `--storage rwo` | PVC `ReadWriteOnce` : répliques placées sur le nœud du volume, sans PodDisruptionBudget |
+| `--storage s3` | store `s3://`, sans PVC (configurer le bucket et ses identifiants avant d'appliquer) |
+| `--image <registre>/mimic:<tag>` | remplace `ghcr.io/thaliph/mimic:<version>` partout (contrôleur, webhook, DaemonSet CNI) ; l'image d'init devient `<registre>/mimic-init:<tag>`. Une image sans tag, ou dont le nom n'est pas `mimic`, est refusée (code 2) |
+| `--cni` | ajoute `deploy/cni/mimic-cni.yaml` (DaemonSet `mimic-cni`) et `cni: true` dans la configuration du webhook (spec §3.1b) |
+| `--production-guard` | ajoute `deploy/controller/production-guard.yaml` (`ValidatingAdmissionPolicy`, Kubernetes 1.30 ou plus) |
+
+Une variante de `--storage` inconnue est refusée (code 2) en citant les variantes valides.
 
 ## `mode`
 
