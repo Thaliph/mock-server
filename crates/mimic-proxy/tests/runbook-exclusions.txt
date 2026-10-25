@@ -1,0 +1,6 @@
+# Messages du sidecar volontairement absents du runbook (DOC-12).
+# Format : « texte fixe | raison ». Le texte fixe est celui que l extraction produit.
+mimic: {} | enveloppe du message de sortie de main.rs : chaque message enveloppé est documenté pour lui-même
+{} | message passé en paramètre à refuse_tunnel : documenté par ses trois appelants
+{}: {} | erreur d'E/S préfixée par un chemin (TLS, store) : le texte vient de l'OS et le chemin est celui de la configuration
+{} {}: {} | enveloppe « méthode chemin: statut corps » d'un refus du contrôleur : le corps est documenté dans controller.md
