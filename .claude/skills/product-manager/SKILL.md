@@ -100,7 +100,7 @@ Read verdicts with `gh pr view <n> --comments`.
 A brief is short and self-contained, because the agent knows nothing else:
 
 ```
-Ticket: #<n> (read it: gh issue view <n> --comments)
+Ticket: #<n> (read it: gh issue view <n>; comments: gh issue view <n> --comments)
 Your step: <one sentence>
 Branch: t/<n>-<slug> (create it from main | switch to it after git fetch)
 Look at: <3-6 paths or spec sections>
