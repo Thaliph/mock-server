@@ -7,6 +7,10 @@
 #   - commentaires `# zizmor: ignore[règle]` : une raison puis une date de revue AAAA-MM-JJ
 #     (même fenêtre) ;
 #   - aucun fichier de configuration zizmor non vide (il pourrait désactiver un audit) ;
+#   - aucun trivy.yaml / trivy.yml non vide à la racine (configuration par défaut de Trivy,
+#     que trivy-action ne remplace pas : skip-dirs/skip-files masqueraient des constats) ;
+#   - les ignores zizmor sont cherchés dans tous les YAML du dépôt (actions composites
+#     comprises), un seul ignore par ligne ;
 #   - pas de .trivyignore texte (format sans raison ni date).
 # Trivy ignore déjà de lui-même une entrée échue (le constat réapparaît) ; ce script
 # donne en plus un message clair et refuse les entrées sans date.
@@ -48,7 +52,14 @@ def check_date(where, value):
         fail(where, f"échéance {d} trop lointaine (12 mois au plus)")
 
 
-# 1. Trivy : .trivyignore.yaml.
+# 1. Trivy : configuration racine interdite, puis .trivyignore.yaml.
+for f in sorted(glob.glob("trivy.y*ml")):
+    try:
+        content = yaml.safe_load(open(f, encoding="utf-8"))
+    except yaml.YAMLError:
+        content = "illisible"
+    if content not in (None, {}):
+        fail(f, "configuration Trivy non vide interdite (skip-dirs, skip-files, severity… contournent le contrôle) ; utiliser .trivyignore.yaml")
 for legacy in (".trivyignore", ".trivyignore.yml"):
     if os.path.exists(legacy):
         fail(legacy, "sans raison ni date, utiliser .trivyignore.yaml")
@@ -97,9 +108,12 @@ for pat in ("zizmor.y*ml", ".github/zizmor.y*ml", ".github/**/zizmor.y*ml"):
             fail(f, "configuration zizmor non vide interdite (désactiver un audit contourne le contrôle) ; utiliser des ignores inline")
 
 inline = re.compile(r"#\s*zizmor:\s*ignore(.*)$")
-for root, _, files in os.walk(".github"):
+for root, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in (".git", "target", "node_modules")]
     for name in files:
-        path = os.path.join(root, name)
+        path = os.path.join(root, name)[2:]
+        if not (path.startswith(".github/") or name.endswith((".yml", ".yaml"))):
+            continue
         try:
             lines = open(path, encoding="utf-8").read().splitlines()
         except (UnicodeDecodeError, OSError):
@@ -109,6 +123,9 @@ for root, _, files in os.walk(".github"):
             if not m:
                 continue
             where = f"{path}:{n}"
+            if len(re.findall(r"zizmor:\s*ignore", line)) > 1:
+                fail(where, "un seul ignore zizmor par ligne")
+                continue
             rule = re.match(r"\[[^\]]+\](.*)$", m.group(1))
             if not rule:
                 fail(where, "ignore zizmor sans règle entre crochets")
