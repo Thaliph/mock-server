@@ -257,7 +257,7 @@ impl Sharer {
         };
 
         let me = &state.config.instance;
-        let oldest_ms = now_ms().saturating_sub(self.config.retention.as_millis() as u64) as i64;
+        let oldest_ms = now_ms().saturating_sub(self.config.retention().as_millis() as u64) as i64;
         let listed = list(store, &self.base).await?;
         let newest = listed.iter().map(|s| s.modified_ms).max();
         let mut to_import = vec![];

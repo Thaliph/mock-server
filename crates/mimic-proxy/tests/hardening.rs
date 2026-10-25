@@ -361,18 +361,18 @@ fn prx_22_zero_periods_and_caps_are_rejected() {
             _ => None,
         })
     };
-    assert!(load("share:\n  url: file:///tmp/mimic\n").is_ok());
+    assert!(load("share:\n  url: http://127.0.0.1:8443\n  allow_insecure: true\n").is_ok());
     for (yaml, field) in [
         (
-            "share:\n  url: file:///tmp/mimic\n  interval: 0\n",
+            "share:\n  url: http://127.0.0.1:8443\n  allow_insecure: true\n  interval: 0\n",
             "share.interval",
         ),
         (
-            "share:\n  url: file:///tmp/mimic\n  mode_poll: 0\n",
+            "share:\n  url: http://127.0.0.1:8443\n  allow_insecure: true\n  mode_poll: 0\n",
             "share.mode_poll",
         ),
         (
-            "share:\n  url: file:///tmp/mimic\n  max_snapshot_bytes: 0\n",
+            "share:\n  url: http://127.0.0.1:8443\n  allow_insecure: true\n  max_snapshot_bytes: 0\n",
             "share.max_snapshot_bytes",
         ),
         (
