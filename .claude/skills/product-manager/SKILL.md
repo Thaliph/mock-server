@@ -79,6 +79,9 @@ product owner).
 Independent tickets run in parallel (product owner, 2026-10-25) when they share neither a
 branch nor files: check the files each ticket will touch before briefing. Two tickets that both
 edit `docs/SPEC.md` may run together; the second resolves the conflict when it rebases.
+When tickets run in parallel, **you** allocate the new criterion IDs (`DOC-11`, `PRX-27`…)
+and the spec version of each ticket, write them in the issue, and give them in the tester's
+brief: two testers picking "the next free ID" at the same time collide.
 
 ### Review verdict block
 
