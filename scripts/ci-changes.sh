@@ -15,10 +15,20 @@ cluster=false
 forced=false
 
 if [ "$event" = "pull_request" ]; then
-  files="$(git diff --name-only "$base_sha"...HEAD)"
-  if printf '%s\n' "$labels" | grep -q '"e2e"'; then forced=true; fi
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
+  if printf '%s' "$labels" | jq -e 'index("e2e") != null' >/dev/null 2>&1; then forced=true; fi
+  # Liste NUL-séparée dans un fichier (une substitution de commande perdrait les NUL).
+  # --no-renames liste ancien et nouveau chemin ; quotePath=false et -z évitent les noms
+  # entre guillemets (non ASCII) qu'aucun motif ne reconnaîtrait.
+  list="$(mktemp)"
+  trap 'rm -f "$list"' EXIT
+  # Échec fermé : sans base ou si le diff échoue, tout est considéré comme modifié.
+  if [ -z "$base_sha" ] || ! git -c core.quotePath=false diff --name-only --no-renames -z "$base_sha"...HEAD >"$list"; then
+    echo "ci-changes : diff impossible, tout est considéré comme modifié" >&2
+    rust=true
+    cluster=true
+    : >"$list"
+  fi
+  while IFS= read -r -d '' f; do
     case "$f" in
       crates/*|Cargo.toml|Cargo.lock|.cargo/*|rust-toolchain|rust-toolchain.*|deny.toml)
         rust=true ;;
@@ -26,11 +36,11 @@ if [ "$event" = "pull_request" ]; then
     case "$f" in
       deploy/monitoring/*) ;;
       crates/*|Cargo.toml|Cargo.lock|.cargo/*|rust-toolchain|rust-toolchain.*|deploy/*|\
-      Dockerfile|.dockerignore|scripts/e2e-*|scripts/otel-demo.py|tests/e2e/*|\
-      .github/workflows/ci.yml|scripts/ci-changes.sh)
+      Dockerfile|.dockerignore|scripts/e2e-*|scripts/lo-up.py|scripts/otel-demo.py|tests/e2e/*|\
+      .github/workflows/ci.yml|scripts/ci-changes.sh|scripts/test-ci-changes.sh)
         cluster=true ;;
     esac
-  done <<<"$files"
+  done <"$list"
 else
   # push sur main, nuit, déclenchement manuel : tout le code est concerné.
   rust=true

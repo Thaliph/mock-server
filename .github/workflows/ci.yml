@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -39,6 +39,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - run: ./scripts/test-ci-changes.sh
       - id: diff
         run: ./scripts/ci-changes.sh
         env:
@@ -116,7 +117,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
           df -h /
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3 # zizmor: ignore[cache-poisoning] écriture limitée à main (save-if), rien de publié ici
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -171,7 +172,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3 # zizmor: ignore[cache-poisoning] écriture limitée à main (save-if), rien de publié ici
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -212,6 +213,28 @@ jobs:
     permissions: {}
     timeout-minutes: 2
     steps:
-      - run: echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")'
+      - run: echo "$NEEDS" | jq -e '.changes.result == "success" and all(.[]; .result == "success" or .result == "skipped")'
         env:
           NEEDS: ${{ toJSON(needs) }}
+
+  nightly-alert:
+    # Une nuit rouge ne doit pas passer inaperçue : ouvre (ou commente) une issue `nightly-red`.
+    needs: ci-ok
+    if: always() && github.event_name == 'schedule' && needs.ci-ok.result != 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    timeout-minutes: 5
+    steps:
+      - run: |
+          gh label create nightly-red --repo "$REPO" --color B60205 --description "Exécution nocturne en échec" 2>/dev/null || true
+          existing="$(gh issue list --repo "$REPO" --label nightly-red --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "Nouvelle exécution nocturne en échec : $RUN_URL"
+          else
+            gh issue create --repo "$REPO" --label nightly-red --title "CI nocturne en échec" --body "L'exécution nocturne a échoué : $RUN_URL"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
