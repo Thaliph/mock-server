@@ -71,7 +71,7 @@ fn shr_12_unknown_scheme_gets_the_same_explicit_message() {
 #[test]
 fn shr_12_refusal_does_not_depend_on_allow_insecure() {
     let yaml = "share:\n  url: s3://bucket\n  allow_insecure: true\n";
-    let err = load(yaml).err().expect("s3:// accepté avec allow_insecure");
+    let err = load(yaml).expect_err("s3:// accepté avec allow_insecure");
     assert_explicit_refusal("s3://bucket", &err);
 }
 
