@@ -102,6 +102,9 @@ impl Captured {
     }
 }
 
+/// Fenêtre zstd la plus grande acceptée au décodage : 2^23 octets.
+const ZSTD_WINDOW_LOG_MAX: u32 = 23;
+
 /// Décode un body compressé, borné à `limit` octets décodés.
 pub(crate) fn decode(encoding: &str, data: &[u8], limit: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
@@ -115,8 +118,12 @@ pub(crate) fn decode(encoding: &str, data: &[u8], limit: usize) -> Option<Vec<u8
         "br" => brotli::Decompressor::new(data, 4096)
             .take(limit as u64 + 1)
             .read_to_end(&mut out),
-        "zstd" => zstd::stream::read::Decoder::new(data)
-            .and_then(|d| d.take(limit as u64 + 1).read_to_end(&mut out)),
+        "zstd" => zstd::stream::read::Decoder::new(data).and_then(|mut d| {
+            // Fenêtre bornée à 8 Mio, plafond de zstd en HTTP (RFC 9659) : sans elle, une
+            // trame de 13 octets annonçant 128 Mio les fait allouer.
+            d.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
+            d.take(limit as u64 + 1).read_to_end(&mut out)
+        }),
         _ => return None,
     };
     (read.is_ok() && out.len() <= limit).then_some(out)
@@ -369,5 +376,18 @@ mod tests {
             c.into_body(true, 100, Some("gzip")),
             Body::captured("hello")
         );
+    }
+
+    // Entrée trouvée par la cible `capture_decode` de `fuzz/` : 13 octets faisaient allouer
+    // 128 Mio au décodeur zstd.
+    #[test]
+    fn zstd_window_beyond_8_mib_is_refused() {
+        // Trame vide annonçant une fenêtre de 2^27 octets, puis de 2^23.
+        let frame = |window: u8| [0x28, 0xb5, 0x2f, 0xfd, 0x00, window, 0x01, 0x00, 0x00];
+        assert_eq!(decode("zstd", &frame(0x88), 1024), None);
+        assert_eq!(decode("zstd", &frame(0x68), 1024), Some(vec![]));
+        let data = vec![7u8; 100_000];
+        let z = encode("zstd", &data).unwrap();
+        assert_eq!(decode("zstd", &z, data.len()), Some(data));
     }
 }

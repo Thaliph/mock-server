@@ -1,0 +1,4 @@
+c
+8080 -j ACCEPT
+0.0.0.0/0 -j ACCEPT
+1 -j ACCEPT

@@ -22,6 +22,16 @@ pub mod watch;
 mod probe;
 pub use probe::{probe, probe_addr};
 
+/// Parseurs internes ouverts aux cibles de `fuzz/`, compilées avec `--cfg fuzzing` : absents
+/// de toute autre compilation, l'API publique du crate n'en change pas.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    /// Voir `capture::decode`.
+    pub fn decode(encoding: &str, data: &[u8], limit: usize) -> Option<Vec<u8>> {
+        crate::capture::decode(encoding, data, limit)
+    }
+}
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;

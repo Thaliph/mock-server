@@ -287,12 +287,22 @@ pub fn parse_sni(data: &[u8]) -> Option<String> {
             let n = list.u16()? as usize;
             let name = list.take(n)?;
             if name_type == 0 {
-                return std::str::from_utf8(name).ok().map(str::to_ascii_lowercase);
+                return host_name(name).map(str::to_ascii_lowercase);
             }
         }
         return None;
     }
     None
+}
+
+/// Nom d'hôte DNS (lettres, chiffres, `-`, `_`, `.`) de 1 à 255 octets : le SNI devient
+/// l'authority `hôte:port` de la requête déchiffrée, il ne peut porter ni `/`, ni `@`, ni `\0`.
+fn host_name(name: &[u8]) -> Option<&str> {
+    let valid = (1..=255).contains(&name.len())
+        && name
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    valid.then(|| std::str::from_utf8(name).ok()).flatten()
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -341,6 +351,56 @@ mod tests {
         // Préfixe incomplet : pas de conclusion hâtive.
         assert_eq!(parse_sni(&hello[..20]), None);
         assert_eq!(parse_sni(b"GET / HTTP/1.1"), None);
+    }
+
+    /// ClientHello minimal dont l'extension SNI porte `name` tel quel.
+    fn raw_hello(name: &[u8]) -> Vec<u8> {
+        let u16b = |n: usize| (n as u16).to_be_bytes();
+        let mut list = vec![0u8];
+        list.extend(u16b(name.len()));
+        list.extend(name);
+        let mut ext = u16b(list.len()).to_vec();
+        ext.extend(&list);
+        let mut exts = vec![0, 0];
+        exts.extend(u16b(ext.len()));
+        exts.extend(&ext);
+        let mut body = vec![0x03, 0x03];
+        body.extend([0x42; 32]);
+        body.extend([0, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        body.extend(u16b(exts.len()));
+        body.extend(&exts);
+        let mut hs = vec![0x01];
+        hs.extend(&(body.len() as u32).to_be_bytes()[1..]);
+        hs.extend(&body);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend(u16b(hs.len()));
+        record.extend(&hs);
+        record
+    }
+
+    // Entrées trouvées par la cible `tls_sni` de `fuzz/` : le SNI devient l'authority de la
+    // requête déchiffrée.
+    #[test]
+    fn sni_that_is_not_a_host_name_is_ignored() {
+        assert_eq!(
+            parse_sni(&raw_hello(b"API.example.com")).as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            parse_sni(&raw_hello(&[b'a'; 255])).map(|n| n.len()),
+            Some(255)
+        );
+        for name in [
+            &b""[..],
+            b"api.example.com/admin",
+            b"api.example.com\0.evil",
+            b"user@api.example.com",
+            b"api.example.com:8443",
+            "b\u{fc}cher.example".as_bytes(),
+            &[b'a'; 256],
+        ] {
+            assert_eq!(parse_sni(&raw_hello(name)), None, "{name:?}");
+        }
     }
 
     #[test]

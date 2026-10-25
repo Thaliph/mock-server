@@ -1,0 +1,99 @@
+[package]
+name = "mimic-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+http = "1.5.0"
+k8s-openapi = { version = "0.28.0", features = ["v1_32"] }
+serde_json = "1"
+serde_yaml = "0.9.34"
+mimic-core = { path = "../crates/mimic-core" }
+mimic-proxy = { path = "../crates/mimic-proxy" }
+mimic-injector = { path = "../crates/mimic-injector" }
+mimic-init = { path = "../crates/mimic-init" }
+mimic-cni = { path = "../crates/mimic-cni" }
+
+# Générateur des corpus de départ (`cargo run --example seeds`).
+[dev-dependencies]
+brotli = "9.0.0"
+flate2 = "1.1.10"
+zstd = "0.14.3"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+
+# Projet à part : hors de l'espace de travail racine.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "net_classify"
+path = "fuzz_targets/net_classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_sni"
+path = "fuzz_targets/tls_sni.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_json"
+path = "fuzz_targets/redact_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_form"
+path = "fuzz_targets/redact_form.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capture_decode"
+path = "fuzz_targets/capture_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inject_annotations"
+path = "fuzz_targets/inject_annotations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cni_settings"
+path = "fuzz_targets/cni_settings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segments"
+path = "fuzz_targets/segments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mock_form"
+path = "fuzz_targets/mock_form.rs"
+test = false
+doc = false
+bench = false
