@@ -7,7 +7,7 @@ model: opus
 
 You are a developer on mimic, a Kubernetes sidecar that records a pod's HTTP traffic and
 mocks its dependencies (Rust workspace, `crates/`; spec `docs/SPEC.md` is authoritative). You
-start without context: read the issue (`gh issue view <n> --comments`), the spec criteria it
+start without context: read the issue (`gh issue view <n>` for the body, then `gh issue view <n> --comments` for the comments), the spec criteria it
 names, and the red tests on your branch.
 
 ## Steps

@@ -138,9 +138,12 @@ de `/api/status`, sous la forme `<méthode> <chemin>: <code> <motif> <body>`.
 
 ## Contrôleur
 
+Chaque message du contrôleur, avec sa cause, son effet sur l'application et sa correction, est dans le [runbook du contrôleur](../runbook/controller.md) (en anglais). Ci-dessous, les cas les plus fréquents.
+
 | Symptôme | Message | Cause | Correction |
 |----------|---------|-------|------------|
-| sort en code 2 | `configuration … invalide: …`, `store non supporté: …`, `auth kubernetes exige tls : les sidecars n'acceptent le contrôleur qu'en HTTPS`, `leader_election exige auth kubernetes (bail Kubernetes)`, `leader_election : lease et namespace requis`, `… doit être positif` | ConfigMap `mimic-controller` | corriger, `rollout restart` |
+| sort en code 2 | `configuration … invalide: …`, `store non supporté: …`, `auth kubernetes exige tls : les sidecars n'acceptent le contrôleur qu'en HTTPS`, `leader_election : lease et namespace requis`, `… doit être positif` | ConfigMap `mimic-controller` | corriger, `rollout restart` |
+| sort en code 1 au démarrage | `client Kubernetes: …`, `leader_election exige auth kubernetes (bail Kubernetes)`, `aggregated exige auth kubernetes`, `certificat …`, `écoute sur …`, `répertoire …` | erreur de `start()` (et non de la configuration lue : code 1, pas 2) : ServiceAccount, `auth: static` en cluster, Secret TLS, port, PVC | voir le [runbook du contrôleur](../runbook/controller.md#1-startup-and-configuration) |
 | sort en code 1 en marche | `bail non renouvelé à temps : la réplique cesse de servir`, `bail tenu par une autre réplique : la réplique cesse de servir` | API server lente, réseau, horloge | normal si isolé : la passive a pris le relais ; récurrent : API server |
 | répétition de `renouvellement du bail` / `lecture du bail` | | droits sur `leases/mimic-controller`, API server | RBAC (Role `mimic-controller` dans `mimic-system`) |
 | prise de relais lente | `prise de relais` (liste des namespaces en échec, retentée), `liste initiale des MimicWorkload non reçue : l'état persisté sert` | API server, droits `namespaces` / `mimicworkloads` | `mimic_controller_takeover_seconds` |

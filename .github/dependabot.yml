@@ -4,6 +4,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
     groups:
       cargo:
         patterns: ["*"]
@@ -11,9 +12,11 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
     groups:
       actions:
         patterns: ["*"]
   - package-ecosystem: docker
     directory: /
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
