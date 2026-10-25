@@ -15,6 +15,10 @@ const SHIPPED_INIT_IMAGE: &str = "ghcr.io/thaliph/mimic-init:0.1.0";
 /// Ligne commentée de la configuration du webhook que `--cni` active.
 const SHIPPED_CNI_OFF: &str = "\n    # cni: true\n";
 const CNI_ON: &str = "\n    cni: true\n";
+/// Début de la spec du PVC du contrôleur (`shared` et `rwo`), où `--storage-class` s'insère.
+const SHIPPED_PVC_SPEC: &str = "kind: PersistentVolumeClaim\nmetadata:\n  name: mimic-controller\n  namespace: mimic-system\nspec:\n";
+/// Store fictif du modèle `s3`, remplacé par `--s3-url` (avec la consigne qui l'accompagne).
+const SHIPPED_S3_STORE: &str = "store: s3://mimic-controller/   # à adapter : bucket et préfixe ; ";
 
 const DEFAULT_REPOSITORY: &str = "ghcr.io/thaliph/";
 
@@ -22,9 +26,10 @@ const DEFAULT_REPOSITORY: &str = "ghcr.io/thaliph/";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Storage {
     /// PVC `ReadWriteMany` (`deploy/controller`).
-    #[default]
     Shared,
-    /// PVC `ReadWriteOnce`, répliques sur le nœud du volume (`deploy/controller-rwo`).
+    /// PVC `ReadWriteOnce`, répliques sur le nœud du volume (`deploy/controller-rwo`) : le
+    /// défaut, qui fonctionne sur tout cluster doté d'une StorageClass par défaut.
+    #[default]
     Rwo,
     /// Store `s3://`, sans PVC (`deploy/controller-s3`).
     S3,
@@ -37,7 +42,7 @@ impl Storage {
             "rwo" => Ok(Self::Rwo),
             "s3" => Ok(Self::S3),
             other => Err(format!(
-                "stockage inconnu « {other} » : shared, rwo ou s3 attendu"
+                "stockage inconnu « {other} » : rwo, shared ou s3 attendu"
             )),
         }
     }
@@ -55,6 +60,10 @@ impl Storage {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InstallOptions {
     pub storage: Storage,
+    /// `storageClassName` du PVC (`shared` et `rwo`) ; sans elle, la StorageClass par défaut.
+    pub storage_class: Option<String>,
+    /// `s3://<bucket>/<préfixe>/`, obligatoire avec `Storage::S3`.
+    pub s3_url: Option<String>,
     /// `<registre>/mimic:<tag>` ; par défaut `ghcr.io/thaliph/mimic:<version de mimicctl>`.
     pub image: Option<String>,
     /// Ajoute le DaemonSet `mimic-cni` et `cni: true` dans la configuration du webhook.
@@ -96,6 +105,47 @@ fn images(image: &str) -> Result<(String, String), String> {
     Ok((image.to_owned(), format!("{prefix}mimic-init:{tag}")))
 }
 
+/// `--storage-class` : un nom DNS (minuscules, chiffres, `-` et `.`, alphanumérique aux
+/// deux bouts).
+fn storage_class(class: &str) -> Result<&str, String> {
+    let ok = !class.is_empty()
+        && class.len() <= 253
+        && class
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.'))
+        && class.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && class.ends_with(|c: char| c.is_ascii_alphanumeric());
+    if ok {
+        Ok(class)
+    } else {
+        Err(format!(
+            "--storage-class « {} » refusée : nom DNS attendu (minuscules, chiffres, - et .)",
+            class.escape_debug()
+        ))
+    }
+}
+
+/// `--s3-url` : schéma `s3://`, bucket non vide, ni espace ni caractère de contrôle (rien
+/// ne doit pouvoir s'injecter dans le YAML).
+fn s3_url(url: &str) -> Result<&str, String> {
+    let refuse = |why: &str| {
+        format!(
+            "--s3-url « {} » refusée : {why} (s3://<bucket>/<préfixe>/)",
+            url.escape_debug()
+        )
+    };
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(refuse("espace ou caractère de contrôle"));
+    }
+    let Some(rest) = url.strip_prefix("s3://") else {
+        return Err(refuse("schéma s3:// attendu"));
+    };
+    if rest.split('/').next().is_none_or(str::is_empty) {
+        return Err(refuse("bucket absent"));
+    }
+    Ok(url)
+}
+
 /// Manifests à appliquer, dans l'ordre : le socle de la variante, le webhook, puis le plugin
 /// CNI et le garde-fou production s'ils sont demandés ; documents séparés par `---`.
 pub fn manifests(options: &InstallOptions) -> Result<String, String> {
@@ -109,11 +159,41 @@ pub fn manifests(options: &InstallOptions) -> Result<String, String> {
             )
         }
     };
+    let mut controller = options.storage.controller().to_owned();
+    match (options.storage, &options.storage_class, &options.s3_url) {
+        (Storage::S3, Some(_), _) => {
+            return Err("--storage-class refusée avec --storage s3, qui n'a pas de PVC".into());
+        }
+        (Storage::S3, None, None) => {
+            return Err("--storage s3 exige --s3-url s3://<bucket>/<préfixe>/".into());
+        }
+        (Storage::S3, None, Some(url)) => {
+            controller = controller.replacen(
+                SHIPPED_S3_STORE,
+                &format!("store: {}   # ", s3_url(url)?),
+                1,
+            );
+        }
+        (_, _, Some(_)) => {
+            return Err("--s3-url refusée sans --storage s3".into());
+        }
+        (_, Some(class), None) => {
+            controller = controller.replacen(
+                SHIPPED_PVC_SPEC,
+                &format!(
+                    "{SHIPPED_PVC_SPEC}  storageClassName: {}\n",
+                    storage_class(class)?
+                ),
+                1,
+            );
+        }
+        (_, None, None) => {}
+    }
     let mut injector = INJECTOR.to_owned();
     if options.cni {
         injector = injector.replacen(SHIPPED_CNI_OFF, CNI_ON, 1);
     }
-    let mut parts = vec![options.storage.controller(), &injector];
+    let mut parts = vec![controller.as_str(), &injector];
     if options.cni {
         parts.push(CNI);
     }
@@ -153,5 +233,10 @@ mod tests {
         }
         assert!(INJECTOR.contains(SHIPPED_INIT_IMAGE));
         assert_eq!(INJECTOR.matches(SHIPPED_CNI_OFF).count(), 1);
+        for m in [CONTROLLER_SHARED, CONTROLLER_RWO] {
+            assert_eq!(m.matches(SHIPPED_PVC_SPEC).count(), 1);
+        }
+        assert_eq!(CONTROLLER_S3.matches(SHIPPED_S3_STORE).count(), 1);
+        assert!(!CONTROLLER_S3.contains("PersistentVolumeClaim"));
     }
 }
