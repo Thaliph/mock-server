@@ -37,12 +37,45 @@ misconfigurations:
     paths: ["deploy/example/deployment.yaml"]
     statement: "Les registres ghcr.io et registry.example.com sont ceux du projet et un exemple ; pas de politique de registres de confiance dans ce dépôt."
     expired_at: 2027-04-30
-  # tests/e2e/websocket.yaml : fixture de test e2e, jamais déployée.
+  # tests/e2e/*.yaml : fixtures de test e2e (démo OpenTelemetry, clients curl), jetables
+  # sur des clusters kind, jamais déployées ailleurs.
   - id: KSV-0125
-    paths: ["tests/e2e/websocket.yaml"]
+    paths: ["tests/e2e/*.yaml"]
     statement: "Fixture e2e basée sur l'image publique de la démo OpenTelemetry (épinglée par version), jamais déployée hors des clusters kind de test."
     expired_at: 2027-04-30
   - id: DS-0026
     paths: ["Dockerfile"]
     statement: "Pas de HEALTHCHECK : images distroless sans shell ni curl, lancées par Kubernetes qui utilise les sondes /healthz et /readyz (deploy/)."
+    expired_at: 2027-04-30
+  - id: KSV-0119
+    paths: ["deploy/example/deployment.yaml"]
+    statement: "NET_RAW est nécessaire à mimic-init avec NET_ADMIN (deploy/README.md) ; toutes les autres capacités sont retirées."
+    expired_at: 2027-04-30
+  - id: KSV-0014
+    paths: ["deploy/cni/mimic-cni.yaml"]
+    statement: "L'installeur CNI écrit dans /opt/cni/bin et /etc/cni/net.d de l'hôte (hostPath), propriétés de root ; il ne le fait pas sans écriture ni privilèges."
+    expired_at: 2027-04-30
+  - id: KSV-0017
+    paths: ["deploy/cni/mimic-cni.yaml"]
+    statement: "L'installeur CNI doit être privilégié et root pour copier le plugin sur le nœud (spec §4.2) ; DaemonSet limité à mimic-system."
+    expired_at: 2027-04-30
+  - id: KSV-0118
+    paths: ["deploy/cni/mimic-cni.yaml"]
+    statement: "Contexte de sécurité par défaut au niveau du pod : le conteneur d'installation déclare son propre securityContext (root, privilégié, voulu)."
+    expired_at: 2027-04-30
+  - id: KSV-0014
+    paths: ["deploy/example/deployment-injected.yaml"]
+    statement: "Conteneur app d'exemple : gabarit d'application à durcir par l'équipe qui l'adopte ; les conteneurs injectés par le webhook sont durcis."
+    expired_at: 2027-04-30
+  - id: KSV-0118
+    paths: ["deploy/example/deployment-injected.yaml"]
+    statement: "Conteneur app d'exemple : gabarit d'application à durcir par l'équipe qui l'adopte ; les conteneurs injectés par le webhook sont durcis."
+    expired_at: 2027-04-30
+  - id: KSV-0014
+    paths: ["tests/e2e/*.yaml"]
+    statement: "Fixture e2e jetable (démo OpenTelemetry, clients curl) sur cluster kind de test, jamais déployée ailleurs ; les durcir casserait les images tierces."
+    expired_at: 2027-04-30
+  - id: KSV-0118
+    paths: ["tests/e2e/*.yaml"]
+    statement: "Fixture e2e jetable (démo OpenTelemetry, clients curl) sur cluster kind de test, jamais déployée ailleurs ; les durcir casserait les images tierces."
     expired_at: 2027-04-30

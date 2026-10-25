@@ -110,7 +110,7 @@ jobs:
       # Premier passage : SARIF vers l'onglet Security (ne fait jamais échouer le job).
       - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
       # Second passage, bloquant : tout nouveau constat non ignoré fait échouer le job.
-      # Les ignores sont des commentaires `# zizmor: ignore[règle] raison, revue AAAA-MM-JJ`
+      # Les ignores sont des commentaires `zizmor: ignore` suivis de la raison et d'une date de revue AAAA-MM-JJ
       # (vérifiés par le job `ignores`).
       - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
         with:
