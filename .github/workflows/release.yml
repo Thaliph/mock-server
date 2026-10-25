@@ -62,11 +62,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ matrix.target }}
-          # Lecture seule : un artefact publié ne doit pas dépendre d'un cache écrit par une PR.
-          save-if: false
+      # Pas de rust-cache ici : les binaires publiés sont compilés à froid (zizmor
+      # cache-poisoning). Le build des images utilise en revanche le cache GHA (cache-from) :
+      # ses entrées viennent de main et des tags, écrits par des refs de confiance, et les
+      # caches de PR restent propres à leur PR.
       - if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       # Windows : NASM sert à l'assembleur d'aws-lc (TLS du client Kubernetes).
