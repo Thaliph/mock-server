@@ -213,4 +213,32 @@ fn inj_19_manual_example_marks_the_controller_ca_optional() {
         "RuntimeDefault"
     );
     assert!(init["resources"]["limits"]["memory"].is_string());
+
+    // Garde : Trivy ignore KSV-0014, KSV-0012, KSV-0022 et KSV-0119 pour tout ce fichier ;
+    // seul mimic-init a le droit d'être en écriture, root et avec des capacités.
+    let pod = &doc["spec"]["template"]["spec"];
+    let inits = pod["initContainers"].as_sequence().unwrap();
+    assert_eq!(
+        inits.len(),
+        2,
+        "mimic-init puis le sidecar mimic : {inits:?}"
+    );
+    let sidecar = inits
+        .iter()
+        .find(|c| c["name"] == "mimic")
+        .expect("sidecar mimic (native sidecar)");
+    let sc = &sidecar["securityContext"];
+    assert_eq!(sc["runAsNonRoot"], true);
+    assert_eq!(sc["readOnlyRootFilesystem"], true);
+    assert_eq!(sc["allowPrivilegeEscalation"], false);
+    assert_eq!(sc["capabilities"]["drop"][0], "ALL");
+    assert!(
+        sc["capabilities"].get("add").is_none(),
+        "le sidecar n'ajoute aucune capacité"
+    );
+    assert!(sc.get("privileged").is_none() || sc["privileged"] == false);
+    assert!(
+        init["securityContext"]["capabilities"]["add"].is_sequence(),
+        "seul mimic-init ajoute des capacités"
+    );
 }

@@ -1,63 +1,128 @@
 #!/usr/bin/env bash
-# Vérifie que chaque ignore de sécurité porte une raison et une échéance non dépassée :
-#   - .trivyignore.yaml : `statement` et `expired_at` (AAAA-MM-JJ) par entrée ;
-#   - commentaires `# zizmor: ignore[...]` : une date AAAA-MM-JJ de revue dans la ligne ;
-#   - pas de zizmor.yml avec une liste `ignore` (non datable).
+# Vérifie que chaque ignore de sécurité porte une raison et une échéance maîtrisée :
+#   - .trivyignore.yaml, lu comme du vrai YAML : chaque entrée de chaque section
+#     (misconfigurations, vulnerabilities, secrets, licenses) exige `id`, `statement` non
+#     vide et `expired_at` (AAAA-MM-JJ) entre aujourd'hui et +12 mois ; toute forme illisible
+#     ou inconnue échoue ;
+#   - commentaires `# zizmor: ignore[règle]` : une raison puis une date de revue AAAA-MM-JJ
+#     (même fenêtre) ;
+#   - aucun fichier de configuration zizmor non vide (il pourrait désactiver un audit) ;
+#   - pas de .trivyignore texte (format sans raison ni date).
 # Trivy ignore déjà de lui-même une entrée échue (le constat réapparaît) ; ce script
 # donne en plus un message clair et refuse les entrées sans date.
+# Dépend de python3 et de PyYAML (présents sur ubuntu-latest).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-today=$(date -u +%F)
-fail=0
+exec python3 -I - "$(date -u +%F)" <<'PY'
+import datetime, glob, os, re, sys
 
-if [ -f .trivyignore.yaml ]; then
-  python3 -I - "$today" <<'PY' || fail=1
-import re, sys
-today = sys.argv[1]
-entries, cur = [], None
-for n, line in enumerate(open(".trivyignore.yaml"), 1):
-    if re.match(r"\s*#", line) or not line.strip():
-        continue
-    m = re.match(r"\s*- id:\s*(\S+)", line)
-    if m:
-        cur = {"id": m.group(1), "line": n}
-        entries.append(cur)
-    elif cur is not None:
-        m = re.match(r"\s*(statement|expired_at):\s*(.+?)\s*$", line)
-        if m:
-            cur[m.group(1)] = m.group(2).strip('"')
-bad = 0
-for e in entries:
-    where = f".trivyignore.yaml:{e['line']} ({e['id']})"
-    if not e.get("statement"):
-        print(f"{where}: raison (statement) manquante")
-        bad = 1
-    d = e.get("expired_at", "")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
-        print(f"{where}: échéance (expired_at AAAA-MM-JJ) manquante")
-        bad = 1
-    elif d < today:
-        print(f"{where}: échue le {d}, à revoir ou retirer")
-        bad = 1
-sys.exit(bad)
+import yaml
+
+today = datetime.date.fromisoformat(sys.argv[1])
+limit = today + datetime.timedelta(days=366)
+bad = False
+
+
+def fail(where, msg):
+    global bad
+    print(f"{where}: {msg}")
+    bad = True
+
+
+def check_date(where, value):
+    """Valide une date de revue ; `value` est une date YAML ou une chaîne."""
+    if isinstance(value, datetime.datetime):
+        value = None
+    if isinstance(value, datetime.date):
+        d = value
+    elif isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        try:
+            d = datetime.date.fromisoformat(value)
+        except ValueError:
+            return fail(where, f"date invalide {value!r}")
+    else:
+        return fail(where, "échéance (AAAA-MM-JJ) manquante ou illisible")
+    if d < today:
+        fail(where, f"échue le {d}, à revoir ou retirer")
+    elif d > limit:
+        fail(where, f"échéance {d} trop lointaine (12 mois au plus)")
+
+
+# 1. Trivy : .trivyignore.yaml.
+for legacy in (".trivyignore", ".trivyignore.yml"):
+    if os.path.exists(legacy):
+        fail(legacy, "sans raison ni date, utiliser .trivyignore.yaml")
+if os.path.exists(".trivyignore.yaml"):
+    f = ".trivyignore.yaml"
+    doc = {}
+    try:
+        doc = yaml.safe_load(open(f, encoding="utf-8"))
+    except yaml.YAMLError as e:
+        fail(f, f"YAML illisible : {e}")
+    if not isinstance(doc, dict):
+        if doc is not None:
+            fail(f, "doit être une table de sections")
+        doc = {}
+    sections = {"misconfigurations", "vulnerabilities", "secrets", "licenses"}
+    for name, entries in doc.items():
+        if name not in sections:
+            fail(f, f"section inconnue {name!r}")
+            continue
+        if not isinstance(entries, list):
+            fail(f"{f} [{name}]", "doit être une liste")
+            continue
+        for i, e in enumerate(entries, 1):
+            where = f"{f} [{name}] entrée {i}"
+            if not isinstance(e, dict):
+                fail(where, "entrée illisible")
+                continue
+            where += f" ({e.get('id')})"
+            if not isinstance(e.get("id"), str) or not e["id"].strip():
+                fail(where, "id manquant")
+            st = e.get("statement")
+            if not isinstance(st, str) or not st.strip():
+                fail(where, "raison (statement) manquante")
+            check_date(where, e.get("expired_at"))
+
+# 2. zizmor : configuration (interdite si non vide) et ignores inline.
+seen = set()
+for pat in ("zizmor.y*ml", ".github/zizmor.y*ml", ".github/**/zizmor.y*ml"):
+    for f in sorted(set(glob.glob(pat, recursive=True)) - seen):
+        seen.add(f)
+        try:
+            content = yaml.safe_load(open(f, encoding="utf-8"))
+        except yaml.YAMLError:
+            content = "illisible"
+        if content not in (None, {}):
+            fail(f, "configuration zizmor non vide interdite (désactiver un audit contourne le contrôle) ; utiliser des ignores inline")
+
+inline = re.compile(r"#\s*zizmor:\s*ignore(.*)$")
+for root, _, files in os.walk(".github"):
+    for name in files:
+        path = os.path.join(root, name)
+        try:
+            lines = open(path, encoding="utf-8").read().splitlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for n, line in enumerate(lines, 1):
+            m = inline.search(line)
+            if not m:
+                continue
+            where = f"{path}:{n}"
+            rule = re.match(r"\[[^\]]+\](.*)$", m.group(1))
+            if not rule:
+                fail(where, "ignore zizmor sans règle entre crochets")
+                continue
+            tail = rule.group(1)
+            dates = re.findall(r"\d{4}-\d{2}-\d{2}", tail)
+            if not dates:
+                fail(where, "ignore zizmor sans date de revue (AAAA-MM-JJ)")
+                continue
+            check_date(where, dates[-1])
+            reason = re.sub(r"\d{4}-\d{2}-\d{2}", "", tail)
+            reason = re.sub(r"à revoir avant|revue|review|before|until", "", reason, flags=re.I)
+            if len(re.sub(r"[\W_]+", "", reason)) < 10:
+                fail(where, "ignore zizmor sans raison (texte avant la date)")
+
+sys.exit(1 if bad else 0)
 PY
-fi
-
-while IFS= read -r hit; do
-  date=$(printf '%s' "$hit" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | tail -n1 || true)
-  if [ -z "$date" ]; then
-    echo "${hit%%:*}: ignore zizmor sans date de revue (AAAA-MM-JJ)"
-    fail=1
-  elif [[ "$date" < "$today" ]]; then
-    echo "${hit%%:*}: ignore zizmor échu le $date"
-    fail=1
-  fi
-done < <(grep -rnE '#\s*zizmor:\s*ignore' .github || true)
-
-for f in zizmor.yml zizmor.yaml .github/zizmor.yml .github/zizmor.yaml; do
-  if [ -f "$f" ] && grep -qE '^\s*ignore:' "$f"; then
-    echo "$f: liste ignore non datable, utiliser des commentaires inline datés"
-    fail=1
-  fi
-done
-exit "$fail"

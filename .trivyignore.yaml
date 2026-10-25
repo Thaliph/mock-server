@@ -1,6 +1,12 @@
 # Constats Trivy (config) acceptés. Chaque entrée porte une raison (`statement`) et une
 # échéance (`expired_at`) : passé cette date, Trivy ne l'ignore plus et le job échoue, ce
-# qui force une revue. scripts/check-ignores.sh exige les deux champs.
+# qui force une revue. scripts/check-ignores.sh exige les deux champs (échéance à 12 mois au
+# plus). Les échéances sont étalées pour ne pas casser toute la CI le même jour.
+#
+# Limite : un ignore vaut pour tout le fichier visé (Trivy n'applique pas d'ignore en ligne
+# dans le YAML Kubernetes). Les tests Rust gardent donc les deux fichiers les plus sensibles :
+# CNI-03 (deploy/cni/mimic-cni.yaml : un seul conteneur, son securityContext exact) et
+# INJ-19 (deploy/example/deployment.yaml : sidecar mimic en lecture seule, sans capacité).
 misconfigurations:
   # deploy/example/deployment.yaml : exemple d'application. L'init container est le seul
   # à tourner en root avec NET_ADMIN/NET_RAW, car il écrit les règles iptables du pod (spec
@@ -8,15 +14,15 @@ misconfigurations:
   - id: KSV-0011
     paths: ["deploy/example/deployment.yaml"]
     statement: "mimic-init n'a pas de limite CPU : éphémère (init container), mémoire bornée, CPU demandé."
-    expired_at: 2027-04-30
+    expired_at: 2027-01-29
   - id: KSV-0012
     paths: ["deploy/example/deployment.yaml"]
     statement: "mimic-init doit tourner en root (uid 0) pour programmer iptables ; capacités limitées à NET_ADMIN et NET_RAW."
-    expired_at: 2027-04-30
+    expired_at: 2027-02-26
   - id: KSV-0014
     paths: ["deploy/example/deployment.yaml"]
     statement: "Système de fichiers racine en écriture pour mimic-init (iptables écrit /run/xtables.lock) ; le sidecar mimic est en lecture seule."
-    expired_at: 2027-04-30
+    expired_at: 2027-03-31
   - id: KSV-0020
     paths: ["deploy/example/deployment.yaml"]
     statement: "mimic-init tourne en uid 0, voulu (voir KSV-0012) ; l'application d'exemple (conteneur app) est un gabarit à adapter."
@@ -24,25 +30,25 @@ misconfigurations:
   - id: KSV-0021
     paths: ["deploy/example/deployment.yaml"]
     statement: "mimic-init tourne en gid 0, voulu (voir KSV-0012) ; l'application d'exemple (conteneur app) est un gabarit à adapter."
-    expired_at: 2027-04-30
+    expired_at: 2027-05-28
   - id: KSV-0022
     paths: ["deploy/example/deployment.yaml"]
     statement: "NET_RAW est nécessaire à mimic-init avec NET_ADMIN (deploy/README.md) ; toutes les autres capacités sont retirées."
-    expired_at: 2027-04-30
+    expired_at: 2027-06-30
   - id: KSV-0118
     paths: ["deploy/example/deployment.yaml"]
     statement: "Le conteneur app est un gabarit d'application à durcir par l'équipe qui l'adopte ; mimic et mimic-init ont leur securityContext explicite."
-    expired_at: 2027-04-30
+    expired_at: 2027-01-29
   - id: KSV-0125
     paths: ["deploy/example/deployment.yaml"]
     statement: "Les registres ghcr.io et registry.example.com sont ceux du projet et un exemple ; pas de politique de registres de confiance dans ce dépôt."
-    expired_at: 2027-04-30
+    expired_at: 2027-02-26
   # tests/e2e/*.yaml : fixtures de test e2e (démo OpenTelemetry, clients curl), jetables
   # sur des clusters kind, jamais déployées ailleurs.
   - id: KSV-0125
     paths: ["tests/e2e/*.yaml"]
     statement: "Fixture e2e basée sur l'image publique de la démo OpenTelemetry (épinglée par version), jamais déployée hors des clusters kind de test."
-    expired_at: 2027-04-30
+    expired_at: 2027-03-31
   - id: DS-0026
     paths: ["Dockerfile"]
     statement: "Pas de HEALTHCHECK : images distroless sans shell ni curl, lancées par Kubernetes qui utilise les sondes /healthz et /readyz (deploy/)."
@@ -50,27 +56,23 @@ misconfigurations:
   - id: KSV-0119
     paths: ["deploy/example/deployment.yaml"]
     statement: "NET_RAW est nécessaire à mimic-init avec NET_ADMIN (deploy/README.md) ; toutes les autres capacités sont retirées."
-    expired_at: 2027-04-30
-  - id: KSV-0014
-    paths: ["deploy/cni/mimic-cni.yaml"]
-    statement: "L'installeur CNI écrit dans /opt/cni/bin et /etc/cni/net.d de l'hôte (hostPath), propriétés de root ; il ne le fait pas sans écriture ni privilèges."
-    expired_at: 2027-04-30
+    expired_at: 2027-05-28
   - id: KSV-0017
     paths: ["deploy/cni/mimic-cni.yaml"]
-    statement: "L'installeur CNI doit être privilégié et root pour copier le plugin sur le nœud (spec §4.2) ; DaemonSet limité à mimic-system."
-    expired_at: 2027-04-30
+    statement: "L'installeur CNI doit être privilégié et root pour copier le plugin sur le nœud (spec §3.1b) ; DaemonSet limité à mimic-system."
+    expired_at: 2027-06-30
   - id: KSV-0118
     paths: ["deploy/cni/mimic-cni.yaml"]
     statement: "Contexte de sécurité par défaut au niveau du pod : le conteneur d'installation déclare son propre securityContext (root, privilégié, voulu)."
-    expired_at: 2027-04-30
+    expired_at: 2027-01-29
   - id: KSV-0014
     paths: ["deploy/example/deployment-injected.yaml"]
     statement: "Conteneur app d'exemple : gabarit d'application à durcir par l'équipe qui l'adopte ; les conteneurs injectés par le webhook sont durcis."
-    expired_at: 2027-04-30
+    expired_at: 2027-02-26
   - id: KSV-0118
     paths: ["deploy/example/deployment-injected.yaml"]
     statement: "Conteneur app d'exemple : gabarit d'application à durcir par l'équipe qui l'adopte ; les conteneurs injectés par le webhook sont durcis."
-    expired_at: 2027-04-30
+    expired_at: 2027-03-31
   - id: KSV-0014
     paths: ["tests/e2e/*.yaml"]
     statement: "Fixture e2e jetable (démo OpenTelemetry, clients curl) sur cluster kind de test, jamais déployée ailleurs ; les durcir casserait les images tierces."
@@ -78,4 +80,4 @@ misconfigurations:
   - id: KSV-0118
     paths: ["tests/e2e/*.yaml"]
     statement: "Fixture e2e jetable (démo OpenTelemetry, clients curl) sur cluster kind de test, jamais déployée ailleurs ; les durcir casserait les images tierces."
-    expired_at: 2027-04-30
+    expired_at: 2027-05-28
