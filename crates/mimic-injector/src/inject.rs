@@ -34,6 +34,12 @@ pub const ANNOTATION_LOG: &str = "mimic.platform.io/log";
 const STORE_SIZE_LIMIT: &str = "512Mi";
 const STORE_SIZE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 pub const LABEL_SIDECAR: &str = "mimic.platform.io/sidecar";
+/// Ports exclus de l'interception entrante du mesh, où l'injecteur ajoute le port admin
+/// (spec §3.3.4, INJ-26).
+pub const MESH_SKIP_INBOUND: &[&str] = &[
+    "config.linkerd.io/skip-inbound-ports",
+    "traffic.sidecar.istio.io/excludeInboundPorts",
+];
 
 /// Hors de l'UID et des ports des mesh (spec §3.3.1).
 pub const SIDECAR_UID: i64 = 1338;
@@ -645,6 +651,36 @@ fn trust_ca(c: &mut Container) {
         .push(mount("mimic-ca", CA_DIR, true));
 }
 
+/// Vrai si une entrée de la liste (port ou plage `a-b`, forme Linkerd) couvre le port admin.
+fn covers_admin(entry: &str) -> bool {
+    let port = ADMIN_PORT.to_string();
+    match entry.split_once('-') {
+        Some((a, b)) => match (a.trim().parse::<i32>(), b.trim().parse::<i32>()) {
+            (Ok(a), Ok(b)) => (a..=b).contains(&ADMIN_PORT),
+            _ => false,
+        },
+        None => entry == port,
+    }
+}
+
+/// Ajoute le port admin aux annotations d'exclusion entrante des mesh (spec §3.3.4,
+/// INJ-26) : valeurs existantes en tête, 15100 ajouté s'il manque, valeur laissée telle
+/// quelle s'il y est déjà.
+fn skip_admin_inbound(out: &mut Pod) {
+    let annotations = out.metadata.annotations.get_or_insert_with(BTreeMap::new);
+    for key in MESH_SKIP_INBOUND {
+        let mut entries = annotations
+            .get(*key)
+            .map(|v| split_list(v))
+            .unwrap_or_default();
+        if entries.iter().any(|e| covers_admin(e)) {
+            continue;
+        }
+        entries.push(ADMIN_PORT.to_string());
+        annotations.insert((*key).into(), entries.join(","));
+    }
+}
+
 /// Place `mimic` (`mimic-init` puis le sidecar) en tête des init containers, ou juste
 /// après le dernier conteneur du mesh (spec §9.4).
 fn place(mut inits: Vec<Container>, mimic: Vec<Container>) -> Vec<Container> {
@@ -657,13 +693,22 @@ fn place(mut inits: Vec<Container>, mimic: Vec<Container>) -> Vec<Container> {
 }
 
 /// Réinvocation (spec §9.4) : un pod injecté avant le webhook du mesh repasse derrière ses
-/// conteneurs, avec `MIMIC_MESH` et les sondes d'un pod du mesh.
+/// conteneurs, avec `MIMIC_MESH` et les sondes d'un pod du mesh ; un pod injecté par une
+/// version antérieure reçoit les annotations d'exclusion entrante qui lui manquent.
 fn adapt(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
-    let skipped = || Outcome::Unchanged;
+    let mut out = pod.clone();
+    skip_admin_inbound(&mut out);
+    let annotated = out.clone();
+    let skipped = || {
+        if annotated == *pod {
+            Outcome::Unchanged
+        } else {
+            Outcome::Injected(Box::new(annotated.clone()))
+        }
+    };
     if mesh_of(pod).is_none() {
         return skipped();
     }
-    let mut out = pod.clone();
     let spec = out.spec.get_or_insert_with(Default::default);
     let mut inits = spec.init_containers.take().unwrap_or_default();
     let take = |inits: &mut Vec<Container>, name: &str| {
@@ -769,6 +814,7 @@ pub fn mutate(pod: &Pod, cfg: &InjectorConfig) -> Outcome {
         .annotations
         .get_or_insert_with(BTreeMap::new)
         .insert(ANNOTATION_STATUS.into(), "injected".into());
+    skip_admin_inbound(&mut out);
     out.metadata
         .labels
         .get_or_insert_with(BTreeMap::new)

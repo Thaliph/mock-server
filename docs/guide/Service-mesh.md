@@ -107,6 +107,25 @@ dans le pod, les sondes du sidecar deviennent `exec` : `mimic-proxy --probe /rea
 l'API admin depuis le conteneur. En ambient, aucun conteneur du mesh n'est dans le pod et le
 kubelet est reconnu par ztunnel : les sondes restent HTTP.
 
+## Port admin hors du mesh
+
+Le webhook ajoute 15100 aux annotations d'exclusion entrante des deux mesh, sur tout pod
+injecté, avec ou sans mesh :
+
+- `config.linkerd.io/skip-inbound-ports` (Linkerd) ;
+- `traffic.sidecar.istio.io/excludeInboundPorts` (Istio sidecar).
+
+Les valeurs déjà posées restent en tête et 15100 est ajouté à la fin s'il manque
+(`"4190"` devient `"4190,15100"`) ; une valeur qui le contient déjà n'est pas modifiée. Un
+mesh qui relaierait vers l'application les connexions distantes depuis `127.0.0.1` les
+ferait sinon passer pour locales auprès de l'API admin (voir
+[Administration et API](Administration-et-API.md)).
+
+Limite d'ordre : le mesh lit l'annotation à sa propre injection. Si le webhook du mesh passe
+**avant** celui de mimic, la configuration de son proxy est déjà posée et l'annotation arrive
+trop tard : poser alors soi-même l'annotation dans le template du pod. Quand le mesh injecte
+après mimic, ou à la réinvocation, l'annotation est bien prise en compte.
+
 ## Effets et limites
 
 | Sujet | Comportement |
@@ -115,7 +134,7 @@ kubelet est reconnu par ztunnel : les sondes restent HTTP.
 | routage L7 du mesh | `VirtualService`, `HTTPRoute`, retries et timeouts s'appliquent à la requête relayée par mimic comme à celle de l'application ; en `mock`, ils ne s'appliquent pas (rien ne sort) |
 | waypoints ambient | hors du pod, sans effet sur mimic |
 | métriques | celles du mesh voient le trafic relayé ; en `mock`, le trafic sortant mocké disparaît des métriques du mesh |
-| collecte des métriques de mimic | le scraper doit joindre 15100 à travers le mesh : en mTLS strict, il doit être dans le mesh, ou le port exclu côté mesh (par exemple `traffic.sidecar.istio.io/excludeInboundPorts: "15100"` pour Istio sidecar) |
+| collecte des métriques de mimic | 15100 est hors de l'interception entrante du mesh (voir [Port admin hors du mesh](#port-admin-hors-du-mesh)) : le scraper joint le port directement, sans mTLS du mesh ; une `NetworkPolicy` du namespace reste le moyen d'en restreindre l'accès |
 | autres mesh (Consul, Kuma, Cilium) | non pris en charge ; `MIMIC_MESH=none` pose les règles classiques, sans garantie d'ordre avec les leurs |
 | IPv6 | le webhook ne pose pas `MIMIC_IPV6` : seul l'IPv4 est intercepté |
 

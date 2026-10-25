@@ -18,7 +18,9 @@ lecture seule du contrôleur, et l'API du contrôleur réservée aux sidecars. S
 > L'admin écoute sur `0.0.0.0:15100`, ce qu'exigent les sondes HTTP du kubelet et la collecte
 > des métriques ; les pages, l'API et les ordres (`PUT /mode`, `DELETE /store`,
 > `/share/sync`) ne répondent qu'à la boucle locale (spec §9.2, SEC-07). `127.0.0.6`, d'où
-> Istio en mode sidecar relaie les autres pods, est refusée. Le proxy de l'API Kubernetes
+> Istio en mode sidecar relaie les autres pods, est refusée ; le webhook exclut de plus 15100
+> de l'interception entrante d'Istio et de Linkerd ([Service mesh](Service-mesh.md#port-admin-hors-du-mesh)),
+> pour qu'aucun mesh ne relaie vers l'admin depuis `127.0.0.1`. Le proxy de l'API Kubernetes
 > (`kubectl get --raw …/proxy/…`) n'atteint donc que les sondes et `/metrics`.
 
 ## Admin du sidecar

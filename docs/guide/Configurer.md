@@ -153,7 +153,10 @@ le **template** du pod (Deployment, StatefulSet…).
 
 Posées **par** le webhook : annotation `mimic.platform.io/status: injected` et label
 `mimic.platform.io/sidecar: "true"` (ce label ouvre l'accès à l'API du contrôleur par sa
-NetworkPolicy).
+NetworkPolicy). Il ajoute aussi 15100 à `config.linkerd.io/skip-inbound-ports` et à
+`traffic.sidecar.istio.io/excludeInboundPorts`, sans écraser les ports déjà listés, pour
+garder le port admin hors de l'interception entrante d'un mesh
+([Service mesh](Service-mesh.md#port-admin-hors-du-mesh)).
 
 `mimic.platform.io/mode` n'est lue que par un sidecar **sans** contrôleur dont la
 configuration renseigne `annotations_file` ; un sidecar piloté l'ignore.
