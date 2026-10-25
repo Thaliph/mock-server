@@ -1,5 +1,6 @@
-//! Critères SHR-* de la spec (§5.4) : partage entre les sidecars d'un même workload, en
-//! partage direct (stockage objet) et sous contrôleur (publication seule, SHR-10).
+//! Critères SHR-* de la spec (§5.4) : partage entre les sidecars d'un même workload, sous
+//! contrôleur (publication seule, SHR-10). Les tests du partage direct, que la validation
+//! refuse désormais (SHR-12), sont ignorés jusqu'au retrait du code (#149).
 
 mod common;
 
@@ -23,7 +24,7 @@ fn shared(
     c.share = Some(ShareConfig {
         url: url.into(),
         interval: Duration::from_millis(100),
-        retention: Duration::from_secs(3600),
+        retention: Some(Duration::from_secs(3600)),
         ..ShareConfig::default()
     });
     c
@@ -78,6 +79,7 @@ async fn status(p: &Running) -> Value {
 }
 
 #[tokio::test]
+#[ignore = "partage direct refusé à la validation (SHR-12) : test retiré avec le code par #149"]
 async fn shr_01_discovery_covers_all_replicas() {
     let dir = tempfile::tempdir().unwrap();
     let url = format!("file://{}", dir.path().display());
@@ -113,6 +115,7 @@ async fn shr_01_discovery_covers_all_replicas() {
 }
 
 #[tokio::test]
+#[ignore = "partage direct refusé à la validation (SHR-12) : test retiré avec le code par #149"]
 async fn shr_02_replica_mocks_with_recordings_of_another() {
     let dir = tempfile::tempdir().unwrap();
     let url = format!("file://{}", dir.path().display());
@@ -140,6 +143,7 @@ async fn shr_02_replica_mocks_with_recordings_of_another() {
 }
 
 #[tokio::test]
+#[ignore = "partage direct refusé à la validation (SHR-12) : test retiré avec le code par #149"]
 async fn shr_03_repeated_syncs_do_not_duplicate() {
     let dir = tempfile::tempdir().unwrap();
     let url = format!("file://{}", dir.path().display());
@@ -168,6 +172,7 @@ async fn shr_03_repeated_syncs_do_not_duplicate() {
 }
 
 #[tokio::test]
+#[ignore = "partage direct refusé à la validation (SHR-12) : test retiré avec le code par #149"]
 async fn shr_04_other_workloads_are_isolated() {
     let dir = tempfile::tempdir().unwrap();
     let url = format!("file://{}", dir.path().display());
@@ -186,11 +191,11 @@ async fn shr_04_other_workloads_are_isolated() {
 
 #[tokio::test]
 async fn shr_05_unavailable_share_does_not_affect_traffic() {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    // Un fichier ordinaire ne peut pas servir de répertoire : chaque synchronisation échoue.
-    let url = format!("file://{}/sub", file.path().display());
+    // Contrôleur qui refuse chaque publication : chaque synchronisation échoue.
+    let (ctl, fake) = fake_controller().await;
+    fake.lock().unwrap().refuse_posts = true;
     let app = fake_server().await;
-    let a = proxy(shared(Some(app.addr), Mode::Record, &url, "api-a", "api")).await;
+    let a = proxy(piloted_by(Some(app.addr), ctl)).await;
     for i in 0..3 {
         let r = client()
             .get(inbound(&a, &format!("/users/{i}")))
@@ -229,10 +234,10 @@ async fn shr_06_without_share_nothing_waits_for_publication() {
 
 #[tokio::test]
 async fn shr_07_unavailable_share_keeps_a_bounded_backlog() {
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let url = format!("file://{}/sub", file.path().display());
+    let (ctl, fake) = fake_controller().await;
+    fake.lock().unwrap().refuse_posts = true;
     let app = fake_server().await;
-    let mut cfg = shared(Some(app.addr), Mode::Record, &url, "api-a", "api");
+    let mut cfg = piloted_by(Some(app.addr), ctl);
     let max = 8 * 1024;
     cfg.share.as_mut().unwrap().max_backlog_bytes = max;
     let a = proxy(cfg).await;
@@ -394,6 +399,7 @@ fn peer_segment(dir: &std::path::Path, name: &str, id: &str, at_ms: i64) {
 }
 
 #[tokio::test]
+#[ignore = "partage direct refusé à la validation (SHR-12) : test retiré avec le code par #149"]
 async fn shr_08_listing_window_follows_the_newest_import() {
     let dir = tempfile::tempdir().unwrap();
     let url = format!("file://{}", dir.path().display());

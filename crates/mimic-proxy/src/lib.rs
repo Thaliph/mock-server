@@ -151,6 +151,13 @@ pub async fn start(mut config: Config) -> Result<Running, String> {
     };
     let (admin, t) = bind(state.config.admin.listen, Listener::Admin).await?;
     tasks.push(t);
+    // `share.retention` reste accepté sans effet : c'est le contrôleur qui purge (spec §5.4).
+    if let Some(retention) = state.config.share.as_ref().and_then(|s| s.retention) {
+        tracing::warn!(
+            retention_s = retention.as_secs(),
+            "share.retention ignoré : la rétention est celle du contrôleur"
+        );
+    }
     // Un sidecar piloté n'obéit qu'au contrôleur : l'annotation de mode est ignorée.
     let controller = match &state.config.share {
         Some(share) if share.is_controller() => {

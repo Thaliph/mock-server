@@ -435,15 +435,20 @@ pub struct TlsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShareConfig {
-    /// URL du contrôleur (`https://…`), ou support partagé sans contrôleur
-    /// (`file:///chemin`, `s3://bucket/prefixe`).
+    /// URL du contrôleur (`https://…`) ; `file://` et `s3://` sont refusés à la validation
+    /// (SHR-12).
     pub url: String,
     #[serde(default = "default_share_interval", with = "duration_secs")]
     pub interval: Duration,
-    /// Partage direct : âge au-delà duquel un segment de pair n'est plus importé (24 heures
-    /// par défaut). Sous contrôleur, rien n'est importé (spec §5.4).
-    #[serde(default = "default_share_retention", with = "duration_secs")]
-    pub retention: Duration,
+    /// Sans effet depuis la v0.37 de la spec (§5.4) : accepté pour les configurations
+    /// existantes, avec un WARN au démarrage ; la rétention est celle du contrôleur. Seul le
+    /// partage direct le lit, et la validation le rend inaccessible.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "duration_secs::option"
+    )]
+    pub retention: Option<Duration>,
     /// Période du battement vers le contrôleur.
     #[serde(default = "default_mode_poll", with = "duration_secs")]
     pub mode_poll: Duration,
@@ -496,7 +501,7 @@ impl Default for ShareConfig {
         Self {
             url: String::new(),
             interval: default_share_interval(),
-            retention: default_share_retention(),
+            retention: None,
             mode_poll: default_mode_poll(),
             ca_file: None,
             token_file: None,
@@ -513,6 +518,12 @@ impl ShareConfig {
     /// Partage par un contrôleur plutôt que par un support objet.
     pub fn is_controller(&self) -> bool {
         self.url.starts_with("https://") || self.url.starts_with("http://")
+    }
+
+    /// Âge au-delà duquel le partage direct n'importe plus un segment de pair (24 heures
+    /// par défaut).
+    pub fn retention(&self) -> Duration {
+        self.retention.unwrap_or_else(default_share_retention)
     }
 }
 
@@ -573,6 +584,22 @@ mod duration_secs {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         let secs = f64::deserialize(d)?;
         Duration::try_from_secs_f64(secs).map_err(serde::de::Error::custom)
+    }
+
+    /// Même format pour un champ facultatif.
+    pub mod option {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+            match d {
+                Some(d) => super::serialize(d, s),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+            super::deserialize(d).map(Some)
+        }
     }
 }
 
@@ -750,11 +777,16 @@ impl Config {
             if self.workload.name.is_empty() {
                 return Err("share exige un nom de workload (MIMIC_WORKLOAD)".into());
             }
-            let scheme_ok = ["file://", "s3://", "https://", "http://"]
-                .iter()
-                .any(|p| share.url.starts_with(p));
-            if !scheme_ok {
-                return Err(format!("share.url non supportée: {}", share.url));
+            // Seul le contrôleur reçoit des échanges (spec §5.4, SHR-12) : `s3://`, `file://`
+            // et tout autre schéma sont refusés, entourés d'espaces ou en majuscules compris.
+            if !share.is_controller() {
+                return Err(format!(
+                    "share.url {:?} refusée : un sidecar ne partage que par le contrôleur \
+                     (share.url: https://mimic-controller.mimic-system:8443, avec share.ca_file) ; \
+                     le partage par stockage objet (s3://, file://) a été retiré. Sans cluster, \
+                     servir un snapshot avec mimic-proxy --mock-from <fichier>",
+                    share.url
+                ));
             }
             if share.url.starts_with("http://") && !share.allow_insecure {
                 return Err(
@@ -796,9 +828,9 @@ mod tests {
     #[test]
     fn ctl_21_share_retention_defaults_to_24_hours() {
         let day = Duration::from_secs(24 * 3600);
-        assert_eq!(ShareConfig::default().retention, day);
+        assert_eq!(ShareConfig::default().retention(), day);
         let s: ShareConfig = serde_yaml::from_str("url: s3://bucket/p\n").unwrap();
-        assert_eq!(s.retention, day);
+        assert_eq!(s.retention(), day);
     }
 
     /// `mock.websocket` : `relay` par défaut, `refuse` accepté, valeur inconnue refusée au
