@@ -149,7 +149,7 @@ passive, qui ne touche pas au support.
 
 | Métrique | Type | Labels | Signification |
 |----------|------|--------|---------------|
-| `mimic_controller_leader` | jauge | | 1 sur la réplique active, 0 sur la passive |
+| `mimic_controller_leader` | jauge | | 1 sur la réplique active une fois la marque posée (le label `mimic.platform.io/leader` que sélectionne le Service), 0 sinon : sur la passive, et sur l'active tant que la marque n'est pas posée ; ce n'est pas « bail tenu » |
 | `mimic_controller_takeover_seconds` | jauge | | durée de la dernière prise de relais : rechargement de l'état persisté jusqu'à la pose du label |
 | `mimic_controller_segments_total` | compteur | `result` (`ok`, `duplicate`, `error`) | segments reçus ; `duplicate` : renvoi d'un segment déjà rangé (reprise après erreur réseau, normal) ; `error` : segment illisible ou identifiant invalide (`400`), ou support en échec (`503`, log `ingestion d'un segment`) ; les refus d'authentification n'y sont pas comptés |
 | `mimic_controller_auth_failures_total` | compteur | `reason` (`missing`, `invalid`, `forbidden`, `unavailable`) | appels de sidecars refusés : jeton absent, jeton invalide, jeton d'un autre pod ou workload, TokenReview ou lecture du pod impossible (`503`) |

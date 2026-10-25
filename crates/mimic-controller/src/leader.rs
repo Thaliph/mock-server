@@ -378,6 +378,9 @@ impl Election {
             tracing::warn!(error = %e, "marque de la réplique active");
             tokio::time::sleep(self.retry()).await;
         }
+        // Jauge à 1 seulement une fois la marque posée : sans elle, le Service n'a pas
+        // d'endpoint et l'alerte « aucune réplique active » doit sonner (CTL-52).
+        ctl.set_leader();
         ctl.metrics
             .takeover_seconds
             .set(started.elapsed().as_secs_f64());

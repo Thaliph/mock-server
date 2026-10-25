@@ -659,3 +659,73 @@ async fn ctl_33_store_errors_on_the_desired_state_are_retried() {
         c.kill();
     }
 }
+
+/// Réplique dont la pose de la marque d'active échoue tant que `fail_mark` est levé ;
+/// compte les tentatives.
+struct FlakyMark {
+    lease: Arc<MemoryLease>,
+    fail_mark: Arc<AtomicBool>,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl Coordination for FlakyMark {
+    fn get(&self) -> BoxFuture<'_, Result<Option<Lease>, String>> {
+        self.lease.get()
+    }
+
+    fn write(&self, record: Record, expected: Option<String>) -> BoxFuture<'_, Result<(), String>> {
+        self.lease.write(record, expected)
+    }
+
+    fn announce(&self, me: &str, active: bool) -> BoxFuture<'_, Result<(), String>> {
+        if active {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_mark.load(Ordering::SeqCst) {
+                return Box::pin(async { Err("marque refusée".to_string()) });
+            }
+        }
+        self.lease.announce(me, active)
+    }
+}
+
+/// CTL-52 : la jauge `mimic_controller_leader` ne passe à 1 qu'une fois la marque posée ;
+/// une pose en échec la laisse à 0 et est retentée jusqu'au succès.
+#[tokio::test]
+async fn ctl_52_leader_gauge_is_one_only_once_the_mark_is_placed() {
+    let dir = tempfile::tempdir().unwrap();
+    let lease = Arc::new(MemoryLease::default());
+    let fail_mark = Arc::new(AtomicBool::new(true));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let replica = Arc::new(FlakyMark {
+        lease: lease.clone(),
+        fail_mark: fail_mark.clone(),
+        attempts: attempts.clone(),
+    });
+    let a = start_elected(config(dir.path(), "ctl-a"), local(dir.path()), replica)
+        .await
+        .unwrap();
+
+    // La marque est refusée plusieurs fois : retentée, jamais abandonnée.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while attempts.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("la pose de la marque n'est pas retentée");
+    // La réplique sert déjà : seule la jauge attend la marque.
+    assert!(a.is_leader(), "marque refusée : la réplique sert déjà");
+    let m = metrics(&a).await;
+    assert_eq!(
+        metric(&m, "mimic_controller_leader"),
+        Some(0.0),
+        "marque non posée : la jauge reste à 0\n{m}"
+    );
+
+    // Support rétabli : la marque est posée, la jauge passe à 1.
+    fail_mark.store(false, Ordering::SeqCst);
+    leads_within(&a, Duration::from_secs(5)).await;
+    let m = metrics(&a).await;
+    assert_eq!(metric(&m, "mimic_controller_leader"), Some(1.0), "{m}");
+    a.shutdown().await;
+}

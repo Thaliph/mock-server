@@ -265,6 +265,7 @@ async fn launch(
             crate::kube::load_namespaces(&ctl, client).await?;
         }
         ctl.set_active(true);
+        ctl.set_leader();
     }
 
     let api_listener = TcpListener::bind(ctl.config.listen)
