@@ -1,0 +1,19 @@
+# Mises à jour des dépendances : crates, actions GitHub et images de base du Dockerfile.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /
+    schedule: {interval: weekly}
