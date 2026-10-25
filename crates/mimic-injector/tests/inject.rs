@@ -859,3 +859,123 @@ fn inj_25_inbound_interception_is_off_by_default() {
     let rules: serde_json::Value = serde_json::from_str(&rules).unwrap();
     assert_eq!(rules["MIMIC_INBOUND_PORTS"], "-");
 }
+
+const SKIP_LINKERD: &str = "config.linkerd.io/skip-inbound-ports";
+const SKIP_ISTIO: &str = "traffic.sidecar.istio.io/excludeInboundPorts";
+
+fn annotation(p: &Pod, key: &str) -> Option<String> {
+    p.metadata.annotations.as_ref()?.get(key).cloned()
+}
+
+fn annotated(mut p: Pod, key: &str, value: &str) -> Pod {
+    p.metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(key.into(), value.into());
+    p
+}
+
+#[test]
+fn inj_26_admin_port_is_added_to_the_mesh_skip_annotations() {
+    for (mesh, base) in [("linkerd", linkerd_pod()), ("istio", istio_pod())] {
+        let out = injected(&base);
+        for key in [SKIP_LINKERD, SKIP_ISTIO] {
+            assert_eq!(
+                annotation(&out, key).as_deref(),
+                Some("15100"),
+                "{mesh} {key}"
+            );
+        }
+    }
+}
+
+#[test]
+fn inj_26_existing_values_are_merged_in_order_without_duplicate() {
+    for key in [SKIP_LINKERD, SKIP_ISTIO] {
+        let cases = [
+            ("4190", "4190,15100"),
+            ("9000, 4190", "9000,4190,15100"),
+            ("4190,,", "4190,15100"),
+            ("15100,4190", "15100,4190"),
+            ("4190,15100", "4190,15100"),
+            ("15100", "15100"),
+        ];
+        for (before, after) in cases {
+            for base in [linkerd_pod(), istio_pod()] {
+                let out = injected(&annotated(base, key, before));
+                assert_eq!(
+                    annotation(&out, key).as_deref(),
+                    Some(after),
+                    "{key} {before:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn inj_26_other_annotations_and_the_other_mesh_key_are_untouched() {
+    let base = annotated(istio_pod(), "example.com/keep", "yes");
+    let base = annotated(base, SKIP_ISTIO, "9000");
+    let out = injected(&base);
+    assert_eq!(annotation(&out, "example.com/keep").as_deref(), Some("yes"));
+    assert_eq!(annotation(&out, SKIP_ISTIO).as_deref(), Some("9000,15100"));
+    // L'autre clé est créée à part, sans reprendre la valeur de la première.
+    assert_eq!(annotation(&out, SKIP_LINKERD).as_deref(), Some("15100"));
+}
+
+#[test]
+fn inj_26_pod_without_mesh_gets_the_annotations_too() {
+    // Le mesh peut injecter après Mimic : Istio lit l'annotation à son injection.
+    let out = injected(&pod(json!({})));
+    for key in [SKIP_LINKERD, SKIP_ISTIO] {
+        assert_eq!(annotation(&out, key).as_deref(), Some("15100"), "{key}");
+    }
+}
+
+#[test]
+fn inj_26_mutation_is_deterministic() {
+    let base = annotated(istio_pod(), SKIP_LINKERD, "4190");
+    let a = serde_json::to_value(injected(&base)).unwrap();
+    let b = serde_json::to_value(injected(&base)).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(
+        a["metadata"]["annotations"][SKIP_LINKERD], "4190,15100",
+        "valeur fusionnée"
+    );
+}
+
+#[test]
+fn inj_26_reinvocation_adds_the_missing_annotation_then_is_idempotent() {
+    let mut once = injected(&pod(json!({})));
+    // Pod injecté par une version antérieure : annotations absentes ou incomplètes.
+    let annotations = once.metadata.annotations.as_mut().unwrap();
+    annotations.remove(SKIP_LINKERD);
+    annotations.insert(SKIP_ISTIO.into(), "9000".into());
+    once.spec
+        .as_mut()
+        .unwrap()
+        .init_containers
+        .as_mut()
+        .unwrap()
+        .splice(0..0, [container("istio-init"), native("istio-proxy")]);
+
+    let adapted = injected(&once);
+    assert_eq!(
+        annotation(&adapted, SKIP_ISTIO).as_deref(),
+        Some("9000,15100")
+    );
+    assert_eq!(annotation(&adapted, SKIP_LINKERD).as_deref(), Some("15100"));
+    assert!(
+        matches!(mutate(&adapted, &config()), Outcome::Unchanged),
+        "plus aucun patch après la fusion"
+    );
+}
+
+#[test]
+fn inj_26_injected_pod_is_not_patched_again() {
+    for base in [linkerd_pod(), istio_pod(), pod(json!({}))] {
+        let out = injected(&base);
+        assert!(matches!(mutate(&out, &config()), Outcome::Unchanged));
+    }
+}
