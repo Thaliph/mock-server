@@ -12,8 +12,14 @@
 //! 3. un message d'erreur de démarrage ou de support : littéral de `Err("…".into())`,
 //!    `Err(format!("…"))`, `Err(IngestError::…(format!("…")))` ou de `.map_err(|e| format!("…"))`.
 //!
+//! 4. un message d'erreur de démarrage porté par `.ok_or("…")` / `.ok_or_else(|| "…".to_string())` ;
+//! 5. le texte d'un `message:` de `StatusCondition` (`Some(…)`, `Some(format!(…))`, `.then(|| …)`).
+//!
+//! Hors périmètre : les `info!` et `debug!` (journal de fonctionnement, pas de message à traiter).
+//!
 //! De chaque littéral, on garde le texte fixe : celui qui précède le premier `{…}` (placeholder
-//! de `format!`), ou, s'il est vide, le plus long segment fixe. Ce texte doit figurer dans une
+//! de `format!`), ou, s'il est vide, le plus long segment fixe, ou, si ce n'est qu'un mot isolé (`vide`), le littéral entier
+//! avec ses placeholders écrits `{}` (`{} vide`). Ce texte doit figurer dans une
 //! ligne de tableau de la page, qui donne au moins le message, la cause, l'effet et l'action.
 //! Les exclusions volontaires, avec leur raison, sont dans `runbook-exclusions.txt`.
 
@@ -100,12 +106,37 @@ fn fixed_text(literal: &str) -> String {
         return first;
     }
     let cleaned: Vec<String> = segments.iter().map(|s| clean(s)).collect();
-    cleaned
+    let longest = cleaned
         .iter()
         .map(String::as_str)
         .max_by_key(|s| s.chars().count())
-        .unwrap_or("")
-        .to_string()
+        .unwrap_or("");
+    // Un mot isolé (`vide`) est trop générique : on garde le littéral entier, placeholders
+    // normalisés en `{}` (`{} vide`), pour que la ligne du runbook soit sans ambiguïté.
+    if longest.split_whitespace().count() < 2 {
+        return normalized_placeholders(literal);
+    }
+    longest.to_string()
+}
+
+/// Littéral dont chaque `{…}` est remplacé par `{}`.
+fn normalized_placeholders(literal: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0;
+    for c in literal.chars() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    out.push_str("{}");
+                }
+                depth += 1;
+            }
+            '}' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Texte qui précède `start`, sans `format!(` ni espaces de fin.
@@ -133,10 +164,25 @@ fn is_closure_of_map_err(pre: &str) -> bool {
         .is_some_and(|(open, _)| open.ends_with("map_err("))
 }
 
+/// Littéral qui ouvre le champ `message:` d'une `StatusCondition`.
+fn is_status_message(pre: &str) -> bool {
+    pre.rsplit_once("message:").is_some_and(|(_, tail)| {
+        let tail: String = tail.chars().filter(|c| !c.is_whitespace()).collect();
+        matches!(tail.as_str(), "Some(" | "empty.then(||")
+    })
+}
+
 fn is_error_return(pre: &str) -> bool {
-    ["Err(", "IngestError::Storage(", "IngestError::Invalid("]
-        .iter()
-        .any(|p| pre.ends_with(p))
+    [
+        "Err(",
+        "IngestError::Storage(",
+        "IngestError::Invalid(",
+        ".ok_or(",
+        ".ok_or_else(||",
+    ]
+    .iter()
+    .any(|p| pre.ends_with(p))
+        || is_status_message(pre)
         || is_closure_of_map_err(pre)
         || pre
             .strip_suffix("Box::new(")
