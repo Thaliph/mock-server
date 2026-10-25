@@ -40,13 +40,62 @@ struct Lit {
     value: String,
 }
 
-/// Code hors tests, commentaires de ligne retirés.
+/// Code de production : sans commentaires de ligne et sans les éléments `#[cfg(test)]`
+/// (l'élément ou le `mod tests {…}` qui suit l'attribut, pas le reste du fichier).
 fn production_code(source: &str) -> String {
-    let code = source.split("#[cfg(test)]").next().unwrap_or(source);
-    code.lines()
+    let code: Vec<char> = source
+        .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
+        .chars()
+        .collect();
+    let attr: Vec<char> = "#[cfg(test)]".chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < code.len() {
+        if code[i..].starts_with(&attr) {
+            i = item_end(&code, i + attr.len());
+        } else {
+            out.push(code[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Indice qui suit l'élément commençant à `from` : jusqu'au `;` ou au bloc `{…}` apparié
+/// (chaînes et littéraux de caractère ignorés).
+fn item_end(code: &[char], from: usize) -> usize {
+    let mut depth = 0;
+    let mut i = from;
+    while i < code.len() {
+        match code[i] {
+            '"' => {
+                i += 1;
+                while i < code.len() && code[i] != '"' {
+                    i += if code[i] == '\\' { 2 } else { 1 };
+                }
+            }
+            '\'' if code.get(i + 2) == Some(&'\'') => i += 2,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            ';' if depth == 0 => return i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    code.len()
+}
+
+/// Première cellule d'une ligne de tableau `| message | cause | effet | action |`.
+fn first_cell(row: &str) -> &str {
+    row.split('|').nth(1).unwrap_or("")
 }
 
 fn literals(code: &[char]) -> Vec<Lit> {
@@ -329,7 +378,12 @@ fn doc_11_every_controller_message_is_in_the_runbook() {
     let mut incomplete = Vec::new();
     let messages = controller_messages();
     for message in messages.difference(&excluded) {
-        match rows.iter().find(|r| r.contains(message.as_str())) {
+        // Seule la première cellule (le message) compte : un texte cité dans la cause ou
+        // l'action d'une autre ligne ne couvre pas son propre message.
+        match rows
+            .iter()
+            .find(|r| first_cell(r).contains(message.as_str()))
+        {
             None => missing.push(message.as_str()),
             Some(row) => {
                 let cells = row.split('|').filter(|c| !c.trim().is_empty()).count();
