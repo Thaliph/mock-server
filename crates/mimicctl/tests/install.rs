@@ -7,6 +7,8 @@ use serde_json::Value;
 const DEFAULT_IMAGE: &str = "ghcr.io/thaliph/mimic";
 const DEFAULT_INIT_IMAGE: &str = "ghcr.io/thaliph/mimic-init";
 
+const S3_URL: &str = "s3://acme-mimic/prod/";
+
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -69,6 +71,21 @@ fn injector_config(docs: &[Value]) -> Value {
     serde_yaml::from_str(text).expect("la configuration du webhook est valide")
 }
 
+fn controller_store(docs: &[Value]) -> String {
+    let cm = find(docs, "ConfigMap", "mimic-controller");
+    let cfg: Value = serde_yaml::from_str(cm["data"]["controller.yaml"].as_str().unwrap()).unwrap();
+    cfg["store"].as_str().expect("store").to_owned()
+}
+
+fn pvc_class(storage: Storage, class: Option<&str>) -> Value {
+    let docs = documents(&render(&InstallOptions {
+        storage,
+        storage_class: class.map(str::to_owned),
+        ..InstallOptions::default()
+    }));
+    find(&docs, "PersistentVolumeClaim", "mimic-controller")["spec"]["storageClassName"].clone()
+}
+
 #[test]
 fn cli_22_default_is_controller_then_webhook_with_default_images() {
     let out = render(&InstallOptions::default());
@@ -85,12 +102,14 @@ fn cli_22_default_is_controller_then_webhook_with_default_images() {
     assert!(ns < controller && controller < injector);
     assert!(position(&docs, "MutatingWebhookConfiguration", "mimic-injector") > controller);
 
-    // Variante `shared` : PVC ReadWriteMany ; ni CNI ni garde de production.
+    // Variante `rwo` par défaut : PVC ReadWriteOnce, sans StorageClass imposée ; ni CNI ni
+    // garde de production.
     let pvc = find(&docs, "PersistentVolumeClaim", "mimic-controller");
     assert_eq!(
         pvc["spec"]["accessModes"],
-        serde_json::json!(["ReadWriteMany"])
+        serde_json::json!(["ReadWriteOnce"])
     );
+    assert!(pvc["spec"].get("storageClassName").is_none());
     assert!(!docs.iter().any(|d| d["kind"] == "DaemonSet"));
     assert!(
         !docs
@@ -119,6 +138,7 @@ fn cli_22_webhook_keeps_inbound_off_and_its_four_webhooks() {
     for storage in [Storage::Shared, Storage::Rwo, Storage::S3] {
         let docs = documents(&render(&InstallOptions {
             storage,
+            s3_url: (storage == Storage::S3).then(|| S3_URL.to_owned()),
             ..InstallOptions::default()
         }));
         let cfg = injector_config(&docs);
@@ -163,14 +183,16 @@ fn cli_22_storage_rwo_uses_a_read_write_once_claim() {
 
 #[test]
 fn cli_22_storage_s3_has_no_claim_and_an_s3_store() {
-    let docs = documents(&render(&InstallOptions {
+    let out = render(&InstallOptions {
         storage: Storage::S3,
+        s3_url: Some(S3_URL.into()),
         ..InstallOptions::default()
-    }));
+    });
+    let docs = documents(&out);
     assert!(!docs.iter().any(|d| d["kind"] == "PersistentVolumeClaim"));
-    let cm = find(&docs, "ConfigMap", "mimic-controller");
-    let cfg: Value = serde_yaml::from_str(cm["data"]["controller.yaml"].as_str().unwrap()).unwrap();
-    assert!(cfg["store"].as_str().unwrap().starts_with("s3://"));
+    assert_eq!(controller_store(&docs), S3_URL);
+    // Le modèle livré est remplacé, pas conservé.
+    assert!(!out.contains("s3://mimic-controller/"));
     assert!(
         position(&docs, "Deployment", "mimic-injector")
             > position(&docs, "Deployment", "mimic-controller")
@@ -284,7 +306,143 @@ fn cli_22_unknown_storage_is_refused_with_the_valid_variants() {
     assert_eq!(Storage::parse("shared").unwrap(), Storage::Shared);
     assert_eq!(Storage::parse("rwo").unwrap(), Storage::Rwo);
     assert_eq!(Storage::parse("s3").unwrap(), Storage::S3);
-    assert_eq!(InstallOptions::default().storage, Storage::Shared);
+    // Défaut : `rwo`, sans StorageClass ni URL S3.
+    let d = InstallOptions::default();
+    assert_eq!(d.storage, Storage::Rwo);
+    assert_eq!(d.storage_class, None);
+    assert_eq!(d.s3_url, None);
+    assert_eq!(Storage::default(), Storage::Rwo);
+}
+
+#[test]
+fn cli_22_storage_shared_uses_a_read_write_many_claim() {
+    let docs = documents(&render(&InstallOptions {
+        storage: Storage::Shared,
+        ..InstallOptions::default()
+    }));
+    let pvc = find(&docs, "PersistentVolumeClaim", "mimic-controller");
+    assert_eq!(
+        pvc["spec"]["accessModes"],
+        serde_json::json!(["ReadWriteMany"])
+    );
+    assert!(pvc["spec"].get("storageClassName").is_none());
+}
+
+#[test]
+fn cli_22_storage_class_is_set_on_the_claim_of_shared_and_rwo() {
+    for storage in [Storage::Shared, Storage::Rwo] {
+        assert_eq!(pvc_class(storage, Some("fast")), "fast", "{storage:?}");
+        assert!(pvc_class(storage, None).is_null(), "{storage:?}");
+    }
+    // Les autres champs du PVC ne bougent pas.
+    let docs = documents(&render(&InstallOptions {
+        storage_class: Some("fast".into()),
+        ..InstallOptions::default()
+    }));
+    let pvc = find(&docs, "PersistentVolumeClaim", "mimic-controller");
+    assert_eq!(
+        pvc["spec"]["accessModes"],
+        serde_json::json!(["ReadWriteOnce"])
+    );
+}
+
+#[test]
+fn cli_22_storage_class_is_refused_with_s3() {
+    let err = manifests(&InstallOptions {
+        storage: Storage::S3,
+        s3_url: Some(S3_URL.into()),
+        storage_class: Some("fast".into()),
+        ..InstallOptions::default()
+    })
+    .expect_err("--storage-class n'a pas de sens avec s3");
+    assert!(err.contains("storage-class"), "{err}");
+}
+
+#[test]
+fn cli_22_invalid_storage_class_is_refused() {
+    for bad in [
+        "",
+        "Fast",
+        "fast class",
+        "fast\nevil: true",
+        "fast\"",
+        "-fast",
+        "fast/../x",
+    ] {
+        let err = manifests(&InstallOptions {
+            storage_class: Some(bad.into()),
+            ..InstallOptions::default()
+        })
+        .expect_err(&format!("storage class {bad:?} refusée"));
+        assert!(err.contains("storage-class"), "{err}");
+    }
+}
+
+#[test]
+fn cli_22_s3_requires_an_s3_url() {
+    let err = manifests(&InstallOptions {
+        storage: Storage::S3,
+        ..InstallOptions::default()
+    })
+    .expect_err("--storage s3 sans --s3-url refusé");
+    assert!(err.contains("s3-url"), "{err}");
+}
+
+#[test]
+fn cli_22_s3_url_is_refused_without_s3_storage() {
+    for storage in [Storage::Rwo, Storage::Shared] {
+        let err = manifests(&InstallOptions {
+            storage,
+            s3_url: Some(S3_URL.into()),
+            ..InstallOptions::default()
+        })
+        .expect_err(&format!("--s3-url refusée avec {storage:?}"));
+        assert!(err.contains("s3-url"), "{err}");
+    }
+}
+
+#[test]
+fn cli_22_s3_url_is_replaced_for_other_buckets_and_prefixes() {
+    for url in ["s3://b/", "s3://acme.mimic-1/team/prod/", "s3://bucket"] {
+        let docs = documents(&render(&InstallOptions {
+            storage: Storage::S3,
+            s3_url: Some(url.into()),
+            ..InstallOptions::default()
+        }));
+        assert_eq!(controller_store(&docs), url);
+    }
+}
+
+#[test]
+fn cli_22_invalid_s3_url_is_refused() {
+    for bad in [
+        "",
+        "acme-mimic/prod/",         // pas de schéma
+        "https://acme-mimic/prod/", // autre schéma
+        "S3://acme-mimic/prod/",    // schéma en majuscules
+        "s3://",                    // pas de bucket
+        "s3:///prod/",              // bucket vide
+        "s3://acme mimic/prod/",    // espace
+        "s3://acme-mimic/pr od/",   // espace dans le préfixe
+        " s3://acme-mimic/prod/",   // espace de tête
+        "s3://acme-mimic/prod/\n",  // saut de ligne final
+        "s3://b/p\nevil: true",     // injection YAML
+        "s3://b/p\r\nevil: true",
+        "s3://b/p\ttab",
+        "s3://b/p\u{0}nul",
+        "s3://b/p # commentaire",
+    ] {
+        let err = manifests(&InstallOptions {
+            storage: Storage::S3,
+            s3_url: Some(bad.into()),
+            ..InstallOptions::default()
+        })
+        .expect_err(&format!("URL {bad:?} refusée"));
+        assert!(
+            err.contains("s3-url"),
+            "l'erreur doit citer --s3-url : {err}"
+        );
+    }
 }
 
 #[test]
