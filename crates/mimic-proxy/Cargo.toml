@@ -47,7 +47,7 @@ nix = { version = "0.31.3", features = ["resource"] }
 reqwest = { version = "0.13.5", features = ["json"] }
 stats_alloc = "0.1.10"
 tempfile = "3.27.0"
-tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 # ADM-05 mesure les allocations de tout le processus : sans le harnais de libtest, aucun
 # autre thread n'alloue pendant la mesure.
