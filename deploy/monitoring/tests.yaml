@@ -119,6 +119,43 @@ tests:
             exp_annotations:
               summary: "Aucune réplique active du contrôleur mimic"
 
+  # Deux répliques en vie mais la marque de l'active ne peut être posée (CTL-52, MON-08) :
+  # les deux jauges restent à 0, l'alerte sonne ; la marque posée à 5 min, elle cesse.
+  - interval: 1m
+    input_series:
+      - series: 'mimic_controller_leader{pod="mimic-controller-0"}'
+        values: '0x15'
+      - series: 'mimic_controller_leader{pod="mimic-controller-1"}'
+        values: '0x4 1x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: MimicControllerNoLeader
+        exp_alerts:
+          - exp_labels: {severity: critical}
+            exp_annotations:
+              summary: "Aucune réplique active du contrôleur mimic"
+      - eval_time: 8m
+        alertname: MimicControllerNoLeader
+        exp_alerts: []
+
+  # Exemples refusés (MON-08) : une série par raison, l'alerte porte la raison qui a bougé.
+  - interval: 1m
+    input_series:
+      - series: 'mimic_controller_exemplars_refused_total{pod="mimic-controller-0",reason="count"}'
+        values: '0 0 1 1 1 1 1 1'
+      - series: 'mimic_controller_exemplars_refused_total{pod="mimic-controller-0",reason="bytes"}'
+        values: '0x7'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MimicExemplarsRefused
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: MimicExemplarsRefused
+        exp_alerts:
+          - exp_labels: {severity: info, reason: count}
+            exp_annotations:
+              summary: "Exemples par endpoint refusés (count) : certains endpoints ne seront plus mockables après la rétention"
+
   # Éviction : seuls les pods injectés comptent.
   - interval: 1m
     input_series:
