@@ -20,13 +20,28 @@
 //! De chaque littéral, on garde le texte fixe (avant le premier `{…}`, sinon le plus long segment
 //! fixe, sinon le littéral entier avec ses placeholders écrits `{}`). Ce texte doit figurer dans
 //! une ligne de tableau de la page, qui donne au moins le message, la cause, l'effet et l'action.
-//! Les exclusions volontaires, avec leur raison, sont dans `runbook-exclusions.txt`.
+//! Les exclusions volontaires, avec leur raison, sont dans `runbook-exclusions.txt` : ainsi
+//! `{}: {}` (`format!("{}: {}", chemin, erreur)`) n'a aucun texte fixe, c'est l'erreur d'E/S de
+//! l'OS préfixée par un chemin de configuration, que la page ne peut pas énumérer.
+//!
+//! La ligne doit contenir le message dans sa PREMIÈRE cellule : citer un texte dans la cause
+//! ou l'action d'une autre ligne ne le couvre pas. Les messages sans littéral sont listés à la
+//! main dans `DYNAMIC_MESSAGES`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 const RUNBOOK: &str = "docs/runbook/sidecar.md";
 const EXCLUSIONS: &str = include_str!("runbook-exclusions.txt");
+
+/// Messages sans littéral dans le code, à documenter à la main :
+/// - `admin.rs` `json_response` : corps `500` = erreur de `serde_json` (« sérialisation JSON ») ;
+/// - `config.rs` module `duration_secs` : durée négative, non finie ou trop grande, rejetée par
+///   `Duration::try_from_secs_f64` (« cannot convert float seconds to Duration »).
+const DYNAMIC_MESSAGES: [&str; 2] = [
+    "sérialisation JSON",
+    "cannot convert float seconds to Duration",
+];
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -39,13 +54,62 @@ struct Lit {
     value: String,
 }
 
-/// Code hors tests, commentaires de ligne retirés.
+/// Code de production : sans commentaires de ligne et sans les éléments `#[cfg(test)]`
+/// (l'élément ou le `mod tests {…}` qui suit l'attribut, pas le reste du fichier).
 fn production_code(source: &str) -> String {
-    let code = source.split("#[cfg(test)]").next().unwrap_or(source);
-    code.lines()
+    let code: Vec<char> = source
+        .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
+        .chars()
+        .collect();
+    let attr: Vec<char> = "#[cfg(test)]".chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < code.len() {
+        if code[i..].starts_with(&attr) {
+            i = item_end(&code, i + attr.len());
+        } else {
+            out.push(code[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Indice qui suit l'élément commençant à `from` : jusqu'au `;` ou au bloc `{…}` apparié
+/// (chaînes et littéraux de caractère ignorés).
+fn item_end(code: &[char], from: usize) -> usize {
+    let mut depth = 0;
+    let mut i = from;
+    while i < code.len() {
+        match code[i] {
+            '"' => {
+                i += 1;
+                while i < code.len() && code[i] != '"' {
+                    i += if code[i] == '\\' { 2 } else { 1 };
+                }
+            }
+            '\'' if code.get(i + 2) == Some(&'\'') => i += 2,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            ';' if depth == 0 => return i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    code.len()
+}
+
+/// Première cellule d'une ligne de tableau `| message | cause | effet | action |`.
+fn first_cell(row: &str) -> &str {
+    row.split('|').nth(1).unwrap_or("")
 }
 
 fn literals(code: &[char]) -> Vec<Lit> {
@@ -224,9 +288,10 @@ fn messages_of(source: &str) -> BTreeSet<String> {
     let chars: Vec<char> = production_code(source).chars().collect();
     let lits = literals(&chars);
     let mut found = BTreeSet::new();
-    let mut keep = |value: &str| {
-        // Un nom de raison d'API (`"BadRequest"`) n'est pas un message.
-        if !value.chars().all(|c| c.is_ascii_alphabetic()) {
+    let mut keep = |value: &str, http_body: bool| {
+        // Un nom de raison d'API (`"BadRequest"`) n'est pas un message, mais un mot seul peut
+        // être un corps d'erreur HTTP (`StatusCode::NOT_FOUND, "introuvable"`).
+        if http_body || !value.chars().all(|c| c.is_ascii_alphabetic()) {
             let fixed = fixed_text(value);
             if !fixed.is_empty() {
                 found.insert(fixed);
@@ -241,7 +306,7 @@ fn messages_of(source: &str) -> BTreeSet<String> {
             let open = at + pattern.len() - 1;
             let end = call_end(&chars, open);
             if let Some(message) = lits.iter().rfind(|l| l.start > open && l.end <= end) {
-                keep(&message.value);
+                keep(&message.value, false);
             }
         }
     }
@@ -252,7 +317,7 @@ fn messages_of(source: &str) -> BTreeSet<String> {
         let open = at + pattern.len() - 1;
         let end = call_end(&chars, open);
         if let Some(message) = lits.iter().rfind(|l| l.start > open && l.end <= end) {
-            keep(&message.value);
+            keep(&message.value, false);
         }
     }
 
@@ -265,8 +330,14 @@ fn messages_of(source: &str) -> BTreeSet<String> {
                 && prev.value.chars().all(|c| c.is_ascii_alphabetic())
                 && after_status_code(&before(&chars, prev.start))
         };
+        // Corps d'erreur HTTP : suit le code, sans autre littéral derrière (sinon c'est le nom
+        // de raison, et le corps est le littéral suivant).
+        let tail: String = chars[lit.end..].iter().take(12).collect();
+        let tail = tail.trim_start().trim_start_matches(',').trim_start();
+        let is_reason = tail.starts_with('"') || tail.starts_with("format!(");
+        let http_body = after_reason || (after_status_code(&pre) && !is_reason);
         if after_status_code(&pre) || after_reason || is_error_return(&pre) {
-            keep(&lit.value);
+            keep(&lit.value, http_body);
         }
     }
     found
@@ -317,6 +388,8 @@ fn doc_12_extraction_finds_the_known_messages() {
         "dépendance inconnue",
         "store {}: {}",
         "mimic: sonde",
+        "introuvable",
+        "partage désactivé",
     ] {
         assert!(
             found.contains(known),
@@ -348,9 +421,17 @@ fn doc_12_every_sidecar_message_is_in_the_runbook() {
 
     let mut missing = Vec::new();
     let mut incomplete = Vec::new();
-    let messages = sidecar_messages();
+    let mut messages = sidecar_messages();
+    // Messages dont le texte n'est pas un littéral (erreur d'une bibliothèque relayée telle
+    // quelle) : liste tenue à la main, chacun doit avoir sa ligne.
+    messages.extend(DYNAMIC_MESSAGES.iter().map(|m| m.to_string()));
     for message in messages.difference(&excluded) {
-        match rows.iter().find(|r| r.contains(message.as_str())) {
+        // Seule la première cellule (le message) compte : un texte cité dans la cause ou
+        // l'action d'une autre ligne ne couvre pas son propre message.
+        match rows
+            .iter()
+            .find(|r| first_cell(r).contains(message.as_str()))
+        {
             None => missing.push(message.as_str()),
             Some(row) => {
                 let cells = row.split('|').filter(|c| !c.trim().is_empty()).count();
