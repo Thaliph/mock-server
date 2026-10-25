@@ -151,6 +151,18 @@ root sur le nœud (#55) ; tests instables MCK-15, LOD-11, PRX-11 (#53, #54).
 - **Isolation** : par namespace, suffisante. Corriger la spec §7.1 en conséquence.
 - **Documentation** : en anglais.
 - **mimicctl** : distribué en binaires sur les releases GitHub (aucun publié à ce jour).
+- **Dépôt public** depuis le 25 octobre : CI gratuite, ghcr.io public, wiki, outils de sécurité
+  GitHub.
+- **Q4, Q6 — l'egress est le produit.** Le mock ne sert que le **sortant** (déjà le cas). L'
+  interception **entrante** devient une option, désactivée par défaut : sans elle, aucun port
+  entrant n'est redirigé (plus de repli vers `127.0.0.1`, plus de sondes du kubelet qui passent
+  par le sidecar, plus de déni de service depuis un autre pod). Avec elle : découverte de l'API
+  du service, requêtes rejouées par `mimicctl load`. Les métriques distinguent `inbound` et
+  `outbound` (label `direction`).
+- **Q5 — fail-closed, mais court** : si le sidecar tombe, le sortant de l'application échoue
+  jusqu'à son redémarrage. Pas de bascule vers le vrai backend (impossible avec iptables sans
+  composant privilégié, et dangereuse en mock).
+- **Isolation par namespace** suffisante : spec §7.1 à corriger.
 
 ## Tests de versions
 
@@ -161,12 +173,46 @@ root sur le nœud (#55) ; tests instables MCK-15, LOD-11, PRX-11 (#53, #54).
   casse le job avant de casser un utilisateur.
 - [ ] Version minimale déclarée (aujourd'hui 1.29) testée, ou relevée à 1.32.
 
-## Questions restantes
+## Suite des décisions
 
-1. Passer le dépôt en public maintenant ?
-2. Repli vers `127.0.0.1` (Q4) : le retirer, avec une annotation pour les applications qui en
-   ont besoin ?
-3. Découverte d'API (Q6) : produit à part entière ou bonus ?
+- [ ] **Interception entrante optionnelle** (spec §3.1, §9.4) : désactivée par défaut ; activée
+  par namespace, workload (annotation) ou configuration du webhook ; repli vers `127.0.0.1`
+  supprimé. Tests e2e et démo à adapter (le rapport de découverte et `mimicctl load` en
+  dépendent). Remplace `[sidecar 1]` et réduit `[sidecar 2, 3]` aux pods qui l'activent.
+- [ ] Vérifier que **toutes** les métriques par requête portent `direction`.
+- [ ] **Redémarrage court** du sidecar : mémoire dimensionnée, pas d'OOM sur un pic ; le
+  back-off de redémarrage du kubelet (jusqu'à 5 min en boucle) est la vraie durée de panne à
+  documenter et à surveiller (alerte sur redémarrage du conteneur `mimic`).
+- [ ] Idée (P3) : faire du sidecar un vrai mesh (mTLS, routage, comme Linkerd) à partir de
+  l'interception entrante. À cadrer comme un produit à part.
+
+## Anneaux (« rings »)
+
+Le contrôleur est aujourd'hui actif/passif : une seule réplique travaille, l'autre attend.
+
+- [ ] (P3) **Anneau de hachage** : répartir les workloads entre plusieurs répliques actives
+  (hachage cohérent de `namespace/workload`), pour monter en charge horizontalement. Utile
+  seulement quand une réplique active ne suffit plus : à mesurer d'abord (`mimicctl load` sur
+  le contrôleur, nombre de workloads, débit d'ingestion).
+- [ ] (P1) **Anneaux de déploiement** : aujourd'hui l'image du sidecar est la même pour tous les
+  pods du cluster, et une nouvelle version touche tout le monde à la prochaine recréation des
+  pods. Déployer par vagues (anneau 0 : namespaces de test, puis 1, puis 2) avec une image par
+  anneau choisie par label de namespace (`mimic.platform.io/ring`), et un retour arrière par
+  anneau. Plus utile que le hachage à court terme.
+
+## Outils de sécurité
+
+Fait (#59) : cargo-deny (2 vulnérabilités trouvées et corrigées), CodeQL (Rust et workflows),
+zizmor, Trivy (configuration), OpenSSF Scorecard, Dependabot, secret scanning et push
+protection, signalement privé (`SECURITY.md`).
+
+- [ ] Fuzzing (`cargo fuzz`) des analyseurs qui lisent des données non sûres : détection de
+  protocole, lecture du SNI, redaction (JSON, formulaires), décodage des bodies, annotations
+  du webhook et du plugin CNI. Lancé en CI quelques minutes par PR, plus longtemps chaque nuit.
+- [ ] Scan des images publiées (Trivy image, bloquant sur CRITICAL et HIGH corrigeables) dans
+  `release.yml`, et chaque semaine sur la dernière version.
+- [ ] Rendre bloquants zizmor et Trivy config une fois les constats actuels traités.
+- [ ] Revue de sécurité externe (pentest) du sidecar avant la première équipe en production.
 
 ## Questions posées le 25 octobre (historique)
 
