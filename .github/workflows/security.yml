@@ -16,12 +16,35 @@ on:
   schedule:
     - cron: "17 5 * * 1"
 
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: diff
+        run: ./scripts/ci-changes.sh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          LABELS_JSON: "[]"
+
   cargo-deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,30 +53,50 @@ jobs:
         with:
           command: check advisories licenses bans sources
 
-  codeql:
+  codeql-rust:
+    # Le plus long des contrôles (~7 min) : sauté sur une PR sans changement Rust ou Cargo.
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [rust, actions]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
-          languages: ${{ matrix.language }}
+          languages: rust
           build-mode: none
           queries: security-and-quality
       - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
-          category: /language:${{ matrix.language }}
+          category: /language:rust
+
+  codeql-actions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          languages: actions
+          build-mode: none
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          category: /language:actions
 
   zizmor:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       security-events: write
@@ -66,6 +109,7 @@ jobs:
   trivy-config:
     # Dockerfile et manifests : utilisateur root, capacités, sondes, images non épinglées…
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       security-events: write
@@ -89,6 +133,7 @@ jobs:
   scorecard:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       security-events: write
@@ -106,3 +151,15 @@ jobs:
         with:
           sarif_file: scorecard.sarif
           category: scorecard
+
+  security-ok:
+    # Unique contrôle à rendre obligatoire (scorecard est ignoré sur PR, par construction).
+    if: always()
+    needs: [changes, cargo-deny, codeql-rust, codeql-actions, zizmor, trivy-config, scorecard]
+    runs-on: ubuntu-latest
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      - run: echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")'
+        env:
+          NEEDS: ${{ toJSON(needs) }}
