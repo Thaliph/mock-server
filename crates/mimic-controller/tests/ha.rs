@@ -713,6 +713,8 @@ async fn ctl_52_leader_gauge_is_one_only_once_the_mark_is_placed() {
     })
     .await
     .expect("la pose de la marque n'est pas retentée");
+    // La réplique sert déjà : seule la jauge attend la marque.
+    assert!(a.is_leader(), "marque refusée : la réplique sert déjà");
     let m = metrics(&a).await;
     assert_eq!(
         metric(&m, "mimic_controller_leader"),
