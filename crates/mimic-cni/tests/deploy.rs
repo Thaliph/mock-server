@@ -48,22 +48,34 @@ fn cni_03_daemonset_and_rights() {
     assert_eq!(
         keys,
         [
+            "allowPrivilegeEscalation",
+            "capabilities",
             "privileged",
             "readOnlyRootFilesystem",
             "runAsNonRoot",
-            "runAsUser"
+            "runAsUser",
+            "seccompProfile"
         ]
         .into_iter()
         .collect(),
         "securityContext inattendu : {sc:?}"
     );
-    assert_eq!(sc["privileged"], true);
     assert_eq!(sc["runAsUser"], 0);
     assert_eq!(sc["runAsNonRoot"], false);
+    assert_eq!(sc["privileged"], false, "plus de mode privilégié");
+    assert_eq!(sc["allowPrivilegeEscalation"], false);
     assert_eq!(
         sc["readOnlyRootFilesystem"], true,
         "le conteneur n'écrit que dans ses volumes hostPath"
     );
+    let caps = sc["capabilities"].as_mapping().unwrap();
+    assert_eq!(caps.len(), 1, "aucune capacité ajoutée : {caps:?}");
+    let drop = caps["drop"].as_sequence().unwrap();
+    assert_eq!(drop.len(), 1, "{drop:?}");
+    assert_eq!(drop[0], "ALL");
+    let seccomp = sc["seccompProfile"].as_mapping().unwrap();
+    assert_eq!(seccomp.len(), 1, "{seccomp:?}");
+    assert_eq!(seccomp["type"], "RuntimeDefault");
     let role = all
         .iter()
         .find(|d| d["kind"] == "ClusterRole" && d["metadata"]["name"] == "mimic-cni")
