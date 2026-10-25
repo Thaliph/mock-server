@@ -32,8 +32,38 @@ fn cni_03_daemonset_and_rights() {
             .any(|t| t["operator"] == "Exists" && t.get("key").is_none()),
         "tolère tous les taints"
     );
-    let container = &pod["containers"][0];
+    // Garde : Trivy ignore KSV-0017 et KSV-0118 pour tout ce fichier, donc le DaemonSet ne
+    // doit contenir que le conteneur d'installation, avec exactement ce securityContext.
+    let containers = pod["containers"].as_sequence().unwrap();
+    assert_eq!(containers.len(), 1, "un seul conteneur : {containers:?}");
+    assert!(
+        pod.get("initContainers").is_none(),
+        "aucun init container privilégié non revu"
+    );
+    let container = &containers[0];
+    assert_eq!(container["name"], "install");
     assert_eq!(container["args"][0], "install");
+    let sc = container["securityContext"].as_mapping().unwrap();
+    let keys: std::collections::BTreeSet<&str> = sc.keys().filter_map(|k| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            "privileged",
+            "readOnlyRootFilesystem",
+            "runAsNonRoot",
+            "runAsUser"
+        ]
+        .into_iter()
+        .collect(),
+        "securityContext inattendu : {sc:?}"
+    );
+    assert_eq!(sc["privileged"], true);
+    assert_eq!(sc["runAsUser"], 0);
+    assert_eq!(sc["runAsNonRoot"], false);
+    assert_eq!(
+        sc["readOnlyRootFilesystem"], true,
+        "le conteneur n'écrit que dans ses volumes hostPath"
+    );
     let role = all
         .iter()
         .find(|d| d["kind"] == "ClusterRole" && d["metadata"]["name"] == "mimic-cni")

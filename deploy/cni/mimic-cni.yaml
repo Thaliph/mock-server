@@ -63,11 +63,14 @@ spec:
           image: ghcr.io/thaliph/mimic:0.1.0
           command: ["/usr/local/bin/mimic-cni"]
           args: ["install", "--bin-dir", "/host/opt/cni/bin", "--conf-dir", "/host/etc/cni/net.d", "--host-conf-dir", "/etc/cni/net.d"]
-          # Écrit dans des répertoires de l'hôte possédés par root.
+          # Écrit dans des répertoires de l'hôte possédés par root (volumes hostPath, qui
+          # restent inscriptibles) ; le système de fichiers du conteneur, lui, est en
+          # lecture seule.
           securityContext:
             runAsUser: 0
             runAsNonRoot: false
             privileged: true
+            readOnlyRootFilesystem: true
           resources:
             requests: {cpu: 10m, memory: 16Mi}
             limits: {memory: 64Mi}

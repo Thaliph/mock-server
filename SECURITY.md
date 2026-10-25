@@ -22,8 +22,9 @@ Every pull request, every push to `main` and a weekly schedule run
 |------|----------------|
 | [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) | known vulnerabilities in Rust dependencies (RustSec), licenses, crate sources (`deny.toml`) |
 | [CodeQL](https://codeql.github.com/) | static analysis of the Rust code and of the GitHub Actions workflows |
-| [zizmor](https://github.com/zizmorcore/zizmor) | GitHub Actions workflow weaknesses (template injection, excessive permissions, unpinned actions) |
-| [Trivy](https://trivy.dev/) (config) | misconfigurations in the `Dockerfile` and the Kubernetes manifests under `deploy/` |
+| [zizmor](https://github.com/zizmorcore/zizmor) | GitHub Actions workflow weaknesses (template injection, excessive permissions, unpinned actions); **blocking**: a new finding fails the pull request |
+| [Trivy](https://trivy.dev/) (config) | misconfigurations in the `Dockerfile` and the Kubernetes manifests (`deploy/`, `tests/e2e/`, `docs/revue/`); **blocking** on HIGH and CRITICAL, MEDIUM is report-only |
+| ignores check ([`scripts/check-ignores.sh`](scripts/check-ignores.sh)) | every accepted finding (`.trivyignore.yaml`, `# zizmor: ignore[...]`) carries a reason and a review or expiry date (at most 12 months ahead, parsed as real YAML; a non-empty zizmor config file is refused); an expired entry fails the job |
 | [OpenSSF Scorecard](https://scorecard.dev/) | repository security practices (`main` only) |
 
 [Dependabot](.github/dependabot.yml) proposes weekly updates of crates, actions and base images.

@@ -342,4 +342,55 @@ async fn prx_24_silent_connection_is_refused_in_mock_after_the_wait() {
     assert_eq!(passthrough(&m, "outbound", "tcp", "relayed"), 1.0, "{m}");
     assert_eq!(passthrough(&m, "outbound", "tcp", "refused"), 0.0, "{m}");
     p.shutdown().await;
+    prx_24_spurious_readiness_does_not_cut_the_silent_wait_short().await;
+}
+
+/// Connexion redirigée dont la disponibilité en lecture est périmée : un octet est arrivé,
+/// puis a été consommé avant la décision. `readable()` se réveille alors sans donnée à lire
+/// (réveil à vide), ce que tokio autorise. Déterministe : la disponibilité reste mémorisée
+/// sur le socket tant qu'une lecture n'a pas rendu `WouldBlock`, quelle que soit la machine.
+async fn spuriously_readable() -> (TcpStream, TcpStream) {
+    let (mut app, sidecar) = redirected().await;
+    app.write_all(b"x").await.unwrap();
+    sidecar.readable().await.unwrap();
+    let mut one = [0u8; 1];
+    assert_eq!(sidecar.try_read(&mut one).unwrap(), 1);
+    (app, sidecar)
+}
+
+/// Réveil à vide de `readable()` : l'attente de silence ne doit pas s'arrêter au délai de détection.
+/// Exécuté à la fin de `prx_24_silent_connection_...` : le compteur de refus et le débit limité
+/// des journaux sont partagés, deux tests parallèles se fausseraient.
+async fn prx_24_spurious_readiness_does_not_cut_the_silent_wait_short() {
+    let dep = dependency(None).await;
+    let p = proxy(mock_config(None)).await;
+    // Large devant SNIFF_TIMEOUT (300 ms) : refuser à ce délai est la régression.
+    let wait = Duration::from_millis(1500);
+    let (mut app, sidecar) = spuriously_readable().await;
+    let state = p.state().clone();
+    let dst = dep.addr;
+    let started = Instant::now();
+    let decide = tokio::spawn(async move {
+        // Comme l'écouteur : une connexion rendue est traitée (refusée en mock) par `tunnel`.
+        match resolve_silent_within(state.clone(), sidecar, dst, false, wait).await {
+            Silent::Client(s, protocol, upstream) => {
+                tunnel(state, s, dst, protocol, false, upstream).await;
+            }
+            Silent::Done => {}
+        }
+    });
+    let mut buf = [0u8; 8];
+    let n = tokio::time::timeout(Duration::from_secs(10), app.read(&mut buf))
+        .await
+        .expect("ni salut ni fermeture")
+        .unwrap_or(0);
+    let closed_at = started.elapsed();
+    decide.await.unwrap();
+    assert_eq!(n, 0, "connexion refermée sans salut");
+    assert!(
+        closed_at >= wait,
+        "refermée à {closed_at:?}, avant la fin de l'attente ({wait:?}) : réveil à vide pris pour du silence définitif"
+    );
+    assert_eq!(dep.accepted(), 0, "la dépendance n'est pas jointe");
+    p.shutdown().await;
 }
