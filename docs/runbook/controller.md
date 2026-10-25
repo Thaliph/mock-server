@@ -58,7 +58,7 @@ exits, the rollout stops on the new ReplicaSet and the previous pods keep servin
 | `écoute sur <adresse>: <err>` | exit 1 | port already taken, or `ui_listen` on an IP that is not the pod's | controller does not start | change `listen`, `ui_listen` or `aggregated.listen` |
 | `répertoire <dir>: <err>` | exit 1 | `file://` store cannot be created: PVC not mounted, missing `fsGroup` 1338, read-only root | controller does not start; nothing is persisted | check the PVC and `fsGroup`; see [storage](../guide/Exploiter-en-production.md#stockage-du-contrôleur) |
 | `bucket <bucket>: <err>` | exit 1 | S3 client cannot be built: region or endpoint missing, malformed URL | controller does not start | fill the `AWS_*` variables of the Secret `mimic-controller-s3`, or the IRSA role |
-| `signal SIGTERM: <err>` | exit 1 | signal handler cannot be installed (practically impossible) | controller does not start | none; report it |
+| `signal SIGTERM: <err>` | exit 1 | signal handler cannot be installed (practically impossible) | controller does not start | none possible in the pod; open an issue with `kubectl logs --previous` |
 
 ## 2. Sidecar API and ingestion
 
@@ -101,20 +101,20 @@ or the limits are too high.
 
 | Message | Level | Cause | Effect on the application | Fix |
 |---|---|---|---|---|
-| `état souhaité illisible sur le support` | WARN (`namespace`, `workload`, `error`), 503 `support indisponible` to the heartbeat or the UI | read of `desired.json` fails (other than not found): S3 or NFS unreachable | the sidecar keeps its state; `mimicctl status` and `mode` fail for that workload | restore the storage |
+| `état souhaité illisible sur le support` | WARN (`namespace`, `workload`, `error`), 503 `support indisponible` to the heartbeat or the UI | read of `desired.json` fails (other than not found): S3 or NFS unreachable | the sidecar keeps its state; `mimicctl status` and `mode` fail for that workload | check the volume and credentials (`kubectl -n mimic-system get pvc`, `describe pod`), then re-run the failing command |
 | `desired.json illisible : état souhaité vide` | ERROR | `desired.json` exists but is invalid JSON: corrupted file, or written by an incompatible version | pods fall back to the mode of their own configuration; a `mock` can be lost | re-apply the `MimicWorkload` (`mimicctl mode …`) to rewrite the file |
-| `lecture de l'état souhaité, retentée au prochain appel` | WARN | storage error while reading `desired.json` | stale view until the next call | restore the storage |
+| `lecture de l'état souhaité, retentée au prochain appel` | WARN | storage error while reading `desired.json` | stale view until the next call | check the volume and credentials (`kubectl -n mimic-system get pvc`, `describe pod`), then re-run the failing command |
 | `lecture de <path>: <err>` | startup error or WARN, depending on the caller | a file of the store cannot be read (the config file at startup, the salt, an exemplar file, a segment) | the feature that needs it is degraded | restore the storage; the `<path>` tells which file |
 | `écriture de <path>: <err>` | WARN, or a 503 on ingestion | a file of the store cannot be written: volume full, read-only, S3 rights | data of that file is not persisted | free space, fix the rights |
-| `<path> vide` | WARN (`sel du workload illisible sur le support`) | salt file empty (truncated) | see below | delete the empty file so a new salt is drawn |
+| `{} vide` (`<path> vide`, e.g. `<ns>/<wl>/redact-salt vide`) | WARN (`sel du workload illisible sur le support`) | salt file empty (truncated write, volume full at the time) | the heartbeat is answered without `redact_salt`; sidecars refuse to capture until a salt exists | delete the empty file so a new salt is drawn: `kubectl -n mimic-system exec deploy/mimic-controller -- rm <data-dir>/<ns>/<wl>/redact-salt` (PVC) or `aws s3 rm s3://<bucket>/<ns>/<wl>/redact-salt` (S3); the next heartbeat redraws it |
 | `sel du workload illisible sur le support` | WARN; the heartbeat is answered **without** `redact_salt` | read or write of `<ns>/<wl>/redact-salt` fails, or the file is empty | sidecars without a salt refuse to capture (`no_salt` in their metrics): discovery stops filling | restore the storage; remove an empty file |
 | `tirage du sel: <err>` | WARN | the system random generator failed when drawing a new salt | same as above | none usual; recreate the pod, report it |
 | `ressource réappliquée à la prochaine maintenance` | WARN | storage error while handling a `MimicWorkload` event; the spec is kept and re-applied within a minute | the mode follows with a delay | none; check the mode followed |
-| `liste de <prefix>: <err>` | WARN, via `index des segments` | listing of a workload prefix failed | partial index | restore the storage |
-| `index des segments` | WARN | listing of the segments failed (takeover, maintenance) | discovery and snapshots built from an incomplete list | restore the storage |
+| `liste de <prefix>: <err>` | WARN, via `index des segments` | listing of a workload prefix failed | partial index | check the volume and credentials (`kubectl -n mimic-system get pvc`, `describe pod`), then re-run the failing command |
+| `index des segments` | WARN | listing of the segments failed (takeover, maintenance) | discovery and snapshots built from an incomplete list | check the volume and credentials (`kubectl -n mimic-system get pvc`, `describe pod`), then re-run the failing command |
 | `relecture des exemples` | WARN | read of `exemplars.jsonl` failed or the file is corrupt | rare endpoints are no longer mockable | restore the storage; if corrupt, record again |
-| `relecture des échanges` | WARN | segments cannot be read at the first sight of a workload | discovery and snapshot are poorer | restore the storage |
-| `liste des workloads du support` | WARN | listing of the root of the store failed | persisted workloads are not reloaded | restore the storage |
+| `relecture des échanges` | WARN | segments cannot be read at the first sight of a workload | discovery and snapshot are poorer | check the volume and credentials (`kubectl -n mimic-system get pvc`, `describe pod`), then re-run the failing command |
+| `liste des workloads du support` | WARN | listing of the root of the store failed | persisted workloads are not reloaded | check the volume and credentials (`kubectl -n mimic-system get pvc`, `describe pod`), then re-run the failing command |
 | `construction du snapshot échouée` | WARN; condition reason `SnapshotFailed` | build or write of the snapshot failed; details below | the workload stays in its previous snapshot; `Aligned` is false | free space, check rights |
 | `construction du snapshot:` | detail of the above | the snapshot cannot be built from the exchanges | same | same |
 | `écriture du snapshot <id>: <err>` | detail of the above | snapshot file cannot be written | same | same |
@@ -218,3 +218,13 @@ These are not log messages but what the operator reads in `kubectl get mw -o yam
 | `ProductionNamespace` | `Allowed=False` | mock requested in an `env=production` namespace, state goes back to `record` | no mock | intended |
 | `EmergencyStop` | `Allowed=False` | emergency-stop label on the namespace or on `mimic-system`; pods in `passthrough` | no capture, no mock | `mimicctl emergency-stop --off` |
 | `Empty` | `SnapshotEmpty=True` | mock with a snapshot holding no replayable outbound exchange: built before any outbound traffic, or capture `off` | every outbound call answers `599` | record traffic, switch back to `record` then `mock` |
+
+### Messages carried by the conditions
+
+Some conditions carry a French `message`, shown by `kubectl -n <ns> get mw <workload> -o jsonpath='{.status.conditions}'`.
+
+| Message | Condition | Cause | Effect on the application | Fix |
+|---|---|---|---|---|
+| `arrêt d'urgence : label mimic.platform.io/emergency-stop=true sur le namespace ou sur mimic-system, pods en passthrough` | `Allowed=False`, reason `EmergencyStop` | someone labelled the namespace or `mimic-system` with `mimic.platform.io/emergency-stop=true` (`mimicctl emergency-stop`) | pods are forced to `passthrough`: no capture, no mock; traffic is proxied untouched | find the label (`kubectl get ns -l mimic.platform.io/emergency-stop=true`), then `mimicctl emergency-stop --off` once the incident is closed |
+| `mock et mock-partial sont refusés dans un namespace labellisé env=production` | `Allowed=False`, reason `ProductionNamespace` | `spec.mode` is `mock` or `mock-partial` in a namespace labelled `env=production` | the mock is not applied; the state goes back to `record` and the real dependencies are called | intended; set `spec.mode: record` (`mimicctl mode record`), or use a non-production namespace |
+| `le snapshot servi ne contient aucun échange sortant rejouable` | `SnapshotEmpty=True`, reason `Empty` | mock with a snapshot built before any outbound traffic was recorded, or capture was `off` | every outbound call answers `599`: the application sees failing dependencies | `mimicctl mode record`, let outbound traffic flow, build a new snapshot (`mimicctl snapshot ls` to check its exchanges), then `mimicctl mode mock` |
