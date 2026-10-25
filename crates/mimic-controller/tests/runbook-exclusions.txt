@@ -1,4 +1,4 @@
-# Messages du contrôleur volontairement absents du runbook (DOC-10).
+# Messages du contrôleur volontairement absents du runbook (DOC-11).
 # Format : « texte fixe | raison ». Le texte fixe est celui que l'extraction produit.
 zstd: | erreur interne de compression, toujours enveloppée par « construction du snapshot »
 gzip: | idem

@@ -1,5 +1,5 @@
 //! Le runbook du contrôleur (`docs/runbook/controller.md`) couvre chaque message que le
-//! contrôleur montre à l'exploitant (DOC-10).
+//! contrôleur montre à l'exploitant (DOC-11).
 //!
 //! Règle d'extraction, volontairement simple : dans `crates/mimic-controller/src/*.rs`, on lit
 //! le code hors tests (tout ce qui précède `#[cfg(test)]`, commentaires de ligne retirés) et on
@@ -237,7 +237,7 @@ fn exclusions() -> BTreeSet<String> {
 }
 
 #[test]
-fn doc_10_extraction_finds_the_known_messages() {
+fn doc_11_extraction_finds_the_known_messages() {
     let found = controller_messages();
     for known in [
         "bail non renouvelé à temps : la réplique cesse de servir",
@@ -260,7 +260,7 @@ fn doc_10_extraction_finds_the_known_messages() {
 }
 
 #[test]
-fn doc_10_every_exclusion_is_a_real_message() {
+fn doc_11_every_exclusion_is_a_real_message() {
     let found = controller_messages();
     for excluded in exclusions() {
         assert!(
@@ -271,9 +271,9 @@ fn doc_10_every_exclusion_is_a_real_message() {
 }
 
 /// Chaque message du contrôleur figure dans une ligne de tableau de `docs/runbook/controller.md`
-/// qui donne aussi la cause, l'effet et l'action (DOC-10).
+/// qui donne aussi la cause, l'effet et l'action (DOC-11).
 #[test]
-fn doc_10_every_controller_message_is_in_the_runbook() {
+fn doc_11_every_controller_message_is_in_the_runbook() {
     let page = std::fs::read_to_string(root().join(RUNBOOK))
         .unwrap_or_else(|e| panic!("{RUNBOOK} manquant : {e}"));
     let rows: Vec<&str> = page.lines().filter(|l| l.starts_with('|')).collect();

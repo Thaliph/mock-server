@@ -51,6 +51,7 @@ mimic est conçu pour les environnements **hors production** : les modes `mock` 
 | [CLI mimicctl](CLI-mimicctl.md) | référence unique de la CLI : installation, droits, chaque commande et option, interface web du contrôleur |
 | [Exploiter en production](Exploiter-en-production.md) | dimensionnement, haute disponibilité, mises à jour, certificats, pannes, sécurité, sauvegarde |
 | [Dépannage](Depannage.md) | symptômes, diagnostics et messages d'erreur réels |
+| [Runbook du contrôleur](../runbook/controller.md) | (en anglais) chaque message du contrôleur : cause, effet sur l'application, correction |
 | [Tir de charge](Tir-de-charge.md) | `mimicctl load` : palier fixe ou montée jusqu'à saturation, lecture du rapport, dimensionnement CPU et mémoire |
 
 ## Démarrage rapide
