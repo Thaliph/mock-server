@@ -2,9 +2,6 @@
 //! a pure function of the seed and `<namespace>/<deployment>`, computed in memory when needed
 //! and never stored. Nothing in this module logs or prints key material.
 
-// The roots are used by the sidecar API and the webhook, which land after the seed.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -96,16 +93,21 @@ impl Seed {
 /// The root CA of one deployment.
 pub struct Root {
     issuer: Issuer<'static, KeyPair>,
+    // The webhook publishes the certificate in the pod spec; it lands after the sidecar API.
+    #[allow(dead_code)]
     certificate: String,
+    #[allow(dead_code)]
     public_key: Vec<u8>,
 }
 
 impl Root {
+    #[allow(dead_code)]
     pub fn certificate_pem(&self) -> &str {
         &self.certificate
     }
 
     /// SubjectPublicKeyInfo (DER) of the root key.
+    #[allow(dead_code)]
     pub fn public_key_der(&self) -> Vec<u8> {
         self.public_key.clone()
     }

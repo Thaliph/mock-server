@@ -7,19 +7,29 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use std::time::SystemTime;
+
+use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use base64::Engine;
+use futures::StreamExt;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::{Api, PostParams};
+use mimic_core::identity::pod_of_deployment;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::sync::OnceCell;
 
-use crate::tls_ca::SeedSlot;
+use crate::tls_ca::{SeedSlot, derive_root};
 
 /// Audience of the projected token (spec §7.1).
 pub const AUDIENCE: &str = "mimic.platform.io";
@@ -68,11 +78,12 @@ pub trait Reviewer: Send + Sync {
 
 /// `TokenReview` against the Kubernetes API server.
 pub struct KubeReviewer {
-    client: kube::Client,
+    client: Arc<OnceCell<kube::Client>>,
 }
 
 impl KubeReviewer {
-    pub fn new(client: kube::Client) -> KubeReviewer {
+    /// `client` is set once the cluster client is available; reviews fail until then.
+    pub fn new(client: Arc<OnceCell<kube::Client>>) -> KubeReviewer {
         KubeReviewer { client }
     }
 }
@@ -87,7 +98,8 @@ impl Reviewer for KubeReviewer {
                 },
                 ..TokenReview::default()
             };
-            let answer = Api::<TokenReview>::all(self.client.clone())
+            let client = self.client.get().ok_or("no Kubernetes client yet")?;
+            let answer = Api::<TokenReview>::all(client.clone())
                 .create(&PostParams::default(), &review)
                 .await
                 .map_err(|e| format!("token review: {e}"))?;
@@ -133,11 +145,151 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
         .with_state(api)
 }
 
+/// Why a request was refused: the status and the `result` label of the log line and metric.
+struct Refusal {
+    status: StatusCode,
+    result: &'static str,
+}
+
+const UNAUTHENTICATED: Refusal = Refusal {
+    status: StatusCode::UNAUTHORIZED,
+    result: "unauthenticated",
+};
+const FORBIDDEN: Refusal = Refusal {
+    status: StatusCode::FORBIDDEN,
+    result: "forbidden",
+};
+const INVALID: Refusal = Refusal {
+    status: StatusCode::BAD_REQUEST,
+    result: "invalid",
+};
+const TOO_LARGE: Refusal = Refusal {
+    status: StatusCode::PAYLOAD_TOO_LARGE,
+    result: "invalid",
+};
+const UNAVAILABLE: Refusal = Refusal {
+    status: StatusCode::SERVICE_UNAVAILABLE,
+    result: "unavailable",
+};
+
+/// What is known of the caller, for the log line.
+#[derive(Default)]
+struct Caller {
+    namespace: String,
+    pod: String,
+    deployment: String,
+}
+
+#[derive(Deserialize)]
+struct IntermediateRequest {
+    deployment: String,
+    public_key: String,
+}
+
 impl SidecarApi {
     async fn intermediate(&self, headers: &HeaderMap, body: Body) -> Response {
-        let _ = (headers, body, StatusCode::OK);
-        StatusCode::NOT_IMPLEMENTED.into_response()
+        let mut caller = Caller::default();
+        let outcome = self.authorize_and_sign(headers, body, &mut caller).await;
+        let result = outcome.as_ref().map_or_else(|r| r.result, |_| "ok");
+        self.metrics
+            .requests
+            .get_or_create(&vec![
+                ("endpoint".to_string(), ENDPOINT.to_string()),
+                ("result".to_string(), result.to_string()),
+            ])
+            .inc();
+        tracing::info!(
+            target: "sidecar_api",
+            endpoint = ENDPOINT,
+            namespace = caller.namespace,
+            pod = caller.pod,
+            deployment = caller.deployment,
+            result,
+            "sidecar api request"
+        );
+        match outcome {
+            Ok(certificate) => Json(json!({ "certificate": certificate })).into_response(),
+            Err(refusal) => refusal.status.into_response(),
+        }
     }
+
+    async fn authorize_and_sign(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+        caller: &mut Caller,
+    ) -> Result<String, Refusal> {
+        let token = bearer(headers).ok_or(UNAUTHENTICATED)?;
+        let review = self.reviewer.review(token).await.map_err(|e| {
+            tracing::warn!(error = %e, "token review failed");
+            UNAVAILABLE
+        })?;
+        if !review.authenticated {
+            return Err(UNAUTHENTICATED);
+        }
+        let namespace = review
+            .username
+            .strip_prefix("system:serviceaccount:")
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(namespace, _)| namespace)
+            .filter(|namespace| !namespace.is_empty())
+            .ok_or(FORBIDDEN)?;
+        caller.namespace = namespace.to_string();
+        caller.pod = review.pod.clone().unwrap_or_default();
+
+        let bytes = read_body(body).await?;
+        // Parse errors quote the offending value: they are never logged or returned.
+        let request: IntermediateRequest = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
+        if !valid_name(&request.deployment) {
+            return Err(INVALID);
+        }
+        caller.deployment = request.deployment.clone();
+        let public_key = base64::engine::general_purpose::STANDARD
+            .decode(request.public_key.as_bytes())
+            .map_err(|_| INVALID)?;
+
+        let pod = review.pod.as_deref().ok_or(FORBIDDEN)?;
+        if !pod_of_deployment(pod, &request.deployment) {
+            return Err(FORBIDDEN);
+        }
+        let seed = self.seed.get().ok_or(UNAVAILABLE)?;
+        let root = derive_root(&seed, namespace, &request.deployment).map_err(|e| {
+            tracing::error!(error = %e, "root derivation failed");
+            UNAVAILABLE
+        })?;
+        root.sign_intermediate(&public_key, SystemTime::now())
+            .map_err(|_| INVALID)
+    }
+}
+
+/// The token of an `Authorization: Bearer` header, if any.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let token = value.strip_prefix("Bearer ")?.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+/// A Kubernetes object name: it is logged, so nothing else gets through.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+}
+
+/// Reads the body, refusing more than [`MAX_BODY`] bytes.
+async fn read_body(body: Body) -> Result<Vec<u8>, Refusal> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| INVALID)?;
+        if bytes.len() + chunk.len() > MAX_BODY {
+            return Err(TOO_LARGE);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -168,11 +320,17 @@ mod tests {
         let service = tower::service_fn(move |request: Request<kube::client::Body>| {
             let seen = seen.clone();
             async move {
-                assert_eq!(request.uri().path(), "/apis/authentication.k8s.io/v1/tokenreviews");
+                assert_eq!(
+                    request.uri().path(),
+                    "/apis/authentication.k8s.io/v1/tokenreviews"
+                );
                 let bytes = request.into_body().collect_bytes().await.unwrap();
                 let review: Value = serde_json::from_slice(&bytes).unwrap();
                 seen.lock().unwrap().push(review.clone());
-                let token = review["spec"]["token"].as_str().unwrap_or_default().to_string();
+                let token = review["spec"]["token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
                 let user = |pod: Option<&str>| {
                     let mut user = json!({"username": "system:serviceaccount:shop:default"});
                     if let Some(pod) = pod {
@@ -202,8 +360,11 @@ mod tests {
                         json!({"authenticated": true, "user": user(Some(POD)),
                                "audiences": ["https://kubernetes.default.svc"]}),
                     ),
-                    "boom" => (500, json!({"kind": "Status", "apiVersion": "v1",
-                               "status": "Failure", "message": "boom", "code": 500})),
+                    "boom" => (
+                        500,
+                        json!({"kind": "Status", "apiVersion": "v1",
+                               "status": "Failure", "message": "boom", "code": 500}),
+                    ),
                     _ => (
                         200,
                         json!({"authenticated": false, "error": "invalid bearer token"}),
@@ -249,7 +410,9 @@ mod tests {
         let mut metrics = Metrics::new("controller", "test");
         let api = Arc::new(SidecarApi {
             seed: seed.clone(),
-            reviewer: Arc::new(KubeReviewer::new(client)),
+            reviewer: Arc::new(KubeReviewer::new(Arc::new(OnceCell::new_with(Some(
+                client,
+            ))))),
             metrics: ApiMetrics::register(metrics.registry_mut()),
         });
         Setup {
@@ -336,7 +499,11 @@ mod tests {
         let s = setup();
         let key = KeyPair::generate().unwrap();
         for token in [None, Some(""), Some("bad"), Some("wrong-audience")] {
-            assert_eq!(post_status(&s, token, body("pay", &key)).await, 401, "{token:?}");
+            assert_eq!(
+                post_status(&s, token, body("pay", &key)).await,
+                401,
+                "{token:?}"
+            );
         }
         // Without a token the API server is not asked.
         let asked = s.reviews.lock().unwrap().len();
@@ -359,8 +526,14 @@ mod tests {
         // The token is bound to a `pay` pod.
         assert_eq!(post_status(&s, Some("ok"), body("web", &key)).await, 403);
         assert_eq!(post_status(&s, Some("ok"), body("pa", &key)).await, 403);
-        assert_eq!(post_status(&s, Some("other-pod"), body("pay", &key)).await, 403);
-        assert_eq!(post_status(&s, Some("no-claim"), body("pay", &key)).await, 403);
+        assert_eq!(
+            post_status(&s, Some("other-pod"), body("pay", &key)).await,
+            403
+        );
+        assert_eq!(
+            post_status(&s, Some("no-claim"), body("pay", &key)).await,
+            403
+        );
     }
 
     #[tokio::test]
@@ -392,7 +565,10 @@ mod tests {
         let key = KeyPair::generate().unwrap();
         assert_eq!(post_status(&s, Some("boom"), body("pay", &key)).await, 503);
         let unseeded = setup_with(Arc::new(SeedSlot::new()));
-        assert_eq!(post_status(&unseeded, Some("ok"), body("pay", &key)).await, 503);
+        assert_eq!(
+            post_status(&unseeded, Some("ok"), body("pay", &key)).await,
+            503
+        );
     }
 
     #[tokio::test]
@@ -419,14 +595,7 @@ mod tests {
         assert_eq!(logs.len(), 5, "{logs:?}");
         let field = |v: &Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
         let line = |i: usize| {
-            [
-                "endpoint",
-                "namespace",
-                "pod",
-                "deployment",
-                "result",
-            ]
-            .map(|k| field(&logs[i], k))
+            ["endpoint", "namespace", "pod", "deployment", "result"].map(|k| field(&logs[i], k))
         };
         assert_eq!(line(0), [ENDPOINT, "shop", POD, "pay", "ok"]);
         assert_eq!(line(1), [ENDPOINT, "shop", POD, "web", "forbidden"]);

@@ -25,11 +25,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_ADMIN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8081);
 
+const DEFAULT_SIDECAR_API: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8444);
+
 struct Config {
     common: CommonConfig,
     valkey: redis::Client,
     webhook: WebhookConfig,
     tls_ca: tls_ca::TlsCaConfig,
+    sidecar_api_addr: SocketAddr,
 }
 
 fn config(env: &Env) -> Result<Config, ConfigError> {
@@ -38,6 +42,7 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
         valkey: valkey::client_from_env(env)?,
         webhook: WebhookConfig::from_env(env, VERSION)?,
         tls_ca: tls_ca::TlsCaConfig::from_env(env)?,
+        sidecar_api_addr: env.parse_or("MIMIC_SIDECAR_API_ADDR", DEFAULT_SIDECAR_API)?,
     })
 }
 
@@ -67,6 +72,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     let mut metrics = Metrics::new("controller", VERSION);
     let admission_metrics = webhook::AdmissionMetrics::register(metrics.registry_mut());
     let cert_metrics = cert_manager::CertMetrics::register(metrics.registry_mut());
+    let api_metrics = sidecar_api::ApiMetrics::register(metrics.registry_mut());
     let seed_metrics = tls_ca::SeedMetrics::register(metrics.registry_mut());
     let metrics = Arc::new(metrics);
     let webhook = config.webhook;
@@ -81,8 +87,11 @@ async fn run(config: Config) -> std::io::Result<()> {
     let cert = Arc::new(tls::CertSlot::new());
     // The TLS seed (spec §5) is loaded into this slot by `tls_ca::manage`.
     let seed = Arc::new(tls_ca::SeedSlot::new());
+    // The cluster client, for the sidecar API's `TokenReview`s, once it is available.
+    let kube_client = Arc::new(tokio::sync::OnceCell::new());
     tokio::spawn({
         let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
+        let kube_client = kube_client.clone();
         let tls_ca = config.tls_ca;
         let certificates = cert_manager::CertConfig {
             namespace: webhook.namespace.clone(),
@@ -92,6 +101,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         };
         async move {
             let client = workloads::client().await;
+            let _ = kube_client.set(client.clone());
             tokio::spawn(workloads::watch(client.clone(), cache));
             tokio::spawn(tls_ca::manage(client.clone(), tls_ca, seed, seed_metrics));
             cert_manager::manage(client, certificates, cert, cert_metrics).await;
@@ -129,18 +139,35 @@ async fn run(config: Config) -> std::io::Result<()> {
         cache,
         metrics: admission_metrics,
     });
+    let api = Arc::new(sidecar_api::SidecarApi {
+        seed: seed.clone(),
+        reviewer: Arc::new(sidecar_api::KubeReviewer::new(kube_client)),
+        metrics: api_metrics,
+    });
     let webhook_listener = tokio::net::TcpListener::bind(webhook.addr).await?;
     tracing::info!(addr = %webhook_listener.local_addr()?, "webhook listening");
     let grace = config.common.shutdown_grace;
+    let limits = tls::Limits {
+        max_connections: webhook.max_connections,
+        request_timeout: webhook.request_timeout,
+        idle_timeout: tls::IDLE_TIMEOUT,
+    };
     let webhook_server = tls::serve(
         webhook_listener,
-        cert,
+        cert.clone(),
         webhook::router(admission),
-        tls::Limits {
-            max_connections: webhook.max_connections,
-            request_timeout: webhook.request_timeout,
-            idle_timeout: tls::IDLE_TIMEOUT,
-        },
+        limits,
+        grace,
+        shutdown.clone().wait(),
+    );
+    // Same serving certificate and limits, with a connection budget of its own.
+    let api_listener = tokio::net::TcpListener::bind(config.sidecar_api_addr).await?;
+    tracing::info!(addr = %api_listener.local_addr()?, "sidecar api listening");
+    let api_server = tls::serve(
+        api_listener,
+        cert,
+        sidecar_api::router(api),
+        limits,
         grace,
         shutdown.clone().wait(),
     );
@@ -152,6 +179,6 @@ async fn run(config: Config) -> std::io::Result<()> {
         grace,
         shutdown.wait(),
     );
-    tokio::try_join!(webhook_server, admin_server)?;
+    tokio::try_join!(webhook_server, api_server, admin_server)?;
     Ok(())
 }
