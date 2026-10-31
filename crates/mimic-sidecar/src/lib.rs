@@ -3,7 +3,8 @@
 pub mod access;
 pub mod connection;
 pub mod exchange;
-pub mod http;
+pub mod h2;
+pub mod http1;
 pub mod listener;
 pub mod opaque;
 pub mod probes;

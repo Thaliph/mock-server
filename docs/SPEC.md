@@ -220,9 +220,9 @@ would see without mimic, except for the limits listed at the end of this section
   | `dst` | original destination `ip:port` | same |
   | `authority` | normalised target authority (below), else `dst` | — |
   | `sni` | — | TLS only, when present |
-  | `method`, `path` | method; path **without query**, at most 1024 bytes | — |
+  | `method`, `path` | method (at most 64 bytes); path **without query**, at most 1024 bytes | — |
   | `status` | response status, absent when none | — |
-  | `grpc_status` | from the trailers, when present | — |
+  | `grpc_status` | HTTP/2 only: from the trailers, when present | — |
   | `upgrade` | `true` when the exchange became a tunnel | — |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
@@ -232,8 +232,11 @@ would see without mimic, except for the limits listed at the end of this section
 
   The target authority is, for HTTP/1, the authority of an absolute-form request target, else
   the `Host` header; for HTTP/2, `:authority`, else the `Host` header (RFC 9110 §7.2,
-  RFC 9113 §8.3.1); its default port is 80, or 443 on an intercepted TLS connection. Header
-  values, cookies, query strings and bodies are never logged, decrypted or not.
+  RFC 9113 §8.3.1); its default port is 80, or 443 on an intercepted TLS connection. The HTTP/1
+  codec keeps at most 64 bytes of the method and 1024 bytes of the `Host` value and of the
+  authority of the request target (a bound on its memory), and the logged `method` and
+  `authority` are cut accordingly. Header values, cookies, query strings and bodies are never
+  logged, decrypted or not.
 
 Accepted limits of the proxy:
 
@@ -564,7 +567,8 @@ client or the destination sees, the connection is **passed through** untouched i
   `mimic_tls_seed_loaded` (gauge, 1 once the seed is loaded).
 
   `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
-  port removed, `(invalid)` when it is not a host name or IP literal). Per direction and per
+  port removed, `(invalid)` when it is not a host name or IP literal; an HTTP/1 `Host` value or
+  request-target authority is first cut to 1024 bytes, the codec's memory bound). Per direction and per
   metric, the first `MIMIC_METRICS_MAX_AUTHORITIES` distinct values are kept; later ones are
   counted under `authority="(other)"`. The two sentinels contain characters that no
   normalised authority has, so a real host named `other` or `invalid` keeps its own series,
@@ -768,7 +772,7 @@ names contain the criterion ID (`fnd_02_…`).
 | FND-07 | The image runs as UID 65532, contains no shell, and both binaries answer `--version` with the crate version. |
 | FND-08 | `helm lint` passes; every rendered pod is Pod Security `restricted` (non-root, read-only root filesystem, no capability, `RuntimeDefault` seccomp, no privilege escalation). Valkey requires a password generated at install and kept on upgrade, and only accepts connections from the controller (NetworkPolicy; needs a CNI that enforces NetworkPolicy, as kind's default does). |
 | FND-09 | On kind (Kubernetes ≥ 1.33), `helm install` brings the controller and Valkey to Ready, and the controller's `/readyz` and `/metrics` answer through a port-forward. |
-| FND-10 | CI runs as dependent stages: lint → unit and integration tests → image build and scan → kind e2e, plus a security stage (`cargo deny`, `zizmor`); a single `ci-ok` check sums them up. A `v*` tag publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart. |
+| FND-10 | CI runs as dependent stages: lint → unit and integration tests → image build and scan → kind e2e, plus a security stage (`cargo deny`, `zizmor`); a single `ci-ok` check sums them up: it fails if any job fails or is cancelled, and accepts a skipped job only when the job's own path filter excluded it (the HTTP/1 codec fuzz job, PRX-28, on a change outside `crates/mimic-core/src/proxy/http1/` and `fuzz/`). A `v*` tag publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart. |
 
 ### 12.2 F1 — Injection
 
@@ -822,7 +826,7 @@ in-process with an injected original destination, as the F1 tunnel tests do.
 | PRX-12 | **I.** Forward, never refuse: 1000 simultaneous connections are all accepted and served. The sidecar's open-file soft limit equals its hard limit (`/proc/<pid>/limits`), or the PRX-25 target when the hard limit is unlimited. While its stdout is not read, requests keep completing; once stdout is read again, `mimic_log_lines_dropped_total` is above zero and the dropped lines are absent, not truncated. |
 | PRX-13 | **I.** On `SIGTERM`, a response being streamed completes, new connections are refused, an idle HTTP/1 connection is closed, an HTTP/1 connection with a pending request is closed after its response with no byte added (no `connection: close`), an HTTP/2 client receives `GOAWAY`, and the process exits 0 within `MIMIC_SHUTDOWN_GRACE` (FND-05). Connections still open at the end of the grace are closed as PRX-20 says. |
 | PRX-14 | **E.** In the INJ-13 scenario, a request from another pod to the app, an HTTP request from the app to another Service and a TLS connection from the app to the controller's webhook Service produce, in the sidecar's logs, access lines with `direction` `inbound` / `outbound` and `protocol` `http1` / `tls` (`sni` = the webhook Service name), and the matching `mimic_http_requests_total{…,status_class="2xx"}` and `mimic_proxy_connections_total{…,protocol="tls"}` series on `/metrics`. |
-| PRX-15 | **I.** HTTP/1 byte exactness: for each conversation of a fixed corpus, the bytes the destination receives equal the bytes the client sent and the bytes the client receives equal the bytes the destination sent (whole-stream comparison), on the inbound and the outbound listener. The corpus covers: mixed-case, repeated and reordered headers, 300 response header lines (more than `hyper`'s 100); `obs-fold` in a non-framing header; bare-LF line ends; `chunked` with chunk extensions and mixed-case trailers without `TE: trailers`; a close-delimited HTTP/1.1 response; an HTTP/1.0 client with and without `Connection: keep-alive` talking to an HTTP/1.1 destination; `Expect: 100-continue` with `100` then the final response; `103` before `200`; `HEAD` answered with `content-length: 5` and no body, `204`, `304`; 5 pipelined requests in one write; a response sent while no request is pending. Each exchange writes one access line with the method, path, final status and body byte counts of the conversation. |
+| PRX-15 | **I.** HTTP/1 byte exactness: for each conversation of a fixed corpus, the bytes the destination receives equal the bytes the client sent and the bytes the client receives equal the bytes the destination sent (whole-stream comparison), on the inbound and the outbound listener. The corpus covers: mixed-case, repeated and reordered headers, 200 response header lines (more than `hyper`'s 100, fewer than the codec's 256); `obs-fold` in a non-framing header; bare-LF line ends; `chunked` with chunk extensions and mixed-case trailers without `TE: trailers`; a close-delimited HTTP/1.1 response; an HTTP/1.0 client with and without `Connection: keep-alive` talking to an HTTP/1.1 destination; `Expect: 100-continue` with `100` then the final response; `103` before `200`; `HEAD` answered with `content-length: 5` and no body, `204`, `304`; 5 pipelined requests in one write; a response sent while no request is pending. Each exchange writes one access line with the method, path, final status and body byte counts of the conversation. |
 | PRX-16 | **I.** No framing header is added on HTTP/2: a `POST` and a `PUT` without body and without `content-length` (`END_STREAM` on `HEADERS`) reach the destination without `content-length`, and a request with a body and no `content-length` reaches it without one. |
 | PRX-17 | **I.** FIN propagation on HTTP/1: after a complete request, a client `shutdown(Write)` reaches the destination, which reads the complete request then EOF within 1 s; it answers after the EOF and the client reads the whole response, then EOF once the destination closes. With two pipelined requests sent in one write followed by the FIN, the destination reads both requests before EOF. A destination FIN after a close-delimited response reaches the client after the last body byte. When the destination closes without answering after the client's EOF, the access line has `result: client_abort`. |
 | PRX-18 | **I.** Resets are propagated as resets: an HTTP/1 client that resets (`SO_LINGER` 0) while its request waits for a silent destination, and one that resets after a FIN, make the destination's socket fail with `ECONNRESET` within 1 s, and the exchange's access line (`result: client_abort`) is written within 1 s; a destination that resets before answering makes the client's socket fail with `ECONNRESET` (`result: upstream_reset`). In an opaque tunnel and in a TLS tunnel, a reset by either side, also during protocol detection, reaches the other as a reset within 1 s. (A peer that already sent its FIN sees the reset as `EPIPE` on Linux, its socket being in `CLOSE_WAIT`.) |

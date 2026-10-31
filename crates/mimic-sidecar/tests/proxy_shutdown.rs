@@ -97,6 +97,49 @@ async fn prx_13_streamed_response_completes_and_new_connections_are_refused() {
 }
 
 #[tokio::test]
+async fn prx_13_pending_http1_request_is_answered_then_closed_with_no_byte_added() {
+    let _logs = common::capture_logs();
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let dest = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            gate.notified().await;
+            s.write_all(response).await.unwrap();
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink).await;
+        });
+        addr
+    };
+    let f = fixture(Direction::Inbound, move |_| Some(dest)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"GET / HTTP/1.1\r\nhost: svc\r\n\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    f.shared.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    gate.notify_one();
+    let mut got = Vec::new();
+    tokio::time::timeout(TIMEOUT, c.read_to_end(&mut got))
+        .await
+        .expect("the connection closes after the response")
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(response)
+    );
+    tokio::time::timeout(TIMEOUT, f.shared.drained())
+        .await
+        .expect("no connection left");
+}
+
+#[tokio::test]
 async fn prx_13_idle_http1_connection_is_closed() {
     let _logs = common::capture_logs();
     let dest = {

@@ -272,57 +272,46 @@ async fn prx_07_destination_closing_after_the_request_closes_the_client_without_
     assert!(got.is_empty(), "{:?}", String::from_utf8_lossy(&got));
 }
 
-async fn answer_to(request: Vec<u8>) -> Vec<u8> {
+/// Sends `request` through the proxy to a destination that answers `200`: the destination
+/// receives the request unchanged and the client gets the destination's answer, never a `400` or
+/// a `431` of the sidecar (PRX-07, PRX-29).
+async fn destination_decides(request: Vec<u8>) {
     let response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-    let dest = scripted(vec![response], 0).await;
+    let mut dest = scripted(vec![response], 0).await;
     let addr = dest.addr;
     let f = fixture(Direction::Inbound, move |_| Some(addr)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
-    // The proxy may answer and close before the whole request is written.
-    let _ = c.write_all(&request).await;
-    let mut got = Vec::new();
-    let _ = tokio::time::timeout(TIMEOUT, c.read_to_end(&mut got)).await;
-    got
-}
-
-#[tokio::test]
-async fn prx_07_malformed_header_gets_400() {
-    let got = answer_to(b"GET / HTTP/1.1\r\nHost: a\r\nBad Header\r\n\r\n".to_vec()).await;
+    c.write_all(&request).await.unwrap();
     assert!(
-        got.starts_with(b"HTTP/1.1 400 "),
-        "{:?}",
-        String::from_utf8_lossy(&got)
+        recv(&mut dest).await == request,
+        "the destination saw other bytes"
     );
+    assert_eq!(read_until(&mut c, response.len()).await, response);
 }
 
 #[tokio::test]
-async fn prx_07_more_than_256_header_lines_gets_431() {
+async fn prx_07_malformed_header_is_forwarded_and_the_destination_answers() {
+    destination_decides(b"GET / HTTP/1.1\r\nHost: a\r\nBad Header\r\n\r\n".to_vec()).await;
+}
+
+#[tokio::test]
+async fn prx_07_more_than_256_header_lines_are_forwarded_and_the_destination_answers() {
     let mut req = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
     for i in 0..300 {
         req.extend_from_slice(format!("X-H{i}: v\r\n").as_bytes());
     }
     req.extend_from_slice(b"\r\n");
-    let got = answer_to(req).await;
-    assert!(
-        got.starts_with(b"HTTP/1.1 431 "),
-        "{:?}",
-        String::from_utf8_lossy(&got)
-    );
+    destination_decides(req).await;
 }
 
 #[tokio::test]
-async fn prx_07_header_section_over_64_kib_gets_431() {
+async fn prx_07_header_section_over_64_kib_is_forwarded_and_the_destination_answers() {
     let mut req = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
     for i in 0..10 {
         req.extend_from_slice(format!("X-Big{i}: {}\r\n", "a".repeat(8000)).as_bytes());
     }
     req.extend_from_slice(b"\r\n");
-    let got = answer_to(req).await;
-    assert!(
-        got.starts_with(b"HTTP/1.1 431 "),
-        "{:?}",
-        String::from_utf8_lossy(&got)
-    );
+    destination_decides(req).await;
 }
 
 #[tokio::test]
