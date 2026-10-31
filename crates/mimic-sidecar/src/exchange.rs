@@ -88,6 +88,10 @@ pub(crate) struct Tracker {
     head: Option<Duration>,
     grpc_status: Option<u64>,
     upgrade: bool,
+    /// The request was counted in the RED metrics.
+    counted: bool,
+    /// The access line was written.
+    ended: bool,
 }
 
 fn grpc_status(headers: &HeaderMap) -> Option<u64> {
@@ -130,6 +134,8 @@ impl Tracker {
             head: None,
             grpc_status: None,
             upgrade: false,
+            counted: false,
+            ended: false,
         };
         let (parts, inner) = req.into_parts();
         let body = ReqBody {
@@ -140,16 +146,21 @@ impl Tracker {
     }
 
     /// The destination did not answer: the exchange ends here.
-    pub(crate) fn failed(self) {
-        let elapsed = self.started.elapsed();
+    pub(crate) fn failed(mut self) {
+        self.count_unanswered();
+        self.finish(Outcome::UpstreamReset, 0);
+    }
+
+    /// Counts a request that got no response (`status_class="none"`).
+    fn count_unanswered(&mut self) {
+        self.counted = true;
         self.ctx.proxy.request(
             self.ctx.direction,
             self.protocol,
             &self.authority,
             None,
-            elapsed,
+            self.started.elapsed(),
         );
-        self.finish(Outcome::UpstreamReset, 0);
     }
 
     /// The response head arrived: counts the request and wraps the response body, which ends
@@ -165,6 +176,7 @@ impl Tracker {
         self.head = Some(head);
         self.upgrade = upgrade;
         self.grpc_status = grpc_status(response.headers());
+        self.counted = true;
         self.ctx.proxy.request(
             self.ctx.direction,
             self.protocol,
@@ -182,7 +194,8 @@ impl Tracker {
         Response::from_parts(parts, body)
     }
 
-    fn finish(self, outcome: Outcome, bytes_out: u64) {
+    fn finish(&mut self, outcome: Outcome, bytes_out: u64) {
+        self.ended = true;
         let failed = self.request.failed.load(Ordering::Relaxed);
         let outcome = if failed && outcome != Outcome::Ok {
             Outcome::ClientAbort
@@ -197,9 +210,9 @@ impl Tracker {
             direction: self.ctx.direction,
             protocol: self.protocol,
             dst: self.ctx.dst,
-            authority: self.authority,
-            method: Some(self.method),
-            path: Some(self.path),
+            authority: std::mem::take(&mut self.authority),
+            method: Some(std::mem::take(&mut self.method)),
+            path: Some(std::mem::take(&mut self.path)),
             status: self.status,
             grpc_status: self.grpc_status,
             upgrade: self.upgrade,
@@ -209,6 +222,19 @@ impl Tracker {
             bytes_in,
             bytes_out,
         });
+    }
+}
+
+impl Drop for Tracker {
+    /// The service future was dropped before the exchange ended (the client left, or the
+    /// connection was torn down): the client aborted.
+    fn drop(&mut self) {
+        if !self.ended {
+            if !self.counted {
+                self.count_unanswered();
+            }
+            self.finish(Outcome::ClientAbort, 0);
+        }
     }
 }
 
@@ -223,7 +249,7 @@ pub(crate) struct RespBody {
 
 impl RespBody {
     fn end(&mut self, outcome: Outcome) {
-        if let Some(tracker) = self.tracker.take() {
+        if let Some(mut tracker) = self.tracker.take() {
             tracker.finish(outcome, self.bytes_out);
         }
     }

@@ -554,14 +554,20 @@ async fn prx_08_client_leaving_before_any_response_is_client_abort() {
     });
     let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"GET /slow HTTP/1.1\r\nHost: a.example\r\n\r\n")
+    // The body is cut short. (A plain close after a complete request may be a half-close: the
+    // proxy then keeps waiting for the answer, as the destination would.)
+    c.write_all(b"POST /slow HTTP/1.1\r\nHost: a.example\r\nContent-Length: 10\r\n\r\nabc")
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
+    socket2::SockRef::from(&c)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
     drop(c);
     let lines = logs.access_exactly(1).await;
     assert_eq!(lines[0]["result"], "client_abort");
     assert_eq!(lines[0]["path"], "/slow");
+    assert_eq!(number(&lines[0], "bytes_in"), 3);
     assert!(lines[0].get("status").is_none(), "{}", lines[0]);
     counted(
         &f.metrics,
