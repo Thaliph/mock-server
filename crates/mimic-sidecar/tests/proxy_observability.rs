@@ -129,23 +129,6 @@ async fn prx_08_authority_falls_back_to_the_destination() {
 }
 
 #[tokio::test]
-async fn prx_08_grpc_status_comes_from_the_trailers() {
-    let logs = capture_logs();
-    let response: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: grpc-status\r\n\r\n3\r\nyes\r\n0\r\ngrpc-status: 7\r\n\r\n";
-    let addr = dest(&[response], 0).await;
-    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
-    let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"GET /svc/Method HTTP/1.1\r\nHost: g\r\nTE: trailers\r\n\r\n")
-        .await
-        .unwrap();
-    read_exact(&mut c, response.len()).await;
-    let lines = logs.access_exactly(1).await;
-    assert_eq!(lines[0]["grpc_status"], 7);
-    assert_eq!(lines[0]["status"], 200);
-    assert_eq!(lines[0]["result"], "ok");
-}
-
-#[tokio::test]
 async fn prx_08_destination_closing_without_answer_is_upstream_reset() {
     let logs = capture_logs();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

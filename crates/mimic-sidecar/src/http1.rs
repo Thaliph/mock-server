@@ -4,14 +4,15 @@
 //! client bytes behind an upgrade request until its response) and reports [`Event`]s. After
 //! `Tunnel` or `Unframed` the codec is silent and the two pumps are a plain opaque relay.
 //! A FIN reaches the other side as a FIN once every byte read before it was written; a reset
-//! (or any socket failure) reaches it as a reset, also after a FIN.
+//! (or any socket failure) reaches it as a reset, also after a FIN. On `stop` (shutdown) the
+//! connection is closed, nothing added, as soon as the codec is between two messages.
 
 use std::future::Future;
 use std::io;
 use std::net::Shutdown;
 use std::pin::pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use mimic_core::proxy::http1::{Codec, Event};
 use socket2::SockRef;
@@ -38,6 +39,8 @@ pub struct Relayed {
     pub to_client: u64,
     /// Requests read and never answered by a final response.
     pub unanswered: usize,
+    /// Payload bytes of the request body left incomplete, and of the response body.
+    pub partial_body: (u64, u64),
 }
 
 type Failure = (Side, io::Error);
@@ -51,6 +54,10 @@ struct Relay<F> {
     state: Mutex<State<F>>,
     /// A response completed, or the codec went silent: the client pump may use more bytes.
     unblocked: Notify,
+    /// The shutdown started: close at the next idle point.
+    stopping: AtomicBool,
+    /// The connection is idle while stopping: the relay can end.
+    closing: Notify,
     /// Which side sent its FIN first: `NONE`, `CLIENT` or `SERVER`.
     closed_first: AtomicU8,
     to_upstream: AtomicU64,
@@ -69,6 +76,13 @@ impl<F: FnMut(Event)> Relay<F> {
             (state.on_event)(event);
         }
         out
+    }
+
+    /// While stopping, ends the relay once nothing is pending and nothing is half-read.
+    fn close_if_idle(&self) {
+        if self.stopping.load(Ordering::Relaxed) && self.with(|codec| (codec.idle(), Vec::new())) {
+            self.closing.notify_one();
+        }
     }
 
     fn first_to_close(&self, side: u8) {
@@ -138,6 +152,7 @@ impl<F: FnMut(Event)> Relay<F> {
             if answered {
                 self.unblocked.notify_one();
             }
+            self.close_if_idle();
         }
     }
 }
@@ -164,13 +179,15 @@ fn fin(to: &TcpStream, side: Side) -> Result<(), Failure> {
 }
 
 /// Relays one HTTP/1 connection until both sides are done, a side fails (the other one gets a
-/// reset) or `abort_signal` resolves. `first` are the client bytes already read (by protocol
+/// reset), `stop` resolves and the connection is idle (no byte added: both sides see a FIN),
+/// or `abort_signal` resolves. `first` are the client bytes already read (by protocol
 /// detection); `on_event` receives the codec's events in order.
 pub async fn relay(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
     first: Vec<u8>,
     on_event: impl FnMut(Event) + Send,
+    stop: impl Future<Output = ()> + Send,
     abort_signal: impl Future<Output = ()> + Send,
 ) -> Relayed {
     let (client, upstream) = (&*client, &*upstream);
@@ -180,25 +197,44 @@ pub async fn relay(
             on_event,
         }),
         unblocked: Notify::new(),
+        stopping: AtomicBool::new(false),
+        closing: Notify::new(),
         closed_first: AtomicU8::new(NONE),
         to_upstream: AtomicU64::new(0),
         to_client: AtomicU64::new(0),
     };
     let ended = {
         let mut abort_signal = pin!(abort_signal);
-        tokio::select! {
-            r = async {
-                tokio::try_join!(
-                    relay.client_pump(client, upstream, first),
-                    relay.server_pump(upstream, client),
-                )
-            } => r.map(|_| ()).map_err(Some),
-            (side, e) = failed(client, Side::Client) => Err(Some((side, e))),
-            (side, e) = failed(upstream, Side::Upstream) => Err(Some((side, e))),
-            () = &mut abort_signal => Err(None),
+        let mut stop = pin!(stop);
+        let mut stopping = false;
+        let mut pumps = pin!(async {
+            tokio::try_join!(
+                relay.client_pump(client, upstream, first),
+                relay.server_pump(upstream, client),
+            )
+        });
+        loop {
+            tokio::select! {
+                r = &mut pumps => break r.map(|_| ()).map_err(Some),
+                (side, e) = failed(client, Side::Client) => break Err(Some((side, e))),
+                (side, e) = failed(upstream, Side::Upstream) => break Err(Some((side, e))),
+                () = &mut abort_signal => break Err(None),
+                () = &mut stop, if !stopping => {
+                    stopping = true;
+                    relay.stopping.store(true, Ordering::Relaxed);
+                    relay.close_if_idle();
+                }
+                () = relay.closing.notified() => break Ok(()),
+            }
         }
     };
     let unanswered = relay.with(|codec| (codec.pending(), Vec::new()));
+    let partial_body = relay.with(|codec| {
+        (
+            (codec.request_body_bytes(), codec.response_body_bytes()),
+            Vec::new(),
+        )
+    });
     let (outcome, error) = match ended {
         Ok(()) if unanswered > 0 && relay.closed_first.load(Ordering::Relaxed) == CLIENT => {
             (Outcome::ClientAbort, None)
@@ -222,5 +258,6 @@ pub async fn relay(
         to_upstream: relay.to_upstream.load(Ordering::Relaxed),
         to_client: relay.to_client.load(Ordering::Relaxed),
         unanswered,
+        partial_body,
     }
 }

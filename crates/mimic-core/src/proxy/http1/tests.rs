@@ -804,3 +804,23 @@ fn prx_27_host_and_authority_are_cut_at_1024_bytes() {
     assert_eq!(r.host.unwrap().len(), AUTHORITY_LIMIT);
     assert_eq!(r.uri_authority.unwrap().len(), AUTHORITY_LIMIT);
 }
+
+#[test]
+fn idle_only_between_two_messages() {
+    let mut c = Codec::new();
+    assert!(c.idle());
+    c.client_bytes(b"GET / HT");
+    assert!(!c.idle(), "half a request line");
+    c.client_bytes(b"TP/1.1\r\nHost: a\r\n\r\n");
+    assert!(!c.idle(), "a request waits for its response");
+    c.server_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no");
+    assert!(!c.idle(), "half a response body");
+    assert_eq!(c.response_body_bytes(), 1);
+    c.server_bytes(b"k");
+    assert!(c.idle());
+    c.client_bytes(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab");
+    assert_eq!(c.request_body_bytes(), 2);
+    let mut u = Codec::new();
+    u.client_bytes(b"GET / HTTP/1.1\r\nContent-Length: x\r\n\r\n");
+    assert!(!u.idle(), "opaque after unframed");
+}
