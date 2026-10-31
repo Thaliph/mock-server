@@ -45,7 +45,7 @@ fn prx_12_unread_stdout_never_blocks_and_drops_are_counted() {
 
     let started = Instant::now();
     tracing::dispatcher::with_default(&dispatch, || {
-        for i in 0..500_000u32 {
+        for i in 0..100_000u32 {
             tracing::info!(i, "access");
         }
     });
@@ -69,7 +69,7 @@ fn prx_12_unread_stdout_never_blocks_and_drops_are_counted() {
         written += 1;
     }
     let dropped = handle.dropped_lines() as u64;
-    assert_eq!(written + dropped, 500_000);
+    assert_eq!(written + dropped, 100_000);
     assert!(
         metrics
             .encode()

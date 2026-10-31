@@ -95,7 +95,7 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
-    mimic_runtime::logging::init(&config.log);
+    let _log = mimic_runtime::logging::init(&config.log);
 
     let mut families = vec![Family::V4];
     if has_ipv6(&std::fs::read_to_string(IF_INET6).unwrap_or_default()) {

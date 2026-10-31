@@ -34,7 +34,7 @@ fn main() -> ExitCode {
         Ok(probes) => probes,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
-    mimic_runtime::logging::init(&config.log);
+    let _log = mimic_runtime::logging::init(&config.log);
     match run(config, tunnel, probes) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
