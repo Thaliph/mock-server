@@ -392,6 +392,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inj_19_tls_then_silence_is_closed_within_the_request_timeout() {
+        let server = start(4, Duration::from_secs(60)).await;
+        let mut tls = server.tls().await;
+        let started = Instant::now();
+        assert!(closed_within(&mut tls, TIMEOUT + MARGIN).await);
+        assert!(started.elapsed() >= TIMEOUT - Duration::from_millis(100));
+    }
+
+    #[tokio::test]
     async fn inj_19_headers_sent_byte_by_byte_are_closed_within_the_timeout() {
         let server = start(4, Duration::from_secs(60)).await;
         let mut tls = server.tls().await;
