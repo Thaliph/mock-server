@@ -288,7 +288,7 @@ fn skip_patch(pod: &Pod, reason: SkipReason) -> JsonPatchOp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request};
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct Capture(pub(crate) Arc<Mutex<Vec<u8>>>);
 
     impl Write for Capture {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -630,7 +630,7 @@ mod tests {
     }
 
     /// Clears the current thread's capture when the test ends.
-    struct CaptureGuard;
+    pub(crate) struct CaptureGuard;
 
     impl Drop for CaptureGuard {
         fn drop(&mut self) {
@@ -640,7 +640,7 @@ mod tests {
 
     /// One global subscriber for the test binary: a thread-local `set_default` races with the
     /// callsite interest cache when other tests log from threads without a subscriber.
-    fn capture_logs() -> (Capture, CaptureGuard) {
+    pub(crate) fn capture_logs() -> (Capture, CaptureGuard) {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             let subscriber = tracing_subscriber::fmt()

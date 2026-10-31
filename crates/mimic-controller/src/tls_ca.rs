@@ -224,7 +224,7 @@ impl SeedSlot {
     }
 
     /// Makes `seed` the one in use; whether it differs from the previous one.
-    fn set(&self, seed: Seed) -> bool {
+    pub(crate) fn set(&self, seed: Seed) -> bool {
         let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
         let changed = current.as_ref().is_none_or(|old| !old.same(&seed));
         if changed {
@@ -445,5 +445,83 @@ mod tests {
         let shown = format!("{s:?}");
         assert!(shown.contains("created"));
         assert!(!shown.contains("bytes"));
+    }
+
+    /// An API server holding one Secret: `GET` answers it, `PUT` replaces it.
+    fn secret_server(secret: Arc<std::sync::Mutex<Secret>>) -> kube::Client {
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let secret = secret.clone();
+            async move {
+                assert_eq!(
+                    request.uri().path(),
+                    "/api/v1/namespaces/mimic-system/secrets/tls-ca"
+                );
+                if request.method() == http::Method::PUT {
+                    let bytes = request.into_body().collect_bytes().await.unwrap();
+                    *secret.lock().unwrap() = serde_json::from_slice(&bytes).unwrap();
+                }
+                let body = serde_json::to_vec(&*secret.lock().unwrap()).unwrap();
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(body))
+                        .unwrap(),
+                )
+            }
+        });
+        kube::Client::new(service, "default")
+    }
+
+    fn secret_with(data: Option<BTreeMap<String, ByteString>>) -> Secret {
+        let mut secret = Secret::default();
+        secret.metadata.name = Some("tls-ca".into());
+        secret.metadata.namespace = Some("mimic-system".into());
+        secret.data = data;
+        secret
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tls_08_a_replaced_seed_signs_intermediates_within_60_seconds() {
+        let secret = Arc::new(std::sync::Mutex::new(secret_with(None)));
+        let slot = Arc::new(SeedSlot::new());
+        let mut registry = Registry::default();
+        tokio::spawn(manage(
+            secret_server(secret.clone()),
+            TlsCaConfig {
+                namespace: "mimic-system".into(),
+                secret: "tls-ca".into(),
+            },
+            slot.clone(),
+            SeedMetrics::register(&mut registry),
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // An empty Secret is filled and loaded.
+        let first = slot.get().expect("seed loaded");
+        assert_eq!(
+            Seed::from_data(secret.lock().unwrap().data.as_ref())
+                .unwrap()
+                .bytes[..],
+            first.bytes[..]
+        );
+
+        // Someone else replaces the seed: within 60 s (+ 5 s) the new root signs.
+        let replaced = Seed::generate(at(7));
+        secret.lock().unwrap().data = Some(replaced.to_data());
+        tokio::time::sleep(Duration::from_secs(65)).await;
+        let current = slot.get().unwrap();
+        assert_eq!(current.bytes[..], replaced.bytes[..]);
+
+        let key = KeyPair::generate().unwrap();
+        let spki = key.subject_public_key_info();
+        let signed = derive_root(&current, "shop", "cart")
+            .unwrap()
+            .sign_intermediate(&spki, at(100))
+            .unwrap();
+        let expected = derive_root(&replaced, "shop", "cart").unwrap();
+        let inter_der = parse(&signed);
+        let (_, inter) = x509_parser::parse_x509_certificate(&inter_der).unwrap();
+        let root_der = parse(expected.certificate_pem());
+        let (_, root) = x509_parser::parse_x509_certificate(&root_der).unwrap();
+        inter.verify_signature(Some(root.public_key())).unwrap();
     }
 }

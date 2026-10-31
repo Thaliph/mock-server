@@ -2,6 +2,7 @@
 //! lives here; the binaries are adapters around it.
 
 pub mod fd;
+pub mod identity;
 pub mod inject;
 pub mod proxy;
 pub mod redirect;
