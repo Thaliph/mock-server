@@ -119,7 +119,15 @@ fn facts(body: &[u8]) -> Option<ClientHello> {
         let n = exts.u16()?;
         let data = exts.take(n)?;
         match kind {
-            0 if out.sni.is_none() => out.sni = server_name(data)?,
+            0 if out.sni.is_none() && !out.sni_invalid => {
+                // An SNI is a key of the bounded memories and a leaf SAN: only DNS names.
+                if let Some(name) = server_name(data)? {
+                    match valid_host(&name) {
+                        Some(_) => out.sni = Some(name),
+                        None => out.sni_invalid = true,
+                    }
+                }
+            }
             16 if out.alpn.is_empty() => out.alpn = alpn(data)?,
             43 if versions.is_none() => versions = Some(supported_versions(data)?),
             _ => {}
@@ -140,8 +148,7 @@ fn server_name(data: &[u8]) -> Option<Option<String>> {
         let n = list.u16()?;
         let name = list.take(n)?;
         if name_type == 0 {
-            let ok = !name.is_empty() && name.iter().all(|b| b.is_ascii_graphic());
-            return Some(ok.then(|| String::from_utf8_lossy(name).into_owned()));
+            return Some(Some(String::from_utf8_lossy(name).into_owned()));
         }
     }
     Some(None)
@@ -236,6 +243,9 @@ pub fn decide(
     remembered: &Bounded<DestKey, Reason>,
     has_ca: bool,
 ) -> Decision {
+    if hello.sni_invalid {
+        return Decision::PassThrough(Reason::Unsupported);
+    }
     if exclusions.matches(hello.sni.as_deref(), dst) {
         return Decision::PassThrough(Reason::Excluded);
     }
