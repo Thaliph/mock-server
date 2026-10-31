@@ -154,3 +154,11 @@ fn inj_07_invalid_listener_address_exits_2() {
     assert_eq!(status.code(), Some(2));
     assert!(stderr.contains("MIMIC_INBOUND_ADDRS"), "{stderr}");
 }
+
+#[test]
+fn inj_18_invalid_app_probes_exit_2_without_echoing_the_value() {
+    let (status, stdout, stderr) = run(BIN, &[], &[("MIMIC_APP_PROBES", "{\"secret-token\":")]);
+    assert_eq!(status.code(), Some(2));
+    assert!(stderr.contains("MIMIC_APP_PROBES"), "{stderr}");
+    assert!(!stderr.contains("secret-token") && !stdout.contains("secret-token"));
+}
