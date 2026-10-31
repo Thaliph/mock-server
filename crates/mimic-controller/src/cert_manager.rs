@@ -7,13 +7,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use futures::StreamExt;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::admissionregistration::v1::MutatingWebhookConfiguration;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, Patch, PatchParams, PostParams};
+use kube::runtime::WatchStreamExt;
+use kube::runtime::watcher::{self, Event};
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use serde_json::json;
+use tokio::sync::Notify;
 
 use crate::certs::{self, Decision, Stored};
 use crate::tls::CertSlot;
@@ -62,6 +66,13 @@ pub async fn manage(
 ) {
     let secrets = Api::<Secret>::namespaced(client.clone(), &config.namespace);
     let configurations = Api::<MutatingWebhookConfiguration>::all(client);
+    // Any change of the configuration, made by anyone, triggers a pass at once (INJ-20).
+    let changed = Arc::new(Notify::new());
+    tokio::spawn(watch_configuration(
+        configurations.clone(),
+        config.configuration.clone(),
+        changed.clone(),
+    ));
     loop {
         let wait = match reconcile(&secrets, &configurations, &config, &slot, &metrics).await {
             Ok(()) => RECHECK,
@@ -70,7 +81,27 @@ pub async fn manage(
                 RETRY
             }
         };
-        tokio::time::sleep(wait).await;
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = changed.notified() => {}
+        }
+    }
+}
+
+/// Wakes `changed` each time the configuration `name` is seen, created or modified.
+async fn watch_configuration(
+    configurations: Api<MutatingWebhookConfiguration>,
+    name: String,
+    changed: Arc<Notify>,
+) {
+    let config = watcher::Config::default().fields(&format!("metadata.name={name}"));
+    let mut events = std::pin::pin!(watcher::watcher(configurations, config).default_backoff());
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(Event::Apply(_) | Event::InitApply(_)) => changed.notify_one(),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "webhook configuration watch error"),
+        }
     }
 }
 
@@ -99,6 +130,9 @@ async fn reconcile(
             .map_err(|e| format!("write secret: {e}"))?;
         tracing::info!(?decision, "webhook certificate issued");
     }
+    // The CA goes out first: loading the certificate makes the controller ready, and the API
+    // server must already trust it by then.
+    publish_ca(configurations, &config.configuration, &stored.ca_crt).await?;
     slot.set_pem(&stored.tls_crt, &stored.tls_key)?;
     if let Some(end) = certs::not_after(&stored.tls_crt) {
         let seconds = end.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -106,7 +140,7 @@ async fn reconcile(
             .expiry
             .set(i64::try_from(seconds).unwrap_or(i64::MAX));
     }
-    publish_ca(configurations, &config.configuration, &stored.ca_crt).await
+    Ok(())
 }
 
 /// Sets the `caBundle` of every webhook of the configuration to `ca`, when it differs.

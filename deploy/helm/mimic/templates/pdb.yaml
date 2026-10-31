@@ -1,0 +1,14 @@
+# At most one controller pod down at a time: the webhook fails closed (spec §7.1), so a drain
+# must not take both replicas at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-controller
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mimic-controller

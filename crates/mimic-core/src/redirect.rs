@@ -30,7 +30,9 @@ pub struct RedirectConfig {
     pub exclude_inbound_ports: BTreeSet<u16>,
 }
 
-/// `iptables-restore --noflush` input for `family`.
+/// `iptables-restore --noflush` input for `family`. Idempotent: the `MIMIC_*` chains are
+/// re-declared (which empties them) and the built-in chains are flushed before their single
+/// jump, so a second run, or a run after a partial failure, leaves one jump per chain.
 pub fn rules(config: &RedirectConfig, family: Family) -> String {
     let reject = match family {
         Family::V4 => "icmp-port-unreachable",
@@ -38,6 +40,8 @@ pub fn rules(config: &RedirectConfig, family: Family) -> String {
     };
     let mut out = String::from(
         "*nat\n:MIMIC_INBOUND - [0:0]\n:MIMIC_OUTPUT - [0:0]\n\
+         -F PREROUTING\n\
+         -F OUTPUT\n\
          -A PREROUTING -p tcp -m addrtype --dst-type LOCAL -j MIMIC_INBOUND\n\
          -A OUTPUT -p tcp -j MIMIC_OUTPUT\n",
     );
@@ -53,6 +57,7 @@ pub fn rules(config: &RedirectConfig, family: Family) -> String {
          -A MIMIC_OUTPUT -p tcp -j REDIRECT --to-ports {}\n\
          COMMIT\n\
          *filter\n:MIMIC_OUTPUT - [0:0]\n\
+         -F OUTPUT\n\
          -A OUTPUT -p udp --dport 443 -j MIMIC_OUTPUT\n\
          -A MIMIC_OUTPUT -p udp --dport 443 -j REJECT --reject-with {reject}\n\
          COMMIT\n",
@@ -90,6 +95,8 @@ mod tests {
                 "*nat",
                 ":MIMIC_INBOUND - [0:0]",
                 ":MIMIC_OUTPUT - [0:0]",
+                "-F PREROUTING",
+                "-F OUTPUT",
                 "-A PREROUTING -p tcp -m addrtype --dst-type LOCAL -j MIMIC_INBOUND",
                 "-A OUTPUT -p tcp -j MIMIC_OUTPUT",
                 "-A MIMIC_INBOUND -p tcp --dport 8081 -j RETURN",
@@ -116,6 +123,7 @@ mod tests {
             [
                 "*filter",
                 ":MIMIC_OUTPUT - [0:0]",
+                "-F OUTPUT",
                 "-A OUTPUT -p udp --dport 443 -j MIMIC_OUTPUT",
                 "-A MIMIC_OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable",
                 "COMMIT",
@@ -150,6 +158,26 @@ mod tests {
         let count = |prefix: &str| a.lines().filter(|l| l.starts_with(prefix)).count();
         assert_eq!(count("-A PREROUTING "), 1);
         assert_eq!(count("-A OUTPUT "), 2, "one in nat, one in filter");
+    }
+
+    #[test]
+    fn inj_22_built_in_chains_are_flushed_before_their_single_jump() {
+        let text = rules(&config(&[80]), Family::V4);
+        let l: Vec<&str> = text.lines().collect();
+        let at = |x: &str| {
+            l.iter()
+                .position(|y| *y == x)
+                .unwrap_or_else(|| panic!("{x}"))
+        };
+        assert!(
+            at("-F PREROUTING")
+                < at("-A PREROUTING -p tcp -m addrtype --dst-type LOCAL -j MIMIC_INBOUND")
+        );
+        assert!(at("-F OUTPUT") < at("-A OUTPUT -p tcp -j MIMIC_OUTPUT"));
+        let filter = at("*filter");
+        let flush = l.iter().rposition(|x| *x == "-F OUTPUT").unwrap();
+        assert!(filter < flush && flush < at("-A OUTPUT -p udp --dport 443 -j MIMIC_OUTPUT"));
+        assert_eq!(l.iter().filter(|x| x.starts_with("-F ")).count(), 3);
     }
 
     #[test]

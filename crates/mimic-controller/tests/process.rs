@@ -273,10 +273,12 @@ struct KubeState {
     secret_data: serde_json::Value,
     secret_version: u64,
     ca_bundles: Vec<String>,
+    config_version: u64,
     unknown: Vec<String>,
 }
 
 const SECRET_PATH: &str = "/api/v1/namespaces/mimic-system/secrets/mimic-webhook-tls";
+const CONFIGS_PATH: &str = "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations";
 const CONFIG_PATH: &str =
     "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/mimic-injector";
 
@@ -301,6 +303,7 @@ impl FakeKube {
             secret_data: serde_json::json!({}),
             secret_version: 1,
             ca_bundles: vec![String::new(); 3],
+            config_version: 1,
             unknown: Vec::new(),
         }));
         let shared = state.clone();
@@ -322,6 +325,13 @@ impl FakeKube {
 
     fn ca_bundles(&self) -> Vec<String> {
         self.state.lock().unwrap().ca_bundles.clone()
+    }
+
+    /// Another client changing the `caBundle` of webhook `index`.
+    fn set_ca_bundle(&self, index: usize, value: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.ca_bundles[index] = value.to_string();
+        state.config_version += 1;
     }
 }
 
@@ -351,6 +361,7 @@ fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
         reader.read_exact(&mut body).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let shared = state.clone();
         let mut state = state.lock().unwrap();
         let (status, reply) = match (method.as_str(), path) {
             ("GET", SECRET_PATH) => (200, secret_json(&state)),
@@ -381,7 +392,34 @@ fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
                         state.unknown.push(format!("patch {path}"));
                     }
                 }
+                state.config_version += 1;
                 (200, config_json(&state))
+            }
+            ("GET", CONFIGS_PATH)
+                if !query.contains("fieldSelector=metadata.name%3Dmimic-injector") =>
+            {
+                // RBAC only allows list and watch by resourceNames (spec §11).
+                state
+                    .unknown
+                    .push(format!("unscoped list or watch: {query}"));
+                (
+                    403,
+                    serde_json::json!({"apiVersion": "v1", "kind": "Status",
+                    "status": "Failure", "reason": "Forbidden", "code": 403, "message": "no"}),
+                )
+            }
+            ("GET", CONFIGS_PATH) => {
+                if query.contains("watch=true") {
+                    drop(state);
+                    watch_configuration(&mut writer, &shared);
+                    return;
+                }
+                let list = serde_json::json!({
+                    "apiVersion": "admissionregistration.k8s.io/v1",
+                    "kind": "MutatingWebhookConfigurationList",
+                    "metadata": {"resourceVersion": state.config_version.to_string()},
+                    "items": [config_json(&state)]});
+                (200, list)
             }
             ("GET", "/apis/mimic.platform.io/v1alpha1/mimicworkloads") => {
                 if query.contains("watch=true") {
@@ -416,6 +454,33 @@ fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
     }
 }
 
+/// Streams a `MODIFIED` event each time the configuration changes, until the client leaves.
+fn watch_configuration(writer: &mut TcpStream, state: &Mutex<KubeState>) {
+    if writer
+        .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+        .is_err()
+    {
+        return;
+    }
+    let mut sent = state.lock().unwrap().config_version;
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        let event = {
+            let state = state.lock().unwrap();
+            (state.config_version > sent).then(|| {
+                sent = state.config_version;
+                serde_json::json!({"type": "MODIFIED", "object": config_json(&state)})
+            })
+        };
+        if let Some(event) = event {
+            let line = format!("{event}\n");
+            if write!(writer, "{:x}\r\n{line}\r\n", line.len()).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 fn secret_json(state: &KubeState) -> serde_json::Value {
     serde_json::json!({"apiVersion": "v1", "kind": "Secret",
         "metadata": {"name": "mimic-webhook-tls", "namespace": "mimic-system",
@@ -435,7 +500,8 @@ fn config_json(state: &KubeState) -> serde_json::Value {
         .collect();
     serde_json::json!({"apiVersion": "admissionregistration.k8s.io/v1",
         "kind": "MutatingWebhookConfiguration",
-        "metadata": {"name": "mimic-injector", "resourceVersion": "1"}, "webhooks": webhooks})
+        "metadata": {"name": "mimic-injector",
+            "resourceVersion": state.config_version.to_string()}, "webhooks": webhooks})
 }
 
 #[test]
@@ -507,4 +573,58 @@ fn inj_11_certificates_are_stored_and_ca_bundle_patched_once_for_all_replicas() 
     );
     assert_eq!(kube.secret(), data);
     assert_eq!(kube.ca_bundles(), bundles);
+}
+
+#[test]
+fn inj_19_invalid_listener_limits_exit_2() {
+    for (var, value) in [
+        ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "0"),
+        ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "65536"),
+        ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "many"),
+        ("MIMIC_WEBHOOK_REQUEST_TIMEOUT", "0s"),
+        ("MIMIC_WEBHOOK_REQUEST_TIMEOUT", "fast"),
+    ] {
+        let (status, _, stderr) = run(
+            BIN,
+            &[],
+            &env(&[("MIMIC_VALKEY_URL", "redis://127.0.0.1:1"), (var, value)]),
+        );
+        assert_eq!(status.code(), Some(2), "{var}={value}");
+        assert!(stderr.contains(var), "{var}: {stderr}");
+    }
+}
+
+#[test]
+fn inj_20_a_changed_or_emptied_ca_bundle_is_restored_within_10s() {
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let kube = FakeKube::start("restore");
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[("MIMIC_VALKEY_URL", &url), ("KUBECONFIG", &kube.kubeconfig)]),
+    );
+    wait_status(
+        controller.admin_addr(),
+        "/readyz",
+        200,
+        Duration::from_secs(15),
+    );
+    let data = kube.secret();
+    // The Secret holds base64 already, as does the `caBundle`.
+    let encoded = data["ca.crt"].as_str().unwrap().to_string();
+    wait_until(|| kube.ca_bundles().iter().all(|b| *b == encoded));
+
+    kube.set_ca_bundle(0, "");
+    kube.set_ca_bundle(2, "Zm9vYmFy");
+    wait_until(|| kube.ca_bundles().iter().all(|b| *b == encoded));
+    assert_eq!(kube.secret(), data, "no new certificate");
+    assert!(kube.state.lock().unwrap().unknown.is_empty());
+}
+
+fn wait_until(condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "not restored in 10 s");
+        thread::sleep(Duration::from_millis(100));
+    }
 }

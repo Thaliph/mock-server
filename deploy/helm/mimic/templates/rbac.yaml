@@ -12,8 +12,9 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [admissionregistration.k8s.io]
     resources: [mutatingwebhookconfigurations]
+    # list and watch are limited by name too: the controller watches only its own configuration.
     resourceNames: [{{ include "mimic.webhookConfiguration" . }}]
-    verbs: [get, patch]
+    verbs: [get, list, watch, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

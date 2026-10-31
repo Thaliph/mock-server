@@ -26,4 +26,4 @@ workspace = true
 mimic-runtime = { path = "../mimic-runtime", features = ["testing"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5.3", features = ["util"] }

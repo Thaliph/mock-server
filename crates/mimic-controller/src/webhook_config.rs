@@ -1,6 +1,7 @@
 //! Webhook and injection settings of the controller (spec §10.2).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use mimic_core::inject::InjectConfig;
@@ -12,6 +13,8 @@ const DEFAULT_RESOURCES: &str =
 
 pub struct WebhookConfig {
     pub addr: SocketAddr,
+    pub max_connections: usize,
+    pub request_timeout: Duration,
     /// Namespace of the controller, never injected.
     pub namespace: String,
     pub service: String,
@@ -32,6 +35,8 @@ impl WebhookConfig {
             .map_err(|e| ConfigError::invalid("MIMIC_INJECT_SIDECAR_LOG", sidecar_log, e))?;
         Ok(WebhookConfig {
             addr: env.parse_or("MIMIC_WEBHOOK_ADDR", DEFAULT_ADDR)?,
+            max_connections: max_connections(env)?,
+            request_timeout: request_timeout(env)?,
             namespace: env.required("MIMIC_NAMESPACE")?.to_string(),
             service: env.required("MIMIC_WEBHOOK_SERVICE")?.to_string(),
             secret: env.required("MIMIC_WEBHOOK_SECRET")?.to_string(),
@@ -45,6 +50,34 @@ impl WebhookConfig {
             },
         })
     }
+}
+
+fn max_connections(env: &Env) -> Result<usize, ConfigError> {
+    let var = "MIMIC_WEBHOOK_MAX_CONNECTIONS";
+    let value = env.parse_or(var, 256_usize)?;
+    if (1..=65535).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ConfigError::invalid(
+            var,
+            &value.to_string(),
+            "expected 1 to 65535",
+        ))
+    }
+}
+
+fn request_timeout(env: &Env) -> Result<Duration, ConfigError> {
+    let var = "MIMIC_WEBHOOK_REQUEST_TIMEOUT";
+    let value = env.duration_or(var, Duration::from_secs(5))?;
+    if value.is_zero() {
+        let given = env.optional(var).unwrap_or_default();
+        return Err(ConfigError::invalid(
+            var,
+            given,
+            "expected a duration above 0",
+        ));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -80,6 +113,20 @@ mod tests {
     }
 
     #[test]
+    fn inj_19_listener_limit_defaults_and_values() {
+        let cfg = WebhookConfig::from_env(&env(&[]), "1").unwrap();
+        assert_eq!(cfg.max_connections, 256);
+        assert_eq!(cfg.request_timeout, Duration::from_secs(5));
+        let extra = [
+            ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "4"),
+            ("MIMIC_WEBHOOK_REQUEST_TIMEOUT", "500ms"),
+        ];
+        let cfg = WebhookConfig::from_env(&env(&extra), "1").unwrap();
+        assert_eq!(cfg.max_connections, 4);
+        assert_eq!(cfg.request_timeout, Duration::from_millis(500));
+    }
+
+    #[test]
     fn inj_08_each_required_variable_is_required() {
         for (var, _) in REQUIRED {
             let pairs = REQUIRED.iter().filter(|(k, _)| *k != var);
@@ -93,6 +140,12 @@ mod tests {
     fn inj_08_invalid_values_are_rejected() {
         for (var, value) in [
             ("MIMIC_WEBHOOK_ADDR", "nope"),
+            ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "0"),
+            ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "65536"),
+            ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "-1"),
+            ("MIMIC_WEBHOOK_REQUEST_TIMEOUT", "0s"),
+            ("MIMIC_WEBHOOK_REQUEST_TIMEOUT", "0ms"),
+            ("MIMIC_WEBHOOK_REQUEST_TIMEOUT", "5"),
             ("MIMIC_INJECT_SIDECAR_RESOURCES", "{not json"),
             ("MIMIC_INJECT_SIDECAR_LOG", "info,=="),
         ] {

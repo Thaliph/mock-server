@@ -57,6 +57,8 @@ fn main() -> ExitCode {
 
 #[tokio::main]
 async fn run(config: Config) -> std::io::Result<()> {
+    // Before any listener is announced: both servers must see a SIGTERM sent right after start.
+    let shutdown = admin::Shutdown::install()?;
     tracing::info!(version = VERSION, "controller starting");
     let mut metrics = Metrics::new("controller", VERSION);
     let admission_metrics = webhook::AdmissionMetrics::register(metrics.registry_mut());
@@ -123,12 +125,22 @@ async fn run(config: Config) -> std::io::Result<()> {
         webhook_listener,
         cert,
         webhook::router(admission),
+        tls::Limits {
+            max_connections: webhook.max_connections,
+            request_timeout: webhook.request_timeout,
+            idle_timeout: tls::IDLE_TIMEOUT,
+        },
         grace,
-        admin::shutdown_signal(),
+        shutdown.clone().wait(),
     );
 
     let listener = admin::bind(config.common.admin_addr).await?;
-    let admin_server = admin::serve(listener, admin::router(metrics, readiness), grace);
+    let admin_server = admin::serve_until(
+        listener,
+        admin::router(metrics, readiness),
+        grace,
+        shutdown.wait(),
+    );
     tokio::try_join!(webhook_server, admin_server)?;
     Ok(())
 }
