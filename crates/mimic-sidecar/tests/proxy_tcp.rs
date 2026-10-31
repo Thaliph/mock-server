@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::io;
 use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use common::{counted, echo_server, fixture};
 use mimic_sidecar::connection::configure_socket;
 use mimic_sidecar::listener::{Direction, raise_fd_limit};
 use nix::sys::socket::{getsockopt, sockopt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 
@@ -312,4 +313,201 @@ async fn prx_12_a_thousand_simultaneous_connections_are_all_served() {
         r#"mimic_tcp_connections_total{direction="inbound",result="ok"} 1000"#,
     )
     .await;
+}
+
+// ---- PRX-17 / PRX-18 (tunnel part): FIN passes as FIN, reset passes as reset ----
+
+fn reset(s: TcpStream) {
+    s.set_linger(Some(Duration::ZERO)).unwrap();
+    drop(s);
+}
+
+/// Waits for the failure that shows a reset (or fails the test after `TIMEOUT`).
+async fn expect_reset(s: &mut TcpStream) -> Duration {
+    let start = Instant::now();
+    tokio::time::timeout(TIMEOUT, async {
+        let mut buf = [0u8; 64];
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) => {
+                    // After a FIN the reset shows on the error readiness, then on a write.
+                    let _ = s.ready(Interest::ERROR).await;
+                    match s.write_all(b"x").await {
+                        Err(e) => {
+                            assert_eq!(e.kind(), io::ErrorKind::ConnectionReset, "{e}");
+                            return;
+                        }
+                        Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e.kind(), io::ErrorKind::ConnectionReset, "{e}");
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("reset in time");
+    start.elapsed()
+}
+
+/// A destination that hands its accepted socket to the test.
+async fn handing_destination() -> (SocketAddr, tokio::sync::oneshot::Receiver<TcpStream>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (s, _) = listener.accept().await.unwrap();
+        let _ = tx.send(s);
+    });
+    (addr, rx)
+}
+
+#[tokio::test]
+async fn prx_18_opaque_client_reset_reaches_the_destination_as_a_reset() {
+    let (dest, rx) = handing_destination().await;
+    let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"hello\n").await.unwrap();
+    let mut d = rx.await.unwrap();
+    read_exactly(&mut d, 6).await;
+    reset(c);
+    let took = expect_reset(&mut d).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
+async fn prx_18_opaque_client_reset_after_a_fin_reaches_the_destination_as_a_reset() {
+    let (dest, rx) = handing_destination().await;
+    let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"hello\n").await.unwrap();
+    c.shutdown().await.unwrap();
+    let mut d = rx.await.unwrap();
+    let mut buf = [0u8; 6];
+    tokio::time::timeout(TIMEOUT, d.read_exact(&mut buf))
+        .await
+        .expect("bytes in time")
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, d.read(&mut buf))
+            .await
+            .expect("fin in time")
+            .unwrap(),
+        0
+    );
+    reset(c);
+    let took = expect_reset(&mut d).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
+async fn prx_18_opaque_destination_reset_reaches_the_client_as_a_reset() {
+    let (dest, rx) = handing_destination().await;
+    let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"hello\n").await.unwrap();
+    let mut d = rx.await.unwrap();
+    read_exactly(&mut d, 6).await;
+    reset(d);
+    let took = expect_reset(&mut c).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
+async fn prx_18_opaque_destination_reset_after_a_fin_reaches_the_client_as_a_reset() {
+    let (dest, rx) = handing_destination().await;
+    let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"hello\n").await.unwrap();
+    let mut d = rx.await.unwrap();
+    read_exactly(&mut d, 6).await;
+    d.shutdown().await.unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        tokio::time::timeout(TIMEOUT, c.read(&mut buf))
+            .await
+            .expect("fin in time")
+            .unwrap(),
+        0
+    );
+    reset(d);
+    let took = expect_reset(&mut c).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
+async fn prx_17_opaque_destination_fin_passes_as_a_fin_and_not_as_a_reset() {
+    let (dest, rx) = handing_destination().await;
+    let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"hello\n").await.unwrap();
+    let mut d = rx.await.unwrap();
+    d.write_all(b"bye\n").await.unwrap();
+    d.shutdown().await.unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(TIMEOUT, c.read_to_end(&mut answer))
+        .await
+        .expect("fin in time")
+        .expect("a FIN, not a reset");
+    assert_eq!(answer, b"bye\n");
+}
+
+/// A TLS destination and a client that completed the handshake through the sidecar.
+async fn tls_pair() -> (
+    tokio_rustls::client::TlsStream<TcpStream>,
+    tokio_rustls::server::TlsStream<TcpStream>,
+) {
+    let cert = rcgen::generate_simple_self_signed(vec!["dest.example".to_string()]).unwrap();
+    let der = cert.cert.der().clone();
+    let key: PrivateKeyDer<'static> =
+        PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into();
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let server_config = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![der.clone()], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let dest = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dest_addr = dest.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = dest.accept().await.unwrap();
+        acceptor.accept(tcp).await.unwrap()
+    });
+    let f = fixture(Direction::Outbound, move |_| Some(dest_addr)).await;
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots.add(der).unwrap();
+    let client_config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tcp = TcpStream::connect(f.addr).await.unwrap();
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+        .connect(ServerName::try_from("dest.example").unwrap(), tcp)
+        .await
+        .expect("handshake through the sidecar");
+    (tls, server.await.unwrap())
+}
+
+#[tokio::test]
+async fn prx_18_tls_client_reset_reaches_the_destination_as_a_reset() {
+    let (tls, mut d) = tls_pair().await;
+    let (tcp, _) = tls.into_inner();
+    reset(tcp);
+    let took = expect_reset(d.get_mut().0).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
+async fn prx_18_tls_destination_reset_reaches_the_client_as_a_reset() {
+    let (mut tls, d) = tls_pair().await;
+    let (tcp, _) = d.into_inner();
+    reset(tcp);
+    let took = expect_reset(tls.get_mut().0).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
 }
