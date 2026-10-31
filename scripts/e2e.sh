@@ -242,6 +242,7 @@ can yes "get its webhook configuration" get mutatingwebhookconfigurations.admiss
 can yes "list its webhook configuration" list mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
 can yes "watch its webhook configuration" watch mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
 can yes "patch its webhook configuration" patch mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
+can yes "create tokenreviews (sidecar API authentication)" create tokenreviews.authentication.k8s.io
 can no "list all webhook configurations" list mutatingwebhookconfigurations.admissionregistration.k8s.io
 can no "watch all webhook configurations" watch mutatingwebhookconfigurations.admissionregistration.k8s.io
 can no "list another webhook configuration" list mutatingwebhookconfigurations.admissionregistration.k8s.io/some-other
@@ -256,6 +257,7 @@ can no "list pods" list pods -A
 can no "patch another webhook configuration" patch mutatingwebhookconfigurations.admissionregistration.k8s.io/some-other
 can no "get another webhook configuration" get mutatingwebhookconfigurations.admissionregistration.k8s.io/some-other
 can no "create deployments" create deployments.apps -n "$NS"
+can no "create subjectaccessreviews (only tokenreviews)" create subjectaccessreviews.authorization.k8s.io
 
 # The ValidatingAdmissionPolicy: as the controller account only caBundle may change.
 orig_cb=$(kubectl get mutatingwebhookconfiguration $cfg -o jsonpath='{.webhooks[0].clientConfig.caBundle}')
