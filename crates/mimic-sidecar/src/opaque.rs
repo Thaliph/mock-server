@@ -1,20 +1,26 @@
 //! The opaque tunnel (spec §4.1): bytes are relayed unchanged in both directions, with no idle
-//! timeout; a close or half-close on one side reaches the other. The bytes relayed and the side
-//! that failed first are recorded for the access line and the metrics.
+//! timeout. A FIN on one side reaches the other as a FIN; a reset (or any socket failure) on one
+//! side reaches the other as a reset (`SO_LINGER` 0), also after a FIN. The bytes relayed and the
+//! side that failed are recorded for the access line and the metrics.
 
 use std::io;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::task::{Context, Poll};
+use std::net::Shutdown;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
+use socket2::SockRef;
+use tokio::io::Interest;
 use tokio::net::TcpStream;
 
 use crate::access::Outcome;
 
-const NONE: u8 = 0;
-const CLIENT: u8 = 1;
-const UPSTREAM: u8 = 2;
+const CHUNK: usize = 16 * 1024;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    Client,
+    Upstream,
+}
 
 /// How a tunnel ended.
 pub struct Tunnelled {
@@ -26,66 +32,67 @@ pub struct Tunnelled {
     pub error: Option<io::Error>,
 }
 
-/// A socket that counts what it reads and records, in `first_failure`, that it failed first.
-struct Marked<'a> {
-    inner: &'a mut TcpStream,
-    side: u8,
-    first_failure: &'a AtomicU8,
-    read: u64,
-}
-
-impl Marked<'_> {
-    fn note<T>(&self, result: Poll<io::Result<T>>) -> Poll<io::Result<T>> {
-        if matches!(result, Poll::Ready(Err(_))) {
-            let _ = self.first_failure.compare_exchange(
-                NONE,
-                self.side,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+async fn write_all(to: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        to.writable().await?;
+        match to.try_write(data) {
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
         }
-        result
     }
+    Ok(())
 }
 
-impl AsyncRead for Marked<'_> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let before = buf.filled().len();
-        let result = Pin::new(&mut *this.inner).poll_read(cx, buf);
-        if matches!(result, Poll::Ready(Ok(()))) {
-            this.read += (buf.filled().len() - before) as u64;
+/// Copies `from` to `to` until `from` sends a FIN, which is passed on as a FIN. A failure is
+/// returned with the side it happened on.
+async fn copy(
+    from: &TcpStream,
+    from_side: Side,
+    to: &TcpStream,
+    to_side: Side,
+    count: &AtomicU64,
+) -> Result<(), (Side, io::Error)> {
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        from.readable().await.map_err(|e| (from_side, e))?;
+        match from.try_read(&mut buf) {
+            Ok(0) => {
+                return SockRef::from(to)
+                    .shutdown(Shutdown::Write)
+                    .or_else(|e| match e.kind() {
+                        io::ErrorKind::NotConnected => Ok(()),
+                        _ => Err((to_side, e)),
+                    });
+            }
+            Ok(n) => {
+                count.fetch_add(n as u64, Ordering::Relaxed);
+                write_all(to, &buf[..n]).await.map_err(|e| (to_side, e))?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err((from_side, e)),
         }
-        this.note(result)
     }
 }
 
-impl AsyncWrite for Marked<'_> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let result = Pin::new(&mut *this.inner).poll_write(cx, data);
-        this.note(result)
+/// Resolves when the socket has a pending error (a reset, also after a FIN was read).
+async fn failed(s: &TcpStream, side: Side) -> (Side, io::Error) {
+    loop {
+        if let Err(e) = s.ready(Interest::ERROR).await {
+            return (side, e);
+        }
+        match s.take_error() {
+            Ok(Some(e)) => return (side, e),
+            Err(e) => return (side, e),
+            // Ready without an error: nothing to report, do not spin.
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
     }
+}
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let result = Pin::new(&mut *this.inner).poll_flush(cx);
-        this.note(result)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let result = Pin::new(&mut *this.inner).poll_shutdown(cx);
-        this.note(result)
-    }
+/// Makes the close of `s` a reset.
+fn abort(s: &TcpStream) {
+    let _ = s.set_linger(Some(Duration::ZERO));
 }
 
 /// Writes the bytes read during detection to their side, then relays until both sides are done.
@@ -95,39 +102,46 @@ pub async fn tunnel(
     to_upstream: Vec<u8>,
     to_client: Vec<u8>,
 ) -> Tunnelled {
-    let first_failure = AtomicU8::new(NONE);
-    let mut client = Marked {
-        inner: client,
-        side: CLIENT,
-        first_failure: &first_failure,
-        read: to_upstream.len() as u64,
-    };
-    let mut upstream = Marked {
-        inner: upstream,
-        side: UPSTREAM,
-        first_failure: &first_failure,
-        read: to_client.len() as u64,
-    };
+    let (client, upstream) = (&*client, &*upstream);
+    let up_count = AtomicU64::new(to_upstream.len() as u64);
+    let down_count = AtomicU64::new(to_client.len() as u64);
     let (up, down) = tokio::join!(
-        upstream.write_all(&to_upstream),
-        client.write_all(&to_client)
+        write_all(upstream, &to_upstream),
+        write_all(client, &to_client)
     );
     let result = match (up, down) {
-        (Err(e), _) | (_, Err(e)) => Err(e),
-        _ => copy_bidirectional(&mut client, &mut upstream)
-            .await
-            .map(|_| ()),
+        (Err(e), _) => Err((Side::Upstream, e)),
+        (_, Err(e)) => Err((Side::Client, e)),
+        _ => tokio::select! {
+            r = async {
+                tokio::try_join!(
+                    copy(client, Side::Client, upstream, Side::Upstream, &up_count),
+                    copy(upstream, Side::Upstream, client, Side::Client, &down_count),
+                )
+            } => r.map(|_| ()),
+            failure = failed(client, Side::Client) => Err(failure),
+            failure = failed(upstream, Side::Upstream) => Err(failure),
+        },
     };
     let (outcome, error) = match result {
         Ok(()) => (Outcome::Ok, None),
-        Err(e) => match first_failure.load(Ordering::SeqCst) {
-            UPSTREAM => (Outcome::UpstreamReset, Some(e)),
-            _ => (Outcome::ClientAbort, Some(e)),
-        },
+        Err((side, e)) => {
+            // The other side sees what this one did: a reset.
+            match side {
+                Side::Upstream => {
+                    abort(client);
+                    (Outcome::UpstreamReset, Some(e))
+                }
+                Side::Client => {
+                    abort(upstream);
+                    (Outcome::ClientAbort, Some(e))
+                }
+            }
+        }
     };
     Tunnelled {
-        to_upstream: client.read,
-        to_client: upstream.read,
+        to_upstream: up_count.load(Ordering::Relaxed),
+        to_client: down_count.load(Ordering::Relaxed),
         outcome,
         error,
     }

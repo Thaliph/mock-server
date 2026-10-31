@@ -330,15 +330,12 @@ async fn expect_reset(s: &mut TcpStream) -> Duration {
         loop {
             match s.read(&mut buf).await {
                 Ok(0) => {
-                    // After a FIN the reset shows on the error readiness, then on a write.
-                    let _ = s.ready(Interest::ERROR).await;
-                    match s.write_all(b"x").await {
-                        Err(e) => {
-                            assert_eq!(e.kind(), io::ErrorKind::ConnectionReset, "{e}");
-                            return;
-                        }
-                        Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
-                    }
+                    // After a FIN the reset only shows on the error readiness, and Linux
+                    // reports a reset in CLOSE_WAIT as EPIPE.
+                    s.ready(Interest::ERROR).await.unwrap();
+                    let e = s.take_error().unwrap().expect("a pending socket error");
+                    assert_eq!(e.kind(), io::ErrorKind::BrokenPipe, "{e}");
+                    return;
                 }
                 Ok(_) => {}
                 Err(e) => {
