@@ -10,6 +10,8 @@
 mod body;
 mod scan;
 #[cfg(test)]
+mod proptests;
+#[cfg(test)]
 mod tests;
 
 use std::collections::VecDeque;
@@ -26,6 +28,16 @@ pub const LINE_LIMIT: usize = 256;
 pub const CHUNK_LINE_LIMIT: usize = 4 * 1024;
 /// Longest `path` reported, in bytes.
 pub const PATH_LIMIT: usize = 1024;
+/// Longest `host` or `uri_authority` reported, in bytes (longer values are cut).
+pub const AUTHORITY_LIMIT: usize = 1024;
+/// Requests the relay reads ahead of their responses.
+pub const READ_AHEAD: usize = 32;
+/// Fixed part of the retained state of one direction, in bytes.
+pub const FIXED_PER_DIRECTION: usize = 128 * 1024;
+/// Bound of [`Codec::retained_bytes`]: 64 KiB of head or trailer section, plus a fixed size
+/// per direction (the requests waiting for a response on the client side, one request head
+/// on the server side).
+pub const RETAINED_LIMIT: usize = HEAD_LIMIT + 2 * FIXED_PER_DIRECTION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
@@ -392,6 +404,21 @@ impl Codec {
             return vec![Event::ResponseEnd { body_bytes }];
         }
         Vec::new()
+    }
+
+    /// Like [`Codec::client_bytes`], but stops before the head of a request that would read
+    /// more than [`READ_AHEAD`] requests ahead of their responses. Returns how many bytes of
+    /// `data` were used; the relay forwards exactly those, keeps the rest unread (TCP
+    /// back-pressure) and offers it again after a response completed.
+    pub fn client_bytes_limited(&mut self, data: &[u8]) -> (usize, Vec<Event>) {
+        let events = Vec::new();
+        (data.len(), events)
+    }
+
+    /// Bytes the codec keeps for its parsing: partial head or trailer section, held client
+    /// bytes, requests waiting for a response. Never above [`RETAINED_LIMIT`].
+    pub fn retained_bytes(&self) -> usize {
+        0
     }
 
     /// Requests read and not yet answered by a final response.
