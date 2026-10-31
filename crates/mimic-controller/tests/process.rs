@@ -14,6 +14,21 @@ use mimic_runtime::testing::{Process, http_get, run, wait_status};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mimic-controller");
 const ADMIN: (&str, &str) = ("MIMIC_ADMIN_ADDR", "127.0.0.1:0");
+/// Required by the webhook (spec §10.2); the listener takes any free port.
+const WEBHOOK: [(&str, &str); 7] = [
+    ("MIMIC_WEBHOOK_ADDR", "127.0.0.1:0"),
+    ("MIMIC_NAMESPACE", "mimic-system"),
+    ("MIMIC_WEBHOOK_SERVICE", "mimic"),
+    ("MIMIC_WEBHOOK_SECRET", "mimic-webhook-tls"),
+    ("MIMIC_WEBHOOK_CONFIGURATION", "mimic-injector"),
+    ("MIMIC_INJECT_SIDECAR_IMAGE", "mimic-sidecar:test"),
+    ("MIMIC_INJECT_INIT_IMAGE", "mimic-init:test"),
+];
+
+/// The admin address, the webhook settings and `extra`.
+fn env<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    [&[ADMIN][..], &WEBHOOK, extra].concat()
+}
 
 struct FakeValkey {
     addr: SocketAddr,
@@ -109,14 +124,14 @@ fn free_addr() -> SocketAddr {
 
 #[test]
 fn fnd_01_missing_valkey_url_exits_2() {
-    let (status, _, stderr) = run(BIN, &[], &[ADMIN]);
+    let (status, _, stderr) = run(BIN, &[], &env(&[]));
     assert_eq!(status.code(), Some(2));
     assert!(stderr.contains("MIMIC_VALKEY_URL"), "{stderr}");
 }
 
 #[test]
 fn fnd_01_invalid_valkey_url_exits_2() {
-    let (status, _, stderr) = run(BIN, &[], &[ADMIN, ("MIMIC_VALKEY_URL", "http://nope")]);
+    let (status, _, stderr) = run(BIN, &[], &env(&[("MIMIC_VALKEY_URL", "http://nope")]));
     assert_eq!(status.code(), Some(2));
     assert!(
         stderr.contains("MIMIC_VALKEY_URL") && stderr.contains("http://nope"),
@@ -129,10 +144,7 @@ fn fnd_01_credentials_in_the_url_are_refused() {
     let (status, _, stderr) = run(
         BIN,
         &[],
-        &[
-            ADMIN,
-            ("MIMIC_VALKEY_URL", "redis://:hunter2@127.0.0.1:6379"),
-        ],
+        &env(&[("MIMIC_VALKEY_URL", "redis://:hunter2@127.0.0.1:6379")]),
     );
     assert_eq!(status.code(), Some(2));
     assert!(stderr.contains("MIMIC_VALKEY_PASSWORD"), "{stderr}");
@@ -141,9 +153,13 @@ fn fnd_01_credentials_in_the_url_are_refused() {
 
 #[test]
 fn fnd_06_ready_only_while_valkey_answers() {
+    let kube = FakeKube::start("fnd06a");
     let valkey_addr = free_addr();
     let url = format!("redis://{valkey_addr}");
-    let mut controller = Process::spawn(BIN, &[ADMIN, ("MIMIC_VALKEY_URL", &url)]);
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[("MIMIC_VALKEY_URL", &url), ("KUBECONFIG", &kube.kubeconfig)]),
+    );
     let addr = controller.admin_addr();
 
     // Valkey down at start: alive but not ready, and still running.
@@ -172,14 +188,15 @@ fn fnd_06_ready_only_while_valkey_answers() {
 fn fnd_06_the_password_is_sent_and_never_logged() {
     let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
     let url = format!("redis://{}", valkey.addr);
+    let kube = FakeKube::start("fnd06b");
     let mut controller = Process::spawn(
         BIN,
-        &[
-            ADMIN,
+        &env(&[
             ("MIMIC_VALKEY_URL", &url),
             ("MIMIC_VALKEY_PASSWORD", "hunter2"),
+            ("KUBECONFIG", &kube.kubeconfig),
             ("MIMIC_LOG", "trace"),
-        ],
+        ]),
     );
     let addr = controller.admin_addr();
     wait_status(addr, "/readyz", 200, Duration::from_secs(10));
@@ -199,15 +216,16 @@ fn fnd_06_the_password_is_sent_and_never_logged() {
 
 #[test]
 fn fnd_05_sigterm_exits_0() {
+    let kube = FakeKube::start("fnd05");
     let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
     let url = format!("redis://{}", valkey.addr);
     let mut controller = Process::spawn(
         BIN,
-        &[
-            ADMIN,
+        &env(&[
             ("MIMIC_VALKEY_URL", &url),
             ("MIMIC_SHUTDOWN_GRACE", "2s"),
-        ],
+            ("KUBECONFIG", &kube.kubeconfig),
+        ]),
     );
     let addr = controller.admin_addr();
     wait_status(addr, "/readyz", 200, Duration::from_secs(10));
@@ -220,7 +238,7 @@ fn fnd_05_sigterm_exits_0() {
 
 #[test]
 fn fnd_04_controller_logs_are_json() {
-    let mut controller = Process::spawn(BIN, &[ADMIN, ("MIMIC_VALKEY_URL", "redis://127.0.0.1:1")]);
+    let mut controller = Process::spawn(BIN, &env(&[("MIMIC_VALKEY_URL", "redis://127.0.0.1:1")]));
     controller.admin_addr();
     controller.terminate();
     controller.wait_exit(Duration::from_secs(10));
@@ -242,4 +260,251 @@ fn fnd_07_version_flag_prints_the_crate_version() {
         stdout.trim(),
         format!("mimic-controller {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+/// A minimal Kubernetes API: the webhook Secret and configuration, and an empty list of
+/// `MimicWorkload`s. Requests it does not know are answered 404 and recorded.
+struct FakeKube {
+    kubeconfig: String,
+    state: Arc<Mutex<KubeState>>,
+}
+
+struct KubeState {
+    secret_data: serde_json::Value,
+    secret_version: u64,
+    ca_bundles: Vec<String>,
+    unknown: Vec<String>,
+}
+
+const SECRET_PATH: &str = "/api/v1/namespaces/mimic-system/secrets/mimic-webhook-tls";
+const CONFIG_PATH: &str =
+    "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/mimic-injector";
+
+impl FakeKube {
+    fn start(name: &str) -> FakeKube {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("mimic-fake-kube-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kubeconfig = dir.join("config");
+        std::fs::write(
+            &kubeconfig,
+            format!(
+                "apiVersion: v1\nkind: Config\nclusters:\n- name: fake\n  cluster:\n    server: http://{addr}\n\
+                 users:\n- name: fake\n  user:\n    token: fake\ncontexts:\n- name: fake\n  context:\n    cluster: fake\n    user: fake\n\
+                 current-context: fake\n"
+            ),
+        )
+        .unwrap();
+        let state = Arc::new(Mutex::new(KubeState {
+            secret_data: serde_json::json!({}),
+            secret_version: 1,
+            ca_bundles: vec![String::new(); 3],
+            unknown: Vec::new(),
+        }));
+        let shared = state.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let state = shared.clone();
+                thread::spawn(move || kube_connection(stream, state));
+            }
+        });
+        FakeKube {
+            kubeconfig: kubeconfig.to_string_lossy().into_owned(),
+            state,
+        }
+    }
+
+    fn secret(&self) -> serde_json::Value {
+        self.state.lock().unwrap().secret_data.clone()
+    }
+
+    fn ca_bundles(&self) -> Vec<String> {
+        self.state.lock().unwrap().ca_bundles.clone()
+    }
+}
+
+fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut request = String::new();
+        if reader.read_line(&mut request).unwrap_or(0) == 0 {
+            return;
+        }
+        let mut parts = request.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_string();
+        let target = parts.next().unwrap_or_default().to_string();
+        let mut length = 0;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).unwrap();
+            if header.trim().is_empty() {
+                break;
+            }
+            if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let mut state = state.lock().unwrap();
+        let (status, reply) = match (method.as_str(), path) {
+            ("GET", SECRET_PATH) => (200, secret_json(&state)),
+            ("PUT", SECRET_PATH) => {
+                let version = body["metadata"]["resourceVersion"].as_str().unwrap_or("");
+                if version == state.secret_version.to_string() {
+                    state.secret_data = body["data"].clone();
+                    state.secret_version += 1;
+                    (200, secret_json(&state))
+                } else {
+                    let conflict = serde_json::json!({"apiVersion": "v1", "kind": "Status",
+                        "status": "Failure", "reason": "Conflict", "code": 409,
+                        "message": "the object has been modified"});
+                    (409, conflict)
+                }
+            }
+            ("GET", CONFIG_PATH) => (200, config_json(&state)),
+            ("PATCH", CONFIG_PATH) => {
+                for op in body.as_array().cloned().unwrap_or_default() {
+                    let path = op["path"].as_str().unwrap_or("");
+                    if let Some(index) = path
+                        .strip_prefix("/webhooks/")
+                        .and_then(|p| p.strip_suffix("/clientConfig/caBundle"))
+                        .and_then(|i| i.parse::<usize>().ok())
+                    {
+                        state.ca_bundles[index] = op["value"].as_str().unwrap_or("").to_string();
+                    } else {
+                        state.unknown.push(format!("patch {path}"));
+                    }
+                }
+                (200, config_json(&state))
+            }
+            ("GET", "/apis/mimic.platform.io/v1alpha1/mimicworkloads") => {
+                if query.contains("watch=true") {
+                    drop(state);
+                    let _ =
+                        writer.write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n");
+                    thread::sleep(Duration::from_secs(120));
+                    return;
+                }
+                let list = serde_json::json!({"apiVersion": "mimic.platform.io/v1alpha1",
+                    "kind": "MimicWorkloadList", "metadata": {"resourceVersion": "1"}, "items": []});
+                (200, list)
+            }
+            _ => {
+                state.unknown.push(format!("{method} {target}"));
+                (
+                    404,
+                    serde_json::json!({"apiVersion": "v1", "kind": "Status",
+                    "status": "Failure", "reason": "NotFound", "code": 404, "message": "no"}),
+                )
+            }
+        };
+        let reply = reply.to_string();
+        let head = format!(
+            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            reply.len()
+        );
+        if writer.write_all(head.as_bytes()).is_err() || writer.write_all(reply.as_bytes()).is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn secret_json(state: &KubeState) -> serde_json::Value {
+    serde_json::json!({"apiVersion": "v1", "kind": "Secret",
+        "metadata": {"name": "mimic-webhook-tls", "namespace": "mimic-system",
+            "resourceVersion": state.secret_version.to_string()},
+        "data": state.secret_data})
+}
+
+fn config_json(state: &KubeState) -> serde_json::Value {
+    let webhooks: Vec<_> = state
+        .ca_bundles
+        .iter()
+        .enumerate()
+        .map(|(i, bundle)| {
+            serde_json::json!({"name": format!("w{i}.mimic.platform.io"),
+                "clientConfig": {"caBundle": bundle}})
+        })
+        .collect();
+    serde_json::json!({"apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "MutatingWebhookConfiguration",
+        "metadata": {"name": "mimic-injector", "resourceVersion": "1"}, "webhooks": webhooks})
+}
+
+#[test]
+fn inj_11_unready_until_the_certificate_is_loaded_and_the_cache_synced() {
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+
+    // No cluster: Valkey is fine, the controller stays alive but unready.
+    let mut lonely = Process::spawn(BIN, &env(&[("MIMIC_VALKEY_URL", &url)]));
+    let addr = lonely.admin_addr();
+    thread::sleep(Duration::from_millis(1500));
+    let (status, body) = http_get(addr, "/readyz");
+    assert_eq!(status, 503);
+    assert!(body.contains("certificate"), "{body}");
+    assert_eq!(http_get(addr, "/healthz").0, 200);
+
+    let kube = FakeKube::start("ready");
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[("MIMIC_VALKEY_URL", &url), ("KUBECONFIG", &kube.kubeconfig)]),
+    );
+    let addr = controller.admin_addr();
+    wait_status(addr, "/readyz", 200, Duration::from_secs(15));
+    assert!(kube.state.lock().unwrap().unknown.is_empty());
+}
+
+#[test]
+fn inj_11_certificates_are_stored_and_ca_bundle_patched_once_for_all_replicas() {
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let kube = FakeKube::start("replicas");
+    let vars = env(&[("MIMIC_VALKEY_URL", &url), ("KUBECONFIG", &kube.kubeconfig)]);
+    let mut first = Process::spawn(BIN, &vars);
+    let mut second = Process::spawn(BIN, &vars);
+    let (a, b) = (first.admin_addr(), second.admin_addr());
+    wait_status(a, "/readyz", 200, Duration::from_secs(15));
+    wait_status(b, "/readyz", 200, Duration::from_secs(15));
+
+    let data = kube.secret();
+    for key in ["ca.crt", "ca.key", "tls.crt", "tls.key"] {
+        assert!(data[key].as_str().is_some_and(|v| !v.is_empty()), "{key}");
+    }
+    let bundles = kube.ca_bundles();
+    assert_eq!(bundles.len(), 3);
+    assert!(
+        bundles
+            .iter()
+            .all(|b| *b == data["ca.crt"].as_str().unwrap())
+    );
+    for admin in [a, b] {
+        let (_, metrics) = http_get(admin, "/metrics");
+        let line = metrics
+            .lines()
+            .find(|l| l.starts_with("mimic_webhook_certificate_expiry_timestamp_seconds"))
+            .unwrap_or_else(|| panic!("{metrics}"));
+        let expiry: f64 = line.split_whitespace().last().unwrap().parse().unwrap();
+        assert!(expiry > 1.7e9, "{line}");
+    }
+
+    // A restart keeps what is stored.
+    first.terminate();
+    first.wait_exit(Duration::from_secs(10));
+    let mut restarted = Process::spawn(BIN, &vars);
+    wait_status(
+        restarted.admin_addr(),
+        "/readyz",
+        200,
+        Duration::from_secs(15),
+    );
+    assert_eq!(kube.secret(), data);
+    assert_eq!(kube.ca_bundles(), bundles);
 }

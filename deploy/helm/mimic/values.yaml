@@ -19,6 +19,22 @@ controller:
   tolerations: []
   affinity: {}
 
+# Pod injection (spec §7.1). The sidecar image is `image` above.
+inject:
+  # mimic-init, the init container that installs the traffic redirection in injected pods.
+  initImage:
+    repository: ghcr.io/thaliph/mimic-init
+    # Defaults to the chart appVersion.
+    tag: ""
+    # Takes precedence over tag when set (sha256:…).
+    digest: ""
+  # Resources of mimic-sidecar in injected pods.
+  sidecarResources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 128Mi}
+  # MIMIC_LOG given to mimic-sidecar.
+  sidecarLogLevel: info
+
 valkey:
   image:
     repository: docker.io/valkey/valkey
