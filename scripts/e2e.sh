@@ -588,12 +588,13 @@ ctx.verify_mode = ssl.CERT_NONE  # the proof is the certificate's bytes, not its
 with socket.create_connection((host, 8443), 10) as sock:
     with ctx.wrap_socket(sock, server_hostname=host) as tls:
         print(hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest())
-        # Read what the server sends after the handshake (TLS 1.3 session tickets): closing with unread
-        # data resets the connection, which the sidecar logs as client_abort rather than ok.
-        tls.settimeout(2)
+        # Close the TLS session (close_notify both ways) before the socket: a server that answers the
+        # client's close, or sends late TLS 1.3 session tickets, writes to a socket the client already
+        # closed, the client's kernel resets, and the sidecar logs client_abort (a real reset) not ok.
+        tls.settimeout(5)
         try:
-            tls.recv(1)
-        except TimeoutError:
+            tls.unwrap()
+        except (OSError, ssl.SSLError):
             pass
 PY
 ) || fail "prx_14: TLS connection to the webhook Service through the sidecar failed"
