@@ -704,6 +704,82 @@ fn inj_19_invalid_listener_limits_exit_2() {
     }
 }
 
+/// Whether the server closes `stream` within `within`, the client having sent nothing.
+fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+    stream.set_read_timeout(Some(within)).unwrap();
+    let mut buf = [0u8; 16];
+    match stream.read(&mut buf) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+    }
+}
+
+#[test]
+fn tls_09_the_sidecar_api_listener_applies_the_inj_19_limits_with_its_own_budget() {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let kube = FakeKube::start("tls09");
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[
+            ("MIMIC_VALKEY_URL", &url),
+            ("KUBECONFIG", &kube.kubeconfig),
+            ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "2"),
+            ("MIMIC_WEBHOOK_REQUEST_TIMEOUT", "1s"),
+        ]),
+    );
+    let mut addr_of = |message: &str| -> SocketAddr {
+        let line = controller.wait_log(Duration::from_secs(10), |v| v["message"] == message);
+        line["addr"].as_str().expect("addr field").parse().unwrap()
+    };
+    let api = addr_of("sidecar api listening");
+    let webhook = addr_of("webhook listening");
+    assert_ne!(api, webhook);
+
+    // Two clients that never start TLS fill the sidecar API budget; a third waits for a slot.
+    let started = std::time::Instant::now();
+    let mut first = TcpStream::connect(api).unwrap();
+    let mut second = TcpStream::connect(api).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let mut third = TcpStream::connect(api).unwrap();
+    // The webhook has a budget of its own: its client is served, hence closed at the timeout.
+    let mut other = TcpStream::connect(webhook).unwrap();
+    assert!(closed_within(&mut other, TIMEOUT + Duration::from_secs(1)));
+    assert!(started.elapsed() < TIMEOUT * 2, "the webhook was blocked");
+    // The request timeout closes the two holders ...
+    assert!(closed_within(&mut first, TIMEOUT + Duration::from_secs(1)));
+    assert!(closed_within(&mut second, TIMEOUT + Duration::from_secs(1)));
+    // ... and only then is the third one served, and closed in turn at its own timeout.
+    assert!(
+        closed_within(&mut third, TIMEOUT * 2 + Duration::from_secs(1)),
+        "the third client was never served"
+    );
+    assert!(
+        started.elapsed() >= TIMEOUT * 2 - Duration::from_millis(200),
+        "the third client was served before a slot was free: {:?}",
+        started.elapsed()
+    );
+
+    // And the other way round: the full webhook does not refuse the sidecar API.
+    let mut held = [
+        TcpStream::connect(webhook).unwrap(),
+        TcpStream::connect(webhook).unwrap(),
+    ];
+    thread::sleep(Duration::from_millis(100));
+    let at = std::time::Instant::now();
+    let mut probe = TcpStream::connect(api).unwrap();
+    assert!(closed_within(&mut probe, TIMEOUT + Duration::from_secs(1)));
+    assert!(at.elapsed() < TIMEOUT * 2, "the sidecar API was blocked");
+    for stream in &mut held {
+        assert!(closed_within(stream, TIMEOUT + Duration::from_secs(1)));
+    }
+}
+
 #[test]
 fn inj_20_a_changed_or_emptied_ca_bundle_is_restored_within_10s() {
     let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());

@@ -186,6 +186,7 @@ fn hello(sni: Option<&str>, alpn: &[&str]) -> ClientHello {
         alpn: alpn.iter().map(|s| s.to_string()).collect(),
         tls12: true,
         tls13: true,
+        sni_invalid: false,
     }
 }
 
@@ -488,4 +489,45 @@ fn tls_05_backoff_doubles_to_60_and_resets() {
 #[test]
 fn tls_05_leaf_validity_equals_intermediate() {
     assert_eq!(V.leaf(), V);
+}
+
+#[test]
+fn tls_01_an_sni_that_is_not_a_dns_name_is_invalid() {
+    let long = format!("{}.test", "a".repeat(296));
+    for bad in [
+        long.as_str(),
+        "a..test",
+        "a test",
+        "-a.test",
+        &"b".repeat(64),
+    ] {
+        let h = parsed(&record(&hello_bytes(0x0303, &sni_ext(bad))));
+        assert_eq!(h.sni, None, "{bad:?}");
+        assert!(h.sni_invalid, "{bad:?}");
+    }
+    for good in ["API.test.", "a_b.test", "x"] {
+        let h = parsed(&record(&hello_bytes(0x0303, &sni_ext(good))));
+        assert_eq!(h.sni.as_deref(), Some(good));
+        assert!(!h.sni_invalid);
+    }
+}
+
+#[test]
+fn tls_02_an_invalid_sni_is_unsupported_before_exclusions_and_memory() {
+    let h = ClientHello {
+        sni_invalid: true,
+        ..hello(None, &[])
+    };
+    let exclusions = Exclusions::parse("10.0.0.1").unwrap();
+    let mut remembered = memory();
+    remembered.insert(
+        dest_key(&hello(None, &[]), ip4(1), 443),
+        Reason::UpstreamUntrusted,
+    );
+    for (ex, mem) in [(&exclusions, &memory()), (&no_exclusions(), &remembered)] {
+        assert_eq!(
+            decide(&h, ip4(1), 443, ex, mem, true),
+            Decision::PassThrough(Reason::Unsupported)
+        );
+    }
 }
