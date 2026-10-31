@@ -4,6 +4,7 @@
 mod cert_manager;
 mod certs;
 mod tls;
+mod tls_ca;
 mod valkey;
 mod webhook;
 mod webhook_config;
