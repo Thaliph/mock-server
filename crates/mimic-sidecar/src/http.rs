@@ -4,6 +4,7 @@
 //! the proxy never routes on `Host` and never answers for a destination failure. HTTP/1 is
 //! [`relay`], HTTP/2 prior knowledge (`h2c`, gRPC included) is [`relay_h2`].
 
+use std::future::Future;
 use std::io;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,6 +86,7 @@ pub async fn relay(
     upstream: TcpStream,
     replay: Vec<u8>,
     ctx: Ctx,
+    stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let (sender, driver) = hyper::client::conn::http1::Builder::new()
         .preserve_header_case(true)
@@ -117,10 +119,19 @@ pub async fn relay(
     let mut server = pin!(server);
     let mut driver = pin!(driver.with_upgrades());
 
+    let mut stop = pin!(stop);
+    let mut stopping = false;
     let mut driver_done = false;
     let served = loop {
         tokio::select! {
             served = server.as_mut() => break served,
+            () = &mut stop, if !stopping => {
+                stopping = true;
+                // Shutdown: the response in flight completes, an idle connection closes.
+                if !state.upgrade_requested.load(Ordering::SeqCst) {
+                    server.as_mut().graceful_shutdown();
+                }
+            }
             _ = &mut driver, if !driver_done => {
                 driver_done = true;
                 // The destination closed: finish the response in flight, then close the
@@ -214,6 +225,7 @@ pub async fn relay_h2(
     upstream: TcpStream,
     replay: Vec<u8>,
     ctx: Ctx,
+    stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let (sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, ReqBody>(TokioIo::new(upstream))
@@ -232,10 +244,17 @@ pub async fn relay_h2(
     let mut server = pin!(server);
     let mut driver = pin!(driver);
 
+    let mut stop = pin!(stop);
+    let mut stopping = false;
     let mut driver_done = false;
     loop {
         tokio::select! {
             served = server.as_mut() => return served.map_err(io::Error::other),
+            () = &mut stop, if !stopping => {
+                stopping = true;
+                // Shutdown: GOAWAY, streams in flight finish.
+                server.as_mut().graceful_shutdown();
+            }
             _ = &mut driver, if !driver_done => {
                 driver_done = true;
                 // The destination connection ended: streams in flight finish or fail, and

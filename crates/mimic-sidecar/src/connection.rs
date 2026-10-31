@@ -13,7 +13,7 @@ use tokio::net::TcpStream;
 
 use crate::access;
 use crate::exchange::Ctx;
-use crate::listener::{Direction, Outcome, Shared};
+use crate::listener::{Active, Direction, Outcome, Shared};
 use crate::{http, opaque};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,7 +46,12 @@ enum First {
     },
 }
 
-pub(crate) async fn handle(client: TcpStream, direction: Direction, shared: Arc<Shared>) {
+pub(crate) async fn handle(
+    client: TcpStream,
+    direction: Direction,
+    shared: Arc<Shared>,
+    _active: Active,
+) {
     let started = Instant::now();
     let dst = match shared.original_dst(&client) {
         Ok(dst) if !shared.is_listener(dst) => dst,
@@ -95,7 +100,8 @@ pub(crate) async fn handle(client: TcpStream, direction: Direction, shared: Arc<
                         dst,
                         proxy: proxy.clone(),
                     };
-                    if let Err(e) = http::relay(client, upstream, buf, ctx).await {
+                    if let Err(e) = http::relay(client, upstream, buf, ctx, shared.stopped()).await
+                    {
                         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
                     }
                     return;
@@ -111,7 +117,9 @@ pub(crate) async fn handle(client: TcpStream, direction: Direction, shared: Arc<
                         dst,
                         proxy: proxy.clone(),
                     };
-                    if let Err(e) = http::relay_h2(client, upstream, buf, ctx).await {
+                    if let Err(e) =
+                        http::relay_h2(client, upstream, buf, ctx, shared.stopped()).await
+                    {
                         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "h2 relay ended");
                     }
                     return;

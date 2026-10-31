@@ -16,6 +16,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
 use crate::connection;
 use crate::red::{DEFAULT_MAX_AUTHORITIES, ProxyMetrics};
@@ -116,6 +117,17 @@ pub struct Shared {
     metrics: TunnelMetrics,
     proxy: ProxyMetrics,
     original_dst: OriginalDst,
+    stop: watch::Sender<bool>,
+    active: watch::Sender<usize>,
+}
+
+/// Counts a connection as active until dropped.
+pub(crate) struct Active(watch::Sender<usize>);
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
 }
 
 impl Shared {
@@ -142,7 +154,32 @@ impl Shared {
             metrics,
             proxy: ProxyMetrics::default(),
             original_dst,
+            stop: watch::channel(false).0,
+            active: watch::channel(0).0,
         }
+    }
+
+    /// Starts the shutdown: the listeners stop accepting and the relays wind down.
+    pub fn shutdown(&self) {
+        self.stop.send_replace(true);
+    }
+
+    /// Resolves once [`Shared::shutdown`] was called, also if it was before this call.
+    pub fn stopped(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut stop = self.stop.subscribe();
+        async move {
+            let _ = stop.wait_for(|stopped| *stopped).await;
+        }
+    }
+
+    /// Resolves when no accepted connection is left.
+    pub async fn drained(&self) {
+        let _ = self.active.subscribe().wait_for(|n| *n == 0).await;
+    }
+
+    fn track(&self) -> Active {
+        self.active.send_modify(|n| *n += 1);
+        Active(self.active.clone())
     }
 
     /// Uses `proxy` for the RED metrics instead of unregistered ones.
@@ -283,14 +320,10 @@ pub fn raise_fd_limit() {
     }
 }
 
-/// Accepts connections on `listener` for as long as the runtime lives.
+/// Accepts connections on `listener` until [`Shared::shutdown`].
 pub fn spawn_listener(listener: TcpListener, direction: Direction, shared: Arc<Shared>) {
-    tokio::spawn(accept_loop(
-        listener,
-        direction,
-        shared,
-        std::future::pending(),
-    ));
+    let stopped = shared.stopped();
+    tokio::spawn(accept_loop(listener, direction, shared, stopped));
 }
 
 /// Accepts connections on `listener` until `shutdown` completes; the connections already
@@ -311,7 +344,13 @@ pub async fn accept_loop(
         };
         match accepted {
             Ok((stream, _)) => {
-                tokio::spawn(connection::handle(stream, direction, shared.clone()));
+                let active = shared.track();
+                tokio::spawn(connection::handle(
+                    stream,
+                    direction,
+                    shared.clone(),
+                    active,
+                ));
             }
             Err(e) => {
                 shared
