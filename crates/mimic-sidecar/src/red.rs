@@ -1,6 +1,6 @@
 //! RED metrics of the proxy (spec §9): requests and their duration per authority, connections
 //! and bytes. The `authority` label is bounded per direction and metric by an
-//! [`AuthorityBudget`]; the rest is counted under `other`.
+//! [`AuthorityBudget`]; the rest is counted under `(other)`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -153,6 +153,24 @@ impl ProxyMetrics {
                 status_class: class,
             })
             .observe(head.as_secs_f64());
+    }
+
+    /// One HTTP request that never got a response head (`status_class="none"`) and that is
+    /// not timed: the duration histogram only observes exchanges with a response head.
+    pub(crate) fn request_unobserved(
+        &self,
+        direction: Direction,
+        protocol: &'static str,
+        authority: &str,
+    ) {
+        self.requests
+            .get_or_create(&RequestLabels {
+                direction: direction.as_str(),
+                protocol,
+                authority: self.label("requests", direction, authority),
+                status_class: "none",
+            })
+            .inc();
     }
 
     pub(crate) fn connection(&self, direction: Direction, protocol: &'static str, authority: &str) {

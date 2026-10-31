@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mimic_core::fd::fd_limit_target;
 use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
@@ -22,6 +23,8 @@ use crate::connection;
 use crate::red::{DEFAULT_MAX_AUTHORITIES, ProxyMetrics};
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// Time given to the connections to finish closing once they were told to.
+const ABORT_WAIT: Duration = Duration::from_secs(1);
 const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const IPV6_INTERFACES: &str = "/proc/net/if_inet6";
 
@@ -118,6 +121,7 @@ pub struct Shared {
     proxy: ProxyMetrics,
     original_dst: OriginalDst,
     stop: watch::Sender<bool>,
+    abort: watch::Sender<bool>,
     active: watch::Sender<usize>,
 }
 
@@ -155,6 +159,7 @@ impl Shared {
             proxy: ProxyMetrics::default(),
             original_dst,
             stop: watch::channel(false).0,
+            abort: watch::channel(false).0,
             active: watch::channel(0).0,
         }
     }
@@ -170,6 +175,33 @@ impl Shared {
         async move {
             let _ = stop.wait_for(|stopped| *stopped).await;
         }
+    }
+
+    /// Resolves once the grace ended and the connections left must close ([`Shared::drain`]).
+    pub(crate) fn aborted(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut abort = self.abort.subscribe();
+        async move {
+            let _ = abort.wait_for(|aborted| *aborted).await;
+        }
+    }
+
+    /// The abort flag, for the exchanges that must tell a closure at the end of the grace.
+    pub(crate) fn abort_flag(&self) -> watch::Receiver<bool> {
+        self.abort.subscribe()
+    }
+
+    /// Waits at most `grace` for the connections to end by themselves. Then closes the ones
+    /// left (their access line says `shutdown`), logs how many, and returns that number.
+    pub async fn drain(&self, grace: Duration) -> usize {
+        if tokio::time::timeout(grace, self.drained()).await.is_ok() {
+            return 0;
+        }
+        let connections = *self.active.borrow();
+        self.abort.send_replace(true);
+        tracing::warn!(connections, "grace period over");
+        // Closing is immediate; this only lets the access lines out.
+        let _ = tokio::time::timeout(ABORT_WAIT, self.drained()).await;
+        connections
     }
 
     /// Resolves when no accepted connection is left.
@@ -307,15 +339,25 @@ pub fn bind_all(
     Ok(bound)
 }
 
-/// Raises the open-file soft limit to the hard limit (spec §4.1): the proxy holds two sockets
-/// per connection and never refuses one. Failures are logged, not fatal.
+/// Raises the open-file soft limit to the hard limit, or to `fs.nr_open` when the hard limit
+/// is unlimited (spec §4.1): the proxy holds two sockets per connection and never refuses one.
+/// Failures are logged, not fatal.
 pub fn raise_fd_limit() {
     match getrlimit(Resource::RLIMIT_NOFILE) {
-        Ok((soft, hard)) if soft < hard => match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
-            Ok(()) => tracing::info!(from = soft, to = hard, "open-file limit raised"),
-            Err(e) => tracing::warn!(error = %e, soft, hard, "cannot raise the open-file limit"),
-        },
-        Ok(_) => {}
+        Ok((soft, hard)) => {
+            let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let Some(target) = fd_limit_target(soft, hard, nr_open) else {
+                return;
+            };
+            match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+                Ok(()) => tracing::info!(from = soft, to = target, "open-file limit raised"),
+                Err(e) => {
+                    tracing::warn!(error = %e, soft, hard, target, "cannot raise the open-file limit");
+                }
+            }
+        }
         Err(e) => tracing::warn!(error = %e, "cannot read the open-file limit"),
     }
 }

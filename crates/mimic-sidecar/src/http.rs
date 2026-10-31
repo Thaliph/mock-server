@@ -231,7 +231,10 @@ pub async fn relay_h2(
         .handshake::<_, ReqBody>(TokioIo::new(upstream))
         .await
         .map_err(io::Error::other)?;
-    let state = Arc::new(StateH2 { ctx, sender });
+    let state = Arc::new(StateH2 {
+        ctx: ctx.clone(),
+        sender,
+    });
     let service = service_fn(move |req| forward_h2(state.clone(), req));
     let io = TokioIo::new(Replay {
         prefix: replay,
@@ -249,7 +252,7 @@ pub async fn relay_h2(
     let mut driver_done = false;
     loop {
         tokio::select! {
-            served = server.as_mut() => return served.map_err(io::Error::other),
+            served = server.as_mut() => return finish_h2(&ctx, served),
             () = &mut stop, if !stopping => {
                 stopping = true;
                 // Shutdown: GOAWAY, streams in flight finish.
@@ -263,6 +266,27 @@ pub async fn relay_h2(
             }
         }
     }
+}
+
+/// The end of the client connection: one the client broke at connection level (`h2` sent
+/// `GOAWAY` with an error) is logged as rejected; a client that just leaves is not.
+fn finish_h2(ctx: &Ctx, served: Result<(), hyper::Error>) -> io::Result<()> {
+    let Err(e) = served else {
+        return Ok(());
+    };
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(err) = source {
+        if let Some(h2) = err.downcast_ref::<h2::Error>()
+            && h2.is_go_away()
+            && !h2.is_remote()
+            && h2.reason() != Some(h2::Reason::NO_ERROR)
+        {
+            exchange::rejected_h2(ctx);
+            break;
+        }
+        source = err.source();
+    }
+    Err(io::Error::other(e))
 }
 
 async fn forward_h2(

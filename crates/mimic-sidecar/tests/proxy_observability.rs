@@ -511,7 +511,7 @@ async fn prx_09_authorities_over_the_budget_are_counted_as_other() {
             .unwrap();
         read_exact(&mut c, 38).await;
     }
-    for (authority, count) in [("a.example", 2), ("b.example", 1), ("other", 1)] {
+    for (authority, count) in [("a.example", 2), ("b.example", 1), ("(other)", 1)] {
         counted(
             &f.metrics,
             &format!(
@@ -588,4 +588,72 @@ fn prx_09_valid_budget_starts() {
         ],
     );
     sidecar.admin_addr();
+}
+
+#[tokio::test]
+async fn prx_23_real_hosts_named_other_and_invalid_are_not_the_sentinels() {
+    let addr = dest(&[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 0).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f = fixture_budget(listener, Direction::Outbound, 2, move |_| Some(addr)).await;
+    // "(bad)" is invalid and "c.example" overflows: neither takes a slot, `other` does.
+    for host in ["(bad)", "other", "a.example", "c.example", "other"] {
+        let mut c = TcpStream::connect(f.addr).await.unwrap();
+        c.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        read_exact(&mut c, 38).await;
+    }
+    for (authority, count) in [
+        ("(invalid)", 1),
+        ("other", 2),
+        ("a.example", 1),
+        ("(other)", 1),
+    ] {
+        counted(
+            &f.metrics,
+            &format!(
+                "mimic_http_requests_total{{direction=\"outbound\",protocol=\"http1\",authority=\"{authority}\",status_class=\"2xx\"}} {count}"
+            ),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+
+async fn prx_21_h2_rejected_has_no_duration_and_is_not_observed() {
+    let logs = capture_logs();
+    let addr = echo_server().await;
+    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    // SETTINGS, then HEADERS on the even stream id 2.
+    c.write_all(
+        b"\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x03\x01\x05\x00\x00\x00\x02\x82\x86\x84",
+    )
+    .await
+    .unwrap();
+    read_to_end(&mut c).await;
+
+    let lines = logs.access_exactly(1).await;
+    assert_eq!(lines[0]["result"], "rejected");
+    for absent in ["duration_ms", "head_ms"] {
+        assert!(lines[0].get(absent).is_none(), "{absent}: {}", lines[0]);
+    }
+    counted(
+        &f.metrics,
+        &format!(
+            "mimic_http_requests_total{{direction=\"outbound\",protocol=\"h2\",authority=\"{addr}\",status_class=\"none\"}} 1"
+        ),
+    )
+    .await;
+    let text = f.metrics.encode();
+    assert!(
+        !text.lines().any(
+            |l| l.starts_with("mimic_http_request_duration_seconds_count") && !l.ends_with(" 0")
+        ),
+        "{text}"
+    );
 }

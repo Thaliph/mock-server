@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap};
 use hyper::{Request, Response};
-use mimic_core::proxy::authority::{INVALID_AUTHORITY, normalise_authority};
+use mimic_core::proxy::authority::{normalise_authority, target_authority};
 
 use crate::access::{self, Outcome};
 use crate::listener::Direction;
@@ -21,12 +21,16 @@ use crate::red::ProxyMetrics;
 /// Default port of a `Host` header on plain HTTP, removed by the authority normalisation.
 const HTTP_PORT: u16 = 80;
 
+const PROTOCOL_H2: &str = "h2";
+
 /// What the observation of a connection needs to know about it.
 #[derive(Clone)]
 pub struct Ctx {
     pub direction: Direction,
     pub dst: SocketAddr,
     pub proxy: ProxyMetrics,
+    /// True once the connections left at the end of the shutdown grace are being closed.
+    pub aborted: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Request body bytes seen so far, and whether the client side of the body failed.
@@ -39,6 +43,8 @@ pub(crate) struct RequestCount {
 /// The request body, counted.
 pub(crate) struct ReqBody {
     inner: Incoming,
+    /// The request carried a `content-length`: only then is the length known to hand on.
+    sized: bool,
     count: Arc<RequestCount>,
 }
 
@@ -71,7 +77,13 @@ impl Body for ReqBody {
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        // `hyper` reports an exact zero for a body-less HTTP/2 request, and its client turns
+        // that into a `content-length: 0` the client never sent.
+        if self.sized {
+            self.inner.size_hint()
+        } else {
+            SizeHint::default()
+        }
     }
 }
 
@@ -111,16 +123,15 @@ impl Tracker {
         protocol: &'static str,
         req: Request<Incoming>,
     ) -> (Tracker, Request<ReqBody>) {
-        let authority = match req.headers().get(header::HOST) {
-            Some(host) => host.to_str().map_or_else(
-                |_| INVALID_AUTHORITY.to_string(),
-                |host| normalise_authority(host, HTTP_PORT),
-            ),
-            None => req.uri().authority().map_or_else(
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .map(|host| host.to_str().unwrap_or(""));
+        let authority = target_authority(req.uri().authority().map(|a| a.as_str()), host)
+            .map_or_else(
                 || ctx.dst.to_string(),
-                |a| normalise_authority(a.as_str(), HTTP_PORT),
-            ),
-        };
+                |raw| normalise_authority(raw, HTTP_PORT),
+            );
         let request = Arc::new(RequestCount::default());
         let tracker = Tracker {
             ctx: ctx.clone(),
@@ -140,6 +151,7 @@ impl Tracker {
         let (parts, inner) = req.into_parts();
         let body = ReqBody {
             inner,
+            sized: parts.headers.contains_key(header::CONTENT_LENGTH),
             count: request,
         };
         (tracker, Request::from_parts(parts, body))
@@ -197,7 +209,11 @@ impl Tracker {
     fn finish(&mut self, outcome: Outcome, bytes_out: u64) {
         self.ended = true;
         let failed = self.request.failed.load(Ordering::Relaxed);
-        let outcome = if failed && outcome != Outcome::Ok {
+        let outcome = if outcome == Outcome::Ok {
+            outcome
+        } else if *self.ctx.aborted.borrow() {
+            Outcome::Shutdown
+        } else if failed {
             Outcome::ClientAbort
         } else {
             outcome
@@ -217,7 +233,7 @@ impl Tracker {
             grpc_status: self.grpc_status,
             upgrade: self.upgrade,
             outcome,
-            duration: self.started.elapsed(),
+            duration: Some(self.started.elapsed()),
             head: self.head,
             bytes_in,
             bytes_out,
@@ -328,7 +344,31 @@ pub(crate) fn rejected(ctx: &Ctx, protocol: &'static str, status: u16) {
         grpc_status: None,
         upgrade: false,
         outcome: Outcome::Rejected,
-        duration: Duration::ZERO,
+        duration: Some(Duration::ZERO),
+        head: None,
+        bytes_in: 0,
+        bytes_out: 0,
+    });
+}
+
+/// An HTTP/2 client connection broken at connection level (the sidecar sent `GOAWAY`): no
+/// request is known, no response head was read, so nothing is timed.
+pub(crate) fn rejected_h2(ctx: &Ctx) {
+    let authority = ctx.dst.to_string();
+    ctx.proxy
+        .request_unobserved(ctx.direction, PROTOCOL_H2, &authority);
+    access::exchange(&access::Exchange {
+        direction: ctx.direction,
+        protocol: PROTOCOL_H2,
+        dst: ctx.dst,
+        authority,
+        method: None,
+        path: None,
+        status: None,
+        grpc_status: None,
+        upgrade: false,
+        outcome: Outcome::Rejected,
+        duration: None,
         head: None,
         bytes_in: 0,
         bytes_out: 0,
