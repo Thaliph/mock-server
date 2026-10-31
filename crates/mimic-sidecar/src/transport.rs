@@ -95,14 +95,12 @@ impl AsyncWrite for Socket {
 
     /// The FIN; a socket that is already gone has nothing left to close.
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(
-            SockRef::from(&*self.tcp)
-                .shutdown(Shutdown::Write)
-                .or_else(|e| match e.kind() {
-                    io::ErrorKind::NotConnected => Ok(()),
-                    _ => Err(e),
-                }),
-        )
+        Poll::Ready(SockRef::from(&*self.tcp).shutdown(Shutdown::Write).or_else(
+            |e| match e.kind() {
+                io::ErrorKind::NotConnected => Ok(()),
+                _ => Err(e),
+            },
+        ))
     }
 }
 

@@ -109,10 +109,7 @@ pub async fn tunnel(
     let result = match early {
         Some(Early::Shutdown) => Err(Ended::Shutdown),
         early => {
-            let (up, down) = tokio::join!(
-                send(upstream, &to_upstream),
-                send(client, &to_client)
-            );
+            let (up, down) = tokio::join!(send(upstream, &to_upstream), send(client, &to_client));
             match (up, down, early) {
                 (Err(e), _, _) => Err(Ended::Failed(Side::Upstream, e)),
                 (_, Err(e), _) => Err(Ended::Failed(Side::Client, e)),

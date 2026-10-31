@@ -59,7 +59,9 @@ impl TlsMetrics {
     pub fn register(metrics: &mut Metrics) -> TlsMetrics {
         let tls = TlsMetrics::default();
         for interception in DECISIONS {
-            let _ = tls.connections.get_or_create(&InterceptionLabel { interception });
+            let _ = tls
+                .connections
+                .get_or_create(&InterceptionLabel { interception });
         }
         let registry = metrics.registry_mut();
         registry.register(
@@ -142,11 +144,7 @@ impl Interception {
 
     /// The §5 decision for `hello` addressed to `dst`, and, when intercepting, the leaf to
     /// answer the client with.
-    pub(crate) fn decide(
-        &self,
-        hello: &ClientHello,
-        dst: SocketAddr,
-    ) -> Result<Plan, Reason> {
+    pub(crate) fn decide(&self, hello: &ClientHello, dst: SocketAddr) -> Result<Plan, Reason> {
         let has_ca = self.ca.as_ref().is_some_and(|ca| ca.usable());
         let decision = {
             let remembered = self
@@ -175,10 +173,9 @@ impl Interception {
             None => Ok(ServerName::IpAddress(dst.ip().into())),
         };
         // A name that cannot be verified or certified is not one mimic can reproduce.
-        let (Ok(server_name), Some(leaf)) = (
-            server_name,
-            self.ca.as_ref().and_then(|ca| ca.leaf(&name)),
-        ) else {
+        let (Ok(server_name), Some(leaf)) =
+            (server_name, self.ca.as_ref().and_then(|ca| ca.leaf(&name)))
+        else {
             return Err(Reason::Unsupported);
         };
         Ok(Plan {

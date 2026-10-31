@@ -20,8 +20,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use crate::connection;
-use crate::tls::intercept::Interception;
 use crate::red::{DEFAULT_MAX_AUTHORITIES, ProxyMetrics};
+use crate::tls::intercept::Interception;
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 /// Time given to the connections to finish closing once they were told to.

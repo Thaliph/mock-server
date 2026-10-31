@@ -193,11 +193,7 @@ struct Sidecar {
     metrics: Arc<Metrics>,
 }
 
-async fn sidecar(
-    dest: &Destination,
-    ca: Option<Arc<CaState>>,
-    exclusions: &str,
-) -> Sidecar {
+async fn sidecar(dest: &Destination, ca: Option<Arc<CaState>>, exclusions: &str) -> Sidecar {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
@@ -253,10 +249,7 @@ fn api() -> ServerName<'static> {
     ServerName::try_from("api.test").unwrap()
 }
 
-async fn exchange(
-    tls: &mut tokio_rustls::client::TlsStream<TcpStream>,
-    request: &[u8],
-) -> Vec<u8> {
+async fn exchange(tls: &mut tokio_rustls::client::TlsStream<TcpStream>, request: &[u8]) -> Vec<u8> {
     tls.write_all(request).await.unwrap();
     let mut out = vec![0u8; RESPONSE.len()];
     tokio::time::timeout(TIMEOUT, tls.read_exact(&mut out))
@@ -287,7 +280,10 @@ async fn tls_17_a_client_gets_a_leaf_from_the_intermediate_and_the_destination_s
     assert_eq!(tls.get_ref().1.alpn_protocol(), None);
     assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
     tls.shutdown().await.unwrap();
-    assert_eq!(*dest.sni.lock().unwrap(), vec![Some("api.test".to_string())]);
+    assert_eq!(
+        *dest.sni.lock().unwrap(),
+        vec![Some("api.test".to_string())]
+    );
     // The destination saw the request unchanged.
     for _ in 0..100 {
         if !dest.requests.lock().unwrap().is_empty() {
@@ -373,16 +369,21 @@ async fn tls_17_without_sni_the_leaf_names_the_destination_ip_and_leaves_are_reu
     let chain = tls.get_ref().1.peer_certificates().unwrap().to_vec();
     let (_, leaf) = X509Certificate::from_der(chain[0].as_ref()).unwrap();
     let san = leaf.subject_alternative_name().unwrap().unwrap();
-    assert!(san.value.general_names.iter().any(
-        |n| matches!(n, GeneralName::IPAddress(b) if *b == [127, 0, 0, 1])
-    ));
+    assert!(
+        san.value
+            .general_names
+            .iter()
+            .any(|n| matches!(n, GeneralName::IPAddress(b) if *b == [127, 0, 0, 1]))
+    );
     assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
     assert_eq!(*dest.sni.lock().unwrap(), vec![None]);
     // Two connections with the same SNI get the same leaf.
     let one = connect(&sidecar, &root, api(), &[]).await.unwrap();
     let two = connect(&sidecar, &root, api(), &[]).await.unwrap();
     let der = |t: &tokio_rustls::client::TlsStream<TcpStream>| {
-        t.get_ref().1.peer_certificates().unwrap()[0].as_ref().to_vec()
+        t.get_ref().1.peer_certificates().unwrap()[0]
+            .as_ref()
+            .to_vec()
     };
     assert_eq!(der(&one), der(&two));
 }
@@ -441,17 +442,20 @@ async fn tls_23_connections_are_counted_under_their_decision() {
     )
     .await;
     for _ in 0..100 {
-        if logs
-            .access()
+        let lines = logs.access();
+        if ["excluded", "unsupported"]
             .iter()
-            .any(|l| l["interception"] == "excluded")
+            .all(|r| lines.iter().any(|l| l["interception"] == *r))
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let lines = logs.access();
-    let excluded = lines.iter().find(|l| l["interception"] == "excluded").unwrap();
+    let excluded = lines
+        .iter()
+        .find(|l| l["interception"] == "excluded")
+        .unwrap();
     assert_eq!(excluded["protocol"], "tls");
     assert_eq!(excluded["sni"], "a.excluded.test");
     assert!(lines.iter().any(|l| l["interception"] == "unsupported"));
