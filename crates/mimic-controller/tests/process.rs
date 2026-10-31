@@ -15,7 +15,8 @@ use mimic_runtime::testing::{Process, http_get, run, wait_status};
 const BIN: &str = env!("CARGO_BIN_EXE_mimic-controller");
 const ADMIN: (&str, &str) = ("MIMIC_ADMIN_ADDR", "127.0.0.1:0");
 /// Required by the webhook (spec §10.2); the listener takes any free port.
-const WEBHOOK: [(&str, &str); 8] = [
+const WEBHOOK: [(&str, &str); 9] = [
+    ("MIMIC_SIDECAR_API_ADDR", "127.0.0.1:0"),
     ("MIMIC_WEBHOOK_ADDR", "127.0.0.1:0"),
     ("MIMIC_NAMESPACE", "mimic-system"),
     ("MIMIC_WEBHOOK_SERVICE", "mimic"),
