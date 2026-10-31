@@ -1,12 +1,20 @@
 //! Injection decision (spec §7.1): which pods get the sidecar, which are skipped and why.
 
-use k8s_openapi::api::core::v1::{HTTPGetAction, Pod, ResourceRequirements};
-use std::collections::BTreeMap;
+use k8s_openapi::api::core::v1::{Container, HTTPGetAction, Pod, Probe, ResourceRequirements};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Label key read on namespaces and pods.
 pub const INJECT_LABEL: &str = "mimic.platform.io/inject";
 /// Name of the injected sidecar init container, also the idempotence marker.
 pub const SIDECAR_NAME: &str = "mimic-sidecar";
+/// Name of the injected iptables init container.
+pub const INIT_NAME: &str = "mimic-init";
+/// Annotation holding the injected version.
+pub const INJECTED_ANNOTATION: &str = "mimic.platform.io/injected";
+/// Sidecar admin port (probes, `/app-health`).
+const ADMIN_PORT: i32 = 15100;
 /// Ports the sidecar owns in the pod's network namespace.
 pub const RESERVED_PORTS: [i32; 3] = [15001, 15006, 15100];
 /// UID of the sidecar, which the app must not use.
@@ -186,21 +194,162 @@ pub struct InjectConfig {
 
 /// Injection patch of `pod`, owned by `deployment`.
 pub fn patch(
-    _pod: &Pod,
-    _deployment: &str,
-    _cfg: &InjectConfig,
+    pod: &Pod,
+    deployment: &str,
+    cfg: &InjectConfig,
 ) -> Result<Vec<JsonPatchOp>, serde_json::Error> {
-    todo!()
+    let add = |path: String, value: Value| JsonPatchOp {
+        op: "add",
+        path,
+        value,
+    };
+    let exclusions = excluded_inbound_ports(pod)
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let init = json!({
+        "name": INIT_NAME,
+        "image": cfg.init_image,
+        "env": [{"name": "MIMIC_EXCLUDE_INBOUND_PORTS", "value": exclusions}],
+        "securityContext": {
+            "runAsUser": 0,
+            "runAsNonRoot": false,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN", "NET_RAW"]},
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+    });
+    let field = |name: &str, path: &str| json!({"name": name, "valueFrom": {"fieldRef": {"fieldPath": path}}});
+    let sidecar = json!({
+        "name": SIDECAR_NAME,
+        "image": cfg.sidecar_image,
+        "restartPolicy": "Always",
+        "env": [
+            {"name": "MIMIC_WORKLOAD", "value": deployment},
+            field("MIMIC_POD_NAMESPACE", "metadata.namespace"),
+            field("MIMIC_POD_NAME", "metadata.name"),
+            field("MIMIC_POD_IP", "status.podIP"),
+            {"name": "MIMIC_APP_PROBES", "value": serde_json::to_string(&app_probes(pod))?},
+            {"name": "MIMIC_LOG", "value": cfg.sidecar_log},
+        ],
+        "resources": serde_json::to_value(&cfg.sidecar_resources)?,
+        "startupProbe": {
+            "httpGet": {"path": "/readyz", "port": ADMIN_PORT},
+            "periodSeconds": 1,
+            "failureThreshold": 60,
+        },
+        "livenessProbe": {
+            "httpGet": {"path": "/healthz", "port": ADMIN_PORT},
+            "periodSeconds": 10,
+        },
+        "securityContext": {
+            "runAsUser": PROXY_UID,
+            "runAsGroup": PROXY_UID,
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+    });
+
+    let spec = pod.spec.as_ref();
+    let mut ops = Vec::new();
+    if spec.is_some_and(|s| s.init_containers.as_ref().is_some_and(|c| !c.is_empty())) {
+        ops.push(add("/spec/initContainers/0".into(), init));
+        ops.push(add("/spec/initContainers/1".into(), sidecar));
+    } else {
+        ops.push(add("/spec/initContainers".into(), json!([init, sidecar])));
+    }
+    if pod.metadata.annotations.is_some() {
+        let key = INJECTED_ANNOTATION.replace('/', "~1");
+        ops.push(add(
+            format!("/metadata/annotations/{key}"),
+            json!(cfg.version),
+        ));
+    } else {
+        ops.push(add(
+            "/metadata/annotations".into(),
+            json!({ INJECTED_ANNOTATION: cfg.version }),
+        ));
+    }
+    for (i, c) in spec.iter().flat_map(|s| &s.containers).enumerate() {
+        for (field, kind, probe) in probes_of(c) {
+            if probe.is_some_and(|p| p.http_get.is_some()) {
+                ops.push(JsonPatchOp {
+                    op: "replace",
+                    path: format!("/spec/containers/{i}/{field}/httpGet"),
+                    value: json!({
+                        "path": format!("/app-health/{}/{kind}", c.name),
+                        "port": ADMIN_PORT,
+                        "scheme": "HTTP",
+                    }),
+                });
+            }
+        }
+    }
+    Ok(ops)
+}
+
+/// Liveness, readiness and startup probes of `c` with the field name and the sidecar's kind.
+fn probes_of(c: &Container) -> [(&'static str, &'static str, Option<&Probe>); 3] {
+    [
+        ("livenessProbe", "livez", c.liveness_probe.as_ref()),
+        ("readinessProbe", "readyz", c.readiness_probe.as_ref()),
+        ("startupProbe", "startupz", c.startup_probe.as_ref()),
+    ]
+}
+
+/// Port number behind `port`, a name being looked up in the container's own ports.
+fn resolve(c: &Container, port: &IntOrString) -> Option<i32> {
+    match port {
+        IntOrString::Int(n) => Some(*n),
+        IntOrString::String(name) => c
+            .ports
+            .iter()
+            .flatten()
+            .find(|p| p.name.as_deref() == Some(name))
+            .map(|p| p.container_port),
+    }
 }
 
 /// Inbound ports `mimic-init` must not redirect (spec §4), sorted and deduplicated.
-pub fn excluded_inbound_ports(_pod: &Pod) -> Vec<u16> {
-    todo!()
+pub fn excluded_inbound_ports(pod: &Pod) -> Vec<u16> {
+    let mut ports = BTreeSet::from([ADMIN_PORT as u16]);
+    for c in pod.spec.iter().flat_map(|s| &s.containers) {
+        for (_, _, probe) in probes_of(c) {
+            let Some(probe) = probe else { continue };
+            let tcp = probe.tcp_socket.as_ref().and_then(|t| resolve(c, &t.port));
+            let grpc = probe.grpc.as_ref().map(|g| g.port);
+            ports.extend(
+                tcp.into_iter()
+                    .chain(grpc)
+                    .filter_map(|p| u16::try_from(p).ok())
+                    .filter(|p| *p != 0),
+            );
+        }
+    }
+    ports.into_iter().collect()
 }
 
-/// Original `httpGet` probes of the app containers, keyed `<container>/<livez|readyz|startupz>`.
-pub fn app_probes(_pod: &Pod) -> BTreeMap<String, HTTPGetAction> {
-    todo!()
+/// Original `httpGet` probes of the app containers, keyed `<container>/<livez|readyz|startupz>`,
+/// named ports resolved when possible.
+pub fn app_probes(pod: &Pod) -> BTreeMap<String, HTTPGetAction> {
+    let mut out = BTreeMap::new();
+    for c in pod.spec.iter().flat_map(|s| &s.containers) {
+        for (_, kind, probe) in probes_of(c) {
+            let Some(mut get) = probe.and_then(|p| p.http_get.clone()) else {
+                continue;
+            };
+            if let Some(port) = resolve(c, &get.port) {
+                get.port = IntOrString::Int(port);
+            }
+            out.insert(format!("{}/{kind}", c.name), get);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
