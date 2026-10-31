@@ -1,2 +1,6 @@
 target
 .git
+.claude
+docs
+deploy
+scripts

@@ -1,0 +1,47 @@
+# Image holding mimic-controller and mimic-sidecar.
+image:
+  repository: ghcr.io/thaliph/mimic
+  # Defaults to the chart appVersion.
+  tag: ""
+  # Takes precedence over tag when set (sha256:…).
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+controller:
+  replicas: 1
+  logLevel: info
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 128Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+valkey:
+  image:
+    repository: docker.io/valkey/valkey
+    tag: 9.0-alpine
+    digest: sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+  # Secret holding the key `password`. Empty: the chart creates one with a random password,
+  # kept across upgrades and on uninstall.
+  existingSecret: ""
+  persistence:
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {memory: 256Mi}
+  nodeSelector: {}
+  tolerations: []
+
+# Restrict Valkey ingress to the controller.
+networkPolicy:
+  enabled: true
+
+metrics:
+  # Prometheus Operator ServiceMonitor for the controller.
+  serviceMonitor:
+    enabled: false
+    interval: 30s

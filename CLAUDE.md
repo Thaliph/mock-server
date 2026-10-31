@@ -1,10 +1,22 @@
-# Instructions pour Claude Code
+# Instructions for Claude Code
 
-- La spécification fait foi : `docs/SPEC.md`. Toute évolution de comportement passe d'abord par la spec.
-- TDD : pour chaque phase, écrire les tests d'acceptation (identifiants de la section 11.2 dans le nom du test) avant l'implémentation.
-- `mimic-core` reste pur : pas de tokio, pas d'I/O, pas d'horloge. Toute la logique testable y vit ; le proxy n'est qu'un adaptateur.
-- L'inférence doit rester déterministe (INF-08) : collections ordonnées (`BTreeMap`, `BTreeSet`), aucun `HashMap` dans une sortie.
-- Aucune valeur sensible ne doit atteindre le disque sans passer par `mimic_core::redact` (RED-04).
-- Avant de proposer une PR : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-- Jamais de push direct sur `main`.
-- Code et commentaires en français, identifiants en anglais.
+- The spec is the source of truth: `docs/SPEC.md`. Any change of behaviour goes into the spec
+  first, then tests, then code.
+- Features are delivered with the `deliver-feature` skill and the agents in `.claude/agents/`
+  (architect, rust-dev, reviewer, ops). One GitHub issue per feature.
+- TDD: tests named after the acceptance criterion IDs of `docs/SPEC.md` §12 (`fnd_02_…`) are
+  written and seen failing before the implementation.
+- `mimic-core` stays pure: no tokio, no I/O, no clock. Process plumbing lives in
+  `mimic-runtime`; binaries are thin adapters.
+- Deterministic outputs: `BTreeMap`/`BTreeSet`, never `HashMap` in anything serialised.
+- 12-factor: configuration from `MIMIC_*` environment variables only (invalid value → exit 2),
+  JSON logs on stdout, stateless processes (state in Valkey), graceful `SIGTERM`.
+- Security first: no secret in logs; nothing sensitive reaches Valkey without redaction;
+  distroless non-root images; pinned actions and images.
+- No traces (logs and metrics only). Mesh traffic management is v2.
+- Before pushing: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`; chart changes: `helm lint --strict deploy/helm/mimic`; workflow
+  changes: `zizmor --offline .github/workflows`; image/chart/cluster changes: `scripts/e2e.sh`.
+- Never push to `main`; merge only on green CI (`ci-ok`) and an approving review.
+- English everywhere: code, comments, docs, commits, issues.
+- Free tier only: public repo, GitHub-hosted runners, GHCR.

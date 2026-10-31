@@ -1,4 +1,5 @@
-# Mises à jour des dépendances : crates, actions GitHub et images de base du Dockerfile.
+# Dependency updates: crates, GitHub Actions and Dockerfile base images. The 7-day cooldown
+# keeps freshly published (possibly compromised) releases out.
 version: 2
 updates:
   - package-ecosystem: cargo

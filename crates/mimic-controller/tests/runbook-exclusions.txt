@@ -1,5 +1,0 @@
-# Messages du contrôleur volontairement absents du runbook (DOC-11).
-# Format : « texte fixe | raison ». Le texte fixe est celui que l'extraction produit.
-zstd: | erreur interne de compression, toujours enveloppée par « construction du snapshot »
-gzip: | idem
-start_elected exige leader_election | erreur de programmation de l'API de la bibliothèque, inatteignable depuis le binaire

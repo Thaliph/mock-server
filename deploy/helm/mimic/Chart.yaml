@@ -1,0 +1,11 @@
+apiVersion: v2
+name: mimic
+description: API discovery and dependency mocking sidecar for Kubernetes workloads
+type: application
+# Chart and app versions are set from the git tag at release.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.33.0-0"
+home: https://github.com/Thaliph/mock-server
+sources:
+  - https://github.com/Thaliph/mock-server

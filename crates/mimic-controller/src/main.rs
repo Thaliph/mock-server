@@ -1,63 +1,71 @@
-use std::path::PathBuf;
+//! `mimic-controller`: webhook, reconciler, sidecar API and UI (spec §2, §7). F0 provides the
+//! process skeleton and the Valkey connection that gates readiness.
 
-use clap::{Parser, Subcommand};
+mod valkey;
 
-#[derive(Parser)]
-#[command(name = "mimic-controller", about = "Plan de contrôle de mimic")]
-struct Args {
-    /// Fichier de configuration YAML.
-    #[arg(long, env = "MIMIC_CONTROLLER_CONFIG")]
-    config: Option<PathBuf>,
-    #[command(subcommand)]
-    command: Option<Command>,
+use std::net::SocketAddr;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use mimic_runtime::admin::{self, Readiness};
+use mimic_runtime::config::{CommonConfig, ConfigError, Env};
+use mimic_runtime::metrics::Metrics;
+
+const BINARY: &str = "mimic-controller";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_ADMIN: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 8081);
+
+struct Config {
+    common: CommonConfig,
+    valkey: redis::Client,
 }
 
-#[derive(Subcommand)]
-enum Command {
-    /// Affiche le manifeste de la CRD MimicWorkload.
-    Crd,
+fn config(env: &Env) -> Result<Config, ConfigError> {
+    Ok(Config {
+        common: CommonConfig::from_env(env, DEFAULT_ADMIN)?,
+        valkey: valkey::client_from_env(env)?,
+    })
+}
+
+fn main() -> ExitCode {
+    if let Some(code) = mimic_runtime::version_flag(BINARY, VERSION) {
+        return code;
+    }
+    let config = match config(&Env::from_os()) {
+        Ok(config) => config,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
+    mimic_runtime::logging::init(&config.common.log);
+    match run(config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "controller stopped");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[tokio::main]
-async fn main() {
-    let args = Args::parse();
-    if let Some(Command::Crd) = args.command {
-        print!("{}", mimic_controller::crd::crd_yaml());
-        return;
-    }
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("MIMIC_LOG")
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-    let config = match mimic_controller::config::ControllerConfig::load(args.config.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(2);
+async fn run(config: Config) -> std::io::Result<()> {
+    tracing::info!(version = VERSION, "controller starting");
+    let metrics = Arc::new(Metrics::new("controller", VERSION));
+    let health = valkey::Health::spawn(config.valkey);
+    let readiness = Readiness::new(move || {
+        let up = health.is_up();
+        async move {
+            if up {
+                Ok(())
+            } else {
+                Err("valkey unreachable".to_string())
+            }
         }
-    };
-    let running = match mimic_controller::start(config).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
-    let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("signal SIGTERM: {e}");
-            std::process::exit(1);
-        }
-    };
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
-        // Bail perdu : la réplique a cessé de servir ; Kubernetes la relance en passive.
-        _ = running.lost() => std::process::exit(1),
-    }
-    running.shutdown().await;
+    });
+    let listener = admin::bind(config.common.admin_addr).await?;
+    admin::serve(
+        listener,
+        admin::router(metrics, readiness),
+        config.common.shutdown_grace,
+    )
+    .await
 }
