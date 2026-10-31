@@ -8,6 +8,9 @@ use mimic_runtime::testing::{Process, http_get, run, wait_status};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mimic-sidecar");
 const ADMIN: (&str, &str) = ("MIMIC_ADMIN_ADDR", "127.0.0.1:0");
+// Ephemeral ports: the default 15006 and 15001 would collide between parallel tests.
+const INBOUND: (&str, &str) = ("MIMIC_INBOUND_ADDRS", "127.0.0.1:0");
+const OUTBOUND: (&str, &str) = ("MIMIC_OUTBOUND_ADDRS", "127.0.0.1:0");
 
 #[test]
 fn fnd_01_invalid_value_exits_2_before_listening() {
@@ -22,7 +25,7 @@ fn fnd_01_invalid_value_exits_2_before_listening() {
 
 #[test]
 fn fnd_04_every_stdout_line_is_a_json_object_with_the_base_fields() {
-    let mut sidecar = Process::spawn(BIN, &[ADMIN, ("MIMIC_LOG", "debug")]);
+    let mut sidecar = Process::spawn(BIN, &[ADMIN, INBOUND, OUTBOUND, ("MIMIC_LOG", "debug")]);
     let addr = sidecar.admin_addr();
     assert_eq!(http_get(addr, "/healthz").0, 200);
     sidecar.terminate();
@@ -41,7 +44,7 @@ fn fnd_04_every_stdout_line_is_a_json_object_with_the_base_fields() {
 
 #[test]
 fn fnd_04_mimic_log_filters_the_output() {
-    let mut sidecar = Process::spawn(BIN, &[ADMIN, ("MIMIC_LOG", "warn")]);
+    let mut sidecar = Process::spawn(BIN, &[ADMIN, INBOUND, OUTBOUND, ("MIMIC_LOG", "warn")]);
     // Nothing at info level reaches stdout, so wait on the process itself.
     std::thread::sleep(Duration::from_millis(500));
     sidecar.terminate();
@@ -58,7 +61,10 @@ fn fnd_04_mimic_log_filters_the_output() {
 
 #[test]
 fn fnd_05_sigterm_exits_0_within_the_grace_period() {
-    let mut sidecar = Process::spawn(BIN, &[ADMIN, ("MIMIC_SHUTDOWN_GRACE", "2s")]);
+    let mut sidecar = Process::spawn(
+        BIN,
+        &[ADMIN, INBOUND, OUTBOUND, ("MIMIC_SHUTDOWN_GRACE", "2s")],
+    );
     let addr = sidecar.admin_addr();
     assert_eq!(http_get(addr, "/readyz").0, 200);
 
@@ -96,11 +102,7 @@ fn tunnel_addrs(sidecar: &mut Process) -> (SocketAddr, SocketAddr) {
     (find("inbound"), find("outbound"))
 }
 
-const LISTENERS: [(&str, &str); 3] = [
-    ADMIN,
-    ("MIMIC_INBOUND_ADDRS", "127.0.0.1:0"),
-    ("MIMIC_OUTBOUND_ADDRS", "127.0.0.1:0"),
-];
+const LISTENERS: [(&str, &str); 3] = [ADMIN, INBOUND, OUTBOUND];
 
 #[test]
 fn inj_07_listeners_are_bound_when_readyz_answers_200() {
