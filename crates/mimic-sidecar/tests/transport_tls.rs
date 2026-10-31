@@ -231,6 +231,7 @@ fn ctx(dst: std::net::SocketAddr) -> Ctx {
     Ctx {
         direction: Direction::Outbound,
         dst,
+        tls: true,
         proxy,
         aborted,
     }

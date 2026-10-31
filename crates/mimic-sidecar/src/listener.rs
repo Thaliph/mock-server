@@ -21,6 +21,7 @@ use tokio::sync::watch;
 
 use crate::connection;
 use crate::red::{DEFAULT_MAX_AUTHORITIES, ProxyMetrics};
+use crate::tls::intercept::Interception;
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 /// Time given to the connections to finish closing once they were told to.
@@ -119,6 +120,7 @@ pub struct Shared {
     bound: Vec<SocketAddr>,
     metrics: TunnelMetrics,
     proxy: ProxyMetrics,
+    tls: Interception,
     original_dst: OriginalDst,
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
@@ -148,6 +150,10 @@ impl Shared {
         &self.proxy
     }
 
+    pub(crate) fn tls(&self) -> &Interception {
+        &self.tls
+    }
+
     pub fn new(
         bound: Vec<SocketAddr>,
         metrics: TunnelMetrics,
@@ -157,6 +163,7 @@ impl Shared {
             bound,
             metrics,
             proxy: ProxyMetrics::default(),
+            tls: Interception::default(),
             original_dst,
             stop: watch::channel(false).0,
             abort: watch::channel(false).0,
@@ -217,6 +224,12 @@ impl Shared {
     /// Uses `proxy` for the RED metrics instead of unregistered ones.
     pub fn with_proxy_metrics(mut self, proxy: ProxyMetrics) -> Shared {
         self.proxy = proxy;
+        self
+    }
+
+    /// Intercepts outbound TLS as `tls` says instead of passing it all through.
+    pub fn with_tls(mut self, tls: Interception) -> Shared {
+        self.tls = tls;
         self
     }
 

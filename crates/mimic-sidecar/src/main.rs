@@ -13,6 +13,7 @@ use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetri
 use mimic_sidecar::probes::{self, Probes};
 use mimic_sidecar::red::ProxyMetrics;
 use mimic_sidecar::tls::ca::{CaClient, CaMetrics, CaState};
+use mimic_sidecar::tls::intercept::{Interception, TlsMetrics};
 use mimic_sidecar::tls::{self, TlsConfig};
 
 const BINARY: &str = "mimic-sidecar";
@@ -74,9 +75,17 @@ async fn run(
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
     let proxy_metrics = ProxyMetrics::register(&mut metrics, tunnel.max_authorities);
     let ca_metrics = CaMetrics::register(&mut metrics);
+    let tls_metrics = TlsMetrics::register(&mut metrics);
     let metrics = Arc::new(metrics);
     // Readiness does not wait for the CA: until it holds an intermediate, TLS is passed through.
-    let _ca = start_ca(&tls, ca_metrics)?;
+    let ca = start_ca(&tls, ca_metrics)?;
+    let interception = Interception::new(
+        tls.exclusions.clone(),
+        ca,
+        tls::SYSTEM_STORES.iter().map(Into::into).collect(),
+        tls.trust_dir.clone(),
+        tls_metrics,
+    );
 
     // The listeners are bound before the admin listener serves, so `/readyz` answers 200 only
     // once they accept connections.
@@ -91,7 +100,8 @@ async fn run(
             tunnel_metrics,
             Arc::new(listener::kernel_original_dst),
         )
-        .with_proxy_metrics(proxy_metrics),
+        .with_proxy_metrics(proxy_metrics)
+        .with_tls(interception),
     );
     // The listeners stop accepting and the relays wind down on the signal.
     tokio::spawn({

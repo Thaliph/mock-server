@@ -1,19 +1,19 @@
 //! The opaque tunnel (spec §4.1): bytes are relayed unchanged in both directions, with no idle
-//! timeout. A FIN on one side reaches the other as a FIN; a reset (or any socket failure) on one
+//! timeout. Each side is a plain TCP or a TLS [`Stream`] (an opaque decrypted tunnel). A FIN on one side reaches the other as a FIN; a reset (or any socket failure) on one
 //! side reaches the other as a reset (`SO_LINGER` 0), also after a FIN. The bytes relayed and the
 //! side that failed are recorded for the access line and the metrics.
 
 use std::future::Future;
 use std::io;
-use std::net::Shutdown;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use socket2::SockRef;
-use tokio::io::Interest;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
 
 use crate::access::Outcome;
+use crate::transport::Stream;
 
 const CHUNK: usize = 16 * 1024;
 
@@ -33,46 +33,29 @@ pub struct Tunnelled {
     pub error: Option<io::Error>,
 }
 
-pub(crate) async fn write_all(to: &TcpStream, mut data: &[u8]) -> io::Result<()> {
-    while !data.is_empty() {
-        to.writable().await?;
-        match to.try_write(data) {
-            Ok(n) => data = &data[n..],
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
+/// Writes `data` and pushes it out (a TLS stream buffers until flushed).
+async fn send(to: &mut (impl AsyncWrite + Unpin), data: &[u8]) -> io::Result<()> {
+    to.write_all(data).await?;
+    to.flush().await
 }
 
-/// Copies `from` to `to` until `from` sends a FIN, which is passed on as a FIN. A failure is
-/// returned with the side it happened on.
+/// Copies `from` to `to` until `from` sends a FIN, which is passed on as a FIN (`close_notify`
+/// first over TLS). A failure is returned with the side it happened on.
 async fn copy(
-    from: &TcpStream,
+    from: &mut (impl AsyncRead + Unpin),
     from_side: Side,
-    to: &TcpStream,
+    to: &mut (impl AsyncWrite + Unpin),
     to_side: Side,
     count: &AtomicU64,
 ) -> Result<(), (Side, io::Error)> {
     let mut buf = vec![0u8; CHUNK];
     loop {
-        from.readable().await.map_err(|e| (from_side, e))?;
-        match from.try_read(&mut buf) {
-            Ok(0) => {
-                return SockRef::from(to)
-                    .shutdown(Shutdown::Write)
-                    .or_else(|e| match e.kind() {
-                        io::ErrorKind::NotConnected => Ok(()),
-                        _ => Err((to_side, e)),
-                    });
-            }
-            Ok(n) => {
-                count.fetch_add(n as u64, Ordering::Relaxed);
-                write_all(to, &buf[..n]).await.map_err(|e| (to_side, e))?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err((from_side, e)),
+        let n = from.read(&mut buf).await.map_err(|e| (from_side, e))?;
+        if n == 0 {
+            return to.shutdown().await.map_err(|e| (to_side, e));
         }
+        count.fetch_add(n as u64, Ordering::Relaxed);
+        send(to, &buf[..n]).await.map_err(|e| (to_side, e))?;
     }
 }
 
@@ -113,38 +96,39 @@ enum Ended {
 /// Writes the bytes read during detection to their side, then relays until both sides are done,
 /// a side fails (the other one gets a reset) or `abort` resolves (both are closed).
 pub async fn tunnel(
-    client: &mut TcpStream,
-    upstream: &mut TcpStream,
+    client: &mut Stream,
+    upstream: &mut Stream,
     to_upstream: Vec<u8>,
     to_client: Vec<u8>,
     early: Option<Early>,
     abort_signal: impl Future<Output = ()>,
 ) -> Tunnelled {
-    let (client, upstream) = (&*client, &*upstream);
+    let (client_socket, upstream_socket) = (client.socket(), upstream.socket());
     let up_count = AtomicU64::new(to_upstream.len() as u64);
     let down_count = AtomicU64::new(to_client.len() as u64);
     let result = match early {
         Some(Early::Shutdown) => Err(Ended::Shutdown),
         early => {
-            let (up, down) = tokio::join!(
-                write_all(upstream, &to_upstream),
-                write_all(client, &to_client)
-            );
+            let (up, down) = tokio::join!(send(upstream, &to_upstream), send(client, &to_client));
             match (up, down, early) {
                 (Err(e), _, _) => Err(Ended::Failed(Side::Upstream, e)),
                 (_, Err(e), _) => Err(Ended::Failed(Side::Client, e)),
                 (_, _, Some(Early::Failed(side, e))) => Err(Ended::Failed(side, e)),
-                _ => tokio::select! {
-                    r = async {
-                        tokio::try_join!(
-                            copy(client, Side::Client, upstream, Side::Upstream, &up_count),
-                            copy(upstream, Side::Upstream, client, Side::Client, &down_count),
-                        )
-                    } => r.map(|_| ()).map_err(|(side, e)| Ended::Failed(side, e)),
-                    (side, e) = failed(client, Side::Client) => Err(Ended::Failed(side, e)),
-                    (side, e) = failed(upstream, Side::Upstream) => Err(Ended::Failed(side, e)),
-                    () = abort_signal => Err(Ended::Shutdown),
-                },
+                _ => {
+                    let (mut client_read, mut client_write) = tokio::io::split(&mut *client);
+                    let (mut upstream_read, mut upstream_write) = tokio::io::split(&mut *upstream);
+                    tokio::select! {
+                        r = async {
+                            tokio::try_join!(
+                                copy(&mut client_read, Side::Client, &mut upstream_write, Side::Upstream, &up_count),
+                                copy(&mut upstream_read, Side::Upstream, &mut client_write, Side::Client, &down_count),
+                            )
+                        } => r.map(|_| ()).map_err(|(side, e)| Ended::Failed(side, e)),
+                        (side, e) = failed(client_socket.tcp(), Side::Client) => Err(Ended::Failed(side, e)),
+                        (side, e) = failed(upstream_socket.tcp(), Side::Upstream) => Err(Ended::Failed(side, e)),
+                        () = abort_signal => Err(Ended::Shutdown),
+                    }
+                }
             }
         }
     };
@@ -155,11 +139,11 @@ pub async fn tunnel(
             // The other side sees what this one did: a reset.
             match side {
                 Side::Upstream => {
-                    abort(client);
+                    abort(client_socket.tcp());
                     (Outcome::UpstreamReset, Some(e))
                 }
                 Side::Client => {
-                    abort(upstream);
+                    abort(upstream_socket.tcp());
                     (Outcome::ClientAbort, Some(e))
                 }
             }

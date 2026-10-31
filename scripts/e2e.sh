@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14). Idempotent: reuses the cluster
-# if it exists; the scenario namespaces are recreated on each run.
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26). Idempotent:
+# reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
 #   TAG=e2e-<sha>-<pid>                         tag of the images built here (unique per run, so
 #                                               another session's image on this daemon is never used)
@@ -23,6 +23,8 @@ PY=docker.io/library/python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f
 KEEP_CLUSTER=${KEEP_CLUSTER:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)}
 BUILT=0
 PIDS=()
+DERIVED=()
+WORK=""
 
 log() { printf '\n== %s\n' "$*"; }
 fail() {
@@ -35,6 +37,8 @@ fail() {
 cleanup() {
   for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
+  for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
+  [[ -z $WORK ]] || rm -rf "$WORK"
   [[ $KEEP_CLUSTER == 1 ]] || kind delete cluster --name "$CLUSTER"
 }
 trap cleanup EXIT
@@ -716,6 +720,419 @@ done
   || fail "inj_16: the injected pod was not rejected by Pod Security baseline"
 [[ -z $(kubectl -n inj-16-baseline get pods -o name) ]] || fail "inj_16: an injected pod violating baseline was admitted"
 
+# --- TLS interception (F3, spec §5, §7.1, §7.2, §12.4 TLS-24..TLS-26) ----------------------------
+# Destinations: HTTPS Services with a certificate from the e2e CA (the client images trust it) and
+# one from an unknown CA. Clients: one Deployment per runtime (curl, Python urllib and requests,
+# Node fetch, the JDK HttpClient), injected, built from a pinned base image with the e2e CA added
+# to its trust store. The clients' code talks only to the destinations; mimic is not visible to it.
+# Helpers defined here take the namespace as an argument where the other sections use `$NS`.
+
+# tls_pod <client>: the pod of a client Deployment (label app=<client>).
+tls_pod() { kubectl -n tls-clients get pods -l "app=$1" -o jsonpath='{.items[0].metadata.name}'; }
+# tls_exec <client> <command...>: runs the command in the client's app container; stderr joins stdout.
+tls_exec() { local c=$1; shift; kubectl -n tls-clients exec "deploy/$c" -c app -- "$@" 2>&1; }
+# sidecar_metrics <namespace> <pod>: the Prometheus text of the sidecar's admin port (15100), through a
+# port-forward so that the check does not depend on the application image.
+sidecar_metrics() {
+  local port=$((29000 + RANDOM % 1000)) pf out=""
+  kubectl -n "$1" port-forward "$2" "$port:15100" >/dev/null 2>&1 &
+  pf=$!
+  for _ in $(seq 20); do
+    out=$(curl -fs "localhost:$port/metrics") && break
+    sleep 0.5
+  done
+  kill "$pf" 2>/dev/null || true
+  wait "$pf" 2>/dev/null || true
+  printf '%s\n' "$out"
+}
+# ready_tls <client>: waits until the client's sidecar holds an intermediate (TLS-15). Before that the
+# sidecar passes TLS through (`no_ca`), which would hide what the checks below look for.
+ready_tls() {
+  local pod
+  pod=$(tls_pod "$1")
+  for _ in $(seq 90); do
+    if sidecar_metrics tls-clients "$pod" | grep -Eq '^mimic_tls_intermediate_expiry_timestamp_seconds [1-9]'; then
+      return 0
+    fi
+    sleep 1
+  done
+  fail "tls_15: the sidecar of $1 holds no intermediate after 90 s"
+}
+# tls_line <namespace> <pod> <jq boolean>: waits up to 15 s until a sidecar log line matches.
+tls_line() {
+  for _ in $(seq 15); do
+    if kubectl -n "$1" logs "$2" -c mimic-sidecar | jq -R -e "fromjson? | select($3)" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+# tls_count <namespace> <pod> <jq boolean>: how many sidecar log lines match.
+tls_count() {
+  kubectl -n "$1" logs "$2" -c mimic-sidecar | jq -R -r "fromjson? | select($3) | 1" | wc -l | tr -d ' '
+}
+# issue <name> <ca name> <dns name>: a server certificate for the name, signed by the CA in $WORK.
+issue() {
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=$3" \
+    -keyout "$WORK/$1.key" -out "$WORK/$1.csr" 2>/dev/null
+  printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:%s\n' "$3" \
+    > "$WORK/$1.ext"
+  openssl x509 -req -in "$WORK/$1.csr" -CA "$WORK/$2.crt" -CAkey "$WORK/$2.key" -CAcreateserial \
+    -days 30 -extfile "$WORK/$1.ext" -out "$WORK/$1.crt" 2>/dev/null
+}
+# derive <name> <base image> <RUN instruction> [ENV line]: the client image mimic-e2e-<name> with the
+# e2e CA in its system store (Debian and Ubuntu: update-ca-certificates; the curl image: its bundle).
+# Node does not read the system store: its ENV names the CA file too (NODE_EXTRA_CA_CERTS). mimic's
+# sidecar takes an image's system store as upstream roots, but not NODE_EXTRA_CA_CERTS (spec §7.1).
+derive() {
+  local dir="$WORK/img-$1" tag="mimic-e2e-$1:$TAG"
+  mkdir -p "$dir"
+  cp "$WORK/e2e-ca.crt" "$dir/mimic-e2e-ca.crt"
+  {
+    printf 'FROM %s\nUSER root\n' "$2"
+    printf 'COPY mimic-e2e-ca.crt /usr/local/share/ca-certificates/mimic-e2e.crt\n'
+    [[ -z ${3:-} ]] || printf 'RUN %s\n' "$3"
+    [[ -z ${4:-} ]] || printf 'ENV %s\n' "$4"
+  } > "$dir/Dockerfile"
+  docker build -q -t "$tag" "$dir" >/dev/null || fail "tls_25: cannot build $tag"
+  DERIVED+=("$tag")
+  kind load docker-image --name "$CLUSTER" "$tag" >/dev/null
+}
+# client_deploy <name> <image> [env line]: one injected client Deployment, sleeping until exec'd into.
+client_deploy() {
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $1, namespace: tls-clients}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: $1}}
+  template:
+    metadata: {labels: {app: $1}}
+    spec:
+      containers:
+        - name: app
+          image: $2
+          imagePullPolicy: Never
+          command: [sleep, "3600"]
+          ${3:+$3}
+          volumeMounts: [{name: scripts, mountPath: /scripts, readOnly: true}]
+      volumes:
+        - name: scripts
+          configMap: {name: tls-scripts}
+YAML
+}
+# dest_deploy <name>: an HTTPS destination (Deployment and Service on port 443) with the certificate
+# Secret <name>-cert.
+dest_deploy() {
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $1, namespace: tls-dest}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: $1}}
+  template:
+    metadata: {labels: {app: $1}}
+    spec:
+      containers:
+        - name: dest
+          image: $PY
+          command: [python3, /code/dest.py]
+          ports: [{containerPort: 8443}]
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: certs, mountPath: /certs, readOnly: true}
+      volumes:
+        - {name: code, configMap: {name: dest-code}}
+        - {name: certs, secret: {secretName: $1-cert}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: $1, namespace: tls-dest}
+spec:
+  selector: {app: $1}
+  ports: [{name: https, port: 443, targetPort: 8443}]
+YAML
+}
+
+log "tls_24: chart pieces: sidecar API Service port, NetworkPolicy, seed Secret and its RBAC, CRD tls.exclude"
+seed_of() { kubectl -n "$NS" get secret $RELEASE-tls-ca -o jsonpath='{.data.seed}'; }
+seed0=$(seed_of)
+[[ $(printf '%s' "$seed0" | base64 -d | wc -c) == 32 ]] || fail "tls_24: the seed Secret does not hold a 32-byte seed"
+[[ $(kubectl -n "$NS" get svc $RELEASE-controller -o jsonpath='{.spec.ports[?(@.name=="sidecar-api")].port}') == 8444 ]] \
+  || fail "tls_24: the controller Service has no sidecar-api port 8444"
+[[ $(kubectl -n "$NS" get networkpolicy $RELEASE-controller -o jsonpath='{.spec.ingress[*].ports[*].port}') == *8444* ]] \
+  || fail "tls_24: the controller NetworkPolicy does not allow port 8444"
+can yes "get the TLS seed Secret" get secret/$RELEASE-tls-ca -n "$NS"
+can yes "update the TLS seed Secret" update secret/$RELEASE-tls-ca -n "$NS"
+can no "get another Secret" get secret/some-other -n "$NS"
+admin_forward
+curl -fs localhost:18081/metrics | grep -q '^mimic_tls_seed_loaded 1' || fail "tls_24: mimic_tls_seed_loaded is not 1"
+exclude_max=$(seq -s, -f 'h%g.example.test' 0 256)
+accepted "a MimicWorkload with tls.exclude: exact host, suffix and IP" workload tls1 \
+  'spec: {deployment: api, tls: {exclude: [api.example.com, "*.corp.example", 10.0.0.1]}}'
+denied "a tls.exclude entry *" workload tls2 'spec: {deployment: api, tls: {exclude: ["*"]}}'
+denied "a tls.exclude entry a.*.com" workload tls3 'spec: {deployment: api, tls: {exclude: ["a.*.com"]}}'
+denied "257 tls.exclude entries" workload tls4 "spec: {deployment: api, tls: {exclude: [$exclude_max]}}"
+kubectl -n default delete mimicworkload tls1 --ignore-not-found >/dev/null
+
+log "tls_25: destinations (an HTTPS Service signed by the e2e CA, one signed by an unknown CA) and client images"
+ns_fresh tls-dest
+ns_fresh tls-clients mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+WORK=$(mktemp -d)
+for ca in "e2e-ca|mimic e2e test CA" "untrusted-ca|mimic untrusted test CA"; do
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+    -keyout "$WORK/${ca%%|*}.key" -out "$WORK/${ca%%|*}.crt" -subj "/CN=${ca#*|}" \
+    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null \
+    || fail "tls_25: cannot create the CA ${ca%%|*}"
+done
+issue dest e2e-ca tls-dest.tls-dest.svc
+issue untrusted untrusted-ca tls-untrusted.tls-dest.svc
+kubectl -n tls-dest create secret tls tls-dest-cert --cert="$WORK/dest.crt" --key="$WORK/dest.key" >/dev/null
+kubectl -n tls-dest create secret tls tls-untrusted-cert --cert="$WORK/untrusted.crt" --key="$WORK/untrusted.key" >/dev/null
+cat > "$WORK/dest.py" <<'PY'
+# The HTTPS destination of the e2e: 200 with the body "ok" for any GET, over the certificate in /certs.
+import http.server
+import ssl
+
+CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+CONTEXT.load_cert_chain("/certs/tls.crt", "/certs/tls.key")
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        self.request = CONTEXT.wrap_socket(self.request, server_side=True)
+        super().setup()
+
+    def do_GET(self):
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+http.server.ThreadingHTTPServer(("0.0.0.0", 8443), Handler).serve_forever()
+PY
+kubectl -n tls-dest create configmap dest-code --from-file=dest.py="$WORK/dest.py" >/dev/null
+dest_deploy tls-dest
+dest_deploy tls-untrusted
+kubectl -n tls-dest rollout status deploy/tls-dest --timeout=2m >/dev/null || fail "tls_25: tls-dest did not roll out"
+kubectl -n tls-dest rollout status deploy/tls-untrusted --timeout=2m >/dev/null || fail "tls_25: tls-untrusted did not roll out"
+
+# The pinned base images (digests as in the CI image checks), with the e2e CA in their trust store.
+CURL_BASE=curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69
+PY_SLIM=python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+NODE_SLIM=node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
+JDK=eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+derive curl "$CURL_BASE" 'cat /usr/local/share/ca-certificates/mimic-e2e.crt >> /etc/ssl/certs/ca-certificates.crt'
+derive python "$PY_SLIM" 'update-ca-certificates && pip install --no-cache-dir requests==2.32.5'
+derive node "$NODE_SLIM" 'apt-get update && apt-get install -y --no-install-recommends ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*' \
+  'NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/mimic-e2e.crt'
+derive jdk "$JDK" 'update-ca-certificates'
+
+cat > "$WORK/client.py" <<'PY'
+# usage: client.py <url> <host>. A urllib GET (exit 1 when it fails), then the issuer of the
+# certificate the client saw, then a requests GET.
+import socket
+import ssl
+import sys
+import urllib.request
+
+url, host = sys.argv[1], sys.argv[2]
+try:
+    with urllib.request.urlopen(url, timeout=10) as response:
+        print(f"urllib status={response.status}")
+except Exception as error:
+    print(f"urllib error={type(error).__name__}: {error}")
+    sys.exit(1)
+with socket.create_connection((host, 443), 10) as sock:
+    with ssl.create_default_context().wrap_socket(sock, server_hostname=host) as tls:
+        cert = tls.getpeercert()
+issuer = ",".join(value for rdn in cert["issuer"] for key, value in rdn if key == "commonName")
+print(f"issuer={issuer}")
+import requests
+
+print(f"requests status={requests.get(url, timeout=10).status_code}")
+PY
+cat > "$WORK/client.mjs" <<'JS'
+// usage: node client.mjs <url> <host>: a fetch, then the issuer of the certificate the client saw.
+import tls from 'node:tls';
+
+const [url, host] = process.argv.slice(2);
+const response = await fetch(url);
+await response.text();
+const issuer = await new Promise((resolve, reject) => {
+  const socket = tls.connect({ host, port: 443, servername: host }, () => {
+    resolve(socket.getPeerCertificate().issuer.CN);
+    socket.end();
+  });
+  socket.on('error', reject);
+});
+console.log(`node status=${response.status} issuer=${issuer}`);
+JS
+cat > "$WORK/Client.java" <<'JAVA'
+// usage: java Client.java <url> <host>: an HttpClient GET, then the issuer of the certificate.
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.security.cert.X509Certificate;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+
+public class Client {
+    public static void main(String[] args) throws Exception {
+        URI uri = URI.create(args[0]);
+        HttpResponse<String> response = HttpClient.newHttpClient()
+            .send(HttpRequest.newBuilder(uri).build(), HttpResponse.BodyHandlers.ofString());
+        try (SSLSocket socket = (SSLSocket) SSLSocketFactory.getDefault().createSocket(args[1], 443)) {
+            socket.startHandshake();
+            X509Certificate cert = (X509Certificate) socket.getSession().getPeerCertificates()[0];
+            System.out.println("java status=" + response.statusCode()
+                + " issuer=" + cert.getIssuerX500Principal().getName());
+        }
+    }
+}
+JAVA
+kubectl -n tls-clients create configmap tls-scripts --from-file=client.py="$WORK/client.py" \
+  --from-file=client.mjs="$WORK/client.mjs" --from-file=Client.java="$WORK/Client.java" \
+  --from-file=only-e2e.pem="$WORK/e2e-ca.crt" >/dev/null
+client_deploy curl "mimic-e2e-curl:$TAG"
+client_deploy python "mimic-e2e-python:$TAG"
+client_deploy node "mimic-e2e-node:$TAG"
+client_deploy jvm "mimic-e2e-jdk:$TAG"
+# SSL_CERT_FILE in the spec is kept by mimic; the file holds only the e2e CA (TLS-26).
+client_deploy pinned "mimic-e2e-python:$TAG" 'env: [{name: SSL_CERT_FILE, value: /scripts/only-e2e.pem}]'
+for c in curl python node jvm pinned; do
+  kubectl -n tls-clients rollout status "deploy/$c" --timeout=4m >/dev/null || fail "tls_25: client $c did not roll out"
+done
+
+dest=tls-dest.tls-dest.svc
+untrusted=tls-untrusted.tls-dest.svc
+pinned_pod=$(tls_pod pinned)
+[[ $(kubectl -n tls-clients get pod "$pinned_pod" -o jsonpath='{.spec.containers[?(@.name=="app")].env[?(@.name=="SSL_CERT_FILE")].value}') == /scripts/only-e2e.pem ]] \
+  || fail "tls_26: the spec's SSL_CERT_FILE was replaced"
+
+log "tls_25: curl, Python (urllib, requests), Node and the JDK reach the HTTPS destination through mimic"
+for c in curl python node jvm; do ready_tls "$c"; done
+out=$(tls_exec curl curl -sv -o /dev/null -w 'curl status=%{http_code}\n' "https://$dest/tls25/curl") \
+  || fail "tls_25: curl call failed: $out"
+grep -q 'curl status=200' <<<"$out" && grep -q 'mimic intermediate' <<<"$out" \
+  || fail "tls_25: curl did not get 200 with a certificate of the mimic intermediate"
+out=$(tls_exec python python3 /scripts/client.py "https://$dest/tls25/python" "$dest") \
+  || fail "tls_25: python call failed: $out"
+grep -q 'urllib status=200' <<<"$out" && grep -q 'requests status=200' <<<"$out" \
+  && grep -q 'issuer=mimic intermediate' <<<"$out" || fail "tls_25: python: $out"
+out=$(tls_exec node node /scripts/client.mjs "https://$dest/tls25/node" "$dest") || fail "tls_25: node call failed: $out"
+grep -q 'node status=200 issuer=mimic intermediate' <<<"$out" || fail "tls_25: node: $out"
+out=$(tls_exec jvm java /scripts/Client.java "https://$dest/tls25/jvm" "$dest") || fail "tls_25: jvm call failed: $out"
+grep -q 'java status=200 issuer=.*CN=mimic intermediate' <<<"$out" || fail "tls_25: jvm: $out"
+for c in curl python node jvm; do
+  pod=$(tls_pod "$c")
+  tls_line tls-clients "$pod" '.target=="access" and .tls==true and .method=="GET" and .path=="/tls25/'"$c"'" and .status==200 and .authority=="'"$dest"'"' \
+    || { kubectl -n tls-clients logs "$pod" -c mimic-sidecar | grep '"target":"access"' >&2 || true; fail "tls_25: no decrypted exchange line with tls true for $c"; }
+done
+
+rc=0; out=$(tls_exec curl curl -sS -o /dev/null "https://$untrusted/tls25/untrusted") || rc=$?
+[[ $rc == 60 ]] || fail "tls_25: curl to the unknown CA exited $rc, want 60 as without mimic: $out"
+rc=0; tls_exec curl curl -sS -o /dev/null "https://$untrusted/tls25/untrusted" >/dev/null || rc=$?
+[[ $rc == 60 ]] || fail "tls_25: the second call to the unknown CA exited $rc, want 60"
+curl_pod=$(tls_pod curl)
+tls_line tls-clients "$curl_pod" '.target=="access" and .protocol=="tls" and .sni=="'"$untrusted"'" and .interception=="upstream_untrusted"' \
+  || fail "tls_25: no connection line interception upstream_untrusted for $untrusted"
+[[ $(tls_count tls-clients "$curl_pod" '.message=="tls passthrough" and .sni=="'"$untrusted"'"') == 1 ]] \
+  || fail "tls_25: the passthrough WARN is not logged exactly once for $untrusted"
+[[ $(tls_count tls-clients "$curl_pod" '.level=="WARN" and .message=="tls passthrough" and .reason=="upstream_untrusted"') == 1 ]] \
+  || fail "tls_25: the WARN does not name reason upstream_untrusted"
+
+log "tls_25: spec.tls.exclude: a MimicWorkload naming the destination makes the next pod's connections excluded"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: excluded, namespace: tls-clients}
+spec: {deployment: excluded, tls: {exclude: [$dest]}}
+YAML
+# The controller's MimicWorkload cache follows the API server within seconds (as in INJ-15).
+sleep 5
+client_deploy excluded "mimic-e2e-curl:$TAG"
+kubectl -n tls-clients rollout status deploy/excluded --timeout=4m >/dev/null || fail "tls_25: the excluded client did not roll out"
+excluded_pod=$(tls_pod excluded)
+[[ $(kubectl -n tls-clients get pod "$excluded_pod" -o jsonpath='{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_TLS_EXCLUDE")].value}') == "$dest" ]] \
+  || fail "tls_25: the pod does not carry MIMIC_TLS_EXCLUDE from the MimicWorkload"
+ready_tls excluded
+out=$(tls_exec excluded curl -sv -o /dev/null -w 'curl status=%{http_code}\n' "https://$dest/tls25/excluded") \
+  || fail "tls_25: the excluded call failed: $out"
+grep -q 'curl status=200' <<<"$out" && grep -q 'mimic e2e test CA' <<<"$out" \
+  || fail "tls_25: the excluded connection did not reach the destination's own certificate"
+tls_line tls-clients "$excluded_pod" '.target=="access" and .protocol=="tls" and .sni=="'"$dest"'" and .interception=="excluded"' \
+  || fail "tls_25: the connection is not logged as interception excluded"
+
+log "tls_26: a client trusting only the e2e CA: client_rejected once, then the destination's own certificate"
+ready_tls pinned
+rc=0; out=$(tls_exec pinned python3 /scripts/client.py "https://$dest/tls26/first" "$dest") || rc=$?
+[[ $rc != 0 ]] || fail "tls_26: the first call succeeded, so mimic's certificate was accepted by a client that trusts only the e2e CA"
+# The failure must be the trust decision (mimic's root is not in the client's store), not another verification error.
+grep -Eq 'unable to get local issuer|self-signed certificate in certificate chain' <<<"$out" \
+  || fail "tls_26: the first call failed for another reason than the untrusted mimic root: $out"
+out=$(tls_exec pinned python3 /scripts/client.py "https://$dest/tls26/second" "$dest") \
+  || fail "tls_26: the second call failed: $out"
+grep -q 'urllib status=200' <<<"$out" && grep -q 'issuer=mimic e2e test CA' <<<"$out" \
+  || fail "tls_26: the second call did not get the destination's own certificate: $out"
+pinned_pod=$(tls_pod pinned)
+tls_line tls-clients "$pinned_pod" '.level=="WARN" and .message=="tls passthrough" and .reason=="client_rejected"' \
+  || fail "tls_26: no WARN tls passthrough with reason client_rejected"
+[[ $(tls_count tls-clients "$pinned_pod" '.message=="tls passthrough"') == 1 ]] \
+  || fail "tls_26: the passthrough WARN is not logged exactly once"
+tls_line tls-clients "$pinned_pod" '.target=="access" and .interception=="client_rejected" and .sni=="'"$dest"'"' \
+  || fail "tls_26: no connection line interception client_rejected"
+
+# The sidecar API (spec §7.2): a token bound to a pod of deployment curl is refused for another name.
+log "tls_26: the sidecar API refuses a token for another deployment (403); the token and the key appear in no log"
+kubectl -n "$NS" port-forward svc/$RELEASE-controller 18444:8444 >/dev/null 2>&1 &
+PIDS+=("$!")
+secret_key 'ca\.crt' | base64 -d > "$WORK/webhook-ca.crt"
+openssl ecparam -name prime256v1 -genkey -noout -out "$WORK/sidecar.key" 2>/dev/null
+pubkey=$(openssl pkey -in "$WORK/sidecar.key" -pubout -outform DER | base64 -w0)
+token=$(kubectl -n tls-clients create token default --audience mimic.platform.io \
+  --bound-object-kind Pod --bound-object-name "$curl_pod" --duration 10m) || fail "tls_26: cannot create a token"
+# sidecar_api <deployment>: the status of an intermediate request with the token bound to $curl_pod.
+sidecar_api() {
+  curl -s -o /dev/null -w '%{http_code}' --cacert "$WORK/webhook-ca.crt" \
+    --resolve "$RELEASE-controller.$NS.svc:18444:127.0.0.1" -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' -d "{\"deployment\":\"$1\",\"public_key\":\"$pubkey\"}" \
+    "https://$RELEASE-controller.$NS.svc:18444/v1/tls/intermediate"
+}
+for _ in $(seq 30); do [[ $(sidecar_api curl) == 200 ]] && break; sleep 1; done
+[[ $(sidecar_api curl) == 200 ]] || fail "tls_26: the sidecar API did not issue an intermediate to the curl pod"
+[[ $(sidecar_api other) == 403 ]] || fail "tls_26: the sidecar API accepted a token for another deployment"
+logs="$WORK/all.log"
+{
+  for p in $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller -o name); do
+    kubectl -n "$NS" logs "$p" --all-containers
+  done
+  for p in $(kubectl -n tls-clients get pods -o name); do kubectl -n tls-clients logs "$p" --all-containers; done
+} > "$logs"
+grep -F -q "$token" "$logs" && fail "tls_26: the projected token appears in a log line"
+grep -F -q "$pubkey" "$logs" && fail "tls_26: the posted public key appears in a log line"
+grep -q 'PRIVATE KEY' "$logs" && fail "tls_26: a PRIVATE KEY appears in a log line"
+grep -q '"target":"sidecar_api"' "$logs" || fail "tls_26: no sidecar_api log line"
+
+log "tls_24: the seed survives a controller restart; the test namespaces are removed"
+kubectl -n "$NS" rollout restart deploy/$RELEASE-controller >/dev/null
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
+[[ $(seed_of) == "$seed0" ]] || fail "tls_24: the seed changed across a controller restart"
+kubectl -n tls-clients delete pods --all --wait=false >/dev/null
+kubectl delete namespace tls-clients tls-dest --wait=false >/dev/null
+
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
@@ -724,6 +1141,7 @@ metadata: {name: kept, namespace: default}
 spec: {deployment: api}
 YAML
 helm uninstall "$RELEASE" -n "$NS" --wait --timeout 4m >/dev/null || fail "inj_23: helm uninstall failed"
+kubectl -n "$NS" get secret $RELEASE-tls-ca >/dev/null 2>&1 && fail "tls_24: helm uninstall left the TLS seed Secret"
 kubectl get crd mimicworkloads.mimic.platform.io >/dev/null 2>&1 || fail "inj_23: the CRD was removed by helm uninstall"
 [[ $(kubectl -n default get mimicworkload kept -o jsonpath='{.spec.deployment}' 2>/dev/null) == api ]] \
   || fail "inj_23: the MimicWorkload was removed by helm uninstall"
