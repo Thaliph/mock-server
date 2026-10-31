@@ -128,6 +128,7 @@ impl Root {
             .distinguished_name
             .push(DnType::OrganizationName, "mimic");
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.use_authority_key_identifier_extension = true;
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         params.not_before = datetime(now - SKEW);
         params.not_after = datetime(now + INTERMEDIATE_LIFETIME);
@@ -408,6 +409,39 @@ mod tests {
         assert_eq!(inter.validity().not_after.timestamp(), issued + 25 * 3600);
         // The certificate carries the sidecar's key, not the root's.
         assert_eq!(inter.public_key().raw, &key.subject_public_key_info()[..]);
+    }
+
+    fn key_ids(der: &[u8]) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        use x509_parser::extensions::ParsedExtension;
+        let (_, cert) = x509_parser::parse_x509_certificate(der).unwrap();
+        let (mut subject, mut authority) = (None, None);
+        for ext in cert.extensions() {
+            match ext.parsed_extension() {
+                ParsedExtension::SubjectKeyIdentifier(id) => subject = Some(id.0.to_vec()),
+                ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    authority = aki.key_identifier.as_ref().map(|id| id.0.to_vec());
+                }
+                _ => {}
+            }
+        }
+        (subject, authority)
+    }
+
+    #[test]
+    fn tls_07_key_identifiers_link_the_intermediate_to_the_root() {
+        let root = derive_root(&seed(1), "shop", "cart").unwrap();
+        let key = KeyPair::generate().unwrap();
+        let pem = root
+            .sign_intermediate(&key.subject_public_key_info(), at(100))
+            .unwrap();
+        let (root_ski, _) = key_ids(&parse(root.certificate_pem()));
+        let (inter_ski, inter_aki) = key_ids(&parse(&pem));
+        assert!(root_ski.is_some(), "root without Subject Key Identifier");
+        assert!(
+            inter_ski.is_some(),
+            "intermediate without Subject Key Identifier"
+        );
+        assert_eq!(inter_aki, root_ski);
     }
 
     #[test]
