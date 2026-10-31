@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mimic_core::fd::fd_limit_target;
 use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
 use nix::sys::resource::{Resource, getrlimit, setrlimit};
@@ -307,15 +308,25 @@ pub fn bind_all(
     Ok(bound)
 }
 
-/// Raises the open-file soft limit to the hard limit (spec §4.1): the proxy holds two sockets
-/// per connection and never refuses one. Failures are logged, not fatal.
+/// Raises the open-file soft limit to the hard limit, or to `fs.nr_open` when the hard limit
+/// is unlimited (spec §4.1): the proxy holds two sockets per connection and never refuses one.
+/// Failures are logged, not fatal.
 pub fn raise_fd_limit() {
     match getrlimit(Resource::RLIMIT_NOFILE) {
-        Ok((soft, hard)) if soft < hard => match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
-            Ok(()) => tracing::info!(from = soft, to = hard, "open-file limit raised"),
-            Err(e) => tracing::warn!(error = %e, soft, hard, "cannot raise the open-file limit"),
-        },
-        Ok(_) => {}
+        Ok((soft, hard)) => {
+            let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let Some(target) = fd_limit_target(soft, hard, nr_open) else {
+                return;
+            };
+            match setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+                Ok(()) => tracing::info!(from = soft, to = target, "open-file limit raised"),
+                Err(e) => {
+                    tracing::warn!(error = %e, soft, hard, target, "cannot raise the open-file limit");
+                }
+            }
+        }
         Err(e) => tracing::warn!(error = %e, "cannot read the open-file limit"),
     }
 }
