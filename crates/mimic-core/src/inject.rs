@@ -1,6 +1,7 @@
 //! Injection decision (spec §7.1): which pods get the sidecar, which are skipped and why.
 
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{HTTPGetAction, Pod, ResourceRequirements};
+use std::collections::BTreeMap;
 
 /// Label key read on namespaces and pods.
 pub const INJECT_LABEL: &str = "mimic.platform.io/inject";
@@ -161,6 +162,45 @@ pub fn decide(
         return skip(SkipReason::UidConflict);
     }
     Decision::Inject { deployment }
+}
+
+/// One RFC 6902 operation of the injection patch.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct JsonPatchOp {
+    pub op: &'static str,
+    pub path: String,
+    pub value: serde_json::Value,
+}
+
+/// What the webhook knows about the sidecar it injects (spec §10.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InjectConfig {
+    /// Value of the `mimic.platform.io/injected` annotation.
+    pub version: String,
+    pub sidecar_image: String,
+    pub init_image: String,
+    pub sidecar_resources: ResourceRequirements,
+    /// `MIMIC_LOG` given to the sidecar.
+    pub sidecar_log: String,
+}
+
+/// Injection patch of `pod`, owned by `deployment`.
+pub fn patch(
+    _pod: &Pod,
+    _deployment: &str,
+    _cfg: &InjectConfig,
+) -> Result<Vec<JsonPatchOp>, serde_json::Error> {
+    todo!()
+}
+
+/// Inbound ports `mimic-init` must not redirect (spec §4), sorted and deduplicated.
+pub fn excluded_inbound_ports(_pod: &Pod) -> Vec<u16> {
+    todo!()
+}
+
+/// Original `httpGet` probes of the app containers, keyed `<container>/<livez|readyz|startupz>`.
+pub fn app_probes(_pod: &Pod) -> BTreeMap<String, HTTPGetAction> {
+    todo!()
 }
 
 #[cfg(test)]
@@ -403,5 +443,321 @@ mod tests {
         // Even when it would otherwise be skipped.
         spec(&mut p).host_network = Some(true);
         assert_eq!(run(&p, NamespaceMode::Enabled, false), untouched);
+    }
+
+    // ---- patch (INJ-03, INJ-04) ----
+
+    use k8s_openapi::api::core::v1::{GRPCAction, Probe, TCPSocketAction};
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    use serde_json::{Value, json};
+
+    fn cfg() -> InjectConfig {
+        InjectConfig {
+            version: "0.1.0".into(),
+            sidecar_image: "ghcr.io/x/mimic-sidecar@sha256:aa".into(),
+            init_image: "ghcr.io/x/mimic-init@sha256:bb".into(),
+            sidecar_resources: serde_json::from_value(json!({
+                "requests": {"cpu": "50m", "memory": "64Mi"},
+                "limits": {"memory": "128Mi"}
+            }))
+            .unwrap(),
+            sidecar_log: "debug".into(),
+        }
+    }
+
+    fn apply(p: &Pod) -> Value {
+        let ops = patch(p, "shop-api", &cfg()).unwrap();
+        let mut doc = serde_json::to_value(p).unwrap();
+        let ops: json_patch::Patch =
+            serde_json::from_value(serde_json::to_value(&ops).unwrap()).unwrap();
+        json_patch::patch(&mut doc, &ops).unwrap();
+        doc
+    }
+
+    fn http(port: IntOrString, path: &str) -> Probe {
+        Probe {
+            http_get: Some(HTTPGetAction {
+                port,
+                path: Some(path.into()),
+                scheme: Some("HTTPS".into()),
+                host: Some("localhost".into()),
+                ..Default::default()
+            }),
+            period_seconds: Some(7),
+            timeout_seconds: Some(3),
+            failure_threshold: Some(5),
+            ..Default::default()
+        }
+    }
+
+    fn tcp(port: IntOrString) -> Probe {
+        Probe {
+            tcp_socket: Some(TCPSocketAction { port, host: None }),
+            ..Default::default()
+        }
+    }
+
+    fn grpc(port: i32) -> Probe {
+        Probe {
+            grpc: Some(GRPCAction {
+                port,
+                service: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn named(name: &str, port: i32) -> ContainerPort {
+        ContainerPort {
+            name: Some(name.into()),
+            container_port: port,
+            ..Default::default()
+        }
+    }
+
+    fn init_names(doc: &Value) -> Vec<&str> {
+        doc["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn inj_03_init_containers_go_first_also_when_none() {
+        assert_eq!(init_names(&apply(&pod())), ["mimic-init", "mimic-sidecar"]);
+        let mut p = pod();
+        spec(&mut p).init_containers = Some(vec![Container {
+            name: "migrate".into(),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            init_names(&apply(&p)),
+            ["mimic-init", "mimic-sidecar", "migrate"]
+        );
+    }
+
+    #[test]
+    fn inj_03_annotation_added_with_and_without_existing_ones() {
+        let doc = apply(&pod());
+        assert_eq!(
+            doc["metadata"]["annotations"],
+            json!({"mimic.platform.io/injected": "0.1.0"})
+        );
+        let mut p = pod();
+        p.metadata.annotations = Some(BTreeMap::from([("a".to_string(), "b".to_string())]));
+        let doc = apply(&p);
+        assert_eq!(
+            doc["metadata"]["annotations"],
+            json!({"a": "b", "mimic.platform.io/injected": "0.1.0"})
+        );
+    }
+
+    #[test]
+    fn inj_03_patch_is_deterministic() {
+        let mut p = pod();
+        spec(&mut p).containers[0].readiness_probe = Some(http(IntOrString::Int(8080), "/r"));
+        spec(&mut p).containers[0].liveness_probe = Some(http(IntOrString::Int(8080), "/l"));
+        let a = serde_json::to_string(&patch(&p, "shop-api", &cfg()).unwrap()).unwrap();
+        let b = serde_json::to_string(&patch(&p, "shop-api", &cfg()).unwrap()).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn inj_03_init_container_security() {
+        let doc = apply(&pod());
+        let init = &doc["spec"]["initContainers"][0];
+        assert_eq!(init["image"], "ghcr.io/x/mimic-init@sha256:bb");
+        assert_eq!(
+            init["securityContext"],
+            json!({
+                "runAsUser": 0,
+                "runAsNonRoot": false,
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": true,
+                "capabilities": {"drop": ["ALL"], "add": ["NET_ADMIN", "NET_RAW"]},
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+        assert!(init.get("volumeMounts").is_none());
+        assert!(init.get("restartPolicy").is_none());
+    }
+
+    #[test]
+    fn inj_03_sidecar_container() {
+        let doc = apply(&pod());
+        let sc = &doc["spec"]["initContainers"][1];
+        assert_eq!(sc["image"], "ghcr.io/x/mimic-sidecar@sha256:aa");
+        assert_eq!(sc["restartPolicy"], "Always");
+        assert_eq!(
+            sc["securityContext"],
+            json!({
+                "runAsUser": 1337,
+                "runAsGroup": 1337,
+                "runAsNonRoot": true,
+                "allowPrivilegeEscalation": false,
+                "readOnlyRootFilesystem": true,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+        assert_eq!(
+            sc["startupProbe"]["httpGet"],
+            json!({"path": "/readyz", "port": 15100})
+        );
+        assert_eq!(
+            sc["livenessProbe"]["httpGet"],
+            json!({"path": "/healthz", "port": 15100})
+        );
+        assert_eq!(
+            sc["resources"],
+            json!({"requests": {"cpu": "50m", "memory": "64Mi"}, "limits": {"memory": "128Mi"}})
+        );
+        assert!(sc.get("volumeMounts").is_none());
+        let env: BTreeMap<_, _> = sc["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| (e["name"].as_str().unwrap(), e))
+            .collect();
+        assert_eq!(env["MIMIC_WORKLOAD"]["value"], "shop-api");
+        assert_eq!(env["MIMIC_LOG"]["value"], "debug");
+        for (name, field) in [
+            ("MIMIC_POD_NAMESPACE", "metadata.namespace"),
+            ("MIMIC_POD_NAME", "metadata.name"),
+            ("MIMIC_POD_IP", "status.podIP"),
+        ] {
+            assert_eq!(env[name]["valueFrom"]["fieldRef"]["fieldPath"], field);
+        }
+        assert_eq!(env["MIMIC_APP_PROBES"]["value"], "{}");
+    }
+
+    #[test]
+    fn inj_03_app_containers_change_only_http_probes() {
+        let mut p = pod();
+        {
+            let c = &mut spec(&mut p).containers[0];
+            c.env = Some(vec![]);
+            c.readiness_probe = Some(http(IntOrString::Int(8080), "/ready"));
+            c.liveness_probe = Some(tcp(IntOrString::Int(9000)));
+        }
+        let mut expected = serde_json::to_value(&p).unwrap();
+        expected["spec"]["containers"][0]["readinessProbe"]["httpGet"] =
+            json!({"path": "/app-health/app/readyz", "port": 15100, "scheme": "HTTP"});
+        // Everything else is the original, init containers and annotation aside.
+        let mut after = apply(&p);
+        after["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("initContainers");
+        after["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("annotations");
+        assert_eq!(after, expected);
+        let rp = &after["spec"]["containers"][0]["readinessProbe"];
+        assert_eq!(rp["periodSeconds"], 7);
+        assert_eq!(rp["timeoutSeconds"], 3);
+        assert_eq!(rp["failureThreshold"], 5);
+    }
+
+    #[test]
+    fn inj_04_exclusions_from_tcp_and_grpc_probes() {
+        let mut p = pod();
+        spec(&mut p).containers[0].ports = Some(vec![named("db", 5432), named("web", 8080)]);
+        spec(&mut p).containers[0].liveness_probe = Some(tcp(IntOrString::String("db".into())));
+        spec(&mut p).containers[0].readiness_probe = Some(tcp(IntOrString::Int(5432)));
+        spec(&mut p).containers[0].startup_probe = Some(grpc(50051));
+        spec(&mut p).containers.push(Container {
+            name: "other".into(),
+            // Names are resolved against the probe's own container: "db" and "nope" are unknown.
+            liveness_probe: Some(tcp(IntOrString::String("db".into()))),
+            readiness_probe: Some(tcp(IntOrString::String("nope".into()))),
+            startup_probe: Some(tcp(IntOrString::Int(81))),
+            ..Default::default()
+        });
+        assert_eq!(excluded_inbound_ports(&p), vec![81, 5432, 15100, 50051]);
+    }
+
+    #[test]
+    fn inj_04_http_probe_ports_are_not_excluded() {
+        let mut p = pod();
+        spec(&mut p).containers[0].ports = Some(vec![named("web", 8080)]);
+        spec(&mut p).containers[0].liveness_probe =
+            Some(http(IntOrString::String("web".into()), "/l"));
+        spec(&mut p).containers[0].readiness_probe = Some(http(IntOrString::Int(9090), "/r"));
+        assert_eq!(excluded_inbound_ports(&p), vec![15100]);
+    }
+
+    #[test]
+    fn inj_04_exclusions_reach_mimic_init() {
+        let mut p = pod();
+        spec(&mut p).containers[0].liveness_probe = Some(tcp(IntOrString::Int(9000)));
+        let doc = apply(&p);
+        assert_eq!(
+            doc["spec"]["initContainers"][0]["env"],
+            json!([{"name": "MIMIC_EXCLUDE_INBOUND_PORTS", "value": "9000,15100"}])
+        );
+    }
+
+    #[test]
+    fn inj_04_app_probes_and_rewrite() {
+        let mut p = pod();
+        spec(&mut p).containers[0].ports = Some(vec![named("web", 8080)]);
+        spec(&mut p).containers[0].liveness_probe =
+            Some(http(IntOrString::String("web".into()), "/l"));
+        spec(&mut p).containers[0].readiness_probe = Some(http(IntOrString::Int(9090), "/r"));
+        spec(&mut p).containers[0].startup_probe =
+            Some(http(IntOrString::String("nope".into()), "/s"));
+        spec(&mut p).containers.push(Container {
+            name: "side".into(),
+            readiness_probe: Some(tcp(IntOrString::Int(1))),
+            ..Default::default()
+        });
+        let probes = app_probes(&p);
+        assert_eq!(
+            probes.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["app/livez", "app/readyz", "app/startupz"]
+        );
+        let live = &probes["app/livez"];
+        assert_eq!(live.port, IntOrString::Int(8080));
+        assert_eq!(live.path.as_deref(), Some("/l"));
+        assert_eq!(live.scheme.as_deref(), Some("HTTPS"));
+        assert_eq!(live.host.as_deref(), Some("localhost"));
+        assert_eq!(probes["app/readyz"].port, IntOrString::Int(9090));
+        // An unresolvable name is kept as is.
+        assert_eq!(
+            probes["app/startupz"].port,
+            IntOrString::String("nope".into())
+        );
+
+        let doc = apply(&p);
+        let value = doc["spec"]["initContainers"][1]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "MIMIC_APP_PROBES")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap();
+        let parsed: BTreeMap<String, HTTPGetAction> = serde_json::from_str(value).unwrap();
+        assert_eq!(parsed, probes);
+        let c = &doc["spec"]["containers"][0];
+        for (k, kind) in [
+            ("livenessProbe", "livez"),
+            ("readinessProbe", "readyz"),
+            ("startupProbe", "startupz"),
+        ] {
+            assert_eq!(
+                c[k]["httpGet"],
+                json!({"path": format!("/app-health/app/{kind}"), "port": 15100, "scheme": "HTTP"})
+            );
+        }
+        assert_eq!(c["livenessProbe"]["periodSeconds"], 7);
+        assert_eq!(
+            doc["spec"]["containers"][1]["readinessProbe"],
+            json!({"tcpSocket": {"port": 1}})
+        );
     }
 }
