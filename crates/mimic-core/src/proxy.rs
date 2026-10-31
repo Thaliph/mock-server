@@ -3,6 +3,7 @@
 
 pub mod authority;
 pub mod http1;
+pub mod tls;
 
 /// Most bytes detection looks at before it gives up.
 pub const DETECT_LIMIT: usize = 16 * 1024;
