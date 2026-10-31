@@ -98,6 +98,7 @@ pub(crate) async fn handle(
     let ctx = |dst| Ctx {
         direction,
         dst,
+        tls: false,
         proxy: proxy.clone(),
         aborted: shared.abort_flag(),
     };
@@ -159,6 +160,7 @@ pub(crate) async fn handle(
     };
     let authority = sni.clone().unwrap_or_else(|| dst.to_string());
     proxy.connection(direction, protocol, &authority);
+    let (mut client, mut upstream) = (Stream::plain(client), Stream::plain(upstream));
     let tunnelled = opaque::tunnel(
         &mut client,
         &mut upstream,
@@ -182,6 +184,7 @@ pub(crate) async fn handle(
         protocol,
         dst,
         sni,
+        interception: None,
         outcome: tunnelled.outcome,
         duration: started.elapsed(),
         bytes_in: tunnelled.to_upstream,

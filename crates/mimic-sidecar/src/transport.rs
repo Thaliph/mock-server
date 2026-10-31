@@ -9,7 +9,7 @@
 use std::io;
 use std::net::Shutdown;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 
 use socket2::SockRef;
@@ -18,17 +18,29 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsStream;
 
 /// A TCP socket shared by the two directions of a connection side (and by the error watch),
-/// read and written by readiness, as the relays always did.
+/// read and written by readiness, as the relays always did. It can start with bytes that were
+/// already read (the ClientHello consumed by protocol detection), which the first reads return.
 #[derive(Clone)]
-pub struct Socket(Arc<TcpStream>);
+pub struct Socket {
+    tcp: Arc<TcpStream>,
+    prefix: Arc<Mutex<Vec<u8>>>,
+}
 
 impl Socket {
     pub fn new(tcp: TcpStream) -> Self {
-        Self(Arc::new(tcp))
+        Self::with_prefix(tcp, Vec::new())
+    }
+
+    /// A socket that reads `prefix` before anything from `tcp`.
+    pub fn with_prefix(tcp: TcpStream, prefix: Vec<u8>) -> Self {
+        Self {
+            tcp: Arc::new(tcp),
+            prefix: Arc::new(Mutex::new(prefix)),
+        }
     }
 
     pub fn tcp(&self) -> &TcpStream {
-        &self.0
+        &self.tcp
     }
 }
 
@@ -38,9 +50,18 @@ impl AsyncRead for Socket {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        {
+            let mut prefix = self.prefix.lock().unwrap_or_else(|e| e.into_inner());
+            if !prefix.is_empty() {
+                let n = prefix.len().min(buf.remaining());
+                buf.put_slice(&prefix[..n]);
+                prefix.drain(..n);
+                return Poll::Ready(Ok(()));
+            }
+        }
         loop {
-            ready!(self.0.poll_read_ready(cx))?;
-            match self.0.try_read(buf.initialize_unfilled()) {
+            ready!(self.tcp.poll_read_ready(cx))?;
+            match self.tcp.try_read(buf.initialize_unfilled()) {
                 Ok(n) => {
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
@@ -59,8 +80,8 @@ impl AsyncWrite for Socket {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         loop {
-            ready!(self.0.poll_write_ready(cx))?;
-            match self.0.try_write(buf) {
+            ready!(self.tcp.poll_write_ready(cx))?;
+            match self.tcp.try_write(buf) {
                 Ok(n) => return Poll::Ready(Ok(n)),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Poll::Ready(Err(e)),
@@ -75,7 +96,7 @@ impl AsyncWrite for Socket {
     /// The FIN; a socket that is already gone has nothing left to close.
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(
-            SockRef::from(&*self.0)
+            SockRef::from(&*self.tcp)
                 .shutdown(Shutdown::Write)
                 .or_else(|e| match e.kind() {
                     io::ErrorKind::NotConnected => Ok(()),

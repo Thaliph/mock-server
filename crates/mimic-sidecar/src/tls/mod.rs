@@ -2,6 +2,7 @@
 //! that obtains and renews the per-pod intermediate, leaf issuance, and the `mimic-trust` volume.
 
 pub mod ca;
+pub mod intercept;
 
 use std::fs;
 use std::io;

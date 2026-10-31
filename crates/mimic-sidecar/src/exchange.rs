@@ -24,6 +24,8 @@ use crate::red::ProxyMetrics;
 
 /// Default port of a `Host` header on plain HTTP, removed by the authority normalisation.
 const HTTP_PORT: u16 = 80;
+/// The same over TLS (intercepted connections).
+const HTTPS_PORT: u16 = 443;
 
 const PROTOCOL_H2: &str = "h2";
 
@@ -32,6 +34,8 @@ const PROTOCOL_H2: &str = "h2";
 pub struct Ctx {
     pub direction: Direction,
     pub dst: SocketAddr,
+    /// The exchanges are decrypted by interception (spec §5).
+    pub tls: bool,
     pub proxy: ProxyMetrics,
     /// True once the connections left at the end of the shutdown grace are being closed.
     pub aborted: tokio::sync::watch::Receiver<bool>,
@@ -119,6 +123,13 @@ fn grpc_status(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
+impl Ctx {
+    /// The default port of an authority on this connection.
+    fn default_port(&self) -> u16 {
+        if self.tls { HTTPS_PORT } else { HTTP_PORT }
+    }
+}
+
 impl Tracker {
     /// Starts the observation of `req` and wraps its body.
     pub(crate) fn start(
@@ -133,7 +144,7 @@ impl Tracker {
         let authority = target_authority(req.uri().authority().map(|a| a.as_str()), host)
             .map_or_else(
                 || ctx.dst.to_string(),
-                |raw| normalise_authority(raw, HTTP_PORT),
+                |raw| normalise_authority(raw, ctx.default_port()),
             );
         let request = Arc::new(RequestCount::default());
         let tracker = Tracker {
@@ -229,6 +240,7 @@ impl Tracker {
             status: self.status,
             grpc_status: self.grpc_status,
             upgrade: false,
+            tls: self.ctx.tls,
             outcome,
             duration: Some(self.started.elapsed()),
             head: self.head,
@@ -335,6 +347,7 @@ pub(crate) fn rejected(ctx: &Ctx) {
         status: None,
         grpc_status: None,
         upgrade: false,
+        tls: ctx.tls,
         outcome: Outcome::Rejected,
         duration: None,
         head: None,
@@ -401,7 +414,7 @@ impl Http1Tracker {
             .and_then(|r| target_authority(r.uri_authority.as_deref(), r.host.as_deref()))
             .map_or_else(
                 || self.ctx.dst.to_string(),
-                |raw| normalise_authority(raw, HTTP_PORT),
+                |raw| normalise_authority(raw, self.ctx.default_port()),
             )
     }
 
@@ -543,6 +556,7 @@ impl Http1Tracker {
             status: open.status,
             grpc_status: None,
             upgrade: open.tunnel,
+            tls: self.ctx.tls,
             outcome,
             duration: timed.then(|| open.started.elapsed()),
             head: open.head.filter(|_| timed),

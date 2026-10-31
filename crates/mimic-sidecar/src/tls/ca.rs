@@ -142,6 +142,23 @@ impl CaState {
         ca_usable(self.validity(), unix_now())
     }
 
+    /// Installs `pem` as the intermediate for `key` if it chains to `root_der`, as the renewal
+    /// task does with the controller's answer (for embedders and tests without a controller).
+    pub fn install_intermediate(
+        &self,
+        root_der: &[u8],
+        key: KeyPair,
+        pem: &str,
+    ) -> Result<(), String> {
+        match accept(root_der, key, pem, unix_now()) {
+            Ok(current) => {
+                self.install(current);
+                Ok(())
+            }
+            Err(Failure::Error(e) | Failure::Mismatch(e)) => Err(e),
+        }
+    }
+
     fn install(&self, current: Current) {
         self.metrics
             .expiry

@@ -49,6 +49,8 @@ pub struct Exchange {
     pub status: Option<u16>,
     pub grpc_status: Option<u64>,
     pub upgrade: bool,
+    /// Decrypted by interception.
+    pub tls: bool,
     pub outcome: Outcome,
     /// `None` for an exchange rejected before any request is read.
     pub duration: Option<Duration>,
@@ -63,6 +65,8 @@ pub struct Connection {
     pub protocol: &'static str,
     pub dst: SocketAddr,
     pub sni: Option<String>,
+    /// Outbound TLS only: why the connection was not intercepted.
+    pub interception: Option<&'static str>,
     pub outcome: Outcome,
     pub duration: Duration,
     pub bytes_in: u64,
@@ -94,6 +98,7 @@ pub fn exchange(e: &Exchange) {
         status = e.status,
         grpc_status = e.grpc_status,
         upgrade = e.upgrade,
+        tls = e.tls.then_some(true),
         result = e.outcome.as_str(),
         duration_ms = e.duration.map(millis),
         head_ms = e.head.map(millis),
@@ -110,6 +115,7 @@ pub fn connection(c: &Connection) {
         protocol = c.protocol,
         dst = %c.dst,
         sni = c.sni.as_deref(),
+        interception = c.interception,
         result = c.outcome.as_str(),
         duration_ms = millis(c.duration),
         bytes_in = c.bytes_in,
