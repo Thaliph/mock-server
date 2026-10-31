@@ -51,14 +51,15 @@ SRE, without any change to application code:
 
 | Component | Kind | Role |
 |---|---|---|
-| `mimic-init` | init container, exits | Installs the iptables redirection in the pod network namespace. Only `NET_ADMIN`, `NET_RAW`. |
-| `mimic-sidecar` | native sidecar (`initContainers` with `restartPolicy: Always`) | Transparent proxy for inbound and outbound traffic; records, measures, mocks. Non-root, no capability. |
+| `mimic-init` | first init container, exits | Installs the iptables redirection in the pod network namespace (§4). Runs as UID 0 with only `NET_ADMIN` and `NET_RAW`, own image `ghcr.io/thaliph/mimic-init`. |
+| `mimic-sidecar` | native sidecar (second init container, `restartPolicy: Always`) | Transparent proxy for inbound and outbound traffic; records, measures, mocks. UID 1337, no capability. |
 | `mimic-controller` | Deployment in `mimic-system` | Mutating webhook (injection), `MimicWorkload` reconciler, sidecar API, UI. Stateless: all state is in Valkey. |
 | Valkey | StatefulSet in `mimic-system` | Shared store: merged endpoints and egress recordings per deployment. AOF persistence on a PVC. |
 
 Crates: `mimic-core` (pure logic: no tokio, no I/O, no clock), `mimic-runtime` (shared process
 plumbing: configuration, logs, metrics, health, shutdown), `mimic-sidecar`, `mimic-controller`,
-and from F1 `mimic-init`.
+and from F1 `mimic-init`. `mimic-core` may depend on pure data crates (`serde`, `serde_json`,
+`k8s-openapi`).
 
 ## 3. Modes
 
@@ -74,13 +75,40 @@ discovery immediately.
 
 ## 4. Traffic capture
 
-- Transparent redirection with iptables (`nat` table) set by `mimic-init`: inbound TCP to the
-  sidecar inbound port, outbound TCP to the sidecar outbound port. Traffic from the sidecar's
-  own UID is excluded.
-- Kubelet probe ports of the app are never redirected (the webhook reads them from the pod spec).
-- UDP 443 is rejected so that HTTP/3 clients fall back to TCP.
+- Transparent redirection with iptables (`nat` table, `iptables-nft` backend) set by
+  `mimic-init` through `iptables-restore` and `ip6tables-restore`, for IPv4 and IPv6:
+  - inbound: TCP whose destination is a local address of the pod is redirected to the sidecar
+    inbound port **15006**, except the excluded inbound ports;
+  - outbound: TCP leaving the pod is redirected to the sidecar outbound port **15001**, except
+    traffic from the sidecar UID **1337** and traffic on the loopback interface;
+  - `filter` table: outbound UDP to port 443 is rejected (ICMP port unreachable) so that HTTP/3
+    clients fall back to TCP. Other UDP (DNS included) is untouched.
+- **HTTP probes go through the sidecar** (as Istio does). The webhook rewrites every `httpGet`
+  liveness, readiness and startup probe of the app containers to `httpGet` on the sidecar admin
+  port 15100, path `/app-health/<container>/<livez|readyz|startupz>`, scheme HTTP, and keeps
+  the probe's timings and thresholds. It gives the original probes to the sidecar in
+  `MIMIC_APP_PROBES`. The sidecar sends the original request (scheme, host, defaulting to the
+  pod IP, port with named ports resolved, path, headers), from UID 1337 so that it is not
+  captured. It does not verify TLS and does not follow redirects, like the kubelet. It answers
+  with the app's status code, or 503 when the app cannot be reached within the probe's
+  `timeoutSeconds`. Only the configured probes can be called: any other `/app-health/` path
+  gets 404. Probe requests are not recorded.
+- Excluded inbound ports: the ports of the `tcpSocket` and `grpc` probes of the app containers
+  (named ports resolved), which the sidecar would otherwise answer for an app that is down, and
+  the sidecar admin port 15100. The webhook reads them from the pod spec. API traffic on an
+  `httpGet` probe port is captured.
+- When the pod has no IPv6 (`/proc/net/if_inet6` absent or empty), the IPv6 rules and listeners
+  are skipped with an INFO log; any other failure is fatal.
+- The sidecar listens on `0.0.0.0:15006` and `[::]:15006` (inbound, IPv6 socket `V6ONLY`) and
+  on loopback only for outbound (`127.0.0.1:15001`, `[::1]:15001`), reads the original
+  destination (`SO_ORIGINAL_DST`) and connects to it from UID 1337. A connection whose original destination is missing or is a
+  sidecar listener is closed (loop protection). The sidecar is ready only once its listeners are
+  bound, and the app containers start only after that (native sidecar startup probe).
 - Protocol detection per connection: TLS (ClientHello), HTTP/1.1, HTTP/2 prior knowledge;
-  anything else is an opaque TCP tunnel (logged and measured).
+  anything else is an opaque TCP tunnel (logged and measured). F1 provides the opaque tunnel
+  for everything; detection comes in F2.
+- When the sidecar is down, redirected connections are refused: capture is **fail-closed**
+  (fail-open is v2, §1.2).
 
 ## 5. TLS interception
 
@@ -115,9 +143,12 @@ discovery immediately.
 
 ## 7. Controller and storage
 
-- `MimicWorkload` (namespaced CRD, `mimic.platform.io/v1alpha1`): selects one deployment, holds
-  `spec.mode`, `spec.tls.exclude`, latency settings; `status` reports pods, mode convergence and
-  counts.
+- `MimicWorkload` (namespaced CRD, `mimic.platform.io/v1alpha1`): selects the deployment named
+  by `spec.deployment` (required, DNS-1123 name, immutable) in its namespace, holds
+  `spec.mode` (`discovery` | `mock`, default `discovery`), `spec.tls.exclude`, latency settings; `status` reports pods, mode convergence and
+  counts. F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
+  with their feature. When several `MimicWorkload`s name the same deployment, any of them
+  selects it for injection; which one sets the mode is decided in F10.
 - Sidecars push their local recordings periodically and pull the deployment's mode and, in mock
   mode, its aggregated egress recordings. Valkey keys are namespaced by
   `<namespace>/<deployment>`.
@@ -125,6 +156,53 @@ discovery immediately.
   counters, histograms, schemas, sample sets).
 - The UI and its API are read-only and served on the controller's HTTP port, reached by
   `kubectl port-forward` (Kubernetes RBAC is the authentication).
+
+### 7.1 Injection
+
+- The controller serves a mutating admission webhook (HTTPS, port 8443) for pod `CREATE`.
+  Kubernetes ≥ 1.33 (native sidecars); the chart refuses older clusters (`kubeVersion`).
+- **Selection** (label key `mimic.platform.io/inject`):
+
+  | Namespace label | Pod label | Injected |
+  |---|---|---|
+  | any | `disabled` | never |
+  | `enabled` | absent or `enabled` | yes |
+  | `selected` | absent | only if a `MimicWorkload` in the namespace has `spec.deployment` equal to the pod's deployment |
+  | any | `enabled` | yes |
+  | absent | absent | no (the webhook is not even called) |
+
+  The namespaces `kube-system`, `kube-public`, `kube-node-lease` and the controller's own
+  namespace are never injected. The `MutatingWebhookConfiguration` has three webhooks, one per
+  path, so the API server only calls the controller for pods in scope (namespace and object
+  selectors, no namespace read by the controller): `/inject/namespace` (namespace `enabled`),
+  `/inject/workload` (namespace `selected`), `/inject/pod` (pod `enabled`). A pod matched twice
+  is handled once (idempotence below). Only pods of a Deployment are injected (owner
+  ReplicaSet named `<deployment>-<pod-template-hash>`); the deployment name is the workload
+  identity.
+- **Skipped** pods are admitted unchanged except for the annotation
+  `mimic.platform.io/skipped: <reason>`: `host-network`, `unsupported-owner`, `port-conflict`
+  (an app container declares port 15001, 15006 or 15100), `uid-conflict` (an app container or
+  the pod sets `runAsUser: 1337`). `unsupported-owner` applies only when injection was asked by
+  an `enabled` label (pod or namespace); in a `selected` namespace, an unlabelled pod not owned
+  by a Deployment is not selected and stays untouched, without annotation. A pod that already has a `mimic-sidecar` init container is
+  admitted unchanged (idempotent, `reinvocationPolicy: IfNeeded`).
+- **Injected** pods get, in front of their own init containers: `mimic-init`, then
+  `mimic-sidecar` (`restartPolicy: Always`, startup and liveness probes on its admin port), and
+  the annotation `mimic.platform.io/injected: <version>`. Neither container mounts a service
+  account token or any app volume. In the app's containers, only the `httpGet` probes are
+  changed (§4); nothing else is modified.
+- The webhook uses `failurePolicy: Fail`: while the controller is unavailable, pod creation in
+  the selected scope fails (fail-closed, consistent with mock mode never calling the real
+  destination). Pods outside the scope are never sent to the webhook.
+- Injection happens at pod creation only: labelling a namespace or creating a `MimicWorkload`
+  does not restart running pods; `kubectl rollout restart` does.
+- **Webhook certificate, self-managed**: the controller keeps a CA (10 years) and a serving
+  certificate (1 year, SAN `<service>.<namespace>.svc`) in the Secret `<release>-webhook-tls`
+  (created empty by the chart), writes the CA into the `caBundle` of its
+  `MutatingWebhookConfiguration`, and renews the serving certificate when less than 30 days
+  remain, without changing the CA. Concurrent replicas converge on one certificate (optimistic
+  concurrency on the Secret). A `ValidatingAdmissionPolicy` lets the controller's service
+  account change nothing in that configuration except `caBundle`.
 
 ## 8. Mock
 
@@ -154,7 +232,10 @@ discovery immediately.
 - Processes are stateless (state is in Valkey or in memory), log to stdout, stop gracefully on
   `SIGTERM`, and bind their ports from configuration.
 - One image `ghcr.io/thaliph/mimic` (distroless, non-root UID 65532, no shell) holds
-  `mimic-sidecar` and `mimic-controller`. `mimic-init` gets its own minimal image in F1.
+  `mimic-sidecar` and `mimic-controller` (the webhook runs the sidecar as UID 1337).
+  `ghcr.io/thaliph/mimic-init` (distroless, no shell) holds only `mimic-init`, `iptables-restore`
+  and `ip6tables-restore` (nft backend) and their libraries.
+- `mimic-init` has no admin listener (it exits): FND-02 and FND-03 do not apply to it.
 - Installation through the Helm chart `oci://ghcr.io/thaliph/charts/mimic`.
 - Release artefacts are multi-arch (amd64, arm64), signed with cosign (keyless), with SBOM and
   provenance.
@@ -173,15 +254,77 @@ discovery immediately.
 |---|---|---|
 | `MIMIC_VALKEY_URL` | required | `redis://host:port[/db]`, without credentials. |
 | `MIMIC_VALKEY_PASSWORD` | empty | Valkey password (from a Secret). |
+| `MIMIC_NAMESPACE` | required | Controller namespace (downward API). |
+| `MIMIC_WEBHOOK_ADDR` | `0.0.0.0:8443` | Webhook HTTPS listener. |
+| `MIMIC_WEBHOOK_SERVICE` | required | Service name of the webhook (certificate SAN). |
+| `MIMIC_WEBHOOK_SECRET` | required | Secret holding the webhook CA and serving certificate. |
+| `MIMIC_WEBHOOK_CONFIGURATION` | required | Name of the `MutatingWebhookConfiguration` whose `caBundle` the controller maintains. |
+| `MIMIC_INJECT_SIDECAR_IMAGE` | required | Image of `mimic-sidecar` in injected pods (digest recommended); the shared `mimic` image, so the injected container sets `command: [/usr/local/bin/mimic-sidecar]`. |
+| `MIMIC_INJECT_INIT_IMAGE` | required | Image of `mimic-init` in injected pods. |
+| `MIMIC_INJECT_SIDECAR_RESOURCES` | `{"requests":{"cpu":"50m","memory":"64Mi"},"limits":{"memory":"128Mi"}}` | Sidecar `resources`, JSON. |
+| `MIMIC_INJECT_SIDECAR_LOG` | `info` | `MIMIC_LOG` given to injected sidecars. |
+
+### 10.3 Sidecar variables
+
+Set by the webhook; the defaults are the values it sets.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIMIC_INBOUND_ADDRS` | `0.0.0.0:15006,[::]:15006` | Inbound listeners. |
+| `MIMIC_OUTBOUND_ADDRS` | `127.0.0.1:15001,[::1]:15001` | Outbound listeners, loopback only. |
+| `MIMIC_WORKLOAD` | required | Deployment name. |
+| `MIMIC_POD_NAMESPACE`, `MIMIC_POD_NAME`, `MIMIC_POD_IP` | required | Downward API. |
+| `MIMIC_APP_PROBES` | `{}` | Original `httpGet` probes, JSON object keyed by `<container>/<livez\|readyz\|startupz>`. |
+
+### 10.4 `mimic-init` variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIMIC_INBOUND_PORT` | `15006` | Redirection target for inbound TCP. |
+| `MIMIC_OUTBOUND_PORT` | `15001` | Redirection target for outbound TCP. |
+| `MIMIC_PROXY_UID` | `1337` | UID whose traffic is not redirected. |
+| `MIMIC_EXCLUDE_INBOUND_PORTS` | empty | Comma-separated ports (1–65535) never redirected inbound. |
 
 ## 11. Security baseline
 
 - Every pod mimic owns runs with `runAsNonRoot`, `readOnlyRootFilesystem`, all capabilities
-  dropped, `seccompProfile: RuntimeDefault`, no service account token unless needed. The only
-  exception is `mimic-init` (`NET_ADMIN`, `NET_RAW`, exits immediately).
+  dropped, `seccompProfile: RuntimeDefault`, no service account token unless needed (the
+  controller needs one from F1). The only exception is `mimic-init`: UID 0 (iptables needs
+  effective capabilities, which a non-root process with `no_new_privs` cannot get), only
+  `NET_ADMIN` and `NET_RAW`, `allowPrivilegeEscalation: false`, read-only root filesystem,
+  `RuntimeDefault` seccomp, exits once the rules are installed.
+- The controller's RBAC is minimal: `get`/`list`/`watch` on `mimicworkloads`; `get`/`patch` on
+  its own `MutatingWebhookConfiguration` only (by name, and restricted to `caBundle` by a
+  `ValidatingAdmissionPolicy`); `get`/`update` on its webhook Secret only (by name, in its
+  namespace). No access to pods, Deployments or other Secrets.
+- The webhook never logs or stores the pod spec or the patch (env values may hold secrets).
 - Images are distroless, pinned by digest, scanned in CI (no fixable HIGH/CRITICAL).
 - Dependencies checked by `cargo deny` (advisories, licences, sources).
 - No sensitive value reaches Valkey or a log without redaction (§6).
+
+### 11.1 Accepted limits
+
+- Capture is an observability and test tool, not a security boundary: an app container with
+  `NET_ADMIN`, or whose image runs as UID 1337 without declaring it in the pod spec, escapes it.
+- All traffic to a `tcpSocket` or `grpc` probe port bypasses the sidecar (not only probes): an
+  API served on such a port is not captured. `exec` probes are left as they are.
+- Rewritten probes depend on the sidecar: while it restarts, the app's liveness probe can fail
+  and restart the app if the outage outlasts `failureThreshold` × `periodSeconds`. The
+  `/app-health/` endpoints sit on the admin port, so the network can reach them. They only run
+  the pod's own probes.
+- Loopback traffic (an app calling itself) and non-TCP traffic other than UDP 443 are not
+  captured.
+- Namespaces whose Pod Security level is `baseline` or `restricted` reject injected pods
+  (`mimic-init` needs `NET_ADMIN`/`NET_RAW`); injection needs the `privileged` level. The
+  rejection is visible as a `FailedCreate` event on the ReplicaSet.
+- The webhook does not authenticate the API server (any client that reaches port 8443 can call
+  it); it has no side effect and only computes a patch.
+- The workload identity comes from the pod's `ownerReferences`, which the pod's creator
+  controls: a user of the namespace can obtain a sidecar named after another deployment of the
+  same namespace. Sidecar identity is bound to the real owner when sidecars authenticate (F5).
+- The `caBundle` of the webhook configuration and the data of the webhook Secret are owned by
+  the controller: GitOps tools must ignore those fields.
+- Only the `iptables-nft` backend is supported (the node kernel needs `nf_tables`).
 
 ## 12. Delivery plan
 
@@ -192,8 +335,8 @@ names contain the criterion ID (`fnd_02_…`).
 | Feature | Content | User plan point |
 |---|---|---|
 | F0 | Foundations: workspace, runtime plumbing, image, Helm chart with Valkey, kind e2e, CI/CD, agent team | — |
-| F1 | Injection: webhook, native sidecar, `mimic-init`, selection by label/CRD | 1 |
-| F2 | Pass-through proxy, access logs, RED metrics, inbound and outbound | 2 |
+| F1 | Injection: webhook, native sidecar, `mimic-init`, selection by label/CRD, opaque TCP tunnel | 1 |
+| F2 | HTTP-aware pass-through proxy, access logs, RED metrics, inbound and outbound | 2 |
 | F3 | TLS interception, per-deployment CA, trust injection, fallback | — |
 | F4 | Ingress endpoint discovery: templating, schemas, redaction | 3 |
 | F5 | Controller collects endpoints into Valkey, merges per deployment | 4, 5 |
@@ -217,6 +360,32 @@ names contain the criterion ID (`fnd_02_…`).
 | FND-08 | `helm lint` passes; every rendered pod is Pod Security `restricted` (non-root, read-only root filesystem, no capability, `RuntimeDefault` seccomp, no privilege escalation). Valkey requires a password generated at install and kept on upgrade, and only accepts connections from the controller (NetworkPolicy; needs a CNI that enforces NetworkPolicy, as kind's default does). |
 | FND-09 | On kind (Kubernetes ≥ 1.33), `helm install` brings the controller and Valkey to Ready, and the controller's `/readyz` and `/metrics` answer through a port-forward. |
 | FND-10 | CI runs as dependent stages: lint → unit and integration tests → image build and scan → kind e2e, plus a security stage (`cargo deny`, `zizmor`); a single `ci-ok` check sums them up. A `v*` tag publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart. |
+
+### 12.2 F1 — Injection
+
+Levels: **U** unit in `mimic-core`, **I** integration in `crates/*/tests`, **E** kind e2e in
+`scripts/e2e.sh`, **C** CI pipeline.
+
+| ID | Criterion |
+|---|---|
+| INJ-01 | **U.** The selection decision follows the table of §7.1 for every combination of namespace label (`enabled`, `selected`, absent), pod label (`enabled`, `disabled`, absent) and presence of a `MimicWorkload` whose `spec.deployment` is the pod's deployment; the excluded namespaces are never injected. The deployment name is derived from the controlling ReplicaSet owner and the `pod-template-hash` label; any other owner gives `unsupported-owner`. |
+| INJ-02 | **U.** A pod with `hostNetwork: true`, a container port 15001, 15006 or 15100, or `runAsUser: 1337` (pod or app container) is skipped with the matching reason; the patch only adds `mimic.platform.io/skipped: <reason>`. A pod that already has a `mimic-sidecar` init container gets an empty patch. |
+| INJ-03 | **U.** The injection patch is a JSON Patch, byte-identical for the same input, that puts `mimic-init` then `mimic-sidecar` before the pod's own init containers (also when it has none), rewrites the app containers' `httpGet` probes as in §4 and changes nothing else in them, and adds `mimic.platform.io/injected: <version>`. `mimic-init`: UID 0, `allowPrivilegeEscalation: false`, drop `ALL`, add only `NET_ADMIN`/`NET_RAW`, read-only root, `RuntimeDefault`. `mimic-sidecar`: `restartPolicy: Always`, UID/GID 1337, `runAsNonRoot`, no capability, read-only root, `RuntimeDefault`, startup probe `/readyz` and liveness probe `/healthz` on 15100, the configured resources and the §10.3 variables. Neither has a volume mount. |
+| INJ-04 | **U.** `MIMIC_EXCLUDE_INBOUND_PORTS` given to `mimic-init` holds, sorted and deduplicated, the ports of the `tcpSocket` and `grpc` liveness/readiness/startup probes of the app containers (named ports resolved against the container's ports, unresolvable names ignored) and 15100; `httpGet` probe ports are not in it. `MIMIC_APP_PROBES` holds every original `httpGet` probe under its `<container>/<kind>` key, with the named port resolved and the probe's `timeoutSeconds`; an `httpGet` probe whose named port does not resolve is left unchanged and absent from `MIMIC_APP_PROBES` (it fails as it would without mimic). Each rewritten probe points to `/app-health/<container>/<kind>` on 15100 with the original timings and thresholds. |
+| INJ-05 | **U.** The `iptables-restore` input generated for IPv4 and for IPv6 is deterministic and: redirects inbound TCP to a local destination (`addrtype LOCAL`) to the inbound port except the excluded ports; returns outbound traffic of the proxy UID and on `lo`; redirects other outbound TCP to the outbound port; rejects outbound UDP to port 443 in `filter`; uses only mimic-owned chains (`MIMIC_INBOUND`, `MIMIC_OUTPUT`) plus one jump from each built-in chain. |
+| INJ-06 | **I.** `mimic-init` pipes the rules to `iptables-restore` and `ip6tables-restore` found on `PATH`, logs one JSON line `redirection installed` with the families and excluded ports, and exits 0; it skips IPv6 with an INFO log when the pod has no IPv6; it exits 1 with an ERROR log naming the family when a restore command fails or is missing, and 2 on an invalid variable (FND-01). It never logs other content of its environment. |
+| INJ-07 | **I.** The sidecar binds its inbound and outbound listeners from §10.3 before `/readyz` answers 200; the outbound listeners accept connections on loopback only. A connection without an original destination, or whose original destination is a sidecar listener, is closed and counted in `mimic_tcp_connections_total{direction,result="loop"}`; tunnelled connections are counted with `result="ok"` or `result="connect_error"`. |
+| INJ-08 | **I.** The webhook answers only HTTPS on `MIMIC_WEBHOOK_ADDR`. `POST /inject/namespace`, `/inject/pod` and `/inject/workload` with an `AdmissionReview` v1 return an `AdmissionReview` with the same `uid`, `allowed: true` and a base64 `JSONPatch` (or none when the patch is empty). A malformed body gets 400, a body over 4 MiB gets 413, another method gets 405, and an internal error gets `allowed: false` with a message (fail-closed). |
+| INJ-09 | **I.** Each admission writes one log line (`target` = `webhook`) with namespace, pod name or `generateName`, deployment, `result` (`injected`, `skipped`, `error`) and `reason`, and increments `mimic_webhook_admissions_total{result,reason}`. Neither the logs nor the metrics contain any env value, annotation value or other pod spec content (checked with a canary env value). |
+| INJ-10 | **U.** The certificate decision is a pure function of the stored certificates and the current time (passed in): no or unparsable CA → new CA and serving certificate; serving certificate missing, expiring within 30 days or with the wrong SAN → new serving certificate signed by the existing CA; otherwise keep. |
+| INJ-11 | **E.** After install, the webhook Secret holds a CA and a serving certificate for `<service>.<namespace>.svc`, the `caBundle` equals the CA, and `mimic_webhook_certificate_expiry_timestamp_seconds` is exposed. With 2 controller replicas both serve the same certificate; after a restart and a `helm upgrade` the certificate and `caBundle` are unchanged. The controller is unready until the certificate is loaded and the `MimicWorkload` cache is synced. |
+| INJ-12 | **E.** The chart installs the `MimicWorkload` CRD (an invalid `spec.mode` or a missing or invalid `spec.deployment` is rejected, a change of `spec.deployment` is rejected, `spec.mode` defaults to `discovery`), a `MutatingWebhookConfiguration` with the three webhooks of §7.1 (`failurePolicy: Fail`, `sideEffects: None`, `reinvocationPolicy: IfNeeded`, pod `CREATE` only, excluded namespaces), and the RBAC of §11: `kubectl auth can-i` as the controller service account is `yes` exactly for the listed verbs and `no` for creating Secrets, reading other Secrets, reading pods and patching another webhook configuration. Patching anything but `caBundle` of its own configuration as that account is denied by the `ValidatingAdmissionPolicy`. |
+| INJ-13 | **E.** In a namespace labelled `enabled` (Pod Security `privileged`), a Deployment with an HTTP readiness and liveness probe on its API port, a `tcpSocket` probe on a second port and an init container that opens a TCP connection to a Service rolls out Ready: `mimic-init` terminated with exit code 0, `mimic-sidecar` running, the injected annotation present, no restart. A request from another pod to the app Service succeeds and increments the sidecar's `mimic_tcp_connections_total{direction="inbound",result="ok"}`; a request from the app container to another Service succeeds and increments `{direction="outbound",result="ok"}`. The pod's readiness probe points to `/app-health/…` on 15100. When the app's readiness path starts failing, the pod becomes NotReady, and Ready again when the path recovers. |
+| INJ-18 | **I.** The sidecar serves `GET /app-health/<container>/<kind>` on its admin port only for the probes in `MIMIC_APP_PROBES`, and 404 for any other path under `/app-health/`. It forwards the original method, path, port and headers and answers the app's status code (2xx, 3xx without following, 4xx and 5xx unchanged). It answers 503 when the app refuses the connection or exceeds the probe's `timeoutSeconds`, and talks HTTPS without verifying the certificate when the probe's scheme is HTTPS. An invalid `MIMIC_APP_PROBES` exits with code 2 (FND-01). |
+| INJ-14 | **E.** From an injected app container, a UDP datagram to port 443 is refused (connected socket reports `ECONNREFUSED`), while DNS resolution over UDP 53 works. |
+| INJ-15 | **E.** On the cluster: pods of an unlabelled namespace are unchanged; in a `selected` namespace only the deployment with a `MimicWorkload` is injected; a pod labelled `disabled` in an `enabled` namespace is unchanged; a pod labelled `enabled` in an unlabelled namespace is injected; the controller's namespace is never injected; labelling a namespace does not restart its running pods. |
+| INJ-16 | **E.** With the controller scaled to 0, creating a pod in an `enabled` namespace fails (`FailedCreate` naming the webhook) while pods of unlabelled namespaces are created; once it is back, the ReplicaSet creates injected pods. In an `enabled` namespace enforcing Pod Security `baseline`, the injected pod is rejected by Pod Security (§11.1). |
+| INJ-17 | **C.** `ghcr.io/thaliph/mimic-init` is built multi-arch, contains no shell, passes the image scan (no fixable HIGH/CRITICAL), and is signed with SBOM and provenance on release. The kind e2e runs on Kubernetes 1.33 (floor) and on the latest kind node image. |
 
 ## 13. Test strategy
 
