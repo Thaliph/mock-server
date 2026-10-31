@@ -46,9 +46,8 @@ pub async fn fixture_budget(
     let original_dst: OriginalDst =
         Arc::new(move |_| dst(addr).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)));
     let proxy = ProxyMetrics::register(&mut metrics, max_authorities);
-    let shared = Arc::new(
-        Shared::new(vec![addr], tunnel_metrics, original_dst).with_proxy_metrics(proxy),
-    );
+    let shared =
+        Arc::new(Shared::new(vec![addr], tunnel_metrics, original_dst).with_proxy_metrics(proxy));
     spawn_listener(listener, direction, shared);
     Fixture {
         addr,

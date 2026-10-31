@@ -9,13 +9,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::upgrade::OnUpgrade;
-use hyper::{Method, Request, Response, StatusCode, client, header, server};
+use hyper::{Method, Request, Response, StatusCode, header, server};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, copy_bidirectional};
 use tokio::net::TcpStream;
+
+use crate::exchange::{self, Ctx, ReqBody, RespBody, Tracker};
+
+const PROTOCOL: &str = "http1";
 
 /// More header lines than this, or a header section over [`MAX_HEADER_BYTES`], gets `431`.
 const MAX_HEADERS: usize = 256;
@@ -65,7 +68,8 @@ impl AsyncWrite for Replay {
 
 /// What the service shares with [`relay`].
 struct State {
-    sender: tokio::sync::Mutex<client::conn::http1::SendRequest<Incoming>>,
+    ctx: Ctx,
+    sender: tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<ReqBody>>,
     /// Set when a request asks for an upgrade or is a `CONNECT`.
     upgrade_requested: AtomicBool,
     /// The two sides of an accepted upgrade: client side, destination side.
@@ -74,13 +78,19 @@ struct State {
 
 /// Relays the HTTP/1 requests of `client` (whose first bytes, `replay`, were already read) to
 /// `upstream` until one side closes. An accepted upgrade continues as an opaque tunnel.
-pub async fn relay(client: TcpStream, upstream: TcpStream, replay: Vec<u8>) -> io::Result<()> {
-    let (sender, driver) = client::conn::http1::Builder::new()
+pub async fn relay(
+    client: TcpStream,
+    upstream: TcpStream,
+    replay: Vec<u8>,
+    ctx: Ctx,
+) -> io::Result<()> {
+    let (sender, driver) = hyper::client::conn::http1::Builder::new()
         .preserve_header_case(true)
-        .handshake::<_, Incoming>(TokioIo::new(upstream))
+        .handshake::<_, ReqBody>(TokioIo::new(upstream))
         .await
         .map_err(io::Error::other)?;
     let state = Arc::new(State {
+        ctx,
         sender: tokio::sync::Mutex::new(sender),
         upgrade_requested: AtomicBool::new(false),
         upgraded: Mutex::new(None),
@@ -119,6 +129,12 @@ pub async fn relay(client: TcpStream, upstream: TcpStream, replay: Vec<u8>) -> i
             }
         }
     };
+    if let Err(e) = &served
+        && e.is_parse()
+    {
+        let status = if e.is_parse_too_large() { 431 } else { 400 };
+        exchange::rejected(&state.ctx, PROTOCOL, status);
+    }
     served.map_err(io::Error::other)?;
 
     let pending = state
@@ -150,18 +166,27 @@ pub async fn relay(client: TcpStream, upstream: TcpStream, replay: Vec<u8>) -> i
 
 async fn forward(
     state: Arc<State>,
-    mut req: Request<Incoming>,
-) -> Result<Response<Incoming>, hyper::Error> {
+    mut req: Request<hyper::body::Incoming>,
+) -> Result<Response<RespBody>, hyper::Error> {
     let is_connect = req.method() == Method::CONNECT;
     let wants_upgrade = is_connect || req.headers().contains_key(header::UPGRADE);
     let from_client = wants_upgrade.then(|| {
         state.upgrade_requested.store(true, Ordering::SeqCst);
         hyper::upgrade::on(&mut req)
     });
-    let mut response = {
+    let (tracker, req) = Tracker::start(&state.ctx, PROTOCOL, req);
+    let sent = async {
         let mut sender = state.sender.lock().await;
         sender.ready().await?;
-        sender.send_request(req).await?
+        sender.send_request(req).await
+    }
+    .await;
+    let mut response = match sent {
+        Ok(response) => response,
+        Err(e) => {
+            tracker.failed();
+            return Err(e);
+        }
     };
     let accepted = response.status() == StatusCode::SWITCHING_PROTOCOLS
         || (is_connect && response.status().is_success());
@@ -170,5 +195,5 @@ async fn forward(
     {
         *slot = Some((from_client, hyper::upgrade::on(&mut response)));
     }
-    Ok(response)
+    Ok(tracker.answered(response, accepted))
 }

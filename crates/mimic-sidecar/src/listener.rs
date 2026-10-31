@@ -18,7 +18,7 @@ use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::connection;
-use crate::red::ProxyMetrics;
+use crate::red::{DEFAULT_MAX_AUTHORITIES, ProxyMetrics};
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -26,6 +26,8 @@ const IPV6_INTERFACES: &str = "/proc/net/if_inet6";
 
 const INBOUND_VAR: &str = "MIMIC_INBOUND_ADDRS";
 const OUTBOUND_VAR: &str = "MIMIC_OUTBOUND_ADDRS";
+const MAX_AUTHORITIES_VAR: &str = "MIMIC_METRICS_MAX_AUTHORITIES";
+const MAX_AUTHORITIES_RANGE: std::ops::RangeInclusive<usize> = 1..=10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
@@ -126,6 +128,10 @@ impl Shared {
         &self.metrics
     }
 
+    pub(crate) fn proxy(&self) -> &ProxyMetrics {
+        &self.proxy
+    }
+
     pub fn new(
         bound: Vec<SocketAddr>,
         metrics: TunnelMetrics,
@@ -172,11 +178,13 @@ pub fn kernel_original_dst(stream: &TcpStream) -> io::Result<SocketAddr> {
     }
 }
 
-/// Listener addresses (spec §10.3).
+/// Listener addresses and metric label budget (spec §10.3).
 #[derive(Debug, Clone)]
 pub struct TunnelConfig {
     pub inbound: Vec<SocketAddr>,
     pub outbound: Vec<SocketAddr>,
+    /// Distinct `authority` label values kept per direction and metric.
+    pub max_authorities: usize,
 }
 
 impl TunnelConfig {
@@ -190,7 +198,19 @@ impl TunnelConfig {
                 "outbound listeners accept loopback connections only",
             ));
         }
-        Ok(TunnelConfig { inbound, outbound })
+        let max_authorities = env.parse_or(MAX_AUTHORITIES_VAR, DEFAULT_MAX_AUTHORITIES)?;
+        if !MAX_AUTHORITIES_RANGE.contains(&max_authorities) {
+            return Err(ConfigError::invalid(
+                MAX_AUTHORITIES_VAR,
+                &max_authorities.to_string(),
+                "expected a number from 1 to 10000",
+            ));
+        }
+        Ok(TunnelConfig {
+            inbound,
+            outbound,
+            max_authorities,
+        })
     }
 }
 

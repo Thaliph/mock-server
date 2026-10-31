@@ -11,6 +11,7 @@ use mimic_runtime::config::{CommonConfig, Env};
 use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 use mimic_sidecar::probes::{self, Probes};
+use mimic_sidecar::red::ProxyMetrics;
 
 const BINARY: &str = "mimic-sidecar";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -49,6 +50,7 @@ async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std:
     tracing::info!(version = VERSION, "sidecar starting");
     let mut metrics = Metrics::new("sidecar", VERSION);
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
+    let proxy_metrics = ProxyMetrics::register(&mut metrics, tunnel.max_authorities);
     let metrics = Arc::new(metrics);
 
     // The listeners are bound before the admin listener serves, so `/readyz` answers 200 only
@@ -58,11 +60,14 @@ async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std:
     let inbound = listener::bind_all(Direction::Inbound, &tunnel.inbound, ipv6)?;
     let outbound = listener::bind_all(Direction::Outbound, &tunnel.outbound, ipv6)?;
     let bound = inbound.iter().chain(&outbound).map(|(_, a)| *a).collect();
-    let shared = Arc::new(Shared::new(
-        bound,
-        tunnel_metrics,
-        Arc::new(listener::kernel_original_dst),
-    ));
+    let shared = Arc::new(
+        Shared::new(
+            bound,
+            tunnel_metrics,
+            Arc::new(listener::kernel_original_dst),
+        )
+        .with_proxy_metrics(proxy_metrics),
+    );
     for (listener, _) in inbound {
         listener::spawn_listener(listener, Direction::Inbound, shared.clone());
     }

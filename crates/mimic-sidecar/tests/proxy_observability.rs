@@ -269,7 +269,8 @@ async fn prx_08_upgraded_exchange_is_marked() {
     c.write_all(b"GET /ws HTTP/1.1\r\nHost: ws.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
         .await
         .unwrap();
-    let head = b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n";
+    let head =
+        b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n";
     read_exact(&mut c, head.len()).await;
     let lines = logs.access_exactly(1).await;
     assert_eq!(lines[0]["upgrade"], true);
@@ -297,7 +298,13 @@ async fn prx_08_hostile_and_long_paths_stay_in_one_json_line() {
     assert_eq!(lines[0]["path"], hostile);
     assert_eq!(lines[1]["path"], long[..1024]);
     // One JSON object per line, whatever the path held.
-    assert_eq!(logs.text().lines().filter(|l| l.contains("http exchange")).count(), 2);
+    assert_eq!(
+        logs.text()
+            .lines()
+            .filter(|l| l.contains("http exchange"))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
