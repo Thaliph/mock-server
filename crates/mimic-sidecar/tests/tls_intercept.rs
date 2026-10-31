@@ -33,7 +33,7 @@ use tokio_rustls::rustls::pki_types::{
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST: &[u8] = b"GET /a?q=canary-query-91 HTTP/1.1\r\nHost: api.test:443\r\nX-Canary: canary-header-91\r\nCookie: s=canary-cookie-91\r\nContent-Length: 0\r\n\r\n";
@@ -354,6 +354,26 @@ async fn tls_17_a_client_gets_a_leaf_from_the_intermediate_and_the_destination_s
             .any(|n| matches!(n, GeneralName::DNSName("api.test")))
     );
     assert!(leaf.validity().is_valid());
+    // Strict verifiers (Python 3.13) need the leaf's AKI to name the intermediate's SKI.
+    let (_, intermediate) = X509Certificate::from_der(chain[1].as_ref()).unwrap();
+    let ski = intermediate
+        .extensions()
+        .iter()
+        .find_map(|e| match e.parsed_extension() {
+            ParsedExtension::SubjectKeyIdentifier(id) => Some(id.0.to_vec()),
+            _ => None,
+        });
+    let aki = leaf
+        .extensions()
+        .iter()
+        .find_map(|e| match e.parsed_extension() {
+            ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                aki.key_identifier.as_ref().map(|id| id.0.to_vec())
+            }
+            _ => None,
+        });
+    assert!(ski.is_some(), "intermediate without Subject Key Identifier");
+    assert_eq!(aki, ski, "leaf Authority Key Identifier");
     assert_eq!(tls.get_ref().1.alpn_protocol(), None);
     assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
     tls.shutdown().await.unwrap();
