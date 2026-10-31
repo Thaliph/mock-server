@@ -1,6 +1,8 @@
 //! Pure logic of mimic: no tokio, no I/O, no clock. Everything testable without a network
 //! lives here; the binaries are adapters around it.
 
+pub mod inject;
+
 use std::fmt;
 use std::str::FromStr;
 
