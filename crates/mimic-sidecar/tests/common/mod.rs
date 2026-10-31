@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct Fixture {
     pub addr: SocketAddr,
     pub metrics: Arc<Metrics>,
+    pub shared: Arc<Shared>,
 }
 
 pub async fn fixture(
@@ -48,9 +49,10 @@ pub async fn fixture_budget(
     let proxy = ProxyMetrics::register(&mut metrics, max_authorities);
     let shared =
         Arc::new(Shared::new(vec![addr], tunnel_metrics, original_dst).with_proxy_metrics(proxy));
-    spawn_listener(listener, direction, shared);
+    spawn_listener(listener, direction, shared.clone());
     Fixture {
         addr,
+        shared,
         metrics: Arc::new(metrics),
     }
 }
