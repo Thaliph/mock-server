@@ -93,6 +93,11 @@ impl HeadScanner {
         (data.len(), Scan::More)
     }
 
+    /// Bytes buffered for the head or trailer section being read.
+    pub(super) fn retained(&self) -> usize {
+        self.buf.len()
+    }
+
     fn too_large(&self) -> Reason {
         if self.kind == Kind::Trailer {
             Reason::TrailersTooLarge

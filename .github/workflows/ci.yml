@@ -4,6 +4,7 @@ name: ci
 #   lint ──▶ test ──▶ image ──▶ e2e
 #   chart ─────────────────────▲
 #   security (cargo deny, zizmor)
+#   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; skipped unless a PR touches the codec)
 # `ci-ok` sums them up; it is the only required check on main.
 
 on:
@@ -163,15 +164,108 @@ jobs:
         env:
           SKIP_BUILD: "1"
 
-  ci-ok:
-    if: always()
-    needs: [lint, test, chart, security, image, e2e]
+  # Path filter for the fuzz job: only a pull request that touches the HTTP/1 codec or the
+  # fuzz crate runs it. Other events leave `codec` empty.
+  changes:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
+    outputs:
+      codec: ${{ steps.filter.outputs.codec }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the base commit must be in the history to diff against it
+          persist-credentials: false
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed=false
+          if [ "$EVENT" = pull_request ] && [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/proxy/http1 fuzz)" ]; then
+            changed=true
+          fi
+          echo "codec=$changed" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    # PRX-28: 60 s on a pull request that touches the codec, 10 min on the weekly schedule.
+    # Skipped otherwise; `ci-ok` accepts that skip (and only that one).
+    name: fuzz (http1)
+    needs: changes
+    if: github.event_name == 'schedule' || (github.event_name == 'pull_request' && needs.changes.outputs.codec == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 600 || 60 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: nightly-2026-10-24
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }} # zizmor: ignore[cache-poisoning] cache written from main only, nothing is published by this job
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/http1
+          key: fuzz-corpus-http1-${{ github.run_id }}
+          restore-keys: fuzz-corpus-http1-
+      - name: Fuzz the HTTP/1 codec
+        working-directory: fuzz
+        # cargo-fuzz defaults to the target it was built for; the prebuilt binary is musl, which
+        # the address sanitizer cannot use.
+        # The corpus directory is missing on a cold cache; libFuzzer requires it to exist.
+        run: >
+          mkdir -p corpus/http1 &&
+          cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu http1
+          corpus/http1 seeds/http1 --
+          -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10 -dict=http1.dict
+      # The corpus grows on the weekly run only; PR runs read it and never write it.
+      - if: github.event_name == 'schedule'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/http1
+          key: fuzz-corpus-http1-${{ github.run_id }}
+      # PRX-28: the crashing input is kept for triage.
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-http1-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  ci-ok:
+    if: always()
+    needs: [lint, test, chart, security, image, e2e, changes, fuzz]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      LINT: ${{ needs.lint.result }}
+      TEST: ${{ needs.test.result }}
+      CHART: ${{ needs.chart.result }}
+      SECURITY: ${{ needs.security.result }}
+      IMAGE: ${{ needs.image.result }}
+      E2E: ${{ needs.e2e.result }}
+      CHANGES: ${{ needs.changes.result }}
+      FUZZ: ${{ needs.fuzz.result }}
+      CODEC: ${{ needs.changes.outputs.codec }}
     steps:
       - name: All stages passed
-        env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          echo "$RESULTS"
-          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
+          echo "lint=$LINT test=$TEST chart=$CHART security=$SECURITY image=$IMAGE e2e=$E2E changes=$CHANGES fuzz=$FUZZ codec=$CODEC"
+          for r in "$LINT" "$TEST" "$CHART" "$SECURITY" "$IMAGE" "$E2E" "$CHANGES"; do
+            [ "$r" = success ] || exit 1
+          done
+          # fuzz may be skipped by its path filter; it may not be skipped when the codec changed.
+          case "$FUZZ" in
+            success) ;;
+            skipped) [ "$CODEC" != true ] || exit 1 ;;
+            *) exit 1 ;;
+          esac

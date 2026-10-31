@@ -683,3 +683,149 @@ fn prx_29_unframed_response_to_an_earlier_request_still_reports_the_pending_one(
     let u = unframed(&ev);
     assert_eq!(u.request.unwrap().path, "/one");
 }
+
+// --- PRX-27 / PRX-30: pairing, read-ahead ------------------------------------------------
+
+#[test]
+fn prx_27_pipelined_responses_are_paired_in_order() {
+    let mut c = Codec::new();
+    c.client_bytes(b"GET /a HTTP/1.1\r\n\r\nHEAD /b HTTP/1.1\r\n\r\nGET /c HTTP/1.1\r\n\r\n");
+    assert_eq!(c.pending(), 3);
+    let ev = c.server_bytes(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx\
+          HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n\
+          HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+    );
+    let paths: Vec<_> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::Response(h) => Some(h.request.as_ref().unwrap().path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(paths, vec!["/a", "/b", "/c"]);
+    assert_eq!(response_ends(&ev), vec![1, 0, 0]);
+    assert_eq!(c.pending(), 0);
+}
+
+#[test]
+fn prx_30_read_ahead_stops_at_the_request_boundary_after_32() {
+    let one = b"GET /x HTTP/1.1\r\n\r\n";
+    let all: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100).collect();
+    let mut c = Codec::new();
+    let (used, ev) = c.client_bytes_limited(&all);
+    assert_eq!(used, one.len() * READ_AHEAD);
+    assert_eq!(c.pending(), READ_AHEAD);
+    assert_eq!(request_ends(&ev).len(), READ_AHEAD);
+    // Nothing more while the 32 are unanswered.
+    let (used, ev) = c.client_bytes_limited(&all[used..]);
+    assert_eq!((used, ev.len()), (0, 0));
+    // A response lets exactly one more through.
+    c.server_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    let (used, _) = c.client_bytes_limited(&all[one.len() * READ_AHEAD..]);
+    assert_eq!(used, one.len());
+    assert_eq!(c.pending(), READ_AHEAD);
+}
+
+#[test]
+fn prx_30_read_ahead_still_lets_the_body_of_the_last_request_through() {
+    let mut c = Codec::new();
+    let mut data = Vec::new();
+    for _ in 0..READ_AHEAD - 1 {
+        data.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+    }
+    data.extend_from_slice(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+    data.extend_from_slice(b"GET /next HTTP/1.1\r\n\r\n");
+    let (used, ev) = c.client_bytes_limited(&data);
+    assert_eq!(used, data.len() - b"GET /next HTTP/1.1\r\n\r\n".len());
+    assert_eq!(request_ends(&ev).last(), Some(&5));
+}
+
+#[test]
+fn prx_27_held_bytes_are_parsed_again_when_the_upgrade_is_declined() {
+    let mut c = Codec::new();
+    c.client_bytes(
+        b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\nGET /after HTTP/1.1\r\n\r\n",
+    );
+    assert!(c.retained_bytes() > 0);
+    let ev = c.server_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(c.pending(), 1);
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::Request(r) if r.path == "/after"))
+    );
+}
+
+#[test]
+fn prx_27_limited_feed_stops_after_an_upgrade_request_and_loses_nothing() {
+    let head = b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n";
+    let after = b"GET /after HTTP/1.1\r\n\r\n";
+    let mut data = head.to_vec();
+    data.extend_from_slice(after);
+    let mut c = Codec::new();
+    let (used, _) = c.client_bytes_limited(&data);
+    assert_eq!(used, head.len());
+    assert_eq!(c.client_bytes_limited(after).0, 0);
+    // Declined: the relay offers the bytes again.
+    c.server_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    let (used, ev) = c.client_bytes_limited(after);
+    assert_eq!(used, after.len());
+    assert_eq!(req(&ev).path, "/after");
+}
+
+#[test]
+fn prx_27_limited_feed_uses_every_byte_once_the_codec_is_opaque() {
+    let mut c = Codec::new();
+    c.client_bytes_limited(
+        b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+    );
+    c.server_bytes(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+    assert_eq!(c.client_bytes_limited(b"\x81\x80frame").0, 7);
+}
+
+#[test]
+fn prx_27_unlimited_feed_of_10000_requests_stays_at_the_read_ahead() {
+    for unit in [
+        &b"GET / HTTP/1.1\r\n\r\n"[..],
+        b"GET /\n\n",
+        b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nab",
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        b"CONNECT a:1 HTTP/1.1\r\n\r\n",
+    ] {
+        let mut c = Codec::new();
+        let ev = c.client_bytes(&unit.repeat(10_000));
+        assert!(c.pending() <= READ_AHEAD, "{unit:?}: {}", c.pending());
+        assert!(c.retained_bytes() <= RETAINED_LIMIT);
+        assert!(ev.len() < 4 * READ_AHEAD, "{unit:?}: {} events", ev.len());
+    }
+}
+
+#[test]
+fn prx_27_unlimited_feed_beyond_the_read_ahead_is_unframed() {
+    let mut c = Codec::new();
+    let data = b"GET / HTTP/1.1\r\n\r\n".repeat(READ_AHEAD + 1);
+    let ev = c.client_bytes(&data);
+    assert_eq!(unframed(&ev).reason, Reason::ReadAheadOverflow);
+}
+
+#[test]
+fn prx_27_retained_state_counts_what_is_buffered() {
+    let mut c = Codec::new();
+    assert_eq!(c.retained_bytes(), 0);
+    c.client_bytes(b"GET / HTTP/1.1\r\nX: 12345678901234567890");
+    assert!(c.retained_bytes() >= 30);
+    c.client_bytes(b"\r\n\r\n");
+    assert!(c.retained_bytes() >= 1, "the pending request counts");
+}
+
+#[test]
+fn prx_27_host_and_authority_are_cut_at_1024_bytes() {
+    let long = "h".repeat(5000);
+    let ev = run(
+        format!("GET http://{long}/ HTTP/1.1\r\nHost: {long}\r\n\r\n").as_bytes(),
+        b"",
+    );
+    let r = req(&ev);
+    assert_eq!(r.host.unwrap().len(), AUTHORITY_LIMIT);
+    assert_eq!(r.uri_authority.unwrap().len(), AUTHORITY_LIMIT);
+}

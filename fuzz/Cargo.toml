@@ -1,0 +1,23 @@
+[package]
+name = "mimic-core-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Not a member of the root workspace (spec PRX-28): the fuzz crate has its own lockfile and
+# is built by `cargo fuzz` on a pinned nightly toolchain.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mimic-core = { path = "../crates/mimic-core" }
+
+[[bin]]
+name = "http1"
+path = "fuzz_targets/http1.rs"
+test = false
+doc = false
+bench = false
