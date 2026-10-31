@@ -321,6 +321,31 @@ fn prx_26_path_is_cut_at_1024_bytes_and_absolute_form_gives_authority() {
 }
 
 #[test]
+fn prx_26_origin_form_with_a_url_inside_is_not_absolute_form() {
+    for (target, path) in [
+        ("/cb?u=http://evil/x", "/cb"),
+        ("/a://b", "/a://b"),
+        ("/r#http://evil/x", "/r"),
+        ("*", "*"),
+    ] {
+        let ev = run(
+            format!("GET {target} HTTP/1.1\r\nHost: app\r\n\r\n").as_bytes(),
+            b"",
+        );
+        let h = req(&ev);
+        assert_eq!(h.uri_authority, None, "{target}");
+        assert_eq!(h.path, path, "{target}");
+    }
+    // A scheme must be letters, digits, `+`, `-`, `.` and start with a letter.
+    let ev = run(b"GET 1http://evil/x HTTP/1.1\r\n\r\n", b"");
+    assert_eq!(req(&ev).uri_authority, None);
+    let ev = run(b"GET HTTPS://Example.com HTTP/1.1\r\n\r\n", b"");
+    let h = req(&ev);
+    assert_eq!(h.uri_authority.as_deref(), Some("Example.com"));
+    assert_eq!(h.path, "/");
+}
+
+#[test]
 fn prx_26_http10_request_and_leading_blank_lines() {
     let ev = run(
         b"\r\n\r\nPOST /x HTTP/1.0\r\nContent-Length: 2\r\n\r\nhi",
