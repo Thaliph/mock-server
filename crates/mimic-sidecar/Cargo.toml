@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 axum = "0.8.9"
+hyper = { version = "1.12.0", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 mimic-core = { version = "0.1.0", path = "../mimic-core" }
 mimic-runtime = { version = "0.1.0", path = "../mimic-runtime" }
 nix = { version = "0.31.3", default-features = false, features = ["net", "resource"] }
