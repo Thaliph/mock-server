@@ -1,0 +1,149 @@
+# Admission webhook for pod injection (spec §7.1): the Secret the controller keeps its CA and
+# serving certificate in, the MutatingWebhookConfiguration (its caBundle is written by the
+# controller, not by Helm), and a ValidatingAdmissionPolicy that lets only the controller's
+# service account change that caBundle.
+{{- $excluded := list "kube-system" "kube-public" "kube-node-lease" .Release.Namespace }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "mimic.webhookSecret" . }}
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+# Empty: the controller generates the CA and the serving certificate on first start.
+type: Opaque
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ include "mimic.webhookConfiguration" . }}
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+# caBundle is owned by the controller: it is not set here, so `helm upgrade` leaves it alone.
+webhooks:
+  # Namespace labelled enabled: every pod is injected unless it is labelled disabled.
+  - name: namespace.inject.mimic.platform.io
+    clientConfig:
+      service:
+        name: {{ include "mimic.controllerService" . }}
+        namespace: {{ .Release.Namespace }}
+        port: 8443
+        path: /inject/namespace
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: mimic.platform.io/inject
+          operator: In
+          values: [enabled]
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: {{ toJson $excluded }}
+    failurePolicy: Fail
+    sideEffects: None
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    admissionReviewVersions: [v1]
+  # Namespace labelled selected: only pods of a deployment named by a MimicWorkload.
+  - name: workload.inject.mimic.platform.io
+    clientConfig:
+      service:
+        name: {{ include "mimic.controllerService" . }}
+        namespace: {{ .Release.Namespace }}
+        port: 8443
+        path: /inject/workload
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: mimic.platform.io/inject
+          operator: In
+          values: [selected]
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: {{ toJson $excluded }}
+    failurePolicy: Fail
+    sideEffects: None
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    admissionReviewVersions: [v1]
+  # Pod labelled enabled, in any namespace: injected even when the namespace is not labelled.
+  - name: pod.inject.mimic.platform.io
+    clientConfig:
+      service:
+        name: {{ include "mimic.controllerService" . }}
+        namespace: {{ .Release.Namespace }}
+        port: 8443
+        path: /inject/pod
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: {{ toJson $excluded }}
+    objectSelector:
+      matchLabels:
+        mimic.platform.io/inject: enabled
+    failurePolicy: Fail
+    sideEffects: None
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    admissionReviewVersions: [v1]
+---
+# Only the controller's service account is restricted, and only in its own configuration.
+# Everything but clientConfig.caBundle (and the labels and annotations) must stay as it is.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ .Release.Name }}-injector-cabundle-only
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [admissionregistration.k8s.io]
+        apiVersions: [v1]
+        operations: [UPDATE]
+        resources: [mutatingwebhookconfigurations]
+        resourceNames: [{{ include "mimic.webhookConfiguration" . }}]
+  matchConditions:
+    - name: controller-service-account
+      expression: 'request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-controller"'
+  variables:
+    # Every field of each webhook except clientConfig.caBundle, projected into a map.
+    - name: webhooks
+      expression: |
+        {{- include "mimic.webhookProjection" "object" | nindent 8 }}
+    - name: oldWebhooks
+      expression: |
+        {{- include "mimic.webhookProjection" "oldObject" | nindent 8 }}
+  validations:
+    - expression: "variables.webhooks == variables.oldWebhooks"
+      message: "the controller may only change clientConfig.caBundle of its webhook configuration"
+    - expression: "(has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})"
+      message: "the controller may not change the labels of its webhook configuration"
+    - expression: "(has(object.metadata.annotations) ? object.metadata.annotations : {}) == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {})"
+      message: "the controller may not change the annotations of its webhook configuration"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ .Release.Name }}-injector-cabundle-only
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  policyName: {{ .Release.Name }}-injector-cabundle-only
+  validationActions: [Deny]
