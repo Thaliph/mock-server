@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 use x509_parser::extensions::GeneralName;
 use x509_parser::pem::parse_x509_pem;
 
+#[cfg(test)]
 const DAY: Duration = Duration::from_secs(24 * 3600);
 const CA_LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
 const SERVING_LIFETIME: Duration = Duration::from_secs(365 * 24 * 3600);
@@ -39,8 +40,18 @@ pub enum Decision {
 
 /// What to do with `stored` for a serving certificate valid for `dns_name`.
 pub fn decide(stored: &Stored, dns_name: &str, now: SystemTime) -> Decision {
-    let _ = (stored, dns_name, now, DAY);
-    Decision::Keep
+    let ca_usable = KeyPair::from_pem(&text(&stored.ca_key)).is_ok()
+        && not_after(&stored.ca_crt).is_some_and(|end| end > now);
+    if !ca_usable {
+        return Decision::NewCa;
+    }
+    let key_ok = KeyPair::from_pem(&text(&stored.tls_key)).is_ok();
+    let fresh = not_after(&stored.tls_crt).is_some_and(|end| end > now + RENEW_BEFORE);
+    if key_ok && fresh && has_dns_name(&stored.tls_crt, dns_name) {
+        Decision::Keep
+    } else {
+        Decision::NewServing
+    }
 }
 
 /// Applies `decision` to `stored`. The CA is untouched unless `decision` is `NewCa`.
@@ -50,16 +61,57 @@ pub fn issue(
     dns_name: &str,
     now: SystemTime,
 ) -> Result<Stored, String> {
-    let _ = (
-        decision,
-        dns_name,
-        now,
-        CA_LIFETIME,
-        SERVING_LIFETIME,
-        RENEW_BEFORE,
-        SKEW,
-    );
-    Ok(stored.clone())
+    let mut next = stored.clone();
+    if decision == Decision::NewCa {
+        let key = KeyPair::generate().map_err(|e| format!("CA key: {e}"))?;
+        let mut params = CertificateParams::default();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "mimic-webhook-ca");
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        validity(&mut params, now, CA_LIFETIME);
+        let cert = params
+            .self_signed(&key)
+            .map_err(|e| format!("CA certificate: {e}"))?;
+        next.ca_crt = cert.pem().into_bytes();
+        next.ca_key = key.serialize_pem().into_bytes();
+    }
+    if decision != Decision::Keep {
+        let ca_key = KeyPair::from_pem(&text(&next.ca_key)).map_err(|e| format!("CA key: {e}"))?;
+        let issuer = Issuer::from_ca_cert_pem(&text(&next.ca_crt), ca_key)
+            .map_err(|e| format!("CA certificate: {e}"))?;
+        let key = KeyPair::generate().map_err(|e| format!("serving key: {e}"))?;
+        let mut params = CertificateParams::new(vec![dns_name.to_string()])
+            .map_err(|e| format!("serving certificate: {e}"))?;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, dns_name.to_string());
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        validity(&mut params, now, SERVING_LIFETIME);
+        let cert = params
+            .signed_by(&key, &issuer)
+            .map_err(|e| format!("serving certificate: {e}"))?;
+        next.tls_crt = cert.pem().into_bytes();
+        next.tls_key = key.serialize_pem().into_bytes();
+    }
+    Ok(next)
+}
+
+fn validity(params: &mut CertificateParams, now: SystemTime, lifetime: Duration) {
+    params.not_before = datetime(now - SKEW);
+    params.not_after = datetime(now + lifetime);
+}
+
+fn datetime(at: SystemTime) -> OffsetDateTime {
+    let seconds = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    OffsetDateTime::from_unix_timestamp(i64::try_from(seconds).unwrap_or(i64::MAX))
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+fn text(pem: &[u8]) -> String {
+    String::from_utf8_lossy(pem).into_owned()
 }
 
 /// End of validity of the first certificate of `pem`.
