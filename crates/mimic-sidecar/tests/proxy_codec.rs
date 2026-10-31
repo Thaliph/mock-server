@@ -804,3 +804,79 @@ async fn prx_30_a_10_mib_header_line_reaches_the_destination_unchanged() {
     let (_, events) = p.finished().await;
     assert_eq!(unframed(&events), vec![Reason::HeadTooLarge]);
 }
+
+// ---- a gated client direction when the destination closes --------------------------------
+
+/// Reads until EOF or a reset, whichever the relay's close shows as, within 1 s.
+async fn closed_within_1s(s: &mut TcpStream) {
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(left, s.read(&mut buf)).await {
+            Ok(Ok(0) | Err(_)) => return,
+            Ok(Ok(_)) => {}
+            Err(_) => panic!("client not closed within 1 s"),
+        }
+    }
+}
+
+async fn ended_within_1s(p: Proxy) -> Relayed {
+    tokio::time::timeout(Duration::from_secs(1), p.done)
+        .await
+        .expect("relay ended within 1 s")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn prx_24_destination_closing_before_the_answer_to_an_upgrade_ends_the_relay() {
+    for head in [WS, CONNECT] {
+        let (l, dest) = listener().await;
+        let p = proxy(dest).await;
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            read_until(&mut s, b"\r\n\r\n").await;
+            // Closed with no answer.
+        });
+        let mut c = TcpStream::connect(p.addr).await.unwrap();
+        // Bytes behind the upgrade request are held back by the relay.
+        c.write_all(format!("{head}EXTRA").as_bytes())
+            .await
+            .unwrap();
+        closed_within_1s(&mut c).await;
+        let relayed = ended_within_1s(p).await;
+        assert!(matches!(relayed.outcome, Outcome::UpstreamReset));
+        assert_eq!(relayed.unanswered, 1);
+    }
+}
+
+#[tokio::test]
+async fn prx_30_destination_closing_with_32_unanswered_requests_ends_the_relay() {
+    let (l, dest) = listener().await;
+    let p = proxy(dest).await;
+    tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut seen = 0;
+        let mut acc = Vec::new();
+        while seen < 32 {
+            let mut buf = [0u8; 8192];
+            let n = s.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            acc.extend_from_slice(&buf[..n]);
+            while let Some(p) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                acc.drain(..p + 4);
+                seen += 1;
+            }
+        }
+        // Closed with 32 requests unanswered.
+    });
+    let all: String = (0..100)
+        .map(|i| format!("GET /{i} HTTP/1.1\r\nHost: a\r\n\r\n"))
+        .collect();
+    let mut c = TcpStream::connect(p.addr).await.unwrap();
+    c.write_all(all.as_bytes()).await.unwrap();
+    closed_within_1s(&mut c).await;
+    let relayed = ended_within_1s(p).await;
+    assert!(matches!(relayed.outcome, Outcome::UpstreamReset));
+    assert_eq!(relayed.unanswered, 32);
+}
