@@ -160,11 +160,11 @@ async fn prx_11_idle_tunnel_carries_the_next_exchange_after_35_seconds() {
     let echo = echo_server().await;
     let f = fixture(Direction::Outbound, move |_| Some(echo)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"one").await.unwrap();
-    assert_eq!(read_exactly(&mut c, 3).await, b"one");
+    c.write_all(b"one\n").await.unwrap();
+    assert_eq!(read_exactly(&mut c, 3).await, b"one\n");
     tokio::time::sleep(Duration::from_secs(35)).await;
-    c.write_all(b"two").await.unwrap();
-    assert_eq!(read_exactly(&mut c, 3).await, b"two");
+    c.write_all(b"two\n").await.unwrap();
+    assert_eq!(read_exactly(&mut c, 3).await, b"two\n");
 }
 
 #[tokio::test]
@@ -180,14 +180,14 @@ async fn prx_11_client_half_close_reaches_the_destination_which_can_still_answer
     });
     let f = fixture(Direction::Inbound, move |_| Some(dest)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"request").await.unwrap();
+    c.write_all(b"request\n").await.unwrap();
     c.shutdown().await.unwrap();
     let mut answer = Vec::new();
     tokio::time::timeout(TIMEOUT, c.read_to_end(&mut answer))
         .await
         .expect("answer in time")
         .unwrap();
-    assert_eq!(answer, b"request and goodbye");
+    assert_eq!(answer, b"request\n and goodbye");
 }
 
 #[tokio::test]
@@ -196,7 +196,7 @@ async fn prx_11_destination_closing_an_idle_connection_reaches_the_client_within
     let dest = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; 5];
         s.read_exact(&mut buf).await.unwrap();
         s.write_all(&buf).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -204,8 +204,8 @@ async fn prx_11_destination_closing_an_idle_connection_reaches_the_client_within
     });
     let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"ping").await.unwrap();
-    assert_eq!(read_exactly(&mut c, 4).await, b"ping");
+    c.write_all(b"ping\n").await.unwrap();
+    assert_eq!(read_exactly(&mut c, 5).await, b"ping\n");
     let start = Instant::now();
     let mut buf = [0u8; 1];
     let n = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf))
@@ -263,8 +263,8 @@ async fn prx_11_both_sockets_of_a_tunnel_have_keepalive_set() {
     let echo = echo_server().await;
     let f = fixture(Direction::Outbound, move |_| Some(echo)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"x").await.unwrap();
-    read_exactly(&mut c, 1).await;
+    c.write_all(b"x\n").await.unwrap();
+    read_exactly(&mut c, 2).await;
     let (listener, client, echo) = (
         f.addr.to_string(),
         c.local_addr().unwrap().to_string(),
@@ -302,10 +302,10 @@ async fn prx_12_a_thousand_simultaneous_connections_are_all_served() {
         clients.push(TcpStream::connect(f.addr).await.unwrap());
     }
     for (i, c) in clients.iter_mut().enumerate() {
-        c.write_all(format!("{i:04}").as_bytes()).await.unwrap();
+        c.write_all(format!("{i:04}\n").as_bytes()).await.unwrap();
     }
     for (i, c) in clients.iter_mut().enumerate() {
-        assert_eq!(read_exactly(c, 4).await, format!("{i:04}").as_bytes());
+        assert_eq!(read_exactly(c, 5).await, format!("{i:04}\n").as_bytes());
     }
     counted(
         &f.metrics,

@@ -96,6 +96,11 @@ impl Process {
             .collect()
     }
 
+    /// Process id of the child.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Sends `SIGTERM`.
     pub fn terminate(&self) {
         let status = Command::new("kill")

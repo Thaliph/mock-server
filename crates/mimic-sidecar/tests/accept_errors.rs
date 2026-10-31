@@ -41,11 +41,11 @@ async fn prx_12_accept_errors_are_counted_and_the_connection_is_served_later() {
     drop(filler);
     setrlimit(Resource::RLIMIT_NOFILE, soft, hard).unwrap();
     let mut c = tokio::net::TcpStream::from_std(client).unwrap();
-    c.write_all(b"ping").await.unwrap();
-    let mut buf = [0u8; 4];
+    c.write_all(b"ping\n").await.unwrap();
+    let mut buf = [0u8; 5];
     tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut buf))
         .await
         .expect("served after the descriptors are back")
         .unwrap();
-    assert_eq!(&buf, b"ping");
+    assert_eq!(&buf, b"ping\n");
 }
