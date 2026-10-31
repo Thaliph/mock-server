@@ -83,6 +83,9 @@ discovery immediately.
     traffic from the sidecar UID **1337** and traffic on the loopback interface;
   - `filter` table: outbound UDP to port 443 is rejected (ICMP port unreachable) so that HTTP/3
     clients fall back to TCP. Other UDP (DNS included) is untouched.
+  - IPv6 rules are installed only when the pod has a non-loopback IPv6 address (`::1` alone
+    means no IPv6). Running `mimic-init` again, also after a partial failure, leaves exactly
+    one jump from each built-in chain (idempotent).
 - **HTTP probes go through the sidecar** (as Istio does). The webhook rewrites every `httpGet`
   liveness, readiness and startup probe of the app containers to `httpGet` on the sidecar admin
   port 15100, path `/app-health/<container>/<livez|readyz|startupz>`, scheme HTTP, and keeps
@@ -182,7 +185,9 @@ discovery immediately.
 - **Skipped** pods are admitted unchanged except for the annotation
   `mimic.platform.io/skipped: <reason>`: `host-network`, `unsupported-owner`, `port-conflict`
   (an app container declares port 15001, 15006 or 15100), `uid-conflict` (an app container or
-  the pod sets `runAsUser: 1337`). `unsupported-owner` applies only when injection was asked by
+  the pod sets `runAsUser: 1337`), `name-conflict` (an app container is named `mimic-init` or
+  `mimic-sidecar`, or an init container is named `mimic-init` in a pod without a
+  `mimic-sidecar` init container). `unsupported-owner` applies only when injection was asked by
   an `enabled` label (pod or namespace); in a `selected` namespace, an unlabelled pod not owned
   by a Deployment is not selected and stays untouched, without annotation. A pod that already has a `mimic-sidecar` init container is
   admitted unchanged (idempotent, `reinvocationPolicy: IfNeeded`).
@@ -190,7 +195,8 @@ discovery immediately.
   `mimic-sidecar` (`restartPolicy: Always`, startup and liveness probes on its admin port), and
   the annotation `mimic.platform.io/injected: <version>`. Neither container mounts a service
   account token or any app volume. In the app's containers, only the `httpGet` probes are
-  changed (§4); nothing else is modified.
+  changed (§4); nothing else is modified. Every literal `env` value the patch writes has each
+  `$` doubled, so the kubelet's `$(VAR)` expansion gives the container the value unchanged.
 - The webhook uses `failurePolicy: Fail`: while the controller is unavailable, pod creation in
   the selected scope fails (fail-closed, consistent with mock mode never calling the real
   destination). Pods outside the scope are never sent to the webhook.
@@ -199,10 +205,25 @@ discovery immediately.
 - **Webhook certificate, self-managed**: the controller keeps a CA (10 years) and a serving
   certificate (1 year, SAN `<service>.<namespace>.svc`) in the Secret `<release>-webhook-tls`
   (created empty by the chart), writes the CA into the `caBundle` of its
-  `MutatingWebhookConfiguration`, and renews the serving certificate when less than 30 days
+  `MutatingWebhookConfiguration` (watched: a `caBundle` changed by anyone else is restored
+  within 10 s), and renews the serving certificate when less than 30 days
   remain, without changing the CA. Concurrent replicas converge on one certificate (optimistic
   concurrency on the Secret). A `ValidatingAdmissionPolicy` lets the controller's service
   account change nothing in that configuration except `caBundle`.
+- **Webhook availability** (it fails closed, so a stalled webhook stalls pod creation in scope):
+  the chart runs 2 controller replicas by default, spread across nodes (preferred pod
+  anti-affinity), with a PodDisruptionBudget `maxUnavailable: 1`. The webhook listener serves
+  at most `MIMIC_WEBHOOK_MAX_CONNECTIONS` connections at once (further ones wait in the accept
+  backlog); a connection must complete its TLS handshake, and then each request (headers and
+  body), within `MIMIC_WEBHOOK_REQUEST_TIMEOUT`, or it is closed; an idle keep-alive connection
+  is closed after 60 s. A NetworkPolicy admits ingress to the controller only on the webhook
+  port (from any source by default, since the API server's source address depends on the
+  cluster; `networkPolicy.webhookFrom` narrows it) and on the admin port (from the release
+  namespace and the namespaces selected by `networkPolicy.metricsNamespaceSelector`).
+- The CRD carries `helm.sh/resource-policy: keep`: `helm uninstall` leaves the CRD and every
+  `MimicWorkload`; removing them is explicit (`kubectl delete crd
+  mimicworkloads.mimic.platform.io`). A later install with the same release name and namespace
+  adopts the kept CRD.
 
 ## 8. Mock
 
@@ -258,6 +279,8 @@ discovery immediately.
 | `MIMIC_WEBHOOK_ADDR` | `0.0.0.0:8443` | Webhook HTTPS listener. |
 | `MIMIC_WEBHOOK_SERVICE` | required | Service name of the webhook (certificate SAN). |
 | `MIMIC_WEBHOOK_SECRET` | required | Secret holding the webhook CA and serving certificate. |
+| `MIMIC_WEBHOOK_MAX_CONNECTIONS` | `256` | Concurrent webhook connections served (1–65535). |
+| `MIMIC_WEBHOOK_REQUEST_TIMEOUT` | `5s` | TLS handshake and per-request read deadline (`<n>s` or `<n>ms`, > 0). |
 | `MIMIC_WEBHOOK_CONFIGURATION` | required | Name of the `MutatingWebhookConfiguration` whose `caBundle` the controller maintains. |
 | `MIMIC_INJECT_SIDECAR_IMAGE` | required | Image of `mimic-sidecar` in injected pods (digest recommended); the shared `mimic` image, so the injected container sets `command: [/usr/local/bin/mimic-sidecar]`. |
 | `MIMIC_INJECT_INIT_IMAGE` | required | Image of `mimic-init` in injected pods. |
@@ -293,8 +316,8 @@ Set by the webhook; the defaults are the values it sets.
   effective capabilities, which a non-root process with `no_new_privs` cannot get), only
   `NET_ADMIN` and `NET_RAW`, `allowPrivilegeEscalation: false`, read-only root filesystem,
   `RuntimeDefault` seccomp, exits once the rules are installed.
-- The controller's RBAC is minimal: `get`/`list`/`watch` on `mimicworkloads`; `get`/`patch` on
-  its own `MutatingWebhookConfiguration` only (by name, and restricted to `caBundle` by a
+- The controller's RBAC is minimal: `get`/`list`/`watch` on `mimicworkloads`; `get`/`list`/`watch`/`patch`
+  on its own `MutatingWebhookConfiguration` only (by name, and restricted to `caBundle` by a
   `ValidatingAdmissionPolicy`); `get`/`update` on its webhook Secret only (by name, in its
   namespace). No access to pods, Deployments or other Secrets.
 - The webhook never logs or stores the pod spec or the patch (env values may hold secrets).
@@ -318,7 +341,9 @@ Set by the webhook; the defaults are the values it sets.
   (`mimic-init` needs `NET_ADMIN`/`NET_RAW`); injection needs the `privileged` level. The
   rejection is visible as a `FailedCreate` event on the ReplicaSet.
 - The webhook does not authenticate the API server (any client that reaches port 8443 can call
-  it); it has no side effect and only computes a patch.
+  it); it has no side effect and only computes a patch. Such a client can hold at most
+  `MIMIC_WEBHOOK_MAX_CONNECTIONS` connections, each for at most `MIMIC_WEBHOOK_REQUEST_TIMEOUT`
+  without completing a request, which bounds how long it can delay admission.
 - The workload identity comes from the pod's `ownerReferences`, which the pod's creator
   controls: a user of the namespace can obtain a sidecar named after another deployment of the
   same namespace. Sidecar identity is bound to the real owner when sidecars authenticate (F5).
@@ -385,6 +410,11 @@ Levels: **U** unit in `mimic-core`, **I** integration in `crates/*/tests`, **E**
 | INJ-14 | **E.** From an injected app container, a UDP datagram to port 443 is refused (connected socket reports `ECONNREFUSED`), while DNS resolution over UDP 53 works. |
 | INJ-15 | **E.** On the cluster: pods of an unlabelled namespace are unchanged; in a `selected` namespace only the deployment with a `MimicWorkload` is injected; a pod labelled `disabled` in an `enabled` namespace is unchanged; a pod labelled `enabled` in an unlabelled namespace is injected; the controller's namespace is never injected; labelling a namespace does not restart its running pods. |
 | INJ-16 | **E.** With the controller scaled to 0, creating a pod in an `enabled` namespace fails (`FailedCreate` naming the webhook) while pods of unlabelled namespaces are created; once it is back, the ReplicaSet creates injected pods. In an `enabled` namespace enforcing Pod Security `baseline`, the injected pod is rejected by Pod Security (§11.1). |
+| INJ-19 | **I.** With `MIMIC_WEBHOOK_MAX_CONNECTIONS=4` and `MIMIC_WEBHOOK_REQUEST_TIMEOUT=500ms`: a TCP client that never starts TLS, and a TLS client that sends headers byte by byte without finishing, are each closed within the timeout (+ 1 s margin); while 4 such clients are connected, a well-formed AdmissionReview is answered once they are closed, within 2 × the timeout; an idle keep-alive connection is closed after 60 s (test with an injectable idle duration). Invalid values of both variables exit with code 2 (FND-01). |
+| INJ-20 | **I.** The controller watches its `MutatingWebhookConfiguration`: when a webhook's `caBundle` is changed or emptied by another client, the controller restores the Secret's CA in every webhook within 10 s, without issuing a new certificate (process test against the fake API server). |
+| INJ-21 | **U.** Every literal `env` value in the patch has each `$` doubled (`MIMIC_APP_PROBES` with a probe path `/x/$(HOME)/$$` and a header value `a$b` decodes, after applying the kubelet's expansion rules, to the original probes). A pod with an app container named `mimic-init` or `mimic-sidecar`, or with an init container named `mimic-init` and no `mimic-sidecar`, is skipped as `name-conflict`. |
+| INJ-22 | **I.** Running `mimic-init` twice, and after a first run whose IPv6 restore failed, results in rules that contain exactly one jump from each built-in chain per family (the fake restore scripts record the inputs; the generated input makes the jumps idempotent). **U.** With only `::1` (or no line) in `/proc/net/if_inet6` content, IPv6 is skipped; with a link-local or global address it is installed (unit test of the parser). |
+| INJ-23 | **E.** By default the chart runs 2 controller replicas with a PodDisruptionBudget `maxUnavailable: 1` and preferred anti-affinity on `kubernetes.io/hostname`; the controller NetworkPolicy exists and the webhook still admits pods with it applied; `helm uninstall` leaves the CRD and an existing `MimicWorkload`, and a reinstall with the same release name succeeds and keeps it. |
 | INJ-17 | **C.** `ghcr.io/thaliph/mimic-init` is built multi-arch, contains no shell, passes the image scan (no fixable HIGH/CRITICAL), and is signed with SBOM and provenance on release. The kind e2e runs on Kubernetes 1.33 (floor) and on the latest kind node image. |
 
 ## 13. Test strategy
