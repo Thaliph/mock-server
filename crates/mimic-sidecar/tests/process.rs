@@ -180,3 +180,30 @@ fn prx_12_open_file_soft_limit_equals_the_hard_limit() {
     let cols: Vec<&str> = line.split_whitespace().collect();
     assert_eq!(cols[3], cols[4], "{line}");
 }
+
+#[test]
+fn prx_13_sigterm_closes_the_listeners_and_flushes_the_last_log_lines() {
+    let mut sidecar = Process::spawn(
+        BIN,
+        &[ADMIN, INBOUND, OUTBOUND, ("MIMIC_SHUTDOWN_GRACE", "5s")],
+    );
+    let (inbound, outbound) = tunnel_addrs(&mut sidecar);
+    sidecar.terminate();
+    let started = std::time::Instant::now();
+    let status = sidecar.wait_exit(Duration::from_secs(6));
+    assert!(status.success(), "{status}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "no connection to wait for"
+    );
+    for addr in [inbound, outbound] {
+        assert!(TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_err());
+    }
+    let logs = sidecar.logs();
+    assert_eq!(
+        logs.last().map(|v| v["message"].clone()),
+        Some("shutdown complete".into()),
+        "{:?}",
+        sidecar.lines()
+    );
+}

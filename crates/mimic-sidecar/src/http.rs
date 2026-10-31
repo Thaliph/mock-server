@@ -1,8 +1,10 @@
-//! The HTTP/1 relay (spec §4.1): a `hyper` server connection on the client socket and a
+//! The HTTP relays (spec §4.1): a `hyper` server connection on the client socket and a
 //! `hyper` client connection on the destination socket, one for the other, with no pool and no
 //! timer (so no header-read, idle or request timeout). Requests are forwarded as received;
-//! the proxy never routes on `Host` and never answers for a destination failure.
+//! the proxy never routes on `Host` and never answers for a destination failure. HTTP/1 is
+//! [`relay`], HTTP/2 prior knowledge (`h2c`, gRPC included) is [`relay_h2`].
 
+use std::future::Future;
 use std::io;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,13 +14,14 @@ use std::task::{Context, Poll};
 use hyper::service::service_fn;
 use hyper::upgrade::OnUpgrade;
 use hyper::{Method, Request, Response, StatusCode, header, server};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, copy_bidirectional};
 use tokio::net::TcpStream;
 
 use crate::exchange::{self, Ctx, ReqBody, RespBody, Tracker};
 
 const PROTOCOL: &str = "http1";
+const PROTOCOL_H2: &str = "h2";
 
 /// More header lines than this, or a header section over [`MAX_HEADER_BYTES`], gets `431`.
 const MAX_HEADERS: usize = 256;
@@ -83,6 +86,7 @@ pub async fn relay(
     upstream: TcpStream,
     replay: Vec<u8>,
     ctx: Ctx,
+    stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let (sender, driver) = hyper::client::conn::http1::Builder::new()
         .preserve_header_case(true)
@@ -115,10 +119,19 @@ pub async fn relay(
     let mut server = pin!(server);
     let mut driver = pin!(driver.with_upgrades());
 
+    let mut stop = pin!(stop);
+    let mut stopping = false;
     let mut driver_done = false;
     let served = loop {
         tokio::select! {
             served = server.as_mut() => break served,
+            () = &mut stop, if !stopping => {
+                stopping = true;
+                // Shutdown: the response in flight completes, an idle connection closes.
+                if !state.upgrade_requested.load(Ordering::SeqCst) {
+                    server.as_mut().graceful_shutdown();
+                }
+            }
             _ = &mut driver, if !driver_done => {
                 driver_done = true;
                 // The destination closed: finish the response in flight, then close the
@@ -196,4 +209,78 @@ async fn forward(
         *slot = Some((from_client, hyper::upgrade::on(&mut response)));
     }
     Ok(tracker.answered(response, accepted))
+}
+
+/// What the HTTP/2 service shares with [`relay_h2`]: the destination connection, on which all
+/// the streams of the client connection are multiplexed.
+struct StateH2 {
+    ctx: Ctx,
+    sender: hyper::client::conn::http2::SendRequest<ReqBody>,
+}
+
+/// Relays the HTTP/2 streams of `client` (whose first bytes, `replay`, were already read) to
+/// `upstream` until one side closes. A stream the destination fails is reset alone.
+pub async fn relay_h2(
+    client: TcpStream,
+    upstream: TcpStream,
+    replay: Vec<u8>,
+    ctx: Ctx,
+    stop: impl Future<Output = ()>,
+) -> io::Result<()> {
+    let (sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, ReqBody>(TokioIo::new(upstream))
+        .await
+        .map_err(io::Error::other)?;
+    let state = Arc::new(StateH2 { ctx, sender });
+    let service = service_fn(move |req| forward_h2(state.clone(), req));
+    let io = TokioIo::new(Replay {
+        prefix: replay,
+        pos: 0,
+        inner: client,
+    });
+    let server = server::conn::http2::Builder::new(TokioExecutor::new())
+        .auto_date_header(false)
+        .serve_connection(io, service);
+    let mut server = pin!(server);
+    let mut driver = pin!(driver);
+
+    let mut stop = pin!(stop);
+    let mut stopping = false;
+    let mut driver_done = false;
+    loop {
+        tokio::select! {
+            served = server.as_mut() => return served.map_err(io::Error::other),
+            () = &mut stop, if !stopping => {
+                stopping = true;
+                // Shutdown: GOAWAY, streams in flight finish.
+                server.as_mut().graceful_shutdown();
+            }
+            _ = &mut driver, if !driver_done => {
+                driver_done = true;
+                // The destination connection ended: streams in flight finish or fail, and
+                // the client is told to open no new one (GOAWAY).
+                server.as_mut().graceful_shutdown();
+            }
+        }
+    }
+}
+
+async fn forward_h2(
+    state: Arc<StateH2>,
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<RespBody>, hyper::Error> {
+    let (tracker, req) = Tracker::start(&state.ctx, PROTOCOL_H2, req);
+    let mut sender = state.sender.clone();
+    let sent = async {
+        sender.ready().await?;
+        sender.send_request(req).await
+    }
+    .await;
+    match sent {
+        Ok(response) => Ok(tracker.answered(response, false)),
+        Err(e) => {
+            tracker.failed();
+            Err(e)
+        }
+    }
 }

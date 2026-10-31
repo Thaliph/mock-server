@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use mimic_runtime::admin::{self, Readiness};
+use mimic_runtime::admin::{self, Readiness, Shutdown};
 use mimic_runtime::config::{CommonConfig, Env};
 use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
@@ -35,19 +35,24 @@ fn main() -> ExitCode {
         Ok(probes) => probes,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
-    let _log = mimic_runtime::logging::init(&config.log);
-    match run(config, tunnel, probes) {
+    let mut log = mimic_runtime::logging::init(&config.log);
+    let code = match run(config, tunnel, probes) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "sidecar stopped");
             ExitCode::FAILURE
         }
-    }
+    };
+    // Flush the queued lines (the shutdown ones included) before exiting.
+    log.finish();
+    code
 }
 
 #[tokio::main]
 async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
+    // Registered before any listener is announced: an early SIGTERM is not lost.
+    let shutdown = Shutdown::install()?;
     let mut metrics = Metrics::new("sidecar", VERSION);
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
     let proxy_metrics = ProxyMetrics::register(&mut metrics, tunnel.max_authorities);
@@ -68,6 +73,14 @@ async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std:
         )
         .with_proxy_metrics(proxy_metrics),
     );
+    // The listeners stop accepting and the relays wind down on the signal.
+    tokio::spawn({
+        let (shared, stop) = (shared.clone(), shutdown.clone());
+        async move {
+            stop.wait().await;
+            shared.shutdown();
+        }
+    });
     for (listener, _) in inbound {
         listener::spawn_listener(listener, Direction::Inbound, shared.clone());
     }
@@ -76,10 +89,22 @@ async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std:
     }
 
     let listener = admin::bind(config.admin_addr).await?;
-    admin::serve(
-        listener,
-        admin::router(metrics, Readiness::always()).merge(probes::router(Arc::new(probes))),
-        config.shutdown_grace,
-    )
-    .await
+    let grace = config.shutdown_grace;
+    // Responses in flight get the grace period too, in parallel with the admin drain.
+    let drain = async {
+        shutdown.clone().wait().await;
+        if tokio::time::timeout(grace, shared.drained()).await.is_err() {
+            tracing::warn!("grace period over, closing remaining proxied connections");
+        }
+    };
+    let (served, ()) = tokio::join!(
+        admin::serve_until(
+            listener,
+            admin::router(metrics, Readiness::always()).merge(probes::router(Arc::new(probes))),
+            grace,
+            shutdown.clone().wait(),
+        ),
+        drain
+    );
+    served
 }

@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub struct Fixture {
     pub addr: SocketAddr,
     pub metrics: Arc<Metrics>,
+    pub shared: Arc<Shared>,
 }
 
 pub async fn fixture(
@@ -48,9 +49,10 @@ pub async fn fixture_budget(
     let proxy = ProxyMetrics::register(&mut metrics, max_authorities);
     let shared =
         Arc::new(Shared::new(vec![addr], tunnel_metrics, original_dst).with_proxy_metrics(proxy));
-    spawn_listener(listener, direction, shared);
+    spawn_listener(listener, direction, shared.clone());
     Fixture {
         addr,
+        shared,
         metrics: Arc::new(metrics),
     }
 }
@@ -74,9 +76,14 @@ pub async fn echo_server() -> SocketAddr {
     addr
 }
 
+/// An address that refuses connections. The port stays bound (without `listen`) for the rest of
+/// the test process: a dropped listener would free it for a parallel test to take.
 pub async fn closed_port() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap()
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    std::mem::forget(socket);
+    addr
 }
 
 pub async fn counted(metrics: &Metrics, line: &str) {
