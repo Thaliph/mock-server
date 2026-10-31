@@ -76,23 +76,27 @@ impl WorkloadCache {
     }
 }
 
-/// Keeps `cache` in line with the `MimicWorkload`s of the cluster, for ever. Without cluster
-/// access the cache simply stays unsynced, which makes `/inject/workload` fail closed.
-pub async fn watch(cache: Arc<WorkloadCache>) {
+/// The client of the cluster, waited for as long as it takes (outside a cluster it never comes).
+pub async fn client() -> kube::Client {
+    loop {
+        match kube::Client::try_default().await {
+            Ok(client) => return client,
+            Err(e) => {
+                tracing::warn!(error = %e, "no Kubernetes client yet");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+/// Keeps `cache` in line with the `MimicWorkload`s of the cluster, for ever. As long as it is
+/// unsynced, `/inject/workload` fails closed and the controller is not ready.
+pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
     let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
         "mimic.platform.io",
         "v1alpha1",
         "MimicWorkload",
     ));
-    let client = loop {
-        match kube::Client::try_default().await {
-            Ok(client) => break client,
-            Err(e) => {
-                tracing::warn!(error = %e, "no Kubernetes client, MimicWorkload cache not synced");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    };
     let api = Api::<DynamicObject>::all_with(client, &resource);
     let mut events =
         std::pin::pin!(watcher::watcher(api, watcher::Config::default()).default_backoff());

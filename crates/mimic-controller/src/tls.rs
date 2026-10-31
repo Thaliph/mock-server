@@ -33,10 +33,6 @@ impl CertSlot {
         CertSlot::default()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the certificate manager")
-    )]
     /// Loads (or replaces) the certificate chain and private key, both PEM.
     pub fn set_pem(&self, cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
         let chain = CertificateDer::pem_slice_iter(cert_pem)
@@ -53,7 +49,6 @@ impl CertSlot {
         Ok(())
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the readiness check"))]
     pub fn is_loaded(&self) -> bool {
         self.get().is_some()
     }

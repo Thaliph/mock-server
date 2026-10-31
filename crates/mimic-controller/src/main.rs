@@ -1,6 +1,7 @@
 //! `mimic-controller`: webhook, reconciler, sidecar API and UI (spec §2, §7). F0 provides the
 //! process skeleton and the Valkey connection that gates readiness.
 
+mod cert_manager;
 mod certs;
 mod tls;
 mod valkey;
@@ -59,19 +60,8 @@ async fn run(config: Config) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "controller starting");
     let mut metrics = Metrics::new("controller", VERSION);
     let admission_metrics = webhook::AdmissionMetrics::register(metrics.registry_mut());
+    let cert_metrics = cert_manager::CertMetrics::register(metrics.registry_mut());
     let metrics = Arc::new(metrics);
-    let health = valkey::Health::spawn(config.valkey);
-    let readiness = Readiness::new(move || {
-        let up = health.is_up();
-        async move {
-            if up {
-                Ok(())
-            } else {
-                Err("valkey unreachable".to_string())
-            }
-        }
-    });
-
     let webhook = config.webhook;
     tracing::info!(
         service = webhook.service,
@@ -80,9 +70,46 @@ async fn run(config: Config) -> std::io::Result<()> {
         "webhook configured"
     );
     let cache = Arc::new(workloads::WorkloadCache::new());
-    tokio::spawn(workloads::watch(cache.clone()));
     // The serving certificate is loaded into this slot by the certificate manager.
     let cert = Arc::new(tls::CertSlot::new());
+    tokio::spawn({
+        let (cache, cert) = (cache.clone(), cert.clone());
+        let certificates = cert_manager::CertConfig {
+            namespace: webhook.namespace.clone(),
+            service: webhook.service,
+            secret: webhook.secret,
+            configuration: webhook.configuration,
+        };
+        async move {
+            let client = workloads::client().await;
+            tokio::spawn(workloads::watch(client.clone(), cache));
+            cert_manager::manage(client, certificates, cert, cert_metrics).await;
+        }
+    });
+    let health = valkey::Health::spawn(config.valkey);
+    let readiness = Readiness::new({
+        let (cache, cert) = (cache.clone(), cert.clone());
+        move || {
+            let up = health.is_up();
+            let (certificate, synced) = (cert.is_loaded(), cache.is_synced());
+            async move {
+                let missing: Vec<&str> = [
+                    (up, "valkey unreachable"),
+                    (certificate, "webhook certificate not loaded"),
+                    (synced, "MimicWorkload cache not synced"),
+                ]
+                .into_iter()
+                .filter(|(ok, _)| !ok)
+                .map(|(_, reason)| reason)
+                .collect();
+                if missing.is_empty() {
+                    Ok(())
+                } else {
+                    Err(missing.join(", "))
+                }
+            }
+        }
+    });
     let admission = Arc::new(webhook::Admission {
         controller_namespace: webhook.namespace,
         inject: webhook.inject,
