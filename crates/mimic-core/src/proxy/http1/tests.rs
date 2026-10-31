@@ -759,6 +759,23 @@ fn prx_27_limited_feed_uses_every_byte_once_the_codec_is_opaque() {
 }
 
 #[test]
+fn prx_27_unlimited_feed_of_10000_requests_stays_at_the_read_ahead() {
+    for unit in [
+        &b"GET / HTTP/1.1\r\n\r\n"[..],
+        b"GET /\n\n",
+        b"POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\nab",
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        b"CONNECT a:1 HTTP/1.1\r\n\r\n",
+    ] {
+        let mut c = Codec::new();
+        let ev = c.client_bytes(&unit.repeat(10_000));
+        assert!(c.pending() <= READ_AHEAD, "{unit:?}: {}", c.pending());
+        assert!(c.retained_bytes() <= RETAINED_LIMIT);
+        assert!(ev.len() < 4 * READ_AHEAD, "{unit:?}: {} events", ev.len());
+    }
+}
+
+#[test]
 fn prx_27_unlimited_feed_beyond_the_read_ahead_is_unframed() {
     let mut c = Codec::new();
     let data = b"GET / HTTP/1.1\r\n\r\n".repeat(READ_AHEAD + 1);

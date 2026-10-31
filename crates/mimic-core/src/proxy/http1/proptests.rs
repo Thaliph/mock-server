@@ -316,6 +316,36 @@ proptest! {
     }
 
     #[test]
+    fn prx_27_plain_feed_never_has_more_than_the_read_ahead_pending(
+        units in proptest::collection::vec(
+            prop_oneof![
+                Just(&b"GET / HTTP/1.1\r\n\r\n"[..]),
+                Just(&b"GET /a\n\n"[..]),
+                Just(&b"POST / HTTP/1.1\r\nContent-Length: 1\r\n\r\nx"[..]),
+                Just(&b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..]),
+                Just(&b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: x\r\n\r\n"[..]),
+                Just(&b"CONNECT a:1 HTTP/1.1\r\n\r\n"[..]),
+                Just(&b"\r\n"[..]),
+                Just(&b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..]),
+                Just(&b"HTTP/1.1 100 Continue\r\n\r\n"[..]),
+            ],
+            0..120,
+        ),
+        server_mask in proptest::collection::vec(any::<bool>(), 120),
+    ) {
+        let mut c = Codec::new();
+        for (u, to_server) in units.iter().zip(server_mask) {
+            if to_server && u.starts_with(b"HTTP") {
+                c.server_bytes(u);
+            } else {
+                c.client_bytes(u);
+            }
+            prop_assert!(c.pending() <= READ_AHEAD, "{}", c.pending());
+            prop_assert!(c.retained_bytes() <= RETAINED_LIMIT);
+        }
+    }
+
+    #[test]
     fn prx_27_any_split_of_the_input_gives_the_same_events(
         client in proptest::collection::vec(any::<u8>(), 0..300),
         server in proptest::collection::vec(any::<u8>(), 0..300),
