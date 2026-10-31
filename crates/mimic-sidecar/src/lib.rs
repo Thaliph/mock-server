@@ -5,3 +5,4 @@ pub mod http;
 pub mod listener;
 pub mod opaque;
 pub mod probes;
+pub mod red;

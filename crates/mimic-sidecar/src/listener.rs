@@ -18,6 +18,7 @@ use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::connection;
+use crate::red::ProxyMetrics;
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -111,6 +112,7 @@ pub type OriginalDst = Arc<dyn Fn(&TcpStream) -> io::Result<SocketAddr> + Send +
 pub struct Shared {
     bound: Vec<SocketAddr>,
     metrics: TunnelMetrics,
+    proxy: ProxyMetrics,
     original_dst: OriginalDst,
 }
 
@@ -132,8 +134,15 @@ impl Shared {
         Shared {
             bound,
             metrics,
+            proxy: ProxyMetrics::default(),
             original_dst,
         }
+    }
+
+    /// Uses `proxy` for the RED metrics instead of unregistered ones.
+    pub fn with_proxy_metrics(mut self, proxy: ProxyMetrics) -> Shared {
+        self.proxy = proxy;
+        self
     }
 
     /// True when `dst` is one of the sidecar's own listeners: a connection to it would loop.

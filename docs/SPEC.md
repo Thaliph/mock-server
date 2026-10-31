@@ -181,6 +181,8 @@ Accepted limits of the proxy:
 - HTTP/2 connection settings (window sizes, concurrent streams, header list size) are the
   sidecar's, not the destination's. An HTTP/1 header section over 64 KiB or 256 lines gets
   `431`, and HTTP that a lenient app would accept but `hyper` rejects gets `400`.
+- On HTTP/1, response trailers are forwarded only when the request carried `TE: trailers`,
+  and trailer names are lowercased (the `hyper` HTTP/1 stack).
 - WebSocket over HTTP/2 (extended `CONNECT`, RFC 8441) is not advertised, so clients use
   HTTP/1.1 for it.
 - Until F3, outbound HTTPS is seen at connection level only (SNI, bytes, duration).
