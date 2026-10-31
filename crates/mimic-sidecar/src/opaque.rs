@@ -92,7 +92,7 @@ async fn failed(s: &TcpStream, side: Side) -> (Side, io::Error) {
 
 /// Makes the close of `s` a reset.
 fn abort(s: &TcpStream) {
-    let _ = s.set_linger(Some(Duration::ZERO));
+    let _ = SockRef::from(s).set_linger(Some(Duration::ZERO));
 }
 
 /// Writes the bytes read during detection to their side, then relays until both sides are done.

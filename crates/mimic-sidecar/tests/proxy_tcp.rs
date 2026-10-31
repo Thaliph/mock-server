@@ -318,7 +318,9 @@ async fn prx_12_a_thousand_simultaneous_connections_are_all_served() {
 // ---- PRX-17 / PRX-18 (tunnel part): FIN passes as FIN, reset passes as reset ----
 
 fn reset(s: TcpStream) {
-    s.set_linger(Some(Duration::ZERO)).unwrap();
+    socket2::SockRef::from(&s)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
     drop(s);
 }
 
