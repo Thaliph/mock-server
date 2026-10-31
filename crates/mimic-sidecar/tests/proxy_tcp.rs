@@ -438,6 +438,32 @@ async fn prx_18_opaque_destination_reset_after_a_fin_reaches_the_client_as_a_res
 }
 
 #[tokio::test]
+async fn prx_18_client_reset_during_detection_reaches_the_destination_as_a_reset() {
+    let (dest, rx) = handing_destination().await;
+    let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    // A prefix of an HTTP method: the protocol is still undecided.
+    c.write_all(b"GE").await.unwrap();
+    let mut d = rx.await.unwrap();
+    // The bytes are held until the protocol is known: nothing reaches `d` before the reset.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    reset(c);
+    let took = expect_reset(&mut d).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
+async fn prx_18_destination_reset_during_detection_reaches_the_client_as_a_reset() {
+    let (dest, rx) = handing_destination().await;
+    let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    let d = rx.await.unwrap();
+    reset(d);
+    let took = expect_reset(&mut c).await;
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
 async fn prx_17_opaque_destination_fin_passes_as_a_fin_and_not_as_a_reset() {
     let (dest, rx) = handing_destination().await;
     let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
