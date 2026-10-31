@@ -1,4 +1,4 @@
-//! FND-01, FND-04, FND-05, FND-07, INJ-07 on the real `mimic-sidecar` binary.
+//! FND-01, FND-04, FND-05, FND-07, INJ-07, PRX-10, PRX-12 on the real `mimic-sidecar` binary.
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
@@ -116,7 +116,7 @@ fn inj_07_listeners_are_bound_when_readyz_answers_200() {
 }
 
 #[test]
-fn inj_07_connection_without_original_destination_is_closed_and_counted() {
+fn prx_10_connection_without_original_destination_is_closed_and_counted() {
     let mut sidecar = Process::spawn(BIN, &LISTENERS);
     let admin = sidecar.admin_addr();
     let (inbound, outbound) = tunnel_addrs(&mut sidecar);
@@ -129,10 +129,14 @@ fn inj_07_connection_without_original_destination_is_closed_and_counted() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let (_, metrics) = http_get(admin, "/metrics");
+        // Without a redirection the kernel either fails (`no_original_dst`) or reports the
+        // listener itself (`loop`), depending on conntrack: both close the connection.
         if ["inbound", "outbound"].iter().all(|d| {
-            metrics.contains(&format!(
-                r#"mimic_tcp_connections_total{{direction="{d}",result="loop"}} 1"#
-            ))
+            ["no_original_dst", "loop"].iter().any(|r| {
+                metrics.contains(&format!(
+                    r#"mimic_tcp_connections_total{{direction="{d}",result="{r}"}} 1"#
+                ))
+            })
         }) {
             break;
         }
@@ -161,4 +165,18 @@ fn inj_18_invalid_app_probes_exit_2_without_echoing_the_value() {
     assert_eq!(status.code(), Some(2));
     assert!(stderr.contains("MIMIC_APP_PROBES"), "{stderr}");
     assert!(!stderr.contains("secret-token") && !stdout.contains("secret-token"));
+}
+
+#[test]
+fn prx_12_open_file_soft_limit_equals_the_hard_limit() {
+    let mut sidecar = Process::spawn(BIN, &LISTENERS);
+    let admin = sidecar.admin_addr();
+    wait_status(admin, "/readyz", 200, Duration::from_secs(10));
+    let limits = std::fs::read_to_string(format!("/proc/{}/limits", sidecar.pid())).unwrap();
+    let line = limits
+        .lines()
+        .find(|l| l.starts_with("Max open files"))
+        .unwrap();
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(cols[3], cols[4], "{line}");
 }

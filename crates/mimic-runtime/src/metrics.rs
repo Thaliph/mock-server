@@ -1,9 +1,29 @@
 //! Prometheus registry of a component (spec §9, FND-03).
 
+use prometheus_client::collector::Collector;
 use prometheus_client::encoding::text::encode;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
+use prometheus_client::metrics::counter::ConstCounter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+
+/// `mimic_log_lines_dropped_total`, read from the process logger at scrape time.
+#[derive(Debug)]
+struct LogDrops;
+
+impl Collector for LogDrops {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> std::fmt::Result {
+        let counter = ConstCounter::new(crate::logging::dropped_lines());
+        let metric = encoder.encode_descriptor(
+            "log_lines_dropped",
+            "Log lines dropped because stdout could not keep up",
+            None,
+            counter.metric_type(),
+        )?;
+        counter.encode(metric)
+    }
+}
 
 pub struct Metrics {
     registry: Registry,
@@ -25,6 +45,7 @@ impl Metrics {
             "Build information of the component",
             build_info,
         );
+        registry.register_collector(Box::new(LogDrops));
         Metrics { registry }
     }
 

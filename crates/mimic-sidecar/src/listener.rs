@@ -1,22 +1,26 @@
-//! Opaque TCP tunnel (spec §4, INJ-07): accepts the connections redirected by `mimic-init`,
-//! reads their original destination and relays the bytes. Protocol detection comes in F2.
+//! Listeners of the sidecar (spec §4, §10.3): configuration, binding, the accept loop and the
+//! counters of the connection layer. Each accepted connection goes to [`crate::connection`].
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
+use nix::sys::resource::{Resource, getrlimit, setrlimit};
 use nix::sys::socket::{getsockopt, sockopt};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use socket2::{Domain, Socket, Type};
-use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::connection;
+
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const IPV6_INTERFACES: &str = "/proc/net/if_inet6";
 
 const INBOUND_VAR: &str = "MIMIC_INBOUND_ADDRS";
@@ -38,10 +42,11 @@ impl Direction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Outcome {
+pub(crate) enum Outcome {
     Ok,
     ConnectError,
     Loop,
+    NoOriginalDst,
 }
 
 impl Outcome {
@@ -50,6 +55,7 @@ impl Outcome {
             Outcome::Ok => "ok",
             Outcome::ConnectError => "connect_error",
             Outcome::Loop => "loop",
+            Outcome::NoOriginalDst => "no_original_dst",
         }
     }
 }
@@ -60,10 +66,16 @@ struct Labels {
     result: &'static str,
 }
 
-/// `mimic_tcp_connections_total{direction,result}`.
+/// `mimic_tcp_connections_total{direction,result}` and `mimic_accept_errors_total{direction}`.
 #[derive(Clone, Default)]
 pub struct TunnelMetrics {
     connections: Family<Labels, Counter>,
+    accept_errors: Family<DirectionLabel, Counter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct DirectionLabel {
+    direction: &'static str,
 }
 
 impl TunnelMetrics {
@@ -74,10 +86,15 @@ impl TunnelMetrics {
             "Connections handled by the TCP tunnel",
             tunnel.connections.clone(),
         );
+        metrics.registry_mut().register(
+            "accept_errors",
+            "Failed accept calls on the sidecar listeners",
+            tunnel.accept_errors.clone(),
+        );
         tunnel
     }
 
-    fn count(&self, direction: Direction, result: Outcome) {
+    pub(crate) fn count(&self, direction: Direction, result: Outcome) {
         self.connections
             .get_or_create(&Labels {
                 direction: direction.as_str(),
@@ -98,6 +115,15 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// The destination `stream` was addressed to before the redirection.
+    pub(crate) fn original_dst(&self, stream: &TcpStream) -> io::Result<SocketAddr> {
+        (self.original_dst)(stream)
+    }
+
+    pub(crate) fn metrics(&self) -> &TunnelMetrics {
+        &self.metrics
+    }
+
     pub fn new(
         bound: Vec<SocketAddr>,
         metrics: TunnelMetrics,
@@ -215,47 +241,66 @@ pub fn bind_all(
     Ok(bound)
 }
 
+/// Raises the open-file soft limit to the hard limit (spec §4.1): the proxy holds two sockets
+/// per connection and never refuses one. Failures are logged, not fatal.
+pub fn raise_fd_limit() {
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) if soft < hard => match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+            Ok(()) => tracing::info!(from = soft, to = hard, "open-file limit raised"),
+            Err(e) => tracing::warn!(error = %e, soft, hard, "cannot raise the open-file limit"),
+        },
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "cannot read the open-file limit"),
+    }
+}
+
 /// Accepts connections on `listener` for as long as the runtime lives.
 pub fn spawn_listener(listener: TcpListener, direction: Direction, shared: Arc<Shared>) {
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    tokio::spawn(handle(stream, direction, shared.clone()));
-                }
-                Err(e) => {
+    tokio::spawn(accept_loop(
+        listener,
+        direction,
+        shared,
+        std::future::pending(),
+    ));
+}
+
+/// Accepts connections on `listener` until `shutdown` completes; the connections already
+/// accepted keep running. A failing `accept` (e.g. no descriptor left) is counted, logged at
+/// most once per second and retried.
+pub async fn accept_loop(
+    listener: TcpListener,
+    direction: Direction,
+    shared: Arc<Shared>,
+    shutdown: impl Future<Output = ()>,
+) {
+    tokio::pin!(shutdown);
+    let mut last_logged: Option<Instant> = None;
+    loop {
+        let accepted = tokio::select! {
+            () = &mut shutdown => return,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
+            Ok((stream, _)) => {
+                tokio::spawn(connection::handle(stream, direction, shared.clone()));
+            }
+            Err(e) => {
+                shared
+                    .metrics
+                    .accept_errors
+                    .get_or_create(&DirectionLabel {
+                        direction: direction.as_str(),
+                    })
+                    .inc();
+                if last_logged.is_none_or(|t| t.elapsed() >= ACCEPT_LOG_INTERVAL) {
+                    last_logged = Some(Instant::now());
                     tracing::warn!(direction = direction.as_str(), error = %e, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                tokio::select! {
+                    () = &mut shutdown => return,
+                    () = tokio::time::sleep(ACCEPT_RETRY) => {}
                 }
             }
         }
-    });
-}
-
-async fn handle(mut client: TcpStream, direction: Direction, shared: Arc<Shared>) {
-    let dst = match (shared.original_dst)(&client) {
-        Ok(dst) if !shared.is_listener(dst) => dst,
-        found => {
-            shared.metrics.count(direction, Outcome::Loop);
-            tracing::debug!(direction = direction.as_str(), original_dst = ?found.ok(), "loop, connection closed");
-            return;
-        }
-    };
-    let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await;
-    let mut upstream = match connected {
-        Ok(Ok(upstream)) => upstream,
-        failure => {
-            shared.metrics.count(direction, Outcome::ConnectError);
-            let error = match failure {
-                Ok(Err(e)) => e.to_string(),
-                _ => "connect timeout".to_string(),
-            };
-            tracing::debug!(direction = direction.as_str(), %dst, %error, "connect failed");
-            return;
-        }
-    };
-    shared.metrics.count(direction, Outcome::Ok);
-    if let Err(e) = copy_bidirectional(&mut client, &mut upstream).await {
-        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "tunnel ended");
     }
 }

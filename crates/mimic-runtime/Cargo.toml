@@ -13,6 +13,7 @@ serde_json = { version = "1.0.154", optional = true }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "sync"] }
 tracing = "0.1.44"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 
 [lints]

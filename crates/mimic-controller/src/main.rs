@@ -45,7 +45,7 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
-    mimic_runtime::logging::init(&config.common.log);
+    let _log = mimic_runtime::logging::init(&config.common.log);
     match run(config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
