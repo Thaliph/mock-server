@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # End-to-end checks on kind (FND-08, FND-09). Idempotent: reuses the cluster if it exists.
 #
-#   IMAGE=ghcr.io/thaliph/mimic:e2e   image to test (built here unless SKIP_BUILD=1)
-#   CLUSTER=mimic-e2e                 kind cluster name
-#   KEEP_CLUSTER=1                    keep the cluster afterwards (default: keep locally, delete in CI)
+#   IMAGE=ghcr.io/thaliph/mimic:e2e        image to test (built here unless SKIP_BUILD=1)
+#   INIT_IMAGE=ghcr.io/thaliph/mimic-init:e2e  mimic-init image (built here unless SKIP_BUILD=1)
+#   CLUSTER=mimic-e2e                      kind cluster name
+#   NODE_IMAGE=kindest/node:v1.33.7@sha256:…   kind node image (default: kind's own)
+#   KEEP_CLUSTER=1                         keep the cluster afterwards (default: keep locally, delete in CI)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IMAGE=${IMAGE:-ghcr.io/thaliph/mimic:e2e}
+INIT_IMAGE=${INIT_IMAGE:-ghcr.io/thaliph/mimic-init:e2e}
 CLUSTER=${CLUSTER:-mimic-e2e}
 NS=mimic-system
 RELEASE=mimic
@@ -23,17 +26,20 @@ trap cleanup EXIT
 
 if ! kind get clusters | grep -qx "$CLUSTER"; then
   log "create kind cluster $CLUSTER"
-  kind create cluster --name "$CLUSTER" --wait 120s
+  node_args=()
+  [[ -z ${NODE_IMAGE:-} ]] || node_args=(--image "$NODE_IMAGE")
+  kind create cluster --name "$CLUSTER" --wait 120s "${node_args[@]}"
 fi
 kubectl config use-context "kind-$CLUSTER" >/dev/null
 server=$(kubectl version -o json | sed -n 's/.*"gitVersion": "v\([0-9]*\.[0-9]*\).*/\1/p' | tail -1)
 log "kubernetes $server"
 
 if [[ ${SKIP_BUILD:-0} != 1 ]]; then
-  log "build $IMAGE"
+  log "build $IMAGE and $INIT_IMAGE"
   docker build -q -t "$IMAGE" .
+  docker build -q -t "$INIT_IMAGE" --target init .
 fi
-kind load docker-image --name "$CLUSTER" "$IMAGE"
+kind load docker-image --name "$CLUSTER" "$IMAGE" "$INIT_IMAGE"
 
 log "fnd_08: namespace enforces Pod Security restricted"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
@@ -101,5 +107,34 @@ after=$(kubectl -n "$NS" get secret $RELEASE-valkey -o jsonpath='{.data.password
 [[ $after == "$password" ]] || fail "fnd_08: password changed on upgrade"
 kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 [[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "fnd_08: not ready after upgrade"
+
+log "inj_17: mimic-init installs the redirection rules in a pod network namespace"
+# Privileged namespace: mimic-init needs NET_ADMIN and NET_RAW as UID 0 (spec §11). Checks that
+# the nft-backed iptables-restore accepts the rules on this Kubernetes version.
+kubectl create namespace inj-17 --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label --overwrite namespace inj-17 pod-security.kubernetes.io/enforce=privileged >/dev/null
+kubectl -n inj-17 delete pod mimic-init --ignore-not-found --wait=true >/dev/null
+kubectl -n inj-17 apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: mimic-init}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  containers:
+    - name: init
+      image: $INIT_IMAGE
+      imagePullPolicy: Never
+      securityContext:
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL], add: [NET_ADMIN, NET_RAW]}
+        seccompProfile: {type: RuntimeDefault}
+YAML
+kubectl -n inj-17 wait --for=jsonpath='{.status.phase}'=Succeeded pod/mimic-init --timeout=120s >/dev/null \
+  || { kubectl -n inj-17 logs mimic-init >&2 || true; fail "inj_17: mimic-init did not exit 0"; }
+kubectl -n inj-17 logs mimic-init | grep -q '"message":"redirection installed"' \
+  || fail "inj_17: mimic-init did not log the installed redirection"
 
 log "e2e passed on kubernetes $server"

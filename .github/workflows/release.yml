@@ -1,8 +1,9 @@
 name: release
 
-# On a v* tag: multi-arch image (native amd64 and arm64 runners), signed with cosign keyless,
-# with SBOM and provenance; then the Helm chart, pushed as an OCI artifact and signed
-# (spec §10, FND-10). Everything lands on ghcr.io, free for a public repository.
+# On a v* tag: multi-arch images (mimic and mimic-init), native amd64 and arm64 runners, each
+# signed with cosign keyless, with SBOM and provenance; then the Helm chart, pinned to the mimic
+# image digest, pushed as an OCI artifact and signed (spec §10, FND-10, INJ-17). Everything lands
+# on ghcr.io, free for a public repository.
 
 on:
   push:
@@ -13,6 +14,7 @@ permissions:
 
 env:
   REPO: ghcr.io/thaliph/mimic
+  INIT_REPO: ghcr.io/thaliph/mimic-init
   CHARTS: ghcr.io/thaliph/charts
 
 jobs:
@@ -20,9 +22,21 @@ jobs:
     strategy:
       matrix:
         include:
-          - platform: linux/amd64
+          - target: app
+            repo: ghcr.io/thaliph/mimic
+            platform: linux/amd64
             runner: ubuntu-24.04
-          - platform: linux/arm64
+          - target: app
+            repo: ghcr.io/thaliph/mimic
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - target: init
+            repo: ghcr.io/thaliph/mimic-init
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - target: init
+            repo: ghcr.io/thaliph/mimic-init
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -49,19 +63,21 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.REPO }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ matrix.repo }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          TARGET: ${{ matrix.target }}
         run: |
           mkdir -p digests
-          touch "digests/${DIGEST#sha256:}"
+          touch "digests/$TARGET-${DIGEST#sha256:}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: digest-${{ matrix.runner }}
+          name: digest-${{ matrix.target }}-${{ matrix.runner }}
           path: digests/*
           retention-days: 1
 
@@ -89,21 +105,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Multi-arch index, signed
+      - name: Multi-arch indexes, signed
         id: index
         env:
           TAG: ${{ github.ref_name }}
         run: |
           version=${TAG#v}
-          docker buildx imagetools create -t "$REPO:$version" \
-            $(for d in digests/*; do echo "$REPO@sha256:$(basename "$d")"; done)
-          digest=$(docker buildx imagetools inspect "$REPO:$version" --format '{{json .Manifest}}' | jq -r .digest)
-          cosign sign --yes "$REPO@$digest"
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          # index <repo> <target> <output>: one manifest list from the per-platform digests of
+          # <target> (files named <target>-<digest>), pushed under the version tag and signed.
+          index() {
+            local repo=$1 target=$2 output=$3 digest
+            docker buildx imagetools create -t "$repo:$version" \
+              $(for d in digests/"$target"-*; do echo "$repo@sha256:${d##*/$target-}"; done)
+            digest=$(docker buildx imagetools inspect "$repo:$version" --format '{{json .Manifest}}' | jq -r .digest)
+            cosign sign --yes "$repo@$digest"
+            echo "$output=$digest" >> "$GITHUB_OUTPUT"
+          }
+          index "$REPO" app app_digest
+          index "$INIT_REPO" init init_digest
       - name: Helm chart, pinned to the image digest, signed
         env:
           TAG: ${{ github.ref_name }}
-          DIGEST: ${{ steps.index.outputs.digest }}
+          DIGEST: ${{ steps.index.outputs.app_digest }}
           GH_ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
