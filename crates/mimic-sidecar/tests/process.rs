@@ -178,7 +178,13 @@ fn prx_12_open_file_soft_limit_equals_the_hard_limit() {
         .find(|l| l.starts_with("Max open files"))
         .unwrap();
     let cols: Vec<&str> = line.split_whitespace().collect();
-    assert_eq!(cols[3], cols[4], "{line}");
+    if cols[4] == "unlimited" {
+        // PRX-25: an unlimited hard limit is replaced by fs.nr_open as the soft limit.
+        let nr_open = std::fs::read_to_string("/proc/sys/fs/nr_open").unwrap();
+        assert_eq!(cols[3], nr_open.trim(), "{line}");
+    } else {
+        assert_eq!(cols[3], cols[4], "{line}");
+    }
 }
 
 #[test]

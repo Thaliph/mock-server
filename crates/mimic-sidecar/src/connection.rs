@@ -1,7 +1,9 @@
 //! One redirected connection (spec §4.1): original destination, connect, socket options and
 //! protocol detection. Opaque traffic goes to [`crate::opaque`].
 
+use std::future::Future;
 use std::io;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,8 +15,9 @@ use tokio::net::TcpStream;
 
 use crate::access;
 use crate::exchange::Ctx;
+use crate::http;
 use crate::listener::{Active, Direction, Outcome, Shared};
-use crate::{http, opaque};
+use crate::opaque::{self, Early, Side};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
@@ -43,6 +46,8 @@ enum First {
     Opaque {
         to_upstream: Vec<u8>,
         to_client: Vec<u8>,
+        /// A reset, or the end of the grace, seen while reading.
+        early: Option<Early>,
     },
 }
 
@@ -87,54 +92,71 @@ pub(crate) async fn handle(
     }
     let proxy = shared.proxy();
     let (mut client, mut upstream) = (client, upstream);
-    let (protocol, sni, to_upstream, to_client) = match first_bytes(&mut client, &mut upstream)
-        .await
+    let mut abort = pin!(shared.aborted());
+    let ctx = |dst| Ctx {
+        direction,
+        dst,
+        proxy: proxy.clone(),
+        aborted: shared.abort_flag(),
+    };
+    let (protocol, sni, to_upstream, to_client, early) = match first_bytes(
+        &mut client,
+        &mut upstream,
+        abort.as_mut(),
+    )
+    .await
     {
         First::Client(detection, buf) => {
             tracing::debug!(direction = direction.as_str(), %dst, ?detection, "protocol detected");
             match detection {
                 Detection::Http1 => {
                     proxy.connection(direction, "http1", &dst.to_string());
-                    let ctx = Ctx {
-                        direction,
-                        dst,
-                        proxy: proxy.clone(),
+                    // At the end of the grace the relay is dropped: both sockets close, and
+                    // the exchanges in flight write their `shutdown` line as they drop.
+                    let relayed = tokio::select! {
+                        r = http::relay(client, upstream, buf, ctx(dst), shared.stopped()) => r,
+                        () = abort.as_mut() => Ok(()),
                     };
-                    if let Err(e) = http::relay(client, upstream, buf, ctx, shared.stopped()).await
-                    {
+                    if let Err(e) = relayed {
                         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
                     }
                     return;
                 }
                 Detection::Tls { sni } => {
                     let sni = sni.map(|name| normalise_authority(&name, TLS_PORT));
-                    ("tls", sni, buf, Vec::new())
+                    ("tls", sni, buf, Vec::new(), None)
                 }
                 Detection::H2 => {
                     proxy.connection(direction, "h2", &dst.to_string());
-                    let ctx = Ctx {
-                        direction,
-                        dst,
-                        proxy: proxy.clone(),
+                    let relayed = tokio::select! {
+                        r = http::relay_h2(client, upstream, buf, ctx(dst), shared.stopped()) => r,
+                        () = abort.as_mut() => Ok(()),
                     };
-                    if let Err(e) =
-                        http::relay_h2(client, upstream, buf, ctx, shared.stopped()).await
-                    {
+                    if let Err(e) = relayed {
                         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "h2 relay ended");
                     }
                     return;
                 }
-                _ => ("tcp", None, buf, Vec::new()),
+                _ => ("tcp", None, buf, Vec::new(), None),
             }
         }
         First::Opaque {
             to_upstream,
             to_client,
-        } => ("tcp", None, to_upstream, to_client),
+            early,
+        } => ("tcp", None, to_upstream, to_client, early),
     };
     let authority = sni.clone().unwrap_or_else(|| dst.to_string());
     proxy.connection(direction, protocol, &authority);
-    let tunnelled = opaque::tunnel(&mut client, &mut upstream, to_upstream, to_client).await;
+    let tunnelled = opaque::tunnel(
+        &mut client,
+        &mut upstream,
+        to_upstream,
+        to_client,
+        early,
+        abort.as_mut(),
+    )
+    .await;
     if let Some(e) = &tunnelled.error {
         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "tunnel ended");
     }
@@ -157,8 +179,14 @@ pub(crate) async fn handle(
 }
 
 /// Reads until the protocol is known, with no timeout and within [`DETECT_LIMIT`]. The bytes
-/// read are returned to be forwarded unchanged.
-async fn first_bytes(client: &mut TcpStream, upstream: &mut TcpStream) -> First {
+/// read are returned to be forwarded unchanged. A reset on either side is returned as such, to
+/// reach the other side as a reset; the end of the grace (`abort`) ends the detection.
+async fn first_bytes(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    abort: impl Future<Output = ()>,
+) -> First {
+    let mut abort = pin!(abort);
     let mut buf = Vec::new();
     loop {
         let mut from_client = [0u8; READ_CHUNK];
@@ -173,14 +201,29 @@ async fn first_bytes(client: &mut TcpStream, upstream: &mut TcpStream) -> First 
                         found => return First::Client(found, buf),
                     }
                 }
-                // Closed or reset: the tunnel propagates it after the pending bytes.
-                _ => return First::Opaque { to_upstream: buf, to_client: Vec::new() },
+                // Closed: the tunnel propagates the FIN after the pending bytes.
+                Ok(_) => return First::Opaque { to_upstream: buf, to_client: Vec::new(), early: None },
+                Err(e) => {
+                    let early = Some(Early::Failed(Side::Client, e));
+                    return First::Opaque { to_upstream: buf, to_client: Vec::new(), early };
+                }
             },
             read = upstream.read(&mut from_upstream) => {
-                let n = read.unwrap_or(0);
+                let (n, early) = match read {
+                    Ok(n) => (n, None),
+                    Err(e) => (0, Some(Early::Failed(Side::Upstream, e))),
+                };
                 return First::Opaque {
                     to_upstream: buf,
                     to_client: from_upstream[..n].to_vec(),
+                    early,
+                };
+            }
+            () = &mut abort => {
+                return First::Opaque {
+                    to_upstream: buf,
+                    to_client: Vec::new(),
+                    early: Some(Early::Shutdown),
                 };
             }
         }

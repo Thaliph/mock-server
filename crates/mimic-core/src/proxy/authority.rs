@@ -7,15 +7,17 @@ use std::net::Ipv6Addr;
 /// Longest accepted authority, in bytes (maximum length of a DNS name).
 const MAX_AUTHORITY_LEN: usize = 253;
 
-/// Label used for anything that is not a host name or IP literal.
-pub const INVALID_AUTHORITY: &str = "invalid";
+/// Label used for anything that is not a host name or IP literal. The parentheses cannot
+/// appear in a normalised authority, so no real host collides with it.
+pub const INVALID_AUTHORITY: &str = "(invalid)";
 
-/// Label used once the [`AuthorityBudget`] is exhausted.
-pub const OTHER_AUTHORITY: &str = "other";
+/// Label used once the [`AuthorityBudget`] is exhausted; outside the host grammar like
+/// [`INVALID_AUTHORITY`].
+pub const OTHER_AUTHORITY: &str = "(other)";
 
 /// Normalises a `Host` / `:authority` value: lower case, no trailing dot, `default_port`
 /// removed, bracketed IPv6 literals kept. Anything that is not a host name or an IP literal
-/// (optionally with a port), or longer than 253 bytes, becomes `invalid`.
+/// (optionally with a port), or longer than 253 bytes, becomes `(invalid)`.
 pub fn normalise_authority(raw: &str, default_port: u16) -> String {
     parse(raw, default_port).unwrap_or_else(|| INVALID_AUTHORITY.to_string())
 }
@@ -86,7 +88,13 @@ pub fn status_class(status: u16) -> &'static str {
     }
 }
 
-/// Keeps the first `max` distinct authorities; later ones are reported as `other`.
+/// The authority an exchange is about: the one of the request target (HTTP/1 absolute-form,
+/// HTTP/2 `:authority`), else the `Host` header (RFC 9110 §7.2, RFC 9113 §8.3.1).
+pub fn target_authority<'a>(uri: Option<&'a str>, host: Option<&'a str>) -> Option<&'a str> {
+    uri.or(host)
+}
+
+/// Keeps the first `max` distinct authorities; later ones are reported as `(other)`. The sentinels take no slot.
 /// One budget per direction and metric.
 #[derive(Debug, Clone)]
 pub struct AuthorityBudget {
@@ -102,8 +110,11 @@ impl AuthorityBudget {
         }
     }
 
-    /// Label to use for `authority`: itself when kept, `other` otherwise.
+    /// Label to use for `authority`: itself when kept, `(other)` otherwise.
     pub fn label(&mut self, authority: &str) -> String {
+        if authority == INVALID_AUTHORITY || authority == OTHER_AUTHORITY {
+            return authority.to_string();
+        }
         if self.seen.contains(authority) {
             return authority.to_string();
         }
@@ -141,9 +152,9 @@ mod tests {
         assert_eq!(normalise_authority("[::1]", 80), "[::1]");
         assert_eq!(normalise_authority("[::1]:80", 80), "[::1]");
         assert_eq!(normalise_authority("[FE80::1]:8080", 80), "[fe80::1]:8080");
-        assert_eq!(normalise_authority("[::1", 80), "invalid");
-        assert_eq!(normalise_authority("[nope]", 80), "invalid");
-        assert_eq!(normalise_authority("[::1]x", 80), "invalid");
+        assert_eq!(normalise_authority("[::1", 80), "(invalid)");
+        assert_eq!(normalise_authority("[nope]", 80), "(invalid)");
+        assert_eq!(normalise_authority("[::1]x", 80), "(invalid)");
     }
 
     #[test]
@@ -163,9 +174,9 @@ mod tests {
             "a\r\nb",
             ":80",
         ] {
-            assert_eq!(normalise_authority(raw, 80), "invalid", "{raw:?}");
+            assert_eq!(normalise_authority(raw, 80), "(invalid)", "{raw:?}");
         }
-        assert_eq!(normalise_authority(&"a".repeat(254), 80), "invalid");
+        assert_eq!(normalise_authority(&"a".repeat(254), 80), "(invalid)");
         let ok = format!("{}.com", "a".repeat(63));
         assert_eq!(normalise_authority(&ok, 80), ok);
         assert_eq!(normalise_authority(&"a".repeat(253), 80), "a".repeat(253));
@@ -191,13 +202,45 @@ mod tests {
             let mut b = AuthorityBudget::new(2);
             inputs.iter().map(|i| b.label(i)).collect::<Vec<_>>()
         };
-        assert_eq!(run(), ["b", "a", "b", "other", "other", "a", "other"]);
+        assert_eq!(run(), ["b", "a", "b", "(other)", "(other)", "a", "(other)"]);
         assert_eq!(run(), run());
     }
 
     #[test]
     fn prx_02_budget_zero_keeps_nothing() {
         let mut b = AuthorityBudget::new(0);
-        assert_eq!(b.label("a"), "other");
+        assert_eq!(b.label("a"), "(other)");
+    }
+
+    #[test]
+    fn prx_23_sentinels_are_outside_the_host_grammar() {
+        assert_eq!(INVALID_AUTHORITY, "(invalid)");
+        assert_eq!(OTHER_AUTHORITY, "(other)");
+        assert_eq!(normalise_authority("other", 80), "other");
+        assert_eq!(normalise_authority("(invalid)", 80), "(invalid)");
+        assert_eq!(normalise_authority("(other)", 80), "(invalid)");
+        assert_eq!(normalise_authority("(invalid)", 80), "(invalid)");
+    }
+
+    #[test]
+    fn prx_23_sentinels_take_no_slot_and_real_other_does() {
+        let mut b = AuthorityBudget::new(2);
+        assert_eq!(b.label("(invalid)"), "(invalid)");
+        assert_eq!(b.label("(other)"), "(other)");
+        assert_eq!(b.label("other"), "other");
+        assert_eq!(b.label("a"), "a");
+        assert_eq!(b.label("c"), "(other)");
+        assert_eq!(b.label("(invalid)"), "(invalid)");
+        assert_eq!(b.label("other"), "other");
+    }
+
+    #[test]
+    fn prx_23_target_authority_prefers_the_uri_then_host() {
+        assert_eq!(
+            target_authority(Some("a.example"), Some("b.example")),
+            Some("a.example")
+        );
+        assert_eq!(target_authority(None, Some("b.example")), Some("b.example"));
+        assert_eq!(target_authority(None, None), None);
     }
 }

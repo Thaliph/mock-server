@@ -54,6 +54,7 @@ async fn refused(addr: SocketAddr) {
 
 #[tokio::test]
 async fn prx_13_streamed_response_completes_and_new_connections_are_refused() {
+    let _logs = common::capture_logs();
     let gate = std::sync::Arc::new(tokio::sync::Notify::new());
     let dest = streaming_dest(gate.clone()).await;
     let f = fixture(Direction::Inbound, move |_| Some(dest)).await;
@@ -97,6 +98,7 @@ async fn prx_13_streamed_response_completes_and_new_connections_are_refused() {
 
 #[tokio::test]
 async fn prx_13_idle_http1_connection_is_closed() {
+    let _logs = common::capture_logs();
     let dest = {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -144,6 +146,7 @@ async fn prx_13_idle_http1_connection_is_closed() {
 
 #[tokio::test]
 async fn prx_13_http2_client_receives_goaway() {
+    let _logs = common::capture_logs();
     let dest = {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -188,4 +191,127 @@ async fn prx_13_http2_client_receives_goaway() {
     tokio::time::timeout(TIMEOUT, f.shared.drained())
         .await
         .expect("no connection left");
+}
+
+// ---- PRX-20: the end of the grace closes what is still open ----
+
+/// A destination that hands each accepted socket to the test, in order.
+async fn handing_destination() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<TcpStream>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = listener.accept().await {
+            let _ = tx.send(s);
+        }
+    });
+    (addr, rx)
+}
+
+/// True when the peer closed (EOF or error) within `TIMEOUT`.
+async fn sees_closed(s: &mut TcpStream) -> bool {
+    let mut buf = [0u8; 64];
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test]
+async fn prx_20_grace_expiry_closes_tunnels_detections_and_pending_exchanges() {
+    let logs = common::capture_logs();
+    let (dest, mut accepted) = handing_destination().await;
+    let f = fixture(Direction::Outbound, move |_| Some(dest)).await;
+
+    // An opaque tunnel, carrying bytes.
+    let mut tunnel = TcpStream::connect(f.addr).await.unwrap();
+    tunnel.write_all(b"\x00\x01hello").await.unwrap();
+    let mut tunnel_dest = accepted.recv().await.unwrap();
+    let mut buf = [0u8; 7];
+    tunnel_dest.read_exact(&mut buf).await.unwrap();
+
+    // A connection still in detection.
+    let mut detecting = TcpStream::connect(f.addr).await.unwrap();
+    detecting.write_all(b"GE").await.unwrap();
+    let mut detecting_dest = accepted.recv().await.unwrap();
+
+    // An HTTP/1 exchange whose destination never answers.
+    let mut pending = TcpStream::connect(f.addr).await.unwrap();
+    pending
+        .write_all(b"GET /slow HTTP/1.1\r\nhost: svc\r\n\r\n")
+        .await
+        .unwrap();
+    let mut pending_dest = accepted.recv().await.unwrap();
+    let mut head = [0u8; 64];
+    let n = pending_dest.read(&mut head).await.unwrap();
+    assert!(head[..n].starts_with(b"GET /slow"));
+
+    let start = std::time::Instant::now();
+    f.shared.shutdown();
+    let shared = f.shared.clone();
+    let drain = tokio::spawn(async move { shared.drain(Duration::from_secs(1)).await });
+
+    // At 0.5 s the tunnel still carries bytes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tunnel.write_all(b"ping").await.unwrap();
+    let mut ping = [0u8; 4];
+    tunnel_dest.read_exact(&mut ping).await.unwrap();
+    assert_eq!(&ping, b"ping");
+    tunnel_dest.write_all(b"pong").await.unwrap();
+    tunnel.read_exact(&mut ping).await.unwrap();
+    assert_eq!(&ping, b"pong");
+
+    // After the grace, both sides of each see the connection closed.
+    assert_eq!(drain.await.unwrap(), 3);
+    assert!(
+        start.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        start.elapsed()
+    );
+    for s in [
+        &mut tunnel,
+        &mut tunnel_dest,
+        &mut detecting,
+        &mut detecting_dest,
+        &mut pending,
+        &mut pending_dest,
+    ] {
+        assert!(sees_closed(s).await);
+    }
+
+    let lines = logs.access_exactly(3).await;
+    for line in &lines {
+        assert_eq!(line["result"], "shutdown", "{line}");
+    }
+    let warns: Vec<_> = logs
+        .text()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["message"] == "grace period over")
+        .collect();
+    assert_eq!(warns.len(), 1, "{}", logs.text());
+    assert_eq!(warns[0]["level"], "WARN");
+    assert_eq!(warns[0]["connections"], 3);
+}
+
+#[tokio::test]
+async fn prx_20_drain_returns_zero_when_everything_ended_in_time() {
+    let _logs = common::capture_logs();
+    let echo = common::echo_server().await;
+    let f = fixture(Direction::Outbound, move |_| Some(echo)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"\x00\x01hi").await.unwrap();
+    let mut buf = [0u8; 4];
+    c.read_exact(&mut buf).await.unwrap();
+    f.shared.shutdown();
+    let shared = f.shared.clone();
+    let drain = tokio::spawn(async move { shared.drain(Duration::from_secs(2)).await });
+    drop(c);
+    assert_eq!(drain.await.unwrap(), 0);
 }

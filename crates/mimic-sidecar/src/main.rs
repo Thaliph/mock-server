@@ -90,12 +90,11 @@ async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std:
 
     let listener = admin::bind(config.admin_addr).await?;
     let grace = config.shutdown_grace;
-    // Responses in flight get the grace period too, in parallel with the admin drain.
+    // Responses in flight get the grace period too, in parallel with the admin drain; the
+    // connections left at its end are closed.
     let drain = async {
         shutdown.clone().wait().await;
-        if tokio::time::timeout(grace, shared.drained()).await.is_err() {
-            tracing::warn!("grace period over, closing remaining proxied connections");
-        }
+        shared.drain(grace).await;
     };
     let (served, ()) = tokio::join!(
         admin::serve_until(
