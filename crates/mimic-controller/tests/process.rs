@@ -395,6 +395,19 @@ fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
                 state.config_version += 1;
                 (200, config_json(&state))
             }
+            ("GET", CONFIGS_PATH)
+                if !query.contains("fieldSelector=metadata.name%3Dmimic-injector") =>
+            {
+                // RBAC only allows list and watch by resourceNames (spec §11).
+                state
+                    .unknown
+                    .push(format!("unscoped list or watch: {query}"));
+                (
+                    403,
+                    serde_json::json!({"apiVersion": "v1", "kind": "Status",
+                    "status": "Failure", "reason": "Forbidden", "code": 403, "message": "no"}),
+                )
+            }
             ("GET", CONFIGS_PATH) => {
                 if query.contains("watch=true") {
                     drop(state);
