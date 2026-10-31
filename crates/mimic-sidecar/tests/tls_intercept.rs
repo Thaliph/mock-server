@@ -30,6 +30,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
 };
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
@@ -96,12 +97,30 @@ struct Destination {
     sni: Arc<Mutex<Vec<Option<String>>>>,
     /// Request bytes read (HTTP/1) per connection.
     requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// TCP connections accepted, handshake or not.
+    accepts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether each completed handshake carried a client certificate.
+    client_certs: Arc<Mutex<Vec<bool>>>,
+    /// How each HTTP/1 connection ended after its request: `Ok` for an end of stream.
+    closes: Arc<Mutex<Vec<Result<(), io::ErrorKind>>>>,
+    /// The destination's CA, for clients that trust it.
+    ca_der: CertificateDer<'static>,
 }
 
 /// A TLS destination for `api.test` / 127.0.0.1 speaking `alpn`; HTTP/1 connections answer
 /// `RESPONSE` once the request head and then the client's end of stream were read, h2
 /// connections answer `GET <path>`.
 async fn destination(alpn: &[&[u8]]) -> Destination {
+    destination_with(alpn, true, None).await
+}
+
+/// `trusted`: its CA is in the image trust store; `client_ca`: client certificates signed by
+/// it are requested (not required).
+async fn destination_with(
+    alpn: &[&[u8]],
+    trusted: bool,
+    client_ca: Option<&CertificateDer<'static>>,
+) -> Destination {
     let (ca, ca_der) = authority("destination ca");
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::default();
@@ -110,10 +129,22 @@ async fn destination(alpn: &[&[u8]]) -> Destination {
         SanType::IpAddress("127.0.0.1".parse().unwrap()),
     ];
     let cert = params.signed_by(&key, &ca).unwrap();
-    let mut config = ServerConfig::builder_with_provider(provider())
+    let builder = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
+        .unwrap();
+    let builder = match client_ca {
+        None => builder.with_no_client_auth(),
+        Some(der) => {
+            let mut roots = RootCertStore::empty();
+            roots.add(der.clone()).unwrap();
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
+                .allow_unauthenticated()
+                .build()
+                .unwrap();
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+    let mut config = builder
         .with_single_cert(
             vec![cert.der().clone()],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
@@ -125,13 +156,24 @@ async fn destination(alpn: &[&[u8]]) -> Destination {
     let addr = listener.local_addr().unwrap();
     let sni: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
     let requests: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
-    let (seen, read) = (sni.clone(), requests.clone());
+    let accepts: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
+    let client_certs: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let closes: Arc<Mutex<Vec<Result<(), io::ErrorKind>>>> = Arc::default();
+    let (seen, read, count, certs, ended) = (
+        sni.clone(),
+        requests.clone(),
+        accepts.clone(),
+        client_certs.clone(),
+        closes.clone(),
+    );
     tokio::spawn(async move {
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (acceptor, seen, read) = (acceptor.clone(), seen.clone(), read.clone());
+            let (certs, ended) = (certs.clone(), ended.clone());
             tokio::spawn(async move {
                 let Ok(mut tls) = acceptor.accept(tcp).await else {
                     return;
@@ -139,6 +181,10 @@ async fn destination(alpn: &[&[u8]]) -> Destination {
                 seen.lock()
                     .unwrap()
                     .push(tls.get_ref().1.server_name().map(str::to_string));
+                certs
+                    .lock()
+                    .unwrap()
+                    .push(tls.get_ref().1.peer_certificates().is_some());
                 if tls.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
                     let service = service_fn(|req: Request<hyper::body::Incoming>| async move {
                         let body = format!("{} {}", req.method(), req.uri().path());
@@ -157,13 +203,27 @@ async fn destination(alpn: &[&[u8]]) -> Destination {
                         _ => return,
                     }
                 }
+                if got.windows(7).any(|w| w == b"X-Mode:") {
+                    if got.windows(4).any(|w| w == b"hang") {
+                        std::future::pending::<()>().await;
+                    }
+                    if got.windows(5).any(|w| w == b"reset") {
+                        let (tcp, _) = tls.into_inner();
+                        let _ = tcp.set_linger(Some(Duration::ZERO));
+                        return;
+                    }
+                }
                 // A request that asks for it is answered only once the client's close_notify
                 // + FIN, which comes after the request, was read.
                 if !got.windows(8).any(|w| w == b"wait-eof") {
                     let _ = tls.write_all(RESPONSE).await;
                 }
                 let mut rest = Vec::new();
-                let _ = tls.read_to_end(&mut rest).await;
+                let closed = tls.read_to_end(&mut rest).await;
+                ended
+                    .lock()
+                    .unwrap()
+                    .push(closed.map(|_| ()).map_err(|e| e.kind()));
                 got.extend_from_slice(&rest);
                 read.lock().unwrap().push(got.clone());
                 if got.windows(8).any(|w| w == b"wait-eof") {
@@ -175,12 +235,18 @@ async fn destination(alpn: &[&[u8]]) -> Destination {
     });
     let trust = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(trust.path().join("trust/0")).unwrap();
-    std::fs::write(trust.path().join("trust/0/image-ca.pem"), pem(&ca_der)).unwrap();
+    if trusted {
+        std::fs::write(trust.path().join("trust/0/image-ca.pem"), pem(&ca_der)).unwrap();
+    }
     Destination {
         addr,
         trust,
         sni,
         requests,
+        accepts,
+        client_certs,
+        closes,
+        ca_der,
     }
 }
 
@@ -191,9 +257,19 @@ fn provider() -> Arc<tokio_rustls::rustls::crypto::CryptoProvider> {
 struct Sidecar {
     addr: SocketAddr,
     metrics: Arc<Metrics>,
+    shared: Arc<Shared>,
 }
 
 async fn sidecar(dest: &Destination, ca: Option<Arc<CaState>>, exclusions: &str) -> Sidecar {
+    sidecar_in(dest, ca, exclusions, Direction::Outbound).await
+}
+
+async fn sidecar_in(
+    dest: &Destination,
+    ca: Option<Arc<CaState>>,
+    exclusions: &str,
+    direction: Direction,
+) -> Sidecar {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
@@ -214,10 +290,11 @@ async fn sidecar(dest: &Destination, ca: Option<Arc<CaState>>, exclusions: &str)
             .with_proxy_metrics(proxy)
             .with_tls(interception),
     );
-    spawn_listener(listener, Direction::Outbound, shared);
+    spawn_listener(listener, direction, shared.clone());
     Sidecar {
         addr,
         metrics: Arc::new(metrics),
+        shared,
     }
 }
 
@@ -466,5 +543,254 @@ async fn tls_23_connections_are_counted_under_their_decision() {
         &none.metrics,
         "mimic_tls_connections_total{interception=\"no_ca\"} 1",
     )
+    .await;
+}
+
+async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
+    for _ in 0..150 {
+        if ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("never: {what}");
+}
+
+fn warns(logs: &common::Logs) -> usize {
+    logs.text().matches("tls passthrough").count()
+}
+
+/// The client trusts the destination's CA only: what it sees through a pass-through.
+async fn own_view(
+    sidecar: &Sidecar,
+    dest: &Destination,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let mut tls = connect(sidecar, &dest.ca_der, api(), &[]).await.unwrap();
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    let chain = tls.get_ref().1.peer_certificates().unwrap().to_vec();
+    let (_, leaf) = X509Certificate::from_der(chain[0].as_ref()).unwrap();
+    assert!(!leaf.issuer().to_string().contains("mimic"));
+    tls
+}
+
+#[tokio::test]
+async fn tls_18_an_unverifiable_destination_is_passed_through_and_remembered() {
+    let logs = common::capture_logs();
+    let dest = destination_with(&[], false, None).await;
+    let (ca, _root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    let one = own_view(&sidecar, &dest).await;
+    // The destination got the client's ClientHello byte for byte: its handshake is the
+    // client's own, with the client's SNI.
+    assert_eq!(
+        *dest.sni.lock().unwrap(),
+        vec![Some("api.test".to_string())]
+    );
+    let two = own_view(&sidecar, &dest).await;
+    drop((one, two));
+    // Sidecar attempt + replay for the first connection, replay only for the second.
+    assert_eq!(dest.accepts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(warns(&logs), 1, "{}", logs.text());
+    common::counted(
+        &sidecar.metrics,
+        "mimic_tls_connections_total{interception=\"upstream_untrusted\"} 2",
+    )
+    .await;
+    common::counted(&sidecar.metrics, "mimic_tls_passthrough_destinations 1").await;
+    eventually("two connection lines", || {
+        logs.access()
+            .iter()
+            .filter(|l| l["interception"] == "upstream_untrusted" && l["protocol"] == "tls")
+            .count()
+            == 2
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn tls_18_a_destination_that_resets_during_the_handshake_resets_the_client() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Read the ClientHello, then reset.
+            let mut tcp = tcp;
+            let mut buf = [0u8; 4096];
+            let _ = tcp.read(&mut buf).await;
+            let _ = tcp.set_linger(Some(Duration::ZERO));
+        }
+    });
+    let mut dest = destination(&[]).await;
+    dest.addr = addr;
+    let (ca, root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    for _ in 0..2 {
+        let started = std::time::Instant::now();
+        assert!(connect(&sidecar, &root, api(), &[]).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    // Not remembered: the sidecar tried again.
+    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        sidecar
+            .metrics
+            .encode()
+            .contains("mimic_tls_passthrough_destinations 0")
+    );
+}
+
+#[tokio::test]
+async fn tls_19_a_destination_asking_for_a_client_certificate_gets_the_clients() {
+    let logs = common::capture_logs();
+    let (client_ca, client_ca_der) = authority("client ca");
+    let dest = destination_with(&[], true, Some(&client_ca_der)).await;
+    let (ca, _root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::default()
+        .signed_by(&key, &client_ca)
+        .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(dest.ca_der.clone()).unwrap();
+    let config = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .unwrap();
+    let tcp = TcpStream::connect(sidecar.addr).await.unwrap();
+    let mut tls = TlsConnector::from(Arc::new(config))
+        .connect(api(), tcp)
+        .await
+        .unwrap();
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    // The destination saw the client's certificate on the connection that completed.
+    assert!(dest.client_certs.lock().unwrap().contains(&true));
+    common::counted(
+        &sidecar.metrics,
+        "mimic_tls_connections_total{interception=\"client_cert_requested\"} 1",
+    )
+    .await;
+    common::counted(&sidecar.metrics, "mimic_tls_passthrough_destinations 1").await;
+    assert_eq!(warns(&logs), 1);
+}
+
+#[tokio::test]
+async fn tls_20_a_client_that_rejects_the_mimic_leaf_gets_the_destination_next_time() {
+    let logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, _root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    // Trusts the destination's CA, not the mimic root.
+    assert!(connect(&sidecar, &dest.ca_der, api(), &[]).await.is_err());
+    eventually("remembered", || warns(&logs) == 1).await;
+    let tls = own_view(&sidecar, &dest).await;
+    drop(tls);
+    assert_eq!(warns(&logs), 1);
+    assert!(logs.text().contains("client_rejected"));
+    common::counted(
+        &sidecar.metrics,
+        "mimic_tls_connections_total{interception=\"client_rejected\"} 2",
+    )
+    .await;
+    common::counted(&sidecar.metrics, "mimic_tls_passthrough_destinations 1").await;
+}
+
+#[tokio::test]
+async fn tls_21_excluded_unsupported_and_inbound_connections_are_not_intercepted() {
+    let logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca.clone()), "*.excluded.test").await;
+    let excluded = ServerName::try_from("a.excluded.test").unwrap();
+    let _ = connect(&sidecar, &root, excluded, &[]).await;
+    // Without any handshake from the sidecar: the destination only saw the client's.
+    assert_eq!(dest.accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // ALPN `imap` only: unsupported, and not remembered.
+    for _ in 0..2 {
+        let _ = connect(&sidecar, &root, api(), &[b"imap"]).await;
+    }
+    common::counted(
+        &sidecar.metrics,
+        "mimic_tls_connections_total{interception=\"unsupported\"} 2",
+    )
+    .await;
+    common::counted(&sidecar.metrics, "mimic_tls_passthrough_destinations 0").await;
+    assert_eq!(warns(&logs), 0);
+    // Intercepted still.
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    // Inbound: never intercepted, no `interception` on its line.
+    let inbound = sidecar_in(&dest, Some(ca), "", Direction::Inbound).await;
+    let _ = connect(&inbound, &root, api(), &[]).await;
+    eventually("inbound line", || {
+        logs.access()
+            .iter()
+            .any(|l| l["direction"] == "inbound" && l["protocol"] == "tls")
+    })
+    .await;
+    let lines = logs.access();
+    let line = lines.iter().find(|l| l["direction"] == "inbound").unwrap();
+    assert!(line.get("interception").is_none());
+}
+
+#[tokio::test]
+async fn tls_22_a_client_reset_reaches_the_destination_and_the_reverse() {
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    let (tcp, _) = tls.into_inner();
+    tcp.set_linger(Some(Duration::ZERO)).unwrap();
+    drop(tcp);
+    eventually("reset reaches the destination", || {
+        matches!(dest.closes.lock().unwrap().first(), Some(Err(_)))
+    })
+    .await;
+    // The destination resets its side: the client sees a reset within 1 s.
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    tls.write_all(b"GET /r HTTP/1.1\r\nHost: api.test\r\nX-Mode: reset\r\n\r\n")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut out = Vec::new();
+    let read = tokio::time::timeout(TIMEOUT, tls.read_to_end(&mut out)).await;
+    assert!(matches!(read, Ok(Err(_))), "{read:?}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn tls_22_an_open_exchange_at_the_end_of_the_grace_is_written_as_shutdown() {
+    let logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    tls.write_all(b"GET /h HTTP/1.1\r\nHost: api.test\r\nX-Mode: hang\r\n\r\n")
+        .await
+        .unwrap();
+    eventually("request reached the destination", || {
+        !dest.sni.lock().unwrap().is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    sidecar.shared.shutdown();
+    let closed = sidecar.shared.drain(Duration::from_millis(200)).await;
+    assert_eq!(closed, 1);
+    eventually("shutdown line", || {
+        logs.access()
+            .iter()
+            .any(|l| l["result"] == "shutdown" && l["tls"] == true)
+    })
     .await;
 }
