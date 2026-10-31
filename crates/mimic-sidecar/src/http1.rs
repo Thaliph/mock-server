@@ -11,7 +11,7 @@ use std::io;
 use std::net::Shutdown;
 use std::pin::pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use mimic_core::proxy::http1::{Codec, Event};
 use socket2::SockRef;
@@ -51,6 +51,8 @@ struct Relay<F> {
     state: Mutex<State<F>>,
     /// A response completed, or the codec went silent: the client pump may use more bytes.
     unblocked: Notify,
+    /// The destination sent its FIN: a gated client pump has nowhere to forward to.
+    server_closed: AtomicBool,
     /// Which side sent its FIN first: `NONE`, `CLIENT` or `SERVER`.
     closed_first: AtomicU8,
     to_upstream: AtomicU64,
@@ -102,7 +104,13 @@ impl<F: FnMut(Event)> Relay<F> {
             }
             let used = self.with(|codec| codec.client_bytes_limited(&held));
             if used == 0 {
-                // Back-pressure: the unused bytes stay here and the socket stays unread.
+                // The destination is gone: what is held has nowhere to go (an upgrade or
+                // read-ahead gate would never open). The relay ends, both sockets close.
+                if self.server_closed.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                // Back-pressure: the unused bytes stay here and the socket stays unread. A
+                // reset of the client is still seen by the error watch in `relay`.
                 self.unblocked.notified().await;
                 continue;
             }
@@ -123,6 +131,7 @@ impl<F: FnMut(Event)> Relay<F> {
             if n == 0 {
                 self.first_to_close(SERVER);
                 self.with(|codec| ((), codec.server_eof()));
+                self.server_closed.store(true, Ordering::Release);
                 self.unblocked.notify_one();
                 return fin(client, Side::Client);
             }
@@ -180,6 +189,7 @@ pub async fn relay(
             on_event,
         }),
         unblocked: Notify::new(),
+        server_closed: AtomicBool::new(false),
         closed_first: AtomicU8::new(NONE),
         to_upstream: AtomicU64::new(0),
         to_client: AtomicU64::new(0),
