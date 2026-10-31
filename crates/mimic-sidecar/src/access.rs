@@ -16,7 +16,7 @@ pub enum Outcome {
     Ok,
     UpstreamReset,
     ClientAbort,
-    /// A `400`/`431` answered by the sidecar itself.
+    /// A `400`/`431` answered by the sidecar itself, or an HTTP/2 connection broken by the client.
     Rejected,
 }
 
@@ -44,7 +44,8 @@ pub struct Exchange {
     pub grpc_status: Option<u64>,
     pub upgrade: bool,
     pub outcome: Outcome,
-    pub duration: Duration,
+    /// `None` for an exchange rejected before any request is read.
+    pub duration: Option<Duration>,
     pub head: Option<Duration>,
     pub bytes_in: u64,
     pub bytes_out: u64,
@@ -88,7 +89,7 @@ pub fn exchange(e: &Exchange) {
         grpc_status = e.grpc_status,
         upgrade = e.upgrade,
         result = e.outcome.as_str(),
-        duration_ms = millis(e.duration),
+        duration_ms = e.duration.map(millis),
         head_ms = e.head.map(millis),
         bytes_in = e.bytes_in,
         bytes_out = e.bytes_out,

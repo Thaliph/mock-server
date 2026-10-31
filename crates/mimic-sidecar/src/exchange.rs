@@ -21,6 +21,8 @@ use crate::red::ProxyMetrics;
 /// Default port of a `Host` header on plain HTTP, removed by the authority normalisation.
 const HTTP_PORT: u16 = 80;
 
+const PROTOCOL_H2: &str = "h2";
+
 /// What the observation of a connection needs to know about it.
 #[derive(Clone)]
 pub struct Ctx {
@@ -39,6 +41,8 @@ pub(crate) struct RequestCount {
 /// The request body, counted.
 pub(crate) struct ReqBody {
     inner: Incoming,
+    /// The request carried a `content-length`: only then is the length known to hand on.
+    sized: bool,
     count: Arc<RequestCount>,
 }
 
@@ -71,7 +75,13 @@ impl Body for ReqBody {
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        // `hyper` reports an exact zero for a body-less HTTP/2 request, and its client turns
+        // that into a `content-length: 0` the client never sent.
+        if self.sized {
+            self.inner.size_hint()
+        } else {
+            SizeHint::default()
+        }
     }
 }
 
@@ -139,6 +149,7 @@ impl Tracker {
         let (parts, inner) = req.into_parts();
         let body = ReqBody {
             inner,
+            sized: parts.headers.contains_key(header::CONTENT_LENGTH),
             count: request,
         };
         (tracker, Request::from_parts(parts, body))
@@ -216,7 +227,7 @@ impl Tracker {
             grpc_status: self.grpc_status,
             upgrade: self.upgrade,
             outcome,
-            duration: self.started.elapsed(),
+            duration: Some(self.started.elapsed()),
             head: self.head,
             bytes_in,
             bytes_out,
@@ -327,7 +338,31 @@ pub(crate) fn rejected(ctx: &Ctx, protocol: &'static str, status: u16) {
         grpc_status: None,
         upgrade: false,
         outcome: Outcome::Rejected,
-        duration: Duration::ZERO,
+        duration: Some(Duration::ZERO),
+        head: None,
+        bytes_in: 0,
+        bytes_out: 0,
+    });
+}
+
+/// An HTTP/2 client connection broken at connection level (the sidecar sent `GOAWAY`): no
+/// request is known, no response head was read, so nothing is timed.
+pub(crate) fn rejected_h2(ctx: &Ctx) {
+    let authority = ctx.dst.to_string();
+    ctx.proxy
+        .request_unobserved(ctx.direction, PROTOCOL_H2, &authority);
+    access::exchange(&access::Exchange {
+        direction: ctx.direction,
+        protocol: PROTOCOL_H2,
+        dst: ctx.dst,
+        authority,
+        method: None,
+        path: None,
+        status: None,
+        grpc_status: None,
+        upgrade: false,
+        outcome: Outcome::Rejected,
+        duration: None,
         head: None,
         bytes_in: 0,
         bytes_out: 0,
