@@ -53,13 +53,14 @@ SRE, without any change to application code:
 |---|---|---|
 | `mimic-init` | first init container, exits | Installs the iptables redirection in the pod network namespace (§4). Runs as UID 0 with only `NET_ADMIN` and `NET_RAW`, own image `ghcr.io/thaliph/mimic-init`. |
 | `mimic-sidecar` | native sidecar (second init container, `restartPolicy: Always`) | Transparent proxy for inbound and outbound traffic; records, measures, mocks. UID 1337, no capability. |
-| `mimic-controller` | Deployment in `mimic-system` | Mutating webhook (injection), `MimicWorkload` reconciler, sidecar API, UI. Stateless: all state is in Valkey. |
+| `mimic-trust` | init container per app image, exits (from F3) | Runs mimic's static `mimic-trust` binary inside an app image to build that image's trust bundle plus the deployment's root CA (§5, §7.1). UID 1337, no capability, no network. |
+| `mimic-controller` | Deployment in `mimic-system` | Mutating webhook (injection), `MimicWorkload` reconciler, sidecar API (§7.2), UI. Stateless: all state is in Valkey, except the TLS seed kept in a Secret (§5). |
 | Valkey | StatefulSet in `mimic-system` | Shared store: merged endpoints and egress recordings per deployment. AOF persistence on a PVC. |
 
 Crates: `mimic-core` (pure logic: no tokio, no I/O, no clock), `mimic-runtime` (shared process
 plumbing: configuration, logs, metrics, health, shutdown), `mimic-sidecar`, `mimic-controller`,
-and from F1 `mimic-init`. `mimic-core` may depend on pure data crates (`serde`, `serde_json`,
-`k8s-openapi`).
+from F1 `mimic-init` and from F3 `mimic-trust`. `mimic-core` may depend on pure data crates
+(`serde`, `serde_json`, `k8s-openapi`, `rustls-pki-types`).
 
 ## 3. Modes
 
@@ -126,8 +127,12 @@ would see without mimic, except for the limits listed at the end of this section
   MySQL, SSH), or the client's first bytes are neither a TLS ClientHello, an HTTP/1.x request
   line nor the HTTP/2 preface, the connection is an opaque tunnel. Detection has no timeout,
   reads at most 16 KiB, and the bytes it read are forwarded unchanged.
-- **TLS** connections are passed through untouched (interception is F3); the SNI of the
-  ClientHello is read for logs and metrics.
+- **TLS**: outbound TLS is intercepted or passed through as §5 decides; inbound TLS and every
+  passed-through connection go through untouched. The SNI of the ClientHello is read for logs
+  and metrics. The decrypted stream of an intercepted connection follows the rules of this
+  section (detection, HTTP/1 codec, `h2` relay, failures, close and reset propagation,
+  shutdown) with TLS in between: a FIN becomes `close_notify` then FIN, a reset stays a TCP
+  reset on the other socket, and the bytes compared are the decrypted ones.
 - **HTTP/2 prior knowledge (`h2c`)** connections are parsed by `hyper`. Each client
   connection gets its own connection to the original destination, and every stream is
   forwarded there as received. The proxy never routes on `:authority`/`Host`, never retries,
@@ -219,15 +224,19 @@ would see without mimic, except for the limits listed at the end of this section
   | `status` | response status, absent when none | — |
   | `grpc_status` | HTTP/2 only: from the trailers, when present | — |
   | `upgrade` | `true` when the exchange became a tunnel | — |
+  | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
+  | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
   | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown` |
   | `duration_ms`, `head_ms` | until the response end; until the final (non-`1xx`) response head; both absent for `unframed` and `rejected` | `duration_ms` |
   | `bytes_in`, `bytes_out` | request / response body bytes | client → destination / destination → client |
 
   The target authority is, for HTTP/1, the authority of an absolute-form request target, else
   the `Host` header; for HTTP/2, `:authority`, else the `Host` header (RFC 9110 §7.2,
-  RFC 9113 §8.3.1). The HTTP/1 codec keeps at most 64 bytes of the method and 1024 bytes of
-  the `Host` value and of the authority of the request target (a bound on its memory), and the
-  logged `method` and `authority` are cut accordingly. Header values, cookies, query strings and bodies are never logged.
+  RFC 9113 §8.3.1); its default port is 80, or 443 on an intercepted TLS connection. The HTTP/1
+  codec keeps at most 64 bytes of the method and 1024 bytes of the `Host` value and of the
+  authority of the request target (a bound on its memory), and the logged `method` and
+  `authority` are cut accordingly. Header values, cookies, query strings and bodies are never
+  logged, decrypted or not.
 
 Accepted limits of the proxy:
 
@@ -252,7 +261,8 @@ Accepted limits of the proxy:
   answer without mimic either.
 - WebSocket over HTTP/2 (extended `CONNECT`, RFC 8441) is not advertised, so clients use
   HTTP/1.1 for it.
-- Until F3, outbound HTTPS is seen at connection level only (SNI, bytes, duration).
+- Inbound HTTPS, and outbound HTTPS that §5 passes through, are seen at connection level only
+  (SNI, bytes, duration).
 - Until F4, the path in access logs is not redacted: a secret placed in a path segment is
   logged.
 - A connection on which neither side ever sends a byte stays in detection (it costs one task
@@ -264,20 +274,96 @@ Accepted limits of the proxy:
 
 ## 5. TLS interception
 
-- Every outbound TLS connection is intercepted. The sidecar terminates TLS with a certificate
-  issued on the fly for the requested SNI, then opens its own TLS connection to the destination,
-  verified against the system trust store.
-- **One CA per deployment**, generated by the controller and stored in a Secret of
-  `mimic-system` readable only by the controller. The sidecar receives the CA key at start
-  (authenticated sidecar API) and keeps it in memory only. Leaf certificates are short-lived.
-- **The app trusts the CA without code change**: the webhook mounts a bundle (the image's own
-  system CAs + the mimic CA) and sets the usual variables: `SSL_CERT_FILE` (OpenSSL, Go),
-  `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (Python), `NODE_EXTRA_CA_CERTS` (Node.js) and a PKCS12
-  truststore through `JAVA_TOOL_OPTIONS` (JVM). Existing internal CAs keep working.
-- **Fallback**: when a client rejects the forged certificate (pinning, custom truststore), the
-  sidecar passes that destination through untouched from then on, logs a WARN once and counts it.
-- **Exclusions**: `spec.tls.exclude` on the `MimicWorkload` lists hosts never intercepted
-  (internal services, mTLS to a provider).
+Outbound TLS is intercepted so that HTTPS is seen as HTTP (§4.1): the sidecar terminates the
+app's TLS with a certificate it issues for the requested name, and opens its own TLS
+connection to the original destination. Inbound TLS is never intercepted (the sidecar has no
+key of the app) and is passed through as in §4.1. Whenever interception would change what the
+client or the destination sees, the connection is **passed through** untouched instead
+(fail-safe): mimic never vouches for a certificate it could not verify.
+
+- **Order of a connection.** On an outbound ClientHello the sidecar decides, in this order
+  (first match wins), from the ClientHello, the original destination and its own state:
+
+  | Case | Decision (`interception`) | Remembered |
+  |---|---|---|
+  | the ClientHello has an SNI that is not a valid DNS name (at most 253 bytes, labels of 1 to 63 letters, digits, `-` or `_`, not starting or ending with `-`) | `unsupported` | no |
+  | SNI (or, without SNI, the destination IP) matches `MIMIC_TLS_EXCLUDE` | `excluded` | — |
+  | destination remembered as passed through | the remembered reason | — |
+  | the sidecar has no valid intermediate CA (below) | `no_ca` | no |
+  | the ClientHello offers no TLS 1.2 or 1.3, or offers ALPN protocols none of which is `h2` or `http/1.1` | `unsupported` | no |
+  | the sidecar's own handshake with the destination fails at TLS level: certificate not verified (unknown issuer, expired, wrong name), alert, no common version or cipher | `upstream_untrusted` | yes |
+  | the destination asks for a client certificate (`CertificateRequest`) | `client_cert_requested` | yes |
+  | the client aborts its handshake after receiving the sidecar's certificate (alert, close or reset), or the handshake with the client fails | `client_rejected` | yes |
+  | otherwise | `intercepted` | — |
+
+  The sidecar handshakes with the destination **before** answering the client: it offers the
+  client's SNI and the client's ALPN list restricted to `h2` and `http/1.1` (client order),
+  verifies the destination's chain against its upstream roots (below) and the SNI (the
+  destination IP when there is no SNI), then completes the client's handshake with the ALPN
+  the destination chose (none if it chose none). The decrypted client stream then goes through
+  the same detection and the same relays as cleartext (§4.1): HTTP/1 through the byte-exact
+  `http1` codec, HTTP/2 through the `h2` relay, anything else as an opaque decrypted tunnel.
+- **Pass-through** means what §4.1 does for TLS today: a new TCP connection to the original
+  destination receives the client's bytes unchanged, from the original ClientHello on, and the
+  client sees the destination's own certificate. For `upstream_untrusted` and
+  `client_cert_requested` the connection being handled is passed through at once (the
+  sidecar's own TCP connection to the destination is closed); for `client_rejected` the
+  connection being handled is lost (the client gave up on it) and the next one passes through.
+  An I/O failure (reset, close) of the destination during the sidecar's handshake reaches the
+  client as that reset or close, and nothing is remembered.
+- **Remembered destinations**: key = (SNI, else destination IP; destination port), kept in
+  memory for the life of the process, at most 4096 (the oldest is forgotten first). The first
+  time a destination is remembered the sidecar logs one WARN `tls passthrough` (`target`
+  `tls`, fields `sni`, `dst`, `reason`).
+- **CA hierarchy and custody.**
+  - The controller keeps one random 32-byte **seed** in the Secret `<release>-tls-ca` of its
+    namespace (created empty by the chart, filled by the controller at first start, deleted by
+    `helm uninstall`). The seed never leaves the controller, which re-reads the Secret every
+    60 s; concurrent replicas converge on one seed (optimistic concurrency).
+  - Each deployment has its own **root CA**, derived from the seed (HKDF-SHA256 over
+    `<namespace>/<deployment>`, ECDSA P-256), subject `CN=mimic <namespace>/<deployment>`,
+    `O=mimic`, valid from the seed's creation time minus 1 h for 10 years. Its key is computed
+    in the controller's memory when needed and never stored or sent. The root certificate is
+    public: the webhook writes it into the pod spec (§7.1).
+  - Each sidecar generates an **intermediate CA key** (ECDSA P-256) in memory at start and
+    asks the controller to certify it (`POST /v1/tls/intermediate` on the sidecar API, §7.2).
+    The intermediate (`CA:true`, `pathLen:0`, key usage `keyCertSign`) is valid from 1 h
+    before issuance for 25 h; the sidecar renews it when less than half of its validity
+    remains, retrying failures with a backoff from 1 s doubling to 60 s. It accepts an
+    intermediate only if it chains to the root given in `MIMIC_TLS_CA`; otherwise it logs an
+    ERROR `tls ca mismatch` and does not intercept.
+  - **Leaf certificates** are issued in memory by the sidecar for the client's SNI (DNS SAN),
+    or for the destination IP (IP SAN) when the ClientHello has no SNI, with one leaf key per
+    process, the intermediate's validity window, and the intermediate in the chain. They are
+    cached per name (at most 4096, oldest first) until the intermediate changes.
+  - Without a valid intermediate (none yet, expired, mismatch) every outbound TLS connection
+    is passed through (`no_ca`). The sidecar's readiness does not depend on the controller.
+  - No key, seed or token is ever logged, written to disk, sent to Valkey or exposed on an
+    endpoint. The sidecar disables core dumps (`RLIMIT_CORE` 0) and makes itself non-dumpable
+    (`PR_SET_DUMPABLE` 0) before it generates a key.
+- **Upstream roots** (what the sidecar verifies destinations against): the system store of the
+  mimic image, plus every `image-ca.pem` written by `mimic-trust` for the pod's app images
+  (§7.1), loaded at the first interception; the mimic roots are never in them. A destination
+  whose certificate the app's own images trust is therefore verified, and a destination signed
+  by a CA that mimic does not know is passed through, so that the app judges it itself.
+- **The app trusts its deployment's root without code change**: `mimic-trust` (§7.1) builds,
+  for each app image, a bundle of that image's own trust store plus the root, and the webhook
+  points the usual variables at it: `SSL_CERT_FILE` (OpenSSL, Go, Ruby, .NET),
+  `REQUESTS_CA_BUNDLE` (Python `requests`), `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` (Node.js)
+  and a PKCS12 truststore through `JAVA_TOOL_OPTIONS` (JVM). Internal CAs installed in the
+  image keep working, for the app and for the sidecar's upstream verification.
+- **Exclusions**: `spec.tls.exclude` on the `MimicWorkload` lists names never intercepted
+  (internal services, mTLS to a provider): an exact host (`api.example.com`), a suffix pattern
+  `*.example.com` (any name below `example.com`, not `example.com` itself) or an IP literal
+  (matched against the destination IP of a ClientHello without SNI). Entries are compared
+  after the authority normalisation of §4.1 (case, trailing dot); at most 256 entries. The
+  webhook gives the sidecar the sorted, deduplicated union of the lists of every
+  `MimicWorkload` naming the deployment, in `MIMIC_TLS_EXCLUDE`; a change applies to pods
+  created afterwards (`kubectl rollout restart`), like the injection itself.
+- **Mock mode (F10)**: the sidecar answers intercepted connections without connecting to the
+  destination (it issues the leaf for the SNI and picks `h2` when offered, else `http/1.1`),
+  and a connection that the table above would pass through is closed instead, without any
+  byte towards the destination (the real destination is never called, §3).
 
 ## 6. Discovery
 
@@ -297,7 +383,8 @@ Accepted limits of the proxy:
 
 - `MimicWorkload` (namespaced CRD, `mimic.platform.io/v1alpha1`): selects the deployment named
   by `spec.deployment` (required, DNS-1123 name, immutable) in its namespace, holds
-  `spec.mode` (`discovery` | `mock`, default `discovery`), `spec.tls.exclude`, latency settings; `status` reports pods, mode convergence and
+  `spec.mode` (`discovery` | `mock`, default `discovery`), `spec.tls.exclude` (F3, §5),
+  latency settings; `status` reports pods, mode convergence and
   counts. F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
   with their feature. When several `MimicWorkload`s name the same deployment, any of them
   selects it for injection; which one sets the mode is decided in F10.
@@ -334,18 +421,61 @@ Accepted limits of the proxy:
 - **Skipped** pods are admitted unchanged except for the annotation
   `mimic.platform.io/skipped: <reason>`: `host-network`, `unsupported-owner`, `port-conflict`
   (an app container declares port 15001, 15006 or 15100), `uid-conflict` (an app container or
-  the pod sets `runAsUser: 1337`), `name-conflict` (an app container is named `mimic-init` or
-  `mimic-sidecar`, or an init container is named `mimic-init` in a pod without a
-  `mimic-sidecar` init container). `unsupported-owner` applies only when injection was asked by
+  the pod sets `runAsUser: 1337`), `name-conflict` (an app container is named `mimic-init`,
+  `mimic-sidecar` or `mimic-trust-<n>`, or an init container is named `mimic-init` in a pod
+  without a `mimic-sidecar` init container, or the pod has a volume named `mimic-trust` or
+  `mimic-token`, or an app container already mounts something at `/etc/mimic/tls`). `unsupported-owner` applies only when injection was asked by
   an `enabled` label (pod or namespace); in a `selected` namespace, an unlabelled pod not owned
   by a Deployment is not selected and stays untouched, without annotation. A pod that already has a `mimic-sidecar` init container is
   admitted unchanged (idempotent, `reinvocationPolicy: IfNeeded`).
 - **Injected** pods get, in front of their own init containers: `mimic-init`, then
-  `mimic-sidecar` (`restartPolicy: Always`, startup and liveness probes on its admin port), and
-  the annotation `mimic.platform.io/injected: <version>`. Neither container mounts a service
-  account token or any app volume. In the app's containers, only the `httpGet` probes are
-  changed (§4); nothing else is modified. Every literal `env` value the patch writes has each
-  `$` doubled, so the kubelet's `$(VAR)` expansion gives the container the value unchanged.
+  `mimic-sidecar` (`restartPolicy: Always`, startup and liveness probes on its admin port), then
+  one `mimic-trust-<n>` per distinct app image (from F3), and the annotation
+  `mimic.platform.io/injected: <version>`. No mimic container mounts an app volume or the
+  pod's API service account token. Every literal `env` value the patch writes has each `$`
+  doubled, so the kubelet's `$(VAR)` expansion gives the container the value unchanged.
+- **TLS trust wiring** (F3, §5). The patch adds two volumes: `mimic-trust` (`emptyDir`,
+  `sizeLimit: 16Mi`) and `mimic-token` (projected service account token of the pod's own
+  service account, `audience: mimic.platform.io`, `expirationSeconds: 3600`, path `token`;
+  the API server rejects that audience, so the token is only good for the sidecar API).
+  - `mimic-sidecar` mounts `mimic-trust` at `/mimic` (read-write) and `mimic-token` at
+    `/var/run/secrets/mimic.platform.io` (read-only), and gets `MIMIC_TLS_CA` (the
+    deployment's root certificate, PEM), `MIMIC_TLS_EXCLUDE` (§5), `MIMIC_CONTROLLER_URL`
+    (`https://<webhook service>.<namespace>.svc:<sidecar API port>`) and `MIMIC_CONTROLLER_CA`
+    (the webhook CA, PEM). Before it is ready it copies the static `mimic-trust` binary to
+    `/mimic/bin/mimic-trust` and its image's system store to `/mimic/bin/fallback-ca.pem`.
+  - `mimic-trust-<n>` (n = 0, 1, … in order of first appearance of the image among the init
+    then regular app containers) runs that image with its `imagePullPolicy`,
+    `command: [/mimic/bin/mimic-trust]`, UID/GID 1337, `runAsNonRoot`, read-only root,
+    no capability, no privilege escalation, `RuntimeDefault`, requests `10m`/`16Mi`, limit
+    `64Mi`, `mimic-trust` mounted at `/mimic`, and `MIMIC_TRUST_CA` (root PEM),
+    `MIMIC_TRUST_OUT=/mimic/trust/<n>`, `MIMIC_LOG`. It runs mimic's binary, never the image's
+    entrypoint, and opens no socket.
+  - Every app container and app init container mounts `mimic-trust` with
+    `subPath: trust/<n>` of its image at `/etc/mimic/tls` (read-only) and gets, unless its
+    `env` already defines the variable: `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+    `CURL_CA_BUNDLE` = `/etc/mimic/tls/ca-bundle.pem`; `NODE_EXTRA_CA_CERTS` =
+    `/etc/mimic/tls/node-extra-ca.pem`; `JAVA_TOOL_OPTIONS` =
+    `-Djavax.net.ssl.trustStore=/etc/mimic/tls/truststore.p12 -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=mimic`.
+    A `JAVA_TOOL_OPTIONS` with a literal `value` gets those options prepended (the app's own
+    options come later and win); a variable defined with `valueFrom` is left untouched.
+    Besides these mounts and variables, only the `httpGet` probes of the app containers are
+    changed (§4).
+  - `mimic-trust` writes into `MIMIC_TRUST_OUT` (files `0644`): `image-ca.pem` (the image's
+    store: the first existing of `/etc/ssl/certs/ca-certificates.crt`,
+    `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`,
+    `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`, plus the files named by the image's
+    own `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`; when none exists, the
+    fallback store with a WARN `no image trust store`), `mimic-ca.pem` (the root),
+    `ca-bundle.pem` (`image-ca.pem` then the root), `node-extra-ca.pem` (the file named by the
+    image's own `NODE_EXTRA_CA_CERTS`, if any, then the root) and `truststore.p12` (every
+    certificate of `ca-bundle.pem` as a trusted entry, password `mimic`). Certificates are
+    deduplicated, in first-seen order; unparsable blocks are skipped and counted. It logs one
+    INFO `trust bundle written` (sources, counts) and exits 0, 1 when it cannot write, 2 on an
+    invalid variable.
+- The webhook computes the deployment's root certificate from the TLS seed (§5); while the
+  seed is not loaded the controller is unready and an admission that needs it is answered
+  `allowed: false`.
 - The webhook uses `failurePolicy: Fail`: while the controller is unavailable, pod creation in
   the selected scope fails (fail-closed, consistent with mock mode never calling the real
   destination). Pods outside the scope are never sent to the webhook.
@@ -374,6 +504,31 @@ Accepted limits of the proxy:
   mimicworkloads.mimic.platform.io`). A later install with the same release name and namespace
   adopts the kept CRD.
 
+### 7.2 Sidecar API
+
+- HTTPS on `MIMIC_SIDECAR_API_ADDR` (port 8444) with the webhook serving certificate (SAN
+  `<service>.<namespace>.svc`), same connection cap and timeouts as the webhook listener
+  (§7.1) with its own budget. Sidecars verify it against `MIMIC_CONTROLLER_CA`.
+- **Authentication**: `Authorization: Bearer <token>`, the projected token of §7.1, which the
+  sidecar re-reads from its file for every request. The controller validates it with a
+  `TokenReview` (audience `mimic.platform.io`) and takes the namespace from the service
+  account user name and the pod name from the bound-pod claim
+  (`authentication.kubernetes.io/pod-name`). A request names its deployment; the controller
+  accepts it only if the pod name is one the ReplicaSet of that deployment can generate:
+  `<deployment>-<pod-template-hash>-<5 chars>`, the part before the 5 chars truncated to 58
+  characters, the hash made of the characters `bcdfghjklmnpqrstvwxz2456789`. No pod or
+  ReplicaSet is read. F5 extends this API with the same authentication.
+- `POST /v1/tls/intermediate`, body `{"deployment": "<name>", "public_key": "<base64 DER
+  SubjectPublicKeyInfo, P-256>"}` (at most 64 KiB) → `200` `{"certificate": "<PEM>"}`, the
+  intermediate of §5 for that key signed by the deployment's root. `401` when the token is
+  missing, invalid, expired or for another audience; `403` when the pod name does not match
+  the deployment or has no bound-pod claim; `400` for a malformed body or key; `413` over the
+  limit; `405` for another method; `503` when the seed is not loaded or the `TokenReview`
+  fails.
+- One log line per request (`target` = `sidecar_api`): `endpoint`, `namespace`, `pod`,
+  `deployment`, `result` (`ok`, `unauthenticated`, `forbidden`, `invalid`, `unavailable`);
+  never the token or the key. Metric `mimic_sidecar_api_requests_total{endpoint,result}`.
+
 ## 8. Mock
 
 - Matching, first hit wins: (1) exact: method, authority, path, query, normalised body;
@@ -401,6 +556,16 @@ Accepted limits of the proxy:
   | `mimic_proxy_bytes_total` | counter | `direction`, `protocol`, `flow` (`to_upstream`, `to_client`) |
   | `mimic_tcp_connections_total` | counter (F1) | `direction`, `result` (`ok`, `connect_error`, `loop`, `no_original_dst`) |
   | `mimic_accept_errors_total` | counter | `direction` |
+  | `mimic_tls_connections_total` | counter, outbound TLS connections by §5 decision | `interception` (`intercepted`, `excluded`, `no_ca`, `unsupported`, `upstream_untrusted`, `client_cert_requested`, `client_rejected`) |
+  | `mimic_tls_passthrough_destinations` | gauge, remembered destinations (§5) | — |
+  | `mimic_tls_intermediate_expiry_timestamp_seconds` | gauge, `notAfter` of the current intermediate, 0 when none | — |
+  | `mimic_tls_intermediate_requests_total` | counter | `result` (`ok`, `error`, `mismatch`) |
+
+  An intercepted connection is counted in `mimic_proxy_connections_total` and
+  `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
+  opaque decrypted tunnel), with the SNI as `authority` when present; a passed-through one
+  under `tls` as before. The controller exposes `mimic_sidecar_api_requests_total` (§7.2) and
+  `mimic_tls_seed_loaded` (gauge, 1 once the seed is loaded).
 
   `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
   port removed, `(invalid)` when it is not a host name or IP literal; an HTTP/1 `Host` value or
@@ -422,6 +587,7 @@ Accepted limits of the proxy:
   `SIGTERM`, and bind their ports from configuration.
 - One image `ghcr.io/thaliph/mimic` (distroless, non-root UID 65532, no shell) holds
   `mimic-sidecar` and `mimic-controller` (the webhook runs the sidecar as UID 1337).
+  From F3 the `mimic` image also holds the static `mimic-trust` binary (§7.1).
   `ghcr.io/thaliph/mimic-init` (distroless, no shell) holds only `mimic-init`, `iptables-restore`
   and `ip6tables-restore` (nft backend) and their libraries.
 - `mimic-init` has no admin listener (it exits): FND-02 and FND-03 do not apply to it.
@@ -454,6 +620,8 @@ Accepted limits of the proxy:
 | `MIMIC_INJECT_INIT_IMAGE` | required | Image of `mimic-init` in injected pods. |
 | `MIMIC_INJECT_SIDECAR_RESOURCES` | `{"requests":{"cpu":"50m","memory":"64Mi"},"limits":{"memory":"128Mi"}}` | Sidecar `resources`, JSON. |
 | `MIMIC_INJECT_SIDECAR_LOG` | `info` | `MIMIC_LOG` given to injected sidecars. |
+| `MIMIC_TLS_CA_SECRET` | required | Secret of the controller's namespace holding the TLS seed (§5). |
+| `MIMIC_SIDECAR_API_ADDR` | `0.0.0.0:8444` | Sidecar API HTTPS listener (§7.2); its port is also the one given to sidecars in `MIMIC_CONTROLLER_URL`. |
 
 ### 10.3 Sidecar variables
 
@@ -467,6 +635,12 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_POD_NAMESPACE`, `MIMIC_POD_NAME`, `MIMIC_POD_IP` | required | Downward API. |
 | `MIMIC_APP_PROBES` | `{}` | Original `httpGet` probes, JSON object keyed by `<container>/<livez\|readyz\|startupz>`. |
 | `MIMIC_METRICS_MAX_AUTHORITIES` | `50` | Distinct `authority` label values kept per direction and metric (§9), 1–10000. Not set by the webhook in F2. |
+| `MIMIC_TLS_CA` | empty | Deployment root certificate (PEM). Empty: no interception, every outbound TLS connection is passed through (`no_ca`), with one INFO line at start. |
+| `MIMIC_TLS_EXCLUDE` | empty | Comma-separated exclusions (§5); an invalid entry or more than 256 exits with code 2. |
+| `MIMIC_CONTROLLER_URL` | required when `MIMIC_TLS_CA` is set | Sidecar API base URL (`https://…`). |
+| `MIMIC_CONTROLLER_CA` | required when `MIMIC_TLS_CA` is set | CA (PEM) the sidecar API certificate is verified against. |
+| `MIMIC_TLS_TOKEN_FILE` | `/var/run/secrets/mimic.platform.io/token` | Projected token, re-read for every sidecar API request. |
+| `MIMIC_TRUST_DIR` | `/mimic` | `mimic-trust` volume: binary and fallback store written at start, `trust/*/image-ca.pem` read as upstream roots. |
 
 ### 10.4 `mimic-init` variables
 
@@ -476,6 +650,17 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_OUTBOUND_PORT` | `15001` | Redirection target for outbound TCP. |
 | `MIMIC_PROXY_UID` | `1337` | UID whose traffic is not redirected. |
 | `MIMIC_EXCLUDE_INBOUND_PORTS` | empty | Comma-separated ports (1–65535) never redirected inbound. |
+
+### 10.5 `mimic-trust` variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MIMIC_TRUST_CA` | required | Deployment root certificate (PEM). |
+| `MIMIC_TRUST_OUT` | required | Output directory (created if missing). |
+| `MIMIC_TRUST_FALLBACK` | `/mimic/bin/fallback-ca.pem` | Store used when the image has none. |
+
+`mimic-trust` has no admin listener (it exits): FND-02 and FND-03 do not apply to it. It is a
+static binary (no dynamic loader, no libc needed) so that it runs in any Linux app image.
 
 ## 11. Security baseline
 
@@ -487,12 +672,18 @@ Set by the webhook; the defaults are the values it sets.
   `RuntimeDefault` seccomp, exits once the rules are installed.
 - The controller's RBAC is minimal: `get`/`list`/`watch` on `mimicworkloads`; `get`/`list`/`watch`/`patch`
   on its own `MutatingWebhookConfiguration` only (by name, and restricted to `caBundle` by a
-  `ValidatingAdmissionPolicy`); `get`/`update` on its webhook Secret only (by name, in its
-  namespace). No access to pods, Deployments or other Secrets.
+  `ValidatingAdmissionPolicy`); `get`/`update` on its webhook Secret and its TLS seed Secret only (by name, in its
+  namespace); `create` on `tokenreviews` (sidecar API authentication, §7.2). No access to
+  pods, Deployments or other Secrets.
 - The webhook never logs or stores the pod spec or the patch (env values may hold secrets).
 - Images are distroless, pinned by digest, scanned in CI (no fixable HIGH/CRITICAL).
 - Dependencies checked by `cargo deny` (advisories, licences, sources).
 - No sensitive value reaches Valkey or a log without redaction (§6).
+- TLS key custody (§5): the seed exists only in its Secret and the controller's memory; root
+  keys only in the controller's memory; intermediate and leaf keys only in the sidecar's
+  memory (non-dumpable, no core file). Tokens and keys are never logged.
+- The sidecar API port is admitted by the controller NetworkPolicy from any source by
+  default (injected pods can be in any namespace; `networkPolicy.sidecarApiFrom` narrows it).
 
 ### 11.1 Accepted limits
 
@@ -521,6 +712,33 @@ Set by the webhook; the defaults are the values it sets.
 - Only the `iptables-nft` backend is supported (the node kernel needs `nf_tables`).
 - `mimic-init` flushes the built-in chains it hooks in the pod's network namespace: another
   tool that installs iptables rules in the same pod (another mesh) is not supported.
+- TLS (§5): the first connection to a destination whose client rejects the mimic certificate
+  (pinning, compiled-in roots such as `webpki-roots`, its own truststore) fails; later ones
+  pass through. Remembered destinations are lost when the sidecar restarts, and at most 4096
+  are kept.
+- A container whose spec already defines one of the trust variables keeps it (it trusts what
+  it chose; its connections fall back as above). Variables set in the *image* (`ENV`) cannot
+  be seen by the webhook: an image-level `JAVA_TOOL_OPTIONS` is masked by mimic's (defining
+  it in the pod spec restores it, mimic then prepends); image-level `SSL_CERT_FILE`,
+  `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` files are merged by
+  `mimic-trust`. JVM certificates added only to the JDK's own `cacerts` (not to the system
+  store) are not in the mimic truststore. The truststore password `mimic` is public: it
+  protects nothing secret.
+- The sidecar's upstream roots are the union of the stores of all the pod's images: a
+  container trusts, through interception, a CA that only another image of the pod has.
+  `webpki` is stricter than OpenSSL (e.g. certificates without SAN): such destinations are
+  passed through (`upstream_untrusted`), and only visibility is lost.
+- Leaves name only the SNI (or the destination IP); a client that verifies another name is
+  handled by the fallback. TLS inside an HTTP `CONNECT` tunnel, STARTTLS and Encrypted Client
+  Hello are not intercepted (ECH falls back as `client_rejected`).
+- A user who can create pods in a namespace can obtain an intermediate for another deployment
+  of the same namespace (pod named after it, as for the workload identity above), and so
+  impersonate any host to that deployment's pods if they also sit on their network path. A
+  compromised controller (or anyone reading the seed Secret) can impersonate any host to every
+  injected pod.
+- Emptying the seed Secret rotates every root: running sidecars then fail the chain check
+  and pass everything through (`no_ca`) until their pod is recreated. The trust wiring and
+  `spec.tls.exclude` apply at pod creation.
 
 ## 12. Delivery plan
 
@@ -566,7 +784,7 @@ Levels: **U** unit in `mimic-core`, **I** integration in `crates/*/tests`, **E**
 |---|---|
 | INJ-01 | **U.** The selection decision follows the table of §7.1 for every combination of namespace label (`enabled`, `selected`, absent), pod label (`enabled`, `disabled`, absent) and presence of a `MimicWorkload` whose `spec.deployment` is the pod's deployment; the excluded namespaces are never injected. The deployment name is derived from the controlling ReplicaSet owner and the `pod-template-hash` label; any other owner gives `unsupported-owner`. |
 | INJ-02 | **U.** A pod with `hostNetwork: true`, a container port 15001, 15006 or 15100, or `runAsUser: 1337` (pod or app container) is skipped with the matching reason; the patch only adds `mimic.platform.io/skipped: <reason>`. A pod that already has a `mimic-sidecar` init container gets an empty patch. |
-| INJ-03 | **U.** The injection patch is a JSON Patch, byte-identical for the same input, that puts `mimic-init` then `mimic-sidecar` before the pod's own init containers (also when it has none), rewrites the app containers' `httpGet` probes as in §4 and changes nothing else in them, and adds `mimic.platform.io/injected: <version>`. `mimic-init`: UID 0, `allowPrivilegeEscalation: false`, drop `ALL`, add only `NET_ADMIN`/`NET_RAW`, read-only root, `RuntimeDefault`. `mimic-sidecar`: `restartPolicy: Always`, UID/GID 1337, `runAsNonRoot`, no capability, read-only root, `RuntimeDefault`, startup probe `/readyz` and liveness probe `/healthz` on 15100, the configured resources and the §10.3 variables. Neither has a volume mount. |
+| INJ-03 | **U.** The injection patch is a JSON Patch, byte-identical for the same input, that puts `mimic-init` then `mimic-sidecar` before the pod's own init containers (also when it has none), rewrites the app containers' `httpGet` probes as in §4 and changes nothing else in them, and adds `mimic.platform.io/injected: <version>`. `mimic-init`: UID 0, `allowPrivilegeEscalation: false`, drop `ALL`, add only `NET_ADMIN`/`NET_RAW`, read-only root, `RuntimeDefault`. `mimic-sidecar`: `restartPolicy: Always`, UID/GID 1337, `runAsNonRoot`, no capability, read-only root, `RuntimeDefault`, startup probe `/readyz` and liveness probe `/healthz` on 15100, the configured resources and the §10.3 variables. Neither has a volume mount (amended by TLS-11). |
 | INJ-04 | **U.** `MIMIC_EXCLUDE_INBOUND_PORTS` given to `mimic-init` holds, sorted and deduplicated, the ports of the `tcpSocket` and `grpc` liveness/readiness/startup probes of the app containers (named ports resolved against the container's ports, unresolvable names ignored) and 15100; `httpGet` probe ports are not in it. `MIMIC_APP_PROBES` holds every original `httpGet` probe under its `<container>/<kind>` key, with the named port resolved and the probe's `timeoutSeconds`; an `httpGet` probe whose named port does not resolve is left unchanged and absent from `MIMIC_APP_PROBES` (it fails as it would without mimic). Each rewritten probe points to `/app-health/<container>/<kind>` on 15100 with the original timings and thresholds. |
 | INJ-05 | **U.** The `iptables-restore` input generated for IPv4 and for IPv6 is deterministic and: redirects inbound TCP to a local destination (`addrtype LOCAL`) to the inbound port except the excluded ports; returns outbound traffic of the proxy UID and on `lo`; redirects other outbound TCP to the outbound port; rejects outbound UDP to port 443 in `filter`; uses only mimic-owned chains (`MIMIC_INBOUND`, `MIMIC_OUTPUT`) plus one jump from each built-in chain it hooks, which it flushes first (§4). |
 | INJ-06 | **I.** `mimic-init` pipes the rules to `iptables-restore` and `ip6tables-restore` found on `PATH`, logs one JSON line `redirection installed` with the families and excluded ports, and exits 0; it skips IPv6 with an INFO log when the pod has no IPv6; it exits 1 with an ERROR log naming the family when a restore command fails or is missing, and 2 on an invalid variable (FND-01). It never logs other content of its environment. |
@@ -599,7 +817,7 @@ in-process with an injected original destination, as the F1 tunnel tests do.
 | PRX-02 | **U.** Authority normalisation lower-cases, removes a trailing dot and the default port (80 for HTTP), keeps bracketed IPv6 literals, and maps anything that is not a host name or IP literal (or longer than 253 bytes) to `(invalid)`. The status class of 100–599 is `1xx`…`5xx`. The authority budget keeps the first N distinct values and returns `(other)` afterwards, the same for the same sequence of inputs (amended by PRX-23). |
 | PRX-03 | **I.** HTTP/1.1 through the inbound and the outbound listener: the destination receives the request line (query included), header names with their case, header order, values, body and framing (`content-length` and `chunked` with trailers) as sent by the client, and the client receives the status, reason phrase, headers and body as sent by the destination. No header is added (no `date`, `server`, `via`, `x-forwarded-*`). Several requests on one keep-alive connection, pipelined requests included, use one destination connection. A request whose `Host` names another server is still sent to the original destination. |
 | PRX-04 | **I.** HTTP/2 prior knowledge: concurrent streams on one client connection reach the destination on one connection with the same pseudo-headers, headers and bodies; a unary gRPC call returns its message and its `grpc-status`/`grpc-message` trailers unchanged. No header is added. |
-| PRX-05 | **I.** A destination that speaks first (banner) and a client that sends non-HTTP bytes are tunnelled byte-for-byte in both directions. A TLS client completes its handshake with a TLS destination through the sidecar and sees the destination's own certificate. |
+| PRX-05 | **I.** A destination that speaks first (banner) and a client that sends non-HTTP bytes are tunnelled byte-for-byte in both directions. A TLS client completes its handshake with a TLS destination through the sidecar and sees the destination's own certificate (inbound, or outbound without `MIMIC_TLS_CA`; amended by TLS-17). |
 | PRX-06 | **I.** A WebSocket upgrade answered `101` and a `CONNECT` answered `200` carry bytes in both directions after the response; each produces one access log line with `upgrade: true`. |
 | PRX-07 | **I.** No synthesised response: when the destination refuses the connection, the client connection is closed without any byte; when it closes (FIN) or resets after receiving an HTTP/1 request, the client sees a FIN or a reset respectively, with no response byte (`result: upstream_reset`, `status_class="none"`); on HTTP/2 the stream is reset and the other streams of the connection complete. The sidecar never answers `400` or `431` on HTTP/1: a malformed or oversized head is forwarded unchanged (PRX-29). |
 | PRX-08 | **I.** Each HTTP exchange writes exactly one access log line and each TLS or opaque connection one line, with the fields and values of the §4.1 table for a known exchange (direction, protocol, dst, authority, sni, method, path without query, status, grpc_status, result, durations, byte counts). A canary value placed in a header, a cookie, the query string and the request and response bodies appears in no log line. A path with quotes, backslashes or percent-encoded CR/LF stays inside one valid JSON line; a path over 1024 bytes is truncated. |
@@ -625,6 +843,42 @@ in-process with an injected original destination, as the F1 tunnel tests do.
 | PRX-28 | **C.** A `cargo-fuzz` target feeds arbitrary byte pairs (client side, destination side) to the codec; CI runs it for 60 s on every PR that touches the codec and for 10 min weekly; a crash, a panic, an out-of-memory or a retained state over the PRX-27 bound fails the job and its input is kept as an artefact. |
 | PRX-29 | **U.** Each ambiguous or unparsable input of §4.1 "Unframed HTTP/1" (both `content-length` and `transfer-encoding`; differing or non-decimal `content-length`; request `transfer-encoding` not ending in `chunked`, or with HTTP/1.0; `obs-fold` in a framing header; a bare CR; a header line without `:`; an invalid or over-long chunk size; a head, chunk-size line or trailer section over its limit) gives `unframed` at the first byte that decides it. **I.** For a request with both `content-length` and `transfer-encoding`, a header line over 64 KiB and a head of 300 lines, the destination receives the client's bytes unchanged, the client receives the destination's answer unchanged, one access line has `result: unframed` (with `method`/`path` when known, no `status`), and later HTTP on that connection produces no exchange line. |
 | PRX-30 | **I.** Bounded read-ahead: against a destination that reads everything and never answers, a client that pipelines 100 requests in one write has exactly 32 of them delivered to the destination; each response the destination then sends lets one more through, and all 100 are eventually answered in order. A client that sends a 10 MiB header line without a line end has all its bytes delivered to the destination unchanged and gets one `unframed` line (its memory bound is PRX-27's). |
+
+### 12.4 F3 — TLS interception
+
+Levels as in §12.2; **U** also covers unit tests next to the code of a crate when the logic
+needs a crypto crate that `mimic-core` must not depend on. Sidecar integration tests use a
+fake sidecar API (a local HTTPS server with a test CA) and destinations with certificates
+from test CAs placed in a temporary `MIMIC_TRUST_DIR`.
+
+| ID | Criterion |
+|---|---|
+| TLS-01 | **U.** The ClientHello parser (`mimic-core`) returns the SNI, the ALPN protocols in order and whether TLS 1.2 or 1.3 is offered (`supported_versions`, else `legacy_version`); an SNI that is not a valid DNS name (300 bytes, an empty label, a space) is reported as invalid and not returned, also when the ClientHello is split over reads and records; it never panics and never reads past the buffer for arbitrary input (property test, extends PRX-01). |
+| TLS-02 | **U.** The interception decision is a pure function of the ClientHello facts, the destination, the exclusions, the remembered set and whether a valid intermediate exists, and follows the §5 table in its order for each row (an excluded and remembered destination is `excluded`; a remembered one is passed through even without CA; an invalid SNI is `unsupported` even when the destination IP is excluded or remembered). For `intercept` it returns the ALPN offer: the client's list restricted to `h2` and `http/1.1`, client order. |
+| TLS-03 | **U.** Exclusions: an exact host matches itself case-insensitively and with a trailing dot; `*.example.com` matches `a.example.com` and `a.b.example.com`, not `example.com` nor `badexample.com`; an IP literal (v4, v6) matches only a ClientHello without SNI to that destination IP. Parsing `MIMIC_TLS_EXCLUDE` rejects empty entries, `*` alone, `a.*.com`, invalid names and more than 256 entries. **I.** Such a value exits the sidecar with code 2 (FND-01). |
+| TLS-04 | **U.** The bounded memory used for remembered destinations and leaves keeps at most its capacity (4096), forgets the oldest insertion first, keeps the first reason of a key inserted twice, and gives the same contents for the same sequence of inserts. |
+| TLS-05 | **U.** Intermediate lifecycle as a function of the current time (passed in): no intermediate, an expired one or one not yet valid is unusable (`no_ca`); renewal is due when less than half the validity remains; the backoff after failures is 1, 2, 4 … 60 s and resets after a success; a leaf's validity equals the intermediate's. |
+| TLS-06 | **U.** The pod-name check of §7.2 accepts `pay-7d9f8b6c4d-x2k9p` for `pay`, rejects it for `pay-7d9f8b6c4d` and for `pa`; with deployments `a` and `a-b`, `a-b-6d4c8f9b7-xxxxx` is accepted only for `a-b`; a name whose generated prefix was truncated to 58 characters is accepted for its long deployment name; a hash with a character outside the alphabet is rejected. |
+| TLS-07 | **U** (controller). The same seed and `<namespace>/<deployment>` give the same root key and subject; another deployment, namespace or seed gives another key. The root is `CA:true`, `keyCertSign`, ECDSA P-256, valid from seed creation − 1 h for 10 years. An intermediate issued for a P-256 public key verifies under the root with `pathLen:0`, `CA:true`, `keyCertSign`, valid from issuance − 1 h for 25 h (time passed in). |
+| TLS-08 | **I** (controller, fake API server). With the seed Secret empty, the controller writes a 32-byte `seed` and its `created` time and becomes ready only after (and after the INJ-11 conditions), with `mimic_tls_seed_loaded 1`; two replicas started together end with one seed; a restart keeps it; after the Secret's seed is replaced, intermediates are signed by the new root within 60 s (+ 5 s). The seed value appears in no log line. |
+| TLS-09 | **I** (controller, fake API server answering `TokenReview`). `POST /v1/tls/intermediate` answers as §7.2 says: `200` with an intermediate for the posted key that chains to the root of (token namespace, requested deployment); `401` without token, with an unauthenticated token and with a token for another audience (the `TokenReview` is sent with `audiences: [mimic.platform.io]`); `403` for a pod name of another deployment and without bound-pod claim; `400`, `413`, `405`; `503` when the `TokenReview` call fails. The listener applies the INJ-19 limits with its own budget. |
+| TLS-10 | **I** (controller). Each sidecar API request writes one `sidecar_api` line with the §7.2 fields and increments `mimic_sidecar_api_requests_total{endpoint,result}`; a canary token and the posted key appear in no log line and no metric. |
+| TLS-11 | **U.** The injection patch adds what §7.1 "TLS trust wiring" lists, byte-identical for the same input: the two volumes (token audience, expiry, path), the sidecar mounts and variables, one `mimic-trust-<n>` per distinct app image in first-appearance order with its image, pull policy, command, security context, resources, mount and variables; in every app container and app init container the read-only `subPath` mount of its image and the five variables, except those its `env` defines; a literal `JAVA_TOOL_OPTIONS` gets mimic's options prepended, a `valueFrom` one is untouched. No mimic container mounts an app volume; app containers get no `mimic-token` mount. The new `name-conflict` cases skip the pod. |
+| TLS-12 | **U.** `MIMIC_TLS_EXCLUDE` is the sorted, deduplicated union of `spec.tls.exclude` of every `MimicWorkload` naming the deployment (absent when none); `MIMIC_TLS_CA` is the deployment's root, `MIMIC_CONTROLLER_URL` and `MIMIC_CONTROLLER_CA` as §7.1 says. **I.** An admission while the seed is not loaded gets `allowed: false`. |
+| TLS-13 | **I** (`mimic-trust`, temporary root directory). With a Debian-style store, a RHEL-style store, an image whose own `SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` name extra files, and an image without store, it writes the five files of §7.1 with the documented contents and order, mode `0644`, duplicates removed, unparsable blocks skipped and counted; the PKCS12 file lists every bundle certificate as a trusted entry readable with password `mimic` (read back with the `p12-keystore` crate). It logs one JSON `trust bundle written` line (WARN `no image trust store` in the last case), exits 0; 1 when the output is not writable; 2 when `MIMIC_TRUST_CA` is missing or not a certificate. |
+| TLS-14 | **C.** `mimic-trust` in the `mimic` image (amd64 and arm64) is statically linked (no `PT_INTERP`, no `DT_NEEDED`); `scripts/check-image.sh` runs it in a `busybox:musl` container and in an empty (`scratch`) image with a store copied in, and both exit 0 with a bundle. |
+| TLS-15 | **I** (sidecar, fake sidecar API). With `MIMIC_TLS_CA` set, the sidecar is ready before it has an intermediate; it reads the token file for each request (a changed file sends the new token), posts its public key, and starts intercepting once it holds an intermediate that chains to `MIMIC_TLS_CA` (`mimic_tls_intermediate_expiry_timestamp_seconds` set); before that, and when the API fails, outbound TLS is passed through (`no_ca`) and failures are retried with the TLS-05 backoff (`result="error"`). An intermediate from another root is refused: ERROR `tls ca mismatch`, `result="mismatch"`, no interception. A 4 s intermediate is renewed about 2 s after issuance. A canary token appears in no log line, and no line contains `PRIVATE KEY`. A missing `MIMIC_CONTROLLER_URL` with `MIMIC_TLS_CA` set exits with code 2. |
+| TLS-16 | **I.** The sidecar's `/proc/<pid>/limits` shows a core file size of 0 and its `/proc/<pid>/environ` is owned by root (non-dumpable), once it has started. |
+| TLS-17 | **I.** Interception, outbound: a client that trusts `MIMIC_TLS_CA` connects with SNI `api.test` to a destination whose certificate for `api.test` comes from a CA in a `trust/0/image-ca.pem`; the client sees a leaf for `api.test` issued by the intermediate, within its validity, and the destination sees SNI `api.test`. Over it, the PRX-15 corpus keeps its byte equality on the decrypted streams; with ALPN `h2` (offered `h2,http/1.1`, destination supporting `h2`) the PRX-04 concurrent streams and unary gRPC pass unchanged and the client's negotiated ALPN equals the destination's choice; a client without ALPN gets HTTP/1.1. Exchange lines have `tls: true`, and `Host: api.test:443` gives `authority` `api.test`. A ClientHello without SNI to `127.0.0.1` gets a leaf with that IP SAN. Two connections with the same SNI get the same leaf until the intermediate changes. |
+| TLS-18 | **I.** A destination whose certificate is self-signed, expired, for another name, or that only speaks TLS 1.1 is passed through: the destination receives the client's ClientHello byte for byte, the client sees the destination's own certificate (or its own failure, as without mimic); one `connection` line `protocol: tls`, `interception: upstream_untrusted`; one WARN `tls passthrough` per destination; the next connection is passed through without the sidecar's own handshake (the destination accepts one handshake from the sidecar in total); `mimic_tls_passthrough_destinations` counts it. A destination that resets during the sidecar's handshake resets the client within 1 s and is not remembered. |
+| TLS-19 | **I.** A destination that requests a client certificate is passed through (`client_cert_requested`): a client presenting its certificate completes mTLS with the destination, which sees that certificate; it is remembered. |
+| TLS-20 | **I.** A client that trusts only the destination's CA (not `MIMIC_TLS_CA`) fails its first handshake (it rejects the mimic leaf), the destination is remembered as `client_rejected` with one WARN `tls passthrough`, and the client's next connection succeeds with the destination's own certificate. |
+| TLS-21 | **I.** With `MIMIC_TLS_EXCLUDE=*.excluded.test`, a connection with SNI `a.excluded.test` is passed through without any handshake from the sidecar (`interception: excluded`), and `api.test` is still intercepted. A ClientHello offering only TLS 1.1, or ALPN `imap` only, is passed through as `unsupported` and not remembered. An inbound TLS connection is never intercepted and its line has no `interception` field. |
+| TLS-22 | **I.** Close and reset on the decrypted path: a client `close_notify` + FIN after a complete request reaches the destination as `close_notify` + FIN after the request bytes, and the destination can still answer (PRX-17); a TCP reset by either side reaches the other as a reset within 1 s (PRX-18); at the end of the shutdown grace an intercepted exchange writes `result: shutdown` (PRX-20). |
+| TLS-23 | **I.** After a known set of connections (intercepted, excluded, `no_ca`, `unsupported`, `upstream_untrusted`, `client_rejected`), `/metrics` shows the exact `mimic_tls_connections_total{interception}` values, `mimic_tls_passthrough_destinations`, and intercepted connections under their decrypted protocol with the SNI as `authority` in `mimic_proxy_connections_total` (§9). The PRX-08 canaries (header, cookie, query, bodies) sent over an intercepted connection appear in no log line. |
+| TLS-24 | **E.** The chart creates the empty seed Secret, the Service and NetworkPolicy port 8444, and the RBAC of §11: `kubectl auth can-i` as the controller is `yes` for `create tokenreviews` and `get`/`update` of the seed Secret, `no` for other Secrets and pods; after install the Secret holds a seed; `helm uninstall` removes it. The CRD accepts `spec.tls.exclude: [api.example.com, "*.corp.example", 10.0.0.1]` and rejects `*`, `a.*.com` and 257 entries. |
+| TLS-25 | **E.** In an `enabled` namespace, four client Deployments built by the e2e from `curlimages/curl`, `python:slim` (`urllib`), `node:slim` (`fetch`) and `eclipse-temurin` (JDK `HttpClient`), each with the e2e test CA installed in the image's system store, call an in-cluster HTTPS Service whose certificate comes from that CA: each call returns 200, the sidecar writes an exchange line with `tls: true` and `status: 200`, and the certificate the client saw is issued by the mimic intermediate. A call to an HTTPS Service signed by an unknown CA fails in the client as without mimic (curl exit 60) and the sidecar logs `upstream_untrusted`. A `MimicWorkload` with `spec.tls.exclude` naming the Service host makes the next pod's connections `excluded`. |
+| TLS-26 | **E.** A client container that defines `SSL_CERT_FILE` in its spec to a file holding only the e2e CA keeps that value (no mimic variables for it); its first call fails, the sidecar logs one WARN `tls passthrough` with `reason: client_rejected`, and its second call returns 200 with the Service's own certificate. A sidecar token presented for another deployment's name gets `403` from the sidecar API. |
 
 ## 13. Test strategy
 

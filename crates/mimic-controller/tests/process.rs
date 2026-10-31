@@ -509,8 +509,15 @@ fn inj_11_unready_until_the_certificate_is_loaded_and_the_cache_synced() {
     let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
     let url = format!("redis://{}", valkey.addr);
 
-    // No cluster: Valkey is fine, the controller stays alive but unready.
-    let mut lonely = Process::spawn(BIN, &env(&[("MIMIC_VALKEY_URL", &url)]));
+    // No cluster: Valkey is fine, the controller stays alive but unready. KUBECONFIG names a file
+    // that does not exist, so a developer's own kubeconfig cannot provide one.
+    let mut lonely = Process::spawn(
+        BIN,
+        &env(&[
+            ("MIMIC_VALKEY_URL", &url),
+            ("KUBECONFIG", "/nonexistent/mimic-test-kubeconfig"),
+        ]),
+    );
     let addr = lonely.admin_addr();
     thread::sleep(Duration::from_millis(1500));
     let (status, body) = http_get(addr, "/readyz");
