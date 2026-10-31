@@ -6,17 +6,20 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mimic_core::proxy::tls::{
-    Bounded, ClientHello, Decision, DestKey, Exclusions, MEMORY_CAPACITY, Reason,
+    Bounded, ClientHello, Decision, DestKey, Exclusions, MEMORY_CAPACITY, Reason, dest_key,
 };
 use mimic_runtime::metrics::Metrics;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use rustls::SignatureScheme;
+use rustls::client::ResolvesClientCert;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::server::{ClientHello as ServerHello, ResolvesServerCert};
@@ -182,6 +185,8 @@ impl Interception {
             alpn,
             server_name,
             leaf,
+            key: dest_key(hello, dst.ip(), dst.port()),
+            sni: hello.sni.clone(),
         })
     }
 
@@ -202,18 +207,53 @@ impl Interception {
         &self,
         upstream: TcpStream,
         plan: &Plan,
-    ) -> io::Result<client::TlsStream<Socket>> {
+    ) -> Result<client::TlsStream<Socket>, ConnectError> {
+        let requested = Arc::new(CertRequested::default());
         let mut config = ClientConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
-            .map_err(io::Error::other)?
+            .map_err(|e| ConnectError::Io(io::Error::other(e)))?
             .with_root_certificates(self.roots().await)
-            .with_no_client_auth();
+            .with_client_cert_resolver(requested.clone());
         config.alpn_protocols = plan.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
         let connector = TlsConnector::from(Arc::new(config));
         let handshake = connector.connect(plan.server_name.clone(), Socket::new(upstream));
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        let result = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"));
+        if requested.0.load(Ordering::Relaxed) {
+            return Err(ConnectError::Reason(Reason::ClientCertRequested));
+        }
+        match result {
+            Ok(Ok(stream)) => Ok(stream),
+            // A TLS-level failure (certificate, alert, version, cipher) is the destination's
+            // verdict; anything else is the connection failing under the handshake.
+            Ok(Err(e)) if e.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()) => {
+                Err(ConnectError::Reason(Reason::UpstreamUntrusted))
+            }
+            Ok(Err(e)) | Err(e) => Err(ConnectError::Io(e)),
+        }
+    }
+
+    /// Counts the connection under `reason` and remembers the destination of `plan`; the first
+    /// time it is remembered, logs the WARN `tls passthrough`.
+    pub(crate) fn passthrough(&self, plan: &Plan, reason: Reason, dst: SocketAddr) {
+        self.count(reason.as_str());
+        let mut remembered = self
+            .remembered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if remembered.insert(plan.key.clone(), reason) {
+            self.metrics
+                .remembered
+                .set(i64::try_from(remembered.len()).unwrap_or(i64::MAX));
+            tracing::warn!(
+                target: "tls",
+                sni = plan.sni.as_deref(),
+                %dst,
+                reason = reason.as_str(),
+                "tls passthrough"
+            );
+        }
     }
 
     /// The client's handshake on `client`, whose first `hello` bytes were already read,
@@ -239,8 +279,34 @@ impl Interception {
     }
 }
 
+/// Why the sidecar's own handshake with the destination did not complete.
+pub(crate) enum ConnectError {
+    /// Pass the connection through for this reason.
+    Reason(Reason),
+    /// The connection failed (reset, close, timeout): the client sees the same.
+    Io(io::Error),
+}
+
+/// Set when the destination sends a `CertificateRequest`; the sidecar has no certificate to
+/// answer with, so the connection is passed through for the client to answer itself.
+#[derive(Debug, Default)]
+struct CertRequested(AtomicBool);
+
+impl ResolvesClientCert for CertRequested {
+    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        self.0.store(true, Ordering::Relaxed);
+        None
+    }
+
+    fn has_certs(&self) -> bool {
+        false
+    }
+}
+
 /// What an interception needs once decided.
 pub(crate) struct Plan {
+    key: DestKey,
+    sni: Option<String>,
     /// ALPN offered to the destination (client order, only `h2` and `http/1.1`).
     alpn: Vec<String>,
     server_name: ServerName<'static>,

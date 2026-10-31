@@ -209,7 +209,7 @@ async fn destination_with(
                     }
                     if got.windows(5).any(|w| w == b"reset") {
                         let (tcp, _) = tls.into_inner();
-                        let _ = tcp.set_linger(Some(Duration::ZERO));
+                        let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
                         return;
                     }
                 }
@@ -623,7 +623,7 @@ async fn tls_18_a_destination_that_resets_during_the_handshake_resets_the_client
             let mut tcp = tcp;
             let mut buf = [0u8; 4096];
             let _ = tcp.read(&mut buf).await;
-            let _ = tcp.set_linger(Some(Duration::ZERO));
+            let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
         }
     });
     let mut dest = destination(&[]).await;
@@ -751,7 +751,7 @@ async fn tls_22_a_client_reset_reaches_the_destination_and_the_reverse() {
     let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
     assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
     let (tcp, _) = tls.into_inner();
-    tcp.set_linger(Some(Duration::ZERO)).unwrap();
+    let _ = socket2::SockRef::from(&tcp).set_linger(Some(Duration::ZERO));
     drop(tcp);
     eventually("reset reaches the destination", || {
         matches!(dest.closes.lock().unwrap().first(), Some(Err(_)))

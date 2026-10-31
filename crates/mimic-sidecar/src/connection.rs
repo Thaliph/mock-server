@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mimic_core::proxy::authority::normalise_authority;
-use mimic_core::proxy::tls::{ClientHello, Parsed, parse_client_hello};
+use mimic_core::proxy::tls::{ClientHello, Parsed, Reason, parse_client_hello};
 use mimic_core::proxy::{DETECT_LIMIT, Detection, detect};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::AsyncReadExt;
@@ -21,7 +21,7 @@ use crate::h2;
 use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
 use crate::opaque::{self, Early, Side};
-use crate::tls::intercept::Plan;
+use crate::tls::intercept::{ConnectError, Plan};
 use crate::transport::Stream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -285,8 +285,29 @@ async fn intercept(
     let tls = conn.shared.tls();
     let upstream = match tls.connect(upstream, &plan).await {
         Ok(upstream) => upstream,
-        Err(e) => {
+        Err(ConnectError::Reason(reason)) => {
+            // Pass through: a fresh connection receives the ClientHello again, untouched.
+            tls.passthrough(&plan, reason, dst);
+            conn.interception = Some(reason.as_str());
+            let fresh = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await {
+                Ok(Ok(fresh)) => fresh,
+                _ => {
+                    tracing::debug!(direction = direction.as_str(), %dst, "pass-through connect failed");
+                    return;
+                }
+            };
+            if let Err(e) = configure_socket(&fresh) {
+                tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
+            }
+            let served = Served::Tunnel("tls", hello, Vec::new(), None);
+            conn.serve(served, Stream::plain(client), Stream::plain(fresh), abort)
+                .await;
+            return;
+        }
+        Err(ConnectError::Io(e)) => {
+            // The client sees what the destination did, and nothing is remembered.
             tracing::debug!(direction = direction.as_str(), %dst, error = %e, "handshake with the destination failed");
+            opaque::abort(&client);
             return;
         }
     };
@@ -294,7 +315,9 @@ async fn intercept(
     let client = match tls.accept(client, hello, &plan, alpn).await {
         Ok(client) => client,
         Err(e) => {
+            // The client gave up on this connection; the next one passes through.
             tracing::debug!(direction = direction.as_str(), %dst, error = %e, "handshake with the client failed");
+            tls.passthrough(&plan, Reason::ClientRejected, dst);
             return;
         }
     };
