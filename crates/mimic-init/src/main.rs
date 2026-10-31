@@ -51,9 +51,13 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
     })
 }
 
-/// The pod has IPv6 when `/proc/net/if_inet6` lists at least one address.
+/// The pod has IPv6 when `/proc/net/if_inet6` lists an address other than `::1`.
 fn has_ipv6(if_inet6: &str) -> bool {
-    !if_inet6.trim().is_empty()
+    const LOOPBACK: &str = "00000000000000000000000000000001";
+    if_inet6
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .any(|address| address != LOOPBACK)
 }
 
 fn restore(family: Family, input: &str) -> Result<(), String> {

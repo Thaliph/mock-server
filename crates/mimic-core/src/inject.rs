@@ -171,7 +171,22 @@ pub fn decide(
     if uid_conflict {
         return skip(SkipReason::UidConflict);
     }
+    let reserved = |name: &str| name == INIT_NAME || name == SIDECAR_NAME;
+    let name_conflict = spec.containers.iter().any(|c| reserved(&c.name))
+        || spec
+            .init_containers
+            .iter()
+            .flatten()
+            .any(|c| c.name == INIT_NAME);
+    if name_conflict {
+        return skip(SkipReason::NameConflict);
+    }
     Decision::Inject { deployment }
+}
+
+/// A literal `env` value as the kubelet will expand it: `$$` stands for a literal `$`.
+fn literal(value: &str) -> String {
+    value.replace('$', "$$")
 }
 
 /// One RFC 6902 operation of the injection patch.
@@ -213,7 +228,7 @@ pub fn patch(
     let init = json!({
         "name": INIT_NAME,
         "image": cfg.init_image,
-        "env": [{"name": "MIMIC_EXCLUDE_INBOUND_PORTS", "value": exclusions}],
+        "env": [{"name": "MIMIC_EXCLUDE_INBOUND_PORTS", "value": literal(&exclusions)}],
         "securityContext": {
             "runAsUser": 0,
             "runAsNonRoot": false,
@@ -231,12 +246,12 @@ pub fn patch(
         "command": ["/usr/local/bin/mimic-sidecar"],
         "restartPolicy": "Always",
         "env": [
-            {"name": "MIMIC_WORKLOAD", "value": deployment},
+            {"name": "MIMIC_WORKLOAD", "value": literal(deployment)},
             field("MIMIC_POD_NAMESPACE", "metadata.namespace"),
             field("MIMIC_POD_NAME", "metadata.name"),
             field("MIMIC_POD_IP", "status.podIP"),
-            {"name": "MIMIC_APP_PROBES", "value": serde_json::to_string(&rewritten)?},
-            {"name": "MIMIC_LOG", "value": cfg.sidecar_log},
+            {"name": "MIMIC_APP_PROBES", "value": literal(&serde_json::to_string(&rewritten)?)},
+            {"name": "MIMIC_LOG", "value": literal(&cfg.sidecar_log)},
         ],
         "resources": serde_json::to_value(&cfg.sidecar_resources)?,
         "startupProbe": {
