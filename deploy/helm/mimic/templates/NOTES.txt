@@ -1,0 +1,6 @@
+mimic {{ .Chart.AppVersion }} is installed in {{ .Release.Namespace }}.
+
+Check the controller:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ .Release.Name }}-controller
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }}-controller 8081:8081
+  curl -s localhost:8081/readyz

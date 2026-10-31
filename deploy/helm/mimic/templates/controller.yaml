@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-controller
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-controller
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mimic-controller
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mimic-controller
+  template:
+    metadata:
+      labels:
+        {{- include "mimic.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mimic-controller
+    spec:
+      serviceAccountName: {{ .Release.Name }}-controller
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: {{ include "mimic.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/mimic-controller"]
+          env:
+            - name: MIMIC_LOG
+              value: {{ .Values.controller.logLevel | quote }}
+            - name: MIMIC_ADMIN_ADDR
+              value: "0.0.0.0:8081"
+            - name: MIMIC_VALKEY_URL
+              value: "redis://{{ .Release.Name }}-valkey:6379"
+            - name: MIMIC_VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mimic.valkeySecret" . }}
+                  key: password
+          ports:
+            - name: admin
+              containerPort: 8081
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: admin}
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          securityContext:
+            {{- include "mimic.containerSecurity" . | nindent 12 }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-controller
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mimic-controller
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: mimic-controller
+  ports:
+    - name: admin
+      port: 8081
+      targetPort: admin

@@ -1,115 +1,31 @@
 name: release
 
-# Publication d'une version (spec §9.4b) : deux images multi-architecture sur ghcr.io
-# (`mimic`, cible runtime, et `mimic-init`, cible init), avec SBOM et provenance, signées
-# sans clé par cosign ; binaires de mimicctl pour Linux, macOS et Windows, attachés à la
-# release GitHub du tag avec leurs sommes SHA-256.
-# Sur une PR qui touche à la chaîne de publication, tout est construit sans rien publier.
+# On a v* tag: multi-arch image (native amd64 and arm64 runners), signed with cosign keyless,
+# with SBOM and provenance; then the Helm chart, pushed as an OCI artifact and signed
+# (spec §10, FND-10). Everything lands on ghcr.io, free for a public repository.
 
 on:
   push:
-    tags: ["v*"]
-  pull_request:
-    paths:
-      - .github/workflows/release.yml
-      - Dockerfile
-      - Cargo.lock
-
-env:
-  CARGO_TERM_COLOR: always
+    tags: ["v*.*.*"]
 
 permissions:
   contents: read
 
-jobs:
-  version:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.v.outputs.version }}
-      registry: ${{ steps.v.outputs.registry }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # Le tag doit correspondre à la version du workspace : une image 0.1.0 contient le code 0.1.0.
-      - id: v
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          # ghcr.io n'accepte que des noms en minuscules.
-          echo "registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
-          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME}, version du workspace $version"
-            exit 1
-          fi
+env:
+  REPO: ghcr.io/thaliph/mimic
+  CHARTS: ghcr.io/thaliph/charts
 
-  cli:
-    needs: version
+jobs:
+  build:
     strategy:
-      fail-fast: false
       matrix:
         include:
-          - {target: x86_64-unknown-linux-musl, os: ubuntu-latest, musl: true}
-          - {target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true}
-          - {target: x86_64-apple-darwin, os: macos-latest}
-          - {target: aarch64-apple-darwin, os: macos-latest}
-          - {target: x86_64-pc-windows-msvc, os: windows-latest}
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          targets: ${{ matrix.target }}
-      # Pas de rust-cache ici : les binaires publiés sont compilés à froid (zizmor
-      # cache-poisoning). Le build des images utilise en revanche le cache GHA (cache-from) :
-      # ses entrées viennent de main et des tags, écrits par des refs de confiance, et les
-      # caches de PR restent propres à leur PR.
-      - if: matrix.musl
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
-      # Windows : NASM sert à l'assembleur d'aws-lc (TLS du client Kubernetes).
-      - if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
-      - run: cargo build --release --locked -p mimicctl --target ${{ matrix.target }}
-      - name: Archive et somme de contrôle
-        shell: bash
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          name="mimicctl-$VERSION-$TARGET"
-          mkdir -p dist "$name"
-          cp README.md LICENSE docs/guide/CLI-mimicctl.md "$name"/
-          if [ "$RUNNER_OS" = Windows ]; then
-            cp "target/$TARGET/release/mimicctl.exe" "$name"/
-            7z a -tzip "dist/$name.zip" "$name" >/dev/null
-          else
-            cp "target/$TARGET/release/mimicctl" "$name"/
-            tar -czf "dist/$name.tar.gz" "$name"
-          fi
-          cd dist
-          for f in *; do
-            if command -v sha256sum >/dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi > "$f.sha256"
-          done
-          ls -l
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: cli-${{ matrix.target }}
-          path: dist/*
-
-  image:
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        image:
-          - {name: mimic, target: runtime}
-          - {name: mimic-init, target: init}
-        arch:
-          - {platform: linux/amd64, os: ubuntu-latest, suffix: amd64}
-          - {platform: linux/arm64, os: ubuntu-24.04-arm, suffix: arm64}
-    runs-on: ${{ matrix.arch.os }}
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -117,61 +33,53 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Tag matches the workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$version" = "$TAG" ] || { echo "tag $TAG != Cargo.toml $version"; exit 1; }
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - if: github.event_name == 'push'
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Chaque architecture est construite sur un runner natif, sans émulation, puis poussée
-      # par son digest ; le job manifest les réunit sous les tags de la version. La
-      # construction Rust est partagée par les deux cibles (même cache par architecture).
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          target: ${{ matrix.image.target }}
-          platforms: ${{ matrix.arch.platform }}
-          cache-from: type=gha,scope=${{ matrix.arch.suffix }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch.suffix }}
-          # Label revision de mimic_build_info (spec §9.3) et labels OCI de l'image.
-          build-args: |
-            MIMIC_REVISION=${{ github.sha }}
-            MIMIC_VERSION=${{ needs.version.outputs.version }}
-          # Attestations BuildKit : SBOM (SPDX) et provenance SLSA, poussées avec l'image.
-          sbom: ${{ github.event_name == 'push' }}
-          provenance: ${{ github.event_name == 'push' && 'mode=max' || 'false' }}
-          outputs: ${{ github.event_name == 'push' && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', needs.version.outputs.registry, matrix.image.name) || 'type=cacheonly' }}
-      - if: github.event_name == 'push'
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REPO }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+      - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           mkdir -p digests
           touch "digests/${DIGEST#sha256:}"
-      - if: github.event_name == 'push'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # « -- » : digest-mimic-* engloberait aussi digest-mimic-init-*.
-          name: digest-${{ matrix.image.name }}--${{ matrix.arch.suffix }}
+          name: digest-${{ matrix.runner }}
           path: digests/*
+          retention-days: 1
 
-  manifest:
-    if: github.event_name == 'push'
-    needs: [version, image]
-    strategy:
-      matrix:
-        name: [mimic, mimic-init]
-    runs-on: ubuntu-latest
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
-      contents: read
+      contents: write
       packages: write
-      # Signature sans clé : identité OIDC du workflow, certificat Fulcio, journal Rekor.
       id-token: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: digest-${{ matrix.name }}--*
+          pattern: digest-*
           path: digests
           merge-multiple: true
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -181,88 +89,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Tags de la version et signature
-        working-directory: digests
+      - name: Multi-arch index, signed
+        id: index
         env:
-          IMAGE: ${{ needs.version.outputs.registry }}/${{ matrix.name }}
-          VERSION: ${{ needs.version.outputs.version }}
-          REPOSITORY: ${{ github.repository }}
-          REVISION: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
         run: |
-          # Annotations OCI sur l'index multi-architecture, que ghcr.io affiche.
-          docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:${VERSION%.*}" \
-            --annotation "index:org.opencontainers.image.source=https://github.com/$REPOSITORY" \
-            --annotation "index:org.opencontainers.image.version=$VERSION" \
-            --annotation "index:org.opencontainers.image.revision=$REVISION" \
-            --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
-            $(printf "$IMAGE@sha256:%s " *)
-          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"')
-          # La signature porte sur le digest de l'index, jamais sur un tag mobile.
-          cosign sign --yes "$IMAGE@$digest"
-          echo "$IMAGE@$digest" | tee "../${{ matrix.name }}.digest"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: index-${{ matrix.name }}
-          path: ${{ matrix.name }}.digest
-
-  release:
-    if: github.event_name == 'push'
-    needs: [version, cli, manifest]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: cli-*
-          path: dist
-          merge-multiple: true
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: index-*
-          path: index
-          merge-multiple: true
-      - name: Release GitHub
+          version=${TAG#v}
+          docker buildx imagetools create -t "$REPO:$version" \
+            $(for d in digests/*; do echo "$REPO@sha256:$(basename "$d")"; done)
+          digest=$(docker buildx imagetools inspect "$REPO:$version" --format '{{json .Manifest}}' | jq -r .digest)
+          cosign sign --yes "$REPO@$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Helm chart, pinned to the image digest, signed
         env:
-          GH_TOKEN: ${{ github.token }}
-          REGISTRY: ${{ needs.version.outputs.registry }}
-          VERSION: ${{ needs.version.outputs.version }}
-          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mimic=$(cat index/mimic.digest)
-          init=$(cat index/mimic-init.digest)
-          cat > notes.md <<EOF
-          Images (linux/amd64, linux/arm64), signées par cosign, avec SBOM et provenance :
-
-          | Image | Digest |
-          |-------|--------|
-          | \`$REGISTRY/mimic:$VERSION\` | \`${mimic#*@}\` |
-          | \`$REGISTRY/mimic-init:$VERSION\` | \`${init#*@}\` |
-
-          Vérifier une image :
-
-          \`\`\`sh
-          cosign verify $REGISTRY/mimic:$VERSION \\
-            --certificate-identity-regexp 'https://github.com/$REPOSITORY/' \\
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com
-          \`\`\`
-
-          Binaires de \`mimicctl\` ci-dessous, avec leur somme SHA-256.
-          EOF
-          # La release peut déjà exister si le tag a été créé depuis l'interface GitHub
-          # (« Draft a new release ») : on y ajoute alors les binaires, sans toucher à ses
-          # notes si elles sont déjà rédigées.
-          # Versions 0.x et suffixées (-rc.1…) : pré-version, pas encore stable.
-          pre=()
-          case "$VERSION" in 0.*|*-*) pre=(--prerelease) ;; esac
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-            if [ -z "$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)" ]; then
-              gh release edit "$GITHUB_REF_NAME" --title "mimic $VERSION" --notes-file notes.md
-            fi
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* --title "mimic $VERSION" --notes-file notes.md --verify-tag "${pre[@]}"
-          fi
+          version=${TAG#v}
+          sed -i "s|^  digest: \"\"|  digest: \"$DIGEST\"|" deploy/helm/mimic/values.yaml
+          helm package deploy/helm/mimic --version "$version" --app-version "$version" -d dist
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          out=$(helm push "dist/mimic-$version.tgz" "oci://$CHARTS" 2>&1)
+          echo "$out"
+          chart_digest=$(echo "$out" | sed -n 's/^Digest: //p')
+          cosign sign --yes "$CHARTS/mimic@$chart_digest"
+      - name: GitHub release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$TAG" --generate-notes --verify-tag dist/*.tgz

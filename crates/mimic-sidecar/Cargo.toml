@@ -1,0 +1,19 @@
+[package]
+name = "mimic-sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mimic-runtime = { version = "0.1.0", path = "../mimic-runtime" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+mimic-runtime = { path = "../mimic-runtime", features = ["testing"] }
+serde_json = "1.0.154"

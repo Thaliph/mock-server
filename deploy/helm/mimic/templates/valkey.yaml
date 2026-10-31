@@ -1,0 +1,146 @@
+{{- if not .Values.valkey.existingSecret }}
+{{- $name := include "mimic.valkeySecret" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+  annotations:
+    # Never deleted by helm, so recorded data stays readable after a reinstall.
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  {{- if and $existing $existing.data }}
+  password: {{ index $existing.data "password" }}
+  {{- else }}
+  password: {{ randAlphaNum 40 | b64enc }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-valkey
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mimic-valkey
+spec:
+  serviceName: {{ .Release.Name }}-valkey
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mimic-valkey
+  template:
+    metadata:
+      labels:
+        {{- include "mimic.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mimic-valkey
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: valkey
+          image: {{ include "mimic.valkeyImage" . }}
+          imagePullPolicy: IfNotPresent
+          command: ["valkey-server"]
+          # $(VALKEY_PASSWORD) is expanded by the kubelet; it never appears in the pod spec.
+          args: ["--dir", "/data", "--appendonly", "yes", "--requirepass", "$(VALKEY_PASSWORD)"]
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mimic.valkeySecret" . }}
+                  key: password
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mimic.valkeySecret" . }}
+                  key: password
+          ports:
+            - name: valkey
+              containerPort: 6379
+          livenessProbe:
+            tcpSocket: {port: valkey}
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["valkey-cli", "ping"]
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.valkey.resources | nindent 12 }}
+          securityContext:
+            {{- include "mimic.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- with .Values.valkey.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.valkey.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.valkey.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.valkey.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-valkey
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mimic-valkey
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: mimic-valkey
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: valkey
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-valkey
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mimic-valkey
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/name: mimic-controller
+      ports:
+        - port: 6379
+  # Valkey calls nothing.
+  egress: []
+{{- end }}

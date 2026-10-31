@@ -1,6 +1,0 @@
-# Cluster de la démo de bout en bout (scripts/e2e-kind.sh). Kubernetes >= 1.29 pour les
-# native sidecars.
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-nodes:
-  - role: control-plane

@@ -1,16 +1,11 @@
-# Politique des dépendances (cargo deny check) : vulnérabilités connues (RustSec), licences
-# compatibles Apache-2.0, sources autorisées. Lancé par .github/workflows/security.yml.
+# Dependency policy, checked by `cargo deny check` in CI: known vulnerabilities and
+# unmaintained crates (RustSec), licences compatible with Apache-2.0, allowed sources.
 [graph]
 all-features = true
 
 [advisories]
-# Toute vulnérabilité ou crate non maintenue publiée par RustSec fait échouer la vérification ;
-# une exception se déclare ici, avec sa justification.
-ignore = [
-  # serde_yaml 0.9 (déprécié) dépend d'unsafe-libyaml, non maintenu : pas de vulnérabilité
-  # connue. Migration vers un fork maintenu suivie dans todo.md.
-  { id = "RUSTSEC-2024-0449", reason = "via serde_yaml ; migration suivie dans todo.md" },
-]
+# Any advisory fails the check; an exception is declared here with its reason.
+ignore = []
 
 [licenses]
 confidence-threshold = 0.9
@@ -26,7 +21,6 @@ allow = [
   "0BSD",
   "BSL-1.0",
   "CC0-1.0",
-  "Unlicense",
   "Unicode-3.0",
   "CDLA-Permissive-2.0",
 ]
@@ -34,7 +28,6 @@ allow = [
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"
-# Les crates du workspace se référencent par chemin et version.
 allow-wildcard-paths = true
 
 [sources]
