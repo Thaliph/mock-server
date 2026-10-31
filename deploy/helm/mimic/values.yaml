@@ -10,14 +10,22 @@ image:
 imagePullSecrets: []
 
 controller:
-  replicas: 1
+  # Two replicas: the webhook fails closed, so one pod being down stalls pod creation in scope.
+  replicas: 2
   logLevel: info
   resources:
     requests: {cpu: 50m, memory: 64Mi}
     limits: {memory: 128Mi}
   nodeSelector: {}
   tolerations: []
+  # Empty: preferred pod anti-affinity on kubernetes.io/hostname (spread replicas across nodes).
   affinity: {}
+  # Admission webhook limits (spec §10.2). Both must be set; invalid values exit the controller with 2.
+  webhook:
+    # Concurrent webhook connections served.
+    maxConnections: 256
+    # TLS handshake and per-request read deadline (`<n>s` or `<n>ms`, greater than 0).
+    requestTimeout: 5s
 
 # Pod injection (spec §7.1). The sidecar image is `image` above.
 inject:
@@ -52,9 +60,15 @@ valkey:
   nodeSelector: {}
   tolerations: []
 
-# Restrict Valkey ingress to the controller.
+# NetworkPolicies of Valkey (ingress from the controller only) and of the controller.
 networkPolicy:
   enabled: true
+  # Sources of the webhook port (8443), as NetworkPolicy `from` peers. Empty: any source, since the
+  # API server's source address depends on the cluster. Set it to narrow the webhook port.
+  webhookFrom: []
+  # Namespace selector of the namespaces that may scrape the admin port (8081), e.g.
+  # {kubernetes.io/metadata.name: monitoring}. Empty: the release namespace only.
+  metricsNamespaceSelector: {}
 
 metrics:
   # Prometheus Operator ServiceMonitor for the controller.

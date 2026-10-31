@@ -5,6 +5,9 @@ metadata:
   name: mimicworkloads.mimic.platform.io
   labels:
     {{- include "mimic.labels" . | nindent 4 }}
+  annotations:
+    # `helm uninstall` leaves the CRD and every MimicWorkload (spec §7.1); removing them is explicit.
+    helm.sh/resource-policy: keep
 spec:
   group: mimic.platform.io
   scope: Namespaced
