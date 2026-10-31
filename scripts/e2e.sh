@@ -64,9 +64,34 @@ log "fnd_08: Valkey refuses clients other than the controller"
 password=$(kubectl -n "$NS" get secret $RELEASE-valkey -o jsonpath='{.data.password}' | base64 -d)
 [[ ${#password} -ge 32 ]] || fail "fnd_08: generated password too short"
 valkey_image=$(kubectl -n "$NS" get statefulset $RELEASE-valkey -o jsonpath='{.spec.template.spec.containers[0].image}')
-if kubectl run "probe-$RANDOM" -n default --rm -i --restart=Never --image="$valkey_image" \
-     --env=REDISCLI_AUTH="$password" --command -- \
-     timeout 5 valkey-cli -h $RELEASE-valkey.$NS ping 2>/dev/null | grep -q PONG; then
+# probe <namespace> <labels>: runs `valkey-cli ping` once and prints its output.
+probe() {
+  local name="probe-$RANDOM"
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: $name, namespace: $1, labels: {$2}}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext: {runAsNonRoot: true, runAsUser: 999, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: probe
+      image: $valkey_image
+      command: [timeout, "5", valkey-cli, -h, $RELEASE-valkey.$NS, ping]
+      env: [{name: REDISCLI_AUTH, value: "$password"}]
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+YAML
+  kubectl -n "$1" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$name" --timeout=60s >/dev/null 2>&1 \
+    || kubectl -n "$1" wait --for=jsonpath='{.status.phase}'=Failed "pod/$name" --timeout=5s >/dev/null 2>&1 || true
+  kubectl -n "$1" logs "$name" 2>/dev/null || true
+  kubectl -n "$1" delete pod "$name" --wait=false >/dev/null
+}
+# Positive control: with the controller's labels the same probe gets through, so a refusal
+# below is the NetworkPolicy and not a broken probe.
+probe "$NS" "app.kubernetes.io/instance: $RELEASE, app.kubernetes.io/name: mimic-controller" | grep -q PONG \
+  || fail "fnd_08: probe with the controller labels could not reach Valkey"
+if probe default "app: probe" | grep -q PONG; then
   fail "fnd_08: a pod outside the controller reached Valkey"
 fi
 
