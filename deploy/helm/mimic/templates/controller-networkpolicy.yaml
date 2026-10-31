@@ -1,7 +1,8 @@
 {{- if .Values.networkPolicy.enabled }}
 # Ingress to the controller (spec §11). The webhook port is open to any source by default, since the
-# API server's source address depends on the cluster (networkPolicy.webhookFrom narrows it). The
-# admin port serves health, readiness and metrics: the release namespace and the namespaces in
+# API server's source address depends on the cluster (networkPolicy.webhookFrom narrows it); the
+# sidecar API port likewise (networkPolicy.sidecarApiFrom). The admin port serves health,
+# readiness and metrics: the release namespace and the namespaces in
 # networkPolicy.metricsNamespaceSelector only.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -22,6 +23,13 @@ spec:
       {{- end }}
       ports:
         - {port: 8443, protocol: TCP}
+    # Sidecar API (spec §7.2, §11): injected pods, in any namespace unless sidecarApiFrom narrows it.
+    - {{- with .Values.networkPolicy.sidecarApiFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      ports:
+        - {port: {{ .Values.controller.sidecarApiPort }}, protocol: TCP}
     - from:
         - namespaceSelector:
             matchLabels:

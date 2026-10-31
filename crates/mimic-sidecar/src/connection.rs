@@ -19,6 +19,7 @@ use crate::h2;
 use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
 use crate::opaque::{self, Early, Side};
+use crate::transport::Stream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
@@ -115,6 +116,8 @@ pub(crate) async fn handle(
                     // At the end of the grace the relay closes both sockets, and the exchanges
                     // still open write their `shutdown` line.
                     let mut tracker = Http1Tracker::new(ctx(dst));
+                    let (mut client, mut upstream) =
+                        (Stream::plain(client), Stream::plain(upstream));
                     let relayed = http1::relay(
                         &mut client,
                         &mut upstream,
@@ -137,7 +140,7 @@ pub(crate) async fn handle(
                 Detection::H2 => {
                     proxy.connection(direction, "h2", &dst.to_string());
                     let relayed = tokio::select! {
-                        r = h2::relay(client, upstream, buf, ctx(dst), shared.stopped()) => r,
+                        r = h2::relay(Stream::plain(client), Stream::plain(upstream), buf, ctx(dst), shared.stopped()) => r,
                         () = abort.as_mut() => Ok(()),
                     };
                     if let Err(e) = relayed {

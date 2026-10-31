@@ -4,23 +4,24 @@
 //! client bytes behind an upgrade request until its response) and reports [`Event`]s. After
 //! `Tunnel` or `Unframed` the codec is silent and the two pumps are a plain opaque relay.
 //! A FIN reaches the other side as a FIN once every byte read before it was written; a reset
-//! (or any socket failure) reaches it as a reset, also after a FIN. On `stop` (shutdown) the
+//! (or any socket failure) reaches it as a reset, also after a FIN. Each side is a plain TCP
+//! or a TLS [`Stream`]: over TLS the bytes are the decrypted ones and a FIN is `close_notify`
+//! then FIN. On `stop` (shutdown) the
 //! connection is closed, nothing added, as soon as the codec is between two messages.
 
 use std::future::Future;
 use std::io;
-use std::net::Shutdown;
 use std::pin::pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use mimic_core::proxy::http1::{Codec, Event};
-use socket2::SockRef;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::access::Outcome;
-use crate::opaque::{Side, abort, failed, write_all};
+use crate::opaque::{Side, abort, failed};
+use crate::transport::Stream;
 
 const CHUNK: usize = 16 * 1024;
 /// Values of [`Relay::closed_first`].
@@ -96,8 +97,8 @@ impl<F: FnMut(Event)> Relay<F> {
     /// Client to destination.
     async fn client_pump(
         &self,
-        client: &TcpStream,
-        upstream: &TcpStream,
+        client: &mut (impl AsyncRead + Unpin),
+        upstream: &mut (impl AsyncWrite + Unpin),
         first: Vec<u8>,
     ) -> Result<(), Failure> {
         let mut buf = vec![0u8; CHUNK];
@@ -106,12 +107,10 @@ impl<F: FnMut(Event)> Relay<F> {
             .fetch_add(held.len() as u64, Ordering::Relaxed);
         loop {
             if held.is_empty() {
-                let n = read_some(client, &mut buf)
-                    .await
-                    .map_err(|e| (Side::Client, e))?;
+                let n = client.read(&mut buf).await.map_err(|e| (Side::Client, e))?;
                 if n == 0 {
                     self.first_to_close(CLIENT);
-                    return fin(upstream, Side::Upstream);
+                    return fin(upstream, Side::Upstream).await;
                 }
                 self.to_upstream.fetch_add(n as u64, Ordering::Relaxed);
                 held.extend_from_slice(&buf[..n]);
@@ -128,7 +127,7 @@ impl<F: FnMut(Event)> Relay<F> {
                 self.unblocked.notified().await;
                 continue;
             }
-            write_all(upstream, &held[..used])
+            send(upstream, &held[..used])
                 .await
                 .map_err(|e| (Side::Upstream, e))?;
             held.drain(..used);
@@ -136,10 +135,15 @@ impl<F: FnMut(Event)> Relay<F> {
     }
 
     /// Destination to client.
-    async fn server_pump(&self, upstream: &TcpStream, client: &TcpStream) -> Result<(), Failure> {
+    async fn server_pump(
+        &self,
+        upstream: &mut (impl AsyncRead + Unpin),
+        client: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<(), Failure> {
         let mut buf = vec![0u8; CHUNK];
         loop {
-            let n = read_some(upstream, &mut buf)
+            let n = upstream
+                .read(&mut buf)
                 .await
                 .map_err(|e| (Side::Upstream, e))?;
             if n == 0 {
@@ -147,7 +151,7 @@ impl<F: FnMut(Event)> Relay<F> {
                 self.with(|codec| ((), codec.server_eof()));
                 self.server_closed.store(true, Ordering::Release);
                 self.unblocked.notify_one();
-                return fin(client, Side::Client);
+                return fin(client, Side::Client).await;
             }
             self.to_client.fetch_add(n as u64, Ordering::Relaxed);
             let answered = self.with(|codec| {
@@ -155,7 +159,7 @@ impl<F: FnMut(Event)> Relay<F> {
                 let events = codec.server_bytes(&buf[..n]);
                 (codec.pending() < before || !events.is_empty(), events)
             });
-            write_all(client, &buf[..n])
+            send(client, &buf[..n])
                 .await
                 .map_err(|e| (Side::Client, e))?;
             if answered {
@@ -166,25 +170,15 @@ impl<F: FnMut(Event)> Relay<F> {
     }
 }
 
-async fn read_some(from: &TcpStream, buf: &mut [u8]) -> io::Result<usize> {
-    loop {
-        from.readable().await?;
-        match from.try_read(buf) {
-            Ok(n) => return Ok(n),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
-        }
-    }
+/// Writes `data` and pushes it out (a TLS stream buffers until flushed).
+async fn send(to: &mut (impl AsyncWrite + Unpin), data: &[u8]) -> io::Result<()> {
+    to.write_all(data).await?;
+    to.flush().await
 }
 
 /// Passes a FIN on.
-fn fin(to: &TcpStream, side: Side) -> Result<(), Failure> {
-    SockRef::from(to)
-        .shutdown(Shutdown::Write)
-        .or_else(|e| match e.kind() {
-            io::ErrorKind::NotConnected => Ok(()),
-            _ => Err((side, e)),
-        })
+async fn fin(to: &mut (impl AsyncWrite + Unpin), side: Side) -> Result<(), Failure> {
+    to.shutdown().await.map_err(|e| (side, e))
 }
 
 /// Relays one HTTP/1 connection until both sides are done, a side fails (the other one gets a
@@ -192,14 +186,14 @@ fn fin(to: &TcpStream, side: Side) -> Result<(), Failure> {
 /// or `abort_signal` resolves. `first` are the client bytes already read (by protocol
 /// detection); `on_event` receives the codec's events in order.
 pub async fn relay(
-    client: &mut TcpStream,
-    upstream: &mut TcpStream,
+    client: &mut Stream,
+    upstream: &mut Stream,
     first: Vec<u8>,
     on_event: impl FnMut(Event) + Send,
     stop: impl Future<Output = ()> + Send,
     abort_signal: impl Future<Output = ()> + Send,
 ) -> Relayed {
-    let (client, upstream) = (&*client, &*upstream);
+    let (client_socket, upstream_socket) = (client.socket(), upstream.socket());
     let relay = Relay {
         state: Mutex::new(State {
             codec: Codec::new(),
@@ -217,17 +211,19 @@ pub async fn relay(
         let mut abort_signal = pin!(abort_signal);
         let mut stop = pin!(stop);
         let mut stopping = false;
+        let (mut client_read, mut client_write) = tokio::io::split(&mut *client);
+        let (mut upstream_read, mut upstream_write) = tokio::io::split(&mut *upstream);
         let mut pumps = pin!(async {
             tokio::try_join!(
-                relay.client_pump(client, upstream, first),
-                relay.server_pump(upstream, client),
+                relay.client_pump(&mut client_read, &mut upstream_write, first),
+                relay.server_pump(&mut upstream_read, &mut client_write),
             )
         });
         loop {
             tokio::select! {
                 r = &mut pumps => break r.map(|_| ()).map_err(Some),
-                (side, e) = failed(client, Side::Client) => break Err(Some((side, e))),
-                (side, e) = failed(upstream, Side::Upstream) => break Err(Some((side, e))),
+                (side, e) = failed(client_socket.tcp(), Side::Client) => break Err(Some((side, e))),
+                (side, e) = failed(upstream_socket.tcp(), Side::Upstream) => break Err(Some((side, e))),
                 () = &mut abort_signal => break Err(None),
                 () = &mut stop, if !stopping => {
                     stopping = true;
@@ -254,11 +250,11 @@ pub async fn relay(
         Err(None) => (Outcome::Shutdown, None),
         Err(Some((Side::Upstream, e))) => {
             // The client sees what the destination did: a reset.
-            abort(client);
+            abort(client_socket.tcp());
             (Outcome::UpstreamReset, Some(e))
         }
         Err(Some((Side::Client, e))) => {
-            abort(upstream);
+            abort(upstream_socket.tcp());
             (Outcome::ClientAbort, Some(e))
         }
     };

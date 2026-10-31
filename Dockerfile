@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Two images (spec §10), both distroless, non-root by default, no shell:
-#   - `mimic` (default target): mimic-sidecar and mimic-controller.
+#   - `mimic` (default target): mimic-sidecar, mimic-controller and the static mimic-trust.
 #   - `mimic-init` (--target init): mimic-init plus iptables-restore and ip6tables-restore
 #     (nft backend) and the libraries they load. The pod runs it as UID 0 with NET_ADMIN/NET_RAW.
 # Base images are pinned by digest; Dependabot keeps them current.
@@ -8,15 +8,29 @@ ARG RUST_IMAGE=rust:1.99.1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3
 ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 
 FROM ${RUST_IMAGE} AS build
+ARG TARGETARCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
+# mimic-trust runs inside arbitrary app images (spec §7.1, §10.5): it is built for the musl
+# target of the image's architecture, which makes it static (no PT_INTERP, no DT_NEEDED).
+# The rustup musl targets are self-contained (own crt objects and libc), so no musl toolchain
+# package is needed.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked --bin mimic-sidecar --bin mimic-controller --bin mimic-init \
-    && mkdir /out /out-init \
-    && cp target/release/mimic-sidecar target/release/mimic-controller /out/ \
-    && cp target/release/mimic-init /out-init/
+    set -eux; \
+    case "$TARGETARCH" in \
+      amd64) triple=x86_64-unknown-linux-musl ;; \
+      arm64) triple=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH '$TARGETARCH'" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$triple"; \
+    cargo build --release --locked --bin mimic-sidecar --bin mimic-controller --bin mimic-init; \
+    cargo build --release --locked --target "$triple" --package mimic-trust --bin mimic-trust; \
+    mkdir /out /out-init; \
+    cp target/release/mimic-sidecar target/release/mimic-controller /out/; \
+    cp "target/$triple/release/mimic-trust" /out/; \
+    cp target/release/mimic-init /out-init/
 
 # The iptables user space with the nft backend, and every shared library it loads at run time
 # (the libraries of the binary and of the xtables extensions). Copied into the init image, not

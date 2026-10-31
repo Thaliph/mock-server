@@ -12,6 +12,8 @@ use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 use mimic_sidecar::probes::{self, Probes};
 use mimic_sidecar::red::ProxyMetrics;
+use mimic_sidecar::tls::ca::{CaClient, CaMetrics, CaState};
+use mimic_sidecar::tls::{self, TlsConfig};
 
 const BINARY: &str = "mimic-sidecar";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -35,8 +37,18 @@ fn main() -> ExitCode {
         Ok(probes) => probes,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
+    let tls = match TlsConfig::from_env(&env) {
+        Ok(tls) => tls,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
     let mut log = mimic_runtime::logging::init(&config.log);
-    let code = match run(config, tunnel, probes) {
+    // Before any key exists: no core dump, not readable through /proc by other processes.
+    if let Err(e) = mimic_sidecar::hardening::harden() {
+        tracing::error!(error = %e, "cannot harden the process");
+        log.finish();
+        return ExitCode::FAILURE;
+    }
+    let code = match run(config, tunnel, probes, tls) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "sidecar stopped");
@@ -49,14 +61,22 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std::io::Result<()> {
+async fn run(
+    config: CommonConfig,
+    tunnel: TunnelConfig,
+    probes: Probes,
+    tls: TlsConfig,
+) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     // Registered before any listener is announced: an early SIGTERM is not lost.
     let shutdown = Shutdown::install()?;
     let mut metrics = Metrics::new("sidecar", VERSION);
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
     let proxy_metrics = ProxyMetrics::register(&mut metrics, tunnel.max_authorities);
+    let ca_metrics = CaMetrics::register(&mut metrics);
     let metrics = Arc::new(metrics);
+    // Readiness does not wait for the CA: until it holds an intermediate, TLS is passed through.
+    let _ca = start_ca(&tls, ca_metrics)?;
 
     // The listeners are bound before the admin listener serves, so `/readyz` answers 200 only
     // once they accept connections.
@@ -106,4 +126,21 @@ async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std:
         drain
     );
     served
+}
+
+/// Publishes the `mimic-trust` volume and starts the renewal task. `None` without
+/// `MIMIC_TLS_CA`: no interception, every outbound TLS connection is passed through.
+fn start_ca(tls: &TlsConfig, metrics: CaMetrics) -> std::io::Result<Option<Arc<CaState>>> {
+    let Some(config) = tls.ca.clone() else {
+        tracing::info!("MIMIC_TLS_CA is empty: outbound TLS is passed through");
+        return Ok(None);
+    };
+    let stores: Vec<_> = tls::SYSTEM_STORES.iter().map(Into::into).collect();
+    if let Err(e) = tls::publish_trust(&tls.trust_dir, tls::TRUST_BINARY.as_ref(), &stores) {
+        tracing::warn!(error = %e, dir = %tls.trust_dir.display(), "trust volume not published");
+    }
+    let state = Arc::new(CaState::new(metrics).map_err(std::io::Error::other)?);
+    let client = CaClient::new(config, state.clone()).map_err(std::io::Error::other)?;
+    tokio::spawn(client.run());
+    Ok(Some(state))
 }
