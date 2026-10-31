@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 axum = "0.8.9"
-hyper = { version = "1.12.0", features = ["http1", "server", "client"] }
+hyper = { version = "1.12.0", features = ["http1", "server", "client", "http2"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 mimic-core = { version = "0.1.0", path = "../mimic-core" }
 mimic-runtime = { version = "0.1.0", path = "../mimic-runtime" }
@@ -26,6 +26,7 @@ tracing = "0.1.44"
 workspace = true
 
 [dev-dependencies]
+http-body-util = "0.1.5"
 mimic-runtime = { path = "../mimic-runtime", features = ["testing"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
