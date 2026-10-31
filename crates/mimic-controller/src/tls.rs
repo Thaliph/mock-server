@@ -2,11 +2,14 @@
 //! be swapped without restarting the listener.
 
 use std::future::Future;
-use std::sync::{Arc, RwLock};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::Router;
 use hyper::server::conn::http1;
+use hyper::service::{Service, service_fn};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use rustls::ServerConfig;
@@ -15,12 +18,12 @@ use rustls::sign::CertifiedKey;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::PoisonError;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
-
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The serving certificate, empty until one is loaded.
 #[derive(Default, Debug)]
@@ -91,7 +94,7 @@ pub async fn serve(
     listener: TcpListener,
     slot: Arc<CertSlot>,
     router: Router,
-    _limits: Limits,
+    limits: Limits,
     grace: Duration,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
@@ -111,7 +114,13 @@ pub async fn serve(
     });
     let mut connections = JoinSet::new();
     let mut stopped = stop_rx.clone();
+    // A permit is taken before accepting: further clients wait in the accept backlog.
+    let slots = Arc::new(Semaphore::new(limits.max_connections));
     loop {
+        let permit = tokio::select! {
+            Ok(permit) = slots.clone().acquire_owned() => permit,
+            _ = stopped.wait_for(|stop| *stop) => break,
+        };
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = stopped.wait_for(|stop| *stop) => break,
@@ -124,12 +133,11 @@ pub async fn serve(
                 continue;
             }
         };
-        connections.spawn(connection(
-            stream,
-            acceptor.clone(),
-            router.clone(),
-            stop_rx.clone(),
-        ));
+        let (acceptor, router, stop) = (acceptor.clone(), router.clone(), stop_rx.clone());
+        connections.spawn(async move {
+            connection(stream, acceptor, router, limits, stop).await;
+            drop(permit);
+        });
     }
     drop(listener);
     let drained = tokio::time::timeout(grace, async {
@@ -143,13 +151,108 @@ pub async fn serve(
     Ok(())
 }
 
+/// Where a connection is in its request cycle, for the deadlines of [`Limits`].
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Waiting for the first byte of a request since this instant.
+    Idle(Instant),
+    /// A request started (first byte read) at this instant and is not answered yet.
+    Request(Instant),
+}
+
+#[derive(Default)]
+struct Cycle {
+    phase: Mutex<Option<Phase>>,
+    changed: Notify,
+}
+
+impl Cycle {
+    fn set(&self, phase: Phase) {
+        *self.phase.lock().unwrap_or_else(PoisonError::into_inner) = Some(phase);
+        self.changed.notify_one();
+    }
+
+    fn get(&self) -> Option<Phase> {
+        *self.phase.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Resolves when the connection overstays the deadline of its phase.
+    async fn expired(&self, limits: Limits) {
+        loop {
+            let Some(phase) = self.get() else {
+                return std::future::pending().await;
+            };
+            let deadline = match phase {
+                Phase::Idle(since) => since + limits.idle_timeout,
+                Phase::Request(since) => since + limits.request_timeout,
+            };
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {
+                    // The phase may have changed while sleeping: only the same one expires.
+                    let unchanged = match (phase, self.get()) {
+                        (Phase::Idle(a), Some(Phase::Idle(b))) => a == b,
+                        (Phase::Request(a), Some(Phase::Request(b))) => a == b,
+                        _ => false,
+                    };
+                    if unchanged {
+                        return;
+                    }
+                }
+                () = self.changed.notified() => {}
+            }
+        }
+    }
+}
+
+/// The TLS stream, noting when the first byte of a request arrives.
+struct Watched<S> {
+    inner: S,
+    cycle: Arc<Cycle>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let started = matches!(polled, Poll::Ready(Ok(()))) && buf.filled().len() > before;
+        if started && matches!(self.cycle.get(), Some(Phase::Idle(_))) {
+            self.cycle.set(Phase::Request(Instant::now()));
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 async fn connection(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     router: Router,
+    limits: Limits,
     mut stop: watch::Receiver<bool>,
 ) {
-    let tls = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+    let handshake = tokio::time::timeout(limits.request_timeout, acceptor.accept(stream));
+    let tls = match handshake.await {
         Ok(Ok(tls)) => tls,
         Ok(Err(e)) => {
             tracing::debug!(error = %e, "webhook TLS handshake failed");
@@ -157,14 +260,34 @@ async fn connection(
         }
         Err(_) => return,
     };
-    let service = TowerToHyperService::new(router);
-    let connection = http1::Builder::new().serve_connection(TokioIo::new(tls), service);
+    let cycle = Arc::new(Cycle::default());
+    cycle.set(Phase::Idle(Instant::now()));
+    let inner = TowerToHyperService::new(router);
+    let service = service_fn({
+        let cycle = cycle.clone();
+        move |request| {
+            let (answer, cycle) = (inner.call(request), cycle.clone());
+            async move {
+                let response = answer.await;
+                cycle.set(Phase::Idle(Instant::now()));
+                response
+            }
+        }
+    });
+    let io = Watched {
+        inner: tls,
+        cycle: cycle.clone(),
+    };
+    let connection = http1::Builder::new().serve_connection(TokioIo::new(io), service);
     let mut connection = std::pin::pin!(connection);
     tokio::select! {
         result = connection.as_mut() => {
             if let Err(e) = result {
                 tracing::debug!(error = %e, "webhook connection error");
             }
+        }
+        () = cycle.expired(limits) => {
+            tracing::debug!("webhook connection closed: deadline passed");
         }
         () = async { let _ = stop.wait_for(|stop| *stop).await; } => {
             connection.as_mut().graceful_shutdown();

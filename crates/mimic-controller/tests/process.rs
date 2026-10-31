@@ -597,8 +597,8 @@ fn inj_20_a_changed_or_emptied_ca_bundle_is_restored_within_10s() {
         Duration::from_secs(15),
     );
     let data = kube.secret();
-    let ca = data["ca.crt"].as_str().unwrap().to_string();
-    let encoded = base64_of(&ca);
+    // The Secret holds base64 already, as does the `caBundle`.
+    let encoded = data["ca.crt"].as_str().unwrap().to_string();
     wait_until(|| kube.ca_bundles().iter().all(|b| *b == encoded));
 
     kube.set_ca_bundle(0, "");
@@ -606,11 +606,6 @@ fn inj_20_a_changed_or_emptied_ca_bundle_is_restored_within_10s() {
     wait_until(|| kube.ca_bundles().iter().all(|b| *b == encoded));
     assert_eq!(kube.secret(), data, "no new certificate");
     assert!(kube.state.lock().unwrap().unknown.is_empty());
-}
-
-fn base64_of(text: &str) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(text)
 }
 
 fn wait_until(condition: impl Fn() -> bool) {

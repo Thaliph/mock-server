@@ -35,8 +35,8 @@ impl WebhookConfig {
             .map_err(|e| ConfigError::invalid("MIMIC_INJECT_SIDECAR_LOG", sidecar_log, e))?;
         Ok(WebhookConfig {
             addr: env.parse_or("MIMIC_WEBHOOK_ADDR", DEFAULT_ADDR)?,
-            max_connections: 256,
-            request_timeout: Duration::from_secs(5),
+            max_connections: max_connections(env)?,
+            request_timeout: request_timeout(env)?,
             namespace: env.required("MIMIC_NAMESPACE")?.to_string(),
             service: env.required("MIMIC_WEBHOOK_SERVICE")?.to_string(),
             secret: env.required("MIMIC_WEBHOOK_SECRET")?.to_string(),
@@ -50,6 +50,34 @@ impl WebhookConfig {
             },
         })
     }
+}
+
+fn max_connections(env: &Env) -> Result<usize, ConfigError> {
+    let var = "MIMIC_WEBHOOK_MAX_CONNECTIONS";
+    let value = env.parse_or(var, 256_usize)?;
+    if (1..=65535).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ConfigError::invalid(
+            var,
+            &value.to_string(),
+            "expected 1 to 65535",
+        ))
+    }
+}
+
+fn request_timeout(env: &Env) -> Result<Duration, ConfigError> {
+    let var = "MIMIC_WEBHOOK_REQUEST_TIMEOUT";
+    let value = env.duration_or(var, Duration::from_secs(5))?;
+    if value.is_zero() {
+        let given = env.optional(var).unwrap_or_default();
+        return Err(ConfigError::invalid(
+            var,
+            given,
+            "expected a duration above 0",
+        ));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
