@@ -188,6 +188,10 @@ Accepted limits of the proxy:
   logged.
 - A connection on which neither side ever sends a byte stays in detection (it costs one task
   and two sockets, as an idle tunnel does).
+- A client-first, non-HTTP protocol whose first bytes are only a token that could start an
+  HTTP request line (for example `ping` with no space or line end) stays in detection until it
+  sends more: such a client that waits for a reply first is stalled. Protocols that end their
+  first message with a line end or send binary data are not affected.
 
 ## 5. TLS interception
 
