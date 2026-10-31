@@ -140,21 +140,41 @@ would see without mimic, except for the limits listed at the end of this section
   destination refuses, resets or closes before answering, the client connection is closed
   (HTTP/1) or the stream is reset (HTTP/2), as close as possible to what the client would see
   without mimic. The sidecar answers by itself only for HTTP it cannot parse after detection
-  (`400`) and for a header section over its limits (`431`).
-- **Idle and long-lived connections**: no idle, header-read or request timeout, no cap on
-  connections or streams. A connection lives until one side closes it; a close or half-close
-  on one side is propagated to the other, and an idle HTTP/1 keep-alive connection closed by
-  the destination is closed on the client side. TCP keepalive (idle 300 s, interval 30 s,
-  4 probes) is set on both sockets so that connections whose peer vanished are released. At
-  start the sidecar raises its open-file soft limit to the hard limit; when `accept` fails
-  (e.g. no descriptor left) it counts the error, logs it at most once per second and retries,
-  without touching established connections.
+  (`400`) and for a request header section over its limits (`431`). The same limits (256
+  lines, 64 KiB) apply to HTTP/1 response header sections: a response over them closes the
+  client connection without a response byte (`result: rejected`, no `status`). An HTTP/2
+  client that breaks the protocol at connection level gets `GOAWAY` (the `h2` stack) and one
+  `rejected` access line.
+- **Idle and long-lived connections**: no idle, header-read, handshake or request timeout, no
+  cap on connections or streams. A connection lives until one side closes it; a close or
+  half-close on one side is propagated to the other, and an idle HTTP/1 keep-alive connection
+  closed by the destination is closed on the client side. The HTTP/2 handshake with the
+  destination does not wait for the destination: a silent destination leaves the client's
+  streams pending, as it would without mimic, until a side closes.
+- **Client close during an HTTP/1 exchange**: a client FIN after its last complete request
+  is forwarded to the destination as a FIN once every request received before it has been
+  forwarded (pipelined requests first); the destination can still answer and its response
+  reaches the client, then the client connection is closed. A reset is propagated as a reset
+  (`SO_LINGER` 0): from the client to the destination of an HTTP/1 exchange, before or after
+  a FIN, and from either side to the other in an opaque or TLS tunnel. An exchange
+  whose client has closed and whose destination then closes without answering ends as
+  `client_abort`. A client that closed and vanished (no RST, e.g. its host is gone) is
+  noticed by TCP keepalive on the client socket, which ends the exchange like a reset.
+- **Resources**: TCP keepalive (idle 300 s, interval 30 s, 4 probes) is set on both sockets so
+  that connections whose peer vanished are released. At start the sidecar raises its
+  open-file soft limit to the hard limit, or to `fs.nr_open` (`/proc/sys/fs/nr_open`, else
+  1048576) when the hard limit is unlimited; when `accept` fails (e.g. no descriptor left) it
+  counts the error, logs it at most once per second and retries, without touching
+  established connections.
 - **Overload: forward, never refuse.** No admission control. Log lines go through a bounded
   in-memory queue; when stdout cannot keep up, lines are dropped and counted
   (`mimic_log_lines_dropped_total`) instead of slowing traffic.
 - **Shutdown** (`SIGTERM`, sent after the app containers stopped): listeners stop accepting,
   HTTP/1 connections close after their in-flight response, HTTP/2 connections get `GOAWAY`,
-  tunnels run until `MIMIC_SHUTDOWN_GRACE` ends.
+  tunnels run until `MIMIC_SHUTDOWN_GRACE` ends. When it ends, the sidecar closes every
+  connection still open (tunnels, connections in detection, exchanges still pending), writes
+  the access line of each (`result: shutdown`), then one WARN line `grace period over` with
+  `connections` (how many it closed), and exits 0.
 - **Access logs** (`target` = `access`, level INFO): one line per HTTP exchange (`message`
   `http exchange`) and one per opaque or TLS connection (`message` `connection`), written when
   it ends.
@@ -164,25 +184,43 @@ would see without mimic, except for the limits listed at the end of this section
   | `direction` | `inbound` \| `outbound` | same |
   | `protocol` | `http1` \| `h2` | `tls` \| `tcp` |
   | `dst` | original destination `ip:port` | same |
-  | `authority` | normalised `Host`/`:authority` (else `dst`) | — |
+  | `authority` | normalised target authority (below), else `dst` | — |
   | `sni` | — | TLS only, when present |
   | `method`, `path` | method; path **without query**, at most 1024 bytes | — |
   | `status` | response status, absent when none | — |
   | `grpc_status` | from the trailers, when present | — |
   | `upgrade` | `true` when the exchange became a tunnel | — |
-  | `result` | `ok`, `upstream_reset`, `client_abort`, `rejected` (400/431 by the sidecar) | `ok`, `upstream_reset`, `client_abort` |
-  | `duration_ms`, `head_ms` | until the response end; until the response head | `duration_ms` |
+  | `result` | `ok`, `upstream_reset`, `client_abort`, `rejected` (refused by the sidecar's limits or parser), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown` |
+  | `duration_ms`, `head_ms` | until the response end; until the response head (both absent for `rejected`) | `duration_ms` |
   | `bytes_in`, `bytes_out` | request / response body bytes | client → destination / destination → client |
 
-  Header values, cookies, query strings and bodies are never logged.
+  The target authority is, for HTTP/1, the authority of an absolute-form request target, else
+  the `Host` header; for HTTP/2, `:authority`, else the `Host` header (RFC 9110 §7.2,
+  RFC 9113 §8.3.1). Header values, cookies, query strings and bodies are never logged.
 
 Accepted limits of the proxy:
 
 - HTTP/2 connection settings (window sizes, concurrent streams, header list size) are the
-  sidecar's, not the destination's. An HTTP/1 header section over 64 KiB or 256 lines gets
-  `431`, and HTTP that a lenient app would accept but `hyper` rejects gets `400`.
-- On HTTP/1, response trailers are forwarded only when the request carried `TE: trailers`,
-  and trailer names are lowercased (the `hyper` HTTP/1 stack).
+  sidecar's, not the destination's. An HTTP/1 request header section over 64 KiB or 256 lines
+  gets `431`, a response one closes the client connection, and HTTP that a lenient app would
+  accept but `hyper` rejects gets `400`. An HTTP/2 request that the `h2` stack refuses at
+  stream level (`RST_STREAM`, e.g. a connection-specific header) never reaches the sidecar's
+  code and writes no access line.
+- The `hyper` HTTP/1 server rewrites a few things the proxy cannot turn off: response
+  trailers are forwarded only when the request carried `TE: trailers`, and trailer names are
+  lowercased; a close-delimited response (no `content-length`, no `transfer-encoding`) to an
+  HTTP/1.1 client is re-framed as `transfer-encoding: chunked`; an HTTP/1.0 client gets an
+  `HTTP/1.0` status line, with `connection: keep-alive` added when it asked for keep-alive;
+  when shutdown or a destination close lands before a response head is written, that head
+  gets `connection: close`.
+- A client that half-closes and stays alive while its destination never answers nor closes
+  keeps the exchange open (one task, two sockets), as the destination would keep its own
+  socket without mimic. A client that vanished without a reset is noticed only by TCP
+  keepalive (about 5 minutes after the last activity).
+- An HTTP/1 request whose bytes arrive while `SIGTERM` closes its idle connection is not
+  read: the client sees the connection closed without a response and no access line is
+  written. The app containers have already stopped then, so the client would get no answer
+  without mimic either.
 - WebSocket over HTTP/2 (extended `CONNECT`, RFC 8441) is not advertised, so clients use
   HTTP/1.1 for it.
 - Until F3, outbound HTTPS is seen at connection level only (SNI, bytes, duration).
@@ -335,10 +373,15 @@ Accepted limits of the proxy:
   | `mimic_tcp_connections_total` | counter (F1) | `direction`, `result` (`ok`, `connect_error`, `loop`, `no_original_dst`) |
   | `mimic_accept_errors_total` | counter | `direction` |
 
-  `authority` is normalised (lower case, no trailing dot, default port removed, `invalid` when
-  it is not a host name or IP literal). Per direction and per metric, the first
-  `MIMIC_METRICS_MAX_AUTHORITIES` distinct values are kept; later ones are counted under
-  `authority="other"`. The set restarts empty with the process.
+  `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
+  port removed, `(invalid)` when it is not a host name or IP literal). Per direction and per
+  metric, the first `MIMIC_METRICS_MAX_AUTHORITIES` distinct values are kept; later ones are
+  counted under `authority="(other)"`. The two sentinels contain characters that no
+  normalised authority has, so a real host named `other` or `invalid` keeps its own series,
+  and they never take a budget slot. The set restarts empty with the process.
+  `mimic_http_request_duration_seconds` observes the exchanges forwarded to the destination;
+  requests the sidecar refuses itself (`rejected`) are counted in `mimic_http_requests_total`
+  only.
 - **Health**: `/healthz` (process alive) and `/readyz` (ready to serve) on the admin port.
 - No traces.
 
@@ -363,7 +406,7 @@ Accepted limits of the proxy:
 |---|---|---|
 | `MIMIC_LOG` | `info` | Log filter (`tracing` syntax). |
 | `MIMIC_ADMIN_ADDR` | sidecar `0.0.0.0:15100`, controller `0.0.0.0:8081` | Admin listener: `/healthz`, `/readyz`, `/metrics`. |
-| `MIMIC_SHUTDOWN_GRACE` | `10s` | Maximum drain time after `SIGTERM` (`<n>s` or `<n>ms`). |
+| `MIMIC_SHUTDOWN_GRACE` | `10s` | Maximum drain time after `SIGTERM` (`<n>s` or `<n>ms`); the sidecar then closes the connections still open (§4.1). |
 
 ### 10.2 Controller variables
 
@@ -524,19 +567,31 @@ in-process with an injected original destination, as the F1 tunnel tests do.
 | ID | Criterion |
 |---|---|
 | PRX-01 | **U.** Detection (§4.1) is a pure function of the bytes read so far that returns `need_more`, `tls` (with the SNI when the ClientHello has one), `http1`, `h2` or `opaque`. A ClientHello split over several reads or TLS records gives `need_more` until its SNI can be read; HTTP/1.0 and 1.1 request lines with standard and extension methods give `http1`; the 24-byte HTTP/2 preface gives `h2`, a prefix of it `need_more`; a first byte that can start none of them gives `opaque` at once; 16 KiB without a decision gives `opaque` (or `tls` without SNI for a TLS record). It never panics and never reads past the buffer for arbitrary input (property test). |
-| PRX-02 | **U.** Authority normalisation lower-cases, removes a trailing dot and the default port (80 for HTTP), keeps bracketed IPv6 literals, and maps anything that is not a host name or IP literal (or longer than 253 bytes) to `invalid`. The status class of 100–599 is `1xx`…`5xx`. The authority budget keeps the first N distinct values and returns `other` afterwards, the same for the same sequence of inputs. |
+| PRX-02 | **U.** Authority normalisation lower-cases, removes a trailing dot and the default port (80 for HTTP), keeps bracketed IPv6 literals, and maps anything that is not a host name or IP literal (or longer than 253 bytes) to `(invalid)`. The status class of 100–599 is `1xx`…`5xx`. The authority budget keeps the first N distinct values and returns `(other)` afterwards, the same for the same sequence of inputs (amended by PRX-23). |
 | PRX-03 | **I.** HTTP/1.1 through the inbound and the outbound listener: the destination receives the request line (query included), header names with their case, header order, values, body and framing (`content-length` and `chunked` with trailers) as sent by the client, and the client receives the status, reason phrase, headers and body as sent by the destination. No header is added (no `date`, `server`, `via`, `x-forwarded-*`). Several requests on one keep-alive connection, pipelined requests included, use one destination connection. A request whose `Host` names another server is still sent to the original destination. |
 | PRX-04 | **I.** HTTP/2 prior knowledge: concurrent streams on one client connection reach the destination on one connection with the same pseudo-headers, headers and bodies; a unary gRPC call returns its message and its `grpc-status`/`grpc-message` trailers unchanged. No header is added. |
 | PRX-05 | **I.** A destination that speaks first (banner) and a client that sends non-HTTP bytes are tunnelled byte-for-byte in both directions. A TLS client completes its handshake with a TLS destination through the sidecar and sees the destination's own certificate. |
 | PRX-06 | **I.** A WebSocket upgrade answered `101` and a `CONNECT` answered `200` carry bytes in both directions after the response; each produces one access log line with `upgrade: true`. |
 | PRX-07 | **I.** No synthesised response: when the destination refuses the connection, the client connection is closed without any byte; when it closes or resets after receiving an HTTP/1 request, the client connection is closed without a response (`result: upstream_reset`, `status_class="none"`); on HTTP/2 the stream is reset and the other streams of the connection complete. After a valid request line, a malformed header gets `400`, and more than 256 header lines or a header section over 64 KiB gets `431` (`result: rejected`). |
 | PRX-08 | **I.** Each HTTP exchange writes exactly one access log line and each TLS or opaque connection one line, with the fields and values of the §4.1 table for a known exchange (direction, protocol, dst, authority, sni, method, path without query, status, grpc_status, result, durations, byte counts). A canary value placed in a header, a cookie, the query string and the request and response bodies appears in no log line. A path with quotes, backslashes or percent-encoded CR/LF stays inside one valid JSON line; a path over 1024 bytes is truncated. |
-| PRX-09 | **I.** After a known set of exchanges, `/metrics` shows the exact values of `mimic_http_requests_total`, the `_count` of `mimic_http_request_duration_seconds`, `mimic_proxy_connections_total` (TLS counted under its SNI) and `mimic_proxy_bytes_total`, with the §9 labels. With `MIMIC_METRICS_MAX_AUTHORITIES=2`, a third authority is counted under `authority="other"`. An invalid value (`0`, `abc`, `10001`) exits with code 2 (FND-01). |
+| PRX-09 | **I.** After a known set of exchanges, `/metrics` shows the exact values of `mimic_http_requests_total`, the `_count` of `mimic_http_request_duration_seconds`, `mimic_proxy_connections_total` (TLS counted under its SNI) and `mimic_proxy_bytes_total`, with the §9 labels. With `MIMIC_METRICS_MAX_AUTHORITIES=2`, a third authority is counted under `authority="(other)"`. An invalid value (`0`, `abc`, `10001`) exits with code 2 (FND-01). |
 | PRX-10 | **I.** A connection without an original destination is closed and counted with `result="no_original_dst"`; one whose original destination is a sidecar listener with `result="loop"` (this splits the INJ-07 `loop` count). |
 | PRX-11 | **I.** No idle timeout: an opaque tunnel and an HTTP/1 keep-alive connection left idle for 35 s (longer than `hyper`'s default 30 s header-read timeout) still carry the next exchange. A client half-close reaches the destination, which can still answer. When the destination closes an idle keep-alive connection, the client sees the close within 1 s. The client-side and destination-side sockets have TCP keepalive set to 300 s / 30 s / 4 probes. |
-| PRX-12 | **I.** Forward, never refuse: 1000 simultaneous connections are all accepted and served. The sidecar's open-file soft limit equals its hard limit (`/proc/<pid>/limits`). While its stdout is not read, requests keep completing; once stdout is read again, `mimic_log_lines_dropped_total` is above zero and the dropped lines are absent, not truncated. |
-| PRX-13 | **I.** On `SIGTERM`, a response being streamed completes, new connections are refused, an idle HTTP/1 connection is closed, an HTTP/2 client receives `GOAWAY`, and the process exits 0 within `MIMIC_SHUTDOWN_GRACE` (FND-05). |
+| PRX-12 | **I.** Forward, never refuse: 1000 simultaneous connections are all accepted and served. The sidecar's open-file soft limit equals its hard limit (`/proc/<pid>/limits`), or the PRX-25 target when the hard limit is unlimited. While its stdout is not read, requests keep completing; once stdout is read again, `mimic_log_lines_dropped_total` is above zero and the dropped lines are absent, not truncated. |
+| PRX-13 | **I.** On `SIGTERM`, a response being streamed completes, new connections are refused, an idle HTTP/1 connection is closed, an HTTP/2 client receives `GOAWAY`, and the process exits 0 within `MIMIC_SHUTDOWN_GRACE` (FND-05). Connections still open at the end of the grace are closed as PRX-20 says. |
 | PRX-14 | **E.** In the INJ-13 scenario, a request from another pod to the app, an HTTP request from the app to another Service and a TLS connection from the app to the controller's webhook Service produce, in the sidecar's logs, access lines with `direction` `inbound` / `outbound` and `protocol` `http1` / `tls` (`sni` = the webhook Service name), and the matching `mimic_http_requests_total{…,status_class="2xx"}` and `mimic_proxy_connections_total{…,protocol="tls"}` series on `/metrics`. |
+| PRX-15 | **I.** HTTP/1 response heads are bounded like request heads: a destination response with 256 header lines, and one with a 64 KiB header section, reach the client byte for byte (more than `hyper`'s default 100 headers). A response with 257 lines or a header section over 64 KiB closes the client connection without a response byte; its access line has `result: rejected` and no `status`, and it is counted with `status_class="none"`. |
+| PRX-16 | **I.** No framing header is added: an HTTP/2 `POST` and `PUT` without body and without `content-length` (`END_STREAM` on `HEADERS`) reach the destination without `content-length`; an HTTP/2 request with a body and no `content-length` reaches it without one; an HTTP/1.1 `POST` without body, `content-length` or `transfer-encoding` reaches it without either. |
+| PRX-17 | **I.** Client FIN on HTTP/1: after a complete request, a client `shutdown(Write)` reaches the destination, which reads the complete request then EOF within 1 s; it answers after the EOF and the client reads the whole response, then EOF. With two pipelined requests sent in one write followed by the FIN, the destination reads both requests before EOF and the client gets both responses. When the destination closes without answering after that EOF, the access line has `result: client_abort` and the client connection is closed. |
+| PRX-18 | **I.** Resets are propagated as resets: an HTTP/1 client that resets (`SO_LINGER` 0) while its complete request waits for a silent destination, and one that resets after a FIN, make the destination's socket fail with `ECONNRESET` within 1 s, and the exchange's access line (`result: client_abort`) is written within 1 s. In an opaque tunnel and in a TLS tunnel, a reset by the client reaches the destination as a reset, and a reset by the destination reaches the client as a reset, within 1 s. |
+| PRX-19 | **I.** No handshake timeout: against a destination that accepts and never reads or writes, an HTTP/2 client's stream and an HTTP/1 client's request are still pending after 35 s (longer than any `hyper`/`h2` default timer), other connections to other destinations are served meanwhile, and when the client closes, the destination sees its connection closed within 1 s. |
+| PRX-20 | **I.** Grace expiry (in-process, grace 1 s): with an idle opaque tunnel, a connection still in detection and an HTTP/1 exchange whose destination never answers, a shutdown leaves the tunnel carrying bytes at 0.5 s; at the end of the grace (+ 1 s) the client and the destination of each see their connection closed, each writes one access line with `result: shutdown`, and one WARN line `grace period over` has `connections: 3`. |
+| PRX-21 | **I.** Requests refused by the sidecar (`400`, `431`, PRX-15 and PRX-22) increase `mimic_http_requests_total` and leave the `_count` of `mimic_http_request_duration_seconds` unchanged; their access lines have no `duration_ms` and no `head_ms`. |
+| PRX-22 | **I.** An HTTP/2 client that sends a frame breaking the protocol at connection level (e.g. `HEADERS` on an even stream id) gets `GOAWAY` with `PROTOCOL_ERROR`, and one access line is written with `protocol: h2`, `result: rejected`, `authority` = `dst`, and no `status`, `method` or `path`; it is counted with `status_class="none"`. |
+| PRX-23 | **U.** Authority sentinels and selection: normalisation maps a value that is not a host name or IP literal to `(invalid)`; `other` and `invalid` are ordinary host names. With a budget of 2, `(invalid)` and the overflow value `(other)` never take a slot, and a real host `other` gets its own label while slots remain. The target authority is the absolute-form authority, else `Host`, for HTTP/1, and `:authority`, else `Host`, for HTTP/2, else `dst`. **I.** An HTTP/2 request with `:authority: a.example` and `host: b.example` is logged and counted under `a.example`. |
+| PRX-24 | **I.** A declined upgrade leaves a plain keep-alive connection: after a WebSocket upgrade answered `400` and after a `CONNECT` answered `403`, the next request on the same connection is forwarded and answered; when the destination then closes the idle connection, the client sees the close within 1 s; on `SIGTERM`, such an idle connection is closed (PRX-13). |
+| PRX-25 | **U.** The open-file target is a pure function of the soft limit, the hard limit and `fs.nr_open`: a finite hard limit above the soft limit gives the hard limit; an unlimited hard limit gives `fs.nr_open` (1048576 when unreadable); a soft limit already at or above the target is left unchanged. |
+| PRX-26 | **I.** Body-less responses end as `ok`: a `HEAD` answered `200` with `content-length: 5`, a `204` and a `304` each write one access line with `result: ok`, their status and `bytes_out: 0`, and the connection carries the next request. |
 
 ## 13. Test strategy
 
@@ -545,3 +600,6 @@ in-process with an injected original destination, as the F1 tunnel tests do.
   as a child process.
 - **End-to-end** on kind with the Helm chart (`scripts/e2e.sh`), locally and in CI.
 - A criterion is covered when a test whose name contains its ID (lower case) passes.
+- A timing bound ("within 1 s") is measured from the event that triggers it (the close, the
+  signal), not from the start of the test, and the test's own wait for that event has its own
+  larger timeout, so that a slow runner fails only when the sidecar is really late.
