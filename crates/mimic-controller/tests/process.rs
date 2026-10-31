@@ -633,15 +633,25 @@ fn tls_08_the_seed_is_written_once_gates_readiness_and_is_never_logged() {
     assert!(String::from_utf8(created).unwrap().parse::<u64>().unwrap() > 1_700_000_000);
     for admin in [a, b] {
         let (_, metrics) = http_get(admin, "/metrics");
-        let line = metrics.lines().find(|l| l.starts_with("mimic_tls_seed_loaded"));
-        assert_eq!(line.map(|l| l.split_whitespace().last().unwrap()), Some("1"));
+        let line = metrics
+            .lines()
+            .find(|l| l.starts_with("mimic_tls_seed_loaded"));
+        assert_eq!(
+            line.map(|l| l.split_whitespace().last().unwrap()),
+            Some("1")
+        );
     }
 
     // A restart keeps it.
     first.terminate();
     first.wait_exit(Duration::from_secs(10));
     let mut restarted = Process::spawn(BIN, &vars);
-    wait_status(restarted.admin_addr(), "/readyz", 200, Duration::from_secs(15));
+    wait_status(
+        restarted.admin_addr(),
+        "/readyz",
+        200,
+        Duration::from_secs(15),
+    );
     assert_eq!(kube.seed(), data);
 
     // The value, in either encoding, is in no log line.

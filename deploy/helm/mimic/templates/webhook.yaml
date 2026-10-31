@@ -12,6 +12,16 @@ metadata:
 # Empty: the controller generates the CA and the serving certificate on first start.
 type: Opaque
 ---
+# The TLS seed (spec §5): empty here, filled by the controller on first start, removed with the
+# release so that no CA outlives the install.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "mimic.tlsCaSecret" . }}
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+type: Opaque
+---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:

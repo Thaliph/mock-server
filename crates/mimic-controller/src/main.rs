@@ -28,6 +28,7 @@ struct Config {
     common: CommonConfig,
     valkey: redis::Client,
     webhook: WebhookConfig,
+    tls_ca: tls_ca::TlsCaConfig,
 }
 
 fn config(env: &Env) -> Result<Config, ConfigError> {
@@ -35,6 +36,7 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
         common: CommonConfig::from_env(env, DEFAULT_ADMIN)?,
         valkey: valkey::client_from_env(env)?,
         webhook: WebhookConfig::from_env(env, VERSION)?,
+        tls_ca: tls_ca::TlsCaConfig::from_env(env)?,
     })
 }
 
@@ -64,6 +66,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     let mut metrics = Metrics::new("controller", VERSION);
     let admission_metrics = webhook::AdmissionMetrics::register(metrics.registry_mut());
     let cert_metrics = cert_manager::CertMetrics::register(metrics.registry_mut());
+    let seed_metrics = tls_ca::SeedMetrics::register(metrics.registry_mut());
     let metrics = Arc::new(metrics);
     let webhook = config.webhook;
     tracing::info!(
@@ -75,8 +78,11 @@ async fn run(config: Config) -> std::io::Result<()> {
     let cache = Arc::new(workloads::WorkloadCache::new());
     // The serving certificate is loaded into this slot by the certificate manager.
     let cert = Arc::new(tls::CertSlot::new());
+    // The TLS seed (spec §5) is loaded into this slot by `tls_ca::manage`.
+    let seed = Arc::new(tls_ca::SeedSlot::new());
     tokio::spawn({
-        let (cache, cert) = (cache.clone(), cert.clone());
+        let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
+        let tls_ca = config.tls_ca;
         let certificates = cert_manager::CertConfig {
             namespace: webhook.namespace.clone(),
             service: webhook.service,
@@ -86,20 +92,23 @@ async fn run(config: Config) -> std::io::Result<()> {
         async move {
             let client = workloads::client().await;
             tokio::spawn(workloads::watch(client.clone(), cache));
+            tokio::spawn(tls_ca::manage(client.clone(), tls_ca, seed, seed_metrics));
             cert_manager::manage(client, certificates, cert, cert_metrics).await;
         }
     });
     let health = valkey::Health::spawn(config.valkey);
     let readiness = Readiness::new({
-        let (cache, cert) = (cache.clone(), cert.clone());
+        let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
         move || {
             let up = health.is_up();
             let (certificate, synced) = (cert.is_loaded(), cache.is_synced());
+            let seeded = seed.is_loaded();
             async move {
                 let missing: Vec<&str> = [
                     (up, "valkey unreachable"),
                     (certificate, "webhook certificate not loaded"),
                     (synced, "MimicWorkload cache not synced"),
+                    (seeded, "TLS seed not loaded"),
                 ]
                 .into_iter()
                 .filter(|(ok, _)| !ok)

@@ -44,6 +44,11 @@ rules:
     resources: [secrets]
     resourceNames: [{{ include "mimic.webhookSecret" . }}]
     verbs: [get, update]
+  # Same for the TLS seed Secret (spec §5, §11); no other Secret.
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [{{ include "mimic.tlsCaSecret" . }}]
+    verbs: [get, update]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
