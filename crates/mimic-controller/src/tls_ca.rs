@@ -128,6 +128,7 @@ impl Root {
             .distinguished_name
             .push(DnType::OrganizationName, "mimic");
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.use_authority_key_identifier_extension = true;
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         params.not_before = datetime(now - SKEW);
         params.not_after = datetime(now + INTERMEDIATE_LIFETIME);

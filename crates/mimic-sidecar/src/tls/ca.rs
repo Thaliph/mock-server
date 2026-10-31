@@ -209,6 +209,7 @@ impl CaState {
             .distinguished_name
             .push(DnType::CommonName, name.to_string());
         params.is_ca = IsCa::NoCa;
+        params.use_authority_key_identifier_extension = true;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let window = ca.validity.leaf();
