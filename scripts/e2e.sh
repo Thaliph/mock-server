@@ -43,7 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! kind get clusters | grep -qx "$CLUSTER"; then
+if ! kind get clusters | grep -x "$CLUSTER" >/dev/null; then
   log "create kind cluster $CLUSTER"
   node_args=()
   [[ -z ${NODE_IMAGE:-} ]] || node_args=(--image "$NODE_IMAGE")
@@ -95,7 +95,7 @@ kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 log "fnd_09: controller readyz and metrics through a port-forward"
 admin_forward
 [[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "fnd_09: /readyz not 200"
-curl -fs localhost:18081/metrics | grep -q '^mimic_build_info{component="controller",version="' \
+curl -fs localhost:18081/metrics | grep '^mimic_build_info{component="controller",version="' >/dev/null \
   || fail "fnd_09: mimic_build_info missing"
 
 # The chart defaults (the install above sets no replica count) and the controller NetworkPolicy. Admission
@@ -141,9 +141,9 @@ YAML
 }
 # Positive control: with the controller's labels the same probe gets through, so a refusal
 # below is the NetworkPolicy and not a broken probe.
-probe "$NS" "app.kubernetes.io/instance: $RELEASE, app.kubernetes.io/name: mimic-controller" | grep -q PONG \
+probe "$NS" "app.kubernetes.io/instance: $RELEASE, app.kubernetes.io/name: mimic-controller" | grep PONG >/dev/null \
   || fail "fnd_08: probe with the controller labels could not reach Valkey"
-if probe default "app: probe" | grep -q PONG; then
+if probe default "app: probe" | grep PONG >/dev/null; then
   fail "fnd_08: a pod outside the controller reached Valkey"
 fi
 
@@ -183,14 +183,15 @@ serving_fp() {
 log "inj_11: the webhook certificate is created, served by both replicas, and kept on restart and upgrade"
 ca_b64=$(secret_key 'ca\.crt'); tls_b64=$(secret_key 'tls\.crt')
 [[ -n $ca_b64 && -n $tls_b64 ]] || fail "inj_11: the webhook Secret has no ca.crt or tls.crt"
-printf '%s' "$tls_b64" | base64 -d | openssl x509 -noout -ext subjectAltName \
-  | grep -q "DNS:$RELEASE-controller.$NS.svc" || fail "inj_11: serving certificate lacks the service name in its SAN"
+# Captured first: under pipefail, `grep -q` exiting early can SIGPIPE openssl and fail the check.
+san=$(printf '%s' "$tls_b64" | base64 -d | openssl x509 -noout -ext subjectAltName)
+[[ $san == *"DNS:$RELEASE-controller.$NS.svc"* ]] || fail "inj_11: serving certificate lacks the service name in its SAN"
 openssl verify -CAfile <(printf '%s' "$ca_b64" | base64 -d) <(printf '%s' "$tls_b64" | base64 -d) >/dev/null \
   || fail "inj_11: serving certificate is not signed by the CA in the Secret"
 [[ $(kubectl get mutatingwebhookconfiguration $RELEASE-injector -o jsonpath='{.webhooks[0].clientConfig.caBundle}') == "$ca_b64" ]] \
   || fail "inj_11: caBundle is not the CA of the Secret"
 admin_forward
-curl -fs localhost:18081/metrics | grep -q '^mimic_webhook_certificate_expiry_timestamp_seconds' \
+curl -fs localhost:18081/metrics | grep '^mimic_webhook_certificate_expiry_timestamp_seconds' >/dev/null \
   || fail "inj_11: mimic_webhook_certificate_expiry_timestamp_seconds not exposed"
 tls_fp=$(printf '%s' "$tls_b64" | base64 -d | openssl x509 -noout -fingerprint -sha256)
 # wait_controller_pods <n>: waits until exactly <n> controller pods exist (terminating ones are gone).
@@ -332,7 +333,7 @@ spec:
 YAML
 kubectl -n inj-17 wait --for=jsonpath='{.status.phase}'=Succeeded pod/mimic-init --timeout=120s >/dev/null \
   || { kubectl -n inj-17 logs mimic-init >&2 || true; fail "inj_17: mimic-init did not exit 0"; }
-kubectl -n inj-17 logs mimic-init | grep -q '"message":"redirection installed"' \
+kubectl -n inj-17 logs mimic-init | grep '"message":"redirection installed"' >/dev/null \
   || fail "inj_17: mimic-init did not log the installed redirection"
 
 # Scenarios below use Deployments of the Python image. `pod` and `jp` read a pod's fields.
@@ -869,7 +870,7 @@ can yes "get the TLS seed Secret" get secret/$RELEASE-tls-ca -n "$NS"
 can yes "update the TLS seed Secret" update secret/$RELEASE-tls-ca -n "$NS"
 can no "get another Secret" get secret/some-other -n "$NS"
 admin_forward
-curl -fs localhost:18081/metrics | grep -q '^mimic_tls_seed_loaded 1' || fail "tls_24: mimic_tls_seed_loaded is not 1"
+curl -fs localhost:18081/metrics | grep '^mimic_tls_seed_loaded 1' >/dev/null || fail "tls_24: mimic_tls_seed_loaded is not 1"
 exclude_max=$(seq -s, -f 'h%g.example.test' 0 256)
 accepted "a MimicWorkload with tls.exclude: exact host, suffix and IP" workload tls1 \
   'spec: {deployment: api, tls: {exclude: [api.example.com, "*.corp.example", 10.0.0.1]}}'
