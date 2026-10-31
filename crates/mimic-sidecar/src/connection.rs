@@ -3,13 +3,16 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use mimic_core::proxy::authority::normalise_authority;
 use mimic_core::proxy::{DETECT_LIMIT, Detection, detect};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
+use crate::access;
+use crate::exchange::Ctx;
 use crate::listener::{Direction, Outcome, Shared};
 use crate::{http, opaque};
 
@@ -18,6 +21,8 @@ const KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_PROBES: u32 = 4;
 const READ_CHUNK: usize = 4096;
+/// Default port of a TLS server name, removed by the authority normalisation.
+const TLS_PORT: u16 = 443;
 
 /// TCP keepalive (idle 300 s, interval 30 s, 4 probes) so that a vanished peer is noticed
 /// without any idle timeout on live connections.
@@ -42,6 +47,7 @@ enum First {
 }
 
 pub(crate) async fn handle(client: TcpStream, direction: Direction, shared: Arc<Shared>) {
+    let started = Instant::now();
     let dst = match shared.original_dst(&client) {
         Ok(dst) if !shared.is_listener(dst) => dst,
         Ok(dst) => {
@@ -74,27 +80,61 @@ pub(crate) async fn handle(client: TcpStream, direction: Direction, shared: Arc<
             tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
         }
     }
+    let proxy = shared.proxy();
     let (mut client, mut upstream) = (client, upstream);
-    let (to_upstream, to_client) = match first_bytes(&mut client, &mut upstream).await {
+    let (protocol, sni, to_upstream, to_client) = match first_bytes(&mut client, &mut upstream)
+        .await
+    {
         First::Client(detection, buf) => {
             tracing::debug!(direction = direction.as_str(), %dst, ?detection, "protocol detected");
-            if detection == Detection::Http1 {
-                if let Err(e) = http::relay(client, upstream, buf).await {
-                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
+            match detection {
+                Detection::Http1 => {
+                    proxy.connection(direction, "http1", &dst.to_string());
+                    let ctx = Ctx {
+                        direction,
+                        dst,
+                        proxy: proxy.clone(),
+                    };
+                    if let Err(e) = http::relay(client, upstream, buf, ctx).await {
+                        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
+                    }
+                    return;
                 }
-                return;
+                Detection::Tls { sni } => {
+                    let sni = sni.map(|name| normalise_authority(&name, TLS_PORT));
+                    ("tls", sni, buf, Vec::new())
+                }
+                // HTTP/2 is tunnelled like any other bytes until its relay exists.
+                _ => ("tcp", None, buf, Vec::new()),
             }
-            // HTTP/2 is tunnelled like any other bytes until its relay exists.
-            (buf, Vec::new())
         }
         First::Opaque {
             to_upstream,
             to_client,
-        } => (to_upstream, to_client),
+        } => ("tcp", None, to_upstream, to_client),
     };
-    if let Err(e) = opaque::tunnel(&mut client, &mut upstream, to_upstream, to_client).await {
+    let authority = sni.clone().unwrap_or_else(|| dst.to_string());
+    proxy.connection(direction, protocol, &authority);
+    let tunnelled = opaque::tunnel(&mut client, &mut upstream, to_upstream, to_client).await;
+    if let Some(e) = &tunnelled.error {
         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "tunnel ended");
     }
+    proxy.bytes(
+        direction,
+        protocol,
+        tunnelled.to_upstream,
+        tunnelled.to_client,
+    );
+    access::connection(&access::Connection {
+        direction,
+        protocol,
+        dst,
+        sni,
+        outcome: tunnelled.outcome,
+        duration: started.elapsed(),
+        bytes_in: tunnelled.to_upstream,
+        bytes_out: tunnelled.to_client,
+    });
 }
 
 /// Reads until the protocol is known, with no timeout and within [`DETECT_LIMIT`]. The bytes
