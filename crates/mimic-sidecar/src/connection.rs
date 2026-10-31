@@ -104,7 +104,18 @@ pub(crate) async fn handle(client: TcpStream, direction: Direction, shared: Arc<
                     let sni = sni.map(|name| normalise_authority(&name, TLS_PORT));
                     ("tls", sni, buf, Vec::new())
                 }
-                // HTTP/2 is tunnelled like any other bytes until its relay exists.
+                Detection::H2 => {
+                    proxy.connection(direction, "h2", &dst.to_string());
+                    let ctx = Ctx {
+                        direction,
+                        dst,
+                        proxy: proxy.clone(),
+                    };
+                    if let Err(e) = http::relay_h2(client, upstream, buf, ctx).await {
+                        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "h2 relay ended");
+                    }
+                    return;
+                }
                 _ => ("tcp", None, buf, Vec::new()),
             }
         }
