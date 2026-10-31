@@ -541,6 +541,35 @@ fn prx_09_invalid_budget_exits_2() {
     }
 }
 
+#[tokio::test]
+async fn prx_08_client_leaving_before_any_response_is_client_abort() {
+    let logs = capture_logs();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The destination reads the request and never answers.
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut sink = Vec::new();
+        let _ = s.read_to_end(&mut sink).await;
+    });
+    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"GET /slow HTTP/1.1\r\nHost: a.example\r\n\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(c);
+    let lines = logs.access_exactly(1).await;
+    assert_eq!(lines[0]["result"], "client_abort");
+    assert_eq!(lines[0]["path"], "/slow");
+    assert!(lines[0].get("status").is_none(), "{}", lines[0]);
+    counted(
+        &f.metrics,
+        "mimic_http_requests_total{direction=\"outbound\",protocol=\"http1\",authority=\"a.example\",status_class=\"none\"} 1",
+    )
+    .await;
+}
+
 #[test]
 fn prx_09_valid_budget_starts() {
     let mut sidecar = Process::spawn(
