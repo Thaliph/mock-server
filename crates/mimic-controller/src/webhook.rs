@@ -605,21 +605,50 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-        type Writer = Capture;
-        fn make_writer(&'a self) -> Capture {
-            self.clone()
+    thread_local! {
+        static CURRENT: std::cell::RefCell<Option<Capture>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writes to the capture of the current thread's test, if any.
+    struct Routed;
+
+    impl Write for Routed {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CURRENT.with(|c| match c.borrow_mut().as_mut() {
+                Some(capture) => capture.write(buf),
+                None => Ok(buf.len()),
+            })
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
 
-    fn capture_logs() -> (Capture, tracing::subscriber::DefaultGuard) {
+    /// Clears the current thread's capture when the test ends.
+    struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            CURRENT.with(|c| c.borrow_mut().take());
+        }
+    }
+
+    /// One global subscriber for the test binary: a thread-local `set_default` races with the
+    /// callsite interest cache when other tests log from threads without a subscriber.
+    fn capture_logs() -> (Capture, CaptureGuard) {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .flatten_event(true)
+                .with_writer(|| Routed)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber");
+        });
         let capture = Capture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .flatten_event(true)
-            .with_writer(capture.clone())
-            .finish();
-        (capture, tracing::subscriber::set_default(subscriber))
+        CURRENT.with(|c| *c.borrow_mut() = Some(capture.clone()));
+        (capture, CaptureGuard)
     }
 
     fn webhook_logs(capture: &Capture) -> Vec<Value> {
