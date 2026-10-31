@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use mimic_core::proxy::http1::{Event, Reason};
 use mimic_sidecar::access::Outcome;
 use mimic_sidecar::http1::{Relayed, relay};
+use mimic_sidecar::transport::Stream;
 use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -42,8 +43,9 @@ async fn proxy(dest: SocketAddr) -> Proxy {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = events.clone();
     let done = tokio::spawn(async move {
-        let (mut client, _) = listener.accept().await.unwrap();
-        let mut upstream = TcpStream::connect(dest).await.unwrap();
+        let (client, _) = listener.accept().await.unwrap();
+        let upstream = TcpStream::connect(dest).await.unwrap();
+        let (mut client, mut upstream) = (Stream::plain(client), Stream::plain(upstream));
         relay(
             &mut client,
             &mut upstream,

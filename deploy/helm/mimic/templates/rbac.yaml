@@ -1,5 +1,6 @@
 # Least privilege for the controller (spec §11): every grant is limited to the names this
-# release creates. No create, no pods, no Deployments, no other Secrets.
+# release creates. The only create is TokenReview (sidecar API authentication, spec §7.2).
+# No pods, no Deployments, no other Secrets.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -15,6 +16,10 @@ rules:
     # list and watch are limited by name too: the controller watches only its own configuration.
     resourceNames: [{{ include "mimic.webhookConfiguration" . }}]
     verbs: [get, list, watch, patch]
+  # Authenticates the sidecar API callers: the API server checks their projected token (spec §7.2).
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

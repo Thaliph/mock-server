@@ -26,6 +26,9 @@ controller:
     maxConnections: 256
     # TLS handshake and per-request read deadline (`<n>s` or `<n>ms`, greater than 0).
     requestTimeout: 5s
+  # Sidecar API port (spec §7.2): sidecars authenticate here with their projected token. Served
+  # with the webhook certificate; the controller Service and NetworkPolicy expose it.
+  sidecarApiPort: 8444
 
 # Pod injection (spec §7.1). The sidecar image is `image` above.
 inject:
@@ -69,6 +72,9 @@ networkPolicy:
   # Namespace selector of the namespaces that may scrape the admin port (8081), e.g.
   # {kubernetes.io/metadata.name: monitoring}. Empty: the release namespace only.
   metricsNamespaceSelector: {}
+  # Sources of the sidecar API port (controller.sidecarApiPort), as NetworkPolicy `from` peers.
+  # Empty: any source, since injected pods can be in any namespace. Set it to narrow the port.
+  sidecarApiFrom: []
 
 metrics:
   # Prometheus Operator ServiceMonitor for the controller.
