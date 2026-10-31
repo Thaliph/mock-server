@@ -3,7 +3,8 @@
 //! Nothing of the pod spec is ever logged or put in a metric label: only the namespace, the
 //! pod name, the deployment name, the result and the reason (INJ-09).
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::Json;
 use axum::Router;
@@ -16,7 +17,8 @@ use base64::Engine;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use mimic_core::inject::{
-    Decision, InjectConfig, JsonPatchOp, NamespaceMode, SkipReason, decide, deployment_of, patch,
+    Decision, InjectConfig, JsonPatchOp, NamespaceMode, SkipReason, TlsWiring, decide,
+    deployment_of, patch,
 };
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -24,6 +26,8 @@ use prometheus_client::registry::Registry;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::tls::CertSlot;
+use crate::tls_ca::{Seed, SeedSlot, derive_root};
 use crate::workloads::WorkloadCache;
 
 /// Largest `AdmissionReview` accepted (the API server's own limit is 3 MiB).
@@ -52,11 +56,48 @@ impl AdmissionMetrics {
     }
 }
 
+/// A root certificate (PEM) with the seed it was derived from.
+type Root = (Arc<Seed>, Arc<str>);
+
+/// Deployments whose root certificate is remembered. Past it the cache starts over.
+const ROOTS_CAPACITY: usize = 4096;
+
+/// Root certificates (PEM) by `(namespace, deployment)`. The signature of a root certificate
+/// is randomized: the PEM is kept so that the pod specs of a deployment are identical. An entry
+/// is only valid for the seed it was derived from.
+#[derive(Default)]
+pub struct RootCache {
+    roots: Mutex<BTreeMap<(String, String), Root>>,
+}
+
+impl RootCache {
+    fn get(&self, seed: &Arc<Seed>, namespace: &str, deployment: &str) -> Result<Arc<str>, String> {
+        let key = (namespace.to_string(), deployment.to_string());
+        let mut roots = self.roots.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached_seed, pem)) = roots.get(&key)
+            && cached_seed.same(seed)
+        {
+            return Ok(pem.clone());
+        }
+        let pem: Arc<str> = Arc::from(derive_root(seed, namespace, deployment)?.certificate_pem());
+        if roots.len() >= ROOTS_CAPACITY {
+            roots.clear();
+        }
+        roots.insert(key, (seed.clone(), pem.clone()));
+        Ok(pem)
+    }
+}
+
 /// What the endpoints need.
 pub struct Admission {
     pub controller_namespace: String,
     pub inject: InjectConfig,
     pub cache: Arc<WorkloadCache>,
+    /// The TLS seed the deployments' roots derive from (spec §5).
+    pub seed: Arc<SeedSlot>,
+    /// Holds the webhook CA handed to sidecars.
+    pub cert: Arc<CertSlot>,
+    pub roots: RootCache,
     pub metrics: AdmissionMetrics,
 }
 
@@ -179,7 +220,8 @@ impl Admission {
         );
         Ok(match decision {
             Decision::Inject { deployment } => {
-                let patch = patch(pod, &deployment, &self.inject).map_err(|_| Failure {
+                let tls = self.wiring(namespace, &deployment)?;
+                let patch = patch(pod, &deployment, &self.inject, &tls).map_err(|_| Failure {
                     reason: "patch",
                     message: "cannot build the injection patch",
                 })?;
@@ -202,6 +244,31 @@ impl Admission {
                 result: "skipped",
                 reason: reason.as_str(),
             },
+        })
+    }
+
+    /// What the sidecar of `deployment` needs for TLS interception; fails while the seed or the
+    /// webhook CA is not loaded, or the root cannot be derived (the pod is then not created).
+    fn wiring(&self, namespace: &str, deployment: &str) -> Result<TlsWiring, Failure> {
+        let seed = self.seed.get().ok_or(Failure {
+            reason: "seed-not-loaded",
+            message: "TLS seed not loaded yet",
+        })?;
+        let controller_ca = self.cert.ca_pem().ok_or(Failure {
+            reason: "ca-not-loaded",
+            message: "webhook CA not loaded yet",
+        })?;
+        let root = self
+            .roots
+            .get(&seed, namespace, deployment)
+            .map_err(|_| Failure {
+                reason: "root",
+                message: "cannot derive the deployment root",
+            })?;
+        Ok(TlsWiring {
+            root_pem: root.to_string(),
+            exclude: self.cache.exclude(namespace, deployment),
+            controller_ca: controller_ca.to_string(),
         })
     }
 
@@ -308,7 +375,10 @@ pub(crate) mod tests {
     const CANARY: &str = "canary-s3cret-7f3a";
 
     fn setup(synced: bool, workloads: &[(&str, &str, &str)]) -> (Router, Arc<Metrics>) {
-        let workloads: Vec<_> = workloads.iter().map(|(a, b, c)| (*a, *b, *c, &[][..])).collect();
+        let workloads: Vec<_> = workloads
+            .iter()
+            .map(|(a, b, c)| (*a, *b, *c, &[][..]))
+            .collect();
         let (router, metrics, _) = setup_tls(synced, &workloads, true);
         (router, metrics)
     }
@@ -809,12 +879,20 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|e| Some((e["name"].as_str()?.to_string(), e["value"].as_str()?.to_string())))
+            .filter_map(|e| {
+                Some((
+                    e["name"].as_str()?.to_string(),
+                    e["value"].as_str()?.to_string(),
+                ))
+            })
             .collect()
     }
 
     fn spki_of(pem: &str) -> Vec<u8> {
-        let der = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap().1.contents;
+        let der = x509_parser::pem::parse_x509_pem(pem.as_bytes())
+            .unwrap()
+            .1
+            .contents;
         let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
         cert.public_key().raw.to_vec()
     }
@@ -837,7 +915,10 @@ pub(crate) mod tests {
             env["MIMIC_TLS_EXCLUDE"],
             "*.corp.example,a.example.com,b.example.com"
         );
-        assert_eq!(env["MIMIC_CONTROLLER_URL"], "https://mimic.mimic-system.svc:8444");
+        assert_eq!(
+            env["MIMIC_CONTROLLER_URL"],
+            "https://mimic.mimic-system.svc:8444"
+        );
         assert!(env["MIMIC_CONTROLLER_CA"].contains("WEBHOOK-CA"));
         // The root is the one derived from the seed for `<namespace>/<deployment>`.
         let expected = derive_root(&seed.get().unwrap(), "shop", "shop").unwrap();
@@ -860,11 +941,9 @@ pub(crate) mod tests {
         let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
         assert_eq!(out["response"]["uid"], "u");
         assert_eq!(out["response"]["allowed"], false);
-        assert!(
-            metrics
-                .encode()
-                .contains(r#"mimic_webhook_admissions_total{result="error",reason="seed-not-loaded"} 1"#)
-        );
+        assert!(metrics.encode().contains(
+            r#"mimic_webhook_admissions_total{result="error",reason="seed-not-loaded"} 1"#
+        ));
         // A pod that is not injected does not need the seed.
         let mut host = pod();
         host["spec"]["hostNetwork"] = json!(true);

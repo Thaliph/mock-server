@@ -19,6 +19,16 @@ const ADMIN_PORT: i32 = 15100;
 pub const RESERVED_PORTS: [i32; 3] = [15001, 15006, 15100];
 /// UID of the sidecar, which the app must not use.
 pub const PROXY_UID: i64 = 1337;
+/// Volume holding the trust bundles, written by the sidecar and the `mimic-trust-<n>` containers.
+const TRUST_VOLUME: &str = "mimic-trust";
+/// Volume holding the projected token for the sidecar API.
+const TOKEN_VOLUME: &str = "mimic-token";
+/// Where app containers see their image's trust bundle.
+const APP_TRUST_PATH: &str = "/etc/mimic/tls";
+/// Prefix of the injected trust init containers.
+const TRUST_PREFIX: &str = "mimic-trust-";
+/// Options pointing a JVM at the PKCS12 trust store (spec §7.1).
+const JAVA_TRUST_OPTIONS: &str = "-Djavax.net.ssl.trustStore=/etc/mimic/tls/truststore.p12 -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=mimic";
 /// Namespaces that are never injected, besides the controller's own.
 pub const EXCLUDED_NAMESPACES: [&str; 3] = ["kube-system", "kube-public", "kube-node-lease"];
 
@@ -171,13 +181,33 @@ pub fn decide(
     if uid_conflict {
         return skip(SkipReason::UidConflict);
     }
-    let reserved = |name: &str| name == INIT_NAME || name == SIDECAR_NAME;
+    let trust_name = |name: &str| {
+        name.strip_prefix(TRUST_PREFIX)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let reserved = |name: &str| name == INIT_NAME || name == SIDECAR_NAME || trust_name(name);
+    let mounts_trust_path = |c: &Container| {
+        c.volume_mounts
+            .iter()
+            .flatten()
+            .any(|m| m.mount_path.trim_end_matches('/') == APP_TRUST_PATH)
+    };
     let name_conflict = spec.containers.iter().any(|c| reserved(&c.name))
         || spec
             .init_containers
             .iter()
             .flatten()
-            .any(|c| c.name == INIT_NAME);
+            .any(|c| c.name == INIT_NAME || trust_name(&c.name))
+        || spec
+            .volumes
+            .iter()
+            .flatten()
+            .any(|v| v.name == TRUST_VOLUME || v.name == TOKEN_VOLUME)
+        || spec
+            .containers
+            .iter()
+            .chain(spec.init_containers.iter().flatten())
+            .any(mounts_trust_path);
     if name_conflict {
         return skip(SkipReason::NameConflict);
     }
@@ -207,6 +237,19 @@ pub struct InjectConfig {
     pub sidecar_resources: ResourceRequirements,
     /// `MIMIC_LOG` given to the sidecar.
     pub sidecar_log: String,
+    /// `MIMIC_CONTROLLER_URL` given to the sidecar (spec §7.1).
+    pub controller_url: String,
+}
+
+/// What differs per pod in the TLS wiring (spec §7.1, §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsWiring {
+    /// The deployment's root certificate, PEM.
+    pub root_pem: String,
+    /// `spec.tls.exclude` of the deployment, sorted and deduplicated.
+    pub exclude: Vec<String>,
+    /// The webhook CA, PEM, which the sidecar verifies the sidecar API against.
+    pub controller_ca: String,
 }
 
 /// Injection patch of `pod`, owned by `deployment`.
@@ -214,6 +257,7 @@ pub fn patch(
     pod: &Pod,
     deployment: &str,
     cfg: &InjectConfig,
+    tls: &TlsWiring,
 ) -> Result<Vec<JsonPatchOp>, serde_json::Error> {
     let add = |path: String, value: Value| JsonPatchOp {
         op: "add",
@@ -240,18 +284,30 @@ pub fn patch(
     });
     let field = |name: &str, path: &str| json!({"name": name, "valueFrom": {"fieldRef": {"fieldPath": path}}});
     let rewritten = app_probes(pod);
+    let mut sidecar_env = vec![
+        json!({"name": "MIMIC_WORKLOAD", "value": literal(deployment)}),
+        field("MIMIC_POD_NAMESPACE", "metadata.namespace"),
+        field("MIMIC_POD_NAME", "metadata.name"),
+        field("MIMIC_POD_IP", "status.podIP"),
+        json!({"name": "MIMIC_APP_PROBES", "value": literal(&serde_json::to_string(&rewritten)?)}),
+        json!({"name": "MIMIC_LOG", "value": literal(&cfg.sidecar_log)}),
+        json!({"name": "MIMIC_TLS_CA", "value": literal(&tls.root_pem)}),
+        json!({"name": "MIMIC_CONTROLLER_URL", "value": literal(&cfg.controller_url)}),
+        json!({"name": "MIMIC_CONTROLLER_CA", "value": literal(&tls.controller_ca)}),
+    ];
+    if !tls.exclude.is_empty() {
+        sidecar_env
+            .push(json!({"name": "MIMIC_TLS_EXCLUDE", "value": literal(&tls.exclude.join(","))}));
+    }
     let sidecar = json!({
         "name": SIDECAR_NAME,
         "image": cfg.sidecar_image,
         "command": ["/usr/local/bin/mimic-sidecar"],
         "restartPolicy": "Always",
-        "env": [
-            {"name": "MIMIC_WORKLOAD", "value": literal(deployment)},
-            field("MIMIC_POD_NAMESPACE", "metadata.namespace"),
-            field("MIMIC_POD_NAME", "metadata.name"),
-            field("MIMIC_POD_IP", "status.podIP"),
-            {"name": "MIMIC_APP_PROBES", "value": literal(&serde_json::to_string(&rewritten)?)},
-            {"name": "MIMIC_LOG", "value": literal(&cfg.sidecar_log)},
+        "env": sidecar_env,
+        "volumeMounts": [
+            {"name": TRUST_VOLUME, "mountPath": "/mimic"},
+            {"name": TOKEN_VOLUME, "mountPath": "/var/run/secrets/mimic.platform.io", "readOnly": true},
         ],
         "resources": serde_json::to_value(&cfg.sidecar_resources)?,
         "startupProbe": {
@@ -276,11 +332,43 @@ pub fn patch(
 
     let spec = pod.spec.as_ref();
     let mut ops = Vec::new();
-    if spec.is_some_and(|s| s.init_containers.as_ref().is_some_and(|c| !c.is_empty())) {
-        ops.push(add("/spec/initContainers/0".into(), init));
-        ops.push(add("/spec/initContainers/1".into(), sidecar));
+    let app_inits: &[Container] = spec
+        .and_then(|s| s.init_containers.as_deref())
+        .unwrap_or_default();
+    let apps: &[Container] = spec.map_or(&[], |s| s.containers.as_slice());
+    let images = distinct_images(app_inits.iter().chain(apps));
+    let mut injected = vec![init, sidecar];
+    for (n, (image, pull_policy)) in images.iter().enumerate() {
+        injected.push(trust_container(n, image, *pull_policy, cfg, tls));
+    }
+    let shift = injected.len();
+    if app_inits.is_empty() {
+        ops.push(add("/spec/initContainers".into(), Value::Array(injected)));
     } else {
-        ops.push(add("/spec/initContainers".into(), json!([init, sidecar])));
+        for (i, container) in injected.into_iter().enumerate() {
+            ops.push(add(format!("/spec/initContainers/{i}"), container));
+        }
+    }
+    let volumes = json!([
+        {"name": TRUST_VOLUME, "emptyDir": {"sizeLimit": "16Mi"}},
+        {"name": TOKEN_VOLUME, "projected": {"sources": [{"serviceAccountToken": {
+            "audience": "mimic.platform.io", "expirationSeconds": 3600, "path": "token",
+        }}]}},
+    ]);
+    if spec.is_some_and(|s| s.volumes.as_ref().is_some_and(|v| !v.is_empty())) {
+        for volume in volumes.as_array().into_iter().flatten() {
+            ops.push(add("/spec/volumes/-".into(), volume.clone()));
+        }
+    } else {
+        ops.push(add("/spec/volumes".into(), volumes));
+    }
+    let bundle_of = |c: &Container| images.iter().position(|(i, _)| Some(i) == c.image.as_ref());
+    for (i, c) in app_inits.iter().enumerate() {
+        let base = format!("/spec/initContainers/{}", shift + i);
+        wire_app_container(&mut ops, &base, c, bundle_of(c));
+    }
+    for (i, c) in apps.iter().enumerate() {
+        wire_app_container(&mut ops, &format!("/spec/containers/{i}"), c, bundle_of(c));
     }
     if pod.metadata.annotations.is_some() {
         let key = INJECTED_ANNOTATION.replace('/', "~1");
@@ -310,6 +398,125 @@ pub fn patch(
         }
     }
     Ok(ops)
+}
+
+/// Images of `containers` with the pull policy of the first container running each, in order
+/// of first appearance. A container without an image is not an app image (the API server
+/// rejects it) and gets no bundle.
+fn distinct_images<'a>(
+    containers: impl Iterator<Item = &'a Container>,
+) -> Vec<(String, Option<&'a str>)> {
+    let mut images: Vec<(String, Option<&str>)> = Vec::new();
+    for c in containers {
+        if let Some(image) = &c.image
+            && !images.iter().any(|(i, _)| i == image)
+        {
+            images.push((image.clone(), c.image_pull_policy.as_deref()));
+        }
+    }
+    images
+}
+
+/// The `mimic-trust-<n>` init container, which runs mimic's binary inside the app image.
+fn trust_container(
+    n: usize,
+    image: &str,
+    pull_policy: Option<&str>,
+    cfg: &InjectConfig,
+    tls: &TlsWiring,
+) -> Value {
+    let mut container = json!({
+        "name": format!("{TRUST_PREFIX}{n}"),
+        "image": image,
+        "command": ["/mimic/bin/mimic-trust"],
+        "env": [
+            {"name": "MIMIC_TRUST_CA", "value": literal(&tls.root_pem)},
+            {"name": "MIMIC_TRUST_OUT", "value": format!("/mimic/trust/{n}")},
+            {"name": "MIMIC_LOG", "value": literal(&cfg.sidecar_log)},
+        ],
+        "volumeMounts": [{"name": TRUST_VOLUME, "mountPath": "/mimic"}],
+        "resources": {
+            "requests": {"cpu": "10m", "memory": "16Mi"},
+            "limits": {"memory": "64Mi"},
+        },
+        "securityContext": {
+            "runAsUser": PROXY_UID,
+            "runAsGroup": PROXY_UID,
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"},
+        },
+    });
+    if let Some(policy) = pull_policy {
+        container["imagePullPolicy"] = json!(policy);
+    }
+    container
+}
+
+/// Mounts the bundle of `c`'s image and sets the trust variables it does not define itself.
+/// `base` is the JSON pointer of the container in the patched pod.
+fn wire_app_container(
+    ops: &mut Vec<JsonPatchOp>,
+    base: &str,
+    c: &Container,
+    bundle: Option<usize>,
+) {
+    let Some(n) = bundle else { return };
+    let add = |path: String, value: Value| JsonPatchOp {
+        op: "add",
+        path,
+        value,
+    };
+    let mount = json!({
+        "name": TRUST_VOLUME,
+        "mountPath": APP_TRUST_PATH,
+        "readOnly": true,
+        "subPath": format!("trust/{n}"),
+    });
+    if c.volume_mounts.as_ref().is_some_and(|m| !m.is_empty()) {
+        ops.push(add(format!("{base}/volumeMounts/-"), mount));
+    } else {
+        ops.push(add(format!("{base}/volumeMounts"), json!([mount])));
+    }
+    let bundle_path = format!("{APP_TRUST_PATH}/ca-bundle.pem");
+    let wanted = [
+        ("SSL_CERT_FILE", bundle_path.as_str()),
+        ("REQUESTS_CA_BUNDLE", bundle_path.as_str()),
+        ("CURL_CA_BUNDLE", bundle_path.as_str()),
+        ("NODE_EXTRA_CA_CERTS", "/etc/mimic/tls/node-extra-ca.pem"),
+        ("JAVA_TOOL_OPTIONS", JAVA_TRUST_OPTIONS),
+    ];
+    let env = c.env.as_deref().unwrap_or_default();
+    let mut added = Vec::new();
+    for (name, value) in wanted {
+        match env.iter().position(|e| e.name == name) {
+            None => added.push(json!({"name": name, "value": value})),
+            // The app's own options come later and win; `$(VAR)` references stay the app's.
+            Some(i) if name == "JAVA_TOOL_OPTIONS" && env[i].value_from.is_none() => {
+                let own = env[i].value.as_deref().unwrap_or_default();
+                let value = if own.is_empty() {
+                    value.to_string()
+                } else {
+                    format!("{value} {own}")
+                };
+                ops.push(JsonPatchOp {
+                    op: "add",
+                    path: format!("{base}/env/{i}/value"),
+                    value: json!(value),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    if env.is_empty() {
+        ops.push(add(format!("{base}/env"), Value::Array(added)));
+    } else {
+        for var in added {
+            ops.push(add(format!("{base}/env/-"), var));
+        }
+    }
 }
 
 /// Liveness, readiness and startup probes of `c` with the field name and the sidecar's kind.
@@ -418,6 +625,7 @@ mod tests {
             spec: Some(PodSpec {
                 containers: vec![Container {
                     name: "app".into(),
+                    image: Some("app:1".into()),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -797,7 +1005,11 @@ mod tests {
 
     #[test]
     fn inj_03_init_containers_go_first_also_when_none() {
-        assert_eq!(init_names(&apply(&pod())), ["mimic-init", "mimic-sidecar"]);
+        // The one app image has its trust container after the sidecar (TLS-11).
+        assert_eq!(
+            init_names(&apply(&pod())),
+            ["mimic-init", "mimic-sidecar", "mimic-trust-0"]
+        );
         let mut p = pod();
         spec(&mut p).init_containers = Some(vec![Container {
             name: "migrate".into(),
@@ -805,7 +1017,7 @@ mod tests {
         }]);
         assert_eq!(
             init_names(&apply(&p)),
-            ["mimic-init", "mimic-sidecar", "migrate"]
+            ["mimic-init", "mimic-sidecar", "mimic-trust-0", "migrate"]
         );
     }
 
@@ -830,8 +1042,8 @@ mod tests {
         let mut p = pod();
         spec(&mut p).containers[0].readiness_probe = Some(http(IntOrString::Int(8080), "/r"));
         spec(&mut p).containers[0].liveness_probe = Some(http(IntOrString::Int(8080), "/l"));
-        let a = serde_json::to_string(&patch(&p, "shop-api", &cfg()).unwrap()).unwrap();
-        let b = serde_json::to_string(&patch(&p, "shop-api", &cfg()).unwrap()).unwrap();
+        let a = serde_json::to_string(&patch(&p, "shop-api", &cfg(), &wiring()).unwrap()).unwrap();
+        let b = serde_json::to_string(&patch(&p, "shop-api", &cfg(), &wiring()).unwrap()).unwrap();
         assert_eq!(a, b);
     }
 
@@ -923,7 +1135,10 @@ mod tests {
         let mut after = apply(&p);
         // The trust wiring (TLS-11) is the only other change: its mount and variables.
         let c = after["spec"]["containers"][0].as_object_mut().unwrap();
-        assert_eq!(c.remove("volumeMounts").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(
+            c.remove("volumeMounts").unwrap().as_array().unwrap().len(),
+            1
+        );
         c.insert("env".into(), json!([]));
         let spec_map = after["spec"].as_object_mut().unwrap();
         spec_map.remove("volumes");
@@ -1348,7 +1563,9 @@ mod tests {
         spec(&mut p)
             .containers
             .push(container("mimic-trusted", "x"));
-        spec(&mut p).containers.push(container("mimic-trust-x", "x"));
+        spec(&mut p)
+            .containers
+            .push(container("mimic-trust-x", "x"));
         spec(&mut p).containers[0].volume_mounts = Some(vec![VolumeMount {
             name: "data".into(),
             mount_path: "/etc/mimic/tls-other".into(),

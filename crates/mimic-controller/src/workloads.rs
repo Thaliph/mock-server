@@ -1,6 +1,6 @@
 //! Cache of the `MimicWorkload`s (spec §7.1), indexed by namespace and `spec.deployment`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -9,10 +9,13 @@ use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
 
+/// `(namespace, name, spec.deployment, spec.tls.exclude)` of a `MimicWorkload`.
+pub type Entry = (String, String, String, Vec<String>);
+
 #[derive(Default)]
 struct State {
-    /// `(namespace, MimicWorkload name)` to `spec.deployment`.
-    items: BTreeMap<(String, String), String>,
+    /// `(namespace, MimicWorkload name)` to `spec.deployment` and `spec.tls.exclude`.
+    items: BTreeMap<(String, String), (String, Vec<String>)>,
     synced: bool,
 }
 
@@ -27,10 +30,11 @@ impl WorkloadCache {
     }
 
     /// Adds or updates a `MimicWorkload`.
-    pub fn apply(&self, namespace: &str, name: &str, deployment: &str) {
-        self.write()
-            .items
-            .insert((namespace.into(), name.into()), deployment.into());
+    pub fn apply(&self, namespace: &str, name: &str, deployment: &str, exclude: Vec<String>) {
+        self.write().items.insert(
+            (namespace.into(), name.into()),
+            (deployment.into(), exclude),
+        );
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
@@ -38,9 +42,12 @@ impl WorkloadCache {
     }
 
     /// Replaces the whole content after a (re)list and marks the cache synced.
-    pub fn replace(&self, items: impl IntoIterator<Item = (String, String, String)>) {
+    pub fn replace(&self, items: impl IntoIterator<Item = Entry>) {
         let mut state = self.write();
-        state.items = items.into_iter().map(|(ns, n, d)| ((ns, n), d)).collect();
+        state.items = items
+            .into_iter()
+            .map(|(ns, n, d, e)| ((ns, n), (d, e)))
+            .collect();
         state.synced = true;
     }
 
@@ -53,7 +60,20 @@ impl WorkloadCache {
         self.read()
             .items
             .iter()
-            .any(|((ns, _), d)| ns == namespace && d == deployment)
+            .any(|((ns, _), (d, _))| ns == namespace && d == deployment)
+    }
+
+    /// `spec.tls.exclude` of every `MimicWorkload` of `namespace` naming `deployment`: the
+    /// sorted, deduplicated union (spec §5).
+    pub fn exclude(&self, namespace: &str, deployment: &str) -> Vec<String> {
+        let state = self.read();
+        let union: BTreeSet<&String> = state
+            .items
+            .iter()
+            .filter(|((ns, _), (d, _))| ns == namespace && d == deployment)
+            .flat_map(|(_, (_, exclude))| exclude)
+            .collect();
+        union.into_iter().cloned().collect()
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, State> {
@@ -66,12 +86,24 @@ impl WorkloadCache {
 
     #[cfg(test)]
     pub fn synced_with(items: &[(&str, &str, &str)]) -> WorkloadCache {
+        let items: Vec<_> = items
+            .iter()
+            .map(|(a, b, c)| (*a, *b, *c, &[][..]))
+            .collect();
+        WorkloadCache::synced_with_exclude(&items)
+    }
+
+    #[cfg(test)]
+    pub fn synced_with_exclude(items: &[(&str, &str, &str, &[&str])]) -> WorkloadCache {
         let cache = WorkloadCache::new();
-        cache.replace(
-            items
-                .iter()
-                .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string())),
-        );
+        cache.replace(items.iter().map(|(a, b, c, e)| {
+            (
+                a.to_string(),
+                b.to_string(),
+                c.to_string(),
+                e.iter().map(|x| x.to_string()).collect(),
+            )
+        }));
         cache
     }
 }
@@ -110,7 +142,9 @@ pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
                 tracing::info!("MimicWorkload cache synced");
             }
             Ok(Event::Apply(object)) => match entry(&object) {
-                Some((ns, name, deployment)) => cache.apply(&ns, &name, &deployment),
+                Some((ns, name, deployment, exclude)) => {
+                    cache.apply(&ns, &name, &deployment, exclude)
+                }
                 None => remove(&cache, &object),
             },
             Ok(Event::Delete(object)) => remove(&cache, &object),
@@ -125,13 +159,22 @@ fn remove(cache: &WorkloadCache, object: &DynamicObject) {
     }
 }
 
-/// `(namespace, name, spec.deployment)` of a `MimicWorkload`.
-fn entry(object: &DynamicObject) -> Option<(String, String, String)> {
-    let deployment = object.data.get("spec")?.get("deployment")?.as_str()?;
+fn entry(object: &DynamicObject) -> Option<Entry> {
+    let spec = object.data.get("spec")?;
+    let deployment = spec.get("deployment")?.as_str()?;
+    let exclude = spec
+        .get("tls")
+        .and_then(|tls| tls.get("exclude"))
+        .and_then(|exclude| exclude.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.as_str().map(str::to_string))
+        .collect();
     Some((
         object.metadata.namespace.clone()?,
         object.metadata.name.clone()?,
         deployment.to_string(),
+        exclude,
     ))
 }
 
@@ -143,7 +186,7 @@ mod tests {
     fn inj_08_cache_is_keyed_by_namespace_and_spec_deployment() {
         let cache = WorkloadCache::new();
         assert!(!cache.is_synced());
-        cache.replace([("shop".into(), "w1".into(), "api".into())]);
+        cache.replace([("shop".into(), "w1".into(), "api".into(), vec![])]);
         assert!(cache.is_synced());
         assert!(cache.has("shop", "api"));
         assert!(!cache.has("shop", "web"));
@@ -157,16 +200,16 @@ mod tests {
         assert!(cache.has("shop", "api"));
         cache.remove("shop", "w2");
         assert!(!cache.has("shop", "api"));
-        cache.apply("shop", "w3", "web");
+        cache.apply("shop", "w3", "web", vec![]);
         assert!(cache.has("shop", "web"));
-        cache.apply("shop", "w3", "api");
+        cache.apply("shop", "w3", "api", vec![]);
         assert!(!cache.has("shop", "web") && cache.has("shop", "api"));
     }
 
     #[test]
     fn inj_08_cache_replace_drops_vanished_workloads() {
         let cache = WorkloadCache::synced_with(&[("shop", "w1", "api")]);
-        cache.replace([("shop".into(), "w2".into(), "web".into())]);
+        cache.replace([("shop".into(), "w2".into(), "web".into(), vec![])]);
         assert!(!cache.has("shop", "api") && cache.has("shop", "web"));
     }
 
@@ -197,7 +240,10 @@ mod tests {
         }))
         .unwrap();
         let (ns, name, deployment, exclude) = entry(&object).unwrap();
-        assert_eq!((ns.as_str(), name.as_str(), deployment.as_str()), ("shop", "w", "api"));
+        assert_eq!(
+            (ns.as_str(), name.as_str(), deployment.as_str()),
+            ("shop", "w", "api")
+        );
         assert_eq!(exclude, ["a.test", "b.test"]);
     }
 }
