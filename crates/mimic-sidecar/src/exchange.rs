@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap};
 use hyper::{Request, Response};
-use mimic_core::proxy::authority::{INVALID_AUTHORITY, normalise_authority};
+use mimic_core::proxy::authority::{normalise_authority, target_authority};
 
 use crate::access::{self, Outcome};
 use crate::listener::Direction;
@@ -111,16 +111,15 @@ impl Tracker {
         protocol: &'static str,
         req: Request<Incoming>,
     ) -> (Tracker, Request<ReqBody>) {
-        let authority = match req.headers().get(header::HOST) {
-            Some(host) => host.to_str().map_or_else(
-                |_| INVALID_AUTHORITY.to_string(),
-                |host| normalise_authority(host, HTTP_PORT),
-            ),
-            None => req.uri().authority().map_or_else(
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .map(|host| host.to_str().unwrap_or(""));
+        let authority = target_authority(req.uri().authority().map(|a| a.as_str()), host)
+            .map_or_else(
                 || ctx.dst.to_string(),
-                |a| normalise_authority(a.as_str(), HTTP_PORT),
-            ),
-        };
+                |raw| normalise_authority(raw, HTTP_PORT),
+            );
         let request = Arc::new(RequestCount::default());
         let tracker = Tracker {
             ctx: ctx.clone(),

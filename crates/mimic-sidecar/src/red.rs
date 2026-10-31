@@ -1,6 +1,6 @@
 //! RED metrics of the proxy (spec §9): requests and their duration per authority, connections
 //! and bytes. The `authority` label is bounded per direction and metric by an
-//! [`AuthorityBudget`]; the rest is counted under `other`.
+//! [`AuthorityBudget`]; the rest is counted under `(other)`.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

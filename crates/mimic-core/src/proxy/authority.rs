@@ -7,15 +7,17 @@ use std::net::Ipv6Addr;
 /// Longest accepted authority, in bytes (maximum length of a DNS name).
 const MAX_AUTHORITY_LEN: usize = 253;
 
-/// Label used for anything that is not a host name or IP literal.
-pub const INVALID_AUTHORITY: &str = "invalid";
+/// Label used for anything that is not a host name or IP literal. The parentheses cannot
+/// appear in a normalised authority, so no real host collides with it.
+pub const INVALID_AUTHORITY: &str = "(invalid)";
 
-/// Label used once the [`AuthorityBudget`] is exhausted.
-pub const OTHER_AUTHORITY: &str = "other";
+/// Label used once the [`AuthorityBudget`] is exhausted; outside the host grammar like
+/// [`INVALID_AUTHORITY`].
+pub const OTHER_AUTHORITY: &str = "(other)";
 
 /// Normalises a `Host` / `:authority` value: lower case, no trailing dot, `default_port`
 /// removed, bracketed IPv6 literals kept. Anything that is not a host name or an IP literal
-/// (optionally with a port), or longer than 253 bytes, becomes `invalid`.
+/// (optionally with a port), or longer than 253 bytes, becomes `(invalid)`.
 pub fn normalise_authority(raw: &str, default_port: u16) -> String {
     parse(raw, default_port).unwrap_or_else(|| INVALID_AUTHORITY.to_string())
 }
@@ -86,12 +88,13 @@ pub fn status_class(status: u16) -> &'static str {
     }
 }
 
+/// The authority an exchange is about: the one of the request target (HTTP/1 absolute-form,
+/// HTTP/2 `:authority`), else the `Host` header (RFC 9110 §7.2, RFC 9113 §8.3.1).
 pub fn target_authority<'a>(uri: Option<&'a str>, host: Option<&'a str>) -> Option<&'a str> {
-    let _ = (uri, host);
-    None
+    uri.or(host)
 }
 
-/// Keeps the first `max` distinct authorities; later ones are reported as `other`.
+/// Keeps the first `max` distinct authorities; later ones are reported as `(other)`. The sentinels take no slot.
 /// One budget per direction and metric.
 #[derive(Debug, Clone)]
 pub struct AuthorityBudget {
@@ -107,8 +110,11 @@ impl AuthorityBudget {
         }
     }
 
-    /// Label to use for `authority`: itself when kept, `other` otherwise.
+    /// Label to use for `authority`: itself when kept, `(other)` otherwise.
     pub fn label(&mut self, authority: &str) -> String {
+        if authority == INVALID_AUTHORITY || authority == OTHER_AUTHORITY {
+            return authority.to_string();
+        }
         if self.seen.contains(authority) {
             return authority.to_string();
         }
