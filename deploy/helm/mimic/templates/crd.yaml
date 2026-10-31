@@ -1,4 +1,4 @@
-# MimicWorkload (spec §7, §7.1). F1 defines spec.deployment and spec.mode only.
+# MimicWorkload (spec §7, §7.1): spec.deployment, spec.mode and (F3) spec.tls.exclude.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -43,3 +43,18 @@ spec:
                   type: string
                   enum: [discovery, mock]
                   default: discovery
+                tls:
+                  description: TLS interception settings of the Deployment's pods (spec §5). Applied to pods created afterwards.
+                  type: object
+                  properties:
+                    exclude:
+                      description: >-
+                        Names whose TLS connections are never intercepted: an exact host, a suffix pattern
+                        `*.example.com` (below `example.com`, not itself) or an IP literal.
+                      type: array
+                      maxItems: 256
+                      items:
+                        type: string
+                        maxLength: 253
+                        # A DNS name (labels of letters, digits, `-`, `_`), optionally `*.` first, or an IPv6 literal.
+                        pattern: '^((\*\.)?[A-Za-z0-9_]([-A-Za-z0-9_]{0,61}[A-Za-z0-9_])?(\.[A-Za-z0-9_]([-A-Za-z0-9_]{0,61}[A-Za-z0-9_])?)*\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]+)$'

@@ -131,8 +131,9 @@ would see without mimic, except for the limits listed at the end of this section
   passed-through connection go through untouched. The SNI of the ClientHello is read for logs
   and metrics. The decrypted stream of an intercepted connection follows the rules of this
   section (detection, HTTP/1 codec, `h2` relay, failures, close and reset propagation,
-  shutdown) with TLS in between: a FIN becomes `close_notify` then FIN, a reset stays a TCP
-  reset on the other socket, and the bytes compared are the decrypted ones.
+  shutdown) with TLS in between: a FIN becomes `close_notify` then FIN, a FIN received without
+  `close_notify` (a peer that just closes its socket) is read as a FIN, not as a failure, a reset
+  stays a TCP reset on the other socket, and the bytes compared are the decrypted ones.
 - **HTTP/2 prior knowledge (`h2c`)** connections are parsed by `hyper`. Each client
   connection gets its own connection to the original destination, and every stream is
   forwarded there as received. The proxy never routes on `:authority`/`Host`, never retries,

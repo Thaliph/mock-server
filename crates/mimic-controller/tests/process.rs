@@ -15,12 +15,14 @@ use mimic_runtime::testing::{Process, http_get, run, wait_status};
 const BIN: &str = env!("CARGO_BIN_EXE_mimic-controller");
 const ADMIN: (&str, &str) = ("MIMIC_ADMIN_ADDR", "127.0.0.1:0");
 /// Required by the webhook (spec §10.2); the listener takes any free port.
-const WEBHOOK: [(&str, &str); 7] = [
+const WEBHOOK: [(&str, &str); 9] = [
+    ("MIMIC_SIDECAR_API_ADDR", "127.0.0.1:0"),
     ("MIMIC_WEBHOOK_ADDR", "127.0.0.1:0"),
     ("MIMIC_NAMESPACE", "mimic-system"),
     ("MIMIC_WEBHOOK_SERVICE", "mimic"),
     ("MIMIC_WEBHOOK_SECRET", "mimic-webhook-tls"),
     ("MIMIC_WEBHOOK_CONFIGURATION", "mimic-injector"),
+    ("MIMIC_TLS_CA_SECRET", "mimic-tls-ca"),
     ("MIMIC_INJECT_SIDECAR_IMAGE", "mimic-sidecar:test"),
     ("MIMIC_INJECT_INIT_IMAGE", "mimic-init:test"),
 ];
@@ -272,12 +274,16 @@ struct FakeKube {
 struct KubeState {
     secret_data: serde_json::Value,
     secret_version: u64,
+    /// The TLS seed Secret (empty at first) and its version.
+    seed_data: serde_json::Value,
+    seed_version: u64,
     ca_bundles: Vec<String>,
     config_version: u64,
     unknown: Vec<String>,
 }
 
 const SECRET_PATH: &str = "/api/v1/namespaces/mimic-system/secrets/mimic-webhook-tls";
+const SEED_PATH: &str = "/api/v1/namespaces/mimic-system/secrets/mimic-tls-ca";
 const CONFIGS_PATH: &str = "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations";
 const CONFIG_PATH: &str =
     "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations/mimic-injector";
@@ -302,6 +308,8 @@ impl FakeKube {
         let state = Arc::new(Mutex::new(KubeState {
             secret_data: serde_json::json!({}),
             secret_version: 1,
+            seed_data: serde_json::json!({}),
+            seed_version: 1,
             ca_bundles: vec![String::new(); 3],
             config_version: 1,
             unknown: Vec::new(),
@@ -321,6 +329,10 @@ impl FakeKube {
 
     fn secret(&self) -> serde_json::Value {
         self.state.lock().unwrap().secret_data.clone()
+    }
+
+    fn seed(&self) -> serde_json::Value {
+        self.state.lock().unwrap().seed_data.clone()
     }
 
     fn ca_bundles(&self) -> Vec<String> {
@@ -371,6 +383,20 @@ fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
                     state.secret_data = body["data"].clone();
                     state.secret_version += 1;
                     (200, secret_json(&state))
+                } else {
+                    let conflict = serde_json::json!({"apiVersion": "v1", "kind": "Status",
+                        "status": "Failure", "reason": "Conflict", "code": 409,
+                        "message": "the object has been modified"});
+                    (409, conflict)
+                }
+            }
+            ("GET", SEED_PATH) => (200, seed_json(&state)),
+            ("PUT", SEED_PATH) => {
+                let version = body["metadata"]["resourceVersion"].as_str().unwrap_or("");
+                if version == state.seed_version.to_string() {
+                    state.seed_data = body["data"].clone();
+                    state.seed_version += 1;
+                    (200, seed_json(&state))
                 } else {
                     let conflict = serde_json::json!({"apiVersion": "v1", "kind": "Status",
                         "status": "Failure", "reason": "Conflict", "code": 409,
@@ -488,6 +514,13 @@ fn secret_json(state: &KubeState) -> serde_json::Value {
         "data": state.secret_data})
 }
 
+fn seed_json(state: &KubeState) -> serde_json::Value {
+    serde_json::json!({"apiVersion": "v1", "kind": "Secret",
+        "metadata": {"name": "mimic-tls-ca", "namespace": "mimic-system",
+            "resourceVersion": state.seed_version.to_string()},
+        "data": state.seed_data})
+}
+
 fn config_json(state: &KubeState) -> serde_json::Value {
     let webhooks: Vec<_> = state
         .ca_bundles
@@ -583,6 +616,76 @@ fn inj_11_certificates_are_stored_and_ca_bundle_patched_once_for_all_replicas() 
 }
 
 #[test]
+fn tls_08_the_seed_is_written_once_gates_readiness_and_is_never_logged() {
+    use base64::Engine;
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let kube = FakeKube::start("seed");
+    assert_eq!(kube.seed(), serde_json::json!({}));
+    let vars = env(&[("MIMIC_VALKEY_URL", &url), ("KUBECONFIG", &kube.kubeconfig)]);
+    let mut first = Process::spawn(BIN, &vars);
+    let mut second = Process::spawn(BIN, &vars);
+    let (a, b) = (first.admin_addr(), second.admin_addr());
+    wait_status(a, "/readyz", 200, Duration::from_secs(15));
+    wait_status(b, "/readyz", 200, Duration::from_secs(15));
+
+    // One seed for both replicas: 32 bytes and its creation time.
+    let data = kube.seed();
+    let seed = base64::engine::general_purpose::STANDARD
+        .decode(data["seed"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(seed.len(), 32);
+    let created = base64::engine::general_purpose::STANDARD
+        .decode(data["created"].as_str().unwrap())
+        .unwrap();
+    assert!(String::from_utf8(created).unwrap().parse::<u64>().unwrap() > 1_700_000_000);
+    for admin in [a, b] {
+        let (_, metrics) = http_get(admin, "/metrics");
+        let line = metrics
+            .lines()
+            .find(|l| l.starts_with("mimic_tls_seed_loaded"));
+        assert_eq!(
+            line.map(|l| l.split_whitespace().last().unwrap()),
+            Some("1")
+        );
+    }
+
+    // A restart keeps it.
+    first.terminate();
+    first.wait_exit(Duration::from_secs(10));
+    let mut restarted = Process::spawn(BIN, &vars);
+    wait_status(
+        restarted.admin_addr(),
+        "/readyz",
+        200,
+        Duration::from_secs(15),
+    );
+    assert_eq!(kube.seed(), data);
+
+    // The value, in either encoding, is in no log line.
+    let encoded = data["seed"].as_str().unwrap().to_string();
+    let hex: String = seed.iter().map(|byte| format!("{byte:02x}")).collect();
+    for process in [&mut second, &mut restarted] {
+        for line in process.lines() {
+            assert!(!line.contains(&encoded) && !line.contains(&hex), "{line}");
+        }
+    }
+    assert!(kube.state.lock().unwrap().unknown.is_empty());
+}
+
+#[test]
+fn tls_08_missing_seed_secret_name_exits_2() {
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let kube = FakeKube::start("noseed");
+    let mut vars = env(&[("MIMIC_VALKEY_URL", &url), ("KUBECONFIG", &kube.kubeconfig)]);
+    vars.retain(|(k, _)| *k != "MIMIC_TLS_CA_SECRET");
+    let (status, _, stderr) = run(BIN, &[], &vars);
+    assert_eq!(status.code(), Some(2));
+    assert!(stderr.contains("MIMIC_TLS_CA_SECRET"), "{stderr}");
+}
+
+#[test]
 fn inj_19_invalid_listener_limits_exit_2() {
     for (var, value) in [
         ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "0"),
@@ -598,6 +701,82 @@ fn inj_19_invalid_listener_limits_exit_2() {
         );
         assert_eq!(status.code(), Some(2), "{var}={value}");
         assert!(stderr.contains(var), "{var}: {stderr}");
+    }
+}
+
+/// Whether the server closes `stream` within `within`, the client having sent nothing.
+fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+    stream.set_read_timeout(Some(within)).unwrap();
+    let mut buf = [0u8; 16];
+    match stream.read(&mut buf) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+    }
+}
+
+#[test]
+fn tls_09_the_sidecar_api_listener_applies_the_inj_19_limits_with_its_own_budget() {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let kube = FakeKube::start("tls09");
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[
+            ("MIMIC_VALKEY_URL", &url),
+            ("KUBECONFIG", &kube.kubeconfig),
+            ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "2"),
+            ("MIMIC_WEBHOOK_REQUEST_TIMEOUT", "1s"),
+        ]),
+    );
+    let mut addr_of = |message: &str| -> SocketAddr {
+        let line = controller.wait_log(Duration::from_secs(10), |v| v["message"] == message);
+        line["addr"].as_str().expect("addr field").parse().unwrap()
+    };
+    let api = addr_of("sidecar api listening");
+    let webhook = addr_of("webhook listening");
+    assert_ne!(api, webhook);
+
+    // Two clients that never start TLS fill the sidecar API budget; a third waits for a slot.
+    let started = std::time::Instant::now();
+    let mut first = TcpStream::connect(api).unwrap();
+    let mut second = TcpStream::connect(api).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let mut third = TcpStream::connect(api).unwrap();
+    // The webhook has a budget of its own: its client is served, hence closed at the timeout.
+    let mut other = TcpStream::connect(webhook).unwrap();
+    assert!(closed_within(&mut other, TIMEOUT + Duration::from_secs(1)));
+    assert!(started.elapsed() < TIMEOUT * 2, "the webhook was blocked");
+    // The request timeout closes the two holders ...
+    assert!(closed_within(&mut first, TIMEOUT + Duration::from_secs(1)));
+    assert!(closed_within(&mut second, TIMEOUT + Duration::from_secs(1)));
+    // ... and only then is the third one served, and closed in turn at its own timeout.
+    assert!(
+        closed_within(&mut third, TIMEOUT * 2 + Duration::from_secs(1)),
+        "the third client was never served"
+    );
+    assert!(
+        started.elapsed() >= TIMEOUT * 2 - Duration::from_millis(200),
+        "the third client was served before a slot was free: {:?}",
+        started.elapsed()
+    );
+
+    // And the other way round: the full webhook does not refuse the sidecar API.
+    let mut held = [
+        TcpStream::connect(webhook).unwrap(),
+        TcpStream::connect(webhook).unwrap(),
+    ];
+    thread::sleep(Duration::from_millis(100));
+    let at = std::time::Instant::now();
+    let mut probe = TcpStream::connect(api).unwrap();
+    assert!(closed_within(&mut probe, TIMEOUT + Duration::from_secs(1)));
+    assert!(at.elapsed() < TIMEOUT * 2, "the sidecar API was blocked");
+    for stream in &mut held {
+        assert!(closed_within(stream, TIMEOUT + Duration::from_secs(1)));
     }
 }
 

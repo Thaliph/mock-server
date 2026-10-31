@@ -61,10 +61,14 @@ spec:
                 fieldRef: {fieldPath: metadata.namespace}
             - name: MIMIC_WEBHOOK_ADDR
               value: "0.0.0.0:8443"
+            - name: MIMIC_SIDECAR_API_ADDR
+              value: {{ printf "0.0.0.0:%v" .Values.controller.sidecarApiPort | quote }}
             - name: MIMIC_WEBHOOK_SERVICE
               value: {{ include "mimic.controllerService" . | quote }}
             - name: MIMIC_WEBHOOK_SECRET
               value: {{ include "mimic.webhookSecret" . | quote }}
+            - name: MIMIC_TLS_CA_SECRET
+              value: {{ include "mimic.tlsCaSecret" . | quote }}
             - name: MIMIC_WEBHOOK_CONFIGURATION
               value: {{ include "mimic.webhookConfiguration" . | quote }}
             - name: MIMIC_WEBHOOK_MAX_CONNECTIONS
@@ -84,6 +88,8 @@ spec:
               containerPort: 8081
             - name: webhook
               containerPort: 8443
+            - name: sidecar-api
+              containerPort: {{ .Values.controller.sidecarApiPort }}
           livenessProbe:
             httpGet: {path: /healthz, port: admin}
             periodSeconds: 10
@@ -137,3 +143,7 @@ spec:
     - name: webhook
       port: 8443
       targetPort: webhook
+    # Sidecar API (spec §7.2): sidecars of injected pods call it with their projected token.
+    - name: sidecar-api
+      port: {{ .Values.controller.sidecarApiPort }}
+      targetPort: sidecar-api

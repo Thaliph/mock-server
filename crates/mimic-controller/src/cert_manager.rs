@@ -133,6 +133,7 @@ async fn reconcile(
     // The CA goes out first: loading the certificate makes the controller ready, and the API
     // server must already trust it by then.
     publish_ca(configurations, &config.configuration, &stored.ca_crt).await?;
+    slot.set_ca_pem(&stored.ca_crt);
     slot.set_pem(&stored.tls_crt, &stored.tls_key)?;
     if let Some(end) = certs::not_after(&stored.tls_crt) {
         let seconds = end.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());

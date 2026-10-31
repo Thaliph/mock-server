@@ -28,6 +28,11 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{ .Release.Name }}-webhook-tls
 {{- end -}}
 
+{{/* The Secret holding the TLS seed the per-deployment root CAs derive from (spec §5). */}}
+{{- define "mimic.tlsCaSecret" -}}
+{{ .Release.Name }}-tls-ca
+{{- end -}}
+
 {{/*
 CEL projection of the webhooks of the injector configuration without clientConfig.caBundle
 (spec §11). The argument is the root variable, "object" or "oldObject". Optional fields are

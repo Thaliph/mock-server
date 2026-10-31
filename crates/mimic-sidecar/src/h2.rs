@@ -2,7 +2,8 @@
 //! connection on the client socket and a `hyper` client connection on the destination socket,
 //! one for the other, with no pool and no timer. Requests are forwarded as received; the proxy
 //! never routes on `Host` and never answers for a destination failure. HTTP/1 goes through the
-//! codec ([`crate::http1`]).
+//! codec ([`crate::http1`]). Each side is a plain TCP or a TLS [`Stream`] (the h2 streams are
+//! then the decrypted ones).
 
 use std::future::Future;
 use std::io;
@@ -14,9 +15,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 
 use crate::exchange::{self, Ctx, ReqBody, RespBody, Tracker};
+use crate::transport::Stream;
 
 const PROTOCOL: &str = "h2";
 
@@ -24,7 +25,7 @@ const PROTOCOL: &str = "h2";
 struct Replay {
     prefix: Vec<u8>,
     pos: usize,
-    inner: TcpStream,
+    inner: Stream,
 }
 
 impl AsyncRead for Replay {
@@ -72,8 +73,8 @@ struct State {
 /// Relays the HTTP/2 streams of `client` (whose first bytes, `replay`, were already read) to
 /// `upstream` until one side closes. A stream the destination fails is reset alone.
 pub async fn relay(
-    client: TcpStream,
-    upstream: TcpStream,
+    client: Stream,
+    upstream: Stream,
     replay: Vec<u8>,
     ctx: Ctx,
     stop: impl Future<Output = ()>,
