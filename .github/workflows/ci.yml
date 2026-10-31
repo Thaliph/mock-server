@@ -218,8 +218,13 @@ jobs:
           restore-keys: fuzz-corpus-http1-
       - name: Fuzz the HTTP/1 codec
         working-directory: fuzz
+        # cargo-fuzz defaults to the target it was built for; the prebuilt binary is musl, which
+        # the address sanitizer cannot use.
+        # The corpus directory is missing on a cold cache; libFuzzer requires it to exist.
         run: >
-          cargo +nightly-2026-10-24 fuzz run http1 corpus/http1 seeds/http1 --
+          mkdir -p corpus/http1 &&
+          cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu http1
+          corpus/http1 seeds/http1 --
           -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10 -dict=http1.dict
       # The corpus grows on the weekly run only; PR runs read it and never write it.
       - if: github.event_name == 'schedule'
