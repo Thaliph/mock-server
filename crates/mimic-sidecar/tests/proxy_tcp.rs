@@ -161,10 +161,10 @@ async fn prx_11_idle_tunnel_carries_the_next_exchange_after_35_seconds() {
     let f = fixture(Direction::Outbound, move |_| Some(echo)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
     c.write_all(b"one\n").await.unwrap();
-    assert_eq!(read_exactly(&mut c, 3).await, b"one\n");
+    assert_eq!(read_exactly(&mut c, 4).await, b"one\n");
     tokio::time::sleep(Duration::from_secs(35)).await;
     c.write_all(b"two\n").await.unwrap();
-    assert_eq!(read_exactly(&mut c, 3).await, b"two\n");
+    assert_eq!(read_exactly(&mut c, 4).await, b"two\n");
 }
 
 #[tokio::test]
