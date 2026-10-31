@@ -71,12 +71,27 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// How long a keep-alive connection may wait for its next request.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounds on what the listener lets clients hold (spec §7.1, INJ-19).
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Connections served at once.
+    pub max_connections: usize,
+    /// TLS handshake, then each request (headers and body).
+    pub request_timeout: Duration,
+    /// Keep-alive connection waiting for a next request.
+    pub idle_timeout: Duration,
+}
+
 /// Serves `router` over TLS on `listener` until `stop` resolves, then lets in-flight requests
 /// finish for at most `grace`.
 pub async fn serve(
     listener: TcpListener,
     slot: Arc<CertSlot>,
     router: Router,
+    _limits: Limits,
     grace: Duration,
     stop: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
@@ -155,5 +170,147 @@ async fn connection(
             connection.as_mut().graceful_shutdown();
             let _ = connection.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::certs::{self, Decision, Stored};
+    use axum::routing::get;
+    use std::time::{Instant, SystemTime};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsConnector;
+    use tokio_rustls::client::TlsStream;
+
+    const TIMEOUT: Duration = Duration::from_millis(500);
+    const NAME: &str = "mimic.mimic-system.svc";
+
+    struct Listener {
+        addr: std::net::SocketAddr,
+        connector: TlsConnector,
+    }
+
+    async fn start(max_connections: usize, idle_timeout: Duration) -> Listener {
+        let stored =
+            certs::issue(&Stored::default(), Decision::NewCa, NAME, SystemTime::now()).unwrap();
+        let slot = Arc::new(CertSlot::new());
+        slot.set_pem(&stored.tls_crt, &stored.tls_key).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in CertificateDer::pem_slice_iter(&stored.ca_crt) {
+            roots.add(ca.unwrap()).unwrap();
+        }
+        let client = rustls::ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route("/ok", get(|| async { "ok" }));
+        let limits = Limits {
+            max_connections,
+            request_timeout: TIMEOUT,
+            idle_timeout,
+        };
+        tokio::spawn(serve(
+            listener,
+            slot,
+            router,
+            limits,
+            Duration::from_secs(1),
+            std::future::pending(),
+        ));
+        Listener {
+            addr,
+            connector: TlsConnector::from(Arc::new(client)),
+        }
+    }
+
+    impl Listener {
+        async fn tls(&self) -> TlsStream<TcpStream> {
+            let tcp = TcpStream::connect(self.addr).await.unwrap();
+            let name = NAME.to_string().try_into().unwrap();
+            self.connector.connect(name, tcp).await.unwrap()
+        }
+    }
+
+    /// True once the peer closes the connection (EOF or reset) within `within`.
+    async fn closed_within(stream: &mut (impl AsyncReadExt + Unpin), within: Duration) -> bool {
+        let mut buffer = [0; 256];
+        let end = Instant::now() + within;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, stream.read(&mut buffer)).await {
+                Err(_) => return false,
+                Ok(Ok(0) | Err(_)) => return true,
+                Ok(Ok(_)) => {}
+            }
+        }
+    }
+
+    const MARGIN: Duration = Duration::from_secs(1);
+
+    async fn get_ok(stream: &mut TlsStream<TcpStream>) -> String {
+        stream
+            .write_all(b"GET /ok HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buffer = [0; 512];
+        let n = stream.read(&mut buffer).await.unwrap();
+        String::from_utf8_lossy(&buffer[..n]).into_owned()
+    }
+
+    #[tokio::test]
+    async fn inj_19_a_client_that_never_starts_tls_is_closed_within_the_timeout() {
+        let server = start(4, Duration::from_secs(60)).await;
+        let mut tcp = TcpStream::connect(server.addr).await.unwrap();
+        assert!(closed_within(&mut tcp, TIMEOUT + MARGIN).await);
+    }
+
+    #[tokio::test]
+    async fn inj_19_headers_sent_byte_by_byte_are_closed_within_the_timeout() {
+        let server = start(4, Duration::from_secs(60)).await;
+        let mut tls = server.tls().await;
+        let started = Instant::now();
+        for byte in b"GET /ok HTTP/1.1\r\nhost: x\r\nx-slow: ".iter().cycle() {
+            if tls.write_all(&[*byte]).await.is_err() || started.elapsed() > TIMEOUT + MARGIN {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(closed_within(&mut tls, Duration::from_millis(200)).await);
+        assert!(
+            started.elapsed() < TIMEOUT + MARGIN,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn inj_19_a_review_waits_for_a_free_slot_and_is_answered_within_twice_the_timeout() {
+        let server = start(4, Duration::from_secs(60)).await;
+        let mut stalled = Vec::new();
+        for _ in 0..4 {
+            stalled.push(TcpStream::connect(server.addr).await.unwrap());
+        }
+        let started = Instant::now();
+        let mut tls = server.tls().await;
+        assert!(get_ok(&mut tls).await.starts_with("HTTP/1.1 200"));
+        assert!(started.elapsed() >= TIMEOUT / 2, "{:?}", started.elapsed());
+        assert!(started.elapsed() < 2 * TIMEOUT + Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn inj_19_an_idle_keep_alive_connection_is_closed_after_the_idle_duration() {
+        let idle = Duration::from_millis(1200);
+        let server = start(4, idle).await;
+        let mut tls = server.tls().await;
+        assert!(get_ok(&mut tls).await.starts_with("HTTP/1.1 200"));
+        let started = Instant::now();
+        // Longer than the request timeout, shorter than the idle duration.
+        assert!(!closed_within(&mut tls, TIMEOUT + Duration::from_millis(300)).await);
+        assert!(closed_within(&mut tls, idle).await);
+        assert!(started.elapsed() >= idle - Duration::from_millis(100));
     }
 }

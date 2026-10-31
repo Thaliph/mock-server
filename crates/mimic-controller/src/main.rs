@@ -123,6 +123,11 @@ async fn run(config: Config) -> std::io::Result<()> {
         webhook_listener,
         cert,
         webhook::router(admission),
+        tls::Limits {
+            max_connections: webhook.max_connections,
+            request_timeout: webhook.request_timeout,
+            idle_timeout: tls::IDLE_TIMEOUT,
+        },
         grace,
         admin::shutdown_signal(),
     );
