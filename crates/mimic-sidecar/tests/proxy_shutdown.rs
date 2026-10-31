@@ -54,6 +54,7 @@ async fn refused(addr: SocketAddr) {
 
 #[tokio::test]
 async fn prx_13_streamed_response_completes_and_new_connections_are_refused() {
+    let _logs = common::capture_logs();
     let gate = std::sync::Arc::new(tokio::sync::Notify::new());
     let dest = streaming_dest(gate.clone()).await;
     let f = fixture(Direction::Inbound, move |_| Some(dest)).await;
@@ -97,6 +98,7 @@ async fn prx_13_streamed_response_completes_and_new_connections_are_refused() {
 
 #[tokio::test]
 async fn prx_13_idle_http1_connection_is_closed() {
+    let _logs = common::capture_logs();
     let dest = {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -144,6 +146,7 @@ async fn prx_13_idle_http1_connection_is_closed() {
 
 #[tokio::test]
 async fn prx_13_http2_client_receives_goaway() {
+    let _logs = common::capture_logs();
     let dest = {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -299,6 +302,7 @@ async fn prx_20_grace_expiry_closes_tunnels_detections_and_pending_exchanges() {
 
 #[tokio::test]
 async fn prx_20_drain_returns_zero_when_everything_ended_in_time() {
+    let _logs = common::capture_logs();
     let echo = common::echo_server().await;
     let f = fixture(Direction::Outbound, move |_| Some(echo)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();

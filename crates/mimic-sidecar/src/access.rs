@@ -18,6 +18,8 @@ pub enum Outcome {
     ClientAbort,
     /// A `400`/`431` answered by the sidecar itself, or an HTTP/2 connection broken by the client.
     Rejected,
+    /// Closed at the end of the shutdown grace.
+    Shutdown,
 }
 
 impl Outcome {
@@ -27,6 +29,7 @@ impl Outcome {
             Outcome::UpstreamReset => "upstream_reset",
             Outcome::ClientAbort => "client_abort",
             Outcome::Rejected => "rejected",
+            Outcome::Shutdown => "shutdown",
         }
     }
 }

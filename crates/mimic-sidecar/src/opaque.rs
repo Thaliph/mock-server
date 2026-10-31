@@ -3,6 +3,7 @@
 //! side reaches the other as a reset (`SO_LINGER` 0), also after a FIN. The bytes relayed and the
 //! side that failed are recorded for the access line and the metrics.
 
+use std::future::Future;
 use std::io;
 use std::net::Shutdown;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +18,7 @@ use crate::access::Outcome;
 const CHUNK: usize = 16 * 1024;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Side {
+pub enum Side {
     Client,
     Upstream,
 }
@@ -95,37 +96,62 @@ fn abort(s: &TcpStream) {
     let _ = SockRef::from(s).set_linger(Some(Duration::ZERO));
 }
 
-/// Writes the bytes read during detection to their side, then relays until both sides are done.
+/// What detection learned before the tunnel starts.
+pub enum Early {
+    /// A side failed (a reset) while the first bytes were read.
+    Failed(Side, io::Error),
+    /// The grace ended during detection.
+    Shutdown,
+}
+
+/// Why a tunnel ended other than by both sides finishing.
+enum Ended {
+    Failed(Side, io::Error),
+    Shutdown,
+}
+
+/// Writes the bytes read during detection to their side, then relays until both sides are done,
+/// a side fails (the other one gets a reset) or `abort` resolves (both are closed).
 pub async fn tunnel(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
     to_upstream: Vec<u8>,
     to_client: Vec<u8>,
+    early: Option<Early>,
+    abort_signal: impl Future<Output = ()>,
 ) -> Tunnelled {
     let (client, upstream) = (&*client, &*upstream);
     let up_count = AtomicU64::new(to_upstream.len() as u64);
     let down_count = AtomicU64::new(to_client.len() as u64);
-    let (up, down) = tokio::join!(
-        write_all(upstream, &to_upstream),
-        write_all(client, &to_client)
-    );
-    let result = match (up, down) {
-        (Err(e), _) => Err((Side::Upstream, e)),
-        (_, Err(e)) => Err((Side::Client, e)),
-        _ => tokio::select! {
-            r = async {
-                tokio::try_join!(
-                    copy(client, Side::Client, upstream, Side::Upstream, &up_count),
-                    copy(upstream, Side::Upstream, client, Side::Client, &down_count),
-                )
-            } => r.map(|_| ()),
-            failure = failed(client, Side::Client) => Err(failure),
-            failure = failed(upstream, Side::Upstream) => Err(failure),
-        },
+    let result = match early {
+        Some(Early::Shutdown) => Err(Ended::Shutdown),
+        early => {
+            let (up, down) = tokio::join!(
+                write_all(upstream, &to_upstream),
+                write_all(client, &to_client)
+            );
+            match (up, down, early) {
+                (Err(e), _, _) => Err(Ended::Failed(Side::Upstream, e)),
+                (_, Err(e), _) => Err(Ended::Failed(Side::Client, e)),
+                (_, _, Some(Early::Failed(side, e))) => Err(Ended::Failed(side, e)),
+                _ => tokio::select! {
+                    r = async {
+                        tokio::try_join!(
+                            copy(client, Side::Client, upstream, Side::Upstream, &up_count),
+                            copy(upstream, Side::Upstream, client, Side::Client, &down_count),
+                        )
+                    } => r.map(|_| ()).map_err(|(side, e)| Ended::Failed(side, e)),
+                    (side, e) = failed(client, Side::Client) => Err(Ended::Failed(side, e)),
+                    (side, e) = failed(upstream, Side::Upstream) => Err(Ended::Failed(side, e)),
+                    () = abort_signal => Err(Ended::Shutdown),
+                },
+            }
+        }
     };
     let (outcome, error) = match result {
         Ok(()) => (Outcome::Ok, None),
-        Err((side, e)) => {
+        Err(Ended::Shutdown) => (Outcome::Shutdown, None),
+        Err(Ended::Failed(side, e)) => {
             // The other side sees what this one did: a reset.
             match side {
                 Side::Upstream => {

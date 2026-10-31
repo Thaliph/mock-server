@@ -29,6 +29,8 @@ pub struct Ctx {
     pub direction: Direction,
     pub dst: SocketAddr,
     pub proxy: ProxyMetrics,
+    /// True once the connections left at the end of the shutdown grace are being closed.
+    pub aborted: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Request body bytes seen so far, and whether the client side of the body failed.
@@ -207,7 +209,11 @@ impl Tracker {
     fn finish(&mut self, outcome: Outcome, bytes_out: u64) {
         self.ended = true;
         let failed = self.request.failed.load(Ordering::Relaxed);
-        let outcome = if failed && outcome != Outcome::Ok {
+        let outcome = if outcome == Outcome::Ok {
+            outcome
+        } else if *self.ctx.aborted.borrow() {
+            Outcome::Shutdown
+        } else if failed {
             Outcome::ClientAbort
         } else {
             outcome

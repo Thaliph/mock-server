@@ -23,6 +23,8 @@ use crate::connection;
 use crate::red::{DEFAULT_MAX_AUTHORITIES, ProxyMetrics};
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+/// Time given to the connections to finish closing once they were told to.
+const ABORT_WAIT: Duration = Duration::from_secs(1);
 const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const IPV6_INTERFACES: &str = "/proc/net/if_inet6";
 
@@ -119,6 +121,7 @@ pub struct Shared {
     proxy: ProxyMetrics,
     original_dst: OriginalDst,
     stop: watch::Sender<bool>,
+    abort: watch::Sender<bool>,
     active: watch::Sender<usize>,
 }
 
@@ -156,6 +159,7 @@ impl Shared {
             proxy: ProxyMetrics::default(),
             original_dst,
             stop: watch::channel(false).0,
+            abort: watch::channel(false).0,
             active: watch::channel(0).0,
         }
     }
@@ -171,6 +175,33 @@ impl Shared {
         async move {
             let _ = stop.wait_for(|stopped| *stopped).await;
         }
+    }
+
+    /// Resolves once the grace ended and the connections left must close ([`Shared::drain`]).
+    pub(crate) fn aborted(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut abort = self.abort.subscribe();
+        async move {
+            let _ = abort.wait_for(|aborted| *aborted).await;
+        }
+    }
+
+    /// The abort flag, for the exchanges that must tell a closure at the end of the grace.
+    pub(crate) fn abort_flag(&self) -> watch::Receiver<bool> {
+        self.abort.subscribe()
+    }
+
+    /// Waits at most `grace` for the connections to end by themselves. Then closes the ones
+    /// left (their access line says `shutdown`), logs how many, and returns that number.
+    pub async fn drain(&self, grace: Duration) -> usize {
+        if tokio::time::timeout(grace, self.drained()).await.is_ok() {
+            return 0;
+        }
+        let connections = *self.active.borrow();
+        self.abort.send_replace(true);
+        tracing::warn!(connections, "grace period over");
+        // Closing is immediate; this only lets the access lines out.
+        let _ = tokio::time::timeout(ABORT_WAIT, self.drained()).await;
+        connections
     }
 
     /// Resolves when no accepted connection is left.
