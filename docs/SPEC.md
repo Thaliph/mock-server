@@ -128,38 +128,66 @@ would see without mimic, except for the limits listed at the end of this section
   reads at most 16 KiB, and the bytes it read are forwarded unchanged.
 - **TLS** connections are passed through untouched (interception is F3); the SNI of the
   ClientHello is read for logs and metrics.
-- **HTTP/1.x and HTTP/2 prior knowledge (`h2c`)** connections are parsed. Each client
-  connection gets its own connection to the original destination, in the same protocol, and
-  every request is forwarded there as received. The proxy never routes on `Host`/`:authority`,
-  never retries, adds, removes or rewrites no header (no `Date`, `Server`, `Via`,
-  `X-Forwarded-*`), keeps HTTP/1 header-name case and reason phrases, and keeps body bytes,
-  framing and trailers. Traffic management is v2 (§1.2).
+- **HTTP/2 prior knowledge (`h2c`)** connections are parsed by `hyper`. Each client
+  connection gets its own connection to the original destination, and every stream is
+  forwarded there as received. The proxy never routes on `:authority`/`Host`, never retries,
+  adds no header (no `Date`, `Server`, `Via`, `X-Forwarded-*`), and adds no
+  `content-length` that the client did not send. Traffic management is v2 (§1.2).
+- **HTTP/1.x** connections go through mimic's own byte relay (the `http1` codec), not
+  `hyper`. Each client connection gets its own connection to the original destination. Every
+  byte read from one side is written to the other unchanged, in order, as soon as it is read:
+  request and status lines, header names (case), order, duplicates and values, line endings,
+  `obs-fold`, bodies and framing (`content-length`, `chunked` with chunk extensions and
+  trailers, close-delimited responses), HTTP/1.0 and keep-alive, pipelining, `1xx` responses
+  (`100 Continue`, `103 Early Hints`), `HEAD`/`204`/`304`. Nothing is added, removed or
+  re-framed, and connection management (keep-alive, `Connection: close`) is left to the two
+  ends. The codec parses only to find message boundaries and to fill the access log and the
+  metrics; it lives in `mimic-core` (pure, no I/O) and keeps bounded state:
+  - message framing follows RFC 9112 §6: a request has a body only with `content-length` or
+    `transfer-encoding: chunked`; a response to `HEAD`, a `1xx`, `204` or `304` has none;
+    otherwise `chunked` when it is the last transfer coding, else `content-length`, else the
+    body runs until the destination closes;
+  - a request line, status line or header line ends with CRLF or a bare LF (RFC 9112 §2.2);
+  - a head over 64 KiB or 256 lines, a chunk-size line over 4 KiB or a trailer section over
+    64 KiB or 256 lines is not framed (below);
+  - responses are matched in order with the requests read; at most 32 requests are read
+    ahead of their responses, after which the relay stops reading the client until a
+    response completes (TCP back-pressure, no refusal);
+  - a response that arrives while no request is pending (e.g. a `408` before the destination
+    closes) is forwarded and logged as an exchange without `method` and `path`.
+- **Unframed HTTP/1.** The codec never answers and never rejects. When it cannot frame a
+  message unambiguously, the bytes still go through unchanged: the destination (or the
+  client, for a response) interprets them, as it would without mimic. A message is unframed
+  when its head does not parse (invalid tokens, a bare CR, `obs-fold` in a framing header),
+  is over the limits above, or has an ambiguous length: both `content-length` and
+  `transfer-encoding`, several `content-length` values that differ or one that is not a
+  decimal number, a request `transfer-encoding` whose last coding is not `chunked` or that
+  comes with HTTP/1.0, or an invalid chunk size. The exchange then writes its access line at
+  once (`result: unframed`, with the fields known so far), and the rest of the connection is
+  relayed as an opaque tunnel, with no further exchange line.
 - **Upgrades**: a request answered with `101` (WebSocket, `h2c` upgrade), or a `CONNECT`
-  answered with 2xx, continues as an opaque tunnel after the response.
-- **Failures**: the sidecar never synthesises a response for a destination failure. When the
-  destination refuses, resets or closes before answering, the client connection is closed
-  (HTTP/1) or the stream is reset (HTTP/2), as close as possible to what the client would see
-  without mimic. The sidecar answers by itself only for HTTP it cannot parse after detection
-  (`400`) and for a request header section over its limits (`431`). The same limits (256
-  lines, 64 KiB) apply to HTTP/1 response header sections: a response over them closes the
-  client connection without a response byte (`result: rejected`, no `status`). An HTTP/2
-  client that breaks the protocol at connection level gets `GOAWAY` (the `h2` stack) and one
-  `rejected` access line.
+  answered with 2xx, continues as an opaque tunnel after the response. After a request that
+  asks for an upgrade or is a `CONNECT`, the relay reads no more client bytes until the final
+  response to it arrives (the client must wait for it, RFC 9110 §7.8, §9.3.6). A declined
+  upgrade leaves a plain HTTP/1 connection.
+- **Failures**: the sidecar never synthesises a response. When the destination refuses the
+  connection, the client connection is closed without any byte; when it closes or resets
+  before answering, the client sees the same close or reset (HTTP/1), or the stream is reset
+  (HTTP/2). An HTTP/2 client that breaks the protocol at connection level gets `GOAWAY` (the
+  `h2` stack) and one `rejected` access line.
 - **Idle and long-lived connections**: no idle, header-read, handshake or request timeout, no
-  cap on connections or streams. A connection lives until one side closes it; a close or
-  half-close on one side is propagated to the other, and an idle HTTP/1 keep-alive connection
-  closed by the destination is closed on the client side. The HTTP/2 handshake with the
-  destination does not wait for the destination: a silent destination leaves the client's
-  streams pending, as it would without mimic, until a side closes.
-- **Client close during an HTTP/1 exchange**: a client FIN after its last complete request
-  is forwarded to the destination as a FIN once every request received before it has been
-  forwarded (pipelined requests first); the destination can still answer and its response
-  reaches the client, then the client connection is closed. A reset is propagated as a reset
-  (`SO_LINGER` 0): from the client to the destination of an HTTP/1 exchange, before or after
-  a FIN, and from either side to the other in an opaque or TLS tunnel. An exchange
-  whose client has closed and whose destination then closes without answering ends as
-  `client_abort`. A client that closed and vanished (no RST, e.g. its host is gone) is
-  noticed by TCP keepalive on the client socket, which ends the exchange like a reset.
+  cap on connections or streams. A connection lives until one side closes it. The HTTP/2
+  handshake with the destination does not wait for the destination: a silent destination
+  leaves the client's streams pending, as it would without mimic, until a side closes.
+- **Close and reset propagation** (HTTP/1 and tunnels): a FIN from one side reaches the other
+  as a FIN once every byte read before it has been written; the other direction keeps
+  flowing, so a destination can still answer a client that half-closed. A reset from one side
+  reaches the other as a reset (`SO_LINGER` 0), also after a FIN: once a side has sent FIN,
+  the relay watches its socket for an error (`EPOLLERR`) without reading it. An exchange whose
+  client has closed and whose destination then closes without answering ends as
+  `client_abort`. A client that closed and vanished (no RST, e.g. its host is gone) is noticed
+  by TCP keepalive on its socket, which ends the connection like a reset. On HTTP/2, the
+  client closing the connection closes the destination connection.
 - **Resources**: TCP keepalive (idle 300 s, interval 30 s, 4 probes) is set on both sockets so
   that connections whose peer vanished are released. At start the sidecar raises its
   open-file soft limit to the hard limit, or to `fs.nr_open` (`/proc/sys/fs/nr_open`, else
@@ -170,7 +198,8 @@ would see without mimic, except for the limits listed at the end of this section
   in-memory queue; when stdout cannot keep up, lines are dropped and counted
   (`mimic_log_lines_dropped_total`) instead of slowing traffic.
 - **Shutdown** (`SIGTERM`, sent after the app containers stopped): listeners stop accepting,
-  HTTP/1 connections close after their in-flight response, HTTP/2 connections get `GOAWAY`,
+  HTTP/1 connections close (FIN to both sides, no byte added) once no request is pending and
+  no message is half-read, HTTP/2 connections get `GOAWAY`,
   tunnels run until `MIMIC_SHUTDOWN_GRACE` ends. When it ends, the sidecar closes every
   connection still open (tunnels, connections in detection, exchanges still pending), writes
   the access line of each (`result: shutdown`), then one WARN line `grace period over` with
@@ -190,8 +219,8 @@ would see without mimic, except for the limits listed at the end of this section
   | `status` | response status, absent when none | — |
   | `grpc_status` | from the trailers, when present | — |
   | `upgrade` | `true` when the exchange became a tunnel | — |
-  | `result` | `ok`, `upstream_reset`, `client_abort`, `rejected` (refused by the sidecar's limits or parser), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown` |
-  | `duration_ms`, `head_ms` | until the response end; until the response head (both absent for `rejected`) | `duration_ms` |
+  | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown` |
+  | `duration_ms`, `head_ms` | until the response end; until the final (non-`1xx`) response head; both absent for `unframed` and `rejected` | `duration_ms` |
   | `bytes_in`, `bytes_out` | request / response body bytes | client → destination / destination → client |
 
   The target authority is, for HTTP/1, the authority of an absolute-form request target, else
@@ -201,26 +230,24 @@ would see without mimic, except for the limits listed at the end of this section
 Accepted limits of the proxy:
 
 - HTTP/2 connection settings (window sizes, concurrent streams, header list size) are the
-  sidecar's, not the destination's. An HTTP/1 request header section over 64 KiB or 256 lines
-  gets `431`, a response one closes the client connection, and HTTP that a lenient app would
-  accept but `hyper` rejects gets `400`. An HTTP/2 request that the `h2` stack refuses at
-  stream level (`RST_STREAM`, e.g. a connection-specific header) never reaches the sidecar's
-  code and writes no access line.
-- The `hyper` HTTP/1 server rewrites a few things the proxy cannot turn off: response
-  trailers are forwarded only when the request carried `TE: trailers`, and trailer names are
-  lowercased; a close-delimited response (no `content-length`, no `transfer-encoding`) to an
-  HTTP/1.1 client is re-framed as `transfer-encoding: chunked`; an HTTP/1.0 client gets an
-  `HTTP/1.0` status line, with `connection: keep-alive` added when it asked for keep-alive;
-  when shutdown or a destination close lands before a response head is written, that head
-  gets `connection: close`.
+  sidecar's, not the destination's. An HTTP/2 request that the `h2` stack refuses at stream
+  level (`RST_STREAM`, e.g. a connection-specific header) never reaches the sidecar's code and
+  writes no access line.
+- The HTTP/1 codec only frames; it does not judge. Where it and the destination disagree on
+  framing (a destination that rejects a bare LF the codec accepts, or a lenient one that
+  accepts what the codec leaves unframed), the bytes are still exact, but the access lines
+  and metrics of that connection can be wrong or missing from that point on (`unframed`).
+- The relay reads at most 32 HTTP/1 requests ahead of their responses and holds the client's
+  bytes after an upgrade or `CONNECT` request until its final response: this changes timing
+  only, never bytes.
 - A client that half-closes and stays alive while its destination never answers nor closes
-  keeps the exchange open (one task, two sockets), as the destination would keep its own
+  keeps the connection open (one task, two sockets), as the destination would keep its own
   socket without mimic. A client that vanished without a reset is noticed only by TCP
   keepalive (about 5 minutes after the last activity).
-- An HTTP/1 request whose bytes arrive while `SIGTERM` closes its idle connection is not
-  read: the client sees the connection closed without a response and no access line is
-  written. The app containers have already stopped then, so the client would get no answer
-  without mimic either.
+- An HTTP/1 request whose first bytes arrive while `SIGTERM` closes its idle connection is
+  not forwarded: the client sees the connection closed without a response and no access line
+  is written. The app containers have already stopped then, so the client would get no
+  answer without mimic either.
 - WebSocket over HTTP/2 (extended `CONNECT`, RFC 8441) is not advertised, so clients use
   HTTP/1.1 for it.
 - Until F3, outbound HTTPS is seen at connection level only (SNI, bytes, duration).
@@ -379,9 +406,8 @@ Accepted limits of the proxy:
   counted under `authority="(other)"`. The two sentinels contain characters that no
   normalised authority has, so a real host named `other` or `invalid` keeps its own series,
   and they never take a budget slot. The set restarts empty with the process.
-  `mimic_http_request_duration_seconds` observes the exchanges forwarded to the destination;
-  requests the sidecar refuses itself (`rejected`) are counted in `mimic_http_requests_total`
-  only.
+  `mimic_http_request_duration_seconds` observes the exchanges whose response head was read;
+  `unframed` and `rejected` exchanges are counted in `mimic_http_requests_total` only.
 - **Health**: `/healthz` (process alive) and `/readyz` (ready to serve) on the admin port.
 - No traces.
 
@@ -572,26 +598,30 @@ in-process with an injected original destination, as the F1 tunnel tests do.
 | PRX-04 | **I.** HTTP/2 prior knowledge: concurrent streams on one client connection reach the destination on one connection with the same pseudo-headers, headers and bodies; a unary gRPC call returns its message and its `grpc-status`/`grpc-message` trailers unchanged. No header is added. |
 | PRX-05 | **I.** A destination that speaks first (banner) and a client that sends non-HTTP bytes are tunnelled byte-for-byte in both directions. A TLS client completes its handshake with a TLS destination through the sidecar and sees the destination's own certificate. |
 | PRX-06 | **I.** A WebSocket upgrade answered `101` and a `CONNECT` answered `200` carry bytes in both directions after the response; each produces one access log line with `upgrade: true`. |
-| PRX-07 | **I.** No synthesised response: when the destination refuses the connection, the client connection is closed without any byte; when it closes or resets after receiving an HTTP/1 request, the client connection is closed without a response (`result: upstream_reset`, `status_class="none"`); on HTTP/2 the stream is reset and the other streams of the connection complete. After a valid request line, a malformed header gets `400`, and more than 256 header lines or a header section over 64 KiB gets `431` (`result: rejected`). |
+| PRX-07 | **I.** No synthesised response: when the destination refuses the connection, the client connection is closed without any byte; when it closes (FIN) or resets after receiving an HTTP/1 request, the client sees a FIN or a reset respectively, with no response byte (`result: upstream_reset`, `status_class="none"`); on HTTP/2 the stream is reset and the other streams of the connection complete. The sidecar never answers `400` or `431` on HTTP/1: a malformed or oversized head is forwarded unchanged (PRX-29). |
 | PRX-08 | **I.** Each HTTP exchange writes exactly one access log line and each TLS or opaque connection one line, with the fields and values of the §4.1 table for a known exchange (direction, protocol, dst, authority, sni, method, path without query, status, grpc_status, result, durations, byte counts). A canary value placed in a header, a cookie, the query string and the request and response bodies appears in no log line. A path with quotes, backslashes or percent-encoded CR/LF stays inside one valid JSON line; a path over 1024 bytes is truncated. |
 | PRX-09 | **I.** After a known set of exchanges, `/metrics` shows the exact values of `mimic_http_requests_total`, the `_count` of `mimic_http_request_duration_seconds`, `mimic_proxy_connections_total` (TLS counted under its SNI) and `mimic_proxy_bytes_total`, with the §9 labels. With `MIMIC_METRICS_MAX_AUTHORITIES=2`, a third authority is counted under `authority="(other)"`. An invalid value (`0`, `abc`, `10001`) exits with code 2 (FND-01). |
 | PRX-10 | **I.** A connection without an original destination is closed and counted with `result="no_original_dst"`; one whose original destination is a sidecar listener with `result="loop"` (this splits the INJ-07 `loop` count). |
 | PRX-11 | **I.** No idle timeout: an opaque tunnel and an HTTP/1 keep-alive connection left idle for 35 s (longer than `hyper`'s default 30 s header-read timeout) still carry the next exchange. A client half-close reaches the destination, which can still answer. When the destination closes an idle keep-alive connection, the client sees the close within 1 s. The client-side and destination-side sockets have TCP keepalive set to 300 s / 30 s / 4 probes. |
 | PRX-12 | **I.** Forward, never refuse: 1000 simultaneous connections are all accepted and served. The sidecar's open-file soft limit equals its hard limit (`/proc/<pid>/limits`), or the PRX-25 target when the hard limit is unlimited. While its stdout is not read, requests keep completing; once stdout is read again, `mimic_log_lines_dropped_total` is above zero and the dropped lines are absent, not truncated. |
-| PRX-13 | **I.** On `SIGTERM`, a response being streamed completes, new connections are refused, an idle HTTP/1 connection is closed, an HTTP/2 client receives `GOAWAY`, and the process exits 0 within `MIMIC_SHUTDOWN_GRACE` (FND-05). Connections still open at the end of the grace are closed as PRX-20 says. |
+| PRX-13 | **I.** On `SIGTERM`, a response being streamed completes, new connections are refused, an idle HTTP/1 connection is closed, an HTTP/1 connection with a pending request is closed after its response with no byte added (no `connection: close`), an HTTP/2 client receives `GOAWAY`, and the process exits 0 within `MIMIC_SHUTDOWN_GRACE` (FND-05). Connections still open at the end of the grace are closed as PRX-20 says. |
 | PRX-14 | **E.** In the INJ-13 scenario, a request from another pod to the app, an HTTP request from the app to another Service and a TLS connection from the app to the controller's webhook Service produce, in the sidecar's logs, access lines with `direction` `inbound` / `outbound` and `protocol` `http1` / `tls` (`sni` = the webhook Service name), and the matching `mimic_http_requests_total{…,status_class="2xx"}` and `mimic_proxy_connections_total{…,protocol="tls"}` series on `/metrics`. |
-| PRX-15 | **I.** HTTP/1 response heads are bounded like request heads: a destination response with 256 header lines, and one with a 64 KiB header section, reach the client byte for byte (more than `hyper`'s default 100 headers). A response with 257 lines or a header section over 64 KiB closes the client connection without a response byte; its access line has `result: rejected` and no `status`, and it is counted with `status_class="none"`. |
-| PRX-16 | **I.** No framing header is added: an HTTP/2 `POST` and `PUT` without body and without `content-length` (`END_STREAM` on `HEADERS`) reach the destination without `content-length`; an HTTP/2 request with a body and no `content-length` reaches it without one; an HTTP/1.1 `POST` without body, `content-length` or `transfer-encoding` reaches it without either. |
-| PRX-17 | **I.** Client FIN on HTTP/1: after a complete request, a client `shutdown(Write)` reaches the destination, which reads the complete request then EOF within 1 s; it answers after the EOF and the client reads the whole response, then EOF. With two pipelined requests sent in one write followed by the FIN, the destination reads both requests before EOF and the client gets both responses. When the destination closes without answering after that EOF, the access line has `result: client_abort` and the client connection is closed. |
-| PRX-18 | **I.** Resets are propagated as resets: an HTTP/1 client that resets (`SO_LINGER` 0) while its complete request waits for a silent destination, and one that resets after a FIN, make the destination's socket fail with `ECONNRESET` within 1 s, and the exchange's access line (`result: client_abort`) is written within 1 s. In an opaque tunnel and in a TLS tunnel, a reset by the client reaches the destination as a reset, and a reset by the destination reaches the client as a reset, within 1 s. |
+| PRX-15 | **I.** HTTP/1 byte exactness: for each conversation of a fixed corpus, the bytes the destination receives equal the bytes the client sent and the bytes the client receives equal the bytes the destination sent (whole-stream comparison), on the inbound and the outbound listener. The corpus covers: mixed-case, repeated and reordered headers, 300 response header lines (more than `hyper`'s 100); `obs-fold` in a non-framing header; bare-LF line ends; `chunked` with chunk extensions and mixed-case trailers without `TE: trailers`; a close-delimited HTTP/1.1 response; an HTTP/1.0 client with and without `Connection: keep-alive` talking to an HTTP/1.1 destination; `Expect: 100-continue` with `100` then the final response; `103` before `200`; `HEAD` answered with `content-length: 5` and no body, `204`, `304`; 5 pipelined requests in one write; a response sent while no request is pending. Each exchange writes one access line with the method, path, final status and body byte counts of the conversation. |
+| PRX-16 | **I.** No framing header is added on HTTP/2: a `POST` and a `PUT` without body and without `content-length` (`END_STREAM` on `HEADERS`) reach the destination without `content-length`, and a request with a body and no `content-length` reaches it without one. |
+| PRX-17 | **I.** FIN propagation on HTTP/1: after a complete request, a client `shutdown(Write)` reaches the destination, which reads the complete request then EOF within 1 s; it answers after the EOF and the client reads the whole response, then EOF once the destination closes. With two pipelined requests sent in one write followed by the FIN, the destination reads both requests before EOF. A destination FIN after a close-delimited response reaches the client after the last body byte. When the destination closes without answering after the client's EOF, the access line has `result: client_abort`. |
+| PRX-18 | **I.** Resets are propagated as resets: an HTTP/1 client that resets (`SO_LINGER` 0) while its request waits for a silent destination, and one that resets after a FIN, make the destination's socket fail with `ECONNRESET` within 1 s, and the exchange's access line (`result: client_abort`) is written within 1 s; a destination that resets before answering makes the client's socket fail with `ECONNRESET` (`result: upstream_reset`). In an opaque tunnel and in a TLS tunnel, a reset by either side reaches the other as a reset within 1 s. |
 | PRX-19 | **I.** No handshake timeout: against a destination that accepts and never reads or writes, an HTTP/2 client's stream and an HTTP/1 client's request are still pending after 35 s (longer than any `hyper`/`h2` default timer), other connections to other destinations are served meanwhile, and when the client closes, the destination sees its connection closed within 1 s. |
 | PRX-20 | **I.** Grace expiry (in-process, grace 1 s): with an idle opaque tunnel, a connection still in detection and an HTTP/1 exchange whose destination never answers, a shutdown leaves the tunnel carrying bytes at 0.5 s; at the end of the grace (+ 1 s) the client and the destination of each see their connection closed, each writes one access line with `result: shutdown`, and one WARN line `grace period over` has `connections: 3`. |
-| PRX-21 | **I.** Requests refused by the sidecar (`400`, `431`, PRX-15 and PRX-22) increase `mimic_http_requests_total` and leave the `_count` of `mimic_http_request_duration_seconds` unchanged; their access lines have no `duration_ms` and no `head_ms`. |
+| PRX-21 | **I.** Exchanges with no response head read (`unframed`, PRX-29, and `rejected`, PRX-22) increase `mimic_http_requests_total` with `status_class="none"` and leave the `_count` of `mimic_http_request_duration_seconds` unchanged; their access lines have no `duration_ms` and no `head_ms`. |
 | PRX-22 | **I.** An HTTP/2 client that sends a frame breaking the protocol at connection level (e.g. `HEADERS` on an even stream id) gets `GOAWAY` with `PROTOCOL_ERROR`, and one access line is written with `protocol: h2`, `result: rejected`, `authority` = `dst`, and no `status`, `method` or `path`; it is counted with `status_class="none"`. |
 | PRX-23 | **U.** Authority sentinels and selection: normalisation maps a value that is not a host name or IP literal to `(invalid)`; `other` and `invalid` are ordinary host names. With a budget of 2, `(invalid)` and the overflow value `(other)` never take a slot, and a real host `other` gets its own label while slots remain. The target authority is the absolute-form authority, else `Host`, for HTTP/1, and `:authority`, else `Host`, for HTTP/2, else `dst`. **I.** An HTTP/2 request with `:authority: a.example` and `host: b.example` is logged and counted under `a.example`. |
-| PRX-24 | **I.** A declined upgrade leaves a plain keep-alive connection: after a WebSocket upgrade answered `400` and after a `CONNECT` answered `403`, the next request on the same connection is forwarded and answered; when the destination then closes the idle connection, the client sees the close within 1 s; on `SIGTERM`, such an idle connection is closed (PRX-13). |
+| PRX-24 | **I.** Upgrades on the codec: after a WebSocket request answered `101` and a `CONNECT` answered `200`, bytes flow both ways unchanged and are not parsed (bytes that look like HTTP produce no exchange line); client bytes sent after such a request and before its response reach the destination only after the response (checked by the destination's read times). After an upgrade answered `400` and a `CONNECT` answered `403`, the next request on the same connection is forwarded, answered and logged; when the destination then closes the idle connection, the client sees the close within 1 s. |
 | PRX-25 | **U.** The open-file target is a pure function of the soft limit, the hard limit and `fs.nr_open`: a finite hard limit above the soft limit gives the hard limit; an unlimited hard limit gives `fs.nr_open` (1048576 when unreadable); a soft limit already at or above the target is left unchanged. |
-| PRX-26 | **I.** Body-less responses end as `ok`: a `HEAD` answered `200` with `content-length: 5`, a `204` and a `304` each write one access line with `result: ok`, their status and `bytes_out: 0`, and the connection carries the next request. |
+| PRX-26 | **U.** Codec framing (RFC 9112 §6) on hand-written cases: requests without `content-length`/`transfer-encoding` end after the head; `content-length` and `chunked` (with extensions and trailers) bodies end where the RFC says; a response to `HEAD`, a `1xx`, a `204` and a `304` has no body whatever its `content-length`; `101` and a 2xx to `CONNECT` end the HTTP part; `chunked` as the last coding wins, a response with another last coding or without length is close-delimited; a `1xx` is not the final response and does not consume the pending request. Each message reports its method, path (no query, at most 1024 bytes), target authority inputs, version, status and body byte count. |
+| PRX-27 | **U.** Codec properties (`proptest`, at least 10 000 cases each): for arbitrary bytes it never panics and its retained state never exceeds 64 KiB plus a fixed size per direction, whatever the input length; feeding the same bytes in any split into reads yields the same events; for generated valid conversations (random heads, header case and order, `content-length`/`chunked` bodies with extensions and trailers, pipelining, `1xx`, `HEAD`/`204`/`304`, close-delimited ends) the reported message boundaries and body byte counts equal the generated ones. |
+| PRX-28 | **C.** A `cargo-fuzz` target feeds arbitrary byte pairs (client side, destination side) to the codec; CI runs it for 60 s on every PR that touches the codec and for 10 min weekly; a crash, a panic, an out-of-memory or a retained state over the PRX-27 bound fails the job and its input is kept as an artefact. |
+| PRX-29 | **U.** Each ambiguous or unparsable input of §4.1 "Unframed HTTP/1" (both `content-length` and `transfer-encoding`; differing or non-decimal `content-length`; request `transfer-encoding` not ending in `chunked`, or with HTTP/1.0; `obs-fold` in a framing header; a bare CR; a header line without `:`; an invalid or over-long chunk size; a head, chunk-size line or trailer section over its limit) gives `unframed` at the first byte that decides it. **I.** For a request with both `content-length` and `transfer-encoding`, a header line over 64 KiB and a head of 300 lines, the destination receives the client's bytes unchanged, the client receives the destination's answer unchanged, one access line has `result: unframed` (with `method`/`path` when known, no `status`), and later HTTP on that connection produces no exchange line. |
+| PRX-30 | **I.** Bounded read-ahead: against a destination that reads everything and never answers, a client that pipelines 100 requests in one write has exactly 32 of them delivered to the destination; each response the destination then sends lets one more through, and all 100 are eventually answered in order. A client that sends a 10 MiB header line without a line end has all its bytes delivered to the destination unchanged and gets one `unframed` line (its memory bound is PRX-27's). |
 
 ## 13. Test strategy
 
