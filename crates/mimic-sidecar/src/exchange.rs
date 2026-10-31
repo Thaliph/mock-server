@@ -103,7 +103,6 @@ pub(crate) struct Tracker {
     status: Option<u16>,
     head: Option<Duration>,
     grpc_status: Option<u64>,
-    upgrade: bool,
     /// The request was counted in the RED metrics.
     counted: bool,
     /// The access line was written.
@@ -148,7 +147,6 @@ impl Tracker {
             status: None,
             head: None,
             grpc_status: None,
-            upgrade: false,
             counted: false,
             ended: false,
         };
@@ -181,16 +179,11 @@ impl Tracker {
 
     /// The response head arrived: counts the request and wraps the response body, which ends
     /// the exchange.
-    pub(crate) fn answered(
-        mut self,
-        response: Response<Incoming>,
-        upgrade: bool,
-    ) -> Response<RespBody> {
+    pub(crate) fn answered(mut self, response: Response<Incoming>) -> Response<RespBody> {
         let head = self.started.elapsed();
         let status = response.status().as_u16();
         self.status = Some(status);
         self.head = Some(head);
-        self.upgrade = upgrade;
         self.grpc_status = grpc_status(response.headers());
         self.counted = true;
         self.ctx.proxy.request(
@@ -235,7 +228,7 @@ impl Tracker {
             path: Some(std::mem::take(&mut self.path)),
             status: self.status,
             grpc_status: self.grpc_status,
-            upgrade: self.upgrade,
+            upgrade: false,
             outcome,
             duration: Some(self.started.elapsed()),
             head: self.head,
@@ -326,38 +319,9 @@ impl Drop for RespBody {
     }
 }
 
-/// A request the sidecar refused itself (`400`, `431`) before any service call: nothing of it
-/// is known but the connection.
-pub(crate) fn rejected(ctx: &Ctx, protocol: &'static str, status: u16) {
-    let authority = ctx.dst.to_string();
-    ctx.proxy.request(
-        ctx.direction,
-        protocol,
-        &authority,
-        Some(status),
-        Duration::ZERO,
-    );
-    access::exchange(&access::Exchange {
-        direction: ctx.direction,
-        protocol,
-        dst: ctx.dst,
-        authority,
-        method: None,
-        path: None,
-        status: Some(status),
-        grpc_status: None,
-        upgrade: false,
-        outcome: Outcome::Rejected,
-        duration: Some(Duration::ZERO),
-        head: None,
-        bytes_in: 0,
-        bytes_out: 0,
-    });
-}
-
 /// An HTTP/2 client connection broken at connection level (the sidecar sent `GOAWAY`): no
 /// request is known, no response head was read, so nothing is timed.
-pub(crate) fn rejected_h2(ctx: &Ctx) {
+pub(crate) fn rejected(ctx: &Ctx) {
     let authority = ctx.dst.to_string();
     ctx.proxy
         .request_unobserved(ctx.direction, PROTOCOL_H2, &authority);

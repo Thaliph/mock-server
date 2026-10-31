@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 
 use crate::access;
 use crate::exchange::{Ctx, Http1Tracker};
-use crate::http;
+use crate::h2;
 use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
 use crate::opaque::{self, Early, Side};
@@ -137,7 +137,7 @@ pub(crate) async fn handle(
                 Detection::H2 => {
                     proxy.connection(direction, "h2", &dst.to_string());
                     let relayed = tokio::select! {
-                        r = http::relay_h2(client, upstream, buf, ctx(dst), shared.stopped()) => r,
+                        r = h2::relay(client, upstream, buf, ctx(dst), shared.stopped()) => r,
                         () = abort.as_mut() => Ok(()),
                     };
                     if let Err(e) = relayed {
