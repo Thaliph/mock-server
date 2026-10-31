@@ -511,7 +511,7 @@ async fn prx_09_authorities_over_the_budget_are_counted_as_other() {
             .unwrap();
         read_exact(&mut c, 38).await;
     }
-    for (authority, count) in [("a.example", 2), ("b.example", 1), ("other", 1)] {
+    for (authority, count) in [("a.example", 2), ("b.example", 1), ("(other)", 1)] {
         counted(
             &f.metrics,
             &format!(
@@ -588,4 +588,33 @@ fn prx_09_valid_budget_starts() {
         ],
     );
     sidecar.admin_addr();
+}
+
+#[tokio::test]
+async fn prx_23_real_hosts_named_other_and_invalid_are_not_the_sentinels() {
+    let addr = dest(&[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"], 0).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f = fixture_budget(listener, Direction::Outbound, 2, move |_| Some(addr)).await;
+    // "(bad)" is invalid and "c.example" overflows: neither takes a slot, `other` does.
+    for host in ["(bad)", "other", "a.example", "c.example", "other"] {
+        let mut c = TcpStream::connect(f.addr).await.unwrap();
+        c.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        read_exact(&mut c, 38).await;
+    }
+    for (authority, count) in [
+        ("(invalid)", 1),
+        ("other", 2),
+        ("a.example", 1),
+        ("(other)", 1),
+    ] {
+        counted(
+            &f.metrics,
+            &format!(
+                "mimic_http_requests_total{{direction=\"outbound\",protocol=\"http1\",authority=\"{authority}\",status_class=\"2xx\"}} {count}"
+            ),
+        )
+        .await;
+    }
 }

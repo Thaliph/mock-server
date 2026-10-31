@@ -86,6 +86,11 @@ pub fn status_class(status: u16) -> &'static str {
     }
 }
 
+pub fn target_authority<'a>(uri: Option<&'a str>, host: Option<&'a str>) -> Option<&'a str> {
+    let _ = (uri, host);
+    None
+}
+
 /// Keeps the first `max` distinct authorities; later ones are reported as `other`.
 /// One budget per direction and metric.
 #[derive(Debug, Clone)]
@@ -141,9 +146,9 @@ mod tests {
         assert_eq!(normalise_authority("[::1]", 80), "[::1]");
         assert_eq!(normalise_authority("[::1]:80", 80), "[::1]");
         assert_eq!(normalise_authority("[FE80::1]:8080", 80), "[fe80::1]:8080");
-        assert_eq!(normalise_authority("[::1", 80), "invalid");
-        assert_eq!(normalise_authority("[nope]", 80), "invalid");
-        assert_eq!(normalise_authority("[::1]x", 80), "invalid");
+        assert_eq!(normalise_authority("[::1", 80), "(invalid)");
+        assert_eq!(normalise_authority("[nope]", 80), "(invalid)");
+        assert_eq!(normalise_authority("[::1]x", 80), "(invalid)");
     }
 
     #[test]
@@ -163,9 +168,9 @@ mod tests {
             "a\r\nb",
             ":80",
         ] {
-            assert_eq!(normalise_authority(raw, 80), "invalid", "{raw:?}");
+            assert_eq!(normalise_authority(raw, 80), "(invalid)", "{raw:?}");
         }
-        assert_eq!(normalise_authority(&"a".repeat(254), 80), "invalid");
+        assert_eq!(normalise_authority(&"a".repeat(254), 80), "(invalid)");
         let ok = format!("{}.com", "a".repeat(63));
         assert_eq!(normalise_authority(&ok, 80), ok);
         assert_eq!(normalise_authority(&"a".repeat(253), 80), "a".repeat(253));
@@ -191,13 +196,45 @@ mod tests {
             let mut b = AuthorityBudget::new(2);
             inputs.iter().map(|i| b.label(i)).collect::<Vec<_>>()
         };
-        assert_eq!(run(), ["b", "a", "b", "other", "other", "a", "other"]);
+        assert_eq!(run(), ["b", "a", "b", "(other)", "(other)", "a", "(other)"]);
         assert_eq!(run(), run());
     }
 
     #[test]
     fn prx_02_budget_zero_keeps_nothing() {
         let mut b = AuthorityBudget::new(0);
-        assert_eq!(b.label("a"), "other");
+        assert_eq!(b.label("a"), "(other)");
+    }
+
+    #[test]
+    fn prx_23_sentinels_are_outside_the_host_grammar() {
+        assert_eq!(INVALID_AUTHORITY, "(invalid)");
+        assert_eq!(OTHER_AUTHORITY, "(other)");
+        assert_eq!(normalise_authority("other", 80), "other");
+        assert_eq!(normalise_authority("(invalid)", 80), "(invalid)");
+        assert_eq!(normalise_authority("(other)", 80), "(invalid)");
+        assert_eq!(normalise_authority("(invalid)", 80), "(invalid)");
+    }
+
+    #[test]
+    fn prx_23_sentinels_take_no_slot_and_real_other_does() {
+        let mut b = AuthorityBudget::new(2);
+        assert_eq!(b.label("(invalid)"), "(invalid)");
+        assert_eq!(b.label("(other)"), "(other)");
+        assert_eq!(b.label("other"), "other");
+        assert_eq!(b.label("a"), "a");
+        assert_eq!(b.label("c"), "(other)");
+        assert_eq!(b.label("(invalid)"), "(invalid)");
+        assert_eq!(b.label("other"), "other");
+    }
+
+    #[test]
+    fn prx_23_target_authority_prefers_the_uri_then_host() {
+        assert_eq!(
+            target_authority(Some("a.example"), Some("b.example")),
+            Some("a.example")
+        );
+        assert_eq!(target_authority(None, Some("b.example")), Some("b.example"));
+        assert_eq!(target_authority(None, None), None);
     }
 }

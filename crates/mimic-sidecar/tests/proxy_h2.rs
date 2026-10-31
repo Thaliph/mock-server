@@ -316,3 +316,28 @@ async fn prx_07_h2_refused_destination_closes_without_a_byte() {
     c.write_all(PREFACE).await.unwrap();
     closed_by_peer(c).await;
 }
+
+#[tokio::test]
+async fn prx_23_h2_authority_wins_over_host() {
+    let logs = capture_logs();
+    let (addr, _) = dest(|_req: Request<Incoming>| async { Ok(Response::new(full("ok"))) }).await;
+    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
+    let mut sender = client(f.addr).await;
+    let req = Request::get("http://a.example/")
+        .header("host", "b.example")
+        .body(full(""))
+        .unwrap();
+    let res = tokio::time::timeout(TIMEOUT, sender.send_request(req))
+        .await
+        .unwrap()
+        .unwrap();
+    res.into_body().collect().await.unwrap();
+    counted(
+        &f.metrics,
+        "mimic_http_requests_total{direction=\"outbound\",protocol=\"h2\",authority=\"a.example\",status_class=\"2xx\"} 1",
+    )
+    .await;
+    let lines = logs.access_exactly(1).await;
+    assert_eq!(lines[0]["authority"], "a.example");
+    assert!(!f.metrics.encode().contains("b.example"));
+}
