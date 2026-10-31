@@ -98,6 +98,11 @@ impl HeadScanner {
         self.buf.len()
     }
 
+    /// Nothing of a head or trailer section was read yet.
+    pub(super) fn is_fresh(&self) -> bool {
+        self.buf.is_empty() && !self.cr
+    }
+
     fn too_large(&self) -> Reason {
         if self.kind == Kind::Trailer {
             Reason::TrailersTooLarge

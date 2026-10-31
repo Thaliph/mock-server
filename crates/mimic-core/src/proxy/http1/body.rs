@@ -75,6 +75,14 @@ impl Body {
         }
     }
 
+    /// Payload bytes read so far.
+    pub(super) fn seen(&self) -> u64 {
+        match self {
+            Body::Length { left, total } => total - left,
+            Body::Chunked { total, .. } | Body::UntilClose { total } => *total,
+        }
+    }
+
     /// Byte count of a close-delimited body when the peer closes.
     pub(super) fn at_eof(&self) -> Option<u64> {
         match self {

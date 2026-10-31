@@ -50,6 +50,7 @@ async fn proxy(dest: SocketAddr) -> Proxy {
             Vec::new(),
             move |e| sink.lock().unwrap().push(e),
             pending(),
+            pending(),
         )
         .await
     });

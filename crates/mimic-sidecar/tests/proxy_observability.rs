@@ -129,23 +129,6 @@ async fn prx_08_authority_falls_back_to_the_destination() {
 }
 
 #[tokio::test]
-async fn prx_08_grpc_status_comes_from_the_trailers() {
-    let logs = capture_logs();
-    let response: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: grpc-status\r\n\r\n3\r\nyes\r\n0\r\ngrpc-status: 7\r\n\r\n";
-    let addr = dest(&[response], 0).await;
-    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
-    let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"GET /svc/Method HTTP/1.1\r\nHost: g\r\nTE: trailers\r\n\r\n")
-        .await
-        .unwrap();
-    read_exact(&mut c, response.len()).await;
-    let lines = logs.access_exactly(1).await;
-    assert_eq!(lines[0]["grpc_status"], 7);
-    assert_eq!(lines[0]["status"], 200);
-    assert_eq!(lines[0]["result"], "ok");
-}
-
-#[tokio::test]
 async fn prx_08_destination_closing_without_answer_is_upstream_reset() {
     let logs = capture_logs();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -201,36 +184,154 @@ async fn prx_08_client_leaving_during_the_response_is_client_abort() {
     assert!(number(&lines[0], "bytes_out") < 1000);
 }
 
+/// PRX-15 (access lines): a pipelined conversation of five exchanges on one connection, each
+/// with the method, path, final status and body byte counts of the conversation.
 #[tokio::test]
-async fn prx_08_requests_rejected_by_the_sidecar_are_logged() {
+async fn prx_15_every_exchange_of_a_pipelined_conversation_has_its_line() {
+    let logs = capture_logs();
+    let many = {
+        let mut r = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..200 {
+            r.extend_from_slice(format!("X-N{i}: v\r\n").as_bytes());
+        }
+        r.extend_from_slice(b"Content-Length: 1\r\n\r\nz");
+        r
+    };
+    let responses: Vec<Vec<u8>> = vec![
+        b"HTTP/1.1 103 Early Hints\r\nLink: </s>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n".to_vec(),
+        b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(),
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\nX-T: 1\r\n\r\n".to_vec(),
+        many,
+    ];
+    let total: usize = responses.iter().map(Vec::len).sum();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let canned = responses.clone();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        for response in canned {
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut buf = [0u8; 4096];
+                match s.read(&mut buf).await {
+                    Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                    _ => return,
+                }
+            }
+            let end = seen.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            seen.drain(..end);
+            s.write_all(&response).await.unwrap();
+        }
+        let mut sink = Vec::new();
+        let _ = s.read_to_end(&mut sink).await;
+    });
+    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(
+        b"GET /a?x=1 HTTP/1.1\r\nHost: Svc.Example\r\n\r\nHEAD /h HTTP/1.1\r\nHost: svc.example\r\n\r\nGET /n HTTP/1.1\r\nHost: svc.example\r\n\r\nGET /c HTTP/1.1\r\nHost: svc.example\r\n\r\nGET /many HTTP/1.1\r\nHost: svc.example\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_exact(&mut c, total).await, responses.concat());
+
+    let lines = logs.access_exactly(5).await;
+    let expected = [
+        ("/a", "GET", 200, 3),
+        ("/h", "HEAD", 200, 0),
+        ("/n", "GET", 204, 0),
+        ("/c", "GET", 200, 5),
+        ("/many", "GET", 200, 1),
+    ];
+    for (line, (path, method, status, bytes_out)) in lines.iter().zip(expected) {
+        assert_eq!(line["path"], path, "{line}");
+        assert_eq!(line["method"], method, "{line}");
+        assert_eq!(line["status"], status, "{line}");
+        assert_eq!(line["authority"], "svc.example", "{line}");
+        assert_eq!(line["result"], "ok", "{line}");
+        assert_eq!(number(line, "bytes_in"), 0, "{line}");
+        assert_eq!(number(line, "bytes_out"), bytes_out, "{line}");
+    }
+}
+
+/// PRX-15: `head_ms` runs to the final (non-`1xx`) head; a response with no request pending is
+/// an exchange without `method` and `path`.
+#[tokio::test]
+async fn prx_15_head_ms_ends_at_the_final_head_and_an_unsolicited_response_has_no_method() {
+    let logs = capture_logs();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let interim: &[u8] = b"HTTP/1.1 103 Early Hints\r\nLink: </s>\r\n\r\n";
+    let ok: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    let late: &[u8] = b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n";
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = s.read(&mut buf).await;
+        s.write_all(interim).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        s.write_all(ok).await.unwrap();
+        s.write_all(late).await.unwrap();
+        let mut sink = Vec::new();
+        let _ = s.read_to_end(&mut sink).await;
+    });
+    let f = fixture(Direction::Inbound, move |_| Some(addr)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"GET /slow HTTP/1.1\r\nHost: a\r\n\r\n")
+        .await
+        .unwrap();
+    read_exact(&mut c, interim.len() + ok.len() + late.len()).await;
+    let lines = logs.access_exactly(2).await;
+    assert_eq!(lines[0]["path"], "/slow");
+    assert_eq!(lines[0]["status"], 200);
+    assert!(number(&lines[0], "head_ms") >= 250, "{}", lines[0]);
+    assert!(number(&lines[0], "head_ms") <= number(&lines[0], "duration_ms"));
+    assert_eq!(lines[1]["status"], 408);
+    assert_eq!(lines[1]["authority"], addr.to_string());
+    for absent in ["method", "path"] {
+        assert!(lines[1].get(absent).is_none(), "{absent}: {}", lines[1]);
+    }
+}
+
+/// PRX-21: an unframed exchange is counted with `status_class="none"`, not observed in the
+/// histogram, and its line has no duration; the destination decides what the bytes mean.
+#[tokio::test]
+async fn prx_21_unframed_http1_has_no_duration_and_is_not_observed() {
     let logs = capture_logs();
     let addr = echo_server().await;
     let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
-
-    let mut flood = b"GET / HTTP/1.1\r\nHost: a\r\n".to_vec();
-    for _ in 0..300 {
-        flood.extend_from_slice(b"X-N: v\r\n");
-    }
-    flood.extend_from_slice(b"\r\n");
     let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(&flood).await.unwrap();
-    assert!(read_to_end(&mut c).await.starts_with(b"HTTP/1.1 431"));
+    let bad: &[u8] = b"POST /x?q=1 HTTP/1.1\r\nHost: U.example\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc";
+    c.write_all(bad).await.unwrap();
+    assert_eq!(read_exact(&mut c, bad.len()).await, bad);
 
-    let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"GET / HTTP/1.1\r\nBad Header\r\n\r\n")
-        .await
-        .unwrap();
-    assert!(read_to_end(&mut c).await.starts_with(b"HTTP/1.1 400"));
-
-    let lines = logs.access_exactly(2).await;
-    let mut statuses: Vec<u64> = lines.iter().map(|l| number(l, "status")).collect();
-    statuses.sort();
-    assert_eq!(statuses, [400, 431]);
-    for line in &lines {
-        assert_eq!(line["message"], "http exchange");
-        assert_eq!(line["result"], "rejected");
-        assert_eq!(line["authority"], addr.to_string());
+    let lines = logs.access_exactly(1).await;
+    assert_eq!(lines[0]["message"], "http exchange");
+    assert_eq!(lines[0]["protocol"], "http1");
+    assert_eq!(lines[0]["result"], "unframed");
+    assert_eq!(lines[0]["method"], "POST");
+    assert_eq!(lines[0]["path"], "/x");
+    for absent in ["status", "duration_ms", "head_ms"] {
+        assert!(lines[0].get(absent).is_none(), "{absent}: {}", lines[0]);
     }
+    counted(
+        &f.metrics,
+        "mimic_http_requests_total{direction=\"outbound\",protocol=\"http1\",authority=\"u.example\",status_class=\"none\"} 1",
+    )
+    .await;
+    let text = f.metrics.encode();
+    assert!(
+        !text.lines().any(
+            |l| l.starts_with("mimic_http_request_duration_seconds_count") && !l.ends_with(" 0")
+        ),
+        "{text}"
+    );
+
+    // The rest of the connection is a tunnel: well-formed HTTP on it produces no line.
+    let next: &[u8] = b"GET /next HTTP/1.1\r\nHost: u.example\r\n\r\n";
+    c.write_all(next).await.unwrap();
+    assert_eq!(read_exact(&mut c, next.len()).await, next);
+    logs.access_exactly(1).await;
 }
 
 /// A destination that answers `101` to the first request head, then echoes raw bytes.

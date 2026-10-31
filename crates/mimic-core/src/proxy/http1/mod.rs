@@ -464,6 +464,31 @@ impl Codec {
         req + resp + pending
     }
 
+    /// Between two messages: no request waiting for its response, no message half-read, not
+    /// opaque. Only then may the relay close the connection (shutdown) without cutting anything.
+    pub fn idle(&self) -> bool {
+        !self.opaque
+            && self.pending.is_empty()
+            && matches!(&self.req, ReqState::Head(scanner) if scanner.is_fresh())
+            && matches!(&self.resp, RespState::Head(scanner) if scanner.is_fresh())
+    }
+
+    /// Payload bytes of the request body being read, 0 between two requests.
+    pub fn request_body_bytes(&self) -> u64 {
+        match &self.req {
+            ReqState::Body { body, .. } => body.seen(),
+            _ => 0,
+        }
+    }
+
+    /// Payload bytes of the response body being read, 0 between two responses.
+    pub fn response_body_bytes(&self) -> u64 {
+        match &self.resp {
+            RespState::Body { body, .. } => body.seen(),
+            _ => 0,
+        }
+    }
+
     /// Requests read and not yet answered by a final response.
     pub fn pending(&self) -> usize {
         self.pending.len()

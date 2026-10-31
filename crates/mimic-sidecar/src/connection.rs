@@ -14,8 +14,9 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 use crate::access;
-use crate::exchange::Ctx;
-use crate::http;
+use crate::exchange::{Ctx, Http1Tracker};
+use crate::h2;
+use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
 use crate::opaque::{self, Early, Side};
 
@@ -111,13 +112,20 @@ pub(crate) async fn handle(
             match detection {
                 Detection::Http1 => {
                     proxy.connection(direction, "http1", &dst.to_string());
-                    // At the end of the grace the relay is dropped: both sockets close, and
-                    // the exchanges in flight write their `shutdown` line as they drop.
-                    let relayed = tokio::select! {
-                        r = http::relay(client, upstream, buf, ctx(dst), shared.stopped()) => r,
-                        () = abort.as_mut() => Ok(()),
-                    };
-                    if let Err(e) = relayed {
+                    // At the end of the grace the relay closes both sockets, and the exchanges
+                    // still open write their `shutdown` line.
+                    let mut tracker = Http1Tracker::new(ctx(dst));
+                    let relayed = http1::relay(
+                        &mut client,
+                        &mut upstream,
+                        buf,
+                        |event| tracker.event(event),
+                        shared.stopped(),
+                        abort.as_mut(),
+                    )
+                    .await;
+                    tracker.finish(relayed.outcome, relayed.partial_body);
+                    if let Some(e) = &relayed.error {
                         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
                     }
                     return;
@@ -129,7 +137,7 @@ pub(crate) async fn handle(
                 Detection::H2 => {
                     proxy.connection(direction, "h2", &dst.to_string());
                     let relayed = tokio::select! {
-                        r = http::relay_h2(client, upstream, buf, ctx(dst), shared.stopped()) => r,
+                        r = h2::relay(client, upstream, buf, ctx(dst), shared.stopped()) => r,
                         () = abort.as_mut() => Ok(()),
                     };
                     if let Err(e) = relayed {
