@@ -1,6 +1,7 @@
 //! `mimic-controller`: webhook, reconciler, sidecar API and UI (spec §2, §7). F0 provides the
 //! process skeleton and the Valkey connection that gates readiness.
 
+mod certs;
 mod tls;
 mod valkey;
 mod webhook;

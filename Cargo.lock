@@ -1164,6 +1164,8 @@ dependencies = [
  "k8s-openapi",
  "kube-core",
  "pem 3.0.6",
+ "rustls",
+ "rustls-platform-verifier",
  "secrecy",
  "serde",
  "serde-saphyr",
@@ -1306,6 +1308,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "json-patch",
  "k8s-openapi",
  "kube",
  "mimic-core",
@@ -1317,11 +1320,13 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tokio-rustls",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]
