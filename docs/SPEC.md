@@ -182,7 +182,9 @@ discovery immediately.
 - **Skipped** pods are admitted unchanged except for the annotation
   `mimic.platform.io/skipped: <reason>`: `host-network`, `unsupported-owner`, `port-conflict`
   (an app container declares port 15001, 15006 or 15100), `uid-conflict` (an app container or
-  the pod sets `runAsUser: 1337`). A pod that already has a `mimic-sidecar` init container is
+  the pod sets `runAsUser: 1337`). `unsupported-owner` applies only when injection was asked by
+  an `enabled` label (pod or namespace); in a `selected` namespace, an unlabelled pod not owned
+  by a Deployment is not selected and stays untouched, without annotation. A pod that already has a `mimic-sidecar` init container is
   admitted unchanged (idempotent, `reinvocationPolicy: IfNeeded`).
 - **Injected** pods get, in front of their own init containers: `mimic-init`, then
   `mimic-sidecar` (`restartPolicy: Always`, startup and liveness probes on its admin port), and
