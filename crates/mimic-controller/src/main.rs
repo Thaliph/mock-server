@@ -1,7 +1,10 @@
 //! `mimic-controller`: webhook, reconciler, sidecar API and UI (spec §2, §7). F0 provides the
 //! process skeleton and the Valkey connection that gates readiness.
 
+mod tls;
 mod valkey;
+mod webhook;
+mod workloads;
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
