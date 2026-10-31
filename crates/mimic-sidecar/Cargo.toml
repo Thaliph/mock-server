@@ -8,7 +8,10 @@ publish.workspace = true
 
 [dependencies]
 mimic-runtime = { version = "0.1.0", path = "../mimic-runtime" }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
+nix = { version = "0.31.3", default-features = false, features = ["net"] }
+prometheus-client = "0.25.2"
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tracing = "0.1.44"
 
 [lints]

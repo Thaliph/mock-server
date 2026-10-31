@@ -1,8 +1,10 @@
-//! FND-01, FND-04, FND-05, FND-07 on the real `mimic-sidecar` binary.
+//! FND-01, FND-04, FND-05, FND-07, INJ-07 on the real `mimic-sidecar` binary.
 
+use std::io::Read;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use mimic_runtime::testing::{Process, http_get, run};
+use mimic_runtime::testing::{Process, http_get, run, wait_status};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mimic-sidecar");
 const ADMIN: (&str, &str) = ("MIMIC_ADMIN_ADDR", "127.0.0.1:0");
@@ -79,4 +81,74 @@ fn fnd_07_version_flag_prints_the_crate_version() {
         stdout.trim(),
         format!("mimic-sidecar {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+fn tunnel_addrs(sidecar: &mut Process) -> (SocketAddr, SocketAddr) {
+    let mut find = |direction: &str| -> SocketAddr {
+        sidecar.wait_log(Duration::from_secs(10), |v| {
+            v["message"] == "tunnel listening" && v["direction"] == direction
+        })["addr"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    (find("inbound"), find("outbound"))
+}
+
+const LISTENERS: [(&str, &str); 3] = [
+    ADMIN,
+    ("MIMIC_INBOUND_ADDRS", "127.0.0.1:0"),
+    ("MIMIC_OUTBOUND_ADDRS", "127.0.0.1:0"),
+];
+
+#[test]
+fn inj_07_listeners_are_bound_when_readyz_answers_200() {
+    let mut sidecar = Process::spawn(BIN, &LISTENERS);
+    let admin = sidecar.admin_addr();
+    wait_status(admin, "/readyz", 200, Duration::from_secs(10));
+    let (inbound, outbound) = tunnel_addrs(&mut sidecar);
+    for addr in [inbound, outbound] {
+        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("listener accepts");
+    }
+}
+
+#[test]
+fn inj_07_connection_without_original_destination_is_closed_and_counted() {
+    let mut sidecar = Process::spawn(BIN, &LISTENERS);
+    let admin = sidecar.admin_addr();
+    let (inbound, outbound) = tunnel_addrs(&mut sidecar);
+    for addr in [inbound, outbound] {
+        let mut c = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, metrics) = http_get(admin, "/metrics");
+        if ["inbound", "outbound"].iter().all(|d| {
+            metrics.contains(&format!(
+                r#"mimic_tcp_connections_total{{direction="{d}",result="loop"}} 1"#
+            ))
+        }) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{metrics}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn inj_07_outbound_listener_off_loopback_exits_2() {
+    let (status, _, stderr) = run(BIN, &[], &[("MIMIC_OUTBOUND_ADDRS", "0.0.0.0:15001")]);
+    assert_eq!(status.code(), Some(2));
+    assert!(stderr.contains("MIMIC_OUTBOUND_ADDRS"), "{stderr}");
+}
+
+#[test]
+fn inj_07_invalid_listener_address_exits_2() {
+    let (status, _, stderr) = run(BIN, &[], &[("MIMIC_INBOUND_ADDRS", "nope")]);
+    assert_eq!(status.code(), Some(2));
+    assert!(stderr.contains("MIMIC_INBOUND_ADDRS"), "{stderr}");
 }
