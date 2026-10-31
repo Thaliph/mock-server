@@ -5,12 +5,14 @@
 //! answers and never rejects: input it cannot frame unambiguously yields
 //! [`Event::Unframed`] and the codec goes silent (the rest of the connection is a tunnel).
 //! State is bounded: a head or trailer section is buffered up to 64 KiB, a chunk-size line is
-//! never buffered, at most 64 KiB of client bytes wait behind an upgrade request.
+//! never buffered, at most 64 KiB of client bytes wait behind an upgrade request, at most
+//! [`READ_AHEAD`] requests wait for their response. Bytes the codec holds or leaves unused
+//! are never dropped by the relay (see [`Codec::client_bytes`], [`Codec::client_bytes_limited`]).
 
 mod body;
-mod scan;
 #[cfg(test)]
 mod proptests;
+mod scan;
 #[cfg(test)]
 mod tests;
 
@@ -30,6 +32,8 @@ pub const CHUNK_LINE_LIMIT: usize = 4 * 1024;
 pub const PATH_LIMIT: usize = 1024;
 /// Longest `host` or `uri_authority` reported, in bytes (longer values are cut).
 pub const AUTHORITY_LIMIT: usize = 1024;
+/// Longest `method` reported, in bytes (longer values are cut).
+pub const METHOD_LIMIT: usize = 64;
 /// Requests the relay reads ahead of their responses.
 pub const READ_AHEAD: usize = 32;
 /// Fixed part of the retained state of one direction, in bytes.
@@ -94,6 +98,9 @@ pub enum Reason {
     BadChunkTerminator,
     /// Client bytes held back behind an upgrade request outgrew the head limit.
     HeldOverflow,
+    /// A request head after [`READ_AHEAD`] unanswered ones, offered to [`Codec::client_bytes`]
+    /// (the relay uses [`Codec::client_bytes_limited`], which never reports this).
+    ReadAheadOverflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,9 +256,19 @@ fn truncate(mut s: String, limit: usize) -> String {
     s
 }
 
+/// Bytes a request head keeps in memory.
+fn head_size(head: &RequestHead) -> usize {
+    mem::size_of::<RequestHead>()
+        + head.method.len()
+        + head.path.len()
+        + head.uri_authority.as_ref().map_or(0, String::len)
+        + head.host.as_ref().map_or(0, String::len)
+}
+
 /// The part of an authority after any userinfo.
 fn host_port(authority: &str) -> String {
-    authority.rsplit('@').next().unwrap_or_default().to_string()
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    truncate(host.to_string(), AUTHORITY_LIMIT)
 }
 
 /// What follows `<scheme>://` when `target` is in absolute form (RFC 9112 §3.2.2): the target
@@ -267,7 +284,7 @@ fn absolute_form(target: &str) -> Option<&str> {
 
 fn request_head(line: &[u8], fields: &Fields) -> Option<RequestHead> {
     let (method, target, minor) = scan::parse_request_line(line)?;
-    let method = String::from_utf8_lossy(method).into_owned();
+    let method = truncate(String::from_utf8_lossy(method).into_owned(), METHOD_LIMIT);
     let target = String::from_utf8_lossy(target);
     let connect = method == "CONNECT";
     let (path, uri_authority) = if connect {
@@ -285,7 +302,7 @@ fn request_head(line: &[u8], fields: &Fields) -> Option<RequestHead> {
         method,
         path: truncate(path, PATH_LIMIT),
         uri_authority,
-        host: fields.host.clone(),
+        host: fields.host.clone().map(|h| truncate(h, AUTHORITY_LIMIT)),
         version: if minor == 0 {
             Version::Http10
         } else {
@@ -353,10 +370,17 @@ impl Codec {
         Self::default()
     }
 
-    /// Bytes read from the client.
+    /// Bytes read from the client, all of them used. Without the relay's flow control: a
+    /// request head after [`READ_AHEAD`] unanswered ones is [`Reason::ReadAheadOverflow`].
+    ///
+    /// Held bytes: after a request that asks for an upgrade or is a `CONNECT`, the codec keeps
+    /// the client bytes that follow (up to [`HEAD_LIMIT`]) until the final response. They have
+    /// been read and are never dropped: the relay forwards them unchanged whatever happens.
+    /// On `101` or a 2xx to `CONNECT` ([`Event::Tunnel`]) the codec stops parsing them; on a
+    /// declined upgrade it parses them as the next requests.
     pub fn client_bytes(&mut self, data: &[u8]) -> Vec<Event> {
         let mut events = Vec::new();
-        self.feed_requests(data, &mut events);
+        self.feed_requests(data, false, &mut events);
         events
     }
 
@@ -410,15 +434,34 @@ impl Codec {
     /// more than [`READ_AHEAD`] requests ahead of their responses. Returns how many bytes of
     /// `data` were used; the relay forwards exactly those, keeps the rest unread (TCP
     /// back-pressure) and offers it again after a response completed.
+    ///
+    /// It also stops right after a request that asks for an upgrade or is a `CONNECT`
+    /// (the client must wait for the final response). The bytes not used are never dropped:
+    /// on [`Event::Tunnel`] or [`Event::Unframed`] the relay forwards them unchanged, and
+    /// after any other final response it offers them again. Once the codec is opaque, every
+    /// byte is used.
     pub fn client_bytes_limited(&mut self, data: &[u8]) -> (usize, Vec<Event>) {
-        let events = Vec::new();
-        (data.len(), events)
+        let mut events = Vec::new();
+        let used = self.feed_requests(data, true, &mut events);
+        (used, events)
     }
 
     /// Bytes the codec keeps for its parsing: partial head or trailer section, held client
     /// bytes, requests waiting for a response. Never above [`RETAINED_LIMIT`].
     pub fn retained_bytes(&self) -> usize {
-        0
+        let req = match &self.req {
+            ReqState::Head(scanner) => scanner.retained(),
+            ReqState::Body { body, head } => body.retained() + head_size(head),
+            ReqState::Held { buf, .. } => buf.len(),
+        };
+        let resp = match &self.resp {
+            RespState::Head(scanner) => scanner.retained(),
+            RespState::Body { body, request } => {
+                body.retained() + request.as_ref().map_or(0, head_size)
+            }
+        };
+        let pending: usize = self.pending.iter().map(|p| head_size(&p.head)).sum();
+        req + resp + pending
     }
 
     /// Requests read and not yet answered by a final response.
@@ -441,8 +484,21 @@ impl Codec {
         }));
     }
 
-    fn feed_requests(&mut self, mut data: &[u8], events: &mut Vec<Event>) {
+    /// Feed client bytes; returns how many were used (all of them unless `limited`).
+    fn feed_requests(&mut self, mut data: &[u8], limited: bool, events: &mut Vec<Event>) -> usize {
+        let total = data.len();
         while !data.is_empty() && !self.opaque {
+            // Only a fresh head can wait: the count grows when a head completes.
+            if matches!(self.req, ReqState::Head(_)) && self.pending.len() >= READ_AHEAD {
+                if limited {
+                    break;
+                }
+                self.unframed(Side::Client, Reason::ReadAheadOverflow, None, events);
+                break;
+            }
+            if limited && matches!(self.req, ReqState::Held { .. }) {
+                break;
+            }
             match mem::take(&mut self.req) {
                 ReqState::Head(mut scanner) => {
                     let (n, scan) = scanner.feed(data);
@@ -478,9 +534,14 @@ impl Codec {
                         buf.extend_from_slice(data);
                         self.req = ReqState::Held { seq, buf };
                     }
-                    return;
+                    return total;
                 }
             }
+        }
+        if self.opaque {
+            total
+        } else {
+            total - data.len()
         }
     }
 
@@ -599,7 +660,7 @@ impl Codec {
             (ReqState::Held { seq, .. }, Some(a)) if a.seq == *seq
         );
         if released && let ReqState::Held { buf, .. } = mem::take(&mut self.req) {
-            self.feed_requests(&buf, events);
+            self.feed_requests(&buf, false, events);
         }
     }
 }
