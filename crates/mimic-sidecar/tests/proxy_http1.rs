@@ -106,19 +106,32 @@ async fn prx_03_request_and_response_reach_each_side_byte_for_byte() {
 
 #[tokio::test]
 async fn prx_03_chunked_bodies_and_trailers_pass_through() {
-    let request: &[u8] = b"POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n5\r\nhello\r\n0\r\nX-Sum: abc\r\n\r\n";
-    let response: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Done\r\n\r\n3\r\nyes\r\n0\r\nX-Done: 1\r\n\r\n";
-    // The scripted destination stops at the end of the head: the body is read from the
-    // connection by the assertion on the response only, so give it the whole request.
-    let mut dest = scripted(vec![response], 0).await;
-    let addr = dest.addr;
+    // `TE: trailers` lets the destination's trailers through (hyper's rule for responses).
+    let request: &[u8] = b"POST /up HTTP/1.1\r\nHost: a\r\nTE: trailers\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n5\r\nhello\r\n0\r\nx-sum: abc\r\n\r\n";
+    let response: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: X-Done\r\n\r\n3\r\nyes\r\n0\r\nx-done: 1\r\n\r\n";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut got = Vec::new();
+        while !got.ends_with(b"\r\n0\r\nx-sum: abc\r\n\r\n") {
+            let mut buf = [0u8; 1024];
+            let n = s.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            got.extend_from_slice(&buf[..n]);
+        }
+        tx.send(got).unwrap();
+        s.write_all(response).await.unwrap();
+    });
     let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
     c.write_all(request).await.unwrap();
-    let head = recv(&mut dest).await;
-    assert!(head.starts_with(
-        b"POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTrailer: X-Sum\r\n\r\n"
-    ));
+    let got = tokio::time::timeout(TIMEOUT, seen.recv())
+        .await
+        .expect("destination saw the request")
+        .unwrap();
+    assert_eq!(got, request);
     assert_eq!(read_until(&mut c, response.len()).await, response);
 }
 

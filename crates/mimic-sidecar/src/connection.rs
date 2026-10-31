@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 use crate::listener::{Direction, Outcome, Shared};
-use crate::opaque;
+use crate::{http, opaque};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
@@ -78,8 +78,13 @@ pub(crate) async fn handle(client: TcpStream, direction: Direction, shared: Arc<
     let (to_upstream, to_client) = match first_bytes(&mut client, &mut upstream).await {
         First::Client(detection, buf) => {
             tracing::debug!(direction = direction.as_str(), %dst, ?detection, "protocol detected");
-            // Hook point for the HTTP relay (`Detection::Http1` / `Detection::H2`): until it
-            // exists, HTTP is tunnelled like any other bytes.
+            if detection == Detection::Http1 {
+                if let Err(e) = http::relay(client, upstream, buf).await {
+                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
+                }
+                return;
+            }
+            // HTTP/2 is tunnelled like any other bytes until its relay exists.
             (buf, Vec::new())
         }
         First::Opaque {
