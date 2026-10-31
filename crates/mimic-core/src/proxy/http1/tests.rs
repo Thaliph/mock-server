@@ -719,10 +719,9 @@ fn prx_30_read_ahead_still_lets_the_body_of_the_last_request_through() {
 #[test]
 fn prx_27_held_bytes_are_parsed_again_when_the_upgrade_is_declined() {
     let mut c = Codec::new();
-    let (used, _) = c.client_bytes_limited(
+    c.client_bytes(
         b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\nGET /after HTTP/1.1\r\n\r\n",
     );
-    assert!(used > 0);
     assert!(c.retained_bytes() > 0);
     let ev = c.server_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
     assert_eq!(c.pending(), 1);
@@ -730,6 +729,41 @@ fn prx_27_held_bytes_are_parsed_again_when_the_upgrade_is_declined() {
         ev.iter()
             .any(|e| matches!(e, Event::Request(r) if r.path == "/after"))
     );
+}
+
+#[test]
+fn prx_27_limited_feed_stops_after_an_upgrade_request_and_loses_nothing() {
+    let head = b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n";
+    let after = b"GET /after HTTP/1.1\r\n\r\n";
+    let mut data = head.to_vec();
+    data.extend_from_slice(after);
+    let mut c = Codec::new();
+    let (used, _) = c.client_bytes_limited(&data);
+    assert_eq!(used, head.len());
+    assert_eq!(c.client_bytes_limited(after).0, 0);
+    // Declined: the relay offers the bytes again.
+    c.server_bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    let (used, ev) = c.client_bytes_limited(after);
+    assert_eq!(used, after.len());
+    assert_eq!(req(&ev).path, "/after");
+}
+
+#[test]
+fn prx_27_limited_feed_uses_every_byte_once_the_codec_is_opaque() {
+    let mut c = Codec::new();
+    c.client_bytes_limited(
+        b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+    );
+    c.server_bytes(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+    assert_eq!(c.client_bytes_limited(b"\x81\x80frame").0, 7);
+}
+
+#[test]
+fn prx_27_unlimited_feed_beyond_the_read_ahead_is_unframed() {
+    let mut c = Codec::new();
+    let data = b"GET / HTTP/1.1\r\n\r\n".repeat(READ_AHEAD + 1);
+    let ev = c.client_bytes(&data);
+    assert_eq!(unframed(&ev).reason, Reason::ReadAheadOverflow);
 }
 
 #[test]

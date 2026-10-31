@@ -64,6 +64,17 @@ impl Body {
         Body::UntilClose { total: 0 }
     }
 
+    /// Bytes buffered for the framing (a trailer section being read).
+    pub(super) fn retained(&self) -> usize {
+        match self {
+            Body::Chunked {
+                state: Chunk::Trailers(scanner),
+                ..
+            } => scanner.retained(),
+            _ => 0,
+        }
+    }
+
     /// Byte count of a close-delimited body when the peer closes.
     pub(super) fn at_eof(&self) -> Option<u64> {
         match self {
