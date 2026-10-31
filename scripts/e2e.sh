@@ -457,6 +457,8 @@ pod=$(kubectl -n inj-13 get pods -l app=app -o jsonpath='{.items[0].metadata.nam
 [[ $(jp inj-13 "$pod" '{.spec.containers[?(@.name=="app")].readinessProbe.httpGet.port}') == 15100 ]] \
   || fail "inj_13: readiness probe port is not the sidecar admin port"
 
+kubectl -n inj-13-up wait --for=condition=Ready pod/client --timeout=180s >/dev/null \
+  || fail "inj_13: client pod in inj-13-up not Ready (image pull?)"
 before=$(tcp_count inj-13 inbound ok) || true; before=${before:-0}
 kubectl -n inj-13-up exec client -- python3 -c \
   'import urllib.request; urllib.request.urlopen("http://app.inj-13.svc:8080/ready", timeout=10).read()' \
