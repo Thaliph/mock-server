@@ -69,20 +69,14 @@ fn inj_06_pipes_the_rules_to_both_restore_commands_and_logs_once() {
         .filter(|v| v["message"] == "redirection installed")
         .collect();
     assert_eq!(installed.len(), 1, "{stdout}");
-    assert_eq!(
-        installed[0]["excluded_ports"],
-        serde_json::json!([8081, 9090])
-    );
+    assert_eq!(installed[0]["excluded_ports"], "8081,9090");
     if host_has_ipv6() {
         let v6 = fs::read_to_string(dir.path().join("ip6tables-restore.stdin")).unwrap();
         assert_eq!(v6, rules(&config, Family::V6));
-        assert_eq!(
-            installed[0]["families"],
-            serde_json::json!(["ipv4", "ipv6"])
-        );
+        assert_eq!(installed[0]["families"], "ipv4,ipv6");
     } else {
         assert!(!dir.path().join("ip6tables-restore.stdin").exists());
-        assert_eq!(installed[0]["families"], serde_json::json!(["ipv4"]));
+        assert_eq!(installed[0]["families"], "ipv4");
         assert!(
             entries
                 .iter()

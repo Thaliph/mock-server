@@ -31,8 +31,34 @@ pub struct RedirectConfig {
 }
 
 /// `iptables-restore --noflush` input for `family`.
-pub fn rules(_config: &RedirectConfig, _family: Family) -> String {
-    String::new()
+pub fn rules(config: &RedirectConfig, family: Family) -> String {
+    let reject = match family {
+        Family::V4 => "icmp-port-unreachable",
+        Family::V6 => "icmp6-port-unreachable",
+    };
+    let mut out = String::from(
+        "*nat\n:MIMIC_INBOUND - [0:0]\n:MIMIC_OUTPUT - [0:0]\n\
+         -A PREROUTING -p tcp -m addrtype --dst-type LOCAL -j MIMIC_INBOUND\n\
+         -A OUTPUT -p tcp -j MIMIC_OUTPUT\n",
+    );
+    for port in &config.exclude_inbound_ports {
+        out.push_str(&format!(
+            "-A MIMIC_INBOUND -p tcp --dport {port} -j RETURN\n"
+        ));
+    }
+    out.push_str(&format!(
+        "-A MIMIC_INBOUND -p tcp -j REDIRECT --to-ports {}\n\
+         -A MIMIC_OUTPUT -m owner --uid-owner {} -j RETURN\n\
+         -A MIMIC_OUTPUT -o lo -j RETURN\n\
+         -A MIMIC_OUTPUT -p tcp -j REDIRECT --to-ports {}\n\
+         COMMIT\n\
+         *filter\n:MIMIC_OUTPUT - [0:0]\n\
+         -A OUTPUT -p udp --dport 443 -j MIMIC_OUTPUT\n\
+         -A MIMIC_OUTPUT -p udp --dport 443 -j REJECT --reject-with {reject}\n\
+         COMMIT\n",
+        config.inbound_port, config.proxy_uid, config.outbound_port
+    ));
+    out
 }
 
 #[cfg(test)]
