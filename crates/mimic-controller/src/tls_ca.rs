@@ -71,7 +71,7 @@ impl Seed {
         })
     }
 
-    fn same(&self, other: &Seed) -> bool {
+    pub fn same(&self, other: &Seed) -> bool {
         self.created == other.created && self.bytes[..] == other.bytes[..]
     }
 

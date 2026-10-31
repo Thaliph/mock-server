@@ -8,6 +8,7 @@ use mimic_core::inject::InjectConfig;
 use mimic_runtime::config::{ConfigError, Env};
 
 const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8443);
+const DEFAULT_API_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8444);
 const DEFAULT_RESOURCES: &str =
     r#"{"requests":{"cpu":"50m","memory":"64Mi"},"limits":{"memory":"128Mi"}}"#;
 
@@ -33,6 +34,10 @@ impl WebhookConfig {
         let sidecar_log = env.optional("MIMIC_INJECT_SIDECAR_LOG").unwrap_or("info");
         mimic_runtime::logging::filter(sidecar_log)
             .map_err(|e| ConfigError::invalid("MIMIC_INJECT_SIDECAR_LOG", sidecar_log, e))?;
+        let namespace = env.required("MIMIC_NAMESPACE")?;
+        let service = env.required("MIMIC_WEBHOOK_SERVICE")?;
+        let api_addr: SocketAddr = env.parse_or("MIMIC_SIDECAR_API_ADDR", DEFAULT_API_ADDR)?;
+        let controller_url = format!("https://{service}.{namespace}.svc:{}", api_addr.port());
         Ok(WebhookConfig {
             addr: env.parse_or("MIMIC_WEBHOOK_ADDR", DEFAULT_ADDR)?,
             max_connections: max_connections(env)?,
@@ -47,6 +52,7 @@ impl WebhookConfig {
                 init_image: env.required("MIMIC_INJECT_INIT_IMAGE")?.to_string(),
                 sidecar_resources,
                 sidecar_log: sidecar_log.to_string(),
+                controller_url,
             },
         })
     }
@@ -110,6 +116,21 @@ mod tests {
         assert_eq!(cfg.inject.version, "1.2.3");
         let limits = cfg.inject.sidecar_resources.limits.unwrap();
         assert_eq!(limits["memory"].0, "128Mi");
+    }
+
+    #[test]
+    fn tls_12_controller_url_names_the_service_and_the_sidecar_api_port() {
+        let cfg = WebhookConfig::from_env(&env(&[]), "1").unwrap();
+        assert_eq!(
+            cfg.inject.controller_url,
+            "https://mimic.mimic-system.svc:8444"
+        );
+        let extra = [("MIMIC_SIDECAR_API_ADDR", "0.0.0.0:9444")];
+        let cfg = WebhookConfig::from_env(&env(&extra), "1").unwrap();
+        assert_eq!(
+            cfg.inject.controller_url,
+            "https://mimic.mimic-system.svc:9444"
+        );
     }
 
     #[test]

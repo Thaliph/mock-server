@@ -137,6 +137,9 @@ async fn run(config: Config) -> std::io::Result<()> {
         controller_namespace: webhook.namespace,
         inject: webhook.inject,
         cache,
+        seed: seed.clone(),
+        cert: cert.clone(),
+        roots: webhook::RootCache::default(),
         metrics: admission_metrics,
     });
     let api = Arc::new(sidecar_api::SidecarApi {
