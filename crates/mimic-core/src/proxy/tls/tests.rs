@@ -81,7 +81,10 @@ fn tls_01_sni_alpn_and_versions() {
 fn tls_01_versions_from_supported_versions_else_legacy() {
     let only13 = parsed(&record(&hello_bytes(0x0303, &versions_ext(&[0x0304]))));
     assert!(!only13.tls12 && only13.tls13);
-    let old = parsed(&record(&hello_bytes(0x0303, &versions_ext(&[0x0302, 0x0301]))));
+    let old = parsed(&record(&hello_bytes(
+        0x0303,
+        &versions_ext(&[0x0302, 0x0301]),
+    )));
     assert!(!old.tls12 && !old.tls13);
     let legacy12 = parsed(&record(&hello_bytes(0x0303, &[])));
     assert!(legacy12.tls12 && !legacy12.tls13);
@@ -103,7 +106,11 @@ fn tls_01_split_over_reads_and_records() {
     let hs = hello_bytes(0x0303, &e);
     let whole = record(&hs);
     for n in 0..whole.len() {
-        assert_eq!(parse_client_hello(&whole[..n]), Parsed::NeedMore, "prefix {n}");
+        assert_eq!(
+            parse_client_hello(&whole[..n]),
+            Parsed::NeedMore,
+            "prefix {n}"
+        );
     }
     let want = parsed(&whole);
     assert_eq!(want.sni.as_deref(), Some("split.example.org"));
@@ -119,14 +126,20 @@ fn tls_01_split_over_reads_and_records() {
 #[test]
 fn tls_01_not_tls_and_malformed() {
     assert_eq!(parse_client_hello(b"GET / HTTP/1.1\r\n"), Parsed::NotTls);
-    assert_eq!(parse_client_hello(&record(&[2, 0, 0, 1, 0])), Parsed::NotTls);
+    assert_eq!(
+        parse_client_hello(&record(&[2, 0, 0, 1, 0])),
+        Parsed::NotTls
+    );
     // A truncated hello in a complete record carries no facts.
     let h = parsed(&record(&[1, 0, 0, 4, 3, 3, 0, 0]));
     assert_eq!(h, ClientHello::default());
     // A malformed extension list carries no facts either.
     let mut e = sni_ext("a.test");
     e.extend([0, 16, 0, 9, 1]);
-    assert_eq!(parsed(&record(&hello_bytes(0x0303, &e))), ClientHello::default());
+    assert_eq!(
+        parsed(&record(&hello_bytes(0x0303, &e))),
+        ClientHello::default()
+    );
 }
 
 proptest! {
@@ -210,7 +223,14 @@ fn tls_02_no_ca_and_unsupported() {
     );
     let alpn_only_imap = hello(Some("a.test"), &["imap"]);
     assert_eq!(
-        decide(&alpn_only_imap, ip4(1), 443, &no_exclusions(), &memory(), true),
+        decide(
+            &alpn_only_imap,
+            ip4(1),
+            443,
+            &no_exclusions(),
+            &memory(),
+            true
+        ),
         Decision::PassThrough(Reason::Unsupported)
     );
     let mut old = hello(Some("a.test"), &[]);

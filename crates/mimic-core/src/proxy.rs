@@ -122,104 +122,11 @@ fn is_tchar(b: u8) -> bool {
 /// A TLS ClientHello, possibly split over several handshake records. `None` means more bytes
 /// are needed.
 fn detect_tls(buf: &[u8]) -> Option<Detection> {
-    let mut hello = Vec::new();
-    let mut pos = 0;
-    let mut first = true;
-    loop {
-        let header = buf.get(pos..pos + 5)?;
-        let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
-        if first {
-            if header[1] != 3 || header[2] > 4 || len == 0 || len > 1 << 14 {
-                return Some(Detection::Opaque);
-            }
-            first = false;
-        } else if header[0] != 0x16 {
-            return Some(Detection::Tls { sni: None });
-        }
-        pos += 5;
-        let end = (pos + len).min(buf.len());
-        hello.extend_from_slice(&buf[pos..end]);
-        if hello.len() >= 4 && hello[0] != 1 {
-            return Some(Detection::Opaque);
-        }
-        if hello.len() >= 4 {
-            let want = 4
-                + (usize::from(hello[1]) << 16
-                    | usize::from(hello[2]) << 8
-                    | usize::from(hello[3]));
-            if hello.len() >= want {
-                return Some(Detection::Tls {
-                    sni: client_hello_sni(&hello[4..want]),
-                });
-            }
-        }
-        if end < pos + len {
-            return None;
-        }
-        pos = end;
+    match tls::parse_client_hello(buf) {
+        tls::Parsed::NeedMore => None,
+        tls::Parsed::NotTls => Some(Detection::Opaque),
+        tls::Parsed::Hello(hello) => Some(Detection::Tls { sni: hello.sni }),
     }
-}
-
-/// Bounds-checked big-endian reader.
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let (head, tail) = self.0.split_at_checked(n)?;
-        self.0 = tail;
-        Some(head)
-    }
-
-    fn u8(&mut self) -> Option<usize> {
-        Some(usize::from(self.take(1)?[0]))
-    }
-
-    fn u16(&mut self) -> Option<usize> {
-        let b = self.take(2)?;
-        Some(usize::from(u16::from_be_bytes([b[0], b[1]])))
-    }
-}
-
-/// The `host_name` of the `server_name` extension of a ClientHello body, if well formed.
-fn client_hello_sni(body: &[u8]) -> Option<String> {
-    let mut r = Reader(body);
-    r.take(2 + 32)?; // version, random
-    let n = r.u8()?;
-    r.take(n)?; // session id
-    let n = r.u16()?;
-    r.take(n)?; // cipher suites
-    let n = r.u8()?;
-    r.take(n)?; // compression methods
-    let n = r.u16()?;
-    let mut exts = Reader(r.take(n)?);
-    while !exts.0.is_empty() {
-        let kind = exts.u16()?;
-        let n = exts.u16()?;
-        let data = exts.take(n)?;
-        if kind != 0 {
-            continue;
-        }
-        let mut list = Reader(data);
-        let n = list.u16()?;
-        let mut list = Reader(list.take(n)?);
-        while !list.0.is_empty() {
-            let name_type = list.u8()?;
-            let n = list.u16()?;
-            let name = list.take(n)?;
-            if name_type == 0 {
-                return host_name(name);
-            }
-        }
-        return None;
-    }
-    None
-}
-
-fn host_name(name: &[u8]) -> Option<String> {
-    if name.is_empty() || !name.iter().all(|b| b.is_ascii_graphic()) {
-        return None;
-    }
-    String::from_utf8(name.to_vec()).ok()
 }
 
 #[cfg(test)]
