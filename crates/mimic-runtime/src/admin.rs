@@ -82,13 +82,24 @@ pub async fn shutdown_signal() {
 
 /// Serves `router` on `listener` until `SIGTERM`, then drains for at most `grace`.
 pub async fn serve(listener: TcpListener, router: Router, grace: Duration) -> std::io::Result<()> {
+    serve_until(listener, router, grace, shutdown_signal()).await
+}
+
+/// Serves `router` until `stop` resolves, then stops accepting, lets in-flight requests finish
+/// and returns after at most `grace` (FND-05).
+pub async fn serve_until(
+    listener: TcpListener,
+    router: Router,
+    grace: Duration,
+    stop: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let mut drain_rx = stop_tx.subscribe();
     let server = axum::serve(listener, router).with_graceful_shutdown(async move {
         let _ = stop_rx.wait_for(|stop| *stop).await;
     });
     tokio::spawn(async move {
-        shutdown_signal().await;
+        stop.await;
         tracing::info!(grace_ms = grace.as_millis() as u64, "shutdown started");
         let _ = stop_tx.send(true);
     });

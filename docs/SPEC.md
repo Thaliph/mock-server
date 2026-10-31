@@ -141,7 +141,7 @@ discovery immediately.
 - **Logs**: JSON lines on stdout, one object per event, with at least `timestamp`, `level`,
   `target` and `message`. Access logs (one line per exchange, `target` = `access`) and
   component logs. Level from `MIMIC_LOG` (`tracing` filter syntax, default `info`).
-- **Metrics**: Prometheus text format on the admin port at `/metrics`. Every component exposes
+- **Metrics**: OpenMetrics text format (Prometheus-compatible) on the admin port at `/metrics`. Every component exposes
   `mimic_build_info{component,version} 1`. RED metrics per direction, authority and status class
   are defined in F2.
 - **Health**: `/healthz` (process alive) and `/readyz` (ready to serve) on the admin port.
@@ -209,12 +209,12 @@ names contain the criterion ID (`fnd_02_…`).
 |---|---|
 | FND-01 | A `MIMIC_*` variable with an invalid value stops the process before it listens, with exit code 2 and a stderr message that names the variable and the value. A missing required variable does the same. |
 | FND-02 | `/healthz` answers 200 as long as the process runs. `/readyz` answers 200 when the component is ready, 503 otherwise. |
-| FND-03 | `/metrics` answers 200 in Prometheus text format and contains `mimic_build_info{component="<component>",version="<crate version>"} 1`. |
+| FND-03 | `/metrics` answers 200 in OpenMetrics text format (scraped natively by Prometheus) and contains `mimic_build_info{component="<component>",version="<crate version>"} 1`. |
 | FND-04 | Every line written on stdout is one JSON object with `timestamp`, `level`, `target` and `message`. `MIMIC_LOG` filters it. |
 | FND-05 | On `SIGTERM` the process stops accepting connections, lets in-flight requests finish, and exits 0 within `MIMIC_SHUTDOWN_GRACE`; it logs the start and the end of the shutdown. |
 | FND-06 | The controller is ready only when Valkey answers `PING` (with the configured password); it becomes unready, without exiting, when Valkey is unreachable, and ready again when it comes back. |
 | FND-07 | The image runs as UID 65532, contains no shell, and both binaries answer `--version` with the crate version. |
-| FND-08 | `helm lint` passes; every rendered pod is Pod Security `restricted` (non-root, read-only root filesystem, no capability, `RuntimeDefault` seccomp, no privilege escalation). Valkey requires a password generated at install and kept on upgrade, and only accepts connections from the controller (NetworkPolicy). |
+| FND-08 | `helm lint` passes; every rendered pod is Pod Security `restricted` (non-root, read-only root filesystem, no capability, `RuntimeDefault` seccomp, no privilege escalation). Valkey requires a password generated at install and kept on upgrade, and only accepts connections from the controller (NetworkPolicy; needs a CNI that enforces NetworkPolicy, as kind's default does). |
 | FND-09 | On kind (Kubernetes ≥ 1.33), `helm install` brings the controller and Valkey to Ready, and the controller's `/readyz` and `/metrics` answer through a port-forward. |
 | FND-10 | CI runs as dependent stages: lint → unit and integration tests → image build and scan → kind e2e, plus a security stage (`cargo deny`, `zizmor`); a single `ci-ok` check sums them up. A `v*` tag publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart. |
 

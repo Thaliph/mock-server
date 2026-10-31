@@ -12,7 +12,7 @@ metadata:
     helm.sh/resource-policy: keep
 type: Opaque
 data:
-  {{- if and $existing $existing.data }}
+  {{- if and $existing $existing.data (index $existing.data "password") }}
   password: {{ index $existing.data "password" }}
   {{- else }}
   password: {{ randAlphaNum 40 | b64enc }}
