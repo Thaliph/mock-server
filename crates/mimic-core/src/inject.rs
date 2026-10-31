@@ -226,6 +226,7 @@ pub fn patch(
     let sidecar = json!({
         "name": SIDECAR_NAME,
         "image": cfg.sidecar_image,
+        "command": ["/usr/local/bin/mimic-sidecar"],
         "restartPolicy": "Always",
         "env": [
             {"name": "MIMIC_WORKLOAD", "value": deployment},
@@ -758,6 +759,8 @@ mod tests {
         let doc = apply(&pod());
         let sc = &doc["spec"]["initContainers"][1];
         assert_eq!(sc["image"], "ghcr.io/x/mimic-sidecar@sha256:aa");
+        // The shared image's entrypoint is the controller.
+        assert_eq!(sc["command"], json!(["/usr/local/bin/mimic-sidecar"]));
         assert_eq!(sc["restartPolicy"], "Always");
         assert_eq!(
             sc["securityContext"],

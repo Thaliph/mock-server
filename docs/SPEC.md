@@ -259,7 +259,7 @@ discovery immediately.
 | `MIMIC_WEBHOOK_SERVICE` | required | Service name of the webhook (certificate SAN). |
 | `MIMIC_WEBHOOK_SECRET` | required | Secret holding the webhook CA and serving certificate. |
 | `MIMIC_WEBHOOK_CONFIGURATION` | required | Name of the `MutatingWebhookConfiguration` whose `caBundle` the controller maintains. |
-| `MIMIC_INJECT_SIDECAR_IMAGE` | required | Image of `mimic-sidecar` in injected pods (digest recommended). |
+| `MIMIC_INJECT_SIDECAR_IMAGE` | required | Image of `mimic-sidecar` in injected pods (digest recommended); the shared `mimic` image, so the injected container sets `command: [/usr/local/bin/mimic-sidecar]`. |
 | `MIMIC_INJECT_INIT_IMAGE` | required | Image of `mimic-init` in injected pods. |
 | `MIMIC_INJECT_SIDECAR_RESOURCES` | `{"requests":{"cpu":"50m","memory":"64Mi"},"limits":{"memory":"128Mi"}}` | Sidecar `resources`, JSON. |
 | `MIMIC_INJECT_SIDECAR_LOG` | `info` | `MIMIC_LOG` given to injected sidecars. |
