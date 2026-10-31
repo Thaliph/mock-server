@@ -2,6 +2,10 @@
 //! authority budget (spec §4.1, §9).
 
 use std::collections::BTreeSet;
+use std::net::Ipv6Addr;
+
+/// Longest accepted authority, in bytes (maximum length of a DNS name).
+const MAX_AUTHORITY_LEN: usize = 253;
 
 /// Label used for anything that is not a host name or IP literal.
 pub const INVALID_AUTHORITY: &str = "invalid";
@@ -9,30 +13,105 @@ pub const INVALID_AUTHORITY: &str = "invalid";
 /// Label used once the [`AuthorityBudget`] is exhausted.
 pub const OTHER_AUTHORITY: &str = "other";
 
-pub fn normalise_authority(raw: &str, _default_port: u16) -> String {
-    raw.to_string()
+/// Normalises a `Host` / `:authority` value: lower case, no trailing dot, `default_port`
+/// removed, bracketed IPv6 literals kept. Anything that is not a host name or an IP literal
+/// (optionally with a port), or longer than 253 bytes, becomes `invalid`.
+pub fn normalise_authority(raw: &str, default_port: u16) -> String {
+    parse(raw, default_port).unwrap_or_else(|| INVALID_AUTHORITY.to_string())
 }
 
-pub fn status_class(_status: u16) -> &'static str {
-    "none"
+fn parse(raw: &str, default_port: u16) -> Option<String> {
+    if raw.is_empty() || raw.len() > MAX_AUTHORITY_LEN {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    let (host, port) = if let Some(rest) = lower.strip_prefix('[') {
+        let (addr, after) = rest.split_once(']')?;
+        addr.parse::<Ipv6Addr>().ok()?;
+        let port = match after {
+            "" => None,
+            _ => Some(after.strip_prefix(':')?),
+        };
+        (format!("[{addr}]"), port)
+    } else {
+        let (host, port) = match lower.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (lower.as_str(), None),
+        };
+        let host = host.strip_suffix('.').unwrap_or(host);
+        if !valid_host(host) {
+            return None;
+        }
+        (host.to_string(), port)
+    };
+    match port {
+        None => Some(host),
+        Some(p) => {
+            let n = parse_port(p)?;
+            if n == default_port {
+                Some(host)
+            } else {
+                Some(format!("{host}:{n}"))
+            }
+        }
+    }
 }
 
+fn parse_port(p: &str) -> Option<u16> {
+    if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    p.parse().ok()
+}
+
+/// Host name or IPv4 literal: non-empty dot-separated labels of `[a-z0-9_-]`.
+fn valid_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.split('.').all(|l| {
+            !l.is_empty()
+                && l.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+/// Status class label of an HTTP status: `1xx`…`5xx`, `none` outside 100–599.
+pub fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "none",
+    }
+}
+
+/// Keeps the first `max` distinct authorities; later ones are reported as `other`.
+/// One budget per direction and metric.
 #[derive(Debug, Clone)]
 pub struct AuthorityBudget {
-    _max: usize,
-    _seen: BTreeSet<String>,
+    max: usize,
+    seen: BTreeSet<String>,
 }
 
 impl AuthorityBudget {
     pub fn new(max: usize) -> Self {
         AuthorityBudget {
-            _max: max,
-            _seen: BTreeSet::new(),
+            max,
+            seen: BTreeSet::new(),
         }
     }
 
+    /// Label to use for `authority`: itself when kept, `other` otherwise.
     pub fn label(&mut self, authority: &str) -> String {
-        authority.to_string()
+        if self.seen.contains(authority) {
+            return authority.to_string();
+        }
+        if self.seen.len() < self.max {
+            self.seen.insert(authority.to_string());
+            return authority.to_string();
+        }
+        OTHER_AUTHORITY.to_string()
     }
 }
 
