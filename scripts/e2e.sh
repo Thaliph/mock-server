@@ -506,10 +506,8 @@ resolved=$(kubectl -n inj-13 exec "$pod" -c app -- python3 -c \
 # --- PRX-14 (spec §12.3, §4.1, §9) ---------------------------------------------------------------
 # The three flows of the INJ-13 scenario: another pod to the app (inbound HTTP), the app to echo
 # (outbound HTTP) and the app to the controller's webhook Service (outbound TLS).
-#   Group 1 runs now: the flows complete through the sidecar and TLS shows the destination's own
-#     certificate.
-#   Group 2 (access lines and RED series) needs F2 steps 5-6 (HTTP relay, access log, RED metrics).
-#     It runs only with PRX14_OBSERVABILITY=1; make 1 the default when those steps land.
+#   Group 1: the flows complete through the sidecar and TLS shows the destination's own certificate.
+#   Group 2: access lines and RED series of the same flows (F2 steps 5-6).
 # The HTTP paths /prx14 exist only for this check, so an access line for them comes from it alone.
 
 # sidecar_series <pod> <metric> [label=value...]: sum of the series of the app pod's sidecar that match
@@ -546,6 +544,10 @@ wait_access() {
   done
   return 1
 }
+# access_dump <pod>: the sidecar's access lines to stderr, for a failed check.
+access_dump() {
+  kubectl -n inj-13 logs "$1" -c mimic-sidecar 2>/dev/null | grep '"target":"access"' >&2 || true
+}
 # wait_series <pod> <before> <metric> [label=value...]: polls up to 10 s until the sum exceeds <before>.
 wait_series() {
   local now=0 pod=$1 before=$2
@@ -559,17 +561,14 @@ wait_series() {
 }
 
 log "prx_14: the INJ-13 flows complete through the sidecar; TLS shows the destination's certificate"
-observed=${PRX14_OBSERVABILITY:-0}
 webhook=$RELEASE-controller.$NS.svc
-if [[ $observed == 1 ]]; then
-  # Snapshots before the requests below, so the checks of group 2 see exactly their increments.
-  before_in=$(sidecar_series "$pod" mimic_http_requests_total direction=inbound protocol=http1 \
-    authority=app.inj-13.svc:8080 status_class=2xx) || true
-  before_out=$(sidecar_series "$pod" mimic_http_requests_total direction=outbound protocol=http1 \
-    authority=echo.inj-13-up.svc:8080 status_class=2xx) || true
-  before_tls=$(sidecar_series "$pod" mimic_proxy_connections_total direction=outbound protocol=tls \
-    authority="$webhook") || true
-fi
+# Snapshots before the requests below, so the checks of group 2 see exactly their increments.
+before_in=$(sidecar_series "$pod" mimic_http_requests_total direction=inbound protocol=http1 \
+  authority=app.inj-13.svc:8080 status_class=2xx) || true
+before_out=$(sidecar_series "$pod" mimic_http_requests_total direction=outbound protocol=http1 \
+  authority=echo.inj-13-up.svc:8080 status_class=2xx) || true
+before_tls=$(sidecar_series "$pod" mimic_proxy_connections_total direction=outbound protocol=tls \
+  authority="$webhook") || true
 kubectl -n inj-13 exec "$pod" -c app -- touch /www/prx14 || fail "prx_14: cannot create /www/prx14 in the app"
 kubectl -n inj-13-up exec deploy/echo -- touch /www/prx14 || fail "prx_14: cannot create /www/prx14 in echo"
 kubectl -n inj-13-up exec client -- python3 -c \
@@ -589,30 +588,33 @@ ctx.verify_mode = ssl.CERT_NONE  # the proof is the certificate's bytes, not its
 with socket.create_connection((host, 8443), 10) as sock:
     with ctx.wrap_socket(sock, server_hostname=host) as tls:
         print(hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest())
+        # Read what the server sends after the handshake (TLS 1.3 session tickets): closing with unread
+        # data resets the connection, which the sidecar logs as client_abort rather than ok.
+        tls.settimeout(2)
+        try:
+            tls.recv(1)
+        except TimeoutError:
+            pass
 PY
 ) || fail "prx_14: TLS connection to the webhook Service through the sidecar failed"
 [[ $got_fp == "$want_fp" ]] || fail "prx_14: TLS through the sidecar does not show the webhook's own certificate"
 
-if [[ $observed == 1 ]]; then
-  log "prx_14: access lines and RED series of the same flows (needs F2 steps 5-6)"
-  wait_access "$pod" '.direction == "inbound" and .protocol == "http1" and .method == "GET" and .path == "/prx14" and .status == 200 and .result == "ok" and .authority == "app.inj-13.svc:8080"' \
-    || fail "prx_14: no inbound http1 access line for GET /prx14"
-  wait_access "$pod" '.direction == "outbound" and .protocol == "http1" and .method == "GET" and .path == "/prx14" and .status == 200 and .result == "ok" and .authority == "echo.inj-13-up.svc:8080"' \
-    || fail "prx_14: no outbound http1 access line for GET /prx14"
-  wait_access "$pod" '.direction == "outbound" and .protocol == "tls" and .sni == "mimic-controller.mimic-system.svc" and .result == "ok"' \
-    || fail "prx_14: no outbound tls access line for the webhook Service"
-  wait_series "$pod" "$before_in" mimic_http_requests_total direction=inbound protocol=http1 \
-    authority=app.inj-13.svc:8080 status_class=2xx \
-    || fail "prx_14: mimic_http_requests_total inbound 2xx did not increase"
-  wait_series "$pod" "$before_out" mimic_http_requests_total direction=outbound protocol=http1 \
-    authority=echo.inj-13-up.svc:8080 status_class=2xx \
-    || fail "prx_14: mimic_http_requests_total outbound 2xx did not increase"
-  wait_series "$pod" "$before_tls" mimic_proxy_connections_total direction=outbound protocol=tls \
-    authority="$webhook" \
-    || fail "prx_14: mimic_proxy_connections_total tls did not increase"
-else
-  log "prx_14: access lines and RED series not checked (needs F2 steps 5-6; PRX14_OBSERVABILITY=1 enables them)"
-fi
+log "prx_14: access lines and RED series of the same flows"
+wait_access "$pod" '.direction == "inbound" and .protocol == "http1" and .method == "GET" and .path == "/prx14" and .status == 200 and .result == "ok" and .authority == "app.inj-13.svc:8080"' \
+  || fail "prx_14: no inbound http1 access line for GET /prx14"
+wait_access "$pod" '.direction == "outbound" and .protocol == "http1" and .method == "GET" and .path == "/prx14" and .status == 200 and .result == "ok" and .authority == "echo.inj-13-up.svc:8080"' \
+  || fail "prx_14: no outbound http1 access line for GET /prx14"
+wait_access "$pod" '.direction == "outbound" and .protocol == "tls" and .sni == "mimic-controller.mimic-system.svc" and .result == "ok"' \
+  || { access_dump "$pod"; fail "prx_14: no outbound tls access line for the webhook Service"; }
+wait_series "$pod" "$before_in" mimic_http_requests_total direction=inbound protocol=http1 \
+  authority=app.inj-13.svc:8080 status_class=2xx \
+  || fail "prx_14: mimic_http_requests_total inbound 2xx did not increase"
+wait_series "$pod" "$before_out" mimic_http_requests_total direction=outbound protocol=http1 \
+  authority=echo.inj-13-up.svc:8080 status_class=2xx \
+  || fail "prx_14: mimic_http_requests_total outbound 2xx did not increase"
+wait_series "$pod" "$before_tls" mimic_proxy_connections_total direction=outbound protocol=tls \
+  authority="$webhook" \
+  || fail "prx_14: mimic_proxy_connections_total tls did not increase"
 
 log "inj_15: selection follows the namespace and pod labels, and labelling does not restart pods"
 ns_fresh inj-15-off
