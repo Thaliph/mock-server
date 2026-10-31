@@ -67,6 +67,10 @@ spec:
               value: {{ include "mimic.webhookSecret" . | quote }}
             - name: MIMIC_WEBHOOK_CONFIGURATION
               value: {{ include "mimic.webhookConfiguration" . | quote }}
+            - name: MIMIC_WEBHOOK_MAX_CONNECTIONS
+              value: {{ .Values.controller.webhook.maxConnections | quote }}
+            - name: MIMIC_WEBHOOK_REQUEST_TIMEOUT
+              value: {{ .Values.controller.webhook.requestTimeout | quote }}
             - name: MIMIC_INJECT_SIDECAR_IMAGE
               value: {{ include "mimic.image" . | quote }}
             - name: MIMIC_INJECT_INIT_IMAGE
@@ -98,10 +102,21 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.controller.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- if .Values.controller.affinity }}
+        {{- toYaml .Values.controller.affinity | nindent 8 }}
+        {{- else }}
+        # Replicas on different nodes when the cluster allows it (preferred, so a single-node cluster still runs them).
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                    app.kubernetes.io/name: mimic-controller
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

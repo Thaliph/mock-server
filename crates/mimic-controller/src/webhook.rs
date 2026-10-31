@@ -541,6 +541,11 @@ mod tests {
             listener,
             slot,
             router,
+            crate::tls::Limits {
+                max_connections: 256,
+                request_timeout: std::time::Duration::from_secs(5),
+                idle_timeout: crate::tls::IDLE_TIMEOUT,
+            },
             std::time::Duration::from_secs(2),
             async move {
                 let _ = stop_rx.await;

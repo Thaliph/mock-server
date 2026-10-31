@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11, INJ-13..INJ-17). Idempotent: reuses the cluster
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23). Idempotent: reuses the cluster
 # if it exists; the scenario namespaces are recreated on each run.
 #
 #   TAG=e2e-<sha>-<pid>                         tag of the images built here (unique per run, so
@@ -70,7 +70,6 @@ install() {
   helm upgrade --install "$RELEASE" deploy/helm/mimic -n "$NS" \
     --set image.repository="$repo" --set image.tag="$tag" --set image.pullPolicy=Never \
     --set inject.initImage.repository="$init_repo" --set inject.initImage.tag="$init_tag" \
-    --set controller.replicas=2 \
     --wait --timeout 4m
 }
 
@@ -94,6 +93,20 @@ admin_forward
 [[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "fnd_09: /readyz not 200"
 curl -fs localhost:18081/metrics | grep -q '^mimic_build_info{component="controller",version="' \
   || fail "fnd_09: mimic_build_info missing"
+
+# The chart defaults (the install above sets no replica count) and the controller NetworkPolicy. Admission
+# under the policy is exercised by every injection check below, which runs after this install.
+log "inj_23: chart defaults: 2 controller replicas, PodDisruptionBudget maxUnavailable 1, hostname anti-affinity, NetworkPolicy, CRD kept"
+[[ $(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.spec.replicas}') == 2 ]] \
+  || fail "inj_23: the controller does not run 2 replicas by default"
+[[ $(kubectl -n "$NS" get pdb $RELEASE-controller -o jsonpath='{.spec.maxUnavailable}') == 1 ]] \
+  || fail "inj_23: the PodDisruptionBudget of the controller is not maxUnavailable 1"
+[[ $(kubectl -n "$NS" get deploy $RELEASE-controller \
+  -o jsonpath='{.spec.template.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm.topologyKey}') == kubernetes.io/hostname ]] \
+  || fail "inj_23: the controller has no preferred anti-affinity on kubernetes.io/hostname"
+kubectl -n "$NS" get networkpolicy $RELEASE-controller >/dev/null 2>&1 || fail "inj_23: the controller NetworkPolicy is missing"
+[[ $(kubectl get crd mimicworkloads.mimic.platform.io -o jsonpath='{.metadata.annotations.helm\.sh/resource-policy}') == keep ]] \
+  || fail "inj_23: the CRD is not annotated helm.sh/resource-policy: keep"
 
 log "fnd_08: Valkey refuses clients other than the controller"
 password=$(kubectl -n "$NS" get secret $RELEASE-valkey -o jsonpath='{.data.password}' | base64 -d)
@@ -226,7 +239,13 @@ denied() { local desc=$1; shift; if "$@" >/dev/null 2>&1; then fail "inj_12: $de
 can yes "list mimicworkloads" list mimicworkloads.mimic.platform.io -A
 can yes "watch mimicworkloads" watch mimicworkloads.mimic.platform.io -A
 can yes "get its webhook configuration" get mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
+can yes "list its webhook configuration" list mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
+can yes "watch its webhook configuration" watch mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
 can yes "patch its webhook configuration" patch mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
+can no "list all webhook configurations" list mutatingwebhookconfigurations.admissionregistration.k8s.io
+can no "watch all webhook configurations" watch mutatingwebhookconfigurations.admissionregistration.k8s.io
+can no "list another webhook configuration" list mutatingwebhookconfigurations.admissionregistration.k8s.io/some-other
+can no "watch another webhook configuration" watch mutatingwebhookconfigurations.admissionregistration.k8s.io/some-other
 can yes "get the webhook secret" get secret/$RELEASE-webhook-tls -n "$NS"
 can yes "update the webhook secret" update secret/$RELEASE-webhook-tls -n "$NS"
 can no "create secrets" create secrets -n "$NS"
@@ -578,5 +597,22 @@ done
 [[ $events == *'violates PodSecurity'* ]] \
   || fail "inj_16: the injected pod was not rejected by Pod Security baseline"
 [[ -z $(kubectl -n inj-16-baseline get pods -o name) ]] || fail "inj_16: an injected pod violating baseline was admitted"
+
+log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: kept, namespace: default}
+spec: {deployment: api}
+YAML
+helm uninstall "$RELEASE" -n "$NS" --wait --timeout 4m >/dev/null || fail "inj_23: helm uninstall failed"
+kubectl get crd mimicworkloads.mimic.platform.io >/dev/null 2>&1 || fail "inj_23: the CRD was removed by helm uninstall"
+[[ $(kubectl -n default get mimicworkload kept -o jsonpath='{.spec.deployment}' 2>/dev/null) == api ]] \
+  || fail "inj_23: the MimicWorkload was removed by helm uninstall"
+install || fail "inj_23: reinstall with the same release name failed"
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
+[[ $(kubectl -n default get mimicworkload kept -o jsonpath='{.spec.deployment}' 2>/dev/null) == api ]] \
+  || fail "inj_23: the MimicWorkload was not kept by the reinstall"
+kubectl -n default delete mimicworkload kept --ignore-not-found >/dev/null
 
 log "e2e passed on kubernetes $server"

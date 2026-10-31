@@ -70,7 +70,36 @@ async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
     )
 }
 
-/// Resolves on `SIGTERM` or `SIGINT`.
+/// `SIGTERM` or `SIGINT`, registered once when installed, so that a signal arriving before a
+/// server starts waiting is not lost; each clone's [`Shutdown::wait`] resolves after it.
+#[derive(Clone)]
+pub struct Shutdown(tokio::sync::watch::Receiver<bool>);
+
+impl Shutdown {
+    /// Registers the handlers now; call it before announcing any listener.
+    pub fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut int = signal(SignalKind::interrupt())?;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            let _ = tx.send(true);
+        });
+        Ok(Self(rx))
+    }
+
+    /// Resolves once the signal has arrived (also if it arrived before this call).
+    pub async fn wait(mut self) {
+        let _ = self.0.wait_for(|stopped| *stopped).await;
+    }
+}
+
+/// Resolves on `SIGTERM` or `SIGINT` received after its first poll; prefer [`Shutdown`] when
+/// several servers stop on the same signal.
 pub async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
