@@ -33,7 +33,7 @@ pub struct Tunnelled {
     pub error: Option<io::Error>,
 }
 
-async fn write_all(to: &TcpStream, mut data: &[u8]) -> io::Result<()> {
+pub(crate) async fn write_all(to: &TcpStream, mut data: &[u8]) -> io::Result<()> {
     while !data.is_empty() {
         to.writable().await?;
         match to.try_write(data) {
@@ -77,7 +77,7 @@ async fn copy(
 }
 
 /// Resolves when the socket has a pending error (a reset, also after a FIN was read).
-async fn failed(s: &TcpStream, side: Side) -> (Side, io::Error) {
+pub(crate) async fn failed(s: &TcpStream, side: Side) -> (Side, io::Error) {
     loop {
         if let Err(e) = s.ready(Interest::ERROR).await {
             return (side, e);
@@ -92,7 +92,7 @@ async fn failed(s: &TcpStream, side: Side) -> (Side, io::Error) {
 }
 
 /// Makes the close of `s` a reset.
-fn abort(s: &TcpStream) {
+pub(crate) fn abort(s: &TcpStream) {
     let _ = SockRef::from(s).set_linger(Some(Duration::ZERO));
 }
 
