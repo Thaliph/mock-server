@@ -244,7 +244,7 @@ fn tls_13_binary_writes_the_bundle_logs_once_and_exits_0() {
     let lines = logs(&stdout);
     let written: Vec<_> = lines
         .iter()
-        .filter(|l| l["fields"]["message"] == "trust bundle written")
+        .filter(|l| l["message"] == "trust bundle written")
         .collect();
     assert_eq!(written.len(), 1, "{stdout}");
     assert_eq!(written[0]["level"], "INFO");

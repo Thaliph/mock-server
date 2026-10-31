@@ -1,6 +1,14 @@
 //! PEM certificate bundles for `mimic-trust` (spec §7.1): parsing, deduplication in first-seen
 //! order and re-encoding. Pure: reading files and writing the PKCS12 store is the binary's job.
 
+use std::collections::BTreeSet;
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
+const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+const END: &str = "-----END CERTIFICATE-----";
+
 /// Certificates found in a PEM text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Parsed {
@@ -13,20 +21,61 @@ pub struct Parsed {
 /// Extracts the `CERTIFICATE` blocks of `text`; text outside the blocks (comments, other PEM
 /// types) is ignored. `is_cert` tells whether decoded bytes are a certificate.
 pub fn parse_pem(text: &str, is_cert: impl Fn(&[u8]) -> bool) -> Parsed {
-    let _ = (text, is_cert);
-    unimplemented!()
+    let mut parsed = Parsed::default();
+    // The base64 body while inside a CERTIFICATE block.
+    let mut body: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == BEGIN {
+            if body.is_some() {
+                parsed.skipped += 1;
+            }
+            body = Some(String::new());
+        } else if line == END {
+            if let Some(b) = body.take() {
+                match STANDARD.decode(b.as_bytes()) {
+                    Ok(der) if is_cert(&der) => parsed.certs.push(der),
+                    _ => parsed.skipped += 1,
+                }
+            }
+        } else if let Some(b) = body.as_mut() {
+            b.push_str(line);
+        }
+    }
+    if body.is_some() {
+        parsed.skipped += 1;
+    }
+    parsed
 }
 
 /// Concatenates the lists, dropping every certificate already seen (first one wins).
 pub fn merge(lists: &[&[Vec<u8>]]) -> Vec<Vec<u8>> {
-    let _ = lists;
-    unimplemented!()
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for cert in lists.iter().flat_map(|l| l.iter()) {
+        if seen.insert(cert.as_slice()) {
+            out.push(cert.clone());
+        }
+    }
+    out
 }
 
 /// One `CERTIFICATE` block per certificate, base64 wrapped at 64 columns, `\n` line ends.
 pub fn encode_pem(certs: &[Vec<u8>]) -> String {
-    let _ = certs;
-    unimplemented!()
+    let mut out = String::new();
+    for cert in certs {
+        out.push_str(BEGIN);
+        out.push('\n');
+        let encoded = STANDARD.encode(cert);
+        for chunk in encoded.as_bytes().chunks(64) {
+            // base64 output is ASCII, so every chunk is valid UTF-8.
+            out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+            out.push('\n');
+        }
+        out.push_str(END);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
