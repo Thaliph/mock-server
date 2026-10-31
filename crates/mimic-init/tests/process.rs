@@ -156,3 +156,89 @@ fn inj_06_never_logs_the_rest_of_the_environment() {
         assert!(!text.contains("canary-"), "{text}");
     }
 }
+
+/// A fake restore command that appends each run's stdin to `<name>.runs`, separated by a line
+/// `=== run`, and exits with the code in `<name>.code` (default 0).
+fn recording(dir: &Path, name: &str, code: i32) {
+    let script = format!(
+        "#!/bin/sh\necho '=== run' >> \"{d}/{name}.runs\"\n/bin/cat >> \"{d}/{name}.runs\"\nexit {code}\n",
+        d = dir.display()
+    );
+    let path = dir.join(name);
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Jumps left in the built-in chains after replaying the recorded `--noflush` inputs in order:
+/// `-F` empties a chain, `-A` appends to it. Keyed by `table chain`.
+fn replay(runs: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut table = "";
+    let mut rules: std::collections::BTreeMap<String, usize> = Default::default();
+    for line in runs.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            [t] if t.starts_with('*') => table = &t[1..],
+            ["-F", chain] => {
+                rules.remove(&format!("{table} {chain}"));
+            }
+            ["-A", chain, .., "-j", target] if target.starts_with("MIMIC_") => {
+                *rules.entry(format!("{table} {chain}")).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    rules.retain(|chain, _| !chain.contains("MIMIC_"));
+    rules
+}
+
+fn run_init(dir: &Path) -> std::process::ExitStatus {
+    run(BIN, &[], &[("PATH", &path_env(dir))]).0
+}
+
+fn expected_jumps() -> std::collections::BTreeMap<String, usize> {
+    [
+        ("nat PREROUTING", 1),
+        ("nat OUTPUT", 1),
+        ("filter OUTPUT", 1),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+#[test]
+fn inj_22_running_twice_keeps_one_jump_per_built_in_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    recording(dir.path(), "iptables-restore", 0);
+    recording(dir.path(), "ip6tables-restore", 0);
+    assert_eq!(run_init(dir.path()).code(), Some(0));
+    assert_eq!(run_init(dir.path()).code(), Some(0));
+    let families: &[&str] = if host_has_ipv6() {
+        &["iptables-restore", "ip6tables-restore"]
+    } else {
+        &["iptables-restore"]
+    };
+    for name in families {
+        let runs = fs::read_to_string(dir.path().join(format!("{name}.runs"))).unwrap();
+        assert_eq!(runs.matches("=== run").count(), 2, "{name}");
+        assert_eq!(replay(&runs), expected_jumps(), "{name}");
+    }
+}
+
+#[test]
+fn inj_22_a_rerun_after_a_failed_ipv6_restore_keeps_one_jump() {
+    if !host_has_ipv6() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    recording(dir.path(), "iptables-restore", 0);
+    recording(dir.path(), "ip6tables-restore", 1);
+    assert_eq!(run_init(dir.path()).code(), Some(1));
+    recording(dir.path(), "ip6tables-restore", 0);
+    assert_eq!(run_init(dir.path()).code(), Some(0));
+    let v4 = fs::read_to_string(dir.path().join("iptables-restore.runs")).unwrap();
+    assert_eq!(v4.matches("=== run").count(), 2);
+    assert_eq!(replay(&v4), expected_jumps());
+    let v6 = fs::read_to_string(dir.path().join("ip6tables-restore.runs")).unwrap();
+    assert_eq!(replay(&v6), expected_jumps());
+}
