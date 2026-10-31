@@ -261,7 +261,8 @@ async fn connection(
         Err(_) => return,
     };
     let cycle = Arc::new(Cycle::default());
-    cycle.set(Phase::Idle(Instant::now()));
+    // The first request is bounded by the request timeout; the idle timeout starts after a reply.
+    cycle.set(Phase::Request(Instant::now()));
     let inner = TowerToHyperService::new(router);
     let service = service_fn({
         let cycle = cycle.clone();
