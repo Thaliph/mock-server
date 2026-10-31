@@ -77,20 +77,90 @@ impl Untouched {
 
 /// Deployment owning the pod: its controlling ReplicaSet is named
 /// `<deployment>-<pod-template-hash>`.
-pub fn deployment_of(_pod: &Pod) -> Option<String> {
-    todo!()
+pub fn deployment_of(pod: &Pod) -> Option<String> {
+    let owner = pod
+        .metadata
+        .owner_references
+        .as_ref()?
+        .iter()
+        .find(|o| o.controller == Some(true))?;
+    if owner.kind != "ReplicaSet" || !owner.api_version.starts_with("apps/") {
+        return None;
+    }
+    let hash = pod.metadata.labels.as_ref()?.get("pod-template-hash")?;
+    let deployment = owner.name.strip_suffix(hash.as_str())?.strip_suffix('-')?;
+    (!hash.is_empty() && !deployment.is_empty()).then(|| deployment.to_string())
 }
 
 /// Decides what to do with `pod` created in `namespace`. `workload_exists` tells whether a
 /// `MimicWorkload` of that namespace has `spec.deployment` equal to the given name.
 pub fn decide(
-    _pod: &Pod,
-    _namespace: &str,
-    _controller_namespace: &str,
-    _namespace_mode: NamespaceMode,
-    _workload_exists: impl Fn(&str) -> bool,
+    pod: &Pod,
+    namespace: &str,
+    controller_namespace: &str,
+    namespace_mode: NamespaceMode,
+    workload_exists: impl Fn(&str) -> bool,
 ) -> Decision {
-    todo!()
+    if namespace == controller_namespace || EXCLUDED_NAMESPACES.contains(&namespace) {
+        return Decision::Untouched(Untouched::ExcludedNamespace);
+    }
+    let pod_label = pod
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(INJECT_LABEL))
+        .map(String::as_str);
+    let deployment = deployment_of(pod);
+    let selected = match (pod_label, namespace_mode) {
+        (Some("disabled"), _) => return Decision::Untouched(Untouched::PodDisabled),
+        (Some("enabled"), _) | (_, NamespaceMode::Enabled) => true,
+        (_, NamespaceMode::Selected) => deployment.as_deref().is_some_and(&workload_exists),
+        (_, NamespaceMode::Absent) => false,
+    };
+    if !selected {
+        return Decision::Untouched(Untouched::NotSelected);
+    }
+    let spec = pod.spec.as_ref();
+    if spec.is_some_and(|s| {
+        s.init_containers
+            .iter()
+            .flatten()
+            .any(|c| c.name == SIDECAR_NAME)
+    }) {
+        return Decision::Untouched(Untouched::AlreadyInjected);
+    }
+    let skip = |reason| Decision::Skip {
+        reason,
+        deployment: deployment.clone(),
+    };
+    let Some(deployment) = deployment.clone() else {
+        return skip(SkipReason::UnsupportedOwner);
+    };
+    let Some(spec) = spec else {
+        return Decision::Inject { deployment };
+    };
+    if spec.host_network == Some(true) {
+        return skip(SkipReason::HostNetwork);
+    }
+    let port_conflict = spec.containers.iter().any(|c| {
+        c.ports
+            .iter()
+            .flatten()
+            .any(|p| RESERVED_PORTS.contains(&p.container_port))
+    });
+    if port_conflict {
+        return skip(SkipReason::PortConflict);
+    }
+    let pod_uid = spec.security_context.as_ref().and_then(|s| s.run_as_user);
+    let uid_conflict = pod_uid == Some(PROXY_UID)
+        || spec
+            .containers
+            .iter()
+            .any(|c| c.security_context.as_ref().and_then(|s| s.run_as_user) == Some(PROXY_UID));
+    if uid_conflict {
+        return skip(SkipReason::UidConflict);
+    }
+    Decision::Inject { deployment }
 }
 
 #[cfg(test)]
