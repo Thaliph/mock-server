@@ -137,7 +137,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         controller_namespace: webhook.namespace,
         inject: webhook.inject,
         cache,
-        seed,
+        seed: seed.clone(),
         cert: cert.clone(),
         roots: webhook::RootCache::default(),
         metrics: admission_metrics,
