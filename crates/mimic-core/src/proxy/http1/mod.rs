@@ -271,6 +271,17 @@ fn host_port(authority: &str) -> String {
     truncate(host.to_string(), AUTHORITY_LIMIT)
 }
 
+/// What follows `<scheme>://` when `target` is in absolute form (RFC 9112 §3.2.2): the target
+/// starts with a scheme (RFC 3986 §3.1). A `://` later in an origin-form target (in its path or
+/// query) is not one, or a client could spoof the logged authority and path.
+fn absolute_form(target: &str) -> Option<&str> {
+    let (scheme, rest) = target.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(rest)
+}
+
 fn request_head(line: &[u8], fields: &Fields) -> Option<RequestHead> {
     let (method, target, minor) = scan::parse_request_line(line)?;
     let method = truncate(String::from_utf8_lossy(method).into_owned(), METHOD_LIMIT);
@@ -278,7 +289,7 @@ fn request_head(line: &[u8], fields: &Fields) -> Option<RequestHead> {
     let connect = method == "CONNECT";
     let (path, uri_authority) = if connect {
         (String::new(), Some(host_port(&target)))
-    } else if let Some((_, rest)) = target.split_once("://") {
+    } else if let Some(rest) = absolute_form(&target) {
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let path = rest[end..].split(['?', '#']).next().unwrap_or_default();
         let path = if path.is_empty() { "/" } else { path };
