@@ -19,13 +19,13 @@ async fn inj_07_tunnels_bytes_both_ways_and_counts_ok() {
     let echo = echo_server().await;
     let f = fixture(Direction::Outbound, move |_| Some(echo)).await;
     let mut c = TcpStream::connect(f.addr).await.unwrap();
-    c.write_all(b"ping").await.unwrap();
-    let mut buf = [0u8; 4];
+    c.write_all(b"ping\n").await.unwrap();
+    let mut buf = [0u8; 5];
     tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut buf))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(&buf, b"ping");
+    assert_eq!(&buf, b"ping\n");
     counted(
         &f.metrics,
         r#"mimic_tcp_connections_total{direction="outbound",result="ok"} 1"#,
