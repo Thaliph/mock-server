@@ -297,14 +297,37 @@ pub(crate) mod tests {
     use k8s_openapi::api::core::v1::ResourceRequirements;
     use mimic_runtime::metrics::Metrics;
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::Mutex;
     use tower::ServiceExt;
 
+    use crate::tls::CertSlot;
+    use crate::tls_ca::{Seed, SeedSlot, derive_root};
+
     const CANARY: &str = "canary-s3cret-7f3a";
 
     fn setup(synced: bool, workloads: &[(&str, &str, &str)]) -> (Router, Arc<Metrics>) {
+        let workloads: Vec<_> = workloads.iter().map(|(a, b, c)| (*a, *b, *c, &[][..])).collect();
+        let (router, metrics, _) = setup_tls(synced, &workloads, true);
+        (router, metrics)
+    }
+
+    type WorkloadSetup<'a> = (&'a str, &'a str, &'a str, &'a [&'a str]);
+
+    /// Like [`setup`], with the TLS exclusions of each workload and the seed loaded or not.
+    fn setup_tls(
+        synced: bool,
+        workloads: &[WorkloadSetup],
+        seeded: bool,
+    ) -> (Router, Arc<Metrics>, Arc<SeedSlot>) {
         let mut metrics = Metrics::new("controller", "test");
+        let seed = Arc::new(SeedSlot::new());
+        if seeded {
+            seed.set(Seed::generate(std::time::SystemTime::now()));
+        }
+        let cert = Arc::new(CertSlot::new());
+        cert.set_ca_pem(b"-----BEGIN CERTIFICATE-----\nWEBHOOK-CA\n-----END CERTIFICATE-----\n");
         let admission = Arc::new(Admission {
             controller_namespace: "mimic-system".into(),
             inject: InjectConfig {
@@ -313,15 +336,19 @@ pub(crate) mod tests {
                 init_image: "mimic-init:test".into(),
                 sidecar_resources: ResourceRequirements::default(),
                 sidecar_log: "info".into(),
+                controller_url: "https://mimic.mimic-system.svc:8444".into(),
             },
             cache: Arc::new(if synced {
-                WorkloadCache::synced_with(workloads)
+                WorkloadCache::synced_with_exclude(workloads)
             } else {
                 WorkloadCache::new()
             }),
+            seed: seed.clone(),
+            cert,
+            roots: RootCache::default(),
             metrics: AdmissionMetrics::register(metrics.registry_mut()),
         });
-        (router(admission), Arc::new(metrics))
+        (router(admission), Arc::new(metrics), seed)
     }
 
     fn pod() -> Value {
@@ -770,5 +797,78 @@ pub(crate) mod tests {
         assert!(!logs.is_empty());
         assert!(!logs.contains(CANARY), "log leak:\n{logs}");
         assert!(!metrics.encode().contains(CANARY));
+    }
+
+    fn sidecar_env(response: &Value) -> BTreeMap<String, String> {
+        let patch = patch_of(response);
+        let init = patch
+            .iter()
+            .find(|op| op["path"] == "/spec/initContainers")
+            .expect("init containers");
+        init["value"][1]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| Some((e["name"].as_str()?.to_string(), e["value"].as_str()?.to_string())))
+            .collect()
+    }
+
+    fn spki_of(pem: &str) -> Vec<u8> {
+        let der = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap().1.contents;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+        cert.public_key().raw.to_vec()
+    }
+
+    #[tokio::test]
+    async fn tls_12_sidecar_gets_the_root_the_webhook_ca_and_the_sorted_union_of_exclusions() {
+        let (router, _, seed) = setup_tls(
+            true,
+            &[
+                ("shop", "w1", "shop", &["b.example.com", "*.corp.example"]),
+                ("shop", "w2", "shop", &["b.example.com", "a.example.com"]),
+                ("shop", "w3", "other", &["not-mine.example.com"]),
+                ("elsewhere", "w4", "shop", &["not-mine-either.example.com"]),
+            ],
+            true,
+        );
+        let first = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        let env = sidecar_env(&first);
+        assert_eq!(
+            env["MIMIC_TLS_EXCLUDE"],
+            "*.corp.example,a.example.com,b.example.com"
+        );
+        assert_eq!(env["MIMIC_CONTROLLER_URL"], "https://mimic.mimic-system.svc:8444");
+        assert!(env["MIMIC_CONTROLLER_CA"].contains("WEBHOOK-CA"));
+        // The root is the one derived from the seed for `<namespace>/<deployment>`.
+        let expected = derive_root(&seed.get().unwrap(), "shop", "shop").unwrap();
+        assert_eq!(spki_of(&env["MIMIC_TLS_CA"]), expected.public_key_der());
+        // Its signature is randomized: the same PEM is served again, so pod specs stay stable.
+        let second = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        assert_eq!(patch_of(&first), patch_of(&second));
+    }
+
+    #[tokio::test]
+    async fn tls_12_no_exclusion_means_no_variable() {
+        let (router, _, _) = setup_tls(true, &[("shop", "w1", "shop", &[])], true);
+        let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        assert!(!sidecar_env(&out).contains_key("MIMIC_TLS_EXCLUDE"));
+    }
+
+    #[tokio::test]
+    async fn tls_12_admission_without_a_seed_is_denied() {
+        let (router, metrics, _) = setup_tls(true, &[], false);
+        let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        assert_eq!(out["response"]["uid"], "u");
+        assert_eq!(out["response"]["allowed"], false);
+        assert!(
+            metrics
+                .encode()
+                .contains(r#"mimic_webhook_admissions_total{result="error",reason="seed-not-loaded"} 1"#)
+        );
+        // A pod that is not injected does not need the seed.
+        let mut host = pod();
+        host["spec"]["hostNetwork"] = json!(true);
+        let out = admit(&router, "/inject/namespace", review("u", "shop", &host)).await;
+        assert_eq!(out["response"]["allowed"], true);
     }
 }

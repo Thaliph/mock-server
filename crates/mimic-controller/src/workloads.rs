@@ -169,4 +169,35 @@ mod tests {
         cache.replace([("shop".into(), "w2".into(), "web".into())]);
         assert!(!cache.has("shop", "api") && cache.has("shop", "web"));
     }
+
+    #[test]
+    fn tls_12_exclusions_are_the_sorted_deduplicated_union_per_deployment() {
+        let cache = WorkloadCache::synced_with_exclude(&[
+            ("shop", "w1", "api", &["b.test", "a.test"]),
+            ("shop", "w2", "api", &["b.test", "*.c.test"]),
+            ("shop", "w3", "web", &["web.test"]),
+            ("other", "w4", "api", &["other.test"]),
+        ]);
+        assert_eq!(
+            cache.exclude("shop", "api"),
+            ["*.c.test", "a.test", "b.test"]
+        );
+        assert_eq!(cache.exclude("shop", "web"), ["web.test"]);
+        assert!(cache.exclude("shop", "none").is_empty());
+        cache.remove("shop", "w2");
+        assert_eq!(cache.exclude("shop", "api"), ["a.test", "b.test"]);
+    }
+
+    #[test]
+    fn tls_12_entry_reads_spec_tls_exclude() {
+        let object: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "mimic.platform.io/v1alpha1", "kind": "MimicWorkload",
+            "metadata": {"name": "w", "namespace": "shop"},
+            "spec": {"deployment": "api", "tls": {"exclude": ["a.test", 7, "b.test"]}},
+        }))
+        .unwrap();
+        let (ns, name, deployment, exclude) = entry(&object).unwrap();
+        assert_eq!((ns.as_str(), name.as_str(), deployment.as_str()), ("shop", "w", "api"));
+        assert_eq!(exclude, ["a.test", "b.test"]);
+    }
 }
