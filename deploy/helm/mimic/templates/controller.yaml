@@ -65,6 +65,8 @@ spec:
               value: {{ include "mimic.controllerService" . | quote }}
             - name: MIMIC_WEBHOOK_SECRET
               value: {{ include "mimic.webhookSecret" . | quote }}
+            - name: MIMIC_TLS_CA_SECRET
+              value: {{ include "mimic.tlsCaSecret" . | quote }}
             - name: MIMIC_WEBHOOK_CONFIGURATION
               value: {{ include "mimic.webhookConfiguration" . | quote }}
             - name: MIMIC_WEBHOOK_MAX_CONNECTIONS

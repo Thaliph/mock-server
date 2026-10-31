@@ -29,6 +29,8 @@ use tokio_rustls::TlsAcceptor;
 #[derive(Default, Debug)]
 pub struct CertSlot {
     current: RwLock<Option<Arc<CertifiedKey>>>,
+    /// The CA that signed the certificate, PEM: handed to sidecars (spec §7.1).
+    ca: RwLock<Option<Arc<str>>>,
 }
 
 impl CertSlot {
@@ -54,6 +56,19 @@ impl CertSlot {
 
     pub fn is_loaded(&self) -> bool {
         self.get().is_some()
+    }
+
+    /// Records the CA certificate (PEM) of the serving certificate.
+    pub fn set_ca_pem(&self, ca_pem: &[u8]) {
+        let ca = String::from_utf8_lossy(ca_pem);
+        *self.ca.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::from(&*ca));
+    }
+
+    pub fn ca_pem(&self) -> Option<Arc<str>> {
+        self.ca
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn get(&self) -> Option<Arc<CertifiedKey>> {

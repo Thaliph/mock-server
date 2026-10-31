@@ -104,7 +104,7 @@ fn validity(params: &mut CertificateParams, now: SystemTime, lifetime: Duration)
     params.not_after = datetime(now + lifetime);
 }
 
-fn datetime(at: SystemTime) -> OffsetDateTime {
+pub(crate) fn datetime(at: SystemTime) -> OffsetDateTime {
     let seconds = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     OffsetDateTime::from_unix_timestamp(i64::try_from(seconds).unwrap_or(i64::MAX))
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
