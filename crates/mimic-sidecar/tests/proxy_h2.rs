@@ -1,4 +1,4 @@
-//! PRX-04, PRX-07 (HTTP/2 part): the HTTP/2 prior-knowledge relay and gRPC, in process.
+//! PRX-04, PRX-07, PRX-16, PRX-19, PRX-22 (HTTP/2 part): the HTTP/2 prior-knowledge relay and gRPC, in process.
 
 mod common;
 
@@ -12,13 +12,13 @@ use std::time::Duration;
 use common::{capture_logs, closed_by_peer, closed_port, counted, fixture};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Bytes, Frame, Incoming, SizeHint};
 use hyper::client::conn::http2::SendRequest;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_sidecar::listener::Direction;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -340,4 +340,190 @@ async fn prx_23_h2_authority_wins_over_host() {
     let lines = logs.access_exactly(1).await;
     assert_eq!(lines[0]["authority"], "a.example");
     assert!(!f.metrics.encode().contains("b.example"));
+}
+
+/// A request body whose length the client does not announce: no size hint, ends after `data`.
+struct Unsized(Option<Bytes>);
+
+impl hyper::body::Body for Unsized {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        std::task::Poll::Ready(self.0.take().map(|data| Ok(Frame::data(data))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+#[tokio::test]
+async fn prx_16_h2_adds_no_content_length() {
+    let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let (addr, _) = dest(move |req: Request<Incoming>| {
+        let tx = tx.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let body = body.collect().await.unwrap().to_bytes();
+            tx.send((parts.method.to_string(), sorted(&parts.headers), body))
+                .unwrap();
+            Ok(Response::new(full("")))
+        }
+    })
+    .await;
+    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
+    let tcp = TcpStream::connect(f.addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, Unsized>(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    for (method, body) in [
+        ("POST", None),
+        ("PUT", None),
+        ("PATCH", None),
+        ("POST", Some("streamed")),
+    ] {
+        let req = Request::builder()
+            .method(method)
+            .uri("http://svc.example/p")
+            .body(Unsized(body.map(|b| Bytes::from_static(b.as_bytes()))))
+            .unwrap();
+        let response = tokio::time::timeout(TIMEOUT, sender.send_request(req))
+            .await
+            .expect("answered")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let (seen_method, headers, seen_body) = seen.recv().await.unwrap();
+        assert_eq!(seen_method, method);
+        assert!(headers.is_empty(), "{method}: no header added: {headers:?}");
+        assert_eq!(seen_body, body.unwrap_or_default());
+    }
+}
+
+/// A destination that accepts connections and never reads or writes.
+async fn silent() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            held.push(listener.accept().await.unwrap().0);
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn prx_19_h2_silent_destination_is_waited_for_without_timeout() {
+    let silent = silent().await;
+    let (live, _) = dest(|_| async { Ok(Response::new(full("ok"))) }).await;
+    let f = fixture(Direction::Outbound, move |_| Some(silent)).await;
+    let mut sender = client(f.addr).await;
+    let req = Request::get("http://silent.example/")
+        .body(full(""))
+        .unwrap();
+    let mut pending = Box::pin(sender.send_request(req));
+    // Longer than any default timer of hyper or h2.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(35), &mut pending)
+            .await
+            .is_err(),
+        "still pending, not failed"
+    );
+    // Other destinations are served meanwhile.
+    let g = fixture(Direction::Outbound, move |_| Some(live)).await;
+    let mut other = client(g.addr).await;
+    let req = Request::get("http://live.example/").body(full("")).unwrap();
+    let response = tokio::time::timeout(TIMEOUT, other.send_request(req))
+        .await
+        .expect("answered")
+        .unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn prx_19_h2_client_closing_releases_the_destination_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(PREFACE).await.unwrap();
+    // An empty SETTINGS frame, then a request that is never answered.
+    c.write_all(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+        .await
+        .unwrap();
+    c.write_all(b"\x00\x00\x03\x01\x05\x00\x00\x00\x01\x82\x86\x84")
+        .await
+        .unwrap();
+    let mut upstream = accepted.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(c);
+    let mut buf = [0u8; 4096];
+    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match upstream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "destination connection closed within 1 s");
+}
+
+/// SETTINGS, then `HEADERS` on the even stream id 2 (a connection error for a server).
+const MALFORMED: &[u8] =
+    b"\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x03\x01\x05\x00\x00\x00\x02\x82\x86\x84";
+
+#[tokio::test]
+async fn prx_22_malformed_h2_is_answered_with_goaway_and_logged_as_rejected() {
+    let logs = capture_logs();
+    let (addr, _) = dest(|_| async { Ok(Response::new(full(""))) }).await;
+    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(PREFACE).await.unwrap();
+    c.write_all(MALFORMED).await.unwrap();
+    let mut received = Vec::new();
+    tokio::time::timeout(TIMEOUT, c.read_to_end(&mut received))
+        .await
+        .expect("closed")
+        .ok();
+    // Frames: 9-byte header (length, type, flags, stream), then the payload.
+    let mut goaway = None;
+    let mut rest = &received[..];
+    while rest.len() >= 9 {
+        let len = u32::from_be_bytes([0, rest[0], rest[1], rest[2]]) as usize;
+        if rest[3] == 7 {
+            goaway = Some(rest[9..9 + len].to_vec());
+        }
+        rest = &rest[(9 + len).min(rest.len())..];
+    }
+    let goaway = goaway.expect("GOAWAY received");
+    assert_eq!(goaway[4..8], 1u32.to_be_bytes(), "PROTOCOL_ERROR");
+
+    let lines = logs.access_exactly(1).await;
+    let line = &lines[0];
+    assert_eq!(line["protocol"], "h2");
+    assert_eq!(line["result"], "rejected");
+    assert_eq!(line["authority"], addr.to_string());
+    for absent in ["status", "method", "path"] {
+        assert!(line.get(absent).is_none(), "{absent}: {line}");
+    }
+    counted(
+        &f.metrics,
+        &format!(
+            "mimic_http_requests_total{{direction=\"outbound\",protocol=\"h2\",authority=\"{addr}\",status_class=\"none\"}} 1"
+        ),
+    )
+    .await;
 }

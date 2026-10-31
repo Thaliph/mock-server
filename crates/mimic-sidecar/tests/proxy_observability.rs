@@ -618,3 +618,42 @@ async fn prx_23_real_hosts_named_other_and_invalid_are_not_the_sentinels() {
         .await;
     }
 }
+
+#[tokio::test]
+
+async fn prx_21_h2_rejected_has_no_duration_and_is_not_observed() {
+    let logs = capture_logs();
+    let addr = echo_server().await;
+    let f = fixture(Direction::Outbound, move |_| Some(addr)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    // SETTINGS, then HEADERS on the even stream id 2.
+    c.write_all(
+        b"\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x03\x01\x05\x00\x00\x00\x02\x82\x86\x84",
+    )
+    .await
+    .unwrap();
+    read_to_end(&mut c).await;
+
+    let lines = logs.access_exactly(1).await;
+    assert_eq!(lines[0]["result"], "rejected");
+    for absent in ["duration_ms", "head_ms"] {
+        assert!(lines[0].get(absent).is_none(), "{absent}: {}", lines[0]);
+    }
+    counted(
+        &f.metrics,
+        &format!(
+            "mimic_http_requests_total{{direction=\"outbound\",protocol=\"h2\",authority=\"{addr}\",status_class=\"none\"}} 1"
+        ),
+    )
+    .await;
+    let text = f.metrics.encode();
+    assert!(
+        !text.lines().any(
+            |l| l.starts_with("mimic_http_request_duration_seconds_count") && !l.ends_with(" 0")
+        ),
+        "{text}"
+    );
+}
