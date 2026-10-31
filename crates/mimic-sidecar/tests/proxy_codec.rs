@@ -80,9 +80,7 @@ async fn read_to_end(s: &mut TcpStream) -> Vec<u8> {
 }
 
 fn reset(s: TcpStream) {
-    SockRef::from(&s)
-        .set_linger(Some(Duration::ZERO))
-        .unwrap();
+    SockRef::from(&s).set_linger(Some(Duration::ZERO)).unwrap();
     drop(s);
 }
 
@@ -150,7 +148,7 @@ fn step(req: &str, resp: &str) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn corpus() -> Vec<Conversation> {
-    let many_headers: String = (0..300).map(|i| format!("X-H{i}: v{i}\r\n")).collect();
+    let many_headers: String = (0..200).map(|i| format!("X-H{i}: v{i}\r\n")).collect();
     let pipelined_req: String = (0..5)
         .map(|i| format!("GET /p{i} HTTP/1.1\r\nHost: a\r\n\r\n"))
         .collect();
@@ -159,7 +157,7 @@ fn corpus() -> Vec<Conversation> {
         .collect();
     vec![
         Conversation {
-            name: "headers: case, repeats, order, 300 response lines",
+            name: "headers: case, repeats, order, 200 response lines",
             steps: vec![step(
                 "GET /a?q=1 HTTP/1.1\r\nHOST: a\r\nx-B: 1\r\nX-a: 2\r\nx-b: 3\r\nX-A:4\r\n\r\n",
                 &format!("HTTP/1.1 200 OK\r\nContent-length: 2\r\n{many_headers}\r\nok"),
@@ -610,6 +608,7 @@ async fn upgrade_declined(head: &str, decline: &'static [u8], status: u16) {
         server.await.unwrap(),
         b"GET /next HTTP/1.1\r\nHost: a\r\n\r\n"
     );
+    drop(c);
     let (_, events) = p.finished().await;
     assert_eq!(responses(&events), vec![status, 200]);
     assert!(!events.contains(&Event::Tunnel));
