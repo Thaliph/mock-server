@@ -209,7 +209,9 @@ async fn tls_22_a_tcp_reset_reaches_the_other_side_as_a_reset() {
         } else {
             (w.dest.into_inner().0, Box::new(w.app))
         };
-        reset.set_linger(Some(Duration::ZERO)).unwrap();
+        socket2::SockRef::from(&reset)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
         drop(reset);
         let mut buf = Vec::new();
         let err = tokio::time::timeout(TIMEOUT, other.read_to_end(&mut buf))
