@@ -126,7 +126,19 @@ mod tests {
         assert!(!has_ipv6(""));
         assert!(!has_ipv6("\n"));
         assert!(has_ipv6(
-            "00000000000000000000000000000001 01 80 10 80 lo\n"
+            "fe80000000000000a8bb3cfffe123456 02 40 20 80 eth0\n"
         ));
+    }
+
+    #[test]
+    fn inj_22_loopback_alone_is_no_ipv6() {
+        let lo = "00000000000000000000000000000001 01 80 10 80 lo\n";
+        assert!(!has_ipv6(lo));
+        assert!(has_ipv6(&format!(
+            "{lo}20010db8000000000000000000000002 02 40 00 80 eth0\n"
+        )));
+        assert!(has_ipv6(&format!(
+            "{lo}fe80000000000000a8bb3cfffe123456 02 40 20 80 eth0\n"
+        )));
     }
 }

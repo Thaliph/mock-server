@@ -153,6 +153,26 @@ mod tests {
     }
 
     #[test]
+    fn inj_22_built_in_chains_are_flushed_before_their_single_jump() {
+        let text = rules(&config(&[80]), Family::V4);
+        let l: Vec<&str> = text.lines().collect();
+        let at = |x: &str| {
+            l.iter()
+                .position(|y| *y == x)
+                .unwrap_or_else(|| panic!("{x}"))
+        };
+        assert!(
+            at("-F PREROUTING")
+                < at("-A PREROUTING -p tcp -m addrtype --dst-type LOCAL -j MIMIC_INBOUND")
+        );
+        assert!(at("-F OUTPUT") < at("-A OUTPUT -p tcp -j MIMIC_OUTPUT"));
+        let filter = at("*filter");
+        let flush = l.iter().rposition(|x| *x == "-F OUTPUT").unwrap();
+        assert!(filter < flush && flush < at("-A OUTPUT -p udp --dport 443 -j MIMIC_OUTPUT"));
+        assert_eq!(l.iter().filter(|x| x.starts_with("-F ")).count(), 3);
+    }
+
+    #[test]
     fn inj_05_ports_and_uid_come_from_the_config() {
         let c = RedirectConfig {
             inbound_port: 1111,

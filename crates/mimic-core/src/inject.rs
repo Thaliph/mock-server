@@ -37,6 +37,7 @@ pub enum SkipReason {
     UnsupportedOwner,
     PortConflict,
     UidConflict,
+    NameConflict,
 }
 
 /// Why a pod is left alone without any patch.
@@ -69,6 +70,7 @@ impl SkipReason {
             SkipReason::UnsupportedOwner => "unsupported-owner",
             SkipReason::PortConflict => "port-conflict",
             SkipReason::UidConflict => "uid-conflict",
+            SkipReason::NameConflict => "name-conflict",
         }
     }
 }
@@ -692,6 +694,76 @@ mod tests {
             .iter()
             .map(|c| c["name"].as_str().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn inj_21_dollars_of_literal_env_values_are_doubled() {
+        let mut p = pod();
+        let mut probe = http(IntOrString::Int(8080), "/x/$(HOME)/$$");
+        probe.http_get.as_mut().unwrap().http_headers =
+            Some(vec![k8s_openapi::api::core::v1::HTTPHeader {
+                name: "X".into(),
+                value: "a$b".into(),
+            }]);
+        spec(&mut p).containers[0].liveness_probe = Some(probe);
+        let doc = apply(&p);
+        let mut seen = 0;
+        for c in doc["spec"]["initContainers"].as_array().unwrap() {
+            for e in c["env"].as_array().unwrap() {
+                let Some(v) = e["value"].as_str() else {
+                    continue;
+                };
+                // Kubelet expansion: `$$` is a literal `$`; a lone `$` or `$(VAR)` would differ.
+                assert!(!v.replace("$$", "").contains('$'), "{}: {v}", e["name"]);
+                if e["name"] == "MIMIC_APP_PROBES" {
+                    let decoded: BTreeMap<String, AppProbe> =
+                        serde_json::from_str(&v.replace("$$", "$")).unwrap();
+                    assert_eq!(decoded, app_probes(&p));
+                    seen += 1;
+                }
+            }
+        }
+        assert_eq!(seen, 1);
+        assert!(
+            doc["spec"]["initContainers"][1]["env"][4]["value"]
+                .as_str()
+                .unwrap()
+                .contains("$$(HOME)/$$$$")
+        );
+    }
+
+    #[test]
+    fn inj_21_name_conflict() {
+        let named = |n: &str| Container {
+            name: n.into(),
+            ..Default::default()
+        };
+        for n in ["mimic-init", "mimic-sidecar"] {
+            let mut p = pod();
+            spec(&mut p).containers.push(named(n));
+            assert_eq!(
+                run(&p, NamespaceMode::Enabled, false),
+                skip(SkipReason::NameConflict),
+                "{n}"
+            );
+        }
+        let mut p = pod();
+        spec(&mut p).init_containers = Some(vec![named("mimic-init")]);
+        assert_eq!(
+            run(&p, NamespaceMode::Enabled, false),
+            skip(SkipReason::NameConflict)
+        );
+        assert_eq!(SkipReason::NameConflict.as_str(), "name-conflict");
+        // With the sidecar present the pod is already injected.
+        spec(&mut p)
+            .init_containers
+            .as_mut()
+            .unwrap()
+            .push(named(SIDECAR_NAME));
+        assert_eq!(
+            run(&p, NamespaceMode::Enabled, false),
+            Decision::Untouched(Untouched::AlreadyInjected)
+        );
     }
 
     #[test]
