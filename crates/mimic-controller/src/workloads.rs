@@ -1,7 +1,13 @@
 //! Cache of the `MimicWorkload`s (spec §7.1), indexed by namespace and `spec.deployment`.
 
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
+
+use futures::StreamExt;
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
+use kube::runtime::WatchStreamExt;
+use kube::runtime::watcher::{self, Event};
 
 #[derive(Default)]
 struct State {
@@ -22,29 +28,40 @@ impl WorkloadCache {
 
     /// Adds or updates a `MimicWorkload`.
     pub fn apply(&self, namespace: &str, name: &str, deployment: &str) {
-        let _ = (namespace, name, deployment);
-        todo!()
+        self.write()
+            .items
+            .insert((namespace.into(), name.into()), deployment.into());
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
-        let _ = (namespace, name);
-        todo!()
+        self.write().items.remove(&(namespace.into(), name.into()));
     }
 
     /// Replaces the whole content after a (re)list and marks the cache synced.
     pub fn replace(&self, items: impl IntoIterator<Item = (String, String, String)>) {
-        let _ = items.into_iter().count();
-        todo!()
+        let mut state = self.write();
+        state.items = items.into_iter().map(|(ns, n, d)| ((ns, n), d)).collect();
+        state.synced = true;
     }
 
     pub fn is_synced(&self) -> bool {
-        todo!()
+        self.read().synced
     }
 
     /// Whether a `MimicWorkload` of `namespace` has `spec.deployment` equal to `deployment`.
     pub fn has(&self, namespace: &str, deployment: &str) -> bool {
-        let _ = (namespace, deployment);
-        todo!()
+        self.read()
+            .items
+            .iter()
+            .any(|((ns, _), d)| ns == namespace && d == deployment)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, State> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, State> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[cfg(test)]
@@ -57,6 +74,61 @@ impl WorkloadCache {
         );
         cache
     }
+}
+
+/// Keeps `cache` in line with the `MimicWorkload`s of the cluster, for ever. Without cluster
+/// access the cache simply stays unsynced, which makes `/inject/workload` fail closed.
+pub async fn watch(cache: Arc<WorkloadCache>) {
+    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "mimic.platform.io",
+        "v1alpha1",
+        "MimicWorkload",
+    ));
+    let client = loop {
+        match kube::Client::try_default().await {
+            Ok(client) => break client,
+            Err(e) => {
+                tracing::warn!(error = %e, "no Kubernetes client, MimicWorkload cache not synced");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    };
+    let api = Api::<DynamicObject>::all_with(client, &resource);
+    let mut events =
+        std::pin::pin!(watcher::watcher(api, watcher::Config::default()).default_backoff());
+    let mut listing = Vec::new();
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(Event::Init) => listing.clear(),
+            Ok(Event::InitApply(object)) => listing.extend(entry(&object)),
+            Ok(Event::InitDone) => {
+                cache.replace(std::mem::take(&mut listing));
+                tracing::info!("MimicWorkload cache synced");
+            }
+            Ok(Event::Apply(object)) => match entry(&object) {
+                Some((ns, name, deployment)) => cache.apply(&ns, &name, &deployment),
+                None => remove(&cache, &object),
+            },
+            Ok(Event::Delete(object)) => remove(&cache, &object),
+            Err(e) => tracing::warn!(error = %e, "MimicWorkload watch error"),
+        }
+    }
+}
+
+fn remove(cache: &WorkloadCache, object: &DynamicObject) {
+    if let (Some(ns), Some(name)) = (&object.metadata.namespace, &object.metadata.name) {
+        cache.remove(ns, name);
+    }
+}
+
+/// `(namespace, name, spec.deployment)` of a `MimicWorkload`.
+fn entry(object: &DynamicObject) -> Option<(String, String, String)> {
+    let deployment = object.data.get("spec")?.get("deployment")?.as_str()?;
+    Some((
+        object.metadata.namespace.clone()?,
+        object.metadata.name.clone()?,
+        deployment.to_string(),
+    ))
 }
 
 #[cfg(test)]

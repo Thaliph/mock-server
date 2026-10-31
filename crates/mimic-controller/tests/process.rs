@@ -14,6 +14,21 @@ use mimic_runtime::testing::{Process, http_get, run, wait_status};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mimic-controller");
 const ADMIN: (&str, &str) = ("MIMIC_ADMIN_ADDR", "127.0.0.1:0");
+/// Required by the webhook (spec §10.2); the listener takes any free port.
+const WEBHOOK: [(&str, &str); 7] = [
+    ("MIMIC_WEBHOOK_ADDR", "127.0.0.1:0"),
+    ("MIMIC_NAMESPACE", "mimic-system"),
+    ("MIMIC_WEBHOOK_SERVICE", "mimic"),
+    ("MIMIC_WEBHOOK_SECRET", "mimic-webhook-tls"),
+    ("MIMIC_WEBHOOK_CONFIGURATION", "mimic-injector"),
+    ("MIMIC_INJECT_SIDECAR_IMAGE", "mimic-sidecar:test"),
+    ("MIMIC_INJECT_INIT_IMAGE", "mimic-init:test"),
+];
+
+/// The admin address, the webhook settings and `extra`.
+fn env<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    [&[ADMIN][..], &WEBHOOK, extra].concat()
+}
 
 struct FakeValkey {
     addr: SocketAddr,
@@ -109,14 +124,14 @@ fn free_addr() -> SocketAddr {
 
 #[test]
 fn fnd_01_missing_valkey_url_exits_2() {
-    let (status, _, stderr) = run(BIN, &[], &[ADMIN]);
+    let (status, _, stderr) = run(BIN, &[], &env(&[]));
     assert_eq!(status.code(), Some(2));
     assert!(stderr.contains("MIMIC_VALKEY_URL"), "{stderr}");
 }
 
 #[test]
 fn fnd_01_invalid_valkey_url_exits_2() {
-    let (status, _, stderr) = run(BIN, &[], &[ADMIN, ("MIMIC_VALKEY_URL", "http://nope")]);
+    let (status, _, stderr) = run(BIN, &[], &env(&[("MIMIC_VALKEY_URL", "http://nope")]));
     assert_eq!(status.code(), Some(2));
     assert!(
         stderr.contains("MIMIC_VALKEY_URL") && stderr.contains("http://nope"),
@@ -129,10 +144,7 @@ fn fnd_01_credentials_in_the_url_are_refused() {
     let (status, _, stderr) = run(
         BIN,
         &[],
-        &[
-            ADMIN,
-            ("MIMIC_VALKEY_URL", "redis://:hunter2@127.0.0.1:6379"),
-        ],
+        &env(&[("MIMIC_VALKEY_URL", "redis://:hunter2@127.0.0.1:6379")]),
     );
     assert_eq!(status.code(), Some(2));
     assert!(stderr.contains("MIMIC_VALKEY_PASSWORD"), "{stderr}");
@@ -143,7 +155,7 @@ fn fnd_01_credentials_in_the_url_are_refused() {
 fn fnd_06_ready_only_while_valkey_answers() {
     let valkey_addr = free_addr();
     let url = format!("redis://{valkey_addr}");
-    let mut controller = Process::spawn(BIN, &[ADMIN, ("MIMIC_VALKEY_URL", &url)]);
+    let mut controller = Process::spawn(BIN, &env(&[("MIMIC_VALKEY_URL", &url)]));
     let addr = controller.admin_addr();
 
     // Valkey down at start: alive but not ready, and still running.
@@ -174,12 +186,11 @@ fn fnd_06_the_password_is_sent_and_never_logged() {
     let url = format!("redis://{}", valkey.addr);
     let mut controller = Process::spawn(
         BIN,
-        &[
-            ADMIN,
+        &env(&[
             ("MIMIC_VALKEY_URL", &url),
             ("MIMIC_VALKEY_PASSWORD", "hunter2"),
             ("MIMIC_LOG", "trace"),
-        ],
+        ]),
     );
     let addr = controller.admin_addr();
     wait_status(addr, "/readyz", 200, Duration::from_secs(10));
@@ -203,11 +214,7 @@ fn fnd_05_sigterm_exits_0() {
     let url = format!("redis://{}", valkey.addr);
     let mut controller = Process::spawn(
         BIN,
-        &[
-            ADMIN,
-            ("MIMIC_VALKEY_URL", &url),
-            ("MIMIC_SHUTDOWN_GRACE", "2s"),
-        ],
+        &env(&[("MIMIC_VALKEY_URL", &url), ("MIMIC_SHUTDOWN_GRACE", "2s")]),
     );
     let addr = controller.admin_addr();
     wait_status(addr, "/readyz", 200, Duration::from_secs(10));
@@ -220,7 +227,7 @@ fn fnd_05_sigterm_exits_0() {
 
 #[test]
 fn fnd_04_controller_logs_are_json() {
-    let mut controller = Process::spawn(BIN, &[ADMIN, ("MIMIC_VALKEY_URL", "redis://127.0.0.1:1")]);
+    let mut controller = Process::spawn(BIN, &env(&[("MIMIC_VALKEY_URL", "redis://127.0.0.1:1")]));
     controller.admin_addr();
     controller.terminate();
     controller.wait_exit(Duration::from_secs(10));

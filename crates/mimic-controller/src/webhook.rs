@@ -5,17 +5,32 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::Router;
+use axum::body::Body;
+use axum::extract::State;
 use axum::http::StatusCode;
-use mimic_core::inject::InjectConfig;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use base64::Engine;
+use futures::StreamExt;
+use k8s_openapi::api::core::v1::Pod;
+use mimic_core::inject::{
+    Decision, InjectConfig, JsonPatchOp, NamespaceMode, SkipReason, decide, deployment_of, patch,
+};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::workloads::WorkloadCache;
 
 /// Largest `AdmissionReview` accepted (the API server's own limit is 3 MiB).
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
+
+/// Annotation recording why a pod was not injected.
+const SKIPPED_ANNOTATION: &str = "mimic.platform.io/skipped";
 
 type Labels = Vec<(String, String)>;
 
@@ -45,9 +60,231 @@ pub struct Admission {
     pub metrics: AdmissionMetrics,
 }
 
+impl AdmissionMetrics {
+    fn count(&self, result: &str, reason: &str) {
+        self.admissions
+            .get_or_create(&vec![
+                ("result".to_string(), result.to_string()),
+                ("reason".to_string(), reason.to_string()),
+            ])
+            .inc();
+    }
+}
+
 pub fn router(admission: Arc<Admission>) -> Router {
-    let _ = admission;
-    Router::new().fallback(|| async { StatusCode::NOT_IMPLEMENTED })
+    let endpoint = |mode: NamespaceMode| {
+        post(
+            move |State(admission): State<Arc<Admission>>, body: Body| async move {
+                admission.handle(mode, body).await
+            },
+        )
+    };
+    Router::new()
+        .route("/inject/namespace", endpoint(NamespaceMode::Enabled))
+        .route("/inject/workload", endpoint(NamespaceMode::Selected))
+        .route("/inject/pod", endpoint(NamespaceMode::Absent))
+        .with_state(admission)
+}
+
+#[derive(Deserialize)]
+struct Review {
+    #[serde(rename = "apiVersion")]
+    api_version: String,
+    kind: String,
+    request: Option<Request>,
+}
+
+#[derive(Deserialize)]
+struct Request {
+    uid: String,
+    #[serde(default)]
+    namespace: String,
+    object: Option<Value>,
+}
+
+/// What was done with an admitted pod, for the response, the log and the counter.
+struct Outcome {
+    patch: Vec<JsonPatchOp>,
+    deployment: String,
+    result: &'static str,
+    reason: &'static str,
+}
+
+/// Why a review could not be answered with a decision.
+struct Failure {
+    reason: &'static str,
+    message: &'static str,
+}
+
+impl Admission {
+    async fn handle(&self, mode: NamespaceMode, body: Body) -> Response {
+        let bytes = match read_body(body).await {
+            Ok(bytes) => bytes,
+            Err(status) => {
+                let reason = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    "too-large"
+                } else {
+                    "unreadable"
+                };
+                self.record("", "", "", "error", reason);
+                return status.into_response();
+            }
+        };
+        // Parse errors quote the offending value: they are never logged or returned.
+        let Some((uid, namespace, pod)) = parse(&bytes) else {
+            self.record("", "", "", "error", "malformed");
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let name = pod
+            .metadata
+            .name
+            .as_deref()
+            .or(pod.metadata.generate_name.as_deref())
+            .unwrap_or_default();
+        let response = match self.admit(mode, &namespace, &pod) {
+            Ok(outcome) => {
+                self.record(
+                    &namespace,
+                    name,
+                    &outcome.deployment,
+                    outcome.result,
+                    outcome.reason,
+                );
+                allowed(&uid, &outcome.patch)
+            }
+            Err(failure) => {
+                self.record(&namespace, name, "", "error", failure.reason);
+                Some(denied(&uid, failure.message))
+            }
+        };
+        match response {
+            Some(json) => Json(json).into_response(),
+            None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+
+    fn admit(&self, mode: NamespaceMode, namespace: &str, pod: &Pod) -> Result<Outcome, Failure> {
+        if mode == NamespaceMode::Selected && !self.cache.is_synced() {
+            return Err(Failure {
+                reason: "cache-not-synced",
+                message: "MimicWorkload cache not synced yet",
+            });
+        }
+        let decision = decide(
+            pod,
+            namespace,
+            &self.controller_namespace,
+            mode,
+            |deployment| self.cache.has(namespace, deployment),
+        );
+        Ok(match decision {
+            Decision::Inject { deployment } => {
+                let patch = patch(pod, &deployment, &self.inject).map_err(|_| Failure {
+                    reason: "patch",
+                    message: "cannot build the injection patch",
+                })?;
+                Outcome {
+                    patch,
+                    deployment,
+                    result: "injected",
+                    reason: "ok",
+                }
+            }
+            Decision::Skip { reason, deployment } => Outcome {
+                patch: vec![skip_patch(pod, reason)],
+                deployment: deployment.unwrap_or_default(),
+                result: "skipped",
+                reason: reason.as_str(),
+            },
+            Decision::Untouched(reason) => Outcome {
+                patch: Vec::new(),
+                deployment: deployment_of(pod).unwrap_or_default(),
+                result: "skipped",
+                reason: reason.as_str(),
+            },
+        })
+    }
+
+    fn record(&self, namespace: &str, pod: &str, deployment: &str, result: &str, reason: &str) {
+        self.metrics.count(result, reason);
+        tracing::info!(
+            target: "webhook",
+            namespace,
+            pod,
+            deployment,
+            result,
+            reason,
+            "admission"
+        );
+    }
+}
+
+/// Reads the body, refusing more than [`MAX_BODY`] bytes.
+async fn read_body(body: Body) -> Result<Vec<u8>, StatusCode> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if bytes.len() + chunk.len() > MAX_BODY {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// `(uid, namespace, pod)` of an `AdmissionReview` v1, `None` when malformed.
+fn parse(bytes: &[u8]) -> Option<(String, String, Pod)> {
+    let review: Review = serde_json::from_slice(bytes).ok()?;
+    if review.api_version != "admission.k8s.io/v1" || review.kind != "AdmissionReview" {
+        return None;
+    }
+    let request = review.request?;
+    let pod = serde_json::from_value(request.object?).ok()?;
+    Some((request.uid, request.namespace, pod))
+}
+
+/// The pod is admitted with `patch` (nothing when empty).
+fn allowed(uid: &str, patch: &[JsonPatchOp]) -> Option<Value> {
+    let mut response = json!({"uid": uid, "allowed": true});
+    if !patch.is_empty() {
+        let raw = serde_json::to_vec(patch).ok()?;
+        response["patchType"] = json!("JSONPatch");
+        response["patch"] = json!(base64::engine::general_purpose::STANDARD.encode(raw));
+    }
+    Some(review_of(response))
+}
+
+fn denied(uid: &str, message: &str) -> Value {
+    review_of(json!({
+        "uid": uid,
+        "allowed": false,
+        "status": {"code": 500, "message": message},
+    }))
+}
+
+fn review_of(response: Value) -> Value {
+    json!({"apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview", "response": response})
+}
+
+/// The `skipped` annotation, the only change made to a skipped pod.
+fn skip_patch(pod: &Pod, reason: SkipReason) -> JsonPatchOp {
+    if pod.metadata.annotations.is_some() {
+        JsonPatchOp {
+            op: "add",
+            path: format!(
+                "/metadata/annotations/{}",
+                SKIPPED_ANNOTATION.replace('/', "~1")
+            ),
+            value: json!(reason.as_str()),
+        }
+    } else {
+        JsonPatchOp {
+            op: "add",
+            path: "/metadata/annotations".into(),
+            value: json!({ SKIPPED_ANNOTATION: reason.as_str() }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -216,7 +453,13 @@ mod tests {
             "request": {"uid": "x", "namespace": "shop", "object": pod()},
         }))
         .unwrap();
-        for body in [b"not json".to_vec(), Vec::new(), bad_kind, no_request, old_version] {
+        for body in [
+            b"not json".to_vec(),
+            Vec::new(),
+            bad_kind,
+            no_request,
+            old_version,
+        ] {
             let (status, _) = call(&router, Method::POST, "/inject/pod", body).await;
             assert_eq!(status, 400);
         }
@@ -225,10 +468,19 @@ mod tests {
     #[tokio::test]
     async fn inj_08_body_over_4_mib_gets_413() {
         let (router, _) = setup(true, &[]);
-        let (status, _) = call(&router, Method::POST, "/inject/pod", vec![b' '; MAX_BODY + 1]).await;
+        let (status, _) = call(
+            &router,
+            Method::POST,
+            "/inject/pod",
+            vec![b' '; MAX_BODY + 1],
+        )
+        .await;
         assert_eq!(status, 413);
         let (status, _) = call(&router, Method::POST, "/inject/pod", vec![b' '; MAX_BODY]).await;
-        assert_eq!(status, 400, "exactly the limit is read, then rejected as malformed");
+        assert_eq!(
+            status, 400,
+            "exactly the limit is read, then rejected as malformed"
+        );
     }
 
     #[tokio::test]
@@ -274,8 +526,11 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let slot = Arc::new(crate::tls::CertSlot::new());
         assert!(!slot.is_loaded());
-        slot.set_pem(cert.pem().as_bytes(), signing_key.serialize_pem().as_bytes())
-            .unwrap();
+        slot.set_pem(
+            cert.pem().as_bytes(),
+            signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
         assert!(slot.is_loaded());
 
         let (router, _) = setup(true, &[]);
@@ -392,7 +647,12 @@ mod tests {
         admit(&router, "/inject/workload", review("c", "shop", &object)).await;
         // error
         let (router_unsynced, _) = setup(false, &[]);
-        admit(&router_unsynced, "/inject/workload", review("d", "shop", &object)).await;
+        admit(
+            &router_unsynced,
+            "/inject/workload",
+            review("d", "shop", &object),
+        )
+        .await;
 
         let logs = webhook_logs(&capture);
         assert_eq!(logs.len(), 4, "{logs:?}");
@@ -406,11 +666,26 @@ mod tests {
             )
         };
         let s = |a: &str, b: &str, c: &str, d: &str, e: &str| {
-            (a.to_string(), b.to_string(), c.to_string(), d.to_string(), e.to_string())
+            (
+                a.to_string(),
+                b.to_string(),
+                c.to_string(),
+                d.to_string(),
+                e.to_string(),
+            )
         };
-        assert_eq!(fields(&logs[0]), s("shop", "shop-5d9c-", "shop", "injected", "ok"));
-        assert_eq!(fields(&logs[1]), s("shop", "shop-5d9c-", "shop", "skipped", "host-network"));
-        assert_eq!(fields(&logs[2]), s("shop", "shop-5d9c-", "shop", "skipped", "not-selected"));
+        assert_eq!(
+            fields(&logs[0]),
+            s("shop", "shop-5d9c-", "shop", "injected", "ok")
+        );
+        assert_eq!(
+            fields(&logs[1]),
+            s("shop", "shop-5d9c-", "shop", "skipped", "host-network")
+        );
+        assert_eq!(
+            fields(&logs[2]),
+            s("shop", "shop-5d9c-", "shop", "skipped", "not-selected")
+        );
         assert_eq!(logs[3]["result"], "error");
         assert_eq!(logs[3]["reason"], "cache-not-synced");
 
