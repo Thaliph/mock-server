@@ -5,6 +5,7 @@ pub mod fd;
 pub mod inject;
 pub mod proxy;
 pub mod redirect;
+pub mod trust;
 
 use std::fmt;
 use std::str::FromStr;
