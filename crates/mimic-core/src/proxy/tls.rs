@@ -22,6 +22,8 @@ pub struct ClientHello {
     pub tls12: bool,
     /// TLS 1.3 is offered.
     pub tls13: bool,
+    /// An SNI was sent but is not a valid DNS name; `sni` is then `None`.
+    pub sni_invalid: bool,
 }
 
 /// Result of [`parse_client_hello`].
