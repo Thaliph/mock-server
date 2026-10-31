@@ -1781,6 +1781,7 @@ name = "mimic-sidecar"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "h2",
  "http-body-util",
  "hyper",
@@ -1795,10 +1796,13 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+ "tempfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tower",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]

@@ -8,20 +8,24 @@ publish.workspace = true
 
 [dependencies]
 axum = "0.8.9"
+base64 = "0.23.1"
 h2 = "0.4.20"
 hyper = { version = "1.12.0", features = ["server", "client", "http2"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 mimic-core = { version = "0.1.0", path = "../mimic-core" }
 mimic-runtime = { version = "0.1.0", path = "../mimic-runtime" }
-nix = { version = "0.31.3", default-features = false, features = ["net", "resource"] }
+nix = { version = "0.31.3", default-features = false, features = ["net", "resource", "process"] }
 prometheus-client = "0.25.2"
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem", "x509-parser"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 socket2 = { version = "0.6.5", features = ["all"] }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+time = "0.3.55"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
 tracing = "0.1.44"
+x509-parser = { version = "0.18.1", features = ["verify"] }
 
 [lints]
 workspace = true
@@ -29,6 +33,7 @@ workspace = true
 [dev-dependencies]
 http-body-util = "0.1.5"
 mimic-runtime = { path = "../mimic-runtime", features = ["testing"] }
-rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+tempfile = "3.27.0"
+time = "0.3.55"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5.3", features = ["util"] }
