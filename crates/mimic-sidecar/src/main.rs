@@ -1,5 +1,6 @@
 //! `mimic-sidecar`: transparent proxy injected next to the app (spec §2): process skeleton
-//! (configuration, logs, admin listener, graceful shutdown) and the opaque TCP tunnel (INJ-07).
+//! (configuration, logs, admin listener, graceful shutdown), the opaque TCP tunnel (INJ-07) and
+//! the `/app-health` probe forwarder (INJ-18).
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -8,6 +9,7 @@ use std::sync::Arc;
 use mimic_runtime::admin::{self, Readiness};
 use mimic_runtime::config::{CommonConfig, Env};
 use mimic_runtime::metrics::Metrics;
+use mimic_sidecar::probes::{self, Probes};
 use mimic_sidecar::tunnel::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 
 const BINARY: &str = "mimic-sidecar";
@@ -28,8 +30,12 @@ fn main() -> ExitCode {
         Ok(tunnel) => tunnel,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
+    let probes = match Probes::from_env(&env) {
+        Ok(probes) => probes,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
     mimic_runtime::logging::init(&config.log);
-    match run(config, tunnel) {
+    match run(config, tunnel, probes) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "sidecar stopped");
@@ -39,7 +45,7 @@ fn main() -> ExitCode {
 }
 
 #[tokio::main]
-async fn run(config: CommonConfig, tunnel: TunnelConfig) -> std::io::Result<()> {
+async fn run(config: CommonConfig, tunnel: TunnelConfig, probes: Probes) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     let mut metrics = Metrics::new("sidecar", VERSION);
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
@@ -66,7 +72,7 @@ async fn run(config: CommonConfig, tunnel: TunnelConfig) -> std::io::Result<()> 
     let listener = admin::bind(config.admin_addr).await?;
     admin::serve(
         listener,
-        admin::router(metrics, Readiness::always()),
+        admin::router(metrics, Readiness::always()).merge(probes::router(Arc::new(probes))),
         config.shutdown_grace,
     )
     .await
