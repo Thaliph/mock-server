@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::histogram::Histogram;
-use super::observed::{Observation, Observed};
+use super::observed::{Observation, Observed, state_bound};
 use super::redact::{MARKER, Redactor, value_rule};
 use super::sample::{MAX_SAMPLES, Sample, Samples};
 use super::template::{Seg, is_param, render, split_path};
@@ -26,10 +26,6 @@ pub enum Direction {
 pub const MAX_PATH: usize = 2048;
 /// Most segments of a recorded path.
 pub const MAX_SEGMENTS: usize = 32;
-/// Room in `state_bound` for what one endpoint learns of its schemas and fields. The
-/// inference itself does not cap this: it holds for bodies like the ones the proxy captures.
-const OBSERVED_BOUND: usize = 256 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// `MIMIC_DISCOVERY_MAX_LITERALS`.
@@ -327,7 +323,7 @@ impl Report {
             + 70 * 16
             + MAX_SAMPLES * 256
             + 256
-            + OBSERVED_BOUND;
+            + state_bound();
         limits.max_endpoints.saturating_mul(per_endpoint) + 1024
     }
 

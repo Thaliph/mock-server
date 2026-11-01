@@ -14,6 +14,8 @@ use super::template::{is_rfc3339, is_uuid};
 
 /// Levels described; a value deeper than this is `{}` (the root is level 1).
 const MAX_LEVEL: usize = 16;
+/// Nodes a body schema keeps (spec §6); deeper levels are cut away to fit.
+pub(super) const MAX_NODES: usize = 512;
 /// Distinct keys of an object before it becomes a map.
 const MAX_KEYS: usize = 128;
 /// A map counts as this many copies of its value: it replaces up to twice `MAX_KEYS` keys.
@@ -167,7 +169,7 @@ impl Object {
             let mut props = self.props;
             for (k, v) in other.props {
                 let merged = match props.remove(&k) {
-                    Some(mine) => mine.merge(v),
+                    Some(mine) => mine.merge_node(v),
                     None => v,
                 };
                 props.insert(k, merged);
@@ -188,7 +190,7 @@ impl Object {
             Some(m) => *m,
             None => merge_all(o.props.into_values()),
         };
-        let merged = values(self).merge(values(other));
+        let merged = values(self).merge_node(values(other));
         Self {
             map: Some(Box::new(merged)),
             ..Self::default()
@@ -197,22 +199,90 @@ impl Object {
 }
 
 fn merge_all(schemas: impl Iterator<Item = Schema>) -> Schema {
-    schemas.fold(Schema::default(), Schema::merge)
+    schemas.fold(Schema::default(), Schema::merge_node)
 }
 
 /// A JSON Schema (2020-12 subset) inferred from the values seen.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schema {
     kinds: BTreeSet<Kind>,
     format: Formats,
     items: Option<Box<Schema>>,
     object: Option<Object>,
+    /// Deepest level kept (the root is level 1). Meaningful on the root of a schema only;
+    /// nested nodes keep the default.
+    #[serde(default = "full_cut", skip_serializing_if = "is_full_cut")]
+    cut: u8,
+}
+
+fn full_cut() -> u8 {
+    MAX_LEVEL as u8
+}
+
+fn is_full_cut(cut: &u8) -> bool {
+    *cut == full_cut()
+}
+
+impl Default for Schema {
+    fn default() -> Self {
+        Self {
+            kinds: BTreeSet::new(),
+            format: Formats::default(),
+            items: None,
+            object: None,
+            cut: full_cut(),
+        }
+    }
 }
 
 impl Schema {
     /// Schema of one JSON value, already redacted. The root is level 1.
     pub fn infer(value: &Value) -> Self {
-        Self::infer_at(value, 1)
+        let mut s = Self::infer_at(value, 1);
+        s.fit(MAX_LEVEL);
+        s
+    }
+
+    /// Cuts the schema at the deepest level, at most `max`, where it has at most
+    /// `MAX_NODES` nodes, and records that level.
+    fn fit(&mut self, max: usize) {
+        let level = (0..=max)
+            .rev()
+            .find(|&l| self.weight(1, l) <= MAX_NODES as u64)
+            .unwrap_or(0);
+        self.truncate(1, level);
+        self.cut = level as u8;
+    }
+
+    /// Replaces every node deeper than `cut` by `{}`.
+    fn truncate(&mut self, level: usize, cut: usize) {
+        if level > cut {
+            *self = Self::default();
+            return;
+        }
+        if let Some(items) = &mut self.items {
+            items.truncate(level + 1, cut);
+        }
+        if let Some(o) = &mut self.object {
+            for v in o.props.values_mut() {
+                v.truncate(level + 1, cut);
+            }
+            if let Some(m) = &mut o.map {
+                m.truncate(level + 1, cut);
+            }
+        }
+    }
+
+    /// Merges two schemas under the 512-node cap (spec §6): both are cut at the lower of
+    /// their levels, united, then cut again where the union fits.
+    pub fn merge(mut self, mut other: Self) -> Self {
+        let cut = self.cut.min(other.cut);
+        self.truncate(1, usize::from(cut));
+        other.truncate(1, usize::from(cut));
+        let mut merged = self.merge_node(other);
+        merged.cut = cut;
+        merged.fit(usize::from(cut));
+        merged
     }
 
     fn infer_at(value: &Value, level: usize) -> Self {
@@ -278,6 +348,7 @@ impl Schema {
     }
 
     /// Nodes of the schema, counted as the 512-node cap counts them (spec §6).
+    #[cfg(test)]
     pub(super) fn nodes(&self) -> usize {
         usize::try_from(self.weight(1, usize::MAX)).unwrap_or(usize::MAX)
     }
@@ -301,11 +372,12 @@ impl Schema {
         n
     }
 
-    pub fn merge(mut self, other: Self) -> Self {
+    /// The union of two schemas, whatever their cut levels: the merge of the structures.
+    fn merge_node(mut self, other: Self) -> Self {
         self.kinds.extend(other.kinds);
         self.format = self.format.merge(other.format);
         self.items = match (self.items, other.items) {
-            (Some(a), Some(b)) => Some(Box::new(a.merge(*b))),
+            (Some(a), Some(b)) => Some(Box::new(a.merge_node(*b))),
             (a, b) => a.or(b),
         };
         self.object = match (self.object, other.object) {

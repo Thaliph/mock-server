@@ -8,8 +8,8 @@ use serde_json::{Map, Value, json};
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::redact::{MARKER, Redactor};
-use super::schema::{Pair, Params, Schema, header_pairs, query_pairs};
-use super::volatile::Volatility;
+use super::schema::{MAX_NODES, MAX_PARAMS, Pair, Params, Schema, header_pairs, query_pairs};
+use super::volatile::{MAX_FIELDS, Volatility};
 
 /// A body over this is not parsed (encoded or decoded): media type and size only.
 pub const MAX_BODY: usize = 256 * 1024;
@@ -20,6 +20,21 @@ const MAX_MEDIA_LEN: usize = 100;
 /// Levels and array items walked for volatile leaves, as for schemas.
 const MAX_LEVEL: usize = 16;
 const MAX_ITEMS: usize = 256;
+
+/// Upper bound of the serialised `Observed` of one endpoint, from the caps of spec §6: 512
+/// nodes per body schema, 64 keys per query, form or header set, 128 volatile fields, 16 media
+/// types per side. A name (key, header, field) is taken to be at most `MAX_BODY` bytes, and
+/// is counted twice in a schema node (`properties` and `required`).
+pub const fn state_bound() -> usize {
+    const NAME: usize = MAX_BODY;
+    const NODE: usize = 2 * NAME + 300;
+    const SCHEMA: usize = MAX_NODES * NODE;
+    const PARAMS: usize = MAX_PARAMS * (NAME + NODE) + 100;
+    const MEDIA: usize = MAX_MEDIA_LEN + 100 + SCHEMA + PARAMS;
+    const FIELD: usize = MAX_MEDIA_LEN + 16 + NAME + 32 * 24 + 100;
+    // Query, then request and response headers, then two sides of media types.
+    3 * PARAMS + 2 * MAX_MEDIA * MEDIA + MAX_FIELDS * FIELD + 1024
+}
 
 /// One exchange as the schemas see it. Bodies are already content-decoded.
 #[derive(Debug, Clone, Default)]
