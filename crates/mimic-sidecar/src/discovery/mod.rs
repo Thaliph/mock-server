@@ -120,15 +120,23 @@ async fn serve(
 /// Set once the first serialisation failure was logged.
 static SERIALISATION_LOGGED: AtomicBool = AtomicBool::new(false);
 
-/// The response for a serialisation (stub).
+/// The response for a serialisation. A failure answers 500 and is logged once (`logged`),
+/// with no part of the report in the line.
 fn answer(
     json: Result<Result<String, serde_json::Error>, tokio::task::JoinError>,
-    _logged: &AtomicBool,
+    logged: &AtomicBool,
 ) -> Response {
-    match json {
-        Ok(Ok(json)) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
-        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let error = match json {
+        Ok(Ok(json)) => {
+            return ([(header::CONTENT_TYPE, "application/json")], json).into_response();
+        }
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    if !logged.swap(true, Ordering::Relaxed) {
+        tracing::error!(target: "discovery", error, "discovery serialisation failed");
     }
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 #[cfg(test)]

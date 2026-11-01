@@ -65,11 +65,11 @@ spec:
                     redact:
                       description: >-
                         Extra names redacted by name in discovered headers, query keys, form fields and JSON keys,
-                        on top of the built-in ones. Compared like the built-in names (case and `-`/`_` ignored).
+                        on top of the built-in ones. Compared like the built-in names (case ignored, matched on token boundaries: `-`, `_`, `.` and case changes). Lower-cased by the webhook.
                       type: array
                       maxItems: 64
                       items:
                         type: string
                         minLength: 1
                         maxLength: 64
-                        pattern: '^[a-z0-9_-]+$'
+                        pattern: '^[A-Za-z0-9_-]+$'

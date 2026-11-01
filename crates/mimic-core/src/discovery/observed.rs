@@ -1,7 +1,7 @@
 //! What one endpoint has shown of its query, headers and bodies (spec §6): schemas and
 //! volatility, merged as one value. Everything is redacted before it is inferred or hashed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -62,8 +62,8 @@ struct Media {
 
 impl Media {
     fn merge(mut self, other: Self) -> Self {
-        self.count += other.count;
-        self.bytes += other.bytes;
+        self.count = self.count.saturating_add(other.count);
+        self.bytes = self.bytes.saturating_add(other.bytes);
         self.json = merge_opt(self.json, other.json, Schema::merge);
         self.form = merge_opt(self.form, other.form, Params::merge);
         self
@@ -132,9 +132,22 @@ fn redacted(value: &str) -> bool {
     value.contains(MARKER)
 }
 
-fn observe_pairs(fields: &mut Volatility, prefix: &str, pairs: &[Pair]) {
+/// The fields of one exchange that were counted already: `n` counts an exchange once.
+type Seen = BTreeSet<String>;
+
+fn observe(fields: &mut Volatility, seen: &mut Seen, field: String, value: &str, redacted: bool) {
+    if seen.contains(&field) {
+        fields.observe_again(&field, value, redacted);
+    } else {
+        fields.observe(&field, value, redacted);
+        seen.insert(field);
+    }
+}
+
+fn observe_pairs(fields: &mut Volatility, seen: &mut Seen, prefix: &str, pairs: &[Pair]) {
     for p in pairs {
-        fields.observe(&format!("{prefix}/{}", p.key), &p.value, redacted(&p.value));
+        let field = format!("{prefix}/{}", p.key);
+        observe(fields, seen, field, &p.value, redacted(&p.value));
     }
 }
 
@@ -145,6 +158,7 @@ fn pointer_token(key: &str) -> String {
 /// Observes the scalar leaves of a redacted JSON value; array indices are `*`.
 fn observe_leaves(
     fields: &mut Volatility,
+    seen: &mut Seen,
     prefix: &str,
     pointer: &str,
     value: &Value,
@@ -157,19 +171,25 @@ fn observe_leaves(
         Value::Object(map) => {
             for (k, v) in map {
                 let p = format!("{pointer}/{}", pointer_token(cut_name(k)));
-                observe_leaves(fields, prefix, &p, v, level + 1);
+                observe_leaves(fields, seen, prefix, &p, v, level + 1);
             }
         }
         Value::Array(items) => {
             let p = format!("{pointer}/*");
             for v in items.iter().take(MAX_ITEMS) {
-                observe_leaves(fields, prefix, &p, v, level + 1);
+                observe_leaves(fields, seen, prefix, &p, v, level + 1);
             }
         }
         leaf => {
             let text = leaf.to_string();
             let is_redacted = leaf.as_str().is_some_and(redacted);
-            fields.observe(&format!("{prefix}{pointer}"), &text, is_redacted);
+            observe(
+                fields,
+                seen,
+                format!("{prefix}{pointer}"),
+                &text,
+                is_redacted,
+            );
         }
     }
 }
@@ -254,13 +274,14 @@ impl Observed {
         o: &Observation<'_>,
     ) -> (Option<Parsed>, Option<Parsed>) {
         let query = query_pairs(redactor, o.query);
-        observe_pairs(&mut self.fields, "query", &query);
+        let mut seen = Seen::new();
+        observe_pairs(&mut self.fields, &mut seen, "query", &query);
         self.query = std::mem::take(&mut self.query).merge(Params::from_pairs(&query));
 
         let req = header_pairs(redactor, o.req_headers);
-        observe_pairs(&mut self.fields, "request.header", &req);
+        observe_pairs(&mut self.fields, &mut seen, "request.header", &req);
         let resp = header_pairs(redactor, o.resp_headers);
-        observe_pairs(&mut self.fields, "response.header", &resp);
+        observe_pairs(&mut self.fields, &mut seen, "response.header", &resp);
 
         let mut request = Side {
             headers: Params::from_pairs(&req),
@@ -272,6 +293,7 @@ impl Observed {
         };
         let req_body = self.body(
             redactor,
+            &mut seen,
             "request.body",
             &mut request,
             o.req_headers,
@@ -279,6 +301,7 @@ impl Observed {
         );
         let resp_body = self.body(
             redactor,
+            &mut seen,
             "response.body",
             &mut response,
             o.resp_headers,
@@ -292,6 +315,7 @@ impl Observed {
     fn body(
         &mut self,
         redactor: &Redactor,
+        seen: &mut Seen,
         prefix: &str,
         side: &mut Side,
         headers: &[(&str, &str)],
@@ -306,11 +330,11 @@ impl Observed {
         };
         match &parsed.content {
             Content::Json { value, schema } => {
-                observe_leaves(&mut self.fields, &field, "", value, 1);
+                observe_leaves(&mut self.fields, seen, &field, "", value, 1);
                 m.json = Some(schema.clone());
             }
             Content::Form { pairs, params } => {
-                observe_pairs(&mut self.fields, &field, pairs);
+                observe_pairs(&mut self.fields, seen, &field, pairs);
                 m.form = Some(params.clone());
             }
             Content::Opaque => {}

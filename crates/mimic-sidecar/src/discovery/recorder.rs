@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -204,9 +205,14 @@ impl Recorder {
         }
     }
 
-    /// Runs `f` (stub).
-    fn guarded(&mut self, _direction: &'static str, f: impl FnOnce(&mut Self)) {
-        f(self);
+    /// Runs `f` for one exchange. A panic is logged and counted, the exchange is skipped and
+    /// the recorder goes on: it is the only writer of the report. The report is updated by
+    /// one merge at the end of an exchange, so it is not left half-written.
+    fn guarded(&mut self, direction: &'static str, f: impl FnOnce(&mut Self)) {
+        if catch_unwind(AssertUnwindSafe(|| f(self))).is_err() {
+            self.metrics.exchange(direction, "panic");
+            tracing::error!(target: "discovery", direction, "recorder panic");
+        }
     }
 
     fn record(&mut self, record: &Record) {
@@ -316,7 +322,8 @@ impl Recorder {
     }
 
     fn samples(&mut self, direction: &'static str, sample: Sampled, sample_bytes: usize) {
-        if sample_bytes < self.sample_bytes {
+        // A rejection says nothing about room: only an exchange that was not rejected re-arms.
+        if sample != Sampled::Budget && rearmed(sample_bytes, self.limits.sample_budget) {
             self.sample_budget_full = false;
         }
         match sample {
@@ -422,10 +429,11 @@ impl Recorder {
     }
 }
 
-/// Whether the samples fell far enough below the budget for a new `sample budget full` line
-/// to be due when it fills again (stub).
-fn rearmed(_sample_bytes: usize, _sample_budget: usize) -> bool {
-    true
+/// Whether the samples fell far enough below the budget (under 7/8 of it) for the
+/// `sample budget full` line to be due again when the budget fills anew. A merge that swaps a
+/// sample for a slightly smaller one does not count.
+fn rearmed(sample_bytes: usize, sample_budget: usize) -> bool {
+    sample_bytes < sample_budget - sample_budget / 8
 }
 
 #[cfg(test)]

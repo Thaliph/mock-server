@@ -4,7 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use mimic_core::discovery::redact::{Redactor, value_rule};
+use mimic_core::discovery::redact::{Redactor, segment_rule, value_rule};
+use mimic_core::discovery::schema::kept_headers;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 
@@ -19,7 +20,7 @@ fn add(counts: &mut Counts, location: &'static str, rule: &'static str) {
 
 pub(super) fn path(counts: &mut Counts, path: &str) {
     for segment in path.split('/') {
-        if let Some(rule) = value_rule(segment) {
+        if let Some(rule) = segment_rule(segment) {
             add(counts, "path", rule.as_str());
         }
     }
@@ -39,9 +40,16 @@ pub(super) fn pairs(counts: &mut Counts, redactor: &Redactor, location: &'static
     }
 }
 
+/// The redactions of the headers the report keeps (at most 64 names), URLs in values included.
 pub(super) fn headers(counts: &mut Counts, redactor: &Redactor, headers: &[(String, String)]) {
-    for (name, value) in headers {
-        field(counts, redactor, "header", name, value);
+    let pairs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    for (name, value) in kept_headers(&pairs) {
+        for rule in redactor.header_rules(&name, value) {
+            add(counts, "header", rule.as_str());
+        }
     }
 }
 

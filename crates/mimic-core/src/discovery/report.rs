@@ -149,7 +149,8 @@ impl Stats {
 
     fn merge(&mut self, other: Stats) {
         for (status, n) in other.statuses {
-            *self.statuses.entry(status).or_default() += n;
+            let mine = self.statuses.entry(status).or_default();
+            *mine = mine.saturating_add(n);
         }
         self.latency.merge(&other.latency);
         self.hosts.extend(other.hosts);
@@ -221,6 +222,64 @@ impl Node {
         }
     }
 
+    fn for_each_stats_mut(&mut self, f: &mut impl FnMut(&mut Stats)) {
+        self.endpoints.values_mut().for_each(&mut *f);
+        for child in self.literals.values_mut().chain(self.param.as_deref_mut()) {
+            child.for_each_stats_mut(f);
+        }
+    }
+
+    /// Nothing below this node, and it does not absorb: it can go.
+    fn prunable(&self) -> bool {
+        self.endpoints.is_empty()
+            && self.literals.is_empty()
+            && self.param.is_none()
+            && !self.absorbing
+    }
+
+    /// Where the endpoints are: the segments of their template, and the method.
+    fn places(&self, prefix: &mut Vec<Seg>, out: &mut Vec<(Vec<Seg>, String)>) {
+        for method in self.endpoints.keys() {
+            out.push((prefix.clone(), method.clone()));
+        }
+        for (literal, child) in &self.literals {
+            prefix.push(Seg::Literal(literal.clone()));
+            child.places(prefix, out);
+            prefix.pop();
+        }
+        if let Some(child) = &self.param {
+            prefix.push(Seg::Param);
+            child.places(prefix, out);
+            prefix.pop();
+        }
+    }
+
+    /// Removes the endpoint at `segments`, and the nodes it leaves empty.
+    fn remove(&mut self, segments: &[Seg], method: &str) {
+        let Some((first, rest)) = segments.split_first() else {
+            self.endpoints.remove(method);
+            return;
+        };
+        match first {
+            Seg::Literal(literal) => {
+                if let Some(child) = self.literals.get_mut(literal) {
+                    child.remove(rest, method);
+                    if child.prunable() {
+                        self.literals.remove(literal);
+                    }
+                }
+            }
+            Seg::Param => {
+                if let Some(child) = self.param.as_deref_mut() {
+                    child.remove(rest, method);
+                    if child.prunable() {
+                        self.param = None;
+                    }
+                }
+            }
+        }
+    }
+
     fn collect<'a>(&'a self, prefix: &mut Vec<Seg>, out: &mut Vec<(String, &'a str, &'a Stats)>) {
         let template = render(prefix);
         for (method, stats) in &self.endpoints {
@@ -263,7 +322,28 @@ impl Scope {
             methods.values().for_each(&mut *f);
         }
     }
+
+    fn for_each_stats_mut(&mut self, f: &mut impl FnMut(&mut Stats)) {
+        self.root.for_each_stats_mut(f);
+        for methods in self.raw.values_mut() {
+            methods.values_mut().for_each(&mut *f);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.root.prunable() && self.raw.is_empty()
+    }
 }
+
+/// Where an endpoint is held in a scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Place {
+    Tree(Vec<Seg>),
+    Raw(String),
+}
+
+/// An endpoint's place in a report, ordered like [`Report::endpoints`].
+type EndpointKey = (Direction, u16, String, String, Place);
 
 impl Report {
     pub fn new(pod: Option<String>) -> Self {
@@ -283,6 +363,117 @@ impl Report {
         for scope in self.scopes.values().flat_map(BTreeMap::values) {
             scope.for_each_stats(&mut f);
         }
+    }
+
+    fn for_each_stats_mut(&mut self, mut f: impl FnMut(&mut Stats)) {
+        for scope in self.scopes.values_mut().flat_map(BTreeMap::values_mut) {
+            scope.for_each_stats_mut(&mut f);
+        }
+    }
+
+    /// The key of every endpoint, sorted.
+    fn endpoint_keys(&self) -> Vec<EndpointKey> {
+        let mut keys = Vec::new();
+        for (direction, ports) in &self.scopes {
+            for (port, scope) in ports {
+                let mut places = Vec::new();
+                scope.root.places(&mut Vec::new(), &mut places);
+                for (segments, method) in places {
+                    let template = if segments.is_empty() {
+                        "/".to_string()
+                    } else {
+                        render(&segments)
+                    };
+                    keys.push((*direction, *port, template, method, Place::Tree(segments)));
+                }
+                for (path, methods) in &scope.raw {
+                    for method in methods.keys() {
+                        keys.push((
+                            *direction,
+                            *port,
+                            path.clone(),
+                            method.clone(),
+                            Place::Raw(path.clone()),
+                        ));
+                    }
+                }
+            }
+        }
+        keys.sort();
+        keys
+    }
+
+    fn remove_endpoint(&mut self, (direction, port, _, method, place): &EndpointKey) {
+        let Some(ports) = self.scopes.get_mut(direction) else {
+            return;
+        };
+        if let Some(scope) = ports.get_mut(port) {
+            match place {
+                Place::Tree(segments) => scope.root.remove(segments, method),
+                Place::Raw(path) => {
+                    if let Some(methods) = scope.raw.get_mut(path) {
+                        methods.remove(method);
+                        if methods.is_empty() {
+                            scope.raw.remove(path);
+                        }
+                    }
+                }
+            }
+            if scope.is_empty() {
+                ports.remove(port);
+            }
+        }
+        if ports.is_empty() {
+            self.scopes.remove(direction);
+        }
+    }
+
+    /// Keeps the `limit` endpoints that sort first (spec §6, merge).
+    fn limit_endpoints(&mut self, limit: usize) {
+        if self.endpoint_count() <= limit {
+            return;
+        }
+        for key in self.endpoint_keys().iter().skip(limit) {
+            self.remove_endpoint(key);
+        }
+    }
+
+    /// Drops the samples with the highest content hash (then the later endpoint) until they
+    /// fit in `budget` (spec §6, merge).
+    fn limit_samples(&mut self, budget: usize) {
+        let total = self.sample_bytes();
+        if total <= budget {
+            return;
+        }
+        // (hash, endpoint ordinal in tree order, bytes)
+        let mut all = Vec::new();
+        let mut ordinal = 0usize;
+        self.for_each_stats(|stats| {
+            all.extend(
+                stats
+                    .samples
+                    .iter()
+                    .map(|(hash, sample)| (hash, ordinal, sample.bytes())),
+            );
+            ordinal += 1;
+        });
+        all.sort_unstable_by_key(|(hash, ordinal, _)| std::cmp::Reverse((*hash, *ordinal)));
+        let mut excess = total - budget;
+        let mut dropped = BTreeSet::new();
+        for (hash, ordinal, bytes) in all {
+            if excess == 0 {
+                break;
+            }
+            excess = excess.saturating_sub(bytes);
+            dropped.insert((ordinal, hash));
+        }
+        let mut ordinal = 0usize;
+        self.for_each_stats_mut(|stats| {
+            stats
+                .samples
+                .retain(|hash| !dropped.contains(&(ordinal, hash)));
+            ordinal += 1;
+        });
     }
 
     /// The stats of the endpoint an exchange belongs to, when it is already known.
@@ -406,12 +597,13 @@ impl Report {
         }
     }
 
-    /// Merges `other` into `self`.
+    /// Merges `other` into `self`, then enforces `max_endpoints` and `sample_budget`: the
+    /// reports of other pods are not trusted to respect them.
     pub fn merge(&mut self, limits: &Limits, other: Report) {
         if self.pod != other.pod {
             self.pod = None;
         }
-        self.exchanges += other.exchanges;
+        self.exchanges = self.exchanges.saturating_add(other.exchanges);
         for (direction, ports) in other.scopes {
             let mine = self.scopes.entry(direction).or_default();
             for (port, scope) in ports {
@@ -420,6 +612,8 @@ impl Report {
                     .merge(scope, limits.max_literals);
             }
         }
+        self.limit_endpoints(limits.max_endpoints);
+        self.limit_samples(limits.sample_budget);
     }
 
     /// Endpoints sorted by direction, port, template, method.
