@@ -7,8 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
@@ -62,6 +63,8 @@ enum Behaviour {
     Fail,
     /// Certify the posted key under this root, valid for this many seconds from now.
     Sign(Arc<Root>, u64),
+    /// `200` with a body that never ends.
+    Flood,
 }
 
 struct Seen {
@@ -150,7 +153,9 @@ async fn fake_api(behaviour: Arc<Mutex<Behaviour>>) -> FakeApi {
                         let bytes = req.into_body().collect().await.unwrap().to_bytes();
                         let body = serde_json::from_slice(&bytes).unwrap_or_default();
                         let current = behaviour.lock().unwrap().clone();
+                        let current_flood = matches!(current, Behaviour::Flood);
                         let (status, out) = match current {
+                            Behaviour::Flood => (200, String::new()),
                             Behaviour::Fail => (503, String::new()),
                             Behaviour::Sign(root, secs) => (
                                 200,
@@ -164,11 +169,16 @@ async fn fake_api(behaviour: Arc<Mutex<Behaviour>>) -> FakeApi {
                             path,
                             body,
                         });
+                        let body: BoxBody<Bytes, std::convert::Infallible> = if current_flood {
+                            StreamBody::new(futures::stream::repeat_with(|| {
+                                Ok(Frame::data(Bytes::from(vec![b'x'; 16 * 1024])))
+                            }))
+                            .boxed()
+                        } else {
+                            Full::new(Bytes::from(out)).boxed()
+                        };
                         Ok::<_, std::convert::Infallible>(
-                            Response::builder()
-                                .status(status)
-                                .body(Full::new(Bytes::from(out)))
-                                .unwrap(),
+                            Response::builder().status(status).body(body).unwrap(),
                         )
                     }
                 });
@@ -201,6 +211,7 @@ impl Setup {
         let api = fake_api(behaviour.clone()).await;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("token"), CANARY).unwrap();
+        std::fs::write(dir.path().join("mimic-trust"), b"\x7fELF").unwrap();
         Setup {
             api,
             root_pem,
@@ -224,6 +235,10 @@ impl Setup {
             ),
             ("MIMIC_WORKLOAD", "pay".into()),
             ("MIMIC_LOG", "debug".into()),
+            (
+                "MIMIC_TRUST_BINARY",
+                self.dir.path().join("mimic-trust").display().to_string(),
+            ),
         ]
     }
 
@@ -274,6 +289,38 @@ async fn tls_15_ready_before_an_intermediate_and_retries_with_backoff() {
     let metrics = http_get(admin, "/metrics").1;
     assert!(sample(&metrics, ERR).unwrap() >= 3.0, "{metrics}");
     assert_eq!(sample(&metrics, EXPIRY), Some(0.0), "{metrics}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_27_a_trust_volume_that_cannot_be_published_disables_interception() {
+    let setup = signing(3600).await;
+    let mut env = setup.env();
+    // A directory cannot be created below a file.
+    env.retain(|(k, _)| *k != "MIMIC_TRUST_DIR");
+    env.push((
+        "MIMIC_TRUST_DIR",
+        setup.dir.path().join("token/trust").display().to_string(),
+    ));
+    let mut sidecar = spawn(&env);
+    let admin = sidecar.admin_addr();
+    wait_status(admin, "/readyz", 200, Duration::from_secs(5));
+    sidecar.wait_log(Duration::from_secs(5), |v| {
+        v["message"] == "trust volume not published" && v["level"] == "ERROR"
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(setup.requests(), 0, "no intermediate is requested");
+    let metrics = http_get(admin, "/metrics").1;
+    assert_eq!(sample(&metrics, EXPIRY), Some(0.0), "{metrics}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_29_an_endless_answer_is_refused_while_it_streams() {
+    let setup = Setup::new(Behaviour::Flood).await;
+    let mut sidecar = spawn(&setup.env());
+    // The request timeout is 10 s: a cap checked only after buffering would wait for it.
+    sidecar.wait_log(Duration::from_secs(4), |v| {
+        v["fields"]["reason"] == "answer too large" || v["reason"] == "answer too large"
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]

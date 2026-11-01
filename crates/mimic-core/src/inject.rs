@@ -3,7 +3,7 @@
 use k8s_openapi::api::core::v1::{Container, HTTPGetAction, Pod, Probe, ResourceRequirements};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Label key read on namespaces and pods.
 pub const INJECT_LABEL: &str = "mimic.platform.io/inject";
@@ -224,6 +224,8 @@ fn literal(value: &str) -> String {
 pub struct JsonPatchOp {
     pub op: &'static str,
     pub path: String,
+    /// Absent (null) for `remove`.
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     pub value: serde_json::Value,
 }
 
@@ -388,18 +390,37 @@ pub fn patch(
         ));
     }
     for (i, c) in spec.iter().flat_map(|s| &s.containers).enumerate() {
-        for (field, kind, _) in probes_of(c) {
-            if rewritten.contains_key(&format!("{}/{kind}", c.name)) {
+        for (field, kind, probe) in probes_of(c) {
+            let Some(probe) =
+                probe.filter(|_| rewritten.contains_key(&format!("{}/{kind}", c.name)))
+            else {
+                continue;
+            };
+            let base = format!("/spec/containers/{i}/{field}");
+            let value = json!({
+                "path": format!("/app-health/{}/{kind}", c.name),
+                "port": ADMIN_PORT,
+                "scheme": "HTTP",
+            });
+            if probe.http_get.is_some() {
                 ops.push(JsonPatchOp {
                     op: "replace",
-                    path: format!("/spec/containers/{i}/{field}/httpGet"),
-                    value: json!({
-                        "path": format!("/app-health/{}/{kind}", c.name),
-                        "port": ADMIN_PORT,
-                        "scheme": "HTTP",
-                    }),
+                    path: format!("{base}/httpGet"),
+                    value,
                 });
+                continue;
             }
+            let old = if probe.tcp_socket.is_some() {
+                "tcpSocket"
+            } else {
+                "grpc"
+            };
+            ops.push(JsonPatchOp {
+                op: "remove",
+                path: format!("{base}/{old}"),
+                value: Value::Null,
+            });
+            ops.push(add(format!("{base}/httpGet"), value));
         }
     }
     Ok(ops)
@@ -546,57 +567,91 @@ fn resolve(c: &Container, port: &IntOrString) -> Option<i32> {
     }
 }
 
-/// Inbound ports `mimic-init` must not redirect (spec §4), sorted and deduplicated.
-pub fn excluded_inbound_ports(pod: &Pod) -> Vec<u16> {
-    let mut ports = BTreeSet::from([ADMIN_PORT as u16]);
-    for c in pod.spec.iter().flat_map(|s| &s.containers) {
-        for (_, _, probe) in probes_of(c) {
-            let Some(probe) = probe else { continue };
-            let tcp = probe.tcp_socket.as_ref().and_then(|t| resolve(c, &t.port));
-            let grpc = probe.grpc.as_ref().map(|g| g.port);
-            ports.extend(
-                tcp.into_iter()
-                    .chain(grpc)
-                    .filter_map(|p| u16::try_from(p).ok())
-                    .filter(|p| *p != 0),
-            );
-        }
-    }
-    ports.into_iter().collect()
+/// Inbound ports `mimic-init` must not redirect (spec §4): only the sidecar admin port, probe
+/// ports stay intercepted because their probes go through the sidecar.
+pub fn excluded_inbound_ports(_pod: &Pod) -> Vec<u16> {
+    vec![ADMIN_PORT as u16]
 }
 
-/// One original `httpGet` probe as handed to the sidecar in `MIMIC_APP_PROBES`.
+/// One original probe as handed to the sidecar in `MIMIC_APP_PROBES`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AppProbe {
-    #[serde(flatten)]
-    pub get: HTTPGetAction,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<i32>,
+#[serde(untagged)]
+pub enum AppProbe {
+    /// `tcpSocket`: the sidecar connects to `host` (default the pod IP) and `port`.
+    #[serde(rename_all = "camelCase")]
+    Tcp {
+        tcp_socket: TcpTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_seconds: Option<i32>,
+    },
+    /// `grpc`: the sidecar calls `grpc.health.v1.Health/Check` on the pod IP and `port`.
+    #[serde(rename_all = "camelCase")]
+    Grpc {
+        grpc: GrpcTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_seconds: Option<i32>,
+    },
+    /// `httpGet`: the fields of the `HTTPGetAction`.
+    #[serde(rename_all = "camelCase")]
+    Http {
+        #[serde(flatten)]
+        get: HTTPGetAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_seconds: Option<i32>,
+    },
 }
 
-/// Original `httpGet` probes of the app containers, keyed `<container>/<livez|readyz|startupz>`,
-/// named ports resolved; a probe whose named port does not resolve is left out (and not
-/// rewritten), so it fails as it would without mimic.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TcpTarget {
+    pub port: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GrpcTarget {
+    pub port: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
+
+/// Original `httpGet`, `tcpSocket` and `grpc` probes of the app containers, keyed
+/// `<container>/<livez|readyz|startupz>`, named ports resolved; a probe whose named port does
+/// not resolve is left out (and not rewritten), so it fails as it would without mimic.
 pub fn app_probes(pod: &Pod) -> BTreeMap<String, AppProbe> {
     let mut out = BTreeMap::new();
     for c in pod.spec.iter().flat_map(|s| &s.containers) {
         for (_, kind, probe) in probes_of(c) {
-            let Some((probe, mut get)) = probe.and_then(|p| Some((p, p.http_get.clone()?))) else {
-                continue;
-            };
-            let Some(port) = resolve(c, &get.port) else {
-                continue;
-            };
-            get.port = IntOrString::Int(port);
+            let Some(probe) = probe else { continue };
             let timeout_seconds = probe.timeout_seconds;
-            out.insert(
-                format!("{}/{kind}", c.name),
-                AppProbe {
-                    get,
+            let app = if let Some(get) = &probe.http_get {
+                resolve(c, &get.port).map(|port| AppProbe::Http {
+                    get: HTTPGetAction {
+                        port: IntOrString::Int(port),
+                        ..get.clone()
+                    },
                     timeout_seconds,
-                },
-            );
+                })
+            } else if let Some(tcp) = &probe.tcp_socket {
+                resolve(c, &tcp.port).map(|port| AppProbe::Tcp {
+                    tcp_socket: TcpTarget {
+                        port,
+                        host: tcp.host.clone().filter(|h| !h.is_empty()),
+                    },
+                    timeout_seconds,
+                })
+            } else {
+                probe.grpc.as_ref().map(|g| AppProbe::Grpc {
+                    grpc: GrpcTarget {
+                        port: g.port,
+                        service: g.service.clone().filter(|s| !s.is_empty()),
+                    },
+                    timeout_seconds,
+                })
+            };
+            if let Some(app) = app {
+                out.insert(format!("{}/{kind}", c.name), app);
+            }
         }
     }
     out
@@ -1131,7 +1186,10 @@ mod tests {
             let c = &mut spec(&mut p).containers[0];
             c.env = Some(vec![]);
             c.readiness_probe = Some(http(IntOrString::Int(8080), "/ready"));
-            c.liveness_probe = Some(tcp(IntOrString::Int(9000)));
+            c.liveness_probe = Some(Probe {
+                exec: Some(Default::default()),
+                ..Default::default()
+            });
         }
         let mut expected = serde_json::to_value(&p).unwrap();
         expected["spec"]["containers"][0]["env"] = json!([]);
@@ -1161,21 +1219,87 @@ mod tests {
     }
 
     #[test]
-    fn inj_04_exclusions_from_tcp_and_grpc_probes() {
+    fn inj_04_probe_ports_are_not_excluded() {
         let mut p = pod();
         spec(&mut p).containers[0].ports = Some(vec![named("db", 5432), named("web", 8080)]);
         spec(&mut p).containers[0].liveness_probe = Some(tcp(IntOrString::String("db".into())));
         spec(&mut p).containers[0].readiness_probe = Some(tcp(IntOrString::Int(5432)));
         spec(&mut p).containers[0].startup_probe = Some(grpc(50051));
-        spec(&mut p).containers.push(Container {
-            name: "other".into(),
-            // Names are resolved against the probe's own container: "db" and "nope" are unknown.
-            liveness_probe: Some(tcp(IntOrString::String("db".into()))),
-            readiness_probe: Some(tcp(IntOrString::String("nope".into()))),
-            startup_probe: Some(tcp(IntOrString::Int(81))),
-            ..Default::default()
-        });
-        assert_eq!(excluded_inbound_ports(&p), vec![81, 5432, 15100, 50051]);
+        assert_eq!(excluded_inbound_ports(&p), vec![15100]);
+        let doc = apply(&p);
+        assert_eq!(
+            doc["spec"]["initContainers"][0]["env"],
+            json!([{"name": "MIMIC_EXCLUDE_INBOUND_PORTS", "value": "15100"}])
+        );
+    }
+
+    #[test]
+    fn inj_04_remove_op_has_no_value_key() {
+        let mut p = pod();
+        spec(&mut p).containers[0].readiness_probe = Some(tcp(IntOrString::Int(9000)));
+        let ops = patch(&p, "shop-api", &cfg(), &wiring()).unwrap();
+        let remove: Vec<Value> = ops
+            .iter()
+            .filter(|o| o.op == "remove")
+            .map(|o| serde_json::to_value(o).unwrap())
+            .collect();
+        assert_eq!(
+            remove,
+            vec![json!({"op": "remove", "path": "/spec/containers/0/readinessProbe/tcpSocket"})]
+        );
+    }
+
+    #[test]
+    fn inj_04_tcp_and_grpc_probes_are_rewritten() {
+        let mut p = pod();
+        spec(&mut p).containers[0].ports = Some(vec![named("db", 5432)]);
+        let mut live = tcp(IntOrString::String("db".into()));
+        live.period_seconds = Some(7);
+        live.failure_threshold = Some(5);
+        live.timeout_seconds = Some(2);
+        spec(&mut p).containers[0].liveness_probe = Some(live);
+        let mut ready = grpc(50051);
+        ready.grpc.as_mut().unwrap().service = Some("svc.Name".into());
+        spec(&mut p).containers[0].readiness_probe = Some(ready);
+        spec(&mut p).containers[0].startup_probe = Some(tcp(IntOrString::String("nope".into())));
+        let probes = app_probes(&p);
+        assert_eq!(
+            probes.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["app/livez", "app/readyz"]
+        );
+        assert_eq!(
+            serde_json::to_value(&probes["app/livez"]).unwrap(),
+            json!({"tcpSocket": {"port": 5432}, "timeoutSeconds": 2})
+        );
+        assert_eq!(
+            serde_json::to_value(&probes["app/readyz"]).unwrap(),
+            json!({"grpc": {"port": 50051, "service": "svc.Name"}})
+        );
+        let doc = apply(&p);
+        let c = &doc["spec"]["containers"][0];
+        assert_eq!(
+            c["livenessProbe"],
+            json!({
+                "httpGet": {"path": "/app-health/app/livez", "port": 15100, "scheme": "HTTP"},
+                "periodSeconds": 7, "failureThreshold": 5, "timeoutSeconds": 2,
+            })
+        );
+        assert_eq!(
+            c["readinessProbe"],
+            json!({"httpGet": {"path": "/app-health/app/readyz", "port": 15100, "scheme": "HTTP"}})
+        );
+        // An unresolvable name is left to fail as it would without mimic.
+        assert_eq!(c["startupProbe"], json!({"tcpSocket": {"port": "nope"}}));
+        let value = doc["spec"]["initContainers"][1]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "MIMIC_APP_PROBES")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap();
+        let parsed: BTreeMap<String, AppProbe> = serde_json::from_str(value).unwrap();
+        assert_eq!(parsed, probes);
     }
 
     #[test]
@@ -1189,17 +1313,6 @@ mod tests {
     }
 
     #[test]
-    fn inj_04_exclusions_reach_mimic_init() {
-        let mut p = pod();
-        spec(&mut p).containers[0].liveness_probe = Some(tcp(IntOrString::Int(9000)));
-        let doc = apply(&p);
-        assert_eq!(
-            doc["spec"]["initContainers"][0]["env"],
-            json!([{"name": "MIMIC_EXCLUDE_INBOUND_PORTS", "value": "9000,15100"}])
-        );
-    }
-
-    #[test]
     fn inj_04_app_probes_and_rewrite() {
         let mut p = pod();
         spec(&mut p).containers[0].ports = Some(vec![named("web", 8080)]);
@@ -1210,7 +1323,10 @@ mod tests {
             Some(http(IntOrString::String("nope".into()), "/s"));
         spec(&mut p).containers.push(Container {
             name: "side".into(),
-            readiness_probe: Some(tcp(IntOrString::Int(1))),
+            readiness_probe: Some(Probe {
+                exec: Some(Default::default()),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         let probes = app_probes(&p);
@@ -1219,13 +1335,22 @@ mod tests {
             probes.keys().map(String::as_str).collect::<Vec<_>>(),
             ["app/livez", "app/readyz"]
         );
-        let live = &probes["app/livez"];
-        assert_eq!(live.get.port, IntOrString::Int(8080));
-        assert_eq!(live.get.path.as_deref(), Some("/l"));
-        assert_eq!(live.get.scheme.as_deref(), Some("HTTPS"));
-        assert_eq!(live.get.host.as_deref(), Some("localhost"));
-        assert_eq!(live.timeout_seconds, Some(3));
-        assert_eq!(probes["app/readyz"].get.port, IntOrString::Int(9090));
+        let AppProbe::Http {
+            get,
+            timeout_seconds,
+        } = &probes["app/livez"]
+        else {
+            panic!("not an httpGet probe");
+        };
+        assert_eq!(get.port, IntOrString::Int(8080));
+        assert_eq!(get.path.as_deref(), Some("/l"));
+        assert_eq!(get.scheme.as_deref(), Some("HTTPS"));
+        assert_eq!(get.host.as_deref(), Some("localhost"));
+        assert_eq!(*timeout_seconds, Some(3));
+        let AppProbe::Http { get, .. } = &probes["app/readyz"] else {
+            panic!("not an httpGet probe");
+        };
+        assert_eq!(get.port, IntOrString::Int(9090));
 
         let doc = apply(&p);
         let value = doc["spec"]["initContainers"][1]["env"]
@@ -1250,7 +1375,7 @@ mod tests {
         assert_eq!(c["livenessProbe"]["periodSeconds"], 7);
         assert_eq!(
             doc["spec"]["containers"][1]["readinessProbe"],
-            json!({"tcpSocket": {"port": 1}})
+            json!({"exec": {}})
         );
     }
 

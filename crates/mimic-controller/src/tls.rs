@@ -140,7 +140,7 @@ pub async fn serve(
             accepted = listener.accept() => accepted,
             _ = stopped.wait_for(|stop| *stop) => break,
         };
-        let (stream, _) = match accepted {
+        let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
             Err(e) => {
                 tracing::warn!(error = %e, "webhook accept failed");
@@ -150,7 +150,7 @@ pub async fn serve(
         };
         let (acceptor, router, stop) = (acceptor.clone(), router.clone(), stop_rx.clone());
         connections.spawn(async move {
-            connection(stream, acceptor, router, limits, stop).await;
+            connection(stream, peer.ip(), acceptor, router, limits, stop).await;
             drop(permit);
         });
     }
@@ -261,6 +261,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
 
 async fn connection(
     stream: TcpStream,
+    peer: std::net::IpAddr,
     acceptor: TlsAcceptor,
     router: Router,
     limits: Limits,
@@ -281,7 +282,11 @@ async fn connection(
     let inner = TowerToHyperService::new(router);
     let service = service_fn({
         let cycle = cycle.clone();
-        move |request| {
+        move |mut request: hyper::Request<hyper::body::Incoming>| {
+            // The sidecar API limits by source; the other routes ignore it.
+            request
+                .extensions_mut()
+                .insert(crate::sidecar_api::Peer(peer));
             let (answer, cycle) = (inner.call(request), cycle.clone());
             async move {
                 let response = answer.await;

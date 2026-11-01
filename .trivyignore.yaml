@@ -1,0 +1,11 @@
+# Misconfigurations that `trivy config` accepts on purpose (#269). Each entry names the rule, the
+# file it applies to and the reason. Anything not listed here fails the trivy-config job on HIGH and
+# CRITICAL.
+misconfigurations:
+  # KSV-0114 (CRITICAL) on the controller's ClusterRole: `patch` on mutatingwebhookconfigurations is
+  # granted only for the controller's own configuration (resourceNames: mimic-injector). The
+  # controller restores the caBundle it manages when another client changes it (spec §11, INJ-20).
+  - id: KSV-0114
+    paths:
+      - "chart.yaml"
+    statement: "patch is limited to the controller's own MutatingWebhookConfiguration, by name (spec §11, INJ-20)"

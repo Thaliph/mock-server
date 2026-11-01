@@ -57,6 +57,30 @@ pub async fn fixture_budget(
     }
 }
 
+/// Like [`fixture`], with `configure` applied to the shared state before it is used.
+pub async fn fixture_configured(
+    direction: Direction,
+    dst: impl Fn(SocketAddr) -> Option<SocketAddr> + Send + Sync + 'static,
+    configure: impl FnOnce(Shared) -> Shared,
+) -> Fixture {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut metrics = Metrics::new("sidecar", "test");
+    let tunnel_metrics = TunnelMetrics::register(&mut metrics);
+    let original_dst: OriginalDst =
+        Arc::new(move |_| dst(addr).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound)));
+    let proxy = ProxyMetrics::register(&mut metrics, 50);
+    let shared = Arc::new(configure(
+        Shared::new(vec![addr], tunnel_metrics, original_dst).with_proxy_metrics(proxy),
+    ));
+    spawn_listener(listener, direction, shared.clone());
+    Fixture {
+        addr,
+        shared,
+        metrics: Arc::new(metrics),
+    }
+}
+
 /// Like [`fixture`] with the exchanges handed to `discovery` (spec §6).
 pub async fn fixture_discovery(
     direction: Direction,
