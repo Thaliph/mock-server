@@ -144,7 +144,7 @@ async fn dsc_13_bodies_are_decoded_within_the_limit() {
     }
     wait_results(&f.metrics, 6).await;
     let text = f.metrics.encode();
-    for (result, n) in [("parsed", 3), ("encoding", 1), ("invalid", 2)] {
+    for (result, n) in [("parsed", 2), ("encoding", 2), ("invalid", 2)] {
         assert_eq!(
             sum(
                 &text,
@@ -155,13 +155,15 @@ async fn dsc_13_bodies_are_decoded_within_the_limit() {
         );
     }
     let json = discovery.report().to_json();
-    for name in ["gzip", "deflate", "brotli"] {
+    // `br` is not decoded: its content never reaches the report.
+    assert!(!json.contains("brotli"), "{json}");
+    for name in ["gzip", "deflate"] {
         assert!(
             json.contains(&format!("\"{name}\"")) || json.contains(name),
             "{name}: {json}"
         );
     }
-    // The three decoded bodies gave the same schema: an object with `name` and `n`.
+    // The two decoded bodies gave the same schema: an object with `name` and `n`.
     assert!(json.contains("\"n\""), "{json}");
 
     // The bomb: 4 MiB once decoded, counted `too_large`, and the memory does not move.
