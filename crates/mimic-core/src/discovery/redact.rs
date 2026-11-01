@@ -15,6 +15,9 @@ pub const MARKER: &str = "<redacted>";
 /// Deepest JSON nesting walked; anything below is redacted as a whole.
 const MAX_DEPTH: usize = 128;
 
+/// Built-in names that only match a whole token (a run of tokens, joined).
+const WHOLE_TOKEN: &[&str] = &["auth", "pan", "iban", "ssn", "cvv", "cvc"];
+
 /// Names (normalised) that are redacted when a run of tokens of a name spells one.
 const NAMES: &[&str] = &[
     "authorization",
@@ -311,23 +314,32 @@ impl Redactor {
     /// of its tokens, joined, is a listed name, or a listed name followed by `s`.
     pub fn name_matches(&self, name: &str) -> bool {
         let tokens = tokens(name);
-        (0..tokens.len()).any(|start| {
-            let mut joined = String::new();
-            for token in &tokens[start..] {
-                joined.push_str(token);
-                if joined.len() > self.max_len + 1 {
-                    return false;
+        // A built-in name glued into a token (`JSESSIONID`, `csrftoken`), except the short
+        // ones, which would match words like `company` or `author`.
+        let glued = tokens.iter().any(|t| {
+            NAMES
+                .iter()
+                .filter(|n| !WHOLE_TOKEN.contains(n))
+                .any(|n| t.contains(n))
+        });
+        glued
+            || (0..tokens.len()).any(|start| {
+                let mut joined = String::new();
+                for token in &tokens[start..] {
+                    joined.push_str(token);
+                    if joined.len() > self.max_len + 1 {
+                        return false;
+                    }
+                    if self.names.contains(&joined)
+                        || joined
+                            .strip_suffix('s')
+                            .is_some_and(|plural| self.names.contains(plural))
+                    {
+                        return true;
+                    }
                 }
-                if self.names.contains(&joined)
-                    || joined
-                        .strip_suffix('s')
-                        .is_some_and(|plural| self.names.contains(plural))
-                {
-                    return true;
-                }
-            }
-            false
-        })
+                false
+            })
     }
 
     /// A header value: `Authorization` keeps its scheme, `Cookie` and `Set-Cookie` keep the
