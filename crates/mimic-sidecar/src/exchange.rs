@@ -743,8 +743,9 @@ impl Http1Tracker {
         while let Some(open) = self.open.pop_front() {
             let outcome = match ended {
                 Outcome::Ok if open.request_done && open.response_done => Outcome::Ok,
-                Outcome::Ok if open.response_done => Outcome::ClientAbort,
-                Outcome::Ok => Outcome::UpstreamReset,
+                // A request without its response ends the relay as `UpstreamReset` or
+                // `ClientAbort` (`http1::relay` decides); `Ok` here is a half-read request.
+                Outcome::Ok => Outcome::ClientAbort,
                 other => other,
             };
             self.write(open, outcome);
