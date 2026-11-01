@@ -1,5 +1,6 @@
-# Dependency updates: crates, GitHub Actions and Dockerfile base images. The 7-day cooldown
-# keeps freshly published (possibly compromised) releases out.
+# Dependency updates: crates (workspace and fuzz crate), GitHub Actions, and Dockerfile base images
+# (the product Dockerfile and images/Dockerfile, which pins Valkey, kind and the e2e images, #273).
+# The 7-day cooldown keeps freshly published (possibly compromised) releases out.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -8,6 +9,14 @@ updates:
     cooldown: {default-days: 7}
     groups:
       cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule: {interval: weekly}
+    cooldown: {default-days: 7}
+    groups:
+      cargo-fuzz:
         patterns: ["*"]
         update-types: [minor, patch]
   - package-ecosystem: github-actions
@@ -19,5 +28,10 @@ updates:
         patterns: ["*"]
   - package-ecosystem: docker
     directory: /
+    schedule: {interval: weekly}
+    cooldown: {default-days: 7}
+  # images/Dockerfile: never built, only the digests of the pinned images, read by Dependabot.
+  - package-ecosystem: docker
+    directory: /images
     schedule: {interval: weekly}
     cooldown: {default-days: 7}
