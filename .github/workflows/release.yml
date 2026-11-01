@@ -18,7 +18,28 @@ env:
   CHARTS: ghcr.io/thaliph/charts
 
 jobs:
+  # #272: a release is cut from main only. The tagged commit must be an ancestor of main (or main
+  # itself); a tag on a branch or on an unreviewed commit fails here before anything is built.
+  on-main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Tagged commit is on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Comparing main with the tagged commit: "behind" means the commit is an ancestor of
+          # main, "identical" means it is main.
+          status=$(gh api "repos/$REPO/compare/main...$SHA" --jq .status)
+          case "$status" in
+            behind|identical) echo "$SHA is on main ($status)" ;;
+            *) echo "refusing to release $SHA: not on main (compare status: $status)"; exit 1 ;;
+          esac
+
   build:
+    needs: on-main
     strategy:
       matrix:
         include:
