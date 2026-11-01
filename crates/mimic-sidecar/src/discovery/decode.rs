@@ -56,7 +56,6 @@ pub(super) fn decode<'a>(data: &'a [u8], encoding: Option<&str>) -> Result<Cow<'
         "gzip" | "x-gzip" => bounded(GzDecoder::new(data))?,
         "deflate" if is_zlib(data) => bounded(ZlibDecoder::new(data))?,
         "deflate" => bounded(DeflateDecoder::new(data))?,
-        "br" => bounded(brotli_decompressor::Decompressor::new(data, 4096))?,
         _ => return Err(Failure::Encoding),
     };
     Ok(Cow::Owned(decoded))
