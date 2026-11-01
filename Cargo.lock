@@ -1791,6 +1791,7 @@ dependencies = [
  "mimic-core",
  "mimic-runtime",
  "nix",
+ "percent-encoding",
  "prometheus-client",
  "rcgen",
  "reqwest",

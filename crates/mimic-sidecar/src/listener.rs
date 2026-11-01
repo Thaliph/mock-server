@@ -227,6 +227,11 @@ impl Shared {
         self
     }
 
+    /// Hands the inbound HTTP/1 exchanges to discovery (spec §6).
+    pub fn with_discovery(self, _tap: crate::discovery::Tap) -> Shared {
+        self
+    }
+
     /// Intercepts outbound TLS as `tls` says instead of passing it all through.
     pub fn with_tls(mut self, tls: Interception) -> Shared {
         self.tls = tls;

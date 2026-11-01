@@ -627,7 +627,9 @@ impl Codec {
         });
         events.push(Event::Request(head.clone()));
         if self.capture {
-            events.push(Event::Captured(Captured::RequestHead(scanner.raw().to_vec())));
+            events.push(Event::Captured(Captured::RequestHead(
+                scanner.raw().to_vec(),
+            )));
             self.req_cap.room = CAPTURE_BODY_LIMIT;
         }
         match framing {
@@ -689,7 +691,9 @@ impl Codec {
         if status == 101 || connect_ok {
             events.push(Event::Response(head));
             if self.capture {
-                events.push(Event::Captured(Captured::ResponseHead(scanner.raw().to_vec())));
+                events.push(Event::Captured(Captured::ResponseHead(
+                    scanner.raw().to_vec(),
+                )));
             }
             events.push(Event::Tunnel);
             self.opaque = true;
@@ -714,7 +718,9 @@ impl Codec {
         };
         events.push(Event::Response(head));
         if self.capture {
-            events.push(Event::Captured(Captured::ResponseHead(scanner.raw().to_vec())));
+            events.push(Event::Captured(Captured::ResponseHead(
+                scanner.raw().to_vec(),
+            )));
             self.resp_cap.room = CAPTURE_BODY_LIMIT;
         }
         match body {

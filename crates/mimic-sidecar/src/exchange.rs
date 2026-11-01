@@ -428,7 +428,7 @@ impl Http1Tracker {
                 }
                 self.reap();
             }
-            Event::Interim(_) => {}
+            Event::Interim(_) | Event::Captured(_) => {}
             Event::Response(head) => {
                 let index = match self.open.iter().position(|o| o.status.is_none()) {
                     Some(index) => index,
