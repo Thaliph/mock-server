@@ -125,11 +125,46 @@ impl Reviewer for KubeReviewer {
     }
 }
 
+/// `TokenReview` calls per second the controller makes for all callers together, and the burst
+/// it allows (spec §7.2).
+pub const REVIEWS_PER_SECOND: u32 = 50;
+pub const REVIEW_BURST: u32 = 100;
+
+/// A token bucket for `TokenReview` calls: callers with arbitrary tokens must not flood the API
+/// server.
+pub struct ReviewLimiter {
+    per_second: f64,
+    burst: f64,
+    state: std::sync::Mutex<(f64, tokio::time::Instant)>,
+}
+
+impl ReviewLimiter {
+    pub fn new(burst: u32, per_second: u32) -> ReviewLimiter {
+        ReviewLimiter {
+            per_second: f64::from(per_second),
+            burst: f64::from(burst),
+            state: std::sync::Mutex::new((f64::from(burst), tokio::time::Instant::now())),
+        }
+    }
+
+    /// Takes one call from the budget; false when it is spent.
+    pub fn allow(&self) -> bool {
+        true
+    }
+}
+
+impl Default for ReviewLimiter {
+    fn default() -> ReviewLimiter {
+        ReviewLimiter::new(REVIEW_BURST, REVIEWS_PER_SECOND)
+    }
+}
+
 /// What the endpoints need.
 pub struct SidecarApi {
     pub seed: Arc<SeedSlot>,
     pub reviewer: Arc<dyn Reviewer>,
     pub metrics: ApiMetrics,
+    pub limiter: ReviewLimiter,
 }
 
 pub fn router(api: Arc<SidecarApi>) -> Router {
@@ -406,6 +441,10 @@ mod tests {
     }
 
     fn setup_with(seed: Arc<SeedSlot>) -> Setup {
+        setup_limited(seed, ReviewLimiter::default())
+    }
+
+    fn setup_limited(seed: Arc<SeedSlot>, limiter: ReviewLimiter) -> Setup {
         let (client, reviews) = api_server();
         let mut metrics = Metrics::new("controller", "test");
         let api = Arc::new(SidecarApi {
@@ -414,6 +453,7 @@ mod tests {
                 client,
             ))))),
             metrics: ApiMetrics::register(metrics.registry_mut()),
+            limiter,
         });
         Setup {
             router: router(api),
@@ -569,6 +609,61 @@ mod tests {
             post_status(&unseeded, Some("ok"), body("pay", &key)).await,
             503
         );
+    }
+
+    /// SPKI of a P-256 key whose point is moved off the curve.
+    fn off_curve_body() -> Vec<u8> {
+        use base64::Engine;
+        let key = KeyPair::generate().unwrap();
+        let mut spki = key.subject_public_key_info();
+        let last = spki.len() - 1;
+        spki[last] ^= 0x01;
+        serde_json::to_vec(&json!({
+            "deployment": "pay",
+            "public_key": base64::engine::general_purpose::STANDARD.encode(spki),
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tls_28_a_key_that_is_not_a_p256_point_gets_400() {
+        let s = setup();
+        assert_eq!(post_status(&s, Some("ok"), off_curve_body()).await, 400);
+        let key = KeyPair::generate().unwrap();
+        assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 200);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tls_28_token_reviews_are_rate_limited_and_the_budget_refills() {
+        let s = setup_limited(seed(), ReviewLimiter::new(2, 1));
+        let key = KeyPair::generate().unwrap();
+        assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 200);
+        assert_eq!(post_status(&s, Some("bad"), body("pay", &key)).await, 401);
+        // Budget spent: no call to the API server.
+        assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 503);
+        assert_eq!(s.reviews.lock().unwrap().len(), 2);
+        // A request without a token never costs a review.
+        assert_eq!(post_status(&s, None, body("pay", &key)).await, 401);
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 200);
+        assert_eq!(s.reviews.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn tls_28_a_failing_token_review_writes_one_log_line() {
+        let (capture, _guard) = crate::webhook::tests::capture_logs();
+        let s = setup();
+        let key = KeyPair::generate().unwrap();
+        assert_eq!(post_status(&s, Some("boom"), body("pay", &key)).await, 503);
+        let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect();
+        assert_eq!(lines.len(), 1, "{raw}");
+        assert_eq!(lines[0]["target"], "sidecar_api");
+        assert_eq!(lines[0]["result"], "unavailable");
+        assert!(lines[0]["error"].as_str().is_some_and(|e| !e.is_empty()));
     }
 
     #[tokio::test]

@@ -75,6 +75,18 @@ fn p12_certs(out: &Path) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn tls_29_a_store_file_over_8_mib_is_ignored_like_an_unreadable_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, root) = (cert("a"), cert("root"));
+    let mut store = pem(&[&a]);
+    store.push_str(&"#".repeat(8 * 1024 * 1024));
+    put(dir.path(), "/etc/ssl/certs/ca-certificates.crt", &store);
+    let report = build(dir.path(), &with_ca(dir.path(), &root, &[])).unwrap();
+    assert!(report.no_image_store, "{report:?}");
+    assert_eq!(report.image_certs, 0);
+}
+
+#[test]
 fn tls_13_debian_store_gets_the_root_appended_in_every_file() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b, root) = (cert("a"), cert("b"), cert("root"));

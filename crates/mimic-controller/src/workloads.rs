@@ -275,6 +275,21 @@ mod tests {
     }
 
     #[test]
+    fn tls_28_the_exclusion_union_is_cut_to_256_entries_in_sorted_order() {
+        let names: Vec<Vec<String>> = (0..3)
+            .map(|w| (0..100).map(|i| format!("h{:03}.test", w * 100 + i)).collect())
+            .collect();
+        let cache = WorkloadCache::new();
+        for (i, list) in names.iter().enumerate() {
+            cache.apply("shop", &format!("w{i}"), "api", list.clone(), vec![]);
+        }
+        let union = cache.exclude("shop", "api");
+        assert_eq!(union.len(), 256);
+        assert_eq!(union[0], "h000.test");
+        assert_eq!(union[255], "h255.test");
+    }
+
+    #[test]
     fn dsc_20_redactions_are_the_sorted_deduplicated_union_per_deployment() {
         let cache = WorkloadCache::synced_with_settings(&[
             ("shop", "w1", "api", &[], &["x-tenant-key", "pin"]),

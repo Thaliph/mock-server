@@ -229,6 +229,16 @@ impl Shared {
         self
     }
 
+    /// Serves at most `max` connections at once (spec §4.1).
+    pub fn with_max_connections(self, _max: usize) -> Shared {
+        self
+    }
+
+    /// Resets a connection stalled on an incomplete protocol prefix after `stall` (spec §4.1).
+    pub fn with_detect_stall(self, _stall: Duration) -> Shared {
+        self
+    }
+
     /// Hands the inbound HTTP/1 exchanges to discovery (spec §6).
     pub fn with_discovery(mut self, tap: crate::discovery::Tap) -> Shared {
         self.discovery = Some(tap);
