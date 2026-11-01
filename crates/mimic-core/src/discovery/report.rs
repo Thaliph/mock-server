@@ -758,7 +758,9 @@ impl Report {
 
     /// Removes every sample, keeping counters, schemas and the shape (the `413` resend of
     /// spec §7.2).
-    pub fn drop_samples(&mut self) {}
+    pub fn drop_samples(&mut self) {
+        self.for_each_stats_mut(|stats| stats.samples = Samples::default());
+    }
 
     /// Sets `last_seen` to `day` on every endpoint and sample (spec §7.3, stamping).
     pub fn stamp(&mut self, day: u64) {

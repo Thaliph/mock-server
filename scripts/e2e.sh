@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22).
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-20, CTL-21).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -1171,7 +1171,7 @@ kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 kubectl -n tls-clients delete pods --all --wait=false >/dev/null
 kubectl delete namespace tls-clients tls-dest --wait=false >/dev/null
 
-# --- Endpoint discovery (F4, spec §6, §7, §12.5 DSC-20, DSC-22) ---------------------------------------
+# --- Endpoint discovery (F4, F5, spec §6, §7, §12.5 DSC-20, DSC-22, CTL-20, CTL-21) ---------------------------------------
 # The CRD takes spec.discovery.redact: an entry with /, an empty entry and 65 entries are refused.
 log "dsc_20: the CRD accepts spec.discovery.redact and rejects an entry with /, an empty entry and 65 entries"
 accepted "a MimicWorkload with spec.discovery.redact" workload dsc20-ok \
@@ -1197,6 +1197,54 @@ def walk_node($node; $prefix; $depth; $lit):
   | walk_node(.; ""; 0; null) | {direction: $direction, port: $port, method, template, stats} ]
 JQ
 endpoints() { jq -c -f "$WORK/endpoints.jq" "$1"; }
+
+# ui_forward: (re)starts the port-forward to the read API (MIMIC_UI_ADDR, loopback in the pod) of a controller
+# pod on localhost:18082. A forward goes to one pod, not to a Service, so it follows the pod it was given.
+ui_forward() {
+  local pod
+  if [[ -n ${UI_PF:-} ]]; then kill "$UI_PF" 2>/dev/null || true; wait "$UI_PF" 2>/dev/null || true; fi
+  pod=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller --field-selector=status.phase=Running \
+    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | head -n 1)
+  [[ -n $pod ]] || fail "ctl_20: no controller pod to forward to"
+  kubectl -n "$NS" port-forward "pod/$pod" 18082:8080 >/dev/null 2>&1 &
+  UI_PF=$!
+  PIDS+=("$UI_PF")
+  for _ in $(seq 30); do curl -fs localhost:18082/v1/workloads >/dev/null && return 0; sleep 1; done
+  fail "ctl_20: port-forward to the read API of $pod"
+}
+# fetch_merged: the merged report of the users deployment, from the read API, into $WORK/merged.json.
+# Fails while the controller has none (404) or the forward is broken.
+fetch_merged() { curl -fs --max-time 10 localhost:18082/v1/workloads/disc-22/users/report > "$WORK/merged.json"; }
+# merged_pods: the pods the controller has seen push for the users deployment, one per line.
+merged_pods() { curl -fs --max-time 10 localhost:18082/v1/workloads/disc-22/users | jq -r '.pods | keys[]'; }
+# merged_count <method>: the 200s of <method> /users/{users_id} (inbound) in $WORK/merged.json.
+merged_count() {
+  endpoints "$WORK/merged.json" | jq --arg m "$1" \
+    '[.[] | select(.direction == "inbound" and .method == $m and .template == "/users/{users_id}") | .stats.statuses["200"] // 0] | add // 0'
+}
+# merged_templates: the inbound endpoints of $WORK/merged.json, one "method template" per line, sorted.
+merged_templates() { endpoints "$WORK/merged.json" | jq -r '.[] | select(.direction == "inbound") | "\(.method) \(.template)"' | sort; }
+# wait_merged <get 200s> <put 200s> <seconds>: polls the read API until the merged counts are exactly those.
+wait_merged() {
+  local end=$((SECONDS + $3))
+  while (( SECONDS < end )); do
+    if fetch_merged 2>/dev/null && [[ $(merged_count GET) == "$1" && $(merged_count PUT) == "$2" ]]; then return 0; fi
+    sleep 3
+  done
+  return 1
+}
+# valkey_dump: every value of the store as text, whatever the type of the key.
+valkey_dump() {
+  local key kind
+  for key in $(kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw --scan --pattern 'mimic:v1:*'); do
+    kind=$(kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw TYPE "$key")
+    case $kind in
+      string) kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw GET "$key" ;;
+      hash) kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw HGETALL "$key" ;;
+      *) kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw DUMP "$key" ;;
+    esac
+  done
+}
 
 # The e2e apps (scripts/e2e/apps): B, the users API with two replicas behind the Service users, in an
 # enabled namespace; A (front) forwards to B, and the client calls A, in a namespace mimic does not inject.
@@ -1251,31 +1299,50 @@ warm_seen() {
   done
   echo "$seen"
 }
+# warm_ok counts the calls that got a 200: they are recorded like any other (CTL-20 counts them).
+warm_ok=0
 for _ in $(seq 60); do
-  kubectl -n disc-22-client exec client -- python3 -c \
+  if kubectl -n disc-22-client exec client -- python3 -c \
     'import urllib.request; urllib.request.urlopen("http://front.disc-22-client.svc:8080/front/users/warm", timeout=5).read()' \
-    >/dev/null 2>&1 || true
+    >/dev/null 2>&1; then warm_ok=$((warm_ok + 1)); fi
   [[ $(warm_seen) == 2 ]] && break
   sleep 1
 done
 [[ $(warm_seen) == 2 ]] || fail "dsc_22: the Service does not reach both pods"
-kubectl -n disc-22-client exec -i client -- python3 - "$token" "$tenant" "$secret" <<'PY' || fail "dsc_22: the calls through front failed"
+# 40 GETs and 5 PUTs (a canary in the JSON body), spread over both pods; the client counts its 200s.
+batch=$(kubectl -n disc-22-client exec -i client -- python3 - "$token" "$tenant" "$secret" <<'PY'
 import json, sys, urllib.request
 token, tenant, secret = sys.argv[1:4]
 base = "http://front.disc-22-client.svc:8080/front/users"
-ids = [str(n) for n in range(1, 31)] + ["3f2b9c1d-8a7e-4c5b-9d6e-1a2b3c4d5e6f"]
+ids = [str(n) for n in range(1, 40)] + ["3f2b9c1d-8a7e-4c5b-9d6e-1a2b3c4d5e6f"]
 auth = {"Authorization": f"Bearer {token}", "X-Tenant-Key": tenant}
+gets = puts = 0
 for uid in ids:
     with urllib.request.urlopen(urllib.request.Request(f"{base}/{uid}", headers=auth), timeout=10) as r:
         r.read()
-for uid in ids[:10]:
+        gets += r.status == 200
+for uid in ids[:5]:
     body = json.dumps({"name": "user " + uid, "password": secret}).encode()
     headers = dict(auth, **{"Content-Type": "application/json"})
     with urllib.request.urlopen(urllib.request.Request(f"{base}/{uid}", data=body, method="PUT", headers=headers), timeout=10) as r:
         r.read()
+        puts += r.status == 200
+print(gets, puts)
 PY
+) || fail "dsc_22: the calls through front failed"
+[[ $batch == "40 5" ]] || fail "dsc_22: the client got '$batch' 200s for 40 GETs and 5 PUTs"
+want_get=$((warm_ok + 40))
+want_put=5
 
 dsc_pods=$(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}')
+# What each pod's /discovery holds now, before the pushes: used for the canary checks (it holds only what
+# the pod has not shipped yet, DSC-22 as amended by CTL-20).
+for p in $dsc_pods; do sidecar_get disc-22 "$p" /discovery > "$WORK/discovery-$p.json"; done
+# What each pod's own log says it answered: the merged report must be the sum of both.
+pod_gets() {
+  kubectl -n disc-22 logs "$1" -c app \
+    | jq -R -s 'split("\n") | map(fromjson? | select(. != null and .method == "GET" and .status == 200 and (.path | startswith("/users/")) and .path != "/users/0")) | length'
+}
 # users_ready <report file>: GET /users/{users_id} has a 200, a response schema with a name, samples whose
 # x-tenant-key is <redacted> and whose Authorization is Bearer <redacted>.
 users_ready() {
@@ -1288,24 +1355,31 @@ users_ready() {
       and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "authorization") | .[1]] | any(. == "Bearer <redacted>")))
   ' >/dev/null
 }
+log "ctl_20: within 2 push intervals the merged report, read through the controller, holds the calls of both pods"
+ui_forward
+# Default push interval (30 s, the first push jittered within it): two intervals plus the request time.
+wait_merged "$want_get" "$want_put" 120 \
+  || { echo "ctl_20: merged GET $(merged_count GET) of $want_get, PUT $(merged_count PUT) of $want_put" >&2; \
+       kubectl -n disc-22 logs "$(echo $dsc_pods | cut -d' ' -f1)" -c mimic-sidecar --tail=30 >&2 || true; \
+       fail "ctl_20: the merged report does not hold $want_get GETs and $want_put PUTs with a 200"; }
+users_ready "$WORK/merged.json" || fail "ctl_20: the merged report has no GET /users/{users_id} with a response schema and redacted samples"
+endpoints "$WORK/merged.json" | jq -e '.[] | select(.direction == "inbound" and .method == "PUT" and .template == "/users/{users_id}")
+  | select((.stats.samples | length) > 0 and ((.stats.observed.response.bodies["application/json"].json.object.props // {}) | has("updated")))' >/dev/null \
+  || fail "ctl_20: the merged report has no PUT /users/{users_id} with a response schema and samples"
+[[ $(merged_templates) == $'GET /users/{users_id}\nPUT /users/{users_id}' ]] \
+  || fail "ctl_20: the merged inbound endpoints are not GET and PUT /users/{users_id}: $(merged_templates | tr '\n' ';')"
+# The union of the pods: both pods answered, and the merged count is the sum of what each answered.
+sum_gets=0
 for p in $dsc_pods; do
-  ready=0
-  for _ in $(seq 30); do
-    sidecar_get disc-22 "$p" /discovery > "$WORK/discovery-$p.json"
-    if users_ready "$WORK/discovery-$p.json"; then ready=1; break; fi
-    sleep 1
-  done
-  if [[ $ready != 1 ]]; then
-    # Names and counts only (no values, no samples): what the pod's report holds instead.
-    echo "dsc_22: $p report is $(wc -c < "$WORK/discovery-$p.json") bytes; inbound exclusions" \
-      "$(jp disc-22 "$p" '{.spec.initContainers[?(@.name=="mimic-init")].env[?(@.name=="MIMIC_EXCLUDE_INBOUND_PORTS")].value}')," \
-      "access lines $(kubectl -n disc-22 logs "$p" -c mimic-sidecar | grep -c '"target":"access"' || true); endpoints:" >&2
-    endpoints "$WORK/discovery-$p.json" | jq -c '[.[] | {direction, method, template, statuses: .stats.statuses,
-      props: ((.stats.observed.response.bodies["application/json"].json.object.props // {}) | keys),
-      samples: (.stats.samples | length), sample_headers: ([.stats.samples[].request.headers[][0]] | unique)}]' >&2 || true
-    fail "dsc_22: pod $p does not show GET /users/{users_id} with a response schema, samples and redacted credentials"
-  fi
+  n=$(pod_gets "$p")
+  (( n > 0 )) || fail "ctl_20: pod $p answered no GET /users/<id>"
+  sum_gets=$((sum_gets + n))
 done
+[[ $sum_gets == "$want_get" ]] || fail "ctl_20: the pods answered $sum_gets GETs, the client got $want_get 200s"
+[[ $(merged_pods | sort | tr '\n' ' ') == "$(echo $dsc_pods | tr ' ' '\n' | sort | tr '\n' ' ')" ]] \
+  || fail "ctl_20: the controller does not list both pods: $(merged_pods | tr '\n' ' ')"
+cp "$WORK/merged.json" "$WORK/merged-first.json"
+merged_templates > "$WORK/templates-first.txt"
 
 # No canary in any /discovery output or pod log (DSC-22, DSC-15).
 for p in $dsc_pods; do
@@ -1320,6 +1394,15 @@ done
 } > "$WORK/dsc22.log"
 for c in "${canaries[@]}"; do
   if grep -F "$c" "$WORK/dsc22.log" >/dev/null; then fail "dsc_22: a canary appears in a pod log"; fi
+done
+# The merged report, every value in Valkey and the controller's logs hold no canary either (CTL-20).
+valkey_dump > "$WORK/valkey.dump" || fail "ctl_20: cannot read the Valkey values"
+[[ -s $WORK/valkey.dump ]] || fail "ctl_20: the Valkey dump is empty"
+kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/controller.log"
+for c in "${canaries[@]}"; do
+  if grep -F "$c" "$WORK/merged.json" >/dev/null; then fail "ctl_20: a canary appears in the merged report"; fi
+  if grep -F "$c" "$WORK/valkey.dump" >/dev/null; then fail "ctl_20: a canary appears in a Valkey value"; fi
+  if grep -F "$c" "$WORK/controller.log" >/dev/null; then fail "ctl_20: a canary appears in the controller logs"; fi
 done
 # The logs explain the traffic: B logs its GETs, A logs its forwarded calls.
 jq -R -e 'fromjson? | select(.app == "users" and .method == "GET" and .status == 200 and (.path | startswith("/users/")))' \
@@ -1372,6 +1455,53 @@ done
 (( after_404 >= before_404 + 100 )) || fail "dsc_22: the 404s were not counted as not_found ($before_404 -> $after_404)"
 after_tpl=$(dsc_templates $dsc_pods) || fail "dsc_22: cannot read the endpoints after the storm"
 [[ $after_tpl == "$before_tpl" ]] || fail "dsc_22: the 404 storm changed the endpoints"
+
+log "ctl_21: a deleted pod's data stays in the merged report"
+gone=$(echo $dsc_pods | cut -d' ' -f1)
+kubectl -n disc-22 delete pod "$gone" --wait >/dev/null || fail "ctl_21: cannot delete pod $gone"
+kubectl -n disc-22 rollout status deploy/users --timeout=3m >/dev/null || fail "ctl_21: users did not recover from the deleted pod"
+# The pod flushed at SIGTERM: nothing was pending, so the count is the same, and its pod entry stays.
+fetch_merged || fail "ctl_21: cannot read the merged report after the pod was deleted"
+[[ $(merged_count GET) == "$want_get" && $(merged_count PUT) == "$want_put" ]] \
+  || fail "ctl_21: deleting pod $gone changed the merged counts to $(merged_count GET) and $(merged_count PUT)"
+pods_now=$'\n'$(merged_pods)$'\n'
+[[ $pods_now == *$'\n'"$gone"$'\n'* ]] || fail "ctl_21: the deleted pod $gone is gone from the controller's list"
+
+log "ctl_21: churn: a rollout and a deleted controller pod, with traffic before, during and after"
+# The client calls for 150 s and counts the 200s it gets; the merged count must be exactly that on top of
+# what the report held (no exchange lost at SIGTERM of the old pods, none counted twice by a retry).
+kubectl -n disc-22-client exec -i client -- python3 - 150 > "$WORK/churn.out" <<'PY' &
+import sys, time, urllib.request
+end = time.time() + int(sys.argv[1])
+ok = n = 0
+while time.time() < end:
+    n += 1
+    try:
+        with urllib.request.urlopen(f"http://front.disc-22-client.svc:8080/front/users/{n % 50 + 1}", timeout=15) as r:
+            r.read()
+            ok += r.status == 200
+    except Exception:
+        pass
+    time.sleep(0.1)
+print(ok)
+PY
+churn_pid=$!
+PIDS+=("$churn_pid")
+sleep 20
+kubectl -n disc-22 rollout restart deploy/users >/dev/null
+kubectl -n disc-22 rollout status deploy/users --timeout=3m >/dev/null || fail "ctl_21: users did not roll out"
+controller_gone=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller -o jsonpath='{.items[0].metadata.name}')
+kubectl -n "$NS" delete pod "$controller_gone" --wait=false >/dev/null || fail "ctl_21: cannot delete controller pod $controller_gone"
+wait "$churn_pid" || fail "ctl_21: the client of the churn failed"
+churn_ok=$(cat "$WORK/churn.out")
+[[ $churn_ok =~ ^[0-9]+$ ]] && (( churn_ok > 100 )) || fail "ctl_21: the churn client got '$churn_ok' 200s"
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m >/dev/null || fail "ctl_21: the controller did not recover"
+ui_forward
+want_get=$((want_get + churn_ok))
+wait_merged "$want_get" "$want_put" 150 \
+  || { echo "ctl_21: merged GET $(merged_count GET), expected $want_get (client 200s: $churn_ok)" >&2; fail "ctl_21: the merged count is not the number of 200s the client received"; }
+[[ $(merged_templates) == "$(cat "$WORK/templates-first.txt")" ]] \
+  || fail "ctl_21: the endpoints changed during the churn: $(merged_templates | tr '\n' ';')"
 kubectl delete namespace disc-22 disc-22-client --wait=false >/dev/null
 
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"

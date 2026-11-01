@@ -434,23 +434,24 @@ async fn ctl_15_posts_ordered_reports_with_one_session_and_the_current_token() {
     // After a 200, the report holds only what was recorded since.
     assert_eq!(rig.discovery.report().exchanges(), 0);
 
-    let seen = rig.api.seen.lock().unwrap();
-    let first = seen[0].session();
-    assert_eq!(first.len(), 32);
-    assert!(
-        first
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    );
-    for (i, s) in seen.iter().enumerate() {
-        assert_eq!(s.path, "/v1/workloads/pay/report");
-        assert_eq!(s.session(), first);
-        assert_eq!(s.sequence(), i as u64 + 1);
-        assert!(s.report().exchanges() > 0);
+    {
+        let seen = rig.api.seen.lock().unwrap();
+        let first = seen[0].session();
+        assert_eq!(first.len(), 32);
+        assert!(
+            first
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        for (i, s) in seen.iter().enumerate() {
+            assert_eq!(s.path, "/v1/workloads/pay/report");
+            assert_eq!(s.session(), first);
+            assert_eq!(s.sequence(), i as u64 + 1);
+            assert!(s.report().exchanges() > 0);
+        }
+        assert_eq!(seen[0].authorization, format!("Bearer {TOKEN}"));
+        assert_eq!(seen.last().unwrap().authorization, "Bearer rotated-token");
     }
-    assert_eq!(seen[0].authorization, format!("Bearer {TOKEN}"));
-    assert_eq!(seen.last().unwrap().authorization, "Bearer rotated-token");
-    drop(seen);
     drop(stop);
     task.await.unwrap();
 }

@@ -25,6 +25,11 @@ impl Budget {
         }
     }
 
+    /// Nothing is captured or queued: the recorder has seen every exchange handed to it.
+    pub(super) fn idle(&self) -> bool {
+        self.used.load(Ordering::Acquire) == 0
+    }
+
     fn try_add(&self, n: usize) -> bool {
         self.used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {

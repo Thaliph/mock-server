@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -12,6 +13,7 @@ use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::{Direction, Exchange, Limits, Outcome, Report, Sampled};
 
+use super::Handoff;
 use super::capture::{Part, Record};
 use super::decode;
 use super::metrics::DiscoveryMetrics;
@@ -29,6 +31,9 @@ pub(super) struct Recorder {
     pub(super) limits: Limits,
     pub(super) redactor: Redactor,
     pub(super) metrics: DiscoveryMetrics,
+    /// What the shipper hands over: sample bytes of the pending report, and the freezes.
+    handoff: Arc<Handoff>,
+    epoch: u64,
     /// Endpoints of the report as of the last change of its shape.
     known: BTreeSet<Key>,
     sample_budget_full: bool,
@@ -185,12 +190,15 @@ impl Recorder {
         limits: Limits,
         redactor: Redactor,
         metrics: DiscoveryMetrics,
+        handoff: Arc<Handoff>,
     ) -> Recorder {
         Recorder {
             report,
             limits,
             redactor,
             metrics,
+            handoff,
+            epoch: 0,
             known: BTreeSet::new(),
             sample_budget_full: false,
             endpoint_limit_logged: false,
@@ -263,9 +271,19 @@ impl Recorder {
                     .and_then(|(_, bytes)| bytes.as_deref()),
             },
         };
-        let (outcome, endpoints, sample_bytes) = {
+        let (outcome, endpoints, sample_bytes, limits, epoch) = {
             let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
-            let outcome = report.record(&self.limits, &self.redactor, &exchange);
+            // Read under the lock, where the shipper writes them: the pending report's samples
+            // share the budget.
+            let epoch = self.handoff.epoch.load(Ordering::Acquire);
+            let limits = Limits {
+                sample_budget: self
+                    .limits
+                    .sample_budget
+                    .saturating_sub(self.handoff.pending_samples.load(Ordering::Acquire)),
+                ..self.limits
+            };
+            let outcome = report.record(&limits, &self.redactor, &exchange);
             let new_endpoint = matches!(
                 outcome,
                 Outcome::Recorded {
@@ -280,8 +298,9 @@ impl Recorder {
                     .map(|e| (e.direction, e.port, e.method.to_string(), e.template))
                     .collect::<BTreeSet<Key>>()
             });
-            (outcome, endpoints, report.sample_bytes())
+            (outcome, endpoints, report.sample_bytes(), limits, epoch)
         };
+        self.restart_shape(epoch);
         match outcome {
             Outcome::Invalid => self.metrics.exchange(direction, "invalid"),
             Outcome::NotFound => self.metrics.exchange(direction, "not_found"),
@@ -309,7 +328,7 @@ impl Recorder {
                     request_body.as_ref().and_then(|(_, b)| b.as_deref()),
                     response_body.as_ref().and_then(|(_, b)| b.as_deref()),
                 );
-                self.samples(direction, sample, sample_bytes);
+                self.samples(direction, sample, sample_bytes, limits.sample_budget);
                 if let Some(endpoints) = endpoints {
                     self.shape_changed(record, &request, endpoints);
                 }
@@ -321,9 +340,15 @@ impl Recorder {
         self.sample_bytes = sample_bytes;
     }
 
-    fn samples(&mut self, direction: &'static str, sample: Sampled, sample_bytes: usize) {
+    fn samples(
+        &mut self,
+        direction: &'static str,
+        sample: Sampled,
+        sample_bytes: usize,
+        sample_budget: usize,
+    ) {
         // A rejection says nothing about room: only an exchange that was not rejected re-arms.
-        if sample != Sampled::Budget && rearmed(sample_bytes, self.limits.sample_budget) {
+        if sample != Sampled::Budget && rearmed(sample_bytes, sample_budget) {
             self.sample_budget_full = false;
         }
         match sample {
@@ -335,13 +360,28 @@ impl Recorder {
                     tracing::warn!(
                         target: "discovery",
                         direction,
-                        sample_budget = self.limits.sample_budget,
+                        sample_budget,
                         "sample budget full"
                     );
                 }
             }
             Sampled::None => {}
         }
+    }
+
+    /// The shipper froze the report since the last exchange: the tree starts anew, so the
+    /// shape known so far (and its gauges) is not the report's any more.
+    fn restart_shape(&mut self, epoch: u64) {
+        if epoch == self.epoch {
+            return;
+        }
+        self.epoch = epoch;
+        for d in [Direction::Inbound, Direction::Outbound] {
+            if self.known.iter().any(|(k, ..)| *k == d) {
+                self.metrics.set_endpoints(label(d), 0);
+            }
+        }
+        self.known.clear();
     }
 
     /// A new endpoint was recorded: the template tree changed, and may have absorbed a node.
@@ -452,6 +492,7 @@ mod tests {
             },
             Redactor::default(),
             metrics.clone(),
+            Arc::default(),
         )
     }
 
