@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::check::Violation;
-use super::redact::Redactor;
+use super::redact::{MARKER, Redactor};
 use super::template::{is_rfc3339, is_uuid};
 
 /// Levels described; a value deeper than this is `{}` (the root is level 1).
@@ -260,6 +260,32 @@ impl Schema {
         let mut s = Self::infer_at(value, 1);
         s.fit(MAX_LEVEL);
         s
+    }
+
+    /// The schema of the marker: what a value under a redacted name is recorded as.
+    fn marker() -> Self {
+        Self::infer(&Value::String(MARKER.to_string()))
+    }
+
+    /// Replaces what sits under a redacted property name by the schema of the marker, as the
+    /// recorder does (spec §7.3, re-redaction).
+    pub(super) fn redact_names(&mut self, redactor: &Redactor) {
+        if let Some(items) = &mut self.items {
+            items.redact_names(redactor);
+        }
+        let Some(object) = &mut self.object else {
+            return;
+        };
+        for (name, schema) in &mut object.props {
+            if redactor.name_matches(name) {
+                *schema = Self::marker();
+            } else {
+                schema.redact_names(redactor);
+            }
+        }
+        if let Some(map) = &mut object.map {
+            map.redact_names(redactor);
+        }
     }
 
     /// Cuts the schema at the deepest level, at most `max`, where it has at most
@@ -589,6 +615,15 @@ pub fn kept_headers<'a>(headers: &[(&'a str, &'a str)]) -> Vec<(String, &'a str)
 }
 
 impl Params {
+    /// Gives a key under a redacted name the schema of the marker.
+    pub(super) fn redact_names(&mut self, redactor: &Redactor) {
+        for (name, param) in &mut self.keys {
+            if redactor.name_matches(name) {
+                param.schema = Schema::marker();
+            }
+        }
+    }
+
     /// A query string or an `application/x-www-form-urlencoded` body.
     pub fn from_query(redactor: &Redactor, query: &str) -> Self {
         Self::from_pairs(&query_pairs(redactor, query))
