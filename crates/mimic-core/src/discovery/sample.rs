@@ -164,6 +164,11 @@ impl Samples {
         self.0.values().map(Sample::bytes).sum()
     }
 
+    /// Keeps the samples whose hash `keep` accepts.
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(u64) -> bool) {
+        self.0.retain(|hash, _| keep(*hash));
+    }
+
     pub(super) fn single(hash: u64, sample: Sample) -> Self {
         Samples(BTreeMap::from([(hash, sample)]))
     }

@@ -503,18 +503,34 @@ pub(super) fn query_pairs(redactor: &Redactor, query: &str) -> Vec<Pair> {
 
 /// The pairs of a header list: names in lower case, skipped names absent, values redacted.
 pub(super) fn header_pairs(redactor: &Redactor, headers: &[(&str, &str)]) -> Vec<Pair> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let key = name.to_ascii_lowercase();
-            if key.starts_with(':') || SKIPPED_HEADERS.contains(&key.as_str()) {
-                return None;
-            }
-            let value = redactor.header(&key, value);
-            let key = cut_name(&key).to_string();
-            Some(Pair { key, value })
+    kept_headers(headers)
+        .into_iter()
+        .map(|(key, value)| Pair {
+            value: redactor.header(&key, value),
+            key: cut_name(&key).to_string(),
         })
         .collect()
+}
+
+/// The headers a report keeps, in arrival order, with lower-case names: the skipped names and
+/// pseudo-headers are absent, and only those of the first `MAX_PARAMS` names (cut to 128
+/// bytes) in byte order are left. What is counted or redacted must be limited to these.
+pub fn kept_headers<'a>(headers: &[(&'a str, &'a str)]) -> Vec<(String, &'a str)> {
+    let mut kept: Vec<(String, &'a str)> = headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), *value))
+        .filter(|(key, _)| !key.starts_with(':') && !SKIPPED_HEADERS.contains(&key.as_str()))
+        .collect();
+    let names: BTreeSet<&str> = kept.iter().map(|(key, _)| cut_name(key)).collect();
+    if names.len() > MAX_PARAMS {
+        let first: BTreeSet<String> = names
+            .into_iter()
+            .take(MAX_PARAMS)
+            .map(str::to_string)
+            .collect();
+        kept.retain(|(key, _)| first.contains(cut_name(key)));
+    }
+    kept
 }
 
 impl Params {
@@ -556,11 +572,11 @@ impl Params {
     }
 
     pub fn merge(mut self, other: Self) -> Self {
-        self.exchanges += other.exchanges;
+        self.exchanges = self.exchanges.saturating_add(other.exchanges);
         for (k, p) in other.keys {
             let merged = match self.keys.remove(&k) {
                 Some(mine) => Param {
-                    count: mine.count + p.count,
+                    count: mine.count.saturating_add(p.count),
                     array: mine.array || p.array,
                     schema: mine.schema.merge(p.schema),
                 },

@@ -382,8 +382,25 @@ pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
-    socket.listen(1024)?;
+    socket.listen(backlog())?;
     TcpListener::from_std(socket.into())
+}
+
+/// The accept queue length for the content of `/proc/sys/net/core/somaxconn`: its value when
+/// it is a positive number, else 1024.
+fn backlog_from(somaxconn: Option<&str>) -> i32 {
+    somaxconn
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .map_or(1024, |n| i32::try_from(n).unwrap_or(i32::MAX))
+}
+
+fn backlog() -> i32 {
+    backlog_from(
+        std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Binds every address, skipping IPv6 ones when the pod has no IPv6. Returns the listeners
@@ -489,6 +506,21 @@ pub async fn accept_loop(
                     () = tokio::time::sleep(ACCEPT_RETRY) => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::backlog_from;
+
+    #[test]
+    fn dsc_16_backlog_follows_somaxconn_when_readable() {
+        assert_eq!(backlog_from(Some("4096\n")), 4096);
+        assert_eq!(backlog_from(Some("128")), 128);
+        assert_eq!(backlog_from(Some("4294967295")), i32::MAX);
+        for bad in [None, Some(""), Some("many"), Some("0"), Some("-1")] {
+            assert_eq!(backlog_from(bad), 1024, "{bad:?}");
         }
     }
 }

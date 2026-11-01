@@ -94,9 +94,15 @@ impl WorkloadCache {
     }
 
     /// `spec.discovery.redact` of every `MimicWorkload` of `namespace` naming `deployment`: the
-    /// sorted, deduplicated union (spec §7).
+    /// sorted, deduplicated union, lower-cased (spec §7): the CRD accepts any case, the sidecar
+    /// compares names in lower case.
     pub fn redact(&self, namespace: &str, deployment: &str) -> Vec<String> {
         self.union(namespace, deployment, |(_, _, redact)| redact)
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     fn union(
@@ -323,6 +329,18 @@ mod tests {
         assert!(cache.redact("shop", "none").is_empty());
         cache.remove("shop", "w2");
         assert_eq!(cache.redact("shop", "api"), ["pin", "x-tenant-key"]);
+    }
+
+    #[test]
+    fn dsc_20_redactions_are_lower_cased() {
+        let cache = WorkloadCache::synced_with_settings(&[
+            ("shop", "w1", "api", &[], &["X-Tenant-Key", "Pin"]),
+            ("shop", "w2", "api", &[], &["pin", "BADGE"]),
+        ]);
+        assert_eq!(
+            cache.redact("shop", "api"),
+            ["badge", "pin", "x-tenant-key"]
+        );
     }
 
     #[test]
