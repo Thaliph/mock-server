@@ -16,6 +16,9 @@ API discovery and dependency mocking for Kubernetes workloads, without touching 
 
 Requirements: Kubernetes ≥ 1.33, Helm 3.8+ (OCI support).
 
+Injected apps must exit on `SIGTERM`: the sidecar ships its last discovery report only in the
+part of the grace period the app leaves it (a loss is logged as `report not shipped`).
+
 ```bash
 helm install mimic oci://ghcr.io/thaliph/charts/mimic -n mimic-system --create-namespace
 kubectl -n mimic-system port-forward svc/mimic-controller 8081:8081 &
