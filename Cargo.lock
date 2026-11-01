@@ -1744,9 +1744,11 @@ dependencies = [
  "base64 0.23.1",
  "json-patch",
  "k8s-openapi",
+ "percent-encoding",
  "proptest",
  "serde",
  "serde_json",
+ "xxhash-rust",
 ]
 
 [[package]]

@@ -9,8 +9,10 @@ publish.workspace = true
 [dependencies]
 base64 = "0.23.1"
 k8s-openapi = { version = "0.28.0", features = ["v1_33"] }
+percent-encoding = "2.3.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 [lints]
 workspace = true

@@ -429,6 +429,7 @@ Everything below except the capture tap, content decoding and the recorder threa
   the body opaque. A body over **256 KiB** (encoded, or decoded) is not parsed (`too_large`):
   it contributes its media type and size only. Schemas are inferred from the original values
   in memory; they hold types and formats, never values.
+  Schemas and volatility are inferred from the redacted values (a redacted subtree is a `string`); the JSON root is level 1, `+` in a query or form is a space, a repeated header is an `array` like a repeated query key, and at most 16 media types are kept per side.
 - **Volatile fields** (values that change on every call: idempotency keys, timestamps, ids).
   Tracked per endpoint for query keys, headers and JSON/form body leaves (JSON pointer with
   array indices as `*`, e.g. `/items/*/id`), at most 128 fields (the first in byte order): `n`

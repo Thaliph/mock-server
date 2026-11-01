@@ -29,7 +29,7 @@ pub fn is_param(segment: &str) -> bool {
         || b.contains(&b'@')
 }
 
-fn is_uuid(b: &[u8]) -> bool {
+pub(super) fn is_uuid(b: &[u8]) -> bool {
     b.len() == 36
         && b.iter().enumerate().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => *c == b'-',
@@ -53,7 +53,7 @@ fn digits(b: &[u8]) -> Option<u32> {
 }
 
 /// `YYYY-MM-DD`, optionally followed by `T` and an RFC 3339 time with an offset.
-fn is_rfc3339(b: &[u8]) -> bool {
+pub(super) fn is_rfc3339(b: &[u8]) -> bool {
     if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
         return false;
     }
