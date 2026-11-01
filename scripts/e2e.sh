@@ -1413,8 +1413,8 @@ wait_status '.endpoints.inbound == 2 and .pods == 2 and (.lastPushTime | test("^
   || fail "ctl_20: the status of users-a and users-b is not endpoints.inbound 2, pods 2 with a lastPushTime: $(kubectl -n disc-22 get mimicworkload -o jsonpath='{.items[*].status}')"
 status_row=$(kubectl -n disc-22 get mimicworkload users-a --no-headers) || fail "ctl_19: cannot print users-a"
 read -r -a row <<< "$status_row"
-[[ ${row[1]} == discovery && ${row[2]} == 2 && ${row[3]} == 2 && ${row[4]} == *Z ]] \
-  || fail "ctl_20: kubectl get mimicworkload prints '$status_row', want Mode discovery, Endpoints 2, Pods 2 and a Last push"
+[[ ${row[1]} == discovery && ${row[2]} == 2 && ${row[3]} == 2 && ${row[4]} =~ ^[0-9]+[smhd]([0-9]+[smhd])?$ ]] \
+  || fail "ctl_20: kubectl get mimicworkload prints '$status_row', want Mode discovery, Endpoints 2, Pods 2 and a Last push age"
 header=$(kubectl -n disc-22 get mimicworkload users-a | head -n 1)
 [[ $header == *"MODE"*"ENDPOINTS"*"PODS"*"LAST PUSH"* ]] || fail "ctl_19: the printed columns are '$header'"
 kubectl -n disc-22 get mimicworkload users-a -o json --show-managed-fields \
