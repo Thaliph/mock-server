@@ -1,9 +1,9 @@
 name: release
 
 # On a v* tag: multi-arch images (mimic and mimic-init), native amd64 and arm64 runners, each
-# signed with cosign keyless, with SBOM and provenance; then the Helm chart, pinned to the mimic
-# image digest, pushed as an OCI artifact and signed (spec §10, FND-10, INJ-17). Everything lands
-# on ghcr.io, free for a public repository.
+# signed with cosign keyless, with SBOM and provenance; then the Helm chart, pinned to the digests of
+# mimic and mimic-init (#271), pushed as an OCI artifact and signed (spec §10, FND-10, INJ-17). A tag
+# that is not on main is refused first (#272). Everything lands on ghcr.io, free for a public repository.
 
 on:
   push:
