@@ -12,7 +12,7 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap as RequestHeaders, StatusCode, header};
 use axum::routing::get;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_runtime::config::{ConfigError, Env};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -22,6 +22,8 @@ use tokio::net::TcpStream;
 
 const PROBES_VAR: &str = "MIMIC_APP_PROBES";
 const POD_IP_VAR: &str = "MIMIC_POD_IP";
+/// Largest `Health/Check` response read: the real one is a few bytes.
+const MAX_GRPC_RESPONSE: usize = 64 * 1024;
 const KINDS: [&str; 3] = ["livez", "readyz", "startupz"];
 /// Kubernetes' default `timeoutSeconds`.
 const DEFAULT_TIMEOUT_SECONDS: u64 = 1;
@@ -300,7 +302,11 @@ async fn health_check(
     let mut frame = vec![0u8];
     frame.extend_from_slice(&u32::try_from(message.len())?.to_be_bytes());
     frame.extend(message);
-    let request = hyper::Request::post(format!("http://{host}:{port}/grpc.health.v1.Health/Check"))
+    let authority = match host.parse::<Ipv6Addr>() {
+        Ok(_) => format!("[{host}]:{port}"),
+        Err(_) => format!("{host}:{port}"),
+    };
+    let request = hyper::Request::post(format!("http://{authority}/grpc.health.v1.Health/Check"))
         .header(header::CONTENT_TYPE, "application/grpc")
         .header("te", "trailers")
         .body(Full::new(hyper::body::Bytes::from(frame)))?;
@@ -313,7 +319,10 @@ async fn health_check(
     if head.status != StatusCode::OK || !is_grpc {
         return Ok(false);
     }
-    let collected = body.collect().await?;
+    let collected = Limited::new(body, MAX_GRPC_RESPONSE)
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?;
     let trailers = collected.trailers().cloned();
     let grpc_status = trailers
         .as_ref()
