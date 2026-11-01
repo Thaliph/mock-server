@@ -938,7 +938,7 @@ CURL_BASE=$(scripts/pinned-image.sh e2e-curl)
 PY_SLIM=$(scripts/pinned-image.sh e2e-python)
 NODE_SLIM=$(scripts/pinned-image.sh e2e-node)
 JDK=$(scripts/pinned-image.sh e2e-jdk)
-derive curl "$CURL_BASE"'cat /usr/local/share/ca-certificates/mimic-e2e.crt >> /etc/ssl/certs/ca-certificates.crt'
+derive curl "$CURL_BASE" 'cat /usr/local/share/ca-certificates/mimic-e2e.crt >> /etc/ssl/certs/ca-certificates.crt'
 derive python "$PY_SLIM" 'update-ca-certificates && pip install --no-cache-dir requests==2.32.5'
 derive node "$NODE_SLIM" 'apt-get update && apt-get install -y --no-install-recommends ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*' \
   'NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/mimic-e2e.crt'
