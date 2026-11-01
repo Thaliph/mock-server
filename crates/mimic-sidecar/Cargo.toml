@@ -11,6 +11,7 @@ axum = "0.8.9"
 base64 = "0.23.1"
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 h2 = "0.4.20"
+http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["server", "client", "http2"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 mimic-core = { version = "0.1.0", path = "../mimic-core" }
@@ -35,7 +36,6 @@ workspace = true
 
 [dev-dependencies]
 futures = "0.3.34"
-http-body-util = "0.1.5"
 mimic-runtime = { path = "../mimic-runtime", features = ["testing"] }
 tempfile = "3.27.0"
 time = "0.3.55"
