@@ -19,8 +19,8 @@ INIT_IMAGE=${INIT_IMAGE:-ghcr.io/thaliph/mimic-init:$TAG}
 CLUSTER=${CLUSTER:-mimic-e2e}
 NS=mimic-system
 RELEASE=mimic
-# Application image for the scenarios: Python with a shell (pinned by digest).
-PY=docker.io/library/python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8
+# Application image for the scenarios: Python with a shell. Pinned in images/Dockerfile (#273).
+PY=$(scripts/pinned-image.sh e2e-app)
 KEEP_CLUSTER=${KEEP_CLUSTER:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)}
 BUILT=0
 PIDS=()
@@ -946,11 +946,11 @@ dest_deploy tls-untrusted
 kubectl -n tls-dest rollout status deploy/tls-dest --timeout=2m >/dev/null || fail "tls_25: tls-dest did not roll out"
 kubectl -n tls-dest rollout status deploy/tls-untrusted --timeout=2m >/dev/null || fail "tls_25: tls-untrusted did not roll out"
 
-# The pinned base images (digests as in the CI image checks), with the e2e CA in their trust store.
-CURL_BASE=curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69
-PY_SLIM=python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
-NODE_SLIM=node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
-JDK=eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a
+# The pinned base images (images/Dockerfile, #273), with the e2e CA in their trust store.
+CURL_BASE=$(scripts/pinned-image.sh e2e-curl)
+PY_SLIM=$(scripts/pinned-image.sh e2e-python)
+NODE_SLIM=$(scripts/pinned-image.sh e2e-node)
+JDK=$(scripts/pinned-image.sh e2e-jdk)
 derive curl "$CURL_BASE" 'cat /usr/local/share/ca-certificates/mimic-e2e.crt >> /etc/ssl/certs/ca-certificates.crt'
 derive python "$PY_SLIM" 'update-ca-certificates && pip install --no-cache-dir requests==2.32.5'
 derive node "$NODE_SLIM" 'apt-get update && apt-get install -y --no-install-recommends ca-certificates && update-ca-certificates && rm -rf /var/lib/apt/lists/*' \
