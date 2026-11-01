@@ -26,6 +26,7 @@ pub enum Violation {
     MediaTypes,
     BodySize,
     BodyMedia,
+    SampleBytes,
 }
 
 impl Violation {
@@ -52,6 +53,7 @@ impl Violation {
             Self::MediaTypes => "media_types",
             Self::BodySize => "body_size",
             Self::BodyMedia => "body_media",
+            Self::SampleBytes => "sample_bytes",
         }
     }
 

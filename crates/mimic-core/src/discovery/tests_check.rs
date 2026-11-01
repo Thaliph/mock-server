@@ -102,6 +102,15 @@ fn sample(v: &mut Value) -> &mut Value {
     &mut samples[&key]
 }
 
+/// Sets a sample's `bytes` to the size of its content, as the recorder does.
+fn refit(sample: &mut Value) {
+    sample["bytes"] = json!(0);
+    let head = sample["head_ms"].take();
+    sample["head_ms"] = json!(0);
+    sample["bytes"] = json!(sample.to_string().len());
+    sample["head_ms"] = head;
+}
+
 fn literal_chain(depth: usize, leaf: &str) -> Value {
     let mut node = json!({"literals": {}, "param": null, "absorbing": false,
         "endpoints": {"GET": valid_endpoint()}});
@@ -386,6 +395,7 @@ fn ctl_01_accepts_the_bounds_exactly() {
             "body of MAX_BODY bytes",
             Box::new(|v| {
                 sample(v)["response"]["body"]["value"] = json!("x".repeat(MAX_BODY - 2));
+                refit(sample(v));
             }),
         ),
     ];
@@ -476,6 +486,7 @@ fn ctl_01_reasons_are_fixed_and_distinct() {
         Violation::MediaTypes,
         Violation::BodySize,
         Violation::BodyMedia,
+        Violation::SampleBytes,
     ];
     let reasons: std::collections::BTreeSet<_> = all.iter().map(|v| v.reason()).collect();
     assert_eq!(reasons.len(), all.len());
@@ -667,4 +678,18 @@ proptest! {
         }
         let _ = Report::parse_checked(&String::from_utf8_lossy(&bytes), PUSH);
     }
+}
+
+#[test]
+fn ctl_01_rejects_forged_sample_bytes() {
+    for forged in [json!(0), json!(1), json!(u64::MAX), json!(u64::MAX - 1)] {
+        let mut v = valid();
+        sample(&mut v)["bytes"] = forged.clone();
+        let err = verdict(&v).expect_err("forged bytes");
+        assert_eq!(err.reason(), "sample_bytes", "{forged}");
+    }
+    // The recorder's value, and a refit one, are accepted.
+    let mut v = valid();
+    refit(sample(&mut v));
+    assert_eq!(verdict(&v), Ok(()));
 }

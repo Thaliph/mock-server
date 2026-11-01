@@ -857,6 +857,10 @@ Everything below except the capture tap, content decoding and the recorder threa
     A template's length counts each literal segment's bytes plus its `/`, and a parameter as
     its `/` alone (the rendered `{name}` can be longer than the raw path); the `{}` that marks
     a schema's cut level is not a level.
+    A sample's `bytes` (what `MIMIC_STORE_SAMPLE_BUDGET` counts) is taken from the wire and
+    verified: it must equal the serialised size of the sample with `bytes` and `head_ms` at 0
+    (reason `sample_bytes`), so a forged value cannot hide samples from the budget; byte sums
+    saturate.
     Any other violation is `400` with its `reason`.
   - *Re-redaction* (pure, idempotent): the §6 redaction applied again to every sample, host,
     concrete path and volatile field with the built-in rules and the union of

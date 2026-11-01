@@ -158,7 +158,15 @@ fn class(sample: &Sample) -> u16 {
 fn victim(held: &BTreeMap<Pair, Held>) -> Option<(Pair, u64)> {
     held.iter()
         .filter(|(_, samples)| samples.len() >= 2)
-        .max_by_key(|(pair, samples)| (samples.len(), samples.values().sum::<usize>(), *pair))
+        .max_by_key(|(pair, samples)| {
+            (
+                samples.len(),
+                samples
+                    .values()
+                    .fold(0, |n, b| usize::saturating_add(n, *b)),
+                *pair,
+            )
+        })
         .and_then(|(pair, samples)| Some((pair.clone(), *samples.keys().next_back()?)))
 }
 
@@ -194,7 +202,7 @@ fn limit_samples(
             .collect();
         for (hash, bytes, class, is_stored) in all {
             if is_stored {
-                total += bytes;
+                total = total.saturating_add(bytes);
                 held.entry((key.clone(), class))
                     .or_default()
                     .insert(hash, bytes);
@@ -210,7 +218,7 @@ fn limit_samples(
             break;
         };
         if let Some(bytes) = held.get_mut(&pair).and_then(|h| h.remove(&hash)) {
-            total -= bytes;
+            total = total.saturating_sub(bytes);
         }
         dropped.push((pair, hash));
     }
@@ -220,20 +228,20 @@ fn limit_samples(
     for (pair, hash, sample) in added {
         let bytes = sample.bytes();
         let mut undo: Vec<(Pair, u64, usize)> = Vec::new();
-        let mut room = total + bytes <= budget;
+        let mut room = total.saturating_add(bytes) <= budget;
         if !room && held.get(&pair).is_none_or(Held::is_empty) {
             let mut free = total;
-            while free + bytes > budget {
+            while free.saturating_add(bytes) > budget {
                 let Some((from, evict)) = victim(&held) else {
                     break;
                 };
                 let Some(freed) = held.get_mut(&from).and_then(|h| h.remove(&evict)) else {
                     break;
                 };
-                free -= freed;
+                free = free.saturating_sub(freed);
                 undo.push((from, evict, freed));
             }
-            room = free + bytes <= budget;
+            room = free.saturating_add(bytes) <= budget;
             if room {
                 total = free;
             } else {
@@ -247,7 +255,7 @@ fn limit_samples(
             continue;
         }
         dropped.extend(undo.into_iter().map(|(from, evict, _)| (from, evict)));
-        total += bytes;
+        total = total.saturating_add(bytes);
         held.entry(pair.clone()).or_default().insert(hash, bytes);
         admitted.insert((pair, hash), sample);
     }

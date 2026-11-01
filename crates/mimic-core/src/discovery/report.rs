@@ -637,7 +637,7 @@ impl Report {
     /// Bytes of the samples held (what `MIMIC_DISCOVERY_SAMPLE_BUDGET` limits).
     pub fn sample_bytes(&self) -> usize {
         let mut n = 0;
-        self.for_each_stats(|s| n += s.samples.bytes());
+        self.for_each_stats(|s| n = usize::saturating_add(n, s.samples.bytes()));
         n
     }
 
@@ -690,7 +690,8 @@ impl Report {
                 .record_parsed(redactor, &exchange.observation);
             let (hash, sample) = Sample::new(redactor, exchange, request, response);
             let present = known.is_some_and(|k| k.samples.contains(hash));
-            if present || self.sample_bytes() + sample.bytes() <= limits.sample_budget {
+            if present || self.sample_bytes().saturating_add(sample.bytes()) <= limits.sample_budget
+            {
                 stats.samples = Samples::single(hash, sample);
                 sampled = Sampled::Admitted;
             } else {

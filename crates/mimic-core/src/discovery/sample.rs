@@ -191,6 +191,16 @@ impl Sample {
                 return Err(Violation::BodySize);
             }
         }
+        // `bytes` is what the sample budget counts: it must be the size of the content.
+        let total = serde_json::to_vec(self).map_or(usize::MAX, |v| v.len());
+        let digits = |n: String| n.len();
+        let content = total
+            .saturating_sub(digits(self.bytes.to_string()))
+            .saturating_sub(digits(self.head_ms.to_string()))
+            .saturating_add(2);
+        if content != self.bytes {
+            return Err(Violation::SampleBytes);
+        }
         Ok(())
     }
 
@@ -324,7 +334,9 @@ impl Samples {
 
     /// Serialised size of the samples.
     pub fn bytes(&self) -> usize {
-        self.0.values().map(Sample::bytes).sum()
+        self.0
+            .values()
+            .fold(0, |n, s| usize::saturating_add(n, s.bytes()))
     }
 
     /// Sets `last_seen` on every sample.
