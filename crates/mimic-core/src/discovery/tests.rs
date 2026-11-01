@@ -336,3 +336,187 @@ fn dsc_09_hosts_capped() {
     let kept: Vec<_> = r.endpoints()[0].stats.hosts.iter().cloned().collect();
     assert_eq!(kept, hosts[..16]);
 }
+
+mod redaction {
+    use super::super::redact::{MARKER, Redactor, path, value_rule};
+    use super::super::template::is_param;
+    use serde_json::json;
+
+    const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln";
+
+    fn r() -> Redactor {
+        Redactor::new(["x-tenant-key", "PIN"])
+    }
+
+    #[test]
+    fn dsc_05_built_in_names_and_variants() {
+        let r = r();
+        let names = [
+            "authorization",
+            "Proxy-Authorization",
+            "cookie",
+            "Set-Cookie",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "apikey",
+            "auth",
+            "session",
+            "signature",
+            "credential",
+            "privatekey",
+            "cvv",
+            "cvc",
+            "cardnumber",
+            "pan",
+            "iban",
+            "ssn",
+            "X-Api-Key",
+            "client_secret",
+            "refreshToken",
+            "Session-Id",
+            "x-tenant-key",
+            "pin",
+            "X_TENANT-KEY",
+        ];
+        for n in names {
+            assert!(r.name_matches(n), "{n} should be redacted");
+        }
+        for n in ["id", "name", "amount", "email", "items"] {
+            assert!(!r.name_matches(n), "{n} should be kept");
+        }
+        // A blank extra name must not match everything.
+        assert!(!Redactor::new(["", "-_"]).name_matches("id"));
+    }
+
+    #[test]
+    fn dsc_05_headers_queries_forms() {
+        let r = r();
+        assert_eq!(r.header("X-Api-Key", "abc"), MARKER);
+        assert_eq!(r.header("Authorization", "Bearer x"), "Bearer <redacted>");
+        assert_eq!(r.header("Authorization", "x"), MARKER);
+        assert_eq!(
+            r.header("Proxy-Authorization", "Basic eDp5"),
+            "Basic <redacted>"
+        );
+        assert_eq!(r.header("Cookie", "a=1; b=2"), "a=<redacted>; b=<redacted>");
+        assert_eq!(
+            r.header("Set-Cookie", "s=1; Path=/; HttpOnly"),
+            "s=<redacted>; Path=/; HttpOnly"
+        );
+        assert_eq!(r.header("x-custom", "plain"), "plain");
+        assert_eq!(r.field("token", "abc"), MARKER);
+        assert_eq!(r.field("refreshToken", "abc"), MARKER);
+        assert_eq!(r.field("page", "2"), "2");
+    }
+
+    #[test]
+    fn dsc_05_json_keys_nested_and_subtrees() {
+        let r = r();
+        let mut v = json!({
+            "id": 1,
+            "name": "n",
+            "amount": 5,
+            "password": "p",
+            "user": {"client_secret": {"a": [1, 2]}, "ok": true},
+            "list": [{"refreshToken": [1, 2, 3], "id": 2}],
+        });
+        r.json(&mut v);
+        assert_eq!(
+            v,
+            json!({
+                "id": 1,
+                "name": "n",
+                "amount": 5,
+                "password": MARKER,
+                "user": {"client_secret": MARKER, "ok": true},
+                "list": [{"refreshToken": MARKER, "id": 2}],
+            })
+        );
+    }
+
+    #[test]
+    fn dsc_06_values() {
+        let secrets = [
+            JWT,
+            "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----",
+            "Bearer abc.def",
+            "Basic dTpw",
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "4111111111111111",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ASIAIOSFODNN7EXAMPLE",
+            "ghp_abc123",
+            "gho_abc123",
+            "ghu_abc123",
+            "ghs_abc123",
+            "ghr_abc123",
+            "github_pat_abc123",
+            "glpat-abc123",
+            "xoxb-1-2",
+            "xoxa-1-2",
+            "xoxp-1-2",
+            "xoxr-1-2",
+            "xoxs-1-2",
+            "sk_live_abc",
+            "rk_live_abc",
+            "sk-abc123",
+            "https://u:p@h/",
+        ];
+        let r = r();
+        for s in secrets {
+            assert!(value_rule(s).is_some(), "{s:?} should be detected");
+            assert_eq!(r.header("x-custom", s), MARKER, "header {s:?}");
+            assert_eq!(r.field("q", s), MARKER, "query {s:?}");
+            let mut v = json!({ "k": s });
+            r.json(&mut v);
+            assert_eq!(v, json!({ "k": MARKER }), "json {s:?}");
+            if !s.contains(['/', '\n']) {
+                assert_eq!(path(&format!("/a/{s}")), "/a/<redacted>", "path {s:?}");
+            }
+        }
+        let near = [
+            "4111111111111112",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0",
+            "e30.e30.c2ln",
+            "AKIAIOSFODNN7EXAMPL",
+            "https://u@h/",
+            "https://h/path",
+            "hello",
+            "12345",
+        ];
+        for s in near {
+            assert!(value_rule(s).is_none(), "{s:?} should be kept");
+            assert_eq!(r.header("x-custom", s), s);
+        }
+        // A card as a JSON number.
+        let mut v = json!({"n": 4111111111111111u64, "m": 4111111111111112u64});
+        r.json(&mut v);
+        assert_eq!(v, json!({"n": MARKER, "m": 4111111111111112u64}));
+    }
+
+    #[test]
+    fn dsc_06_redacted_segment_is_a_parameter_and_marker_is_constant() {
+        for s in [
+            JWT,
+            "4111-1111-1111-1111",
+            "ghp_abc",
+            "AKIAIOSFODNN7EXAMPLE",
+        ] {
+            assert!(is_param(s), "{s}");
+        }
+        assert_eq!(path("/reset/ghp_a"), path("/reset/ghp_b"));
+        assert_eq!(path("/reset/ghp_a"), "/reset/<redacted>");
+    }
+
+    #[test]
+    fn dsc_21_path_segment_by_segment() {
+        assert_eq!(path(&format!("/reset/{JWT}")), "/reset/<redacted>");
+        assert_eq!(path("/a/b/c"), "/a/b/c");
+        assert_eq!(path("/a//b/"), "/a//b/");
+        assert_eq!(path("/"), "/");
+        assert_eq!(path("/pay/4111-1111-1111-1111/ok"), "/pay/<redacted>/ok");
+    }
+}

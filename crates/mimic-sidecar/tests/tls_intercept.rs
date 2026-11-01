@@ -814,3 +814,21 @@ async fn tls_22_an_open_exchange_at_the_end_of_the_grace_is_written_as_shutdown(
     })
     .await;
 }
+
+#[tokio::test]
+async fn dsc_21_intercepted_outbound_access_line_redacts_path_secrets() {
+    let logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln";
+    let request =
+        format!("GET /reset/{jwt} HTTP/1.1\r\nHost: api.test:443\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(exchange(&mut tls, request.as_bytes()).await, RESPONSE);
+    eventually("the access line", || !logs.access().is_empty()).await;
+    let lines = logs.access();
+    assert_eq!(lines[0]["tls"], true);
+    assert_eq!(lines[0]["path"], "/reset/<redacted>");
+    assert!(!logs.text().contains(jwt), "{}", logs.text());
+}
