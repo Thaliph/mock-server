@@ -275,6 +275,54 @@ fn drive(client: &[&[u8]], server: &[&[u8]], eof: bool) -> (Vec<Event>, usize) {
     (ev, peak)
 }
 
+
+fn check_framing(conv: &Conversation, ev: &[Event], peak: usize) -> Result<(), TestCaseError> {
+    prop_assert!(peak <= RETAINED_LIMIT);
+    let n = conv.exchanges.len();
+    let requests: Vec<_> = ev.iter().filter_map(|e| match e {
+        Event::Request(r) => Some((r.method.clone(), r.path.clone())),
+        _ => None,
+    }).collect();
+    let expected: Vec<_> = conv.exchanges.iter()
+        .map(|e| (e.method.to_string(), e.path.clone())).collect();
+    prop_assert_eq!(requests, expected);
+    let req_ends: Vec<u64> = ev.iter().filter_map(|e| match e {
+        Event::RequestEnd { body_bytes } => Some(*body_bytes),
+        _ => None,
+    }).collect();
+    prop_assert_eq!(
+        req_ends,
+        conv.exchanges.iter().map(|e| e.req_body.bytes()).collect::<Vec<_>>()
+    );
+    let finals: Vec<(u16, String)> = ev.iter().filter_map(|e| match e {
+        Event::Response(h) => Some((
+            h.status,
+            h.request.as_ref().map(|r| r.path.clone()).unwrap_or_default(),
+        )),
+        _ => None,
+    }).collect();
+    prop_assert_eq!(
+        finals,
+        conv.exchanges.iter().map(|e| (e.status, e.path.clone())).collect::<Vec<_>>()
+    );
+    let interims = ev.iter().filter(|e| matches!(e, Event::Interim(_))).count();
+    prop_assert_eq!(
+        interims,
+        conv.exchanges.iter().map(|e| e.interims.len()).sum::<usize>()
+    );
+    let resp_ends: Vec<u64> = ev.iter().filter_map(|e| match e {
+        Event::ResponseEnd { body_bytes } => Some(*body_bytes),
+        _ => None,
+    }).collect();
+    let mut want: Vec<u64> = conv.exchanges.iter().map(|e| e.wire_body().bytes()).collect();
+    if conv.close_delimited {
+        want[n - 1] = CLOSE_BODY.len() as u64;
+    }
+    prop_assert_eq!(resp_ends, want);
+    prop_assert!(!ev.iter().any(|e| matches!(e, Event::Unframed(_) | Event::Tunnel)));
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(CASES))]
 
@@ -383,48 +431,136 @@ proptest! {
             &split(&conv.server, &scuts),
             conv.close_delimited,
         );
-        prop_assert!(peak <= RETAINED_LIMIT);
-        let n = conv.exchanges.len();
-        let requests: Vec<_> = ev.iter().filter_map(|e| match e {
-            Event::Request(r) => Some((r.method.clone(), r.path.clone())),
-            _ => None,
-        }).collect();
-        let expected: Vec<_> = conv.exchanges.iter()
-            .map(|e| (e.method.to_string(), e.path.clone())).collect();
-        prop_assert_eq!(requests, expected);
-        let req_ends: Vec<u64> = ev.iter().filter_map(|e| match e {
-            Event::RequestEnd { body_bytes } => Some(*body_bytes),
-            _ => None,
-        }).collect();
-        prop_assert_eq!(
-            req_ends,
-            conv.exchanges.iter().map(|e| e.req_body.bytes()).collect::<Vec<_>>()
-        );
-        let finals: Vec<(u16, String)> = ev.iter().filter_map(|e| match e {
-            Event::Response(h) => Some((
-                h.status,
-                h.request.as_ref().map(|r| r.path.clone()).unwrap_or_default(),
-            )),
-            _ => None,
-        }).collect();
-        prop_assert_eq!(
-            finals,
-            conv.exchanges.iter().map(|e| (e.status, e.path.clone())).collect::<Vec<_>>()
-        );
-        let interims = ev.iter().filter(|e| matches!(e, Event::Interim(_))).count();
-        prop_assert_eq!(
-            interims,
-            conv.exchanges.iter().map(|e| e.interims.len()).sum::<usize>()
-        );
-        let resp_ends: Vec<u64> = ev.iter().filter_map(|e| match e {
-            Event::ResponseEnd { body_bytes } => Some(*body_bytes),
-            _ => None,
-        }).collect();
-        let mut want: Vec<u64> = conv.exchanges.iter().map(|e| e.wire_body().bytes()).collect();
-        if conv.close_delimited {
-            want[n - 1] = CLOSE_BODY.len() as u64;
+        check_framing(&conv, &ev, peak)?;
+    }
+}
+
+fn cuts_of(len: usize, cuts: &[u16]) -> Vec<usize> {
+    let mut points: Vec<usize> = cuts.iter().map(|c| usize::from(*c) * 7 % (len + 1)).collect();
+    points.sort_unstable();
+    points
+}
+
+fn pieces(data: &[u8], cuts: &[u16]) -> Vec<Vec<u8>> {
+    let mut parts = Vec::new();
+    let mut from = 0;
+    for p in cuts_of(data.len(), cuts) {
+        parts.push(data[from..p].to_vec());
+        from = p;
+    }
+    parts.push(data[from..].to_vec());
+    parts
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+    /// Heads and trailer sections whose size straddles the 64 KiB limit, with the requests
+    /// read ahead in front of them, cut anywhere.
+    #[test]
+    fn prx_27_sections_around_the_limit_keep_retained_state_bounded(
+        client_value in HEAD_LIMIT - 2000..HEAD_LIMIT + 2000,
+        server_value in HEAD_LIMIT - 2000..HEAD_LIMIT + 2000,
+        trailer_value in HEAD_LIMIT - 2000..HEAD_LIMIT + 2000,
+        ahead in 0usize..READ_AHEAD,
+        host in 0usize..3000,
+        open in any::<bool>(),
+        ccuts in proptest::collection::vec(any::<u16>(), 0..6),
+        scuts in proptest::collection::vec(any::<u16>(), 0..6),
+    ) {
+        let mut client = Vec::new();
+        for _ in 0..ahead {
+            client.extend(format!("GET http://{0}/{0} HTTP/1.1\r\nHost: {0}\r\n\r\n", "h".repeat(host)).bytes());
         }
-        prop_assert_eq!(resp_ends, want);
-        prop_assert!(!ev.iter().any(|e| matches!(e, Event::Unframed(_) | Event::Tunnel)));
+        // An open section (no blank line yet) is what the scanner retains between two reads.
+        let end = if open { "" } else { "\r\n\r\n" };
+        client.extend(format!("GET / HTTP/1.1\r\nX: {}{end}", "a".repeat(client_value)).bytes());
+        let mut server = Vec::new();
+        for _ in 0..ahead {
+            server.extend(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        }
+        server.extend(format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nT: {}\r\n\r\n",
+            "a".repeat(trailer_value)
+        ).bytes());
+        server.extend(format!("HTTP/1.1 200 OK\r\nX: {}{end}", "a".repeat(server_value)).bytes());
+        let (client, server) = (pieces(&client, &ccuts), pieces(&server, &scuts));
+        let (client, server): (Vec<&[u8]>, Vec<&[u8]>) = (
+            client.iter().map(Vec::as_slice).collect(),
+            server.iter().map(Vec::as_slice).collect(),
+        );
+        let (_, peak) = drive(&client, &server, true);
+        prop_assert!(peak <= RETAINED_LIMIT, "retained {peak}");
+        // The bound is approached, not merely respected by small inputs.
+        if open && client_value < HEAD_LIMIT - 100 {
+            prop_assert!(peak >= client_value, "retained {peak}");
+        }
+    }
+
+    /// Client bytes held behind an upgrade, up to and past the limit, in any cut.
+    #[test]
+    fn prx_27_held_bytes_around_the_limit_keep_retained_state_bounded(
+        total in HEAD_LIMIT - 2000..HEAD_LIMIT + 2000,
+        cuts in proptest::collection::vec(any::<u16>(), 0..12),
+    ) {
+        let mut c = Codec::new();
+        c.client_bytes(b"CONNECT a:1 HTTP/1.1\r\n\r\n");
+        let mut peak = 0;
+        for part in pieces(&vec![b'x'; total], &cuts) {
+            c.client_bytes(&part);
+            peak = peak.max(c.retained_bytes());
+        }
+        prop_assert!(peak <= RETAINED_LIMIT, "retained {peak}");
+        if total <= HEAD_LIMIT {
+            prop_assert!(peak >= total, "retained {peak}");
+        }
+    }
+}
+
+/// Request `i + 1` and response `i` are on the wire at the same time: their pieces alternate.
+fn interleaved(conv: &Conversation, ccuts: &[u16], scuts: &[u16]) -> (Vec<Event>, usize) {
+    let mut c = Codec::new();
+    let (mut ev, mut peak) = (Vec::new(), 0);
+    let n = conv.exchanges.len();
+    let mut previous: Vec<Vec<u8>> = Vec::new();
+    for i in 0..=n {
+        let request = conv.exchanges.get(i).map(Exchange::request).unwrap_or_default();
+        let mine = pieces(&request, ccuts);
+        let mut theirs = previous.into_iter();
+        let mut mine = mine.into_iter();
+        loop {
+            let (a, b) = (mine.next(), theirs.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            if let Some(a) = a {
+                ev.extend(c.client_bytes(&a));
+            }
+            if let Some(b) = b {
+                ev.extend(c.server_bytes(&b));
+            }
+            peak = peak.max(c.retained_bytes());
+        }
+        previous = conv.exchanges.get(i).map_or_else(Vec::new, |e| {
+            pieces(&e.response(conv.close_delimited && i + 1 == n), scuts)
+        });
+    }
+    if conv.close_delimited {
+        ev.extend(c.server_eof());
+    }
+    (ev, peak)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+    #[test]
+    fn prx_27_interleaved_client_and_server_bytes_frame_exactly(
+        conv in conversation(),
+        ccuts in proptest::collection::vec(any::<u16>(), 0..12),
+        scuts in proptest::collection::vec(any::<u16>(), 0..12),
+    ) {
+        let (ev, peak) = interleaved(&conv, &ccuts, &scuts);
+        check_framing(&conv, &ev, peak)?;
     }
 }

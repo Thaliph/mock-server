@@ -167,15 +167,19 @@ would see without mimic, except for the limits listed at the end of this section
   when its head does not parse (invalid tokens, a bare CR, `obs-fold` in a framing header),
   is over the limits above, or has an ambiguous length: both `content-length` and
   `transfer-encoding`, several `content-length` values that differ or one that is not a
-  decimal number, a request `transfer-encoding` whose last coding is not `chunked` or that
-  comes with HTTP/1.0, or an invalid chunk size. The exchange then writes its access line at
-  once (`result: unframed`, with the fields known so far), and the rest of the connection is
-  relayed as an opaque tunnel, with no further exchange line.
+  decimal number, a `transfer-encoding` with a coding that has parameters (`chunked;x=1`:
+  recipients disagree on it) or quotes, a request `transfer-encoding` whose last coding is
+  not `chunked` or that comes with HTTP/1.0, or an invalid chunk size. The exchange then
+  writes its access line at once (`result: unframed`, with the fields known so far), and the
+  rest of the connection is relayed as an opaque tunnel, with no further exchange line.
 - **Upgrades**: a request answered with `101` (WebSocket, `h2c` upgrade), or a `CONNECT`
   answered with 2xx, continues as an opaque tunnel after the response. After a request that
   asks for an upgrade or is a `CONNECT`, the relay reads no more client bytes until the final
   response to it arrives (the client must wait for it, RFC 9110 §7.8, §9.3.6). A declined
-  upgrade leaves a plain HTTP/1 connection.
+  upgrade leaves a plain HTTP/1 connection. The relay holds at most one 16 KiB read, the rest
+  stays in the socket; a codec fed more than 64 KiB behind an unanswered upgrade (without the
+  relay's flow control) reports the upgrade request as `unframed`, drops its
+  copy and uses every byte: none is lost.
 - **Failures**: the sidecar never synthesises a response. When the destination refuses the
   connection, the client connection is closed without any byte; when it closes or resets
   before answering, the client sees the same close or reset (HTTP/1), or the stream is reset
@@ -209,7 +213,10 @@ would see without mimic, except for the limits listed at the end of this section
   tunnels run until `MIMIC_SHUTDOWN_GRACE` ends. When it ends, the sidecar closes every
   connection still open (tunnels, connections in detection, exchanges still pending), writes
   the access line of each (`result: shutdown`), then one WARN line `grace period over` with
-  `connections` (how many it closed), and exits 0.
+  `connections` (how many it closed), and exits 0. An idle HTTP/1 connection is closed with a
+  FIN, never a reset: the client bytes that reached the socket after the connection was found
+  idle are read and discarded (at most 250 ms) before the sockets are released. The bytes
+  protocol detection had already read when `SIGTERM` came are forwarded.
 - **Access logs** (`target` = `access`, level INFO): one line per HTTP exchange (`message`
   `http exchange`) and one per opaque or TLS connection (`message` `connection`), written when
   it ends.
@@ -256,7 +263,7 @@ Accepted limits of the proxy:
   keeps the connection open (one task, two sockets), as the destination would keep its own
   socket without mimic. A client that vanished without a reset is noticed only by TCP
   keepalive (about 5 minutes after the last activity).
-- An HTTP/1 request whose first bytes arrive while `SIGTERM` closes its idle connection is
+- An HTTP/1 request whose first bytes arrive after `SIGTERM` found its connection idle is
   not forwarded: the client sees the connection closed without a response and no access line
   is written. The app containers have already stopped then, so the client would get no
   answer without mimic either.
@@ -879,6 +886,12 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
 
 ### 11.1 Accepted limits
 
+- While the relay holds the client's bytes behind an upgrade or `CONNECT` request, or at the
+  read-ahead of 32 requests, it does not read the client socket, so a bare client FIN is not
+  seen until the destination answers or closes, or the client resets: the destination holds
+  the same state (it has not answered either), and the FIN could only be passed on after the
+  held bytes, which must wait for the response. Watching the socket without consuming it is
+  not possible on a TLS stream.
 - Capture is an observability and test tool, not a security boundary: an app container with
   `NET_ADMIN`, or whose image runs as UID 1337 without declaring it in the pod spec, escapes it.
 - All traffic to a `tcpSocket` or `grpc` probe port bypasses the sidecar (not only probes): an

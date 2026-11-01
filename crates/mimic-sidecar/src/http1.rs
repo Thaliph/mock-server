@@ -285,3 +285,98 @@ pub async fn relay_with(
         partial_body,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+
+    use super::*;
+
+    /// A connected pair: (the test's end, the relay's end).
+    async fn pair() -> (TcpStream, Stream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let near = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (far, _) = listener.accept().await.unwrap();
+        (near, Stream::plain(far))
+    }
+
+    const REQUEST: &[u8] = b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n";
+
+    #[tokio::test]
+    async fn prx_13_detection_bytes_survive_a_shutdown_already_started() {
+        for round in 0..40 {
+            let ((client, mut relay_client), (mut dest, mut relay_dest)) =
+                (pair().await, pair().await);
+            let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+            let relayed = tokio::spawn(async move {
+                relay(
+                    &mut relay_client,
+                    &mut relay_dest,
+                    REQUEST.to_vec(),
+                    |_| {},
+                    std::future::ready(()),
+                    async {
+                        let _ = abort_rx.await;
+                    },
+                )
+                .await
+                .outcome
+            });
+            let mut got = vec![0u8; REQUEST.len()];
+            timeout(Duration::from_secs(2), dest.read_exact(&mut got))
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: the detection bytes were dropped"))
+                .unwrap();
+            assert_eq!(got, REQUEST);
+            drop(abort_tx);
+            let _ = relayed.await;
+            drop(client);
+        }
+    }
+
+    #[tokio::test]
+    async fn prx_13_idle_close_with_unread_client_bytes_is_a_fin() {
+        for round in 0..20 {
+            let ((mut client, mut relay_client), (dest, mut relay_dest)) =
+                (pair().await, pair().await);
+            // Bytes already queued when the relay finds the connection idle.
+            client.write_all(b"GET /late HTT").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let relayed = tokio::spawn(async move {
+                let relayed = relay(
+                    &mut relay_client,
+                    &mut relay_dest,
+                    Vec::new(),
+                    |_| {},
+                    std::future::ready(()),
+                    std::future::pending(),
+                )
+                .await;
+                // What the caller does next: it drops both sockets.
+                drop((relay_client, relay_dest));
+                relayed.outcome
+            });
+            let mut buf = [0u8; 64];
+            let end = timeout(Duration::from_secs(3), async {
+                loop {
+                    match client.read(&mut buf).await {
+                        Ok(0) => break Ok(()),
+                        Ok(_) => {}
+                        Err(e) => break Err(e),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: the connection stayed open"));
+            assert!(end.is_ok(), "round {round}: reset instead of FIN: {end:?}");
+            drop((client, dest));
+            let _ = relayed.await;
+        }
+    }
+}

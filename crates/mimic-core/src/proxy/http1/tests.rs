@@ -899,3 +899,81 @@ fn dsc_12_capturing_codec_caps_the_payload_and_reports_the_size() {
     assert_eq!(payload, CAPTURE_BODY_LIMIT);
     assert_eq!(request_ends(&events), vec![total as u64]);
 }
+
+#[test]
+fn prx_29_transfer_encoding_parameters_are_unframed() {
+    for te in [
+        "chunked;x=1",
+        "chunked ; x=1",
+        "gzip;q=1, chunked",
+        "chunked, gzip;q=1",
+        "\"chunked\"",
+    ] {
+        let ev = run(
+            format!("POST / HTTP/1.1\r\nTransfer-Encoding: {te}\r\n\r\n0\r\n\r\n").as_bytes(),
+            b"",
+        );
+        let u = unframed(&ev);
+        assert_eq!(u.reason, Reason::BadTransferEncoding, "{te}");
+        assert_eq!(u.side, Side::Client, "{te}");
+        let ev = run(
+            b"GET / HTTP/1.1\r\n\r\n",
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: {te}\r\n\r\n0\r\n\r\n").as_bytes(),
+        );
+        let u = unframed(&ev);
+        assert_eq!(u.reason, Reason::BadTransferEncoding, "{te}");
+        assert_eq!(u.side, Side::Server, "{te}");
+    }
+    // Plain codings, in any case and spacing, stay framed.
+    let ev = run(
+        b"POST / HTTP/1.1\r\nTransfer-Encoding:  GZip ,\tChunked \r\n\r\n0\r\n\r\n",
+        b"",
+    );
+    assert!(!ev.iter().any(|e| matches!(e, Event::Unframed(_))));
+}
+
+#[test]
+fn prx_29_held_overflow_names_the_upgrade_and_uses_every_byte() {
+    let mut c = Codec::new();
+    c.client_bytes(b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n");
+    assert!(c.client_bytes(&vec![b'x'; HEAD_LIMIT]).is_empty());
+    let retained = c.retained_bytes();
+    assert!(retained >= HEAD_LIMIT);
+    let ev = c.client_bytes(b"xyz");
+    let u = unframed(&ev);
+    assert_eq!(u.reason, Reason::HeldOverflow);
+    assert_eq!(u.request.expect("the upgrade request").path, "/ws");
+    assert!(c.retained_bytes() < retained, "the held copy is dropped");
+    // Opaque from now on: every byte is used.
+    assert_eq!(c.client_bytes_limited(b"more").0, 4);
+}
+
+#[test]
+fn prx_27_held_bytes_are_counted_by_capacity() {
+    let mut c = Codec::new();
+    c.client_bytes(b"GET /ws HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n");
+    let base = c.retained_bytes();
+    // Odd sizes make a growing vector over-allocate; the buffer never holds more than the limit.
+    for n in [1, 3, 5000, 7000, 20_000, 30_000] {
+        c.client_bytes(&vec![b'x'; n]);
+        assert!(c.retained_bytes() - base <= HEAD_LIMIT, "{n}");
+    }
+}
+
+#[test]
+fn prx_27_the_retained_limit_is_the_sum_of_the_real_bounds() {
+    // Two 64 KiB sections (one per direction), the requests read ahead and the two copies of
+    // a head a body keeps: nothing else.
+    assert!(RETAINED_LIMIT < 2 * HEAD_LIMIT + 40 * 4096, "{RETAINED_LIMIT}");
+}
+
+#[test]
+fn prx_27_cut_values_do_not_keep_their_capacity() {
+    let long = "h".repeat(20_000);
+    let mut c = Codec::new();
+    for _ in 0..READ_AHEAD {
+        c.client_bytes(format!("GET http://{long}/{long} HTTP/1.1\r\nHost: {long}\r\n\r\n").as_bytes());
+    }
+    assert_eq!(c.pending(), READ_AHEAD);
+    assert!(c.retained_bytes() <= READ_AHEAD * 4096, "{}", c.retained_bytes());
+}
