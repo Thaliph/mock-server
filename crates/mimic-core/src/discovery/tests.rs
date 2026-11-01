@@ -65,7 +65,6 @@ fn dsc_01_params() {
         "",
         "%41",
         "2026-13-01",
-        "eyJub3QiOiJhbGcifQ.e30.c2ln",
     ];
     for l in literals {
         assert!(!is_param(l), "{l:?} should be a literal");

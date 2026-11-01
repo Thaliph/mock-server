@@ -10,8 +10,17 @@ pub const OVERFLOW: u8 = 69;
 
 /// Bucket of a latency in milliseconds. Bucket `i` closes at `2^(i/4)` ms (bucket 0 holds
 /// 0 and 1 ms); the overflow bucket is `OVERFLOW`.
-pub fn bucket_index(_ms: u64) -> u8 {
-    todo!()
+pub fn bucket_index(ms: u64) -> u8 {
+    if ms <= 1 {
+        return 0;
+    }
+    if ms > 1 << 17 {
+        return OVERFLOW;
+    }
+    // Smallest i with ms <= 2^(i/4), i.e. ms^4 <= 2^i, in exact integer arithmetic.
+    let fourth = u128::from(ms).pow(4);
+    let bits = 128 - (fourth - 1).leading_zeros();
+    bits as u8
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,12 +29,14 @@ pub struct Histogram {
 }
 
 impl Histogram {
-    pub fn observe(&mut self, _ms: u64) {
-        todo!()
+    pub fn observe(&mut self, ms: u64) {
+        *self.buckets.entry(bucket_index(ms)).or_default() += 1;
     }
 
-    pub fn merge(&mut self, _other: &Histogram) {
-        todo!()
+    pub fn merge(&mut self, other: &Histogram) {
+        for (bucket, n) in &other.buckets {
+            *self.buckets.entry(*bucket).or_default() += n;
+        }
     }
 
     /// Non-empty buckets, by index.
