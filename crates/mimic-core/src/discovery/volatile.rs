@@ -114,6 +114,40 @@ impl Volatility {
         }
     }
 
+    /// `target` names the field that a field is recorded under once redacted (itself, or the
+    /// field of a redacted name above it). That field is marked redacted and keeps no hash
+    /// but that of the marker; a field below it is folded into it, its `n` being the larger.
+    pub(super) fn redact(&mut self, target: impl Fn(&str) -> Option<String>) {
+        let marker = xxh3_64(MARKER.as_bytes());
+        let names: Vec<String> = self.fields.keys().cloned().collect();
+        for name in names {
+            let Some(into) = target(&name) else {
+                continue;
+            };
+            let from = if into == name {
+                None
+            } else {
+                self.fields.remove(&name)
+            };
+            let field = self.fields.entry(into).or_default();
+            if let Some(from) = from {
+                field.n = field.n.max(from.n);
+            }
+            field.redacted = true;
+            field.sketch.hashes.retain(|h| *h == marker);
+        }
+    }
+
+    /// The fields that are not the same in `other`, in either.
+    pub(super) fn changed(&self, other: &Self) -> BTreeSet<String> {
+        self.fields
+            .keys()
+            .chain(other.fields.keys())
+            .filter(|name| self.fields.get(*name) != other.fields.get(*name))
+            .cloned()
+            .collect()
+    }
+
     pub fn merge(mut self, other: Self) -> Self {
         for (name, f) in other.fields {
             match self.fields.remove(&name) {
@@ -165,6 +199,11 @@ impl Volatility {
     /// `n ≥ 3` and distinct values ≥ `n / 2`.
     pub fn is_volatile(&self, field: &str) -> bool {
         self.fields.get(field).is_some_and(Field::volatile)
+    }
+
+    /// Hashes held for a field; `None` when it is not tracked.
+    pub fn sketch_len(&self, field: &str) -> Option<usize> {
+        self.fields.get(field).map(|f| f.sketch.len())
     }
 
     pub fn is_redacted(&self, field: &str) -> bool {

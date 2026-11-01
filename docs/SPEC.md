@@ -863,11 +863,17 @@ Everything below except the capture tap, content decoding and the recorder threa
     saturate.
     Any other violation is `400` with its `reason`.
   - *Re-redaction* (pure, idempotent): the §6 redaction applied again to every sample, host,
-    concrete path and volatile field with the built-in rules and the union of
+    concrete path, literal path segment (tree keys and gRPC paths; keys that become equal
+    merge), schema and parameter key and volatile field with the built-in rules and the union of
     `spec.discovery.redact` of the `MimicWorkload`s naming the deployment (from the
     controller's cache, so a name added after the pod started applies); a field that becomes
     redacted loses its sketch and is marked `redacted`, a sample that changes is keyed by the
-    hash of its new content. A sidecar of an older version, or a faulty one, cannot put a
+    hash of its new content. Names are redacted as the sidecar does: a key whose name is
+    redacted has the schema of the marker (a string without format), and the volatile fields
+    below a redacted name become that name's field; a name is never redacted by value. A
+    volatile sketch holds hashes only, so a detected form (JWT, card, token prefix) cannot be
+    found in it: its sketch is dropped when a retained sample shows a detected form at that
+    field, and kept otherwise (§11.1). A sidecar of an older version, or a faulty one, cannot put a
     value into Valkey that the controller's rules redact.
   - *Stamping*: every endpoint and sample of the push gets `last_seen`, the current UTC day
     (days since 1970-01-01); a merge keeps the larger value. Sidecar reports carry no
@@ -1192,6 +1198,11 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   and restart the app if the outage outlasts `failureThreshold` × `periodSeconds`. The
   `/app-health/` endpoints sit on the admin port, so the network can reach them. They only run
   the pod's own probes.
+- A volatile sketch holds XXH3 hashes of values. A sidecar redacts detected forms (JWT, card,
+  token prefix) before it sketches, so only a faulty or hostile one stores such a hash, and
+  the controller cannot tell it from a hash of another value: it drops a sketch only when a
+  retained sample shows a detected form at that field. A low-entropy value left in a sketch
+  could be recovered by brute force.
 - Loopback traffic (an app calling itself) and non-TCP traffic other than UDP 443 are not
   captured.
 - Namespaces whose Pod Security level is `baseline` or `restricted` reject injected pods
@@ -1453,7 +1464,7 @@ Sidecar integration tests use the fake sidecar API of F3. A *canary* is as in §
 |---|---|
 | CTL-01 | **U.** The structural check of §7.3 accepts every report the recorder produces within the §6 bounds, merged or not (`proptest`, ≥ 10 000 cases), and rejects, each with its own fixed `reason`: a version other than 1; 21 samples; 17 hosts or a host over 1024 bytes; status 99 or 600; a histogram bucket out of range; a schema of 513 nodes, of 17 levels or with a cut level of 17; a 129-byte name; 65 query keys or headers; 129 volatile fields or a 33-hash sketch; a 2049-byte or 33-segment path or template; 17 media types on a side; a 256 KiB + 1 sample body or a sample body for an opaque media type; an unknown field; more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints in a direction is `push_limit`, apart from the `400` reasons. `Report::from_json` then the check never panic on arbitrary input (`proptest`, and CTL-22). |
 | CTL-02 | **U.** The bounded merge equals the §6 `merge` while the result is within the store limits, and below them does not depend on the order or grouping of pushes (`proptest`); two pushes each below the literal limit at a node absorb it when their union exceeds it; counters and buckets at 2^64 − 1 stay there; the result's `pod` is null. Anti-crowding, with `MIMIC_STORE_MAX_ENDPOINTS` = 4: a store of 4 endpoints with 100 exchanges each, merged with a push of 50 endpoints `/!0` … `/!49` of 1 exchange each, keeps the 4 (50 `endpoint_limit` refusals, no eviction); a push of an endpoint with 101 exchanges evicts the stored endpoint with the fewest exchanges, ties broken by key (`evicted` = 1); a new endpoint tying the lowest stored count does not displace it. Samples, with a full budget: a new `5xx` sample of an endpoint holding only `2xx` samples evicts samples of the (endpoint, class) with the most samples until it fits, never the only sample of a class; a new `2xx` sample of that endpoint is refused (`budget`); when room cannot be made without emptying a class, nothing is evicted. The same input always gives byte-identical output; `refused` and `evicted` counts are returned per kind and reason. |
-| CTL-03 | **U.** Re-redaction is idempotent and leaves unchanged a report recorded with the same redactor. For reports recorded with a redactor that lacks a name the controller's redactor has (`proptest`, ≥ 10 000 cases), with a canary under that name at a random place (query, header, form or JSON body at any depth, request or response, URL-valued header), the re-redacted report contains neither the canary nor its XXH3 hash in decimal or hex, its sample keys are the hashes of the re-redacted content, and the field is marked `redacted` without sketch. A canary in a detected form (JWT, card, token prefix) in a report that bypassed the sidecar's redaction is removed the same way. |
+| CTL-03 | **U.** Re-redaction is idempotent and leaves unchanged a report recorded with the same redactor. For reports recorded with a redactor that lacks a name the controller's redactor has (`proptest`, ≥ 10 000 cases), with a canary under that name at a random place (query, header, form or JSON body at any depth, request or response, URL-valued header), the re-redacted report contains neither the canary nor its XXH3 hash in decimal or hex, its sample keys are the hashes of the re-redacted content, and the field is marked `redacted` without sketch. A canary in a detected form (JWT, card, token prefix) in a report that bypassed the sidecar's redaction is removed the same way from its samples, hosts and path keys (tree literals, gRPC paths: equal keys merge); a volatile field's sketch is dropped when a retained sample shows a detected form at that field and kept otherwise. A schema or parameter key under a redacted name has the schema of the marker, and the volatile fields below it become its field. |
 | CTL-04 | **U.** Retention: stamping a push with day `D` sets `last_seen = D` on each endpoint and sample; merge keeps the larger value (commutative, associative); dropping with day `T` and a TTL of `n` days removes exactly the endpoints and samples with `last_seen < T − n` (counted per kind); a sidecar report without `last_seen` parses, and a sidecar never serialises it. |
 | CTL-05 | **U.** The key names of §7.3 for namespace `shop` and deployment `pay.v2` are byte-exact; a namespace or deployment name that is not DNS-1123 is refused before any key is built. The sequence decision applies a push whose sequence is above the stored one of its pod and session, or that has none, and reports any other as a duplicate; a session that is not 32 lower-case hex characters and a sequence of 0 or above 2^53 are `invalid`. |
 | CTL-06 | **U.** The status of §7.4 is a pure function of `:meta`, the pods' push times, the window and the current time (passed in): byte-identical for the same input; a pod counts exactly when its last push is at or after now − window; without data the counts are zero and `lastPushTime` is absent; `lastPushTime` is RFC 3339 UTC in seconds; directions without endpoints are omitted. |

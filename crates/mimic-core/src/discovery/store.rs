@@ -274,3 +274,26 @@ fn limit_samples(
         }
     }
 }
+
+/// Removes the endpoints and samples whose `last_seen` is older than `today - ttl_days` (a
+/// missing `last_seen` counts as day 0). Returns how many of each kind were removed.
+pub fn drop_expired(report: &mut Report, today: u64, ttl_days: u64) -> BTreeMap<Kind, u64> {
+    let stale = |day: Option<u64>| day.unwrap_or(0).saturating_add(ttl_days) < today;
+    let (mut endpoints, mut samples) = (0u64, 0u64);
+    for key in report.endpoint_keys() {
+        let Some(stats) = report.stats_at_mut(&key) else {
+            continue;
+        };
+        samples += stats
+            .samples_mut()
+            .retain_samples(|s| !stale(s.last_seen()));
+        if stale(stats.last_seen()) {
+            report.remove_endpoint(&key);
+            endpoints += 1;
+        }
+    }
+    [(Kind::Endpoint, endpoints), (Kind::Sample, samples)]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .collect()
+}

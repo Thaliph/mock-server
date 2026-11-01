@@ -118,6 +118,18 @@ impl Side {
         Ok(())
     }
 
+    fn redact_names(&mut self, redactor: &Redactor) {
+        self.headers.redact_names(redactor);
+        for media in self.bodies.values_mut() {
+            if let Some(schema) = &mut media.json {
+                schema.redact_names(redactor);
+            }
+            if let Some(form) = &mut media.form {
+                form.redact_names(redactor);
+            }
+        }
+    }
+
     fn to_json(&self) -> Value {
         let bodies: Map<String, Value> = self
             .bodies
@@ -153,7 +165,7 @@ fn redacted(value: &str) -> bool {
 }
 
 /// The fields of one exchange that were counted already: `n` counts an exchange once.
-type Seen = BTreeSet<String>;
+pub(super) type Seen = BTreeSet<String>;
 
 fn observe(fields: &mut Volatility, seen: &mut Seen, field: String, value: &str, redacted: bool) {
     if seen.contains(&field) {
@@ -164,7 +176,12 @@ fn observe(fields: &mut Volatility, seen: &mut Seen, field: String, value: &str,
     }
 }
 
-fn observe_pairs(fields: &mut Volatility, seen: &mut Seen, prefix: &str, pairs: &[Pair]) {
+pub(super) fn observe_pairs(
+    fields: &mut Volatility,
+    seen: &mut Seen,
+    prefix: &str,
+    pairs: &[Pair],
+) {
     for p in pairs {
         let field = format!("{prefix}/{}", p.key);
         observe(fields, seen, field, &p.value, redacted(&p.value));
@@ -176,7 +193,7 @@ fn pointer_token(key: &str) -> String {
 }
 
 /// Observes the scalar leaves of a redacted JSON value; array indices are `*`.
-fn observe_leaves(
+pub(super) fn observe_leaves(
     fields: &mut Volatility,
     seen: &mut Seen,
     prefix: &str,
@@ -250,6 +267,51 @@ pub(super) fn parsed_media(media: &str) -> bool {
     media == "application/json"
         || media.ends_with("+json")
         || media == "application/x-www-form-urlencoded"
+}
+
+/// XXH3 of the schema skeleton of a redacted body: a JSON value, or the pairs of a form.
+pub(super) fn body_shape(media: &str, value: &Value, form: Option<Vec<Pair>>) -> u64 {
+    if let Some(pairs) = form {
+        return xxh3_64(Params::from_pairs(&pairs).to_json().to_string().as_bytes());
+    }
+    if parsed_media(media) {
+        return xxh3_64(Schema::infer(value).to_json().to_string().as_bytes());
+    }
+    0
+}
+
+/// The field that a volatile field is recorded under once names are redacted: itself when its
+/// query key, header or form field is redacted, the field of the first redacted key on the
+/// way to a JSON leaf. `None` when no name is redacted.
+fn named_secret(redactor: &Redactor, field: &str) -> Option<String> {
+    if let Some(name) = field
+        .strip_prefix("query/")
+        .or_else(|| field.strip_prefix("request.header/"))
+        .or_else(|| field.strip_prefix("response.header/"))
+    {
+        return redactor.name_matches(name).then(|| field.to_string());
+    }
+    let rest = field
+        .strip_prefix("request.body/")
+        .or_else(|| field.strip_prefix("response.body/"))?;
+    // The media type is `type/subtype`; a form field is the whole rest, a JSON key a token.
+    let mut parts = rest.splitn(3, '/');
+    let (Some(_), Some(media), Some(keys)) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    if media == "x-www-form-urlencoded" {
+        return redactor.name_matches(keys).then(|| field.to_string());
+    }
+    let start = field.len() - keys.len();
+    let mut end = start;
+    for token in keys.split('/') {
+        end += token.len();
+        if token != "*" && redactor.name_matches(&token.replace("~1", "/").replace("~0", "~")) {
+            return Some(field[..end].to_string());
+        }
+        end += 1;
+    }
+    None
 }
 
 /// Parses a body (already content-decoded) by its `content-type`; nothing without one.
@@ -377,6 +439,23 @@ impl Observed {
         self.request.check()?;
         self.response.check()?;
         self.fields.check()
+    }
+
+    /// The §6 redaction again on the volatile fields: those named after a name of `redactor`,
+    /// and `changed` (reached by a sample that re-redaction changed), become redacted and
+    /// lose the hashes of their values.
+    pub(super) fn re_redact(&mut self, redactor: &Redactor, changed: &BTreeSet<String>) {
+        self.query.redact_names(redactor);
+        self.request.redact_names(redactor);
+        self.response.redact_names(redactor);
+        self.fields.redact(|field| {
+            named_secret(redactor, field)
+                .or_else(|| changed.contains(field).then(|| field.to_string()))
+        });
+    }
+
+    pub fn volatility(&self) -> &Volatility {
+        &self.fields
     }
 
     pub fn merge(self, other: Self) -> Self {

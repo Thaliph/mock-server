@@ -90,6 +90,10 @@ pub struct Stats {
     pub hosts: BTreeSet<String>,
     observed: Observed,
     samples: Samples,
+    /// The UTC day (days since 1970-01-01) of the last push that held the endpoint. Set by
+    /// the controller (spec §7.3, stamping); a sidecar never serialises it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +153,10 @@ impl Stats {
         &self.samples
     }
 
+    pub fn last_seen(&self) -> Option<u64> {
+        self.last_seen
+    }
+
     pub(super) fn samples_mut(&mut self) -> &mut Samples {
         &mut self.samples
     }
@@ -192,6 +200,23 @@ impl Stats {
         }
         self.observed = std::mem::take(&mut self.observed).merge(other.observed);
         self.samples = std::mem::take(&mut self.samples).merge(other.samples);
+        self.last_seen = self.last_seen.max(other.last_seen);
+    }
+
+    /// The §6 redaction again on the hosts, the samples and the volatile fields.
+    fn re_redact(&mut self, redactor: &Redactor) {
+        self.hosts = std::mem::take(&mut self.hosts)
+            .into_iter()
+            .map(|h| {
+                if value_rule(&h).is_some() {
+                    MARKER.to_string()
+                } else {
+                    h
+                }
+            })
+            .collect();
+        let changed = self.samples.re_redact(redactor);
+        self.observed.re_redact(redactor, &changed);
     }
 }
 
@@ -202,6 +227,19 @@ fn merge_methods(into: &mut BTreeMap<String, Stats>, from: BTreeMap<String, Stat
 }
 
 impl Node {
+    fn re_redact_paths(&mut self) {
+        if let Some(param) = &mut self.param {
+            param.re_redact_paths();
+        }
+        for (literal, mut child) in std::mem::take(&mut self.literals) {
+            child.re_redact_paths();
+            self.literals
+                .entry(redact::segment(&literal))
+                .or_default()
+                .merge(child, usize::MAX);
+        }
+    }
+
     /// Union of two subtrees. Past `max_literals` literal children a node absorbs: its
     /// literals and its parameter child become one parameter, for good. The result does not
     /// depend on the order of the merges.
@@ -412,6 +450,15 @@ impl Scope {
 }
 
 impl Scope {
+    /// The value detectors again on the literal segments and the gRPC paths; keys that become
+    /// equal merge.
+    fn re_redact_paths(&mut self) {
+        self.root.re_redact_paths();
+        for (path, methods) in std::mem::take(&mut self.raw) {
+            merge_methods(self.raw.entry(redact::path(&path)).or_default(), methods);
+        }
+    }
+
     fn check(&self) -> Result<(), Violation> {
         self.root.check(0, 0)?;
         for (path, methods) in &self.raw {
@@ -729,6 +776,23 @@ impl Report {
         self.union(other, limits.max_literals);
         self.limit_endpoints(limits.max_endpoints);
         self.limit_samples(limits.sample_budget);
+    }
+
+    /// Sets `last_seen` to `day` on every endpoint and sample (spec §7.3, stamping).
+    pub fn stamp(&mut self, day: u64) {
+        self.for_each_stats_mut(|stats| {
+            stats.last_seen = Some(day);
+            stats.samples.stamp(day);
+        });
+    }
+
+    /// The §6 redaction applied again to every sample, host and volatile field (spec §7.3,
+    /// re-redaction), so that a report cannot hold what `redactor` redacts.
+    pub fn re_redact(&mut self, redactor: &Redactor) {
+        for scope in self.scopes.values_mut().flat_map(BTreeMap::values_mut) {
+            scope.re_redact_paths();
+        }
+        self.for_each_stats_mut(|stats| stats.re_redact(redactor));
     }
 
     pub(super) fn clear_pod(&mut self) {

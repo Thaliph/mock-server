@@ -17,6 +17,8 @@ mod tests;
 #[cfg(test)]
 mod tests_check;
 #[cfg(test)]
+mod tests_ctl;
+#[cfg(test)]
 mod tests_followup;
 #[cfg(test)]
 mod tests_samples;
