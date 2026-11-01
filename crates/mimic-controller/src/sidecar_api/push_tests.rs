@@ -788,7 +788,7 @@ async fn ctl_11_nothing_sensitive_reaches_valkey_stdout_or_metrics() {
         plant(&mut value, secret);
         assert!(value.to_string().contains(secret), "planted");
         let body = serde_json::to_vec(&value).unwrap();
-        assert_eq!(push(&s, "pay", body).await.status, 200, "{secret}");
+        assert_eq!(push(&s, "pay", body).await.status, 200, "push {sequence}");
         secrets.push(secret);
     }
     // A name that only the MimicWorkload lists: the sidecar kept the value.
@@ -829,11 +829,17 @@ async fn ctl_11_nothing_sensitive_reaches_valkey_stdout_or_metrics() {
             format!("{hash:x}"),
             format!("{hash:016x}"),
         ] {
-            assert!(!stored.contains(&needle), "{needle} in Valkey:\n{stored}");
-            assert!(!logs.contains(&needle), "{needle} in the logs:\n{logs}");
+            assert!(
+                !stored.contains(&needle),
+                "a canary or its hash is in Valkey"
+            );
+            assert!(
+                !logs.contains(&needle),
+                "a canary or its hash is in the logs"
+            );
             assert!(
                 !metrics.contains(&needle),
-                "{needle} in the metrics:\n{metrics}"
+                "a canary or its hash is in the metrics"
             );
         }
     }

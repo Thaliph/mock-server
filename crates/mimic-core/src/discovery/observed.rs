@@ -118,6 +118,18 @@ impl Side {
         Ok(())
     }
 
+    fn redact_names(&mut self, redactor: &Redactor) {
+        self.headers.redact_names(redactor);
+        for media in self.bodies.values_mut() {
+            if let Some(schema) = &mut media.json {
+                schema.redact_names(redactor);
+            }
+            if let Some(form) = &mut media.form {
+                form.redact_names(redactor);
+            }
+        }
+    }
+
     fn to_json(&self) -> Value {
         let bodies: Map<String, Value> = self
             .bodies
@@ -268,33 +280,38 @@ pub(super) fn body_shape(media: &str, value: &Value, form: Option<Vec<Pair>>) ->
     0
 }
 
-/// True when a volatile field is named after a redacted name: its query key, header, form
-/// field, or one of the keys on the way to a JSON leaf.
-fn named_secret(redactor: &Redactor, field: &str) -> bool {
+/// The field that a volatile field is recorded under once names are redacted: itself when its
+/// query key, header or form field is redacted, the field of the first redacted key on the
+/// way to a JSON leaf. `None` when no name is redacted.
+fn named_secret(redactor: &Redactor, field: &str) -> Option<String> {
     if let Some(name) = field
         .strip_prefix("query/")
         .or_else(|| field.strip_prefix("request.header/"))
         .or_else(|| field.strip_prefix("response.header/"))
     {
-        return redactor.name_matches(name);
+        return redactor.name_matches(name).then(|| field.to_string());
     }
-    let Some(rest) = field
+    let rest = field
         .strip_prefix("request.body/")
-        .or_else(|| field.strip_prefix("response.body/"))
-    else {
-        return false;
-    };
+        .or_else(|| field.strip_prefix("response.body/"))?;
     // The media type is `type/subtype`; a form field is the whole rest, a JSON key a token.
     let mut parts = rest.splitn(3, '/');
     let (Some(_), Some(media), Some(keys)) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
+        return None;
     };
     if media == "x-www-form-urlencoded" {
-        return redactor.name_matches(keys);
+        return redactor.name_matches(keys).then(|| field.to_string());
     }
-    keys.split('/')
-        .filter(|token| *token != "*")
-        .any(|token| redactor.name_matches(&token.replace("~1", "/").replace("~0", "~")))
+    let start = field.len() - keys.len();
+    let mut end = start;
+    for token in keys.split('/') {
+        end += token.len();
+        if token != "*" && redactor.name_matches(&token.replace("~1", "/").replace("~0", "~")) {
+            return Some(field[..end].to_string());
+        }
+        end += 1;
+    }
+    None
 }
 
 /// Parses a body (already content-decoded) by its `content-type`; nothing without one.
@@ -428,8 +445,13 @@ impl Observed {
     /// and `changed` (reached by a sample that re-redaction changed), become redacted and
     /// lose the hashes of their values.
     pub(super) fn re_redact(&mut self, redactor: &Redactor, changed: &BTreeSet<String>) {
-        self.fields
-            .redact(|field| changed.contains(field) || named_secret(redactor, field));
+        self.query.redact_names(redactor);
+        self.request.redact_names(redactor);
+        self.response.redact_names(redactor);
+        self.fields.redact(|field| {
+            named_secret(redactor, field)
+                .or_else(|| changed.contains(field).then(|| field.to_string()))
+        });
     }
 
     pub fn volatility(&self) -> &Volatility {

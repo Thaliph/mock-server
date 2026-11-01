@@ -97,11 +97,21 @@ impl Answer {
 }
 
 async fn call(store: &Arc<Store>, method: Method, path: &str, peer: &str) -> Answer {
-    let mut request = Request::builder()
-        .method(method)
-        .uri(path)
-        .body(Body::empty())
-        .unwrap();
+    call_host(store, method, path, peer, Some("localhost:8080")).await
+}
+
+async fn call_host(
+    store: &Arc<Store>,
+    method: Method,
+    path: &str,
+    peer: &str,
+    host: Option<&str>,
+) -> Answer {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(host) = host {
+        builder = builder.header("host", host);
+    }
+    let mut request = builder.body(Body::empty()).unwrap();
     let peer: SocketAddr = format!("{peer}:40000").parse().unwrap();
     request.extensions_mut().insert(ConnectInfo(peer));
     let response = router(store.clone()).oneshot(request).await.unwrap();
@@ -273,6 +283,39 @@ async fn ctl_13_a_peer_that_is_not_loopback_gets_403() {
     }
     let answer = call(&store, Method::GET, "/v1/workloads", "127.0.0.1").await;
     assert_eq!(answer.status, 200);
+}
+
+#[tokio::test]
+async fn ctl_13_a_host_other_than_loopback_gets_403() {
+    let store = store(&valkey_url());
+    for host in [
+        Some("evil.example"),
+        Some("localhost.evil.example"),
+        Some("127.0.0.1.evil.example:8080"),
+        Some("10.0.0.1:8080"),
+        None,
+    ] {
+        let answer = call_host(&store, Method::GET, "/v1/workloads", "127.0.0.1", host).await;
+        assert_eq!(answer.status, 403, "{host:?}");
+    }
+    for host in [
+        "localhost:8080",
+        "localhost",
+        "127.0.0.1",
+        "127.0.0.1:8080",
+        "[::1]:8080",
+        "LOCALHOST:8080",
+    ] {
+        let answer = call_host(
+            &store,
+            Method::GET,
+            "/v1/workloads",
+            "127.0.0.1",
+            Some(host),
+        )
+        .await;
+        assert_eq!(answer.status, 200, "{host}");
+    }
 }
 
 #[tokio::test]

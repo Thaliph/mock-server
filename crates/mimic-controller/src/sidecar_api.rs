@@ -615,7 +615,15 @@ impl SidecarApi {
         let (seq, report) = tokio::task::spawn_blocking(move || prepare(&bytes, max_push, &extra))
             .await
             .map_err(|e| {
-                caller.error = Some(format!("push task: {e}"));
+                // Never the panic payload: it could hold push content from before re-redaction.
+                caller.error = Some(
+                    if e.is_panic() {
+                        "push task panicked"
+                    } else {
+                        "push task cancelled"
+                    }
+                    .into(),
+                );
                 UNAVAILABLE
             })?;
         if let Some(seq) = &seq {
