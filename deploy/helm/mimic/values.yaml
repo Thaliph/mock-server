@@ -15,7 +15,8 @@ controller:
   logLevel: info
   resources:
     requests: {cpu: 50m, memory: 64Mi}
-    limits: {memory: 128Mi}
+    # Sized for two writes of a deployment report at once plus the body budget (spec §7.3).
+    limits: {memory: 512Mi}
   nodeSelector: {}
   tolerations: []
   # Empty: preferred pod anti-affinity on kubernetes.io/hostname (spread replicas across nodes).
@@ -54,12 +55,17 @@ valkey:
   # Secret holding the key `password`. Empty: the chart creates one with a random password,
   # kept across upgrades and on uninstall.
   existingSecret: ""
+  # AOF on a PVC (spec §7.3). false: an emptyDir, so the store is lost when the pod restarts.
   persistence:
-    size: 1Gi
+    enabled: true
+    # AOF rewrites need about twice the data.
+    size: 4Gi
     storageClass: ""
+  # Valkey runs with maxmemory at 75 % of limits.memory and maxmemory-policy noeviction (spec §7.3):
+  # a full store answers writes with an error instead of evicting part of a deployment.
   resources:
     requests: {cpu: 50m, memory: 64Mi}
-    limits: {memory: 256Mi}
+    limits: {memory: 1Gi}
   nodeSelector: {}
   tolerations: []
 

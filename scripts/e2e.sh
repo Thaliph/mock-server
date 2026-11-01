@@ -148,6 +148,26 @@ if probe default "app: probe" | grep PONG >/dev/null; then
   fail "fnd_08: a pod outside the controller reached Valkey"
 fi
 
+# CTL-19: maxmemory is 75 % of the memory limit of the Valkey container, and a full store refuses writes
+# (noeviction) instead of evicting. valkey-cli inside the pod authenticates with REDISCLI_AUTH.
+log "ctl-19: Valkey maxmemory is 75 % of its memory limit, maxmemory-policy noeviction"
+mem_limit=$(kubectl -n "$NS" get statefulset $RELEASE-valkey -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}')
+mem_num=${mem_limit%%[!0-9]*}
+mem_unit=${mem_limit:${#mem_num}}
+case $mem_unit in
+  "") mem_mult=1 ;;
+  Ki) mem_mult=1024 ;;
+  Mi) mem_mult=1048576 ;;
+  Gi) mem_mult=1073741824 ;;
+  *) fail "ctl-19: unsupported Valkey memory limit $mem_limit" ;;
+esac
+want_maxmemory=$((mem_num * mem_mult * 3 / 4))
+# valkey_config <parameter>: prints the value of CONFIG GET for one parameter.
+valkey_config() { kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw CONFIG GET "$1" | tail -n 1; }
+[[ $(valkey_config maxmemory) == "$want_maxmemory" ]] \
+  || fail "ctl-19: maxmemory is not 75 % of the limit $mem_limit ($want_maxmemory bytes)"
+[[ $(valkey_config maxmemory-policy) == noeviction ]] || fail "ctl-19: maxmemory-policy is not noeviction"
+
 log "fnd_08: the password survives an upgrade"
 install || fail "fnd_08: helm upgrade"
 after=$(kubectl -n "$NS" get secret $RELEASE-valkey -o jsonpath='{.data.password}' | base64 -d)

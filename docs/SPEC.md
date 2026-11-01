@@ -842,7 +842,7 @@ Everything below except the capture tap, content decoding and the recorder threa
   | `mimic:v1:{<ns>/<dep>}:pods` | hash | field `<pod>` → ms of its last push (applied or not) | each field min(24 h, `MIMIC_STORE_TTL`) after its last write |
   | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
   | `mimic:v1:ns:<ns>` | sorted set | member `<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
-  | `mimic:v1:workloads` | sorted set | member `<ns>/<dep>`, score = `updated` | members older than `MIMIC_STORE_TTL` removed by each write |
+  | `mimic:v1:workloads` | sorted set | member `<ns>/<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
 
 - **Push processing**: structural check of the posted report, then re-redaction, then
   stamping, then the write. Nothing of a push is stored or logged before its re-redaction.
