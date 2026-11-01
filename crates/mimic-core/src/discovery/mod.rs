@@ -12,4 +12,6 @@ pub mod volatile;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_samples;
+#[cfg(test)]
 mod tests_schema;
