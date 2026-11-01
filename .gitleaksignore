@@ -1,0 +1,2 @@
+# Test canaries flagged in commits already pushed (newer lines carry gitleaks:allow).
+62e1c95cafd0afaf85152063fb7ea68f76357285:crates/mimic-core/src/discovery/tests_ctl.rs:jwt:254

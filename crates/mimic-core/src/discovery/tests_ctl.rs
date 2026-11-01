@@ -119,12 +119,9 @@ fn url(canary: &str) -> String {
 
 /// The volatile field the canary lands in, and the strings the sidecar hashed for it.
 fn field_of(place: Place, canary: &str) -> (String, String) {
-    let json_field = |side: &str, depth: usize, wrap: bool| {
-        let mut f = format!("{side}.body/application/json{}/{NAME}", "/a".repeat(depth));
-        if wrap {
-            f.push_str("/inner");
-        }
-        f
+    // A field below the redacted name is the field of the name.
+    let json_field = |side: &str, depth: usize, _wrap: bool| {
+        format!("{side}.body/application/json{}/{NAME}", "/a".repeat(depth))
     };
     match place {
         Place::Query => ("query/xtrafield".into(), canary.into()),
@@ -241,6 +238,115 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// CTL-03: the schemas and the volatile field names under a name the sidecar did not know
+    /// are those of a sidecar that knew it.
+    #[test]
+    fn ctl_03_schema_and_field_names(place in place(), canary in "CANARY[A-Za-z0-9]{8,24}") {
+        let input = input_of(place, &canary);
+        let mut report = record(&Redactor::default(), &input, 2);
+        report.re_redact(&controller());
+        let truth = record(&controller(), &input, 2);
+        let (got, want) = (
+            report.endpoints()[0].stats.observed().to_json(),
+            truth.endpoints()[0].stats.observed().to_json(),
+        );
+        for part in ["query", "request", "response"] {
+            prop_assert_eq!(&got[part], &want[part], "{}", part);
+        }
+        let names = |v: &Value| v["fields"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        prop_assert_eq!(names(&got), names(&want));
+    }
+}
+
+/// Renames `from` to `to` in the object at `pointer`.
+fn rename(v: &mut Value, pointer: &str, from: &str, to: &str) {
+    let map = v
+        .pointer_mut(pointer)
+        .and_then(Value::as_object_mut)
+        .expect("an object");
+    let node = map.remove(from).expect("the key");
+    map.insert(to.to_string(), node);
+}
+
+fn get(path: &str, grpc: bool) -> Report {
+    let mut r = Report::new(None);
+    r.record(
+        &LIMITS,
+        &Redactor::default(),
+        &Exchange {
+            direction: Direction::Inbound,
+            port: 80,
+            method: "POST",
+            path,
+            status: 200,
+            head_ms: 1,
+            host: None,
+            grpc,
+            observation: Observation::default(),
+        },
+    );
+    r
+}
+
+/// CTL-03: a detected form as a literal path segment or a gRPC path is redacted again, and
+/// keys that become equal merge.
+#[test]
+fn ctl_03_path_keys() {
+    let other = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI1NiJ9.b3RoZXItc2lnbmF0dXJl"; // gitleaks:allow (test canary)
+    let a = get("/alpha", false);
+    let b = get("/beta", false);
+    let mut value: Value = serde_json::from_str(&merge(a, b, &LIMITS).to_json().unwrap()).unwrap();
+    let literals = "/scopes/inbound/80/root/literals";
+    rename(&mut value, literals, "alpha", JWT);
+    rename(&mut value, literals, "beta", other);
+    let mut report = Report::from_json(&value.to_string()).unwrap();
+    report.re_redact(&Redactor::default());
+    let json = report.to_json().unwrap();
+    assert!(!json.contains(JWT) && !json.contains(other));
+    let endpoints = report.endpoints();
+    assert_eq!(endpoints.len(), 1, "the two keys merged");
+    assert_eq!(endpoints[0].stats.statuses[&200], 2);
+    let mut again = report.clone();
+    again.re_redact(&Redactor::default());
+    assert_eq!(again, report);
+
+    let mut value: Value =
+        serde_json::from_str(&get("/pkg.Svc/Method", true).to_json().unwrap()).unwrap();
+    rename(
+        &mut value,
+        "/scopes/inbound/80/raw",
+        "/pkg.Svc/Method",
+        &format!("/{JWT}"),
+    );
+    let mut report = Report::from_json(&value.to_string()).unwrap();
+    report.re_redact(&Redactor::default());
+    assert!(!report.to_json().unwrap().contains(JWT));
+    assert_eq!(report.endpoints().len(), 1);
+}
+
+/// CTL-03: a sketch is kept when no retained sample shows a detected form at its field.
+#[test]
+fn ctl_03_sketch_without_a_sample_is_kept() {
+    let input = Input {
+        req_headers: header("x-note", "plain"),
+        ..Input::default()
+    };
+    let report = record(&Redactor::default(), &input, 1);
+    let planted = xxh3_64(JWT.as_bytes());
+    let text = report
+        .to_json()
+        .unwrap()
+        .replace(&xxh3_64(b"plain").to_string(), &planted.to_string());
+    let mut report = Report::from_json(&text).unwrap();
+    report.re_redact(&Redactor::default());
+    let fields = report.endpoints()[0].stats.observed().volatility().clone();
+    assert!(!fields.is_redacted("request.header/x-note"));
+    assert_eq!(fields.sketch_len("request.header/x-note"), Some(1));
+}
+
 /// Replaces `MARKER` by `secret` in every string value (not key) of `v`.
 fn plant(v: &mut Value, secret: &str) {
     match v {
@@ -251,7 +357,7 @@ fn plant(v: &mut Value, secret: &str) {
     }
 }
 
-const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl";
+const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl"; // gitleaks:allow (test canary)
 const CARD: &str = "4111111111111111";
 const GITHUB: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -325,7 +431,10 @@ fn ctl_03_detected_forms_in_a_bypassing_report() {
             );
             report.re_redact(&Redactor::default());
             let json = report.to_json().unwrap();
-            assert!(!json.contains(secret), "{place}: {secret} kept");
+            assert!(
+                !json.contains(secret),
+                "{place}: the planted secret was kept"
+            );
             assert_eq!(samples_of(&report), samples_of(&truth), "{place}");
             assert_eq!(
                 report.endpoints()[0].stats.hosts,

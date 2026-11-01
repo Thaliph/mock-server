@@ -224,6 +224,15 @@ pub fn path(path: &str) -> String {
     path_with(path, &mut Vec::new())
 }
 
+/// A path segment with the value detectors applied.
+pub fn segment(seg: &str) -> String {
+    if segment_rule(seg).is_some() {
+        MARKER.to_string()
+    } else {
+        seg.to_string()
+    }
+}
+
 fn path_with(path: &str, rules: &mut Vec<Rule>) -> String {
     path.split('/')
         .map(|seg| match segment_rule(seg) {
