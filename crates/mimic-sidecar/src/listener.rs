@@ -17,7 +17,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::connection;
 use crate::red::{DEFAULT_MAX_AUTHORITIES, ProxyMetrics};
@@ -33,6 +33,12 @@ const INBOUND_VAR: &str = "MIMIC_INBOUND_ADDRS";
 const OUTBOUND_VAR: &str = "MIMIC_OUTBOUND_ADDRS";
 const MAX_AUTHORITIES_VAR: &str = "MIMIC_METRICS_MAX_AUTHORITIES";
 const MAX_AUTHORITIES_RANGE: std::ops::RangeInclusive<usize> = 1..=10_000;
+const MAX_CONNECTIONS_VAR: &str = "MIMIC_MAX_CONNECTIONS";
+const MAX_CONNECTIONS_RANGE: std::ops::RangeInclusive<usize> = 1..=1_000_000;
+/// Connections served at once unless `MIMIC_MAX_CONNECTIONS` says otherwise.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 16_384;
+/// A connection with an incomplete protocol prefix that stays silent this long is reset.
+pub const DETECT_STALL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
@@ -126,10 +132,16 @@ pub struct Shared {
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
     active: watch::Sender<usize>,
+    /// One permit per connection served at once, per direction (inbound, outbound).
+    permits: [Arc<Semaphore>; 2],
+    detect_stall: Duration,
 }
 
-/// Counts a connection as active until dropped.
-pub(crate) struct Active(watch::Sender<usize>);
+/// Counts a connection as active until dropped, and holds its slot under the cap.
+pub(crate) struct Active(
+    watch::Sender<usize>,
+    #[allow(dead_code)] OwnedSemaphorePermit,
+);
 
 impl Drop for Active {
     fn drop(&mut self) {
@@ -170,6 +182,11 @@ impl Shared {
             stop: watch::channel(false).0,
             abort: watch::channel(false).0,
             active: watch::channel(0).0,
+            permits: [
+                Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+                Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            ],
+            detect_stall: DETECT_STALL,
         }
     }
 
@@ -218,15 +235,35 @@ impl Shared {
         let _ = self.active.subscribe().wait_for(|n| *n == 0).await;
     }
 
-    fn track(&self) -> Active {
+    fn track(&self, slot: OwnedSemaphorePermit) -> Active {
         self.active.send_modify(|n| *n += 1);
-        Active(self.active.clone())
+        Active(self.active.clone(), slot)
     }
 
     /// Uses `proxy` for the RED metrics instead of unregistered ones.
     pub fn with_proxy_metrics(mut self, proxy: ProxyMetrics) -> Shared {
         self.proxy = proxy;
         self
+    }
+
+    /// Serves at most `max` connections at once in each direction (spec §4.1).
+    pub fn with_max_connections(mut self, max: usize) -> Shared {
+        self.permits = [Arc::new(Semaphore::new(max)), Arc::new(Semaphore::new(max))];
+        self
+    }
+
+    fn permits(&self, direction: Direction) -> Arc<Semaphore> {
+        self.permits[usize::from(direction == Direction::Outbound)].clone()
+    }
+
+    /// Resets a connection stalled on an incomplete protocol prefix after `stall` (spec §4.1).
+    pub fn with_detect_stall(mut self, stall: Duration) -> Shared {
+        self.detect_stall = stall;
+        self
+    }
+
+    pub(crate) fn detect_stall(&self) -> Duration {
+        self.detect_stall
     }
 
     /// Hands the inbound HTTP/1 exchanges to discovery (spec §6).
@@ -279,6 +316,8 @@ pub struct TunnelConfig {
     pub outbound: Vec<SocketAddr>,
     /// Distinct `authority` label values kept per direction and metric.
     pub max_authorities: usize,
+    /// Connections served at once (both directions).
+    pub max_connections: usize,
 }
 
 impl TunnelConfig {
@@ -300,10 +339,19 @@ impl TunnelConfig {
                 "expected a number from 1 to 10000",
             ));
         }
+        let max_connections = env.parse_or(MAX_CONNECTIONS_VAR, DEFAULT_MAX_CONNECTIONS)?;
+        if !MAX_CONNECTIONS_RANGE.contains(&max_connections) {
+            return Err(ConfigError::invalid(
+                MAX_CONNECTIONS_VAR,
+                &max_connections.to_string(),
+                "expected a number from 1 to 1000000",
+            ));
+        }
         Ok(TunnelConfig {
             inbound,
             outbound,
             max_authorities,
+            max_connections,
         })
     }
 }
@@ -405,13 +453,18 @@ pub async fn accept_loop(
     tokio::pin!(shutdown);
     let mut last_logged: Option<Instant> = None;
     loop {
+        // At the cap nothing is accepted: further connections wait in the backlog.
+        let slot = tokio::select! {
+            () = &mut shutdown => return,
+            Ok(slot) = shared.permits(direction).acquire_owned() => slot,
+        };
         let accepted = tokio::select! {
             () = &mut shutdown => return,
             accepted = listener.accept() => accepted,
         };
         match accepted {
             Ok((stream, _)) => {
-                let active = shared.track();
+                let active = shared.track(slot);
                 tokio::spawn(connection::handle(
                     stream,
                     direction,

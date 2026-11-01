@@ -29,7 +29,9 @@ pub struct ClientHello {
 /// Result of [`parse_client_hello`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
-    /// Not enough bytes to decide.
+    /// Not enough bytes to decide: what was read so far is consistent with a ClientHello. The
+    /// parser never decides to stop reading; the caller bounds its buffer (`DETECT_LIMIT`) and
+    /// treats a buffer that is still `NeedMore` at the bound as not intercepted.
     NeedMore,
     /// Not a TLS ClientHello.
     NotTls,

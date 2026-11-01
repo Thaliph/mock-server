@@ -146,6 +146,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         seed: seed.clone(),
         reviewer: Arc::new(sidecar_api::KubeReviewer::new(kube_client)),
         metrics: api_metrics,
+        limiter: sidecar_api::ReviewLimiter::default(),
     });
     let webhook_listener = tokio::net::TcpListener::bind(webhook.addr).await?;
     tracing::info!(addr = %webhook_listener.local_addr()?, "webhook listening");

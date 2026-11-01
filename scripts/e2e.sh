@@ -236,7 +236,7 @@ can() {
   local want=$1 desc=$2 got
   shift 2
   got=$(kubectl auth can-i --as="$sa" "$@" 2>/dev/null) || true
-  [[ $got == "$want" ]] || fail "inj_12: $desc (want $want, got '$got')"
+  [[ $got == "$want" ]] || fail "${CAN_ID:-inj_12}: $desc (want $want, got '$got')"
 }
 # accepted <description> <command...>: the command succeeds. denied: it fails.
 accepted() { local desc=$1; shift; "$@" >/dev/null 2>&1 || fail "inj_12: $desc was rejected"; }
@@ -248,7 +248,7 @@ can yes "get its webhook configuration" get mutatingwebhookconfigurations.admiss
 can yes "list its webhook configuration" list mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
 can yes "watch its webhook configuration" watch mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
 can yes "patch its webhook configuration" patch mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
-can yes "create tokenreviews (sidecar API authentication)" create tokenreviews.authentication.k8s.io
+CAN_ID=tls_24 can yes "create tokenreviews (sidecar API authentication)" create tokenreviews.authentication.k8s.io
 can no "list all webhook configurations" list mutatingwebhookconfigurations.admissionregistration.k8s.io
 can no "watch all webhook configurations" watch mutatingwebhookconfigurations.admissionregistration.k8s.io
 can no "list another webhook configuration" list mutatingwebhookconfigurations.admissionregistration.k8s.io/some-other
@@ -464,6 +464,10 @@ pod=$(kubectl -n inj-13 get pods -l app=app -o jsonpath='{.items[0].metadata.nam
   || fail "inj_13: readiness probe does not go through the sidecar"
 [[ $(jp inj-13 "$pod" '{.spec.containers[?(@.name=="app")].readinessProbe.httpGet.port}') == 15100 ]] \
   || fail "inj_13: readiness probe port is not the sidecar admin port"
+[[ $(jp inj-13 "$pod" '{.spec.containers[?(@.name=="app")].startupProbe.httpGet.path}') == /app-health/app/startupz ]] \
+  || fail "inj_13: tcpSocket startup probe was not rewritten to go through the sidecar"
+[[ $(jp inj-13 "$pod" '{.spec.initContainers[?(@.name=="mimic-init")].env[?(@.name=="MIMIC_EXCLUDE_INBOUND_PORTS")].value}') == 15100 ]] \
+  || fail "inj_13: a probe port is excluded from inbound interception"
 
 kubectl -n inj-13-up wait --for=condition=Ready pod/client --timeout=180s >/dev/null \
   || fail "inj_13: client pod in inj-13-up not Ready (image pull?)"
@@ -473,6 +477,15 @@ kubectl -n inj-13-up exec client -- python3 -c \
   || fail "inj_13: request from another pod to the app Service failed"
 wait_tcp_increase inj-13 inbound "$before" \
   || fail "inj_13: inbound connection not counted as mimic_tcp_connections_total{direction=\"inbound\",result=\"ok\"}"
+
+# The port of the tcpSocket probe is intercepted too.
+pod_ip=$(jp inj-13 "$pod" '{.status.podIP}')
+before=$(tcp_count inj-13 inbound ok) || true; before=${before:-0}
+kubectl -n inj-13-up exec client -- python3 -c \
+  "import urllib.request; urllib.request.urlopen('http://$pod_ip:9090/ready', timeout=10).read()" \
+  || fail "inj_13: request from another pod to the tcpSocket probe port failed"
+wait_tcp_increase inj-13 inbound "$before" \
+  || fail "inj_13: connection to the tcpSocket probe port bypassed the sidecar"
 
 before=$(tcp_count inj-13 outbound ok) || true; before=${before:-0}
 kubectl -n inj-13 exec "$pod" -c app -- python3 -c \
@@ -870,9 +883,9 @@ seed0=$(seed_of)
   || fail "tls_24: the controller Service has no sidecar-api port 8444"
 [[ $(kubectl -n "$NS" get networkpolicy $RELEASE-controller -o jsonpath='{.spec.ingress[*].ports[*].port}') == *8444* ]] \
   || fail "tls_24: the controller NetworkPolicy does not allow port 8444"
-can yes "get the TLS seed Secret" get secret/$RELEASE-tls-ca -n "$NS"
-can yes "update the TLS seed Secret" update secret/$RELEASE-tls-ca -n "$NS"
-can no "get another Secret" get secret/some-other -n "$NS"
+CAN_ID=tls_24 can yes "get the TLS seed Secret" get secret/$RELEASE-tls-ca -n "$NS"
+CAN_ID=tls_24 can yes "update the TLS seed Secret" update secret/$RELEASE-tls-ca -n "$NS"
+CAN_ID=tls_24 can no "get another Secret" get secret/some-other -n "$NS"
 admin_forward
 curl -fs localhost:18081/metrics | grep '^mimic_tls_seed_loaded 1' >/dev/null || fail "tls_24: mimic_tls_seed_loaded is not 1"
 exclude_max=$(seq -s, -f 'h%g.example.test' 0 256)

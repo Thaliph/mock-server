@@ -300,8 +300,9 @@ jobs:
         env:
           SKIP_BUILD: "1"
 
-  # Path filters for the fuzz jobs: only a pull request that touches the HTTP/1 codec (or the
-  # discovery module) or the fuzz crate runs the matching job. Other events leave them false.
+  # Path filters for the fuzz jobs: only a pull request that touches the HTTP/1 codec (its
+  # module, `proxy.rs` that declares it, the Cargo files that pin its dependencies) or the
+  # discovery module, or the fuzz crate runs the matching job. Other events leave them false.
   changes:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -321,7 +322,7 @@ jobs:
           codec=false
           discovery=false
           if [ "$EVENT" = pull_request ]; then
-            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/proxy/http1 fuzz)" ]; then
+            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/proxy/http1 crates/mimic-core/src/proxy.rs Cargo.toml Cargo.lock fuzz)" ]; then
               codec=true
             fi
             if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/discovery fuzz)" ]; then

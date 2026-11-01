@@ -39,12 +39,13 @@ pub const METHOD_LIMIT: usize = 64;
 pub const CAPTURE_BODY_LIMIT: usize = 256 * 1024;
 /// Requests the relay reads ahead of their responses.
 pub const READ_AHEAD: usize = 32;
-/// Fixed part of the retained state of one direction, in bytes.
-pub const FIXED_PER_DIRECTION: usize = 128 * 1024;
-/// Bound of [`Codec::retained_bytes`]: 64 KiB of head or trailer section, plus a fixed size
-/// per direction (the requests waiting for a response on the client side, one request head
-/// on the server side).
-pub const RETAINED_LIMIT: usize = HEAD_LIMIT + 2 * FIXED_PER_DIRECTION;
+/// Most bytes a [`RequestHead`] keeps (capacity of its strings included).
+const HEAD_BOUND: usize =
+    mem::size_of::<RequestHead>() + METHOD_LIMIT + PATH_LIMIT + 2 * AUTHORITY_LIMIT;
+/// Bound of [`Codec::retained_bytes`] (allocated capacity, not length): a head, trailer
+/// section or held buffer of at most 64 KiB in each direction, the requests waiting for a
+/// response (at most [`READ_AHEAD`]), and the one head a body keeps on each side.
+pub const RETAINED_LIMIT: usize = 2 * HEAD_LIMIT + (READ_AHEAD + 2) * HEAD_BOUND;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
@@ -154,6 +155,8 @@ struct Fields {
     bad_content_length: bool,
     /// Transfer codings of every `transfer-encoding` header, lowercase.
     codings: Option<Vec<String>>,
+    /// A transfer coding with parameters, or a quote: recipients disagree on what it frames.
+    coding_parameters: bool,
     host: Option<String>,
     connection_upgrade: bool,
     has_upgrade: bool,
@@ -181,6 +184,7 @@ fn collect_fields<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Fields {
         content_lengths: Vec::new(),
         bad_content_length: false,
         codings: None,
+        coding_parameters: false,
         host: None,
         connection_upgrade: false,
         has_upgrade: false,
@@ -212,8 +216,8 @@ fn collect_fields<'a>(lines: impl Iterator<Item = &'a [u8]>) -> Fields {
             }
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
             let codings = f.codings.get_or_insert_with(Vec::new);
+            f.coding_parameters |= value.iter().any(|&b| b == b';' || b == b'"');
             for item in value.split(|&b| b == b',') {
-                let item = item.split(|&b| b == b';').next().unwrap_or_default();
                 let item = trim_ows(item);
                 if !item.is_empty() {
                     codings.push(String::from_utf8_lossy(item).to_ascii_lowercase());
@@ -242,6 +246,9 @@ impl Fields {
         if self.bad_content_length || self.content_lengths.windows(2).any(|w| w[0] != w[1]) {
             return Err(Reason::BadContentLength);
         }
+        if self.coding_parameters {
+            return Err(Reason::BadTransferEncoding);
+        }
         match (&self.codings, self.content_lengths.first()) {
             (Some(_), Some(_)) => Err(Reason::ConflictingLength),
             (Some(codings), None) => {
@@ -268,6 +275,8 @@ fn truncate(mut s: String, limit: usize) -> String {
             end -= 1;
         }
         s.truncate(end);
+        // The cut tail would stay allocated, and counted, otherwise.
+        s.shrink_to_fit();
     }
     s
 }
@@ -275,10 +284,10 @@ fn truncate(mut s: String, limit: usize) -> String {
 /// Bytes a request head keeps in memory.
 fn head_size(head: &RequestHead) -> usize {
     mem::size_of::<RequestHead>()
-        + head.method.len()
-        + head.path.len()
-        + head.uri_authority.as_ref().map_or(0, String::len)
-        + head.host.as_ref().map_or(0, String::len)
+        + head.method.capacity()
+        + head.path.capacity()
+        + head.uri_authority.as_ref().map_or(0, String::capacity)
+        + head.host.as_ref().map_or(0, String::capacity)
 }
 
 /// The part of an authority after any userinfo.
@@ -484,7 +493,7 @@ impl Codec {
         let req = match &self.req {
             ReqState::Head(scanner) => scanner.retained(),
             ReqState::Body { body, head } => body.retained() + head_size(head),
-            ReqState::Held { buf, .. } => buf.len(),
+            ReqState::Held { buf, .. } => buf.capacity(),
         };
         let resp = match &self.resp {
             RespState::Head(scanner) => scanner.retained(),
@@ -590,8 +599,18 @@ impl Codec {
                 }
                 ReqState::Held { seq, mut buf } => {
                     if buf.len() + data.len() > HEAD_LIMIT {
-                        self.unframed(Side::Client, Reason::HeldOverflow, None, events);
+                        // The copy is dropped, the bytes are all used: the relay forwards them.
+                        let held = self.pending.iter().find(|p| p.seq == seq);
+                        let request = held.map(|p| p.head.clone());
+                        self.unframed(Side::Client, Reason::HeldOverflow, request, events);
                     } else {
+                        // Grow geometrically but never past the limit, so the allocation
+                        // (what is counted) stays within it.
+                        let needed = buf.len() + data.len();
+                        if needed > buf.capacity() {
+                            let target = needed.max(2 * buf.capacity()).min(HEAD_LIMIT);
+                            buf.reserve_exact(target - buf.len());
+                        }
                         buf.extend_from_slice(data);
                         self.req = ReqState::Held { seq, buf };
                     }

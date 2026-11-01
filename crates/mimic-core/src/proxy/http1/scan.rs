@@ -95,7 +95,7 @@ impl HeadScanner {
 
     /// Bytes buffered for the head or trailer section being read.
     pub(super) fn retained(&self) -> usize {
-        self.buf.len()
+        self.buf.capacity()
     }
 
     /// Nothing of a head or trailer section was read yet.
