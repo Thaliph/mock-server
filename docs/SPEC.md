@@ -729,8 +729,10 @@ Everything below except the capture tap, content decoding and the recorder threa
   `Content-Length`, a malformed body, session or sequence, or a report that fails the
   structural check of §7.3; `413` when `Content-Length` is over
   `MIMIC_SIDECAR_API_MAX_REPORT`, answered before the body is read; `405` for another method;
-  `429` over the rate; `507` when the deployment is new and its namespace already holds
-  `MIMIC_STORE_MAX_DEPLOYMENTS` deployments; `503` with `Retry-After: 1` when the bodies being
+  `429` over the rate; `507` when the report has more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS`
+  endpoints in a direction (the push is refused whole, never truncated) or when the
+  deployment is new and its namespace already holds `MIMIC_STORE_MAX_DEPLOYMENTS`
+  deployments; `503` with `Retry-After: 1` when the bodies being
   read would exceed `MIMIC_SIDECAR_API_BODY_BUDGET`, Valkey is unavailable, the write lost 5
   optimistic attempts (§7.3) or the `TokenReview` fails.
 - **Shipping client** (sidecar, F5). Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (the first one after
@@ -755,7 +757,7 @@ Everything below except the capture tap, content decoding and the recorder threa
 - One log line per request (`target` = `sidecar_api`): `endpoint` (the route, e.g.
   `/v1/workloads/{deployment}/report`), `namespace`, `pod`, `deployment`, `result` (`ok`,
   `duplicate`, `unauthenticated`, `forbidden`, `invalid`, `too_large`, `rate_limited`,
-  `deployment_limit`, `unavailable`), plus for a push `session`, `sequence`, `bytes`, and for
+  `push_limit`, `deployment_limit`, `unavailable`), plus for a push `session`, `sequence`, `bytes`, and for
   `invalid` a `reason` from a fixed list; never the token, the key or report content. Metric
   `mimic_sidecar_api_requests_total{endpoint,result}`. A rate-limited request is logged at
   DEBUG only (the metric counts it), so a flood cannot flood the logs.
@@ -779,13 +781,14 @@ Everything below except the capture tap, content decoding and the recorder threa
 - **Push processing**: structural check of the posted report, then re-redaction, then
   stamping, then the write. Nothing of a push is stored or logged before its re-redaction.
   - *Structural check* (pure, `mimic-core`): `"version": 1` and every bound of §6 — at most
-    `MIMIC_STORE_MAX_ENDPOINTS` endpoints per direction, 20 samples and 16 hosts (each at most
+    `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints per direction (else `507`, reason
+    `push_limit`, so that one pod cannot fill the store in one push), 20 samples and 16 hosts (each at most
     1024 bytes) per endpoint, statuses 100–599, histogram buckets within the §6 range, at most
     512 nodes, 16 levels and a cut level of at most 16 per schema, names of at most 128
     bytes, at most 64 query keys and 64 headers, 128 volatile fields and 32 hashes per
     sketch, paths and templates of at most 2048 bytes and 32 segments, 16 media types per
     side, sample bodies only for parsed media types and of at most 256 KiB, no unknown field.
-    A violation is `400` with its `reason`.
+    Any other violation is `400` with its `reason`.
   - *Re-redaction* (pure, idempotent): the §6 redaction applied again to every sample, host,
     concrete path and volatile field with the built-in rules and the union of
     `spec.discovery.redact` of the `MimicWorkload`s naming the deployment (from the
@@ -814,15 +817,29 @@ Everything below except the capture tap, content decoding and the recorder threa
     `deployment`), push `503`, read `500`.
 - **Bounded merge** (pure, `mimic-core`): the §6 merge under the store limits
   (`MIMIC_STORE_MAX_LITERALS`, `MIMIC_STORE_MAX_ENDPOINTS` per direction,
-  `MIMIC_STORE_SAMPLE_BUDGET` per deployment), refusing growth as the sidecar does: a pushed
-  endpoint that is new past the endpoint limit is refused (`endpoint_limit`), a new sample
-  that does not fit the budget is refused (`budget`) while counters, histograms, schemas and
-  volatility still merge; counters saturate at 2^64 − 1. The merge re-applies templating on
-  the union: a node that the deployment sees above the literal limit absorbs. Below the
-  limits the stored report does not depend on the order or grouping of pushes.
+  `MIMIC_STORE_SAMPLE_BUDGET` per deployment); counters saturate at 2^64 − 1. The merge
+  re-applies templating on the union: a node that the deployment sees above the literal limit
+  absorbs. Below the limits the stored report does not depend on the order or grouping of
+  pushes. At a limit, what is kept is chosen by traffic, never by key order alone, so that
+  endpoints that sort first (`/!`, `/0`, the paths of a scanner the app answers `2xx`) cannot
+  crowd out the deployment's real API:
+  - *Endpoints*: when the union holds more than `MIMIC_STORE_MAX_ENDPOINTS` endpoints in a
+    direction, the endpoints kept are the first ones ranked by total exchange count (the sum
+    of their status counters) descending, then stored before new (an endpoint of the stored
+    report wins a tie over one this write adds), then by key (method, template). The others
+    are dropped (`evicted` when they were stored, `endpoint_limit` refused when they were new).
+  - *Samples*: a new sample that does not fit `MIMIC_STORE_SAMPLE_BUDGET` is refused
+    (`budget`), unless its endpoint has no sample of its status class (`1xx` … `5xx`): then
+    samples are evicted to make room, one at a time, each time from the (endpoint, status
+    class) of the deployment holding the most samples (ties: the most sample bytes, then the
+    larger key), the sample with the largest key first, never taking a class of an endpoint
+    to zero samples; if room cannot be made that way the new sample is refused (`budget`)
+    and nothing is evicted. Counters, histograms, schemas and volatility merge whatever is
+    refused or evicted.
   Refusals are counted in `mimic_store_refused_total{kind,reason}` with one WARN
   `store limit reached` (`namespace`, `deployment`, `reason`) per deployment and reason per
-  process.
+  process; evictions in `mimic_store_evicted_total{kind}` with one WARN `store evicted`
+  (`namespace`, `deployment`, `kind`, `count`) per deployment and kind per process.
 - **Pod churn**: no pod is read. A deleted pod's data stays merged (the deployment's API is
   the union over its life) and it ships its last report at `SIGTERM`; the pods of a rolling
   update push into the same key; a deleted pod's `:pods` and `:seq` fields expire after
@@ -933,6 +950,7 @@ Everything below except the capture tap, content decoding and the recorder threa
   | `mimic_store_report_bytes` | histogram, size of each report written; buckets 4Ki, 16Ki, 64Ki, 256Ki, 1Mi, 4Mi, 16Mi, 64Mi | — |
   | `mimic_store_pushes_total` | counter, pushes by outcome | `result` (`applied`, `duplicate`) |
   | `mimic_store_refused_total` | counter, growth refused by the bounded merge | `kind` (`endpoint`, `sample`), `reason` (`endpoint_limit`, `budget`) |
+  | `mimic_store_evicted_total` | counter, stored endpoints and samples displaced by the bounded merge (§7.3) | `kind` (`endpoint`, `sample`) |
   | `mimic_store_expired_total` | counter, endpoints and samples dropped by retention | `kind` |
   | `mimic_status_updates_total` | counter, `MimicWorkload` status applies | `result` (`ok`, `error`) |
 
@@ -997,6 +1015,7 @@ Everything below except the capture tap, content decoding and the recorder threa
 | `MIMIC_SIDECAR_API_BODY_BUDGET` | `64Mi` | Push bodies being read at once, in bytes (same syntax; at least `MIMIC_SIDECAR_API_MAX_REPORT`, at most 4Gi). |
 | `MIMIC_STORE_TTL` | `30d` | Retention of a deployment's data after its last push, and of endpoints and samples after they were last seen (§7.3); 10s–365d. |
 | `MIMIC_STORE_MAX_ENDPOINTS` | `512` | Endpoints per direction and deployment in the store, 1–10000. |
+| `MIMIC_STORE_MAX_PUSH_ENDPOINTS` | `256` | Endpoints per direction in one pushed report (§7.2), 1–10000, at most `MIMIC_STORE_MAX_ENDPOINTS`. |
 | `MIMIC_STORE_MAX_LITERALS` | `32` | Literal limit of the store's templating (§6), 2–1000. |
 | `MIMIC_STORE_SAMPLE_BUDGET` | `4Mi` | Sample bytes per deployment in the store (1Mi–1Gi). |
 | `MIMIC_STORE_MAX_DEPLOYMENTS` | `50` | Deployments with data per namespace (§7.3), 1–100000. |
@@ -1350,20 +1369,20 @@ Sidecar integration tests use the fake sidecar API of F3. A *canary* is as in §
 
 | ID | Criterion |
 |---|---|
-| CTL-01 | **U.** The structural check of §7.3 accepts every report the recorder produces within the §6 bounds, merged or not (`proptest`, ≥ 10 000 cases), and rejects, each with its own fixed `reason`: a version other than 1; more endpoints per direction than the limit; 21 samples; 17 hosts or a host over 1024 bytes; status 99 or 600; a histogram bucket out of range; a schema of 513 nodes, of 17 levels or with a cut level of 17; a 129-byte name; 65 query keys or headers; 129 volatile fields or a 33-hash sketch; a 2049-byte or 33-segment path or template; 17 media types on a side; a 256 KiB + 1 sample body or a sample body for an opaque media type; an unknown field. `Report::from_json` then the check never panic on arbitrary input (`proptest`, and CTL-22). |
-| CTL-02 | **U.** The bounded merge equals the §6 `merge` while the result is within the store limits, and below them does not depend on the order or grouping of pushes (`proptest`); past `MIMIC_STORE_MAX_ENDPOINTS` in a direction the push's new endpoints are refused and counted (`endpoint_limit`) while its known endpoints merge; past `MIMIC_STORE_SAMPLE_BUDGET` new samples are refused (`budget`) while counters, histograms, schemas and volatility merge; two pushes each below the literal limit at a node absorb it when their union exceeds it; counters and buckets at 2^64 − 1 stay there; the result's `pod` is null. |
+| CTL-01 | **U.** The structural check of §7.3 accepts every report the recorder produces within the §6 bounds, merged or not (`proptest`, ≥ 10 000 cases), and rejects, each with its own fixed `reason`: a version other than 1; 21 samples; 17 hosts or a host over 1024 bytes; status 99 or 600; a histogram bucket out of range; a schema of 513 nodes, of 17 levels or with a cut level of 17; a 129-byte name; 65 query keys or headers; 129 volatile fields or a 33-hash sketch; a 2049-byte or 33-segment path or template; 17 media types on a side; a 256 KiB + 1 sample body or a sample body for an opaque media type; an unknown field; more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints in a direction is `push_limit`, apart from the `400` reasons. `Report::from_json` then the check never panic on arbitrary input (`proptest`, and CTL-22). |
+| CTL-02 | **U.** The bounded merge equals the §6 `merge` while the result is within the store limits, and below them does not depend on the order or grouping of pushes (`proptest`); two pushes each below the literal limit at a node absorb it when their union exceeds it; counters and buckets at 2^64 − 1 stay there; the result's `pod` is null. Anti-crowding, with `MIMIC_STORE_MAX_ENDPOINTS` = 4: a store of 4 endpoints with 100 exchanges each, merged with a push of 50 endpoints `/!0` … `/!49` of 1 exchange each, keeps the 4 (50 `endpoint_limit` refusals, no eviction); a push of an endpoint with 101 exchanges evicts the stored endpoint with the fewest exchanges, ties broken by key (`evicted` = 1); a new endpoint tying the lowest stored count does not displace it. Samples, with a full budget: a new `5xx` sample of an endpoint holding only `2xx` samples evicts samples of the (endpoint, class) with the most samples until it fits, never the only sample of a class; a new `2xx` sample of that endpoint is refused (`budget`); when room cannot be made without emptying a class, nothing is evicted. The same input always gives byte-identical output; `refused` and `evicted` counts are returned per kind and reason. |
 | CTL-03 | **U.** Re-redaction is idempotent and leaves unchanged a report recorded with the same redactor. For reports recorded with a redactor that lacks a name the controller's redactor has (`proptest`, ≥ 10 000 cases), with a canary under that name at a random place (query, header, form or JSON body at any depth, request or response, URL-valued header), the re-redacted report contains neither the canary nor its XXH3 hash in decimal or hex, its sample keys are the hashes of the re-redacted content, and the field is marked `redacted` without sketch. A canary in a detected form (JWT, card, token prefix) in a report that bypassed the sidecar's redaction is removed the same way. |
 | CTL-04 | **U.** Retention: stamping a push with day `D` sets `last_seen = D` on each endpoint and sample; merge keeps the larger value (commutative, associative); dropping with day `T` and a TTL of `n` days removes exactly the endpoints and samples with `last_seen < T − n` (counted per kind); a sidecar report without `last_seen` parses, and a sidecar never serialises it. |
 | CTL-05 | **U.** The key names of §7.3 for namespace `shop` and deployment `pay.v2` are byte-exact; a namespace or deployment name that is not DNS-1123 is refused before any key is built. The sequence decision applies a push whose sequence is above the stored one of its pod and session, or that has none, and reports any other as a duplicate; a session that is not 32 lower-case hex characters and a sequence of 0 or above 2^53 are `invalid`. |
 | CTL-06 | **U.** The status of §7.4 is a pure function of `:meta`, the pods' push times, the window and the current time (passed in): byte-identical for the same input; a pod counts exactly when its last push is at or after now − window; without data the counts are zero and `lastPushTime` is absent; `lastPushTime` is RFC 3339 UTC in seconds; directions without endpoints are omitted. |
-| CTL-07 | **I.** `POST /v1/workloads/<deployment>/report` answers as §7.2 says: `200` `{"applied": true}` and the stored report equals the bounded merge; the same body again, and a lower sequence of the same session, `200` `{"applied": false}` with `:report` and `:meta` unchanged; a new session of the same pod applies from sequence 1; `401` and `403` as TLS-09; `400` for malformed JSON, a bad session or sequence, a missing `Content-Length` and one CTL-01 violation; `405`; `413` when `Content-Length` is over `MIMIC_SIDECAR_API_MAX_REPORT`, received by the client before it has sent any body byte; `507` for a new deployment once `MIMIC_STORE_MAX_DEPLOYMENTS` (= 2 in the test) deployments of the namespace have data, while those two still apply; `503` with `Retry-After` while Valkey is stopped, when the `TokenReview` fails, and when two concurrent bodies exceed `MIMIC_SIDECAR_API_BODY_BUDGET`. An unauthenticated request declaring a 1 GiB body is answered `401` while the client has sent only its headers. |
+| CTL-07 | **I.** `POST /v1/workloads/<deployment>/report` answers as §7.2 says: `200` `{"applied": true}` and the stored report equals the bounded merge; the same body again, and a lower sequence of the same session, `200` `{"applied": false}` with `:report` and `:meta` unchanged; a new session of the same pod applies from sequence 1; `401` and `403` as TLS-09; `400` for malformed JSON, a bad session or sequence, a missing `Content-Length` and one CTL-01 violation; `405`; `413` when `Content-Length` is over `MIMIC_SIDECAR_API_MAX_REPORT`, received by the client before it has sent any body byte; `507` for a report over `MIMIC_STORE_MAX_PUSH_ENDPOINTS` (= 3 in the test) endpoints in a direction, with nothing stored, and for a new deployment once `MIMIC_STORE_MAX_DEPLOYMENTS` (= 2 in the test) deployments of the namespace have data, while those two still apply; `503` with `Retry-After` while Valkey is stopped, when the `TokenReview` fails, and when two concurrent bodies exceed `MIMIC_SIDECAR_API_BODY_BUDGET`. An unauthenticated request declaring a 1 GiB body is answered `401` while the client has sent only its headers. |
 | CTL-08 | **I.** Rate limit and review cache: with `MIMIC_SIDECAR_API_RATE=5`, 30 requests sent at once from one source get 10 answers other than `429` and 20 `429` with `Retry-After: 1`, the fake API server receives no `TokenReview` for the `429`s, a second source is served meanwhile, and 1 s later 5 more requests from the first pass. Two pushes with the same token within 60 s cause one `TokenReview`; another token causes its own; a failed review is not cached (the next request with that token is reviewed again). |
 | CTL-09 | **I.** Applied once across replicas: two controller processes share one Valkey; 16 simulated sidecars (pods of 2 deployments) each post 50 generated pushes to random replicas, 30 % of them posted twice and 10 % posted to both replicas at once, with limits that are not reached. For each deployment the stored `:report` is byte-identical to the bounded merge of its distinct pushes, `:meta` `exchanges` is their sum, and `mimic_store_writes_total{result="conflict"}` is above 0 on a replica (contention happened). Passes 3 runs in a row. |
 | CTL-10 | **I.** Keys and expiry: after a push exactly the keys of §7.3 exist for its deployment, with their types and fields; with `MIMIC_STORE_TTL=10s` every key and both index members have an expiry of at most 10 s, refreshed by each applied push (a duplicate refreshes only its `:pods` field); 10 s (+ 2 s) after the last push the deployment's keys and index members are gone, and the `:pods` and `:seq` fields expire after min(24 h, TTL). |
 | CTL-11 | **I.** Nothing sensitive reaches Valkey: pushes carrying the DSC-15 canaries unredacted (as a faulty sidecar would send them) and a canary under a name that only the `MimicWorkload`'s `spec.discovery.redact` lists are applied, and no value of any `mimic:v1:*` key (dumped with `SCAN` and `GET`/`HGETALL`/`ZRANGE`) contains a canary, its XXH3 hash or the bearer token; nor does stdout or `/metrics`. |
-| CTL-12 | **I.** Each push writes one `sidecar_api` line with the §7.2 fields (`endpoint` `/v1/workloads/{deployment}/report`, `session`, `sequence`, `bytes`, `result`, `reason` for `invalid`), at DEBUG for `rate_limited`; after a known sequence of pushes `mimic_sidecar_api_requests_total{endpoint,result}`, `mimic_store_pushes_total`, `mimic_store_writes_total`, `mimic_store_refused_total`, `mimic_store_report_bytes` and `mimic_store_write_duration_seconds` have the expected values; one WARN `store limit reached` per deployment and reason; no line and no series contains a path, template, header, sample, token or report content. |
+| CTL-12 | **I.** Each push writes one `sidecar_api` line with the §7.2 fields (`endpoint` `/v1/workloads/{deployment}/report`, `session`, `sequence`, `bytes`, `result`, `reason` for `invalid`), at DEBUG for `rate_limited`; after a known sequence of pushes `mimic_sidecar_api_requests_total{endpoint,result}`, `mimic_store_pushes_total`, `mimic_store_writes_total`, `mimic_store_refused_total`, `mimic_store_evicted_total`, `mimic_store_report_bytes` and `mimic_store_write_duration_seconds` have the expected values; one WARN `store limit reached` per deployment and reason and one WARN `store evicted` per deployment and kind; no line and no series contains a path, template, header, sample, token or report content. |
 | CTL-13 | **I.** Read API: `GET /v1/workloads`, `/v1/workloads/<ns>/<dep>` and `/v1/workloads/<ns>/<dep>/report` on `MIMIC_UI_ADDR` answer as §7.5 (list sorted, pods map, report bytes equal to `:report`); `404` for a deployment without data, `400` for an invalid name, `405` for `POST` and `DELETE`, `503` while Valkey is stopped, `500` with one ERROR `stored report unreadable` for a corrupted `:report` (also refused by a push, `503`, without overwriting it). With `MIMIC_UI_ADDR=0.0.0.0:<port>` a request from the host's non-loopback address gets `403`. |
-| CTL-14 | **I.** An invalid value of each variable added in §10.2 (out of range, bad suffix, `MIMIC_SIDECAR_API_BODY_BUDGET` below `MIMIC_SIDECAR_API_MAX_REPORT`, an unparsable `MIMIC_UI_ADDR`) and of `MIMIC_DISCOVERY_PUSH_INTERVAL` exits 2 before listening (FND-01); `1m`, `2h` and `30d` parse as durations. |
+| CTL-14 | **I.** An invalid value of each variable added in §10.2 (out of range, bad suffix, `MIMIC_SIDECAR_API_BODY_BUDGET` below `MIMIC_SIDECAR_API_MAX_REPORT`, `MIMIC_STORE_MAX_PUSH_ENDPOINTS` above `MIMIC_STORE_MAX_ENDPOINTS`, an unparsable `MIMIC_UI_ADDR`) and of `MIMIC_DISCOVERY_PUSH_INTERVAL` exits 2 before listening (FND-01); `1m`, `2h` and `30d` parse as durations. |
 | CTL-15 | **I.** Shipping: with `MIMIC_DISCOVERY_PUSH_INTERVAL=1s` and exchanges to the test app, the sidecar posts to `/v1/workloads/<MIMIC_WORKLOAD>/report` bodies with one 32-hex session and sequences 1, 2, …; the exchanges of all posts sum to the exchanges recorded; an interval without exchanges posts nothing; the token file is read for each post; after a `200`, `/discovery` holds only exchanges recorded since; a restarted sidecar posts a new session from sequence 1. Without `MIMIC_CONTROLLER_URL` nothing is posted and one INFO `report shipping disabled` is written. |
 | CTL-16 | **I.** Retries: while the fake API answers `503`, resets the connection or stays silent past 30 s, the sidecar posts the same bytes with the same sequence again with the 1, 2, 4 … s backoff, and the exchanges recorded meanwhile go into the next sequence, posted only after the pending one is acknowledged; `429` with `Retry-After: 3` delays the retry by at least 3 s; `413` is followed by the same sequence without samples; `400` drops the pending report with one WARN `report rejected` and the next sequence follows. Samples of the pending and current reports never exceed `MIMIC_DISCOVERY_SAMPLE_BUDGET`. `mimic_discovery_pushes_total{result}` and `mimic_discovery_last_push_timestamp_seconds` follow; one WARN `report push failed` per failure streak and one INFO `report push recovered`; no line holds the token. |
 | CTL-17 | **I.** At `SIGTERM`, a sidecar with a pending report and unshipped exchanges posts the pending then the current report and exits 0 within `MIMIC_SHUTDOWN_GRACE`; the fake API received every exchange once. With the fake API silent, it exits within the grace (+ 1 s) with one WARN `report not shipped` whose `exchanges` is the number lost. |
