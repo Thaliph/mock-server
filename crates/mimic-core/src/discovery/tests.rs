@@ -529,13 +529,14 @@ mod redaction {
             ..super::ex(&secret, 200, 1)
         };
         let mut report = Report::new(None);
-        report.record(&super::limits(50), &exchange);
+        report.record(&super::limits(50), &Redactor::default(), &exchange);
         let json = report.to_json();
         assert!(!json.contains(JWT), "{json}");
         assert!(json.contains("/pkg.Svc/<redacted>"), "{json}");
         // Not templated: an id-like segment stays literal.
         report.record(
             &super::limits(50),
+            &Redactor::default(),
             &Exchange {
                 grpc: true,
                 ..super::ex("/pkg.Svc/42", 200, 1)
