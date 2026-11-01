@@ -4,6 +4,7 @@
 mod cert_manager;
 mod certs;
 mod sidecar_api;
+mod store;
 mod tls;
 mod tls_ca;
 mod valkey;
