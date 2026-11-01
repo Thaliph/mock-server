@@ -713,3 +713,29 @@ async fn ctl_17_flush_gives_up_within_the_grace_and_counts_the_loss() {
     assert_eq!(lines[0]["level"], "WARN");
     assert_eq!(lines[0]["exchanges"], 3);
 }
+
+#[tokio::test]
+async fn ctl_17_flush_retries_fast_and_ignores_retry_after() {
+    // The kubelet leaves a sidecar about 2 s after the app containers stopped (#298): the flush
+    // must not sleep a backoff or a `Retry-After` of 1 s or more between two posts.
+    let _logs = capture_logs();
+    let rig = Rig::new(
+        vec![Reply::RetryAfter(503, 3), Reply::Reset],
+        Duration::from_secs(3600),
+        DiscoveryConfig::default(),
+    )
+    .await;
+    rig.call("users", 1).await;
+    rig.call("users", 2).await;
+    rig.recorded(2).await;
+    let mut shipper = rig.shipper();
+    let started = Instant::now();
+    shipper.flush(Duration::from_secs(10)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(rig.api.acknowledged(), 2, "{:?}", rig.api.posts());
+    assert_eq!(rig.api.count(), 3, "{:?}", rig.api.posts());
+}
