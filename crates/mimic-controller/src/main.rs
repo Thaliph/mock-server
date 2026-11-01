@@ -8,6 +8,7 @@ mod sidecar_api;
 mod store;
 mod tls;
 mod tls_ca;
+mod ui;
 mod valkey;
 mod webhook;
 mod webhook_config;
@@ -113,6 +114,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         }
     });
     let store = store::Store::new(config.valkey.clone(), config.push.store, store_metrics);
+    let ui_router = ui::router(store.clone());
     let health = valkey::Health::spawn(config.valkey);
     let readiness = Readiness::new({
         let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
@@ -189,6 +191,11 @@ async fn run(config: Config) -> std::io::Result<()> {
         shutdown.clone().wait(),
     );
 
+    // Plain HTTP, loopback peers only (spec §7.5).
+    let ui_listener = tokio::net::TcpListener::bind(config.push.ui_addr).await?;
+    tracing::info!(addr = %ui_listener.local_addr()?, "read api listening");
+    let ui_server = admin::serve_until(ui_listener, ui_router, grace, shutdown.clone().wait());
+
     let listener = admin::bind(config.common.admin_addr).await?;
     let admin_server = admin::serve_until(
         listener,
@@ -196,6 +203,6 @@ async fn run(config: Config) -> std::io::Result<()> {
         grace,
         shutdown.wait(),
     );
-    tokio::try_join!(webhook_server, api_server, admin_server)?;
+    tokio::try_join!(webhook_server, api_server, ui_server, admin_server)?;
     Ok(())
 }

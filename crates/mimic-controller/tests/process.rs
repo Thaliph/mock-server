@@ -14,6 +14,8 @@ use mimic_runtime::testing::{Process, http_get, run, wait_status};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mimic-controller");
 const ADMIN: (&str, &str) = ("MIMIC_ADMIN_ADDR", "127.0.0.1:0");
+/// The read API listens on a free loopback port, not on 8080 (several controllers run at once).
+const UI: (&str, &str) = ("MIMIC_UI_ADDR", "127.0.0.1:0");
 /// Required by the webhook (spec §10.2); the listener takes any free port.
 const WEBHOOK: [(&str, &str); 9] = [
     ("MIMIC_SIDECAR_API_ADDR", "127.0.0.1:0"),
@@ -29,7 +31,7 @@ const WEBHOOK: [(&str, &str); 9] = [
 
 /// The admin address, the webhook settings and `extra`.
 fn env<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-    [&[ADMIN][..], &WEBHOOK, extra].concat()
+    [&[ADMIN, UI][..], &WEBHOOK, extra].concat()
 }
 
 struct FakeValkey {
@@ -832,6 +834,51 @@ fn inj_20_a_changed_or_emptied_ca_bundle_is_restored_within_10s() {
     wait_until(|| kube.ca_bundles().iter().all(|b| *b == encoded));
     assert_eq!(kube.secret(), data, "no new certificate");
     assert!(kube.state.lock().unwrap().unknown.is_empty());
+}
+
+/// A non-loopback address of the host: the one it would use to reach a remote peer.
+fn host_address() -> std::net::IpAddr {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    // A UDP connect sends nothing: it only selects the route.
+    socket
+        .connect("192.0.2.1:9")
+        .expect("the host has a route to a non-loopback address");
+    socket.local_addr().unwrap().ip()
+}
+
+#[test]
+fn ctl_13_the_read_api_refuses_a_non_loopback_peer_and_stops_on_sigterm() {
+    let kube = FakeKube::start("ctl13");
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let ui = format!("0.0.0.0:{}", free_addr().port());
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[
+            ("MIMIC_VALKEY_URL", &url),
+            ("MIMIC_UI_ADDR", &ui),
+            ("MIMIC_SHUTDOWN_GRACE", "2s"),
+            ("KUBECONFIG", &kube.kubeconfig),
+        ]),
+    );
+    let line = controller.wait_log(Duration::from_secs(10), |v| {
+        v["message"] == "read api listening"
+    });
+    let bound: SocketAddr = line["addr"].as_str().unwrap().parse().unwrap();
+    let host = SocketAddr::new(host_address(), bound.port());
+    assert!(!host.ip().is_loopback(), "{host}");
+    assert_eq!(http_get(host, "/v1/workloads").0, 403);
+    assert_eq!(http_get(host, "/v1/workloads/shop/front/report").0, 403);
+    // A loopback peer is past the check: an unsupported method is a 405, not a 403.
+    let mut stream = TcpStream::connect(("127.0.0.1", bound.port())).unwrap();
+    stream
+        .write_all(b"DELETE /v1/workloads HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 405"), "{answer}");
+    controller.terminate();
+    assert!(controller.wait_exit(Duration::from_secs(3)).success());
 }
 
 fn wait_until(condition: impl Fn() -> bool) {

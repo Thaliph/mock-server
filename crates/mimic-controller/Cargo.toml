@@ -28,7 +28,7 @@ rustls-pki-types = "1.15.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 sha2 = "0.11.1"
-time = "0.3.55"
+time = { version = "0.3.55", features = ["formatting"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "signal"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1.44"
