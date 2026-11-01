@@ -8,7 +8,9 @@ use serde_json::{Map, Value, json};
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::redact::{MARKER, Redactor};
-use super::schema::{MAX_NODES, MAX_PARAMS, Pair, Params, Schema, header_pairs, query_pairs};
+use super::schema::{
+    MAX_NAME, MAX_NODES, MAX_PARAMS, Pair, Params, Schema, cut_name, header_pairs, query_pairs,
+};
 use super::volatile::{MAX_FIELDS, Volatility};
 
 /// A body over this is not parsed (encoded or decoded): media type and size only.
@@ -23,15 +25,16 @@ const MAX_ITEMS: usize = 256;
 
 /// Upper bound of the serialised `Observed` of one endpoint, from the caps of spec §6: 512
 /// nodes per body schema, 64 keys per query, form or header set, 128 volatile fields, 16 media
-/// types per side. A name (key, header, field) is taken to be at most `MAX_BODY` bytes, and
-/// is counted twice in a schema node (`properties` and `required`).
+/// types per side. A name (key, header, field) is at most `MAX_NAME` bytes (spec §6), six times
+/// that once escaped in JSON, and is counted twice in a schema node (`properties` and
+/// `required`). A volatile field is a path of up to `MAX_LEVEL` names.
 pub const fn state_bound() -> usize {
-    const NAME: usize = MAX_BODY;
+    const NAME: usize = 6 * MAX_NAME;
     const NODE: usize = 2 * NAME + 300;
     const SCHEMA: usize = MAX_NODES * NODE;
     const PARAMS: usize = MAX_PARAMS * (NAME + NODE) + 100;
     const MEDIA: usize = MAX_MEDIA_LEN + 100 + SCHEMA + PARAMS;
-    const FIELD: usize = MAX_MEDIA_LEN + 16 + NAME + 32 * 24 + 100;
+    const FIELD: usize = MAX_MEDIA_LEN + 16 + (MAX_LEVEL + 1) * (NAME + 1) + 32 * 24 + 100;
     // Query, then request and response headers, then two sides of media types.
     3 * PARAMS + 2 * MAX_MEDIA * MEDIA + MAX_FIELDS * FIELD + 1024
 }
@@ -153,7 +156,7 @@ fn observe_leaves(
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                let p = format!("{pointer}/{}", pointer_token(k));
+                let p = format!("{pointer}/{}", pointer_token(cut_name(k)));
                 observe_leaves(fields, prefix, &p, v, level + 1);
             }
         }

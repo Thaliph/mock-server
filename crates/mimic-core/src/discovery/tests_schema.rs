@@ -1052,7 +1052,11 @@ mod names {
 
         let s = schema(json!({ straddling(): 1, ascii.clone(): {straddling(): 2} }));
         assert!(s["properties"].get(&cut).is_some());
-        assert!(s["properties"][&ascii_cut]["properties"].get(&cut).is_some());
+        assert!(
+            s["properties"][&ascii_cut]["properties"]
+                .get(&cut)
+                .is_some()
+        );
         assert_eq!(s["required"], json!([cut, ascii_cut]));
     }
 
@@ -1074,11 +1078,9 @@ mod names {
         // The sensitive word starts at byte 126: it is not in the first 128 bytes.
         let name = format!("{}token", "a".repeat(126));
         let cut = &name[..128];
-        let mut r = Redactor::default();
         let mut body = json!({ name.clone(): "plain-value" });
-        r.json(&mut body);
+        Redactor::default().json(&mut body);
         assert_eq!(body[&name], json!("<redacted>"));
-        let _ = &mut r;
 
         let q = format!("{name}=plain-value");
         let hdr = [(name.as_str(), "plain-value")];
@@ -1099,7 +1101,7 @@ mod names {
         ] {
             assert_eq!(f[&field]["redacted"], json!(true), "{field}");
         }
-        assert_eq!(f.as_object().unwrap().len(), 3);
+        assert!(f.as_object().unwrap().keys().all(|k| !k.contains(&name)));
     }
 
     #[test]
