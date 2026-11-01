@@ -1,3 +1,155 @@
+//! Push API, store and status settings of the controller (spec §10.2).
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use mimic_core::discovery::report::Limits;
+use mimic_runtime::config::{ConfigError, Env};
+
+use crate::store::StoreConfig;
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+const GIB: u64 = 1024 * MIB;
+const DAY: u64 = 86_400;
+const DEFAULT_UI: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+
+pub struct PushConfig {
+    /// `MIMIC_SIDECAR_API_RATE`: requests per second per source.
+    pub rate: u32,
+    /// `MIMIC_SIDECAR_API_MAX_REPORT`, in bytes.
+    pub max_report: usize,
+    /// `MIMIC_SIDECAR_API_BODY_BUDGET`, in bytes.
+    pub body_budget: u64,
+    /// `MIMIC_STORE_MAX_PUSH_ENDPOINTS`.
+    pub max_push_endpoints: usize,
+    pub store: StoreConfig,
+    /// `MIMIC_STATUS_INTERVAL` (read by the status reconciler).
+    #[allow(dead_code)]
+    pub status_interval: Duration,
+    /// `MIMIC_STATUS_POD_WINDOW`.
+    #[allow(dead_code)]
+    pub pod_window: Duration,
+    /// `MIMIC_UI_ADDR` (read by the read API).
+    #[allow(dead_code)]
+    pub ui_addr: SocketAddr,
+}
+
+impl PushConfig {
+    pub fn from_env(env: &Env) -> Result<PushConfig, ConfigError> {
+        let max_report = size(env, "MIMIC_SIDECAR_API_MAX_REPORT", 32 * MIB, 64 * KIB, GIB)?;
+        let var = "MIMIC_SIDECAR_API_BODY_BUDGET";
+        let body_budget = size(env, var, 64 * MIB, max_report, 4 * GIB)?;
+        let max_endpoints = number(env, "MIMIC_STORE_MAX_ENDPOINTS", 512, 1, 10_000)?;
+        let var = "MIMIC_STORE_MAX_PUSH_ENDPOINTS";
+        let max_push_endpoints = number(env, var, 256, 1, max_endpoints)?;
+        Ok(PushConfig {
+            rate: number(env, "MIMIC_SIDECAR_API_RATE", 10, 1, 10_000)?,
+            max_report: usize_of(max_report),
+            body_budget,
+            max_push_endpoints,
+            store: StoreConfig {
+                ttl: duration(env, "MIMIC_STORE_TTL", 30 * DAY, 10, 365 * DAY)?,
+                limits: Limits {
+                    max_literals: number(env, "MIMIC_STORE_MAX_LITERALS", 32, 2, 1000)?,
+                    max_endpoints,
+                    sample_budget: usize_of(size(
+                        env,
+                        "MIMIC_STORE_SAMPLE_BUDGET",
+                        4 * MIB,
+                        MIB,
+                        GIB,
+                    )?),
+                },
+                max_deployments: number(env, "MIMIC_STORE_MAX_DEPLOYMENTS", 50, 1, 100_000)?,
+            },
+            status_interval: duration(env, "MIMIC_STATUS_INTERVAL", 30, 1, 3600)?,
+            pod_window: duration(env, "MIMIC_STATUS_POD_WINDOW", 300, 1, DAY)?,
+            ui_addr: env.parse_or("MIMIC_UI_ADDR", DEFAULT_UI)?,
+        })
+    }
+}
+
+fn usize_of(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+/// An integer of `min..=max`.
+fn number<T>(env: &Env, var: &str, default: T, min: T, max: T) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+    T::Err: std::fmt::Display,
+{
+    let n = env.parse_or(var, default)?;
+    if (min..=max).contains(&n) {
+        Ok(n)
+    } else {
+        Err(ConfigError::invalid(
+            var,
+            &n.to_string(),
+            format!("expected a number from {min} to {max}"),
+        ))
+    }
+}
+
+/// `<n>`, `<n>Ki`, `<n>Mi` or `<n>Gi` bytes, from `min` to `max`.
+fn size(env: &Env, var: &str, default: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
+    let Some(value) = env.optional(var) else {
+        return Ok(default);
+    };
+    let (digits, unit) = match value {
+        v if v.ends_with("Ki") => (&v[..v.len() - 2], KIB),
+        v if v.ends_with("Mi") => (&v[..v.len() - 2], MIB),
+        v if v.ends_with("Gi") => (&v[..v.len() - 2], GIB),
+        v => (v, 1),
+    };
+    let bytes = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
+        .and_then(|n| n.checked_mul(unit));
+    match bytes {
+        Some(n) if (min..=max).contains(&n) => Ok(n),
+        _ => Err(ConfigError::invalid(
+            var,
+            value,
+            format!(
+                "expected a size (<n>, <n>Ki, <n>Mi or <n>Gi) from {} to {}",
+                human(min),
+                human(max)
+            ),
+        )),
+    }
+}
+
+fn human(bytes: u64) -> String {
+    match bytes {
+        b if b % GIB == 0 => format!("{}Gi", b / GIB),
+        b if b % MIB == 0 => format!("{}Mi", b / MIB),
+        b if b % KIB == 0 => format!("{}Ki", b / KIB),
+        b => b.to_string(),
+    }
+}
+
+/// A duration from `min` to `max` seconds.
+fn duration(
+    env: &Env,
+    var: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<Duration, ConfigError> {
+    let value = env.duration_or(var, Duration::from_secs(default))?;
+    if (Duration::from_secs(min)..=Duration::from_secs(max)).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ConfigError::invalid(
+            var,
+            env.optional(var).unwrap_or_default(),
+            format!("expected a duration from {min}s to {max}s"),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

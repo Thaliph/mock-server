@@ -7,9 +7,6 @@
 //! writes only if those are still what was read (compare-and-set), so a push is applied once
 //! whichever replica receives it.
 
-// Called by the push route (step 4 of F5).
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

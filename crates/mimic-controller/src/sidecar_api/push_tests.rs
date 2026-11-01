@@ -674,12 +674,26 @@ const CARD: &str = "4111111111111111";
 const GITHUB: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 const NAMED: &str = "CANARYnamedvalue12345";
 
-/// Replaces every redaction marker of `value` by `secret`, as a faulty sidecar would send it.
+/// Replaces every redaction marker of `value` by `secret`, as a faulty sidecar would send it,
+/// with the size of each sample that holds one kept true (the check verifies it).
 fn plant(value: &mut Value, secret: &str) {
     match value {
         Value::String(s) if s.contains(MARKER) => *s = s.replace(MARKER, secret),
         Value::Array(items) => items.iter_mut().for_each(|i| plant(i, secret)),
-        Value::Object(map) => map.values_mut().for_each(|i| plant(i, secret)),
+        Value::Object(map) => {
+            let planted = map.contains_key("request_shape").then(|| {
+                Value::Object(map.clone())
+                    .to_string()
+                    .matches(MARKER)
+                    .count()
+            });
+            map.values_mut().for_each(|i| plant(i, secret));
+            if let (Some(count), Some(bytes)) = (planted, map.get("bytes").and_then(Value::as_u64))
+            {
+                let grown = count * (secret.len() - MARKER.len());
+                map.insert("bytes".to_string(), json!(bytes + grown as u64));
+            }
+        }
         _ => {}
     }
 }
