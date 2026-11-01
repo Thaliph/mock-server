@@ -97,3 +97,42 @@ fn walk(counts: &mut Counts, redactor: &Redactor, value: &Value, depth: usize) {
         Value::Bool(_) | Value::Null => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln";
+
+    fn header(name: &str, value: &str) -> (String, String) {
+        (name.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn dsc_18_url_redactions_in_header_values_are_counted() {
+        let mut counts = Counts::new();
+        let location = format!("https://h/reset/{JWT}?token=T&page=2");
+        let headers = [header("Location", &location), header("Link", "<cb?code=1>")];
+        super::headers(&mut counts, &Redactor::default(), &headers);
+        assert_eq!(counts.get(&("header", "jwt")), Some(&1), "{counts:?}");
+        assert_eq!(counts.get(&("header", "name")), Some(&1), "{counts:?}");
+    }
+
+    #[test]
+    fn dsc_18_only_the_64_kept_headers_are_counted() {
+        let mut headers: Vec<_> = (0..100)
+            .map(|i| header(&format!("x-api-key-{i:03}"), "k"))
+            .collect();
+        headers.push(header("Connection", "close"));
+        let mut counts = Counts::new();
+        super::headers(&mut counts, &Redactor::default(), &headers);
+        assert_eq!(counts.get(&("header", "name")), Some(&64), "{counts:?}");
+    }
+
+    #[test]
+    fn dsc_18_percent_encoded_path_segments_are_counted() {
+        let mut counts = Counts::new();
+        path(&mut counts, &format!("/reset/%65{}", &JWT[1..]));
+        assert_eq!(counts.get(&("path", "jwt")), Some(&1), "{counts:?}");
+    }
+}

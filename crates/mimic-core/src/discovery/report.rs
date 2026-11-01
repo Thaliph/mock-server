@@ -446,9 +446,8 @@ impl Report {
     }
 
     /// Canonical JSON: sorted keys, `"version": 1`.
-    pub fn to_json(&self) -> String {
-        // Maps with sorted keys and plain data cannot fail to serialise.
-        serde_json::to_string(self).unwrap_or_default()
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
     }
 
     pub fn from_json(json: &str) -> Result<Self, String> {

@@ -294,6 +294,18 @@ mod tests {
     }
 
     #[test]
+    fn dsc_20_redactions_are_lower_cased() {
+        let cache = WorkloadCache::synced_with_settings(&[
+            ("shop", "w1", "api", &[], &["X-Tenant-Key", "Pin"]),
+            ("shop", "w2", "api", &[], &["pin", "BADGE"]),
+        ]);
+        assert_eq!(
+            cache.redact("shop", "api"),
+            ["badge", "pin", "x-tenant-key"]
+        );
+    }
+
+    #[test]
     fn dsc_20_entry_reads_spec_discovery_redact() {
         let object: DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "mimic.platform.io/v1alpha1", "kind": "MimicWorkload",

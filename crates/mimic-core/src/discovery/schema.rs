@@ -517,6 +517,15 @@ pub(super) fn header_pairs(redactor: &Redactor, headers: &[(&str, &str)]) -> Vec
         .collect()
 }
 
+/// The headers a report keeps (stub).
+pub fn kept_headers<'a>(headers: &[(&'a str, &'a str)]) -> Vec<(String, &'a str)> {
+    headers
+        .iter()
+        .map(|(n, v)| (n.to_ascii_lowercase(), *v))
+        .filter(|(k, _)| !k.starts_with(':') && !SKIPPED_HEADERS.contains(&k.as_str()))
+        .collect()
+}
+
 impl Params {
     /// A query string or an `application/x-www-form-urlencoded` body.
     pub fn from_query(redactor: &Redactor, query: &str) -> Self {

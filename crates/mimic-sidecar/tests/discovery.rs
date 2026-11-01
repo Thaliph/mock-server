@@ -211,7 +211,7 @@ async fn dsc_12_inbound_http1_exchanges_appear_in_the_report() {
     let orders = endpoints.iter().find(|e| e.method == "POST").unwrap();
     assert_eq!(orders.stats.statuses.get(&201), Some(&1));
     assert_eq!(orders.stats.statuses.get(&400), Some(&1));
-    let json = report.to_json();
+    let json = report.to_json().unwrap();
     for expected in ["dry_run", "qty", "sku", "total", "/users/3", "accept"] {
         assert!(json.contains(expected), "{expected} missing from {json}");
     }

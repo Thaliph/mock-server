@@ -195,6 +195,11 @@ fn has_userinfo_password(s: &str) -> bool {
     matches!(userinfo.split_once(':'), Some((_, password)) if !password.is_empty())
 }
 
+/// The value detector that catches a path segment (stub).
+pub fn segment_rule(s: &str) -> Option<Rule> {
+    value_rule(s)
+}
+
 /// A path with the value detectors applied segment by segment; other segments are unchanged.
 pub fn path(path: &str) -> String {
     path.split('/')
@@ -233,6 +238,11 @@ impl Redactor {
                 .filter(|n| !n.is_empty())
                 .collect(),
         }
+    }
+
+    /// Rules that redact parts of a header value (stub).
+    pub fn header_rules(&self, _name: &str, _value: &str) -> Vec<Rule> {
+        Vec::new()
     }
 
     /// True when a header name, query key, form field or JSON key is redacted by name.

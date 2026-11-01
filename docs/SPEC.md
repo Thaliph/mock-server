@@ -127,6 +127,8 @@ would see without mimic, except for the limits listed at the end of this section
   MySQL, SSH), or the client's first bytes are neither a TLS ClientHello, an HTTP/1.x request
   line nor the HTTP/2 preface, the connection is an opaque tunnel. Detection has no timeout,
   reads at most 16 KiB, and the bytes it read are forwarded unchanged.
+- **Listeners**: the accept queue (`listen` backlog) is `/proc/sys/net/core/somaxconn` when
+  readable and valid, else 1024.
 - **TLS**: outbound TLS is intercepted or passed through as §5 decides; inbound TLS and every
   passed-through connection go through untouched. The SNI of the ClientHello is read for logs
   and metrics. The decrypted stream of an intercepted connection follows the rules of this
@@ -455,7 +457,8 @@ Everything below except the capture tap, content decoding and the recorder threa
 - **Volatile fields** (values that change on every call: idempotency keys, timestamps, ids).
   Tracked per endpoint for query keys, headers and JSON/form body leaves (JSON pointer with
   array indices as `*`, e.g. `/items/*/id`), at most 128 fields (the first in byte order): `n`
-  (observations) and a bottom-32 sketch of the 64-bit XXH3 hashes of the redacted values. The
+  (exchanges that had the field: once per exchange, however many array items or repeated
+  headers carry it) and a bottom-32 sketch of the 64-bit XXH3 hashes of the redacted values. The
   distinct count `d` is exact while the sketch holds fewer than 32 hashes, else estimated
   (`31 / max normalised hash`). A field is **volatile** when `n ≥ 3` and `d ≥ n / 2`. Redacted
   fields are always marked `redacted`, which mock matching (§8) and the load test treat like
@@ -463,11 +466,17 @@ Everything below except the capture tap, content decoding and the recorder threa
 - **Redaction**, pure, applied to everything the report keeps (samples, `hosts`) and to the
   access-log `path`, before it is stored, logged or sent. The marker is the constant string
   `<redacted>` (stable: same output for any secret, so no hash of a secret is ever kept).
-  - *By name* (header name, query key, form field, JSON key; compared in lower case with `-`
-    and `_` removed): `authorization`, `proxyauthorization`, `cookie`, `setcookie`, and any
-    name containing `password`, `passwd`, `secret`, `token`, `apikey`, `auth`, `session`,
-    `signature`, `credential`, `privatekey`, `cvv`, `cvc`, `cardnumber`, `pan`, `iban`, `ssn`,
-    plus the names of `MIMIC_DISCOVERY_REDACT_NAMES`. The whole value (a JSON subtree
+  - *By name* (header name, query key, form field, JSON key): the name is split into tokens
+    at every character that is not a letter or a digit (`-`, `_`, `.`, ...), at a change of
+    case (`refreshToken` is `refresh`, `token`; `APIKey` is `api`, `key`) and between letters
+    and digits, then compared in lower case. A name is redacted when a run of consecutive
+    tokens, joined, equals a built-in name or one of `MIMIC_DISCOVERY_REDACT_NAMES` (with
+    `-` and `_` removed), or that name followed by `s`. Built-in names: `authorization`,
+    `proxyauthorization`, `cookie`, `setcookie`, `password`, `passwd`, `secret`, `token`,
+    `apikey`, `auth`, `session`, `signature`, `credential`, `privatekey`, `cvv`, `cvc`,
+    `cardnumber`, `pan`, `iban`, `ssn`. So `X-Api-Key`, `auth_token`, `Authorization`,
+    `client_secret`, `Session-Id` and `tokens` are redacted, `company`, `author`, `panel` and
+    `passenger` are not. The whole value (a JSON subtree
     included) becomes the marker, except: `authorization` keeps its scheme
     (`Bearer <redacted>`); `cookie` keeps cookie names (`a=<redacted>; b=<redacted>`);
     `set-cookie` keeps the name and attributes.
@@ -476,13 +485,16 @@ Everything below except the capture tap, content decoding and the recorder threa
     `alg`), a PEM block, a `Bearer `/`Basic ` credential, a 13–19 digit card number (spaces or
     dashes allowed) that passes Luhn, an AWS access key id (`AKIA`/`ASIA` + 16), and tokens with
     a known prefix (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `glpat-`,
-    `xox[abprs]-`, `sk_live_`, `rk_live_`, `sk-`); a URL's userinfo password.
+    `xox[abprs]-`, `sk_live_`, `rk_live_`, `sk-`); a URL's userinfo password. A path segment and a query value are percent-decoded for the
+    detectors (the stored form of a segment that is kept stays as received; a redacted one
+    becomes the marker): `%65yJ...` is a JWT, `Bearer%20x` a credential.
   - *URLs in header values* (`Location`, `Referer`, `Content-Location`, `Link: <url>; rel=next`,
-    `Refresh`, any value or token that contains `://` or starts with `/`) are redacted like a
+    `Refresh`, any value or token that contains `://`, `/`, `?` or `#`, so relative URLs too) are redacted like a
     path plus query: query parameters by name and value, path segments by value, and the
     fragment like a query. Scheme, host and other text are unchanged.
   - Opaque bodies are never kept (only media type and size). Redaction counts appear in
-    `mimic_discovery_redactions_total{location,rule}` (§9).
+    `mimic_discovery_redactions_total{location,rule}` (§9): a redaction inside a URL of a header
+    value counts under `header`, and only the at most 64 headers the report keeps are counted.
 - **Samples**: per endpoint at most **20**, each a redacted request (method, concrete path,
   query, headers, body) and response (status, headers, body), with its head latency. Each body
   is kept only when parsed and at most 256 KiB. Selection is deterministic and
@@ -504,7 +516,16 @@ Everything below except the capture tap, content decoding and the recorder threa
   template trees (with the absorbing rule), adds counters and histograms, merges schemas,
   sketches and `hosts`, and reselects samples: the sidecar records an exchange by merging a
   one-exchange report, and the controller (F5) uses the same function across pods. Merging is
-  not idempotent for counters: the transport must apply each report once (F5).
+  not idempotent for counters: the transport must apply each report once (F5). Counters
+  saturate at `u64::MAX` (a report read back from Valkey is not trusted). The merge also
+  enforces the limits it is given, so that the union of reports the controller does not trust
+  stays bounded: past `max_endpoints` it keeps the endpoints that sort first by direction, port,
+  template and method (the others, their counters included, are dropped, and the nodes left
+  empty are pruned), and while the samples exceed `sample_budget` it drops the sample with the
+  highest content hash (then the highest endpoint key). Both are functions of the merged
+  content: the merge is commutative; it is associative as long as no dropped endpoint would
+  have been absorbed by a later merge. `to_json` reports a serialisation error instead of an
+  empty document.
 - **Bounds.** At most `MIMIC_DISCOVERY_MAX_ENDPOINTS` endpoints per sidecar (further new
   endpoints are dropped, `endpoint_limit`, one WARN `endpoint limit reached`); the template tree
   keeps its shape for the life of the process (counters and samples are what F5 ships and
@@ -537,13 +558,16 @@ Everything below except the capture tap, content decoding and the recorder threa
   `method`, `template`) once per new endpoint (not for the parameter a node absorbs into),
   INFO `template absorbed` (`direction`, `port`, `method`, `template` = the new template of
   the exchange, `old` = the replaced `<METHOD> <template>` entries, comma-separated, the first
-  16, and `old_count`) when a node absorbs, WARN `endpoint limit reached` once, WARN `sample budget full` once until
-  samples are freed. Templates are redacted; no line holds a header value, query, body or
+  16, and `old_count`) when a node absorbs, WARN `endpoint limit reached` once, WARN `sample budget full` once when the budget
+  becomes full, again only after the samples fell below 7/8 of the budget and it filled anew;
+  ERROR `recorder panic` (counted `panic`) when the recorder fails on an exchange, which is
+  skipped. Templates are redacted; no line holds a header value, query, body or
   sample.
 - **Local access.** `GET /discovery` on the admin port answers the local report
   (`application/json`) only to clients on loopback (`127.0.0.1`, `::1`): `kubectl
   port-forward` (Kubernetes RBAC `pods/portforward` is the authentication) and the pod itself.
-  Any other peer gets 403. Its content is the redacted report, as it would be shipped.
+  Any other peer gets 403. Its content is the redacted report, as it would be shipped. A serialisation failure answers
+  500 and logs ERROR `discovery serialisation failed` once.
 - **Shipping (F5).** Every `MIMIC_DISCOVERY_PUSH_INTERVAL` and at `SIGTERM`, the sidecar
   posts the report accumulated since its last acknowledged post to the sidecar API (§7.2, same
   authentication, the deployment taken from the token's pod), with a per-pod sequence number;
@@ -565,8 +589,8 @@ Everything below except the capture tap, content decoding and the recorder threa
 - `MimicWorkload` (namespaced CRD, `mimic.platform.io/v1alpha1`): selects the deployment named
   by `spec.deployment` (required, DNS-1123 name, immutable) in its namespace, holds
   `spec.mode` (`discovery` | `mock`, default `discovery`), `spec.tls.exclude` (F3, §5),
-  `spec.discovery.redact` (F4, §6: extra names redacted by name, at most 64, applied like
-  `spec.tls.exclude` to pods created afterwards),
+  `spec.discovery.redact` (F4, §6: extra names redacted by name, at most 64, each of `a-z`, `A-Z`, `0-9`, `-`, `_`,
+  lower-cased by the webhook, applied like `spec.tls.exclude` to pods created afterwards),
   latency settings; `status` reports pods, mode convergence and
   counts. F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
   with their feature. When several `MimicWorkload`s name the same deployment, any of them
@@ -745,7 +769,7 @@ Everything below except the capture tap, content decoding and the recorder threa
   | `mimic_tls_passthrough_destinations` | gauge, remembered destinations (§5) | — |
   | `mimic_tls_intermediate_expiry_timestamp_seconds` | gauge, `notAfter` of the current intermediate, 0 when none | — |
   | `mimic_tls_intermediate_requests_total` | counter | `result` (`ok`, `error`, `mismatch`) |
-  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `dropped`) |
+  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `dropped`, `panic`) |
   | `mimic_discovery_bodies_total` | counter (F4), bodies of recorded exchanges | `direction`, `part` (`request`, `response`), `result` (`parsed`, `empty`, `opaque`, `too_large`, `encoding`, `invalid`, `budget`) |
   | `mimic_discovery_samples_total` | counter (F4), sample admissions | `direction`, `result` (`kept`, `replaced`, `rejected`, `budget`) |
   | `mimic_discovery_redactions_total` | counter (F4) | `location` (`path`, `query`, `header`, `body`), `rule` (`name`, `jwt`, `pem`, `credential`, `card`, `aws`, `token_prefix`, `userinfo`) |
@@ -837,7 +861,7 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_DISCOVERY_SAMPLE_BUDGET` | `16Mi` | Bytes held by samples (`<n>`, `<n>Ki`, `<n>Mi`; 1Mi–1Gi). Not set by the webhook. |
 | `MIMIC_DISCOVERY_CAPTURE_BUDGET` | `8Mi` | Bytes of bodies captured in flight and queued (same syntax; 1Mi–1Gi). Not set by the webhook. |
 | `MIMIC_DISCOVERY_QUEUE` | `1024` | Exchange records waiting for the recorder (1–65536). Not set by the webhook. |
-| `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Extra names redacted by name (§6), comma-separated, at most 64, each 1–64 characters of `a-z0-9-_` (compared like the built-in names); the webhook sets the sorted, deduplicated union of `spec.discovery.redact` of every `MimicWorkload` naming the deployment. |
+| `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Extra names redacted by name (§6), comma-separated, at most 64, each 1–64 characters of `a-z0-9-_` (compared like the built-in names); the webhook sets the sorted, deduplicated union, lower-cased, of `spec.discovery.redact` of every `MimicWorkload` naming the deployment. |
 
 ### 10.4 `mimic-init` variables
 
@@ -1107,12 +1131,12 @@ with a fake original destination (as in F2) and read `GET /discovery` from loopb
 | DSC-01 | **U.** Segment classification: `42`, a UUID in upper and lower case, a ULID, `5f2b9c1d` (hex with a digit), `2026-11-01`, `2026-11-01T10:00:00Z`, `a1b2c3d4e5f6g7h8i9` (16+ with letter and digit), `alice@example.com` and a JWT are parameters; `v1`, `api`, `users`, `deadbeef` (no digit), `health`, an empty last segment and `%41` (not decoded) are literals. Parameter names follow §6 (`/users/42/orders/7` → `/users/{users_id}/orders/{orders_id}`, `/42` → `/{param1}`, a repeated literal gets `{param<n>}`), and a gRPC path is never templated (it is still redacted: DSC-06). |
 | DSC-02 | **U.** Absorbing nodes: with `MIMIC_DISCOVERY_MAX_LITERALS` = 3, `/u/a`, `/u/b`, `/u/c` stay three endpoints, a fourth literal turns them into one `/u/{u_id}` whose counters, schemas and samples are the merge of the four, later literals map to it, and a `/u/42` parameter and the literals share it; siblings of `/u` are untouched. For any set of paths (`proptest`, ≥ 10 000 cases), every permutation of the arrival order gives the same templates. |
 | DSC-03 | **U.** Schema inference and merge follow §6: `type` sets with `null`; `integer` only while every number is integral; each `format` only when every value has it; `required` = present in every object; array `items` over the first 256 items; an object with 129 keys becomes a map; level 17 is `{}`. Query: keys percent-decoded, a repeated key is an `array`, a key missing once is not `required`, at most 64 keys (first in byte order). Headers: names in lower case, the skipped names of §6 absent, at most 64. `application/x-www-form-urlencoded` bodies get the same schema as the equivalent query; `text/plain`, `application/grpc` and `application/octet-stream` are opaque (media type and size). |
-| DSC-04 | **U.** Volatility: a field with values `a`, `b`, `c` is volatile; `a`, `b` (n = 2) is not; 10 observations of 2 values are not; 1000 distinct values are, and 1000 observations of 100 values are not (fixed data, deterministic hash). The sketch holds at most 32 hashes; merging two sketches equals the sketch of the union. At most 128 fields are tracked (first in byte order). A redacted field is marked `redacted`. |
-| DSC-05 | **U.** Redaction by name: each built-in name of §6, and names containing them in any case with `-`/`_` (`X-Api-Key`, `client_secret`, `refreshToken`, `Session-Id`), as a header, query key, form field and JSON key (also nested, and with an object or array value, which becomes the marker as a whole), gives `<redacted>`; `Authorization: Bearer x` → `Bearer <redacted>`, `Cookie: a=1; b=2` → `a=<redacted>; b=<redacted>`, `Set-Cookie: s=1; Path=/; HttpOnly` → `s=<redacted>; Path=/; HttpOnly`; a name of `MIMIC_DISCOVERY_REDACT_NAMES` is redacted; in a URL-valued header (`Location: https://h/cb?code=C&access_token=T`, `Referer`, `Link: <u?api_key=K>; rel=next`) the query parameters (and fragment) are redacted by name; `id`, `name` and `amount` are not. |
-| DSC-06 | **U.** Redaction by value, in a header value, a query value, a path segment, a JSON string and (cards) a JSON number: a JWT, a PEM private key, `Bearer`/`Basic` credentials, `4111 1111 1111 1111` and `4111-1111-1111-1111`, an `AKIA` key, each listed token prefix, and the password of `https://u:p@h/` become `<redacted>`, also inside a URL in a header value (`Location: https://h/reset/<JWT>`); near misses are kept (`4111111111111112` fails Luhn, three base64url parts whose first does not decode to JSON with `alg`, `AKIA` + 15). A redacted path segment is a parameter. The marker is the same for every secret. |
+| DSC-04 | **U.** Volatility: a field with values `a`, `b`, `c` is volatile; `a`, `b` (n = 2) is not; 10 observations of 2 values are not; 1000 distinct values are, and 1000 observations of 100 values are not (fixed data, deterministic hash). The sketch holds at most 32 hashes; merging two sketches equals the sketch of the union. At most 128 fields are tracked (first in byte order). A redacted field is marked `redacted`; `n` counts an exchange once, whatever the repeats inside it (a field in 10 array items, one call: `n` = 1). |
+| DSC-05 | **U.** Redaction by name: each built-in name of §6, and names containing them in any case with `-`/`_` (`X-Api-Key`, `client_secret`, `refreshToken`, `Session-Id`), as a header, query key, form field and JSON key (also nested, and with an object or array value, which becomes the marker as a whole), gives `<redacted>`; `Authorization: Bearer x` → `Bearer <redacted>`, `Cookie: a=1; b=2` → `a=<redacted>; b=<redacted>`, `Set-Cookie: s=1; Path=/; HttpOnly` → `s=<redacted>; Path=/; HttpOnly`; a name of `MIMIC_DISCOVERY_REDACT_NAMES` is redacted; in a URL-valued header (`Location: https://h/cb?code=C&access_token=T`, `Referer`, `Link: <u?api_key=K>; rel=next`) the query parameters (and fragment) are redacted by name; `id`, `name` and `amount` are not; neither are `company`, `author`, `panel`; `tokens`, `auth.token`, `authToken` and `Authorization` are, extra names follow the same token rule, and `Link: <cb?token=T>` (relative URL) is redacted. The URL redactions are counted under `header` and only for the 64 kept headers. |
+| DSC-06 | **U.** Redaction by value, in a header value, a query value, a path segment, a JSON string and (cards) a JSON number: a JWT, a PEM private key, `Bearer`/`Basic` credentials, `4111 1111 1111 1111` and `4111-1111-1111-1111`, an `AKIA` key, each listed token prefix, and the password of `https://u:p@h/` (also percent-encoded in a path segment or a query value: `/reset/%65yJ…`) become `<redacted>`, also inside a URL in a header value (`Location: https://h/reset/<JWT>`); near misses are kept (`4111111111111112` fails Luhn, three base64url parts whose first does not decode to JSON with `alg`, `AKIA` + 15). A redacted path segment is a parameter. The marker is the same for every secret. |
 | DSC-07 | **U.** No leak (`proptest`, ≥ 10 000 cases): generated exchanges carrying a canary under a listed name or in a detected form, at a random place (path, query, header, form or JSON body at any depth, request or response), give a serialised report that contains neither the canary nor its XXH3 hash, in decimal or hex. |
 | DSC-08 | **U.** Samples: at most 20 per endpoint; with 25 candidates of statuses 200, 201, 400, 500, every status is represented, then every (status, request shape, response shape) class, then the lowest content hashes; identical candidates count once; any arrival order gives the same set. A body over 256 KiB, encoded or decoded, and an opaque body are not kept (size and media type are). When the sample budget is full a new sample is rejected (`budget`) while counters and schemas still change. |
-| DSC-09 | **U.** Merge algebra (`proptest`, ≥ 10 000 cases): `merge` is commutative and associative; recording a sequence of exchanges one by one equals merging the reports of any partition of it (as several replicas would), counters and histograms included; two reports each below the literal limit at one node absorb it when their union exceeds it. Serialisation is byte-identical for equal reports, keys sorted, `"version": 1`, and it round-trips. |
+| DSC-09 | **U.** Merge algebra (`proptest`, ≥ 10 000 cases): `merge` is commutative and associative; recording a sequence of exchanges one by one equals merging the reports of any partition of it (as several replicas would), counters and histograms included (saturating at `u64::MAX`); a merge of reports over the limits stays within `max_endpoints` and `sample_budget`, commutatively; two reports each below the literal limit at one node absorb it when their union exceeds it. Serialisation is byte-identical for equal reports, keys sorted, `"version": 1`, and it round-trips. |
 | DSC-10 | **U.** Latency buckets: 4 per doubling from 1 ms; 0 ms and 1 ms fall in the first bucket, a value on a boundary in the bucket it closes, more than 131 s in the overflow; merge adds bucket counts. |
 | DSC-11 | **U.** Bounds: past `MIMIC_DISCOVERY_MAX_ENDPOINTS` new endpoints are refused (`endpoint_limit`) while known ones still update; a `404` or `405` on a path matching a known template is counted on it, else it is `not_found` and creates nothing; a path over 2048 bytes or 32 segments is `invalid`. For arbitrary exchanges (`proptest`) the recorder never panics and its retained state, sample bytes excluded, stays below a bound computed from the limits and the caps of §6 (512 schema nodes per body, 128 volatile fields, 64 keys per query or header set, 128 bytes per name). a name over 128 bytes is recorded as its first 128, cut on a UTF-8 character boundary, and a name that is sensitive only past byte 128 is still redacted. 10 000 distinct wide or deep bodies leave a body schema at 512 nodes or fewer; with the cap, schema merge is commutative and associative and any partition of the exchanges merges to the same schema (`proptest`, wide and deep bodies). |
 | DSC-12 | **I.** Inbound HTTP/1.1 and `h2` exchanges to the test app (`GET /users/{1..5}` with JSON responses, `POST /orders` with a JSON body and a `?dry_run=true` query, a `201` and a `400`) appear in `/discovery` under `direction` `inbound`, the app port and their templates, with status counters, histogram, query and header schemas, body schemas and samples; probe requests, outbound exchanges, `unframed` exchanges and a `404` to an unknown path do not; `hosts` lists the `Host` values used. |
@@ -1121,9 +1145,9 @@ with a fake original destination (as in F2) and read `GET /discovery` from loopb
 | DSC-15 | **I.** No leak end to end: canaries sent as `Authorization`, `Cookie`, `X-Api-Key`, a query `token=`, a JWT path segment, a card number and `password` in JSON request and response bodies, and in a `x-custom` header value with a `ghp_` prefix, appear neither in `/discovery`, nor on stdout (access lines included: the path shows `<redacted>`), nor in `/metrics`; bytes reach the app and the client unchanged. |
 | DSC-16 | **I.** Discovery never slows or alters traffic: with `MIMIC_DISCOVERY_QUEUE=1` and `MIMIC_DISCOVERY_CAPTURE_BUDGET=1Mi`, 2000 concurrent requests with 200 KiB bodies are all answered with the bytes the app sent; `mimic_discovery_exchanges_total` sums to the number of exchanges, with `dropped` > 0, and bodies skipped for budget are counted `budget`. |
 | DSC-17 | **I.** Memory: 256 endpoints each receiving 30 distinct 256 KiB JSON exchanges leave the sidecar RSS under 128 MiB with `mimic_discovery_sample_bytes` ≤ `MIMIC_DISCOVERY_SAMPLE_BUDGET`; a 257th endpoint is `endpoint_limit`, with one WARN `endpoint limit reached`. |
-| DSC-18 | **I.** Logs (`target` = `discovery`): one INFO `endpoint discovered` per new endpoint with `direction`, `port`, `method`, `template`, and one when a node is absorbed (`template absorbed`, old and new templates); one WARN `sample budget full` until samples are freed; no line holds a header value, query, body or sample. `mimic_discovery_endpoints` and `mimic_discovery_redactions_total{location,rule}` match the traffic sent. |
+| DSC-18 | **I.** Logs (`target` = `discovery`): one INFO `endpoint discovered` per new endpoint with `direction`, `port`, `method`, `template`, and one when a node is absorbed (`template absorbed`, old and new templates); one WARN `sample budget full` when the budget becomes full (not repeated while it stays full); a recorder panic is logged and counted `panic`, later exchanges are still recorded; no line holds a header value, query, body or sample. `mimic_discovery_endpoints` and `mimic_discovery_redactions_total{location,rule}` match the traffic sent. |
 | DSC-19 | **I.** An invalid `MIMIC_DISCOVERY_*` value (out of range, bad size suffix, a 65th or invalid redact name) exits 2 before listening (FND-01). |
-| DSC-20 | **U.** The injection patch sets `MIMIC_DISCOVERY_REDACT_NAMES` to the sorted, deduplicated union of `spec.discovery.redact` of every `MimicWorkload` naming the deployment, absent when there is none. **E.** The CRD accepts `spec.discovery.redact: [x-tenant-key, pin]` and rejects an entry with `/`, an empty one and 65 entries. |
+| DSC-20 | **U.** The injection patch sets `MIMIC_DISCOVERY_REDACT_NAMES` to the sorted, deduplicated union of `spec.discovery.redact` of every `MimicWorkload` naming the deployment, absent when there is none, entries lower-cased. **E.** The CRD accepts `spec.discovery.redact: [x-tenant-key, Pin]` and rejects an entry with `/`, an empty one and 65 entries. |
 | DSC-21 | **U.** The access-log path function applies the value detectors of DSC-06 segment by segment and leaves other segments unchanged. **I.** An inbound and an intercepted outbound request to `/reset/<JWT>` write access lines with `path` `/reset/<redacted>`. |
 | DSC-22 | **E.** On kind, a 2-replica Deployment in an `enabled` namespace behind a Service gets calls to `/users/<id>` (ids, a canary bearer token, JSON bodies); through `kubectl port-forward` each pod's `/discovery` shows `GET /users/{users_id}` with its response schema and samples, and no canary; a `404` storm on random root paths creates no endpoint. |
 | DSC-23 | **C.** A `cargo-fuzz` target feeds arbitrary request and response heads and bodies to the recorder (parse, decode-free inference, redaction, merge); CI runs it 60 s on PRs touching `crates/mimic-core/src/discovery/` and 10 min weekly, like PRX-28 (same `ci-ok` path-filter rule). |

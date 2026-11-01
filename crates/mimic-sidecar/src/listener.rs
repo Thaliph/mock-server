@@ -334,8 +334,36 @@ pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
-    socket.listen(1024)?;
+    socket.listen(backlog())?;
     TcpListener::from_std(socket.into())
+}
+
+/// The accept queue length for a `somaxconn` file content (stub).
+fn backlog_from(_somaxconn: Option<&str>) -> i32 {
+    1024
+}
+
+fn backlog() -> i32 {
+    backlog_from(
+        std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::backlog_from;
+
+    #[test]
+    fn dsc_16_backlog_follows_somaxconn_when_readable() {
+        assert_eq!(backlog_from(Some("4096\n")), 4096);
+        assert_eq!(backlog_from(Some("128")), 128);
+        assert_eq!(backlog_from(Some("4294967295")), i32::MAX);
+        for bad in [None, Some(""), Some("many"), Some("0"), Some("-1")] {
+            assert_eq!(backlog_from(bad), 1024, "{bad:?}");
+        }
+    }
 }
 
 /// Binds every address, skipping IPv6 ones when the pod has no IPv6. Returns the listeners
