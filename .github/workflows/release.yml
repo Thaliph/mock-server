@@ -144,16 +144,23 @@ jobs:
           }
           index "$REPO" app app_digest
           index "$INIT_REPO" init init_digest
-      - name: Helm chart, pinned to the image digest, signed
+      - name: Helm chart, pinned to both image digests, signed
         env:
           TAG: ${{ github.ref_name }}
           DIGEST: ${{ steps.index.outputs.app_digest }}
+          INIT_DIGEST: ${{ steps.index.outputs.init_digest }}
           GH_ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version=${TAG#v}
-          sed -i "s|^  digest: \"\"|  digest: \"$DIGEST\"|" deploy/helm/mimic/values.yaml
+          # #271: image.digest and inject.initImage.digest (yq, key paths matched exactly; fails if a
+          # digest is not sha256:<64 hex> or does not land).
+          scripts/pin-chart.sh deploy/helm/mimic/values.yaml "$DIGEST" "$INIT_DIGEST"
           helm package deploy/helm/mimic --version "$version" --app-version "$version" -d dist
+          # The packaged values carry both digests (what the signed chart will deploy).
+          tar -xzOf "dist/mimic-$version.tgz" mimic/values.yaml |
+            DIGEST="$DIGEST" INIT_DIGEST="$INIT_DIGEST" \
+            yq -e '.image.digest == strenv(DIGEST) and .inject.initImage.digest == strenv(INIT_DIGEST)' > /dev/null
           echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
           out=$(helm push "dist/mimic-$version.tgz" "oci://$CHARTS" 2>&1)
           echo "$out"

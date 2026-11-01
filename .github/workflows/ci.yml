@@ -73,6 +73,8 @@ jobs:
           persist-credentials: false
       - run: helm lint --strict deploy/helm/mimic
       - run: helm template mimic deploy/helm/mimic -n mimic-system > /dev/null
+      # #271: the chart as the release pins it renders both mimic images by digest.
+      - run: scripts/check-release-chart.sh
 
   security:
     runs-on: ubuntu-24.04
