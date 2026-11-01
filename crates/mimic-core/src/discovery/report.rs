@@ -227,6 +227,19 @@ fn merge_methods(into: &mut BTreeMap<String, Stats>, from: BTreeMap<String, Stat
 }
 
 impl Node {
+    fn re_redact_paths(&mut self) {
+        if let Some(param) = &mut self.param {
+            param.re_redact_paths();
+        }
+        for (literal, mut child) in std::mem::take(&mut self.literals) {
+            child.re_redact_paths();
+            self.literals
+                .entry(redact::segment(&literal))
+                .or_default()
+                .merge(child, usize::MAX);
+        }
+    }
+
     /// Union of two subtrees. Past `max_literals` literal children a node absorbs: its
     /// literals and its parameter child become one parameter, for good. The result does not
     /// depend on the order of the merges.
@@ -437,6 +450,15 @@ impl Scope {
 }
 
 impl Scope {
+    /// The value detectors again on the literal segments and the gRPC paths; keys that become
+    /// equal merge.
+    fn re_redact_paths(&mut self) {
+        self.root.re_redact_paths();
+        for (path, methods) in std::mem::take(&mut self.raw) {
+            merge_methods(self.raw.entry(redact::path(&path)).or_default(), methods);
+        }
+    }
+
     fn check(&self) -> Result<(), Violation> {
         self.root.check(0, 0)?;
         for (path, methods) in &self.raw {
@@ -767,6 +789,9 @@ impl Report {
     /// The §6 redaction applied again to every sample, host and volatile field (spec §7.3,
     /// re-redaction), so that a report cannot hold what `redactor` redacts.
     pub fn re_redact(&mut self, redactor: &Redactor) {
+        for scope in self.scopes.values_mut().flat_map(BTreeMap::values_mut) {
+            scope.re_redact_paths();
+        }
         self.for_each_stats_mut(|stats| stats.re_redact(redactor));
     }
 
