@@ -16,9 +16,10 @@ use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap};
 use hyper::{Request, Response};
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
-use mimic_core::proxy::http1::{Event, RequestHead, Side};
+use mimic_core::proxy::http1::{Captured, Event, RequestHead, Side};
 
 use crate::access::{self, Outcome};
+use crate::discovery::{Capture, Meta, Tap};
 use crate::listener::Direction;
 use crate::red::ProxyMetrics;
 
@@ -374,6 +375,8 @@ struct Open {
     tunnel: bool,
     /// The request was counted in the RED metrics (with its status).
     counted: bool,
+    /// The bytes discovery captures (spec §6), when it is on for this connection.
+    capture: Option<Capture>,
 }
 
 impl Open {
@@ -389,6 +392,7 @@ impl Open {
             response_done: false,
             tunnel: false,
             counted: false,
+            capture: None,
         }
     }
 }
@@ -399,6 +403,8 @@ impl Open {
 pub(crate) struct Http1Tracker {
     ctx: Ctx,
     open: VecDeque<Open>,
+    /// Where the exchanges go for discovery.
+    tap: Option<Tap>,
 }
 
 impl Http1Tracker {
@@ -406,7 +412,14 @@ impl Http1Tracker {
         Http1Tracker {
             ctx,
             open: VecDeque::new(),
+            tap: None,
         }
+    }
+
+    /// Hands the exchanges to discovery as well.
+    pub(crate) fn with_tap(mut self, tap: Option<Tap>) -> Http1Tracker {
+        self.tap = tap;
+        self
     }
 
     fn authority(&self, request: Option<&RequestHead>) -> String {
@@ -420,15 +433,28 @@ impl Http1Tracker {
 
     pub(crate) fn event(&mut self, event: Event) {
         match event {
-            Event::Request(head) => self.open.push_back(Open::new(Some(head))),
+            Event::Request(head) => {
+                let capture = self
+                    .tap
+                    .as_ref()
+                    .filter(|_| !head.connect)
+                    .map(Tap::capture);
+                let mut open = Open::new(Some(head));
+                open.capture = capture;
+                self.open.push_back(open);
+            }
+            Event::Captured(captured) => self.captured(captured),
             Event::RequestEnd { body_bytes } => {
                 if let Some(open) = self.open.iter_mut().rev().find(|o| !o.request_done) {
                     open.request_done = true;
                     open.bytes_in = body_bytes;
+                    if let Some(capture) = open.capture.as_mut() {
+                        capture.request_end(body_bytes);
+                    }
                 }
                 self.reap();
             }
-            Event::Interim(_) | Event::Captured(_) => {}
+            Event::Interim(_) => {}
             Event::Response(head) => {
                 let index = match self.open.iter().position(|o| o.status.is_none()) {
                     Some(index) => index,
@@ -459,6 +485,9 @@ impl Http1Tracker {
                 {
                     open.response_done = true;
                     open.bytes_out = body_bytes;
+                    if let Some(capture) = open.capture.as_mut() {
+                        capture.response_end(body_bytes);
+                    }
                 }
                 self.reap();
             }
@@ -487,6 +516,22 @@ impl Http1Tracker {
                     self.write(open, Outcome::Unframed);
                 }
             }
+        }
+    }
+
+    /// Routes captured bytes to the exchange they belong to.
+    fn captured(&mut self, captured: Captured) {
+        let open = match captured {
+            Captured::RequestHead(_) | Captured::RequestBody(_) => {
+                self.open.iter_mut().rev().find(|o| !o.request_done)
+            }
+            Captured::ResponseHead(_) | Captured::ResponseBody(_) => self
+                .open
+                .iter_mut()
+                .find(|o| o.status.is_some() && !o.response_done),
+        };
+        if let Some(capture) = open.and_then(|o| o.capture.as_mut()) {
+            capture.push(captured);
         }
     }
 
@@ -527,7 +572,33 @@ impl Http1Tracker {
         }
     }
 
-    fn write(&self, open: Open, outcome: Outcome) {
+    /// Hands an exchange that got a response head to discovery.
+    fn discover(&self, open: &mut Open, outcome: Outcome) {
+        let (Some(tap), Some(capture)) = (&self.tap, open.capture.take()) else {
+            return;
+        };
+        let (Some(request), Some(status)) = (&open.request, open.status) else {
+            return;
+        };
+        if outcome == Outcome::Unframed {
+            return;
+        }
+        let authority = target_authority(request.uri_authority.as_deref(), request.host.as_deref())
+            .map(|raw| normalise_authority(raw, self.ctx.default_port()));
+        tap.submit(
+            capture,
+            Meta {
+                port: self.ctx.dst.port(),
+                authority,
+                status,
+                head_ms: open.head.map_or(0, |h| h.as_millis() as u64),
+                tunnel: open.tunnel,
+            },
+        );
+    }
+
+    fn write(&self, mut open: Open, outcome: Outcome) {
+        self.discover(&mut open, outcome);
         let authority = self.authority(open.request.as_ref());
         if !open.counted {
             self.ctx

@@ -1,62 +1,119 @@
-//! Endpoint discovery in the sidecar (spec §6). Stub: the red tests run against it.
+//! Endpoint discovery in the sidecar (spec §6): the capture tap of the HTTP/1 relay, the
+//! bounded queue, the single recorder thread that owns the local report, the
+//! `mimic_discovery_*` metrics and `GET /discovery` (loopback peers only). The inference, the
+//! redaction and the merge are pure and live in `mimic_core::discovery`.
+
+mod capture;
+mod config;
+mod metrics;
+mod recorder;
+mod redactions;
 
 use std::io;
+use std::net::SocketAddr;
+use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::Router;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::Report;
-use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
 
-#[derive(Debug, Clone)]
-pub struct DiscoveryConfig {
-    pub max_endpoints: usize,
-    pub max_literals: usize,
-    pub sample_budget: usize,
-    pub capture_budget: usize,
-    pub queue: usize,
-    pub redact_names: Vec<String>,
+pub use capture::Tap;
+pub(crate) use capture::{Capture, Meta};
+pub use config::DiscoveryConfig;
+pub use metrics::DiscoveryMetrics;
+
+/// Discovery of one sidecar: the local report and the thread that fills it.
+pub struct Discovery {
+    report: Arc<Mutex<Report>>,
+    tap: Tap,
+    metrics: DiscoveryMetrics,
 }
-
-impl Default for DiscoveryConfig {
-    fn default() -> Self {
-        DiscoveryConfig {
-            max_endpoints: 256,
-            max_literals: 32,
-            sample_budget: 16 << 20,
-            capture_budget: 8 << 20,
-            queue: 1024,
-            redact_names: Vec::new(),
-        }
-    }
-}
-
-impl DiscoveryConfig {
-    pub fn from_env(_env: &Env) -> Result<DiscoveryConfig, ConfigError> {
-        Ok(DiscoveryConfig::default())
-    }
-}
-
-#[derive(Clone)]
-pub struct Tap;
-
-pub struct Discovery;
 
 impl Discovery {
-    pub fn start(_config: &DiscoveryConfig, _pod: Option<String>) -> io::Result<Discovery> {
-        Ok(Discovery)
+    /// Starts the recorder thread. The thread logs through the subscriber of the caller and
+    /// ends when the last [`Tap`] is dropped.
+    pub fn start(config: &DiscoveryConfig, pod: Option<String>) -> io::Result<Discovery> {
+        let report = Arc::new(Mutex::new(Report::new(pod)));
+        let metrics = DiscoveryMetrics::default();
+        let (queue, records) = sync_channel(config.queue);
+        let tap = Tap::new(
+            queue,
+            Arc::new(capture::Budget::new(config.capture_budget)),
+            metrics.clone(),
+        );
+        let recorder = recorder::Recorder::new(
+            report.clone(),
+            config.limits(),
+            Redactor::new(config.redact_names.iter().map(String::as_str)),
+            metrics.clone(),
+        );
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        std::thread::Builder::new()
+            .name("mimic-discovery".into())
+            .spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || recorder.run(records));
+            })?;
+        Ok(Discovery {
+            report,
+            tap,
+            metrics,
+        })
     }
 
+    /// The handle the proxy captures exchanges with.
     pub fn tap(&self) -> Tap {
-        Tap
+        self.tap.clone()
     }
 
-    pub fn register(&self, _metrics: &mut Metrics) {}
+    /// Exposes the `mimic_discovery_*` metrics in `metrics`.
+    pub fn register(&self, metrics: &mut Metrics) {
+        self.metrics.register(metrics);
+    }
 
+    /// A copy of the local report.
     pub fn report(&self) -> Report {
-        Report::new(None)
+        self.report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
+    /// `GET /discovery`, for the admin listener. Answered to loopback peers only: the admin
+    /// router must be served with connection info.
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/discovery", get(serve))
+            .with_state(self.report.clone())
+    }
+}
+
+async fn serve(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(report): State<Arc<Mutex<Report>>>,
+) -> Response {
+    if !peer.ip().to_canonical().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            "discovery is answered to loopback peers only\n",
+        )
+            .into_response();
+    }
+    // Serialising a large report must not stall the admin listener's worker.
+    let json = tokio::task::spawn_blocking(move || {
+        report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .to_json()
+    })
+    .await;
+    match json {
+        Ok(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

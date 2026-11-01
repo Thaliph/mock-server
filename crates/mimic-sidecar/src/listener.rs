@@ -121,6 +121,7 @@ pub struct Shared {
     metrics: TunnelMetrics,
     proxy: ProxyMetrics,
     tls: Interception,
+    discovery: Option<crate::discovery::Tap>,
     original_dst: OriginalDst,
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
@@ -164,6 +165,7 @@ impl Shared {
             metrics,
             proxy: ProxyMetrics::default(),
             tls: Interception::default(),
+            discovery: None,
             original_dst,
             stop: watch::channel(false).0,
             abort: watch::channel(false).0,
@@ -228,8 +230,13 @@ impl Shared {
     }
 
     /// Hands the inbound HTTP/1 exchanges to discovery (spec §6).
-    pub fn with_discovery(self, _tap: crate::discovery::Tap) -> Shared {
+    pub fn with_discovery(mut self, tap: crate::discovery::Tap) -> Shared {
+        self.discovery = Some(tap);
         self
+    }
+
+    pub(crate) fn discovery(&self) -> Option<&crate::discovery::Tap> {
+        self.discovery.as_ref()
     }
 
     /// Intercepts outbound TLS as `tls` says instead of passing it all through.

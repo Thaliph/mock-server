@@ -496,9 +496,29 @@ Everything below except the capture tap, content decoding and the recorder threa
   drained by one recorder thread that does the decoding, inference and merge. A full queue
   drops the record (`dropped`). Forwarding never waits for discovery (§4.1: forward, never
   refuse).
+- **HTTP/1 tap (F4 step 6).** Only inbound exchanges of plain HTTP/1 connections are
+  captured. The codec hands the raw head and the first 256 KiB of the body payload (chunk
+  framing removed) of each message to the exchange record; a head that does not fit in the
+  capture budget drops the whole exchange (`dropped`), a body that does not fit is `budget`.
+  A body of more than 256 KiB is `too_large` and contributes nothing (not even its size) to the
+  report. An exchange whose response head came but whose request or response body did not
+  complete is recorded without that body (not counted in `mimic_discovery_bodies_total`);
+  an exchange that got no response head, a `CONNECT` and an `unframed` exchange are not
+  recorded. Every recorded or dropped exchange has exactly one `mimic_discovery_exchanges_total`
+  result; the other results are counted by the recorder, `dropped` by the tap. Bodies and
+  samples are counted for recorded exchanges only. `content-encoding` other than `identity`
+  makes the body `encoding` until the decoders of step 7. `mimic_discovery_samples_total`
+  has `kept` and `budget` in F4 (a sample admitted to the candidates, or refused for the
+  budget); `replaced` and `rejected` need the sample selection to report its choices
+  (later). `mimic_discovery_redactions_total` is counted by the recorder from the same inputs
+  and detectors as the report, for recorded exchanges. The authority of `hosts` is the
+  normalised `Host` or absolute-form authority of §4.1; the endpoint port is the original
+  destination port.
 - **Logs** (`target` = `discovery`): INFO `endpoint discovered` (`direction`, `port`,
-  `method`, `template`) once per new endpoint, INFO `template absorbed` (`from`, `to`) when a
-  node absorbs, WARN `endpoint limit reached` once, WARN `sample budget full` once until
+  `method`, `template`) once per new endpoint (not for the parameter a node absorbs into),
+  INFO `template absorbed` (`direction`, `port`, `method`, `template` = the new template of
+  the exchange, `old` = the replaced `<METHOD> <template>` entries, comma-separated, the first
+  16, and `old_count`) when a node absorbs, WARN `endpoint limit reached` once, WARN `sample budget full` once until
   samples are freed. Templates are redacted; no line holds a header value, query, body or
   sample.
 - **Local access.** `GET /discovery` on the admin port answers the local report

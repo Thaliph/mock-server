@@ -486,7 +486,9 @@ async fn dsc_16_discovery_never_slows_or_alters_traffic() {
     );
 }
 
-fn log_lines(logs: &common::Logs) -> Vec<serde_json::Value> {
+/// The `discovery` lines so far, once the log queue had time to write them.
+async fn log_lines(logs: &common::Logs) -> Vec<serde_json::Value> {
+    tokio::time::sleep(Duration::from_millis(300)).await;
     logs.text()
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -509,7 +511,7 @@ async fn dsc_18_logs_name_endpoints_and_absorbed_templates_without_values() {
         "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"recorded\"} 1",
     )
     .await;
-    let lines = log_lines(&logs);
+    let lines = log_lines(&logs).await;
     let discovered: Vec<_> = lines
         .iter()
         .filter(|l| l["message"] == "endpoint discovered")
@@ -582,7 +584,7 @@ async fn dsc_18_absorption_sample_budget_and_endpoint_limit_are_logged() {
         "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"recorded\"} 4",
     )
     .await;
-    let lines = log_lines(&logs);
+    let lines = log_lines(&logs).await;
     let absorbed: Vec<_> = lines
         .iter()
         .filter(|l| l["message"] == "template absorbed")
@@ -629,7 +631,7 @@ async fn dsc_18_absorption_sample_budget_and_endpoint_limit_are_logged() {
         "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"endpoint_limit\"}",
     )
     .await;
-    let lines = log_lines(&logs);
+    let lines = log_lines(&logs).await;
     let limit: Vec<_> = lines
         .iter()
         .filter(|l| l["message"] == "endpoint limit reached")
@@ -651,7 +653,7 @@ async fn dsc_18_absorption_sample_budget_and_endpoint_limit_are_logged() {
         "mimic_discovery_samples_total{direction=\"inbound\",result=\"budget\"}",
     )
     .await;
-    let lines = log_lines(&logs);
+    let lines = log_lines(&logs).await;
     let full: Vec<_> = lines
         .iter()
         .filter(|l| l["message"] == "sample budget full")
