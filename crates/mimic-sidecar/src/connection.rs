@@ -230,8 +230,12 @@ impl Conn<'_> {
             }
             Served::H2(buf) => {
                 proxy.connection(direction, "h2", &self.authority(false));
+                let tap = self
+                    .shared
+                    .discovery()
+                    .filter(|_| direction == Direction::Inbound && !self.tls);
                 let relayed = tokio::select! {
-                    r = h2::relay(client, upstream, buf, self.ctx(), self.shared.stopped()) => r,
+                    r = h2::relay_with(client, upstream, buf, self.ctx(), tap.cloned(), self.shared.stopped()) => r,
                     () = abort.as_mut() => Ok(()),
                 };
                 if let Err(e) = relayed {

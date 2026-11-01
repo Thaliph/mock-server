@@ -432,8 +432,14 @@ Everything below except the capture tap, content decoding and the recorder threa
   Request and response **bodies** per media type (`content-type` without
   parameters): JSON (`application/json`, `*/*+json`) and `application/x-www-form-urlencoded`
   get a schema; any other type is **opaque**: media type and size only. Bodies are decoded
-  from `content-encoding` `gzip`, `deflate` and `br` before inference; another encoding makes
-  the body opaque. A body over **256 KiB** (encoded, or decoded) is not parsed (`too_large`):
+  from `content-encoding` `gzip` (also `x-gzip`), `deflate` (a zlib stream, or a raw deflate
+  stream when the zlib header is absent) and `br` before inference, on the recorder thread,
+  reading at most 256 KiB + 1 byte of output (a corrupt stream is `invalid`, a longer output
+  `too_large`: a small body cannot expand into memory); any other value, `zstd` or a list of
+  codings included, counts as `encoding` and makes the body opaque. The `h2` tee copies the
+  same bytes as the HTTP/1 codec (up to 256 KiB per body, in the capture budget): the heads
+  are written as HTTP/1 text for the recorder, an extended `CONNECT` is not captured, and a
+  body whose stream did not end before the exchange was recorded is not counted. A body over **256 KiB** (encoded, or decoded) is not parsed (`too_large`):
   it contributes its media type and size only. Schemas are inferred from the original values
   in memory; they hold types and formats, never values.
   Schemas and volatility are inferred from the redacted values (a redacted subtree is a `string`); the JSON root is level 1, `+` in a query or form is a space, a repeated header is an `array` like a repeated query key, and at most 16 media types are kept per side.

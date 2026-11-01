@@ -122,6 +122,8 @@ fn sum(text: &str, metric: &str, labels: &[&str]) -> u64 {
 
 #[tokio::test]
 async fn dsc_12_inbound_h2_exchanges_appear_in_the_report() {
+    // Every test of this file has a subscriber: callsites are registered once per process.
+    let _logs = capture_logs();
     let (app, _) = app().await;
     let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
     let f = fixture_discovery(Direction::Inbound, &discovery, move |_| Some(app)).await;
@@ -317,12 +319,20 @@ async fn dsc_15_no_leak_end_to_end_over_h2() {
     assert!(json.contains("<redacted>"), "{json}");
     assert_no_leak("/discovery", &json);
     assert_no_leak("the metrics", &f.metrics.encode());
-    let text = logs.text();
-    assert_no_leak("the logs", &text);
-    let paths: Vec<_> = logs
-        .access()
-        .iter()
-        .filter_map(|l| l["path"].as_str().map(str::to_string))
-        .collect();
+    // The access lines go through the log queue.
+    let mut paths = Vec::new();
+    for _ in 0..100 {
+        paths = logs
+            .access()
+            .iter()
+            .filter_map(|l| l["path"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        if paths.len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(paths.iter().any(|p| p == "/users/<redacted>"), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("eyJ")), "{paths:?}");
+    assert_no_leak("the logs", &logs.text());
 }
