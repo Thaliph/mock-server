@@ -239,7 +239,13 @@ async fn inj_18_tcp_probe_answers_200_when_it_connects_and_503_otherwise() {
 /// An h2c server answering `Health/Check`. The service name asked for picks the answer: "up"
 /// and "" are SERVING, "down" NOT_SERVING, "err" a gRPC error (UNIMPLEMENTED).
 async fn grpc_app() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    grpc_app_on("127.0.0.1:0").await
+}
+
+/// Like [`grpc_app`], also: "silent" never answers and "big" is SERVING followed by more
+/// message bytes than the sidecar accepts.
+async fn grpc_app_on(bind: &str) -> SocketAddr {
+    let listener = TcpListener::bind(bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
@@ -258,6 +264,11 @@ async fn grpc_app() -> SocketAddr {
                         }
                         // 5-byte frame header, then field 1 (tag 0x0a, one-byte length) if any.
                         let service = String::from_utf8_lossy(data.get(7..).unwrap_or_default());
+                        if service == "silent" {
+                            let _keep = respond;
+                            std::future::pending::<()>().await;
+                            return;
+                        }
                         let response = axum::http::Response::builder()
                             .header("content-type", "application/grpc")
                             .body(())
@@ -267,9 +278,14 @@ async fn grpc_app() -> SocketAddr {
                         if service == "err" {
                             trailers.insert("grpc-status", "12".parse().unwrap());
                         } else {
-                            let serving = u8::from(service == "up" || service.is_empty());
+                            let serving = u8::from(matches!(service.as_ref(), "up" | "big" | ""));
                             let msg = [0u8, 0, 0, 0, 2, 0x08, serving];
                             stream.send_data(msg.to_vec().into(), false).unwrap();
+                            if service == "big" {
+                                stream
+                                    .send_data(vec![0u8; 70 * 1024].into(), false)
+                                    .unwrap();
+                            }
                             trailers.insert("grpc-status", "0".parse().unwrap());
                         }
                         stream.send_trailers(trailers).unwrap();
@@ -327,4 +343,84 @@ fn inj_18_invalid_tcp_and_grpc_probes_are_rejected() {
     ] {
         assert!(Probes::from_env(&env(bad)).is_err(), "{bad}");
     }
+}
+
+#[tokio::test]
+async fn inj_18_grpc_probe_works_on_an_ipv6_pod() {
+    let addr = grpc_app_on("[::1]:0").await;
+    let json = format!(
+        r#"{{"a/readyz":{{"grpc":{{"port":{},"service":"up"}},"timeoutSeconds":2}}}}"#,
+        addr.port()
+    );
+    let env = Env::from_pairs([
+        ("MIMIC_APP_PROBES".to_string(), json),
+        ("MIMIC_POD_IP".to_string(), "::1".to_string()),
+    ]);
+    let r = probes::router(Arc::new(Probes::from_env(&env).unwrap()));
+    assert_eq!(get_status(&r, "/app-health/a/readyz").await, 200);
+}
+
+#[tokio::test]
+async fn inj_18_grpc_probe_answers_503_when_the_response_exceeds_the_cap() {
+    let addr = grpc_app().await;
+    let json = format!(
+        r#"{{"a/readyz":{{"grpc":{{"port":{p},"service":"big"}},"timeoutSeconds":2}},"b/readyz":{{"grpc":{{"port":{p},"service":"up"}},"timeoutSeconds":2}}}}"#,
+        p = addr.port()
+    );
+    let r = router_for(&json).await;
+    assert_eq!(get_status(&r, "/app-health/b/readyz").await, 200);
+    assert_eq!(get_status(&r, "/app-health/a/readyz").await, 503);
+}
+
+#[tokio::test]
+async fn inj_18_grpc_probe_answers_503_after_the_probe_timeout() {
+    let addr = grpc_app().await;
+    let json = format!(
+        r#"{{"a/readyz":{{"grpc":{{"port":{},"service":"silent"}},"timeoutSeconds":1}}}}"#,
+        addr.port()
+    );
+    let r = router_for(&json).await;
+    let started = std::time::Instant::now();
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        get_status(&r, "/app-health/a/readyz"),
+    )
+    .await
+    .expect("the probe never timed out");
+    assert_eq!(status, 503);
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn inj_18_tcp_probe_answers_503_after_the_probe_timeout() {
+    // A listener with an empty backlog that never accepts: once its queue is full the kernel
+    // drops further SYNs, so a connect neither succeeds nor fails.
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket
+        .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        .unwrap();
+    socket.listen(0).unwrap();
+    let addr = socket.local_addr().unwrap().as_socket().unwrap();
+    let mut fillers = Vec::new();
+    for _ in 0..4 {
+        let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        s.set_nonblocking(true).unwrap();
+        let _ = s.connect(&addr.into());
+        fillers.push(s);
+    }
+    let json = format!(
+        r#"{{"a/readyz":{{"tcpSocket":{{"port":{}}},"timeoutSeconds":1}}}}"#,
+        addr.port()
+    );
+    let r = router_for(&json).await;
+    let started = std::time::Instant::now();
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        get_status(&r, "/app-health/a/readyz"),
+    )
+    .await
+    .expect("the probe never timed out");
+    assert_eq!(status, 503);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    drop(fillers);
 }

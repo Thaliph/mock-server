@@ -1234,6 +1234,22 @@ mod tests {
     }
 
     #[test]
+    fn inj_04_remove_op_has_no_value_key() {
+        let mut p = pod();
+        spec(&mut p).containers[0].readiness_probe = Some(tcp(IntOrString::Int(9000)));
+        let ops = patch(&p, "shop-api", &cfg(), &wiring()).unwrap();
+        let remove: Vec<Value> = ops
+            .iter()
+            .filter(|o| o.op == "remove")
+            .map(|o| serde_json::to_value(o).unwrap())
+            .collect();
+        assert_eq!(
+            remove,
+            vec![json!({"op": "remove", "path": "/spec/containers/0/readinessProbe/tcpSocket"})]
+        );
+    }
+
+    #[test]
     fn inj_04_tcp_and_grpc_probes_are_rewritten() {
         let mut p = pod();
         spec(&mut p).containers[0].ports = Some(vec![named("db", 5432)]);
