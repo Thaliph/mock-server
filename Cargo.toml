@@ -14,3 +14,11 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# The discovery tests (DSC-17) push gigabytes of JSON through the proxy and the pure
+# inference code: unoptimised builds take minutes.
+[profile.dev.package.mimic-core]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 1
