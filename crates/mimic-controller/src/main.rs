@@ -5,6 +5,7 @@ mod cert_manager;
 mod certs;
 mod push_config;
 mod sidecar_api;
+mod status;
 mod store;
 mod tls;
 mod tls_ca;

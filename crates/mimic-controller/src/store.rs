@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimic_core::discovery::report::{Direction, Limits, Report};
+use mimic_core::discovery::status::Meta as StatusMeta;
 use mimic_core::discovery::store::{Kind, Refusal, drop_expired, merge_bounded};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -552,6 +553,17 @@ impl Store {
             })
             .collect::<Result<_, _>>()?;
         Ok((summary, pods))
+    }
+
+    /// `:meta` and `:pods` of a deployment (the pods' last push in Unix milliseconds); no meta
+    /// for a deployment without data.
+    pub async fn status_input(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<(Option<StatusMeta>, BTreeMap<String, u64>), ReadError> {
+        let _ = (namespace, deployment);
+        todo!("status_input")
     }
 
     /// The stored `:report` bytes, once they are known to parse.

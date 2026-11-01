@@ -14,6 +14,15 @@ use mimic_core::proxy::tls::MAX_EXCLUDES;
 /// `MimicWorkload`.
 pub type Entry = (String, String, String, Vec<String>, Vec<String>);
 
+/// A `MimicWorkload` and the `status.discovery` it holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    pub namespace: String,
+    pub name: String,
+    pub deployment: String,
+    pub status: Option<serde_json::Value>,
+}
+
 /// `spec.deployment`, `spec.tls.exclude` and `spec.discovery.redact` of a `MimicWorkload`.
 type Settings = (String, Vec<String>, Vec<String>);
 
@@ -61,6 +70,17 @@ impl WorkloadCache {
             .map(|(ns, n, d, e, r)| ((ns, n), (d, e, r)))
             .collect();
         state.synced = true;
+    }
+
+    /// Records the `status.discovery` the cluster holds for a `MimicWorkload`.
+    pub fn set_status(&self, namespace: &str, name: &str, status: Option<serde_json::Value>) {
+        let _ = (namespace, name, status);
+        todo!("set_status")
+    }
+
+    /// Every `MimicWorkload` with the status it holds.
+    pub fn targets(&self) -> Vec<Target> {
+        todo!("targets")
     }
 
     pub fn is_synced(&self) -> bool {

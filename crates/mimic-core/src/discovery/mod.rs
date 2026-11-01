@@ -8,6 +8,7 @@ pub mod redact;
 pub mod report;
 pub mod sample;
 pub mod schema;
+pub mod status;
 pub mod store;
 pub mod template;
 pub mod volatile;
@@ -24,5 +25,7 @@ mod tests_followup;
 mod tests_samples;
 #[cfg(test)]
 mod tests_schema;
+#[cfg(test)]
+mod tests_status;
 #[cfg(test)]
 mod tests_store;
