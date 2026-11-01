@@ -964,7 +964,7 @@ fn prx_27_held_bytes_are_counted_by_capacity() {
 fn prx_27_the_retained_limit_is_the_sum_of_the_real_bounds() {
     // Two 64 KiB sections (one per direction), the requests read ahead and the two copies of
     // a head a body keeps: nothing else.
-    assert!(RETAINED_LIMIT < 2 * HEAD_LIMIT + 40 * 4096, "{RETAINED_LIMIT}");
+    const { assert!(RETAINED_LIMIT < 2 * HEAD_LIMIT + 40 * 4096) };
 }
 
 #[test]
@@ -972,8 +972,14 @@ fn prx_27_cut_values_do_not_keep_their_capacity() {
     let long = "h".repeat(20_000);
     let mut c = Codec::new();
     for _ in 0..READ_AHEAD {
-        c.client_bytes(format!("GET http://{long}/{long} HTTP/1.1\r\nHost: {long}\r\n\r\n").as_bytes());
+        c.client_bytes(
+            format!("GET http://{long}/{long} HTTP/1.1\r\nHost: {long}\r\n\r\n").as_bytes(),
+        );
     }
     assert_eq!(c.pending(), READ_AHEAD);
-    assert!(c.retained_bytes() <= READ_AHEAD * 4096, "{}", c.retained_bytes());
+    assert!(
+        c.retained_bytes() <= READ_AHEAD * 4096,
+        "{}",
+        c.retained_bytes()
+    );
 }

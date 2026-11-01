@@ -275,51 +275,84 @@ fn drive(client: &[&[u8]], server: &[&[u8]], eof: bool) -> (Vec<Event>, usize) {
     (ev, peak)
 }
 
-
 fn check_framing(conv: &Conversation, ev: &[Event], peak: usize) -> Result<(), TestCaseError> {
     prop_assert!(peak <= RETAINED_LIMIT);
     let n = conv.exchanges.len();
-    let requests: Vec<_> = ev.iter().filter_map(|e| match e {
-        Event::Request(r) => Some((r.method.clone(), r.path.clone())),
-        _ => None,
-    }).collect();
-    let expected: Vec<_> = conv.exchanges.iter()
-        .map(|e| (e.method.to_string(), e.path.clone())).collect();
+    let requests: Vec<_> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::Request(r) => Some((r.method.clone(), r.path.clone())),
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<_> = conv
+        .exchanges
+        .iter()
+        .map(|e| (e.method.to_string(), e.path.clone()))
+        .collect();
     prop_assert_eq!(requests, expected);
-    let req_ends: Vec<u64> = ev.iter().filter_map(|e| match e {
-        Event::RequestEnd { body_bytes } => Some(*body_bytes),
-        _ => None,
-    }).collect();
+    let req_ends: Vec<u64> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::RequestEnd { body_bytes } => Some(*body_bytes),
+            _ => None,
+        })
+        .collect();
     prop_assert_eq!(
         req_ends,
-        conv.exchanges.iter().map(|e| e.req_body.bytes()).collect::<Vec<_>>()
+        conv.exchanges
+            .iter()
+            .map(|e| e.req_body.bytes())
+            .collect::<Vec<_>>()
     );
-    let finals: Vec<(u16, String)> = ev.iter().filter_map(|e| match e {
-        Event::Response(h) => Some((
-            h.status,
-            h.request.as_ref().map(|r| r.path.clone()).unwrap_or_default(),
-        )),
-        _ => None,
-    }).collect();
+    let finals: Vec<(u16, String)> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::Response(h) => Some((
+                h.status,
+                h.request
+                    .as_ref()
+                    .map(|r| r.path.clone())
+                    .unwrap_or_default(),
+            )),
+            _ => None,
+        })
+        .collect();
     prop_assert_eq!(
         finals,
-        conv.exchanges.iter().map(|e| (e.status, e.path.clone())).collect::<Vec<_>>()
+        conv.exchanges
+            .iter()
+            .map(|e| (e.status, e.path.clone()))
+            .collect::<Vec<_>>()
     );
     let interims = ev.iter().filter(|e| matches!(e, Event::Interim(_))).count();
     prop_assert_eq!(
         interims,
-        conv.exchanges.iter().map(|e| e.interims.len()).sum::<usize>()
+        conv.exchanges
+            .iter()
+            .map(|e| e.interims.len())
+            .sum::<usize>()
     );
-    let resp_ends: Vec<u64> = ev.iter().filter_map(|e| match e {
-        Event::ResponseEnd { body_bytes } => Some(*body_bytes),
-        _ => None,
-    }).collect();
-    let mut want: Vec<u64> = conv.exchanges.iter().map(|e| e.wire_body().bytes()).collect();
+    let resp_ends: Vec<u64> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::ResponseEnd { body_bytes } => Some(*body_bytes),
+            _ => None,
+        })
+        .collect();
+    let mut want: Vec<u64> = conv
+        .exchanges
+        .iter()
+        .map(|e| e.wire_body().bytes())
+        .collect();
     if conv.close_delimited {
         want[n - 1] = CLOSE_BODY.len() as u64;
     }
     prop_assert_eq!(resp_ends, want);
-    prop_assert!(!ev.iter().any(|e| matches!(e, Event::Unframed(_) | Event::Tunnel)));
+    prop_assert!(
+        !ev.iter()
+            .any(|e| matches!(e, Event::Unframed(_) | Event::Tunnel))
+    );
     Ok(())
 }
 
@@ -436,7 +469,10 @@ proptest! {
 }
 
 fn cuts_of(len: usize, cuts: &[u16]) -> Vec<usize> {
-    let mut points: Vec<usize> = cuts.iter().map(|c| usize::from(*c) * 7 % (len + 1)).collect();
+    let mut points: Vec<usize> = cuts
+        .iter()
+        .map(|c| usize::from(*c) * 7 % (len + 1))
+        .collect();
     points.sort_unstable();
     points
 }
@@ -524,7 +560,11 @@ fn interleaved(conv: &Conversation, ccuts: &[u16], scuts: &[u16]) -> (Vec<Event>
     let n = conv.exchanges.len();
     let mut previous: Vec<Vec<u8>> = Vec::new();
     for i in 0..=n {
-        let request = conv.exchanges.get(i).map(Exchange::request).unwrap_or_default();
+        let request = conv
+            .exchanges
+            .get(i)
+            .map(Exchange::request)
+            .unwrap_or_default();
         let mine = pieces(&request, ccuts);
         let mut theirs = previous.into_iter();
         let mut mine = mine.into_iter();
