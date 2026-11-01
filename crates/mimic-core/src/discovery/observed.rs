@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use xxhash_rust::xxh3::xxh3_64;
 
 use super::redact::{MARKER, Redactor};
 use super::schema::{Pair, Params, Schema, header_pairs, query_pairs};
@@ -162,9 +163,78 @@ fn header<'a>(headers: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| *v)
 }
 
+/// What a body turned out to be, redacted.
+pub(super) enum Content {
+    /// Not parsed: another media type, or over `MAX_BODY`.
+    Opaque,
+    Json {
+        value: Value,
+        schema: Schema,
+    },
+    Form {
+        pairs: Vec<Pair>,
+        params: Params,
+    },
+}
+
+/// A body with a `content-type`, parsed once for both the schemas and the samples.
+pub(super) struct Parsed {
+    pub media: String,
+    pub size: usize,
+    pub content: Content,
+    /// XXH3 of the schema skeleton; 0 for an opaque body.
+    pub shape: u64,
+}
+
+/// Parses a body (already content-decoded) by its `content-type`; nothing without one.
+pub(super) fn parse(redactor: &Redactor, headers: &[(&str, &str)], body: &[u8]) -> Option<Parsed> {
+    let media = header(headers, "content-type")?
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if media.is_empty() || media.len() > MAX_MEDIA_LEN {
+        return None;
+    }
+    let mut content = Content::Opaque;
+    let mut shape = 0;
+    if body.len() <= MAX_BODY {
+        if media == "application/json" || media.ends_with("+json") {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(body) {
+                redactor.json(&mut value);
+                let schema = Schema::infer(&value);
+                shape = xxh3_64(schema.to_json().to_string().as_bytes());
+                content = Content::Json { value, schema };
+            }
+        } else if media == "application/x-www-form-urlencoded" {
+            let text = String::from_utf8_lossy(body);
+            let pairs = query_pairs(redactor, &text);
+            let params = Params::from_pairs(&pairs);
+            shape = xxh3_64(params.to_json().to_string().as_bytes());
+            content = Content::Form { pairs, params };
+        }
+    }
+    Some(Parsed {
+        media,
+        size: body.len(),
+        content,
+        shape,
+    })
+}
+
 impl Observed {
     /// Records one exchange: the same as merging the one-exchange value.
     pub fn record(&mut self, redactor: &Redactor, o: &Observation<'_>) {
+        self.record_parsed(redactor, o);
+    }
+
+    /// As `record`, and hands back the parsed request and response bodies for the samples.
+    pub(super) fn record_parsed(
+        &mut self,
+        redactor: &Redactor,
+        o: &Observation<'_>,
+    ) -> (Option<Parsed>, Option<Parsed>) {
         let query = query_pairs(redactor, o.query);
         observe_pairs(&mut self.fields, "query", &query);
         self.query = std::mem::take(&mut self.query).merge(Params::from_pairs(&query));
@@ -182,14 +252,14 @@ impl Observed {
             headers: Params::from_pairs(&resp),
             ..Side::default()
         };
-        self.body(
+        let req_body = self.body(
             redactor,
             "request.body",
             &mut request,
             o.req_headers,
             o.req_body,
         );
-        self.body(
+        let resp_body = self.body(
             redactor,
             "response.body",
             &mut response,
@@ -198,6 +268,7 @@ impl Observed {
         );
         self.request = std::mem::take(&mut self.request).merge(request);
         self.response = std::mem::take(&mut self.response).merge(response);
+        (req_body, resp_body)
     }
 
     fn body(
@@ -207,40 +278,27 @@ impl Observed {
         side: &mut Side,
         headers: &[(&str, &str)],
         body: Option<&[u8]>,
-    ) {
-        let (Some(body), Some(content_type)) = (body, header(headers, "content-type")) else {
-            return;
-        };
-        let media = content_type
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if media.is_empty() || media.len() > MAX_MEDIA_LEN {
-            return;
-        }
+    ) -> Option<Parsed> {
+        let parsed = parse(redactor, headers, body?)?;
+        let field = format!("{prefix}/{}", parsed.media);
         let mut m = Media {
             count: 1,
-            bytes: body.len() as u64,
+            bytes: parsed.size as u64,
             ..Media::default()
         };
-        if body.len() <= MAX_BODY {
-            let field = format!("{prefix}/{media}");
-            if media == "application/json" || media.ends_with("+json") {
-                if let Ok(mut value) = serde_json::from_slice::<Value>(body) {
-                    redactor.json(&mut value);
-                    observe_leaves(&mut self.fields, &field, "", &value, 1);
-                    m.json = Some(Schema::infer(&value));
-                }
-            } else if media == "application/x-www-form-urlencoded" {
-                let text = String::from_utf8_lossy(body);
-                let pairs = query_pairs(redactor, &text);
-                observe_pairs(&mut self.fields, &field, &pairs);
-                m.form = Some(Params::from_pairs(&pairs));
+        match &parsed.content {
+            Content::Json { value, schema } => {
+                observe_leaves(&mut self.fields, &field, "", value, 1);
+                m.json = Some(schema.clone());
             }
+            Content::Form { pairs, params } => {
+                observe_pairs(&mut self.fields, &field, pairs);
+                m.form = Some(params.clone());
+            }
+            Content::Opaque => {}
         }
-        side.bodies.insert(media, m);
+        side.bodies.insert(parsed.media.clone(), m);
+        Some(parsed)
     }
 
     pub fn merge(self, other: Self) -> Self {

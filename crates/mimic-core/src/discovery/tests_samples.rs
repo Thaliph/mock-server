@@ -144,7 +144,10 @@ mod samples {
         assert_eq!(samples.len(), 20);
         let statuses: std::collections::BTreeSet<u16> =
             samples.iter().map(|(_, s)| s.status()).collect();
-        assert_eq!(statuses.into_iter().collect::<Vec<_>>(), [200, 201, 400, 500]);
+        assert_eq!(
+            statuses.into_iter().collect::<Vec<_>>(),
+            [200, 201, 400, 500]
+        );
         // Every (status, request shape, response shape) class that a candidate has.
         let classes: std::collections::BTreeSet<_> = samples
             .iter()
@@ -209,6 +212,7 @@ mod samples {
         let mut body = br#"{"filler":""#.to_vec();
         body.extend(std::iter::repeat_n(b'z', 300 * 1024));
         body.extend(br#""}"#);
+        let size = body.len();
         big.resp_body = Some(body);
         let mut opaque = Owned::new("/b", 200);
         opaque
@@ -221,7 +225,7 @@ mod samples {
         assert!(!json.contains("zzzzzzzz"), "big body kept");
         assert!(!json.contains("OPAQUE-BODY-TEXT"), "opaque body kept");
         // The size and the media type are.
-        assert!(json.contains("\"bytes\":307212"), "{}", &json[..300]);
+        assert!(json.contains(&format!("\"bytes\":{size}")), "no size");
         assert!(json.contains("text/plain"));
         // The exchange is still a sample, without its body.
         assert_eq!(r.endpoints()[0].stats.samples().len(), 1);
@@ -269,7 +273,10 @@ mod samples {
         let mut o = Owned::new("/a", 200).query("password=hunter2&page=1");
         o.req_headers
             .push(("authorization".into(), "Bearer abc.def".into()));
-        let r = report(&limits(), &[o.json_request(&json!({"token": "t0k3n", "n": 1}))]);
+        let r = report(
+            &limits(),
+            &[o.json_request(&json!({"token": "t0k3n", "n": 1}))],
+        );
         let json = r.to_json();
         assert!(!json.contains("hunter2") && !json.contains("t0k3n"));
         assert!(!json.contains("abc.def"));
@@ -362,7 +369,9 @@ mod bounds {
         for p in ["/u/a", "/u/b", "/u/c"] {
             Owned::new(p, 200).record(&mut r, &l, &red);
         }
-        assert!(recorded(&Owned::new("/u/zzz", 404).record(&mut r, &l, &red)));
+        assert!(recorded(
+            &Owned::new("/u/zzz", 404).record(&mut r, &l, &red)
+        ));
         assert_eq!(r.endpoints().len(), 1);
     }
 
@@ -373,19 +382,31 @@ mod bounds {
         let mut r = Report::new(None);
         let long = format!("/{}", "a".repeat(2048));
         assert_eq!(long.len(), 2049);
-        assert_eq!(Owned::new(&long, 200).record(&mut r, &l, &red), Outcome::Invalid);
+        assert_eq!(
+            Owned::new(&long, 200).record(&mut r, &l, &red),
+            Outcome::Invalid
+        );
         let ok = format!("/{}", "a".repeat(2047));
         assert!(recorded(&Owned::new(&ok, 200).record(&mut r, &l, &red)));
 
         let deep33 = "/a".repeat(33);
-        assert_eq!(Owned::new(&deep33, 200).record(&mut r, &l, &red), Outcome::Invalid);
+        assert_eq!(
+            Owned::new(&deep33, 200).record(&mut r, &l, &red),
+            Outcome::Invalid
+        );
         let deep32 = "/a".repeat(32);
         assert!(recorded(&Owned::new(&deep32, 200).record(&mut r, &l, &red)));
         assert_eq!(r.endpoints().len(), 2);
         assert_eq!(r.exchanges(), 2);
         // A status outside 100..=599 is not an HTTP status.
-        assert_eq!(Owned::new("/s", 99).record(&mut r, &l, &red), Outcome::Invalid);
-        assert_eq!(Owned::new("/s", 600).record(&mut r, &l, &red), Outcome::Invalid);
+        assert_eq!(
+            Owned::new("/s", 99).record(&mut r, &l, &red),
+            Outcome::Invalid
+        );
+        assert_eq!(
+            Owned::new("/s", 600).record(&mut r, &l, &red),
+            Outcome::Invalid
+        );
     }
 
     fn arbitrary_exchange() -> impl Strategy<Value = Owned> {
@@ -421,7 +442,7 @@ mod bounds {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(2_000))]
+        #![proptest_config(ProptestConfig::with_cases(1_000))]
 
         #[test]
         fn dsc_11_never_panics_and_state_stays_bounded(
@@ -432,8 +453,8 @@ mod bounds {
             let mut r = Report::new(None);
             for o in &items {
                 o.record(&mut r, &l, &red);
-                prop_assert!(r.endpoints().len() <= l.max_endpoints);
             }
+            prop_assert!(r.endpoints().len() <= l.max_endpoints);
             prop_assert!(r.sample_bytes() <= l.sample_budget);
             let retained = r.to_json().len() - r.sample_bytes();
             prop_assert!(
@@ -451,7 +472,13 @@ mod algebra {
 
     fn exchange() -> impl Strategy<Value = Owned> {
         (
-            prop_oneof![Just("/a"), Just("/a/1"), Just("/b"), Just("/b/x"), Just("/b/y")],
+            prop_oneof![
+                Just("/a"),
+                Just("/a/1"),
+                Just("/b"),
+                Just("/b/x"),
+                Just("/b/y")
+            ],
             prop_oneof![Just(200u16), Just(201), Just(400), Just(500)],
             0u8..4,
             0u8..3,

@@ -122,7 +122,7 @@ fn dsc_02_absorbing() {
         &[
             ex("/u/a", 200, 1),
             ex("/u/b", 200, 1),
-            ex("/u/c", 404, 1),
+            ex("/u/c", 500, 1),
             ex("/u/d", 200, 1),
             ex("/x/a", 200, 1),
         ],
@@ -130,7 +130,7 @@ fn dsc_02_absorbing() {
     assert_eq!(templates(&r), ["/u/{u_id}", "/x/a"]);
     let eps = r.endpoints();
     assert_eq!(eps[0].stats.statuses.get(&200), Some(&3));
-    assert_eq!(eps[0].stats.statuses.get(&404), Some(&1));
+    assert_eq!(eps[0].stats.statuses.get(&500), Some(&1));
     assert_eq!(eps[0].stats.latency.count(), 4);
 
     // Later literals and a parameter share the absorbed node.

@@ -5,6 +5,7 @@ name: ci
 #   chart ─────────────────────▲
 #   security (cargo deny, zizmor)
 #   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; skipped unless a PR touches the codec)
+#           └─▶ fuzz-discovery (discovery recorder, spec DSC-23; same rule for its own paths)
 # `ci-ok` sums them up; it is the only required check on main.
 
 on:
@@ -164,13 +165,14 @@ jobs:
         env:
           SKIP_BUILD: "1"
 
-  # Path filter for the fuzz job: only a pull request that touches the HTTP/1 codec or the
-  # fuzz crate runs it. Other events leave `codec` empty.
+  # Path filters for the fuzz jobs: only a pull request that touches the HTTP/1 codec (or the
+  # discovery module) or the fuzz crate runs the matching job. Other events leave them false.
   changes:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     outputs:
       codec: ${{ steps.filter.outputs.codec }}
+      discovery: ${{ steps.filter.outputs.discovery }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -181,11 +183,18 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          changed=false
-          if [ "$EVENT" = pull_request ] && [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/proxy/http1 fuzz)" ]; then
-            changed=true
+          codec=false
+          discovery=false
+          if [ "$EVENT" = pull_request ]; then
+            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/proxy/http1 fuzz)" ]; then
+              codec=true
+            fi
+            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/discovery fuzz)" ]; then
+              discovery=true
+            fi
           fi
-          echo "codec=$changed" >> "$GITHUB_OUTPUT"
+          echo "codec=$codec" >> "$GITHUB_OUTPUT"
+          echo "discovery=$discovery" >> "$GITHUB_OUTPUT"
 
   fuzz:
     # PRX-28: 60 s on a pull request that touches the codec, 10 min on the weekly schedule.
@@ -241,9 +250,63 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  fuzz-discovery:
+    # DSC-23: 60 s on a pull request that touches the discovery module, 10 min on the weekly schedule.
+    # Skipped otherwise; `ci-ok` accepts that skip (and only that one).
+    name: fuzz (discovery)
+    needs: changes
+    if: github.event_name == 'schedule' || (github.event_name == 'pull_request' && needs.changes.outputs.discovery == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 600 || 60 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: nightly-2026-10-24
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }} # zizmor: ignore[cache-poisoning] cache written from main only, nothing is published by this job
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/discovery
+          key: fuzz-corpus-discovery-${{ github.run_id }}
+          restore-keys: fuzz-corpus-discovery-
+      - name: Fuzz the discovery recorder
+        working-directory: fuzz
+        # cargo-fuzz defaults to the target it was built for; the prebuilt binary is musl, which
+        # the address sanitizer cannot use.
+        # The corpus directory is missing on a cold cache; libFuzzer requires it to exist.
+        run: >
+          mkdir -p corpus/discovery &&
+          cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu discovery
+          corpus/discovery seeds/discovery --
+          -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10
+      # The corpus grows on the weekly run only; PR runs read it and never write it.
+      - if: github.event_name == 'schedule'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/discovery
+          key: fuzz-corpus-discovery-${{ github.run_id }}
+      # DSC-23: the crashing input is kept for triage.
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-discovery-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
   ci-ok:
     if: always()
-    needs: [lint, test, chart, security, image, e2e, changes, fuzz]
+    needs: [lint, test, chart, security, image, e2e, changes, fuzz, fuzz-discovery]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     env:
@@ -255,11 +318,13 @@ jobs:
       E2E: ${{ needs.e2e.result }}
       CHANGES: ${{ needs.changes.result }}
       FUZZ: ${{ needs.fuzz.result }}
+      FUZZ_DISCOVERY: ${{ needs.fuzz-discovery.result }}
       CODEC: ${{ needs.changes.outputs.codec }}
+      DISCOVERY: ${{ needs.changes.outputs.discovery }}
     steps:
       - name: All stages passed
         run: |
-          echo "lint=$LINT test=$TEST chart=$CHART security=$SECURITY image=$IMAGE e2e=$E2E changes=$CHANGES fuzz=$FUZZ codec=$CODEC"
+          echo "lint=$LINT test=$TEST chart=$CHART security=$SECURITY image=$IMAGE e2e=$E2E changes=$CHANGES fuzz=$FUZZ codec=$CODEC fuzz-discovery=$FUZZ_DISCOVERY discovery=$DISCOVERY"
           for r in "$LINT" "$TEST" "$CHART" "$SECURITY" "$IMAGE" "$E2E" "$CHANGES"; do
             [ "$r" = success ] || exit 1
           done
@@ -267,5 +332,10 @@ jobs:
           case "$FUZZ" in
             success) ;;
             skipped) [ "$CODEC" != true ] || exit 1 ;;
+            *) exit 1 ;;
+          esac
+          case "$FUZZ_DISCOVERY" in
+            success) ;;
+            skipped) [ "$DISCOVERY" != true ] || exit 1 ;;
             *) exit 1 ;;
           esac

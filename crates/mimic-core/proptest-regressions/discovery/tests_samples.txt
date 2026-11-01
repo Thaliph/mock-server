@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d24ed3f831ae9da919998d1b49261c24ce74560fdf7dfe6ea94f94da3dded95a # shrinks to items = [Owned { method: "GET", path: "/b/y", status: 200, head_ms: 0, query: "q=0", req_headers: [], req_body: None, resp_headers: [("content-type", "application/json")], resp_body: Some([123, 34, 105, 100, 34, 58, 48, 125]) }, Owned { method: "GET", path: "/a", status: 200, head_ms: 0, query: "q=0", req_headers: [], req_body: None, resp_headers: [], resp_body: None }, Owned { method: "GET", path: "/a", status: 200, head_ms: 0, query: "q=0", req_headers: [], req_body: None, resp_headers: [], resp_body: None }, Owned { method: "GET", path: "/a", status: 200, head_ms: 0, query: "q=0", req_headers: [], req_body: None, resp_headers: [], resp_body: None }, Owned { method: "GET", path: "/a", status: 200, head_ms: 0, query: "q=0", req_headers: [], req_body: None, resp_headers: [], resp_body: None }, Owned { method: "GET", path: "/a", status: 200, head_ms: 0, query: "q=0", req_headers: [], req_body: None, resp_headers: [], resp_body: None }, Owned { method: "GET", path: "/b/y", status: 200, head_ms: 10, query: "q=0", req_headers: [], req_body: None, resp_headers: [("content-type", "application/json")], resp_body: Some([123, 34, 105, 100, 34, 58, 48, 125]) }], cut1 = 1, cut2 = 0

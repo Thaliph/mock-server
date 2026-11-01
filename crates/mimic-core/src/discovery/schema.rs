@@ -357,6 +357,7 @@ pub struct Params {
 }
 
 /// A decoded, redacted key and value.
+#[derive(Debug, Clone)]
 pub(super) struct Pair {
     pub key: String,
     pub value: String,
