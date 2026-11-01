@@ -16,6 +16,8 @@ use super::template::{is_rfc3339, is_uuid};
 const MAX_LEVEL: usize = 16;
 /// Distinct keys of an object before it becomes a map.
 const MAX_KEYS: usize = 128;
+/// A map counts as this many copies of its value: it replaces up to twice `MAX_KEYS` keys.
+const MAP_WEIGHT: u64 = 256;
 /// Items of an array that are looked at.
 const MAX_ITEMS: usize = 256;
 /// Keys of a query, form or header set.
@@ -273,6 +275,30 @@ impl Schema {
             }
         }
         s
+    }
+
+    /// Nodes of the schema, counted as the 512-node cap counts them (spec §6).
+    pub(super) fn nodes(&self) -> usize {
+        usize::try_from(self.weight(1, usize::MAX)).unwrap_or(usize::MAX)
+    }
+
+    fn weight(&self, level: usize, cut: usize) -> u64 {
+        if level > cut {
+            return 1;
+        }
+        let mut n: u64 = 1;
+        if let Some(items) = &self.items {
+            n = n.saturating_add(items.weight(level + 1, cut));
+        }
+        if let Some(o) = &self.object {
+            for v in o.props.values() {
+                n = n.saturating_add(v.weight(level + 1, cut));
+            }
+            if let Some(m) = &o.map {
+                n = n.saturating_add(m.weight(level + 1, cut).saturating_mul(MAP_WEIGHT));
+            }
+        }
+        n
     }
 
     pub fn merge(mut self, other: Self) -> Self {

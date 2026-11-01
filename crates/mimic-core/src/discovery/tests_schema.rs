@@ -844,3 +844,187 @@ proptest! {
         prop_assert_eq!(of(&a).merge(of(&b)), of(&b).merge(of(&a)));
     }
 }
+
+mod cap {
+    use super::*;
+
+    const CAP: usize = 512;
+
+    /// Wide objects (some over 128 keys, so maps), long arrays and deep chains.
+    fn heavy() -> impl Strategy<Value = Value> {
+        scalar().prop_recursive(4, 400, 40, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..12).prop_map(Value::Array),
+                prop::collection::btree_map("[a-f]{1,2}", inner.clone(), 0..40)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+                prop::collection::vec(("[a-z]{1,2}", inner), 100..200)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    fn chain(keys: &[String], leaf: Value) -> Value {
+        keys.iter()
+            .rev()
+            .fold(leaf, |inner, k| json!({ k.as_str(): inner, "z": 1 }))
+    }
+
+    fn deep() -> impl Strategy<Value = Value> {
+        (prop::collection::vec("[a-e]{1,2}", 1..22), heavy_small())
+            .prop_map(|(keys, leaf)| chain(&keys, leaf))
+    }
+
+    fn heavy_small() -> impl Strategy<Value = Value> {
+        scalar().prop_recursive(3, 30, 6, |inner| {
+            prop::collection::btree_map("[a-d]", inner, 0..6)
+                .prop_map(|m| Value::Object(m.into_iter().collect()))
+        })
+    }
+
+    fn body_kind() -> impl Strategy<Value = Value> {
+        prop_oneof![heavy(), deep(), json_value()]
+    }
+
+    #[test]
+    fn dsc_11_ten_thousand_wide_bodies_keep_the_schema_under_512_nodes() {
+        let mut acc: Option<Schema> = None;
+        for i in 0..10_000u32 {
+            let body: Value = (0..100)
+                .map(|j| (format!("w{i}_{j}"), json!({ format!("f{}", i % 7): j })))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+            let s = Schema::infer(&body);
+            assert!(s.nodes() <= CAP, "body {i}: {}", s.nodes());
+            let m = match acc.take() {
+                Some(a) => a.merge(s),
+                None => s,
+            };
+            assert!(m.nodes() <= CAP, "after {i}: {}", m.nodes());
+            acc = Some(m);
+        }
+    }
+
+    #[test]
+    fn dsc_11_ten_thousand_deep_bodies_keep_the_schema_under_512_nodes() {
+        let mut acc: Option<Schema> = None;
+        for i in 0..10_000u32 {
+            let keys: Vec<String> = (0..15).map(|d| format!("k{d}_{}", i >> (d % 12))).collect();
+            let body = json!({ "items": [chain(&keys, json!(i))], format!("x{i}"): 1 });
+            let s = Schema::infer(&body);
+            assert!(s.nodes() <= CAP, "body {i}: {}", s.nodes());
+            let m = match acc.take() {
+                Some(a) => a.merge(s),
+                None => s,
+            };
+            assert!(m.nodes() <= CAP, "after {i}: {}", m.nodes());
+            acc = Some(m);
+        }
+    }
+
+    #[test]
+    fn dsc_11_cut_level_is_the_deepest_that_fits() {
+        // A map of 300 objects of 3 nodes weighs 1 + 256 * 3: the values are cut to `{}`.
+        let wide: Value = (0..300)
+            .map(|j| (format!("k{j}"), json!({ "a": 1, "b": 2 })))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        let s = Schema::infer(&wide);
+        assert!(s.nodes() <= CAP);
+        let j = s.to_json();
+        assert_eq!(j["additionalProperties"], json!({}), "{j}");
+        // 100 keys of 5 nodes each: 501 nodes fit whole.
+        let fits: Value = (0..100)
+            .map(|j| (format!("k{j}"), json!({ "a": 1, "b": { "c": 1, "d": 1 } })))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        assert_eq!(Schema::infer(&fits).nodes(), 501);
+        let cut: Value = (0..100)
+            .map(|j| {
+                (
+                    format!("k{j}"),
+                    json!({ "a": 1, "b": { "c": 1, "d": 1, "e": 1 } }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        // 601 nodes: the third level is cut, leaving 1 + 100 + 200 placeholders.
+        let s = Schema::infer(&cut);
+        assert_eq!(s.nodes(), 301);
+        assert_eq!(
+            s.to_json()["properties"]["k0"]["properties"]["b"],
+            json!({})
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        #[test]
+        fn dsc_11_capped_merge_is_commutative_and_associative(
+            a in body_kind(), b in body_kind(), c in body_kind()
+        ) {
+            let (a, b, c) = (Schema::infer(&a), Schema::infer(&b), Schema::infer(&c));
+            prop_assert!(a.nodes() <= CAP);
+            let ab = a.clone().merge(b.clone());
+            prop_assert!(ab.nodes() <= CAP);
+            prop_assert_eq!(&ab, &b.clone().merge(a.clone()));
+            let left = ab.merge(c.clone());
+            prop_assert!(left.nodes() <= CAP);
+            prop_assert_eq!(left, a.merge(b.merge(c)));
+        }
+
+        #[test]
+        fn dsc_11_capped_schema_equals_any_partition(
+            seq in prop::collection::vec(body_kind(), 1..8),
+            cuts in prop::collection::vec(any::<bool>(), 8)
+        ) {
+            let whole = seq.iter().map(Schema::infer).reduce(Schema::merge).unwrap();
+            let mut groups: Vec<Vec<&Value>> = vec![vec![]];
+            for (i, v) in seq.iter().enumerate() {
+                if i > 0 && cuts[i] {
+                    groups.push(vec![]);
+                }
+                groups.last_mut().unwrap().push(v);
+            }
+            let parts = groups
+                .into_iter()
+                .map(|g| g.into_iter().map(Schema::infer).reduce(Schema::merge).unwrap())
+                .reduce(Schema::merge)
+                .unwrap();
+            prop_assert!(whole.nodes() <= CAP);
+            prop_assert_eq!(parts, whole);
+        }
+
+        #[test]
+        fn dsc_11_capped_observed_equals_any_partition(
+            seq in prop::collection::vec(body_kind(), 1..6),
+            cuts in prop::collection::vec(any::<bool>(), 6)
+        ) {
+            let record = |vs: &[&Value]| {
+                let mut o = Observed::default();
+                for v in vs {
+                    let body = v.to_string();
+                    o.record(&redactor(), &Observation {
+                        query: "",
+                        req_headers: &[("content-type", "application/json")],
+                        req_body: Some(body.as_bytes()),
+                        resp_headers: &[],
+                        resp_body: None,
+                    });
+                }
+                o
+            };
+            let all: Vec<&Value> = seq.iter().collect();
+            let whole = record(&all);
+            let mut groups: Vec<Vec<&Value>> = vec![vec![]];
+            for (i, v) in seq.iter().enumerate() {
+                if i > 0 && cuts[i] {
+                    groups.push(vec![]);
+                }
+                groups.last_mut().unwrap().push(v);
+            }
+            let parts = groups.iter().map(|g| record(g)).reduce(Observed::merge).unwrap();
+            prop_assert_eq!(parts, whole);
+        }
+    }
+}
