@@ -132,8 +132,8 @@ pub struct Shared {
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
     active: watch::Sender<usize>,
-    /// One permit per connection served at once.
-    permits: Arc<Semaphore>,
+    /// One permit per connection served at once, per direction (inbound, outbound).
+    permits: [Arc<Semaphore>; 2],
     detect_stall: Duration,
 }
 
@@ -182,7 +182,10 @@ impl Shared {
             stop: watch::channel(false).0,
             abort: watch::channel(false).0,
             active: watch::channel(0).0,
-            permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            permits: [
+                Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+                Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            ],
             detect_stall: DETECT_STALL,
         }
     }
@@ -243,10 +246,14 @@ impl Shared {
         self
     }
 
-    /// Serves at most `max` connections at once (spec §4.1).
+    /// Serves at most `max` connections at once in each direction (spec §4.1).
     pub fn with_max_connections(mut self, max: usize) -> Shared {
-        self.permits = Arc::new(Semaphore::new(max));
+        self.permits = [Arc::new(Semaphore::new(max)), Arc::new(Semaphore::new(max))];
         self
+    }
+
+    fn permits(&self, direction: Direction) -> Arc<Semaphore> {
+        self.permits[usize::from(direction == Direction::Outbound)].clone()
     }
 
     /// Resets a connection stalled on an incomplete protocol prefix after `stall` (spec §4.1).
@@ -449,7 +456,7 @@ pub async fn accept_loop(
         // At the cap nothing is accepted: further connections wait in the backlog.
         let slot = tokio::select! {
             () = &mut shutdown => return,
-            Ok(slot) = shared.permits.clone().acquire_owned() => slot,
+            Ok(slot) = shared.permits(direction).acquire_owned() => slot,
         };
         let accepted = tokio::select! {
             () = &mut shutdown => return,

@@ -125,49 +125,128 @@ impl Reviewer for KubeReviewer {
     }
 }
 
-/// `TokenReview` calls per second the controller makes for all callers together, and the burst
-/// it allows (spec §7.2).
-pub const REVIEWS_PER_SECOND: u32 = 50;
-pub const REVIEW_BURST: u32 = 100;
+/// `TokenReview` budget of one source IP: burst and calls per second (spec §7.2).
+pub const SOURCE_BURST: u32 = 10;
+pub const SOURCE_PER_SECOND: u32 = 2;
+/// Budget of all sources together.
+pub const GLOBAL_BURST: u32 = 200;
+pub const GLOBAL_PER_SECOND: u32 = 100;
+/// Sources tracked; the oldest is forgotten first.
+pub const MAX_SOURCES: usize = 4096;
 
-/// A token bucket for `TokenReview` calls: callers with arbitrary tokens must not flood the API
-/// server.
-pub struct ReviewLimiter {
-    per_second: f64,
-    burst: f64,
-    state: std::sync::Mutex<(f64, tokio::time::Instant)>,
+/// A token bucket.
+struct Bucket {
+    tokens: f64,
+    at: tokio::time::Instant,
 }
 
-impl ReviewLimiter {
-    pub fn new(burst: u32, per_second: u32) -> ReviewLimiter {
-        ReviewLimiter {
-            per_second: f64::from(per_second),
-            burst: f64::from(burst),
-            state: std::sync::Mutex::new((f64::from(burst), tokio::time::Instant::now())),
+impl Bucket {
+    fn full(burst: u32) -> Bucket {
+        Bucket {
+            tokens: f64::from(burst),
+            at: tokio::time::Instant::now(),
         }
     }
 
-    /// Takes one call from the budget; false when it is spent.
-    pub fn allow(&self) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+    /// Whether one call is left, without taking it.
+    fn refill(&mut self, burst: u32, per_second: u32) -> bool {
         let now = tokio::time::Instant::now();
-        let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
-        state.0 = (state.0 + elapsed * self.per_second).min(self.burst);
-        state.1 = now;
-        if state.0 >= 1.0 {
-            state.0 -= 1.0;
-            true
-        } else {
-            false
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * f64::from(per_second)).min(f64::from(burst));
+        self.at = now;
+        self.tokens >= 1.0
+    }
+}
+
+struct LimiterState {
+    global: Bucket,
+    sources: std::collections::BTreeMap<std::net::IpAddr, Bucket>,
+    /// Insertion order of `sources`, for eviction.
+    order: std::collections::VecDeque<std::net::IpAddr>,
+}
+
+/// Limits `TokenReview` calls: per source IP, so that one pod with garbage tokens cannot starve
+/// the sidecars of the others, and in total.
+pub struct ReviewLimiter {
+    source: (u32, u32),
+    global: (u32, u32),
+    max_sources: usize,
+    state: std::sync::Mutex<LimiterState>,
+}
+
+impl ReviewLimiter {
+    /// `source` and `global` are `(burst, per second)`.
+    pub fn new(source: (u32, u32), global: (u32, u32), max_sources: usize) -> ReviewLimiter {
+        ReviewLimiter {
+            source,
+            global,
+            max_sources,
+            state: std::sync::Mutex::new(LimiterState {
+                global: Bucket::full(global.0),
+                sources: std::collections::BTreeMap::new(),
+                order: std::collections::VecDeque::new(),
+            }),
         }
+    }
+
+    /// Takes one call from the budget of `source` and the global one; false when either is
+    /// spent (a refused call costs the global budget nothing).
+    pub fn allow(&self, source: Option<std::net::IpAddr>) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state;
+        // Without a known source the call is only held to the global budget.
+        if let Some(ip) = source {
+            if !state.sources.contains_key(&ip) {
+                if state.order.len() >= self.max_sources
+                    && let Some(oldest) = state.order.pop_front()
+                {
+                    state.sources.remove(&oldest);
+                }
+                state.order.push_back(ip);
+                state.sources.insert(ip, Bucket::full(self.source.0));
+            }
+            if let Some(bucket) = state.sources.get_mut(&ip)
+                && !bucket.refill(self.source.0, self.source.1)
+            {
+                return false;
+            }
+        }
+        if !state.global.refill(self.global.0, self.global.1) {
+            return false;
+        }
+        state.global.tokens -= 1.0;
+        if let Some(ip) = source
+            && let Some(bucket) = state.sources.get_mut(&ip)
+        {
+            bucket.tokens -= 1.0;
+        }
+        true
+    }
+
+    /// Sources tracked now.
+    #[cfg(test)]
+    fn sources(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sources
+            .len()
     }
 }
 
 impl Default for ReviewLimiter {
     fn default() -> ReviewLimiter {
-        ReviewLimiter::new(REVIEW_BURST, REVIEWS_PER_SECOND)
+        ReviewLimiter::new(
+            (SOURCE_BURST, SOURCE_PER_SECOND),
+            (GLOBAL_BURST, GLOBAL_PER_SECOND),
+            MAX_SOURCES,
+        )
     }
 }
+
+/// The IP of the connection a request came in on, put in the request by the listener.
+#[derive(Debug, Clone, Copy)]
+pub struct Peer(pub std::net::IpAddr);
 
 /// What the endpoints need.
 pub struct SidecarApi {
@@ -182,8 +261,10 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
         .route(
             ENDPOINT,
             post(
-                |State(api): State<Arc<SidecarApi>>, headers: HeaderMap, body: Body| async move {
-                    api.intermediate(&headers, body).await
+                |State(api): State<Arc<SidecarApi>>, request: axum::extract::Request| async move {
+                    let peer = request.extensions().get::<Peer>().map(|peer| peer.0);
+                    let headers = request.headers().clone();
+                    api.intermediate(&headers, peer, request.into_body()).await
                 },
             ),
         )
@@ -242,9 +323,16 @@ struct IntermediateRequest {
 }
 
 impl SidecarApi {
-    async fn intermediate(&self, headers: &HeaderMap, body: Body) -> Response {
+    async fn intermediate(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<std::net::IpAddr>,
+        body: Body,
+    ) -> Response {
         let mut caller = Caller::default();
-        let outcome = self.authorize_and_sign(headers, body, &mut caller).await;
+        let outcome = self
+            .authorize_and_sign(headers, peer, body, &mut caller)
+            .await;
         let result = outcome.as_ref().map_or_else(|r| r.result, |_| "ok");
         self.metrics
             .requests
@@ -272,11 +360,12 @@ impl SidecarApi {
     async fn authorize_and_sign(
         &self,
         headers: &HeaderMap,
+        peer: Option<std::net::IpAddr>,
         body: Body,
         caller: &mut Caller,
     ) -> Result<String, Refusal> {
         let token = bearer(headers).ok_or(UNAUTHENTICATED)?;
-        if !self.limiter.allow() {
+        if !self.limiter.allow(peer) {
             caller.error = Some("token review budget spent".to_string());
             return Err(UNAVAILABLE);
         }
@@ -519,22 +608,34 @@ mod tests {
         token: Option<&str>,
         body: Vec<u8>,
     ) -> (u16, Vec<u8>) {
+        call_from(router, None, method, token, body).await
+    }
+
+    async fn call_from(
+        router: &Router,
+        peer: Option<&str>,
+        method: Method,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> (u16, Vec<u8>) {
         let mut request = Request::builder().method(method).uri(ENDPOINT);
         if let Some(token) = token {
             request = request.header("authorization", format!("Bearer {token}"));
         }
-        let response = router
-            .clone()
-            .oneshot(request.body(Body::from(body)).unwrap())
-            .await
-            .unwrap();
+        let mut request = request.body(Body::from(body)).unwrap();
+        if let Some(peer) = peer {
+            request.extensions_mut().insert(Peer(peer.parse().unwrap()));
+        }
+        let response = router.clone().oneshot(request).await.unwrap();
         let status = response.status().as_u16();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         (status, bytes.to_vec())
     }
 
     async fn post_status(s: &Setup, token: Option<&str>, body: Vec<u8>) -> u16 {
-        call(&s.router, Method::POST, token, body).await.0
+        call_from(&s.router, Some("10.1.1.1"), Method::POST, token, body)
+            .await
+            .0
     }
 
     #[tokio::test]
@@ -675,7 +776,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn tls_28_token_reviews_are_rate_limited_and_the_budget_refills() {
-        let s = setup_limited(seed(), ReviewLimiter::new(2, 1));
+        let s = setup_limited(seed(), ReviewLimiter::new((2, 1), (100, 100), 16));
         let key = KeyPair::generate().unwrap();
         assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 200);
         assert_eq!(post_status(&s, Some("bad"), body("pay", &key)).await, 401);
@@ -687,6 +788,38 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
         assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 200);
         assert_eq!(s.reviews.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tls_28_one_noisy_source_does_not_get_another_refused() {
+        let s = setup_limited(seed(), ReviewLimiter::new((2, 1), (100, 100), 16));
+        let key = KeyPair::generate().unwrap();
+        let post = |peer: &'static str, token: &'static str| {
+            let (router, body) = (s.router.clone(), body("pay", &key));
+            async move {
+                call_from(&router, Some(peer), Method::POST, Some(token), body)
+                    .await
+                    .0
+            }
+        };
+        for _ in 0..2 {
+            assert_eq!(post("10.0.0.1", "garbage").await, 401);
+        }
+        assert_eq!(post("10.0.0.1", "garbage").await, 503);
+        assert_eq!(post("10.0.0.1", "ok").await, 503);
+        // Another pod is served, and the refused calls never reached the API server.
+        assert_eq!(post("10.0.0.2", "ok").await, 200);
+        assert_eq!(s.reviews.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn tls_28_the_global_ceiling_and_the_table_of_sources_are_bounded() {
+        let limiter = ReviewLimiter::new((10, 1), (3, 1), 2);
+        let ip = |n: u8| Some(std::net::IpAddr::from([10, 0, 0, n]));
+        assert!(limiter.allow(ip(1)) && limiter.allow(ip(2)) && limiter.allow(ip(3)));
+        // Global ceiling reached for every source.
+        assert!(!limiter.allow(ip(4)));
+        assert_eq!(limiter.sources(), 2);
     }
 
     #[tokio::test]

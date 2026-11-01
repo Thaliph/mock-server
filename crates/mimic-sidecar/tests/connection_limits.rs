@@ -48,6 +48,37 @@ async fn prx_31_connections_over_the_cap_wait_until_one_ends() {
 }
 
 #[tokio::test]
+async fn prx_31_a_full_inbound_side_does_not_delay_outbound() {
+    use mimic_runtime::metrics::Metrics;
+    use mimic_sidecar::listener::{OriginalDst, Shared, TunnelMetrics, spawn_listener};
+    use std::sync::Arc;
+    let echo = echo_server().await;
+    let inbound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let outbound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (in_addr, out_addr) = (
+        inbound.local_addr().unwrap(),
+        outbound.local_addr().unwrap(),
+    );
+    let mut metrics = Metrics::new("sidecar", "test");
+    let tunnel = TunnelMetrics::register(&mut metrics);
+    let original: OriginalDst = Arc::new(move |_| Ok(echo));
+    let shared =
+        Arc::new(Shared::new(vec![in_addr, out_addr], tunnel, original).with_max_connections(1));
+    spawn_listener(inbound, Direction::Inbound, shared.clone());
+    spawn_listener(outbound, Direction::Outbound, shared.clone());
+    let mut held = TcpStream::connect(in_addr).await.unwrap();
+    assert!(echoes(&mut held).await);
+    // The inbound side is full: a second inbound connection waits, an outbound one is served.
+    let mut waiting = TcpStream::connect(in_addr).await.unwrap();
+    assert!(!echoes(&mut waiting).await);
+    let mut out = TcpStream::connect(out_addr).await.unwrap();
+    assert!(
+        echoes(&mut out).await,
+        "outbound waited for the inbound side"
+    );
+}
+
+#[tokio::test]
 async fn prx_31_a_stalled_prefix_is_reset_and_a_silent_connection_is_not() {
     let echo = echo_server().await;
     let f = fixture_configured(
