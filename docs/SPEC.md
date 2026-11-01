@@ -854,6 +854,9 @@ Everything below except the capture tap, content decoding and the recorder threa
     bytes, at most 64 query keys and 64 headers, 128 volatile fields and 32 hashes per
     sketch, paths and templates of at most 2048 bytes and 32 segments, 16 media types per
     side, sample bodies only for parsed media types and of at most 256 KiB, no unknown field.
+    A template's length counts each literal segment's bytes plus its `/`, and a parameter as
+    its `/` alone (the rendered `{name}` can be longer than the raw path); the `{}` that marks
+    a schema's cut level is not a level.
     Any other violation is `400` with its `reason`.
   - *Re-redaction* (pure, idempotent): the §6 redaction applied again to every sample, host,
     concrete path and volatile field with the built-in rules and the union of
@@ -902,6 +905,9 @@ Everything below except the capture tap, content decoding and the recorder threa
     to zero samples; if room cannot be made that way the new sample is refused (`budget`)
     and nothing is evicted. Counters, histograms, schemas and volatility merge whatever is
     refused or evicted.
+  Ties left by those rules are broken by the full endpoint key. A stored report already over
+  the budget (a lowered `MIMIC_STORE_SAMPLE_BUDGET`) is trimmed by the same eviction rule; a
+  sample added and evicted within one merge counts as `evicted`.
   Refusals are counted in `mimic_store_refused_total{kind,reason}` with one WARN
   `store limit reached` (`namespace`, `deployment`, `reason`) per deployment and reason per
   process; evictions in `mimic_store_evicted_total{kind}` with one WARN `store evicted`
