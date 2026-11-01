@@ -464,6 +464,10 @@ pod=$(kubectl -n inj-13 get pods -l app=app -o jsonpath='{.items[0].metadata.nam
   || fail "inj_13: readiness probe does not go through the sidecar"
 [[ $(jp inj-13 "$pod" '{.spec.containers[?(@.name=="app")].readinessProbe.httpGet.port}') == 15100 ]] \
   || fail "inj_13: readiness probe port is not the sidecar admin port"
+[[ $(jp inj-13 "$pod" '{.spec.containers[?(@.name=="app")].startupProbe.httpGet.path}') == /app-health/app/startupz ]] \
+  || fail "inj_13: tcpSocket startup probe was not rewritten to go through the sidecar"
+[[ $(jp inj-13 "$pod" '{.spec.initContainers[?(@.name=="mimic-init")].env[?(@.name=="MIMIC_EXCLUDE_INBOUND_PORTS")].value}') == 15100 ]] \
+  || fail "inj_13: a probe port is excluded from inbound interception"
 
 kubectl -n inj-13-up wait --for=condition=Ready pod/client --timeout=180s >/dev/null \
   || fail "inj_13: client pod in inj-13-up not Ready (image pull?)"
@@ -473,6 +477,15 @@ kubectl -n inj-13-up exec client -- python3 -c \
   || fail "inj_13: request from another pod to the app Service failed"
 wait_tcp_increase inj-13 inbound "$before" \
   || fail "inj_13: inbound connection not counted as mimic_tcp_connections_total{direction=\"inbound\",result=\"ok\"}"
+
+# The port of the tcpSocket probe is intercepted too.
+pod_ip=$(jp inj-13 "$pod" '{.status.podIP}')
+before=$(tcp_count inj-13 inbound ok) || true; before=${before:-0}
+kubectl -n inj-13-up exec client -- python3 -c \
+  "import urllib.request; urllib.request.urlopen('http://$pod_ip:9090/ready', timeout=10).read()" \
+  || fail "inj_13: request from another pod to the tcpSocket probe port failed"
+wait_tcp_increase inj-13 inbound "$before" \
+  || fail "inj_13: connection to the tcpSocket probe port bypassed the sidecar"
 
 before=$(tcp_count inj-13 outbound ok) || true; before=${before:-0}
 kubectl -n inj-13 exec "$pod" -c app -- python3 -c \

@@ -216,3 +216,115 @@ fn inj_18_invalid_probes_are_rejected() {
     }
     assert!(Probes::from_env(&Env::default()).is_ok());
 }
+
+#[tokio::test]
+async fn inj_18_tcp_probe_answers_200_when_it_connects_and_503_otherwise() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let json = format!(
+        r#"{{"web/readyz":{{"tcpSocket":{{"port":{port}}},"timeoutSeconds":1}},
+            "web/livez":{{"tcpSocket":{{"port":{port},"host":"127.0.0.1"}}}},
+            "api/readyz":{{"tcpSocket":{{"port":{closed_port}}},"timeoutSeconds":1}}}}"#
+    );
+    let r = router_for(&json).await;
+    assert_eq!(get_status(&r, "/app-health/web/readyz").await, 200);
+    assert_eq!(get_status(&r, "/app-health/web/livez").await, 200);
+    assert_eq!(get_status(&r, "/app-health/api/readyz").await, 503);
+}
+
+/// An h2c server answering `Health/Check`. The service name asked for picks the answer: "up"
+/// and "" are SERVING, "down" NOT_SERVING, "err" a gRPC error (UNIMPLEMENTED).
+async fn grpc_app() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(tcp).await else {
+                    return;
+                };
+                while let Some(Ok((request, mut respond))) = conn.accept().await {
+                    tokio::spawn(async move {
+                        let mut body = request.into_body();
+                        let mut data = Vec::new();
+                        while let Some(Ok(chunk)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            data.extend_from_slice(&chunk);
+                        }
+                        // 5-byte frame header, then field 1 (tag 0x0a, one-byte length) if any.
+                        let service = String::from_utf8_lossy(data.get(7..).unwrap_or_default());
+                        let response = axum::http::Response::builder()
+                            .header("content-type", "application/grpc")
+                            .body(())
+                            .unwrap();
+                        let mut stream = respond.send_response(response, false).unwrap();
+                        let mut trailers = axum::http::HeaderMap::new();
+                        if service == "err" {
+                            trailers.insert("grpc-status", "12".parse().unwrap());
+                        } else {
+                            let serving = u8::from(service == "up" || service.is_empty());
+                            let msg = [0u8, 0, 0, 0, 2, 0x08, serving];
+                            stream.send_data(msg.to_vec().into(), false).unwrap();
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                        }
+                        stream.send_trailers(trailers).unwrap();
+                    });
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn inj_18_grpc_probe_answers_200_only_for_serving() {
+    let addr = grpc_app().await;
+    let port = addr.port();
+    let g = |service: &str| {
+        format!(r#"{{"grpc":{{"port":{port},"service":"{service}"}},"timeoutSeconds":2}}"#)
+    };
+    let json = format!(
+        r#"{{"a/readyz":{},"a/livez":{},"a/startupz":{},"c/readyz":{{"grpc":{{"port":{port}}},"timeoutSeconds":2}}}}"#,
+        g("up"),
+        g("down"),
+        g("err"),
+    );
+    let r = router_for(&json).await;
+    assert_eq!(get_status(&r, "/app-health/a/readyz").await, 200);
+    assert_eq!(get_status(&r, "/app-health/a/livez").await, 503);
+    assert_eq!(get_status(&r, "/app-health/a/startupz").await, 503);
+    // No service: the empty name, which this server reports as SERVING.
+    assert_eq!(get_status(&r, "/app-health/c/readyz").await, 200);
+}
+
+#[tokio::test]
+async fn inj_18_grpc_probe_answers_503_for_a_refused_connection_and_a_non_grpc_server() {
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let addr = app().await;
+    let json = format!(
+        r#"{{"a/readyz":{{"grpc":{{"port":{closed_port}}}}},"b/readyz":{{"grpc":{{"port":{}}},"timeoutSeconds":1}}}}"#,
+        addr.port()
+    );
+    let r = router_for(&json).await;
+    assert_eq!(get_status(&r, "/app-health/a/readyz").await, 503);
+    assert_eq!(get_status(&r, "/app-health/b/readyz").await, 503);
+}
+
+#[test]
+fn inj_18_invalid_tcp_and_grpc_probes_are_rejected() {
+    for bad in [
+        r#"{"web/readyz":{"tcpSocket":{"port":0}}}"#,
+        r#"{"web/readyz":{"tcpSocket":{}}}"#,
+        r#"{"web/readyz":{"grpc":{"port":0}}}"#,
+        r#"{"web/readyz":{"grpc":{"port":"x"}}}"#,
+    ] {
+        assert!(Probes::from_env(&env(bad)).is_err(), "{bad}");
+    }
+}
