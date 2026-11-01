@@ -197,6 +197,11 @@ impl Sample {
         let content = total
             .saturating_sub(digits(self.bytes.to_string()))
             .saturating_sub(digits(self.head_ms.to_string()))
+            // The stamp (`,"last_seen":N`) is not part of the content.
+            .saturating_sub(
+                self.last_seen
+                    .map_or(0, |day| ",\"last_seen\":".len() + digits(day.to_string())),
+            )
             .saturating_add(2);
         if content != self.bytes {
             return Err(Violation::SampleBytes);
