@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::histogram::Histogram;
+use super::redact;
 use super::template::{Seg, is_param, render, split_path};
 
 /// Hosts kept per endpoint.
@@ -193,7 +194,8 @@ impl Report {
         let mut scope = Scope::default();
         if exchange.grpc {
             let methods = BTreeMap::from([(exchange.method.to_string(), stats)]);
-            scope.raw.insert(exchange.path.to_string(), methods);
+            // Not templated, but redacted: the client chooses its `content-type`.
+            scope.raw.insert(redact::path(exchange.path), methods);
         } else {
             let mut node = Node {
                 endpoints: BTreeMap::from([(exchange.method.to_string(), stats)]),
