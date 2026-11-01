@@ -295,7 +295,7 @@ fn get(path: &str, grpc: bool) -> Report {
 /// keys that become equal merge.
 #[test]
 fn ctl_03_path_keys() {
-    let other = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI1NiJ9.b3RoZXItc2lnbmF0dXJl";
+    let other = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI1NiJ9.b3RoZXItc2lnbmF0dXJl"; // gitleaks:allow (test canary)
     let a = get("/alpha", false);
     let b = get("/beta", false);
     let mut value: Value = serde_json::from_str(&merge(a, b, &LIMITS).to_json().unwrap()).unwrap();
@@ -357,7 +357,7 @@ fn plant(v: &mut Value, secret: &str) {
     }
 }
 
-const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl";
+const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVl"; // gitleaks:allow (test canary)
 const CARD: &str = "4111111111111111";
 const GITHUB: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -431,7 +431,10 @@ fn ctl_03_detected_forms_in_a_bypassing_report() {
             );
             report.re_redact(&Redactor::default());
             let json = report.to_json().unwrap();
-            assert!(!json.contains(secret), "{place}: {secret} kept");
+            assert!(
+                !json.contains(secret),
+                "{place}: the planted secret was kept"
+            );
             assert_eq!(samples_of(&report), samples_of(&truth), "{place}");
             assert_eq!(
                 report.endpoints()[0].stats.hosts,
