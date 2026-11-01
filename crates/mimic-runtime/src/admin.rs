@@ -124,7 +124,9 @@ pub async fn serve_until(
 ) -> std::io::Result<()> {
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let mut drain_rx = stop_tx.subscribe();
-    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+    // Peer addresses are available to the handlers (`/discovery` is loopback only).
+    let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = axum::serve(listener, service).with_graceful_shutdown(async move {
         let _ = stop_rx.wait_for(|stop| *stop).await;
     });
     tokio::spawn(async move {

@@ -3,6 +3,21 @@
 use super::scan::{HeadScanner, Kind, Scan};
 use super::{CHUNK_LINE_LIMIT, Reason};
 
+/// Payload bytes handed to the discovery tap: at most `room` of them, per message.
+#[derive(Debug, Default)]
+pub(super) struct Cap {
+    pub(super) room: usize,
+    pub(super) out: Vec<u8>,
+}
+
+impl Cap {
+    fn put(&mut self, payload: &[u8]) {
+        let n = payload.len().min(self.room);
+        self.out.extend_from_slice(&payload[..n]);
+        self.room -= n;
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum BodyScan {
     More,
@@ -92,12 +107,13 @@ impl Body {
     }
 
     /// Consume bytes; returns how many belong to this body.
-    pub(super) fn feed(&mut self, data: &[u8]) -> (usize, BodyScan) {
+    pub(super) fn feed(&mut self, data: &[u8], cap: &mut Cap) -> (usize, BodyScan) {
         match self {
             Body::Length { left, total } => {
                 let n = u64::try_from(data.len()).unwrap_or(u64::MAX).min(*left);
                 *left -= n;
                 let used = usize::try_from(n).unwrap_or(data.len());
+                cap.put(&data[..used]);
                 if *left == 0 {
                     (used, BodyScan::Done(*total))
                 } else {
@@ -106,14 +122,20 @@ impl Body {
             }
             Body::UntilClose { total } => {
                 *total = total.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                cap.put(data);
                 (data.len(), BodyScan::More)
             }
-            Body::Chunked { state, total } => feed_chunked(state, total, data),
+            Body::Chunked { state, total } => feed_chunked(state, total, data, cap),
         }
     }
 }
 
-fn feed_chunked(state: &mut Chunk, total: &mut u64, data: &[u8]) -> (usize, BodyScan) {
+fn feed_chunked(
+    state: &mut Chunk,
+    total: &mut u64,
+    data: &[u8],
+    cap: &mut Cap,
+) -> (usize, BodyScan) {
     let mut pos = 0;
     while pos < data.len() {
         match state {
@@ -122,7 +144,9 @@ fn feed_chunked(state: &mut Chunk, total: &mut u64, data: &[u8]) -> (usize, Body
                 let n = avail.min(*left);
                 *left -= n;
                 *total = total.saturating_add(n);
-                pos += usize::try_from(n).unwrap_or(data.len() - pos);
+                let used = usize::try_from(n).unwrap_or(data.len() - pos);
+                cap.put(&data[pos..pos + used]);
+                pos += used;
                 if *left == 0 {
                     *state = Chunk::DataEnd { cr: false };
                 }

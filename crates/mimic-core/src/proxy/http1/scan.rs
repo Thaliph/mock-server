@@ -119,6 +119,11 @@ impl HeadScanner {
         }
     }
 
+    /// The head as read, line endings and blank line included.
+    pub(super) fn raw(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// The lines read so far, line endings removed.
     pub(super) fn lines(&self) -> impl Iterator<Item = &[u8]> {
         self.buf

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use mimic_runtime::admin::{self, Readiness, Shutdown};
 use mimic_runtime::config::{CommonConfig, Env};
 use mimic_runtime::metrics::Metrics;
+use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 use mimic_sidecar::probes::{self, Probes};
 use mimic_sidecar::red::ProxyMetrics;
@@ -42,6 +43,11 @@ fn main() -> ExitCode {
         Ok(tls) => tls,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
+    let discovery = match DiscoveryConfig::from_env(&env) {
+        Ok(discovery) => discovery,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
+    let pod = env.optional("MIMIC_POD_NAME").map(str::to_string);
     let mut log = mimic_runtime::logging::init(&config.log);
     // Before any key exists: no core dump, not readable through /proc by other processes.
     if let Err(e) = mimic_sidecar::hardening::harden() {
@@ -49,7 +55,7 @@ fn main() -> ExitCode {
         log.finish();
         return ExitCode::FAILURE;
     }
-    let code = match run(config, tunnel, probes, tls) {
+    let code = match run(config, tunnel, probes, tls, (discovery, pod)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "sidecar stopped");
@@ -67,6 +73,7 @@ async fn run(
     tunnel: TunnelConfig,
     probes: Probes,
     tls: TlsConfig,
+    (discovery, pod): (DiscoveryConfig, Option<String>),
 ) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     // Registered before any listener is announced: an early SIGTERM is not lost.
@@ -76,6 +83,8 @@ async fn run(
     let proxy_metrics = ProxyMetrics::register(&mut metrics, tunnel.max_authorities);
     let ca_metrics = CaMetrics::register(&mut metrics);
     let tls_metrics = TlsMetrics::register(&mut metrics);
+    let discovery = Discovery::start(&discovery, pod)?;
+    discovery.register(&mut metrics);
     let metrics = Arc::new(metrics);
     // Readiness does not wait for the CA: until it holds an intermediate, TLS is passed through.
     let ca = start_ca(&tls, ca_metrics)?;
@@ -101,6 +110,7 @@ async fn run(
             Arc::new(listener::kernel_original_dst),
         )
         .with_proxy_metrics(proxy_metrics)
+        .with_discovery(discovery.tap())
         .with_tls(interception),
     );
     // The listeners stop accepting and the relays wind down on the signal.
@@ -129,7 +139,9 @@ async fn run(
     let (served, ()) = tokio::join!(
         admin::serve_until(
             listener,
-            admin::router(metrics, Readiness::always()).merge(probes::router(Arc::new(probes))),
+            admin::router(metrics, Readiness::always())
+                .merge(probes::router(Arc::new(probes)))
+                .merge(discovery.router()),
             grace,
             shutdown.clone().wait(),
         ),

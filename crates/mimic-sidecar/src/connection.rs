@@ -206,11 +206,17 @@ impl Conn<'_> {
                 proxy.connection(direction, "http1", &self.authority(false));
                 // At the end of the grace the relay closes both sockets, and the exchanges
                 // still open write their `shutdown` line.
-                let mut tracker = Http1Tracker::new(self.ctx());
-                let relayed = http1::relay(
+                // Only the exchanges the deployment serves are discovered (spec §6).
+                let tap = self
+                    .shared
+                    .discovery()
+                    .filter(|_| direction == Direction::Inbound && !self.tls);
+                let mut tracker = Http1Tracker::new(self.ctx()).with_tap(tap.cloned());
+                let relayed = http1::relay_with(
                     &mut client,
                     &mut upstream,
                     buf,
+                    tap.is_some(),
                     |event| tracker.event(event),
                     self.shared.stopped(),
                     abort.as_mut(),

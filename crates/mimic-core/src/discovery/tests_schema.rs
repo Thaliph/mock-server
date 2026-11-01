@@ -1028,3 +1028,96 @@ mod cap {
         }
     }
 }
+
+mod names {
+    use super::*;
+
+    /// 127 ASCII bytes then a two-byte character: 129 bytes, the cut falls inside it.
+    fn straddling() -> String {
+        format!("{}é", "a".repeat(127))
+    }
+
+    #[test]
+    fn dsc_11_long_names_are_cut_on_a_character_boundary() {
+        let cut = "a".repeat(127);
+        let ascii = "b".repeat(300);
+        let ascii_cut = "b".repeat(128);
+
+        let q = Params::from_query(&redactor(), &format!("{}=1&{ascii}=2", straddling())).to_json();
+        let keys: Vec<&String> = q["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, [&cut, &ascii_cut]);
+
+        let h = Params::from_headers(&redactor(), &[(ascii.as_str(), "x")]).to_json();
+        assert!(h["properties"].get(&ascii_cut).is_some());
+
+        let s = schema(json!({ straddling(): 1, ascii.clone(): {straddling(): 2} }));
+        assert!(s["properties"].get(&cut).is_some());
+        assert!(
+            s["properties"][&ascii_cut]["properties"]
+                .get(&cut)
+                .is_some()
+        );
+        assert_eq!(s["required"], json!([cut, ascii_cut]));
+    }
+
+    #[test]
+    fn dsc_11_names_that_collide_after_the_cut_merge() {
+        let a = format!("{}1", "k".repeat(128));
+        let b = format!("{}2", "k".repeat(128));
+        let s = schema(json!({ a: 1, b: "x" }));
+        let props = s["properties"].as_object().unwrap();
+        assert_eq!(props.len(), 1);
+        assert_eq!(
+            props["k".repeat(128).as_str()]["type"],
+            json!(["integer", "string"])
+        );
+    }
+
+    #[test]
+    fn dsc_11_redaction_is_decided_on_the_full_name() {
+        // The sensitive word starts at byte 126: it is not in the first 128 bytes.
+        let name = format!("{}token", "a".repeat(126));
+        let cut = &name[..128];
+        let mut body = json!({ name.clone(): "plain-value" });
+        Redactor::default().json(&mut body);
+        assert_eq!(body[&name], json!("<redacted>"));
+
+        let q = format!("{name}=plain-value");
+        let hdr = [(name.as_str(), "plain-value")];
+        let body = serde_json::to_vec(&json!({ name.clone(): "plain-value" })).unwrap();
+        let ct = [("content-type", "application/json")];
+        let o = Observation {
+            query: &q,
+            req_headers: &hdr,
+            req_body: None,
+            resp_headers: &ct,
+            resp_body: Some(&body),
+        };
+        let f = observed(&o).to_json()["fields"].clone();
+        for field in [
+            format!("query/{cut}"),
+            format!("request.header/{cut}"),
+            format!("response.body/application/json/{cut}"),
+        ] {
+            assert_eq!(f[&field]["redacted"], json!(true), "{field}");
+        }
+        assert!(f.as_object().unwrap().keys().all(|k| !k.contains(&name)));
+    }
+
+    #[test]
+    fn dsc_11_state_stays_under_the_bound_with_longest_names() {
+        let name = "é".repeat(5000);
+        let body = serde_json::to_vec(&json!({ name.clone(): { name.clone(): 1 } })).unwrap();
+        let q = format!("{name}=1");
+        let hdr = [(name.as_str(), "x"), ("content-type", "application/json")];
+        let o = Observation {
+            query: &q,
+            req_headers: &hdr,
+            req_body: Some(&body),
+            resp_headers: &hdr,
+            resp_body: Some(&body),
+        };
+        let json = observed(&o).to_json().to_string();
+        assert!(!json.contains(&"é".repeat(65)), "a name was not cut");
+    }
+}

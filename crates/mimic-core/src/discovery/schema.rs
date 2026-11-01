@@ -198,6 +198,22 @@ impl Object {
     }
 }
 
+/// Longest name (query key, header name, JSON field name) kept, in bytes.
+pub(super) const MAX_NAME: usize = 128;
+
+/// A name as it is recorded: its first `MAX_NAME` bytes, cut on a character boundary. Redaction
+/// is decided on the full name, before this.
+pub(super) fn cut_name(name: &str) -> &str {
+    if name.len() <= MAX_NAME {
+        return name;
+    }
+    let mut end = MAX_NAME;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
 fn merge_all(schemas: impl Iterator<Item = Schema>) -> Schema {
     schemas.fold(Schema::default(), Schema::merge_node)
 }
@@ -333,12 +349,15 @@ impl Schema {
                         ..Object::default()
                     }
                 } else {
+                    let mut props: BTreeMap<String, Schema> = BTreeMap::new();
+                    for (k, v) in map {
+                        let child = Self::infer_at(v, level + 1);
+                        let slot = props.entry(cut_name(k).to_string()).or_default();
+                        *slot = std::mem::take(slot).merge_node(child);
+                    }
                     Object {
-                        props: map
-                            .iter()
-                            .map(|(k, v)| (k.clone(), Self::infer_at(v, level + 1)))
-                            .collect(),
-                        required: map.keys().cloned().collect(),
+                        required: props.keys().cloned().collect(),
+                        props,
                         map: None,
                     }
                 });
@@ -476,6 +495,7 @@ pub(super) fn query_pairs(redactor: &Redactor, query: &str) -> Vec<Pair> {
             let (k, v) = p.split_once('=').unwrap_or((p, ""));
             let key = decode(k);
             let value = redactor.field(&key, &decode(v));
+            let key = cut_name(&key).to_string();
             Pair { key, value }
         })
         .collect()
@@ -491,6 +511,7 @@ pub(super) fn header_pairs(redactor: &Redactor, headers: &[(&str, &str)]) -> Vec
                 return None;
             }
             let value = redactor.header(&key, value);
+            let key = cut_name(&key).to_string();
             Some(Pair { key, value })
         })
         .collect()

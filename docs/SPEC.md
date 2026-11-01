@@ -427,7 +427,10 @@ Everything below except the capture tap, content decoding and the recorder threa
   request and response **headers** (lower-case names, value schema, `required`; at most 64, the
   first in byte order; hop-by-hop and framing headers `connection`, `keep-alive`,
   `transfer-encoding`, `te`, `upgrade`, `content-length`, `host` and pseudo-headers are
-  skipped); request and response **bodies** per media type (`content-type` without
+  skipped). A **name** (query key, header name, JSON field name) longer than 128 bytes is
+  recorded as its first 128 bytes, cut on a UTF-8 character boundary, when it is recorded;
+  names that collide after the cut merge. Redaction is decided on the full name, before the cut.
+  Request and response **bodies** per media type (`content-type` without
   parameters): JSON (`application/json`, `*/*+json`) and `application/x-www-form-urlencoded`
   get a schema; any other type is **opaque**: media type and size only. Bodies are decoded
   from `content-encoding` `gzip`, `deflate` and `br` before inference; another encoding makes
@@ -494,9 +497,29 @@ Everything below except the capture tap, content decoding and the recorder threa
   drained by one recorder thread that does the decoding, inference and merge. A full queue
   drops the record (`dropped`). Forwarding never waits for discovery (§4.1: forward, never
   refuse).
+- **HTTP/1 tap (F4 step 6).** Only inbound exchanges of plain HTTP/1 connections are
+  captured. The codec hands the raw head and the first 256 KiB of the body payload (chunk
+  framing removed) of each message to the exchange record; a head that does not fit in the
+  capture budget drops the whole exchange (`dropped`), a body that does not fit is `budget`.
+  A body of more than 256 KiB is `too_large` and contributes nothing (not even its size) to the
+  report. An exchange whose response head came but whose request or response body did not
+  complete is recorded without that body (not counted in `mimic_discovery_bodies_total`);
+  an exchange that got no response head, a `CONNECT` and an `unframed` exchange are not
+  recorded. Every recorded or dropped exchange has exactly one `mimic_discovery_exchanges_total`
+  result; the other results are counted by the recorder, `dropped` by the tap. Bodies and
+  samples are counted for recorded exchanges only. `content-encoding` other than `identity`
+  makes the body `encoding` until the decoders of step 7. `mimic_discovery_samples_total`
+  has `kept` and `budget` in F4 (a sample admitted to the candidates, or refused for the
+  budget); `replaced` and `rejected` need the sample selection to report its choices
+  (later). `mimic_discovery_redactions_total` is counted by the recorder from the same inputs
+  and detectors as the report, for recorded exchanges. The authority of `hosts` is the
+  normalised `Host` or absolute-form authority of §4.1; the endpoint port is the original
+  destination port.
 - **Logs** (`target` = `discovery`): INFO `endpoint discovered` (`direction`, `port`,
-  `method`, `template`) once per new endpoint, INFO `template absorbed` (`from`, `to`) when a
-  node absorbs, WARN `endpoint limit reached` once, WARN `sample budget full` once until
+  `method`, `template`) once per new endpoint (not for the parameter a node absorbs into),
+  INFO `template absorbed` (`direction`, `port`, `method`, `template` = the new template of
+  the exchange, `old` = the replaced `<METHOD> <template>` entries, comma-separated, the first
+  16, and `old_count`) when a node absorbs, WARN `endpoint limit reached` once, WARN `sample budget full` once until
   samples are freed. Templates are redacted; no line holds a header value, query, body or
   sample.
 - **Local access.** `GET /discovery` on the admin port answers the local report
@@ -1067,7 +1090,7 @@ with a fake original destination (as in F2) and read `GET /discovery` from loopb
 | DSC-08 | **U.** Samples: at most 20 per endpoint; with 25 candidates of statuses 200, 201, 400, 500, every status is represented, then every (status, request shape, response shape) class, then the lowest content hashes; identical candidates count once; any arrival order gives the same set. A body over 256 KiB, encoded or decoded, and an opaque body are not kept (size and media type are). When the sample budget is full a new sample is rejected (`budget`) while counters and schemas still change. |
 | DSC-09 | **U.** Merge algebra (`proptest`, ≥ 10 000 cases): `merge` is commutative and associative; recording a sequence of exchanges one by one equals merging the reports of any partition of it (as several replicas would), counters and histograms included; two reports each below the literal limit at one node absorb it when their union exceeds it. Serialisation is byte-identical for equal reports, keys sorted, `"version": 1`, and it round-trips. |
 | DSC-10 | **U.** Latency buckets: 4 per doubling from 1 ms; 0 ms and 1 ms fall in the first bucket, a value on a boundary in the bucket it closes, more than 131 s in the overflow; merge adds bucket counts. |
-| DSC-11 | **U.** Bounds: past `MIMIC_DISCOVERY_MAX_ENDPOINTS` new endpoints are refused (`endpoint_limit`) while known ones still update; a `404` or `405` on a path matching a known template is counted on it, else it is `not_found` and creates nothing; a path over 2048 bytes or 32 segments is `invalid`. For arbitrary exchanges (`proptest`) the recorder never panics and its retained state, sample bytes excluded, stays below a bound computed from the limits and the caps of §6 (512 schema nodes per body, 128 volatile fields, 64 keys per query or header set). 10 000 distinct wide or deep bodies leave a body schema at 512 nodes or fewer; with the cap, schema merge is commutative and associative and any partition of the exchanges merges to the same schema (`proptest`, wide and deep bodies). |
+| DSC-11 | **U.** Bounds: past `MIMIC_DISCOVERY_MAX_ENDPOINTS` new endpoints are refused (`endpoint_limit`) while known ones still update; a `404` or `405` on a path matching a known template is counted on it, else it is `not_found` and creates nothing; a path over 2048 bytes or 32 segments is `invalid`. For arbitrary exchanges (`proptest`) the recorder never panics and its retained state, sample bytes excluded, stays below a bound computed from the limits and the caps of §6 (512 schema nodes per body, 128 volatile fields, 64 keys per query or header set, 128 bytes per name). a name over 128 bytes is recorded as its first 128, cut on a UTF-8 character boundary, and a name that is sensitive only past byte 128 is still redacted. 10 000 distinct wide or deep bodies leave a body schema at 512 nodes or fewer; with the cap, schema merge is commutative and associative and any partition of the exchanges merges to the same schema (`proptest`, wide and deep bodies). |
 | DSC-12 | **I.** Inbound HTTP/1.1 and `h2` exchanges to the test app (`GET /users/{1..5}` with JSON responses, `POST /orders` with a JSON body and a `?dry_run=true` query, a `201` and a `400`) appear in `/discovery` under `direction` `inbound`, the app port and their templates, with status counters, histogram, query and header schemas, body schemas and samples; probe requests, outbound exchanges, `unframed` exchanges and a `404` to an unknown path do not; `hosts` lists the `Host` values used. |
 | DSC-13 | **I.** Bodies with `content-encoding` `gzip`, `deflate` and `br` are decoded and inferred; `zstd` is `encoding`; a 1 KiB gzip body that expands past 256 KiB is `too_large` and the sidecar's RSS does not grow by more than 1 MiB; malformed JSON is `invalid`; each case increments `mimic_discovery_bodies_total` with its `result`. |
 | DSC-14 | **I.** `GET /discovery` on the admin port answers 200 `application/json` with the local report to a client connecting from `127.0.0.1` and from `::1`, and 403 to one connecting from the pod's non-loopback address. |

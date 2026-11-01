@@ -193,10 +193,28 @@ pub async fn relay(
     stop: impl Future<Output = ()> + Send,
     abort_signal: impl Future<Output = ()> + Send,
 ) -> Relayed {
+    relay_with(client, upstream, first, false, on_event, stop, abort_signal).await
+}
+
+/// [`relay`], with a codec that also reports [`Event::Captured`] when `capture` is set (the
+/// discovery tap, spec §6).
+pub async fn relay_with(
+    client: &mut Stream,
+    upstream: &mut Stream,
+    first: Vec<u8>,
+    capture: bool,
+    on_event: impl FnMut(Event) + Send,
+    stop: impl Future<Output = ()> + Send,
+    abort_signal: impl Future<Output = ()> + Send,
+) -> Relayed {
     let (client_socket, upstream_socket) = (client.socket(), upstream.socket());
     let relay = Relay {
         state: Mutex::new(State {
-            codec: Codec::new(),
+            codec: if capture {
+                Codec::with_capture()
+            } else {
+                Codec::new()
+            },
             on_event,
         }),
         unblocked: Notify::new(),
