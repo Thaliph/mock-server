@@ -1072,8 +1072,8 @@ mod names {
 
     #[test]
     fn dsc_11_redaction_is_decided_on_the_full_name() {
-        // The sensitive token starts at byte 127: it is not in the first 128 bytes.
-        let name = format!("{}_token", "a".repeat(126));
+        // The sensitive word starts at byte 126: it is not in the first 128 bytes.
+        let name = format!("{}token", "a".repeat(126));
         let cut = &name[..128];
         let mut body = json!({ name.clone(): "plain-value" });
         Redactor::default().json(&mut body);

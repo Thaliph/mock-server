@@ -474,9 +474,13 @@ Everything below except the capture tap, content decoding and the recorder threa
     `-` and `_` removed), or that name followed by `s`. Built-in names: `authorization`,
     `proxyauthorization`, `cookie`, `setcookie`, `password`, `passwd`, `secret`, `token`,
     `apikey`, `auth`, `session`, `signature`, `credential`, `privatekey`, `cvv`, `cvc`,
-    `cardnumber`, `pan`, `iban`, `ssn`. So `X-Api-Key`, `auth_token`, `Authorization`,
-    `client_secret`, `Session-Id` and `tokens` are redacted, `company`, `author`, `panel` and
-    `passenger` are not. The whole value (a JSON subtree
+    `cardnumber`, `pan`, `iban`, `ssn`. The short names `auth`, `pan`, `iban`, `ssn`, `cvv`
+    and `cvc` match whole tokens only. Every other built-in name is also matched inside a
+    single token, glued or not (`JSESSIONID`, `csrftoken`, `XAPIKEY`, `clientsecret`,
+    `userpassword`), as a prefix, a suffix or in the middle. The names of
+    `MIMIC_DISCOVERY_REDACT_NAMES` match whole tokens only. So `X-Api-Key`, `auth_token`,
+    `Authorization`, `client_secret`, `Session-Id`, `tokens` and `JSESSIONID` are redacted,
+    `company`, `author`, `panel` and `passenger` are not. The whole value (a JSON subtree
     included) becomes the marker, except: `authorization` keeps its scheme
     (`Bearer <redacted>`); `cookie` keeps cookie names (`a=<redacted>; b=<redacted>`);
     `set-cookie` keeps the name and attributes.

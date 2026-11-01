@@ -44,6 +44,21 @@ fn dsc_05_names_match_on_token_boundaries() {
         assert!(r.name_matches(n), "{n} should be redacted");
     }
     for n in [
+        "JSESSIONID",
+        "sessionid",
+        "csrftoken",
+        "accesstoken",
+        "authtoken",
+        "XAPIKEY",
+        "xapikey",
+        "clientsecret",
+        "SECRETKEY",
+        "userpassword",
+        "dbpassword",
+    ] {
+        assert!(r.name_matches(n), "{n} should be redacted");
+    }
+    for n in [
         "company",
         "author",
         "panel",
