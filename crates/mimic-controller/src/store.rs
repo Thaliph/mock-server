@@ -187,6 +187,31 @@ pub enum StoreError {
     Unavailable,
 }
 
+/// Why a read failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError {
+    /// A name that is not DNS-1123: `400`.
+    Name,
+    /// A deployment without data: `404`.
+    NotFound,
+    /// Valkey unavailable: `503`.
+    Unavailable,
+    /// A stored value that does not parse: `500`.
+    Unreadable,
+}
+
+/// What `:meta` says of a deployment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    pub namespace: String,
+    pub deployment: String,
+    pub endpoints: u64,
+    pub exchanges: u64,
+    pub sample_bytes: u64,
+    /// Unix milliseconds.
+    pub last_push_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
     /// `MIMIC_STORE_TTL`.
@@ -418,6 +443,25 @@ impl Store {
         }
         tracing::warn!(namespace, deployment, "store write kept conflicting");
         Err(StoreError::Unavailable)
+    }
+
+    /// The deployments with data, sorted by namespace then deployment.
+    pub async fn list(&self) -> Result<Vec<Summary>, ReadError> {
+        Err(ReadError::Unavailable)
+    }
+
+    /// One deployment and its pods with their last push (Unix milliseconds).
+    pub async fn workload(
+        &self,
+        _namespace: &str,
+        _deployment: &str,
+    ) -> Result<(Summary, BTreeMap<String, u64>), ReadError> {
+        Err(ReadError::Unavailable)
+    }
+
+    /// The stored `:report` bytes.
+    pub async fn report(&self, _namespace: &str, _deployment: &str) -> Result<Vec<u8>, ReadError> {
+        Err(ReadError::Unavailable)
     }
 
     async fn connection(&self) -> Result<MultiplexedConnection, StoreError> {

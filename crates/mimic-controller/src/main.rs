@@ -8,6 +8,7 @@ mod sidecar_api;
 mod store;
 mod tls;
 mod tls_ca;
+mod ui;
 mod valkey;
 mod webhook;
 mod webhook_config;
