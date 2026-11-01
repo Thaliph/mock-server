@@ -1291,11 +1291,11 @@ secret="dsc22-password-$(openssl rand -hex 12)"
 canaries=("$token" "$tenant" "$secret")
 # kube-proxy programs a Ready endpoint a little after the rollout reports it: warm up through the Service
 # until each pod has logged a request of its own, so that the calls below reach both pods. The
-# readiness probes log /users/0 (from the pod itself), so the warm-up path is /users/warm.
+# readiness probes log /users/0 (from the pod itself), so the warm-up path is /users/9999 (numeric, so that it joins the {users_id} template).
 warm_seen() {
   local seen=0 p
   for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}'); do
-    if (( $(kubectl -n disc-22 logs "$p" -c app | grep -c '"path": "/users/warm"' || true) > 0 )); then seen=$((seen + 1)); fi
+    if (( $(kubectl -n disc-22 logs "$p" -c app | grep -c '"path": "/users/9999"' || true) > 0 )); then seen=$((seen + 1)); fi
   done
   echo "$seen"
 }
@@ -1303,7 +1303,7 @@ warm_seen() {
 warm_ok=0
 for _ in $(seq 60); do
   if kubectl -n disc-22-client exec client -- python3 -c \
-    'import urllib.request; urllib.request.urlopen("http://front.disc-22-client.svc:8080/front/users/warm", timeout=5).read()' \
+    'import urllib.request; urllib.request.urlopen("http://front.disc-22-client.svc:8080/front/users/9999", timeout=5).read()' \
     >/dev/null 2>&1; then warm_ok=$((warm_ok + 1)); fi
   [[ $(warm_seen) == 2 ]] && break
   sleep 1
