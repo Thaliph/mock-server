@@ -394,7 +394,9 @@ fn dsc_19_valid_discovery_values_are_accepted() {
 async fn dsc_16_discovery_never_slows_or_alters_traffic() {
     mimic_sidecar::listener::raise_fd_limit();
     let reply = response("200 OK", &format!("{{\"data\":\"{}\"}}", "y".repeat(500)));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // The sidecar's own bind (backlog 1024): the 512 of a plain tokio bind overflows under a
+    // 2000-connection burst and the kernel resets the connections it cannot queue.
+    let listener = mimic_sidecar::listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let app = listener.local_addr().unwrap();
     let canned = reply.clone();
     tokio::spawn(async move {
@@ -430,15 +432,11 @@ async fn dsc_16_discovery_never_slows_or_alters_traffic() {
         r.extend(vec![b'z'; 200 * 1024]);
         Arc::new(r)
     };
-    // 2000 requests, 100 connections at a time: with 500 at once the plain proxy already
-    // resets connections on this test host, whatever discovery does.
-    let permits = Arc::new(tokio::sync::Semaphore::new(100));
+    // 2000 requests, all concurrent (spec DSC-16).
     let mut tasks = Vec::new();
     for _ in 0..2000 {
         let (addr, request, reply) = (f.addr, request.clone(), reply.clone());
-        let permit = permits.clone().acquire_owned().await.unwrap();
         tasks.push(tokio::spawn(async move {
-            let _permit = permit;
             let mut c = TcpStream::connect(addr).await.unwrap();
             c.write_all(&request).await.unwrap();
             let mut got = vec![0u8; reply.len()];
