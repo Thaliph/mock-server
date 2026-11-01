@@ -55,6 +55,9 @@ pub struct Sample {
     response_shape: u64,
     /// Serialised size, which the sample budget counts.
     bytes: usize,
+    /// The UTC day of the last push that held the sample (spec §7.3, stamping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen: Option<u64>,
 }
 
 fn pairs(pairs: Vec<Pair>) -> Vec<(String, String)> {
@@ -113,6 +116,7 @@ impl Sample {
             request_shape,
             response_shape,
             bytes: 0,
+            last_seen: None,
         };
         sample.bytes = serde_json::to_vec(&sample).map_or(0, |v| v.len());
         sample.head_ms = exchange.head_ms;
@@ -152,6 +156,10 @@ impl Sample {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub fn last_seen(&self) -> Option<u64> {
+        self.last_seen
     }
 
     fn class(&self) -> (u16, u64, u64) {

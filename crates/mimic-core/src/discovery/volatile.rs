@@ -167,6 +167,11 @@ impl Volatility {
         self.fields.get(field).is_some_and(Field::volatile)
     }
 
+    /// Hashes held for a field; `None` when it is not tracked.
+    pub fn sketch_len(&self, field: &str) -> Option<usize> {
+        self.fields.get(field).map(|f| f.sketch.len())
+    }
+
     pub fn is_redacted(&self, field: &str) -> bool {
         self.fields.get(field).is_some_and(|f| f.redacted)
     }

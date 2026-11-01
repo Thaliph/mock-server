@@ -379,6 +379,10 @@ impl Observed {
         self.fields.check()
     }
 
+    pub fn volatility(&self) -> &Volatility {
+        &self.fields
+    }
+
     pub fn merge(self, other: Self) -> Self {
         Self {
             query: self.query.merge(other.query),

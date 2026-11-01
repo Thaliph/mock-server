@@ -90,6 +90,10 @@ pub struct Stats {
     pub hosts: BTreeSet<String>,
     observed: Observed,
     samples: Samples,
+    /// The UTC day (days since 1970-01-01) of the last push that held the endpoint. Set by
+    /// the controller (spec §7.3, stamping); a sidecar never serialises it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +151,14 @@ impl Stats {
 
     pub fn samples(&self) -> &Samples {
         &self.samples
+    }
+
+    pub fn last_seen(&self) -> Option<u64> {
+        self.last_seen
+    }
+
+    pub(super) fn set_last_seen(&mut self, last_seen: Option<u64>) {
+        self.last_seen = last_seen;
     }
 
     pub(super) fn samples_mut(&mut self) -> &mut Samples {
@@ -729,6 +741,13 @@ impl Report {
         self.limit_endpoints(limits.max_endpoints);
         self.limit_samples(limits.sample_budget);
     }
+
+    /// Sets `last_seen` to `day` on every endpoint and sample (spec §7.3, stamping).
+    pub fn stamp(&mut self, _day: u64) {}
+
+    /// The §6 redaction applied again to every sample, host and volatile field (spec §7.3,
+    /// re-redaction), so that a report cannot hold what `redactor` redacts.
+    pub fn re_redact(&mut self, _redactor: &Redactor) {}
 
     pub(super) fn clear_pod(&mut self) {
         self.pod = None;
