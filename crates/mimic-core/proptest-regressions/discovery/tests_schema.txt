@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5eead6da6532ae63f42f4e771eb4cb729f49dab2ba5125ed6bcba9761a6e4526 # shrinks to v = Null
+cc 68ab1c6a987e6a9fb5cbfe1f8d364e40b122e481fe610e9225b82d17774cfc83 # shrinks to seq = [Owned { query: "", req_headers: [], req_media: 0, req_body: None, resp_headers: [], resp_body: None }], cuts = [false, false, false, false, false, false, false, false]
+cc 3c9c902071c0094fb0c8652c2a6f0ae0cfccc51ccf847028d99dd8dc6d14518f # shrinks to a = Null, b = Null, c = Null
+cc 7c20f8465dc198cbf23cb3b3b623ac36be8909ee07aa7c0ab1a616f06a45316b # shrinks to a = Owned { query: "", req_headers: [], req_media: 0, req_body: None, resp_headers: [], resp_body: None }, b = Owned { query: "", req_headers: [], req_media: 0, req_body: None, resp_headers: [], resp_body: None }
+cc b788259eecfdb8ef096e77ac727580601086540362b916823e254253d2d8500b # shrinks to a = [], b = []
+cc dc11070daa646cf86a3acbea4ba8af79ccf08bc552d0d9548392332e3f50058b # shrinks to a = Owned { query: "", req_headers: [], req_media: 0, req_body: None, resp_headers: [], resp_body: None }, b = Owned { query: "", req_headers: [], req_media: 0, req_body: None, resp_headers: [], resp_body: None }, c = Owned { query: "", req_headers: [], req_media: 0, req_body: None, resp_headers: [], resp_body: None }
