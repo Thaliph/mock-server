@@ -403,7 +403,10 @@ mod redaction {
     fn dsc_05_url_valued_headers_query() {
         let r = r();
         assert_eq!(
-            r.header("Location", "https://h/cb?code=SplxlOBeZQQ&access_token=abc123&state=ok"),
+            r.header(
+                "Location",
+                "https://h/cb?code=SplxlOBeZQQ&access_token=abc123&state=ok"
+            ),
             "https://h/cb?code=SplxlOBeZQQ&access_token=<redacted>&state=ok"
         );
         assert_eq!(
@@ -415,7 +418,10 @@ mod redaction {
             "https://h/reset?token=<redacted>"
         );
         assert_eq!(
-            r.header("Link", "<https://api/x?api_key=zzz>; rel=next, </p?page=2>; rel=prev"),
+            r.header(
+                "Link",
+                "<https://api/x?api_key=zzz>; rel=next, </p?page=2>; rel=prev"
+            ),
             "<https://api/x?api_key=<redacted>>; rel=next, </p?page=2>; rel=prev"
         );
         assert_eq!(
@@ -426,14 +432,20 @@ mod redaction {
             r.header("Refresh", "0; url=https://h/x?auth=1"),
             "0; url=https://h/x?auth=<redacted>"
         );
-        assert_eq!(r.header("Content-Type", "application/json; charset=utf-8"), "application/json; charset=utf-8");
+        assert_eq!(
+            r.header("Content-Type", "application/json; charset=utf-8"),
+            "application/json; charset=utf-8"
+        );
     }
 
     #[test]
     fn dsc_06_url_valued_headers_path_and_value() {
         let r = r();
         assert_eq!(
-            r.header("Location", &format!("https://h/reset/{JWT}/done?next=/home")),
+            r.header(
+                "Location",
+                &format!("https://h/reset/{JWT}/done?next=/home")
+            ),
             "https://h/reset/<redacted>/done?next=/home"
         );
         assert_eq!(
@@ -441,7 +453,10 @@ mod redaction {
             "https://h/x?v=<redacted>"
         );
         assert_eq!(r.header("Location", "https://u:p@h/x"), MARKER);
-        assert_eq!(r.header("Location", "https://h/plain/path"), "https://h/plain/path");
+        assert_eq!(
+            r.header("Location", "https://h/plain/path"),
+            "https://h/plain/path"
+        );
     }
 
     #[test]
