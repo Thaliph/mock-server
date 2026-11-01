@@ -63,7 +63,7 @@ pub async fn fixture_discovery(
     discovery: &mimic_sidecar::discovery::Discovery,
     dst: impl Fn(SocketAddr) -> Option<SocketAddr> + Send + Sync + 'static,
 ) -> Fixture {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = mimic_sidecar::listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
