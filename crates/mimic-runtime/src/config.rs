@@ -91,12 +91,14 @@ fn parse_duration(value: &str) -> Option<Duration> {
     let (digits, unit_ms) = if let Some(ms) = value.strip_suffix("ms") {
         (ms, 1)
     } else {
-        let (digits, unit) = value.split_at(value.len().checked_sub(1)?);
+        // The unit is the last character, which may not be ASCII: never split inside it.
+        let unit = value.chars().next_back()?;
+        let digits = &value[..value.len() - unit.len_utf8()];
         let unit_secs: u64 = match unit {
-            "s" => 1,
-            "m" => 60,
-            "h" => 3_600,
-            "d" => 86_400,
+            's' => 1,
+            'm' => 60,
+            'h' => 3_600,
+            'd' => 86_400,
             _ => return None,
         };
         (digits, unit_secs * 1000)

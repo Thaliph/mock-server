@@ -35,9 +35,9 @@ const LIMITS: Limits = Limits {
     max_endpoints: 16,
     sample_budget: 256 * 1024,
 };
-/// Appears in every exchange under a listed name: it must never reach the report.
 /// Endpoints per direction accepted from a push.
 const PUSH: usize = 16;
+/// Appears in every exchange under a listed name: it must never reach the report.
 const CANARY: &str = "FUZZCANARYVALUE";
 
 /// Everything the controller does with a pushed body, against a fixed valid report.
