@@ -400,6 +400,51 @@ mod redaction {
     }
 
     #[test]
+    fn dsc_05_url_valued_headers_query() {
+        let r = r();
+        assert_eq!(
+            r.header("Location", "https://h/cb?code=SplxlOBeZQQ&access_token=abc123&state=ok"),
+            "https://h/cb?code=SplxlOBeZQQ&access_token=<redacted>&state=ok"
+        );
+        assert_eq!(
+            r.header("Location", "https://h/cb?token=a&page=2#access_token=T&x=1"),
+            "https://h/cb?token=<redacted>&page=2#access_token=<redacted>&x=1"
+        );
+        assert_eq!(
+            r.header("Referer", "https://h/reset?token=abcdef123456"),
+            "https://h/reset?token=<redacted>"
+        );
+        assert_eq!(
+            r.header("Link", "<https://api/x?api_key=zzz>; rel=next, </p?page=2>; rel=prev"),
+            "<https://api/x?api_key=<redacted>>; rel=next, </p?page=2>; rel=prev"
+        );
+        assert_eq!(
+            r.header("Content-Location", "/a/b?secret=1"),
+            "/a/b?secret=<redacted>"
+        );
+        assert_eq!(
+            r.header("Refresh", "0; url=https://h/x?auth=1"),
+            "0; url=https://h/x?auth=<redacted>"
+        );
+        assert_eq!(r.header("Content-Type", "application/json; charset=utf-8"), "application/json; charset=utf-8");
+    }
+
+    #[test]
+    fn dsc_06_url_valued_headers_path_and_value() {
+        let r = r();
+        assert_eq!(
+            r.header("Location", &format!("https://h/reset/{JWT}/done?next=/home")),
+            "https://h/reset/<redacted>/done?next=/home"
+        );
+        assert_eq!(
+            r.header("Referer", &format!("https://h/x?v={JWT}")),
+            "https://h/x?v=<redacted>"
+        );
+        assert_eq!(r.header("Location", "https://u:p@h/x"), MARKER);
+        assert_eq!(r.header("Location", "https://h/plain/path"), "https://h/plain/path");
+    }
+
+    #[test]
     fn dsc_05_headers_queries_forms() {
         let r = r();
         assert_eq!(r.header("X-Api-Key", "abc"), MARKER);
