@@ -408,7 +408,8 @@ Everything below except the capture tap, content decoding and the recorder threa
   preceding segment only, and only when that segment is a non-empty literal. There is one
   template tree per (direction, port), built from paths only; methods are keys below a template
   and do not shape the tree. gRPC paths
-  (`content-type: application/grpc*`) are never templated. The result depends only on the set
+  (`content-type: application/grpc*`) are never templated, but they are redacted like any
+  path (a client chooses its `content-type`). The result depends only on the set
   of paths seen, not on their order.
 - **Schemas** (JSON Schema 2020-12 subset, the dialect of OpenAPI 3.1): `type` (set, with
   `null`; `integer` when every number seen is integral), `format` when every string value has
@@ -1051,7 +1052,7 @@ with a fake original destination (as in F2) and read `GET /discovery` from loopb
 
 | ID | Criterion |
 |---|---|
-| DSC-01 | **U.** Segment classification: `42`, a UUID in upper and lower case, a ULID, `5f2b9c1d` (hex with a digit), `2026-11-01`, `2026-11-01T10:00:00Z`, `a1b2c3d4e5f6g7h8i9` (16+ with letter and digit), `alice@example.com` and a JWT are parameters; `v1`, `api`, `users`, `deadbeef` (no digit), `health`, an empty last segment and `%41` (not decoded) are literals. Parameter names follow §6 (`/users/42/orders/7` → `/users/{users_id}/orders/{orders_id}`, `/42` → `/{param1}`, a repeated literal gets `{param<n>}`), and a gRPC path is never templated. |
+| DSC-01 | **U.** Segment classification: `42`, a UUID in upper and lower case, a ULID, `5f2b9c1d` (hex with a digit), `2026-11-01`, `2026-11-01T10:00:00Z`, `a1b2c3d4e5f6g7h8i9` (16+ with letter and digit), `alice@example.com` and a JWT are parameters; `v1`, `api`, `users`, `deadbeef` (no digit), `health`, an empty last segment and `%41` (not decoded) are literals. Parameter names follow §6 (`/users/42/orders/7` → `/users/{users_id}/orders/{orders_id}`, `/42` → `/{param1}`, a repeated literal gets `{param<n>}`), and a gRPC path is never templated (it is still redacted: DSC-06). |
 | DSC-02 | **U.** Absorbing nodes: with `MIMIC_DISCOVERY_MAX_LITERALS` = 3, `/u/a`, `/u/b`, `/u/c` stay three endpoints, a fourth literal turns them into one `/u/{u_id}` whose counters, schemas and samples are the merge of the four, later literals map to it, and a `/u/42` parameter and the literals share it; siblings of `/u` are untouched. For any set of paths (`proptest`, ≥ 10 000 cases), every permutation of the arrival order gives the same templates. |
 | DSC-03 | **U.** Schema inference and merge follow §6: `type` sets with `null`; `integer` only while every number is integral; each `format` only when every value has it; `required` = present in every object; array `items` over the first 256 items; an object with 129 keys becomes a map; level 17 is `{}`. Query: keys percent-decoded, a repeated key is an `array`, a key missing once is not `required`, at most 64 keys (first in byte order). Headers: names in lower case, the skipped names of §6 absent, at most 64. `application/x-www-form-urlencoded` bodies get the same schema as the equivalent query; `text/plain`, `application/grpc` and `application/octet-stream` are opaque (media type and size). |
 | DSC-04 | **U.** Volatility: a field with values `a`, `b`, `c` is volatile; `a`, `b` (n = 2) is not; 10 observations of 2 values are not; 1000 distinct values are, and 1000 observations of 100 values are not (fixed data, deterministic hash). The sketch holds at most 32 hashes; merging two sketches equals the sketch of the union. At most 128 fields are tracked (first in byte order). A redacted field is marked `redacted`. |
