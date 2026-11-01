@@ -1,4 +1,4 @@
-# MimicWorkload (spec §7, §7.1): spec.deployment, spec.mode and (F3) spec.tls.exclude.
+# MimicWorkload (spec §7, §7.1): spec.deployment, spec.mode, (F3) spec.tls.exclude and (F4) spec.discovery.redact.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -58,3 +58,18 @@ spec:
                         maxLength: 253
                         # A DNS name (labels of letters, digits, `-`, `_`), optionally `*.` first, or an IPv6 literal.
                         pattern: '^((\*\.)?[A-Za-z0-9_]([-A-Za-z0-9_]{0,61}[A-Za-z0-9_])?(\.[A-Za-z0-9_]([-A-Za-z0-9_]{0,61}[A-Za-z0-9_])?)*\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]+)$'
+                discovery:
+                  description: Endpoint discovery settings of the Deployment's pods (spec §6). Applied to pods created afterwards.
+                  type: object
+                  properties:
+                    redact:
+                      description: >-
+                        Extra names redacted by name in discovered headers, query keys, form fields and JSON keys,
+                        on top of the built-in ones. Compared like the built-in names (case and `-`/`_` ignored).
+                      type: array
+                      maxItems: 64
+                      items:
+                        type: string
+                        minLength: 1
+                        maxLength: 64
+                        pattern: '^[a-z0-9_-]+$'

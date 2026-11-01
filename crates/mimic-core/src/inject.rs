@@ -248,6 +248,8 @@ pub struct TlsWiring {
     pub root_pem: String,
     /// `spec.tls.exclude` of the deployment, sorted and deduplicated.
     pub exclude: Vec<String>,
+    /// `spec.discovery.redact` of the deployment, sorted and deduplicated (spec §6, §7).
+    pub redact: Vec<String>,
     /// The webhook CA, PEM, which the sidecar verifies the sidecar API against.
     pub controller_ca: String,
 }
@@ -298,6 +300,9 @@ pub fn patch(
     if !tls.exclude.is_empty() {
         sidecar_env
             .push(json!({"name": "MIMIC_TLS_EXCLUDE", "value": literal(&tls.exclude.join(","))}));
+    }
+    if !tls.redact.is_empty() {
+        sidecar_env.push(json!({"name": "MIMIC_DISCOVERY_REDACT_NAMES", "value": literal(&tls.redact.join(","))}));
     }
     let sidecar = json!({
         "name": SIDECAR_NAME,

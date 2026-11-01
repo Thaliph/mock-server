@@ -9,13 +9,17 @@ use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
 
-/// `(namespace, name, spec.deployment, spec.tls.exclude)` of a `MimicWorkload`.
-pub type Entry = (String, String, String, Vec<String>);
+/// `(namespace, name, spec.deployment, spec.tls.exclude, spec.discovery.redact)` of a
+/// `MimicWorkload`.
+pub type Entry = (String, String, String, Vec<String>, Vec<String>);
+
+/// `spec.deployment`, `spec.tls.exclude` and `spec.discovery.redact` of a `MimicWorkload`.
+type Settings = (String, Vec<String>, Vec<String>);
 
 #[derive(Default)]
 struct State {
-    /// `(namespace, MimicWorkload name)` to `spec.deployment` and `spec.tls.exclude`.
-    items: BTreeMap<(String, String), (String, Vec<String>)>,
+    /// `(namespace, MimicWorkload name)` to its settings.
+    items: BTreeMap<(String, String), Settings>,
     synced: bool,
 }
 
@@ -30,10 +34,17 @@ impl WorkloadCache {
     }
 
     /// Adds or updates a `MimicWorkload`.
-    pub fn apply(&self, namespace: &str, name: &str, deployment: &str, exclude: Vec<String>) {
+    pub fn apply(
+        &self,
+        namespace: &str,
+        name: &str,
+        deployment: &str,
+        exclude: Vec<String>,
+        redact: Vec<String>,
+    ) {
         self.write().items.insert(
             (namespace.into(), name.into()),
-            (deployment.into(), exclude),
+            (deployment.into(), exclude, redact),
         );
     }
 
@@ -46,7 +57,7 @@ impl WorkloadCache {
         let mut state = self.write();
         state.items = items
             .into_iter()
-            .map(|(ns, n, d, e)| ((ns, n), (d, e)))
+            .map(|(ns, n, d, e, r)| ((ns, n), (d, e, r)))
             .collect();
         state.synced = true;
     }
@@ -60,18 +71,33 @@ impl WorkloadCache {
         self.read()
             .items
             .iter()
-            .any(|((ns, _), (d, _))| ns == namespace && d == deployment)
+            .any(|((ns, _), (d, _, _))| ns == namespace && d == deployment)
     }
 
     /// `spec.tls.exclude` of every `MimicWorkload` of `namespace` naming `deployment`: the
     /// sorted, deduplicated union (spec §5).
     pub fn exclude(&self, namespace: &str, deployment: &str) -> Vec<String> {
+        self.union(namespace, deployment, |(_, exclude, _)| exclude)
+    }
+
+    /// `spec.discovery.redact` of every `MimicWorkload` of `namespace` naming `deployment`: the
+    /// sorted, deduplicated union (spec §7).
+    pub fn redact(&self, namespace: &str, deployment: &str) -> Vec<String> {
+        self.union(namespace, deployment, |(_, _, redact)| redact)
+    }
+
+    fn union(
+        &self,
+        namespace: &str,
+        deployment: &str,
+        field: fn(&Settings) -> &Vec<String>,
+    ) -> Vec<String> {
         let state = self.read();
         let union: BTreeSet<&String> = state
             .items
             .iter()
-            .filter(|((ns, _), (d, _))| ns == namespace && d == deployment)
-            .flat_map(|(_, (_, exclude))| exclude)
+            .filter(|((ns, _), (d, _, _))| ns == namespace && d == deployment)
+            .flat_map(|(_, settings)| field(settings))
             .collect();
         union.into_iter().cloned().collect()
     }
@@ -95,18 +121,33 @@ impl WorkloadCache {
 
     #[cfg(test)]
     pub fn synced_with_exclude(items: &[(&str, &str, &str, &[&str])]) -> WorkloadCache {
+        let items: Vec<_> = items
+            .iter()
+            .map(|(a, b, c, e)| (*a, *b, *c, *e, &[][..]))
+            .collect();
+        WorkloadCache::synced_with_settings(&items)
+    }
+
+    #[cfg(test)]
+    pub fn synced_with_settings(items: &[TestWorkload]) -> WorkloadCache {
+        let owned = |list: &[&str]| list.iter().map(|x| x.to_string()).collect();
         let cache = WorkloadCache::new();
-        cache.replace(items.iter().map(|(a, b, c, e)| {
+        cache.replace(items.iter().map(|(a, b, c, e, r)| {
             (
                 a.to_string(),
                 b.to_string(),
                 c.to_string(),
-                e.iter().map(|x| x.to_string()).collect(),
+                owned(e),
+                owned(r),
             )
         }));
         cache
     }
 }
+
+/// `(namespace, name, deployment, exclude, redact)` of a test workload.
+#[cfg(test)]
+pub type TestWorkload<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a [&'a str]);
 
 /// The client of the cluster, waited for as long as it takes (outside a cluster it never comes).
 pub async fn client() -> kube::Client {
@@ -142,8 +183,8 @@ pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
                 tracing::info!("MimicWorkload cache synced");
             }
             Ok(Event::Apply(object)) => match entry(&object) {
-                Some((ns, name, deployment, exclude)) => {
-                    cache.apply(&ns, &name, &deployment, exclude)
+                Some((ns, name, deployment, exclude, redact)) => {
+                    cache.apply(&ns, &name, &deployment, exclude, redact)
                 }
                 None => remove(&cache, &object),
             },
@@ -162,19 +203,21 @@ fn remove(cache: &WorkloadCache, object: &DynamicObject) {
 fn entry(object: &DynamicObject) -> Option<Entry> {
     let spec = object.data.get("spec")?;
     let deployment = spec.get("deployment")?.as_str()?;
-    let exclude = spec
-        .get("tls")
-        .and_then(|tls| tls.get("exclude"))
-        .and_then(|exclude| exclude.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.as_str().map(str::to_string))
-        .collect();
+    let strings = |section: &str, field: &str| -> Vec<String> {
+        spec.get(section)
+            .and_then(|section| section.get(field))
+            .and_then(|list| list.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.as_str().map(str::to_string))
+            .collect()
+    };
     Some((
         object.metadata.namespace.clone()?,
         object.metadata.name.clone()?,
         deployment.to_string(),
-        exclude,
+        strings("tls", "exclude"),
+        strings("discovery", "redact"),
     ))
 }
 

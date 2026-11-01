@@ -268,6 +268,7 @@ impl Admission {
         Ok(TlsWiring {
             root_pem: root.to_string(),
             exclude: self.cache.exclude(namespace, deployment),
+            redact: self.cache.redact(namespace, deployment),
             controller_ca: controller_ca.to_string(),
         })
     }
