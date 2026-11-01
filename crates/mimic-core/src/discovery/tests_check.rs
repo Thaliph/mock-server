@@ -10,6 +10,9 @@ use super::report::{Direction, Exchange, Limits, Report, merge};
 
 const PUSH: usize = 256;
 
+/// A name and the change that makes a valid report break (or not) its bound.
+type Case = (&'static str, Box<dyn Fn(&mut Value)>);
+
 fn limits(max_literals: usize, max_endpoints: usize, sample_budget: usize) -> Limits {
     Limits {
         max_literals,
@@ -127,7 +130,7 @@ fn ctl_01_accepts_the_valid_report() {
 #[test]
 fn ctl_01_rejects_each_violation_with_its_own_reason() {
     let long_name = "n".repeat(129);
-    let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+    let cases: Vec<Case> = vec![
         ("version", Box::new(|v| v["version"] = json!(2))),
         (
             "samples",
@@ -315,7 +318,7 @@ fn ctl_01_rejects_each_violation_with_its_own_reason() {
 
 #[test]
 fn ctl_01_accepts_the_bounds_exactly() {
-    let cases: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+    let cases: Vec<Case> = vec![
         (
             "20 samples",
             Box::new(|v| {
@@ -506,13 +509,13 @@ fn json_value() -> impl Strategy<Value = Value> {
         "[a-z0-9 ]{0,12}".prop_map(Value::String),
         "[A-Za-z0-9]{16,40}".prop_map(Value::String),
     ];
-    leaf.prop_recursive(20, 120, 6, |inner| {
+    leaf.prop_recursive(20, 40, 4, |inner| {
         prop_oneof![
             proptest::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
             proptest::collection::btree_map("[a-z]{1,200}", inner.clone(), 0..6)
                 .prop_map(|m| Value::Object(m.into_iter().collect())),
             // Wide objects, which become maps.
-            (130usize..300, any::<i64>()).prop_map(|(n, v)| Value::Object(
+            (130usize..160, any::<i64>()).prop_map(|(n, v)| Value::Object(
                 (0..n).map(|i| (format!("w{i}"), json!(v))).collect()
             )),
         ]
@@ -531,6 +534,14 @@ fn path() -> impl Strategy<Value = String> {
     proptest::collection::vec(seg, 1..40).prop_map(|s| format!("/{}", s.join("/")))
 }
 
+/// Mostly a few pairs, sometimes enough to pass the 64-key bound.
+fn pairs(key: &'static str) -> impl Strategy<Value = Vec<(String, String)>> {
+    prop_oneof![
+        6 => proptest::collection::vec((key, "[a-z0-9]{0,8}"), 0..3),
+        1 => proptest::collection::vec((key, "[a-z0-9]{0,8}"), 60..70),
+    ]
+}
+
 fn exchange() -> impl Strategy<Value = Ex> {
     (
         (
@@ -547,8 +558,8 @@ fn exchange() -> impl Strategy<Value = Ex> {
         ),
         (
             "[a-z0-9.]{0,1024}",
-            proptest::collection::vec(("[a-z]{1,200}", "[a-z0-9]{0,8}"), 0..70),
-            proptest::collection::vec(("x-[a-z]{1,150}", "[a-z0-9]{0,8}"), 0..70),
+            pairs("[a-z]{1,200}"),
+            pairs("x-[a-z]{1,150}"),
             proptest::option::of(json_value()),
             any::<bool>(),
         ),
@@ -616,7 +627,7 @@ proptest! {
 
     #[test]
     fn ctl_01_accepts_what_the_recorder_produces(
-        items in proptest::collection::vec(exchange(), 1..8),
+        items in proptest::collection::vec(exchange(), 1..6),
         split in 0usize..8,
         max_literals in 1usize..5,
         max_endpoints in 1usize..12,

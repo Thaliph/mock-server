@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::check::Violation;
 use super::redact::{MARKER, Redactor};
 use super::schema::{
     MAX_NAME, MAX_NODES, MAX_PARAMS, Pair, Params, Schema, cut_name, header_pairs, query_pairs,
@@ -51,6 +52,7 @@ pub struct Observation<'a> {
 
 /// The bodies of one media type.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Media {
     count: u64,
     bytes: u64,
@@ -78,6 +80,7 @@ fn merge_opt<T>(a: Option<T>, b: Option<T>, f: impl FnOnce(T, T) -> T) -> Option
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Side {
     headers: Params,
     bodies: BTreeMap<String, Media>,
@@ -97,6 +100,22 @@ impl Side {
             self.bodies.pop_last();
         }
         self
+    }
+
+    fn check(&self) -> Result<(), Violation> {
+        self.headers.check()?;
+        if self.bodies.len() > MAX_MEDIA {
+            return Err(Violation::MediaTypes);
+        }
+        for media in self.bodies.values() {
+            if let Some(schema) = &media.json {
+                schema.check()?;
+            }
+            if let Some(form) = &media.form {
+                form.check()?;
+            }
+        }
+        Ok(())
     }
 
     fn to_json(&self) -> Value {
@@ -120,6 +139,7 @@ impl Side {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Observed {
     query: Params,
     request: Side,
@@ -222,6 +242,14 @@ pub(super) struct Parsed {
     pub content: Content,
     /// XXH3 of the schema skeleton; 0 for an opaque body.
     pub shape: u64,
+}
+
+/// True for the media types whose bodies are parsed (JSON and urlencoded forms); the others
+/// are kept as media type and size only.
+pub(super) fn parsed_media(media: &str) -> bool {
+    media == "application/json"
+        || media.ends_with("+json")
+        || media == "application/x-www-form-urlencoded"
 }
 
 /// Parses a body (already content-decoded) by its `content-type`; nothing without one.
@@ -341,6 +369,14 @@ impl Observed {
         }
         side.bodies.insert(parsed.media.clone(), m);
         Some(parsed)
+    }
+
+    /// The query, headers, bodies and volatile fields are within their bounds.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        self.query.check()?;
+        self.request.check()?;
+        self.response.check()?;
+        self.fields.check()
     }
 
     pub fn merge(self, other: Self) -> Self {

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::check::Violation;
 use super::histogram::Histogram;
 use super::observed::{Observation, Observed, state_bound};
 use super::redact::{self, MARKER, Redactor, value_rule};
@@ -14,6 +15,8 @@ use super::template::{Seg, is_param, render, split_path};
 
 /// Hosts kept per endpoint.
 pub const MAX_HOSTS: usize = 16;
+/// Longest host kept, in bytes (the codec cuts the authority there).
+pub const MAX_HOST: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -80,6 +83,7 @@ pub enum Sampled {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Stats {
     pub statuses: BTreeMap<u16, u64>,
     pub latency: Histogram,
@@ -89,6 +93,7 @@ pub struct Stats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Node {
     literals: BTreeMap<String, Node>,
     param: Option<Box<Node>>,
@@ -97,6 +102,7 @@ struct Node {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Scope {
     root: Node,
     /// gRPC paths, never templated: path, then method.
@@ -104,6 +110,7 @@ struct Scope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Report {
     version: u32,
     pod: Option<String>,
@@ -140,6 +147,32 @@ impl Stats {
 
     pub fn samples(&self) -> &Samples {
         &self.samples
+    }
+
+    pub(super) fn samples_mut(&mut self) -> &mut Samples {
+        &mut self.samples
+    }
+
+    /// Exchanges counted on the endpoint.
+    pub(super) fn total(&self) -> u64 {
+        self.statuses.values().fold(0, |n, c| n.saturating_add(*c))
+    }
+
+    /// Statuses 100..=599, histogram, at most `MAX_HOSTS` hosts of at most `MAX_HOST` bytes,
+    /// schemas and samples within their bounds.
+    fn check(&self) -> Result<(), Violation> {
+        if self.statuses.keys().any(|s| !(100..=599).contains(s)) {
+            return Err(Violation::Status);
+        }
+        self.latency.check()?;
+        if self.hosts.len() > MAX_HOSTS {
+            return Err(Violation::Hosts);
+        }
+        if self.hosts.iter().any(|h| h.len() > MAX_HOST) {
+            return Err(Violation::HostLength);
+        }
+        self.observed.check()?;
+        self.samples.check()
     }
 
     /// Schemas and volatility of the query, headers and bodies.
@@ -229,6 +262,69 @@ impl Node {
         }
     }
 
+    /// The node at exactly these segments.
+    fn at(&self, segments: &[Seg]) -> Option<&Node> {
+        let Some((first, rest)) = segments.split_first() else {
+            return Some(self);
+        };
+        match first {
+            Seg::Literal(literal) => self.literals.get(literal),
+            Seg::Param => self.param.as_deref(),
+        }?
+        .at(rest)
+    }
+
+    fn at_mut(&mut self, segments: &[Seg]) -> Option<&mut Node> {
+        let Some((first, rest)) = segments.split_first() else {
+            return Some(self);
+        };
+        match first {
+            Seg::Literal(literal) => self.literals.get_mut(literal),
+            Seg::Param => self.param.as_deref_mut(),
+        }?
+        .at_mut(rest)
+    }
+
+    /// Where the endpoint at `segments` is once literals have been absorbed: a literal that
+    /// is gone leads to the parameter child.
+    fn route(&self, segments: &[Seg]) -> Option<Vec<Seg>> {
+        let mut node = self;
+        let mut out = Vec::with_capacity(segments.len());
+        for segment in segments {
+            match segment {
+                Seg::Literal(literal) if node.literals.contains_key(literal) => {
+                    out.push(segment.clone());
+                    node = &node.literals[literal];
+                }
+                _ => {
+                    out.push(Seg::Param);
+                    node = node.param.as_deref()?;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// The endpoints below are within the bounds, `segments` levels and `bytes` of path
+    /// deep: a literal costs its bytes and a slash, a parameter a slash.
+    fn check(&self, segments: usize, bytes: usize) -> Result<(), Violation> {
+        for stats in self.endpoints.values() {
+            stats.check()?;
+        }
+        let literals = self.literals.iter().map(|(l, c)| (l.len() + 1, c));
+        let param = self.param.as_deref().map(|c| (1, c));
+        for (cost, child) in literals.chain(param) {
+            if segments + 1 > MAX_SEGMENTS {
+                return Err(Violation::PathSegments);
+            }
+            if bytes + cost > MAX_PATH {
+                return Err(Violation::PathLength);
+            }
+            child.check(segments + 1, bytes + cost)?;
+        }
+        Ok(())
+    }
+
     /// Nothing below this node, and it does not absorb: it can go.
     fn prunable(&self) -> bool {
         self.endpoints.is_empty()
@@ -316,6 +412,20 @@ impl Scope {
 }
 
 impl Scope {
+    fn check(&self) -> Result<(), Violation> {
+        self.root.check(0, 0)?;
+        for (path, methods) in &self.raw {
+            if path.len() > MAX_PATH {
+                return Err(Violation::PathLength);
+            }
+            if split_path(path).len() > MAX_SEGMENTS {
+                return Err(Violation::PathSegments);
+            }
+            methods.values().try_for_each(Stats::check)?;
+        }
+        Ok(())
+    }
+
     fn for_each_stats<'a>(&'a self, f: &mut impl FnMut(&'a Stats)) {
         self.root.for_each_stats(f);
         for methods in self.raw.values() {
@@ -337,13 +447,13 @@ impl Scope {
 
 /// Where an endpoint is held in a scope.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum Place {
+pub(super) enum Place {
     Tree(Vec<Seg>),
     Raw(String),
 }
 
 /// An endpoint's place in a report, ordered like [`Report::endpoints`].
-type EndpointKey = (Direction, u16, String, String, Place);
+pub(super) type EndpointKey = (Direction, u16, String, String, Place);
 
 impl Report {
     pub fn new(pod: Option<String>) -> Self {
@@ -372,7 +482,7 @@ impl Report {
     }
 
     /// The key of every endpoint, sorted.
-    fn endpoint_keys(&self) -> Vec<EndpointKey> {
+    pub(super) fn endpoint_keys(&self) -> Vec<EndpointKey> {
         let mut keys = Vec::new();
         for (direction, ports) in &self.scopes {
             for (port, scope) in ports {
@@ -403,7 +513,7 @@ impl Report {
         keys
     }
 
-    fn remove_endpoint(&mut self, (direction, port, _, method, place): &EndpointKey) {
+    pub(super) fn remove_endpoint(&mut self, (direction, port, _, method, place): &EndpointKey) {
         let Some(ports) = self.scopes.get_mut(direction) else {
             return;
         };
@@ -597,9 +707,9 @@ impl Report {
         }
     }
 
-    /// Merges `other` into `self`, then enforces `max_endpoints` and `sample_budget`: the
-    /// reports of other pods are not trusted to respect them.
-    pub fn merge(&mut self, limits: &Limits, other: Report) {
+    /// The union of `other` into `self`, absorbing literals past `max_literals`; nothing is
+    /// dropped. The counters saturate.
+    pub(super) fn union(&mut self, other: Report, max_literals: usize) {
         if self.pod != other.pod {
             self.pod = None;
         }
@@ -607,13 +717,103 @@ impl Report {
         for (direction, ports) in other.scopes {
             let mine = self.scopes.entry(direction).or_default();
             for (port, scope) in ports {
-                mine.entry(port)
-                    .or_default()
-                    .merge(scope, limits.max_literals);
+                mine.entry(port).or_default().merge(scope, max_literals);
             }
         }
+    }
+
+    /// Merges `other` into `self`, then enforces `max_endpoints` and `sample_budget`: the
+    /// reports of other pods are not trusted to respect them.
+    pub fn merge(&mut self, limits: &Limits, other: Report) {
+        self.union(other, limits.max_literals);
         self.limit_endpoints(limits.max_endpoints);
         self.limit_samples(limits.sample_budget);
+    }
+
+    pub(super) fn clear_pod(&mut self) {
+        self.pod = None;
+    }
+
+    pub(super) fn stats_at(
+        &self,
+        (direction, port, _, method, place): &EndpointKey,
+    ) -> Option<&Stats> {
+        let scope = self.scopes.get(direction)?.get(port)?;
+        match place {
+            Place::Tree(segments) => scope.root.at(segments)?.endpoints.get(method),
+            Place::Raw(path) => scope.raw.get(path)?.get(method),
+        }
+    }
+
+    pub(super) fn stats_at_mut(
+        &mut self,
+        (direction, port, _, method, place): &EndpointKey,
+    ) -> Option<&mut Stats> {
+        let scope = self.scopes.get_mut(direction)?.get_mut(port)?;
+        match place {
+            Place::Tree(segments) => scope.root.at_mut(segments)?.endpoints.get_mut(method),
+            Place::Raw(path) => scope.raw.get_mut(path)?.get_mut(method),
+        }
+    }
+
+    /// The key that an endpoint of an earlier report has in this one, which is its union
+    /// with others: absorbed literals lead to their parameter. `None` when it is gone.
+    pub(super) fn route(
+        &self,
+        (direction, port, template, method, place): &EndpointKey,
+    ) -> Option<EndpointKey> {
+        let scope = self.scopes.get(direction)?.get(port)?;
+        let (template, place) = match place {
+            Place::Tree(segments) => {
+                let routed = scope.root.route(segments)?;
+                let template = if routed.is_empty() {
+                    "/".to_string()
+                } else {
+                    render(&routed)
+                };
+                (template, Place::Tree(routed))
+            }
+            Place::Raw(path) => {
+                scope.raw.get(path)?;
+                (template.clone(), Place::Raw(path.clone()))
+            }
+        };
+        let key = (*direction, *port, template, method.clone(), place);
+        self.stats_at(&key).map(|_| key)
+    }
+
+    /// Within the bounds of spec §6 and, per direction, at most `max_push_endpoints`
+    /// endpoints: what the recorder of a sidecar can produce (spec §7.3, structural check).
+    pub fn check(&self, max_push_endpoints: usize) -> Result<(), Violation> {
+        if self.version != 1 {
+            return Err(Violation::Version);
+        }
+        for ports in self.scopes.values() {
+            let mut endpoints = 0usize;
+            for scope in ports.values() {
+                scope.for_each_stats(&mut |_| endpoints += 1);
+            }
+            if endpoints > max_push_endpoints {
+                return Err(Violation::PushLimit);
+            }
+        }
+        self.scopes
+            .values()
+            .flat_map(BTreeMap::values)
+            .try_for_each(Scope::check)
+    }
+
+    /// Parses a pushed body, then checks it. Never panics, whatever the input.
+    pub fn parse_checked(json: &str, max_push_endpoints: usize) -> Result<Self, Violation> {
+        let report: Report = serde_json::from_str(json).map_err(|e| {
+            if e.is_data() && e.to_string().starts_with("unknown field") {
+                Violation::UnknownField
+            } else {
+                Violation::Malformed
+            }
+        })?;
+        report.check(max_push_endpoints)?;
+        Ok(report)
     }
 
     /// Endpoints sorted by direction, port, template, method.

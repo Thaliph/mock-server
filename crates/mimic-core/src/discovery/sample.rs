@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::observed::{Content, Parsed};
+use super::check::Violation;
+use super::observed::{Content, MAX_BODY, Parsed, parsed_media};
 use super::redact::{self, Redactor};
 use super::report::Exchange;
 use super::schema::{Pair, header_pairs, query_pairs};
@@ -18,12 +19,14 @@ pub const MAX_SAMPLES: usize = 20;
 
 /// A parsed body. Opaque and oversized bodies are not kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Body {
     media: String,
     value: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Request {
     method: String,
     path: String,
@@ -33,6 +36,7 @@ struct Request {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Response {
     status: u16,
     headers: Vec<(String, String)>,
@@ -41,6 +45,7 @@ struct Response {
 
 /// One redacted exchange.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sample {
     request: Request,
     response: Response,
@@ -118,6 +123,23 @@ impl Sample {
         self.response.status
     }
 
+    /// A status in 100..=599; bodies of a parsed media type and at most `MAX_BODY` bytes.
+    fn check(&self) -> Result<(), Violation> {
+        if !(100..=599).contains(&self.response.status) {
+            return Err(Violation::Status);
+        }
+        let bodies = [&self.request.body, &self.response.body];
+        for body in bodies.into_iter().flatten() {
+            if !parsed_media(&body.media) {
+                return Err(Violation::BodyMedia);
+            }
+            if serde_json::to_vec(&body.value).map_or(usize::MAX, |v| v.len()) > MAX_BODY {
+                return Err(Violation::BodySize);
+            }
+        }
+        Ok(())
+    }
+
     /// Hash of the request body schema skeleton; 0 without a parsed body.
     pub fn request_shape(&self) -> u64 {
         self.request_shape
@@ -150,6 +172,14 @@ impl Samples {
         self.0.is_empty()
     }
 
+    /// At most `MAX_SAMPLES`, each within its bounds.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        if self.0.len() > MAX_SAMPLES {
+            return Err(Violation::Samples);
+        }
+        self.0.values().try_for_each(Sample::check)
+    }
+
     pub fn contains(&self, hash: u64) -> bool {
         self.0.contains_key(&hash)
     }
@@ -167,6 +197,14 @@ impl Samples {
     /// Keeps the samples whose hash `keep` accepts.
     pub(super) fn retain(&mut self, mut keep: impl FnMut(u64) -> bool) {
         self.0.retain(|hash, _| keep(*hash));
+    }
+
+    pub(super) fn remove(&mut self, hash: u64) -> Option<Sample> {
+        self.0.remove(&hash)
+    }
+
+    pub(super) fn insert(&mut self, hash: u64, sample: Sample) {
+        self.0.insert(hash, sample);
     }
 
     pub(super) fn single(hash: u64, sample: Sample) -> Self {

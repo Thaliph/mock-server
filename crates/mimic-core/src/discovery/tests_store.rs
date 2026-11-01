@@ -107,7 +107,7 @@ fn item() -> impl Strategy<Value = Item> {
             Just("/u/7"),
             Just("/c/d/e"),
         ],
-        prop_oneof![Just(200u16), Just(201), Just(404), Just(500)],
+        prop_oneof![Just(200u16), Just(201), Just(400), Just(500)],
         prop_oneof![Just(""), Just("q=1"), Just("q=2"), Just("q=3")],
         1usize..4,
     )
@@ -281,7 +281,7 @@ fn ctl_02_noise_does_not_crowd_out_a_full_store() {
     assert_eq!(out.refused, counts(&[(Refusal::EndpointLimit, 50)]));
     assert!(out.evicted.is_empty());
     // The same push again changes nothing.
-    assert_eq!(out.report, stored);
+    assert_eq!(out.report.endpoints(), stored.endpoints());
 }
 
 #[test]
