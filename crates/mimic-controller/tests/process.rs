@@ -872,7 +872,7 @@ fn ctl_13_the_read_api_refuses_a_non_loopback_peer_and_stops_on_sigterm() {
     // A loopback peer is past the check: an unsupported method is a 405, not a 403.
     let mut stream = TcpStream::connect(("127.0.0.1", bound.port())).unwrap();
     stream
-        .write_all(b"DELETE /v1/workloads HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .write_all(b"DELETE /v1/workloads HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .unwrap();
     let mut answer = String::new();
     stream.read_to_string(&mut answer).unwrap();

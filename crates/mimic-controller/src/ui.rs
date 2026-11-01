@@ -25,17 +25,33 @@ pub fn router(store: Arc<Store>) -> Router {
         .with_state(store)
 }
 
-/// `403` for a peer that is not a loopback address, whatever the bind address.
+/// `403` for a peer that is not a loopback address, whatever the bind address, and for a `Host`
+/// that is not a loopback name (DNS rebinding through an open port-forward).
 async fn loopback_only(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
     next: Next,
 ) -> Response {
-    if peer.ip().to_canonical().is_loopback() {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok());
+    if peer.ip().to_canonical().is_loopback() && host.is_some_and(loopback_host) {
         next.run(request).await
     } else {
         StatusCode::FORBIDDEN.into_response()
     }
+}
+
+/// `localhost`, `127.0.0.1` or `[::1]`, with or without a port.
+fn loopback_host(host: &str) -> bool {
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !name.ends_with(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            name
+        }
+        _ => host,
+    };
+    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "[::1]"
 }
 
 impl IntoResponse for ReadError {
