@@ -1821,6 +1821,7 @@ dependencies = [
  "nix",
  "percent-encoding",
  "prometheus-client",
+ "rand",
  "rcgen",
  "reqwest",
  "rustls",

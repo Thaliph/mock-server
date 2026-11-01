@@ -716,3 +716,20 @@ fn ctl_04_drop_threshold_day_is_kept() {
     let mut r = stamped(&[(1, &["a=1"])], 0);
     assert!(drop_expired(&mut r, 5, 10).is_empty());
 }
+
+#[test]
+fn ctl_16_dropping_the_samples_keeps_counters_and_shape() {
+    let input = Input {
+        resp_body: Some(json!({"id": 1}).to_string()),
+        resp_headers: header("content-type", "application/json"),
+        ..Input::default()
+    };
+    let mut report = record(&Redactor::default(), &input, 3);
+    assert!(report.sample_bytes() > 0);
+    let before = report.endpoints().len();
+    report.drop_samples();
+    assert_eq!(report.sample_bytes(), 0);
+    assert_eq!(report.exchanges(), 3);
+    assert_eq!(report.endpoints().len(), before);
+    assert!(report.check(256).is_ok());
+}

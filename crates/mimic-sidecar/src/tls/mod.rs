@@ -20,7 +20,7 @@ const TOKEN_VAR: &str = "MIMIC_TLS_TOKEN_FILE";
 const TRUST_DIR_VAR: &str = "MIMIC_TRUST_DIR";
 const TRUST_BINARY_VAR: &str = "MIMIC_TRUST_BINARY";
 const WORKLOAD_VAR: &str = "MIMIC_WORKLOAD";
-const DEFAULT_TOKEN: &str = "/var/run/secrets/mimic.platform.io/token";
+pub(crate) const DEFAULT_TOKEN: &str = "/var/run/secrets/mimic.platform.io/token";
 const DEFAULT_TRUST_DIR: &str = "/mimic";
 
 /// Where the image ships the static `mimic-trust` binary.

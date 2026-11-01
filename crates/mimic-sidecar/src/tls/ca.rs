@@ -248,6 +248,42 @@ enum Failure {
     Mismatch(String),
 }
 
+/// The client for the sidecar API: it trusts `controller_ca` only, follows no redirect and
+/// uses no proxy.
+pub(crate) fn api_client(
+    controller_ca: &str,
+    timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    // Already installed by an earlier call: the existing provider is the same one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let anchor =
+        reqwest::Certificate::from_pem(controller_ca.as_bytes()).map_err(|e| e.to_string())?;
+    reqwest::Client::builder()
+        .tls_certs_only([anchor])
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// The body of `response`, read chunk by chunk: an endless answer is refused at the cap, not
+/// buffered.
+pub(crate) async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| e.without_url().to_string())?
+    {
+        if bytes.len() + chunk.len() > MAX_RESPONSE {
+            return Err("answer too large".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 /// Requests, renews and installs the intermediate.
 pub struct CaClient {
     config: CaConfig,
@@ -257,17 +293,7 @@ pub struct CaClient {
 
 impl CaClient {
     pub fn new(config: CaConfig, state: Arc<CaState>) -> Result<CaClient, String> {
-        // Already installed by an earlier call: the existing provider is the same one.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let anchor = reqwest::Certificate::from_pem(config.controller_ca.as_bytes())
-            .map_err(|e| e.to_string())?;
-        let http = reqwest::Client::builder()
-            .tls_certs_only([anchor])
-            .timeout(REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|e| e.to_string())?;
+        let http = api_client(&config.controller_ca, REQUEST_TIMEOUT)?;
         Ok(CaClient {
             config,
             state,
@@ -338,19 +364,7 @@ impl CaClient {
         if !status.is_success() {
             return Err(Failure::Error(format!("status {status}")));
         }
-        // Read chunk by chunk: an endless answer is refused at the cap, not buffered.
-        let mut response = response;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| Failure::Error(e.without_url().to_string()))?
-        {
-            if bytes.len() + chunk.len() > MAX_RESPONSE {
-                return Err(Failure::Error("answer too large".into()));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = read_capped(response).await.map_err(Failure::Error)?;
         let answer: Answer = serde_json::from_slice(&bytes)
             .map_err(|_| Failure::Error("malformed answer".into()))?;
         accept(&self.config.root_der, key, &answer.certificate, unix_now())

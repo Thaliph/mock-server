@@ -9,7 +9,7 @@ use std::sync::Arc;
 use mimic_runtime::admin::{self, Readiness, Shutdown};
 use mimic_runtime::config::{CommonConfig, Env};
 use mimic_runtime::metrics::Metrics;
-use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
+use mimic_sidecar::discovery::{Discovery, DiscoveryConfig, ShipConfig};
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 use mimic_sidecar::probes::{self, Probes};
 use mimic_sidecar::red::ProxyMetrics;
@@ -47,6 +47,10 @@ fn main() -> ExitCode {
         Ok(discovery) => discovery,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
+    let ship = match ShipConfig::from_env(&env) {
+        Ok(ship) => ship,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
     let pod = env.optional("MIMIC_POD_NAME").map(str::to_string);
     let mut log = mimic_runtime::logging::init(&config.log);
     // Before any key exists: no core dump, not readable through /proc by other processes.
@@ -55,7 +59,7 @@ fn main() -> ExitCode {
         log.finish();
         return ExitCode::FAILURE;
     }
-    let code = match run(config, tunnel, probes, tls, (discovery, pod)) {
+    let code = match run(config, tunnel, probes, tls, (discovery, ship, pod)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "sidecar stopped");
@@ -73,7 +77,7 @@ async fn run(
     tunnel: TunnelConfig,
     probes: Probes,
     tls: TlsConfig,
-    (discovery, pod): (DiscoveryConfig, Option<String>),
+    (discovery, ship, pod): (DiscoveryConfig, ShipConfig, Option<String>),
 ) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     // Registered before any listener is announced: an early SIGTERM is not lost.
@@ -85,6 +89,7 @@ async fn run(
     let tls_metrics = TlsMetrics::register(&mut metrics);
     let discovery = Discovery::start(&discovery, pod)?;
     discovery.register(&mut metrics);
+    let shipper = discovery.shipper(ship).map_err(std::io::Error::other)?;
     let metrics = Arc::new(metrics);
     // Readiness does not wait for the CA: until it holds an intermediate, TLS is passed through.
     let ca = start_ca(&tls, ca_metrics)?;
@@ -133,9 +138,26 @@ async fn run(
     let grace = config.shutdown_grace;
     // Responses in flight get the grace period too, in parallel with the admin drain; the
     // connections left at its end are closed.
+    // Shipping stops at the signal; once the proxy has drained, what was recorded is flushed
+    // within what remains of the grace.
+    let shipping = shipper.map(|mut shipper| {
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            shipper.run(stop.wait()).await;
+            shipper
+        })
+    });
     let drain = async {
         shutdown.clone().wait().await;
+        let begun = std::time::Instant::now();
         shared.drain(grace).await;
+        let shipper = match shipping {
+            Some(task) => task.await.ok(),
+            None => None,
+        };
+        if let Some(mut shipper) = shipper {
+            shipper.flush(grace.saturating_sub(begun.elapsed())).await;
+        }
     };
     let (served, ()) = tokio::join!(
         admin::serve_until(

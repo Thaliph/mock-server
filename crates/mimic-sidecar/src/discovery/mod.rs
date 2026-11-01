@@ -9,10 +9,11 @@ mod decode;
 mod metrics;
 mod recorder;
 mod redactions;
+mod ship;
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -29,10 +30,23 @@ pub use capture::Tap;
 pub(crate) use capture::{Capture, Meta};
 pub use config::DiscoveryConfig;
 pub use metrics::DiscoveryMetrics;
+pub use ship::{ShipConfig, Shipper, Target};
+
+/// What the shipper and the recorder share (spec §7.2, "Shipping client").
+#[derive(Default)]
+pub(crate) struct Handoff {
+    /// Sample bytes of the pending report: the current report may use the rest of the budget.
+    pending_samples: AtomicUsize,
+    /// Counts the freezes. Written under the report's lock.
+    epoch: AtomicU64,
+}
 
 /// Discovery of one sidecar: the local report and the thread that fills it.
 pub struct Discovery {
     report: Arc<Mutex<Report>>,
+    pod: Option<String>,
+    handoff: Arc<Handoff>,
+    budget: Arc<capture::Budget>,
     tap: Tap,
     metrics: DiscoveryMetrics,
 }
@@ -41,19 +55,18 @@ impl Discovery {
     /// Starts the recorder thread. The thread logs through the subscriber of the caller and
     /// ends when the last [`Tap`] is dropped.
     pub fn start(config: &DiscoveryConfig, pod: Option<String>) -> io::Result<Discovery> {
-        let report = Arc::new(Mutex::new(Report::new(pod)));
+        let report = Arc::new(Mutex::new(Report::new(pod.clone())));
+        let handoff = Arc::new(Handoff::default());
+        let budget = Arc::new(capture::Budget::new(config.capture_budget));
         let metrics = DiscoveryMetrics::default();
         let (queue, records) = sync_channel(config.queue);
-        let tap = Tap::new(
-            queue,
-            Arc::new(capture::Budget::new(config.capture_budget)),
-            metrics.clone(),
-        );
+        let tap = Tap::new(queue, budget.clone(), metrics.clone());
         let recorder = recorder::Recorder::new(
             report.clone(),
             config.limits(),
             Redactor::new(config.redact_names.iter().map(String::as_str)),
             metrics.clone(),
+            handoff.clone(),
         );
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::Builder::new()
@@ -63,6 +76,9 @@ impl Discovery {
             })?;
         Ok(Discovery {
             report,
+            pod,
+            handoff,
+            budget,
             tap,
             metrics,
         })
@@ -73,12 +89,31 @@ impl Discovery {
         self.tap.clone()
     }
 
+    /// The shipping client, or `None` (after one INFO line) without a target.
+    pub fn shipper(&self, config: ShipConfig) -> Result<Option<Shipper>, String> {
+        if config.target.is_none() {
+            tracing::info!(target: "discovery", "report shipping disabled");
+            return Ok(None);
+        }
+        ship::Shipper::new(
+            config,
+            ship::Parts {
+                report: self.report.clone(),
+                pod: self.pod.clone(),
+                handoff: self.handoff.clone(),
+                budget: self.budget.clone(),
+                metrics: self.metrics.clone(),
+            },
+        )
+        .map(Some)
+    }
+
     /// Exposes the `mimic_discovery_*` metrics in `metrics`.
     pub fn register(&self, metrics: &mut Metrics) {
         self.metrics.register(metrics);
     }
 
-    /// A copy of the local report.
+    /// A copy of the current report: what has not been frozen for shipping yet.
     pub fn report(&self) -> Report {
         self.report
             .lock()
