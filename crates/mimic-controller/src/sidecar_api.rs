@@ -457,6 +457,9 @@ async fn read_body(body: Body) -> Result<Vec<u8>, Refusal> {
 }
 
 #[cfg(test)]
+mod push_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tls_ca::{Seed, derive_root};
@@ -473,12 +476,12 @@ mod tests {
     const CANARY: &str = "canary-token-7f3a91";
     const POD: &str = "pay-7d9f8b6c4d-x2k9p";
 
-    type Reviews = Arc<Mutex<Vec<Value>>>;
+    pub(super) type Reviews = Arc<Mutex<Vec<Value>>>;
 
     /// An API server answering `TokenReview` by token: `ok` is the pod `POD` of namespace
     /// `shop`, `other-pod` another deployment's, `no-claim` has no bound pod, `wrong-audience`
     /// is accepted but for another audience, `boom` makes the call fail.
-    fn api_server() -> (kube::Client, Reviews) {
+    pub(super) fn api_server() -> (kube::Client, Reviews) {
         let reviews = Reviews::default();
         let seen = reviews.clone();
         let service = tower::service_fn(move |request: Request<kube::client::Body>| {
@@ -503,6 +506,19 @@ mod tests {
                     user
                 };
                 let (code, status) = match token.as_str() {
+                    // `ns|<namespace>|<pod>|<anything>`: a pod of any namespace.
+                    t if t.starts_with("ns|") => {
+                        let parts: Vec<&str> = t.split('|').collect();
+                        let user = json!({
+                            "username": format!("system:serviceaccount:{}:default", parts[1]),
+                            "extra": {POD_NAME_CLAIM: [parts[2]]},
+                        });
+                        (
+                            200,
+                            json!({"authenticated": true, "user": user,
+                                   "audiences": [AUDIENCE]}),
+                        )
+                    }
                     t if t.starts_with("ok") => (
                         200,
                         json!({"authenticated": true, "user": user(Some(POD)),
