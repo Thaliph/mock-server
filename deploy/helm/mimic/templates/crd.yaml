@@ -1,4 +1,4 @@
-# MimicWorkload (spec §7, §7.1): spec.deployment, spec.mode, (F3) spec.tls.exclude and (F4) spec.discovery.redact.
+# MimicWorkload (spec §7, §7.1): spec.deployment, spec.mode, (F3) spec.tls.exclude and (F4) spec.discovery.redact, (F5) status.discovery.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -20,11 +20,51 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
+      # Written by the controller only, through the status subresource (spec §7.4).
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Mode
+          type: string
+          jsonPath: .spec.mode
+        # Inbound endpoints: the only direction before F9.
+        - name: Endpoints
+          type: integer
+          jsonPath: .status.discovery.endpoints.inbound
+        - name: Pods
+          type: integer
+          jsonPath: .status.discovery.pods
+        - name: Last push
+          type: date
+          jsonPath: .status.discovery.lastPushTime
       schema:
         openAPIV3Schema:
           type: object
           required: [spec]
           properties:
+            status:
+              type: object
+              properties:
+                discovery:
+                  description: What the controller holds of the Deployment's discovery data (spec §7.4).
+                  type: object
+                  properties:
+                    endpoints:
+                      description: Endpoints per direction; a direction without any is omitted.
+                      type: object
+                      properties:
+                        inbound: {type: integer, format: int64}
+                        outbound: {type: integer, format: int64}
+                    exchanges: {type: integer, format: int64}
+                    sampleBytes: {type: integer, format: int64}
+                    pods:
+                      description: Pods whose last push is within MIMIC_STATUS_POD_WINDOW.
+                      type: integer
+                      format: int64
+                    lastPushTime:
+                      description: Last applied push, UTC, in seconds. Absent without data.
+                      type: string
+                      format: date-time
             spec:
               type: object
               required: [deployment]

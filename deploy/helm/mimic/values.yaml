@@ -30,6 +30,12 @@ controller:
   # Sidecar API port (spec §7.2): sidecars authenticate here with their projected token. Served
   # with the webhook certificate; the controller Service and NetworkPolicy expose it.
   sidecarApiPort: 8444
+  # MimicWorkload status (spec §7.4).
+  status:
+    # Period of the status update (1s to 1h).
+    interval: 30s
+    # A pod counts in status.discovery.pods while its last push is this recent (1s to 24h).
+    podWindow: 5m
 
 # Pod injection (spec §7.1). The sidecar image is `image` above.
 inject:

@@ -25,10 +25,8 @@ pub struct PushConfig {
     pub max_push_endpoints: usize,
     pub store: StoreConfig,
     /// `MIMIC_STATUS_INTERVAL` (read by the status reconciler).
-    #[allow(dead_code)]
     pub status_interval: Duration,
     /// `MIMIC_STATUS_POD_WINDOW`.
-    #[allow(dead_code)]
     pub pod_window: Duration,
     /// `MIMIC_UI_ADDR` (read by the read API).
     pub ui_addr: SocketAddr,

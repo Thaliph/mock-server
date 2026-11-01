@@ -81,6 +81,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     let api_metrics = sidecar_api::ApiMetrics::register(metrics.registry_mut());
     let seed_metrics = tls_ca::SeedMetrics::register(metrics.registry_mut());
     let store_metrics = store::StoreMetrics::register(metrics.registry_mut());
+    let status_metrics = status::StatusMetrics::register(metrics.registry_mut());
     let metrics = Arc::new(metrics);
     let webhook = config.webhook;
     tracing::info!(
@@ -116,6 +117,17 @@ async fn run(config: Config) -> std::io::Result<()> {
     });
     let store = store::Store::new(config.valkey.clone(), config.push.store, store_metrics);
     let ui_router = ui::router(store.clone());
+    tokio::spawn(
+        status::Reconciler {
+            store: store.clone(),
+            cache: cache.clone(),
+            sink: Arc::new(status::KubeSink::new(kube_client.clone())),
+            metrics: status_metrics,
+            window: config.push.pod_window,
+            down: Default::default(),
+        }
+        .run(config.push.status_interval),
+    );
     let health = valkey::Health::spawn(config.valkey);
     let readiness = Readiness::new({
         let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());

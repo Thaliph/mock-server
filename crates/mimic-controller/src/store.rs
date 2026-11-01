@@ -562,8 +562,45 @@ impl Store {
         namespace: &str,
         deployment: &str,
     ) -> Result<(Option<StatusMeta>, BTreeMap<String, u64>), ReadError> {
-        let _ = (namespace, deployment);
-        todo!("status_input")
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        let (meta, pods): (BTreeMap<String, String>, BTreeMap<String, String>) = match redis::pipe()
+            .cmd("HGETALL")
+            .arg(&k.meta)
+            .cmd("HGETALL")
+            .arg(&k.pods)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(read) => read,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        if meta.is_empty() {
+            return Ok((None, BTreeMap::new()));
+        }
+        let unreadable = || {
+            tracing::error!(namespace, deployment, "stored meta unreadable");
+            ReadError::Unreadable
+        };
+        let field = |name: &str| meta.get(name).and_then(|v| v.parse::<u64>().ok());
+        let meta = (|| {
+            Some(StatusMeta {
+                inbound: field("endpoints_inbound")?,
+                outbound: field("endpoints_outbound")?,
+                exchanges: field("exchanges")?,
+                sample_bytes: field("sample_bytes")?,
+                updated_ms: field("updated")?,
+            })
+        })()
+        .ok_or_else(unreadable)?;
+        let pods = pods
+            .into_iter()
+            .map(|(pod, ms)| ms.parse().map(|ms| (pod, ms)).map_err(|_| unreadable()))
+            .collect::<Result<_, _>>()?;
+        Ok((Some(meta), pods))
     }
 
     /// The stored `:report` bytes, once they are known to parse.

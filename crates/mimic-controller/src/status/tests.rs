@@ -151,7 +151,14 @@ async fn ctl_18_every_workload_naming_the_deployment_gets_the_status() {
             (&ns, "w3", "front"),
         ],
     );
-    push(&s.reconciler.store, &ns, "users", "users-a", &["/a", "/b/1"]).await;
+    push(
+        &s.reconciler.store,
+        &ns,
+        "users",
+        "users-a",
+        &["/a", "/b/1"],
+    )
+    .await;
     push(&s.reconciler.store, &ns, "users", "users-b", &["/a"]).await;
     s.reconciler.tick(now_ms()).await;
     let calls = s.sink.calls();

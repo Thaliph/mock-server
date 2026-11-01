@@ -75,6 +75,10 @@ spec:
               value: {{ .Values.controller.webhook.maxConnections | quote }}
             - name: MIMIC_WEBHOOK_REQUEST_TIMEOUT
               value: {{ .Values.controller.webhook.requestTimeout | quote }}
+            - name: MIMIC_STATUS_INTERVAL
+              value: {{ .Values.controller.status.interval | quote }}
+            - name: MIMIC_STATUS_POD_WINDOW
+              value: {{ .Values.controller.status.podWindow | quote }}
             - name: MIMIC_INJECT_SIDECAR_IMAGE
               value: {{ include "mimic.image" . | quote }}
             - name: MIMIC_INJECT_INIT_IMAGE

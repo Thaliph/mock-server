@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-20, CTL-21).
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -71,11 +71,11 @@ repo=${IMAGE%:*}; tag=${IMAGE##*:}
 init_repo=${INIT_IMAGE%:*}; init_tag=${INIT_IMAGE##*:}
 install() {
   # The injector must use the images under test too: otherwise injected pods pull the chart's default
-  # mimic-init tag from the registry.
+  # mimic-init tag from the registry. Extra arguments are further helm flags.
   helm upgrade --install "$RELEASE" deploy/helm/mimic -n "$NS" \
     --set image.repository="$repo" --set image.tag="$tag" --set image.pullPolicy=Never \
     --set inject.initImage.repository="$init_repo" --set inject.initImage.tag="$init_tag" \
-    --wait --timeout 4m
+    "$@" --wait --timeout 4m
 }
 
 # admin_forward: (re)starts the port-forward to the controller's admin port on localhost:18081.
@@ -284,6 +284,12 @@ can no "patch another webhook configuration" patch mutatingwebhookconfigurations
 can no "get another webhook configuration" get mutatingwebhookconfigurations.admissionregistration.k8s.io/some-other
 can no "create deployments" create deployments.apps -n "$NS"
 can no "create subjectaccessreviews (only tokenreviews)" create subjectaccessreviews.authorization.k8s.io
+# CTL-19: the status of a MimicWorkload and nothing else of it; no pods, no ReplicaSets.
+CAN_ID=ctl_19 can yes "patch mimicworkloads/status" patch mimicworkloads.mimic.platform.io --subresource=status -A
+CAN_ID=ctl_19 can no "update mimicworkloads" update mimicworkloads.mimic.platform.io -A
+CAN_ID=ctl_19 can no "patch mimicworkloads" patch mimicworkloads.mimic.platform.io -A
+CAN_ID=ctl_19 can no "get pods in every namespace" get pods -A
+CAN_ID=ctl_19 can no "list replicasets" list replicasets.apps -A
 
 # The ValidatingAdmissionPolicy: as the controller account only caBundle may change.
 orig_cb=$(kubectl get mutatingwebhookconfiguration $cfg -o jsonpath='{.webhooks[0].clientConfig.caBundle}')
@@ -303,6 +309,13 @@ denied "the controller adds an annotation" kubectl patch mutatingwebhookconfigur
   -p '{"metadata":{"annotations":{"x":"y"}}}'
 [[ $(kubectl get mutatingwebhookconfiguration $cfg -o jsonpath='{.webhooks[0].clientConfig.caBundle}') == "$orig_cb" ]] \
   || fail "inj_12: restoring the caBundle failed"
+
+# CTL-19: the CRD has the status subresource and the printer columns of spec §7.4.
+log "ctl_19: the CRD has the status subresource and the printer columns Mode, Endpoints, Pods, Last push"
+crd_columns=$(kubectl get crd mimicworkloads.mimic.platform.io -o jsonpath='{range .spec.versions[0].additionalPrinterColumns[*]}{.name}{"|"}{end}')
+[[ $crd_columns == 'Mode|Endpoints|Pods|Last push|' ]] || fail "ctl_19: printer columns are '$crd_columns'"
+[[ $(kubectl get crd mimicworkloads.mimic.platform.io -o jsonpath='{.spec.versions[0].subresources.status}') == '{}' ]] \
+  || fail "ctl_19: the CRD has no status subresource"
 
 # The CRD: spec.deployment is required, DNS-1123, immutable; spec.mode defaults to discovery.
 workload() {
@@ -1381,6 +1394,33 @@ done
 cp "$WORK/merged.json" "$WORK/merged-first.json"
 merged_templates > "$WORK/templates-first.txt"
 
+# wait_status <jq expression> <seconds>: polls until the expression holds for the status.discovery of users-a
+# and users-b, the MimicWorkloads of the users deployment.
+wait_status() {
+  local end=$((SECONDS + $2)) w ok
+  while (( SECONDS < end )); do
+    ok=1
+    for w in users-a users-b; do
+      kubectl -n disc-22 get mimicworkload "$w" -o json 2>/dev/null | jq -e ".status.discovery | $1" >/dev/null || ok=0
+    done
+    (( ok )) && return 0
+    sleep 2
+  done
+  return 1
+}
+log "ctl_20: within MIMIC_STATUS_INTERVAL more the MimicWorkloads show endpoints.inbound 2, pods 2 and a lastPushTime"
+wait_status '.endpoints.inbound == 2 and .pods == 2 and (.lastPushTime | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))' 90 \
+  || fail "ctl_20: the status of users-a and users-b is not endpoints.inbound 2, pods 2 with a lastPushTime: $(kubectl -n disc-22 get mimicworkload -o jsonpath='{.items[*].status}')"
+status_row=$(kubectl -n disc-22 get mimicworkload users-a --no-headers) || fail "ctl_19: cannot print users-a"
+read -r -a row <<< "$status_row"
+[[ ${row[1]} == discovery && ${row[2]} == 2 && ${row[3]} == 2 && ${row[4]} == *Z ]] \
+  || fail "ctl_20: kubectl get mimicworkload prints '$status_row', want Mode discovery, Endpoints 2, Pods 2 and a Last push"
+header=$(kubectl -n disc-22 get mimicworkload users-a | head -n 1)
+[[ $header == *"MODE"*"ENDPOINTS"*"PODS"*"LAST PUSH"* ]] || fail "ctl_19: the printed columns are '$header'"
+kubectl -n disc-22 get mimicworkload users-a -o json --show-managed-fields \
+  | jq -e '[.metadata.managedFields[] | select(.manager == "mimic-controller" and .operation == "Apply" and .subresource == "status")] | length == 1' >/dev/null \
+  || fail "ctl_18: the status is not managed by mimic-controller through a server-side apply on the status subresource"
+
 # No canary in any /discovery output or pod log (DSC-22, DSC-15).
 for p in $dsc_pods; do
   for c in "${canaries[@]}"; do
@@ -1468,9 +1508,13 @@ pods_now=$'\n'$(merged_pods)$'\n'
 [[ $pods_now == *$'\n'"$gone"$'\n'* ]] || fail "ctl_21: the deleted pod $gone is gone from the controller's list"
 
 log "ctl_21: churn: a rollout and a deleted controller pod, with traffic before, during and after"
-# The client calls for 150 s and counts the 200s it gets; the merged count must be exactly that on top of
+# The pods of the status count for 30 s after their last push, and the status is applied every 5 s.
+install --set controller.status.podWindow=30s --set controller.status.interval=5s \
+  || fail "ctl_21: helm upgrade with MIMIC_STATUS_POD_WINDOW=30s"
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m >/dev/null || fail "ctl_21: the controller did not roll out"
+# The client calls for 210 s and counts the 200s it gets; the merged count must be exactly that on top of
 # what the report held (no exchange lost at SIGTERM of the old pods, none counted twice by a retry).
-kubectl -n disc-22-client exec -i client -- python3 - 150 > "$WORK/churn.out" <<'PY' &
+kubectl -n disc-22-client exec -i client -- python3 - 210 > "$WORK/churn.out" <<'PY' &
 import sys, time, urllib.request
 end = time.time() + int(sys.argv[1])
 ok = n = 0
@@ -1492,6 +1536,10 @@ kubectl -n disc-22 rollout restart deploy/users >/dev/null
 kubectl -n disc-22 rollout status deploy/users --timeout=3m >/dev/null || fail "ctl_21: users did not roll out"
 controller_gone=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller -o jsonpath='{.items[0].metadata.name}')
 kubectl -n "$NS" delete pod "$controller_gone" --wait=false >/dev/null || fail "ctl_21: cannot delete controller pod $controller_gone"
+# The traffic goes on: the old pods leave the status after their window and the new ones are counted,
+# with the same endpoints.
+wait_status '.pods == 2 and .endpoints.inbound == 2' 120 \
+  || fail "ctl_21: status.discovery.pods did not come back to 2 with the same endpoints: $(kubectl -n disc-22 get mimicworkload -o jsonpath='{.items[*].status}')"
 wait "$churn_pid" || fail "ctl_21: the client of the churn failed"
 churn_ok=$(cat "$WORK/churn.out")
 [[ $churn_ok =~ ^[0-9]+$ ]] && (( churn_ok > 100 )) || fail "ctl_21: the churn client got '$churn_ok' 200s"
