@@ -9,6 +9,7 @@ mod decode;
 mod metrics;
 mod recorder;
 mod redactions;
+mod ship;
 
 use std::io;
 use std::net::SocketAddr;
@@ -29,6 +30,7 @@ pub use capture::Tap;
 pub(crate) use capture::{Capture, Meta};
 pub use config::DiscoveryConfig;
 pub use metrics::DiscoveryMetrics;
+pub use ship::{ShipConfig, Shipper, Target};
 
 /// Discovery of one sidecar: the local report and the thread that fills it.
 pub struct Discovery {
@@ -71,6 +73,15 @@ impl Discovery {
     /// The handle the proxy captures exchanges with.
     pub fn tap(&self) -> Tap {
         self.tap.clone()
+    }
+
+    /// The shipping client, or `None` (after one INFO line) without a target.
+    pub fn shipper(&self, config: ShipConfig) -> Result<Option<Shipper>, String> {
+        if config.target.is_none() {
+            tracing::info!(target: "discovery", "report shipping disabled");
+            return Ok(None);
+        }
+        Ok(Some(Shipper))
     }
 
     /// Exposes the `mimic_discovery_*` metrics in `metrics`.
