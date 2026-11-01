@@ -186,7 +186,7 @@ mod tests {
     fn inj_08_cache_is_keyed_by_namespace_and_spec_deployment() {
         let cache = WorkloadCache::new();
         assert!(!cache.is_synced());
-        cache.replace([("shop".into(), "w1".into(), "api".into(), vec![])]);
+        cache.replace([("shop".into(), "w1".into(), "api".into(), vec![], vec![])]);
         assert!(cache.is_synced());
         assert!(cache.has("shop", "api"));
         assert!(!cache.has("shop", "web"));
@@ -200,16 +200,16 @@ mod tests {
         assert!(cache.has("shop", "api"));
         cache.remove("shop", "w2");
         assert!(!cache.has("shop", "api"));
-        cache.apply("shop", "w3", "web", vec![]);
+        cache.apply("shop", "w3", "web", vec![], vec![]);
         assert!(cache.has("shop", "web"));
-        cache.apply("shop", "w3", "api", vec![]);
+        cache.apply("shop", "w3", "api", vec![], vec![]);
         assert!(!cache.has("shop", "web") && cache.has("shop", "api"));
     }
 
     #[test]
     fn inj_08_cache_replace_drops_vanished_workloads() {
         let cache = WorkloadCache::synced_with(&[("shop", "w1", "api")]);
-        cache.replace([("shop".into(), "w2".into(), "web".into(), vec![])]);
+        cache.replace([("shop".into(), "w2".into(), "web".into(), vec![], vec![])]);
         assert!(!cache.has("shop", "api") && cache.has("shop", "web"));
     }
 
@@ -232,6 +232,38 @@ mod tests {
     }
 
     #[test]
+    fn dsc_20_redactions_are_the_sorted_deduplicated_union_per_deployment() {
+        let cache = WorkloadCache::synced_with_settings(&[
+            ("shop", "w1", "api", &[], &["x-tenant-key", "pin"]),
+            ("shop", "w2", "api", &["a.test"], &["pin", "badge"]),
+            ("shop", "w3", "web", &[], &["web-key"]),
+            ("other", "w4", "api", &[], &["other-key"]),
+        ]);
+        assert_eq!(
+            cache.redact("shop", "api"),
+            ["badge", "pin", "x-tenant-key"]
+        );
+        assert_eq!(cache.exclude("shop", "api"), ["a.test"]);
+        assert_eq!(cache.redact("shop", "web"), ["web-key"]);
+        assert!(cache.redact("shop", "none").is_empty());
+        cache.remove("shop", "w2");
+        assert_eq!(cache.redact("shop", "api"), ["pin", "x-tenant-key"]);
+    }
+
+    #[test]
+    fn dsc_20_entry_reads_spec_discovery_redact() {
+        let object: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "mimic.platform.io/v1alpha1", "kind": "MimicWorkload",
+            "metadata": {"name": "w", "namespace": "shop"},
+            "spec": {"deployment": "api", "discovery": {"redact": ["pin", 7, "x-tenant-key"]}},
+        }))
+        .unwrap();
+        let (_, _, _, exclude, redact) = entry(&object).unwrap();
+        assert!(exclude.is_empty());
+        assert_eq!(redact, ["pin", "x-tenant-key"]);
+    }
+
+    #[test]
     fn tls_12_entry_reads_spec_tls_exclude() {
         let object: DynamicObject = serde_json::from_value(serde_json::json!({
             "apiVersion": "mimic.platform.io/v1alpha1", "kind": "MimicWorkload",
@@ -239,7 +271,7 @@ mod tests {
             "spec": {"deployment": "api", "tls": {"exclude": ["a.test", 7, "b.test"]}},
         }))
         .unwrap();
-        let (ns, name, deployment, exclude) = entry(&object).unwrap();
+        let (ns, name, deployment, exclude, _) = entry(&object).unwrap();
         assert_eq!(
             (ns.as_str(), name.as_str(), deployment.as_str()),
             ("shop", "w", "api")

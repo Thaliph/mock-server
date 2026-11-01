@@ -391,6 +391,28 @@ pub(crate) mod tests {
         workloads: &[WorkloadSetup],
         seeded: bool,
     ) -> (Router, Arc<Metrics>, Arc<SeedSlot>) {
+        let workloads: Vec<_> = workloads
+            .iter()
+            .map(|(a, b, c, e)| (*a, *b, *c, *e, &[][..]))
+            .collect();
+        setup_settings(synced, &workloads, seeded)
+    }
+
+    type RedactSetup<'a> = (&'a str, &'a str, &'a str, &'a [&'a str], &'a [&'a str]);
+
+    /// Like [`setup_tls`], with the discovery redactions too; synced and seeded.
+    fn setup_tls_redact(
+        workloads: &[RedactSetup],
+        seeded: bool,
+    ) -> (Router, Arc<Metrics>, Arc<SeedSlot>) {
+        setup_settings(true, workloads, seeded)
+    }
+
+    fn setup_settings(
+        synced: bool,
+        workloads: &[RedactSetup],
+        seeded: bool,
+    ) -> (Router, Arc<Metrics>, Arc<SeedSlot>) {
         let mut metrics = Metrics::new("controller", "test");
         let seed = Arc::new(SeedSlot::new());
         if seeded {
@@ -409,7 +431,7 @@ pub(crate) mod tests {
                 controller_url: "https://mimic.mimic-system.svc:8444".into(),
             },
             cache: Arc::new(if synced {
-                WorkloadCache::synced_with_exclude(workloads)
+                WorkloadCache::synced_with_settings(workloads)
             } else {
                 WorkloadCache::new()
             }),
@@ -926,6 +948,31 @@ pub(crate) mod tests {
         // Its signature is randomized: the same PEM is served again, so pod specs stay stable.
         let second = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
         assert_eq!(patch_of(&first), patch_of(&second));
+    }
+
+    #[tokio::test]
+    async fn dsc_20_sidecar_gets_the_sorted_union_of_discovery_redactions() {
+        let (router, _, _) = setup_tls_redact(
+            &[
+                ("shop", "w1", "shop", &[], &["x-tenant-key", "pin"]),
+                ("shop", "w2", "shop", &[], &["pin", "badge"]),
+                ("shop", "w3", "other", &[], &["not-mine"]),
+                ("elsewhere", "w4", "shop", &[], &["not-mine-either"]),
+            ],
+            true,
+        );
+        let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        assert_eq!(
+            sidecar_env(&out)["MIMIC_DISCOVERY_REDACT_NAMES"],
+            "badge,pin,x-tenant-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn dsc_20_no_redaction_means_no_variable() {
+        let (router, _, _) = setup_tls(true, &[("shop", "w1", "shop", &[])], true);
+        let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        assert!(!sidecar_env(&out).contains_key("MIMIC_DISCOVERY_REDACT_NAMES"));
     }
 
     #[tokio::test]

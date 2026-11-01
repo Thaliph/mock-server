@@ -865,6 +865,7 @@ mod tests {
         TlsWiring {
             root_pem: "-----BEGIN CERTIFICATE-----\nROOT $x\n-----END CERTIFICATE-----\n".into(),
             exclude: Vec::new(),
+            redact: Vec::new(),
             controller_ca: "-----BEGIN CERTIFICATE-----\nWEBHOOK\n-----END CERTIFICATE-----\n"
                 .into(),
         }
@@ -1330,6 +1331,21 @@ mod tests {
             env["MIMIC_TLS_EXCLUDE"]["value"],
             "*.corp.example,api.example.com"
         );
+    }
+
+    #[test]
+    fn dsc_20_redact_variable_is_the_joined_names_and_absent_without_any() {
+        let mut tls = wiring();
+        tls.redact = vec!["pin".into(), "x-tenant-key".into()];
+        let doc = apply_with(&pod(), &tls);
+        let env = env_of(&doc["spec"]["initContainers"][1]);
+        assert_eq!(
+            env["MIMIC_DISCOVERY_REDACT_NAMES"]["value"],
+            "pin,x-tenant-key"
+        );
+        let doc = apply(&pod());
+        let env = env_of(&doc["spec"]["initContainers"][1]);
+        assert!(!env.contains_key("MIMIC_DISCOVERY_REDACT_NAMES"));
     }
 
     #[test]
