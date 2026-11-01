@@ -7,13 +7,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, PoisonError};
 
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::header::AUTHORIZATION;
+use axum::extract::{Path, State};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, RETRY_AFTER};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -21,21 +21,31 @@ use base64::Engine;
 use futures::StreamExt;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::{Api, PostParams};
+use mimic_core::discovery::redact::Redactor;
+use mimic_core::discovery::report::Report;
 use mimic_core::identity::pod_of_deployment;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 use serde::Deserialize;
 use serde_json::json;
+use serde_json::value::RawValue;
 use tokio::sync::OnceCell;
 
+use crate::store::{Outcome, Push, SeqId, Store, StoreError};
 use crate::tls_ca::{SeedSlot, derive_root};
+use crate::workloads::WorkloadCache;
+
+mod admission;
+
+pub use admission::{BodyBudget, RateLimiter, ReviewCache};
 
 /// Audience of the projected token (spec §7.1).
 pub const AUDIENCE: &str = "mimic.platform.io";
 /// Largest request body accepted.
 pub const MAX_BODY: usize = 64 * 1024;
 const ENDPOINT: &str = "/v1/tls/intermediate";
+const REPORT_ENDPOINT: &str = "/v1/workloads/{deployment}/report";
 /// Claim holding the pod a service-account token is bound to.
 const POD_NAME_CLAIM: &str = "authentication.kubernetes.io/pod-name";
 
@@ -253,7 +263,19 @@ pub struct SidecarApi {
     pub seed: Arc<SeedSlot>,
     pub reviewer: Arc<dyn Reviewer>,
     pub metrics: ApiMetrics,
+    /// `TokenReview` calls per source and in total (spec §7.2).
     pub limiter: ReviewLimiter,
+    /// Requests per source (`MIMIC_SIDECAR_API_RATE`).
+    pub rate: RateLimiter,
+    pub reviews: ReviewCache,
+    /// Push bodies being read (`MIMIC_SIDECAR_API_BODY_BUDGET`).
+    pub budget: BodyBudget,
+    pub store: Arc<Store>,
+    pub workloads: Arc<WorkloadCache>,
+    /// `MIMIC_SIDECAR_API_MAX_REPORT`.
+    pub max_report: usize,
+    /// `MIMIC_STORE_MAX_PUSH_ENDPOINTS`.
+    pub max_push_endpoints: usize,
 }
 
 pub fn router(api: Arc<SidecarApi>) -> Router {
@@ -268,6 +290,19 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
                 },
             ),
         )
+        .route(
+            "/v1/workloads/{deployment}/report",
+            post(
+                |State(api): State<Arc<SidecarApi>>,
+                 Path(deployment): Path<String>,
+                 request: axum::extract::Request| async move {
+                    let peer = request.extensions().get::<Peer>().map(|peer| peer.0);
+                    let headers = request.headers().clone();
+                    api.report(&deployment, &headers, peer, request.into_body())
+                        .await
+                },
+            ),
+        )
         .with_state(api)
 }
 
@@ -275,28 +310,51 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
 struct Refusal {
     status: StatusCode,
     result: &'static str,
+    /// Answered with `Retry-After: 1`.
+    retry: bool,
+    /// For `invalid`, why: a fixed string, never part of the request.
+    reason: Option<&'static str>,
 }
 
-const UNAUTHENTICATED: Refusal = Refusal {
-    status: StatusCode::UNAUTHORIZED,
-    result: "unauthenticated",
-};
-const FORBIDDEN: Refusal = Refusal {
-    status: StatusCode::FORBIDDEN,
-    result: "forbidden",
-};
-const INVALID: Refusal = Refusal {
-    status: StatusCode::BAD_REQUEST,
-    result: "invalid",
-};
-const TOO_LARGE: Refusal = Refusal {
-    status: StatusCode::PAYLOAD_TOO_LARGE,
-    result: "invalid",
+impl Refusal {
+    fn into_response(self) -> Response {
+        if self.retry {
+            (self.status, [(RETRY_AFTER, "1")]).into_response()
+        } else {
+            self.status.into_response()
+        }
+    }
+}
+
+const fn refusal(status: StatusCode, result: &'static str) -> Refusal {
+    Refusal {
+        status,
+        result,
+        retry: false,
+        reason: None,
+    }
+}
+
+const UNAUTHENTICATED: Refusal = refusal(StatusCode::UNAUTHORIZED, "unauthenticated");
+const FORBIDDEN: Refusal = refusal(StatusCode::FORBIDDEN, "forbidden");
+const TOO_LARGE: Refusal = refusal(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
+const PUSH_LIMIT: Refusal = refusal(StatusCode::INSUFFICIENT_STORAGE, "push_limit");
+const DEPLOYMENT_LIMIT: Refusal = refusal(StatusCode::INSUFFICIENT_STORAGE, "deployment_limit");
+const RATE_LIMITED: Refusal = Refusal {
+    retry: true,
+    ..refusal(StatusCode::TOO_MANY_REQUESTS, "rate_limited")
 };
 const UNAVAILABLE: Refusal = Refusal {
-    status: StatusCode::SERVICE_UNAVAILABLE,
-    result: "unavailable",
+    retry: true,
+    ..refusal(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
 };
+
+const fn invalid(reason: &'static str) -> Refusal {
+    Refusal {
+        reason: Some(reason),
+        ..refusal(StatusCode::BAD_REQUEST, "invalid")
+    }
+}
 
 /// What is known of the caller, for the log line.
 #[derive(Default)]
@@ -304,6 +362,10 @@ struct Caller {
     namespace: String,
     pod: String,
     deployment: String,
+    /// A push: its session, sequence and declared size.
+    session: Option<String>,
+    sequence: Option<u64>,
+    bytes: Option<usize>,
     /// Why the controller could not answer (never the token or the key).
     error: Option<String>,
 }
@@ -322,7 +384,107 @@ struct IntermediateRequest {
     public_key: String,
 }
 
+/// The body of a push; the report is checked as a whole, after the envelope.
+#[derive(Deserialize)]
+struct PushRequest {
+    session: String,
+    sequence: u64,
+    report: Box<RawValue>,
+}
+
+/// An authenticated caller.
+struct Identity {
+    namespace: String,
+    pod: Option<String>,
+}
+
 impl SidecarApi {
+    /// Counts the request and writes its one log line.
+    fn record(&self, endpoint: &str, caller: &Caller, result: &str, reason: Option<&str>) {
+        self.metrics
+            .requests
+            .get_or_create(&vec![
+                ("endpoint".to_string(), endpoint.to_string()),
+                ("result".to_string(), result.to_string()),
+            ])
+            .inc();
+        // A flood of rate-limited requests must not flood the logs.
+        macro_rules! line {
+            ($level:ident) => {
+                tracing::$level!(
+                    target: "sidecar_api",
+                    endpoint,
+                    namespace = caller.namespace,
+                    pod = caller.pod,
+                    deployment = caller.deployment,
+                    session = caller.session,
+                    sequence = caller.sequence,
+                    bytes = caller.bytes,
+                    reason,
+                    error = caller.error,
+                    result,
+                    "sidecar api request"
+                )
+            };
+        }
+        if result == "rate_limited" {
+            line!(debug);
+        } else {
+            line!(info);
+        }
+    }
+
+    /// The per-source rate limit, before anything else is done for the request.
+    fn admit(&self, peer: Option<std::net::IpAddr>) -> Result<(), Refusal> {
+        if self.rate.allow(peer) {
+            Ok(())
+        } else {
+            Err(RATE_LIMITED)
+        }
+    }
+
+    /// Authenticates from the headers alone: a cached review, or a `TokenReview` within the
+    /// limits.
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        peer: Option<std::net::IpAddr>,
+        caller: &mut Caller,
+    ) -> Result<Identity, Refusal> {
+        let token = bearer(headers).ok_or(UNAUTHENTICATED)?;
+        let review = match self.reviews.get(token) {
+            Some(review) => review,
+            None => {
+                if !self.limiter.allow(peer) {
+                    caller.error = Some("token review budget spent".to_string());
+                    return Err(UNAVAILABLE);
+                }
+                let review = self.reviewer.review(token).await.map_err(|e| {
+                    caller.error = Some(e);
+                    UNAVAILABLE
+                })?;
+                if !review.authenticated {
+                    return Err(UNAUTHENTICATED);
+                }
+                self.reviews.put(token, review.clone());
+                review
+            }
+        };
+        let namespace = review
+            .username
+            .strip_prefix("system:serviceaccount:")
+            .and_then(|rest| rest.split_once(':'))
+            .map(|(namespace, _)| namespace)
+            .filter(|namespace| !namespace.is_empty())
+            .ok_or(FORBIDDEN)?;
+        caller.namespace = namespace.to_string();
+        caller.pod = review.pod.clone().unwrap_or_default();
+        Ok(Identity {
+            namespace: namespace.to_string(),
+            pod: review.pod,
+        })
+    }
+
     async fn intermediate(
         &self,
         headers: &HeaderMap,
@@ -334,26 +496,11 @@ impl SidecarApi {
             .authorize_and_sign(headers, peer, body, &mut caller)
             .await;
         let result = outcome.as_ref().map_or_else(|r| r.result, |_| "ok");
-        self.metrics
-            .requests
-            .get_or_create(&vec![
-                ("endpoint".to_string(), ENDPOINT.to_string()),
-                ("result".to_string(), result.to_string()),
-            ])
-            .inc();
-        tracing::info!(
-            target: "sidecar_api",
-            endpoint = ENDPOINT,
-            namespace = caller.namespace,
-            pod = caller.pod,
-            deployment = caller.deployment,
-            error = caller.error,
-            result,
-            "sidecar api request"
-        );
+        let reason = outcome.as_ref().err().and_then(|r| r.reason);
+        self.record(ENDPOINT, &caller, result, reason);
         match outcome {
             Ok(certificate) => Json(json!({ "certificate": certificate })).into_response(),
-            Err(refusal) => refusal.status.into_response(),
+            Err(refusal) => refusal.into_response(),
         }
     }
 
@@ -364,45 +511,27 @@ impl SidecarApi {
         body: Body,
         caller: &mut Caller,
     ) -> Result<String, Refusal> {
-        let token = bearer(headers).ok_or(UNAUTHENTICATED)?;
-        if !self.limiter.allow(peer) {
-            caller.error = Some("token review budget spent".to_string());
-            return Err(UNAVAILABLE);
-        }
-        let review = self.reviewer.review(token).await.map_err(|e| {
-            caller.error = Some(e);
-            UNAVAILABLE
-        })?;
-        if !review.authenticated {
-            return Err(UNAUTHENTICATED);
-        }
-        let namespace = review
-            .username
-            .strip_prefix("system:serviceaccount:")
-            .and_then(|rest| rest.split_once(':'))
-            .map(|(namespace, _)| namespace)
-            .filter(|namespace| !namespace.is_empty())
-            .ok_or(FORBIDDEN)?;
-        caller.namespace = namespace.to_string();
-        caller.pod = review.pod.clone().unwrap_or_default();
+        self.admit(peer)?;
+        let identity = self.authenticate(headers, peer, caller).await?;
 
         let bytes = read_body(body).await?;
         // Parse errors quote the offending value: they are never logged or returned.
-        let request: IntermediateRequest = serde_json::from_slice(&bytes).map_err(|_| INVALID)?;
+        let request: IntermediateRequest =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("malformed"))?;
         if !valid_name(&request.deployment) {
-            return Err(INVALID);
+            return Err(invalid("deployment"));
         }
         caller.deployment = request.deployment.clone();
         let public_key = base64::engine::general_purpose::STANDARD
             .decode(request.public_key.as_bytes())
-            .map_err(|_| INVALID)?;
+            .map_err(|_| invalid("public_key"))?;
 
-        let pod = review.pod.as_deref().ok_or(FORBIDDEN)?;
+        let pod = identity.pod.as_deref().ok_or(FORBIDDEN)?;
         if !pod_of_deployment(pod, &request.deployment) {
             return Err(FORBIDDEN);
         }
         let seed = self.seed.get().ok_or(UNAVAILABLE)?;
-        let (namespace, deployment) = (namespace.to_string(), request.deployment);
+        let (namespace, deployment) = (identity.namespace, request.deployment);
         // HKDF and ECDSA are CPU work: not on the threads that serve the fail-closed webhook.
         let signed = tokio::task::spawn_blocking(move || {
             let root = derive_root(&seed, &namespace, &deployment).map_err(Signing::Derive)?;
@@ -413,7 +542,7 @@ impl SidecarApi {
         match signed {
             Ok(Ok(certificate)) => Ok(certificate),
             // The posted key is not one that can be certified.
-            Ok(Err(Signing::Key)) => Err(INVALID),
+            Ok(Err(Signing::Key)) => Err(invalid("public_key")),
             Ok(Err(Signing::Derive(e))) => {
                 caller.error = Some(e);
                 Err(UNAVAILABLE)
@@ -424,6 +553,146 @@ impl SidecarApi {
             }
         }
     }
+
+    /// `POST /v1/workloads/<deployment>/report` (spec §7.2).
+    async fn report(
+        &self,
+        deployment: &str,
+        headers: &HeaderMap,
+        peer: Option<std::net::IpAddr>,
+        body: Body,
+    ) -> Response {
+        let mut caller = Caller::default();
+        let outcome = self
+            .authorize_and_store(deployment, headers, peer, body, &mut caller)
+            .await;
+        let result = match &outcome {
+            Ok(Outcome::Applied) => "ok",
+            Ok(Outcome::Duplicate) => "duplicate",
+            Err(refusal) => refusal.result,
+        };
+        let reason = outcome.as_ref().err().and_then(|r| r.reason);
+        self.record(REPORT_ENDPOINT, &caller, result, reason);
+        match outcome {
+            Ok(outcome) => Json(json!({ "applied": outcome == Outcome::Applied })).into_response(),
+            Err(refusal) => refusal.into_response(),
+        }
+    }
+
+    async fn authorize_and_store(
+        &self,
+        deployment: &str,
+        headers: &HeaderMap,
+        peer: Option<std::net::IpAddr>,
+        body: Body,
+        caller: &mut Caller,
+    ) -> Result<Outcome, Refusal> {
+        self.admit(peer)?;
+        let identity = self.authenticate(headers, peer, caller).await?;
+        if !valid_name(deployment) {
+            return Err(invalid("deployment"));
+        }
+        caller.deployment = deployment.to_string();
+        let pod = identity.pod.as_deref().ok_or(FORBIDDEN)?;
+        if !pod_of_deployment(pod, deployment) {
+            return Err(FORBIDDEN);
+        }
+
+        // Authorised: only now is the body announced, bounded and read.
+        let length = content_length(headers)?;
+        caller.bytes = Some(length);
+        if length > self.max_report {
+            return Err(TOO_LARGE);
+        }
+        let _reservation = self.budget.reserve(length as u64).ok_or_else(|| {
+            caller.error = Some("body budget spent".to_string());
+            UNAVAILABLE
+        })?;
+        let bytes = read_exact(body, length).await?;
+
+        let extra = self.workloads.redact(&identity.namespace, deployment);
+        let max_push = self.max_push_endpoints;
+        let (seq, report) = tokio::task::spawn_blocking(move || prepare(&bytes, max_push, &extra))
+            .await
+            .map_err(|e| {
+                // Never the panic payload: it could hold push content from before re-redaction.
+                caller.error = Some(
+                    if e.is_panic() {
+                        "push task panicked"
+                    } else {
+                        "push task cancelled"
+                    }
+                    .into(),
+                );
+                UNAVAILABLE
+            })?;
+        if let Some(seq) = &seq {
+            caller.session = Some(seq.session.clone());
+            caller.sequence = Some(seq.sequence);
+        }
+        let push = Push {
+            pod: pod.to_string(),
+            seq,
+            report: report?,
+        };
+        self.store
+            .push(&identity.namespace, deployment, push)
+            .await
+            .map_err(|e| match e {
+                StoreError::Name => invalid("name"),
+                StoreError::Deployments => DEPLOYMENT_LIMIT,
+                StoreError::Unavailable => {
+                    caller.error = Some("store unavailable".to_string());
+                    UNAVAILABLE
+                }
+            })
+    }
+}
+
+/// The envelope of a push, then its report: checked, re-redacted with the built-in rules
+/// and the names of the `MimicWorkload`s, and stamped with today (spec §7.3). Nothing of
+/// the push is logged before this is done.
+fn prepare(
+    bytes: &[u8],
+    max_push_endpoints: usize,
+    extra: &[String],
+) -> (Option<SeqId>, Result<Report, Refusal>) {
+    let Ok(request) = serde_json::from_slice::<PushRequest>(bytes) else {
+        return (None, Err(invalid("malformed")));
+    };
+    let Ok(seq) = SeqId::parse(&request.session, request.sequence) else {
+        let hex = SeqId::parse(&request.session, 1).is_ok();
+        return (None, Err(invalid(if hex { "sequence" } else { "session" })));
+    };
+    let report = Report::parse_checked(request.report.get(), max_push_endpoints).map_err(|v| {
+        if v.is_push_limit() {
+            Refusal {
+                reason: Some(v.reason()),
+                ..PUSH_LIMIT
+            }
+        } else {
+            invalid(v.reason())
+        }
+    });
+    let report = report.map(|mut report| {
+        report.re_redact(&Redactor::new(extra.iter().map(String::as_str)));
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() / 86_400);
+        report.stamp(today);
+        report
+    });
+    (Some(seq), report)
+}
+
+/// The Content-Length of a push, required.
+fn content_length(headers: &HeaderMap) -> Result<usize, Refusal> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|value| value.parse().ok())
+        .ok_or(invalid("content_length"))
 }
 
 /// The token of an `Authorization: Bearer` header, if any.
@@ -447,7 +716,7 @@ async fn read_body(body: Body) -> Result<Vec<u8>, Refusal> {
     let mut stream = body.into_data_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| INVALID)?;
+        let chunk = chunk.map_err(|_| invalid("body"))?;
         if bytes.len() + chunk.len() > MAX_BODY {
             return Err(TOO_LARGE);
         }
@@ -456,9 +725,31 @@ async fn read_body(body: Body) -> Result<Vec<u8>, Refusal> {
     Ok(bytes)
 }
 
+/// Reads a body of exactly the `length` that was declared.
+async fn read_exact(body: Body, length: usize) -> Result<Vec<u8>, Refusal> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| invalid("body"))?;
+        if bytes.len() + chunk.len() > length {
+            return Err(invalid("content_length"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() == length {
+        Ok(bytes)
+    } else {
+        Err(invalid("content_length"))
+    }
+}
+
+#[cfg(test)]
+mod push_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{StoreConfig, StoreMetrics};
     use crate::tls_ca::{Seed, derive_root};
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
@@ -473,12 +764,12 @@ mod tests {
     const CANARY: &str = "canary-token-7f3a91";
     const POD: &str = "pay-7d9f8b6c4d-x2k9p";
 
-    type Reviews = Arc<Mutex<Vec<Value>>>;
+    pub(super) type Reviews = Arc<Mutex<Vec<Value>>>;
 
     /// An API server answering `TokenReview` by token: `ok` is the pod `POD` of namespace
     /// `shop`, `other-pod` another deployment's, `no-claim` has no bound pod, `wrong-audience`
     /// is accepted but for another audience, `boom` makes the call fail.
-    fn api_server() -> (kube::Client, Reviews) {
+    pub(super) fn api_server() -> (kube::Client, Reviews) {
         let reviews = Reviews::default();
         let seen = reviews.clone();
         let service = tower::service_fn(move |request: Request<kube::client::Body>| {
@@ -503,6 +794,19 @@ mod tests {
                     user
                 };
                 let (code, status) = match token.as_str() {
+                    // `ns|<namespace>|<pod>|<anything>`: a pod of any namespace.
+                    t if t.starts_with("ns|") => {
+                        let parts: Vec<&str> = t.split('|').collect();
+                        let user = json!({
+                            "username": format!("system:serviceaccount:{}:default", parts[1]),
+                            "extra": {POD_NAME_CLAIM: [parts[2]]},
+                        });
+                        (
+                            200,
+                            json!({"authenticated": true, "user": user,
+                                   "audiences": [AUDIENCE]}),
+                        )
+                    }
                     t if t.starts_with("ok") => (
                         200,
                         json!({"authenticated": true, "user": user(Some(POD)),
@@ -583,6 +887,26 @@ mod tests {
             ))))),
             metrics: ApiMetrics::register(metrics.registry_mut()),
             limiter,
+            rate: RateLimiter::new(10_000),
+            reviews: ReviewCache::default(),
+            budget: BodyBudget::new(1 << 30),
+            // These tests do not push: the store is never reached.
+            store: Store::new(
+                redis::Client::open("redis://127.0.0.1:1").expect("a valid URL"),
+                StoreConfig {
+                    ttl: std::time::Duration::from_secs(86_400),
+                    limits: mimic_core::discovery::report::Limits {
+                        max_literals: 32,
+                        max_endpoints: 256,
+                        sample_budget: 1 << 20,
+                    },
+                    max_deployments: 50,
+                },
+                StoreMetrics::register(metrics.registry_mut()),
+            ),
+            workloads: Arc::new(WorkloadCache::new()),
+            max_report: 1 << 20,
+            max_push_endpoints: 256,
         });
         Setup {
             router: router(api),
@@ -780,13 +1104,13 @@ mod tests {
         let key = KeyPair::generate().unwrap();
         assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 200);
         assert_eq!(post_status(&s, Some("bad"), body("pay", &key)).await, 401);
-        // Budget spent: no call to the API server.
-        assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 503);
+        // Budget spent (with another token: the first one is cached): no call to the API server.
+        assert_eq!(post_status(&s, Some("ok-2"), body("pay", &key)).await, 503);
         assert_eq!(s.reviews.lock().unwrap().len(), 2);
         // A request without a token never costs a review.
         assert_eq!(post_status(&s, None, body("pay", &key)).await, 401);
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
-        assert_eq!(post_status(&s, Some("ok"), body("pay", &key)).await, 200);
+        assert_eq!(post_status(&s, Some("ok-3"), body("pay", &key)).await, 200);
         assert_eq!(s.reviews.lock().unwrap().len(), 3);
     }
 

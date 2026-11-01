@@ -894,6 +894,15 @@ Everything below except the capture tap, content decoding and the recorder threa
     (within the `:seq` field expiry, §11.1). A stored value that does not parse or fails the
     structural check is never overwritten: ERROR `stored report unreadable` (`namespace`,
     `deployment`), push `503`, read `500`.
+  - *Failures*: the connection to Valkey is shared by all writers. A Valkey reply error (`OOM`
+    under `noeviction`, a script error, `WRONGTYPE`) answers the pushes of the write `503` and
+    keeps the connection; only a connection error (I/O, timeout, closed, refused) drops it, so
+    that the next attempt makes a new one. The WARN for a failed write (`valkey command failed`,
+    `valkey connection failed`) is logged once per failure streak: for the first failed write
+    after a write that succeeded, not for each push that follows. A writer that panics logs one
+    ERROR `store writer failed` (`namespace`, `deployment`), drops its queue entry and answers
+    `503` to the pushes of its batch and to those waiting; the next push for the deployment
+    starts a new writer, so no push waits for a writer that is gone.
 - **Bounded merge** (pure, `mimic-core`): the §6 merge under the store limits
   (`MIMIC_STORE_MAX_LITERALS`, `MIMIC_STORE_MAX_ENDPOINTS` per direction,
   `MIMIC_STORE_SAMPLE_BUDGET` per deployment); counters saturate at 2^64 − 1. The merge
@@ -971,6 +980,9 @@ Everything below except the capture tap, content decoding and the recorder threa
 
   `404` for a deployment without data, `400` for a name that is not DNS-1123, `503` while
   Valkey is unavailable. No write and no delete: data leaves by expiry (§7.3).
+  A stored value that does not parse is `500` with one ERROR line per read, with the fields
+  `namespace` and `deployment`: `stored report unreadable` for `:report` (§7.3), `stored meta
+  unreadable` for `:meta` and `stored pods unreadable` for `:pods`.
 - Consumers: F6 adds the OpenAPI 3.1 document and Swagger UI of a deployment on this
   listener, built from the same report; F9 adds an authenticated read of a sidecar's own
   deployment on the sidecar API (§7.2) for egress recordings and the mode (F10); F11 reads
@@ -1027,7 +1039,7 @@ Everything below except the capture tap, content decoding and the recorder threa
 
   | Metric | Type | Labels |
   |---|---|---|
-  | `mimic_store_writes_total` | counter, store write attempts (§7.3) | `result` (`ok`, `conflict`, `error`) |
+  | `mimic_store_writes_total` | counter, store write attempts (§7.3); `refused` is an attempt the script refused for `MIMIC_STORE_MAX_DEPLOYMENTS` (`507`), which writes nothing | `result` (`ok`, `conflict`, `error`, `refused`) |
   | `mimic_store_write_duration_seconds` | histogram, one write from read to script result; buckets 0.005 … 10 as `mimic_http_request_duration_seconds` | — |
   | `mimic_store_report_bytes` | histogram, size of each report written; buckets 4Ki, 16Ki, 64Ki, 256Ki, 1Mi, 4Mi, 16Mi, 64Mi | — |
   | `mimic_store_pushes_total` | counter, pushes by outcome | `result` (`applied`, `duplicate`) |

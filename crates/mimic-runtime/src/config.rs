@@ -72,26 +72,43 @@ impl Env {
         }
     }
 
-    /// Parses a duration written `<n>s` or `<n>ms`.
+    /// Parses a duration written `<n>ms`, `<n>s`, `<n>m`, `<n>h` or `<n>d`.
     pub fn duration_or(&self, var: &str, default: Duration) -> Result<Duration, ConfigError> {
         match self.optional(var) {
             None => Ok(default),
             Some(value) => parse_duration(value).ok_or_else(|| {
-                ConfigError::invalid(var, value, "expected a duration such as 10s or 500ms")
+                ConfigError::invalid(
+                    var,
+                    value,
+                    "expected a duration such as 500ms, 10s, 1m, 2h or 30d",
+                )
             }),
         }
     }
 }
 
 fn parse_duration(value: &str) -> Option<Duration> {
-    if let Some(ms) = value.strip_suffix("ms") {
-        return ms.parse().ok().map(Duration::from_millis);
+    let (digits, unit_ms) = if let Some(ms) = value.strip_suffix("ms") {
+        (ms, 1)
+    } else {
+        // The unit is the last character, which may not be ASCII: never split inside it.
+        let unit = value.chars().next_back()?;
+        let digits = &value[..value.len() - unit.len_utf8()];
+        let unit_secs: u64 = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 3_600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        (digits, unit_secs * 1000)
+    };
+    // Digits only: `parse` alone would accept a leading `+`.
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    value
-        .strip_suffix('s')?
-        .parse()
-        .ok()
-        .map(Duration::from_secs)
+    let millis = digits.parse::<u64>().ok()?.checked_mul(unit_ms)?;
+    Some(Duration::from_millis(millis))
 }
 
 /// Variables every component reads (spec §10.1).

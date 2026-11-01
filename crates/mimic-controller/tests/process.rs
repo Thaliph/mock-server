@@ -686,6 +686,33 @@ fn tls_08_missing_seed_secret_name_exits_2() {
 }
 
 #[test]
+fn ctl_14_invalid_push_api_and_store_settings_exit_2_before_listening() {
+    for (var, value) in [
+        ("MIMIC_SIDECAR_API_RATE", "0"),
+        ("MIMIC_SIDECAR_API_MAX_REPORT", "32Mb"),
+        ("MIMIC_SIDECAR_API_BODY_BUDGET", "1Mi"),
+        ("MIMIC_STORE_TTL", "30w"),
+        ("MIMIC_STORE_TTL", "9s"),
+        ("MIMIC_STORE_MAX_ENDPOINTS", "10001"),
+        ("MIMIC_STORE_MAX_PUSH_ENDPOINTS", "513"),
+        ("MIMIC_STORE_MAX_LITERALS", "1"),
+        ("MIMIC_STORE_SAMPLE_BUDGET", "1Ki"),
+        ("MIMIC_STORE_MAX_DEPLOYMENTS", "0"),
+        ("MIMIC_STATUS_INTERVAL", "2h"),
+        ("MIMIC_STATUS_POD_WINDOW", "25h"),
+        ("MIMIC_UI_ADDR", "localhost"),
+    ] {
+        let (status, _, stderr) = run(
+            BIN,
+            &[],
+            &env(&[("MIMIC_VALKEY_URL", "redis://127.0.0.1:1"), (var, value)]),
+        );
+        assert_eq!(status.code(), Some(2), "{var}={value}");
+        assert!(stderr.contains(var), "{var}: {stderr}");
+    }
+}
+
+#[test]
 fn inj_19_invalid_listener_limits_exit_2() {
     for (var, value) in [
         ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "0"),
