@@ -5,6 +5,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use mimic_core::discovery::redact;
+
 use crate::listener::Direction;
 
 /// Longest path logged, in bytes.
@@ -86,6 +88,7 @@ pub fn truncate_path(path: &str) -> &str {
     &path[..end]
 }
 
+/// Spec §6: the path goes through the value detectors before it is cut and logged.
 pub fn exchange(e: &Exchange) {
     tracing::info!(
         target: "access",
@@ -94,7 +97,11 @@ pub fn exchange(e: &Exchange) {
         dst = %e.dst,
         authority = e.authority.as_str(),
         method = e.method.as_deref(),
-        path = e.path.as_deref().map(truncate_path),
+        path = e.path
+            .as_deref()
+            .map(redact::path)
+            .as_deref()
+            .map(truncate_path),
         status = e.status,
         grpc_status = e.grpc_status,
         upgrade = e.upgrade,

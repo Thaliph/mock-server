@@ -404,7 +404,10 @@ Everything below except the capture tap, content decoding and the recorder threa
   are one parameter (OpenAPI cannot hold `/a/{x}` and `/a/{y}`); its schema is the merge of the
   values' schemas (§6 schemas). A parameter is named after the previous literal segment, `{<literal>_id}`
   (lower case, characters other than `a-z0-9` replaced by `_`), or `{param<n>}` (n = 1-based
-  segment position) when there is no previous literal or the name is taken. gRPC paths
+  segment position) when there is no previous literal or the name is taken. The name comes from the immediately
+  preceding segment only, and only when that segment is a non-empty literal. There is one
+  template tree per (direction, port), built from paths only; methods are keys below a template
+  and do not shape the tree. gRPC paths
   (`content-type: application/grpc*`) are never templated. The result depends only on the set
   of paths seen, not on their order.
 - **Schemas** (JSON Schema 2020-12 subset, the dialect of OpenAPI 3.1): `type` (set, with
@@ -466,6 +469,9 @@ Everything below except the capture tap, content decoding and the recorder threa
   1 ms to 131 s, plus overflow), sparse.
 - **Local report.** A JSON document (`"version": 1`), serialised with sorted keys
   (`BTreeMap`), holding the endpoints above plus `pod` and the number of exchanges it covers.
+  The wire format serialises the template tree with its absorbing flags, so a merge keeps
+  absorbed positions absorbed. A merged `pod` is kept only when both reports have the same one,
+  else it is null. After a merge, `hosts` of an endpoint keeps the 16 smallest in byte order.
   Merging two reports is a pure function, commutative and associative, that unions the
   template trees (with the absorbing rule), adds counters and histograms, merges schemas,
   sketches and `hosts`, and reselects samples: the sidecar records an exchange by merging a

@@ -2,8 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use super::redact::value_rule;
 
 /// One segment of a template.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -26,7 +25,7 @@ pub fn is_param(segment: &str) -> bool {
         || (b.len() >= 8 && has_digit && b.iter().all(u8::is_ascii_hexdigit))
         || is_rfc3339(b)
         || (segment.chars().count() >= 16 && has_letter && has_digit)
-        || is_jwt(segment)
+        || value_rule(segment).is_some()
         || b.contains(&b'@')
 }
 
@@ -97,28 +96,6 @@ fn is_rfc3339(b: &[u8]) -> bool {
         }
         _ => false,
     }
-}
-
-/// Three base64url parts whose first decodes to a JSON object with `alg`.
-fn is_jwt(s: &str) -> bool {
-    let mut parts = s.split('.');
-    let (Some(head), Some(body), Some(sig), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let b64 = |p: &str| {
-        !p.is_empty()
-            && p.bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    };
-    if !(b64(head) && b64(body) && b64(sig)) {
-        return false;
-    }
-    let Ok(bytes) = URL_SAFE_NO_PAD.decode(head) else {
-        return false;
-    };
-    matches!(serde_json::from_slice::<serde_json::Value>(&bytes), Ok(serde_json::Value::Object(o)) if o.contains_key("alg"))
 }
 
 /// Splits a path (without query) into raw segments; a trailing slash is an empty last segment.
