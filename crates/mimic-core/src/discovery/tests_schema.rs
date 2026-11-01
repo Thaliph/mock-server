@@ -547,10 +547,7 @@ mod volatility {
             f["request.body/application/json/items/*/id"]["volatile"],
             json!(true)
         );
-        assert_eq!(
-            f["request.body/application/json/items/*/id"]["n"],
-            json!(10)
-        );
+        assert_eq!(f["request.body/application/json/items/*/id"]["n"], json!(5));
         assert_eq!(
             f["request.body/application/json/kind"]["volatile"],
             json!(false)

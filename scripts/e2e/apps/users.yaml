@@ -17,9 +17,8 @@ spec:
           command: [python3, /code/service.py]
           env: [{name: APP_NAME, value: users}]
           ports: [{name: api, containerPort: 8080}]
-          # An httpGet probe, not tcpSocket: the injector (mimic-core, excluded_inbound_ports) leaves the ports
-          # of tcpSocket probes out of inbound interception, so the app's own traffic would bypass the sidecar.
-          readinessProbe: {httpGet: {path: /users/0, port: api}, periodSeconds: 1}
+          # A tcpSocket probe on the API port: the injector rewrites it, so the port stays intercepted.
+          readinessProbe: {tcpSocket: {port: api}, periodSeconds: 1}
           volumeMounts: [{name: code, mountPath: /code, readOnly: true}]
       volumes:
         - {name: code, configMap: {name: apps-code}}

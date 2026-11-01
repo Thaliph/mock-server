@@ -29,6 +29,13 @@ allow = [
 multiple-versions = "allow"
 wildcards = "deny"
 allow-wildcard-paths = true
+# #269: the Brotli crates are distrusted, with no advisory needed. The check fails if one comes back,
+# directly or transitively (none is in the lock today; the brotli test vector is plain bytes).
+deny = [
+  { crate = "brotli", reason = "distrusted: no Brotli decoder or encoder is linked (#269)" },
+  { crate = "brotli-decompressor", reason = "distrusted: no Brotli decoder or encoder is linked (#269)" },
+  { crate = "brotli-sys", reason = "distrusted: no Brotli decoder or encoder is linked (#269)" },
+]
 
 [sources]
 unknown-registry = "deny"

@@ -12,6 +12,7 @@ mod redactions;
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -113,8 +114,43 @@ async fn serve(
             .to_json()
     })
     .await;
-    match json {
-        Ok(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    answer(json, &SERIALISATION_LOGGED)
+}
+
+/// Set once the first serialisation failure was logged.
+static SERIALISATION_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// The response for a serialisation. A failure answers 500 and is logged once (`logged`),
+/// with no part of the report in the line.
+fn answer(
+    json: Result<Result<String, serde_json::Error>, tokio::task::JoinError>,
+    logged: &AtomicBool,
+) -> Response {
+    let error = match json {
+        Ok(Ok(json)) => {
+            return ([(header::CONTENT_TYPE, "application/json")], json).into_response();
+        }
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    if !logged.swap(true, Ordering::Relaxed) {
+        tracing::error!(target: "discovery", error, "discovery serialisation failed");
+    }
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dsc_14_a_serialisation_failure_answers_500_and_is_logged_once() {
+        let logged = AtomicBool::new(false);
+        let failure = serde_json::from_str::<()>("x").unwrap_err();
+        let response = answer(Ok(Err(failure)), &logged);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(logged.load(Ordering::Relaxed));
+        let response = answer(Ok(Ok("{}".into())), &logged);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

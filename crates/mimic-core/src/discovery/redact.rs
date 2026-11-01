@@ -1,10 +1,12 @@
 //! Redaction (spec §6), by name and by value. The marker is a constant: no hash of a secret is
 //! ever kept, so two secrets cannot be told apart.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use percent_encoding::percent_decode_str;
 use serde_json::Value;
 
 /// What a redacted value becomes.
@@ -13,7 +15,10 @@ pub const MARKER: &str = "<redacted>";
 /// Deepest JSON nesting walked; anything below is redacted as a whole.
 const MAX_DEPTH: usize = 128;
 
-/// Names (normalised) that are redacted when they appear anywhere in a name.
+/// Built-in names that only match a whole token (a run of tokens, joined).
+const WHOLE_TOKEN: &[&str] = &["auth", "pan", "iban", "ssn", "cvv", "cvc"];
+
+/// Names (normalised) that are redacted when a run of tokens of a name spells one.
 const NAMES: &[&str] = &[
     "authorization",
     "proxyauthorization",
@@ -195,15 +200,38 @@ fn has_userinfo_password(s: &str) -> bool {
     matches!(userinfo.split_once(':'), Some((_, password)) if !password.is_empty())
 }
 
+/// The value detector that catches a path segment, which is percent-decoded first (the
+/// segment itself is kept as received).
+pub fn segment_rule(s: &str) -> Option<Rule> {
+    if let Some(rule) = value_rule(s) {
+        return Some(rule);
+    }
+    match percent_decode_str(s).decode_utf8_lossy() {
+        Cow::Owned(decoded) => value_rule(&decoded),
+        Cow::Borrowed(_) => None,
+    }
+}
+
+/// A query value as the detectors see it: `+` is a space, percent escapes are decoded.
+fn decode_query(s: &str) -> String {
+    percent_decode_str(&s.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 /// A path with the value detectors applied segment by segment; other segments are unchanged.
 pub fn path(path: &str) -> String {
+    path_with(path, &mut Vec::new())
+}
+
+fn path_with(path: &str, rules: &mut Vec<Rule>) -> String {
     path.split('/')
-        .map(|seg| {
-            if value_rule(seg).is_some() {
+        .map(|seg| match segment_rule(seg) {
+            Some(rule) => {
+                rules.push(rule);
                 MARKER
-            } else {
-                seg
             }
+            None => seg,
         })
         .collect::<Vec<_>>()
         .join("/")
@@ -217,51 +245,145 @@ fn normalise(name: &str) -> String {
         .collect()
 }
 
+/// The lower-case tokens of a name: it is cut at every character that is not a letter or a
+/// digit, between a letter and a digit, at a lower-to-upper case change (`refreshToken`) and
+/// before the last capital of a run followed by a lower-case letter (`APIKey`).
+fn tokens(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            flush(&mut out, &mut current);
+            continue;
+        }
+        let boundary = i
+            .checked_sub(1)
+            .and_then(|j| chars.get(j))
+            .is_some_and(|&p| {
+                p.is_alphanumeric()
+                    && (p.is_numeric() != c.is_numeric()
+                        || (p.is_lowercase() && c.is_uppercase())
+                        || (p.is_uppercase()
+                            && c.is_uppercase()
+                            && chars.get(i + 1).is_some_and(|n| n.is_lowercase())))
+            });
+        if boundary {
+            flush(&mut out, &mut current);
+        }
+        current.extend(c.to_lowercase());
+    }
+    flush(&mut out, &mut current);
+    out
+}
+
+fn flush(out: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        out.push(std::mem::take(current));
+    }
+}
+
 /// Redaction by name (built-in plus `MIMIC_DISCOVERY_REDACT_NAMES`) and by value.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Redactor {
-    extra: BTreeSet<String>,
+    /// Built-in and extra names, normalised.
+    names: BTreeSet<String>,
+    /// Longest of `names`, in bytes.
+    max_len: usize,
+}
+
+impl Default for Redactor {
+    fn default() -> Self {
+        Self::new([])
+    }
 }
 
 impl Redactor {
     pub fn new<'a>(extra: impl IntoIterator<Item = &'a str>) -> Self {
-        Self {
-            // A name that normalises to nothing would match every name.
-            extra: extra
-                .into_iter()
-                .map(normalise)
-                .filter(|n| !n.is_empty())
-                .collect(),
-        }
+        // A name that normalises to nothing would match every name.
+        let names: BTreeSet<String> = NAMES
+            .iter()
+            .map(|n| (*n).to_string())
+            .chain(extra.into_iter().map(normalise).filter(|n| !n.is_empty()))
+            .collect();
+        let max_len = names.iter().map(String::len).max().unwrap_or(0);
+        Self { names, max_len }
     }
 
-    /// True when a header name, query key, form field or JSON key is redacted by name.
+    /// True when a header name, query key, form field or JSON key is redacted by name: a run
+    /// of its tokens, joined, is a listed name, or a listed name followed by `s`.
     pub fn name_matches(&self, name: &str) -> bool {
-        let n = normalise(name);
-        NAMES.iter().any(|b| n.contains(b)) || self.extra.iter().any(|e| n.contains(e.as_str()))
+        let tokens = tokens(name);
+        // A built-in name glued into a token (`JSESSIONID`, `csrftoken`), except the short
+        // ones, which would match words like `company` or `author`.
+        let glued = tokens.iter().any(|t| {
+            NAMES
+                .iter()
+                .filter(|n| !WHOLE_TOKEN.contains(n))
+                .any(|n| t.contains(n))
+        });
+        glued
+            || (0..tokens.len()).any(|start| {
+                let mut joined = String::new();
+                for token in &tokens[start..] {
+                    joined.push_str(token);
+                    if joined.len() > self.max_len + 1 {
+                        return false;
+                    }
+                    if self.names.contains(&joined)
+                        || joined
+                            .strip_suffix('s')
+                            .is_some_and(|plural| self.names.contains(plural))
+                    {
+                        return true;
+                    }
+                }
+                false
+            })
     }
 
     /// A header value: `Authorization` keeps its scheme, `Cookie` and `Set-Cookie` keep the
     /// cookie names (and `Set-Cookie` its attributes).
     pub fn header(&self, name: &str, value: &str) -> String {
+        self.header_with(name, value, &mut Vec::new())
+    }
+
+    /// The rules that redact `value` of header `name`, in the order they apply: one `name`
+    /// for a sensitive header, else the value detector, else one per redacted part of a URL
+    /// in the value (path segments, then query, then fragment).
+    pub fn header_rules(&self, name: &str, value: &str) -> Vec<Rule> {
+        let mut rules = Vec::new();
+        self.header_with(name, value, &mut rules);
+        rules
+    }
+
+    fn header_with(&self, name: &str, value: &str, rules: &mut Vec<Rule>) -> String {
         match normalise(name).as_str() {
-            "authorization" | "proxyauthorization" => match value.split_once(' ') {
-                Some((scheme, _))
-                    if !scheme.is_empty() && scheme.bytes().all(|c| c.is_ascii_alphanumeric()) =>
-                {
-                    format!("{scheme} {MARKER}")
+            "authorization" | "proxyauthorization" => {
+                rules.push(Rule::Name);
+                match value.split_once(' ') {
+                    Some((scheme, _))
+                        if !scheme.is_empty()
+                            && scheme.bytes().all(|c| c.is_ascii_alphanumeric()) =>
+                    {
+                        format!("{scheme} {MARKER}")
+                    }
+                    _ => MARKER.to_string(),
                 }
-                _ => MARKER.to_string(),
-            },
-            "cookie" => value
-                .split(';')
-                .map(|pair| match pair.trim().split_once('=') {
-                    Some((n, _)) => format!("{n}={MARKER}"),
-                    None => MARKER.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("; "),
+            }
+            "cookie" => {
+                rules.push(Rule::Name);
+                value
+                    .split(';')
+                    .map(|pair| match pair.trim().split_once('=') {
+                        Some((n, _)) => format!("{n}={MARKER}"),
+                        None => MARKER.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }
             "setcookie" => {
+                rules.push(Rule::Name);
                 let (pair, attrs) = match value.split_once(';') {
                     Some((p, a)) => (p, Some(a)),
                     None => (value, None),
@@ -276,22 +398,29 @@ impl Redactor {
                 }
             }
             _ => {
-                let v = self.field(name, value);
-                if v == MARKER { v } else { self.urls(&v) }
+                if self.name_matches(name) {
+                    rules.push(Rule::Name);
+                    MARKER.to_string()
+                } else if let Some(rule) = value_rule(value) {
+                    rules.push(rule);
+                    MARKER.to_string()
+                } else {
+                    self.urls(value, rules)
+                }
             }
         }
     }
 
     /// URLs inside a header value (`Location`, `Referer`, `Link: <u>; rel=next`, `Refresh`,
     /// ...): each one is redacted like a path plus query. Other text is unchanged.
-    fn urls(&self, value: &str) -> String {
+    fn urls(&self, value: &str, rules: &mut Vec<Rule>) -> String {
         const DELIMS: &[char] = &[' ', ';', ',', '<', '>', '"', '\''];
         let mut out = String::with_capacity(value.len());
         let mut rest = value;
         while !rest.is_empty() {
             let end = rest.find(DELIMS).unwrap_or(rest.len());
             let (token, tail) = rest.split_at(end);
-            out.push_str(&self.url_token(token));
+            out.push_str(&self.url_token(token, rules));
             let delim_end = tail.find(|c| !DELIMS.contains(&c)).unwrap_or(tail.len());
             out.push_str(&tail[..delim_end]);
             rest = &tail[delim_end..];
@@ -299,12 +428,13 @@ impl Redactor {
         out
     }
 
-    fn url_token(&self, token: &str) -> String {
+    /// An absolute URL, or a relative reference (a token with a `/`, a `?` or a `#`).
+    fn url_token(&self, token: &str, rules: &mut Vec<Rule>) -> String {
         let start = match token.find("://") {
             Some(i) => token[..i]
                 .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
                 .map_or(0, |j| j + 1),
-            None if token.starts_with('/') => 0,
+            None if token.contains(['/', '?', '#']) => 0,
             None => return token.to_string(),
         };
         let (prefix, url) = token.split_at(start);
@@ -324,25 +454,44 @@ impl Redactor {
             },
             None => (String::new(), base),
         };
-        let mut out = format!("{prefix}{origin}{}", path(p));
+        let mut out = format!("{prefix}{origin}{}", path_with(p, rules));
         if let Some(q) = query {
             out.push('?');
-            out.push_str(&self.pairs(q));
+            out.push_str(&self.pairs(q, rules));
         }
         if let Some(f) = frag {
             out.push('#');
-            out.push_str(&self.pairs(f));
+            out.push_str(&self.pairs(f, rules));
         }
         out
     }
 
-    /// `k=v&k=v` with each pair through `field`; a bare item through the value detectors.
-    fn pairs(&self, s: &str) -> String {
+    /// `k=v&k=v` with each pair redacted by name or by (decoded) value; the pairs that are
+    /// kept stay as received. A bare item goes through the value detectors, then the names.
+    fn pairs(&self, s: &str, rules: &mut Vec<Rule>) -> String {
         s.split('&')
-            .map(|pair| match pair.split_once('=') {
-                Some((k, v)) => format!("{k}={}", self.field(k, v)),
-                None if value_rule(pair).is_some() || self.name_matches(pair) => MARKER.to_string(),
-                None => pair.to_string(),
+            .map(|pair| {
+                let (key, value) = match pair.split_once('=') {
+                    Some((k, v)) => (k, Some(v)),
+                    None => (pair, None),
+                };
+                let decoded_key = decode_query(key);
+                let by_name = || self.name_matches(&decoded_key).then_some(Rule::Name);
+                let rule = match value {
+                    Some(v) => by_name().or_else(|| value_rule(&decode_query(v))),
+                    None => value_rule(&decoded_key).or_else(by_name),
+                };
+                match (rule, value) {
+                    (Some(rule), Some(_)) => {
+                        rules.push(rule);
+                        format!("{key}={MARKER}")
+                    }
+                    (Some(rule), None) => {
+                        rules.push(rule);
+                        MARKER.to_string()
+                    }
+                    (None, _) => pair.to_string(),
+                }
             })
             .collect::<Vec<_>>()
             .join("&")

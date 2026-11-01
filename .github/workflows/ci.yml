@@ -3,10 +3,19 @@ name: ci
 # Dependent stages (spec FND-10):
 #   lint ──▶ test ──▶ image ──▶ e2e
 #   chart ─────────────────────▲
-#   security (cargo deny, zizmor)
+#   security (cargo deny, zizmor); supply chain (cooldown, dependency-review, gitleaks, trivy-config, codeql)
 #   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; skipped unless a PR touches the codec)
 #           └─▶ fuzz-discovery (discovery recorder, spec DSC-23; same rule for its own paths)
 # `ci-ok` sums them up; it is the only required check on main.
+#
+# Actions allowed in the repository settings (#273; Settings → Actions → General, or
+# `gh api repos/Thaliph/mock-server/actions/permissions/selected-actions`). Keep this list and the
+# setting in sync: every `uses:` here, and every action nested in one of them, must be allowed.
+#   GitHub-owned (actions/*, github/*): allowed by the setting itself.
+#   docker/*, aquasecurity/trivy-action, aquasecurity/setup-trivy (nested in trivy-action),
+#   sigstore/cosign-installer, dtolnay/rust-toolchain, Swatinem/rust-cache,
+#   EmbarkStudios/cargo-deny-action, zizmorcore/zizmor-action, helm/kind-action,
+#   taiki-e/install-action, gitleaks/gitleaks-action, ossf/scorecard-action (scorecard.yml).
 
 on:
   pull_request:
@@ -73,6 +82,10 @@ jobs:
           persist-credentials: false
       - run: helm lint --strict deploy/helm/mimic
       - run: helm template mimic deploy/helm/mimic -n mimic-system > /dev/null
+      # #271: the chart as the release pins it renders both mimic images by digest.
+      - run: scripts/check-release-chart.sh
+      # #273: the Valkey image of values.yaml and the kind node image match images/Dockerfile.
+      - run: scripts/check-pins.sh
 
   security:
     runs-on: ubuntu-24.04
@@ -87,6 +100,119 @@ jobs:
       - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
         with:
           advanced-security: false
+
+  # #269 (spec FND-10): the supply-chain checks, beyond the advisories of cargo deny. All of them run
+  # on every event, so `ci-ok` needs them to succeed (none is skipped).
+  cooldown:
+    # A crate version that this change adds or bumps in a lockfile must be 14 days old on crates.io,
+    # unless scripts/cooldown-allowlist.toml lists it with a reason. A pull request is compared with
+    # its base, a push with the previous tip; a schedule changes nothing to compare.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the base commit must be in the history to be compared with
+          persist-credentials: false
+      - name: Crate cooldown
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request) base=$PR_BASE ;;
+            push) base=$PUSH_BEFORE ;;
+            *) echo "nothing to compare on $EVENT"; exit 0 ;;
+          esac
+          if [[ $base =~ ^0+$ ]]; then
+            echo "no previous tip on this push"
+            exit 0
+          fi
+          python3 scripts/check-cooldown.py "$base" Cargo.lock fuzz/Cargo.lock
+
+  dependency-review:
+    # Adding a crate or an action with a known vulnerability, or a licence outside the policy of
+    # deny.toml, fails a pull request; the run summary lists the dependencies that it adds.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          allow-licenses: Apache-2.0, Apache-2.0 WITH LLVM-exception, MIT, MIT-0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, 0BSD, BSL-1.0, CC0-1.0, Unicode-3.0, CDLA-Permissive-2.0
+
+  gitleaks:
+    # No secret in the commits under review (the pull request's, or the commits of a push).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # gitleaks scans the history under review
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  trivy-config:
+    # Misconfigurations of the rendered chart and of the Dockerfile fail on HIGH and CRITICAL.
+    # Accepted findings are listed, each with its reason, in .trivyignore.yaml.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Render the chart
+        run: |
+          mkdir -p rendered
+          helm template mimic deploy/helm/mimic -n mimic-system > rendered/chart.yaml
+      - name: Trivy config, rendered chart
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: rendered
+          trivyignores: .trivyignore.yaml
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+      - name: Trivy config, Dockerfile
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: Dockerfile
+          trivyignores: .trivyignore.yaml
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  codeql:
+    # CodeQL for the Rust code and the GitHub Actions workflows; findings go to code scanning.
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}
 
   image:
     needs: test
@@ -124,6 +250,15 @@ jobs:
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.INIT_IMAGE }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      # #273: the Valkey image the chart deploys (it stores every recorded sample) is scanned too.
+      - name: Valkey image reference (images/Dockerfile)
+        run: echo "VALKEY_IMAGE=$(scripts/pinned-image.sh valkey)" >> "$GITHUB_ENV"
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.VALKEY_IMAGE }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
@@ -307,7 +442,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, chart, security, image, e2e, changes, fuzz, fuzz-discovery]
+    needs: [lint, test, chart, security, cooldown, dependency-review, gitleaks, trivy-config, codeql, image, e2e, changes, fuzz, fuzz-discovery]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     env:
@@ -315,6 +450,11 @@ jobs:
       TEST: ${{ needs.test.result }}
       CHART: ${{ needs.chart.result }}
       SECURITY: ${{ needs.security.result }}
+      COOLDOWN: ${{ needs.cooldown.result }}
+      DEPENDENCY_REVIEW: ${{ needs.dependency-review.result }}
+      GITLEAKS: ${{ needs.gitleaks.result }}
+      TRIVY_CONFIG: ${{ needs.trivy-config.result }}
+      CODEQL: ${{ needs.codeql.result }}
       IMAGE: ${{ needs.image.result }}
       E2E: ${{ needs.e2e.result }}
       CHANGES: ${{ needs.changes.result }}
@@ -325,8 +465,8 @@ jobs:
     steps:
       - name: All stages passed
         run: |
-          echo "lint=$LINT test=$TEST chart=$CHART security=$SECURITY image=$IMAGE e2e=$E2E changes=$CHANGES fuzz=$FUZZ codec=$CODEC fuzz-discovery=$FUZZ_DISCOVERY discovery=$DISCOVERY"
-          for r in "$LINT" "$TEST" "$CHART" "$SECURITY" "$IMAGE" "$E2E" "$CHANGES"; do
+          echo "lint=$LINT test=$TEST chart=$CHART security=$SECURITY cooldown=$COOLDOWN dependency-review=$DEPENDENCY_REVIEW gitleaks=$GITLEAKS trivy-config=$TRIVY_CONFIG codeql=$CODEQL image=$IMAGE e2e=$E2E changes=$CHANGES fuzz=$FUZZ codec=$CODEC fuzz-discovery=$FUZZ_DISCOVERY discovery=$DISCOVERY"
+          for r in "$LINT" "$TEST" "$CHART" "$SECURITY" "$COOLDOWN" "$DEPENDENCY_REVIEW" "$GITLEAKS" "$TRIVY_CONFIG" "$CODEQL" "$IMAGE" "$E2E" "$CHANGES"; do
             [ "$r" = success ] || exit 1
           done
           # fuzz may be skipped by its path filter; it may not be skipped when the codec changed.

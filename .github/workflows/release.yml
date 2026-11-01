@@ -1,9 +1,9 @@
 name: release
 
 # On a v* tag: multi-arch images (mimic and mimic-init), native amd64 and arm64 runners, each
-# signed with cosign keyless, with SBOM and provenance; then the Helm chart, pinned to the mimic
-# image digest, pushed as an OCI artifact and signed (spec §10, FND-10, INJ-17). Everything lands
-# on ghcr.io, free for a public repository.
+# signed with cosign keyless, with SBOM and provenance; then the Helm chart, pinned to the digests of
+# mimic and mimic-init (#271), pushed as an OCI artifact and signed (spec §10, FND-10, INJ-17). A tag
+# that is not on main is refused first (#272). Everything lands on ghcr.io, free for a public repository.
 
 on:
   push:
@@ -18,7 +18,28 @@ env:
   CHARTS: ghcr.io/thaliph/charts
 
 jobs:
+  # #272: a release is cut from main only. The tagged commit must be an ancestor of main (or main
+  # itself); a tag on a branch or on an unreviewed commit fails here before anything is built.
+  on-main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Tagged commit is on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Comparing main with the tagged commit: "behind" means the commit is an ancestor of
+          # main, "identical" means it is main.
+          status=$(gh api "repos/$REPO/compare/main...$SHA" --jq .status)
+          case "$status" in
+            behind|identical) echo "$SHA is on main ($status)" ;;
+            *) echo "refusing to release $SHA: not on main (compare status: $status)"; exit 1 ;;
+          esac
+
   build:
+    needs: on-main
     strategy:
       matrix:
         include:
@@ -123,16 +144,23 @@ jobs:
           }
           index "$REPO" app app_digest
           index "$INIT_REPO" init init_digest
-      - name: Helm chart, pinned to the image digest, signed
+      - name: Helm chart, pinned to both image digests, signed
         env:
           TAG: ${{ github.ref_name }}
           DIGEST: ${{ steps.index.outputs.app_digest }}
+          INIT_DIGEST: ${{ steps.index.outputs.init_digest }}
           GH_ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version=${TAG#v}
-          sed -i "s|^  digest: \"\"|  digest: \"$DIGEST\"|" deploy/helm/mimic/values.yaml
+          # #271: image.digest and inject.initImage.digest (yq, key paths matched exactly; fails if a
+          # digest is not sha256:<64 hex> or does not land).
+          scripts/pin-chart.sh deploy/helm/mimic/values.yaml "$DIGEST" "$INIT_DIGEST"
           helm package deploy/helm/mimic --version "$version" --app-version "$version" -d dist
+          # The packaged values carry both digests (what the signed chart will deploy).
+          tar -xzOf "dist/mimic-$version.tgz" mimic/values.yaml |
+            DIGEST="$DIGEST" INIT_DIGEST="$INIT_DIGEST" \
+            yq -e '.image.digest == strenv(DIGEST) and .inject.initImage.digest == strenv(INIT_DIGEST)' > /dev/null
           echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
           out=$(helm push "dist/mimic-$version.tgz" "oci://$CHARTS" 2>&1)
           echo "$out"

@@ -98,7 +98,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let [a, b] = reports;
     let merged = merge(a, b, &LIMITS);
-    let json = merged.to_json();
+    let json = merged.to_json().expect("a report serialises");
     assert!(
         !json.contains(CANARY),
         "a canary under a listed name leaked"

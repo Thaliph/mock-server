@@ -30,12 +30,14 @@ pub struct Histogram {
 
 impl Histogram {
     pub fn observe(&mut self, ms: u64) {
-        *self.buckets.entry(bucket_index(ms)).or_default() += 1;
+        let n = self.buckets.entry(bucket_index(ms)).or_default();
+        *n = n.saturating_add(1);
     }
 
     pub fn merge(&mut self, other: &Histogram) {
         for (bucket, n) in &other.buckets {
-            *self.buckets.entry(*bucket).or_default() += n;
+            let mine = self.buckets.entry(*bucket).or_default();
+            *mine = mine.saturating_add(*n);
         }
     }
 

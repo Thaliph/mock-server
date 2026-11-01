@@ -77,8 +77,19 @@ pub struct Volatility {
 }
 
 impl Volatility {
-    /// One observation. A redacted field hashes the constant marker, never the value.
+    /// The first observation of a field in an exchange. A redacted field hashes the constant
+    /// marker, never the value.
     pub fn observe(&mut self, field: &str, value: &str, redacted: bool) {
+        self.add(field, value, redacted, true);
+    }
+
+    /// Another value of a field already observed in the same exchange (an array item, a
+    /// repeated header): it goes to the sketch, `n` does not change.
+    pub fn observe_again(&mut self, field: &str, value: &str, redacted: bool) {
+        self.add(field, value, redacted, false);
+    }
+
+    fn add(&mut self, field: &str, value: &str, redacted: bool, first: bool) {
         if !self.fields.contains_key(field) {
             if self.fields.len() >= MAX_FIELDS {
                 match self.fields.last_key_value() {
@@ -91,7 +102,9 @@ impl Volatility {
             self.fields.insert(field.to_string(), Field::default());
         }
         if let Some(f) = self.fields.get_mut(field) {
-            f.n += 1;
+            if first {
+                f.n = f.n.saturating_add(1);
+            }
             f.redacted |= redacted;
             f.sketch.insert(if redacted { MARKER } else { value });
         }
@@ -104,7 +117,7 @@ impl Volatility {
                     self.fields.insert(
                         name,
                         Field {
-                            n: mine.n + f.n,
+                            n: mine.n.saturating_add(f.n),
                             redacted: mine.redacted || f.redacted,
                             sketch: mine.sketch.merge(f.sketch),
                         },

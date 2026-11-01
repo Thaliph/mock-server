@@ -196,7 +196,7 @@ mod samples {
         reversed.reverse();
         let backward = report(&limits(), &reversed);
         assert_eq!(sample_hashes(&forward), sample_hashes(&backward));
-        assert_eq!(forward.to_json(), backward.to_json());
+        assert_eq!(forward.to_json().unwrap(), backward.to_json().unwrap());
 
         let one = Owned::new("/a", 200).query("x=1");
         let twice = report(&limits(), &[one.clone(), one]);
@@ -221,7 +221,7 @@ mod samples {
         opaque.resp_body = Some(b"OPAQUE-BODY-TEXT".to_vec());
 
         let r = report(&limits(), &[big, opaque]);
-        let json = r.to_json();
+        let json = r.to_json().unwrap();
         assert!(!json.contains("zzzzzzzz"), "big body kept");
         assert!(!json.contains("OPAQUE-BODY-TEXT"), "opaque body kept");
         // The size and the media type are.
@@ -264,7 +264,10 @@ mod samples {
         let e = &r.endpoints()[0];
         assert_eq!(e.stats.samples().len(), 1);
         assert_eq!(e.stats.statuses.get(&201), Some(&1));
-        assert!(r.to_json().contains("extra"), "schema did not change");
+        assert!(
+            r.to_json().unwrap().contains("extra"),
+            "schema did not change"
+        );
         assert!(r.sample_bytes() <= l.sample_budget);
     }
 
@@ -277,7 +280,7 @@ mod samples {
             &limits(),
             &[o.json_request(&json!({"token": "t0k3n", "n": 1}))],
         );
-        let json = r.to_json();
+        let json = r.to_json().unwrap();
         assert!(!json.contains("hunter2") && !json.contains("t0k3n"));
         assert!(!json.contains("abc.def"));
         assert!(json.contains("<redacted>") && json.contains("page"));
@@ -456,13 +459,13 @@ mod bounds {
             }
             prop_assert!(r.endpoints().len() <= l.max_endpoints);
             prop_assert!(r.sample_bytes() <= l.sample_budget);
-            let retained = r.to_json().len() - r.sample_bytes();
+            let retained = r.to_json().unwrap().len() - r.sample_bytes();
             prop_assert!(
                 retained <= Report::state_bound(&l),
                 "{retained} > {}",
                 Report::state_bound(&l)
             );
-            prop_assert_eq!(Report::from_json(&r.to_json()).unwrap(), r);
+            prop_assert_eq!(Report::from_json(&r.to_json().unwrap()).unwrap(), r);
         }
     }
 }
@@ -516,9 +519,9 @@ mod algebra {
             );
             let left = merge(merge(x.clone(), y.clone(), &l), z.clone(), &l);
             let right = merge(x.clone(), merge(y.clone(), z.clone(), &l), &l);
-            prop_assert_eq!(left.to_json(), whole.to_json());
-            prop_assert_eq!(right.to_json(), whole.to_json());
-            prop_assert_eq!(merge(z.clone(), x.clone(), &l).to_json(), merge(x, z, &l).to_json());
+            prop_assert_eq!(left.to_json().unwrap(), whole.to_json().unwrap());
+            prop_assert_eq!(right.to_json().unwrap(), whole.to_json().unwrap());
+            prop_assert_eq!(merge(z.clone(), x.clone(), &l).to_json().unwrap(), merge(x, z, &l).to_json().unwrap());
         }
     }
 }
@@ -644,7 +647,7 @@ mod no_leak {
             o.record(&mut other, &limits(), &red);
             let merged = merge(r, other, &limits());
             let hash = xxh3_64(canary.as_bytes());
-            let json = merged.to_json();
+            let json = merged.to_json().unwrap();
             prop_assert!(!json.contains(&canary), "canary in {json}");
             for needle in [
                 hash.to_string(),
