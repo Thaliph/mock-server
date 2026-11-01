@@ -12,6 +12,8 @@
 import http.server
 import json
 import os
+import signal
+import sys
 import urllib.error
 import urllib.request
 
@@ -83,4 +85,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # PID 1 ignores SIGTERM unless it has a handler; without one the pod's whole grace period goes by
+    # before the sidecar is stopped, and it is left only the kubelet's minimum to ship its last report.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
