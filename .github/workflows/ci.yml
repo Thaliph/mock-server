@@ -75,6 +75,8 @@ jobs:
       - run: helm template mimic deploy/helm/mimic -n mimic-system > /dev/null
       # #271: the chart as the release pins it renders both mimic images by digest.
       - run: scripts/check-release-chart.sh
+      # #273: the Valkey image of values.yaml and the kind node image match images/Dockerfile.
+      - run: scripts/check-pins.sh
 
   security:
     runs-on: ubuntu-24.04
@@ -126,6 +128,15 @@ jobs:
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.INIT_IMAGE }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      # #273: the Valkey image the chart deploys (it stores every recorded sample) is scanned too.
+      - name: Valkey image reference (images/Dockerfile)
+        run: echo "VALKEY_IMAGE=$(scripts/pinned-image.sh valkey)" >> "$GITHUB_ENV"
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.VALKEY_IMAGE }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
