@@ -264,8 +264,9 @@ Accepted limits of the proxy:
   HTTP/1.1 for it.
 - Inbound HTTPS, and outbound HTTPS that §5 passes through, are seen at connection level only
   (SNI, bytes, duration).
-- Until F4, the path in access logs is not redacted: a secret placed in a path segment is
-  logged.
+- From F4 the access-log `path` goes through the value detectors of §6 redaction (a JWT or a
+  card number in a path segment is logged as `<redacted>`); a secret that no detector
+  recognises (an opaque random token without a known prefix) is still logged.
 - A connection on which neither side ever sends a byte stays in detection (it costs one task
   and two sockets, as an idle tunnel does).
 - A client-first, non-HTTP protocol whose first bytes are only a token that could start an
@@ -371,23 +372,154 @@ client or the destination sees, the connection is **passed through** untouched i
 
 ## 6. Discovery
 
-- An *endpoint* is identified by direction, authority (host), method and path template
-  (`/users/{id}`). Query keys, header names and body schemas are inferred and merged.
-- Per endpoint, the sidecar keeps: request/response counters by status, a latency histogram,
-  and up to **20 samples** (each distinct status code and each distinct response shape first),
-  bodies capped at **256 KiB**. Samples expire after **30 days** in Valkey.
-- Volatile fields (values that change on every call: idempotency keys, timestamps, ids) are
-  detected and marked; mock matching ignores them.
-- **Redaction** happens in the sidecar, before anything leaves process memory: secrets in
-  headers, query, path segments and bodies are replaced by stable markers.
-- Under overload the sidecar stops recording (and counts the dropped exchanges) but keeps
-  forwarding traffic.
+The sidecar turns the HTTP exchanges it relays into a description of the endpoints, keeps that
+description in a bounded in-memory **local report**, and (from F5) ships it to the controller,
+which merges the reports of every pod of the deployment in Valkey. F4 records **inbound**
+exchanges (the endpoints the deployment exposes); F7 runs the same engine on outbound ones.
+Everything below except the capture tap, content decoding and the recorder thread is pure logic in `mimic-core`
+(`discovery` module): parsing, templating, inference, redaction, sampling, merging.
+
+- **What is recorded.** Every inbound HTTP/1 and `h2` exchange that got a response head, except
+  probe requests (§4, they never reach the inbound listener), `unframed` and `rejected`
+  exchanges, and exchanges whose path is over 2048 bytes or 32 segments (`invalid`). An
+  exchange answered `404` or `405` creates no endpoint: it is counted on the endpoint whose
+  template already matches it, else dropped as `not_found` (scanners must not fill the
+  report). Inbound HTTPS is not decrypted (§5), so it is not discovered. An upgraded exchange
+  (`101`, WebSocket) is recorded without bodies.
+- **Endpoint key**: `direction`, `port`, `method`, path template. For inbound, `port` is the
+  original destination port (the app's listening port), not the `Host`: clients reach the
+  same API through the Service name, its FQDN or the pod IP. The normalised authorities seen
+  (§4.1) are kept per endpoint as a set of at most 16 (`hosts`, first 16 in byte order). F7
+  keys outbound endpoints by authority instead of port.
+- **Path templating.** The path (without query) is split on `/`; segments are compared as
+  raw bytes (no percent-decoding, case kept; an empty last segment, i.e. a trailing slash, is
+  a segment). Per position, a segment is a **parameter** when its value is id-like: digits only;
+  a UUID (8-4-4-4-12 hex, any case); a ULID (26 Crockford base32); hex of at least 8 characters
+  with a digit; an RFC 3339 date or date-time; at least 16 characters with a letter and a
+  digit; a value caught by a redaction detector (below); or anything containing `@`. Other
+  segments are literals. Templates form a tree: below one node, at most
+  `MIMIC_DISCOVERY_MAX_LITERALS` distinct literal children are kept; when one more appears the
+  node becomes **absorbing**: its literals and its parameter child merge into one parameter, and
+  every later segment at that position is that parameter. All parameter kinds at one position
+  are one parameter (OpenAPI cannot hold `/a/{x}` and `/a/{y}`); its schema is the merge of the
+  values' schemas (§6 schemas). A parameter is named after the previous literal segment, `{<literal>_id}`
+  (lower case, characters other than `a-z0-9` replaced by `_`), or `{param<n>}` (n = 1-based
+  segment position) when there is no previous literal or the name is taken. The name comes from the immediately
+  preceding segment only, and only when that segment is a non-empty literal. There is one
+  template tree per (direction, port), built from paths only; methods are keys below a template
+  and do not shape the tree. gRPC paths
+  (`content-type: application/grpc*`) are never templated, but they are redacted like any
+  path (a client chooses its `content-type`). The result depends only on the set
+  of paths seen, not on their order.
+- **Schemas** (JSON Schema 2020-12 subset, the dialect of OpenAPI 3.1): `type` (set, with
+  `null`; `integer` when every number seen is integral), `format` when every string value has
+  it (`uuid`, `date-time`, `date`, `email`, `uri`, `ipv4`, `ipv6`), `properties`, `required`
+  (present in every object seen), `items` (merged over the first 256 items of each array),
+  `additionalProperties`. An object with more than 128 distinct keys becomes a map
+  (`additionalProperties` = merge of the values, no `properties`); deeper than 16 levels a
+  value is `{}`. Inferred per endpoint: **path parameters**; **query** keys (percent-decoded,
+  value schema, `array` when repeated, `required`; at most 64 keys, the first in byte order);
+  request and response **headers** (lower-case names, value schema, `required`; at most 64, the
+  first in byte order; hop-by-hop and framing headers `connection`, `keep-alive`,
+  `transfer-encoding`, `te`, `upgrade`, `content-length`, `host` and pseudo-headers are
+  skipped); request and response **bodies** per media type (`content-type` without
+  parameters): JSON (`application/json`, `*/*+json`) and `application/x-www-form-urlencoded`
+  get a schema; any other type is **opaque**: media type and size only. Bodies are decoded
+  from `content-encoding` `gzip`, `deflate` and `br` before inference; another encoding makes
+  the body opaque. A body over **256 KiB** (encoded, or decoded) is not parsed (`too_large`):
+  it contributes its media type and size only. Schemas are inferred from the original values
+  in memory; they hold types and formats, never values.
+- **Volatile fields** (values that change on every call: idempotency keys, timestamps, ids).
+  Tracked per endpoint for query keys, headers and JSON/form body leaves (JSON pointer with
+  array indices as `*`, e.g. `/items/*/id`), at most 128 fields (the first in byte order): `n`
+  (observations) and a bottom-32 sketch of the 64-bit XXH3 hashes of the redacted values. The
+  distinct count `d` is exact while the sketch holds fewer than 32 hashes, else estimated
+  (`31 / max normalised hash`). A field is **volatile** when `n ≥ 3` and `d ≥ n / 2`. Redacted
+  fields are always marked `redacted`, which mock matching (§8) and the load test treat like
+  volatile.
+- **Redaction**, pure, applied to everything the report keeps (samples, `hosts`) and to the
+  access-log `path`, before it is stored, logged or sent. The marker is the constant string
+  `<redacted>` (stable: same output for any secret, so no hash of a secret is ever kept).
+  - *By name* (header name, query key, form field, JSON key; compared in lower case with `-`
+    and `_` removed): `authorization`, `proxyauthorization`, `cookie`, `setcookie`, and any
+    name containing `password`, `passwd`, `secret`, `token`, `apikey`, `auth`, `session`,
+    `signature`, `credential`, `privatekey`, `cvv`, `cvc`, `cardnumber`, `pan`, `iban`, `ssn`,
+    plus the names of `MIMIC_DISCOVERY_REDACT_NAMES`. The whole value (a JSON subtree
+    included) becomes the marker, except: `authorization` keeps its scheme
+    (`Bearer <redacted>`); `cookie` keeps cookie names (`a=<redacted>; b=<redacted>`);
+    `set-cookie` keeps the name and attributes.
+  - *By value* (every other string: header values, query values, path segments, JSON strings
+    and numbers): a JWT (three base64url parts, the first decoding to a JSON object with
+    `alg`), a PEM block, a `Bearer `/`Basic ` credential, a 13–19 digit card number (spaces or
+    dashes allowed) that passes Luhn, an AWS access key id (`AKIA`/`ASIA` + 16), and tokens with
+    a known prefix (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `glpat-`,
+    `xox[abprs]-`, `sk_live_`, `rk_live_`, `sk-`); a URL's userinfo password.
+  - Opaque bodies are never kept (only media type and size). Redaction counts appear in
+    `mimic_discovery_redactions_total{location,rule}` (§9).
+- **Samples**: per endpoint at most **20**, each a redacted request (method, concrete path,
+  query, headers, body) and response (status, headers, body), with its head latency. Each body
+  is kept only when parsed and at most 256 KiB. Selection is deterministic and
+  order-independent: candidates are deduplicated by the XXH3 hash of their redacted content;
+  first one sample per status code (lowest status first), then one per class
+  (status, request shape, response shape — a shape is the hash of the body schema skeleton),
+  then the rest; within each pass the lowest content hash wins. All samples of a sidecar fit in
+  `MIMIC_DISCOVERY_SAMPLE_BUDGET`; when it is full, new samples are not admitted (counted
+  `budget`) and counters, schemas and volatility still update.
+- **Counters and latency**, per endpoint: exchanges by status code, and a histogram of the
+  time to the response head (`head_ms`, §4.1) with fixed log buckets (4 per doubling, from
+  1 ms to 131 s, plus overflow), sparse.
+- **Local report.** A JSON document (`"version": 1`), serialised with sorted keys
+  (`BTreeMap`), holding the endpoints above plus `pod` and the number of exchanges it covers.
+  The wire format serialises the template tree with its absorbing flags, so a merge keeps
+  absorbed positions absorbed. A merged `pod` is kept only when both reports have the same one,
+  else it is null. After a merge, `hosts` of an endpoint keeps the 16 smallest in byte order.
+  Merging two reports is a pure function, commutative and associative, that unions the
+  template trees (with the absorbing rule), adds counters and histograms, merges schemas,
+  sketches and `hosts`, and reselects samples: the sidecar records an exchange by merging a
+  one-exchange report, and the controller (F5) uses the same function across pods. Merging is
+  not idempotent for counters: the transport must apply each report once (F5).
+- **Bounds.** At most `MIMIC_DISCOVERY_MAX_ENDPOINTS` endpoints per sidecar (further new
+  endpoints are dropped, `endpoint_limit`, one WARN `endpoint limit reached`); the template tree
+  keeps its shape for the life of the process (counters and samples are what F5 ships and
+  resets). Capture never slows forwarding: the proxy copies at most the head (64 KiB, §4.1) and
+  256 KiB of each body into an exchange record while relaying, within the global in-flight
+  budget `MIMIC_DISCOVERY_CAPTURE_BUDGET` (a body that does not fit is not captured,
+  `budget`), and hands the record to a bounded queue of `MIMIC_DISCOVERY_QUEUE` records,
+  drained by one recorder thread that does the decoding, inference and merge. A full queue
+  drops the record (`dropped`). Forwarding never waits for discovery (§4.1: forward, never
+  refuse).
+- **Logs** (`target` = `discovery`): INFO `endpoint discovered` (`direction`, `port`,
+  `method`, `template`) once per new endpoint, INFO `template absorbed` (`from`, `to`) when a
+  node absorbs, WARN `endpoint limit reached` once, WARN `sample budget full` once until
+  samples are freed. Templates are redacted; no line holds a header value, query, body or
+  sample.
+- **Local access.** `GET /discovery` on the admin port answers the local report
+  (`application/json`) only to clients on loopback (`127.0.0.1`, `::1`): `kubectl
+  port-forward` (Kubernetes RBAC `pods/portforward` is the authentication) and the pod itself.
+  Any other peer gets 403. Its content is the redacted report, as it would be shipped.
+- **Shipping (F5).** Every `MIMIC_DISCOVERY_PUSH_INTERVAL` and at `SIGTERM`, the sidecar
+  posts the report accumulated since its last acknowledged post to the sidecar API (§7.2, same
+  authentication, the deployment taken from the token's pod), with a per-pod sequence number;
+  the controller merges it into the deployment's report in Valkey atomically with the
+  sequence, so a retried post is applied once, and answers 200; the sidecar then drops the
+  shipped counters and samples (the tree shape stays). Until acknowledged, reports keep
+  merging locally within the same bounds. Replicas therefore merge only in the controller,
+  with the same pure merge; the controller re-applies templating on the union, so a position
+  that each pod sees below the literal limit but the deployment sees above it is absorbed.
+  Key layout, TTL (samples 30 days) and the API are specified in F5.
+- **Consumers.** F6 renders reports as OpenAPI 3.1. F7 records egress with the same engine.
+  F10 mock matching ignores volatile and redacted fields (§8). F11 (load test) builds requests
+  from ingress templates, samples, schemas and volatility; redacted values (credentials) must
+  be supplied by the user, and its own traffic must not be recorded as discovery (F11
+  design).
 
 ## 7. Controller and storage
 
 - `MimicWorkload` (namespaced CRD, `mimic.platform.io/v1alpha1`): selects the deployment named
   by `spec.deployment` (required, DNS-1123 name, immutable) in its namespace, holds
   `spec.mode` (`discovery` | `mock`, default `discovery`), `spec.tls.exclude` (F3, §5),
+  `spec.discovery.redact` (F4, §6: extra names redacted by name, at most 64, applied like
+  `spec.tls.exclude` to pods created afterwards),
   latency settings; `status` reports pods, mode convergence and
   counts. F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
   with their feature. When several `MimicWorkload`s name the same deployment, any of them
@@ -396,7 +528,8 @@ client or the destination sees, the connection is **passed through** untouched i
   mode, its aggregated egress recordings. Valkey keys are namespaced by
   `<namespace>/<deployment>`.
 - The controller merges endpoints of all pods of a deployment (same endpoint key → merged
-  counters, histograms, schemas, sample sets).
+  counters, histograms, schemas, sample sets) with the pure merge of §6, which also
+  re-applies path templating on the union.
 - The UI and its API are read-only and served on the controller's HTTP port, reached by
   `kubectl port-forward` (Kubernetes RBAC is the authentication).
 
@@ -537,7 +670,8 @@ client or the destination sees, the connection is **passed through** untouched i
 
 - Matching, first hit wins: (1) exact: method, authority, path, query, normalised body;
   (2) same endpoint, closest body ignoring volatile fields; (3) most frequent response of the
-  endpoint. The response carries `x-mimic-match: exact|endpoint|fallback`.
+  endpoint. The response carries `x-mimic-match: exact|endpoint|fallback`. Volatile and
+  redacted fields (§6) are ignored by (2) and never compared by (1).
 - Latency: drawn from the endpoint's recorded histogram; `spec.mock.latencyFactor` scales it
   (`0` disables it).
 - No match: status **599**, header `x-mimic-miss: 1`, metric `mimic_mock_miss_total`, one log
@@ -564,6 +698,12 @@ client or the destination sees, the connection is **passed through** untouched i
   | `mimic_tls_passthrough_destinations` | gauge, remembered destinations (§5) | — |
   | `mimic_tls_intermediate_expiry_timestamp_seconds` | gauge, `notAfter` of the current intermediate, 0 when none | — |
   | `mimic_tls_intermediate_requests_total` | counter | `result` (`ok`, `error`, `mismatch`) |
+  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `dropped`) |
+  | `mimic_discovery_bodies_total` | counter (F4), bodies of recorded exchanges | `direction`, `part` (`request`, `response`), `result` (`parsed`, `empty`, `opaque`, `too_large`, `encoding`, `invalid`, `budget`) |
+  | `mimic_discovery_samples_total` | counter (F4), sample admissions | `direction`, `result` (`kept`, `replaced`, `rejected`, `budget`) |
+  | `mimic_discovery_redactions_total` | counter (F4) | `location` (`path`, `query`, `header`, `body`), `rule` (`name`, `jwt`, `pem`, `credential`, `card`, `aws`, `token_prefix`, `userinfo`) |
+  | `mimic_discovery_endpoints` | gauge (F4), endpoints in the template tree | `direction` |
+  | `mimic_discovery_sample_bytes` | gauge (F4), bytes held by samples | — |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -645,6 +785,12 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_CONTROLLER_CA` | required when `MIMIC_TLS_CA` is set | CA (PEM) the sidecar API certificate is verified against. |
 | `MIMIC_TLS_TOKEN_FILE` | `/var/run/secrets/mimic.platform.io/token` | Projected token, re-read for every sidecar API request. |
 | `MIMIC_TRUST_DIR` | `/mimic` | `mimic-trust` volume: binary and fallback store written at start, `trust/*/image-ca.pem` read as upstream roots. |
+| `MIMIC_DISCOVERY_MAX_ENDPOINTS` | `256` | Endpoints kept per direction (§6), 1–10000. Not set by the webhook. |
+| `MIMIC_DISCOVERY_MAX_LITERALS` | `32` | Distinct literal segments below a template node before it absorbs them into a parameter (§6), 2–1000. Not set by the webhook. |
+| `MIMIC_DISCOVERY_SAMPLE_BUDGET` | `16Mi` | Bytes held by samples (`<n>`, `<n>Ki`, `<n>Mi`; 1Mi–1Gi). Not set by the webhook. |
+| `MIMIC_DISCOVERY_CAPTURE_BUDGET` | `8Mi` | Bytes of bodies captured in flight and queued (same syntax; 1Mi–1Gi). Not set by the webhook. |
+| `MIMIC_DISCOVERY_QUEUE` | `1024` | Exchange records waiting for the recorder (1–65536). Not set by the webhook. |
+| `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Extra names redacted by name (§6), comma-separated, at most 64, each 1–64 characters of `a-z0-9-_` (compared like the built-in names); the webhook sets the sorted, deduplicated union of `spec.discovery.redact` of every `MimicWorkload` naming the deployment. |
 
 ### 10.4 `mimic-init` variables
 
@@ -682,7 +828,9 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
 - The webhook never logs or stores the pod spec or the patch (env values may hold secrets).
 - Images are distroless, pinned by digest, scanned in CI (no fixable HIGH/CRITICAL).
 - Dependencies checked by `cargo deny` (advisories, licences, sources).
-- No sensitive value reaches Valkey or a log without redaction (§6).
+- No sensitive value reaches Valkey or a log without redaction (§6). Discovery keeps no
+  opaque body, no hash of a redacted value, and never logs a header value, query, body or
+  sample; the local report is served on loopback only.
 - TLS key custody (§5): the seed exists only in its Secret and the controller's memory; root
   keys only in the controller's memory; intermediate and leaf keys only in the sidecar's
   memory (non-dumpable, no core file). Tokens and keys are never logged.
@@ -740,6 +888,17 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   impersonate any host to that deployment's pods if they also sit on their network path. A
   compromised controller (or anyone reading the seed Secret) can impersonate any host to every
   injected pod.
+- Discovery redaction (§6) is a fixed list of names and detectors plus
+  `spec.discovery.redact`: a secret under an unlisted name and in a form no detector
+  recognises (e.g. a random API key in a custom header) is kept in samples, served by
+  `/discovery` and, from F5, stored in Valkey. Personal data that is not a credential (names,
+  e-mail addresses, amounts) is kept in samples by design; the `@` rule only keeps it out of
+  path templates. Inbound HTTPS is not discovered.
+- Discovery is best effort under load: dropped records, a full sample budget or the endpoint
+  limit make counters and samples partial (counted in §9 metrics), never slow traffic. A
+  `404`/`405` reaching a path no other status has created is not recorded. Template
+  absorption can merge distinct resources below one node (an API with more than
+  `MIMIC_DISCOVERY_MAX_LITERALS` literal routes at one level, e.g. static files at the root).
 - Emptying the seed Secret rotates every root: running sidecars then fail the chain check
   and pass everything through (`no_ca`) until their pod is recreated. The trust wiring and
   `spec.tls.exclude` apply at pod creation.
@@ -883,6 +1042,38 @@ from test CAs placed in a temporary `MIMIC_TRUST_DIR`.
 | TLS-24 | **E.** The chart creates the empty seed Secret, the Service and NetworkPolicy port 8444, and the RBAC of §11: `kubectl auth can-i` as the controller is `yes` for `create tokenreviews` and `get`/`update` of the seed Secret, `no` for other Secrets and pods; after install the Secret holds a seed; `helm uninstall` removes it. The CRD accepts `spec.tls.exclude: [api.example.com, "*.corp.example", 10.0.0.1]` and rejects `*`, `a.*.com` and 257 entries. |
 | TLS-25 | **E.** In an `enabled` namespace, four client Deployments built by the e2e from `curlimages/curl`, `python:slim` (`urllib`), `node:slim` (`fetch`) and `eclipse-temurin` (JDK `HttpClient`), each with the e2e test CA installed in the image's system store, call an in-cluster HTTPS Service whose certificate comes from that CA: each call returns 200, the sidecar writes an exchange line with `tls: true` and `status: 200`, and the certificate the client saw is issued by the mimic intermediate. A call to an HTTPS Service signed by an unknown CA fails in the client as without mimic (curl exit 60) and the sidecar logs `upstream_untrusted`. A `MimicWorkload` with `spec.tls.exclude` naming the Service host makes the next pod's connections `excluded`. |
 | TLS-26 | **E.** A client container that defines `SSL_CERT_FILE` in its spec to a file holding only the e2e CA keeps that value (no mimic variables for it); its first call fails, the sidecar logs one WARN `tls passthrough` with `reason: client_rejected`, and its second call returns 200 with the Service's own certificate. A sidecar token presented for another deployment's name gets `403` from the sidecar API. |
+
+### 12.5 F4 — Ingress endpoint discovery
+
+Levels as in §12.2. Sidecar integration tests run the real binary against a local test app
+with a fake original destination (as in F2) and read `GET /discovery` from loopback. A
+*canary* is a secret value unique to the test, searched for in every output.
+
+| ID | Criterion |
+|---|---|
+| DSC-01 | **U.** Segment classification: `42`, a UUID in upper and lower case, a ULID, `5f2b9c1d` (hex with a digit), `2026-11-01`, `2026-11-01T10:00:00Z`, `a1b2c3d4e5f6g7h8i9` (16+ with letter and digit), `alice@example.com` and a JWT are parameters; `v1`, `api`, `users`, `deadbeef` (no digit), `health`, an empty last segment and `%41` (not decoded) are literals. Parameter names follow §6 (`/users/42/orders/7` → `/users/{users_id}/orders/{orders_id}`, `/42` → `/{param1}`, a repeated literal gets `{param<n>}`), and a gRPC path is never templated (it is still redacted: DSC-06). |
+| DSC-02 | **U.** Absorbing nodes: with `MIMIC_DISCOVERY_MAX_LITERALS` = 3, `/u/a`, `/u/b`, `/u/c` stay three endpoints, a fourth literal turns them into one `/u/{u_id}` whose counters, schemas and samples are the merge of the four, later literals map to it, and a `/u/42` parameter and the literals share it; siblings of `/u` are untouched. For any set of paths (`proptest`, ≥ 10 000 cases), every permutation of the arrival order gives the same templates. |
+| DSC-03 | **U.** Schema inference and merge follow §6: `type` sets with `null`; `integer` only while every number is integral; each `format` only when every value has it; `required` = present in every object; array `items` over the first 256 items; an object with 129 keys becomes a map; level 17 is `{}`. Query: keys percent-decoded, a repeated key is an `array`, a key missing once is not `required`, at most 64 keys (first in byte order). Headers: names in lower case, the skipped names of §6 absent, at most 64. `application/x-www-form-urlencoded` bodies get the same schema as the equivalent query; `text/plain`, `application/grpc` and `application/octet-stream` are opaque (media type and size). |
+| DSC-04 | **U.** Volatility: a field with values `a`, `b`, `c` is volatile; `a`, `b` (n = 2) is not; 10 observations of 2 values are not; 1000 distinct values are, and 1000 observations of 100 values are not (fixed data, deterministic hash). The sketch holds at most 32 hashes; merging two sketches equals the sketch of the union. At most 128 fields are tracked (first in byte order). A redacted field is marked `redacted`. |
+| DSC-05 | **U.** Redaction by name: each built-in name of §6, and names containing them in any case with `-`/`_` (`X-Api-Key`, `client_secret`, `refreshToken`, `Session-Id`), as a header, query key, form field and JSON key (also nested, and with an object or array value, which becomes the marker as a whole), gives `<redacted>`; `Authorization: Bearer x` → `Bearer <redacted>`, `Cookie: a=1; b=2` → `a=<redacted>; b=<redacted>`, `Set-Cookie: s=1; Path=/; HttpOnly` → `s=<redacted>; Path=/; HttpOnly`; a name of `MIMIC_DISCOVERY_REDACT_NAMES` is redacted; `id`, `name` and `amount` are not. |
+| DSC-06 | **U.** Redaction by value, in a header value, a query value, a path segment, a JSON string and (cards) a JSON number: a JWT, a PEM private key, `Bearer`/`Basic` credentials, `4111 1111 1111 1111` and `4111-1111-1111-1111`, an `AKIA` key, each listed token prefix, and the password of `https://u:p@h/` become `<redacted>`; near misses are kept (`4111111111111112` fails Luhn, three base64url parts whose first does not decode to JSON with `alg`, `AKIA` + 15). A redacted path segment is a parameter. The marker is the same for every secret. |
+| DSC-07 | **U.** No leak (`proptest`, ≥ 10 000 cases): generated exchanges carrying a canary under a listed name or in a detected form, at a random place (path, query, header, form or JSON body at any depth, request or response), give a serialised report that contains neither the canary nor its XXH3 hash, in decimal or hex. |
+| DSC-08 | **U.** Samples: at most 20 per endpoint; with 25 candidates of statuses 200, 201, 400, 500, every status is represented, then every (status, request shape, response shape) class, then the lowest content hashes; identical candidates count once; any arrival order gives the same set. A body over 256 KiB, encoded or decoded, and an opaque body are not kept (size and media type are). When the sample budget is full a new sample is rejected (`budget`) while counters and schemas still change. |
+| DSC-09 | **U.** Merge algebra (`proptest`, ≥ 10 000 cases): `merge` is commutative and associative; recording a sequence of exchanges one by one equals merging the reports of any partition of it (as several replicas would), counters and histograms included; two reports each below the literal limit at one node absorb it when their union exceeds it. Serialisation is byte-identical for equal reports, keys sorted, `"version": 1`, and it round-trips. |
+| DSC-10 | **U.** Latency buckets: 4 per doubling from 1 ms; 0 ms and 1 ms fall in the first bucket, a value on a boundary in the bucket it closes, more than 131 s in the overflow; merge adds bucket counts. |
+| DSC-11 | **U.** Bounds: past `MIMIC_DISCOVERY_MAX_ENDPOINTS` new endpoints are refused (`endpoint_limit`) while known ones still update; a `404` or `405` on a path matching a known template is counted on it, else it is `not_found` and creates nothing; a path over 2048 bytes or 32 segments is `invalid`. For arbitrary exchanges (`proptest`) the recorder never panics and its retained state, sample bytes excluded, stays below a bound computed from the limits. |
+| DSC-12 | **I.** Inbound HTTP/1.1 and `h2` exchanges to the test app (`GET /users/{1..5}` with JSON responses, `POST /orders` with a JSON body and a `?dry_run=true` query, a `201` and a `400`) appear in `/discovery` under `direction` `inbound`, the app port and their templates, with status counters, histogram, query and header schemas, body schemas and samples; probe requests, outbound exchanges, `unframed` exchanges and a `404` to an unknown path do not; `hosts` lists the `Host` values used. |
+| DSC-13 | **I.** Bodies with `content-encoding` `gzip`, `deflate` and `br` are decoded and inferred; `zstd` is `encoding`; a 1 KiB gzip body that expands past 256 KiB is `too_large` and the sidecar's RSS does not grow by more than 1 MiB; malformed JSON is `invalid`; each case increments `mimic_discovery_bodies_total` with its `result`. |
+| DSC-14 | **I.** `GET /discovery` on the admin port answers 200 `application/json` with the local report to a client connecting from `127.0.0.1` and from `::1`, and 403 to one connecting from the pod's non-loopback address. |
+| DSC-15 | **I.** No leak end to end: canaries sent as `Authorization`, `Cookie`, `X-Api-Key`, a query `token=`, a JWT path segment, a card number and `password` in JSON request and response bodies, and in a `x-custom` header value with a `ghp_` prefix, appear neither in `/discovery`, nor on stdout (access lines included: the path shows `<redacted>`), nor in `/metrics`; bytes reach the app and the client unchanged. |
+| DSC-16 | **I.** Discovery never slows or alters traffic: with `MIMIC_DISCOVERY_QUEUE=1` and `MIMIC_DISCOVERY_CAPTURE_BUDGET=1Mi`, 2000 concurrent requests with 200 KiB bodies are all answered with the bytes the app sent; `mimic_discovery_exchanges_total` sums to the number of exchanges, with `dropped` > 0, and bodies skipped for budget are counted `budget`. |
+| DSC-17 | **I.** Memory: 256 endpoints each receiving 30 distinct 256 KiB JSON exchanges leave the sidecar RSS under 128 MiB with `mimic_discovery_sample_bytes` ≤ `MIMIC_DISCOVERY_SAMPLE_BUDGET`; a 257th endpoint is `endpoint_limit`, with one WARN `endpoint limit reached`. |
+| DSC-18 | **I.** Logs (`target` = `discovery`): one INFO `endpoint discovered` per new endpoint with `direction`, `port`, `method`, `template`, and one when a node is absorbed (`template absorbed`, old and new templates); one WARN `sample budget full` until samples are freed; no line holds a header value, query, body or sample. `mimic_discovery_endpoints` and `mimic_discovery_redactions_total{location,rule}` match the traffic sent. |
+| DSC-19 | **I.** An invalid `MIMIC_DISCOVERY_*` value (out of range, bad size suffix, a 65th or invalid redact name) exits 2 before listening (FND-01). |
+| DSC-20 | **U.** The injection patch sets `MIMIC_DISCOVERY_REDACT_NAMES` to the sorted, deduplicated union of `spec.discovery.redact` of every `MimicWorkload` naming the deployment, absent when there is none. **E.** The CRD accepts `spec.discovery.redact: [x-tenant-key, pin]` and rejects an entry with `/`, an empty one and 65 entries. |
+| DSC-21 | **U.** The access-log path function applies the value detectors of DSC-06 segment by segment and leaves other segments unchanged. **I.** An inbound and an intercepted outbound request to `/reset/<JWT>` write access lines with `path` `/reset/<redacted>`. |
+| DSC-22 | **E.** On kind, a 2-replica Deployment in an `enabled` namespace behind a Service gets calls to `/users/<id>` (ids, a canary bearer token, JSON bodies); through `kubectl port-forward` each pod's `/discovery` shows `GET /users/{users_id}` with its response schema and samples, and no canary; a `404` storm on random root paths creates no endpoint. |
+| DSC-23 | **C.** A `cargo-fuzz` target feeds arbitrary request and response heads and bodies to the recorder (parse, decode-free inference, redaction, merge); CI runs it 60 s on PRs touching `crates/mimic-core/src/discovery/` and 10 min weekly, like PRX-28 (same `ci-ok` path-filter rule). |
 
 ## 13. Test strategy
 

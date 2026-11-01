@@ -758,3 +758,21 @@ async fn prx_21_h2_rejected_has_no_duration_and_is_not_observed() {
         "{text}"
     );
 }
+
+const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln";
+
+#[tokio::test]
+async fn dsc_21_inbound_access_line_redacts_path_secrets() {
+    let logs = capture_logs();
+    let response: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let addr = dest(&[response], 0).await;
+    let f = fixture(Direction::Inbound, move |_| Some(addr)).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(format!("GET /reset/{JWT} HTTP/1.1\r\nHost: a\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(read_exact(&mut c, response.len()).await, response);
+    let lines = logs.access_exactly(1).await;
+    assert_eq!(lines[0]["path"], "/reset/<redacted>");
+    assert!(!logs.text().contains(JWT), "{}", logs.text());
+}
