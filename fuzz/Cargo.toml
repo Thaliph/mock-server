@@ -21,3 +21,10 @@ path = "fuzz_targets/http1.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "discovery"
+path = "fuzz_targets/discovery.rs"
+test = false
+doc = false
+bench = false

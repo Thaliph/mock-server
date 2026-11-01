@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 1c2ff1e349d3d65710262f34882ec5024954159e5195f8d25d755515e98efc39 # shrinks to paths = ["/a"], max = 1, seed = 0
 cc 4af4a8957b620e1ac6b3a75162599a269e93cb19cd1342e472c1933a31d11a28 # shrinks to items = [], parts = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], max = 1
+cc c3b49a2660f62f3360d08af43a9c3233e632de96b32b413aed758d0d7a8f491d # shrinks to items = [(8080, "/7", 200, 0, 0), (8080, "/a", 200, 0, 0), (8080, "/a", 200, 0, 0), (8080, "/a", 200, 0, 0), (8080, "/a", 200, 0, 0), (8080, "/a", 200, 0, 0), (8080, "/a", 200, 0, 0), (8080, "/7", 200, 10, 0)], parts = [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], max = 1

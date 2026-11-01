@@ -1,6 +1,8 @@
 use proptest::prelude::*;
 
 use super::histogram::{Histogram, OVERFLOW, bucket_index};
+use super::observed::Observation;
+use super::redact::Redactor;
 use super::report::{Direction, Exchange, Limits, Report, merge};
 use super::template::is_param;
 
@@ -14,17 +16,22 @@ fn ex<'a>(path: &'a str, status: u16, head_ms: u64) -> Exchange<'a> {
         head_ms,
         host: None,
         grpc: false,
+        observation: Observation::default(),
     }
 }
 
 fn limits(max_literals: usize) -> Limits {
-    Limits { max_literals }
+    Limits {
+        max_literals,
+        max_endpoints: 256,
+        sample_budget: 16 << 20,
+    }
 }
 
 fn report_of(l: &Limits, exchanges: &[Exchange<'_>]) -> Report {
     let mut r = Report::new(Some("p".into()));
     for e in exchanges {
-        r.record(l, e);
+        r.record(l, &Redactor::default(), e);
     }
     r
 }
@@ -90,9 +97,9 @@ fn dsc_01_grpc_never_templated() {
     let mut r = Report::new(None);
     let mut e = ex("/pkg.Svc/Get/42", 200, 1);
     e.grpc = true;
-    r.record(&limits(1), &e);
+    r.record(&limits(1), &Redactor::default(), &e);
     e.path = "/pkg.Svc/Get/43";
-    r.record(&limits(1), &e);
+    r.record(&limits(1), &Redactor::default(), &e);
     assert_eq!(templates(&r), ["/pkg.Svc/Get/42", "/pkg.Svc/Get/43"]);
 }
 
@@ -115,7 +122,7 @@ fn dsc_02_absorbing() {
         &[
             ex("/u/a", 200, 1),
             ex("/u/b", 200, 1),
-            ex("/u/c", 404, 1),
+            ex("/u/c", 500, 1),
             ex("/u/d", 200, 1),
             ex("/x/a", 200, 1),
         ],
@@ -123,13 +130,13 @@ fn dsc_02_absorbing() {
     assert_eq!(templates(&r), ["/u/{u_id}", "/x/a"]);
     let eps = r.endpoints();
     assert_eq!(eps[0].stats.statuses.get(&200), Some(&3));
-    assert_eq!(eps[0].stats.statuses.get(&404), Some(&1));
+    assert_eq!(eps[0].stats.statuses.get(&500), Some(&1));
     assert_eq!(eps[0].stats.latency.count(), 4);
 
     // Later literals and a parameter share the absorbed node.
     let mut r = r;
-    r.record(&l, &ex("/u/zzz", 200, 1));
-    r.record(&l, &ex("/u/42", 200, 1));
+    r.record(&l, &Redactor::default(), &ex("/u/zzz", 200, 1));
+    r.record(&l, &Redactor::default(), &ex("/u/42", 200, 1));
     assert_eq!(templates(&r), ["/u/{u_id}", "/x/a"]);
     assert_eq!(r.endpoints()[0].stats.latency.count(), 6);
 
@@ -253,6 +260,7 @@ fn build(l: &Limits, items: &[(u16, String, u16, u64, u8)]) -> Report {
     for (port, path, status, ms, h) in items {
         r.record(
             l,
+            &Redactor::default(),
             &Exchange {
                 direction: Direction::Inbound,
                 port: *port,
@@ -262,6 +270,7 @@ fn build(l: &Limits, items: &[(u16, String, u16, u64, u8)]) -> Report {
                 head_ms: *ms,
                 host: Some(HOSTS[*h as usize]),
                 grpc: false,
+                observation: Observation::default(),
             },
         );
     }
@@ -331,7 +340,7 @@ fn dsc_09_hosts_capped() {
     for h in hosts.iter().rev() {
         let mut e = ex("/a", 200, 1);
         e.host = Some(h);
-        r.record(&l, &e);
+        r.record(&l, &Redactor::default(), &e);
     }
     let kept: Vec<_> = r.endpoints()[0].stats.hosts.iter().cloned().collect();
     assert_eq!(kept, hosts[..16]);
@@ -520,13 +529,14 @@ mod redaction {
             ..super::ex(&secret, 200, 1)
         };
         let mut report = Report::new(None);
-        report.record(&super::limits(50), &exchange);
+        report.record(&super::limits(50), &Redactor::default(), &exchange);
         let json = report.to_json();
         assert!(!json.contains(JWT), "{json}");
         assert!(json.contains("/pkg.Svc/<redacted>"), "{json}");
         // Not templated: an id-like segment stays literal.
         report.record(
             &super::limits(50),
+            &Redactor::default(),
             &Exchange {
                 grpc: true,
                 ..super::ex("/pkg.Svc/42", 200, 1)

@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::histogram::Histogram;
-use super::redact;
+use super::observed::{Observation, Observed, state_bound};
+use super::redact::{self, MARKER, Redactor, value_rule};
+use super::sample::{MAX_SAMPLES, Sample, Samples};
 use super::template::{Seg, is_param, render, split_path};
 
 /// Hosts kept per endpoint.
@@ -20,10 +22,18 @@ pub enum Direction {
     Outbound,
 }
 
+/// Longest path recorded, in bytes.
+pub const MAX_PATH: usize = 2048;
+/// Most segments of a recorded path.
+pub const MAX_SEGMENTS: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// `MIMIC_DISCOVERY_MAX_LITERALS`.
     pub max_literals: usize,
+    /// `MIMIC_DISCOVERY_MAX_ENDPOINTS`.
+    pub max_endpoints: usize,
+    /// `MIMIC_DISCOVERY_SAMPLE_BUDGET`, in bytes.
+    pub sample_budget: usize,
 }
 
 /// One relayed exchange, as the recorder sees it.
@@ -40,6 +50,33 @@ pub struct Exchange<'a> {
     pub host: Option<&'a str>,
     /// `content-type: application/grpc*`: the path is never templated.
     pub grpc: bool,
+    /// Query, headers and bodies (content-decoded).
+    pub observation: Observation<'a>,
+}
+
+/// Why an exchange was not recorded, or what was kept of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Recorded {
+        new_endpoint: bool,
+        sample: Sampled,
+    },
+    /// Path over 2048 bytes or 32 segments, or a status outside 100..=599.
+    Invalid,
+    /// `404` or `405` on an endpoint that is not known.
+    NotFound,
+    /// A new endpoint past `max_endpoints`.
+    EndpointLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sampled {
+    /// The exchange is a sample candidate.
+    Admitted,
+    /// The sample budget is full: counters and schemas changed, the sample was not admitted.
+    Budget,
+    /// No sample: a `404` or `405`.
+    None,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +84,8 @@ pub struct Stats {
     pub statuses: BTreeMap<u16, u64>,
     pub latency: Histogram,
     pub hosts: BTreeSet<String>,
+    observed: Observed,
+    samples: Samples,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,12 +122,29 @@ pub struct Endpoint<'a> {
 }
 
 impl Stats {
+    /// Counters, latency and host of one exchange.
     fn of(exchange: &Exchange<'_>) -> Self {
         let mut s = Stats::default();
         *s.statuses.entry(exchange.status).or_default() += 1;
         s.latency.observe(exchange.head_ms);
-        s.hosts.extend(exchange.host.map(str::to_string));
+        // An authority has no userinfo (spec §4.1), but it is redacted like any other value.
+        s.hosts.extend(exchange.host.map(|h| {
+            if value_rule(h).is_some() {
+                MARKER.to_string()
+            } else {
+                h.to_string()
+            }
+        }));
         s
+    }
+
+    pub fn samples(&self) -> &Samples {
+        &self.samples
+    }
+
+    /// Schemas and volatility of the query, headers and bodies.
+    pub fn observed(&self) -> &Observed {
+        &self.observed
     }
 
     fn merge(&mut self, other: Stats) {
@@ -100,6 +156,8 @@ impl Stats {
         while self.hosts.len() > MAX_HOSTS {
             self.hosts.pop_last();
         }
+        self.observed = std::mem::take(&mut self.observed).merge(other.observed);
+        self.samples = std::mem::take(&mut self.samples).merge(other.samples);
     }
 }
 
@@ -139,6 +197,30 @@ impl Node {
         }
     }
 
+    /// The node a path leads to, as the template tree would route it.
+    fn find(&self, segments: &[&str]) -> Option<&Node> {
+        let Some((first, rest)) = segments.split_first() else {
+            return Some(self);
+        };
+        let next = if is_param(first) {
+            self.param.as_deref()
+        } else if let Some(child) = self.literals.get(*first) {
+            Some(child)
+        } else if self.absorbing {
+            self.param.as_deref()
+        } else {
+            None
+        };
+        next?.find(rest)
+    }
+
+    fn for_each_stats<'a>(&'a self, f: &mut impl FnMut(&'a Stats)) {
+        self.endpoints.values().for_each(&mut *f);
+        for child in self.literals.values().chain(self.param.as_deref()) {
+            child.for_each_stats(f);
+        }
+    }
+
     fn collect<'a>(&'a self, prefix: &mut Vec<Seg>, out: &mut Vec<(String, &'a str, &'a Stats)>) {
         let template = render(prefix);
         for (method, stats) in &self.endpoints {
@@ -174,6 +256,15 @@ impl Scope {
     }
 }
 
+impl Scope {
+    fn for_each_stats<'a>(&'a self, f: &mut impl FnMut(&'a Stats)) {
+        self.root.for_each_stats(f);
+        for methods in self.raw.values() {
+            methods.values().for_each(&mut *f);
+        }
+    }
+}
+
 impl Report {
     pub fn new(pod: Option<String>) -> Self {
         Report {
@@ -188,21 +279,110 @@ impl Report {
         self.exchanges
     }
 
-    /// Records one exchange: the same as merging a one-exchange report.
-    pub fn record(&mut self, limits: &Limits, exchange: &Exchange<'_>) {
-        let stats = Stats::of(exchange);
+    fn for_each_stats<'a>(&'a self, mut f: impl FnMut(&'a Stats)) {
+        for scope in self.scopes.values().flat_map(BTreeMap::values) {
+            scope.for_each_stats(&mut f);
+        }
+    }
+
+    /// The stats of the endpoint an exchange belongs to, when it is already known.
+    fn find(&self, exchange: &Exchange<'_>) -> Option<&Stats> {
+        let scope = self.scopes.get(&exchange.direction)?.get(&exchange.port)?;
+        if exchange.grpc {
+            return scope
+                .raw
+                .get(&redact::path(exchange.path))?
+                .get(exchange.method);
+        }
+        scope
+            .root
+            .find(&split_path(exchange.path))?
+            .endpoints
+            .get(exchange.method)
+    }
+
+    /// Endpoints held, whatever their direction and port.
+    fn endpoint_count(&self) -> usize {
+        let mut n = 0;
+        self.for_each_stats(|_| n += 1);
+        n
+    }
+
+    /// Bytes of the samples held (what `MIMIC_DISCOVERY_SAMPLE_BUDGET` limits).
+    pub fn sample_bytes(&self) -> usize {
+        let mut n = 0;
+        self.for_each_stats(|s| n += s.samples.bytes());
+        n
+    }
+
+    /// Upper bound of the serialised report without its samples, from the limits alone.
+    pub fn state_bound(limits: &Limits) -> usize {
+        // Path, hosts, statuses (100..=599), histogram buckets, the framing of the samples
+        // and of the scope, and the schemas.
+        let per_endpoint = MAX_PATH
+            + MAX_SEGMENTS * 16
+            + MAX_HOSTS * 300
+            + 500 * 16
+            + 70 * 16
+            + MAX_SAMPLES * 256
+            + 256
+            + state_bound();
+        limits.max_endpoints.saturating_mul(per_endpoint) + 1024
+    }
+
+    /// Records one exchange: the same as merging a one-exchange report, once the bounds
+    /// (spec §6) allow it.
+    pub fn record(
+        &mut self,
+        limits: &Limits,
+        redactor: &Redactor,
+        exchange: &Exchange<'_>,
+    ) -> Outcome {
+        let segments = split_path(exchange.path);
+        if exchange.path.len() > MAX_PATH
+            || segments.len() > MAX_SEGMENTS
+            || !(100..=599).contains(&exchange.status)
+        {
+            return Outcome::Invalid;
+        }
+        let known = self.find(exchange);
+        let counted_only = matches!(exchange.status, 404 | 405);
+        if known.is_none() {
+            if counted_only {
+                return Outcome::NotFound;
+            }
+            if self.endpoint_count() >= limits.max_endpoints {
+                return Outcome::EndpointLimit;
+            }
+        }
+        let new_endpoint = known.is_none();
+        let mut stats = Stats::of(exchange);
+        let mut sampled = Sampled::None;
+        if !counted_only {
+            let (request, response) = stats
+                .observed
+                .record_parsed(redactor, &exchange.observation);
+            let (hash, sample) = Sample::new(redactor, exchange, request, response);
+            let present = known.is_some_and(|k| k.samples.contains(hash));
+            if present || self.sample_bytes() + sample.bytes() <= limits.sample_budget {
+                stats.samples = Samples::single(hash, sample);
+                sampled = Sampled::Admitted;
+            } else {
+                sampled = Sampled::Budget;
+            }
+        }
+        let methods = BTreeMap::from([(exchange.method.to_string(), stats)]);
         let mut scope = Scope::default();
         if exchange.grpc {
-            let methods = BTreeMap::from([(exchange.method.to_string(), stats)]);
             // Not templated, but redacted: the client chooses its `content-type`.
             scope.raw.insert(redact::path(exchange.path), methods);
         } else {
             let mut node = Node {
-                endpoints: BTreeMap::from([(exchange.method.to_string(), stats)]),
+                endpoints: methods,
                 ..Node::default()
             };
             // The root node stands for "/", whose first segment is its child.
-            for segment in split_path(exchange.path).into_iter().rev() {
+            for segment in segments.into_iter().rev() {
                 let mut parent = Node::default();
                 if is_param(segment) {
                     parent.param = Some(Box::new(node));
@@ -220,6 +400,10 @@ impl Report {
             .or_default()
             .insert(exchange.port, scope);
         self.merge(limits, one);
+        Outcome::Recorded {
+            new_endpoint,
+            sample: sampled,
+        }
     }
 
     /// Merges `other` into `self`.
