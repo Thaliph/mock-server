@@ -19,7 +19,7 @@ mod tests;
 use std::collections::VecDeque;
 use std::mem;
 
-use body::{Body, BodyScan};
+use body::{Body, BodyScan, Cap};
 use scan::{HeadScanner, Kind, Scan};
 
 /// Largest head or trailer section, in bytes (the blank line included).
@@ -34,6 +34,9 @@ pub const PATH_LIMIT: usize = 1024;
 pub const AUTHORITY_LIMIT: usize = 1024;
 /// Longest `method` reported, in bytes (longer values are cut).
 pub const METHOD_LIMIT: usize = 64;
+/// Payload bytes of a message body handed to the discovery tap (spec §6): the first
+/// `CAPTURE_BODY_LIMIT` bytes; the `body_bytes` of the end event tells whether there were more.
+pub const CAPTURE_BODY_LIMIT: usize = 256 * 1024;
 /// Requests the relay reads ahead of their responses.
 pub const READ_AHEAD: usize = 32;
 /// Fixed part of the retained state of one direction, in bytes.
@@ -130,6 +133,19 @@ pub enum Event {
     Tunnel,
     /// Framing gave up: the rest is opaque, no further event.
     Unframed(Unframed),
+    /// Bytes for the discovery tap, only from a [`Codec::with_capture`] codec.
+    Captured(Captured),
+}
+
+/// What a capturing codec hands over: the raw head right after its `Request` or `Response`
+/// event (a `1xx` other than `101` is not captured), then the body payload in order, without
+/// chunk framing, at most [`CAPTURE_BODY_LIMIT`] bytes per message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Captured {
+    RequestHead(Vec<u8>),
+    RequestBody(Vec<u8>),
+    ResponseHead(Vec<u8>),
+    ResponseBody(Vec<u8>),
 }
 
 /// What a head says about its body and its upgrade, before the direction-specific rules.
@@ -363,11 +379,23 @@ pub struct Codec {
     next_seq: u64,
     /// Unframed or tunnelled: no more events.
     opaque: bool,
+    /// Emit [`Event::Captured`].
+    capture: bool,
+    req_cap: Cap,
+    resp_cap: Cap,
 }
 
 impl Codec {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A codec that also emits [`Event::Captured`] for the discovery tap.
+    pub fn with_capture() -> Self {
+        Self {
+            capture: true,
+            ..Self::default()
+        }
     }
 
     /// Bytes read from the client, all of them used. Without the relay's flow control: a
@@ -402,8 +430,12 @@ impl Codec {
                     }
                 }
                 RespState::Body { mut body, request } => {
-                    let (n, scan) = body.feed(data);
+                    let (n, scan) = body.feed(data, &mut self.resp_cap);
                     data = &data[n..];
+                    if !self.resp_cap.out.is_empty() {
+                        let bytes = mem::take(&mut self.resp_cap.out);
+                        events.push(Event::Captured(Captured::ResponseBody(bytes)));
+                    }
                     match scan {
                         BodyScan::More => self.resp = RespState::Body { body, request },
                         BodyScan::Done(body_bytes) => {
@@ -542,8 +574,12 @@ impl Codec {
                     }
                 }
                 ReqState::Body { mut body, head } => {
-                    let (n, scan) = body.feed(data);
+                    let (n, scan) = body.feed(data, &mut self.req_cap);
                     data = &data[n..];
+                    if !self.req_cap.out.is_empty() {
+                        let bytes = mem::take(&mut self.req_cap.out);
+                        events.push(Event::Captured(Captured::RequestBody(bytes)));
+                    }
                     match scan {
                         BodyScan::More => self.req = ReqState::Body { body, head },
                         BodyScan::Done(body_bytes) => self.request_done(&head, body_bytes, events),
@@ -590,6 +626,10 @@ impl Codec {
             head: head.clone(),
         });
         events.push(Event::Request(head.clone()));
+        if self.capture {
+            events.push(Event::Captured(Captured::RequestHead(scanner.raw().to_vec())));
+            self.req_cap.room = CAPTURE_BODY_LIMIT;
+        }
         match framing {
             Framing::Length(n) if n > 0 => {
                 self.req = ReqState::Body {
@@ -648,6 +688,9 @@ impl Codec {
         let connect_ok = (200..300).contains(&status) && front.as_ref().is_some_and(|r| r.connect);
         if status == 101 || connect_ok {
             events.push(Event::Response(head));
+            if self.capture {
+                events.push(Event::Captured(Captured::ResponseHead(scanner.raw().to_vec())));
+            }
             events.push(Event::Tunnel);
             self.opaque = true;
             return;
@@ -670,6 +713,10 @@ impl Codec {
             }
         };
         events.push(Event::Response(head));
+        if self.capture {
+            events.push(Event::Captured(Captured::ResponseHead(scanner.raw().to_vec())));
+            self.resp_cap.room = CAPTURE_BODY_LIMIT;
+        }
         match body {
             Some(body) => {
                 self.resp = RespState::Body {

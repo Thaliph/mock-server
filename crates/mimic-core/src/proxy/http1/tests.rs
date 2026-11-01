@@ -849,3 +849,53 @@ fn idle_only_between_two_messages() {
     u.client_bytes(b"GET / HTTP/1.1\r\nContent-Length: x\r\n\r\n");
     assert!(!u.idle(), "opaque after unframed");
 }
+
+/// DSC-12: a capturing codec hands over the raw heads and the body payload without chunk
+/// framing, bounded per message; a plain codec hands over nothing.
+#[test]
+fn dsc_12_capturing_codec_emits_heads_and_payload() {
+    let request = b"POST /orders?dry_run=true HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    let response = b"HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\nbody";
+    let mut c = Codec::with_capture();
+    let mut events = c.client_bytes(request);
+    events.extend(c.server_bytes(response));
+    let captured: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Captured(c) => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+    let head = |b: &[u8]| b[..b.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4].to_vec();
+    assert_eq!(
+        captured,
+        vec![
+            Captured::RequestHead(head(request)),
+            Captured::RequestBody(b"abcde".to_vec()),
+            Captured::ResponseHead(head(response)),
+            Captured::ResponseBody(b"body".to_vec()),
+        ]
+    );
+    let mut plain = Codec::new();
+    let mut events = plain.client_bytes(request);
+    events.extend(plain.server_bytes(response));
+    assert!(!events.iter().any(|e| matches!(e, Event::Captured(_))));
+}
+
+#[test]
+fn dsc_12_capturing_codec_caps_the_payload_and_reports_the_size() {
+    let total = CAPTURE_BODY_LIMIT + 1000;
+    let mut request = format!("POST /x HTTP/1.1\r\nContent-Length: {total}\r\n\r\n").into_bytes();
+    request.extend(vec![b'x'; total]);
+    let mut c = Codec::with_capture();
+    let events = c.client_bytes(&request);
+    let payload: usize = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Captured(Captured::RequestBody(b)) => Some(b.len()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(payload, CAPTURE_BODY_LIMIT);
+    assert_eq!(request_ends(&events), vec![total as u64]);
+}
