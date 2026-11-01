@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1309701a53d712f5143b56c7bb05ea026a50c2eae2a45f8271a800aadb65b9d2 # shrinks to s = ""
+cc ed1af71b540afdfcdb92742f09fa01c628241a33e8f7bc7cba45185e75117d32 # shrinks to edits = [(Index(0), 0)], cut = None
+cc 47068a9d2dcbe41d978844b8c3956958f08a42af9e749b9f1a3bbf3ad1e2ea9c # shrinks to items = [Ex { outbound: false, port: 80, path: "/a", status: 200, ms: 0, host: "", query: "", headers: [], body: None, grpc: false }], split = 0, max_literals = 1, max_endpoints = 1, budget = 4000
