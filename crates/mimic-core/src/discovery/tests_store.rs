@@ -477,3 +477,32 @@ fn ctl_02_the_output_is_byte_identical_for_the_same_input() {
         assert_eq!(ids(&first), ids(&again));
     }
 }
+
+/// A report whose samples claim `bytes` (a forged push; the check would refuse it).
+fn forged(l: &Limits, bytes: u64) -> Report {
+    let r = report(l, &[("/e", 200, "q=1", 1), ("/e", 500, "q=1", 1)]);
+    let json = r.to_json().unwrap();
+    let real = r.sample_bytes() / 2;
+    let json = json.replace(
+        &format!("\"bytes\":{real}}}"),
+        &format!("\"bytes\":{bytes}}}"),
+    );
+    assert_ne!(json, r.to_json().unwrap());
+    Report::from_json(&json).unwrap()
+}
+
+#[test]
+fn ctl_02_forged_sample_bytes_do_not_overflow_the_sums() {
+    let wide = limits(32, 256, 16 << 20);
+    let tight = limits(32, 256, 1000);
+    for bytes in [0, u64::MAX] {
+        let a = forged(&wide, bytes);
+        let b = forged(&wide, bytes);
+        let _ = a.sample_bytes();
+        let _ = merge(a.clone(), b.clone(), &tight);
+        let _ = merge_bounded(a, b, &tight);
+    }
+    // A max-sized claim is never admitted past a budget.
+    let out = merge_bounded(Report::new(None), forged(&wide, u64::MAX), &tight);
+    assert!(out.report.sample_bytes() <= tight.sample_budget);
+}
