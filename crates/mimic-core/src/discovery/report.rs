@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::histogram::Histogram;
 use super::observed::{Observation, Observed, state_bound};
-use super::redact::{MARKER, Redactor, value_rule};
+use super::redact::{self, MARKER, Redactor, value_rule};
 use super::sample::{MAX_SAMPLES, Sample, Samples};
 use super::template::{Seg, is_param, render, split_path};
 
@@ -289,7 +289,10 @@ impl Report {
     fn find(&self, exchange: &Exchange<'_>) -> Option<&Stats> {
         let scope = self.scopes.get(&exchange.direction)?.get(&exchange.port)?;
         if exchange.grpc {
-            return scope.raw.get(exchange.path)?.get(exchange.method);
+            return scope
+                .raw
+                .get(&redact::path(exchange.path))?
+                .get(exchange.method);
         }
         scope
             .root
@@ -371,7 +374,8 @@ impl Report {
         let methods = BTreeMap::from([(exchange.method.to_string(), stats)]);
         let mut scope = Scope::default();
         if exchange.grpc {
-            scope.raw.insert(exchange.path.to_string(), methods);
+            // Not templated, but redacted: the client chooses its `content-type`.
+            scope.raw.insert(redact::path(exchange.path), methods);
         } else {
             let mut node = Node {
                 endpoints: methods,

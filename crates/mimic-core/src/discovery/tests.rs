@@ -348,6 +348,7 @@ fn dsc_09_hosts_capped() {
 
 mod redaction {
     use super::super::redact::{MARKER, Redactor, path, value_rule};
+    use super::super::report::{Exchange, Report};
     use super::super::template::is_param;
     use serde_json::json;
 
@@ -518,6 +519,29 @@ mod redaction {
         }
         assert_eq!(path("/reset/ghp_a"), path("/reset/ghp_b"));
         assert_eq!(path("/reset/ghp_a"), "/reset/<redacted>");
+    }
+
+    #[test]
+    fn dsc_06_a_grpc_path_is_redacted_but_not_templated() {
+        let secret = format!("/pkg.Svc/{JWT}");
+        let exchange = Exchange {
+            grpc: true,
+            ..super::ex(&secret, 200, 1)
+        };
+        let mut report = Report::new(None);
+        report.record(&super::limits(50), &exchange);
+        let json = report.to_json();
+        assert!(!json.contains(JWT), "{json}");
+        assert!(json.contains("/pkg.Svc/<redacted>"), "{json}");
+        // Not templated: an id-like segment stays literal.
+        report.record(
+            &super::limits(50),
+            &Exchange {
+                grpc: true,
+                ..super::ex("/pkg.Svc/42", 200, 1)
+            },
+        );
+        assert!(report.to_json().contains("/pkg.Svc/42"));
     }
 
     #[test]
