@@ -7,13 +7,15 @@
 //! (or any socket failure) reaches it as a reset, also after a FIN. Each side is a plain TCP
 //! or a TLS [`Stream`]: over TLS the bytes are the decrypted ones and a FIN is `close_notify`
 //! then FIN. On `stop` (shutdown) the
-//! connection is closed, nothing added, as soon as the codec is between two messages.
+//! connection is closed, nothing added, as soon as the codec is between two messages: a FIN on
+//! both sides, after what the peers still sent was read and dropped (no reset).
 
 use std::future::Future;
 use std::io;
 use std::pin::pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::time::Duration;
 
 use mimic_core::proxy::http1::{Codec, Event};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -54,11 +56,17 @@ struct State<F> {
 struct Relay<F> {
     state: Mutex<State<F>>,
     /// A response completed, or the codec went silent: the client pump may use more bytes.
+    /// `notify_one` stores a permit when the pump is not waiting yet, so a response that
+    /// completes between the pump's refusal (`used == 0`) and its `notified().await` is not
+    /// lost; the pump then retries once and, if still gated, waits again.
     unblocked: Notify,
     /// The shutdown started: close at the next idle point.
     stopping: AtomicBool,
     /// The connection is idle while stopping: the relay can end.
     closing: Notify,
+    /// The client pump has written the bytes it was given (`first`): until then the codec has
+    /// not seen them and looks idle.
+    primed: AtomicBool,
     /// The destination sent its FIN: a gated client pump has nowhere to forward to.
     server_closed: AtomicBool,
     /// Which side sent its FIN first: `NONE`, `CLIENT` or `SERVER`.
@@ -83,7 +91,10 @@ impl<F: FnMut(Event)> Relay<F> {
 
     /// While stopping, ends the relay once nothing is pending and nothing is half-read.
     fn close_if_idle(&self) {
-        if self.stopping.load(Ordering::Relaxed) && self.with(|codec| (codec.idle(), Vec::new())) {
+        if self.stopping.load(Ordering::Relaxed)
+            && self.primed.load(Ordering::Acquire)
+            && self.with(|codec| (codec.idle(), Vec::new()))
+        {
             self.closing.notify_one();
         }
     }
@@ -107,6 +118,9 @@ impl<F: FnMut(Event)> Relay<F> {
             .fetch_add(held.len() as u64, Ordering::Relaxed);
         loop {
             if held.is_empty() {
+                // Everything handed over has been through the codec: it may now be idle.
+                self.primed.store(true, Ordering::Release);
+                self.close_if_idle();
                 let n = client.read(&mut buf).await.map_err(|e| (Side::Client, e))?;
                 if n == 0 {
                     self.first_to_close(CLIENT);
@@ -181,6 +195,23 @@ async fn fin(to: &mut (impl AsyncWrite + Unpin), side: Side) -> Result<(), Failu
     to.shutdown().await.map_err(|e| (side, e))
 }
 
+/// Most time the idle close waits for the peers to read the FIN and close.
+const IDLE_DRAIN: Duration = Duration::from_millis(250);
+
+/// Sends a FIN on both streams, then reads and drops what the peers still send until they
+/// close (or [`IDLE_DRAIN`] passes).
+async fn close_idle(client: &mut Stream, upstream: &mut Stream) {
+    async fn drain(stream: &mut Stream) {
+        let _ = stream.shutdown().await;
+        let mut buf = vec![0u8; CHUNK];
+        while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+    }
+    let _ = tokio::time::timeout(IDLE_DRAIN, async {
+        tokio::join!(drain(client), drain(upstream));
+    })
+    .await;
+}
+
 /// Relays one HTTP/1 connection until both sides are done, a side fails (the other one gets a
 /// reset), `stop` resolves and the connection is idle (no byte added: both sides see a FIN),
 /// or `abort_signal` resolves. `first` are the client bytes already read (by protocol
@@ -220,6 +251,7 @@ pub async fn relay_with(
         unblocked: Notify::new(),
         stopping: AtomicBool::new(false),
         closing: Notify::new(),
+        primed: AtomicBool::new(false),
         server_closed: AtomicBool::new(false),
         closed_first: AtomicU8::new(NONE),
         to_upstream: AtomicU64::new(0),
@@ -229,6 +261,7 @@ pub async fn relay_with(
         let mut abort_signal = pin!(abort_signal);
         let mut stop = pin!(stop);
         let mut stopping = false;
+        let mut idle_close = false;
         let (mut client_read, mut client_write) = tokio::io::split(&mut *client);
         let (mut upstream_read, mut upstream_write) = tokio::io::split(&mut *upstream);
         let mut pumps = pin!(async {
@@ -248,10 +281,20 @@ pub async fn relay_with(
                     relay.stopping.store(true, Ordering::Relaxed);
                     relay.close_if_idle();
                 }
-                () = relay.closing.notified() => break Ok(()),
+                () = relay.closing.notified() => {
+                    idle_close = true;
+                    break Ok(());
+                }
             }
         }
+        .map(|()| idle_close)
     };
+    // Closing a socket that holds unread bytes sends a reset: the idle close is a FIN on both
+    // sides, and what the client sent meanwhile is read and dropped before the caller closes.
+    if matches!(ended, Ok(true)) {
+        close_idle(client, upstream).await;
+    }
+    let ended = ended.map(|_| ());
     let unanswered = relay.with(|codec| (codec.pending(), Vec::new()));
     let partial_body = relay.with(|codec| {
         (
@@ -263,6 +306,7 @@ pub async fn relay_with(
         Ok(()) if unanswered > 0 && relay.closed_first.load(Ordering::Relaxed) == CLIENT => {
             (Outcome::ClientAbort, None)
         }
+        // The only place that names unanswered requests (`Http1Tracker::finish` takes it as is).
         Ok(()) if unanswered > 0 => (Outcome::UpstreamReset, None),
         Ok(()) => (Outcome::Ok, None),
         Err(None) => (Outcome::Shutdown, None),
@@ -283,5 +327,127 @@ pub async fn relay_with(
         to_client: relay.to_client.load(Ordering::Relaxed),
         unanswered,
         partial_body,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+
+    use super::*;
+
+    /// A connected pair: (the test's end, the relay's end).
+    async fn pair() -> (TcpStream, Stream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let near = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (far, _) = listener.accept().await.unwrap();
+        (near, Stream::plain(far))
+    }
+
+    const REQUEST: &[u8] = b"GET /a HTTP/1.1\r\nHost: a\r\n\r\n";
+
+    #[tokio::test]
+    async fn prx_13_detection_bytes_survive_a_shutdown_already_started() {
+        for round in 0..40 {
+            let ((client, mut relay_client), (mut dest, mut relay_dest)) =
+                (pair().await, pair().await);
+            let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+            let relayed = tokio::spawn(async move {
+                relay(
+                    &mut relay_client,
+                    &mut relay_dest,
+                    REQUEST.to_vec(),
+                    |_| {},
+                    std::future::ready(()),
+                    async {
+                        let _ = abort_rx.await;
+                    },
+                )
+                .await
+                .outcome
+            });
+            let mut got = vec![0u8; REQUEST.len()];
+            timeout(Duration::from_secs(2), dest.read_exact(&mut got))
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: the detection bytes were dropped"))
+                .unwrap();
+            assert_eq!(got, REQUEST);
+            drop(abort_tx);
+            let _ = relayed.await;
+            drop(client);
+        }
+    }
+
+    /// Reads to the end: `Ok` when the peer closed with a FIN, the error when it reset.
+    async fn end_of(s: &mut TcpStream) -> io::Result<()> {
+        let mut buf = [0u8; 64];
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if s.read(&mut buf).await? == 0 {
+                    return Ok(());
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(io::Error::other("the connection stayed open")))
+    }
+
+    #[tokio::test]
+    async fn prx_13_idle_close_with_unread_client_bytes_is_a_fin() {
+        for round in 0..20 {
+            let ((mut client, mut relay_client), (mut dest, mut relay_dest)) =
+                (pair().await, pair().await);
+            // Bytes that reached the socket after the connection was found idle.
+            client.write_all(b"GET /late HTT").await.unwrap();
+            dest.write_all(b"late too").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let closing = tokio::spawn(async move {
+                close_idle(&mut relay_client, &mut relay_dest).await;
+                drop((relay_client, relay_dest));
+            });
+            // The peers see the FIN (not a reset), then close.
+            end_of(&mut client)
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: {e}"));
+            end_of(&mut dest)
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: {e}"));
+            drop((client, dest));
+            closing.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prx_13_idle_relay_closes_both_sides_with_a_fin() {
+        let ((mut client, mut relay_client), (mut dest, mut relay_dest)) =
+            (pair().await, pair().await);
+        let stop = Arc::new(Notify::new());
+        let stopper = Arc::clone(&stop);
+        let relayed = tokio::spawn(async move {
+            let outcome = relay(
+                &mut relay_client,
+                &mut relay_dest,
+                Vec::new(),
+                |_| {},
+                async move { stopper.notified().await },
+                std::future::pending(),
+            )
+            .await
+            .outcome;
+            drop((relay_client, relay_dest));
+            outcome
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.notify_one();
+        end_of(&mut client).await.expect("a FIN to the client");
+        end_of(&mut dest).await.expect("a FIN to the destination");
+        assert_eq!(relayed.await.unwrap(), Outcome::Ok);
     }
 }

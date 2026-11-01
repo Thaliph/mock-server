@@ -226,6 +226,9 @@ impl Conn<'_> {
                 if let Some(e) = &relayed.error {
                     tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
                 }
+                if relayed.outcome == access::Outcome::Shutdown {
+                    tracing::debug!(direction = direction.as_str(), %dst, unanswered = relayed.unanswered, "http relay closed at the end of the grace");
+                }
                 return;
             }
             Served::H2(buf) => {
