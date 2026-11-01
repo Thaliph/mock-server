@@ -16,6 +16,7 @@ use hyper::{Request, Response, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, ReqBody, RespBody, Tracker};
 use crate::transport::Stream;
 
@@ -67,6 +68,7 @@ impl AsyncWrite for Replay {
 /// the streams of the client connection are multiplexed.
 struct State {
     ctx: Ctx,
+    tap: Option<Tap>,
     sender: hyper::client::conn::http2::SendRequest<ReqBody>,
 }
 
@@ -79,12 +81,25 @@ pub async fn relay(
     ctx: Ctx,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    relay_with(client, upstream, replay, ctx, None, stop).await
+}
+
+/// Like [`relay`], with the exchanges also handed to the discovery `tap` (spec §6).
+pub(crate) async fn relay_with(
+    client: Stream,
+    upstream: Stream,
+    replay: Vec<u8>,
+    ctx: Ctx,
+    tap: Option<Tap>,
+    stop: impl Future<Output = ()>,
+) -> io::Result<()> {
     let (sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, ReqBody>(TokioIo::new(upstream))
         .await
         .map_err(io::Error::other)?;
     let state = Arc::new(State {
         ctx: ctx.clone(),
+        tap,
         sender,
     });
     let service = service_fn(move |req| forward(state.clone(), req));
@@ -145,7 +160,7 @@ async fn forward(
     state: Arc<State>,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<RespBody>, hyper::Error> {
-    let (tracker, req) = Tracker::start(&state.ctx, PROTOCOL, req);
+    let (tracker, req) = Tracker::start(&state.ctx, PROTOCOL, state.tap.as_ref(), req);
     let mut sender = state.sender.clone();
     let sent = async {
         sender.ready().await?;

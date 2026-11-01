@@ -5,6 +5,7 @@
 
 mod capture;
 mod config;
+mod decode;
 mod metrics;
 mod recorder;
 mod redactions;

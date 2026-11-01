@@ -2,6 +2,7 @@
 //! (spec §6). Parsing of the captured heads, body classification, the core `Report::record`,
 //! metrics and logs all happen here, never on a proxy task.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -11,6 +12,7 @@ use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::{Direction, Exchange, Limits, Outcome, Report, Sampled};
 
 use super::capture::{Part, Record};
+use super::decode;
 use super::metrics::DiscoveryMetrics;
 use super::redactions::{self, Counts};
 
@@ -122,26 +124,25 @@ fn is_json(media: &str) -> bool {
     media == "application/json" || media.ends_with("+json")
 }
 
-fn encoded(headers: &[(String, String)]) -> bool {
-    header(headers, "content-encoding")
-        .is_some_and(|v| !v.trim().is_empty() && !v.trim().eq_ignore_ascii_case("identity"))
-}
-
-/// The `result` of `mimic_discovery_bodies_total` for a part, and the bytes to infer from.
+/// The `result` of `mimic_discovery_bodies_total` for a part, and the decoded bytes to infer
+/// from.
 fn classify<'a>(
     part: &'a Part,
     headers: &[(String, String)],
-) -> Option<(&'static str, Option<&'a [u8]>)> {
+) -> Option<(&'static str, Option<Cow<'a, [u8]>>)> {
     Some(match part {
         Part::Absent => return None,
         Part::Empty => ("empty", None),
         Part::Budget => ("budget", None),
         Part::TooLarge => ("too_large", None),
-        Part::Data(_) if encoded(headers) => ("encoding", None),
         Part::Data(bytes) => {
+            let bytes = match decode::decode(bytes, header(headers, "content-encoding")) {
+                Ok(bytes) => bytes,
+                Err(failure) => return Some((failure.result(), None)),
+            };
             let media = media(headers);
             let result = if is_json(&media) {
-                if serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok() {
+                if serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_ok() {
                     "parsed"
                 } else {
                     "invalid"
@@ -151,7 +152,7 @@ fn classify<'a>(
             } else {
                 "opaque"
             };
-            (result, Some(bytes.as_slice()))
+            (result, Some(bytes))
         }
     })
 }
@@ -241,9 +242,13 @@ impl Recorder {
             observation: Observation {
                 query: &request.query,
                 req_headers: &req,
-                req_body: request_body.and_then(|(_, bytes)| bytes),
+                req_body: request_body
+                    .as_ref()
+                    .and_then(|(_, bytes)| bytes.as_deref()),
                 resp_headers: &resp,
-                resp_body: response_body.and_then(|(_, bytes)| bytes),
+                resp_body: response_body
+                    .as_ref()
+                    .and_then(|(_, bytes)| bytes.as_deref()),
             },
         };
         let (outcome, endpoints, sample_bytes) = {
@@ -281,7 +286,7 @@ impl Recorder {
                 }
             }
             Outcome::Recorded { sample, .. } => {
-                for (part, body) in [("request", request_body), ("response", response_body)] {
+                for (part, body) in [("request", &request_body), ("response", &response_body)] {
                     if let Some((result, _)) = body {
                         self.metrics.body(direction, part, result);
                     }
@@ -289,8 +294,8 @@ impl Recorder {
                 self.count_redactions(
                     &request,
                     &response_headers,
-                    &record.request,
-                    &record.response,
+                    request_body.as_ref().and_then(|(_, b)| b.as_deref()),
+                    response_body.as_ref().and_then(|(_, b)| b.as_deref()),
                 );
                 self.samples(direction, sample, sample_bytes);
                 if let Some(endpoints) = endpoints {
@@ -380,8 +385,8 @@ impl Recorder {
         &self,
         request: &Request,
         response_headers: &[(String, String)],
-        request_body: &Part,
-        response_body: &Part,
+        request_body: Option<&[u8]>,
+        response_body: Option<&[u8]>,
     ) {
         let mut counts = Counts::new();
         redactions::path(&mut counts, &request.path);
@@ -392,10 +397,7 @@ impl Recorder {
             (request_body, request.headers.as_slice()),
             (response_body, response_headers),
         ] {
-            let Part::Data(bytes) = part else { continue };
-            if encoded(headers) {
-                continue;
-            }
+            let Some(bytes) = part else { continue };
             let media = media(headers);
             if is_json(&media) {
                 redactions::json(&mut counts, &self.redactor, bytes);

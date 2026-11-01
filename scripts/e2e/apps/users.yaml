@@ -1,0 +1,32 @@
+# Service B of the e2e apps (scripts/e2e/apps/service.py): the users API, two replicas behind the Service
+# `users`. Apply with `kubectl -n <namespace> apply -f`, after creating the ConfigMap apps-code in that
+# namespace from service.py. Pinned: python:3.13-slim by digest.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: users}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: users}}
+  template:
+    metadata: {labels: {app: users}}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: docker.io/library/python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb
+          command: [python3, /code/service.py]
+          env: [{name: APP_NAME, value: users}]
+          ports: [{name: api, containerPort: 8080}]
+          # An httpGet probe, not tcpSocket: the injector (mimic-core, excluded_inbound_ports) leaves the ports
+          # of tcpSocket probes out of inbound interception, so the app's own traffic would bypass the sidecar.
+          readinessProbe: {httpGet: {path: /users/0, port: api}, periodSeconds: 1}
+          volumeMounts: [{name: code, mountPath: /code, readOnly: true}]
+      volumes:
+        - {name: code, configMap: {name: apps-code}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: users}
+spec:
+  selector: {app: users}
+  ports: [{name: api, port: 8080, targetPort: api}]

@@ -275,8 +275,77 @@ impl Redactor {
                     None => first,
                 }
             }
-            _ => self.field(name, value),
+            _ => {
+                let v = self.field(name, value);
+                if v == MARKER { v } else { self.urls(&v) }
+            }
         }
+    }
+
+    /// URLs inside a header value (`Location`, `Referer`, `Link: <u>; rel=next`, `Refresh`,
+    /// ...): each one is redacted like a path plus query. Other text is unchanged.
+    fn urls(&self, value: &str) -> String {
+        const DELIMS: &[char] = &[' ', ';', ',', '<', '>', '"', '\''];
+        let mut out = String::with_capacity(value.len());
+        let mut rest = value;
+        while !rest.is_empty() {
+            let end = rest.find(DELIMS).unwrap_or(rest.len());
+            let (token, tail) = rest.split_at(end);
+            out.push_str(&self.url_token(token));
+            let delim_end = tail.find(|c| !DELIMS.contains(&c)).unwrap_or(tail.len());
+            out.push_str(&tail[..delim_end]);
+            rest = &tail[delim_end..];
+        }
+        out
+    }
+
+    fn url_token(&self, token: &str) -> String {
+        let start = match token.find("://") {
+            Some(i) => token[..i]
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+                .map_or(0, |j| j + 1),
+            None if token.starts_with('/') => 0,
+            None => return token.to_string(),
+        };
+        let (prefix, url) = token.split_at(start);
+        let (before_frag, frag) = match url.split_once('#') {
+            Some((u, f)) => (u, Some(f)),
+            None => (url, None),
+        };
+        let (base, query) = match before_frag.split_once('?') {
+            Some((b, q)) => (b, Some(q)),
+            None => (before_frag, None),
+        };
+        // Scheme and authority are kept; only what follows is a path.
+        let (origin, p) = match base.split_once("://") {
+            Some((scheme, rest)) => match rest.find('/') {
+                Some(i) => (format!("{scheme}://{}", &rest[..i]), &rest[i..]),
+                None => (base.to_string(), ""),
+            },
+            None => (String::new(), base),
+        };
+        let mut out = format!("{prefix}{origin}{}", path(p));
+        if let Some(q) = query {
+            out.push('?');
+            out.push_str(&self.pairs(q));
+        }
+        if let Some(f) = frag {
+            out.push('#');
+            out.push_str(&self.pairs(f));
+        }
+        out
+    }
+
+    /// `k=v&k=v` with each pair through `field`; a bare item through the value detectors.
+    fn pairs(&self, s: &str) -> String {
+        s.split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((k, v)) => format!("{k}={}", self.field(k, v)),
+                None if value_rule(pair).is_some() || self.name_matches(pair) => MARKER.to_string(),
+                None => pair.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("&")
     }
 
     /// A query value or form field: the marker when the name or the value is sensitive.

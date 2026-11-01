@@ -7,8 +7,8 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -16,7 +16,7 @@ use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap};
 use hyper::{Request, Response};
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
-use mimic_core::proxy::http1::{Captured, Event, RequestHead, Side};
+use mimic_core::proxy::http1::{CAPTURE_BODY_LIMIT, Captured, Event, RequestHead, Side};
 
 use crate::access::{self, Outcome};
 use crate::discovery::{Capture, Meta, Tap};
@@ -55,6 +55,69 @@ pub(crate) struct ReqBody {
     /// The request carried a `content-length`: only then is the length known to hand on.
     sized: bool,
     count: Arc<RequestCount>,
+    /// Copies the body for discovery (spec §6).
+    tee: Option<Tee>,
+}
+
+/// The exchange being captured, shared by the request side, the response side and the tracker.
+type SharedCapture = Arc<Mutex<Option<Capture>>>;
+
+/// Copies the body frames that pass into the [`Capture`] of the exchange, up to the capture
+/// limit; the frames themselves are forwarded unchanged.
+struct Tee {
+    capture: SharedCapture,
+    request: bool,
+    kept: usize,
+    ended: bool,
+}
+
+impl Tee {
+    fn new(capture: &SharedCapture, request: bool) -> Tee {
+        Tee {
+            capture: capture.clone(),
+            request,
+            kept: 0,
+            ended: false,
+        }
+    }
+
+    fn with(&self, f: impl FnOnce(&mut Capture)) {
+        let mut capture = self.capture.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(capture) = capture.as_mut() {
+            f(capture);
+        }
+    }
+
+    fn data(&mut self, data: &[u8]) {
+        let take = data.len().min(CAPTURE_BODY_LIMIT - self.kept);
+        if take == 0 {
+            return;
+        }
+        self.kept += take;
+        let bytes = data[..take].to_vec();
+        let captured = if self.request {
+            Captured::RequestBody(bytes)
+        } else {
+            Captured::ResponseBody(bytes)
+        };
+        self.with(|capture| capture.push(captured));
+    }
+
+    /// The body is complete: `total` payload bytes went through.
+    fn end(&mut self, total: u64) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
+        let request = self.request;
+        self.with(|capture| {
+            if request {
+                capture.request_end(total);
+            } else {
+                capture.response_end(total);
+            }
+        });
+    }
 }
 
 impl Body for ReqBody {
@@ -73,6 +136,20 @@ impl Body for ReqBody {
                     this.count
                         .bytes
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    if let Some(tee) = this.tee.as_mut() {
+                        tee.data(data);
+                    }
+                }
+                // The server may not poll again once it knows the body is complete.
+                if this.inner.is_end_stream()
+                    && let Some(tee) = this.tee.as_mut()
+                {
+                    tee.end(this.count.bytes.load(Ordering::Relaxed));
+                }
+            }
+            Poll::Ready(None) => {
+                if let Some(tee) = this.tee.as_mut() {
+                    tee.end(this.count.bytes.load(Ordering::Relaxed));
                 }
             }
             Poll::Ready(Some(Err(_))) => this.count.failed.store(true, Ordering::Relaxed),
@@ -112,6 +189,26 @@ pub(crate) struct Tracker {
     counted: bool,
     /// The access line was written.
     ended: bool,
+    /// The bytes discovery captures (spec §6), when it is on for this connection.
+    capture: Option<SharedCapture>,
+    tap: Option<Tap>,
+    /// The authority the request named, normalised.
+    named_authority: Option<String>,
+}
+
+/// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
+fn head_text(first_line: &str, headers: &HeaderMap) -> Vec<u8> {
+    let mut out = Vec::with_capacity(first_line.len() + 64 * headers.len());
+    out.extend_from_slice(first_line.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for (name, value) in headers {
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 fn grpc_status(headers: &HeaderMap) -> Option<u64> {
@@ -136,18 +233,35 @@ impl Tracker {
     pub(crate) fn start(
         ctx: &Ctx,
         protocol: &'static str,
+        tap: Option<&Tap>,
         req: Request<Incoming>,
     ) -> (Tracker, Request<ReqBody>) {
         let host = req
             .headers()
             .get(header::HOST)
             .map(|host| host.to_str().unwrap_or(""));
-        let authority = target_authority(req.uri().authority().map(|a| a.as_str()), host)
-            .map_or_else(
-                || ctx.dst.to_string(),
-                |raw| normalise_authority(raw, ctx.default_port()),
-            );
+        let named_authority = target_authority(req.uri().authority().map(|a| a.as_str()), host)
+            .map(|raw| normalise_authority(raw, ctx.default_port()));
+        let authority = named_authority
+            .clone()
+            .unwrap_or_else(|| ctx.dst.to_string());
         let request = Arc::new(RequestCount::default());
+        // An extended `CONNECT` is a tunnel, not an exchange.
+        let capture = tap
+            .filter(|_| req.method() != hyper::Method::CONNECT)
+            .map(|tap| {
+                let mut capture = tap.capture();
+                let target = req
+                    .uri()
+                    .path_and_query()
+                    .map_or("/", |p| p.as_str())
+                    .to_string();
+                capture.push(Captured::RequestHead(head_text(
+                    &format!("{} {target} HTTP/1.1", req.method()),
+                    req.headers(),
+                )));
+                Arc::new(Mutex::new(Some(capture)))
+            });
         let tracker = Tracker {
             ctx: ctx.clone(),
             protocol,
@@ -161,12 +275,22 @@ impl Tracker {
             grpc_status: None,
             counted: false,
             ended: false,
+            capture: capture.clone(),
+            tap: tap.cloned(),
+            named_authority,
         };
         let (parts, inner) = req.into_parts();
+        let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
+        if let Some(tee) = tee.as_mut()
+            && inner.is_end_stream()
+        {
+            tee.end(0);
+        }
         let body = ReqBody {
             inner,
             sized: parts.headers.contains_key(header::CONTENT_LENGTH),
             count: request,
+            tee,
         };
         (tracker, Request::from_parts(parts, body))
     }
@@ -206,17 +330,57 @@ impl Tracker {
             head,
         );
         let (parts, inner) = response.into_parts();
+        let mut tee = self.capture.as_ref().map(|c| Tee::new(c, false));
+        if let (Some(tee), Some(capture)) = (tee.as_mut(), self.capture.as_ref()) {
+            let line = format!("HTTP/1.1 {status}");
+            if let Some(capture) = capture
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                capture.push(Captured::ResponseHead(head_text(&line, &parts.headers)));
+            }
+            if inner.is_end_stream() {
+                tee.end(0);
+            }
+        }
         let body = RespBody {
             inner,
             tracker: Some(self),
             bytes_out: 0,
             trailers_seen: false,
+            tee,
         };
         Response::from_parts(parts, body)
     }
 
+    /// Hands an exchange that got a response head to discovery.
+    fn discover(&mut self) {
+        let (Some(capture), Some(tap), Some(status), Some(head)) = (
+            self.capture
+                .take()
+                .and_then(|c| c.lock().unwrap_or_else(PoisonError::into_inner).take()),
+            self.tap.as_ref(),
+            self.status,
+            self.head,
+        ) else {
+            return;
+        };
+        tap.submit(
+            capture,
+            Meta {
+                port: self.ctx.dst.port(),
+                authority: self.named_authority.take(),
+                status,
+                head_ms: head.as_millis() as u64,
+                tunnel: false,
+            },
+        );
+    }
+
     fn finish(&mut self, outcome: Outcome, bytes_out: u64) {
         self.ended = true;
+        self.discover();
         let failed = self.request.failed.load(Ordering::Relaxed);
         let outcome = if outcome == Outcome::Ok {
             outcome
@@ -271,10 +435,17 @@ pub(crate) struct RespBody {
     bytes_out: u64,
     /// The trailers, the last frame, were handed over: the server may not poll for the end.
     trailers_seen: bool,
+    /// Copies the body for discovery (spec §6).
+    tee: Option<Tee>,
 }
 
 impl RespBody {
     fn end(&mut self, outcome: Outcome) {
+        if self.inner.is_end_stream()
+            && let Some(tee) = self.tee.as_mut()
+        {
+            tee.end(self.bytes_out);
+        }
         if let Some(mut tracker) = self.tracker.take() {
             tracker.finish(outcome, self.bytes_out);
         }
@@ -295,6 +466,9 @@ impl Body for RespBody {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     this.bytes_out += data.len() as u64;
+                    if let Some(tee) = this.tee.as_mut() {
+                        tee.data(data);
+                    }
                 } else if let Some(trailers) = frame.trailers_ref() {
                     this.trailers_seen = true;
                     if let (Some(tracker), Some(status)) =
@@ -304,7 +478,12 @@ impl Body for RespBody {
                     }
                 }
             }
-            Poll::Ready(None) => this.end(Outcome::Ok),
+            Poll::Ready(None) => {
+                if let Some(tee) = this.tee.as_mut() {
+                    tee.end(this.bytes_out);
+                }
+                this.end(Outcome::Ok);
+            }
             Poll::Ready(Some(Err(_))) => this.end(Outcome::UpstreamReset),
             Poll::Pending => {}
         }

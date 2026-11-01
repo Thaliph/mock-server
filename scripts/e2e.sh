@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26). Idempotent:
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22).
+# Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
 #   TAG=e2e-<sha>-<pid>                         tag of the images built here (unique per run, so
@@ -732,20 +733,23 @@ done
 tls_pod() { kubectl -n tls-clients get pods -l "app=$1" -o jsonpath='{.items[0].metadata.name}'; }
 # tls_exec <client> <command...>: runs the command in the client's app container; stderr joins stdout.
 tls_exec() { local c=$1; shift; kubectl -n tls-clients exec "deploy/$c" -c app -- "$@" 2>&1; }
-# sidecar_metrics <namespace> <pod>: the Prometheus text of the sidecar's admin port (15100), through a
-# port-forward so that the check does not depend on the application image.
-sidecar_metrics() {
+# sidecar_get <namespace> <pod> <path>: the body of GET <path> on the sidecar's admin port (15100) through a
+# port-forward, so the peer is loopback (as for /discovery). Empty when the request fails.
+sidecar_get() {
   local port=$((29000 + RANDOM % 1000)) pf out=""
   kubectl -n "$1" port-forward "$2" "$port:15100" >/dev/null 2>&1 &
   pf=$!
   for _ in $(seq 20); do
-    out=$(curl -fs "localhost:$port/metrics") && break
+    out=$(curl -fs "localhost:$port$3") && break
     sleep 0.5
   done
   kill "$pf" 2>/dev/null || true
   wait "$pf" 2>/dev/null || true
   printf '%s\n' "$out"
 }
+# sidecar_metrics <namespace> <pod>: the Prometheus text of the sidecar's admin port (15100), through a
+# port-forward so that the check does not depend on the application image.
+sidecar_metrics() { sidecar_get "$1" "$2" /metrics; }
 # ready_tls <client>: waits until the client's sidecar holds an intermediate (TLS-15). Before that the
 # sidecar passes TLS through (`no_ca`), which would hide what the checks below look for.
 ready_tls() {
@@ -1133,6 +1137,209 @@ kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 [[ $(seed_of) == "$seed0" ]] || fail "tls_24: the seed changed across a controller restart"
 kubectl -n tls-clients delete pods --all --wait=false >/dev/null
 kubectl delete namespace tls-clients tls-dest --wait=false >/dev/null
+
+# --- Endpoint discovery (F4, spec §6, §7, §12.5 DSC-20, DSC-22) ---------------------------------------
+# The CRD takes spec.discovery.redact: an entry with /, an empty entry and 65 entries are refused.
+log "dsc_20: the CRD accepts spec.discovery.redact and rejects an entry with /, an empty entry and 65 entries"
+accepted "a MimicWorkload with spec.discovery.redact" workload dsc20-ok \
+  "spec: {deployment: api, discovery: {redact: [x-tenant-key, pin]}}"
+kubectl -n default delete mimicworkload dsc20-ok --ignore-not-found >/dev/null
+denied "a spec.discovery.redact entry with /" workload dsc20-slash "spec: {deployment: api, discovery: {redact: [a/b]}}"
+denied "an empty spec.discovery.redact entry" workload dsc20-empty 'spec: {deployment: api, discovery: {redact: [""]}}'
+denied "65 spec.discovery.redact entries" workload dsc20-many \
+  "spec: {deployment: api, discovery: {redact: [$(seq -s, -f 'r%g' 0 64)]}}"
+
+# endpoints <report file>: the endpoints of a /discovery report (spec §6) as a JSON array. The template
+# tree is walked: a parameter is named after the literal before it, {<literal>_id}, or {param<n>}.
+cat > "$WORK/endpoints.jq" <<'JQ'
+def sanitize: ascii_downcase | gsub("[^a-z0-9]"; "_");
+def walk_node($node; $prefix; $depth; $lit):
+  ( ($node.endpoints // {}) | to_entries[]
+    | {method: .key, template: (if $prefix == "" then "/" else $prefix end), stats: .value} ),
+  ( ($node.literals // {}) | to_entries[]
+    | walk_node(.value; "\($prefix)/\(.key)"; $depth + 1; .key) ),
+  ( $node.param // empty
+    | walk_node(.; "\($prefix)/{\(if ($lit // "") != "" then ($lit | sanitize) + "_id" else "param\($depth + 1)" end)}"; $depth + 1; null) );
+[ .scopes | to_entries[] | .key as $direction | .value | to_entries[] | .key as $port | .value.root
+  | walk_node(.; ""; 0; null) | {direction: $direction, port: $port, method, template, stats} ]
+JQ
+endpoints() { jq -c -f "$WORK/endpoints.jq" "$1"; }
+
+# The e2e apps (scripts/e2e/apps): B, the users API with two replicas behind the Service users, in an
+# enabled namespace; A (front) forwards to B, and the client calls A, in a namespace mimic does not inject.
+log "dsc_20: a newly created pod gets the sorted union of the MimicWorkloads' redact names; a deployment without one gets none"
+ns_fresh disc-22-client
+ns_fresh disc-22 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: users-a, namespace: disc-22}
+spec: {deployment: users, discovery: {redact: [x-tenant-key, pin]}}
+---
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: users-b, namespace: disc-22}
+spec: {deployment: users, discovery: {redact: [pin, badge]}}
+YAML
+# The controller's MimicWorkload cache follows the API server within seconds (as in INJ-15).
+sleep 5
+for ns in disc-22 disc-22-client; do
+  kubectl -n "$ns" create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py >/dev/null
+done
+kubectl -n disc-22 apply -f scripts/e2e/apps/users.yaml >/dev/null
+kubectl -n disc-22-client apply -f scripts/e2e/apps/front.yaml >/dev/null
+deploy_sleeper disc-22 plain
+kubectl -n disc-22 rollout status deploy/users --timeout=3m \
+  || { kubectl -n disc-22 describe pods -l app=users >&2 || true; fail "dsc_22: deployment users did not roll out"; }
+kubectl -n disc-22 rollout status deploy/plain --timeout=3m >/dev/null || fail "dsc_20: deployment plain did not roll out"
+kubectl -n disc-22-client rollout status deploy/front --timeout=3m >/dev/null || fail "dsc_22: deployment front did not roll out"
+kubectl -n disc-22-client wait --for=condition=Ready pod/client --timeout=180s >/dev/null || fail "dsc_22: client pod not Ready"
+for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}'); do
+  [[ $(jp disc-22 "$p" '{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_DISCOVERY_REDACT_NAMES")].value}') == badge,pin,x-tenant-key ]] \
+    || fail "dsc_20: pod $p does not carry MIMIC_DISCOVERY_REDACT_NAMES=badge,pin,x-tenant-key"
+done
+plain_pod=$(kubectl -n disc-22 get pods -l app=plain -o jsonpath='{.items[0].metadata.name}')
+has_mimic disc-22 app=plain || fail "dsc_20: the plain deployment was not injected"
+[[ -z $(jp disc-22 "$plain_pod" '{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_DISCOVERY_REDACT_NAMES")].value}') ]] \
+  || fail "dsc_20: a deployment without a MimicWorkload carries MIMIC_DISCOVERY_REDACT_NAMES"
+
+log "dsc_22: calls through A to /users/<id> with a canary token, an x-tenant-key canary and JSON bodies show up per pod, redacted"
+token="dsc22-token-$(openssl rand -hex 12)"
+tenant="dsc22-tenant-$(openssl rand -hex 12)"
+secret="dsc22-password-$(openssl rand -hex 12)"
+canaries=("$token" "$tenant" "$secret")
+# kube-proxy programs a Ready endpoint a little after the rollout reports it: warm up through the Service
+# until each pod has logged a request of its own, so that the calls below reach both pods. The
+# readiness probes log /users/0 (from the pod itself), so the warm-up path is /users/warm.
+warm_seen() {
+  local seen=0 p
+  for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}'); do
+    if (( $(kubectl -n disc-22 logs "$p" -c app | grep -c '"path": "/users/warm"' || true) > 0 )); then seen=$((seen + 1)); fi
+  done
+  echo "$seen"
+}
+for _ in $(seq 60); do
+  kubectl -n disc-22-client exec client -- python3 -c \
+    'import urllib.request; urllib.request.urlopen("http://front.disc-22-client.svc:8080/front/users/warm", timeout=5).read()' \
+    >/dev/null 2>&1 || true
+  [[ $(warm_seen) == 2 ]] && break
+  sleep 1
+done
+[[ $(warm_seen) == 2 ]] || fail "dsc_22: the Service does not reach both pods"
+kubectl -n disc-22-client exec -i client -- python3 - "$token" "$tenant" "$secret" <<'PY' || fail "dsc_22: the calls through front failed"
+import json, sys, urllib.request
+token, tenant, secret = sys.argv[1:4]
+base = "http://front.disc-22-client.svc:8080/front/users"
+ids = [str(n) for n in range(1, 31)] + ["3f2b9c1d-8a7e-4c5b-9d6e-1a2b3c4d5e6f"]
+auth = {"Authorization": f"Bearer {token}", "X-Tenant-Key": tenant}
+for uid in ids:
+    with urllib.request.urlopen(urllib.request.Request(f"{base}/{uid}", headers=auth), timeout=10) as r:
+        r.read()
+for uid in ids[:10]:
+    body = json.dumps({"name": "user " + uid, "password": secret}).encode()
+    headers = dict(auth, **{"Content-Type": "application/json"})
+    with urllib.request.urlopen(urllib.request.Request(f"{base}/{uid}", data=body, method="PUT", headers=headers), timeout=10) as r:
+        r.read()
+PY
+
+dsc_pods=$(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}')
+# users_ready <report file>: GET /users/{users_id} has a 200, a response schema with a name, samples whose
+# x-tenant-key is <redacted> and whose Authorization is Bearer <redacted>.
+users_ready() {
+  endpoints "$1" | jq -e '
+    .[] | select(.direction == "inbound" and .method == "GET" and .template == "/users/{users_id}")
+    | select((.stats.statuses["200"] // 0) > 0
+      and ((.stats.observed.response.bodies["application/json"].json.object.props // {}) | has("name"))
+      and ((.stats.samples | length) > 0)
+      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "x-tenant-key") | .[1]] | any(. == "<redacted>"))
+      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "authorization") | .[1]] | any(. == "Bearer <redacted>")))
+  ' >/dev/null
+}
+for p in $dsc_pods; do
+  ready=0
+  for _ in $(seq 30); do
+    sidecar_get disc-22 "$p" /discovery > "$WORK/discovery-$p.json"
+    if users_ready "$WORK/discovery-$p.json"; then ready=1; break; fi
+    sleep 1
+  done
+  if [[ $ready != 1 ]]; then
+    # Names and counts only (no values, no samples): what the pod's report holds instead.
+    echo "dsc_22: $p report is $(wc -c < "$WORK/discovery-$p.json") bytes; inbound exclusions" \
+      "$(jp disc-22 "$p" '{.spec.initContainers[?(@.name=="mimic-init")].env[?(@.name=="MIMIC_EXCLUDE_INBOUND_PORTS")].value}')," \
+      "access lines $(kubectl -n disc-22 logs "$p" -c mimic-sidecar | grep -c '"target":"access"' || true); endpoints:" >&2
+    endpoints "$WORK/discovery-$p.json" | jq -c '[.[] | {direction, method, template, statuses: .stats.statuses,
+      props: ((.stats.observed.response.bodies["application/json"].json.object.props // {}) | keys),
+      samples: (.stats.samples | length), sample_headers: ([.stats.samples[].request.headers[][0]] | unique)}]' >&2 || true
+    fail "dsc_22: pod $p does not show GET /users/{users_id} with a response schema, samples and redacted credentials"
+  fi
+done
+
+# No canary in any /discovery output or pod log (DSC-22, DSC-15).
+for p in $dsc_pods; do
+  for c in "${canaries[@]}"; do
+    if grep -F "$c" "$WORK/discovery-$p.json" >/dev/null; then fail "dsc_22: a canary appears in the /discovery of $p"; fi
+  done
+done
+{
+  for p in $dsc_pods; do kubectl -n disc-22 logs "$p" --all-containers; done
+  kubectl -n disc-22-client logs deploy/front --all-containers
+  kubectl -n disc-22-client logs client
+} > "$WORK/dsc22.log"
+for c in "${canaries[@]}"; do
+  if grep -F "$c" "$WORK/dsc22.log" >/dev/null; then fail "dsc_22: a canary appears in a pod log"; fi
+done
+# The logs explain the traffic: B logs its GETs, A logs its forwarded calls.
+jq -R -e 'fromjson? | select(.app == "users" and .method == "GET" and .status == 200 and (.path | startswith("/users/")))' \
+  "$WORK/dsc22.log" >/dev/null || fail "dsc_22: no access line for GET /users/<id> in the users pods"
+jq -R -e 'fromjson? | select(.app == "front" and .method == "GET" and .status == 200 and (.path | startswith("/front/users/")))' \
+  "$WORK/dsc22.log" >/dev/null || fail "dsc_22: no access line for the forwarded calls in front"
+
+# dsc_templates <pods...>: the inbound endpoints of each pod's /discovery, one "pod method template" per line.
+dsc_templates() {
+  local p
+  for p in "$@"; do
+    sidecar_get disc-22 "$p" /discovery > "$WORK/templates-$p.json"
+    endpoints "$WORK/templates-$p.json" | jq -r '.[] | select(.direction == "inbound") | "\(.method) \(.template)"' \
+      | sed "s/^/$p /"
+  done | sort
+}
+# not_found_total <pods...>: the sum over the pods of mimic_discovery_exchanges_total{direction="inbound",result="not_found"}.
+not_found_total() {
+  local total=0 p n
+  for p in "$@"; do
+    n=$(sidecar_metrics disc-22 "$p" \
+      | awk 'index($0, "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"not_found\"}") == 1 { printf "%d\n", $2 }' \
+      | tail -1)
+    total=$((total + ${n:-0}))
+  done
+  echo "$total"
+}
+
+log "dsc_22: a 404 storm on random root paths, through front, creates no endpoint"
+before_tpl=$(dsc_templates $dsc_pods) || fail "dsc_22: cannot read the endpoints before the storm"
+before_404=$(not_found_total $dsc_pods)
+hits=$(kubectl -n disc-22-client exec -i client -- python3 - <<'PY'
+import os, urllib.error, urllib.request
+hits = 0
+for _ in range(100):
+    try:
+        urllib.request.urlopen(f"http://front.disc-22-client.svc:8080/front/{os.urandom(8).hex()}", timeout=10).read()
+    except urllib.error.HTTPError as e:
+        hits += e.code == 404
+print(hits)
+PY
+) || fail "dsc_22: the 404 storm failed"
+[[ $hits == 100 ]] || fail "dsc_22: $hits of 100 random root paths answered 404"
+after_404=$before_404
+for _ in $(seq 20); do
+  after_404=$(not_found_total $dsc_pods)
+  (( after_404 >= before_404 + 100 )) && break
+  sleep 1
+done
+(( after_404 >= before_404 + 100 )) || fail "dsc_22: the 404s were not counted as not_found ($before_404 -> $after_404)"
+after_tpl=$(dsc_templates $dsc_pods) || fail "dsc_22: cannot read the endpoints after the storm"
+[[ $after_tpl == "$before_tpl" ]] || fail "dsc_22: the 404 storm changed the endpoints"
+kubectl delete namespace disc-22 disc-22-client --wait=false >/dev/null
 
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"
 kubectl apply -f - >/dev/null <<YAML
