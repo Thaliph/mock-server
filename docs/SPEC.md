@@ -610,7 +610,7 @@ Everything below except the capture tap, content decoding and the recorder threa
   merging locally within the same bounds. Replicas therefore merge only in the controller,
   with the same pure merge; the controller re-applies templating on the union, so a position
   that each pod sees below the literal limit but the deployment sees above it is absorbed.
-  Key layout, TTL (samples 30 days) and the API are specified in F5.
+  Key layout, retention (30 days) and the API are in §7.3 and §7.2.
 - **Consumers.** F6 renders reports as OpenAPI 3.1. F7 records egress with the same engine.
   F10 mock matching ignores volatile and redacted fields (§8). F11 (load test) builds requests
   from ingress templates, samples, schemas and volatility; redacted values (credentials) must
@@ -624,18 +624,19 @@ Everything below except the capture tap, content decoding and the recorder threa
   `spec.mode` (`discovery` | `mock`, default `discovery`), `spec.tls.exclude` (F3, §5),
   `spec.discovery.redact` (F4, §6: extra names redacted by name, at most 64, each of `a-z`, `A-Z`, `0-9`, `-`, `_`,
   lower-cased by the webhook, applied like `spec.tls.exclude` to pods created afterwards),
-  latency settings; `status` reports pods, mode convergence and
-  counts. F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
+  latency settings; `status` reports the deployment's discovery counts and pushing pods
+  (F5, §7.4), later mode convergence (F10). F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
   with their feature. When several `MimicWorkload`s name the same deployment, any of them
   selects it for injection; which one sets the mode is decided in F10.
-- Sidecars push their local recordings periodically and pull the deployment's mode and, in mock
-  mode, its aggregated egress recordings. Valkey keys are namespaced by
-  `<namespace>/<deployment>`.
+- Sidecars push their local recordings periodically (§6 "Shipping", §7.2) and, from F9/F10,
+  pull the deployment's mode and, in mock mode, its aggregated egress recordings. Valkey keys
+  are namespaced by `<namespace>/<deployment>` (§7.3).
 - The controller merges endpoints of all pods of a deployment (same endpoint key → merged
   counters, histograms, schemas, sample sets) with the pure merge of §6, which also
-  re-applies path templating on the union.
-- The UI and its API are read-only and served on the controller's HTTP port, reached by
-  `kubectl port-forward` (Kubernetes RBAC is the authentication).
+  re-applies path templating on the union, within the store bounds of §7.3.
+- The UI and its API are read-only and served on the controller's UI listener, bound to
+  loopback and reached by `kubectl port-forward` (Kubernetes RBAC `pods/portforward` in the
+  controller's namespace is the authentication, §7.5).
 
 ### 7.1 Injection
 
@@ -758,7 +759,18 @@ Everything below except the capture tap, content decoding and the recorder threa
   accepts it only if the pod name is one the ReplicaSet of that deployment can generate:
   `<deployment>-<pod-template-hash>-<5 chars>`, the part before the 5 chars truncated to 58
   characters, the hash made of the characters `bcdfghjklmnpqrstvwxz2456789`. No pod or
-  ReplicaSet is read. F5 extends this API with the same authentication.
+  ReplicaSet is read (§11.1).
+- **Admission order** (F5, every endpoint): connection cap and timeouts; then a **per-source
+  rate limit**, a token bucket per peer IP address of `MIMIC_SIDECAR_API_RATE` requests per
+  second with a burst of twice that (at most 65 536 sources tracked, the least recently seen
+  forgotten first): a request over it gets `429` with `Retry-After: 1` and causes no
+  `TokenReview`; then authentication from the headers alone, so that a body is read only for
+  an authenticated caller (the report endpoint, whose deployment is in its path, is also
+  authorised before its body is read). A successful review is cached
+  for 60 s (at most 10 000 entries, keyed by the SHA-256 of the token; the token itself is
+  never kept); a failed one is not cached. A review not served from the cache counts against the
+  `TokenReview` limits of `POST /v1/tls/intermediate`, which every endpoint shares (`503` when
+  spent).
 - `POST /v1/tls/intermediate`, body `{"deployment": "<name>", "public_key": "<base64 DER
   SubjectPublicKeyInfo, P-256>"}` (at most 64 KiB) → `200` `{"certificate": "<PEM>"}`, the
   intermediate of §5 for that key signed by the deployment's root. `401` when the token is
@@ -771,11 +783,193 @@ Everything below except the capture tap, content decoding and the recorder threa
   and by a global ceiling (burst 200, 100 per second), so that callers with arbitrary tokens
   neither flood the API server nor, from one pod, starve the sidecars of the others; the HKDF and ECDSA work runs outside the async threads that
   serve the webhook.
-- One log line per request (`target` = `sidecar_api`): `endpoint`, `namespace`, `pod`,
-  `deployment`, `result` (`ok`, `unauthenticated`, `forbidden`, `invalid`, `unavailable`) and,
-  when the request failed on the controller's side, `error`; a request writes no other line;
-  never the token or the key. The sidecar reads the answer with a 64 KiB cap while it
-  streams. Metric `mimic_sidecar_api_requests_total{endpoint,result}`.
+- `POST /v1/workloads/<deployment>/report` (F5): the discovery push of §6 "Shipping". Headers
+  `Authorization`, `Content-Type: application/json` and `Content-Length` (required); body
+  `{"session": "<32 lower-case hex>", "sequence": <1 … 2^53>, "report": <§6 report>}`. The
+  deployment is in the path, so it is authorised before the body is read. → `200`
+  `{"applied": true}` once the push is merged into the deployment's store (§7.3), or
+  `{"applied": false}` when this pod and session already had this or a later sequence
+  applied (a retry: nothing changes). `401`/`403` as above; `400` for a missing
+  `Content-Length`, a malformed body, session or sequence, or a report that fails the
+  structural check of §7.3; `413` when `Content-Length` is over
+  `MIMIC_SIDECAR_API_MAX_REPORT`, answered before the body is read; `405` for another method;
+  `429` over the rate; `507` when the report has more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS`
+  endpoints in a direction (the push is refused whole, never truncated) or when the
+  deployment is new and its namespace already holds `MIMIC_STORE_MAX_DEPLOYMENTS`
+  deployments; `503` with `Retry-After: 1` when the bodies being
+  read would exceed `MIMIC_SIDECAR_API_BODY_BUDGET`, Valkey is unavailable, the write lost 5
+  optimistic attempts (§7.3) or the `TokenReview` fails.
+- **Shipping client** (sidecar, F5). Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (the first one after
+  a random delay within one interval, so that the pods of a rollout do not push together),
+  the sidecar freezes the report recorded since its last acknowledged push into a *pending*
+  report with the next sequence (nothing is frozen when it covers no exchange) and posts it;
+  new exchanges go into a fresh *current* report. The session is 128 random bits drawn at
+  process start, so a restarted sidecar starts a new session at sequence 1. A pending report
+  is retried unchanged (same body) until it is settled: `200` settles it; `413` removes its
+  samples and posts it again with the same sequence (it was not applied); `400`, `405` and
+  `507` drop it with one WARN `report rejected` (`status`); anything else (connection error,
+  no answer within 30 s, `401`, `403`, `429`, `5xx`) retries with the backoff of §5 (1, 2,
+  4 … 60 s, or `Retry-After` when longer). No new report is frozen while one is pending.
+  Pending and current samples share `MIMIC_DISCOVERY_SAMPLE_BUDGET`. At `SIGTERM`, once the
+  proxy has drained, the sidecar posts the pending then the current report within what
+  remains of `MIMIC_SHUTDOWN_GRACE`; what is not acknowledged then is lost, with one WARN
+  `report not shipped` (`exchanges`). Without `MIMIC_CONTROLLER_URL` nothing is shipped (one
+  INFO `report shipping disabled` at start) and the report accumulates as in F4. `GET
+  /discovery` serves the current report. Logs (`target` = `discovery`): DEBUG `report pushed`
+  (`sequence`, `exchanges`, `bytes`, `applied`), WARN `report push failed` (`status` or
+  `error`, `attempt`) once per failure streak, INFO `report push recovered`; never the token.
+- One log line per request (`target` = `sidecar_api`): `endpoint` (the route, e.g.
+  `/v1/workloads/{deployment}/report`), `namespace`, `pod`, `deployment`, `result` (`ok`,
+  `duplicate`, `unauthenticated`, `forbidden`, `invalid`, `too_large`, `rate_limited`,
+  `push_limit`, `deployment_limit`, `unavailable`), plus for a push `session`, `sequence`, `bytes`, and for
+  `invalid` a `reason` from a fixed list, and, when the request failed on the controller's
+  side, `error`; a request writes no other line; never the token, the key or report content.
+  The sidecar reads every answer with a 64 KiB cap while it streams. Metric
+  `mimic_sidecar_api_requests_total{endpoint,result}`. A rate-limited request is logged at
+  DEBUG only (the metric counts it), so a flood cannot flood the logs.
+
+### 7.3 Discovery store (F5)
+
+- Valkey ≥ 9.0 (hash field expiry), standalone (cluster mode is not supported). The
+  controller's `store` module is the only code that reads or writes these keys. `<ns>` and
+  `<dep>` are the Kubernetes names (DNS-1123: no `:`, `/`, `{` or `}`), checked before a key
+  is built:
+
+  | Key | Type | Content | Expiry |
+  |---|---|---|---|
+  | `mimic:v1:{<ns>/<dep>}:report` | string | merged report: canonical §6 JSON, `pod` null, with `last_seen` | `MIMIC_STORE_TTL` after the last applied push |
+  | `mimic:v1:{<ns>/<dep>}:meta` | hash | `version` (write counter), `updated` (ms of the last applied push), `exchanges`, `endpoints_inbound`, `endpoints_outbound`, `sample_bytes`, `report_bytes` | same |
+  | `mimic:v1:{<ns>/<dep>}:pods` | hash | field `<pod>` → ms of its last push (applied or not) | each field min(24 h, `MIMIC_STORE_TTL`) after its last write |
+  | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
+  | `mimic:v1:ns:<ns>` | sorted set | member `<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
+  | `mimic:v1:workloads` | sorted set | member `<ns>/<dep>`, score = `updated` | members older than `MIMIC_STORE_TTL` removed by each write |
+
+- **Push processing**: structural check of the posted report, then re-redaction, then
+  stamping, then the write. Nothing of a push is stored or logged before its re-redaction.
+  - *Structural check* (pure, `mimic-core`): `"version": 1` and every bound of §6 — at most
+    `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints per direction (else `507`, reason
+    `push_limit`, so that one pod cannot fill the store in one push), 20 samples and 16 hosts (each at most
+    1024 bytes) per endpoint, statuses 100–599, histogram buckets within the §6 range, at most
+    512 nodes, 16 levels and a cut level of at most 16 per schema, names of at most 128
+    bytes, at most 64 query keys and 64 headers, 128 volatile fields and 32 hashes per
+    sketch, paths and templates of at most 2048 bytes and 32 segments, 16 media types per
+    side, sample bodies only for parsed media types and of at most 256 KiB, no unknown field.
+    A template's length counts each literal segment's bytes plus its `/`, and a parameter as
+    its `/` alone (the rendered `{name}` can be longer than the raw path); the `{}` that marks
+    a schema's cut level is not a level.
+    A sample's `bytes` (what `MIMIC_STORE_SAMPLE_BUDGET` counts) is taken from the wire and
+    verified: it must equal the serialised size of the sample with `bytes` and `head_ms` at 0
+    (reason `sample_bytes`), so a forged value cannot hide samples from the budget; byte sums
+    saturate.
+    Any other violation is `400` with its `reason`.
+  - *Re-redaction* (pure, idempotent): the §6 redaction applied again to every sample, host,
+    concrete path and volatile field with the built-in rules and the union of
+    `spec.discovery.redact` of the `MimicWorkload`s naming the deployment (from the
+    controller's cache, so a name added after the pod started applies); a field that becomes
+    redacted loses its sketch and is marked `redacted`, a sample that changes is keyed by the
+    hash of its new content. A sidecar of an older version, or a faulty one, cannot put a
+    value into Valkey that the controller's rules redact.
+  - *Stamping*: every endpoint and sample of the push gets `last_seen`, the current UTC day
+    (days since 1970-01-01); a merge keeps the larger value. Sidecar reports carry no
+    `last_seen`.
+  - *Write*: within a replica, one writer per deployment; pushes that arrive while it writes
+    are merged into its next write (group commit), and each is answered after the write that
+    holds it. At most 2 deployments are written at once per replica (memory bound). A write
+    reads `:report`, `:meta` `version` and the `:seq` fields of its pushes; answers
+    `applied: false` for a push whose sequence is not above the stored one of its pod and
+    session; merges the others into the stored report with the **bounded merge** below;
+    drops endpoints and samples whose `last_seen` is older than `MIMIC_STORE_TTL` (in whole
+    days); and runs one Lua script that, only if `version` and the `:seq` fields are still
+    those read, writes `:report`, `:meta` (`version` + 1), `:seq`, `:pods` and both indexes,
+    refreshes the expiries and prunes the indexes, refusing a new deployment past
+    `MIMIC_STORE_MAX_DEPLOYMENTS` in the namespace (`507`). Otherwise nothing is written and
+    the write starts again (at most 5 attempts, 10–100 ms random backoff, then `503`). So a
+    push is applied once, whichever replica receives it and however often it is retried
+    (within the `:seq` field expiry, §11.1). A stored value that does not parse or fails the
+    structural check is never overwritten: ERROR `stored report unreadable` (`namespace`,
+    `deployment`), push `503`, read `500`.
+- **Bounded merge** (pure, `mimic-core`): the §6 merge under the store limits
+  (`MIMIC_STORE_MAX_LITERALS`, `MIMIC_STORE_MAX_ENDPOINTS` per direction,
+  `MIMIC_STORE_SAMPLE_BUDGET` per deployment); counters saturate at 2^64 − 1. The merge
+  re-applies templating on the union: a node that the deployment sees above the literal limit
+  absorbs. Below the limits the stored report does not depend on the order or grouping of
+  pushes. At a limit, what is kept is chosen by traffic, never by key order alone, so that
+  endpoints that sort first (`/!`, `/0`, the paths of a scanner the app answers `2xx`) cannot
+  crowd out the deployment's real API:
+  - *Endpoints*: when the union holds more than `MIMIC_STORE_MAX_ENDPOINTS` endpoints in a
+    direction, the endpoints kept are the first ones ranked by total exchange count (the sum
+    of their status counters) descending, then stored before new (an endpoint of the stored
+    report wins a tie over one this write adds), then by key (method, template). The others
+    are dropped (`evicted` when they were stored, `endpoint_limit` refused when they were new).
+  - *Samples*: a new sample that does not fit `MIMIC_STORE_SAMPLE_BUDGET` is refused
+    (`budget`), unless its endpoint has no sample of its status class (`1xx` … `5xx`): then
+    samples are evicted to make room, one at a time, each time from the (endpoint, status
+    class) of the deployment holding the most samples (ties: the most sample bytes, then the
+    larger key), the sample with the largest key first, never taking a class of an endpoint
+    to zero samples; if room cannot be made that way the new sample is refused (`budget`)
+    and nothing is evicted. Counters, histograms, schemas and volatility merge whatever is
+    refused or evicted.
+  Ties left by those rules are broken by the full endpoint key. A stored report already over
+  the budget (a lowered `MIMIC_STORE_SAMPLE_BUDGET`) is trimmed by the same eviction rule; a
+  sample added and evicted within one merge counts as `evicted`.
+  Refusals are counted in `mimic_store_refused_total{kind,reason}` with one WARN
+  `store limit reached` (`namespace`, `deployment`, `reason`) per deployment and reason per
+  process; evictions in `mimic_store_evicted_total{kind}` with one WARN `store evicted`
+  (`namespace`, `deployment`, `kind`, `count`) per deployment and kind per process.
+- **Pod churn**: no pod is read. A deleted pod's data stays merged (the deployment's API is
+  the union over its life) and it ships its last report at `SIGTERM`; the pods of a rolling
+  update push into the same key; a deleted pod's `:pods` and `:seq` fields expire after
+  min(24 h, `MIMIC_STORE_TTL`). A deployment's keys outlive it until `MIMIC_STORE_TTL`, and a
+  deployment created again with the same name continues them.
+- **Valkey memory**: the chart runs Valkey with `maxmemory` (75 % of its memory limit) and
+  `maxmemory-policy noeviction`: a full Valkey refuses writes (pushes get `503`, sidecars
+  keep merging locally within their bounds) instead of evicting one key of a deployment and
+  breaking its consistency. Chart defaults: Valkey memory limit `1Gi` and PVC `4Gi` (AOF
+  rewrites need about twice the data), controller memory limit `512Mi` (two writes of a
+  deployment report at once plus `MIMIC_SIDECAR_API_BODY_BUDGET`).
+
+### 7.4 `MimicWorkload` status (F5)
+
+- The CRD has a `status` subresource. Every `MIMIC_STATUS_INTERVAL` each controller replica
+  computes, for each `MimicWorkload` of its cache, from the `:meta` and `:pods` keys of its
+  deployment (a pure function of them, the window and the current time):
+
+  ```yaml
+  status:
+    discovery:
+      endpoints: {inbound: 12}               # per direction; directions without any omitted
+      exchanges: 34567
+      sampleBytes: 1048576
+      pods: 2                                # pods whose last push is within MIMIC_STATUS_POD_WINDOW
+      lastPushTime: "2026-11-01T10:00:00Z"   # last applied push, UTC, seconds; absent without data
+  ```
+
+  and applies it by server-side apply on the status subresource (field manager
+  `mimic-controller`) only when it differs from the status in its cache. Both replicas
+  compute the same value except at a window edge, and an apply of an equal value changes
+  nothing, so no leader is elected. A deployment without data gets zero counts and no
+  `lastPushTime`. While Valkey is unavailable the status is left as it is (one WARN
+  `status not updated` until it recovers). `kubectl get mimicworkload` prints `Mode`,
+  `Endpoints` (sum), `Pods` and `Last push`. Mode convergence is added in F10.
+
+### 7.5 Read API (F5)
+
+- Plain HTTP on `MIMIC_UI_ADDR` (default `127.0.0.1:8080`, loopback: reached only through
+  `kubectl port-forward` to a controller pod); a peer that is not a loopback address gets
+  `403` whatever the bind address. `GET` only (`405` otherwise), JSON, sorted keys:
+  - `GET /v1/workloads` → `{"workloads": [{"namespace", "deployment", "endpoints",
+    "exchanges", "sample_bytes", "last_push"}]}`, sorted by namespace then deployment;
+  - `GET /v1/workloads/<ns>/<dep>` → the same object plus `"pods": {"<pod>": "<last push,
+    RFC 3339>"}`;
+  - `GET /v1/workloads/<ns>/<dep>/report` → the stored `:report` bytes.
+
+  `404` for a deployment without data, `400` for a name that is not DNS-1123, `503` while
+  Valkey is unavailable. No write and no delete: data leaves by expiry (§7.3).
+- Consumers: F6 adds the OpenAPI 3.1 document and Swagger UI of a deployment on this
+  listener, built from the same report; F9 adds an authenticated read of a sidecar's own
+  deployment on the sidecar API (§7.2) for egress recordings and the mode (F10); F11 reads
+  ingress templates, samples, schemas and volatility through the same `store` module, its
+  access path being part of its design.
 
 ## 8. Mock
 
@@ -815,12 +1009,26 @@ Everything below except the capture tap, content decoding and the recorder threa
   | `mimic_discovery_redactions_total` | counter (F4) | `location` (`path`, `query`, `header`, `body`), `rule` (`name`, `jwt`, `pem`, `credential`, `card`, `aws`, `token_prefix`, `userinfo`) |
   | `mimic_discovery_endpoints` | gauge (F4), endpoints in the template tree | `direction` |
   | `mimic_discovery_sample_bytes` | gauge (F4), bytes held by samples | — |
+  | `mimic_discovery_pushes_total` | counter (F5), settled or failed push attempts (§7.2) | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`) |
+  | `mimic_discovery_last_push_timestamp_seconds` | gauge (F5), time of the last acknowledged push, 0 before | — |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
   opaque decrypted tunnel), with the SNI as `authority` when present; a passed-through one
   under `tls` as before. The controller exposes `mimic_sidecar_api_requests_total` (§7.2) and
-  `mimic_tls_seed_loaded` (gauge, 1 once the seed is loaded).
+  `mimic_tls_seed_loaded` (gauge, 1 once the seed is loaded), and from F5 (no label carries a
+  namespace, deployment or pod, so cardinality stays fixed):
+
+  | Metric | Type | Labels |
+  |---|---|---|
+  | `mimic_store_writes_total` | counter, store write attempts (§7.3) | `result` (`ok`, `conflict`, `error`) |
+  | `mimic_store_write_duration_seconds` | histogram, one write from read to script result; buckets 0.005 … 10 as `mimic_http_request_duration_seconds` | — |
+  | `mimic_store_report_bytes` | histogram, size of each report written; buckets 4Ki, 16Ki, 64Ki, 256Ki, 1Mi, 4Mi, 16Mi, 64Mi | — |
+  | `mimic_store_pushes_total` | counter, pushes by outcome | `result` (`applied`, `duplicate`) |
+  | `mimic_store_refused_total` | counter, growth refused by the bounded merge | `kind` (`endpoint`, `sample`), `reason` (`endpoint_limit`, `budget`) |
+  | `mimic_store_evicted_total` | counter, stored endpoints and samples displaced by the bounded merge (§7.3) | `kind` (`endpoint`, `sample`) |
+  | `mimic_store_expired_total` | counter, endpoints and samples dropped by retention | `kind` |
+  | `mimic_status_updates_total` | counter, `MimicWorkload` status applies | `result` (`ok`, `error`) |
 
   `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
   port removed, `(invalid)` when it is not a host name or IP literal; an HTTP/1 `Host` value or
@@ -840,6 +1048,7 @@ Everything below except the capture tap, content decoding and the recorder threa
   stops the process at start with exit code **2** and a message naming the variable.
 - Processes are stateless (state is in Valkey or in memory), log to stdout, stop gracefully on
   `SIGTERM`, and bind their ports from configuration.
+- Durations are written `<n>ms`, `<n>s` and, from F5, `<n>m`, `<n>h` or `<n>d`.
 - One image `ghcr.io/thaliph/mimic` (distroless, non-root UID 65532, no shell) holds
   `mimic-sidecar` and `mimic-controller` (the webhook runs the sidecar as UID 1337).
   From F3 the `mimic` image also holds the static `mimic-trust` binary (§7.1).
@@ -877,6 +1086,18 @@ Everything below except the capture tap, content decoding and the recorder threa
 | `MIMIC_INJECT_SIDECAR_LOG` | `info` | `MIMIC_LOG` given to injected sidecars. |
 | `MIMIC_TLS_CA_SECRET` | required | Secret of the controller's namespace holding the TLS seed (§5). |
 | `MIMIC_SIDECAR_API_ADDR` | `0.0.0.0:8444` | Sidecar API HTTPS listener (§7.2); its port is also the one given to sidecars in `MIMIC_CONTROLLER_URL`. |
+| `MIMIC_SIDECAR_API_RATE` | `10` | Requests per second per source address on the sidecar API, burst twice that (§7.2), 1–10000. |
+| `MIMIC_SIDECAR_API_MAX_REPORT` | `32Mi` | Largest push body (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–1Gi). |
+| `MIMIC_SIDECAR_API_BODY_BUDGET` | `64Mi` | Push bodies being read at once, in bytes (same syntax; at least `MIMIC_SIDECAR_API_MAX_REPORT`, at most 4Gi). |
+| `MIMIC_STORE_TTL` | `30d` | Retention of a deployment's data after its last push, and of endpoints and samples after they were last seen (§7.3); 10s–365d. |
+| `MIMIC_STORE_MAX_ENDPOINTS` | `512` | Endpoints per direction and deployment in the store, 1–10000. |
+| `MIMIC_STORE_MAX_PUSH_ENDPOINTS` | `256` | Endpoints per direction in one pushed report (§7.2), 1–10000, at most `MIMIC_STORE_MAX_ENDPOINTS`. |
+| `MIMIC_STORE_MAX_LITERALS` | `32` | Literal limit of the store's templating (§6), 2–1000. |
+| `MIMIC_STORE_SAMPLE_BUDGET` | `4Mi` | Sample bytes per deployment in the store (1Mi–1Gi). |
+| `MIMIC_STORE_MAX_DEPLOYMENTS` | `50` | Deployments with data per namespace (§7.3), 1–100000. |
+| `MIMIC_STATUS_INTERVAL` | `30s` | Period of the `MimicWorkload` status update (§7.4), 1s–1h. |
+| `MIMIC_STATUS_POD_WINDOW` | `5m` | A pod counts in `status.discovery.pods` while its last push is this recent, 1s–24h. |
+| `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API (§7.5) and, from F6, UI listener; plain HTTP, loopback peers only. |
 
 ### 10.3 Sidecar variables
 
@@ -893,7 +1114,7 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_METRICS_MAX_AUTHORITIES` | `50` | Distinct `authority` label values kept per direction and metric (§9), 1–10000. Not set by the webhook in F2. |
 | `MIMIC_TLS_CA` | empty | Deployment root certificate (PEM). Empty: no interception, every outbound TLS connection is passed through (`no_ca`), with one INFO line at start. |
 | `MIMIC_TLS_EXCLUDE` | empty | Comma-separated exclusions (§5); an invalid entry or more than 256 exits with code 2. |
-| `MIMIC_CONTROLLER_URL` | required when `MIMIC_TLS_CA` is set | Sidecar API base URL (`https://…`). |
+| `MIMIC_CONTROLLER_URL` | required when `MIMIC_TLS_CA` is set | Sidecar API base URL (`https://…`). Without it, discovery reports are not shipped (§7.2). |
 | `MIMIC_CONTROLLER_CA` | required when `MIMIC_TLS_CA` is set | CA (PEM) the sidecar API certificate is verified against. |
 | `MIMIC_TLS_TOKEN_FILE` | `/var/run/secrets/mimic.platform.io/token` | Projected token, re-read for every sidecar API request. |
 | `MIMIC_TRUST_BINARY` | `/usr/local/bin/mimic-trust` | The `mimic-trust` binary published into the trust volume (tests point it elsewhere); the webhook never sets it. |
@@ -903,6 +1124,7 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_DISCOVERY_SAMPLE_BUDGET` | `16Mi` | Bytes held by samples (`<n>`, `<n>Ki`, `<n>Mi`; 1Mi–1Gi). Not set by the webhook. |
 | `MIMIC_DISCOVERY_CAPTURE_BUDGET` | `8Mi` | Bytes of bodies captured in flight and queued (same syntax; 1Mi–1Gi). Not set by the webhook. |
 | `MIMIC_DISCOVERY_QUEUE` | `1024` | Exchange records waiting for the recorder (1–65536). Not set by the webhook. |
+| `MIMIC_DISCOVERY_PUSH_INTERVAL` | `30s` | Period of the discovery push (§6, §7.2), 1s–1h. Not set by the webhook. |
 | `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Extra names redacted by name (§6), comma-separated, at most 64, each 1–64 characters of `a-z0-9-_` (compared like the built-in names); the webhook sets the sorted, deduplicated union, lower-cased, of `spec.discovery.redact` of every `MimicWorkload` naming the deployment. |
 
 ### 10.4 `mimic-init` variables
@@ -933,7 +1155,8 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   effective capabilities, which a non-root process with `no_new_privs` cannot get), only
   `NET_ADMIN` and `NET_RAW`, `allowPrivilegeEscalation: false`, read-only root filesystem,
   `RuntimeDefault` seccomp, exits once the rules are installed.
-- The controller's RBAC is minimal: `get`/`list`/`watch` on `mimicworkloads`; `get`/`list`/`watch`/`patch`
+- The controller's RBAC is minimal: `get`/`list`/`watch` on `mimicworkloads` and, from F5,
+  `patch` on `mimicworkloads/status` (§7.4); `get`/`list`/`watch`/`patch`
   on its own `MutatingWebhookConfiguration` only (by name, and restricted to `caBundle` by a
   `ValidatingAdmissionPolicy`); `get`/`update` on its webhook Secret and its TLS seed Secret only (by name, in its
   namespace); `create` on `tokenreviews` (sidecar API authentication, §7.2). No access to
@@ -943,7 +1166,10 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
 - Dependencies checked by `cargo deny` (advisories, licences, sources).
 - No sensitive value reaches Valkey or a log without redaction (§6). Discovery keeps no
   opaque body, no hash of a redacted value, and never logs a header value, query, body or
-  sample; the local report is served on loopback only.
+  sample; the local report is served on loopback only. From F5 the controller re-applies the
+  redaction to every pushed report before it reaches Valkey or a log (§7.3), never logs
+  report content, and serves the stored reports on loopback only (§7.5). Valkey keeps only
+  redacted reports, sequence numbers and pod names.
 - TLS key custody (§5): the seed exists only in its Secret and the controller's memory; root
   keys only in the controller's memory; intermediate and leaf keys only in the sidecar's
   memory (non-dumpable, no core file). Tokens and keys are never logged.
@@ -977,7 +1203,24 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   without completing a request, which bounds how long it can delay admission.
 - The workload identity comes from the pod's `ownerReferences`, which the pod's creator
   controls: a user of the namespace can obtain a sidecar named after another deployment of the
-  same namespace. Sidecar identity is bound to the real owner when sidecars authenticate (F5).
+  same namespace. The sidecar API checks only that the token's bound pod exists and has a name
+  that deployment's ReplicaSets can generate (§7.2), without reading pods (an
+  `ownerReference` is set by the pod's creator too, so reading it would not bind the identity
+  either): such a user can push reports into another deployment of the same namespace,
+  within the store bounds of §7.3, and so add endpoints, counts and samples to its discovered
+  API (and, from F8, to its recordings). Other namespaces are out of reach: the namespace
+  comes from the token.
+- Store (§7.3): a push retried more than min(24 h, `MIMIC_STORE_TTL`) after it was applied is
+  applied again (its `:seq` field has expired). A pod that dies without `SIGTERM` (node loss,
+  sidecar killed) loses its unshipped report: at most one push interval plus a pending
+  report. A successful `TokenReview` is cached 60 s, so a deleted pod's token works up to
+  60 s longer. Valkey's AOF file on its PVC is not encrypted by mimic (it holds redacted
+  reports only; use an encrypted storage class). A user who can create pods in a namespace
+  can fill up to `MIMIC_STORE_MAX_DEPLOYMENTS` × the per-deployment bound of Valkey memory;
+  once Valkey reaches `maxmemory`, pushes of every namespace get `503` until data expires or
+  memory is added. The per-source rate limit assumes pod source addresses are not translated
+  between nodes (a CNI that masquerades pod traffic makes the pods of a node share a bucket).
+  `status.discovery.pods` can differ by one between replicas at a window edge.
 - The `caBundle` of the webhook configuration and the data of the webhook Secret are owned by
   the controller: GitOps tools must ignore those fields.
 - Only the `iptables-nft` backend is supported (the node kernel needs `nf_tables`).
@@ -1195,14 +1438,48 @@ with a fake original destination (as in F2) and read `GET /discovery` from loopb
 | DSC-19 | **I.** An invalid `MIMIC_DISCOVERY_*` value (out of range, bad size suffix, a 65th or invalid redact name) exits 2 before listening (FND-01). |
 | DSC-20 | **U.** The injection patch sets `MIMIC_DISCOVERY_REDACT_NAMES` to the sorted, deduplicated union of `spec.discovery.redact` of every `MimicWorkload` naming the deployment, absent when there is none, entries lower-cased. **E.** The CRD accepts `spec.discovery.redact: [x-tenant-key, Pin]` and rejects an entry with `/`, an empty one and 65 entries. |
 | DSC-21 | **U.** The access-log path function applies the value detectors of DSC-06 segment by segment and leaves other segments unchanged. **I.** An inbound and an intercepted outbound request to `/reset/<JWT>` write access lines with `path` `/reset/<redacted>`. |
-| DSC-22 | **E.** On kind, a 2-replica Deployment in an `enabled` namespace behind a Service gets calls to `/users/<id>` (ids, a canary bearer token, JSON bodies); through `kubectl port-forward` each pod's `/discovery` shows `GET /users/{users_id}` with its response schema and samples, and no canary; a `404` storm on random root paths creates no endpoint. |
+| DSC-22 | **E.** On kind, a 2-replica Deployment in an `enabled` namespace behind a Service gets calls to `/users/<id>` (ids, a canary bearer token, JSON bodies); through `kubectl port-forward` each pod's `/discovery` shows `GET /users/{users_id}` with its response schema and samples, and no canary; a `404` storm on random root paths creates no endpoint. (Amended by CTL-20: from F5 a pod's `/discovery` holds only what it has not shipped yet, so the endpoint, schema and sample checks read the merged report; `/discovery` is still checked for canaries.) |
 | DSC-23 | **C.** A `cargo-fuzz` target feeds arbitrary request and response heads and bodies to the recorder (parse, decode-free inference, redaction, merge); CI runs it 60 s on PRs touching `crates/mimic-core/src/discovery/` and 10 min weekly, like PRX-28 (same `ci-ok` path-filter rule). |
+
+### 12.6 F5 — Controller collects and merges endpoints
+
+Levels as in §12.2. Controller integration tests run the real controller binary (or its
+routers in-process) against a **real Valkey** (the chart's pinned image, started by the test
+harness, or `MIMIC_TEST_VALKEY_URL`; a CI service container) and the fake API server of F3,
+which answers `TokenReview` and serves `MimicWorkload`s with their status subresource.
+Sidecar integration tests use the fake sidecar API of F3. A *canary* is as in §12.5.
+
+| ID | Criterion |
+|---|---|
+| CTL-01 | **U.** The structural check of §7.3 accepts every report the recorder produces within the §6 bounds, merged or not (`proptest`, ≥ 10 000 cases), and rejects, each with its own fixed `reason`: a version other than 1; 21 samples; 17 hosts or a host over 1024 bytes; status 99 or 600; a histogram bucket out of range; a schema of 513 nodes, of 17 levels or with a cut level of 17; a 129-byte name; 65 query keys or headers; 129 volatile fields or a 33-hash sketch; a 2049-byte or 33-segment path or template; 17 media types on a side; a 256 KiB + 1 sample body or a sample body for an opaque media type; an unknown field; more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints in a direction is `push_limit`, apart from the `400` reasons. `Report::from_json` then the check never panic on arbitrary input (`proptest`, and CTL-22). |
+| CTL-02 | **U.** The bounded merge equals the §6 `merge` while the result is within the store limits, and below them does not depend on the order or grouping of pushes (`proptest`); two pushes each below the literal limit at a node absorb it when their union exceeds it; counters and buckets at 2^64 − 1 stay there; the result's `pod` is null. Anti-crowding, with `MIMIC_STORE_MAX_ENDPOINTS` = 4: a store of 4 endpoints with 100 exchanges each, merged with a push of 50 endpoints `/!0` … `/!49` of 1 exchange each, keeps the 4 (50 `endpoint_limit` refusals, no eviction); a push of an endpoint with 101 exchanges evicts the stored endpoint with the fewest exchanges, ties broken by key (`evicted` = 1); a new endpoint tying the lowest stored count does not displace it. Samples, with a full budget: a new `5xx` sample of an endpoint holding only `2xx` samples evicts samples of the (endpoint, class) with the most samples until it fits, never the only sample of a class; a new `2xx` sample of that endpoint is refused (`budget`); when room cannot be made without emptying a class, nothing is evicted. The same input always gives byte-identical output; `refused` and `evicted` counts are returned per kind and reason. |
+| CTL-03 | **U.** Re-redaction is idempotent and leaves unchanged a report recorded with the same redactor. For reports recorded with a redactor that lacks a name the controller's redactor has (`proptest`, ≥ 10 000 cases), with a canary under that name at a random place (query, header, form or JSON body at any depth, request or response, URL-valued header), the re-redacted report contains neither the canary nor its XXH3 hash in decimal or hex, its sample keys are the hashes of the re-redacted content, and the field is marked `redacted` without sketch. A canary in a detected form (JWT, card, token prefix) in a report that bypassed the sidecar's redaction is removed the same way. |
+| CTL-04 | **U.** Retention: stamping a push with day `D` sets `last_seen = D` on each endpoint and sample; merge keeps the larger value (commutative, associative); dropping with day `T` and a TTL of `n` days removes exactly the endpoints and samples with `last_seen < T − n` (counted per kind); a sidecar report without `last_seen` parses, and a sidecar never serialises it. |
+| CTL-05 | **U.** The key names of §7.3 for namespace `shop` and deployment `pay.v2` are byte-exact; a namespace or deployment name that is not DNS-1123 is refused before any key is built. The sequence decision applies a push whose sequence is above the stored one of its pod and session, or that has none, and reports any other as a duplicate; a session that is not 32 lower-case hex characters and a sequence of 0 or above 2^53 are `invalid`. |
+| CTL-06 | **U.** The status of §7.4 is a pure function of `:meta`, the pods' push times, the window and the current time (passed in): byte-identical for the same input; a pod counts exactly when its last push is at or after now − window; without data the counts are zero and `lastPushTime` is absent; `lastPushTime` is RFC 3339 UTC in seconds; directions without endpoints are omitted. |
+| CTL-07 | **I.** `POST /v1/workloads/<deployment>/report` answers as §7.2 says: `200` `{"applied": true}` and the stored report equals the bounded merge; the same body again, and a lower sequence of the same session, `200` `{"applied": false}` with `:report` and `:meta` unchanged; a new session of the same pod applies from sequence 1; `401` and `403` as TLS-09; `400` for malformed JSON, a bad session or sequence, a missing `Content-Length` and one CTL-01 violation; `405`; `413` when `Content-Length` is over `MIMIC_SIDECAR_API_MAX_REPORT`, received by the client before it has sent any body byte; `507` for a report over `MIMIC_STORE_MAX_PUSH_ENDPOINTS` (= 3 in the test) endpoints in a direction, with nothing stored, and for a new deployment once `MIMIC_STORE_MAX_DEPLOYMENTS` (= 2 in the test) deployments of the namespace have data, while those two still apply; `503` with `Retry-After` while Valkey is stopped, when the `TokenReview` fails, and when two concurrent bodies exceed `MIMIC_SIDECAR_API_BODY_BUDGET`. An unauthenticated request declaring a 1 GiB body is answered `401` while the client has sent only its headers. |
+| CTL-08 | **I.** Rate limit and review cache: with `MIMIC_SIDECAR_API_RATE=5`, 30 requests sent at once from one source get 10 answers other than `429` and 20 `429` with `Retry-After: 1`, the fake API server receives no `TokenReview` for the `429`s, a second source is served meanwhile, and 1 s later 5 more requests from the first pass. Two pushes with the same token within 60 s cause one `TokenReview`; another token causes its own; a failed review is not cached (the next request with that token is reviewed again). |
+| CTL-09 | **I.** Applied once across replicas: two controller processes share one Valkey; 16 simulated sidecars (pods of 2 deployments) each post 50 generated pushes to random replicas, 30 % of them posted twice and 10 % posted to both replicas at once, with limits that are not reached. For each deployment the stored `:report` is byte-identical to the bounded merge of its distinct pushes, `:meta` `exchanges` is their sum, and `mimic_store_writes_total{result="conflict"}` is above 0 on a replica (contention happened). Passes 3 runs in a row. |
+| CTL-10 | **I.** Keys and expiry: after a push exactly the keys of §7.3 exist for its deployment, with their types and fields; with `MIMIC_STORE_TTL=10s` every key and both index members have an expiry of at most 10 s, refreshed by each applied push (a duplicate refreshes only its `:pods` field); 10 s (+ 2 s) after the last push the deployment's keys and index members are gone, and the `:pods` and `:seq` fields expire after min(24 h, TTL). |
+| CTL-11 | **I.** Nothing sensitive reaches Valkey: pushes carrying the DSC-15 canaries unredacted (as a faulty sidecar would send them) and a canary under a name that only the `MimicWorkload`'s `spec.discovery.redact` lists are applied, and no value of any `mimic:v1:*` key (dumped with `SCAN` and `GET`/`HGETALL`/`ZRANGE`) contains a canary, its XXH3 hash or the bearer token; nor does stdout or `/metrics`. |
+| CTL-12 | **I.** Each push writes one `sidecar_api` line with the §7.2 fields (`endpoint` `/v1/workloads/{deployment}/report`, `session`, `sequence`, `bytes`, `result`, `reason` for `invalid`), at DEBUG for `rate_limited`; after a known sequence of pushes `mimic_sidecar_api_requests_total{endpoint,result}`, `mimic_store_pushes_total`, `mimic_store_writes_total`, `mimic_store_refused_total`, `mimic_store_evicted_total`, `mimic_store_report_bytes` and `mimic_store_write_duration_seconds` have the expected values; one WARN `store limit reached` per deployment and reason and one WARN `store evicted` per deployment and kind; no line and no series contains a path, template, header, sample, token or report content. |
+| CTL-13 | **I.** Read API: `GET /v1/workloads`, `/v1/workloads/<ns>/<dep>` and `/v1/workloads/<ns>/<dep>/report` on `MIMIC_UI_ADDR` answer as §7.5 (list sorted, pods map, report bytes equal to `:report`); `404` for a deployment without data, `400` for an invalid name, `405` for `POST` and `DELETE`, `503` while Valkey is stopped, `500` with one ERROR `stored report unreadable` for a corrupted `:report` (also refused by a push, `503`, without overwriting it). With `MIMIC_UI_ADDR=0.0.0.0:<port>` a request from the host's non-loopback address gets `403`. |
+| CTL-14 | **I.** An invalid value of each variable added in §10.2 (out of range, bad suffix, `MIMIC_SIDECAR_API_BODY_BUDGET` below `MIMIC_SIDECAR_API_MAX_REPORT`, `MIMIC_STORE_MAX_PUSH_ENDPOINTS` above `MIMIC_STORE_MAX_ENDPOINTS`, an unparsable `MIMIC_UI_ADDR`) and of `MIMIC_DISCOVERY_PUSH_INTERVAL` exits 2 before listening (FND-01); `1m`, `2h` and `30d` parse as durations. |
+| CTL-15 | **I.** Shipping: with `MIMIC_DISCOVERY_PUSH_INTERVAL=1s` and exchanges to the test app, the sidecar posts to `/v1/workloads/<MIMIC_WORKLOAD>/report` bodies with one 32-hex session and sequences 1, 2, …; the exchanges of all posts sum to the exchanges recorded; an interval without exchanges posts nothing; the token file is read for each post; after a `200`, `/discovery` holds only exchanges recorded since; a restarted sidecar posts a new session from sequence 1. Without `MIMIC_CONTROLLER_URL` nothing is posted and one INFO `report shipping disabled` is written. |
+| CTL-16 | **I.** Retries: while the fake API answers `503`, resets the connection or stays silent past 30 s, the sidecar posts the same bytes with the same sequence again with the 1, 2, 4 … s backoff, and the exchanges recorded meanwhile go into the next sequence, posted only after the pending one is acknowledged; `429` with `Retry-After: 3` delays the retry by at least 3 s; `413` is followed by the same sequence without samples; `400` drops the pending report with one WARN `report rejected` and the next sequence follows. Samples of the pending and current reports never exceed `MIMIC_DISCOVERY_SAMPLE_BUDGET`. `mimic_discovery_pushes_total{result}` and `mimic_discovery_last_push_timestamp_seconds` follow; one WARN `report push failed` per failure streak and one INFO `report push recovered`; no line holds the token. |
+| CTL-17 | **I.** At `SIGTERM`, a sidecar with a pending report and unshipped exchanges posts the pending then the current report and exits 0 within `MIMIC_SHUTDOWN_GRACE`; the fake API received every exchange once. With the fake API silent, it exits within the grace (+ 1 s) with one WARN `report not shipped` whose `exchanges` is the number lost. |
+| CTL-18 | **I.** Status: within `MIMIC_STATUS_INTERVAL` (+ 1 s) of a push, every `MimicWorkload` naming that deployment gets the §7.4 `status.discovery` through the status subresource by server-side apply with field manager `mimic-controller`; an unchanged status sends no request; a `MimicWorkload` of a deployment without data gets the empty status; while Valkey is stopped no status request is sent and one WARN `status not updated` is written; `mimic_status_updates_total` counts the applies. |
+| CTL-19 | **E.** The CRD has the status subresource and schema of §7.4 and the printer columns `Mode`, `Endpoints`, `Pods`, `Last push`; `kubectl auth can-i` as the controller is `yes` for `patch mimicworkloads/status` and `no` for `update mimicworkloads`, `get pods` and `list replicasets`; Valkey answers `CONFIG GET maxmemory` with 75 % of its memory limit and `maxmemory-policy` `noeviction`; no Service and no NetworkPolicy port exposes `MIMIC_UI_ADDR`. |
+| CTL-20 | **E.** On kind with the shared apps: `users` (B, 2 replicas) in an `enabled` namespace with a `MimicWorkload`, `front` (A) calling it, and the client sending 40 `GET /front/users/<id>` (numeric ids, a canary bearer token) and 5 `PUT` with a canary in the JSON body, spread over both pods. Within 2 push intervals, through `kubectl port-forward` to a controller pod's `MIMIC_UI_ADDR`, `/v1/workloads/<ns>/users/report` has `GET /users/{users_id}` with as many `200`s as the client got for its `GET`s (probe requests are not recorded) and `PUT /users/{users_id}` with 5, with response schemas and samples; `/v1/workloads/<ns>/users` lists both pods; within `MIMIC_STATUS_INTERVAL` more the `MimicWorkload` shows `endpoints.inbound: 2`, `pods: 2` and a `lastPushTime`, also in `kubectl get mimicworkload`. No canary is in the report, in any Valkey value (`valkey-cli` dump), in the controller's logs or in the pods' `/discovery`. |
+| CTL-21 | **E.** Churn: with traffic from the client before, during and after `kubectl rollout restart deployment/users`, and one controller pod deleted while pushes are flowing, the merged `200` count of `GET /users/{users_id}` equals the number of `200`s the client received (no exchange lost at `SIGTERM`, none counted twice); with `MIMIC_STATUS_POD_WINDOW=30s` (set by the e2e), `status.discovery.pods` comes back to 2 after the old pods' window, and the endpoints are unchanged. |
+| CTL-22 | **C.** The DSC-23 fuzz target also feeds arbitrary bytes to `Report::from_json`, the structural check, re-redaction and the bounded merge with a fixed valid report: no panic, and every merge result passes the check. Same CI schedule and `ci-ok` path-filter rule as DSC-23. |
 
 ## 13. Test strategy
 
 - **Unit** tests in `mimic-core` (pure logic) and next to the code.
 - **Integration** tests per crate in `tests/`: in-process routers, or the real binary started
-  as a child process.
+  as a child process. From F5, controller store tests use a real Valkey (§12.6); the fake RESP
+  server of FND-06 stays for readiness only.
 - **End-to-end** on kind with the Helm chart (`scripts/e2e.sh`), locally and in CI.
 - A criterion is covered when a test whose name contains its ID (lower case) passes.
 - A timing bound ("within 1 s") is measured from the event that triggers it (the close, the

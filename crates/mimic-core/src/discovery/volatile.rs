@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::check::Violation;
 use super::redact::MARKER;
 
 /// Hashes kept per field.
@@ -16,6 +17,7 @@ pub const MAX_FIELDS: usize = 128;
 
 /// The 32 smallest distinct hashes seen.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sketch {
     hashes: BTreeSet<u64>,
 }
@@ -58,6 +60,7 @@ impl Sketch {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Field {
     n: u64,
     redacted: bool,
@@ -72,6 +75,7 @@ impl Field {
 
 /// The tracked fields of one endpoint, at most 128 (the first in byte order).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Volatility {
     fields: BTreeMap<String, Field>,
 }
@@ -132,6 +136,17 @@ impl Volatility {
             self.fields.pop_last();
         }
         self
+    }
+
+    /// At most `MAX_FIELDS` fields, each with at most `SKETCH` hashes.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        if self.fields.len() > MAX_FIELDS {
+            return Err(Violation::VolatileFields);
+        }
+        if self.fields.values().any(|f| f.sketch.len() > SKETCH) {
+            return Err(Violation::Sketch);
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {

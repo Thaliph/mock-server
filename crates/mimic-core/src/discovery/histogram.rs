@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::check::Violation;
+
 /// Index of the overflow bucket (values above 131 072 ms).
 pub const OVERFLOW: u8 = 69;
 
@@ -24,6 +26,7 @@ pub fn bucket_index(ms: u64) -> u8 {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Histogram {
     buckets: BTreeMap<u8, u64>,
 }
@@ -47,6 +50,16 @@ impl Histogram {
     }
 
     pub fn count(&self) -> u64 {
-        self.buckets.values().sum()
+        self.buckets
+            .values()
+            .fold(0, |n, c| u64::saturating_add(n, *c))
+    }
+
+    /// Every bucket index is one of the fixed buckets.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        match self.buckets.keys().any(|b| *b > OVERFLOW) {
+            true => Err(Violation::Bucket),
+            false => Ok(()),
+        }
     }
 }

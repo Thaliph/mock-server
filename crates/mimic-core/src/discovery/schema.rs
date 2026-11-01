@@ -9,6 +9,7 @@ use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::check::Violation;
 use super::redact::Redactor;
 use super::template::{is_rfc3339, is_uuid};
 
@@ -151,6 +152,7 @@ impl Formats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Object {
     props: BTreeMap<String, Schema>,
     required: BTreeSet<String>,
@@ -220,6 +222,7 @@ fn merge_all(schemas: impl Iterator<Item = Schema>) -> Schema {
 
 /// A JSON Schema (2020-12 subset) inferred from the values seen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Schema {
     kinds: BTreeSet<Kind>,
     format: Formats,
@@ -366,6 +369,56 @@ impl Schema {
         s
     }
 
+    /// Within the bounds of spec §6: at most `MAX_NODES` nodes and `MAX_LEVEL` levels, a cut
+    /// level of at most `MAX_LEVEL`, names of at most `MAX_NAME` bytes. The `{}` that stands
+    /// where a deeper value was cut away is not a level.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        self.check_node()?;
+        if self.levels() > MAX_LEVEL {
+            return Err(Violation::SchemaLevels);
+        }
+        if self.weight(1, usize::MAX) > MAX_NODES as u64 {
+            return Err(Violation::SchemaNodes);
+        }
+        Ok(())
+    }
+
+    fn check_node(&self) -> Result<(), Violation> {
+        if usize::from(self.cut) > MAX_LEVEL {
+            return Err(Violation::SchemaCut);
+        }
+        if let Some(items) = &self.items {
+            items.check_node()?;
+        }
+        if let Some(o) = &self.object {
+            let names = o.props.keys().chain(&o.required);
+            if names.into_iter().any(|n| n.len() > MAX_NAME) {
+                return Err(Violation::NameLength);
+            }
+            for v in o.props.values().chain(o.map.as_deref()) {
+                v.check_node()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn levels(&self) -> usize {
+        if self.kinds.is_empty() && self.items.is_none() && self.object.is_none() {
+            return 0;
+        }
+        let object = self.object.iter().flat_map(|o| {
+            o.props
+                .values()
+                .map(Schema::levels)
+                .chain(o.map.as_deref().map(Schema::levels))
+        });
+        let below = object
+            .chain(self.items.as_deref().map(Schema::levels))
+            .max()
+            .unwrap_or(0);
+        1 + below
+    }
+
     /// Nodes of the schema, counted as the 512-node cap counts them (spec §6).
     #[cfg(test)]
     pub(super) fn nodes(&self) -> usize {
@@ -458,6 +511,7 @@ impl Schema {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Param {
     /// Exchanges that had the key.
     count: u64,
@@ -468,6 +522,7 @@ struct Param {
 
 /// Keyed values of one kind (query keys, form fields or headers) over many exchanges.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Params {
     exchanges: u64,
     keys: BTreeMap<String, Param>,
@@ -588,6 +643,20 @@ impl Params {
             self.keys.pop_last();
         }
         self
+    }
+
+    /// At most `MAX_PARAMS` keys of at most `MAX_NAME` bytes, each with a valid schema.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        if self.keys.len() > MAX_PARAMS {
+            return Err(Violation::Params);
+        }
+        for (key, param) in &self.keys {
+            if key.len() > MAX_NAME {
+                return Err(Violation::NameLength);
+            }
+            param.schema.check()?;
+        }
+        Ok(())
     }
 
     pub fn to_json(&self) -> Value {
