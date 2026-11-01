@@ -300,6 +300,9 @@ pub struct Store {
     queues: Mutex<Queues>,
     /// What was already logged: (namespace, deployment, reason or kind).
     logged: Mutex<BTreeSet<(String, String, String)>>,
+    /// Test hook: the next write panics.
+    #[cfg(test)]
+    panic_next_write: std::sync::atomic::AtomicBool,
 }
 
 fn now_ms() -> u64 {
@@ -323,6 +326,8 @@ impl Store {
             writers: Semaphore::new(MAX_WRITERS),
             queues: Mutex::new(BTreeMap::new()),
             logged: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            panic_next_write: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -393,6 +398,13 @@ impl Store {
         keys: &Keys,
         batch: &[Pending],
     ) -> Result<Vec<Outcome>, StoreError> {
+        #[cfg(test)]
+        if self
+            .panic_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("injected writer panic");
+        }
         for attempt in 0..ATTEMPTS {
             let started = Instant::now();
             let result = self.attempt(namespace, deployment, keys, batch).await;

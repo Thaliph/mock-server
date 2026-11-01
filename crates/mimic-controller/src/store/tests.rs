@@ -462,3 +462,128 @@ async fn ctl_10_expiry_refreshed_by_applied_pushes_and_everything_expires() {
         .collect();
     assert!(left.is_empty(), "left after expiry: {left:?}");
 }
+
+fn log_lines(capture: &crate::webhook::tests::Capture, message: &str) -> usize {
+    String::from_utf8(capture.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["message"] == message)
+        .count()
+}
+
+#[tokio::test]
+async fn ctl_12_a_reply_error_keeps_the_connection_and_warns_once_per_streak() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl12r"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let mut c = conn(None).await;
+    // GET on a hash: a WRONGTYPE reply, the connection is fine.
+    let _: () = cmd(&mut c, &["HSET", &k.report, "f", "v"]).await;
+    for seq in 1..=3 {
+        let got = store
+            .push(&ns, dep, push_of("p", Some(seq), &[("/a", 200)]))
+            .await;
+        assert_eq!(got, Err(StoreError::Unavailable));
+    }
+    assert!(
+        store.connection.lock().await.is_some(),
+        "a reply error dropped the shared connection"
+    );
+    assert_eq!(log_lines(&capture, "valkey command failed"), 1);
+
+    // A write that succeeds ends the streak: the next failure warns again.
+    let _: () = cmd(&mut c, &["DEL", &k.report]).await;
+    let got = store
+        .push(&ns, dep, push_of("p", Some(4), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Ok(Outcome::Applied));
+    let _: () = cmd(&mut c, &["DEL", &k.report]).await;
+    let _: () = cmd(&mut c, &["HSET", &k.report, "f", "v"]).await;
+    let got = store
+        .push(&ns, dep, push_of("p", Some(5), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Err(StoreError::Unavailable));
+    assert_eq!(log_lines(&capture, "valkey command failed"), 2);
+}
+
+#[tokio::test]
+async fn ctl_12_the_deployment_limit_is_not_an_ok_write() {
+    let mut cfg = config(Duration::from_secs(3600));
+    cfg.max_deployments = 1;
+    let (store, metrics) = replica(None, cfg);
+    let ns = unique("ctl12d");
+    let got = store
+        .push(&ns, "one", push_of("p", Some(1), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Ok(Outcome::Applied));
+    let got = store
+        .push(&ns, "two", push_of("p", Some(1), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Err(StoreError::Deployments));
+    assert_eq!(counter(&metrics, "store_writes_total", "\"ok\""), 1.0);
+    assert_eq!(counter(&metrics, "store_writes_total", "\"refused\""), 1.0);
+}
+
+#[tokio::test]
+async fn ctl_09_a_writer_that_panics_does_not_block_later_pushes() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09p"), "front");
+    store
+        .panic_next_write
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.push(&ns, dep, push_of("p", Some(1), &[("/a", 200)])),
+    )
+    .await
+    .expect("the push of the panicked writer is answered");
+    assert_eq!(first, Err(StoreError::Unavailable));
+    assert!(
+        lock(&store.queues).is_empty(),
+        "the queue entry outlived its writer"
+    );
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.push(&ns, dep, push_of("p", Some(1), &[("/a", 200)])),
+    )
+    .await
+    .expect("a later push does not wait for a writer that is gone");
+    assert_eq!(second, Ok(Outcome::Applied));
+}
+
+#[tokio::test]
+async fn ctl_13_a_version_that_is_not_a_number_is_never_overwritten() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl13v"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let mut c = conn(None).await;
+    let _: () = cmd(&mut c, &["HSET", &k.meta, "version", "abc"]).await;
+    let got = store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Err(StoreError::Unavailable));
+    let version: String = cmd(&mut c, &["HGET", &k.meta, "version"]).await;
+    assert_eq!(version, "abc");
+    let exists: i64 = cmd(&mut c, &["EXISTS", &k.report]).await;
+    assert_eq!(exists, 0);
+}
+
+#[tokio::test]
+async fn ctl_13_a_sequence_that_is_not_a_number_is_never_overwritten() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl13s"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let field = format!("p/{SESSION}");
+    let mut c = conn(None).await;
+    let _: () = cmd(&mut c, &["HSET", &k.seq, &field, "x"]).await;
+    let got = store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Err(StoreError::Unavailable));
+    let seq: String = cmd(&mut c, &["HGET", &k.seq, &field]).await;
+    assert_eq!(seq, "x");
+    let exists: i64 = cmd(&mut c, &["EXISTS", &k.report]).await;
+    assert_eq!(exists, 0);
+}
