@@ -18,6 +18,7 @@ const URL_VAR: &str = "MIMIC_CONTROLLER_URL";
 const CONTROLLER_CA_VAR: &str = "MIMIC_CONTROLLER_CA";
 const TOKEN_VAR: &str = "MIMIC_TLS_TOKEN_FILE";
 const TRUST_DIR_VAR: &str = "MIMIC_TRUST_DIR";
+const TRUST_BINARY_VAR: &str = "MIMIC_TRUST_BINARY";
 const WORKLOAD_VAR: &str = "MIMIC_WORKLOAD";
 const DEFAULT_TOKEN: &str = "/var/run/secrets/mimic.platform.io/token";
 const DEFAULT_TRUST_DIR: &str = "/mimic";
@@ -53,6 +54,8 @@ pub struct TlsConfig {
     /// `None`: no interception, outbound TLS is passed through (`no_ca`).
     pub ca: Option<CaConfig>,
     pub trust_dir: PathBuf,
+    /// The `mimic-trust` binary to publish (`MIMIC_TRUST_BINARY`).
+    pub trust_binary: PathBuf,
 }
 
 impl TlsConfig {
@@ -63,6 +66,7 @@ impl TlsConfig {
                 .map_err(|reason| ConfigError::invalid(EXCLUDE_VAR, value, reason))?,
         };
         let trust_dir = PathBuf::from(env.optional(TRUST_DIR_VAR).unwrap_or(DEFAULT_TRUST_DIR));
+        let trust_binary = PathBuf::from(env.optional(TRUST_BINARY_VAR).unwrap_or(TRUST_BINARY));
         let ca = match env.optional(CA_VAR) {
             None => None,
             Some(pem) => Some(ca_config(env, pem)?),
@@ -71,6 +75,7 @@ impl TlsConfig {
             exclusions,
             ca,
             trust_dir,
+            trust_binary,
         })
     }
 }

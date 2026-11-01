@@ -172,22 +172,35 @@ would see without mimic, except for the limits listed at the end of this section
   when its head does not parse (invalid tokens, a bare CR, `obs-fold` in a framing header),
   is over the limits above, or has an ambiguous length: both `content-length` and
   `transfer-encoding`, several `content-length` values that differ or one that is not a
-  decimal number, a request `transfer-encoding` whose last coding is not `chunked` or that
-  comes with HTTP/1.0, or an invalid chunk size. The exchange then writes its access line at
-  once (`result: unframed`, with the fields known so far), and the rest of the connection is
-  relayed as an opaque tunnel, with no further exchange line.
+  decimal number, a `transfer-encoding` with a coding that has parameters (`chunked;x=1`:
+  recipients disagree on it) or quotes, a request `transfer-encoding` whose last coding is
+  not `chunked` or that comes with HTTP/1.0, or an invalid chunk size. The exchange then
+  writes its access line at once (`result: unframed`, with the fields known so far), and the
+  rest of the connection is relayed as an opaque tunnel, with no further exchange line.
 - **Upgrades**: a request answered with `101` (WebSocket, `h2c` upgrade), or a `CONNECT`
   answered with 2xx, continues as an opaque tunnel after the response. After a request that
   asks for an upgrade or is a `CONNECT`, the relay reads no more client bytes until the final
   response to it arrives (the client must wait for it, RFC 9110 §7.8, §9.3.6). A declined
-  upgrade leaves a plain HTTP/1 connection.
+  upgrade leaves a plain HTTP/1 connection. The relay holds at most one 16 KiB read, the rest
+  stays in the socket; a codec fed more than 64 KiB behind an unanswered upgrade (without the
+  relay's flow control) reports the upgrade request as `unframed`, drops its
+  copy and uses every byte: none is lost.
 - **Failures**: the sidecar never synthesises a response. When the destination refuses the
   connection, the client connection is closed without any byte; when it closes or resets
   before answering, the client sees the same close or reset (HTTP/1), or the stream is reset
   (HTTP/2). An HTTP/2 client that breaks the protocol at connection level gets `GOAWAY` (the
   `h2` stack) and one `rejected` access line.
-- **Idle and long-lived connections**: no idle, header-read, handshake or request timeout, no
-  cap on connections or streams. A connection lives until one side closes it. The HTTP/2
+- **Idle and long-lived connections**: no idle, header-read, handshake or request timeout and no
+  cap on streams. A connection lives until one side closes it. Two bounds protect the sidecar
+  from clients that pin it: a connection whose first bytes are an incomplete prefix of a known
+  protocol (an HTTP method, a TLS record header, the h2 preface) and that then stays silent on
+  both sides for 30 s is reset (a connection with no byte at all is not a prefix: a
+  server-first protocol is waited for); and at most `MIMIC_MAX_CONNECTIONS` connections are
+  served at once in each direction (inbound and outbound have a budget of their own, so that a
+  full inbound side cannot make the app's outbound calls wait for the requests they serve),
+  further ones waiting in the accept backlog (never refused). The stall timer restarts on
+  every read: a client that drips one byte at a time keeps its connection (accepted limit; the
+  cap bounds the damage). The HTTP/2
   handshake with the destination does not wait for the destination: a silent destination
   leaves the client's streams pending, as it would without mimic, until a side closes.
 - **Close and reset propagation** (HTTP/1 and tunnels): a FIN from one side reaches the other
@@ -214,7 +227,10 @@ would see without mimic, except for the limits listed at the end of this section
   tunnels run until `MIMIC_SHUTDOWN_GRACE` ends. When it ends, the sidecar closes every
   connection still open (tunnels, connections in detection, exchanges still pending), writes
   the access line of each (`result: shutdown`), then one WARN line `grace period over` with
-  `connections` (how many it closed), and exits 0.
+  `connections` (how many it closed), and exits 0. An idle HTTP/1 connection is closed with a
+  FIN, never a reset: the client bytes that reached the socket after the connection was found
+  idle are read and discarded (at most 250 ms) before the sockets are released. The bytes
+  protocol detection had already read when `SIGTERM` came are forwarded.
 - **Access logs** (`target` = `access`, level INFO): one line per HTTP exchange (`message`
   `http exchange`) and one per opaque or TLS connection (`message` `connection`), written when
   it ends.
@@ -261,7 +277,7 @@ Accepted limits of the proxy:
   keeps the connection open (one task, two sockets), as the destination would keep its own
   socket without mimic. A client that vanished without a reset is noticed only by TCP
   keepalive (about 5 minutes after the last activity).
-- An HTTP/1 request whose first bytes arrive while `SIGTERM` closes its idle connection is
+- An HTTP/1 request whose first bytes arrive after `SIGTERM` found its connection idle is
   not forwarded: the client sees the connection closed without a response and no access line
   is written. The app containers have already stopped then, so the client would get no
   answer without mimic either.
@@ -300,7 +316,7 @@ client or the destination sees, the connection is **passed through** untouched i
   | the ClientHello offers no TLS 1.2 or 1.3, or offers ALPN protocols none of which is `h2` or `http/1.1` | `unsupported` | no |
   | the sidecar's own handshake with the destination fails at TLS level: certificate not verified (unknown issuer, expired, wrong name), alert, no common version or cipher | `upstream_untrusted` | yes |
   | the destination asks for a client certificate (`CertificateRequest`) | `client_cert_requested` | yes |
-  | the client aborts its handshake after receiving the sidecar's certificate (alert, close or reset), or the handshake with the client fails | `client_rejected` | yes |
+  | the client answers the sidecar's certificate with an alert, or closes the connection right after it | `client_rejected` | yes |
   | otherwise | `intercepted` | — |
 
   The sidecar handshakes with the destination **before** answering the client: it offers the
@@ -310,6 +326,9 @@ client or the destination sees, the connection is **passed through** untouched i
   the destination chose (none if it chose none). The decrypted client stream then goes through
   the same detection and the same relays as cleartext (§4.1): HTTP/1 through the byte-exact
   `http1` codec, HTTP/2 through the `h2` relay, anything else as an opaque decrypted tunnel.
+  As in §4.1, the detection also reads the destination: one that speaks first (a TLS banner
+  protocol) makes an opaque decrypted tunnel at once, and a client that stays silent is waited
+  for, as without mimic.
 - **Pass-through** means what §4.1 does for TLS today: a new TCP connection to the original
   destination receives the client's bytes unchanged, from the original ClientHello on, and the
   client sees the destination's own certificate. For `upstream_untrusted` and
@@ -317,7 +336,9 @@ client or the destination sees, the connection is **passed through** untouched i
   sidecar's own TCP connection to the destination is closed); for `client_rejected` the
   connection being handled is lost (the client gave up on it) and the next one passes through.
   An I/O failure (reset, close) of the destination during the sidecar's handshake reaches the
-  client as that reset or close, and nothing is remembered.
+  client as that reset or close, and nothing is remembered. Likewise a handshake with the
+  client that ends otherwise than by an alert or a close (a reset, which may be a client crash,
+  a timeout, a malformed message) drops that connection and remembers nothing.
 - **Remembered destinations**: key = (SNI, else destination IP; destination port), kept in
   memory for the life of the process, at most 4096 (the oldest is forgotten first). The first
   time a destination is remembered the sidecar logs one WARN `tls passthrough` (`target`
@@ -355,7 +376,14 @@ client or the destination sees, the connection is **passed through** untouched i
   mimic image, plus every `image-ca.pem` written by `mimic-trust` for the pod's app images
   (§7.1), loaded at the first interception; the mimic roots are never in them. A destination
   whose certificate the app's own images trust is therefore verified, and a destination signed
-  by a CA that mimic does not know is passed through, so that the app judges it itself.
+  by a CA that mimic does not know is passed through, so that the app judges it itself. A file
+  that cannot be read, or a PEM block of it that does not parse, is skipped with one WARN
+  `tls roots skipped` (`path`, `skipped`) at load; a load that fails is not remembered (the
+  next interception loads again; the connection that met the failure is reset).
+- **Trust volume**: the sidecar publishes the `mimic-trust` binary and the fallback store into
+  `MIMIC_TRUST_DIR` at start (§7.1). If it cannot, the app images' bundles will not exist and
+  the apps would not trust the mimic root: it logs an ERROR `trust volume not published` and
+  does not intercept (`no_ca`).
 - **The app trusts its deployment's root without code change**: `mimic-trust` (§7.1) builds,
   for each app image, a bundle of that image's own trust store plus the root, and the webhook
   points the usual variables at it: `SSL_CERT_FILE` (OpenSSL, Go, Ruby, .NET),
@@ -368,7 +396,8 @@ client or the destination sees, the connection is **passed through** untouched i
   (matched against the destination IP of a ClientHello without SNI). Entries are compared
   after the authority normalisation of §4.1 (case, trailing dot); at most 256 entries. The
   webhook gives the sidecar the sorted, deduplicated union of the lists of every
-  `MimicWorkload` naming the deployment, in `MIMIC_TLS_EXCLUDE`; a change applies to pods
+  `MimicWorkload` naming the deployment, in `MIMIC_TLS_EXCLUDE`; a union of more than 256
+  entries is cut to its first 256 in sorted order, with one WARN `tls exclude truncated`; a change applies to pods
   created afterwards (`kubectl rollout restart`), like the injection itself.
 - **Mock mode (F10)**: the sidecar answers intercepted connections without connecting to the
   destination (it issues the leaf for the SNI and picks `h2` when offered, else `http/1.1`),
@@ -705,11 +734,18 @@ Everything below except the capture tap, content decoding and the recorder threa
   intermediate of §5 for that key signed by the deployment's root. `401` when the token is
   missing, invalid, expired or for another audience; `403` when the pod name does not match
   the deployment or has no bound-pod claim; `400` for a malformed body or key; `413` over the
-  limit; `405` for another method; `503` when the seed is not loaded or the `TokenReview`
-  fails.
+  limit; `405` for another method; `503` when the seed is not loaded, the `TokenReview`
+  fails or the `TokenReview` budget is spent. The posted key must be a point of the P-256
+  curve (`400` otherwise). `TokenReview` calls are limited per source IP of the connection (burst 10, 2 per
+  second, whatever the answer; at most 4096 sources are tracked, the oldest is forgotten first)
+  and by a global ceiling (burst 200, 100 per second), so that callers with arbitrary tokens
+  neither flood the API server nor, from one pod, starve the sidecars of the others; the HKDF and ECDSA work runs outside the async threads that
+  serve the webhook.
 - One log line per request (`target` = `sidecar_api`): `endpoint`, `namespace`, `pod`,
-  `deployment`, `result` (`ok`, `unauthenticated`, `forbidden`, `invalid`, `unavailable`);
-  never the token or the key. Metric `mimic_sidecar_api_requests_total{endpoint,result}`.
+  `deployment`, `result` (`ok`, `unauthenticated`, `forbidden`, `invalid`, `unavailable`) and,
+  when the request failed on the controller's side, `error`; a request writes no other line;
+  never the token or the key. The sidecar reads the answer with a 64 KiB cap while it
+  streams. Metric `mimic_sidecar_api_requests_total{endpoint,result}`.
 
 ## 8. Mock
 
@@ -823,12 +859,14 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_WORKLOAD` | required | Deployment name. |
 | `MIMIC_POD_NAMESPACE`, `MIMIC_POD_NAME`, `MIMIC_POD_IP` | required | Downward API. |
 | `MIMIC_APP_PROBES` | `{}` | Original `httpGet` probes, JSON object keyed by `<container>/<livez\|readyz\|startupz>`. |
+| `MIMIC_MAX_CONNECTIONS` | `16384` | Connections served at once in each direction, inbound and outbound separately (§4.1), 1–1000000. |
 | `MIMIC_METRICS_MAX_AUTHORITIES` | `50` | Distinct `authority` label values kept per direction and metric (§9), 1–10000. Not set by the webhook in F2. |
 | `MIMIC_TLS_CA` | empty | Deployment root certificate (PEM). Empty: no interception, every outbound TLS connection is passed through (`no_ca`), with one INFO line at start. |
 | `MIMIC_TLS_EXCLUDE` | empty | Comma-separated exclusions (§5); an invalid entry or more than 256 exits with code 2. |
 | `MIMIC_CONTROLLER_URL` | required when `MIMIC_TLS_CA` is set | Sidecar API base URL (`https://…`). |
 | `MIMIC_CONTROLLER_CA` | required when `MIMIC_TLS_CA` is set | CA (PEM) the sidecar API certificate is verified against. |
 | `MIMIC_TLS_TOKEN_FILE` | `/var/run/secrets/mimic.platform.io/token` | Projected token, re-read for every sidecar API request. |
+| `MIMIC_TRUST_BINARY` | `/usr/local/bin/mimic-trust` | The `mimic-trust` binary published into the trust volume (tests point it elsewhere); the webhook never sets it. |
 | `MIMIC_TRUST_DIR` | `/mimic` | `mimic-trust` volume: binary and fallback store written at start, `trust/*/image-ca.pem` read as upstream roots. |
 | `MIMIC_DISCOVERY_MAX_ENDPOINTS` | `256` | Endpoints kept per direction (§6), 1–10000. Not set by the webhook. |
 | `MIMIC_DISCOVERY_MAX_LITERALS` | `32` | Distinct literal segments below a template node before it absorbs them into a parameter (§6), 2–1000. Not set by the webhook. |
@@ -884,6 +922,12 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
 
 ### 11.1 Accepted limits
 
+- While the relay holds the client's bytes behind an upgrade or `CONNECT` request, or at the
+  read-ahead of 32 requests, it does not read the client socket, so a bare client FIN is not
+  seen until the destination answers or closes, or the client resets: the destination holds
+  the same state (it has not answered either), and the FIN could only be passed on after the
+  held bytes, which must wait for the response. Watching the socket without consuming it is
+  not possible on a TLS stream.
 - Capture is an observability and test tool, not a security boundary: an app container with
   `NET_ADMIN`, or whose image runs as UID 1337 without declaring it in the pod spec, escapes it.
 - `exec` probes are left as they are. A `tcpSocket` probe only checks that the sidecar can
@@ -981,7 +1025,7 @@ names contain the criterion ID (`fnd_02_…`).
 | FND-07 | The image runs as UID 65532, contains no shell, and both binaries answer `--version` with the crate version. |
 | FND-08 | `helm lint` passes; every rendered pod is Pod Security `restricted` (non-root, read-only root filesystem, no capability, `RuntimeDefault` seccomp, no privilege escalation). Valkey requires a password generated at install and kept on upgrade, and only accepts connections from the controller (NetworkPolicy; needs a CNI that enforces NetworkPolicy, as kind's default does). |
 | FND-09 | On kind (Kubernetes ≥ 1.33), `helm install` brings the controller and Valkey to Ready, and the controller's `/readyz` and `/metrics` answer through a port-forward. |
-| FND-10 | CI runs as dependent stages: lint → unit and integration tests → image build and scan → kind e2e, plus a security stage (`cargo deny`, `zizmor`); a single `ci-ok` check sums them up: it fails if any job fails or is cancelled, and accepts a skipped job only when the job's own path filter excluded it (the HTTP/1 codec fuzz job, PRX-28, on a change outside `crates/mimic-core/src/proxy/http1/` and `fuzz/`; the discovery recorder fuzz job, DSC-23, on a change outside `crates/mimic-core/src/discovery/` and `fuzz/`). A `v*` tag publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart. |
+| FND-10 | CI runs as dependent stages: lint → unit and integration tests → image build and scan → kind e2e, plus a security stage (`cargo deny`, `zizmor`); a single `ci-ok` check sums them up: it fails if any job fails or is cancelled, and accepts a skipped job only when the job's own path filter excluded it (the HTTP/1 codec fuzz job, PRX-28, on a change outside `crates/mimic-core/src/proxy/http1/`, `crates/mimic-core/src/proxy.rs`, the workspace `Cargo.toml` and `Cargo.lock`, and `fuzz/`; the discovery recorder fuzz job, DSC-23, on a change outside `crates/mimic-core/src/discovery/` and `fuzz/`). A `v*` tag publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart. |
 
 ### 12.2 F1 — Injection
 
@@ -1051,6 +1095,7 @@ in-process with an injected original destination, as the F1 tunnel tests do.
 | PRX-28 | **C.** A `cargo-fuzz` target feeds arbitrary byte pairs (client side, destination side) to the codec; CI runs it for 60 s on every PR that touches the codec and for 10 min weekly; a crash, a panic, an out-of-memory or a retained state over the PRX-27 bound fails the job and its input is kept as an artefact. |
 | PRX-29 | **U.** Each ambiguous or unparsable input of §4.1 "Unframed HTTP/1" (both `content-length` and `transfer-encoding`; differing or non-decimal `content-length`; request `transfer-encoding` not ending in `chunked`, or with HTTP/1.0; `obs-fold` in a framing header; a bare CR; a header line without `:`; an invalid or over-long chunk size; a head, chunk-size line or trailer section over its limit) gives `unframed` at the first byte that decides it. **I.** For a request with both `content-length` and `transfer-encoding`, a header line over 64 KiB and a head of 300 lines, the destination receives the client's bytes unchanged, the client receives the destination's answer unchanged, one access line has `result: unframed` (with `method`/`path` when known, no `status`), and later HTTP on that connection produces no exchange line. |
 | PRX-30 | **I.** Bounded read-ahead: against a destination that reads everything and never answers, a client that pipelines 100 requests in one write has exactly 32 of them delivered to the destination; each response the destination then sends lets one more through, and all 100 are eventually answered in order. A client that sends a 10 MiB header line without a line end has all its bytes delivered to the destination unchanged and gets one `unframed` line (its memory bound is PRX-27's). |
+| PRX-31 | **I.** With `MIMIC_MAX_CONNECTIONS=2`, a third connection is accepted by the kernel but not served until one of the two ends, then served, and a full inbound side does not delay an outbound connection; an invalid value exits with code 2 (FND-01). A client that sends an incomplete prefix of a protocol (`GE`) and goes silent is reset after the stall duration (injectable; 30 s in production) while a connection that sent nothing is not. |
 
 ### 12.4 F3 — TLS interception
 
@@ -1078,15 +1123,18 @@ from test CAs placed in a temporary `MIMIC_TRUST_DIR`.
 | TLS-15 | **I** (sidecar, fake sidecar API). With `MIMIC_TLS_CA` set, the sidecar is ready before it has an intermediate; it reads the token file for each request (a changed file sends the new token), posts its public key, and starts intercepting once it holds an intermediate that chains to `MIMIC_TLS_CA` (`mimic_tls_intermediate_expiry_timestamp_seconds` set); before that, and when the API fails, outbound TLS is passed through (`no_ca`) and failures are retried with the TLS-05 backoff (`result="error"`). An intermediate from another root is refused: ERROR `tls ca mismatch`, `result="mismatch"`, no interception. A 4 s intermediate is renewed about 2 s after issuance. A canary token appears in no log line, and no line contains `PRIVATE KEY`. A missing `MIMIC_CONTROLLER_URL` with `MIMIC_TLS_CA` set exits with code 2. |
 | TLS-16 | **I.** The sidecar's `/proc/<pid>/limits` shows a core file size of 0 and its `/proc/<pid>/environ` is owned by root (non-dumpable), once it has started. |
 | TLS-17 | **I.** Interception, outbound: a client that trusts `MIMIC_TLS_CA` connects with SNI `api.test` to a destination whose certificate for `api.test` comes from a CA in a `trust/0/image-ca.pem`; the client sees a leaf for `api.test` issued by the intermediate, within its validity, whose Authority Key Identifier equals the intermediate's Subject Key Identifier, and the destination sees SNI `api.test`. Over it, the PRX-15 corpus keeps its byte equality on the decrypted streams; with ALPN `h2` (offered `h2,http/1.1`, destination supporting `h2`) the PRX-04 concurrent streams and unary gRPC pass unchanged and the client's negotiated ALPN equals the destination's choice; a client without ALPN gets HTTP/1.1. Exchange lines have `tls: true`, and `Host: api.test:443` gives `authority` `api.test`. A ClientHello without SNI to `127.0.0.1` gets a leaf with that IP SAN. Two connections with the same SNI get the same leaf until the intermediate changes. |
-| TLS-18 | **I.** A destination whose certificate is self-signed, expired, for another name, or that only speaks TLS 1.1 is passed through: the destination receives the client's ClientHello byte for byte, the client sees the destination's own certificate (or its own failure, as without mimic); one `connection` line `protocol: tls`, `interception: upstream_untrusted`; one WARN `tls passthrough` per destination; the next connection is passed through without the sidecar's own handshake (the destination accepts one handshake from the sidecar in total); `mimic_tls_passthrough_destinations` counts it. A destination that resets during the sidecar's handshake resets the client within 1 s and is not remembered. |
+| TLS-18 | **I.** A destination whose certificate is self-signed, expired, for another name, or that only speaks TLS 1.1 is passed through: the destination receives the client's ClientHello byte for byte, the client sees the destination's own certificate (or its own failure, as without mimic); one `connection` line `protocol: tls`, `interception: upstream_untrusted`; one WARN `tls passthrough` per destination; the next connection is passed through without the sidecar's own handshake (the destination accepts one handshake from the sidecar in total); `mimic_tls_passthrough_destinations` counts it. A destination that resets during the sidecar's handshake resets the client within 1 s and is not remembered. A root file that does not parse is logged (WARN `tls roots skipped`). |
 | TLS-19 | **I.** A destination that requests a client certificate is passed through (`client_cert_requested`): a client presenting its certificate completes mTLS with the destination, which sees that certificate; it is remembered. |
-| TLS-20 | **I.** A client that trusts only the destination's CA (not `MIMIC_TLS_CA`) fails its first handshake (it rejects the mimic leaf), the destination is remembered as `client_rejected` with one WARN `tls passthrough`, and the client's next connection succeeds with the destination's own certificate. |
+| TLS-20 | **I.** A client that trusts only the destination's CA (not `MIMIC_TLS_CA`) fails its first handshake (it rejects the mimic leaf), the destination is remembered as `client_rejected` with one WARN `tls passthrough`, and the client's next connection succeeds with the destination's own certificate. A client that resets the connection during the handshake, or that stalls, is not remembered. |
 | TLS-21 | **I.** With `MIMIC_TLS_EXCLUDE=*.excluded.test`, a connection with SNI `a.excluded.test` is passed through without any handshake from the sidecar (`interception: excluded`), and `api.test` is still intercepted. A ClientHello offering only TLS 1.1, or ALPN `imap` only, is passed through as `unsupported` and not remembered. An inbound TLS connection is never intercepted and its line has no `interception` field. |
 | TLS-22 | **I.** Close and reset on the decrypted path: a client `close_notify` + FIN after a complete request reaches the destination as `close_notify` + FIN after the request bytes, and the destination can still answer (PRX-17); a TCP reset by either side reaches the other as a reset within 1 s (PRX-18); at the end of the shutdown grace an intercepted exchange writes `result: shutdown` (PRX-20). |
 | TLS-23 | **I.** After a known set of connections (intercepted, excluded, `no_ca`, `unsupported`, `upstream_untrusted`, `client_rejected`), `/metrics` shows the exact `mimic_tls_connections_total{interception}` values, `mimic_tls_passthrough_destinations`, and intercepted connections under their decrypted protocol with the SNI as `authority` in `mimic_proxy_connections_total` (§9). The PRX-08 canaries (header, cookie, query, bodies) sent over an intercepted connection appear in no log line. |
 | TLS-24 | **E.** The chart creates the empty seed Secret, the Service and NetworkPolicy port 8444, and the RBAC of §11: `kubectl auth can-i` as the controller is `yes` for `create tokenreviews` and `get`/`update` of the seed Secret, `no` for other Secrets and pods; after install the Secret holds a seed; `helm uninstall` removes it. The CRD accepts `spec.tls.exclude: [api.example.com, "*.corp.example", 10.0.0.1]` and rejects `*`, `a.*.com` and 257 entries. |
 | TLS-25 | **E.** In an `enabled` namespace, four client Deployments built by the e2e from `curlimages/curl`, `python:slim` (`urllib`), `node:slim` (`fetch`) and `eclipse-temurin` (JDK `HttpClient`), each with the e2e test CA installed in the image's system store, call an in-cluster HTTPS Service whose certificate comes from that CA: each call returns 200, the sidecar writes an exchange line with `tls: true` and `status: 200`, and the certificate the client saw is issued by the mimic intermediate. A call to an HTTPS Service signed by an unknown CA fails in the client as without mimic (curl exit 60) and the sidecar logs `upstream_untrusted`. A `MimicWorkload` with `spec.tls.exclude` naming the Service host makes the next pod's connections `excluded`. |
 | TLS-26 | **E.** A client container that defines `SSL_CERT_FILE` in its spec to a file holding only the e2e CA keeps that value (no mimic variables for it); its first call fails, the sidecar logs one WARN `tls passthrough` with `reason: client_rejected`, and its second call returns 200 with the Service's own certificate. A sidecar token presented for another deployment's name gets `403` from the sidecar API. |
+| TLS-27 | **I** (sidecar). A destination that the app image's trust accepts is intercepted although the first handshake with the client is a reset: a client that resets during the handshake is not remembered (`mimic_tls_passthrough_destinations 0`, no WARN), one that sends an alert is. An intercepted connection to a server-first protocol over TLS (the destination sends a banner, the client waits) receives the banner. A failing `publish_trust` (unwritable `MIMIC_TRUST_DIR`) leaves outbound TLS passed through (`no_ca`) and logs ERROR `trust volume not published`. |
+| TLS-28 | **I** (controller). The sidecar API rejects (400) a posted key that is not a point of the P-256 curve; with a budget of 2 `TokenReview` calls per source the third request from one source within the window gets 503 without a call to the API server while another source is still served, the budget refills with time, and the table of sources keeps at most its capacity (oldest forgotten first); a failing `TokenReview` writes exactly one `sidecar_api` log line, carrying `error`. **U.** A union of `spec.tls.exclude` of 300 distinct entries over several `MimicWorkload`s is cut to its first 256 in sorted order. |
+| TLS-29 | **I** (sidecar CA client). An answer larger than 64 KiB is refused while it streams (the client does not buffer more than the cap plus one chunk). **I** (`mimic-trust`). A store file over 8 MiB is ignored like an unreadable one. |
 
 ### 12.5 F4 — Ingress endpoint discovery
 

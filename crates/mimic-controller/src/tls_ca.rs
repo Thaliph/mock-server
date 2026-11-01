@@ -11,7 +11,7 @@ use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, PostParams};
 use mimic_runtime::config::{ConfigError, Env};
-use p256::pkcs8::EncodePrivateKey;
+use p256::pkcs8::{DecodePublicKey, EncodePrivateKey};
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use rcgen::{
@@ -120,6 +120,9 @@ impl Root {
         if PublicKeyData::algorithm(&subject) != &PKCS_ECDSA_P256_SHA256 {
             return Err("public key: expected ECDSA P-256".to_string());
         }
+        // A point off the curve (or a coordinate that is not one) is not a key to certify.
+        p256::PublicKey::from_public_key_der(spki_der)
+            .map_err(|_| "public key: not a P-256 point")?;
         let mut params = CertificateParams::default();
         params
             .distinguished_name

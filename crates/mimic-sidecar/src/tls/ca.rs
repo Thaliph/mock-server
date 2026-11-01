@@ -96,7 +96,7 @@ struct Current {
 }
 
 struct Inner {
-    current: Option<Current>,
+    current: Option<Arc<Current>>,
     /// Leaves of the current intermediate by name; emptied when it changes.
     leaves: Bounded<String, Arc<CertifiedKey>>,
 }
@@ -164,7 +164,7 @@ impl CaState {
             .expiry
             .set(i64::try_from(current.validity.not_after).unwrap_or(i64::MAX));
         let mut inner = self.lock();
-        inner.current = Some(current);
+        inner.current = Some(Arc::new(current));
         inner.leaves.clear();
     }
 
@@ -186,16 +186,28 @@ impl CaState {
     /// SNI), issued on first use. `None` without a usable intermediate.
     pub fn leaf(&self, name: &str) -> Option<Arc<CertifiedKey>> {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let current = {
+            let inner = self.lock();
+            let current = inner.current.clone()?;
+            if !current.validity.usable(unix_now()) {
+                return None;
+            }
+            if let Some(leaf) = inner.leaves.get(&name) {
+                return Some(leaf.clone());
+            }
+            current
+        };
+        // Signing runs without the lock: other connections keep looking leaves up meanwhile.
+        let certified = self.issue(&current, &name).ok()?;
         let mut inner = self.lock();
-        let current = inner.current.as_ref()?;
-        if !current.validity.usable(unix_now()) {
-            return None;
+        // Cached only if the intermediate it was signed under is still the current one.
+        if inner
+            .current
+            .as_ref()
+            .is_some_and(|now| Arc::ptr_eq(now, &current))
+        {
+            inner.leaves.insert(name, certified.clone());
         }
-        if let Some(leaf) = inner.leaves.get(&name) {
-            return Some(leaf.clone());
-        }
-        let certified = self.issue(current, &name).ok()?;
-        inner.leaves.insert(name, certified.clone());
         Some(certified)
     }
 
@@ -326,12 +338,18 @@ impl CaClient {
         if !status.is_success() {
             return Err(Failure::Error(format!("status {status}")));
         }
-        let bytes = response
-            .bytes()
+        // Read chunk by chunk: an endless answer is refused at the cap, not buffered.
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| Failure::Error(e.without_url().to_string()))?;
-        if bytes.len() > MAX_RESPONSE {
-            return Err(Failure::Error("answer too large".into()));
+            .map_err(|e| Failure::Error(e.without_url().to_string()))?
+        {
+            if bytes.len() + chunk.len() > MAX_RESPONSE {
+                return Err(Failure::Error("answer too large".into()));
+            }
+            bytes.extend_from_slice(&chunk);
         }
         let answer: Answer = serde_json::from_slice(&bytes)
             .map_err(|_| Failure::Error("malformed answer".into()))?;

@@ -236,7 +236,7 @@ can() {
   local want=$1 desc=$2 got
   shift 2
   got=$(kubectl auth can-i --as="$sa" "$@" 2>/dev/null) || true
-  [[ $got == "$want" ]] || fail "inj_12: $desc (want $want, got '$got')"
+  [[ $got == "$want" ]] || fail "${CAN_ID:-inj_12}: $desc (want $want, got '$got')"
 }
 # accepted <description> <command...>: the command succeeds. denied: it fails.
 accepted() { local desc=$1; shift; "$@" >/dev/null 2>&1 || fail "inj_12: $desc was rejected"; }
@@ -248,7 +248,7 @@ can yes "get its webhook configuration" get mutatingwebhookconfigurations.admiss
 can yes "list its webhook configuration" list mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
 can yes "watch its webhook configuration" watch mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
 can yes "patch its webhook configuration" patch mutatingwebhookconfigurations.admissionregistration.k8s.io/$cfg
-can yes "create tokenreviews (sidecar API authentication)" create tokenreviews.authentication.k8s.io
+CAN_ID=tls_24 can yes "create tokenreviews (sidecar API authentication)" create tokenreviews.authentication.k8s.io
 can no "list all webhook configurations" list mutatingwebhookconfigurations.admissionregistration.k8s.io
 can no "watch all webhook configurations" watch mutatingwebhookconfigurations.admissionregistration.k8s.io
 can no "list another webhook configuration" list mutatingwebhookconfigurations.admissionregistration.k8s.io/some-other
@@ -883,9 +883,9 @@ seed0=$(seed_of)
   || fail "tls_24: the controller Service has no sidecar-api port 8444"
 [[ $(kubectl -n "$NS" get networkpolicy $RELEASE-controller -o jsonpath='{.spec.ingress[*].ports[*].port}') == *8444* ]] \
   || fail "tls_24: the controller NetworkPolicy does not allow port 8444"
-can yes "get the TLS seed Secret" get secret/$RELEASE-tls-ca -n "$NS"
-can yes "update the TLS seed Secret" update secret/$RELEASE-tls-ca -n "$NS"
-can no "get another Secret" get secret/some-other -n "$NS"
+CAN_ID=tls_24 can yes "get the TLS seed Secret" get secret/$RELEASE-tls-ca -n "$NS"
+CAN_ID=tls_24 can yes "update the TLS seed Secret" update secret/$RELEASE-tls-ca -n "$NS"
+CAN_ID=tls_24 can no "get another Secret" get secret/some-other -n "$NS"
 admin_forward
 curl -fs localhost:18081/metrics | grep '^mimic_tls_seed_loaded 1' >/dev/null || fail "tls_24: mimic_tls_seed_loaded is not 1"
 exclude_max=$(seq -s, -f 'h%g.example.test' 0 256)

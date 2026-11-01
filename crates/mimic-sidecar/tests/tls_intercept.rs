@@ -114,12 +114,21 @@ async fn destination(alpn: &[&[u8]]) -> Destination {
     destination_with(alpn, true, None).await
 }
 
-/// `trusted`: its CA is in the image trust store; `client_ca`: client certificates signed by
-/// it are requested (not required).
 async fn destination_with(
     alpn: &[&[u8]],
     trusted: bool,
     client_ca: Option<&CertificateDer<'static>>,
+) -> Destination {
+    destination_full(alpn, trusted, client_ca, None).await
+}
+
+/// `trusted`: its CA is in the image trust store; `client_ca`: client certificates signed by
+/// it are requested (not required); `banner`: written first, before the client says anything.
+async fn destination_full(
+    alpn: &[&[u8]],
+    trusted: bool,
+    client_ca: Option<&CertificateDer<'static>>,
+    banner: Option<&'static [u8]>,
 ) -> Destination {
     let (ca, ca_der) = authority("destination ca");
     let key = KeyPair::generate().unwrap();
@@ -178,6 +187,9 @@ async fn destination_with(
                 let Ok(mut tls) = acceptor.accept(tcp).await else {
                     return;
                 };
+                if let Some(banner) = banner {
+                    let _ = tls.write_all(banner).await;
+                }
                 seen.lock()
                     .unwrap()
                     .push(tls.get_ref().1.server_name().map(str::to_string));
@@ -831,4 +843,81 @@ async fn dsc_21_intercepted_outbound_access_line_redacts_path_secrets() {
     assert_eq!(lines[0]["tls"], true);
     assert_eq!(lines[0]["path"], "/reset/<redacted>");
     assert!(!logs.text().contains(jwt), "{}", logs.text());
+}
+
+#[tokio::test]
+async fn tls_27_a_client_that_resets_during_the_handshake_is_not_remembered() {
+    let logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    let addr = sidecar.addr;
+    // Sends its ClientHello, reads the sidecar's first flight, then resets.
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Write};
+        let config = ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        let mut conn =
+            tokio_rustls::rustls::ClientConnection::new(Arc::new(config), api()).unwrap();
+        let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+        let mut hello = Vec::new();
+        conn.write_tls(&mut hello).unwrap();
+        tcp.write_all(&hello).unwrap();
+        let mut flight = [0u8; 4096];
+        assert!(tcp.read(&mut flight).unwrap() > 0);
+        socket2::SockRef::from(&tcp)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(warns(&logs), 0, "{}", logs.text());
+    assert!(
+        sidecar
+            .metrics
+            .encode()
+            .contains("mimic_tls_passthrough_destinations 0")
+    );
+    // Still intercepted: the next client trusting the mimic root gets its answer.
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+}
+
+#[tokio::test]
+async fn tls_27_a_server_first_protocol_over_an_intercepted_connection_gets_its_banner() {
+    let dest = destination_full(&[], true, None, Some(b"220 hello\r\n")).await;
+    let (ca, root) = ca_state();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    let mut banner = [0u8; 11];
+    tokio::time::timeout(TIMEOUT, tls.read_exact(&mut banner))
+        .await
+        .expect("the banner reaches a client that is waiting for it")
+        .unwrap();
+    assert_eq!(&banner, b"220 hello\r\n");
+}
+
+#[tokio::test]
+async fn tls_27_unreadable_and_unparsable_root_files_are_logged() {
+    let logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    // A directory where a file is expected, and a block that is not a certificate.
+    std::fs::create_dir_all(dest.trust.path().join("trust/1/image-ca.pem")).unwrap();
+    std::fs::create_dir_all(dest.trust.path().join("trust/2")).unwrap();
+    std::fs::write(
+        dest.trust.path().join("trust/2/image-ca.pem"),
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let sidecar = sidecar(&dest, Some(ca), "").await;
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    let text = logs.text();
+    assert_eq!(text.matches("tls roots skipped").count(), 2, "{text}");
+    assert!(text.contains("trust/1/image-ca.pem") && text.contains("trust/2/image-ca.pem"));
 }
