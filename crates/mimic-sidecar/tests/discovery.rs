@@ -133,6 +133,8 @@ fn templates(report: &Report) -> Vec<String> {
 
 #[tokio::test]
 async fn dsc_12_inbound_http1_exchanges_appear_in_the_report() {
+    // Every test that runs a recorder has the process logger: see `capture_logs`.
+    let _logs = capture_logs();
     let app = app().await;
     let discovery = start(&DiscoveryConfig::default());
     let f = fixture_discovery(Direction::Inbound, &discovery, move |_| Some(app)).await;
@@ -254,6 +256,8 @@ fn admin_request(peer: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn dsc_14_discovery_is_answered_to_loopback_peers_only() {
+    // Every test that runs a recorder has the process logger: see `capture_logs`.
+    let _logs = capture_logs();
     let discovery = start(&DiscoveryConfig::default());
     let router = discovery.router();
     for peer in ["127.0.0.1:4000", "[::1]:4000", "[::ffff:127.0.0.1]:4000"] {
@@ -392,6 +396,8 @@ fn dsc_19_valid_discovery_values_are_accepted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dsc_16_discovery_never_slows_or_alters_traffic() {
+    // Every test that runs a recorder has the process logger: see `capture_logs`.
+    let _logs = capture_logs();
     mimic_sidecar::listener::raise_fd_limit();
     let reply = response("200 OK", &format!("{{\"data\":\"{}\"}}", "y".repeat(500)));
     // The sidecar's own bind (backlog 1024): the 512 of a plain tokio bind overflows under a
@@ -486,7 +492,7 @@ async fn dsc_16_discovery_never_slows_or_alters_traffic() {
 
 /// The `discovery` lines so far, once the log queue had time to write them.
 async fn log_lines(logs: &common::Logs) -> Vec<serde_json::Value> {
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    logs.settled().await;
     logs.text()
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())

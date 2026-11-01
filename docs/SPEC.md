@@ -586,7 +586,9 @@ Everything below except the capture tap, content decoding and the recorder threa
   normalised `Host` or absolute-form authority of §4.1; the endpoint port is the original
   destination port.
 - **Logs** (`target` = `discovery`): INFO `endpoint discovered` (`direction`, `port`,
-  `method`, `template`) once per new endpoint (not for the parameter a node absorbs into),
+  `method`, `template`) once per new endpoint (not for the parameter a node absorbs into), logged
+  when its exchange is recorded, one exchange at a time in arrival order, so an endpoint that a
+  later exchange absorbs was logged before the absorption,
   INFO `template absorbed` (`direction`, `port`, `method`, `template` = the new template of
   the exchange, `old` = the replaced `<METHOD> <template>` entries, comma-separated, the first
   16, and `old_count`) when a node absorbs, WARN `endpoint limit reached` once, WARN `sample budget full` once when the budget
