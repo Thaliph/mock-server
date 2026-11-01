@@ -31,7 +31,6 @@ pub struct PushConfig {
     #[allow(dead_code)]
     pub pod_window: Duration,
     /// `MIMIC_UI_ADDR` (read by the read API).
-    #[allow(dead_code)]
     pub ui_addr: SocketAddr,
 }
 

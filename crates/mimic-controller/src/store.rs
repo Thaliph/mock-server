@@ -333,6 +333,29 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// The summary of `:meta`; a field that is missing or not a number makes it unreadable.
+fn summary(
+    namespace: &str,
+    deployment: &str,
+    meta: &BTreeMap<String, String>,
+) -> Result<Summary, ReadError> {
+    let field = |name: &str| meta.get(name).and_then(|v| v.parse::<u64>().ok());
+    let read = || {
+        Some(Summary {
+            namespace: namespace.to_string(),
+            deployment: deployment.to_string(),
+            endpoints: field("endpoints_inbound")?.saturating_add(field("endpoints_outbound")?),
+            exchanges: field("exchanges")?,
+            sample_bytes: field("sample_bytes")?,
+            last_push_ms: field("updated")?,
+        })
+    };
+    read().ok_or_else(|| {
+        tracing::error!(namespace, deployment, "stored meta unreadable");
+        ReadError::Unreadable
+    })
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -447,21 +470,119 @@ impl Store {
 
     /// The deployments with data, sorted by namespace then deployment.
     pub async fn list(&self) -> Result<Vec<Summary>, ReadError> {
-        Err(ReadError::Unavailable)
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        let floor =
+            now_ms().saturating_sub(u64::try_from(self.config.ttl.as_millis()).unwrap_or(u64::MAX));
+        let members: Vec<String> = match redis::cmd("ZRANGEBYSCORE")
+            .arg("mimic:v1:workloads")
+            .arg(floor)
+            .arg("+inf")
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(members) => members,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        // Sorted as pairs: the byte order of "<ns>/<dep>" differs ('-' and '.' sort after '/').
+        let names: BTreeSet<(String, String)> = members
+            .iter()
+            .filter_map(|m| m.split_once('/'))
+            .filter(|(ns, dep)| keys(ns, dep).is_ok())
+            .map(|(ns, dep)| (ns.to_string(), dep.to_string()))
+            .collect();
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for (ns, dep) in &names {
+            let k = keys(ns, dep).map_err(|_| ReadError::Name)?;
+            pipe.cmd("HGETALL").arg(k.meta);
+        }
+        let metas: Vec<BTreeMap<String, String>> = match pipe.query_async(&mut conn).await {
+            Ok(metas) => metas,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        let mut found = Vec::with_capacity(names.len());
+        for ((ns, dep), meta) in names.into_iter().zip(metas) {
+            // Expired between the index and the read: not a deployment any more.
+            if meta.is_empty() {
+                continue;
+            }
+            found.push(summary(&ns, &dep, &meta)?);
+        }
+        Ok(found)
     }
 
     /// One deployment and its pods with their last push (Unix milliseconds).
     pub async fn workload(
         &self,
-        _namespace: &str,
-        _deployment: &str,
+        namespace: &str,
+        deployment: &str,
     ) -> Result<(Summary, BTreeMap<String, u64>), ReadError> {
-        Err(ReadError::Unavailable)
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        let (meta, pods): (BTreeMap<String, String>, BTreeMap<String, String>) = match redis::pipe()
+            .cmd("HGETALL")
+            .arg(&k.meta)
+            .cmd("HGETALL")
+            .arg(&k.pods)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(read) => read,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        if meta.is_empty() {
+            return Err(ReadError::NotFound);
+        }
+        let summary = summary(namespace, deployment, &meta)?;
+        let pods = pods
+            .into_iter()
+            .map(|(pod, ms)| {
+                ms.parse().map(|ms| (pod, ms)).map_err(|_| {
+                    tracing::error!(namespace, deployment, "stored pods unreadable");
+                    ReadError::Unreadable
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((summary, pods))
     }
 
-    /// The stored `:report` bytes.
-    pub async fn report(&self, _namespace: &str, _deployment: &str) -> Result<Vec<u8>, ReadError> {
-        Err(ReadError::Unavailable)
+    /// The stored `:report` bytes, once they are known to parse.
+    pub async fn report(&self, namespace: &str, deployment: &str) -> Result<Vec<u8>, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        let stored: Option<Vec<u8>> = match redis::cmd("GET")
+            .arg(&k.report)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        let bytes = stored.ok_or(ReadError::NotFound)?;
+        let readable = std::str::from_utf8(&bytes)
+            .ok()
+            .is_some_and(|json| Report::parse_checked(json, usize::MAX).is_ok());
+        if !readable {
+            tracing::error!(namespace, deployment, "stored report unreadable");
+            return Err(ReadError::Unreadable);
+        }
+        Ok(bytes)
+    }
+
+    async fn read_failed(&self, error: redis::RedisError) -> ReadError {
+        self.failed(error).await;
+        ReadError::Unavailable
     }
 
     async fn connection(&self) -> Result<MultiplexedConnection, StoreError> {

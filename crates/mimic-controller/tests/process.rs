@@ -14,6 +14,8 @@ use mimic_runtime::testing::{Process, http_get, run, wait_status};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mimic-controller");
 const ADMIN: (&str, &str) = ("MIMIC_ADMIN_ADDR", "127.0.0.1:0");
+/// The read API listens on a free loopback port, not on 8080 (several controllers run at once).
+const UI: (&str, &str) = ("MIMIC_UI_ADDR", "127.0.0.1:0");
 /// Required by the webhook (spec §10.2); the listener takes any free port.
 const WEBHOOK: [(&str, &str); 9] = [
     ("MIMIC_SIDECAR_API_ADDR", "127.0.0.1:0"),
@@ -29,7 +31,7 @@ const WEBHOOK: [(&str, &str); 9] = [
 
 /// The admin address, the webhook settings and `extra`.
 fn env<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-    [&[ADMIN][..], &WEBHOOK, extra].concat()
+    [&[ADMIN, UI][..], &WEBHOOK, extra].concat()
 }
 
 struct FakeValkey {

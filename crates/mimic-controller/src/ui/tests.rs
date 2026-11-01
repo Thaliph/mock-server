@@ -124,7 +124,7 @@ async fn get(store: &Arc<Store>, path: &str) -> Answer {
 /// One push per pod; the pod `i` sees `1 + i % 2` endpoints.
 async fn seed(store: &Arc<Store>, ns: &str, dep: &str, pods: &[&str]) {
     for (i, pod) in pods.iter().enumerate() {
-        let push = push_of(pod, 1, &[("/a", 200), ("/b", 404)][..1 + i % 2]);
+        let push = push_of(pod, 1, &[("/a", 200), ("/b", 200)][..1 + i % 2]);
         store.push(ns, dep, push).await.expect("push applied");
     }
 }
