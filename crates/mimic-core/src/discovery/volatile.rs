@@ -114,6 +114,27 @@ impl Volatility {
         }
     }
 
+    /// Marks the fields that `redacted` accepts: they keep no hash but that of the marker.
+    pub(super) fn redact(&mut self, redacted: impl Fn(&str) -> bool) {
+        let marker = xxh3_64(MARKER.as_bytes());
+        for (name, field) in &mut self.fields {
+            if redacted(name) {
+                field.redacted = true;
+                field.sketch.hashes.retain(|h| *h == marker);
+            }
+        }
+    }
+
+    /// The fields that are not the same in `other`, in either.
+    pub(super) fn changed(&self, other: &Self) -> BTreeSet<String> {
+        self.fields
+            .keys()
+            .chain(other.fields.keys())
+            .filter(|name| self.fields.get(*name) != other.fields.get(*name))
+            .cloned()
+            .collect()
+    }
+
     pub fn merge(mut self, other: Self) -> Self {
         for (name, f) in other.fields {
             match self.fields.remove(&name) {

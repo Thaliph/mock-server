@@ -16,6 +16,11 @@
 //! must not panic or hang, the endpoint limit and the sample budget hold, the serialised report
 //! round-trips, and no custom-listed canary survives redaction. Content decoding is not part
 //! of the pure recorder, bodies arrive decoded.
+//!
+//! The controller side (spec CTL-22): the input as text, and the recorded report with bytes
+//! of the input written over its JSON, go through `Report::from_json`, the structural check,
+//! re-redaction and the bounded merge with a fixed valid report. Nothing panics, and every
+//! merge result passes the check.
 
 #![no_main]
 
@@ -23,6 +28,7 @@ use libfuzzer_sys::fuzz_target;
 use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::{Direction, Exchange, Limits, Report, merge};
+use mimic_core::discovery::store::merge_bounded;
 
 const LIMITS: Limits = Limits {
     max_literals: 4,
@@ -30,7 +36,24 @@ const LIMITS: Limits = Limits {
     sample_budget: 256 * 1024,
 };
 /// Appears in every exchange under a listed name: it must never reach the report.
+/// Endpoints per direction accepted from a push.
+const PUSH: usize = 16;
 const CANARY: &str = "FUZZCANARYVALUE";
+
+/// Everything the controller does with a pushed body, against a fixed valid report.
+fn push(stored: &Report, text: &str) {
+    let _ = Report::from_json(text);
+    let Ok(mut pushed) = Report::parse_checked(text, PUSH) else {
+        return;
+    };
+    pushed.re_redact(&Redactor::new(["fuzzsecret"]));
+    pushed.stamp(20_000);
+    let bounded = merge_bounded(stored.clone(), pushed, &LIMITS);
+    assert!(
+        bounded.report.check(LIMITS.max_endpoints).is_ok(),
+        "a merge result fails the structural check"
+    );
+}
 
 fn headers(field: &[u8]) -> Vec<(String, String)> {
     String::from_utf8_lossy(field)
@@ -99,6 +122,15 @@ fuzz_target!(|data: &[u8]| {
     let [a, b] = reports;
     let merged = merge(a, b, &LIMITS);
     let json = merged.to_json().expect("a report serialises");
+    push(&merged, &String::from_utf8_lossy(data));
+    let mut bytes = json.clone().into_bytes();
+    for write in data.chunks_exact(3) {
+        if let Some(at) = usize::from(write[0]) .checked_mul(256).and_then(|n| n.checked_add(usize::from(write[1]))).and_then(|n| n.checked_rem(bytes.len())) {
+            bytes[at] = write[2];
+        }
+    }
+    push(&merged, &String::from_utf8_lossy(&bytes));
+    push(&merged, &json);
     assert!(
         !json.contains(CANARY),
         "a canary under a listed name leaked"

@@ -157,10 +157,6 @@ impl Stats {
         self.last_seen
     }
 
-    pub(super) fn set_last_seen(&mut self, last_seen: Option<u64>) {
-        self.last_seen = last_seen;
-    }
-
     pub(super) fn samples_mut(&mut self) -> &mut Samples {
         &mut self.samples
     }
@@ -204,6 +200,23 @@ impl Stats {
         }
         self.observed = std::mem::take(&mut self.observed).merge(other.observed);
         self.samples = std::mem::take(&mut self.samples).merge(other.samples);
+        self.last_seen = self.last_seen.max(other.last_seen);
+    }
+
+    /// The §6 redaction again on the hosts, the samples and the volatile fields.
+    fn re_redact(&mut self, redactor: &Redactor) {
+        self.hosts = std::mem::take(&mut self.hosts)
+            .into_iter()
+            .map(|h| {
+                if value_rule(&h).is_some() {
+                    MARKER.to_string()
+                } else {
+                    h
+                }
+            })
+            .collect();
+        let changed = self.samples.re_redact(redactor);
+        self.observed.re_redact(redactor, &changed);
     }
 }
 
@@ -743,11 +756,18 @@ impl Report {
     }
 
     /// Sets `last_seen` to `day` on every endpoint and sample (spec §7.3, stamping).
-    pub fn stamp(&mut self, _day: u64) {}
+    pub fn stamp(&mut self, day: u64) {
+        self.for_each_stats_mut(|stats| {
+            stats.last_seen = Some(day);
+            stats.samples.stamp(day);
+        });
+    }
 
     /// The §6 redaction applied again to every sample, host and volatile field (spec §7.3,
     /// re-redaction), so that a report cannot hold what `redactor` redacts.
-    pub fn re_redact(&mut self, _redactor: &Redactor) {}
+    pub fn re_redact(&mut self, redactor: &Redactor) {
+        self.for_each_stats_mut(|stats| stats.re_redact(redactor));
+    }
 
     pub(super) fn clear_pod(&mut self) {
         self.pod = None;

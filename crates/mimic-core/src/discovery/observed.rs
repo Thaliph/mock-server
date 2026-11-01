@@ -153,7 +153,7 @@ fn redacted(value: &str) -> bool {
 }
 
 /// The fields of one exchange that were counted already: `n` counts an exchange once.
-type Seen = BTreeSet<String>;
+pub(super) type Seen = BTreeSet<String>;
 
 fn observe(fields: &mut Volatility, seen: &mut Seen, field: String, value: &str, redacted: bool) {
     if seen.contains(&field) {
@@ -164,7 +164,12 @@ fn observe(fields: &mut Volatility, seen: &mut Seen, field: String, value: &str,
     }
 }
 
-fn observe_pairs(fields: &mut Volatility, seen: &mut Seen, prefix: &str, pairs: &[Pair]) {
+pub(super) fn observe_pairs(
+    fields: &mut Volatility,
+    seen: &mut Seen,
+    prefix: &str,
+    pairs: &[Pair],
+) {
     for p in pairs {
         let field = format!("{prefix}/{}", p.key);
         observe(fields, seen, field, &p.value, redacted(&p.value));
@@ -176,7 +181,7 @@ fn pointer_token(key: &str) -> String {
 }
 
 /// Observes the scalar leaves of a redacted JSON value; array indices are `*`.
-fn observe_leaves(
+pub(super) fn observe_leaves(
     fields: &mut Volatility,
     seen: &mut Seen,
     prefix: &str,
@@ -250,6 +255,46 @@ pub(super) fn parsed_media(media: &str) -> bool {
     media == "application/json"
         || media.ends_with("+json")
         || media == "application/x-www-form-urlencoded"
+}
+
+/// XXH3 of the schema skeleton of a redacted body: a JSON value, or the pairs of a form.
+pub(super) fn body_shape(media: &str, value: &Value, form: Option<Vec<Pair>>) -> u64 {
+    if let Some(pairs) = form {
+        return xxh3_64(Params::from_pairs(&pairs).to_json().to_string().as_bytes());
+    }
+    if parsed_media(media) {
+        return xxh3_64(Schema::infer(value).to_json().to_string().as_bytes());
+    }
+    0
+}
+
+/// True when a volatile field is named after a redacted name: its query key, header, form
+/// field, or one of the keys on the way to a JSON leaf.
+fn named_secret(redactor: &Redactor, field: &str) -> bool {
+    if let Some(name) = field
+        .strip_prefix("query/")
+        .or_else(|| field.strip_prefix("request.header/"))
+        .or_else(|| field.strip_prefix("response.header/"))
+    {
+        return redactor.name_matches(name);
+    }
+    let Some(rest) = field
+        .strip_prefix("request.body/")
+        .or_else(|| field.strip_prefix("response.body/"))
+    else {
+        return false;
+    };
+    // The media type is `type/subtype`; a form field is the whole rest, a JSON key a token.
+    let mut parts = rest.splitn(3, '/');
+    let (Some(_), Some(media), Some(keys)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if media == "x-www-form-urlencoded" {
+        return redactor.name_matches(keys);
+    }
+    keys.split('/')
+        .filter(|token| *token != "*")
+        .any(|token| redactor.name_matches(&token.replace("~1", "/").replace("~0", "~")))
 }
 
 /// Parses a body (already content-decoded) by its `content-type`; nothing without one.
@@ -377,6 +422,14 @@ impl Observed {
         self.request.check()?;
         self.response.check()?;
         self.fields.check()
+    }
+
+    /// The §6 redaction again on the volatile fields: those named after a name of `redactor`,
+    /// and `changed` (reached by a sample that re-redaction changed), become redacted and
+    /// lose the hashes of their values.
+    pub(super) fn re_redact(&mut self, redactor: &Redactor, changed: &BTreeSet<String>) {
+        self.fields
+            .redact(|field| changed.contains(field) || named_secret(redactor, field));
     }
 
     pub fn volatility(&self) -> &Volatility {

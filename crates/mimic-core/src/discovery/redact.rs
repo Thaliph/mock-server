@@ -283,6 +283,26 @@ fn flush(out: &mut Vec<String>, current: &mut String) {
     }
 }
 
+/// The end of the token at the start of `s`: the first delimiter that is not part of a
+/// marker, so that redacting a redacted URL again leaves it as it is.
+fn token_end(s: &str, delims: &[char]) -> usize {
+    let mut i = 0;
+    while i < s.len() {
+        if s[i..].starts_with(MARKER) {
+            i += MARKER.len();
+            continue;
+        }
+        let Some(c) = s[i..].chars().next() else {
+            break;
+        };
+        if delims.contains(&c) {
+            return i;
+        }
+        i += c.len_utf8();
+    }
+    s.len()
+}
+
 /// Redaction by name (built-in plus `MIMIC_DISCOVERY_REDACT_NAMES`) and by value.
 #[derive(Debug, Clone)]
 pub struct Redactor {
@@ -418,7 +438,7 @@ impl Redactor {
         let mut out = String::with_capacity(value.len());
         let mut rest = value;
         while !rest.is_empty() {
-            let end = rest.find(DELIMS).unwrap_or(rest.len());
+            let end = token_end(rest, DELIMS);
             let (token, tail) = rest.split_at(end);
             out.push_str(&self.url_token(token, rules));
             let delim_end = tail.find(|c| !DELIMS.contains(&c)).unwrap_or(tail.len());
