@@ -224,9 +224,10 @@ impl Shipper {
             match timeout_at(deadline, self.attempt()).await {
                 Err(_) => break,
                 Ok(Attempt::Settled) => {}
-                Ok(Attempt::Retry(wait)) => {
-                    // The kubelet may stop the process well before the deadline: no backoff.
-                    let wait = wait.min(FLUSH_RETRY);
+                Ok(Attempt::Retry(_)) => {
+                    // The kubelet may stop the process well before the deadline: no backoff and no
+                    // `Retry-After`, a fixed pause (never shorter, so a `Retry-After: 0` cannot spin).
+                    let wait = FLUSH_RETRY;
                     if Instant::now() + wait >= deadline {
                         break;
                     }

@@ -739,3 +739,22 @@ async fn ctl_17_flush_retries_fast_and_ignores_retry_after() {
     assert_eq!(rig.api.acknowledged(), 2, "{:?}", rig.api.posts());
     assert_eq!(rig.api.count(), 3, "{:?}", rig.api.posts());
 }
+
+#[tokio::test]
+async fn ctl_17_flush_pauses_200_ms_even_after_a_retry_after_of_0() {
+    // A `Retry-After: 0` must not turn the flush into back-to-back posts: the pause is fixed.
+    let _logs = capture_logs();
+    let rig = Rig::new(
+        vec![Reply::RetryAfter(503, 0); 50],
+        Duration::from_secs(3600),
+        DiscoveryConfig::default(),
+    )
+    .await;
+    rig.call("users", 1).await;
+    rig.recorded(1).await;
+    let mut shipper = rig.shipper();
+    shipper.flush(Duration::from_secs(1)).await;
+    // One post, then one every 200 ms within the second: at most 6, never the 50 replies.
+    assert!(rig.api.count() <= 6, "{:?}", rig.api.posts());
+    assert!(rig.api.count() >= 3, "{:?}", rig.api.posts());
+}

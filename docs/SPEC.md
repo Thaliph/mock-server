@@ -815,8 +815,9 @@ Everything below except the capture tap, content decoding and the recorder threa
   remains of `MIMIC_SHUTDOWN_GRACE`; what is not acknowledged then is lost, with one WARN
   `report not shipped` (`exchanges`). The kubelet stops a sidecar after the app containers
   and leaves it only what is left of the pod's grace period, at least 2 s (an app that
-  ignores `SIGTERM` uses the whole period), so the flush does not back off: a failed post is
-  repeated after 200 ms, whatever the backoff or the `Retry-After`, until the deadline. Without `MIMIC_CONTROLLER_URL` nothing is shipped (one
+  ignores `SIGTERM` uses the whole period, and the README asks apps to exit on it), so the
+  flush does not back off: a failed post is repeated after a fixed 200 ms, whatever the backoff
+  or the `Retry-After`, until the deadline. Without `MIMIC_CONTROLLER_URL` nothing is shipped (one
   INFO `report shipping disabled` at start) and the report accumulates as in F4. `GET
   /discovery` serves the current report. Logs (`target` = `discovery`): DEBUG `report pushed`
   (`sequence`, `exchanges`, `bytes`, `applied`), WARN `report push failed` (`status` or
