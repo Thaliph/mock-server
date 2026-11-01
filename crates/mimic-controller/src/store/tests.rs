@@ -211,12 +211,21 @@ async fn ctl_09_applied_once_across_replicas() {
                 let exchanges: Vec<(&str, u16)> = (0..k)
                     .map(|_| {
                         let r = rng.next();
-                        (PATHS[(r % 6) as usize], if r % 7 == 0 { 404 } else { 200 })
+                        (
+                            PATHS[(r % 6) as usize],
+                            if r.is_multiple_of(7) { 404 } else { 200 },
+                        )
                     })
                     .collect();
                 let make = || push_of(&pod, Some(seq), &exchanges);
                 distinct.lock().expect("lock")[dep_index].push(make().report);
-                let pick = |r: u64| if r % 2 == 0 { a.clone() } else { b.clone() };
+                let pick = |r: u64| {
+                    if r.is_multiple_of(2) {
+                        a.clone()
+                    } else {
+                        b.clone()
+                    }
+                };
                 let roll = rng.next() % 100;
                 if roll < 10 {
                     let (x, y) = tokio::join!(a.push(&ns, &dep, make()), b.push(&ns, &dep, make()));
