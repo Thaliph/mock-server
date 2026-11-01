@@ -863,11 +863,17 @@ Everything below except the capture tap, content decoding and the recorder threa
     saturate.
     Any other violation is `400` with its `reason`.
   - *Re-redaction* (pure, idempotent): the §6 redaction applied again to every sample, host,
-    concrete path and volatile field with the built-in rules and the union of
+    concrete path, literal path segment (tree keys and gRPC paths; keys that become equal
+    merge), schema and parameter key and volatile field with the built-in rules and the union of
     `spec.discovery.redact` of the `MimicWorkload`s naming the deployment (from the
     controller's cache, so a name added after the pod started applies); a field that becomes
     redacted loses its sketch and is marked `redacted`, a sample that changes is keyed by the
-    hash of its new content. A sidecar of an older version, or a faulty one, cannot put a
+    hash of its new content. Names are redacted as the sidecar does: a key whose name is
+    redacted has the schema of the marker (a string without format), and the volatile fields
+    below a redacted name become that name's field; a name is never redacted by value. A
+    volatile sketch holds hashes only, so a detected form (JWT, card, token prefix) cannot be
+    found in it: its sketch is dropped when a retained sample shows a detected form at that
+    field, and kept otherwise (§11.1). A sidecar of an older version, or a faulty one, cannot put a
     value into Valkey that the controller's rules redact.
   - *Stamping*: every endpoint and sample of the push gets `last_seen`, the current UTC day
     (days since 1970-01-01); a merge keeps the larger value. Sidecar reports carry no
@@ -888,6 +894,15 @@ Everything below except the capture tap, content decoding and the recorder threa
     (within the `:seq` field expiry, §11.1). A stored value that does not parse or fails the
     structural check is never overwritten: ERROR `stored report unreadable` (`namespace`,
     `deployment`), push `503`, read `500`.
+  - *Failures*: the connection to Valkey is shared by all writers. A Valkey reply error (`OOM`
+    under `noeviction`, a script error, `WRONGTYPE`) answers the pushes of the write `503` and
+    keeps the connection; only a connection error (I/O, timeout, closed, refused) drops it, so
+    that the next attempt makes a new one. The WARN for a failed write (`valkey command failed`,
+    `valkey connection failed`) is logged once per failure streak: for the first failed write
+    after a write that succeeded, not for each push that follows. A writer that panics logs one
+    ERROR `store writer failed` (`namespace`, `deployment`), drops its queue entry and answers
+    `503` to the pushes of its batch and to those waiting; the next push for the deployment
+    starts a new writer, so no push waits for a writer that is gone.
 - **Bounded merge** (pure, `mimic-core`): the §6 merge under the store limits
   (`MIMIC_STORE_MAX_LITERALS`, `MIMIC_STORE_MAX_ENDPOINTS` per direction,
   `MIMIC_STORE_SAMPLE_BUDGET` per deployment); counters saturate at 2^64 − 1. The merge
@@ -957,7 +972,9 @@ Everything below except the capture tap, content decoding and the recorder threa
 
 - Plain HTTP on `MIMIC_UI_ADDR` (default `127.0.0.1:8080`, loopback: reached only through
   `kubectl port-forward` to a controller pod); a peer that is not a loopback address gets
-  `403` whatever the bind address. `GET` only (`405` otherwise), JSON, sorted keys:
+  `403` whatever the bind address, and so does a request whose `Host` is missing or is not
+  `localhost`, `127.0.0.1` or `[::1]` (with or without a port), so that a web page cannot
+  reach an open port-forward through DNS rebinding. `GET` only (`405` otherwise), JSON, sorted keys:
   - `GET /v1/workloads` → `{"workloads": [{"namespace", "deployment", "endpoints",
     "exchanges", "sample_bytes", "last_push"}]}`, sorted by namespace then deployment;
   - `GET /v1/workloads/<ns>/<dep>` → the same object plus `"pods": {"<pod>": "<last push,
@@ -966,6 +983,9 @@ Everything below except the capture tap, content decoding and the recorder threa
 
   `404` for a deployment without data, `400` for a name that is not DNS-1123, `503` while
   Valkey is unavailable. No write and no delete: data leaves by expiry (§7.3).
+  A stored value that does not parse is `500` with one ERROR line per read, with the fields
+  `namespace` and `deployment`: `stored report unreadable` for `:report` (§7.3), `stored meta
+  unreadable` for `:meta` and `stored pods unreadable` for `:pods`.
 - Consumers: F6 adds the OpenAPI 3.1 document and Swagger UI of a deployment on this
   listener, built from the same report; F9 adds an authenticated read of a sidecar's own
   deployment on the sidecar API (§7.2) for egress recordings and the mode (F10); F11 reads
@@ -1022,7 +1042,7 @@ Everything below except the capture tap, content decoding and the recorder threa
 
   | Metric | Type | Labels |
   |---|---|---|
-  | `mimic_store_writes_total` | counter, store write attempts (§7.3) | `result` (`ok`, `conflict`, `error`) |
+  | `mimic_store_writes_total` | counter, store write attempts (§7.3); `refused` is an attempt the script refused for `MIMIC_STORE_MAX_DEPLOYMENTS` (`507`), which writes nothing | `result` (`ok`, `conflict`, `error`, `refused`) |
   | `mimic_store_write_duration_seconds` | histogram, one write from read to script result; buckets 0.005 … 10 as `mimic_http_request_duration_seconds` | — |
   | `mimic_store_report_bytes` | histogram, size of each report written; buckets 4Ki, 16Ki, 64Ki, 256Ki, 1Mi, 4Mi, 16Mi, 64Mi | — |
   | `mimic_store_pushes_total` | counter, pushes by outcome | `result` (`applied`, `duplicate`) |
@@ -1193,6 +1213,11 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   and restart the app if the outage outlasts `failureThreshold` × `periodSeconds`. The
   `/app-health/` endpoints sit on the admin port, so the network can reach them. They only run
   the pod's own probes.
+- A volatile sketch holds XXH3 hashes of values. A sidecar redacts detected forms (JWT, card,
+  token prefix) before it sketches, so only a faulty or hostile one stores such a hash, and
+  the controller cannot tell it from a hash of another value: it drops a sketch only when a
+  retained sample shows a detected form at that field. A low-entropy value left in a sketch
+  could be recovered by brute force.
 - Loopback traffic (an app calling itself) and non-TCP traffic other than UDP 443 are not
   captured.
 - Namespaces whose Pod Security level is `baseline` or `restricted` reject injected pods
@@ -1454,7 +1479,7 @@ Sidecar integration tests use the fake sidecar API of F3. A *canary* is as in §
 |---|---|
 | CTL-01 | **U.** The structural check of §7.3 accepts every report the recorder produces within the §6 bounds, merged or not (`proptest`, ≥ 10 000 cases), and rejects, each with its own fixed `reason`: a version other than 1; 21 samples; 17 hosts or a host over 1024 bytes; status 99 or 600; a histogram bucket out of range; a schema of 513 nodes, of 17 levels or with a cut level of 17; a 129-byte name; 65 query keys or headers; 129 volatile fields or a 33-hash sketch; a 2049-byte or 33-segment path or template; 17 media types on a side; a 256 KiB + 1 sample body or a sample body for an opaque media type; an unknown field; more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints in a direction is `push_limit`, apart from the `400` reasons. `Report::from_json` then the check never panic on arbitrary input (`proptest`, and CTL-22). |
 | CTL-02 | **U.** The bounded merge equals the §6 `merge` while the result is within the store limits, and below them does not depend on the order or grouping of pushes (`proptest`); two pushes each below the literal limit at a node absorb it when their union exceeds it; counters and buckets at 2^64 − 1 stay there; the result's `pod` is null. Anti-crowding, with `MIMIC_STORE_MAX_ENDPOINTS` = 4: a store of 4 endpoints with 100 exchanges each, merged with a push of 50 endpoints `/!0` … `/!49` of 1 exchange each, keeps the 4 (50 `endpoint_limit` refusals, no eviction); a push of an endpoint with 101 exchanges evicts the stored endpoint with the fewest exchanges, ties broken by key (`evicted` = 1); a new endpoint tying the lowest stored count does not displace it. Samples, with a full budget: a new `5xx` sample of an endpoint holding only `2xx` samples evicts samples of the (endpoint, class) with the most samples until it fits, never the only sample of a class; a new `2xx` sample of that endpoint is refused (`budget`); when room cannot be made without emptying a class, nothing is evicted. The same input always gives byte-identical output; `refused` and `evicted` counts are returned per kind and reason. |
-| CTL-03 | **U.** Re-redaction is idempotent and leaves unchanged a report recorded with the same redactor. For reports recorded with a redactor that lacks a name the controller's redactor has (`proptest`, ≥ 10 000 cases), with a canary under that name at a random place (query, header, form or JSON body at any depth, request or response, URL-valued header), the re-redacted report contains neither the canary nor its XXH3 hash in decimal or hex, its sample keys are the hashes of the re-redacted content, and the field is marked `redacted` without sketch. A canary in a detected form (JWT, card, token prefix) in a report that bypassed the sidecar's redaction is removed the same way. |
+| CTL-03 | **U.** Re-redaction is idempotent and leaves unchanged a report recorded with the same redactor. For reports recorded with a redactor that lacks a name the controller's redactor has (`proptest`, ≥ 10 000 cases), with a canary under that name at a random place (query, header, form or JSON body at any depth, request or response, URL-valued header), the re-redacted report contains neither the canary nor its XXH3 hash in decimal or hex, its sample keys are the hashes of the re-redacted content, and the field is marked `redacted` without sketch. A canary in a detected form (JWT, card, token prefix) in a report that bypassed the sidecar's redaction is removed the same way from its samples, hosts and path keys (tree literals, gRPC paths: equal keys merge); a volatile field's sketch is dropped when a retained sample shows a detected form at that field and kept otherwise. A schema or parameter key under a redacted name has the schema of the marker, and the volatile fields below it become its field. |
 | CTL-04 | **U.** Retention: stamping a push with day `D` sets `last_seen = D` on each endpoint and sample; merge keeps the larger value (commutative, associative); dropping with day `T` and a TTL of `n` days removes exactly the endpoints and samples with `last_seen < T − n` (counted per kind); a sidecar report without `last_seen` parses, and a sidecar never serialises it. |
 | CTL-05 | **U.** The key names of §7.3 for namespace `shop` and deployment `pay.v2` are byte-exact; a namespace or deployment name that is not DNS-1123 is refused before any key is built. The sequence decision applies a push whose sequence is above the stored one of its pod and session, or that has none, and reports any other as a duplicate; a session that is not 32 lower-case hex characters and a sequence of 0 or above 2^53 are `invalid`. |
 | CTL-06 | **U.** The status of §7.4 is a pure function of `:meta`, the pods' push times, the window and the current time (passed in): byte-identical for the same input; a pod counts exactly when its last push is at or after now − window; without data the counts are zero and `lastPushTime` is absent; `lastPushTime` is RFC 3339 UTC in seconds; directions without endpoints are omitted. |
@@ -1464,7 +1489,7 @@ Sidecar integration tests use the fake sidecar API of F3. A *canary* is as in §
 | CTL-10 | **I.** Keys and expiry: after a push exactly the keys of §7.3 exist for its deployment, with their types and fields; with `MIMIC_STORE_TTL=10s` every key and both index members have an expiry of at most 10 s, refreshed by each applied push (a duplicate refreshes only its `:pods` field); 10 s (+ 2 s) after the last push the deployment's keys and index members are gone, and the `:pods` and `:seq` fields expire after min(24 h, TTL). |
 | CTL-11 | **I.** Nothing sensitive reaches Valkey: pushes carrying the DSC-15 canaries unredacted (as a faulty sidecar would send them) and a canary under a name that only the `MimicWorkload`'s `spec.discovery.redact` lists are applied, and no value of any `mimic:v1:*` key (dumped with `SCAN` and `GET`/`HGETALL`/`ZRANGE`) contains a canary, its XXH3 hash or the bearer token; nor does stdout or `/metrics`. |
 | CTL-12 | **I.** Each push writes one `sidecar_api` line with the §7.2 fields (`endpoint` `/v1/workloads/{deployment}/report`, `session`, `sequence`, `bytes`, `result`, `reason` for `invalid`), at DEBUG for `rate_limited`; after a known sequence of pushes `mimic_sidecar_api_requests_total{endpoint,result}`, `mimic_store_pushes_total`, `mimic_store_writes_total`, `mimic_store_refused_total`, `mimic_store_evicted_total`, `mimic_store_report_bytes` and `mimic_store_write_duration_seconds` have the expected values; one WARN `store limit reached` per deployment and reason and one WARN `store evicted` per deployment and kind; no line and no series contains a path, template, header, sample, token or report content. |
-| CTL-13 | **I.** Read API: `GET /v1/workloads`, `/v1/workloads/<ns>/<dep>` and `/v1/workloads/<ns>/<dep>/report` on `MIMIC_UI_ADDR` answer as §7.5 (list sorted, pods map, report bytes equal to `:report`); `404` for a deployment without data, `400` for an invalid name, `405` for `POST` and `DELETE`, `503` while Valkey is stopped, `500` with one ERROR `stored report unreadable` for a corrupted `:report` (also refused by a push, `503`, without overwriting it). With `MIMIC_UI_ADDR=0.0.0.0:<port>` a request from the host's non-loopback address gets `403`. |
+| CTL-13 | **I.** Read API: `GET /v1/workloads`, `/v1/workloads/<ns>/<dep>` and `/v1/workloads/<ns>/<dep>/report` on `MIMIC_UI_ADDR` answer as §7.5 (list sorted, pods map, report bytes equal to `:report`); `404` for a deployment without data, `400` for an invalid name, `405` for `POST` and `DELETE`, `503` while Valkey is stopped, `500` with one ERROR `stored report unreadable` for a corrupted `:report` (also refused by a push, `503`, without overwriting it). With `MIMIC_UI_ADDR=0.0.0.0:<port>` a request from the host's non-loopback address gets `403`; a loopback request with `Host: evil.example`, `Host: localhost.evil.example` or no `Host` gets `403`, and `localhost:8080`, `127.0.0.1` and `[::1]:8080` are served. |
 | CTL-14 | **I.** An invalid value of each variable added in §10.2 (out of range, bad suffix, `MIMIC_SIDECAR_API_BODY_BUDGET` below `MIMIC_SIDECAR_API_MAX_REPORT`, `MIMIC_STORE_MAX_PUSH_ENDPOINTS` above `MIMIC_STORE_MAX_ENDPOINTS`, an unparsable `MIMIC_UI_ADDR`) and of `MIMIC_DISCOVERY_PUSH_INTERVAL` exits 2 before listening (FND-01); `1m`, `2h` and `30d` parse as durations. |
 | CTL-15 | **I.** Shipping: with `MIMIC_DISCOVERY_PUSH_INTERVAL=1s` and exchanges to the test app, the sidecar posts to `/v1/workloads/<MIMIC_WORKLOAD>/report` bodies with one 32-hex session and sequences 1, 2, …; the exchanges of all posts sum to the exchanges recorded; an interval without exchanges posts nothing; the token file is read for each post; after a `200`, `/discovery` holds only exchanges recorded since; a restarted sidecar posts a new session from sequence 1. Without `MIMIC_CONTROLLER_URL` nothing is posted and one INFO `report shipping disabled` is written. |
 | CTL-16 | **I.** Retries: while the fake API answers `503`, resets the connection or stays silent past 30 s, the sidecar posts the same bytes with the same sequence again with the 1, 2, 4 … s backoff, and the exchanges recorded meanwhile go into the next sequence, posted only after the pending one is acknowledged; `429` with `Retry-After: 3` delays the retry by at least 3 s; `413` is followed by the same sequence without samples; `400` drops the pending report with one WARN `report rejected` and the next sequence follows. Samples of the pending and current reports never exceed `MIMIC_DISCOVERY_SAMPLE_BUDGET`. `mimic_discovery_pushes_total{result}` and `mimic_discovery_last_push_timestamp_seconds` follow; one WARN `report push failed` per failure streak and one INFO `report push recovered`; no line holds the token. |

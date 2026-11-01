@@ -108,6 +108,10 @@ fn ctl_14_bad_duration_suffixes_and_numbers_are_refused() {
         "1D",
         "1mm",
         "18446744073709551615d",
+        "5é",
+        "é",
+        "1ms\u{e9}",
+        "10秒",
     ] {
         let result = env(&[("MIMIC_SHUTDOWN_GRACE", value)])
             .duration_or("MIMIC_SHUTDOWN_GRACE", Duration::from_secs(1));

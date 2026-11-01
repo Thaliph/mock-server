@@ -8,6 +8,7 @@
 //! whichever replica receives it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -326,6 +327,11 @@ pub struct Store {
     queues: Mutex<Queues>,
     /// What was already logged: (namespace, deployment, reason or kind).
     logged: Mutex<BTreeSet<(String, String, String)>>,
+    /// A failed write was logged and none succeeded since: one WARN per failure streak.
+    failing: AtomicBool,
+    /// Test hook: the next write panics.
+    #[cfg(test)]
+    panic_next_write: AtomicBool,
 }
 
 fn now_ms() -> u64 {
@@ -372,6 +378,9 @@ impl Store {
             writers: Semaphore::new(MAX_WRITERS),
             queues: Mutex::new(BTreeMap::new()),
             logged: Mutex::new(BTreeSet::new()),
+            failing: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_next_write: AtomicBool::new(false),
         })
     }
 
@@ -401,7 +410,18 @@ impl Store {
         };
         if start_writer {
             let store = self.clone();
-            tokio::spawn(async move { store.drain(key, keys).await });
+            let writer = {
+                let (store, key) = (store.clone(), key.clone());
+                tokio::spawn(async move { store.drain(key, keys).await })
+            };
+            // A writer that panics leaves no queue entry: the pushes it held were dropped
+            // (answered 503) and so are those still waiting in the entry.
+            tokio::spawn(async move {
+                if writer.await.is_err() {
+                    tracing::error!(namespace = key.0, deployment = key.1, "store writer failed");
+                    lock(&store.queues).remove(&key);
+                }
+            });
         }
         answer.await.unwrap_or(Err(StoreError::Unavailable))
     }
@@ -442,6 +462,10 @@ impl Store {
         keys: &Keys,
         batch: &[Pending],
     ) -> Result<Vec<Outcome>, StoreError> {
+        #[cfg(test)]
+        if self.panic_next_write.swap(false, Ordering::SeqCst) {
+            panic!("injected writer panic");
+        }
         for attempt in 0..ATTEMPTS {
             let started = Instant::now();
             let result = self.attempt(namespace, deployment, keys, batch).await;
@@ -449,8 +473,12 @@ impl Store {
                 .duration
                 .observe(started.elapsed().as_secs_f64());
             match result {
-                Ok(Attempt::Done(outcomes)) => return Ok(outcomes),
+                Ok(Attempt::Done(outcomes)) => {
+                    self.failing.store(false, Ordering::Relaxed);
+                    return Ok(outcomes);
+                }
                 Ok(Attempt::Conflict) => {
+                    self.failing.store(false, Ordering::Relaxed);
                     self.metrics.write("conflict");
                     if attempt + 1 < ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(rand::random_range(BACKOFF_MS)))
@@ -458,8 +486,9 @@ impl Store {
                     }
                 }
                 Err(e) => {
-                    if e == StoreError::Unavailable {
-                        self.metrics.write("error");
+                    match e {
+                        StoreError::Unavailable => self.metrics.write("error"),
+                        _ => self.failing.store(false, Ordering::Relaxed),
                     }
                     return Err(e);
                 }
@@ -647,17 +676,35 @@ impl Store {
             .get_multiplexed_async_connection_with_config(&config)
             .await
             .map_err(|error| {
-                tracing::warn!(%error, "valkey connection failed");
+                if self.first_failure() {
+                    tracing::warn!(%error, "valkey connection failed");
+                }
                 StoreError::Unavailable
             })?;
         *guard = Some(conn.clone());
         Ok(conn)
     }
 
-    /// A connection that failed is dropped so that the next attempt makes a new one.
+    /// Whether this failure starts a streak (the one to log).
+    fn first_failure(&self) -> bool {
+        !self.failing.swap(true, Ordering::Relaxed)
+    }
+
+    /// A connection that failed is dropped so that the next attempt makes a new one. A reply
+    /// error (`OOM`, a script error) leaves it healthy: other writers share it.
     async fn failed(&self, error: redis::RedisError) -> StoreError {
-        tracing::warn!(%error, "valkey command failed");
-        *self.connection.lock().await = None;
+        if self.first_failure() {
+            tracing::warn!(%error, "valkey command failed");
+        }
+        let reply = matches!(
+            error.kind(),
+            redis::ErrorKind::Server(_)
+                | redis::ErrorKind::Extension
+                | redis::ErrorKind::UnexpectedReturnType
+        );
+        if !reply {
+            *self.connection.lock().await = None;
+        }
         StoreError::Unavailable
     }
 
@@ -836,7 +883,7 @@ impl Store {
             1 => {}
             0 => return Ok(Attempt::Conflict),
             _ => {
-                self.metrics.write("ok");
+                self.metrics.write("refused");
                 if self.once(namespace, deployment, "deployments") {
                     tracing::warn!(
                         namespace,
