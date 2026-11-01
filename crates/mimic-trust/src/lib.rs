@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -19,6 +20,8 @@ const STORES: [&str; 5] = [
 ];
 /// Variables of the image that name extra trust files merged into `image-ca.pem`.
 const IMAGE_VARS: [&str; 3] = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"];
+/// Largest trust file read: system bundles are a few hundred KiB, anything above is not one.
+const MAX_STORE: u64 = 8 * 1024 * 1024;
 /// Public on purpose: the store holds no secret (spec §11.1).
 const TRUSTSTORE_PASSWORD: &str = "mimic";
 
@@ -126,9 +129,14 @@ pub fn build(root: &Path, env: &Env) -> Result<Report, Error> {
 }
 
 /// Certificates of the file at `path` (absolute, looked up under `root`); `None` when it
-/// cannot be read.
+/// cannot be read or is larger than [`MAX_STORE`].
 fn read_pem(root: &Path, path: &str) -> Option<Parsed> {
-    let bytes = fs::read(root.join(path.trim_start_matches('/'))).ok()?;
+    let file = fs::File::open(root.join(path.trim_start_matches('/'))).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STORE + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_STORE {
+        return None;
+    }
     Some(parse_pem(&String::from_utf8_lossy(&bytes), is_certificate))
 }
 

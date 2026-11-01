@@ -169,15 +169,14 @@ async fn fake_api(behaviour: Arc<Mutex<Behaviour>>) -> FakeApi {
                             path,
                             body,
                         });
-                        let body: BoxBody<Bytes, std::convert::Infallible> =
-                            if matches!(current_flood, true) {
-                                StreamBody::new(futures::stream::repeat_with(|| {
-                                    Ok(Frame::data(Bytes::from(vec![b'x'; 16 * 1024])))
-                                }))
-                                .boxed()
-                            } else {
-                                Full::new(Bytes::from(out)).boxed()
-                            };
+                        let body: BoxBody<Bytes, std::convert::Infallible> = if current_flood {
+                            StreamBody::new(futures::stream::repeat_with(|| {
+                                Ok(Frame::data(Bytes::from(vec![b'x'; 16 * 1024])))
+                            }))
+                            .boxed()
+                        } else {
+                            Full::new(Bytes::from(out)).boxed()
+                        };
                         Ok::<_, std::convert::Infallible>(
                             Response::builder().status(status).body(body).unwrap(),
                         )

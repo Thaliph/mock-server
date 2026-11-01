@@ -109,6 +109,7 @@ async fn run(
             tunnel_metrics,
             Arc::new(listener::kernel_original_dst),
         )
+        .with_max_connections(tunnel.max_connections)
         .with_proxy_metrics(proxy_metrics)
         .with_discovery(discovery.tap())
         .with_tls(interception),
@@ -158,8 +159,10 @@ fn start_ca(tls: &TlsConfig, metrics: CaMetrics) -> std::io::Result<Option<Arc<C
         return Ok(None);
     };
     let stores: Vec<_> = tls::SYSTEM_STORES.iter().map(Into::into).collect();
-    if let Err(e) = tls::publish_trust(&tls.trust_dir, tls::TRUST_BINARY.as_ref(), &stores) {
-        tracing::warn!(error = %e, dir = %tls.trust_dir.display(), "trust volume not published");
+    if let Err(e) = tls::publish_trust(&tls.trust_dir, &tls.trust_binary, &stores) {
+        // The app images' bundles cannot be built: the apps would not trust the mimic root.
+        tracing::error!(error = %e, dir = %tls.trust_dir.display(), "trust volume not published");
+        return Ok(None);
     }
     let state = Arc::new(CaState::new(metrics).map_err(std::io::Error::other)?);
     let client = CaClient::new(config, state.clone()).map_err(std::io::Error::other)?;

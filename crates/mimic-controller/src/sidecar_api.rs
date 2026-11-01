@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use std::time::SystemTime;
 
@@ -149,7 +149,17 @@ impl ReviewLimiter {
 
     /// Takes one call from the budget; false when it is spent.
     pub fn allow(&self) -> bool {
-        true
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = tokio::time::Instant::now();
+        let elapsed = now.saturating_duration_since(state.1).as_secs_f64();
+        state.0 = (state.0 + elapsed * self.per_second).min(self.burst);
+        state.1 = now;
+        if state.0 >= 1.0 {
+            state.0 -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -213,6 +223,16 @@ struct Caller {
     namespace: String,
     pod: String,
     deployment: String,
+    /// Why the controller could not answer (never the token or the key).
+    error: Option<String>,
+}
+
+/// Why the signing task gave no certificate.
+enum Signing {
+    /// The posted key cannot be certified.
+    Key,
+    /// The root could not be derived.
+    Derive(String),
 }
 
 #[derive(Deserialize)]
@@ -239,6 +259,7 @@ impl SidecarApi {
             namespace = caller.namespace,
             pod = caller.pod,
             deployment = caller.deployment,
+            error = caller.error,
             result,
             "sidecar api request"
         );
@@ -255,8 +276,12 @@ impl SidecarApi {
         caller: &mut Caller,
     ) -> Result<String, Refusal> {
         let token = bearer(headers).ok_or(UNAUTHENTICATED)?;
+        if !self.limiter.allow() {
+            caller.error = Some("token review budget spent".to_string());
+            return Err(UNAVAILABLE);
+        }
         let review = self.reviewer.review(token).await.map_err(|e| {
-            tracing::warn!(error = %e, "token review failed");
+            caller.error = Some(e);
             UNAVAILABLE
         })?;
         if !review.authenticated {
@@ -288,12 +313,27 @@ impl SidecarApi {
             return Err(FORBIDDEN);
         }
         let seed = self.seed.get().ok_or(UNAVAILABLE)?;
-        let root = derive_root(&seed, namespace, &request.deployment).map_err(|e| {
-            tracing::error!(error = %e, "root derivation failed");
-            UNAVAILABLE
-        })?;
-        root.sign_intermediate(&public_key, SystemTime::now())
-            .map_err(|_| INVALID)
+        let (namespace, deployment) = (namespace.to_string(), request.deployment);
+        // HKDF and ECDSA are CPU work: not on the threads that serve the fail-closed webhook.
+        let signed = tokio::task::spawn_blocking(move || {
+            let root = derive_root(&seed, &namespace, &deployment).map_err(Signing::Derive)?;
+            root.sign_intermediate(&public_key, SystemTime::now())
+                .map_err(|_| Signing::Key)
+        })
+        .await;
+        match signed {
+            Ok(Ok(certificate)) => Ok(certificate),
+            // The posted key is not one that can be certified.
+            Ok(Err(Signing::Key)) => Err(INVALID),
+            Ok(Err(Signing::Derive(e))) => {
+                caller.error = Some(e);
+                Err(UNAVAILABLE)
+            }
+            Err(e) => {
+                caller.error = Some(format!("signing task: {e}"));
+                Err(UNAVAILABLE)
+            }
+        }
     }
 }
 

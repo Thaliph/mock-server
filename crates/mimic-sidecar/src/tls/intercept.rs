@@ -190,15 +190,29 @@ impl Interception {
         })
     }
 
-    async fn roots(&self) -> Arc<RootCertStore> {
+    /// The upstream roots, loaded once. A load that fails is not remembered: the next
+    /// interception tries again.
+    async fn roots(&self) -> io::Result<Arc<RootCertStore>> {
         self.roots
-            .get_or_init(|| async {
+            .get_or_try_init(|| async {
                 let (stores, dir) = (self.system_stores.clone(), self.trust_dir.clone());
-                let loaded = tokio::task::spawn_blocking(move || load_roots(&stores, &dir)).await;
-                Arc::new(loaded.unwrap_or_else(|_| RootCertStore::empty()))
+                let (roots, skipped) =
+                    tokio::task::spawn_blocking(move || load_roots(&stores, &dir))
+                        .await
+                        .map_err(|e| io::Error::other(format!("loading the roots: {e}")))?;
+                for skip in skipped {
+                    tracing::warn!(
+                        target: "tls",
+                        path = %skip.path.display(),
+                        skipped = skip.blocks,
+                        error = skip.error,
+                        "tls roots skipped"
+                    );
+                }
+                Ok(Arc::new(roots))
             })
             .await
-            .clone()
+            .cloned()
     }
 
     /// The sidecar's own handshake with the destination on `upstream`, offering the client's
@@ -208,11 +222,12 @@ impl Interception {
         upstream: TcpStream,
         plan: &Plan,
     ) -> Result<client::TlsStream<Socket>, ConnectError> {
+        let roots = self.roots().await.map_err(ConnectError::Io)?;
         let requested = Arc::new(CertRequested::default());
         let mut config = ClientConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
             .map_err(|e| ConnectError::Io(io::Error::other(e)))?
-            .with_root_certificates(self.roots().await)
+            .with_root_certificates(roots)
             .with_client_cert_resolver(requested.clone());
         config.alpn_protocols = plan.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
         let connector = TlsConnector::from(Arc::new(config));
@@ -264,19 +279,45 @@ impl Interception {
         hello: Vec<u8>,
         plan: &Plan,
         alpn: Option<Vec<u8>>,
-    ) -> io::Result<tokio_rustls::server::TlsStream<Socket>> {
+    ) -> Result<tokio_rustls::server::TlsStream<Socket>, AcceptError> {
         let mut config = ServerConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
-            .map_err(io::Error::other)?
+            .map_err(|e| AcceptError::Failed(io::Error::other(e)))?
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(Fixed(plan.leaf.clone())));
         config.alpn_protocols = alpn.into_iter().collect();
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let handshake = acceptor.accept(Socket::with_prefix(client, hello));
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        let result = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))
+            .and_then(|handshake| handshake);
+        result.map_err(|e| {
+            if client_gave_up(&e) {
+                AcceptError::Rejected
+            } else {
+                AcceptError::Failed(e)
+            }
+        })
     }
+}
+
+/// Why the handshake with the client did not complete.
+pub(crate) enum AcceptError {
+    /// The client answered the mimic certificate with an alert, or closed right after it: it
+    /// does not trust it (spec §5).
+    Rejected,
+    /// A reset, a timeout or a malformed message: nothing is learned about the client's trust.
+    Failed(io::Error),
+}
+
+/// An alert from the client, or the end of its stream in the middle of the handshake (the
+/// sidecar's flight with the certificate was already written by then).
+fn client_gave_up(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::UnexpectedEof
+        || e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            .is_some_and(|inner| matches!(inner, rustls::Error::AlertReceived(_)))
 }
 
 /// Why the sidecar's own handshake with the destination did not complete.
@@ -319,10 +360,11 @@ fn provider() -> Arc<CryptoProvider> {
 
 /// The first existing of `stores`, plus `dir/trust/*/image-ca.pem`. Unreadable files are
 /// skipped: a destination they would have verified is then passed through.
-fn load_roots(stores: &[PathBuf], dir: &Path) -> RootCertStore {
+fn load_roots(stores: &[PathBuf], dir: &Path) -> (RootCertStore, Vec<Skipped>) {
     let mut roots = RootCertStore::empty();
+    let mut skipped = Vec::new();
     if let Some(store) = stores.iter().find(|s| s.is_file()) {
-        add_pem(&mut roots, store);
+        skipped.extend(add_pem(&mut roots, store));
     }
     let mut images: Vec<PathBuf> = fs::read_dir(dir.join("trust"))
         .into_iter()
@@ -332,18 +374,50 @@ fn load_roots(stores: &[PathBuf], dir: &Path) -> RootCertStore {
         .collect();
     images.sort();
     for image in images {
-        add_pem(&mut roots, &image);
+        // An image without a bundle (no `mimic-trust` run for it) is not an error.
+        if image.exists() || image.is_symlink() {
+            skipped.extend(add_pem(&mut roots, &image));
+        }
     }
-    roots
+    (roots, skipped)
 }
 
-fn add_pem(roots: &mut RootCertStore, path: &Path) {
-    let Ok(bytes) = fs::read(path) else {
-        return;
+/// What a root file did not give.
+struct Skipped {
+    path: PathBuf,
+    /// PEM blocks that did not parse as certificates.
+    blocks: usize,
+    /// The file could not be read.
+    error: Option<String>,
+}
+
+fn add_pem(roots: &mut RootCertStore, path: &Path) -> Option<Skipped> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return Some(Skipped {
+                path: path.to_path_buf(),
+                blocks: 0,
+                error: Some(e.kind().to_string()),
+            });
+        }
     };
-    let certs = Pem::iter_from_buffer(&bytes)
-        .map_while(Result::ok)
+    let mut malformed = 0;
+    let certs: Vec<_> = Pem::iter_from_buffer(&bytes)
+        .map_while(|pem| {
+            if pem.is_err() {
+                malformed += 1;
+            }
+            pem.ok()
+        })
         .filter(|p| p.label == "CERTIFICATE")
-        .map(|p| CertificateDer::from(p.contents));
-    roots.add_parsable_certificates(certs);
+        .map(|p| CertificateDer::from(p.contents))
+        .collect();
+    let (_, ignored) = roots.add_parsable_certificates(certs);
+    let blocks = malformed + ignored;
+    (blocks > 0).then(|| Skipped {
+        path: path.to_path_buf(),
+        blocks,
+        error: None,
+    })
 }
