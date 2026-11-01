@@ -7,6 +7,15 @@ name: ci
 #   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; skipped unless a PR touches the codec)
 #           └─▶ fuzz-discovery (discovery recorder, spec DSC-23; same rule for its own paths)
 # `ci-ok` sums them up; it is the only required check on main.
+#
+# Actions allowed in the repository settings (#273; Settings → Actions → General, or
+# `gh api repos/Thaliph/mock-server/actions/permissions/selected-actions`). Keep this list and the
+# setting in sync: every `uses:` here, and every action nested in one of them, must be allowed.
+#   GitHub-owned (actions/*, github/*): allowed by the setting itself.
+#   docker/*, aquasecurity/trivy-action, aquasecurity/setup-trivy (nested in trivy-action),
+#   sigstore/cosign-installer, dtolnay/rust-toolchain, Swatinem/rust-cache,
+#   EmbarkStudios/cargo-deny-action, zizmorcore/zizmor-action, helm/kind-action,
+#   taiki-e/install-action, gitleaks/gitleaks-action, ossf/scorecard-action (scorecard.yml).
 
 on:
   pull_request:
