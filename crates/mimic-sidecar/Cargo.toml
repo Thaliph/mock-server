@@ -34,6 +34,7 @@ x509-parser = { version = "0.18.1", features = ["verify"] }
 workspace = true
 
 [dev-dependencies]
+futures = "0.3.34"
 http-body-util = "0.1.5"
 mimic-runtime = { path = "../mimic-runtime", features = ["testing"] }
 tempfile = "3.27.0"

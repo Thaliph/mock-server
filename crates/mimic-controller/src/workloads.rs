@@ -8,6 +8,7 @@ use futures::StreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
+use mimic_core::proxy::tls::MAX_EXCLUDES;
 
 /// `(namespace, name, spec.deployment, spec.tls.exclude, spec.discovery.redact)` of a
 /// `MimicWorkload`.
@@ -75,9 +76,21 @@ impl WorkloadCache {
     }
 
     /// `spec.tls.exclude` of every `MimicWorkload` of `namespace` naming `deployment`: the
-    /// sorted, deduplicated union (spec §5).
+    /// sorted, deduplicated union (spec §5), cut to the sidecar's limit of
+    /// [`MAX_EXCLUDES`] entries: a longer list would make it exit.
     pub fn exclude(&self, namespace: &str, deployment: &str) -> Vec<String> {
-        self.union(namespace, deployment, |(_, exclude, _)| exclude)
+        let mut union = self.union(namespace, deployment, |(_, exclude, _)| exclude);
+        if union.len() > MAX_EXCLUDES {
+            tracing::warn!(
+                namespace,
+                deployment,
+                entries = union.len(),
+                kept = MAX_EXCLUDES,
+                "tls exclude truncated"
+            );
+            union.truncate(MAX_EXCLUDES);
+        }
+        union
     }
 
     /// `spec.discovery.redact` of every `MimicWorkload` of `namespace` naming `deployment`: the
@@ -272,6 +285,25 @@ mod tests {
         assert!(cache.exclude("shop", "none").is_empty());
         cache.remove("shop", "w2");
         assert_eq!(cache.exclude("shop", "api"), ["a.test", "b.test"]);
+    }
+
+    #[test]
+    fn tls_28_the_exclusion_union_is_cut_to_256_entries_in_sorted_order() {
+        let names: Vec<Vec<String>> = (0..3)
+            .map(|w| {
+                (0..100)
+                    .map(|i| format!("h{:03}.test", w * 100 + i))
+                    .collect()
+            })
+            .collect();
+        let cache = WorkloadCache::new();
+        for (i, list) in names.iter().enumerate() {
+            cache.apply("shop", &format!("w{i}"), "api", list.clone(), vec![]);
+        }
+        let union = cache.exclude("shop", "api");
+        assert_eq!(union.len(), 256);
+        assert_eq!(union[0], "h000.test");
+        assert_eq!(union[255], "h255.test");
     }
 
     #[test]

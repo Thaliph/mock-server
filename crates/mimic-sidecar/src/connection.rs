@@ -21,7 +21,7 @@ use crate::h2;
 use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
 use crate::opaque::{self, Early, Side};
-use crate::tls::intercept::{ConnectError, Plan};
+use crate::tls::intercept::{AcceptError, ConnectError, Plan};
 use crate::transport::Stream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -106,7 +106,8 @@ pub(crate) async fn handle(
         interception: None,
     };
     let (mut client, mut upstream) = (client, upstream);
-    let served = match first_bytes(&mut client, &mut upstream, abort.as_mut()).await {
+    let stall = shared.detect_stall();
+    let served = match first_bytes(&mut client, &mut upstream, stall, abort.as_mut()).await {
         First::Client(detection, buf) => {
             tracing::debug!(direction = direction.as_str(), %dst, ?detection, "protocol detected");
             match detection {
@@ -325,23 +326,36 @@ async fn intercept(
         }
     };
     let alpn = upstream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+    let alpn_agreed = alpn.is_some();
     let client = match tls.accept(client, hello, &plan, alpn).await {
         Ok(client) => client,
-        Err(e) => {
+        Err(AcceptError::Rejected) => {
             // The client gave up on this connection; the next one passes through.
-            tracing::debug!(direction = direction.as_str(), %dst, error = %e, "handshake with the client failed");
+            tracing::debug!(direction = direction.as_str(), %dst, "client rejected the certificate");
             tls.passthrough(&plan, Reason::ClientRejected, dst);
+            return;
+        }
+        Err(AcceptError::Failed(e)) => {
+            // A reset, a timeout: nothing is learned about the client's trust.
+            tracing::debug!(direction = direction.as_str(), %dst, error = %e, "handshake with the client failed");
             return;
         }
     };
     tls.count("intercepted");
     conn.tls = true;
-    let (mut client, upstream) = (Stream::tls(client.into()), Stream::tls(upstream.into()));
-    let served = match decrypted_first_bytes(&mut client, abort.as_mut()).await {
+    let (mut client, mut upstream) = (Stream::tls(client.into()), Stream::tls(upstream.into()));
+    // With an ALPN protocol agreed, the client speaks first (an h2 destination sends SETTINGS
+    // at once, which is not a banner); without, a destination that speaks first is a banner
+    // protocol and its bytes make an opaque tunnel.
+    let banner_watch = (!alpn_agreed).then_some(&mut upstream);
+    let stall = conn.shared.detect_stall();
+    let served = match decrypted_first_bytes(&mut client, banner_watch, stall, abort.as_mut()).await
+    {
         Decrypted::Found(Detection::Http1, buf) => Served::Http1(buf),
         Decrypted::Found(Detection::H2, buf) => Served::H2(buf),
         Decrypted::Found(_, buf) => Served::Tunnel("tcp", buf, Vec::new(), None),
         Decrypted::Closed(buf, early) => Served::Tunnel("tcp", buf, Vec::new(), early),
+        Decrypted::Upstream(buf, to_client, early) => Served::Tunnel("tcp", buf, to_client, early),
     };
     conn.serve(served, client, upstream, abort).await;
 }
@@ -350,17 +364,37 @@ enum Decrypted {
     Found(Detection, Vec<u8>),
     /// The client closed or failed, or the grace ended, before a protocol was known.
     Closed(Vec<u8>, Option<Early>),
+    /// The destination spoke first: the bytes read from the client so far, those from the
+    /// destination, and how the destination side ended, if it did.
+    Upstream(Vec<u8>, Vec<u8>, Option<Early>),
 }
 
-/// [`first_bytes`] for the decrypted client stream: the destination is not read, a TLS client
-/// speaks first.
-async fn decrypted_first_bytes(client: &mut Stream, abort: impl Future<Output = ()>) -> Decrypted {
+/// [`first_bytes`] for the decrypted client stream. The destination is read only when
+/// `upstream` is given (no ALPN protocol agreed): a banner then ends the detection.
+async fn decrypted_first_bytes(
+    client: &mut Stream,
+    mut upstream: Option<&mut Stream>,
+    stall: Duration,
+    abort: impl Future<Output = ()>,
+) -> Decrypted {
     let mut abort = pin!(abort);
     let mut buf = Vec::new();
     loop {
         let mut chunk = [0u8; READ_CHUNK];
+        let mut banner = [0u8; READ_CHUNK];
         let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
         tokio::select! {
+            () = stalled(!buf.is_empty(), stall) => {
+                let timeout = io::Error::new(io::ErrorKind::TimedOut, "stalled on a protocol prefix");
+                return Decrypted::Closed(buf, Some(Early::Failed(Side::Client, timeout)));
+            }
+            read = read_watch(upstream.as_deref_mut(), &mut banner) => {
+                let (n, early) = match read {
+                    Ok(n) => (n, None),
+                    Err(e) => (0, Some(Early::Failed(Side::Upstream, e))),
+                };
+                return Decrypted::Upstream(buf, banner[..n].to_vec(), early);
+            }
             read = client.read(&mut chunk[..want]) => match read {
                 Ok(n) if n > 0 => {
                     buf.extend_from_slice(&chunk[..n]);
@@ -379,12 +413,32 @@ async fn decrypted_first_bytes(client: &mut Stream, abort: impl Future<Output = 
     }
 }
 
-/// Reads until the protocol is known, with no timeout and within [`DETECT_LIMIT`]. The bytes
+/// Resolves after `stall` when `pending_bytes`; never otherwise: a connection that has sent
+/// nothing may be waiting for a server-first protocol (spec §4.1).
+async fn stalled(pending_bytes: bool, stall: Duration) {
+    if pending_bytes {
+        tokio::time::sleep(stall).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// A read of the destination, when it is watched; never ready otherwise.
+async fn read_watch(upstream: Option<&mut Stream>, into: &mut [u8]) -> io::Result<usize> {
+    match upstream {
+        Some(upstream) => upstream.read(into).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Reads until the protocol is known, within [`DETECT_LIMIT`] and with no timeout but the
+/// stall of an incomplete prefix. The bytes
 /// read are returned to be forwarded unchanged. A reset on either side is returned as such, to
 /// reach the other side as a reset; the end of the grace (`abort`) ends the detection.
 async fn first_bytes(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
+    stall: Duration,
     abort: impl Future<Output = ()>,
 ) -> First {
     let mut abort = pin!(abort);
@@ -394,6 +448,11 @@ async fn first_bytes(
         let mut from_upstream = [0u8; READ_CHUNK];
         let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
         tokio::select! {
+            () = stalled(!buf.is_empty(), stall) => {
+                let timeout = io::Error::new(io::ErrorKind::TimedOut, "stalled on a protocol prefix");
+                let early = Some(Early::Failed(Side::Client, timeout));
+                return First::Opaque { to_upstream: buf, to_client: Vec::new(), early };
+            }
             read = client.read(&mut from_client[..want]) => match read {
                 Ok(n) if n > 0 => {
                     buf.extend_from_slice(&from_client[..n]);
