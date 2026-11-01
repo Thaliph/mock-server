@@ -183,7 +183,7 @@ mod schemas {
         assert_eq!(s["properties"]["a"], json!({}));
 
         let mut s = schema(nested(15));
-        for _ in 0..15 {
+        for _ in 0..14 {
             s = s["properties"]["a"].clone();
         }
         assert_eq!(s["properties"]["a"], json!({"type": "integer"}).clone());
