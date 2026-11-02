@@ -3,7 +3,7 @@ name: ci
 # Dependent stages (spec FND-10):
 #   lint ──▶ test ──▶ image ──▶ e2e
 #   chart ─────────────────────▲
-#   security (cargo deny, zizmor); supply chain (cooldown, dependency-review, gitleaks, trivy-config, codeql)
+#   security (cargo deny, zizmor); supply chain (cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql)
 #   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; skipped unless a PR touches the codec)
 #           └─▶ fuzz-discovery (discovery recorder, spec DSC-23; same rule for its own paths)
 # `ci-ok` sums them up; it is the only required check on main.
@@ -121,7 +121,8 @@ jobs:
   # on every event, so `ci-ok` needs them to succeed (none is skipped).
   cooldown:
     # A crate version that this change adds or bumps in a lockfile must be 14 days old on crates.io,
-    # unless scripts/cooldown-allowlist.toml lists it with a reason. A pull request is compared with
+    # and so must an npm version in the Swagger UI lockfile (#239, UI-13), unless
+    # scripts/cooldown-allowlist.toml lists it with a reason. A pull request is compared with
     # its base, a push with the previous tip; a schedule changes nothing to compare.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -145,7 +146,24 @@ jobs:
             echo "no previous tip on this push"
             exit 0
           fi
-          python3 scripts/check-cooldown.py "$base" Cargo.lock fuzz/Cargo.lock
+          python3 scripts/check-cooldown.py "$base" Cargo.lock fuzz/Cargo.lock crates/mimic-controller/ui/package-lock.json
+
+  # #239 (spec §7.5, UI-13): the vendored Swagger UI is the locked npm tarball, byte for byte. The
+  # offline tests of the script run first; then the check downloads the locked tarball from the npm
+  # registry, verifies its sha512 and compares the committed files with it.
+  vendored-ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Swagger UI vendoring check
+        run: |
+          python3 -I scripts/test_vendor_swagger_ui.py
+          python3 -I scripts/vendor-swagger-ui.py --check
 
   dependency-review:
     # Adding a crate or an action with a known vulnerability, or a licence outside the policy of
@@ -458,7 +476,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, chart, security, cooldown, dependency-review, gitleaks, trivy-config, codeql, image, e2e, changes, fuzz, fuzz-discovery]
+    needs: [lint, test, chart, security, cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql, image, e2e, changes, fuzz, fuzz-discovery]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     env:
@@ -467,6 +485,7 @@ jobs:
       CHART: ${{ needs.chart.result }}
       SECURITY: ${{ needs.security.result }}
       COOLDOWN: ${{ needs.cooldown.result }}
+      VENDORED_UI: ${{ needs.vendored-ui.result }}
       DEPENDENCY_REVIEW: ${{ needs.dependency-review.result }}
       GITLEAKS: ${{ needs.gitleaks.result }}
       TRIVY_CONFIG: ${{ needs.trivy-config.result }}
@@ -481,8 +500,8 @@ jobs:
     steps:
       - name: All stages passed
         run: |
-          echo "lint=$LINT test=$TEST chart=$CHART security=$SECURITY cooldown=$COOLDOWN dependency-review=$DEPENDENCY_REVIEW gitleaks=$GITLEAKS trivy-config=$TRIVY_CONFIG codeql=$CODEQL image=$IMAGE e2e=$E2E changes=$CHANGES fuzz=$FUZZ codec=$CODEC fuzz-discovery=$FUZZ_DISCOVERY discovery=$DISCOVERY"
-          for r in "$LINT" "$TEST" "$CHART" "$SECURITY" "$COOLDOWN" "$DEPENDENCY_REVIEW" "$GITLEAKS" "$TRIVY_CONFIG" "$CODEQL" "$IMAGE" "$E2E" "$CHANGES"; do
+          echo "lint=$LINT test=$TEST chart=$CHART security=$SECURITY cooldown=$COOLDOWN vendored-ui=$VENDORED_UI dependency-review=$DEPENDENCY_REVIEW gitleaks=$GITLEAKS trivy-config=$TRIVY_CONFIG codeql=$CODEQL image=$IMAGE e2e=$E2E changes=$CHANGES fuzz=$FUZZ codec=$CODEC fuzz-discovery=$FUZZ_DISCOVERY discovery=$DISCOVERY"
+          for r in "$LINT" "$TEST" "$CHART" "$SECURITY" "$COOLDOWN" "$VENDORED_UI" "$DEPENDENCY_REVIEW" "$GITLEAKS" "$TRIVY_CONFIG" "$CODEQL" "$IMAGE" "$E2E" "$CHANGES"; do
             [ "$r" = success ] || exit 1
           done
           # fuzz may be skipped by its path filter; it may not be skipped when the codec changed.

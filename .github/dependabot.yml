@@ -1,4 +1,5 @@
-# Dependency updates: crates (workspace and fuzz crate), GitHub Actions, and Dockerfile base images
+# Dependency updates: crates (workspace and fuzz crate), the npm lockfile of the vendored Swagger UI
+# (#239, UI-13), GitHub Actions, and Dockerfile base images
 # (the product Dockerfile and images/Dockerfile, which pins Valkey, kind and the e2e images, #273).
 # The 14-day cooldown (#269, as scripts/check-cooldown.py) keeps freshly published (possibly compromised) releases out.
 version: 2
@@ -19,6 +20,11 @@ updates:
       cargo-fuzz:
         patterns: ["*"]
         update-types: [minor, patch]
+  # Swagger UI (#239, UI-13): a bump needs scripts/vendor-swagger-ui.py and a reviewed diff of the vendored files.
+  - package-ecosystem: npm
+    directory: /crates/mimic-controller/ui
+    schedule: {interval: weekly}
+    cooldown: {default-days: 14}
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
