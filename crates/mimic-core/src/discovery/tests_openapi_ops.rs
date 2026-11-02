@@ -517,6 +517,30 @@ fn ui_01_ref_keys_of_recorded_names_never_reach_a_reference_position() {
     assert!(d["paths"]["/p"].get("x-mimic-methods").is_none());
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1_000))]
+
+    #[test]
+    fn ui_05_a_forged_authorization_scheme_never_reaches_the_document(
+        word in "[a-z0-9]{10,24}",
+        registered in prop::sample::select(vec!["Bearer", "Basic"]),
+    ) {
+        // An older or faulty sidecar may store `authorization: <word> <redacted>`.
+        let canary = format!("cnry{word}");
+        let stored = report_of(&[authorized(&format!("{registered} abc"))])
+            .to_json()
+            .expect("serialises");
+        let forged = stored.replace(
+            &format!("{registered} <redacted>"),
+            &format!("{canary} <redacted>"),
+        );
+        prop_assert_ne!(&forged, &stored);
+        let d = doc(&Report::from_json(&forged).expect("parses"));
+        prop_assert!(!d.to_string().contains(&canary), "a forged scheme is in the document");
+        prop_assert!(d.get("components").is_none());
+    }
+}
+
 fn arb_rx() -> impl Strategy<Value = Rx> {
     let names = prop::sample::select(vec!["$ref", "a", "x-h", "token", "id"]);
     let media = prop::sample::select(vec![
