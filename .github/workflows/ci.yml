@@ -160,10 +160,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Swagger UI vendoring check
+      - name: Swagger UI vendoring and npm cooldown tests (offline)
         run: |
           python3 -I scripts/test_vendor_swagger_ui.py
-          python3 -I scripts/vendor-swagger-ui.py --check
+          python3 -I scripts/test_check_cooldown.py
+      - name: Swagger UI vendoring check
+        run: python3 -I scripts/vendor-swagger-ui.py --check
 
   dependency-review:
     # Adding a crate or an action with a known vulnerability, or a licence outside the policy of

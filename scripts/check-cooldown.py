@@ -7,7 +7,9 @@ The publication date is the `created_at` of the version in the crates.io API. Th
 an npm package version that a change adds or bumps in a package-lock.json (the vendored Swagger UI,
 crates/mimic-controller/ui): its date is the `time` of that version in the npm registry. Only
 registry packages count: workspace members have no source, and git sources are refused by
-cargo-deny; npm entries that do not resolve to the npm registry are skipped the same way.
+cargo-deny. An npm lockfile is held to a stricter rule: every entry must be an installed package
+that resolves to the npm registry with a version, and the lockfile must have a `packages` map;
+anything else is an error (fail closed), never a silent skip.
 
 usage: check-cooldown.py <base-commit> <lockfile>...
 
@@ -55,13 +57,23 @@ def registry_packages(text):
 def npm_packages(text):
     """The (npm, name, version) triples of the package-lock.json entries that come from the npm registry."""
     doc = json.loads(text)
+    entries = doc.get("packages") if isinstance(doc, dict) else None
+    if not isinstance(entries, dict):
+        raise ValueError("package-lock.json has no packages map (lockfileVersion 2 or 3 is needed)")
     found = set()
-    for key, entry in doc.get("packages", {}).items():
-        if key == "" or "node_modules/" not in key or not isinstance(entry, dict):
-            continue
-        if not str(entry.get("resolved", "")).startswith(NPM_REGISTRY_PREFIX) or "version" not in entry:
-            continue
-        found.add((NPM, key.rsplit("node_modules/", 1)[1], entry["version"]))
+    for key, entry in entries.items():
+        if key == "":
+            continue  # the root project, not a dependency
+        if not isinstance(entry, dict) or "node_modules/" not in key:
+            raise ValueError(f"package-lock.json entry {key!r} is not an installed npm package")
+        resolved = entry.get("resolved")
+        if not isinstance(resolved, str) or not resolved.startswith(NPM_REGISTRY_PREFIX):
+            raise ValueError(f"package-lock.json entry {key!r} does not resolve to the npm registry "
+                             f"(resolved: {resolved!r})")
+        version = entry.get("version")
+        if not isinstance(version, str) or not version:
+            raise ValueError(f"package-lock.json entry {key!r} has no version")
+        found.add((NPM, key.rsplit("node_modules/", 1)[1], version))
     return found
 
 
@@ -136,9 +148,13 @@ def main(argv):
         return 2
 
     new = set()
-    for lockfile in args.lockfiles:
-        head = packages(lockfile, Path(lockfile).read_text())
-        new |= head - base_packages(args.base, lockfile)
+    try:
+        for lockfile in args.lockfiles:
+            head = packages(lockfile, Path(lockfile).read_text())
+            new |= head - base_packages(args.base, lockfile)
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f"cannot read the lockfiles, failing closed: {error}", file=sys.stderr)
+        return 1
 
     rows, failures = [], []
     for kind, name, version in sorted(new):
