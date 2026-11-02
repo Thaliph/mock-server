@@ -11,6 +11,7 @@ mod recorder;
 mod redactions;
 mod ship;
 
+use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -39,6 +40,8 @@ pub(crate) struct Handoff {
     pending_samples: AtomicUsize,
     /// Counts the freezes. Written under the report's lock.
     epoch: AtomicU64,
+    /// Endpoints of the pending report, for the gauges. Written under the report's lock.
+    pending_keys: Mutex<BTreeSet<recorder::Key>>,
 }
 
 /// Discovery of one sidecar: the local report and the thread that fills it.

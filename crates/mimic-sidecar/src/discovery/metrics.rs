@@ -134,9 +134,14 @@ impl DiscoveryMetrics {
             .inc_by(n);
     }
 
+    /// A direction that never had an endpoint has no series: 0 does not create one.
     pub(super) fn set_endpoints(&self, direction: &'static str, n: usize) {
+        let labels = DirectionLabels { direction };
+        if n == 0 && self.endpoints.get(&labels).is_none() {
+            return;
+        }
         self.endpoints
-            .get_or_create(&DirectionLabels { direction })
+            .get_or_create(&labels)
             .set(i64::try_from(n).unwrap_or(i64::MAX));
     }
 

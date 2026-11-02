@@ -211,10 +211,10 @@ proptest! {
         // The sample keys are the hashes of the re-redacted content.
         let truth = record(&controller(), &input, times);
         prop_assert_eq!(samples_of(&report), samples_of(&truth));
-        // The field is redacted and has no sketch.
+        // The field is redacted, and holds the hash of the marker only.
         let fields = report.endpoints()[0].stats.observed().volatility().clone();
         prop_assert!(fields.is_redacted(&field), "{field} not redacted: {:?}", fields.fields());
-        prop_assert_eq!(fields.sketch_len(&field), Some(0));
+        prop_assert_eq!(fields.sketch_len(&field), Some(1));
     }
 
     /// CTL-03: idempotent, and the identity for a report recorded with the same redactor.
@@ -240,6 +240,24 @@ proptest! {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// CTL-03: the volatile fields of a re-redacted report, a folded one included, are those of
+    /// a sidecar that knew the name (same `n`, same marker hash, same flags).
+    #[test]
+    fn ctl_03_volatile_fields_equal_those_of_a_sidecar_that_knew_the_name(
+        place in place(),
+        canary in "CANARY[A-Za-z0-9]{8,24}",
+        times in 1usize..4,
+    ) {
+        let input = input_of(place, &canary);
+        let mut report = record(&Redactor::default(), &input, times);
+        report.re_redact(&controller());
+        let truth = record(&controller(), &input, times);
+        prop_assert_eq!(
+            report.endpoints()[0].stats.observed().volatility(),
+            truth.endpoints()[0].stats.observed().volatility()
+        );
+    }
 
     /// CTL-03: the schemas and the volatile field names under a name the sidecar did not know
     /// are those of a sidecar that knew it.
@@ -520,7 +538,7 @@ fn ctl_03_detected_form_marks_the_volatile_field() {
     report.re_redact(&Redactor::default());
     let fields = report.endpoints()[0].stats.observed().volatility().clone();
     assert!(fields.is_redacted("request.header/x-note"));
-    assert_eq!(fields.sketch_len("request.header/x-note"), Some(0));
+    assert_eq!(fields.sketch_len("request.header/x-note"), Some(1));
     assert!(!report.to_json().unwrap().contains(&planted.to_string()));
 }
 

@@ -27,6 +27,13 @@ PIDS=()
 DERIVED=()
 WORK=""
 
+# kill_tree <pid>: the process and everything it started.
+kill_tree() {
+  local children child
+  children=$(pgrep -P "$1" 2>/dev/null || true)
+  kill "$1" 2>/dev/null || true
+  for child in $children; do kill_tree "$child"; done
+}
 log() { printf '\n== %s\n' "$*"; }
 fail() {
   echo "FAIL $*" >&2
@@ -1409,8 +1416,13 @@ wait_status() {
   return 1
 }
 log "ctl_20: within MIMIC_STATUS_INTERVAL more the MimicWorkloads show endpoints.inbound 2, pods 2 and a lastPushTime"
-wait_status '.endpoints.inbound == 2 and .pods == 2 and (.lastPushTime | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))' 90 \
-  || fail "ctl_20: the status of users-a and users-b is not endpoints.inbound 2, pods 2 with a lastPushTime: $(kubectl -n disc-22 get mimicworkload -o jsonpath='{.items[*].status}')"
+# The merged report exists (ctl_20 above), so the status needs one status interval (30 s by default; a replica
+# may have just missed the push, so two), the apply, and a margin for a slow runner.
+status_wait=$((2 * 30 + 60))
+wait_status '.endpoints.inbound == 2 and .pods == 2 and (.lastPushTime | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))' "$status_wait" \
+  || { echo "ctl_20: status after ${status_wait}s: $(kubectl -n disc-22 get mimicworkload -o jsonpath='{.items[*].status}')" >&2; \
+       kubectl -n "$NS" logs deploy/$RELEASE-controller --all-pods --tail=200 2>&1 | grep -i 'status' | tail -20 >&2 || true; \
+       fail "ctl_20: the status of users-a and users-b is not endpoints.inbound 2, pods 2 with a lastPushTime within ${status_wait}s"; }
 status_row=$(kubectl -n disc-22 get mimicworkload users-a --no-headers) || fail "ctl_19: cannot print users-a"
 read -r -a row <<< "$status_row"
 [[ ${row[1]} == discovery && ${row[2]} == 2 && ${row[3]} == 2 && ${row[4]} =~ ^[0-9]+[smhd]([0-9]+[smhd])?$ ]] \
@@ -1527,8 +1539,27 @@ log "ctl_21: churn: a rollout and a deleted controller pod, with traffic before,
 install --set controller.status.podWindow=30s --set controller.status.interval=5s \
   || fail "ctl_21: helm upgrade with MIMIC_STATUS_POD_WINDOW=30s"
 kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m >/dev/null || fail "ctl_21: the controller did not roll out"
-# The client calls for 210 s and counts the 200s it gets; the merged count must be exactly that on top of
-# what the report held (no exchange lost at SIGTERM of the old pods, none counted twice by a retry).
+# The client calls for 210 s on ids of its own (100000 and up) and counts the 200s it gets. The truth for
+# the merged count is what B answered: its access lines, streamed from every pod of the rollout, those of
+# the pods that are deleted included. A rollout may cut a connection after the pod answered, so the client
+# can miss a 200 that B sent (and the sidecar recorded); it can never see one B did not send.
+old_pods=$(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}')
+mkdir -p "$WORK/churn-logs"
+(
+  while true; do
+    for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+      [[ -e "$WORK/churn-logs/$p.seen" ]] && continue
+      : > "$WORK/churn-logs/$p.seen"
+      # Until a stream ends cleanly (the container exited): one that fails, while the container is still
+      # starting for instance, starts again from the first line, in a file of its own (a file is never
+      # truncated, so the lines of a pod that is deleted meanwhile are kept; the longest file of a pod counts).
+      ( n=0; until kubectl -n disc-22 logs -f "$p" -c app > "$WORK/churn-logs/$p.$((n += 1)).log" 2>/dev/null; do sleep 1; done ) &
+    done
+    sleep 1
+  done
+) &
+streams_pid=$!
+PIDS+=("$streams_pid")
 kubectl -n disc-22-client exec -i client -- python3 - 210 > "$WORK/churn.out" <<'PY' &
 import sys, time, urllib.request
 end = time.time() + int(sys.argv[1])
@@ -1536,7 +1567,7 @@ ok = n = 0
 while time.time() < end:
     n += 1
     try:
-        with urllib.request.urlopen(f"http://front.disc-22-client.svc:8080/front/users/{n % 50 + 1}", timeout=15) as r:
+        with urllib.request.urlopen(f"http://front.disc-22-client.svc:8080/front/users/{n % 50 + 100000}", timeout=15) as r:
             r.read()
             ok += r.status == 200
     except Exception:
@@ -1551,18 +1582,55 @@ kubectl -n disc-22 rollout restart deploy/users >/dev/null
 kubectl -n disc-22 rollout status deploy/users --timeout=3m >/dev/null || fail "ctl_21: users did not roll out"
 controller_gone=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller -o jsonpath='{.items[0].metadata.name}')
 kubectl -n "$NS" delete pod "$controller_gone" --wait=false >/dev/null || fail "ctl_21: cannot delete controller pod $controller_gone"
-# The traffic goes on: the old pods leave the status after their window and the new ones are counted,
-# with the same endpoints.
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m >/dev/null || fail "ctl_21: the controller did not recover"
+# The traffic goes on. The pods of the rollout must have pushed (their names are not those from before), and
+# then the old pods leave the status after their window: pods 2 on the old pods alone would pass too early.
+new_pods=$(comm -13 <(printf '%s\n' $old_pods | sort) \
+  <(kubectl -n disc-22 get pods -l app=users -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | sort))
+[[ $(echo "$new_pods" | wc -w) == 2 ]] || fail "ctl_21: expected 2 new users pods after the rollout, got '$new_pods' (old: $old_pods)"
+ui_forward
+pushed=0
+for _ in $(seq 60); do
+  if pods_listed=$(merged_pods 2>/dev/null) && [[ -z $(comm -23 <(echo "$new_pods" | sort) <(echo "$pods_listed" | sort)) ]]; then pushed=1; break; fi
+  sleep 2
+done
+(( pushed )) || fail "ctl_21: the new pods $new_pods did not push: $(merged_pods | tr '\n' ' ')"
 wait_status '.pods == 2 and .endpoints.inbound == 2' 120 \
   || fail "ctl_21: status.discovery.pods did not come back to 2 with the same endpoints: $(kubectl -n disc-22 get mimicworkload -o jsonpath='{.items[*].status}')"
 wait "$churn_pid" || fail "ctl_21: the client of the churn failed"
 churn_ok=$(cat "$WORK/churn.out")
 [[ $churn_ok =~ ^[0-9]+$ ]] && (( churn_ok > 100 )) || fail "ctl_21: the churn client got '$churn_ok' 200s"
-kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m >/dev/null || fail "ctl_21: the controller did not recover"
+# The streams of the pods still running hold their last lines a moment after the last answer.
+sleep 5
+kill_tree "$streams_pid"
+# Only the ids of the churn (100000 to 100049, exactly): no earlier step uses them (1 to 39 and 9999).
+b_ok=0
+for pod in $(ls "$WORK"/churn-logs | sed -n 's/^\(.*\)\.[0-9]*\.log$/\1/p' | sort -u); do
+  best=0
+  for f in "$WORK/churn-logs/$pod".*.log; do
+    n=$(jq -R -s 'split("\n") | map(fromjson? | select(. != null and .method == "GET" and .status == 200 and (.path | test("^/users/1000[0-4][0-9]$")))) | length' "$f") || n=0
+    (( n > best )) && best=$n
+  done
+  b_ok=$((b_ok + best))
+done
+[[ $b_ok =~ ^[0-9]+$ ]] || fail "ctl_21: cannot count the 200s B answered: '$b_ok'"
+echo "ctl_21: the client got $churn_ok 200s, B answered $b_ok" >&2
+(( churn_ok <= b_ok )) || fail "ctl_21: the client got $churn_ok 200s, more than the $b_ok B answered"
 ui_forward
-want_get=$((want_get + churn_ok))
-wait_merged "$want_get" "$want_put" 150 \
-  || { echo "ctl_21: merged GET $(merged_count GET), expected $want_get (client 200s: $churn_ok)" >&2; fail "ctl_21: the merged count is not the number of 200s the client received"; }
+# Every 200 the client received must be counted (nothing lost at SIGTERM) and nothing counted twice, so the
+# merged count is at most what B answered. A rollout that cuts a connection after B answered can also cost the
+# sidecar the exchange it was relaying, and the client the answer: the gap below B's count is accepted, and
+# printed, only up to the 200s the client did not receive.
+base_get=$want_get
+min_get=$((base_get + churn_ok))
+max_get=$((base_get + b_ok))
+wait_merged "$max_get" "$want_put" 90 || true
+fetch_merged || fail "ctl_21: cannot read the merged report after the churn"
+got_get=$(merged_count GET)
+echo "ctl_21: merged GET $got_get, between $min_get (the client's 200s) and $max_get (B's)" >&2
+(( got_get >= min_get && got_get <= max_get )) \
+  || fail "ctl_21: merged GET $got_get is not in [$min_get, $max_get] (B answered $b_ok, the client got $churn_ok)"
+[[ $(merged_count PUT) == "$want_put" ]] || fail "ctl_21: merged PUT $(merged_count PUT), expected $want_put"
 [[ $(merged_templates) == "$(cat "$WORK/templates-first.txt")" ]] \
   || fail "ctl_21: the endpoints changed during the churn: $(merged_templates | tr '\n' ';')"
 kubectl delete namespace disc-22 disc-22-client --wait=false >/dev/null

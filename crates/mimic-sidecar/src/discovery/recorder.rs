@@ -24,7 +24,40 @@ const MAX_AUTHORITY: usize = 1024;
 /// Old templates named in a `template absorbed` line.
 const MAX_OLD_LOGGED: usize = 16;
 
-type Key = (Direction, u16, String, String);
+pub(super) type Key = (Direction, u16, String, String);
+
+/// The endpoints of `report`.
+pub(super) fn keys(report: &Report) -> BTreeSet<Key> {
+    report
+        .endpoints()
+        .into_iter()
+        .map(|e| (e.direction, e.port, e.method.to_string(), e.template))
+        .collect()
+}
+
+/// Sets the gauges for the current report together with the pending one: sample bytes, and the
+/// distinct endpoints. Called under the report's lock, so that a freeze and a record cannot
+/// overwrite each other with stale values.
+pub(super) fn publish(
+    metrics: &DiscoveryMetrics,
+    handoff: &Handoff,
+    current: &Report,
+    current_keys: &BTreeSet<Key>,
+) {
+    let pending = handoff.pending_samples.load(Ordering::Acquire);
+    metrics.set_sample_bytes(current.sample_bytes().saturating_add(pending));
+    let pending_keys = handoff
+        .pending_keys
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    for d in [Direction::Inbound, Direction::Outbound] {
+        let n = current_keys
+            .union(&pending_keys)
+            .filter(|(k, ..)| *k == d)
+            .count();
+        metrics.set_endpoints(label(d), n);
+    }
+}
 
 pub(super) struct Recorder {
     pub(super) report: Arc<Mutex<Report>>,
@@ -291,13 +324,16 @@ impl Recorder {
                     ..
                 }
             );
-            let endpoints = new_endpoint.then(|| {
-                report
-                    .endpoints()
-                    .into_iter()
-                    .map(|e| (e.direction, e.port, e.method.to_string(), e.template))
-                    .collect::<BTreeSet<Key>>()
-            });
+            let endpoints = new_endpoint.then(|| keys(&report));
+            // The gauges cover the pending report too.
+            match &endpoints {
+                Some(keys) => publish(&self.metrics, &self.handoff, &report, keys),
+                None => self.metrics.set_sample_bytes(
+                    report
+                        .sample_bytes()
+                        .saturating_add(self.handoff.pending_samples.load(Ordering::Acquire)),
+                ),
+            }
             (outcome, endpoints, report.sample_bytes(), limits, epoch)
         };
         self.restart_shape(epoch);
@@ -336,7 +372,6 @@ impl Recorder {
                 self.metrics.exchange(direction, "recorded");
             }
         }
-        self.metrics.set_sample_bytes(sample_bytes);
         self.sample_bytes = sample_bytes;
     }
 
@@ -370,17 +405,12 @@ impl Recorder {
     }
 
     /// The shipper froze the report since the last exchange: the tree starts anew, so the
-    /// shape known so far (and its gauges) is not the report's any more.
+    /// shape known so far is not the report's any more (the shipper has set the gauges).
     fn restart_shape(&mut self, epoch: u64) {
         if epoch == self.epoch {
             return;
         }
         self.epoch = epoch;
-        for d in [Direction::Inbound, Direction::Outbound] {
-            if self.known.iter().any(|(k, ..)| *k == d) {
-                self.metrics.set_endpoints(label(d), 0);
-            }
-        }
         self.known.clear();
     }
 
@@ -424,12 +454,6 @@ impl Recorder {
                 old_count = removed.len(),
                 "template absorbed"
             );
-        }
-        for d in [Direction::Inbound, Direction::Outbound] {
-            let n = now.iter().filter(|(k, ..)| *k == d).count();
-            if n > 0 || self.known.iter().any(|(k, ..)| *k == d) {
-                self.metrics.set_endpoints(label(d), n);
-            }
         }
         self.known = now;
     }

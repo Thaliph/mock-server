@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 axum = "0.8.9"
 base64 = "0.23.1"
+bytes = "1.12.1"
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 h2 = "0.4.20"
 http-body-util = "0.1.5"
