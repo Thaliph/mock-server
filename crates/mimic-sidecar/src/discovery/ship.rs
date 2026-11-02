@@ -1,6 +1,8 @@
 //! The shipping client (spec §7.2): freezes the local report into a pending report every
 //! `MIMIC_DISCOVERY_PUSH_INTERVAL` and posts it to the sidecar API until it is settled.
 
+use bytes::Bytes;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -16,6 +18,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use super::Handoff;
 use super::capture::Budget;
 use super::metrics::DiscoveryMetrics;
+use super::recorder;
 use crate::tls::ca::{self, api_client, read_capped};
 
 const INTERVAL_VAR: &str = "MIMIC_DISCOVERY_PUSH_INTERVAL";
@@ -112,7 +115,7 @@ pub(super) struct Parts {
 struct Pending {
     sequence: u64,
     report: Report,
-    body: Vec<u8>,
+    body: Bytes,
     exchanges: u64,
     /// The samples were removed after a `413`.
     stripped: bool,
@@ -272,18 +275,23 @@ impl Shipper {
             }
             let frozen = std::mem::replace(&mut *report, Report::new(self.parts.pod.clone()));
             // Under the lock: the recorder reads them there.
-            self.parts
-                .handoff
+            let handoff = &self.parts.handoff;
+            handoff
                 .pending_samples
                 .store(frozen.sample_bytes(), Ordering::Release);
-            self.parts.handoff.epoch.fetch_add(1, Ordering::AcqRel);
+            *handoff
+                .pending_keys
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = recorder::keys(&frozen);
+            handoff.epoch.fetch_add(1, Ordering::AcqRel);
+            recorder::publish(&self.parts.metrics, handoff, &report, &BTreeSet::new());
             frozen
         };
         self.sequence += 1;
         self.pending = Some(Pending {
             sequence: self.sequence,
             exchanges: frozen.exchanges(),
-            body: Vec::new(),
+            body: Bytes::new(),
             report: frozen,
             stripped: false,
         });
@@ -301,7 +309,7 @@ impl Shipper {
             report: &pending.report,
         };
         match serde_json::to_vec(&push) {
-            Ok(body) => pending.body = body,
+            Ok(body) => pending.body = Bytes::from(body),
             Err(e) => {
                 tracing::warn!(
                     target: "discovery",
@@ -318,10 +326,32 @@ impl Shipper {
     /// The pending report is gone: acknowledged, rejected or lost.
     fn settle(&mut self) {
         self.pending = None;
-        self.parts
-            .handoff
-            .pending_samples
-            .store(0, Ordering::Release);
+        self.release(true);
+    }
+
+    /// The pending report no longer holds its samples (and its endpoints when `gone`): the gauges
+    /// and the budget of the current report follow.
+    fn release(&self, gone: bool) {
+        let report = self
+            .parts
+            .report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let handoff = &self.parts.handoff;
+        handoff.pending_samples.store(0, Ordering::Release);
+        if gone {
+            handoff
+                .pending_keys
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        }
+        recorder::publish(
+            &self.parts.metrics,
+            handoff,
+            &report,
+            &recorder::keys(&report),
+        );
     }
 
     async fn attempt(&mut self) -> Attempt {
@@ -359,10 +389,7 @@ impl Shipper {
                     pending.report.drop_samples();
                     pending.stripped = true;
                 }
-                self.parts
-                    .handoff
-                    .pending_samples
-                    .store(0, Ordering::Release);
+                self.release(false);
                 self.encode();
                 Attempt::Retry(Duration::ZERO)
             }
@@ -379,6 +406,9 @@ impl Shipper {
                     "report rejected"
                 );
                 self.settle();
+                // A dropped report ends the streak as an acknowledged one does.
+                self.backoff.success();
+                self.failures = 0;
                 Attempt::Settled
             }
             Answer::Status {
@@ -419,7 +449,7 @@ impl Shipper {
     }
 
     /// One post of `body`. The token is read again for each: the kubelet rotates it.
-    async fn post(&self, body: Vec<u8>) -> Answer {
+    async fn post(&self, body: Bytes) -> Answer {
         let token = match tokio::fs::read_to_string(&self.target.token_file).await {
             Ok(token) => token,
             Err(e) => return Answer::Error(format!("token file: {}", e.kind())),
@@ -447,12 +477,22 @@ impl Shipper {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(retry_after);
-        let applied = match read_capped(response).await {
-            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+        let answer = read_capped(response).await;
+        let applied = if code == 200 {
+            // An acknowledgement says whether it applied the report: nothing else settles it.
+            let bytes = match answer {
+                Ok(bytes) => bytes,
+                Err(e) => return Answer::Error(e),
+            };
+            match serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
-                .is_some_and(|v| v["applied"] != false),
-            Err(e) if code == 200 => return Answer::Error(e),
-            Err(_) => false,
+                .and_then(|v| v["applied"].as_bool())
+            {
+                Some(applied) => applied,
+                None => return Answer::Error("unreadable answer".to_string()),
+            }
+        } else {
+            false
         };
         Answer::Status {
             code,

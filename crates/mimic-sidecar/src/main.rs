@@ -147,10 +147,17 @@ async fn run(
             shipper
         })
     });
+    // With shipping, the drain stops at three quarters of the grace: a drain held open by a request
+    // that never ends must not leave the flush with nothing (spec §4.1, §7.2).
+    let drain_grace = if shipping.is_some() {
+        grace / 4 * 3
+    } else {
+        grace
+    };
     let drain = async {
         shutdown.clone().wait().await;
         let begun = std::time::Instant::now();
-        shared.drain(grace).await;
+        shared.drain(drain_grace).await;
         let shipper = match shipping {
             Some(task) => task.await.ok(),
             None => None,

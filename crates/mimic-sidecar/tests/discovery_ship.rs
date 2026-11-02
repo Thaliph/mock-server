@@ -812,11 +812,12 @@ async fn ctl_16_a_200_with_an_unreadable_body_is_a_failed_attempt() {
     let (_stop, _task) = rig.start();
     rig.call("users", 1).await;
     wait(|| rig.api.count() >= 3).await;
-    let seen = rig.api.seen.lock().unwrap();
-    // The same report, three times: the first two answers did not acknowledge it.
-    assert_eq!(seen[1].body, seen[0].body);
-    assert_eq!(seen[2].body, seen[0].body);
-    drop(seen);
+    {
+        let seen = rig.api.seen.lock().unwrap();
+        // The same report, three times: the first two answers did not acknowledge it.
+        assert_eq!(seen[1].body, seen[0].body);
+        assert_eq!(seen[2].body, seen[0].body);
+    }
     tokio::time::sleep(Duration::from_millis(300)).await;
     let text = metrics.encode();
     assert!(
@@ -953,8 +954,9 @@ async fn sidecar(api: &FakeApi, dir: &std::path::Path, grace: &str) -> Process {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ctl_17_sigterm_flushes_the_pending_then_the_current_report_despite_a_long_drain() {
-    if !in_namespace("ctl_17_sigterm_flushes_the_pending_then_the_current_report_despite_a_long_drain")
-    {
+    if !in_namespace(
+        "ctl_17_sigterm_flushes_the_pending_then_the_current_report_despite_a_long_drain",
+    ) {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -1007,7 +1009,11 @@ async fn ctl_17_sigterm_with_a_silent_api_exits_within_the_grace_and_counts_the_
     process.terminate();
     let status = process.wait_exit(Duration::from_secs(10));
     assert!(status.success(), "{status}");
-    assert!(begun.elapsed() < Duration::from_secs(4), "{:?}", begun.elapsed());
+    assert!(
+        begun.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        begun.elapsed()
+    );
     let lines: Vec<serde_json::Value> = process
         .logs()
         .into_iter()

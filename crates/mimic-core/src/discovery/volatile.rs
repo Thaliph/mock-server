@@ -115,8 +115,9 @@ impl Volatility {
     }
 
     /// `target` names the field that a field is recorded under once redacted (itself, or the
-    /// field of a redacted name above it). That field is marked redacted and keeps no hash
-    /// but that of the marker; a field below it is folded into it, its `n` being the larger.
+    /// field of a redacted name above it). That field is marked redacted and holds the hash of
+    /// the marker only, as a field recorded redacted does; a field below it is folded into it,
+    /// its `n` being the larger.
     pub(super) fn redact(&mut self, target: impl Fn(&str) -> Option<String>) {
         let marker = xxh3_64(MARKER.as_bytes());
         let names: Vec<String> = self.fields.keys().cloned().collect();
@@ -134,7 +135,8 @@ impl Volatility {
                 field.n = field.n.max(from.n);
             }
             field.redacted = true;
-            field.sketch.hashes.retain(|h| *h == marker);
+            field.sketch.hashes.clear();
+            field.sketch.hashes.insert(marker);
         }
     }
 
