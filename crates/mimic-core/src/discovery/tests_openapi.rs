@@ -12,7 +12,7 @@ use super::openapi::{OPENAPI_VERSION, document, endpoint_list, index, parse_id};
 use super::redact::Redactor;
 use super::report::{Direction, Exchange, Limits, Report, merge};
 
-const LIMITS: Limits = Limits {
+pub(super) const LIMITS: Limits = Limits {
     max_literals: 32,
     max_endpoints: 256,
     sample_budget: 16 << 20,
@@ -67,7 +67,7 @@ fn validator() -> &'static Validator {
 }
 
 /// The validation errors of a document, empty when it is valid.
-fn errors(doc: &Value) -> Vec<String> {
+pub(super) fn errors(doc: &Value) -> Vec<String> {
     validator()
         .iter_errors(doc)
         .map(|e| format!("{e} at {}", e.instance_path()))
@@ -134,7 +134,7 @@ fn paths(doc: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn assert_valid(doc: &Value) {
+pub(super) fn assert_valid(doc: &Value) {
     let problems = errors(doc);
     assert!(problems.is_empty(), "{problems:?}");
 }
@@ -428,16 +428,22 @@ fn ui_05_quantile_of_an_out_of_range_bucket_does_not_panic() {
 
 #[test]
 fn ui_01_refs_outside_the_allowed_places_are_refused() {
-    let allowed = json!({"properties": {"$ref": {"type": "string"}},
-        "examples": {"sample-1": {"value": {"$ref": "http://h/x"}}}});
-    assert!(refs_ok(&allowed, false, false));
+    let allowed = json!({"schema": {"properties": {"$ref": {"type": "string"}}},
+        "examples": {"sample-1": {"value": {"$ref": "http://h/x", "a": {"$ref": 1}}}}});
+    assert!(refs_ok(&allowed));
     for bad in [
         json!({"paths": {"/x": {"get": {"$ref": "#/x"}}}}),
         json!({"content": {"$ref": {}}}),
         json!({"schema": {"$ref": "http://h/x"}}),
         json!([{"$ref": "x"}]),
+        // Neither a schema's `properties` nor an example `value`: no free subtree.
+        json!({"properties": {"$ref": {}}}),
+        json!({"example": {"$ref": 1}}),
+        json!({"schema": {"properties": {"a": {"$ref": "x"}}}}),
+        json!({"examples": {"s": {"$ref": "x"}}}),
+        json!({"examples": {"s": {"value": 1, "other": {"$ref": "x"}}}}),
     ] {
-        assert!(!refs_ok(&bad, false, false), "{bad}");
+        assert!(!refs_ok(&bad), "{bad}");
     }
 }
 
@@ -501,18 +507,46 @@ fn ui_01_top_level() {
     );
 }
 
-/// No `$ref` member other than a key of a `properties` map or inside an example value.
-fn refs_ok(v: &Value, in_properties: bool, in_example: bool) -> bool {
-    match v {
-        Value::Object(map) => map.iter().all(|(k, child)| {
-            (k != "$ref" || in_properties || in_example)
-                && refs_ok(
-                    child,
-                    k == "properties",
-                    in_example || k == "example" || k == "examples",
-                )
+/// Where a value sits in a document, for the `$ref` rule.
+#[derive(Clone, Copy, PartialEq)]
+enum At {
+    /// Anything that is none of the below: no `$ref` member at all.
+    Plain,
+    /// A schema: `properties`, `items` and `additionalProperties` hold schemas.
+    Schema,
+    /// The `properties` map of a schema: its keys are free, its values are schemas.
+    Properties,
+    /// An `examples` map of example objects.
+    Examples,
+    /// An example object: only its `value` is free.
+    Example,
+    /// An example `value`.
+    Value,
+}
+
+/// No `$ref` member other than a key of a schema's `properties` map and inside the `value` of
+/// an example: exactly those places, not whole subtrees around them.
+pub(super) fn refs_ok(v: &Value) -> bool {
+    refs_at(v, At::Plain)
+}
+
+fn refs_at(v: &Value, at: At) -> bool {
+    match (v, at) {
+        (_, At::Value) => true,
+        (Value::Object(map), _) => map.iter().all(|(k, child)| {
+            let below = match (at, k.as_str()) {
+                (At::Properties, _) => At::Schema,
+                (At::Examples, _) => At::Example,
+                (At::Example, "value") => At::Value,
+                (At::Plain, "schema") => At::Schema,
+                (At::Plain, "examples") => At::Examples,
+                (At::Schema, "properties") => At::Properties,
+                (At::Schema, "items" | "additionalProperties") => At::Schema,
+                _ => At::Plain,
+            };
+            (k != "$ref" || at == At::Properties) && refs_at(child, below)
         }),
-        Value::Array(items) => items.iter().all(|i| refs_ok(i, false, in_example)),
+        (Value::Array(items), _) => items.iter().all(|i| refs_at(i, At::Plain)),
         _ => true,
     }
 }
@@ -601,7 +635,7 @@ proptest! {
             prop_assert_eq!(&d["info"]["version"], "3");
             let title = d["info"]["title"].as_str().unwrap();
             prop_assert!(title.starts_with("ns/dep inbound :"), "{}", title);
-            prop_assert!(refs_ok(&d, false, false), "{}", text);
+            prop_assert!(refs_ok(&d), "{}", text);
         }
     }
 }

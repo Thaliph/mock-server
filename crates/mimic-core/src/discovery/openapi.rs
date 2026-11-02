@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::proxy::authority::{INVALID_AUTHORITY, normalise_authority};
 
 use super::histogram::{Bound, Histogram};
+use super::openapi_parts as parts;
 use super::redact::MARKER;
 use super::report::{Direction, Endpoint, Report, Stats};
 use super::schema::string_format;
@@ -23,7 +24,8 @@ pub const OPENAPI_VERSION: &str = "3.1.1";
 /// Most `servers` of a document.
 const MAX_SERVERS: usize = 16;
 /// `info.description`: constant, nothing recorded.
-const DESCRIPTION: &str = "Inferred by mimic from observed traffic; not an authoritative contract.";
+pub(super) const DESCRIPTION: &str =
+    "Inferred by mimic from observed traffic; not an authoritative contract.";
 /// The last day shown, 9999-12-31, in days since 1970-01-01.
 const MAX_DAY: u64 = 2_932_896;
 
@@ -123,23 +125,18 @@ pub fn document(
         return None;
     }
     let mut paths: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+    let mut schemes: BTreeMap<String, Value> = BTreeMap::new();
     for e in &endpoints {
+        // A method named `$ref` would put a `$ref` member into the document.
+        if parts::is_ref(e.method) {
+            continue;
+        }
         let key = path_key(e);
         let item = paths.entry(key.clone()).or_default();
-        let operation = operation(e, &key);
-        match METHODS.iter().find(|(upper, _)| *upper == e.method) {
-            Some((_, lower)) => {
-                item.insert((*lower).to_string(), operation);
-            }
-            None => {
-                let extra = item
-                    .entry("x-mimic-methods")
-                    .or_insert_with(|| Value::Object(Map::new()));
-                if let Value::Object(extra) = extra {
-                    extra.insert(e.method.to_string(), operation);
-                }
-            }
-        }
+        let auth = parts::schemes(e);
+        let operation = operation(e, &key, auth.keys());
+        schemes.extend(auth);
+        place(item, e.method, operation);
     }
     let paths: Map<String, Value> = paths
         .into_iter()
@@ -158,7 +155,39 @@ pub fn document(
     if !servers.is_empty() {
         doc["servers"] = servers.into();
     }
+    if !schemes.is_empty() {
+        doc["components"] = json!({ "securitySchemes": schemes });
+    }
     Some(doc)
+}
+
+/// Puts an operation into a path item: under the lower-case key of a standard method, else in
+/// `x-mimic-methods` under the method. Endpoints that share a key and a method (a gRPC and an
+/// HTTP one, literals that escape alike) never overwrite each other: the first, in the order
+/// of the report, takes the slot, the next ones are `x-mimic-methods` entries `<METHOD>#2`,
+/// `<METHOD>#3`, and so on.
+fn place(item: &mut Map<String, Value>, method: &str, operation: Value) {
+    if let Some((_, lower)) = METHODS.iter().find(|(upper, _)| *upper == method)
+        && !item.contains_key(*lower)
+    {
+        item.insert((*lower).to_string(), operation);
+        return;
+    }
+    let extra = item
+        .entry("x-mimic-methods")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(extra) = extra else {
+        return;
+    };
+    // A standard method is here because its slot is taken: it starts at `#2`.
+    let standard = METHODS.iter().any(|(upper, _)| *upper == method);
+    let name = std::iter::once(method.to_string())
+        .filter(|_| !standard)
+        .chain((2..).map(|n| format!("{method}#{n}")))
+        .find(|name| !extra.contains_key(name));
+    if let Some(name) = name {
+        extra.insert(name, operation);
+    }
 }
 
 /// `{`/`}` of a literal are percent-encoded so that a literal is never read as a parameter.
@@ -177,8 +206,10 @@ fn path_key(e: &Endpoint<'_>) -> String {
     }
 }
 
-fn operation(e: &Endpoint<'_>, key: &str) -> Value {
+fn operation<'a>(e: &Endpoint<'_>, key: &str, security: impl Iterator<Item = &'a String>) -> Value {
+    let observed = e.stats.observed().to_json();
     let mut op = Map::new();
+    let mut parameters = Vec::new();
     if e.grpc {
         let service = e.template.trim_start_matches('/').split('/').next();
         if let Some(service) = service.filter(|s| !s.is_empty()) {
@@ -186,10 +217,37 @@ fn operation(e: &Endpoint<'_>, key: &str) -> Value {
         }
         op.insert("x-mimic-grpc".into(), true.into());
     } else {
-        let parameters = path_parameters(e, key);
-        if !parameters.is_empty() {
-            op.insert("parameters".into(), parameters.into());
-        }
+        parameters = path_parameters(e, key);
+    }
+    parameters.extend(parts::parameters(e, &observed));
+    if !parameters.is_empty() {
+        op.insert("parameters".into(), parameters.into());
+    }
+    // One requirement per scheme, in byte order of its key.
+    let security: Vec<Value> = security.map(|name| json!({ name: [] })).collect();
+    if !security.is_empty() {
+        op.insert("security".into(), security.into());
+    }
+    if let Some(body) = parts::request_body(e, &observed) {
+        op.insert("requestBody".into(), body);
+    }
+    op.insert("responses".into(), parts::responses(e, &observed));
+    let fields = e.stats.observed().volatility();
+    let volatile: Vec<&str> = fields
+        .fields()
+        .into_iter()
+        .filter(|f| fields.is_volatile(f))
+        .collect();
+    let redacted: Vec<&str> = fields
+        .fields()
+        .into_iter()
+        .filter(|f| fields.is_redacted(f))
+        .collect();
+    if !volatile.is_empty() {
+        op.insert("x-mimic-volatile".into(), json!(volatile));
+    }
+    if !redacted.is_empty() {
+        op.insert("x-mimic-redacted".into(), json!(redacted));
     }
     op.insert("x-mimic-exchanges".into(), e.stats.total().into());
     if let Some(latency) = latency(&e.stats.latency) {

@@ -5,6 +5,7 @@ pub mod check;
 pub mod histogram;
 pub mod observed;
 pub mod openapi;
+mod openapi_parts;
 pub mod redact;
 pub mod report;
 pub mod sample;
@@ -24,6 +25,8 @@ mod tests_ctl;
 mod tests_followup;
 #[cfg(test)]
 mod tests_openapi;
+#[cfg(test)]
+mod tests_openapi_ops;
 #[cfg(test)]
 mod tests_samples;
 #[cfg(test)]
