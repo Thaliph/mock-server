@@ -5,6 +5,7 @@ pub mod check;
 pub mod histogram;
 pub mod observed;
 pub mod openapi;
+mod openapi_parts;
 pub mod redact;
 pub mod report;
 pub mod sample;

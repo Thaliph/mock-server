@@ -456,12 +456,17 @@ fn ui_05_security_bare_credential_is_an_api_key() {
 
 #[test]
 fn ui_05_security_scheme_outside_the_token_set_is_ignored() {
-    let d = doc(&report_of(&[
-        authorized("Bea_rer abc"),
-        authorized("Béarer abc"),
-    ]));
-    assert!(d.get("components").is_none());
-    assert!(op(&d, "/p", "get").get("security").is_none());
+    // The recorder keeps only alphanumeric schemes, so a hostile report is needed: the scheme
+    // of a stored sample is rewritten.
+    let json = report_of(&[authorized("Bearer abc")])
+        .to_json()
+        .expect("serialises");
+    for scheme in ["Bea_rer", "Béarer", "Be\\u0020arer"] {
+        let forged = json.replace("Bearer <redacted>", &format!("{scheme} <redacted>"));
+        let d = doc(&Report::from_json(&forged).expect("parses"));
+        assert!(d.get("components").is_none(), "{scheme}");
+        assert!(op(&d, "/p", "get").get("security").is_none(), "{scheme}");
+    }
 }
 
 #[test]
