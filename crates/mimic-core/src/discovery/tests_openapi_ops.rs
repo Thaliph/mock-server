@@ -508,10 +508,7 @@ fn ui_01_ref_keys_of_recorded_names_never_reach_a_reference_position() {
         ..rx("POST", "/p")
     };
     let d = doc(&report_of(&[hostile, json_body]));
-    assert!(
-        refs_ok(&d, false, false),
-        "a $ref member outside the allowed places"
-    );
+    assert!(refs_ok(&d), "a $ref member outside the allowed places");
     assert!(d["paths"]["/p"].get("x-mimic-methods").is_none());
 }
 
@@ -577,7 +574,7 @@ proptest! {
         let text = d.to_string();
         let problems = errors(&d);
         prop_assert!(problems.is_empty(), "{:?}", problems);
-        prop_assert!(refs_ok(&d, false, false));
+        prop_assert!(refs_ok(&d));
         // Merging in another grouping and order gives the same bytes (the 404 rule of the
         // recorder aside: no generated status is 404 or 405).
         let again = document(&parts, "ns", "dep", 1, "inbound-80").unwrap();
