@@ -5,7 +5,8 @@
 # UI: do that once (any content, it is replaced).
 #   WIKI_REMOTE=git@github.com:Thaliph/mock-server.wiki.git   remote of the wiki
 # The commit uses this repository's git identity (user.name, user.email), local or global.
-# Only the wiki's Markdown pages are replaced: other files there (images, attachments) are kept.
+# Only the wiki's Markdown pages are replaced: other files there (images, attachments) are kept,
+# and a page removed from docs/wiki is removed from the wiki.
 set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 remote=${WIKI_REMOTE:-git@github.com:Thaliph/mock-server.wiki.git}
@@ -14,10 +15,12 @@ email=$(git -C "$root" config user.email) || { echo "set git user.email in this 
 shopt -s nullglob
 pages=("$root"/docs/wiki/*.md)
 (( ${#pages[@]} > 0 )) || { echo "no page in $root/docs/wiki" >&2; exit 1; }
+# Never print credentials: `https://user:token@host/…` is shown as `https://***@host/…`.
+shown=$(printf '%s' "$remote" | sed -E 's#^([a-z]+://)[^/@]+@#\1***@#')
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 if ! clone_error=$(git clone -q "$remote" "$work" 2>&1); then
-  echo "cannot clone $remote: $clone_error" >&2
+  echo "cannot clone $shown: ${clone_error//$remote/$shown}" >&2
   echo "if the repository is not found, save a first page in the repository's Wiki tab once" >&2
   exit 1
 fi
@@ -31,6 +34,6 @@ if git diff --cached --quiet; then
 fi
 git -c user.name="$name" -c user.email="$email" commit -q \
   -m "Sync from docs/wiki at $(git -C "$root" rev-parse --short HEAD)"
-branch=$(git symbolic-ref --short HEAD)
+branch=$(git symbolic-ref --short HEAD) || { echo "the wiki clone has no branch checked out" >&2; exit 1; }
 git push -q origin "HEAD:$branch"
 echo "wiki published from $(git -C "$root" rev-parse --short HEAD) to $branch"
