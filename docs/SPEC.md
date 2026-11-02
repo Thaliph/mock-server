@@ -1696,7 +1696,7 @@ Sidecar integration tests use the fake sidecar API of F3. A *canary* is as in §
 Levels as in §12.2. Unit tests of §7.6 run on reports built by the recorder and the bounded
 merge (the generators of DSC and CTL tests). Documents are validated against the official
 OpenAPI 3.1 schema (`https://spec.openapis.org/oas/3.1/schema-base/2022-10-07`, vendored as a
-test fixture) with the `jsonschema` crate as a dev-dependency (default features off: no
+test fixture with the three schemas it references, unmodified, Apache-2.0, in `crates/mimic-core/tests/fixtures/oas-3.1/` with their source commit, SHA-256 and licence in its `README.md`) with the `jsonschema` crate as a dev-dependency (default features off: no
 network). Controller integration tests run against a real Valkey as in §12.6. The browser
 checks use a pinned headless Chromium image (`images/Dockerfile` stage `e2e-chromium`), run
 on the host network against the port-forward, with `--host-resolver-rules` that resolve no

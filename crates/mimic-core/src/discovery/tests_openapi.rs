@@ -415,6 +415,33 @@ fn ui_05_histogram_quantiles() {
 }
 
 #[test]
+fn ui_05_quantile_of_an_out_of_range_bucket_does_not_panic() {
+    // `from_json` alone does not run the §7.3 check, so a bucket past the overflow bucket can
+    // reach `quantile`: it counts as overflow.
+    let h: Histogram =
+        serde_json::from_str(r#"{"buckets":{"10":1,"70":1,"255":1}}"#).expect("parses");
+    assert_eq!(h.quantile(30), Some(Bound::Ms(6)));
+    for p in [50, 99, 100] {
+        assert_eq!(h.quantile(p), Some(Bound::Overflow), "p{p}");
+    }
+}
+
+#[test]
+fn ui_01_refs_outside_the_allowed_places_are_refused() {
+    let allowed = json!({"properties": {"$ref": {"type": "string"}},
+        "examples": {"sample-1": {"value": {"$ref": "http://h/x"}}}});
+    assert!(refs_ok(&allowed, false, false));
+    for bad in [
+        json!({"paths": {"/x": {"get": {"$ref": "#/x"}}}}),
+        json!({"content": {"$ref": {}}}),
+        json!({"schema": {"$ref": "http://h/x"}}),
+        json!([{"$ref": "x"}]),
+    ] {
+        assert!(!refs_ok(&bad, false, false), "{bad}");
+    }
+}
+
+#[test]
 fn ui_05_latency_in_the_operation() {
     let all: Vec<Ex> = (0..100).map(|_| ex(80, "GET", "/x")).collect();
     let d = doc(&report_of(&all), "inbound-80");
