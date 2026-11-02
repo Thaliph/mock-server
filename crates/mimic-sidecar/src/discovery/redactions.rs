@@ -4,7 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use mimic_core::discovery::redact::{Redactor, value_rule};
+use mimic_core::discovery::redact::{Redactor, segment_rule, value_rule};
+use mimic_core::discovery::schema::kept_headers;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 
@@ -19,7 +20,7 @@ fn add(counts: &mut Counts, location: &'static str, rule: &'static str) {
 
 pub(super) fn path(counts: &mut Counts, path: &str) {
     for segment in path.split('/') {
-        if let Some(rule) = value_rule(segment) {
+        if let Some(rule) = segment_rule(segment) {
             add(counts, "path", rule.as_str());
         }
     }
@@ -39,9 +40,16 @@ pub(super) fn pairs(counts: &mut Counts, redactor: &Redactor, location: &'static
     }
 }
 
+/// The redactions of the headers the report keeps (at most 64 names), URLs in values included.
 pub(super) fn headers(counts: &mut Counts, redactor: &Redactor, headers: &[(String, String)]) {
-    for (name, value) in headers {
-        field(counts, redactor, "header", name, value);
+    let pairs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    for (name, value) in kept_headers(&pairs) {
+        for rule in redactor.header_rules(&name, value) {
+            add(counts, "header", rule.as_str());
+        }
     }
 }
 
@@ -95,5 +103,44 @@ fn walk(counts: &mut Counts, redactor: &Redactor, value: &Value, depth: usize) {
             }
         }
         Value::Bool(_) | Value::Null => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln";
+
+    fn header(name: &str, value: &str) -> (String, String) {
+        (name.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn dsc_18_url_redactions_in_header_values_are_counted() {
+        let mut counts = Counts::new();
+        let location = format!("https://h/reset/{JWT}?token=T&page=2");
+        let headers = [header("Location", &location), header("Link", "<cb?code=1>")];
+        super::headers(&mut counts, &Redactor::default(), &headers);
+        assert_eq!(counts.get(&("header", "jwt")), Some(&1), "{counts:?}");
+        assert_eq!(counts.get(&("header", "name")), Some(&1), "{counts:?}");
+    }
+
+    #[test]
+    fn dsc_18_only_the_64_kept_headers_are_counted() {
+        let mut headers: Vec<_> = (0..100)
+            .map(|i| header(&format!("x-api-key-{i:03}"), "k"))
+            .collect();
+        headers.push(header("Connection", "close"));
+        let mut counts = Counts::new();
+        super::headers(&mut counts, &Redactor::default(), &headers);
+        assert_eq!(counts.get(&("header", "name")), Some(&64), "{counts:?}");
+    }
+
+    #[test]
+    fn dsc_18_percent_encoded_path_segments_are_counted() {
+        let mut counts = Counts::new();
+        path(&mut counts, &format!("/reset/%65{}", &JWT[1..]));
+        assert_eq!(counts.get(&("path", "jwt")), Some(&1), "{counts:?}");
     }
 }

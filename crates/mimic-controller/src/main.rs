@@ -3,9 +3,13 @@
 
 mod cert_manager;
 mod certs;
+mod push_config;
 mod sidecar_api;
+mod status;
+mod store;
 mod tls;
 mod tls_ca;
+mod ui;
 mod valkey;
 mod webhook;
 mod webhook_config;
@@ -34,6 +38,7 @@ struct Config {
     webhook: WebhookConfig,
     tls_ca: tls_ca::TlsCaConfig,
     sidecar_api_addr: SocketAddr,
+    push: push_config::PushConfig,
 }
 
 fn config(env: &Env) -> Result<Config, ConfigError> {
@@ -43,6 +48,7 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
         webhook: WebhookConfig::from_env(env, VERSION)?,
         tls_ca: tls_ca::TlsCaConfig::from_env(env)?,
         sidecar_api_addr: env.parse_or("MIMIC_SIDECAR_API_ADDR", DEFAULT_SIDECAR_API)?,
+        push: push_config::PushConfig::from_env(env)?,
     })
 }
 
@@ -74,6 +80,8 @@ async fn run(config: Config) -> std::io::Result<()> {
     let cert_metrics = cert_manager::CertMetrics::register(metrics.registry_mut());
     let api_metrics = sidecar_api::ApiMetrics::register(metrics.registry_mut());
     let seed_metrics = tls_ca::SeedMetrics::register(metrics.registry_mut());
+    let store_metrics = store::StoreMetrics::register(metrics.registry_mut());
+    let status_metrics = status::StatusMetrics::register(metrics.registry_mut());
     let metrics = Arc::new(metrics);
     let webhook = config.webhook;
     tracing::info!(
@@ -107,6 +115,19 @@ async fn run(config: Config) -> std::io::Result<()> {
             cert_manager::manage(client, certificates, cert, cert_metrics).await;
         }
     });
+    let store = store::Store::new(config.valkey.clone(), config.push.store, store_metrics);
+    let ui_router = ui::router(store.clone());
+    tokio::spawn(
+        status::Reconciler {
+            store: store.clone(),
+            cache: cache.clone(),
+            sink: Arc::new(status::KubeSink::new(kube_client.clone())),
+            metrics: status_metrics,
+            window: config.push.pod_window,
+            down: Default::default(),
+        }
+        .run(config.push.status_interval),
+    );
     let health = valkey::Health::spawn(config.valkey);
     let readiness = Readiness::new({
         let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
@@ -136,7 +157,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     let admission = Arc::new(webhook::Admission {
         controller_namespace: webhook.namespace,
         inject: webhook.inject,
-        cache,
+        cache: cache.clone(),
         seed: seed.clone(),
         cert: cert.clone(),
         roots: webhook::RootCache::default(),
@@ -147,6 +168,13 @@ async fn run(config: Config) -> std::io::Result<()> {
         reviewer: Arc::new(sidecar_api::KubeReviewer::new(kube_client)),
         metrics: api_metrics,
         limiter: sidecar_api::ReviewLimiter::default(),
+        rate: sidecar_api::RateLimiter::new(config.push.rate),
+        reviews: sidecar_api::ReviewCache::default(),
+        budget: sidecar_api::BodyBudget::new(config.push.body_budget),
+        store,
+        workloads: cache.clone(),
+        max_report: config.push.max_report,
+        max_push_endpoints: config.push.max_push_endpoints,
     });
     let webhook_listener = tokio::net::TcpListener::bind(webhook.addr).await?;
     tracing::info!(addr = %webhook_listener.local_addr()?, "webhook listening");
@@ -176,6 +204,11 @@ async fn run(config: Config) -> std::io::Result<()> {
         shutdown.clone().wait(),
     );
 
+    // Plain HTTP, loopback peers only (spec §7.5).
+    let ui_listener = tokio::net::TcpListener::bind(config.push.ui_addr).await?;
+    tracing::info!(addr = %ui_listener.local_addr()?, "read api listening");
+    let ui_server = admin::serve_until(ui_listener, ui_router, grace, shutdown.clone().wait());
+
     let listener = admin::bind(config.common.admin_addr).await?;
     let admin_server = admin::serve_until(
         listener,
@@ -183,6 +216,6 @@ async fn run(config: Config) -> std::io::Result<()> {
         grace,
         shutdown.wait(),
     );
-    tokio::try_join!(webhook_server, api_server, admin_server)?;
+    tokio::try_join!(webhook_server, api_server, ui_server, admin_server)?;
     Ok(())
 }

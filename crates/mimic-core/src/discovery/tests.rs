@@ -303,8 +303,8 @@ proptest! {
         prop_assert_eq!(&left, &whole);
         prop_assert_eq!(left.exchanges(), items.len() as u64);
         // Serialisation is canonical and round-trips.
-        let json = whole.to_json();
-        prop_assert_eq!(&json, &left.to_json());
+        let json = whole.to_json().unwrap();
+        prop_assert_eq!(&json, &left.to_json().unwrap());
         prop_assert_eq!(Report::from_json(&json).unwrap(), whole);
     }
 }
@@ -325,9 +325,9 @@ fn dsc_09_json_shape() {
     let mut e = ex("/u/1", 200, 3);
     e.host = Some("svc");
     let r = report_of(&limits(3), &[e]);
-    let json = r.to_json();
+    let json = r.to_json().unwrap();
     assert!(json.contains("\"version\":1"), "{json}");
-    assert_eq!(json, r.clone().to_json());
+    assert_eq!(json, r.clone().to_json().unwrap());
     assert_eq!(Report::from_json(&json).unwrap(), r);
     assert!(Report::from_json(&json.replace("\"version\":1", "\"version\":2")).is_err());
 }
@@ -590,7 +590,7 @@ mod redaction {
         };
         let mut report = Report::new(None);
         report.record(&super::limits(50), &Redactor::default(), &exchange);
-        let json = report.to_json();
+        let json = report.to_json().unwrap();
         assert!(!json.contains(JWT), "{json}");
         assert!(json.contains("/pkg.Svc/<redacted>"), "{json}");
         // Not templated: an id-like segment stays literal.
@@ -602,7 +602,7 @@ mod redaction {
                 ..super::ex("/pkg.Svc/42", 200, 1)
             },
         );
-        assert!(report.to_json().contains("/pkg.Svc/42"));
+        assert!(report.to_json().unwrap().contains("/pkg.Svc/42"));
     }
 
     #[test]

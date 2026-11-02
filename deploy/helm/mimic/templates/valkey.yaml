@@ -55,7 +55,18 @@ spec:
           imagePullPolicy: IfNotPresent
           command: ["valkey-server"]
           # $(VALKEY_PASSWORD) is expanded by the kubelet; it never appears in the pod spec.
-          args: ["--dir", "/data", "--appendonly", "yes", "--requirepass", "$(VALKEY_PASSWORD)"]
+          # maxmemory is 75 % of the memory limit; noeviction makes a full store refuse writes (spec §7.3).
+          args:
+            - --dir
+            - /data
+            - --appendonly
+            - "yes"
+            - --requirepass
+            - $(VALKEY_PASSWORD)
+            - --maxmemory
+            - {{ include "mimic.valkeyMaxmemory" . | quote }}
+            - --maxmemory-policy
+            - noeviction
           env:
             - name: VALKEY_PASSWORD
               valueFrom:
@@ -92,6 +103,12 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if not .Values.valkey.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.valkey.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -103,6 +120,7 @@ spec:
         resources:
           requests:
             storage: {{ .Values.valkey.persistence.size }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: Service

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::redact::value_rule;
+use super::redact::segment_rule;
 
 /// One segment of a template.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,7 +25,7 @@ pub fn is_param(segment: &str) -> bool {
         || (b.len() >= 8 && has_digit && b.iter().all(u8::is_ascii_hexdigit))
         || is_rfc3339(b)
         || (segment.chars().count() >= 16 && has_letter && has_digit)
-        || value_rule(segment).is_some()
+        || segment_rule(segment).is_some()
         || b.contains(&b'@')
 }
 

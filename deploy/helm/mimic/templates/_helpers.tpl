@@ -71,6 +71,21 @@ guarded with has(); dyn() keeps the map literal heterogeneous.
 {{ .Values.valkey.existingSecret | default (printf "%s-valkey" .Release.Name) }}
 {{- end -}}
 
+{{/*
+Valkey maxmemory in bytes: 75 % of valkey.resources.limits.memory (spec §7.3). The limit is a whole
+number with an optional binary (Ki, Mi, Gi, Ti) or decimal (K, M, G, T) suffix, as Kubernetes writes it.
+*/}}
+{{- define "mimic.valkeyMaxmemory" -}}
+{{- $limit := required "valkey.resources.limits.memory is required" .Values.valkey.resources.limits.memory | toString -}}
+{{- if not (regexMatch "^[1-9][0-9]*(Ki|Mi|Gi|Ti|K|M|G|T)?$" $limit) -}}
+{{- fail (printf "valkey.resources.limits.memory %q is not a whole quantity such as 1Gi" $limit) -}}
+{{- end -}}
+{{- $num := regexFind "^[0-9]+" $limit -}}
+{{- $unit := trimPrefix $num $limit -}}
+{{- $multiplier := dict "" 1 "K" 1000 "M" 1000000 "G" 1000000000 "T" 1000000000000 "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776 -}}
+{{- div (mul (mul (int64 $num) (index $multiplier $unit)) 3) 4 -}}
+{{- end -}}
+
 {{/* Pod Security "restricted" container settings (spec §11). */}}
 {{- define "mimic.containerSecurity" -}}
 allowPrivilegeEscalation: false

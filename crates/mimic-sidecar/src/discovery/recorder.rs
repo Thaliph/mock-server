@@ -4,6 +4,8 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -11,6 +13,7 @@ use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::{Direction, Exchange, Limits, Outcome, Report, Sampled};
 
+use super::Handoff;
 use super::capture::{Part, Record};
 use super::decode;
 use super::metrics::DiscoveryMetrics;
@@ -28,6 +31,9 @@ pub(super) struct Recorder {
     pub(super) limits: Limits,
     pub(super) redactor: Redactor,
     pub(super) metrics: DiscoveryMetrics,
+    /// What the shipper hands over: sample bytes of the pending report, and the freezes.
+    handoff: Arc<Handoff>,
+    epoch: u64,
     /// Endpoints of the report as of the last change of its shape.
     known: BTreeSet<Key>,
     sample_budget_full: bool,
@@ -184,12 +190,15 @@ impl Recorder {
         limits: Limits,
         redactor: Redactor,
         metrics: DiscoveryMetrics,
+        handoff: Arc<Handoff>,
     ) -> Recorder {
         Recorder {
             report,
             limits,
             redactor,
             metrics,
+            handoff,
+            epoch: 0,
             known: BTreeSet::new(),
             sample_budget_full: false,
             endpoint_limit_logged: false,
@@ -199,7 +208,18 @@ impl Recorder {
 
     pub(super) fn run(mut self, queue: Receiver<Record>) {
         for record in queue {
-            self.record(&record);
+            let direction = label(record.direction);
+            self.guarded(direction, |recorder| recorder.record(&record));
+        }
+    }
+
+    /// Runs `f` for one exchange. A panic is logged and counted, the exchange is skipped and
+    /// the recorder goes on: it is the only writer of the report. The report is updated by
+    /// one merge at the end of an exchange, so it is not left half-written.
+    fn guarded(&mut self, direction: &'static str, f: impl FnOnce(&mut Self)) {
+        if catch_unwind(AssertUnwindSafe(|| f(self))).is_err() {
+            self.metrics.exchange(direction, "panic");
+            tracing::error!(target: "discovery", direction, "recorder panic");
         }
     }
 
@@ -251,9 +271,19 @@ impl Recorder {
                     .and_then(|(_, bytes)| bytes.as_deref()),
             },
         };
-        let (outcome, endpoints, sample_bytes) = {
+        let (outcome, endpoints, sample_bytes, limits, epoch) = {
             let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
-            let outcome = report.record(&self.limits, &self.redactor, &exchange);
+            // Read under the lock, where the shipper writes them: the pending report's samples
+            // share the budget.
+            let epoch = self.handoff.epoch.load(Ordering::Acquire);
+            let limits = Limits {
+                sample_budget: self
+                    .limits
+                    .sample_budget
+                    .saturating_sub(self.handoff.pending_samples.load(Ordering::Acquire)),
+                ..self.limits
+            };
+            let outcome = report.record(&limits, &self.redactor, &exchange);
             let new_endpoint = matches!(
                 outcome,
                 Outcome::Recorded {
@@ -268,8 +298,9 @@ impl Recorder {
                     .map(|e| (e.direction, e.port, e.method.to_string(), e.template))
                     .collect::<BTreeSet<Key>>()
             });
-            (outcome, endpoints, report.sample_bytes())
+            (outcome, endpoints, report.sample_bytes(), limits, epoch)
         };
+        self.restart_shape(epoch);
         match outcome {
             Outcome::Invalid => self.metrics.exchange(direction, "invalid"),
             Outcome::NotFound => self.metrics.exchange(direction, "not_found"),
@@ -297,7 +328,7 @@ impl Recorder {
                     request_body.as_ref().and_then(|(_, b)| b.as_deref()),
                     response_body.as_ref().and_then(|(_, b)| b.as_deref()),
                 );
-                self.samples(direction, sample, sample_bytes);
+                self.samples(direction, sample, sample_bytes, limits.sample_budget);
                 if let Some(endpoints) = endpoints {
                     self.shape_changed(record, &request, endpoints);
                 }
@@ -309,8 +340,15 @@ impl Recorder {
         self.sample_bytes = sample_bytes;
     }
 
-    fn samples(&mut self, direction: &'static str, sample: Sampled, sample_bytes: usize) {
-        if sample_bytes < self.sample_bytes {
+    fn samples(
+        &mut self,
+        direction: &'static str,
+        sample: Sampled,
+        sample_bytes: usize,
+        sample_budget: usize,
+    ) {
+        // A rejection says nothing about room: only an exchange that was not rejected re-arms.
+        if sample != Sampled::Budget && rearmed(sample_bytes, sample_budget) {
             self.sample_budget_full = false;
         }
         match sample {
@@ -322,13 +360,28 @@ impl Recorder {
                     tracing::warn!(
                         target: "discovery",
                         direction,
-                        sample_budget = self.limits.sample_budget,
+                        sample_budget,
                         "sample budget full"
                     );
                 }
             }
             Sampled::None => {}
         }
+    }
+
+    /// The shipper froze the report since the last exchange: the tree starts anew, so the
+    /// shape known so far (and its gauges) is not the report's any more.
+    fn restart_shape(&mut self, epoch: u64) {
+        if epoch == self.epoch {
+            return;
+        }
+        self.epoch = epoch;
+        for d in [Direction::Inbound, Direction::Outbound] {
+            if self.known.iter().any(|(k, ..)| *k == d) {
+                self.metrics.set_endpoints(label(d), 0);
+            }
+        }
+        self.known.clear();
     }
 
     /// A new endpoint was recorded: the template tree changed, and may have absorbed a node.
@@ -413,5 +466,63 @@ impl Recorder {
         for ((location, rule), n) in counts {
             self.metrics.redaction(location, rule, n);
         }
+    }
+}
+
+/// Whether the samples fell far enough below the budget (under 7/8 of it) for the
+/// `sample budget full` line to be due again when the budget fills anew. A merge that swaps a
+/// sample for a slightly smaller one does not count.
+fn rearmed(sample_bytes: usize, sample_budget: usize) -> bool {
+    sample_bytes < sample_budget - sample_budget / 8
+}
+
+#[cfg(test)]
+mod tests {
+    use mimic_runtime::metrics::Metrics;
+
+    use super::*;
+
+    fn recorder(metrics: &DiscoveryMetrics) -> Recorder {
+        Recorder::new(
+            Arc::new(Mutex::new(Report::new(None))),
+            Limits {
+                max_literals: 32,
+                max_endpoints: 4,
+                sample_budget: 1 << 20,
+            },
+            Redactor::default(),
+            metrics.clone(),
+            Arc::default(),
+        )
+    }
+
+    #[test]
+    fn dsc_18_a_recorder_panic_is_counted_and_the_recorder_goes_on() {
+        let metrics = DiscoveryMetrics::default();
+        let mut registry = Metrics::new("sidecar", "test");
+        metrics.register(&mut registry);
+        let mut recorder = recorder(&metrics);
+        recorder.guarded("inbound", |_| panic!("boom"));
+        let mut ran = false;
+        recorder.guarded("inbound", |_| ran = true);
+        assert!(ran);
+        let text = registry.encode();
+        assert!(
+            text.contains(
+                "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"panic\"} 1"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn dsc_18_the_budget_warning_is_rearmed_only_when_samples_were_freed() {
+        let budget = 1000;
+        assert!(!rearmed(1000, budget));
+        // Merging replaces a sample with a slightly smaller one: still full.
+        assert!(!rearmed(990, budget));
+        assert!(!rearmed(875, budget));
+        assert!(rearmed(874, budget));
+        assert!(rearmed(0, budget));
     }
 }

@@ -5,6 +5,7 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::registry::Unit;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct ExchangeLabels {
@@ -36,6 +37,11 @@ struct DirectionLabels {
     direction: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ResultLabel {
+    result: &'static str,
+}
+
 /// Shared by the taps (which count what they drop) and the recorder. Unregistered until
 /// [`DiscoveryMetrics::register`].
 #[derive(Clone, Default)]
@@ -46,10 +52,16 @@ pub struct DiscoveryMetrics {
     redactions: Family<RedactionLabels, Counter>,
     endpoints: Family<DirectionLabels, Gauge>,
     sample_bytes: Gauge,
+    pushes: Family<ResultLabel, Counter>,
+    last_push: Gauge,
 }
 
 impl DiscoveryMetrics {
     pub fn register(&self, metrics: &mut Metrics) {
+        // Every series exists from the start, at 0.
+        for result in ["ok", "duplicate", "too_large", "rejected", "error"] {
+            let _ = self.pushes.get_or_create(&ResultLabel { result });
+        }
         let registry = metrics.registry_mut();
         registry.register(
             "discovery_exchanges",
@@ -80,6 +92,17 @@ impl DiscoveryMetrics {
             "discovery_sample_bytes",
             "Bytes held by samples",
             self.sample_bytes.clone(),
+        );
+        registry.register(
+            "discovery_pushes",
+            "Settled or failed report push attempts, by result",
+            self.pushes.clone(),
+        );
+        registry.register_with_unit(
+            "discovery_last_push_timestamp",
+            "Time of the last acknowledged push, 0 before",
+            Unit::Seconds,
+            self.last_push.clone(),
         );
     }
 
@@ -119,5 +142,14 @@ impl DiscoveryMetrics {
 
     pub(super) fn set_sample_bytes(&self, n: usize) {
         self.sample_bytes.set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+
+    pub(super) fn push(&self, result: &'static str) {
+        self.pushes.get_or_create(&ResultLabel { result }).inc();
+    }
+
+    pub(super) fn set_last_push(&self, unix_seconds: u64) {
+        self.last_push
+            .set(i64::try_from(unix_seconds).unwrap_or(i64::MAX));
     }
 }

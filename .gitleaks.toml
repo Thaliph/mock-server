@@ -1,0 +1,12 @@
+# gitleaks configuration: the default rules, minus Rust test files, whose fake JWTs, cards and
+# token prefixes are redaction canaries (#294). Production code and every other file stay scanned.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "redaction canaries in Rust tests"
+paths = [
+  '''(^|/)crates/[^/]+/tests/.+\.rs$''',
+  '''(^|/)crates/[^/]+/src/(.+/)?(tests?|[a-z0-9_]+_tests|tests_[a-z0-9_]+)\.rs$''',
+  '''(^|/)crates/[^/]+/src/(.+/)?tests/.+\.rs$''',
+]

@@ -75,3 +75,46 @@ fn fnd_01_secrets_are_never_echoed_in_errors() {
     let err = env(&[]).required("MIMIC_VALKEY_PASSWORD").unwrap_err();
     assert!(!err.to_string().contains("hunter2"));
 }
+
+#[test]
+fn ctl_14_durations_take_the_suffixes_ms_s_m_h_and_d() {
+    for (value, expected) in [
+        ("500ms", Duration::from_millis(500)),
+        ("10s", Duration::from_secs(10)),
+        ("1m", Duration::from_secs(60)),
+        ("2h", Duration::from_secs(7200)),
+        ("30d", Duration::from_secs(30 * 86_400)),
+        ("0m", Duration::ZERO),
+    ] {
+        let parsed = env(&[("MIMIC_SHUTDOWN_GRACE", value)])
+            .duration_or("MIMIC_SHUTDOWN_GRACE", Duration::from_secs(1))
+            .unwrap_or_else(|e| panic!("{value}: {e}"));
+        assert_eq!(parsed, expected, "{value}");
+    }
+}
+
+#[test]
+fn ctl_14_bad_duration_suffixes_and_numbers_are_refused() {
+    for value in [
+        "1w",
+        "30",
+        "d",
+        "m",
+        "1.5h",
+        "-1m",
+        "+1m",
+        "1 m",
+        "1M",
+        "1D",
+        "1mm",
+        "18446744073709551615d",
+        "5é",
+        "é",
+        "1ms\u{e9}",
+        "10秒",
+    ] {
+        let result = env(&[("MIMIC_SHUTDOWN_GRACE", value)])
+            .duration_or("MIMIC_SHUTDOWN_GRACE", Duration::from_secs(1));
+        assert!(result.is_err(), "{value:?} was accepted");
+    }
+}

@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 02a91eb00bbe3805d24a1b980f45d2d77689d3fab2e4dbb67bf7e441270a581d # shrinks to items = [], cut1 = 0, cut2 = 0, max_literals = 1
+cc afd17ea423f250f41846a3ce754f11fd7777910e8a131c2f9bc3a56df28d0ca8 # shrinks to left = [], right = [], max_endpoints = 1, extra = 0
+cc 2fba4cb12cd969ef7baa507140174f6745e95938f88fc309f50358cae84e4450 # shrinks to left = [], right = [], max_literals = 1
+cc 920ba881aafe13d69aeb0bc707db93a0eb9320a255edb99e64064076dcdb812b # shrinks to items = [Item { path: "/a", status: 200, query: "", times: 1 }, Item { path: "/a", status: 200, query: "", times: 1 }, Item { path: "/a", status: 200, query: "", times: 1 }, Item { path: "/a", status: 200, query: "", times: 1 }, Item { path: "/a", status: 200, query: "", times: 1 }, Item { path: "/a", status: 200, query: "", times: 1 }, Item { path: "/a", status: 200, query: "", times: 1 }, Item { path: "/c/d/e", status: 500, query: "", times: 1 }, Item { path: "/a", status: 200, query: "", times: 1 }, Item { path: "/c/d/e", status: 404, query: "", times: 1 }], cut1 = 8, cut2 = 0, max_literals = 1

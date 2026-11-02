@@ -1759,6 +1759,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x509-parser",
+ "xxhash-rust",
  "zeroize",
 ]
 
@@ -1820,6 +1821,7 @@ dependencies = [
  "nix",
  "percent-encoding",
  "prometheus-client",
+ "rand",
  "rcgen",
  "reqwest",
  "rustls",

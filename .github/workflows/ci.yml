@@ -61,6 +61,22 @@ jobs:
     needs: lint
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      # Real-Valkey tests of the discovery store (spec §7.3) use this service container.
+      MIMIC_TEST_VALKEY_URL: redis://127.0.0.1:6379
+    # Valkey: the image and digest of images/Dockerfile (stage valkey, scripts/pinned-image.sh valkey).
+    services:
+      valkey:
+        image: docker.io/valkey/valkey:9.0-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

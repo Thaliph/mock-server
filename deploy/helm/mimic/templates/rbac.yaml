@@ -11,6 +11,10 @@ rules:
   - apiGroups: [mimic.platform.io]
     resources: [mimicworkloads]
     verbs: [get, list, watch]
+  # The status of a MimicWorkload (spec §7.4), by server-side apply; no update of the object itself.
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicworkloads/status]
+    verbs: [patch]
   - apiGroups: [admissionregistration.k8s.io]
     resources: [mutatingwebhookconfigurations]
     # list and watch are limited by name too: the controller watches only its own configuration.

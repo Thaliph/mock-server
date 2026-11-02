@@ -154,7 +154,7 @@ async fn dsc_13_bodies_are_decoded_within_the_limit() {
             "{result}:\n{text}"
         );
     }
-    let json = discovery.report().to_json();
+    let json = discovery.report().to_json().unwrap();
     // `br` is not decoded: its content never reaches the report.
     assert!(!json.contains("brotli"), "{json}");
     for name in ["gzip", "deflate"] {

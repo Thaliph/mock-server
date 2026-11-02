@@ -9,7 +9,8 @@ use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::redact::Redactor;
+use super::check::Violation;
+use super::redact::{MARKER, Redactor};
 use super::template::{is_rfc3339, is_uuid};
 
 /// Levels described; a value deeper than this is `{}` (the root is level 1).
@@ -151,6 +152,7 @@ impl Formats {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Object {
     props: BTreeMap<String, Schema>,
     required: BTreeSet<String>,
@@ -220,6 +222,7 @@ fn merge_all(schemas: impl Iterator<Item = Schema>) -> Schema {
 
 /// A JSON Schema (2020-12 subset) inferred from the values seen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Schema {
     kinds: BTreeSet<Kind>,
     format: Formats,
@@ -257,6 +260,32 @@ impl Schema {
         let mut s = Self::infer_at(value, 1);
         s.fit(MAX_LEVEL);
         s
+    }
+
+    /// The schema of the marker: what a value under a redacted name is recorded as.
+    fn marker() -> Self {
+        Self::infer(&Value::String(MARKER.to_string()))
+    }
+
+    /// Replaces what sits under a redacted property name by the schema of the marker, as the
+    /// recorder does (spec §7.3, re-redaction).
+    pub(super) fn redact_names(&mut self, redactor: &Redactor) {
+        if let Some(items) = &mut self.items {
+            items.redact_names(redactor);
+        }
+        let Some(object) = &mut self.object else {
+            return;
+        };
+        for (name, schema) in &mut object.props {
+            if redactor.name_matches(name) {
+                *schema = Self::marker();
+            } else {
+                schema.redact_names(redactor);
+            }
+        }
+        if let Some(map) = &mut object.map {
+            map.redact_names(redactor);
+        }
     }
 
     /// Cuts the schema at the deepest level, at most `max`, where it has at most
@@ -366,6 +395,56 @@ impl Schema {
         s
     }
 
+    /// Within the bounds of spec §6: at most `MAX_NODES` nodes and `MAX_LEVEL` levels, a cut
+    /// level of at most `MAX_LEVEL`, names of at most `MAX_NAME` bytes. The `{}` that stands
+    /// where a deeper value was cut away is not a level.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        self.check_node()?;
+        if self.levels() > MAX_LEVEL {
+            return Err(Violation::SchemaLevels);
+        }
+        if self.weight(1, usize::MAX) > MAX_NODES as u64 {
+            return Err(Violation::SchemaNodes);
+        }
+        Ok(())
+    }
+
+    fn check_node(&self) -> Result<(), Violation> {
+        if usize::from(self.cut) > MAX_LEVEL {
+            return Err(Violation::SchemaCut);
+        }
+        if let Some(items) = &self.items {
+            items.check_node()?;
+        }
+        if let Some(o) = &self.object {
+            let names = o.props.keys().chain(&o.required);
+            if names.into_iter().any(|n| n.len() > MAX_NAME) {
+                return Err(Violation::NameLength);
+            }
+            for v in o.props.values().chain(o.map.as_deref()) {
+                v.check_node()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn levels(&self) -> usize {
+        if self.kinds.is_empty() && self.items.is_none() && self.object.is_none() {
+            return 0;
+        }
+        let object = self.object.iter().flat_map(|o| {
+            o.props
+                .values()
+                .map(Schema::levels)
+                .chain(o.map.as_deref().map(Schema::levels))
+        });
+        let below = object
+            .chain(self.items.as_deref().map(Schema::levels))
+            .max()
+            .unwrap_or(0);
+        1 + below
+    }
+
     /// Nodes of the schema, counted as the 512-node cap counts them (spec §6).
     #[cfg(test)]
     pub(super) fn nodes(&self) -> usize {
@@ -458,6 +537,7 @@ impl Schema {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Param {
     /// Exchanges that had the key.
     count: u64,
@@ -468,6 +548,7 @@ struct Param {
 
 /// Keyed values of one kind (query keys, form fields or headers) over many exchanges.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Params {
     exchanges: u64,
     keys: BTreeMap<String, Param>,
@@ -503,21 +584,46 @@ pub(super) fn query_pairs(redactor: &Redactor, query: &str) -> Vec<Pair> {
 
 /// The pairs of a header list: names in lower case, skipped names absent, values redacted.
 pub(super) fn header_pairs(redactor: &Redactor, headers: &[(&str, &str)]) -> Vec<Pair> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let key = name.to_ascii_lowercase();
-            if key.starts_with(':') || SKIPPED_HEADERS.contains(&key.as_str()) {
-                return None;
-            }
-            let value = redactor.header(&key, value);
-            let key = cut_name(&key).to_string();
-            Some(Pair { key, value })
+    kept_headers(headers)
+        .into_iter()
+        .map(|(key, value)| Pair {
+            value: redactor.header(&key, value),
+            key: cut_name(&key).to_string(),
         })
         .collect()
 }
 
+/// The headers a report keeps, in arrival order, with lower-case names: the skipped names and
+/// pseudo-headers are absent, and only those of the first `MAX_PARAMS` names (cut to 128
+/// bytes) in byte order are left. What is counted or redacted must be limited to these.
+pub fn kept_headers<'a>(headers: &[(&'a str, &'a str)]) -> Vec<(String, &'a str)> {
+    let mut kept: Vec<(String, &'a str)> = headers
+        .iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), *value))
+        .filter(|(key, _)| !key.starts_with(':') && !SKIPPED_HEADERS.contains(&key.as_str()))
+        .collect();
+    let names: BTreeSet<&str> = kept.iter().map(|(key, _)| cut_name(key)).collect();
+    if names.len() > MAX_PARAMS {
+        let first: BTreeSet<String> = names
+            .into_iter()
+            .take(MAX_PARAMS)
+            .map(str::to_string)
+            .collect();
+        kept.retain(|(key, _)| first.contains(cut_name(key)));
+    }
+    kept
+}
+
 impl Params {
+    /// Gives a key under a redacted name the schema of the marker.
+    pub(super) fn redact_names(&mut self, redactor: &Redactor) {
+        for (name, param) in &mut self.keys {
+            if redactor.name_matches(name) {
+                param.schema = Schema::marker();
+            }
+        }
+    }
+
     /// A query string or an `application/x-www-form-urlencoded` body.
     pub fn from_query(redactor: &Redactor, query: &str) -> Self {
         Self::from_pairs(&query_pairs(redactor, query))
@@ -556,11 +662,11 @@ impl Params {
     }
 
     pub fn merge(mut self, other: Self) -> Self {
-        self.exchanges += other.exchanges;
+        self.exchanges = self.exchanges.saturating_add(other.exchanges);
         for (k, p) in other.keys {
             let merged = match self.keys.remove(&k) {
                 Some(mine) => Param {
-                    count: mine.count + p.count,
+                    count: mine.count.saturating_add(p.count),
                     array: mine.array || p.array,
                     schema: mine.schema.merge(p.schema),
                 },
@@ -572,6 +678,20 @@ impl Params {
             self.keys.pop_last();
         }
         self
+    }
+
+    /// At most `MAX_PARAMS` keys of at most `MAX_NAME` bytes, each with a valid schema.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        if self.keys.len() > MAX_PARAMS {
+            return Err(Violation::Params);
+        }
+        for (key, param) in &self.keys {
+            if key.len() > MAX_NAME {
+                return Err(Violation::NameLength);
+            }
+            param.schema.check()?;
+        }
+        Ok(())
     }
 
     pub fn to_json(&self) -> Value {

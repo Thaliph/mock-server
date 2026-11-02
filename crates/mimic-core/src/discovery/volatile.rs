@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::check::Violation;
 use super::redact::MARKER;
 
 /// Hashes kept per field.
@@ -16,6 +17,7 @@ pub const MAX_FIELDS: usize = 128;
 
 /// The 32 smallest distinct hashes seen.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sketch {
     hashes: BTreeSet<u64>,
 }
@@ -58,6 +60,7 @@ impl Sketch {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Field {
     n: u64,
     redacted: bool,
@@ -72,13 +75,25 @@ impl Field {
 
 /// The tracked fields of one endpoint, at most 128 (the first in byte order).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Volatility {
     fields: BTreeMap<String, Field>,
 }
 
 impl Volatility {
-    /// One observation. A redacted field hashes the constant marker, never the value.
+    /// The first observation of a field in an exchange. A redacted field hashes the constant
+    /// marker, never the value.
     pub fn observe(&mut self, field: &str, value: &str, redacted: bool) {
+        self.add(field, value, redacted, true);
+    }
+
+    /// Another value of a field already observed in the same exchange (an array item, a
+    /// repeated header): it goes to the sketch, `n` does not change.
+    pub fn observe_again(&mut self, field: &str, value: &str, redacted: bool) {
+        self.add(field, value, redacted, false);
+    }
+
+    fn add(&mut self, field: &str, value: &str, redacted: bool, first: bool) {
         if !self.fields.contains_key(field) {
             if self.fields.len() >= MAX_FIELDS {
                 match self.fields.last_key_value() {
@@ -91,10 +106,46 @@ impl Volatility {
             self.fields.insert(field.to_string(), Field::default());
         }
         if let Some(f) = self.fields.get_mut(field) {
-            f.n += 1;
+            if first {
+                f.n = f.n.saturating_add(1);
+            }
             f.redacted |= redacted;
             f.sketch.insert(if redacted { MARKER } else { value });
         }
+    }
+
+    /// `target` names the field that a field is recorded under once redacted (itself, or the
+    /// field of a redacted name above it). That field is marked redacted and keeps no hash
+    /// but that of the marker; a field below it is folded into it, its `n` being the larger.
+    pub(super) fn redact(&mut self, target: impl Fn(&str) -> Option<String>) {
+        let marker = xxh3_64(MARKER.as_bytes());
+        let names: Vec<String> = self.fields.keys().cloned().collect();
+        for name in names {
+            let Some(into) = target(&name) else {
+                continue;
+            };
+            let from = if into == name {
+                None
+            } else {
+                self.fields.remove(&name)
+            };
+            let field = self.fields.entry(into).or_default();
+            if let Some(from) = from {
+                field.n = field.n.max(from.n);
+            }
+            field.redacted = true;
+            field.sketch.hashes.retain(|h| *h == marker);
+        }
+    }
+
+    /// The fields that are not the same in `other`, in either.
+    pub(super) fn changed(&self, other: &Self) -> BTreeSet<String> {
+        self.fields
+            .keys()
+            .chain(other.fields.keys())
+            .filter(|name| self.fields.get(*name) != other.fields.get(*name))
+            .cloned()
+            .collect()
     }
 
     pub fn merge(mut self, other: Self) -> Self {
@@ -104,7 +155,7 @@ impl Volatility {
                     self.fields.insert(
                         name,
                         Field {
-                            n: mine.n + f.n,
+                            n: mine.n.saturating_add(f.n),
                             redacted: mine.redacted || f.redacted,
                             sketch: mine.sketch.merge(f.sketch),
                         },
@@ -119,6 +170,17 @@ impl Volatility {
             self.fields.pop_last();
         }
         self
+    }
+
+    /// At most `MAX_FIELDS` fields, each with at most `SKETCH` hashes.
+    pub(super) fn check(&self) -> Result<(), Violation> {
+        if self.fields.len() > MAX_FIELDS {
+            return Err(Violation::VolatileFields);
+        }
+        if self.fields.values().any(|f| f.sketch.len() > SKETCH) {
+            return Err(Violation::Sketch);
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -137,6 +199,11 @@ impl Volatility {
     /// `n ≥ 3` and distinct values ≥ `n / 2`.
     pub fn is_volatile(&self, field: &str) -> bool {
         self.fields.get(field).is_some_and(Field::volatile)
+    }
+
+    /// Hashes held for a field; `None` when it is not tracked.
+    pub fn sketch_len(&self, field: &str) -> Option<usize> {
+        self.fields.get(field).map(|f| f.sketch.len())
     }
 
     pub fn is_redacted(&self, field: &str) -> bool {

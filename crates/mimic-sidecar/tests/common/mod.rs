@@ -177,6 +177,9 @@ impl io::Write for Sink {
     }
 }
 
+/// A test that runs a recorder, or any other thread that logs, must capture too: a callsite
+/// first hit while no dispatcher exists can stay disabled for the tests that follow, and their
+/// events are lost.
 pub fn capture_logs() -> Logs {
     let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (dispatch, handle) = mimic_runtime::logging::build("info", Sink(buf.clone()));
@@ -188,6 +191,27 @@ pub fn capture_logs() -> Logs {
 }
 
 impl Logs {
+    /// Waits until the log worker has written every line emitted so far. The worker thread
+    /// drains its queue asynchronously and a loaded machine can starve it for a long time, so
+    /// no sleep is long enough: a marker line is emitted and awaited, and the queue is in
+    /// order. Fails if a line was dropped.
+    pub async fn settled(&self) {
+        static MARKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = format!(
+            "log-sync-{}",
+            MARKERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        tracing::info!(target: "sync", marker = %id, "log sync");
+        for _ in 0..1000 {
+            if self.text().contains(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(self.text().contains(&id), "the log worker did not catch up");
+        assert_eq!(self._handle.dropped_lines(), 0, "log lines were dropped");
+    }
+
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
     }

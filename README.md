@@ -8,13 +8,22 @@ API discovery and dependency mocking for Kubernetes workloads, without touching 
   (payment provider, SaaS APIs) are answered from recorded responses with recorded latencies, so
   you can push it to saturation without calling — or being rate-limited by — its dependencies.
 
-> Status: v2 rewrite in progress. Delivered: **F0 foundations** (runtime, image, Helm chart with
-> Valkey, CI/CD). Plan and acceptance criteria: [`docs/SPEC.md`](docs/SPEC.md) §12. The previous
-> implementation is kept under the tag `legacy-v0.37`.
+> Status: v2 rewrite in progress. Delivered: F0 to F5 (sidecar injection, HTTP/1 and HTTP/2
+> proxy, TLS interception, discovery, collection and merge in the controller, read API). Mock mode,
+> egress, the UI and load testing are next. Plan and acceptance criteria:
+> [`docs/SPEC.md`](docs/SPEC.md) §12. The previous implementation is kept under the tag
+> `legacy-v0.37`.
+
+**Documentation:** the [wiki](docs/wiki/Home.md) covers installing, configuring and operating
+mimic, for developers and ops (also published to the repository's GitHub wiki with
+`scripts/publish-wiki.sh`).
 
 ## Install (development)
 
 Requirements: Kubernetes ≥ 1.33, Helm 3.8+ (OCI support).
+
+Injected apps must exit on `SIGTERM`: the sidecar ships its last discovery report only in the
+part of the grace period the app leaves it (a loss is logged as `report not shipped`).
 
 ```bash
 helm install mimic oci://ghcr.io/thaliph/charts/mimic -n mimic-system --create-namespace
