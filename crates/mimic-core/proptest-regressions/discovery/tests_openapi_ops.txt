@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 35fcf0695678220a72f9d172fb0b1ffab96cddaa927e76c5d5c34a11302841f6 # shrinks to exchanges = [Rx { method: "$ref", path: "/p", status: 200, query: "$ref=v0&$ref=w", req_headers: [("$ref", "h0"), ("content-type", "application/json"), ("authorization", "Bearer a")], req_body: None, resp_headers: [("$ref", "r"), ("content-type", "application/json")], resp_body: None, host: None, grpc: false }], chunk = 1
