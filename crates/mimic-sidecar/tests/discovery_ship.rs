@@ -877,31 +877,57 @@ async fn ctl_16_gauges_cover_the_pending_and_the_current_report() {
 
 const REDIRECTED: &str = "127.0.0.1:18080";
 const CLIENT_IP: &str = "127.0.0.9";
-const SKIP: i32 = 77;
+
+/// A test that cannot run here: skipped with a message, or failed under `MIMIC_TEST_REQUIRE_NETNS=1`
+/// (the CI test job does not set it unless the runner is known to support `unshare -rn` with iptables).
+fn skip(test: &str, why: &str) {
+    assert!(
+        std::env::var_os("MIMIC_TEST_REQUIRE_NETNS").is_none(),
+        "{test} needs a user and network namespace with iptables, and MIMIC_TEST_REQUIRE_NETNS is set: {why}"
+    );
+    eprintln!("{test}: skipped, {why} (set MIMIC_TEST_REQUIRE_NETNS=1 to make this a failure)");
+}
 
 /// `true` inside the namespace (run the body). Outside, runs this test again in a user and network
-/// namespace with the redirect, and returns `false`; skips (with a message) when the host forbids
-/// that.
+/// namespace with the redirect, and returns `false`; skips (see [`skip`]) when the host has no
+/// `unshare`, forbids user namespaces or lacks `ip` or `iptables`.
 fn in_namespace(test: &str) -> bool {
     if std::env::var_os("MIMIC_TEST_NETNS").is_some() {
         return true;
     }
-    let script = format!(
-        "ip link set lo up && iptables -t nat -A OUTPUT -p tcp -s {CLIENT_IP} -d 127.0.0.1 --dport 18080 -j REDIRECT --to-ports 15006 || exit {SKIP}; exec \"$0\" \"$@\""
+    let rule = format!(
+        "iptables -t nat -A OUTPUT -p tcp -s {CLIENT_IP} -d 127.0.0.1 --dport 18080 -j REDIRECT --to-ports 15006"
     );
+    let setup = format!("ip link set lo up && {rule}");
+    // Can the namespace be set up at all?
+    let probe = std::process::Command::new("unshare")
+        .args(["-rn", "sh", "-c", &setup])
+        .stderr(std::process::Stdio::null())
+        .status();
+    match probe {
+        Err(e) => return skip_false(test, &format!("unshare is not available ({e})")),
+        Ok(status) if !status.success() => {
+            return skip_false(
+                test,
+                &format!("no user namespace with ip and iptables here ({status})"),
+            );
+        }
+        Ok(_) => {}
+    }
+    let script = format!("{setup} && exec \"$0\" \"$@\"");
     let status = std::process::Command::new("unshare")
         .args(["-rn", "sh", "-c", &script])
         .arg(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"])
         .env("MIMIC_TEST_NETNS", "1")
-        .status();
-    match status {
-        Ok(status) if status.code() == Some(SKIP) => {
-            eprintln!("{test}: no user namespace with iptables here, skipped");
-        }
-        Ok(status) => assert!(status.success(), "{test} failed in its namespace: {status}"),
-        Err(e) => eprintln!("{test}: unshare is not available ({e}), skipped"),
-    }
+        .status()
+        .expect("unshare starts");
+    assert!(status.success(), "{test} failed in its namespace: {status}");
+    false
+}
+
+fn skip_false(test: &str, why: &str) -> bool {
+    skip(test, why);
     false
 }
 
@@ -1022,18 +1048,4 @@ async fn ctl_17_sigterm_with_a_silent_api_exits_within_the_grace_and_counts_the_
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0]["level"], "WARN");
     assert_eq!(lines[0]["exchanges"], 2);
-}
-
-// ---------------------------------------------------------------------------------------
-// CTL-16: `Retry-After`.
-
-#[test]
-fn ctl_16_retry_after_is_read_in_seconds_and_capped_at_300() {
-    use mimic_sidecar::discovery::retry_after;
-    assert_eq!(retry_after(" 3 "), Some(Duration::from_secs(3)));
-    assert_eq!(retry_after("0"), Some(Duration::ZERO));
-    assert_eq!(retry_after("300"), Some(Duration::from_secs(300)));
-    assert_eq!(retry_after("86400"), Some(Duration::from_secs(300)));
-    assert_eq!(retry_after("soon"), None);
-    assert_eq!(retry_after("-1"), None);
 }

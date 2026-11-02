@@ -137,7 +137,7 @@ enum Attempt {
 }
 
 /// A `Retry-After` in seconds, capped at 300 s (spec §7.2); `None` for another form.
-pub fn retry_after(value: &str) -> Option<Duration> {
+pub(crate) fn retry_after(value: &str) -> Option<Duration> {
     let secs = value.trim().parse::<u64>().ok()?;
     Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }
@@ -499,5 +499,20 @@ impl Shipper {
             retry_after,
             applied,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctl_16_retry_after_is_read_in_seconds_and_capped_at_300() {
+        assert_eq!(retry_after(" 3 "), Some(Duration::from_secs(3)));
+        assert_eq!(retry_after("0"), Some(Duration::ZERO));
+        assert_eq!(retry_after("300"), Some(Duration::from_secs(300)));
+        assert_eq!(retry_after("86400"), Some(Duration::from_secs(300)));
+        assert_eq!(retry_after("soon"), None);
+        assert_eq!(retry_after("-1"), None);
     }
 }

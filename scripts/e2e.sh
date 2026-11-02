@@ -1551,8 +1551,9 @@ mkdir -p "$WORK/churn-logs"
       [[ -e "$WORK/churn-logs/$p.seen" ]] && continue
       : > "$WORK/churn-logs/$p.seen"
       # Until a stream ends cleanly (the container exited): one that fails, while the container is still
-      # starting for instance, starts again from the first line.
-      ( until kubectl -n disc-22 logs -f "$p" -c app > "$WORK/churn-logs/$p.log" 2>/dev/null; do sleep 1; done ) &
+      # starting for instance, starts again from the first line, in a file of its own (a file is never
+      # truncated, so the lines of a pod that is deleted meanwhile are kept; the longest file of a pod counts).
+      ( n=0; until kubectl -n disc-22 logs -f "$p" -c app > "$WORK/churn-logs/$p.$((n += 1)).log" 2>/dev/null; do sleep 1; done ) &
     done
     sleep 1
   done
@@ -1602,7 +1603,16 @@ churn_ok=$(cat "$WORK/churn.out")
 # The streams of the pods still running hold their last lines a moment after the last answer.
 sleep 5
 kill_tree "$streams_pid"
-b_ok=$(cat "$WORK"/churn-logs/*.log | jq -R -s 'split("\n") | map(fromjson? | select(. != null and .method == "GET" and .status == 200 and (.path | startswith("/users/10")))) | length')
+# Only the ids of the churn (100000 to 100049, exactly): no earlier step uses them (1 to 39 and 9999).
+b_ok=0
+for pod in $(ls "$WORK"/churn-logs | sed -n 's/^\(.*\)\.[0-9]*\.log$/\1/p' | sort -u); do
+  best=0
+  for f in "$WORK/churn-logs/$pod".*.log; do
+    n=$(jq -R -s 'split("\n") | map(fromjson? | select(. != null and .method == "GET" and .status == 200 and (.path | test("^/users/1000[0-4][0-9]$")))) | length' "$f") || n=0
+    (( n > best )) && best=$n
+  done
+  b_ok=$((b_ok + best))
+done
 [[ $b_ok =~ ^[0-9]+$ ]] || fail "ctl_21: cannot count the 200s B answered: '$b_ok'"
 echo "ctl_21: the client got $churn_ok 200s, B answered $b_ok" >&2
 (( churn_ok <= b_ok )) || fail "ctl_21: the client got $churn_ok 200s, more than the $b_ok B answered"
