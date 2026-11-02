@@ -36,8 +36,11 @@ See [Discovery and redaction](Discovery-and-redaction).
 | `mimic-init` | UID 0 | only `NET_ADMIN` and `NET_RAW`, no privilege escalation, read-only root, exits after installing the rules |
 
 Every pod the chart creates is Pod Security `restricted`. Application namespaces must be `privileged`
-for `mimic-init`. No mimic container mounts an app volume or the pod's API token. Images are distroless
-(no shell), pinned by digest, scanned in CI; dependencies are checked with `cargo deny`.
+for `mimic-init`. No mimic container mounts an app volume or the pod's API token. mimic's images are
+distroless (no shell). Valkey is the pinned upstream Alpine image (`valkey/valkey:9.0-alpine`, which has
+a shell). mimic's images are pinned by digest only when `image.digest` and `inject.initImage.digest`
+are set; the default is the chart appVersion tag, so set both to pin them. CI scans images and checks
+dependencies with `cargo deny`.
 
 ## RBAC
 

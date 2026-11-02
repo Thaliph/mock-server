@@ -1,5 +1,7 @@
 # Operations
 
+Names assume the Helm release is called `mimic`; replace `mimic` with your release name otherwise.
+
 Audience: ops. Covers F0 to F5. Reference: spec §7.3, §9, §10, §11.
 
 ## Health probes
@@ -67,6 +69,13 @@ pod on the controller.
 | `mimic_store_expired_total` | counter | `kind` |
 | `mimic_status_updates_total` | counter | `result` (`ok`, `error`) (F5 status) |
 
+Webhook metrics (controller):
+
+| Metric | Type | Labels |
+|---|---|---|
+| `mimic_webhook_admissions_total` | counter | `result` (`injected`, `skipped`, `error`), `reason` (for example `ok`, `not-selected`, `malformed`, `seed-not-loaded`, and the skip reasons of [Concepts](Concepts#injection-which-pods) such as `host-network`) |
+| `mimic_webhook_certificate_expiry_timestamp_seconds` | gauge | none (expiry of the webhook serving certificate; the controller renews it 30 days before) |
+
 Starting alerts (tune to taste):
 
 | Alert on | Meaning |
@@ -75,6 +84,8 @@ Starting alerts (tune to taste):
 | `mimic_store_writes_total{result="error"}` rising | Valkey unavailable or full |
 | `mimic_store_refused_total`, `mimic_store_evicted_total` rising | A deployment hit the store limits |
 | `mimic_discovery_exchanges_total{result="dropped"}` or `{result="panic"}` | Discovery is losing records |
+| `mimic_webhook_certificate_expiry_timestamp_seconds - time()` under a few days | The webhook certificate is not being renewed |
+| `mimic_webhook_admissions_total{result="error"}` rising | Admissions failing (`seed-not-loaded`, `malformed`) |
 | `mimic_tls_seed_loaded == 0` | Webhook cannot issue injections that need the seed |
 | `mimic_log_lines_dropped_total` rising | stdout cannot keep up; log lines are being dropped |
 | `mimic_tls_intermediate_expiry_timestamp_seconds - time()` small, non-zero | Intermediate not renewed |
@@ -120,7 +131,7 @@ Key messages:
 | WARN | `report rejected` (`status`) | sidecar | The controller refused the report (400, 405, 507); it is dropped. |
 | WARN | `report not shipped` | sidecar | Shutdown ended before the last report was acknowledged; it is lost. |
 | WARN | `endpoint limit reached`, `sample budget full` | sidecar | Discovery is now partial. |
-| WARN | `grace period over` (`connections`) | sidecar, controller | Connections were still open at the end of `MIMIC_SHUTDOWN_GRACE`. |
+| WARN | `grace period over` (sidecar, with `connections`), `grace period over, closing remaining connections` and `grace period over, closing remaining webhook connections` (controller and runtime) | sidecar, controller | Connections were still open at the end of `MIMIC_SHUTDOWN_GRACE`. |
 | WARN | `tls passthrough`, `tls roots skipped`, `tls exclude truncated` | see [TLS interception](TLS-interception) | |
 | INFO | `report shipping disabled` | sidecar | No `MIMIC_CONTROLLER_URL`: nothing is shipped. |
 
@@ -162,7 +173,13 @@ Pushes go every 30 s per pod, so controller load grows with pods, not traffic.
   ```
 
   (The image is Alpine, so `sh` and `xargs` exist.) Also remove the deployment from the indexes:
-  `valkey-cli ZREM mimic:v1:workloads demo/users` and `ZREM mimic:v1:ns:demo users`. Everything:
+
+  ```bash
+  kubectl -n mimic-system exec mimic-valkey-0 -- valkey-cli ZREM mimic:v1:workloads demo/users
+  kubectl -n mimic-system exec mimic-valkey-0 -- valkey-cli ZREM mimic:v1:ns:demo users
+  ```
+
+  A push that arrives during the delete re-creates part of the data; this is harmless. Everything:
   the same scan with pattern `mimic:v1:*`. Sidecars rebuild from new traffic; counters restart from
   zero. Standalone Valkey 9.0 or later is required; cluster mode is not supported.
 

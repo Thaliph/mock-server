@@ -37,7 +37,7 @@ the spec disagree, the spec wins.
 | Page | Content |
 |---|---|
 | [Concepts](Concepts) | Components, data flow, injection, discovery and mock modes |
-| [Install](Install) | Requirements, `helm install`, upgrade, uninstall, the PVC upgrade note |
+| [Install](Install) | Requirements, `helm install` from a clone, upgrade, uninstall, the PVC upgrade note |
 | [Quick start](Quick-start) | Two Python services, discovery, the merged report |
 | [Configuration](Configuration) | `MimicWorkload` fields, Helm values, `MIMIC_*` variables |
 | [TLS interception](TLS-interception) | How it works, trust injection, exclusions, pass-through |

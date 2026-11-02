@@ -44,7 +44,7 @@ and the TLS seed. Logs: `valkey unreachable`, `webhook certificate not in place 
 to it ([Configuration](Configuration)).
 
 **`helm upgrade` fails on the Valkey StatefulSet** (`updates to statefulset spec ... are forbidden`).
-The PVC size changed; see [Install](Install#known-issue-upgrading-from-v010-fails-on-the-valkey-pvc-293).
+The PVC size default changed between `main` builds; see [Install](Install#known-issue-upgrading-a-chart-installed-from-an-earlier-main-build-293).
 
 **GitOps shows a diff on the webhook `caBundle` or Secrets.** The controller owns them; tell your tool
 to ignore those fields.

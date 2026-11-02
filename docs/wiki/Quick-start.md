@@ -172,8 +172,7 @@ kubectl -n demo get mimicworkload users -o jsonpath='{.status}' | jq
  "pods": 2, "sampleBytes": 41230}}
 ```
 
-(The status subresource is part of the F5 change that is merging now; on a chart without it, use the
-read API.)
+(The status subresource is F5; on a chart without it, use the read API.)
 
 ## 8. Clean up
 

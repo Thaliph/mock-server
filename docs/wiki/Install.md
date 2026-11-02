@@ -17,12 +17,25 @@ The release namespace itself runs at `restricted`: every pod the chart creates s
 
 ## Install
 
+No v2 release is published yet, so install the chart from a clone of the repository:
+
 ```bash
-helm install mimic oci://ghcr.io/thaliph/charts/mimic -n mimic-system --create-namespace
+git clone https://github.com/Thaliph/mock-server.git && cd mock-server
+helm install mimic deploy/helm/mimic -n mimic-system --create-namespace
 kubectl -n mimic-system rollout status deploy/mimic-controller
 kubectl -n mimic-system port-forward svc/mimic-controller 8081:8081 &
 curl -s localhost:8081/readyz
 ```
+
+The chart's images default to `ghcr.io/thaliph/mimic` and `ghcr.io/thaliph/mimic-init` at the chart
+appVersion tag. Until a v2 release is published, build and load your own images (see
+[Developing](Developing#end-to-end-on-kind) and `scripts/e2e.sh`) and set `image.*` and
+`inject.initImage.*`. Once a v2 release is published, the chart is also available as
+`oci://ghcr.io/thaliph/charts/mimic`, and `deploy/helm/mimic` below can be replaced by that reference.
+
+All names in this wiki (`mimic-controller`, `mimic-valkey-0`, `data-mimic-valkey-0`, the Secret
+`mimic-valkey`, ...) assume the release is called `mimic`; replace `mimic` with your release name
+otherwise.
 
 To enforce Pod Security on the release namespace as the chart's tests do:
 
@@ -34,7 +47,7 @@ kubectl label namespace mimic-system \
 Common overrides (all values: [Configuration](Configuration#helm-values)):
 
 ```bash
-helm install mimic oci://ghcr.io/thaliph/charts/mimic -n mimic-system --create-namespace \
+helm install mimic deploy/helm/mimic -n mimic-system --create-namespace \
   --set valkey.persistence.size=8Gi \
   --set valkey.resources.limits.memory=2Gi \
   --set metrics.serviceMonitor.enabled=true
@@ -52,7 +65,7 @@ cluster-wide, the CRD, the `MutatingWebhookConfiguration` `<release>-injector` a
 
 ```bash
 kubectl -n mimic-system create secret generic my-valkey --from-literal=password="$(openssl rand -base64 30)"
-helm install mimic oci://ghcr.io/thaliph/charts/mimic -n mimic-system --create-namespace \
+helm install mimic deploy/helm/mimic -n mimic-system --create-namespace \
   --set valkey.existingSecret=my-valkey
 ```
 
@@ -75,31 +88,42 @@ A pod label `mimic.platform.io/inject: disabled` always opts a pod out. The full
 ## Upgrade
 
 ```bash
-helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic -n mimic-system
+helm upgrade mimic deploy/helm/mimic -n mimic-system
 ```
 
 Running pods keep the sidecar version they were created with; `rollout restart` them to pick up a new
 one. The Valkey password Secret is kept across upgrades. The CRD is not removed or reset.
 
-### Known issue: upgrading from v0.1.0 fails on the Valkey PVC (#293)
+### Known issue: upgrading a chart installed from an earlier `main` build (#293)
 
-The default `valkey.persistence.size` went from `1Gi` (v0.1.0) to `4Gi`. A StatefulSet's
-`volumeClaimTemplates` is immutable, so `helm upgrade` from v0.1.0 fails with an error such as
+(The tag `v0.1.0` is the legacy v1 product and has no chart; this affects only a chart installed from
+`main` or a checkout before the change, for example a cluster left by an earlier `scripts/e2e.sh`.)
+
+The default `valkey.persistence.size` went from `1Gi` to `4Gi`. A StatefulSet's `volumeClaimTemplates`
+is immutable, so `helm upgrade` of such an install fails with an error such as
 `updates to statefulset spec for fields other than ... are forbidden`. Either:
 
 - **keep the existing size** for that release:
 
   ```bash
-  helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic -n mimic-system --set valkey.persistence.size=1Gi
+  helm upgrade mimic deploy/helm/mimic -n mimic-system --set valkey.persistence.size=1Gi
   ```
+
+  Risk: AOF rewrites need about twice the data, so a 1Gi volume can fill up. The old chart also used a
+  low Valkey memory limit (256Mi); if you keep 1Gi, also keep `valkey.resources.limits.memory` low
+  (`maxmemory` is 75 % of it) and watch the volume.
 
 - or **start with the new size** by deleting the Valkey StatefulSet and its PVC before upgrading. The
   stored reports are lost; sidecars rebuild them from new traffic.
 
+  Warning: while Valkey is gone the controller is unready, and the webhook fails closed, so **pod
+  creation in injected namespaces is blocked** until `helm upgrade` has recreated Valkey and it is
+  ready. Do it in a quiet window.
+
   ```bash
   kubectl -n mimic-system delete statefulset mimic-valkey
   kubectl -n mimic-system delete pvc data-mimic-valkey-0
-  helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic -n mimic-system
+  helm upgrade mimic deploy/helm/mimic -n mimic-system
   ```
 
 ## Uninstall

@@ -36,7 +36,7 @@ A deployment without data has zero counts and no `lastPushTime`.
 
 ## Helm values
 
-Chart `oci://ghcr.io/thaliph/charts/mimic`. Defaults from `values.yaml`.
+Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 release is published). Defaults from `values.yaml`.
 
 | Value | Default | Range / notes |
 |---|---|---|
@@ -62,7 +62,7 @@ Chart `oci://ghcr.io/thaliph/charts/mimic`. Defaults from `values.yaml`.
 | `valkey.image.repository` / `.tag` / `.digest` | `docker.io/valkey/valkey` / `9.0-alpine` / pinned digest | Valkey 9.0 or later is required (hash field expiry). |
 | `valkey.existingSecret` | `""` | Secret with key `password`. Empty: the chart creates a random one, kept on upgrade and uninstall. |
 | `valkey.persistence.enabled` | `true` | `false`: `emptyDir`, store lost on pod restart. |
-| `valkey.persistence.size` | `4Gi` | AOF rewrites need about twice the data. Immutable after install, see the [upgrade note](Install#known-issue-upgrading-from-v010-fails-on-the-valkey-pvc-293). |
+| `valkey.persistence.size` | `4Gi` | AOF rewrites need about twice the data. Immutable after install, see the [upgrade note](Install#known-issue-upgrading-a-chart-installed-from-an-earlier-main-build-293). |
 | `valkey.persistence.storageClass` | `""` | Empty: cluster default. |
 | `valkey.resources` | requests `50m` / `64Mi`; limit memory `1Gi` | `maxmemory` = 75 % of the memory limit (a whole quantity such as `1Gi` is required), policy `noeviction`. |
 | `valkey.nodeSelector`, `valkey.tolerations` | `{}`, `[]` | |
