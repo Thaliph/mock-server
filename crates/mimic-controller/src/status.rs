@@ -95,9 +95,22 @@ impl StatusSink for KubeSink {
 
 const MANAGER: &str = "mimic-controller";
 
-/// The parameters of the status apply.
+/// The parameters of the status apply. Forced: `status.discovery` is owned by the controller
+/// alone, so a conflict is never a second owner to respect (and would repeat at every pass).
 fn apply_params() -> PatchParams {
-    PatchParams::apply(MANAGER)
+    PatchParams::apply(MANAGER).force()
+}
+
+/// The status as the cluster returns it: the CRD defaults `endpoints.inbound` to 0 (for the
+/// `Endpoints` printer column), which the computed status omits.
+fn defaulted(status: &Value) -> Value {
+    let mut status = status.clone();
+    if let Some(endpoints) = status.get_mut("endpoints").and_then(Value::as_object_mut) {
+        endpoints
+            .entry("inbound")
+            .or_insert_with(|| Value::from(0u64));
+    }
+    status
 }
 
 pub struct Reconciler {
@@ -139,13 +152,18 @@ impl Reconciler {
                     Err(_) => continue,
                 },
             };
-            if target.status.as_ref() == Some(&status) {
+            if target.status.as_ref().map(defaulted) == Some(defaulted(&status)) {
                 continue;
             }
-            let result = self
-                .sink
-                .apply(&target.namespace, &target.name, &status)
-                .await;
+            let result = match tokio::time::timeout(
+                self.apply_timeout,
+                self.sink.apply(&target.namespace, &target.name, &status),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(format!("no answer within {:?}", self.apply_timeout)),
+            };
             let label = if result.is_ok() { "ok" } else { "error" };
             self.metrics
                 .updates

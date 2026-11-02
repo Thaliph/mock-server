@@ -64,7 +64,7 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `valkey.persistence.enabled` | `true` | `false`: `emptyDir`, store lost on pod restart. |
 | `valkey.persistence.size` | `4Gi` | AOF rewrites need about twice the data. Immutable after install, see the [upgrade note](Install#known-issue-upgrading-a-chart-installed-from-an-earlier-main-build-293). |
 | `valkey.persistence.storageClass` | `""` | Empty: cluster default. |
-| `valkey.resources` | requests `50m` / `64Mi`; limit memory `1Gi` | `maxmemory` = 75 % of the memory limit (a whole quantity such as `1Gi` is required), policy `noeviction`. |
+| `valkey.resources` | requests `50m` / `768Mi` (= `maxmemory`); limit memory `1Gi` | `maxmemory` = 75 % of the memory limit (a whole quantity such as `1Gi` is required), policy `noeviction`. |
 | `valkey.nodeSelector`, `valkey.tolerations` | `{}`, `[]` | |
 | `networkPolicy.enabled` | `true` | Valkey: ingress from the controller only, no egress. Controller: see below. |
 | `networkPolicy.webhookFrom` | `[]` | `from` peers for port 8443. Empty: any source (the API server's address depends on the cluster). |

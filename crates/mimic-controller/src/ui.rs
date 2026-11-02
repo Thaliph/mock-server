@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -26,7 +26,8 @@ pub fn router(store: Arc<Store>) -> Router {
 }
 
 /// `403` for a peer that is not a loopback address, whatever the bind address, and for a `Host`
-/// that is not a loopback name (DNS rebinding through an open port-forward).
+/// that is not a loopback name (DNS rebinding through an open port-forward). `405` for `HEAD`,
+/// which the `GET` routes would serve: only `GET` is (spec §7.5).
 async fn loopback_only(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
@@ -37,16 +38,23 @@ async fn loopback_only(
         .get(header::HOST)
         .and_then(|h| h.to_str().ok());
     if peer.ip().to_canonical().is_loopback() && host.is_some_and(loopback_host) {
+        if request.method() == Method::HEAD {
+            return (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "GET")]).into_response();
+        }
         next.run(request).await
     } else {
         StatusCode::FORBIDDEN.into_response()
     }
 }
 
-/// `localhost`, `127.0.0.1` or `[::1]`, with or without a port.
+/// `localhost`, `127.0.0.1` or `[::1]`, with or without a port (but not with an empty one).
 fn loopback_host(host: &str) -> bool {
     let name = match host.rsplit_once(':') {
-        Some((name, port)) if !name.ends_with(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+        Some((name, port))
+            if !name.ends_with(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
             name
         }
         _ => host,
@@ -66,9 +74,12 @@ impl IntoResponse for ReadError {
     }
 }
 
-/// RFC 3339 in UTC, to the millisecond.
+/// The last millisecond of year 9999, the end of what RFC 3339 can write.
+const MAX_MS: u64 = 253_402_300_799_999;
+
+/// RFC 3339 in UTC, to the millisecond; a later instant is shown as [`MAX_MS`].
 fn rfc3339(ms: u64) -> String {
-    i128::from(ms)
+    i128::from(ms.min(MAX_MS))
         .checked_mul(1_000_000)
         .and_then(|ns| OffsetDateTime::from_unix_timestamp_nanos(ns).ok())
         .and_then(|at| at.format(&Rfc3339).ok())

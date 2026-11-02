@@ -327,7 +327,11 @@ fn unreadable_errors(capture: &crate::webhook::tests::Capture, ns: &str) -> usiz
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .filter(|v| v["level"] == "ERROR" && v["namespace"] == ns)
-        .filter(|v| v["message"].as_str().is_some_and(|m| m.ends_with("unreadable")))
+        .filter(|v| {
+            v["message"]
+                .as_str()
+                .is_some_and(|m| m.ends_with("unreadable"))
+        })
         .count()
 }
 
