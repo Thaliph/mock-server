@@ -845,3 +845,111 @@ async fn ui_10_at_most_two_renders_run_at_once_and_other_routes_are_not_blocked(
         assert_eq!(task.await.unwrap(), 200);
     }
 }
+
+/// Opens the gate for good when a test ends, so a failed assertion cannot hang the runtime
+/// on held blocking threads.
+struct OpenOnDrop(Arc<dyn Fn() + Send + Sync>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        for _ in 0..16 {
+            (self.0)();
+        }
+    }
+}
+
+#[tokio::test]
+async fn ui_10_aborted_requests_do_not_free_the_slots_of_running_renders() {
+    use std::sync::atomic::Ordering;
+    let store = store(&valkey_url());
+    let mut metrics = Metrics::new("controller", "test");
+    let (hook, entered, release) = gate();
+    let ui = UiMetrics::register(metrics.registry_mut());
+    let app = router_with_hook(store.clone(), ui, hook);
+    let _open = OpenOnDrop(release.clone());
+    let ns = unique("ui10a");
+    seed(&store, &ns, "front", &["front-1"]).await;
+    let path = format!("/v1/workloads/{ns}/front/openapi/inbound-80");
+    let spawn = || {
+        let (app, path) = (app.clone(), path.clone());
+        tokio::spawn(async move { fetch(&app, &path).await.status })
+    };
+    let first: Vec<_> = (0..2).map(|_| spawn()).collect();
+    until("two renders", || entered.load(Ordering::SeqCst) == 2).await;
+    for task in &first {
+        task.abort();
+    }
+    for task in first {
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    let second: Vec<_> = (0..2).map(|_| spawn()).collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        2,
+        "a render started while two still ran"
+    );
+    for _ in 0..4 {
+        release();
+    }
+    for task in second {
+        assert_eq!(task.await.unwrap(), 200);
+    }
+    assert_eq!(entered.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn ui_10_invalid_and_unknown_requests_do_not_wait_for_a_render_slot() {
+    use std::sync::atomic::Ordering;
+    let store = store(&valkey_url());
+    let mut metrics = Metrics::new("controller", "test");
+    let (hook, entered, release) = gate();
+    let ui = UiMetrics::register(metrics.registry_mut());
+    let app = router_with_hook(store.clone(), ui, hook);
+    let _open = OpenOnDrop(release.clone());
+    let ns = unique("ui10w");
+    seed(&store, &ns, "front", &["front-1"]).await;
+    let path = format!("/v1/workloads/{ns}/front/openapi/inbound-80");
+    let held: Vec<_> = (0..2)
+        .map(|_| {
+            let (app, path) = (app.clone(), path.clone());
+            tokio::spawn(async move { fetch(&app, &path).await.status })
+        })
+        .collect();
+    until("two renders", || entered.load(Ordering::SeqCst) == 2).await;
+    for (path, status) in [
+        (format!("/v1/workloads/{ns}/front/openapi/bad"), 400),
+        (format!("/v1/workloads/{ns}/Bad_Name/endpoints"), 400),
+        (format!("/v1/workloads/{ns}/absent/endpoints"), 404),
+        (format!("/v1/workloads/{ns}/absent/openapi"), 404),
+    ] {
+        let answer = tokio::time::timeout(Duration::from_secs(5), fetch(&app, &path))
+            .await
+            .unwrap_or_else(|_| panic!("{path} waited for a slot"));
+        assert_eq!(answer.status, status, "{path}");
+    }
+    release();
+    release();
+    for task in held {
+        assert_eq!(task.await.unwrap(), 200);
+    }
+}
+
+#[tokio::test]
+async fn ui_10_a_panicking_render_is_a_500_with_one_error() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let store = store(&valkey_url());
+    let mut metrics = Metrics::new("controller", "test");
+    let ui = UiMetrics::register(metrics.registry_mut());
+    let hook: Hook = Arc::new(|| panic!("render blew up"));
+    let app = router_with_hook(store.clone(), ui, hook);
+    let ns = unique("ui10p");
+    seed(&store, &ns, "front", &["front-1"]).await;
+    let answer = fetch(&app, &format!("/v1/workloads/{ns}/front/endpoints")).await;
+    assert_eq!(answer.status, 500);
+    assert_eq!(errors(&capture, &ns, "openapi render failed"), 1);
+    // The slot is back: a second request is answered too.
+    let again = fetch(&app, &format!("/v1/workloads/{ns}/front/openapi")).await;
+    assert_eq!(again.status, 500);
+    assert_eq!(errors(&capture, &ns, "openapi render failed"), 2);
+}
