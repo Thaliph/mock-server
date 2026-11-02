@@ -14,6 +14,15 @@ use mimic_core::proxy::tls::MAX_EXCLUDES;
 /// `MimicWorkload`.
 pub type Entry = (String, String, String, Vec<String>, Vec<String>);
 
+/// A `MimicWorkload` and the `status.discovery` it holds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    pub namespace: String,
+    pub name: String,
+    pub deployment: String,
+    pub status: Option<serde_json::Value>,
+}
+
 /// `spec.deployment`, `spec.tls.exclude` and `spec.discovery.redact` of a `MimicWorkload`.
 type Settings = (String, Vec<String>, Vec<String>);
 
@@ -21,6 +30,8 @@ type Settings = (String, Vec<String>, Vec<String>);
 struct State {
     /// `(namespace, MimicWorkload name)` to its settings.
     items: BTreeMap<(String, String), Settings>,
+    /// `(namespace, MimicWorkload name)` to the `status.discovery` the cluster holds for it.
+    statuses: BTreeMap<(String, String), serde_json::Value>,
     synced: bool,
 }
 
@@ -50,7 +61,10 @@ impl WorkloadCache {
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
-        self.write().items.remove(&(namespace.into(), name.into()));
+        let mut state = self.write();
+        let key = (namespace.to_string(), name.to_string());
+        state.items.remove(&key);
+        state.statuses.remove(&key);
     }
 
     /// Replaces the whole content after a (re)list and marks the cache synced.
@@ -60,7 +74,36 @@ impl WorkloadCache {
             .into_iter()
             .map(|(ns, n, d, e, r)| ((ns, n), (d, e, r)))
             .collect();
+        state.statuses.clear();
         state.synced = true;
+    }
+
+    /// Records the `status.discovery` the cluster holds for a `MimicWorkload`.
+    pub fn set_status(&self, namespace: &str, name: &str, status: Option<serde_json::Value>) {
+        let mut state = self.write();
+        let key = (namespace.to_string(), name.to_string());
+        if !state.items.contains_key(&key) {
+            return;
+        }
+        match status {
+            Some(status) => state.statuses.insert(key, status),
+            None => state.statuses.remove(&key),
+        };
+    }
+
+    /// Every `MimicWorkload` with the status it holds, sorted by namespace then name.
+    pub fn targets(&self) -> Vec<Target> {
+        let state = self.read();
+        state
+            .items
+            .iter()
+            .map(|(key, (deployment, _, _))| Target {
+                namespace: key.0.clone(),
+                name: key.1.clone(),
+                deployment: deployment.clone(),
+                status: state.statuses.get(key).cloned(),
+            })
+            .collect()
     }
 
     pub fn is_synced(&self) -> bool {
@@ -193,17 +236,30 @@ pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
     let mut events =
         std::pin::pin!(watcher::watcher(api, watcher::Config::default()).default_backoff());
     let mut listing = Vec::new();
+    let mut statuses = Vec::new();
     while let Some(event) = events.next().await {
         match event {
-            Ok(Event::Init) => listing.clear(),
-            Ok(Event::InitApply(object)) => listing.extend(entry(&object)),
+            Ok(Event::Init) => {
+                listing.clear();
+                statuses.clear();
+            }
+            Ok(Event::InitApply(object)) => {
+                if let Some(found) = entry(&object) {
+                    statuses.push((found.0.clone(), found.1.clone(), held_status(&object)));
+                    listing.push(found);
+                }
+            }
             Ok(Event::InitDone) => {
                 cache.replace(std::mem::take(&mut listing));
+                for (ns, name, status) in std::mem::take(&mut statuses) {
+                    cache.set_status(&ns, &name, status);
+                }
                 tracing::info!("MimicWorkload cache synced");
             }
             Ok(Event::Apply(object)) => match entry(&object) {
                 Some((ns, name, deployment, exclude, redact)) => {
-                    cache.apply(&ns, &name, &deployment, exclude, redact)
+                    cache.apply(&ns, &name, &deployment, exclude, redact);
+                    cache.set_status(&ns, &name, held_status(&object));
                 }
                 None => remove(&cache, &object),
             },
@@ -217,6 +273,11 @@ fn remove(cache: &WorkloadCache, object: &DynamicObject) {
     if let (Some(ns), Some(name)) = (&object.metadata.namespace, &object.metadata.name) {
         cache.remove(ns, name);
     }
+}
+
+/// `status.discovery` of a `MimicWorkload`, as the cluster holds it.
+fn held_status(object: &DynamicObject) -> Option<serde_json::Value> {
+    object.data.get("status")?.get("discovery").cloned()
 }
 
 fn entry(object: &DynamicObject) -> Option<Entry> {
