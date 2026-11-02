@@ -19,4 +19,5 @@ workspace = true
 
 [dev-dependencies]
 json-patch = "4.2.0"
+jsonschema = { version = "0.59.0", default-features = false }
 proptest = "1.12.0"

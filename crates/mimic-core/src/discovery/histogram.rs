@@ -63,3 +63,19 @@ impl Histogram {
         }
     }
 }
+
+/// Where a quantile falls: the upper bound of its bucket, or the overflow bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// Upper bound of the bucket in milliseconds, rounded up.
+    Ms(u64),
+    Overflow,
+}
+
+impl Histogram {
+    /// The `percent` quantile (1..=100): the bucket holding the observation of rank
+    /// `ceil(count * percent / 100)`. `None` without data.
+    pub fn quantile(&self, _percent: u64) -> Option<Bound> {
+        todo!()
+    }
+}
