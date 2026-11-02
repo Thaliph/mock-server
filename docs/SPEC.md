@@ -1121,7 +1121,10 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   The operations of a path item are its methods: `GET`, `PUT`, `POST`, `DELETE`, `OPTIONS`,
   `HEAD`, `PATCH` and `TRACE` (exact upper case) under their lower-case keys; any other method
   under `x-mimic-methods` (object keyed by method) with the same operation object (OpenAPI 3.1
-  has no field for it).
+  has no field for it). Endpoints that share a path key and a method (a gRPC and an HTTP one, or
+  literals that escape alike) overwrite nothing: the first in the report's endpoint order takes
+  the slot, the next ones are `x-mimic-methods` entries `<METHOD>#2`, `<METHOD>#3`, ... (a
+  non-standard method's first entry is `<METHOD>`).
 - **Operation.**
   - `parameters`, in this order: path parameters in template order (`required: true`; schema
     `{"type": "string"}` plus `format` when every value of that position in the endpoint's

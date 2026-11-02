@@ -136,19 +136,7 @@ pub fn document(
         let auth = parts::schemes(e);
         let operation = operation(e, &key, auth.keys());
         schemes.extend(auth);
-        match METHODS.iter().find(|(upper, _)| *upper == e.method) {
-            Some((_, lower)) => {
-                item.insert((*lower).to_string(), operation);
-            }
-            None => {
-                let extra = item
-                    .entry("x-mimic-methods")
-                    .or_insert_with(|| Value::Object(Map::new()));
-                if let Value::Object(extra) = extra {
-                    extra.insert(e.method.to_string(), operation);
-                }
-            }
-        }
+        place(item, e.method, operation);
     }
     let paths: Map<String, Value> = paths
         .into_iter()
@@ -171,6 +159,35 @@ pub fn document(
         doc["components"] = json!({ "securitySchemes": schemes });
     }
     Some(doc)
+}
+
+/// Puts an operation into a path item: under the lower-case key of a standard method, else in
+/// `x-mimic-methods` under the method. Endpoints that share a key and a method (a gRPC and an
+/// HTTP one, literals that escape alike) never overwrite each other: the first, in the order
+/// of the report, takes the slot, the next ones are `x-mimic-methods` entries `<METHOD>#2`,
+/// `<METHOD>#3`, and so on.
+fn place(item: &mut Map<String, Value>, method: &str, operation: Value) {
+    if let Some((_, lower)) = METHODS.iter().find(|(upper, _)| *upper == method)
+        && !item.contains_key(*lower)
+    {
+        item.insert((*lower).to_string(), operation);
+        return;
+    }
+    let extra = item
+        .entry("x-mimic-methods")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(extra) = extra else {
+        return;
+    };
+    // A standard method is here because its slot is taken: it starts at `#2`.
+    let standard = METHODS.iter().any(|(upper, _)| *upper == method);
+    let name = std::iter::once(method.to_string())
+        .filter(|_| !standard)
+        .chain((2..).map(|n| format!("{method}#{n}")))
+        .find(|name| !extra.contains_key(name));
+    if let Some(name) = name {
+        extra.insert(name, operation);
+    }
 }
 
 /// `{`/`}` of a literal are percent-encoded so that a literal is never read as a parameter.
