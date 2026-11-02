@@ -28,6 +28,8 @@ const WORKLOAD_VAR: &str = "MIMIC_WORKLOAD";
 const POST_TIMEOUT: Duration = Duration::from_secs(30);
 /// A `Retry-After` longer than this is capped: a pending report must not wait for ever.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+/// The pause between two posts of the shutdown flush, whatever the backoff or `Retry-After`.
+const FLUSH_RETRY: Duration = Duration::from_millis(200);
 /// How long the shutdown flush waits for the recorder to see the last exchanges.
 const MAX_SETTLE: Duration = Duration::from_secs(2);
 
@@ -222,7 +224,10 @@ impl Shipper {
             match timeout_at(deadline, self.attempt()).await {
                 Err(_) => break,
                 Ok(Attempt::Settled) => {}
-                Ok(Attempt::Retry(wait)) => {
+                Ok(Attempt::Retry(_)) => {
+                    // The kubelet may stop the process well before the deadline: no backoff and no
+                    // `Retry-After`, a fixed pause (never shorter, so a `Retry-After: 0` cannot spin).
+                    let wait = FLUSH_RETRY;
                     if Instant::now() + wait >= deadline {
                         break;
                     }
