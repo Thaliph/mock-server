@@ -75,7 +75,38 @@ pub enum Bound {
 impl Histogram {
     /// The `percent` quantile (1..=100): the bucket holding the observation of rank
     /// `ceil(count * percent / 100)`. `None` without data.
-    pub fn quantile(&self, _percent: u64) -> Option<Bound> {
-        todo!()
+    pub fn quantile(&self, percent: u64) -> Option<Bound> {
+        let count = self.count();
+        if count == 0 {
+            return None;
+        }
+        let rank = (u128::from(count) * u128::from(percent.clamp(1, 100)))
+            .div_ceil(100)
+            .max(1);
+        let mut seen = 0u128;
+        for (bucket, n) in &self.buckets {
+            seen += u128::from(*n);
+            if seen >= rank {
+                return Some(match *bucket {
+                    OVERFLOW => Bound::Overflow,
+                    b => Bound::Ms(upper_bound(b)),
+                });
+            }
+        }
+        Some(Bound::Overflow)
     }
+}
+
+/// Upper bound of bucket `i` in milliseconds, rounded up: the smallest `m` with `m^4 >= 2^i`.
+fn upper_bound(bucket: u8) -> u64 {
+    let (mut low, mut high) = (1u64, 1 << 17);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if u128::from(mid).pow(4) >= 1u128 << bucket {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    low
 }

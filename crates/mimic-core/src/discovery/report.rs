@@ -129,7 +129,20 @@ pub struct Endpoint<'a> {
     pub port: u16,
     pub method: &'a str,
     pub template: String,
+    /// The segments of the template; empty for a gRPC path, which is never templated.
+    pub segs: Vec<Seg>,
+    /// A gRPC path (`content-type: application/grpc*`).
+    pub grpc: bool,
     pub stats: &'a Stats,
+}
+
+/// An endpoint on its way to `Endpoint`.
+struct Found<'a> {
+    template: String,
+    segs: Vec<Seg>,
+    grpc: bool,
+    method: &'a str,
+    stats: &'a Stats,
 }
 
 impl Stats {
@@ -414,18 +427,20 @@ impl Node {
         }
     }
 
-    fn collect<'a>(&'a self, prefix: &mut Vec<Seg>, out: &mut Vec<(String, &'a str, &'a Stats)>) {
+    fn collect<'a>(&'a self, prefix: &mut Vec<Seg>, out: &mut Vec<Found<'a>>) {
         let template = render(prefix);
         for (method, stats) in &self.endpoints {
-            out.push((
-                if prefix.is_empty() {
+            out.push(Found {
+                template: if prefix.is_empty() {
                     "/".into()
                 } else {
                     template.clone()
                 },
+                segs: prefix.clone(),
+                grpc: false,
                 method,
                 stats,
-            ));
+            });
         }
         for (literal, child) in &self.literals {
             prefix.push(Seg::Literal(literal.clone()));
@@ -895,15 +910,23 @@ impl Report {
                 let mut found = Vec::new();
                 scope.root.collect(&mut Vec::new(), &mut found);
                 for (path, methods) in &scope.raw {
-                    found.extend(methods.iter().map(|(m, s)| (path.clone(), m.as_str(), s)));
+                    found.extend(methods.iter().map(|(m, s)| Found {
+                        template: path.clone(),
+                        segs: Vec::new(),
+                        grpc: true,
+                        method: m.as_str(),
+                        stats: s,
+                    }));
                 }
-                found.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-                out.extend(found.into_iter().map(|(template, method, stats)| Endpoint {
+                found.sort_by(|a, b| (&a.template, a.method).cmp(&(&b.template, b.method)));
+                out.extend(found.into_iter().map(|f| Endpoint {
                     direction: *direction,
                     port: *port,
-                    method,
-                    template,
-                    stats,
+                    method: f.method,
+                    grpc: f.grpc,
+                    template: f.template,
+                    segs: f.segs,
+                    stats: f.stats,
                 }));
             }
         }

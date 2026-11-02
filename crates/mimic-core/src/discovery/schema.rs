@@ -96,6 +96,11 @@ impl Format {
     }
 }
 
+/// The §6 string format of a value (`uuid`, `date-time`, ...), if it has one.
+pub fn string_format(s: &str) -> Option<&'static str> {
+    Format::of(s).map(Format::name)
+}
+
 fn is_email(s: &str) -> bool {
     match s.split_once('@') {
         Some((local, domain)) => {

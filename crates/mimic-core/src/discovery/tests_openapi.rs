@@ -335,13 +335,15 @@ fn ui_02_index_and_endpoint_list() {
 // UI-05
 
 fn servers(hosts: &[&str]) -> Option<Value> {
-    let all: Vec<Ex> = hosts
+    let mut all: Vec<Ex> = hosts
         .iter()
         .map(|h| Ex {
             host: Some((*h).into()),
             ..ex(80, "GET", "/x")
         })
         .collect();
+    // An exchange without a host, so that the document exists.
+    all.push(ex(80, "GET", "/x"));
     let d = doc(&report_of(&all), "inbound-80");
     assert_valid(&d);
     d.get("servers").cloned()
@@ -506,7 +508,7 @@ fn arb_ex() -> impl Strategy<Value = Ex> {
         prop::sample::select(vec![8080u16, 9090]),
         prop::sample::select(vec!["GET", "PUT", "POST", "PROPFIND"]),
         prop_oneof![paths.prop_map(String::from), guid],
-        prop::sample::select(vec![200u16, 201, 404, 500]),
+        prop::sample::select(vec![200u16, 201, 500, 503]),
         prop::sample::select(vec![1u64, 10, 100, 5000, 1 << 20]),
         prop::sample::select(vec![None, Some("svc"), Some("svc:8080"), Some("(invalid)")]),
     )
