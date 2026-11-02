@@ -701,3 +701,92 @@ proptest! {
         prop_assert!(!super::openapi::endpoint_list(&r).to_string().contains(&canary));
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Review items: colliding path items, saturating counts
+
+/// The operations of a path item, whatever the slot: the standard methods and the entries of
+/// `x-mimic-methods`.
+fn operations(d: &Value) -> usize {
+    d["paths"]
+        .as_object()
+        .expect("paths")
+        .values()
+        .map(|item| {
+            let item = item.as_object().expect("item");
+            let extra = item
+                .get("x-mimic-methods")
+                .and_then(Value::as_object)
+                .map_or(0, serde_json::Map::len);
+            item.keys().filter(|k| !k.starts_with("x-")).count() + extra
+        })
+        .sum()
+}
+
+#[test]
+fn ui_02_grpc_and_http_endpoints_of_one_key_and_method_are_both_kept() {
+    let http = rx("POST", "/pkg.Svc/Get");
+    let grpc = Rx {
+        grpc: true,
+        ..rx("POST", "/pkg.Svc/Get")
+    };
+    let r = report_of(&[http, grpc]);
+    assert_eq!(r.endpoints().len(), 2);
+    let d = doc(&r);
+    assert_eq!(operations(&d), 2);
+    let item = &d["paths"]["/pkg.Svc/Get"];
+    // Report order decides who has the standard slot: the HTTP endpoint comes first.
+    assert!(item["post"].get("x-mimic-grpc").is_none());
+    assert_eq!(item["x-mimic-methods"]["POST#2"]["x-mimic-grpc"], true);
+}
+
+#[test]
+fn ui_02_literals_that_escape_to_one_key_are_both_kept() {
+    let d = doc(&report_of(&[rx("GET", "/a{"), rx("GET", "/a%7B")]));
+    assert_eq!(operations(&d), 2);
+    assert_eq!(d["paths"]["/a%7B"]["get"]["x-mimic-exchanges"], 1);
+    assert_eq!(
+        d["paths"]["/a%7B"]["x-mimic-methods"]["GET#2"]["x-mimic-exchanges"],
+        1
+    );
+}
+
+#[test]
+fn ui_02_three_endpoints_of_one_slot_take_numbered_entries() {
+    let d = doc(&report_of(&[
+        rx("PROPFIND", "/a{"),
+        rx("PROPFIND", "/a%7B"),
+        Rx {
+            grpc: true,
+            ..rx("PROPFIND", "/a%7B")
+        },
+    ]));
+    assert_eq!(operations(&d), 3);
+    let extra = d["paths"]["/a%7B"]["x-mimic-methods"]
+        .as_object()
+        .expect("extra");
+    assert_eq!(
+        extra.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["PROPFIND", "PROPFIND#2", "PROPFIND#3"]
+    );
+}
+
+#[test]
+fn ui_02_counts_saturate() {
+    // A stored report is not trusted: counters at the top of u64 must not overflow.
+    let json = report_of(&[rx("GET", "/p"), rx("GET", "/p")])
+        .to_json()
+        .expect("serialises");
+    assert!(json.contains(r#""statuses":{"200":2}"#));
+    let json = json.replace(
+        r#""statuses":{"200":2}"#,
+        &format!(r#""statuses":{{"200":{},"201":7}}"#, u64::MAX),
+    );
+    let r = Report::from_json(&json).expect("parses");
+    let d = document(&r, "ns", "dep", 1, "inbound-80").expect("document");
+    assert_eq!(d["paths"]["/p"]["get"]["x-mimic-exchanges"], u64::MAX);
+    assert_eq!(
+        super::openapi::endpoint_list(&r)["endpoints"][0]["exchanges"],
+        u64::MAX
+    );
+}
