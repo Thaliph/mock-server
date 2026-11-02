@@ -462,3 +462,23 @@ async fn ctl_13_the_list_skips_an_unreadable_meta_with_one_error() {
     assert_eq!(mine, ["good"]);
     assert_eq!(errors(&capture, &ns, "stored meta unreadable"), 1);
 }
+
+#[tokio::test]
+async fn ctl_13_every_read_logs_its_error_although_the_status_pass_logged_the_streak() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let store = store(&valkey_url());
+    let ns = unique("ctl13s");
+    seed(&store, &ns, "front", &["front-1"]).await;
+    hset(&keys(&ns, "front").unwrap().meta, "exchanges", "many").await;
+    // The status pass logs the streak once, however often it reads.
+    for _ in 0..2 {
+        assert!(store.status_input(&ns, "front").await.is_err());
+    }
+    assert_eq!(errors(&capture, &ns, "stored meta unreadable"), 1);
+    // The read API logs one line per read (spec 7.5).
+    for want in [2, 3] {
+        let answer = get(&store, &format!("/v1/workloads/{ns}/front")).await;
+        assert_eq!(answer.status, 500);
+        assert_eq!(errors(&capture, &ns, "stored meta unreadable"), want);
+    }
+}
