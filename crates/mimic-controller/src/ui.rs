@@ -10,13 +10,36 @@ use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use prometheus_client::registry::Registry;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::store::{ReadError, Store, Summary};
 
-pub fn router(store: Arc<Store>) -> Router {
+/// Called on the blocking thread of a render, before it starts (tests hold renders with it).
+pub(crate) type Hook = Arc<dyn Fn() + Send + Sync>;
+
+/// `mimic_ui_requests_total` and `mimic_ui_render_duration_seconds` (spec §9).
+#[derive(Clone, Default)]
+pub struct UiMetrics {}
+
+impl UiMetrics {
+    pub fn register(_registry: &mut Registry) -> UiMetrics {
+        UiMetrics {}
+    }
+}
+
+pub fn router(store: Arc<Store>, metrics: UiMetrics) -> Router {
+    build(store, metrics, None)
+}
+
+#[cfg(test)]
+pub(crate) fn router_with_hook(store: Arc<Store>, metrics: UiMetrics, hook: Hook) -> Router {
+    build(store, metrics, Some(hook))
+}
+
+fn build(store: Arc<Store>, _metrics: UiMetrics, _hook: Option<Hook>) -> Router {
     Router::new()
         .route("/v1/workloads", get(list))
         .route("/v1/workloads/{namespace}/{deployment}", get(workload))
