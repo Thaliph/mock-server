@@ -670,6 +670,40 @@ impl Store {
         Ok(bytes)
     }
 
+    /// The stored `:report` bytes, unparsed, and the `:meta` `version` they were written with.
+    pub async fn stored_report(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<(Vec<u8>, u64), ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        let (stored, version): (Option<Vec<u8>>, Option<String>) = match redis::pipe()
+            .cmd("GET")
+            .arg(&k.report)
+            .cmd("HGET")
+            .arg(&k.meta)
+            .arg("version")
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(read) => read,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        // Expired between the two keys is the same as absent.
+        let (Some(bytes), Some(version)) = (stored, version) else {
+            return Err(ReadError::NotFound);
+        };
+        let version = version.parse().map_err(|_| {
+            tracing::error!(namespace, deployment, "stored meta unreadable");
+            ReadError::Unreadable
+        })?;
+        Ok((bytes, version))
+    }
+
     async fn read_failed(&self, error: redis::RedisError) -> ReadError {
         self.failed(error).await;
         ReadError::Unavailable
