@@ -85,7 +85,7 @@ impl StatusSink for KubeSink {
                 "metadata": {"name": name},
                 "status": {"discovery": discovery},
             });
-            api.patch_status(name, &PatchParams::apply(MANAGER), &Patch::Apply(&body))
+            api.patch_status(name, &apply_params(), &Patch::Apply(&body))
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
@@ -95,12 +95,19 @@ impl StatusSink for KubeSink {
 
 const MANAGER: &str = "mimic-controller";
 
+/// The parameters of the status apply.
+fn apply_params() -> PatchParams {
+    PatchParams::apply(MANAGER)
+}
+
 pub struct Reconciler {
     pub store: Arc<Store>,
     pub cache: Arc<WorkloadCache>,
     pub sink: Arc<dyn StatusSink>,
     pub metrics: StatusMetrics,
     pub window: Duration,
+    /// An apply that takes longer is abandoned.
+    pub apply_timeout: Duration,
     /// Whether `status not updated` was already logged for the current outage.
     pub down: AtomicBool,
 }

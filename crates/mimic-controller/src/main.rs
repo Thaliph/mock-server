@@ -18,6 +18,7 @@ mod workloads;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mimic_runtime::admin::{self, Readiness};
 use mimic_runtime::config::{CommonConfig, ConfigError, Env};
@@ -124,6 +125,7 @@ async fn run(config: Config) -> std::io::Result<()> {
             sink: Arc::new(status::KubeSink::new(kube_client.clone())),
             metrics: status_metrics,
             window: config.push.pod_window,
+            apply_timeout: Duration::from_secs(10),
             down: Default::default(),
         }
         .run(config.push.status_interval),

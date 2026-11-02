@@ -24,6 +24,7 @@ const WINDOW: Duration = Duration::from_secs(300);
 struct FakeSink {
     calls: Mutex<Vec<(String, String, Value)>>,
     fail: AtomicBool,
+    hang: AtomicBool,
 }
 
 impl FakeSink {
@@ -39,6 +40,9 @@ impl StatusSink for FakeSink {
                 .lock()
                 .unwrap()
                 .push((ns.into(), name.into(), discovery.clone()));
+            if self.hang.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if self.fail.load(Ordering::SeqCst) {
                 Err("refused".into())
             } else {
@@ -93,6 +97,7 @@ fn setup(url: &str, workloads: &[(&str, &str, &str)]) -> Setup {
         sink: sink.clone(),
         metrics: status_metrics,
         window: WINDOW,
+        apply_timeout: Duration::from_millis(200),
         down: AtomicBool::new(false),
     };
     Setup {
@@ -276,4 +281,105 @@ fn ctl_18_the_cache_lists_workloads_with_the_status_they_hold() {
     assert_eq!(cache.targets().len(), 1);
     cache.set_status("shop", "gone", Some(json!({})));
     assert_eq!(cache.targets().len(), 1);
+}
+
+#[test]
+fn ctl_18_the_status_apply_is_forced_under_the_controller_manager() {
+    let params = apply_params();
+    assert!(params.force);
+    assert_eq!(params.field_manager.as_deref(), Some("mimic-controller"));
+}
+
+#[tokio::test]
+async fn ctl_18_an_apply_that_hangs_is_abandoned_counted_and_logged() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let ns = unique("ctl18");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "users"), (&ns, "w2", "users")]);
+    s.sink.hang.store(true, Ordering::SeqCst);
+    let pass = s.reconciler.tick(now_ms());
+    tokio::time::timeout(Duration::from_secs(5), pass)
+        .await
+        .expect("the pass ends although the apply hangs");
+    // Both workloads were tried: the hanging one did not hold the pass.
+    assert_eq!(s.sink.calls().len(), 2);
+    assert_eq!(count(&s.metrics, "error"), 2.0);
+    let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(raw.contains("status apply failed"), "{raw}");
+}
+
+#[tokio::test]
+async fn ctl_18_a_status_without_the_defaulted_inbound_count_is_unchanged() {
+    let ns = unique("ctl18");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    // The CRD defaults `endpoints.inbound` to 0, so the watch returns it.
+    s.reconciler.cache.set_status(
+        &ns,
+        "w1",
+        Some(json!({"endpoints": {"inbound": 0}, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
+    );
+    s.reconciler.tick(now_ms()).await;
+    assert!(s.sink.calls().is_empty());
+}
+
+fn unreadable_errors(capture: &crate::webhook::tests::Capture, ns: &str) -> usize {
+    String::from_utf8(capture.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["level"] == "ERROR" && v["namespace"] == ns)
+        .filter(|v| v["message"].as_str().is_some_and(|m| m.ends_with("unreadable")))
+        .count()
+}
+
+async fn corrupt(ns: &str, dep: &str, field: &str, value: &str, pods: bool) {
+    let k = crate::store::keys(ns, dep).unwrap();
+    let key = if pods { k.pods } else { k.meta };
+    let mut conn = redis::Client::open(valkey_url().as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(key)
+        .arg(field)
+        .arg(value)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ctl_18_an_unreadable_meta_is_logged_once_per_streak() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let ns = unique("ctl18");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "users")]);
+    push(&s.reconciler.store, &ns, "users", "users-a", &["/a"]).await;
+    corrupt(&ns, "users", "exchanges", "many", false).await;
+    for _ in 0..3 {
+        s.reconciler.tick(now_ms()).await;
+    }
+    assert_eq!(unreadable_errors(&capture, &ns), 1);
+    assert!(s.sink.calls().is_empty());
+    // Readable again, then broken again: a new streak, a new line.
+    corrupt(&ns, "users", "exchanges", "7", false).await;
+    s.reconciler.tick(now_ms()).await;
+    assert_eq!(s.sink.calls().len(), 1);
+    corrupt(&ns, "users", "exchanges", "many", false).await;
+    s.reconciler.tick(now_ms()).await;
+    s.reconciler.tick(now_ms()).await;
+    assert_eq!(unreadable_errors(&capture, &ns), 2);
+}
+
+#[tokio::test]
+async fn ctl_18_unreadable_pods_are_logged_as_pods() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let ns = unique("ctl18");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "users")]);
+    push(&s.reconciler.store, &ns, "users", "users-a", &["/a"]).await;
+    corrupt(&ns, "users", "users-a", "yesterday", true).await;
+    s.reconciler.tick(now_ms()).await;
+    s.reconciler.tick(now_ms()).await;
+    let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(raw.matches("stored pods unreadable").count(), 1, "{raw}");
+    assert_eq!(raw.matches("stored meta unreadable").count(), 0, "{raw}");
 }
