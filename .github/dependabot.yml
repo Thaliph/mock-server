@@ -35,3 +35,12 @@ updates:
     directory: /images
     schedule: {interval: weekly}
     cooldown: {default-days: 14}
+    ignore:
+      # The floor of the e2e Kubernetes matrix (1.33): patch updates only (#287).
+      - dependency-name: kindest/node
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # e2e clients stay on LTS lines, moved by hand (#286, #289).
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+      - dependency-name: eclipse-temurin
+        update-types: ["version-update:semver-major"]
