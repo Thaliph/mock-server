@@ -88,8 +88,6 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }} # zizmor: ignore[cache-poisoning] cache written from main only, nothing is published by this job
       - run: cargo test --workspace --locked
-        env:
-          MIMIC_TEST_REQUIRE_NETNS: "1" # the SIGTERM test of the sidecar needs `unshare -rn` with iptables
 
   chart:
     runs-on: ubuntu-24.04

@@ -879,7 +879,8 @@ const REDIRECTED: &str = "127.0.0.1:18080";
 const CLIENT_IP: &str = "127.0.0.9";
 
 /// A test that cannot run here: skipped with a message, or failed under `MIMIC_TEST_REQUIRE_NETNS=1`
-/// (the CI test job does not set it unless the runner is known to support `unshare -rn` with iptables).
+/// (the CI test job does not set it: a CI run on a GitHub-hosted `ubuntu-24.04` runner failed the probe,
+/// `unshare -rn` with `ip` and `iptables` is not usable there, so the test is skipped in CI and runs locally).
 fn skip(test: &str, why: &str) {
     assert!(
         std::env::var_os("MIMIC_TEST_REQUIRE_NETNS").is_none(),
