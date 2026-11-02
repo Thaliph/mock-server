@@ -438,8 +438,9 @@ Everything below except the capture tap, content decoding and the recorder threa
   `MIMIC_DISCOVERY_MAX_LITERALS` distinct literal children are kept; when one more appears the
   node becomes **absorbing**: its literals and its parameter child merge into one parameter, and
   every later segment at that position is that parameter. All parameter kinds at one position
-  are one parameter (OpenAPI cannot hold `/a/{x}` and `/a/{y}`); its schema is the merge of the
-  values' schemas (§6 schemas). A parameter is named after the previous literal segment, `{<literal>_id}`
+  are one parameter (OpenAPI cannot hold `/a/{x}` and `/a/{y}`). The tree keeps no parameter
+  value: the OpenAPI document (§7.6) derives a parameter's schema from the concrete paths of the
+  endpoint's samples. A parameter is named after the previous literal segment, `{<literal>_id}`
   (lower case, characters other than `a-z0-9` replaced by `_`), or `{param<n>}` (n = 1-based
   segment position) when there is no previous literal or the name is taken. The name comes from the immediately
   preceding segment only, and only when that segment is a non-empty literal. There is one
@@ -612,7 +613,7 @@ Everything below except the capture tap, content decoding and the recorder threa
   with the same pure merge; the controller re-applies templating on the union, so a position
   that each pod sees below the literal limit but the deployment sees above it is absorbed.
   Key layout, retention (30 days) and the API are in §7.3 and §7.2.
-- **Consumers.** F6 renders reports as OpenAPI 3.1. F7 records egress with the same engine.
+- **Consumers.** F6 renders stored reports as OpenAPI 3.1 (§7.6). F7 records egress with the same engine.
   F10 mock matching ignores volatile and redacted fields (§8). F11 (load test) builds requests
   from ingress templates, samples, schemas and volatility; redacted values (credentials) must
   be supplied by the user, and its own traffic must not be recorded as discovery (F11
@@ -637,7 +638,8 @@ Everything below except the capture tap, content decoding and the recorder threa
   re-applies path templating on the union, within the store bounds of §7.3.
 - The UI and its API are read-only and served on the controller's UI listener, bound to
   loopback and reached by `kubectl port-forward` (Kubernetes RBAC `pods/portforward` in the
-  controller's namespace is the authentication, §7.5).
+  controller's namespace is the authentication, §7.5). The UI never sends traffic to the
+  cluster's workloads: it reads the store only (§7.5, §7.6).
 
 ### 7.1 Injection
 
@@ -987,21 +989,33 @@ Everything below except the capture tap, content decoding and the recorder threa
   is `0` and not blank for a direction without endpoints, while the stored status omits it and
   the controller compares statuses with that default applied), `Pods` and `Last push` (an age, as kubectl prints `date` columns). Mode convergence is added in F10.
 
-### 7.5 Read API (F5)
+### 7.5 Read API and UI (F5, F6)
 
 - Plain HTTP on `MIMIC_UI_ADDR` (default `127.0.0.1:8080`, loopback: reached only through
   `kubectl port-forward` to a controller pod); a peer that is not a loopback address gets
   `403` whatever the bind address, and so does a request whose `Host` is missing or is not
   `localhost`, `127.0.0.1` or `[::1]` (with or without a port), so that a web page cannot
   reach an open port-forward through DNS rebinding; an empty port (`127.0.0.1:`) is not a port
-  and gets `403` as well. `GET` only: every other method, `HEAD` included, gets `405` with
-  `Allow: GET` (a body-less probe of a read API has no use, and the answers are not cacheable
-  anyway). JSON, sorted keys:
+  and gets `403` as well. `GET` and, from F6, `HEAD` (RFC 9110: the same status and headers as
+  `GET`, no body); every other method gets `405` with `Allow: GET, HEAD`. In F5 `HEAD` got `405`
+  (`Allow: GET`); F6 serves it because browsers and link checkers expect it wherever `GET` is
+  served (#293 note 28). JSON, sorted keys:
   - `GET /v1/workloads` → `{"workloads": [{"namespace", "deployment", "endpoints",
     "exchanges", "sample_bytes", "last_push"}]}`, sorted by namespace then deployment;
   - `GET /v1/workloads/<ns>/<dep>` → the same object plus `"pods": {"<pod>": "<last push,
     RFC 3339>"}`;
-  - `GET /v1/workloads/<ns>/<dep>/report` → the stored `:report` bytes.
+  - `GET /v1/workloads/<ns>/<dep>/report` → the stored `:report` bytes;
+  - `GET /v1/workloads/<ns>/<dep>/endpoints` (F6) → `{"endpoints": [{"direction", "port",
+    "method", "template", "grpc", "exchanges", "statuses": {"<code>": <count>}, "latency_ms":
+    {"p50", "p90", "p99"}, "hosts", "last_seen", "document"}]}` in the order of the report's
+    endpoints (direction, port, template, method); `latency_ms` values are the §7.6 quantiles,
+    `last_seen` is `YYYY-MM-DD` or absent, `document` is the id of the §7.6 document that holds
+    the endpoint;
+  - `GET /v1/workloads/<ns>/<dep>/openapi` (F6) → `{"documents": [{"id", "direction", "port",
+    "endpoints"}]}`, one entry per document of §7.6, sorted by id;
+  - `GET /v1/workloads/<ns>/<dep>/openapi/<id>` (F6) → the OpenAPI 3.1 document `<id>` (§7.6),
+    `application/json`; `400` for an id outside the grammar of §7.6, `404` for a well-formed id
+    that the report does not hold.
 
   `404` for a deployment without data, `400` for a name that is not DNS-1123, `503` while
   Valkey is unavailable. A timestamp beyond year 9999 is shown as `9999-12-31T23:59:59.999Z`.
@@ -1010,11 +1024,144 @@ Everything below except the capture tap, content decoding and the recorder threa
   `namespace` and `deployment`: `stored report unreadable` for `:report` (§7.3), `stored meta
   unreadable` for `:meta` and `stored pods unreadable` for `:pods`. In the list, an entry whose `:meta` is unreadable is
   skipped, with that one ERROR line, instead of failing the whole list.
-- Consumers: F6 adds the OpenAPI 3.1 document and Swagger UI of a deployment on this
-  listener, built from the same report; F9 adds an authenticated read of a sidecar's own
-  deployment on the sidecar API (§7.2) for egress recordings and the mode (F10); F11 reads
-  ingress templates, samples, schemas and volatility through the same `store` module, its
-  access path being part of its design.
+  The `endpoints`, `openapi` and document routes parse the stored report (`Report::from_json`
+  and the structural check of §7.3, as a push) and render it on a blocking thread, at most 2 at
+  once per replica (others wait), so a large report cannot stall the listener; rendering is a
+  pure function of the report and the `:meta` `version` and cannot fail on a checked report (a
+  serialisation error is `500` with ERROR `openapi render failed`, `namespace`, `deployment`).
+- **UI pages (F6).** Static HTML, the same bytes for every deployment, filled in the browser by
+  one script, `mimic.js`, that reads the JSON routes above and writes text through DOM APIs only
+  (`textContent`, `createElement`; never `innerHTML`, never `eval`):
+  - `GET /` → `308` to `/ui/`;
+  - `GET /ui/` → the workloads list: namespace, deployment, endpoints, exchanges, last push,
+    each linking to its deployment page;
+  - `GET /ui/workloads/<ns>/<dep>` → the deployment page: the summary and pods of
+    `/v1/workloads/<ns>/<dep>`, the endpoint list of `/endpoints` (direction, port, method,
+    template, exchanges, statuses, latency quantiles, last seen), and one link per document;
+  - `GET /ui/workloads/<ns>/<dep>/openapi/<id>` → Swagger UI showing that document, with a
+    link to the raw JSON (for import into other tools).
+
+  `400` for a name or id outside its grammar (no page is served for it). A page of a
+  deployment without data is served and shows "no data" from the `404` of its JSON route.
+- **Swagger UI configuration** (in `mimic.js`, nothing inline): `url` = the document route;
+  `supportedSubmitMethods: []` (no "Try it out" button, so the UI never sends a request to a
+  workload); `tryItOutEnabled: false`; `validatorUrl: null` (no call to
+  `validator.swagger.io`); `queryConfigEnabled: false` (a URL cannot load another document or
+  configuration); `withCredentials: false`; `showExtensions: true` (the `x-mimic-*` fields of
+  §7.6 are shown); `deepLinking: true`; base layout, no standalone preset (no "Explore" URL
+  box); a `requestInterceptor` that refuses every URL other than a same-origin
+  `/v1/workloads/` route (a `$ref` in a document cannot make the UI fetch anything else).
+- **Static assets (F6)**, embedded in the controller binary (`include_bytes!`, no file in the
+  image, no CDN, nothing fetched at run time) and served under `/ui/assets/`: `mimic.js`,
+  `mimic.css`, and `swagger-ui/<version>/` with `swagger-ui-bundle.js`, `swagger-ui.css`,
+  `LICENSE`, `NOTICE` and `swagger-ui-bundle.js.LICENSE.txt` of the npm package
+  `swagger-ui-dist` (Apache-2.0; its licence and notices are served and kept in the source
+  tree). Any other asset path is `404`. Content types are fixed per extension (`text/html;
+  charset=utf-8`, `text/javascript; charset=utf-8`, `text/css; charset=utf-8`, `text/plain;
+  charset=utf-8`). Source maps are not vendored.
+  - *Pinning*: `crates/mimic-controller/ui/package.json` names `swagger-ui-dist` at an exact
+    version and `package-lock.json` holds its tarball URL and `sha512` integrity; Dependabot
+    (`npm` ecosystem, 14-day cooldown) proposes updates; `scripts/check-cooldown.py` also reads
+    that lockfile (publication time from the npm registry) with the same 14 days and allowlist.
+  - *Vendoring and integrity*: `scripts/vendor-swagger-ui.py` downloads the locked tarball from
+    `registry.npmjs.org`, verifies its `sha512` against the lockfile, extracts the files above
+    into `crates/mimic-controller/ui/vendor/swagger-ui/` and writes `SHA256SUMS`; `--check`
+    (CI supply-chain stage) does the same into a temporary directory and fails unless the
+    committed files are byte-identical. A unit test of the controller checks the embedded bytes
+    against `SHA256SUMS`. A Dependabot bump therefore fails CI until the files are vendored
+    again by the script and the diff is reviewed.
+- **Response headers (F6)**, on every answer of the listener (`403`, `404` and `405`
+  included):
+  - `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self';
+    img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action
+    'none'; frame-ancestors 'none'` (no inline or evaluated script; the page can only talk to
+    the listener's own origin, i.e. the port-forward). A relaxation that Swagger UI needs is a
+    spec change; `'unsafe-eval'` and an inline script source are never allowed;
+  - `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+    `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`;
+  - `Cache-Control: no-store`, except `public, max-age=31536000, immutable` for the versioned
+    `swagger-ui/<version>/` assets;
+  - no `Access-Control-Allow-*` header: other origins cannot read an answer.
+- **Observability (F6)**: `mimic_ui_requests_total{route,code}` (`route` is the route pattern,
+  e.g. `/v1/workloads/{namespace}/{deployment}/openapi/{id}`, or `other`; `code` the status
+  code) and `mimic_ui_render_duration_seconds` (histogram of parse + render, buckets as
+  `mimic_store_write_duration_seconds`). No line is written per request; no line or series
+  holds a path, template or report content.
+- Consumers: F8 adds outbound documents (§7.6) with no change to the routes; F9 adds an
+  authenticated read of a sidecar's own deployment on the sidecar API (§7.2) for egress
+  recordings and the mode (F10); F11 reads ingress templates, samples, schemas and volatility
+  through the same `store` module, its access path being part of its design.
+
+### 7.6 OpenAPI mapping (F6)
+
+A pure function in `mimic-core` (`discovery::openapi`) of a checked stored report, the
+namespace, the deployment and the `:meta` `version`; no clock, no I/O. Output is
+`serde_json::Value` serialised with sorted keys, arrays in the orders stated below, so the same
+input gives byte-identical output. Only the report's names, structure and **samples** (redacted
+by the sidecar and again by the controller, §7.3) reach the document; nothing recorded is ever
+written into a `description`, `summary` or `title` (Swagger UI renders those as Markdown).
+
+- **Documents.** One per scope of the report: `inbound-<port>` per inbound port (decimal, no
+  leading zero; id grammar `inbound-[1-9][0-9]{0,4}`, port 1–65535). From F8, one per outbound
+  authority, `outbound-<authority>` (grammar defined by F7/F8 from the §4.1 normalised
+  authority): adding them changes neither the inbound documents nor the routes; the index and
+  the endpoint list gain entries with `direction: "outbound"` and `authority` instead of `port`.
+  A deployment that listens on one port has one document. Paths of two scopes never share a
+  document, so `/a` on port 8080 and `/a` on 9090 never collide.
+- **Top level.** `openapi: "3.1.1"`; `info.title` = `<ns>/<dep> inbound :<port>` (Kubernetes
+  names and a number only); `info.version` = the `:meta` `version` in decimal; `info.description`
+  a constant text saying the document is inferred from observed traffic. `servers`: one
+  `{"url": "http://<host>"}` per distinct `hosts` value of the scope's endpoints that is a §4.1
+  normalised authority (not `(invalid)`, not containing the redaction marker), sorted, at most
+  16 (inbound HTTPS is not discovered, so inbound is `http`); no `servers` when none qualifies.
+  `components.securitySchemes` as below; no other `components`, no `$ref` anywhere.
+- **Paths.** The key is the endpoint's template (§6), parameters as rendered (`{users_id}`),
+  with `{` and `}` of literal segments percent-encoded (`%7B`, `%7D`) so a literal is never read
+  as a parameter; `/` for the root. gRPC paths are keys as they are, with the same escaping.
+  The operations of a path item are its methods: `GET`, `PUT`, `POST`, `DELETE`, `OPTIONS`,
+  `HEAD`, `PATCH` and `TRACE` (exact upper case) under their lower-case keys; any other method
+  under `x-mimic-methods` (object keyed by method) with the same operation object (OpenAPI 3.1
+  has no field for it).
+- **Operation.**
+  - `parameters`, in this order: path parameters in template order (`required: true`; schema
+    `{"type": "string"}` plus `format` when every value of that position in the endpoint's
+    sample paths has the same §6 string format; no sample: `{"type": "string"}`); query keys
+    in byte order (`required` when the key was in every exchange of the endpoint, schema from
+    §6, `array` with `items` when repeated); request headers in byte order, except
+    `accept`, `content-type` and `authorization` (ignored by OpenAPI as parameters). Each
+    parameter has `examples` from the samples: `{"sample-<16 hex of the sample key>": {"value":
+    <the redacted value>}}`, distinct values only, the first sample key in order kept per value.
+    A parameter whose §6 field is volatile has `x-mimic-volatile: true`, a redacted one
+    `x-mimic-redacted: true`.
+  - `security`: when samples carry `authorization: <Scheme> <redacted>`, one requirement per
+    scheme, in byte order of the lower-case scheme, naming `components.securitySchemes`
+    `http_<scheme>` = `{"type": "http", "scheme": "<scheme>"}` (scheme a token of `a-z0-9-`,
+    else ignored); a redacted `authorization` without a scheme gives `apiKey` in header
+    `Authorization`, named `authorization`.
+  - `requestBody` when the endpoint has request bodies: `content` per media type (§6, at most
+    16, byte order) with `schema` (JSON: the §6 schema; form: the object schema of its fields;
+    opaque: no schema) and `examples` from the samples whose request has that media type
+    (JSON value, or a form as an object of field → value, a repeated field → array of values);
+    `x-mimic-count` and `x-mimic-bytes` (mean size) per media type; `required: true` when the
+    media counts sum to at least the endpoint's exchanges.
+  - `responses`: one per status code of the endpoint's counters (string key), `description`
+    the reason phrase of the IANA registry for that code, else `Status <code>`, and
+    `x-mimic-count`. A response holds the `content` (media types seen in the `content-type` of
+    that status's samples, each with the endpoint-wide §6 schema of that media type and the
+    examples of that status's samples) and `headers` (response headers seen in that status's
+    samples, except `content-type`, with the endpoint-wide schema). A status without a sample
+    has a description only. The report keeps schemas per endpoint and media type, not per
+    status (§11.1).
+  - Extensions: `x-mimic-exchanges` (sum of the counters), `x-mimic-latency-ms` `{"p50",
+    "p90", "p99"}`: for each quantile the upper bound in ms (rounded up) of the histogram bucket
+    holding it, `null` for the overflow bucket, absent without data; `x-mimic-hosts` (sorted);
+    `x-mimic-last-seen` (`YYYY-MM-DD`, when stamped); `x-mimic-volatile` and
+    `x-mimic-redacted`, the sorted §6 field names of the endpoint that are volatile and
+    redacted; `x-mimic-grpc: true` and `tags: ["<package.Service>"]` (the first path segment)
+    for a gRPC path. No `operationId` (it would need disambiguation and nothing uses it).
+- **Bounds.** The document is a function of a report that passed the §7.3 check, so its size
+  is bounded by the store limits (at most 20 samples per endpoint, `MIMIC_STORE_SAMPLE_BUDGET`
+  of sample bytes per deployment).
 
 ## 8. Mock
 
@@ -1074,6 +1221,8 @@ Everything below except the capture tap, content decoding and the recorder threa
   | `mimic_store_evicted_total` | counter, stored endpoints and samples displaced by the bounded merge (§7.3) | `kind` (`endpoint`, `sample`) |
   | `mimic_store_expired_total` | counter, endpoints and samples dropped by retention | `kind` |
   | `mimic_status_updates_total` | counter, `MimicWorkload` status applies | `result` (`ok`, `error`) |
+| `mimic_ui_requests_total` | counter (F6), answers of the UI listener (§7.5) | `route` (route pattern or `other`), `code` |
+| `mimic_ui_render_duration_seconds` | histogram (F6), parse and render of a stored report for `endpoints`, `openapi` and a document; buckets as `mimic_store_write_duration_seconds` | `route` |
 
   `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
   port removed, `(invalid)` when it is not a host name or IP literal; an HTTP/1 `Host` value or
@@ -1096,7 +1245,9 @@ Everything below except the capture tap, content decoding and the recorder threa
 - Durations are written `<n>ms`, `<n>s` and, from F5, `<n>m`, `<n>h` or `<n>d`.
 - One image `ghcr.io/thaliph/mimic` (distroless, non-root UID 65532, no shell) holds
   `mimic-sidecar` and `mimic-controller` (the webhook runs the sidecar as UID 1337).
-  From F3 the `mimic` image also holds the static `mimic-trust` binary (§7.1).
+  From F3 the `mimic` image also holds the static `mimic-trust` binary (§7.1). From F6 the
+  `mimic-controller` binary embeds the UI assets, Swagger UI included (§7.5): the image gains no
+  file and the UI fetches nothing from outside the listener.
   `ghcr.io/thaliph/mimic-init` (distroless, no shell) holds only `mimic-init`, `iptables-restore`
   and `ip6tables-restore` (nft backend) and their libraries.
 - `mimic-init` has no admin listener (it exits): FND-02 and FND-03 do not apply to it.
@@ -1142,7 +1293,7 @@ Everything below except the capture tap, content decoding and the recorder threa
 | `MIMIC_STORE_MAX_DEPLOYMENTS` | `50` | Deployments with data per namespace (§7.3), 1–100000. |
 | `MIMIC_STATUS_INTERVAL` | `30s` | Period of the `MimicWorkload` status update (§7.4), 1s–1h. |
 | `MIMIC_STATUS_POD_WINDOW` | `5m` | A pod counts in `status.discovery.pods` while its last push is this recent, 1s–24h. |
-| `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API (§7.5) and, from F6, UI listener; plain HTTP, loopback peers only. |
+| `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API (§7.5) and, from F6, UI listener (pages, OpenAPI documents, embedded Swagger UI); plain HTTP, loopback peers only. |
 
 ### 10.3 Sidecar variables
 
@@ -1215,6 +1366,12 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   redaction to every pushed report before it reaches Valkey or a log (§7.3), never logs
   report content, and serves the stored reports on loopback only (§7.5). Valkey keeps only
   redacted reports, sequence numbers and pod names.
+- The UI (F6, §7.5) is read-only and renders stored, re-redacted reports only: its documents
+  hold names, schemas and redacted samples, never a recorded value in a Markdown field
+  (§7.6). Its pages run under a CSP that forbids inline and evaluated script and any origin but
+  the listener's own; Swagger UI has no "Try it out" and no validator, so a browser on the
+  UI never sends a request to a workload or to the Internet. Swagger UI is vendored at a pinned
+  version, verified against its npm `sha512` and embedded in the binary.
 - TLS key custody (§5): the seed exists only in its Secret and the controller's memory; root
   keys only in the controller's memory; intermediate and leaf keys only in the sidecar's
   memory (non-dumpable, no core file). Tokens and keys are never logged.
@@ -1306,6 +1463,16 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   `/discovery` and, from F5, stored in Valkey. Personal data that is not a credential (names,
   e-mail addresses, amounts) is kept in samples by design; the `@` rule only keeps it out of
   path templates. Inbound HTTPS is not discovered.
+- UI (F6): anyone allowed `pods/portforward` on the controller pods reads the discovered API
+  of every namespace (the port-forward carries no user identity, so there is no
+  per-namespace authorisation); grant it like read access to all injected namespaces. Any
+  process of the workstation that runs `kubectl port-forward` can reach the forwarded port,
+  as with every port-forward. The UI shows what redaction kept (the limits above apply to
+  it). Response schemas are per endpoint and media type, not per status (§6): a `200` and a
+  `404` with the same media type show the same merged schema; a status whose samples were
+  all refused by the sample budget shows a description only. Inferred documents describe
+  observed traffic, not a contract: optional fields never sent, and statuses never seen, are
+  missing.
 - Discovery is best effort under load: dropped records, a full sample budget or the endpoint
   limit make counters and samples partial (counted in §9 metrics), never slow traffic. A
   `404`/`405` reaching a path no other status has created is not recorded. Template
@@ -1348,7 +1515,7 @@ names contain the criterion ID (`fnd_02_…`).
 | FND-07 | The image runs as UID 65532, contains no shell, and both binaries answer `--version` with the crate version. |
 | FND-08 | `helm lint` passes; every rendered pod is Pod Security `restricted` (non-root, read-only root filesystem, no capability, `RuntimeDefault` seccomp, no privilege escalation). Valkey requires a password generated at install and kept on upgrade, and only accepts connections from the controller (NetworkPolicy; needs a CNI that enforces NetworkPolicy, as kind's default does). |
 | FND-09 | On kind (Kubernetes ≥ 1.33), `helm install` brings the controller and Valkey to Ready, and the controller's `/readyz` and `/metrics` answer through a port-forward. |
-| FND-10 | CI runs as dependent stages: lint → unit and integration tests → image build and scan → kind e2e, plus a chart stage (`helm lint --strict`; the release-pinned chart renders both mimic images by digest, `scripts/check-release-chart.sh`; the pins of `images/Dockerfile` match `values.yaml` and the kind node image in ci.yml, `scripts/check-pins.sh`) and a supply-chain stage: `cargo deny` (advisories, licences, sources, and the bans of `deny.toml`, which deny the Brotli crates), `zizmor`, `actions/dependency-review-action` on a pull request, a dependency cooldown (`scripts/check-cooldown.py`: a crate that a pull request adds or bumps in a `Cargo.lock` must be published at least 14 days before, unless `scripts/cooldown-allowlist.toml` lists it with a reason), gitleaks on a pull request, `trivy config` on the rendered chart and on the Dockerfile (HIGH and CRITICAL fail), and CodeQL for Rust and GitHub Actions. The image job scans the mimic, mimic-init and Valkey images with Trivy. A weekly and a push-to-main OpenSSF Scorecard run reports its result without gating. A single `ci-ok` check sums up every job except Scorecard: it fails if any job fails or is cancelled, and accepts a skipped job only when the job's own path filter excluded it (the HTTP/1 codec fuzz job, PRX-28, on a change outside `crates/mimic-core/src/proxy/http1/`, `crates/mimic-core/src/proxy.rs`, the workspace `Cargo.toml` and `Cargo.lock`, and `fuzz/`; the discovery recorder fuzz job, DSC-23, on a change outside `crates/mimic-core/src/discovery/` and `fuzz/`). A `v*` tag is released only from a commit on `main`; it publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart pinned to the digests of both mimic images. |
+| FND-10 | CI runs as dependent stages: lint → unit and integration tests → image build and scan → kind e2e, plus a chart stage (`helm lint --strict`; the release-pinned chart renders both mimic images by digest, `scripts/check-release-chart.sh`; the pins of `images/Dockerfile` match `values.yaml` and the kind node image in ci.yml, `scripts/check-pins.sh`) and a supply-chain stage: `cargo deny` (advisories, licences, sources, and the bans of `deny.toml`, which deny the Brotli crates), `zizmor`, `actions/dependency-review-action` on a pull request, a dependency cooldown (`scripts/check-cooldown.py`: a crate that a pull request adds or bumps in a `Cargo.lock` must be published at least 14 days before, unless `scripts/cooldown-allowlist.toml` lists it with a reason), gitleaks on a pull request, `trivy config` on the rendered chart and on the Dockerfile (HIGH and CRITICAL fail), and CodeQL for Rust and GitHub Actions. The image job scans the mimic, mimic-init and Valkey images with Trivy. A weekly and a push-to-main OpenSSF Scorecard run reports its result without gating. A single `ci-ok` check sums up every job except Scorecard: it fails if any job fails or is cancelled, and accepts a skipped job only when the job's own path filter excluded it (the HTTP/1 codec fuzz job, PRX-28, on a change outside `crates/mimic-core/src/proxy/http1/`, `crates/mimic-core/src/proxy.rs`, the workspace `Cargo.toml` and `Cargo.lock`, and `fuzz/`; the discovery recorder fuzz job, DSC-23, on a change outside `crates/mimic-core/src/discovery/` and `fuzz/`). A `v*` tag is released only from a commit on `main`; it publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart pinned to the digests of both mimic images. From F6 the cooldown also covers the npm lockfile of the vendored Swagger UI, and the supply-chain stage checks the vendored files against it (UI-13). |
 
 ### 12.2 F1 — Injection
 
@@ -1524,13 +1691,41 @@ Sidecar integration tests use the fake sidecar API of F3. A *canary* is as in §
 | CTL-21 | **E.** Churn: with traffic from the client before, during and after `kubectl rollout restart deployment/users`, and one controller pod deleted while pushes are flowing, the merged `200` count of `GET /users/{users_id}` is at least the number of `200`s the client received (no exchange lost at `SIGTERM`) and at most the number the users pods answered, from their access lines (none counted twice; a rollout cutting a connection after the pod answered may cost the client its answer and the sidecar its exchange, never more than that gap); with `MIMIC_STATUS_POD_WINDOW=30s` (set by the e2e), `status.discovery.pods` comes back to 2, with the pods of the rollout listed by the read API, after the old pods' window while traffic still flows (a sidecar pushes only when it recorded exchanges, so without traffic the window empties), and the endpoints are unchanged. |
 | CTL-22 | **C.** The DSC-23 fuzz target also feeds arbitrary bytes to `Report::from_json`, the structural check, re-redaction and the bounded merge with a fixed valid report: no panic, and every merge result passes the check. Same CI schedule and `ci-ok` path-filter rule as DSC-23. |
 
+### 12.7 F6 — Discovery UI (OpenAPI 3.1 + Swagger UI)
+
+Levels as in §12.2. Unit tests of §7.6 run on reports built by the recorder and the bounded
+merge (the generators of DSC and CTL tests). Documents are validated against the official
+OpenAPI 3.1 schema (`https://spec.openapis.org/oas/3.1/schema-base/2022-10-07`, vendored as a
+test fixture) with the `jsonschema` crate as a dev-dependency (default features off: no
+network). Controller integration tests run against a real Valkey as in §12.6. The browser
+checks use a pinned headless Chromium image (`images/Dockerfile` stage `e2e-chromium`), run
+on the host network against the port-forward, with `--host-resolver-rules` that resolve no
+name but `localhost`. A *canary* is as in §12.5.
+
+| ID | Criterion |
+|---|---|
+| UI-01 | **U.** Determinism and validity: for every generated report (`proptest`, ≥ 10 000 cases) the index, the endpoint list and every document of §7.6 are byte-identical across two calls, and equal for reports merged from the same pushes in another order or grouping (below the store limits); every document validates against the OpenAPI 3.1 schema-base, has `openapi` `3.1.1`, the `info.title` and `info.version` of §7.6, and no `$ref` member other than a key of a `properties` map or inside an example `value`. |
+| UI-02 | **U.** Paths: `/users/42` and `/users/7` give the key `/users/{users_id}` with a required path parameter `users_id` of schema `{"type": "string"}`; UUID sample values give `format: uuid`, mixed values none; `/` and `/users/` (trailing slash) are their own keys; a literal `a{b}` is written `a%7Bb%7D`; `GET` … `TRACE` are lower-case operations and `PROPFIND` is under `x-mimic-methods`; the same template on ports 8080 and 9090 gives two documents `inbound-8080` and `inbound-9090`, each holding it once; a gRPC path `/pkg.Svc/Get` is a key as it is, with `tags: ["pkg.Svc"]` and `x-mimic-grpc: true`. The index lists the documents sorted by id with their endpoint counts; the endpoint list follows the report's endpoint order and names each endpoint's document. |
+| UI-03 | **U.** Parameters: a query key in every exchange is `required`, one in some is not, a repeated one is an `array` with `items`; request headers are header parameters in byte order without `accept`, `content-type` and `authorization`; parameters come in the order path, query, header; each has `examples` named `sample-<16 hex>` after the sample keys, one per distinct value; a volatile field has `x-mimic-volatile: true` and a redacted one `x-mimic-redacted: true`, with the marker as its only example value. |
+| UI-04 | **U.** Bodies and responses: a JSON request body gives `requestBody.content["application/json"]` with the §6 schema and the samples' bodies as examples; a form body gives an object schema and an object example (a repeated field is an array); an opaque media type has no schema, with `x-mimic-count` and `x-mimic-bytes`; `required` follows §7.6. Statuses `200`, `404` and `299` give responses with descriptions `OK`, `Not Found` and `Status 299` and their `x-mimic-count`; a response holds the media types and headers (without `content-type`) seen in its own samples, with the endpoint-wide schema; a status without a sample has a description only. |
+| UI-05 | **U.** Samples with `authorization: Bearer <redacted>` and `Basic <redacted>` give `components.securitySchemes` `http_bearer` and `http_basic` and both requirements, in that order; a bare `<redacted>` gives the `apiKey` scheme `authorization`; a scheme outside `a-z0-9-` is ignored. `servers` holds `http://<host>` for the scope's valid hosts, sorted, at most 16, and never `(invalid)` or a host with the marker; none qualifying gives no `servers`. A histogram of 100 exchanges at 10 ms gives `p50`, `p90` and `p99` equal to the upper bound of the 10 ms bucket, rounded up; one in the overflow bucket gives `null`; `x-mimic-last-seen` is `YYYY-MM-DD` of the stamped day. |
+| UI-06 | **U.** No recorded content in Markdown: for reports with a canary at every recordable place (path literal, gRPC path, query key and value, header name and value, JSON key and value, form field, host; `proptest`), no `description`, `summary` or `title` value and no tag `description` of any document contains the canary, and `info.description` is the constant text. A report re-redacted by the controller (§7.3) renders to documents in which no DSC-15 canary appears. |
+| UI-07 | **I.** Routes on `MIMIC_UI_ADDR`: `/v1/workloads/<ns>/<dep>/endpoints`, `/openapi` and `/openapi/inbound-<port>` answer `200` with exactly the §7.6 output for the stored `:report` and `:meta` `version`; `400` for the ids `inbound-0`, `inbound-65536`, `inbound-08080` and `foo`; `404` for an absent port and for a deployment without data; `503` while Valkey is stopped; `500` with one ERROR `stored report unreadable` for a corrupted `:report`. `HEAD` on every route of §7.5 (F5 routes, pages and assets included) answers the status and headers of `GET` with an empty body; `POST` and `DELETE` answer `405` with `Allow: GET, HEAD`; the CTL-13 `403` cases (non-loopback peer, `Host: evil.example`, no `Host`) hold on every new route. |
+| UI-08 | **I.** Headers: every answer of the listener (a page, a JSON route, a vendored asset, `308`, `400`, `403`, `404`, `405`, `500`, `503`) carries the exact `Content-Security-Policy` of §7.5, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin` and `Cache-Control: no-store`, except `public, max-age=31536000, immutable` on `swagger-ui/<version>/` assets; no answer has an `Access-Control-Allow-*` header, also for a request with an `Origin`. |
+| UI-09 | **I.** Pages and assets: `GET /` is `308` to `/ui/`; `/ui/`, `/ui/workloads/<ns>/<dep>` and `/ui/workloads/<ns>/<dep>/openapi/<id>` are `200` `text/html; charset=utf-8`, have no inline script, no `on*` attribute and no `style` attribute, and load scripts and stylesheets from `/ui/assets/` only; an invalid name or id is `400`. Every asset of §7.5 is served with its content type and the bytes of the vendored file, whose SHA-256 matches `SHA256SUMS`; any other asset path is `404`. No served page, `mimic.js` or `mimic.css` contains an `http://` or `https://` URL; `mimic.js` contains no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval` or `Function(`, and sets the Swagger UI options of §7.5 (`supportedSubmitMethods: []`, `tryItOutEnabled: false`, `validatorUrl: null`, `queryConfigEnabled: false`, the `requestInterceptor`). |
+| UI-10 | **I.** Rendering bounds and metrics: with two renders held by a test hook, a third document request waits and completes once one is released, while `/v1/workloads` is answered meanwhile. After a known sequence of requests `mimic_ui_requests_total{route,code}` and the `mimic_ui_render_duration_seconds` count have the expected values; a request writes no stdout line; no line and no series contains a path, template, sample or report content. |
+| UI-11 | **E.** On kind with the CTL-20 apps and traffic (a canary bearer token, a canary in a `PUT` body), through `kubectl port-forward` to a controller pod: `/v1/workloads/<ns>/users/openapi` lists `inbound-<users port>`; that document has `/users/{users_id}` with `get` and `put`, a `200` response with an example taken from a sample, the `http_bearer` scheme required by `get`, and `servers` naming the `users` Service host seen by the sidecar; `/endpoints` lists both endpoints with their counts. No canary is in any document, endpoint list or page. `HEAD /ui/` answers `200`. |
+| UI-12 | **E.** Browser: the headless Chromium loads `/ui/`, the `users` deployment page and its document page through the port-forward and dumps each DOM: they list the deployment, its two endpoints and the operations `GET /users/{users_id}` and `PUT /users/{users_id}`; there is no "Try it out" or "Execute" button; Chromium's log shows no Content Security Policy violation and no request to an origin other than the port-forward. A body recorded with the key and value `<img src=/ui-xss onerror=alert(1)>` shows as text, with no `img` element of that `src` in the DOM; a body recorded as `{"$ref": "http://localhost:<canary port>/ref"}` makes no request reach a server listening on that port. The `users` pods log no access line during the browser run (the UI sends no traffic to workloads). |
+| UI-13 | **C.** Supply chain: `scripts/vendor-swagger-ui.py --check` passes on the committed tree, fails when one vendored byte is changed and when the tarball does not match the lockfile's `sha512` (offline test with a fixture tarball); it runs in the supply-chain stage and `ci-ok` requires it. `scripts/check-cooldown.py` refuses a `swagger-ui-dist` version that a pull request adds or bumps in `crates/mimic-controller/ui/package-lock.json` when it was published less than 14 days before (`--now`), accepts it when the allowlist names it, and fails closed when the npm registry cannot be read. `.github/dependabot.yml` has an `npm` entry for `crates/mimic-controller/ui` with a 14-day cooldown; `zizmor` passes. |
+
 ## 13. Test strategy
 
 - **Unit** tests in `mimic-core` (pure logic) and next to the code.
 - **Integration** tests per crate in `tests/`: in-process routers, or the real binary started
   as a child process. From F5, controller store tests use a real Valkey (§12.6); the fake RESP
   server of FND-06 stays for readiness only.
-- **End-to-end** on kind with the Helm chart (`scripts/e2e.sh`), locally and in CI.
+- **End-to-end** on kind with the Helm chart (`scripts/e2e.sh`), locally and in CI. From F6
+  the UI is also checked in a pinned headless Chromium (§12.7), the only browser test.
 - A criterion is covered when a test whose name contains its ID (lower case) passes.
 - A timing bound ("within 1 s") is measured from the event that triggers it (the close, the
   signal), not from the start of the test, and the test's own wait for that event has its own

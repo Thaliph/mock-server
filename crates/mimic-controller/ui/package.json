@@ -1,0 +1,9 @@
+{
+  "name": "mimic-controller-ui",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pins the Swagger UI assets vendored by scripts/vendor-swagger-ui.py (spec §7.5, UI-13)",
+  "dependencies": {
+    "swagger-ui-dist": "5.34.0"
+  }
+}
