@@ -461,6 +461,22 @@ mod redaction {
     }
 
     #[test]
+    fn dsc_05_authorization_scheme_allowlist() {
+        let r = r();
+        for name in ["Authorization", "Proxy-Authorization"] {
+            assert_eq!(r.header(name, "Bearer x"), "Bearer <redacted>");
+            assert_eq!(r.header(name, "bearer x"), "Bearer <redacted>");
+            assert_eq!(r.header(name, "DIGEST realm=r"), "Digest <redacted>");
+            assert_eq!(
+                r.header(name, "aws4-hmac-sha256 a=b"),
+                "AWS4-HMAC-SHA256 <redacted>"
+            );
+            assert_eq!(r.header(name, "NotAScheme x"), MARKER);
+            assert_eq!(r.header(name, "sk1a2b3c4d5e6f x"), MARKER);
+        }
+    }
+
+    #[test]
     fn dsc_05_headers_queries_forms() {
         let r = r();
         assert_eq!(r.header("X-Api-Key", "abc"), MARKER);

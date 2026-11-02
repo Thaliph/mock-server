@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
-use super::redact::MARKER;
+use super::redact::{MARKER, auth_scheme};
 use super::report::Endpoint;
 use super::sample::Sample;
 
@@ -14,8 +14,6 @@ use super::sample::Sample;
 const MAX_MEDIA: usize = 16;
 /// Request headers that OpenAPI ignores as parameters.
 const IGNORED_HEADERS: [&str; 3] = ["accept", "content-type", "authorization"];
-/// Longest security scheme token kept.
-const MAX_SCHEME: usize = 64;
 
 /// The key a recorded name must not take in a map of the document: a `$ref` member there
 /// would be read as a reference by OpenAPI tools.
@@ -241,13 +239,9 @@ pub(super) fn schemes(e: &Endpoint<'_>) -> BTreeMap<String, Value> {
                     json!({"type": "apiKey", "in": "header", "name": "Authorization"}),
                 );
             } else if let Some((scheme, rest)) = value.split_once(' ') {
-                let scheme = scheme.to_ascii_lowercase();
-                let token = !scheme.is_empty()
-                    && scheme.len() <= MAX_SCHEME
-                    && scheme
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-                if rest == MARKER && token {
+                // Only a registered scheme is kept, in its lower-case spelling.
+                if let (Some(scheme), true) = (auth_scheme(scheme), rest == MARKER) {
+                    let scheme = scheme.to_ascii_lowercase();
                     out.insert(
                         format!("http_{scheme}"),
                         json!({"type": "http", "scheme": scheme}),
