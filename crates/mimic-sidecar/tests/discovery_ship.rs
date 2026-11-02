@@ -44,6 +44,8 @@ enum Reply {
     Reset,
     /// No answer for an hour.
     Silent,
+    /// `200` with this body.
+    Body(&'static str),
 }
 
 struct Seen {
@@ -163,7 +165,7 @@ async fn fake_api(script: Vec<Reply>) -> FakeApi {
                         let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
                         let reply = script.lock().unwrap().pop_front().unwrap_or(Reply::Ok);
                         let (status, retry_after) = match reply {
-                            Reply::Ok => (200, None),
+                            Reply::Ok | Reply::Body(_) => (200, None),
                             Reply::Status(s) => (s, None),
                             Reply::RetryAfter(s, n) => (s, Some(n)),
                             Reply::Reset | Reply::Silent => (0, None),
@@ -186,9 +188,11 @@ async fn fake_api(script: Vec<Reply>) -> FakeApi {
                                 if let Some(n) = retry_after {
                                     response = response.header("retry-after", n.to_string());
                                 }
-                                Ok(response
-                                    .body(Full::new(Bytes::from_static(b"{\"applied\":true}")))
-                                    .unwrap())
+                                let body = match reply {
+                                    Reply::Body(text) => text,
+                                    _ => "{\"applied\":true}",
+                                };
+                                Ok(response.body(Full::new(Bytes::from(body))).unwrap())
                             }
                         }
                     }
@@ -204,7 +208,12 @@ async fn fake_api(script: Vec<Reply>) -> FakeApi {
 
 /// An app answering every request with `200 {}`.
 async fn app() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    app_on("127.0.0.1:0").await
+}
+
+/// The same app on `bind`; a request for `/hang/...` is never answered.
+async fn app_on(bind: &str) -> SocketAddr {
+    let listener = TcpListener::bind(bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
@@ -217,6 +226,10 @@ async fn app() -> SocketAddr {
                         Ok(n) if n > 0 => head.extend_from_slice(&buf[..n]),
                         _ => return,
                     }
+                }
+                if head.starts_with(b"GET /hang") {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    return;
                 }
                 let body = "{\"ok\":true,\"name\":\"user\"}";
                 let _ = s
@@ -757,4 +770,264 @@ async fn ctl_17_flush_pauses_200_ms_even_after_a_retry_after_of_0() {
     // One post, then one every 200 ms within the second: at most 6, never the 50 replies.
     assert!(rig.api.count() <= 6, "{:?}", rig.api.posts());
     assert!(rig.api.count() >= 3, "{:?}", rig.api.posts());
+}
+
+#[tokio::test]
+async fn ctl_16_a_failure_streak_ended_by_a_dropped_report_logs_the_next_failure() {
+    let logs = capture_logs();
+    // 503 then 400 for the first report, 503 then 200 for the second.
+    let rig = Rig::new(
+        vec![Reply::Status(503), Reply::Status(400), Reply::Status(503)],
+        INTERVAL,
+        DiscoveryConfig::default(),
+    )
+    .await;
+    let (_stop, _task) = rig.start();
+    rig.call("users", 1).await;
+    wait(|| rig.api.count() >= 2).await;
+    rig.call("users", 2).await;
+    wait(|| rig.api.acknowledged() == 1).await;
+    {
+        let seen = rig.api.seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        // The backoff restarted at 1 s for the second report.
+        assert!(seen[3].at - seen[2].at < Duration::from_millis(1800));
+    }
+    logs.settled().await;
+    let text = logs.text();
+    assert_eq!(text.matches("report push failed").count(), 2, "{text}");
+}
+
+#[tokio::test]
+async fn ctl_16_a_200_with_an_unreadable_body_is_a_failed_attempt() {
+    let _logs = capture_logs();
+    let rig = Rig::new(
+        vec![Reply::Body("not json"), Reply::Body("{}")],
+        INTERVAL,
+        DiscoveryConfig::default(),
+    )
+    .await;
+    let mut metrics = Metrics::new("sidecar", "test");
+    rig.discovery.register(&mut metrics);
+    let (_stop, _task) = rig.start();
+    rig.call("users", 1).await;
+    wait(|| rig.api.count() >= 3).await;
+    let seen = rig.api.seen.lock().unwrap();
+    // The same report, three times: the first two answers did not acknowledge it.
+    assert_eq!(seen[1].body, seen[0].body);
+    assert_eq!(seen[2].body, seen[0].body);
+    drop(seen);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let text = metrics.encode();
+    assert!(
+        text.contains("mimic_discovery_pushes_total{result=\"error\"} 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mimic_discovery_pushes_total{result=\"ok\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mimic_discovery_pushes_total{result=\"duplicate\"} 0"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn ctl_16_gauges_cover_the_pending_and_the_current_report() {
+    let _logs = capture_logs();
+    let rig = Rig::new(
+        vec![Reply::Status(503); 3],
+        INTERVAL,
+        DiscoveryConfig::default(),
+    )
+    .await;
+    let mut metrics = Metrics::new("sidecar", "test");
+    rig.discovery.register(&mut metrics);
+    let gauge = |name: &str| -> i64 {
+        metrics
+            .encode()
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1)
+    };
+    let (_stop, _task) = rig.start();
+    rig.call("users", 1).await;
+    wait(|| rig.api.count() >= 1).await;
+    // The first report is pending (the fake refuses it), a second endpoint is current.
+    rig.call("orders", 1).await;
+    rig.recorded(1).await;
+    let pending = rig.api.seen.lock().unwrap()[0].report().sample_bytes();
+    let current = rig.discovery.report().sample_bytes();
+    assert!(pending > 0 && current > 0, "{pending} {current}");
+    wait(|| gauge("mimic_discovery_sample_bytes") == (pending + current) as i64).await;
+    wait(|| gauge("mimic_discovery_endpoints{direction=\"inbound\"}") == 2).await;
+    // Everything acknowledged: nothing is held.
+    wait(|| rig.api.acknowledged() == 2).await;
+    wait(|| gauge("mimic_discovery_sample_bytes") == 0).await;
+    wait(|| gauge("mimic_discovery_endpoints{direction=\"inbound\"}") == 0).await;
+}
+
+// ---------------------------------------------------------------------------------------
+// CTL-17 as the binary, in a network namespace where `127.0.0.9 -> 127.0.0.1:18080` is
+// redirected to the sidecar the way the init container redirects a pod's traffic.
+
+const REDIRECTED: &str = "127.0.0.1:18080";
+const CLIENT_IP: &str = "127.0.0.9";
+const SKIP: i32 = 77;
+
+/// `true` inside the namespace (run the body). Outside, runs this test again in a user and network
+/// namespace with the redirect, and returns `false`; skips (with a message) when the host forbids
+/// that.
+fn in_namespace(test: &str) -> bool {
+    if std::env::var_os("MIMIC_TEST_NETNS").is_some() {
+        return true;
+    }
+    let script = format!(
+        "ip link set lo up && iptables -t nat -A OUTPUT -p tcp -s {CLIENT_IP} -d 127.0.0.1 --dport 18080 -j REDIRECT --to-ports 15006 || exit {SKIP}; exec \"$0\" \"$@\""
+    );
+    let status = std::process::Command::new("unshare")
+        .args(["-rn", "sh", "-c", &script])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env("MIMIC_TEST_NETNS", "1")
+        .status();
+    match status {
+        Ok(status) if status.code() == Some(SKIP) => {
+            eprintln!("{test}: no user namespace with iptables here, skipped");
+        }
+        Ok(status) => assert!(status.success(), "{test} failed in its namespace: {status}"),
+        Err(e) => eprintln!("{test}: unshare is not available ({e}), skipped"),
+    }
+    false
+}
+
+/// A request from the redirected source address; the connection is returned unread.
+async fn redirected_get(path: &str) -> TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket
+        .bind(format!("{CLIENT_IP}:0").parse().unwrap())
+        .unwrap();
+    let mut c = socket.connect(REDIRECTED.parse().unwrap()).await.unwrap();
+    c.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: svc.ns:8080\r\nAccept: application/json\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    c
+}
+
+async fn answered(path: &str) {
+    let mut c = redirected_get(path).await;
+    let mut head = [0u8; 12];
+    c.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200");
+}
+
+/// Starts the sidecar binary shipping to `api`, with `grace` as its shutdown grace.
+async fn sidecar(api: &FakeApi, dir: &std::path::Path, grace: &str) -> Process {
+    let token = dir.join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let url = format!("https://{}", api.addr);
+    let mut process = Process::spawn(
+        BIN,
+        &[
+            ("MIMIC_ADMIN_ADDR", "127.0.0.1:0"),
+            ("MIMIC_INBOUND_ADDRS", "127.0.0.1:15006"),
+            ("MIMIC_OUTBOUND_ADDRS", "127.0.0.1:15001"),
+            ("MIMIC_CONTROLLER_URL", &url),
+            ("MIMIC_CONTROLLER_CA", &api.ca_pem),
+            ("MIMIC_TLS_TOKEN_FILE", token.to_str().unwrap()),
+            ("MIMIC_WORKLOAD", "pay"),
+            ("MIMIC_DISCOVERY_PUSH_INTERVAL", "1s"),
+            ("MIMIC_SHUTDOWN_GRACE", grace),
+        ],
+    );
+    let admin = process.admin_addr();
+    mimic_runtime::testing::wait_status(admin, "/readyz", 200, Duration::from_secs(10));
+    process
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctl_17_sigterm_flushes_the_pending_then_the_current_report_despite_a_long_drain() {
+    if !in_namespace("ctl_17_sigterm_flushes_the_pending_then_the_current_report_despite_a_long_drain")
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // The first two posts are refused: the first report is pending when the signal comes.
+    let api = fake_api(vec![Reply::Status(503), Reply::Status(503)]).await;
+    app_on(REDIRECTED).await;
+    let mut process = sidecar(&api, dir.path(), "4s").await;
+    answered("/users/1").await;
+    wait(|| api.count() >= 1).await;
+    answered("/users/2").await;
+    // A request the app never answers keeps the drain going until its limit.
+    let _hung = redirected_get("/hang/1").await;
+    wait(|| api.count() >= 2).await;
+    let begun = Instant::now();
+    process.terminate();
+    let status = process.wait_exit(Duration::from_secs(10));
+    let took = begun.elapsed();
+    assert!(status.success(), "{status}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    let posts = api.posts();
+    assert_eq!(api.acknowledged(), 2, "{posts:?}");
+    let sequences: Vec<u64> = posts
+        .iter()
+        .filter(|(_, status, _)| *status == 200)
+        .map(|(sequence, ..)| *sequence)
+        .collect();
+    assert_eq!(sequences, vec![1, 2], "{posts:?}");
+    let lost = process
+        .logs()
+        .iter()
+        .filter(|v| v["message"] == "report not shipped")
+        .count();
+    assert_eq!(lost, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctl_17_sigterm_with_a_silent_api_exits_within_the_grace_and_counts_the_loss() {
+    if !in_namespace("ctl_17_sigterm_with_a_silent_api_exits_within_the_grace_and_counts_the_loss")
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let api = fake_api(vec![Reply::Silent; 50]).await;
+    app_on(REDIRECTED).await;
+    let mut process = sidecar(&api, dir.path(), "3s").await;
+    answered("/users/1").await;
+    wait(|| api.count() >= 1).await;
+    answered("/users/2").await;
+    let begun = Instant::now();
+    process.terminate();
+    let status = process.wait_exit(Duration::from_secs(10));
+    assert!(status.success(), "{status}");
+    assert!(begun.elapsed() < Duration::from_secs(4), "{:?}", begun.elapsed());
+    let lines: Vec<serde_json::Value> = process
+        .logs()
+        .into_iter()
+        .filter(|v| v["message"] == "report not shipped")
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "WARN");
+    assert_eq!(lines[0]["exchanges"], 2);
+}
+
+// ---------------------------------------------------------------------------------------
+// CTL-16: `Retry-After`.
+
+#[test]
+fn ctl_16_retry_after_is_read_in_seconds_and_capped_at_300() {
+    use mimic_sidecar::discovery::retry_after;
+    assert_eq!(retry_after(" 3 "), Some(Duration::from_secs(3)));
+    assert_eq!(retry_after("0"), Some(Duration::ZERO));
+    assert_eq!(retry_after("300"), Some(Duration::from_secs(300)));
+    assert_eq!(retry_after("86400"), Some(Duration::from_secs(300)));
+    assert_eq!(retry_after("soon"), None);
+    assert_eq!(retry_after("-1"), None);
 }

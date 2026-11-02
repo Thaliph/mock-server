@@ -133,6 +133,12 @@ enum Attempt {
     Retry(Duration),
 }
 
+/// A `Retry-After` in seconds, capped at 300 s (spec §7.2); `None` for another form.
+pub fn retry_after(value: &str) -> Option<Duration> {
+    let secs = value.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+}
+
 /// The answer of the controller, or why there is none.
 enum Answer {
     Status {
@@ -440,8 +446,7 @@ impl Shipper {
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER));
+            .and_then(retry_after);
         let applied = match read_capped(response).await {
             Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()

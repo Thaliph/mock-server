@@ -30,7 +30,7 @@ pub use capture::Tap;
 pub(crate) use capture::{Capture, Meta};
 pub use config::DiscoveryConfig;
 pub use metrics::DiscoveryMetrics;
-pub use ship::{ShipConfig, Shipper, Target};
+pub use ship::{ShipConfig, Shipper, Target, retry_after};
 
 /// What the shipper and the recorder share (spec §7.2, "Shipping client").
 #[derive(Default)]
