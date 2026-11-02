@@ -845,3 +845,130 @@ async fn ui_10_at_most_two_renders_run_at_once_and_other_routes_are_not_blocked(
         assert_eq!(task.await.unwrap(), 200);
     }
 }
+
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+                   font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; \
+                   frame-ancestors 'none'";
+
+async fn raw(
+    store: &Arc<Store>,
+    method: Method,
+    path: &str,
+    peer: &str,
+    host: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("origin", "https://evil.example");
+    if let Some(host) = host {
+        builder = builder.header("host", host);
+    }
+    let mut request = builder.body(Body::empty()).unwrap();
+    let peer: SocketAddr = format!("{peer}:40000").parse().unwrap();
+    request.extensions_mut().insert(ConnectInfo(peer));
+    router(store.clone(), UiMetrics::default())
+        .oneshot(request)
+        .await
+        .unwrap()
+}
+
+fn assert_secure(response: &axum::response::Response, what: &str) {
+    let h = response.headers();
+    for (name, value) in [
+        ("content-security-policy", CSP),
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+        ("x-frame-options", "DENY"),
+        ("cross-origin-opener-policy", "same-origin"),
+        ("cross-origin-resource-policy", "same-origin"),
+        ("cache-control", "no-store"),
+    ] {
+        assert_eq!(
+            h.get(name).and_then(|v| v.to_str().ok()),
+            Some(value),
+            "{what}: {name}"
+        );
+    }
+    assert!(
+        !h.keys().any(|k| k.as_str().starts_with("access-control-")),
+        "{what}: CORS header"
+    );
+}
+
+#[tokio::test]
+async fn ui_08_every_answer_carries_the_security_headers_and_no_cors() {
+    // Nothing listens on port 1: the store answers 503 without Valkey.
+    let store = store("redis://127.0.0.1:1");
+    let local = Some("localhost:8080");
+    let cases = [
+        (Method::GET, "/v1/workloads", "127.0.0.1", local, 503),
+        (
+            Method::GET,
+            "/v1/workloads/Bad_Ns/front",
+            "127.0.0.1",
+            local,
+            400,
+        ),
+        (Method::GET, "/nothing", "127.0.0.1", local, 404),
+        (Method::POST, "/v1/workloads", "127.0.0.1", local, 405),
+        (Method::GET, "/v1/workloads", "10.1.2.3", local, 403),
+        (
+            Method::GET,
+            "/v1/workloads",
+            "127.0.0.1",
+            Some("evil.example"),
+            403,
+        ),
+        (Method::GET, "/v1/workloads", "127.0.0.1", None, 403),
+        (Method::GET, "/", "127.0.0.1", local, 308),
+    ];
+    for (method, path, peer, host, status) in cases {
+        let response = raw(&store, method.clone(), path, peer, host).await;
+        assert_eq!(response.status().as_u16(), status, "{method} {path}");
+        assert_secure(&response, &format!("{method} {path} {status}"));
+    }
+}
+
+#[tokio::test]
+async fn ui_08_success_and_server_error_carry_the_security_headers() {
+    let store = store(&valkey_url());
+    let ns = unique("ui08");
+    seed(&store, &ns, "front", &["front-1"]).await;
+    let k = keys(&ns, "front").unwrap();
+    for path in [
+        "/v1/workloads".to_string(),
+        format!("/v1/workloads/{ns}/front"),
+        format!("/v1/workloads/{ns}/front/report"),
+        format!("/v1/workloads/{ns}/front/endpoints"),
+        format!("/v1/workloads/{ns}/missing"),
+    ] {
+        let response = raw(&store, Method::GET, &path, "127.0.0.1", Some("localhost")).await;
+        assert_secure(&response, &path);
+    }
+    let _: () = redis::cmd("SET")
+        .arg(&k.report)
+        .arg("{not json")
+        .query_async(&mut connection().await)
+        .await
+        .unwrap();
+    let path = format!("/v1/workloads/{ns}/front/report");
+    let response = raw(&store, Method::GET, &path, "127.0.0.1", Some("localhost")).await;
+    assert_eq!(response.status().as_u16(), 500);
+    assert_secure(&response, "500");
+}
+
+#[tokio::test]
+async fn ui_08_root_redirects_with_308_to_ui() {
+    let store = store("redis://127.0.0.1:1");
+    let response = raw(
+        &store,
+        Method::GET,
+        "/",
+        "127.0.0.1",
+        Some("localhost:8080"),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 308);
+    assert_eq!(response.headers()["location"], "/ui/");
+}
