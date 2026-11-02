@@ -302,11 +302,20 @@ where
         tracing::error!(namespace, deployment, "openapi render failed");
         ReadError::Unreadable
     };
-    let _permit = ui.renders.acquire().await.map_err(|_| failed())?;
+    // Names and the read come first: an invalid or unknown request never waits for a slot.
     let (bytes, version) = ui.store.stored_report(namespace, deployment).await?;
+    // The permit moves into the blocking closure: a dropped request leaves the render running,
+    // and the slot with it.
+    let permit = ui
+        .renders
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| failed())?;
     let hook = ui.hook.clone();
     let started = Instant::now();
     let rendered = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         if let Some(hook) = hook {
             hook();
         }
