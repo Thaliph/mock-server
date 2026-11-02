@@ -1416,8 +1416,13 @@ wait_status() {
   return 1
 }
 log "ctl_20: within MIMIC_STATUS_INTERVAL more the MimicWorkloads show endpoints.inbound 2, pods 2 and a lastPushTime"
-wait_status '.endpoints.inbound == 2 and .pods == 2 and (.lastPushTime | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))' 90 \
-  || fail "ctl_20: the status of users-a and users-b is not endpoints.inbound 2, pods 2 with a lastPushTime: $(kubectl -n disc-22 get mimicworkload -o jsonpath='{.items[*].status}')"
+# The merged report exists (ctl_20 above), so the status needs one status interval (30 s by default; a replica
+# may have just missed the push, so two), the apply, and a margin for a slow runner.
+status_wait=$((2 * 30 + 60))
+wait_status '.endpoints.inbound == 2 and .pods == 2 and (.lastPushTime | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))' "$status_wait" \
+  || { echo "ctl_20: status after ${status_wait}s: $(kubectl -n disc-22 get mimicworkload -o jsonpath='{.items[*].status}')" >&2; \
+       kubectl -n "$NS" logs deploy/$RELEASE-controller --all-pods --tail=200 2>&1 | grep -i 'status' | tail -20 >&2 || true; \
+       fail "ctl_20: the status of users-a and users-b is not endpoints.inbound 2, pods 2 with a lastPushTime within ${status_wait}s"; }
 status_row=$(kubectl -n disc-22 get mimicworkload users-a --no-headers) || fail "ctl_19: cannot print users-a"
 read -r -a row <<< "$status_row"
 [[ ${row[1]} == discovery && ${row[2]} == 2 && ${row[3]} == 2 && ${row[4]} =~ ^[0-9]+[smhd]([0-9]+[smhd])?$ ]] \
