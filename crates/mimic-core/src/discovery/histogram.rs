@@ -88,7 +88,7 @@ impl Histogram {
             seen += u128::from(*n);
             if seen >= rank {
                 return Some(match *bucket {
-                    OVERFLOW => Bound::Overflow,
+                    b if b >= OVERFLOW => Bound::Overflow,
                     b => Bound::Ms(upper_bound(b)),
                 });
             }
@@ -102,7 +102,7 @@ fn upper_bound(bucket: u8) -> u64 {
     let (mut low, mut high) = (1u64, 1 << 17);
     while low < high {
         let mid = low + (high - low) / 2;
-        if u128::from(mid).pow(4) >= 1u128 << bucket {
+        if u128::from(mid).pow(4) >= 1u128.checked_shl(u32::from(bucket)).unwrap_or(u128::MAX) {
             high = mid;
         } else {
             low = mid + 1;
