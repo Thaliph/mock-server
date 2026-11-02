@@ -106,12 +106,17 @@ pub fn split_path(path: &str) -> Vec<&str> {
 /// Renders a template, naming parameters `{<literal>_id}` after the previous segment when it
 /// is a literal and the name is free, else `{param<n>}` (n = 1-based position).
 pub fn render(segs: &[Seg]) -> String {
+    render_with(segs, str::to_string)
+}
+
+/// `render` with `literal` applied to every literal segment.
+pub fn render_with(segs: &[Seg], literal: impl Fn(&str) -> String) -> String {
     let mut taken = BTreeSet::new();
     let mut out = String::new();
     for (i, seg) in segs.iter().enumerate() {
         out.push('/');
         match seg {
-            Seg::Literal(l) => out.push_str(l),
+            Seg::Literal(l) => out.push_str(&literal(l)),
             Seg::Param => {
                 let named = match i.checked_sub(1).map(|p| &segs[p]) {
                     Some(Seg::Literal(prev)) if !prev.is_empty() => {

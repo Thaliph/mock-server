@@ -177,6 +177,11 @@ impl Sample {
         self.response.status
     }
 
+    /// The concrete request path, redacted.
+    pub fn path(&self) -> &str {
+        &self.request.path
+    }
+
     /// A status in 100..=599; bodies of a parsed media type and at most `MAX_BODY` bytes.
     fn check(&self) -> Result<(), Violation> {
         if !(100..=599).contains(&self.response.status) {
