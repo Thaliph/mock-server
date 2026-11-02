@@ -12,6 +12,35 @@ use serde_json::Value;
 /// What a redacted value becomes.
 pub const MARKER: &str = "<redacted>";
 
+/// HTTP authentication schemes kept by `Authorization` and `Proxy-Authorization`, in their
+/// registered spelling: the IANA registry, plus `NTLM` and `AWS4-HMAC-SHA256`.
+pub const AUTH_SCHEMES: &[&str] = &[
+    "Basic",
+    "Bearer",
+    "Digest",
+    "DPoP",
+    "GNAP",
+    "HOBA",
+    "Mutual",
+    "Negotiate",
+    "OAuth",
+    "PrivateToken",
+    "SCRAM-SHA-1",
+    "SCRAM-SHA-256",
+    "vapid",
+    "Concealed",
+    "NTLM",
+    "AWS4-HMAC-SHA256",
+];
+
+/// The registered spelling of `scheme` when it is in `AUTH_SCHEMES` (any case).
+pub fn auth_scheme(scheme: &str) -> Option<&'static str> {
+    AUTH_SCHEMES
+        .iter()
+        .copied()
+        .find(|known| known.eq_ignore_ascii_case(scheme))
+}
+
 /// Deepest JSON nesting walked; anything below is redacted as a whole.
 const MAX_DEPTH: usize = 128;
 
@@ -391,13 +420,11 @@ impl Redactor {
             "authorization" | "proxyauthorization" => {
                 rules.push(Rule::Name);
                 match value.split_once(' ') {
-                    Some((scheme, _))
-                        if !scheme.is_empty()
-                            && scheme.bytes().all(|c| c.is_ascii_alphanumeric()) =>
-                    {
-                        format!("{scheme} {MARKER}")
-                    }
-                    _ => MARKER.to_string(),
+                    Some((scheme, _)) => match auth_scheme(scheme) {
+                        Some(known) => format!("{known} {MARKER}"),
+                        None => MARKER.to_string(),
+                    },
+                    None => MARKER.to_string(),
                 }
             }
             "cookie" => {

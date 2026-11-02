@@ -751,3 +751,38 @@ fn ctl_16_dropping_the_samples_keeps_counters_and_shape() {
     assert_eq!(report.endpoints().len(), before);
     assert!(report.check(256).is_ok());
 }
+
+const AUTH_CANARY: &str = "sk1a2b3c4d5e6f";
+
+/// CTL-03: a canary as the first word of `Authorization` or `Proxy-Authorization` never
+/// reaches the report, recorded by the sidecar or planted by an older one.
+#[test]
+fn ctl_03_authorization_canary() {
+    for name in ["Authorization", "Proxy-Authorization"] {
+        let input = Input {
+            req_headers: header(name, &format!("{AUTH_CANARY} x")),
+            ..Input::default()
+        };
+        let truth = record(&Redactor::default(), &input, 1);
+        assert!(!truth.to_json().unwrap().contains(AUTH_CANARY), "{name}");
+
+        let input = Input {
+            req_headers: header(name, "Bearer x"),
+            ..Input::default()
+        };
+        let report = record(&Redactor::default(), &input, 1);
+        let mut value: Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
+        plant_value(
+            &mut value,
+            "Bearer <redacted>",
+            &format!("{AUTH_CANARY} <redacted>"),
+        );
+        let mut report = Report::from_json(&value.to_string()).unwrap();
+        assert!(
+            report.to_json().unwrap().contains(AUTH_CANARY),
+            "{name}: planted"
+        );
+        report.re_redact(&Redactor::default());
+        assert!(!report.to_json().unwrap().contains(AUTH_CANARY), "{name}");
+    }
+}
