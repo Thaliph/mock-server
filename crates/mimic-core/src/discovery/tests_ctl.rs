@@ -772,7 +772,11 @@ fn ctl_03_authorization_canary() {
         };
         let report = record(&Redactor::default(), &input, 1);
         let mut value: Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
-        plant_value(&mut value, "Bearer", AUTH_CANARY);
+        plant_value(
+            &mut value,
+            "Bearer <redacted>",
+            &format!("{AUTH_CANARY} <redacted>"),
+        );
         let mut report = Report::from_json(&value.to_string()).unwrap();
         assert!(
             report.to_json().unwrap().contains(AUTH_CANARY),
