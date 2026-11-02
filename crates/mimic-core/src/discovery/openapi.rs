@@ -23,7 +23,8 @@ pub const OPENAPI_VERSION: &str = "3.1.1";
 /// Most `servers` of a document.
 const MAX_SERVERS: usize = 16;
 /// `info.description`: constant, nothing recorded.
-const DESCRIPTION: &str = "Inferred by mimic from observed traffic; not an authoritative contract.";
+pub(super) const DESCRIPTION: &str =
+    "Inferred by mimic from observed traffic; not an authoritative contract.";
 /// The last day shown, 9999-12-31, in days since 1970-01-01.
 const MAX_DAY: u64 = 2_932_896;
 

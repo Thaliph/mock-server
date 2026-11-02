@@ -49,6 +49,27 @@ impl Body {
         )
     }
 
+    /// The media type and the value as an example: a form is an object of field to value, a
+    /// repeated field an array of values.
+    fn example(&self) -> (&str, Value) {
+        let Some(pairs) = self.form() else {
+            return (&self.media, self.value.clone());
+        };
+        let mut object = serde_json::Map::new();
+        for Pair { key, value } in pairs {
+            let value = Value::String(value);
+            match object.remove(&key) {
+                None => object.insert(key, value),
+                Some(Value::Array(mut values)) => {
+                    values.push(value);
+                    object.insert(key, Value::Array(values))
+                }
+                Some(first) => object.insert(key, Value::Array(vec![first, value])),
+            };
+        }
+        (&self.media, Value::Object(object))
+    }
+
     fn redact(&mut self, redactor: &Redactor) {
         let Some(pairs) = self.form() else {
             redactor.json(&mut self.value);
@@ -180,6 +201,32 @@ impl Sample {
     /// The concrete request path, redacted.
     pub fn path(&self) -> &str {
         &self.request.path
+    }
+
+    /// The decoded query pairs, redacted, in request order.
+    pub fn query(&self) -> &[(String, String)] {
+        &self.request.query
+    }
+
+    /// Request headers (lower-case names), redacted.
+    pub fn request_headers(&self) -> &[(String, String)] {
+        &self.request.headers
+    }
+
+    /// Response headers (lower-case names), redacted.
+    pub fn response_headers(&self) -> &[(String, String)] {
+        &self.response.headers
+    }
+
+    /// The media type and value of the parsed request body: the JSON value, or a form as an
+    /// object of field to value (an array of values for a repeated field).
+    pub fn request_body(&self) -> Option<(&str, Value)> {
+        self.request.body.as_ref().map(Body::example)
+    }
+
+    /// As `request_body`, for the response.
+    pub fn response_body(&self) -> Option<(&str, Value)> {
+        self.response.body.as_ref().map(Body::example)
     }
 
     /// A status in 100..=599; bodies of a parsed media type and at most `MAX_BODY` bytes.

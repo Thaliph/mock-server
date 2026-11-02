@@ -12,7 +12,7 @@ use super::openapi::{OPENAPI_VERSION, document, endpoint_list, index, parse_id};
 use super::redact::Redactor;
 use super::report::{Direction, Exchange, Limits, Report, merge};
 
-const LIMITS: Limits = Limits {
+pub(super) const LIMITS: Limits = Limits {
     max_literals: 32,
     max_endpoints: 256,
     sample_budget: 16 << 20,
@@ -67,7 +67,7 @@ fn validator() -> &'static Validator {
 }
 
 /// The validation errors of a document, empty when it is valid.
-fn errors(doc: &Value) -> Vec<String> {
+pub(super) fn errors(doc: &Value) -> Vec<String> {
     validator()
         .iter_errors(doc)
         .map(|e| format!("{e} at {}", e.instance_path()))
@@ -134,7 +134,7 @@ fn paths(doc: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn assert_valid(doc: &Value) {
+pub(super) fn assert_valid(doc: &Value) {
     let problems = errors(doc);
     assert!(problems.is_empty(), "{problems:?}");
 }
@@ -475,7 +475,7 @@ fn ui_01_top_level() {
 }
 
 /// No `$ref` member other than a key of a `properties` map or inside an example value.
-fn refs_ok(v: &Value, in_properties: bool, in_example: bool) -> bool {
+pub(super) fn refs_ok(v: &Value, in_properties: bool, in_example: bool) -> bool {
     match v {
         Value::Object(map) => map.iter().all(|(k, child)| {
             (k != "$ref" || in_properties || in_example)

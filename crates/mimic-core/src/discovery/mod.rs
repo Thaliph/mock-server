@@ -25,6 +25,8 @@ mod tests_followup;
 #[cfg(test)]
 mod tests_openapi;
 #[cfg(test)]
+mod tests_openapi_ops;
+#[cfg(test)]
 mod tests_samples;
 #[cfg(test)]
 mod tests_schema;
