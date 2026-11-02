@@ -27,6 +27,13 @@ PIDS=()
 DERIVED=()
 WORK=""
 
+# kill_tree <pid>: the process and everything it started.
+kill_tree() {
+  local children child
+  children=$(pgrep -P "$1" 2>/dev/null || true)
+  kill "$1" 2>/dev/null || true
+  for child in $children; do kill_tree "$child"; done
+}
 log() { printf '\n== %s\n' "$*"; }
 fail() {
   echo "FAIL $*" >&2
@@ -1521,9 +1528,11 @@ mkdir -p "$WORK/churn-logs"
 (
   while true; do
     for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-      [[ -e "$WORK/churn-logs/$p.log" ]] && continue
-      : > "$WORK/churn-logs/$p.log"
-      kubectl -n disc-22 logs -f "$p" -c app >> "$WORK/churn-logs/$p.log" 2>/dev/null &
+      [[ -e "$WORK/churn-logs/$p.seen" ]] && continue
+      : > "$WORK/churn-logs/$p.seen"
+      # Until a stream ends cleanly (the container exited): one that fails, while the container is still
+      # starting for instance, starts again from the first line.
+      ( until kubectl -n disc-22 logs -f "$p" -c app > "$WORK/churn-logs/$p.log" 2>/dev/null; do sleep 1; done ) &
     done
     sleep 1
   done
@@ -1572,8 +1581,7 @@ churn_ok=$(cat "$WORK/churn.out")
 [[ $churn_ok =~ ^[0-9]+$ ]] && (( churn_ok > 100 )) || fail "ctl_21: the churn client got '$churn_ok' 200s"
 # The streams of the pods still running hold their last lines a moment after the last answer.
 sleep 5
-pkill -P "$streams_pid" 2>/dev/null || true
-kill "$streams_pid" 2>/dev/null || true
+kill_tree "$streams_pid"
 b_ok=$(cat "$WORK"/churn-logs/*.log | jq -R -s 'split("\n") | map(fromjson? | select(. != null and .method == "GET" and .status == 200 and (.path | startswith("/users/10")))) | length')
 [[ $b_ok =~ ^[0-9]+$ ]] || fail "ctl_21: cannot count the 200s B answered: '$b_ok'"
 echo "ctl_21: the client got $churn_ok 200s, B answered $b_ok" >&2
