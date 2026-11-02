@@ -85,7 +85,7 @@ Starting alerts (tune to taste):
 | `mimic_store_refused_total`, `mimic_store_evicted_total` rising | A deployment hit the store limits |
 | `mimic_discovery_exchanges_total{result="dropped"}` or `{result="panic"}` | Discovery is losing records |
 | `mimic_webhook_certificate_expiry_timestamp_seconds - time()` under a few days | The webhook certificate is not being renewed |
-| `mimic_webhook_admissions_total{result="error"}` rising | Admissions failing (`seed-not-loaded`, `malformed`) |
+| `mimic_webhook_admissions_total{result="error"}` rising | Admissions failing; the `reason` label says why: `too-large`, `unreadable`, `cache-not-synced`, `patch`, `seed-not-loaded`, `ca-not-loaded`, `root` or `malformed` |
 | `mimic_tls_seed_loaded == 0` | Webhook cannot issue injections that need the seed |
 | `mimic_log_lines_dropped_total` rising | stdout cannot keep up; log lines are being dropped |
 | `mimic_tls_intermediate_expiry_timestamp_seconds - time()` small, non-zero | Intermediate not renewed |
