@@ -69,8 +69,11 @@ valkey:
     storageClass: ""
   # Valkey runs with maxmemory at 75 % of limits.memory and maxmemory-policy noeviction (spec §7.3):
   # a full store answers writes with an error instead of evicting part of a deployment.
+  # The memory request equals maxmemory (75 % of the limit): the scheduler reserves what a full
+  # store uses, and Valkey is not the first pod evicted under node memory pressure. The rest of
+  # the limit is the headroom of AOF rewrites.
   resources:
-    requests: {cpu: 50m, memory: 64Mi}
+    requests: {cpu: 50m, memory: 768Mi}
     limits: {memory: 1Gi}
   nodeSelector: {}
   tolerations: []
