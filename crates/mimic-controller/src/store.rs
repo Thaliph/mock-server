@@ -541,7 +541,10 @@ impl Store {
             if meta.is_empty() {
                 continue;
             }
-            found.push(summary(&ns, &dep, &meta)?);
+            // Logged by `summary`: one bad entry does not fail the list.
+            if let Ok(summary) = summary(&ns, &dep, &meta) {
+                found.push(summary);
+            }
         }
         Ok(found)
     }
@@ -608,10 +611,14 @@ impl Store {
             Err(e) => return Err(self.read_failed(e).await),
         };
         if meta.is_empty() {
+            self.readable(namespace, deployment);
             return Ok((None, BTreeMap::new()));
         }
-        let unreadable = || {
-            tracing::error!(namespace, deployment, "stored meta unreadable");
+        // Read at every status pass: logged once per streak, not at every pass.
+        let unreadable = |what: &'static str| {
+            if self.once(namespace, deployment, what) {
+                tracing::error!(namespace, deployment, "{what}");
+            }
             ReadError::Unreadable
         };
         let field = |name: &str| meta.get(name).and_then(|v| v.parse::<u64>().ok());
@@ -624,11 +631,16 @@ impl Store {
                 updated_ms: field("updated")?,
             })
         })()
-        .ok_or_else(unreadable)?;
+        .ok_or_else(|| unreadable("stored meta unreadable"))?;
         let pods = pods
             .into_iter()
-            .map(|(pod, ms)| ms.parse().map(|ms| (pod, ms)).map_err(|_| unreadable()))
+            .map(|(pod, ms)| {
+                ms.parse()
+                    .map(|ms| (pod, ms))
+                    .map_err(|_| unreadable("stored pods unreadable"))
+            })
             .collect::<Result<_, _>>()?;
+        self.readable(namespace, deployment);
         Ok((Some(meta), pods))
     }
 
@@ -706,6 +718,14 @@ impl Store {
             *self.connection.lock().await = None;
         }
         StoreError::Unavailable
+    }
+
+    /// Ends the streak of unreadable values of a deployment: the next one is logged again.
+    fn readable(&self, namespace: &str, deployment: &str) {
+        let mut logged = lock(&self.logged);
+        for what in ["stored meta unreadable", "stored pods unreadable"] {
+            logged.remove(&(namespace.into(), deployment.into(), what.into()));
+        }
     }
 
     fn once(&self, namespace: &str, deployment: &str, what: &str) -> bool {

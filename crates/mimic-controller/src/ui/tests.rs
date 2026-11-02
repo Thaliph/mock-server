@@ -293,6 +293,9 @@ async fn ctl_13_a_host_other_than_loopback_gets_403() {
         Some("localhost.evil.example"),
         Some("127.0.0.1.evil.example:8080"),
         Some("10.0.0.1:8080"),
+        Some("127.0.0.1:"),
+        Some("localhost:"),
+        Some("[::1]:"),
         None,
     ] {
         let answer = call_host(&store, Method::GET, "/v1/workloads", "127.0.0.1", host).await;
@@ -370,4 +373,112 @@ async fn ctl_13_a_corrupted_report_is_a_500_with_one_error_and_is_not_overwritte
         .await
         .unwrap();
     assert_eq!(stored, "{not json");
+}
+
+#[tokio::test]
+async fn ctl_13_head_is_refused_like_every_method_but_get() {
+    let store = store(&valkey_url());
+    for path in [
+        "/v1/workloads",
+        "/v1/workloads/shop/front",
+        "/v1/workloads/shop/front/report",
+    ] {
+        let answer = call(&store, Method::HEAD, path, "127.0.0.1").await;
+        assert_eq!(answer.status, 405, "{path}");
+    }
+}
+
+#[test]
+fn ctl_13_a_timestamp_out_of_range_is_still_a_timestamp() {
+    assert_eq!(rfc3339(1), "1970-01-01T00:00:00.001Z");
+    assert_eq!(rfc3339(u64::MAX), "9999-12-31T23:59:59.999Z");
+}
+
+fn errors(capture: &crate::webhook::tests::Capture, ns: &str, message: &str) -> usize {
+    String::from_utf8(capture.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["level"] == "ERROR" && v["message"] == message && v["namespace"] == ns)
+        .count()
+}
+
+async fn hset(key: &str, field: &str, value: &str) {
+    let _: () = redis::cmd("HSET")
+        .arg(key)
+        .arg(field)
+        .arg(value)
+        .query_async(&mut connection().await)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ctl_13_a_corrupted_meta_is_a_500_with_one_error() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let store = store(&valkey_url());
+    let ns = unique("ctl13m");
+    seed(&store, &ns, "front", &["front-1"]).await;
+    hset(&keys(&ns, "front").unwrap().meta, "exchanges", "many").await;
+    let answer = get(&store, &format!("/v1/workloads/{ns}/front")).await;
+    assert_eq!(answer.status, 500);
+    assert_eq!(errors(&capture, &ns, "stored meta unreadable"), 1);
+    // The report does not need `:meta`.
+    let report = get(&store, &format!("/v1/workloads/{ns}/front/report")).await;
+    assert_eq!(report.status, 200);
+}
+
+#[tokio::test]
+async fn ctl_13_corrupted_pods_are_a_500_with_one_error() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let store = store(&valkey_url());
+    let ns = unique("ctl13q");
+    seed(&store, &ns, "front", &["front-1"]).await;
+    hset(&keys(&ns, "front").unwrap().pods, "front-1", "yesterday").await;
+    let answer = get(&store, &format!("/v1/workloads/{ns}/front")).await;
+    assert_eq!(answer.status, 500);
+    assert_eq!(errors(&capture, &ns, "stored pods unreadable"), 1);
+    assert_eq!(errors(&capture, &ns, "stored meta unreadable"), 0);
+}
+
+#[tokio::test]
+async fn ctl_13_the_list_skips_an_unreadable_meta_with_one_error() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let store = store(&valkey_url());
+    let ns = unique("ctl13l");
+    seed(&store, &ns, "good", &["p1"]).await;
+    seed(&store, &ns, "bad", &["p1"]).await;
+    hset(&keys(&ns, "bad").unwrap().meta, "updated", "never").await;
+    let answer = get(&store, "/v1/workloads").await;
+    assert_eq!(answer.status, 200);
+    let body = answer.json();
+    let mine: Vec<&str> = body["workloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["namespace"] == ns.as_str())
+        .map(|w| w["deployment"].as_str().unwrap())
+        .collect();
+    assert_eq!(mine, ["good"]);
+    assert_eq!(errors(&capture, &ns, "stored meta unreadable"), 1);
+}
+
+#[tokio::test]
+async fn ctl_13_every_read_logs_its_error_although_the_status_pass_logged_the_streak() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let store = store(&valkey_url());
+    let ns = unique("ctl13s");
+    seed(&store, &ns, "front", &["front-1"]).await;
+    hset(&keys(&ns, "front").unwrap().meta, "exchanges", "many").await;
+    // The status pass logs the streak once, however often it reads.
+    for _ in 0..2 {
+        assert!(store.status_input(&ns, "front").await.is_err());
+    }
+    assert_eq!(errors(&capture, &ns, "stored meta unreadable"), 1);
+    // The read API logs one line per read (spec 7.5).
+    for want in [2, 3] {
+        let answer = get(&store, &format!("/v1/workloads/{ns}/front")).await;
+        assert_eq!(answer.status, 500);
+        assert_eq!(errors(&capture, &ns, "stored meta unreadable"), want);
+    }
 }

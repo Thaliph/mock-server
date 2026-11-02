@@ -1415,6 +1415,21 @@ status_row=$(kubectl -n disc-22 get mimicworkload users-a --no-headers) || fail 
 read -r -a row <<< "$status_row"
 [[ ${row[1]} == discovery && ${row[2]} == 2 && ${row[3]} == 2 && ${row[4]} =~ ^[0-9]+[smhd]([0-9]+[smhd])?$ ]] \
   || fail "ctl_20: kubectl get mimicworkload prints '$status_row', want Mode discovery, Endpoints 2, Pods 2 and a Last push age"
+# A deployment without data prints 0 in the Endpoints column, not a blank (the CRD defaults endpoints.inbound).
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: idle, namespace: disc-22}
+spec: {deployment: idle}
+YAML
+end=$((SECONDS + 90)); idle_row=""
+while (( SECONDS < end )); do
+  idle_row=$(kubectl -n disc-22 get mimicworkload idle --no-headers 2>/dev/null) || idle_row=""
+  read -r -a row <<< "$idle_row"
+  [[ ${row[2]:-} == 0 ]] && break
+  sleep 2
+done
+[[ ${row[2]:-} == 0 ]] || fail "ctl_19: a MimicWorkload without data prints '$idle_row', want 0 in the Endpoints column"
 header=$(kubectl -n disc-22 get mimicworkload users-a | head -n 1)
 [[ $header == *"MODE"*"ENDPOINTS"*"PODS"*"LAST PUSH"* ]] || fail "ctl_19: the printed columns are '$header'"
 kubectl -n disc-22 get mimicworkload users-a -o json --show-managed-fields \

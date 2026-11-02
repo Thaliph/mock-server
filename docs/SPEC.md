@@ -943,8 +943,10 @@ Everything below except the capture tap, content decoding and the recorder threa
 - **Valkey memory**: the chart runs Valkey with `maxmemory` (75 % of its memory limit) and
   `maxmemory-policy noeviction`: a full Valkey refuses writes (pushes get `503`, sidecars
   keep merging locally within their bounds) instead of evicting one key of a deployment and
-  breaking its consistency. Chart defaults: Valkey memory limit `1Gi` and PVC `4Gi` (AOF
-  rewrites need about twice the data), controller memory limit `512Mi` (two writes of a
+  breaking its consistency. Chart defaults: Valkey memory limit `1Gi`, memory request `768Mi`
+  (equal to `maxmemory`: the scheduler reserves what a full store uses, which is not then the
+  first pod evicted under node memory pressure; the 256 Mi between request and limit is the
+  headroom of AOF rewrites) and PVC `4Gi` (AOF rewrites need about twice the data), controller memory limit `512Mi` (two writes of a
   deployment report at once plus `MIMIC_SIDECAR_API_BODY_BUDGET`).
 
 ### 7.4 `MimicWorkload` status (F5)
@@ -964,13 +966,20 @@ Everything below except the capture tap, content decoding and the recorder threa
   ```
 
   and applies it by server-side apply on the status subresource (field manager
-  `mimic-controller`) only when it differs from the status in its cache. Both replicas
+  `mimic-controller`, forced: the controller owns `status.discovery` alone, so a conflict
+  cannot arise, and a refused apply is never repeated as a conflict at every interval) only
+  when it differs from the status in its cache. An apply that takes more than 10 s is
+  abandoned, counted as an error and logged as a failed apply; the next pass retries it.
+  An unreadable `:meta` or `:pods` is logged once (ERROR, §7.5) for as long as it stays
+  unreadable, not at every pass, and the status of that deployment is left as it is. Both replicas
   compute the same value except at a window edge, and an apply of an equal value changes
   nothing, so no leader is elected. A deployment without data gets zero counts and no
   `lastPushTime`. While Valkey is unavailable the status is left as it is (one WARN
   `status not updated` until it recovers). `kubectl get mimicworkload` prints `Mode`,
   `Endpoints` (the inbound count: a printer column cannot add fields; F9 adds a total when
-  outbound endpoints exist), `Pods` and `Last push` (an age, as kubectl prints `date` columns). Mode convergence is added in F10.
+  outbound endpoints exist; the CRD schema defaults `endpoints.inbound` to `0`, so the column
+  is `0` and not blank for a direction without endpoints, while the stored status omits it and
+  the controller compares statuses with that default applied), `Pods` and `Last push` (an age, as kubectl prints `date` columns). Mode convergence is added in F10.
 
 ### 7.5 Read API (F5)
 
@@ -978,7 +987,10 @@ Everything below except the capture tap, content decoding and the recorder threa
   `kubectl port-forward` to a controller pod); a peer that is not a loopback address gets
   `403` whatever the bind address, and so does a request whose `Host` is missing or is not
   `localhost`, `127.0.0.1` or `[::1]` (with or without a port), so that a web page cannot
-  reach an open port-forward through DNS rebinding. `GET` only (`405` otherwise), JSON, sorted keys:
+  reach an open port-forward through DNS rebinding; an empty port (`127.0.0.1:`) is not a port
+  and gets `403` as well. `GET` only: every other method, `HEAD` included, gets `405` with
+  `Allow: GET` (a body-less probe of a read API has no use, and the answers are not cacheable
+  anyway). JSON, sorted keys:
   - `GET /v1/workloads` → `{"workloads": [{"namespace", "deployment", "endpoints",
     "exchanges", "sample_bytes", "last_push"}]}`, sorted by namespace then deployment;
   - `GET /v1/workloads/<ns>/<dep>` → the same object plus `"pods": {"<pod>": "<last push,
@@ -986,10 +998,12 @@ Everything below except the capture tap, content decoding and the recorder threa
   - `GET /v1/workloads/<ns>/<dep>/report` → the stored `:report` bytes.
 
   `404` for a deployment without data, `400` for a name that is not DNS-1123, `503` while
-  Valkey is unavailable. No write and no delete: data leaves by expiry (§7.3).
+  Valkey is unavailable. A timestamp beyond year 9999 is shown as `9999-12-31T23:59:59.999Z`.
+  No write and no delete: data leaves by expiry (§7.3).
   A stored value that does not parse is `500` with one ERROR line per read, with the fields
   `namespace` and `deployment`: `stored report unreadable` for `:report` (§7.3), `stored meta
-  unreadable` for `:meta` and `stored pods unreadable` for `:pods`.
+  unreadable` for `:meta` and `stored pods unreadable` for `:pods`. In the list, an entry whose `:meta` is unreadable is
+  skipped, with that one ERROR line, instead of failing the whole list.
 - Consumers: F6 adds the OpenAPI 3.1 document and Swagger UI of a deployment on this
   listener, built from the same report; F9 adds an authenticated read of a sidecar's own
   deployment on the sidecar API (§7.2) for egress recordings and the mode (F10); F11 reads
