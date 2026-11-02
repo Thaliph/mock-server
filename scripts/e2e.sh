@@ -1607,9 +1607,20 @@ b_ok=$(cat "$WORK"/churn-logs/*.log | jq -R -s 'split("\n") | map(fromjson? | se
 echo "ctl_21: the client got $churn_ok 200s, B answered $b_ok" >&2
 (( churn_ok <= b_ok )) || fail "ctl_21: the client got $churn_ok 200s, more than the $b_ok B answered"
 ui_forward
-want_get=$((want_get + b_ok))
-wait_merged "$want_get" "$want_put" 150 \
-  || { echo "ctl_21: merged GET $(merged_count GET), expected $want_get (B answered $b_ok, the client got $churn_ok)" >&2; fail "ctl_21: the merged count is not the number of 200s B answered"; }
+# Every 200 the client received must be counted (nothing lost at SIGTERM) and nothing counted twice, so the
+# merged count is at most what B answered. A rollout that cuts a connection after B answered can also cost the
+# sidecar the exchange it was relaying, and the client the answer: the gap below B's count is accepted, and
+# printed, only up to the 200s the client did not receive.
+base_get=$want_get
+min_get=$((base_get + churn_ok))
+max_get=$((base_get + b_ok))
+wait_merged "$max_get" "$want_put" 90 || true
+fetch_merged || fail "ctl_21: cannot read the merged report after the churn"
+got_get=$(merged_count GET)
+echo "ctl_21: merged GET $got_get, between $min_get (the client's 200s) and $max_get (B's)" >&2
+(( got_get >= min_get && got_get <= max_get )) \
+  || fail "ctl_21: merged GET $got_get is not in [$min_get, $max_get] (B answered $b_ok, the client got $churn_ok)"
+[[ $(merged_count PUT) == "$want_put" ]] || fail "ctl_21: merged PUT $(merged_count PUT), expected $want_put"
 [[ $(merged_templates) == "$(cat "$WORK/templates-first.txt")" ]] \
   || fail "ctl_21: the endpoints changed during the churn: $(merged_templates | tr '\n' ';')"
 kubectl delete namespace disc-22 disc-22-client --wait=false >/dev/null
