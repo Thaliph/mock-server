@@ -68,13 +68,9 @@ fn json(r: &Report) -> Value {
     serde_json::from_str(&r.to_json().unwrap()).unwrap()
 }
 
-fn sample_of(
-    r: &Report,
-) -> (
-    Vec<(String, String)>,
-    Vec<(String, String)>,
-    Vec<(String, String)>,
-) {
+type Pairs = Vec<(String, String)>;
+
+fn sample_of(r: &Report) -> (Pairs, Pairs, Pairs) {
     let e = &r.endpoints()[0];
     let (_, s) = e.stats.samples().iter().next().unwrap();
     (
@@ -570,9 +566,10 @@ proptest! {
             for report in [r, path_report] {
                 let text = report.to_json().unwrap();
                 let hash = xxh3_64(canary.as_bytes());
+                let hex = format!("{hash:x}");
                 prop_assert!(!text.contains(&canary));
                 prop_assert!(!text.contains(&hash.to_string()));
-                prop_assert!(!text.contains(&format!("{hash:x}")));
+                prop_assert!(!text.contains(&hex));
             }
         }
     }

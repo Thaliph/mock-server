@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -39,6 +40,37 @@ pub fn auth_scheme(scheme: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|known| known.eq_ignore_ascii_case(scheme))
+}
+
+/// Request header values an outbound request keeps (spec §6.1): the negotiation and conditional
+/// headers of RFC 9110, `user-agent` and the gRPC headers. Every other value is redacted.
+const OUTBOUND_HEADERS: &[&str] = &[
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "content-encoding",
+    "content-language",
+    "content-type",
+    "expect",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "pragma",
+    "range",
+    "user-agent",
+    "grpc-accept-encoding",
+    "grpc-encoding",
+    "grpc-timeout",
+];
+
+fn outbound_header_kept(name: &str) -> bool {
+    OUTBOUND_HEADERS
+        .iter()
+        .any(|kept| kept.eq_ignore_ascii_case(name))
 }
 
 /// Deepest JSON nesting walked; anything below is redacted as a whole.
@@ -100,6 +132,8 @@ pub enum Rule {
     Aws,
     TokenPrefix,
     Userinfo,
+    /// An outbound request header value outside the allowlist (spec §6.1).
+    OutboundHeader,
 }
 
 impl Rule {
@@ -113,6 +147,7 @@ impl Rule {
             Rule::Aws => "aws",
             Rule::TokenPrefix => "token_prefix",
             Rule::Userinfo => "userinfo",
+            Rule::OutboundHeader => "outbound_header",
         }
     }
 }
@@ -129,9 +164,10 @@ pub fn value_rule(s: &str) -> Option<Rule> {
         Some(Rule::Card)
     } else if is_aws(s) {
         Some(Rule::Aws)
-    } else if TOKEN_PREFIXES
-        .iter()
-        .any(|p| s.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
+    } else if is_google_key(s)
+        || TOKEN_PREFIXES
+            .iter()
+            .any(|p| s.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
     {
         Some(Rule::TokenPrefix)
     } else if has_userinfo_password(s) {
@@ -215,6 +251,15 @@ fn is_aws(s: &str) -> bool {
         && (s.starts_with("AKIA") || s.starts_with("ASIA"))
         && s.bytes()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// `AIza` followed by 35 characters of `A-Za-z0-9_-`: a Google API key.
+fn is_google_key(s: &str) -> bool {
+    s.len() == 39
+        && s.starts_with("AIza")
+        && s.bytes()
+            .skip(4)
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
 /// A URL whose userinfo has a password: `scheme://user:password@host`.
@@ -345,9 +390,12 @@ fn token_end(s: &str, delims: &[char]) -> usize {
 #[derive(Debug, Clone)]
 pub struct Redactor {
     /// Built-in and extra names, normalised.
-    names: BTreeSet<String>,
+    names: Arc<BTreeSet<String>>,
     /// Longest of `names`, in bytes.
     max_len: usize,
+    /// The view of an outbound request (spec §6.1): header values outside an allowlist, and
+    /// `key` and `sig`, are redacted.
+    outbound_request: bool,
 }
 
 impl Default for Redactor {
@@ -365,13 +413,34 @@ impl Redactor {
             .chain(extra.into_iter().map(normalise).filter(|n| !n.is_empty()))
             .collect();
         let max_len = names.iter().map(String::len).max().unwrap_or(0);
-        Self { names, max_len }
+        Self {
+            names: Arc::new(names),
+            max_len,
+            outbound_request: false,
+        }
+    }
+
+    /// The same redaction with the additional rules of an outbound request (spec §6.1).
+    pub fn outbound_request(&self) -> Redactor {
+        Redactor {
+            outbound_request: true,
+            ..self.clone()
+        }
+    }
+
+    /// True when the value of header `name` is redacted whatever it holds: a sensitive name,
+    /// or in the outbound request view a name outside the allowlist.
+    pub fn header_name_matches(&self, name: &str) -> bool {
+        self.name_matches(name) || (self.outbound_request && !outbound_header_kept(name))
     }
 
     /// True when a header name, query key, form field or JSON key is redacted by name: a run
     /// of its tokens, joined, is a listed name, or a listed name followed by `s`.
     pub fn name_matches(&self, name: &str) -> bool {
         let tokens = tokens(name);
+        if self.outbound_request && tokens.iter().any(|t| t == "key" || t == "sig") {
+            return true;
+        }
         // A built-in name glued into a token (`JSESSIONID`, `csrftoken`), except the short
         // ones, which would match words like `company` or `author`.
         let glued = tokens.iter().any(|t| {
@@ -454,7 +523,10 @@ impl Redactor {
                 }
             }
             _ => {
-                if self.name_matches(name) {
+                if self.outbound_request && !outbound_header_kept(name) {
+                    rules.push(Rule::OutboundHeader);
+                    MARKER.to_string()
+                } else if self.name_matches(name) {
                     rules.push(Rule::Name);
                     MARKER.to_string()
                 } else if let Some(rule) = value_rule(value) {
