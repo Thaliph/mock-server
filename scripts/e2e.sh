@@ -1746,9 +1746,14 @@ browse list /ui/ --wait disc-22 --wait users
 browse deployment /ui/workloads/disc-22/users --wait '/users/{users_id}' --wait GET --wait PUT
 jq -e '.text | test("GET\\s+/users/\\{users_id\\}") and test("PUT\\s+/users/\\{users_id\\}")' "$WORK/browse-deployment.json" >/dev/null \
   || fail "ui_12: the deployment page lacks the GET and PUT /users/{users_id} rows"
-browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand
+browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand --interceptor
 jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-document.json" >/dev/null \
   || fail "ui_12: the document page lists the operations $(jq -c .methods "$WORK/browse-document.json"), not GET and PUT"
+# The request interceptor refuses by throwing (a returned null falls back to the original request): a cross-origin
+# URL, a same-origin URL outside /v1/workloads/ and a malformed one throw; a same-origin /v1/workloads/ URL passes.
+jq -e '.interceptor | (.cross_origin.threw and .cross_origin_workloads.threw and .same_origin_outside.threw and .malformed.threw)
+  and (.same_origin_workloads | .threw == false and .passed)' "$WORK/browse-document.json" >/dev/null \
+  || fail "ui_12: the request interceptor does not refuse as expected: $(jq -c .interceptor "$WORK/browse-document.json")"
 # The payload is shown as text, inert: no img element of that src (browse), and the text holds it.
 jq -e --arg x "$xss" '.text | contains($x)' "$WORK/browse-document.json" >/dev/null \
   || fail "ui_12: the XSS payload is not shown as text in the document page"

@@ -1,6 +1,6 @@
 # Loads one page in a headless Chromium through the DevTools protocol and prints what it saw as JSON (UI-12).
 # Stdlib only (a minimal WebSocket client), run by scripts/e2e.sh with python3 -I. Usage:
-#   ui_browser.py <devtools port> <url> [--wait TEXT]... [--expand]
+#   ui_browser.py <devtools port> <url> [--wait TEXT]... [--expand] [--interceptor]
 # It waits until the page text holds every TEXT (up to 45 s), with --expand opens every operation and walks
 # every example selector, settles for 3 s so that a stray request would show, then prints:
 #   text       the page text (innerText), with --expand also what each selector option showed
@@ -9,6 +9,8 @@
 #   methods    the text of every operation method label
 #   xss_imgs   the number of img elements whose src holds "ui-xss"
 #   requests   the URL of every request the page made
+#   interceptor with --interceptor, the outcome of window.mimicRequestInterceptor on its URLs: for each, whether
+#              it threw (a refusal) or returned the request
 #   violations CSP violations (console, log and audit issues, requests blocked by the policy)
 #   errors     other console errors and uncaught exceptions
 import base64
@@ -151,6 +153,31 @@ COLLECT = """JSON.stringify({
 })"""
 
 
+INTERCEPTOR = """(() => {
+  const o = window.location.origin;
+  const urls = {
+    cross_origin: "http://localhost:18090/ref",
+    cross_origin_workloads: "http://other.example/v1/workloads/x",
+    same_origin_outside: o + "/ui/assets/mimic.js",
+    malformed: "http://[",
+    prefix_trick: o + "/v1/workloadsX",
+    ui_path: o + "/ui/x",
+    same_origin_workloads: o + "/v1/workloads/disc-22/users/openapi/inbound-8080",
+  };
+  const out = {};
+  for (const [name, url] of Object.entries(urls)) {
+    const request = { url: url, headers: {} };
+    try {
+      const result = window.mimicRequestInterceptor(request);
+      out[name] = { threw: false, passed: result === request };
+    } catch (error) {
+      out[name] = { threw: true, passed: false };
+    }
+  }
+  return out;
+})()"""
+
+
 def is_csp(text):
     return "Content Security Policy" in text or "Refused to" in text
 
@@ -177,6 +204,12 @@ def main():
         print(f"ui_browser: {url}: the page never showed {waits}; it shows {text[:500]!r}", file=sys.stderr)
         sys.exit(1)
     extra = cdp.eval(EXPAND) if expand else []
+    interceptor = cdp.eval(INTERCEPTOR) if "--interceptor" in rest else None
+    if interceptor is not None:
+        wrong = [n for n, r in interceptor.items() if r["threw"] != (n != "same_origin_workloads")]
+        if wrong:
+            print(f"ui_browser: the request interceptor misjudged {wrong}: {interceptor}", file=sys.stderr)
+            sys.exit(1)
     cdp.drain(3)
     seen = json.loads(cdp.eval(COLLECT))
     seen["text"] = "\n".join([seen["text"], *extra])
@@ -203,6 +236,7 @@ def main():
                 errors.append(line)
         elif name == "Runtime.exceptionThrown":
             errors.append(json.dumps(p["exceptionDetails"].get("exception", {}).get("description", "")))
+    seen["interceptor"] = interceptor
     seen.update(requests=requests, violations=violations, errors=errors)
     print(json.dumps(seen))
 
