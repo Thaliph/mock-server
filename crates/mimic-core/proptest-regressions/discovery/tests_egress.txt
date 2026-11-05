@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 498640211bba34620f72b0757c5e9ec5697d60b3fceb44e3f8e9a001682d7bd2 # shrinks to a = [Tunnel(2, 0)], b = [], c = [Out(2, 0, 200, false, 0), Out(0, 0, 200, false, 0)], max_authorities = 2, max_endpoints = 1
