@@ -24,6 +24,8 @@ use tokio::sync::Semaphore;
 
 use crate::store::{ReadError, Store, Summary};
 
+mod assets;
+
 /// Renders at once per replica (spec §7.5).
 const MAX_RENDERS: usize = 2;
 
@@ -106,6 +108,16 @@ fn build(store: Arc<Store>, metrics: UiMetrics, hook: Option<Hook>) -> Router {
     };
     Router::new()
         .route("/", get(|| async { Redirect::permanent("/ui/") }))
+        .route("/ui/", get(assets::list_page))
+        .route(
+            "/ui/workloads/{namespace}/{deployment}",
+            get(assets::workload_page),
+        )
+        .route(
+            "/ui/workloads/{namespace}/{deployment}/openapi/{id}",
+            get(assets::openapi_page),
+        )
+        .route("/ui/assets/{*path}", get(assets::asset))
         .route("/v1/workloads", get(list))
         .route("/v1/workloads/{namespace}/{deployment}", get(workload))
         .route("/v1/workloads/{namespace}/{deployment}/report", get(report))
