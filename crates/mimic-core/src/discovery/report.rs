@@ -123,6 +123,18 @@ struct Scope {
 /// Most distinct SNIs and destinations kept per outbound scope.
 const MAX_ORIGINS: usize = 16;
 
+/// The kinds of `tunnels` (spec §6.1).
+pub const TUNNEL_KINDS: [&str; 8] = [
+    "tcp",
+    "connect",
+    "tls_excluded",
+    "tls_no_ca",
+    "tls_unsupported",
+    "tls_upstream_untrusted",
+    "tls_client_cert_requested",
+    "tls_client_rejected",
+];
+
 /// What an outbound scope knows of where its exchanges went (spec §6.1).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,6 +146,16 @@ struct Origin {
 }
 
 impl Origin {
+    /// Within the bounds of §6.1: what a sidecar can have recorded.
+    fn within_bounds(&self) -> bool {
+        self.schemes
+            .keys()
+            .all(|s| matches!(s.as_str(), "http" | "https"))
+            && self.sni.len() <= MAX_ORIGINS
+            && self.dst.len() <= MAX_ORIGINS
+            && self.sni.iter().chain(&self.dst).all(|v| v.len() <= 261)
+    }
+
     fn merge(&mut self, other: Origin) {
         for (scheme, n) in other.schemes {
             let count = self.schemes.entry(scheme).or_default();
@@ -517,6 +539,18 @@ impl Scope {
 }
 
 impl Scope {
+    /// `origin` and `tunnels` only on outbound scopes, within their bounds.
+    fn egress_valid(&self, outbound: bool) -> bool {
+        if !outbound {
+            return self.origin.is_none() && self.tunnels.is_none();
+        }
+        self.origin.as_ref().is_none_or(Origin::within_bounds)
+            && self
+                .tunnels
+                .as_ref()
+                .is_none_or(|t| t.keys().all(|k| TUNNEL_KINDS.contains(&k.as_str())))
+    }
+
     /// The value detectors again on the literal segments and the gRPC paths; keys that become
     /// equal merge.
     fn re_redact_paths(&mut self) {
@@ -963,11 +997,11 @@ impl Report {
         if self.version != 1 || self.has_authorities() {
             return Err(Violation::Version);
         }
-        if self
-            .scopes
-            .get(&Direction::Inbound)
-            .is_some_and(|scopes| scopes.keys().any(|k| matches!(k, ScopeKey::Authority(_))))
-        {
+        if self.scopes.get(&Direction::Inbound).is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|(k, s)| matches!(k, ScopeKey::Authority(_)) || !s.egress_valid(false))
+        }) {
             return Err(Violation::Malformed);
         }
         for ports in self.scopes.values() {
@@ -1045,7 +1079,7 @@ impl Report {
             return Err(format!("unsupported report version {}", report.version));
         }
         let outbound = report.scopes.get(&Direction::Outbound);
-        if (report.version == 2) != outbound.is_some() {
+        if (report.version == 2) != report.has_authorities() {
             return Err(format!(
                 "report version {} does not match its scopes",
                 report.version
@@ -1057,6 +1091,12 @@ impl Report {
         }
         if outbound.is_some_and(|s| s.keys().any(|k| !matches!(k, ScopeKey::Authority(_)))) {
             return Err("outbound scope key is not an authority".to_string());
+        }
+        let egress_ok = |scopes: Option<&BTreeMap<ScopeKey, Scope>>, outbound: bool| {
+            scopes.is_none_or(|s| s.values().all(|scope| scope.egress_valid(outbound)))
+        };
+        if !egress_ok(inbound, false) || !egress_ok(outbound, true) {
+            return Err("origin or tunnels out of bounds".to_string());
         }
         Ok(report)
     }

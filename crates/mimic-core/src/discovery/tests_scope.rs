@@ -200,6 +200,15 @@ fn egr_01_scope_keys_round_trip_through_their_text() {
         "a\u{0}.com:80",
         "-a.com:80",
         "a..com:80",
+        "a.com:+80",
+        "[::1]:+80",
+        "+80",
+        "a.com:",
+        "a.com:00",
+        "a.com:0",
+        "a.com:-1",
+        "a.com: 80",
+        "0",
     ] {
         assert_eq!(ScopeKey::parse(bad), None, "{bad:?}");
     }
@@ -307,4 +316,125 @@ fn egr_03_the_push_check_still_refuses_version_2() {
     let err = Report::parse_checked(&r.to_json().unwrap(), 256).unwrap_err();
     assert_eq!(err.reason(), "version");
     assert!(Report::parse_checked(V1_FIXTURE, 256).is_ok());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+    #[test]
+    fn egr_01_parse_is_canonical(s in "[0-9a-z:.\\[\\]+<>_ -]{0,30}") {
+        if let Some(k) = ScopeKey::parse(&s) {
+            prop_assert_eq!(k.to_string(), s);
+        }
+    }
+}
+
+fn v2_json() -> String {
+    let mut r = v1_report();
+    outbound(&mut r, "api.example.com:443", "/v1/charges", 200);
+    r.to_json().unwrap()
+}
+
+fn with_scope_field(
+    json: &str,
+    direction: &str,
+    key: &str,
+    field: &str,
+    value: serde_json::Value,
+) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+    v["scopes"][direction][key][field] = value;
+    v.to_string()
+}
+
+#[test]
+fn egr_03_from_json_bounds_origin_and_tunnels() {
+    let json = v2_json();
+    let key = "api.example.com:443";
+    let many: Vec<String> = (0..17).map(|i| format!("h{i:02}.example.com")).collect();
+    for (what, field, value) in [
+        (
+            "17 sni",
+            "origin",
+            serde_json::json!({"schemes": {}, "sni": many, "dst": []}),
+        ),
+        (
+            "17 dst",
+            "origin",
+            serde_json::json!({"schemes": {}, "sni": [], "dst": many}),
+        ),
+        (
+            "scheme",
+            "origin",
+            serde_json::json!({"schemes": {"ftp": 1}, "sni": [], "dst": []}),
+        ),
+        (
+            "long sni",
+            "origin",
+            serde_json::json!({"schemes": {}, "sni": ["a".repeat(300)], "dst": []}),
+        ),
+        (
+            "unknown field",
+            "origin",
+            serde_json::json!({"schemes": {}, "sni": [], "dst": [], "x": 1}),
+        ),
+        ("kind", "tunnels", serde_json::json!({"made_up": 1})),
+    ] {
+        let bad = with_scope_field(&json, "outbound", key, field, value);
+        assert!(Report::from_json(&bad).is_err(), "{what}");
+    }
+    let ok = with_scope_field(
+        &json,
+        "outbound",
+        key,
+        "tunnels",
+        serde_json::json!({"tcp": 2, "tls_no_ca": 1}),
+    );
+    assert!(Report::from_json(&ok).is_ok());
+}
+
+#[test]
+fn egr_03_from_json_refuses_origin_and_tunnels_on_inbound_scopes() {
+    for (field, value) in [
+        (
+            "origin",
+            serde_json::json!({"schemes": {}, "sni": [], "dst": []}),
+        ),
+        ("tunnels", serde_json::json!({"tcp": 1})),
+    ] {
+        let bad = with_scope_field(V1_FIXTURE, "inbound", "8080", field, value.clone());
+        assert!(Report::from_json(&bad).is_err(), "{field}");
+        assert_eq!(
+            Report::parse_checked(&bad, 256).unwrap_err(),
+            Violation::Malformed,
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn egr_03_one_version_rule_everywhere() {
+    // A port-keyed outbound scope is version 1 and is no valid report: `from_json` refuses it.
+    let l = limits();
+    let mut r = Report::new(None);
+    r.record(
+        &l,
+        &Redactor::default(),
+        &Exchange {
+            direction: Direction::Outbound,
+            port: 80,
+            method: "GET",
+            path: "/x",
+            status: 200,
+            head_ms: 1,
+            host: None,
+            grpc: false,
+            observation: Observation::default(),
+        },
+    );
+    let json = r.to_json().unwrap();
+    assert!(json.starts_with("{\"version\":1,"));
+    assert!(Report::from_json(&json).is_err());
+    // Version 2 holds exactly when an authority scope does.
+    assert!(Report::from_json(&v2_json()).is_ok());
 }
