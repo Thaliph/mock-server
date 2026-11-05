@@ -1080,3 +1080,5 @@ async fn ui_10_a_panicking_render_is_a_500_with_one_error() {
     assert_eq!(again.status, 500);
     assert_eq!(errors(&capture, &ns, "openapi render failed"), 2);
 }
+
+mod pages;
