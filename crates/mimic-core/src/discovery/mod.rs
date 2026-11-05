@@ -23,6 +23,8 @@ mod tests_check;
 #[cfg(test)]
 mod tests_ctl;
 #[cfg(test)]
+mod tests_egress;
+#[cfg(test)]
 mod tests_followup;
 #[cfg(test)]
 mod tests_openapi;
