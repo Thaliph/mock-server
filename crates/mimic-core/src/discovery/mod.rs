@@ -30,6 +30,8 @@ mod tests_openapi_ops;
 #[cfg(test)]
 mod tests_samples;
 #[cfg(test)]
+mod tests_scope;
+#[cfg(test)]
 mod tests_schema;
 #[cfg(test)]
 mod tests_status;
