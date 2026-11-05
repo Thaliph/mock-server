@@ -5,7 +5,7 @@ use proptest::prelude::*;
 use super::check::Violation;
 use super::observed::Observation;
 use super::redact::Redactor;
-use super::report::{Direction, Exchange, Limits, Report};
+use super::report::{Direction, Exchange, Limits, Report, Via};
 use super::scope::{ScopeKey, authority_key};
 
 fn dst(s: &str) -> SocketAddr {
@@ -16,6 +16,7 @@ fn limits() -> Limits {
     Limits {
         max_literals: 8,
         max_endpoints: 256,
+        max_authorities: 64,
         sample_budget: 16 << 20,
     }
 }
@@ -77,6 +78,11 @@ const V1_FIXTURE: &str = include_str!("../../tests/fixtures/report-v1.json");
 fn outbound(r: &mut Report, authority: &str, path: &str, status: u16) {
     r.record_at(
         ScopeKey::Authority(authority.to_string()),
+        &Via {
+            tls: false,
+            sni: None,
+            dst: None,
+        },
         &limits(),
         &Redactor::default(),
         &Exchange {

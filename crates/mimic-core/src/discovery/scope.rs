@@ -159,7 +159,7 @@ fn split_target(raw: &str, default_port: u16) -> Option<(String, u16)> {
 }
 
 /// A DNS name in the grammar, from any case and with one trailing dot.
-fn dns_host(name: &str) -> Option<String> {
+pub(super) fn dns_host(name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     let host = lower.strip_suffix('.').unwrap_or(&lower);
     valid_dns(host).then(|| host.to_string())

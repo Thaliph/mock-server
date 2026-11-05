@@ -12,6 +12,7 @@ fn limits() -> Limits {
     Limits {
         max_literals: 32,
         max_endpoints: 256,
+        max_authorities: 64,
         sample_budget: 16 << 20,
     }
 }
@@ -241,6 +242,7 @@ mod samples {
         assert!(size > 0);
 
         let l = Limits {
+            max_authorities: 64,
             sample_budget: size + 10,
             ..limits()
         };
@@ -451,7 +453,7 @@ mod bounds {
         fn dsc_11_never_panics_and_state_stays_bounded(
             items in proptest::collection::vec(arbitrary_exchange(), 0..60),
         ) {
-            let l = Limits { max_literals: 4, max_endpoints: 8, sample_budget: 1 << 20 };
+            let l = Limits { max_literals: 4, max_endpoints: 8, max_authorities: 4, sample_budget: 1 << 20 };
             let red = Redactor::default();
             let mut r = Report::new(None);
             for o in &items {

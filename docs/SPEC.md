@@ -655,7 +655,7 @@ logic in `mimic-core` (`discovery` module).
 
   `host` is a lower-case DNS name of at most 253 bytes (the SNI rule of §5), an IPv4 literal or
   a bracketed IPv6 literal in RFC 5952 form; `port` is decimal 1–65535 without leading zero,
-  always written. A host caught by a value detector of §6 redaction is the marker
+  always written (a destination port 0, which no connection has, is written as 1, so that every key matches the grammar). A host caught by a value detector of §6 redaction is the marker
   (`<redacted>:443`). The authority, not the IP, is the key: a provider's IPs change with DNS,
   and one IP serves many hosts. Path templating, its literal limit and absorption are per
   (direction, scope): `/v1/payments` on two authorities are two endpoints. An outbound endpoint
@@ -702,7 +702,9 @@ logic in `mimic-core` (`discovery` module).
   thread with inbound: under overload records are dropped and bodies skipped (`dropped`,
   `budget`) in proportion to each direction's traffic, and traffic is never slowed or altered
   (§4.1). `MIMIC_DISCOVERY_MAX_ENDPOINTS` applies to each direction on its own: outbound
-  endpoints never refuse an inbound one, nor the reverse. At most
+  endpoints never refuse an inbound one, nor the reverse; an outbound scope whose endpoints are
+  all evicted stays, with its `origin` and `tunnels`, so that the merge does not depend on the
+  order of the evictions. At most
   `MIMIC_DISCOVERY_MAX_AUTHORITIES` outbound scopes are held: an exchange or a tunnel to one more
   is refused (`authority_limit`, one WARN `authority limit reached`); there is no host
   templating (§11.1). Outbound samples hold at most half of `MIMIC_DISCOVERY_SAMPLE_BUDGET`

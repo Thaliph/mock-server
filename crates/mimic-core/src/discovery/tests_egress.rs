@@ -7,9 +7,7 @@ use serde_json::Value;
 
 use super::observed::Observation;
 use super::redact::Redactor;
-use super::report::{
-    Direction, Exchange, Limits, Outcome, Report, Sampled, Tunneled, Via, merge,
-};
+use super::report::{Direction, Exchange, Limits, Outcome, Report, Sampled, Tunneled, Via, merge};
 use super::scope::ScopeKey;
 
 fn limits() -> Limits {
@@ -56,7 +54,11 @@ fn out(r: &mut Report, l: &Limits, authority: &str, path: &str, status: u16) -> 
 }
 
 fn inb(r: &mut Report, l: &Limits, path: &str, status: u16) -> Outcome {
-    r.record(l, &Redactor::default(), &ex(Direction::Inbound, path, status))
+    r.record(
+        l,
+        &Redactor::default(),
+        &ex(Direction::Inbound, path, status),
+    )
 }
 
 fn json(r: &Report) -> Value {
@@ -84,8 +86,14 @@ fn egr_02_endpoints_are_per_authority() {
     assert_eq!(
         outbound_endpoints(&r),
         [
-            ("a.example:443".to_string(), "/v1/payments/{payments_id}".to_string()),
-            ("b.example:443".to_string(), "/v1/payments/{payments_id}".to_string()),
+            (
+                "a.example:443".to_string(),
+                "/v1/payments/{payments_id}".to_string()
+            ),
+            (
+                "b.example:443".to_string(),
+                "/v1/payments/{payments_id}".to_string()
+            ),
         ]
     );
     // Absorption at one authority leaves the other untouched.
@@ -94,9 +102,20 @@ fn egr_02_endpoints_are_per_authority() {
     }
     out(&mut r, &l, "b.example:443", "/u/aa", 200);
     let found = outbound_endpoints(&r);
-    assert!(found.contains(&("a.example:443".into(), "/u/{param}".into())), "{found:?}");
-    assert!(!found.iter().any(|(a, t)| a == "a.example:443" && t == "/u/aa"), "{found:?}");
-    assert!(found.contains(&("b.example:443".into(), "/u/aa".into())), "{found:?}");
+    assert!(
+        found.contains(&("a.example:443".into(), "/u/{u_id}".into())),
+        "{found:?}"
+    );
+    assert!(
+        !found
+            .iter()
+            .any(|(a, t)| a == "a.example:443" && t == "/u/aa"),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&("b.example:443".into(), "/u/aa".into())),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -104,7 +123,13 @@ fn egr_02_an_outbound_endpoint_has_no_hosts() {
     let mut r = Report::new(None);
     let mut e = ex(Direction::Outbound, "/x", 200);
     e.host = Some("api.example.com");
-    r.record_at(auth("api.example.com:80"), &PLAIN, &limits(), &Redactor::default(), &e);
+    r.record_at(
+        auth("api.example.com:80"),
+        &PLAIN,
+        &limits(),
+        &Redactor::default(),
+        &e,
+    );
     let e = r.endpoints().remove(0);
     assert!(e.stats.hosts.is_empty());
 }
@@ -133,9 +158,22 @@ fn egr_02_origin_counts_schemes_and_bounds_sni_and_dst() {
     }
     let v = json(&r);
     let origin = &v["scopes"]["outbound"]["api.example.com:443"]["origin"];
-    assert_eq!(origin["schemes"], serde_json::json!({"http": 2, "https": 20}));
-    let sni: Vec<&str> = origin["sni"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
-    let dst: Vec<&str> = origin["dst"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    assert_eq!(
+        origin["schemes"],
+        serde_json::json!({"http": 2, "https": 20})
+    );
+    let sni: Vec<&str> = origin["sni"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
+    let dst: Vec<&str> = origin["dst"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap())
+        .collect();
     assert_eq!(sni.len(), 16);
     assert_eq!(sni[0], "h00.example.com");
     assert_eq!(sni[15], "h15.example.com");
@@ -186,7 +224,10 @@ fn egr_05_the_authority_limit_refuses_a_third_scope() {
     let mut r = Report::new(None);
     out(&mut r, &l, "a.example:443", "/x", 200);
     out(&mut r, &l, "b.example:443", "/x", 200);
-    assert_eq!(out(&mut r, &l, "c.example:443", "/x", 200), Outcome::AuthorityLimit);
+    assert_eq!(
+        out(&mut r, &l, "c.example:443", "/x", 200),
+        Outcome::AuthorityLimit
+    );
     assert_eq!(
         r.record_tunnel(&l, auth("c.example:443"), "tcp"),
         Tunneled::AuthorityLimit
@@ -196,7 +237,10 @@ fn egr_05_the_authority_limit_refuses_a_third_scope() {
         out(&mut r, &l, "a.example:443", "/y", 200),
         Outcome::Recorded { .. }
     ));
-    assert_eq!(r.record_tunnel(&l, auth("b.example:443"), "tcp"), Tunneled::Counted);
+    assert_eq!(
+        r.record_tunnel(&l, auth("b.example:443"), "tcp"),
+        Tunneled::Counted
+    );
     assert_eq!(json(&r)["scopes"]["outbound"].as_object().unwrap().len(), 2);
 }
 
@@ -210,8 +254,17 @@ fn egr_05_the_endpoint_limit_is_per_direction() {
     for p in ["/a", "/b", "/c"] {
         out(&mut r, &l, "a.example:443", p, 200);
     }
-    assert_eq!(out(&mut r, &l, "a.example:443", "/d", 200), Outcome::EndpointLimit);
-    assert!(matches!(inb(&mut r, &l, "/a", 200), Outcome::Recorded { new_endpoint: true, .. }));
+    assert_eq!(
+        out(&mut r, &l, "a.example:443", "/d", 200),
+        Outcome::EndpointLimit
+    );
+    assert!(matches!(
+        inb(&mut r, &l, "/a", 200),
+        Outcome::Recorded {
+            new_endpoint: true,
+            ..
+        }
+    ));
     let mut r = Report::new(None);
     for p in ["/a", "/b", "/c"] {
         inb(&mut r, &l, p, 200);
@@ -219,7 +272,10 @@ fn egr_05_the_endpoint_limit_is_per_direction() {
     assert_eq!(inb(&mut r, &l, "/d", 200), Outcome::EndpointLimit);
     assert!(matches!(
         out(&mut r, &l, "a.example:443", "/a", 200),
-        Outcome::Recorded { new_endpoint: true, .. }
+        Outcome::Recorded {
+            new_endpoint: true,
+            ..
+        }
     ));
 }
 
@@ -240,13 +296,19 @@ fn egr_05_outbound_samples_stop_at_half_the_budget() {
         req_body: Some(&body),
         ..Observation::default()
     };
-    let probe = |direction, path| Exchange {
-        observation: obs.clone(),
-        ..ex(direction, path, 200)
-    };
+    fn probe<'a>(obs: &Observation<'a>, direction: Direction, path: &'a str) -> Exchange<'a> {
+        Exchange {
+            observation: obs.clone(),
+            ..ex(direction, path, 200)
+        }
+    }
     // One sample's size.
     let mut one = Report::new(None);
-    one.record(&limits(), &Redactor::default(), &probe(Direction::Inbound, "/p"));
+    one.record(
+        &limits(),
+        &Redactor::default(),
+        &probe(&obs, Direction::Inbound, "/p"),
+    );
     let size = one.sample_bytes();
     assert!(size > 2000);
     let l = Limits {
@@ -257,24 +319,49 @@ fn egr_05_outbound_samples_stop_at_half_the_budget() {
     let mut sampled = Vec::new();
     for i in 0..4 {
         let path = format!("/o{i}");
-        let o = r.record_at(auth("a.example:443"), &PLAIN, &l, &Redactor::default(), &probe(Direction::Outbound, &path));
+        let o = r.record_at(
+            auth("a.example:443"),
+            &PLAIN,
+            &l,
+            &Redactor::default(),
+            &probe(&obs, Direction::Outbound, &path),
+        );
         sampled.push(o);
     }
     let admitted = sampled
         .iter()
-        .filter(|o| matches!(o, Outcome::Recorded { sample: Sampled::Admitted, .. }))
+        .filter(|o| {
+            matches!(
+                o,
+                Outcome::Recorded {
+                    sample: Sampled::Admitted,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(admitted, 2, "{sampled:?}");
-    assert!(sampled
-        .iter()
-        .any(|o| matches!(o, Outcome::Recorded { sample: Sampled::Budget, .. })));
+    assert!(sampled.iter().any(|o| matches!(
+        o,
+        Outcome::Recorded {
+            sample: Sampled::Budget,
+            ..
+        }
+    )));
     // Inbound still uses the rest of the whole budget.
     let mut inbound = 0;
     for i in 0..4 {
         let path = format!("/i{i}");
         if matches!(
-            r.record(&l, &Redactor::default(), &probe(Direction::Inbound, &path)),
-            Outcome::Recorded { sample: Sampled::Admitted, .. }
+            r.record(
+                &l,
+                &Redactor::default(),
+                &probe(&obs, Direction::Inbound, &path)
+            ),
+            Outcome::Recorded {
+                sample: Sampled::Admitted,
+                ..
+            }
         ) {
             inbound += 1;
         }
@@ -282,10 +369,14 @@ fn egr_05_outbound_samples_stop_at_half_the_budget() {
     assert_eq!(inbound, 2);
     assert!(r.sample_bytes() <= l.sample_budget);
     // The merge enforces the same split.
-    let merged = merge(Report::new(None), r.clone(), &Limits {
-        sample_budget: size * 2,
-        ..l
-    });
+    let merged = merge(
+        Report::new(None),
+        r.clone(),
+        &Limits {
+            sample_budget: size * 2,
+            ..l
+        },
+    );
     assert!(merged.sample_bytes() <= size * 2);
 }
 
@@ -304,11 +395,23 @@ fn egr_08_tunnels_are_counted_by_kind_without_endpoint_sample_or_hosts() {
         "tls_client_rejected",
     ];
     for k in kinds {
-        assert_eq!(r.record_tunnel(&l, auth("db.example:5432"), k), Tunneled::Counted);
+        assert_eq!(
+            r.record_tunnel(&l, auth("db.example:5432"), k),
+            Tunneled::Counted
+        );
     }
-    assert_eq!(r.record_tunnel(&l, auth("db.example:5432"), "tcp"), Tunneled::Counted);
-    assert_eq!(r.record_tunnel(&l, auth("10.0.0.5:9000"), "tcp"), Tunneled::Counted);
-    assert_eq!(r.record_tunnel(&l, auth("db.example:5432"), "bogus"), Tunneled::Invalid);
+    assert_eq!(
+        r.record_tunnel(&l, auth("db.example:5432"), "tcp"),
+        Tunneled::Counted
+    );
+    assert_eq!(
+        r.record_tunnel(&l, auth("10.0.0.5:9000"), "tcp"),
+        Tunneled::Counted
+    );
+    assert_eq!(
+        r.record_tunnel(&l, auth("db.example:5432"), "bogus"),
+        Tunneled::Invalid
+    );
     assert!(r.endpoints().is_empty());
     assert_eq!(r.sample_bytes(), 0);
     assert_eq!(r.exchanges(), 0);
@@ -318,11 +421,17 @@ fn egr_08_tunnels_are_counted_by_kind_without_endpoint_sample_or_hosts() {
     assert_eq!(t["tcp"], 2);
     assert_eq!(t["tls_no_ca"], 1);
     assert_eq!(t.as_object().unwrap().len(), 8);
-    assert_eq!(v["scopes"]["outbound"]["10.0.0.5:9000"]["tunnels"]["tcp"], 1);
+    assert_eq!(
+        v["scopes"]["outbound"]["10.0.0.5:9000"]["tunnels"]["tcp"],
+        1
+    );
     assert!(!v.to_string().contains("hosts"));
     // Merges add the counts and the report round-trips.
     let twice = merge(r.clone(), r.clone(), &l);
-    assert_eq!(json(&twice)["scopes"]["outbound"]["db.example:5432"]["tunnels"]["tcp"], 4);
+    assert_eq!(
+        json(&twice)["scopes"]["outbound"]["db.example:5432"]["tunnels"]["tcp"],
+        4
+    );
     assert_eq!(Report::from_json(&r.to_json().unwrap()).unwrap(), r);
 }
 
@@ -351,7 +460,9 @@ const KINDS: [&str; 4] = ["tcp", "connect", "tls_no_ca", "tls_excluded"];
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
-        (0u8..4, prop_oneof![Just(200u16), Just(404), Just(500)]).prop_map(|(p, s)| Op::In(p, s)),
+        // Inbound `404` is state dependent (`not_found` on an unknown endpoint, DSC-11): the
+        // partition property needs exchanges that do not depend on what came before.
+        (0u8..4, prop_oneof![Just(200u16), Just(500)]).prop_map(|(p, s)| Op::In(p, s)),
         (
             0u8..4,
             0u8..4,
@@ -387,7 +498,11 @@ fn apply(r: &mut Report, l: &Limits, op: &Op) {
             );
         }
         Op::Tunnel(a, k) => {
-            r.record_tunnel(l, auth(&format!("h{a}.example:443")), KINDS[usize::from(*k)]);
+            r.record_tunnel(
+                l,
+                auth(&format!("h{a}.example:443")),
+                KINDS[usize::from(*k)],
+            );
         }
     }
 }

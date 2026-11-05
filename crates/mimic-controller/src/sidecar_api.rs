@@ -898,6 +898,7 @@ mod tests {
                     limits: mimic_core::discovery::report::Limits {
                         max_literals: 32,
                         max_endpoints: 256,
+                        max_authorities: 64,
                         sample_budget: 1 << 20,
                     },
                     max_deployments: 50,

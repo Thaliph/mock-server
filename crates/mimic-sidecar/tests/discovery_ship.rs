@@ -599,6 +599,7 @@ async fn ctl_16_pending_and_current_samples_share_the_budget() {
         vec![Reply::Status(503); 100],
         INTERVAL,
         DiscoveryConfig {
+            max_authorities: 64,
             sample_budget: budget,
             max_literals: 1000,
             ..DiscoveryConfig::default()

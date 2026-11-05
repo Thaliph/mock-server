@@ -3,6 +3,7 @@
 //! commutative and associative; recording an exchange merges a one-exchange report.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +12,7 @@ use super::histogram::Histogram;
 use super::observed::{Observation, Observed, state_bound};
 use super::redact::{self, MARKER, Redactor, value_rule};
 use super::sample::{MAX_SAMPLES, Sample, Samples};
-use super::scope::ScopeKey;
+use super::scope::{self, ScopeKey};
 use super::template::{Seg, is_param, render, split_path};
 
 /// Hosts kept per endpoint.
@@ -34,8 +35,10 @@ pub const MAX_SEGMENTS: usize = 32;
 pub struct Limits {
     /// `MIMIC_DISCOVERY_MAX_LITERALS`.
     pub max_literals: usize,
-    /// `MIMIC_DISCOVERY_MAX_ENDPOINTS`.
+    /// `MIMIC_DISCOVERY_MAX_ENDPOINTS`, for each direction.
     pub max_endpoints: usize,
+    /// `MIMIC_DISCOVERY_MAX_AUTHORITIES`: outbound scopes held.
+    pub max_authorities: usize,
     /// `MIMIC_DISCOVERY_SAMPLE_BUDGET`, in bytes.
     pub sample_budget: usize,
 }
@@ -69,8 +72,31 @@ pub enum Outcome {
     Invalid,
     /// `404` or `405` on an endpoint that is not known.
     NotFound,
-    /// A new endpoint past `max_endpoints`.
+    /// A new endpoint past `max_endpoints` in its direction.
     EndpointLimit,
+    /// An outbound exchange to a new authority past `max_authorities`.
+    AuthorityLimit,
+}
+
+/// What `record_tunnel` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tunneled {
+    Counted,
+    /// A new authority past `max_authorities`.
+    AuthorityLimit,
+    /// A kind outside [`TUNNEL_KINDS`], or a key that is not an authority.
+    Invalid,
+}
+
+/// How an outbound exchange reached its destination (spec §6.1, `origin`).
+#[derive(Debug, Clone, Copy)]
+pub struct Via<'a> {
+    /// Intercepted TLS (`https`), else cleartext (`http`).
+    pub tls: bool,
+    /// The SNI of the intercepted ClientHello.
+    pub sni: Option<&'a str>,
+    /// The original destination.
+    pub dst: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +172,29 @@ struct Origin {
 }
 
 impl Origin {
+    /// The origin of one exchange: one count under its scheme, the SNI and destination when
+    /// they are plain (a name in the grammar that no detector catches, an address).
+    fn of(via: &Via<'_>) -> Self {
+        let scheme = if via.tls { "https" } else { "http" };
+        let mut origin = Origin {
+            schemes: BTreeMap::from([(scheme.to_string(), 1)]),
+            ..Origin::default()
+        };
+        if let Some(sni) = via.sni.and_then(scope::dns_host)
+            && value_rule(&sni).is_none()
+        {
+            origin.sni.insert(sni);
+        }
+        if let Some(dst) = via.dst {
+            let port = dst.port();
+            origin.dst.insert(match dst.ip().to_canonical() {
+                IpAddr::V4(v4) => format!("{v4}:{port}"),
+                IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+            });
+        }
+        origin
+    }
+
     /// Within the bounds of §6.1: what a sidecar can have recorded.
     fn within_bounds(&self) -> bool {
         self.schemes
@@ -214,7 +263,10 @@ impl Stats {
         *s.statuses.entry(exchange.status).or_default() += 1;
         s.latency.observe(exchange.head_ms);
         // An authority has no userinfo (spec §4.1), but it is redacted like any other value.
-        s.hosts.extend(exchange.host.map(|h| {
+        let host = exchange
+            .host
+            .filter(|_| exchange.direction == Direction::Inbound);
+        s.hosts.extend(host.map(|h| {
             if value_rule(h).is_some() {
                 MARKER.to_string()
             } else {
@@ -619,15 +671,32 @@ impl Report {
         self.exchanges
     }
 
-    fn for_each_stats<'a>(&'a self, mut f: impl FnMut(&'a Stats)) {
-        for scope in self.scopes.values().flat_map(BTreeMap::values) {
-            scope.for_each_stats(&mut f);
+    /// The endpoints of one direction, or of both.
+    fn for_each_stats_of<'a>(&'a self, only: Option<Direction>, mut f: impl FnMut(&'a Stats)) {
+        for (_, scopes) in self
+            .scopes
+            .iter()
+            .filter(|(d, _)| only.is_none_or(|o| o == **d))
+        {
+            scopes
+                .values()
+                .for_each(|scope| scope.for_each_stats(&mut f));
         }
     }
 
-    fn for_each_stats_mut(&mut self, mut f: impl FnMut(&mut Stats)) {
-        for scope in self.scopes.values_mut().flat_map(BTreeMap::values_mut) {
-            scope.for_each_stats_mut(&mut f);
+    fn for_each_stats_mut(&mut self, f: impl FnMut(&mut Stats)) {
+        self.for_each_stats_of_mut(None, f);
+    }
+
+    fn for_each_stats_of_mut(&mut self, only: Option<Direction>, mut f: impl FnMut(&mut Stats)) {
+        for (_, scopes) in self
+            .scopes
+            .iter_mut()
+            .filter(|(d, _)| only.is_none_or(|o| o == **d))
+        {
+            scopes
+                .values_mut()
+                .for_each(|scope| scope.for_each_stats_mut(&mut f));
         }
     }
 
@@ -685,7 +754,9 @@ impl Report {
                     }
                 }
             }
-            if scope.is_empty() {
+            // An outbound scope stays with its origin and tunnels: evicting endpoints must not
+            // change what the merge keeps of them (spec §6.1), and `max_authorities` bounds them.
+            if *direction == Direction::Inbound && scope.is_empty() {
                 ports.remove(key);
             }
         }
@@ -696,25 +767,50 @@ impl Report {
 
     /// Keeps the `limit` endpoints that sort first (spec §6, merge).
     fn limit_endpoints(&mut self, limit: usize) {
-        if self.endpoint_count() <= limit {
-            return;
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            if self.endpoint_count(direction) <= limit {
+                continue;
+            }
+            let keys: Vec<EndpointKey> = self
+                .endpoint_keys()
+                .into_iter()
+                .filter(|k| k.0 == direction)
+                .collect();
+            for key in keys.iter().skip(limit) {
+                self.remove_endpoint(key);
+            }
         }
-        for key in self.endpoint_keys().iter().skip(limit) {
-            self.remove_endpoint(key);
+    }
+
+    /// Keeps the `limit` outbound scopes that sort first (spec §6.1, merge).
+    fn limit_authorities(&mut self, limit: usize) {
+        if let Some(scopes) = self.scopes.get_mut(&Direction::Outbound) {
+            while scopes.len() > limit {
+                scopes.pop_last();
+            }
+            if scopes.is_empty() {
+                self.scopes.remove(&Direction::Outbound);
+            }
         }
     }
 
     /// Drops the samples with the highest content hash (then the later endpoint) until they
     /// fit in `budget` (spec §6, merge).
     fn limit_samples(&mut self, budget: usize) {
-        let total = self.sample_bytes();
+        // Outbound samples hold at most half of the budget (spec §6.1).
+        self.limit_samples_of(Some(Direction::Outbound), budget / 2);
+        self.limit_samples_of(None, budget);
+    }
+
+    fn limit_samples_of(&mut self, only: Option<Direction>, budget: usize) {
+        let total = self.sample_bytes_of(only);
         if total <= budget {
             return;
         }
         // (hash, endpoint ordinal in tree order, bytes)
         let mut all = Vec::new();
         let mut ordinal = 0usize;
-        self.for_each_stats(|stats| {
+        self.for_each_stats_of(only, |stats| {
             all.extend(
                 stats
                     .samples
@@ -734,7 +830,7 @@ impl Report {
             dropped.insert((ordinal, hash));
         }
         let mut ordinal = 0usize;
-        self.for_each_stats_mut(|stats| {
+        self.for_each_stats_of_mut(only, |stats| {
             stats
                 .samples
                 .retain(|hash| !dropped.contains(&(ordinal, hash)));
@@ -758,17 +854,27 @@ impl Report {
             .get(exchange.method)
     }
 
-    /// Endpoints held, whatever their direction and port.
-    fn endpoint_count(&self) -> usize {
+    /// Endpoints held in a direction, whatever their scope.
+    fn endpoint_count(&self, direction: Direction) -> usize {
         let mut n = 0;
-        self.for_each_stats(|_| n += 1);
+        self.for_each_stats_of(Some(direction), |_| n += 1);
         n
+    }
+
+    fn outbound_scopes(&self) -> usize {
+        self.scopes
+            .get(&Direction::Outbound)
+            .map_or(0, BTreeMap::len)
     }
 
     /// Bytes of the samples held (what `MIMIC_DISCOVERY_SAMPLE_BUDGET` limits).
     pub fn sample_bytes(&self) -> usize {
+        self.sample_bytes_of(None)
+    }
+
+    fn sample_bytes_of(&self, only: Option<Direction>) -> usize {
         let mut n = 0;
-        self.for_each_stats(|s| n = usize::saturating_add(n, s.samples.bytes()));
+        self.for_each_stats_of(only, |s| n = usize::saturating_add(n, s.samples.bytes()));
         n
     }
 
@@ -784,7 +890,50 @@ impl Report {
             + MAX_SAMPLES * 256
             + 256
             + state_bound();
-        limits.max_endpoints.saturating_mul(per_endpoint) + 1024
+        // Both directions hold `max_endpoints`; each outbound scope adds its origin
+        // (16 SNIs and 16 destinations), its tunnels and its framing.
+        let per_authority = 300 + 2 * MAX_ORIGINS * 300 + TUNNEL_KINDS.len() * 60 + 256;
+        limits
+            .max_endpoints
+            .saturating_mul(2)
+            .saturating_mul(per_endpoint)
+            .saturating_add(limits.max_authorities.saturating_mul(per_authority))
+            + 1024
+    }
+
+    /// Counts a connection that carried no recordable HTTP in the `tunnels` of the outbound
+    /// scope `key` (spec §6.1): no endpoint, no sample.
+    pub fn record_tunnel(&mut self, limits: &Limits, key: ScopeKey, kind: &str) -> Tunneled {
+        let Some(kind) = TUNNEL_KINDS.iter().find(|k| **k == kind) else {
+            return Tunneled::Invalid;
+        };
+        if !matches!(key, ScopeKey::Authority(_)) {
+            return Tunneled::Invalid;
+        }
+        if self.authority_refused(&key, limits) {
+            return Tunneled::AuthorityLimit;
+        }
+        let scope = Scope {
+            origin: Some(Origin::default()),
+            tunnels: Some(BTreeMap::from([((*kind).to_string(), 1)])),
+            ..Scope::default()
+        };
+        let mut one = Report::new(self.pod.clone());
+        one.scopes
+            .entry(Direction::Outbound)
+            .or_default()
+            .insert(key, scope);
+        self.merge(limits, one);
+        Tunneled::Counted
+    }
+
+    /// A new outbound scope past `max_authorities`.
+    fn authority_refused(&self, key: &ScopeKey, limits: &Limits) -> bool {
+        self.outbound_scopes() >= limits.max_authorities
+            && !self
+                .scopes
+                .get(&Direction::Outbound)
+                .is_some_and(|scopes| scopes.contains_key(key))
     }
 
     /// Records one exchange: the same as merging a one-exchange report, once the bounds
@@ -795,7 +944,18 @@ impl Report {
         redactor: &Redactor,
         exchange: &Exchange<'_>,
     ) -> Outcome {
-        self.record_at(ScopeKey::Port(exchange.port), limits, redactor, exchange)
+        let via = Via {
+            tls: false,
+            sni: None,
+            dst: None,
+        };
+        self.record_at(
+            ScopeKey::Port(exchange.port),
+            &via,
+            limits,
+            redactor,
+            exchange,
+        )
     }
 
     /// [`Report::record`] in the scope `key`: the port, or the authority of an outbound
@@ -803,6 +963,7 @@ impl Report {
     pub fn record_at(
         &mut self,
         key: ScopeKey,
+        via: &Via<'_>,
         limits: &Limits,
         redactor: &Redactor,
         exchange: &Exchange<'_>,
@@ -814,13 +975,19 @@ impl Report {
         {
             return Outcome::Invalid;
         }
+        if matches!(key, ScopeKey::Authority(_)) && self.authority_refused(&key, limits) {
+            return Outcome::AuthorityLimit;
+        }
         let known = self.find(&key, exchange);
-        let counted_only = matches!(exchange.status, 404 | 405);
+        // Inbound scanners make `404` and `405` cheap; an outbound call was chosen by the app
+        // and a mock must answer it as the destination did (spec §6.1).
+        let counted_only =
+            exchange.direction == Direction::Inbound && matches!(exchange.status, 404 | 405);
         if known.is_none() {
             if counted_only {
                 return Outcome::NotFound;
             }
-            if self.endpoint_count() >= limits.max_endpoints {
+            if self.endpoint_count(exchange.direction) >= limits.max_endpoints {
                 return Outcome::EndpointLimit;
             }
         }
@@ -833,8 +1000,14 @@ impl Report {
                 .record_parsed(redactor, &exchange.observation);
             let (hash, sample) = Sample::new(redactor, exchange, request, response);
             let present = known.is_some_and(|k| k.samples.contains(hash));
-            if present || self.sample_bytes().saturating_add(sample.bytes()) <= limits.sample_budget
-            {
+            let bytes = sample.bytes();
+            let fits = self.sample_bytes().saturating_add(bytes) <= limits.sample_budget
+                && (exchange.direction == Direction::Inbound
+                    || self
+                        .sample_bytes_of(Some(Direction::Outbound))
+                        .saturating_add(bytes)
+                        <= limits.sample_budget / 2);
+            if present || fits {
                 stats.samples = Samples::single(hash, sample);
                 sampled = Sampled::Admitted;
             } else {
@@ -844,7 +1017,7 @@ impl Report {
         let methods = BTreeMap::from([(exchange.method.to_string(), stats)]);
         let mut scope = Scope::default();
         if matches!(key, ScopeKey::Authority(_)) {
-            scope.origin = Some(Origin::default());
+            scope.origin = Some(Origin::of(via));
             scope.tunnels = Some(BTreeMap::new());
         }
         if exchange.grpc {
@@ -911,6 +1084,7 @@ impl Report {
     /// reports of other pods are not trusted to respect them.
     pub fn merge(&mut self, limits: &Limits, other: Report) {
         self.union(other, limits.max_literals);
+        self.limit_authorities(limits.max_authorities);
         self.limit_endpoints(limits.max_endpoints);
         self.limit_samples(limits.sample_budget);
     }

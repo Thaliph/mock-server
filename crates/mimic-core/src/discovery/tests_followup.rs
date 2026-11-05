@@ -176,6 +176,7 @@ fn limits(max_endpoints: usize, sample_budget: usize) -> Limits {
     Limits {
         max_literals: 32,
         max_endpoints,
+        max_authorities: 64,
         sample_budget,
     }
 }
