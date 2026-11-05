@@ -150,6 +150,23 @@
     }).catch(failed);
   }
 
+  // Swagger UI falls back to the original request when an interceptor returns a falsy value, so
+  // a refusal must throw: the request is then never sent.
+  function requestInterceptor(request) {
+    var target;
+    try {
+      target = new URL(request.url, window.location.href);
+    } catch (error) {
+      throw new Error("request refused: malformed URL");
+    }
+    if (target.origin !== window.location.origin ||
+        target.pathname.indexOf("/v1/workloads/") !== 0) {
+      throw new Error("request refused: only same-origin /v1/workloads/ routes are allowed");
+    }
+    return request;
+  }
+  window.mimicRequestInterceptor = requestInterceptor;
+
   function openapiPage(ns, dep, id) {
     var url = apiPath(ns, dep, "/openapi/" + enc(id));
     show([
@@ -174,19 +191,7 @@
       withCredentials: false,
       showExtensions: true,
       deepLinking: true,
-      requestInterceptor: function (request) {
-        var target;
-        try {
-          target = new URL(request.url, window.location.href);
-        } catch (error) {
-          return null;
-        }
-        if (target.origin !== window.location.origin ||
-            target.pathname.indexOf("/v1/workloads/") !== 0) {
-          return null;
-        }
-        return request;
-      }
+      requestInterceptor: requestInterceptor
     });
   }
 

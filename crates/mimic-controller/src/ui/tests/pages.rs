@@ -203,6 +203,21 @@ async fn ui_09_mimic_js_is_safe_and_sets_the_swagger_options() {
     ] {
         assert!(js.contains(required), "mimic.js lacks {required}");
     }
+    // Swagger UI keeps the original request when an interceptor returns a falsy value: the
+    // interceptor must throw to refuse, and never return null or undefined.
+    let start = js
+        .find("function requestInterceptor")
+        .expect("the interceptor");
+    let body = &js[start..js[start..].find("\n  }\n").map(|e| start + e).unwrap()];
+    assert!(body.matches("throw new Error").count() >= 2, "{body}");
+    assert!(body.contains("catch (error) {\n      throw"), "{body}");
+    assert!(
+        !body.contains("return null") && !body.contains("return;"),
+        "{body}"
+    );
+    assert!(!body.contains("undefined"), "{body}");
+    assert!(js.contains("requestInterceptor: requestInterceptor"));
+    assert!(js.contains("window.mimicRequestInterceptor = requestInterceptor"));
 }
 
 #[tokio::test]
