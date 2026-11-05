@@ -1,0 +1,11 @@
+body { font-family: system-ui, sans-serif; margin: 0; color: #1b1b1b; background: #fff; }
+header { padding: 0.6rem 1rem; background: #1b2a3a; }
+header a { color: #fff; font-weight: bold; text-decoration: none; }
+main { padding: 0 1rem 1rem; }
+h1 { font-size: 1.4rem; }
+h2 { font-size: 1.1rem; margin-top: 1.5rem; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { border-bottom: 1px solid #ddd; padding: 0.3rem 0.5rem; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+th { background: #f3f5f7; }
+a { color: #0b5cad; }
+.error { color: #a40000; }
