@@ -68,6 +68,8 @@ pod on the controller.
 | `mimic_store_evicted_total` | counter | `kind` |
 | `mimic_store_expired_total` | counter | `kind` |
 | `mimic_status_updates_total` | counter | `result` (`ok`, `error`) (F5 status) |
+| `mimic_ui_requests_total` | counter | `route` (route pattern or `other`), `code` (read API and UI listener) |
+| `mimic_ui_render_duration_seconds` | histogram | none (parse and render of an OpenAPI document) |
 
 Webhook metrics (controller):
 
@@ -89,6 +91,16 @@ Starting alerts (tune to taste):
 | `mimic_tls_seed_loaded == 0` | Webhook cannot issue injections that need the seed |
 | `mimic_log_lines_dropped_total` rising | stdout cannot keep up; log lines are being dropped |
 | `mimic_tls_intermediate_expiry_timestamp_seconds - time()` small, non-zero | Intermediate not renewed |
+
+### The UI
+
+The UI is on the read API listener (`MIMIC_UI_ADDR`, loopback of each controller pod): reach it with
+`kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080` and open
+`http://localhost:8080/ui/`. Same access rule as the read API: whoever may use `pods/portforward` in
+the release namespace sees every namespace's discovered data. A render parses the stored report on a
+blocking thread, at most 2 at once per replica; the others wait. No log line is written per request.
+Rising `mimic_ui_requests_total{code="500"}` or `{code="503"}` means a stored value that does not
+parse or Valkey unavailable (see [Troubleshooting](Troubleshooting)).
 
 ## Logs
 
