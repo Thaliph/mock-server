@@ -65,7 +65,11 @@ impl<'de> Deserialize<'de> for ScopeKey {
 
 /// Decimal 1–65535 without sign or leading zero.
 fn canonical_port(text: &str) -> Option<u16> {
-    if text.len() > 5 || text.starts_with('0') {
+    if text.is_empty()
+        || text.len() > 5
+        || text.starts_with('0')
+        || !text.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     text.parse().ok()

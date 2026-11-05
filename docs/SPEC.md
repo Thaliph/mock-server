@@ -709,11 +709,14 @@ logic in `mimic-core` (`discovery` module).
   (`budget` beyond it), so egress never takes the room of the API the deployment serves;
   inbound samples may use the whole budget, as in F4.
 - **Report format, version 2.** Outbound scopes are under `scopes.outbound`, keyed by
-  authority, each with its tree, gRPC paths, `origin` and `tunnels`. A report that holds an
-  outbound scope is `"version": 2`; one without is `"version": 1` and byte-identical to F4/F5
-  (stored reports and pushes do not change). From F7 `Report::from_json` reads both and rejects
-  a version 1 report with an outbound scope, an inbound key that is not a port and an outbound
-  key outside the grammar above. The merge adds `schemes` and `tunnels`, keeps the 16 smallest
+  authority, each with its tree, gRPC paths, `origin` and `tunnels`. A report is
+  `"version": 2` if and only if it holds an outbound scope keyed by an authority, in `from_json`,
+  the push check and serialisation alike; otherwise it is `"version": 1` and byte-identical to
+  F4/F5 (stored reports and pushes do not change). From F7 `Report::from_json` reads both and
+  rejects a version that does not follow this rule, an inbound key that is not a port, an
+  outbound key outside the grammar above (so an outbound scope keyed by a port is no valid
+  report), `origin` or `tunnels` on an inbound scope, an `origin` with more than 16 `sni` or
+  `dst`, a scheme other than `http` and `https`, and a `tunnels` kind outside the list above. The merge adds `schemes` and `tunnels`, keeps the 16 smallest
   `sni` and `dst`, and past `max_authorities` keeps the authorities that sort first (the
   sidecar trusts its own report; the store ranks by traffic, F8).
 - **Kept in the sidecar (F7), shipped by F8.** In F7 the outbound part of the report is never
