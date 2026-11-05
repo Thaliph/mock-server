@@ -225,15 +225,17 @@ impl Logs {
             .collect()
     }
 
-    /// Waits for `n` access lines, lets stragglers arrive, and checks there are exactly `n`.
+    /// Waits for `n` access lines, lets stragglers arrive, and checks there are exactly `n`. A
+    /// loaded CI runner can starve the log worker for seconds, so the wait is long, and
+    /// `settled` (a marker line, written in order) replaces a fixed pause for stragglers.
     pub async fn access_exactly(&self, n: usize) -> Vec<serde_json::Value> {
-        for _ in 0..100 {
+        for _ in 0..500 {
             if self.access().len() >= n {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        self.settled().await;
         let lines = self.access();
         assert_eq!(lines.len(), n, "access lines:\n{}", self.text());
         lines
