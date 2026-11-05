@@ -412,7 +412,8 @@ client or the destination sees, the connection is **passed through** untouched i
 The sidecar turns the HTTP exchanges it relays into a description of the endpoints, keeps that
 description in a bounded in-memory **local report**, and (from F5) ships it to the controller,
 which merges the reports of every pod of the deployment in Valkey. F4 records **inbound**
-exchanges (the endpoints the deployment exposes); F7 runs the same engine on outbound ones.
+exchanges (the endpoints the deployment exposes); F7 runs the same engine on outbound ones
+(the APIs the deployment calls, §6.1), kept in the sidecar until F8 ships them.
 Everything below except the capture tap, content decoding and the recorder thread is pure logic in `mimic-core`
 (`discovery` module): parsing, templating, inference, redaction, sampling, merging.
 
@@ -422,12 +423,13 @@ Everything below except the capture tap, content decoding and the recorder threa
   exchange answered `404` or `405` creates no endpoint: it is counted on the endpoint whose
   template already matches it, else dropped as `not_found` (scanners must not fill the
   report). Inbound HTTPS is not decrypted (§5), so it is not discovered. An upgraded exchange
-  (`101`, WebSocket) is recorded without bodies.
+  (`101`, WebSocket) is recorded without bodies. Outbound exchanges follow §6.1 (`404` and
+  `405` included).
 - **Endpoint key**: `direction`, `port`, `method`, path template. For inbound, `port` is the
   original destination port (the app's listening port), not the `Host`: clients reach the
   same API through the Service name, its FQDN or the pod IP. The normalised authorities seen
-  (§4.1) are kept per endpoint as a set of at most 16 (`hosts`, first 16 in byte order). F7
-  keys outbound endpoints by authority instead of port.
+  (§4.1) are kept per endpoint as a set of at most 16 (`hosts`, first 16 in byte order).
+  Outbound endpoints are keyed by the destination's authority instead of a port (§6.1).
 - **Path templating.** The path (without query) is split on `/`; segments are compared as
   raw bytes (no percent-decoding, case kept; an empty last segment, i.e. a trailing slash, is
   a segment). Per position, a segment is a **parameter** when its value is id-like: digits only;
@@ -524,7 +526,8 @@ Everything below except the capture tap, content decoding and the recorder threa
     `alg`), a PEM block, a `Bearer `/`Basic ` credential, a 13–19 digit card number (spaces or
     dashes allowed) that passes Luhn, an AWS access key id (`AKIA`/`ASIA` + 16), and tokens with
     a known prefix (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `glpat-`,
-    `xox[abprs]-`, `sk_live_`, `rk_live_`, `sk-`); a URL's userinfo password. A path segment and a query value are percent-decoded for the
+    `xox[abprs]-`, `sk_live_`, `rk_live_`, `sk-`, and from F7 a Google API key: `AIza` followed
+    by 35 characters of `A-Za-z0-9_-`); a URL's userinfo password. A path segment and a query value are percent-decoded for the
     detectors (the stored form of a segment that is kept stays as received; a redacted one
     becomes the marker): `%65yJ...` is a JWT, `Bearer%20x` a credential.
   - *URLs in header values* (`Location`, `Referer`, `Content-Location`, `Link: <url>; rel=next`,
@@ -546,7 +549,7 @@ Everything below except the capture tap, content decoding and the recorder threa
 - **Counters and latency**, per endpoint: exchanges by status code, and a histogram of the
   time to the response head (`head_ms`, §4.1) with fixed log buckets (4 per doubling, from
   1 ms to 131 s, plus overflow), sparse.
-- **Local report.** A JSON document (`"version": 1`), serialised with sorted keys
+- **Local report.** A JSON document (`"version": 1`; 2 when it holds outbound scopes, §6.1), serialised with sorted keys
   (`BTreeMap`), holding the endpoints above plus `pod` and the number of exchanges it covers.
   The wire format serialises the template tree with its absorbing flags, so a merge keeps
   absorbed positions absorbed. A merged `pod` is kept only when both reports have the same one,
@@ -565,7 +568,7 @@ Everything below except the capture tap, content decoding and the recorder threa
   content: the merge is commutative; it is associative as long as no dropped endpoint would
   have been absorbed by a later merge. `to_json` reports a serialisation error instead of an
   empty document.
-- **Bounds.** At most `MIMIC_DISCOVERY_MAX_ENDPOINTS` endpoints per sidecar (further new
+- **Bounds.** At most `MIMIC_DISCOVERY_MAX_ENDPOINTS` endpoints per direction (§6.1; further new
   endpoints are dropped, `endpoint_limit`, one WARN `endpoint limit reached`); the template tree
   keeps its shape for the life of the process (counters and samples are what F5 ships and
   resets). Capture never slows forwarding: the proxy copies at most the head (64 KiB, §4.1) and
@@ -575,8 +578,8 @@ Everything below except the capture tap, content decoding and the recorder threa
   drained by one recorder thread that does the decoding, inference and merge. A full queue
   drops the record (`dropped`). Forwarding never waits for discovery (§4.1: forward, never
   refuse).
-- **HTTP/1 tap (F4 step 6).** Only inbound exchanges of plain HTTP/1 connections are
-  captured. The codec hands the raw head and the first 256 KiB of the body payload (chunk
+- **HTTP/1 tap (F4 step 6).** In F4 only inbound exchanges of plain HTTP/1 connections are
+  captured; F7 also captures outbound ones, cleartext and intercepted (§6.1). The codec hands the raw head and the first 256 KiB of the body payload (chunk
   framing removed) of each message to the exchange record; a head that does not fit in the
   capture budget drops the whole exchange (`dropped`), a body that does not fit is `budget`.
   A body of more than 256 KiB is `too_large` and contributes nothing (not even its size) to the
@@ -624,6 +627,113 @@ Everything below except the capture tap, content decoding and the recorder threa
   from ingress templates, samples, schemas and volatility; redacted values (credentials) must
   be supplied by the user, and its own traffic must not be recorded as discovery (F11
   design).
+
+### 6.1 Egress recording (F7)
+
+The sidecar records the exchanges the app sends to other services and providers with the engine
+of §6, into the same local report. Everything §6 states applies to outbound exchanges unless
+this section says otherwise; the scope key, origin, tunnels and outbound redaction view are pure
+logic in `mimic-core` (`discovery` module).
+
+- **What is recorded.** Every outbound HTTP/1 and `h2` exchange that got a response head, on a
+  cleartext connection or on a TLS connection that §5 intercepted (the decrypted exchange,
+  through the same tap, `h2` tee, capture budget and queue as inbound), except `unframed` and
+  `rejected` exchanges, `CONNECT` requests and `invalid` paths, as inbound. The sidecar's own
+  traffic (probes, sidecar API calls) runs as UID 1337 and is never captured (§4). Unlike
+  inbound, an outbound `404` or `405` is recorded like any other status: it creates its
+  endpoint and is a sample candidate. The app chose the call, and a mock (F10) must answer it
+  as the destination did; the bounds below contain an app that forwards paths chosen by its
+  own clients.
+- **Scope key: the authority.** Outbound endpoints are grouped by the destination's authority
+  `<host>:<port>`, the first that applies of:
+  1. the normalised target authority of §4.1 (absolute-form authority, else `Host`; for `h2`
+     `:authority`, else `Host`), with its explicit port, else the default port (80, or 443 on
+     an intercepted connection);
+  2. when it is absent, `(invalid)` or a host outside the grammar below: the SNI of the
+     intercepted ClientHello with the original destination port;
+  3. else the original destination `ip:port`.
+
+  `host` is a lower-case DNS name of at most 253 bytes (the SNI rule of §5), an IPv4 literal or
+  a bracketed IPv6 literal in RFC 5952 form; `port` is decimal 1–65535 without leading zero,
+  always written. A host caught by a value detector of §6 redaction is the marker
+  (`<redacted>:443`). The authority, not the IP, is the key: a provider's IPs change with DNS,
+  and one IP serves many hosts. Path templating, its literal limit and absorption are per
+  (direction, scope): `/v1/payments` on two authorities are two endpoints. An outbound endpoint
+  has no `hosts`; its scope has an **origin** instead: `schemes` (exchanges counted under
+  `http` and `https`, `https` meaning intercepted TLS), `sni` (the distinct SNIs of its
+  intercepted connections) and `dst` (the distinct original destinations `ip:port`), each set at
+  most 16, the first in byte order.
+- **Unrecordable traffic.** What carries no plaintext HTTP is neither decrypted nor parsed. It
+  is counted in the `tunnels` of an outbound scope, by kind, once per connection when its kind
+  is decided, with no endpoint and no sample:
+  - `tcp`: an opaque outbound connection (server-first or non-HTTP protocol, decrypted or not);
+  - `connect`: an HTTP `CONNECT` answered `2xx` (an egress proxy); its scope is the request
+    target authority;
+  - `tls_<reason>`: an outbound TLS connection that §5 passes through, one kind per decision
+    (`tls_excluded`, `tls_no_ca`, `tls_unsupported`, `tls_upstream_untrusted`,
+    `tls_client_cert_requested` for an mTLS destination, since the sidecar has no client key, and
+    `tls_client_rejected` for a pinning client or one with its own truststore).
+
+  The scope of a TLS tunnel is the SNI with the destination port when the SNI is valid, else the
+  destination `ip:port`; of a `tcp` tunnel, the SNI of an intercepted connection with the
+  destination port, else the destination `ip:port`. These counts show which destinations cannot
+  be documented, nor mocked by F10.
+- **Latency as the app sees it.** `head_ms` of §4.1: from the first byte of the request read
+  from the app to the final response head read from the destination, which the relay forwards
+  to the app at once. The same histogram as inbound. Connection setup (the app's DNS lookup, its
+  TCP connect, and the TLS handshake with the destination that §5 completes before answering
+  the app) happens before the request and is not in it (§11.1).
+- **Outbound view of redaction.** An outbound request carries the app's own credentials (one
+  provider key opens the whole account), often under names no rule knows. In an outbound
+  **request** only, besides every §6 rule:
+  - a header value is kept only for `accept`, `accept-charset`, `accept-encoding`,
+    `accept-language`, `cache-control`, `content-encoding`, `content-language`, `content-type`,
+    `expect`, `if-match`, `if-modified-since`, `if-none-match`, `if-range`,
+    `if-unmodified-since`, `pragma`, `range`, `user-agent`, `grpc-accept-encoding`,
+    `grpc-encoding` and `grpc-timeout` (still through the value detectors); `authorization`,
+    `proxy-authorization` and `cookie` keep their §6 rules (scheme, cookie names); every other
+    header value becomes the marker (rule `outbound_header`, its field marked `redacted`), so
+    `Ocp-Apim-Subscription-Key` or `X-Tenant-Key` keep their name and lose their value;
+  - a query key, form field or JSON key with `key` or `sig` as a whole token (`?key=`, `sig`,
+    `idempotency_key`) is redacted by name.
+
+  Responses of outbound exchanges, and inbound exchanges, follow §6 alone.
+- **Bounds and shedding.** Outbound shares the capture budget, the queue and the recorder
+  thread with inbound: under overload records are dropped and bodies skipped (`dropped`,
+  `budget`) in proportion to each direction's traffic, and traffic is never slowed or altered
+  (§4.1). `MIMIC_DISCOVERY_MAX_ENDPOINTS` applies to each direction on its own: outbound
+  endpoints never refuse an inbound one, nor the reverse. At most
+  `MIMIC_DISCOVERY_MAX_AUTHORITIES` outbound scopes are held: an exchange or a tunnel to one more
+  is refused (`authority_limit`, one WARN `authority limit reached`); there is no host
+  templating (§11.1). Outbound samples hold at most half of `MIMIC_DISCOVERY_SAMPLE_BUDGET`
+  (`budget` beyond it), so egress never takes the room of the API the deployment serves;
+  inbound samples may use the whole budget, as in F4.
+- **Report format, version 2.** Outbound scopes are under `scopes.outbound`, keyed by
+  authority, each with its tree, gRPC paths, `origin` and `tunnels`. A report that holds an
+  outbound scope is `"version": 2`; one without is `"version": 1` and byte-identical to F4/F5
+  (stored reports and pushes do not change). From F7 `Report::from_json` reads both and rejects
+  a version 1 report with an outbound scope, an inbound key that is not a port and an outbound
+  key outside the grammar above. The merge adds `schemes` and `tunnels`, keeps the 16 smallest
+  `sni` and `dst`, and past `max_authorities` keeps the authorities that sort first (the
+  sidecar trusts its own report; the store ranks by traffic, F8).
+- **Kept in the sidecar (F7), shipped by F8.** In F7 the outbound part of the report is never
+  frozen, pushed nor reset: pushes stay `"version": 1`, inbound only, because a controller up to
+  F7 answers `400` (`version`) to a version 2 report, and the inbound data in it would be lost.
+  Outbound counters accumulate for the life of the process (saturating) and its samples are
+  reselected as exchanges come; a restart loses them (§11.1). `GET /discovery` serves the
+  current inbound report merged with the outbound part. F8 ships the outbound part in the same
+  push (version 2) and resets it after acknowledgement like inbound, and adds the controller
+  side: the structural check with the outbound bounds, re-redaction with the outbound view, an
+  authority limit in the store ranked by traffic, a sample rule under which one direction never
+  evicts samples of the other while that one holds at most half of the budget (the bounded merge
+  of §7.3 ranks endpoints per direction already, but evicts samples across the deployment),
+  `status.discovery.endpoints.outbound`, and the `outbound-…` OpenAPI documents and endpoint
+  list entries (§7.5, §7.6). F9 serves the aggregated egress to sidecars; F10 mocks it.
+- **Logs** (`target` = `discovery`): `endpoint discovered` and `template absorbed` of an
+  outbound endpoint carry `authority` instead of `port`; WARN `endpoint limit reached` is
+  written once per direction (`direction`); WARN `authority limit reached` (`limit`) once; WARN
+  `sample budget full` carries `direction` (outbound: when its half fills). Authorities are
+  logged, as in access lines; never a header value, query, body or sample.
 
 ## 7. Controller and storage
 
@@ -833,7 +943,8 @@ Everything below except the capture tap, content decoding and the recorder threa
   flush does not back off: a failed post is repeated after a fixed 200 ms, whatever the backoff
   or the `Retry-After`, until the deadline. Without `MIMIC_CONTROLLER_URL` nothing is shipped (one
   INFO `report shipping disabled` at start) and the report accumulates as in F4. `GET
-  /discovery` serves the current report. Logs (`target` = `discovery`): DEBUG `report pushed`
+  /discovery` serves the current report (from F7 with the outbound part, which is not
+  shipped before F8, §6.1). Logs (`target` = `discovery`): DEBUG `report pushed`
   (`sequence`, `exchanges`, `bytes`, `applied`), WARN `report push failed` (`status` or
   `error`, `attempt`) once per failure streak, INFO `report push recovered`; never the token.
 - One log line per request (`target` = `sidecar_api`): `endpoint` (the route, e.g.
@@ -949,6 +1060,10 @@ Everything below except the capture tap, content decoding and the recorder threa
   `store limit reached` (`namespace`, `deployment`, `reason`) per deployment and reason per
   process; evictions in `mimic_store_evicted_total{kind}` with one WARN `store evicted`
   (`namespace`, `deployment`, `kind`, `count`) per deployment and kind per process.
+- **Outbound (F7, F8).** Up to F7 the structural check accepts `"version": 1` only, and
+  sidecars push no outbound data (§6.1): the store, the status and the UI hold inbound
+  endpoints only. F8 accepts version 2 pushes and adds the outbound rules listed in §6.1
+  (authority limit ranked by traffic, per-direction sample floor, outbound re-redaction).
 - **Pod churn**: no pod is read. A deleted pod's data stays merged (the deployment's API is
   the union over its life) and it ships its last report at `SIGTERM`; the pods of a rolling
   update push into the same key; a deleted pod's `:pods` and `:seq` fields expire after
@@ -1109,8 +1224,8 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
 
 - **Documents.** One per scope of the report: `inbound-<port>` per inbound port (decimal, no
   leading zero; id grammar `inbound-[1-9][0-9]{0,4}`, port 1–65535). From F8, one per outbound
-  authority, `outbound-<authority>` (grammar defined by F7/F8 from the §4.1 normalised
-  authority): adding them changes neither the inbound documents nor the routes; the index and
+  authority, `outbound-<authority>` (the scope is the `<host>:<port>` key of §6.1; F8 defines
+  its encoding in the id): adding them changes neither the inbound documents nor the routes; the index and
   the endpoint list gain entries with `direction: "outbound"` and `authority` instead of `port`.
   A deployment that listens on one port has one document. Paths of two scopes never share a
   document, so `/a` on port 8080 and `/a` on 9090 never collide.
@@ -1204,12 +1319,14 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   | `mimic_tls_passthrough_destinations` | gauge, remembered destinations (§5) | — |
   | `mimic_tls_intermediate_expiry_timestamp_seconds` | gauge, `notAfter` of the current intermediate, 0 when none | — |
   | `mimic_tls_intermediate_requests_total` | counter | `result` (`ok`, `error`, `mismatch`) |
-  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `dropped`, `panic`) |
+  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `authority_limit` (F7, outbound), `dropped`, `panic`) |
   | `mimic_discovery_bodies_total` | counter (F4), bodies of recorded exchanges | `direction`, `part` (`request`, `response`), `result` (`parsed`, `empty`, `opaque`, `too_large`, `encoding`, `invalid`, `budget`) |
   | `mimic_discovery_samples_total` | counter (F4), sample admissions | `direction`, `result` (`kept`, `replaced`, `rejected`, `budget`) |
-  | `mimic_discovery_redactions_total` | counter (F4) | `location` (`path`, `query`, `header`, `body`), `rule` (`name`, `jwt`, `pem`, `credential`, `card`, `aws`, `token_prefix`, `userinfo`) |
+  | `mimic_discovery_redactions_total` | counter (F4) | `location` (`path`, `query`, `header`, `body`), `rule` (`name`, `jwt`, `pem`, `credential`, `card`, `aws`, `token_prefix`, `userinfo`, from F7 `outbound_header`, §6.1) |
   | `mimic_discovery_endpoints` | gauge (F4), endpoints in the template tree; after a freeze (§7.2) those of the pending and the current report together, each distinct endpoint once | `direction` |
-  | `mimic_discovery_sample_bytes` | gauge (F4), bytes held by samples; after a freeze those of the pending and the current report together | — |
+  | `mimic_discovery_sample_bytes` | gauge (F4), bytes held by samples; after a freeze those of the pending and the current report together; from F7 the outbound part included | — |
+  | `mimic_discovery_authorities` | gauge (F7), outbound scopes held (§6.1) | — |
+  | `mimic_discovery_tunnels_total` | counter (F7), outbound connections without plaintext HTTP (§6.1) | `kind` (`tcp`, `connect`, `tls_excluded`, `tls_no_ca`, `tls_unsupported`, `tls_upstream_untrusted`, `tls_client_cert_requested`, `tls_client_rejected`), `result` (`recorded`, `authority_limit`, `dropped`) |
   | `mimic_discovery_pushes_total` | counter (F5), settled or failed push attempts (§7.2) | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`) |
   | `mimic_discovery_last_push_timestamp_seconds` | gauge (F5), time of the last acknowledged push, 0 before | — |
 
@@ -1324,7 +1441,8 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_TLS_TOKEN_FILE` | `/var/run/secrets/mimic.platform.io/token` | Projected token, re-read for every sidecar API request. |
 | `MIMIC_TRUST_BINARY` | `/usr/local/bin/mimic-trust` | The `mimic-trust` binary published into the trust volume (tests point it elsewhere); the webhook never sets it. |
 | `MIMIC_TRUST_DIR` | `/mimic` | `mimic-trust` volume: binary and fallback store written at start, `trust/*/image-ca.pem` read as upstream roots. |
-| `MIMIC_DISCOVERY_MAX_ENDPOINTS` | `256` | Endpoints kept per direction (§6), 1–10000. Not set by the webhook. |
+| `MIMIC_DISCOVERY_MAX_ENDPOINTS` | `256` | Endpoints kept per direction (§6), each direction on its own (§6.1), 1–10000. Not set by the webhook. |
+| `MIMIC_DISCOVERY_MAX_AUTHORITIES` | `64` | Outbound scopes (authorities) kept (§6.1), 1–10000. Not set by the webhook. |
 | `MIMIC_DISCOVERY_MAX_LITERALS` | `32` | Distinct literal segments below a template node before it absorbs them into a parameter (§6), 2–1000. Not set by the webhook. |
 | `MIMIC_DISCOVERY_SAMPLE_BUDGET` | `16Mi` | Bytes held by samples (`<n>`, `<n>Ki`, `<n>Mi`; 1Mi–1Gi). Not set by the webhook. |
 | `MIMIC_DISCOVERY_CAPTURE_BUDGET` | `8Mi` | Bytes of bodies captured in flight and queued (same syntax; 1Mi–1Gi). Not set by the webhook. |
@@ -1381,6 +1499,11 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   the listener's own; Swagger UI has no "Try it out" and no validator, so a browser on the
   UI never sends a request to a workload or to the Internet. Swagger UI is vendored at a pinned
   version, verified against its npm `sha512` and embedded in the binary.
+- Egress recording (F7, §6.1) adds no privilege, Kubernetes object, RBAC rule or variable set
+  by the webhook. Decrypted outbound exchanges exist only in the sidecar's memory, within the
+  capture budget, and leave it only redacted, through `/discovery` on loopback; outbound
+  request header values are kept only for a fixed allowlist, since the app's own provider
+  credentials travel there under arbitrary names. Nothing outbound is pushed before F8.
 - TLS key custody (§5): the seed exists only in its Secret and the controller's memory; root
   keys only in the controller's memory; intermediate and leaf keys only in the sidecar's
   memory (non-dumpable, no core file). Tokens and keys are never logged.
@@ -1482,6 +1605,21 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   all refused by the sample budget shows a description only. Inferred documents describe
   observed traffic, not a contract: optional fields never sent, and statuses never seen, are
   missing.
+- Egress recording (F7, §6.1): only cleartext and intercepted HTTP is recorded. Passed-through
+  TLS (pinning clients, mTLS destinations, exclusions, no CA, ECH), `CONNECT` tunnels and
+  non-HTTP TCP are only counted per authority (`tunnels`). Recorded latency is per request:
+  DNS, TCP connect and the TLS handshake are not in it, so a mock replaying it (F10) is
+  faster than the provider on new connections. There is no host templating: an app calling
+  one host per tenant or bucket fills `MIMIC_DISCOVERY_MAX_AUTHORITIES`, later authorities are
+  only counted (`authority_limit`). Outbound `404`/`405` create endpoints, so an app that
+  forwards paths chosen by its clients records them, within the endpoint limit and template
+  absorption. The outbound header allowlist does not cover queries and bodies: a credential
+  there under an unlisted name, in a form no detector knows, is kept, as in §6. Until F8 the
+  outbound part lives in the sidecar's memory only: a restart loses it, and anyone allowed
+  `pods/portforward` on the app's pods reads its redacted provider exchanges (response bodies
+  included, personal data in them too) through `/discovery`. A sidecar that pushes version 2
+  reports to a controller up to F7 gets `400` and drops that report (F8 must order its
+  rollout: controller first).
 - Discovery is best effort under load: dropped records, a full sample budget or the endpoint
   limit make counters and samples partial (counted in §9 metrics), never slow traffic. A
   `404`/`405` reaching a path no other status has created is not recorded. Template
@@ -1726,6 +1864,37 @@ name but `localhost`. A *canary* is as in §12.5.
 | UI-11 | **E.** On kind with the CTL-20 apps and traffic (a canary bearer token, a canary in a `PUT` body), through `kubectl port-forward` to a controller pod: `/v1/workloads/<ns>/users/openapi` lists `inbound-<users port>`; that document has `/users/{users_id}` with `get` and `put`, a `200` response with an example taken from a sample, the `http_bearer` scheme required by `get`, and `servers` naming the `users` Service host seen by the sidecar; `/endpoints` lists both endpoints with their counts. No canary is in any document, endpoint list or page. `HEAD /ui/` answers `200`. |
 | UI-12 | **E.** Browser: the headless Chromium loads `/ui/`, the `users` deployment page and its document page through the port-forward and dumps each DOM: they list the deployment, its two endpoints and the operations `GET /users/{users_id}` and `PUT /users/{users_id}`; there is no "Try it out" or "Execute" button; Chromium's log shows no Content Security Policy violation and no request to an origin other than the port-forward. A body recorded with the key and value `<img src=/ui-xss onerror=alert(1)>` shows as text, with no `img` element of that `src` in the DOM; a body recorded as `{"$ref": "http://localhost:<canary port>/ref"}` makes no request reach a server listening on that port. The `users` pods log no access line during the browser run (the UI sends no traffic to workloads). |
 | UI-13 | **C.** Supply chain: `scripts/vendor-swagger-ui.py --check` passes on the committed tree, fails when one vendored byte is changed and when the tarball does not match the lockfile's `sha512` (offline test with a fixture tarball); it runs in the supply-chain stage and `ci-ok` requires it. `scripts/check-cooldown.py` refuses a `swagger-ui-dist` version that a pull request adds or bumps in `crates/mimic-controller/ui/package-lock.json` when it was published less than 14 days before (`--now`), accepts it when the allowlist names it, and fails closed when the npm registry cannot be read. `.github/dependabot.yml` has an `npm` entry for `crates/mimic-controller/ui` with a 14-day cooldown; `zizmor` passes. |
+
+### 12.8 F7 — Egress recording in the sidecar
+
+Levels as in §12.2. Unit tests of §6.1 run on the recorder and the merge with the generators of
+the DSC tests, extended to outbound exchanges (any authority, SNI and destination). Sidecar
+integration tests run the real binary with the fake original destination of F2 on the
+outbound listener, the interception harness of F3 (test root, fake sidecar API, a test HTTPS
+destination) for TLS, and read `GET /discovery` from loopback. A *canary* is as in §12.5.
+
+| ID | Criterion |
+|---|---|
+| EGR-01 | **U.** Scope key (§6.1): an absolute-form `http://API.Example.com./v1` gives `api.example.com:80`; `Host: users.disc-22.svc:8080` gives `users.disc-22.svc:8080`; `Host: api.example.com` on an intercepted connection gives `api.example.com:443`; an `h2` `:authority` wins over `Host`; `Host: [2001:DB8::1]:8443` gives `[2001:db8::1]:8443`; a missing or `(invalid)` authority gives the SNI with the destination port, else the destination `10.0.0.5:8080`; a host that a value detector catches gives `<redacted>:<port>`; every key produced matches the grammar of §6.1 (`proptest` on arbitrary `Host`, SNI and destination: no panic, never a control character, a space or a key over 261 bytes). |
+| EGR-02 | **U.** Outbound endpoints: `GET /v1/payments/42` to `a.example:443` and to `b.example:443` are two endpoints `GET /v1/payments/{payments_id}`, and literal absorption at one authority leaves the other untouched; an outbound endpoint has no `hosts`; its scope's `origin` counts `schemes` `http` and `https`, and keeps at most 16 `sni` and 16 `dst`, the first in byte order; an outbound `404` on an unknown path creates its endpoint with a sample and a `405` is a sample candidate, while an inbound `404` is still `not_found` (DSC-11 unchanged). |
+| EGR-03 | **U.** Format: a report without outbound scope serialises byte-identical to F5 (`"version": 1`, the DSC-09 and CTL fixtures unchanged); one with an outbound exchange is `"version": 2` with `scopes.outbound.<authority>` holding the tree, `origin` and `tunnels`; both round-trip through `from_json`; `from_json` rejects a version 1 report with an outbound scope, an inbound key that is not a port, an outbound key outside the grammar and a version 3; the push check of §7.3 still rejects a version 2 report (reason `version`). |
+| EGR-04 | **U.** Merge algebra with outbound (`proptest`, ≥ 10 000 cases): commutative and associative; recording a sequence of inbound and outbound exchanges one by one equals merging the reports of any partition of it, `origin` and `tunnels` included; past `max_authorities` the merge keeps the authorities that sort first, commutatively; `max_endpoints` is enforced per direction. |
+| EGR-05 | **U.** Bounds: with `max_authorities` = 2, an exchange and a tunnel to a third authority are `authority_limit` while the two known ones still update; with `max_endpoints` = 3, three outbound endpoints do not refuse a new inbound one, nor the reverse; outbound samples stop at half of the sample budget (`budget`) while inbound samples are still admitted up to the whole budget. For arbitrary inbound and outbound exchanges (`proptest`) the recorder never panics and its retained state, sample bytes excluded, stays below the DSC-11 bound computed for both directions and the authority limit. |
+| EGR-06 | **U.** Outbound view of redaction: in an outbound request, `Ocp-Apim-Subscription-Key: <canary>`, `X-Tenant-Key: <canary>` and `X-Anything: <canary>` keep their names and get the marker (rule `outbound_header`, fields marked `redacted`), while `accept`, `content-type`, `user-agent` and `if-none-match` values are kept, `Authorization: Basic <canary>` gives `Basic <redacted>` and `Cookie: a=<canary>` gives `a=<redacted>`; `?key=<canary>`, `?sig=<canary>` and a JSON `idempotency_key` are redacted by name; the same headers and keys in an outbound response and in an inbound request are kept (`X-Anything: v`, `?key=v`). An `AIza` key (`AIza` + 35 characters) is redacted by value in both directions, and `AIza` + 34 is kept. |
+| EGR-07 | **U.** No leak (`proptest`, ≥ 10 000 cases): generated outbound exchanges carrying a canary under a listed name, in a detected form, or as the value of a request header with an arbitrary name outside the allowlist, at a random place (path, query, header, form or JSON body at any depth, request or response), give a serialised report that contains neither the canary nor its XXH3 hash, in decimal or hex. |
+| EGR-08 | **U.** Tunnels: a `tcp`, a `connect` and each `tls_<reason>` kind of §6.1 are counted in the `tunnels` of their scope (SNI with the destination port, or the destination `ip:port`, or the `CONNECT` target), a scope can hold tunnels only (no endpoint), merges add the counts, and a tunnel creates no sample and no `hosts`. |
+| EGR-09 | **I.** Cleartext outbound: HTTP/1.1 and `h2` (prior knowledge) exchanges from a test client through the outbound listener to the test destination (`GET /users/{1..5}` with JSON responses, `POST /orders?dry_run=true` with a JSON body answered `201` and `400`, a `GET /missing` answered `404`, a unary gRPC call) appear in `/discovery` under `scopes.outbound.<authority>` with their templates, status counters, histogram, query, header and body schemas, samples and `origin` (`schemes.http`, `dst`), the `404` included; `unframed` exchanges, exchanges without a response head and the sidecar's own probe and sidecar API requests do not; inbound exchanges sent meanwhile are recorded under `inbound` as in DSC-12; bytes reach both ends unchanged. |
+| EGR-10 | **I.** Intercepted outbound: HTTPS requests over HTTP/1.1 and over `h2` (ALPN) to the test HTTPS destination are recorded with their decrypted heads and bodies under `<sni>:443`-style authorities, with `schemes.https` and the SNI in `origin.sni`; a `Host` that differs from the SNI keys the endpoint by `Host` and keeps the SNI in `origin.sni`; a `gzip` response body is decoded and inferred. |
+| EGR-11 | **I.** Unrecordable traffic: a destination that asks for a client certificate (mTLS), a destination signed by an unknown CA, an excluded SNI, a client that rejects the mimic certificate, a sidecar without CA, an opaque TCP connection and a `CONNECT` answered `200` record no endpoint and count one `tunnels` entry each, of kinds `tls_client_cert_requested`, `tls_upstream_untrusted`, `tls_excluded`, `tls_client_rejected`, `tls_no_ca`, `tcp` and `connect`, under the scope of §6.1; `mimic_discovery_tunnels_total{kind,result="recorded"}` matches; the bytes of every case are unchanged. |
+| EGR-12 | **I.** Latency: a destination that sends its response head 300 ms after the request gives outbound histogram observations at 300 ms or more, in the bucket of the `head_ms` of the matching access line; a destination whose TLS handshake is delayed by 500 ms and that answers at once gives a first exchange whose recorded `head_ms` is under 500 ms (connection setup is not in it). |
+| EGR-13 | **I.** F7 boundary: with the fake sidecar API, every pushed report is `"version": 1` and holds no outbound scope while outbound and inbound traffic is sent; after an acknowledged push `/discovery` still shows the outbound endpoints with their counters unchanged (not reset) and only the unshipped inbound exchanges; `mimic_discovery_endpoints{direction="outbound"}` and `mimic_discovery_sample_bytes` include the outbound part. |
+| EGR-14 | **I.** Shedding: with `MIMIC_DISCOVERY_QUEUE=1` and `MIMIC_DISCOVERY_CAPTURE_BUDGET=1Mi`, 2000 concurrent outbound requests with 200 KiB bodies (1800 cleartext, 200 intercepted) and 200 inbound ones sent at the same time are all answered with the bytes the destination or the app sent; `mimic_discovery_exchanges_total` sums, per direction, to the exchanges of that direction, with `dropped` > 0 for outbound, at least one inbound exchange `recorded`, and bodies skipped for the budget counted `budget`. |
+| EGR-15 | **I.** Memory and limits: 256 inbound and 256 outbound endpoints over 64 authorities, each receiving 30 distinct 256 KiB JSON exchanges, leave the sidecar RSS under 128 MiB (the injected memory limit), with `mimic_discovery_sample_bytes` ≤ `MIMIC_DISCOVERY_SAMPLE_BUDGET` and the outbound samples at most half of it; a 65th authority is `authority_limit` with one WARN `authority limit reached`; a 257th outbound endpoint is `endpoint_limit` with one WARN `endpoint limit reached` (`direction` `outbound`) while a new inbound endpoint is still recorded. |
+| EGR-16 | **I.** Logs and metrics: one INFO `endpoint discovered` per new outbound endpoint with `direction` `outbound`, `authority`, `method` and `template` and no `port`; `template absorbed` likewise; WARN `sample budget full` with `direction` `outbound` once when the outbound half fills; `mimic_discovery_exchanges_total{direction="outbound"}`, `mimic_discovery_bodies_total`, `mimic_discovery_samples_total`, `mimic_discovery_redactions_total{rule="outbound_header"}` and `mimic_discovery_authorities` match the traffic sent; no `mimic_discovery_*` series has an authority label; no line holds a header value, query, body or sample. |
+| EGR-17 | **I.** No leak end to end: canaries sent by the client in outbound `Authorization`, `Cookie`, `X-Api-Key`, `Ocp-Apim-Subscription-Key` and `X-Custom` headers, a `?key=` and a `?sig=` query, an `AIza` key, a JWT path segment, `client_secret` in a form body to a token endpoint, and returned by the destination as `access_token` in a JSON body and in a `Set-Cookie`, cleartext and intercepted, appear neither in `/discovery`, nor on stdout (access lines included), nor in `/metrics`; the bytes reach the destination and the client unchanged. |
+| EGR-18 | **I.** `MIMIC_DISCOVERY_MAX_AUTHORITIES` at `0`, `10001` or `abc` exits 2 before listening (FND-01); unset, the limit is 64. |
+| EGR-19 | **E.** On kind, service A (`front`, `scripts/e2e/apps`) runs injected in its own `enabled` namespace with `UPSTREAM` the `users` Service of DSC-22 (service B); a client calls A's `/front/users/<id>` (GET with a canary bearer token and an `X-Tenant-Key` canary, PUT with a JSON body, some with B's `delay_ms=200`) and `/front/missing`. Through `kubectl port-forward`, A's `/discovery` holds `scopes.outbound."users.disc-22.svc:8080"` with `GET` and `PUT /users/{users_id}` (their counts equal to the client's calls), a `GET /missing` with a `404`, the delayed calls in histogram buckets of 200 ms or more, `Authorization: Bearer <redacted>` and `X-Tenant-Key: <redacted>` in samples (no `spec.discovery.redact` applies to `front`: the outbound allowlist does it), and no canary; B's access lines show every call (B got the traffic); A's stdout has no canary; the controller's merged report of `front` holds inbound endpoints only (F8). |
+| EGR-20 | **C.** The DSC-23 fuzz target also feeds outbound exchanges (arbitrary authority, SNI, destination and tunnel kind) to the recorder; same CI schedule as DSC-23. |
 
 ## 13. Test strategy
 
