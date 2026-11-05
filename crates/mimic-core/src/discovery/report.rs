@@ -11,6 +11,7 @@ use super::histogram::Histogram;
 use super::observed::{Observation, Observed, state_bound};
 use super::redact::{self, MARKER, Redactor, value_rule};
 use super::sample::{MAX_SAMPLES, Sample, Samples};
+use super::scope::ScopeKey;
 use super::template::{Seg, is_param, render, split_path};
 
 /// Hosts kept per endpoint.
@@ -111,6 +112,42 @@ struct Scope {
     root: Node,
     /// gRPC paths, never templated: path, then method.
     raw: BTreeMap<String, BTreeMap<String, Stats>>,
+    /// Outbound scopes only (spec §6.1): where the exchanges went.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<Origin>,
+    /// Outbound scopes only: connections that were counted, not recorded, by kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tunnels: Option<BTreeMap<String, u64>>,
+}
+
+/// Most distinct SNIs and destinations kept per outbound scope.
+const MAX_ORIGINS: usize = 16;
+
+/// What an outbound scope knows of where its exchanges went (spec §6.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Origin {
+    /// Exchanges per scheme, `http` and `https`.
+    schemes: BTreeMap<String, u64>,
+    sni: BTreeSet<String>,
+    dst: BTreeSet<String>,
+}
+
+impl Origin {
+    fn merge(&mut self, other: Origin) {
+        for (scheme, n) in other.schemes {
+            let count = self.schemes.entry(scheme).or_default();
+            *count = count.saturating_add(n);
+        }
+        self.sni.extend(other.sni);
+        self.dst.extend(other.dst);
+        while self.sni.len() > MAX_ORIGINS {
+            self.sni.pop_last();
+        }
+        while self.dst.len() > MAX_ORIGINS {
+            self.dst.pop_last();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,14 +156,17 @@ pub struct Report {
     version: u32,
     pod: Option<String>,
     exchanges: u64,
-    scopes: BTreeMap<Direction, BTreeMap<u16, Scope>>,
+    scopes: BTreeMap<Direction, BTreeMap<ScopeKey, Scope>>,
 }
 
 /// An endpoint of a report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint<'a> {
     pub direction: Direction,
+    /// The port of the scope: the listening port, or the one the authority ends with.
     pub port: u16,
+    /// The scope key of an outbound endpoint (spec §6.1); `None` for inbound.
+    pub authority: Option<&'a str>,
     pub method: &'a str,
     pub template: String,
     /// The segments of the template; empty for a gRPC path, which is never templated.
@@ -461,6 +501,18 @@ impl Scope {
         for (path, methods) in other.raw {
             merge_methods(self.raw.entry(path).or_default(), methods);
         }
+        if let Some(origin) = other.origin {
+            self.origin
+                .get_or_insert_with(Origin::default)
+                .merge(origin);
+        }
+        if let Some(tunnels) = other.tunnels {
+            let mine = self.tunnels.get_or_insert_with(BTreeMap::new);
+            for (kind, n) in tunnels {
+                let count = mine.entry(kind).or_default();
+                *count = count.saturating_add(n);
+            }
+        }
     }
 }
 
@@ -503,7 +555,9 @@ impl Scope {
     }
 
     fn is_empty(&self) -> bool {
-        self.root.prunable() && self.raw.is_empty()
+        self.root.prunable()
+            && self.raw.is_empty()
+            && self.tunnels.as_ref().is_none_or(BTreeMap::is_empty)
     }
 }
 
@@ -515,7 +569,7 @@ pub(super) enum Place {
 }
 
 /// An endpoint's place in a report, ordered like [`Report::endpoints`].
-pub(super) type EndpointKey = (Direction, u16, String, String, Place);
+pub(super) type EndpointKey = (Direction, ScopeKey, String, String, Place);
 
 impl Report {
     pub fn new(pod: Option<String>) -> Self {
@@ -547,7 +601,7 @@ impl Report {
     pub(super) fn endpoint_keys(&self) -> Vec<EndpointKey> {
         let mut keys = Vec::new();
         for (direction, ports) in &self.scopes {
-            for (port, scope) in ports {
+            for (scope_key, scope) in ports {
                 let mut places = Vec::new();
                 scope.root.places(&mut Vec::new(), &mut places);
                 for (segments, method) in places {
@@ -556,13 +610,19 @@ impl Report {
                     } else {
                         render(&segments)
                     };
-                    keys.push((*direction, *port, template, method, Place::Tree(segments)));
+                    keys.push((
+                        *direction,
+                        scope_key.clone(),
+                        template,
+                        method,
+                        Place::Tree(segments),
+                    ));
                 }
                 for (path, methods) in &scope.raw {
                     for method in methods.keys() {
                         keys.push((
                             *direction,
-                            *port,
+                            scope_key.clone(),
                             path.clone(),
                             method.clone(),
                             Place::Raw(path.clone()),
@@ -575,11 +635,11 @@ impl Report {
         keys
     }
 
-    pub(super) fn remove_endpoint(&mut self, (direction, port, _, method, place): &EndpointKey) {
+    pub(super) fn remove_endpoint(&mut self, (direction, key, _, method, place): &EndpointKey) {
         let Some(ports) = self.scopes.get_mut(direction) else {
             return;
         };
-        if let Some(scope) = ports.get_mut(port) {
+        if let Some(scope) = ports.get_mut(key) {
             match place {
                 Place::Tree(segments) => scope.root.remove(segments, method),
                 Place::Raw(path) => {
@@ -592,7 +652,7 @@ impl Report {
                 }
             }
             if scope.is_empty() {
-                ports.remove(port);
+                ports.remove(key);
             }
         }
         if ports.is_empty() {
@@ -649,8 +709,8 @@ impl Report {
     }
 
     /// The stats of the endpoint an exchange belongs to, when it is already known.
-    fn find(&self, exchange: &Exchange<'_>) -> Option<&Stats> {
-        let scope = self.scopes.get(&exchange.direction)?.get(&exchange.port)?;
+    fn find(&self, key: &ScopeKey, exchange: &Exchange<'_>) -> Option<&Stats> {
+        let scope = self.scopes.get(&exchange.direction)?.get(key)?;
         if exchange.grpc {
             return scope
                 .raw
@@ -701,6 +761,18 @@ impl Report {
         redactor: &Redactor,
         exchange: &Exchange<'_>,
     ) -> Outcome {
+        self.record_at(ScopeKey::Port(exchange.port), limits, redactor, exchange)
+    }
+
+    /// [`Report::record`] in the scope `key`: the port, or the authority of an outbound
+    /// exchange (spec §6.1).
+    pub fn record_at(
+        &mut self,
+        key: ScopeKey,
+        limits: &Limits,
+        redactor: &Redactor,
+        exchange: &Exchange<'_>,
+    ) -> Outcome {
         let segments = split_path(exchange.path);
         if exchange.path.len() > MAX_PATH
             || segments.len() > MAX_SEGMENTS
@@ -708,7 +780,7 @@ impl Report {
         {
             return Outcome::Invalid;
         }
-        let known = self.find(exchange);
+        let known = self.find(&key, exchange);
         let counted_only = matches!(exchange.status, 404 | 405);
         if known.is_none() {
             if counted_only {
@@ -737,6 +809,10 @@ impl Report {
         }
         let methods = BTreeMap::from([(exchange.method.to_string(), stats)]);
         let mut scope = Scope::default();
+        if matches!(key, ScopeKey::Authority(_)) {
+            scope.origin = Some(Origin::default());
+            scope.tunnels = Some(BTreeMap::new());
+        }
         if exchange.grpc {
             // Not templated, but redacted: the client chooses its `content-type`.
             scope.raw.insert(redact::path(exchange.path), methods);
@@ -762,7 +838,7 @@ impl Report {
         one.scopes
             .entry(exchange.direction)
             .or_default()
-            .insert(exchange.port, scope);
+            .insert(key, scope);
         self.merge(limits, one);
         Outcome::Recorded {
             new_endpoint,
@@ -779,10 +855,22 @@ impl Report {
         self.exchanges = self.exchanges.saturating_add(other.exchanges);
         for (direction, ports) in other.scopes {
             let mine = self.scopes.entry(direction).or_default();
-            for (port, scope) in ports {
-                mine.entry(port).or_default().merge(scope, max_literals);
+            for (key, scope) in ports {
+                mine.entry(key).or_default().merge(scope, max_literals);
             }
         }
+        self.sync_version();
+    }
+
+    fn has_authorities(&self) -> bool {
+        self.scopes
+            .get(&Direction::Outbound)
+            .is_some_and(|scopes| scopes.keys().any(|k| matches!(k, ScopeKey::Authority(_))))
+    }
+
+    /// Version 2 when the report holds an outbound scope, else 1 (spec §6.1).
+    fn sync_version(&mut self) {
+        self.version = if self.has_authorities() { 2 } else { 1 };
     }
 
     /// Merges `other` into `self`, then enforces `max_endpoints` and `sample_budget`: the
@@ -822,9 +910,9 @@ impl Report {
 
     pub(super) fn stats_at(
         &self,
-        (direction, port, _, method, place): &EndpointKey,
+        (direction, key, _, method, place): &EndpointKey,
     ) -> Option<&Stats> {
-        let scope = self.scopes.get(direction)?.get(port)?;
+        let scope = self.scopes.get(direction)?.get(key)?;
         match place {
             Place::Tree(segments) => scope.root.at(segments)?.endpoints.get(method),
             Place::Raw(path) => scope.raw.get(path)?.get(method),
@@ -833,9 +921,9 @@ impl Report {
 
     pub(super) fn stats_at_mut(
         &mut self,
-        (direction, port, _, method, place): &EndpointKey,
+        (direction, key, _, method, place): &EndpointKey,
     ) -> Option<&mut Stats> {
-        let scope = self.scopes.get_mut(direction)?.get_mut(port)?;
+        let scope = self.scopes.get_mut(direction)?.get_mut(key)?;
         match place {
             Place::Tree(segments) => scope.root.at_mut(segments)?.endpoints.get_mut(method),
             Place::Raw(path) => scope.raw.get_mut(path)?.get_mut(method),
@@ -846,9 +934,9 @@ impl Report {
     /// with others: absorbed literals lead to their parameter. `None` when it is gone.
     pub(super) fn route(
         &self,
-        (direction, port, template, method, place): &EndpointKey,
+        (direction, key, template, method, place): &EndpointKey,
     ) -> Option<EndpointKey> {
-        let scope = self.scopes.get(direction)?.get(port)?;
+        let scope = self.scopes.get(direction)?.get(key)?;
         let (template, place) = match place {
             Place::Tree(segments) => {
                 let routed = scope.root.route(segments)?;
@@ -864,15 +952,23 @@ impl Report {
                 (template.clone(), Place::Raw(path.clone()))
             }
         };
-        let key = (*direction, *port, template, method.clone(), place);
-        self.stats_at(&key).map(|_| key)
+        let routed = (*direction, key.clone(), template, method.clone(), place);
+        self.stats_at(&routed).map(|_| routed)
     }
 
     /// Within the bounds of spec §6 and, per direction, at most `max_push_endpoints`
     /// endpoints: what the recorder of a sidecar can produce (spec §7.3, structural check).
     pub fn check(&self, max_push_endpoints: usize) -> Result<(), Violation> {
-        if self.version != 1 {
+        // Version 2 and outbound authorities are F8's (spec §6.1): a push is version 1.
+        if self.version != 1 || self.has_authorities() {
             return Err(Violation::Version);
+        }
+        if self
+            .scopes
+            .get(&Direction::Inbound)
+            .is_some_and(|scopes| scopes.keys().any(|k| matches!(k, ScopeKey::Authority(_))))
+        {
+            return Err(Violation::Malformed);
         }
         for ports in self.scopes.values() {
             let mut endpoints = 0usize;
@@ -906,7 +1002,7 @@ impl Report {
     pub fn endpoints(&self) -> Vec<Endpoint<'_>> {
         let mut out = Vec::new();
         for (direction, ports) in &self.scopes {
-            for (port, scope) in ports {
+            for (key, scope) in ports {
                 let mut found = Vec::new();
                 scope.root.collect(&mut Vec::new(), &mut found);
                 for (path, methods) in &scope.raw {
@@ -921,7 +1017,11 @@ impl Report {
                 found.sort_by(|a, b| (&a.template, a.method).cmp(&(&b.template, b.method)));
                 out.extend(found.into_iter().map(|f| Endpoint {
                     direction: *direction,
-                    port: *port,
+                    port: key.port(),
+                    authority: match key {
+                        ScopeKey::Authority(authority) => Some(authority.as_str()),
+                        ScopeKey::Port(_) => None,
+                    },
                     method: f.method,
                     grpc: f.grpc,
                     template: f.template,
@@ -933,7 +1033,7 @@ impl Report {
         out
     }
 
-    /// Canonical JSON: sorted keys, `"version": 1`.
+    /// Canonical JSON: sorted keys, `"version": 1`, or 2 when the report holds outbound scopes.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
@@ -941,8 +1041,22 @@ impl Report {
     pub fn from_json(json: &str) -> Result<Self, String> {
         let report: Report =
             serde_json::from_str(json).map_err(|e| format!("invalid report: {e}"))?;
-        if report.version != 1 {
+        if !matches!(report.version, 1 | 2) {
             return Err(format!("unsupported report version {}", report.version));
+        }
+        let outbound = report.scopes.get(&Direction::Outbound);
+        if (report.version == 2) != outbound.is_some() {
+            return Err(format!(
+                "report version {} does not match its scopes",
+                report.version
+            ));
+        }
+        let inbound = report.scopes.get(&Direction::Inbound);
+        if inbound.is_some_and(|s| s.keys().any(|k| !matches!(k, ScopeKey::Port(_)))) {
+            return Err("inbound scope key is not a port".to_string());
+        }
+        if outbound.is_some_and(|s| s.keys().any(|k| !matches!(k, ScopeKey::Authority(_)))) {
+            return Err("outbound scope key is not an authority".to_string());
         }
         Ok(report)
     }
