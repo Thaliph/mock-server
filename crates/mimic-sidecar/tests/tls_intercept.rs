@@ -713,6 +713,9 @@ async fn tls_19_a_destination_asking_for_a_client_certificate_gets_the_clients()
     )
     .await;
     common::counted(&sidecar.metrics, "mimic_tls_passthrough_destinations 1").await;
+    // The log worker writes asynchronously: wait for the line, then check that it is the only one.
+    eventually("warned", || warns(&logs) == 1).await;
+    logs.settled().await;
     assert_eq!(warns(&logs), 1);
 }
 
