@@ -1197,9 +1197,16 @@ impl Report {
             .is_some_and(|scopes| scopes.keys().any(|k| matches!(k, ScopeKey::Authority(_))))
     }
 
-    /// Version 2 when the report holds an outbound scope, else 1 (spec §6.1).
+    /// Version 2 when the report holds an outbound scope, else 1 (spec §6.1). A report that
+    /// holds none no longer counts the exchanges of its outbound scopes: they go with them.
     fn sync_version(&mut self) {
-        self.version = if self.has_authorities() { 2 } else { 1 };
+        if self.has_authorities() {
+            self.version = 2;
+        } else {
+            self.version = 1;
+            self.exchanges = self.exchanges.saturating_sub(self.outbound_exchanges);
+            self.outbound_exchanges = 0;
+        }
     }
 
     /// Merges `other` into `self`, then enforces `max_endpoints` and `sample_budget`: the

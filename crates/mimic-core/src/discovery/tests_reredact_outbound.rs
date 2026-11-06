@@ -264,15 +264,19 @@ fn shr_02_aiza_inside_a_longer_string() {
 fn shr_02_userinfo_in_an_h2_authority_never_reaches_the_report() {
     let d: SocketAddr = "10.0.0.5:443".parse().unwrap();
     let password = "pwcnry8f3a1b7d9e2c4a6f0b5d7e";
-    for target in [
+    for (case, target) in [
         format!("user:{password}@api.example.com:443"),
         format!("user:{password}@api.example.com"),
         format!("{password}@api.example.com:443"),
-    ] {
-        let key = authority_key(Some(&target), 443, None, d);
-        assert!(!key.contains(password), "{target}");
-        assert!(!key.contains('@'));
-        assert!(ScopeKey::parse(&key).is_some());
+    ]
+    .iter()
+    .enumerate()
+    {
+        let key = authority_key(Some(target), 443, None, d);
+        // Never the target or the key in a message: both may hold the canary.
+        assert!(!key.contains(password), "case {case}");
+        assert!(!key.contains('@'), "case {case}");
+        assert!(ScopeKey::parse(&key).is_some(), "case {case}");
     }
     let mut r = Report::new(None);
     let target = format!("user:{password}@api.example.com:443");
