@@ -1083,3 +1083,37 @@ async fn ui_10_a_panicking_render_is_a_500_with_one_error() {
 }
 
 mod pages;
+
+fn skipped(metrics: &Metrics) -> u64 {
+    metrics
+        .encode()
+        .lines()
+        .find(|l| {
+            l.starts_with("mimic_ui_skipped_total{") && l.contains("reason=\"meta-unreadable\"")
+        })
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn ctl_13_a_list_entry_skipped_for_an_unreadable_meta_is_counted_by_reason() {
+    let store = store(&valkey_url());
+    let (app, metrics) = app(&store);
+    let ns = unique("ctl13k");
+    seed(&store, &ns, "good", &["p1"]).await;
+    assert_eq!(fetch(&app, "/v1/workloads").await.status, 200);
+    let before = skipped(&metrics);
+    seed(&store, &ns, "bad", &["p1"]).await;
+    hset(&keys(&ns, "bad").unwrap().meta, "updated", "never").await;
+    assert_eq!(fetch(&app, "/v1/workloads").await.status, 200);
+    // Other tests share the Valkey: at least this entry, counted once per list read.
+    assert!(
+        skipped(&metrics) > before,
+        "the skipped entry is not counted"
+    );
+    assert!(
+        !metrics.encode().contains(ns.as_str()),
+        "a series carries a name"
+    );
+}
