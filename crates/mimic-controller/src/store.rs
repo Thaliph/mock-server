@@ -20,6 +20,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::{Registry, Unit};
 use redis::aio::MultiplexedConnection;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot};
 
 /// Deployments written at once per replica (memory bound).
@@ -62,10 +63,11 @@ if ARGV[out_at] ~= '' then
 else
   redis.call('DEL', KEYS[7])
 end
-redis.call('HINCRBY', KEYS[2], 'version', 1)
+local version = redis.call('HINCRBY', KEYS[2], 'version', 1)
 redis.call('HSET', KEYS[2], 'updated', now, 'exchanges', ARGV[9],
   'endpoints_inbound', ARGV[10], 'endpoints_outbound', ARGV[11],
-  'sample_bytes', ARGV[12], 'report_bytes', ARGV[13])
+  'sample_bytes', ARGV[12], 'report_bytes', ARGV[13],
+  'outbound_digest', version .. ':' .. ARGV[out_at + 1])
 redis.call('PEXPIRE', KEYS[2], ttl)
 for i = 15, 14 + n_pods do
   redis.call('HSET', KEYS[3], ARGV[i], now)
@@ -349,6 +351,25 @@ pub struct Store {
     /// Test hook: the next write panics.
     #[cfg(test)]
     panic_next_write: AtomicBool,
+}
+
+/// The lowercase hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
+}
+
+/// The hash part of `digest` (`<version>:<64 hex>`) when its version is `version`.
+#[allow(dead_code)] // read by the egress route (F9 step 3)
+fn fresh_digest(version: Option<&str>, digest: Option<&str>) -> Option<String> {
+    let (written, hash) = digest?.split_once(':')?;
+    let valid = hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    (valid && Some(written) == version).then(|| hash.to_string())
 }
 
 fn now_ms() -> u64 {
@@ -836,13 +857,30 @@ impl Store {
     }
 
     /// The hex SHA-256 of the stored `:outbound` bytes, from `:meta` `outbound_digest`; `None`
-    /// when the digest is absent, malformed or written for another `version` (stale, §7.7).
+    /// when the digest is absent, malformed or written for another `version` (stale, §7.7), or
+    /// when the deployment has no `:meta`.
+    #[allow(dead_code)] // read by the egress route (F9 step 3)
     pub async fn outbound_digest(
         &self,
-        _namespace: &str,
-        _deployment: &str,
+        namespace: &str,
+        deployment: &str,
     ) -> Result<Option<String>, ReadError> {
-        Ok(None)
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        let (version, digest): (Option<String>, Option<String>) = match redis::cmd("HMGET")
+            .arg(&k.meta)
+            .arg("version")
+            .arg("outbound_digest")
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(read) => read,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        Ok(fresh_digest(version.as_deref(), digest.as_deref()))
     }
 
     async fn read_failed(&self, error: redis::RedisError) -> ReadError {
@@ -1110,6 +1148,8 @@ impl Store {
                 });
         }
         script.arg(&outbound_json);
+        // The digest of §7.7: the script prefixes it with the version it writes.
+        script.arg(sha256_hex(outbound_json.as_bytes()));
         // The arguments are copies: the strings need not outlive the call.
         drop((json, outbound_json));
         let result: i64 = match script.invoke_async(&mut conn).await {
