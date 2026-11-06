@@ -1144,6 +1144,7 @@ impl Report {
         for scope in self.scopes.values_mut().flat_map(BTreeMap::values_mut) {
             scope.re_redact_paths();
         }
+        self.re_redact_authorities();
         // The outbound request view of §6.1 applies again to the outbound requests.
         let outbound = redactor.outbound_request();
         self.for_each_stats_of_mut(Some(Direction::Inbound), |stats| {
@@ -1152,6 +1153,27 @@ impl Report {
         self.for_each_stats_of_mut(Some(Direction::Outbound), |stats| {
             stats.re_redact(&outbound, redactor);
         });
+    }
+
+    /// The authority hosts (scope keys) and the SNIs of the outbound scopes, redacted again:
+    /// scopes whose key becomes equal merge, a caught SNI is removed.
+    fn re_redact_authorities(&mut self) {
+        let Some(scopes) = self.scopes.get_mut(&Direction::Outbound) else {
+            return;
+        };
+        for (key, mut scope) in std::mem::take(scopes) {
+            if let Some(origin) = &mut scope.origin {
+                origin.sni.retain(|sni| !scope::caught(sni));
+            }
+            let key = match key {
+                ScopeKey::Authority(authority) => {
+                    ScopeKey::Authority(scope::redact_authority(&authority))
+                }
+                port => port,
+            };
+            // The bound on literals applies again when the report is merged into the store.
+            scopes.entry(key).or_default().merge(scope, usize::MAX);
+        }
     }
 
     pub(super) fn clear_pod(&mut self) {

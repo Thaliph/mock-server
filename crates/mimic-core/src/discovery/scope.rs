@@ -198,6 +198,17 @@ pub(super) fn caught(original: &str) -> bool {
     value_rule(original).is_some() || value_rule(&original.to_ascii_lowercase()).is_some()
 }
 
+/// The key of an outbound scope with its host redacted again (spec §7.3): a host that a value
+/// detector catches, as it is or in lower case, becomes the marker; the port is kept.
+pub(super) fn redact_authority(authority: &str) -> String {
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.starts_with('[') && host != MARKER && caught(host) => {
+            format!("{MARKER}:{port}")
+        }
+        _ => authority.to_string(),
+    }
+}
+
 /// `host:port`, with the marker instead of a host a value detector caught (`caught`, on the
 /// text as received) or catches in its normalised form.
 fn join(host: String, port: u16, caught: bool) -> String {
