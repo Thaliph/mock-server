@@ -536,15 +536,96 @@ fn shr_05_the_split_is_exact_when_every_outbound_scope_expired() {
     r.merge(&l, fresh);
     drop_expired(&mut r, 100, 5);
     assert!(authorities(&r).is_empty());
+    // The expired outbound exchanges leave with their scope: a valid version 1 report.
+    assert_round_trip_is_inbound_only(&r, 4);
+}
+
+/// A report without outbound scope: version 1, no counter, and the same after a store
+/// round trip, `check` and `split`, with `inbound` exchanges all counted as inbound.
+fn assert_round_trip_is_inbound_only(r: &Report, inbound: u64) {
     assert_eq!(r.version(), 1);
-    assert_eq!(r.exchanges(), 9);
-    let (inbound_part, outbound_part) = r.split();
+    assert_eq!(r.exchanges(), inbound);
+    assert_eq!(r.outbound_exchanges(), 0);
+    assert_eq!(r.check(256, 64), Ok(()));
+    assert_eq!(counter(r), None);
+    let json = r.to_json().unwrap();
+    assert!(!json.contains("outbound_exchanges"));
+    let back = Report::from_json(&json).unwrap();
+    assert_eq!(&back, r);
+    assert_eq!(back.to_json().unwrap(), json);
+    assert_eq!(Report::parse_checked(&json, 256, 64).as_ref(), Ok(r));
+    let (inbound_part, outbound_part) = back.split();
     assert!(outbound_part.is_none());
-    assert_eq!(inbound_part.exchanges(), 4);
+    assert_eq!(inbound_part.exchanges(), inbound);
+    assert_eq!(inbound_part.check(256, 64), Ok(()));
+    assert_eq!(Report::join(inbound_part, None), *r);
+}
+
+#[test]
+fn shr_05_a_report_that_loses_every_outbound_scope_by_eviction_is_valid_version_1() {
+    let mut push = Report::new(None);
+    inbound(&mut push, &wide(), "/in", 3);
+    outbound(&mut push, &wide(), "a.example.com:443", "/x", 5);
+    outbound(&mut push, &wide(), "b.example.com:443", "/y", 2);
+    let out = merge_bounded(Report::new(None), push, &limits(256, 0));
+    assert_eq!(out.evicted.len() + out.refused.len(), 1);
+    assert!(authorities(&out.report).is_empty());
+    assert_round_trip_is_inbound_only(&out.report, 3);
+    // The same from a stored report with outbound data.
+    let mut stored = Report::new(None);
+    inbound(&mut stored, &wide(), "/in", 3);
+    outbound(&mut stored, &wide(), "a.example.com:443", "/x", 5);
+    let mut more = Report::new(None);
+    inbound(&mut more, &wide(), "/in", 1);
+    let out = merge_bounded(stored, more, &limits(256, 0));
+    assert!(authorities(&out.report).is_empty());
+    assert_round_trip_is_inbound_only(&out.report, 4);
+}
+
+#[test]
+fn shr_05_removing_the_last_authority_resets_the_counter() {
+    let l = wide();
+    let mut r = Report::new(None);
+    inbound(&mut r, &l, "/in", 3);
+    outbound(&mut r, &l, "a.example.com:443", "/x", 5);
+    outbound(&mut r, &l, "b.example.com:443", "/x", 2);
+    r.remove_authority(&ScopeKey::Authority("a.example.com:443".into()));
+    // One scope left: still version 2, the counter untouched.
+    assert_eq!((r.version(), r.exchanges(), r.outbound_exchanges()), (2, 10, 7));
+    r.remove_authority(&ScopeKey::Authority("b.example.com:443".into()));
+    assert_round_trip_is_inbound_only(&r, 3);
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(1_000))]
+
+    #[test]
+    fn shr_05_the_merge_with_the_counter_is_associative_and_valid(
+        items in proptest::collection::vec(item(), 0..12),
+        cut1 in 0usize..13,
+        cut2 in 0usize..13,
+    ) {
+        let l = limits(256, 64);
+        let [x, y, z] = split3(&items, cut1, cut2).map(|g| build(&l, &g));
+        let m = |a: &Report, b: &Report| merge_bounded(a.clone(), b.clone(), &l).report;
+        let (left, right) = (m(&m(&x, &y), &z), m(&x, &m(&y, &z)));
+        prop_assert_eq!(left.outbound_exchanges(), right.outbound_exchanges());
+        prop_assert_eq!(left.exchanges(), right.exchanges());
+        let outbound_n: u64 = items.iter().filter(|i| i.kind == 1).map(|i| i.times as u64).sum();
+        prop_assert_eq!(left.outbound_exchanges(), outbound_n);
+        // Whatever remains, the report survives a store round trip with its counter.
+        prop_assert_eq!(left.check(256, 64), Ok(()));
+        prop_assert_eq!(Report::from_json(&left.to_json().unwrap()).unwrap(), left.clone());
+        // Dropping every outbound scope (any order) leaves the inbound exchanges exact.
+        let mut dropped = left.clone();
+        for key in dropped.outbound_keys() {
+            dropped.remove_authority(&key);
+        }
+        let inbound_n: u64 = items.iter().filter(|i| i.kind == 0).map(|i| i.times as u64).sum();
+        prop_assert_eq!(dropped.exchanges(), inbound_n);
+        prop_assert_eq!(dropped.outbound_exchanges(), 0);
+        prop_assert_eq!(dropped.check(256, 64), Ok(()));
+    }
 
     #[test]
     fn shr_05_the_parts_of_a_split_count_each_direction(
