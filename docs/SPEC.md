@@ -941,8 +941,12 @@ logic in `mimic-core` (`discovery` module).
   (the push is refused whole, never truncated) or when the
   deployment is new and its namespace already holds `MIMIC_STORE_MAX_DEPLOYMENTS`
   deployments; `503` with `Retry-After: 1` when the bodies being
-  read would exceed `MIMIC_SIDECAR_API_BODY_BUDGET`, Valkey is unavailable, the write lost 5
-  optimistic attempts (§7.3) or the `TokenReview` fails.
+  read or still being stored would exceed `MIMIC_SIDECAR_API_BODY_BUDGET`, Valkey is
+  unavailable, the write lost 5 optimistic attempts (§7.3) or the `TokenReview` fails. A push
+  holds a share of the budget equal to its `Content-Length` from before its body is read until
+  its store write ends (F8, SHR-18): the parsed reports of a write cost about three times the
+  body, so two pushes near `MIMIC_SIDECAR_API_MAX_REPORT` are stored one after the other (the
+  second gets the `503` and the sidecar re-posts it), while small pushes stay concurrent.
 - **Shipping client** (sidecar, F5). Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (the first one after
   a random delay within one interval, so that the pods of a rollout do not push together),
   the sidecar freezes the report recorded since its last acknowledged push into a *pending*
@@ -1171,10 +1175,13 @@ logic in `mimic-core` (`discovery` module).
   breaking its consistency. Chart defaults: Valkey memory limit `1Gi`, memory request `768Mi`
   (equal to `maxmemory`: the scheduler reserves what a full store uses, which is not then the
   first pod evicted under node memory pressure; the 256 Mi between request and limit is the
-  headroom of AOF rewrites) and PVC `4Gi` (AOF rewrites need about twice the data), controller memory limit `512Mi` (two writes of a
-  deployment report at once plus `MIMIC_SIDECAR_API_BODY_BUDGET`; from F8 a report holds up to
+  headroom of AOF rewrites) and PVC `4Gi` (AOF rewrites need about twice the data), controller memory limit `512Mi` (the pushes the body budget
+  lets through at once, each held until its write ends; from F8 a report holds up to
   `MIMIC_STORE_MAX_ENDPOINTS` endpoints in each direction, the sample budget staying per
-  deployment, and SHR-18 checks that the limit still holds).
+  deployment, and SHR-18 checks that the limit still holds). The chart sets
+  `MALLOC_ARENA_MAX=2` on the controller to bound the allocator's arenas. An inbound document
+  parses only `:report` and an outbound document only `:outbound`; the index and the endpoint
+  list read both.
 
 ### 7.4 `MimicWorkload` status (F5)
 
@@ -2084,7 +2091,7 @@ changed in the step that changes the behaviour.
 | SHR-15 | **I.** Shipping outbound (§6.1, §7.2): with the fake sidecar API accepting version 2 and outbound, inbound and tunnel traffic, every push that holds an outbound scope is `"version": 2`; per direction, the exchanges of all pushes sum to the exchanges recorded, and the tunnel counts to the tunnels recorded; an interval with only a tunnel is pushed; after an acknowledged push `/discovery` holds only outbound exchanges recorded since (counters, samples, `origin` and `tunnels` reset); outbound samples of the pending and current reports together stay at most half of `MIMIC_DISCOVERY_SAMPLE_BUDGET`; without `MIMIC_CONTROLLER_URL` the outbound part accumulates as in F7. |
 | SHR-16 | **I.** Fallback to inbound only (§7.2): with the fake sidecar API set as a controller up to F7, a pending version 2 report is followed by a post of the same session and sequence whose report is `"version": 1`, inbound only, and is applied; the fake API receives every inbound exchange once and no outbound scope; `/discovery` keeps every outbound exchange recorded so far (counts accumulated, none lost); the next interval tries version 2 again; once the fake accepts version 2, the next push carries every outbound exchange recorded since the start, each once. A report with outbound and no inbound exchange posts nothing after the `400`, and the next freeze uses the same sequence. When the first attempt has no answer (the fake applies it, then closes the connection) and the retry is answered `400`, the inbound-only post follows, the outbound part is dropped (not in `/discovery`, `mimic_discovery_outbound_dropped_total` 1, one WARN `outbound not shipped` with `reason` `unknown_outcome`), and the outbound exchanges are counted once overall. A `507` to a version 2 report falls back the same way; a `400` to the inbound-only post drops it with one WARN `report rejected`. At `SIGTERM` the flush falls back the same way and ships the inbound part within `MIMIC_SHUTDOWN_GRACE`. `mimic_discovery_pushes_total{result="inbound_only"}` counts the fallbacks; one WARN `outbound not shipped` (`status`) per streak, written again after an acknowledged version 2 push ends a streak; no line holds the token or report content. |
 | SHR-17 | **C.** The CTL-22 fuzz target also feeds version 2 reports (arbitrary outbound keys, `origin`, `tunnels`) to `Report::from_json`, the structural check, re-redaction, the bounded merge and the split: no panic, every merge result and both split parts pass the check. Same CI schedule as DSC-23. |
-| SHR-18 | **I.** Controller memory: two concurrent writes of deployments each at the store limits (512 inbound and 512 outbound endpoints over 128 authorities, schemas at their caps, `MIMIC_STORE_SAMPLE_BUDGET` full) while a `MIMIC_SIDECAR_API_MAX_REPORT` body is read and a document of each is rendered keep the controller's RSS under 512 MiB (the chart's limit). |
+| SHR-18 | **I.** Controller memory: two concurrent pushes (the second waits for the body budget or gets `503`, and is re-posted) onto deployments whose stored reports are each at the store limits (512 inbound and 512 outbound endpoints over 128 authorities, schemas at their caps, `MIMIC_STORE_SAMPLE_BUDGET` full), with a body near `MIMIC_SIDECAR_API_MAX_REPORT` and with `MIMIC_SIDECAR_API_BODY_BUDGET` = `MIMIC_SIDECAR_API_MAX_REPORT`, then a document of each kind rendered per deployment, keep the controller's peak RSS (`VmHWM`) under 512 MiB (the chart's limit). |
 | SHR-19 | **E.** On kind, `front` (service A, `scripts/e2e/apps`) runs with 2 replicas injected in its own `enabled` namespace with a `MimicWorkload`, `UPSTREAM` the `users` Service (service B); a client sends calls spread over both pods to `/front/users/<id>` (GET with a canary bearer token and an `X-Tenant-Key` canary, PUT with a JSON body holding a canary) and `/front/missing`. Within 2 push intervals, through `kubectl port-forward` to a controller pod: front's `/report` holds `scopes.outbound."users.disc-22.svc:8080"` with `GET` and `PUT /users/{users_id}` and `GET /missing` (`404`), whose counts are the sums of the outbound calls in the two front pods' access lines, each pod having sent some (the union of both pods); `/v1/workloads/<ns>/front` lists both pods; `/openapi` lists `outbound-users.disc-22.svc:8080` and its document has `/users/{users_id}` with `get` and `put`, `servers` `http://users.disc-22.svc:8080`, and `X-Tenant-Key` as a redacted header parameter; within `MIMIC_STATUS_INTERVAL` more the `MimicWorkload` of front shows `endpoints.outbound: 3` and `totalEndpoints` equal to its inbound plus 3, and `kubectl get mimicworkload` prints that total under `Endpoints`. No canary is in front's report, documents, any Valkey value, the controller's logs or the pods' `/discovery`. The `users` checks of CTL-20 and UI-11 still pass. |
 | SHR-20 | **E.** Browser: the headless Chromium of UI-12 loads front's deployment page and its `outbound-users.disc-22.svc:8080` document page: the endpoint list shows the outbound endpoints with their authority, the document shows `GET /users/{users_id}`, there is no "Try it out" or "Execute" button, Chromium's log shows no CSP violation and no request to an origin other than the port-forward, and the `users` pods log no access line during the run. |
 
