@@ -635,6 +635,35 @@ impl Node {
     }
 }
 
+/// What an outbound scope holds besides its endpoints (spec §6.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutboundMeta<'a> {
+    /// `http` and `https`, those with a count, in that order.
+    pub schemes: Vec<&'a str>,
+    pub sni: Vec<&'a str>,
+    pub dst: Vec<&'a str>,
+    /// Connections counted, not recorded, by kind.
+    pub tunnels: BTreeMap<&'a str, u64>,
+}
+
+impl Scope {
+    fn meta(&self) -> OutboundMeta<'_> {
+        let mut meta = OutboundMeta::default();
+        if let Some(origin) = &self.origin {
+            meta.schemes = ["http", "https"]
+                .into_iter()
+                .filter(|s| origin.schemes.get(*s).is_some_and(|n| *n > 0))
+                .collect();
+            meta.sni = origin.sni.iter().map(String::as_str).collect();
+            meta.dst = origin.dst.iter().map(String::as_str).collect();
+        }
+        if let Some(tunnels) = &self.tunnels {
+            meta.tunnels = tunnels.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+        }
+        meta
+    }
+}
+
 impl Scope {
     fn merge(&mut self, other: Scope, max_literals: usize) {
         self.last_seen = self.last_seen.max(other.last_seen);
@@ -963,6 +992,18 @@ impl Report {
         self.outbound_scopes()
     }
 
+    /// The outbound scopes by authority, with what they know besides their endpoints (spec
+    /// §6.1): schemes seen, SNIs, destinations and tunnel counts.
+    pub fn outbound_meta(&self) -> BTreeMap<&str, OutboundMeta<'_>> {
+        let scopes = self.scopes.get(&Direction::Outbound).into_iter().flatten();
+        scopes
+            .filter_map(|(key, scope)| match key {
+                ScopeKey::Authority(authority) => Some((authority.as_str(), scope.meta())),
+                ScopeKey::Port(_) => None,
+            })
+            .collect()
+    }
+
     fn outbound_scopes(&self) -> usize {
         self.scopes
             .get(&Direction::Outbound)
@@ -1184,6 +1225,13 @@ impl Report {
         self.sync_version();
     }
 
+    /// Whether the report holds an inbound scope (an outbound part holds none).
+    pub fn holds_inbound(&self) -> bool {
+        self.scopes
+            .get(&Direction::Inbound)
+            .is_some_and(|scopes| !scopes.is_empty())
+    }
+
     fn has_authorities(&self) -> bool {
         self.scopes
             .get(&Direction::Outbound)
@@ -1334,19 +1382,28 @@ impl Report {
     /// (`"version": 2`, outbound scopes only; none without outbound scopes) of a report
     /// (spec §7.3, write).
     pub fn split(&self) -> (Report, Option<Report>) {
-        let part = |direction: Direction, version: u32| Report {
-            version,
-            pod: self.pod.clone(),
-            exchanges: 0,
-            outbound_exchanges: 0,
-            scopes: self
-                .scopes
-                .get(&direction)
-                .map(|scopes| BTreeMap::from([(direction, scopes.clone())]))
-                .unwrap_or_default(),
-        };
-        let mut inbound = part(Direction::Inbound, 1);
-        let mut outbound = part(Direction::Outbound, 2);
+        self.clone().into_split()
+    }
+
+    /// [`Report::split`] without copying the scopes: the controller's write holds a report of
+    /// tens of megabytes at the store limits (SHR-18).
+    pub fn into_split(mut self) -> (Report, Option<Report>) {
+        let part =
+            |direction: Direction, version: u32, scopes: Option<BTreeMap<ScopeKey, Scope>>| {
+                Report {
+                    version,
+                    pod: self.pod.clone(),
+                    exchanges: 0,
+                    outbound_exchanges: 0,
+                    scopes: scopes
+                        .map(|scopes| BTreeMap::from([(direction, scopes)]))
+                        .unwrap_or_default(),
+                }
+            };
+        let inbound_scopes = self.scopes.remove(&Direction::Inbound);
+        let outbound_scopes = self.scopes.remove(&Direction::Outbound);
+        let mut inbound = part(Direction::Inbound, 1, inbound_scopes);
+        let mut outbound = part(Direction::Outbound, 2, outbound_scopes);
         // A report counts its exchanges once: the outbound part takes the counter of the
         // outbound ones (also those of scopes that are gone), the inbound part the rest, so
         // that the parts add up to the report.

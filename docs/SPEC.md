@@ -70,8 +70,9 @@ from F1 `mimic-init` and from F3 `mimic-trust`. `mimic-core` may depend on pure 
 | `mock` | forwarded to the app, recorded | answered from recordings; never forwarded (§8) |
 
 The mode is set per deployment on its `MimicWorkload` (`spec.mode`). Every pod of the deployment
-follows it, including pods created later. Entering mock: the sidecar pulls the deployment's
-egress recordings from the controller, then switches. Leaving mock: the sidecar switches back to
+follows it, including pods created later. From F9 every sidecar keeps a snapshot of the
+deployment's aggregated egress, pulled from the controller (§7.7). Entering mock: the sidecar
+pulls the deployment's egress recordings from the controller, then switches. Leaving mock: the sidecar switches back to
 discovery immediately.
 
 ## 4. Traffic capture
@@ -769,8 +770,8 @@ logic in `mimic-core` (`discovery` module).
   (F5, §7.4), later mode convergence (F10). F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
   with their feature. When several `MimicWorkload`s name the same deployment, any of them
   selects it for injection; which one sets the mode is decided in F10.
-- Sidecars push their local recordings periodically (§6 "Shipping", §7.2) and, from F9/F10,
-  pull the deployment's mode and, in mock mode, its aggregated egress recordings. Valkey keys
+- Sidecars push their local recordings periodically (§6 "Shipping", §7.2), from F9 pull the
+  deployment's aggregated egress recordings (§7.7) and, from F10, its mode. Valkey keys
   are namespaced by `<namespace>/<deployment>` (§7.3).
 - The controller merges endpoints of all pods of a deployment (same endpoint key → merged
   counters, histograms, schemas, sample sets) with the pure merge of §6, which also
@@ -941,8 +942,15 @@ logic in `mimic-core` (`discovery` module).
   (the push is refused whole, never truncated) or when the
   deployment is new and its namespace already holds `MIMIC_STORE_MAX_DEPLOYMENTS`
   deployments; `503` with `Retry-After: 1` when the bodies being
-  read would exceed `MIMIC_SIDECAR_API_BODY_BUDGET`, Valkey is unavailable, the write lost 5
-  optimistic attempts (§7.3) or the `TokenReview` fails.
+  read or still being stored would exceed `MIMIC_SIDECAR_API_BODY_BUDGET`, Valkey is
+  unavailable, the write lost 5 optimistic attempts (§7.3) or the `TokenReview` fails. A push
+  holds a share of the budget equal to its `Content-Length` from before its body is read until
+  its store write ends (F8, SHR-18): the parsed reports of a write cost about three times the
+  body, so two pushes near `MIMIC_SIDECAR_API_MAX_REPORT` are stored one after the other (the
+  second gets the `503` and the sidecar re-posts it), while small pushes stay concurrent.
+- `GET /v1/workloads/<deployment>/egress?format=1` (F9): the deployment's egress set, with
+  `ETag` and `304`, under the memory bounds of §7.7. It shares the admission, authentication
+  and `TokenReview` limits above; it has no body.
 - **Shipping client** (sidecar, F5). Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (the first one after
   a random delay within one interval, so that the pods of a rollout do not push together),
   the sidecar freezes the report recorded since its last acknowledged push into a *pending*
@@ -971,7 +979,9 @@ logic in `mimic-core` (`discovery` module).
   `outbound not shipped`, `reason` = `unknown_outcome`). In both cases the sidecar posts, with the same session and sequence, the remaining inbound part
   (`"version": 1`, the body an F7 sidecar would have sent), which then follows the rules above
   (a `400` or `507` to it drops it with WARN `report rejected`). When the inbound part covers no
-  exchange nothing is posted and the sequence is used again by the next freeze. The next freeze
+  exchange nothing is posted and the sequence is used again by the next freeze (not after an
+  unknown outcome: a replica may have applied that sequence and would answer `applied: false`
+  to other data, so the next freeze takes the next sequence). The next freeze
   tries version 2 again. The inbound part of a report that a replica already applied is a
   duplicate of its pod, session and sequence (`applied: false`), so it is never applied twice
   either; this is the only case, with `413`, where a pending
@@ -981,7 +991,16 @@ logic in `mimic-core` (`discovery` module).
   (more authorities than its `MIMIC_STORE_MAX_AUTHORITIES`, a bound a later version adds).
   The attempt is counted `inbound_only` in `mimic_discovery_pushes_total`, with one WARN
   `outbound not shipped` (`status`) per streak of fallbacks, the streak ended by an acknowledged
-  version 2 push. The flush at `SIGTERM` applies the fallback too (within its deadline).
+  version 2 push. An attempt has an unknown outcome when it got no answer after the body was
+  sent (not when the connection was refused), or `500`, `502`, `504`, any status outside
+  `200`, `400`, `401`, `403`, `405`, `413`, `429`, `503`, `507`, or a `200` that is not a JSON
+  object with a boolean `applied`; the flag lasts for the whole sequence, whatever later
+  attempts are answered, and the next sequence starts without it. When the per-streak and the
+  per-sequence case both apply (a fallback after an unknown outcome), only the per-sequence
+  line is written (it carries `status` and `reason`) and it also counts as the streak's line;
+  it is written even in a streak that has already written its own. The flush at `SIGTERM`
+  applies the fallback too (within its deadline), posts the remaining inbound part and does not
+  try version 2 again.
   *Rollout order*: the chart upgrades the controller; a sidecar changes only when its pod is
   recreated (the webhook sets the image at admission), so F8 sidecars meet F8 controllers in the
   normal order, and the fallback covers the window where both versions answer, and rollbacks.
@@ -1001,7 +1020,8 @@ logic in `mimic-core` (`discovery` module).
 - One log line per request (`target` = `sidecar_api`): `endpoint` (the route, e.g.
   `/v1/workloads/{deployment}/report`), `namespace`, `pod`, `deployment`, `result` (`ok`,
   `duplicate`, `unauthenticated`, `forbidden`, `invalid`, `too_large`, `rate_limited`,
-  `push_limit`, `deployment_limit`, `unavailable`), plus for a push `session`, `sequence`, `bytes`,
+  `push_limit`, `deployment_limit`, `unavailable`, from F9 `not_modified` and `egress_limit`),
+  plus for an egress pull (F9) `bytes` (the body sent, 0 for `304`), for a push `session`, `sequence`, `bytes`,
   from F8 `version` (the pushed report's, when it parsed), and for
   `invalid` a `reason` from a fixed list, and, when the request failed on the controller's
   side, `error`; a request writes no other line; never the token, the key or report content.
@@ -1020,7 +1040,7 @@ logic in `mimic-core` (`discovery` module).
   |---|---|---|---|
   | `mimic:v1:{<ns>/<dep>}:report` | string | merged report: canonical §6 JSON, `pod` null, with `last_seen`; from F8 its inbound part only, always `"version": 1` | `MIMIC_STORE_TTL` after the last applied push |
   | `mimic:v1:{<ns>/<dep>}:outbound` | string | (F8) merged outbound part: canonical §6.1 JSON, `"version": 2`, outbound scopes only, `pod` null, with `last_seen`; absent while the deployment has no outbound scope | same |
-  | `mimic:v1:{<ns>/<dep>}:meta` | hash | `version` (write counter), `updated` (ms of the last applied push), `exchanges`, `endpoints_inbound`, `endpoints_outbound`, `sample_bytes`, `report_bytes` (from F8 of `:report` and `:outbound` together) | same |
+  | `mimic:v1:{<ns>/<dep>}:meta` | hash | `version` (write counter), `updated` (ms of the last applied push), `exchanges`, `endpoints_inbound`, `endpoints_outbound`, `sample_bytes`, `report_bytes` (from F8 of `:report` and `:outbound` together), from F9 `outbound_digest` (`<version>:<hex SHA-256 of :outbound>`, §7.7) | same |
   | `mimic:v1:{<ns>/<dep>}:pods` | hash | field `<pod>` → ms of its last push (applied or not) | each field min(24 h, `MIMIC_STORE_TTL`) after its last write |
   | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
   | `mimic:v1:ns:<ns>` | sorted set | member `<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
@@ -1171,10 +1191,13 @@ logic in `mimic-core` (`discovery` module).
   breaking its consistency. Chart defaults: Valkey memory limit `1Gi`, memory request `768Mi`
   (equal to `maxmemory`: the scheduler reserves what a full store uses, which is not then the
   first pod evicted under node memory pressure; the 256 Mi between request and limit is the
-  headroom of AOF rewrites) and PVC `4Gi` (AOF rewrites need about twice the data), controller memory limit `512Mi` (two writes of a
-  deployment report at once plus `MIMIC_SIDECAR_API_BODY_BUDGET`; from F8 a report holds up to
+  headroom of AOF rewrites) and PVC `4Gi` (AOF rewrites need about twice the data), controller memory limit `768Mi` (the pushes the body budget
+  lets through at once, each held until its write ends; from F8 a report holds up to
   `MIMIC_STORE_MAX_ENDPOINTS` endpoints in each direction, the sample budget staying per
-  deployment, and SHR-18 checks that the limit still holds).
+  deployment, and SHR-18 checks that the limit still holds). The chart sets
+  `MALLOC_ARENA_MAX=2` on the controller to bound the allocator's arenas. An inbound document
+  parses only `:report` and an outbound document only `:outbound`; the index and the endpoint
+  list read both.
 
 ### 7.4 `MimicWorkload` status (F5)
 
@@ -1322,7 +1345,8 @@ logic in `mimic-core` (`discovery` module).
 - **Observability (F6)**: `mimic_ui_requests_total{route,code}` (`route` is the route pattern,
   e.g. `/v1/workloads/{namespace}/{deployment}/openapi/{id}`, or `other`; `code` the status
   code) and `mimic_ui_render_duration_seconds` (histogram of parse + render, buckets as
-  `mimic_store_write_duration_seconds`). No line is written per request; no line or series
+  `mimic_store_write_duration_seconds`) and `mimic_ui_skipped_total{reason}` (list entries
+  skipped because their `:meta` is unreadable, one per entry per list read). No line is written per request; no line or series
   holds a path, template or report content.
 - Consumers: F8 adds outbound documents (§7.6) with no new route; F9 adds an
   authenticated read of a sidecar's own deployment on the sidecar API (§7.2) for egress
@@ -1414,8 +1438,124 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   is bounded by the store limits (at most 20 samples per endpoint, `MIMIC_STORE_SAMPLE_BUDGET`
   of sample bytes per deployment).
 
+### 7.7 Egress endpoint (F9)
+
+Sidecars pull their own deployment's aggregated egress from the controller and keep it in
+memory, so that F10 can answer outbound calls from it. F9 changes no traffic: the snapshot is
+held, measured and summarised, never used to answer a request.
+
+- **Egress set** (pure, `mimic-core` `discovery::egress`). The *projection* of a stored report
+  is what a mock needs and nothing else:
+
+  ```json
+  {"format": 1, "authorities": {"<authority>": {"endpoints": [
+    {"method": "GET", "template": "/users/{users_id}", "grpc": false,
+     "statuses": {"200": 12}, "latency": <§6 histogram>,
+     "volatile": ["<field>"], "redacted": ["<field>"], "samples": [<§6 sample>]}]}}}
+  ```
+
+  One entry per outbound scope that holds at least one endpoint (tunnel-only scopes and the
+  inbound part are left out), endpoints in report order (template, method), samples in report
+  order without `last_seen`, `volatile` and `redacted` the sorted §6 field names of the
+  endpoint (the lists §7.6 writes as `x-mimic-volatile` and `x-mimic-redacted`). No schema,
+  volatility sketch, `origin`, `tunnels`, `hosts`, `last_seen` or `pod`: the projection holds
+  no hash of a value. It is canonical JSON (sorted keys, `BTreeMap`) and a pure function of the
+  outbound part, so equal `:outbound` bytes give byte-identical projections.
+  `EgressSet::from_json` reads it back with `deny_unknown_fields` and checks, each failure with
+  its `reason`: `format` 1 (`format`); authorities of the §6.1 grammar (`authority`); at most
+  10 000 authorities and 10 000 endpoints in all (`limit`); per endpoint the §7.3 bounds that
+  apply: templates of at most 2048 bytes and 32 segments, statuses 100–599, the §6 histogram
+  range, at most 20 samples each passing the sample check of §7.3, at most 128 names in
+  `volatile` and `redacted` together, each at most 128 bytes (`malformed`). A new format gets a
+  new number; a controller keeps serving every format that a released sidecar asks for.
+- **Digest** (store change, §7.3). Every write sets the `:meta` field `outbound_digest` to
+  `<version>:<hex SHA-256 of the :outbound bytes written>` (of the empty string when there is no
+  `:outbound`), `<version>` being the `version` the same script writes. A digest whose
+  `<version>` differs from `:meta` `version`, or an absent one, was left by a controller up to
+  F8 (which writes `:outbound` without it) and is *stale*: no `304` is possible, and the pull
+  goes through a build (below), which hashes the `:outbound` bytes it reads under the same
+  body-budget share. The `ETag` of an answer is `"<format>-<hex digest>"`.
+- **Route**: `GET /v1/workloads/<deployment>/egress?format=1` on the sidecar API (§7.2), with
+  the admission, authentication and authorisation of §7.2 (deployment in the path, namespace
+  from the token: a pod reads its own deployment only); there is no body to read. The
+  controller then reads `:meta` `version` and `outbound_digest`:
+  - an `If-None-Match` equal to the current `ETag` (digest not stale) answers `304` with the
+    `ETag` and no body, without reading `:outbound`;
+  - otherwise the projection for that digest is served from the replica's cache, keyed by
+    namespace, deployment, format and digest (`<ns>/<dep>`, never the deployment name alone),
+    or built: `GET :outbound`, `Report::from_json` and the §7.3 structural check, projection and
+    serialisation, on a blocking thread; the cache key and the `ETag` come from the bytes
+    actually read, so a write between the two reads only makes the answer newer;
+  - `200` `application/json`, `ETag`, `Cache-Control: no-store`, the projection. A deployment
+    without data or without `:outbound` answers `200` `{"authorities": {}, "format": 1}` (not
+    `404`: the sidecar needs no special case).
+
+  `400` (`format`) for a missing or unknown `format`, `400` for a deployment name that is not
+  DNS-1123, `401`/`403`/`429` as §7.2, `405` with `Allow: GET` for another method, `500` with
+  ERROR `stored report unreadable` (`key` `outbound`) for an `:outbound` that fails the check
+  (never overwritten, §7.3), `503` (`Retry-After: 1`) while Valkey is unavailable, when the
+  `TokenReview` fails or when the budgets below are spent, `507` (`egress_limit`) when the
+  projection is larger than `MIMIC_SIDECAR_API_MAX_EGRESS` or when the build's body-budget
+  share (below) is larger than the whole `MIMIC_SIDECAR_API_BODY_BUDGET` (it could never be
+  served: answered without reading `:outbound`, not `503`, so the sidecar does not retry it at
+  once), with one WARN `egress limit reached` (`namespace`, `deployment`, `bytes`, `reason`:
+  `projection` or `stored`) per deployment and reason per process and
+  `mimic_sidecar_api_egress_builds_total{result="too_large"}`.
+- **Memory bounds** (controller, as SHR-18). A build (also the one a stale digest forces)
+  holds a share of `MIMIC_SIDECAR_API_BODY_BUDGET` equal to the `:outbound` size (`STRLEN`,
+  read before the `GET`) plus `MIMIC_SIDECAR_API_MAX_EGRESS` (the serialised projection, which
+  is cut at that size and then refused `507`), from before its `GET` until its projection
+  holds its egress share (or is refused), so that pushes and builds together, the build's
+  output buffer included, stay within the budget SHR-18 measures. Concurrent pulls of the same
+  deployment and digest wait for one build (single flight); at most 2 builds run at once per
+  replica. A projection holds its size of `MIMIC_SIDECAR_API_EGRESS_BUDGET` while it is cached
+  or being sent (all answers of one projection share one share). When a new projection does not fit,
+  the least recently served cached projections that are not being sent are dropped; if it
+  still does not fit, the pull gets `503`. A cached projection is dropped when a newer digest of
+  its deployment is cached.
+- **Pull client** (sidecar). With `MIMIC_CONTROLLER_URL` set the sidecar pulls every
+  `MIMIC_EGRESS_PULL_INTERVAL`, the first time after a random delay within one interval, in
+  every mode; without it nothing is pulled (one INFO `egress pull disabled` at start). Each
+  pull re-reads the token, sends `If-None-Match` with the `ETag` of the snapshot it holds (none
+  before the first), waits at most 30 s for the answer and reads at most
+  `MIMIC_EGRESS_MAX_BYTES` of it while it streams. `200` with a body that
+  `EgressSet::from_json` accepts replaces the snapshot (an empty set empties it); `304` keeps
+  it. *Sidecar memory*: pulls are sequential, so one body at most is read and parsed at a time
+  (never two pulls at once, `SIGTERM` flush or not); the body is parsed from its buffer into
+  the typed egress set and the buffer is freed before the swap; the snapshot held is dropped
+  only after the new one is accepted, so the peak is the old snapshot, the buffer and the new
+  set together, and a refused body leaves the old snapshot untouched. That peak, on top of the
+  worst case of discovery, must fit the injected memory limit (PUL-18). Every other outcome keeps the snapshot held, and is counted with its `result`:
+  - a body over the cap (`too_large`: the read stops at the cap), a body the check refuses
+    (`invalid`, with WARN `egress rejected` and its `reason`), `507` (`too_large`): retried at
+    the next interval;
+  - `404` or `405` (a controller up to F8, which has no such route): `unsupported`, retried at
+    the next interval;
+  - a connection error, no answer within 30 s, `401`, `403`, `429`, `5xx` or any other status
+    (`error`): retried with the §7.2 backoff (1, 2, 4 … 60 s, or `Retry-After` when longer, at
+    most 300 s).
+
+  One WARN `egress pull failed` (`status` or `error`, `result`) per failure streak, INFO
+  `egress pull recovered` when a `200` or `304` ends it; DEBUG `egress pulled` (`result`,
+  `bytes`, `authorities`, `endpoints`). Logs (`target` = `egress`) never hold the token or
+  snapshot content. The snapshot lives in memory only: a restarted sidecar pulls again. At
+  `SIGTERM` the pull loop stops at once (a pull in flight is abandoned).
+- **Local view.** `GET /egress` on the sidecar admin port, loopback peers only (403 otherwise,
+  as `/discovery`), answers a summary of the snapshot, sorted keys: `{"etag": "<ETag>" | null,
+  "pulled": "<RFC 3339 of the last 200 or 304>" | null, "authorities": {"<authority>":
+  {"endpoints": [{"method", "template", "grpc", "exchanges", "statuses"}]}}}`. No sample and no
+  field name: `/egress` shows what the pod could mock, not the exchanges the other pods
+  recorded.
+- **Rollout.** An F9 controller answers pulls whatever the sidecar version (sidecars up to F8
+  do not pull); an F9 sidecar facing a controller up to F8 gets `unsupported` and holds an
+  empty snapshot. A controller rolled back to F8 writes without the digest; an F9 controller
+  that comes back finds it stale and hashes the bytes. The webhook sets no new variable.
+- **Consumers.** F10 adds the mode to what sidecars pull and answers outbound calls from the
+  snapshot (§8). Mesh traffic management is v2.
+
 ## 8. Mock
 
+- The sidecar answers from the egress snapshot it pulled (§7.7).
 - Matching, first hit wins: (1) exact: method, authority, path, query, normalised body;
   (2) same endpoint, closest body ignoring volatile fields; (3) most frequent response of the
   endpoint. The response carries `x-mimic-match: exact|endpoint|fallback`. Volatile and
@@ -1457,6 +1597,10 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   | `mimic_discovery_pushes_total` | counter (F5), settled or failed push attempts (§7.2) | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`, from F8 `inbound_only`: a version 2 report answered `400` or `507`, followed by the fallback of §7.2) |
   | `mimic_discovery_outbound_dropped_total` | counter (F8), outbound parts dropped by the inbound-only fallback after an attempt with an unknown outcome (§7.2) | — |
   | `mimic_discovery_last_push_timestamp_seconds` | gauge (F5), time of the last acknowledged push, 0 before | — |
+  | `mimic_egress_pulls_total` | counter (F9, sidecar), egress pull attempts (§7.7) | `result` (`ok`, `not_modified`, `too_large`, `invalid`, `unsupported`, `error`) |
+  | `mimic_egress_endpoints` | gauge (F9, sidecar), endpoints in the egress snapshot | — |
+  | `mimic_egress_bytes` | gauge (F9, sidecar), size of the snapshot's body as received, 0 without one | — |
+  | `mimic_egress_last_pull_timestamp_seconds` | gauge (F9, sidecar), time of the last `200` or `304` pull, 0 before | — |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -1476,7 +1620,11 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   | `mimic_store_expired_total` | counter, endpoints and samples dropped by retention | `kind` |
   | `mimic_status_updates_total` | counter, `MimicWorkload` status applies | `result` (`ok`, `error`) |
 | `mimic_ui_requests_total` | counter (F6), answers of the UI listener (§7.5) | `route` (route pattern or `other`), `code` |
+| `mimic_ui_skipped_total` | counter, `/v1/workloads` entries left out of the list (§7.5) | `reason` (`meta-unreadable`: the `:meta` of the deployment does not parse; also logged) |
 | `mimic_ui_render_duration_seconds` | histogram (F6), parse and render of a stored report for `endpoints`, `openapi` and a document; buckets as `mimic_store_write_duration_seconds` | `route` |
+| `mimic_sidecar_api_egress_builds_total` | counter (F9, controller; the sidecar's pull metrics are `mimic_egress_*`), egress projections built (§7.7); `too_large` also counts a pull refused `507` before its build | `result` (`ok`, `too_large`, `unreadable`, `error`) |
+| `mimic_sidecar_api_egress_build_duration_seconds` | histogram (F9, controller), read, check, projection and serialisation of one build; buckets as `mimic_store_write_duration_seconds` | — |
+| `mimic_sidecar_api_egress_cache_bytes` | gauge (F9, controller), bytes of `MIMIC_SIDECAR_API_EGRESS_BUDGET` held by cached and in-flight projections | — |
 
   `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
   port removed, `(invalid)` when it is not a host name or IP literal; an HTTP/1 `Host` value or
@@ -1538,7 +1686,9 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
 | `MIMIC_SIDECAR_API_ADDR` | `0.0.0.0:8444` | Sidecar API HTTPS listener (§7.2); its port is also the one given to sidecars in `MIMIC_CONTROLLER_URL`. |
 | `MIMIC_SIDECAR_API_RATE` | `10` | Requests per second per source address on the sidecar API, burst twice that (§7.2), 1–10000. |
 | `MIMIC_SIDECAR_API_MAX_REPORT` | `32Mi` | Largest push body (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–1Gi). |
-| `MIMIC_SIDECAR_API_BODY_BUDGET` | `64Mi` | Push bodies being read at once, in bytes (same syntax; at least `MIMIC_SIDECAR_API_MAX_REPORT`, at most 4Gi). |
+| `MIMIC_SIDECAR_API_BODY_BUDGET` | `32Mi` | Push bodies being read at once, in bytes (same syntax; at least `MIMIC_SIDECAR_API_MAX_REPORT`, at most 4Gi); from F9 egress builds hold a share too (§7.7). |
+| `MIMIC_SIDECAR_API_MAX_EGRESS` | `4Mi` | (F9) Largest egress set answered (§7.7; same syntax, 64Ki–1Gi); a larger one gets `507`. Keep it at most the sidecars' `MIMIC_EGRESS_MAX_BYTES`. |
+| `MIMIC_SIDECAR_API_EGRESS_BUDGET` | `32Mi` | (F9) Bytes of egress sets cached or being sent at once per replica (§7.7; same syntax, at least `MIMIC_SIDECAR_API_MAX_EGRESS`, at most 4Gi). |
 | `MIMIC_STORE_TTL` | `30d` | Retention of a deployment's data after its last push, and of endpoints and samples after they were last seen (§7.3); 10s–365d. |
 | `MIMIC_STORE_MAX_ENDPOINTS` | `512` | Endpoints per direction and deployment in the store, 1–10000. |
 | `MIMIC_STORE_MAX_PUSH_ENDPOINTS` | `256` | Endpoints per direction in one pushed report (§7.2), 1–10000, at most `MIMIC_STORE_MAX_ENDPOINTS`. |
@@ -1578,6 +1728,8 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_DISCOVERY_QUEUE` | `1024` | Exchange records waiting for the recorder (1–65536). Not set by the webhook. |
 | `MIMIC_DISCOVERY_PUSH_INTERVAL` | `30s` | Period of the discovery push (§6, §7.2), 1s–1h. Not set by the webhook. |
 | `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Extra names redacted by name (§6), comma-separated, at most 64, each 1–64 characters of `a-z0-9-_` (compared like the built-in names); the webhook sets the sorted, deduplicated union, lower-cased, of `spec.discovery.redact` of every `MimicWorkload` naming the deployment. |
+| `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | (F9) Period of the egress pull (§7.7), 1s–1h. Not set by the webhook. |
+| `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | (F9) Largest egress set read from the controller (§7.7; `<n>`, `<n>Ki`, `<n>Mi`; 64Ki–1Gi). Not set by the webhook. Sized so that the pull peak and the discovery worst case fit the 128 Mi sidecar limit (PUL-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
 
 ### 10.4 `mimic-init` variables
 
@@ -1641,6 +1793,14 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
 - TLS key custody (§5): the seed exists only in its Secret and the controller's memory; root
   keys only in the controller's memory; intermediate and leaf keys only in the sidecar's
   memory (non-dumpable, no core file). Tokens and keys are never logged.
+- Egress endpoint (F9, §7.7): a pod reads only its own deployment's egress set (namespace from
+  its token, deployment checked against its pod name). The set is built from the re-redacted
+  `:outbound` and keeps no schema, sketch or hash; it travels over the verified TLS of §7.2 and
+  lives in the sidecar's memory only. `/egress` shows authorities, templates and counts to
+  loopback peers, never a sample or a field name. F9 adds no privilege, RBAC rule, port,
+  Kubernetes object or webhook variable; the controller's memory for it is bounded by the body
+  budget (builds) and `MIMIC_SIDECAR_API_EGRESS_BUDGET` (projections), the sidecar's by
+  `MIMIC_EGRESS_MAX_BYTES`.
 - The sidecar API port is admitted by the controller NetworkPolicy from any source by
   default (injected pods can be in any namespace; `networkPolicy.sidecarApiFrom` narrows it).
 
@@ -1772,6 +1932,20 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   An inbound-only fallback after an attempt with an unknown outcome drops that sequence's
   outbound part (§7.2) rather than risk counting it twice: at most one push of outbound data per
   such event, counted and logged.
+- Egress endpoint (F9, §7.7): every pod of a deployment holds the redacted outbound samples
+  recorded by all its replicas (provider responses and the personal data in them included), so
+  whoever controls one pod of the deployment reads what its other replicas exchanged with
+  providers, within redaction. A user who can create pods in a namespace can pull the egress
+  set of any deployment of that namespace (a pod named after it, as for the workload identity
+  above); creating pods already gives more (the namespace's Secrets can be mounted). In
+  discovery mode the outbound part changes with almost every push, so a busy deployment's
+  pulls are mostly `200` and builds (at most one per digest per replica): the cost grows with
+  pods ÷ `MIMIC_EGRESS_PULL_INTERVAL` × the size of the set. A set larger than
+  `MIMIC_SIDECAR_API_MAX_EGRESS` (default 4Mi, sized for the sidecar's memory limit) is not
+  served (`507`), nor is an `:outbound` too large for the body budget: that deployment's pods
+  keep an older snapshot, or none. With the default store sample budget (4Mi for both
+  directions), a deployment whose outbound samples use most of it can exceed 4Mi. A restarted sidecar has no snapshot until its next pull, at most one
+  interval later.
 - Value detectors match a whole value (or a whole header credential): a Google `AIza` key, a
   token prefix or a JWT embedded inside longer free text (`note AIza…`) is not caught by value;
   only by name, when its field or header name is a redacted name.
@@ -2082,9 +2256,42 @@ changed in the step that changes the behaviour.
 | SHR-15 | **I.** Shipping outbound (§6.1, §7.2): with the fake sidecar API accepting version 2 and outbound, inbound and tunnel traffic, every push that holds an outbound scope is `"version": 2`; per direction, the exchanges of all pushes sum to the exchanges recorded, and the tunnel counts to the tunnels recorded; an interval with only a tunnel is pushed; after an acknowledged push `/discovery` holds only outbound exchanges recorded since (counters, samples, `origin` and `tunnels` reset); outbound samples of the pending and current reports together stay at most half of `MIMIC_DISCOVERY_SAMPLE_BUDGET`; without `MIMIC_CONTROLLER_URL` the outbound part accumulates as in F7. |
 | SHR-16 | **I.** Fallback to inbound only (§7.2): with the fake sidecar API set as a controller up to F7, a pending version 2 report is followed by a post of the same session and sequence whose report is `"version": 1`, inbound only, and is applied; the fake API receives every inbound exchange once and no outbound scope; `/discovery` keeps every outbound exchange recorded so far (counts accumulated, none lost); the next interval tries version 2 again; once the fake accepts version 2, the next push carries every outbound exchange recorded since the start, each once. A report with outbound and no inbound exchange posts nothing after the `400`, and the next freeze uses the same sequence. When the first attempt has no answer (the fake applies it, then closes the connection) and the retry is answered `400`, the inbound-only post follows, the outbound part is dropped (not in `/discovery`, `mimic_discovery_outbound_dropped_total` 1, one WARN `outbound not shipped` with `reason` `unknown_outcome`), and the outbound exchanges are counted once overall. A `507` to a version 2 report falls back the same way; a `400` to the inbound-only post drops it with one WARN `report rejected`. At `SIGTERM` the flush falls back the same way and ships the inbound part within `MIMIC_SHUTDOWN_GRACE`. `mimic_discovery_pushes_total{result="inbound_only"}` counts the fallbacks; one WARN `outbound not shipped` (`status`) per streak, written again after an acknowledged version 2 push ends a streak; no line holds the token or report content. |
 | SHR-17 | **C.** The CTL-22 fuzz target also feeds version 2 reports (arbitrary outbound keys, `origin`, `tunnels`) to `Report::from_json`, the structural check, re-redaction, the bounded merge and the split: no panic, every merge result and both split parts pass the check. Same CI schedule as DSC-23. |
-| SHR-18 | **I.** Controller memory: two concurrent writes of deployments each at the store limits (512 inbound and 512 outbound endpoints over 128 authorities, schemas at their caps, `MIMIC_STORE_SAMPLE_BUDGET` full) while a `MIMIC_SIDECAR_API_MAX_REPORT` body is read and a document of each is rendered keep the controller's RSS under 512 MiB (the chart's limit). |
+| SHR-18 | **I.** Controller memory: two concurrent pushes (the second waits for the body budget or gets `503`, and is re-posted) onto deployments whose stored reports are each at the store limits (512 inbound and 512 outbound endpoints over 128 authorities, schemas at their caps, `MIMIC_STORE_SAMPLE_BUDGET` full), with a body near `MIMIC_SIDECAR_API_MAX_REPORT` and the default `MIMIC_SIDECAR_API_BODY_BUDGET` (`32Mi`), then a document of each kind rendered per deployment, keep the controller's peak RSS (`VmHWM`) under 640 MiB (128 MiB of headroom under the chart's 768 Mi limit). |
 | SHR-19 | **E.** On kind, `front` (service A, `scripts/e2e/apps`) runs with 2 replicas injected in its own `enabled` namespace with a `MimicWorkload`, `UPSTREAM` the `users` Service (service B); a client sends calls spread over both pods to `/front/users/<id>` (GET with a canary bearer token and an `X-Tenant-Key` canary, PUT with a JSON body holding a canary) and `/front/missing`. Within 2 push intervals, through `kubectl port-forward` to a controller pod: front's `/report` holds `scopes.outbound."users.disc-22.svc:8080"` with `GET` and `PUT /users/{users_id}` and `GET /missing` (`404`), whose counts are the sums of the outbound calls in the two front pods' access lines, each pod having sent some (the union of both pods); `/v1/workloads/<ns>/front` lists both pods; `/openapi` lists `outbound-users.disc-22.svc:8080` and its document has `/users/{users_id}` with `get` and `put`, `servers` `http://users.disc-22.svc:8080`, and `X-Tenant-Key` as a redacted header parameter; within `MIMIC_STATUS_INTERVAL` more the `MimicWorkload` of front shows `endpoints.outbound: 3` and `totalEndpoints` equal to its inbound plus 3, and `kubectl get mimicworkload` prints that total under `Endpoints`. No canary is in front's report, documents, any Valkey value, the controller's logs or the pods' `/discovery`. The `users` checks of CTL-20 and UI-11 still pass. |
 | SHR-20 | **E.** Browser: the headless Chromium of UI-12 loads front's deployment page and its `outbound-users.disc-22.svc:8080` document page: the endpoint list shows the outbound endpoints with their authority, the document shows `GET /users/{users_id}`, there is no "Try it out" or "Execute" button, Chromium's log shows no CSP violation and no request to an origin other than the port-forward, and the `users` pods log no access line during the run. |
+
+### 12.10 F9 — Egress endpoint for sidecars
+
+Levels as in §12.2. Unit tests build reports with the recorder and the bounded merge and the
+generators of the CTL, EGR and SHR tests. Controller integration tests run against a real
+Valkey and the fake API server as in §12.6; sidecar integration tests use the fake sidecar API
+of F3, extended to serve an egress set (with `ETag`, `304` and any status or body) and to
+answer `404` as a controller up to F8. A *canary* is as in §12.5. F9 changes no row of
+earlier features: SHR-09 and SHR-18 must still pass with the digest write and the egress
+route in place.
+
+| ID | Criterion |
+|---|---|
+| PUL-01 | **U.** Projection (§7.7), for reports with inbound and outbound exchanges and tunnels built by the recorder and the bounded merge (`proptest`, ≥ 10 000 cases): one authority per outbound scope that holds an endpoint, tunnel-only scopes and the inbound part absent (the projection of the union equals that of its `:outbound` part); per endpoint `method`, `template`, `grpc`, `statuses` and `latency` equal to the report's, `samples` equal to the report's without `last_seen`, in report order, `volatile` and `redacted` equal to the `x-mimic-volatile` and `x-mimic-redacted` of the same endpoint's §7.6 document; no key `schema`, sketch, `origin`, `tunnels`, `hosts`, `last_seen` or `pod` at any depth; byte-identical output for equal input; a report without outbound scope gives `{"authorities":{},"format":1}`; `EgressSet::from_json` accepts every projection and serialises it back byte-identically. |
+| PUL-02 | **U.** Egress set check (§7.7) refuses, each with its `reason`: `format` 0, 2 or absent (`format`); an authority `A.example:80`, `a.example:080` or `a.example` (`authority`); 10 001 authorities, 10 001 endpoints in all (`limit`); a template of 2049 bytes or 33 segments, a status 99 or 600, a histogram bucket outside the §6 range, 21 samples, a sample whose `bytes` is not its serialised size, 129 field names, a field name of 129 bytes, an unknown field at any level, a body that is not JSON (`malformed`). |
+| PUL-03 | **U.** No leak in the projection: reports that held a canary at a random place (the SHR-02 generator, inbound and outbound) re-redacted by §7.3 then projected contain neither the canary nor its XXH3 hash in decimal or hex, and no hash of any volatility sketch of the source report (`proptest`, ≥ 10 000 cases). |
+| PUL-04 | **U.** Digest and `ETag` (§7.7): the digest of version `v` and bytes `b` is `v:<hex SHA-256 of b>` (of the empty string without `:outbound`); the `ETag` is `"1-<hex>"`; a digest field that is absent, malformed or written for another `version` is stale; `If-None-Match` matches when one entry of its list equals the `ETag` exactly (`W/"…"` and `*` do not match). |
+| PUL-05 | **U.** Local view (§7.7): the summary of a snapshot lists every authority and endpoint with `method`, `template`, `grpc`, `exchanges` (the sum of `statuses`) and `statuses`, sorted keys, byte-identical for equal input; it holds no sample, no field name and none of the PUL-03 canaries; without snapshot it is `{"authorities":{},"etag":null,"pulled":null}`. |
+| PUL-06 | **I.** Digest in the store (§7.3, §7.7): after a version 2 push `:meta` `outbound_digest` is `<version>:<SHA-256 of the :outbound bytes>`; after a version 1 push that leaves `:outbound` unchanged its hash part is unchanged and its version follows `version`; a deployment without `:outbound` holds the empty-string digest; `:report`, `:outbound` and the other `:meta` fields are byte-identical to what F8 writes for the same pushes. After an F8-style write (digest removed or left at an older version, `:outbound` changed), the route answers the projection of the stored bytes with their `ETag`, and an `If-None-Match` of the earlier `ETag` gets `200`. |
+| PUL-07 | **I.** Route (§7.7): a token of a pod of the deployment gets `200` `application/json` with `ETag` and `Cache-Control: no-store`, the body byte-identical to the `mimic-core` projection of the stored `:outbound`; the same `If-None-Match` gets `304` with the `ETag`, an empty body and no `GET` of `:outbound` (Valkey `INFO commandstats`); after a version 2 push that changes the outbound part the next pull is `200` with a new `ETag`, after a version 1 push it is still `304`; a deployment without data and one with inbound data only get `200` `{"authorities":{},"format":1}`; two replicas answer the same `ETag` and bytes. |
+| PUL-08 | **I.** Refusals (§7.7): missing, invalid and foreign-audience tokens get `401`; a pod of another deployment or without bound-pod claim `403`; a pod of namespace `b` naming a deployment that has data only in namespace `a` gets the empty set; over `MIMIC_SIDECAR_API_RATE` `429` with no `TokenReview`; `format` absent, `2` or `abc` `400` (`format`); a name that is not DNS-1123 `400`; `POST` and `PUT` `405` with `Allow: GET`; Valkey stopped `503` with `Retry-After: 1`; a corrupted `:outbound` `500` with one ERROR `stored report unreadable` (`key` `outbound`), the key left unchanged; a projection over `MIMIC_SIDECAR_API_MAX_EGRESS` (64Ki in the test) `507` (`egress_limit`) with one WARN `egress limit reached` (`reason` `projection`) per deployment. |
+| PUL-09 | **I.** Builds and budgets (§7.7): 32 concurrent pulls of one deployment at a new digest make one build (`mimic_sidecar_api_egress_builds_total{result="ok"}` + 1) and 32 identical `200` answers; with `MIMIC_SIDECAR_API_EGRESS_BUDGET` twice a projection, pulls of three deployments in turn keep `mimic_sidecar_api_egress_cache_bytes` at most the budget and the least recently served is built again at its next pull; a projection that cannot fit while others are being sent gets `503` with `Retry-After: 1`; while pushes hold the whole `MIMIC_SIDECAR_API_BODY_BUDGET`, a pull that needs a build gets `503` and a pull answered from the cache or by `304` does not; a stale digest (PUL-06) takes the same share (it gets `503` too while the pushes hold the budget); an `:outbound` whose `STRLEN` plus `MIMIC_SIDECAR_API_MAX_EGRESS` exceeds the whole body budget (256Ki budget in the test) gets `507` (`egress_limit`) at every pull, never `503`, without a `GET` of `:outbound`, with one WARN `egress limit reached` (`reason` `stored`) and `mimic_sidecar_api_egress_builds_total{result="too_large"}` counting each; two deployments of the same name in two namespaces never get each other's projection from the cache. |
+| PUL-10 | **I.** Logs and metrics of the route: one `sidecar_api` line per pull with `endpoint` `/v1/workloads/{deployment}/egress`, `namespace`, `pod`, `deployment`, `result` (`ok`, `not_modified`, `unauthenticated`, `forbidden`, `invalid` with `reason` `format`, `egress_limit`, `unavailable`; `rate_limited` at DEBUG) and `bytes`; `mimic_sidecar_api_requests_total{endpoint="/v1/workloads/{deployment}/egress",result}` follows. With the SHR-10 canary pushes applied, no answer of the route, no line of stdout and no `/metrics` series holds a canary, its XXH3 hash or the token, and no series holds a template or an authority. |
+| PUL-11 | **I.** Controller configuration: `MIMIC_SIDECAR_API_MAX_EGRESS` at `0`, `63Ki`, `2Gi` or `abc`, and `MIMIC_SIDECAR_API_EGRESS_BUDGET` below `MIMIC_SIDECAR_API_MAX_EGRESS` or over `4Gi`, exit 2 before listening (FND-01); unset, they are `4Mi` and `32Mi`. |
+| PUL-12 | **I.** Controller memory: the SHR-18 scenario with default settings plus, during the two pushes, 32 concurrent pulls of each deployment at a new digest (each pull builds; a projection over `MIMIC_SIDECAR_API_MAX_EGRESS` is built, then refused), keeps the controller's peak RSS (`VmHWM`) under 672 MiB (96 MiB of headroom under the chart's 768 Mi limit); every pull gets `200`, `503` or `507`. The bound is 640 MiB (SHR-18) plus the 32 MiB egress budget: builds add nothing beyond the body budget SHR-18 already measures, since their share counts the stored bytes and the output buffer (`MIMIC_SIDECAR_API_MAX_EGRESS`) and displaces pushes. If it is missed, step 4 reports the measurement on #242 rather than raising the bound. |
+| PUL-13 | **I.** Pull client (§7.7), against the fake sidecar API with `MIMIC_EGRESS_PULL_INTERVAL=2s`: the first `GET /v1/workloads/<MIMIC_WORKLOAD>/egress?format=1` arrives within one interval of start, without `If-None-Match`, with the token the file holds at that moment (the file changes between two pulls and the next pull carries the new one); later pulls come once per interval with the `ETag` held; `304` keeps the snapshot and moves `pulled`; a new `200` replaces it; an empty set empties it; `/egress`, `mimic_egress_endpoints`, `mimic_egress_bytes`, `mimic_egress_last_pull_timestamp_seconds` and `mimic_egress_pulls_total{result="ok"|"not_modified"}` follow. |
+| PUL-14 | **I.** Pull failures keep the snapshot held (§7.7): `503`, a reset, an answer delayed past 30 s, `401`, `403` and `429` are `error` and retried after 1, 2, 4 … s (`Retry-After: 3` waits at least 3 s, `Retry-After: 900` waits 300 s); one WARN `egress pull failed` per streak and one INFO `egress pull recovered`; `404` and `405` are `unsupported` and the next pull comes one interval later, not sooner; a 1 GiB body is `too_large` and the sidecar stops reading at `MIMIC_EGRESS_MAX_BYTES` (its RSS grows by less than twice the cap); a body with `format` 2, one that is not JSON, and one with 21 samples in an endpoint are `invalid` with one WARN `egress rejected` carrying the PUL-02 `reason`; `507` is `too_large`. No line holds the token or snapshot content. |
+| PUL-15 | **I.** F9 changes no traffic: with a snapshot holding the authority and endpoint the app calls, the outbound calls still reach the destination and the app gets its answers unchanged (no `x-mimic-match` header); access lines, `/discovery` and the pushed reports are the same as with an empty snapshot (timings aside). Without `MIMIC_CONTROLLER_URL` nothing is pulled and one INFO `egress pull disabled` is written. At `SIGTERM` no pull starts after the signal, and a pull in flight to a silent fake does not delay the exit beyond the FND-05 bound. |
+| PUL-16 | **I.** `/egress` on the sidecar admin port: a non-loopback peer gets `403`; a loopback peer gets the PUL-05 summary of the snapshot held; with a snapshot whose samples hold canaries, no canary is in `/egress`, the sidecar's stdout or `/metrics`. |
+| PUL-17 | **I.** Sidecar configuration: `MIMIC_EGRESS_PULL_INTERVAL` at `0s`, `2h` or `abc`, and `MIMIC_EGRESS_MAX_BYTES` at `63Ki`, `2Gi` or `abc`, exit 2 before listening (FND-01); unset, they are `60s` and `4Mi`. |
+| PUL-18 | **I.** Sidecar memory, combined with discovery: with default settings, while the EGR-15 load runs (256 inbound and 256 outbound endpoints over 64 authorities, each receiving 30 distinct 256 KiB JSON exchanges, the worst case of DSC-17 included), the sidecar pulls from the fake sidecar API two different egress sets of just under `MIMIC_EGRESS_MAX_BYTES` each (samples with JSON bodies of many small keys, the costliest to parse), one after the other with the first still held while the second parses, and a third pull returns a refused body of the same size; its peak RSS (`VmHWM`) stays under 120 MiB (8 MiB of headroom under the injected 128 Mi limit), and after each accepted pull `/egress` shows the new set. |
+| PUL-19 | **E.** On kind, after the traffic of SHR-19 stops, within 2 push intervals plus 2 pull intervals: through `kubectl port-forward` to each `front` pod's admin port, `/egress` lists `users.disc-22.svc:8080` with `GET` and `PUT /users/{users_id}` and `GET /missing`, with the same `etag` on both pods; a `users` pod's `/egress` has no authority; the controllers' logs hold `sidecar_api` lines for `/v1/workloads/{deployment}/egress` with `ok` and `not_modified`; no SHR-19 canary is in any `/egress` answer or controller log line. |
+| PUL-20 | **C.** A fuzz target feeds arbitrary bytes to `EgressSet::from_json`, and the reports of the CTL-22 corpus that pass the §7.3 check to the projection: no panic, and every projection passes the egress set check. Same CI schedule as DSC-23. |
 
 ## 13. Test strategy
 

@@ -21,7 +21,6 @@ use base64::Engine;
 use futures::StreamExt;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::{Api, PostParams};
-use mimic_core::discovery::check::Violation;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::Report;
 use mimic_core::identity::pod_of_deployment;
@@ -366,6 +365,8 @@ struct Caller {
     /// A push: its session, sequence and declared size.
     session: Option<String>,
     sequence: Option<u64>,
+    /// The `version` of the pushed report.
+    version: Option<u64>,
     bytes: Option<usize>,
     /// Why the controller could not answer (never the token or the key).
     error: Option<String>,
@@ -385,12 +386,14 @@ struct IntermediateRequest {
     public_key: String,
 }
 
-/// The body of a push; the report is checked as a whole, after the envelope.
+/// The body of a push; the report is checked as a whole, after the envelope. It stays a slice
+/// of the body: a copy of a report of tens of megabytes would add to the peak (SHR-18).
 #[derive(Deserialize)]
-struct PushRequest {
+struct PushRequest<'a> {
     session: String,
     sequence: u64,
-    report: Box<RawValue>,
+    #[serde(borrow)]
+    report: &'a RawValue,
 }
 
 /// An authenticated caller.
@@ -420,6 +423,7 @@ impl SidecarApi {
                     deployment = caller.deployment,
                     session = caller.session,
                     sequence = caller.sequence,
+                    version = caller.version,
                     bytes = caller.bytes,
                     reason,
                     error = caller.error,
@@ -613,20 +617,23 @@ impl SidecarApi {
 
         let extra = self.workloads.redact(&identity.namespace, deployment);
         let max_push = self.max_push_endpoints;
-        let (seq, report) = tokio::task::spawn_blocking(move || prepare(&bytes, max_push, &extra))
-            .await
-            .map_err(|e| {
-                // Never the panic payload: it could hold push content from before re-redaction.
-                caller.error = Some(
-                    if e.is_panic() {
-                        "push task panicked"
-                    } else {
-                        "push task cancelled"
-                    }
-                    .into(),
-                );
-                UNAVAILABLE
-            })?;
+        let max_authorities = self.store.limits().max_authorities;
+        let (seq, version, report) =
+            tokio::task::spawn_blocking(move || prepare(&bytes, max_push, max_authorities, &extra))
+                .await
+                .map_err(|e| {
+                    // Never the panic payload: it could hold push content from before re-redaction.
+                    caller.error = Some(
+                        if e.is_panic() {
+                            "push task panicked"
+                        } else {
+                            "push task cancelled"
+                        }
+                        .into(),
+                    );
+                    UNAVAILABLE
+                })?;
+        caller.version = version;
         if let Some(seq) = &seq {
             caller.session = Some(seq.session.clone());
             caller.sequence = Some(seq.sequence);
@@ -656,16 +663,26 @@ impl SidecarApi {
 fn prepare(
     bytes: &[u8],
     max_push_endpoints: usize,
+    max_authorities: usize,
     extra: &[String],
-) -> (Option<SeqId>, Result<Report, Refusal>) {
+) -> (Option<SeqId>, Option<u64>, Result<Report, Refusal>) {
     let Ok(request) = serde_json::from_slice::<PushRequest>(bytes) else {
-        return (None, Err(invalid("malformed")));
+        return (None, None, Err(invalid("malformed")));
     };
     let Ok(seq) = SeqId::parse(&request.session, request.sequence) else {
         let hex = SeqId::parse(&request.session, 1).is_ok();
-        return (None, Err(invalid(if hex { "sequence" } else { "session" })));
+        let reason = if hex { "sequence" } else { "session" };
+        return (None, None, Err(invalid(reason)));
     };
-    let report = Report::parse_checked(request.report.get(), max_push_endpoints, usize::MAX)
+    // The version as pushed, for the log line, also when the check refuses the report.
+    #[derive(Deserialize)]
+    struct Peek {
+        version: Option<u64>,
+    }
+    let version = serde_json::from_str::<Peek>(request.report.get())
+        .ok()
+        .and_then(|peek| peek.version);
+    let report = Report::parse_checked(request.report.get(), max_push_endpoints, max_authorities)
         .map_err(|v| {
             if v.is_push_limit() {
                 Refusal {
@@ -674,14 +691,6 @@ fn prepare(
                 }
             } else {
                 invalid(v.reason())
-            }
-        })
-        // The store holds no `:outbound` key yet (F8 step 5): version 2 stays refused here.
-        .and_then(|report| {
-            if report.version() == 1 {
-                Ok(report)
-            } else {
-                Err(invalid(Violation::Version.reason()))
             }
         });
     let report = report.map(|mut report| {
@@ -692,7 +701,7 @@ fn prepare(
         report.stamp(today);
         report
     });
-    (Some(seq), report)
+    (Some(seq), version, report)
 }
 
 /// The Content-Length of a push, required.

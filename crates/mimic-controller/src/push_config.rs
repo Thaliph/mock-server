@@ -36,7 +36,7 @@ impl PushConfig {
     pub fn from_env(env: &Env) -> Result<PushConfig, ConfigError> {
         let max_report = size(env, "MIMIC_SIDECAR_API_MAX_REPORT", 32 * MIB, 64 * KIB, GIB)?;
         let var = "MIMIC_SIDECAR_API_BODY_BUDGET";
-        let body_budget = size(env, var, 64 * MIB, max_report, 4 * GIB)?;
+        let body_budget = size(env, var, 32 * MIB, max_report, 4 * GIB)?;
         let max_endpoints = number(env, "MIMIC_STORE_MAX_ENDPOINTS", 512, 1, 10_000)?;
         let var = "MIMIC_STORE_MAX_PUSH_ENDPOINTS";
         let max_push_endpoints = number(env, var, 256, 1, max_endpoints)?;
@@ -50,8 +50,7 @@ impl PushConfig {
                 limits: Limits {
                     max_literals: number(env, "MIMIC_STORE_MAX_LITERALS", 32, 2, 1000)?,
                     max_endpoints,
-                    // The store is inbound only until F8 (`MIMIC_STORE_MAX_AUTHORITIES`).
-                    max_authorities: 64,
+                    max_authorities: number(env, "MIMIC_STORE_MAX_AUTHORITIES", 128, 1, 10_000)?,
                     sample_budget: usize_of(size(
                         env,
                         "MIMIC_STORE_SAMPLE_BUDGET",
@@ -166,16 +165,43 @@ mod tests {
         let config = PushConfig::from_env(&env(&[])).unwrap();
         assert_eq!(config.rate, 10);
         assert_eq!(config.max_report, 32 << 20);
-        assert_eq!(config.body_budget, 64 << 20);
+        assert_eq!(config.body_budget, 32 << 20);
         assert_eq!(config.max_push_endpoints, 256);
         assert_eq!(config.store.ttl, Duration::from_secs(30 * 86_400));
         assert_eq!(config.store.limits.max_endpoints, 512);
         assert_eq!(config.store.limits.max_literals, 32);
+        assert_eq!(config.store.limits.max_authorities, 128);
         assert_eq!(config.store.limits.sample_budget, 4 << 20);
         assert_eq!(config.store.max_deployments, 50);
         assert_eq!(config.status_interval, Duration::from_secs(30));
         assert_eq!(config.pod_window, Duration::from_secs(300));
         assert_eq!(config.ui_addr, "127.0.0.1:8080".parse().unwrap());
+    }
+
+    #[test]
+    fn shr_11_max_authorities_defaults_to_128_and_takes_1_to_10000() {
+        assert_eq!(
+            PushConfig::from_env(&env(&[]))
+                .unwrap()
+                .store
+                .limits
+                .max_authorities,
+            128
+        );
+        for (value, expected) in [("1", 1), ("64", 64), ("10000", 10_000)] {
+            let config =
+                PushConfig::from_env(&env(&[("MIMIC_STORE_MAX_AUTHORITIES", value)])).unwrap();
+            assert_eq!(config.store.limits.max_authorities, expected, "{value}");
+        }
+        for value in ["0", "10001", "many", "-1"] {
+            let error = PushConfig::from_env(&env(&[("MIMIC_STORE_MAX_AUTHORITIES", value)]))
+                .err()
+                .unwrap_or_else(|| panic!("{value} was accepted"));
+            assert!(
+                error.to_string().contains("MIMIC_STORE_MAX_AUTHORITIES"),
+                "{value}"
+            );
+        }
     }
 
     #[test]
@@ -188,6 +214,7 @@ mod tests {
             ("MIMIC_STORE_MAX_ENDPOINTS", "10"),
             ("MIMIC_STORE_MAX_PUSH_ENDPOINTS", "10"),
             ("MIMIC_STORE_MAX_LITERALS", "1000"),
+            ("MIMIC_STORE_MAX_AUTHORITIES", "10000"),
             ("MIMIC_STORE_SAMPLE_BUDGET", "1Gi"),
             ("MIMIC_STORE_MAX_DEPLOYMENTS", "100000"),
             ("MIMIC_STATUS_INTERVAL", "1m"),
@@ -198,6 +225,7 @@ mod tests {
         assert_eq!(config.rate, 10_000);
         assert_eq!(config.max_report, 64 << 10);
         assert_eq!(config.body_budget, 4 << 30);
+        assert_eq!(config.store.limits.max_authorities, 10_000);
         assert_eq!(config.store.ttl, Duration::from_secs(7200));
         assert_eq!(config.status_interval, Duration::from_secs(60));
         assert_eq!(config.pod_window, Duration::from_secs(86_400));
@@ -227,6 +255,9 @@ mod tests {
             ("MIMIC_STORE_MAX_ENDPOINTS", "10001"),
             ("MIMIC_STORE_MAX_PUSH_ENDPOINTS", "0"),
             ("MIMIC_STORE_MAX_PUSH_ENDPOINTS", "513"),
+            ("MIMIC_STORE_MAX_AUTHORITIES", "0"),
+            ("MIMIC_STORE_MAX_AUTHORITIES", "10001"),
+            ("MIMIC_STORE_MAX_AUTHORITIES", "many"),
             ("MIMIC_STORE_MAX_LITERALS", "1"),
             ("MIMIC_STORE_MAX_LITERALS", "1001"),
             ("MIMIC_STORE_SAMPLE_BUDGET", "512Ki"),

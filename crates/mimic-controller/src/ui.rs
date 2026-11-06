@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
-use crate::store::{ReadError, Store, Summary};
+use crate::store::{Half, ReadError, Store, Summary};
 
 mod assets;
 
@@ -47,12 +47,13 @@ fn render_histogram() -> Histogram {
     ])
 }
 
-/// `mimic_ui_requests_total{route,code}` and `mimic_ui_render_duration_seconds{route}` (spec
+/// `mimic_ui_requests_total{route,code}`, `mimic_ui_render_duration_seconds{route}` and `mimic_ui_skipped_total{reason}` (spec
 /// §9). `route` is a route pattern or `other`: no label holds request content.
 #[derive(Clone)]
 pub struct UiMetrics {
     requests: Family<Labels, Counter>,
     renders: Family<Labels, Histogram, fn() -> Histogram>,
+    skipped: Family<Labels, Counter>,
 }
 
 impl Default for UiMetrics {
@@ -60,6 +61,7 @@ impl Default for UiMetrics {
         UiMetrics {
             requests: Family::default(),
             renders: Family::new_with_constructor(render_histogram),
+            skipped: Family::default(),
         }
     }
 }
@@ -77,6 +79,11 @@ impl UiMetrics {
             "Parse and render of a stored report",
             Unit::Seconds,
             metrics.renders.clone(),
+        );
+        registry.register(
+            "ui_skipped",
+            "Entries left out of the workload list",
+            metrics.skipped.clone(),
         );
         metrics
     }
@@ -266,10 +273,13 @@ fn object(summary: &Summary) -> Map<String, Value> {
     map
 }
 
-async fn list(State(Ui { store, .. }): State<Ui>) -> Result<Json, ReadError> {
-    let workloads: Vec<Value> = store
-        .list()
-        .await?
+async fn list(State(Ui { store, metrics, .. }): State<Ui>) -> Result<Json, ReadError> {
+    let (summaries, skipped) = store.list().await?;
+    metrics
+        .skipped
+        .get_or_create(&labels(&[("reason", "meta-unreadable")]))
+        .inc_by(skipped);
+    let workloads: Vec<Value> = summaries
         .iter()
         .map(|summary| Value::Object(object(summary)))
         .collect();
@@ -305,6 +315,7 @@ async fn render<F>(
     route: &str,
     namespace: &str,
     deployment: &str,
+    half: Half,
     build: F,
 ) -> Result<Response, ReadError>
 where
@@ -315,7 +326,7 @@ where
         ReadError::Unreadable
     };
     // Names and the read come first: an invalid or unknown request never waits for a slot.
-    let (bytes, version) = ui.store.stored_report(namespace, deployment).await?;
+    let stored = ui.store.stored_report(namespace, deployment, half).await?;
     // The permit moves into the blocking closure: a dropped request leaves the render running,
     // and the slot with it.
     let permit = ui
@@ -331,10 +342,8 @@ where
         if let Some(hook) = hook {
             hook();
         }
-        let report = std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|json| Report::parse_checked(json, usize::MAX, usize::MAX).ok())
-            .ok_or(Failure::Report)?;
+        let version = stored.version;
+        let report = stored.parse().ok_or(Failure::Report)?;
         let value = build(&report, version).ok_or(Failure::Absent)?;
         serde_json::to_vec(&value).map_err(|_| Failure::Render)
     })
@@ -374,6 +383,7 @@ async fn endpoints(
         matched.as_str(),
         &namespace,
         &deployment,
+        Half::Both,
         |report, _| Some(openapi::endpoint_list(report)),
     )
     .await
@@ -389,6 +399,7 @@ async fn openapi_index(
         matched.as_str(),
         &namespace,
         &deployment,
+        Half::Both,
         |report, _| Some(openapi::index(report)),
     )
     .await
@@ -399,15 +410,18 @@ async fn openapi_document(
     matched: MatchedPath,
     Path((namespace, deployment, id)): Path<(String, String, String)>,
 ) -> Result<Response, ReadError> {
-    if openapi::parse_id(&id).is_none() {
-        return Err(ReadError::Name);
-    }
+    let half = match openapi::parse_document_id(&id) {
+        None => return Err(ReadError::Name),
+        Some(openapi::DocId::Inbound(_)) => Half::Inbound,
+        Some(openapi::DocId::Outbound(_)) => Half::Outbound,
+    };
     let (ns, dep) = (namespace.clone(), deployment.clone());
     render(
         &ui,
         matched.as_str(),
         &namespace,
         &deployment,
+        half,
         move |report, version| openapi::document(report, &ns, &dep, version, &id),
     )
     .await

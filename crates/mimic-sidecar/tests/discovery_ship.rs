@@ -1,10 +1,11 @@
-//! CTL-14 (push interval), CTL-15, CTL-16 and CTL-17 on the shipping client of the sidecar
-//! (spec §7.2), against a fake sidecar API served over TLS in the test process.
+//! CTL-14 (push interval), CTL-15, CTL-16, CTL-17, SHR-15 and SHR-16 on the shipping client of
+//! the sidecar (spec §7.2), against a fake sidecar API served over TLS in the test process.
 
 mod common;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,6 +80,9 @@ struct FakeApi {
     addr: SocketAddr,
     ca_pem: String,
     seen: Arc<Mutex<Vec<Seen>>>,
+    /// Set: past its script the fake answers as a controller up to F7 (`400` to any report
+    /// that is not `"version": 1`). Past the script, it acknowledges.
+    f7: Arc<AtomicBool>,
 }
 
 impl FakeApi {
@@ -94,6 +98,25 @@ impl FakeApi {
             .iter()
             .map(|s| (s.sequence(), s.status, s.report().exchanges()))
             .collect()
+    }
+
+    /// The posts so far, as `(sequence, version, status)`.
+    fn versions(&self) -> Vec<(u64, u64, u16)> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let version = s.json()["report"]["version"].as_u64().unwrap();
+                (s.sequence(), version, s.status)
+            })
+            .collect()
+    }
+
+    /// The reports of the posts that satisfy `keep`.
+    fn reports(&self, keep: impl Fn(&Seen) -> bool) -> Vec<Report> {
+        let seen = self.seen.lock().unwrap();
+        seen.iter().filter(|s| keep(s)).map(Seen::report).collect()
     }
 
     /// Exchanges of the posts the fake acknowledged.
@@ -141,19 +164,25 @@ async fn fake_api(script: Vec<Reply>) -> FakeApi {
     let addr = listener.local_addr().unwrap();
     let script: Arc<Mutex<VecDeque<Reply>>> = Arc::new(Mutex::new(script.into()));
     let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
-    let (script_in, seen_in) = (script.clone(), seen.clone());
+    let f7 = Arc::new(AtomicBool::new(false));
+    let (script_in, seen_in, f7_in) = (script.clone(), seen.clone(), f7.clone());
     tokio::spawn(async move {
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
-            let (acceptor, script, seen) = (acceptor.clone(), script_in.clone(), seen_in.clone());
+            let (acceptor, script, seen, f7) = (
+                acceptor.clone(),
+                script_in.clone(),
+                seen_in.clone(),
+                f7_in.clone(),
+            );
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
                 };
                 let service = service_fn(move |req: Request<Incoming>| {
-                    let (script, seen) = (script.clone(), seen.clone());
+                    let (script, seen, f7) = (script.clone(), seen.clone(), f7.clone());
                     async move {
                         let authorization = req
                             .headers()
@@ -163,7 +192,16 @@ async fn fake_api(script: Vec<Reply>) -> FakeApi {
                             .to_string();
                         let path = req.uri().path().to_string();
                         let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
-                        let reply = script.lock().unwrap().pop_front().unwrap_or(Reply::Ok);
+                        let scripted = script.lock().unwrap().pop_front();
+                        let reply = scripted.unwrap_or_else(|| {
+                            let version = serde_json::from_slice::<serde_json::Value>(&body)
+                                .map_or(0, |v| v["report"]["version"].as_u64().unwrap_or(0));
+                            if f7.load(Ordering::Relaxed) && version != 1 {
+                                Reply::Status(400)
+                            } else {
+                                Reply::Ok
+                            }
+                        });
                         let (status, retry_after) = match reply {
                             Reply::Ok | Reply::Body(_) => (200, None),
                             Reply::Status(s) => (s, None),
@@ -203,7 +241,12 @@ async fn fake_api(script: Vec<Reply>) -> FakeApi {
             });
         }
     });
-    FakeApi { addr, ca_pem, seen }
+    FakeApi {
+        addr,
+        ca_pem,
+        seen,
+        f7,
+    }
 }
 
 /// An app answering every request with `200 {}`.
@@ -248,6 +291,10 @@ struct Rig {
     api: FakeApi,
     discovery: Discovery,
     proxy: common::Fixture,
+    /// The outbound proxy, towards the app.
+    out: common::Fixture,
+    /// The outbound proxy, towards an echo server: its connections are tunnels.
+    tcp: common::Fixture,
     token: std::path::PathBuf,
     config: ShipConfig,
     _dir: tempfile::TempDir,
@@ -262,6 +309,9 @@ impl Rig {
         let discovery = Discovery::start(&config, Some("pod-a".into())).unwrap();
         let app = app().await;
         let proxy = fixture_discovery(Direction::Inbound, &discovery, move |_| Some(app)).await;
+        let out = fixture_discovery(Direction::Outbound, &discovery, move |_| Some(app)).await;
+        let echo = common::echo_server().await;
+        let tcp = fixture_discovery(Direction::Outbound, &discovery, move |_| Some(echo)).await;
         let config = ShipConfig {
             interval,
             timeout: Duration::from_secs(1),
@@ -276,6 +326,8 @@ impl Rig {
             api,
             discovery,
             proxy,
+            out,
+            tcp,
             token,
             config,
             _dir: dir,
@@ -326,6 +378,36 @@ impl Rig {
             .expect("answered in time")
             .unwrap();
         assert!(out.starts_with(b"HTTP/1.1 200"));
+    }
+
+    /// `GET /v1/items/<n>` to `api.example.test:8080` through the outbound proxy.
+    async fn outbound_call(&self, n: u32) {
+        let mut c = TcpStream::connect(self.out.addr).await.unwrap();
+        c.write_all(
+            format!(
+                "GET /v1/items/{n} HTTP/1.1\r\nHost: api.example.test:8080\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut out))
+            .await
+            .expect("answered in time")
+            .unwrap();
+        assert!(out.starts_with(b"HTTP/1.1 200"));
+    }
+
+    /// One opaque TCP connection through the outbound proxy: a tunnel.
+    async fn tunnel(&self) {
+        let mut c = TcpStream::connect(self.tcp.addr).await.unwrap();
+        c.write_all(&[0u8, 1, 2, 3]).await.unwrap();
+        let mut back = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(10), c.read_exact(&mut back))
+            .await
+            .expect("echoed in time")
+            .unwrap();
     }
 
     /// Waits until the recorder holds `n` exchanges (or the shipper took them).
@@ -641,6 +723,14 @@ async fn ctl_16_metrics_and_logs_follow_a_failure_streak() {
     let (_stop, _task) = rig.start();
     rig.call("users", 1).await;
     wait(|| rig.api.acknowledged() == 1).await;
+    // The API acknowledges before the sidecar counts the answer.
+    // The counter is set before the timestamp: wait for both.
+    wait(|| {
+        let text = metrics.encode();
+        text.contains("mimic_discovery_pushes_total{result=\"ok\"} 1")
+            && !text.contains("mimic_discovery_last_push_timestamp_seconds 0\n")
+    })
+    .await;
     let text = metrics.encode();
     assert!(
         text.contains("mimic_discovery_pushes_total{result=\"error\"} 2"),
@@ -872,96 +962,561 @@ async fn ctl_16_gauges_cover_the_pending_and_the_current_report() {
     wait(|| gauge("mimic_discovery_endpoints{direction=\"inbound\"}") == 0).await;
 }
 
-#[tokio::test]
-async fn egr_13_pushes_stay_version_1_inbound_and_outbound_is_kept_locally() {
-    let _logs = capture_logs();
-    let rig = Rig::new(vec![], INTERVAL, DiscoveryConfig::default()).await;
+// ---------------------------------------------------------------------------------------
+// SHR-15 and SHR-16: shipping the outbound part, and the fallback to inbound only.
+
+fn metric(rig: &Rig, name: &str) -> i64 {
     let mut metrics = Metrics::new("sidecar", "test");
     rig.discovery.register(&mut metrics);
-    let gauge = |name: &str| -> i64 {
-        metrics
-            .encode()
-            .lines()
-            .find(|l| l.starts_with(name))
-            .and_then(|l| l.rsplit(' ').next())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(-1)
+    metrics
+        .encode()
+        .lines()
+        .find(|l| l.starts_with(name))
+        .and_then(|l| l.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(-1)
+}
+
+const INBOUND_ONLY: &str = "mimic_discovery_pushes_total{result=\"inbound_only\"}";
+const DROPPED: &str = "mimic_discovery_outbound_dropped_total";
+
+/// The `outbound not shipped` lines so far.
+async fn not_shipped(logs: &common::Logs) -> Vec<serde_json::Value> {
+    logs.settled().await;
+    logs.text()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["message"] == "outbound not shipped")
+        .collect()
+}
+
+/// The tunnels counted by the outbound scopes of `report`.
+fn tunnels(report: &Report) -> u64 {
+    let v: serde_json::Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
+    v["scopes"]["outbound"].as_object().map_or(0, |scopes| {
+        scopes
+            .values()
+            .filter_map(|s| s["tunnels"].as_object())
+            .flat_map(|t| t.values().filter_map(serde_json::Value::as_u64))
+            .sum()
+    })
+}
+
+fn holds_outbound(report: &Report) -> bool {
+    report
+        .endpoints()
+        .iter()
+        .any(|e| e.direction == mimic_core::discovery::report::Direction::Outbound)
+}
+
+fn outbound_scope_in(seen: &Seen) -> bool {
+    seen.json()["report"]["scopes"].get("outbound").is_some()
+}
+
+/// Outbound exchanges in the posts the fake acknowledged.
+fn shipped_outbound(rig: &Rig) -> u64 {
+    rig.api
+        .reports(|s| s.status == 200)
+        .iter()
+        .map(Report::outbound_exchanges)
+        .sum()
+}
+
+#[tokio::test]
+async fn shr_15_pushes_carry_the_outbound_part_and_reset_it_after_the_acknowledgement() {
+    let _logs = capture_logs();
+    let rig = Rig::new(vec![], INTERVAL, DiscoveryConfig::default()).await;
+    for n in 1..=3 {
+        rig.outbound_call(n).await;
+    }
+    rig.tunnel().await;
+    rig.tunnel().await;
+    rig.call("users", 1).await;
+    rig.call("users", 2).await;
+    wait(|| rig.discovery.report().exchanges() >= 5 && tunnels(&rig.discovery.report()) == 2).await;
+    wait(|| metric(&rig, "mimic_discovery_endpoints{direction=\"outbound\"}") == 1).await;
+    assert!(metric(&rig, "mimic_discovery_sample_bytes") > 0);
+
+    let (stop, task) = rig.start();
+    wait(|| rig.api.acknowledged() == 5).await;
+    // Every push that holds an outbound scope is version 2, the others version 1.
+    {
+        let seen = rig.api.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        for s in seen.iter() {
+            let version = s.json()["report"]["version"].as_u64().unwrap();
+            assert_eq!(version, if outbound_scope_in(s) { 2 } else { 1 });
+        }
+    }
+    let all = rig.api.reports(|s| s.status == 200);
+    let outbound: u64 = all.iter().map(Report::outbound_exchanges).sum();
+    let inbound: u64 = all
+        .iter()
+        .map(|r| r.exchanges() - r.outbound_exchanges())
+        .sum();
+    assert_eq!((inbound, outbound), (2, 3));
+    assert_eq!(all.iter().map(tunnels).sum::<u64>(), 2);
+    // After the acknowledgement /discovery is reset: counters, samples, origin and tunnels.
+    wait(|| rig.discovery.report().exchanges() == 0).await;
+    let after = rig.discovery.report();
+    assert!(!holds_outbound(&after));
+    assert_eq!(tunnels(&after), 0);
+    assert_eq!(after.sample_bytes(), 0);
+    wait(|| metric(&rig, "mimic_discovery_endpoints{direction=\"outbound\"}") <= 0).await;
+    wait(|| metric(&rig, "mimic_discovery_sample_bytes") == 0).await;
+    drop(stop);
+    task.await.unwrap();
+
+    // Outbound traffic recorded since is all that /discovery holds.
+    rig.outbound_call(4).await;
+    wait(|| rig.discovery.report().outbound_exchanges() == 1).await;
+    assert_eq!(rig.discovery.report().exchanges(), 1);
+    assert!(metric(&rig, "mimic_discovery_sample_bytes") > 0);
+    assert_eq!(
+        metric(&rig, "mimic_discovery_endpoints{direction=\"outbound\"}"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn shr_15_an_interval_with_only_a_tunnel_is_pushed() {
+    let _logs = capture_logs();
+    let rig = Rig::new(vec![], INTERVAL, DiscoveryConfig::default()).await;
+    rig.tunnel().await;
+    wait(|| tunnels(&rig.discovery.report()) == 1).await;
+    let (stop, task) = rig.start();
+    wait(|| rig.api.count() >= 1).await;
+    let posts = rig.api.versions();
+    assert_eq!(posts[0], (1, 2, 200), "{posts:?}");
+    let report = rig.api.seen.lock().unwrap()[0].report();
+    assert_eq!((report.exchanges(), tunnels(&report)), (0, 1));
+    wait(|| tunnels(&rig.discovery.report()) == 0).await;
+    // Nothing recorded since: nothing is pushed.
+    tokio::time::sleep(INTERVAL * 3).await;
+    assert_eq!(rig.api.count(), 1);
+    drop(stop);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shr_15_outbound_samples_of_pending_and_current_stay_within_half_the_budget() {
+    let _logs = capture_logs();
+    let budget = 6_000;
+    let config = DiscoveryConfig {
+        sample_budget: budget,
+        ..DiscoveryConfig::default()
     };
-    let dest = app().await;
-    let out = fixture_discovery(Direction::Outbound, &rig.discovery, move |_| Some(dest)).await;
-    let outbound_call = |n: u32| {
-        let addr = out.addr;
+    // The fake refuses every push: the first report stays pending.
+    let rig = Rig::new(vec![Reply::Status(503); 50], INTERVAL, config).await;
+    let call = |n: u32| {
+        let addr = rig.out.addr;
         async move {
             let mut c = TcpStream::connect(addr).await.unwrap();
             c.write_all(
                 format!(
-                    "GET /v1/items/{n} HTTP/1.1\r\nHost: api.example.test:8080\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+                    "GET /seg{n}/x HTTP/1.1\r\nHost: api.example.test:8080\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
                 )
                 .as_bytes(),
             )
             .await
             .unwrap();
-            let mut answer = Vec::new();
-            tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut answer))
-                .await
-                .expect("answered in time")
-                .unwrap();
-            assert!(answer.starts_with(b"HTTP/1.1 200"));
+            let mut out = Vec::new();
+            c.read_to_end(&mut out).await.unwrap();
         }
     };
-    for n in 1..=3 {
-        outbound_call(n).await;
+    for n in 0..6 {
+        call(n).await;
     }
-    rig.call("users", 1).await;
-    rig.call("users", 2).await;
-    wait(|| rig.discovery.report().exchanges() >= 5).await;
-    let outbound_json = |report: &Report| {
-        let v: serde_json::Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
-        v["scopes"]["outbound"].clone()
-    };
-    let before = outbound_json(&rig.discovery.report());
-    assert!(before["api.example.test:8080"].is_object());
-    wait(|| gauge("mimic_discovery_endpoints{direction=\"outbound\"}") == 1).await;
-    let outbound_samples = gauge("mimic_discovery_sample_bytes");
-    assert!(outbound_samples > 0);
+    wait(|| rig.discovery.report().outbound_exchanges() == 6).await;
+    let (_stop, _task) = rig.start();
+    wait(|| rig.api.count() >= 1).await;
+    for n in 6..40 {
+        call(n).await;
+    }
+    wait(|| rig.discovery.report().outbound_exchanges() >= 30).await;
+    tokio::time::sleep(INTERVAL).await;
+    let pending = rig.api.seen.lock().unwrap()[0].report().sample_bytes();
+    let current = rig.discovery.report().sample_bytes();
+    assert!(pending > 0, "the pending report holds outbound samples");
+    assert!(
+        pending + current <= budget / 2,
+        "{pending} + {current} over {}",
+        budget / 2
+    );
+}
 
+#[tokio::test]
+async fn shr_15_without_a_controller_url_the_outbound_part_accumulates() {
+    let _logs = capture_logs();
+    let rig = Rig::new(vec![], INTERVAL, DiscoveryConfig::default()).await;
+    let mut config = rig.config.clone();
+    config.target = None;
+    assert!(rig.discovery.shipper(config).unwrap().is_none());
+    for n in 1..=3 {
+        rig.outbound_call(n).await;
+    }
+    wait(|| rig.discovery.report().outbound_exchanges() == 3).await;
+    rig.outbound_call(4).await;
+    wait(|| rig.discovery.report().outbound_exchanges() == 4).await;
+    assert_eq!(rig.api.count(), 0);
+}
+
+/// Inbound and outbound exchanges, recorded before the next push.
+async fn traffic(rig: &Rig, inbound: u32, outbound: u32) {
+    for n in 1..=inbound {
+        rig.call("users", n).await;
+    }
+    for n in 1..=outbound {
+        rig.outbound_call(n).await;
+    }
+    wait(|| {
+        let report = rig.discovery.report();
+        report.exchanges() >= u64::from(inbound + outbound)
+            && report.outbound_exchanges() >= u64::from(outbound)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn shr_16_a_400_falls_back_to_inbound_only_and_the_next_interval_tries_version_2_again() {
+    let logs = capture_logs();
+    let rig = Rig::new(vec![], INTERVAL, DiscoveryConfig::default()).await;
+    rig.api.f7.store(true, Ordering::Relaxed);
+    traffic(&rig, 2, 3).await;
     let (stop, task) = rig.start();
-    wait(|| rig.api.acknowledged() == 2).await;
-    // More traffic of both kinds after the push.
-    outbound_call(4).await;
-    rig.call("users", 3).await;
-    wait(|| rig.api.acknowledged() == 3).await;
+    // Version 2 refused, then the same session and sequence, inbound only, applied.
+    wait(|| rig.api.count() >= 2).await;
+    let posts = rig.api.versions();
+    assert_eq!(posts[0], (1, 2, 400), "{posts:?}");
+    assert_eq!(posts[1], (1, 1, 200), "{posts:?}");
     {
         let seen = rig.api.seen.lock().unwrap();
-        assert!(!seen.is_empty());
-        for s in seen.iter() {
-            let report = &s.json()["report"];
-            assert_eq!(report["version"], 1);
-            assert!(report["scopes"].get("outbound").is_none());
-        }
+        assert_eq!(seen[0].session(), seen[1].session());
+        assert!(!outbound_scope_in(&seen[1]));
+        assert_eq!(seen[1].report().exchanges(), 2);
     }
-    // The outbound part is not reset: its counters only grew, and only unshipped inbound
-    // exchanges are left.
-    let after = rig.discovery.report();
-    assert_eq!(after.exchanges(), 4);
-    let scope = &outbound_json(&after)["api.example.test:8080"];
-    let items = |scope: &serde_json::Value| {
-        scope["root"]["literals"]["v1"]["literals"]["items"]["param"]["endpoints"]["GET"]
-            ["statuses"]["200"]
-            .clone()
-    };
-    assert_eq!(items(&before["api.example.test:8080"]), 3);
-    assert_eq!(items(scope), 4);
-    assert!(
-        after
-            .endpoints()
-            .iter()
-            .all(|e| e.direction == mimic_core::discovery::report::Direction::Outbound)
-    );
-    wait(|| gauge("mimic_discovery_endpoints{direction=\"outbound\"}") == 1).await;
-    assert!(gauge("mimic_discovery_sample_bytes") > 0);
+    // Every outbound exchange is still in /discovery, none lost.
+    wait(|| rig.discovery.report().outbound_exchanges() == 3).await;
+    assert_eq!(rig.discovery.report().exchanges(), 3);
+    // The next interval tries version 2 again (the outbound part alone: nothing else posts).
+    wait(|| rig.api.count() >= 3).await;
+    assert_eq!(rig.api.versions()[2], (2, 2, 400));
+    wait(|| metric(&rig, INBOUND_ONLY) >= 2).await;
+    // A streak of fallbacks writes one line.
+    let lines = not_shipped(&logs).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "WARN");
+    assert_eq!(lines[0]["status"], 400);
+    assert!(lines[0].get("reason").is_none(), "{lines:?}");
+    assert_eq!(metric(&rig, DROPPED), 0);
+
+    // The fake accepts version 2: every outbound exchange recorded since the start, once.
+    rig.api.f7.store(false, Ordering::Relaxed);
+    wait(|| shipped_outbound(&rig) == 3).await;
+    let inbound: u64 = rig
+        .api
+        .reports(|s| s.status == 200)
+        .iter()
+        .map(|r| r.exchanges() - r.outbound_exchanges())
+        .sum();
+    assert_eq!(inbound, 2);
+    // The acknowledged version 2 push ended the streak: the next fallback writes again.
+    rig.api.f7.store(true, Ordering::Relaxed);
+    let before = metric(&rig, INBOUND_ONLY);
+    rig.outbound_call(9).await;
+    wait(|| metric(&rig, INBOUND_ONLY) > before).await;
+    assert_eq!(not_shipped(&logs).await.len(), 2);
+    for line in logs.text().lines() {
+        assert!(!line.contains(TOKEN), "{line}");
+    }
     drop(stop);
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shr_16_an_outbound_report_without_inbound_posts_nothing_after_the_400() {
+    let _logs = capture_logs();
+    let rig = Rig::new(vec![], INTERVAL, DiscoveryConfig::default()).await;
+    rig.api.f7.store(true, Ordering::Relaxed);
+    traffic(&rig, 0, 3).await;
+    let (stop, task) = rig.start();
+    wait(|| rig.api.count() >= 3).await;
+    // Only version 2 attempts, all of sequence 1: the next freeze uses the same sequence.
+    for post in rig.api.versions() {
+        assert_eq!(post, (1, 2, 400));
+    }
+    wait(|| rig.discovery.report().outbound_exchanges() == 3).await;
+    rig.api.f7.store(false, Ordering::Relaxed);
+    wait(|| rig.api.acknowledged() == 3).await;
+    let last = *rig.api.versions().last().unwrap();
+    assert_eq!(last, (1, 2, 200));
+    drop(stop);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shr_16_a_507_falls_back_the_same_way() {
+    let _logs = capture_logs();
+    let rig = Rig::new(
+        vec![Reply::Status(507)],
+        INTERVAL,
+        DiscoveryConfig::default(),
+    )
+    .await;
+    traffic(&rig, 2, 3).await;
+    let (stop, task) = rig.start();
+    wait(|| rig.api.count() >= 2).await;
+    let posts = rig.api.versions();
+    assert_eq!(posts[0], (1, 2, 507), "{posts:?}");
+    assert_eq!(posts[1], (1, 1, 200), "{posts:?}");
+    // Nothing is lost: the outbound part follows in version 2.
+    wait(|| shipped_outbound(&rig) == 3).await;
+    drop(stop);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shr_16_a_400_to_the_inbound_only_post_drops_it_with_one_warning() {
+    let logs = capture_logs();
+    let rig = Rig::new(
+        vec![Reply::Status(400), Reply::Status(400)],
+        INTERVAL,
+        DiscoveryConfig::default(),
+    )
+    .await;
+    traffic(&rig, 2, 3).await;
+    let (stop, task) = rig.start();
+    wait(|| rig.api.count() >= 2).await;
+    wait(|| metric(&rig, "mimic_discovery_pushes_total{result=\"rejected\"}") == 1).await;
+    let posts = rig.api.versions();
+    assert_eq!(posts[0], (1, 2, 400), "{posts:?}");
+    assert_eq!(posts[1], (1, 1, 400), "{posts:?}");
+    logs.settled().await;
+    let rejected: Vec<_> = logs
+        .text()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["message"] == "report rejected")
+        .collect();
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert_eq!(rejected[0]["status"], 400);
+    // The outbound part was kept: it is shipped by a later push.
+    wait(|| shipped_outbound(&rig) == 3).await;
+    drop(stop);
+    task.await.unwrap();
+}
+
+/// A version 2 report whose first attempt gets `first`, then `400`, then is acknowledged
+/// (the inbound-only post). Returns once that post is applied.
+async fn first_then_400(first: Reply) -> (Rig, common::Logs) {
+    let logs = capture_logs();
+    let rig = Rig::new(
+        vec![first, Reply::Status(400), Reply::Ok],
+        INTERVAL,
+        DiscoveryConfig::default(),
+    )
+    .await;
+    traffic(&rig, 2, 3).await;
+    let (stop, task) = rig.start();
+    // The three posts, the last one acknowledged (a `200` that the fake sends with a body that
+    // does not acknowledge is not).
+    wait(|| rig.api.count() >= 3).await;
+    wait(|| metric(&rig, "mimic_discovery_pushes_total{result=\"ok\"}") >= 1).await;
+    drop(stop);
+    task.await.unwrap();
+    (rig, logs)
+}
+
+#[tokio::test]
+async fn shr_16_after_an_unknown_first_attempt_a_400_drops_the_outbound_part() {
+    let (rig, logs) = first_then_400(Reply::Reset).await;
+    let posts = rig.api.versions();
+    assert_eq!(posts[0], (1, 2, 0), "{posts:?}");
+    assert_eq!(posts[1], (1, 2, 400), "{posts:?}");
+    assert_eq!(posts[2], (1, 1, 200), "{posts:?}");
+    // Dropped: not in /discovery, counted, and one WARN with the reason.
+    assert!(!holds_outbound(&rig.discovery.report()));
+    assert_eq!(rig.discovery.report().exchanges(), 0);
+    assert_eq!(metric(&rig, DROPPED), 1);
+    assert_eq!(metric(&rig, INBOUND_ONLY), 1);
+    let lines = not_shipped(&logs).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "WARN");
+    assert_eq!(lines[0]["reason"], "unknown_outcome");
+    assert_eq!(lines[0]["status"], 400);
+    // The inbound part is shipped once; the outbound exchanges are counted once overall: the
+    // fake applied them in the first attempt and nothing posts them again.
+    let applied = rig
+        .api
+        .reports(|s| s.status == 200 || s.status == 0 && outbound_scope_in(s));
+    assert_eq!(
+        applied.iter().map(Report::outbound_exchanges).sum::<u64>(),
+        3
+    );
+    let inbound = rig
+        .api
+        .reports(|s| s.status == 200 && !outbound_scope_in(s));
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].exchanges(), 2);
+    for line in logs.text().lines() {
+        assert!(!line.contains(TOKEN), "{line}");
+    }
+    // Later outbound traffic ships in version 2 again.
+    let (stop, task) = rig.start();
+    rig.outbound_call(7).await;
+    wait(|| shipped_outbound(&rig) == 1).await;
+    drop(stop);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shr_16_500_502_504_and_malformed_answers_are_unknown_outcomes() {
+    for first in [
+        Reply::Status(500),
+        Reply::Status(502),
+        Reply::Status(504),
+        Reply::Body("not json"),
+        Reply::Body("{\"applied\":\"yes\"}"),
+    ] {
+        let (rig, logs) = first_then_400(first).await;
+        assert!(!holds_outbound(&rig.discovery.report()), "{first:?}");
+        assert_eq!(metric(&rig, DROPPED), 1, "{first:?}");
+        let lines = not_shipped(&logs).await;
+        assert_eq!(lines.len(), 1, "{first:?} {lines:?}");
+        assert_eq!(lines[0]["reason"], "unknown_outcome", "{first:?}");
+    }
+}
+
+#[tokio::test]
+async fn shr_16_answered_attempts_before_the_400_keep_the_outbound_part() {
+    for first in [
+        Reply::Status(503),
+        Reply::Status(429),
+        Reply::Status(401),
+        Reply::Status(403),
+        Reply::Status(413),
+    ] {
+        let (rig, logs) = first_then_400(first).await;
+        assert_eq!(metric(&rig, DROPPED), 0, "{first:?}");
+        let lines = not_shipped(&logs).await;
+        assert_eq!(lines.len(), 1, "{first:?} {lines:?}");
+        assert!(lines[0].get("reason").is_none(), "{first:?} {lines:?}");
+        assert_eq!(lines[0]["status"], 400);
+    }
+}
+
+#[tokio::test]
+async fn shr_16_the_unknown_flag_persists_across_answered_retries_and_resets_on_a_new_sequence() {
+    let logs = capture_logs();
+    // Sequence 1: no answer, then 503 (answered), then 400: the first attempt is still
+    // unknown. The inbound-only post is applied. Sequence 2: its first attempt gets a 400.
+    let script = vec![
+        Reply::Reset,
+        Reply::Status(503),
+        Reply::Status(400),
+        Reply::Ok,
+        Reply::Status(400),
+        Reply::Ok,
+    ];
+    let rig = Rig::new(script, INTERVAL, DiscoveryConfig::default()).await;
+    traffic(&rig, 2, 3).await;
+    let (stop, task) = rig.start();
+    wait(|| rig.api.count() >= 1).await;
+    // Recorded while sequence 1 is pending: it is frozen as sequence 2.
+    traffic(&rig, 2, 2).await;
+    wait(|| rig.api.count() >= 6).await;
+    let posts = rig.api.versions();
+    assert_eq!(posts[0], (1, 2, 0), "{posts:?}");
+    assert_eq!(posts[1], (1, 2, 503), "{posts:?}");
+    assert_eq!(posts[2], (1, 2, 400), "{posts:?}");
+    assert_eq!(posts[3], (1, 1, 200), "{posts:?}");
+    assert_eq!(posts[4], (2, 2, 400), "{posts:?}");
+    assert_eq!(posts[5], (2, 1, 200), "{posts:?}");
+    // Sequence 1 dropped its outbound part, sequence 2 (answered) kept it.
+    assert_eq!(metric(&rig, DROPPED), 1);
+    wait(|| metric(&rig, INBOUND_ONLY) >= 2).await;
+    // Both cases apply, the unknown outcome first: its line wins and also warns the streak,
+    // so the plain fallback of sequence 2 writes none.
+    let lines = not_shipped(&logs).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["reason"], "unknown_outcome");
+    // The outbound exchanges of sequence 2 are shipped once, in version 2.
+    wait(|| shipped_outbound(&rig) == 2).await;
+    drop(stop);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shr_16_a_streak_line_and_a_sequence_line_are_each_written_once_per_event() {
+    let logs = capture_logs();
+    // Sequence 1: a plain fallback (the streak's line). Sequence 2: an unknown outcome in the
+    // same streak (the sequence's line, which carries `status` too): one line per event.
+    let script = vec![
+        Reply::Status(400),
+        Reply::Ok,
+        Reply::Reset,
+        Reply::Status(400),
+    ];
+    let rig = Rig::new(script, INTERVAL, DiscoveryConfig::default()).await;
+    traffic(&rig, 2, 3).await;
+    let (stop, task) = rig.start();
+    wait(|| metric(&rig, DROPPED) == 1).await;
+    let lines = not_shipped(&logs).await;
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].get("reason").is_none());
+    assert_eq!(lines[0]["status"], 400);
+    assert_eq!(lines[1]["reason"], "unknown_outcome");
+    assert_eq!(lines[1]["status"], 400);
+    // The inbound part of sequence 2 covers no exchange: nothing was posted. A replica may
+    // have applied sequence 2, so the next freeze does not use it again.
+    assert_eq!(rig.api.count(), 4, "{:?}", rig.api.versions());
+    rig.outbound_call(10).await;
+    wait(|| rig.api.acknowledged() >= 3).await;
+    let last = *rig.api.versions().last().unwrap();
+    assert_eq!(last, (3, 2, 200));
+    drop(stop);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn shr_16_the_sigterm_flush_falls_back_and_ships_the_inbound_part() {
+    let logs = capture_logs();
+    // The first report is pending (refused) when the signal comes; the flush gets a 400.
+    let script = vec![Reply::Status(503), Reply::Status(400)];
+    let rig = Rig::new(script, INTERVAL, DiscoveryConfig::default()).await;
+    traffic(&rig, 2, 3).await;
+    let (stop, task) = rig.start();
+    wait(|| rig.api.count() >= 1).await;
+    drop(stop);
+    let mut shipper = task.await.unwrap();
+    // The current report: one more inbound exchange and one more outbound.
+    rig.call("orders", 1).await;
+    rig.outbound_call(5).await;
+    wait(|| rig.discovery.report().exchanges() >= 2).await;
+    let begun = Instant::now();
+    shipper.flush(Duration::from_secs(5)).await;
+    assert!(
+        begun.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        begun.elapsed()
+    );
+    let posts = rig.api.versions();
+    assert_eq!(posts[0], (1, 2, 503), "{posts:?}");
+    assert_eq!(posts[1], (1, 2, 400), "{posts:?}");
+    assert_eq!(posts[2], (1, 1, 200), "{posts:?}");
+    // Then the current report, inbound only: the flush does not try version 2 again.
+    assert_eq!(posts[3], (2, 1, 200), "{posts:?}");
+    assert_eq!(posts.len(), 4, "{posts:?}");
+    let inbound: u64 = rig
+        .api
+        .reports(|s| s.status == 200)
+        .iter()
+        .map(Report::exchanges)
+        .sum();
+    assert_eq!(inbound, 3);
+    assert_eq!(metric(&rig, INBOUND_ONLY), 1);
+    let lines = not_shipped(&logs).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
 }
 
 // ---------------------------------------------------------------------------------------

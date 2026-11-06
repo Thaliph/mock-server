@@ -45,6 +45,10 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/usr/local/bin/mimic-controller"]
           env:
+            # Bounds the allocator's arenas: the controller holds reports of tens of megabytes
+            # (spec §7.3, SHR-18).
+            - name: MALLOC_ARENA_MAX
+              value: "2"
             - name: MIMIC_LOG
               value: {{ .Values.controller.logLevel | quote }}
             - name: MIMIC_ADMIN_ADDR

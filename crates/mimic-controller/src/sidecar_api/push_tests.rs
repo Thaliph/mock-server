@@ -73,8 +73,10 @@ struct Options {
     budget: u64,
     max_push: usize,
     max_endpoints: usize,
+    max_authorities: usize,
     max_deployments: usize,
     valkey: String,
+    sample_budget: usize,
     redact: &'static [&'static str],
 }
 
@@ -86,8 +88,10 @@ impl Default for Options {
             budget: 1 << 30,
             max_push: 256,
             max_endpoints: 256,
+            max_authorities: 64,
             max_deployments: 50,
             valkey: valkey_url(),
+            sample_budget: LIMITS.sample_budget,
             redact: &[],
         }
     }
@@ -109,6 +113,8 @@ fn setup(options: Options) -> Setup {
     let mut metrics = Metrics::new("controller", "test");
     let limits = Limits {
         max_endpoints: options.max_endpoints,
+        max_authorities: options.max_authorities,
+        sample_budget: options.sample_budget,
         ..LIMITS
     };
     let store = Store::new(
@@ -995,3 +1001,6 @@ async fn ctl_12_one_line_per_push_and_the_expected_metrics() {
         assert!(!exposition.contains(needle), "{needle} in the metrics");
     }
 }
+
+mod memory;
+mod v2;

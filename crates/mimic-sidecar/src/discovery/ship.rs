@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mimic_core::discovery::report::Report;
+use mimic_core::discovery::report::{Limits, Report};
 use mimic_core::proxy::tls::Backoff;
 use mimic_runtime::config::{ConfigError, Env};
 use serde::Serialize;
@@ -105,6 +105,9 @@ fn target(env: &Env, url: &str) -> Result<Target, ConfigError> {
 /// What the shipper takes from its [`super::Discovery`].
 pub(super) struct Parts {
     pub(super) report: Arc<Mutex<Report>>,
+    /// The outbound exchanges (spec §6.1), frozen with the report.
+    pub(super) egress: Arc<Mutex<Report>>,
+    pub(super) limits: Limits,
     pub(super) pod: Option<String>,
     pub(super) handoff: Arc<Handoff>,
     pub(super) budget: Arc<Budget>,
@@ -119,6 +122,9 @@ struct Pending {
     exchanges: u64,
     /// The samples were removed after a `413`.
     stripped: bool,
+    /// An attempt of this sequence had an unknown outcome (spec §7.2): a replica may have
+    /// applied it. Set for the life of the sequence, whatever the later answers.
+    unknown: bool,
 }
 
 #[derive(Serialize)]
@@ -132,6 +138,8 @@ struct Push<'a> {
 enum Attempt {
     /// Acknowledged, or dropped: the pending report is gone.
     Settled,
+    /// Post the pending report again at once: it was not applied and its body changed.
+    Again,
     /// Post again after this long (not at all when zero).
     Retry(Duration),
 }
@@ -149,7 +157,14 @@ enum Answer {
         retry_after: Option<Duration>,
         applied: bool,
     },
-    Error(String),
+    /// No answer. `sent`: the body may have reached a replica, which may have applied it.
+    Error { message: String, sent: bool },
+}
+
+/// Statuses that say nothing was applied: a controller answers them before it merges, or
+/// refuses the push whole (spec §7.2). Any other answer leaves the outcome unknown.
+fn applied_nothing(code: u16) -> bool {
+    matches!(code, 400 | 401 | 403 | 405 | 413 | 429 | 503 | 507)
 }
 
 /// Ships the report of one [`super::Discovery`].
@@ -165,6 +180,11 @@ pub struct Shipper {
     backoff: Backoff,
     /// Failed attempts of the current streak, 0 outside one.
     failures: u32,
+    /// The streak of fallbacks has written its `outbound not shipped` line; an acknowledged
+    /// version 2 push ends it.
+    fallback_logged: bool,
+    /// Fallbacks so far.
+    fallbacks: u64,
 }
 
 fn unix_now() -> u64 {
@@ -188,6 +208,8 @@ impl Shipper {
             pending: None,
             backoff: Backoff::default(),
             failures: 0,
+            fallback_logged: false,
+            fallbacks: 0,
         })
     }
 
@@ -205,10 +227,10 @@ impl Shipper {
         let first = rand::random_range(0..=self.interval.as_millis().max(1) as u64);
         sleep(Duration::from_millis(first)).await;
         loop {
-            self.freeze();
+            self.freeze(true);
             while self.pending.is_some() {
                 match self.attempt().await {
-                    Attempt::Settled => {}
+                    Attempt::Settled | Attempt::Again => {}
                     Attempt::Retry(wait) => sleep(wait).await,
                 }
             }
@@ -225,14 +247,28 @@ impl Shipper {
         while !self.parts.budget.idle() && Instant::now() < settle {
             sleep(Duration::from_millis(10)).await;
         }
+        // Version 2 is tried once more; after a fallback only the inbound part is frozen, so
+        // the flush does not post the outbound part again and again.
+        let mut outbound = true;
         loop {
-            self.freeze();
+            self.freeze(outbound);
             if self.pending.is_none() {
+                if !outbound {
+                    let held = self.held_exchanges();
+                    if held > 0 {
+                        tracing::warn!(target: "discovery", exchanges = held, "report not shipped");
+                    }
+                }
                 return;
             }
-            match timeout_at(deadline, self.attempt()).await {
+            let fallbacks = self.fallbacks;
+            let attempt = timeout_at(deadline, self.attempt()).await;
+            if self.fallbacks != fallbacks {
+                outbound = false;
+            }
+            match attempt {
                 Err(_) => break,
-                Ok(Attempt::Settled) => {}
+                Ok(Attempt::Settled | Attempt::Again) => {}
                 Ok(Attempt::Retry(_)) => {
                     // The kubelet may stop the process well before the deadline: no backoff and no
                     // `Retry-After`, a fixed pause (never shorter, so a `Retry-After: 0` cannot spin).
@@ -244,23 +280,35 @@ impl Shipper {
                 }
             }
         }
+        tracing::warn!(
+            target: "discovery",
+            exchanges = self.held_exchanges(),
+            "report not shipped"
+        );
+    }
+
+    /// Exchanges of the pending, the current and the egress report.
+    fn held_exchanges(&self) -> u64 {
         let current = self
             .parts
             .report
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .exchanges();
+        let egress = self
+            .parts
+            .egress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .exchanges();
         let pending = self.pending.as_ref().map_or(0, |p| p.exchanges);
-        tracing::warn!(
-            target: "discovery",
-            exchanges = pending.saturating_add(current),
-            "report not shipped"
-        );
+        pending.saturating_add(current).saturating_add(egress)
     }
 
-    /// Freezes the current report into the pending one, when nothing is pending and an
-    /// exchange was recorded.
-    fn freeze(&mut self) {
+    /// Freezes the current report, with the egress report when `outbound`, into the pending
+    /// one, when nothing is pending and an exchange (or, from F8, an outbound tunnel) was
+    /// recorded.
+    fn freeze(&mut self, outbound: bool) {
         if self.pending.is_some() {
             return;
         }
@@ -270,15 +318,37 @@ impl Shipper {
                 .report
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if report.exchanges() == 0 {
+            // Never held together by the recorder, which takes them one after the other.
+            let mut egress = self
+                .parts
+                .egress
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let outbound = outbound && egress.authorities() > 0;
+            if report.exchanges() == 0 && !outbound {
                 return;
             }
-            let frozen = std::mem::replace(&mut *report, Report::new(self.parts.pod.clone()));
-            // Under the lock: the recorder reads them there.
+            let mut frozen = std::mem::replace(&mut *report, Report::new(self.parts.pod.clone()));
             let handoff = &self.parts.handoff;
+            // Under the locks: the recorder reads them there.
+            let mut outbound_samples = 0;
+            if outbound {
+                let part = std::mem::replace(&mut *egress, Report::new(self.parts.pod.clone()));
+                outbound_samples = part.sample_bytes();
+                frozen.merge(&self.parts.limits, part);
+                handoff.egress_samples.store(0, Ordering::Release);
+                handoff
+                    .egress_keys
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clear();
+            }
             handoff
                 .pending_samples
                 .store(frozen.sample_bytes(), Ordering::Release);
+            handoff
+                .pending_egress_samples
+                .store(outbound_samples, Ordering::Release);
             *handoff
                 .pending_keys
                 .lock()
@@ -294,6 +364,7 @@ impl Shipper {
             body: Bytes::new(),
             report: frozen,
             stripped: false,
+            unknown: false,
         });
         self.encode();
     }
@@ -339,6 +410,7 @@ impl Shipper {
             .unwrap_or_else(PoisonError::into_inner);
         let handoff = &self.parts.handoff;
         handoff.pending_samples.store(0, Ordering::Release);
+        handoff.pending_egress_samples.store(0, Ordering::Release);
         if gone {
             handoff
                 .pending_keys
@@ -391,7 +463,17 @@ impl Shipper {
                 }
                 self.release(false);
                 self.encode();
-                Attempt::Retry(Duration::ZERO)
+                Attempt::Again
+            }
+            Answer::Status {
+                code: code @ (400 | 507),
+                ..
+            } if self
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.report.version() == 2) =>
+            {
+                self.fall_back(code)
             }
             Answer::Status {
                 code: code @ (400 | 405 | 413 | 507),
@@ -414,14 +496,170 @@ impl Shipper {
             Answer::Status {
                 code, retry_after, ..
             } => {
+                if !applied_nothing(code) {
+                    self.unknown_outcome();
+                }
                 let wait = self.failed(Some(code), None);
                 Attempt::Retry(wait.max(retry_after.unwrap_or_default()))
             }
-            Answer::Error(error) => Attempt::Retry(self.failed(None, Some(error))),
+            Answer::Error { message, sent } => {
+                if sent {
+                    self.unknown_outcome();
+                }
+                Attempt::Retry(self.failed(None, Some(message)))
+            }
         }
     }
 
+    /// An attempt of the pending sequence may have been applied (spec §7.2).
+    fn unknown_outcome(&mut self) {
+        if let Some(pending) = &mut self.pending {
+            pending.unknown = true;
+        }
+    }
+
+    /// Fallback to inbound only (spec §7.2): a `400` or `507` to a version 2 report. The
+    /// outbound part goes back into the egress report, unless an attempt of the sequence had
+    /// an unknown outcome: it is dropped then, so that it is never counted twice. The inbound
+    /// part is posted at once, with the same sequence.
+    fn fall_back(&mut self, status: u16) -> Attempt {
+        let Some(pending) = &mut self.pending else {
+            return Attempt::Settled;
+        };
+        let sequence = pending.sequence;
+        let unknown = pending.unknown;
+        let (inbound, outbound) = pending.report.split();
+        let outbound = outbound.unwrap_or_else(|| Report::new(None));
+        let lost = outbound.exchanges();
+        self.fallbacks += 1;
+        self.parts.metrics.push("inbound_only");
+        // A controller answered: the streak of failures is over.
+        self.backoff.success();
+        self.failures = 0;
+        let posted = inbound.exchanges() > 0;
+        if posted {
+            pending.exchanges = inbound.exchanges();
+            pending.report = inbound;
+            self.hold_pending();
+            self.encode();
+        } else {
+            // Nothing to post. The next freeze uses the sequence again, unless a replica may
+            // have applied it: it would answer `applied: false` to other data.
+            self.settle();
+            if !unknown {
+                self.sequence -= 1;
+            }
+        }
+        if unknown {
+            self.parts.metrics.outbound_dropped();
+            // The sequence's line also stands for the streak's: one line per event.
+            self.fallback_logged = true;
+            tracing::warn!(
+                target: "discovery",
+                status,
+                sequence,
+                exchanges = lost,
+                reason = "unknown_outcome",
+                "outbound not shipped"
+            );
+        } else {
+            self.restore(outbound);
+            if !self.fallback_logged {
+                self.fallback_logged = true;
+                tracing::warn!(
+                    target: "discovery",
+                    status,
+                    sequence,
+                    "outbound not shipped"
+                );
+            }
+        }
+        if posted {
+            Attempt::Again
+        } else {
+            Attempt::Settled
+        }
+    }
+
+    /// Moves an outbound part back into the egress report, within the sidecar bounds: a
+    /// later push ships it.
+    fn restore(&self, outbound: Report) {
+        let report = self
+            .parts
+            .report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut egress = self
+            .parts
+            .egress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let handoff = &self.parts.handoff;
+        // As the recorder: half of the budget for outbound samples, and what the inbound and
+        // pending samples leave.
+        let budget = self.parts.limits.sample_budget;
+        let inbound = report
+            .sample_bytes()
+            .saturating_add(handoff.pending_samples.load(Ordering::Acquire));
+        let cap = (budget / 2)
+            .saturating_sub(handoff.pending_egress_samples.load(Ordering::Acquire))
+            .min(budget.saturating_sub(inbound));
+        let limits = Limits {
+            sample_budget: cap.saturating_mul(2),
+            ..self.parts.limits
+        };
+        egress.merge(&limits, outbound);
+        handoff
+            .egress_samples
+            .store(egress.sample_bytes(), Ordering::Release);
+        *handoff
+            .egress_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = recorder::keys(&egress);
+        recorder::publish(
+            &self.parts.metrics,
+            handoff,
+            &report,
+            &recorder::keys(&report),
+        );
+    }
+
+    /// The pending report was reduced to its inbound part: the gauges and the budget follow.
+    fn hold_pending(&self) {
+        let Some(pending) = &self.pending else {
+            return;
+        };
+        let report = self
+            .parts
+            .report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let handoff = &self.parts.handoff;
+        handoff
+            .pending_samples
+            .store(pending.report.sample_bytes(), Ordering::Release);
+        handoff.pending_egress_samples.store(0, Ordering::Release);
+        *handoff
+            .pending_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = recorder::keys(&pending.report);
+        recorder::publish(
+            &self.parts.metrics,
+            handoff,
+            &report,
+            &recorder::keys(&report),
+        );
+    }
+
     fn acknowledged(&mut self) {
+        // An acknowledged version 2 push ends the streak of fallbacks.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.report.version() == 2)
+        {
+            self.fallback_logged = false;
+        }
         self.settle();
         self.backoff.success();
         if self.failures > 0 {
@@ -452,7 +690,12 @@ impl Shipper {
     async fn post(&self, body: Bytes) -> Answer {
         let token = match tokio::fs::read_to_string(&self.target.token_file).await {
             Ok(token) => token,
-            Err(e) => return Answer::Error(format!("token file: {}", e.kind())),
+            Err(e) => {
+                return Answer::Error {
+                    message: format!("token file: {}", e.kind()),
+                    sent: false,
+                };
+            }
         };
         let url = format!(
             "{}/v1/workloads/{}/report",
@@ -469,7 +712,13 @@ impl Shipper {
         let response = match response {
             Ok(response) => response,
             // Without the URL: it is the configured one, and nothing else is useful here.
-            Err(e) => return Answer::Error(e.without_url().to_string()),
+            // The body reached no replica when the connection was not made.
+            Err(e) => {
+                return Answer::Error {
+                    sent: !e.is_connect(),
+                    message: e.without_url().to_string(),
+                };
+            }
         };
         let code = response.status().as_u16();
         let retry_after = response
@@ -482,14 +731,24 @@ impl Shipper {
             // An acknowledgement says whether it applied the report: nothing else settles it.
             let bytes = match answer {
                 Ok(bytes) => bytes,
-                Err(e) => return Answer::Error(e),
+                Err(message) => {
+                    return Answer::Error {
+                        message,
+                        sent: true,
+                    };
+                }
             };
             match serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
                 .and_then(|v| v["applied"].as_bool())
             {
                 Some(applied) => applied,
-                None => return Answer::Error("unreadable answer".to_string()),
+                None => {
+                    return Answer::Error {
+                        message: "unreadable answer".to_string(),
+                        sent: true,
+                    };
+                }
             }
         } else {
             false

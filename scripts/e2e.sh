@@ -27,6 +27,18 @@ PIDS=()
 DERIVED=()
 WORK=""
 
+# found <grep args>: 0 on a match, 1 on none; an error of grep (status 2: unreadable file, bad
+# pattern) stops the script instead of reading as "no match". The arguments are not printed.
+found() {
+  local status=0
+  grep "$@" >/dev/null || status=$?
+  if (( status > 1 )); then
+    echo "FAIL grep exited with status $status" >&2
+    exit 1
+  fi
+  return "$status"
+}
+
 # kill_tree <pid>: the process and everything it started.
 kill_tree() {
   local children child
@@ -52,7 +64,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! kind get clusters | grep -x "$CLUSTER" >/dev/null; then
+clusters=$(kind get clusters) || { echo "FAIL kind get clusters failed" >&2; exit 1; }
+if ! found -x "$CLUSTER" <<<"$clusters"; then
   log "create kind cluster $CLUSTER"
   node_args=()
   [[ -z ${NODE_IMAGE:-} ]] || node_args=(--image "$NODE_IMAGE")
@@ -152,7 +165,8 @@ YAML
 # below is the NetworkPolicy and not a broken probe.
 probe "$NS" "app.kubernetes.io/instance: $RELEASE, app.kubernetes.io/name: mimic-controller" | grep PONG >/dev/null \
   || fail "fnd_08: probe with the controller labels could not reach Valkey"
-if probe default "app: probe" | grep PONG >/dev/null; then
+outside=$(probe default "app: probe")
+if found PONG <<<"$outside"; then
   fail "fnd_08: a pod outside the controller reached Valkey"
 fi
 
@@ -807,10 +821,11 @@ sidecar_metrics() { sidecar_get "$1" "$2" /metrics; }
 # ready_tls <client>: waits until the client's sidecar holds an intermediate (TLS-15). Before that the
 # sidecar passes TLS through (`no_ca`), which would hide what the checks below look for.
 ready_tls() {
-  local pod
+  local pod metrics
   pod=$(tls_pod "$1")
   for _ in $(seq 90); do
-    if sidecar_metrics tls-clients "$pod" | grep -Eq '^mimic_tls_intermediate_expiry_timestamp_seconds [1-9]'; then
+    metrics=$(sidecar_metrics tls-clients "$pod") || metrics=""
+    if found -E '^mimic_tls_intermediate_expiry_timestamp_seconds [1-9]' <<<"$metrics"; then
       return 0
     fi
     sleep 1
@@ -1180,9 +1195,9 @@ logs="$WORK/all.log"
   done
   for p in $(kubectl -n tls-clients get pods -o name); do kubectl -n tls-clients logs "$p" --all-containers; done
 } > "$logs"
-grep -F -q "$token" "$logs" && fail "tls_26: the projected token appears in a log line"
-grep -F -q "$pubkey" "$logs" && fail "tls_26: the posted public key appears in a log line"
-grep -q 'PRIVATE KEY' "$logs" && fail "tls_26: a PRIVATE KEY appears in a log line"
+if found -F "$token" "$logs"; then fail "tls_26: the projected token appears in a log line"; fi
+if found -F "$pubkey" "$logs"; then fail "tls_26: the posted public key appears in a log line"; fi
+if found 'PRIVATE KEY' "$logs"; then fail "tls_26: a PRIVATE KEY appears in a log line"; fi
 grep -q '"target":"sidecar_api"' "$logs" || fail "tls_26: no sidecar_api log line"
 
 log "tls_24: the seed survives a controller restart; the test namespaces are removed"
@@ -1314,9 +1329,10 @@ canaries=("$token" "$tenant" "$secret")
 # until each pod has logged a request of its own, so that the calls below reach both pods. The
 # readiness probes log /users/0 (from the pod itself), so the warm-up path is /users/9999 (numeric, so that it joins the {users_id} template).
 warm_seen() {
-  local seen=0 p
+  local seen=0 p app_log
   for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}'); do
-    if (( $(kubectl -n disc-22 logs "$p" -c app | grep -c '"path": "/users/9999"' || true) > 0 )); then seen=$((seen + 1)); fi
+    app_log=$(kubectl -n disc-22 logs "$p" -c app) || fail "disc_22: cannot read the log of $p"
+    if found -F '"path": "/users/9999"' <<<"$app_log"; then seen=$((seen + 1)); fi
   done
   echo "$seen"
 }
@@ -1452,7 +1468,7 @@ kubectl -n disc-22 get mimicworkload users-a -o json --show-managed-fields \
 # No canary in any /discovery output or pod log (DSC-22, DSC-15).
 for p in $dsc_pods; do
   for c in "${canaries[@]}"; do
-    if grep -F "$c" "$WORK/discovery-$p.json" >/dev/null; then fail "dsc_22: a canary appears in the /discovery of $p"; fi
+    if found -F "$c" "$WORK/discovery-$p.json"; then fail "dsc_22: a canary appears in the /discovery of $p"; fi
   done
 done
 {
@@ -1461,16 +1477,16 @@ done
   kubectl -n disc-22-client logs client
 } > "$WORK/dsc22.log"
 for c in "${canaries[@]}"; do
-  if grep -F "$c" "$WORK/dsc22.log" >/dev/null; then fail "dsc_22: a canary appears in a pod log"; fi
+  if found -F "$c" "$WORK/dsc22.log"; then fail "dsc_22: a canary appears in a pod log"; fi
 done
 # The merged report, every value in Valkey and the controller's logs hold no canary either (CTL-20).
 valkey_dump > "$WORK/valkey.dump" || fail "ctl_20: cannot read the Valkey values"
 [[ -s $WORK/valkey.dump ]] || fail "ctl_20: the Valkey dump is empty"
 kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/controller.log"
 for c in "${canaries[@]}"; do
-  if grep -F "$c" "$WORK/merged.json" >/dev/null; then fail "ctl_20: a canary appears in the merged report"; fi
-  if grep -F "$c" "$WORK/valkey.dump" >/dev/null; then fail "ctl_20: a canary appears in a Valkey value"; fi
-  if grep -F "$c" "$WORK/controller.log" >/dev/null; then fail "ctl_20: a canary appears in the controller logs"; fi
+  if found -F "$c" "$WORK/merged.json"; then fail "ctl_20: a canary appears in the merged report"; fi
+  if found -F "$c" "$WORK/valkey.dump"; then fail "ctl_20: a canary appears in a Valkey value"; fi
+  if found -F "$c" "$WORK/controller.log"; then fail "ctl_20: a canary appears in the controller logs"; fi
 done
 # The logs explain the traffic: B logs its GETs, A logs its forwarded calls.
 jq -R -e 'fromjson? | select(.app == "users" and .method == "GET" and .status == 200 and (.path | startswith("/users/")))' \
@@ -1678,11 +1694,11 @@ jq -e '[.endpoints[] | select(.method == "GET") | .exchanges] | add >= 40' "$WOR
 for page in / /ui/ /ui/workloads/disc-22/users /ui/workloads/disc-22/users/openapi/inbound-8080; do
   curl -s "$ui_url$page" > "$WORK/ui-page.html" || fail "ui_11: cannot read $page"
   for c in "${canaries[@]}"; do
-    if grep -F "$c" "$WORK/ui-page.html" >/dev/null; then fail "ui_11: a canary appears in the page $page"; fi
+    if found -F "$c" "$WORK/ui-page.html"; then fail "ui_11: a canary appears in the page $page"; fi
   done
 done
 for c in "${canaries[@]}"; do
-  if grep -F "$c" "$WORK/ui-doc.json" "$WORK/ui-endpoints.json" >/dev/null; then fail "ui_11: a canary appears in the document or the endpoint list"; fi
+  if found -F "$c" "$WORK/ui-doc.json" "$WORK/ui-endpoints.json"; then fail "ui_11: a canary appears in the document or the endpoint list"; fi
 done
 [[ $(curl -s -I -o /dev/null -w '%{http_code}' "$ui_url/ui/") == 200 ]] || fail "ui_11: HEAD /ui/ is not 200"
 [[ $(curl -s -o /dev/null -w '%{http_code}' -X POST "$ui_url/ui/") == 405 ]] || fail "ui_11: POST /ui/ is not 405"
@@ -1691,9 +1707,9 @@ curl -s -D "$WORK/ui-headers.txt" -o /dev/null "$ui_url/ui/" || fail "ui_11: can
 tr -d '\r' < "$WORK/ui-headers.txt" | tr 'A-Z' 'a-z' > "$WORK/ui-headers.lower"
 for h in "x-content-type-options: nosniff" "referrer-policy: no-referrer" "x-frame-options: deny" "cache-control: no-store" \
   "content-security-policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"; do
-  if ! grep -Fx "$h" "$WORK/ui-headers.lower" >/dev/null; then fail "ui_11: /ui/ lacks the header '$h'"; fi
+  if ! found -Fx "$h" "$WORK/ui-headers.lower"; then fail "ui_11: /ui/ lacks the header '$h'"; fi
 done
-if grep -F 'access-control-allow' "$WORK/ui-headers.lower" >/dev/null; then fail "ui_11: /ui/ has an Access-Control-Allow header"; fi
+if found -F 'access-control-allow' "$WORK/ui-headers.lower"; then fail "ui_11: /ui/ has an Access-Control-Allow header"; fi
 
 log "ui_12: a pinned headless Chromium, with no name but localhost resolvable, loads the pages"
 CHROME_IMAGE=$(scripts/pinned-image.sh e2e-chromium)
@@ -1783,7 +1799,7 @@ docker rm -f "$CHROME" >/dev/null 2>&1 || true
 # --- Egress discovery (F7, spec §6.1, §12.8 EGR-19) -----------------------------------------------------------------------
 # A second front, injected, in its own namespace: its sidecar records A's calls to B (users, disc-22). It runs after
 # CTL-20 and CTL-21, whose counts of users it would change.
-log "egr_19: the sidecar of an injected front records its calls to users as outbound discovery, redacted, and pushes inbound only"
+log "egr_19: the sidecar of an injected front records its calls to users as outbound discovery, redacted, and pushes both directions"
 ns_fresh egr-19 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
 kubectl -n egr-19 create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py >/dev/null
 kubectl -n egr-19 apply -f scripts/e2e/apps/front-injected.yaml >/dev/null
@@ -1874,23 +1890,30 @@ done
 sidecar_get egr-19 "$egr_pod" /metrics > "$egr_metrics"
 [[ -s $egr_metrics ]] || fail "egr_19: cannot read the metrics of the sidecar of front"
 
-egr_check_outbound() {
-  sidecar_get egr-19 "$egr_pod" /discovery > "$egr_report"
-  [[ -s $egr_report ]] || fail "egr_19: cannot read /discovery of the sidecar of front"
-  # The outbound part is neither shipped nor reset by a push: all three canaries are checked against it, and the
-  # bearer token and the password against the whole report (the inbound X-Tenant-Key of an unlisted header is the
-  # accepted limit of spec §11.1).
-  jq -e '.scopes.outbound | type == "object"' "$egr_report" >/dev/null || fail "egr_19: /discovery of front has no scopes.outbound"
-  jq '.scopes.outbound' "$egr_report" > "$WORK/egr19-outbound.json"
+# Canaries in a report ($1, named $2): all three are checked against its outbound part, the bearer token and the
+# password against the whole report (the inbound X-Tenant-Key of an unlisted header is the accepted limit of §11.1).
+egr_check_canaries() {
+  jq '.scopes.outbound // {}' "$1" > "$WORK/egr19-outbound.json"
   local c
   for c in "${egr_canaries[@]}"; do
-    if grep -F "$c" "$WORK/egr19-outbound.json" >/dev/null; then fail "egr_19: a canary appears in scopes.outbound of front"; fi
+    if found -F "$c" "$WORK/egr19-outbound.json"; then fail "egr_19: a canary appears in scopes.outbound of $2"; fi
   done
   for c in "$egr_token" "$egr_secret"; do
-    if grep -F "$c" "$egr_report" >/dev/null; then fail "egr_19: the bearer token or the password appears in /discovery of front"; fi
+    if found -F "$c" "$1"; then fail "egr_19: the bearer token or the password appears in $2"; fi
   done
+}
+# /discovery holds only what the sidecar has not shipped yet (SHR-19): it is checked for canaries only.
+egr_check_discovery() {
+  sidecar_get egr-19 "$egr_pod" /discovery > "$egr_report"
+  [[ -s $egr_report ]] || fail "egr_19: cannot read /discovery of the sidecar of front"
+  egr_check_canaries "$egr_report" "/discovery of front"
+}
+# The outbound endpoints, counts, histograms, origin and samples of a report ($1): the merged report from F8.
+egr_check_outbound() {
+  local egr_report=$1
+  jq -e '.scopes.outbound | type == "object"' "$egr_report" >/dev/null || fail "egr_19: the merged report of front has no scopes.outbound"
   jq -e --arg a "$egr_authority" '.scopes.outbound[$a] | type == "object"' "$egr_report" >/dev/null \
-    || fail "egr_19: no scopes.outbound.\"$egr_authority\" in /discovery of front"
+    || fail "egr_19: no scopes.outbound.\"$egr_authority\" in the merged report of front"
   jq -e '(.scopes.outbound | keys) | length == 1' "$egr_report" >/dev/null \
     || fail "egr_19: front has outbound scopes other than users: $(jq -c '.scopes.outbound | keys' "$egr_report")"
   [[ $(endpoints "$egr_report" | jq -r --arg a "$egr_authority" '.[] | select(.direction == "outbound") | select(.port == $a) | "\(.method) \(.template)"' | sort | tr '\n' ';') \
@@ -1923,31 +1946,32 @@ egr_check_outbound() {
   endpoints "$egr_report" | jq -e '.[] | select(.direction == "outbound" and .method == "PUT" and .template == "/users/{users_id}")
     | select((.stats.samples | length) > 0)' >/dev/null || fail "egr_19: the outbound PUT has no sample"
 }
-egr_check_outbound
+egr_check_discovery
 [[ $(awk 'index($0, "mimic_discovery_authorities ") == 1 { printf "%d\n", $2 }' "$egr_metrics" | tail -1) == 1 ]] \
   || fail "egr_19: mimic_discovery_authorities is not 1 on front"
 [[ $(awk 'index($0, "mimic_discovery_exchanges_total{direction=\"outbound\"") == 1 { n += $2 } END { printf "%d\n", n }' "$egr_metrics") == 17 ]] \
   || fail "egr_19: the outbound exchanges of front do not sum to 17"
 
-# Pushes stay inbound only (F7): the controller's merged report of front holds inbound endpoints and nothing else,
-# once a push that follows the calls arrived; the outbound part is still in the sidecar afterwards (never reset).
+# Pushes carry both directions (F8, SHR-19): the controller's merged report of front holds the 12 inbound GETs and
+# the 17 outbound exchanges once the pushes that follow the calls arrived; the sidecar resets what it shipped.
 ui_forward
 egr_merged="$WORK/egr19-merged.json"
 egr_merged_get() {
   curl -fs --max-time 10 localhost:18082/v1/workloads/egr-19/front/report > "$egr_merged" 2>/dev/null || return 1
-  endpoints "$egr_merged" | jq -e '[.[] | select(.direction == "inbound" and .method == "GET" and (.template | startswith("/front/users/"))) | .stats.statuses["200"] // 0] | add == 12' >/dev/null
+  endpoints "$egr_merged" | jq -e '[.[] | select(.direction == "inbound" and .method == "GET" and (.template | startswith("/front/users/"))) | .stats.statuses["200"] // 0] | add == 12' >/dev/null \
+    && jq -e --arg a "$egr_authority" '.scopes.outbound[$a].origin.schemes.http == 17' "$egr_merged" >/dev/null
 }
 egr_pushed=0
 for _ in $(seq 60); do
   if egr_merged_get; then egr_pushed=1; break; fi
   sleep 3
 done
-(( egr_pushed )) || fail "egr_19: the controller holds no report of front with its 12 inbound GETs after 180 s"
-jq -e '.version == 1 and ((.scopes | keys) == ["inbound"])' "$egr_merged" >/dev/null \
-  || fail "egr_19: the merged report of front is not version 1 with inbound scopes only: $(jq -c '[.version, (.scopes | keys)]' "$egr_merged")"
-[[ $(endpoints "$egr_merged" | jq -r '[.[] | select(.direction == "outbound")] | length') == 0 ]] \
-  || fail "egr_19: the merged report of front holds outbound endpoints"
-egr_check_outbound
+(( egr_pushed )) || fail "egr_19: the controller holds no report of front with its 12 inbound GETs and 17 outbound exchanges after 180 s"
+jq -e '.version == 2 and ((.scopes | keys) == ["inbound", "outbound"])' "$egr_merged" >/dev/null \
+  || fail "egr_19: the merged report of front is not version 2 with inbound and outbound scopes: $(jq -c '[.version, (.scopes | keys)]' "$egr_merged")"
+egr_check_outbound "$egr_merged"
+egr_check_canaries "$egr_merged" "the merged report of front"
+egr_check_discovery
 
 # No canary where the outbound view or the stdout rules apply: scopes.outbound (checked above, before and after the
 # push), /metrics, the stdout of front (app and sidecar) and B's logs hold none of the three. The inbound parts (the
@@ -1963,12 +1987,12 @@ valkey_dump > "$WORK/egr19-valkey.dump" || fail "egr_19: cannot read the Valkey 
 [[ -s $WORK/egr19-valkey.dump ]] || fail "egr_19: the Valkey dump is empty"
 for c in "${egr_canaries[@]}"; do
   for f in "$WORK/egr19-outbound.json" "$egr_metrics" "$WORK/egr19-front.log" "$WORK/egr19-users.log"; do
-    if grep -F "$c" "$f" >/dev/null; then fail "egr_19: a canary appears in ${f##*/}"; fi
+    if found -F "$c" "$f"; then fail "egr_19: a canary appears in ${f##*/}"; fi
   done
 done
 for c in "$egr_token" "$egr_secret"; do
   for f in "$egr_merged" "$WORK/egr19-valkey.dump"; do
-    if grep -F "$c" "$f" >/dev/null; then fail "egr_19: the bearer token or the password appears in ${f##*/}"; fi
+    if found -F "$c" "$f"; then fail "egr_19: the bearer token or the password appears in ${f##*/}"; fi
   done
 done
 
