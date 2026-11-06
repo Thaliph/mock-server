@@ -21,6 +21,7 @@ use base64::Engine;
 use futures::StreamExt;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use kube::api::{Api, PostParams};
+use mimic_core::discovery::check::Violation;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::Report;
 use mimic_core::identity::pod_of_deployment;
@@ -664,16 +665,25 @@ fn prepare(
         let hex = SeqId::parse(&request.session, 1).is_ok();
         return (None, Err(invalid(if hex { "sequence" } else { "session" })));
     };
-    let report = Report::parse_checked(request.report.get(), max_push_endpoints).map_err(|v| {
-        if v.is_push_limit() {
-            Refusal {
-                reason: Some(v.reason()),
-                ..PUSH_LIMIT
+    let report = Report::parse_checked(request.report.get(), max_push_endpoints, usize::MAX)
+        .map_err(|v| {
+            if v.is_push_limit() {
+                Refusal {
+                    reason: Some(v.reason()),
+                    ..PUSH_LIMIT
+                }
+            } else {
+                invalid(v.reason())
             }
-        } else {
-            invalid(v.reason())
-        }
-    });
+        })
+        // The store holds no `:outbound` key yet (F8 step 5): version 2 stays refused here.
+        .and_then(|report| {
+            if report.version() == 1 {
+                Ok(report)
+            } else {
+                Err(invalid(Violation::Version.reason()))
+            }
+        });
     let report = report.map(|mut report| {
         report.re_redact(&Redactor::new(extra.iter().map(String::as_str)));
         let today = SystemTime::now()

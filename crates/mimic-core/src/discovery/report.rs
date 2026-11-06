@@ -198,13 +198,20 @@ impl Origin {
     }
 
     /// Within the bounds of §6.1: what a sidecar can have recorded.
-    fn within_bounds(&self) -> bool {
-        self.schemes
+    fn check(&self) -> Result<(), Violation> {
+        let plain = self
+            .schemes
             .keys()
             .all(|s| matches!(s.as_str(), "http" | "https"))
             && self.sni.len() <= MAX_ORIGINS
             && self.dst.len() <= MAX_ORIGINS
-            && self.sni.iter().chain(&self.dst).all(|v| v.len() <= 261)
+            && self.sni.iter().all(|v| scope::valid_sni(v))
+            && self.dst.iter().all(|v| scope::valid_dst(v));
+        if plain {
+            Ok(())
+        } else {
+            Err(Violation::Origin)
+        }
     }
 
     fn merge(&mut self, other: Origin) {
@@ -594,16 +601,25 @@ impl Scope {
 }
 
 impl Scope {
-    /// `origin` and `tunnels` only on outbound scopes, within their bounds.
-    fn egress_valid(&self, outbound: bool) -> bool {
+    /// `origin` and `tunnels` only on outbound scopes, within their bounds; no `hosts` on an
+    /// outbound endpoint.
+    fn egress_check(&self, outbound: bool) -> Result<(), Violation> {
         if !outbound {
-            return self.origin.is_none() && self.tunnels.is_none();
+            return if self.origin.is_none() && self.tunnels.is_none() {
+                Ok(())
+            } else {
+                Err(Violation::Malformed)
+            };
         }
-        self.origin.as_ref().is_none_or(Origin::within_bounds)
-            && self
-                .tunnels
-                .as_ref()
-                .is_none_or(|t| t.keys().all(|k| TUNNEL_KINDS.contains(&k.as_str())))
+        self.origin.as_ref().map_or(Ok(()), Origin::check)?;
+        if let Some(tunnels) = &self.tunnels
+            && !tunnels.keys().all(|k| TUNNEL_KINDS.contains(&k.as_str()))
+        {
+            return Err(Violation::Tunnels);
+        }
+        let mut hosts = false;
+        self.for_each_stats(&mut |s| hosts |= !s.hosts.is_empty());
+        if hosts { Err(Violation::Hosts) } else { Ok(()) }
     }
 
     /// The value detectors again on the literal segments and the gRPC paths; keys that become
@@ -1190,17 +1206,32 @@ impl Report {
         self.stats_at(&routed).map(|_| routed)
     }
 
+    /// 1, or 2 when the report holds outbound scopes (spec §6.1).
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
     /// Within the bounds of spec §6 and, per direction, at most `max_push_endpoints`
     /// endpoints: what the recorder of a sidecar can produce (spec §7.3, structural check).
-    pub fn check(&self, max_push_endpoints: usize) -> Result<(), Violation> {
-        // Version 2 and outbound authorities are F8's (spec §6.1): a push is version 1.
-        if self.version != 1 || self.has_authorities() {
+    pub fn check(
+        &self,
+        max_push_endpoints: usize,
+        max_authorities: usize,
+    ) -> Result<(), Violation> {
+        let outbound = self.scopes.get(&Direction::Outbound);
+        if outbound
+            .is_some_and(|scopes| scopes.keys().any(|k| !matches!(k, ScopeKey::Authority(_))))
+        {
+            return Err(Violation::Authority);
+        }
+        // Version 2 iff the report holds an outbound scope (spec §6.1).
+        if self.version != if self.has_authorities() { 2 } else { 1 } {
             return Err(Violation::Version);
         }
         if self.scopes.get(&Direction::Inbound).is_some_and(|scopes| {
             scopes
                 .iter()
-                .any(|(k, s)| matches!(k, ScopeKey::Authority(_)) || !s.egress_valid(false))
+                .any(|(k, s)| matches!(k, ScopeKey::Authority(_)) || s.egress_check(false).is_err())
         }) {
             return Err(Violation::Malformed);
         }
@@ -1213,6 +1244,12 @@ impl Report {
                 return Err(Violation::PushLimit);
             }
         }
+        if outbound.is_some_and(|scopes| scopes.len() > max_authorities) {
+            return Err(Violation::PushLimit);
+        }
+        if let Some(scopes) = outbound {
+            scopes.values().try_for_each(|s| s.egress_check(true))?;
+        }
         self.scopes
             .values()
             .flat_map(BTreeMap::values)
@@ -1220,15 +1257,21 @@ impl Report {
     }
 
     /// Parses a pushed body, then checks it. Never panics, whatever the input.
-    pub fn parse_checked(json: &str, max_push_endpoints: usize) -> Result<Self, Violation> {
+    pub fn parse_checked(
+        json: &str,
+        max_push_endpoints: usize,
+        max_authorities: usize,
+    ) -> Result<Self, Violation> {
         let report: Report = serde_json::from_str(json).map_err(|e| {
             if e.is_data() && e.to_string().starts_with("unknown field") {
                 Violation::UnknownField
+            } else if e.is_data() && e.to_string().starts_with("invalid scope key") {
+                bad_scope_key(json)
             } else {
                 Violation::Malformed
             }
         })?;
-        report.check(max_push_endpoints)?;
+        report.check(max_push_endpoints, max_authorities)?;
         Ok(report)
     }
 
@@ -1293,12 +1336,31 @@ impl Report {
             return Err("outbound scope key is not an authority".to_string());
         }
         let egress_ok = |scopes: Option<&BTreeMap<ScopeKey, Scope>>, outbound: bool| {
-            scopes.is_none_or(|s| s.values().all(|scope| scope.egress_valid(outbound)))
+            scopes.is_none_or(|s| s.values().all(|scope| scope.egress_check(outbound).is_ok()))
         };
         if !egress_ok(inbound, false) || !egress_ok(outbound, true) {
             return Err("origin or tunnels out of bounds".to_string());
         }
         Ok(report)
+    }
+}
+
+/// A scope key failed to parse: `authority` when an outbound key is outside the grammar of
+/// §6.1 (the only place a wrong key is not a malformed report), else `malformed`.
+fn bad_scope_key(json: &str) -> Violation {
+    let outbound_bad = serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/scopes/outbound")?.as_object().map(|keys| {
+                keys.keys()
+                    .any(|k| !matches!(ScopeKey::parse(k), Some(ScopeKey::Authority(_))))
+            })
+        })
+        .unwrap_or(false);
+    if outbound_bad {
+        Violation::Authority
+    } else {
+        Violation::Malformed
     }
 }
 

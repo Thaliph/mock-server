@@ -662,7 +662,7 @@ impl Store {
         let bytes = stored.ok_or(ReadError::NotFound)?;
         let readable = std::str::from_utf8(&bytes)
             .ok()
-            .is_some_and(|json| Report::parse_checked(json, usize::MAX).is_ok());
+            .is_some_and(|json| Report::parse_checked(json, usize::MAX, usize::MAX).is_ok());
         if !readable {
             tracing::error!(namespace, deployment, "stored report unreadable");
             return Err(ReadError::Unreadable);
@@ -810,7 +810,7 @@ impl Store {
             None => Report::new(None),
             Some(bytes) => std::str::from_utf8(&bytes)
                 .ok()
-                .and_then(|json| Report::parse_checked(json, usize::MAX).ok())
+                .and_then(|json| Report::parse_checked(json, usize::MAX, usize::MAX).ok())
                 .ok_or_else(unreadable)?,
         };
         let version: u64 = match version {

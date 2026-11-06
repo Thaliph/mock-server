@@ -413,7 +413,8 @@ The sidecar turns the HTTP exchanges it relays into a description of the endpoin
 description in a bounded in-memory **local report**, and (from F5) ships it to the controller,
 which merges the reports of every pod of the deployment in Valkey. F4 records **inbound**
 exchanges (the endpoints the deployment exposes); F7 runs the same engine on outbound ones
-(the APIs the deployment calls, §6.1), kept in the sidecar until F8 ships them.
+(the APIs the deployment calls, §6.1), kept in the sidecar until F8, which ships them with the
+inbound part and merges them per deployment (§6.1 "Shipping", §7.3).
 Everything below except the capture tap, content decoding and the recorder thread is pure logic in `mimic-core`
 (`discovery` module): parsing, templating, inference, redaction, sampling, merging.
 
@@ -621,7 +622,8 @@ Everything below except the capture tap, content decoding and the recorder threa
   merging locally within the same bounds. Replicas therefore merge only in the controller,
   with the same pure merge; the controller re-applies templating on the union, so a position
   that each pod sees below the literal limit but the deployment sees above it is absorbed.
-  Key layout, retention (30 days) and the API are in §7.3 and §7.2.
+  Key layout, retention (30 days) and the API are in §7.3 and §7.2. From F8 the push also
+  carries the outbound part (§6.1 "Shipping").
 - **Consumers.** F6 renders stored reports as OpenAPI 3.1 (§7.6). F7 records egress with the same engine.
   F10 mock matching ignores volatile and redacted fields (§8). F11 (load test) builds requests
   from ingress templates, samples, schemas and volatility; redacted values (credentials) must
@@ -721,19 +723,23 @@ logic in `mimic-core` (`discovery` module).
   `dst`, a scheme other than `http` and `https`, and a `tunnels` kind outside the list above. The merge adds `schemes` and `tunnels`, keeps the 16 smallest
   `sni` and `dst`, and past `max_authorities` keeps the authorities that sort first (the
   sidecar trusts its own report; the store ranks by traffic, F8).
-- **Kept in the sidecar (F7), shipped by F8.** In F7 the outbound part of the report is never
-  frozen, pushed nor reset: pushes stay `"version": 1`, inbound only, because a controller up to
-  F7 answers `400` (`version`) to a version 2 report, and the inbound data in it would be lost.
-  Outbound counters accumulate for the life of the process (saturating) and its samples are
-  reselected as exchanges come; a restart loses them (§11.1). `GET /discovery` serves the
-  current inbound report merged with the outbound part. F8 ships the outbound part in the same
-  push (version 2) and resets it after acknowledgement like inbound, and adds the controller
-  side: the structural check with the outbound bounds, re-redaction with the outbound view, an
-  authority limit in the store ranked by traffic, a sample rule under which one direction never
-  evicts samples of the other while that one holds at most half of the budget (the bounded merge
-  of §7.3 ranks endpoints per direction already, but evicts samples across the deployment),
-  `status.discovery.endpoints.outbound`, and the `outbound-…` OpenAPI documents and endpoint
-  list entries (§7.5, §7.6). F9 serves the aggregated egress to sidecars; F10 mocks it.
+- **Shipping (F8).** In F7 the outbound part was kept in the sidecar: never frozen, pushed nor
+  reset, for the life of the process (pushes stayed `"version": 1`, inbound only). From F8 the
+  sidecar freezes the outbound part together with the inbound one into the pending report of
+  §7.2, so a push is `"version": 2` whenever it holds an outbound scope, and after the
+  acknowledgement drops the shipped outbound counters, samples, `origin` and `tunnels` as it does
+  for inbound (the tree shape stays). A report is frozen when it covers an exchange or a tunnel of
+  either direction. `GET /discovery` then serves what is not acknowledged yet, in both
+  directions. The outbound half of `MIMIC_DISCOVERY_SAMPLE_BUDGET` applies to the pending and
+  the current report together. Without `MIMIC_CONTROLLER_URL` nothing is shipped and the
+  outbound part accumulates as in F7. A controller up to F7 answers `400` (`version`) to a
+  version 2 report; the **fallback to inbound only** of §7.2 makes sure that this, a mixed set of
+  controller replicas during a rollout, or a controller rollback never costs the inbound data:
+  the inbound part is posted alone and the outbound part waits in the sidecar, within its
+  bounds, for a controller that accepts it. The controller side (structural check with the
+  outbound bounds, re-redaction with the outbound view, authority limit ranked by traffic,
+  per-direction sample floor, the `:outbound` key, status, documents and endpoint list) is in
+  §7.3 to §7.6. F9 serves the aggregated egress to sidecars; F10 mocks it.
 - **Logs** (`target` = `discovery`): `endpoint discovered` and `template absorbed` of an
   outbound endpoint carry `authority` instead of `port`; WARN `endpoint limit reached` is
   written once per direction (`direction`); WARN `authority limit reached` (`limit`) once; WARN
@@ -909,7 +915,8 @@ logic in `mimic-core` (`discovery` module).
   serve the webhook.
 - `POST /v1/workloads/<deployment>/report` (F5): the discovery push of §6 "Shipping". Headers
   `Authorization`, `Content-Type: application/json` and `Content-Length` (required); body
-  `{"session": "<32 lower-case hex>", "sequence": <1 … 2^53>, "report": <§6 report>}`. The
+  `{"session": "<32 lower-case hex>", "sequence": <1 … 2^53>, "report": <§6 report>}` (from F8
+  version 1 or 2, §6.1; a controller up to F7 accepts version 1 only). The
   deployment is in the path, so it is authorised before the body is read. → `200`
   `{"applied": true}` once the push is merged into the deployment's store (§7.3), or
   `{"applied": false}` when this pod and session already had this or a later sequence
@@ -918,7 +925,8 @@ logic in `mimic-core` (`discovery` module).
   structural check of §7.3; `413` when `Content-Length` is over
   `MIMIC_SIDECAR_API_MAX_REPORT`, answered before the body is read; `405` for another method;
   `429` over the rate; `507` when the report has more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS`
-  endpoints in a direction (the push is refused whole, never truncated) or when the
+  endpoints in a direction or, from F8, more than `MIMIC_STORE_MAX_AUTHORITIES` outbound scopes
+  (the push is refused whole, never truncated) or when the
   deployment is new and its namespace already holds `MIMIC_STORE_MAX_DEPLOYMENTS`
   deployments; `503` with `Retry-After: 1` when the bodies being
   read would exceed `MIMIC_SIDECAR_API_BODY_BUDGET`, Valkey is unavailable, the write lost 5
@@ -926,7 +934,8 @@ logic in `mimic-core` (`discovery` module).
 - **Shipping client** (sidecar, F5). Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (the first one after
   a random delay within one interval, so that the pods of a rollout do not push together),
   the sidecar freezes the report recorded since its last acknowledged push into a *pending*
-  report with the next sequence (nothing is frozen when it covers no exchange) and posts it;
+  report with the next sequence (nothing is frozen when it covers no exchange and, from F8, no
+  outbound tunnel) and posts it;
   new exchanges go into a fresh *current* report. The session is 128 random bits drawn at
   process start, so a restarted sidecar starts a new session at sequence 1. A pending report
   is retried unchanged (same body) until it is settled: `200` settles it; `413` removes its
@@ -938,6 +947,32 @@ logic in `mimic-core` (`discovery` module).
   acknowledgement. A settled report (acknowledged or dropped) ends the failure streak: the
   backoff restarts at 1 s and the next failure logs its WARN again. No new report is frozen
   while one is pending.
+  **Fallback to inbound only** (F8). A `400` or `507` answer to a pending report that holds an
+  outbound scope does not drop it. When every earlier attempt of that sequence got an answer
+  (`400`, `413`, `429`, `503` or `507`: none of them applies anything), the sidecar moves the
+  outbound part of the pending report back into the current report (merged within the sidecar
+  bounds of §6.1, so it is shipped by a later push). When an earlier attempt had an unknown
+  outcome (connection error after the body was sent, no answer within 30 s), a replica may have
+  applied it while a mixed or rolled-back set of replicas answers the retry `400`: the outbound
+  part is then dropped, never moved back, so that no outbound exchange is counted twice; that
+  loss is counted (`mimic_discovery_outbound_dropped_total`) and logged once per sequence (WARN
+  `outbound not shipped`, `reason` = `unknown_outcome`). In both cases the sidecar posts, with the same session and sequence, the remaining inbound part
+  (`"version": 1`, the body an F7 sidecar would have sent), which then follows the rules above
+  (a `400` or `507` to it drops it with WARN `report rejected`). When the inbound part covers no
+  exchange nothing is posted and the sequence is used again by the next freeze. The next freeze
+  tries version 2 again. The inbound part of a report that a replica already applied is a
+  duplicate of its pod, session and sequence (`applied: false`), so it is never applied twice
+  either; this is the only case, with `413`, where a pending
+  sequence is posted with another body. This keeps the inbound data whatever the controller
+  version: a controller up to F7 (`400` with an empty body), a mixed set of replicas during a
+  controller rollout, a controller rollback, and an outbound part that a controller refuses
+  (more authorities than its `MIMIC_STORE_MAX_AUTHORITIES`, a bound a later version adds).
+  The attempt is counted `inbound_only` in `mimic_discovery_pushes_total`, with one WARN
+  `outbound not shipped` (`status`) per streak of fallbacks, the streak ended by an acknowledged
+  version 2 push. The flush at `SIGTERM` applies the fallback too (within its deadline).
+  *Rollout order*: the chart upgrades the controller; a sidecar changes only when its pod is
+  recreated (the webhook sets the image at admission), so F8 sidecars meet F8 controllers in the
+  normal order, and the fallback covers the window where both versions answer, and rollbacks.
   Pending and current samples share `MIMIC_DISCOVERY_SAMPLE_BUDGET`. At `SIGTERM`, once the
   proxy has drained (at most three quarters of `MIMIC_SHUTDOWN_GRACE`, so that the flush has
   at least a quarter of it), the sidecar posts the pending then the current report within what
@@ -948,14 +983,14 @@ logic in `mimic-core` (`discovery` module).
   flush does not back off: a failed post is repeated after a fixed 200 ms, whatever the backoff
   or the `Retry-After`, until the deadline. Without `MIMIC_CONTROLLER_URL` nothing is shipped (one
   INFO `report shipping disabled` at start) and the report accumulates as in F4. `GET
-  /discovery` serves the current report (from F7 with the outbound part, which is not
-  shipped before F8, §6.1). Logs (`target` = `discovery`): DEBUG `report pushed`
+  /discovery` serves the current report (from F7 with the outbound part, shipped from F8, §6.1). Logs (`target` = `discovery`): DEBUG `report pushed`
   (`sequence`, `exchanges`, `bytes`, `applied`), WARN `report push failed` (`status` or
   `error`, `attempt`) once per failure streak, INFO `report push recovered`; never the token.
 - One log line per request (`target` = `sidecar_api`): `endpoint` (the route, e.g.
   `/v1/workloads/{deployment}/report`), `namespace`, `pod`, `deployment`, `result` (`ok`,
   `duplicate`, `unauthenticated`, `forbidden`, `invalid`, `too_large`, `rate_limited`,
-  `push_limit`, `deployment_limit`, `unavailable`), plus for a push `session`, `sequence`, `bytes`, and for
+  `push_limit`, `deployment_limit`, `unavailable`), plus for a push `session`, `sequence`, `bytes`,
+  from F8 `version` (the pushed report's, when it parsed), and for
   `invalid` a `reason` from a fixed list, and, when the request failed on the controller's
   side, `error`; a request writes no other line; never the token, the key or report content.
   The sidecar reads every answer with a 64 KiB cap while it streams. Metric
@@ -971,8 +1006,9 @@ logic in `mimic-core` (`discovery` module).
 
   | Key | Type | Content | Expiry |
   |---|---|---|---|
-  | `mimic:v1:{<ns>/<dep>}:report` | string | merged report: canonical §6 JSON, `pod` null, with `last_seen` | `MIMIC_STORE_TTL` after the last applied push |
-  | `mimic:v1:{<ns>/<dep>}:meta` | hash | `version` (write counter), `updated` (ms of the last applied push), `exchanges`, `endpoints_inbound`, `endpoints_outbound`, `sample_bytes`, `report_bytes` | same |
+  | `mimic:v1:{<ns>/<dep>}:report` | string | merged report: canonical §6 JSON, `pod` null, with `last_seen`; from F8 its inbound part only, always `"version": 1` | `MIMIC_STORE_TTL` after the last applied push |
+  | `mimic:v1:{<ns>/<dep>}:outbound` | string | (F8) merged outbound part: canonical §6.1 JSON, `"version": 2`, outbound scopes only, `pod` null, with `last_seen`; absent while the deployment has no outbound scope | same |
+  | `mimic:v1:{<ns>/<dep>}:meta` | hash | `version` (write counter), `updated` (ms of the last applied push), `exchanges`, `endpoints_inbound`, `endpoints_outbound`, `sample_bytes`, `report_bytes` (from F8 of `:report` and `:outbound` together) | same |
   | `mimic:v1:{<ns>/<dep>}:pods` | hash | field `<pod>` → ms of its last push (applied or not) | each field min(24 h, `MIMIC_STORE_TTL`) after its last write |
   | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
   | `mimic:v1:ns:<ns>` | sorted set | member `<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
@@ -980,7 +1016,8 @@ logic in `mimic-core` (`discovery` module).
 
 - **Push processing**: structural check of the posted report, then re-redaction, then
   stamping, then the write. Nothing of a push is stored or logged before its re-redaction.
-  - *Structural check* (pure, `mimic-core`): `"version": 1` and every bound of §6 — at most
+  - *Structural check* (pure, `mimic-core`): `"version": 1` (from F8, the version rule of §6.1:
+    1 without an outbound scope, 2 with one; reason `version`) and every bound of §6 — at most
     `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints per direction (else `507`, reason
     `push_limit`, so that one pod cannot fill the store in one push), 20 samples and 16 hosts (each at most
     1024 bytes) per endpoint, statuses 100–599, histogram buckets within the §6 range, at most
@@ -995,6 +1032,13 @@ logic in `mimic-core` (`discovery` module).
     verified: it must equal the serialised size of the sample with `bytes` and `head_ms` at 0
     (reason `sample_bytes`), so a forged value cannot hide samples from the budget; byte sums
     saturate.
+    From F8 an outbound scope also has: a key of the §6.1 authority grammar (reason
+    `authority`); at most `MIMIC_STORE_MAX_AUTHORITIES` outbound scopes in the push (else `507`,
+    reason `push_limit`); an `origin` with schemes `http` and `https` only, at most 16 `sni`,
+    each a host of the §5 SNI rule (lower-case DNS name, at most 253 bytes), and at most 16
+    `dst`, each an IP literal and port of the §6.1 grammar (reason `origin`); `tunnels` kinds of
+    the §6.1 list only (reason `tunnels`); outbound endpoints without `hosts` (reason `hosts`).
+    `origin` or `tunnels` on an inbound scope is `malformed`.
     Any other violation is `400` with its `reason`.
   - *Re-redaction* (pure, idempotent): the §6 redaction applied again to every sample, host,
     concrete path, literal path segment (tree keys and gRPC paths; keys that become equal
@@ -1007,27 +1051,40 @@ logic in `mimic-core` (`discovery` module).
     below a redacted name become that name's field; a name is never redacted by value. A
     volatile sketch holds hashes only, so a detected form (JWT, card, token prefix) cannot be
     found in it: its sketch is dropped when a retained sample shows a detected form at that
-    field, and kept otherwise (§11.1). A sidecar of an older version, or a faulty one, cannot put a
-    value into Valkey that the controller's rules redact.
+    field, and kept otherwise (§11.1). From F8 an outbound exchange is re-redacted with the
+    outbound view of §6.1 as well (the request header allowlist, `key` and `sig` by name), and
+    each outbound scope's identity: the host of an authority key that a value detector catches
+    becomes the marker (`<redacted>:<port>`; scopes that become equal merge, trees, `origin` and
+    `tunnels` included, as path keys do), and an `origin.sni` value that a detector catches is
+    removed (the sidecar never records one). A sidecar of an older version, or a faulty one,
+    cannot put a value into Valkey that the controller's rules redact.
   - *Stamping*: every endpoint and sample of the push gets `last_seen`, the current UTC day
-    (days since 1970-01-01); a merge keeps the larger value. Sidecar reports carry no
+    (days since 1970-01-01), and from F8 so does every outbound scope of the push (its `origin`
+    and `tunnels` are dated by it); a merge keeps the larger value. Sidecar reports carry no
     `last_seen`.
   - *Write*: within a replica, one writer per deployment; pushes that arrive while it writes
     are merged into its next write (group commit), and each is answered after the write that
     holds it. At most 2 deployments are written at once per replica (memory bound). A write
-    reads `:report`, `:meta` `version` and the `:seq` fields of its pushes; answers
+    reads `:report` (from F8 with `:outbound`: the stored report is their union), `:meta`
+    `version` and the `:seq` fields of its pushes; answers
     `applied: false` for a push whose sequence is not above the stored one of its pod and
     session; merges the others into the stored report with the **bounded merge** below;
     drops endpoints and samples whose `last_seen` is older than `MIMIC_STORE_TTL` (in whole
-    days); and runs one Lua script that, only if `version` and the `:seq` fields are still
-    those read, writes `:report`, `:meta` (`version` + 1), `:seq`, `:pods` and both indexes,
+    days), and from F8 the outbound scopes that are older and hold no endpoint any more; and
+    runs one Lua script that, only if `version` and the `:seq` fields are still
+    those read, writes `:report` (from F8 the inbound part, and the outbound part to
+    `:outbound`, deleted when there is none), `:meta` (`version` + 1), `:seq`, `:pods` and both indexes,
     refreshes the expiries and prunes the indexes, refusing a new deployment past
     `MIMIC_STORE_MAX_DEPLOYMENTS` in the namespace (`507`). Otherwise nothing is written and
     the write starts again (at most 5 attempts, 10–100 ms random backoff, then `503`). So a
     push is applied once, whichever replica receives it and however often it is retried
     (within the `:seq` field expiry, §11.1). A stored value that does not parse or fails the
-    structural check is never overwritten: ERROR `stored report unreadable` (`namespace`,
-    `deployment`), push `503`, read `500`.
+    structural check (a `:report` that is not version 1 or an `:outbound` that holds an inbound
+    scope included) is never overwritten: ERROR `stored report unreadable` (`namespace`,
+    `deployment`, from F8 `key`: `report` or `outbound`), push `503`, read `500`. Keeping
+    the outbound part in its own key leaves `:report` readable by a controller up to F7: a
+    rollback keeps serving and merging the inbound data and ignores `:outbound`, which expires
+    unless an F8 controller writes again (§11.1).
   - *Failures*: the connection to Valkey is shared by all writers. A Valkey reply error (`OOM`
     under `noeviction`, a script error, `WRONGTYPE`) answers the pushes of the write `503` and
     keeps the connection; only a connection error (I/O, timeout, closed, refused) drops it, so
@@ -1039,12 +1096,19 @@ logic in `mimic-core` (`discovery` module).
     starts a new writer, so no push waits for a writer that is gone.
 - **Bounded merge** (pure, `mimic-core`): the §6 merge under the store limits
   (`MIMIC_STORE_MAX_LITERALS`, `MIMIC_STORE_MAX_ENDPOINTS` per direction,
-  `MIMIC_STORE_SAMPLE_BUDGET` per deployment); counters saturate at 2^64 − 1. The merge
+  `MIMIC_STORE_SAMPLE_BUDGET` per deployment, from F8 `MIMIC_STORE_MAX_AUTHORITIES`);
+  counters saturate at 2^64 − 1. The merge
   re-applies templating on the union: a node that the deployment sees above the literal limit
   absorbs. Below the limits the stored report does not depend on the order or grouping of
   pushes. At a limit, what is kept is chosen by traffic, never by key order alone, so that
   endpoints that sort first (`/!`, `/0`, the paths of a scanner the app answers `2xx`) cannot
   crowd out the deployment's real API:
+  - *Authorities* (F8), applied first: when the union holds more than
+    `MIMIC_STORE_MAX_AUTHORITIES` outbound scopes, those kept are the first ranked by traffic
+    (the exchanges of their endpoints plus their `tunnels` counts) descending, then stored
+    before new, then by key; a scope that is not kept goes with its endpoints, samples,
+    `origin` and `tunnels` (`evicted` kind `authority` when it was stored, refused
+    `authority_limit` when it was new; its endpoints and samples are not counted again).
   - *Endpoints*: when the union holds more than `MIMIC_STORE_MAX_ENDPOINTS` endpoints in a
     direction, the endpoints kept are the first ones ranked by total exchange count (the sum
     of their status counters) descending, then stored before new (an endpoint of the stored
@@ -1056,10 +1120,16 @@ logic in `mimic-core` (`discovery` module).
     class) of the deployment holding the most samples (ties: the most sample bytes, then the
     larger key), the sample with the largest key first, never taking a class of an endpoint
     to zero samples; if room cannot be made that way the new sample is refused (`budget`)
-    and nothing is evicted. Counters, histograms, schemas and volatility merge whatever is
+    and nothing is evicted. *Per-direction floor* (F8): the (endpoint, status class) pairs
+    that can lose a sample are those of the new sample's direction, and those of the other
+    direction only while that direction holds more than half of `MIMIC_STORE_SAMPLE_BUDGET`,
+    so a direction holding at most half of the budget never loses a sample to the other; a
+    direction may use more than half while the other leaves it free (the store has no fixed
+    split, unlike the sidecar's outbound half, §6.1). Counters, histograms, schemas and volatility merge whatever is
     refused or evicted.
   Ties left by those rules are broken by the full endpoint key. A stored report already over
-  the budget (a lowered `MIMIC_STORE_SAMPLE_BUDGET`) is trimmed by the same eviction rule; a
+  the budget (a lowered `MIMIC_STORE_SAMPLE_BUDGET`) is trimmed by the same eviction rule
+  (from F8 from the direction that holds more than half of the budget, while it does); a
   sample added and evicted within one merge counts as `evicted`.
   Refusals are counted in `mimic_store_refused_total{kind,reason}` with one WARN
   `store limit reached` (`namespace`, `deployment`, `reason`) per deployment and reason per
@@ -1067,8 +1137,10 @@ logic in `mimic-core` (`discovery` module).
   (`namespace`, `deployment`, `kind`, `count`) per deployment and kind per process.
 - **Outbound (F7, F8).** Up to F7 the structural check accepts `"version": 1` only, and
   sidecars push no outbound data (§6.1): the store, the status and the UI hold inbound
-  endpoints only. F8 accepts version 2 pushes and adds the outbound rules listed in §6.1
-  (authority limit ranked by traffic, per-direction sample floor, outbound re-redaction).
+  endpoints only. From F8 the store accepts version 2 pushes with the outbound check,
+  re-redaction, stamping, authority limit and sample floor above, and keeps the merged
+  outbound part in `:outbound`; pushes of F5–F7 sidecars (version 1) are processed exactly as
+  before, and a deployment without outbound data has the same keys and bytes as in F7.
 - **Pod churn**: no pod is read. A deleted pod's data stays merged (the deployment's API is
   the union over its life) and it ships its last report at `SIGTERM`; the pods of a rolling
   update push into the same key; a deleted pod's `:pods` and `:seq` fields expire after
@@ -1081,7 +1153,9 @@ logic in `mimic-core` (`discovery` module).
   (equal to `maxmemory`: the scheduler reserves what a full store uses, which is not then the
   first pod evicted under node memory pressure; the 256 Mi between request and limit is the
   headroom of AOF rewrites) and PVC `4Gi` (AOF rewrites need about twice the data), controller memory limit `512Mi` (two writes of a
-  deployment report at once plus `MIMIC_SIDECAR_API_BODY_BUDGET`).
+  deployment report at once plus `MIMIC_SIDECAR_API_BODY_BUDGET`; from F8 a report holds up to
+  `MIMIC_STORE_MAX_ENDPOINTS` endpoints in each direction, the sample budget staying per
+  deployment, and SHR-18 checks that the limit still holds).
 
 ### 7.4 `MimicWorkload` status (F5)
 
@@ -1092,7 +1166,8 @@ logic in `mimic-core` (`discovery` module).
   ```yaml
   status:
     discovery:
-      endpoints: {inbound: 12}               # per direction; directions without any omitted
+      endpoints: {inbound: 12, outbound: 3}  # per direction; directions without any omitted
+      totalEndpoints: 15                     # (F8) sum of the directions, 0 without data
       exchanges: 34567
       sampleBytes: 1048576
       pods: 2                                # pods whose last push is within MIMIC_STATUS_POD_WINDOW
@@ -1110,10 +1185,14 @@ logic in `mimic-core` (`discovery` module).
   nothing, so no leader is elected. A deployment without data gets zero counts and no
   `lastPushTime`. While Valkey is unavailable the status is left as it is (one WARN
   `status not updated` until it recovers). `kubectl get mimicworkload` prints `Mode`,
-  `Endpoints` (the inbound count: a printer column cannot add fields; F9 adds a total when
-  outbound endpoints exist; the CRD schema defaults `endpoints.inbound` to `0`, so the column
-  is `0` and not blank for a direction without endpoints, while the stored status omits it and
-  the controller compares statuses with that default applied), `Pods` and `Last push` (an age, as kubectl prints `date` columns). Mode convergence is added in F10.
+  `Endpoints`, `Pods` and `Last push` (an age, as kubectl prints `date` columns). Up to F7
+  `Endpoints` was the inbound count; a printer column cannot add fields, so from F8 the
+  controller writes `totalEndpoints` (inbound + outbound) and `Endpoints` reads it. The CRD
+  schema defaults `endpoints.inbound` and `totalEndpoints` to `0`, so the column is `0` and not
+  blank without endpoints (and for a status written by a controller up to F7 the column reads
+  `0` until an F8 controller applies one), while the stored status omits the default
+  `endpoints.inbound` and the controller compares statuses with the defaults applied.
+  `exchanges` and `sampleBytes` count both directions. Mode convergence is added in F10.
 
 ### 7.5 Read API and UI (F5, F6)
 
@@ -1127,21 +1206,32 @@ logic in `mimic-core` (`discovery` module).
   (`Allow: GET`); F6 serves it because browsers and link checkers expect it wherever `GET` is
   served (#293 note 28). JSON, sorted keys:
   - `GET /v1/workloads` → `{"workloads": [{"namespace", "deployment", "endpoints",
-    "exchanges", "sample_bytes", "last_push"}]}`, sorted by namespace then deployment;
+    "exchanges", "sample_bytes", "last_push"}]}`, sorted by namespace then deployment
+    (`endpoints` counts both directions);
   - `GET /v1/workloads/<ns>/<dep>` → the same object plus `"pods": {"<pod>": "<last push,
     RFC 3339>"}`;
-  - `GET /v1/workloads/<ns>/<dep>/report` → the stored `:report` bytes;
+  - `GET /v1/workloads/<ns>/<dep>/report` → the stored `:report` bytes; from F8, when
+    `:outbound` exists, the canonical serialisation of the union of both (`"version": 2`,
+    rendered like the routes below), so the route always answers the deployment's whole
+    merged report;
   - `GET /v1/workloads/<ns>/<dep>/endpoints` (F6) → `{"endpoints": [{"direction", "port",
     "method", "template", "grpc", "exchanges", "statuses": {"<code>": <count>}, "latency_ms":
     {"p50", "p90", "p99"}, "hosts", "last_seen", "document"}]}` in the order of the report's
-    endpoints (direction, port, template, method); `latency_ms` values are the §7.6 quantiles,
+    endpoints (direction, port, template, method; from F8 outbound entries follow the inbound
+    ones, ordered by authority, template, method, with `"direction": "outbound"`, `authority`
+    instead of `port` and no `hosts`); `latency_ms` values are the §7.6 quantiles,
     `last_seen` is `YYYY-MM-DD` or absent, `document` is the id of the §7.6 document that holds
     the endpoint;
   - `GET /v1/workloads/<ns>/<dep>/openapi` (F6) → `{"documents": [{"id", "direction", "port",
-    "endpoints"}]}`, one entry per document of §7.6, sorted by id;
+    "endpoints"}]}`, one entry per document of §7.6, sorted by id (from F8 an outbound entry has
+    `authority` instead of `port`, and `tunnels`, the sum of its scope's tunnel counts);
   - `GET /v1/workloads/<ns>/<dep>/openapi/<id>` (F6) → the OpenAPI 3.1 document `<id>` (§7.6),
     `application/json`; `400` for an id outside the grammar of §7.6, `404` for a well-formed id
-    that the report does not hold.
+    that the report does not hold. From F8 the `<id>` path segment (here and in the page route
+    below) is percent-decoded once (RFC 3986) before it is matched against the grammar, so an
+    outbound id is written with its `[`, `]`, `<` and `>` percent-encoded and `:` raw or encoded;
+    a segment that does not decode (bad `%` escape, not UTF-8) is `400`, and `mimic.js` builds
+    links with `encodeURIComponent`.
 
   `404` for a deployment without data, `400` for a name that is not DNS-1123, `503` while
   Valkey is unavailable. A timestamp beyond year 9999 is shown as `9999-12-31T23:59:59.999Z`.
@@ -1150,8 +1240,9 @@ logic in `mimic-core` (`discovery` module).
   `namespace` and `deployment`: `stored report unreadable` for `:report` (§7.3), `stored meta
   unreadable` for `:meta` and `stored pods unreadable` for `:pods`. In the list, an entry whose `:meta` is unreadable is
   skipped, with that one ERROR line, instead of failing the whole list.
-  The `endpoints`, `openapi` and document routes parse the stored report (`Report::from_json`
-  and the structural check of §7.3, as a push) and render it on a blocking thread, at most 2 at
+  The `endpoints`, `openapi` and document routes (from F8 also `report` when `:outbound`
+  exists) parse the stored report (`Report::from_json`
+  and the structural check of §7.3, as a push; from F8 the union of `:report` and `:outbound`) and render it on a blocking thread, at most 2 at
   once per replica (others wait), so a large report cannot stall the listener; rendering is a
   pure function of the report and the `:meta` `version` and cannot fail on a checked report (a
   serialisation error is `500` with ERROR `openapi render failed`, `namespace`, `deployment`).
@@ -1162,8 +1253,9 @@ logic in `mimic-core` (`discovery` module).
   - `GET /ui/` → the workloads list: namespace, deployment, endpoints, exchanges, last push,
     each linking to its deployment page;
   - `GET /ui/workloads/<ns>/<dep>` → the deployment page: the summary and pods of
-    `/v1/workloads/<ns>/<dep>`, the endpoint list of `/endpoints` (direction, port, method,
-    template, exchanges, statuses, latency quantiles, last seen), and one link per document;
+    `/v1/workloads/<ns>/<dep>`, the endpoint list of `/endpoints` (direction, port or, from F8,
+    authority, method, template, exchanges, statuses, latency quantiles, last seen), and one
+    link per document (from F8 with each outbound document's tunnel count);
   - `GET /ui/workloads/<ns>/<dep>/openapi/<id>` → Swagger UI showing that document, with a
     link to the raw JSON (for import into other tools).
 
@@ -1213,7 +1305,7 @@ logic in `mimic-core` (`discovery` module).
   code) and `mimic_ui_render_duration_seconds` (histogram of parse + render, buckets as
   `mimic_store_write_duration_seconds`). No line is written per request; no line or series
   holds a path, template or report content.
-- Consumers: F8 adds outbound documents (§7.6) with no change to the routes; F9 adds an
+- Consumers: F8 adds outbound documents (§7.6) with no new route; F9 adds an
   authenticated read of a sidecar's own deployment on the sidecar API (§7.2) for egress
   recordings and the mode (F10); F11 reads ingress templates, samples, schemas and volatility
   through the same `store` module, its access path being part of its design.
@@ -1229,9 +1321,13 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
 
 - **Documents.** One per scope of the report: `inbound-<port>` per inbound port (decimal, no
   leading zero; id grammar `inbound-[1-9][0-9]{0,4}`, port 1–65535). From F8, one per outbound
-  authority, `outbound-<authority>` (the scope is the `<host>:<port>` key of §6.1; F8 defines
-  its encoding in the id): adding them changes neither the inbound documents nor the routes; the index and
-  the endpoint list gain entries with `direction: "outbound"` and `authority` instead of `port`.
+  scope, `outbound-<authority>`: the `<host>:<port>` key of §6.1 as it is (id grammar
+  `outbound-` followed by the §6.1 authority grammar, `<redacted>:<port>` included; in a URL the
+  id is percent-encoded, §7.5), so `outbound-api.example.com:443`,
+  `outbound-10.0.0.5:8080`, `outbound-[2001:db8::1]:8443`. A scope with tunnels only has a
+  document with empty `paths`, so that destinations that cannot be documented are listed.
+  Adding them changes neither the inbound documents nor the routes; the index and the
+  endpoint list gain entries with `direction: "outbound"` and `authority` instead of `port`.
   A deployment that listens on one port has one document. Paths of two scopes never share a
   document, so `/a` on port 8080 and `/a` on 9090 never collide.
 - **Top level.** `openapi: "3.1.1"`; `info.title` = `<ns>/<dep> inbound :<port>` (Kubernetes
@@ -1240,6 +1336,13 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   `{"url": "http://<host>"}` per distinct `hosts` value of the scope's endpoints that is a §4.1
   normalised authority (not `(invalid)`, not containing the redaction marker), sorted, at most
   16 (inbound HTTPS is not discovered, so inbound is `http`); no `servers` when none qualifies.
+  *Outbound document* (F8): `info.title` = `<ns>/<dep> outbound` (the authority is recorded
+  data, so it is not in the title); `info.x-mimic-authority` = the authority; `servers` = one
+  `{"url": "<scheme>://<authority>"}` per scheme of its `origin.schemes` (`http`, `https`, in
+  that order; the port always written), none when the host is the marker; `x-mimic-origin` =
+  `{"sni": [...], "dst": [...]}` (sorted, as stored) and `x-mimic-tunnels` = the `tunnels` map
+  (kind → count, sorted), both at the top level and absent when empty. Operations follow the
+  rules below; an outbound endpoint has no `x-mimic-hosts`.
   `components.securitySchemes` as below; no other `components`, no `$ref` anywhere.
 - **Paths.** The key is the endpoint's template (§6), parameters as rendered (`{users_id}`),
   with `{` and `}` of literal segments percent-encoded (`%7B`, `%7D`) so a literal is never read
@@ -1332,7 +1435,8 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   | `mimic_discovery_sample_bytes` | gauge (F4), bytes held by samples; after a freeze those of the pending and the current report together; from F7 the outbound part included | — |
   | `mimic_discovery_authorities` | gauge (F7), outbound scopes held (§6.1) | — |
   | `mimic_discovery_tunnels_total` | counter (F7), outbound connections without plaintext HTTP (§6.1) | `kind` (`tcp`, `connect`, `tls_excluded`, `tls_no_ca`, `tls_unsupported`, `tls_upstream_untrusted`, `tls_client_cert_requested`, `tls_client_rejected`), `result` (`recorded`, `authority_limit`, `dropped`) |
-  | `mimic_discovery_pushes_total` | counter (F5), settled or failed push attempts (§7.2) | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`) |
+  | `mimic_discovery_pushes_total` | counter (F5), settled or failed push attempts (§7.2) | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`, from F8 `inbound_only`: a version 2 report answered `400` or `507`, followed by the fallback of §7.2) |
+  | `mimic_discovery_outbound_dropped_total` | counter (F8), outbound parts dropped by the inbound-only fallback after an attempt with an unknown outcome (§7.2) | — |
   | `mimic_discovery_last_push_timestamp_seconds` | gauge (F5), time of the last acknowledged push, 0 before | — |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
@@ -1348,8 +1452,8 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   | `mimic_store_write_duration_seconds` | histogram, one write from read to script result; buckets 0.005 … 10 as `mimic_http_request_duration_seconds` | — |
   | `mimic_store_report_bytes` | histogram, size of each report written; buckets 4Ki, 16Ki, 64Ki, 256Ki, 1Mi, 4Mi, 16Mi, 64Mi | — |
   | `mimic_store_pushes_total` | counter, pushes by outcome | `result` (`applied`, `duplicate`) |
-  | `mimic_store_refused_total` | counter, growth refused by the bounded merge | `kind` (`endpoint`, `sample`), `reason` (`endpoint_limit`, `budget`) |
-  | `mimic_store_evicted_total` | counter, stored endpoints and samples displaced by the bounded merge (§7.3) | `kind` (`endpoint`, `sample`) |
+  | `mimic_store_refused_total` | counter, growth refused by the bounded merge | `kind` (`endpoint`, `sample`, from F8 `authority`), `reason` (`endpoint_limit`, `budget`, from F8 `authority_limit`) |
+  | `mimic_store_evicted_total` | counter, stored endpoints and samples displaced by the bounded merge (§7.3) | `kind` (`endpoint`, `sample`, from F8 `authority`) |
   | `mimic_store_expired_total` | counter, endpoints and samples dropped by retention | `kind` |
   | `mimic_status_updates_total` | counter, `MimicWorkload` status applies | `result` (`ok`, `error`) |
 | `mimic_ui_requests_total` | counter (F6), answers of the UI listener (§7.5) | `route` (route pattern or `other`), `code` |
@@ -1419,6 +1523,7 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
 | `MIMIC_STORE_TTL` | `30d` | Retention of a deployment's data after its last push, and of endpoints and samples after they were last seen (§7.3); 10s–365d. |
 | `MIMIC_STORE_MAX_ENDPOINTS` | `512` | Endpoints per direction and deployment in the store, 1–10000. |
 | `MIMIC_STORE_MAX_PUSH_ENDPOINTS` | `256` | Endpoints per direction in one pushed report (§7.2), 1–10000, at most `MIMIC_STORE_MAX_ENDPOINTS`. |
+| `MIMIC_STORE_MAX_AUTHORITIES` | `128` | (F8) Outbound scopes (authorities) per deployment in the store and in one push (§7.3), 1–10000. |
 | `MIMIC_STORE_MAX_LITERALS` | `32` | Literal limit of the store's templating (§6), 2–1000. |
 | `MIMIC_STORE_SAMPLE_BUDGET` | `4Mi` | Sample bytes per deployment in the store (1Mi–1Gi). |
 | `MIMIC_STORE_MAX_DEPLOYMENTS` | `50` | Deployments with data per namespace (§7.3), 1–100000. |
@@ -1508,7 +1613,12 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   by the webhook. Decrypted outbound exchanges exist only in the sidecar's memory, within the
   capture budget, and leave it only redacted, through `/discovery` on loopback; outbound
   request header values are kept only for a fixed allowlist, since the app's own provider
-  credentials travel there under arbitrary names. Nothing outbound is pushed before F8.
+  credentials travel there under arbitrary names. Nothing outbound is pushed before F8. From
+  F8 the redacted outbound part travels in the same authenticated push as inbound, and the
+  controller applies the outbound view again (request header allowlist, `key`/`sig`, authority
+  hosts and SNIs through the detectors) before anything reaches Valkey or a log (§7.3): a
+  sidecar up to F7, or a faulty one, cannot store an outbound credential the controller's rules
+  redact. F8 adds no privilege, RBAC rule or port.
 - TLS key custody (§5): the seed exists only in its Secret and the controller's memory; root
   keys only in the controller's memory; intermediate and leaf keys only in the sidecar's
   memory (non-dumpable, no core file). Tokens and keys are never logged.
@@ -1552,7 +1662,9 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   `ownerReference` is set by the pod's creator too, so reading it would not bind the identity
   either): such a user can push reports into another deployment of the same namespace,
   within the store bounds of §7.3, and so add endpoints, counts and samples to its discovered
-  API (and, from F8, to its recordings). Other namespaces are out of reach: the namespace
+  API (and, from F8, to its recordings: forged outbound endpoints and authorities, which F10
+  would replay as mocks; the authority limit ranks by the counts the pods push, which such a
+  user also chooses). Other namespaces are out of reach: the namespace
   comes from the token.
 - Store (§7.3): a push retried more than min(24 h, `MIMIC_STORE_TTL`) after it was applied is
   applied again (its `:seq` field has expired). A pod that dies without `SIGTERM` (node loss,
@@ -1622,9 +1734,28 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
   there under an unlisted name, in a form no detector knows, is kept, as in §6. Until F8 the
   outbound part lives in the sidecar's memory only: a restart loses it, and anyone allowed
   `pods/portforward` on the app's pods reads its redacted provider exchanges (response bodies
-  included, personal data in them too) through `/discovery`. A sidecar that pushes version 2
-  reports to a controller up to F7 gets `400` and drops that report (F8 must order its
-  rollout: controller first).
+  included, personal data in them too) through `/discovery`. A spoofed `Host` sent by the app
+  (or forwarded by it from its clients) can fill `MIMIC_DISCOVERY_MAX_AUTHORITIES`; later
+  authorities are only counted.
+- Egress aggregation (F8, §6.1, §7.3): the redacted provider exchanges of every injected
+  deployment (response bodies and the personal data in them included) are stored in Valkey and
+  shown by the UI: anyone allowed `pods/portforward` on the controller pods reads them for every
+  namespace, as for inbound. While a sidecar falls back to inbound only (§7.2), its outbound
+  part waits in its memory within the §6.1 bounds and is lost if the pod stops before a
+  controller accepts it; a controller rolled back below F8 keeps serving inbound data and leaves
+  `:outbound` to expire, so outbound data recorded meanwhile is lost. The store has no fixed
+  split of the sample budget between directions: a direction may hold more than half while the
+  other uses less, and gives the room back only as the other direction's new status classes
+  arrive. The status `Endpoints` column of a `MimicWorkload` reads `0` between a chart upgrade
+  (new CRD) and the first status apply of an F8 controller. Each deployment's store bound grows
+  by its outbound endpoints and authorities (`MIMIC_STORE_MAX_ENDPOINTS` and
+  `MIMIC_STORE_MAX_AUTHORITIES`; the sample budget is shared), which Valkey sizing must allow.
+  An inbound-only fallback after an attempt with an unknown outcome drops that sequence's
+  outbound part (§7.2) rather than risk counting it twice: at most one push of outbound data per
+  such event, counted and logged.
+- Value detectors match a whole value (or a whole header credential): a Google `AIza` key, a
+  token prefix or a JWT embedded inside longer free text (`note AIza…`) is not caught by value;
+  only by name, when its field or header name is a redacted name.
 - Discovery is best effort under load: dropped records, a full sample budget or the endpoint
   limit make counters and samples partial (counted in §9 metrics), never slow traffic. A
   `404`/`405` reaching a path no other status has created is not recorded. Template
@@ -1820,7 +1951,7 @@ Sidecar integration tests use the fake sidecar API of F3. A *canary* is as in §
 
 | ID | Criterion |
 |---|---|
-| CTL-01 | **U.** The structural check of §7.3 accepts every report the recorder produces within the §6 bounds, merged or not (`proptest`, ≥ 10 000 cases), and rejects, each with its own fixed `reason`: a version other than 1; 21 samples; 17 hosts or a host over 1024 bytes; status 99 or 600; a histogram bucket out of range; a schema of 513 nodes, of 17 levels or with a cut level of 17; a 129-byte name; 65 query keys or headers; 129 volatile fields or a 33-hash sketch; a 2049-byte or 33-segment path or template; 17 media types on a side; a 256 KiB + 1 sample body or a sample body for an opaque media type; an unknown field; more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints in a direction is `push_limit`, apart from the `400` reasons. `Report::from_json` then the check never panic on arbitrary input (`proptest`, and CTL-22). |
+| CTL-01 | **U.** The structural check of §7.3 accepts every report the recorder produces within the §6 bounds, merged or not (`proptest`, ≥ 10 000 cases), and rejects, each with its own fixed `reason`: a version other than 1; 21 samples; 17 hosts or a host over 1024 bytes; status 99 or 600; a histogram bucket out of range; a schema of 513 nodes, of 17 levels or with a cut level of 17; a 129-byte name; 65 query keys or headers; 129 volatile fields or a 33-hash sketch; a 2049-byte or 33-segment path or template; 17 media types on a side; a 256 KiB + 1 sample body or a sample body for an opaque media type; an unknown field; more than `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints in a direction is `push_limit`, apart from the `400` reasons. `Report::from_json` then the check never panic on arbitrary input (`proptest`, and CTL-22). (Amended by SHR-01: from F8 version 2 is accepted with an outbound scope.) |
 | CTL-02 | **U.** The bounded merge equals the §6 `merge` while the result is within the store limits, and below them does not depend on the order or grouping of pushes (`proptest`); two pushes each below the literal limit at a node absorb it when their union exceeds it; counters and buckets at 2^64 − 1 stay there; the result's `pod` is null. Anti-crowding, with `MIMIC_STORE_MAX_ENDPOINTS` = 4: a store of 4 endpoints with 100 exchanges each, merged with a push of 50 endpoints `/!0` … `/!49` of 1 exchange each, keeps the 4 (50 `endpoint_limit` refusals, no eviction); a push of an endpoint with 101 exchanges evicts the stored endpoint with the fewest exchanges, ties broken by key (`evicted` = 1); a new endpoint tying the lowest stored count does not displace it. Samples, with a full budget: a new `5xx` sample of an endpoint holding only `2xx` samples evicts samples of the (endpoint, class) with the most samples until it fits, never the only sample of a class; a new `2xx` sample of that endpoint is refused (`budget`); when room cannot be made without emptying a class, nothing is evicted. The same input always gives byte-identical output; `refused` and `evicted` counts are returned per kind and reason. |
 | CTL-03 | **U.** Re-redaction is idempotent and leaves unchanged a report recorded with the same redactor. For reports recorded with a redactor that lacks a name the controller's redactor has (`proptest`, ≥ 10 000 cases), with a canary under that name at a random place (query, header, form or JSON body at any depth, request or response, URL-valued header), the re-redacted report contains neither the canary nor its XXH3 hash in decimal or hex, its sample keys are the hashes of the re-redacted content, and the field is marked `redacted` with the hash of the marker as its only hash, equal to the field of a sidecar that knew the name. A canary as the first word of `Authorization` or `Proxy-Authorization` (an unlisted scheme) in a report recorded by an older sidecar is removed the same way. A canary in a detected form (JWT, card, token prefix) in a report that bypassed the sidecar's redaction is removed the same way from its samples, hosts and path keys (tree literals, gRPC paths: equal keys merge); a volatile field's sketch is dropped when a retained sample shows a detected form at that field and kept otherwise. A schema or parameter key under a redacted name has the schema of the marker, and the volatile fields below it become its field. |
 | CTL-04 | **U.** Retention: stamping a push with day `D` sets `last_seen = D` on each endpoint and sample; merge keeps the larger value (commutative, associative); dropping with day `T` and a TTL of `n` days removes exactly the endpoints and samples with `last_seen < T − n` (counted per kind); a sidecar report without `last_seen` parses, and a sidecar never serialises it. |
@@ -1882,7 +2013,7 @@ destination) for TLS, and read `GET /discovery` from loopback. A *canary* is as 
 |---|---|
 | EGR-01 | **U.** Scope key (§6.1): an absolute-form `http://API.Example.com./v1` gives `api.example.com:80`; `Host: users.disc-22.svc:8080` gives `users.disc-22.svc:8080`; `Host: api.example.com` on an intercepted connection gives `api.example.com:443`; an `h2` `:authority` wins over `Host`; `Host: [2001:DB8::1]:8443` gives `[2001:db8::1]:8443`; a missing or `(invalid)` authority gives the SNI with the destination port, else the destination `10.0.0.5:8080`; a host that a value detector catches gives `<redacted>:<port>`; every key produced matches the grammar of §6.1 (`proptest` on arbitrary `Host`, SNI and destination: no panic, never a control character, a space or a key over 261 bytes). |
 | EGR-02 | **U.** Outbound endpoints: `GET /v1/payments/42` to `a.example:443` and to `b.example:443` are two endpoints `GET /v1/payments/{payments_id}`, and literal absorption at one authority leaves the other untouched; an outbound endpoint has no `hosts`; its scope's `origin` counts `schemes` `http` and `https`, and keeps at most 16 `sni` and 16 `dst`, the first in byte order; an outbound `404` on an unknown path creates its endpoint with a sample and a `405` is a sample candidate, while an inbound `404` is still `not_found` (DSC-11 unchanged). |
-| EGR-03 | **U.** Format: a report without outbound scope serialises byte-identical to F5 (`"version": 1`, the DSC-09 and CTL fixtures unchanged); one with an outbound exchange is `"version": 2` with `scopes.outbound.<authority>` holding the tree, `origin` and `tunnels`; both round-trip through `from_json`; `from_json` rejects a version 1 report with an outbound scope, an inbound key that is not a port, an outbound key outside the grammar and a version 3; the push check of §7.3 still rejects a version 2 report (reason `version`). |
+| EGR-03 | **U.** Format: a report without outbound scope serialises byte-identical to F5 (`"version": 1`, the DSC-09 and CTL fixtures unchanged); one with an outbound exchange is `"version": 2` with `scopes.outbound.<authority>` holding the tree, `origin` and `tunnels`; both round-trip through `from_json`; `from_json` rejects a version 1 report with an outbound scope, an inbound key that is not a port, an outbound key outside the grammar and a version 3; the push check of §7.3 still rejects a version 2 report (reason `version`). (Amended by SHR-01: from F8 the push check accepts version 2 with outbound.) |
 | EGR-04 | **U.** Merge algebra with outbound (`proptest`, ≥ 10 000 cases): commutative and associative; recording a sequence of inbound and outbound exchanges one by one equals merging the reports of any partition of it, `origin` and `tunnels` included; past `max_authorities` the merge keeps the authorities that sort first, commutatively; `max_endpoints` is enforced per direction. |
 | EGR-05 | **U.** Bounds: with `max_authorities` = 2, an exchange and a tunnel to a third authority are `authority_limit` while the two known ones still update; with `max_endpoints` = 3, three outbound endpoints do not refuse a new inbound one, nor the reverse; outbound samples stop at half of the sample budget (`budget`) while inbound samples are still admitted up to the whole budget. For arbitrary inbound and outbound exchanges (`proptest`) the recorder never panics and its retained state, sample bytes excluded, stays below the DSC-11 bound computed for both directions and the authority limit. |
 | EGR-06 | **U.** Outbound view of redaction: in an outbound request, `Ocp-Apim-Subscription-Key: <canary>`, `X-Tenant-Key: <canary>` and `X-Anything: <canary>` keep their names and get the marker (rule `outbound_header`, fields marked `redacted`), while `accept`, `content-type`, `user-agent` and `if-none-match` values are kept, `Authorization: Basic <canary>` gives `Basic <redacted>` and `Cookie: a=<canary>` gives `a=<redacted>`; `?key=<canary>`, `?sig=<canary>` and a JSON `idempotency_key` are redacted by name; the same headers and keys in an outbound response and in an inbound request are kept (`X-Anything: v`, `?key=v`). An `AIza` key (`AIza` + 35 characters) is redacted by value in both directions, and `AIza` + 34 is kept. |
@@ -1892,14 +2023,49 @@ destination) for TLS, and read `GET /discovery` from loopback. A *canary* is as 
 | EGR-10 | **I.** Intercepted outbound: HTTPS requests over HTTP/1.1 and over `h2` (ALPN) to the test HTTPS destination are recorded with their decrypted heads and bodies under `<sni>:443`-style authorities, with `schemes.https` and the SNI in `origin.sni`; a `Host` that differs from the SNI keys the endpoint by `Host` and keeps the SNI in `origin.sni`; a `gzip` response body is decoded and inferred. |
 | EGR-11 | **I.** Unrecordable traffic: a destination that asks for a client certificate (mTLS), a destination signed by an unknown CA, an excluded SNI, a client that rejects the mimic certificate, a sidecar without CA, an opaque TCP connection and a `CONNECT` answered `200` record no endpoint and count one `tunnels` entry each, of kinds `tls_client_cert_requested`, `tls_upstream_untrusted`, `tls_excluded`, `tls_client_rejected`, `tls_no_ca`, `tcp` and `connect`, under the scope of §6.1; `mimic_discovery_tunnels_total{kind,result="recorded"}` matches; the bytes of every case are unchanged. |
 | EGR-12 | **I.** Latency: a destination that sends its response head 300 ms after the request gives outbound histogram observations at 300 ms or more, in the bucket of the `head_ms` of the matching access line; a destination whose TLS handshake is delayed by 500 ms and that answers at once gives a first exchange whose recorded `head_ms` is under 500 ms (connection setup is not in it). |
-| EGR-13 | **I.** F7 boundary: with the fake sidecar API, every pushed report is `"version": 1` and holds no outbound scope while outbound and inbound traffic is sent; after an acknowledged push `/discovery` still shows the outbound endpoints with their counters unchanged (not reset) and only the unshipped inbound exchanges; `mimic_discovery_endpoints{direction="outbound"}` and `mimic_discovery_sample_bytes` include the outbound part. |
+| EGR-13 | **I.** F7 boundary: with the fake sidecar API, every pushed report is `"version": 1` and holds no outbound scope while outbound and inbound traffic is sent; after an acknowledged push `/discovery` still shows the outbound endpoints with their counters unchanged (not reset) and only the unshipped inbound exchanges; `mimic_discovery_endpoints{direction="outbound"}` and `mimic_discovery_sample_bytes` include the outbound part. (Replaced by SHR-15 from F8: pushes carry the outbound part, which is reset after acknowledgement; the gauge clause still holds.) |
 | EGR-14 | **I.** Shedding: with `MIMIC_DISCOVERY_QUEUE=1` and `MIMIC_DISCOVERY_CAPTURE_BUDGET=1Mi`, 2000 concurrent outbound requests with 200 KiB bodies (1800 cleartext, 200 intercepted) and 200 inbound ones sent at the same time are all answered with the bytes the destination or the app sent; `mimic_discovery_exchanges_total` sums, per direction, to the exchanges of that direction, with `dropped` > 0 for outbound, at least one inbound exchange `recorded`, and bodies skipped for the budget counted `budget`. |
 | EGR-15 | **I.** Memory and limits: 256 inbound and 256 outbound endpoints over 64 authorities, each receiving 30 distinct 256 KiB JSON exchanges, leave the sidecar RSS under 128 MiB (the injected memory limit), with `mimic_discovery_sample_bytes` ≤ `MIMIC_DISCOVERY_SAMPLE_BUDGET` and the outbound samples at most half of it; a 65th authority is `authority_limit` with one WARN `authority limit reached`; a 257th outbound endpoint is `endpoint_limit` with one WARN `endpoint limit reached` (`direction` `outbound`) while a new inbound endpoint is still recorded. |
 | EGR-16 | **I.** Logs and metrics: one INFO `endpoint discovered` per new outbound endpoint with `direction` `outbound`, `authority`, `method` and `template` and no `port`; `template absorbed` likewise; WARN `sample budget full` with `direction` `outbound` once when the outbound half fills; `mimic_discovery_exchanges_total{direction="outbound"}`, `mimic_discovery_bodies_total`, `mimic_discovery_samples_total`, `mimic_discovery_redactions_total{rule="outbound_header"}` and `mimic_discovery_authorities` match the traffic sent; no `mimic_discovery_*` series has an authority label; no line holds a header value, query, body or sample. |
 | EGR-17 | **I.** No leak end to end: canaries sent by the client in outbound `Authorization`, `Cookie`, `X-Api-Key`, `Ocp-Apim-Subscription-Key` and `X-Custom` headers, a `?key=` and a `?sig=` query, an `AIza` key, a JWT path segment, `client_secret` in a form body to a token endpoint, and returned by the destination as `access_token` in a JSON body and in a `Set-Cookie`, cleartext and intercepted, appear neither in `/discovery`, nor on stdout (access lines included), nor in `/metrics`; the bytes reach the destination and the client unchanged. |
 | EGR-18 | **I.** `MIMIC_DISCOVERY_MAX_AUTHORITIES` at `0`, `10001` or `abc` exits 2 before listening (FND-01); unset, the limit is 64. |
-| EGR-19 | **E.** On kind, service A (`front`, `scripts/e2e/apps`) runs injected in its own `enabled` namespace with `UPSTREAM` the `users` Service of DSC-22 (service B); a client calls A's `/front/users/<id>` (GET with a canary bearer token and an `X-Tenant-Key` canary, PUT with a JSON body, some with B's `delay_ms=200`) and `/front/missing`. Through `kubectl port-forward`, A's `/discovery` holds `scopes.outbound."users.disc-22.svc:8080"` with `GET` and `PUT /users/{users_id}` (their counts equal to the client's calls), a `GET /missing` with a `404`, the delayed calls in histogram buckets of 200 ms or more, `Authorization: Bearer <redacted>` and `X-Tenant-Key: <redacted>` in samples (no `spec.discovery.redact` applies to `front`: the outbound allowlist does it), and none of the three canaries (the bearer token, the `X-Tenant-Key` value and the `password` of the PUT body) appears in `scopes.outbound` of `/discovery`, in A's stdout and `/metrics`, or in B's logs; neither the bearer token nor the password appears in A's inbound part, in the controller's merged report, nor in the Valkey values (the inbound `X-Tenant-Key` value of an unlisted header is the §11.1 limit, which `spec.discovery.redact` closes); B's access lines show every call (B got the traffic); the controller's merged report of `front` holds inbound endpoints only (F8). |
+| EGR-19 | **E.** On kind, service A (`front`, `scripts/e2e/apps`) runs injected in its own `enabled` namespace with `UPSTREAM` the `users` Service of DSC-22 (service B); a client calls A's `/front/users/<id>` (GET with a canary bearer token and an `X-Tenant-Key` canary, PUT with a JSON body, some with B's `delay_ms=200`) and `/front/missing`. Through `kubectl port-forward`, A's `/discovery` holds `scopes.outbound."users.disc-22.svc:8080"` with `GET` and `PUT /users/{users_id}` (their counts equal to the client's calls), a `GET /missing` with a `404`, the delayed calls in histogram buckets of 200 ms or more, `Authorization: Bearer <redacted>` and `X-Tenant-Key: <redacted>` in samples (no `spec.discovery.redact` applies to `front`: the outbound allowlist does it), and none of the three canaries (the bearer token, the `X-Tenant-Key` value and the `password` of the PUT body) appears in `scopes.outbound` of `/discovery`, in A's stdout and `/metrics`, or in B's logs; neither the bearer token nor the password appears in A's inbound part, in the controller's merged report, nor in the Valkey values (the inbound `X-Tenant-Key` value of an unlisted header is the §11.1 limit, which `spec.discovery.redact` closes); B's access lines show every call (B got the traffic); the controller's merged report of `front` holds inbound endpoints only (F8). (Amended by SHR-19: from F8 the merged report of `front` holds the outbound endpoints, and A's `/discovery` holds only what it has not shipped yet, so the endpoint, count and histogram checks read the merged report; `/discovery` is still checked for canaries.) |
 | EGR-20 | **C.** The DSC-23 fuzz target also feeds outbound exchanges (arbitrary authority, SNI, destination and tunnel kind) to the recorder; same CI schedule as DSC-23. |
+
+### 12.9 F8 — Egress shared and aggregated by the controller
+
+Levels as in §12.2. Unit tests of §7.3 to §7.6 run on reports built by the recorder and the
+bounded merge with the generators of the CTL and EGR tests (inbound and outbound exchanges, any
+authority, SNI, destination and tunnel kind). Controller integration tests run against a real
+Valkey and the fake API server as in §12.6; sidecar integration tests use the fake sidecar API
+of F3, which can be set to answer as a controller up to F7 (`400` with an empty body to any
+report that is not `"version": 1`). A *canary* is as in §12.5. From F8, SHR-01 replaces the
+version clause of CTL-01 and the last clause of EGR-03, SHR-15 replaces EGR-13, and the last
+clause of EGR-19 no longer holds (SHR-19 checks the merged outbound report); their tests are
+changed in the step that changes the behaviour.
+
+| ID | Criterion |
+|---|---|
+| SHR-01 | **U.** Structural check with outbound (§7.3): it accepts every report the recorder produces with inbound and outbound exchanges and tunnels within the §6 and §6.1 bounds, merged or not (`proptest`, ≥ 10 000 cases), and a version 1 report exactly as CTL-01 does. It rejects, each with its fixed `reason`: a version 2 report without an outbound scope, a version 1 report with one, and a version 3 (`version`); an outbound key outside the §6.1 grammar (`A.example:80`, `a.example:080`, `a.example:0`, `a.example`, a 254-byte host) (`authority`); 17 `sni` or 17 `dst`, an SNI with an upper-case letter or over 253 bytes, a `dst` that is not an IP literal and port, a scheme `ftp` (`origin`); a tunnel kind `udp` (`tunnels`); `hosts` on an outbound endpoint (`hosts`); `origin` or `tunnels` on an inbound scope (`malformed`); `MIMIC_STORE_MAX_PUSH_ENDPOINTS` + 1 outbound endpoints and `MIMIC_STORE_MAX_AUTHORITIES` + 1 outbound scopes (tunnels only) are `push_limit`, while the same number of inbound endpoints alongside is not counted against the outbound limit. |
+| SHR-02 | **U.** Re-redaction with the outbound view (§7.3): for outbound exchanges recorded by a redactor without the outbound view (an F7-era or faulty sidecar), with a canary at a random place (`proptest`, ≥ 10 000 cases): the value of a request header with an arbitrary name outside the allowlist, `?key=`, `?sig=`, a JSON `idempotency_key`, an `AIza` key, a JWT or token prefix in an allowlisted header (`user-agent`, `if-none-match`), in a header name, as the innermost JSON key at depth 4 or more, the host of an authority key and an `origin.sni` value in a detected form: the re-redacted report contains neither the canary nor its XXH3 hash in decimal or hex, redacted header values carry rule `outbound_header` and are marked `redacted`, an outbound response and an inbound request keep `X-Anything: v` and `?key=v`. A caught authority host becomes `<redacted>:<port>` and merges with an existing `<redacted>:<port>` scope (trees, `origin` and `tunnels` added); a caught SNI is removed. Re-redaction is idempotent and leaves a report recorded by an F8 sidecar with the same rules unchanged. |
+| SHR-03 | **U.** Bounded merge with outbound (§7.3): below the limits it equals the §6 merge and does not depend on the order or grouping of pushes, `origin` and `tunnels` included (`proptest`). Anti-crowding of authorities with `MIMIC_STORE_MAX_AUTHORITIES` = 2: a store of 2 authorities with 100 exchanges each, merged with a push of 50 authorities of 1 exchange each, keeps the 2 (50 `authority_limit` refusals, no eviction, the refused authorities' endpoints and samples counted nowhere else); a push of an authority with 101 exchanges, or with 101 tunnel counts and no endpoint, evicts the stored authority with the least traffic, ties broken by key (`evicted` kind `authority` = 1); a new authority tying the lowest stored traffic does not displace it. With `MIMIC_STORE_MAX_ENDPOINTS` = 3, three outbound endpoints refuse no inbound one, nor the reverse. The same input always gives byte-identical output. |
+| SHR-04 | **U.** Per-direction sample floor (§7.3), with a full budget `B`: while inbound holds at most `B`/2, a new outbound sample of a new (endpoint, status class) evicts outbound samples only, and is refused (`budget`) with nothing evicted when no outbound pair can give one; the same with the directions swapped; while inbound holds more than `B`/2, such an outbound sample evicts from the inbound pair holding the most samples. A stored report over a lowered budget is trimmed from the direction above half. For arbitrary sequences of pushes (`proptest`), a direction that holds at most `B`/2 before a merge holds no fewer samples after it, except those of its own endpoints evicted by its own new samples, and sample bytes never exceed `B` after a merge. |
+| SHR-05 | **U.** Stamping, retention and the split of §7.3: stamping day `D` sets `last_seen = D` on every outbound scope, endpoint and sample of a push; dropping with day `T` and a TTL of `n` days removes an outbound scope whose `last_seen < T − n` once it holds no endpoint, and keeps one that still holds an endpoint seen later. Splitting a merged report gives an inbound part that is `"version": 1`, byte-identical to the report the same pushes without their outbound scopes would have stored (F7), and an outbound part that is `"version": 2` with outbound scopes only, or none; the union of the two parts is the merged report; each part passes the structural check. |
+| SHR-06 | **U.** Status (§7.4): `:meta` with 2 inbound and 3 outbound endpoints gives `endpoints: {inbound: 2, outbound: 3}` and `totalEndpoints: 5`; without outbound, `outbound` is omitted and `totalEndpoints` equals `inbound`; without data `totalEndpoints` is `0`; byte-identical output for the same input; a status equal but for the defaulted `endpoints.inbound` and `totalEndpoints` compares equal. |
+| SHR-07 | **U.** Outbound documents (§7.6): a report with scopes `api.example.com:443`, `10.0.0.5:8080`, `[2001:db8::1]:8443`, `<redacted>:443` and a tunnels-only `pay.example:443` gives documents with ids `outbound-<authority>` of each, alongside unchanged `inbound-<port>` documents (byte-identical to those of the same report without outbound); `info.title` is `<ns>/<dep> outbound`, `info.x-mimic-authority` the authority; `servers` is `http://…` and `https://…` per `origin.schemes`, port written, none for the marker; `x-mimic-origin` and `x-mimic-tunnels` as stored; the tunnels-only document has empty `paths`; `/v1/payments/{payments_id}` on two authorities is in two documents; outbound `Bearer <redacted>` gives `http_bearer`. The UI-01 determinism and OpenAPI 3.1 validity and the UI-06 no-Markdown property hold for reports with outbound scopes, with canaries also in SNI values, authority hosts and tunnel scopes (`proptest`). |
+| SHR-08 | **U.** Index and endpoint list (§7.5): the index has one entry per outbound document with `direction` `outbound`, `authority`, `endpoints` and `tunnels`, sorted by id with the inbound ones; the endpoint list has the inbound entries first, unchanged, then the outbound ones by authority, template and method, with `authority`, no `port` and no `hosts`, each naming its document. The id grammar accepts every key the §6.1 grammar accepts and only those (`proptest` against the scope-key parser), and rejects `outbound-`, `outbound-a.example`, `outbound-A.example:80`, `outbound-a.example:080`, `outbound-a/b:80` and `inbound-80` written as `outbound-80`. |
+| SHR-09 | **I.** Version 2 pushes (§7.2, §7.3): a push with outbound scopes answers `200` `{"applied": true}`; `:report` then holds the inbound part (`"version": 1`, byte-identical to the stored report of the same pushes without outbound) and `:outbound` the outbound part, each equal to the split of the bounded merge; `:meta` `endpoints_outbound` counts the outbound endpoints and `report_bytes` both keys; a deployment pushed only version 1 reports has no `:outbound` key and the keys and bytes of CTL-10; duplicates are `applied: false` with both keys unchanged; each SHR-01 violation is `400` with its `reason` in the `sidecar_api` line (with `version`), `MIMIC_STORE_MAX_AUTHORITIES` + 1 outbound scopes (= 2 in the test) is `507` `push_limit` with nothing stored; the CTL-09 replica test passes with outbound pushes. With `MIMIC_STORE_MAX_AUTHORITIES` = 2 across pushes, `mimic_store_refused_total{kind="authority",reason="authority_limit"}` and `mimic_store_evicted_total{kind="authority"}` follow, with one WARN `store limit reached` (`reason` `authority_limit`) and one WARN `store evicted` (`kind` `authority`) per deployment; a corrupted `:outbound` gives ERROR `stored report unreadable` with `key` `outbound`, push `503`, read `500`, and is not overwritten. |
+| SHR-10 | **I.** No leak: version 2 pushes carrying the EGR-17 canaries unredacted in their outbound part (as a faulty sidecar would send them: headers outside the allowlist, `?key=`, `?sig=`, an `AIza` key, a JWT in an allowlisted header, a detected form as an authority host and as an SNI) and a canary under a name only `spec.discovery.redact` lists are applied, and no value of any `mimic:v1:*` key (`SCAN` dump), no line of stdout, no `/metrics` series, and no answer of the `report`, `endpoints`, `openapi` and document routes contains a canary, its XXH3 hash or the token. |
+| SHR-11 | **I.** `MIMIC_STORE_MAX_AUTHORITIES` at `0`, `10001` or `abc` exits 2 before listening (FND-01); unset, the limit is 128. |
+| SHR-12 | **I.** Status: within `MIMIC_STATUS_INTERVAL` (+ 1 s) of a version 2 push, the `MimicWorkload` gets `endpoints.outbound`, `totalEndpoints` and `exchanges` of both directions through the status subresource (CTL-18 rules: server-side apply, no request when unchanged). |
+| SHR-13 | **I.** Read routes with outbound: `/v1/workloads/<ns>/<dep>/report` answers the union of `:report` and `:outbound` (`"version": 2`), and the `:report` bytes when there is no `:outbound`; `/openapi` lists the outbound documents; `/openapi/outbound-users.disc-22.svc:8080` and `/openapi/outbound-%5B2001%3Adb8%3A%3A1%5D%3A8443` answer `200` with exactly the §7.6 output; `outbound-%3Credacted%3E%3A443` is served when stored; `400` for `outbound-a%2Fb:80`, `outbound-%ZZ`, a segment that decodes to invalid UTF-8 and the SHR-08 invalid ids, `404` for an absent authority; the page `/ui/workloads/<ns>/<dep>/openapi/<encoded id>` is served; `mimic.js` builds document links with `encodeURIComponent`; UI-07 and UI-08 hold on the outbound routes. |
+| SHR-14 | **I.** Compatibility of a version 1 sidecar: pushes of the F7 fixtures (version 1, recorded by an F7 sidecar) are applied, stored and rendered byte-identically to F7, and a controller started on a Valkey written by F7 serves and merges its data unchanged. A controller up to F7 started on a Valkey written by F8 (the `:report` bytes checked with the F7 rule: version 1, no outbound scope) reads and merges every deployment. |
+| SHR-15 | **I.** Shipping outbound (§6.1, §7.2): with the fake sidecar API accepting version 2 and outbound, inbound and tunnel traffic, every push that holds an outbound scope is `"version": 2`; per direction, the exchanges of all pushes sum to the exchanges recorded, and the tunnel counts to the tunnels recorded; an interval with only a tunnel is pushed; after an acknowledged push `/discovery` holds only outbound exchanges recorded since (counters, samples, `origin` and `tunnels` reset); outbound samples of the pending and current reports together stay at most half of `MIMIC_DISCOVERY_SAMPLE_BUDGET`; without `MIMIC_CONTROLLER_URL` the outbound part accumulates as in F7. |
+| SHR-16 | **I.** Fallback to inbound only (§7.2): with the fake sidecar API set as a controller up to F7, a pending version 2 report is followed by a post of the same session and sequence whose report is `"version": 1`, inbound only, and is applied; the fake API receives every inbound exchange once and no outbound scope; `/discovery` keeps every outbound exchange recorded so far (counts accumulated, none lost); the next interval tries version 2 again; once the fake accepts version 2, the next push carries every outbound exchange recorded since the start, each once. A report with outbound and no inbound exchange posts nothing after the `400`, and the next freeze uses the same sequence. When the first attempt has no answer (the fake applies it, then closes the connection) and the retry is answered `400`, the inbound-only post follows, the outbound part is dropped (not in `/discovery`, `mimic_discovery_outbound_dropped_total` 1, one WARN `outbound not shipped` with `reason` `unknown_outcome`), and the outbound exchanges are counted once overall. A `507` to a version 2 report falls back the same way; a `400` to the inbound-only post drops it with one WARN `report rejected`. At `SIGTERM` the flush falls back the same way and ships the inbound part within `MIMIC_SHUTDOWN_GRACE`. `mimic_discovery_pushes_total{result="inbound_only"}` counts the fallbacks; one WARN `outbound not shipped` (`status`) per streak, written again after an acknowledged version 2 push ends a streak; no line holds the token or report content. |
+| SHR-17 | **C.** The CTL-22 fuzz target also feeds version 2 reports (arbitrary outbound keys, `origin`, `tunnels`) to `Report::from_json`, the structural check, re-redaction, the bounded merge and the split: no panic, every merge result and both split parts pass the check. Same CI schedule as DSC-23. |
+| SHR-18 | **I.** Controller memory: two concurrent writes of deployments each at the store limits (512 inbound and 512 outbound endpoints over 128 authorities, schemas at their caps, `MIMIC_STORE_SAMPLE_BUDGET` full) while a `MIMIC_SIDECAR_API_MAX_REPORT` body is read and a document of each is rendered keep the controller's RSS under 512 MiB (the chart's limit). |
+| SHR-19 | **E.** On kind, `front` (service A, `scripts/e2e/apps`) runs with 2 replicas injected in its own `enabled` namespace with a `MimicWorkload`, `UPSTREAM` the `users` Service (service B); a client sends calls spread over both pods to `/front/users/<id>` (GET with a canary bearer token and an `X-Tenant-Key` canary, PUT with a JSON body holding a canary) and `/front/missing`. Within 2 push intervals, through `kubectl port-forward` to a controller pod: front's `/report` holds `scopes.outbound."users.disc-22.svc:8080"` with `GET` and `PUT /users/{users_id}` and `GET /missing` (`404`), whose counts are the sums of the outbound calls in the two front pods' access lines, each pod having sent some (the union of both pods); `/v1/workloads/<ns>/front` lists both pods; `/openapi` lists `outbound-users.disc-22.svc:8080` and its document has `/users/{users_id}` with `get` and `put`, `servers` `http://users.disc-22.svc:8080`, and `X-Tenant-Key` as a redacted header parameter; within `MIMIC_STATUS_INTERVAL` more the `MimicWorkload` of front shows `endpoints.outbound: 3` and `totalEndpoints` equal to its inbound plus 3, and `kubectl get mimicworkload` prints that total under `Endpoints`. No canary is in front's report, documents, any Valkey value, the controller's logs or the pods' `/discovery`. The `users` checks of CTL-20 and UI-11 still pass. |
+| SHR-20 | **E.** Browser: the headless Chromium of UI-12 loads front's deployment page and its `outbound-users.disc-22.svc:8080` document page: the endpoint list shows the outbound endpoints with their authority, the document shows `GET /users/{users_id}`, there is no "Try it out" or "Execute" button, Chromium's log shows no CSP violation and no request to an origin other than the port-forward, and the `users` pods log no access line during the run. |
 
 ## 13. Test strategy
 

@@ -6,7 +6,10 @@ use serde_json::{Value, json};
 use super::check::Violation;
 use super::observed::{MAX_BODY, Observation};
 use super::redact::Redactor;
-use super::report::{Direction, Exchange, Limits, Report, merge};
+use super::report::{Direction, Exchange, Limits, Report, Via, merge};
+use super::scope::ScopeKey;
+
+const AUTH: usize = 64;
 
 const PUSH: usize = 256;
 
@@ -57,7 +60,7 @@ fn at<'a>(v: &'a mut Value, suffix: &str) -> &'a mut Value {
 }
 
 fn verdict(v: &Value) -> Result<(), Violation> {
-    Report::parse_checked(&v.to_string(), PUSH).map(|_| ())
+    Report::parse_checked(&v.to_string(), PUSH, AUTH).map(|_| ())
 }
 
 fn schema_leaf() -> Value {
@@ -411,34 +414,41 @@ fn ctl_01_accepts_the_bounds_exactly() {
 fn ctl_01_push_limit_is_per_direction() {
     let l = limits(100, 256, 1 << 20);
     let record = |r: &mut Report, direction, path: &str| {
-        r.record(
-            &l,
-            &Redactor::default(),
-            &Exchange {
-                direction,
-                port: 80,
-                method: "GET",
-                path,
-                status: 200,
-                head_ms: 1,
-                host: None,
-                grpc: false,
-                observation: Observation::default(),
-            },
-        );
+        let exchange = Exchange {
+            direction,
+            port: 80,
+            method: "GET",
+            path,
+            status: 200,
+            head_ms: 1,
+            host: None,
+            grpc: false,
+            observation: Observation::default(),
+        };
+        if direction == Direction::Outbound {
+            let key = ScopeKey::Authority("out.example.com:80".into());
+            let via = Via {
+                tls: false,
+                sni: None,
+                dst: None,
+            };
+            r.record_at(key, &via, &l, &Redactor::default(), &exchange);
+        } else {
+            r.record(&l, &Redactor::default(), &exchange);
+        }
     };
     let mut r = Report::new(None);
     for p in ["/a", "/b", "/c"] {
         record(&mut r, Direction::Inbound, p);
         record(&mut r, Direction::Outbound, p);
     }
-    assert_eq!(r.check(3), Ok(()));
+    assert_eq!(r.check(3, AUTH), Ok(()));
     record(&mut r, Direction::Outbound, "/d");
-    let err = r.check(3).unwrap_err();
+    let err = r.check(3, AUTH).unwrap_err();
     assert_eq!(err, Violation::PushLimit);
     assert_eq!(err.reason(), "push_limit");
     assert!(err.is_push_limit());
-    let err = Report::parse_checked(&r.to_json().unwrap(), 3).unwrap_err();
+    let err = Report::parse_checked(&r.to_json().unwrap(), 3, AUTH).unwrap_err();
     assert_eq!(err.reason(), "push_limit");
 }
 
@@ -453,14 +463,14 @@ fn ctl_01_malformed_input_is_a_violation_not_a_panic() {
         "\u{0}",
         "{\"version\":\"1\"}",
     ] {
-        let err = Report::parse_checked(bad, PUSH).unwrap_err();
+        let err = Report::parse_checked(bad, PUSH, AUTH).unwrap_err();
         assert!(
             matches!(err, Violation::Malformed | Violation::Version),
             "{bad:?}: {err:?}"
         );
     }
     let deep = format!("{}1{}", "[".repeat(100_000), "]".repeat(100_000));
-    assert!(Report::parse_checked(&deep, PUSH).is_err());
+    assert!(Report::parse_checked(&deep, PUSH, AUTH).is_err());
 }
 
 #[test]
@@ -605,31 +615,38 @@ fn record_all(l: &Limits, items: &[Ex]) -> Report {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         headers.push(("content-type", "application/json"));
-        r.record(
-            l,
-            &Redactor::default(),
-            &Exchange {
-                direction: if e.outbound {
-                    Direction::Outbound
-                } else {
-                    Direction::Inbound
-                },
-                port: e.port,
-                method: "POST",
-                path: &e.path,
-                status: e.status,
-                head_ms: e.ms,
-                host: Some(&e.host),
-                grpc: e.grpc,
-                observation: Observation {
-                    query: &e.query,
-                    req_headers: &headers,
-                    req_body: e.body.as_deref().map(str::as_bytes),
-                    resp_headers: &headers,
-                    resp_body: e.body.as_deref().map(str::as_bytes),
-                },
+        let exchange = Exchange {
+            direction: if e.outbound {
+                Direction::Outbound
+            } else {
+                Direction::Inbound
             },
-        );
+            port: e.port,
+            method: "POST",
+            path: &e.path,
+            status: e.status,
+            head_ms: e.ms,
+            host: Some(&e.host),
+            grpc: e.grpc,
+            observation: Observation {
+                query: &e.query,
+                req_headers: &headers,
+                req_body: e.body.as_deref().map(str::as_bytes),
+                resp_headers: &headers,
+                resp_body: e.body.as_deref().map(str::as_bytes),
+            },
+        };
+        if e.outbound {
+            let key = ScopeKey::Authority(format!("h{}.example.com:{}", e.port, e.port));
+            let via = Via {
+                tls: false,
+                sni: None,
+                dst: None,
+            };
+            r.record_at(key, &via, l, &Redactor::default(), &exchange);
+        } else {
+            r.record(l, &Redactor::default(), &exchange);
+        }
     }
     r
 }
@@ -650,18 +667,18 @@ proptest! {
         let a = record_all(&l, &items[..split]);
         let b = record_all(&l, &items[split..]);
         for r in [&a, &b] {
-            prop_assert_eq!(r.check(PUSH), Ok(()), "recorded");
+            prop_assert_eq!(r.check(PUSH, AUTH), Ok(()), "recorded");
             let json = r.to_json().unwrap();
-            prop_assert!(Report::parse_checked(&json, PUSH).is_ok(), "round trip");
+            prop_assert!(Report::parse_checked(&json, PUSH, AUTH).is_ok(), "round trip");
         }
         let merged = merge(a, b, &l);
-        prop_assert_eq!(merged.check(PUSH), Ok(()), "merged");
-        prop_assert!(Report::parse_checked(&merged.to_json().unwrap(), PUSH).is_ok());
+        prop_assert_eq!(merged.check(PUSH, AUTH), Ok(()), "merged");
+        prop_assert!(Report::parse_checked(&merged.to_json().unwrap(), PUSH, AUTH).is_ok());
     }
 
     #[test]
     fn ctl_01_never_panics_on_arbitrary_input(s in "\\PC{0,400}") {
-        let _ = Report::parse_checked(&s, PUSH);
+        let _ = Report::parse_checked(&s, PUSH, AUTH);
     }
 
     #[test]
@@ -677,7 +694,7 @@ proptest! {
         if let Some(c) = cut {
             bytes.truncate(c.index(bytes.len()));
         }
-        let _ = Report::parse_checked(&String::from_utf8_lossy(&bytes), PUSH);
+        let _ = Report::parse_checked(&String::from_utf8_lossy(&bytes), PUSH, AUTH);
     }
 }
 

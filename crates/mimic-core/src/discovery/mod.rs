@@ -33,6 +33,8 @@ mod tests_openapi_ops;
 #[cfg(test)]
 mod tests_outbound_view;
 #[cfg(test)]
+mod tests_push_v2;
+#[cfg(test)]
 mod tests_samples;
 #[cfg(test)]
 mod tests_schema;
