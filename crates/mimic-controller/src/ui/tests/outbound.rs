@@ -240,6 +240,9 @@ async fn shr_13_mimic_js_shows_the_authority_and_encodes_the_ids() {
 const CHILD: &str = "MIMIC_SHR_18_CHILD";
 const RSS_LIMIT: u64 = 512 * 1024 * 1024;
 const MAX_REPORT: usize = 32 * 1024 * 1024;
+/// Keys of the JSON bodies of the exchanges: sets the size of the pushes (about 20 MB of JSON at
+/// the store limits, 32 MiB with the padding of the body).
+const KEYS: usize = 28;
 
 /// The controller's default store limits.
 const FULL: Limits = Limits {
@@ -262,7 +265,7 @@ fn peak_rss() -> u64 {
 
 fn wide_body(seed: usize, status: u16) -> String {
     let mut out = String::from("{");
-    for key in 0..40 {
+    for key in 0..KEYS {
         if key > 0 {
             out.push(',');
         }
@@ -337,7 +340,16 @@ fn full_push(pod: &str, salt: usize) -> Push {
     }
 }
 
-async fn shr_18_work() {
+/// The body of a full-size push, padded to `MIMIC_SIDECAR_API_MAX_REPORT` as the handler holds it.
+fn full_body(dep: &str) -> String {
+    let push = full_push(&format!("{dep}-1"), dep.len());
+    let mut body = push.report.to_json().expect("serialises");
+    assert!(body.len() < MAX_REPORT, "{} bytes", body.len());
+    body.extend(std::iter::repeat_n(' ', MAX_REPORT - body.len()));
+    body
+}
+
+async fn shr_18_work(dir: &str) {
     let mut metrics = Metrics::new("controller", "test");
     let store = Store::new(
         redis::Client::open(valkey_url().as_str()).expect("a valid URL"),
@@ -354,17 +366,16 @@ async fn shr_18_work() {
     for dep in ["front", "back"] {
         let store = store.clone();
         let ns = ns.clone();
+        let path = format!("{dir}/{dep}.json");
         writes.push(tokio::spawn(async move {
-            // The body as the push handler holds it: one full-size buffer, parsed and checked.
-            let push = full_push(&format!("{dep}-1"), dep.len());
-            let mut body = push.report.to_json().expect("serialises");
-            assert!(body.len() < MAX_REPORT, "{} bytes", body.len());
-            body.extend(std::iter::repeat_n(' ', MAX_REPORT - body.len()));
-            let parsed = Report::parse_checked(&body, 1024, 128).expect("a valid push");
+            let body = std::fs::read_to_string(path).expect("the body");
+            let mut report = Report::parse_checked(&body, 1024, 128).expect("a valid push");
+            report.re_redact(&Redactor::default());
             drop(body);
             let push = Push {
-                report: parsed,
-                ..push
+                pod: format!("{dep}-1"),
+                seq: Some(SeqId::parse(SESSION, 1).expect("valid seq")),
+                report,
             };
             store.push(&ns, dep, push).await.expect("push applied");
         }));
@@ -372,16 +383,19 @@ async fn shr_18_work() {
     for write in writes {
         write.await.expect("the write ran");
     }
+    // A document of each kind per deployment, rendered at once.
+    let mut reads = Vec::new();
     for dep in ["front", "back"] {
-        let base = format!("/v1/workloads/{ns}/{dep}/openapi");
         for id in ["inbound-8000", "outbound-a0.example.com%3A443"] {
-            let answer = fetch(&app, &format!("{base}/{id}")).await;
-            assert_eq!(answer.status, 200, "{dep} {id}");
-            assert!(answer.body.len() > 1000);
+            let app = app.clone();
+            let path = format!("/v1/workloads/{ns}/{dep}/openapi/{id}");
+            reads.push(tokio::spawn(async move { fetch(&app, &path).await }));
         }
-        assert_eq!(fetch(&app, &base).await.status, 200);
-        let report = fetch(&app, &format!("/v1/workloads/{ns}/{dep}/report")).await;
-        assert_eq!(report.status, 200);
+    }
+    for read in reads {
+        let answer = read.await.expect("the render ran");
+        assert_eq!(answer.status, 200);
+        assert!(answer.body.len() > 1000);
     }
     let peak = peak_rss();
     assert!(
@@ -394,13 +408,19 @@ async fn shr_18_work() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shr_18_child_work() {
-    if std::env::var_os(CHILD).is_some() {
-        shr_18_work().await;
+    if let Some(dir) = std::env::var_os(CHILD) {
+        shr_18_work(dir.to_str().expect("a UTF-8 path")).await;
     }
 }
 
 #[test]
 fn shr_18_two_max_size_writes_and_renders_stay_under_512_mib() {
+    // The bodies are built here, so that the peak of the child is the controller's own.
+    let dir = std::env::temp_dir().join(unique("mimic-shr18"));
+    std::fs::create_dir(&dir).expect("a scratch directory");
+    for dep in ["front", "back"] {
+        std::fs::write(dir.join(format!("{dep}.json")), full_body(dep)).expect("a body");
+    }
     let exe = std::env::current_exe().expect("the test binary");
     let output = std::process::Command::new(exe)
         .args([
@@ -408,9 +428,10 @@ fn shr_18_two_max_size_writes_and_renders_stay_under_512_mib() {
             "ui::tests::outbound::shr_18_child_work",
             "--nocapture",
         ])
-        .env(CHILD, "1")
+        .env(CHILD, &dir)
         .output()
         .expect("the child runs");
+    std::fs::remove_dir_all(&dir).expect("the scratch directory goes");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

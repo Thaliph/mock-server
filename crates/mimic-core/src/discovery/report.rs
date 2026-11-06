@@ -1382,19 +1382,28 @@ impl Report {
     /// (`"version": 2`, outbound scopes only; none without outbound scopes) of a report
     /// (spec §7.3, write).
     pub fn split(&self) -> (Report, Option<Report>) {
-        let part = |direction: Direction, version: u32| Report {
-            version,
-            pod: self.pod.clone(),
-            exchanges: 0,
-            outbound_exchanges: 0,
-            scopes: self
-                .scopes
-                .get(&direction)
-                .map(|scopes| BTreeMap::from([(direction, scopes.clone())]))
-                .unwrap_or_default(),
-        };
-        let mut inbound = part(Direction::Inbound, 1);
-        let mut outbound = part(Direction::Outbound, 2);
+        self.clone().into_split()
+    }
+
+    /// [`Report::split`] without copying the scopes: the controller's write holds a report of
+    /// tens of megabytes at the store limits (SHR-18).
+    pub fn into_split(mut self) -> (Report, Option<Report>) {
+        let part =
+            |direction: Direction, version: u32, scopes: Option<BTreeMap<ScopeKey, Scope>>| {
+                Report {
+                    version,
+                    pod: self.pod.clone(),
+                    exchanges: 0,
+                    outbound_exchanges: 0,
+                    scopes: scopes
+                        .map(|scopes| BTreeMap::from([(direction, scopes)]))
+                        .unwrap_or_default(),
+                }
+            };
+        let inbound_scopes = self.scopes.remove(&Direction::Inbound);
+        let outbound_scopes = self.scopes.remove(&Direction::Outbound);
+        let mut inbound = part(Direction::Inbound, 1, inbound_scopes);
+        let mut outbound = part(Direction::Outbound, 2, outbound_scopes);
         // A report counts its exchanges once: the outbound part takes the counter of the
         // outbound ones (also those of scopes that are gone), the inbound part the rest, so
         // that the parts add up to the report.

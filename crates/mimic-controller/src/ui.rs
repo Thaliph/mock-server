@@ -325,7 +325,7 @@ where
         ReadError::Unreadable
     };
     // Names and the read come first: an invalid or unknown request never waits for a slot.
-    let (bytes, version) = ui.store.stored_report(namespace, deployment).await?;
+    let stored = ui.store.stored_report(namespace, deployment).await?;
     // The permit moves into the blocking closure: a dropped request leaves the render running,
     // and the slot with it.
     let permit = ui
@@ -341,10 +341,8 @@ where
         if let Some(hook) = hook {
             hook();
         }
-        let report = std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|json| Report::parse_checked(json, usize::MAX, usize::MAX).ok())
-            .ok_or(Failure::Report)?;
+        let version = stored.version;
+        let report = stored.parse().ok_or(Failure::Report)?;
         let value = build(&report, version).ok_or(Failure::Absent)?;
         serde_json::to_vec(&value).map_err(|_| Failure::Render)
     })
@@ -409,7 +407,7 @@ async fn openapi_document(
     matched: MatchedPath,
     Path((namespace, deployment, id)): Path<(String, String, String)>,
 ) -> Result<Response, ReadError> {
-    if openapi::parse_id(&id).is_none() {
+    if openapi::parse_document_id(&id).is_none() {
         return Err(ReadError::Name);
     }
     let (ns, dep) = (namespace.clone(), deployment.clone());
