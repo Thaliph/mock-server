@@ -2,7 +2,7 @@
 //! `MIMIC_TEST_VALKEY_URL` (for example `redis://127.0.0.1:6379`, no password).
 
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
@@ -27,6 +27,17 @@ struct FakeSink {
     calls: Mutex<Vec<(String, String, Value)>>,
     fail: AtomicBool,
     hang: AtomicBool,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+/// Decrements the in-flight count when the apply ends or is abandoned.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FakeSink {
@@ -38,6 +49,9 @@ impl FakeSink {
 impl StatusSink for FakeSink {
     fn apply<'a>(&'a self, ns: &'a str, name: &'a str, discovery: &'a Value) -> ApplyFuture<'a> {
         Box::pin(async move {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            let _in_flight = InFlight(&self.in_flight);
             self.calls
                 .lock()
                 .unwrap()
@@ -473,4 +487,39 @@ async fn ctl_18_unreadable_pods_are_logged_as_pods() {
     let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert_eq!(raw.matches("stored pods unreadable").count(), 1, "{raw}");
     assert_eq!(raw.matches("stored meta unreadable").count(), 0, "{raw}");
+}
+
+#[tokio::test]
+async fn ctl_18_hung_applies_run_concurrently_within_a_fixed_bound() {
+    let ns = unique("ctl18");
+    let names: Vec<String> = (0..20).map(|i| format!("w{i:02}")).collect();
+    let workloads: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|n| (ns.as_str(), n.as_str(), "users"))
+        .collect();
+    let s = setup(&valkey_url(), &workloads);
+    s.sink.hang.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    s.reconciler.tick(now_ms()).await;
+    // 20 hung applies of 200 ms: 3 rounds of 8 at most, not 20 in a row (4 s). #293 note 25.
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert_eq!(s.sink.calls().len(), 20);
+    assert_eq!(s.sink.max_in_flight.load(Ordering::SeqCst), 8);
+    assert_eq!(count(&s.metrics, "error"), 20.0);
+}
+
+#[tokio::test]
+async fn ctl_18_concurrent_applies_still_skip_unchanged_statuses() {
+    let ns = unique("ctl18");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "users"), (&ns, "w2", "users")]);
+    s.reconciler.tick(now_ms()).await;
+    let first = s.sink.calls();
+    assert_eq!(first.len(), 2);
+    for call in &first {
+        s.reconciler
+            .cache
+            .set_status(&ns, &call.1, Some(call.2.clone()));
+    }
+    s.reconciler.tick(now_ms()).await;
+    assert_eq!(s.sink.calls().len(), 2);
 }
