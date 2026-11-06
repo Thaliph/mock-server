@@ -6,13 +6,15 @@ use super::check::Violation;
 use super::observed::Observation;
 use super::redact::Redactor;
 use super::report::{Direction, Exchange, Limits, Report, Via};
+
+const AUTH: usize = 64;
 use super::scope::{ScopeKey, authority_key};
 
-fn dst(s: &str) -> SocketAddr {
+pub(super) fn dst(s: &str) -> SocketAddr {
     s.parse().expect("socket address")
 }
 
-fn limits() -> Limits {
+pub(super) fn limits() -> Limits {
     Limits {
         max_literals: 8,
         max_endpoints: 256,
@@ -22,7 +24,7 @@ fn limits() -> Limits {
 }
 
 /// A fixed inbound report: ports, templates, a gRPC path, hosts, samples.
-fn v1_report() -> Report {
+pub(super) fn v1_report() -> Report {
     let l = limits();
     let mut r = Report::new(Some("pod-a".into()));
     let h = [("content-type", "application/json")];
@@ -72,10 +74,10 @@ fn v1_report() -> Report {
     r
 }
 
-const V1_FIXTURE: &str = include_str!("../../tests/fixtures/report-v1.json");
+pub(super) const V1_FIXTURE: &str = include_str!("../../tests/fixtures/report-v1.json");
 
 /// One outbound exchange to `authority`.
-fn outbound(r: &mut Report, authority: &str, path: &str, status: u16) {
+pub(super) fn outbound(r: &mut Report, authority: &str, path: &str, status: u16) {
     r.record_at(
         ScopeKey::Authority(authority.to_string()),
         &Via {
@@ -312,18 +314,6 @@ fn egr_03_from_json_refuses_what_the_format_does_not_allow() {
     }
 }
 
-#[test]
-fn egr_03_the_push_check_still_refuses_version_2() {
-    let mut r = v1_report();
-    assert_eq!(r.check(256), Ok(()));
-    outbound(&mut r, "api.example.com:443", "/v1/charges", 200);
-    let err = r.check(256).unwrap_err();
-    assert_eq!(err, Violation::Version);
-    let err = Report::parse_checked(&r.to_json().unwrap(), 256).unwrap_err();
-    assert_eq!(err.reason(), "version");
-    assert!(Report::parse_checked(V1_FIXTURE, 256).is_ok());
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10_000))]
 
@@ -411,7 +401,7 @@ fn egr_03_from_json_refuses_origin_and_tunnels_on_inbound_scopes() {
         let bad = with_scope_field(V1_FIXTURE, "inbound", "8080", field, value.clone());
         assert!(Report::from_json(&bad).is_err(), "{field}");
         assert_eq!(
-            Report::parse_checked(&bad, 256).unwrap_err(),
+            Report::parse_checked(&bad, 256, AUTH).unwrap_err(),
             Violation::Malformed,
             "{field}"
         );

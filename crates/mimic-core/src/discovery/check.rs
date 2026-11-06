@@ -27,6 +27,9 @@ pub enum Violation {
     BodySize,
     BodyMedia,
     SampleBytes,
+    Authority,
+    Origin,
+    Tunnels,
 }
 
 impl Violation {
@@ -54,6 +57,9 @@ impl Violation {
             Self::BodySize => "body_size",
             Self::BodyMedia => "body_media",
             Self::SampleBytes => "sample_bytes",
+            Self::Authority => "authority",
+            Self::Origin => "origin",
+            Self::Tunnels => "tunnels",
         }
     }
 

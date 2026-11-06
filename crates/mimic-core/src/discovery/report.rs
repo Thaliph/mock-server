@@ -1190,9 +1190,19 @@ impl Report {
         self.stats_at(&routed).map(|_| routed)
     }
 
+    /// 1, or 2 when the report holds outbound scopes (spec §6.1).
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
     /// Within the bounds of spec §6 and, per direction, at most `max_push_endpoints`
     /// endpoints: what the recorder of a sidecar can produce (spec §7.3, structural check).
-    pub fn check(&self, max_push_endpoints: usize) -> Result<(), Violation> {
+    pub fn check(
+        &self,
+        max_push_endpoints: usize,
+        max_authorities: usize,
+    ) -> Result<(), Violation> {
+        let _ = max_authorities;
         // Version 2 and outbound authorities are F8's (spec §6.1): a push is version 1.
         if self.version != 1 || self.has_authorities() {
             return Err(Violation::Version);
@@ -1220,7 +1230,11 @@ impl Report {
     }
 
     /// Parses a pushed body, then checks it. Never panics, whatever the input.
-    pub fn parse_checked(json: &str, max_push_endpoints: usize) -> Result<Self, Violation> {
+    pub fn parse_checked(
+        json: &str,
+        max_push_endpoints: usize,
+        max_authorities: usize,
+    ) -> Result<Self, Violation> {
         let report: Report = serde_json::from_str(json).map_err(|e| {
             if e.is_data() && e.to_string().starts_with("unknown field") {
                 Violation::UnknownField
@@ -1228,7 +1242,7 @@ impl Report {
                 Violation::Malformed
             }
         })?;
-        report.check(max_push_endpoints)?;
+        report.check(max_push_endpoints, max_authorities)?;
         Ok(report)
     }
 

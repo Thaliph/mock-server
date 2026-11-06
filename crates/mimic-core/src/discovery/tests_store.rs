@@ -192,7 +192,7 @@ proptest! {
         prop_assert_eq!(ids(&one), ids(&two));
         prop_assert!(one.report.endpoints().len() <= max_endpoints);
         prop_assert!(one.report.sample_bytes() <= l.sample_budget);
-        prop_assert_eq!(one.report.check(256), Ok(()));
+        prop_assert_eq!(one.report.check(256, 64), Ok(()));
     }
 }
 

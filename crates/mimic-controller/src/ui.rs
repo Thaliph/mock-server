@@ -333,7 +333,7 @@ where
         }
         let report = std::str::from_utf8(&bytes)
             .ok()
-            .and_then(|json| Report::parse_checked(json, usize::MAX).ok())
+            .and_then(|json| Report::parse_checked(json, usize::MAX, usize::MAX).ok())
             .ok_or(Failure::Report)?;
         let value = build(&report, version).ok_or(Failure::Absent)?;
         serde_json::to_vec(&value).map_err(|_| Failure::Render)

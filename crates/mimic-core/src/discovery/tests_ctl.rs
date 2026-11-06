@@ -9,6 +9,8 @@ use xxhash_rust::xxh3::xxh3_64;
 use super::observed::Observation;
 use super::redact::{MARKER, Redactor};
 use super::report::{Direction, Exchange, Limits, Report, merge};
+
+const AUTH: usize = 64;
 use super::store::{Kind, drop_expired, merge_bounded};
 
 const LIMITS: Limits = Limits {
@@ -641,7 +643,7 @@ fn ctl_04_stamp_overrides_a_value_sent_by_a_pod() {
     assert!(json.contains("\"last_seen\":99999"));
     let far = json.replace("99999", "4000000000");
     let mut pushed =
-        Report::parse_checked(&far, 256).expect("a report with last_seen passes the check");
+        Report::parse_checked(&far, 256, AUTH).expect("a report with last_seen passes the check");
     assert_eq!(days(&pushed)["/e1"].0, Some(4_000_000_000));
     pushed.stamp(20_000);
     let d = days(&pushed);
@@ -653,7 +655,7 @@ fn ctl_04_sidecar_report_parses_and_never_serialises_last_seen() {
     let r = record(&Redactor::default(), &Input::default(), 1);
     let json = r.to_json().unwrap();
     assert!(!json.contains("last_seen"));
-    let back = Report::parse_checked(&json, 256).expect("parses without last_seen");
+    let back = Report::parse_checked(&json, 256, AUTH).expect("parses without last_seen");
     assert_eq!(days(&back)["/p"], (None, vec![None]));
     assert_eq!(back.to_json().unwrap(), json);
 }
@@ -750,7 +752,7 @@ fn ctl_16_dropping_the_samples_keeps_counters_and_shape() {
     assert_eq!(report.sample_bytes(), 0);
     assert_eq!(report.exchanges(), 3);
     assert_eq!(report.endpoints().len(), before);
-    assert!(report.check(256).is_ok());
+    assert!(report.check(256, AUTH).is_ok());
 }
 
 const AUTH_CANARY: &str = "sk1a2b3c4d5e6f";

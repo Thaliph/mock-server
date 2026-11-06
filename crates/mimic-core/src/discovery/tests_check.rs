@@ -8,6 +8,8 @@ use super::observed::{MAX_BODY, Observation};
 use super::redact::Redactor;
 use super::report::{Direction, Exchange, Limits, Report, merge};
 
+const AUTH: usize = 64;
+
 const PUSH: usize = 256;
 
 /// A name and the change that makes a valid report break (or not) its bound.
@@ -57,7 +59,7 @@ fn at<'a>(v: &'a mut Value, suffix: &str) -> &'a mut Value {
 }
 
 fn verdict(v: &Value) -> Result<(), Violation> {
-    Report::parse_checked(&v.to_string(), PUSH).map(|_| ())
+    Report::parse_checked(&v.to_string(), PUSH, AUTH).map(|_| ())
 }
 
 fn schema_leaf() -> Value {
@@ -142,6 +144,7 @@ fn ctl_01_rejects_each_violation_with_its_own_reason() {
     let long_name = "n".repeat(129);
     let cases: Vec<Case> = vec![
         ("version", Box::new(|v| v["version"] = json!(2))),
+        ("version 3", Box::new(|v| v["version"] = json!(3))),
         (
             "samples",
             Box::new(|v| {
@@ -432,13 +435,13 @@ fn ctl_01_push_limit_is_per_direction() {
         record(&mut r, Direction::Inbound, p);
         record(&mut r, Direction::Outbound, p);
     }
-    assert_eq!(r.check(3), Ok(()));
+    assert_eq!(r.check(3, AUTH), Ok(()));
     record(&mut r, Direction::Outbound, "/d");
-    let err = r.check(3).unwrap_err();
+    let err = r.check(3, AUTH).unwrap_err();
     assert_eq!(err, Violation::PushLimit);
     assert_eq!(err.reason(), "push_limit");
     assert!(err.is_push_limit());
-    let err = Report::parse_checked(&r.to_json().unwrap(), 3).unwrap_err();
+    let err = Report::parse_checked(&r.to_json().unwrap(), 3, AUTH).unwrap_err();
     assert_eq!(err.reason(), "push_limit");
 }
 
@@ -453,14 +456,14 @@ fn ctl_01_malformed_input_is_a_violation_not_a_panic() {
         "\u{0}",
         "{\"version\":\"1\"}",
     ] {
-        let err = Report::parse_checked(bad, PUSH).unwrap_err();
+        let err = Report::parse_checked(bad, PUSH, AUTH).unwrap_err();
         assert!(
             matches!(err, Violation::Malformed | Violation::Version),
             "{bad:?}: {err:?}"
         );
     }
     let deep = format!("{}1{}", "[".repeat(100_000), "]".repeat(100_000));
-    assert!(Report::parse_checked(&deep, PUSH).is_err());
+    assert!(Report::parse_checked(&deep, PUSH, AUTH).is_err());
 }
 
 #[test]
@@ -650,18 +653,18 @@ proptest! {
         let a = record_all(&l, &items[..split]);
         let b = record_all(&l, &items[split..]);
         for r in [&a, &b] {
-            prop_assert_eq!(r.check(PUSH), Ok(()), "recorded");
+            prop_assert_eq!(r.check(PUSH, AUTH), Ok(()), "recorded");
             let json = r.to_json().unwrap();
-            prop_assert!(Report::parse_checked(&json, PUSH).is_ok(), "round trip");
+            prop_assert!(Report::parse_checked(&json, PUSH, AUTH).is_ok(), "round trip");
         }
         let merged = merge(a, b, &l);
-        prop_assert_eq!(merged.check(PUSH), Ok(()), "merged");
-        prop_assert!(Report::parse_checked(&merged.to_json().unwrap(), PUSH).is_ok());
+        prop_assert_eq!(merged.check(PUSH, AUTH), Ok(()), "merged");
+        prop_assert!(Report::parse_checked(&merged.to_json().unwrap(), PUSH, AUTH).is_ok());
     }
 
     #[test]
     fn ctl_01_never_panics_on_arbitrary_input(s in "\\PC{0,400}") {
-        let _ = Report::parse_checked(&s, PUSH);
+        let _ = Report::parse_checked(&s, PUSH, AUTH);
     }
 
     #[test]
@@ -677,7 +680,7 @@ proptest! {
         if let Some(c) = cut {
             bytes.truncate(c.index(bytes.len()));
         }
-        let _ = Report::parse_checked(&String::from_utf8_lossy(&bytes), PUSH);
+        let _ = Report::parse_checked(&String::from_utf8_lossy(&bytes), PUSH, AUTH);
     }
 }
 

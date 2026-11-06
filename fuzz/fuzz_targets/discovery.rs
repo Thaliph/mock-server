@@ -49,20 +49,22 @@ const LIMITS: Limits = Limits {
 };
 /// Endpoints per direction accepted from a push.
 const PUSH: usize = 16;
+/// Outbound scopes accepted from a push.
+const PUSH_AUTHORITIES: usize = 16;
 /// Appears in every exchange under a listed name: it must never reach the report.
 const CANARY: &str = "FUZZCANARYVALUE";
 
 /// Everything the controller does with a pushed body, against a fixed valid report.
 fn push(stored: &Report, text: &str) {
     let _ = Report::from_json(text);
-    let Ok(mut pushed) = Report::parse_checked(text, PUSH) else {
+    let Ok(mut pushed) = Report::parse_checked(text, PUSH, PUSH_AUTHORITIES) else {
         return;
     };
     pushed.re_redact(&Redactor::new(["fuzzsecret"]));
     pushed.stamp(20_000);
     let bounded = merge_bounded(stored.clone(), pushed, &LIMITS);
     assert!(
-        bounded.report.check(LIMITS.max_endpoints).is_ok(),
+        bounded.report.check(LIMITS.max_endpoints, LIMITS.max_authorities).is_ok(),
         "a merge result fails the structural check"
     );
 }
@@ -191,6 +193,10 @@ fuzz_target!(|data: &[u8]| {
     }
     let [a, b] = reports;
     let merged = merge(a, b, &LIMITS);
+    assert!(
+        merged.check(PUSH, PUSH_AUTHORITIES).is_ok(),
+        "a recorded report fails the structural check"
+    );
     let json = merged.to_json().expect("a report serialises");
     push(&merged, &String::from_utf8_lossy(data));
     let mut bytes = json.clone().into_bytes();
