@@ -1184,6 +1184,13 @@ impl Report {
         self.sync_version();
     }
 
+    /// Whether the report holds an inbound scope (an outbound part holds none).
+    pub fn holds_inbound(&self) -> bool {
+        self.scopes
+            .get(&Direction::Inbound)
+            .is_some_and(|scopes| !scopes.is_empty())
+    }
+
     fn has_authorities(&self) -> bool {
         self.scopes
             .get(&Direction::Outbound)
