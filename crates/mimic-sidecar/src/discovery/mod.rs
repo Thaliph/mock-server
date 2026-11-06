@@ -38,6 +38,9 @@ pub use ship::{ShipConfig, Shipper, Target};
 pub(crate) struct Handoff {
     /// Sample bytes of the pending report: the current report may use the rest of the budget.
     pending_samples: AtomicUsize,
+    /// The part of `pending_samples` held by the pending report's outbound scopes: they share
+    /// half of the budget with the egress report.
+    pending_egress_samples: AtomicUsize,
     /// Counts the freezes. Written under the report's lock.
     epoch: AtomicU64,
     /// Endpoints of the pending report, for the gauges. Written under the report's lock.
@@ -51,8 +54,8 @@ pub(crate) struct Handoff {
 /// Discovery of one sidecar: the local report and the thread that fills it.
 pub struct Discovery {
     report: Arc<Mutex<Report>>,
-    /// The outbound exchanges (spec §6.1): kept for the life of the process, never frozen,
-    /// shipped nor reset in F7.
+    /// The outbound exchanges (spec §6.1): frozen with the inbound report when shipping, kept
+    /// for the life of the process without a controller.
     egress: Arc<Mutex<Report>>,
     limits: Limits,
     pod: Option<String>,
@@ -114,6 +117,8 @@ impl Discovery {
             config,
             ship::Parts {
                 report: self.report.clone(),
+                egress: self.egress.clone(),
+                limits: self.limits,
                 pod: self.pod.clone(),
                 handoff: self.handoff.clone(),
                 budget: self.budget.clone(),

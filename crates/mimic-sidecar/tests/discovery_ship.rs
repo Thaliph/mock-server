@@ -1310,7 +1310,10 @@ async fn first_then_400(first: Reply) -> (Rig, common::Logs) {
     .await;
     traffic(&rig, 2, 3).await;
     let (stop, task) = rig.start();
-    wait(|| rig.api.acknowledged() >= 2).await;
+    // The three posts, the last one acknowledged (a `200` that the fake sends with a body that
+    // does not acknowledge is not).
+    wait(|| rig.api.count() >= 3).await;
+    wait(|| metric(&rig, "mimic_discovery_pushes_total{result=\"ok\"}") >= 1).await;
     drop(stop);
     task.await.unwrap();
     (rig, logs)
