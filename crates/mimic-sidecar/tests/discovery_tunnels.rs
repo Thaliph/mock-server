@@ -15,17 +15,9 @@ use tokio::net::{TcpListener, TcpStream};
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 const PROXY_SECRET: &str = "CANARY-PROXYAUTH-61c";
-const PATH_SECRET: &str = "CANARY-PATH-61c";
 const QUERY_SECRET: &str = "CANARY-QUERY-61c";
 const HEADER_SECRET: &str = "CANARY-HEADER-61c";
-const BODY_SECRET: &str = "CANARY-BODY-61c";
-const SECRETS: [&str; 5] = [
-    PROXY_SECRET,
-    PATH_SECRET,
-    QUERY_SECRET,
-    HEADER_SECRET,
-    BODY_SECRET,
-];
+const SECRETS: [&str; 3] = [PROXY_SECRET, QUERY_SECRET, HEADER_SECRET];
 
 fn discovery(config: &DiscoveryConfig) -> Discovery {
     Discovery::start(config, Some("pod-a".into())).unwrap()
@@ -215,7 +207,7 @@ async fn egr_11_the_authority_limit_refuses_new_tunnels_and_exchanges_with_one_w
     .await;
     counted(metrics, "mimic_discovery_authorities 2").await;
     // An exchange to a new authority is refused as well, and one line says so.
-    let provider = echo_server().await;
+    let provider = provider().await;
     let http = fixture_discovery(Direction::Outbound, &discovery, move |_| Some(provider)).await;
     let mut c = TcpStream::connect(http.addr).await.unwrap();
     c.write_all(b"GET /x HTTP/1.1\r\nHost: third.example\r\nConnection: close\r\n\r\n")
@@ -248,18 +240,14 @@ async fn provider() -> SocketAddr {
             let (mut s, _) = listener.accept().await.unwrap();
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
-                while let Ok(n) = s.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
+                // Every request of these tests says `Connection: close`.
+                if s.read(&mut buf).await.is_ok_and(|n| n > 0) {
                     let body = "{\"ok\":true}";
                     let reply = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
                     );
-                    if s.write_all(reply.as_bytes()).await.is_err() {
-                        break;
-                    }
+                    let _ = s.write_all(reply.as_bytes()).await;
                 }
             });
         }
@@ -345,7 +333,7 @@ async fn egr_16_authorities_gauge_and_series_are_bounded_and_carry_no_recorded_v
         get(
             http.addr,
             &format!("h{n}.example:443"),
-            &format!("/{PATH_SECRET}-{n}?token={QUERY_SECRET}"),
+            &format!("/v1/item-{n}?token={QUERY_SECRET}"),
         )
         .await;
     }

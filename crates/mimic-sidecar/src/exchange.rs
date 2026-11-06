@@ -760,6 +760,23 @@ impl Http1Tracker {
 
     /// Hands an exchange that got a response head to discovery.
     fn discover(&self, open: &mut Open, outcome: Outcome) {
+        // A `CONNECT` answered `2xx` carries no HTTP any more: it is a tunnel of its target
+        // (spec §6.1), never an exchange.
+        if let (Some(tap), Some(request), Some(status)) = (&self.tap, &open.request, open.status)
+            && request.connect
+        {
+            if self.ctx.direction == Direction::Outbound
+                && (200..300).contains(&status)
+                && outcome != Outcome::Unframed
+            {
+                let target =
+                    target_authority(request.uri_authority.as_deref(), request.host.as_deref())
+                        .map(|raw| normalise_authority(raw, self.ctx.default_port()));
+                let (dst, tls, sni) = (self.ctx.dst, self.ctx.tls, self.ctx.sni.clone());
+                tap.tunnel("connect", dst, tls, sni, target);
+            }
+            return;
+        }
         let (Some(tap), Some(capture)) = (&self.tap, open.capture.take()) else {
             return;
         };

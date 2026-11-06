@@ -187,7 +187,8 @@ impl Origin {
             origin.sni.insert(sni);
         }
         if let Some(dst) = via.dst {
-            let port = dst.port();
+            // As in the scope key (spec §6.1): the grammar has no room for port 0.
+            let port = dst.port().max(1);
             origin.dst.insert(match dst.ip().to_canonical() {
                 IpAddr::V4(v4) => format!("{v4}:{port}"),
                 IpAddr::V6(v6) => format!("[{v6}]:{port}"),

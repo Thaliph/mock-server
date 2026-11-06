@@ -11,11 +11,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
-use mimic_core::discovery::report::{Direction, Exchange, Limits, Outcome, Report, Sampled, Via};
+use mimic_core::discovery::report::{
+    Direction, Exchange, Limits, Outcome, Report, Sampled, Tunneled, Via,
+};
 use mimic_core::discovery::scope::{ScopeKey, authority_key};
 
 use super::Handoff;
-use super::capture::{Part, Record};
+use super::capture::{Item, Part, Record, Tunnel};
 use super::decode;
 use super::metrics::DiscoveryMetrics;
 use super::redactions::{self, Counts};
@@ -96,7 +98,19 @@ pub(super) struct Recorder {
     egress_known: BTreeSet<Key>,
     sample_budget_full: bool,
     endpoint_limit_logged: bool,
+    authority_limit_logged: bool,
     sample_bytes: usize,
+}
+
+/// The scope of an outbound exchange (spec §6.1): its target authority, else the SNI, else the
+/// destination.
+fn egress_key(record: &Record, host: Option<&str>) -> ScopeKey {
+    ScopeKey::Authority(authority_key(
+        host,
+        if record.tls { 443 } else { 80 },
+        record.sni.as_deref(),
+        record.dst,
+    ))
 }
 
 fn label(direction: Direction) -> &'static str {
@@ -263,14 +277,58 @@ impl Recorder {
             egress_known: BTreeSet::new(),
             sample_budget_full: false,
             endpoint_limit_logged: false,
+            authority_limit_logged: false,
             sample_bytes: 0,
         }
     }
 
-    pub(super) fn run(mut self, queue: Receiver<Record>) {
-        for record in queue {
-            let direction = label(record.direction);
-            self.guarded(direction, |recorder| recorder.record(&record));
+    pub(super) fn run(mut self, queue: Receiver<Item>) {
+        for item in queue {
+            match item {
+                Item::Exchange(record) => {
+                    let direction = label(record.direction);
+                    self.guarded(direction, |recorder| recorder.record(&record));
+                }
+                Item::Tunnel(tunnel) => {
+                    self.guarded("outbound", |recorder| recorder.tunnel(&tunnel));
+                }
+            }
+        }
+    }
+
+    /// Counts a connection without plaintext HTTP in the `tunnels` of its authority.
+    fn tunnel(&mut self, tunnel: &Tunnel) {
+        let key = ScopeKey::Authority(authority_key(
+            tunnel.target.as_deref(),
+            if tunnel.tls { 443 } else { 80 },
+            tunnel.sni.as_deref(),
+            tunnel.dst,
+        ));
+        let (counted, authorities) = {
+            let mut egress = self.egress.lock().unwrap_or_else(PoisonError::into_inner);
+            let counted = egress.record_tunnel(&self.limits, key, tunnel.kind);
+            (counted, egress.authorities())
+        };
+        self.metrics.set_authorities(authorities);
+        match counted {
+            Tunneled::Counted => self.metrics.tunnel(tunnel.kind, "recorded"),
+            Tunneled::AuthorityLimit => {
+                self.metrics.tunnel(tunnel.kind, "authority_limit");
+                self.warn_authority_limit();
+            }
+            // The kinds are the ones of `TUNNEL_KINDS` and the key a valid authority.
+            Tunneled::Invalid => {}
+        }
+    }
+
+    fn warn_authority_limit(&mut self) {
+        if !self.authority_limit_logged {
+            self.authority_limit_logged = true;
+            tracing::warn!(
+                target: "discovery",
+                limit = self.limits.max_authorities,
+                "authority limit reached"
+            );
         }
     }
 
@@ -369,8 +427,10 @@ impl Recorder {
         match outcome {
             Outcome::Invalid => self.metrics.exchange(direction, "invalid"),
             Outcome::NotFound => self.metrics.exchange(direction, "not_found"),
-            // Outbound recording reaches the sidecar with the tap (F7 step 4).
-            Outcome::AuthorityLimit => self.metrics.exchange(direction, "authority_limit"),
+            Outcome::AuthorityLimit => {
+                self.metrics.exchange(direction, "authority_limit");
+                self.warn_authority_limit();
+            }
             Outcome::EndpointLimit => {
                 self.metrics.exchange(direction, "endpoint_limit");
                 if !self.endpoint_limit_logged {
@@ -397,7 +457,8 @@ impl Recorder {
                 );
                 self.samples(direction, sample, sample_bytes, limits.sample_budget);
                 if let Some(endpoints) = endpoints {
-                    self.shape_changed(record, &request, endpoints);
+                    let scope = outbound.then(|| egress_key(record, exchange.host));
+                    self.shape_changed(record, &request, scope.as_ref(), endpoints);
                 }
                 // Last: the exchange counts as recorded once everything about it is visible.
                 self.metrics.exchange(direction, "recorded");
@@ -415,12 +476,7 @@ impl Recorder {
         record: &Record,
         exchange: &Exchange<'_>,
     ) -> (Outcome, Option<BTreeSet<Key>>, usize, Limits, u64) {
-        let key = ScopeKey::Authority(authority_key(
-            exchange.host,
-            if record.tls { 443 } else { 80 },
-            record.sni.as_deref(),
-            record.dst,
-        ));
+        let key = egress_key(record, exchange.host);
         let (inbound_bytes, epoch) = {
             let report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
             (
@@ -445,6 +501,7 @@ impl Recorder {
         let (outcome, endpoints, sample_bytes) = {
             let mut egress = self.egress.lock().unwrap_or_else(PoisonError::into_inner);
             let outcome = egress.record_at(key, &via, &limits, &self.redactor, exchange);
+            self.metrics.set_authorities(egress.authorities());
             let new_endpoint = matches!(
                 outcome,
                 Outcome::Recorded {
@@ -521,7 +578,13 @@ impl Recorder {
     }
 
     /// A new endpoint was recorded: the template tree changed, and may have absorbed a node.
-    fn shape_changed(&mut self, record: &Record, request: &Request, now: BTreeSet<Key>) {
+    fn shape_changed(
+        &mut self,
+        record: &Record,
+        request: &Request,
+        authority: Option<&ScopeKey>,
+        now: BTreeSet<Key>,
+    ) {
         let direction = label(record.direction);
         let known = if record.direction == Direction::Outbound {
             &mut self.egress_known
@@ -556,9 +619,9 @@ impl Recorder {
                 .filter(|(d, scope, method, _)| {
                     *d == record.direction
                         && *method == request.method
-                        && match scope {
-                            ScopeKey::Port(port) => *port == record.port,
-                            ScopeKey::Authority(_) => true,
+                        && match authority {
+                            Some(authority) => scope == authority,
+                            None => *scope == ScopeKey::Port(record.port),
                         }
                 })
                 .filter_map(|(.., template)| Some((matches(template, &request.path)?, template)))
@@ -567,12 +630,15 @@ impl Recorder {
                 .unwrap_or_default();
             let old: Vec<String> = removed
                 .iter()
+                .filter(|(_, scope, ..)| authority.is_none_or(|a| scope == a))
                 .take(MAX_OLD_LOGGED)
                 .map(|(_, _, method, template)| format!("{method} {template}"))
                 .collect();
+            let authority = authority.map(|a| a.to_string());
             tracing::info!(
                 target: "discovery",
                 direction,
+                authority = authority.as_deref(),
                 port = record.port,
                 method = %request.method,
                 template,
