@@ -292,21 +292,26 @@ proptest! {
         let mut stored = Report::new(None);
         for items in pushes {
             let push = push_report(&items, None);
+            let out = merge_bounded(stored.clone(), push.clone(), &l);
+            prop_assert!(out.report.sample_bytes() <= b);
             for direction in [Direction::Inbound, Direction::Outbound] {
                 let own = items.iter().filter(|i| i.0 == (direction == Direction::Outbound)).count();
-                let before = (bytes(&stored, direction), hashes(&stored, direction));
-                let out = merge_bounded(stored.clone(), push.clone(), &l);
-                prop_assert!(out.report.sample_bytes() <= b);
-                if before.0 <= b / 2 {
+                let (before_bytes, before) = (bytes(&stored, direction), hashes(&stored, direction));
+                if before_bytes <= b / 2 {
                     let after = hashes(&out.report, direction);
                     if own == 0 {
-                        prop_assert!(before.1.is_subset(&after), "{:?} lost samples: {after:?}", before.1);
+                        // No growth of its own: not a single sample lost.
+                        prop_assert!(before.is_subset(&after), "{before:?} lost samples: {after:?}");
                     }
-                    // Whatever the other direction does, at most one sample below half.
-                    prop_assert!(bytes(&out.report, direction) + unit > before.0.min(b / 2));
+                    // Whatever the other direction does, it does not shrink: it loses a
+                    // sample only to a new one of its own, of the same size.
+                    prop_assert!(
+                        bytes(&out.report, direction) >= before_bytes,
+                        "{direction:?} shrank from {before_bytes}"
+                    );
                 }
             }
-            stored = merge_bounded(stored, push, &l).report;
+            stored = out.report;
         }
     }
 

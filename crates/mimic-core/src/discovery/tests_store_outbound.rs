@@ -591,7 +591,10 @@ fn shr_05_removing_the_last_authority_resets_the_counter() {
     outbound(&mut r, &l, "b.example.com:443", "/x", 2);
     r.remove_authority(&ScopeKey::Authority("a.example.com:443".into()));
     // One scope left: still version 2, the counter untouched.
-    assert_eq!((r.version(), r.exchanges(), r.outbound_exchanges()), (2, 10, 7));
+    assert_eq!(
+        (r.version(), r.exchanges(), r.outbound_exchanges()),
+        (2, 10, 7)
+    );
     r.remove_authority(&ScopeKey::Authority("b.example.com:443".into()));
     assert_round_trip_is_inbound_only(&r, 3);
 }
