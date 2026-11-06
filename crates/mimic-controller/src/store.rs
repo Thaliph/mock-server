@@ -101,6 +101,8 @@ fn check_name(name: &str) -> Result<(), NameError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keys {
     pub report: String,
+    /// The outbound part of the report (F8).
+    pub outbound: String,
     pub meta: String,
     pub pods: String,
     pub seq: String,
@@ -115,6 +117,7 @@ pub fn keys(namespace: &str, deployment: &str) -> Result<Keys, NameError> {
     let base = format!("mimic:v1:{{{namespace}/{deployment}}}");
     Ok(Keys {
         report: format!("{base}:report"),
+        outbound: format!("{base}:outbound"),
         meta: format!("{base}:meta"),
         pods: format!("{base}:pods"),
         seq: format!("{base}:seq"),

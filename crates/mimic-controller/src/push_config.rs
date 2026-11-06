@@ -171,6 +171,7 @@ mod tests {
         assert_eq!(config.store.ttl, Duration::from_secs(30 * 86_400));
         assert_eq!(config.store.limits.max_endpoints, 512);
         assert_eq!(config.store.limits.max_literals, 32);
+        assert_eq!(config.store.limits.max_authorities, 128);
         assert_eq!(config.store.limits.sample_budget, 4 << 20);
         assert_eq!(config.store.max_deployments, 50);
         assert_eq!(config.status_interval, Duration::from_secs(30));
@@ -188,6 +189,7 @@ mod tests {
             ("MIMIC_STORE_MAX_ENDPOINTS", "10"),
             ("MIMIC_STORE_MAX_PUSH_ENDPOINTS", "10"),
             ("MIMIC_STORE_MAX_LITERALS", "1000"),
+            ("MIMIC_STORE_MAX_AUTHORITIES", "10000"),
             ("MIMIC_STORE_SAMPLE_BUDGET", "1Gi"),
             ("MIMIC_STORE_MAX_DEPLOYMENTS", "100000"),
             ("MIMIC_STATUS_INTERVAL", "1m"),
@@ -198,6 +200,7 @@ mod tests {
         assert_eq!(config.rate, 10_000);
         assert_eq!(config.max_report, 64 << 10);
         assert_eq!(config.body_budget, 4 << 30);
+        assert_eq!(config.store.limits.max_authorities, 10_000);
         assert_eq!(config.store.ttl, Duration::from_secs(7200));
         assert_eq!(config.status_interval, Duration::from_secs(60));
         assert_eq!(config.pod_window, Duration::from_secs(86_400));
@@ -227,6 +230,9 @@ mod tests {
             ("MIMIC_STORE_MAX_ENDPOINTS", "10001"),
             ("MIMIC_STORE_MAX_PUSH_ENDPOINTS", "0"),
             ("MIMIC_STORE_MAX_PUSH_ENDPOINTS", "513"),
+            ("MIMIC_STORE_MAX_AUTHORITIES", "0"),
+            ("MIMIC_STORE_MAX_AUTHORITIES", "10001"),
+            ("MIMIC_STORE_MAX_AUTHORITIES", "many"),
             ("MIMIC_STORE_MAX_LITERALS", "1"),
             ("MIMIC_STORE_MAX_LITERALS", "1001"),
             ("MIMIC_STORE_SAMPLE_BUDGET", "512Ki"),
