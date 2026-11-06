@@ -589,4 +589,16 @@ async fn ctl_13_a_sequence_that_is_not_a_number_is_never_overwritten() {
     assert_eq!(exists, 0);
 }
 
+#[test]
+fn ctl_18_the_logged_set_stays_bounded_for_deployments_that_never_come_back() {
+    let (store, _metrics) = replica(None, config(Duration::from_secs(60)));
+    for i in 0..(MAX_LOGGED * 3) {
+        assert!(store.once("ns", &format!("gone-{i}"), "stored meta unreadable"));
+        assert!(lock(&store.logged).len() <= MAX_LOGGED);
+    }
+    // A streak still logs once while it lasts.
+    assert!(store.once("ns", "live", "stored meta unreadable"));
+    assert!(!store.once("ns", "live", "stored meta unreadable"));
+}
+
 mod v2;

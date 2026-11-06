@@ -11,6 +11,9 @@
 #   requests   the URL of every request the page made
 #   interceptor with --interceptor, the outcome of window.mimicRequestInterceptor on its URLs: for each, whether
 #              it threw (a refusal) or returned the request
+#   swagger    with --interceptor, what a probe installed before the page scripts saw of Swagger UI: whether
+#              SwaggerUIBundle was configured with window.mimicRequestInterceptor itself, and the URL of every
+#              request that went through the interceptor Swagger UI was given (the probe wraps it to record them)
 #   violations CSP violations (console, log and audit issues, requests blocked by the policy)
 #   errors     other console errors and uncaught exceptions
 import base64
@@ -218,6 +221,37 @@ INTERCEPTOR = """(() => {
 })()"""
 
 
+# Runs before any page script. It wraps SwaggerUIBundle as the bundle defines it: the configuration's
+# requestInterceptor must be window.mimicRequestInterceptor, and is replaced by a wrapper that records the URL of each
+# request Swagger UI sends through it, then calls it. The spec load is such a request.
+PROBE = """(() => {
+  const probe = { configured: null, calls: [] };
+  window.__mimicProbe = probe;
+  let bundle;
+  Object.defineProperty(window, 'SwaggerUIBundle', {
+    configurable: true,
+    get() { return bundle; },
+    set(real) {
+      const wrapped = function (config) {
+        const given = config && config.requestInterceptor;
+        probe.configured = typeof given === 'function' && given === window.mimicRequestInterceptor;
+        if (typeof given === 'function') {
+          config = Object.assign({}, config, {
+            requestInterceptor(request) {
+              probe.calls.push(String(request && request.url));
+              return given(request);
+            },
+          });
+        }
+        return real(config);
+      };
+      Object.assign(wrapped, real);
+      bundle = wrapped;
+    },
+  });
+})()"""
+
+
 def is_csp(text):
     return "Content Security Policy" in text or "Refused to" in text
 
@@ -232,6 +266,8 @@ def main():
     cdp = Cdp(target["webSocketDebuggerUrl"])
     for domain in ("Network", "Log", "Runtime", "Audits", "Page"):
         cdp.call(f"{domain}.enable")
+    if "--interceptor" in rest:
+        cdp.call("Page.addScriptToEvaluateOnNewDocument", source=PROBE)
     cdp.call("Page.navigate", url=url)
     end = time.time() + 45
     text = ""
@@ -249,6 +285,15 @@ def main():
         wrong = [n for n, r in interceptor.items() if r["threw"] != (n != "same_origin_workloads")]
         if wrong:
             print(f"ui_browser: the request interceptor misjudged {wrong}: {interceptor}", file=sys.stderr)
+            sys.exit(1)
+    swagger = cdp.eval("window.__mimicProbe || null") if interceptor is not None else None
+    if interceptor is not None:
+        if not swagger or swagger["configured"] is not True:
+            print(f"ui_browser: Swagger UI was not configured with window.mimicRequestInterceptor: {swagger}", file=sys.stderr)
+            sys.exit(1)
+        spec = "/v1/workloads/" + url.split("/ui/workloads/", 1)[1]
+        if not any(c.endswith(spec) for c in swagger["calls"]):
+            print(f"ui_browser: the spec load did not go through the interceptor: {swagger}", file=sys.stderr)
             sys.exit(1)
     cdp.drain(3)
     seen = json.loads(cdp.eval(COLLECT))
@@ -277,6 +322,7 @@ def main():
         elif name == "Runtime.exceptionThrown":
             errors.append(json.dumps(p["exceptionDetails"].get("exception", {}).get("description", "")))
     seen["interceptor"] = interceptor
+    seen["swagger"] = swagger
     seen.update(requests=requests, violations=violations, errors=errors)
     print(json.dumps(seen))
 
