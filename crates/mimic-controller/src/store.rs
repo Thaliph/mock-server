@@ -694,7 +694,9 @@ impl Store {
             .connection()
             .await
             .map_err(|_| ReadError::Unavailable)?;
+        // One transaction: a write between two GETs could join an old part with a new one.
         let (stored, outbound): (Option<Vec<u8>>, Option<Vec<u8>>) = match redis::pipe()
+            .atomic()
             .cmd("GET")
             .arg(&k.report)
             .cmd("GET")
