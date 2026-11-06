@@ -64,7 +64,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! kind get clusters | found -x "$CLUSTER"; then
+clusters=$(kind get clusters) || { echo "FAIL kind get clusters failed" >&2; exit 1; }
+if ! found -x "$CLUSTER" <<<"$clusters"; then
   log "create kind cluster $CLUSTER"
   node_args=()
   [[ -z ${NODE_IMAGE:-} ]] || node_args=(--image "$NODE_IMAGE")
@@ -164,7 +165,8 @@ YAML
 # below is the NetworkPolicy and not a broken probe.
 probe "$NS" "app.kubernetes.io/instance: $RELEASE, app.kubernetes.io/name: mimic-controller" | grep PONG >/dev/null \
   || fail "fnd_08: probe with the controller labels could not reach Valkey"
-if probe default "app: probe" | found PONG; then
+outside=$(probe default "app: probe")
+if found PONG <<<"$outside"; then
   fail "fnd_08: a pod outside the controller reached Valkey"
 fi
 
@@ -819,10 +821,11 @@ sidecar_metrics() { sidecar_get "$1" "$2" /metrics; }
 # ready_tls <client>: waits until the client's sidecar holds an intermediate (TLS-15). Before that the
 # sidecar passes TLS through (`no_ca`), which would hide what the checks below look for.
 ready_tls() {
-  local pod
+  local pod metrics
   pod=$(tls_pod "$1")
   for _ in $(seq 90); do
-    if sidecar_metrics tls-clients "$pod" | found -E '^mimic_tls_intermediate_expiry_timestamp_seconds [1-9]'; then
+    metrics=$(sidecar_metrics tls-clients "$pod") || metrics=""
+    if found -E '^mimic_tls_intermediate_expiry_timestamp_seconds [1-9]' <<<"$metrics"; then
       return 0
     fi
     sleep 1

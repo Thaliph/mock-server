@@ -1098,6 +1098,7 @@ fn skipped(metrics: &Metrics) -> u64 {
 
 #[tokio::test]
 async fn ctl_13_a_list_entry_skipped_for_an_unreadable_meta_is_counted_by_reason() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
     let store = store(&valkey_url());
     let (app, metrics) = app(&store);
     let ns = unique("ctl13k");
@@ -1107,7 +1108,9 @@ async fn ctl_13_a_list_entry_skipped_for_an_unreadable_meta_is_counted_by_reason
     seed(&store, &ns, "bad", &["p1"]).await;
     hset(&keys(&ns, "bad").unwrap().meta, "updated", "never").await;
     assert_eq!(fetch(&app, "/v1/workloads").await.status, 200);
-    // Other tests share the Valkey: at least this entry, counted once per list read.
+    // Other tests share the Valkey and the counter has no namespace: the entry is the one logged
+    // under this test's namespace, and the count rose by at least that one.
+    assert_eq!(errors(&capture, &ns, "stored meta unreadable"), 1);
     assert!(
         skipped(&metrics) > before,
         "the skipped entry is not counted"

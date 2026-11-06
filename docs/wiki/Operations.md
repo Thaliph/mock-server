@@ -180,21 +180,6 @@ Pushes go every 30 s per pod, so controller load grows with pods, not traffic.
 
   (`REDISCLI_AUTH` is set in the container, so `valkey-cli` authenticates.)
 
-### AOF rewrites and sizing
-
-Valkey rewrites the AOF in a forked child while the old file is still in use, so a rewrite briefly
-needs both on disk, and copy-on-write pages in memory for what changes meanwhile. The rules:
-
-- **Volume:** `valkey.persistence.size` at least twice `maxmemory`, that is **1.5 times
-  `valkey.resources.limits.memory`** (`maxmemory` is 75 % of the limit). The defaults (`1Gi`
-  limit, `768Mi` `maxmemory`, `4Gi` volume) leave a margin of 2.5Gi; a limit above `2Gi` needs a
-  larger volume, and the volume is immutable after install
-  ([Install](Install#known-issue-upgrading-a-chart-installed-from-an-earlier-main-build-293)).
-  A full volume stops the rewrite and then the appends, and pushes get `503`.
-- **Memory:** the 25 % of the limit above `maxmemory` (`256Mi` by default) is the headroom of the
-  child's copy-on-write pages and buffers. Pushes arrive every 30 s per pod, so few pages change
-  during a rewrite, but with a store near `maxmemory` watch `used_memory` and the container's
-  working set; if a rewrite is OOM-killed, raise the memory limit (and the volume with it).
 - **Reset.** The store only holds discovery data; it is safe to delete. All mimic keys start with
   `mimic:v1:`. One deployment:
 
@@ -214,6 +199,21 @@ needs both on disk, and copy-on-write pages in memory for what changes meanwhile
   the same scan with pattern `mimic:v1:*`. Sidecars rebuild from new traffic; counters restart from
   zero. Standalone Valkey 9.0 or later is required; cluster mode is not supported.
 
+### AOF rewrites and sizing
+
+Valkey rewrites the AOF in a forked child while the old file is still in use, so a rewrite briefly
+needs both on disk, and copy-on-write pages in memory for what changes meanwhile. The rules:
+
+- **Volume:** `valkey.persistence.size` at least twice `maxmemory`, that is **1.5 times
+  `valkey.resources.limits.memory`** (`maxmemory` is 75 % of the limit). The defaults (`1Gi`
+  limit, `768Mi` `maxmemory`, `4Gi` volume) leave a margin of 2.5Gi; a limit above about 2.67Gi needs a
+  larger volume, and the volume is immutable after install
+  ([Install](Install#known-issue-upgrading-a-chart-installed-from-an-earlier-main-build-293)).
+  A full volume stops the rewrite and then the appends, and pushes get `503`.
+- **Memory:** the 25 % of the limit above `maxmemory` (`256Mi` by default) is the headroom of the
+  child's copy-on-write pages and buffers. Pushes arrive every 30 s per pod, so few pages change
+  during a rewrite, but with a store near `maxmemory` watch `used_memory` and the container's
+  working set; if a rewrite is OOM-killed, raise the memory limit (and the volume with it).
 ## Retention
 
 Data of a deployment expires `MIMIC_STORE_TTL` (30 days) after its last applied push; endpoints and
