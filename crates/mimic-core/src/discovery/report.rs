@@ -635,6 +635,35 @@ impl Node {
     }
 }
 
+/// What an outbound scope holds besides its endpoints (spec §6.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutboundMeta<'a> {
+    /// `http` and `https`, those with a count, in that order.
+    pub schemes: Vec<&'a str>,
+    pub sni: Vec<&'a str>,
+    pub dst: Vec<&'a str>,
+    /// Connections counted, not recorded, by kind.
+    pub tunnels: BTreeMap<&'a str, u64>,
+}
+
+impl Scope {
+    fn meta(&self) -> OutboundMeta<'_> {
+        let mut meta = OutboundMeta::default();
+        if let Some(origin) = &self.origin {
+            meta.schemes = ["http", "https"]
+                .into_iter()
+                .filter(|s| origin.schemes.get(*s).is_some_and(|n| *n > 0))
+                .collect();
+            meta.sni = origin.sni.iter().map(String::as_str).collect();
+            meta.dst = origin.dst.iter().map(String::as_str).collect();
+        }
+        if let Some(tunnels) = &self.tunnels {
+            meta.tunnels = tunnels.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+        }
+        meta
+    }
+}
+
 impl Scope {
     fn merge(&mut self, other: Scope, max_literals: usize) {
         self.last_seen = self.last_seen.max(other.last_seen);
@@ -961,6 +990,18 @@ impl Report {
     /// Outbound scopes held (`mimic_discovery_authorities`).
     pub fn authorities(&self) -> usize {
         self.outbound_scopes()
+    }
+
+    /// The outbound scopes by authority, with what they know besides their endpoints (spec
+    /// §6.1): schemes seen, SNIs, destinations and tunnel counts.
+    pub fn outbound_meta(&self) -> BTreeMap<&str, OutboundMeta<'_>> {
+        let scopes = self.scopes.get(&Direction::Outbound).into_iter().flatten();
+        scopes
+            .filter_map(|(key, scope)| match key {
+                ScopeKey::Authority(authority) => Some((authority.as_str(), scope.meta())),
+                ScopeKey::Port(_) => None,
+            })
+            .collect()
     }
 
     fn outbound_scopes(&self) -> usize {
