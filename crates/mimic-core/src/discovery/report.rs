@@ -864,6 +864,11 @@ impl Report {
         n
     }
 
+    /// Outbound scopes held (`mimic_discovery_authorities`).
+    pub fn authorities(&self) -> usize {
+        self.outbound_scopes()
+    }
+
     fn outbound_scopes(&self) -> usize {
         self.scopes
             .get(&Direction::Outbound)

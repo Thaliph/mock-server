@@ -1190,3 +1190,150 @@ async fn egr_12_the_handshake_with_the_destination_is_not_in_the_latency() {
     recorded(&discovery, 1).await;
     assert!(bucket(&discovery) < mimic_core::discovery::histogram::bucket_index(500));
 }
+
+// ---------------------------------------------------------------------------------------
+// EGR-11: the TLS connections that are passed through are counted as tunnels.
+
+/// Waits for one `kind` tunnel under `authority`, and checks the metric, the lack of any
+/// endpoint and that the count is exactly one.
+async fn tunnelled(sidecar: &Sidecar, discovery: &Discovery, authority: &str, kind: &str) {
+    eventually("the tunnel is recorded", || {
+        scope(discovery, authority)["tunnels"][kind] == 1
+    })
+    .await;
+    common::counted(
+        &sidecar.metrics,
+        &format!("mimic_discovery_tunnels_total{{kind=\"{kind}\",result=\"recorded\"}} 1"),
+    )
+    .await;
+    assert_eq!(
+        scope(discovery, authority)["tunnels"],
+        serde_json::json!({ kind: 1 })
+    );
+    assert!(discovery.report().endpoints().is_empty());
+    assert_eq!(discovery.report().sample_bytes(), 0);
+}
+
+#[tokio::test]
+async fn egr_11_an_untrusted_destination_is_a_tunnel_of_its_sni_and_port() {
+    let _logs = common::capture_logs();
+    let dest = destination_with(&[], false, None).await;
+    let (ca, _root) = ca_state();
+    let discovery = discovery();
+    let sidecar = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let tls = own_view(&sidecar, &dest).await;
+    drop(tls);
+    let authority = format!("api.test:{}", dest.addr.port());
+    tunnelled(&sidecar, &discovery, &authority, "tls_upstream_untrusted").await;
+}
+
+#[tokio::test]
+async fn egr_11_an_mtls_destination_is_a_tunnel_and_the_client_certificate_still_reaches_it() {
+    let _logs = common::capture_logs();
+    let (client_ca, client_ca_der) = authority("client ca");
+    let dest = destination_with(&[], true, Some(&client_ca_der)).await;
+    let (ca, _root) = ca_state();
+    let discovery = discovery();
+    let sidecar = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let key = KeyPair::generate().unwrap();
+    let cert = CertificateParams::default()
+        .signed_by(&key, &client_ca)
+        .unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(dest.ca_der.clone()).unwrap();
+    let config = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .unwrap();
+    let tcp = TcpStream::connect(sidecar.addr).await.unwrap();
+    let mut tls = TlsConnector::from(Arc::new(config))
+        .connect(api(), tcp)
+        .await
+        .unwrap();
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    assert!(dest.client_certs.lock().unwrap().contains(&true));
+    let authority = format!("api.test:{}", dest.addr.port());
+    tunnelled(
+        &sidecar,
+        &discovery,
+        &authority,
+        "tls_client_cert_requested",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn egr_11_excluded_unsupported_and_no_ca_connections_are_tunnels() {
+    let _logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let port = dest.addr.port();
+    let out = Direction::Outbound;
+
+    let excluded = discovery();
+    let a = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca.clone()),
+        "*.excluded.test",
+        out,
+        Some(&excluded),
+    )
+    .await;
+    let name = ServerName::try_from("a.excluded.test").unwrap();
+    let _ = connect(&a, &root, name, &[]).await;
+    let key = format!("a.excluded.test:{port}");
+    tunnelled(&a, &excluded, &key, "tls_excluded").await;
+
+    let unsupported = discovery();
+    let b = sidecar_to(&dest, dest.addr, Some(ca), "", out, Some(&unsupported)).await;
+    let _ = connect(&b, &root, api(), &[b"imap"]).await;
+    let key = format!("api.test:{port}");
+    tunnelled(&b, &unsupported, &key, "tls_unsupported").await;
+
+    let no_ca = discovery();
+    let c = sidecar_to(&dest, dest.addr, None, "", out, Some(&no_ca)).await;
+    let _ = connect(&c, &root, api(), &[]).await;
+    tunnelled(&c, &no_ca, &key, "tls_no_ca").await;
+}
+
+#[tokio::test]
+async fn egr_11_a_client_that_rejects_the_mimic_certificate_is_a_tunnel() {
+    let _logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, _root) = ca_state();
+    let discovery = discovery();
+    let sidecar = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    assert!(connect(&sidecar, &dest.ca_der, api(), &[]).await.is_err());
+    let authority = format!("api.test:{}", dest.addr.port());
+    tunnelled(&sidecar, &discovery, &authority, "tls_client_rejected").await;
+}
