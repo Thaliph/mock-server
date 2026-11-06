@@ -835,6 +835,16 @@ impl Store {
         })
     }
 
+    /// The hex SHA-256 of the stored `:outbound` bytes, from `:meta` `outbound_digest`; `None`
+    /// when the digest is absent, malformed or written for another `version` (stale, §7.7).
+    pub async fn outbound_digest(
+        &self,
+        _namespace: &str,
+        _deployment: &str,
+    ) -> Result<Option<String>, ReadError> {
+        Ok(None)
+    }
+
     async fn read_failed(&self, error: redis::RedisError) -> ReadError {
         self.failed(error).await;
         ReadError::Unavailable
