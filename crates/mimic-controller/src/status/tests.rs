@@ -6,7 +6,8 @@ use std::sync::atomic::Ordering;
 
 use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
-use mimic_core::discovery::report::{Direction, Exchange, Limits, Report};
+use mimic_core::discovery::report::{Direction, Exchange, Limits, Report, Via};
+use mimic_core::discovery::scope::ScopeKey;
 use mimic_runtime::metrics::Metrics;
 use serde_json::{Value, json};
 
@@ -136,6 +137,48 @@ async fn push(store: &Arc<Store>, ns: &str, dep: &str, pod: &str, paths: &[&str]
     store.push(ns, dep, push).await.expect("push applied");
 }
 
+/// One inbound and one outbound exchange (authority `api.example.com:443`).
+async fn push_both(store: &Arc<Store>, ns: &str, dep: &str, pod: &str) {
+    let mut report = Report::new(Some(pod.to_string()));
+    for (key, direction, path) in [
+        (ScopeKey::Port(80), Direction::Inbound, "/a"),
+        (
+            ScopeKey::Authority("api.example.com:443".to_string()),
+            Direction::Outbound,
+            "/v1",
+        ),
+    ] {
+        report.record_at(
+            key,
+            &Via {
+                tls: false,
+                sni: None,
+                dst: None,
+            },
+            &LIMITS,
+            &Redactor::default(),
+            &Exchange {
+                direction,
+                port: 80,
+                method: "GET",
+                path,
+                status: 200,
+                head_ms: 3,
+                host: Some("svc"),
+                grpc: false,
+                observation: Observation::default(),
+            },
+        );
+    }
+    report.stamp(now_ms() / 86_400_000);
+    let push = Push {
+        pod: pod.to_string(),
+        seq: None,
+        report,
+    };
+    store.push(ns, dep, push).await.expect("push applied");
+}
+
 fn count(metrics: &Metrics, result: &str) -> f64 {
     metrics
         .encode()
@@ -172,13 +215,16 @@ async fn ctl_18_every_workload_naming_the_deployment_gets_the_status() {
     let users = by_name("w1").expect("w1 applied");
     assert_eq!(by_name("w2"), Some(users.clone()));
     assert_eq!(users["endpoints"], json!({"inbound": 2}));
+    assert_eq!(users["totalEndpoints"], json!(2));
     assert_eq!(users["pods"], json!(2));
     assert_eq!(users["exchanges"], json!(3));
     assert!(users["lastPushTime"].as_str().unwrap().ends_with('Z'));
     // A deployment without data gets the empty status.
     assert_eq!(
         by_name("w3"),
-        Some(json!({"endpoints": {}, "exchanges": 0, "sampleBytes": 0, "pods": 0}))
+        Some(
+            json!({"endpoints": {}, "totalEndpoints": 0, "exchanges": 0, "sampleBytes": 0, "pods": 0})
+        )
     );
     assert_eq!(calls.len(), 3);
     assert!(calls.iter().all(|c| c.0 == ns));
@@ -316,10 +362,50 @@ async fn ctl_18_a_status_without_the_defaulted_inbound_count_is_unchanged() {
     s.reconciler.cache.set_status(
         &ns,
         "w1",
-        Some(json!({"endpoints": {"inbound": 0}, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
+        Some(json!({"endpoints": {"inbound": 0}, "totalEndpoints": 0, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
     );
     s.reconciler.tick(now_ms()).await;
     assert!(s.sink.calls().is_empty());
+}
+
+#[tokio::test]
+async fn shr_12_a_status_without_the_defaulted_total_is_unchanged() {
+    let ns = unique("shr12");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    // Neither default is stored: the cache holds what the controller applied.
+    s.reconciler.cache.set_status(
+        &ns,
+        "w1",
+        Some(json!({"endpoints": {}, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
+    );
+    s.reconciler.tick(now_ms()).await;
+    assert!(s.sink.calls().is_empty());
+    // A status of a controller up to F7 with data differs by the total.
+    push(&s.reconciler.store, &ns, "front", "front-a", &["/a"]).await;
+    s.reconciler.cache.set_status(
+        &ns,
+        "w1",
+        Some(json!({"endpoints": {"inbound": 1}, "exchanges": 1, "sampleBytes": 0, "pods": 1})),
+    );
+    s.reconciler.tick(now_ms()).await;
+    let calls = s.sink.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2["totalEndpoints"], json!(1));
+}
+
+#[tokio::test]
+async fn shr_12_outbound_endpoints_and_the_total_are_applied() {
+    let ns = unique("shr12");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    push_both(&s.reconciler.store, &ns, "front", "front-a").await;
+    s.reconciler.tick(now_ms()).await;
+    let calls = s.sink.calls();
+    assert_eq!(calls.len(), 1);
+    let status = &calls[0].2;
+    assert_eq!(status["endpoints"], json!({"inbound": 1, "outbound": 1}));
+    assert_eq!(status["totalEndpoints"], json!(2));
+    // The exchanges currently held, both directions.
+    assert_eq!(status["exchanges"], json!(2));
 }
 
 fn unreadable_errors(capture: &crate::webhook::tests::Capture, ns: &str) -> usize {
