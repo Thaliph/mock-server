@@ -234,13 +234,65 @@ impl Origin {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "WireReport")]
 pub struct Report {
     version: u32,
     pod: Option<String>,
     exchanges: u64,
+    /// The exchanges of the outbound scopes, a part of `exchanges` (spec §6.1). Kept when
+    /// the scopes are gone (evicted, expired) so that the split stays exact; written in
+    /// version 2 only.
+    outbound_exchanges: u64,
     scopes: BTreeMap<Direction, BTreeMap<ScopeKey, Scope>>,
+}
+
+/// What `Report` serialises as: `outbound_exchanges` is written in version 2 only.
+#[derive(Serialize)]
+struct WireRef<'a> {
+    version: u32,
+    pod: &'a Option<String>,
+    exchanges: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outbound_exchanges: Option<u64>,
+    scopes: &'a BTreeMap<Direction, BTreeMap<ScopeKey, Scope>>,
+}
+
+/// What `Report` is read from; an absent `outbound_exchanges` is 0.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireReport {
+    version: u32,
+    pod: Option<String>,
+    exchanges: u64,
+    #[serde(default)]
+    outbound_exchanges: u64,
+    scopes: BTreeMap<Direction, BTreeMap<ScopeKey, Scope>>,
+}
+
+impl From<WireReport> for Report {
+    fn from(w: WireReport) -> Self {
+        Report {
+            version: w.version,
+            pod: w.pod,
+            exchanges: w.exchanges,
+            outbound_exchanges: w.outbound_exchanges,
+            scopes: w.scopes,
+        }
+    }
+}
+
+impl Serialize for Report {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        WireRef {
+            version: self.version,
+            pod: &self.pod,
+            exchanges: self.exchanges,
+            outbound_exchanges: (self.version == 2).then_some(self.outbound_exchanges),
+            scopes: &self.scopes,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// An endpoint of a report.
@@ -695,12 +747,24 @@ impl Report {
             version: 1,
             pod,
             exchanges: 0,
+            outbound_exchanges: 0,
             scopes: BTreeMap::new(),
         }
     }
 
     pub fn exchanges(&self) -> u64 {
         self.exchanges
+    }
+
+    /// The part of [`Report::exchanges`] that went to outbound scopes (spec §6.1).
+    pub fn outbound_exchanges(&self) -> u64 {
+        self.outbound_exchanges
+    }
+
+    /// A version 1 report carries no outbound exchange, and no report more than it counts.
+    fn counter_ok(&self) -> bool {
+        self.outbound_exchanges <= self.exchanges
+            && (self.version == 2 || self.outbound_exchanges == 0)
     }
 
     /// The endpoints of one direction, or of both.
@@ -1089,6 +1153,7 @@ impl Report {
         }
         let mut one = Report::new(self.pod.clone());
         one.exchanges = 1;
+        one.outbound_exchanges = u64::from(exchange.direction == Direction::Outbound);
         one.scopes
             .entry(exchange.direction)
             .or_default()
@@ -1107,6 +1172,9 @@ impl Report {
             self.pod = None;
         }
         self.exchanges = self.exchanges.saturating_add(other.exchanges);
+        self.outbound_exchanges = self
+            .outbound_exchanges
+            .saturating_add(other.outbound_exchanges);
         for (direction, ports) in other.scopes {
             let mine = self.scopes.entry(direction).or_default();
             for (key, scope) in ports {
@@ -1122,9 +1190,16 @@ impl Report {
             .is_some_and(|scopes| scopes.keys().any(|k| matches!(k, ScopeKey::Authority(_))))
     }
 
-    /// Version 2 when the report holds an outbound scope, else 1 (spec §6.1).
+    /// Version 2 when the report holds an outbound scope, else 1 (spec §6.1). A report that
+    /// holds none no longer counts the exchanges of its outbound scopes: they go with them.
     fn sync_version(&mut self) {
-        self.version = if self.has_authorities() { 2 } else { 1 };
+        if self.has_authorities() {
+            self.version = 2;
+        } else {
+            self.version = 1;
+            self.exchanges = self.exchanges.saturating_sub(self.outbound_exchanges);
+            self.outbound_exchanges = 0;
+        }
     }
 
     /// Merges `other` into `self`, then enforces `max_endpoints` and `sample_budget`: the
@@ -1263,6 +1338,7 @@ impl Report {
             version,
             pod: self.pod.clone(),
             exchanges: 0,
+            outbound_exchanges: 0,
             scopes: self
                 .scopes
                 .get(&direction)
@@ -1271,11 +1347,11 @@ impl Report {
         };
         let mut inbound = part(Direction::Inbound, 1);
         let mut outbound = part(Direction::Outbound, 2);
-        // A report counts its exchanges once: the outbound part takes what its endpoints
-        // hold, the inbound part the rest, so that the parts add up to the report.
-        let mut held = 0u64;
-        outbound.for_each_stats_of(None, |s| held = held.saturating_add(s.total()));
-        outbound.exchanges = self.exchanges.min(held);
+        // A report counts its exchanges once: the outbound part takes the counter of the
+        // outbound ones (also those of scopes that are gone), the inbound part the rest, so
+        // that the parts add up to the report.
+        outbound.exchanges = self.outbound_exchanges.min(self.exchanges);
+        outbound.outbound_exchanges = outbound.exchanges;
         inbound.exchanges = self.exchanges - outbound.exchanges;
         (inbound, (!outbound.scopes.is_empty()).then_some(outbound))
     }
@@ -1361,6 +1437,9 @@ impl Report {
         // Version 2 iff the report holds an outbound scope (spec §6.1).
         if self.version != if self.has_authorities() { 2 } else { 1 } {
             return Err(Violation::Version);
+        }
+        if !self.counter_ok() {
+            return Err(Violation::Malformed);
         }
         if self.scopes.get(&Direction::Inbound).is_some_and(|scopes| {
             scopes
@@ -1461,6 +1540,9 @@ impl Report {
                 "report version {} does not match its scopes",
                 report.version
             ));
+        }
+        if !report.counter_ok() {
+            return Err("outbound exchanges out of bounds".to_string());
         }
         let inbound = report.scopes.get(&Direction::Inbound);
         if inbound.is_some_and(|s| s.keys().any(|k| !matches!(k, ScopeKey::Port(_)))) {
