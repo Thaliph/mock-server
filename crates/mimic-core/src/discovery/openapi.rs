@@ -14,8 +14,9 @@ use crate::proxy::authority::{INVALID_AUTHORITY, normalise_authority};
 use super::histogram::{Bound, Histogram};
 use super::openapi_parts as parts;
 use super::redact::MARKER;
-use super::report::{Direction, Endpoint, Report, Stats};
+use super::report::{Direction, Endpoint, OutboundMeta, Report, Stats};
 use super::schema::string_format;
+use super::scope::ScopeKey;
 use super::template::{render_with, split_path};
 
 /// `openapi` of every document.
@@ -53,49 +54,105 @@ pub fn parse_id(id: &str) -> Option<u16> {
     digits.parse().ok()
 }
 
+/// A document id (spec §7.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocId {
+    Inbound(u16),
+    /// The authority of the scope, in the grammar of §6.1.
+    Outbound(String),
+}
+
+/// `inbound-<port>` or `outbound-<authority>`: the scope key grammar of §6.1, no other.
+pub fn parse_document_id(id: &str) -> Option<DocId> {
+    if let Some(authority) = id.strip_prefix("outbound-") {
+        return match ScopeKey::parse(authority)? {
+            ScopeKey::Authority(authority) => Some(DocId::Outbound(authority)),
+            ScopeKey::Port(_) => None,
+        };
+    }
+    parse_id(id).map(DocId::Inbound)
+}
+
 fn id_of(port: u16) -> String {
     format!("inbound-{port}")
 }
 
-/// The inbound endpoints, in the order of the report. Outbound endpoints get their documents
-/// with F8 (spec §7.6).
+fn outbound_id(authority: &str) -> String {
+    format!("outbound-{authority}")
+}
+
+/// The inbound endpoints, in the order of the report.
 fn inbound(report: &Report) -> Vec<Endpoint<'_>> {
     let mut endpoints = report.endpoints();
     endpoints.retain(|e| e.direction == Direction::Inbound);
     endpoints
 }
 
-/// `{"documents": [{"id", "direction", "port", "endpoints"}]}`, sorted by id.
+/// The outbound endpoints, in the order of the report (authority, template, method).
+fn outbound(report: &Report) -> Vec<Endpoint<'_>> {
+    let mut endpoints = report.endpoints();
+    endpoints.retain(|e| e.direction == Direction::Outbound);
+    endpoints
+}
+
+/// `{"documents": [{"id", "direction", "port" | "authority", "endpoints", "tunnels"?}]}`,
+/// sorted by id.
 pub fn index(report: &Report) -> Value {
+    let mut documents: BTreeMap<String, Value> = BTreeMap::new();
     let mut counts: BTreeMap<String, (u16, u64)> = BTreeMap::new();
     for e in inbound(report) {
         counts.entry(id_of(e.port)).or_insert((e.port, 0)).1 += 1;
     }
-    let documents: Vec<Value> = counts
-        .into_iter()
-        .map(|(id, (port, endpoints))| {
-            json!({"id": id, "direction": "inbound", "port": port, "endpoints": endpoints})
-        })
-        .collect();
-    json!({ "documents": documents })
+    for (id, (port, endpoints)) in counts {
+        let entry = json!({"id": id, "direction": "inbound", "port": port, "endpoints": endpoints});
+        documents.insert(id, entry);
+    }
+    let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
+    for e in outbound(report) {
+        if let Some(authority) = e.authority {
+            *counts.entry(authority).or_default() += 1;
+        }
+    }
+    for (authority, meta) in report.outbound_meta() {
+        let id = outbound_id(authority);
+        let tunnels = meta
+            .tunnels
+            .values()
+            .fold(0u64, |n, t| n.saturating_add(*t));
+        let entry = json!({
+            "id": id,
+            "direction": "outbound",
+            "authority": authority,
+            "endpoints": counts.get(authority).copied().unwrap_or(0),
+            "tunnels": tunnels,
+        });
+        documents.insert(id, entry);
+    }
+    json!({ "documents": documents.into_values().collect::<Vec<_>>() })
 }
 
 /// `{"endpoints": [...]}` in the order of the report's endpoints.
 pub fn endpoint_list(report: &Report) -> Value {
-    let endpoints: Vec<Value> = inbound(report)
-        .iter()
+    let all = inbound(report).into_iter().chain(outbound(report));
+    let endpoints: Vec<Value> = all
         .map(|e| {
             let mut row = json!({
-                "direction": "inbound",
-                "port": e.port,
                 "method": e.method,
                 "template": e.template,
                 "grpc": e.grpc,
                 "exchanges": e.stats.total(),
                 "statuses": statuses(e.stats),
-                "hosts": e.stats.hosts,
-                "document": id_of(e.port),
             });
+            if let Some(authority) = e.authority {
+                row["direction"] = "outbound".into();
+                row["authority"] = authority.into();
+                row["document"] = outbound_id(authority).into();
+            } else {
+                row["direction"] = "inbound".into();
+                row["port"] = e.port.into();
+                row["hosts"] = json!(e.stats.hosts);
+                row["document"] = id_of(e.port).into();
+            }
             if let Some(latency) = latency(&e.stats.latency) {
                 row["latency_ms"] = latency;
             }
@@ -116,14 +173,26 @@ pub fn document(
     version: u64,
     id: &str,
 ) -> Option<Value> {
-    let port = parse_id(id)?;
-    let endpoints: Vec<Endpoint<'_>> = inbound(report)
-        .into_iter()
-        .filter(|e| e.port == port)
-        .collect();
-    if endpoints.is_empty() {
-        return None;
-    }
+    let (endpoints, scope) = match parse_document_id(id)? {
+        DocId::Inbound(port) => {
+            let endpoints: Vec<Endpoint<'_>> = inbound(report)
+                .into_iter()
+                .filter(|e| e.port == port)
+                .collect();
+            if endpoints.is_empty() {
+                return None;
+            }
+            (endpoints, DocScope::Inbound(port))
+        }
+        DocId::Outbound(authority) => {
+            let meta = report.outbound_meta().remove(authority.as_str())?;
+            let endpoints: Vec<Endpoint<'_>> = outbound(report)
+                .into_iter()
+                .filter(|e| e.authority == Some(authority.as_str()))
+                .collect();
+            (endpoints, DocScope::Outbound(authority, meta))
+        }
+    };
     let mut paths: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
     let mut schemes: BTreeMap<String, Value> = BTreeMap::new();
     for e in &endpoints {
@@ -142,23 +211,60 @@ pub fn document(
         .into_iter()
         .map(|(key, item)| (key, Value::Object(item)))
         .collect();
+    let title = match &scope {
+        DocScope::Inbound(port) => format!("{namespace}/{deployment} inbound :{port}"),
+        // The authority is recorded data: it is not in a Markdown field.
+        DocScope::Outbound(..) => format!("{namespace}/{deployment} outbound"),
+    };
     let mut doc = json!({
         "openapi": OPENAPI_VERSION,
         "info": {
-            "title": format!("{namespace}/{deployment} inbound :{port}"),
+            "title": title,
             "version": version.to_string(),
             "description": DESCRIPTION,
         },
         "paths": paths,
     });
-    let servers = servers(&endpoints);
+    let servers = match &scope {
+        DocScope::Inbound(_) => servers(&endpoints),
+        DocScope::Outbound(authority, meta) => {
+            doc["info"]["x-mimic-authority"] = authority.as_str().into();
+            outbound_servers(authority, meta)
+        }
+    };
     if !servers.is_empty() {
         doc["servers"] = servers.into();
+    }
+    if let DocScope::Outbound(_, meta) = &scope {
+        if !meta.sni.is_empty() || !meta.dst.is_empty() {
+            doc["x-mimic-origin"] = json!({"sni": meta.sni, "dst": meta.dst});
+        }
+        if !meta.tunnels.is_empty() {
+            doc["x-mimic-tunnels"] = json!(meta.tunnels);
+        }
     }
     if !schemes.is_empty() {
         doc["components"] = json!({ "securitySchemes": schemes });
     }
     Some(doc)
+}
+
+/// The scope of a document.
+enum DocScope<'a> {
+    Inbound(u16),
+    Outbound(String, OutboundMeta<'a>),
+}
+
+/// One `{"url": "<scheme>://<authority>"}` per scheme seen, `http` then `https`; none for a
+/// redacted host.
+fn outbound_servers(authority: &str, meta: &OutboundMeta<'_>) -> Vec<Value> {
+    if authority.contains(MARKER) {
+        return Vec::new();
+    }
+    meta.schemes
+        .iter()
+        .map(|scheme| json!({"url": format!("{scheme}://{authority}")}))
+        .collect()
 }
 
 /// Puts an operation into a path item: under the lower-case key of a standard method, else in
@@ -253,7 +359,7 @@ fn operation<'a>(e: &Endpoint<'_>, key: &str, security: impl Iterator<Item = &'a
     if let Some(latency) = latency(&e.stats.latency) {
         op.insert("x-mimic-latency-ms".into(), latency);
     }
-    if !e.stats.hosts.is_empty() {
+    if e.direction == Direction::Inbound && !e.stats.hosts.is_empty() {
         op.insert("x-mimic-hosts".into(), json!(e.stats.hosts));
     }
     if let Some(day) = e.stats.last_seen() {
