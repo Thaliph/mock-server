@@ -5,7 +5,8 @@
 #   PORT      listening port (default 8080)
 #   UPSTREAM  optional base URL (service B). With it, /front/<path> is forwarded to UPSTREAM/<path> with
 #             the Authorization, X-Tenant-Key and Content-Type headers, and the upstream status and body
-#             are returned. Without it, /users/<id> answers JSON (GET and PUT) and any other path 404s.
+#             are returned. Without it, /users/<id> answers JSON (GET and PUT) and any other path 404s, and a
+#             `delay_ms` query parameter (0 to 5000) delays the answer by that many milliseconds.
 #
 # Each request writes one JSON access line to stdout: app, method, path, status, peer. Never headers or
 # bodies, so the logs of a test can be checked for canaries.
@@ -14,7 +15,9 @@ import json
 import os
 import signal
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 NAME = os.environ.get("APP_NAME", "app")
@@ -58,6 +61,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _route(self, body):
         if UPSTREAM and self.path.startswith("/front/"):
             return self._forward(body)
+        if not UPSTREAM:
+            time.sleep(self._delay_ms() / 1000)
         parts = self.path.split("?", 1)[0].split("/")
         if not UPSTREAM and len(parts) == 3 and parts[1] == "users" and parts[2]:
             if self.command == "PUT":
@@ -65,6 +70,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(200, {"id": parts[2], "updated": True, "name": payload.get("name")})
             return self._json(200, {"id": parts[2], "name": "user " + parts[2], "active": True, "score": 1.5})
         self._json(404, {"error": "not found"})
+
+    def _delay_ms(self):
+        values = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("delay_ms", [])
+        return min(int(values[0]), 5000) if values and values[0].isdigit() else 0
 
     def _forward(self, body):
         target = UPSTREAM + self.path[len("/front"):]

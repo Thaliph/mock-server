@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12).
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -1780,7 +1780,199 @@ users_after=$(users_log_count) || fail "ui_12: cannot count the access lines of 
 [[ $users_before == "$users_after" ]] || fail "ui_12: the users pods logged $((users_after - users_before)) request(s) during the browser run"
 docker rm -f "$CHROME" >/dev/null 2>&1 || true
 
-kubectl delete namespace disc-22 disc-22-client --wait=false >/dev/null
+# --- Egress discovery (F7, spec §6.1, §12.8 EGR-19) -----------------------------------------------------------------------
+# A second front, injected, in its own namespace: its sidecar records A's calls to B (users, disc-22). It runs after
+# CTL-20 and CTL-21, whose counts of users it would change.
+log "egr_19: the sidecar of an injected front records its calls to users as outbound discovery, redacted, and pushes inbound only"
+ns_fresh egr-19 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl -n egr-19 create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py >/dev/null
+kubectl -n egr-19 apply -f scripts/e2e/apps/front-injected.yaml >/dev/null
+kubectl -n egr-19 rollout status deploy/front --timeout=3m >/dev/null \
+  || { kubectl -n egr-19 describe pods -l app=front >&2 || true; fail "egr_19: deployment front did not roll out"; }
+has_mimic egr-19 app=front || fail "egr_19: front was not injected"
+egr_pod=$(kubectl -n egr-19 get pods -l app=front -o jsonpath='{.items[0].metadata.name}')
+[[ -n $egr_pod ]] || fail "egr_19: no front pod"
+[[ -z $(jp egr-19 "$egr_pod" '{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_DISCOVERY_REDACT_NAMES")].value}') ]] \
+  || fail "egr_19: front carries MIMIC_DISCOVERY_REDACT_NAMES: the outbound allowlist must do the redaction alone"
+# Warm-up without any HTTP exchange: a TCP connect to the Service, until kube-proxy routes it.
+egr_up=0
+for _ in $(seq 60); do
+  if kubectl -n disc-22-client exec client -- python3 -c \
+    'import socket; socket.create_connection(("front.egr-19.svc", 8080), timeout=3).close()' >/dev/null 2>&1; then egr_up=1; break; fi
+  sleep 1
+done
+(( egr_up )) || fail "egr_19: the Service front.egr-19 does not accept connections"
+
+egr_token="egr19-token-$(openssl rand -hex 12)"
+egr_tenant="egr19-tenant-$(openssl rand -hex 12)"
+egr_secret="egr19-password-$(openssl rand -hex 12)"
+egr_canaries=("$egr_token" "$egr_tenant" "$egr_secret")
+# 12 GETs (4 with delay_ms=200), 3 PUTs (1 delayed) and 2 calls to a missing path. The client checks every answer
+# byte for byte against what B must answer: the calls reach B unchanged.
+egr_batch=$(kubectl -n disc-22-client exec -i client -- python3 - "$egr_token" "$egr_tenant" "$egr_secret" <<'PY'
+import json, sys, urllib.error, urllib.request
+token, tenant, secret = sys.argv[1:4]
+base = "http://front.egr-19.svc:8080/front"
+auth = {"Authorization": f"Bearer {token}", "X-Tenant-Key": tenant}
+ids = [str(200000 + n) for n in range(1, 13)]
+gets = puts = missing = 0
+for n, uid in enumerate(ids):
+    query = "?delay_ms=200" if n % 3 == 0 else ""
+    with urllib.request.urlopen(urllib.request.Request(f"{base}/users/{uid}{query}", headers=auth), timeout=15) as r:
+        assert r.status == 200, r.status
+        assert json.loads(r.read()) == {"id": uid, "name": "user " + uid, "active": True, "score": 1.5}
+        gets += 1
+for n, uid in enumerate(ids[:3]):
+    query = "?delay_ms=200" if n == 0 else ""
+    body = json.dumps({"name": "user " + uid, "password": secret}).encode()
+    headers = dict(auth, **{"Content-Type": "application/json"})
+    with urllib.request.urlopen(urllib.request.Request(f"{base}/users/{uid}{query}", data=body, method="PUT", headers=headers), timeout=15) as r:
+        assert r.status == 200, r.status
+        assert json.loads(r.read()) == {"id": uid, "updated": True, "name": "user " + uid}
+        puts += 1
+for _ in range(2):
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"{base}/missing", headers=auth), timeout=15).read()
+    except urllib.error.HTTPError as e:
+        assert e.code == 404, e.code
+        assert json.loads(e.read()) == {"error": "not found"}
+        missing += 1
+print(gets, puts, missing)
+PY
+) || fail "egr_19: the calls through front failed or an answer differs from what B sends"
+[[ $egr_batch == "12 3 2" ]] || fail "egr_19: the client got '$egr_batch' answers for 12 GETs, 3 PUTs and 2 missing"
+
+# B got every call: its access lines, summed over both pods.
+: > "$WORK/egr19-users.log"
+for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}'); do
+  kubectl -n disc-22 logs "$p" -c app >> "$WORK/egr19-users.log" || fail "egr_19: cannot read the log of $p"
+done
+users_lines() {
+  jq -R -s --arg m "$1" --arg re "$2" --argjson s "$3" \
+    'split("\n") | map(fromjson? | select(. != null and .method == $m and .status == $s and (.path | test($re)))) | length' \
+    "$WORK/egr19-users.log"
+}
+[[ $(users_lines GET '^/users/2000[0-9]{2}(\?.*)?$' 200) == 12 ]] || fail "egr_19: users did not answer 12 GETs with a 200"
+[[ $(users_lines PUT '^/users/2000[0-9]{2}(\?.*)?$' 200) == 3 ]] || fail "egr_19: users did not answer 3 PUTs with a 200"
+[[ $(users_lines GET '^/missing$' 404) == 2 ]] || fail "egr_19: users did not answer 2 GETs of /missing with a 404"
+
+# The sidecar of front: what it recorded of those calls. Polled until its recorder holds the 17 exchanges.
+egr_authority="users.disc-22.svc:8080"
+egr_report="$WORK/egr19-discovery.json"
+egr_metrics="$WORK/egr19-metrics.txt"
+egr_exchanges() {
+  sidecar_get egr-19 "$egr_pod" /metrics \
+    | awk 'index($0, "mimic_discovery_exchanges_total{direction=\"outbound\",result=\"recorded\"} ") == 1 { printf "%d\n", $2 }' | tail -1
+}
+egr_seen=0
+for _ in $(seq 30); do
+  egr_seen=$(egr_exchanges)
+  [[ ${egr_seen:-0} == 17 ]] && break
+  sleep 1
+done
+[[ ${egr_seen:-0} == 17 ]] || fail "egr_19: the sidecar of front recorded ${egr_seen:-0} outbound exchanges, not 17"
+sidecar_get egr-19 "$egr_pod" /metrics > "$egr_metrics"
+[[ -s $egr_metrics ]] || fail "egr_19: cannot read the metrics of the sidecar of front"
+
+egr_check_outbound() {
+  sidecar_get egr-19 "$egr_pod" /discovery > "$egr_report"
+  [[ -s $egr_report ]] || fail "egr_19: cannot read /discovery of the sidecar of front"
+  # The outbound part is neither shipped nor reset by a push: all three canaries are checked against it, and the
+  # bearer token and the password against the whole report (the inbound X-Tenant-Key of an unlisted header is the
+  # accepted limit of spec §11.1).
+  jq -e '.scopes.outbound | type == "object"' "$egr_report" >/dev/null || fail "egr_19: /discovery of front has no scopes.outbound"
+  jq '.scopes.outbound' "$egr_report" > "$WORK/egr19-outbound.json"
+  local c
+  for c in "${egr_canaries[@]}"; do
+    if grep -F "$c" "$WORK/egr19-outbound.json" >/dev/null; then fail "egr_19: a canary appears in scopes.outbound of front"; fi
+  done
+  for c in "$egr_token" "$egr_secret"; do
+    if grep -F "$c" "$egr_report" >/dev/null; then fail "egr_19: the bearer token or the password appears in /discovery of front"; fi
+  done
+  jq -e --arg a "$egr_authority" '.scopes.outbound[$a] | type == "object"' "$egr_report" >/dev/null \
+    || fail "egr_19: no scopes.outbound.\"$egr_authority\" in /discovery of front"
+  jq -e '(.scopes.outbound | keys) | length == 1' "$egr_report" >/dev/null \
+    || fail "egr_19: front has outbound scopes other than users: $(jq -c '.scopes.outbound | keys' "$egr_report")"
+  [[ $(endpoints "$egr_report" | jq -r --arg a "$egr_authority" '.[] | select(.direction == "outbound") | select(.port == $a) | "\(.method) \(.template)"' | sort | tr '\n' ';') \
+     == 'GET /missing;GET /users/{users_id};PUT /users/{users_id};' ]] \
+    || fail "egr_19: the outbound endpoints of front are not GET /missing, GET and PUT /users/{users_id}: $(endpoints "$egr_report" | jq -c '[.[] | select(.direction == "outbound") | "\(.method) \(.template)"]')"
+  out_status() { endpoints "$egr_report" | jq -r --arg m "$1" --arg t "$2" --arg s "$3" \
+    '[.[] | select(.direction == "outbound" and .method == $m and .template == $t) | .stats.statuses[$s] // 0] | add // 0'; }
+  # Calls whose head came in 200 ms or later (bucket 31 holds 200 ms), and all the calls of the endpoint.
+  out_late() { endpoints "$egr_report" | jq -r --arg m "$1" --arg t "$2" \
+    '[.[] | select(.direction == "outbound" and .method == $m and .template == $t) | .stats.latency.buckets | to_entries[] | select((.key | tonumber) >= 31) | .value] | add // 0'; }
+  out_total() { endpoints "$egr_report" | jq -r --arg m "$1" --arg t "$2" \
+    '[.[] | select(.direction == "outbound" and .method == $m and .template == $t) | .stats.latency.buckets | to_entries[] | .value] | add // 0'; }
+  [[ $(out_status GET '/users/{users_id}' 200) == 12 ]] || fail "egr_19: GET /users/{users_id} does not hold 12 calls with a 200: $(out_status GET '/users/{users_id}' 200)"
+  [[ $(out_status PUT '/users/{users_id}' 200) == 3 ]] || fail "egr_19: PUT /users/{users_id} does not hold 3 calls with a 200: $(out_status PUT '/users/{users_id}' 200)"
+  [[ $(out_status GET /missing 404) == 2 ]] || fail "egr_19: GET /missing does not hold 2 calls with a 404: $(out_status GET /missing 404)"
+  [[ $(out_total GET '/users/{users_id}') == 12 && $(out_total PUT '/users/{users_id}') == 3 ]] \
+    || fail "egr_19: the latency histograms do not count the calls"
+  (( $(out_late GET '/users/{users_id}') >= 4 )) || fail "egr_19: fewer than 4 GETs of /users/{users_id} in a bucket of 200 ms or more: $(out_late GET '/users/{users_id}')"
+  (( $(out_late PUT '/users/{users_id}') >= 1 )) || fail "egr_19: no PUT of /users/{users_id} in a bucket of 200 ms or more"
+  # The origin: cleartext HTTP, and the original destination (the Service address, port 8080).
+  jq -e --arg a "$egr_authority" '.scopes.outbound[$a].origin
+    | .schemes == {"http": 17} and ((.dst | length) >= 1) and (.dst | all(test("^[0-9.]+:8080$"))) and ((.sni // []) | length == 0)' \
+    "$egr_report" >/dev/null || fail "egr_19: the origin of $egr_authority is not 17 http exchanges to a :8080 destination: $(jq -c --arg a "$egr_authority" '.scopes.outbound[$a].origin' "$egr_report")"
+  # The samples: the credentials are redacted by the outbound allowlist, whatever the names.
+  endpoints "$egr_report" | jq -e '.[] | select(.direction == "outbound" and .method == "GET" and .template == "/users/{users_id}")
+    | select((.stats.samples | length) > 0
+      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "x-tenant-key") | .[1]] | (length > 0 and all(. == "<redacted>")))
+      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "authorization") | .[1]] | (length > 0 and all(. == "Bearer <redacted>"))))' \
+    >/dev/null || fail "egr_19: the outbound GET samples do not hold Authorization: Bearer <redacted> and X-Tenant-Key: <redacted>"
+  endpoints "$egr_report" | jq -e '.[] | select(.direction == "outbound" and .method == "PUT" and .template == "/users/{users_id}")
+    | select((.stats.samples | length) > 0)' >/dev/null || fail "egr_19: the outbound PUT has no sample"
+}
+egr_check_outbound
+[[ $(awk 'index($0, "mimic_discovery_authorities ") == 1 { printf "%d\n", $2 }' "$egr_metrics" | tail -1) == 1 ]] \
+  || fail "egr_19: mimic_discovery_authorities is not 1 on front"
+[[ $(awk 'index($0, "mimic_discovery_exchanges_total{direction=\"outbound\"") == 1 { n += $2 } END { printf "%d\n", n }' "$egr_metrics") == 17 ]] \
+  || fail "egr_19: the outbound exchanges of front do not sum to 17"
+
+# Pushes stay inbound only (F7): the controller's merged report of front holds inbound endpoints and nothing else,
+# once a push that follows the calls arrived; the outbound part is still in the sidecar afterwards (never reset).
+ui_forward
+egr_merged="$WORK/egr19-merged.json"
+egr_merged_get() {
+  curl -fs --max-time 10 localhost:18082/v1/workloads/egr-19/front/report > "$egr_merged" 2>/dev/null || return 1
+  endpoints "$egr_merged" | jq -e '[.[] | select(.direction == "inbound" and .method == "GET" and (.template | startswith("/front/users/"))) | .stats.statuses["200"] // 0] | add == 12' >/dev/null
+}
+egr_pushed=0
+for _ in $(seq 60); do
+  if egr_merged_get; then egr_pushed=1; break; fi
+  sleep 3
+done
+(( egr_pushed )) || fail "egr_19: the controller holds no report of front with its 12 inbound GETs after 180 s"
+jq -e '.version == 1 and ((.scopes | keys) == ["inbound"])' "$egr_merged" >/dev/null \
+  || fail "egr_19: the merged report of front is not version 1 with inbound scopes only: $(jq -c '[.version, (.scopes | keys)]' "$egr_merged")"
+[[ $(endpoints "$egr_merged" | jq -r '[.[] | select(.direction == "outbound")] | length') == 0 ]] \
+  || fail "egr_19: the merged report of front holds outbound endpoints"
+egr_check_outbound
+
+# No canary where the outbound view or the stdout rules apply: scopes.outbound (checked above, before and after the
+# push), /metrics, the stdout of front (app and sidecar) and B's logs hold none of the three. The inbound parts (the
+# merged report, Valkey) hold neither the bearer token nor the password.
+{
+  kubectl -n egr-19 logs "$egr_pod" --all-containers
+  kubectl -n disc-22-client logs client
+} > "$WORK/egr19-front.log" || fail "egr_19: cannot read the logs of front"
+[[ -s $WORK/egr19-front.log ]] || fail "egr_19: the logs of front are empty"
+jq -R -e 'fromjson? | select(.app == "front" and .method == "GET" and .status == 200 and (.path | startswith("/front/users/")))' \
+  "$WORK/egr19-front.log" >/dev/null || fail "egr_19: no access line of front for its forwarded calls"
+valkey_dump > "$WORK/egr19-valkey.dump" || fail "egr_19: cannot read the Valkey values"
+[[ -s $WORK/egr19-valkey.dump ]] || fail "egr_19: the Valkey dump is empty"
+for c in "${egr_canaries[@]}"; do
+  for f in "$WORK/egr19-outbound.json" "$egr_metrics" "$WORK/egr19-front.log" "$WORK/egr19-users.log"; do
+    if grep -F "$c" "$f" >/dev/null; then fail "egr_19: a canary appears in ${f##*/}"; fi
+  done
+done
+for c in "$egr_token" "$egr_secret"; do
+  for f in "$egr_merged" "$WORK/egr19-valkey.dump"; do
+    if grep -F "$c" "$f" >/dev/null; then fail "egr_19: the bearer token or the password appears in ${f##*/}"; fi
+  done
+done
+
+kubectl delete namespace disc-22 disc-22-client egr-19 --wait=false >/dev/null
 
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"
 kubectl apply -f - >/dev/null <<YAML
