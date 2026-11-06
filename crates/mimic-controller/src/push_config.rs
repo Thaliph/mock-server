@@ -36,7 +36,7 @@ impl PushConfig {
     pub fn from_env(env: &Env) -> Result<PushConfig, ConfigError> {
         let max_report = size(env, "MIMIC_SIDECAR_API_MAX_REPORT", 32 * MIB, 64 * KIB, GIB)?;
         let var = "MIMIC_SIDECAR_API_BODY_BUDGET";
-        let body_budget = size(env, var, 64 * MIB, max_report, 4 * GIB)?;
+        let body_budget = size(env, var, 32 * MIB, max_report, 4 * GIB)?;
         let max_endpoints = number(env, "MIMIC_STORE_MAX_ENDPOINTS", 512, 1, 10_000)?;
         let var = "MIMIC_STORE_MAX_PUSH_ENDPOINTS";
         let max_push_endpoints = number(env, var, 256, 1, max_endpoints)?;
@@ -165,7 +165,7 @@ mod tests {
         let config = PushConfig::from_env(&env(&[])).unwrap();
         assert_eq!(config.rate, 10);
         assert_eq!(config.max_report, 32 << 20);
-        assert_eq!(config.body_budget, 64 << 20);
+        assert_eq!(config.body_budget, 32 << 20);
         assert_eq!(config.max_push_endpoints, 256);
         assert_eq!(config.store.ttl, Duration::from_secs(30 * 86_400));
         assert_eq!(config.store.limits.max_endpoints, 512);

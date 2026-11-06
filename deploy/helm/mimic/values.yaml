@@ -15,8 +15,9 @@ controller:
   logLevel: info
   resources:
     requests: {cpu: 50m, memory: 64Mi}
-    # Sized for two writes of a deployment report at once plus the body budget (spec §7.3).
-    limits: {memory: 512Mi}
+    # Sized for the pushes the body budget lets through at once, each at the store limits, plus
+    # headroom for the allocator (spec §7.3, SHR-18).
+    limits: {memory: 768Mi}
   nodeSelector: {}
   tolerations: []
   # Empty: preferred pod anti-affinity on kubernetes.io/hostname (spread replicas across nodes).

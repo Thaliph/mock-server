@@ -386,12 +386,14 @@ struct IntermediateRequest {
     public_key: String,
 }
 
-/// The body of a push; the report is checked as a whole, after the envelope.
+/// The body of a push; the report is checked as a whole, after the envelope. It stays a slice
+/// of the body: a copy of a report of tens of megabytes would add to the peak (SHR-18).
 #[derive(Deserialize)]
-struct PushRequest {
+struct PushRequest<'a> {
     session: String,
     sequence: u64,
-    report: Box<RawValue>,
+    #[serde(borrow)]
+    report: &'a RawValue,
 }
 
 /// An authenticated caller.

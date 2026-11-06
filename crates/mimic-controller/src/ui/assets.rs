@@ -70,7 +70,7 @@ pub(super) async fn workload_page(
 pub(super) async fn openapi_page(
     Path((namespace, deployment, id)): Path<(String, String, String)>,
 ) -> Response {
-    if keys(&namespace, &deployment).is_err() || openapi::parse_id(&id).is_none() {
+    if keys(&namespace, &deployment).is_err() || openapi::parse_document_id(&id).is_none() {
         return ReadError::Name.into_response();
     }
     served(HTML, OPENAPI_PAGE)

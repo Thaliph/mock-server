@@ -404,6 +404,46 @@ fn read_part(bytes: &[u8], part: Part) -> Option<Report> {
     .then_some(report)
 }
 
+/// The stored parts of a report, as read: `:report`, `:outbound` when present, and the `:meta`
+/// `version` they were written with.
+pub struct StoredReport {
+    inbound: Option<Vec<u8>>,
+    outbound: Option<Vec<u8>>,
+    pub version: u64,
+}
+
+/// What a read needs of a stored report.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Half {
+    /// `:report` and `:outbound`, joined.
+    Both,
+    /// `:report` only: the inbound scopes.
+    Inbound,
+    /// `:outbound` only: the outbound scopes.
+    Outbound,
+}
+
+impl StoredReport {
+    /// The report of the parts that were read, once each parses and passes the check; `None`
+    /// for a part that does not. Each part's bytes go as soon as it is parsed.
+    pub fn parse(self) -> Option<Report> {
+        let inbound = match &self.inbound {
+            Some(bytes) => Some(read_part(bytes, Part::Inbound)?),
+            None => None,
+        };
+        drop(self.inbound);
+        let outbound = match &self.outbound {
+            Some(bytes) => Some(read_part(bytes, Part::Outbound)?),
+            None => None,
+        };
+        drop(self.outbound);
+        match inbound {
+            Some(inbound) => Some(Report::join(inbound, outbound)),
+            None => outbound,
+        }
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -489,7 +529,8 @@ impl Store {
                 }
                 batch
             };
-            let result = self.write(&key.0, &key.1, &keys, &batch).await;
+            let mut batch = batch;
+            let result = self.write(&key.0, &key.1, &keys, &mut batch).await;
             for (i, pending) in batch.into_iter().enumerate() {
                 let answer = match &result {
                     Ok(outcomes) => Ok(outcomes[i]),
@@ -506,7 +547,7 @@ impl Store {
         namespace: &str,
         deployment: &str,
         keys: &Keys,
-        batch: &[Pending],
+        batch: &mut [Pending],
     ) -> Result<Vec<Outcome>, StoreError> {
         #[cfg(test)]
         if self.panic_next_write.swap(false, Ordering::SeqCst) {
@@ -514,7 +555,7 @@ impl Store {
         }
         for attempt in 0..ATTEMPTS {
             let started = Instant::now();
-            let result = self.attempt(namespace, deployment, keys, batch).await;
+            let result = self.attempt(namespace, deployment, keys, &mut *batch).await;
             self.metrics
                 .duration
                 .observe(started.elapsed().as_secs_f64());
@@ -731,38 +772,67 @@ impl Store {
             .map_err(|_| unreadable("report"))
     }
 
-    /// The stored `:report` bytes, unparsed, and the `:meta` `version` they were written with.
+    /// The stored parts that `half` needs, unparsed, and the `:meta` `version` they were written
+    /// with. An inbound document needs `:report` only and an outbound one `:outbound` only: the
+    /// other half is neither read nor parsed (SHR-18).
     pub async fn stored_report(
         &self,
         namespace: &str,
         deployment: &str,
-    ) -> Result<(Vec<u8>, u64), ReadError> {
+        half: Half,
+    ) -> Result<StoredReport, ReadError> {
         let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
         let mut conn = self
             .connection()
             .await
             .map_err(|_| ReadError::Unavailable)?;
-        let (stored, version): (Option<Vec<u8>>, Option<String>) = match redis::pipe()
-            .cmd("GET")
-            .arg(&k.report)
-            .cmd("HGET")
-            .arg(&k.meta)
-            .arg("version")
-            .query_async(&mut conn)
-            .await
-        {
+        // One transaction, as for `report`: the parts and the version belong together.
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        if half != Half::Outbound {
+            pipe.cmd("GET").arg(&k.report);
+        }
+        if half != Half::Inbound {
+            pipe.cmd("GET").arg(&k.outbound);
+        }
+        pipe.cmd("HGET").arg(&k.meta).arg("version");
+        let mut read: Vec<Option<Vec<u8>>> = match pipe.query_async(&mut conn).await {
             Ok(read) => read,
             Err(e) => return Err(self.read_failed(e).await),
         };
-        // Expired between the two keys is the same as absent.
-        let (Some(bytes), Some(version)) = (stored, version) else {
+        let version = read.pop().flatten();
+        let mut read = read.into_iter();
+        let inbound = if half == Half::Outbound {
+            None
+        } else {
+            read.next().flatten()
+        };
+        let outbound = if half == Half::Inbound {
+            None
+        } else {
+            read.next().flatten()
+        };
+        // Expired between the keys is the same as absent; so is a half that is not there, for
+        // the half that the request is about.
+        let present = match half {
+            Half::Outbound => outbound.is_some(),
+            _ => inbound.is_some(),
+        };
+        let (true, Some(version)) = (present, version) else {
             return Err(ReadError::NotFound);
         };
-        let version = version.parse().map_err(|_| {
-            tracing::error!(namespace, deployment, "stored meta unreadable");
-            ReadError::Unreadable
-        })?;
-        Ok((bytes, version))
+        let version = String::from_utf8(version)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                tracing::error!(namespace, deployment, "stored meta unreadable");
+                ReadError::Unreadable
+            })?;
+        Ok(StoredReport {
+            inbound,
+            outbound,
+            version,
+        })
     }
 
     async fn read_failed(&self, error: redis::RedisError) -> ReadError {
@@ -838,7 +908,7 @@ impl Store {
         namespace: &str,
         deployment: &str,
         keys: &Keys,
-        batch: &[Pending],
+        batch: &mut [Pending],
     ) -> Result<Attempt, StoreError> {
         let mut conn = self.connection().await?;
 
@@ -907,7 +977,10 @@ impl Store {
         let mut outcomes = Vec::with_capacity(batch.len());
         let mut refused: BTreeMap<Refusal, u64> = BTreeMap::new();
         let mut evicted: BTreeMap<Kind, u64> = BTreeMap::new();
-        for pending in batch {
+        // A pushed report moves into the merge instead of being copied (at the store limits it
+        // is tens of megabytes, SHR-18). Its JSON is kept to put it back for the next attempt.
+        let mut backups: Vec<(usize, String)> = Vec::new();
+        for (index, pending) in batch.iter_mut().enumerate() {
             let push = &pending.push;
             let field = push.seq.as_ref().map(|s| s.field(&push.pod));
             let stored_seq = field.as_ref().and_then(|f| sequences.get(f)).copied();
@@ -917,7 +990,13 @@ impl Store {
                     if let (Some(field), Some(seq)) = (field, &push.seq) {
                         sequences.insert(field, seq.sequence);
                     }
-                    let merged = merge_bounded(report, push.report.clone(), &self.config.limits);
+                    let backup = push.report.to_json().map_err(|error| {
+                        tracing::error!(%error, namespace, deployment, "report not serialisable");
+                        StoreError::Unavailable
+                    })?;
+                    backups.push((index, backup));
+                    let pushed = std::mem::replace(&mut pending.push.report, Report::new(None));
+                    let merged = merge_bounded(report, pushed, &self.config.limits);
                     report = merged.report;
                     for (reason, n) in merged.refused {
                         *refused.entry(reason).or_default() += n;
@@ -958,14 +1037,6 @@ impl Store {
             tracing::error!(%error, namespace, deployment, "report not serialisable");
             StoreError::Unavailable
         };
-        // `:report` keeps the F7 format (inbound, version 1); outbound goes in its own key.
-        let (inbound, outbound) = report.split();
-        let json = inbound.to_json().map_err(unserialisable)?;
-        let outbound_json = match &outbound {
-            Some(part) => part.to_json().map_err(unserialisable)?,
-            None => String::new(),
-        };
-        let stored_bytes = json.len() + outbound_json.len();
         let endpoints = |direction| {
             report
                 .endpoints()
@@ -973,6 +1044,21 @@ impl Store {
                 .filter(|e| e.direction == direction)
                 .count()
         };
+        let (inbound_endpoints, outbound_endpoints) = (
+            endpoints(Direction::Inbound),
+            endpoints(Direction::Outbound),
+        );
+        let (exchanges, sample_bytes) = (report.exchanges(), report.sample_bytes());
+        // `:report` keeps the F7 format (inbound, version 1); outbound goes in its own key.
+        let (inbound, outbound) = report.into_split();
+        let json = inbound.to_json().map_err(unserialisable)?;
+        drop(inbound);
+        let outbound_json = match &outbound {
+            Some(part) => part.to_json().map_err(unserialisable)?,
+            None => String::new(),
+        };
+        drop(outbound);
+        let stored_bytes = json.len() + outbound_json.len();
 
         let mut script = self.script.prepare_invoke();
         script
@@ -991,10 +1077,10 @@ impl Store {
             .arg(namespace)
             .arg(deployment)
             .arg(&json)
-            .arg(report.exchanges())
-            .arg(endpoints(Direction::Inbound))
-            .arg(endpoints(Direction::Outbound))
-            .arg(report.sample_bytes())
+            .arg(exchanges)
+            .arg(inbound_endpoints)
+            .arg(outbound_endpoints)
+            .arg(sample_bytes)
             .arg(stored_bytes)
             .arg(pods.len());
         for pod in &pods {
@@ -1014,13 +1100,23 @@ impl Store {
                 });
         }
         script.arg(&outbound_json);
+        // The arguments are copies: the strings need not outlive the call.
+        drop((json, outbound_json));
         let result: i64 = match script.invoke_async(&mut conn).await {
             Ok(result) => result,
             Err(e) => return Err(self.failed(e).await),
         };
         match result {
             1 => {}
-            0 => return Ok(Attempt::Conflict),
+            0 => {
+                for (index, backup) in backups {
+                    batch[index].push.report = Report::from_json(&backup).map_err(|error| {
+                        tracing::error!(%error, namespace, deployment, "report not readable");
+                        StoreError::Unavailable
+                    })?;
+                }
+                return Ok(Attempt::Conflict);
+            }
             _ => {
                 self.metrics.write("refused");
                 if self.once(namespace, deployment, "deployments") {

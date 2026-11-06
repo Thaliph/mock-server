@@ -121,9 +121,10 @@
       var documents = (results[2] && results[2].documents) || [];
       var endpoints = (results[1] && results[1].endpoints) || [];
       var docs = add(el("ul"), documents.map(function (doc) {
+        var tunnels = doc.tunnels ? ", " + doc.tunnels + " tunnels" : "";
         return add(el("li"), [
           link(doc.id, workloadPath(ns, dep) + "/openapi/" + enc(doc.id)),
-          document.createTextNode(" (" + doc.endpoints + " endpoints)")
+          document.createTextNode(" (" + doc.endpoints + " endpoints" + tunnels + ")")
         ]);
       }));
       show([
@@ -138,12 +139,14 @@
         docs,
         el("h2", "Endpoints"),
         table(
-          ["Direction", "Port", "Method", "Template", "Exchanges", "Statuses",
+          ["Direction", "Port", "Authority", "Method", "Template", "Exchanges", "Statuses",
             "p50 ms", "p90 ms", "p99 ms", "Last seen"],
           endpoints.map(function (e) {
             var latency = e.latency_ms || {};
-            return [e.direction, e.port, e.method, e.template, e.exchanges, pairs(e.statuses),
-              latency.p50, latency.p90, latency.p99, e.last_seen];
+            var authority = e.authority === undefined ? "" : link(
+              e.authority, workloadPath(ns, dep) + "/openapi/" + enc(e.document));
+            return [e.direction, e.port, authority, e.method, e.template, e.exchanges,
+              pairs(e.statuses), latency.p50, latency.p90, latency.p99, e.last_seen];
           })
         )
       ]);
