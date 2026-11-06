@@ -1699,8 +1699,12 @@ log "ui_12: a pinned headless Chromium, with no name but localhost resolvable, l
 CHROME_IMAGE=$(scripts/pinned-image.sh e2e-chromium)
 chrome_port=19223
 CHROME=mimic-e2e-chromium-$$
-docker run -d --rm --name "$CHROME" --network host --entrypoint /headless-shell/headless-shell "$CHROME_IMAGE" \
-  --no-sandbox --disable-gpu --remote-debugging-address=127.0.0.1 --remote-debugging-port=$chrome_port \
+# The container holds no capability, cannot gain one, and writes only to its tmpfs. --no-sandbox stays: Chromium's own
+# sandbox needs user namespaces or CAP_SYS_ADMIN, which the dropped capabilities and the default seccomp profile refuse;
+# the container is the sandbox here, and the browser only loads the pages of this script.
+docker run -d --rm --name "$CHROME" --network host --cap-drop=ALL --security-opt no-new-privileges --read-only \
+  --tmpfs /tmp --tmpfs /root --entrypoint /headless-shell/headless-shell "$CHROME_IMAGE" \
+  --no-sandbox --user-data-dir=/tmp/chrome --disable-gpu --remote-debugging-address=127.0.0.1 --remote-debugging-port=$chrome_port \
   --host-resolver-rules='MAP * ~NOTFOUND , EXCLUDE localhost' about:blank >/dev/null || fail "ui_12: cannot start Chromium"
 for _ in $(seq 30); do curl -fs "127.0.0.1:$chrome_port/json/version" >/dev/null && break; sleep 1; done
 curl -fs "127.0.0.1:$chrome_port/json/version" >/dev/null || fail "ui_12: Chromium does not answer on its DevTools port"
@@ -1719,13 +1723,27 @@ http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_foreve
 PY
 python3 -I "$WORK/ref_server.py" "$ref_port" > "$WORK/ref_hits.log" &
 PIDS+=("$!")
+# users_log_count: the access lines of the users pods, without the /users/0 probes, summed. Every failure is fatal
+# (the caller fails on a non-zero status): no pipe hides a failed kubectl or jq, and no pod at all is a failure.
 users_log_count() {
-  local p
-  for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}'); do
-    kubectl -n disc-22 logs "$p" -c app | jq -R -s 'split("\n") | map(fromjson? | select(. != null and .path != "/users/0")) | length'
-  done | awk '{ s += $1 } END { print s + 0 }'
+  local pods p log n total=0
+  pods=$(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}') || return 1
+  [[ -n $pods ]] || return 1
+  for p in $pods; do
+    log=$(kubectl -n disc-22 logs "$p" -c app) || return 1
+    n=$(jq -R -s 'split("\n") | map(fromjson? | select(. != null and .path != "/users/0")) | length' <<< "$log") || return 1
+    [[ $n =~ ^[0-9]+$ ]] || return 1
+    total=$((total + n))
+  done
+  echo "$total"
 }
+# The client traffic is over (the churn client was waited for, the hostile PUTs returned): the count must hold still.
+# users_before > 0 proves the counter sees the traffic, so an equal count afterwards is not a count of nothing.
 users_before=$(users_log_count) || fail "ui_12: cannot count the access lines of the users pods"
+sleep 3
+users_settled=$(users_log_count) || fail "ui_12: cannot count the access lines of the users pods"
+[[ $users_before == "$users_settled" ]] || fail "ui_12: the users pods still log requests before the browser run ($users_before, then $users_settled)"
+(( users_before > 0 )) || fail "ui_12: the users pods' access lines count 0 after the traffic: the counter sees nothing"
 
 # browse <name> <path> <args...>: the page as the browser saw it, in $WORK/browse-<name>.json; no violation, no failure to
 # load, and no request but to the port-forward's origin (a data: image is not a request to an origin).

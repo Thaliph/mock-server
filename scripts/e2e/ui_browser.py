@@ -41,36 +41,79 @@ class Cdp:
             head += chunk
         if b" 101 " not in head.split(b"\r\n", 1)[0]:
             raise SystemExit(f"devtools: handshake refused: {head!r}")
+        self.buf = bytearray()
+        self.partial = None
         self.next_id = 0
         self.events = []
 
-    def _read(self, n):
-        data = b""
-        while len(data) < n:
-            chunk = self.sock.recv(n - len(data))
-            if not chunk:
-                raise SystemExit("devtools: connection closed")
-            data += chunk
-        return data
+    def _fill(self, timeout):
+        """Reads what the socket has into the buffer; False when nothing came within the timeout."""
+        self.sock.settimeout(timeout)
+        try:
+            chunk = self.sock.recv(65536)
+        except (socket.timeout, TimeoutError):
+            return False
+        if not chunk:
+            raise SystemExit("devtools: connection closed")
+        self.buf += chunk
+        return True
 
-    def _frame(self):
-        message = b""
+    def _parse(self):
+        """One complete message out of the buffer, or None while a frame is incomplete. A frame is consumed
+        only once it is whole, so a timeout between two reads never splits one. A frame that a server cannot
+        send (masked, reserved bits, unknown opcode, a stray continuation) means the stream is out of step."""
         while True:
-            b0, b1 = self._read(2)
-            length = b1 & 0x7F
+            if len(self.buf) < 2:
+                return None
+            b0, b1 = self.buf[0], self.buf[1]
+            if b0 & 0x70 or b1 & 0x80:
+                raise SystemExit("devtools: the WebSocket stream is out of step (reserved bits or a masked frame)")
+            opcode, length, offset = b0 & 0x0F, b1 & 0x7F, 2
             if length == 126:
-                (length,) = struct.unpack(">H", self._read(2))
+                if len(self.buf) < 4:
+                    return None
+                (length,) = struct.unpack(">H", self.buf[2:4])
+                offset = 4
             elif length == 127:
-                (length,) = struct.unpack(">Q", self._read(8))
-            payload = self._read(length)
-            opcode = b0 & 0x0F
+                if len(self.buf) < 10:
+                    return None
+                (length,) = struct.unpack(">Q", self.buf[2:10])
+                offset = 10
+            if len(self.buf) < offset + length:
+                return None
+            payload = bytes(self.buf[offset : offset + length])
+            del self.buf[: offset + length]
             if opcode == 8:
                 raise SystemExit("devtools: connection closed by the browser")
             if opcode in (9, 10):
                 continue
-            message += payload
+            if opcode in (1, 2):
+                if self.partial is not None:
+                    raise SystemExit("devtools: the WebSocket stream is out of step (data frame inside a message)")
+                self.partial = b""
+            elif opcode == 0:
+                if self.partial is None:
+                    raise SystemExit("devtools: the WebSocket stream is out of step (stray continuation)")
+            else:
+                raise SystemExit(f"devtools: the WebSocket stream is out of step (opcode {opcode})")
+            self.partial += payload
             if b0 & 0x80:
+                message, self.partial = self.partial, None
                 return message
+
+    def _message(self, timeout):
+        """The next message as parsed JSON, or None when none is complete within the timeout."""
+        end = time.time() + timeout
+        while True:
+            raw = self._parse()
+            if raw is not None:
+                try:
+                    return json.loads(raw)
+                except ValueError:
+                    raise SystemExit("devtools: a message is not JSON: the stream is out of step")
+            left = end - time.time()
+            if left <= 0 or not self._fill(left):
+                return None
 
     def _send(self, text):
         payload = text.encode()
@@ -90,7 +133,9 @@ class Cdp:
         want = self.next_id
         self._send(json.dumps({"id": want, "method": method, "params": params}))
         while True:
-            message = json.loads(self._frame())
+            message = self._message(60)
+            if message is None:
+                raise SystemExit(f"devtools: {method}: no answer within 60 s")
             if message.get("id") == want:
                 if "error" in message:
                     raise SystemExit(f"devtools: {method}: {message['error']}")
@@ -101,14 +146,9 @@ class Cdp:
     def drain(self, seconds):
         end = time.time() + seconds
         while time.time() < end:
-            self.sock.settimeout(max(end - time.time(), 0.05))
-            try:
-                message = json.loads(self._frame())
-            except (socket.timeout, TimeoutError):
-                break
-            if "method" in message:
+            message = self._message(max(end - time.time(), 0.01))
+            if message is not None and "method" in message:
                 self.events.append(message)
-        self.sock.settimeout(60)
 
     def eval(self, expression):
         result = self.call("Runtime.evaluate", expression=expression, returnByValue=True, awaitPromise=True)

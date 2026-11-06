@@ -151,7 +151,7 @@ grep -o 'Bearer <redacted>' report.json | sort -u
 
 Or look at it in the browser, with the same port-forward: open <http://localhost:8080/ui/>, pick
 `demo/users`, then its document. Swagger UI shows `GET` and `PUT /users/{users_id}` with the recorded
-examples and the `bearer` security scheme (never the token). The raw OpenAPI 3.1 file is
+examples and the `http_bearer` security scheme (never the token). The raw OpenAPI 3.1 file is
 `curl -s localhost:8080/v1/workloads/demo/users/openapi/inbound-8080`.
 
 ## 7. See it in kubectl
