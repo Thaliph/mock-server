@@ -76,6 +76,7 @@ struct Options {
     max_authorities: usize,
     max_deployments: usize,
     valkey: String,
+    sample_budget: usize,
     redact: &'static [&'static str],
 }
 
@@ -90,6 +91,7 @@ impl Default for Options {
             max_authorities: 64,
             max_deployments: 50,
             valkey: valkey_url(),
+            sample_budget: LIMITS.sample_budget,
             redact: &[],
         }
     }
@@ -112,6 +114,7 @@ fn setup(options: Options) -> Setup {
     let limits = Limits {
         max_endpoints: options.max_endpoints,
         max_authorities: options.max_authorities,
+        sample_budget: options.sample_budget,
         ..LIMITS
     };
     let store = Store::new(
@@ -999,4 +1002,5 @@ async fn ctl_12_one_line_per_push_and_the_expected_metrics() {
     }
 }
 
+mod memory;
 mod v2;
