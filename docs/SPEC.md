@@ -971,7 +971,9 @@ logic in `mimic-core` (`discovery` module).
   `outbound not shipped`, `reason` = `unknown_outcome`). In both cases the sidecar posts, with the same session and sequence, the remaining inbound part
   (`"version": 1`, the body an F7 sidecar would have sent), which then follows the rules above
   (a `400` or `507` to it drops it with WARN `report rejected`). When the inbound part covers no
-  exchange nothing is posted and the sequence is used again by the next freeze. The next freeze
+  exchange nothing is posted and the sequence is used again by the next freeze (not after an
+  unknown outcome: a replica may have applied that sequence and would answer `applied: false`
+  to other data, so the next freeze takes the next sequence). The next freeze
   tries version 2 again. The inbound part of a report that a replica already applied is a
   duplicate of its pod, session and sequence (`applied: false`), so it is never applied twice
   either; this is the only case, with `413`, where a pending
@@ -981,7 +983,16 @@ logic in `mimic-core` (`discovery` module).
   (more authorities than its `MIMIC_STORE_MAX_AUTHORITIES`, a bound a later version adds).
   The attempt is counted `inbound_only` in `mimic_discovery_pushes_total`, with one WARN
   `outbound not shipped` (`status`) per streak of fallbacks, the streak ended by an acknowledged
-  version 2 push. The flush at `SIGTERM` applies the fallback too (within its deadline).
+  version 2 push. An attempt has an unknown outcome when it got no answer after the body was
+  sent (not when the connection was refused), or `500`, `502`, `504`, any status outside
+  `200`, `400`, `401`, `403`, `405`, `413`, `429`, `503`, `507`, or a `200` that is not a JSON
+  object with a boolean `applied`; the flag lasts for the whole sequence, whatever later
+  attempts are answered, and the next sequence starts without it. When the per-streak and the
+  per-sequence case both apply (a fallback after an unknown outcome), only the per-sequence
+  line is written (it carries `status` and `reason`) and it also counts as the streak's line;
+  it is written even in a streak that has already written its own. The flush at `SIGTERM`
+  applies the fallback too (within its deadline), posts the remaining inbound part and does not
+  try version 2 again.
   *Rollout order*: the chart upgrades the controller; a sidecar changes only when its pod is
   recreated (the webhook sets the image at admission), so F8 sidecars meet F8 controllers in the
   normal order, and the fallback covers the window where both versions answer, and rollbacks.

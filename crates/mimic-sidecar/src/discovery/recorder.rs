@@ -84,7 +84,7 @@ fn held_samples(handoff: &Handoff, current: &Report) -> usize {
 
 pub(super) struct Recorder {
     pub(super) report: Arc<Mutex<Report>>,
-    /// The outbound exchanges (spec §6.1): never frozen, shipped nor reset.
+    /// The outbound exchanges (spec §6.1): frozen with the report when shipping.
     egress: Arc<Mutex<Report>>,
     pub(super) limits: Limits,
     pub(super) redactor: Redactor,
@@ -478,16 +478,20 @@ impl Recorder {
         exchange: &Exchange<'_>,
     ) -> (Outcome, Option<BTreeSet<Key>>, usize, Limits, u64) {
         let key = egress_key(record, exchange.host);
-        let (inbound_bytes, epoch) = {
+        let (inbound_bytes, pending_egress, epoch) = {
             let report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
             (
                 report
                     .sample_bytes()
                     .saturating_add(self.handoff.pending_samples.load(Ordering::Acquire)),
+                self.handoff.pending_egress_samples.load(Ordering::Acquire),
                 self.handoff.epoch.load(Ordering::Acquire),
             )
         };
+        // The pending report's outbound samples count against the half; all its samples
+        // count against the budget (`inbound_bytes` holds them).
         let cap = (self.limits.sample_budget / 2)
+            .saturating_sub(pending_egress)
             .min(self.limits.sample_budget.saturating_sub(inbound_bytes));
         // The core takes half of `sample_budget` for outbound samples.
         let limits = Limits {
@@ -576,6 +580,8 @@ impl Recorder {
         }
         self.epoch = epoch;
         self.known.clear();
+        // A freeze takes the egress report with it.
+        self.egress_known.clear();
     }
 
     /// A new endpoint was recorded: the template tree changed, and may have absorbed a node.
