@@ -88,8 +88,9 @@ fn bump<K: Ord>(counts: &mut BTreeMap<K, u64>, key: K) {
 ///   (descending), then stored before new, then by key.
 /// - Samples: a new sample past the budget is refused, unless its endpoint has no sample of
 ///   its status class; then samples are evicted one at a time from the pair holding the most
-///   (ties: the most bytes, then the larger key), never the last of a pair. If room cannot be
-///   made that way, nothing is evicted and the sample is refused.
+///   (ties: the most bytes, then the larger key), never the last of a pair, and from the
+///   other direction only while it holds more than half of the budget. If room cannot be made
+///   that way, nothing is evicted and the sample is refused.
 pub fn merge_bounded(stored: Report, push: Report, limits: &Limits) -> Bounded {
     // What the stored report holds, to tell it from what the push adds once they are united.
     let held: Vec<(EndpointKey, BTreeSet<u64>)> = stored
@@ -196,10 +197,28 @@ fn class(sample: &Sample) -> u16 {
     sample.status() / 100
 }
 
-/// The pair with the most samples that has at least two, and its largest sample hash.
-fn victim(held: &BTreeMap<Pair, Held>) -> Option<(Pair, u64)> {
+/// The pair with the most samples that has at least two, and its largest sample hash. The
+/// pairs that can lose one are those of the direction `new` that grows, and those of a
+/// direction holding more than half of `budget`: a direction holding at most half never
+/// loses a sample to the other (spec §7.3, per-direction floor). `new` is `None` when a stored
+/// report over the budget is trimmed.
+fn victim(
+    held: &BTreeMap<Pair, Held>,
+    budget: usize,
+    new: Option<Direction>,
+) -> Option<(Pair, u64)> {
+    let mut bytes: BTreeMap<Direction, usize> = BTreeMap::new();
+    for (pair, samples) in held {
+        let n = bytes.entry(pair.0.0).or_default();
+        *n = samples
+            .values()
+            .fold(*n, |n, b| usize::saturating_add(n, *b));
+    }
+    let may_lose = |direction: Direction| {
+        new == Some(direction) || bytes.get(&direction).is_some_and(|n| *n > budget / 2)
+    };
     held.iter()
-        .filter(|(_, samples)| samples.len() >= 2)
+        .filter(|(pair, samples)| samples.len() >= 2 && may_lose(pair.0.0))
         .max_by_key(|(pair, samples)| {
             (
                 samples.len(),
@@ -256,7 +275,7 @@ fn limit_samples(
     // A stored report that exceeds the budget on its own (a lowered limit) is trimmed the same way.
     let mut dropped: Vec<(Pair, u64)> = Vec::new();
     while total > budget {
-        let Some((pair, hash)) = victim(&held) else {
+        let Some((pair, hash)) = victim(&held, budget, None) else {
             break;
         };
         if let Some(bytes) = held.get_mut(&pair).and_then(|h| h.remove(&hash)) {
@@ -274,7 +293,7 @@ fn limit_samples(
         if !room && held.get(&pair).is_none_or(Held::is_empty) {
             let mut free = total;
             while free.saturating_add(bytes) > budget {
-                let Some((from, evict)) = victim(&held) else {
+                let Some((from, evict)) = victim(&held, budget, Some(pair.0.0)) else {
                     break;
                 };
                 let Some(freed) = held.get_mut(&from).and_then(|h| h.remove(&evict)) else {
