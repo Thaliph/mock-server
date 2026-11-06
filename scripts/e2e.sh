@@ -8,7 +8,7 @@
 #   IMAGE=ghcr.io/thaliph/mimic:$TAG            image to test (built here unless SKIP_BUILD=1)
 #   INIT_IMAGE=ghcr.io/thaliph/mimic-init:$TAG  mimic-init image (built here unless SKIP_BUILD=1)
 #   CLUSTER=mimic-e2e                           kind cluster name
-#   NODE_IMAGE=kindest/node:v1.33.7@sha256:…    kind node image (default: kind's own)
+#   NODE_IMAGE=kindest/node:v1.33.12@sha256:…    kind node image (default: kind's own)
 #   KEEP_CLUSTER=1                              keep the cluster afterwards (default: keep locally, delete in CI)
 set -euo pipefail
 cd "$(dirname "$0")/.."
