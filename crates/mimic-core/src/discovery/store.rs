@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::report::{Direction, EndpointKey, Limits, Report};
 use super::sample::Sample;
+use super::scope::ScopeKey;
 
 /// What a limit applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -102,9 +103,21 @@ pub fn merge_bounded(stored: Report, push: Report, limits: &Limits) -> Bounded {
             (key, hashes)
         })
         .collect();
+    let stored_authorities: BTreeSet<ScopeKey> = stored.outbound_keys().into_iter().collect();
     let mut report = stored;
     report.union(push, limits.max_literals);
     report.clear_pod();
+    let mut out = Bounded {
+        report: Report::new(None),
+        refused: BTreeMap::new(),
+        evicted: BTreeMap::new(),
+    };
+    limit_authorities(
+        &mut report,
+        limits.max_authorities,
+        &stored_authorities,
+        &mut out,
+    );
     let mut stored_hashes: BTreeMap<EndpointKey, BTreeSet<u64>> = BTreeMap::new();
     for (key, hashes) in held {
         if let Some(routed) = report.route(&key) {
@@ -112,15 +125,37 @@ pub fn merge_bounded(stored: Report, push: Report, limits: &Limits) -> Bounded {
         }
     }
 
-    let mut out = Bounded {
-        report: Report::new(None),
-        refused: BTreeMap::new(),
-        evicted: BTreeMap::new(),
-    };
     limit_endpoints(&mut report, limits.max_endpoints, &stored_hashes, &mut out);
     limit_samples(&mut report, limits.sample_budget, &stored_hashes, &mut out);
     out.report = report;
     out
+}
+
+/// Keeps the `max` outbound scopes ranked by traffic (descending), then stored before new, then
+/// by key; the others go with everything they hold.
+fn limit_authorities(
+    report: &mut Report,
+    max: usize,
+    stored: &BTreeSet<ScopeKey>,
+    out: &mut Bounded,
+) {
+    let mut ranks: Vec<_> = report
+        .outbound_traffic()
+        .into_iter()
+        .map(|(key, traffic)| (Reverse(traffic), !stored.contains(&key), key))
+        .collect();
+    if ranks.len() <= max {
+        return;
+    }
+    ranks.sort();
+    for (_, new, key) in ranks.drain(max..) {
+        report.remove_authority(&key);
+        if new {
+            bump(&mut out.refused, Refusal::AuthorityLimit);
+        } else {
+            bump(&mut out.evicted, Kind::Authority);
+        }
+    }
 }
 
 fn limit_endpoints(
@@ -299,8 +334,13 @@ pub fn drop_expired(report: &mut Report, today: u64, ttl_days: u64) -> BTreeMap<
             endpoints += 1;
         }
     }
-    [(Kind::Endpoint, endpoints), (Kind::Sample, samples)]
-        .into_iter()
-        .filter(|(_, n)| *n > 0)
-        .collect()
+    let authorities = report.drop_stale_authorities(stale);
+    [
+        (Kind::Endpoint, endpoints),
+        (Kind::Sample, samples),
+        (Kind::Authority, authorities),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .collect()
 }

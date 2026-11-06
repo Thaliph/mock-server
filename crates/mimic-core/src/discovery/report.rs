@@ -144,6 +144,10 @@ struct Scope {
     /// Outbound scopes only: connections that were counted, not recorded, by kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tunnels: Option<BTreeMap<String, u64>>,
+    /// Outbound scopes only, set by the controller (spec §7.3, stamping): the last day the
+    /// scope, its `origin` and its `tunnels` were pushed; a merge keeps the larger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen: Option<u64>,
 }
 
 /// Most distinct SNIs and destinations kept per outbound scope.
@@ -581,6 +585,7 @@ impl Node {
 
 impl Scope {
     fn merge(&mut self, other: Scope, max_literals: usize) {
+        self.last_seen = self.last_seen.max(other.last_seen);
         self.root.merge(other.root, max_literals);
         for (path, methods) in other.raw {
             merge_methods(self.raw.entry(path).or_default(), methods);
@@ -605,7 +610,7 @@ impl Scope {
     /// outbound endpoint.
     fn egress_check(&self, outbound: bool) -> Result<(), Violation> {
         if !outbound {
-            return if self.origin.is_none() && self.tunnels.is_none() {
+            return if self.origin.is_none() && self.tunnels.is_none() && self.last_seen.is_none() {
                 Ok(())
             } else {
                 Err(Violation::Malformed)
@@ -657,6 +662,14 @@ impl Scope {
         for methods in self.raw.values_mut() {
             methods.values_mut().for_each(&mut *f);
         }
+    }
+
+    /// What the scope carried: the exchanges of its endpoints plus its tunnel counts.
+    fn traffic(&self) -> u64 {
+        let mut n = 0u64;
+        self.for_each_stats(&mut |s| n = n.saturating_add(s.total()));
+        let tunnels = self.tunnels.iter().flat_map(BTreeMap::values);
+        tunnels.fold(n, |n, t| n.saturating_add(*t))
     }
 
     fn is_empty(&self) -> bool {
@@ -1136,6 +1149,72 @@ impl Report {
             stats.last_seen = Some(day);
             stats.samples.stamp(day);
         });
+        for scope in self
+            .scopes
+            .entry(Direction::Outbound)
+            .or_default()
+            .values_mut()
+        {
+            scope.last_seen = Some(day);
+        }
+        if self
+            .scopes
+            .get(&Direction::Outbound)
+            .is_some_and(BTreeMap::is_empty)
+        {
+            self.scopes.remove(&Direction::Outbound);
+        }
+    }
+
+    /// The traffic of every outbound scope: the exchanges of its endpoints plus its `tunnels`
+    /// counts (spec §7.3, bounded merge).
+    pub(super) fn outbound_traffic(&self) -> Vec<(ScopeKey, u64)> {
+        self.scopes
+            .get(&Direction::Outbound)
+            .into_iter()
+            .flatten()
+            .map(|(key, scope)| (key.clone(), scope.traffic()))
+            .collect()
+    }
+
+    pub(super) fn outbound_keys(&self) -> Vec<ScopeKey> {
+        self.scopes
+            .get(&Direction::Outbound)
+            .into_iter()
+            .flat_map(|scopes| scopes.keys().cloned())
+            .collect()
+    }
+
+    /// Removes an outbound scope with its endpoints, samples, `origin` and `tunnels`.
+    pub(super) fn remove_authority(&mut self, key: &ScopeKey) {
+        if let Some(scopes) = self.scopes.get_mut(&Direction::Outbound) {
+            scopes.remove(key);
+            if scopes.is_empty() {
+                self.scopes.remove(&Direction::Outbound);
+            }
+        }
+        self.sync_version();
+    }
+
+    /// Removes the outbound scopes that hold no endpoint and whose `last_seen` is `stale`
+    /// (spec §7.3, retention); how many.
+    pub(super) fn drop_stale_authorities(&mut self, stale: impl Fn(Option<u64>) -> bool) -> u64 {
+        let doomed: Vec<ScopeKey> = self
+            .scopes
+            .get(&Direction::Outbound)
+            .into_iter()
+            .flatten()
+            .filter(|(_, scope)| {
+                let mut endpoints = false;
+                scope.for_each_stats(&mut |_| endpoints = true);
+                !endpoints && stale(scope.last_seen)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &doomed {
+            self.remove_authority(key);
+        }
+        doomed.len() as u64
     }
 
     /// The §6 redaction applied again to every sample, host and volatile field (spec §7.3,
@@ -1180,13 +1259,33 @@ impl Report {
     /// (`"version": 2`, outbound scopes only; none without outbound scopes) of a report
     /// (spec §7.3, write).
     pub fn split(&self) -> (Report, Option<Report>) {
-        unimplemented!()
+        let part = |direction: Direction, version: u32| Report {
+            version,
+            pod: self.pod.clone(),
+            exchanges: 0,
+            scopes: self
+                .scopes
+                .get(&direction)
+                .map(|scopes| BTreeMap::from([(direction, scopes.clone())]))
+                .unwrap_or_default(),
+        };
+        let mut inbound = part(Direction::Inbound, 1);
+        let mut outbound = part(Direction::Outbound, 2);
+        // A report counts its exchanges once: the outbound part takes what its endpoints
+        // hold, the inbound part the rest, so that the parts add up to the report.
+        let mut held = 0u64;
+        outbound.for_each_stats_of(None, |s| held = held.saturating_add(s.total()));
+        outbound.exchanges = self.exchanges.min(held);
+        inbound.exchanges = self.exchanges - outbound.exchanges;
+        (inbound, (!outbound.scopes.is_empty()).then_some(outbound))
     }
 
     /// The report that `split` took apart.
-    pub fn join(inbound: Report, outbound: Option<Report>) -> Report {
-        let _ = (inbound, outbound);
-        unimplemented!()
+    pub fn join(mut inbound: Report, outbound: Option<Report>) -> Report {
+        if let Some(outbound) = outbound {
+            inbound.union(outbound, usize::MAX);
+        }
+        inbound
     }
 
     pub(super) fn clear_pod(&mut self) {
