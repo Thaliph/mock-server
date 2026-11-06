@@ -47,7 +47,7 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `imagePullSecrets` | `[]` | |
 | `controller.replicas` | `2` | Keep 2 or more: the webhook fails closed. |
 | `controller.logLevel` | `info` | `MIMIC_LOG` of the controller (`tracing` filter syntax). |
-| `controller.resources` | requests `50m` / `64Mi`; limit memory `512Mi` | Sized for two report writes at once plus the push body budget. |
+| `controller.resources` | requests `50m` / `64Mi`; limit memory `768Mi` | Sized for the pushes the body budget lets through at once, each at the store limits, plus allocator headroom. |
 | `controller.nodeSelector`, `controller.tolerations` | `{}`, `[]` | |
 | `controller.affinity` | `{}` | Empty: preferred pod anti-affinity on `kubernetes.io/hostname`. |
 | `controller.webhook.maxConnections` | `256` | 1-65535. `MIMIC_WEBHOOK_MAX_CONNECTIONS`. |
@@ -109,7 +109,7 @@ sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 | `MIMIC_SIDECAR_API_ADDR` | `0.0.0.0:8444` | Sidecar API HTTPS listener. |
 | `MIMIC_SIDECAR_API_RATE` | `10` | Requests/s per source address, burst twice that. 1-10000. |
 | `MIMIC_SIDECAR_API_MAX_REPORT` | `32Mi` | Largest push body. 64Ki-1Gi. |
-| `MIMIC_SIDECAR_API_BODY_BUDGET` | `64Mi` | Push bodies being read at once; at least `MAX_REPORT`, at most 4Gi. |
+| `MIMIC_SIDECAR_API_BODY_BUDGET` | `32Mi` | Push bodies being read at once; at least `MAX_REPORT`, at most 4Gi. |
 | `MIMIC_STORE_TTL` | `30d` | Retention after last push / last seen. 10s-365d. |
 | `MIMIC_STORE_MAX_ENDPOINTS` | `512` | Per direction and deployment. 1-10000. |
 | `MIMIC_STORE_MAX_PUSH_ENDPOINTS` | `256` | Per direction in one push; 1-10000, at most `MAX_ENDPOINTS`. |

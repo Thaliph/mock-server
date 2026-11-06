@@ -12,17 +12,22 @@ use super::*;
 use crate::ui::{UiMetrics, router as ui_router};
 
 const CHILD: &str = "MIMIC_SHR_18_CHILD";
-const RSS_LIMIT: u64 = 512 * 1024 * 1024;
-const MAX_REPORT: usize = 32 << 20;
+const RSS_LIMIT: u64 = 640 * 1024 * 1024;
 /// Keys of the JSON bodies of the exchanges: schemas near their caps, pushes of about 28 MB.
 const KEYS: usize = 40;
 const DEPLOYMENTS: [&str; 2] = ["pay", "web"];
 
+/// The default limits of the push route (spec §10.2).
+fn defaults() -> crate::push_config::PushConfig {
+    crate::push_config::PushConfig::from_env(&mimic_runtime::config::Env::from_pairs([]))
+        .expect("the defaults are valid")
+}
+
 fn options() -> Options {
+    let defaults = defaults();
     Options {
-        max_report: MAX_REPORT,
-        // Two bodies of this size are never held at once (spec §7.2).
-        budget: MAX_REPORT as u64,
+        max_report: defaults.max_report,
+        budget: defaults.body_budget,
         max_push: 1024,
         max_endpoints: 512,
         max_authorities: 128,
@@ -127,7 +132,7 @@ fn full_report(salt: usize) -> Report {
 /// The push body, written by hand: no second copy of the report as a JSON value.
 fn full_body(sequence: u64, salt: usize) -> Vec<u8> {
     let json = full_report(salt).to_json().expect("serialises");
-    assert!(json.len() < MAX_REPORT, "{} bytes", json.len());
+    assert!(json.len() < defaults().max_report, "{} bytes", json.len());
     format!("{{\"session\":\"{SESSION}\",\"sequence\":{sequence},\"report\":{json}}}").into_bytes()
 }
 
