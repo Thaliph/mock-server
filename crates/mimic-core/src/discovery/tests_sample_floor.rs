@@ -279,6 +279,37 @@ proptest! {
         }
     }
 
+    /// Pushes of both directions: a direction at most half only loses samples to its own
+    /// new ones, or to the other once its own growth took it above half.
+    #[test]
+    fn shr_04_mixed_pushes_respect_the_floor(
+        pushes in proptest::collection::vec(push_of(), 1..8),
+        extra in 0usize..3,
+    ) {
+        let unit = unit();
+        let b = unit * (4 + extra) + unit / 2;
+        let l = limits(b);
+        let mut stored = Report::new(None);
+        for items in pushes {
+            let push = push_report(&items, None);
+            for direction in [Direction::Inbound, Direction::Outbound] {
+                let own = items.iter().filter(|i| i.0 == (direction == Direction::Outbound)).count();
+                let before = (bytes(&stored, direction), hashes(&stored, direction));
+                let out = merge_bounded(stored.clone(), push.clone(), &l);
+                prop_assert!(out.report.sample_bytes() <= b);
+                if before.0 <= b / 2 {
+                    let after = hashes(&out.report, direction);
+                    if own == 0 {
+                        prop_assert!(before.1.is_subset(&after), "{:?} lost samples: {after:?}", before.1);
+                    }
+                    // Whatever the other direction does, at most one sample below half.
+                    prop_assert!(bytes(&out.report, direction) + unit > before.0.min(b / 2));
+                }
+            }
+            stored = merge_bounded(stored, push, &l).report;
+        }
+    }
+
     #[test]
     fn shr_04_the_merge_stays_commutative_below_the_budget(a in push_of(), b in push_of()) {
         let l = limits(64 << 20);
