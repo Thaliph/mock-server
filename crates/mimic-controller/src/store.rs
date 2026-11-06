@@ -357,6 +357,9 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Bound of the set of streaks of unreadable values already logged.
+const MAX_LOGGED: usize = 1024;
+
 /// The summary of `:meta`; a field that is missing or not a number makes it unreadable.
 fn summary(
     namespace: &str,
@@ -542,7 +545,8 @@ impl Store {
     }
 
     /// The deployments with data, sorted by namespace then deployment.
-    pub async fn list(&self) -> Result<Vec<Summary>, ReadError> {
+    /// The second value counts the entries left out because their `:meta` is unreadable.
+    pub async fn list(&self) -> Result<(Vec<Summary>, u64), ReadError> {
         let mut conn = self
             .connection()
             .await
@@ -567,7 +571,7 @@ impl Store {
             .map(|(ns, dep)| (ns.to_string(), dep.to_string()))
             .collect();
         if names.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let mut pipe = redis::pipe();
         for (ns, dep) in &names {
@@ -579,17 +583,19 @@ impl Store {
             Err(e) => return Err(self.read_failed(e).await),
         };
         let mut found = Vec::with_capacity(names.len());
+        let mut skipped = 0;
         for ((ns, dep), meta) in names.into_iter().zip(metas) {
             // Expired between the index and the read: not a deployment any more.
             if meta.is_empty() {
                 continue;
             }
             // Logged by `summary`: one bad entry does not fail the list.
-            if let Ok(summary) = summary(&ns, &dep, &meta) {
-                found.push(summary);
+            match summary(&ns, &dep, &meta) {
+                Ok(summary) => found.push(summary),
+                Err(_) => skipped += 1,
             }
         }
-        Ok(found)
+        Ok((found, skipped))
     }
 
     /// One deployment and its pods with their last push (Unix milliseconds).
@@ -818,7 +824,13 @@ impl Store {
     }
 
     fn once(&self, namespace: &str, deployment: &str, what: &str) -> bool {
-        lock(&self.logged).insert((namespace.into(), deployment.into(), what.into()))
+        let mut logged = lock(&self.logged);
+        // A deleted deployment is never read again, so its streak is never ended: past the bound
+        // the set starts over (at worst one more line per live streak).
+        if logged.len() >= MAX_LOGGED {
+            logged.clear();
+        }
+        logged.insert((namespace.into(), deployment.into(), what.into()))
     }
 
     async fn attempt(
