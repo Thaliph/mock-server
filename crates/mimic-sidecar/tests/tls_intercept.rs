@@ -42,6 +42,26 @@ const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
 
 type Authority = Issuer<'static, KeyPair>;
 
+// What the token endpoint returns and what the client sends it (EGR-17). None may leave the
+// sidecar.
+const ACCESS_TOKEN: &str = "CANARY-ACCESSTOKEN-92e";
+const SET_COOKIE: &str = "CANARY-SETCOOKIE-92e";
+const CLIENT_SECRET: &str = "CANARY-CLIENTSECRET-92e";
+const BEARER: &str = "CANARY-BEARER-92e";
+const API_KEY: &str = "CANARY-APIKEY-92e";
+const QUERY_KEY: &str = "CANARY-QKEY-92e";
+const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.CANARYJWTSIGNATURE92e";
+const GOOGLE: &str = "AIzaCANARY0123456789abcdefghijklmnopqrs";
+
+fn token_reply() -> Vec<u8> {
+    let body = format!("{{\"access_token\":\"{ACCESS_TOKEN}\",\"token_type\":\"bearer\"}}");
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: sid={SET_COOKIE}; HttpOnly\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 fn authority(name: &str) -> (Authority, CertificateDer<'static>) {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -226,6 +246,15 @@ async fn destination_full(
                         return;
                     }
                 }
+                if got.windows(13).any(|w| w == b"X-Mode: token") {
+                    let _ = tls.write_all(&token_reply()).await;
+                    let mut rest = Vec::new();
+                    let _ = tls.read_to_end(&mut rest).await;
+                    got.extend_from_slice(&rest);
+                    read.lock().unwrap().push(got.clone());
+                    let _ = tls.shutdown().await;
+                    return;
+                }
                 if got.windows(12).any(|w| w == b"X-Mode: slow") {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
@@ -314,7 +343,7 @@ async fn sidecar_to(
     direction: Direction,
     discovery: Option<&Discovery>,
 ) -> Sidecar {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = mimic_sidecar::listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
     let tunnel = TunnelMetrics::register(&mut metrics);
@@ -1336,4 +1365,255 @@ async fn egr_11_a_client_that_rejects_the_mimic_certificate_is_a_tunnel() {
     assert!(connect(&sidecar, &dest.ca_der, api(), &[]).await.is_err());
     let authority = format!("api.test:{}", dest.addr.port());
     tunnelled(&sidecar, &discovery, &authority, "tls_client_rejected").await;
+}
+
+#[tokio::test]
+async fn egr_17_an_intercepted_token_exchange_leaves_no_canary_and_no_byte_changes() {
+    let logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let discovery = discovery();
+    let sidecar = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let form = format!("grant_type=client_credentials&client_id=app&client_secret={CLIENT_SECRET}");
+    let request = format!(
+        "POST /oauth/token/{JWT}?key={QUERY_KEY}&maps={GOOGLE} HTTP/1.1\r\nHost: api.test:443\r\n\
+         X-Mode: token\r\nAuthorization: Bearer {BEARER}\r\nX-Api-Key: {API_KEY}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}",
+        form.len()
+    );
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    tls.write_all(request.as_bytes()).await.unwrap();
+    // The response reaches the client unchanged.
+    let expected = token_reply();
+    let mut got = vec![0u8; expected.len()];
+    tokio::time::timeout(TIMEOUT, tls.read_exact(&mut got))
+        .await
+        .expect("answer in time")
+        .unwrap();
+    assert_eq!(got, expected);
+    recorded(&discovery, 1).await;
+    // The request reaches the destination unchanged.
+    tls.shutdown().await.unwrap();
+    eventually("the destination read the request", || {
+        !dest.requests.lock().unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(dest.requests.lock().unwrap()[0], request.as_bytes());
+    let report = discovery.report().to_json().unwrap();
+    assert!(report.contains("access_token") && report.contains("client_secret"));
+    logs.settled().await;
+    let texts = [
+        ("report", report),
+        ("metrics", sidecar.metrics.encode()),
+        ("logs", logs.text()),
+    ];
+    let canaries = [
+        ACCESS_TOKEN,
+        SET_COOKIE,
+        CLIENT_SECRET,
+        BEARER,
+        API_KEY,
+        QUERY_KEY,
+        JWT,
+        "CANARYJWTSIGNATURE",
+        GOOGLE,
+    ];
+    for (what, text) in &texts {
+        for (i, canary) in canaries.iter().enumerate() {
+            let leaked = text.contains(canary);
+            assert!(!leaked, "canary {i} in {what}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// EGR-14: shedding under a heavy outbound load.
+
+const CANNED: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+const BIG: usize = 200 * 1024;
+
+/// An app that checks each 200 KiB request body (all `z`) and answers `CANNED`, or a `500`.
+async fn checking_app() -> SocketAddr {
+    let listener = mimic_sidecar::listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                let mut buf = vec![0u8; 64 * 1024];
+                let end = loop {
+                    if let Some(p) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                    match s.read(&mut buf).await {
+                        Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                        _ => return,
+                    }
+                };
+                while got.len() < end + BIG {
+                    match s.read(&mut buf).await {
+                        Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                        _ => return,
+                    }
+                }
+                let intact = got[end..].iter().all(|&b| b == b'z');
+                let reply: &[u8] = if intact {
+                    CANNED
+                } else {
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+                };
+                let _ = s.write_all(reply).await;
+            });
+        }
+    });
+    addr
+}
+
+fn big_request(host: &str) -> Vec<u8> {
+    let mut r = format!(
+        "POST /upload HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {BIG}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    r.extend(vec![b'z'; BIG]);
+    r
+}
+
+fn direction_sum(text: &str, direction: &str, result: Option<&str>) -> u64 {
+    text.lines()
+        .filter(|l| l.starts_with("mimic_discovery_exchanges_total{"))
+        .filter(|l| l.contains(&format!("direction=\"{direction}\"")))
+        .filter(|l| result.is_none_or(|r| l.contains(&format!("result=\"{r}\""))))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn egr_14_outbound_shedding_keeps_inbound_recorded_and_traffic_intact() {
+    let _logs = common::capture_logs();
+    mimic_sidecar::listener::raise_fd_limit();
+    let app = checking_app().await;
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let config = DiscoveryConfig {
+        queue: 1,
+        capture_budget: 1024 * 1024,
+        ..DiscoveryConfig::default()
+    };
+    let discovery = Discovery::start(&config, Some("pod-a".into())).unwrap();
+    let clear = sidecar_to(
+        &dest,
+        app,
+        Some(ca.clone()),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let tls_out = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca.clone()),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let inbound = sidecar_to(
+        &dest,
+        app,
+        Some(ca),
+        "",
+        Direction::Inbound,
+        Some(&discovery),
+    )
+    .await;
+    let request = Arc::new(big_request("api.example.test:8080"));
+    let inbound_request = Arc::new(big_request("svc.ns:8080"));
+    let mut tasks = Vec::new();
+    for i in 0..2000 {
+        if i % 10 == 9 {
+            // 200 intercepted exchanges.
+            let (addr, root) = (tls_out.addr, root.clone());
+            let request = request.clone();
+            tasks.push(tokio::spawn(async move {
+                let tcp = TcpStream::connect(addr).await.unwrap();
+                let connector = client_config(&root, &[]);
+                let mut tls =
+                    tokio::time::timeout(Duration::from_secs(60), connector.connect(api(), tcp))
+                        .await
+                        .expect("handshake in time")
+                        .unwrap();
+                tls.write_all(&request).await.unwrap();
+                let mut got = vec![0u8; RESPONSE.len()];
+                tokio::time::timeout(Duration::from_secs(60), tls.read_exact(&mut got))
+                    .await
+                    .expect("answered in time")
+                    .unwrap();
+                got == RESPONSE
+            }));
+        } else {
+            tasks.push(tokio::spawn(clear_call(clear.addr, request.clone())));
+        }
+        if i % 10 == 0 {
+            tasks.push(tokio::spawn(clear_call(
+                inbound.addr,
+                inbound_request.clone(),
+            )));
+        }
+    }
+    for task in tasks {
+        assert!(
+            task.await.unwrap(),
+            "an answer differs from what the destination sent"
+        );
+    }
+    for _ in 0..400 {
+        let text = clear.metrics.encode();
+        if direction_sum(&text, "outbound", None) == 2000
+            && direction_sum(&text, "inbound", None) == 200
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let text = clear.metrics.encode();
+    assert_eq!(direction_sum(&text, "outbound", None), 2000, "{text}");
+    assert_eq!(direction_sum(&text, "inbound", None), 200, "{text}");
+    assert!(
+        direction_sum(&text, "outbound", Some("dropped")) > 0,
+        "{text}"
+    );
+    assert!(
+        direction_sum(&text, "inbound", Some("recorded")) >= 1,
+        "{text}"
+    );
+    let budget: u64 = text
+        .lines()
+        .filter(|l| {
+            l.starts_with("mimic_discovery_bodies_total{") && l.contains("result=\"budget\"")
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum();
+    assert!(budget > 0, "{text}");
+}
+
+async fn clear_call(addr: SocketAddr, request: Arc<Vec<u8>>) -> bool {
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    c.write_all(&request).await.unwrap();
+    let mut got = vec![0u8; CANNED.len()];
+    tokio::time::timeout(Duration::from_secs(60), c.read_exact(&mut got))
+        .await
+        .expect("answered in time")
+        .unwrap();
+    got == CANNED
 }

@@ -81,6 +81,22 @@ async fn read_message(s: &mut TcpStream, pending: &mut Vec<u8>) -> Option<(Strin
     }
 }
 
+// What the token endpoint returns and what the client sends it. None may leave the sidecar.
+const ACCESS_TOKEN: &str = "CANARY-ACCESSTOKEN-91d";
+const SET_COOKIE: &str = "CANARY-SETCOOKIE-91d";
+const CLIENT_SECRET: &str = "CANARY-CLIENTSECRET-91d";
+const JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.CANARYJWTSIGNATURE91d";
+
+/// The token endpoint's answer: an `access_token` in the body and a session cookie.
+pub fn token_response() -> Vec<u8> {
+    let body = format!("{{\"access_token\":\"{ACCESS_TOKEN}\",\"token_type\":\"bearer\"}}");
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: sid={SET_COOKIE}; HttpOnly\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 fn response(status: &str, body: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -107,7 +123,9 @@ async fn provider() -> (SocketAddr, Seen) {
                         .unwrap()
                         .push(format!("{head}\n\n{}", String::from_utf8_lossy(&body)));
                     let line = head.lines().next().unwrap_or_default().to_string();
-                    let reply = if let Some(n) = line
+                    let reply = if line.starts_with("POST /oauth/token") {
+                        token_response()
+                    } else if let Some(n) = line
                         .strip_prefix("GET /users/")
                         .and_then(|r| r.split(' ').next())
                     {
@@ -447,6 +465,61 @@ async fn egr_17_no_canary_leaves_the_sidecar_from_cleartext_outbound_exchanges()
     let log = logs.text();
     for canary in CANARIES {
         assert!(!log.contains(canary));
+    }
+}
+
+#[tokio::test]
+async fn egr_17_a_token_exchange_and_a_jwt_path_leave_no_canary_and_no_byte_changes() {
+    let logs = capture_logs();
+    let (app, seen) = provider().await;
+    let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
+    let out = fixture_discovery(Direction::Outbound, &discovery, move |_| Some(app)).await;
+    let form = format!("grant_type=client_credentials&client_id=app&client_secret={CLIENT_SECRET}");
+    let request = format!(
+        "POST /oauth/token HTTP/1.1\r\nHost: {AUTHORITY}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{form}",
+        form.len()
+    );
+    let (head, body) = call(out.addr, request.as_bytes()).await;
+    // The response reaches the client unchanged.
+    assert!(head.contains(&format!("Set-Cookie: sid={SET_COOKIE}")));
+    assert!(String::from_utf8(body).unwrap().contains(ACCESS_TOKEN));
+    let (head, _) = call(out.addr, &get(&format!("/v1/files/{JWT}/meta"))).await;
+    assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    counted(
+        &out.metrics,
+        "mimic_discovery_exchanges_total{direction=\"outbound\",result=\"recorded\"} 2",
+    )
+    .await;
+    // The destination got the secrets unchanged.
+    let kept = seen.lock().unwrap().clone();
+    assert!(kept[0].contains(CLIENT_SECRET));
+    assert!(kept[1].contains(JWT));
+    let report = discovery.report().to_json().unwrap();
+    // The token body is kept as a shape: the endpoint and its fields are there.
+    assert!(report.contains("/oauth/token") && report.contains("access_token"));
+    assert!(report.contains("client_secret"));
+    logs.settled().await;
+    let texts = [
+        ("report", report),
+        ("metrics", out.metrics.encode()),
+        ("logs", logs.text()),
+    ];
+    for (what, text) in &texts {
+        for (i, canary) in [
+            ACCESS_TOKEN,
+            SET_COOKIE,
+            CLIENT_SECRET,
+            JWT,
+            "CANARYJWTSIGNATURE",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let leaked = text.contains(canary);
+            assert!(!leaked, "canary {i} in {what}");
+        }
     }
 }
 
