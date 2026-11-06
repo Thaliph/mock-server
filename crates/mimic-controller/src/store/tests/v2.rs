@@ -32,7 +32,12 @@ fn outbound_exchange(report: &mut Report, authority: &str, path: &str, times: us
 }
 
 /// A push with `inbound` paths and `outbound` `(authority, path, times)` exchanges.
-fn push_v2(pod: &str, seq: u64, inbound: &[&str], outbound: &[(&str, &str, usize)]) -> Push {
+pub(super) fn push_v2(
+    pod: &str,
+    seq: u64,
+    inbound: &[&str],
+    outbound: &[(&str, &str, usize)],
+) -> Push {
     let mut report = Report::new(Some(pod.to_string()));
     for path in inbound {
         exchange(&mut report, path, 200);
