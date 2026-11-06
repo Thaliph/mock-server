@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21).
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -46,6 +46,7 @@ cleanup() {
   for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
+  [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
   [[ -z $WORK ]] || rm -rf "$WORK"
   [[ $KEEP_CLUSTER == 1 ]] || kind delete cluster --name "$CLUSTER"
 }
@@ -1633,6 +1634,152 @@ echo "ctl_21: merged GET $got_get, between $min_get (the client's 200s) and $max
 [[ $(merged_count PUT) == "$want_put" ]] || fail "ctl_21: merged PUT $(merged_count PUT), expected $want_put"
 [[ $(merged_templates) == "$(cat "$WORK/templates-first.txt")" ]] \
   || fail "ctl_21: the endpoints changed during the churn: $(merged_templates | tr '\n' ';')"
+
+# --- Discovery UI (F6, spec §7.5, §12.7 UI-11, UI-12) -------------------------------------------------------------
+# The same apps and the same port-forward to a controller pod. Two more PUTs record hostile bodies: a key and a value
+# that are HTML, and a "$ref" that points to a server of this script. Both end up in the users document.
+log "ui_11: the read API serves the users document, the endpoints and the pages through the port-forward"
+ui_url=http://localhost:18082
+ref_port=18090
+xss='<img src=/ui-xss onerror=alert(1)>'
+kubectl -n disc-22-client exec -i client -- python3 - "$xss" "http://localhost:$ref_port/ref" <<'PY' || fail "ui_11: the hostile PUTs failed"
+import json, sys, urllib.request
+xss, ref = sys.argv[1:3]
+for n, body in ((771, {xss: xss}), (772, {"$ref": ref})):
+    request = urllib.request.Request(
+        f"http://front.disc-22-client.svc:8080/front/users/{n}", data=json.dumps(body).encode(), method="PUT",
+        headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(request, timeout=10).read()
+PY
+# The pods ship within seconds: wait for both bodies to show in the document.
+ui_doc_ready() {
+  curl -fs --max-time 10 "$ui_url/v1/workloads/disc-22/users/openapi/inbound-8080" > "$WORK/ui-doc.json" 2>/dev/null \
+    && jq -e --arg x "$xss" --arg r "http://localhost:$ref_port/ref" \
+      '(tojson | contains($x)) and (tojson | contains($r))' \
+      "$WORK/ui-doc.json" >/dev/null 2>&1
+}
+for _ in $(seq 60); do ui_doc_ready && break; sleep 3; done
+ui_doc_ready || fail "ui_11: the hostile bodies never reached the users document"
+
+[[ $(curl -fs "$ui_url/v1/workloads/disc-22/users/openapi" | jq -c '[.documents[] | .id]') == '["inbound-8080"]' ]] \
+  || fail "ui_11: the users documents are not [inbound-8080]"
+jq -e '.openapi == "3.1.1"
+  and (.paths["/users/{users_id}"] | has("get") and has("put"))
+  and ([.paths["/users/{users_id}"].get.responses["200"].content["application/json"].examples[]?.value] | length > 0)
+  and (.paths["/users/{users_id}"].get.security == [{"http_bearer": []}])
+  and (.components.securitySchemes.http_bearer == {"type": "http", "scheme": "bearer"})
+  and (.servers | map(.url) | index("http://users.disc-22.svc:8080") != null)' "$WORK/ui-doc.json" >/dev/null \
+  || fail "ui_11: the users document lacks get/put /users/{users_id}, a 200 example, http_bearer or the users server"
+curl -fs "$ui_url/v1/workloads/disc-22/users/endpoints" > "$WORK/ui-endpoints.json" || fail "ui_11: no endpoints route"
+[[ $(jq -r '[.endpoints[] | select(.direction == "inbound") | "\(.method) \(.template)"] | sort | join(",")' "$WORK/ui-endpoints.json") \
+  == 'GET /users/{users_id},PUT /users/{users_id}' ]] || fail "ui_11: the endpoint list is not GET and PUT /users/{users_id}"
+jq -e '[.endpoints[] | select(.method == "GET") | .exchanges] | add >= 40' "$WORK/ui-endpoints.json" >/dev/null \
+  || fail "ui_11: the GET endpoint counts fewer than the 40 exchanges of the client"
+for page in / /ui/ /ui/workloads/disc-22/users /ui/workloads/disc-22/users/openapi/inbound-8080; do
+  curl -s "$ui_url$page" > "$WORK/ui-page.html" || fail "ui_11: cannot read $page"
+  for c in "${canaries[@]}"; do
+    if grep -F "$c" "$WORK/ui-page.html" >/dev/null; then fail "ui_11: a canary appears in the page $page"; fi
+  done
+done
+for c in "${canaries[@]}"; do
+  if grep -F "$c" "$WORK/ui-doc.json" "$WORK/ui-endpoints.json" >/dev/null; then fail "ui_11: a canary appears in the document or the endpoint list"; fi
+done
+[[ $(curl -s -I -o /dev/null -w '%{http_code}' "$ui_url/ui/") == 200 ]] || fail "ui_11: HEAD /ui/ is not 200"
+[[ $(curl -s -o /dev/null -w '%{http_code}' -X POST "$ui_url/ui/") == 405 ]] || fail "ui_11: POST /ui/ is not 405"
+[[ $(curl -s -o /dev/null -w '%{http_code}' "$ui_url/ui/workloads/disc-22/Users") == 400 ]] || fail "ui_11: an invalid name is not 400"
+curl -s -D "$WORK/ui-headers.txt" -o /dev/null "$ui_url/ui/" || fail "ui_11: cannot read the headers of /ui/"
+tr -d '\r' < "$WORK/ui-headers.txt" | tr 'A-Z' 'a-z' > "$WORK/ui-headers.lower"
+for h in "x-content-type-options: nosniff" "referrer-policy: no-referrer" "x-frame-options: deny" "cache-control: no-store" \
+  "content-security-policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"; do
+  if ! grep -Fx "$h" "$WORK/ui-headers.lower" >/dev/null; then fail "ui_11: /ui/ lacks the header '$h'"; fi
+done
+if grep -F 'access-control-allow' "$WORK/ui-headers.lower" >/dev/null; then fail "ui_11: /ui/ has an Access-Control-Allow header"; fi
+
+log "ui_12: a pinned headless Chromium, with no name but localhost resolvable, loads the pages"
+CHROME_IMAGE=$(scripts/pinned-image.sh e2e-chromium)
+chrome_port=19223
+CHROME=mimic-e2e-chromium-$$
+# The container holds no capability, cannot gain one, and writes only to its tmpfs. --no-sandbox stays: Chromium's own
+# sandbox needs user namespaces or CAP_SYS_ADMIN, which the dropped capabilities and the default seccomp profile refuse;
+# the container is the sandbox here, and the browser only loads the pages of this script.
+docker run -d --rm --name "$CHROME" --network host --cap-drop=ALL --security-opt no-new-privileges --read-only \
+  --tmpfs /tmp --tmpfs /root --entrypoint /headless-shell/headless-shell "$CHROME_IMAGE" \
+  --no-sandbox --user-data-dir=/tmp/chrome --disable-gpu --remote-debugging-address=127.0.0.1 --remote-debugging-port=$chrome_port \
+  --host-resolver-rules='MAP * ~NOTFOUND , EXCLUDE localhost' about:blank >/dev/null || fail "ui_12: cannot start Chromium"
+for _ in $(seq 30); do curl -fs "127.0.0.1:$chrome_port/json/version" >/dev/null && break; sleep 1; done
+curl -fs "127.0.0.1:$chrome_port/json/version" >/dev/null || fail "ui_12: Chromium does not answer on its DevTools port"
+# The server that the "$ref" points to: any request it gets is a failure.
+cat > "$WORK/ref_server.py" <<'PY'
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        print(self.path, flush=True)
+        self.send_response(200)
+        self.end_headers()
+    do_POST = do_PUT = do_HEAD = do_GET
+    def log_message(self, *args):
+        pass
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+PY
+python3 -I "$WORK/ref_server.py" "$ref_port" > "$WORK/ref_hits.log" &
+PIDS+=("$!")
+# users_log_count: the access lines of the users pods, without the /users/0 probes, summed. Every failure is fatal
+# (the caller fails on a non-zero status): no pipe hides a failed kubectl or jq, and no pod at all is a failure.
+users_log_count() {
+  local pods p log n total=0
+  pods=$(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}') || return 1
+  [[ -n $pods ]] || return 1
+  for p in $pods; do
+    log=$(kubectl -n disc-22 logs "$p" -c app) || return 1
+    n=$(jq -R -s 'split("\n") | map(fromjson? | select(. != null and .path != "/users/0")) | length' <<< "$log") || return 1
+    [[ $n =~ ^[0-9]+$ ]] || return 1
+    total=$((total + n))
+  done
+  echo "$total"
+}
+# The client traffic is over (the churn client was waited for, the hostile PUTs returned): the count must hold still.
+# users_before > 0 proves the counter sees the traffic, so an equal count afterwards is not a count of nothing.
+users_before=$(users_log_count) || fail "ui_12: cannot count the access lines of the users pods"
+sleep 3
+users_settled=$(users_log_count) || fail "ui_12: cannot count the access lines of the users pods"
+[[ $users_before == "$users_settled" ]] || fail "ui_12: the users pods still log requests before the browser run ($users_before, then $users_settled)"
+(( users_before > 0 )) || fail "ui_12: the users pods' access lines count 0 after the traffic: the counter sees nothing"
+
+# browse <name> <path> <args...>: the page as the browser saw it, in $WORK/browse-<name>.json; no violation, no failure to
+# load, and no request but to the port-forward's origin (a data: image is not a request to an origin).
+browse() {
+  local name=$1 path=$2; shift 2
+  python3 -I scripts/e2e/ui_browser.py "$chrome_port" "$ui_url$path" "$@" > "$WORK/browse-$name.json" \
+    || fail "ui_12: $name: the browser did not show the page"
+  [[ $(jq '.violations | length' "$WORK/browse-$name.json") == 0 ]] \
+    || fail "ui_12: $name: CSP violations: $(jq -c .violations "$WORK/browse-$name.json")"
+  [[ $(jq --arg o "$ui_url/" '[.requests[] | select((startswith($o) or startswith("data:")) | not)] | length' "$WORK/browse-$name.json") == 0 ]] \
+    || fail "ui_12: $name: requests outside $ui_url: $(jq -c .requests "$WORK/browse-$name.json")"
+  [[ $(jq '.requests | length' "$WORK/browse-$name.json") -gt 0 ]] || fail "ui_12: $name: the browser recorded no request"
+  [[ $(jq '[.buttons[] | select(test("try it out|execute"; "i"))] | length' "$WORK/browse-$name.json") == 0 ]] \
+    || fail "ui_12: $name: a Try it out or Execute button is shown"
+  [[ $(jq .xss_imgs "$WORK/browse-$name.json") == 0 ]] || fail "ui_12: $name: the payload became an img element"
+}
+browse list /ui/ --wait disc-22 --wait users
+browse deployment /ui/workloads/disc-22/users --wait '/users/{users_id}' --wait GET --wait PUT
+jq -e '.text | test("GET\\s+/users/\\{users_id\\}") and test("PUT\\s+/users/\\{users_id\\}")' "$WORK/browse-deployment.json" >/dev/null \
+  || fail "ui_12: the deployment page lacks the GET and PUT /users/{users_id} rows"
+browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand --interceptor
+jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-document.json" >/dev/null \
+  || fail "ui_12: the document page lists the operations $(jq -c .methods "$WORK/browse-document.json"), not GET and PUT"
+# The request interceptor refuses by throwing (a returned null falls back to the original request): a cross-origin
+# URL, a same-origin URL outside /v1/workloads/ and a malformed one throw; a same-origin /v1/workloads/ URL passes.
+jq -e '.interceptor | (.cross_origin.threw and .cross_origin_workloads.threw and .same_origin_outside.threw and .malformed.threw)
+  and (.same_origin_workloads | .threw == false and .passed)' "$WORK/browse-document.json" >/dev/null \
+  || fail "ui_12: the request interceptor does not refuse as expected: $(jq -c .interceptor "$WORK/browse-document.json")"
+# The payload is shown as text, inert: no img element of that src (browse), and the text holds it.
+jq -e --arg x "$xss" '.text | contains($x)' "$WORK/browse-document.json" >/dev/null \
+  || fail "ui_12: the XSS payload is not shown as text in the document page"
+[[ ! -s $WORK/ref_hits.log ]] || fail "ui_12: the server of the \$ref example got a request: $(cat "$WORK/ref_hits.log")"
+users_after=$(users_log_count) || fail "ui_12: cannot count the access lines of the users pods after the browser run"
+[[ $users_before == "$users_after" ]] || fail "ui_12: the users pods logged $((users_after - users_before)) request(s) during the browser run"
+docker rm -f "$CHROME" >/dev/null 2>&1 || true
+
 kubectl delete namespace disc-22 disc-22-client --wait=false >/dev/null
 
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"

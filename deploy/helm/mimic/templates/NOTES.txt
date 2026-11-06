@@ -4,3 +4,7 @@ Check the controller:
   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ .Release.Name }}-controller
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }}-controller 8081:8081
   curl -s localhost:8081/readyz
+
+Read the discovered APIs (OpenAPI and Swagger UI, loopback of the pod):
+  kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ .Release.Name }}-controller 8080:8080
+  open http://localhost:8080/ui/
