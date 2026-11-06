@@ -195,6 +195,14 @@ impl Sample {
         (hash, sample)
     }
 
+    /// The sample without the controller's stamp.
+    pub(super) fn unstamped(&self) -> Sample {
+        Sample {
+            last_seen: None,
+            ..self.clone()
+        }
+    }
+
     pub fn status(&self) -> u16 {
         self.response.status
     }
@@ -231,7 +239,7 @@ impl Sample {
     }
 
     /// A status in 100..=599; bodies of a parsed media type and at most `MAX_BODY` bytes.
-    fn check(&self) -> Result<(), Violation> {
+    pub(super) fn check(&self) -> Result<(), Violation> {
         if !(100..=599).contains(&self.response.status) {
             return Err(Violation::Status);
         }

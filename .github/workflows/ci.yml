@@ -461,6 +461,14 @@ jobs:
           cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu discovery
           corpus/discovery seeds/discovery --
           -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10
+      # PUL-20: the egress set (check and projection), on the same schedule.
+      - name: Fuzz the egress set
+        working-directory: fuzz
+        run: >
+          mkdir -p corpus/egress &&
+          cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu egress
+          corpus/egress seeds/egress --
+          -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10
       # The corpus grows on the weekly run only; PR runs read it and never write it.
       - if: github.event_name == 'schedule'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

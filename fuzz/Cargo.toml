@@ -28,3 +28,10 @@ path = "fuzz_targets/discovery.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "egress"
+path = "fuzz_targets/egress.rs"
+test = false
+doc = false
+bench = false

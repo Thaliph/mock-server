@@ -1914,6 +1914,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "xxhash-rust",
 ]
 
