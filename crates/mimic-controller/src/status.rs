@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures::StreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
 use mimic_core::discovery::status::discovery;
 use prometheus_client::metrics::counter::Counter;
@@ -101,10 +102,15 @@ fn apply_params() -> PatchParams {
     PatchParams::apply(MANAGER).force()
 }
 
-/// The status as the cluster returns it: the CRD defaults `endpoints.inbound` to 0 (for the
-/// `Endpoints` printer column), which the computed status omits.
+/// The status as the cluster returns it: the CRD defaults `endpoints.inbound` and
+/// `totalEndpoints` to 0 (for the `Endpoints` printer column), which a stored status may omit.
 fn defaulted(status: &Value) -> Value {
     let mut status = status.clone();
+    if let Some(object) = status.as_object_mut() {
+        object
+            .entry("totalEndpoints")
+            .or_insert_with(|| Value::from(0u64));
+    }
     if let Some(endpoints) = status.get_mut("endpoints").and_then(Value::as_object_mut) {
         endpoints
             .entry("inbound")
@@ -112,6 +118,10 @@ fn defaulted(status: &Value) -> Value {
     }
     status
 }
+
+/// How many status applies run at once (#293 note 25): a slow API server delays a pass by one
+/// timeout per batch, not per workload.
+const APPLY_CONCURRENCY: usize = 8;
 
 pub struct Reconciler {
     pub store: Arc<Store>,
@@ -131,6 +141,7 @@ impl Reconciler {
         let window_ms = u64::try_from(self.window.as_millis()).unwrap_or(u64::MAX);
         // One read per deployment, however many workloads name it.
         let mut computed: BTreeMap<(String, String), Value> = BTreeMap::new();
+        let mut changed = Vec::new();
         for target in self.cache.targets() {
             let key = (target.namespace.clone(), target.deployment.clone());
             let status = match computed.get(&key) {
@@ -146,7 +157,7 @@ impl Reconciler {
                         if !self.down.swap(true, Ordering::SeqCst) {
                             tracing::warn!("status not updated");
                         }
-                        return;
+                        break;
                     }
                     // Logged by the store; the other workloads still get their status.
                     Err(_) => continue,
@@ -155,28 +166,38 @@ impl Reconciler {
             if target.status.as_ref().map(defaulted) == Some(defaulted(&status)) {
                 continue;
             }
-            let result = match tokio::time::timeout(
-                self.apply_timeout,
-                self.sink.apply(&target.namespace, &target.name, &status),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(format!("no answer within {:?}", self.apply_timeout)),
-            };
-            let label = if result.is_ok() { "ok" } else { "error" };
-            self.metrics
-                .updates
-                .get_or_create(&vec![("result".to_string(), label.to_string())])
-                .inc();
-            if let Err(error) = result {
-                tracing::warn!(
-                    namespace = target.namespace,
-                    workload = target.name,
-                    error,
-                    "status apply failed"
-                );
-            }
+            changed.push((target, status));
+        }
+        // At most APPLY_CONCURRENCY applies at once, each bounded by its own timeout.
+        futures::stream::iter(changed)
+            .for_each_concurrent(APPLY_CONCURRENCY, |(target, status)| async move {
+                self.apply_one(&target, &status).await;
+            })
+            .await;
+    }
+
+    async fn apply_one(&self, target: &crate::workloads::Target, status: &Value) {
+        let result = match tokio::time::timeout(
+            self.apply_timeout,
+            self.sink.apply(&target.namespace, &target.name, status),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!("no answer within {:?}", self.apply_timeout)),
+        };
+        let label = if result.is_ok() { "ok" } else { "error" };
+        self.metrics
+            .updates
+            .get_or_create(&vec![("result".to_string(), label.to_string())])
+            .inc();
+        if let Err(error) = result {
+            tracing::warn!(
+                namespace = target.namespace,
+                workload = target.name,
+                error,
+                "status apply failed"
+            );
         }
     }
 

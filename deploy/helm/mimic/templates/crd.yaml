@@ -27,10 +27,10 @@ spec:
         - name: Mode
           type: string
           jsonPath: .spec.mode
-        # Inbound endpoints: the only direction before F9.
+        # Inbound + outbound endpoints; 0 until a controller of F8 or later applies a status (spec §7.4).
         - name: Endpoints
           type: integer
-          jsonPath: .status.discovery.endpoints.inbound
+          jsonPath: .status.discovery.totalEndpoints
         - name: Pods
           type: integer
           jsonPath: .status.discovery.pods
@@ -53,10 +53,15 @@ spec:
                       description: Endpoints per direction; a direction without any is omitted.
                       type: object
                       properties:
-                        # Defaulted, so the Endpoints column reads 0 instead of nothing (spec §7.4).
+                        # Defaulted (spec §7.4).
                         inbound: {type: integer, format: int64, default: 0}
                         outbound: {type: integer, format: int64}
-                    exchanges: {type: integer, format: int64}
+                    # Defaulted, so the Endpoints column reads 0 instead of nothing (spec §7.4).
+                    totalEndpoints: {type: integer, format: int64, default: 0}
+                    exchanges:
+                      description: Exchanges currently held, both directions. Not a running total.
+                      type: integer
+                      format: int64
                     sampleBytes: {type: integer, format: int64}
                     pods:
                       description: Pods whose last push is within MIMIC_STATUS_POD_WINDOW.

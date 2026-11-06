@@ -10,6 +10,8 @@ use serde_json::{Map, Value, json};
 pub struct Meta {
     pub inbound: u64,
     pub outbound: u64,
+    /// The exchanges currently held, both directions: not a running total, it decreases when
+    /// outbound scopes expire or are evicted.
     pub exchanges: u64,
     pub sample_bytes: u64,
     /// Last applied push, Unix milliseconds.
@@ -25,7 +27,7 @@ pub fn discovery(
     now_ms: u64,
 ) -> Value {
     let Some(meta) = meta else {
-        return json!({"endpoints": {}, "exchanges": 0, "sampleBytes": 0, "pods": 0});
+        return json!({"endpoints": {}, "totalEndpoints": 0, "exchanges": 0, "sampleBytes": 0, "pods": 0});
     };
     let floor = now_ms.saturating_sub(window_ms);
     let counted = pods.values().filter(|last| **last >= floor).count();
@@ -37,6 +39,7 @@ pub fn discovery(
     }
     json!({
         "endpoints": endpoints,
+        "totalEndpoints": meta.inbound.saturating_add(meta.outbound),
         "exchanges": meta.exchanges,
         "sampleBytes": meta.sample_bytes,
         "pods": counted,
