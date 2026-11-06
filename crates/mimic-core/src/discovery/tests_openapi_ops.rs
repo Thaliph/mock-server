@@ -616,7 +616,7 @@ proptest! {
 
 /// The string values of the Markdown fields (`description`, `summary`, `title`) of a document,
 /// outside example values.
-fn markdown_fields(v: &Value, out: &mut Vec<String>) {
+pub(super) fn markdown_fields(v: &Value, out: &mut Vec<String>) {
     match v {
         Value::Object(map) => {
             for (k, child) in map {

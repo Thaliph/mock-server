@@ -2,11 +2,12 @@
 //! `MIMIC_TEST_VALKEY_URL` (for example `redis://127.0.0.1:6379`, no password).
 
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
-use mimic_core::discovery::report::{Direction, Exchange, Limits, Report};
+use mimic_core::discovery::report::{Direction, Exchange, Limits, Report, Via};
+use mimic_core::discovery::scope::ScopeKey;
 use mimic_runtime::metrics::Metrics;
 use serde_json::{Value, json};
 
@@ -26,6 +27,17 @@ struct FakeSink {
     calls: Mutex<Vec<(String, String, Value)>>,
     fail: AtomicBool,
     hang: AtomicBool,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+/// Decrements the in-flight count when the apply ends or is abandoned.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FakeSink {
@@ -37,6 +49,9 @@ impl FakeSink {
 impl StatusSink for FakeSink {
     fn apply<'a>(&'a self, ns: &'a str, name: &'a str, discovery: &'a Value) -> ApplyFuture<'a> {
         Box::pin(async move {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            let _in_flight = InFlight(&self.in_flight);
             self.calls
                 .lock()
                 .unwrap()
@@ -136,6 +151,48 @@ async fn push(store: &Arc<Store>, ns: &str, dep: &str, pod: &str, paths: &[&str]
     store.push(ns, dep, push).await.expect("push applied");
 }
 
+/// One inbound and one outbound exchange (authority `api.example.com:443`).
+async fn push_both(store: &Arc<Store>, ns: &str, dep: &str, pod: &str) {
+    let mut report = Report::new(Some(pod.to_string()));
+    for (key, direction, path) in [
+        (ScopeKey::Port(80), Direction::Inbound, "/a"),
+        (
+            ScopeKey::Authority("api.example.com:443".to_string()),
+            Direction::Outbound,
+            "/v1",
+        ),
+    ] {
+        report.record_at(
+            key,
+            &Via {
+                tls: false,
+                sni: None,
+                dst: None,
+            },
+            &LIMITS,
+            &Redactor::default(),
+            &Exchange {
+                direction,
+                port: 80,
+                method: "GET",
+                path,
+                status: 200,
+                head_ms: 3,
+                host: Some("svc"),
+                grpc: false,
+                observation: Observation::default(),
+            },
+        );
+    }
+    report.stamp(now_ms() / 86_400_000);
+    let push = Push {
+        pod: pod.to_string(),
+        seq: None,
+        report,
+    };
+    store.push(ns, dep, push).await.expect("push applied");
+}
+
 fn count(metrics: &Metrics, result: &str) -> f64 {
     metrics
         .encode()
@@ -172,13 +229,16 @@ async fn ctl_18_every_workload_naming_the_deployment_gets_the_status() {
     let users = by_name("w1").expect("w1 applied");
     assert_eq!(by_name("w2"), Some(users.clone()));
     assert_eq!(users["endpoints"], json!({"inbound": 2}));
+    assert_eq!(users["totalEndpoints"], json!(2));
     assert_eq!(users["pods"], json!(2));
     assert_eq!(users["exchanges"], json!(3));
     assert!(users["lastPushTime"].as_str().unwrap().ends_with('Z'));
     // A deployment without data gets the empty status.
     assert_eq!(
         by_name("w3"),
-        Some(json!({"endpoints": {}, "exchanges": 0, "sampleBytes": 0, "pods": 0}))
+        Some(
+            json!({"endpoints": {}, "totalEndpoints": 0, "exchanges": 0, "sampleBytes": 0, "pods": 0})
+        )
     );
     assert_eq!(calls.len(), 3);
     assert!(calls.iter().all(|c| c.0 == ns));
@@ -316,10 +376,50 @@ async fn ctl_18_a_status_without_the_defaulted_inbound_count_is_unchanged() {
     s.reconciler.cache.set_status(
         &ns,
         "w1",
-        Some(json!({"endpoints": {"inbound": 0}, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
+        Some(json!({"endpoints": {"inbound": 0}, "totalEndpoints": 0, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
     );
     s.reconciler.tick(now_ms()).await;
     assert!(s.sink.calls().is_empty());
+}
+
+#[tokio::test]
+async fn shr_12_a_status_without_the_defaulted_total_is_unchanged() {
+    let ns = unique("shr12");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    // Neither default is stored: the cache holds what the controller applied.
+    s.reconciler.cache.set_status(
+        &ns,
+        "w1",
+        Some(json!({"endpoints": {}, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
+    );
+    s.reconciler.tick(now_ms()).await;
+    assert!(s.sink.calls().is_empty());
+    // A status of a controller up to F7 with data differs by the total.
+    push(&s.reconciler.store, &ns, "front", "front-a", &["/a"]).await;
+    s.reconciler.cache.set_status(
+        &ns,
+        "w1",
+        Some(json!({"endpoints": {"inbound": 1}, "exchanges": 1, "sampleBytes": 0, "pods": 1})),
+    );
+    s.reconciler.tick(now_ms()).await;
+    let calls = s.sink.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2["totalEndpoints"], json!(1));
+}
+
+#[tokio::test]
+async fn shr_12_outbound_endpoints_and_the_total_are_applied() {
+    let ns = unique("shr12");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    push_both(&s.reconciler.store, &ns, "front", "front-a").await;
+    s.reconciler.tick(now_ms()).await;
+    let calls = s.sink.calls();
+    assert_eq!(calls.len(), 1);
+    let status = &calls[0].2;
+    assert_eq!(status["endpoints"], json!({"inbound": 1, "outbound": 1}));
+    assert_eq!(status["totalEndpoints"], json!(2));
+    // The exchanges currently held, both directions.
+    assert_eq!(status["exchanges"], json!(2));
 }
 
 fn unreadable_errors(capture: &crate::webhook::tests::Capture, ns: &str) -> usize {
@@ -387,4 +487,39 @@ async fn ctl_18_unreadable_pods_are_logged_as_pods() {
     let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert_eq!(raw.matches("stored pods unreadable").count(), 1, "{raw}");
     assert_eq!(raw.matches("stored meta unreadable").count(), 0, "{raw}");
+}
+
+#[tokio::test]
+async fn ctl_18_hung_applies_run_concurrently_within_a_fixed_bound() {
+    let ns = unique("ctl18");
+    let names: Vec<String> = (0..20).map(|i| format!("w{i:02}")).collect();
+    let workloads: Vec<(&str, &str, &str)> = names
+        .iter()
+        .map(|n| (ns.as_str(), n.as_str(), "users"))
+        .collect();
+    let s = setup(&valkey_url(), &workloads);
+    s.sink.hang.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    s.reconciler.tick(now_ms()).await;
+    // 20 hung applies of 200 ms: 3 rounds of 8 at most, not 20 in a row (4 s). #293 note 25.
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert_eq!(s.sink.calls().len(), 20);
+    assert_eq!(s.sink.max_in_flight.load(Ordering::SeqCst), 8);
+    assert_eq!(count(&s.metrics, "error"), 20.0);
+}
+
+#[tokio::test]
+async fn ctl_18_concurrent_applies_still_skip_unchanged_statuses() {
+    let ns = unique("ctl18");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "users"), (&ns, "w2", "users")]);
+    s.reconciler.tick(now_ms()).await;
+    let first = s.sink.calls();
+    assert_eq!(first.len(), 2);
+    for call in &first {
+        s.reconciler
+            .cache
+            .set_status(&ns, &call.1, Some(call.2.clone()));
+    }
+    s.reconciler.tick(now_ms()).await;
+    assert_eq!(s.sink.calls().len(), 2);
 }
