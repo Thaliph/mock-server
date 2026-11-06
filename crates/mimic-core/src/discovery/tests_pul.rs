@@ -454,6 +454,31 @@ fn pul_02_limits() {
 }
 
 #[test]
+fn pul_02_a_method_and_template_twice_in_one_authority_is_malformed() {
+    let mut v = base();
+    let twice = endpoint(&mut v).clone();
+    v["authorities"][AUTHORITY]["endpoints"]
+        .as_array_mut()
+        .unwrap()
+        .push(twice);
+    assert_refused(&v, Refusal::Malformed, "same method and template twice");
+    // Another method, another template or another authority is not a duplicate.
+    let mut other = base();
+    let mut put = endpoint(&mut other).clone();
+    put["method"] = "PUT".into();
+    let mut path = endpoint(&mut other).clone();
+    path["template"] = "/other".into();
+    let endpoints = other["authorities"][AUTHORITY]["endpoints"]
+        .as_array_mut()
+        .unwrap();
+    endpoints.push(put);
+    endpoints.push(path);
+    let entry = other["authorities"][AUTHORITY].clone();
+    other["authorities"]["b.example.com:443"] = entry;
+    assert!(refusal(&other).is_ok());
+}
+
+#[test]
 fn pul_02_template() {
     let long = |n: usize| format!("/{}", "a".repeat(n - 1));
     let mut v = base();

@@ -276,6 +276,11 @@ pub struct SidecarApi {
     pub max_report: usize,
     /// `MIMIC_STORE_MAX_PUSH_ENDPOINTS`.
     pub max_push_endpoints: usize,
+    /// `MIMIC_SIDECAR_API_MAX_EGRESS`.
+    pub max_egress: usize,
+    /// `MIMIC_SIDECAR_API_EGRESS_BUDGET`: what the egress cache will hold (F9 step 4).
+    #[allow(dead_code)] // read by the egress cache (F9 step 4)
+    pub egress_budget: u64,
 }
 
 pub fn router(api: Arc<SidecarApi>) -> Router {
@@ -302,6 +307,10 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
                         .await
                 },
             ),
+        )
+        .route(
+            "/v1/workloads/{deployment}/egress",
+            axum::routing::get(|| async { StatusCode::NOT_IMPLEMENTED }),
         )
         .with_state(api)
 }
@@ -927,6 +936,8 @@ mod tests {
             workloads: Arc::new(WorkloadCache::new()),
             max_report: 1 << 20,
             max_push_endpoints: 256,
+            max_egress: 4 << 20,
+            egress_budget: 32 << 20,
         });
         Setup {
             router: router(api),
