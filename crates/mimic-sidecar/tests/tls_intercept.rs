@@ -685,7 +685,7 @@ async fn tls_18_an_unverifiable_destination_is_passed_through_and_remembered() {
     drop((one, two));
     // Sidecar attempt + replay for the first connection, replay only for the second.
     assert_eq!(dest.accepts.load(std::sync::atomic::Ordering::SeqCst), 3);
-    assert_eq!(warns(&logs), 1, "{}", logs.text());
+    eventually("warned", || warns(&logs) == 1).await;
     common::counted(
         &sidecar.metrics,
         "mimic_tls_connections_total{interception=\"upstream_untrusted\"} 2",
@@ -700,6 +700,8 @@ async fn tls_18_an_unverifiable_destination_is_passed_through_and_remembered() {
             == 2
     })
     .await;
+    // Remembered: the second connection adds no WARN.
+    assert_eq!(warns(&logs), 1, "{}", logs.text());
 }
 
 #[tokio::test]
