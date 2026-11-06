@@ -5,6 +5,7 @@ use mimic_core::discovery::report::Limits;
 use mimic_runtime::config::{ConfigError, Env};
 
 const MAX_ENDPOINTS_VAR: &str = "MIMIC_DISCOVERY_MAX_ENDPOINTS";
+const MAX_AUTHORITIES_VAR: &str = "MIMIC_DISCOVERY_MAX_AUTHORITIES";
 const MAX_LITERALS_VAR: &str = "MIMIC_DISCOVERY_MAX_LITERALS";
 const SAMPLE_BUDGET_VAR: &str = "MIMIC_DISCOVERY_SAMPLE_BUDGET";
 const CAPTURE_BUDGET_VAR: &str = "MIMIC_DISCOVERY_CAPTURE_BUDGET";
@@ -20,6 +21,8 @@ const MAX_REDACT_NAME_LEN: usize = 64;
 pub struct DiscoveryConfig {
     /// Endpoints kept per direction.
     pub max_endpoints: usize,
+    /// Outbound authorities held.
+    pub max_authorities: usize,
     /// Distinct literal segments below a template node before it absorbs them.
     pub max_literals: usize,
     /// Bytes held by samples.
@@ -36,6 +39,7 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         DiscoveryConfig {
             max_endpoints: 256,
+            max_authorities: 64,
             max_literals: 32,
             sample_budget: 16 * MIB,
             capture_budget: 8 * MIB,
@@ -50,6 +54,7 @@ impl DiscoveryConfig {
         let default = DiscoveryConfig::default();
         Ok(DiscoveryConfig {
             max_endpoints: number(env, MAX_ENDPOINTS_VAR, default.max_endpoints, 1, 10_000)?,
+            max_authorities: number(env, MAX_AUTHORITIES_VAR, default.max_authorities, 1, 10_000)?,
             max_literals: number(env, MAX_LITERALS_VAR, default.max_literals, 2, 1000)?,
             sample_budget: size(env, SAMPLE_BUDGET_VAR, default.sample_budget)?,
             capture_budget: size(env, CAPTURE_BUDGET_VAR, default.capture_budget)?,
@@ -63,6 +68,7 @@ impl DiscoveryConfig {
         Limits {
             max_literals: self.max_literals,
             max_endpoints: self.max_endpoints,
+            max_authorities: self.max_authorities,
             sample_budget: self.sample_budget,
         }
     }

@@ -340,6 +340,8 @@ impl Recorder {
         match outcome {
             Outcome::Invalid => self.metrics.exchange(direction, "invalid"),
             Outcome::NotFound => self.metrics.exchange(direction, "not_found"),
+            // Outbound recording reaches the sidecar with the tap (F7 step 4).
+            Outcome::AuthorityLimit => self.metrics.exchange(direction, "authority_limit"),
             Outcome::EndpointLimit => {
                 self.metrics.exchange(direction, "endpoint_limit");
                 if !self.endpoint_limit_logged {
@@ -512,6 +514,7 @@ mod tests {
             Limits {
                 max_literals: 32,
                 max_endpoints: 4,
+                max_authorities: 64,
                 sample_budget: 1 << 20,
             },
             Redactor::default(),

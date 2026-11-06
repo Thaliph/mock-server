@@ -16,6 +16,7 @@ use crate::store::{Push, StoreConfig, StoreMetrics};
 const LIMITS: Limits = Limits {
     max_literals: 32,
     max_endpoints: 256,
+    max_authorities: 64,
     sample_budget: 1 << 20,
 };
 const WINDOW: Duration = Duration::from_secs(300);

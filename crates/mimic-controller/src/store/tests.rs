@@ -16,6 +16,7 @@ use super::*;
 const LIMITS: Limits = Limits {
     max_literals: 32,
     max_endpoints: 256,
+    max_authorities: 64,
     sample_budget: 1 << 20,
 };
 const SESSION: &str = "0123456789abcdef0123456789abcdef";

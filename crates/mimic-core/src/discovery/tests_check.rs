@@ -17,6 +17,7 @@ fn limits(max_literals: usize, max_endpoints: usize, sample_budget: usize) -> Li
     Limits {
         max_literals,
         max_endpoints,
+        max_authorities: 64,
         sample_budget,
     }
 }

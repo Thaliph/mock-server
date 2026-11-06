@@ -573,6 +573,7 @@ async fn dsc_18_absorption_sample_budget_and_endpoint_limit_are_logged() {
     let config = DiscoveryConfig {
         max_literals: 3,
         max_endpoints: 5,
+        max_authorities: 64,
         sample_budget: 1024 * 1024,
         ..DiscoveryConfig::default()
     };

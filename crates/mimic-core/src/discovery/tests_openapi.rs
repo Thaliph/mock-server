@@ -15,6 +15,7 @@ use super::report::{Direction, Exchange, Limits, Report, merge};
 pub(super) const LIMITS: Limits = Limits {
     max_literals: 32,
     max_endpoints: 256,
+    max_authorities: 64,
     sample_budget: 16 << 20,
 };
 const GUID_A: &str = "123e4567-e89b-12d3-a456-426614174000";

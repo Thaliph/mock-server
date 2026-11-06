@@ -50,6 +50,8 @@ impl PushConfig {
                 limits: Limits {
                     max_literals: number(env, "MIMIC_STORE_MAX_LITERALS", 32, 2, 1000)?,
                     max_endpoints,
+                    // The store is inbound only until F8 (`MIMIC_STORE_MAX_AUTHORITIES`).
+                    max_authorities: 64,
                     sample_budget: usize_of(size(
                         env,
                         "MIMIC_STORE_SAMPLE_BUDGET",
