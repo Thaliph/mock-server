@@ -723,6 +723,14 @@ logic in `mimic-core` (`discovery` module).
   `dst`, a scheme other than `http` and `https`, and a `tunnels` kind outside the list above. The merge adds `schemes` and `tunnels`, keeps the 16 smallest
   `sni` and `dst`, and past `max_authorities` keeps the authorities that sort first (the
   sidecar trusts its own report; the store ranks by traffic, F8).
+- **Outbound exchange counter (F8).** A report has one `exchanges` counter for both
+  directions. A version 2 report also carries `outbound_exchanges`, the exchanges of its
+  outbound scopes (at most `exchanges`), so that the split of §7.3 is exact; it is present if
+  and only if the report is version 2, so a version 1 report stays byte-identical to F4/F5. The
+  recorder counts it for each recorded outbound exchange (a tunnel is no exchange), the merge
+  adds it (saturating), and the structural check rejects a version 1 report that carries a
+  non-zero one and a version 2 report whose counter exceeds `exchanges` (`malformed`). An
+  absent counter in version 2 reads as 0.
 - **Shipping (F8).** In F7 the outbound part was kept in the sidecar: never frozen, pushed nor
   reset, for the life of the process (pushes stayed `"version": 1`, inbound only). From F8 the
   sidecar freezes the outbound part together with the inbound one into the pending report of
@@ -1141,6 +1149,11 @@ logic in `mimic-core` (`discovery` module).
   re-redaction, stamping, authority limit and sample floor above, and keeps the merged
   outbound part in `:outbound`; pushes of F5–F7 sidecars (version 1) are processed exactly as
   before, and a deployment without outbound data has the same keys and bytes as in F7.
+- **Split (F8).** The split of the merged report into `:report` and `:outbound` gives the
+  inbound part `exchanges − outbound_exchanges` and the outbound part `outbound_exchanges`
+  (§6.1), exactly, also after authorities or endpoints were evicted or expired: their
+  exchanges stay counted on the outbound side and never turn into inbound ones. The inbound
+  part never carries the counter (it is version 1); the union of the parts adds them back.
 - **Pod churn**: no pod is read. A deleted pod's data stays merged (the deployment's API is
   the union over its life) and it ships its last report at `SIGTERM`; the pods of a rolling
   update push into the same key; a deleted pod's `:pods` and `:seq` fields expire after

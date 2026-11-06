@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
+use super::check::Violation;
 use super::observed::Observation;
 use super::redact::Redactor;
 use super::report::{Direction, Exchange, Limits, Report, Via, merge};
@@ -419,4 +420,142 @@ fn shr_05_the_split_equals_what_f7_would_have_stored() {
     // Without outbound scopes there is no outbound part.
     let (_, none) = f7.split();
     assert!(none.is_none());
+}
+
+/// The `outbound_exchanges` member of a report's JSON, if any.
+fn counter(r: &Report) -> Option<Value> {
+    let v: Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+    v.get("outbound_exchanges").cloned()
+}
+
+#[test]
+fn shr_05_the_recorder_counts_outbound_exchanges_in_version_2_only() {
+    let l = wide();
+    let mut r = Report::new(None);
+    inbound(&mut r, &l, "/in", 2);
+    assert_eq!(counter(&r), None);
+    assert!(!r.to_json().unwrap().contains("outbound_exchanges"));
+    outbound(&mut r, &l, "a.example.com:443", "/x", 3);
+    // A tunnel is no exchange.
+    tunnels(&mut r, &l, "t.example.com:443", 4);
+    assert_eq!(r.exchanges(), 5);
+    assert_eq!(counter(&r), Some(json!(3)));
+    // Version 2 without an exchange still carries it.
+    let mut only_tunnels = Report::new(None);
+    tunnels(&mut only_tunnels, &l, "t.example.com:443", 1);
+    assert_eq!(counter(&only_tunnels), Some(json!(0)));
+}
+
+#[test]
+fn shr_05_the_merge_adds_the_counter_and_saturates() {
+    let l = wide();
+    let mut a = Report::new(None);
+    outbound(&mut a, &l, "a.example.com:443", "/x", 2);
+    let mut b = Report::new(None);
+    inbound(&mut b, &l, "/in", 1);
+    outbound(&mut b, &l, "b.example.com:443", "/y", 3);
+    let m = merge(a.clone(), b.clone(), &l);
+    assert_eq!(counter(&m), Some(json!(5)));
+    assert_eq!(m.exchanges(), 6);
+    assert_eq!(merge_bounded(a.clone(), b, &l).report, m);
+    // At the top of the range.
+    let mut v: Value = serde_json::from_str(&a.to_json().unwrap()).unwrap();
+    v["exchanges"] = json!(u64::MAX - 1);
+    v["outbound_exchanges"] = json!(u64::MAX - 1);
+    let big = Report::from_json(&v.to_string()).unwrap();
+    let twice = merge(big.clone(), big, &l);
+    assert_eq!(counter(&twice), Some(json!(u64::MAX)));
+    assert_eq!(twice.exchanges(), u64::MAX);
+}
+
+#[test]
+fn shr_05_the_check_bounds_the_counter() {
+    let l = wide();
+    let mut r = Report::new(None);
+    inbound(&mut r, &l, "/in", 1);
+    outbound(&mut r, &l, "a.example.com:443", "/x", 2);
+    let mut v: Value = serde_json::from_str(&r.to_json().unwrap()).unwrap();
+    assert_eq!(Report::parse_checked(&v.to_string(), 256, 64), Ok(r));
+    // Over `exchanges`.
+    v["outbound_exchanges"] = json!(4);
+    assert_eq!(
+        Report::parse_checked(&v.to_string(), 256, 64),
+        Err(Violation::Malformed)
+    );
+    // Absent in version 2 reads as 0.
+    v.as_object_mut().unwrap().remove("outbound_exchanges");
+    assert!(Report::parse_checked(&v.to_string(), 256, 64).is_ok());
+    // A version 1 report carries none.
+    let mut v1: Value = serde_json::from_str(&{
+        let mut r = Report::new(None);
+        inbound(&mut r, &l, "/in", 2);
+        r.to_json().unwrap()
+    })
+    .unwrap();
+    assert!(Report::parse_checked(&v1.to_string(), 256, 64).is_ok());
+    v1["outbound_exchanges"] = json!(1);
+    assert_eq!(
+        Report::parse_checked(&v1.to_string(), 256, 64),
+        Err(Violation::Malformed)
+    );
+}
+
+#[test]
+fn shr_05_the_split_is_exact_after_evictions() {
+    let l = limits(256, 1);
+    // Stored: 3 inbound, 5 + 2 outbound exchanges in two authorities.
+    let mut push = Report::new(None);
+    inbound(&mut push, &wide(), "/in", 3);
+    outbound(&mut push, &wide(), "a.example.com:443", "/x", 5);
+    outbound(&mut push, &wide(), "b.example.com:443", "/y", 2);
+    let out = merge_bounded(Report::new(None), push, &l);
+    assert_eq!(out.evicted.len() + out.refused.len(), 1);
+    assert_eq!(authorities(&out.report), ["a.example.com:443"]);
+    // All 10 exchanges stay counted; the evicted ones stay on the outbound side.
+    let (inbound_part, outbound_part) = out.report.split();
+    assert_eq!(inbound_part.exchanges(), 3);
+    assert_eq!(counter(&inbound_part), None);
+    let outbound_part = outbound_part.unwrap();
+    assert_eq!(outbound_part.exchanges(), 7);
+    assert_eq!(counter(&outbound_part), Some(json!(7)));
+    assert_eq!(outbound_part.check(256, 64), Ok(()));
+    assert_eq!(Report::join(inbound_part, Some(outbound_part)), out.report);
+}
+
+#[test]
+fn shr_05_the_split_is_exact_when_every_outbound_scope_expired() {
+    let l = wide();
+    let mut r = Report::new(None);
+    inbound(&mut r, &l, "/in", 3);
+    outbound(&mut r, &l, "a.example.com:443", "/x", 5);
+    r.stamp(10);
+    // Keep the inbound endpoint fresh: only the outbound scope is stale.
+    let mut fresh = Report::new(None);
+    inbound(&mut fresh, &l, "/in", 1);
+    fresh.stamp(100);
+    r.merge(&l, fresh);
+    drop_expired(&mut r, 100, 5);
+    assert!(authorities(&r).is_empty());
+    assert_eq!(r.version(), 1);
+    assert_eq!(r.exchanges(), 9);
+    let (inbound_part, outbound_part) = r.split();
+    assert!(outbound_part.is_none());
+    assert_eq!(inbound_part.exchanges(), 4);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn shr_05_the_parts_of_a_split_count_each_direction(
+        items in proptest::collection::vec(item(), 0..12),
+    ) {
+        let l = wide();
+        let r = build(&l, &items);
+        let inbound_n: u64 = items.iter().filter(|i| i.kind == 0).map(|i| i.times as u64).sum();
+        let outbound_n: u64 = items.iter().filter(|i| i.kind == 1).map(|i| i.times as u64).sum();
+        let (inbound_part, outbound_part) = r.split();
+        prop_assert_eq!(inbound_part.exchanges(), inbound_n);
+        prop_assert_eq!(outbound_part.map_or(0, |o| o.exchanges()), outbound_n);
+    }
 }
