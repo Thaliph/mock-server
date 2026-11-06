@@ -47,12 +47,13 @@ fn render_histogram() -> Histogram {
     ])
 }
 
-/// `mimic_ui_requests_total{route,code}` and `mimic_ui_render_duration_seconds{route}` (spec
+/// `mimic_ui_requests_total{route,code}`, `mimic_ui_render_duration_seconds{route}` and `mimic_ui_skipped_total{reason}` (spec
 /// §9). `route` is a route pattern or `other`: no label holds request content.
 #[derive(Clone)]
 pub struct UiMetrics {
     requests: Family<Labels, Counter>,
     renders: Family<Labels, Histogram, fn() -> Histogram>,
+    skipped: Family<Labels, Counter>,
 }
 
 impl Default for UiMetrics {
@@ -60,6 +61,7 @@ impl Default for UiMetrics {
         UiMetrics {
             requests: Family::default(),
             renders: Family::new_with_constructor(render_histogram),
+            skipped: Family::default(),
         }
     }
 }
@@ -77,6 +79,11 @@ impl UiMetrics {
             "Parse and render of a stored report",
             Unit::Seconds,
             metrics.renders.clone(),
+        );
+        registry.register(
+            "ui_skipped",
+            "Entries left out of the workload list",
+            metrics.skipped.clone(),
         );
         metrics
     }
@@ -266,10 +273,13 @@ fn object(summary: &Summary) -> Map<String, Value> {
     map
 }
 
-async fn list(State(Ui { store, .. }): State<Ui>) -> Result<Json, ReadError> {
-    let workloads: Vec<Value> = store
-        .list()
-        .await?
+async fn list(State(Ui { store, metrics, .. }): State<Ui>) -> Result<Json, ReadError> {
+    let (summaries, skipped) = store.list().await?;
+    metrics
+        .skipped
+        .get_or_create(&labels(&[("reason", "meta-unreadable")]))
+        .inc_by(skipped);
+    let workloads: Vec<Value> = summaries
         .iter()
         .map(|summary| Value::Object(object(summary)))
         .collect();
