@@ -1,7 +1,7 @@
 # Reading the API
 
-Covers F5. Reference: spec §7.5, §7.4, §6. The UI (OpenAPI / Swagger) is planned (F6); today you read
-the discovered data as JSON.
+Covers F5 and F6. Reference: spec §7.5, §7.6, §7.4, §6. You read the discovered data as JSON, as an
+OpenAPI 3.1 document per port, or in the browser ([the UI](#the-ui)).
 
 ## Reaching it
 
@@ -15,7 +15,8 @@ kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080
 
 All replicas read the same Valkey, so any pod gives the same answer. Safeguards: a peer that is not
 loopback gets `403`; so does a request whose `Host` is missing or not `localhost`, `127.0.0.1` or
-`[::1]` (DNS rebinding). `GET` only (`405` otherwise); JSON with sorted keys. Nothing can be written or
+`[::1]` (DNS rebinding). `GET` and `HEAD` (the same status and headers, no body); every other method gets
+`405` with `Allow: GET, HEAD`. JSON with sorted keys. Nothing can be written or
 deleted: data leaves by expiry ([Operations](Operations#retention)).
 
 ## Endpoints
@@ -25,6 +26,9 @@ deleted: data leaves by expiry ([Operations](Operations#retention)).
 | `GET /v1/workloads` | Summary of every deployment with data, sorted by namespace then deployment. |
 | `GET /v1/workloads/<ns>/<dep>` | The same summary plus `pods`. |
 | `GET /v1/workloads/<ns>/<dep>/report` | The stored merged report. |
+| `GET /v1/workloads/<ns>/<dep>/endpoints` | Every endpoint: direction, port, method, template, exchanges, statuses, latency quantiles, hosts, last seen and the `document` that holds it. |
+| `GET /v1/workloads/<ns>/<dep>/openapi` | The documents of the deployment: `inbound-<port>`, one per listening port. |
+| `GET /v1/workloads/<ns>/<dep>/openapi/<id>` | The OpenAPI 3.1 document `<id>` (`400` for an invalid id, `404` for one the report does not hold). |
 
 Status codes: `404` deployment without data, `400` a name that is not DNS-1123, `503` Valkey
 unavailable, `500` a stored value that does not parse (the controller logs an ERROR, see below).
@@ -102,7 +106,7 @@ tracking, with `redacted` marks), `samples` and `last_seen`. Trimmed excerpt of 
 
 (Fields such as `latency`, `sketch`, `format`, `items`, `request_shape` and `bytes` are omitted here.)
 The path template (`/users/{users_id}`) is derived when rendering: the tree stores `users` as a literal
-and its `param` child. The format is internal and versioned; the OpenAPI 3.1 view is planned (F6).
+and its `param` child. The format is internal and versioned; the OpenAPI 3.1 view is the next section.
 
 Useful `jq` one-liners:
 
@@ -115,6 +119,35 @@ curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET
 # samples of one endpoint
 curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET.samples | length'
 ```
+
+## OpenAPI documents
+
+```bash
+curl -s localhost:8080/v1/workloads/demo/users/openapi | jq -c .documents
+curl -s localhost:8080/v1/workloads/demo/users/openapi/inbound-8080 > users.openapi.json
+```
+
+The document is inferred from observed traffic and built from the stored, redacted report only: paths
+are the discovered templates (`/users/{users_id}`), with parameters, bodies and responses taken from
+the recorded schemas and up to 20 samples as `examples`. `servers` lists the hosts the sidecar saw
+(documentation of how to reach the service; nothing calls it), `security` follows the `Authorization`
+schemes seen (the credential itself is never stored), and `x-mimic-*` fields carry counts, latency
+quantiles, hosts and last-seen days. Import the JSON into any OpenAPI 3.1 tool.
+
+## The UI
+
+The same listener serves a small read-only UI. With the port-forward above, open
+`http://localhost:8080/ui/`:
+
+- `/ui/` lists the deployments with data;
+- `/ui/workloads/<ns>/<dep>` shows the summary, the pods, the endpoints and one link per document;
+- `/ui/workloads/<ns>/<dep>/openapi/<id>` shows the document in Swagger UI, with a link to the raw JSON.
+
+Swagger UI is embedded in the controller (no CDN, nothing fetched from the internet) and has no "Try
+it out" button: the UI never sends a request to your workloads, it only reads the store. The pages run
+under a strict Content Security Policy (no inline script, same origin only) and show recorded text
+as text, so a hostile request body cannot run script in your browser. Use `localhost` in the URL: the
+`Host` check refuses other names.
 
 ## Local report of one pod
 

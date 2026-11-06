@@ -19,3 +19,7 @@ FROM curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f
 FROM python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb AS e2e-python
 FROM node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS e2e-node
 FROM eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a AS e2e-jdk
+
+# e2e: headless Chromium of the UI check (UI-12, scripts/e2e/ui_browser.py). The tag is 156.0.8078.36,
+# published 2026-10-20; the digest is the multi-arch index. Dependabot proposes later releases after its cooldown.
+FROM docker.io/chromedp/headless-shell:156.0.8078.36@sha256:53cc0f33c0598ff244f6e45458f6dfaf0ae4206d388ae7364903afd1d9d14f0a AS e2e-chromium
