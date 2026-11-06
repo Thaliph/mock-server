@@ -9,7 +9,7 @@ use axum::Router;
 use axum::extract::{ConnectInfo, MatchedPath, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use mimic_core::discovery::openapi;
 use mimic_core::discovery::report::Report;
@@ -23,6 +23,8 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
 use crate::store::{ReadError, Store, Summary};
+
+mod assets;
 
 /// Renders at once per replica (spec §7.5).
 const MAX_RENDERS: usize = 2;
@@ -105,6 +107,17 @@ fn build(store: Arc<Store>, metrics: UiMetrics, hook: Option<Hook>) -> Router {
         hook,
     };
     Router::new()
+        .route("/", get(|| async { Redirect::permanent("/ui/") }))
+        .route("/ui/", get(assets::list_page))
+        .route(
+            "/ui/workloads/{namespace}/{deployment}",
+            get(assets::workload_page),
+        )
+        .route(
+            "/ui/workloads/{namespace}/{deployment}/openapi/{id}",
+            get(assets::openapi_page),
+        )
+        .route("/ui/assets/{*path}", get(assets::asset))
         .route("/v1/workloads", get(list))
         .route("/v1/workloads/{namespace}/{deployment}", get(workload))
         .route("/v1/workloads/{namespace}/{deployment}/report", get(report))
@@ -122,7 +135,41 @@ fn build(store: Arc<Store>, metrics: UiMetrics, hook: Option<Hook>) -> Router {
         )
         .layer(middleware::from_fn(loopback_only))
         .layer(middleware::from_fn_with_state(ui.clone(), count))
+        .layer(middleware::from_fn(security_headers))
         .with_state(ui)
+}
+
+/// The `Content-Security-Policy` of spec §7.5: no inline or evaluated script, and the page can
+/// only talk to the listener's own origin.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+                   font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; \
+                   frame-ancestors 'none'";
+
+/// The security headers on every answer, the `403`, `404` and `405` ones included (spec §7.5).
+/// A handler's own `Cache-Control` (the versioned assets) is kept. No CORS header is ever added.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::CONTENT_SECURITY_POLICY, CSP),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (
+            header::HeaderName::from_static("cross-origin-opener-policy"),
+            "same-origin",
+        ),
+        (
+            header::HeaderName::from_static("cross-origin-resource-policy"),
+            "same-origin",
+        ),
+    ] {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Counts every answer, the `403` and `405` ones included, by route pattern.
