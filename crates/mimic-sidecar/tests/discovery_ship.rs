@@ -958,7 +958,7 @@ async fn egr_13_pushes_stay_version_1_inbound_and_outbound_is_kept_locally() {
             .iter()
             .all(|e| e.direction == mimic_core::discovery::report::Direction::Outbound)
     );
-    wait(|| gauge("mimic_discovery_endpoints{direction="outbound"}") == 1).await;
+    wait(|| gauge("mimic_discovery_endpoints{direction=\"outbound\"}") == 1).await;
     assert!(gauge("mimic_discovery_sample_bytes") > 0);
     drop(stop);
     task.await.unwrap();

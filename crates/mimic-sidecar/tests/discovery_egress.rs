@@ -40,7 +40,7 @@ const CUSTOM: &str = "CANARY-CUSTOM-91c";
 const QUERY_KEY: &str = "CANARY-QKEY-91c";
 const QUERY_SIG: &str = "CANARY-QSIG-91c";
 const IDEMPOTENCY: &str = "CANARY-IDEM-91c";
-const GOOGLE: &str = "AIzaCANARY0123456789abcdefghijklmnop";
+const GOOGLE: &str = "AIzaCANARY0123456789abcdefghijklmnopqrs";
 const CANARIES: [&str; 9] = [
     BEARER,
     COOKIE,
@@ -437,9 +437,10 @@ async fn egr_17_no_canary_leaves_the_sidecar_from_cleartext_outbound_exchanges()
         ("report", discovery.report().to_json().unwrap()),
         ("metrics", out.metrics.encode()),
     ];
-    for (_, text) in &texts {
-        for canary in CANARIES {
-            assert!(!text.contains(canary));
+    for (what, text) in &texts {
+        for (i, canary) in CANARIES.iter().enumerate() {
+            let leaked = text.contains(canary);
+            assert!(!leaked, "canary {i} in {what}");
         }
     }
     tokio::time::sleep(Duration::from_millis(300)).await;

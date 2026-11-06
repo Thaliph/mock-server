@@ -369,6 +369,9 @@ impl Tracker {
         tap.submit(
             capture,
             Meta {
+                outbound: self.ctx.direction == Direction::Outbound,
+                dst: self.ctx.dst,
+                tls: self.ctx.tls,
                 port: self.ctx.dst.port(),
                 authority: self.named_authority.take(),
                 status,
@@ -768,6 +771,9 @@ impl Http1Tracker {
         tap.submit(
             capture,
             Meta {
+                outbound: self.ctx.direction == Direction::Outbound,
+                dst: self.ctx.dst,
+                tls: self.ctx.tls,
                 port: self.ctx.dst.port(),
                 authority,
                 status,

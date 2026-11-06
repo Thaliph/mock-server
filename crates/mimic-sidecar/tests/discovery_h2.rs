@@ -197,9 +197,7 @@ async fn dsc_12_inbound_h2_exchanges_appear_in_the_report() {
     for expected in ["dry_run", "qty", "sku", "total", "/users/3", "accept"] {
         assert!(json.contains(expected), "{expected} missing from {json}");
     }
-    for absent in ["/unknown"] {
-        assert!(!json.contains(absent), "{absent} in {json}");
-    }
+    assert!(!json.contains("/unknown"), "/unknown in {json}");
     let text = f.metrics.encode();
     assert_eq!(
         sum(

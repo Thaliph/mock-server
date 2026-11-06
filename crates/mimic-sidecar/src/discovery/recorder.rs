@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
-use mimic_core::discovery::report::{Direction, Exchange, Limits, Outcome, Report, Sampled};
+use mimic_core::discovery::report::{Direction, Exchange, Limits, Outcome, Report, Sampled, Via};
+use mimic_core::discovery::scope::{ScopeKey, authority_key};
 
 use super::Handoff;
 use super::capture::{Part, Record};
@@ -24,14 +25,21 @@ const MAX_AUTHORITY: usize = 1024;
 /// Old templates named in a `template absorbed` line.
 const MAX_OLD_LOGGED: usize = 16;
 
-pub(super) type Key = (Direction, u16, String, String);
+/// Direction, scope (a port, or the authority of an outbound endpoint), method and template.
+pub(super) type Key = (Direction, ScopeKey, String, String);
 
 /// The endpoints of `report`.
 pub(super) fn keys(report: &Report) -> BTreeSet<Key> {
     report
         .endpoints()
         .into_iter()
-        .map(|e| (e.direction, e.port, e.method.to_string(), e.template))
+        .map(|e| {
+            let scope = match e.authority {
+                Some(authority) => ScopeKey::Authority(authority.to_string()),
+                None => ScopeKey::Port(e.port),
+            };
+            (e.direction, scope, e.method.to_string(), e.template)
+        })
         .collect()
 }
 
@@ -44,23 +52,38 @@ pub(super) fn publish(
     current: &Report,
     current_keys: &BTreeSet<Key>,
 ) {
-    let pending = handoff.pending_samples.load(Ordering::Acquire);
-    metrics.set_sample_bytes(current.sample_bytes().saturating_add(pending));
+    metrics.set_sample_bytes(held_samples(handoff, current));
     let pending_keys = handoff
         .pending_keys
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    let egress_keys = handoff
+        .egress_keys
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let all: BTreeSet<&Key> = current_keys
+        .iter()
+        .chain(pending_keys.iter())
+        .chain(egress_keys.iter())
+        .collect();
     for d in [Direction::Inbound, Direction::Outbound] {
-        let n = current_keys
-            .union(&pending_keys)
-            .filter(|(k, ..)| *k == d)
-            .count();
+        let n = all.iter().filter(|(k, ..)| *k == d).count();
         metrics.set_endpoints(label(d), n);
     }
 }
 
+/// Sample bytes held: the current report, the pending one and the egress report.
+fn held_samples(handoff: &Handoff, current: &Report) -> usize {
+    current
+        .sample_bytes()
+        .saturating_add(handoff.pending_samples.load(Ordering::Acquire))
+        .saturating_add(handoff.egress_samples.load(Ordering::Acquire))
+}
+
 pub(super) struct Recorder {
     pub(super) report: Arc<Mutex<Report>>,
+    /// The outbound exchanges (spec §6.1): never frozen, shipped nor reset.
+    egress: Arc<Mutex<Report>>,
     pub(super) limits: Limits,
     pub(super) redactor: Redactor,
     pub(super) metrics: DiscoveryMetrics,
@@ -69,6 +92,8 @@ pub(super) struct Recorder {
     epoch: u64,
     /// Endpoints of the report as of the last change of its shape.
     known: BTreeSet<Key>,
+    /// Likewise for the egress report.
+    egress_known: BTreeSet<Key>,
     sample_budget_full: bool,
     endpoint_limit_logged: bool,
     sample_bytes: usize,
@@ -220,6 +245,7 @@ fn matches(template: &str, path: &str) -> Option<usize> {
 impl Recorder {
     pub(super) fn new(
         report: Arc<Mutex<Report>>,
+        egress: Arc<Mutex<Report>>,
         limits: Limits,
         redactor: Redactor,
         metrics: DiscoveryMetrics,
@@ -227,12 +253,14 @@ impl Recorder {
     ) -> Recorder {
         Recorder {
             report,
+            egress,
             limits,
             redactor,
             metrics,
             handoff,
             epoch: 0,
             known: BTreeSet::new(),
+            egress_known: BTreeSet::new(),
             sample_budget_full: false,
             endpoint_limit_logged: false,
             sample_bytes: 0,
@@ -304,7 +332,10 @@ impl Recorder {
                     .and_then(|(_, bytes)| bytes.as_deref()),
             },
         };
-        let (outcome, endpoints, sample_bytes, limits, epoch) = {
+        let outbound = record.direction == Direction::Outbound;
+        let (outcome, endpoints, sample_bytes, limits, epoch) = if outbound {
+            self.record_egress(record, &exchange)
+        } else {
             let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
             // Read under the lock, where the shipper writes them: the pending report's samples
             // share the budget.
@@ -328,11 +359,9 @@ impl Recorder {
             // The gauges cover the pending report too.
             match &endpoints {
                 Some(keys) => publish(&self.metrics, &self.handoff, &report, keys),
-                None => self.metrics.set_sample_bytes(
-                    report
-                        .sample_bytes()
-                        .saturating_add(self.handoff.pending_samples.load(Ordering::Acquire)),
-                ),
+                None => self
+                    .metrics
+                    .set_sample_bytes(held_samples(&self.handoff, &report)),
             }
             (outcome, endpoints, report.sample_bytes(), limits, epoch)
         };
@@ -374,7 +403,82 @@ impl Recorder {
                 self.metrics.exchange(direction, "recorded");
             }
         }
-        self.sample_bytes = sample_bytes;
+        if !outbound {
+            self.sample_bytes = sample_bytes;
+        }
+    }
+
+    /// Records an outbound exchange into the egress report (spec §6.1). Its samples hold at
+    /// most half of the budget, and never more than inbound leaves.
+    fn record_egress(
+        &mut self,
+        record: &Record,
+        exchange: &Exchange<'_>,
+    ) -> (Outcome, Option<BTreeSet<Key>>, usize, Limits, u64) {
+        let key = ScopeKey::Authority(authority_key(
+            exchange.host,
+            if record.tls { 443 } else { 80 },
+            None,
+            record.dst,
+        ));
+        let (inbound_bytes, epoch) = {
+            let report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                report
+                    .sample_bytes()
+                    .saturating_add(self.handoff.pending_samples.load(Ordering::Acquire)),
+                self.handoff.epoch.load(Ordering::Acquire),
+            )
+        };
+        let cap = (self.limits.sample_budget / 2)
+            .min(self.limits.sample_budget.saturating_sub(inbound_bytes));
+        // The core takes half of `sample_budget` for outbound samples.
+        let limits = Limits {
+            sample_budget: cap.saturating_mul(2),
+            ..self.limits
+        };
+        let via = Via {
+            tls: record.tls,
+            sni: None,
+            dst: Some(record.dst),
+        };
+        let (outcome, endpoints, sample_bytes) = {
+            let mut egress = self.egress.lock().unwrap_or_else(PoisonError::into_inner);
+            let outcome = egress.record_at(key, &via, &limits, &self.redactor, exchange);
+            let new_endpoint = matches!(
+                outcome,
+                Outcome::Recorded {
+                    new_endpoint: true,
+                    ..
+                }
+            );
+            let endpoints = new_endpoint.then(|| keys(&egress));
+            self.handoff
+                .egress_samples
+                .store(egress.sample_bytes(), Ordering::Release);
+            if let Some(keys) = &endpoints {
+                *self
+                    .handoff
+                    .egress_keys
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = keys.clone();
+            }
+            (outcome, endpoints, egress.sample_bytes())
+        };
+        {
+            let report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
+            if endpoints.is_some() {
+                publish(&self.metrics, &self.handoff, &report, &keys(&report));
+            } else {
+                self.metrics
+                    .set_sample_bytes(held_samples(&self.handoff, &report));
+            }
+        }
+        let limits = Limits {
+            sample_budget: cap,
+            ..self.limits
+        };
+        (outcome, endpoints, sample_bytes, limits, epoch)
     }
 
     fn samples(
@@ -419,23 +523,43 @@ impl Recorder {
     /// A new endpoint was recorded: the template tree changed, and may have absorbed a node.
     fn shape_changed(&mut self, record: &Record, request: &Request, now: BTreeSet<Key>) {
         let direction = label(record.direction);
-        let removed: Vec<&Key> = self.known.difference(&now).collect();
+        let known = if record.direction == Direction::Outbound {
+            &mut self.egress_known
+        } else {
+            &mut self.known
+        };
+        let removed: Vec<&Key> = known.difference(&now).collect();
         if removed.is_empty() {
-            for (d, port, method, template) in now.difference(&self.known) {
-                tracing::info!(
-                    target: "discovery",
-                    direction = label(*d),
-                    port,
-                    method,
-                    template,
-                    "endpoint discovered"
-                );
+            for (d, scope, method, template) in now.difference(known) {
+                match scope {
+                    ScopeKey::Port(port) => tracing::info!(
+                        target: "discovery",
+                        direction = label(*d),
+                        port,
+                        method,
+                        template,
+                        "endpoint discovered"
+                    ),
+                    ScopeKey::Authority(authority) => tracing::info!(
+                        target: "discovery",
+                        direction = label(*d),
+                        authority,
+                        method,
+                        template,
+                        "endpoint discovered"
+                    ),
+                }
             }
         } else {
             let template = now
                 .iter()
-                .filter(|(d, port, method, _)| {
-                    *d == record.direction && *port == record.port && *method == request.method
+                .filter(|(d, scope, method, _)| {
+                    *d == record.direction
+                        && *method == request.method
+                        && match scope {
+                            ScopeKey::Port(port) => *port == record.port,
+                            ScopeKey::Authority(_) => true,
+                        }
                 })
                 .filter_map(|(.., template)| Some((matches(template, &request.path)?, template)))
                 .min()
@@ -457,7 +581,7 @@ impl Recorder {
                 "template absorbed"
             );
         }
-        self.known = now;
+        *known = now;
     }
 
     fn count_redactions(
@@ -510,6 +634,7 @@ mod tests {
 
     fn recorder(metrics: &DiscoveryMetrics) -> Recorder {
         Recorder::new(
+            Arc::new(Mutex::new(Report::new(None))),
             Arc::new(Mutex::new(Report::new(None))),
             Limits {
                 max_literals: 32,
