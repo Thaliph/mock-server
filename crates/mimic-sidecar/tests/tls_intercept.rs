@@ -17,6 +17,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::proxy::tls::Exclusions;
 use mimic_runtime::metrics::Metrics;
+use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
 use mimic_sidecar::listener::{Direction, OriginalDst, Shared, TunnelMetrics, spawn_listener};
 use mimic_sidecar::red::ProxyMetrics;
 use mimic_sidecar::tls::ca::{CaMetrics, CaState};
@@ -225,6 +226,24 @@ async fn destination_full(
                         return;
                     }
                 }
+                if got.windows(12).any(|w| w == b"X-Mode: slow") {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                if got.windows(12).any(|w| w == b"X-Mode: gzip") {
+                    use std::io::Write;
+                    let mut gz =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    gz.write_all(br#"{"gz":true,"items":[1,2]}"#).unwrap();
+                    let body = gz.finish().unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = tls.write_all(head.as_bytes()).await;
+                    let _ = tls.write_all(&body).await;
+                    let _ = tls.shutdown().await;
+                    return;
+                }
                 // A request that asks for it is answered only once the client's close_notify
                 // + FIN, which comes after the request, was read.
                 if !got.windows(8).any(|w| w == b"wait-eof") {
@@ -282,6 +301,19 @@ async fn sidecar_in(
     exclusions: &str,
     direction: Direction,
 ) -> Sidecar {
+    sidecar_to(dest, dest.addr, ca, exclusions, direction, None).await
+}
+
+/// The sidecar sending to `to` (the destination, or something in front of it), recording
+/// into `discovery`.
+async fn sidecar_to(
+    dest: &Destination,
+    to: SocketAddr,
+    ca: Option<Arc<CaState>>,
+    exclusions: &str,
+    direction: Direction,
+    discovery: Option<&Discovery>,
+) -> Sidecar {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
@@ -295,13 +327,15 @@ async fn sidecar_in(
         dest.trust.path().to_path_buf(),
         tls,
     );
-    let to = dest.addr;
     let original: OriginalDst = Arc::new(move |_| Ok(to));
-    let shared = Arc::new(
-        Shared::new(vec![addr], tunnel, original)
-            .with_proxy_metrics(proxy)
-            .with_tls(interception),
-    );
+    let mut shared = Shared::new(vec![addr], tunnel, original)
+        .with_proxy_metrics(proxy)
+        .with_tls(interception);
+    if let Some(discovery) = discovery {
+        discovery.register(&mut metrics);
+        shared = shared.with_discovery(discovery.tap());
+    }
+    let shared = Arc::new(shared);
     spawn_listener(listener, direction, shared.clone());
     Sidecar {
         addr,
@@ -923,4 +957,237 @@ async fn tls_27_unreadable_and_unparsable_root_files_are_logged() {
     let text = logs.text();
     assert_eq!(text.matches("tls roots skipped").count(), 2, "{text}");
     assert!(text.contains("trust/1/image-ca.pem") && text.contains("trust/2/image-ca.pem"));
+}
+
+// ---------------------------------------------------------------------------------------
+// EGR-10 and EGR-12: the decrypted exchanges are recorded as outbound discovery.
+
+fn discovery() -> Discovery {
+    Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap()
+}
+
+fn scope(discovery: &Discovery, authority: &str) -> serde_json::Value {
+    let json: serde_json::Value =
+        serde_json::from_str(&discovery.report().to_json().unwrap()).unwrap();
+    json["scopes"]["outbound"][authority].clone()
+}
+
+async fn recorded(discovery: &Discovery, n: u64) {
+    eventually("the recorder holds the exchanges", || {
+        discovery.report().exchanges() >= n
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn egr_10_intercepted_http1_is_recorded_decrypted_under_the_sni_authority() {
+    let _logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let discovery = discovery();
+    let sidecar = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    // A `Host` that differs from the SNI keys the endpoint by `Host`.
+    let other = b"GET /b HTTP/1.1\r\nHost: other.example:443\r\nContent-Length: 0\r\n\r\n";
+    let mut second = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    assert_eq!(exchange(&mut second, other).await, RESPONSE);
+    recorded(&discovery, 2).await;
+    let report = discovery.report();
+    let found: Vec<_> = report
+        .endpoints()
+        .iter()
+        .map(|e| (e.authority.unwrap().to_string(), e.template.clone()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("api.test:443".to_string(), "/a".to_string()),
+            ("other.example:443".to_string(), "/b".to_string())
+        ]
+    );
+    let dst = format!("127.0.0.1:{}", dest.addr.port());
+    for authority in ["api.test:443", "other.example:443"] {
+        let origin = &scope(&discovery, authority)["origin"];
+        assert_eq!(origin["schemes"], serde_json::json!({"https": 1}));
+        assert_eq!(origin["sni"], serde_json::json!(["api.test"]));
+        assert_eq!(origin["dst"], serde_json::json!([dst]));
+    }
+    // The decrypted head and its redaction: the canary of the request is not kept.
+    let json = report.to_json().unwrap();
+    assert!(json.contains("x-canary"));
+    assert!(!json.contains("canary-header-91"));
+    assert!(!json.contains("canary-cookie-91"));
+    assert!(!json.contains("canary-query-91"));
+}
+
+#[tokio::test]
+async fn egr_10_a_gzip_response_over_tls_is_decoded_and_inferred() {
+    let _logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let discovery = discovery();
+    let sidecar = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    tls.write_all(
+        b"GET /gz HTTP/1.1\r\nHost: api.test\r\nX-Mode: gzip\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(TIMEOUT, tls.read_to_end(&mut out)).await;
+    assert!(out.starts_with(b"HTTP/1.1 200"));
+    recorded(&discovery, 1).await;
+    let json = discovery.report().to_json().unwrap();
+    assert!(json.contains("\"gz\""), "{json}");
+    assert!(json.contains("items"));
+}
+
+#[tokio::test]
+async fn egr_10_intercepted_h2_is_recorded_decrypted() {
+    let _logs = common::capture_logs();
+    let dest = destination(&[b"h2", b"http/1.1"]).await;
+    let (ca, root) = ca_state();
+    let discovery = discovery();
+    let sidecar = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let tls = connect(&sidecar, &root, api(), &[b"h2"]).await.unwrap();
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, Empty<Bytes>>(TokioIo::new(tls))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    for path in ["/one", "/two"] {
+        let req = Request::get(format!("https://api.test{path}"))
+            .body(Empty::new())
+            .unwrap();
+        let resp = tokio::time::timeout(TIMEOUT, sender.send_request(req))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = resp.into_body().collect().await;
+    }
+    recorded(&discovery, 2).await;
+    let templates: Vec<_> = discovery
+        .report()
+        .endpoints()
+        .iter()
+        .map(|e| (e.authority.unwrap().to_string(), e.template.clone()))
+        .collect();
+    assert_eq!(
+        templates,
+        [
+            ("api.test:443".to_string(), "/one".to_string()),
+            ("api.test:443".to_string(), "/two".to_string())
+        ]
+    );
+    let origin = &scope(&discovery, "api.test:443")["origin"];
+    assert_eq!(origin["schemes"], serde_json::json!({"https": 2}));
+    assert_eq!(origin["sni"], serde_json::json!(["api.test"]));
+}
+
+/// The bucket the single observation of the only endpoint is in.
+fn bucket(discovery: &Discovery) -> u8 {
+    let report = discovery.report();
+    let endpoints = report.endpoints();
+    *endpoints[0].stats.latency.buckets().keys().next().unwrap()
+}
+
+#[tokio::test]
+async fn egr_12_latency_is_the_time_to_the_response_head_as_the_access_line_says() {
+    let logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let discovery = discovery();
+    let sidecar = sidecar_to(
+        &dest,
+        dest.addr,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    let slow = b"GET /slow HTTP/1.1\r\nHost: api.test\r\nX-Mode: slow\r\nContent-Length: 0\r\n\r\n";
+    assert_eq!(exchange(&mut tls, slow).await, RESPONSE);
+    recorded(&discovery, 1).await;
+    let lines = logs.access_exactly(1).await;
+    let head_ms = lines[0]["head_ms"].as_u64().unwrap();
+    assert!(head_ms >= 300, "{head_ms}");
+    assert!(bucket(&discovery) >= mimic_core::discovery::histogram::bucket_index(300));
+    assert_eq!(
+        bucket(&discovery),
+        mimic_core::discovery::histogram::bucket_index(head_ms)
+    );
+}
+
+/// A TCP relay that holds each connection for `delay` before connecting to `to`: the TLS
+/// handshake with the destination starts late.
+async fn delayed(to: SocketAddr, delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Ok(mut outbound) = TcpStream::connect(to).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn egr_12_the_handshake_with_the_destination_is_not_in_the_latency() {
+    let _logs = common::capture_logs();
+    let dest = destination(&[]).await;
+    let (ca, root) = ca_state();
+    let discovery = discovery();
+    let front = delayed(dest.addr, Duration::from_millis(500)).await;
+    let sidecar = sidecar_to(
+        &dest,
+        front,
+        Some(ca),
+        "",
+        Direction::Outbound,
+        Some(&discovery),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    recorded(&discovery, 1).await;
+    assert!(bucket(&discovery) < mimic_core::discovery::histogram::bucket_index(500));
 }
