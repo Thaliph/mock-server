@@ -187,7 +187,8 @@ impl Origin {
             origin.sni.insert(sni);
         }
         if let Some(dst) = via.dst {
-            let port = dst.port();
+            // As in the scope key (spec §6.1): the grammar has no room for port 0.
+            let port = dst.port().max(1);
             origin.dst.insert(match dst.ip().to_canonical() {
                 IpAddr::V4(v4) => format!("{v4}:{port}"),
                 IpAddr::V6(v6) => format!("[{v6}]:{port}"),
@@ -862,6 +863,11 @@ impl Report {
         let mut n = 0;
         self.for_each_stats_of(Some(direction), |_| n += 1);
         n
+    }
+
+    /// Outbound scopes held (`mimic_discovery_authorities`).
+    pub fn authorities(&self) -> usize {
+        self.outbound_scopes()
     }
 
     fn outbound_scopes(&self) -> usize {

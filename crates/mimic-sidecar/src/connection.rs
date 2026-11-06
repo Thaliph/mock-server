@@ -151,6 +151,20 @@ pub(crate) async fn handle(
     .await;
 }
 
+/// The tunnel kind of an outbound opaque connection (spec §6.1): `tls_<reason>` when §5 passed
+/// it through, else `tcp`.
+fn tunnel_kind(interception: Option<&str>) -> &'static str {
+    match interception {
+        Some("excluded") => "tls_excluded",
+        Some("no_ca") => "tls_no_ca",
+        Some("unsupported") => "tls_unsupported",
+        Some("upstream_untrusted") => "tls_upstream_untrusted",
+        Some("client_cert_requested") => "tls_client_cert_requested",
+        Some("client_rejected") => "tls_client_rejected",
+        _ => "tcp",
+    }
+}
+
 /// What the first bytes decided, to relay.
 enum Served {
     Http1(Vec<u8>),
@@ -179,6 +193,7 @@ impl Conn<'_> {
             direction: self.direction,
             dst: self.dst,
             tls: self.tls,
+            sni: self.sni.clone(),
             proxy: self.shared.proxy().clone(),
             aborted: self.shared.abort_flag(),
         }
@@ -207,9 +222,9 @@ impl Conn<'_> {
                 proxy.connection(direction, "http1", &self.authority(false));
                 // At the end of the grace the relay closes both sockets, and the exchanges
                 // still open write their `shutdown` line.
-                // The exchanges the deployment serves, and (cleartext) those it sends (spec §6,
-                // §6.1).
-                let tap = self.shared.discovery().filter(|_| !self.tls);
+                // The exchanges the deployment serves, and those it sends, decrypted or not
+                // (spec §6, §6.1).
+                let tap = self.shared.discovery();
                 let mut tracker = Http1Tracker::new(self.ctx()).with_tap(tap.cloned());
                 let relayed = http1::relay_with(
                     &mut client,
@@ -232,7 +247,7 @@ impl Conn<'_> {
             }
             Served::H2(buf) => {
                 proxy.connection(direction, "h2", &self.authority(false));
-                let tap = self.shared.discovery().filter(|_| !self.tls);
+                let tap = self.shared.discovery();
                 let relayed = tokio::select! {
                     r = h2::relay_with(client, upstream, buf, self.ctx(), tap.cloned(), self.shared.stopped()) => r,
                     () = abort.as_mut() => Ok(()),
@@ -247,6 +262,13 @@ impl Conn<'_> {
             }
         };
         proxy.connection(direction, protocol, &self.authority(true));
+        // Counted once its kind is decided (spec §6.1).
+        if direction == Direction::Outbound
+            && let Some(tap) = self.shared.discovery()
+        {
+            let kind = tunnel_kind(self.interception);
+            tap.tunnel(kind, dst, self.tls, self.sni.clone(), None);
+        }
         let tunnelled = opaque::tunnel(
             &mut client,
             &mut upstream,
@@ -328,6 +350,9 @@ async fn intercept(
             // The client gave up on this connection; the next one passes through.
             tracing::debug!(direction = direction.as_str(), %dst, "client rejected the certificate");
             tls.passthrough(&plan, Reason::ClientRejected, dst);
+            if let Some(tap) = conn.shared.discovery() {
+                tap.tunnel("tls_client_rejected", dst, false, conn.sni.clone(), None);
+            }
             return;
         }
         Err(AcceptError::Failed(e)) => {

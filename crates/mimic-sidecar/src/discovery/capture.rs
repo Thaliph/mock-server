@@ -105,6 +105,7 @@ pub(super) struct Record {
     /// exchange went (spec §6.1).
     pub(super) dst: SocketAddr,
     pub(super) tls: bool,
+    pub(super) sni: Option<String>,
     /// The normalised authority (spec §4.1), when the request named one.
     pub(super) authority: Option<String>,
     pub(super) status: u16,
@@ -116,12 +117,29 @@ pub(super) struct Record {
     _reservation: Reservation,
 }
 
+/// An outbound connection that carries no plaintext HTTP (spec §6.1, "Unrecordable traffic").
+pub(super) struct Tunnel {
+    pub(super) kind: &'static str,
+    pub(super) dst: SocketAddr,
+    pub(super) tls: bool,
+    pub(super) sni: Option<String>,
+    /// The normalised target authority of a `CONNECT`.
+    pub(super) target: Option<String>,
+}
+
+/// What goes through the queue.
+pub(super) enum Item {
+    Exchange(Record),
+    Tunnel(Tunnel),
+}
+
 /// What the relay knows of an exchange that the capture does not.
 pub(crate) struct Meta {
     /// The exchange was sent by the app, not served by it.
     pub(crate) outbound: bool,
     pub(crate) dst: SocketAddr,
     pub(crate) tls: bool,
+    pub(crate) sni: Option<String>,
     pub(crate) port: u16,
     pub(crate) authority: Option<String>,
     pub(crate) status: u16,
@@ -207,14 +225,14 @@ fn body(reservation: &mut Reservation, body: &mut Vec<u8>, skipped: &mut bool, b
 /// The relay's side of discovery: cheap to clone, never blocks.
 #[derive(Clone)]
 pub struct Tap {
-    queue: SyncSender<Record>,
+    queue: SyncSender<Item>,
     budget: Arc<Budget>,
     metrics: DiscoveryMetrics,
 }
 
 impl Tap {
     pub(super) fn new(
-        queue: SyncSender<Record>,
+        queue: SyncSender<Item>,
         budget: Arc<Budget>,
         metrics: DiscoveryMetrics,
     ) -> Tap {
@@ -261,6 +279,7 @@ impl Tap {
             port: meta.port,
             dst: meta.dst,
             tls: meta.tls,
+            sni: meta.sni,
             authority: meta.authority,
             status: meta.status,
             head_ms: meta.head_ms,
@@ -286,8 +305,30 @@ impl Tap {
             },
             _reservation: capture.reservation,
         };
-        if self.queue.try_send(record).is_err() {
+        if self.queue.try_send(Item::Exchange(record)).is_err() {
             self.metrics.exchange(label, "dropped");
+        }
+    }
+
+    /// Queues an outbound connection of `kind` (one of `TUNNEL_KINDS`) for the recorder; a full
+    /// queue drops it, counted.
+    pub(crate) fn tunnel(
+        &self,
+        kind: &'static str,
+        dst: SocketAddr,
+        tls: bool,
+        sni: Option<String>,
+        target: Option<String>,
+    ) {
+        let tunnel = Tunnel {
+            kind,
+            dst,
+            tls,
+            sni,
+            target,
+        };
+        if self.queue.try_send(Item::Tunnel(tunnel)).is_err() {
+            self.metrics.tunnel(kind, "dropped");
         }
     }
 }

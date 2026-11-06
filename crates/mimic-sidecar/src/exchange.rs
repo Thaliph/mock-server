@@ -37,6 +37,8 @@ pub struct Ctx {
     pub dst: SocketAddr,
     /// The exchanges are decrypted by interception (spec §5).
     pub tls: bool,
+    /// The normalised SNI of the connection, when there is one.
+    pub sni: Option<String>,
     pub proxy: ProxyMetrics,
     /// True once the connections left at the end of the shutdown grace are being closed.
     pub aborted: tokio::sync::watch::Receiver<bool>,
@@ -372,6 +374,7 @@ impl Tracker {
                 outbound: self.ctx.direction == Direction::Outbound,
                 dst: self.ctx.dst,
                 tls: self.ctx.tls,
+                sni: self.ctx.sni.clone(),
                 port: self.ctx.dst.port(),
                 authority: self.named_authority.take(),
                 status,
@@ -757,6 +760,23 @@ impl Http1Tracker {
 
     /// Hands an exchange that got a response head to discovery.
     fn discover(&self, open: &mut Open, outcome: Outcome) {
+        // A `CONNECT` answered `2xx` carries no HTTP any more: it is a tunnel of its target
+        // (spec §6.1), never an exchange.
+        if let (Some(tap), Some(request), Some(status)) = (&self.tap, &open.request, open.status)
+            && request.connect
+        {
+            if self.ctx.direction == Direction::Outbound
+                && (200..300).contains(&status)
+                && outcome != Outcome::Unframed
+            {
+                let target =
+                    target_authority(request.uri_authority.as_deref(), request.host.as_deref())
+                        .map(|raw| normalise_authority(raw, self.ctx.default_port()));
+                let (dst, tls, sni) = (self.ctx.dst, self.ctx.tls, self.ctx.sni.clone());
+                tap.tunnel("connect", dst, tls, sni, target);
+            }
+            return;
+        }
         let (Some(tap), Some(capture)) = (&self.tap, open.capture.take()) else {
             return;
         };
@@ -774,6 +794,7 @@ impl Http1Tracker {
                 outbound: self.ctx.direction == Direction::Outbound,
                 dst: self.ctx.dst,
                 tls: self.ctx.tls,
+                sni: self.ctx.sni.clone(),
                 port: self.ctx.dst.port(),
                 authority,
                 status,

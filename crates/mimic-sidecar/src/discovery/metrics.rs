@@ -42,6 +42,12 @@ struct ResultLabel {
     result: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct TunnelLabels {
+    kind: &'static str,
+    result: &'static str,
+}
+
 /// Shared by the taps (which count what they drop) and the recorder. Unregistered until
 /// [`DiscoveryMetrics::register`].
 #[derive(Clone, Default)]
@@ -51,6 +57,8 @@ pub struct DiscoveryMetrics {
     samples: Family<SampleLabels, Counter>,
     redactions: Family<RedactionLabels, Counter>,
     endpoints: Family<DirectionLabels, Gauge>,
+    authorities: Gauge,
+    tunnels: Family<TunnelLabels, Counter>,
     sample_bytes: Gauge,
     pushes: Family<ResultLabel, Counter>,
     last_push: Gauge,
@@ -87,6 +95,16 @@ impl DiscoveryMetrics {
             "discovery_endpoints",
             "Endpoints in the template tree",
             self.endpoints.clone(),
+        );
+        registry.register(
+            "discovery_authorities",
+            "Outbound scopes (authorities) held",
+            self.authorities.clone(),
+        );
+        registry.register(
+            "discovery_tunnels",
+            "Outbound connections without plaintext HTTP, by kind and result",
+            self.tunnels.clone(),
         );
         registry.register(
             "discovery_sample_bytes",
@@ -143,6 +161,16 @@ impl DiscoveryMetrics {
         self.endpoints
             .get_or_create(&labels)
             .set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+
+    pub(super) fn tunnel(&self, kind: &'static str, result: &'static str) {
+        self.tunnels
+            .get_or_create(&TunnelLabels { kind, result })
+            .inc();
+    }
+
+    pub(super) fn set_authorities(&self, n: usize) {
+        self.authorities.set(i64::try_from(n).unwrap_or(i64::MAX));
     }
 
     pub(super) fn set_sample_bytes(&self, n: usize) {

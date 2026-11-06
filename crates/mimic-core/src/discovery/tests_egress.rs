@@ -576,3 +576,29 @@ proptest! {
         prop_assert!(retained <= Report::state_bound(&l), "{retained} > {}", Report::state_bound(&l));
     }
 }
+
+#[test]
+fn egr_02_origin_dst_writes_port_zero_as_one_like_the_scope_key() {
+    let l = limits();
+    let mut r = Report::new(None);
+    for dst in ["10.0.0.1:0", "[2001:db8::1]:0", "10.0.0.2:7"] {
+        r.record_at(
+            auth("api.example.com:443"),
+            &Via {
+                tls: false,
+                sni: None,
+                dst: Some(dst.parse().unwrap()),
+            },
+            &l,
+            &Redactor::default(),
+            &ex(Direction::Outbound, "/x", 200),
+        );
+    }
+    let v = json(&r);
+    let dst = &v["scopes"]["outbound"]["api.example.com:443"]["origin"]["dst"];
+    assert_eq!(
+        *dst,
+        serde_json::json!(["10.0.0.1:1", "10.0.0.2:7", "[2001:db8::1]:1"])
+    );
+    assert_eq!(Report::from_json(&r.to_json().unwrap()).unwrap(), r);
+}
