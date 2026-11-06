@@ -240,3 +240,33 @@ async fn shr_09_the_push_line_carries_the_report_version() {
     let versions: Vec<_> = seen.iter().map(|l| l["version"].clone()).collect();
     assert_eq!(versions, [json!(2), json!(1)]);
 }
+
+#[tokio::test]
+async fn shr_09_a_hostile_last_seen_does_not_keep_stored_data_alive_past_the_ttl() {
+    let s = setup(Options::default());
+    let far = today() + 10_000;
+    let body = edited(|report| {
+        fn set(value: &mut Value, day: u64) {
+            match value {
+                Value::Object(map) => {
+                    if map.contains_key("last_seen") {
+                        map.insert("last_seen".into(), json!(day));
+                    }
+                    map.values_mut().for_each(|v| set(v, day));
+                }
+                Value::Array(items) => items.iter_mut().for_each(|v| set(v, day)),
+                _ => {}
+            }
+        }
+        set(report, far);
+    });
+    assert_eq!(push(&s, "pay", body).await.status, 200);
+    let inbound = Report::from_json(&stored_report(&s, "pay").await.unwrap()).unwrap();
+    let outbound = Report::from_json(&stored_outbound(&s, "pay").await.unwrap()).unwrap();
+    let mut stored = Report::join(inbound, Some(outbound));
+    assert!(!stored.endpoints().is_empty());
+    // The TTL is 30 days: one day past it, everything the push brought is expired.
+    mimic_core::discovery::store::drop_expired(&mut stored, today() + 31, 30);
+    assert!(stored.endpoints().is_empty());
+    assert_eq!(stored.authorities(), 0);
+}

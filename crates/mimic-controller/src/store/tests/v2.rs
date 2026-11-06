@@ -103,6 +103,8 @@ async fn shr_09_a_version_2_push_is_split_into_report_and_outbound() {
     assert!(ttl > thirty_days - 60_000 && ttl <= thirty_days, "{ttl}");
     let ty: String = cmd(&mut c, &["TYPE", &k.outbound]).await;
     assert_eq!(ty, "string");
+    let ttl: i64 = cmd(&mut c, &["PTTL", &k.report]).await;
+    assert!(ttl > thirty_days - 60_000 && ttl <= thirty_days, "{ttl}");
 }
 
 #[tokio::test]
