@@ -363,6 +363,7 @@ async fn ctl_10_keys_types_and_field_expiry_with_the_default_ttl() {
         "endpoints_outbound",
         "sample_bytes",
         "report_bytes",
+        "outbound_digest",
     ]
     .map(String::from)
     .to_vec();
@@ -601,4 +602,5 @@ fn ctl_18_the_logged_set_stays_bounded_for_deployments_that_never_come_back() {
     assert!(!store.once("ns", "live", "stored meta unreadable"));
 }
 
+mod digest;
 mod v2;
