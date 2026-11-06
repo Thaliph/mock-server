@@ -2,6 +2,7 @@
 //! mergeable report, with schemas, volatility and samples.
 
 pub mod check;
+pub mod egress;
 pub mod histogram;
 pub mod observed;
 pub mod openapi;
@@ -34,6 +35,8 @@ mod tests_openapi_ops;
 mod tests_outbound_openapi;
 #[cfg(test)]
 mod tests_outbound_view;
+#[cfg(test)]
+mod tests_pul;
 #[cfg(test)]
 mod tests_push_v2;
 #[cfg(test)]
