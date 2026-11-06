@@ -1176,6 +1176,19 @@ impl Report {
         }
     }
 
+    /// The inbound part (`"version": 1`, what an F7 controller stores) and the outbound part
+    /// (`"version": 2`, outbound scopes only; none without outbound scopes) of a report
+    /// (spec §7.3, write).
+    pub fn split(&self) -> (Report, Option<Report>) {
+        unimplemented!()
+    }
+
+    /// The report that `split` took apart.
+    pub fn join(inbound: Report, outbound: Option<Report>) -> Report {
+        let _ = (inbound, outbound);
+        unimplemented!()
+    }
+
     pub(super) fn clear_pod(&mut self) {
         self.pod = None;
     }

@@ -13,6 +13,8 @@ use super::sample::Sample;
 pub enum Kind {
     Endpoint,
     Sample,
+    /// An outbound scope (F8).
+    Authority,
 }
 
 impl Kind {
@@ -21,6 +23,7 @@ impl Kind {
         match self {
             Self::Endpoint => "endpoint",
             Self::Sample => "sample",
+            Self::Authority => "authority",
         }
     }
 }
@@ -32,6 +35,8 @@ pub enum Refusal {
     EndpointLimit,
     /// A new sample past `sample_budget`.
     Budget,
+    /// A new outbound scope past `max_authorities` (F8).
+    AuthorityLimit,
 }
 
 impl Refusal {
@@ -39,6 +44,7 @@ impl Refusal {
         match self {
             Self::EndpointLimit => Kind::Endpoint,
             Self::Budget => Kind::Sample,
+            Self::AuthorityLimit => Kind::Authority,
         }
     }
 
@@ -47,6 +53,7 @@ impl Refusal {
         match self {
             Self::EndpointLimit => "endpoint_limit",
             Self::Budget => "budget",
+            Self::AuthorityLimit => "authority_limit",
         }
     }
 }
