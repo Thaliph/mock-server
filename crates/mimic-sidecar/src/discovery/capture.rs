@@ -2,6 +2,7 @@
 //! copied into a [`Capture`] within a global byte budget, then handed to the recorder thread
 //! through a bounded queue. Nothing here waits: what does not fit is dropped and counted.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -100,6 +101,10 @@ fn part(total: Option<u64>, skipped: bool, body: Vec<u8>) -> Part {
 pub(super) struct Record {
     pub(super) direction: Direction,
     pub(super) port: u16,
+    /// The original destination and whether the exchange was decrypted: where an outbound
+    /// exchange went (spec §6.1).
+    pub(super) dst: SocketAddr,
+    pub(super) tls: bool,
     /// The normalised authority (spec §4.1), when the request named one.
     pub(super) authority: Option<String>,
     pub(super) status: u16,
@@ -113,6 +118,10 @@ pub(super) struct Record {
 
 /// What the relay knows of an exchange that the capture does not.
 pub(crate) struct Meta {
+    /// The exchange was sent by the app, not served by it.
+    pub(crate) outbound: bool,
+    pub(crate) dst: SocketAddr,
+    pub(crate) tls: bool,
     pub(crate) port: u16,
     pub(crate) authority: Option<String>,
     pub(crate) status: u16,
@@ -237,15 +246,21 @@ impl Tap {
 
     /// Queues the exchange for the recorder; a full queue or a lost head drops it, counted.
     pub(crate) fn submit(&self, capture: Capture, meta: Meta) {
-        let direction = Direction::Inbound;
+        let (direction, label) = if meta.outbound {
+            (Direction::Outbound, "outbound")
+        } else {
+            (Direction::Inbound, "inbound")
+        };
         if capture.head_lost {
-            self.metrics.exchange("inbound", "dropped");
+            self.metrics.exchange(label, "dropped");
             return;
         }
         let bodies = !meta.tunnel;
         let record = Record {
             direction,
             port: meta.port,
+            dst: meta.dst,
+            tls: meta.tls,
             authority: meta.authority,
             status: meta.status,
             head_ms: meta.head_ms,
@@ -272,7 +287,7 @@ impl Tap {
             _reservation: capture.reservation,
         };
         if self.queue.try_send(record).is_err() {
-            self.metrics.exchange("inbound", "dropped");
+            self.metrics.exchange(label, "dropped");
         }
     }
 }

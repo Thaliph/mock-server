@@ -175,13 +175,6 @@ async fn dsc_12_inbound_http1_exchanges_appear_in_the_report() {
         .await
         .unwrap();
     drop(c);
-    // An outbound exchange through the same discovery is not discovered either.
-    let out = fixture_discovery(Direction::Outbound, &discovery, move |_| Some(app)).await;
-    call(
-        out.addr,
-        b"GET /users/9 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
-    )
-    .await;
 
     counted(
         &f.metrics,
@@ -217,7 +210,7 @@ async fn dsc_12_inbound_http1_exchanges_appear_in_the_report() {
     for expected in ["dry_run", "qty", "sku", "total", "/users/3", "accept"] {
         assert!(json.contains(expected), "{expected} missing from {json}");
     }
-    for absent in ["/broken", "/unknown", "outbound"] {
+    for absent in ["/broken", "/unknown"] {
         assert!(!json.contains(absent), "{absent} in {json}");
     }
     let text = f.metrics.encode();

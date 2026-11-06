@@ -158,13 +158,6 @@ async fn dsc_12_inbound_h2_exchanges_appear_in_the_report() {
         .body(Full::new(Bytes::new()))
         .unwrap();
     assert_eq!(send(&mut sender, req).await.0, 404);
-    // An outbound exchange through the same discovery is not discovered.
-    let out = fixture_discovery(Direction::Outbound, &discovery, move |_| Some(app)).await;
-    let mut out_sender = client(out.addr).await;
-    let req = Request::get("http://x/users/9")
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-    assert_eq!(send(&mut out_sender, req).await.0, 200);
 
     counted(
         &f.metrics,
@@ -204,9 +197,7 @@ async fn dsc_12_inbound_h2_exchanges_appear_in_the_report() {
     for expected in ["dry_run", "qty", "sku", "total", "/users/3", "accept"] {
         assert!(json.contains(expected), "{expected} missing from {json}");
     }
-    for absent in ["/unknown", "outbound"] {
-        assert!(!json.contains(absent), "{absent} in {json}");
-    }
+    assert!(!json.contains("/unknown"), "/unknown in {json}");
     let text = f.metrics.encode();
     assert_eq!(
         sum(

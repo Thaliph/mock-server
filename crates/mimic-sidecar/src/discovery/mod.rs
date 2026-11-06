@@ -24,7 +24,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use mimic_core::discovery::redact::Redactor;
-use mimic_core::discovery::report::Report;
+use mimic_core::discovery::report::{Limits, Report};
 use mimic_runtime::metrics::Metrics;
 
 pub use capture::Tap;
@@ -42,11 +42,19 @@ pub(crate) struct Handoff {
     epoch: AtomicU64,
     /// Endpoints of the pending report, for the gauges. Written under the report's lock.
     pending_keys: Mutex<BTreeSet<recorder::Key>>,
+    /// Sample bytes and endpoints of the egress report (spec §6.1), for the gauges and the
+    /// budget of the inbound samples. Written under the egress report's lock.
+    egress_samples: AtomicUsize,
+    egress_keys: Mutex<BTreeSet<recorder::Key>>,
 }
 
 /// Discovery of one sidecar: the local report and the thread that fills it.
 pub struct Discovery {
     report: Arc<Mutex<Report>>,
+    /// The outbound exchanges (spec §6.1): kept for the life of the process, never frozen,
+    /// shipped nor reset in F7.
+    egress: Arc<Mutex<Report>>,
+    limits: Limits,
     pod: Option<String>,
     handoff: Arc<Handoff>,
     budget: Arc<capture::Budget>,
@@ -59,6 +67,7 @@ impl Discovery {
     /// ends when the last [`Tap`] is dropped.
     pub fn start(config: &DiscoveryConfig, pod: Option<String>) -> io::Result<Discovery> {
         let report = Arc::new(Mutex::new(Report::new(pod.clone())));
+        let egress = Arc::new(Mutex::new(Report::new(pod.clone())));
         let handoff = Arc::new(Handoff::default());
         let budget = Arc::new(capture::Budget::new(config.capture_budget));
         let metrics = DiscoveryMetrics::default();
@@ -66,6 +75,7 @@ impl Discovery {
         let tap = Tap::new(queue, budget.clone(), metrics.clone());
         let recorder = recorder::Recorder::new(
             report.clone(),
+            egress.clone(),
             config.limits(),
             Redactor::new(config.redact_names.iter().map(String::as_str)),
             metrics.clone(),
@@ -79,6 +89,8 @@ impl Discovery {
             })?;
         Ok(Discovery {
             report,
+            egress,
+            limits: config.limits(),
             pod,
             handoff,
             budget,
@@ -116,12 +128,10 @@ impl Discovery {
         self.metrics.register(metrics);
     }
 
-    /// A copy of the current report: what has not been frozen for shipping yet.
+    /// A copy of the current report: the inbound exchanges that have not been frozen for
+    /// shipping yet, with the outbound part (spec §7.2).
     pub fn report(&self) -> Report {
-        self.report
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        current(&self.report, &self.egress, &self.limits)
     }
 
     /// `GET /discovery`, for the admin listener. Answered to loopback peers only: the admin
@@ -129,13 +139,40 @@ impl Discovery {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/discovery", get(serve))
-            .with_state(self.report.clone())
+            .with_state(Served {
+                report: self.report.clone(),
+                egress: self.egress.clone(),
+                limits: self.limits,
+            })
     }
+}
+
+/// What `GET /discovery` serves.
+#[derive(Clone)]
+struct Served {
+    report: Arc<Mutex<Report>>,
+    egress: Arc<Mutex<Report>>,
+    limits: Limits,
+}
+
+/// The inbound report with the egress report merged in. The locks are taken one after the
+/// other, never together.
+fn current(report: &Mutex<Report>, egress: &Mutex<Report>, limits: &Limits) -> Report {
+    let mut merged = report
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let outbound = egress
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    merged.merge(limits, outbound);
+    merged
 }
 
 async fn serve(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(report): State<Arc<Mutex<Report>>>,
+    State(served): State<Served>,
 ) -> Response {
     if !peer.ip().to_canonical().is_loopback() {
         return (
@@ -146,10 +183,7 @@ async fn serve(
     }
     // Serialising a large report must not stall the admin listener's worker.
     let json = tokio::task::spawn_blocking(move || {
-        report
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .to_json()
+        current(&served.report, &served.egress, &served.limits).to_json()
     })
     .await;
     answer(json, &SERIALISATION_LOGGED)

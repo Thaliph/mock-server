@@ -872,6 +872,98 @@ async fn ctl_16_gauges_cover_the_pending_and_the_current_report() {
     wait(|| gauge("mimic_discovery_endpoints{direction=\"inbound\"}") == 0).await;
 }
 
+#[tokio::test]
+async fn egr_13_pushes_stay_version_1_inbound_and_outbound_is_kept_locally() {
+    let _logs = capture_logs();
+    let rig = Rig::new(vec![], INTERVAL, DiscoveryConfig::default()).await;
+    let mut metrics = Metrics::new("sidecar", "test");
+    rig.discovery.register(&mut metrics);
+    let gauge = |name: &str| -> i64 {
+        metrics
+            .encode()
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1)
+    };
+    let dest = app().await;
+    let out = fixture_discovery(Direction::Outbound, &rig.discovery, move |_| Some(dest)).await;
+    let outbound_call = |n: u32| {
+        let addr = out.addr;
+        async move {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(
+                format!(
+                    "GET /v1/items/{n} HTTP/1.1\r\nHost: api.example.test:8080\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut answer = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut answer))
+                .await
+                .expect("answered in time")
+                .unwrap();
+            assert!(answer.starts_with(b"HTTP/1.1 200"));
+        }
+    };
+    for n in 1..=3 {
+        outbound_call(n).await;
+    }
+    rig.call("users", 1).await;
+    rig.call("users", 2).await;
+    wait(|| rig.discovery.report().exchanges() >= 5).await;
+    let outbound_json = |report: &Report| {
+        let v: serde_json::Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
+        v["scopes"]["outbound"].clone()
+    };
+    let before = outbound_json(&rig.discovery.report());
+    assert!(before["api.example.test:8080"].is_object());
+    wait(|| gauge("mimic_discovery_endpoints{direction=\"outbound\"}") == 1).await;
+    let outbound_samples = gauge("mimic_discovery_sample_bytes");
+    assert!(outbound_samples > 0);
+
+    let (stop, task) = rig.start();
+    wait(|| rig.api.acknowledged() == 2).await;
+    // More traffic of both kinds after the push.
+    outbound_call(4).await;
+    rig.call("users", 3).await;
+    wait(|| rig.api.acknowledged() == 3).await;
+    {
+        let seen = rig.api.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        for s in seen.iter() {
+            let report = &s.json()["report"];
+            assert_eq!(report["version"], 1);
+            assert!(report["scopes"].get("outbound").is_none());
+        }
+    }
+    // The outbound part is not reset: its counters only grew, and only unshipped inbound
+    // exchanges are left.
+    let after = rig.discovery.report();
+    assert_eq!(after.exchanges(), 4);
+    let scope = &outbound_json(&after)["api.example.test:8080"];
+    let items = |scope: &serde_json::Value| {
+        scope["root"]["literals"]["v1"]["literals"]["items"]["param"]["endpoints"]["GET"]
+            ["statuses"]["200"]
+            .clone()
+    };
+    assert_eq!(items(&before["api.example.test:8080"]), 3);
+    assert_eq!(items(scope), 4);
+    assert!(
+        after
+            .endpoints()
+            .iter()
+            .all(|e| e.direction == mimic_core::discovery::report::Direction::Outbound)
+    );
+    wait(|| gauge("mimic_discovery_endpoints{direction=\"outbound\"}") == 1).await;
+    assert!(gauge("mimic_discovery_sample_bytes") > 0);
+    drop(stop);
+    task.await.unwrap();
+}
+
 // ---------------------------------------------------------------------------------------
 // CTL-17 as the binary, in a network namespace where `127.0.0.9 -> 127.0.0.1:18080` is
 // redirected to the sidecar the way the init container redirects a pod's traffic.

@@ -207,11 +207,9 @@ impl Conn<'_> {
                 proxy.connection(direction, "http1", &self.authority(false));
                 // At the end of the grace the relay closes both sockets, and the exchanges
                 // still open write their `shutdown` line.
-                // Only the exchanges the deployment serves are discovered (spec §6).
-                let tap = self
-                    .shared
-                    .discovery()
-                    .filter(|_| direction == Direction::Inbound && !self.tls);
+                // The exchanges the deployment serves, and (cleartext) those it sends (spec §6,
+                // §6.1).
+                let tap = self.shared.discovery().filter(|_| !self.tls);
                 let mut tracker = Http1Tracker::new(self.ctx()).with_tap(tap.cloned());
                 let relayed = http1::relay_with(
                     &mut client,
@@ -234,10 +232,7 @@ impl Conn<'_> {
             }
             Served::H2(buf) => {
                 proxy.connection(direction, "h2", &self.authority(false));
-                let tap = self
-                    .shared
-                    .discovery()
-                    .filter(|_| direction == Direction::Inbound && !self.tls);
+                let tap = self.shared.discovery().filter(|_| !self.tls);
                 let relayed = tokio::select! {
                     r = h2::relay_with(client, upstream, buf, self.ctx(), tap.cloned(), self.shared.stopped()) => r,
                     () = abort.as_mut() => Ok(()),
