@@ -337,12 +337,19 @@ mod tests {
         ]))
         .err()
         .expect("budget below the largest projection");
-        assert!(error.to_string().contains("MIMIC_SIDECAR_API_EGRESS_BUDGET"));
+        assert!(
+            error
+                .to_string()
+                .contains("MIMIC_SIDECAR_API_EGRESS_BUDGET")
+        );
         let config = PushConfig::from_env(&env(&[
             ("MIMIC_SIDECAR_API_MAX_EGRESS", "64Ki"),
             ("MIMIC_SIDECAR_API_EGRESS_BUDGET", "64Ki"),
         ]))
         .expect("the minimums are valid");
-        assert_eq!((config.max_egress, config.egress_budget), (64 << 10, 64 << 10));
+        assert_eq!(
+            (config.max_egress, config.egress_budget),
+            (64 << 10, 64 << 10)
+        );
     }
 }

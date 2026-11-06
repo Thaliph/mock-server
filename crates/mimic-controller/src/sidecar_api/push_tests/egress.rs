@@ -331,7 +331,15 @@ async fn pul_08_refusals_by_identity_and_request() {
         assert_eq!(answer.status, 400, "{query}");
     }
     let bad = token(&s.ns, "Pay_X", "t");
-    let answer = request(&s.router, Method::GET, Some(&bad), "Pay_X", "?format=1", None).await;
+    let answer = request(
+        &s.router,
+        Method::GET,
+        Some(&bad),
+        "Pay_X",
+        "?format=1",
+        None,
+    )
+    .await;
     assert_eq!(answer.status, 400);
     // Other methods.
     for method in [Method::POST, Method::PUT] {
@@ -341,7 +349,15 @@ async fn pul_08_refusals_by_identity_and_request() {
     }
     // A pod of namespace `b` naming a deployment that has data in namespace `a` only.
     let other = token(&unique("elsewhere"), "pay", "t");
-    let answer = request(&s.router, Method::GET, Some(&other), "pay", "?format=1", None).await;
+    let answer = request(
+        &s.router,
+        Method::GET,
+        Some(&other),
+        "pay",
+        "?format=1",
+        None,
+    )
+    .await;
     assert_eq!((answer.status, answer.text()), (200, EMPTY.to_string()));
 }
 
@@ -428,14 +444,20 @@ async fn pul_08_a_projection_over_the_limit_is_a_507_warned_once_per_deployment(
         "mimic_sidecar_api_egress_builds_total{{result=\"too_large\"}} {}",
         2
     );
-    assert!(s.metrics.encode().contains(&result), "{}", s.metrics.encode());
+    assert!(
+        s.metrics.encode().contains(&result),
+        "{}",
+        s.metrics.encode()
+    );
 }
 
 #[tokio::test]
 async fn pul_08_a_stored_outbound_that_could_never_be_built_is_a_507_without_a_read() {
     let (capture, _guard) = crate::webhook::tests::capture_logs();
-    // STRLEN plus the 64 KiB of the projection is over the whole 256 KiB budget.
-    let s = setup(Options {
+    // The push goes through a replica with room; the pulls through one whose whole budget is
+    // below STRLEN plus the 64 KiB of the projection.
+    let s = setup(Options::default());
+    let small = setup(Options {
         max_egress: 64 << 10,
         budget: 256 << 10,
         ..Options::default()
@@ -443,8 +465,17 @@ async fn pul_08_a_stored_outbound_that_could_never_be_built_is_a_507_without_a_r
     push_report(&s, "pay", SESSION, 1, &fat_report(CANARY)).await;
     let stored = stored_outbound(&s, "pay").await.unwrap();
     assert!(stored.len() > 192 << 10, "the premise of the test");
+    let tok = token(&s.ns, "pay", "t");
     for _ in 0..2 {
-        let answer = pull(&s, "pay", None).await;
+        let answer = request(
+            &small.router,
+            Method::GET,
+            Some(&tok),
+            "pay",
+            "?format=1",
+            None,
+        )
+        .await;
         assert_eq!(answer.status, 507);
         assert!(answer.header("retry-after").is_none());
     }
@@ -455,7 +486,8 @@ async fn pul_08_a_stored_outbound_that_could_never_be_built_is_a_507_without_a_r
     assert_eq!(warns.len(), 1, "{warns:#?}");
     assert_eq!(warns[0]["reason"], "stored");
     assert!(
-        s.metrics
+        small
+            .metrics
             .encode()
             .contains("mimic_sidecar_api_egress_builds_total{result=\"too_large\"} 2")
     );
@@ -507,7 +539,10 @@ async fn pul_10_one_line_per_pull_and_the_series_follow_without_a_secret() {
     assert_eq!(api[1]["bytes"], 0);
     for line in [api[0], api[1], api[5]] {
         assert_eq!(line["namespace"], s.ns.as_str());
-        assert_eq!(line["pod"], pod_of(if line == api[5] { "web" } else { "pay" }));
+        assert_eq!(
+            line["pod"],
+            pod_of(if line == api[5] { "web" } else { "pay" })
+        );
     }
     assert_eq!(api[0]["deployment"], "pay");
     assert_eq!(api[4]["reason"], "format");

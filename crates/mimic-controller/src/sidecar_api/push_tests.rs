@@ -150,6 +150,7 @@ fn setup(options: Options) -> Setup {
         max_push_endpoints: options.max_push,
         max_egress: options.max_egress,
         egress_budget: 32 << 20,
+        egress_logged: EgressLogged::default(),
     });
     Setup {
         router: router(api.clone()),

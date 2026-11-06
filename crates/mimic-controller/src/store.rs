@@ -354,7 +354,7 @@ pub struct Store {
 }
 
 /// The lowercase hex SHA-256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     Sha256::digest(bytes)
         .iter()
@@ -365,7 +365,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// The hash part of `digest` (`<version>:<64 hex>`) when its version is `version`.
-#[allow(dead_code)] // read by the egress route (F9 step 3)
 fn fresh_digest(version: Option<&str>, digest: Option<&str>) -> Option<String> {
     let (written, hash) = digest?.split_once(':')?;
     let valid = hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
@@ -423,6 +422,11 @@ fn read_part(bytes: &[u8], part: Part) -> Option<Report> {
         Part::Outbound => report.version() == 2 && !report.holds_inbound(),
     }
     .then_some(report)
+}
+
+/// A stored `:outbound` once it parses, passes the structural check and is of its kind.
+pub fn parse_outbound(bytes: &[u8]) -> Option<Report> {
+    read_part(bytes, Part::Outbound)
 }
 
 /// The stored parts of a report, as read: `:report`, `:outbound` when present, and the `:meta`
@@ -859,7 +863,6 @@ impl Store {
     /// The hex SHA-256 of the stored `:outbound` bytes, from `:meta` `outbound_digest`; `None`
     /// when the digest is absent, malformed or written for another `version` (stale, §7.7), or
     /// when the deployment has no `:meta`.
-    #[allow(dead_code)] // read by the egress route (F9 step 3)
     pub async fn outbound_digest(
         &self,
         namespace: &str,
@@ -881,6 +884,45 @@ impl Store {
             Err(e) => return Err(self.read_failed(e).await),
         };
         Ok(fresh_digest(version.as_deref(), digest.as_deref()))
+    }
+
+    /// The size of the stored `:outbound` in bytes (`STRLEN`), 0 when there is none: what a
+    /// build reserves before it reads the bytes.
+    pub async fn outbound_len(&self, namespace: &str, deployment: &str) -> Result<u64, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        match redis::cmd("STRLEN")
+            .arg(&k.outbound)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(len) => Ok(len),
+            Err(e) => Err(self.read_failed(e).await),
+        }
+    }
+
+    /// The stored `:outbound` bytes, unparsed; `None` for a deployment without any.
+    pub async fn outbound_bytes(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<Option<Vec<u8>>, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        match redis::cmd("GET")
+            .arg(&k.outbound)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => Err(self.read_failed(e).await),
+        }
     }
 
     async fn read_failed(&self, error: redis::RedisError) -> ReadError {
