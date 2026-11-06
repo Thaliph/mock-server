@@ -179,6 +179,32 @@ mod tests {
     }
 
     #[test]
+    fn shr_11_max_authorities_defaults_to_128_and_takes_1_to_10000() {
+        assert_eq!(
+            PushConfig::from_env(&env(&[]))
+                .unwrap()
+                .store
+                .limits
+                .max_authorities,
+            128
+        );
+        for (value, expected) in [("1", 1), ("64", 64), ("10000", 10_000)] {
+            let config =
+                PushConfig::from_env(&env(&[("MIMIC_STORE_MAX_AUTHORITIES", value)])).unwrap();
+            assert_eq!(config.store.limits.max_authorities, expected, "{value}");
+        }
+        for value in ["0", "10001", "many", "-1"] {
+            let error = PushConfig::from_env(&env(&[("MIMIC_STORE_MAX_AUTHORITIES", value)]))
+                .err()
+                .unwrap_or_else(|| panic!("{value} was accepted"));
+            assert!(
+                error.to_string().contains("MIMIC_STORE_MAX_AUTHORITIES"),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn ctl_14_valid_values_are_taken() {
         let config = PushConfig::from_env(&env(&[
             ("MIMIC_SIDECAR_API_RATE", "10000"),

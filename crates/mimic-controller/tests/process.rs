@@ -715,6 +715,29 @@ fn ctl_14_invalid_push_api_and_store_settings_exit_2_before_listening() {
 }
 
 #[test]
+fn shr_11_an_invalid_max_authorities_exits_2_before_listening() {
+    for value in ["0", "10001", "many", "-1"] {
+        let (status, _, stderr) = run(
+            BIN,
+            &[],
+            &env(&[
+                ("MIMIC_VALKEY_URL", "redis://127.0.0.1:1"),
+                ("MIMIC_STORE_MAX_AUTHORITIES", value),
+            ]),
+        );
+        assert_eq!(
+            status.code(),
+            Some(2),
+            "MIMIC_STORE_MAX_AUTHORITIES={value:?}"
+        );
+        assert!(
+            stderr.contains("MIMIC_STORE_MAX_AUTHORITIES"),
+            "{value:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn inj_19_invalid_listener_limits_exit_2() {
     for (var, value) in [
         ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "0"),
