@@ -228,6 +228,8 @@ async fn shr_18_two_max_size_pushes_onto_full_reports_stay_under_512_mib() {
             "--nocapture",
         ])
         .env(CHILD, &dir)
+        // As the chart sets it on the controller.
+        .env("MALLOC_ARENA_MAX", "2")
         .output()
         .expect("the child runs");
     std::fs::remove_dir_all(&dir).expect("the scratch directory goes");

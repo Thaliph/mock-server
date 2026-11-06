@@ -22,7 +22,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
-use crate::store::{ReadError, Store, Summary};
+use crate::store::{Half, ReadError, Store, Summary};
 
 mod assets;
 
@@ -315,6 +315,7 @@ async fn render<F>(
     route: &str,
     namespace: &str,
     deployment: &str,
+    half: Half,
     build: F,
 ) -> Result<Response, ReadError>
 where
@@ -325,7 +326,7 @@ where
         ReadError::Unreadable
     };
     // Names and the read come first: an invalid or unknown request never waits for a slot.
-    let stored = ui.store.stored_report(namespace, deployment).await?;
+    let stored = ui.store.stored_report(namespace, deployment, half).await?;
     // The permit moves into the blocking closure: a dropped request leaves the render running,
     // and the slot with it.
     let permit = ui
@@ -382,6 +383,7 @@ async fn endpoints(
         matched.as_str(),
         &namespace,
         &deployment,
+        Half::Both,
         |report, _| Some(openapi::endpoint_list(report)),
     )
     .await
@@ -397,6 +399,7 @@ async fn openapi_index(
         matched.as_str(),
         &namespace,
         &deployment,
+        Half::Both,
         |report, _| Some(openapi::index(report)),
     )
     .await
@@ -407,15 +410,18 @@ async fn openapi_document(
     matched: MatchedPath,
     Path((namespace, deployment, id)): Path<(String, String, String)>,
 ) -> Result<Response, ReadError> {
-    if openapi::parse_document_id(&id).is_none() {
-        return Err(ReadError::Name);
-    }
+    let half = match openapi::parse_document_id(&id) {
+        None => return Err(ReadError::Name),
+        Some(openapi::DocId::Inbound(_)) => Half::Inbound,
+        Some(openapi::DocId::Outbound(_)) => Half::Outbound,
+    };
     let (ns, dep) = (namespace.clone(), deployment.clone());
     render(
         &ui,
         matched.as_str(),
         &namespace,
         &deployment,
+        half,
         move |report, version| openapi::document(report, &ns, &dep, version, &id),
     )
     .await

@@ -407,23 +407,40 @@ fn read_part(bytes: &[u8], part: Part) -> Option<Report> {
 /// The stored parts of a report, as read: `:report`, `:outbound` when present, and the `:meta`
 /// `version` they were written with.
 pub struct StoredReport {
-    inbound: Vec<u8>,
+    inbound: Option<Vec<u8>>,
     outbound: Option<Vec<u8>>,
     pub version: u64,
 }
 
+/// What a read needs of a stored report.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Half {
+    /// `:report` and `:outbound`, joined.
+    Both,
+    /// `:report` only: the inbound scopes.
+    Inbound,
+    /// `:outbound` only: the outbound scopes.
+    Outbound,
+}
+
 impl StoredReport {
-    /// The union of the parts, once each parses and passes the check; `None` for a part that
-    /// does not. Each part's bytes go as soon as it is parsed.
+    /// The report of the parts that were read, once each parses and passes the check; `None`
+    /// for a part that does not. Each part's bytes go as soon as it is parsed.
     pub fn parse(self) -> Option<Report> {
-        let inbound = read_part(&self.inbound, Part::Inbound)?;
+        let inbound = match &self.inbound {
+            Some(bytes) => Some(read_part(bytes, Part::Inbound)?),
+            None => None,
+        };
         drop(self.inbound);
         let outbound = match &self.outbound {
             Some(bytes) => Some(read_part(bytes, Part::Outbound)?),
             None => None,
         };
         drop(self.outbound);
-        Some(Report::join(inbound, outbound))
+        match inbound {
+            Some(inbound) => Some(Report::join(inbound, outbound)),
+            None => outbound,
+        }
     }
 }
 
@@ -755,11 +772,14 @@ impl Store {
             .map_err(|_| unreadable("report"))
     }
 
-    /// The stored parts, unparsed, and the `:meta` `version` they were written with.
+    /// The stored parts that `half` needs, unparsed, and the `:meta` `version` they were written
+    /// with. An inbound document needs `:report` only and an outbound one `:outbound` only: the
+    /// other half is neither read nor parsed (SHR-18).
     pub async fn stored_report(
         &self,
         namespace: &str,
         deployment: &str,
+        half: Half,
     ) -> Result<StoredReport, ReadError> {
         let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
         let mut conn = self
@@ -767,30 +787,47 @@ impl Store {
             .await
             .map_err(|_| ReadError::Unavailable)?;
         // One transaction, as for `report`: the parts and the version belong together.
-        let (inbound, outbound, version): (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>) =
-            match redis::pipe()
-                .atomic()
-                .cmd("GET")
-                .arg(&k.report)
-                .cmd("GET")
-                .arg(&k.outbound)
-                .cmd("HGET")
-                .arg(&k.meta)
-                .arg("version")
-                .query_async(&mut conn)
-                .await
-            {
-                Ok(read) => read,
-                Err(e) => return Err(self.read_failed(e).await),
-            };
-        // Expired between the keys is the same as absent.
-        let (Some(inbound), Some(version)) = (inbound, version) else {
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        if half != Half::Outbound {
+            pipe.cmd("GET").arg(&k.report);
+        }
+        if half != Half::Inbound {
+            pipe.cmd("GET").arg(&k.outbound);
+        }
+        pipe.cmd("HGET").arg(&k.meta).arg("version");
+        let mut read: Vec<Option<Vec<u8>>> = match pipe.query_async(&mut conn).await {
+            Ok(read) => read,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        let version = read.pop().flatten();
+        let mut read = read.into_iter();
+        let inbound = if half == Half::Outbound {
+            None
+        } else {
+            read.next().flatten()
+        };
+        let outbound = if half == Half::Inbound {
+            None
+        } else {
+            read.next().flatten()
+        };
+        // Expired between the keys is the same as absent; so is a half that is not there, for
+        // the half that the request is about.
+        let present = match half {
+            Half::Outbound => outbound.is_some(),
+            _ => inbound.is_some(),
+        };
+        let (true, Some(version)) = (present, version) else {
             return Err(ReadError::NotFound);
         };
-        let version = version.parse().map_err(|_| {
-            tracing::error!(namespace, deployment, "stored meta unreadable");
-            ReadError::Unreadable
-        })?;
+        let version = String::from_utf8(version)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                tracing::error!(namespace, deployment, "stored meta unreadable");
+                ReadError::Unreadable
+            })?;
         Ok(StoredReport {
             inbound,
             outbound,
