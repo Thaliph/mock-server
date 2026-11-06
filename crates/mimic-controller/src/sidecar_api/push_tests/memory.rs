@@ -28,6 +28,8 @@ fn options() -> Options {
     Options {
         max_report: defaults.max_report,
         budget: defaults.body_budget,
+        // One push reaches the store limits (512 endpoints per direction): harsher than
+        // production, where the sidecars' pushes are smaller and the limit is reached by merging.
         max_push: 1024,
         max_endpoints: 512,
         max_authorities: 128,

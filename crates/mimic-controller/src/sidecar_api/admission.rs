@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -162,34 +162,42 @@ impl ReviewCache {
 
 /// Bytes of push bodies being read at once, reserved from the declared `Content-Length`.
 pub struct BodyBudget {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
     capacity: u64,
     used: AtomicU64,
 }
 
-/// A reservation; released when dropped.
-pub struct Reservation<'a> {
-    budget: &'a BodyBudget,
+/// A reservation; released when dropped. It owns its share of the budget, so that it can
+/// move into the task that outlives the request (the store write).
+pub struct Reservation {
+    shared: Arc<Shared>,
     bytes: u64,
 }
 
 impl BodyBudget {
     pub fn new(capacity: u64) -> BodyBudget {
         BodyBudget {
-            capacity,
-            used: AtomicU64::new(0),
+            shared: Arc::new(Shared {
+                capacity,
+                used: AtomicU64::new(0),
+            }),
         }
     }
 
     /// Reserves `bytes`, or None when that would exceed the capacity.
-    pub fn reserve(&self, bytes: u64) -> Option<Reservation<'_>> {
-        self.used
+    pub fn reserve(&self, bytes: u64) -> Option<Reservation> {
+        self.shared
+            .used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
-                    .filter(|total| *total <= self.capacity)
+                    .filter(|total| *total <= self.shared.capacity)
             })
             .ok()
             .map(|_| Reservation {
-                budget: self,
+                shared: self.shared.clone(),
                 bytes,
             })
     }
@@ -197,13 +205,13 @@ impl BodyBudget {
     /// Bytes reserved now.
     #[cfg(test)]
     pub fn used(&self) -> u64 {
-        self.used.load(Ordering::Acquire)
+        self.shared.used.load(Ordering::Acquire)
     }
 }
 
-impl Drop for Reservation<'_> {
+impl Drop for Reservation {
     fn drop(&mut self) {
-        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.shared.used.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
