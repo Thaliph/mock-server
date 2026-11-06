@@ -2,7 +2,7 @@
 //! destination authority `<host>:<port>` for outbound ones.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -88,6 +88,30 @@ fn valid_dns(host: &str) -> bool {
                 && !label.starts_with('-')
                 && !label.ends_with('-')
         })
+}
+
+/// An SNI of an outbound scope's origin (spec §6.1): a lower-case DNS name of at most 253 bytes.
+pub(super) fn valid_sni(text: &str) -> bool {
+    valid_dns(text)
+}
+
+/// A destination of an outbound scope's origin (spec §6.1): an IP literal and a port, in the
+/// canonical form `a.b.c.d:port` or `[v6]:port`.
+pub(super) fn valid_dst(text: &str) -> bool {
+    let Some((host, port)) = text.rsplit_once(':') else {
+        return false;
+    };
+    if canonical_port(port).is_none() {
+        return false;
+    }
+    match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) => inner
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|ip| ip.to_string() == inner),
+        None => host
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|ip| ip.to_string() == host),
+    }
 }
 
 fn valid_authority(text: &str) -> bool {

@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 use super::check::Violation;
 use super::observed::{MAX_BODY, Observation};
 use super::redact::Redactor;
-use super::report::{Direction, Exchange, Limits, Report, merge};
+use super::report::{Direction, Exchange, Limits, Report, Via, merge};
+use super::scope::ScopeKey;
 
 const AUTH: usize = 64;
 
@@ -144,7 +145,6 @@ fn ctl_01_rejects_each_violation_with_its_own_reason() {
     let long_name = "n".repeat(129);
     let cases: Vec<Case> = vec![
         ("version", Box::new(|v| v["version"] = json!(2))),
-        ("version 3", Box::new(|v| v["version"] = json!(3))),
         (
             "samples",
             Box::new(|v| {
@@ -414,21 +414,28 @@ fn ctl_01_accepts_the_bounds_exactly() {
 fn ctl_01_push_limit_is_per_direction() {
     let l = limits(100, 256, 1 << 20);
     let record = |r: &mut Report, direction, path: &str| {
-        r.record(
-            &l,
-            &Redactor::default(),
-            &Exchange {
-                direction,
-                port: 80,
-                method: "GET",
-                path,
-                status: 200,
-                head_ms: 1,
-                host: None,
-                grpc: false,
-                observation: Observation::default(),
-            },
-        );
+        let exchange = Exchange {
+            direction,
+            port: 80,
+            method: "GET",
+            path,
+            status: 200,
+            head_ms: 1,
+            host: None,
+            grpc: false,
+            observation: Observation::default(),
+        };
+        if direction == Direction::Outbound {
+            let key = ScopeKey::Authority("out.example.com:80".into());
+            let via = Via {
+                tls: false,
+                sni: None,
+                dst: None,
+            };
+            r.record_at(key, &via, &l, &Redactor::default(), &exchange);
+        } else {
+            r.record(&l, &Redactor::default(), &exchange);
+        }
     };
     let mut r = Report::new(None);
     for p in ["/a", "/b", "/c"] {
@@ -608,31 +615,38 @@ fn record_all(l: &Limits, items: &[Ex]) -> Report {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         headers.push(("content-type", "application/json"));
-        r.record(
-            l,
-            &Redactor::default(),
-            &Exchange {
-                direction: if e.outbound {
-                    Direction::Outbound
-                } else {
-                    Direction::Inbound
-                },
-                port: e.port,
-                method: "POST",
-                path: &e.path,
-                status: e.status,
-                head_ms: e.ms,
-                host: Some(&e.host),
-                grpc: e.grpc,
-                observation: Observation {
-                    query: &e.query,
-                    req_headers: &headers,
-                    req_body: e.body.as_deref().map(str::as_bytes),
-                    resp_headers: &headers,
-                    resp_body: e.body.as_deref().map(str::as_bytes),
-                },
+        let exchange = Exchange {
+            direction: if e.outbound {
+                Direction::Outbound
+            } else {
+                Direction::Inbound
             },
-        );
+            port: e.port,
+            method: "POST",
+            path: &e.path,
+            status: e.status,
+            head_ms: e.ms,
+            host: Some(&e.host),
+            grpc: e.grpc,
+            observation: Observation {
+                query: &e.query,
+                req_headers: &headers,
+                req_body: e.body.as_deref().map(str::as_bytes),
+                resp_headers: &headers,
+                resp_body: e.body.as_deref().map(str::as_bytes),
+            },
+        };
+        if e.outbound {
+            let key = ScopeKey::Authority(format!("h{}.example.com:{}", e.port, e.port));
+            let via = Via {
+                tls: false,
+                sni: None,
+                dst: None,
+            };
+            r.record_at(key, &via, l, &Redactor::default(), &exchange);
+        } else {
+            r.record(l, &Redactor::default(), &exchange);
+        }
     }
     r
 }

@@ -177,7 +177,7 @@ fn shr_01_tunnel_kinds() {
 fn shr_01_hosts_on_an_outbound_endpoint() {
     let mut v = v2_value();
     each_endpoint(outbound_scope(&mut v), &mut |e| {
-        e["GET"]["hosts"] = json!(["svc"]);
+        e["hosts"] = json!(["svc"]);
     });
     assert_eq!(verdict(&v), Err(Violation::Hosts));
 }
