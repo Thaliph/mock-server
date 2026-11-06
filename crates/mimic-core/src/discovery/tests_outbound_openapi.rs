@@ -198,22 +198,30 @@ fn shr_07_tunnel_only_scope_has_empty_paths() {
 
 #[test]
 fn shr_07_same_path_on_two_authorities_is_in_two_documents() {
-    let r = mixed();
-    for id in ["outbound-api.example.com:443", "outbound-other.example:443"] {
-        let d = doc(&r, id);
-        assert!(
-            d["paths"]
-                .as_object()
-                .expect("paths")
-                .contains_key("/v1/payments/{payments_id}")
-                || d["paths"]
-                    .as_object()
-                    .expect("paths")
-                    .contains_key("/v1/payments/43"),
-            "{id}: {}",
-            d["paths"]
-        );
+    let mut r = Report::new(None);
+    for authority in ["api.example.com:443", "other.example:443"] {
+        for id in [42, 43, 44] {
+            record_out(&mut r, &out(authority, true, &format!("/v1/payments/{id}")));
+        }
     }
+    record_out(&mut r, &out("api.example.com:443", true, "/v1/refunds"));
+    let paths = |id: &str| -> Vec<String> {
+        doc(&r, id)["paths"]
+            .as_object()
+            .expect("paths")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        paths("outbound-api.example.com:443"),
+        ["/v1/payments/{payments_id}", "/v1/refunds"]
+    );
+    // A path recorded on one authority stays out of the other's document.
+    assert_eq!(
+        paths("outbound-other.example:443"),
+        ["/v1/payments/{payments_id}"]
+    );
 }
 
 #[test]
