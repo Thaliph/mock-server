@@ -629,6 +629,16 @@ impl Params {
         }
     }
 
+    /// [`Params::redact_names`] for header names, which the outbound request view also
+    /// redacts outside its allowlist.
+    pub(super) fn redact_header_names(&mut self, redactor: &Redactor) {
+        for (name, param) in &mut self.keys {
+            if redactor.header_name_matches(name) {
+                param.schema = Schema::marker();
+            }
+        }
+    }
+
     /// A query string or an `application/x-www-form-urlencoded` body.
     pub fn from_query(redactor: &Redactor, query: &str) -> Self {
         Self::from_pairs(&query_pairs(redactor, query))

@@ -156,7 +156,8 @@ fn body(parsed: Option<Parsed>) -> Option<Body> {
 impl Sample {
     /// The sample of an exchange and the XXH3 hash of its redacted content (latency aside).
     pub(super) fn new(
-        redactor: &Redactor,
+        request_redactor: &Redactor,
+        response_redactor: &Redactor,
         exchange: &Exchange<'_>,
         request_body: Option<Parsed>,
         response_body: Option<Parsed>,
@@ -167,13 +168,13 @@ impl Sample {
         let request = Request {
             method: exchange.method.to_string(),
             path: redact::path(exchange.path),
-            query: pairs(query_pairs(redactor, o.query)),
-            headers: pairs(header_pairs(redactor, o.req_headers)),
+            query: pairs(query_pairs(request_redactor, o.query)),
+            headers: pairs(header_pairs(request_redactor, o.req_headers)),
             body: body(request_body),
         };
         let response = Response {
             status: exchange.status,
-            headers: pairs(header_pairs(redactor, o.resp_headers)),
+            headers: pairs(header_pairs(response_redactor, o.resp_headers)),
             body: body(response_body),
         };
         // Plain data: serialisation cannot fail.
@@ -263,25 +264,23 @@ impl Sample {
 
     /// The §6 redaction again on the path, query, headers and bodies. True when something
     /// changed.
-    fn redact(&mut self, redactor: &Redactor) -> bool {
+    fn redact(&mut self, request_redactor: &Redactor, response_redactor: &Redactor) -> bool {
         let before = (self.request.clone(), self.response.clone());
         self.request.path = redact::path(&self.request.path);
         for (key, value) in &mut self.request.query {
-            *value = redactor.field(key, value);
+            *value = request_redactor.field(key, value);
         }
-        for (name, value) in self
-            .request
-            .headers
-            .iter_mut()
-            .chain(&mut self.response.headers)
-        {
-            *value = redactor.header(name, value);
+        for (name, value) in &mut self.request.headers {
+            *value = request_redactor.header(name, value);
         }
-        for body in [&mut self.request.body, &mut self.response.body]
-            .into_iter()
-            .flatten()
-        {
-            body.redact(redactor);
+        for (name, value) in &mut self.response.headers {
+            *value = response_redactor.header(name, value);
+        }
+        if let Some(body) = &mut self.request.body {
+            body.redact(request_redactor);
+        }
+        if let Some(body) = &mut self.response.body {
+            body.redact(response_redactor);
         }
         let changed = before != (self.request.clone(), self.response.clone());
         if changed {
@@ -412,11 +411,15 @@ impl Samples {
 
     /// Redacts every sample again and keys it by the hash of its new content (samples that
     /// become the same are one). Returns the volatile fields that a sample's change reaches.
-    pub(super) fn re_redact(&mut self, redactor: &Redactor) -> BTreeSet<String> {
+    pub(super) fn re_redact(
+        &mut self,
+        request_redactor: &Redactor,
+        response_redactor: &Redactor,
+    ) -> BTreeSet<String> {
         let mut fields = BTreeSet::new();
         for (_, mut sample) in std::mem::take(&mut self.0) {
             let original = sample.clone();
-            if sample.redact(redactor) {
+            if sample.redact(request_redactor, response_redactor) {
                 fields.extend(original.volatility().changed(&sample.volatility()));
             }
             let hash = sample.reseal();

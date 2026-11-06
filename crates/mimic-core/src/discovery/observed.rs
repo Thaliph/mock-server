@@ -119,7 +119,7 @@ impl Side {
     }
 
     fn redact_names(&mut self, redactor: &Redactor) {
-        self.headers.redact_names(redactor);
+        self.headers.redact_header_names(redactor);
         for media in self.bodies.values_mut() {
             if let Some(schema) = &mut media.json {
                 schema.redact_names(redactor);
@@ -284,12 +284,16 @@ pub(super) fn body_shape(media: &str, value: &Value, form: Option<Vec<Pair>>) ->
 /// query key, header or form field is redacted, the field of the first redacted key on the
 /// way to a JSON leaf. `None` when no name is redacted.
 fn named_secret(redactor: &Redactor, field: &str) -> Option<String> {
+    if let Some(name) = field.strip_prefix("query/") {
+        return redactor.name_matches(name).then(|| field.to_string());
+    }
     if let Some(name) = field
-        .strip_prefix("query/")
-        .or_else(|| field.strip_prefix("request.header/"))
+        .strip_prefix("request.header/")
         .or_else(|| field.strip_prefix("response.header/"))
     {
-        return redactor.name_matches(name).then(|| field.to_string());
+        return redactor
+            .header_name_matches(name)
+            .then(|| field.to_string());
     }
     let rest = field
         .strip_prefix("request.body/")
@@ -354,23 +358,24 @@ pub(super) fn parse(redactor: &Redactor, headers: &[(&str, &str)], body: &[u8]) 
 impl Observed {
     /// Records one exchange: the same as merging the one-exchange value.
     pub fn record(&mut self, redactor: &Redactor, o: &Observation<'_>) {
-        self.record_parsed(redactor, o);
+        self.record_parsed(redactor, redactor, o);
     }
 
     /// As `record`, and hands back the parsed request and response bodies for the samples.
     pub(super) fn record_parsed(
         &mut self,
-        redactor: &Redactor,
+        request_redactor: &Redactor,
+        response_redactor: &Redactor,
         o: &Observation<'_>,
     ) -> (Option<Parsed>, Option<Parsed>) {
-        let query = query_pairs(redactor, o.query);
+        let query = query_pairs(request_redactor, o.query);
         let mut seen = Seen::new();
         observe_pairs(&mut self.fields, &mut seen, "query", &query);
         self.query = std::mem::take(&mut self.query).merge(Params::from_pairs(&query));
 
-        let req = header_pairs(redactor, o.req_headers);
+        let req = header_pairs(request_redactor, o.req_headers);
         observe_pairs(&mut self.fields, &mut seen, "request.header", &req);
-        let resp = header_pairs(redactor, o.resp_headers);
+        let resp = header_pairs(response_redactor, o.resp_headers);
         observe_pairs(&mut self.fields, &mut seen, "response.header", &resp);
 
         let mut request = Side {
@@ -382,7 +387,7 @@ impl Observed {
             ..Side::default()
         };
         let req_body = self.body(
-            redactor,
+            request_redactor,
             &mut seen,
             "request.body",
             &mut request,
@@ -390,7 +395,7 @@ impl Observed {
             o.req_body,
         );
         let resp_body = self.body(
-            redactor,
+            response_redactor,
             &mut seen,
             "response.body",
             &mut response,
@@ -444,11 +449,21 @@ impl Observed {
     /// The §6 redaction again on the volatile fields: those named after a name of `redactor`,
     /// and `changed` (reached by a sample that re-redaction changed), become redacted and
     /// lose the hashes of their values.
-    pub(super) fn re_redact(&mut self, redactor: &Redactor, changed: &BTreeSet<String>) {
-        self.query.redact_names(redactor);
-        self.request.redact_names(redactor);
-        self.response.redact_names(redactor);
+    pub(super) fn re_redact(
+        &mut self,
+        request_redactor: &Redactor,
+        response_redactor: &Redactor,
+        changed: &BTreeSet<String>,
+    ) {
+        self.query.redact_names(request_redactor);
+        self.request.redact_names(request_redactor);
+        self.response.redact_names(response_redactor);
         self.fields.redact(|field| {
+            let redactor = if field.starts_with("response.") {
+                response_redactor
+            } else {
+                request_redactor
+            };
             named_secret(redactor, field)
                 .or_else(|| changed.contains(field).then(|| field.to_string()))
         });

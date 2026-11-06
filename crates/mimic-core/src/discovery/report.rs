@@ -180,8 +180,9 @@ impl Origin {
             schemes: BTreeMap::from([(scheme.to_string(), 1)]),
             ..Origin::default()
         };
-        if let Some(sni) = via.sni.and_then(scope::dns_host)
-            && value_rule(&sni).is_none()
+        if let Some(sni) = via.sni
+            && !scope::caught(sni)
+            && let Some(sni) = scope::dns_host(sni)
         {
             origin.sni.insert(sni);
         }
@@ -331,7 +332,7 @@ impl Stats {
     }
 
     /// The §6 redaction again on the hosts, the samples and the volatile fields.
-    fn re_redact(&mut self, redactor: &Redactor) {
+    fn re_redact(&mut self, request_redactor: &Redactor, response_redactor: &Redactor) {
         self.hosts = std::mem::take(&mut self.hosts)
             .into_iter()
             .map(|h| {
@@ -342,8 +343,9 @@ impl Stats {
                 }
             })
             .collect();
-        let changed = self.samples.re_redact(redactor);
-        self.observed.re_redact(redactor, &changed);
+        let changed = self.samples.re_redact(request_redactor, response_redactor);
+        self.observed
+            .re_redact(request_redactor, response_redactor, &changed);
     }
 }
 
@@ -763,6 +765,7 @@ impl Report {
         if ports.is_empty() {
             self.scopes.remove(direction);
         }
+        self.sync_version();
     }
 
     /// Keeps the `limit` endpoints that sort first (spec §6, merge).
@@ -995,10 +998,19 @@ impl Report {
         let mut stats = Stats::of(exchange);
         let mut sampled = Sampled::None;
         if !counted_only {
-            let (request, response) = stats
-                .observed
-                .record_parsed(redactor, &exchange.observation);
-            let (hash, sample) = Sample::new(redactor, exchange, request, response);
+            // An outbound request carries the app's own credentials (spec §6.1).
+            let outbound = redactor.outbound_request();
+            let request_redactor = if exchange.direction == Direction::Outbound {
+                &outbound
+            } else {
+                redactor
+            };
+            let (request, response) =
+                stats
+                    .observed
+                    .record_parsed(request_redactor, redactor, &exchange.observation);
+            let (hash, sample) =
+                Sample::new(request_redactor, redactor, exchange, request, response);
             let present = known.is_some_and(|k| k.samples.contains(hash));
             let bytes = sample.bytes();
             let fits = self.sample_bytes().saturating_add(bytes) <= limits.sample_budget
@@ -1087,6 +1099,7 @@ impl Report {
         self.limit_authorities(limits.max_authorities);
         self.limit_endpoints(limits.max_endpoints);
         self.limit_samples(limits.sample_budget);
+        self.sync_version();
     }
 
     /// Removes every sample, keeping counters, schemas and the shape (the `413` resend of
@@ -1109,7 +1122,14 @@ impl Report {
         for scope in self.scopes.values_mut().flat_map(BTreeMap::values_mut) {
             scope.re_redact_paths();
         }
-        self.for_each_stats_mut(|stats| stats.re_redact(redactor));
+        // The outbound request view of §6.1 applies again to the outbound requests.
+        let outbound = redactor.outbound_request();
+        self.for_each_stats_of_mut(Some(Direction::Inbound), |stats| {
+            stats.re_redact(redactor, redactor);
+        });
+        self.for_each_stats_of_mut(Some(Direction::Outbound), |stats| {
+            stats.re_redact(&outbound, redactor);
+        });
     }
 
     pub(super) fn clear_pod(&mut self) {

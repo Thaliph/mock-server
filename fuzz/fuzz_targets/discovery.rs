@@ -12,6 +12,12 @@
 //! 7. the response body;
 //! 8. the host.
 //!
+//! Outbound exchanges (spec EGR-20): a flag of the control field makes the exchange outbound.
+//! Its authority comes from the host field (the target), the SNI from the first line of the
+//! query, the destination from the control bytes, and one more flag counts a tunnel whose kind
+//! is a known one or the path (an arbitrary string). The request carries a canary under a name
+//! outside the allowlist as well.
+//!
 //! Exchanges are recorded alternately into two reports, which are then merged. The recorder
 //! must not panic or hang, the endpoint limit and the sample budget hold, the serialised report
 //! round-trips, and no custom-listed canary survives redaction. Content decoding is not part
@@ -27,14 +33,19 @@
 use libfuzzer_sys::fuzz_target;
 use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
-use mimic_core::discovery::report::{Direction, Exchange, Limits, Report, merge};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use mimic_core::discovery::report::{
+    Direction, Exchange, Limits, Report, TUNNEL_KINDS, Via, merge,
+};
+use mimic_core::discovery::scope::{ScopeKey, authority_key};
 use mimic_core::discovery::store::merge_bounded;
 
 const LIMITS: Limits = Limits {
     max_literals: 4,
     max_endpoints: 16,
+    max_authorities: 4,
     sample_budget: 256 * 1024,
-    max_authorities: 8,
 };
 /// Endpoints per direction accepted from a push.
 const PUSH: usize = 16;
@@ -91,33 +102,91 @@ fuzz_target!(|data: &[u8]| {
         let query = format!("{}&fuzzsecret={CANARY}", String::from_utf8_lossy(get(2)));
         let mut req_headers = headers(get(3));
         req_headers.push(("x-fuzzsecret".into(), CANARY.into()));
+        let outbound = flags & 0x20 != 0;
+        if outbound {
+            // Outside the allowlist: redacted in an outbound request.
+            req_headers.push(("x-fuzzcustom".into(), CANARY.into()));
+        }
         let resp_headers = headers(get(5));
         let host = String::from_utf8_lossy(get(7)).into_owned();
         let req = borrowed(&req_headers);
         let resp = borrowed(&resp_headers);
         let report = &mut reports[i % 2];
-        report.record(
-            &LIMITS,
-            &redactor,
-            &Exchange {
-                direction: Direction::Inbound,
-                port: u16::from(byte(3, 80)),
-                method,
-                path: &path,
-                status,
-                head_ms: u64::from(byte(4, 1)) << (flags % 24),
-                host: (flags & 0x80 != 0).then_some(host.as_str()),
-                grpc: flags & 0x40 != 0,
-                observation: Observation {
-                    query: &query,
-                    req_headers: &req,
-                    req_body: Some(get(4)),
-                    resp_headers: &resp,
-                    resp_body: Some(get(6)),
-                },
-            },
+        let target = host.as_str();
+        let sni = String::from_utf8_lossy(get(2))
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let dst = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, byte(5, 0), byte(6, 0), byte(7, 1))),
+            u16::from(byte(8, 80)) * 257,
         );
-        assert!(report.endpoints().len() <= LIMITS.max_endpoints);
+        let key = authority_key(
+            Some(target),
+            if flags & 0x08 != 0 { 443 } else { 80 },
+            (flags & 0x04 != 0).then_some(sni.as_str()),
+            dst,
+        );
+        assert!(
+            ScopeKey::parse(&key).is_some(),
+            "an authority key breaks its grammar"
+        );
+        if outbound && flags & 0x10 != 0 {
+            let kind = if byte(9, 0) % 2 == 0 {
+                TUNNEL_KINDS[usize::from(byte(9, 0)) % TUNNEL_KINDS.len()].to_string()
+            } else {
+                path.clone()
+            };
+            report.record_tunnel(&LIMITS, ScopeKey::Authority(key.clone()), &kind);
+        }
+        let exchange = Exchange {
+            direction: if outbound {
+                Direction::Outbound
+            } else {
+                Direction::Inbound
+            },
+            port: u16::from(byte(3, 80)),
+            method,
+            path: &path,
+            status,
+            head_ms: u64::from(byte(4, 1)) << (flags % 24),
+            host: (flags & 0x80 != 0).then_some(host.as_str()),
+            grpc: flags & 0x40 != 0,
+            observation: Observation {
+                query: &query,
+                req_headers: &req,
+                req_body: Some(get(4)),
+                resp_headers: &resp,
+                resp_body: Some(get(6)),
+            },
+        };
+        if outbound {
+            let via = Via {
+                tls: flags & 0x04 != 0,
+                sni: Some(sni.as_str()),
+                dst: Some(dst),
+            };
+            report.record_at(
+                ScopeKey::Authority(key),
+                &via,
+                &LIMITS,
+                &redactor,
+                &exchange,
+            );
+        } else {
+            report.record(&LIMITS, &redactor, &exchange);
+        }
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            assert!(
+                report
+                    .endpoints()
+                    .iter()
+                    .filter(|e| e.direction == direction)
+                    .count()
+                    <= LIMITS.max_endpoints
+            );
+        }
         assert!(report.sample_bytes() <= LIMITS.sample_budget);
     }
     let [a, b] = reports;
@@ -126,7 +195,11 @@ fuzz_target!(|data: &[u8]| {
     push(&merged, &String::from_utf8_lossy(data));
     let mut bytes = json.clone().into_bytes();
     for write in data.chunks_exact(3) {
-        if let Some(at) = usize::from(write[0]) .checked_mul(256).and_then(|n| n.checked_add(usize::from(write[1]))).and_then(|n| n.checked_rem(bytes.len())) {
+        if let Some(at) = usize::from(write[0])
+            .checked_mul(256)
+            .and_then(|n| n.checked_add(usize::from(write[1])))
+            .and_then(|n| n.checked_rem(bytes.len()))
+        {
             bytes[at] = write[2];
         }
     }

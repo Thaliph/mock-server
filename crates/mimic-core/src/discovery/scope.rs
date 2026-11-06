@@ -114,28 +114,30 @@ pub fn authority_key(
     sni: Option<&str>,
     dst: SocketAddr,
 ) -> String {
-    if let Some((host, port)) = target.and_then(|t| split_target(t, default_port)) {
-        return join(host, port);
+    if let Some((host, port, caught)) = target.and_then(|t| split_target(t, default_port)) {
+        return join(host, port, caught);
     }
     // A destination has a port; 0 cannot be one, and the grammar has no room for it.
     let dst_port = dst.port().max(1);
     if let Some(host) = sni.and_then(dns_host) {
-        return join(host, dst_port);
+        return join(host, dst_port, sni.is_some_and(caught));
     }
     let ip = dst.ip().to_canonical();
     let host = match ip {
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => format!("[{v6}]"),
     };
-    join(host, dst_port)
+    join(host, dst_port, false)
 }
 
 /// Host and port of a `Host` / `:authority` value, normalised.
-fn split_target(raw: &str, default_port: u16) -> Option<(String, u16)> {
+fn split_target(raw: &str, default_port: u16) -> Option<(String, u16, bool)> {
     if raw.is_empty() || raw.len() > MAX_HOST + 8 {
         return None;
     }
     let lower = raw.to_ascii_lowercase();
+    // The detectors run on the text as received, and on the lower-cased name DNS compares.
+    let mut secret = false;
     let (host, port) = if let Some(rest) = lower.strip_prefix('[') {
         let (addr, after) = rest.split_once(']')?;
         let ip: Ipv6Addr = addr.parse().ok()?;
@@ -149,13 +151,15 @@ fn split_target(raw: &str, default_port: u16) -> Option<(String, u16)> {
             Some((h, p)) => (h, Some(p)),
             None => (lower.as_str(), None),
         };
+        let original = &raw[..host.len()];
+        secret = caught(original);
         (dns_host(host)?, port)
     };
     let port = match port {
         None => default_port,
         Some(p) => canonical_port(p)?,
     };
-    Some((host, port))
+    Some((host, port, secret))
 }
 
 /// A DNS name in the grammar, from any case and with one trailing dot.
@@ -165,9 +169,15 @@ pub(super) fn dns_host(name: &str) -> Option<String> {
     valid_dns(host).then(|| host.to_string())
 }
 
-/// `host:port`, with the marker instead of a host a value detector catches.
-fn join(host: String, port: u16) -> String {
-    if !host.starts_with('[') && value_rule(&host).is_some() {
+/// True when a value detector catches a host as received or in lower case.
+pub(super) fn caught(original: &str) -> bool {
+    value_rule(original).is_some() || value_rule(&original.to_ascii_lowercase()).is_some()
+}
+
+/// `host:port`, with the marker instead of a host a value detector caught (`caught`, on the
+/// text as received) or catches in its normalised form.
+fn join(host: String, port: u16, caught: bool) -> String {
+    if !host.starts_with('[') && (caught || value_rule(&host).is_some()) {
         return format!("{MARKER}:{port}");
     }
     format!("{host}:{port}")
