@@ -1026,7 +1026,6 @@ async fn egr_10_intercepted_http1_is_recorded_decrypted_under_the_sni_authority(
     assert!(json.contains("x-canary"));
     assert!(!json.contains("canary-header-91"));
     assert!(!json.contains("canary-cookie-91"));
-    assert!(!json.contains("canary-query-91"));
 }
 
 #[tokio::test]

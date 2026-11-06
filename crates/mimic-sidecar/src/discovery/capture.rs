@@ -105,6 +105,7 @@ pub(super) struct Record {
     /// exchange went (spec §6.1).
     pub(super) dst: SocketAddr,
     pub(super) tls: bool,
+    pub(super) sni: Option<String>,
     /// The normalised authority (spec §4.1), when the request named one.
     pub(super) authority: Option<String>,
     pub(super) status: u16,
@@ -122,6 +123,7 @@ pub(crate) struct Meta {
     pub(crate) outbound: bool,
     pub(crate) dst: SocketAddr,
     pub(crate) tls: bool,
+    pub(crate) sni: Option<String>,
     pub(crate) port: u16,
     pub(crate) authority: Option<String>,
     pub(crate) status: u16,
@@ -261,6 +263,7 @@ impl Tap {
             port: meta.port,
             dst: meta.dst,
             tls: meta.tls,
+            sni: meta.sni,
             authority: meta.authority,
             status: meta.status,
             head_ms: meta.head_ms,

@@ -37,6 +37,8 @@ pub struct Ctx {
     pub dst: SocketAddr,
     /// The exchanges are decrypted by interception (spec §5).
     pub tls: bool,
+    /// The normalised SNI of the connection, when there is one.
+    pub sni: Option<String>,
     pub proxy: ProxyMetrics,
     /// True once the connections left at the end of the shutdown grace are being closed.
     pub aborted: tokio::sync::watch::Receiver<bool>,
@@ -372,6 +374,7 @@ impl Tracker {
                 outbound: self.ctx.direction == Direction::Outbound,
                 dst: self.ctx.dst,
                 tls: self.ctx.tls,
+                sni: self.ctx.sni.clone(),
                 port: self.ctx.dst.port(),
                 authority: self.named_authority.take(),
                 status,
@@ -774,6 +777,7 @@ impl Http1Tracker {
                 outbound: self.ctx.direction == Direction::Outbound,
                 dst: self.ctx.dst,
                 tls: self.ctx.tls,
+                sni: self.ctx.sni.clone(),
                 port: self.ctx.dst.port(),
                 authority,
                 status,

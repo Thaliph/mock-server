@@ -418,7 +418,7 @@ impl Recorder {
         let key = ScopeKey::Authority(authority_key(
             exchange.host,
             if record.tls { 443 } else { 80 },
-            None,
+            record.sni.as_deref(),
             record.dst,
         ));
         let (inbound_bytes, epoch) = {
@@ -439,7 +439,7 @@ impl Recorder {
         };
         let via = Via {
             tls: record.tls,
-            sni: None,
+            sni: record.sni.as_deref(),
             dst: Some(record.dst),
         };
         let (outcome, endpoints, sample_bytes) = {
