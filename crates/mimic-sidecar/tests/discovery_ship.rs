@@ -641,6 +641,14 @@ async fn ctl_16_metrics_and_logs_follow_a_failure_streak() {
     let (_stop, _task) = rig.start();
     rig.call("users", 1).await;
     wait(|| rig.api.acknowledged() == 1).await;
+    // The API acknowledges before the sidecar counts the answer.
+    // The counter is set before the timestamp: wait for both.
+    wait(|| {
+        let text = metrics.encode();
+        text.contains("mimic_discovery_pushes_total{result=\"ok\"} 1")
+            && !text.contains("mimic_discovery_last_push_timestamp_seconds 0\n")
+    })
+    .await;
     let text = metrics.encode();
     assert!(
         text.contains("mimic_discovery_pushes_total{result=\"error\"} 2"),

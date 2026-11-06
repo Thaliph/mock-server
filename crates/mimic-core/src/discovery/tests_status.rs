@@ -34,6 +34,7 @@ fn ctl_06_status_of_a_deployment_with_data() {
         status,
         json!({
             "endpoints": {"inbound": 12},
+            "totalEndpoints": 12,
             "exchanges": 34_567,
             "sampleBytes": 1_048_576,
             "pods": 2,
@@ -53,11 +54,33 @@ fn ctl_06_directions_without_endpoints_are_omitted() {
 }
 
 #[test]
+fn shr_06_the_total_is_the_sum_of_the_directions() {
+    let both = discovery(Some(&meta(2, 3)), &pods(&[]), 1000, NOW);
+    assert_eq!(both["endpoints"], json!({"inbound": 2, "outbound": 3}));
+    assert_eq!(both["totalEndpoints"], json!(5));
+    let inbound = discovery(Some(&meta(2, 0)), &pods(&[]), 1000, NOW);
+    assert_eq!(inbound["endpoints"], json!({"inbound": 2}));
+    assert_eq!(inbound["totalEndpoints"], json!(2));
+    let outbound = discovery(Some(&meta(0, 3)), &pods(&[]), 1000, NOW);
+    assert_eq!(outbound["totalEndpoints"], json!(3));
+    let empty = discovery(Some(&meta(0, 0)), &pods(&[]), 1000, NOW);
+    assert_eq!(empty["totalEndpoints"], json!(0));
+    let none = discovery(None, &pods(&[]), 1000, NOW);
+    assert_eq!(none["totalEndpoints"], json!(0));
+}
+
+#[test]
+fn shr_06_the_total_does_not_overflow() {
+    let status = discovery(Some(&meta(u64::MAX, 1)), &pods(&[]), 1000, NOW);
+    assert_eq!(status["totalEndpoints"], json!(u64::MAX));
+}
+
+#[test]
 fn ctl_06_without_data_the_counts_are_zero_and_last_push_is_absent() {
     let status = discovery(None, &pods(&[0, 5]), 300_000, NOW);
     assert_eq!(
         status,
-        json!({"endpoints": {}, "exchanges": 0, "sampleBytes": 0, "pods": 0})
+        json!({"endpoints": {}, "totalEndpoints": 0, "exchanges": 0, "sampleBytes": 0, "pods": 0})
     );
     assert!(status.get("lastPushTime").is_none());
 }
