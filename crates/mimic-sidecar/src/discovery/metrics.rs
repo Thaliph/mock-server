@@ -61,13 +61,21 @@ pub struct DiscoveryMetrics {
     tunnels: Family<TunnelLabels, Counter>,
     sample_bytes: Gauge,
     pushes: Family<ResultLabel, Counter>,
+    outbound_dropped: Counter,
     last_push: Gauge,
 }
 
 impl DiscoveryMetrics {
     pub fn register(&self, metrics: &mut Metrics) {
         // Every series exists from the start, at 0.
-        for result in ["ok", "duplicate", "too_large", "rejected", "error"] {
+        for result in [
+            "ok",
+            "duplicate",
+            "too_large",
+            "rejected",
+            "error",
+            "inbound_only",
+        ] {
             let _ = self.pushes.get_or_create(&ResultLabel { result });
         }
         let registry = metrics.registry_mut();
@@ -115,6 +123,11 @@ impl DiscoveryMetrics {
             "discovery_pushes",
             "Settled or failed report push attempts, by result",
             self.pushes.clone(),
+        );
+        registry.register(
+            "discovery_outbound_dropped",
+            "Outbound parts dropped by the inbound-only fallback after an attempt with an unknown outcome",
+            self.outbound_dropped.clone(),
         );
         registry.register_with_unit(
             "discovery_last_push_timestamp",
@@ -179,6 +192,10 @@ impl DiscoveryMetrics {
 
     pub(super) fn push(&self, result: &'static str) {
         self.pushes.get_or_create(&ResultLabel { result }).inc();
+    }
+
+    pub(super) fn outbound_dropped(&self) {
+        self.outbound_dropped.inc();
     }
 
     pub(super) fn set_last_push(&self, unix_seconds: u64) {

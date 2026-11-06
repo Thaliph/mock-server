@@ -1799,7 +1799,7 @@ docker rm -f "$CHROME" >/dev/null 2>&1 || true
 # --- Egress discovery (F7, spec §6.1, §12.8 EGR-19) -----------------------------------------------------------------------
 # A second front, injected, in its own namespace: its sidecar records A's calls to B (users, disc-22). It runs after
 # CTL-20 and CTL-21, whose counts of users it would change.
-log "egr_19: the sidecar of an injected front records its calls to users as outbound discovery, redacted, and pushes inbound only"
+log "egr_19: the sidecar of an injected front records its calls to users as outbound discovery, redacted, and pushes both directions"
 ns_fresh egr-19 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
 kubectl -n egr-19 create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py >/dev/null
 kubectl -n egr-19 apply -f scripts/e2e/apps/front-injected.yaml >/dev/null
@@ -1890,23 +1890,30 @@ done
 sidecar_get egr-19 "$egr_pod" /metrics > "$egr_metrics"
 [[ -s $egr_metrics ]] || fail "egr_19: cannot read the metrics of the sidecar of front"
 
-egr_check_outbound() {
-  sidecar_get egr-19 "$egr_pod" /discovery > "$egr_report"
-  [[ -s $egr_report ]] || fail "egr_19: cannot read /discovery of the sidecar of front"
-  # The outbound part is neither shipped nor reset by a push: all three canaries are checked against it, and the
-  # bearer token and the password against the whole report (the inbound X-Tenant-Key of an unlisted header is the
-  # accepted limit of spec §11.1).
-  jq -e '.scopes.outbound | type == "object"' "$egr_report" >/dev/null || fail "egr_19: /discovery of front has no scopes.outbound"
-  jq '.scopes.outbound' "$egr_report" > "$WORK/egr19-outbound.json"
+# Canaries in a report ($1, named $2): all three are checked against its outbound part, the bearer token and the
+# password against the whole report (the inbound X-Tenant-Key of an unlisted header is the accepted limit of §11.1).
+egr_check_canaries() {
+  jq '.scopes.outbound // {}' "$1" > "$WORK/egr19-outbound.json"
   local c
   for c in "${egr_canaries[@]}"; do
-    if found -F "$c" "$WORK/egr19-outbound.json"; then fail "egr_19: a canary appears in scopes.outbound of front"; fi
+    if found -F "$c" "$WORK/egr19-outbound.json"; then fail "egr_19: a canary appears in scopes.outbound of $2"; fi
   done
   for c in "$egr_token" "$egr_secret"; do
-    if found -F "$c" "$egr_report"; then fail "egr_19: the bearer token or the password appears in /discovery of front"; fi
+    if found -F "$c" "$1"; then fail "egr_19: the bearer token or the password appears in $2"; fi
   done
+}
+# /discovery holds only what the sidecar has not shipped yet (SHR-19): it is checked for canaries only.
+egr_check_discovery() {
+  sidecar_get egr-19 "$egr_pod" /discovery > "$egr_report"
+  [[ -s $egr_report ]] || fail "egr_19: cannot read /discovery of the sidecar of front"
+  egr_check_canaries "$egr_report" "/discovery of front"
+}
+# The outbound endpoints, counts, histograms, origin and samples of a report ($1): the merged report from F8.
+egr_check_outbound() {
+  local egr_report=$1
+  jq -e '.scopes.outbound | type == "object"' "$egr_report" >/dev/null || fail "egr_19: the merged report of front has no scopes.outbound"
   jq -e --arg a "$egr_authority" '.scopes.outbound[$a] | type == "object"' "$egr_report" >/dev/null \
-    || fail "egr_19: no scopes.outbound.\"$egr_authority\" in /discovery of front"
+    || fail "egr_19: no scopes.outbound.\"$egr_authority\" in the merged report of front"
   jq -e '(.scopes.outbound | keys) | length == 1' "$egr_report" >/dev/null \
     || fail "egr_19: front has outbound scopes other than users: $(jq -c '.scopes.outbound | keys' "$egr_report")"
   [[ $(endpoints "$egr_report" | jq -r --arg a "$egr_authority" '.[] | select(.direction == "outbound") | select(.port == $a) | "\(.method) \(.template)"' | sort | tr '\n' ';') \
@@ -1939,31 +1946,32 @@ egr_check_outbound() {
   endpoints "$egr_report" | jq -e '.[] | select(.direction == "outbound" and .method == "PUT" and .template == "/users/{users_id}")
     | select((.stats.samples | length) > 0)' >/dev/null || fail "egr_19: the outbound PUT has no sample"
 }
-egr_check_outbound
+egr_check_discovery
 [[ $(awk 'index($0, "mimic_discovery_authorities ") == 1 { printf "%d\n", $2 }' "$egr_metrics" | tail -1) == 1 ]] \
   || fail "egr_19: mimic_discovery_authorities is not 1 on front"
 [[ $(awk 'index($0, "mimic_discovery_exchanges_total{direction=\"outbound\"") == 1 { n += $2 } END { printf "%d\n", n }' "$egr_metrics") == 17 ]] \
   || fail "egr_19: the outbound exchanges of front do not sum to 17"
 
-# Pushes stay inbound only (F7): the controller's merged report of front holds inbound endpoints and nothing else,
-# once a push that follows the calls arrived; the outbound part is still in the sidecar afterwards (never reset).
+# Pushes carry both directions (F8, SHR-19): the controller's merged report of front holds the 12 inbound GETs and
+# the 17 outbound exchanges once the pushes that follow the calls arrived; the sidecar resets what it shipped.
 ui_forward
 egr_merged="$WORK/egr19-merged.json"
 egr_merged_get() {
   curl -fs --max-time 10 localhost:18082/v1/workloads/egr-19/front/report > "$egr_merged" 2>/dev/null || return 1
-  endpoints "$egr_merged" | jq -e '[.[] | select(.direction == "inbound" and .method == "GET" and (.template | startswith("/front/users/"))) | .stats.statuses["200"] // 0] | add == 12' >/dev/null
+  endpoints "$egr_merged" | jq -e '[.[] | select(.direction == "inbound" and .method == "GET" and (.template | startswith("/front/users/"))) | .stats.statuses["200"] // 0] | add == 12' >/dev/null \
+    && jq -e --arg a "$egr_authority" '.scopes.outbound[$a].origin.schemes.http == 17' "$egr_merged" >/dev/null
 }
 egr_pushed=0
 for _ in $(seq 60); do
   if egr_merged_get; then egr_pushed=1; break; fi
   sleep 3
 done
-(( egr_pushed )) || fail "egr_19: the controller holds no report of front with its 12 inbound GETs after 180 s"
-jq -e '.version == 1 and ((.scopes | keys) == ["inbound"])' "$egr_merged" >/dev/null \
-  || fail "egr_19: the merged report of front is not version 1 with inbound scopes only: $(jq -c '[.version, (.scopes | keys)]' "$egr_merged")"
-[[ $(endpoints "$egr_merged" | jq -r '[.[] | select(.direction == "outbound")] | length') == 0 ]] \
-  || fail "egr_19: the merged report of front holds outbound endpoints"
-egr_check_outbound
+(( egr_pushed )) || fail "egr_19: the controller holds no report of front with its 12 inbound GETs and 17 outbound exchanges after 180 s"
+jq -e '.version == 2 and ((.scopes | keys) == ["inbound", "outbound"])' "$egr_merged" >/dev/null \
+  || fail "egr_19: the merged report of front is not version 2 with inbound and outbound scopes: $(jq -c '[.version, (.scopes | keys)]' "$egr_merged")"
+egr_check_outbound "$egr_merged"
+egr_check_canaries "$egr_merged" "the merged report of front"
+egr_check_discovery
 
 # No canary where the outbound view or the stdout rules apply: scopes.outbound (checked above, before and after the
 # push), /metrics, the stdout of front (app and sidecar) and B's logs hold none of the three. The inbound parts (the
