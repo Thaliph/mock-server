@@ -512,6 +512,19 @@ impl Store {
         answer.await.unwrap_or(Err(StoreError::Unavailable))
     }
 
+    /// Test hook: holds every writer slot, so that no write starts until the guard drops.
+    #[cfg(test)]
+    pub(crate) async fn hold_writers(&self) -> tokio::sync::SemaphorePermit<'_> {
+        let slots = u32::try_from(MAX_WRITERS).expect("a small count");
+        self.writers.acquire_many(slots).await.expect("open")
+    }
+
+    /// Test hook: the pushes waiting for a write.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        lock(&self.queues).values().map(Vec::len).sum()
+    }
+
     /// The deployment's writer: one write per batch of queued pushes until none is left.
     async fn drain(self: Arc<Self>, key: (String, String), keys: Keys) {
         loop {
