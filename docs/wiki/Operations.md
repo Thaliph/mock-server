@@ -69,7 +69,8 @@ pod on the controller.
 | `mimic_store_expired_total` | counter | `kind` |
 | `mimic_status_updates_total` | counter | `result` (`ok`, `error`) (F5 status) |
 | `mimic_ui_requests_total` | counter | `route` (route pattern or `other`), `code` (read API and UI listener) |
-| `mimic_ui_render_duration_seconds` | histogram | none (parse and render of an OpenAPI document) |
+| `mimic_ui_render_duration_seconds` | histogram | `route` (parse and render of a stored report for `endpoints`, `openapi` and a document) |
+| `mimic_ui_skipped_total` | counter | `reason` (`meta-unreadable`: a list entry left out) |
 
 Webhook metrics (controller):
 
@@ -97,10 +98,12 @@ Starting alerts (tune to taste):
 The UI is on the read API listener (`MIMIC_UI_ADDR`, loopback of each controller pod): reach it with
 `kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080` and open
 `http://localhost:8080/ui/`. Same access rule as the read API: whoever may use `pods/portforward` in
-the release namespace sees every namespace's discovered data. A render parses the stored report on a
-blocking thread, at most 2 at once per replica; the others wait. No log line is written per request.
-Rising `mimic_ui_requests_total{code="500"}` or `{code="503"}` means a stored value that does not
-parse or Valkey unavailable (see [Troubleshooting](Troubleshooting)).
+the release namespace sees every namespace's discovered data. A render (the `endpoints` and
+`openapi` routes) parses the stored report on a blocking thread, at most 2 at once per replica; the
+others wait, and the list, workload and report routes are not held up by them. No log line is written per request.
+`mimic_ui_skipped_total{reason="meta-unreadable"}` counts list entries left out because their
+`:meta` does not parse (also logged). Rising `mimic_ui_requests_total{code="500"}` or `{code="503"}`
+means a stored value that does not parse or Valkey unavailable (see [Troubleshooting](Troubleshooting)).
 
 ## Logs
 
@@ -152,7 +155,7 @@ Key messages:
 | What | Default | Guidance |
 |---|---|---|
 | Valkey memory limit | `1Gi` (`maxmemory` 768Mi) | Watch `mimic_store_report_bytes` and Valkey `used_memory`. A deployment's report is bounded by the store limits (512 endpoints per direction, 4Mi of samples); up to 50 deployments per namespace. Raise `valkey.resources.limits.memory` for many deployments. |
-| Valkey PVC | `4Gi` | AOF rewrites need about twice the data. |
+| Valkey PVC | `4Gi` | At least twice `maxmemory`, see [AOF rewrites](#aof-rewrites-and-sizing). |
 | Controller memory limit | `512Mi` | Two deployment-report writes at once plus 64Mi of push bodies. |
 | Sidecar memory limit | `128Mi` | Samples up to 16Mi, capture up to 8Mi, plus proxy state. Raise `inject.sidecarResources.limits.memory` for many endpoints or connections. |
 | Connections | 16384 per direction per sidecar | Further ones wait in the accept backlog; never refused. |
@@ -176,6 +179,7 @@ Pushes go every 30 s per pod, so controller load grows with pods, not traffic.
   ```
 
   (`REDISCLI_AUTH` is set in the container, so `valkey-cli` authenticates.)
+
 - **Reset.** The store only holds discovery data; it is safe to delete. All mimic keys start with
   `mimic:v1:`. One deployment:
 
@@ -195,6 +199,21 @@ Pushes go every 30 s per pod, so controller load grows with pods, not traffic.
   the same scan with pattern `mimic:v1:*`. Sidecars rebuild from new traffic; counters restart from
   zero. Standalone Valkey 9.0 or later is required; cluster mode is not supported.
 
+### AOF rewrites and sizing
+
+Valkey rewrites the AOF in a forked child while the old file is still in use, so a rewrite briefly
+needs both on disk, and copy-on-write pages in memory for what changes meanwhile. The rules:
+
+- **Volume:** `valkey.persistence.size` at least twice `maxmemory`, that is **1.5 times
+  `valkey.resources.limits.memory`** (`maxmemory` is 75 % of the limit). The defaults (`1Gi`
+  limit, `768Mi` `maxmemory`, `4Gi` volume) leave a margin of 2.5Gi; a limit above about 2.67Gi needs a
+  larger volume, and the volume is immutable after install
+  ([Install](Install#known-issue-upgrading-a-chart-installed-from-an-earlier-main-build-293)).
+  A full volume stops the rewrite and then the appends, and pushes get `503`.
+- **Memory:** the 25 % of the limit above `maxmemory` (`256Mi` by default) is the headroom of the
+  child's copy-on-write pages and buffers. Pushes arrive every 30 s per pod, so few pages change
+  during a rewrite, but with a store near `maxmemory` watch `used_memory` and the container's
+  working set; if a rewrite is OOM-killed, raise the memory limit (and the volume with it).
 ## Retention
 
 Data of a deployment expires `MIMIC_STORE_TTL` (30 days) after its last applied push; endpoints and

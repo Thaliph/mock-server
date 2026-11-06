@@ -1322,7 +1322,8 @@ logic in `mimic-core` (`discovery` module).
 - **Observability (F6)**: `mimic_ui_requests_total{route,code}` (`route` is the route pattern,
   e.g. `/v1/workloads/{namespace}/{deployment}/openapi/{id}`, or `other`; `code` the status
   code) and `mimic_ui_render_duration_seconds` (histogram of parse + render, buckets as
-  `mimic_store_write_duration_seconds`). No line is written per request; no line or series
+  `mimic_store_write_duration_seconds`) and `mimic_ui_skipped_total{reason}` (list entries
+  skipped because their `:meta` is unreadable, one per entry per list read). No line is written per request; no line or series
   holds a path, template or report content.
 - Consumers: F8 adds outbound documents (§7.6) with no new route; F9 adds an
   authenticated read of a sidecar's own deployment on the sidecar API (§7.2) for egress
@@ -1476,6 +1477,7 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
   | `mimic_store_expired_total` | counter, endpoints and samples dropped by retention | `kind` |
   | `mimic_status_updates_total` | counter, `MimicWorkload` status applies | `result` (`ok`, `error`) |
 | `mimic_ui_requests_total` | counter (F6), answers of the UI listener (§7.5) | `route` (route pattern or `other`), `code` |
+| `mimic_ui_skipped_total` | counter, `/v1/workloads` entries left out of the list (§7.5) | `reason` (`meta-unreadable`: the `:meta` of the deployment does not parse; also logged) |
 | `mimic_ui_render_duration_seconds` | histogram (F6), parse and render of a stored report for `endpoints`, `openapi` and a document; buckets as `mimic_store_write_duration_seconds` | `route` |
 
   `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
