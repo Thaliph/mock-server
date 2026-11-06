@@ -97,7 +97,8 @@ pub(super) struct Recorder {
     /// Likewise for the egress report.
     egress_known: BTreeSet<Key>,
     sample_budget_full: bool,
-    endpoint_limit_logged: bool,
+    /// The directions whose limit was logged: each logs it once.
+    endpoint_limit_logged: BTreeSet<&'static str>,
     authority_limit_logged: bool,
     sample_bytes: usize,
 }
@@ -276,7 +277,7 @@ impl Recorder {
             known: BTreeSet::new(),
             egress_known: BTreeSet::new(),
             sample_budget_full: false,
-            endpoint_limit_logged: false,
+            endpoint_limit_logged: BTreeSet::new(),
             authority_limit_logged: false,
             sample_bytes: 0,
         }
@@ -396,13 +397,14 @@ impl Recorder {
         } else {
             let mut report = self.report.lock().unwrap_or_else(PoisonError::into_inner);
             // Read under the lock, where the shipper writes them: the pending report's samples
-            // share the budget.
+            // and the egress report's (at most half of the budget) share the budget.
             let epoch = self.handoff.epoch.load(Ordering::Acquire);
             let limits = Limits {
                 sample_budget: self
                     .limits
                     .sample_budget
-                    .saturating_sub(self.handoff.pending_samples.load(Ordering::Acquire)),
+                    .saturating_sub(self.handoff.pending_samples.load(Ordering::Acquire))
+                    .saturating_sub(self.handoff.egress_samples.load(Ordering::Acquire)),
                 ..self.limits
             };
             let outcome = report.record(&limits, &self.redactor, &exchange);
@@ -433,8 +435,7 @@ impl Recorder {
             }
             Outcome::EndpointLimit => {
                 self.metrics.exchange(direction, "endpoint_limit");
-                if !self.endpoint_limit_logged {
-                    self.endpoint_limit_logged = true;
+                if self.endpoint_limit_logged.insert(direction) {
                     tracing::warn!(
                         target: "discovery",
                         direction,
