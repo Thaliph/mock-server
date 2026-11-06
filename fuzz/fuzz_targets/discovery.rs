@@ -34,6 +34,7 @@ const LIMITS: Limits = Limits {
     max_literals: 4,
     max_endpoints: 16,
     sample_budget: 256 * 1024,
+    max_authorities: 8,
 };
 /// Endpoints per direction accepted from a push.
 const PUSH: usize = 16;
