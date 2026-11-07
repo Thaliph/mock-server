@@ -49,7 +49,10 @@ fn ldt_12_open_model_sends_the_rate_over_both_targets() {
         for seen in target.state.seen.lock().unwrap().iter() {
             assert_eq!(seen.headers["mimic-load-run"], TICKET);
             assert_eq!(seen.headers["x-keep"], "same");
-            assert_eq!(seen.headers["host"], format!("{}:{REQUEST_PORT}", target.ip));
+            assert_eq!(
+                seen.headers["host"],
+                format!("{}:{REQUEST_PORT}", target.ip)
+            );
             let key = &seen.headers["idempotency-key"];
             assert_eq!(key.len(), 36, "{key}");
             for (i, c) in key.chars().enumerate() {
@@ -63,9 +66,19 @@ fn ldt_12_open_model_sends_the_rate_over_both_targets() {
         }
         // Keep-alive: far fewer connections than requests, each one probed first.
         assert!(target.accepted() <= 60, "{} connections", target.accepted());
-        assert!(target.state.probes.load(std::sync::atomic::Ordering::SeqCst) >= target.accepted());
+        assert!(
+            target
+                .state
+                .probes
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= target.accepted()
+        );
     }
-    assert!(keys.len() * 100 >= total * 99, "{} distinct of {total}", keys.len());
+    assert!(
+        keys.len() * 100 >= total * 99,
+        "{} distinct of {total}",
+        keys.len()
+    );
 
     let posts = rig.state().posts();
     assert!(posts.len() >= 8, "{} posts", posts.len());
@@ -109,10 +122,8 @@ fn ldt_12_closed_model_never_has_more_requests_in_flight_than_the_concurrency() 
 fn credentials_plan() -> Plan {
     let mut plan = simple_plan();
     plan.credentials = vec![credential("header/authorization", "token")];
-    plan.endpoints[0].samples[0].headers = vec![(
-        "authorization".to_string(),
-        "Bearer <redacted>".to_string(),
-    )];
+    plan.endpoints[0].samples[0].headers =
+        vec![("authorization".to_string(), "Bearer <redacted>".to_string())];
     plan
 }
 
@@ -163,7 +174,11 @@ fn ldt_12_unverified_targets_receive_no_connection() {
 fn ldt_12_without_a_verified_target_the_run_ends_with_no_targets() {
     let mut params = Params::closed(4, 30_000);
     params.start_timeout_ms = 2_000;
-    let rig = Rig::new(&simple_plan(), &params, &[Probe::Discovery, Probe::NotFound]);
+    let rig = Rig::new(
+        &simple_plan(),
+        &params,
+        &[Probe::Discovery, Probe::NotFound],
+    );
     let mut generator = rig.spawn("1s", &[]);
     let status = generator.wait_exit(Duration::from_secs(20));
     assert_eq!(status.code(), Some(1));

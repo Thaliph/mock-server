@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Two images (spec §10), both distroless, non-root by default, no shell:
-#   - `mimic` (default target): mimic-sidecar, mimic-controller and the static mimic-trust.
+#   - `mimic` (default target): mimic-sidecar, mimic-controller, mimic-load and the static mimic-trust.
 #   - `mimic-init` (--target init): mimic-init plus iptables-restore and ip6tables-restore
 #     (nft backend) and the libraries they load. The pod runs it as UID 0 with NET_ADMIN/NET_RAW.
 # Base images are pinned by digest; Dependabot keeps them current.
@@ -25,10 +25,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       *) echo "unsupported TARGETARCH '$TARGETARCH'" >&2; exit 1 ;; \
     esac; \
     rustup target add "$triple"; \
-    cargo build --release --locked --bin mimic-sidecar --bin mimic-controller --bin mimic-init; \
+    cargo build --release --locked --bin mimic-sidecar --bin mimic-controller --bin mimic-load --bin mimic-init; \
     cargo build --release --locked --target "$triple" --package mimic-trust --bin mimic-trust; \
     mkdir /out /out-init; \
-    cp target/release/mimic-sidecar target/release/mimic-controller /out/; \
+    cp target/release/mimic-sidecar target/release/mimic-controller target/release/mimic-load /out/; \
     cp "target/$triple/release/mimic-trust" /out/; \
     cp target/release/mimic-init /out-init/
 

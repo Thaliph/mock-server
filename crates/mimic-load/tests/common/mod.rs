@@ -186,10 +186,7 @@ impl ApiState {
     }
 
     pub fn final_post(&self) -> Option<Value> {
-        self.posts()
-            .into_iter()
-            .rev()
-            .find(|p| p["final"] == true)
+        self.posts().into_iter().rev().find(|p| p["final"] == true)
     }
 
     pub fn set_targets(&self, targets: &[Target]) {
@@ -281,7 +278,11 @@ async fn api_route(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    state.authorizations.lock().unwrap().push(authorization.clone());
+    state
+        .authorizations
+        .lock()
+        .unwrap()
+        .push(authorization.clone());
     let path = req.uri().path().to_string();
     let method = req.method().clone();
     let raw = req.into_body().collect().await.map(|b| b.to_bytes());
@@ -492,7 +493,11 @@ async fn request_answer(state: &TargetState, req: Request<Incoming>) -> Response
     let current = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     state.max_in_flight.fetch_max(current, Ordering::SeqCst);
     let (parts, body) = req.into_parts();
-    let body = body.collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let body = body
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
     let keep = state.keep_bodies.load(Ordering::SeqCst);
     state.seen.lock().unwrap().push(Seen {
         at: now,

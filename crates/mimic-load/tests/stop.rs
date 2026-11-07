@@ -85,7 +85,12 @@ fn ldt_13_sigterm_posts_the_final_results_within_the_grace_period() {
     generator.wait_exit(Duration::from_secs(4));
     assert!(sent.elapsed() <= Duration::from_secs(3) + Duration::from_millis(500));
     let post = rig.state().final_post().expect("a final post");
-    assert!(post["results"]["endpoints"][0]["requests"].as_u64().unwrap() > 0);
+    assert!(
+        post["results"]["endpoints"][0]["requests"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     generator.wait_log(Duration::from_secs(1), |v| {
         v["message"] == "shutdown complete"
     });
@@ -102,8 +107,12 @@ fn ldt_13_without_the_controller_for_three_intervals_the_generator_stops() {
     rig.state().down.store(true, Ordering::SeqCst);
     let status = generator.wait_exit(Duration::from_secs(15));
     assert_eq!(status.code(), Some(1));
-    // Three intervals of silence, and a little more for the loop to notice.
-    assert!(down.elapsed() >= Duration::from_secs(3), "{:?}", down.elapsed());
+    // Three intervals since the last answer, which came up to one interval before the outage.
+    assert!(
+        down.elapsed() >= Duration::from_secs(2),
+        "{:?}",
+        down.elapsed()
+    );
     silent_after(&rig, down, Duration::from_secs(6));
 }
 
