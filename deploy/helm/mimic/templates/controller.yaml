@@ -84,6 +84,9 @@ spec:
               value: {{ .Values.controller.status.interval | quote }}
             - name: MIMIC_STATUS_POD_WINDOW
               value: {{ .Values.controller.status.podWindow | quote }}
+            # Load test runs active at once in the cluster (spec §10.2): 0 disables load tests.
+            - name: MIMIC_LOAD_MAX_RUNS
+              value: {{ ternary "4" "0" .Values.loadTest.enabled | quote }}
             - name: MIMIC_INJECT_SIDECAR_IMAGE
               value: {{ include "mimic.image" . | quote }}
             - name: MIMIC_INJECT_INIT_IMAGE

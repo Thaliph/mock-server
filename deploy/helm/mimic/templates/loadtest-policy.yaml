@@ -1,0 +1,259 @@
+{{- if .Values.loadTest.enabled }}
+{{- if not .Values.image.digest }}
+{{- fail "loadTest.enabled needs image.digest: the load test policies pin the mimic image by digest (spec §11)" }}
+{{- end }}
+{{- $dns := .Values.loadTest.dnsSelector }}
+{{- $controller := printf "{\"app.kubernetes.io/instance\": %q, \"app.kubernetes.io/name\": \"mimic-controller\"}" .Release.Name }}
+{{- $controllerPeer := printf "[{\"namespaceSelector\": {\"matchLabels\": {\"kubernetes.io/metadata.name\": %q}}, \"podSelector\": {\"matchLabels\": %s}}]" .Release.Namespace $controller }}
+{{- $dnsPeer := printf "[{\"namespaceSelector\": {\"matchLabels\": {\"kubernetes.io/metadata.name\": %q}}, \"podSelector\": {\"matchLabels\": %s}}]" $dns.namespace (toJson $dns.podLabels) }}
+{{- $ingressCheck := "variables.ingress == []" }}
+{{- if .Values.loadTest.metricsFrom }}
+{{- $ingressCheck = printf "size(variables.ingress) == 1 && has(variables.ingress[0].from) && variables.ingress[0].from == %s && has(variables.ingress[0].ports) && size(variables.ingress[0].ports) == 1 && variables.ingress[0].ports[0].port == 15100 && (!has(variables.ingress[0].ports[0].protocol) || variables.ingress[0].ports[0].protocol == 'TCP')" (toJson .Values.loadTest.metricsFrom) }}
+{{- end }}
+# The admission policies of the load test (spec §7.8, §11, LDT-06, LDT-17). Both bind to the
+# objects only: the Job and NetworkPolicy policy matches the controller's account alone, so a
+# Job of any other user is not its business; the MimicLoadTest policy checks the author of every
+# create and update, whoever it is. Messages name the field that refused the object.
+#
+# Job and NetworkPolicy: the controller may create only the generator's shape, in a namespace the
+# webhook already injects. The image is the chart's mimic image by digest (never a tag).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ .Release.Name }}-load-job
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [batch]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [jobs]
+      - apiGroups: [networking.k8s.io]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [networkpolicies]
+  matchConditions:
+    - name: controller-service-account
+      expression: 'request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-controller"'
+  variables:
+    - name: isJob
+      expression: 'request.resource.resource == "jobs"'
+    - name: isPolicy
+      expression: 'request.resource.resource == "networkpolicies"'
+    - name: labels
+      expression: 'has(object.metadata.labels) ? object.metadata.labels : dyn({})'
+    - name: namespaceLabels
+      expression: 'has(namespaceObject.metadata.labels) ? namespaceObject.metadata.labels : dyn({})'
+    # Jobs only: the lazy variables below are evaluated only behind `!variables.isJob ||`.
+    - name: pod
+      expression: 'object.spec.template.spec'
+    - name: podLabels
+      expression: 'has(object.spec.template.metadata.labels) ? object.spec.template.metadata.labels : dyn({})'
+    - name: container
+      expression: 'variables.pod.containers[0]'
+    - name: sc
+      expression: 'has(variables.container.securityContext) ? variables.container.securityContext : dyn({})'
+    - name: psc
+      expression: 'has(variables.pod.securityContext) ? variables.pod.securityContext : dyn({})'
+    - name: volumes
+      expression: 'has(variables.pod.volumes) ? variables.pod.volumes : []'
+    - name: secrets
+      expression: 'variables.volumes.filter(v, has(v.secret))'
+    - name: projected
+      expression: 'variables.volumes.filter(v, has(v.projected))'
+    # NetworkPolicy only.
+    - name: egress
+      expression: 'has(object.spec.egress) ? object.spec.egress : []'
+    - name: ingress
+      expression: 'has(object.spec.ingress) ? object.spec.ingress : []'
+  validations:
+    # Both kinds.
+    - expression: >-
+        'mimic.platform.io/inject' in variables.namespaceLabels
+        && variables.namespaceLabels['mimic.platform.io/inject'] in ['enabled', 'selected']
+      message: "the namespace must have mimic.platform.io/inject enabled or selected (spec §7.1)"
+    - expression: >-
+        'app.kubernetes.io/managed-by' in variables.labels
+        && variables.labels['app.kubernetes.io/managed-by'] == 'mimic'
+        && 'mimic.platform.io/load-test' in variables.labels
+      message: "metadata labels must be those of spec 7.8: managed-by mimic and mimic.platform.io/load-test"
+    # Jobs.
+    - expression: >-
+        !variables.isJob || (
+        'mimic.platform.io/inject' in variables.podLabels
+        && variables.podLabels['mimic.platform.io/inject'] == 'disabled'
+        && 'app.kubernetes.io/managed-by' in variables.podLabels
+        && variables.podLabels['app.kubernetes.io/managed-by'] == 'mimic'
+        && 'mimic.platform.io/load-test' in variables.podLabels)
+      message: "load job: pod labels must be those of spec 7.8, and mimic.platform.io/inject disabled"
+    - expression: '!variables.isJob || size(variables.pod.containers) == 1'
+      message: "load job: exactly one container"
+    - expression: >-
+        !variables.isJob || (
+        (!has(variables.pod.initContainers) || size(variables.pod.initContainers) == 0)
+        && (!has(variables.pod.ephemeralContainers) || size(variables.pod.ephemeralContainers) == 0))
+      message: "load job: no init or ephemeral container"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && variables.container.image == "{{ include "mimic.image" . }}")'
+      message: "load job: image must be the mimic image of the chart, by digest"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && variables.container.command == ["/usr/local/bin/mimic-load"])'
+      message: "load job: command must be [/usr/local/bin/mimic-load]"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && !has(variables.container.args))'
+      message: "load job: args must be absent"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (!has(variables.container.env) || variables.container.env.all(e, !has(e.valueFrom))))'
+      message: "load job: env must hold literal values, no valueFrom"
+    - expression: >-
+        !variables.isJob || (size(variables.pod.containers) == 1 && (!has(variables.container.env)
+        || variables.container.env.all(e, e.name in ['MIMIC_LOAD_RUN', 'MIMIC_LOAD_DEPLOYMENT', 'MIMIC_CONTROLLER_URL', 'MIMIC_CONTROLLER_CA', 'MIMIC_LOAD_TOKEN_FILE', 'MIMIC_LOAD_CREDENTIALS_DIR', 'MIMIC_LOAD_REPORT_INTERVAL', 'MIMIC_LOAD_MAX_PLAN'])))
+      message: "load job: env names of spec 10.6 only"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (!has(variables.container.envFrom) || size(variables.container.envFrom) == 0))'
+      message: "load job: envFrom must be absent"
+    - expression: '!variables.isJob || (has(variables.pod.automountServiceAccountToken) && variables.pod.automountServiceAccountToken == false)'
+      message: "load job: automountServiceAccountToken must be false"
+    - expression: '!variables.isJob || (has(variables.pod.serviceAccountName) ? variables.pod.serviceAccountName : "default") == "default"'
+      message: "load job: serviceAccountName must be default"
+    - expression: '!variables.isJob || (variables.volumes.all(v, has(v.projected) || has(v.secret)) && size(variables.projected) == 1)'
+      message: "load job: volumes must be the projected token and at most one Secret"
+    - expression: '!variables.isJob || size(variables.secrets) <= 1'
+      message: "load job: at most one Secret volume"
+    - expression: '!variables.isJob || variables.projected.all(v, size(v.projected.sources) == 1)'
+      message: "load job: the projected volume must hold one serviceAccountToken source"
+    - expression: >-
+        !variables.isJob || variables.projected.all(v, size(v.projected.sources) == 1
+        && has(v.projected.sources[0].serviceAccountToken)
+        && has(v.projected.sources[0].serviceAccountToken.audience)
+        && v.projected.sources[0].serviceAccountToken.audience == 'mimic.platform.io/load')
+      message: "load job: audience must be mimic.platform.io/load"
+    - expression: >-
+        !variables.isJob || variables.projected.all(v, size(v.projected.sources) == 1
+        && has(v.projected.sources[0].serviceAccountToken)
+        && has(v.projected.sources[0].serviceAccountToken.expirationSeconds)
+        && v.projected.sources[0].serviceAccountToken.expirationSeconds <= 600)
+      message: "load job: expirationSeconds must be at most 600"
+    - expression: >-
+        !variables.isJob || size(variables.secrets) == 0 || (size(variables.pod.containers) == 1
+        && has(variables.container.volumeMounts)
+        && variables.container.volumeMounts.exists(m, m.name == variables.secrets[0].name && m.mountPath == '/mimic/credentials'))
+      message: "load job: the Secret volume must be mounted at /mimic/credentials"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (!has(variables.container.volumeMounts) || variables.container.volumeMounts.all(m, has(m.readOnly) && m.readOnly == true)))'
+      message: "load job: every volume mount must be read-only"
+    - expression: '!variables.isJob || (!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false)'
+      message: "load job: hostNetwork must be absent or false"
+    - expression: '!variables.isJob || (!has(variables.pod.hostPID) || variables.pod.hostPID == false)'
+      message: "load job: hostPID must be absent or false"
+    - expression: '!variables.isJob || (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false)'
+      message: "load job: hostIPC must be absent or false"
+    - expression: '!variables.isJob || (!has(variables.pod.hostUsers) || variables.pod.hostUsers == false)'
+      message: "load job: hostUsers must be absent or false"
+    - expression: '!variables.isJob || (!has(variables.pod.shareProcessNamespace) || variables.pod.shareProcessNamespace == false)'
+      message: "load job: shareProcessNamespace must be absent or false"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (!has(variables.container.ports) || variables.container.ports.all(p, !has(p.hostPort) || p.hostPort == 0)))'
+      message: "load job: hostPort must be absent"
+    - expression: '!variables.isJob || (!has(variables.pod.nodeName) || variables.pod.nodeName == "")'
+      message: "load job: nodeName must be absent"
+    - expression: '!variables.isJob || (!has(variables.pod.tolerations) || size(variables.pod.tolerations) == 0)'
+      message: "load job: tolerations must be absent"
+    - expression: '!variables.isJob || (!has(variables.pod.hostAliases) || size(variables.pod.hostAliases) == 0)'
+      message: "load job: hostAliases must be absent"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (has(variables.sc.runAsUser) ? variables.sc.runAsUser : (has(variables.psc.runAsUser) ? variables.psc.runAsUser : 0)) == 65532)'
+      message: "load job: the container must run as UID 65532"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (has(variables.sc.runAsNonRoot) ? variables.sc.runAsNonRoot : (has(variables.psc.runAsNonRoot) ? variables.psc.runAsNonRoot : false)) == true)'
+      message: "load job: runAsNonRoot must be true"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (!has(variables.sc.privileged) || variables.sc.privileged == false))'
+      message: "load job: privileged must be absent or false"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && has(variables.sc.allowPrivilegeEscalation) && variables.sc.allowPrivilegeEscalation == false)'
+      message: "load job: allowPrivilegeEscalation must be false"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && has(variables.sc.readOnlyRootFilesystem) && variables.sc.readOnlyRootFilesystem == true)'
+      message: "load job: readOnlyRootFilesystem must be true"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && has(variables.sc.capabilities) && has(variables.sc.capabilities.drop) && "ALL" in variables.sc.capabilities.drop && (!has(variables.sc.capabilities.add) || size(variables.sc.capabilities.add) == 0))'
+      message: "load job: capabilities must drop ALL and add none"
+    - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (has(variables.sc.seccompProfile) ? variables.sc.seccompProfile.type : (has(variables.psc.seccompProfile) ? variables.psc.seccompProfile.type : "")) == "RuntimeDefault")'
+      message: "load job: seccompProfile must be RuntimeDefault"
+    # NetworkPolicy: the shape of spec §7.8 (the generator's pods, the deployment, the controller, DNS).
+    - expression: >-
+        !variables.isPolicy || (
+        'mimic.platform.io/load-test' in variables.labels
+        && object.spec.podSelector == {'matchLabels': {'mimic.platform.io/load-test': variables.labels['mimic.platform.io/load-test']}})
+      message: "load networkpolicy: podSelector must select the run's label only"
+    - expression: '!variables.isPolicy || object.spec.policyTypes == ["Ingress", "Egress"]'
+      message: "load networkpolicy: policyTypes must be Ingress and Egress"
+    - expression: >-
+        !variables.isPolicy || ({{ $ingressCheck }})
+      message: "load networkpolicy: ingress must be absent, or the metrics source on the admin port only"
+    - expression: '!variables.isPolicy || size(variables.egress) == 3'
+      message: "load networkpolicy: egress must have three rules: deployment, controller, DNS"
+    - expression: >-
+        !variables.isPolicy || (size(variables.egress) == 3
+        && size(variables.egress[0].to) == 1
+        && has(variables.egress[0].to[0].podSelector)
+        && !has(variables.egress[0].to[0].namespaceSelector)
+        && has(variables.egress[0].to[0].podSelector.matchLabels)
+        && size(variables.egress[0].to[0].podSelector.matchLabels) == 1
+        && 'mimic.platform.io/deployment' in variables.egress[0].to[0].podSelector.matchLabels
+        && has(variables.egress[0].ports)
+        && variables.egress[0].ports.all(p, !has(p.protocol) || p.protocol == 'TCP')
+        && variables.egress[0].ports.exists(p, p.port == 15100))
+      message: "load networkpolicy: egress[0] must be the deployment's pods on TCP ports, 15100 among them"
+    - expression: >-
+        !variables.isPolicy || (size(variables.egress) == 3
+        && has(variables.egress[1].to) && variables.egress[1].to == {{ $controllerPeer }}
+        && has(variables.egress[1].ports) && size(variables.egress[1].ports) == 1
+        && variables.egress[1].ports[0].port == {{ .Values.controller.sidecarApiPort }}
+        && (!has(variables.egress[1].ports[0].protocol) || variables.egress[1].ports[0].protocol == 'TCP'))
+      message: "load networkpolicy: egress[1] must be the controller's sidecar API port"
+    - expression: >-
+        !variables.isPolicy || (size(variables.egress) == 3
+        && has(variables.egress[2].to) && variables.egress[2].to == {{ $dnsPeer }}
+        && has(variables.egress[2].ports) && size(variables.egress[2].ports) == 2
+        && variables.egress[2].ports[0].port == 53 && variables.egress[2].ports[0].protocol == 'UDP'
+        && variables.egress[2].ports[1].port == 53 && variables.egress[2].ports[1].protocol == 'TCP')
+      message: "load networkpolicy: egress[2] must be DNS on UDP and TCP port 53"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ .Release.Name }}-load-job
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  policyName: {{ .Release.Name }}-load-job
+  validationActions: [Deny]
+---
+# MimicLoadTest: the author may create or update one only if the author may get the Secret it
+# names (spec §7.8). The generator reads the Secret, the controller never does.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ .Release.Name }}-load-secret
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [mimic.platform.io]
+        apiVersions: [v1alpha1]
+        operations: [CREATE, UPDATE]
+        resources: [mimicloadtests]
+  variables:
+    - name: secret
+      expression: 'has(object.spec.credentials) ? object.spec.credentials.secretName : ""'
+  validations:
+    - expression: >-
+        variables.secret == ""
+        || authorizer.group('').resource('secrets').namespace(request.namespace).name(variables.secret).check('get').allowed()
+      messageExpression: >-
+        "the requesting user may not get the Secret " + variables.secret + " named in spec.credentials.secretName"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ .Release.Name }}-load-secret
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  policyName: {{ .Release.Name }}-load-secret
+  validationActions: [Deny]
+{{- end }}

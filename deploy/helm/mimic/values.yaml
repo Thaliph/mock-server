@@ -92,6 +92,21 @@ networkPolicy:
   # Empty: any source, since injected pods can be in any namespace. Set it to narrow the port.
   sidecarApiFrom: []
 
+# Load tests of a deployment in mock mode (spec §7.8, F11). Off by default: it adds the
+# MimicLoadTest CRD, Job and EndpointSlice RBAC and two ValidatingAdmissionPolicies. Needs image.digest:
+# the policies pin the mimic image by digest.
+loadTest:
+  enabled: false
+  # NetworkPolicy of each generator pod (spec §7.8): egress only to the deployment, the controller and DNS.
+  # A CNI without NetworkPolicy support ignores it (spec §11.1).
+  networkPolicy: true
+  # NetworkPolicy peers allowed to scrape the generator's admin port (15100). Empty: none.
+  metricsFrom: []
+  # DNS of the generator's controller name lookups: the namespace and the labels of the DNS pods.
+  dnsSelector:
+    namespace: kube-system
+    podLabels: {k8s-app: kube-dns}
+
 metrics:
   # Prometheus Operator ServiceMonitor for the controller.
   serviceMonitor:

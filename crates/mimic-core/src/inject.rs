@@ -13,6 +13,11 @@ pub const SIDECAR_NAME: &str = "mimic-sidecar";
 pub const INIT_NAME: &str = "mimic-init";
 /// Annotation holding the injected version.
 pub const INJECTED_ANNOTATION: &str = "mimic.platform.io/injected";
+/// Label holding the deployment of an injected pod: the load test generator selects its targets
+/// by it (spec §7.8, LDT-20).
+pub const DEPLOYMENT_LABEL: &str = "mimic.platform.io/deployment";
+/// Longest label value (Kubernetes): a longer deployment name gets no label (INJ-03).
+const LABEL_VALUE_MAX: usize = 63;
 /// Sidecar admin port (probes, `/app-health`).
 const ADMIN_PORT: i32 = 15100;
 /// Ports the sidecar owns in the pod's network namespace.
@@ -404,6 +409,17 @@ pub fn patch(
             "/metadata/annotations".into(),
             json!({ INJECTED_ANNOTATION: cfg.version }),
         ));
+    }
+    if deployment.len() <= LABEL_VALUE_MAX {
+        if pod.metadata.labels.is_some() {
+            let key = DEPLOYMENT_LABEL.replace('/', "~1");
+            ops.push(add(format!("/metadata/labels/{key}"), json!(deployment)));
+        } else {
+            ops.push(add(
+                "/metadata/labels".into(),
+                json!({ DEPLOYMENT_LABEL: deployment }),
+            ));
+        }
     }
     for (i, c) in spec.iter().flat_map(|s| &s.containers).enumerate() {
         for (field, kind, probe) in probes_of(c) {
@@ -954,6 +970,15 @@ mod tests {
         apply_with(p, &wiring())
     }
 
+    fn apply_with_deployment(p: &Pod, deployment: &str) -> Value {
+        let ops = patch(p, deployment, &cfg(), &wiring()).unwrap();
+        let mut doc = serde_json::to_value(p).unwrap();
+        let ops: json_patch::Patch =
+            serde_json::from_value(serde_json::to_value(&ops).unwrap()).unwrap();
+        json_patch::patch(&mut doc, &ops).unwrap();
+        doc
+    }
+
     fn apply_with(p: &Pod, tls: &TlsWiring) -> Value {
         let ops = patch(p, "shop-api", &cfg(), tls).unwrap();
         let mut doc = serde_json::to_value(p).unwrap();
@@ -1118,6 +1143,58 @@ mod tests {
     }
 
     #[test]
+    fn ldt_20_the_patch_labels_the_pod_with_its_deployment() {
+        // Created when the pod has no labels, and replacing a value the pod set (LDT-20, INJ-03).
+        let doc = apply(&pod());
+        assert_eq!(
+            doc["metadata"]["labels"]["mimic.platform.io/deployment"],
+            "shop-api"
+        );
+        assert_eq!(doc["metadata"]["labels"]["pod-template-hash"], "5d8f7c9b6");
+        let mut p = pod();
+        p.metadata.labels = None;
+        assert_eq!(
+            apply(&p)["metadata"]["labels"],
+            json!({"mimic.platform.io/deployment": "shop-api"})
+        );
+        let mut p = pod();
+        p.metadata
+            .labels
+            .get_or_insert_default()
+            .insert("mimic.platform.io/deployment".into(), "other".into());
+        assert_eq!(
+            apply(&p)["metadata"]["labels"]["mimic.platform.io/deployment"],
+            "shop-api"
+        );
+    }
+
+    #[test]
+    fn ldt_20_a_name_too_long_for_a_label_value_gets_no_label() {
+        // 63 characters is the longest label value; a longer name gets no label, so the
+        // injection still succeeds and such a deployment has no load test target (§7.8).
+        let name = "a".repeat(63);
+        let doc = apply_with_deployment(&pod(), &name);
+        assert_eq!(
+            doc["metadata"]["labels"]["mimic.platform.io/deployment"],
+            name
+        );
+        let long = "a".repeat(64);
+        let ops = patch(&pod(), &long, &cfg(), &wiring()).unwrap();
+        assert!(
+            ops.iter()
+                .all(|op| !op.path.contains("mimic.platform.io~1deployment")
+                    && op.path != "/metadata/labels"),
+            "a label for a 64-character deployment: {ops:?}"
+        );
+        let doc = apply_with_deployment(&pod(), &long);
+        assert!(
+            doc["metadata"]["labels"]
+                .get("mimic.platform.io/deployment")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn inj_03_patch_is_deterministic() {
         let mut p = pod();
         spec(&mut p).containers[0].readiness_probe = Some(http(IntOrString::Int(8080), "/r"));
@@ -1230,6 +1307,11 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("annotations");
+        // The deployment label is the pod's own metadata change (LDT-20).
+        after["metadata"]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mimic.platform.io/deployment");
         assert_eq!(after, expected);
         let rp = &after["spec"]["containers"][0]["readinessProbe"];
         assert_eq!(rp["periodSeconds"], 7);
