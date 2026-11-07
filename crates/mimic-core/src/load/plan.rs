@@ -9,6 +9,18 @@ use crate::discovery::redact::MARKER;
 use crate::discovery::report::{Direction, Report};
 use crate::discovery::sample::{self as recorded, Payload};
 
+/// Smallest `MIMIC_LOAD_MAX_PLAN` (spec §10.2): the skeleton of an empty plan is about 34
+/// bytes, so a plan shrunk to this limit is always readable.
+pub const MIN_PLAN: usize = 64 << 10;
+
+/// Largest `MIMIC_LOAD_MAX_PLAN`.
+pub const MAX_PLAN: usize = 256 << 20;
+
+/// Parses `MIMIC_LOAD_MAX_PLAN` (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–256Mi).
+pub fn plan_limit(value: &str) -> Result<usize, String> {
+    todo!()
+}
+
 /// A credential the test supplies: the request field it replaces and the Secret key that holds
 /// the value. The plan holds these two names, never a value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
