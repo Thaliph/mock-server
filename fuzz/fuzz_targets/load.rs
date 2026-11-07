@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use libfuzzer_sys::fuzz_target;
 use mimic_core::discovery::report::Report;
-use mimic_core::load::plan::{CredentialField, Plan, Spec, plan};
+use mimic_core::load::plan::{CredentialField, MIN_PLAN, Plan, Spec, plan};
 use mimic_core::load::request::{Context, Request, request};
 
 /// A recorded report with an inbound scope, samples and volatility.
@@ -80,12 +80,12 @@ fn load(text: &str, knobs: &[u8]) {
     };
     let planned = plan(&report, &spec);
     let json = planned.plan.to_json().expect("a plan serialises");
-    assert!(json.len() <= spec.max_plan.max(64));
+    // `plan` raises a limit below `MIN_PLAN` to it, so every plan reads back.
+    let limit = spec.max_plan.max(MIN_PLAN);
+    assert!(json.len() <= limit);
     assert!(planned.plan.endpoints.len() <= spec.max_endpoints);
-    if json.len() <= spec.max_plan {
-        let back = Plan::from_json(&json, spec.max_plan).expect("a plan reads back");
-        assert_eq!(back, planned.plan);
-    }
+    let back = Plan::from_json(&json, limit).expect("a plan reads back");
+    assert_eq!(back, planned.plan);
     let secrets: BTreeMap<String, String> = [("k".to_string(), "secret value".to_string())].into();
     let ctx = Context {
         marker: "v1.payload.signature",
