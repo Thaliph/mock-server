@@ -240,6 +240,11 @@ fn host_ok(host: &str) -> bool {
 
 /// The plan of a stored inbound report.
 pub fn plan(report: &Report, spec: &Spec) -> Planned {
+    build(report, spec, spec.max_plan)
+}
+
+/// `plan` with an explicit byte limit, not raised to `MIN_PLAN` (tests).
+pub(super) fn build(report: &Report, spec: &Spec, max_plan: usize) -> Planned {
     let supplied: BTreeSet<&str> = spec.credentials.iter().map(|c| c.field.as_str()).collect();
     let mut skipped: BTreeMap<&'static str, u64> = BTreeMap::new();
     // Usable endpoints in report order.
@@ -347,7 +352,7 @@ pub fn plan(report: &Report, spec: &Spec) -> Planned {
         credentials: spec.credentials.clone(),
         endpoints: usable,
     };
-    let emptied = shrink(&mut plan, spec.max_plan);
+    let emptied = shrink(&mut plan, max_plan);
     if emptied > 0 {
         *skipped.entry(PLAN_SIZE).or_default() += emptied;
     }

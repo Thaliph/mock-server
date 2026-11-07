@@ -360,6 +360,7 @@ fn limits() -> Limits {
         max_concurrency: 256,
         max_rate: 2000,
         max_duration_ms: 30 * 60_000,
+        pod_concurrency: 128,
     }
 }
 
@@ -575,6 +576,48 @@ mod gate_tests {
             ("a-6d4c8f9b7-ggggg", &d),
         ]);
         assert_eq!(gate(Mode::Mock, &two(), &extra, NOW, WINDOW), Gate::Open);
+    }
+
+    #[test]
+    fn ldt_05_a_pulls_timestamp_in_the_future_beyond_the_skew_is_stale() {
+        let at = |ms: u64| {
+            let f = format!("mock {ms}");
+            pulls(&[("a-6d4c8f9b7-xxxxx", &f), ("a-6d4c8f9b7-zzzzz", &f)])
+        };
+        // Within 60 s of skew it counts, beyond it does not.
+        assert_eq!(
+            gate(Mode::Mock, &two(), &at(NOW + 60_000), NOW, WINDOW),
+            Gate::Open
+        );
+        assert_eq!(
+            gate(Mode::Mock, &two(), &at(NOW + 60_001), NOW, WINDOW),
+            Gate::WaitingForMock
+        );
+        assert_eq!(
+            gate(Mode::Mock, &two(), &at(u64::MAX), NOW, WINDOW),
+            Gate::WaitingForMock
+        );
+    }
+
+    #[test]
+    fn ldt_03_a_rate_below_the_pod_count_is_invalid_naming_the_rate() {
+        // 300 over 128 per pod: 3 pods.
+        let p = |rate| Params {
+            concurrency: 300,
+            rate: Some(rate),
+            ..params()
+        };
+        let bad = validate(&p(2), &limits()).err();
+        assert_eq!(bad.as_ref().map(|i| i.field), Some("spec.rate"));
+        assert!(bad.is_some_and(|i| i.message.contains("pods")));
+        assert_eq!(validate(&p(3), &limits()), Ok(()));
+        // Every pod then gets at least 1 and the total is exact.
+        let s = split(300, Some(3), 128);
+        assert!(s.iter().all(|s| s.rate.is_some_and(|r| r >= 1)));
+        assert_eq!(s.iter().filter_map(|s| s.rate).sum::<u64>(), 3);
+        // Closed model has no such rule.
+        let closed = Params { rate: None, ..p(1) };
+        assert_eq!(validate(&closed, &limits()), Ok(()));
     }
 
     #[test]
