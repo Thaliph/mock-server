@@ -9,6 +9,7 @@ pub mod h2;
 pub mod hardening;
 pub mod http1;
 pub mod listener;
+pub mod mode;
 pub mod opaque;
 pub mod probes;
 pub mod red;

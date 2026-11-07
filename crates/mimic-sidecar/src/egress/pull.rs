@@ -9,6 +9,7 @@ use tokio::time::sleep;
 
 use super::{EgressConfig, EgressMetrics, Snapshot};
 use crate::discovery::{Target, retry_after};
+use crate::mode::Announced;
 use crate::tls::ca::api_client;
 
 /// Why a pull did not give a set.
@@ -106,9 +107,8 @@ impl Puller {
     }
 
     async fn cycle(&mut self) {
-        // The pods of a rollout must not pull together.
-        let first = rand::random_range(0..=self.interval.as_millis().max(1) as u64);
-        sleep(Duration::from_millis(first)).await;
+        // The first pull is at once: the pod learns its mode and gets a snapshot before its
+        // app sends much traffic (spec §7.7).
         loop {
             let wait = self.pull().await;
             sleep(wait).await;
@@ -117,7 +117,18 @@ impl Puller {
 
     /// One pull; how long to wait before the next.
     async fn pull(&mut self) -> Duration {
-        match self.fetch().await {
+        let (fetched, announced) = self.fetch().await;
+        let wait = self.settle(fetched);
+        // After the snapshot of the same answer: a sidecar that enters mock answers from it.
+        if let Some(announced) = announced {
+            self.snapshot.mode().observe(announced).await;
+        }
+        wait
+    }
+
+    /// Keeps or replaces the snapshot; how long to wait before the next pull.
+    fn settle(&mut self, fetched: Fetched) -> Duration {
+        match fetched {
             Fetched::Set { set, etag, bytes } => {
                 let (authorities, endpoints) = (set.authorities.len(), set.endpoint_count());
                 self.snapshot.replace(set, etag, bytes, SystemTime::now());
@@ -188,12 +199,15 @@ impl Puller {
     }
 
     /// The token is read again for each pull: the kubelet rotates it.
-    async fn fetch(&self) -> Fetched {
+    async fn fetch(&self) -> (Fetched, Option<Announced>) {
         let token = match tokio::fs::read_to_string(&self.target.token_file).await {
             Ok(token) => token,
             Err(e) => {
                 let error = format!("token file: {}", e.kind());
-                return Fetched::Failed(Failure::error(None, Some(error), None));
+                return (
+                    Fetched::Failed(Failure::error(None, Some(error), None)),
+                    None,
+                );
             }
         };
         let url = format!(
@@ -209,11 +223,17 @@ impl Puller {
             // Without the URL: it is the configured one, and nothing else is useful here.
             Err(e) => {
                 let error = e.without_url().to_string();
-                return Fetched::Failed(Failure::error(None, Some(error), None));
+                return (
+                    Fetched::Failed(Failure::error(None, Some(error), None)),
+                    None,
+                );
             }
         };
         let status = response.status().as_u16();
-        match status {
+        // The mode of a `200` counts even when its body is refused; no other answer has one.
+        let announced =
+            matches!(status, 200 | 304).then(|| Announced::from_headers(response.headers()));
+        let fetched = match status {
             200 => self.read(response).await,
             304 => Fetched::NotModified,
             507 => Fetched::Failed(Failure::refused("too_large", Some(status), None)),
@@ -226,7 +246,8 @@ impl Puller {
                     .and_then(retry_after);
                 Fetched::Failed(Failure::error(Some(status), None, wait))
             }
-        }
+        };
+        (fetched, announced)
     }
 
     /// Reads the body of a `200`, at most `max_bytes` of it, and checks it. The buffer is

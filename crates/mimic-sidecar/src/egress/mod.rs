@@ -1,6 +1,6 @@
 //! The egress pull client of the sidecar (spec §7.7): pulls the deployment's aggregated
-//! egress from the controller and holds it in memory, in every mode. F9 only holds,
-//! measures and summarises it; nothing answers a request from it.
+//! egress from the controller and holds it in memory, in every mode, and follows the mode
+//! the controller announces with it (F10).
 
 mod metrics;
 mod pull;
@@ -18,6 +18,7 @@ use mimic_core::discovery::egress::{self, EgressSet};
 use mimic_runtime::config::{ConfigError, Env};
 
 use crate::discovery::Target;
+use crate::mode::ModeState;
 
 pub use metrics::EgressMetrics;
 pub use pull::Puller;
@@ -102,9 +103,19 @@ struct Held {
 /// The egress snapshot, shared between the pull client and its readers. Memory only: a
 /// restarted sidecar pulls again.
 #[derive(Clone, Default)]
-pub struct Snapshot(Arc<Mutex<Held>>);
+pub struct Snapshot(Arc<Mutex<Held>>, ModeState);
 
 impl Snapshot {
+    /// An empty snapshot of a sidecar in this mode state.
+    pub fn new(mode: ModeState) -> Snapshot {
+        Snapshot(Arc::default(), mode)
+    }
+
+    /// The mode the pulls update and the summary shows.
+    pub fn mode(&self) -> &ModeState {
+        &self.1
+    }
+
     fn held(&self) -> MutexGuard<'_, Held> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -153,6 +164,7 @@ impl Snapshot {
             let held = self.held();
             (held.set.clone(), held.etag.clone(), held.pulled)
         };
+        let (mode, factor) = (self.1.mode(), self.1.factor());
         let pulled = pulled.and_then(|at| {
             time::OffsetDateTime::from(at)
                 .format(&time::format_description::well_known::Rfc3339)
@@ -160,10 +172,12 @@ impl Snapshot {
         });
         match (&set, &pulled) {
             // A controller that sent no `ETag`: the set is held, but nothing names it.
-            (Some(set), Some(pulled)) => {
-                egress::summary(Some((set, etag.as_deref().unwrap_or(""), pulled)))
-            }
-            _ => egress::summary(None),
+            (Some(set), Some(pulled)) => egress::summary(
+                Some((set, etag.as_deref().unwrap_or(""), pulled)),
+                mode,
+                factor,
+            ),
+            _ => egress::summary(None, mode, factor),
         }
     }
 
