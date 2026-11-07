@@ -132,6 +132,15 @@ pub fn merge_bounded(stored: Report, push: Report, limits: &Limits) -> Bounded {
     out
 }
 
+/// [`merge_bounded`] of a push that is read from its JSON. Stub.
+pub fn merge_bounded_json(
+    _stored: Report,
+    _push: &str,
+    _limits: &Limits,
+) -> Result<Bounded, serde_json::Error> {
+    Err(serde::de::Error::custom("unimplemented"))
+}
+
 /// Keeps the `max` outbound scopes ranked by traffic (descending), then stored before new, then
 /// by key; the others go with everything they hold.
 fn limit_authorities(
