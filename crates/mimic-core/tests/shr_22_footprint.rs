@@ -1,7 +1,6 @@
 //! SHR-22 (#339): the heap footprint of a parsed report. The report of SHR-18 at the store
 //! limits is read with `Report::from_json`; the live heap bytes plus 16 bytes per live block (a
-//! malloc header) are compared with its JSON length. Measured only for now: the bound of 1.6
-//! lands with the change that meets it.
+//! malloc header) are compared with its JSON length, which must be at most 1.6 times.
 
 mod common;
 
@@ -11,7 +10,7 @@ use mimic_core::discovery::report::Report;
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 #[test]
-fn shr_22_parsed_report_footprint_is_measured() {
+fn shr_22_parsed_report_takes_at_most_1_6_times_its_json() {
     let _profiler = dhat::Profiler::builder().testing().build();
     let json = common::full_report(0).to_json().expect("serialises");
     let before = dhat::HeapStats::get();
@@ -26,6 +25,7 @@ fn shr_22_parsed_report_footprint_is_measured() {
         "SHR22 json={} live_bytes={bytes} live_blocks={blocks} ratio={ratio:.2}",
         json.len()
     );
+    assert!(ratio <= 1.6, "the parsed report costs {ratio:.2} times its JSON");
     assert!(report.exchanges() > 0);
     assert!(json.len() > 20 << 20, "the report is at the store limits");
 }
