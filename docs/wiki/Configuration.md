@@ -25,9 +25,9 @@ Status (written by the controller only, through the status subresource; F5):
 
 | Field | Meaning |
 |---|---|
+| `status.discovery.endpoints.inbound` / `.outbound` | Endpoints per direction in the merged report. |
 | `status.discovery.totalEndpoints` | Inbound + outbound endpoints; the `Endpoints` column of `kubectl get` (`0` until an F8 controller applies a status). |
 | `status.discovery.exchanges` | Exchanges currently held, both directions. Not a running total: it decreases when outbound scopes expire or are evicted. |
-| `status.discovery.exchanges` | Exchanges merged. |
 | `status.discovery.sampleBytes` | Bytes held by samples. |
 | `status.discovery.pods` | Pods whose last push is within `MIMIC_STATUS_POD_WINDOW`. |
 | `status.discovery.lastPushTime` | Last applied push, UTC, seconds; absent without data. |

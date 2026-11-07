@@ -5,6 +5,7 @@
 - [Quick start](Quick-start)
 - [Reading the API](Reading-the-API)
 - [Discovery and redaction](Discovery-and-redaction)
+- [Egress aggregation](Egress-aggregation)
 - [TLS interception](TLS-interception)
 
 **Run**

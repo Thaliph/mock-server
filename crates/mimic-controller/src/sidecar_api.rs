@@ -654,7 +654,7 @@ impl SidecarApi {
         if length > self.max_report {
             return Err(TOO_LARGE);
         }
-        let _reservation = self.budget.reserve(length as u64).ok_or_else(|| {
+        let reservation = self.budget.reserve(length as u64).ok_or_else(|| {
             caller.error = Some("body budget spent".to_string());
             UNAVAILABLE
         })?;
@@ -688,8 +688,10 @@ impl SidecarApi {
             seq,
             report: report?,
         };
+        // The reservation goes with the push: the write goes on if the client disconnects, and
+        // so does the memory it holds (SHR-18).
         self.store
-            .push(&identity.namespace, deployment, push)
+            .push_holding(&identity.namespace, deployment, push, reservation)
             .await
             .map_err(|e| match e {
                 StoreError::Name => invalid("name"),

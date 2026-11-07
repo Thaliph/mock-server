@@ -157,6 +157,9 @@ impl Reconciler {
                         if !self.down.swap(true, Ordering::SeqCst) {
                             tracing::warn!("status not updated");
                         }
+                        // The reads that already succeeded in this pass are valid: their applies
+                        // (requests to the API server, not to Valkey) still run below. No
+                        // further read is attempted, so no later deployment is computed.
                         break;
                     }
                     // Logged by the store; the other workloads still get their status.

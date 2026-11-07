@@ -42,6 +42,7 @@ the spec disagree, the spec wins.
 | [Configuration](Configuration) | `MimicWorkload` fields, Helm values, `MIMIC_*` variables |
 | [TLS interception](TLS-interception) | How it works, trust injection, exclusions, pass-through |
 | [Discovery and redaction](Discovery-and-redaction) | What is recorded, templating, limits, what is never stored |
+| [Egress aggregation](Egress-aggregation) | Outbound calls per pod, merged by the controller, outbound documents, fallback to older controllers |
 | [Reading the API](Reading-the-API) | The read API endpoints and example output |
 | [Operations](Operations) | Metrics, logs, probes, sizing, Valkey, retention, scaling, shutdown |
 | [Security](Security) | Threat model summary, what reaches Valkey, RBAC, network, accepted limits |
@@ -54,8 +55,6 @@ the spec disagree, the spec wins.
 Planned, **not available yet**; nothing in this wiki depends on it.
 
 - **F6, UI.** OpenAPI 3.1 document and Swagger UI per deployment, on the read API listener.
-- **F7 to F9, egress.** Record the calls a deployment makes to external APIs, share them with the
-  controller, aggregate them per deployment.
 - **F10, mock mode.** Answer a deployment's egress calls from recorded responses, and switch back to
   discovery.
 - **F11, load testing** of one workload in isolation.
