@@ -337,6 +337,9 @@ type Read = (
     Vec<Option<String>>,
 );
 
+#[cfg(test)]
+type Intruder = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 type Queues = BTreeMap<(String, String), Vec<Pending>>;
 
 pub struct Store {
@@ -355,6 +358,10 @@ pub struct Store {
     /// Test hook: the next write panics.
     #[cfg(test)]
     panic_next_write: AtomicBool,
+    /// Test hook: runs once between the next read and its write (a type-erased future: a push by
+    /// another replica would make the write's future recursive).
+    #[cfg(test)]
+    intruder: Mutex<Option<Intruder>>,
 }
 
 /// The lowercase hex SHA-256 of `bytes`.
@@ -491,6 +498,8 @@ impl Store {
             failing: AtomicBool::new(false),
             #[cfg(test)]
             panic_next_write: AtomicBool::new(false),
+            #[cfg(test)]
+            intruder: Mutex::new(None),
         })
     }
 
@@ -565,6 +574,12 @@ impl Store {
             });
         }
         answer.await.unwrap_or(Err(StoreError::Unavailable))
+    }
+
+    /// Test hook: `intruder` runs between the next write's read and its compare-and-set.
+    #[cfg(test)]
+    pub(crate) fn intrude_once(&self, intruder: Intruder) {
+        *lock(&self.intruder) = Some(intruder);
     }
 
     /// Test hook: holds every writer slot, so that no write starts until the guard drops.
@@ -1073,6 +1088,12 @@ impl Store {
             Ok(read) => read,
             Err(e) => return Err(self.failed(e).await),
         };
+        #[cfg(test)]
+        let intruder = lock(&self.intruder).take();
+        #[cfg(test)]
+        if let Some(intruder) = intruder {
+            intruder.await;
+        }
         let unreadable = |key: &'static str| {
             tracing::error!(namespace, deployment, key, "stored report unreadable");
             StoreError::Unavailable

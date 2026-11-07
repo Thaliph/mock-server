@@ -1,7 +1,7 @@
 //! The egress set (spec §7.7): what a sidecar needs of the controller's outbound report to
 //! mock its provider calls, and nothing else. Pure: no I/O, no clock.
 
-use std::collections::{BTreeMap, BTreeSet};
+use crate::compact::{SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,7 +53,7 @@ pub struct Endpoint {
     pub method: String,
     pub redacted: Vec<String>,
     pub samples: Vec<Sample>,
-    pub statuses: BTreeMap<u16, u64>,
+    pub statuses: SortedMap<u16, u64>,
     pub template: String,
     pub volatile: Vec<String>,
 }
@@ -67,7 +67,7 @@ pub struct Authority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressSet {
-    pub authorities: BTreeMap<String, Authority>,
+    pub authorities: SortedMap<String, Authority>,
     pub format: u32,
 }
 
@@ -102,7 +102,7 @@ impl EgressSet {
     /// The projection of a report (spec §7.7): the outbound scopes that hold an endpoint and,
     /// per endpoint, what a mock needs. A pure function of the outbound part.
     pub fn project(report: &Report) -> Self {
-        let mut authorities: BTreeMap<String, Authority> = BTreeMap::new();
+        let mut authorities: SortedMap<String, Authority> = SortedMap::new();
         for e in report.endpoints() {
             let Some(authority) = e.authority.filter(|_| e.direction == Direction::Outbound) else {
                 continue;
@@ -166,7 +166,7 @@ impl EgressSet {
         }
         for authority in set.authorities.values() {
             // A mock picks an endpoint by method and template: twice would be ambiguous.
-            let mut seen = BTreeSet::new();
+            let mut seen = SortedSet::new();
             for endpoint in &authority.endpoints {
                 endpoint.check()?;
                 if !seen.insert((endpoint.method.as_str(), endpoint.template.as_str())) {
@@ -229,7 +229,7 @@ struct ViewEndpoint<'a> {
     exchanges: u64,
     grpc: bool,
     method: &'a str,
-    statuses: &'a BTreeMap<u16, u64>,
+    statuses: &'a SortedMap<u16, u64>,
     template: &'a str,
 }
 
@@ -240,7 +240,7 @@ struct ViewAuthority<'a> {
 
 #[derive(Serialize)]
 struct View<'a> {
-    authorities: BTreeMap<&'a str, ViewAuthority<'a>>,
+    authorities: SortedMap<&'a str, ViewAuthority<'a>>,
     etag: Option<&'a str>,
     pulled: Option<&'a str>,
 }
@@ -250,7 +250,7 @@ struct View<'a> {
 pub fn summary(snapshot: Option<(&EgressSet, &str, &str)>) -> String {
     let view = match snapshot {
         None => View {
-            authorities: BTreeMap::new(),
+            authorities: SortedMap::new(),
             etag: None,
             pulled: None,
         },

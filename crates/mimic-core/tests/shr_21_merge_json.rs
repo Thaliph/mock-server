@@ -64,13 +64,16 @@ proptest! {
         authorities in 1..5usize,
         budget in 512..65_536usize,
         literals in 1..9usize,
+        pushed_literals in 1..9usize,
     ) {
         // Few literals per node make the nodes absorb.
         let limits = Limits { max_literals: literals, ..limits(endpoints, authorities, budget) };
+        // The second and third pushes were built under another literal limit than the merge's.
+        let pushed = Limits { max_literals: pushed_literals, ..limits };
         let all = [
             build(&a, &limits, 19_000),
-            build(&b, &limits, 19_001),
-            build(&c, &limits, 19_002),
+            build(&b, &pushed, 19_001),
+            build(&c, &pushed, 19_002),
         ];
         // The six orders of three pushes.
         let [i, j, k] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]][order];

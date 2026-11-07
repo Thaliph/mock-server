@@ -2,7 +2,7 @@
 //! the set of candidates, so any arrival order, and any partition merged later, gives the
 //! same samples.
 
-use std::collections::{BTreeMap, BTreeSet};
+use crate::compact::{SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -368,7 +368,7 @@ impl Sample {
 
 /// The samples of one endpoint, by content hash.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Samples(BTreeMap<u64, Sample>);
+pub struct Samples(SortedMap<u64, Sample>);
 
 impl Samples {
     pub fn len(&self) -> usize {
@@ -423,8 +423,8 @@ impl Samples {
         &mut self,
         request_redactor: &Redactor,
         response_redactor: &Redactor,
-    ) -> BTreeSet<String> {
-        let mut fields = BTreeSet::new();
+    ) -> SortedSet<String> {
+        let mut fields = SortedSet::new();
         for (_, mut sample) in std::mem::take(&mut self.0) {
             let original = sample.clone();
             if sample.redact(request_redactor, response_redactor) {
@@ -462,7 +462,7 @@ impl Samples {
     }
 
     pub(super) fn single(hash: u64, sample: Sample) -> Self {
-        Samples(BTreeMap::from([(hash, sample)]))
+        Samples(SortedMap::from([(hash, sample)]))
     }
 
     /// The union, then the selection. The same content seen twice keeps the lowest latency.
@@ -478,20 +478,20 @@ impl Samples {
 /// At most `MAX_SAMPLES`: one per status code (lowest status first), then one per class
 /// (status, request shape, response shape) not yet represented, then the rest; in each pass
 /// the lowest content hash wins.
-fn select(all: BTreeMap<u64, Sample>) -> BTreeMap<u64, Sample> {
+fn select(all: SortedMap<u64, Sample>) -> SortedMap<u64, Sample> {
     if all.len() <= MAX_SAMPLES {
         return all;
     }
-    let mut by_status: BTreeMap<u16, u64> = BTreeMap::new();
-    let mut by_class: BTreeMap<(u16, u64, u64), u64> = BTreeMap::new();
+    let mut by_status: SortedMap<u16, u64> = SortedMap::new();
+    let mut by_class: SortedMap<(u16, u64, u64), u64> = SortedMap::new();
     // Ascending hashes: the first of each key is its lowest.
     for (hash, s) in &all {
         by_status.entry(s.status()).or_insert(*hash);
         by_class.entry(s.class()).or_insert(*hash);
     }
-    let mut keep: BTreeSet<u64> = BTreeSet::new();
-    let mut classes = BTreeSet::new();
-    let mut take = |hash: u64, classes: &mut BTreeSet<(u16, u64, u64)>| {
+    let mut keep: SortedSet<u64> = SortedSet::new();
+    let mut classes = SortedSet::new();
+    let mut take = |hash: u64, classes: &mut SortedSet<(u16, u64, u64)>| {
         if keep.len() < MAX_SAMPLES && keep.insert(hash) {
             classes.extend(all.get(&hash).map(Sample::class));
         }

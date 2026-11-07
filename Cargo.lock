@@ -1957,6 +1957,7 @@ dependencies = [
  "json-patch",
  "jsonschema",
  "k8s-openapi",
+ "litemap",
  "percent-encoding",
  "proptest",
  "serde",

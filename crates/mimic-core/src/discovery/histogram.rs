@@ -1,7 +1,7 @@
 //! Latency histogram with fixed log buckets (spec §6, DSC-10): 4 per doubling from 1 ms to
 //! 131 072 ms, plus an overflow bucket. Sparse, integer-only, so merging is exact.
 
-use std::collections::BTreeMap;
+use crate::compact::SortedMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +28,7 @@ pub fn bucket_index(ms: u64) -> u8 {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Histogram {
-    buckets: BTreeMap<u8, u64>,
+    buckets: SortedMap<u8, u64>,
 }
 
 impl Histogram {
@@ -45,7 +45,7 @@ impl Histogram {
     }
 
     /// Non-empty buckets, by index.
-    pub fn buckets(&self) -> &BTreeMap<u8, u64> {
+    pub fn buckets(&self) -> &SortedMap<u8, u64> {
         &self.buckets
     }
 
