@@ -227,17 +227,17 @@ pub fn matches_etag(if_none_match: &str, etag: &str) -> bool {
 }
 
 #[derive(Serialize)]
-struct ViewEndpoint<'a> {
-    exchanges: u64,
-    grpc: bool,
-    method: &'a str,
-    statuses: &'a SortedMap<u16, u64>,
-    template: &'a str,
+pub(crate) struct ViewEndpoint<'a> {
+    pub(crate) exchanges: u64,
+    pub(crate) grpc: bool,
+    pub(crate) method: &'a str,
+    pub(crate) statuses: &'a SortedMap<u16, u64>,
+    pub(crate) template: &'a str,
 }
 
 #[derive(Serialize)]
-struct ViewAuthority<'a> {
-    endpoints: Vec<ViewEndpoint<'a>>,
+pub(crate) struct ViewAuthority<'a> {
+    pub(crate) endpoints: Vec<ViewEndpoint<'a>>,
 }
 
 #[derive(Serialize)]
@@ -247,6 +247,25 @@ struct View<'a> {
     latency_factor: serde_json::Number,
     mode: &'static str,
     pulled: Option<&'a str>,
+}
+
+/// The local view of a snapshot given as its authorities, with its `ETag` and pull time.
+pub(crate) fn render_summary<'a>(
+    authorities: SortedMap<&'a str, ViewAuthority<'a>>,
+    etag: &'a str,
+    pulled: &'a str,
+    mode: Mode,
+    factor: u32,
+) -> String {
+    let view = View {
+        authorities,
+        etag: Some(etag),
+        latency_factor: factor_number(factor),
+        mode: mode.as_str(),
+        pulled: Some(pulled),
+    };
+    // Plain data: serialisation cannot fail.
+    serde_json::to_string(&view).unwrap_or_default()
 }
 
 /// The local view of a snapshot (`(set, etag, pulled)`), or of none: what the pod could mock,

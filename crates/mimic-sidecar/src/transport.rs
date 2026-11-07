@@ -115,6 +115,11 @@ impl Stream {
         Self::Plain(Socket::new(tcp))
     }
 
+    /// A plain stream that reads `prefix` before anything from `tcp`.
+    pub fn plain_with_prefix(tcp: TcpStream, prefix: Vec<u8>) -> Self {
+        Self::Plain(Socket::with_prefix(tcp, prefix))
+    }
+
     pub fn tls(tls: TlsStream<Socket>) -> Self {
         Self::Tls(Box::new(tls))
     }

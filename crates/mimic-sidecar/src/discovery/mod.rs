@@ -5,7 +5,7 @@
 
 mod capture;
 mod config;
-mod decode;
+pub(crate) mod decode;
 mod metrics;
 mod recorder;
 mod redactions;
@@ -27,8 +27,8 @@ use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::{Limits, Report};
 use mimic_runtime::metrics::Metrics;
 
-pub use capture::Tap;
-pub(crate) use capture::{Capture, Meta};
+pub(crate) use capture::{Capture, Meta, Reservation};
+pub use capture::{CaptureBudget, Tap};
 pub use config::DiscoveryConfig;
 pub use metrics::DiscoveryMetrics;
 pub(crate) use ship::retry_after;

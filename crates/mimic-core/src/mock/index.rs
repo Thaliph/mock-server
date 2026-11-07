@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::Mode;
 use crate::compact::{Name, SortedMap};
-use crate::discovery::egress::{EgressSet, Endpoint};
+use crate::discovery::egress::{EgressSet, Endpoint, ViewAuthority, ViewEndpoint, render_summary};
 use crate::discovery::histogram::Histogram;
 use crate::discovery::redact::Redactor;
 use crate::discovery::sample::{Payload, Sample};
@@ -55,6 +56,8 @@ struct IndexEndpoint {
     /// Fields never compared: the endpoint's `volatile` and `redacted` names.
     excluded: BTreeSet<String>,
     latency: Histogram,
+    /// The statuses seen and their counts, for the local view (spec §7.7).
+    statuses: SortedMap<u16, u64>,
     /// Samples that a mock can replay (no `1xx`), in snapshot order.
     samples: Vec<IndexSample>,
     /// The answer of the most frequent status; none when the endpoint has only `1xx`.
@@ -214,6 +217,7 @@ fn index_endpoint(e: Endpoint) -> IndexEndpoint {
         parameters,
         excluded,
         latency: e.latency,
+        statuses: e.statuses,
         samples: kept.into_iter().map(|(_, s)| s).collect(),
         fallback,
     }
@@ -324,6 +328,33 @@ impl Index {
 
     pub fn endpoint_count(&self) -> usize {
         self.authorities.values().map(Vec::len).sum()
+    }
+
+    pub fn authority_count(&self) -> usize {
+        self.authorities.len()
+    }
+
+    /// The local view of the snapshot (spec §7.7), the same as
+    /// [`egress::summary`](crate::discovery::egress::summary) gives for the set it was built from.
+    pub fn summary(&self, etag: &str, pulled: &str, mode: Mode, factor: u32) -> String {
+        let authorities = self
+            .authorities
+            .iter()
+            .map(|(name, endpoints)| {
+                let endpoints = endpoints
+                    .iter()
+                    .map(|e| ViewEndpoint {
+                        exchanges: e.statuses.values().fold(0, |n, c| n.saturating_add(*c)),
+                        grpc: e.grpc,
+                        method: &e.method,
+                        statuses: &e.statuses,
+                        template: &e.template,
+                    })
+                    .collect();
+                (name.as_str(), ViewAuthority { endpoints })
+            })
+            .collect();
+        render_summary(authorities, etag, pulled, mode, factor)
     }
 
     /// The answer to a request, or why there is none (spec §8, "Endpoint lookup" and "Tiers").

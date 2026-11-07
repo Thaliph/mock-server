@@ -417,6 +417,8 @@ impl Tracker {
             head: self.head,
             bytes_in,
             bytes_out,
+            mock: None,
+            mock_miss: None,
         });
     }
 }
@@ -539,6 +541,8 @@ pub(crate) fn rejected(ctx: &Ctx) {
         head: None,
         bytes_in: 0,
         bytes_out: 0,
+        mock: None,
+        mock_miss: None,
     });
 }
 
@@ -840,6 +844,8 @@ impl Http1Tracker {
             head: open.head.filter(|_| timed),
             bytes_in: open.bytes_in,
             bytes_out: open.bytes_out,
+            mock: None,
+            mock_miss: None,
         });
     }
 }

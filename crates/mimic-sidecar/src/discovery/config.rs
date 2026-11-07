@@ -63,6 +63,11 @@ impl DiscoveryConfig {
         })
     }
 
+    /// The redaction by name, built-in names and `MIMIC_DISCOVERY_REDACT_NAMES`.
+    pub fn redactor(&self) -> mimic_core::discovery::redact::Redactor {
+        mimic_core::discovery::redact::Redactor::new(self.redact_names.iter().map(String::as_str))
+    }
+
     /// The bounds the report enforces.
     pub fn limits(&self) -> Limits {
         Limits {

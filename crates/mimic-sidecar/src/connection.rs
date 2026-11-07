@@ -29,6 +29,8 @@ const KEEPALIVE_IDLE: Duration = Duration::from_secs(300);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_PROBES: u32 = 4;
 const READ_CHUNK: usize = 4096;
+/// How long a mocked-or-not connection waits for the client's first byte before it connects.
+const MOCK_WAIT: Duration = Duration::from_secs(1);
 /// Default port of a TLS server name, removed by the authority normalisation.
 const TLS_PORT: u16 = 443;
 
@@ -76,6 +78,49 @@ pub(crate) async fn handle(
             return;
         }
     };
+    let mut abort = pin!(shared.aborted());
+    let mut client = client;
+    let stall = shared.detect_stall();
+    // In mock mode the sidecar connects only once it knows this is not a mocked HTTP/1
+    // connection (spec §8): what it read meanwhile is replayed to the detection below.
+    let mut read = Vec::new();
+    let mock = match shared.mock() {
+        Some(mock) if direction == Direction::Outbound && mock.active() => Some(mock.clone()),
+        _ => None,
+    };
+    if let Some(mock) = mock {
+        match mock_first(&mut client, stall, abort.as_mut()).await {
+            MockFirst::Http1(buf, first) => {
+                shared.metrics().count(direction, Outcome::Ok);
+                if let Err(e) = configure_socket(&client) {
+                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
+                }
+                mock.connection("mocked");
+                let conn = Conn {
+                    shared: &shared,
+                    direction,
+                    dst,
+                    started,
+                    tls: false,
+                    sni: None,
+                    interception: None,
+                };
+                shared
+                    .proxy()
+                    .connection(direction, "http1", &dst.to_string());
+                mock.serve_http1(
+                    conn.ctx(),
+                    Stream::plain_with_prefix(client, buf),
+                    first,
+                    shared.stopped(),
+                    abort.as_mut(),
+                )
+                .await;
+                return;
+            }
+            MockFirst::Other(buf) => read = buf,
+        }
+    }
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await;
     let upstream = match connected {
         Ok(Ok(upstream)) => upstream,
@@ -95,7 +140,6 @@ pub(crate) async fn handle(
             tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
         }
     }
-    let mut abort = pin!(shared.aborted());
     let mut conn = Conn {
         shared: &shared,
         direction,
@@ -105,9 +149,8 @@ pub(crate) async fn handle(
         sni: None,
         interception: None,
     };
-    let (mut client, mut upstream) = (client, upstream);
-    let stall = shared.detect_stall();
-    let served = match first_bytes(&mut client, &mut upstream, stall, abort.as_mut()).await {
+    let mut upstream = upstream;
+    let served = match first_bytes(&mut client, &mut upstream, read, stall, abort.as_mut()).await {
         First::Client(detection, buf) => {
             tracing::debug!(direction = direction.as_str(), %dst, ?detection, "protocol detected");
             match detection {
@@ -162,6 +205,53 @@ fn tunnel_kind(interception: Option<&str>) -> &'static str {
         Some("client_cert_requested") => "tls_client_cert_requested",
         Some("client_rejected") => "tls_client_rejected",
         _ => "tcp",
+    }
+}
+
+/// What the client said first on an outbound connection in mock mode, before any connection
+/// to the destination.
+enum MockFirst {
+    /// An HTTP/1.x request line, the bytes read, and when the first one arrived.
+    Http1(Vec<u8>, Instant),
+    /// Anything else: the bytes read so far (possibly none), to detect again once connected.
+    Other(Vec<u8>),
+}
+
+/// Waits for the first bytes of the client without connecting (spec §8): at most
+/// [`MOCK_WAIT`] for the first byte (a server-first protocol), then the usual stall of an
+/// incomplete prefix.
+async fn mock_first(
+    client: &mut TcpStream,
+    stall: Duration,
+    abort: impl Future<Output = ()>,
+) -> MockFirst {
+    let mut abort = pin!(abort);
+    let mut buf = Vec::new();
+    let mut first = None;
+    let silent = tokio::time::sleep(MOCK_WAIT);
+    let mut silent = pin!(silent);
+    loop {
+        let mut chunk = [0u8; READ_CHUNK];
+        let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
+        tokio::select! {
+            () = &mut silent, if buf.is_empty() => return MockFirst::Other(buf),
+            () = stalled(!buf.is_empty(), stall) => return MockFirst::Other(buf),
+            read = client.read(&mut chunk[..want]) => match read {
+                Ok(n) if n > 0 => {
+                    first.get_or_insert_with(Instant::now);
+                    buf.extend_from_slice(&chunk[..n]);
+                    match detect(&buf) {
+                        Detection::NeedMore => {}
+                        Detection::Http1 => {
+                            return MockFirst::Http1(buf, first.unwrap_or_else(Instant::now));
+                        }
+                        _ => return MockFirst::Other(buf),
+                    }
+                }
+                _ => return MockFirst::Other(buf),
+            },
+            () = &mut abort => return MockFirst::Other(buf),
+        }
     }
 }
 
@@ -458,11 +548,18 @@ async fn read_watch(upstream: Option<&mut Stream>, into: &mut [u8]) -> io::Resul
 async fn first_bytes(
     client: &mut TcpStream,
     upstream: &mut TcpStream,
+    mut buf: Vec<u8>,
     stall: Duration,
     abort: impl Future<Output = ()>,
 ) -> First {
     let mut abort = pin!(abort);
-    let mut buf = Vec::new();
+    // Bytes read before the connection to the destination existed (mock mode).
+    if !buf.is_empty() {
+        match detect(&buf) {
+            Detection::NeedMore => {}
+            found => return First::Client(found, buf),
+        }
+    }
     loop {
         let mut from_client = [0u8; READ_CHUNK];
         let mut from_upstream = [0u8; READ_CHUNK];

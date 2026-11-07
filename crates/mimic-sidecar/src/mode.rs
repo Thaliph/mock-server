@@ -1,10 +1,11 @@
 //! The mode state of the sidecar (spec §3, §8 "Mode state"): `discovery` or `mock`, with the
 //! latency factor. It starts from the state file of the pod, else from `MIMIC_MODE`, and
-//! follows the `Mimic-Mode` and `Mimic-Latency-Factor` headers of the egress pulls (§7.7). It
-//! is only held and shown here: nothing in the traffic path reads it yet.
+//! follows the `Mimic-Mode` and `Mimic-Latency-Factor` headers of the egress pulls (§7.7). The
+//! mock (`crate::mock`) reads it when an outbound connection begins.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mimic_core::Mode;
@@ -19,6 +20,10 @@ use prometheus_client::metrics::gauge::Gauge;
 const MODE_VAR: &str = "MIMIC_MODE";
 const FACTOR_VAR: &str = "MIMIC_MOCK_LATENCY_FACTOR";
 const PASSTHROUGH_VAR: &str = "MIMIC_MOCK_PASSTHROUGH";
+const MAX_PENDING_VAR: &str = "MIMIC_MOCK_MAX_PENDING";
+const MAX_PENDING_RANGE: std::ops::RangeInclusive<usize> = 1..=65_536;
+/// Mocked requests pending at once unless `MIMIC_MOCK_MAX_PENDING` says otherwise.
+pub const DEFAULT_MAX_PENDING: usize = 1024;
 
 /// The state file is read up to this many bytes: a valid one has about 40.
 const MAX_STATE_BYTES: u64 = 1024;
@@ -34,6 +39,8 @@ pub struct ModeConfig {
     pub factor: u32,
     /// Hosts, suffixes and addresses that mock mode passes through (spec §8).
     pub passthrough: Exclusions,
+    /// Mocked requests pending at once (spec §8 "Bounds").
+    pub max_pending: usize,
     /// `<MIMIC_TRUST_DIR>/state/mode`.
     pub state_file: PathBuf,
 }
@@ -57,10 +64,25 @@ impl ModeConfig {
             Some(value) => Exclusions::parse(value)
                 .map_err(|reason| ConfigError::invalid(PASSTHROUGH_VAR, value, reason))?,
         };
+        let max_pending = match env.optional(MAX_PENDING_VAR) {
+            None => DEFAULT_MAX_PENDING,
+            Some(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|n| MAX_PENDING_RANGE.contains(n))
+                .ok_or_else(|| {
+                    ConfigError::invalid(
+                        MAX_PENDING_VAR,
+                        value,
+                        "expected a number from 1 to 65536",
+                    )
+                })?,
+        };
         Ok(ModeConfig {
             mode,
             factor,
             passthrough,
+            max_pending,
             state_file: trust_dir.join("state").join("mode"),
         })
     }
@@ -72,6 +94,7 @@ impl Default for ModeConfig {
             mode: Mode::Discovery,
             factor: DEFAULT_FACTOR,
             passthrough: Exclusions::default(),
+            max_pending: DEFAULT_MAX_PENDING,
             state_file: PathBuf::new(),
         }
     }
@@ -143,6 +166,8 @@ struct Inner {
     current: Mutex<Current>,
     state_file: PathBuf,
     gauge: Gauge,
+    /// Counts the changes of mode: a period of the miss log (spec §8) is one value.
+    epoch: AtomicU64,
 }
 
 /// The mode and latency factor of the sidecar, shared between the pull client and its readers.
@@ -167,6 +192,7 @@ impl ModeState {
             }),
             state_file: config.state_file.clone(),
             gauge: Gauge::default(),
+            epoch: AtomicU64::new(0),
         }))
     }
 
@@ -219,6 +245,11 @@ impl ModeState {
         self.get().0
     }
 
+    /// Changes with each change of mode.
+    pub fn epoch(&self) -> u64 {
+        self.0.epoch.load(Ordering::Acquire)
+    }
+
     /// The latency factor in hundredths.
     pub fn factor(&self) -> u32 {
         self.get().1
@@ -252,6 +283,9 @@ impl ModeState {
         {
             let mut current = self.current();
             (current.mode, current.factor) = (mode, factor);
+            if mode != previous {
+                self.0.epoch.fetch_add(1, Ordering::AcqRel);
+            }
         }
         self.0.gauge.set(i64::from(mode == Mode::Mock));
         changed(mode, Some(previous), factor, Source::Pull);
