@@ -948,6 +948,9 @@ logic in `mimic-core` (`discovery` module).
   its store write ends (F8, SHR-18): the parsed reports of a write cost about three times the
   body, so two pushes near `MIMIC_SIDECAR_API_MAX_REPORT` are stored one after the other (the
   second gets the `503` and the sidecar re-posts it), while small pushes stay concurrent.
+  From #339 a parsed report costs at most 1.6 times its JSON (SHR-22) and a write holds one
+  parsed report, so two such pushes fit in memory at once (SHR-23); the default budget is
+  unchanged.
 - `GET /v1/workloads/<deployment>/egress?format=1` (F9): the deployment's egress set, with
   `ETag` and `304`, under the memory bounds of §7.7. It shares the admission, authentication
   and `TokenReview` limits above; it has no body.
@@ -1100,7 +1103,11 @@ logic in `mimic-core` (`discovery` module).
     reads `:report` (from F8 with `:outbound`: the stored report is their union), `:meta`
     `version` and the `:seq` fields of its pushes; answers
     `applied: false` for a push whose sequence is not above the stored one of its pod and
-    session; merges the others into the stored report with the **bounded merge** below;
+    session; merges the others into the stored report with the **bounded merge** below
+    (from #339 a push waits for its write as its checked JSON, re-redacted and stamped, not
+    as a parsed report, and the merge reads it into the stored report as it parses it: no
+    second parsed report is built, and a write that starts again reads it again; the result
+    is byte-identical to the bounded merge of the parsed push, SHR-21);
     drops endpoints and samples whose `last_seen` is older than `MIMIC_STORE_TTL` (in whole
     days), and from F8 the outbound scopes that are older and hold no endpoint any more; and
     runs one Lua script that, only if `version` and the `:seq` fields are still
@@ -2235,7 +2242,8 @@ of F3, which can be set to answer as a controller up to F7 (`400` with an empty 
 report that is not `"version": 1`). A *canary* is as in §12.5. From F8, SHR-01 replaces the
 version clause of CTL-01 and the last clause of EGR-03, SHR-15 replaces EGR-13, and the last
 clause of EGR-19 no longer holds (SHR-19 checks the merged outbound report); their tests are
-changed in the step that changes the behaviour.
+changed in the step that changes the behaviour. SHR-21 to SHR-23 come from enhancement #339
+(the in-memory report of the controller): they change no output, only its memory cost.
 
 | ID | Criterion |
 |---|---|
@@ -2259,6 +2267,9 @@ changed in the step that changes the behaviour.
 | SHR-18 | **I.** Controller memory: two concurrent pushes (the second waits for the body budget or gets `503`, and is re-posted) onto deployments whose stored reports are each at the store limits (512 inbound and 512 outbound endpoints over 128 authorities, schemas at their caps, `MIMIC_STORE_SAMPLE_BUDGET` full), with a body near `MIMIC_SIDECAR_API_MAX_REPORT` and the default `MIMIC_SIDECAR_API_BODY_BUDGET` (`32Mi`), then a document of each kind rendered per deployment, keep the controller's peak RSS (`VmHWM`) under 640 MiB (128 MiB of headroom under the chart's 768 Mi limit). |
 | SHR-19 | **E.** On kind, `front` (service A, `scripts/e2e/apps`) runs with 2 replicas injected in its own `enabled` namespace with a `MimicWorkload`, `UPSTREAM` the `users` Service (service B); a client sends calls spread over both pods to `/front/users/<id>` (GET with a canary bearer token and an `X-Tenant-Key` canary, PUT with a JSON body holding a canary) and `/front/missing`. Within 2 push intervals, through `kubectl port-forward` to a controller pod: front's `/report` holds `scopes.outbound."users.disc-22.svc:8080"` with `GET` and `PUT /users/{users_id}` and `GET /missing` (`404`), whose counts are the sums of the outbound calls in the two front pods' access lines, each pod having sent some (the union of both pods); `/v1/workloads/<ns>/front` lists both pods; `/openapi` lists `outbound-users.disc-22.svc:8080` and its document has `/users/{users_id}` with `get` and `put`, `servers` `http://users.disc-22.svc:8080`, and `X-Tenant-Key` as a redacted header parameter; within `MIMIC_STATUS_INTERVAL` more the `MimicWorkload` of front shows `endpoints.outbound: 3` and `totalEndpoints` equal to its inbound plus 3, and `kubectl get mimicworkload` prints that total under `Endpoints`. No canary is in front's report, documents, any Valkey value, the controller's logs or the pods' `/discovery`. The `users` checks of CTL-20 and UI-11 still pass. |
 | SHR-20 | **E.** Browser: the headless Chromium of UI-12 loads front's deployment page and its `outbound-users.disc-22.svc:8080` document page: the endpoint list shows the outbound endpoints with their authority, the document shows `GET /users/{users_id}`, there is no "Try it out" or "Execute" button, Chromium's log shows no CSP violation and no request to an origin other than the port-forward, and the `users` pods log no access line during the run. |
+| SHR-21 | **U.** Byte identity of the compact report (#339): a corpus committed before the first change of #339 (`crates/mimic-core/tests/golden/`: reports built by the recorder and the bounded merge from fixed seeds of the CTL, EGR and SHR generators, inbound and outbound, at and below the store limits) is reproduced byte for byte: `to_json`, both split parts, the §7.6 documents, the §7.5 index and endpoint list, and the §7.7 egress projection and digest. `to_json(from_json(x))` equals `x` for every report the recorder and the bounded merge produce (`proptest`, ≥ 10 000 cases); `from_json` accepts object keys in any order and keeps the last of duplicate keys at every map of the report, as before. Merging a push read from its JSON into a stored report (§7.3, write) gives the same bytes and the same `refused` and `evicted` counts as the bounded merge of the parsed push, for any order and grouping of pushes (`proptest`, ≥ 10 000 cases). |
+| SHR-22 | **I.** Footprint of a parsed report (`crates/mimic-core/tests`, `dhat` heap testing): the report of SHR-18 at the store limits (512 inbound and 512 outbound endpoints over 128 authorities, schemas at their caps, a full 4 MiB sample budget), read with `Report::from_json`, holds live heap bytes plus 16 bytes per live block of at most 1.6 times its JSON length (3.1 times before #339). |
+| SHR-23 | **I.** Concurrent writes (#339): the SHR-18 scenario with `MIMIC_SIDECAR_API_BODY_BUDGET` at `64Mi` (both pushes are read and written at once: neither gets a `503`) keeps the controller's peak RSS (`VmHWM`) under 640 MiB, and the SHR-18 scenario with the defaults peaks (highest of 5 runs) at no more than 70% of B, the highest of 5 runs of the same test before the first memory change of #339 (B is 509 MiB, measured by step 1 of #339: 422, 422, 509, 423 and 508 MiB over 5 runs, so the bound is 356 MiB). In both, the test holds each push body once and re-posts it without a copy, so that the peak is the controller's. |
 
 ### 12.10 F9 — Egress endpoint for sidecars
 
