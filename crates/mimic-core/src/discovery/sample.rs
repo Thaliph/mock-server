@@ -84,6 +84,15 @@ fn form_pairs(value: &Value) -> Vec<Pair> {
         .collect()
 }
 
+/// A body as a mock replays it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payload<'a> {
+    /// The canonical (compact) text of the JSON value.
+    Json(&'a str),
+    /// The pairs of a form, in order.
+    Form(Vec<(String, String)>),
+}
+
 /// A parsed body. Opaque and oversized bodies are not kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +108,14 @@ impl Body {
             return None;
         }
         Some(form_pairs(&self.value.value()))
+    }
+
+    fn payload(&self) -> (&str, Payload<'_>) {
+        let content = match self.form() {
+            Some(pairs) => Payload::Form(pairs.into_iter().map(|p| (p.key, p.value)).collect()),
+            None => Payload::Json(self.value.0.get()),
+        };
+        (&self.media, content)
     }
 
     /// The media type and the value as an example: a form is an object of field to value, a
@@ -294,6 +311,16 @@ impl Sample {
     /// As `request_body`, for the response.
     pub fn response_body(&self) -> Option<(&str, Value)> {
         self.response.body.as_ref().map(Body::example)
+    }
+
+    /// The media type and content of the parsed request body.
+    pub fn request_payload(&self) -> Option<(&str, Payload<'_>)> {
+        self.request.body.as_ref().map(Body::payload)
+    }
+
+    /// As `request_payload`, for the response.
+    pub fn response_payload(&self) -> Option<(&str, Payload<'_>)> {
+        self.response.body.as_ref().map(Body::payload)
     }
 
     /// A status in 100..=599; bodies of a parsed media type and at most `MAX_BODY` bytes.
