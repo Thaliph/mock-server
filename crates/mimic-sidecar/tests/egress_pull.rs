@@ -1030,6 +1030,18 @@ async fn fixed_app() -> SocketAddr {
     addr
 }
 
+fn untimed(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(o) => {
+            o.remove("head_ms");
+            o.remove("latency");
+            o.values_mut().for_each(untimed);
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(untimed),
+        _ => {}
+    }
+}
+
 /// One outbound call through the proxy: the raw answer, the projection of what discovery
 /// recorded and the access lines without what varies from one run to the next.
 async fn one_call(held: Option<&str>) -> (Vec<u8>, String, Vec<serde_json::Value>) {
@@ -1069,6 +1081,10 @@ async fn one_call(held: Option<&str>) -> (Vec<u8>, String, Vec<serde_json::Value
     answer.truncate(got);
     let lines = logs.access_exactly(1).await;
     let recorded = EgressSet::project(&discovery.report()).to_json().unwrap();
+    // Timings aside.
+    let mut recorded: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+    untimed(&mut recorded);
+    let recorded = recorded.to_string();
     if let Some(rig) = rig {
         rig.stop().await;
     }
@@ -1077,7 +1093,7 @@ async fn one_call(held: Option<&str>) -> (Vec<u8>, String, Vec<serde_json::Value
         .map(|mut l| {
             if let Some(o) = l.as_object_mut() {
                 o.retain(|k, _| {
-                    !["time", "duration", "latency", "src", "peer", "ms"]
+                    !["time", "duration", "latency", "src", "dst", "peer", "ms"]
                         .iter()
                         .any(|v| k.contains(v))
                 });

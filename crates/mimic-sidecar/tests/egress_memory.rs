@@ -255,7 +255,10 @@ fn patch(set: &Bytes, variant: Variant) -> (usize, &'static [u8]) {
     match variant {
         Variant::First => (0, b""),
         Variant::Second => (find(b"\"GET\""), b"\"PUT\""),
-        Variant::Refused => (find(b"\"/p00001\""), b"\"/p00000\""),
+        Variant::Refused => {
+            let at = find(b"\"template\":\"/p00001\"");
+            (at + 11, b"\"/p00000\"")
+        }
     }
 }
 

@@ -5,10 +5,16 @@
 mod metrics;
 mod pull;
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use mimic_core::discovery::egress::EgressSet;
+use axum::Router;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use mimic_core::discovery::egress::{self, EgressSet};
 use mimic_runtime::config::{ConfigError, Env};
 
 use crate::discovery::Target;
@@ -57,7 +63,7 @@ impl EgressConfig {
     }
 }
 
-/// `<n>`, `<n>Ki` or `<n>Mi`, from 64Ki to 1Gi.
+/// `<n>`, `<n>Ki`, `<n>Mi` or `<n>Gi`, from 64Ki to 1Gi.
 fn size(env: &Env, var: &str, default: usize) -> Result<usize, ConfigError> {
     let Some(value) = env.optional(var) else {
         return Ok(default);
@@ -65,6 +71,7 @@ fn size(env: &Env, var: &str, default: usize) -> Result<usize, ConfigError> {
     let (digits, unit) = match value {
         v if v.ends_with("Ki") => (&v[..v.len() - 2], KIB),
         v if v.ends_with("Mi") => (&v[..v.len() - 2], MIB),
+        v if v.ends_with("Gi") => (&v[..v.len() - 2], GIB),
         v => (v, 1),
     };
     let bytes = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
@@ -76,7 +83,7 @@ fn size(env: &Env, var: &str, default: usize) -> Result<usize, ConfigError> {
         _ => Err(ConfigError::invalid(
             var,
             value,
-            "expected a size such as 4Mi (<n>, <n>Ki or <n>Mi) from 64Ki to 1Gi",
+            "expected a size such as 4Mi (<n>, <n>Ki, <n>Mi or <n>Gi) from 64Ki to 1Gi",
         )),
     }
 }
@@ -139,8 +146,51 @@ impl Snapshot {
         drop(old);
     }
 
+    /// The local view (spec §7.7): what the pod could mock, no sample and no field name.
+    pub fn summary(&self) -> String {
+        let held = self.held();
+        let pulled = held.pulled.and_then(|at| {
+            time::OffsetDateTime::from(at)
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        });
+        match (&held.set, &pulled) {
+            // A controller that sent no `ETag`: the set is held, but nothing names it.
+            (Some(set), Some(pulled)) => {
+                egress::summary(Some((set, held.etag.as_deref().unwrap_or(""), pulled)))
+            }
+            _ => egress::summary(None),
+        }
+    }
+
+    /// `GET /egress`, for the admin listener. Answered to loopback peers only: the admin
+    /// router must be served with connection info.
+    pub fn router(&self) -> Router {
+        Router::new()
+            .route("/egress", get(serve))
+            .with_state(self.clone())
+    }
+
     /// A `304`: the set is kept.
     fn touch(&self, now: SystemTime) {
         self.held().pulled = Some(now);
+    }
+}
+
+async fn serve(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(snapshot): State<Snapshot>,
+) -> Response {
+    if !peer.ip().to_canonical().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            "egress is answered to loopback peers only\n",
+        )
+            .into_response();
+    }
+    // A large set must not stall the admin listener's worker.
+    match tokio::task::spawn_blocking(move || snapshot.summary()).await {
+        Ok(json) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
