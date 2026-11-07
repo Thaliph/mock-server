@@ -32,12 +32,7 @@ pub const AUTHORITIES: [&str; 6] = [
     "pay.example:443",
     "<redacted>:443",
 ];
-const QUERIES: [&str; 4] = [
-    "",
-    "page=2&sort=name",
-    "key=abc123&q=x",
-    "ids=1&ids=2&flag",
-];
+const QUERIES: [&str; 4] = ["", "page=2&sort=name", "key=abc123&q=x", "ids=1&ids=2&flag"];
 
 /// One exchange to record, by index into the tables above.
 #[derive(Debug, Clone)]
@@ -216,7 +211,13 @@ pub fn full_report(salt: usize) -> Report {
                 sni: None,
                 dst: None,
             };
-            report.record_at(scope.clone(), &via, &limits, &Redactor::default(), &exchange);
+            report.record_at(
+                scope.clone(),
+                &via,
+                &limits,
+                &Redactor::default(),
+                &exchange,
+            );
         }
     }
     report.stamp(20_000);
