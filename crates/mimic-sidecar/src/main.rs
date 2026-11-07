@@ -117,6 +117,7 @@ async fn run(
     let egress_metrics = EgressMetrics::default();
     egress_metrics.register(&mut metrics);
     let max_pending = mode.max_pending;
+    let passthrough = mode.passthrough.clone();
     let mode = ModeState::start(&mode, &mut metrics).await;
     let snapshot = Snapshot::new(mode);
     let mock = Mock::with_budget(
@@ -126,6 +127,7 @@ async fn run(
         discovery.tap().budget(),
     );
     mock.register(&mut metrics);
+    mock.set_passthrough(passthrough);
     let puller =
         Puller::new(egress, egress_metrics, snapshot.clone()).map_err(std::io::Error::other)?;
     let metrics = Arc::new(metrics);

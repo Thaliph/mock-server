@@ -10,7 +10,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ use mimic_core::discovery::redact::{self, Redactor};
 use mimic_core::mock::{self, Miss, Random};
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
 use mimic_core::proxy::http1::CAPTURE_BODY_LIMIT;
+use mimic_core::proxy::tls::Exclusions;
 use mimic_runtime::metrics::Metrics;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -108,6 +109,8 @@ struct Inner {
     miss_log: Mutex<MissLog>,
     /// Milliseconds a mocked connection may stay silent in the middle of a request.
     stall_ms: AtomicU64,
+    /// `MIMIC_MOCK_PASSTHROUGH`.
+    passthrough: OnceLock<Exclusions>,
 }
 
 /// The mock of a sidecar: answers outbound requests from the snapshot while the mode is
@@ -143,6 +146,7 @@ impl Mock {
             connections: Family::default(),
             miss_log: Mutex::default(),
             stall_ms: AtomicU64::new(30_000),
+            passthrough: OnceLock::new(),
         }))
     }
 
@@ -151,6 +155,16 @@ impl Mock {
     pub fn set_stall(&self, stall: Duration) {
         let ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX).max(1);
         self.0.stall_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The destinations handled as in discovery while in mock (`MIMIC_MOCK_PASSTHROUGH`);
+    /// set once, at start.
+    pub fn set_passthrough(&self, passthrough: Exclusions) {
+        let _ = self.0.passthrough.set(passthrough);
+    }
+
+    pub(crate) fn passthrough(&self) -> &Exclusions {
+        self.0.passthrough.get_or_init(Exclusions::default)
     }
 
     /// Exposes the `mimic_mock_*` metrics in `metrics`.
@@ -387,12 +401,28 @@ impl HyperService<Request<Incoming>> for Service {
     }
 }
 
-/// The streams of a mocked `h2` connection, for its idle timeout: how many are open, and how
-/// many have begun or ended.
-#[derive(Default)]
+/// The streams of a mocked `h2` connection, for its idle timeout: how many are open, and when
+/// the last one began or ended.
 struct Streams {
     open: AtomicUsize,
-    events: AtomicU64,
+    active: Mutex<tokio::time::Instant>,
+}
+
+impl Streams {
+    fn new() -> Streams {
+        Streams {
+            open: AtomicUsize::new(0),
+            active: Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        *self.active.lock().unwrap_or_else(PoisonError::into_inner) = tokio::time::Instant::now();
+    }
+
+    fn last_active(&self) -> tokio::time::Instant {
+        *self.active.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// An open stream, counted until the service future ends (answered or dropped).
@@ -401,7 +431,7 @@ struct Open<'a>(&'a Streams);
 impl<'a> Open<'a> {
     fn new(streams: &'a Streams) -> Open<'a> {
         streams.open.fetch_add(1, Ordering::AcqRel);
-        streams.events.fetch_add(1, Ordering::AcqRel);
+        streams.touch();
         Open(streams)
     }
 }
@@ -409,7 +439,7 @@ impl<'a> Open<'a> {
 impl Drop for Open<'_> {
     fn drop(&mut self) {
         self.0.open.fetch_sub(1, Ordering::AcqRel);
-        self.0.events.fetch_add(1, Ordering::AcqRel);
+        self.0.touch();
     }
 }
 
@@ -596,7 +626,7 @@ impl Mock {
             owed: AtomicBool::new(false),
         });
         let conn = Arc::new(Conn {
-            streams: Streams::default(),
+            streams: Streams::new(),
             mock: self.clone(),
             ctx,
             clock: Some(clock.clone()),
@@ -649,7 +679,7 @@ impl Mock {
         mut abort: Pin<&mut (impl Future<Output = ()> + Send)>,
     ) {
         let conn = Arc::new(Conn {
-            streams: Streams::default(),
+            streams: Streams::new(),
             mock: self.clone(),
             ctx,
             clock: None,
@@ -665,8 +695,10 @@ impl Mock {
         let mut served = std::pin::pin!(served);
         let mut stopped = std::pin::pin!(stopped);
         // A connection with no stream open for `idle` gets `GOAWAY`, as the header-read
-        // timeout of an HTTP/1 mocked connection closes it (spec §8).
-        let mut seen = conn.streams.events.load(Ordering::Acquire);
+        // timeout of an HTTP/1 mocked connection closes it (spec §8): one deadline, moved
+        // by the activity of the streams.
+        let deadline = tokio::time::sleep_until(conn.streams.last_active() + idle);
+        let mut deadline = std::pin::pin!(deadline);
         let ended = loop {
             tokio::select! {
                 r = served.as_mut() => break Some(r),
@@ -679,18 +711,25 @@ impl Mock {
                     };
                 }
                 () = abort.as_mut() => break None,
-                () = tokio::time::sleep(idle) => {
-                    let events = conn.streams.events.load(Ordering::Acquire);
-                    if conn.streams.open.load(Ordering::Acquire) == 0 && events == seen {
-                        tracing::debug!(target: "mock", %dst, "mocked h2 connection idle");
-                        served.as_mut().graceful_shutdown();
-                        break tokio::select! {
-                            r = served.as_mut() => Some(r),
-                            () = tokio::time::sleep(IDLE_GRACE) => None,
-                            () = abort.as_mut() => None,
+                () = deadline.as_mut() => {
+                    let due = conn.streams.last_active() + idle;
+                    if conn.streams.open.load(Ordering::Acquire) > 0 || due > tokio::time::Instant::now() {
+                        // Busy, or active since the deadline was set: wait for the next one.
+                        let next = if conn.streams.open.load(Ordering::Acquire) > 0 {
+                            tokio::time::Instant::now() + idle
+                        } else {
+                            due
                         };
+                        deadline.as_mut().reset(next);
+                        continue;
                     }
-                    seen = events;
+                    tracing::debug!(target: "mock", %dst, "mocked h2 connection idle");
+                    served.as_mut().graceful_shutdown();
+                    break tokio::select! {
+                        r = served.as_mut() => Some(r),
+                        () = tokio::time::sleep(IDLE_GRACE) => None,
+                        () = abort.as_mut() => None,
+                    };
                 }
             }
         };

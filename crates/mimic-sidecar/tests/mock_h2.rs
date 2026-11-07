@@ -205,6 +205,27 @@ async fn mck_12_an_idle_h2_connection_with_no_stream_open_is_closed_but_not_whil
     assert_eq!(rig.accepted.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn mck_12_the_idle_deadline_runs_from_the_end_of_the_last_stream() {
+    let rig = rig(users_set(5), 100, 1024).await;
+    rig.mock.set_stall(Duration::from_millis(600));
+    let mut sender = h2c(rig.addr).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (head, _, _) = send(&mut sender, get(1)).await;
+    assert_eq!(head.status(), 200);
+    let answered = Instant::now();
+    while !sender.is_closed() {
+        assert!(answered.elapsed() < Duration::from_secs(5), "never closed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // One deadline: the idle time counts from the end of the stream, not 1 to 2 periods.
+    let idle = answered.elapsed();
+    assert!(
+        idle >= Duration::from_millis(500) && idle < Duration::from_millis(750),
+        "{idle:?}"
+    );
+}
+
 // --- MCK-15 -----------------------------------------------------------------------------
 
 #[tokio::test]

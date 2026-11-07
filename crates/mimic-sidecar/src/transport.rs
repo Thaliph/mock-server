@@ -23,7 +23,27 @@ use tokio_rustls::TlsStream;
 #[derive(Clone)]
 pub struct Socket {
     tcp: Arc<TcpStream>,
-    prefix: Arc<Mutex<Vec<u8>>>,
+    prefix: Arc<Mutex<Prefix>>,
+}
+
+/// Bytes read ahead and handed back, and how many of them were handed back already.
+pub struct Prefix {
+    bytes: Vec<u8>,
+    taken: usize,
+}
+
+impl Prefix {
+    /// Copies the next bytes into `buf`; false once nothing is left.
+    fn take(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        let rest = &self.bytes[self.taken..];
+        if rest.is_empty() {
+            return false;
+        }
+        let n = rest.len().min(buf.remaining());
+        buf.put_slice(&rest[..n]);
+        self.taken += n;
+        true
+    }
 }
 
 impl Socket {
@@ -35,7 +55,10 @@ impl Socket {
     pub fn with_prefix(tcp: TcpStream, prefix: Vec<u8>) -> Self {
         Self {
             tcp: Arc::new(tcp),
-            prefix: Arc::new(Mutex::new(prefix)),
+            prefix: Arc::new(Mutex::new(Prefix {
+                bytes: prefix,
+                taken: 0,
+            })),
         }
     }
 
@@ -52,10 +75,7 @@ impl AsyncRead for Socket {
     ) -> Poll<io::Result<()>> {
         {
             let mut prefix = self.prefix.lock().unwrap_or_else(|e| e.into_inner());
-            if !prefix.is_empty() {
-                let n = prefix.len().min(buf.remaining());
-                buf.put_slice(&prefix[..n]);
-                prefix.drain(..n);
+            if prefix.take(buf) {
                 return Poll::Ready(Ok(()));
             }
         }
@@ -110,7 +130,7 @@ pub enum Stream {
     Tls(Box<TlsStream<Socket>>),
     /// A stream that reads `prefix` before anything from `inner` (the bytes protocol
     /// detection consumed from a decrypted stream).
-    Replay(Vec<u8>, Box<Stream>),
+    Replay(Prefix, Box<Stream>),
 }
 
 impl Stream {
@@ -129,7 +149,13 @@ impl Stream {
 
     /// `self`, reading `prefix` first.
     pub fn with_prefix(self, prefix: Vec<u8>) -> Self {
-        Self::Replay(prefix, Box::new(self))
+        Self::Replay(
+            Prefix {
+                bytes: prefix,
+                taken: 0,
+            },
+            Box::new(self),
+        )
     }
 
     /// The TCP socket under the stream.
@@ -156,13 +182,10 @@ impl AsyncRead for Stream {
                 r => Poll::Ready(r),
             },
             Self::Replay(prefix, inner) => {
-                if prefix.is_empty() {
-                    return Pin::new(&mut **inner).poll_read(cx, buf);
+                if prefix.take(buf) {
+                    return Poll::Ready(Ok(()));
                 }
-                let n = prefix.len().min(buf.remaining());
-                buf.put_slice(&prefix[..n]);
-                prefix.drain(..n);
-                Poll::Ready(Ok(()))
+                Pin::new(&mut **inner).poll_read(cx, buf)
             }
         }
     }

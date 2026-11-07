@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::mock_rig::{AUTHORITY, Rig, TlsSetup, rig_full, users_set};
+use common::mock_rig::{AUTHORITY, Options, Rig, TlsSetup, rig_full, rig_with, users_set};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Bytes;
@@ -350,4 +350,62 @@ async fn mck_13_a_decrypted_stream_that_is_not_http_is_closed() {
         .expect("closed in time");
     assert!(out.is_empty());
     assert_closed_by_mock(&rig, None, None).await;
+}
+
+#[tokio::test]
+async fn mck_13_a_decrypted_stream_that_stays_silent_is_closed_after_the_stall() {
+    let (ca, root) = ca_state();
+    let rig = rig_with(
+        users_set(5),
+        100,
+        1024,
+        None,
+        Options {
+            tls: Some(TlsSetup {
+                exclude: "",
+                ca: Some(ca),
+            }),
+            stall: Some(Duration::from_millis(400)),
+            ..Options::default()
+        },
+    )
+    .await;
+    let mut tls = handshake(&rig, &root, name("api.test"), &[]).await.unwrap();
+    let started = std::time::Instant::now();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(TIMEOUT, tls.read_to_end(&mut out))
+        .await
+        .expect("closed by the stall");
+    assert!(out.is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(350));
+    assert_closed_by_mock(&rig, None, None).await;
+}
+
+#[tokio::test]
+async fn mck_13_a_client_that_rejects_the_leaf_is_closed_and_the_next_connection_too() {
+    let (ca, _) = ca_state();
+    // A client that trusts another root rejects the leaf.
+    let (_, wrong_root) = ca_state();
+    let rig = mock_rig("", Some(ca)).await;
+    let failed = handshake(&rig, &wrong_root, name("api.test"), &[b"http/1.1"]).await;
+    assert!(failed.is_err());
+    let access = rig.logs.access_exactly(1).await;
+    assert_eq!(access[0]["result"], "mock_closed", "{access:?}");
+    assert_eq!(access[0]["interception"], "client_rejected");
+    assert_eq!(
+        rig.counter("mimic_mock_connections_total{decision=\"closed\"}"),
+        1
+    );
+    // The destination is remembered: the next connection is closed without a handshake.
+    let mut tcp = TcpStream::connect(rig.addr).await.unwrap();
+    tcp.write_all(&tls11_hello("api.test")).await.unwrap();
+    closed_without_answer(&mut tcp).await;
+    let access = rig.logs.access_exactly(2).await;
+    assert_eq!(access[1]["result"], "mock_closed", "{access:?}");
+    assert_eq!(access[1]["interception"], "client_rejected");
+    assert_eq!(
+        rig.counter("mimic_mock_connections_total{decision=\"closed\"}"),
+        2
+    );
+    assert_eq!(rig.accepted.load(Ordering::SeqCst), 0);
 }
