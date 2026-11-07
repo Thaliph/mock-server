@@ -54,6 +54,16 @@ impl CaptureBudget {
         CaptureBudget(Arc::new(Budget::new(limit)))
     }
 
+    /// Bytes held now.
+    pub fn used(&self) -> usize {
+        self.0.used.load(Ordering::Acquire)
+    }
+
+    /// The budget, `MIMIC_DISCOVERY_CAPTURE_BUDGET`.
+    pub fn limit(&self) -> usize {
+        self.0.limit
+    }
+
     pub(crate) fn reservation(&self) -> Reservation {
         Reservation {
             budget: self.0.clone(),

@@ -475,6 +475,13 @@ fn log_lines(logs: &Mutex<Vec<u8>>) -> Vec<serde_json::Value> {
 
 // ---- the mocked clients: a child process, so that the RSS measured is the sidecar's ----
 
+/// What the clients saw, reported on stdout by the child process (spec MCK-18): overload
+/// answers (`599`) on HTTP/1 and on `h2`, and `h2` streams that ended any other way.
+static H1_OVERLOAD: AtomicUsize = AtomicUsize::new(0);
+static H2_OVERLOAD: AtomicUsize = AtomicUsize::new(0);
+static H2_OTHER: AtomicUsize = AtomicUsize::new(0);
+static H1_OTHER: AtomicUsize = AtomicUsize::new(0);
+
 /// An HTTP/1 client: sends the request and keeps the connection.
 async fn h1_client(addr: SocketAddr, payload: Bytes) {
     let Ok(mut s) = TcpStream::connect(addr).await else {
@@ -488,7 +495,13 @@ async fn h1_client(addr: SocketAddr, payload: Bytes) {
     let _ = s.write_all(&payload).await;
     let mut buf = [0u8; 256];
     // The overload answer, or nothing for a pending request.
-    let _ = s.read(&mut buf).await;
+    if let Ok(n) = s.read(&mut buf).await {
+        if buf[..n].starts_with(b"HTTP/1.1 599") {
+            H1_OVERLOAD.fetch_add(1, Ordering::SeqCst);
+        } else {
+            H1_OTHER.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     std::future::pending::<()>().await;
 }
 
@@ -510,7 +523,19 @@ async fn h2_client(addr: SocketAddr, payload: Bytes) {
                 .header("content-type", "application/json")
                 .body(Full::new(payload))
                 .unwrap();
-            let _ = send.send_request(request).await;
+            // The overload answer is complete and followed by `RST_STREAM(NO_ERROR)`: the
+            // client sees the answer and no error.
+            let ok = async {
+                let response = send.send_request(request).await.ok()?;
+                let status = response.status();
+                response.into_body().collect().await.ok()?;
+                Some(status)
+            }
+            .await;
+            match ok {
+                Some(status) if status == 599 => H2_OVERLOAD.fetch_add(1, Ordering::SeqCst),
+                _ => H2_OTHER.fetch_add(1, Ordering::SeqCst),
+            };
         });
     }
     std::future::pending::<()>().await;
@@ -545,22 +570,52 @@ fn mck_18_clients_child_process() {
         let mut out = std::io::stdout();
         writeln!(out, "CLIENTS_STARTED").unwrap();
         out.flush().unwrap();
-        std::future::pending::<()>().await;
+        loop {
+            writeln!(
+                out,
+                "CLIENTS {} {} {} {}",
+                H1_OVERLOAD.load(Ordering::SeqCst),
+                H2_OVERLOAD.load(Ordering::SeqCst),
+                H1_OTHER.load(Ordering::SeqCst),
+                H2_OTHER.load(Ordering::SeqCst)
+            )
+            .unwrap();
+            out.flush().unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     });
 }
 
+/// What the clients reported last: `[h1 overload, h2 overload, h1 other, h2 other]`.
+type Seen = Arc<Mutex<[usize; 4]>>;
+
 /// Starts the clients in a child process; killing it aborts every client at once.
-fn spawn_clients(addr: SocketAddr) -> ApiProcess {
+fn spawn_clients(addr: SocketAddr) -> (ApiProcess, Seen) {
+    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
-    ApiProcess(
+    let mut clients = ApiProcess(
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "mck_18_clients_child_process", "--nocapture"])
             .env("MIMIC_TEST_MOCK_CLIENTS", addr.to_string())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn()
             .expect("the clients start"),
-    )
+    );
+    let seen = Seen::default();
+    let stdout = clients.0.stdout.take().unwrap();
+    let report = seen.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(counts) = line.strip_prefix("CLIENTS ") {
+                let n: Vec<usize> = counts.split(' ').filter_map(|v| v.parse().ok()).collect();
+                if let Ok(n) = <[usize; 4]>::try_from(n) {
+                    *report.lock().unwrap() = n;
+                }
+            }
+        }
+    });
+    (clients, seen)
 }
 
 /// The test runs in a child process with the allocator settings the measurement assumes:
@@ -640,7 +695,19 @@ async fn measure() {
     )
     .unwrap()
     .expect("a target");
-    let mock = Mock::new(snapshot.clone(), 1024, Redactor::default());
+    // The capture budget is discovery's, shared with the mock as `main.rs` does.
+    let discovery = Arc::new(
+        Discovery::start(
+            &DiscoveryConfig {
+                max_literals: 1000,
+                ..DiscoveryConfig::default()
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    let budget = discovery.tap().budget();
+    let mock = Mock::with_budget(snapshot.clone(), 1024, Redactor::default(), budget.clone());
     mock.register(&mut metrics);
     let tunnel = TunnelMetrics::register(&mut metrics);
     let proxy = ProxyMetrics::register(&mut metrics, 50);
@@ -665,16 +732,6 @@ async fn measure() {
         )
         .await;
     });
-    let discovery = Arc::new(
-        Discovery::start(
-            &DiscoveryConfig {
-                max_literals: 1000,
-                ..DiscoveryConfig::default()
-            },
-            None,
-        )
-        .unwrap(),
-    );
     tokio::spawn(puller.run(std::future::pending()));
     view_etag(admin_addr, "\"1-first\"").await;
     eprintln!("mck-18 first set held: peak {} MiB", peak_rss() >> 20);
@@ -691,7 +748,18 @@ async fn measure() {
 
     // 2 048 requests of 256 KiB from a child process.
     eprintln!("mck-18 before the mock load: peak {} MiB", peak_rss() >> 20);
-    let mut clients = spawn_clients(mock_addr);
+    let (mut clients, seen) = spawn_clients(mock_addr);
+    // The bodies being matched never hold more than the shared capture budget.
+    let peak_used = Arc::new(AtomicUsize::new(0));
+    let sampling = {
+        let (budget, peak_used) = (budget.clone(), peak_used.clone());
+        tokio::spawn(async move {
+            loop {
+                peak_used.fetch_max(budget.used(), Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
     let overload = "mimic_mock_miss_total{reason=\"overload\"}";
     until("1024 overload answers", Duration::from_secs(120), || {
         counter(&metrics, overload) >= 1024
@@ -710,6 +778,38 @@ async fn measure() {
         .count();
     assert_eq!(warns, 1);
     eprintln!("mck-18 at the cap: peak {} MiB", peak_rss() >> 20);
+    // The 1 024 overload answers reached the clients: `599` on HTTP/1, `599` then
+    // `RST_STREAM(NO_ERROR)` on `h2` (no error seen), and nothing else was answered.
+    until(
+        "the clients saw 1024 overload answers",
+        Duration::from_secs(30),
+        || {
+            let [h1, h2, _, _] = *seen.lock().unwrap();
+            h1 + h2 >= PENDING
+        },
+    )
+    .await;
+    let [h1, h2, h1_other, h2_other] = *seen.lock().unwrap();
+    assert_eq!(h1 + h2, PENDING, "overload answers: h1 {h1}, h2 {h2}");
+    assert_eq!(
+        (h1_other, h2_other),
+        (0, 0),
+        "answers other than the overload one"
+    );
+    // The budget was used (bodies were matched) and never exceeded; the bodies beyond it were
+    // matched as absent, and it is empty once the pending requests hold only their answers.
+    sampling.abort();
+    let used_peak = peak_used.load(Ordering::SeqCst);
+    assert!(used_peak > 0, "no body was ever held in the budget");
+    assert!(
+        used_peak <= budget.limit(),
+        "{used_peak} bytes held over a budget of {}",
+        budget.limit()
+    );
+    until("the budget is empty", Duration::from_secs(30), || {
+        budget.used() == 0
+    })
+    .await;
 
     // A pull that swaps the snapshot while the answers are pending.
     std::fs::write(&gate, "open").unwrap();

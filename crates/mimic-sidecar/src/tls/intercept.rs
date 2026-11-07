@@ -354,6 +354,17 @@ pub(crate) struct Plan {
     leaf: Arc<CertifiedKey>,
 }
 
+impl Plan {
+    /// The ALPN protocol a mocked connection answers with: `h2` when offered, else `http/1.1`,
+    /// else none (spec §5 "Mock mode").
+    pub(crate) fn mock_alpn(&self) -> Option<Vec<u8>> {
+        ["h2", "http/1.1"]
+            .into_iter()
+            .find(|p| self.alpn.iter().any(|offered| offered == p))
+            .map(|p| p.as_bytes().to_vec())
+    }
+}
+
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }

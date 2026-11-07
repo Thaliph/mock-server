@@ -24,6 +24,8 @@ pub enum Outcome {
     Unframed,
     /// Closed at the end of the shutdown grace.
     Shutdown,
+    /// A connection the mock closed instead of connecting it (spec §5, §8).
+    MockClosed,
 }
 
 impl Outcome {
@@ -35,6 +37,7 @@ impl Outcome {
             Outcome::Rejected => "rejected",
             Outcome::Unframed => "unframed",
             Outcome::Shutdown => "shutdown",
+            Outcome::MockClosed => "mock_closed",
         }
     }
 }

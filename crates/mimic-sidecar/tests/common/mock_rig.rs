@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -12,12 +13,16 @@ use mimic_core::discovery::observed::Observation;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::{Direction as CoreDirection, Exchange, Limits, Report, Via};
 use mimic_core::discovery::scope::ScopeKey;
+use mimic_core::proxy::tls::Exclusions;
 use mimic_runtime::metrics::Metrics;
+use mimic_sidecar::discovery::CaptureBudget;
 use mimic_sidecar::egress::Snapshot;
 use mimic_sidecar::listener::{Direction, OriginalDst, Shared, TunnelMetrics, spawn_listener};
 use mimic_sidecar::mock::Mock;
 use mimic_sidecar::mode::{ModeConfig, ModeState};
 use mimic_sidecar::red::ProxyMetrics;
+use mimic_sidecar::tls::ca::CaState;
+use mimic_sidecar::tls::intercept::{Interception, TlsMetrics};
 use tokio::net::TcpListener;
 
 pub const AUTHORITY: &str = "users.test:8080";
@@ -143,6 +148,33 @@ async fn destination() -> (SocketAddr, Arc<AtomicUsize>) {
 }
 
 pub async fn rig(set: EgressSet, factor: u32, max_pending: usize) -> Rig {
+    rig_with_budget(set, factor, max_pending, None).await
+}
+
+/// Like [`rig`], keeping the request bodies being matched in `budget` (as `main.rs` shares
+/// the capture budget of discovery).
+pub async fn rig_with_budget(
+    set: EgressSet,
+    factor: u32,
+    max_pending: usize,
+    budget: Option<CaptureBudget>,
+) -> Rig {
+    rig_full(set, factor, max_pending, budget, None).await
+}
+
+/// TLS interception of the sidecar: the `MIMIC_TLS_EXCLUDE` value and the intermediate.
+pub struct TlsSetup {
+    pub exclude: &'static str,
+    pub ca: Option<Arc<CaState>>,
+}
+
+pub async fn rig_full(
+    set: EgressSet,
+    factor: u32,
+    max_pending: usize,
+    budget: Option<CaptureBudget>,
+    tls: Option<TlsSetup>,
+) -> Rig {
     let (dst, accepted) = destination().await;
     let logs = capture_logs();
     let mut metrics = Metrics::new("sidecar", "test");
@@ -154,18 +186,32 @@ pub async fn rig(set: EgressSet, factor: u32, max_pending: usize) -> Rig {
     let mode = ModeState::start(&config, &mut metrics).await;
     let snapshot = Snapshot::new(mode.clone());
     snapshot.load(set, "\"1\"");
-    let mock = Mock::new(snapshot.clone(), max_pending, Redactor::default());
+    let mock = match budget {
+        Some(budget) => {
+            Mock::with_budget(snapshot.clone(), max_pending, Redactor::default(), budget)
+        }
+        None => Mock::new(snapshot.clone(), max_pending, Redactor::default()),
+    };
     mock.register(&mut metrics);
     let tunnel = TunnelMetrics::register(&mut metrics);
     let proxy = ProxyMetrics::register(&mut metrics, 50);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let original: OriginalDst = Arc::new(move |_| Ok(dst));
-    let shared = Arc::new(
-        Shared::new(vec![addr], tunnel, original)
-            .with_proxy_metrics(proxy)
-            .with_mock(mock.clone()),
-    );
+    let mut shared = Shared::new(vec![addr], tunnel, original)
+        .with_proxy_metrics(proxy)
+        .with_mock(mock.clone());
+    if let Some(tls) = tls {
+        let metrics = TlsMetrics::register(&mut metrics);
+        shared = shared.with_tls(Interception::new(
+            Exclusions::parse(tls.exclude).unwrap(),
+            tls.ca,
+            Vec::<PathBuf>::new(),
+            PathBuf::new(),
+            metrics,
+        ));
+    }
+    let shared = Arc::new(shared);
     spawn_listener(listener, Direction::Outbound, shared.clone());
     Rig {
         addr,
