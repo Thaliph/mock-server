@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod fd;
 pub mod identity;
 pub mod inject;
+pub mod load;
 pub mod mock;
 pub mod proxy;
 pub mod redirect;
