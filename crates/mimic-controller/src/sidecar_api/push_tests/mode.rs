@@ -30,6 +30,22 @@ fn modes(answer: &Pulled) -> (Option<&str>, Option<&str>) {
     )
 }
 
+/// `:pulls` once `done` holds: the write runs after the answer.
+async fn pulls_when(
+    s: &Setup,
+    deployment: &str,
+    done: impl Fn(&BTreeMap<String, String>) -> bool,
+) -> BTreeMap<String, String> {
+    for _ in 0..200 {
+        let found = pulls(s, deployment).await;
+        if done(&found) {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("`:pulls` never reached the expected state");
+}
+
 async fn pulls(s: &Setup, deployment: &str) -> BTreeMap<String, String> {
     let key = keys(&s.ns, deployment).unwrap().pulls;
     redis::cmd("HGETALL")
@@ -145,7 +161,7 @@ async fn mck_08_each_pull_writes_pulls_with_the_expiry_of_pods_fields() {
     push_report(&s, "pay", SESSION, 1, &outbound_report(&[AUTHORITY])).await;
     workload(&s, &s.ns, "pay-workload", true, 100);
     let first = pull(&s, "pay", None).await;
-    let before = pulls(&s, "pay").await;
+    let before = pulls_when(&s, "pay", |p| p.contains_key(&pod_of("pay"))).await;
     let (mode, ms) = before[&pod_of("pay")].split_once(' ').unwrap();
     assert_eq!(mode, "mock");
     let ms: u64 = ms.parse().unwrap();
@@ -180,7 +196,11 @@ async fn mck_08_each_pull_writes_pulls_with_the_expiry_of_pods_fields() {
     workload(&s, &s.ns, "pay-workload", false, 100);
     let cached = pull(&s, "pay", Some(&first.etag())).await;
     assert_eq!(cached.status, 304);
-    let after = pulls(&s, "pay").await;
+    let after = pulls_when(&s, "pay", |p| {
+        p.get(&pod_of("pay"))
+            .is_some_and(|v| v.starts_with("discovery "))
+    })
+    .await;
     assert!(after[&pod_of("pay")].starts_with("discovery "), "{after:?}");
     // Other deployments' keys are untouched.
     assert!(pulls(&s, "web").await.is_empty());
@@ -224,9 +244,16 @@ async fn mck_08_a_stalled_pulls_write_never_delays_the_answer_and_over_16_are_dr
     let started = std::time::Instant::now();
     for _ in 0..40 {
         let answer = pull(&s, "pay", None).await;
-        assert_eq!((answer.status, answer.header("mimic-mode")), (200, Some("mock")));
+        assert_eq!(
+            (answer.status, answer.header("mimic-mode")),
+            (200, Some("mock"))
+        );
     }
-    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
     wait_for(&s, "mimic_store_writes_total{result=\"dropped\"} 24").await;
     // Released: the 16 in flight are written.
     s.api.store.stall_pulls.store(false, Ordering::SeqCst);

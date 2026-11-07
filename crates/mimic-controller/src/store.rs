@@ -25,6 +25,8 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot};
 
 /// Deployments written at once per replica (memory bound).
 const MAX_WRITERS: usize = 2;
+/// `:pulls` writes in flight at once; a pull over that is not recorded (spec §7.7).
+const MAX_PULL_WRITES: usize = 16;
 /// Attempts of one write before `503`.
 const ATTEMPTS: u32 = 5;
 const BACKOFF_MS: std::ops::RangeInclusive<u64> = 10..=100;
@@ -463,12 +465,17 @@ pub struct Store {
     connection: AsyncMutex<Option<MultiplexedConnection>>,
     script: redis::Script,
     writers: Semaphore,
+    /// `:pulls` writes in flight (F10).
+    pull_writes: Arc<Semaphore>,
     /// A deployment with a writer has an entry: the pushes waiting for its next write.
     queues: Mutex<Queues>,
     /// What was already logged: (namespace, deployment, reason or kind).
     logged: Mutex<BTreeSet<(String, String, String)>>,
     /// A failed write was logged and none succeeded since: one WARN per failure streak.
     failing: AtomicBool,
+    /// Test hook: `:pulls` writes wait while this is set.
+    #[cfg(test)]
+    pub stall_pulls: AtomicBool,
     /// Test hook: the next write panics.
     #[cfg(test)]
     panic_next_write: AtomicBool,
@@ -607,6 +614,9 @@ impl Store {
             connection: AsyncMutex::new(None),
             script: redis::Script::new(WRITE),
             writers: Semaphore::new(MAX_WRITERS),
+            pull_writes: Arc::new(Semaphore::new(MAX_PULL_WRITES)),
+            #[cfg(test)]
+            stall_pulls: AtomicBool::new(false),
             queues: Mutex::new(BTreeMap::new()),
             logged: Mutex::new(BTreeSet::new()),
             failing: AtomicBool::new(false),
@@ -1097,14 +1107,38 @@ impl Store {
         }
     }
 
-    /// Notes that `pod` pulled the egress set and was answered `mode` (spec §7.3 `:pulls`).
-    /// Best effort: a failure is counted and changes nothing for the caller.
-    pub async fn record_pull(&self, namespace: &str, deployment: &str, pod: &str, mode: &str) {
+    /// Notes that `pod` pulled the egress set and was answered `mode` (spec §7.3 `:pulls`), in a
+    /// task of its own: the answer never waits for Valkey. At most [`MAX_PULL_WRITES`] run at
+    /// once; a pull over that is counted `dropped` and not recorded. A failure is counted `error`.
+    pub fn record_pull(
+        self: &Arc<Self>,
+        namespace: &str,
+        deployment: &str,
+        pod: &str,
+        mode: &'static str,
+    ) {
         let Ok(k) = keys(namespace, deployment) else {
             return;
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let Ok(permit) = self.pull_writes.clone().try_acquire_owned() else {
+            self.metrics.write("dropped");
+            return;
+        };
+        let store = self.clone();
+        let pod = pod.to_string();
+        tokio::spawn(async move {
+            store.write_pull(&k, &pod, mode).await;
+            drop(permit);
+        });
+    }
+
+    async fn write_pull(&self, k: &Keys, pod: &str, mode: &str) {
+        #[cfg(test)]
+        while self.stall_pulls.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         let ttl_ms = u64::try_from(self.config.ttl.as_millis()).unwrap_or(u64::MAX);
         let Ok(mut conn) = self.connection().await else {

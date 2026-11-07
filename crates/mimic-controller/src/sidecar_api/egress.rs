@@ -589,7 +589,7 @@ impl SidecarApi {
         let reason = outcome.as_ref().err().and_then(|r| r.reason);
         self.record(ENDPOINT, &caller, result, reason);
         let mode = match &outcome {
-            Ok(_) => Some(self.pulled(&caller).await),
+            Ok(_) => Some(self.pulled(&caller)),
             Err(_) => None,
         };
         let response = match outcome {
@@ -618,18 +618,16 @@ impl SidecarApi {
 
     /// The mode a `200` or `304` carries, read when the answer is written, and noted in
     /// `:pulls`.
-    async fn pulled(&self, caller: &Caller) -> Effective {
+    fn pulled(&self, caller: &Caller) -> Effective {
         let mode = self
             .workloads
             .effective(&caller.namespace, &caller.deployment);
-        self.store
-            .record_pull(
-                &caller.namespace,
-                &caller.deployment,
-                &caller.pod,
-                mode.mode(),
-            )
-            .await;
+        self.store.record_pull(
+            &caller.namespace,
+            &caller.deployment,
+            &caller.pod,
+            mode.mode(),
+        );
         mode
     }
 
