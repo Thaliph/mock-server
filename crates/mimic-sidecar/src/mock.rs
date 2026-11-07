@@ -10,7 +10,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ use mimic_core::discovery::redact::{self, Redactor};
 use mimic_core::mock::{self, Miss, Random};
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
 use mimic_core::proxy::http1::CAPTURE_BODY_LIMIT;
+use mimic_core::proxy::tls::Exclusions;
 use mimic_runtime::metrics::Metrics;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -108,6 +109,8 @@ struct Inner {
     miss_log: Mutex<MissLog>,
     /// Milliseconds a mocked connection may stay silent in the middle of a request.
     stall_ms: AtomicU64,
+    /// `MIMIC_MOCK_PASSTHROUGH`.
+    passthrough: OnceLock<Exclusions>,
 }
 
 /// The mock of a sidecar: answers outbound requests from the snapshot while the mode is
@@ -143,6 +146,7 @@ impl Mock {
             connections: Family::default(),
             miss_log: Mutex::default(),
             stall_ms: AtomicU64::new(30_000),
+            passthrough: OnceLock::new(),
         }))
     }
 
@@ -151,6 +155,12 @@ impl Mock {
     pub fn set_stall(&self, stall: Duration) {
         let ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX).max(1);
         self.0.stall_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The destinations handled as in discovery while in mock (`MIMIC_MOCK_PASSTHROUGH`);
+    /// set once, at start.
+    pub fn set_passthrough(&self, passthrough: Exclusions) {
+        let _ = self.0.passthrough.set(passthrough);
     }
 
     /// Exposes the `mimic_mock_*` metrics in `metrics`.

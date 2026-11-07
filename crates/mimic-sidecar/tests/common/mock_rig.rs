@@ -3,8 +3,9 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::{Logs, capture_logs};
 use mimic_core::Mode;
@@ -15,7 +16,7 @@ use mimic_core::discovery::report::{Direction as CoreDirection, Exchange, Limits
 use mimic_core::discovery::scope::ScopeKey;
 use mimic_core::proxy::tls::Exclusions;
 use mimic_runtime::metrics::Metrics;
-use mimic_sidecar::discovery::CaptureBudget;
+use mimic_sidecar::discovery::{CaptureBudget, Tap};
 use mimic_sidecar::egress::Snapshot;
 use mimic_sidecar::listener::{Direction, OriginalDst, Shared, TunnelMetrics, spawn_listener};
 use mimic_sidecar::mock::Mock;
@@ -23,6 +24,7 @@ use mimic_sidecar::mode::{ModeConfig, ModeState};
 use mimic_sidecar::red::ProxyMetrics;
 use mimic_sidecar::tls::ca::CaState;
 use mimic_sidecar::tls::intercept::{Interception, TlsMetrics};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 pub const AUTHORITY: &str = "users.test:8080";
@@ -127,24 +129,87 @@ pub struct Rig {
     pub mock: Mock,
     pub accepted: Arc<AtomicUsize>,
     pub shared: Arc<Shared>,
+    /// The bytes the destination received, in `Dest::Hold` mode.
+    pub received: Arc<Mutex<Vec<u8>>>,
+    /// The connections of the destination that ended (EOF or reset), in `Dest::Hold` mode.
+    pub closed: Arc<AtomicUsize>,
+}
+
+/// What the destination does with a connection.
+#[derive(Clone, Copy, Default)]
+pub enum Dest {
+    /// Counts the connection and closes it at once.
+    #[default]
+    Drop,
+    /// Counts the connection, writes `greeting` first, records what it receives, answers
+    /// the first bytes it receives with `reply`, and counts the end of the connection.
+    Hold {
+        greeting: &'static [u8],
+        reply: &'static [u8],
+    },
+}
+
+/// What differs from the default mock rig.
+#[derive(Default)]
+pub struct Options {
+    pub tls: Option<TlsSetup>,
+    /// `MIMIC_MOCK_PASSTHROUGH`.
+    pub passthrough: &'static str,
+    /// The stall of an incomplete protocol prefix and of a mocked connection.
+    pub stall: Option<Duration>,
+    pub dest: Dest,
+    pub discovery: Option<Tap>,
 }
 
 /// A destination that counts the connections it accepts.
-async fn destination() -> (SocketAddr, Arc<AtomicUsize>) {
+async fn destination(
+    dest: Dest,
+) -> (
+    SocketAddr,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<u8>>>,
+    Arc<AtomicUsize>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepted = Arc::new(AtomicUsize::new(0));
-    let count = accepted.clone();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let (count, bytes, ended) = (accepted.clone(), received.clone(), closed.clone());
     tokio::spawn(async move {
         loop {
-            let Ok((s, _)) = listener.accept().await else {
+            let Ok((mut s, _)) = listener.accept().await else {
                 return;
             };
             count.fetch_add(1, Ordering::SeqCst);
-            drop(s);
+            let Dest::Hold { greeting, reply } = dest else {
+                drop(s);
+                continue;
+            };
+            let (bytes, ended) = (bytes.clone(), ended.clone());
+            tokio::spawn(async move {
+                if !greeting.is_empty() && s.write_all(greeting).await.is_err() {
+                    return;
+                }
+                let mut replied = false;
+                let mut buf = [0u8; 4096];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(n) if n > 0 => {
+                            bytes.lock().unwrap().extend_from_slice(&buf[..n]);
+                            if !reply.is_empty() && !replied {
+                                replied = true;
+                                let _ = s.write_all(reply).await;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                ended.fetch_add(1, Ordering::SeqCst);
+            });
         }
     });
-    (addr, accepted)
+    (addr, accepted, received, closed)
 }
 
 pub async fn rig(set: EgressSet, factor: u32, max_pending: usize) -> Rig {
@@ -159,7 +224,7 @@ pub async fn rig_with_budget(
     max_pending: usize,
     budget: Option<CaptureBudget>,
 ) -> Rig {
-    rig_full(set, factor, max_pending, budget, None).await
+    rig_with(set, factor, max_pending, budget, Options::default()).await
 }
 
 /// TLS interception of the sidecar: the `MIMIC_TLS_EXCLUDE` value and the intermediate.
@@ -175,7 +240,28 @@ pub async fn rig_full(
     budget: Option<CaptureBudget>,
     tls: Option<TlsSetup>,
 ) -> Rig {
-    let (dst, accepted) = destination().await;
+    let options = Options {
+        tls,
+        ..Options::default()
+    };
+    rig_with(set, factor, max_pending, budget, options).await
+}
+
+pub async fn rig_with(
+    set: EgressSet,
+    factor: u32,
+    max_pending: usize,
+    budget: Option<CaptureBudget>,
+    options: Options,
+) -> Rig {
+    let Options {
+        tls,
+        passthrough,
+        stall,
+        dest,
+        discovery,
+    } = options;
+    let (dst, accepted, received, closed) = destination(dest).await;
     let logs = capture_logs();
     let mut metrics = Metrics::new("sidecar", "test");
     let config = ModeConfig {
@@ -193,6 +279,10 @@ pub async fn rig_full(
         None => Mock::new(snapshot.clone(), max_pending, Redactor::default()),
     };
     mock.register(&mut metrics);
+    mock.set_passthrough(Exclusions::parse(passthrough).unwrap());
+    if let Some(stall) = stall {
+        mock.set_stall(stall);
+    }
     let tunnel = TunnelMetrics::register(&mut metrics);
     let proxy = ProxyMetrics::register(&mut metrics, 50);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -211,6 +301,12 @@ pub async fn rig_full(
             metrics,
         ));
     }
+    if let Some(stall) = stall {
+        shared = shared.with_detect_stall(stall);
+    }
+    if let Some(tap) = discovery {
+        shared = shared.with_discovery(tap);
+    }
     let shared = Arc::new(shared);
     spawn_listener(listener, Direction::Outbound, shared.clone());
     Rig {
@@ -222,6 +318,8 @@ pub async fn rig_full(
         mock,
         accepted,
         shared,
+        received,
+        closed,
     }
 }
 

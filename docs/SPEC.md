@@ -1925,7 +1925,9 @@ random numbers it hands to the draw.
     sidecar itself, with no connection to the destination, unless the target authority of its
     first request matches `MIMIC_MOCK_PASSTHROUGH` (below);
   - a TLS ClientHello: §5 "Mock mode"; an intercepted stream whose decrypted bytes are HTTP is
-    a mocked connection, any other decrypted stream is closed (`result: mock_closed`);
+    a mocked connection, any other decrypted stream is closed (`result: mock_closed`), and so
+    is one that sends no byte for 30 s (nothing is connected, so no server could speak first;
+    the stall of an incomplete prefix applies from the handshake on);
   - other client bytes (a client-first non-HTTP protocol: PostgreSQL, Redis, Kafka …):
     connected and relayed as an opaque tunnel, as in discovery, and recorded as a `tcp` tunnel
     (§6.1): mimic cannot answer them, and the workload under test needs its own datastores;
@@ -1935,10 +1937,15 @@ random numbers it hands to the draw.
     client before the destination spoke: the destination socket is closed without a byte
     written to it and the connection is handled as above. Only a TCP handshake reaches such a
     destination.
+  - Each connection is counted once in `mimic_mock_connections_total{decision}`: `mocked`,
+    `tunnel` (an opaque tunnel), `passthrough` or `closed`.
   - **Passthrough** (`MIMIC_MOCK_PASSTHROUGH`, from `spec.mock.passthrough`, grammar and
     matching of `spec.tls.exclude`, §5): a connection whose first request's target authority
     host, SNI, or destination IP (IP literal entries) matches is handled exactly as in
-    discovery (connected, forwarded, recorded), for its whole life. It is how internal
+    discovery (connected, forwarded, recorded), for its whole life. With a passthrough list,
+    an HTTP/1 connection is held until its first request head is complete (within the stall
+    of an incomplete prefix) to read the authority; the authority of an `h2c` connection is
+    not read: only the destination IP entries match it. It is how internal
     services the load test needs (an auth service, a TLS datastore excluded from interception)
     stay real. Applied at pod creation, like `spec.tls.exclude`.
 - **Requests on a mocked connection.** HTTP/1.1 (keep-alive, pipelining, `Expect:
@@ -1953,7 +1960,7 @@ random numbers it hands to the draw.
   answer is still unflushed, can let `hyper`'s own `400` out: it carries no data and reaches no
   destination, and the `unframed` line and count are written either way. The 30 s header-read
   timeout also closes idle keep-alive connections on the mocked path, and an HTTP/2 connection
-  with no stream open for 30 s (after the preface too) gets `GOAWAY` and is closed (the
+  with no stream open for 30 s (after the preface too, counted from the end of the last stream) gets `GOAWAY` and is closed (the
   no-idle-timeout rule of §4.1 holds for forwarded connections only); `MIMIC_MAX_CONNECTIONS`
   is the real bound. A
   `CONNECT` and a request that asks for an upgrade (`Upgrade`, extended `CONNECT`) are misses
