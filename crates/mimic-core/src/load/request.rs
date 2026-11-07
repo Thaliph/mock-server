@@ -9,8 +9,8 @@ use serde_json::{Number, Value};
 use super::plan::{Body, Endpoint, Plan, Sample};
 use crate::discovery::redact::MARKER;
 
-/// What the caller supplies besides the plan.
-#[derive(Debug, Clone)]
+/// What the caller supplies besides the plan. `Debug` prints the Secret's key names only.
+#[derive(Clone)]
 pub struct Context<'a> {
     /// The value of the `mimic-load-run` header.
     pub marker: &'a str,
@@ -22,7 +22,19 @@ pub struct Context<'a> {
     pub secrets: &'a BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl std::fmt::Debug for Context<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Context")
+            .field("ip", &self.ip)
+            .field("now_ms", &self.now_ms)
+            .field("secret_keys", &self.secrets.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A request to send. `Debug` prints the method, the indices, the header names and the sizes:
+/// the target, the header values and the body may hold credentials.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Request {
     /// Index in `plan.endpoints`.
     pub endpoint: usize,
@@ -33,6 +45,22 @@ pub struct Request {
     pub target: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("endpoint", &self.endpoint)
+            .field("sample", &self.sample)
+            .field("method", &self.method)
+            .field("target_len", &self.target.len())
+            .field(
+                "headers",
+                &self.headers.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            )
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Why no request is built. Never carries a value.

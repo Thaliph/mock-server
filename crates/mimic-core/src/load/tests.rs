@@ -910,3 +910,141 @@ mod robustness {
         assert!(accepted > 100, "{accepted} corrupted reports accepted");
     }
 }
+
+/// Follow-ups of the review of step 1: names with the marker, `Debug` without values, the plan
+/// limit's floor.
+mod follow_ups {
+    use super::*;
+    use crate::load::plan::{MIN_PLAN, plan_limit};
+
+    /// The report of `items` with `from` replaced by `to` in its JSON.
+    fn marked(items: &[Ex], from: &str, to: &str) -> Report {
+        let json = report(items).to_json().expect("a report");
+        assert!(json.contains(from), "{from} not in the report");
+        Report::from_json(&json.replace(from, to)).expect("a report")
+    }
+
+    fn all_fields() -> Spec {
+        let mut s = spec();
+        for field in [
+            "header/<redacted>",
+            "header/x-custom-name",
+            "query/<redacted>",
+            "query/qkey",
+            "body/<redacted>",
+            "body/jsonkey",
+            "body/n/<redacted>",
+            "body/fkey",
+        ] {
+            s.credentials.push(credential(field, "k"));
+        }
+        s
+    }
+
+    #[test]
+    fn ldt_01_a_marker_in_a_header_query_form_or_json_key_is_credentials() {
+        let named = Ex::new("POST", "/a", 200)
+            .header("x-custom-name", "v1")
+            .query("qkey=1")
+            .json(&json!({"jsonkey": 1, "n": {"deep": 2}}));
+        let mut form =
+            Ex::new("POST", "/f", 200).header("content-type", "application/x-www-form-urlencoded");
+        form.body = Some(b"fkey=1&g=2".to_vec());
+        let cases = [
+            (
+                vec![named.clone()],
+                r#"[["x-custom-name","v1"]"#,
+                r#"[["<redacted>","v1"]"#,
+            ),
+            (
+                vec![named.clone()],
+                r#""query":[["qkey""#,
+                r#""query":[["<redacted>""#,
+            ),
+            (
+                vec![named.clone()],
+                r#""value":{"jsonkey""#,
+                r#""value":{"<redacted>""#,
+            ),
+            (vec![named], r#"{"deep":2}"#, r#"{"<redacted>":2}"#),
+            (vec![form], r#"[["fkey","1"]"#, r#"[["<redacted>","1"]"#),
+        ];
+        for (items, from, to) in cases {
+            // Unmarked, the endpoint is planned.
+            let clean = plan(&report(&items), &all_fields());
+            assert_eq!(clean.plan.endpoints.len(), 1, "{from}");
+            // Marked: skipped at plan time, whatever the spec supplies.
+            let marked = marked(&items, from, to);
+            for s in [spec(), all_fields()] {
+                let p = plan(&marked, &s);
+                assert!(p.plan.endpoints.is_empty(), "{from}");
+                assert_eq!(skipped(&p), [("credentials", 1)], "{from}");
+            }
+        }
+    }
+
+    #[test]
+    fn ldt_01_context_and_request_debug_print_names_only() {
+        let secrets: BTreeMap<String, String> = [("token".to_string(), SECRET.to_string())].into();
+        let c = ctx(&secrets, 5);
+        let shown = format!("{c:?}");
+        assert!(shown.contains("token"), "{shown}");
+        assert!(
+            !shown.contains(SECRET) && !shown.contains(c.marker),
+            "{shown}"
+        );
+
+        let mut s = spec();
+        s.credentials = vec![
+            credential("header/authorization", "token"),
+            credential("query/api_key", "token"),
+        ];
+        let items = [Ex::new("GET", "/me", 200)
+            .header("authorization", &format!("Bearer {CANARY}"))
+            .query(&format!("api_key={CANARY}"))];
+        let r = one(&items, &s, &secrets);
+        assert_eq!(header(&r, "authorization"), [SECRET]);
+        let shown = format!("{r:?}");
+        assert!(
+            shown.contains("authorization") && shown.contains("GET"),
+            "{shown}"
+        );
+        for secret in [SECRET, CANARY, ctx(&secrets, 5).marker, "api_key"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        // Errors never hold a value either.
+        let e = format!("{:?}", Error::MissingSecret("token".into()));
+        assert!(!e.contains(SECRET));
+    }
+
+    #[test]
+    fn ldt_01_the_plan_limit_has_a_floor_that_holds_the_empty_plan() {
+        assert_eq!(MIN_PLAN, 64 << 10);
+        assert!(Plan::default().to_json().expect("json").len() < 64);
+        assert_eq!(plan_limit("64Ki"), Ok(64 << 10));
+        assert_eq!(plan_limit("65536"), Ok(64 << 10));
+        assert_eq!(plan_limit("8Mi"), Ok(8 << 20));
+        assert_eq!(plan_limit("256Mi"), Ok(256 << 20));
+        for bad in [
+            "63Ki", "65535", "34", "0", "", "257Mi", "1Gi", "-1", "8 Mi", "1.5Mi", "8MiB", "Mi",
+        ] {
+            assert!(plan_limit(bad).is_err(), "{bad}");
+        }
+        // A plan shrunk to the floor is readable.
+        let mut items = Vec::new();
+        for i in 0..40 {
+            items.push(
+                Ex::new("GET", "/big", 200).query(&format!("n={i}&pad={}", "x".repeat(4000))),
+            );
+        }
+        let mut s = spec();
+        s.max_plan = MIN_PLAN;
+        let p = planned(&items, &s);
+        let json = p.plan.to_json().expect("json");
+        assert!(json.len() <= MIN_PLAN);
+        assert!(Plan::from_json(&json, MIN_PLAN).is_ok());
+        // Even when everything is dropped.
+        let empty = Plan::default().to_json().expect("json");
+        assert!(Plan::from_json(&empty, MIN_PLAN).is_ok());
+    }
+}

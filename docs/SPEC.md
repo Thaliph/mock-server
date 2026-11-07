@@ -1748,11 +1748,17 @@ no `MimicLoadTest` and creates no Job).
   `status.skipped`, when it is `grpc` (recorded messages are opaque, §6: `grpc`), was
   answered `101` (`upgrade`), is not in `include` or is in `exclude` (`excluded`), has no
   usable sample (`no_sample`), or every usable sample needs a credential the spec does not
-  supply (`credentials`) or has a request body that was not kept (`opaque_body`). Usable
+  supply (`credentials`) or has a request body that was not kept (`opaque_body`: its request
+  has a `content-type` header but the report holds no body, because the recorder keeps none
+  for an oversize, unparsable or other than JSON or form body; sending it without body would
+  not be the recorded request, so such a sample is unusable and an endpoint with only such
+  samples is `opaque_body`). Usable
   samples: status 200–399, else, when the endpoint has none, 400–599. A sample *needs a
   credential* when a header, query value or body leaf of its request holds `<redacted>` (or is
-  a field marked `redacted`), or a path segment does (path credentials cannot be supplied); it
-  is usable only when every such field is in `credentials.fields`. The plan keeps at most
+  a field marked `redacted`); it is usable only when every such field is in
+  `credentials.fields`. A name cannot be supplied: a sample whose path segment, header name,
+  query key, form key or JSON object key holds `<redacted>` is never usable and counts as
+  `credentials`, whatever the spec supplies. The plan keeps at most
   `MIMIC_LOAD_MAX_ENDPOINTS` endpoints, those with the most exchanges (ties: endpoint key
   order; the others `limit`), each with its usable samples, its `volatile` list, its port, its
   first host in byte order (else none) and a weight equal to its exchange count. While the
@@ -2195,7 +2201,7 @@ random numbers it hands to the draw.
 | `MIMIC_LOAD_MAX_DURATION` | `30m` | (F11) Longest `spec.duration` accepted, 10s–24h. |
 | `MIMIC_LOAD_POD_CONCURRENCY` | `128` | (F11) Concurrency of one generator pod: a run gets `ceil(concurrency / this)` pods, 1–4096. |
 | `MIMIC_LOAD_MAX_ENDPOINTS` | `64` | (F11) Endpoints in a plan (§7.8), 1–256. |
-| `MIMIC_LOAD_MAX_PLAN` | `8Mi` | (F11) Largest serialised plan (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–256Mi). |
+| `MIMIC_LOAD_MAX_PLAN` | `8Mi` | (F11) Largest serialised plan (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–256Mi). The floor leaves room for the plan's skeleton (about 34 bytes without endpoint) so that a shrunk plan is always readable; `load::plan` treats a smaller limit as 64Ki. |
 | `MIMIC_LOAD_START_TIMEOUT` | `5m` | (F11) Longest wait in `Pending` for the gate, and for a verified target (§7.8), 5s–1h. |
 | `MIMIC_LOAD_RESOURCES` | `{"requests":{"cpu":"500m","memory":"128Mi"},"limits":{"cpu":"2","memory":"256Mi"}}` | (F11) Generator pod `resources`, JSON. |
 | `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API (§7.5) and, from F6, UI listener (pages, OpenAPI documents, embedded Swagger UI); plain HTTP, loopback peers only. |

@@ -9,6 +9,34 @@ use crate::discovery::redact::MARKER;
 use crate::discovery::report::{Direction, Report};
 use crate::discovery::sample::{self as recorded, Payload};
 
+/// Smallest `MIMIC_LOAD_MAX_PLAN` (spec §10.2): the skeleton of an empty plan is about 34
+/// bytes, so a plan shrunk to this limit is always readable.
+pub const MIN_PLAN: usize = 64 << 10;
+
+/// Largest `MIMIC_LOAD_MAX_PLAN`.
+pub const MAX_PLAN: usize = 256 << 20;
+
+/// Parses `MIMIC_LOAD_MAX_PLAN` (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–256Mi).
+pub fn plan_limit(value: &str) -> Result<usize, String> {
+    let (digits, unit) = match value {
+        v if v.ends_with("Ki") => (&v[..v.len() - 2], 1usize << 10),
+        v if v.ends_with("Mi") => (&v[..v.len() - 2], 1usize << 20),
+        v => (v, 1),
+    };
+    let bytes = (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse::<usize>().ok())
+        .flatten()
+        .and_then(|n| n.checked_mul(unit))
+        .ok_or_else(|| format!("invalid size {value:?}, expected <n>, <n>Ki or <n>Mi"))?;
+    if (MIN_PLAN..=MAX_PLAN).contains(&bytes) {
+        Ok(bytes)
+    } else {
+        Err(format!(
+            "size {value:?} out of range, expected 64Ki to 256Mi"
+        ))
+    }
+}
+
 /// A credential the test supplies: the request field it replaces and the Secret key that holds
 /// the value. The plan holds these two names, never a value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -28,7 +56,8 @@ pub struct Spec {
     pub credentials: Vec<CredentialField>,
     /// `MIMIC_LOAD_MAX_ENDPOINTS`.
     pub max_endpoints: usize,
-    /// `MIMIC_LOAD_MAX_PLAN`, in bytes of the serialised plan.
+    /// `MIMIC_LOAD_MAX_PLAN`, in bytes of the serialised plan; at least `MIN_PLAN` (see
+    /// `plan_limit`), else a plan shrunk to the limit may be unreadable.
     pub max_plan: usize,
 }
 
@@ -102,38 +131,51 @@ fn token(key: &str) -> String {
 }
 
 /// The credential fields of the leaves of a JSON value that hold the marker.
-fn marked_leaves(pointer: &str, value: &Value, out: &mut BTreeSet<String>) {
+/// Returns `false` when an object key holds the marker: a name cannot be supplied.
+fn marked_leaves(pointer: &str, value: &Value, out: &mut BTreeSet<String>) -> bool {
     match value {
         Value::String(s) if s.contains(MARKER) => {
             out.insert(format!("body{pointer}"));
         }
         Value::Object(map) => {
             for (k, v) in map {
-                marked_leaves(&format!("{pointer}/{}", token(k)), v, out);
+                if k.contains(MARKER) || !marked_leaves(&format!("{pointer}/{}", token(k)), v, out)
+                {
+                    return false;
+                }
             }
         }
         Value::Array(items) => {
             for (i, v) in items.iter().enumerate() {
-                marked_leaves(&format!("{pointer}/{i}"), v, out);
+                if !marked_leaves(&format!("{pointer}/{i}"), v, out) {
+                    return false;
+                }
             }
         }
         _ => {}
     }
+    true
 }
 
 /// The credential fields a sample needs, or `None` when it needs one that cannot be supplied
-/// (a redacted path segment).
+/// (a redacted path segment, header name, query key, form key or JSON object key).
 fn needs(sample: &recorded::Sample) -> Option<BTreeSet<String>> {
     if sample.path().contains(MARKER) {
         return None;
     }
     let mut out = BTreeSet::new();
     for (name, value) in sample.request_headers() {
+        if name.contains(MARKER) {
+            return None;
+        }
         if value.contains(MARKER) {
             out.insert(format!("header/{name}"));
         }
     }
     for (key, value) in sample.query() {
+        if key.contains(MARKER) {
+            return None;
+        }
         if value.contains(MARKER) {
             out.insert(format!("query/{key}"));
         }
@@ -141,10 +183,15 @@ fn needs(sample: &recorded::Sample) -> Option<BTreeSet<String>> {
     match sample.request_payload() {
         Some((_, Payload::Json(text))) => {
             let value = serde_json::from_str(text).unwrap_or(Value::Null);
-            marked_leaves("", &value, &mut out);
+            if !marked_leaves("", &value, &mut out) {
+                return None;
+            }
         }
         Some((_, Payload::Form(pairs))) => {
             for (key, value) in pairs {
+                if key.contains(MARKER) {
+                    return None;
+                }
                 if value.contains(MARKER) {
                     out.insert(format!("body/{key}"));
                 }
