@@ -269,7 +269,7 @@ fn shr_01_push_limits_are_per_direction_and_for_authorities() {
 }
 
 #[derive(Debug, Clone)]
-struct Ex {
+pub(super) struct Ex {
     kind: u8,
     authority: usize,
     path: String,
@@ -290,7 +290,7 @@ const AUTHORITIES: [&str; 5] = [
 const SNIS: [&str; 3] = ["Api.Example.com", "other.example.com.", "x_y.example.com"];
 const DSTS: [&str; 3] = ["10.0.0.1:443", "[2001:db8::1]:8443", "[::ffff:10.0.0.9]:80"];
 
-fn exchange() -> impl Strategy<Value = Ex> {
+pub(super) fn exchange() -> impl Strategy<Value = Ex> {
     (
         0u8..3,
         0..AUTHORITIES.len(),
@@ -315,7 +315,7 @@ fn exchange() -> impl Strategy<Value = Ex> {
         )
 }
 
-fn record_all(items: &[Ex], max_authorities: usize) -> Report {
+pub(super) fn record_all(items: &[Ex], max_authorities: usize) -> Report {
     let mut l = limits();
     l.max_authorities = max_authorities;
     let mut r = Report::new(Some("p".into()));

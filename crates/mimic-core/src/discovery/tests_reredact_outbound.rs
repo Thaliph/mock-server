@@ -31,7 +31,7 @@ fn jwt(canary: &str) -> String {
 }
 
 /// The detected forms that go into an allowlisted header: the value and the secret part of it.
-fn form(i: usize, canary: &str) -> (String, String) {
+pub(super) fn form(i: usize, canary: &str) -> (String, String) {
     match i % 4 {
         0 => (jwt(canary), canary.to_string()),
         1 => (format!("AIza{canary}"), canary.to_string()),
@@ -70,7 +70,7 @@ fn leaked_json(observation: Observation<'_>, authority: &str, sni: &[&str]) -> S
     v.to_string()
 }
 
-fn hash_free(text: &str, needle: &str) -> bool {
+pub(super) fn hash_free(text: &str, needle: &str) -> bool {
     let hash = xxh3_64(needle.as_bytes());
     !text.contains(needle)
         && !text.contains(&hash.to_string())
@@ -84,7 +84,7 @@ fn fields(v: &Value, authority: &str) -> Value {
 }
 
 /// Request and response of the leaked exchange, one placeholder per place.
-struct Places<'a> {
+pub(super) struct Places<'a> {
     headers: Vec<(&'a str, &'a str)>,
     query: &'a str,
     body: &'a [u8],
@@ -92,7 +92,7 @@ struct Places<'a> {
     resp_body: &'a [u8],
 }
 
-fn leak_all(p: &Places<'_>, authority: &str, sni: &[&str]) -> String {
+pub(super) fn leak_all(p: &Places<'_>, authority: &str, sni: &[&str]) -> String {
     let mut headers = p.headers.clone();
     headers.push(("content-type", "application/json"));
     let mut resp = p.resp_headers.clone();
@@ -113,7 +113,7 @@ fn leak_all(p: &Places<'_>, authority: &str, sni: &[&str]) -> String {
 const BODY: &[u8] = br#"{"zzp3zz":"zzp3azz","a":{"b":{"c":{"d":{"znm":"zzp4zz"}}}}}"#;
 const RESP_BODY: &[u8] = br#"{"znr":"zzp8zz","ok":true}"#;
 
-fn standard() -> Places<'static> {
+pub(super) fn standard() -> Places<'static> {
     Places {
         headers: vec![
             ("x-extra", "zzp1zz"),
@@ -129,7 +129,7 @@ fn standard() -> Places<'static> {
 }
 
 /// The leaked JSON with every placeholder swapped for its canary form.
-fn plant(text: &str, canary: &str, ua: usize, etag: usize) -> String {
+pub(super) fn plant(text: &str, canary: &str, ua: usize, etag: usize) -> String {
     text.replace("zzp1zz", canary)
         .replace("zzp2zz", canary)
         .replace("zzp2azz", canary)
