@@ -2,7 +2,7 @@
 //! with status counters, a latency histogram and the hosts seen. Merging is pure,
 //! commutative and associative; recording an exchange merges a one-exchange report.
 
-use crate::compact::{SortedMap, SortedSet};
+use crate::compact::{Name, SortedMap, SortedSet};
 use std::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
@@ -116,7 +116,7 @@ pub enum Sampled {
 pub struct Stats {
     pub statuses: SortedMap<u16, u64>,
     pub latency: Histogram,
-    pub hosts: SortedSet<String>,
+    pub hosts: SortedSet<Name>,
     observed: Observed,
     samples: Samples,
     /// The UTC day (days since 1970-01-01) of the last push that held the endpoint. Set by
@@ -128,10 +128,10 @@ pub struct Stats {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Node {
-    literals: SortedMap<String, Node>,
+    literals: SortedMap<Name, Node>,
     param: Option<Box<Node>>,
     absorbing: bool,
-    endpoints: SortedMap<String, Stats>,
+    endpoints: SortedMap<Name, Stats>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,13 +139,13 @@ struct Node {
 struct Scope {
     root: Node,
     /// gRPC paths, never templated: path, then method.
-    raw: SortedMap<String, SortedMap<String, Stats>>,
+    raw: SortedMap<Name, SortedMap<Name, Stats>>,
     /// Outbound scopes only (spec §6.1): where the exchanges went.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     origin: Option<Origin>,
     /// Outbound scopes only: connections that were counted, not recorded, by kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    tunnels: Option<SortedMap<String, u64>>,
+    tunnels: Option<SortedMap<Name, u64>>,
     /// Outbound scopes only, set by the controller (spec §7.3, stamping): the last day the
     /// scope, its `origin` and its `tunnels` were pushed; a merge keeps the larger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,9 +172,9 @@ pub const TUNNEL_KINDS: [&str; 8] = [
 #[serde(deny_unknown_fields)]
 struct Origin {
     /// Exchanges per scheme, `http` and `https`.
-    schemes: SortedMap<String, u64>,
-    sni: SortedSet<String>,
-    dst: SortedSet<String>,
+    schemes: SortedMap<Name, u64>,
+    sni: SortedSet<Name>,
+    dst: SortedSet<Name>,
 }
 
 impl Origin {
@@ -183,21 +183,21 @@ impl Origin {
     fn of(via: &Via<'_>) -> Self {
         let scheme = if via.tls { "https" } else { "http" };
         let mut origin = Origin {
-            schemes: SortedMap::from([(scheme.to_string(), 1)]),
+            schemes: SortedMap::from([(Name::from(scheme), 1)]),
             ..Origin::default()
         };
         if let Some(sni) = via.sni
             && !scope::caught(sni)
             && let Some(sni) = scope::dns_host(sni)
         {
-            origin.sni.insert(sni);
+            origin.sni.insert(sni.into());
         }
         if let Some(dst) = via.dst {
             // As in the scope key (spec §6.1): the grammar has no room for port 0.
             let port = dst.port().max(1);
             origin.dst.insert(match dst.ip().to_canonical() {
-                IpAddr::V4(v4) => format!("{v4}:{port}"),
-                IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+                IpAddr::V4(v4) => format!("{v4}:{port}").into(),
+                IpAddr::V6(v6) => format!("[{v6}]:{port}").into(),
             });
         }
         origin
@@ -335,9 +335,9 @@ impl Stats {
             .filter(|_| exchange.direction == Direction::Inbound);
         s.hosts.extend(host.map(|h| {
             if value_rule(h).is_some() {
-                MARKER.to_string()
+                Name::from(MARKER)
             } else {
-                h.to_string()
+                Name::from(h)
             }
         }));
         s
@@ -403,7 +403,7 @@ impl Stats {
             .into_iter()
             .map(|h| {
                 if value_rule(&h).is_some() {
-                    MARKER.to_string()
+                    Name::from(MARKER)
                 } else {
                     h
                 }
@@ -415,7 +415,7 @@ impl Stats {
     }
 }
 
-fn merge_methods(into: &mut SortedMap<String, Stats>, from: SortedMap<String, Stats>) {
+fn merge_methods(into: &mut SortedMap<Name, Stats>, from: SortedMap<Name, Stats>) {
     for (method, stats) in from {
         into.entry(method).or_default().merge(stats);
     }
@@ -429,7 +429,7 @@ impl Node {
         for (literal, mut child) in std::mem::take(&mut self.literals) {
             child.re_redact_paths();
             self.literals
-                .entry(redact::segment(&literal))
+                .entry(redact::segment(&literal).into())
                 .or_default()
                 .merge(child, usize::MAX);
         }
@@ -507,7 +507,7 @@ impl Node {
             return Some(self);
         };
         match first {
-            Seg::Literal(literal) => self.literals.get(literal),
+            Seg::Literal(literal) => self.literals.get(literal.as_str()),
             Seg::Param => self.param.as_deref(),
         }?
         .at(rest)
@@ -518,7 +518,7 @@ impl Node {
             return Some(self);
         };
         match first {
-            Seg::Literal(literal) => self.literals.get_mut(literal),
+            Seg::Literal(literal) => self.literals.get_mut(literal.as_str()),
             Seg::Param => self.param.as_deref_mut(),
         }?
         .at_mut(rest)
@@ -531,9 +531,9 @@ impl Node {
         let mut out = Vec::with_capacity(segments.len());
         for segment in segments {
             match segment {
-                Seg::Literal(literal) if node.literals.contains_key(literal) => {
+                Seg::Literal(literal) if node.literals.contains_key(literal.as_str()) => {
                     out.push(segment.clone());
-                    node = &node.literals[literal];
+                    node = &node.literals[literal.as_str()];
                 }
                 _ => {
                     out.push(Seg::Param);
@@ -575,10 +575,10 @@ impl Node {
     /// Where the endpoints are: the segments of their template, and the method.
     fn places(&self, prefix: &mut Vec<Seg>, out: &mut Vec<(Vec<Seg>, String)>) {
         for method in self.endpoints.keys() {
-            out.push((prefix.clone(), method.clone()));
+            out.push((prefix.clone(), method.to_string()));
         }
         for (literal, child) in &self.literals {
-            prefix.push(Seg::Literal(literal.clone()));
+            prefix.push(Seg::Literal(literal.to_string()));
             child.places(prefix, out);
             prefix.pop();
         }
@@ -597,10 +597,10 @@ impl Node {
         };
         match first {
             Seg::Literal(literal) => {
-                if let Some(child) = self.literals.get_mut(literal) {
+                if let Some(child) = self.literals.get_mut(literal.as_str()) {
                     child.remove(rest, method);
                     if child.prunable() {
-                        self.literals.remove(literal);
+                        self.literals.remove(literal.as_str());
                     }
                 }
             }
@@ -631,7 +631,7 @@ impl Node {
             });
         }
         for (literal, child) in &self.literals {
-            prefix.push(Seg::Literal(literal.clone()));
+            prefix.push(Seg::Literal(literal.to_string()));
             child.collect(prefix, out);
             prefix.pop();
         }
@@ -662,8 +662,8 @@ impl Scope {
                 .into_iter()
                 .filter(|s| origin.schemes.get(*s).is_some_and(|n| *n > 0))
                 .collect();
-            meta.sni = origin.sni.iter().map(String::as_str).collect();
-            meta.dst = origin.dst.iter().map(String::as_str).collect();
+            meta.sni = origin.sni.iter().map(Name::as_str).collect();
+            meta.dst = origin.dst.iter().map(Name::as_str).collect();
         }
         if let Some(tunnels) = &self.tunnels {
             meta.tunnels = tunnels.iter().map(|(k, n)| (k.as_str(), *n)).collect();
@@ -721,7 +721,10 @@ impl Scope {
     fn re_redact_paths(&mut self) {
         self.root.re_redact_paths();
         for (path, methods) in std::mem::take(&mut self.raw) {
-            merge_methods(self.raw.entry(redact::path(&path)).or_default(), methods);
+            merge_methods(
+                self.raw.entry(redact::path(&path).into()).or_default(),
+                methods,
+            );
         }
     }
 
@@ -859,9 +862,9 @@ impl Report {
                         keys.push((
                             *direction,
                             scope_key.clone(),
-                            path.clone(),
-                            method.clone(),
-                            Place::Raw(path.clone()),
+                            path.to_string(),
+                            method.to_string(),
+                            Place::Raw(path.to_string()),
                         ));
                     }
                 }
@@ -879,10 +882,10 @@ impl Report {
             match place {
                 Place::Tree(segments) => scope.root.remove(segments, method),
                 Place::Raw(path) => {
-                    if let Some(methods) = scope.raw.get_mut(path) {
-                        methods.remove(method);
+                    if let Some(methods) = scope.raw.get_mut(path.as_str()) {
+                        methods.remove(method.as_str());
                         if methods.is_empty() {
-                            scope.raw.remove(path);
+                            scope.raw.remove(path.as_str());
                         }
                     }
                 }
@@ -955,14 +958,16 @@ impl Report {
         });
         all.sort_unstable_by_key(|(hash, ordinal, _)| std::cmp::Reverse((*hash, *ordinal)));
         let mut excess = total - budget;
-        let mut dropped = SortedSet::new();
+        let mut picked = Vec::new();
         for (hash, ordinal, bytes) in all {
             if excess == 0 {
                 break;
             }
             excess = excess.saturating_sub(bytes);
-            dropped.insert((ordinal, hash));
+            picked.push((ordinal, hash));
         }
+        // Sorted once, when the set is built.
+        let dropped: SortedSet<_> = picked.into_iter().collect();
         let mut ordinal = 0usize;
         self.for_each_stats_of_mut(only, |stats| {
             stats
@@ -978,7 +983,7 @@ impl Report {
         if exchange.grpc {
             return scope
                 .raw
-                .get(&redact::path(exchange.path))?
+                .get(redact::path(exchange.path).as_str())?
                 .get(exchange.method);
         }
         scope
@@ -1066,7 +1071,7 @@ impl Report {
         }
         let scope = Scope {
             origin: Some(Origin::default()),
-            tunnels: Some(SortedMap::from([((*kind).to_string(), 1)])),
+            tunnels: Some(SortedMap::from([(Name::from(*kind), 1)])),
             ..Scope::default()
         };
         let mut one = Report::new(self.pod.clone());
@@ -1174,7 +1179,7 @@ impl Report {
                 sampled = Sampled::Budget;
             }
         }
-        let methods = SortedMap::from([(exchange.method.to_string(), stats)]);
+        let methods = SortedMap::from([(Name::from(exchange.method), stats)]);
         let mut scope = Scope::default();
         if matches!(key, ScopeKey::Authority(_)) {
             scope.origin = Some(Origin::of(via));
@@ -1182,7 +1187,9 @@ impl Report {
         }
         if exchange.grpc {
             // Not templated, but redacted: the client chooses its `content-type`.
-            scope.raw.insert(redact::path(exchange.path), methods);
+            scope
+                .raw
+                .insert(redact::path(exchange.path).into(), methods);
         } else {
             let mut node = Node {
                 endpoints: methods,
@@ -1194,7 +1201,7 @@ impl Report {
                 if is_param(segment) {
                     parent.param = Some(Box::new(node));
                 } else {
-                    parent.literals.insert(segment.to_string(), node);
+                    parent.literals.insert(segment.into(), node);
                 }
                 node = parent;
             }
@@ -1439,8 +1446,8 @@ impl Report {
     ) -> Option<&Stats> {
         let scope = self.scopes.get(direction)?.get(key)?;
         match place {
-            Place::Tree(segments) => scope.root.at(segments)?.endpoints.get(method),
-            Place::Raw(path) => scope.raw.get(path)?.get(method),
+            Place::Tree(segments) => scope.root.at(segments)?.endpoints.get(method.as_str()),
+            Place::Raw(path) => scope.raw.get(path.as_str())?.get(method.as_str()),
         }
     }
 
@@ -1450,8 +1457,12 @@ impl Report {
     ) -> Option<&mut Stats> {
         let scope = self.scopes.get_mut(direction)?.get_mut(key)?;
         match place {
-            Place::Tree(segments) => scope.root.at_mut(segments)?.endpoints.get_mut(method),
-            Place::Raw(path) => scope.raw.get_mut(path)?.get_mut(method),
+            Place::Tree(segments) => scope
+                .root
+                .at_mut(segments)?
+                .endpoints
+                .get_mut(method.as_str()),
+            Place::Raw(path) => scope.raw.get_mut(path.as_str())?.get_mut(method.as_str()),
         }
     }
 
@@ -1473,8 +1484,8 @@ impl Report {
                 (template, Place::Tree(routed))
             }
             Place::Raw(path) => {
-                scope.raw.get(path)?;
-                (template.clone(), Place::Raw(path.clone()))
+                scope.raw.get(path.as_str())?;
+                (template.clone(), Place::Raw(path.to_string()))
             }
         };
         let routed = (*direction, key.clone(), template, method.clone(), place);
@@ -1562,7 +1573,7 @@ impl Report {
                 scope.root.collect(&mut Vec::new(), &mut found);
                 for (path, methods) in &scope.raw {
                     found.extend(methods.iter().map(|(m, s)| Found {
-                        template: path.clone(),
+                        template: path.to_string(),
                         segs: Vec::new(),
                         grpc: true,
                         method: m.as_str(),

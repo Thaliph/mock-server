@@ -7,7 +7,7 @@
 //! The JSON is what `Report::to_json` writes (the controller wrote it after the check): a key
 //! that appears twice is merged twice, where `from_json` keeps the last.
 
-use crate::compact::SortedMap;
+use crate::compact::{Name, SortedMap};
 use std::fmt;
 
 use serde::Deserialize;
@@ -207,7 +207,7 @@ impl<'de> Visitor<'de> for ScopeSeed<'_> {
                     }
                 }
                 ScopeField::Tunnels => {
-                    if let Some(tunnels) = map.next_value::<Option<SortedMap<String, u64>>>()? {
+                    if let Some(tunnels) = map.next_value::<Option<SortedMap<Name, u64>>>()? {
                         let mine = self.into.tunnels.get_or_insert_with(SortedMap::new);
                         for (kind, n) in tunnels {
                             let count = mine.entry(kind).or_default();
@@ -226,7 +226,7 @@ impl<'de> Visitor<'de> for ScopeSeed<'_> {
 }
 
 /// `raw`: path to method to stats.
-struct RawSeed<'a>(&'a mut SortedMap<String, SortedMap<String, Stats>>);
+struct RawSeed<'a>(&'a mut SortedMap<Name, SortedMap<Name, Stats>>);
 
 map_seed!(RawSeed<'_>);
 
@@ -238,7 +238,7 @@ impl<'de> Visitor<'de> for RawSeed<'_> {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        while let Some(path) = map.next_key::<String>()? {
+        while let Some(path) = map.next_key::<Name>()? {
             map.next_value_seed(MethodsSeed(self.0.entry(path).or_default()))?;
         }
         Ok(())
@@ -246,7 +246,7 @@ impl<'de> Visitor<'de> for RawSeed<'_> {
 }
 
 /// Method to stats: each `Stats` is read whole, then merged.
-struct MethodsSeed<'a>(&'a mut SortedMap<String, Stats>);
+struct MethodsSeed<'a>(&'a mut SortedMap<Name, Stats>);
 
 map_seed!(MethodsSeed<'_>);
 
@@ -258,7 +258,7 @@ impl<'de> Visitor<'de> for MethodsSeed<'_> {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        while let Some(method) = map.next_key::<String>()? {
+        while let Some(method) = map.next_key::<Name>()? {
             let stats: Stats = map.next_value()?;
             self.0.entry(method).or_default().merge(stats);
         }
@@ -313,7 +313,7 @@ impl<'de> Visitor<'de> for NodeSeed<'_> {
 }
 
 struct LiteralsSeed<'a> {
-    into: &'a mut SortedMap<String, Node>,
+    into: &'a mut SortedMap<Name, Node>,
     max_literals: usize,
 }
 
@@ -327,7 +327,7 @@ impl<'de> Visitor<'de> for LiteralsSeed<'_> {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        while let Some(literal) = map.next_key::<String>()? {
+        while let Some(literal) = map.next_key::<Name>()? {
             map.next_value_seed(NodeSeed {
                 into: self.into.entry(literal).or_default(),
                 max_literals: self.max_literals,

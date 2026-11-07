@@ -224,7 +224,11 @@ fn pul_01_projection_of_a_mixed_report() {
     let r = mixed();
     assert_matches_report(&r).expect("projection matches the report");
     let set = EgressSet::project(&r);
-    let authorities: Vec<_> = set.authorities.keys().map(String::as_str).collect();
+    let authorities: Vec<_> = set
+        .authorities
+        .keys()
+        .map(compact_str::CompactString::as_str)
+        .collect();
     // The tunnel-only scope and the inbound part are left out.
     assert_eq!(authorities, ["10.0.0.5:8080", AUTHORITY]);
     assert_eq!(set.endpoint_count(), 3);

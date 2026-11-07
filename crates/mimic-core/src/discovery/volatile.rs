@@ -2,7 +2,7 @@
 //! bottom-32 sketch of the XXH3 hashes of the (redacted) values. Integer-only, so merging is
 //! exact and order-independent.
 
-use crate::compact::{SortedMap, SortedSet};
+use crate::compact::{Name, SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
@@ -77,7 +77,7 @@ impl Field {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Volatility {
-    fields: SortedMap<String, Field>,
+    fields: SortedMap<Name, Field>,
 }
 
 impl Volatility {
@@ -103,7 +103,7 @@ impl Volatility {
                     _ => return,
                 }
             }
-            self.fields.insert(field.to_string(), Field::default());
+            self.fields.insert(Name::from(field), Field::default());
         }
         if let Some(f) = self.fields.get_mut(field) {
             if first {
@@ -120,7 +120,7 @@ impl Volatility {
     /// its `n` being the larger.
     pub(super) fn redact(&mut self, target: impl Fn(&str) -> Option<String>) {
         let marker = xxh3_64(MARKER.as_bytes());
-        let names: Vec<String> = self.fields.keys().cloned().collect();
+        let names: Vec<Name> = self.fields.keys().cloned().collect();
         for name in names {
             let Some(into) = target(&name) else {
                 continue;
@@ -128,9 +128,9 @@ impl Volatility {
             let from = if into == name {
                 None
             } else {
-                self.fields.remove(&name)
+                self.fields.remove(name.as_str())
             };
-            let field = self.fields.entry(into).or_default();
+            let field = self.fields.entry(into.into()).or_default();
             if let Some(from) = from {
                 field.n = field.n.max(from.n);
             }
@@ -141,7 +141,7 @@ impl Volatility {
     }
 
     /// The fields that are not the same in `other`, in either.
-    pub(super) fn changed(&self, other: &Self) -> SortedSet<String> {
+    pub(super) fn changed(&self, other: &Self) -> SortedSet<Name> {
         self.fields
             .keys()
             .chain(other.fields.keys())
@@ -152,7 +152,7 @@ impl Volatility {
 
     pub fn merge(mut self, other: Self) -> Self {
         for (name, f) in other.fields {
-            match self.fields.remove(&name) {
+            match self.fields.remove(name.as_str()) {
                 Some(mine) => {
                     self.fields.insert(
                         name,
@@ -195,7 +195,7 @@ impl Volatility {
 
     /// Tracked field names, in byte order.
     pub fn fields(&self) -> Vec<&str> {
-        self.fields.keys().map(String::as_str).collect()
+        self.fields.keys().map(Name::as_str).collect()
     }
 
     /// `n ≥ 3` and distinct values ≥ `n / 2`.
@@ -217,7 +217,7 @@ impl Volatility {
             .iter()
             .map(|(name, f)| {
                 (
-                    name.clone(),
+                    name.to_string(),
                     serde_json::json!({"n": f.n, "redacted": f.redacted, "volatile": f.volatile()}),
                 )
             })

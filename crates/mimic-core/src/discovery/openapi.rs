@@ -18,6 +18,7 @@ use super::report::{Direction, Endpoint, OutboundMeta, Report, Stats};
 use super::schema::string_format;
 use super::scope::ScopeKey;
 use super::template::{render_with, split_path};
+use crate::compact::Name;
 
 /// `openapi` of every document.
 pub const OPENAPI_VERSION: &str = "3.1.1";
@@ -426,7 +427,7 @@ fn latency(histogram: &Histogram) -> Option<Value> {
 fn servers(endpoints: &[Endpoint<'_>]) -> Vec<Value> {
     let hosts: BTreeSet<&str> = endpoints
         .iter()
-        .flat_map(|e| e.stats.hosts.iter().map(String::as_str))
+        .flat_map(|e| e.stats.hosts.iter().map(Name::as_str))
         .filter(|h| is_authority(h))
         .collect();
     hosts
