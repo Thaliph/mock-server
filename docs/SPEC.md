@@ -1110,14 +1110,20 @@ logic in `mimic-core` (`discovery` module).
     is byte-identical to the bounded merge of the parsed push, SHR-21);
     drops endpoints and samples whose `last_seen` is older than `MIMIC_STORE_TTL` (in whole
     days), and from F8 the outbound scopes that are older and hold no endpoint any more; and
-    stages the two parts under temporary keys `mimic:v1:{<ns>/<dep>}:stage:<random>:report` and
-    `…:outbound` (`SET` then `APPEND`, 1 MiB per command, 60 s expiry, so that no command holds a
-    copy of a whole part, #339), and runs one Lua script that, only if `version` and the `:seq`
+    stages the two parts under temporary keys `mimic:v1:{<ns>/<dep>}:stage:<128-bit random,
+    hex>:report` and `…:outbound` (1 MiB per command: `SET`, then `APPEND`s, so that no command
+    holds a copy of a whole part, #339; every command also renews the 60 s expiry of both keys,
+    so that no stage key exists without one, and a part that waits for the other does not
+    expire), and runs one Lua script that, only if `version` and the `:seq`
     fields are still those read and the staged keys have the lengths announced, `RENAME`s the
     staged keys over `:report` (from F8 the inbound part, and the outbound part over
     `:outbound`, deleted when there is none; so a reader sees the old value or the new one, never
     a part of it, and a crash between two chunks leaves only a temporary key that expires, which
-    no read uses; every refusal of the script deletes them), writes `:meta` (`version` + 1), `:seq`, `:pods` and both indexes,
+    no read uses; every refusal of the script, and every error or cancellation of the writer
+    between the first chunk and the script's answer, deletes them, best effort: the expiry
+    bounds what a crash leaves; a write holds up to about 3 times the size of a report in
+    Valkey, the old value, the staged parts and the new value, which `maxmemory` sizing must
+    allow), writes `:meta` (`version` + 1), `:seq`, `:pods` and both indexes,
     refreshes the expiries and prunes the indexes, refusing a new deployment past
     `MIMIC_STORE_MAX_DEPLOYMENTS` in the namespace (`507`). Otherwise nothing is written and
     the write starts again (at most 5 attempts, 10–100 ms random backoff, then `503`). So a

@@ -154,7 +154,7 @@ Key messages:
 
 | What | Default | Guidance |
 |---|---|---|
-| Valkey memory limit | `1Gi` (`maxmemory` 768Mi) | Watch `mimic_store_report_bytes` and Valkey `used_memory`. A deployment's report is bounded by the store limits (512 endpoints per direction, 4Mi of samples); up to 50 deployments per namespace. Raise `valkey.resources.limits.memory` for many deployments. |
+| Valkey memory limit | `1Gi` (`maxmemory` 768Mi) | Watch `mimic_store_report_bytes` and Valkey `used_memory`. A deployment's report is bounded by the store limits (512 endpoints per direction, 4Mi of samples); up to 50 deployments per namespace. Raise `valkey.resources.limits.memory` for many deployments. During a write Valkey holds the old report, the staged copy (temporary `:stage:` keys, gone after the write or 60 s) and the new one: size `maxmemory` for about 3x a report per deployment being written (two writes per controller replica at once). |
 | Valkey PVC | `4Gi` | At least twice `maxmemory`, see [AOF rewrites](#aof-rewrites-and-sizing). |
 | Controller memory limit | `768Mi` | The pushes the 32Mi push body budget lets through at once, each held until its write ends, plus allocator headroom. |
 | Sidecar memory limit | `128Mi` | Samples up to 16Mi, capture up to 8Mi, plus proxy state. Raise `inject.sidecarResources.limits.memory` for many endpoints or connections. |
