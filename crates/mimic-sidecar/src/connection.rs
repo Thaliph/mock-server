@@ -139,13 +139,19 @@ pub(crate) async fn handle(
     // The client spoke HTTP or TLS before the destination did: the mock answers, and the
     // destination socket is closed without a byte written to it (spec §8).
     let first = match (first, &mock) {
-        (First::Client(detection, buf), Some(mock))
+        (First::Client(detection, mut buf), Some(mock))
             if !passthrough
                 && matches!(
                     detection,
                     Detection::Http1 | Detection::H2 | Detection::Tls { .. }
                 ) =>
         {
+            // With a passthrough list the first request head is read whole (within the
+            // stall) to know its authority, as before connecting.
+            if matches!(pick(mock, &detection, &buf, dst, true), Pick::More) {
+                let deadline = tokio::time::Instant::now() + stall;
+                hold_head(&mut client, &mut buf, deadline, abort.as_mut()).await;
+            }
             match pick(mock, &detection, &buf, dst, false) {
                 Pick::Passthrough => {
                     mock.connection("passthrough");
@@ -336,6 +342,31 @@ fn tunnel_kind(interception: Option<&str>) -> &'static str {
     }
 }
 
+/// Reads from `client` until `buf` holds a whole HTTP/1 request head, the detection limit is
+/// reached, or `deadline` passes, the client ends or the connection is aborted.
+async fn hold_head(
+    client: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    deadline: tokio::time::Instant,
+    abort: impl Future<Output = ()>,
+) {
+    let mut abort = pin!(abort);
+    let deadline = tokio::time::sleep_until(deadline);
+    let mut deadline = pin!(deadline);
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < DETECT_LIMIT {
+        let mut chunk = [0u8; READ_CHUNK];
+        let want = READ_CHUNK.min(DETECT_LIMIT - buf.len());
+        tokio::select! {
+            () = &mut deadline => return,
+            read = client.read(&mut chunk[..want]) => match read {
+                Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                _ => return,
+            },
+            () = &mut abort => return,
+        }
+    }
+}
+
 /// What the client said first on an outbound connection in mock mode, before any connection
 /// to the destination.
 enum MockFirst {
@@ -365,25 +396,36 @@ async fn mock_first(
     let mut first = None;
     let silent = tokio::time::sleep(MOCK_WAIT);
     let mut silent = pin!(silent);
+    // One deadline from the first byte, not one per read: a client trickling bytes is cut too.
+    let deadline = tokio::time::sleep(stall);
+    let mut deadline = pin!(deadline);
     loop {
         let mut chunk = [0u8; READ_CHUNK];
         let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
         tokio::select! {
             () = &mut silent, if buf.is_empty() => return MockFirst::Other(buf),
-            () = stalled(!buf.is_empty(), stall) => {
-                // An HTTP/1 head still incomplete: the mock's own header timeout deals with it.
-                return match detect(&buf) {
-                    Detection::Http1 => MockFirst::Route(MockRoute::Http(
-                        false,
-                        buf,
-                        first.unwrap_or_else(Instant::now),
-                    )),
-                    _ => MockFirst::Other(buf),
-                };
+            () = &mut deadline, if !buf.is_empty() => {
+                // An HTTP/1 head still incomplete: decided on what it holds, and the mock's own
+                // header timeout deals with the rest. Any other incomplete prefix is reset.
+                let detection = detect(&buf);
+                if !matches!(detection, Detection::Http1) {
+                    return MockFirst::Gone;
+                }
+                if matches!(pick(mock, &detection, &buf, dst, false), Pick::Passthrough) {
+                    return MockFirst::Passthrough(buf);
+                }
+                return MockFirst::Route(MockRoute::Http(
+                    false,
+                    buf,
+                    first.unwrap_or_else(Instant::now),
+                ));
             }
             read = client.read(&mut chunk[..want]) => match read {
                 Ok(n) if n > 0 => {
-                    first.get_or_insert_with(Instant::now);
+                    if first.is_none() {
+                        first = Some(Instant::now());
+                        deadline.as_mut().reset(tokio::time::Instant::now() + stall);
+                    }
                     buf.extend_from_slice(&chunk[..n]);
                     let detection = detect(&buf);
                     if matches!(detection, Detection::NeedMore) {

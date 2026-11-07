@@ -334,7 +334,8 @@ async fn mck_14_a_passthrough_ip_entry_matches_the_destination_of_an_h2c_connect
     assert_eq!(decision(&rig, "passthrough"), 1);
 }
 
-const PASS_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\n\r\nok";
+const PASS_REPLY: &[u8] =
+    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\n\r\nok";
 
 fn passthrough_options(stall: Option<Duration>) -> Options {
     Options {
@@ -362,7 +363,9 @@ async fn mck_14_a_trickling_client_is_closed_at_one_deadline_from_its_first_byte
     let started = Instant::now();
     let head = b"GET /users/1 HTTP/1.1\r\nhost: users.test:8080\r\nx-slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let mut closed = false;
-    for byte in head {
+    // The request line at once, then the rest a byte at a time, each under the stall.
+    tcp.write_all(&head[..24]).await.unwrap();
+    for byte in &head[24..] {
         if tcp.write_all(&[*byte]).await.is_err() {
             closed = true;
             break;
@@ -421,13 +424,12 @@ async fn mck_14_a_head_that_stalls_after_the_silence_falls_back_to_the_mock() {
     .await;
     let mut tcp = TcpStream::connect(rig.addr).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    tcp.write_all(b"GET /users/1 HTTP/1.1\r\nhost: users.test:8080\r\n")
+    tcp.write_all(b"GET /users/1 HTTP/1.1\r\nhost: users.te")
         .await
         .unwrap();
     let mut out = Vec::new();
-    let _ = tokio::time::timeout(TIMEOUT, tcp.read_to_end(&mut out))
-        .await
-        .expect("closed in time");
+    let r = tokio::time::timeout(TIMEOUT, tcp.read_to_end(&mut out)).await;
+    r.expect("closed in time").ok();
     assert!(!String::from_utf8_lossy(&out).contains("ok"));
     eventually("the destination sees its socket closed", || {
         rig.closed.load(Ordering::SeqCst) == 1

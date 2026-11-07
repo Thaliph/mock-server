@@ -99,7 +99,10 @@ pub fn target_authority<'a>(uri: Option<&'a str>, host: Option<&'a str>) -> Opti
 /// `Host` header. `None` when neither is there (yet).
 pub fn http1_request_host(head: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(&head[..head.len().min(crate::proxy::DETECT_LIMIT)]);
-    let mut lines = text.split("\r\n");
+    // The last segment is not terminated yet: a line cut in the middle says nothing.
+    let mut lines: Vec<&str> = text.split("\r\n").collect();
+    lines.pop();
+    let mut lines = lines.into_iter();
     let target = lines.next()?.split(' ').nth(1)?;
     let from_target = target
         .split_once("://")
@@ -293,6 +296,7 @@ mod tests {
         );
         assert_eq!(host("GET / HTTP/1.1\r\nx: y\r\n\r\n"), None);
         assert_eq!(host("GET / HTTP/1.1\r\n"), None);
+        assert_eq!(host("GET / HTTP/1.1\r\nhost: users.te"), None);
         assert_eq!(host("GET"), None);
     }
 }
