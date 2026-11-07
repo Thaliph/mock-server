@@ -850,3 +850,254 @@ fn pul_17_the_binary_exits_2_on_an_invalid_value() {
         assert!(stderr.contains(var), "{var}={value}: {stderr}");
     }
 }
+
+#[test]
+fn pul_17_gi_is_a_size_unit_and_1gi_is_the_maximum() {
+    let config = EgressConfig::from_env(&env(&[("MIMIC_EGRESS_MAX_BYTES", "1Gi")])).unwrap();
+    assert_eq!(config.max_bytes, 1 << 30);
+    for value in ["2Gi", "0Gi", "Gi", "1.5Gi"] {
+        let e = EgressConfig::from_env(&env(&[("MIMIC_EGRESS_MAX_BYTES", value)])).unwrap_err();
+        assert!(
+            e.to_string().contains("MIMIC_EGRESS_MAX_BYTES"),
+            "{value}: {e}"
+        );
+    }
+}
+
+const CANARY_BODY: &str = "canary-sample-7b3e1f";
+const EMPTY_VIEW: &str = r#"{"authorities":{},"etag":null,"pulled":null}"#;
+
+/// A set whose samples hold `CANARY_BODY`.
+fn canary_set() -> String {
+    let mut report = Report::new(None);
+    let text = format!("{{\"id\":\"{CANARY_BODY}\"}}");
+    let resp = [("content-type", "application/json")];
+    report.record_at(
+        ScopeKey::Authority("api.example.com:443".into()),
+        &Via {
+            tls: true,
+            sni: Some("api.example.com"),
+            dst: None,
+        },
+        &limits(),
+        &Redactor::default(),
+        &Exchange {
+            direction: Direction::Outbound,
+            port: 8080,
+            method: "GET",
+            path: "/v1/ping",
+            status: 200,
+            head_ms: 3,
+            host: None,
+            grpc: false,
+            observation: Observation {
+                query: "",
+                req_headers: &[],
+                req_body: None,
+                resp_headers: &resp,
+                resp_body: Some(text.as_bytes()),
+            },
+        },
+    );
+    let json = EgressSet::project(&report).to_json().unwrap();
+    assert!(json.contains(CANARY_BODY), "the set holds the canary");
+    json
+}
+
+#[test]
+fn pul_16_a_loopback_peer_gets_the_summary_and_no_canary_leaves_the_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let api = rt.block_on(fake_api(
+        vec![Reply::Status(503), ok(&canary_set(), "\"1-aa\"")],
+        Reply::NotModified,
+    ));
+    let mut process = sidecar(&api, dir.path(), &[]);
+    let admin = process.admin_addr();
+    // Before the first answer: no snapshot.
+    let (status, body) = http_get(admin, "/egress");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, EMPTY_VIEW);
+    let mut view = serde_json::Value::Null;
+    for _ in 0..600 {
+        let (status, body) = http_get(admin, "/egress");
+        assert_eq!(status, 200, "{body}");
+        view = serde_json::from_str(&body).unwrap();
+        if view["etag"] == "\"1-aa\"" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(view["etag"], "\"1-aa\"", "{view}");
+    assert!(
+        view["pulled"].as_str().is_some_and(|t| t.contains('T')),
+        "{view}"
+    );
+    let endpoint = &view["authorities"]["api.example.com:443"]["endpoints"][0];
+    assert_eq!(endpoint["method"], "GET");
+    assert_eq!(endpoint["template"], "/v1/ping");
+    assert_eq!(endpoint["exchanges"], 1);
+    assert_eq!(endpoint["statuses"]["200"], 1);
+    assert!(endpoint.get("samples").is_none(), "{view}");
+    let (_, body) = http_get(admin, "/egress");
+    let (_, metrics) = http_get(admin, "/metrics");
+    process.terminate();
+    assert!(process.wait_exit(Duration::from_secs(10)).success());
+    let stdout = process.lines().join("\n");
+    for (what, text) in [("/egress", body), ("/metrics", metrics), ("stdout", stdout)] {
+        assert!(!text.contains(CANARY_BODY), "{what} holds the canary");
+    }
+}
+
+#[test]
+fn pul_16_a_non_loopback_peer_gets_403() {
+    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    let dir = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let api = rt.block_on(fake_api(vec![], Reply::Status(503)));
+    let mut process = sidecar(&api, dir.path(), &[("MIMIC_ADMIN_ADDR", "0.0.0.0:0")]);
+    let port = process.admin_addr().port();
+    let (status, _) = http_get(SocketAddr::from(([127, 0, 0, 1], port)), "/egress");
+    assert_eq!(status, 200);
+    // The address a route to a public destination would leave from.
+    let pod = UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("192.0.2.1:9").map(|()| s))
+        .and_then(|s| s.local_addr())
+        .map(|a| a.ip())
+        .ok()
+        .filter(|ip| !ip.is_loopback() && *ip != IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    match pod {
+        Some(ip) => {
+            let (status, body) = http_get(SocketAddr::new(ip, port), "/egress");
+            assert_eq!(status, 403, "{body}");
+            assert!(!body.contains("authorities"), "{body}");
+        }
+        None => eprintln!("no non-loopback address: 403 covered by the in-process test"),
+    }
+    process.terminate();
+    assert!(process.wait_exit(Duration::from_secs(10)).success());
+}
+
+#[tokio::test]
+async fn pul_16_the_router_refuses_a_non_loopback_peer_in_process() {
+    use axum::extract::ConnectInfo;
+    use tower::ServiceExt;
+    let get = |peer: &str| {
+        let mut request = axum::http::Request::get("/egress")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        Snapshot::default().router().oneshot(request)
+    };
+    for peer in ["10.1.2.3:4000", "[2001:db8::1]:4000"] {
+        let response = get(peer).await.unwrap();
+        assert_eq!(response.status(), 403, "{peer}");
+    }
+    for peer in ["127.0.0.1:4000", "[::1]:4000", "[::ffff:127.0.0.1]:4000"] {
+        let response = get(peer).await.unwrap();
+        assert_eq!(response.status(), 200, "{peer}");
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, EMPTY_VIEW);
+    }
+}
+
+/// An app that answers every request with the same fixed response.
+async fn fixed_app() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                while let Ok(n) = s.read(&mut buf).await {
+                    let reply: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+                    if n == 0 || s.write_all(reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// One outbound call through the proxy: the raw answer, the projection of what discovery
+/// recorded and the access lines without what varies from one run to the next.
+async fn one_call(held: Option<&str>) -> (Vec<u8>, String, Vec<serde_json::Value>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let logs = capture_logs();
+    let rig = match held {
+        Some(set) => {
+            let rig = Rig::start(vec![ok(set, "\"1-aa\"")], Reply::NotModified).await;
+            wait(|| rig.snapshot.endpoints() == 1).await;
+            Some(rig)
+        }
+        None => None,
+    };
+    let app = fixed_app().await;
+    let discovery = mimic_sidecar::discovery::Discovery::start(
+        &mimic_sidecar::discovery::DiscoveryConfig::default(),
+        None,
+    )
+    .unwrap();
+    let proxy = common::fixture_discovery(
+        mimic_sidecar::listener::Direction::Outbound,
+        &discovery,
+        move |_| Some(app),
+    )
+    .await;
+    let mut c = tokio::net::TcpStream::connect(proxy.addr).await.unwrap();
+    c.write_all(b"GET /v1/ping HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut answer = vec![0u8; 256];
+    let mut got = 0;
+    while !answer[..got].ends_with(b"{\"ok\":true}") {
+        let n = c.read(&mut answer[got..]).await.unwrap();
+        assert!(n > 0, "closed after {got} bytes");
+        got += n;
+    }
+    answer.truncate(got);
+    let lines = logs.access_exactly(1).await;
+    let recorded = EgressSet::project(&discovery.report()).to_json().unwrap();
+    if let Some(rig) = rig {
+        rig.stop().await;
+    }
+    let steady = lines
+        .into_iter()
+        .map(|mut l| {
+            if let Some(o) = l.as_object_mut() {
+                o.retain(|k, _| {
+                    !["time", "duration", "latency", "src", "peer", "ms"]
+                        .iter()
+                        .any(|v| k.contains(v))
+                });
+            }
+            l
+        })
+        .collect();
+    (answer, recorded, steady)
+}
+
+#[tokio::test]
+async fn pul_15_a_held_snapshot_changes_no_traffic() {
+    let set = set_json(&["/v1/ping"], true);
+    let (plain, plain_recorded, plain_lines) = one_call(None).await;
+    let (held, held_recorded, held_lines) = one_call(Some(&set)).await;
+    let text = String::from_utf8_lossy(&held).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 200"), "{text}");
+    assert!(!text.contains("x-mimic-match"), "{text}");
+    assert_eq!(plain, held);
+    assert_eq!(plain_recorded, held_recorded);
+    assert!(plain_recorded.contains("/v1/ping"), "{plain_recorded}");
+    assert_eq!(plain_lines, held_lines);
+}
