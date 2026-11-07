@@ -9,3 +9,14 @@ misconfigurations:
     paths:
       - "chart.yaml"
     statement: "patch is limited to the controller's own MutatingWebhookConfiguration, by name (spec §11, INJ-20)"
+vulnerabilities:
+  # #369: zlib1g 1:1.3.dfsg+really1.3.1-1+b1 in gcr.io/distroless/cc-debian13 (both mimic images).
+  # Debian fixed it in +deb13u1; the distroless digest is not rebuilt yet (checked 2026-11-07). No
+  # mimic binary links zlib (ldd: no libz), so the package is never loaded. The entries expire: if
+  # the base is still unfixed on 2026-11-21 the scan fails again. Remove them with the digest bump.
+  - id: CVE-2026-76844
+    expired_at: 2026-11-21
+    statement: zlib1g in the distroless base, not linked by mimic binaries (#369)
+  - id: CVE-2026-85091
+    expired_at: 2026-11-21
+    statement: zlib1g in the distroless base, not linked by mimic binaries (#369)
