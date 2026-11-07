@@ -1015,4 +1015,5 @@ mod disconnect;
 mod egress;
 mod egress_cache;
 mod memory;
+mod mode;
 mod v2;

@@ -23,6 +23,55 @@ pub struct Target {
     pub status: Option<serde_json::Value>,
 }
 
+/// `spec.mode`, `spec.mock.latencyFactor` and `spec.mock.passthrough` of a `MimicWorkload`
+/// (spec §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MockSettings {
+    /// `spec.mode` is `mock`.
+    pub mock: bool,
+    /// `spec.mock.latencyFactor` in hundredths, rounded half up (0 to 10 000).
+    pub factor: u32,
+    pub passthrough: Vec<String>,
+}
+
+impl Default for MockSettings {
+    fn default() -> MockSettings {
+        MockSettings {
+            mock: false,
+            factor: 100,
+            passthrough: Vec::new(),
+        }
+    }
+}
+
+/// The mode of a deployment, from all its `MimicWorkload`s (spec §7 "Effective mode").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Effective {
+    pub mock: bool,
+    /// Latency factor in hundredths.
+    pub factor: u32,
+    /// Sorted, deduplicated, at most [`MAX_EXCLUDES`] entries.
+    pub passthrough: Vec<String>,
+}
+
+impl Effective {
+    /// `Mimic-Mode` and `MIMIC_MODE`.
+    pub fn mode(&self) -> &'static str {
+        if self.mock { "mock" } else { "discovery" }
+    }
+
+    /// `Mimic-Latency-Factor` and `MIMIC_MOCK_LATENCY_FACTOR`: the shortest decimal that reads
+    /// back to the same value (`1`, `0.5`, `0.05`, `100`).
+    pub fn factor_text(&self) -> String {
+        let (whole, frac) = (self.factor / 100, self.factor % 100);
+        match frac {
+            0 => whole.to_string(),
+            f if f % 10 == 0 => format!("{whole}.{}", f / 10),
+            f => format!("{whole}.{f:02}"),
+        }
+    }
+}
+
 /// `spec.deployment`, `spec.tls.exclude` and `spec.discovery.redact` of a `MimicWorkload`.
 type Settings = (String, Vec<String>, Vec<String>);
 
@@ -32,6 +81,8 @@ struct State {
     items: BTreeMap<(String, String), Settings>,
     /// `(namespace, MimicWorkload name)` to the `status.discovery` the cluster holds for it.
     statuses: BTreeMap<(String, String), serde_json::Value>,
+    /// `(namespace, MimicWorkload name)` to its mock settings (absent: the defaults).
+    mocks: BTreeMap<(String, String), MockSettings>,
     synced: bool,
 }
 
@@ -65,6 +116,7 @@ impl WorkloadCache {
         let key = (namespace.to_string(), name.to_string());
         state.items.remove(&key);
         state.statuses.remove(&key);
+        state.mocks.remove(&key);
     }
 
     /// Replaces the whole content after a (re)list and marks the cache synced.
@@ -75,7 +127,51 @@ impl WorkloadCache {
             .map(|(ns, n, d, e, r)| ((ns, n), (d, e, r)))
             .collect();
         state.statuses.clear();
+        state.mocks.clear();
         state.synced = true;
+    }
+
+    /// Records the mock settings of a `MimicWorkload`.
+    pub fn set_mock(&self, namespace: &str, name: &str, mock: MockSettings) {
+        let mut state = self.write();
+        let key = (namespace.to_string(), name.to_string());
+        if !state.items.contains_key(&key) {
+            return;
+        }
+        if mock == MockSettings::default() {
+            state.mocks.remove(&key);
+        } else {
+            state.mocks.insert(key, mock);
+        }
+    }
+
+    /// The effective mode of `deployment` in `namespace` (spec §7): `mock` when any of its
+    /// `MimicWorkload`s says so, with the latency factor of the first of them in name order and
+    /// the union of their passthrough lists.
+    pub fn effective(&self, namespace: &str, deployment: &str) -> Effective {
+        let state = self.read();
+        let mut effective = Effective {
+            mock: false,
+            factor: MockSettings::default().factor,
+            passthrough: Vec::new(),
+        };
+        let mut union = BTreeSet::new();
+        // `items` is sorted by `(namespace, name)`.
+        for (key, (d, _, _)) in &state.items {
+            if key.0 != namespace || d != deployment {
+                continue;
+            }
+            let Some(mock) = state.mocks.get(key) else {
+                continue;
+            };
+            if mock.mock && !effective.mock {
+                effective.mock = true;
+                effective.factor = mock.factor;
+            }
+            union.extend(mock.passthrough.iter().cloned());
+        }
+        effective.passthrough = union.into_iter().take(MAX_EXCLUDES).collect();
+        effective
     }
 
     /// Records the `status.discovery` the cluster holds for a `MimicWorkload`.
@@ -237,15 +333,18 @@ pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
         std::pin::pin!(watcher::watcher(api, watcher::Config::default()).default_backoff());
     let mut listing = Vec::new();
     let mut statuses = Vec::new();
+    let mut mocks = Vec::new();
     while let Some(event) = events.next().await {
         match event {
             Ok(Event::Init) => {
                 listing.clear();
                 statuses.clear();
+                mocks.clear();
             }
             Ok(Event::InitApply(object)) => {
                 if let Some(found) = entry(&object) {
                     statuses.push((found.0.clone(), found.1.clone(), held_status(&object)));
+                    mocks.push((found.0.clone(), found.1.clone(), mock_of(&object)));
                     listing.push(found);
                 }
             }
@@ -254,12 +353,16 @@ pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
                 for (ns, name, status) in std::mem::take(&mut statuses) {
                     cache.set_status(&ns, &name, status);
                 }
+                for (ns, name, mock) in std::mem::take(&mut mocks) {
+                    cache.set_mock(&ns, &name, mock);
+                }
                 tracing::info!("MimicWorkload cache synced");
             }
             Ok(Event::Apply(object)) => match entry(&object) {
                 Some((ns, name, deployment, exclude, redact)) => {
                     cache.apply(&ns, &name, &deployment, exclude, redact);
                     cache.set_status(&ns, &name, held_status(&object));
+                    cache.set_mock(&ns, &name, mock_of(&object));
                 }
                 None => remove(&cache, &object),
             },
@@ -278,6 +381,43 @@ fn remove(cache: &WorkloadCache, object: &DynamicObject) {
 /// `status.discovery` of a `MimicWorkload`, as the cluster holds it.
 fn held_status(object: &DynamicObject) -> Option<serde_json::Value> {
     object.data.get("status")?.get("discovery").cloned()
+}
+
+/// `spec.mode` and `spec.mock` of a `MimicWorkload`; what the CRD would refuse reads as the
+/// default.
+pub fn mock_of(object: &DynamicObject) -> MockSettings {
+    let Some(spec) = object.data.get("spec") else {
+        return MockSettings::default();
+    };
+    let mock = spec.get("mock");
+    MockSettings {
+        mock: spec.get("mode").and_then(|m| m.as_str()) == Some("mock"),
+        factor: mock
+            .and_then(|m| m.get("latencyFactor"))
+            .and_then(|f| f.as_f64())
+            .and_then(hundredths)
+            .unwrap_or(100),
+        passthrough: mock
+            .and_then(|m| m.get("passthrough"))
+            .and_then(|list| list.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.as_str().map(str::to_string))
+            .collect(),
+    }
+}
+
+/// `factor` (0 to 100) in hundredths, rounded half up on its shortest decimal form, so that
+/// `1.005` gives 101 whatever its binary value.
+fn hundredths(factor: f64) -> Option<u32> {
+    if !(0.0..=100.0).contains(&factor) {
+        return None;
+    }
+    let text = factor.to_string();
+    let (whole, frac) = text.split_once('.').unwrap_or((&text, ""));
+    let digit = |at: usize| frac.as_bytes().get(at).map_or(0, |d| u32::from(d - b'0'));
+    let rounded = u32::from(digit(2) >= 5);
+    Some(whole.parse::<u32>().ok()? * 100 + digit(0) * 10 + digit(1) + rounded)
 }
 
 fn entry(object: &DynamicObject) -> Option<Entry> {
@@ -431,5 +571,132 @@ mod tests {
             ("shop", "w", "api")
         );
         assert_eq!(exclude, ["a.test", "b.test"]);
+    }
+
+    fn mock(on: bool, factor: u32, passthrough: &[&str]) -> MockSettings {
+        MockSettings {
+            mock: on,
+            factor,
+            passthrough: passthrough.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn mck_01_no_workload_or_only_discovery_gives_discovery_factor_1_no_passthrough() {
+        let cache = WorkloadCache::synced_with(&[("shop", "w1", "api")]);
+        let none = cache.effective("shop", "web");
+        assert_eq!((none.mode(), none.factor_text()), ("discovery", "1".into()));
+        assert!(none.passthrough.is_empty());
+        cache.set_mock("shop", "w1", mock(false, 100, &[]));
+        let found = cache.effective("shop", "api");
+        assert_eq!(found.mode(), "discovery");
+        assert_eq!(found.factor, 100);
+    }
+
+    #[test]
+    fn mck_01_one_mock_workload_makes_the_deployment_mock_with_the_first_factor_in_name_order() {
+        let cache = WorkloadCache::synced_with(&[
+            ("shop", "a", "api"),
+            ("shop", "b", "api"),
+            ("shop", "c", "api"),
+            ("other", "a", "api"),
+        ]);
+        cache.set_mock("shop", "c", mock(true, 300, &[]));
+        cache.set_mock("shop", "b", mock(true, 50, &[]));
+        cache.set_mock("shop", "a", mock(false, 700, &[]));
+        cache.set_mock("other", "a", mock(true, 900, &[]));
+        let found = cache.effective("shop", "api");
+        assert_eq!(found.mode(), "mock");
+        assert_eq!(found.factor_text(), "0.5");
+        // Another namespace never leaks in.
+        assert_eq!(cache.effective("other", "api").factor, 900);
+        cache.remove("shop", "b");
+        assert_eq!(cache.effective("shop", "api").factor, 300);
+        cache.remove("shop", "c");
+        assert_eq!(cache.effective("shop", "api").mode(), "discovery");
+    }
+
+    #[test]
+    fn mck_01_passthrough_is_the_sorted_deduplicated_union_cut_to_256() {
+        let cache = WorkloadCache::synced_with(&[("shop", "a", "api"), ("shop", "b", "api")]);
+        cache.set_mock("shop", "a", mock(false, 100, &["b.test", "a.test"]));
+        cache.set_mock("shop", "b", mock(true, 100, &["b.test", "*.c.test"]));
+        assert_eq!(
+            cache.effective("shop", "api").passthrough,
+            ["*.c.test", "a.test", "b.test"]
+        );
+        let many: Vec<String> = (0..200).map(|i| format!("h{i:03}.test")).collect();
+        let more: Vec<String> = (100..300).map(|i| format!("h{i:03}.test")).collect();
+        fn refs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        cache.set_mock("shop", "a", mock(false, 100, &refs(&many)));
+        cache.set_mock("shop", "b", mock(false, 100, &refs(&more)));
+        let union = cache.effective("shop", "api").passthrough;
+        assert_eq!(union.len(), 256);
+        assert_eq!(
+            (union[0].as_str(), union[255].as_str()),
+            ("h000.test", "h255.test")
+        );
+    }
+
+    #[test]
+    fn mck_01_factor_text_is_the_shortest_decimal() {
+        let text = |factor| {
+            Effective {
+                mock: true,
+                factor,
+                passthrough: Vec::new(),
+            }
+            .factor_text()
+        };
+        assert_eq!(
+            [
+                text(100),
+                text(50),
+                text(0),
+                text(10_000),
+                text(5),
+                text(130),
+                text(101)
+            ],
+            ["1", "0.5", "0", "100", "0.05", "1.3", "1.01"]
+        );
+    }
+
+    #[test]
+    fn mck_01_mock_of_reads_the_spec_and_rounds_the_factor_half_up() {
+        let object = |spec: serde_json::Value| -> DynamicObject {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "mimic.platform.io/v1alpha1", "kind": "MimicWorkload",
+                "metadata": {"name": "w", "namespace": "shop"}, "spec": spec,
+            }))
+            .unwrap()
+        };
+        let read = |spec| mock_of(&object(spec));
+        assert_eq!(
+            read(serde_json::json!({"deployment": "api"})),
+            MockSettings::default()
+        );
+        let full = read(serde_json::json!({"deployment": "api", "mode": "mock",
+            "mock": {"latencyFactor": 0.5, "passthrough": ["a.test", 7, "b.test"]}}));
+        assert_eq!(full, mock(true, 50, &["a.test", "b.test"]));
+        let factor = |f: f64| {
+            read(serde_json::json!({"deployment": "api", "mock": {"latencyFactor": f}})).factor
+        };
+        assert_eq!(
+            [
+                factor(0.005),
+                factor(0.004),
+                factor(1.005),
+                factor(0.0),
+                factor(100.0),
+                factor(2.0)
+            ],
+            [1, 0, 101, 0, 10_000, 200]
+        );
+        // A value the CRD would refuse reads as the default.
+        assert_eq!(factor(101.0), 100);
+        assert_eq!(factor(-1.0), 100);
     }
 }
