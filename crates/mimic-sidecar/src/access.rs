@@ -59,6 +59,10 @@ pub struct Exchange {
     pub head: Option<Duration>,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// Answered by the mock (spec §8): the tier, or `miss`.
+    pub mock: Option<&'static str>,
+    /// Why a mocked request was a miss.
+    pub mock_miss: Option<&'static str>,
 }
 
 /// One finished opaque or TLS connection.
@@ -111,6 +115,8 @@ pub fn exchange(e: &Exchange) {
         head_ms = e.head.map(millis),
         bytes_in = e.bytes_in,
         bytes_out = e.bytes_out,
+        mock = e.mock,
+        mock_miss = e.mock_miss,
         "http exchange"
     );
 }

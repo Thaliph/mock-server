@@ -14,7 +14,8 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use mimic_core::discovery::egress::{self, EgressSet};
+use mimic_core::discovery::egress::EgressSet;
+use mimic_core::mock::Index;
 use mimic_runtime::config::{ConfigError, Env};
 
 use crate::discovery::Target;
@@ -92,7 +93,8 @@ fn size(env: &Env, var: &str, default: usize) -> Result<usize, ConfigError> {
 /// What the sidecar holds of the controller's egress set.
 #[derive(Default)]
 struct Held {
-    set: Option<Arc<EgressSet>>,
+    /// The snapshot as the mock reads it; it replaces the typed set (spec §8 "Bounds").
+    set: Option<Arc<Index>>,
     etag: Option<String>,
     /// The last `200` or `304`.
     pulled: Option<SystemTime>,
@@ -142,9 +144,25 @@ impl Snapshot {
         self.held().bytes
     }
 
+    /// The index of the snapshot held, for the mock; `None` before the first `200`. Requests
+    /// pending when the snapshot is swapped keep the one they began with.
+    pub fn index(&self) -> Option<Arc<Index>> {
+        self.held().set.clone()
+    }
+
+    /// Holds `set` as if it was pulled now, with this `ETag`.
+    pub fn load(&self, set: EgressSet, etag: &str) {
+        self.replace(
+            Index::build(set),
+            Some(etag.to_string()),
+            0,
+            SystemTime::now(),
+        );
+    }
+
     /// Replaces the set. The old one is dropped here, after the new one was accepted and
     /// outside the lock.
-    fn replace(&self, set: EgressSet, etag: Option<String>, bytes: usize, now: SystemTime) {
+    fn replace(&self, set: Index, etag: Option<String>, bytes: usize, now: SystemTime) {
         let old = std::mem::replace(
             &mut *self.held(),
             Held {
@@ -172,12 +190,10 @@ impl Snapshot {
         });
         match (&set, &pulled) {
             // A controller that sent no `ETag`: the set is held, but nothing names it.
-            (Some(set), Some(pulled)) => egress::summary(
-                Some((set, etag.as_deref().unwrap_or(""), pulled)),
-                mode,
-                factor,
-            ),
-            _ => egress::summary(None, mode, factor),
+            (Some(set), Some(pulled)) => {
+                set.summary(etag.as_deref().unwrap_or(""), pulled, mode, factor)
+            }
+            _ => mimic_core::discovery::egress::summary(None, mode, factor),
         }
     }
 

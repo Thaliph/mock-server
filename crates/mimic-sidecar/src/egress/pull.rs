@@ -4,6 +4,7 @@ use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mimic_core::discovery::egress::{EgressSet, Refusal};
+use mimic_core::mock::Index;
 use mimic_core::proxy::tls::Backoff;
 use tokio::time::sleep;
 
@@ -48,7 +49,9 @@ impl Failure {
 /// What a pull came to.
 enum Fetched {
     Set {
-        set: EgressSet,
+        set: Index,
+        authorities: usize,
+        endpoints: usize,
         etag: Option<String>,
         bytes: usize,
     },
@@ -129,8 +132,13 @@ impl Puller {
     /// Keeps or replaces the snapshot; how long to wait before the next pull.
     fn settle(&mut self, fetched: Fetched) -> Duration {
         match fetched {
-            Fetched::Set { set, etag, bytes } => {
-                let (authorities, endpoints) = (set.authorities.len(), set.endpoint_count());
+            Fetched::Set {
+                set,
+                authorities,
+                endpoints,
+                etag,
+                bytes,
+            } => {
                 self.snapshot.replace(set, etag, bytes, SystemTime::now());
                 self.metrics.pull("ok");
                 self.metrics.set_snapshot(endpoints, bytes);
@@ -274,11 +282,20 @@ impl Puller {
                 .map_err(|_| Refusal::Malformed)
                 .and_then(EgressSet::from_json);
             drop(body);
-            parsed
+            parsed.map(|set| {
+                let (authorities, endpoints) = (set.authorities.len(), set.endpoint_count());
+                (Index::build(set), authorities, endpoints)
+            })
         })
         .await;
         match parsed {
-            Ok(Ok(set)) => Fetched::Set { set, etag, bytes },
+            Ok(Ok((set, authorities, endpoints))) => Fetched::Set {
+                set,
+                authorities,
+                endpoints,
+                etag,
+                bytes,
+            },
             Ok(Err(refusal)) => {
                 Fetched::Failed(Failure::refused("invalid", None, Some(refusal.reason())))
             }
