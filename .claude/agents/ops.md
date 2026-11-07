@@ -28,3 +28,8 @@ issue (`gh issue view <n> --comments`) and only the files your brief names.
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`; push; never push to `main`.
 - Report in at most 8 lines: what changed, checks run and their result.
 - If the change needs a design decision your brief does not settle, stop and report.
+- Gate the push on the checks' exit status in one command (`checks && git push`), never after a
+  `;`, a pipe or a check you only read. Wrap long test runs in `timeout`.
+- Never wait in a loop on `pgrep -f <pattern>`: it matches the waiting shell's own command line and
+  never ends. Run the work in the foreground, or chain the steps in one command. Leave no
+  background loop, container or cluster behind when you report.
