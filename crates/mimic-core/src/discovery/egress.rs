@@ -1,7 +1,7 @@
 //! The egress set (spec §7.7): what a sidecar needs of the controller's outbound report to
 //! mock its provider calls, and nothing else. Pure: no I/O, no clock.
 
-use crate::compact::{SortedMap, SortedSet};
+use crate::compact::{Name, SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,7 +67,7 @@ pub struct Authority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressSet {
-    pub authorities: SortedMap<String, Authority>,
+    pub authorities: SortedMap<Name, Authority>,
     pub format: u32,
 }
 
@@ -102,7 +102,7 @@ impl EgressSet {
     /// The projection of a report (spec §7.7): the outbound scopes that hold an endpoint and,
     /// per endpoint, what a mock needs. A pure function of the outbound part.
     pub fn project(report: &Report) -> Self {
-        let mut authorities: SortedMap<String, Authority> = SortedMap::new();
+        let mut authorities: SortedMap<Name, Authority> = SortedMap::new();
         for e in report.endpoints() {
             let Some(authority) = e.authority.filter(|_| e.direction == Direction::Outbound) else {
                 continue;
@@ -117,7 +117,7 @@ impl EgressSet {
                     .collect()
             };
             authorities
-                .entry(authority.to_string())
+                .entry(Name::from(authority))
                 .or_insert_with(|| Authority {
                     endpoints: Vec::new(),
                 })

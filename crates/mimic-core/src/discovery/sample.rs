@@ -2,7 +2,7 @@
 //! the set of candidates, so any arrival order, and any partition merged later, gives the
 //! same samples.
 
-use crate::compact::{SortedMap, SortedSet};
+use crate::compact::{Name, SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -423,7 +423,7 @@ impl Samples {
         &mut self,
         request_redactor: &Redactor,
         response_redactor: &Redactor,
-    ) -> SortedSet<String> {
+    ) -> SortedSet<Name> {
         let mut fields = SortedSet::new();
         for (_, mut sample) in std::mem::take(&mut self.0) {
             let original = sample.clone();

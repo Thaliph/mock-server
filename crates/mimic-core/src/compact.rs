@@ -3,8 +3,12 @@
 //! full). Iteration order is the key order, exactly that of the `BTreeMap`/`BTreeSet` they replace,
 //! and so is the serialised form: a JSON object for the map, an array for the set.
 //!
-//! Inserts are linear, which is fine for the bounded collections of a report (at most a few hundred
-//! entries each). Deserialisation sorts and deduplicates (the last duplicate wins, as in a
+//! Inserts are linear, which is fine for the bounded collections of a report. The bounds are
+//! configurable: the endpoints of a direction (`MIMIC_STORE_MAX_ENDPOINTS`, 512 by default, at
+//! most 10 000), the literals of a template node (`MIMIC_STORE_MAX_LITERALS`, 32 by default, at
+//! most 1000), the authorities, the properties of an object schema and the samples of an
+//! endpoint. None grows with the traffic. Bulk builds (`collect`, `extend`, reading) sort once.
+//! Deserialisation sorts and deduplicates (the last duplicate wins, as in a
 //! `BTreeMap`) and drops the spare capacity.
 
 use std::borrow::Borrow;
@@ -12,6 +16,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
+pub use compact_str::CompactString as Name;
 use litemap::LiteMap;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -119,9 +124,11 @@ impl<K: Ord, V, const N: usize> From<[(K, V); N]> for SortedMap<K, V> {
 
 impl<K: Ord, V> Extend<(K, V)> for SortedMap<K, V> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
-        for (k, v) in iter {
-            self.0.insert(k, v);
-        }
+        // Collect, sort and deduplicate once (the last value wins), then rebuild: linear inserts
+        // would be quadratic on a large unsorted input.
+        let mut pairs = std::mem::take(&mut self.0).into_tuple_vec();
+        pairs.extend(iter);
+        *self = Self::from_pairs(pairs);
     }
 }
 
@@ -357,6 +364,20 @@ mod tests {
                 prop_assert_eq!(incremental.insert(*k, *v), model.insert(*k, *v));
             }
             prop_assert_eq!(incremental, built);
+        }
+
+        /// `extend` on a non-empty map, with unsorted input and duplicate keys, equals the
+        /// `BTreeMap`: the last value wins.
+        #[test]
+        fn shr_21_sorted_map_extend_matches_btree_map(
+            first in prop::collection::vec((0u16..40, any::<u8>()), 0..30),
+            more in prop::collection::vec((0u16..40, any::<u8>()), 0..60),
+        ) {
+            let mut model: BTreeMap<u16, u8> = first.iter().copied().collect();
+            let mut built: SortedMap<u16, u8> = first.iter().copied().collect();
+            model.extend(more.iter().copied());
+            built.extend(more.iter().copied());
+            prop_assert_eq!(built.iter().collect::<Vec<_>>(), model.iter().collect::<Vec<_>>());
         }
 
         #[test]
