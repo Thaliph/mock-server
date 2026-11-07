@@ -93,7 +93,7 @@ fn push_of(pod: &str, seq: Option<u64>, paths: &[(&str, u16)]) -> Push {
     Push {
         pod: pod.to_string(),
         seq: seq.map(|n| SeqId::parse(SESSION, n).expect("valid seq")),
-        report,
+        json: report.to_json().expect("serialises"),
     }
 }
 
@@ -219,7 +219,8 @@ async fn ctl_09_applied_once_across_replicas() {
                     })
                     .collect();
                 let make = || push_of(&pod, Some(seq), &exchanges);
-                distinct.lock().expect("lock")[dep_index].push(make().report);
+                distinct.lock().expect("lock")[dep_index]
+                    .push(Report::from_json(&make().json).expect("reads"));
                 let pick = |r: u64| {
                     if r.is_multiple_of(2) {
                         a.clone()

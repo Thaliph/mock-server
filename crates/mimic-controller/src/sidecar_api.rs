@@ -686,7 +686,7 @@ impl SidecarApi {
         let push = Push {
             pod: pod.to_string(),
             seq,
-            report: report?,
+            json: report?,
         };
         // The reservation goes with the push: the write goes on if the client disconnects, and
         // so does the memory it holds (SHR-18).
@@ -705,14 +705,15 @@ impl SidecarApi {
 }
 
 /// The envelope of a push, then its report: checked, re-redacted with the built-in rules
-/// and the names of the `MimicWorkload`s, and stamped with today (spec §7.3). Nothing of
-/// the push is logged before this is done.
+/// and the names of the `MimicWorkload`s, and stamped with today (spec §7.3), then written as
+/// JSON for the store, so that no parsed report waits for its write (#339). Nothing of the push
+/// is logged before this is done.
 fn prepare(
     bytes: &[u8],
     max_push_endpoints: usize,
     max_authorities: usize,
     extra: &[String],
-) -> (Option<SeqId>, Option<u64>, Result<Report, Refusal>) {
+) -> (Option<SeqId>, Option<u64>, Result<String, Refusal>) {
     let Ok(request) = serde_json::from_slice::<PushRequest>(bytes) else {
         return (None, None, Err(invalid("malformed")));
     };
@@ -748,6 +749,7 @@ fn prepare(
         report.stamp(today);
         report
     });
+    let report = report.and_then(|report| report.to_json().map_err(|_| UNAVAILABLE));
     (Some(seq), version, report)
 }
 

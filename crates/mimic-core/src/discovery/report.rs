@@ -15,6 +15,8 @@ use super::sample::{MAX_SAMPLES, Sample, Samples};
 use super::scope::{self, ScopeKey};
 use super::template::{Seg, is_param, render, split_path};
 
+mod merge_json;
+
 /// Hosts kept per endpoint.
 pub const MAX_HOSTS: usize = 16;
 /// Longest host kept, in bytes (the codec cuts the authority there).
@@ -450,6 +452,12 @@ impl Node {
                 .or_default()
                 .merge(child, max_literals);
         }
+        self.absorb(max_literals);
+    }
+
+    /// Past `max_literals` literal children, or once absorbing, the literals become the
+    /// parameter child.
+    fn absorb(&mut self, max_literals: usize) {
         if self.absorbing || self.literals.len() > max_literals {
             self.absorbing = true;
             let literals = std::mem::take(&mut self.literals);

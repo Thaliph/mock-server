@@ -49,7 +49,7 @@ pub(super) fn push_v2(
     Push {
         pod: pod.to_string(),
         seq: Some(SeqId::parse(SESSION, seq).expect("valid seq")),
-        report,
+        json: report.to_json().expect("serialises"),
     }
 }
 
@@ -81,7 +81,7 @@ async fn shr_09_a_version_2_push_is_split_into_report_and_outbound() {
     let report: String = cmd(&mut c, &["GET", &k.report]).await;
     let f7_report: String = cmd(&mut c, &["GET", &f7.report]).await;
     // Exchanges differ by the outbound ones only: compare the parts.
-    let merged = push_v2("pod-a", 1, &["/a", "/b"], &out).report;
+    let merged = Report::from_json(&push_v2("pod-a", 1, &["/a", "/b"], &out).json).expect("reads");
     let (inbound_part, outbound_part) = merge_bounded(Report::new(None), merged, &LIMITS)
         .report
         .split();
@@ -213,7 +213,8 @@ async fn shr_09_an_unreadable_outbound_value_is_never_overwritten_and_names_its_
     let k = keys(&ns, dep).expect("keys");
     let mut c = conn(None).await;
     // Not JSON, then an `:outbound` that holds an inbound scope.
-    let mut with_inbound = push_of("p", None, &[("/a", 200)]).report;
+    let mut with_inbound =
+        Report::from_json(&push_of("p", None, &[("/a", 200)]).json).expect("reads");
     with_inbound.stamp(today());
     for bad in ["{not json".to_string(), with_inbound.to_json().unwrap()] {
         let _: () = cmd(&mut c, &["SET", &k.outbound, &bad]).await;

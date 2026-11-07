@@ -39,13 +39,15 @@ fn record_outbound(report: &mut Report, authority: &str, path: &str, times: usiz
 /// One v2 push: an inbound `/a` and two outbound exchanges per `(authority, path)`.
 async fn seed_outbound(store: &Arc<Store>, ns: &str, dep: &str, outbound: &[(&str, &str)]) {
     let mut push = push_of("front-1", 1, &[("/a", 200)]);
+    let mut report = Report::from_json(&push.json).expect("reads");
     for (authority, path) in outbound {
-        record_outbound(&mut push.report, authority, path, 2);
+        record_outbound(&mut report, authority, path, 2);
     }
     let today = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() / DAY);
-    push.report.stamp(today);
+    report.stamp(today);
+    push.json = report.to_json().expect("serialises");
     store.push(ns, dep, push).await.expect("push applied");
 }
 
