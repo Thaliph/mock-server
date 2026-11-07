@@ -97,8 +97,9 @@ async fn run(
     let shipper = discovery.shipper(ship).map_err(std::io::Error::other)?;
     let egress_metrics = EgressMetrics::default();
     egress_metrics.register(&mut metrics);
+    let snapshot = Snapshot::default();
     let puller =
-        Puller::new(egress, egress_metrics, Snapshot::default()).map_err(std::io::Error::other)?;
+        Puller::new(egress, egress_metrics, snapshot.clone()).map_err(std::io::Error::other)?;
     let metrics = Arc::new(metrics);
     // Readiness does not wait for the CA: until it holds an intermediate, TLS is passed through.
     let ca = start_ca(&tls, ca_metrics)?;
@@ -185,7 +186,8 @@ async fn run(
             listener,
             admin::router(metrics, Readiness::always())
                 .merge(probes::router(Arc::new(probes)))
-                .merge(discovery.router()),
+                .merge(discovery.router())
+                .merge(snapshot.router()),
             grace,
             shutdown.clone().wait(),
         ),

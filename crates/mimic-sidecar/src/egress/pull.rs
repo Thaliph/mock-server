@@ -266,6 +266,9 @@ impl Puller {
     }
 }
 
+/// How much the body buffer grows at a time.
+const STEP: usize = 1 << 20;
+
 enum Body {
     /// More than the cap: the read stopped there.
     TooLarge,
@@ -281,7 +284,8 @@ async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<
     if declared.is_some_and(|n| n > cap) {
         return Err(Body::TooLarge);
     }
-    let mut bytes = Vec::with_capacity(declared.unwrap_or(0));
+    // Grown in steps as the bytes arrive: a declared length is not trusted with a reservation.
+    let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
@@ -289,6 +293,10 @@ async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<
     {
         if bytes.len() + chunk.len() > cap {
             return Err(Body::TooLarge);
+        }
+        if bytes.capacity() - bytes.len() < chunk.len() {
+            let ahead = declared.map_or(0, |n| n.saturating_sub(bytes.len()));
+            bytes.reserve_exact(chunk.len().max(ahead.min(STEP)));
         }
         bytes.extend_from_slice(&chunk);
     }
