@@ -3,8 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::discovery::report::Report;
+use crate::discovery::redact::MARKER;
+use crate::discovery::report::{Direction, Report};
+use crate::discovery::sample::{self as recorded, Payload};
 
 /// A credential the test supplies: the request field it replaces and the Secret key that holds
 /// the value. The plan holds these two names, never a value.
@@ -83,9 +86,266 @@ pub struct Planned {
     pub skipped: BTreeMap<&'static str, u64>,
 }
 
+// Why an endpoint is left out: the keys of `status.skipped`.
+const GRPC: &str = "grpc";
+const UPGRADE: &str = "upgrade";
+const EXCLUDED: &str = "excluded";
+const NO_SAMPLE: &str = "no_sample";
+const CREDENTIALS: &str = "credentials";
+const OPAQUE_BODY: &str = "opaque_body";
+const LIMIT: &str = "limit";
+const PLAN_SIZE: &str = "plan_size";
+
+/// Escapes a JSON object key as a pointer token.
+fn token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// The credential fields of the leaves of a JSON value that hold the marker.
+fn marked_leaves(pointer: &str, value: &Value, out: &mut BTreeSet<String>) {
+    match value {
+        Value::String(s) if s.contains(MARKER) => {
+            out.insert(format!("body{pointer}"));
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                marked_leaves(&format!("{pointer}/{}", token(k)), v, out);
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                marked_leaves(&format!("{pointer}/{i}"), v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The credential fields a sample needs, or `None` when it needs one that cannot be supplied
+/// (a redacted path segment).
+fn needs(sample: &recorded::Sample) -> Option<BTreeSet<String>> {
+    if sample.path().contains(MARKER) {
+        return None;
+    }
+    let mut out = BTreeSet::new();
+    for (name, value) in sample.request_headers() {
+        if value.contains(MARKER) {
+            out.insert(format!("header/{name}"));
+        }
+    }
+    for (key, value) in sample.query() {
+        if value.contains(MARKER) {
+            out.insert(format!("query/{key}"));
+        }
+    }
+    match sample.request_payload() {
+        Some((_, Payload::Json(text))) => {
+            let value = serde_json::from_str(text).unwrap_or(Value::Null);
+            marked_leaves("", &value, &mut out);
+        }
+        Some((_, Payload::Form(pairs))) => {
+            for (key, value) in pairs {
+                if value.contains(MARKER) {
+                    out.insert(format!("body/{key}"));
+                }
+            }
+        }
+        None => {}
+    }
+    Some(out)
+}
+
+/// A request that had a body the report did not keep: a `content-type` without a body.
+fn opaque_body(sample: &recorded::Sample) -> bool {
+    sample.request_payload().is_none()
+        && sample
+            .request_headers()
+            .iter()
+            .any(|(name, _)| name == "content-type")
+}
+
+fn plan_sample(hash: u64, sample: &recorded::Sample) -> Sample {
+    let body = sample
+        .request_payload()
+        .map(|(media, payload)| match payload {
+            Payload::Json(text) => Body::Json {
+                media: media.to_string(),
+                text: text.to_string(),
+            },
+            Payload::Form(pairs) => Body::Form {
+                media: media.to_string(),
+                pairs,
+            },
+        });
+    Sample {
+        hash,
+        path: sample.path().to_string(),
+        query: sample.query().to_vec(),
+        headers: sample.request_headers().to_vec(),
+        body,
+    }
+}
+
+/// A host the `host` header can carry.
+fn host_ok(host: &str) -> bool {
+    !host.is_empty() && !host.contains(MARKER) && host.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// The plan of a stored inbound report.
-pub fn plan(_report: &Report, _spec: &Spec) -> Planned {
-    todo!()
+pub fn plan(report: &Report, spec: &Spec) -> Planned {
+    let supplied: BTreeSet<&str> = spec.credentials.iter().map(|c| c.field.as_str()).collect();
+    let mut skipped: BTreeMap<&'static str, u64> = BTreeMap::new();
+    // Usable endpoints in report order.
+    let mut usable: Vec<Endpoint> = Vec::new();
+    for e in report.endpoints() {
+        if e.direction != Direction::Inbound {
+            continue;
+        }
+        let key = format!("{} {}", e.method, e.template);
+        if e.grpc {
+            *skipped.entry(GRPC).or_default() += 1;
+            continue;
+        }
+        if e.stats.statuses.contains_key(&101) {
+            *skipped.entry(UPGRADE).or_default() += 1;
+            continue;
+        }
+        let listed = spec.include.as_ref().is_none_or(|i| i.contains(&key));
+        if !listed || spec.exclude.contains(&key) {
+            *skipped.entry(EXCLUDED).or_default() += 1;
+            continue;
+        }
+        let all: Vec<(u64, &recorded::Sample)> = e.stats.samples().iter().collect();
+        let success = |s: &recorded::Sample| (200..400).contains(&s.status());
+        let by_class: Vec<_> = if all.iter().any(|(_, s)| success(s)) {
+            all.into_iter().filter(|(_, s)| success(s)).collect()
+        } else {
+            all.into_iter()
+                .filter(|(_, s)| (400..600).contains(&s.status()))
+                .collect()
+        };
+        if by_class.is_empty() {
+            *skipped.entry(NO_SAMPLE).or_default() += 1;
+            continue;
+        }
+        let mut samples = Vec::new();
+        let mut credential_refused = false;
+        for (hash, sample) in by_class {
+            if opaque_body(sample) {
+                continue;
+            }
+            match needs(sample) {
+                Some(n) if n.iter().all(|f| supplied.contains(f.as_str())) => {
+                    samples.push(plan_sample(hash, sample));
+                }
+                _ => credential_refused = true,
+            }
+        }
+        if samples.is_empty() {
+            let reason = if credential_refused {
+                CREDENTIALS
+            } else {
+                OPAQUE_BODY
+            };
+            *skipped.entry(reason).or_default() += 1;
+            continue;
+        }
+        let fields = e.stats.observed().volatility();
+        usable.push(Endpoint {
+            method: e.method.to_string(),
+            port: e.port,
+            template: e.template.clone(),
+            host: e
+                .stats
+                .hosts
+                .iter()
+                .map(|h| h.as_str())
+                .find(|h| host_ok(h))
+                .map(str::to_string),
+            weight: e
+                .stats
+                .statuses
+                .values()
+                .fold(0u64, |n, c| n.saturating_add(*c))
+                .max(1),
+            volatile: fields
+                .fields()
+                .into_iter()
+                .filter(|f| {
+                    fields.is_volatile(f)
+                        && !fields.is_redacted(f)
+                        && ["query/", "request.header/", "request.body/"]
+                            .iter()
+                            .any(|p| f.starts_with(p))
+                })
+                .map(str::to_string)
+                .collect(),
+            samples,
+        });
+    }
+    // The endpoints with the most exchanges, ties in key (report) order.
+    if usable.len() > spec.max_endpoints {
+        let mut order: Vec<usize> = (0..usable.len()).collect();
+        order.sort_by(|a, b| usable[*b].weight.cmp(&usable[*a].weight).then(a.cmp(b)));
+        let keep: BTreeSet<usize> = order.into_iter().take(spec.max_endpoints).collect();
+        *skipped.entry(LIMIT).or_default() += (usable.len() - keep.len()) as u64;
+        usable = usable
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| keep.contains(i))
+            .map(|(_, e)| e)
+            .collect();
+    }
+    let mut plan = Plan {
+        credentials: spec.credentials.clone(),
+        endpoints: usable,
+    };
+    let emptied = shrink(&mut plan, spec.max_plan);
+    if emptied > 0 {
+        *skipped.entry(PLAN_SIZE).or_default() += emptied;
+    }
+    Planned { plan, skipped }
+}
+
+fn size(plan: &Plan) -> usize {
+    serde_json::to_vec(plan).map_or(usize::MAX, |v| v.len())
+}
+
+/// Drops the sample with the highest content hash until the plan fits. Returns how many
+/// endpoints were left without sample, and removed.
+fn shrink(plan: &mut Plan, max: usize) -> u64 {
+    let mut emptied = 0;
+    loop {
+        let excess = size(plan).saturating_sub(max);
+        if excess == 0 {
+            return emptied;
+        }
+        let mut hashes: Vec<(u64, usize)> = plan
+            .endpoints
+            .iter()
+            .enumerate()
+            .flat_map(|(i, e)| e.samples.iter().map(move |s| (s.hash, i)))
+            .collect();
+        hashes.sort_unstable();
+        if hashes.is_empty() {
+            // Only the skeleton is left, and it does not fit.
+            plan.credentials.clear();
+            return emptied;
+        }
+        // Drop at least the excess in one round, then measure again.
+        let mut freed = 0usize;
+        while freed < excess {
+            let Some((hash, i)) = hashes.pop() else { break };
+            let samples = &mut plan.endpoints[i].samples;
+            if let Some(at) = samples.iter().position(|s| s.hash == hash) {
+                freed += serde_json::to_vec(&samples[at]).map_or(1, |v| v.len() + 1);
+                samples.remove(at);
+            }
+        }
+        let before = plan.endpoints.len();
+        plan.endpoints.retain(|e| !e.samples.is_empty());
+        emptied += (before - plan.endpoints.len()) as u64;
+    }
 }
 
 impl Plan {
@@ -94,7 +354,10 @@ impl Plan {
     }
 
     /// Reads a plan of at most `max_plan` bytes.
-    pub fn from_json(_json: &str, _max_plan: usize) -> Result<Self, String> {
-        todo!()
+    pub fn from_json(json: &str, max_plan: usize) -> Result<Self, String> {
+        if json.len() > max_plan {
+            return Err(format!("plan over {max_plan} bytes"));
+        }
+        serde_json::from_str(json).map_err(|e| format!("invalid plan: {e}"))
     }
 }

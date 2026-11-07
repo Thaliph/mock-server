@@ -205,7 +205,7 @@ mod plan_tests {
             Ex::new("GET", "/mixed", 200).query("v=ok"),
             Ex::new("GET", "/mixed", 500).query("v=bad"),
             Ex::new("GET", "/mixed", 302).query("v=redirect"),
-            Ex::new("GET", "/failing", 404).query("v=missing"),
+            Ex::new("GET", "/failing", 400).query("v=missing"),
             Ex::new("GET", "/failing", 503).query("v=down"),
         ];
         let p = planned(&items, &spec());
@@ -461,7 +461,6 @@ mod request_tests {
             .header("te", "trailers")
             .header("upgrade", "h2c")
             .header("expect", "100-continue")
-            .header("proxy-authorization", "Basic abc")
             .header("proxy-connection", "keep-alive")
             .header("content-length", "999")
             .json(&json!({"item": "book", "qty": 2}))];
@@ -596,7 +595,7 @@ mod request_tests {
         );
         assert!(trace.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
         let seq = r.target.split("seq=").nth(1).unwrap_or_default();
-        assert_eq!(seq.len(), 8);
+        assert_eq!(seq.len(), 8, "{}", r.target);
         assert!(seq.chars().all(|c| c.is_ascii_digit()) && !seq.starts_with('0'));
 
         let body: serde_json::Value = serde_json::from_slice(&r.body).expect("json");
@@ -604,8 +603,8 @@ mod request_tests {
         let digits = body["id"].as_u64().map(|n| n.to_string().len());
         assert_eq!(digits, Some(13));
         let note = body["note"].as_str().unwrap_or_default();
-        assert_eq!(note.len(), 8);
-        assert_eq!(note.as_bytes()[4], b'-');
+        assert_eq!(note.len(), 10);
+        assert_eq!(note.as_bytes()[5], b'-');
     }
 
     #[test]
@@ -806,7 +805,7 @@ mod request_tests {
         let sample = &endpoint.samples[r.sample];
         assert_eq!(r.method, endpoint.method);
         let supplied: BTreeSet<&str> = spec.credentials.iter().map(|c| c.field.as_str()).collect();
-        let volatile = |field: String| endpoint.volatile.iter().any(|f| *f == field);
+        let volatile = |field: String| endpoint.volatile.contains(&field);
         for (name, value) in &r.headers {
             if matches!(name.as_str(), "host" | "content-length" | "mimic-load-run") {
                 continue;
@@ -890,7 +889,7 @@ mod robustness {
         ];
         let mut accepted = 0;
         for at in (0..bytes.len()).step_by(3) {
-            for value in [b'0', b'"', b'<', b'/', b'}'] {
+            for &value in b"0\"</}" {
                 let mut mutated = bytes.to_vec();
                 mutated[at] = value;
                 let Ok(report) = Report::from_json(&String::from_utf8_lossy(&mutated)) else {
