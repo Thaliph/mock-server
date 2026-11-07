@@ -34,5 +34,11 @@ in your brief, and the code you are about to change. Nothing else.
 - Configuration from `MIMIC_*` env vars only, through `mimic_runtime::config`; an invalid value
   exits 2. Logs through `tracing` (JSON); metrics through the component's `Metrics` registry.
 - No `unsafe`, no `unwrap()` on input from the network or the environment, no secret in a log.
-- New dependency: latest version (`cargo add`), maintained, licence allowed by `deny.toml`.
+- New dependency: the latest version outside the 14-day cooldown (`scripts/check-cooldown.py`),
+  maintained, licence allowed by `deny.toml`.
+- Gate the push on the checks' exit status in one command (`checks && git push`), never after a
+  `;`, a pipe or a check you only read. Wrap long test runs in `timeout`.
+- Never wait in a loop on `pgrep -f <pattern>`: it matches the waiting shell's own command line and
+  never ends. Run the work in the foreground, or chain the steps in one command. Leave no
+  background loop, container or cluster behind when you report.
 - Never push to `main`, never force-push a branch under review.
