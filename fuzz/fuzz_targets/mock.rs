@@ -26,7 +26,7 @@ use mimic_core::discovery::egress::EgressSet;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::Report;
 use mimic_core::discovery::sample::Payload;
-use mimic_core::mock::{Index, MAX_DELAY_MS, Random, Request, draw, signature};
+use mimic_core::mock::{Index, MAX_DELAY_MS, Miss, Random, Request, draw, signature};
 
 const PUSH: usize = 16;
 const PUSH_AUTHORITIES: usize = 16;
@@ -60,11 +60,24 @@ fn set_of(part: &[u8]) -> EgressSet {
 }
 
 /// Every header and body value of an answer is a sample's of the authority, or fixed.
-fn check(set: &EgressSet, authority: &str, response: &mimic_core::mock::Response, canary: bool) {
+fn check(
+    set: &EgressSet,
+    authority: &str,
+    (method, template): (&str, &str),
+    response: &mimic_core::mock::Response,
+    canary: bool,
+) {
+    // The samples of the matched endpoint only.
     let samples: Vec<_> = set
         .authorities
         .get(authority)
-        .map(|a| a.endpoints.iter().flat_map(|e| e.samples.iter()).collect())
+        .map(|a| {
+            a.endpoints
+                .iter()
+                .filter(|e| e.method == method && e.template == template)
+                .flat_map(|e| e.samples.iter())
+                .collect()
+        })
         .unwrap_or_default();
     for (name, value) in &response.headers {
         if canary {
@@ -74,9 +87,10 @@ fn check(set: &EgressSet, authority: &str, response: &mimic_core::mock::Response
             continue;
         }
         assert!(
-            samples
+            samples.iter().any(|s| s
+                .response_headers()
                 .iter()
-                .any(|s| s.response_headers().iter().any(|(n, v)| n == name && v == value)),
+                .any(|(n, v)| n == name && v == value)),
             "a header that no sample holds"
         );
     }
@@ -146,14 +160,33 @@ fuzz_target!(|data: &[u8]| {
     let canary = !set.to_json().unwrap_or_default().contains(CANARY);
 
     let index = Index::build(set.clone());
-    if let Ok(hit) = index.lookup(&redactor, &request) {
-        check(&set, sig.authority(), &hit.response(&method), canary);
-        for factor in [0, 1, 100, 10_000] {
-            assert!(draw(hit.latency, factor, &mut Bits(seed | 1)) <= MAX_DELAY_MS);
+    // A miss is a 599 with `x-mimic-miss: 1`, `content-length: 0` and nothing else.
+    for miss in [Miss::Authority, Miss::Endpoint, Miss::Overload] {
+        let response = miss.response();
+        assert_eq!(response.status, 599);
+        assert_eq!(response.headers.len(), 2);
+        assert!(response.body().is_empty() && response.trailers.is_empty());
+    }
+    match index.lookup(&redactor, &request) {
+        Err(miss) => {
+            assert!(matches!(miss, Miss::Authority | Miss::Endpoint));
+            assert_eq!(miss.response().status, 599);
         }
-        // The same request, the same answer.
-        let again = index.lookup(&redactor, &request).expect("a second lookup");
-        assert_eq!(again.tier, hit.tier);
-        assert_eq!(again.answer, hit.answer);
+        Ok(hit) => {
+            check(
+                &set,
+                sig.authority(),
+                (hit.method, hit.template),
+                &hit.response(&method),
+                canary,
+            );
+            for factor in [0, 1, 100, 10_000] {
+                assert!(draw(hit.latency, factor, &mut Bits(seed | 1)) <= MAX_DELAY_MS);
+            }
+            // The same request, the same answer.
+            let again = index.lookup(&redactor, &request).expect("a second lookup");
+            assert_eq!(again.tier, hit.tier);
+            assert_eq!(again.answer, hit.answer);
+        }
     }
 });

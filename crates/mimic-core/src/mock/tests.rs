@@ -599,6 +599,25 @@ fn mck_04_a_grpc_answer_is_ok_with_an_empty_message_and_trailers() {
 }
 
 #[test]
+fn mck_04_a_grpc_answer_drops_the_status_headers_of_its_sample() {
+    let mut call = ex("POST", "/pkg.Svc/Get", 200)
+        .resp("application/grpc", "")
+        .resp_header("grpc-status", "5")
+        .resp_header("grpc-message", "not found");
+    call.grpc = true;
+    let index = index(&record(&[call]));
+    let mut r = req("POST", "/pkg.Svc/Get").header("content-type", "application/grpc");
+    r.h2 = true;
+    let (_, response) = ask(&index, &r).expect("an answer");
+    assert!(header(&response, "grpc-status").is_none());
+    assert!(header(&response, "grpc-message").is_none());
+    assert_eq!(
+        response.trailers,
+        vec![("grpc-status".to_string(), "0".to_string())]
+    );
+}
+
+#[test]
 fn mck_04_a_miss_is_599_and_nothing_else() {
     for miss in [
         Miss::Authority,

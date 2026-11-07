@@ -100,7 +100,10 @@ fn answer_of(sample: &Sample, grpc: bool) -> Answer {
     let headers = sample
         .response_headers()
         .iter()
-        .filter(|(name, _)| !DROPPED.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            !DROPPED.contains(&name.as_str())
+                && !(grpc && matches!(name.as_str(), "grpc-status" | "grpc-message"))
+        })
         .map(|(name, value)| (name.as_str().into(), value.as_str().into()))
         .collect();
     let body: Box<[u8]> = match sample.response_payload() {
@@ -346,6 +349,8 @@ impl Index {
             tier,
             answer: Arc::clone(answer),
             latency: &endpoint.latency,
+            method: &endpoint.method,
+            template: &endpoint.template,
         })
     }
 }

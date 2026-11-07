@@ -130,6 +130,9 @@ pub struct Hit<'a> {
     pub tier: Tier,
     pub answer: Arc<Answer>,
     pub latency: &'a Histogram,
+    /// The method and template of the endpoint the answer comes from.
+    pub method: &'a str,
+    pub template: &'a str,
 }
 
 /// What a mocked exchange sends: status, headers, trailers and a body shared with the index.
