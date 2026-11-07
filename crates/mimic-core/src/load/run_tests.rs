@@ -91,7 +91,9 @@ mod schedule_tests {
         assert_eq!(s, [share(100, 334), share(100, 334), share(100, 333)]);
         let s = split(10, None, 4);
         assert_eq!(
-            s.iter().map(|s| (s.concurrency, s.rate)).collect::<Vec<_>>(),
+            s.iter()
+                .map(|s| (s.concurrency, s.rate))
+                .collect::<Vec<_>>(),
             [(4, None), (3, None), (3, None)]
         );
     }
@@ -274,7 +276,9 @@ mod results_tests {
         s.missed(4);
         assert_eq!((s.requests, s.missed), (10, 4));
         let json = serde_json::to_value(&s).unwrap_or(Value::Null);
-        let keys: Vec<&String> = json["statuses"].as_object().map_or(vec![], |m| m.keys().collect());
+        let keys: Vec<&String> = json["statuses"]
+            .as_object()
+            .map_or(vec![], |m| m.keys().collect());
         assert_eq!(keys, ["2xx", "3xx", "4xx", "5xx"]);
         // A class outside the list is refused when read.
         let bad = json!({"requests": 1, "missed": 0, "statuses": {"6xx": 1}, "errors": {}, "latency": {}});
@@ -310,16 +314,44 @@ mod results_tests {
         let mut seen = Vec::new();
         words(&value, &mut seen);
         let allowed = [
-            "total", "endpoints", "method", "port", "template", "requests", "missed", "statuses",
-            "errors", "rps", "latencyMicros", "p50", "p90", "p99", "max", "GET", "POST", "/a",
-            "/b/{b_id}", "2xx", "3xx", "4xx", "5xx", "timeout", "connect", "reset", "protocol",
-            "refused", "unverified",
+            "total",
+            "endpoints",
+            "method",
+            "port",
+            "template",
+            "requests",
+            "missed",
+            "statuses",
+            "errors",
+            "rps",
+            "latencyMicros",
+            "p50",
+            "p90",
+            "p99",
+            "max",
+            "GET",
+            "POST",
+            "/a",
+            "/b/{b_id}",
+            "2xx",
+            "3xx",
+            "4xx",
+            "5xx",
+            "timeout",
+            "connect",
+            "reset",
+            "protocol",
+            "refused",
+            "unverified",
         ];
         for w in &seen {
             assert!(allowed.contains(&w.as_str()), "unexpected {w:?}");
         }
         // Round trip.
-        assert_eq!(serde_json::from_str::<crate::load::summary::Summary>(&a).ok(), Some(sum));
+        assert_eq!(
+            serde_json::from_str::<crate::load::summary::Summary>(&a).ok(),
+            Some(sum)
+        );
     }
 }
 
@@ -379,33 +411,77 @@ mod validation_tests {
         let bad = |p: Params| validate(&p, &limits()).err();
         let field = |p: Params| bad(p).map(|e| e.field);
         assert_eq!(
-            field(Params { concurrency: 257, ..params() }),
+            field(Params {
+                concurrency: 257,
+                ..params()
+            }),
             Some("spec.concurrency")
         );
         assert_eq!(
-            field(Params { rate: Some(2001), ..params() }),
+            field(Params {
+                rate: Some(2001),
+                ..params()
+            }),
             Some("spec.rate")
         );
         assert_eq!(
-            field(Params { duration_ms: 30 * 60_000 + 1, ..params() }),
+            field(Params {
+                duration_ms: 30 * 60_000 + 1,
+                ..params()
+            }),
             Some("spec.duration")
         );
         assert_eq!(
-            field(Params { ramp_up_ms: 300_001, ..params() }),
+            field(Params {
+                ramp_up_ms: 300_001,
+                ..params()
+            }),
             Some("spec.rampUp")
         );
         assert_eq!(
-            field(Params { timeout_ms: 60_001, ..params() }),
+            field(Params {
+                timeout_ms: 60_001,
+                ..params()
+            }),
             Some("spec.timeout")
         );
         // The message names the field and the limit.
-        let e = bad(Params { rate: Some(2001), ..params() }).expect("invalid");
+        let e = bad(Params {
+            rate: Some(2001),
+            ..params()
+        })
+        .expect("invalid");
         assert!(e.message.contains("spec.rate") && e.message.contains("MIMIC_LOAD_MAX_RATE"));
         // The CRD floors.
-        assert_eq!(field(Params { concurrency: 0, ..params() }), Some("spec.concurrency"));
-        assert_eq!(field(Params { rate: Some(0), ..params() }), Some("spec.rate"));
-        assert_eq!(field(Params { duration_ms: 9_999, ramp_up_ms: 0, ..params() }), Some("spec.duration"));
-        assert_eq!(field(Params { timeout_ms: 99, ..params() }), Some("spec.timeout"));
+        assert_eq!(
+            field(Params {
+                concurrency: 0,
+                ..params()
+            }),
+            Some("spec.concurrency")
+        );
+        assert_eq!(
+            field(Params {
+                rate: Some(0),
+                ..params()
+            }),
+            Some("spec.rate")
+        );
+        assert_eq!(
+            field(Params {
+                duration_ms: 9_999,
+                ramp_up_ms: 0,
+                ..params()
+            }),
+            Some("spec.duration")
+        );
+        assert_eq!(
+            field(Params {
+                timeout_ms: 99,
+                ..params()
+            }),
+            Some("spec.timeout")
+        );
         // The edges are valid; the closed model has no rate.
         let edge = Params {
             concurrency: 256,
@@ -415,7 +491,16 @@ mod validation_tests {
             timeout_ms: 100,
         };
         assert_eq!(validate(&edge, &limits()), Ok(()));
-        assert_eq!(validate(&Params { rate: None, ..params() }, &limits()), Ok(()));
+        assert_eq!(
+            validate(
+                &Params {
+                    rate: None,
+                    ..params()
+                },
+                &limits()
+            ),
+            Ok(())
+        );
     }
 }
 
@@ -426,11 +511,17 @@ mod gate_tests {
     const WINDOW: u64 = 300_000;
 
     fn pulls(items: &[(&str, &str)]) -> BTreeMap<String, String> {
-        items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn two() -> Vec<Target> {
-        vec![target("a-6d4c8f9b7-xxxxx", "10.0.0.1"), target("a-6d4c8f9b7-zzzzz", "10.0.0.2")]
+        vec![
+            target("a-6d4c8f9b7-xxxxx", "10.0.0.1"),
+            target("a-6d4c8f9b7-zzzzz", "10.0.0.2"),
+        ]
     }
 
     #[test]
@@ -439,26 +530,44 @@ mod gate_tests {
         let ok = pulls(&[("a-6d4c8f9b7-xxxxx", &fresh), ("a-6d4c8f9b7-zzzzz", &fresh)]);
         assert_eq!(gate(Mode::Mock, &two(), &ok, NOW, WINDOW), Gate::Open);
         // Effective mode discovery.
-        assert_eq!(gate(Mode::Discovery, &two(), &ok, NOW, WINDOW), Gate::WaitingForMock);
+        assert_eq!(
+            gate(Mode::Discovery, &two(), &ok, NOW, WINDOW),
+            Gate::WaitingForMock
+        );
         // No target.
-        assert_eq!(gate(Mode::Mock, &[], &ok, NOW, WINDOW), Gate::WaitingForTargets);
+        assert_eq!(
+            gate(Mode::Mock, &[], &ok, NOW, WINDOW),
+            Gate::WaitingForTargets
+        );
         // A pod still in discovery.
         let d = format!("discovery {}", NOW - 1_000);
         let one_discovery = pulls(&[("a-6d4c8f9b7-xxxxx", &fresh), ("a-6d4c8f9b7-zzzzz", &d)]);
-        assert_eq!(gate(Mode::Mock, &two(), &one_discovery, NOW, WINDOW), Gate::WaitingForMock);
+        assert_eq!(
+            gate(Mode::Mock, &two(), &one_discovery, NOW, WINDOW),
+            Gate::WaitingForMock
+        );
         // An expired field.
         let old = format!("mock {}", NOW - WINDOW - 1);
         let expired = pulls(&[("a-6d4c8f9b7-xxxxx", &fresh), ("a-6d4c8f9b7-zzzzz", &old)]);
-        assert_eq!(gate(Mode::Mock, &two(), &expired, NOW, WINDOW), Gate::WaitingForMock);
+        assert_eq!(
+            gate(Mode::Mock, &two(), &expired, NOW, WINDOW),
+            Gate::WaitingForMock
+        );
         // On the edge of the window it still counts.
         let edge = format!("mock {}", NOW - WINDOW);
         let at_edge = pulls(&[("a-6d4c8f9b7-xxxxx", &fresh), ("a-6d4c8f9b7-zzzzz", &edge)]);
         assert_eq!(gate(Mode::Mock, &two(), &at_edge, NOW, WINDOW), Gate::Open);
         // No field at all, and a field that does not parse.
         let missing = pulls(&[("a-6d4c8f9b7-xxxxx", &fresh)]);
-        assert_eq!(gate(Mode::Mock, &two(), &missing, NOW, WINDOW), Gate::WaitingForMock);
+        assert_eq!(
+            gate(Mode::Mock, &two(), &missing, NOW, WINDOW),
+            Gate::WaitingForMock
+        );
         let junk = pulls(&[("a-6d4c8f9b7-xxxxx", &fresh), ("a-6d4c8f9b7-zzzzz", "mock")]);
-        assert_eq!(gate(Mode::Mock, &two(), &junk, NOW, WINDOW), Gate::WaitingForMock);
+        assert_eq!(
+            gate(Mode::Mock, &two(), &junk, NOW, WINDOW),
+            Gate::WaitingForMock
+        );
         // A pod that is not a target does not matter.
         let extra = pulls(&[
             ("a-6d4c8f9b7-xxxxx", &fresh),
@@ -496,7 +605,10 @@ mod gate_tests {
                 target("a-6d4c8f9b7-zzzzz", "10.0.0.2"),
             ]
         );
-        assert_eq!(targets(&slices, "a-b"), [target("a-b-6d4c8f9b7-xxxxx", "10.0.0.9")]);
+        assert_eq!(
+            targets(&slices, "a-b"),
+            [target("a-b-6d4c8f9b7-xxxxx", "10.0.0.9")]
+        );
         assert!(targets(&[], "a").is_empty());
     }
 }
@@ -528,7 +640,10 @@ fn input<'a>(resources: &'a Value, secret: Option<&'a str>) -> JobInput<'a> {
 }
 
 fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 /// The checks of the Job `ValidatingAdmissionPolicy` of §11, in Rust (the policy itself is
@@ -550,18 +665,38 @@ fn job_admitted(job: &Value, image: &str) -> Result<(), String> {
     if containers.len() != 1 {
         return Err("one container".into());
     }
-    for forbidden in ["initContainers", "ephemeralContainers", "nodeName", "tolerations", "hostAliases", "hostNetwork", "hostPID", "hostIPC", "hostUsers", "shareProcessNamespace"] {
+    for forbidden in [
+        "initContainers",
+        "ephemeralContainers",
+        "nodeName",
+        "tolerations",
+        "hostAliases",
+        "hostNetwork",
+        "hostPID",
+        "hostIPC",
+        "hostUsers",
+        "shareProcessNamespace",
+    ] {
         if !pod[forbidden].is_null() && pod[forbidden] != json!(false) {
             return Err(format!("forbidden {forbidden}"));
         }
     }
     let c = &containers[0];
-    if c["image"] != image || c["command"] != json!(["/usr/local/bin/mimic-load"]) || !c["args"].is_null() || !c["envFrom"].is_null() {
+    if c["image"] != image
+        || c["command"] != json!(["/usr/local/bin/mimic-load"])
+        || !c["args"].is_null()
+        || !c["envFrom"].is_null()
+    {
         return Err("image, command or args".into());
     }
     let allowed = [
-        "MIMIC_LOAD_RUN", "MIMIC_LOAD_DEPLOYMENT", "MIMIC_CONTROLLER_URL", "MIMIC_CONTROLLER_CA",
-        "MIMIC_LOAD_TOKEN_FILE", "MIMIC_LOAD_CREDENTIALS_DIR", "MIMIC_LOAD_REPORT_INTERVAL",
+        "MIMIC_LOAD_RUN",
+        "MIMIC_LOAD_DEPLOYMENT",
+        "MIMIC_CONTROLLER_URL",
+        "MIMIC_CONTROLLER_CA",
+        "MIMIC_LOAD_TOKEN_FILE",
+        "MIMIC_LOAD_CREDENTIALS_DIR",
+        "MIMIC_LOAD_REPORT_INTERVAL",
         "MIMIC_LOAD_MAX_PLAN",
     ];
     for e in c["env"].as_array().ok_or("env")? {
@@ -570,7 +705,9 @@ fn job_admitted(job: &Value, image: &str) -> Result<(), String> {
             return Err(format!("env {name}"));
         }
     }
-    if pod["automountServiceAccountToken"] != json!(false) || pod["serviceAccountName"] != json!("default") {
+    if pod["automountServiceAccountToken"] != json!(false)
+        || pod["serviceAccountName"] != json!("default")
+    {
         return Err("service account".into());
     }
     let sc = &c["securityContext"];
@@ -588,15 +725,25 @@ fn job_admitted(job: &Value, image: &str) -> Result<(), String> {
     for v in pod["volumes"].as_array().ok_or("volumes")? {
         if let Some(p) = v["projected"].as_object() {
             let sources = p["sources"].as_array().ok_or("sources")?;
-            let [src] = sources.as_slice() else { return Err("one source".into()) };
+            let [src] = sources.as_slice() else {
+                return Err("one source".into());
+            };
             let t = &src["serviceAccountToken"];
-            if t["audience"] != json!("mimic.platform.io/load") || t["expirationSeconds"].as_u64().is_none_or(|s| s > 600) {
+            if t["audience"] != json!("mimic.platform.io/load")
+                || t["expirationSeconds"].as_u64().is_none_or(|s| s > 600)
+            {
                 return Err("token".into());
             }
         } else if v["secret"].is_object() {
             secrets += 1;
-            let m = c["volumeMounts"].as_array().ok_or("mounts")?.iter().find(|m| m["name"] == v["name"]);
-            if m.is_none_or(|m| m["mountPath"] != json!("/mimic/credentials") || m["readOnly"] != json!(true)) {
+            let m = c["volumeMounts"]
+                .as_array()
+                .ok_or("mounts")?
+                .iter()
+                .find(|m| m["name"] == v["name"]);
+            if m.is_none_or(|m| {
+                m["mountPath"] != json!("/mimic/credentials") || m["readOnly"] != json!(true)
+            }) {
                 return Err("secret mount".into());
             }
         } else {
@@ -614,7 +761,12 @@ fn env_of(job: &Value) -> BTreeMap<String, String> {
         .as_array()
         .map(|a| {
             a.iter()
-                .map(|e| (e["name"].as_str().unwrap_or_default().to_string(), e["value"].as_str().unwrap_or_default().to_string()))
+                .map(|e| {
+                    (
+                        e["name"].as_str().unwrap_or_default().to_string(),
+                        e["value"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -646,11 +798,23 @@ mod object_tests {
         assert_eq!(owner["name"], "load-1");
         assert_eq!(owner["uid"], UID);
         assert_eq!(owner["blockOwnerDeletion"], false);
-        assert_eq!(j["metadata"]["labels"]["mimic.platform.io/load-test"], "load-1");
-        assert_eq!(j["metadata"]["labels"]["app.kubernetes.io/managed-by"], "mimic");
+        assert_eq!(
+            j["metadata"]["labels"]["mimic.platform.io/load-test"],
+            "load-1"
+        );
+        assert_eq!(
+            j["metadata"]["labels"]["app.kubernetes.io/managed-by"],
+            "mimic"
+        );
         let t = &s["template"];
-        assert_eq!(t["metadata"]["labels"]["mimic.platform.io/inject"], "disabled");
-        assert_eq!(t["metadata"]["labels"]["mimic.platform.io/load-test"], "load-1");
+        assert_eq!(
+            t["metadata"]["labels"]["mimic.platform.io/inject"],
+            "disabled"
+        );
+        assert_eq!(
+            t["metadata"]["labels"]["mimic.platform.io/load-test"],
+            "load-1"
+        );
         assert_eq!(t["spec"]["restartPolicy"], "Never");
         assert_eq!(t["spec"]["automountServiceAccountToken"], false);
         let c = &t["spec"]["containers"][0];
@@ -660,15 +824,27 @@ mod object_tests {
         // The projected token, and no secret volume without credentials.
         let volumes = t["spec"]["volumes"].as_array().expect("volumes");
         assert_eq!(volumes.len(), 1);
-        assert_eq!(volumes[0]["projected"]["sources"][0]["serviceAccountToken"]["audience"], "mimic.platform.io/load");
-        assert_eq!(volumes[0]["projected"]["sources"][0]["serviceAccountToken"]["expirationSeconds"], 600);
+        assert_eq!(
+            volumes[0]["projected"]["sources"][0]["serviceAccountToken"]["audience"],
+            "mimic.platform.io/load"
+        );
+        assert_eq!(
+            volumes[0]["projected"]["sources"][0]["serviceAccountToken"]["expirationSeconds"],
+            600
+        );
         // Literal env of §10.6 names.
         let env = env_of(&j);
         assert_eq!(env["MIMIC_LOAD_RUN"], format!("shop/load-1/{UID}"));
         assert_eq!(env["MIMIC_LOAD_DEPLOYMENT"], "payment");
-        assert_eq!(env["MIMIC_CONTROLLER_URL"], "https://mimic-controller.mimic-system.svc:8444");
+        assert_eq!(
+            env["MIMIC_CONTROLLER_URL"],
+            "https://mimic-controller.mimic-system.svc:8444"
+        );
         assert!(env["MIMIC_CONTROLLER_CA"].starts_with("-----BEGIN CERTIFICATE-----"));
-        assert_eq!(env["MIMIC_LOAD_TOKEN_FILE"], "/var/run/secrets/mimic.platform.io/load-token");
+        assert_eq!(
+            env["MIMIC_LOAD_TOKEN_FILE"],
+            "/var/run/secrets/mimic.platform.io/load-token"
+        );
         assert_eq!(env["MIMIC_LOAD_REPORT_INTERVAL"], "5s");
         assert_eq!(env["MIMIC_LOAD_MAX_PLAN"], (8 << 20).to_string());
         assert!(!env.contains_key("MIMIC_LOAD_CREDENTIALS_DIR"));
@@ -699,7 +875,10 @@ mod object_tests {
             .expect("a mount");
         assert_eq!(mount["mountPath"], "/mimic/credentials");
         assert_eq!(mount["readOnly"], true);
-        assert_eq!(env_of(&j)["MIMIC_LOAD_CREDENTIALS_DIR"], "/mimic/credentials");
+        assert_eq!(
+            env_of(&j)["MIMIC_LOAD_CREDENTIALS_DIR"],
+            "/mimic/credentials"
+        );
         assert_eq!(job_admitted(&j, input(&r, None).image), Ok(()));
     }
 
@@ -726,17 +905,58 @@ mod object_tests {
         let ok = job(&input(&r, Some("s")));
         let with = |path: &str, v: Value| {
             let mut j = ok.clone();
-            if let Some(slot) = j.pointer_mut(path) {
-                *slot = v;
-            }
+            let (parent, key) = path.rsplit_once('/').expect("a pointer");
+            let slot = j
+                .pointer_mut(parent)
+                .and_then(Value::as_object_mut)
+                .expect("a parent object");
+            slot.insert(key.to_string(), v);
             j
         };
         let p = "/spec/template/spec";
-        assert!(job_admitted(&with("/spec/template/spec/containers/0/image", json!("x:latest")), image).is_err());
-        assert!(job_admitted(&with(&format!("{p}/automountServiceAccountToken"), json!(true)), image).is_err());
-        assert!(job_admitted(&with(&format!("{p}/containers/0/args"), json!(["--x"])), image).is_err());
-        assert!(job_admitted(&with(&format!("{p}/volumes/0/projected/sources/0/serviceAccountToken/audience"), json!("")), image).is_err());
-        assert!(job_admitted(&with(&format!("{p}/volumes/0/projected/sources/0/serviceAccountToken/expirationSeconds"), json!(3600)), image).is_err());
+        assert!(
+            job_admitted(
+                &with("/spec/template/spec/containers/0/image", json!("x:latest")),
+                image
+            )
+            .is_err()
+        );
+        assert!(
+            job_admitted(
+                &with(&format!("{p}/automountServiceAccountToken"), json!(true)),
+                image
+            )
+            .is_err()
+        );
+        assert!(
+            job_admitted(
+                &with(&format!("{p}/containers/0/args"), json!(["--x"])),
+                image
+            )
+            .is_err()
+        );
+        assert!(
+            job_admitted(
+                &with(
+                    &format!("{p}/volumes/0/projected/sources/0/serviceAccountToken/audience"),
+                    json!("")
+                ),
+                image
+            )
+            .is_err()
+        );
+        assert!(
+            job_admitted(
+                &with(
+                    &format!(
+                        "{p}/volumes/0/projected/sources/0/serviceAccountToken/expirationSeconds"
+                    ),
+                    json!(3600)
+                ),
+                image
+            )
+            .is_err()
+        );
     }
 
     fn policy<'a>(
@@ -770,20 +990,43 @@ mod object_tests {
         assert_eq!(n["metadata"]["namespace"], "shop");
         assert_eq!(n["metadata"]["name"], "mimic-load-7c9e66797425");
         assert_eq!(n["metadata"]["ownerReferences"][0]["uid"], UID);
-        assert_eq!(n["metadata"]["ownerReferences"][0]["blockOwnerDeletion"], false);
-        assert_eq!(n["metadata"]["labels"]["mimic.platform.io/load-test"], "load-1");
+        assert_eq!(
+            n["metadata"]["ownerReferences"][0]["blockOwnerDeletion"],
+            false
+        );
+        assert_eq!(
+            n["metadata"]["labels"]["mimic.platform.io/load-test"],
+            "load-1"
+        );
         let spec = &n["spec"];
-        assert_eq!(spec["podSelector"]["matchLabels"], json!({"mimic.platform.io/load-test": "load-1"}));
+        assert_eq!(
+            spec["podSelector"]["matchLabels"],
+            json!({"mimic.platform.io/load-test": "load-1"})
+        );
         assert_eq!(spec["policyTypes"], json!(["Ingress", "Egress"]));
         // No ingress rule without a metrics source.
         assert_eq!(spec["ingress"].as_array().map_or(0, Vec::len), 0);
         let egress = spec["egress"].as_array().expect("egress");
         assert_eq!(egress.len(), 3);
         // The deployment's pods on the plan's ports (once each) and 15100.
-        assert_eq!(egress[0]["to"], json!([{"podSelector": {"matchLabels": {"mimic.platform.io/deployment": "payment"}}}]));
-        let ports: Vec<u64> = egress[0]["ports"].as_array().expect("ports").iter().map(|p| p["port"].as_u64().unwrap_or(0)).collect();
+        assert_eq!(
+            egress[0]["to"],
+            json!([{"podSelector": {"matchLabels": {"mimic.platform.io/deployment": "payment"}}}])
+        );
+        let ports: Vec<u64> = egress[0]["ports"]
+            .as_array()
+            .expect("ports")
+            .iter()
+            .map(|p| p["port"].as_u64().unwrap_or(0))
+            .collect();
         assert_eq!(ports, [8080, 9090, 15100]);
-        assert!(egress[0]["ports"].as_array().expect("ports").iter().all(|p| p["protocol"] == "TCP"));
+        assert!(
+            egress[0]["ports"]
+                .as_array()
+                .expect("ports")
+                .iter()
+                .all(|p| p["protocol"] == "TCP")
+        );
         // The controller on 8444.
         assert_eq!(
             egress[1],
@@ -819,6 +1062,9 @@ mod object_tests {
             json!([{"from": from, "ports": [{"protocol": "TCP", "port": 15100}]}])
         );
         // Same input, same object.
-        assert_eq!(n, network_policy(&policy(&[8080], &controller, &dns, &from)));
+        assert_eq!(
+            n,
+            network_policy(&policy(&[8080], &controller, &dns, &from))
+        );
     }
 }

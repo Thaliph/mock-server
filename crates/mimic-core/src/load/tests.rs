@@ -967,11 +967,7 @@ mod follow_ups {
                 r#""value":{"<redacted>""#,
             ),
             (vec![named], r#"{"deep":2}"#, r#"{"<redacted>":2}"#),
-            (
-                vec![form],
-                r#"[["fkey","1"]"#,
-                r#"[["<redacted>","1"]"#,
-            ),
+            (vec![form], r#"[["fkey","1"]"#, r#"[["<redacted>","1"]"#),
         ];
         for (items, from, to) in cases {
             // Unmarked, the endpoint is planned.
@@ -993,10 +989,16 @@ mod follow_ups {
         let c = ctx(&secrets, 5);
         let shown = format!("{c:?}");
         assert!(shown.contains("token"), "{shown}");
-        assert!(!shown.contains(SECRET) && !shown.contains(c.marker), "{shown}");
+        assert!(
+            !shown.contains(SECRET) && !shown.contains(c.marker),
+            "{shown}"
+        );
 
         let mut s = spec();
-        s.credentials = vec![credential("header/authorization", "token")];
+        s.credentials = vec![
+            credential("header/authorization", "token"),
+            credential("query/api_key", "token"),
+        ];
         let items = [Ex::new("GET", "/me", 200)
             .header("authorization", &format!("Bearer {CANARY}"))
             .query(&format!("api_key={CANARY}"))];

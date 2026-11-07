@@ -31,6 +31,11 @@ pub enum ErrorKind {
     Unverified,
 }
 
+fn bump<K: Ord>(map: &mut BTreeMap<K, u64>, key: K, n: u64) {
+    let c = map.entry(key).or_default();
+    *c = c.saturating_add(n);
+}
+
 /// Cumulative counts of one endpoint, on one pod or merged.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,19 +50,40 @@ pub struct Stats {
 impl Stats {
     /// A response head arrived `micros` after the first byte was written.
     pub fn response(&mut self, status: u16, micros: u64) {
-        todo!()
+        let class = match status {
+            200..=299 => Class::C2xx,
+            300..=399 => Class::C3xx,
+            400..=499 => Class::C4xx,
+            500..=599 => Class::C5xx,
+            // Not a final status of HTTP/1.1.
+            _ => return self.error(ErrorKind::Protocol),
+        };
+        self.requests = self.requests.saturating_add(1);
+        bump(&mut self.statuses, class, 1);
+        self.latency.record(micros);
     }
 
+    /// A request that got no usable response.
     pub fn error(&mut self, kind: ErrorKind) {
-        todo!()
+        self.requests = self.requests.saturating_add(1);
+        bump(&mut self.errors, kind, 1);
     }
 
+    /// Sends that were due with the concurrency in flight (not requests).
     pub fn missed(&mut self, n: u64) {
-        todo!()
+        self.missed = self.missed.saturating_add(n);
     }
 
     pub fn merge(&mut self, other: &Stats) {
-        todo!()
+        self.requests = self.requests.saturating_add(other.requests);
+        self.missed = self.missed.saturating_add(other.missed);
+        for (class, n) in &other.statuses {
+            bump(&mut self.statuses, *class, *n);
+        }
+        for (kind, n) in &other.errors {
+            bump(&mut self.errors, *kind, *n);
+        }
+        self.latency.merge(&other.latency);
     }
 }
 
@@ -70,7 +96,13 @@ pub struct PodResults {
 
 impl PodResults {
     pub fn merge(&mut self, other: &PodResults) {
-        todo!()
+        if self.endpoints.len() < other.endpoints.len() {
+            self.endpoints
+                .resize_with(other.endpoints.len(), Stats::default);
+        }
+        for (mine, theirs) in self.endpoints.iter_mut().zip(&other.endpoints) {
+            mine.merge(theirs);
+        }
     }
 }
 
@@ -111,5 +143,47 @@ pub struct Summary {
 
 /// The summary of the pods' cumulative results after `elapsed_ms`.
 pub fn summary(plan: &Plan, pods: &[PodResults], elapsed_ms: u64) -> Summary {
-    todo!()
+    let mut merged = PodResults {
+        endpoints: vec![Stats::default(); plan.endpoints.len()],
+    };
+    for pod in pods {
+        merged.merge(pod);
+    }
+    let mut total = Stats::default();
+    let mut endpoints = Vec::with_capacity(plan.endpoints.len());
+    for (endpoint, stats) in plan.endpoints.iter().zip(&merged.endpoints) {
+        total.merge(stats);
+        endpoints.push(EndpointRow {
+            method: endpoint.method.clone(),
+            port: endpoint.port,
+            template: endpoint.template.clone(),
+            row: row(stats, elapsed_ms),
+        });
+    }
+    Summary {
+        total: row(&total, elapsed_ms),
+        endpoints,
+    }
+}
+
+fn row(stats: &Stats, elapsed_ms: u64) -> Row {
+    let rps = if elapsed_ms == 0 {
+        0
+    } else {
+        let n = u128::from(stats.requests) * 1000 + u128::from(elapsed_ms / 2);
+        u64::try_from(n / u128::from(elapsed_ms)).unwrap_or(u64::MAX)
+    };
+    Row {
+        requests: stats.requests,
+        missed: stats.missed,
+        statuses: stats.statuses.clone(),
+        errors: stats.errors.clone(),
+        rps,
+        latency_micros: Latency {
+            p50: stats.latency.percentile(50),
+            p90: stats.latency.percentile(90),
+            p99: stats.latency.percentile(99),
+            max: stats.latency.max(),
+        },
+    }
 }
