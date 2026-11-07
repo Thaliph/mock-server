@@ -1483,6 +1483,14 @@ mod tests {
     }
 
     #[test]
+    fn mck_18_the_sidecar_gets_the_allocator_settings() {
+        let doc = apply_with(&pod(), &wiring());
+        let env = env_of(&doc["spec"]["initContainers"][1]);
+        assert_eq!(env["MALLOC_ARENA_MAX"]["value"], "2");
+        assert_eq!(env["MALLOC_MMAP_THRESHOLD_"]["value"], "131072");
+    }
+
+    #[test]
     fn mck_01_mode_is_always_set_and_the_factor_and_passthrough_only_when_not_default() {
         let env = |tls: &TlsWiring| {
             let doc = apply_with(&pod(), tls);
