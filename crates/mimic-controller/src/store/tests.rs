@@ -371,6 +371,135 @@ async fn ctl_09_torn_staged_write_is_refused_and_never_visible() {
     assert!(staged(&mut c, &k).await.is_empty(), "the staged keys stay");
 }
 
+/// Runs the script on staged keys of `tmp_len` and `out_len` announced bytes (`""`: no outbound).
+async fn invoke(
+    store: &Store,
+    c: &mut redis::aio::MultiplexedConnection,
+    k: &Keys,
+    (ns, dep): (&str, &str),
+    (tmp, tmp_out): (&str, &str),
+    (len, out_len): (usize, &str),
+) -> i64 {
+    let version: String = cmd(c, &["HGET", &k.meta, "version"]).await;
+    store
+        .script
+        .prepare_invoke()
+        .key(&k.report)
+        .key(&k.meta)
+        .key(&k.pods)
+        .key(&k.seq)
+        .key(&k.ns_index)
+        .key(&k.workloads)
+        .key(&k.outbound)
+        .key(tmp)
+        .key(tmp_out)
+        .arg(&version)
+        .arg(3_600_000)
+        .arg(1000)
+        .arg(now_ms())
+        .arg(50)
+        .arg(ns)
+        .arg(dep)
+        .arg(len)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(out_len)
+        .arg("digest")
+        .invoke_async(c)
+        .await
+        .expect("the script runs")
+}
+
+/// A whole inbound part and a short outbound one: the script refuses on the outbound length.
+#[tokio::test]
+async fn ctl_09_torn_outbound_stage_is_refused_and_cleaned() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09o"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await
+        .expect("applied");
+    let mut c = conn(None).await;
+    let before: String = cmd(&mut c, &["GET", &k.report]).await;
+    let (tmp, tmp_out) = (k.staged(7, "report"), k.staged(7, "outbound"));
+    let _: () = cmd(&mut c, &["SET", &tmp, "01234", "PX", "60000"]).await;
+    let _: () = cmd(&mut c, &["SET", &tmp_out, "{}", "PX", "60000"]).await;
+    let got = invoke(&store, &mut c, &k, (&ns, dep), (&tmp, &tmp_out), (5, "100")).await;
+    assert_eq!(got, 0);
+    let after: String = cmd(&mut c, &["GET", &k.report]).await;
+    assert_eq!(after, before);
+    assert!(staged(&mut c, &k).await.is_empty());
+}
+
+/// After a staged write the keys hold the writer's TTL (not the stage's 60 s), `:outbound` is the
+/// renamed part, and the digest is the version and the hash of the stored `:outbound` (PUL-06).
+#[tokio::test]
+async fn ctl_09_staged_write_renames_both_parts_with_the_writers_ttl_and_digest() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09p"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let out = [("api.example.com:443", "/v1/x", 2)];
+    let got = store
+        .push(&ns, dep, v2::push_v2("pod-a", 1, &["/a"], &out))
+        .await;
+    assert_eq!(got, Ok(Outcome::Applied));
+    let mut c = conn(None).await;
+    for key in [&k.report, &k.outbound] {
+        let ttl: i64 = cmd(&mut c, &["PTTL", key]).await;
+        assert!((3_000_000..=3_600_000).contains(&ttl), "{key}: {ttl}");
+    }
+    let outbound: Vec<u8> = cmd(&mut c, &["GET", &k.outbound]).await;
+    assert!(Report::from_json(std::str::from_utf8(&outbound).expect("text")).is_ok());
+    let digest: String = cmd(&mut c, &["HGET", &k.meta, "outbound_digest"]).await;
+    let version: String = cmd(&mut c, &["HGET", &k.meta, "version"]).await;
+    assert_eq!(digest, format!("{version}:{}", sha256_hex(&outbound)));
+    assert!(staged(&mut c, &k).await.is_empty());
+}
+
+/// A write with no outbound part deletes the old `:outbound` and stages nothing for it.
+#[tokio::test]
+async fn ctl_09_staged_write_without_outbound_leaves_no_outbound_key() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09n"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await
+        .expect("applied");
+    let mut c = conn(None).await;
+    let exists: i64 = cmd(&mut c, &["EXISTS", &k.outbound]).await;
+    assert_eq!(exists, 0);
+    let ttl: i64 = cmd(&mut c, &["PTTL", &k.report]).await;
+    assert!((3_000_000..=3_600_000).contains(&ttl), "{ttl}");
+    assert!(staged(&mut c, &k).await.is_empty());
+}
+
+/// The script fails (a Lua error: `:meta` is not a hash) after the parts were staged: the writer
+/// deletes the staged keys instead of leaving them for the expiry.
+#[tokio::test]
+async fn ctl_09_a_failed_script_leaves_no_staged_key() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09e"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let meta = k.meta.clone();
+    store.intrude_once(Box::pin(async move {
+        let mut c = conn(None).await;
+        let _: () = cmd(&mut c, &["SET", &meta, "not a hash"]).await;
+    }));
+    let got = store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Err(StoreError::Unavailable));
+    let mut c = conn(None).await;
+    assert!(staged(&mut c, &k).await.is_empty());
+}
+
 /// A part of several chunks is staged whole, with the TTL of the stage; the write keeps its own.
 #[tokio::test]
 async fn ctl_09_chunked_stage_stores_every_byte() {
