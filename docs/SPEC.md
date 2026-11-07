@@ -1563,7 +1563,8 @@ held, measured and summarised, never used to answer a request.
   "pulled": "<RFC 3339 of the last 200 or 304>" | null, "authorities": {"<authority>":
   {"endpoints": [{"method", "template", "grpc", "exchanges", "statuses"}]}}}`. No sample and no
   field name: `/egress` shows what the pod could mock, not the exchanges the other pods
-  recorded.
+  recorded. The loopback check reads the socket peer, so it assumes the admin port is not
+  redirected by the mesh rules and the pod does not use `hostNetwork`.
 - **Rollout.** An F9 controller answers pulls whatever the sidecar version (sidecars up to F8
   do not pull); an F9 sidecar facing a controller up to F8 gets `unsupported` and holds an
   empty snapshot. A controller rolled back to F8 writes without the digest; an F9 controller
@@ -1747,7 +1748,7 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_DISCOVERY_PUSH_INTERVAL` | `30s` | Period of the discovery push (§6, §7.2), 1s–1h. Not set by the webhook. |
 | `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Extra names redacted by name (§6), comma-separated, at most 64, each 1–64 characters of `a-z0-9-_` (compared like the built-in names); the webhook sets the sorted, deduplicated union, lower-cased, of `spec.discovery.redact` of every `MimicWorkload` naming the deployment. |
 | `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | (F9) Period of the egress pull (§7.7), 1s–1h. Not set by the webhook. |
-| `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | (F9) Largest egress set read from the controller (§7.7; `<n>`, `<n>Ki`, `<n>Mi`; 64Ki–1Gi). Not set by the webhook. Sized so that the pull peak and the discovery worst case fit the 128 Mi sidecar limit (PUL-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
+| `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | (F9) Largest egress set read from the controller (§7.7; `<n>`, `<n>Ki`, `<n>Mi`, `<n>Gi`; 64Ki–1Gi). Not set by the webhook. Sized so that the pull peak and the discovery worst case fit the 128 Mi sidecar limit (PUL-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
 
 ### 10.4 `mimic-init` variables
 

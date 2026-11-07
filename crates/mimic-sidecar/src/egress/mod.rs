@@ -91,7 +91,7 @@ fn size(env: &Env, var: &str, default: usize) -> Result<usize, ConfigError> {
 /// What the sidecar holds of the controller's egress set.
 #[derive(Default)]
 struct Held {
-    set: Option<EgressSet>,
+    set: Option<Arc<EgressSet>>,
     etag: Option<String>,
     /// The last `200` or `304`.
     pulled: Option<SystemTime>,
@@ -123,7 +123,7 @@ impl Snapshot {
         self.held()
             .set
             .as_ref()
-            .map_or(0, EgressSet::endpoint_count)
+            .map_or(0, |set| set.endpoint_count())
     }
 
     /// Size of the body of the set held, 0 without one.
@@ -137,7 +137,7 @@ impl Snapshot {
         let old = std::mem::replace(
             &mut *self.held(),
             Held {
-                set: Some(set),
+                set: Some(Arc::new(set)),
                 etag,
                 pulled: Some(now),
                 bytes,
@@ -148,16 +148,20 @@ impl Snapshot {
 
     /// The local view (spec §7.7): what the pod could mock, no sample and no field name.
     pub fn summary(&self) -> String {
-        let held = self.held();
-        let pulled = held.pulled.and_then(|at| {
+        // The lock is held for a clone only: the pull's swap never waits for the serialisation.
+        let (set, etag, pulled) = {
+            let held = self.held();
+            (held.set.clone(), held.etag.clone(), held.pulled)
+        };
+        let pulled = pulled.and_then(|at| {
             time::OffsetDateTime::from(at)
                 .format(&time::format_description::well_known::Rfc3339)
                 .ok()
         });
-        match (&held.set, &pulled) {
+        match (&set, &pulled) {
             // A controller that sent no `ETag`: the set is held, but nothing names it.
             (Some(set), Some(pulled)) => {
-                egress::summary(Some((set, held.etag.as_deref().unwrap_or(""), pulled)))
+                egress::summary(Some((set, etag.as_deref().unwrap_or(""), pulled)))
             }
             _ => egress::summary(None),
         }

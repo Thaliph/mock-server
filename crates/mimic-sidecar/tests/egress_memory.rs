@@ -37,6 +37,10 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 
 const BODY: usize = 256 * 1024;
 const CAP: usize = 4 << 20;
+/// Exchanges of the load, and the share of them that comes before the pulls: the pulls run
+/// when discovery is at its worst case, the load not yet over.
+const TOTAL: usize = 2 * 256 * 30;
+const PULLS_FROM: usize = TOTAL / 10 * 9;
 const REPLY: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
 
@@ -132,8 +136,9 @@ async fn recorded(metrics: &Metrics, label: &str, n: u64) {
     panic!("{n} x {label} not reached:\n{}", metrics.encode());
 }
 
-/// 256 outbound and 256 inbound endpoints over 64 authorities, 30 exchanges each.
-async fn load(discovery: Arc<Discovery>) {
+/// 256 outbound and 256 inbound endpoints over 64 authorities, 30 exchanges each, `TOTAL` in
+/// all; `done` counts the exchanges answered.
+async fn load(discovery: Arc<Discovery>, done: Arc<AtomicUsize>) {
     let app = app().await;
     let out = common::fixture_discovery(Direction::Outbound, &discovery, move |_| Some(app)).await;
     let inbound =
@@ -145,6 +150,7 @@ async fn load(discovery: Arc<Discovery>) {
             for _ in 0..30 {
                 let host = format!("a{authority}.example");
                 post(&mut c, &host, &format!("/p{path}"), seq).await;
+                done.fetch_add(1, Ordering::Relaxed);
                 seq += 1;
             }
             recorded(
@@ -160,6 +166,7 @@ async fn load(discovery: Arc<Discovery>) {
     for endpoint in 0..256 {
         for _ in 0..30 {
             post(&mut i, "svc.ns:8080", &format!("/svc/e{endpoint}"), n).await;
+            done.fetch_add(1, Ordering::Relaxed);
             n += 1;
         }
         recorded(
@@ -388,7 +395,7 @@ async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_und
     let token = dir.path().join("token");
     std::fs::write(&token, "token").unwrap();
     let config = EgressConfig {
-        interval: Duration::from_secs(1),
+        interval: Duration::from_millis(300),
         max_bytes: CAP,
         timeout: Duration::from_secs(30),
         target: Some(Target {
@@ -422,13 +429,28 @@ async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_und
     let discovery = Arc::new(Discovery::start(&discovery_config, None).unwrap());
     let metrics = Arc::new(metrics);
 
-    let loading = tokio::spawn(load(discovery.clone()));
+    let done = Arc::new(AtomicUsize::new(0));
+    let loading = tokio::spawn(load(discovery.clone(), done.clone()));
+    // The pulls start when 90% of the exchanges are recorded.
+    for _ in 0..6000 {
+        if done.load(Ordering::Relaxed) >= PULLS_FROM {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let level = |label: &str, done: &AtomicUsize| {
+        let n = done.load(Ordering::Relaxed);
+        eprintln!("pul-18 load at {label}: {n}/{TOTAL}");
+        n
+    };
+    assert!(level("start of the pulls", &done) >= PULLS_FROM);
     tokio::spawn(puller.run(std::future::pending()));
 
-    // After each accepted pull `/egress` shows the new set, while the load runs.
+    // After each accepted pull `/egress` shows the new set, the load still running.
     let first = view_etag(admin_addr, "\"1-first\"").await;
-    assert!(!loading.is_finished(), "the load ended before the pulls");
+    assert!(level("first set", &done) >= PULLS_FROM);
     let second = view_etag(admin_addr, "\"1-second\"").await;
+    assert!(level("second set", &done) >= PULLS_FROM);
     assert_ne!(first["authorities"], second["authorities"]);
     // The third body is refused, and the second set is still held.
     let refused = "mimic_egress_pulls_total{result=\"invalid\"} 1";
@@ -439,11 +461,12 @@ async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_und
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(metrics.encode().contains(refused), "{}", metrics.encode());
-    assert_eq!(egress_view(admin_addr).await["etag"], "\"1-second\"");
     assert!(
-        !loading.is_finished(),
+        level("refused body", &done) < TOTAL,
         "the load ended before the refused pull"
     );
+    assert_eq!(egress_view(admin_addr).await["etag"], "\"1-second\"");
+    assert!(!loading.is_finished());
     assert!(pulls.load(Ordering::SeqCst) >= 3);
     loading.await.unwrap();
 
