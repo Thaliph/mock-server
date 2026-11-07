@@ -437,7 +437,7 @@ const LATENCY_FACTOR: HeaderName = HeaderName::from_static("mimic-latency-factor
 /// Adds the deployment's effective mode (spec §7.7): outside the `ETag` and the projection.
 fn with_mode(mut response: Response, mode: &Effective) -> Response {
     let headers = response.headers_mut();
-    headers.insert(MODE, HeaderValue::from_static(mode.mode()));
+    headers.insert(MODE, HeaderValue::from_static(mode.mode().as_str()));
     if mode.mock
         && let Ok(factor) = HeaderValue::from_str(&mode.factor_text())
     {
@@ -626,7 +626,7 @@ impl SidecarApi {
             &caller.namespace,
             &caller.deployment,
             &caller.pod,
-            mode.mode(),
+            mode.mode().as_str(),
         );
         mode
     }

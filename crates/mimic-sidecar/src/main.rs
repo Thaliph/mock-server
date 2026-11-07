@@ -12,6 +12,7 @@ use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig, ShipConfig};
 use mimic_sidecar::egress::{EgressConfig, EgressMetrics, Puller, Snapshot};
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
+use mimic_sidecar::mode::{ModeConfig, ModeState};
 use mimic_sidecar::probes::{self, Probes};
 use mimic_sidecar::red::ProxyMetrics;
 use mimic_sidecar::tls::ca::{CaClient, CaMetrics, CaState};
@@ -56,6 +57,10 @@ fn main() -> ExitCode {
         Ok(egress) => egress,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
+    let mode = match ModeConfig::from_env(&env, &tls.trust_dir) {
+        Ok(mode) => mode,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
     let pod = env.optional("MIMIC_POD_NAME").map(str::to_string);
     let mut log = mimic_runtime::logging::init(&config.log);
     // Before any key exists: no core dump, not readable through /proc by other processes.
@@ -64,7 +69,13 @@ fn main() -> ExitCode {
         log.finish();
         return ExitCode::FAILURE;
     }
-    let code = match run(config, tunnel, probes, tls, (discovery, ship, egress, pod)) {
+    let code = match run(
+        config,
+        tunnel,
+        probes,
+        tls,
+        (discovery, ship, egress, mode, pod),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "sidecar stopped");
@@ -82,7 +93,13 @@ async fn run(
     tunnel: TunnelConfig,
     probes: Probes,
     tls: TlsConfig,
-    (discovery, ship, egress, pod): (DiscoveryConfig, ShipConfig, EgressConfig, Option<String>),
+    (discovery, ship, egress, mode, pod): (
+        DiscoveryConfig,
+        ShipConfig,
+        EgressConfig,
+        ModeConfig,
+        Option<String>,
+    ),
 ) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     // Registered before any listener is announced: an early SIGTERM is not lost.
@@ -97,7 +114,8 @@ async fn run(
     let shipper = discovery.shipper(ship).map_err(std::io::Error::other)?;
     let egress_metrics = EgressMetrics::default();
     egress_metrics.register(&mut metrics);
-    let snapshot = Snapshot::default();
+    let mode = ModeState::start(&mode, &mut metrics);
+    let snapshot = Snapshot::new(mode);
     let puller =
         Puller::new(egress, egress_metrics, snapshot.clone()).map_err(std::io::Error::other)?;
     let metrics = Arc::new(metrics);

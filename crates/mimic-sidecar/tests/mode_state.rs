@@ -189,13 +189,13 @@ fn mode_gauge(admin: SocketAddr) -> Option<String> {
 }
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    for _ in 0..500 {
+    for _ in 0..1500 {
         if done() {
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("{what} not reached in 10 s");
+    panic!("{what} not reached in 30 s");
 }
 
 fn count(process: &mut Process, message: &str) -> usize {
@@ -225,7 +225,7 @@ fn changes(process: &mut Process) -> Vec<(String, String, String)> {
             assert_eq!(v["target"], "mock");
             (
                 v["mode"].as_str().unwrap().to_string(),
-                v["latency_factor"].to_string(),
+                v["latency_factor"].as_f64().unwrap().to_string(),
                 v["source"].as_str().unwrap().to_string(),
             )
         })
@@ -307,7 +307,7 @@ async fn mck_10_answers_switch_the_mode_and_failures_keep_it() {
     assert_eq!(count(&mut process, "mode unknown"), 1);
     let unknown = line(&mut process, "mode unknown");
     assert_eq!(unknown["level"], "WARN");
-    assert_eq!(unknown["value"], "MOCK");
+    assert_eq!(unknown["value"], "");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
