@@ -121,7 +121,7 @@ impl Puller {
         let wait = self.settle(fetched);
         // After the snapshot of the same answer: a sidecar that enters mock answers from it.
         if let Some(announced) = announced {
-            self.snapshot.mode().observe(announced);
+            self.snapshot.mode().observe(announced).await;
         }
         wait
     }

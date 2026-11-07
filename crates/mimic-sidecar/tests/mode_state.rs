@@ -12,7 +12,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use mimic_runtime::testing::{Process, http_get, run};
+use mimic_runtime::testing::{Process, http_get};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType,
@@ -389,8 +389,49 @@ fn mck_10_invalid_mode_settings_exit_2_before_listening() {
         ("MIMIC_MOCK_LATENCY_FACTOR", "abc"),
         ("MIMIC_MOCK_PASSTHROUGH", "*"),
     ] {
-        let (status, stdout, _) = run(BIN, &[], &[(var, value)]);
+        // Loopback and ephemeral ports: a value not rejected must not bind a real port.
+        let mut child = std::process::Command::new(BIN)
+            .env_clear()
+            .env("MIMIC_ADMIN_ADDR", "127.0.0.1:0")
+            .env("MIMIC_INBOUND_ADDRS", "127.0.0.1:0")
+            .env("MIMIC_OUTBOUND_ADDRS", "127.0.0.1:0")
+            .env(var, value)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let status = status.unwrap_or_else(|| panic!("{var}={value} was not rejected in 10 s"));
         assert_eq!(status.code(), Some(2), "{var}={value}");
-        assert!(!stdout.contains("admin listening"), "{var}={value}");
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert!(stderr.contains(var), "{var}={value}: {stderr}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mck_10_a_state_path_that_is_not_a_regular_file_is_ignored_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("mimic/state")).unwrap();
+    let fifo = state_file(dir.path());
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let api = fake_api(vec![], Reply::Silent).await;
+    let (mut process, admin) = sidecar(&api, dir.path(), "60s", &[]);
+    assert_eq!(count(&mut process, "mode state ignored"), 1);
+    assert_eq!(egress(admin)["mode"], "discovery");
 }

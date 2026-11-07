@@ -114,7 +114,7 @@ async fn run(
     let shipper = discovery.shipper(ship).map_err(std::io::Error::other)?;
     let egress_metrics = EgressMetrics::default();
     egress_metrics.register(&mut metrics);
-    let mode = ModeState::start(&mode, &mut metrics);
+    let mode = ModeState::start(&mode, &mut metrics).await;
     let snapshot = Snapshot::new(mode);
     let puller =
         Puller::new(egress, egress_metrics, snapshot.clone()).map_err(std::io::Error::other)?;

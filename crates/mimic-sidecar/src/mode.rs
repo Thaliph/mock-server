@@ -172,7 +172,7 @@ impl ModeState {
 
     /// The state at start: the state file when it holds a valid one, else the configuration.
     /// Registers `mimic_mock_mode`.
-    pub fn start(config: &ModeConfig, metrics: &mut Metrics) -> ModeState {
+    pub async fn start(config: &ModeConfig, metrics: &mut Metrics) -> ModeState {
         let state = ModeState::new(config);
         metrics.registry_mut().register(
             "mock_mode",
@@ -181,7 +181,11 @@ impl ModeState {
         );
         let mut source = Source::Env;
         if !config.state_file.as_os_str().is_empty() {
-            match read_state(&config.state_file) {
+            let path = config.state_file.clone();
+            let read = tokio::task::spawn_blocking(move || read_state(&path))
+                .await
+                .unwrap_or_else(|_| Err("read task failed".to_string()));
+            match read {
                 Ok(Some((mode, factor))) => {
                     let mut current = state.current();
                     (current.mode, current.factor) = (mode, factor);
@@ -222,7 +226,7 @@ impl ModeState {
 
     /// Applies the mode of a `200` or `304`. An answer without a valid `Mimic-Mode` keeps
     /// the current one (one warning per streak of them).
-    pub fn observe(&self, announced: Announced) {
+    pub async fn observe(&self, announced: Announced) {
         let mode = match announced.mode {
             Ok(mode) => mode,
             Err(value) => {
@@ -244,7 +248,7 @@ impl ModeState {
             return;
         }
         // Saved before it is applied, so that a restart never resumes an older mode.
-        self.save(mode, factor);
+        self.save(mode, factor).await;
         {
             let mut current = self.current();
             (current.mode, current.factor) = (mode, factor);
@@ -255,8 +259,12 @@ impl ModeState {
 
     /// Writes the state file through a temporary file and a rename. A failure is one warning
     /// per streak and changes nothing else.
-    fn save(&self, mode: Mode, factor: u32) {
-        let failure = write_state(&self.0.state_file, mode, factor).err();
+    async fn save(&self, mode: Mode, factor: u32) {
+        let path = self.0.state_file.clone();
+        let failure = tokio::task::spawn_blocking(move || write_state(&path, mode, factor))
+            .await
+            .unwrap_or_else(|_| Err("write task failed".to_string()))
+            .err();
         let mut current = self.current();
         match failure {
             None => current.unsaved = false,
@@ -283,11 +291,14 @@ fn changed(mode: Mode, previous: Option<Mode>, factor: u32, source: Source) {
 
 /// The saved mode, `None` without a file.
 fn read_state(path: &Path) -> Result<Option<(Mode, u32)>, String> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
+    // A FIFO or a device would block the open or the read: only a regular file is read.
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err("not a regular file".to_string()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("cannot read: {}", e.kind())),
-    };
+    }
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot read: {}", e.kind()))?;
     let mut text = String::new();
     file.take(MAX_STATE_BYTES + 1)
         .read_to_string(&mut text)
