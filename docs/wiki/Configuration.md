@@ -111,6 +111,8 @@ sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 | `MIMIC_SIDECAR_API_RATE` | `10` | Requests/s per source address, burst twice that. 1-10000. |
 | `MIMIC_SIDECAR_API_MAX_REPORT` | `32Mi` | Largest push body. 64Ki-1Gi. |
 | `MIMIC_SIDECAR_API_BODY_BUDGET` | `32Mi` | Push bodies being read at once; at least `MAX_REPORT`, at most 4Gi. |
+| `MIMIC_SIDECAR_API_MAX_EGRESS` | `4Mi` | Largest egress set answered (F9); larger gets `507`. 64Ki-1Gi. See [Egress endpoint](Egress-endpoint). |
+| `MIMIC_SIDECAR_API_EGRESS_BUDGET` | `32Mi` | Egress sets cached or being sent at once; at least `MAX_EGRESS`, at most 4Gi. |
 | `MIMIC_STORE_TTL` | `30d` | Retention after last push / last seen. 10s-365d. |
 | `MIMIC_STORE_MAX_ENDPOINTS` | `512` | Per direction and deployment. 1-10000. |
 | `MIMIC_STORE_MAX_PUSH_ENDPOINTS` | `256` | Per direction in one push; 1-10000, at most `MAX_ENDPOINTS`. |
@@ -147,6 +149,8 @@ Set by the webhook; the defaults are what it sets unless noted.
 | `MIMIC_DISCOVERY_CAPTURE_BUDGET` | `8Mi` | Body bytes captured in flight and queued. 1Mi-1Gi. Not set by the webhook. |
 | `MIMIC_DISCOVERY_QUEUE` | `1024` | Records waiting for the recorder. 1-65536. Not set by the webhook. |
 | `MIMIC_DISCOVERY_PUSH_INTERVAL` | `30s` | 1s-1h. Not set by the webhook. |
+| `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | Period of the egress pull (F9). 1s-1h. Not set by the webhook. |
+| `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | Largest egress set read (F9). 64Ki-1Gi. Raising it needs a larger sidecar memory limit. Not set by the webhook. |
 | `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Set by the webhook from `spec.discovery.redact`. At most 64 names. |
 
 ### `mimic-init` and `mimic-trust`

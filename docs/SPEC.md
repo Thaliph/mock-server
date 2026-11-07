@@ -1861,7 +1861,7 @@ random numbers it hands to the draw.
 | `mimic_ui_render_duration_seconds` | histogram (F6), parse and render of a stored report for `endpoints`, `openapi` and a document; buckets as `mimic_store_write_duration_seconds` | `route` |
 | `mimic_sidecar_api_egress_builds_total` | counter (F9, controller; the sidecar's pull metrics are `mimic_egress_*`), egress projections built (§7.7); `too_large` also counts a pull refused `507` before its build | `result` (`ok`, `too_large`, `unreadable`, `error`) |
 | `mimic_sidecar_api_egress_build_duration_seconds` | histogram (F9, controller), read, check, projection and serialisation of one build; buckets as `mimic_store_write_duration_seconds` | — |
-| `mimic_sidecar_api_egress_cache_bytes` | gauge (F9, controller), bytes of `MIMIC_SIDECAR_API_EGRESS_BUDGET` held by cached and in-flight projections | — |
+| `mimic_sidecar_api_egress_cache_bytes` | gauge (F9, controller), bytes of `MIMIC_SIDECAR_API_EGRESS_BUDGET` held by projections, cached or being sent (a build refused by this budget is still counted `ok` in `mimic_sidecar_api_egress_builds_total`) | — |
 
   `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
   port removed, `(invalid)` when it is not a host name or IP literal; an HTTP/1 `Host` value or
