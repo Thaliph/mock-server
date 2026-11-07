@@ -119,6 +119,7 @@ pub(crate) async fn handle(
                 return;
             }
             MockFirst::Other(buf) => read = buf,
+            MockFirst::Gone => return,
         }
     }
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await;
@@ -215,6 +216,8 @@ enum MockFirst {
     Http1(Vec<u8>, Instant),
     /// Anything else: the bytes read so far (possibly none), to detect again once connected.
     Other(Vec<u8>),
+    /// The client closed, failed or was told to stop: nothing is dialled.
+    Gone,
 }
 
 /// Waits for the first bytes of the client without connecting (spec §8): at most
@@ -248,9 +251,9 @@ async fn mock_first(
                         _ => return MockFirst::Other(buf),
                     }
                 }
-                _ => return MockFirst::Other(buf),
+                _ => return MockFirst::Gone,
             },
-            () = &mut abort => return MockFirst::Other(buf),
+            () = &mut abort => return MockFirst::Gone,
         }
     }
 }

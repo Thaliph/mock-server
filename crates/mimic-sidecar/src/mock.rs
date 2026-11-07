@@ -18,7 +18,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::service::Service as HyperService;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use mimic_core::Mode;
 use mimic_core::discovery::redact::{self, Redactor};
 use mimic_core::mock::{self, Miss, Random};
@@ -271,6 +271,8 @@ struct Clock {
     first: Mutex<Option<Instant>>,
     /// A request is being served: the reads are its body or the next request's lookahead.
     busy: AtomicBool,
+    /// An answer was handed to hyper and not yet flushed to the client.
+    owed: AtomicBool,
 }
 
 impl Clock {
@@ -291,6 +293,12 @@ impl Clock {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
             .unwrap_or_else(Instant::now)
+    }
+
+    /// Whether hyper may write now: an interim or final answer of ours is due. Anything else
+    /// is hyper's own answer to a request it cannot parse, which spec §8 replaces by a close.
+    fn may_write(&self) -> bool {
+        self.busy.load(Ordering::Acquire) || self.owed.load(Ordering::Acquire)
     }
 
     fn release(&self) {
@@ -325,11 +333,18 @@ impl AsyncWrite for Timed {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if !self.clock.may_write() {
+            return Poll::Ready(Ok(buf.len()));
+        }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(polled, Poll::Ready(Ok(()))) && !self.clock.busy.load(Ordering::Acquire) {
+            self.clock.owed.store(false, Ordering::Release);
+        }
+        polled
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -425,6 +440,7 @@ impl Flight {
             mock: Some(mock),
             mock_miss: miss.map(Miss::as_str),
         });
+        self.conn.clock.owed.store(true, Ordering::Release);
         self.conn.clock.release();
         // The slot goes with the flight, at the return of the answer.
         drop(self.slot.take());
@@ -499,18 +515,24 @@ impl Mock {
         let clock = Arc::new(Clock {
             first: Mutex::new(Some(first)),
             busy: AtomicBool::new(false),
+            owed: AtomicBool::new(false),
         });
         let conn = Arc::new(Conn {
             mock: self.clone(),
             ctx,
             clock: clock.clone(),
         });
+        let ctx = conn.ctx.clone();
         let service = Service(conn);
         let io = TokioIo::new(Timed {
             inner: stream,
             clock,
         });
-        let served = hyper::server::conn::http1::Builder::new().serve_connection(io, service);
+        let stall = Duration::from_millis(self.0.stall_ms.load(Ordering::Relaxed));
+        let served = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(stall)
+            .serve_connection(io, service);
         let mut served = std::pin::pin!(served);
         let ended = tokio::select! {
             r = served.as_mut() => Some(r),
@@ -525,8 +547,40 @@ impl Mock {
             () = abort.as_mut() => None,
         };
         if let Some(Err(e)) = ended {
+            if e.is_parse() || e.is_parse_too_large() || e.is_parse_status() {
+                self.unframed(&ctx);
+            }
             tracing::debug!(target: "mock", error = %e, "mocked connection ended");
         }
+    }
+}
+
+impl Mock {
+    /// A request the server cannot parse: the connection was closed without an answer, and
+    /// the exchange counts with `status_class="none"` (spec §8, PRX-21).
+    fn unframed(&self, ctx: &Ctx) {
+        let authority = ctx.dst.to_string();
+        ctx.proxy
+            .request_unobserved(ctx.direction, PROTOCOL_H1, &authority);
+        access::exchange(&access::Exchange {
+            direction: ctx.direction,
+            protocol: PROTOCOL_H1,
+            dst: ctx.dst,
+            authority,
+            method: None,
+            path: None,
+            status: None,
+            grpc_status: None,
+            upgrade: false,
+            tls: ctx.tls,
+            outcome: Outcome::Unframed,
+            duration: None,
+            head: None,
+            bytes_in: 0,
+            bytes_out: 0,
+            mock: None,
+            mock_miss: None,
+        });
     }
 }
 
@@ -588,7 +642,7 @@ impl Conn {
         let (response, label, miss, delay) = self.decide(&parts, target, matched.as_deref());
         // From here the answer is all that is held: the body and the index are let go before
         // the wait (spec §8 "Bounds").
-        drop((matched, reservation));
+        drop((matched, reservation, parts));
         if let Some(reason) = miss {
             flight.miss(reason);
         }
@@ -666,7 +720,19 @@ async fn read_body(
     let mut kept: Vec<u8> = Vec::new();
     let mut absent = false;
     let mut total = 0u64;
-    while let Some(frame) = body.frame().await {
+    let stall = Duration::from_millis(mock.0.stall_ms.load(Ordering::Relaxed));
+    loop {
+        // A client that stops sending does not hold a pending slot for ever.
+        let frame = match tokio::time::timeout(stall, body.frame()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request body stalled",
+                )));
+            }
+        };
         let Ok(data) = frame.map_err(BoxError::from)?.into_data() else {
             continue;
         };
