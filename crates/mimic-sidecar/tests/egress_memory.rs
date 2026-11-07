@@ -409,23 +409,21 @@ fn pul_18_fake_api_child_process() {
 fn spawn_fake_api() -> (ApiProcess, SocketAddr, String) {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "pul_18_fake_api_child_process", "--nocapture"])
-        .env("MIMIC_TEST_FAKE_API", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("the fake API starts");
-    let stdout = child.stdout.take().unwrap();
+    let mut api = ApiProcess(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pul_18_fake_api_child_process", "--nocapture"])
+            .env("MIMIC_TEST_FAKE_API", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("the fake API starts"),
+    );
+    let stdout = api.0.stdout.take().unwrap();
     for line in BufReader::new(stdout).lines() {
         let line = line.unwrap();
         if let Some(rest) = line.strip_prefix("FAKE_API ") {
             let (addr, ca) = rest.split_once(' ').unwrap();
-            return (
-                ApiProcess(child),
-                addr.parse().unwrap(),
-                ca.replace('|', "\n"),
-            );
+            return (api, addr.parse().unwrap(), ca.replace('|', "\n"));
         }
     }
     panic!("the fake API did not announce its address");
