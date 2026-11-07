@@ -3,12 +3,12 @@
 
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mimic_core::proxy::authority::normalise_authority;
+use mimic_core::proxy::authority::{http1_request_host, normalise_authority};
 use mimic_core::proxy::tls::{ClientHello, Parsed, Reason, parse_client_hello};
 use mimic_core::proxy::{DETECT_LIMIT, Detection, detect};
 use socket2::{SockRef, TcpKeepalive};
@@ -82,60 +82,25 @@ pub(crate) async fn handle(
     let mut abort = pin!(shared.aborted());
     let mut client = client;
     let stall = shared.detect_stall();
-    // In mock mode the sidecar connects only once it knows this is not a mocked HTTP/1
-    // connection (spec §8): what it read meanwhile is replayed to the detection below.
+    // In mock mode the sidecar connects only once it knows this is not a mocked connection
+    // (spec §8): what it read meanwhile is replayed to the detection below.
     let mut read = Vec::new();
     let mock = match shared.mock() {
         Some(mock) if direction == Direction::Outbound && mock.active() => Some(mock.clone()),
         _ => None,
     };
-    if let Some(mock) = mock {
-        match mock_first(&mut client, stall, abort.as_mut()).await {
-            MockFirst::Http(h2, buf, first) => {
-                shared.metrics().count(direction, Outcome::Ok);
-                if let Err(e) = configure_socket(&client) {
-                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
-                }
-                mock.connection("mocked");
-                let conn = Conn {
-                    shared: &shared,
-                    direction,
-                    dst,
-                    started,
-                    tls: false,
-                    sni: None,
-                    interception: None,
-                };
-                let protocol = if h2 { "h2" } else { "http1" };
-                shared
-                    .proxy()
-                    .connection(direction, protocol, &dst.to_string());
-                let stream = Stream::plain_with_prefix(client, buf);
-                if h2 {
-                    mock.serve_h2(conn.ctx(), stream, shared.stopped(), abort.as_mut())
-                        .await;
-                } else {
-                    mock.serve_http1(conn.ctx(), stream, first, shared.stopped(), abort.as_mut())
-                        .await;
-                }
+    // Whether a passthrough entry makes this connection one of discovery's.
+    let mut passthrough = false;
+    if let Some(mock) = &mock {
+        match mock_first(&mut client, mock, dst, stall, abort.as_mut()).await {
+            MockFirst::Route(route) => {
+                serve_mock(&shared, mock, dst, started, client, route, abort.as_mut()).await;
                 return;
             }
-            MockFirst::Tls(sni, buf) => {
-                shared.metrics().count(direction, Outcome::Ok);
-                if let Err(e) = configure_socket(&client) {
-                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
-                }
-                let conn = Conn {
-                    shared: &shared,
-                    direction,
-                    dst,
-                    started,
-                    tls: false,
-                    sni: sni.map(|name| normalise_authority(&name, TLS_PORT)),
-                    interception: None,
-                };
-                mock_tls(conn, &mock, client, buf, abort.as_mut()).await;
-                return;
+            MockFirst::Passthrough(buf) => {
+                mock.connection("passthrough");
+                passthrough = true;
+                read = buf;
             }
             MockFirst::Other(buf) => read = buf,
             MockFirst::Gone => return,
@@ -170,7 +135,34 @@ pub(crate) async fn handle(
         interception: None,
     };
     let mut upstream = upstream;
-    let served = match first_bytes(&mut client, &mut upstream, read, stall, abort.as_mut()).await {
+    let first = first_bytes(&mut client, &mut upstream, read, stall, abort.as_mut()).await;
+    // The client spoke HTTP or TLS before the destination did: the mock answers, and the
+    // destination socket is closed without a byte written to it (spec §8).
+    let first = match (first, &mock) {
+        (First::Client(detection, buf), Some(mock))
+            if !passthrough
+                && matches!(
+                    detection,
+                    Detection::Http1 | Detection::H2 | Detection::Tls { .. }
+                ) =>
+        {
+            match pick(mock, &detection, &buf, dst, false) {
+                Pick::Passthrough => {
+                    mock.connection("passthrough");
+                    passthrough = true;
+                    First::Client(detection, buf)
+                }
+                _ => {
+                    drop(upstream);
+                    let route = MockRoute::new(detection, buf);
+                    serve_mock(&shared, mock, dst, started, client, route, abort.as_mut()).await;
+                    return;
+                }
+            }
+        }
+        (first, _) => first,
+    };
+    let served = match first {
         First::Client(detection, buf) => {
             tracing::debug!(direction = direction.as_str(), %dst, ?detection, "protocol detected");
             match detection {
@@ -205,6 +197,12 @@ pub(crate) async fn handle(
             early,
         } => Served::Tunnel("tcp", to_upstream, to_client, early),
     };
+    if let Some(mock) = &mock
+        && !passthrough
+        && matches!(served, Served::Tunnel(..))
+    {
+        mock.connection("tunnel");
+    }
     conn.serve(
         served,
         Stream::plain(client),
@@ -212,6 +210,116 @@ pub(crate) async fn handle(
         abort.as_mut(),
     )
     .await;
+}
+
+/// What the mock does with a connection whose first bytes are HTTP or TLS.
+enum MockRoute {
+    /// An HTTP/1.x request line or the HTTP/2 preface (`true`), the bytes read, and when the
+    /// first one arrived.
+    Http(bool, Vec<u8>, Instant),
+    /// A TLS ClientHello, with its SNI and the bytes read: answered by the mock (spec §5).
+    Tls(Option<String>, Vec<u8>),
+}
+
+impl MockRoute {
+    fn new(detection: Detection, buf: Vec<u8>) -> MockRoute {
+        MockRoute::at(detection, buf, Instant::now())
+    }
+
+    fn at(detection: Detection, buf: Vec<u8>, first: Instant) -> MockRoute {
+        match detection {
+            Detection::Tls { sni } => MockRoute::Tls(sni, buf),
+            detection => MockRoute::Http(detection == Detection::H2, buf, first),
+        }
+    }
+}
+
+/// Serves a mocked connection (HTTP or intercepted TLS), with no connection to the destination.
+async fn serve_mock(
+    shared: &Arc<Shared>,
+    mock: &Mock,
+    dst: SocketAddr,
+    started: Instant,
+    client: TcpStream,
+    route: MockRoute,
+    mut abort: Pin<&mut (impl Future<Output = ()> + Send)>,
+) {
+    let direction = Direction::Outbound;
+    shared.metrics().count(direction, Outcome::Ok);
+    if let Err(e) = configure_socket(&client) {
+        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
+    }
+    let mut conn = Conn {
+        shared,
+        direction,
+        dst,
+        started,
+        tls: false,
+        sni: None,
+        interception: None,
+    };
+    match route {
+        MockRoute::Http(h2, buf, first) => {
+            mock.connection("mocked");
+            let protocol = if h2 { "h2" } else { "http1" };
+            shared
+                .proxy()
+                .connection(direction, protocol, &dst.to_string());
+            let stream = Stream::plain_with_prefix(client, buf);
+            if h2 {
+                mock.serve_h2(conn.ctx(), stream, shared.stopped(), abort.as_mut())
+                    .await;
+            } else {
+                mock.serve_http1(conn.ctx(), stream, first, shared.stopped(), abort.as_mut())
+                    .await;
+            }
+        }
+        MockRoute::Tls(sni, buf) => {
+            conn.sni = sni.map(|name| normalise_authority(&name, TLS_PORT));
+            mock_tls(conn, mock, client, buf, abort.as_mut()).await;
+        }
+    }
+}
+
+/// Whether a connection whose first bytes are `detection` is mocked or passed through
+/// (`MIMIC_MOCK_PASSTHROUGH`, spec §8), or needs more bytes to tell.
+enum Pick {
+    Mock,
+    Passthrough,
+    More,
+}
+
+/// With `wait_head`, an HTTP/1 connection is undecided until its request head is complete.
+fn pick(mock: &Mock, detection: &Detection, buf: &[u8], dst: SocketAddr, wait_head: bool) -> Pick {
+    let list = mock.passthrough();
+    if list.is_empty() {
+        return Pick::Mock;
+    }
+    let matched = match detection {
+        Detection::Tls { sni } => list.matches(sni.as_deref(), dst.ip()),
+        Detection::Http1 => {
+            if list.matches(None, dst.ip()) {
+                return Pick::Passthrough;
+            }
+            let complete = buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= DETECT_LIMIT;
+            if wait_head && !complete {
+                return Pick::More;
+            }
+            match http1_request_host(buf) {
+                Some(host) => match host.parse::<IpAddr>() {
+                    Ok(ip) => list.matches(None, ip),
+                    Err(_) => list.matches(Some(&host), dst.ip()),
+                },
+                None => false,
+            }
+        }
+        _ => list.matches(None, dst.ip()),
+    };
+    if matched {
+        Pick::Passthrough
+    } else {
+        Pick::Mock
+    }
 }
 
 /// The tunnel kind of an outbound opaque connection (spec §6.1): `tls_<reason>` when §5 passed
@@ -231,11 +339,11 @@ fn tunnel_kind(interception: Option<&str>) -> &'static str {
 /// What the client said first on an outbound connection in mock mode, before any connection
 /// to the destination.
 enum MockFirst {
-    /// An HTTP/1.x request line or the HTTP/2 preface (`true`), the bytes read, and when the
-    /// first one arrived.
-    Http(bool, Vec<u8>, Instant),
-    /// A TLS ClientHello, with its SNI and the bytes read: answered by the mock (spec §5).
-    Tls(Option<String>, Vec<u8>),
+    /// Served by the mock.
+    Route(MockRoute),
+    /// Handled as in discovery (`MIMIC_MOCK_PASSTHROUGH`): the bytes read, to detect again once
+    /// connected.
+    Passthrough(Vec<u8>),
     /// Anything else: the bytes read so far (possibly none), to detect again once connected.
     Other(Vec<u8>),
     /// The client closed, failed or was told to stop: nothing is dialled.
@@ -247,6 +355,8 @@ enum MockFirst {
 /// incomplete prefix.
 async fn mock_first(
     client: &mut TcpStream,
+    mock: &Mock,
+    dst: SocketAddr,
     stall: Duration,
     abort: impl Future<Output = ()>,
 ) -> MockFirst {
@@ -260,19 +370,35 @@ async fn mock_first(
         let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
         tokio::select! {
             () = &mut silent, if buf.is_empty() => return MockFirst::Other(buf),
-            () = stalled(!buf.is_empty(), stall) => return MockFirst::Other(buf),
+            () = stalled(!buf.is_empty(), stall) => {
+                // An HTTP/1 head still incomplete: the mock's own header timeout deals with it.
+                return match detect(&buf) {
+                    Detection::Http1 => MockFirst::Route(MockRoute::Http(
+                        false,
+                        buf,
+                        first.unwrap_or_else(Instant::now),
+                    )),
+                    _ => MockFirst::Other(buf),
+                };
+            }
             read = client.read(&mut chunk[..want]) => match read {
                 Ok(n) if n > 0 => {
                     first.get_or_insert_with(Instant::now);
                     buf.extend_from_slice(&chunk[..n]);
-                    match detect(&buf) {
-                        Detection::NeedMore => {}
-                        detection @ (Detection::Http1 | Detection::H2) => {
-                            let h2 = detection == Detection::H2;
-                            return MockFirst::Http(h2, buf, first.unwrap_or_else(Instant::now));
+                    let detection = detect(&buf);
+                    if matches!(detection, Detection::NeedMore) {
+                        continue;
+                    }
+                    if !matches!(detection, Detection::Http1 | Detection::H2 | Detection::Tls { .. }) {
+                        return MockFirst::Other(buf);
+                    }
+                    match pick(mock, &detection, &buf, dst, true) {
+                        Pick::More => {}
+                        Pick::Passthrough => return MockFirst::Passthrough(buf),
+                        Pick::Mock => {
+                            let at = first.unwrap_or_else(Instant::now);
+                            return MockFirst::Route(MockRoute::at(detection, buf, at));
                         }
-                        Detection::Tls { sni } => return MockFirst::Tls(sni, buf),
-                        _ => return MockFirst::Other(buf),
                     }
                 }
                 _ => return MockFirst::Gone,
@@ -486,7 +612,14 @@ async fn intercept(
     // protocol and its bytes make an opaque tunnel.
     let banner_watch = (!alpn_agreed).then_some(&mut upstream);
     let stall = conn.shared.detect_stall();
-    let served = match decrypted_first_bytes(&mut client, banner_watch, stall, abort.as_mut()).await
+    let served = match decrypted_first_bytes(
+        &mut client,
+        banner_watch,
+        false,
+        stall,
+        abort.as_mut(),
+    )
+    .await
     {
         Decrypted::Found(Detection::Http1, buf) => Served::Http1(buf),
         Decrypted::Found(Detection::H2, buf) => Served::H2(buf),
@@ -548,7 +681,7 @@ async fn mock_tls(
     let mut stream = Stream::tls(server.into());
     let first = Instant::now();
     let stall = shared.detect_stall();
-    let detected = decrypted_first_bytes(&mut stream, None, stall, abort.as_mut()).await;
+    let detected = decrypted_first_bytes(&mut stream, None, true, stall, abort.as_mut()).await;
     let (h2, buf) = match detected {
         Decrypted::Found(Detection::H2, buf) => (true, buf),
         Decrypted::Found(Detection::Http1, buf) => (false, buf),
@@ -604,10 +737,12 @@ enum Decrypted {
 }
 
 /// [`first_bytes`] for the decrypted client stream. The destination is read only when
-/// `upstream` is given (no ALPN protocol agreed): a banner then ends the detection.
+/// `upstream` is given (no ALPN protocol agreed): a banner then ends the detection. With no
+/// destination connected (`silent_closes`), a client silent for `stall` is closed too.
 async fn decrypted_first_bytes(
     client: &mut Stream,
     mut upstream: Option<&mut Stream>,
+    silent_closes: bool,
     stall: Duration,
     abort: impl Future<Output = ()>,
 ) -> Decrypted {
@@ -618,7 +753,7 @@ async fn decrypted_first_bytes(
         let mut banner = [0u8; READ_CHUNK];
         let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
         tokio::select! {
-            () = stalled(!buf.is_empty(), stall) => {
+            () = stalled(silent_closes || !buf.is_empty(), stall) => {
                 let timeout = io::Error::new(io::ErrorKind::TimedOut, "stalled on a protocol prefix");
                 return Decrypted::Closed(buf, Some(Early::Failed(Side::Client, timeout)));
             }

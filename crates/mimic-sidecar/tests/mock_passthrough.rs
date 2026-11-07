@@ -187,7 +187,8 @@ async fn mck_14_passthrough_http_reaches_the_destination_and_is_recorded() {
             passthrough: "users.test",
             dest: Dest::Hold {
                 greeting: b"",
-                reply: b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\n\r\nok",
+                reply:
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\n\r\nok",
             },
             discovery: Some(discovery.tap()),
             ..Options::default()
@@ -295,7 +296,9 @@ async fn mck_14_passthrough_tls_reaches_the_destination_and_is_recorded() {
     assert_eq!(decision(&rig, "passthrough"), 1);
     assert_eq!(decision(&rig, "closed"), 0);
     eventually("the tunnel is recorded", || {
-        outbound_scopes(&discovery).to_string().contains("tls_no_ca")
+        outbound_scopes(&discovery)
+            .to_string()
+            .contains("tls_no_ca")
     })
     .await;
 }
@@ -322,9 +325,11 @@ async fn mck_14_a_passthrough_ip_entry_matches_the_destination_of_an_h2c_connect
     let mut tcp = TcpStream::connect(rig.addr).await.unwrap();
     let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     tcp.write_all(preface).await.unwrap();
-    eventually("the destination receives the preface", || {
-        *rig.received.lock().unwrap() == preface
+    // The relay speaks h2 to the destination itself, as in discovery.
+    eventually("the destination receives a preface", || {
+        rig.received.lock().unwrap().starts_with(preface)
     })
     .await;
+    assert_eq!(rig.accepted.load(Ordering::SeqCst), 1);
     assert_eq!(decision(&rig, "passthrough"), 1);
 }

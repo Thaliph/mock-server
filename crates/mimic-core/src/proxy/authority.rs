@@ -94,6 +94,34 @@ pub fn target_authority<'a>(uri: Option<&'a str>, host: Option<&'a str>) -> Opti
     uri.or(host)
 }
 
+/// The host (no port, no userinfo, brackets of an IPv6 literal removed) of the first request in
+/// `head`, the bytes read so far of an HTTP/1 connection: the absolute-form target, else the
+/// `Host` header. `None` when neither is there (yet).
+pub fn http1_request_host(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(&head[..head.len().min(crate::proxy::DETECT_LIMIT)]);
+    let mut lines = text.split("\r\n");
+    let target = lines.next()?.split(' ').nth(1)?;
+    let from_target = target
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?']).next().unwrap_or(""));
+    let authority = match from_target {
+        Some(authority) => authority,
+        None => lines.take_while(|line| !line.is_empty()).find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("host").then_some(value.trim())
+        })?,
+    };
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => match authority.rsplit_once(':') {
+            Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+            _ => authority,
+        },
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 /// Keeps the first `max` distinct authorities; later ones are reported as `(other)`. The sentinels take no slot.
 /// One budget per direction and metric.
 #[derive(Debug, Clone)]
@@ -242,5 +270,29 @@ mod tests {
         );
         assert_eq!(target_authority(None, Some("b.example")), Some("b.example"));
         assert_eq!(target_authority(None, None), None);
+    }
+
+    #[test]
+    fn mck_14_http1_request_host_reads_the_target_then_the_host_header() {
+        let host = |head: &str| http1_request_host(head.as_bytes());
+        assert_eq!(
+            host("GET /a HTTP/1.1\r\nAccept: x\r\nHOST: Users.test:8080\r\n\r\n").as_deref(),
+            Some("Users.test")
+        );
+        assert_eq!(
+            host("GET http://a.test:81/x?y=1 HTTP/1.1\r\nhost: b.test\r\n\r\n").as_deref(),
+            Some("a.test")
+        );
+        assert_eq!(
+            host("GET / HTTP/1.1\r\nhost: [::1]:80\r\n\r\n").as_deref(),
+            Some("::1")
+        );
+        assert_eq!(
+            host("GET / HTTP/1.1\r\nhost: u:p@c.test\r\n\r\n").as_deref(),
+            Some("c.test")
+        );
+        assert_eq!(host("GET / HTTP/1.1\r\nx: y\r\n\r\n"), None);
+        assert_eq!(host("GET / HTTP/1.1\r\n"), None);
+        assert_eq!(host("GET"), None);
     }
 }
