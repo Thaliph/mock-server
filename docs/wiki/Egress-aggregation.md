@@ -55,6 +55,11 @@ streak. The next interval tries version 2 again. If a retry cannot tell whether 
 applied, the outbound part is dropped rather than counted twice
 (`mimic_discovery_outbound_dropped_total`).
 
+## Pulling it back
+
+Each sidecar pulls its deployment's aggregated egress from the controller and holds it in memory (F9): see
+[Egress endpoint](Egress-endpoint).
+
 ## Checking it
 
 `scripts/e2e.sh` runs a `front` Deployment with two replicas and a `MimicWorkload`, calls it, and checks that

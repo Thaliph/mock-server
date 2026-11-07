@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20).
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -2127,6 +2127,73 @@ for c in "$egr_token" "$egr_secret"; do
     if found -F "$c" "$f"; then fail "egr_19: the bearer token or the password appears in ${f##*/}"; fi
   done
 done
+
+# --- PUL-19: the injected front pods pull their deployment's egress from the controller (F9, spec §7.7) -------------------
+# The traffic of SHR-19 is over. Within 2 push intervals (30 s) plus 2 pull intervals (60 s) both front pods hold the
+# egress of front, and a second pull gets a 304. The pulls change no traffic: users logs nothing during the wait.
+log "pul_19: the front pods pull their deployment's egress (same etag, 304 on the second pull), a users pod sees none, no canary, B's access lines unchanged"
+pul_users_before=$(users_log_count) || fail "pul_19: cannot count the access lines of the users pods"
+pul_want='GET /missing;GET /users/{users_id};PUT /users/{users_id};'
+pul_ok() {
+  local p etags=""
+  for p in $egr_pods; do
+    sidecar_get egr-19 "$p" /egress > "$WORK/pul19-egress-$p.json"
+    [[ $(jq -r --arg a "$egr_authority" '.authorities[$a].endpoints // [] | map("\(.method) \(.template);") | sort | join("")' "$WORK/pul19-egress-$p.json" 2>/dev/null) == "$pul_want" ]] || return 1
+    etags+="$(jq -r '.etag // ""' "$WORK/pul19-egress-$p.json")"$'\n'
+  done
+  [[ $(sort -u <<<"${etags%$'\n'}" | wc -l) == 1 && -n $(head -1 <<<"$etags") ]]
+}
+pul_done=0
+for _ in $(seq 70); do
+  if pul_ok; then pul_done=1; break; fi
+  sleep 3
+done
+(( pul_done )) || fail "pul_19: the front pods do not both list $egr_authority with $pul_want and one etag after 210 s: $(head -c 2000 "$WORK"/pul19-egress-*.json 2>/dev/null)"
+for p in $egr_pods; do
+  jq -e --arg a "$egr_authority" '(.authorities | keys) == [$a] and (.pulled | type == "string")' "$WORK/pul19-egress-$p.json" >/dev/null \
+    || fail "pul_19: /egress of $p does not hold exactly the authority $egr_authority and a pull time: $(head -c 1000 "$WORK/pul19-egress-$p.json")"
+done
+# The second pull: each pod counts a not_modified pull (a metric), within 2 more pull intervals.
+pul_nm() {
+  local p n
+  for p in $egr_pods; do
+    n=$(sidecar_get egr-19 "$p" /metrics \
+      | awk 'index($0, "mimic_egress_pulls_total{result=\"not_modified\"} ") == 1 { printf "%d\n", $2 }' | tail -1)
+    (( ${n:-0} >= 1 )) || return 1
+  done
+}
+pul_got=0
+for _ in $(seq 50); do
+  if pul_nm; then pul_got=1; break; fi
+  sleep 3
+done
+(( pul_got )) || fail "pul_19: a front pod did not count a not_modified egress pull within 150 s"
+# The controller's logs: sidecar_api lines for the egress route of front with ok and not_modified.
+kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/pul19-controller.log" || fail "pul_19: cannot read the controller logs"
+for r in ok not_modified; do
+  jq -R -e --arg r "$r" 'fromjson? | select(.target == "sidecar_api" and .endpoint == "/v1/workloads/{deployment}/egress"
+    and .namespace == "egr-19" and .deployment == "front" and .result == $r)' "$WORK/pul19-controller.log" >/dev/null \
+    || fail "pul_19: no sidecar_api line for the egress route of front with result $r in the controller logs"
+done
+# Isolation: a users pod (another deployment) holds no authority.
+for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}'); do
+  sidecar_get disc-22 "$p" /egress > "$WORK/pul19-users-$p.json"
+  jq -e '.authorities == {}' "$WORK/pul19-users-$p.json" >/dev/null \
+    || fail "pul_19: /egress of the users pod $p holds an authority: $(head -c 1000 "$WORK/pul19-users-$p.json")"
+done
+# No canary in /egress, the controller logs or the sidecar logs of front.
+: > "$WORK/pul19-sidecar.log"
+for p in $egr_pods; do
+  kubectl -n egr-19 logs "$p" --all-containers >> "$WORK/pul19-sidecar.log" || fail "pul_19: cannot read the logs of $p"
+done
+for c in "${egr_canaries[@]}"; do
+  for f in "$WORK"/pul19-egress-*.json "$WORK"/pul19-users-*.json "$WORK/pul19-controller.log" "$WORK/pul19-sidecar.log"; do
+    if found -F "$c" "$f"; then fail "pul_19: a canary appears in ${f##*/}"; fi
+  done
+done
+# F9 changes no traffic: B's access lines are those of before the pulls.
+pul_users_after=$(users_log_count) || fail "pul_19: cannot count the access lines of the users pods after the pulls"
+[[ $pul_users_before == "$pul_users_after" ]] || fail "pul_19: the users pods logged $((pul_users_after - pul_users_before)) request(s) during the pulls"
 
 # --- SHR-20: the browser shows front's outbound endpoints and document -----------------------------------------------
 # The Chromium of UI-12 is still running. The client traffic is over: users must log nothing during the run.

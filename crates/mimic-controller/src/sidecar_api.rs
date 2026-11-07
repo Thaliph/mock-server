@@ -93,7 +93,7 @@ impl ApiMetrics {
         );
         registry.register_with_unit(
             "sidecar_api_egress_cache",
-            "Bytes of the egress budget held by cached and in-flight projections",
+            "Bytes of the egress budget held by projections, cached or being sent",
             Unit::Bytes,
             metrics.egress_cache_bytes.clone(),
         );
