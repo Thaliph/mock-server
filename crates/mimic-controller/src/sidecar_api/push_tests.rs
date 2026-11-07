@@ -241,7 +241,8 @@ async fn send(
 }
 
 /// A push of `body` for `deployment` by its pod, in the namespace of `s`.
-async fn push(s: &Setup, deployment: &str, body: Vec<u8>) -> Answer {
+async fn push(s: &Setup, deployment: &str, body: impl Into<axum::body::Bytes>) -> Answer {
+    let body: axum::body::Bytes = body.into();
     let token = token(&s.ns, deployment, "t");
     send(
         &s.router,

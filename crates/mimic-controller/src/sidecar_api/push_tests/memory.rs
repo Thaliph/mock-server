@@ -159,7 +159,9 @@ async fn work(dir: &str) {
         let s = s.clone();
         let path = format!("{dir}/{deployment}.json");
         pushes.push(tokio::spawn(async move {
-            let body = std::fs::read(path).expect("the body");
+            // The body is held once; a re-post shares it (a clone of `Bytes` copies nothing), so
+            // that the peak is the controller's (SHR-23).
+            let body = axum::body::Bytes::from(std::fs::read(path).expect("the body"));
             // A sidecar re-posts a push that got the `503` of the body budget.
             for _ in 0..600 {
                 let answer = push(&s, deployment, body.clone()).await;
