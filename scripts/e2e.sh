@@ -2144,30 +2144,49 @@ pul_ok() {
   [[ $(sort -u <<<"${etags%$'\n'}" | wc -l) == 1 && -n $(head -1 <<<"$etags") ]]
 }
 pul_done=0
-for _ in $(seq 70); do
+end=$((SECONDS + 2 * 30 + 2 * 60))
+while (( SECONDS < end )); do
   if pul_ok; then pul_done=1; break; fi
   sleep 3
 done
-(( pul_done )) || fail "pul_19: the front pods do not both list $egr_authority with $pul_want and one etag after 210 s: $(head -c 2000 "$WORK"/pul19-egress-*.json 2>/dev/null)"
+(( pul_done )) || fail "pul_19: the front pods do not both list $egr_authority with $pul_want and one etag within 2 push and 2 pull intervals: $(head -c 2000 "$WORK"/pul19-egress-*.json 2>/dev/null)"
 for p in $egr_pods; do
   jq -e --arg a "$egr_authority" '(.authorities | keys) == [$a] and (.pulled | type == "string")' "$WORK/pul19-egress-$p.json" >/dev/null \
     || fail "pul_19: /egress of $p does not hold exactly the authority $egr_authority and a pull time: $(head -c 1000 "$WORK/pul19-egress-$p.json")"
 done
-# The second pull: each pod counts a not_modified pull (a metric), within 2 more pull intervals.
+# The second pull: an empty set has an etag too, so the 304s of before the data existed do not count. The counts of
+# not_modified pulls (each pod's metric, the controller's log lines) are taken now, with the data held, and must rise
+# within 2 more pull intervals.
+pul_nm_pod() {
+  local n
+  n=$(sidecar_get egr-19 "$1" /metrics \
+    | awk 'index($0, "mimic_egress_pulls_total{result=\"not_modified\"} ") == 1 { printf "%d\n", $2 }' | tail -1)
+  echo "${n:-0}"
+}
+pul_nm_log() {
+  kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/pul19-controller.log" || return 1
+  jq -R -s '[split("\n")[] | fromjson? | select(.target == "sidecar_api" and .endpoint == "/v1/workloads/{deployment}/egress"
+    and .namespace == "egr-19" and .deployment == "front" and .result == "not_modified")] | length' "$WORK/pul19-controller.log"
+}
+declare -A pul_base
+for p in $egr_pods; do pul_base[$p]=$(pul_nm_pod "$p"); done
+pul_log_base=$(pul_nm_log) || fail "pul_19: cannot read the controller logs"
 pul_nm() {
   local p n
   for p in $egr_pods; do
-    n=$(sidecar_get egr-19 "$p" /metrics \
-      | awk 'index($0, "mimic_egress_pulls_total{result=\"not_modified\"} ") == 1 { printf "%d\n", $2 }' | tail -1)
-    (( ${n:-0} >= 1 )) || return 1
+    n=$(pul_nm_pod "$p")
+    (( n > pul_base[$p] )) || return 1
   done
+  n=$(pul_nm_log) || return 1
+  (( n > pul_log_base ))
 }
 pul_got=0
-for _ in $(seq 50); do
+end=$((SECONDS + 2 * 60))
+while (( SECONDS < end )); do
   if pul_nm; then pul_got=1; break; fi
   sleep 3
 done
-(( pul_got )) || fail "pul_19: a front pod did not count a not_modified egress pull within 150 s"
+(( pul_got )) || fail "pul_19: after the data was held, a front pod or the controller log did not show a new not_modified egress pull within 2 pull intervals"
 # The controller's logs: sidecar_api lines for the egress route of front with ok and not_modified.
 kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/pul19-controller.log" || fail "pul_19: cannot read the controller logs"
 for r in ok not_modified; do
@@ -2184,7 +2203,7 @@ done
 # No canary in /egress, the controller logs or the sidecar logs of front.
 : > "$WORK/pul19-sidecar.log"
 for p in $egr_pods; do
-  kubectl -n egr-19 logs "$p" --all-containers >> "$WORK/pul19-sidecar.log" || fail "pul_19: cannot read the logs of $p"
+  kubectl -n egr-19 logs "$p" --all-containers --tail=-1 >> "$WORK/pul19-sidecar.log" || fail "pul_19: cannot read the logs of $p"
 done
 for c in "${egr_canaries[@]}"; do
   for f in "$WORK"/pul19-egress-*.json "$WORK"/pul19-users-*.json "$WORK/pul19-controller.log" "$WORK/pul19-sidecar.log"; do
