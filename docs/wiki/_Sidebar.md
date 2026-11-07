@@ -6,6 +6,7 @@
 - [Reading the API](Reading-the-API)
 - [Discovery and redaction](Discovery-and-redaction)
 - [Egress aggregation](Egress-aggregation)
+- [Egress endpoint](Egress-endpoint)
 - [TLS interception](TLS-interception)
 
 **Run**

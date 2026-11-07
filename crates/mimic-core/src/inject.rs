@@ -254,6 +254,13 @@ pub struct TlsWiring {
     pub redact: Vec<String>,
     /// The webhook CA, PEM, which the sidecar verifies the sidecar API against.
     pub controller_ca: String,
+    /// The deployment's effective mode, `discovery` or `mock` (spec §7, F10).
+    pub mode: String,
+    /// `spec.mock.latencyFactor` in its shortest decimal form (`1`, `0.5`); only the
+    /// effective one of a deployment in `mock` is ever not `1`.
+    pub latency_factor: String,
+    /// `spec.mock.passthrough` of the deployment, sorted and deduplicated.
+    pub mock_passthrough: Vec<String>,
 }
 
 /// Injection patch of `pod`, owned by `deployment`.
@@ -302,6 +309,15 @@ pub fn patch(
     if !tls.exclude.is_empty() {
         sidecar_env
             .push(json!({"name": "MIMIC_TLS_EXCLUDE", "value": literal(&tls.exclude.join(","))}));
+    }
+    sidecar_env.push(json!({"name": "MIMIC_MODE", "value": literal(&tls.mode)}));
+    if tls.latency_factor != "1" {
+        sidecar_env.push(
+            json!({"name": "MIMIC_MOCK_LATENCY_FACTOR", "value": literal(&tls.latency_factor)}),
+        );
+    }
+    if !tls.mock_passthrough.is_empty() {
+        sidecar_env.push(json!({"name": "MIMIC_MOCK_PASSTHROUGH", "value": literal(&tls.mock_passthrough.join(","))}));
     }
     if !tls.redact.is_empty() {
         sidecar_env.push(json!({"name": "MIMIC_DISCOVERY_REDACT_NAMES", "value": literal(&tls.redact.join(","))}));
@@ -928,6 +944,9 @@ mod tests {
             redact: Vec::new(),
             controller_ca: "-----BEGIN CERTIFICATE-----\nWEBHOOK\n-----END CERTIFICATE-----\n"
                 .into(),
+            mode: "discovery".into(),
+            latency_factor: "1".into(),
+            mock_passthrough: Vec::new(),
         }
     }
 
@@ -1461,6 +1480,61 @@ mod tests {
             env["MIMIC_TLS_EXCLUDE"]["value"],
             "*.corp.example,api.example.com"
         );
+    }
+
+    #[test]
+    fn mck_01_mode_is_always_set_and_the_factor_and_passthrough_only_when_not_default() {
+        let env = |tls: &TlsWiring| {
+            let doc = apply_with(&pod(), tls);
+            env_of(&doc["spec"]["initContainers"][1])
+        };
+        let found = env(&wiring());
+        assert_eq!(found["MIMIC_MODE"]["value"], "discovery");
+        assert!(!found.contains_key("MIMIC_MOCK_LATENCY_FACTOR"));
+        assert!(!found.contains_key("MIMIC_MOCK_PASSTHROUGH"));
+        let mut tls = wiring();
+        tls.mode = "mock".into();
+        let found = env(&tls);
+        assert_eq!(found["MIMIC_MODE"]["value"], "mock");
+        assert!(!found.contains_key("MIMIC_MOCK_LATENCY_FACTOR"));
+        tls.latency_factor = "0.5".into();
+        tls.mock_passthrough = vec!["*.corp.example".into(), "db.example.com".into()];
+        let found = env(&tls);
+        assert_eq!(found["MIMIC_MOCK_LATENCY_FACTOR"]["value"], "0.5");
+        assert_eq!(
+            found["MIMIC_MOCK_PASSTHROUGH"]["value"],
+            "*.corp.example,db.example.com"
+        );
+        // Byte-identical for the same input (INJ-03).
+        assert_eq!(apply_with(&pod(), &tls), apply_with(&pod(), &tls));
+    }
+
+    #[test]
+    fn tls_11_only_the_sidecar_mounts_the_state_directory_read_write() {
+        let doc = apply(&pod());
+        let trust = |c: &Value| -> Vec<Value> {
+            c["volumeMounts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m["name"] == "mimic-trust")
+                .collect()
+        };
+        // `/mimic/state/mode` lives in the sidecar's own read-write mount of the volume.
+        let sidecar = &doc["spec"]["initContainers"][1];
+        assert_eq!(sidecar["name"], "mimic-sidecar");
+        assert_eq!(
+            trust(sidecar),
+            [json!({"name": "mimic-trust", "mountPath": "/mimic"})]
+        );
+        // The app only sees a `trust/<n>` subpath, read-only.
+        let mounted = trust(&doc["spec"]["containers"][0]);
+        assert!(!mounted.is_empty());
+        for m in mounted {
+            assert_eq!(m["readOnly"], true, "{m}");
+            assert!(m["subPath"].as_str().unwrap().starts_with("trust/"), "{m}");
+        }
     }
 
     #[test]
