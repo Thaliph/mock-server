@@ -121,6 +121,7 @@ struct Rig {
     logs: Logs,
     mode: ModeState,
     snapshot: Snapshot,
+    mock: Mock,
     accepted: Arc<AtomicUsize>,
     shared: Arc<Shared>,
 }
@@ -175,7 +176,7 @@ async fn rig_to(
     let shared = Arc::new(
         Shared::new(vec![addr], tunnel, original)
             .with_proxy_metrics(proxy)
-            .with_mock(mock),
+            .with_mock(mock.clone()),
     );
     spawn_listener(listener, Direction::Outbound, shared.clone());
     Rig {
@@ -184,6 +185,7 @@ async fn rig_to(
         logs,
         mode,
         snapshot,
+        mock,
         accepted,
         shared,
     }
@@ -744,4 +746,85 @@ fn mck_18_max_pending_defaults_to_1024_and_takes_1_to_65536() {
     for bad in ["0", "65537", "-1", "many"] {
         assert!(config(Some(bad)).is_err(), "{bad:?} must be refused");
     }
+}
+
+// --- unparseable requests, silence and stalls ---------------------------------------------
+
+#[tokio::test]
+async fn mck_11_a_request_hyper_cannot_parse_closes_the_connection_with_an_unframed_line() {
+    let rig = rig(users_set(5), 100, 1024).await;
+    let mut s = TcpStream::connect(rig.addr).await.unwrap();
+    // A space before the colon is not a header.
+    s.write_all(
+        format!("GET /users/3 HTTP/1.1\r\nHost: {AUTHORITY}\r\nBad Header : x\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(TIMEOUT, s.read_to_end(&mut out))
+        .await
+        .expect("closed in time")
+        .ok();
+    // No response of hyper's: the connection is just closed.
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    let access = rig.logs.access_exactly(1).await;
+    let line = &access[0];
+    assert_eq!(line["result"], "unframed");
+    assert_eq!(line["direction"], "outbound");
+    for absent in ["status", "method", "path", "duration_ms", "head_ms"] {
+        assert!(line.get(absent).is_none_or(|v| v.is_null()), "{absent}");
+    }
+    let text = rig.metrics.encode();
+    let none: u64 = text
+        .lines()
+        .filter(|l| {
+            l.starts_with("mimic_http_requests_total{") && l.contains("status_class=\"none\"")
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum();
+    assert_eq!(none, 1, "{text}");
+    assert_eq!(rig.accepted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mck_11_a_client_that_closes_before_any_byte_does_not_dial_the_destination() {
+    let rig = rig(users_set(5), 100, 1024).await;
+    for _ in 0..3 {
+        drop(TcpStream::connect(rig.addr).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(rig.accepted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mck_11_a_stalled_request_body_releases_its_pending_slot() {
+    let rig = rig(users_set(5), 100, 4).await;
+    rig.mock.set_stall(Duration::from_millis(300));
+    let mut s = TcpStream::connect(rig.addr).await.unwrap();
+    s.write_all(
+        format!(
+            "POST /orders HTTP/1.1\r\nHost: {AUTHORITY}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{\"item\""
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    gauge_is(&rig, "mimic_mock_pending", 1, TIMEOUT).await;
+    gauge_is(&rig, "mimic_mock_pending", 0, Duration::from_secs(3)).await;
+    let mut out = Vec::new();
+    let closed = tokio::time::timeout(TIMEOUT, s.read_to_end(&mut out)).await;
+    assert!(closed.is_ok(), "the connection stays open");
+}
+
+#[tokio::test]
+async fn mck_11_a_head_that_never_completes_closes_the_connection() {
+    let rig = rig(users_set(5), 100, 4).await;
+    rig.mock.set_stall(Duration::from_millis(300));
+    let mut s = TcpStream::connect(rig.addr).await.unwrap();
+    s.write_all(b"GET /users/3 HTTP/1.1\r\nHost: users.te")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    assert!(closed.is_ok(), "the connection stays open");
 }

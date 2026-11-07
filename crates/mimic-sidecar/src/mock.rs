@@ -8,7 +8,7 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -91,6 +91,8 @@ struct Inner {
     misses: Family<ReasonLabel, Counter>,
     connections: Family<DecisionLabel, Counter>,
     miss_log: Mutex<MissLog>,
+    /// Milliseconds a mocked connection may stay silent in the middle of a request.
+    stall_ms: AtomicU64,
 }
 
 /// The mock of a sidecar: answers outbound requests from the snapshot while the mode is
@@ -125,7 +127,15 @@ impl Mock {
             misses: Family::default(),
             connections: Family::default(),
             miss_log: Mutex::default(),
+            stall_ms: AtomicU64::new(30_000),
         }))
+    }
+
+    /// How long a mocked connection may stay silent while a request head or body is being
+    /// read (the stall of an incomplete prefix, spec §4.1).
+    pub fn set_stall(&self, stall: Duration) {
+        let ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX).max(1);
+        self.0.stall_ms.store(ms, Ordering::Relaxed);
     }
 
     /// Exposes the `mimic_mock_*` metrics in `metrics`.
