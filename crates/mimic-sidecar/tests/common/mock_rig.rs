@@ -159,6 +159,10 @@ pub struct Options {
     pub stall: Option<Duration>,
     pub dest: Dest,
     pub discovery: Option<Tap>,
+    /// The mode at start (default `mock`).
+    pub mode: Option<Mode>,
+    /// The destination of every connection, instead of the rig's own listener.
+    pub dst: Option<SocketAddr>,
 }
 
 /// A destination that counts the connections it accepts.
@@ -260,12 +264,15 @@ pub async fn rig_with(
         stall,
         dest,
         discovery,
+        mode: start,
+        dst: fixed,
     } = options;
     let (dst, accepted, received, closed) = destination(dest).await;
+    let dst = fixed.unwrap_or(dst);
     let logs = capture_logs();
     let mut metrics = Metrics::new("sidecar", "test");
     let config = ModeConfig {
-        mode: Mode::Mock,
+        mode: start.unwrap_or(Mode::Mock),
         factor,
         ..ModeConfig::default()
     };
