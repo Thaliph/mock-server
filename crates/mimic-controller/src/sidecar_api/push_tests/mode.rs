@@ -201,11 +201,40 @@ async fn mck_08_a_failing_pulls_write_is_counted_and_the_pull_still_answered() {
     let answer = pull(&s, "pay", None).await;
     assert_eq!(answer.status, 200);
     assert_eq!(modes(&answer), (Some("mock"), Some("0.5")));
-    assert!(
-        s.metrics
-            .encode()
-            .contains("mimic_store_writes_total{result=\"error\"} 1"),
-        "{}",
-        s.metrics.encode()
-    );
+    // The write runs after the answer: wait for its task.
+    wait_for(&s, "mimic_store_writes_total{result=\"error\"} 1").await;
+}
+
+async fn wait_for(s: &Setup, series: &str) {
+    for _ in 0..200 {
+        if s.metrics.encode().contains(series) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{series} never appeared:\n{}", s.metrics.encode());
+}
+
+#[tokio::test]
+async fn mck_08_a_stalled_pulls_write_never_delays_the_answer_and_over_16_are_dropped() {
+    let s = setup(Options::default());
+    push_report(&s, "pay", SESSION, 1, &outbound_report(&[AUTHORITY])).await;
+    workload(&s, &s.ns, "pay-workload", true, 100);
+    s.api.store.stall_pulls.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    for _ in 0..40 {
+        let answer = pull(&s, "pay", None).await;
+        assert_eq!((answer.status, answer.header("mimic-mode")), (200, Some("mock")));
+    }
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    wait_for(&s, "mimic_store_writes_total{result=\"dropped\"} 24").await;
+    // Released: the 16 in flight are written.
+    s.api.store.stall_pulls.store(false, Ordering::SeqCst);
+    for _ in 0..200 {
+        if pulls(&s, "pay").await.contains_key(&pod_of("pay")) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the writes in flight never finished");
 }
