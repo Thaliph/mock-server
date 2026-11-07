@@ -73,6 +73,7 @@ struct Options {
     budget: u64,
     max_push: usize,
     max_egress: usize,
+    egress_budget: u64,
     max_endpoints: usize,
     max_authorities: usize,
     max_deployments: usize,
@@ -89,6 +90,7 @@ impl Default for Options {
             budget: 1 << 30,
             max_push: 256,
             max_egress: 4 << 20,
+            egress_budget: 32 << 20,
             max_endpoints: 256,
             max_authorities: 64,
             max_deployments: 50,
@@ -128,12 +130,13 @@ fn setup(options: Options) -> Setup {
         },
         StoreMetrics::register(metrics.registry_mut()),
     );
+    let api_metrics = ApiMetrics::register(metrics.registry_mut());
     let api = Arc::new(SidecarApi {
         seed: Arc::new(SeedSlot::new()),
         reviewer: Arc::new(KubeReviewer::new(Arc::new(OnceCell::new_with(Some(
             client,
         ))))),
-        metrics: ApiMetrics::register(metrics.registry_mut()),
+        metrics: api_metrics.clone(),
         limiter: ReviewLimiter::default(),
         rate: RateLimiter::new(options.rate),
         reviews: ReviewCache::default(),
@@ -149,7 +152,7 @@ fn setup(options: Options) -> Setup {
         max_report: options.max_report,
         max_push_endpoints: options.max_push,
         max_egress: options.max_egress,
-        egress_budget: 32 << 20,
+        egress: EgressCache::new(options.egress_budget, &api_metrics),
         egress_logged: EgressLogged::default(),
     });
     Setup {
@@ -1010,5 +1013,6 @@ async fn ctl_12_one_line_per_push_and_the_expected_metrics() {
 
 mod disconnect;
 mod egress;
+mod egress_cache;
 mod memory;
 mod v2;

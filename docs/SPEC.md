@@ -1492,7 +1492,7 @@ held, measured and summarised, never used to answer a request.
   `<version>` differs from `:meta` `version`, or an absent one, was left by a controller up to
   F8 (which writes `:outbound` without it) and is *stale*: no `304` is possible, and the pull
   goes through a build (below), which hashes the `:outbound` bytes it reads under the same
-  body-budget share. The `ETag` of an answer is `"<format>-<hex digest>"`.
+  body-budget share. The `ETag` of an answer is `"<format>-<hex digest>"`. The digest decides: a corruption of `:outbound` under an unchanged digest is not detected, neither for a `304` nor for a cached projection.
 - **Route**: `GET /v1/workloads/<deployment>/egress?format=1` on the sidecar API (§7.2), with
   the admission, authentication and authorisation of §7.2 (deployment in the path, namespace
   from the token: a pod reads its own deployment only); there is no body to read. The
