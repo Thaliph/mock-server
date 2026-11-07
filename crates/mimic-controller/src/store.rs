@@ -36,15 +36,35 @@ const DAY_SECS: u64 = 86_400;
 /// Lifetime of the `:pods` and `:seq` fields, at most.
 const FIELD_TTL_MS: u64 = DAY_SECS * 1000;
 
+/// A staged write that never reached its script (a crash, a lost connection) is gone after this.
+const STAGE_TTL_MS: u64 = 60_000;
+/// The bytes of a staged key sent per command: what redis-rs copies at once. A write whose
+/// stage is not whole (the expiry cannot pass between two commands of one writer: each renews it)
+/// is refused by the script.
+const STAGE_CHUNK: usize = 1 << 20;
+
+/// The report and the outbound part are staged under temporary keys, `SET` then `APPEND`ed in
+/// chunks so that the command never holds a copy of a whole part (#339); this script checks their
+/// lengths and `RENAME`s them into place with the version check, in one atomic step: a reader
+/// sees the old value or the new one, never a part of it. Every refusal deletes them.
 const WRITE: &str = r"
-local current = redis.call('HGET', KEYS[2], 'version')
-if (current or '0') ~= ARGV[1] then return 0 end
+local function refuse(code)
+  redis.call('DEL', KEYS[8], KEYS[9])
+  return code
+end
 local n_pods = tonumber(ARGV[14])
 local seq_at = 15 + n_pods
 local n_seq = tonumber(ARGV[seq_at])
+local out_at = seq_at + 1 + n_seq * 3
+local current = redis.call('HGET', KEYS[2], 'version')
+if (current or '0') ~= ARGV[1] then return refuse(0) end
 for i = 0, n_seq - 1 do
   local at = seq_at + 1 + i * 3
-  if (redis.call('HGET', KEYS[4], ARGV[at]) or '') ~= ARGV[at + 1] then return 0 end
+  if (redis.call('HGET', KEYS[4], ARGV[at]) or '') ~= ARGV[at + 1] then return refuse(0) end
+end
+if redis.call('STRLEN', KEYS[8]) ~= tonumber(ARGV[8]) then return refuse(0) end
+if ARGV[out_at] ~= '' and redis.call('STRLEN', KEYS[9]) ~= tonumber(ARGV[out_at]) then
+  return refuse(0)
 end
 local ttl = tonumber(ARGV[2])
 local field_ttl = tonumber(ARGV[3])
@@ -54,12 +74,13 @@ redis.call('ZREMRANGEBYSCORE', KEYS[5], '-inf', floor)
 redis.call('ZREMRANGEBYSCORE', KEYS[6], '-inf', floor)
 if not redis.call('ZSCORE', KEYS[5], ARGV[7])
    and redis.call('ZCARD', KEYS[5]) >= tonumber(ARGV[5]) then
-  return -1
+  return refuse(-1)
 end
-redis.call('SET', KEYS[1], ARGV[8], 'PX', ttl)
-local out_at = seq_at + 1 + n_seq * 3
+redis.call('RENAME', KEYS[8], KEYS[1])
+redis.call('PEXPIRE', KEYS[1], ttl)
 if ARGV[out_at] ~= '' then
-  redis.call('SET', KEYS[7], ARGV[out_at], 'PX', ttl)
+  redis.call('RENAME', KEYS[9], KEYS[7])
+  redis.call('PEXPIRE', KEYS[7], ttl)
 else
   redis.call('DEL', KEYS[7])
 end
@@ -116,6 +137,14 @@ pub struct Keys {
     pub seq: String,
     pub ns_index: String,
     pub workloads: String,
+}
+
+impl Keys {
+    /// A temporary key of one write attempt (same hash tag as the other keys of the deployment).
+    fn staged(&self, id: u128, part: &str) -> String {
+        let base = self.meta.strip_suffix(":meta").unwrap_or(&self.meta);
+        format!("{base}:stage:{id:032x}:{part}")
+    }
 }
 
 /// The keys of `<namespace>/<deployment>`, once both names are checked.
@@ -315,6 +344,88 @@ impl StoreMetrics {
     fn write(&self, result: &str) {
         self.writes.get_or_create(&label("result", result)).inc();
     }
+}
+
+/// Stores `bytes` under the temporary `key`, a chunk per command. Every command renews the
+/// expiry of `key` and of `other` (the part staged before or after it), so that no staged key
+/// exists without one and none expires while the other part is sent.
+async fn stage(
+    conn: &mut MultiplexedConnection,
+    key: &str,
+    other: &str,
+    bytes: &[u8],
+) -> redis::RedisResult<()> {
+    for (i, chunk) in bytes.chunks(STAGE_CHUNK).enumerate() {
+        append_chunk(conn, key, other, chunk, i == 0).await?;
+    }
+    Ok(())
+}
+
+/// `SET` (the first chunk) or `APPEND`s `chunk` to `key`, and renews the expiry of both keys, in
+/// one pipeline: an `APPEND` that re-creates an expired key gives it an expiry too.
+async fn append_chunk(
+    conn: &mut MultiplexedConnection,
+    key: &str,
+    other: &str,
+    chunk: &[u8],
+    first: bool,
+) -> redis::RedisResult<()> {
+    let mut pipe = redis::pipe();
+    if first {
+        pipe.cmd("SET").arg(key).arg(chunk).ignore();
+    } else {
+        pipe.cmd("APPEND").arg(key).arg(chunk).ignore();
+    }
+    for k in [key, other] {
+        pipe.cmd("PEXPIRE").arg(k).arg(STAGE_TTL_MS).ignore();
+    }
+    pipe.query_async(conn).await
+}
+
+/// Deletes the staged keys of a write unless disarmed: [`StageGuard::clean`] on a failure, and the
+/// drop (a cancelled future) spawns the `DEL`, never blocking. What neither reaches (a crash, a
+/// lost connection) expires after [`STAGE_TTL_MS`].
+struct StageGuard {
+    conn: MultiplexedConnection,
+    keys: [String; 2],
+    armed: bool,
+}
+
+impl StageGuard {
+    fn new(conn: MultiplexedConnection, keys: [&str; 2]) -> StageGuard {
+        StageGuard {
+            conn,
+            keys: keys.map(str::to_string),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Best effort: bounded by the response timeout, failures ignored.
+    async fn clean(&mut self) {
+        if std::mem::take(&mut self.armed) {
+            delete(self.conn.clone(), self.keys.clone()).await;
+        }
+    }
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(delete(self.conn.clone(), self.keys.clone()));
+        }
+    }
+}
+
+async fn delete(mut conn: MultiplexedConnection, keys: [String; 2]) {
+    let mut del = redis::cmd("DEL");
+    del.arg(&keys[0]).arg(&keys[1]);
+    let _ = tokio::time::timeout(RESPONSE_TIMEOUT, del.query_async::<()>(&mut conn)).await;
 }
 
 struct Pending {
@@ -1210,6 +1321,24 @@ impl Store {
         };
         drop(outbound);
         let stored_bytes = json.len() + outbound_json.len();
+        let id = rand::random::<u128>();
+        let (staged, staged_outbound) = (keys.staged(id, "report"), keys.staged(id, "outbound"));
+        // From here the staged keys are deleted on every way out but the script's answer.
+        let mut guard = StageGuard::new(conn.clone(), [&staged, &staged_outbound]);
+        let sent = async {
+            stage(&mut conn, &staged, &staged_outbound, json.as_bytes()).await?;
+            stage(
+                &mut conn,
+                &staged_outbound,
+                &staged,
+                outbound_json.as_bytes(),
+            )
+            .await
+        };
+        if let Err(e) = sent.await {
+            guard.clean().await;
+            return Err(self.failed(e).await);
+        }
 
         let mut script = self.script.prepare_invoke();
         script
@@ -1220,6 +1349,8 @@ impl Store {
             .key(&keys.ns_index)
             .key(&keys.workloads)
             .key(&keys.outbound)
+            .key(&staged)
+            .key(&staged_outbound)
             .arg(version)
             .arg(ttl_ms)
             .arg(field_ttl)
@@ -1227,7 +1358,7 @@ impl Store {
             .arg(self.config.max_deployments)
             .arg(namespace)
             .arg(deployment)
-            .arg(&json)
+            .arg(json.len())
             .arg(exchanges)
             .arg(inbound_endpoints)
             .arg(outbound_endpoints)
@@ -1250,14 +1381,24 @@ impl Store {
                     after.map_or_else(String::new, u64::to_string)
                 });
         }
-        script.arg(&outbound_json);
+        script.arg(if outbound_json.is_empty() {
+            String::new()
+        } else {
+            outbound_json.len().to_string()
+        });
         // The digest of §7.7: the script prefixes it with the version it writes.
         script.arg(sha256_hex(outbound_json.as_bytes()));
-        // The arguments are copies: the strings need not outlive the call.
         drop((json, outbound_json));
         let result: i64 = match script.invoke_async(&mut conn).await {
-            Ok(result) => result,
-            Err(e) => return Err(self.failed(e).await),
+            Ok(result) => {
+                // Renamed, or deleted by the script's refusal.
+                guard.disarm();
+                result
+            }
+            Err(e) => {
+                guard.clean().await;
+                return Err(self.failed(e).await);
+            }
         };
         match result {
             1 => {}

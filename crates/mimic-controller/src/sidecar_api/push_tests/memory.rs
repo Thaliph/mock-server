@@ -24,8 +24,8 @@ const NO_503: &str = "MIMIC_SHR_NO_503";
 const MIB: u64 = 1 << 20;
 /// SHR-23: two concurrent writes, with a `64Mi` body budget.
 const CONCURRENT_LIMIT: u64 = 640 * MIB;
-// The other bound of SHR-23 (the defaults at most 356 MiB, 70% of B) is not asserted: after step
-// 5 of #339 the SHR-18 test above peaks at 308 to 368 MiB over 10 runs, and 368 is over.
+/// SHR-23: the defaults at most 70% of B (509 MiB, measured before #339), 356 MiB.
+const DEFAULTS_LIMIT: u64 = 356 * MIB;
 /// Keys of the JSON bodies of the exchanges: schemas near their caps, pushes of about 28 MB.
 const KEYS: usize = 40;
 const DEPLOYMENTS: [&str; 2] = ["pay", "web"];
@@ -211,7 +211,7 @@ async fn work(dir: &str, budget: u64, concurrent: bool) {
         assert!(length > 1000);
     }
     let peak = peak_rss();
-    eprintln!("PEAK_MIB={}", peak >> 20);
+    eprintln!("PEAK_MIB={}", peak.div_ceil(MIB));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -283,6 +283,13 @@ async fn measure(budget: Option<u64>) -> u64 {
 async fn shr_18_two_max_size_pushes_onto_full_reports_stay_under_640_mib() {
     let peak = measure(None).await;
     assert!(peak < 640 * MIB, "peak RSS {} MiB", peak / MIB);
+    // SHR-23: at most 70% of B.
+    assert!(
+        peak <= DEFAULTS_LIMIT,
+        "peak RSS {} MiB over {} MiB",
+        peak / MIB,
+        DEFAULTS_LIMIT / MIB
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
