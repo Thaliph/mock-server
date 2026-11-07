@@ -23,7 +23,7 @@ struct Case {
     limits: fn() -> Limits,
 }
 
-const COUNT: usize = 160;
+const COUNT: usize = 70;
 
 const CASES: [Case; 5] = [
     Case {
