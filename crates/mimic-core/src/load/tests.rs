@@ -332,7 +332,7 @@ mod plan_tests {
             .collect();
         hashes.sort_unstable();
 
-        let mut s = spec();
+        let s = spec();
         let p = build(&report(&items), &s, size - 1);
         let after: BTreeSet<u64> = p
             .plan

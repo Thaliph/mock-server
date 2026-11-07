@@ -70,6 +70,17 @@ pub fn validate(params: &Params, limits: &Limits) -> Result<(), Invalid> {
             ),
         );
     }
+    if params
+        .rate
+        .is_some_and(|r| r < super::schedule::pods(params.concurrency, limits.pod_concurrency))
+    {
+        return invalid(
+            "spec.rate",
+            "spec.rate must be at least the number of generator pods \
+             (spec.concurrency / MIMIC_LOAD_POD_CONCURRENCY, rounded up)"
+                .to_string(),
+        );
+    }
     if !(MIN_DURATION_MS..=limits.max_duration_ms).contains(&params.duration_ms) {
         return invalid(
             "spec.duration",

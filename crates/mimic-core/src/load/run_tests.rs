@@ -601,20 +601,20 @@ mod gate_tests {
 
     #[test]
     fn ldt_03_a_rate_below_the_pod_count_is_invalid_naming_the_rate() {
-        // 300 over 128 per pod: 3 pods.
+        // 256 over 128 per pod: 2 pods.
         let p = |rate| Params {
-            concurrency: 300,
+            concurrency: 256,
             rate: Some(rate),
             ..params()
         };
-        let bad = validate(&p(2), &limits()).err();
+        let bad = validate(&p(1), &limits()).err();
         assert_eq!(bad.as_ref().map(|i| i.field), Some("spec.rate"));
         assert!(bad.is_some_and(|i| i.message.contains("pods")));
-        assert_eq!(validate(&p(3), &limits()), Ok(()));
+        assert_eq!(validate(&p(2), &limits()), Ok(()));
         // Every pod then gets at least 1 and the total is exact.
-        let s = split(300, Some(3), 128);
+        let s = split(256, Some(2), 128);
         assert!(s.iter().all(|s| s.rate.is_some_and(|r| r >= 1)));
-        assert_eq!(s.iter().filter_map(|s| s.rate).sum::<u64>(), 3);
+        assert_eq!(s.iter().filter_map(|s| s.rate).sum::<u64>(), 2);
         // Closed model has no such rule.
         let closed = Params { rate: None, ..p(1) };
         assert_eq!(validate(&closed, &limits()), Ok(()));
