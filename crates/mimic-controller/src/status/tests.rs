@@ -146,7 +146,7 @@ async fn push(store: &Arc<Store>, ns: &str, dep: &str, pod: &str, paths: &[&str]
     let push = Push {
         pod: pod.to_string(),
         seq: None,
-        report,
+        json: report.to_json().expect("serialises"),
     };
     store.push(ns, dep, push).await.expect("push applied");
 }
@@ -188,7 +188,7 @@ async fn push_both(store: &Arc<Store>, ns: &str, dep: &str, pod: &str) {
     let push = Push {
         pod: pod.to_string(),
         seq: None,
-        report,
+        json: report.to_json().expect("serialises"),
     };
     store.push(ns, dep, push).await.expect("push applied");
 }
