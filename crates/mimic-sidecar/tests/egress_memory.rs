@@ -387,10 +387,64 @@ async fn view_etag(admin: SocketAddr, etag: &str) -> serde_json::Value {
     panic!("/egress never showed {etag}");
 }
 
+/// The child process of [`spawn_fake_api`]: the test binary run again on this test, with
+/// `MIMIC_TEST_FAKE_API` set. It serves until its stdin closes. Without the variable it is a
+/// test that does nothing.
+#[test]
+fn pul_18_fake_api_child_process() {
+    use std::io::{Read, Write};
+    if std::env::var_os("MIMIC_TEST_FAKE_API").is_none() {
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (addr, ca, _) = runtime.block_on(fake_api(big_set()));
+    let mut out = std::io::stdout();
+    writeln!(out, "FAKE_API {addr} {}", ca.replace('\n', "|")).unwrap();
+    out.flush().unwrap();
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
+}
+
+/// Starts the fake API in a child process; dropping the handle stops it.
+fn spawn_fake_api() -> (ApiProcess, SocketAddr, String) {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pul_18_fake_api_child_process", "--nocapture"])
+        .env("MIMIC_TEST_FAKE_API", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("the fake API starts");
+    let stdout = child.stdout.take().unwrap();
+    for line in BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        if let Some(rest) = line.strip_prefix("FAKE_API ") {
+            let (addr, ca) = rest.split_once(' ').unwrap();
+            return (
+                ApiProcess(child),
+                addr.parse().unwrap(),
+                ca.replace('|', "\n"),
+            );
+        }
+    }
+    panic!("the fake API did not announce its address");
+}
+
+struct ApiProcess(std::process::Child);
+
+impl Drop for ApiProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_under_120_mib() {
-    let set = big_set();
-    let (addr, ca, pulls) = fake_api(set.clone()).await;
+    // The fake API runs in a child process: this one holds what the sidecar holds (puller,
+    // snapshot, discovery) and the load's client and app side, never the sets being served.
+    let (_api, addr, ca) = spawn_fake_api();
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("token");
     std::fs::write(&token, "token").unwrap();
@@ -467,7 +521,13 @@ async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_und
     );
     assert_eq!(egress_view(admin_addr).await["etag"], "\"1-second\"");
     assert!(!loading.is_finished());
-    assert!(pulls.load(Ordering::SeqCst) >= 3);
+    assert!(
+        metrics
+            .encode()
+            .contains("mimic_egress_pulls_total{result=\"ok\"} 2"),
+        "{}",
+        metrics.encode()
+    );
     loading.await.unwrap();
 
     let peak = peak_rss();
