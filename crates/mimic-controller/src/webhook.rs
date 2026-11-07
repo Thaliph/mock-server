@@ -414,6 +414,18 @@ pub(crate) mod tests {
         workloads: &[RedactSetup],
         seeded: bool,
     ) -> (Router, Arc<Metrics>, Arc<SeedSlot>) {
+        let cache = if synced {
+            WorkloadCache::synced_with_settings(workloads)
+        } else {
+            WorkloadCache::new()
+        };
+        setup_cache(cache, seeded)
+    }
+
+    fn setup_cache(
+        cache: WorkloadCache,
+        seeded: bool,
+    ) -> (Router, Arc<Metrics>, Arc<SeedSlot>) {
         let mut metrics = Metrics::new("controller", "test");
         let seed = Arc::new(SeedSlot::new());
         if seeded {
@@ -431,11 +443,7 @@ pub(crate) mod tests {
                 sidecar_log: "info".into(),
                 controller_url: "https://mimic.mimic-system.svc:8444".into(),
             },
-            cache: Arc::new(if synced {
-                WorkloadCache::synced_with_settings(workloads)
-            } else {
-                WorkloadCache::new()
-            }),
+            cache: Arc::new(cache),
             seed: seed.clone(),
             cert,
             roots: RootCache::default(),
@@ -967,6 +975,41 @@ pub(crate) mod tests {
             sidecar_env(&out)["MIMIC_DISCOVERY_REDACT_NAMES"],
             "badge,pin,x-tenant-key"
         );
+    }
+
+    #[tokio::test]
+    async fn mck_01_sidecar_gets_the_effective_mode_of_its_own_deployment() {
+        use crate::workloads::MockSettings;
+        let cache = WorkloadCache::synced_with_settings(&[
+            ("shop", "w1", "shop", &[], &[]),
+            ("shop", "w2", "shop", &[], &[]),
+            ("shop", "w3", "other", &[], &[]),
+            ("elsewhere", "w4", "shop", &[], &[]),
+        ]);
+        let mock = |factor, passthrough: &[&str]| MockSettings {
+            mock: true,
+            factor,
+            passthrough: passthrough.iter().map(|p| p.to_string()).collect(),
+        };
+        cache.set_mock("shop", "w2", mock(50, &["db.test", "a.test"]));
+        cache.set_mock("shop", "w3", mock(300, &["not-mine.test"]));
+        cache.set_mock("elsewhere", "w4", mock(700, &["not-mine-either.test"]));
+        let (router, _, _) = setup_cache(cache, true);
+        let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        let env = sidecar_env(&out);
+        assert_eq!(env["MIMIC_MODE"], "mock");
+        assert_eq!(env["MIMIC_MOCK_LATENCY_FACTOR"], "0.5");
+        assert_eq!(env["MIMIC_MOCK_PASSTHROUGH"], "a.test,db.test");
+    }
+
+    #[tokio::test]
+    async fn mck_01_a_deployment_in_discovery_gets_the_mode_and_nothing_else() {
+        let (router, _, _) = setup_tls(true, &[("shop", "w1", "shop", &[])], true);
+        let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        let env = sidecar_env(&out);
+        assert_eq!(env["MIMIC_MODE"], "discovery");
+        assert!(!env.contains_key("MIMIC_MOCK_LATENCY_FACTOR"));
+        assert!(!env.contains_key("MIMIC_MOCK_PASSTHROUGH"));
     }
 
     #[tokio::test]

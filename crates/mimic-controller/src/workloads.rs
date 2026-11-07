@@ -432,4 +432,106 @@ mod tests {
         );
         assert_eq!(exclude, ["a.test", "b.test"]);
     }
+
+    fn mock(on: bool, factor: u32, passthrough: &[&str]) -> MockSettings {
+        MockSettings {
+            mock: on,
+            factor,
+            passthrough: passthrough.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn mck_01_no_workload_or_only_discovery_gives_discovery_factor_1_no_passthrough() {
+        let cache = WorkloadCache::synced_with(&[("shop", "w1", "api")]);
+        let none = cache.effective("shop", "web");
+        assert_eq!((none.mode(), none.factor_text()), ("discovery", "1".into()));
+        assert!(none.passthrough.is_empty());
+        cache.set_mock("shop", "w1", mock(false, 100, &[]));
+        let found = cache.effective("shop", "api");
+        assert_eq!(found.mode(), "discovery");
+        assert_eq!(found.factor, 100);
+    }
+
+    #[test]
+    fn mck_01_one_mock_workload_makes_the_deployment_mock_with_the_first_factor_in_name_order() {
+        let cache = WorkloadCache::synced_with(&[
+            ("shop", "a", "api"),
+            ("shop", "b", "api"),
+            ("shop", "c", "api"),
+            ("other", "a", "api"),
+        ]);
+        cache.set_mock("shop", "c", mock(true, 300, &[]));
+        cache.set_mock("shop", "b", mock(true, 50, &[]));
+        cache.set_mock("shop", "a", mock(false, 700, &[]));
+        cache.set_mock("other", "a", mock(true, 900, &[]));
+        let found = cache.effective("shop", "api");
+        assert_eq!(found.mode(), "mock");
+        assert_eq!(found.factor_text(), "0.5");
+        // Another namespace never leaks in.
+        assert_eq!(cache.effective("other", "api").factor, 900);
+        cache.remove("shop", "b");
+        assert_eq!(cache.effective("shop", "api").factor, 300);
+        cache.remove("shop", "c");
+        assert_eq!(cache.effective("shop", "api").mode(), "discovery");
+    }
+
+    #[test]
+    fn mck_01_passthrough_is_the_sorted_deduplicated_union_cut_to_256() {
+        let cache = WorkloadCache::synced_with(&[("shop", "a", "api"), ("shop", "b", "api")]);
+        cache.set_mock("shop", "a", mock(false, 100, &["b.test", "a.test"]));
+        cache.set_mock("shop", "b", mock(true, 100, &["b.test", "*.c.test"]));
+        assert_eq!(
+            cache.effective("shop", "api").passthrough,
+            ["*.c.test", "a.test", "b.test"]
+        );
+        let many: Vec<String> = (0..200).map(|i| format!("h{i:03}.test")).collect();
+        let more: Vec<String> = (100..300).map(|i| format!("h{i:03}.test")).collect();
+        let refs = |v: &Vec<String>| v.iter().map(String::as_str).collect::<Vec<_>>();
+        cache.set_mock("shop", "a", mock(false, 100, &refs(&many)));
+        cache.set_mock("shop", "b", mock(false, 100, &refs(&more)));
+        let union = cache.effective("shop", "api").passthrough;
+        assert_eq!(union.len(), 256);
+        assert_eq!((union[0].as_str(), union[255].as_str()), ("h000.test", "h255.test"));
+    }
+
+    #[test]
+    fn mck_01_factor_text_is_the_shortest_decimal() {
+        let text = |factor| {
+            Effective {
+                mock: true,
+                factor,
+                passthrough: Vec::new(),
+            }
+            .factor_text()
+        };
+        assert_eq!(
+            [text(100), text(50), text(0), text(10_000), text(5), text(130), text(101)],
+            ["1", "0.5", "0", "100", "0.05", "1.3", "1.01"]
+        );
+    }
+
+    #[test]
+    fn mck_01_mock_of_reads_the_spec_and_rounds_the_factor_half_up() {
+        let object = |spec: serde_json::Value| -> DynamicObject {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "mimic.platform.io/v1alpha1", "kind": "MimicWorkload",
+                "metadata": {"name": "w", "namespace": "shop"}, "spec": spec,
+            }))
+            .unwrap()
+        };
+        let read = |spec| mock_of(&object(spec));
+        assert_eq!(read(serde_json::json!({"deployment": "api"})), MockSettings::default());
+        let full = read(serde_json::json!({"deployment": "api", "mode": "mock",
+            "mock": {"latencyFactor": 0.5, "passthrough": ["a.test", 7, "b.test"]}}));
+        assert_eq!(full, mock(true, 50, &["a.test", "b.test"]));
+        let factor = |f: f64| read(serde_json::json!({"deployment": "api", "mock": {"latencyFactor": f}})).factor;
+        assert_eq!(
+            [factor(0.005), factor(0.004), factor(1.005), factor(0.0), factor(100.0), factor(2.0)],
+            [1, 0, 101, 0, 10_000, 200]
+        );
+        // A value the CRD would refuse reads as the default.
+        assert_eq!(factor(101.0), 100);
+        assert_eq!(factor(-1.0), 100);
+    }
 }
