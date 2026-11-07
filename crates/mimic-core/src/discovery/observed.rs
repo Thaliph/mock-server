@@ -21,8 +21,8 @@ const MAX_MEDIA: usize = 16;
 /// Longest media type kept.
 const MAX_MEDIA_LEN: usize = 100;
 /// Levels and array items walked for volatile leaves, as for schemas.
-const MAX_LEVEL: usize = 16;
-const MAX_ITEMS: usize = 256;
+pub(crate) const MAX_LEVEL: usize = 16;
+pub(crate) const MAX_ITEMS: usize = 256;
 
 /// Upper bound of the serialised `Observed` of one endpoint, from the caps of spec §6: 512
 /// nodes per body schema, 64 keys per query, form or header set, 128 volatile fields, 16 media
@@ -188,7 +188,7 @@ pub(super) fn observe_pairs(
     }
 }
 
-fn pointer_token(key: &str) -> String {
+pub(crate) fn pointer_token(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
@@ -239,7 +239,7 @@ fn header<'a>(headers: &[(&'a str, &'a str)], name: &str) -> Option<&'a str> {
 }
 
 /// What a body turned out to be, redacted.
-pub(super) enum Content {
+pub(crate) enum Content {
     /// Not parsed: another media type, or over `MAX_BODY`.
     Opaque,
     Json {
@@ -253,7 +253,7 @@ pub(super) enum Content {
 }
 
 /// A body with a `content-type`, parsed once for both the schemas and the samples.
-pub(super) struct Parsed {
+pub(crate) struct Parsed {
     pub media: String,
     pub size: usize,
     pub content: Content,
@@ -319,7 +319,7 @@ fn named_secret(redactor: &Redactor, field: &str) -> Option<String> {
 }
 
 /// Parses a body (already content-decoded) by its `content-type`; nothing without one.
-pub(super) fn parse(redactor: &Redactor, headers: &[(&str, &str)], body: &[u8]) -> Option<Parsed> {
+pub(crate) fn parse(redactor: &Redactor, headers: &[(&str, &str)], body: &[u8]) -> Option<Parsed> {
     let media = header(headers, "content-type")?
         .split(';')
         .next()

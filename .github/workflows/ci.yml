@@ -5,7 +5,7 @@ name: ci
 #   chart ─────────────────────▲
 #   security (cargo deny, zizmor); supply chain (cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql)
 #   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; skipped unless a PR touches the codec)
-#           └─▶ fuzz-discovery (discovery recorder, spec DSC-23; same rule for its own paths)
+#           └─▶ fuzz-discovery (a matrix: recorder, egress set and mock, spec DSC-23, PUL-20, MCK-20; same rule for their own paths)
 # `ci-ok` sums them up; it is the only required check on main.
 #
 # Actions allowed in the repository settings (#273; Settings → Actions → General, or
@@ -338,7 +338,7 @@ jobs:
 
   # Path filters for the fuzz jobs: only a pull request that touches the HTTP/1 codec (its
   # module, `proxy.rs` that declares it, the Cargo files that pin its dependencies) or the
-  # discovery module, or the fuzz crate runs the matching job. Other events leave them false.
+  # discovery or mock module, or the fuzz crate runs the matching job. Other events leave them false.
   changes:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -361,7 +361,7 @@ jobs:
             if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/proxy/http1 crates/mimic-core/src/proxy.rs Cargo.toml Cargo.lock fuzz)" ]; then
               codec=true
             fi
-            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/discovery fuzz)" ]; then
+            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/discovery crates/mimic-core/src/mock crates/mimic-core/src/mock.rs fuzz)" ]; then
               discovery=true
             fi
           fi
@@ -423,15 +423,22 @@ jobs:
           retention-days: 14
 
   fuzz-discovery:
-    # DSC-23: 60 s on a pull request that touches the discovery module, 10 min on the weekly schedule.
-    # Skipped otherwise; `ci-ok` accepts that skip (and only that one).
-    name: fuzz (discovery)
+    # DSC-23, PUL-20, MCK-20: one job per target (the recorder, the egress set, the mock), so that
+    # each has its own time limit and corpus: 60 s on a pull request that touches the discovery
+    # or mock modules, 10 min on the weekly schedule. Skipped otherwise; `ci-ok` accepts that skip
+    # (and only that one), and sums the three jobs up as one result.
+    name: fuzz (${{ matrix.target }})
     needs: changes
     if: github.event_name == 'schedule' || (github.event_name == 'pull_request' && needs.changes.outputs.discovery == 'true')
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [discovery, egress, mock]
     env:
       FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 600 || 60 }}
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -448,38 +455,30 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }} # zizmor: ignore[cache-poisoning] cache written from main only, nothing is published by this job
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: fuzz/corpus/discovery
-          key: fuzz-corpus-discovery-${{ github.run_id }}
-          restore-keys: fuzz-corpus-discovery-
-      - name: Fuzz the discovery recorder
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz the target
         working-directory: fuzz
         # cargo-fuzz defaults to the target it was built for; the prebuilt binary is musl, which
         # the address sanitizer cannot use.
         # The corpus directory is missing on a cold cache; libFuzzer requires it to exist.
         run: >
-          mkdir -p corpus/discovery &&
-          cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu discovery
-          corpus/discovery seeds/discovery --
-          -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10
-      # PUL-20: the egress set (check and projection), on the same schedule.
-      - name: Fuzz the egress set
-        working-directory: fuzz
-        run: >
-          mkdir -p corpus/egress &&
-          cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu egress
-          corpus/egress seeds/egress --
+          mkdir -p "corpus/$TARGET" &&
+          cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu "$TARGET"
+          "corpus/$TARGET" "seeds/$TARGET" --
           -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10
       # The corpus grows on the weekly run only; PR runs read it and never write it.
       - if: github.event_name == 'schedule'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: fuzz/corpus/discovery
-          key: fuzz-corpus-discovery-${{ github.run_id }}
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
       # DSC-23: the crashing input is kept for triage.
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-discovery-artifacts
+          name: fuzz-${{ matrix.target }}-artifacts
           path: fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 14

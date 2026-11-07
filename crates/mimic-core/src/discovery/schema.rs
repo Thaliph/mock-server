@@ -210,7 +210,7 @@ pub(super) const MAX_NAME: usize = 128;
 
 /// A name as it is recorded: its first `MAX_NAME` bytes, cut on a character boundary. Redaction
 /// is decided on the full name, before this.
-pub(super) fn cut_name(name: &str) -> &str {
+pub(crate) fn cut_name(name: &str) -> &str {
     if name.len() <= MAX_NAME {
         return name;
     }
@@ -561,7 +561,7 @@ pub struct Params {
 
 /// A decoded, redacted key and value.
 #[derive(Debug, Clone)]
-pub(super) struct Pair {
+pub(crate) struct Pair {
     pub key: String,
     pub value: String,
 }
@@ -573,7 +573,7 @@ fn decode(s: &str) -> String {
 }
 
 /// The pairs of a query string or form body: keys and values percent-decoded, then redacted.
-pub(super) fn query_pairs(redactor: &Redactor, query: &str) -> Vec<Pair> {
+pub(crate) fn query_pairs(redactor: &Redactor, query: &str) -> Vec<Pair> {
     query
         .split('&')
         .filter(|p| !p.is_empty())
