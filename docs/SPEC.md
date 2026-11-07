@@ -67,13 +67,24 @@ from F1 `mimic-init` and from F3 `mimic-trust`. `mimic-core` may depend on pure 
 | Mode | Inbound | Outbound |
 |---|---|---|
 | `discovery` (default) | forwarded to the app, recorded | forwarded to the destination, recorded |
-| `mock` | forwarded to the app, recorded | answered from recordings; never forwarded (§8) |
+| `mock` | forwarded to the app, recorded | HTTP answered from recordings, never forwarded nor recorded; non-HTTP cleartext TCP and `spec.mock.passthrough` destinations forwarded and recorded; other TLS closed (§8) |
 
-The mode is set per deployment on its `MimicWorkload` (`spec.mode`). Every pod of the deployment
-follows it, including pods created later. From F9 every sidecar keeps a snapshot of the
-deployment's aggregated egress, pulled from the controller (§7.7). Entering mock: the sidecar
-pulls the deployment's egress recordings from the controller, then switches. Leaving mock: the sidecar switches back to
-discovery immediately.
+The mode is set per deployment on its `MimicWorkload` (`spec.mode`); when several
+`MimicWorkload`s name the deployment, it is `mock` as soon as one of them says `mock` (§7).
+Every pod of the deployment follows it, including pods created later, without a restart
+(F10): the webhook gives a new pod the mode of the moment in `MIMIC_MODE`, and every sidecar
+learns changes from its egress pull (§7.7), which carries the mode with the snapshot of the
+deployment's aggregated egress. A change therefore reaches every pod within one
+`MIMIC_EGRESS_PULL_INTERVAL` (plus the pull's own retry delay while the controller is
+unreachable); `status.mode` of the `MimicWorkload` counts the pods that follow it (§7.4).
+Entering mock: the pull answer that carries `mock` also carries the current egress snapshot
+(or confirms it with `304`), so the sidecar switches with it; requests started after the
+switch are answered from it. Leaving mock: the sidecar switches back to discovery at the
+answer that carries `discovery`; mocked connections close once their answers are sent, new
+connections reach the real destinations and are recorded again (§8 "Switching"). Until a
+sidecar's first pull answer it follows the mode it last saved in its pod (a restarted sidecar
+container), else `MIMIC_MODE` (§8 "Mode state"); when the controller cannot be reached, it
+keeps the mode it has.
 
 ## 4. Traffic capture
 
@@ -188,7 +199,7 @@ would see without mimic, except for the limits listed at the end of this section
   stays in the socket; a codec fed more than 64 KiB behind an unanswered upgrade (without the
   relay's flow control) reports the upgrade request as `unframed`, drops its
   copy and uses every byte: none is lost.
-- **Failures**: the sidecar never synthesises a response. When the destination refuses the
+- **Failures**: the sidecar never synthesises a response (in discovery; mock answers are §8's). When the destination refuses the
   connection, the client connection is closed without any byte; when it closes or resets
   before answering, the client sees the same close or reset (HTTP/1), or the stream is reset
   (HTTP/2). An HTTP/2 client that breaks the protocol at connection level gets `GOAWAY` (the
@@ -252,7 +263,8 @@ would see without mimic, except for the limits listed at the end of this section
   | `upgrade` | `true` when the exchange became a tunnel | — |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
-  | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown` |
+  | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown`, (F10) `mock_closed` (§8) |
+  | `mock`, `mock_miss` | (F10) outbound in mock only: `exact` \| `endpoint` \| `fallback` \| `miss`, and the miss reason (§8) | — |
   | `duration_ms`, `head_ms` | until the response end; until the final (non-`1xx`) response head; both absent for `unframed` and `rejected` | `duration_ms` |
   | `bytes_in`, `bytes_out` | request / response body bytes | client → destination / destination → client |
 
@@ -404,9 +416,17 @@ client or the destination sees, the connection is **passed through** untouched i
   entries is cut to its first 256 in sorted order, with one WARN `tls exclude truncated`; a change applies to pods
   created afterwards (`kubectl rollout restart`), like the injection itself.
 - **Mock mode (F10)**: the sidecar answers intercepted connections without connecting to the
-  destination (it issues the leaf for the SNI and picks `h2` when offered, else `http/1.1`),
-  and a connection that the table above would pass through is closed instead, without any
-  byte towards the destination (the real destination is never called, §3).
+  destination (it issues the leaf for the SNI, or for the destination IP without SNI, and
+  picks `h2` when offered, else `http/1.1`), and a connection that the table above would pass
+  through before any upstream handshake (`unsupported`, `excluded`, a remembered destination,
+  `no_ca`) is closed instead, without any byte towards the destination (the real destination
+  is never called, §3), unless its SNI (or destination IP without SNI) matches
+  `MIMIC_MOCK_PASSTHROUGH` (§8), in which case it is handled as in discovery. The decisions
+  that need the destination (`upstream_untrusted`, `client_cert_requested`) cannot arise in
+  mock; `client_rejected` closes the connection as in discovery. In mock a leaf is issued for a
+  name whose real certificate was never verified: it is only trusted by the pods of this
+  deployment (its root is per deployment) and no traffic leaves, so it vouches for nothing
+  outside the pod (§11.1).
 
 ## 6. Discovery
 
@@ -766,10 +786,25 @@ logic in `mimic-core` (`discovery` module).
   `spec.mode` (`discovery` | `mock`, default `discovery`), `spec.tls.exclude` (F3, §5),
   `spec.discovery.redact` (F4, §6: extra names redacted by name, at most 64, each of `a-z`, `A-Z`, `0-9`, `-`, `_`,
   lower-cased by the webhook, applied like `spec.tls.exclude` to pods created afterwards),
-  latency settings; `status` reports the deployment's discovery counts and pushing pods
-  (F5, §7.4), later mode convergence (F10). F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
+  from F10 `spec.mock.latencyFactor` (number, 0–100, default 1, §8; the controller rounds it
+  to the nearest hundredth, halves up) and
+  `spec.mock.passthrough` (at most 256 entries of the `spec.tls.exclude` grammar, §8);
+  `status` reports the deployment's discovery counts and pushing pods
+  (F5, §7.4) and from F10 mode convergence. F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
   with their feature. When several `MimicWorkload`s name the same deployment, any of them
-  selects it for injection; which one sets the mode is decided in F10.
+  selects it for injection. **Effective mode** (F10, pure, `mimic-core` `mock::effective`):
+  `mock` when at least one of them has `spec.mode: mock`, else `discovery` (a deployment
+  injected by label without any `MimicWorkload` is in `discovery`); the latency factor is the
+  `spec.mock.latencyFactor` of the first `mock` one in name order; `spec.mock.passthrough` is
+  the sorted, deduplicated union over all of them (cut to its first 256, as `spec.tls.exclude`).
+  Mock wins so that nobody's load test calls a real provider because another
+  `MimicWorkload` still says `discovery`. *Upgrade and rollback* (F10): the CRD is a chart
+  template (`deploy/helm/mimic/templates/crd.yaml`, kept on uninstall), not a `crds/` file, so
+  `helm upgrade` applies the new schema with `spec.mock` and `status.mode`. `helm rollback` to
+  a chart up to F9 applies the old schema: the API server then prunes `spec.mock` and
+  `status.mode` from every read and from the next write of each object (a re-upgrade before a
+  write gets them back from etcd), and the F9 controller sends no mode, so F10 sidecars keep
+  their mode (§7.7) while pods recreated with the F9 image never mock (§11.1).
 - Sidecars push their local recordings periodically (§6 "Shipping", §7.2), from F9 pull the
   deployment's aggregated egress recordings (§7.7) and, from F10, its mode. Valkey keys
   are namespaced by `<namespace>/<deployment>` (§7.3).
@@ -827,7 +862,10 @@ logic in `mimic-core` (`discovery` module).
     `/var/run/secrets/mimic.platform.io` (read-only), and gets `MIMIC_TLS_CA` (the
     deployment's root certificate, PEM), `MIMIC_TLS_EXCLUDE` (§5), `MIMIC_CONTROLLER_URL`
     (`https://<webhook service>.<namespace>.svc:<sidecar API port>`) and `MIMIC_CONTROLLER_CA`
-    (the webhook CA, PEM). Before it is ready it copies the static `mimic-trust` binary to
+    (the webhook CA, PEM); from F10 also `MIMIC_MODE`, `MIMIC_MOCK_LATENCY_FACTOR` and
+    `MIMIC_MOCK_PASSTHROUGH` (the effective mode, factor and passthrough list of §7 at
+    admission; the last two absent when they are the default or empty, `MIMIC_MODE` always
+    set). Before it is ready it copies the static `mimic-trust` binary to
     `/mimic/bin/mimic-trust` and its image's system store to `/mimic/bin/fallback-ca.pem`.
   - `mimic-trust-<n>` (n = 0, 1, … in order of first appearance of the image among the init
     then regular app containers) runs that image with its `imagePullPolicy`,
@@ -1046,6 +1084,7 @@ logic in `mimic-core` (`discovery` module).
   | `mimic:v1:{<ns>/<dep>}:meta` | hash | `version` (write counter), `updated` (ms of the last applied push), `exchanges`, `endpoints_inbound`, `endpoints_outbound`, `sample_bytes`, `report_bytes` (from F8 of `:report` and `:outbound` together), from F9 `outbound_digest` (`<version>:<hex SHA-256 of :outbound>`, §7.7) | same |
   | `mimic:v1:{<ns>/<dep>}:pods` | hash | field `<pod>` → ms of its last push (applied or not) | each field min(24 h, `MIMIC_STORE_TTL`) after its last write |
   | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
+  | `mimic:v1:{<ns>/<dep>}:pulls` | hash | (F10) field `<pod>` → `<mode> <ms>`: the mode the last `200` or `304` egress answer to that pod carried and when (§7.7) | same as `:pods` fields; the key itself `MIMIC_STORE_TTL` after its last write |
   | `mimic:v1:ns:<ns>` | sorted set | member `<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
   | `mimic:v1:workloads` | sorted set | member `<ns>/<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
 
@@ -1252,7 +1291,22 @@ logic in `mimic-core` (`discovery` module).
   blank without endpoints (and for a status written by a controller up to F7 the column reads
   `0` until an F8 controller applies one), while the stored status omits the default
   `endpoints.inbound` and the controller compares statuses with the defaults applied.
-  `exchanges` and `sampleBytes` count both directions. Mode convergence is added in F10.
+  `exchanges` and `sampleBytes` count both directions.
+- **Mode convergence (F10).** The same pass also reads `:pulls` and writes
+
+  ```yaml
+  status:
+    mode:
+      mode: mock        # effective mode of the deployment (§7), from the controller's cache
+      pods: 2           # pods whose last egress answer is within MIMIC_STATUS_POD_WINDOW and carried `mode`
+      otherPods: 1      # pods within the window whose last answer carried the other mode
+  ```
+
+  in the same apply (`status.mode` is owned by the controller like `status.discovery`; both
+  counts default to `0`). A load test can start when `otherPods` is `0` and `pods` equals the
+  deployment's ready replicas. `kubectl get mimicworkload` also prints `Mode pods`
+  (`.status.mode.pods`). An unreadable `:pulls` field is skipped (not counted) and logged once,
+  as `:pods`. Pods that never pull (no `MIMIC_CONTROLLER_URL`) are in neither count.
 
 ### 7.5 Read API and UI (F5, F6)
 
@@ -1507,6 +1561,14 @@ held, measured and summarised, never used to answer a request.
   - `200` `application/json`, `ETag`, `Cache-Control: no-store`, the projection. A deployment
     without data or without `:outbound` answers `200` `{"authorities": {}, "format": 1}` (not
     `404`: the sidecar needs no special case).
+  - (F10) every `200` and `304` carries the deployment's effective mode (§7) from the
+    controller's `MimicWorkload` cache, read when the answer is written: `Mimic-Mode:
+    discovery|mock` and, in mock, `Mimic-Latency-Factor: <decimal>` (shortest form that reads
+    back to the same value, e.g. `1`, `0.5`). The mode is not part of the `ETag` nor of the
+    cached projection: the projection stays a pure function of `:outbound`, and a mode change
+    needs no build. After answering, the controller writes `:pulls` `<pod>` → `<mode> <ms>`
+    (best effort: a failed write is counted `mimic_store_writes_total{result="error"}` and
+    changes nothing in the answer). No other answer carries the headers.
 
   `400` (`format`) for a missing or unknown `format`, `400` for a deployment name that is not
   DNS-1123, `401`/`403`/`429` as §7.2, `405` with `Allow: GET` for another method, `500` with
@@ -1532,8 +1594,9 @@ held, measured and summarised, never used to answer a request.
   still does not fit, the pull gets `503`. A cached projection is dropped when a newer digest of
   its deployment is cached.
 - **Pull client** (sidecar). With `MIMIC_CONTROLLER_URL` set the sidecar pulls every
-  `MIMIC_EGRESS_PULL_INTERVAL`, the first time after a random delay within one interval, in
-  every mode; without it nothing is pulled (one INFO `egress pull disabled` at start). Each
+  `MIMIC_EGRESS_PULL_INTERVAL` in every mode, the first time after a random delay within one
+  interval up to F9 and, from F10, at once at start (so that a pod learns its mode and gets a
+  snapshot before its app sends much traffic); without it nothing is pulled (one INFO `egress pull disabled` at start). Each
   pull re-reads the token, sends `If-None-Match` with the `ETag` of the snapshot it holds (none
   before the first), waits at most 30 s for the answer and reads at most
   `MIMIC_EGRESS_MAX_BYTES` of it while it streams. `200` with a body that
@@ -1543,7 +1606,13 @@ held, measured and summarised, never used to answer a request.
   the typed egress set and the buffer is freed before the swap; the snapshot held is dropped
   only after the new one is accepted, so the peak is the old snapshot, the buffer and the new
   set together, and a refused body leaves the old snapshot untouched. That peak, on top of the
-  worst case of discovery, must fit the injected memory limit (PUL-18). Every other outcome keeps the snapshot held, and is counted with its `result`:
+  worst case of discovery, must fit the injected memory limit (PUL-18). (F10) The mode of a
+  `200` or `304` is applied after the snapshot of the same answer is swapped in (or kept), so
+  a sidecar that enters mock answers from the snapshot that came with the mode; a `200` whose
+  body is refused (`too_large`, `invalid`) still applies its mode, with the snapshot held.
+  An answer without `Mimic-Mode` (a controller up to F9) or with an invalid value keeps the
+  current mode (one WARN `mode unknown` per streak, `value` cut to 32 bytes); so does every
+  failed pull. Every other outcome keeps the snapshot held, and is counted with its `result`:
   - a body over the cap (`too_large`: the read stops at the cap), a body the check refuses
     (`invalid`, with WARN `egress rejected` and its `reason`), `507` (`too_large`): retried at
     the next interval;
@@ -1561,28 +1630,172 @@ held, measured and summarised, never used to answer a request.
 - **Local view.** `GET /egress` on the sidecar admin port, loopback peers only (403 otherwise,
   as `/discovery`), answers a summary of the snapshot, sorted keys: `{"etag": "<ETag>" | null,
   "pulled": "<RFC 3339 of the last 200 or 304>" | null, "authorities": {"<authority>":
-  {"endpoints": [{"method", "template", "grpc", "exchanges", "statuses"}]}}}`. No sample and no
+  {"endpoints": [{"method", "template", "grpc", "exchanges", "statuses"}]}}}`, from F10 with
+  `"mode": "discovery" | "mock"` and `"latency_factor": <number>`. No sample and no
   field name: `/egress` shows what the pod could mock, not the exchanges the other pods
   recorded. The loopback check reads the socket peer, so it assumes the admin port is not
   redirected by the mesh rules and the pod does not use `hostNetwork`.
 - **Rollout.** An F9 controller answers pulls whatever the sidecar version (sidecars up to F8
   do not pull); an F9 sidecar facing a controller up to F8 gets `unsupported` and holds an
   empty snapshot. A controller rolled back to F8 writes without the digest; an F9 controller
-  that comes back finds it stale and hashes the bytes. The webhook sets no new variable.
+  that comes back finds it stale and hashes the bytes. The webhook sets no new variable in
+  F9. (F10) An F9 sidecar ignores the mode headers; an F10 sidecar facing an F9 controller
+  follows `MIMIC_MODE` and keeps it (`mode unknown`), so a controller rollback during a load
+  test never turns mock into real egress.
 - **Consumers.** F10 adds the mode to what sidecars pull and answers outbound calls from the
   snapshot (§8). Mesh traffic management is v2.
 
 ## 8. Mock
 
-- The sidecar answers from the egress snapshot it pulled (§7.7).
-- Matching, first hit wins: (1) exact: method, authority, path, query, normalised body;
-  (2) same endpoint, closest body ignoring volatile fields; (3) most frequent response of the
-  endpoint. The response carries `x-mimic-match: exact|endpoint|fallback`. Volatile and
-  redacted fields (§6) are ignored by (2) and never compared by (1).
-- Latency: drawn from the endpoint's recorded histogram; `spec.mock.latencyFactor` scales it
-  (`0` disables it).
-- No match: status **599**, header `x-mimic-miss: 1`, metric `mimic_mock_miss_total`, one log
-  line with the request signature. The real destination is never called.
+F10. The sidecar answers the app's outbound HTTP from the egress snapshot it pulled (§7.7),
+never from another deployment's data: the snapshot is the only source, and the controller
+serves a pod its own deployment only (§7.2). Matching, response building and the latency draw
+are pure logic in `mimic-core` (`mock` module); the sidecar does the I/O, the timers and the
+random numbers it hands to the draw.
+
+- **Mode state.** At start the mode and latency factor come from the state file
+  `/mimic/state/mode` when it holds a valid `{"latency_factor": <n>, "mode": "<mode>"}`, else
+  from `MIMIC_MODE` and `MIMIC_MOCK_LATENCY_FACTOR`; from then on, from each pull answer
+  (§7.7). The sidecar writes the state file (write to a temporary file, then rename) at each
+  change, before it applies the change to traffic. `/mimic` is the `mimic-trust` `emptyDir`
+  (§7.1): it survives a restart of the sidecar container, not the pod (a new pod gets the mode
+  of its admission), and app containers only mount its `trust/<n>` subpaths read-only, so the
+  app can neither read nor write the file. An unreadable or invalid file is ignored with one
+  WARN `mode state ignored`; a failed write is one WARN `mode state not saved` and changes
+  nothing in traffic. One INFO `mode changed` (`target` = `mock`, `mode`, `previous`,
+  `latency_factor`, `source`: `env` | `state` | `pull`) at start and at each change of mode or
+  factor. The latency factor is a number of hundredths, 0–10000 (the controller and the
+  sidecar round a written factor to the nearest hundredth, halves up). The snapshot is pulled and refreshed in both
+  modes; an empty snapshot in mock answers every request `599`.
+- **Connections in mock.** The sidecar does not connect to the destination before it knows
+  what the connection is. It waits for the client's first bytes (detection of §4.1):
+  - an HTTP/1.x request line or the HTTP/2 preface: a **mocked connection**, served by the
+    sidecar itself, with no connection to the destination, unless the target authority of its
+    first request matches `MIMIC_MOCK_PASSTHROUGH` (below);
+  - a TLS ClientHello: §5 "Mock mode"; an intercepted stream whose decrypted bytes are HTTP is
+    a mocked connection, any other decrypted stream is closed (`result: mock_closed`);
+  - other client bytes (a client-first non-HTTP protocol: PostgreSQL, Redis, Kafka …):
+    connected and relayed as an opaque tunnel, as in discovery, and recorded as a `tcp` tunnel
+    (§6.1): mimic cannot answer them, and the workload under test needs its own datastores;
+  - no byte within **1 s**: the sidecar connects (a server-first protocol: MySQL, SMTP) and
+    keeps waiting for the first bytes of either side; the destination first, or non-HTTP
+    client bytes: an opaque tunnel; an HTTP request line, the preface or a ClientHello from the
+    client before the destination spoke: the destination socket is closed without a byte
+    written to it and the connection is handled as above. Only a TCP handshake reaches such a
+    destination.
+  - **Passthrough** (`MIMIC_MOCK_PASSTHROUGH`, from `spec.mock.passthrough`, grammar and
+    matching of `spec.tls.exclude`, §5): a connection whose first request's target authority
+    host, SNI, or destination IP (IP literal entries) matches is handled exactly as in
+    discovery (connected, forwarded, recorded), for its whole life. It is how internal
+    services the load test needs (an auth service, a TLS datastore excluded from interception)
+    stay real. Applied at pod creation, like `spec.tls.exclude`.
+- **Requests on a mocked connection.** HTTP/1.1 (keep-alive, pipelining, `Expect:
+  100-continue` answered `100`) and HTTP/2 (each stream on its own, concurrently) are served by
+  the sidecar's own `hyper` server; mocked answers are mimic's, so the byte exactness of §4.1
+  does not apply to them (the server may add `date`). The request body is read to its end: its
+  first 256 KiB are kept for matching within `MIMIC_DISCOVERY_CAPTURE_BUDGET` (decoded and
+  parsed as §6; a body over the limit, opaque, undecodable or that does not fit the budget is
+  matched as absent), the rest is read and discarded. A request the server cannot parse closes
+  the connection (`result: unframed` or `rejected`, as §4.1). A `CONNECT` and a request that
+  asks for an upgrade (`Upgrade`, extended `CONNECT`) are misses (`connect`, `upgrade`).
+- **Request signature** (pure). Authority: the scope key of §6.1 (target authority, else SNI,
+  else destination `ip:port`). Path: the concrete path redacted as samples are (§6 value
+  detectors). Query pairs and body: redacted with the outbound request view (§6.1), as the
+  recorder would have redacted them. Header values are never compared.
+- **Endpoint lookup.** Among the endpoints of the request's authority (none: miss
+  `authority`) with the request's method (exact, `HEAD` is not `GET`): a gRPC request
+  (`content-type: application/grpc*` on HTTP/2) takes the `grpc` endpoint whose template equals
+  its redacted path; any other request the templates with as many segments as its path where
+  every literal equals the segment (raw bytes) and every `{param}` takes any segment, the most
+  specific first (at the first position where two templates differ, a literal beats a
+  parameter). None: miss `endpoint`.
+- **Fields** of a request or of a sample's request: `path/<n>` (the segment at each parameter
+  position of the template), `query/<key>` (its values in order), and the leaves of a parsed
+  body `request.body/<media><pointer>` (JSON pointer, form field `/<key>`). A field whose §6
+  name (array indices written `*`) is in the endpoint's `volatile` or `redacted` list, or whose
+  value holds the marker `<redacted>`, is left out on both sides: it is never compared.
+- **Tiers**, first that gives a sample wins, samples taken in snapshot order, `1xx` samples
+  never used:
+  1. `exact`: the first sample whose fields are exactly the request's (same names, same
+     values; same body media type, or both without body);
+  2. `endpoint`: the sample that shares the most fields (same name and value) with the
+     request, at least one; ties go to the first;
+  3. `fallback`: the endpoint's most frequent status other than `1xx` (ties: the lowest); the
+     first sample with that status, else that status alone with an empty body. An endpoint
+     with only `1xx` statuses is a miss (`endpoint`).
+- **Answer.** The sample's status and response headers in their order, without
+  `content-length`, `content-encoding`, `transfer-encoding`, `connection`, `keep-alive`,
+  `te`, `trailer`, `upgrade` and `proxy-connection`, plus `content-length` of the body sent and
+  `x-mimic-match: exact|endpoint|fallback`. Body: the sample's JSON value serialised compactly,
+  or its form pairs encoded as `application/x-www-form-urlencoded`, identity coding; a sample
+  without body (opaque, too large) gives an empty body; `HEAD`, `204` and `304` have none.
+  Redacted values are sent as recorded (`<redacted>`): a mock never holds, and so never
+  returns, a secret (§11.1). **gRPC**: status 200, the sample's headers (`content-type`
+  kept), one message of length zero (5 bytes `00 00 00 00 00`, the default value of any
+  message), then trailers `grpc-status: 0`; recorded messages are opaque and not kept (§6), so
+  a gRPC mock always succeeds with an empty message.
+- **Latency.** Drawn from the endpoint's recorded histogram (§6), never from the sample: a
+  bucket with probability count / total, then a whole number of milliseconds uniformly within
+  it (bucket `i` holds the integers in (2^((i-1)/4), 2^(i/4)], bucket 0 holds 0 and 1, the
+  overflow bucket gives 131 072); multiplied by the latency factor in hundredths `f` as `(d × f + 50) / 100` in integer
+  milliseconds (rounded to the nearest, halves up; `0` disables it) and capped at 300 s; an
+  empty histogram gives 0. The response head is sent no earlier than that delay after the first
+  byte of the request was read (the definition of `head_ms`, §4.1), the body right after it.
+  A miss is answered without delay.
+- **Miss.** Status **599**, headers `x-mimic-miss: 1` and `content-length: 0`, empty body,
+  gRPC included (its client sees an HTTP error, not a `grpc-status`). The real destination is
+  never called. The overload answer of "Bounds" has the same form. One WARN `mock miss`
+  (`reason`: `authority`, `endpoint`, `connect`, `upgrade`; `overload` is logged as "Bounds"
+  says, not here; `authority`, `method`, `path` as in the access line: redacted, no query) per
+  distinct (`reason`, `authority`, `method`, `path`) per mode period (from one entry into
+  mock to the next), at most 256 lines per period, then one WARN `mock miss log limit reached` until the mode changes; every miss is
+  counted.
+- **Not recorded.** A mocked exchange is not discovery: it creates no exchange record (not in
+  `mimic_discovery_exchanges_total`), so a mock never feeds its own snapshot. Inbound
+  exchanges, tunnels and passthrough connections are recorded as in discovery.
+- **Access lines and metrics.** A mocked exchange writes its `http exchange` line with `mock`:
+  `exact` | `endpoint` | `fallback` | `miss` and, for a miss, `mock_miss` (the reason); it is
+  counted in the RED metrics (`direction="outbound"`) like a forwarded one. A connection closed
+  by mock writes a `connection` line with `result: mock_closed` (and its `interception` for
+  TLS). `mimic_mock_*` metrics: §9.
+- **Switching.** The mode is read when a request's first byte is read and when a connection's
+  kind is decided:
+  - *discovery → mock*: on a forwarded HTTP connection (HTTP/1 or h2, cleartext or
+    intercepted) a request read after the switch is answered by the mock, never forwarded;
+    requests forwarded before it get the destination's answers, then the destination
+    connection is closed (FIN; `GOAWAY` for h2) and the connection continues as mocked. Open
+    tunnels that mock would not keep (TLS passed through, decrypted opaque streams, `CONNECT`
+    and upgraded tunnels) are closed at once (`result: mock_closed`); non-HTTP cleartext
+    tunnels and passthrough connections continue.
+  - *mock → discovery*: on a mocked connection the requests read before the switch are
+    answered (latency included); then an HTTP/1 connection is closed (FIN) and an HTTP/2 one
+    gets `GOAWAY` naming its last stream opened before the switch. New connections are handled
+    as in discovery (connected, forwarded, recorded). The snapshot is kept.
+- **Bounds.** Matching cost is bounded by the snapshot bounds (§7.7: 20 samples per endpoint,
+  128 field names) and the 256 KiB body. The *index* built from an accepted snapshot replaces
+  the typed set (it is not held twice) and holds each sample's answer once, serialised (status,
+  headers, body), behind an `Arc`; PUL-18 measures it in place of the typed set.
+  - *Pending answers share, never copy.* A mocked request is *pending* from the first byte of
+    its request to the end of its answer. Its matched request body is held in
+    `MIMIC_DISCOVERY_CAPTURE_BUDGET` only until matching ends, before the latency wait; then it
+    holds an `Arc` of the chosen answer (and of the index it belongs to, so a snapshot swapped
+    meanwhile is freed when its last pending answer ends) and a timer, nothing else.
+  - *Cap.* At most `MIMIC_MOCK_MAX_PENDING` requests are pending at once (gauge
+    `mimic_mock_pending`). One more is answered at once, without reading its body, with an
+    *overload* answer: `599`, `x-mimic-miss: 1`, `content-length: 0`, counted as a miss with
+    reason `overload` (access `mock_miss: overload`); an HTTP/1 connection is then closed (its
+    unread body cannot be skipped safely), an HTTP/2 stream is ended with `RST_STREAM`
+    (`NO_ERROR`) after the answer. One WARN `mock overload` (`limit`) when the cap is reached,
+    again only after the pending count fell below 7/8 of the cap (INFO `mock overload ended`).
+    Mocked `h2` connections advertise `SETTINGS_MAX_CONCURRENT_STREAMS` 256.
+  - *Cancellation.* When the client aborts (closes or resets the connection, or resets the
+    stream) the pending request is dropped at once: its timer is cancelled, nothing is written,
+    the access line says `client_abort`, and its pending slot and `Arc` are released. At
+    `SIGTERM` pending answers are dropped the same way when the grace of §4.1 ends.
+  - The default cap keeps the worst case (every pending answer sharing one 256 KiB sample, or
+    all different) within the 128 Mi sidecar limit with the PUL-18 snapshot held (MCK-18):
+    answers are shared, so pending requests cost their task and stream state only.
+- Mesh traffic management (retries, fault injection, routing) is v2 (§1.2).
 
 ## 9. Observability
 
@@ -1620,6 +1833,11 @@ held, measured and summarised, never used to answer a request.
   | `mimic_egress_endpoints` | gauge (F9, sidecar), endpoints in the egress snapshot | — |
   | `mimic_egress_bytes` | gauge (F9, sidecar), size of the snapshot's body as received, 0 without one | — |
   | `mimic_egress_last_pull_timestamp_seconds` | gauge (F9, sidecar), time of the last `200` or `304` pull, 0 before | — |
+  | `mimic_mock_mode` | gauge (F10, sidecar), 1 in mock, 0 in discovery (§8) | — |
+  | `mimic_mock_requests_total` | counter (F10), outbound requests answered by the mock (§8) | `result` (`exact`, `endpoint`, `fallback`, `miss`) |
+  | `mimic_mock_miss_total` | counter (F10), misses answered `599` | `reason` (`authority`, `endpoint`, `connect`, `upgrade`, `overload`) |
+  | `mimic_mock_pending` | gauge (F10), mocked requests pending (§8 "Bounds") | — |
+  | `mimic_mock_connections_total` | counter (F10), outbound connections whose kind was decided in mock | `decision` (`mocked`, `tunnel`: non-HTTP relayed, `passthrough`, `closed`) |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -1749,6 +1967,10 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Extra names redacted by name (§6), comma-separated, at most 64, each 1–64 characters of `a-z0-9-_` (compared like the built-in names); the webhook sets the sorted, deduplicated union, lower-cased, of `spec.discovery.redact` of every `MimicWorkload` naming the deployment. |
 | `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | (F9) Period of the egress pull (§7.7), 1s–1h. Not set by the webhook. |
 | `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | (F9) Largest egress set read from the controller (§7.7; `<n>`, `<n>Ki`, `<n>Mi`, `<n>Gi`; 64Ki–1Gi). Not set by the webhook. Sized so that the pull peak and the discovery worst case fit the 128 Mi sidecar limit (PUL-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
+| `MIMIC_MODE` | `discovery` | (F10) Mode until the first pull answer (§3, §8): `discovery` or `mock`. The webhook always sets it to the effective mode at admission (§7). |
+| `MIMIC_MOCK_LATENCY_FACTOR` | `1` | (F10) Latency factor until the first pull answer (§8), a decimal 0–100 with at most 2 fractional digits. Set by the webhook when the effective factor is not 1. |
+| `MIMIC_MOCK_MAX_PENDING` | `1024` | (F10) Mocked requests pending at once (§8 "Bounds"), 1–65536; more are answered `599` (`overload`). Not set by the webhook. Sized with the 128 Mi sidecar limit (MCK-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
+| `MIMIC_MOCK_PASSTHROUGH` | empty | (F10) Destinations handled as in discovery while in mock (§8), comma-separated, the `MIMIC_TLS_EXCLUDE` grammar; an invalid entry or more than 256 exits with code 2. The webhook sets the union of `spec.mock.passthrough` (§7), absent when empty. |
 
 ### 10.4 `mimic-init` variables
 
@@ -1976,6 +2198,38 @@ static binary (no dynamic loader, no libc needed) so that it runs in any Linux a
 - Emptying the seed Secret rotates every root: running sidecars then fail the chain check
   and pass everything through (`no_ca`) until their pod is recreated. The trust wiring and
   `spec.tls.exclude` apply at pod creation.
+
+- (F10) **Mock is HTTP only and does not answer DNS.** The app still resolves the names it
+  calls (UDP DNS is not captured, §4): in an environment that cannot resolve a provider's name
+  the app never connects, and the mock is not reached. Non-HTTP cleartext TCP is relayed to the
+  real destination in mock (§8), and so is every `spec.mock.passthrough` destination; a client
+  that stays silent for 1 s on a new connection makes a TCP handshake (no byte) reach its
+  destination, and server-first protocols wait 1 s more per new connection in mock.
+- (F10) **Mode changes are eventually consistent.** A change reaches a pod within one pull
+  interval (60 s by default) while the controller answers; a sidecar that cannot reach it keeps
+  the mode it has (stuck in mock, or in discovery), which `status.mode.otherPods` shows. A
+  restarted sidecar container resumes the mode it saved in the pod (§8 "Mode state"), so a
+  restart does not reopen real egress; only a pod created in the instant before a change starts
+  in the old mode, for the round trip of its first pull (sent at once). `spec.mock.passthrough`
+  applies to pods created afterwards, like `spec.tls.exclude`.
+- (F10) **Roll back only out of mock.** A rollback of mimic to F9 keeps running F10 sidecars in
+  their mode, but every pod recreated afterwards gets an F9 sidecar, which has no mock and
+  forwards for real; `spec.mock` is pruned by the old CRD schema (§7).
+- (F10) **Whoever may create or edit a `MimicWorkload` in a namespace decides the egress of
+  every deployment there** (mock wins, §7): Kubernetes RBAC on `mimicworkloads` is the
+  authorisation, as it already is for injection and `spec.tls.exclude`.
+- (F10) **Replay fidelity.** A mock replays recorded samples, chosen per request: no state
+  across calls (a created resource is not readable afterwards), no sequence. Opaque bodies
+  (binary, protobuf, over 256 KiB) are replayed empty; gRPC always answers `OK` with an empty
+  message; redacted values are replayed as `<redacted>` (an OAuth token endpoint returns that
+  as the token, which later mocked calls accept, since header values are not compared). A
+  deployment's mock answers are built from what its own pods recorded, values that no detector
+  catches (names, e-mail addresses) included, and are sent to its own app only; a pod of the
+  deployment that pushes crafted reports can shape what its sibling pods are answered (the same
+  trust domain as discovery, §7.2).
+- (F10) In mock the sidecar issues leaves for any name a client of the pod asks for, without a
+  verified upstream certificate: they chain to the deployment's own root, which only this
+  deployment's pods trust, and no traffic leaves, so nobody outside the pod relies on them.
 
 ## 12. Delivery plan
 
@@ -2299,7 +2553,7 @@ route in place.
 | PUL-02 | **U.** Egress set check (§7.7) refuses, each with its `reason`: `format` 0, 2 or absent (`format`); an authority `A.example:80`, `a.example:080` or `a.example` (`authority`); 10 001 authorities, 10 001 endpoints in all (`limit`); a template of 2049 bytes or 33 segments, a status 99 or 600, a histogram bucket outside the §6 range, 21 samples, a sample whose `bytes` is not its serialised size, 129 field names, a field name of 129 bytes, an unknown field at any level, a body that is not JSON (`malformed`). |
 | PUL-03 | **U.** No leak in the projection: reports that held a canary at a random place (the SHR-02 generator, inbound and outbound) re-redacted by §7.3 then projected contain neither the canary nor its XXH3 hash in decimal or hex, and no hash of any volatility sketch of the source report (`proptest`, ≥ 10 000 cases). |
 | PUL-04 | **U.** Digest and `ETag` (§7.7): the digest of version `v` and bytes `b` is `v:<hex SHA-256 of b>` (of the empty string without `:outbound`); the `ETag` is `"1-<hex>"`; a digest field that is absent, malformed or written for another `version` is stale; `If-None-Match` matches when one entry of its list equals the `ETag` exactly (`W/"…"` and `*` do not match). |
-| PUL-05 | **U.** Local view (§7.7): the summary of a snapshot lists every authority and endpoint with `method`, `template`, `grpc`, `exchanges` (the sum of `statuses`) and `statuses`, sorted keys, byte-identical for equal input; it holds no sample, no field name and none of the PUL-03 canaries; without snapshot it is `{"authorities":{},"etag":null,"pulled":null}`. |
+| PUL-05 | **U.** Local view (§7.7): the summary is a function of the snapshot, its `ETag`, the `pulled` time and (from F10) the mode and latency factor; it lists every authority and endpoint with `method`, `template`, `grpc`, `exchanges` (the sum of `statuses`) and `statuses`, sorted keys, byte-identical for equal inputs (snapshot, `ETag`, `pulled`, mode and factor); it holds no sample, no field name and none of the PUL-03 canaries; without snapshot in discovery with factor 1 it is `{"authorities":{},"etag":null,"latency_factor":1,"mode":"discovery","pulled":null}` (amended by F10: up to F9 it was `{"authorities":{},"etag":null,"pulled":null}`). |
 | PUL-06 | **I.** Digest in the store (§7.3, §7.7): after a version 2 push `:meta` `outbound_digest` is `<version>:<SHA-256 of the :outbound bytes>`; after a version 1 push that leaves `:outbound` unchanged its hash part is unchanged and its version follows `version`; a deployment without `:outbound` holds the empty-string digest; `:report`, `:outbound` and the other `:meta` fields are byte-identical to what F8 writes for the same pushes. After an F8-style write (digest removed or left at an older version, `:outbound` changed), the route answers the projection of the stored bytes with their `ETag`, and an `If-None-Match` of the earlier `ETag` gets `200`. |
 | PUL-07 | **I.** Route (§7.7): a token of a pod of the deployment gets `200` `application/json` with `ETag` and `Cache-Control: no-store`, the body byte-identical to the `mimic-core` projection of the stored `:outbound`; the same `If-None-Match` gets `304` with the `ETag`, an empty body and no `GET` of `:outbound` (Valkey `INFO commandstats`); after a version 2 push that changes the outbound part the next pull is `200` with a new `ETag`, after a version 1 push it is still `304`; a deployment without data and one with inbound data only get `200` `{"authorities":{},"format":1}`; two replicas answer the same `ETag` and bytes. |
 | PUL-08 | **I.** Refusals (§7.7): missing, invalid and foreign-audience tokens get `401`; a pod of another deployment or without bound-pod claim `403`; a pod of namespace `b` naming a deployment that has data only in namespace `a` gets the empty set; over `MIMIC_SIDECAR_API_RATE` `429` with no `TokenReview`; `format` absent, `2` or `abc` `400` (`format`); a name that is not DNS-1123 `400`; `POST` and `PUT` `405` with `Allow: GET`; Valkey stopped `503` with `Retry-After: 1`; a corrupted `:outbound` `500` with one ERROR `stored report unreadable` (`key` `outbound`), the key left unchanged; a projection over `MIMIC_SIDECAR_API_MAX_EGRESS` (64Ki in the test) `507` (`egress_limit`) with one WARN `egress limit reached` (`reason` `projection`) per deployment. |
@@ -2310,11 +2564,46 @@ route in place.
 | PUL-13 | **I.** Pull client (§7.7), against the fake sidecar API with `MIMIC_EGRESS_PULL_INTERVAL=2s`: the first `GET /v1/workloads/<MIMIC_WORKLOAD>/egress?format=1` arrives within one interval of start, without `If-None-Match`, with the token the file holds at that moment (the file changes between two pulls and the next pull carries the new one); later pulls come once per interval with the `ETag` held; `304` keeps the snapshot and moves `pulled`; a new `200` replaces it; an empty set empties it; `/egress`, `mimic_egress_endpoints`, `mimic_egress_bytes`, `mimic_egress_last_pull_timestamp_seconds` and `mimic_egress_pulls_total{result="ok"|"not_modified"}` follow. |
 | PUL-14 | **I.** Pull failures keep the snapshot held (§7.7): `503`, a reset, an answer delayed past 30 s, `401`, `403` and `429` are `error` and retried after 1, 2, 4 … s (`Retry-After: 3` waits at least 3 s, `Retry-After: 900` waits 300 s); one WARN `egress pull failed` per streak and one INFO `egress pull recovered`; `404` and `405` are `unsupported` and the next pull comes one interval later, not sooner; a 1 GiB body is `too_large` and the sidecar stops reading at `MIMIC_EGRESS_MAX_BYTES` (its RSS grows by less than twice the cap); a body with `format` 2, one that is not JSON, and one with 21 samples in an endpoint are `invalid` with one WARN `egress rejected` carrying the PUL-02 `reason`; `507` is `too_large`. No line holds the token or snapshot content. |
 | PUL-15 | **I.** F9 changes no traffic: with a snapshot holding the authority and endpoint the app calls, the outbound calls still reach the destination and the app gets its answers unchanged (no `x-mimic-match` header); access lines, `/discovery` and the pushed reports are the same as with an empty snapshot (timings aside). Without `MIMIC_CONTROLLER_URL` nothing is pulled and one INFO `egress pull disabled` is written. At `SIGTERM` no pull starts after the signal, and a pull in flight to a silent fake does not delay the exit beyond the FND-05 bound. |
-| PUL-16 | **I.** `/egress` on the sidecar admin port: a non-loopback peer gets `403`; a loopback peer gets the PUL-05 summary of the snapshot held; with a snapshot whose samples hold canaries, no canary is in `/egress`, the sidecar's stdout or `/metrics`. |
+| PUL-16 | **I.** `/egress` on the sidecar admin port: a non-loopback peer gets `403`; a loopback peer gets the PUL-05 summary of the snapshot held and (from F10) of the current mode and latency factor; with a snapshot whose samples hold canaries, no canary is in `/egress`, the sidecar's stdout or `/metrics`. |
 | PUL-17 | **I.** Sidecar configuration: `MIMIC_EGRESS_PULL_INTERVAL` at `0s`, `2h` or `abc`, and `MIMIC_EGRESS_MAX_BYTES` at `63Ki`, `2Gi` or `abc`, exit 2 before listening (FND-01); unset, they are `60s` and `4Mi`. |
 | PUL-18 | **I.** Sidecar memory, combined with discovery: with default settings, while the EGR-15 load runs (256 inbound and 256 outbound endpoints over 64 authorities, each receiving 30 distinct 256 KiB JSON exchanges, the worst case of DSC-17 included), the sidecar pulls from the fake sidecar API two different egress sets of just under `MIMIC_EGRESS_MAX_BYTES` each (samples with JSON bodies of many small keys, the costliest to parse), one after the other with the first still held while the second parses, and a third pull returns a refused body of the same size; its peak RSS (`VmHWM`) stays under 120 MiB (8 MiB of headroom under the injected 128 Mi limit), and after each accepted pull `/egress` shows the new set. |
 | PUL-19 | **E.** On kind, after the traffic of SHR-19 stops, within 2 push intervals plus 2 pull intervals: through `kubectl port-forward` to each `front` pod's admin port, `/egress` lists `users.disc-22.svc:8080` with `GET` and `PUT /users/{users_id}` and `GET /missing`, with the same `etag` on both pods; a `users` pod's `/egress` has no authority; the controllers' logs hold `sidecar_api` lines for `/v1/workloads/{deployment}/egress` with `ok` and `not_modified`; no SHR-19 canary is in any `/egress` answer or controller log line. |
 | PUL-20 | **C.** A fuzz target feeds arbitrary bytes to `EgressSet::from_json`, and the reports of the CTL-22 corpus that pass the §7.3 check to the projection: no panic, and every projection passes the egress set check. Same CI schedule as DSC-23. |
+
+### 12.11 F10 — Mock mode, and back to discovery
+
+Levels as in §12.2. Unit tests build egress sets with the recorder, the bounded merge and the
+projection of F9 (so that samples, `volatile` and `redacted` are what production gives).
+Sidecar integration tests use the fake sidecar API of F9, extended to send `Mimic-Mode` and
+`Mimic-Latency-Factor` (or none) and to change them between pulls, and fake destinations
+that count accepted connections and received bytes; "no egress" means that count is 0.
+Controller integration tests run against a real Valkey and the fake API server as in §12.6. A
+*canary* is as in §12.5. F10 amends PUL-05 and PUL-16 in place (the `/egress` summary gains
+`mode` and `latency_factor`); every other earlier row must still pass, PUL-15 included with
+`MIMIC_MODE=discovery` and answers carrying `Mimic-Mode: discovery`.
+
+| ID | Criterion |
+|---|---|
+| MCK-01 | **U.** Effective mode (§7): no `MimicWorkload` gives `discovery`, factor 1, no passthrough; `discovery` + `mock` gives `mock`; the factor is that of the first `mock` one in name order; `spec.mock.passthrough` is the sorted, deduplicated union, cut to its first 256. The injection patch always sets `MIMIC_MODE` to the effective mode, sets `MIMIC_MOCK_LATENCY_FACTOR` only when the factor is not 1 and `MIMIC_MOCK_PASSTHROUGH` only when the union is not empty. **E.** The CRD defaults `spec.mock.latencyFactor` to 1 when `spec.mock` is given, accepts 0, 0.5 and 100, rejects -1, 101 and a string, and rejects a `spec.mock.passthrough` entry `*` and 257 entries. |
+| MCK-02 | **U.** Endpoint lookup (§8): an authority absent from the set is a miss `authority` (an empty set too); `GET /users/42` takes `GET /users/{users_id}`; `GET /users/me` takes `GET /users/me` before `GET /users/{users_id}` whatever their order in the set; `HEAD /users/42`, `POST /users/42` and `GET /users/42/x` are misses `endpoint`; a gRPC request on `/pkg.Svc/Get` takes only the `grpc` endpoint of that exact path; `Host: API.Example.COM.` on a cleartext connection to port 80 looks up `api.example.com:80`, and without `Host` on an intercepted connection the SNI with the destination port; a path segment holding a JWT matches the template whose segment at that position is a parameter. |
+| MCK-03 | **U.** Tiers (§8), on sets built by the recorder: a request equal to a sample but for a volatile query key, a redacted JSON field, a field whose sample value is `<redacted>` and any header value is `exact` with that sample; a request differing in one non-volatile body leaf is `endpoint` with the sample sharing the most fields, ties going to the first in set order; a request sharing no field is `fallback` with the first sample of the most frequent status (statuses `{200: 5, 404: 5}` give `200`); an endpoint whose most frequent status has no sample answers that status with an empty body; a `101` sample or status is never used, and an endpoint holding only `101` is a miss `endpoint`. The result is the same for the same set and request (deterministic) and never depends on the order of the request's query keys of different names. |
+| MCK-04 | **U.** Answer (§8): the sample's status and headers in order without `content-length`, `content-encoding`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer`, `upgrade` and `proxy-connection`, plus `content-length` equal to the body length and `x-mimic-match`; a JSON body serialised compactly reads back to the sample's value; a form body encodes its pairs in order; a sample without body, and `HEAD`, `204` and `304`, give an empty body; a gRPC answer is status 200 with the sample's `content-type`, the body `00 00 00 00 00` and trailers `grpc-status: 0`; a miss is `599` with `x-mimic-miss: 1`, `content-length: 0` and nothing else. Property (`proptest`, ≥ 10 000 cases, any set and request): every header and body value of an answer comes from one sample of the request's authority and endpoint in that set or from the fixed values above, and a canary (a random string of 32 characters of `A-Za-z0-9`, drawn per case) placed in the request's headers, query or body is not in the answer. |
+| MCK-05 | **U.** Latency draw (§8), with the inputs the caller supplies: a draw is a whole number of milliseconds in the chosen bucket (bucket 0: 0 or 1); for each bucket, the inputs that select it are a share of the input range equal to its count over the total (exact, by enumeration on a small histogram); the overflow bucket gives 131 072 ms; an empty histogram gives 0; factor 0 gives 0, factor 2 twice the factor-1 draw for the same inputs, and no draw exceeds 300 s. Rounding: a draw `d` with factor `f` hundredths gives `(d × f + 50) / 100` ms: factor 0.5 on 3 ms gives 2 ms, 1.3 on 10 ms 13 ms, 0.01 on 49 ms 0 ms and on 50 ms 1 ms; a factor written `0.005` reads as 0.01, `0.004` as 0. |
+| MCK-06 | **U.** Request signature (§8): a request with `?api_key=<canary>`, `Authorization: Bearer <canary>`, a JSON body `{"token": "<canary>", "amount": 3}` and a card number in a path segment is matched as the recorder would have recorded it: it is `exact` with the sample the recorder made of the same exchange, and none of the fields compared holds the canary. Mode headers: `Mimic-Mode` `discovery` and `mock` are read, anything else (case changed, empty, two values) is invalid; `Mimic-Latency-Factor` reads decimals 0–100, and the controller writes `1`, `0.5`, `0` and `100` in that form. |
+| MCK-07 | **U.** Mode convergence (§7.4): from `:pulls` fields, a window and a time, `status.mode.pods` counts the fields within the window carrying the effective mode and `otherPods` those carrying the other one; fields outside the window or unreadable are in neither count. |
+| MCK-08 | **I** (controller). Mode on the egress route (§7.7): with one `MimicWorkload` in `mock` (factor 0.5) for the deployment, `200` and `304` answers carry `Mimic-Mode: mock` and `Mimic-Latency-Factor: 0.5`; after `spec.mode` is set to `discovery` in the fake API server, the next pull with the same `If-None-Match` is still `304`, with the same `ETag`, and carries `Mimic-Mode: discovery` and no factor; a second `MimicWorkload` in `mock` naming the same deployment turns it back to `mock`; a pod of namespace `b` gets the mode of its own deployment, never that of `a`; `400`, `401`, `403`, `429`, `503` and `507` answers carry no mode header. After each `200`/`304`, `:pulls` holds `<pod>` → `<mode> <ms>` with the expiry of `:pods` fields; with the `:pulls` write failing the pull is still answered, and `mimic_store_writes_total{result="error"}` counts it. |
+| MCK-09 | **I** (controller). Status: with `MIMIC_STATUS_POD_WINDOW=10s`, two pods pulling in `mock` and one whose last pull carried `discovery` give `status.mode` `{mode: mock, pods: 2, otherPods: 1}`; 10 s (+ one status interval) after that pod's last pull, `otherPods` is 0. **E.** `kubectl get mimicworkload` prints a `Mode pods` column. |
+| MCK-10 | **I.** Sidecar mode state (§3, §7.7, §8): with `MIMIC_MODE=mock` and `MIMIC_EGRESS_PULL_INTERVAL=60s` the first pull arrives within 1 s of start; `mode changed` lines (`source` `env` at start, then `pull` at each change of mode or factor) and `mimic_mock_mode` follow the answers; an answer without `Mimic-Mode` or with `Mimic-Mode: MOCK` keeps the current mode with one WARN `mode unknown` per streak; a `200` refused as `too_large` or `invalid` still applies its mode; `503`, a reset and `404` keep the mode; `/egress` shows `mode` and `latency_factor`. State file: after a pull switched it to `mock` (factor 0.5), `/mimic/state/mode` holds `{"latency_factor":0.5,"mode":"mock"}`; a sidecar restarted with the same `/mimic` and `MIMIC_MODE=discovery`, its controller silent (no answer), answers outbound requests from the mock from its first one with `source` `state`, and the fake destination accepts no connection; an invalid file is ignored with one WARN `mode state ignored` and `MIMIC_MODE` applies; an unwritable `/mimic/state` gives one WARN `mode state not saved` and the switch still applies. `MIMIC_MODE=record`, `MIMIC_MOCK_LATENCY_FACTOR` at `-1`, `101` or `abc` and `MIMIC_MOCK_PASSTHROUGH=*` exit 2 before listening (FND-01); unset they are `discovery`, `1` and empty. |
+| MCK-11 | **I.** No real egress, HTTP/1 (§8): in mock, with the set holding `GET /users/{users_id}` for `users.test:8080`, the app's request to `users.test:8080` gets the sample's answer with `x-mimic-match`, a request to an unknown path and one to an unknown authority get `599` with `x-mimic-miss: 1`, a `CONNECT` and a WebSocket upgrade get `599` (`connect`, `upgrade`), keep-alive and 5 pipelined requests are answered in order, `Expect: 100-continue` gets `100` then the answer; the fake destination accepts no connection in any of these cases, also when nothing listens there; access lines carry `mock` and `mock_miss`, `mimic_mock_requests_total`, `mimic_mock_miss_total` and `mimic_http_requests_total{direction="outbound"}` count each request, and `mimic_discovery_exchanges_total{direction="outbound"}` and the outbound part of `/discovery` do not change. |
+| MCK-12 | **I.** HTTP/2 and gRPC (§8): in mock, 32 concurrent `h2c` streams to a recorded authority are answered on one connection with their samples; a unary gRPC call with a generated client to a recorded method succeeds with the default message and `grpc-status` 0; an unrecorded gRPC method fails at the client (HTTP status 599, not `OK`); the fake destination accepts no connection. |
+| MCK-13 | **I.** TLS in mock (§5, §8): a client trusting `MIMIC_TLS_CA` and offering `h2,http/1.1` to SNI `api.test`, with nothing listening at the destination, gets a leaf for `api.test` from the intermediate, ALPN `h2` and the mocked answer; with `http/1.1` only, HTTP/1.1; a ClientHello without SNI to `127.0.0.1` gets a leaf with that IP SAN; an SNI matching `MIMIC_TLS_EXCLUDE`, a sidecar without CA and a TLS 1.1 ClientHello are closed with no connection at the destination, a `connection` line with `result: mock_closed` and its `interception`, and `mimic_mock_connections_total{decision="closed"}`; a decrypted stream that is not HTTP is closed the same way. |
+| MCK-14 | **I.** Non-HTTP and passthrough (§8): in mock, a client-first non-HTTP stream (a PostgreSQL `SSLRequest`) reaches its destination unchanged and is recorded as a `tcp` tunnel; a server-first destination with a silent client is connected between 1 s and 1.5 s after accept and its greeting reaches the client; a client that sends an HTTP request after 1.2 s to a destination that stays silent gets the mocked answer, while the destination saw one connection, received 0 bytes and was closed; with `MIMIC_MOCK_PASSTHROUGH=users.test`, HTTP to `users.test:8080` and TLS with SNI `users.test` reach the destination as in discovery (PRX-03, TLS-17) and are recorded; `mimic_mock_connections_total{decision}` counts `mocked`, `tunnel`, `passthrough` and `closed`. |
+| MCK-15 | **I.** Latency (§8): with a set whose endpoint histogram has all its exchanges in bucket 31 (182–215 ms), 20 mocked requests each get their response head between 182 ms and 215 ms (+ 50 ms) after their first byte, and the access `head_ms` agrees; factor `0` answers within 50 ms, factor `2` between 364 ms and 430 ms (+ 50 ms); misses are answered within 50 ms; 32 concurrent `h2c` streams of that endpoint all finish within 215 ms + 100 ms of the first (delays run concurrently). |
+| MCK-16 | **I.** Switching (§8), with `MIMIC_EGRESS_PULL_INTERVAL=2s`: *to mock*, after a forwarded HTTP/1 keep-alive request, the fake API flips to `mock`; within 2 intervals the next request on the same connection gets a mocked answer, the destination receives no byte after the first exchange and sees its connection closed with a FIN; the same for a new stream on a forwarded `h2c` connection; an open TLS tunnel passed through as `excluded` is closed (`mock_closed`) within one second of the pull, while a non-HTTP tunnel keeps flowing. *Back to discovery*: a mocked HTTP/1 connection gets its pending answer and is then closed, a mocked `h2c` connection gets `GOAWAY`; the next connection reaches the destination, gets its answer unchanged (no `x-mimic-match`) and is recorded in `/discovery`. |
+| MCK-17 | **I.** Miss logs (§8): 1000 misses over 3 distinct signatures write exactly 3 WARN `mock miss` lines; 300 distinct signatures write 256 lines and one `mock miss log limit reached`; after a mode change and back, a signature already logged is logged again; `mimic_mock_miss_total` counts all 1300. With canaries in the requests' query, headers and body and in a path segment caught by a detector, no stdout line, `/metrics` series, `/egress` answer, pushed report or mocked answer holds a canary. |
+| MCK-18 | **I.** Sidecar memory in mock (§8 "Bounds"), default settings: the sidecar holds a snapshot of just under `MIMIC_EGRESS_MAX_BYTES` (the PUL-18 set) plus one endpoint whose only sample has a 256 KiB JSON response body and whose histogram, with factor 100, always draws the 300 s cap, while the inbound half of the EGR-15 load runs. 4 `h2c` connections of 256 streams and 1 024 HTTP/1 connections (2 048 requests) each post a 256 KiB JSON body to that endpoint: exactly 1 024 are pending (`mimic_mock_pending` 1024) and 1 024 get the overload answer at once (`599`, `mimic_mock_miss_total{reason="overload"}` 1024, one WARN `mock overload`); the bodies beyond `MIMIC_DISCOVERY_CAPTURE_BUDGET` are matched as absent; the peak RSS (`VmHWM`) stays under 120 MiB (8 MiB of headroom under the injected 128 Mi limit). Then every client aborts: within 1 s `mimic_mock_pending` is 0, nothing is written to the aborted clients, each access line says `client_abort`, and one INFO `mock overload ended` is written. A pull that swaps the snapshot while answers are pending does not raise the peak beyond the bound. |
+| MCK-19 | **E.** On kind (after the PUL-19 setup): `front` calls `users` and an HTTPS fake provider in discovery until the egress is pulled; `spec.mode: mock` on the `front` `MimicWorkload` makes, within 2 pull intervals, `status.mode` `{mode: mock, pods: 2, otherPods: 0}`; then `front`'s calls are answered with `x-mimic-match`, the `users` and provider pods log no request, a call to an unrecorded path gets `599`, and a `front` pod created by a scale-up has `MIMIC_MODE=mock` and answers mocked from its first request; `spec.mode: discovery` makes, within 2 pull intervals, `otherPods` 0 again, `users` and the provider receive `front`'s calls and the answers carry no `x-mimic-match`. No canary that `front` sends is in any log line of the cluster. |
+| MCK-20 | **C.** A fuzz target feeds arbitrary request parts (method, authority, path, query, headers, body bytes) and egress sets accepted by `EgressSet::from_json` to the signature, lookup, tiers and answer: no panic, and every answer is a miss or satisfies the MCK-04 property. Same CI schedule as DSC-23. |
 
 ## 13. Test strategy
 
