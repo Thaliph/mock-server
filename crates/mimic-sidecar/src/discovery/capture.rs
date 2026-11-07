@@ -44,15 +44,33 @@ impl Budget {
     }
 }
 
+/// The capture budget (`MIMIC_DISCOVERY_CAPTURE_BUDGET`), shared with the mock, which keeps
+/// the request body it matches in it until matching ends (spec §8 "Bounds").
+#[derive(Clone)]
+pub struct CaptureBudget(Arc<Budget>);
+
+impl CaptureBudget {
+    pub fn new(limit: usize) -> CaptureBudget {
+        CaptureBudget(Arc::new(Budget::new(limit)))
+    }
+
+    pub(crate) fn reservation(&self) -> Reservation {
+        Reservation {
+            budget: self.0.clone(),
+            held: 0,
+        }
+    }
+}
+
 /// Bytes taken from the budget, given back when dropped (the record was processed, dropped
 /// or abandoned).
-struct Reservation {
+pub(crate) struct Reservation {
     budget: Arc<Budget>,
     held: usize,
 }
 
 impl Reservation {
-    fn grow(&mut self, n: usize) -> bool {
+    pub(crate) fn grow(&mut self, n: usize) -> bool {
         let ok = self.budget.try_add(n);
         if ok {
             self.held += n;
@@ -60,7 +78,7 @@ impl Reservation {
         ok
     }
 
-    fn shrink(&mut self, n: usize) {
+    pub(crate) fn shrink(&mut self, n: usize) {
         self.budget.sub(n);
         self.held -= n;
     }
@@ -241,6 +259,11 @@ impl Tap {
             budget,
             metrics,
         }
+    }
+
+    /// The budget the captures are taken from.
+    pub fn budget(&self) -> CaptureBudget {
+        CaptureBudget(self.budget.clone())
     }
 
     /// Starts the capture of an exchange.

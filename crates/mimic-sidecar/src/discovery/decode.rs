@@ -10,7 +10,7 @@ use mimic_core::proxy::http1::CAPTURE_BODY_LIMIT;
 
 /// Why a body could not be decoded.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Failure {
+pub(crate) enum Failure {
     /// A `content-encoding` that is not decoded (`zstd`, a list, an unknown coding).
     Encoding,
     /// The decoded body is over the limit.
@@ -49,7 +49,7 @@ fn bounded(reader: impl Read) -> Result<Vec<u8>, Failure> {
 }
 
 /// `data` decoded according to the value of `content-encoding` (`None` when absent).
-pub(super) fn decode<'a>(data: &'a [u8], encoding: Option<&str>) -> Result<Cow<'a, [u8]>, Failure> {
+pub(crate) fn decode<'a>(data: &'a [u8], encoding: Option<&str>) -> Result<Cow<'a, [u8]>, Failure> {
     let encoding = encoding.unwrap_or_default().trim().to_ascii_lowercase();
     let decoded = match encoding.as_str() {
         "" | "identity" => return Ok(Cow::Borrowed(data)),

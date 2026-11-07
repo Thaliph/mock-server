@@ -152,6 +152,24 @@ impl Response {
     }
 }
 
+/// The body of a response, shared with the index: it hands the bytes to a transport without
+/// copying them.
+#[derive(Debug, Clone)]
+pub struct SharedBody(Arc<Answer>);
+
+impl AsRef<[u8]> for SharedBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0.body
+    }
+}
+
+impl Response {
+    /// The body as an owner of the shared answer; `None` when there is no body.
+    pub fn shared_body(&self) -> Option<SharedBody> {
+        self.body.as_ref().map(|a| SharedBody(Arc::clone(a)))
+    }
+}
+
 impl Hit<'_> {
     /// The response to a request of `method`: `HEAD`, `204` and `304` have no body.
     pub fn response(&self, method: &str) -> Response {

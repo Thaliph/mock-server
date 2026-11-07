@@ -12,6 +12,7 @@ use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig, ShipConfig};
 use mimic_sidecar::egress::{EgressConfig, EgressMetrics, Puller, Snapshot};
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
+use mimic_sidecar::mock::Mock;
 use mimic_sidecar::mode::{ModeConfig, ModeState};
 use mimic_sidecar::probes::{self, Probes};
 use mimic_sidecar::red::ProxyMetrics;
@@ -109,13 +110,22 @@ async fn run(
     let proxy_metrics = ProxyMetrics::register(&mut metrics, tunnel.max_authorities);
     let ca_metrics = CaMetrics::register(&mut metrics);
     let tls_metrics = TlsMetrics::register(&mut metrics);
+    let redactor = discovery.redactor();
     let discovery = Discovery::start(&discovery, pod)?;
     discovery.register(&mut metrics);
     let shipper = discovery.shipper(ship).map_err(std::io::Error::other)?;
     let egress_metrics = EgressMetrics::default();
     egress_metrics.register(&mut metrics);
+    let max_pending = mode.max_pending;
     let mode = ModeState::start(&mode, &mut metrics).await;
     let snapshot = Snapshot::new(mode);
+    let mock = Mock::with_budget(
+        snapshot.clone(),
+        max_pending,
+        redactor,
+        discovery.tap().budget(),
+    );
+    mock.register(&mut metrics);
     let puller =
         Puller::new(egress, egress_metrics, snapshot.clone()).map_err(std::io::Error::other)?;
     let metrics = Arc::new(metrics);
@@ -145,6 +155,7 @@ async fn run(
         .with_max_connections(tunnel.max_connections)
         .with_proxy_metrics(proxy_metrics)
         .with_discovery(discovery.tap())
+        .with_mock(mock)
         .with_tls(interception),
     );
     // The listeners stop accepting and the relays wind down on the signal.

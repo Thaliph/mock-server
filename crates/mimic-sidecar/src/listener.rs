@@ -20,6 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::connection;
+use crate::mock::Mock;
 use crate::red::{DEFAULT_MAX_AUTHORITIES, ProxyMetrics};
 use crate::tls::intercept::Interception;
 
@@ -128,6 +129,7 @@ pub struct Shared {
     proxy: ProxyMetrics,
     tls: Interception,
     discovery: Option<crate::discovery::Tap>,
+    mock: Option<Mock>,
     original_dst: OriginalDst,
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
@@ -178,6 +180,7 @@ impl Shared {
             proxy: ProxyMetrics::default(),
             tls: Interception::default(),
             discovery: None,
+            mock: None,
             original_dst,
             stop: watch::channel(false).0,
             abort: watch::channel(false).0,
@@ -274,6 +277,16 @@ impl Shared {
 
     pub(crate) fn discovery(&self) -> Option<&crate::discovery::Tap> {
         self.discovery.as_ref()
+    }
+
+    /// Answers outbound HTTP/1 from the egress snapshot while the mode is `mock` (spec §8).
+    pub fn with_mock(mut self, mock: Mock) -> Shared {
+        self.mock = Some(mock);
+        self
+    }
+
+    pub(crate) fn mock(&self) -> Option<&Mock> {
+        self.mock.as_ref()
     }
 
     /// Intercepts outbound TLS as `tls` says instead of passing it all through.
