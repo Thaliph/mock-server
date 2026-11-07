@@ -52,8 +52,8 @@ to ignore those fields.
 ## No data
 
 **`GET /v1/workloads/<ns>/<dep>` returns `404`.** The controller holds nothing for that deployment.
-1. Is the pod injected and the traffic **inbound**? Only inbound exchanges are recorded; egress is not
-   yet.
+1. Is the pod injected? Inbound and outbound exchanges are recorded (see
+   [Egress aggregation](Egress-aggregation) for the outbound part).
 2. Did the app receive requests that got a response? `404`/`405` on unknown paths are not recorded; HTTPS
    inbound is not decrypted; probes are not recorded.
 3. A sidecar pushes only when it recorded exchanges, every 30 s after a random initial delay: wait a

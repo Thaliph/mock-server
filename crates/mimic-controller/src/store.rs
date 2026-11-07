@@ -318,6 +318,8 @@ impl StoreMetrics {
 struct Pending {
     push: Push,
     reply: oneshot::Sender<Result<Outcome, StoreError>>,
+    /// Released with the push, when its write ends or the push is dropped.
+    _hold: Box<dyn Send>,
 }
 
 enum Attempt {
@@ -492,12 +494,27 @@ impl Store {
     }
 
     /// Merges the push into the deployment's report. Answered after the write that holds it.
+    #[cfg(test)]
     pub async fn push(
         self: &Arc<Self>,
         namespace: &str,
         deployment: &str,
         push: Push,
     ) -> Result<Outcome, StoreError> {
+        self.push_holding(namespace, deployment, push, ()).await
+    }
+
+    /// As `push`, and `hold` lives until the write that applies the push ends, even if the
+    /// caller is dropped first: the write runs in a task of the store, so what bounds its
+    /// memory (the body budget) must not end with the caller.
+    pub async fn push_holding(
+        self: &Arc<Self>,
+        namespace: &str,
+        deployment: &str,
+        push: Push,
+        hold: impl Send + 'static,
+    ) -> Result<Outcome, StoreError> {
+        let hold: Box<dyn Send> = Box::new(hold);
         let keys = keys(namespace, deployment).map_err(|_| StoreError::Name)?;
         check_name(&push.pod).map_err(|_| StoreError::Name)?;
         let (reply, answer) = oneshot::channel();
@@ -506,11 +523,22 @@ impl Store {
             let mut queues = lock(&self.queues);
             match queues.get_mut(&key) {
                 Some(queue) => {
-                    queue.push(Pending { push, reply });
+                    queue.push(Pending {
+                        push,
+                        reply,
+                        _hold: hold,
+                    });
                     false
                 }
                 None => {
-                    queues.insert(key.clone(), vec![Pending { push, reply }]);
+                    queues.insert(
+                        key.clone(),
+                        vec![Pending {
+                            push,
+                            reply,
+                            _hold: hold,
+                        }],
+                    );
                     true
                 }
             }
@@ -531,6 +559,19 @@ impl Store {
             });
         }
         answer.await.unwrap_or(Err(StoreError::Unavailable))
+    }
+
+    /// Test hook: holds every writer slot, so that no write starts until the guard drops.
+    #[cfg(test)]
+    pub(crate) async fn hold_writers(&self) -> tokio::sync::SemaphorePermit<'_> {
+        let slots = u32::try_from(MAX_WRITERS).expect("a small count");
+        self.writers.acquire_many(slots).await.expect("open")
+    }
+
+    /// Test hook: the pushes waiting for a write.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        lock(&self.queues).values().map(Vec::len).sum()
     }
 
     /// The deployment's writer: one write per batch of queued pushes until none is left.
