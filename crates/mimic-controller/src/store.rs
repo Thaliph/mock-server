@@ -36,15 +36,33 @@ const DAY_SECS: u64 = 86_400;
 /// Lifetime of the `:pods` and `:seq` fields, at most.
 const FIELD_TTL_MS: u64 = DAY_SECS * 1000;
 
+/// A staged write that never reached its script (a crash, a lost connection) is gone after this.
+const STAGE_TTL_MS: u64 = 60_000;
+/// The bytes of a staged key sent per command: what redis-rs copies at once.
+const STAGE_CHUNK: usize = 1 << 20;
+
+/// The report and the outbound part are staged under temporary keys, `SET` then `APPEND`ed in
+/// chunks so that the command never holds a copy of a whole part (#339); this script checks their
+/// lengths and `RENAME`s them into place with the version check, in one atomic step: a reader
+/// sees the old value or the new one, never a part of it. Every refusal deletes them.
 const WRITE: &str = r"
-local current = redis.call('HGET', KEYS[2], 'version')
-if (current or '0') ~= ARGV[1] then return 0 end
+local function refuse(code)
+  redis.call('DEL', KEYS[8], KEYS[9])
+  return code
+end
 local n_pods = tonumber(ARGV[14])
 local seq_at = 15 + n_pods
 local n_seq = tonumber(ARGV[seq_at])
+local out_at = seq_at + 1 + n_seq * 3
+local current = redis.call('HGET', KEYS[2], 'version')
+if (current or '0') ~= ARGV[1] then return refuse(0) end
 for i = 0, n_seq - 1 do
   local at = seq_at + 1 + i * 3
-  if (redis.call('HGET', KEYS[4], ARGV[at]) or '') ~= ARGV[at + 1] then return 0 end
+  if (redis.call('HGET', KEYS[4], ARGV[at]) or '') ~= ARGV[at + 1] then return refuse(0) end
+end
+if redis.call('STRLEN', KEYS[8]) ~= tonumber(ARGV[8]) then return refuse(0) end
+if ARGV[out_at] ~= '' and redis.call('STRLEN', KEYS[9]) ~= tonumber(ARGV[out_at]) then
+  return refuse(0)
 end
 local ttl = tonumber(ARGV[2])
 local field_ttl = tonumber(ARGV[3])
@@ -54,12 +72,13 @@ redis.call('ZREMRANGEBYSCORE', KEYS[5], '-inf', floor)
 redis.call('ZREMRANGEBYSCORE', KEYS[6], '-inf', floor)
 if not redis.call('ZSCORE', KEYS[5], ARGV[7])
    and redis.call('ZCARD', KEYS[5]) >= tonumber(ARGV[5]) then
-  return -1
+  return refuse(-1)
 end
-redis.call('SET', KEYS[1], ARGV[8], 'PX', ttl)
-local out_at = seq_at + 1 + n_seq * 3
+redis.call('RENAME', KEYS[8], KEYS[1])
+redis.call('PEXPIRE', KEYS[1], ttl)
 if ARGV[out_at] ~= '' then
-  redis.call('SET', KEYS[7], ARGV[out_at], 'PX', ttl)
+  redis.call('RENAME', KEYS[9], KEYS[7])
+  redis.call('PEXPIRE', KEYS[7], ttl)
 else
   redis.call('DEL', KEYS[7])
 end
@@ -116,6 +135,14 @@ pub struct Keys {
     pub seq: String,
     pub ns_index: String,
     pub workloads: String,
+}
+
+impl Keys {
+    /// A temporary key of one write attempt (same hash tag as the other keys of the deployment).
+    fn staged(&self, id: u64, part: &str) -> String {
+        let base = self.meta.strip_suffix(":meta").unwrap_or(&self.meta);
+        format!("{base}:stage:{id:016x}:{part}")
+    }
 }
 
 /// The keys of `<namespace>/<deployment>`, once both names are checked.
@@ -1210,6 +1237,17 @@ impl Store {
         };
         drop(outbound);
         let stored_bytes = json.len() + outbound_json.len();
+        let stage = rand::random::<u64>();
+        let (staged, staged_outbound) =
+            (keys.staged(stage, "report"), keys.staged(stage, "outbound"));
+        let sent = async {
+            self.stage(&mut conn, &staged, json.as_bytes()).await?;
+            self.stage(&mut conn, &staged_outbound, outbound_json.as_bytes())
+                .await
+        };
+        if let Err(e) = sent.await {
+            return Err(self.failed(e).await);
+        }
 
         let mut script = self.script.prepare_invoke();
         script
@@ -1220,6 +1258,8 @@ impl Store {
             .key(&keys.ns_index)
             .key(&keys.workloads)
             .key(&keys.outbound)
+            .key(&staged)
+            .key(&staged_outbound)
             .arg(version)
             .arg(ttl_ms)
             .arg(field_ttl)
@@ -1227,7 +1267,7 @@ impl Store {
             .arg(self.config.max_deployments)
             .arg(namespace)
             .arg(deployment)
-            .arg(&json)
+            .arg(json.len())
             .arg(exchanges)
             .arg(inbound_endpoints)
             .arg(outbound_endpoints)
@@ -1250,10 +1290,13 @@ impl Store {
                     after.map_or_else(String::new, u64::to_string)
                 });
         }
-        script.arg(&outbound_json);
+        script.arg(if outbound_json.is_empty() {
+            String::new()
+        } else {
+            outbound_json.len().to_string()
+        });
         // The digest of §7.7: the script prefixes it with the version it writes.
         script.arg(sha256_hex(outbound_json.as_bytes()));
-        // The arguments are copies: the strings need not outlive the call.
         drop((json, outbound_json));
         let result: i64 = match script.invoke_async(&mut conn).await {
             Ok(result) => result,
@@ -1317,6 +1360,36 @@ impl Store {
                 .inc_by(*n);
         }
         Ok(Attempt::Done(outcomes))
+    }
+
+    /// Stores `bytes` under the temporary `key`, a chunk per command, for [`STAGE_TTL_MS`].
+    async fn stage(
+        &self,
+        conn: &mut MultiplexedConnection,
+        key: &str,
+        bytes: &[u8],
+    ) -> redis::RedisResult<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        for (i, chunk) in bytes.chunks(STAGE_CHUNK).enumerate() {
+            if i == 0 {
+                redis::cmd("SET")
+                    .arg(key)
+                    .arg(chunk)
+                    .arg("PX")
+                    .arg(STAGE_TTL_MS)
+                    .query_async::<()>(conn)
+                    .await?;
+            } else {
+                redis::cmd("APPEND")
+                    .arg(key)
+                    .arg(chunk)
+                    .query_async::<()>(conn)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     fn count_pushes(&self, outcomes: &[Outcome]) {

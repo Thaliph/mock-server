@@ -303,6 +303,88 @@ async fn ctl_09_conflict_retries_the_queued_json_on_the_new_report() {
     let mut c = conn(None).await;
     let stored: String = cmd(&mut c, &["GET", &k.report]).await;
     assert_eq!(stored, expected.to_json().expect("json"));
+    assert!(
+        staged(&mut c, &k).await.is_empty(),
+        "a conflicting attempt left its staged keys"
+    );
+}
+
+async fn staged(c: &mut redis::aio::MultiplexedConnection, k: &Keys) -> Vec<String> {
+    let base = k.meta.strip_suffix(":meta").expect("a meta key");
+    cmd(c, &["KEYS", &format!("{base}:stage:*")]).await
+}
+
+/// #339: a part is written to temporary keys in chunks and renamed by the script. A crash between
+/// two chunks leaves only a temporary key (never read, it expires); a write whose staged value is
+/// not whole is refused by the script and leaves `:report` as it was.
+#[tokio::test]
+async fn ctl_09_torn_staged_write_is_refused_and_never_visible() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09t"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let got = store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Ok(Outcome::Applied));
+    let mut c = conn(None).await;
+    let before: String = cmd(&mut c, &["GET", &k.report]).await;
+    let (tmp, tmp_out) = (k.staged(1, "report"), k.staged(1, "outbound"));
+    // A crash after the first chunk of a part: 10 of the 100 bytes the script is told about.
+    let _: () = cmd(&mut c, &["SET", &tmp, "0123456789", "PX", "60000"]).await;
+    let _: () = cmd(&mut c, &["SET", &tmp_out, "{}", "PX", "60000"]).await;
+    let version: String = cmd(&mut c, &["HGET", &k.meta, "version"]).await;
+    let refused: i64 = store
+        .script
+        .prepare_invoke()
+        .key(&k.report)
+        .key(&k.meta)
+        .key(&k.pods)
+        .key(&k.seq)
+        .key(&k.ns_index)
+        .key(&k.workloads)
+        .key(&k.outbound)
+        .key(&tmp)
+        .key(&tmp_out)
+        .arg(&version)
+        .arg(3_600_000)
+        .arg(1000)
+        .arg(now_ms())
+        .arg(50)
+        .arg(&ns)
+        .arg(dep)
+        .arg(100)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg("")
+        .arg("digest")
+        .invoke_async(&mut c)
+        .await
+        .expect("the script runs");
+    assert_eq!(refused, 0);
+    let after: String = cmd(&mut c, &["GET", &k.report]).await;
+    assert_eq!(after, before);
+    assert!(staged(&mut c, &k).await.is_empty(), "the staged keys stay");
+}
+
+/// A part of several chunks is staged whole, with the TTL of the stage; the write keeps its own.
+#[tokio::test]
+async fn ctl_09_chunked_stage_stores_every_byte() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let k = keys(&unique("ctl09c"), "front").expect("keys");
+    let bytes: Vec<u8> = (0..3 * STAGE_CHUNK + 7).map(|i| (i % 251) as u8).collect();
+    let tmp = k.staged(2, "report");
+    let mut c = conn(None).await;
+    store.stage(&mut c, &tmp, &bytes).await.expect("staged");
+    let stored: Vec<u8> = cmd(&mut c, &["GET", &tmp]).await;
+    assert!(stored == bytes, "{} bytes of {}", stored.len(), bytes.len());
+    let ttl: i64 = cmd(&mut c, &["PTTL", &tmp]).await;
+    assert!((1..=STAGE_TTL_MS as i64).contains(&ttl), "{ttl}");
+    let _: () = cmd(&mut c, &["DEL", &tmp]).await;
 }
 
 #[tokio::test]
