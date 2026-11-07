@@ -319,6 +319,9 @@ pub fn patch(
     if !tls.mock_passthrough.is_empty() {
         sidecar_env.push(json!({"name": "MIMIC_MOCK_PASSTHROUGH", "value": literal(&tls.mock_passthrough.join(","))}));
     }
+    // Bounds the glibc allocator of the sidecar (spec §7.1, MCK-18).
+    sidecar_env.push(json!({"name": "MALLOC_ARENA_MAX", "value": "2"}));
+    sidecar_env.push(json!({"name": "MALLOC_MMAP_THRESHOLD_", "value": "131072"}));
     if !tls.redact.is_empty() {
         sidecar_env.push(json!({"name": "MIMIC_DISCOVERY_REDACT_NAMES", "value": literal(&tls.redact.join(","))}));
     }
@@ -1480,6 +1483,14 @@ mod tests {
             env["MIMIC_TLS_EXCLUDE"]["value"],
             "*.corp.example,api.example.com"
         );
+    }
+
+    #[test]
+    fn mck_18_the_sidecar_gets_the_allocator_settings() {
+        let doc = apply_with(&pod(), &wiring());
+        let env = env_of(&doc["spec"]["initContainers"][1]);
+        assert_eq!(env["MALLOC_ARENA_MAX"]["value"], "2");
+        assert_eq!(env["MALLOC_MMAP_THRESHOLD_"]["value"], "131072");
     }
 
     #[test]
