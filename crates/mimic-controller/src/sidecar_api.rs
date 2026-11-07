@@ -41,6 +41,7 @@ mod admission;
 mod egress;
 
 pub use admission::{BodyBudget, RateLimiter, ReviewCache};
+pub use egress::Cache as EgressCache;
 pub use egress::Logged as EgressLogged;
 
 /// Audience of the projected token (spec §7.1).
@@ -300,9 +301,8 @@ pub struct SidecarApi {
     pub max_push_endpoints: usize,
     /// `MIMIC_SIDECAR_API_MAX_EGRESS`.
     pub max_egress: usize,
-    /// `MIMIC_SIDECAR_API_EGRESS_BUDGET`: what the egress cache will hold (F9 step 4).
-    #[allow(dead_code)] // read by the egress cache (F9 step 4)
-    pub egress_budget: u64,
+    /// Projections served, built once and held within `MIMIC_SIDECAR_API_EGRESS_BUDGET`.
+    pub egress: egress::Cache,
     /// What `egress_limit` warnings were written already.
     pub egress_logged: egress::Logged,
 }
@@ -948,12 +948,13 @@ mod tests {
     fn setup_limited(seed: Arc<SeedSlot>, limiter: ReviewLimiter) -> Setup {
         let (client, reviews) = api_server();
         let mut metrics = Metrics::new("controller", "test");
+        let api_metrics = ApiMetrics::register(metrics.registry_mut());
         let api = Arc::new(SidecarApi {
             seed: seed.clone(),
             reviewer: Arc::new(KubeReviewer::new(Arc::new(OnceCell::new_with(Some(
                 client,
             ))))),
-            metrics: ApiMetrics::register(metrics.registry_mut()),
+            metrics: api_metrics.clone(),
             limiter,
             rate: RateLimiter::new(10_000),
             reviews: ReviewCache::default(),
@@ -977,7 +978,7 @@ mod tests {
             max_report: 1 << 20,
             max_push_endpoints: 256,
             max_egress: 4 << 20,
-            egress_budget: 32 << 20,
+            egress: egress::Cache::new(32 << 20, &api_metrics),
             egress_logged: egress::Logged::default(),
         });
         Setup {

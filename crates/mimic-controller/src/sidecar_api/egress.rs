@@ -40,6 +40,37 @@ impl Logged {
     }
 }
 
+/// Projections held within the egress budget (spec §7.7).
+#[allow(dead_code)] // red commit: the cache is wired in the next one
+pub struct Cache {
+    budget: u64,
+    /// Tests: the blocking part of a build waits while this is set.
+    #[cfg(test)]
+    pub pause: std::sync::atomic::AtomicBool,
+}
+
+impl Cache {
+    pub fn new(budget: u64, _metrics: &ApiMetrics) -> Cache {
+        Cache {
+            budget,
+            #[cfg(test)]
+            pause: Default::default(),
+        }
+    }
+
+    /// Tests: builds in their blocking part now.
+    #[cfg(test)]
+    pub fn running(&self) -> usize {
+        0
+    }
+
+    /// Tests: the most builds that were in their blocking part at once.
+    #[cfg(test)]
+    pub fn peak(&self) -> usize {
+        0
+    }
+}
+
 /// What a pull is answered with.
 enum Answered {
     /// `304`: the caller holds this `ETag`.

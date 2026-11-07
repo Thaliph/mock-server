@@ -21,9 +21,13 @@ const CHILD: &str = "MIMIC_SHR_18_CHILD";
 /// failure (SHR-23: both pushes are read at once) instead of a re-post (SHR-18).
 const BUDGET: &str = "MIMIC_SHR_BUDGET";
 const NO_503: &str = "MIMIC_SHR_NO_503";
+/// PUL-12: also 32 pulls of each deployment during the pushes and again after them.
+const PULLS: &str = "MIMIC_PUL_12";
 const MIB: u64 = 1 << 20;
 /// SHR-23: two concurrent writes, with a `64Mi` body budget.
 const CONCURRENT_LIMIT: u64 = 640 * MIB;
+/// PUL-12: the 640 MiB of SHR-18 plus the 32 MiB egress budget.
+const EGRESS_LIMIT: u64 = 672 * MIB;
 /// SHR-23: the defaults at most 70% of B (509 MiB, measured before #339), 356 MiB.
 const DEFAULTS_LIMIT: u64 = 356 * MIB;
 /// Keys of the JSON bodies of the exchanges: schemas near their caps, pushes of about 28 MB.
@@ -165,10 +169,49 @@ async fn get(router: &Router, path: &str) -> (u16, usize) {
     (status, bytes.len())
 }
 
-async fn work(dir: &str, budget: u64, concurrent: bool) {
+/// One pull of the egress route: its status and size; the body is dropped as it is counted.
+async fn pull_size(s: &Setup, deployment: &str) -> (u16, usize) {
+    let mut request = Request::builder()
+        .uri(format!("/v1/workloads/{deployment}/egress?format=1"))
+        .header(
+            "authorization",
+            format!("Bearer {}", token(&s.ns, deployment, "t")),
+        )
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(Peer(PEER.parse().unwrap()));
+    let response = s.router.clone().oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, bytes.len())
+}
+
+/// 32 concurrent pulls of each deployment.
+fn pulls(s: &Arc<Setup>) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
+    for deployment in DEPLOYMENTS {
+        for _ in 0..32 {
+            let s = s.clone();
+            tasks.push(tokio::spawn(async move {
+                let (status, _) = pull_size(&s, deployment).await;
+                assert!(
+                    [200, 503, 507].contains(&status),
+                    "a pull of {deployment} got {status}"
+                );
+            }));
+        }
+    }
+    tasks
+}
+
+async fn work(dir: &str, budget: u64, concurrent: bool, pulled: bool) {
     let mut s = setup(options(budget));
     s.ns = std::fs::read_to_string(format!("{dir}/ns")).expect("the namespace");
     let s = Arc::new(s);
+    let mut reads = Vec::new();
+    if pulled {
+        reads.extend(pulls(&s));
+    }
     let mut pushes = Vec::new();
     for deployment in DEPLOYMENTS {
         let s = s.clone();
@@ -195,17 +238,24 @@ async fn work(dir: &str, budget: u64, concurrent: bool) {
     for push in pushes {
         assert_eq!(push.await.expect("the push ran"), 200);
     }
+    if pulled {
+        // The pushes changed the digests: pulls at new digests again.
+        reads.extend(pulls(&s));
+    }
+    for read in reads {
+        read.await.expect("the pull ran");
+    }
     // A document of each kind per deployment, rendered at once.
     let ui = ui_router(s.api.store.clone(), UiMetrics::default());
-    let mut reads = Vec::new();
+    let mut renders = Vec::new();
     for deployment in DEPLOYMENTS {
         for id in ["inbound-8000", "outbound-a0.example.com%3A443"] {
             let ui = ui.clone();
             let path = format!("/v1/workloads/{}/{deployment}/openapi/{id}", s.ns);
-            reads.push(tokio::spawn(async move { get(&ui, &path).await }));
+            renders.push(tokio::spawn(async move { get(&ui, &path).await }));
         }
     }
-    for read in reads {
+    for read in renders {
         let (status, length) = read.await.expect("the render ran");
         assert_eq!(status, 200);
         assert!(length > 1000);
@@ -222,13 +272,14 @@ async fn shr_18_child_work() {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| defaults().body_budget);
         let concurrent = std::env::var_os(NO_503).is_some();
-        work(dir.to_str().expect("a UTF-8 path"), budget, concurrent).await;
+        let pulled = std::env::var_os(PULLS).is_some();
+        work(dir.to_str().expect("a UTF-8 path"), budget, concurrent, pulled).await;
     }
 }
 
 /// Fills both deployments to the store limits, then runs the measured pushes in a child process;
 /// the peak RSS of the child, in bytes.
-async fn measure(budget: Option<u64>) -> u64 {
+async fn measure(budget: Option<u64>, pulled: bool) -> u64 {
     // Everything but the measured work happens here: the bodies are built, and both
     // deployments are first filled to the store limits (a first push each), so that the
     // measured pushes merge into full stored reports.
@@ -262,6 +313,9 @@ async fn measure(budget: Option<u64>) -> u64 {
     if let Some(budget) = budget {
         command.env(BUDGET, budget.to_string()).env(NO_503, "1");
     }
+    if pulled {
+        command.env(PULLS, "1");
+    }
     let output = command.output().expect("the child runs");
     std::fs::remove_dir_all(&dir).expect("the scratch directory goes");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -281,7 +335,7 @@ async fn measure(budget: Option<u64>) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shr_18_two_max_size_pushes_onto_full_reports_stay_under_640_mib() {
-    let peak = measure(None).await;
+    let peak = measure(None, false).await;
     assert!(peak < 640 * MIB, "peak RSS {} MiB", peak / MIB);
     // SHR-23: at most 70% of B.
     assert!(
@@ -294,11 +348,22 @@ async fn shr_18_two_max_size_pushes_onto_full_reports_stay_under_640_mib() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shr_23_two_concurrent_writes_stay_under_640_mib() {
-    let peak = measure(Some(64 * MIB)).await;
+    let peak = measure(Some(64 * MIB), false).await;
     assert!(
         peak < CONCURRENT_LIMIT,
         "peak RSS {} MiB over {} MiB",
         peak / MIB,
         CONCURRENT_LIMIT / MIB
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pul_12_pushes_and_32_pulls_per_deployment_stay_under_672_mib() {
+    let peak = measure(None, true).await;
+    assert!(
+        peak < EGRESS_LIMIT,
+        "peak RSS {} MiB over {} MiB",
+        peak / MIB,
+        EGRESS_LIMIT / MIB
     );
 }
