@@ -1002,5 +1002,6 @@ async fn ctl_12_one_line_per_push_and_the_expected_metrics() {
     }
 }
 
+mod disconnect;
 mod memory;
 mod v2;
