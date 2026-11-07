@@ -150,6 +150,13 @@ async fn fake_api(behaviour: Arc<Mutex<Behaviour>>) -> FakeApi {
                             .unwrap_or_default()
                             .to_string();
                         let path = req.uri().path().to_string();
+                        // The egress pull of the sidecar (spec §7.7) is not an intermediate request.
+                        if path.starts_with("/v1/workloads/") {
+                            return Ok(Response::builder()
+                                .status(404)
+                                .body(Full::new(Bytes::new()).boxed())
+                                .unwrap());
+                        }
                         let bytes = req.into_body().collect().await.unwrap().to_bytes();
                         let body = serde_json::from_slice(&bytes).unwrap_or_default();
                         let current = behaviour.lock().unwrap().clone();

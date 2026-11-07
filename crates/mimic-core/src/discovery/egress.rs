@@ -12,6 +12,8 @@ use super::report::{Direction, MAX_PATH, MAX_SEGMENTS, Report};
 use super::sample::{MAX_SAMPLES, Sample};
 use super::scope::ScopeKey;
 use super::template::split_path;
+use crate::Mode;
+use crate::mock::factor_number;
 
 /// The only format there is.
 pub const FORMAT: u32 = 1;
@@ -242,16 +244,22 @@ struct ViewAuthority<'a> {
 struct View<'a> {
     authorities: SortedMap<&'a str, ViewAuthority<'a>>,
     etag: Option<&'a str>,
+    latency_factor: serde_json::Number,
+    mode: &'static str,
     pulled: Option<&'a str>,
 }
 
 /// The local view of a snapshot (`(set, etag, pulled)`), or of none: what the pod could mock,
-/// with no sample and no field name. Sorted keys, so equal input gives equal bytes.
-pub fn summary(snapshot: Option<(&EgressSet, &str, &str)>) -> String {
+/// with no sample and no field name, and the mode and latency factor (hundredths) in force.
+/// Sorted keys, so equal input gives equal bytes.
+pub fn summary(snapshot: Option<(&EgressSet, &str, &str)>, mode: Mode, factor: u32) -> String {
+    let latency_factor = factor_number(factor);
     let view = match snapshot {
         None => View {
             authorities: SortedMap::new(),
             etag: None,
+            latency_factor,
+            mode: mode.as_str(),
             pulled: None,
         },
         Some((set, etag, pulled)) => View {
@@ -274,6 +282,8 @@ pub fn summary(snapshot: Option<(&EgressSet, &str, &str)>) -> String {
                 })
                 .collect(),
             etag: Some(etag),
+            latency_factor,
+            mode: mode.as_str(),
             pulled: Some(pulled),
         },
     };

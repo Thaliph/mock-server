@@ -865,7 +865,8 @@ fn pul_17_gi_is_a_size_unit_and_1gi_is_the_maximum() {
 }
 
 const CANARY_BODY: &str = "canary-sample-7b3e1f";
-const EMPTY_VIEW: &str = r#"{"authorities":{},"etag":null,"pulled":null}"#;
+const EMPTY_VIEW: &str =
+    r#"{"authorities":{},"etag":null,"latency_factor":1,"mode":"discovery","pulled":null}"#;
 
 /// A set whose samples hold `CANARY_BODY`.
 fn canary_set() -> String {
