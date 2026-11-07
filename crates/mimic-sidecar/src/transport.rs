@@ -108,6 +108,9 @@ impl AsyncWrite for Socket {
 pub enum Stream {
     Plain(Socket),
     Tls(Box<TlsStream<Socket>>),
+    /// A stream that reads `prefix` before anything from `inner` (the bytes protocol
+    /// detection consumed from a decrypted stream).
+    Replay(Vec<u8>, Box<Stream>),
 }
 
 impl Stream {
@@ -124,11 +127,17 @@ impl Stream {
         Self::Tls(Box::new(tls))
     }
 
+    /// `self`, reading `prefix` first.
+    pub fn with_prefix(self, prefix: Vec<u8>) -> Self {
+        Self::Replay(prefix, Box::new(self))
+    }
+
     /// The TCP socket under the stream.
     pub fn socket(&self) -> Socket {
         match self {
             Self::Plain(socket) => socket.clone(),
             Self::Tls(tls) => tls.get_ref().0.clone(),
+            Self::Replay(_, inner) => inner.socket(),
         }
     }
 }
@@ -146,6 +155,15 @@ impl AsyncRead for Stream {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Poll::Ready(Ok(())),
                 r => Poll::Ready(r),
             },
+            Self::Replay(prefix, inner) => {
+                if prefix.is_empty() {
+                    return Pin::new(&mut **inner).poll_read(cx, buf);
+                }
+                let n = prefix.len().min(buf.remaining());
+                buf.put_slice(&prefix[..n]);
+                prefix.drain(..n);
+                Poll::Ready(Ok(()))
+            }
         }
     }
 }
@@ -159,6 +177,7 @@ impl AsyncWrite for Stream {
         match &mut *self {
             Self::Plain(socket) => Pin::new(socket).poll_write(cx, buf),
             Self::Tls(tls) => Pin::new(tls).poll_write(cx, buf),
+            Self::Replay(_, inner) => Pin::new(&mut **inner).poll_write(cx, buf),
         }
     }
 
@@ -166,6 +185,7 @@ impl AsyncWrite for Stream {
         match &mut *self {
             Self::Plain(socket) => Pin::new(socket).poll_flush(cx),
             Self::Tls(tls) => Pin::new(tls).poll_flush(cx),
+            Self::Replay(_, inner) => Pin::new(&mut **inner).poll_flush(cx),
         }
     }
 
@@ -174,6 +194,7 @@ impl AsyncWrite for Stream {
         match &mut *self {
             Self::Plain(socket) => Pin::new(socket).poll_shutdown(cx),
             Self::Tls(tls) => Pin::new(tls).poll_shutdown(cx),
+            Self::Replay(_, inner) => Pin::new(&mut **inner).poll_shutdown(cx),
         }
     }
 }

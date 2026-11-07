@@ -20,6 +20,7 @@ use crate::exchange::{Ctx, Http1Tracker};
 use crate::h2;
 use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
+use crate::mock::Mock;
 use crate::opaque::{self, Early, Side};
 use crate::tls::intercept::{AcceptError, ConnectError, Plan};
 use crate::transport::Stream;
@@ -119,6 +120,23 @@ pub(crate) async fn handle(
                 }
                 return;
             }
+            MockFirst::Tls(sni, buf) => {
+                shared.metrics().count(direction, Outcome::Ok);
+                if let Err(e) = configure_socket(&client) {
+                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
+                }
+                let conn = Conn {
+                    shared: &shared,
+                    direction,
+                    dst,
+                    started,
+                    tls: false,
+                    sni: sni.map(|name| normalise_authority(&name, TLS_PORT)),
+                    interception: None,
+                };
+                mock_tls(conn, &mock, client, buf, abort.as_mut()).await;
+                return;
+            }
             MockFirst::Other(buf) => read = buf,
             MockFirst::Gone => return,
         }
@@ -216,6 +234,8 @@ enum MockFirst {
     /// An HTTP/1.x request line or the HTTP/2 preface (`true`), the bytes read, and when the
     /// first one arrived.
     Http(bool, Vec<u8>, Instant),
+    /// A TLS ClientHello, with its SNI and the bytes read: answered by the mock (spec §5).
+    Tls(Option<String>, Vec<u8>),
     /// Anything else: the bytes read so far (possibly none), to detect again once connected.
     Other(Vec<u8>),
     /// The client closed, failed or was told to stop: nothing is dialled.
@@ -251,6 +271,7 @@ async fn mock_first(
                             let h2 = detection == Detection::H2;
                             return MockFirst::Http(h2, buf, first.unwrap_or_else(Instant::now));
                         }
+                        Detection::Tls { sni } => return MockFirst::Tls(sni, buf),
                         _ => return MockFirst::Other(buf),
                     }
                 }
@@ -474,6 +495,103 @@ async fn intercept(
         Decrypted::Upstream(buf, to_client, early) => Served::Tunnel("tcp", buf, to_client, early),
     };
     conn.serve(served, client, upstream, abort).await;
+}
+
+/// An outbound TLS connection in mock mode (spec §5 "Mock mode"): the leaf for the SNI is
+/// issued without any handshake with the destination, and a decrypted HTTP stream is a mocked
+/// connection. Whatever the mock cannot answer is closed, with no byte to the destination.
+async fn mock_tls(
+    mut conn: Conn<'_>,
+    mock: &Mock,
+    client: TcpStream,
+    hello_bytes: Vec<u8>,
+    mut abort: Pin<&mut (impl Future<Output = ()> + Send)>,
+) {
+    let (direction, dst) = (conn.direction, conn.dst);
+    let shared = conn.shared;
+    let tls = shared.tls();
+    let hello = match parse_client_hello(&hello_bytes) {
+        Parsed::Hello(hello) => hello,
+        _ => ClientHello::default(),
+    };
+    let hello_len = hello_bytes.len() as u64;
+    let plan = match tls.decide(&hello, dst) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            tls.count(reason.as_str());
+            conn.interception = Some(reason.as_str());
+            conn.mock_closed(mock, "tls", hello_len);
+            return;
+        }
+    };
+    let server = match tls
+        .accept(client, hello_bytes, &plan, plan.mock_alpn())
+        .await
+    {
+        Ok(server) => server,
+        Err(AcceptError::Rejected) => {
+            // The client does not trust the leaf: as in discovery, the next connection to this
+            // destination is not intercepted.
+            tracing::debug!(direction = direction.as_str(), %dst, "client rejected the certificate");
+            tls.passthrough(&plan, Reason::ClientRejected, dst);
+            conn.interception = Some(Reason::ClientRejected.as_str());
+            conn.mock_closed(mock, "tls", hello_len);
+            return;
+        }
+        Err(AcceptError::Failed(e)) => {
+            tracing::debug!(direction = direction.as_str(), %dst, error = %e, "handshake with the client failed");
+            return;
+        }
+    };
+    tls.count("intercepted");
+    conn.tls = true;
+    let mut stream = Stream::tls(server.into());
+    let first = Instant::now();
+    let stall = shared.detect_stall();
+    let detected = decrypted_first_bytes(&mut stream, None, stall, abort.as_mut()).await;
+    let (h2, buf) = match detected {
+        Decrypted::Found(Detection::H2, buf) => (true, buf),
+        Decrypted::Found(Detection::Http1, buf) => (false, buf),
+        Decrypted::Found(_, buf) | Decrypted::Closed(buf, _) | Decrypted::Upstream(buf, _, _) => {
+            conn.mock_closed(mock, "tcp", buf.len() as u64);
+            return;
+        }
+    };
+    mock.connection("mocked");
+    let protocol = if h2 { "h2" } else { "http1" };
+    shared
+        .proxy()
+        .connection(direction, protocol, &conn.authority(false));
+    let stream = stream.with_prefix(buf);
+    if h2 {
+        mock.serve_h2(conn.ctx(), stream, shared.stopped(), abort.as_mut())
+            .await;
+    } else {
+        mock.serve_http1(conn.ctx(), stream, first, shared.stopped(), abort.as_mut())
+            .await;
+    }
+}
+
+impl Conn<'_> {
+    /// A connection the mock closes (spec §8): counted and written as a `connection` line with
+    /// `result: mock_closed`; nothing was sent to the destination.
+    fn mock_closed(&self, mock: &Mock, protocol: &'static str, bytes_in: u64) {
+        mock.connection("closed");
+        self.shared
+            .proxy()
+            .connection(self.direction, protocol, &self.authority(true));
+        access::connection(&access::Connection {
+            direction: self.direction,
+            protocol,
+            dst: self.dst,
+            sni: self.sni.clone(),
+            interception: self.interception,
+            outcome: access::Outcome::MockClosed,
+            duration: self.started.elapsed(),
+            bytes_in,
+            bytes_out: 0,
+        });
+    }
 }
 
 enum Decrypted {

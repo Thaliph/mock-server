@@ -180,7 +180,7 @@ async fn mck_13_h2_is_negotiated_and_the_mocked_answer_comes_with_a_leaf_for_the
     let access = rig.logs.access_exactly(1).await;
     assert_eq!(access[0]["protocol"], "h2");
     assert_eq!(access[0]["tls"], true);
-    assert_eq!(access[0]["mock"].as_str().is_some(), true);
+    assert!(access[0]["mock"].is_string());
 }
 
 #[tokio::test]

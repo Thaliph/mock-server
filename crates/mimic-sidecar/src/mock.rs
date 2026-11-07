@@ -9,7 +9,7 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -56,6 +56,8 @@ const READ_CAP: usize = 4 * 1024;
 const H2_STREAMS: u32 = 256;
 /// Signatures written to the log per mode period (spec §8 "Miss").
 const MISS_LOG_LIMIT: usize = 256;
+/// How long an idle `h2` connection may take to finish after its `GOAWAY`.
+const IDLE_GRACE: Duration = Duration::from_secs(1);
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 /// Largest mocked body of a request kept for matching: the capture limit of spec §6.
@@ -385,8 +387,35 @@ impl HyperService<Request<Incoming>> for Service {
     }
 }
 
+/// The streams of a mocked `h2` connection, for its idle timeout: how many are open, and how
+/// many have begun or ended.
+#[derive(Default)]
+struct Streams {
+    open: AtomicUsize,
+    events: AtomicU64,
+}
+
+/// An open stream, counted until the service future ends (answered or dropped).
+struct Open<'a>(&'a Streams);
+
+impl<'a> Open<'a> {
+    fn new(streams: &'a Streams) -> Open<'a> {
+        streams.open.fetch_add(1, Ordering::AcqRel);
+        streams.events.fetch_add(1, Ordering::AcqRel);
+        Open(streams)
+    }
+}
+
+impl Drop for Open<'_> {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::AcqRel);
+        self.0.events.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// One mocked connection.
 struct Conn {
+    streams: Streams,
     mock: Mock,
     ctx: Ctx,
     /// Notes the first byte of each request of an HTTP/1 connection; an `h2` stream starts
@@ -567,6 +596,7 @@ impl Mock {
             owed: AtomicBool::new(false),
         });
         let conn = Arc::new(Conn {
+            streams: Streams::default(),
             mock: self.clone(),
             ctx,
             clock: Some(clock.clone()),
@@ -619,29 +649,50 @@ impl Mock {
         mut abort: Pin<&mut (impl Future<Output = ()> + Send)>,
     ) {
         let conn = Arc::new(Conn {
+            streams: Streams::default(),
             mock: self.clone(),
             ctx,
             clock: None,
             protocol: PROTOCOL_H2,
         });
         let dst = conn.ctx.dst;
+        let idle = Duration::from_millis(self.0.stall_ms.load(Ordering::Relaxed));
         let served = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .timer(TokioTimer::new())
             .max_concurrent_streams(H2_STREAMS)
             .max_header_list_size(MAX_HEAD as u32)
-            .serve_connection(TokioIo::new(stream), Service(conn));
+            .serve_connection(TokioIo::new(stream), Service(conn.clone()));
         let mut served = std::pin::pin!(served);
-        let ended = tokio::select! {
-            r = served.as_mut() => Some(r),
-            () = stopped => {
-                // The streams open are answered, then the connection closes (`GOAWAY`).
-                served.as_mut().graceful_shutdown();
-                tokio::select! {
-                    r = served.as_mut() => Some(r),
-                    () = abort.as_mut() => None,
+        let mut stopped = std::pin::pin!(stopped);
+        // A connection with no stream open for `idle` gets `GOAWAY`, as the header-read
+        // timeout of an HTTP/1 mocked connection closes it (spec §8).
+        let mut seen = conn.streams.events.load(Ordering::Acquire);
+        let ended = loop {
+            tokio::select! {
+                r = served.as_mut() => break Some(r),
+                () = stopped.as_mut() => {
+                    // The streams open are answered, then the connection closes (`GOAWAY`).
+                    served.as_mut().graceful_shutdown();
+                    break tokio::select! {
+                        r = served.as_mut() => Some(r),
+                        () = abort.as_mut() => None,
+                    };
+                }
+                () = abort.as_mut() => break None,
+                () = tokio::time::sleep(idle) => {
+                    let events = conn.streams.events.load(Ordering::Acquire);
+                    if conn.streams.open.load(Ordering::Acquire) == 0 && events == seen {
+                        tracing::debug!(target: "mock", %dst, "mocked h2 connection idle");
+                        served.as_mut().graceful_shutdown();
+                        break tokio::select! {
+                            r = served.as_mut() => Some(r),
+                            () = tokio::time::sleep(IDLE_GRACE) => None,
+                            () = abort.as_mut() => None,
+                        };
+                    }
+                    seen = events;
                 }
             }
-            () = abort.as_mut() => None,
         };
         if let Some(Err(e)) = ended {
             tracing::debug!(target: "mock", %dst, error = %e, "mocked h2 connection ended");
@@ -681,6 +732,7 @@ impl Conn {
         self: &Arc<Conn>,
         request: Request<Incoming>,
     ) -> Result<Response<MockBody>, BoxError> {
+        let _open = Open::new(&self.streams);
         let started = self
             .clock
             .as_ref()
