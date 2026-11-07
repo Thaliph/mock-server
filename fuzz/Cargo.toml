@@ -35,3 +35,10 @@ path = "fuzz_targets/egress.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "mock"
+path = "fuzz_targets/mock.rs"
+test = false
+doc = false
+bench = false

@@ -5,7 +5,7 @@ name: ci
 #   chart ─────────────────────▲
 #   security (cargo deny, zizmor); supply chain (cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql)
 #   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; skipped unless a PR touches the codec)
-#           └─▶ fuzz-discovery (discovery recorder, spec DSC-23; same rule for its own paths)
+#           └─▶ fuzz-discovery (discovery recorder and mock, spec DSC-23, MCK-20; same rule for their own paths)
 # `ci-ok` sums them up; it is the only required check on main.
 #
 # Actions allowed in the repository settings (#273; Settings → Actions → General, or
@@ -338,7 +338,7 @@ jobs:
 
   # Path filters for the fuzz jobs: only a pull request that touches the HTTP/1 codec (its
   # module, `proxy.rs` that declares it, the Cargo files that pin its dependencies) or the
-  # discovery module, or the fuzz crate runs the matching job. Other events leave them false.
+  # discovery or mock module, or the fuzz crate runs the matching job. Other events leave them false.
   changes:
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -361,7 +361,7 @@ jobs:
             if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/proxy/http1 crates/mimic-core/src/proxy.rs Cargo.toml Cargo.lock fuzz)" ]; then
               codec=true
             fi
-            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/discovery fuzz)" ]; then
+            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/discovery crates/mimic-core/src/mock crates/mimic-core/src/mock.rs fuzz)" ]; then
               discovery=true
             fi
           fi
@@ -468,6 +468,14 @@ jobs:
           mkdir -p corpus/egress &&
           cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu egress
           corpus/egress seeds/egress --
+          -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10
+      # MCK-20: the mock (signature, lookup, tiers, answer), on the same schedule.
+      - name: Fuzz the mock
+        working-directory: fuzz
+        run: >
+          mkdir -p corpus/mock &&
+          cargo +nightly-2026-10-24 fuzz run --target x86_64-unknown-linux-gnu mock
+          corpus/mock seeds/mock --
           -max_total_time=$FUZZ_SECONDS -max_len=262144 -timeout=10
       # The corpus grows on the weekly run only; PR runs read it and never write it.
       - if: github.event_name == 'schedule'
