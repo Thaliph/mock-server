@@ -858,7 +858,9 @@ logic in `mimic-core` (`discovery` module).
   `sizeLimit: 16Mi`) and `mimic-token` (projected service account token of the pod's own
   service account, `audience: mimic.platform.io`, `expirationSeconds: 3600`, path `token`;
   the API server rejects that audience, so the token is only good for the sidecar API).
-  - `mimic-sidecar` mounts `mimic-trust` at `/mimic` (read-write) and `mimic-token` at
+  - `mimic-sidecar` mounts `mimic-trust` at `/mimic` (read-write; its own mount, in which it
+    owns `/mimic/state`, where it saves its mode, §8, while `mimic-trust-<n>` writes only
+    `trust/<n>` and the app containers only see a `trust/<n>` subpath, read-only) and `mimic-token` at
     `/var/run/secrets/mimic.platform.io` (read-only), and gets `MIMIC_TLS_CA` (the
     deployment's root certificate, PEM), `MIMIC_TLS_EXCLUDE` (§5), `MIMIC_CONTROLLER_URL`
     (`https://<webhook service>.<namespace>.svc:<sidecar API port>`) and `MIMIC_CONTROLLER_CA`

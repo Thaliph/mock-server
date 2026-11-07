@@ -134,6 +134,8 @@ pub struct Keys {
     pub outbound: String,
     pub meta: String,
     pub pods: String,
+    /// The mode each pod's last egress pull carried (F10).
+    pub pulls: String,
     pub seq: String,
     pub ns_index: String,
     pub workloads: String,
@@ -157,6 +159,7 @@ pub fn keys(namespace: &str, deployment: &str) -> Result<Keys, NameError> {
         outbound: format!("{base}:outbound"),
         meta: format!("{base}:meta"),
         pods: format!("{base}:pods"),
+        pulls: format!("{base}:pulls"),
         seq: format!("{base}:seq"),
         ns_index: format!("mimic:v1:ns:{namespace}"),
         workloads: "mimic:v1:workloads".to_string(),
@@ -1091,6 +1094,45 @@ impl Store {
         {
             Ok(bytes) => Ok(bytes),
             Err(e) => Err(self.read_failed(e).await),
+        }
+    }
+
+    /// Notes that `pod` pulled the egress set and was answered `mode` (spec §7.3 `:pulls`).
+    /// Best effort: a failure is counted and changes nothing for the caller.
+    pub async fn record_pull(&self, namespace: &str, deployment: &str, pod: &str, mode: &str) {
+        let Ok(k) = keys(namespace, deployment) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let ttl_ms = u64::try_from(self.config.ttl.as_millis()).unwrap_or(u64::MAX);
+        let Ok(mut conn) = self.connection().await else {
+            self.metrics.write("error");
+            return;
+        };
+        let written = redis::pipe()
+            .cmd("HSET")
+            .arg(&k.pulls)
+            .arg(pod)
+            .arg(format!("{mode} {now}"))
+            .ignore()
+            .cmd("HPEXPIRE")
+            .arg(&k.pulls)
+            .arg(ttl_ms.min(FIELD_TTL_MS))
+            .arg("FIELDS")
+            .arg(1)
+            .arg(pod)
+            .ignore()
+            .cmd("PEXPIRE")
+            .arg(&k.pulls)
+            .arg(ttl_ms)
+            .ignore()
+            .query_async::<()>(&mut conn)
+            .await;
+        if let Err(e) = written {
+            self.failed(e).await;
+            self.metrics.write("error");
         }
     }
 

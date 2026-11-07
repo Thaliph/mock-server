@@ -1,6 +1,6 @@
 //! F10 step 2: the mode on the egress route (spec §7.7) and `:pulls` (§7.3): MCK-08.
 
-use super::egress::{Pulled, pull, request};
+use super::egress::{Pulled, pull, push_report, request};
 use super::v2::{AUTHORITY, outbound_report};
 use super::*;
 use crate::workloads::MockSettings;
@@ -9,7 +9,9 @@ const SESSION: &str = "0123456789abcdef0123456789abcdef";
 
 /// Sets `spec.mode` and `spec.mock.latencyFactor` (hundredths) of a `MimicWorkload` naming `pay`.
 fn workload(s: &Setup, namespace: &str, name: &str, mock: bool, factor: u32) {
-    s.api.workloads.apply(namespace, name, "pay", vec![], vec![]);
+    s.api
+        .workloads
+        .apply(namespace, name, "pay", vec![], vec![]);
     s.api.workloads.set_mock(
         namespace,
         name,
@@ -95,7 +97,15 @@ async fn mck_08_refusals_carry_no_mode_header() {
         assert_eq!(answer.status, status);
         assert_eq!(modes(&answer), (None, None), "{status}");
     }
-    let answer = request(&s.router, Method::POST, Some(&tok), "pay", "?format=1", None).await;
+    let answer = request(
+        &s.router,
+        Method::POST,
+        Some(&tok),
+        "pay",
+        "?format=1",
+        None,
+    )
+    .await;
     assert_eq!((answer.status, modes(&answer)), (405, (None, None)));
 }
 
@@ -132,6 +142,7 @@ async fn mck_08_429_503_and_507_carry_no_mode_header() {
 #[tokio::test]
 async fn mck_08_each_pull_writes_pulls_with_the_expiry_of_pods_fields() {
     let s = setup(Options::default());
+    push_report(&s, "pay", SESSION, 1, &outbound_report(&[AUTHORITY])).await;
     workload(&s, &s.ns, "pay-workload", true, 100);
     let first = pull(&s, "pay", None).await;
     let before = pulls(&s, "pay").await;

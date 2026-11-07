@@ -265,11 +265,15 @@ impl Admission {
                 reason: "root",
                 message: "cannot derive the deployment root",
             })?;
+        let effective = self.cache.effective(namespace, deployment);
         Ok(TlsWiring {
             root_pem: root.to_string(),
             exclude: self.cache.exclude(namespace, deployment),
             redact: self.cache.redact(namespace, deployment),
             controller_ca: controller_ca.to_string(),
+            mode: effective.mode().to_string(),
+            latency_factor: effective.factor_text(),
+            mock_passthrough: effective.passthrough,
         })
     }
 
@@ -422,10 +426,7 @@ pub(crate) mod tests {
         setup_cache(cache, seeded)
     }
 
-    fn setup_cache(
-        cache: WorkloadCache,
-        seeded: bool,
-    ) -> (Router, Arc<Metrics>, Arc<SeedSlot>) {
+    fn setup_cache(cache: WorkloadCache, seeded: bool) -> (Router, Arc<Metrics>, Arc<SeedSlot>) {
         let mut metrics = Metrics::new("controller", "test");
         let seed = Arc::new(SeedSlot::new());
         if seeded {

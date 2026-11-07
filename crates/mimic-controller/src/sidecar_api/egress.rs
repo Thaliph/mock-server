@@ -14,6 +14,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use axum::body::Bytes;
+use axum::http::HeaderName;
 use axum::http::HeaderValue;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use mimic_core::discovery::egress::{EgressSet, FORMAT, etag, matches_etag};
@@ -22,6 +23,7 @@ use tokio::sync::{Semaphore, watch};
 
 use super::*;
 use crate::store::{ReadError, parse_outbound, sha256_hex};
+use crate::workloads::Effective;
 
 pub(super) const ENDPOINT: &str = "/v1/workloads/{deployment}/egress";
 
@@ -429,6 +431,21 @@ fn refuse(denied: Denied, caller: &mut Caller) -> Refusal {
     denied.refusal
 }
 
+const MODE: HeaderName = HeaderName::from_static("mimic-mode");
+const LATENCY_FACTOR: HeaderName = HeaderName::from_static("mimic-latency-factor");
+
+/// Adds the deployment's effective mode (spec §7.7): outside the `ETag` and the projection.
+fn with_mode(mut response: Response, mode: &Effective) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(MODE, HeaderValue::from_static(mode.mode()));
+    if mode.mock
+        && let Ok(factor) = HeaderValue::from_str(&mode.factor_text())
+    {
+        headers.insert(LATENCY_FACTOR, factor);
+    }
+    response
+}
+
 fn with_etag(mut response: Response, etag: &str) -> Response {
     if let Ok(value) = HeaderValue::from_str(etag) {
         response.headers_mut().insert(ETAG, value);
@@ -571,7 +588,11 @@ impl SidecarApi {
         };
         let reason = outcome.as_ref().err().and_then(|r| r.reason);
         self.record(ENDPOINT, &caller, result, reason);
-        match outcome {
+        let mode = match &outcome {
+            Ok(_) => Some(self.pulled(&caller).await),
+            Err(_) => None,
+        };
+        let response = match outcome {
             Ok(Answered::Set(projection)) => {
                 let etag = projection.etag.clone();
                 let response = (
@@ -588,7 +609,28 @@ impl SidecarApi {
                 with_etag(StatusCode::NOT_MODIFIED.into_response(), &etag)
             }
             Err(refusal) => refusal.into_response(),
+        };
+        match mode {
+            Some(mode) => with_mode(response, &mode),
+            None => response,
         }
+    }
+
+    /// The mode a `200` or `304` carries, read when the answer is written, and noted in
+    /// `:pulls`.
+    async fn pulled(&self, caller: &Caller) -> Effective {
+        let mode = self
+            .workloads
+            .effective(&caller.namespace, &caller.deployment);
+        self.store
+            .record_pull(
+                &caller.namespace,
+                &caller.deployment,
+                &caller.pod,
+                mode.mode(),
+            )
+            .await;
+        mode
     }
 
     async fn authorize_and_answer(

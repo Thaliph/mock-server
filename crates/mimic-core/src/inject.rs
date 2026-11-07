@@ -254,6 +254,13 @@ pub struct TlsWiring {
     pub redact: Vec<String>,
     /// The webhook CA, PEM, which the sidecar verifies the sidecar API against.
     pub controller_ca: String,
+    /// The deployment's effective mode, `discovery` or `mock` (spec §7, F10).
+    pub mode: String,
+    /// `spec.mock.latencyFactor` in its shortest decimal form (`1`, `0.5`); only the
+    /// effective one of a deployment in `mock` is ever not `1`.
+    pub latency_factor: String,
+    /// `spec.mock.passthrough` of the deployment, sorted and deduplicated.
+    pub mock_passthrough: Vec<String>,
 }
 
 /// Injection patch of `pod`, owned by `deployment`.
@@ -302,6 +309,15 @@ pub fn patch(
     if !tls.exclude.is_empty() {
         sidecar_env
             .push(json!({"name": "MIMIC_TLS_EXCLUDE", "value": literal(&tls.exclude.join(","))}));
+    }
+    sidecar_env.push(json!({"name": "MIMIC_MODE", "value": literal(&tls.mode)}));
+    if tls.latency_factor != "1" {
+        sidecar_env.push(
+            json!({"name": "MIMIC_MOCK_LATENCY_FACTOR", "value": literal(&tls.latency_factor)}),
+        );
+    }
+    if !tls.mock_passthrough.is_empty() {
+        sidecar_env.push(json!({"name": "MIMIC_MOCK_PASSTHROUGH", "value": literal(&tls.mock_passthrough.join(","))}));
     }
     if !tls.redact.is_empty() {
         sidecar_env.push(json!({"name": "MIMIC_DISCOVERY_REDACT_NAMES", "value": literal(&tls.redact.join(","))}));
