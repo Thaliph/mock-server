@@ -66,15 +66,21 @@ impl ShipConfig {
                 "expected a duration from 1s to 1h",
             ));
         }
-        let target = match env.optional(URL_VAR) {
-            None => None,
-            Some(url) => Some(target(env, url)?),
-        };
         Ok(ShipConfig {
             interval,
             timeout: POST_TIMEOUT,
-            target,
+            target: Target::from_env(env)?,
         })
+    }
+}
+
+impl Target {
+    /// The controller the sidecar talks to (`MIMIC_CONTROLLER_URL` and its companions), or
+    /// `None` when the URL is unset.
+    pub fn from_env(env: &Env) -> Result<Option<Target>, ConfigError> {
+        env.optional(URL_VAR)
+            .map(|url| target(env, url))
+            .transpose()
     }
 }
 

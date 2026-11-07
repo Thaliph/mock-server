@@ -3,6 +3,7 @@
 pub mod access;
 pub mod connection;
 pub mod discovery;
+pub mod egress;
 pub mod exchange;
 pub mod h2;
 pub mod hardening;
