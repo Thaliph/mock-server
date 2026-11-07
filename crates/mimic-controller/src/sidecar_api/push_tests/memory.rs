@@ -187,7 +187,7 @@ async fn pull_size(s: &Setup, deployment: &str) -> (u16, usize) {
 }
 
 /// 32 concurrent pulls of each deployment.
-fn pulls(s: &Arc<Setup>) -> Vec<tokio::task::JoinHandle<()>> {
+fn pulls(s: &Arc<Setup>) -> Vec<tokio::task::JoinHandle<u16>> {
     let mut tasks = Vec::new();
     for deployment in DEPLOYMENTS {
         for _ in 0..32 {
@@ -198,6 +198,7 @@ fn pulls(s: &Arc<Setup>) -> Vec<tokio::task::JoinHandle<()>> {
                     [200, 503, 507].contains(&status),
                     "a pull of {deployment} got {status}"
                 );
+                status
             }));
         }
     }
@@ -242,8 +243,14 @@ async fn work(dir: &str, budget: u64, concurrent: bool, pulled: bool) {
         // The pushes changed the digests: pulls at new digests again.
         reads.extend(pulls(&s));
     }
+    let mut statuses = BTreeMap::new();
     for read in reads {
-        read.await.expect("the pull ran");
+        *statuses
+            .entry(read.await.expect("the pull ran"))
+            .or_insert(0) += 1;
+    }
+    if pulled {
+        eprintln!("PULLS={statuses:?}");
     }
     // A document of each kind per deployment, rendered at once.
     let ui = ui_router(s.api.store.clone(), UiMetrics::default());
@@ -273,7 +280,13 @@ async fn shr_18_child_work() {
             .unwrap_or_else(|| defaults().body_budget);
         let concurrent = std::env::var_os(NO_503).is_some();
         let pulled = std::env::var_os(PULLS).is_some();
-        work(dir.to_str().expect("a UTF-8 path"), budget, concurrent, pulled).await;
+        work(
+            dir.to_str().expect("a UTF-8 path"),
+            budget,
+            concurrent,
+            pulled,
+        )
+        .await;
     }
 }
 
@@ -330,6 +343,9 @@ async fn measure(budget: Option<u64>, pulled: bool) -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .expect("the child reports its peak");
     eprintln!("PEAK_MIB={peak}");
+    if let Some(line) = stderr.lines().find(|l| l.starts_with("PULLS=")) {
+        eprintln!("{line}");
+    }
     peak * MIB
 }
 

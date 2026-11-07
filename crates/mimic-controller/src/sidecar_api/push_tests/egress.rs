@@ -133,7 +133,13 @@ fn projection_of(outbound: &str) -> String {
     EgressSet::project(&report).to_json().unwrap()
 }
 
-pub(super) async fn push_report(s: &Setup, deployment: &str, session: &str, sequence: u64, report: &Report) {
+pub(super) async fn push_report(
+    s: &Setup,
+    deployment: &str,
+    session: &str,
+    sequence: u64,
+    report: &Report,
+) {
     let answer = push(s, deployment, payload(session, sequence, report)).await;
     assert_eq!(answer.status, 200, "{}", answer.text());
 }
@@ -253,9 +259,11 @@ async fn pul_07_the_route_serves_the_projection_and_a_304_without_reading_outbou
         assert_eq!(cached.etag(), first.etag());
         assert!(cached.bytes.is_empty());
     }
-    // Weak validators and `*` do not match: the route reads, and finds the damage.
+    // Weak validators and `*` do not match: a 200, from the cache (step 4), which holds the
+    // projection of this digest and never reads the damaged bytes.
     for none_match in [format!("W/{}", first.etag()), "*".to_string()] {
-        assert_eq!(pull(&s, "pay", Some(&none_match)).await.status, 500);
+        let answer = pull(&s, "pay", Some(&none_match)).await;
+        assert_eq!((answer.status, answer.text()), (200, first.text()));
     }
     set_outbound(&s, "pay", &stored).await;
 

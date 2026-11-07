@@ -26,6 +26,7 @@ use mimic_core::discovery::report::Report;
 use mimic_core::identity::pod_of_deployment;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::{Registry, Unit};
 use serde::Deserialize;
@@ -61,6 +62,7 @@ pub struct ApiMetrics {
     requests: Family<Labels, Counter>,
     egress_builds: Family<Labels, Counter>,
     egress_build_duration: Histogram,
+    egress_cache_bytes: Gauge,
 }
 
 impl ApiMetrics {
@@ -71,6 +73,7 @@ impl ApiMetrics {
             egress_build_duration: Histogram::new([
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
             ]),
+            egress_cache_bytes: Gauge::default(),
         };
         registry.register(
             "sidecar_api_requests",
@@ -87,6 +90,12 @@ impl ApiMetrics {
             "One egress projection, from the read of the stored bytes to the serialised set",
             Unit::Seconds,
             metrics.egress_build_duration.clone(),
+        );
+        registry.register_with_unit(
+            "sidecar_api_egress_cache",
+            "Bytes of the egress budget held by cached and in-flight projections",
+            Unit::Bytes,
+            metrics.egress_cache_bytes.clone(),
         );
         metrics
     }
@@ -352,6 +361,7 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
 }
 
 /// Why a request was refused: the status and the `result` label of the log line and metric.
+#[derive(Clone, Copy)]
 struct Refusal {
     status: StatusCode,
     result: &'static str,
