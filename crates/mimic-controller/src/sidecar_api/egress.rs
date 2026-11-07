@@ -659,3 +659,28 @@ impl SidecarApi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use prometheus_client::registry::Registry;
+
+    use super::*;
+
+    #[test]
+    fn pul_09_an_old_flight_that_drops_leaves_the_newer_one_of_its_key() {
+        let cache = Cache::new(1 << 20, &ApiMetrics::register(&mut Registry::default()));
+        let Joined::Lead(_rx, old) = cache.join("shop", "pay", None) else {
+            panic!("the first pull leads");
+        };
+        // The old build failed and left the table; a new pull starts a build of the same key.
+        cache.lock().flights.remove(&old.key);
+        let Joined::Lead(_rx, _new) = cache.join("shop", "pay", None) else {
+            panic!("a new build starts");
+        };
+        drop(old);
+        assert!(
+            matches!(cache.join("shop", "pay", None), Joined::Wait(_)),
+            "the old guard removed the newer flight: a duplicate build would start"
+        );
+    }
+}
