@@ -93,7 +93,7 @@ fn push_of(pod: &str, seq: Option<u64>, paths: &[(&str, u16)]) -> Push {
     Push {
         pod: pod.to_string(),
         seq: seq.map(|n| SeqId::parse(SESSION, n).expect("valid seq")),
-        report,
+        json: report.to_json().expect("serialises"),
     }
 }
 
@@ -219,7 +219,8 @@ async fn ctl_09_applied_once_across_replicas() {
                     })
                     .collect();
                 let make = || push_of(&pod, Some(seq), &exchanges);
-                distinct.lock().expect("lock")[dep_index].push(make().report);
+                distinct.lock().expect("lock")[dep_index]
+                    .push(Report::from_json(&make().json).expect("reads"));
                 let pick = |r: u64| {
                     if r.is_multiple_of(2) {
                         a.clone()
@@ -272,6 +273,303 @@ async fn ctl_09_applied_once_across_replicas() {
     let conflicts = counter(&metrics_a, "store_writes_total", "conflict")
         + counter(&metrics_b, "store_writes_total", "conflict");
     assert!(conflicts > 0.0, "no contention happened");
+}
+
+/// The stored report changes between the read and the compare-and-set of a write: the retry
+/// merges the queued JSON again, on top of the new report.
+#[tokio::test]
+async fn ctl_09_conflict_retries_the_queued_json_on_the_new_report() {
+    let (a, metrics_a) = replica(None, config(Duration::from_secs(3600)));
+    let (b, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09r"), "front");
+    let mine = push_of("pod-a", Some(1), &[("/a", 200), ("/c/1", 200)]);
+    let theirs = push_of("pod-b", Some(1), &[("/b", 200), ("/c/2", 404)]);
+    let mut expected = Report::new(None);
+    for push in [&theirs, &mine] {
+        let parsed = Report::from_json(&push.json).expect("reads");
+        expected = merge_bounded(expected, parsed, &LIMITS).report;
+    }
+    let (ns_b, dep_b) = (ns.clone(), dep.to_string());
+    a.intrude_once(Box::pin(async move {
+        let got = b.push(&ns_b, &dep_b, theirs).await;
+        assert_eq!(got, Ok(Outcome::Applied));
+    }));
+
+    let got = a.push(&ns, dep, mine).await;
+
+    assert_eq!(got, Ok(Outcome::Applied));
+    assert!(counter(&metrics_a, "store_writes_total", "conflict") >= 1.0);
+    let k = keys(&ns, dep).expect("keys");
+    let mut c = conn(None).await;
+    let stored: String = cmd(&mut c, &["GET", &k.report]).await;
+    assert_eq!(stored, expected.to_json().expect("json"));
+    assert!(
+        staged(&mut c, &k).await.is_empty(),
+        "a conflicting attempt left its staged keys"
+    );
+}
+
+async fn staged(c: &mut redis::aio::MultiplexedConnection, k: &Keys) -> Vec<String> {
+    let base = k.meta.strip_suffix(":meta").expect("a meta key");
+    cmd(c, &["KEYS", &format!("{base}:stage:*")]).await
+}
+
+/// #339: a part is written to temporary keys in chunks and renamed by the script. A crash between
+/// two chunks leaves only a temporary key (never read, it expires); a write whose staged value is
+/// not whole is refused by the script and leaves `:report` as it was.
+#[tokio::test]
+async fn ctl_09_torn_staged_write_is_refused_and_never_visible() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09t"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let got = store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Ok(Outcome::Applied));
+    let mut c = conn(None).await;
+    let before: String = cmd(&mut c, &["GET", &k.report]).await;
+    let (tmp, tmp_out) = (k.staged(1, "report"), k.staged(1, "outbound"));
+    // A crash after the first chunk of a part: 10 of the 100 bytes the script is told about.
+    let _: () = cmd(&mut c, &["SET", &tmp, "0123456789", "PX", "60000"]).await;
+    let _: () = cmd(&mut c, &["SET", &tmp_out, "{}", "PX", "60000"]).await;
+    let version: String = cmd(&mut c, &["HGET", &k.meta, "version"]).await;
+    let refused: i64 = store
+        .script
+        .prepare_invoke()
+        .key(&k.report)
+        .key(&k.meta)
+        .key(&k.pods)
+        .key(&k.seq)
+        .key(&k.ns_index)
+        .key(&k.workloads)
+        .key(&k.outbound)
+        .key(&tmp)
+        .key(&tmp_out)
+        .arg(&version)
+        .arg(3_600_000)
+        .arg(1000)
+        .arg(now_ms())
+        .arg(50)
+        .arg(&ns)
+        .arg(dep)
+        .arg(100)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg("")
+        .arg("digest")
+        .invoke_async(&mut c)
+        .await
+        .expect("the script runs");
+    assert_eq!(refused, 0);
+    let after: String = cmd(&mut c, &["GET", &k.report]).await;
+    assert_eq!(after, before);
+    assert!(staged(&mut c, &k).await.is_empty(), "the staged keys stay");
+}
+
+/// Runs the script on staged keys of `tmp_len` and `out_len` announced bytes (`""`: no outbound).
+async fn invoke(
+    store: &Store,
+    c: &mut redis::aio::MultiplexedConnection,
+    k: &Keys,
+    (ns, dep): (&str, &str),
+    (tmp, tmp_out): (&str, &str),
+    (len, out_len): (usize, &str),
+) -> i64 {
+    let version: String = cmd(c, &["HGET", &k.meta, "version"]).await;
+    store
+        .script
+        .prepare_invoke()
+        .key(&k.report)
+        .key(&k.meta)
+        .key(&k.pods)
+        .key(&k.seq)
+        .key(&k.ns_index)
+        .key(&k.workloads)
+        .key(&k.outbound)
+        .key(tmp)
+        .key(tmp_out)
+        .arg(&version)
+        .arg(3_600_000)
+        .arg(1000)
+        .arg(now_ms())
+        .arg(50)
+        .arg(ns)
+        .arg(dep)
+        .arg(len)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(0)
+        .arg(out_len)
+        .arg("digest")
+        .invoke_async(c)
+        .await
+        .expect("the script runs")
+}
+
+/// A whole inbound part and a short outbound one: the script refuses on the outbound length.
+#[tokio::test]
+async fn ctl_09_torn_outbound_stage_is_refused_and_cleaned() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09o"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await
+        .expect("applied");
+    let mut c = conn(None).await;
+    let before: String = cmd(&mut c, &["GET", &k.report]).await;
+    let (tmp, tmp_out) = (k.staged(7, "report"), k.staged(7, "outbound"));
+    let _: () = cmd(&mut c, &["SET", &tmp, "01234", "PX", "60000"]).await;
+    let _: () = cmd(&mut c, &["SET", &tmp_out, "{}", "PX", "60000"]).await;
+    let got = invoke(&store, &mut c, &k, (&ns, dep), (&tmp, &tmp_out), (5, "100")).await;
+    assert_eq!(got, 0);
+    let after: String = cmd(&mut c, &["GET", &k.report]).await;
+    assert_eq!(after, before);
+    assert!(staged(&mut c, &k).await.is_empty());
+}
+
+/// After a staged write the keys hold the writer's TTL (not the stage's 60 s), `:outbound` is the
+/// renamed part, and the digest is the version and the hash of the stored `:outbound` (PUL-06).
+#[tokio::test]
+async fn ctl_09_staged_write_renames_both_parts_with_the_writers_ttl_and_digest() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09p"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let out = [("api.example.com:443", "/v1/x", 2)];
+    let got = store
+        .push(&ns, dep, v2::push_v2("pod-a", 1, &["/a"], &out))
+        .await;
+    assert_eq!(got, Ok(Outcome::Applied));
+    let mut c = conn(None).await;
+    for key in [&k.report, &k.outbound] {
+        let ttl: i64 = cmd(&mut c, &["PTTL", key]).await;
+        assert!((3_000_000..=3_600_000).contains(&ttl), "{key}: {ttl}");
+    }
+    let outbound: Vec<u8> = cmd(&mut c, &["GET", &k.outbound]).await;
+    assert!(Report::from_json(std::str::from_utf8(&outbound).expect("text")).is_ok());
+    let digest: String = cmd(&mut c, &["HGET", &k.meta, "outbound_digest"]).await;
+    let version: String = cmd(&mut c, &["HGET", &k.meta, "version"]).await;
+    assert_eq!(digest, format!("{version}:{}", sha256_hex(&outbound)));
+    assert!(staged(&mut c, &k).await.is_empty());
+}
+
+/// A write with no outbound part deletes the old `:outbound` and stages nothing for it.
+#[tokio::test]
+async fn ctl_09_staged_write_without_outbound_leaves_no_outbound_key() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09n"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await
+        .expect("applied");
+    let mut c = conn(None).await;
+    let exists: i64 = cmd(&mut c, &["EXISTS", &k.outbound]).await;
+    assert_eq!(exists, 0);
+    let ttl: i64 = cmd(&mut c, &["PTTL", &k.report]).await;
+    assert!((3_000_000..=3_600_000).contains(&ttl), "{ttl}");
+    assert!(staged(&mut c, &k).await.is_empty());
+}
+
+/// The script fails (a Lua error: `:meta` is not a hash) after the parts were staged: the writer
+/// deletes the staged keys instead of leaving them for the expiry.
+#[tokio::test]
+async fn ctl_09_a_failed_script_leaves_no_staged_key() {
+    let (store, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09e"), "front");
+    let k = keys(&ns, dep).expect("keys");
+    let meta = k.meta.clone();
+    store.intrude_once(Box::pin(async move {
+        let mut c = conn(None).await;
+        let _: () = cmd(&mut c, &["SET", &meta, "not a hash"]).await;
+    }));
+    let got = store
+        .push(&ns, dep, push_of("p", Some(1), &[("/a", 200)]))
+        .await;
+    assert_eq!(got, Err(StoreError::Unavailable));
+    let mut c = conn(None).await;
+    assert!(staged(&mut c, &k).await.is_empty());
+}
+
+/// A part of several chunks is staged whole, and its key and the other one expire.
+#[tokio::test]
+async fn ctl_09_chunked_stage_stores_every_byte() {
+    let k = keys(&unique("ctl09c"), "front").expect("keys");
+    let bytes: Vec<u8> = (0..3 * STAGE_CHUNK + 7).map(|i| (i % 251) as u8).collect();
+    let (tmp, other) = (k.staged(2, "report"), k.staged(2, "outbound"));
+    let mut c = conn(None).await;
+    let _: () = cmd(&mut c, &["SET", &other, "x"]).await;
+    stage(&mut c, &tmp, &other, &bytes).await.expect("staged");
+    let stored: Vec<u8> = cmd(&mut c, &["GET", &tmp]).await;
+    assert!(stored == bytes, "{} bytes of {}", stored.len(), bytes.len());
+    for key in [&tmp, &other] {
+        let ttl: i64 = cmd(&mut c, &["PTTL", key]).await;
+        assert!((1..=STAGE_TTL_MS as i64).contains(&ttl), "{ttl}");
+    }
+    let _: () = cmd(&mut c, &["DEL", &tmp, &other]).await;
+}
+
+/// A key that expired between two chunks is re-created by the `APPEND` with an expiry.
+#[tokio::test]
+async fn ctl_09_an_append_that_recreates_a_stage_key_gives_it_an_expiry() {
+    let k = keys(&unique("ctl09r2"), "front").expect("keys");
+    let (tmp, other) = (k.staged(3, "report"), k.staged(3, "outbound"));
+    let mut c = conn(None).await;
+    append_chunk(&mut c, &tmp, &other, b"tail", false)
+        .await
+        .expect("appended");
+    let ttl: i64 = cmd(&mut c, &["PTTL", &tmp]).await;
+    assert!((1..=STAGE_TTL_MS as i64).contains(&ttl), "{ttl}");
+    let _: () = cmd(&mut c, &["DEL", &tmp]).await;
+}
+
+/// A guard dropped armed (a cancelled write) deletes the staged keys, without blocking.
+#[tokio::test]
+async fn ctl_09_a_dropped_stage_guard_deletes_the_staged_keys() {
+    let k = keys(&unique("ctl09g"), "front").expect("keys");
+    let (tmp, tmp_out) = (k.staged(4, "report"), k.staged(4, "outbound"));
+    let mut c = conn(None).await;
+    stage(&mut c, &tmp, &tmp_out, b"half")
+        .await
+        .expect("staged");
+    stage(&mut c, &tmp_out, &tmp, b"half")
+        .await
+        .expect("staged");
+    assert_eq!(staged(&mut c, &k).await.len(), 2);
+    drop(StageGuard::new(c.clone(), [&tmp, &tmp_out]));
+    for _ in 0..100 {
+        if staged(&mut c, &k).await.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the staged keys are still there");
+}
+
+/// A disarmed guard leaves them.
+#[tokio::test]
+async fn ctl_09_a_disarmed_stage_guard_leaves_the_staged_keys() {
+    let k = keys(&unique("ctl09d"), "front").expect("keys");
+    let (tmp, tmp_out) = (k.staged(5, "report"), k.staged(5, "outbound"));
+    let mut c = conn(None).await;
+    stage(&mut c, &tmp, &tmp_out, b"half")
+        .await
+        .expect("staged");
+    let mut guard = StageGuard::new(c.clone(), [&tmp, &tmp_out]);
+    guard.disarm();
+    drop(guard);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(staged(&mut c, &k).await.len(), 1);
+    let _: () = cmd(&mut c, &["DEL", &tmp]).await;
 }
 
 #[tokio::test]

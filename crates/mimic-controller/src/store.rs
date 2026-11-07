@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimic_core::discovery::report::{Direction, Limits, Report};
 use mimic_core::discovery::status::Meta as StatusMeta;
-use mimic_core::discovery::store::{Kind, Refusal, drop_expired, merge_bounded};
+use mimic_core::discovery::store::{Kind, Refusal, drop_expired, merge_bounded_json};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
@@ -36,15 +36,35 @@ const DAY_SECS: u64 = 86_400;
 /// Lifetime of the `:pods` and `:seq` fields, at most.
 const FIELD_TTL_MS: u64 = DAY_SECS * 1000;
 
+/// A staged write that never reached its script (a crash, a lost connection) is gone after this.
+const STAGE_TTL_MS: u64 = 60_000;
+/// The bytes of a staged key sent per command: what redis-rs copies at once. A write whose
+/// stage is not whole (the expiry cannot pass between two commands of one writer: each renews it)
+/// is refused by the script.
+const STAGE_CHUNK: usize = 1 << 20;
+
+/// The report and the outbound part are staged under temporary keys, `SET` then `APPEND`ed in
+/// chunks so that the command never holds a copy of a whole part (#339); this script checks their
+/// lengths and `RENAME`s them into place with the version check, in one atomic step: a reader
+/// sees the old value or the new one, never a part of it. Every refusal deletes them.
 const WRITE: &str = r"
-local current = redis.call('HGET', KEYS[2], 'version')
-if (current or '0') ~= ARGV[1] then return 0 end
+local function refuse(code)
+  redis.call('DEL', KEYS[8], KEYS[9])
+  return code
+end
 local n_pods = tonumber(ARGV[14])
 local seq_at = 15 + n_pods
 local n_seq = tonumber(ARGV[seq_at])
+local out_at = seq_at + 1 + n_seq * 3
+local current = redis.call('HGET', KEYS[2], 'version')
+if (current or '0') ~= ARGV[1] then return refuse(0) end
 for i = 0, n_seq - 1 do
   local at = seq_at + 1 + i * 3
-  if (redis.call('HGET', KEYS[4], ARGV[at]) or '') ~= ARGV[at + 1] then return 0 end
+  if (redis.call('HGET', KEYS[4], ARGV[at]) or '') ~= ARGV[at + 1] then return refuse(0) end
+end
+if redis.call('STRLEN', KEYS[8]) ~= tonumber(ARGV[8]) then return refuse(0) end
+if ARGV[out_at] ~= '' and redis.call('STRLEN', KEYS[9]) ~= tonumber(ARGV[out_at]) then
+  return refuse(0)
 end
 local ttl = tonumber(ARGV[2])
 local field_ttl = tonumber(ARGV[3])
@@ -54,12 +74,13 @@ redis.call('ZREMRANGEBYSCORE', KEYS[5], '-inf', floor)
 redis.call('ZREMRANGEBYSCORE', KEYS[6], '-inf', floor)
 if not redis.call('ZSCORE', KEYS[5], ARGV[7])
    and redis.call('ZCARD', KEYS[5]) >= tonumber(ARGV[5]) then
-  return -1
+  return refuse(-1)
 end
-redis.call('SET', KEYS[1], ARGV[8], 'PX', ttl)
-local out_at = seq_at + 1 + n_seq * 3
+redis.call('RENAME', KEYS[8], KEYS[1])
+redis.call('PEXPIRE', KEYS[1], ttl)
 if ARGV[out_at] ~= '' then
-  redis.call('SET', KEYS[7], ARGV[out_at], 'PX', ttl)
+  redis.call('RENAME', KEYS[9], KEYS[7])
+  redis.call('PEXPIRE', KEYS[7], ttl)
 else
   redis.call('DEL', KEYS[7])
 end
@@ -116,6 +137,14 @@ pub struct Keys {
     pub seq: String,
     pub ns_index: String,
     pub workloads: String,
+}
+
+impl Keys {
+    /// A temporary key of one write attempt (same hash tag as the other keys of the deployment).
+    fn staged(&self, id: u128, part: &str) -> String {
+        let base = self.meta.strip_suffix(":meta").unwrap_or(&self.meta);
+        format!("{base}:stage:{id:032x}:{part}")
+    }
 }
 
 /// The keys of `<namespace>/<deployment>`, once both names are checked.
@@ -177,11 +206,13 @@ pub fn decide(stored: Option<u64>, sequence: Option<u64>) -> Decision {
     }
 }
 
-/// A checked, re-redacted and stamped report, and who sent it.
+/// A checked, re-redacted and stamped report, and who sent it. The report waits as its JSON
+/// (`Report::to_json`): the write merges it into the stored report as it reads it, and reads it
+/// again if the write conflicts, so that no parsed copy and no backup is held (SHR-18, #339).
 pub struct Push {
     pub pod: String,
     pub seq: Option<SeqId>,
-    pub report: Report,
+    pub json: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,9 +346,93 @@ impl StoreMetrics {
     }
 }
 
+/// Stores `bytes` under the temporary `key`, a chunk per command. Every command renews the
+/// expiry of `key` and of `other` (the part staged before or after it), so that no staged key
+/// exists without one and none expires while the other part is sent.
+async fn stage(
+    conn: &mut MultiplexedConnection,
+    key: &str,
+    other: &str,
+    bytes: &[u8],
+) -> redis::RedisResult<()> {
+    for (i, chunk) in bytes.chunks(STAGE_CHUNK).enumerate() {
+        append_chunk(conn, key, other, chunk, i == 0).await?;
+    }
+    Ok(())
+}
+
+/// `SET` (the first chunk) or `APPEND`s `chunk` to `key`, and renews the expiry of both keys, in
+/// one pipeline: an `APPEND` that re-creates an expired key gives it an expiry too.
+async fn append_chunk(
+    conn: &mut MultiplexedConnection,
+    key: &str,
+    other: &str,
+    chunk: &[u8],
+    first: bool,
+) -> redis::RedisResult<()> {
+    let mut pipe = redis::pipe();
+    if first {
+        pipe.cmd("SET").arg(key).arg(chunk).ignore();
+    } else {
+        pipe.cmd("APPEND").arg(key).arg(chunk).ignore();
+    }
+    for k in [key, other] {
+        pipe.cmd("PEXPIRE").arg(k).arg(STAGE_TTL_MS).ignore();
+    }
+    pipe.query_async(conn).await
+}
+
+/// Deletes the staged keys of a write unless disarmed: [`StageGuard::clean`] on a failure, and the
+/// drop (a cancelled future) spawns the `DEL`, never blocking. What neither reaches (a crash, a
+/// lost connection) expires after [`STAGE_TTL_MS`].
+struct StageGuard {
+    conn: MultiplexedConnection,
+    keys: [String; 2],
+    armed: bool,
+}
+
+impl StageGuard {
+    fn new(conn: MultiplexedConnection, keys: [&str; 2]) -> StageGuard {
+        StageGuard {
+            conn,
+            keys: keys.map(str::to_string),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Best effort: bounded by the response timeout, failures ignored.
+    async fn clean(&mut self) {
+        if std::mem::take(&mut self.armed) {
+            delete(self.conn.clone(), self.keys.clone()).await;
+        }
+    }
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(delete(self.conn.clone(), self.keys.clone()));
+        }
+    }
+}
+
+async fn delete(mut conn: MultiplexedConnection, keys: [String; 2]) {
+    let mut del = redis::cmd("DEL");
+    del.arg(&keys[0]).arg(&keys[1]);
+    let _ = tokio::time::timeout(RESPONSE_TIMEOUT, del.query_async::<()>(&mut conn)).await;
+}
+
 struct Pending {
     push: Push,
     reply: oneshot::Sender<Result<Outcome, StoreError>>,
+    /// Released with the push, when its write ends or the push is dropped.
+    _hold: Box<dyn Send>,
 }
 
 enum Attempt {
@@ -332,6 +447,9 @@ type Read = (
     Option<String>,
     Vec<Option<String>>,
 );
+
+#[cfg(test)]
+type Intruder = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 type Queues = BTreeMap<(String, String), Vec<Pending>>;
 
@@ -351,10 +469,14 @@ pub struct Store {
     /// Test hook: the next write panics.
     #[cfg(test)]
     panic_next_write: AtomicBool,
+    /// Test hook: runs once between the next read and its write (a type-erased future: a push by
+    /// another replica would make the write's future recursive).
+    #[cfg(test)]
+    intruder: Mutex<Option<Intruder>>,
 }
 
 /// The lowercase hex SHA-256 of `bytes`.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     Sha256::digest(bytes)
         .iter()
@@ -365,7 +487,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// The hash part of `digest` (`<version>:<64 hex>`) when its version is `version`.
-#[allow(dead_code)] // read by the egress route (F9 step 3)
 fn fresh_digest(version: Option<&str>, digest: Option<&str>) -> Option<String> {
     let (written, hash) = digest?.split_once(':')?;
     let valid = hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
@@ -423,6 +544,11 @@ fn read_part(bytes: &[u8], part: Part) -> Option<Report> {
         Part::Outbound => report.version() == 2 && !report.holds_inbound(),
     }
     .then_some(report)
+}
+
+/// A stored `:outbound` once it parses, passes the structural check and is of its kind.
+pub fn parse_outbound(bytes: &[u8]) -> Option<Report> {
+    read_part(bytes, Part::Outbound)
 }
 
 /// The stored parts of a report, as read: `:report`, `:outbound` when present, and the `:meta`
@@ -483,6 +609,8 @@ impl Store {
             failing: AtomicBool::new(false),
             #[cfg(test)]
             panic_next_write: AtomicBool::new(false),
+            #[cfg(test)]
+            intruder: Mutex::new(None),
         })
     }
 
@@ -492,12 +620,27 @@ impl Store {
     }
 
     /// Merges the push into the deployment's report. Answered after the write that holds it.
+    #[cfg(test)]
     pub async fn push(
         self: &Arc<Self>,
         namespace: &str,
         deployment: &str,
         push: Push,
     ) -> Result<Outcome, StoreError> {
+        self.push_holding(namespace, deployment, push, ()).await
+    }
+
+    /// As `push`, and `hold` lives until the write that applies the push ends, even if the
+    /// caller is dropped first: the write runs in a task of the store, so what bounds its
+    /// memory (the body budget) must not end with the caller.
+    pub async fn push_holding(
+        self: &Arc<Self>,
+        namespace: &str,
+        deployment: &str,
+        push: Push,
+        hold: impl Send + 'static,
+    ) -> Result<Outcome, StoreError> {
+        let hold: Box<dyn Send> = Box::new(hold);
         let keys = keys(namespace, deployment).map_err(|_| StoreError::Name)?;
         check_name(&push.pod).map_err(|_| StoreError::Name)?;
         let (reply, answer) = oneshot::channel();
@@ -506,11 +649,22 @@ impl Store {
             let mut queues = lock(&self.queues);
             match queues.get_mut(&key) {
                 Some(queue) => {
-                    queue.push(Pending { push, reply });
+                    queue.push(Pending {
+                        push,
+                        reply,
+                        _hold: hold,
+                    });
                     false
                 }
                 None => {
-                    queues.insert(key.clone(), vec![Pending { push, reply }]);
+                    queues.insert(
+                        key.clone(),
+                        vec![Pending {
+                            push,
+                            reply,
+                            _hold: hold,
+                        }],
+                    );
                     true
                 }
             }
@@ -531,6 +685,25 @@ impl Store {
             });
         }
         answer.await.unwrap_or(Err(StoreError::Unavailable))
+    }
+
+    /// Test hook: `intruder` runs between the next write's read and its compare-and-set.
+    #[cfg(test)]
+    pub(crate) fn intrude_once(&self, intruder: Intruder) {
+        *lock(&self.intruder) = Some(intruder);
+    }
+
+    /// Test hook: holds every writer slot, so that no write starts until the guard drops.
+    #[cfg(test)]
+    pub(crate) async fn hold_writers(&self) -> tokio::sync::SemaphorePermit<'_> {
+        let slots = u32::try_from(MAX_WRITERS).expect("a small count");
+        self.writers.acquire_many(slots).await.expect("open")
+    }
+
+    /// Test hook: the pushes waiting for a write.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        lock(&self.queues).values().map(Vec::len).sum()
     }
 
     /// The deployment's writer: one write per batch of queued pushes until none is left.
@@ -859,7 +1032,6 @@ impl Store {
     /// The hex SHA-256 of the stored `:outbound` bytes, from `:meta` `outbound_digest`; `None`
     /// when the digest is absent, malformed or written for another `version` (stale, §7.7), or
     /// when the deployment has no `:meta`.
-    #[allow(dead_code)] // read by the egress route (F9 step 3)
     pub async fn outbound_digest(
         &self,
         namespace: &str,
@@ -881,6 +1053,45 @@ impl Store {
             Err(e) => return Err(self.read_failed(e).await),
         };
         Ok(fresh_digest(version.as_deref(), digest.as_deref()))
+    }
+
+    /// The size of the stored `:outbound` in bytes (`STRLEN`), 0 when there is none: what a
+    /// build reserves before it reads the bytes.
+    pub async fn outbound_len(&self, namespace: &str, deployment: &str) -> Result<u64, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        match redis::cmd("STRLEN")
+            .arg(&k.outbound)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(len) => Ok(len),
+            Err(e) => Err(self.read_failed(e).await),
+        }
+    }
+
+    /// The stored `:outbound` bytes, unparsed; `None` for a deployment without any.
+    pub async fn outbound_bytes(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<Option<Vec<u8>>, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        match redis::cmd("GET")
+            .arg(&k.outbound)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => Err(self.read_failed(e).await),
+        }
     }
 
     async fn read_failed(&self, error: redis::RedisError) -> ReadError {
@@ -988,6 +1199,12 @@ impl Store {
             Ok(read) => read,
             Err(e) => return Err(self.failed(e).await),
         };
+        #[cfg(test)]
+        let intruder = lock(&self.intruder).take();
+        #[cfg(test)]
+        if let Some(intruder) = intruder {
+            intruder.await;
+        }
         let unreadable = |key: &'static str| {
             tracing::error!(namespace, deployment, key, "stored report unreadable");
             StoreError::Unavailable
@@ -1025,10 +1242,7 @@ impl Store {
         let mut outcomes = Vec::with_capacity(batch.len());
         let mut refused: BTreeMap<Refusal, u64> = BTreeMap::new();
         let mut evicted: BTreeMap<Kind, u64> = BTreeMap::new();
-        // A pushed report moves into the merge instead of being copied (at the store limits it
-        // is tens of megabytes, SHR-18). Its JSON is kept to put it back for the next attempt.
-        let mut backups: Vec<(usize, String)> = Vec::new();
-        for (index, pending) in batch.iter_mut().enumerate() {
+        for pending in batch.iter() {
             let push = &pending.push;
             let field = push.seq.as_ref().map(|s| s.field(&push.pod));
             let stored_seq = field.as_ref().and_then(|f| sequences.get(f)).copied();
@@ -1038,13 +1252,13 @@ impl Store {
                     if let (Some(field), Some(seq)) = (field, &push.seq) {
                         sequences.insert(field, seq.sequence);
                     }
-                    let backup = push.report.to_json().map_err(|error| {
-                        tracing::error!(%error, namespace, deployment, "report not serialisable");
-                        StoreError::Unavailable
-                    })?;
-                    backups.push((index, backup));
-                    let pushed = std::mem::replace(&mut pending.push.report, Report::new(None));
-                    let merged = merge_bounded(report, pushed, &self.config.limits);
+                    // Merged as it is read: at the store limits a parsed push is tens of
+                    // megabytes (SHR-18). The JSON stays for the next attempt.
+                    let merged = merge_bounded_json(report, &push.json, &self.config.limits)
+                        .map_err(|error| {
+                            tracing::error!(%error, namespace, deployment, "report not readable");
+                            StoreError::Unavailable
+                        })?;
                     report = merged.report;
                     for (reason, n) in merged.refused {
                         *refused.entry(reason).or_default() += n;
@@ -1107,6 +1321,24 @@ impl Store {
         };
         drop(outbound);
         let stored_bytes = json.len() + outbound_json.len();
+        let id = rand::random::<u128>();
+        let (staged, staged_outbound) = (keys.staged(id, "report"), keys.staged(id, "outbound"));
+        // From here the staged keys are deleted on every way out but the script's answer.
+        let mut guard = StageGuard::new(conn.clone(), [&staged, &staged_outbound]);
+        let sent = async {
+            stage(&mut conn, &staged, &staged_outbound, json.as_bytes()).await?;
+            stage(
+                &mut conn,
+                &staged_outbound,
+                &staged,
+                outbound_json.as_bytes(),
+            )
+            .await
+        };
+        if let Err(e) = sent.await {
+            guard.clean().await;
+            return Err(self.failed(e).await);
+        }
 
         let mut script = self.script.prepare_invoke();
         script
@@ -1117,6 +1349,8 @@ impl Store {
             .key(&keys.ns_index)
             .key(&keys.workloads)
             .key(&keys.outbound)
+            .key(&staged)
+            .key(&staged_outbound)
             .arg(version)
             .arg(ttl_ms)
             .arg(field_ttl)
@@ -1124,7 +1358,7 @@ impl Store {
             .arg(self.config.max_deployments)
             .arg(namespace)
             .arg(deployment)
-            .arg(&json)
+            .arg(json.len())
             .arg(exchanges)
             .arg(inbound_endpoints)
             .arg(outbound_endpoints)
@@ -1147,26 +1381,28 @@ impl Store {
                     after.map_or_else(String::new, u64::to_string)
                 });
         }
-        script.arg(&outbound_json);
+        script.arg(if outbound_json.is_empty() {
+            String::new()
+        } else {
+            outbound_json.len().to_string()
+        });
         // The digest of §7.7: the script prefixes it with the version it writes.
         script.arg(sha256_hex(outbound_json.as_bytes()));
-        // The arguments are copies: the strings need not outlive the call.
         drop((json, outbound_json));
         let result: i64 = match script.invoke_async(&mut conn).await {
-            Ok(result) => result,
-            Err(e) => return Err(self.failed(e).await),
+            Ok(result) => {
+                // Renamed, or deleted by the script's refusal.
+                guard.disarm();
+                result
+            }
+            Err(e) => {
+                guard.clean().await;
+                return Err(self.failed(e).await);
+            }
         };
         match result {
             1 => {}
-            0 => {
-                for (index, backup) in backups {
-                    batch[index].push.report = Report::from_json(&backup).map_err(|error| {
-                        tracing::error!(%error, namespace, deployment, "report not readable");
-                        StoreError::Unavailable
-                    })?;
-                }
-                return Ok(Attempt::Conflict);
-            }
+            0 => return Ok(Attempt::Conflict),
             _ => {
                 self.metrics.write("refused");
                 if self.once(namespace, deployment, "deployments") {

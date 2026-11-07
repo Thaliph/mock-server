@@ -553,6 +553,9 @@ impl Shipper {
             // have applied it: it would answer `applied: false` to other data.
             self.settle();
             if !unknown {
+                // The freeze that made this sequence incremented the counter, and only one
+                // sequence is pending: the counter equals it and is at least 1.
+                debug_assert!(sequence >= 1 && self.sequence == sequence);
                 self.sequence -= 1;
             }
         }

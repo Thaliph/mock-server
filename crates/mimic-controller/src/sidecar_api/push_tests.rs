@@ -72,6 +72,7 @@ struct Options {
     max_report: usize,
     budget: u64,
     max_push: usize,
+    max_egress: usize,
     max_endpoints: usize,
     max_authorities: usize,
     max_deployments: usize,
@@ -87,6 +88,7 @@ impl Default for Options {
             max_report: 1 << 20,
             budget: 1 << 30,
             max_push: 256,
+            max_egress: 4 << 20,
             max_endpoints: 256,
             max_authorities: 64,
             max_deployments: 50,
@@ -146,6 +148,9 @@ fn setup(options: Options) -> Setup {
         )])),
         max_report: options.max_report,
         max_push_endpoints: options.max_push,
+        max_egress: options.max_egress,
+        egress_budget: 32 << 20,
+        egress_logged: EgressLogged::default(),
     });
     Setup {
         router: router(api.clone()),
@@ -241,7 +246,8 @@ async fn send(
 }
 
 /// A push of `body` for `deployment` by its pod, in the namespace of `s`.
-async fn push(s: &Setup, deployment: &str, body: Vec<u8>) -> Answer {
+async fn push(s: &Setup, deployment: &str, body: impl Into<axum::body::Bytes>) -> Answer {
+    let body: axum::body::Bytes = body.into();
     let token = token(&s.ns, deployment, "t");
     send(
         &s.router,
@@ -1002,5 +1008,7 @@ async fn ctl_12_one_line_per_push_and_the_expected_metrics() {
     }
 }
 
+mod disconnect;
+mod egress;
 mod memory;
 mod v2;

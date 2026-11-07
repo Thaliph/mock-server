@@ -4,6 +4,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 
 use super::report::{Direction, EndpointKey, Limits, Report};
 use super::sample::Sample;
@@ -92,6 +93,32 @@ fn bump<K: Ord>(counts: &mut BTreeMap<K, u64>, key: K) {
 ///   other direction only while it holds more than half of the budget. If room cannot be made
 ///   that way, nothing is evicted and the sample is refused.
 pub fn merge_bounded(stored: Report, push: Report, limits: &Limits) -> Bounded {
+    let merged: Result<_, Infallible> = bounded(stored, limits, |report| {
+        report.union(push, limits.max_literals);
+        Ok(())
+    });
+    merged.unwrap_or_else(|never| match never {})
+}
+
+/// [`merge_bounded`] of the push in `push`, the JSON of a report (`Report::to_json`): the push is
+/// merged into the stored report as it is read, and never held as a report (SHR-21). An error
+/// leaves nothing to keep: the stored report is partly merged.
+pub fn merge_bounded_json(
+    stored: Report,
+    push: &str,
+    limits: &Limits,
+) -> Result<Bounded, serde_json::Error> {
+    bounded(stored, limits, |report| {
+        report.merge_json(push, limits.max_literals)
+    })
+}
+
+/// The bounded merge around `union`, which adds the push to the report.
+fn bounded<E>(
+    stored: Report,
+    limits: &Limits,
+    union: impl FnOnce(&mut Report) -> Result<(), E>,
+) -> Result<Bounded, E> {
     // What the stored report holds, to tell it from what the push adds once they are united.
     let held: Vec<(EndpointKey, BTreeSet<u64>)> = stored
         .endpoint_keys()
@@ -106,7 +133,7 @@ pub fn merge_bounded(stored: Report, push: Report, limits: &Limits) -> Bounded {
         .collect();
     let stored_authorities: BTreeSet<ScopeKey> = stored.outbound_keys().into_iter().collect();
     let mut report = stored;
-    report.union(push, limits.max_literals);
+    union(&mut report)?;
     report.clear_pod();
     let mut out = Bounded {
         report: Report::new(None),
@@ -129,7 +156,7 @@ pub fn merge_bounded(stored: Report, push: Report, limits: &Limits) -> Bounded {
     limit_endpoints(&mut report, limits.max_endpoints, &stored_hashes, &mut out);
     limit_samples(&mut report, limits.sample_budget, &stored_hashes, &mut out);
     out.report = report;
-    out
+    Ok(out)
 }
 
 /// Keeps the `max` outbound scopes ranked by traffic (descending), then stored before new, then

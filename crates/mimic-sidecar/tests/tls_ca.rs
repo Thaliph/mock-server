@@ -282,12 +282,21 @@ async fn tls_15_ready_before_an_intermediate_and_retries_with_backoff() {
     let mut sidecar = spawn(&setup.env());
     let admin = sidecar.admin_addr();
     wait_status(admin, "/readyz", 200, Duration::from_secs(5));
-    // Failures at about 0, 1 and 3 s: the TLS-05 backoff, not a busy loop.
-    tokio::time::sleep(Duration::from_millis(3500)).await;
-    let n = setup.requests();
-    assert!((3..=4).contains(&n), "{n} requests");
+    // TLS-05 backoff: waits of 1 s then 2 s between failures. A sleep never ends early, so the
+    // lower bounds hold under any load; upper bounds would only measure the machine.
+    eventually("three requests", || setup.requests() >= 3).await;
+    {
+        let seen = setup.api.seen.lock().unwrap();
+        let first = seen[1].at - seen[0].at;
+        let second = seen[2].at - seen[1].at;
+        assert!(first >= Duration::from_millis(950), "{first:?}");
+        assert!(second >= Duration::from_millis(1950), "{second:?}");
+    }
+    eventually("error metric", || {
+        sample(&http_get(admin, "/metrics").1, ERR) >= Some(3.0)
+    })
+    .await;
     let metrics = http_get(admin, "/metrics").1;
-    assert!(sample(&metrics, ERR).unwrap() >= 3.0, "{metrics}");
     assert_eq!(sample(&metrics, EXPIRY), Some(0.0), "{metrics}");
 }
 

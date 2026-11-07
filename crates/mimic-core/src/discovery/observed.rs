@@ -1,7 +1,7 @@
 //! What one endpoint has shown of its query, headers and bodies (spec §6): schemas and
 //! volatility, merged as one value. Everything is redacted before it is inferred or hashed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use crate::compact::{Name, SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -83,7 +83,7 @@ fn merge_opt<T>(a: Option<T>, b: Option<T>, f: impl FnOnce(T, T) -> T) -> Option
 #[serde(deny_unknown_fields)]
 struct Side {
     headers: Params,
-    bodies: BTreeMap<String, Media>,
+    bodies: SortedMap<Name, Media>,
 }
 
 impl Side {
@@ -143,7 +143,7 @@ impl Side {
                 } else if let Some(p) = &m.form {
                     o.insert("schema".into(), p.to_json());
                 }
-                (media.clone(), o.into())
+                (media.to_string(), o.into())
             })
             .collect();
         json!({"headers": self.headers.to_json(), "body": bodies})
@@ -165,9 +165,9 @@ fn redacted(value: &str) -> bool {
 }
 
 /// The fields of one exchange that were counted already: `n` counts an exchange once.
-pub(super) type Seen = BTreeSet<String>;
+pub(super) type Seen = SortedSet<Name>;
 
-fn observe(fields: &mut Volatility, seen: &mut Seen, field: String, value: &str, redacted: bool) {
+fn observe(fields: &mut Volatility, seen: &mut Seen, field: Name, value: &str, redacted: bool) {
     if seen.contains(&field) {
         fields.observe_again(&field, value, redacted);
     } else {
@@ -184,7 +184,7 @@ pub(super) fn observe_pairs(
 ) {
     for p in pairs {
         let field = format!("{prefix}/{}", p.key);
-        observe(fields, seen, field, &p.value, redacted(&p.value));
+        observe(fields, seen, field.into(), &p.value, redacted(&p.value));
     }
 }
 
@@ -223,7 +223,7 @@ pub(super) fn observe_leaves(
             observe(
                 fields,
                 seen,
-                format!("{prefix}{pointer}"),
+                format!("{prefix}{pointer}").into(),
                 &text,
                 is_redacted,
             );
@@ -434,7 +434,7 @@ impl Observed {
             }
             Content::Opaque => {}
         }
-        side.bodies.insert(parsed.media.clone(), m);
+        side.bodies.insert(Name::from(parsed.media.as_str()), m);
         Some(parsed)
     }
 
@@ -453,7 +453,7 @@ impl Observed {
         &mut self,
         request_redactor: &Redactor,
         response_redactor: &Redactor,
-        changed: &BTreeSet<String>,
+        changed: &SortedSet<Name>,
     ) {
         self.query.redact_names(request_redactor);
         self.request.redact_names(request_redactor);

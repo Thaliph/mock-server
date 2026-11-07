@@ -18,7 +18,8 @@ Outbound HTTPS is, when the client trusts the injected bundle ([TLS interception
 Inbound HTTPS is not decrypted, so it is not discovered.
 
 **What about egress (calls my service makes)?**
-Not recorded yet (planned, F7 to F9). Today the reports describe what the deployment exposes.
+Yes, for HTTP and intercepted HTTPS: each sidecar records the calls and the controller merges them per
+deployment. See [Egress aggregation](Egress-aggregation).
 
 **Can I mock a dependency or load-test?**
 Not yet: mock mode (F10) and load testing (F11) are planned. `spec.mode: mock` is accepted but does

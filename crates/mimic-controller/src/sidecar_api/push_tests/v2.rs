@@ -5,9 +5,9 @@ use mimic_core::discovery::scope::ScopeKey;
 
 use super::*;
 
-const AUTHORITY: &str = "api.example.com:443";
+pub(super) const AUTHORITY: &str = "api.example.com:443";
 
-fn outbound_report(authorities: &[&str]) -> Report {
+pub(super) fn outbound_report(authorities: &[&str]) -> Report {
     let mut report = Report::new(Some(pod_of("pay")));
     exchange(&mut report, "/in", 200);
     for authority in authorities {

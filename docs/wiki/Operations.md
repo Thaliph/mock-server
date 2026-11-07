@@ -51,7 +51,7 @@ pod on the controller.
 | `mimic_discovery_redactions_total` | counter | `location` (`path`, `query`, `header`, `body`), `rule` |
 | `mimic_discovery_endpoints` | gauge | `direction` |
 | `mimic_discovery_sample_bytes` | gauge | none |
-| `mimic_discovery_pushes_total` | counter | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`) |
+| `mimic_discovery_pushes_total` | counter | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`, `inbound_only`: a version 2 report answered `400` or `507`, followed by the inbound-only fallback) |
 | `mimic_discovery_last_push_timestamp_seconds` | gauge | none (0 before the first acknowledged push) |
 
 ### Controller
@@ -154,7 +154,7 @@ Key messages:
 
 | What | Default | Guidance |
 |---|---|---|
-| Valkey memory limit | `1Gi` (`maxmemory` 768Mi) | Watch `mimic_store_report_bytes` and Valkey `used_memory`. A deployment's report is bounded by the store limits (512 endpoints per direction, 4Mi of samples); up to 50 deployments per namespace. Raise `valkey.resources.limits.memory` for many deployments. |
+| Valkey memory limit | `1Gi` (`maxmemory` 768Mi) | Watch `mimic_store_report_bytes` and Valkey `used_memory`. A deployment's report is bounded by the store limits (512 endpoints per direction, 4Mi of samples); up to 50 deployments per namespace. Raise `valkey.resources.limits.memory` for many deployments. During a write Valkey holds the old report, the staged copy (temporary `:stage:` keys, gone after the write or 60 s) and the new one: size `maxmemory` for about 3x a report per deployment being written (two writes per controller replica at once). |
 | Valkey PVC | `4Gi` | At least twice `maxmemory`, see [AOF rewrites](#aof-rewrites-and-sizing). |
 | Controller memory limit | `768Mi` | The pushes the 32Mi push body budget lets through at once, each held until its write ends, plus allocator headroom. |
 | Sidecar memory limit | `128Mi` | Samples up to 16Mi, capture up to 8Mi, plus proxy state. Raise `inject.sidecarResources.limits.memory` for many endpoints or connections. |

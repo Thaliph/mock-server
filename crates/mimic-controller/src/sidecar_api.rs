@@ -13,10 +13,10 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, RETRY_AFTER};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, RETRY_AFTER};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{any, post};
 use base64::Engine;
 use futures::StreamExt;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
@@ -26,7 +26,8 @@ use mimic_core::discovery::report::Report;
 use mimic_core::identity::pod_of_deployment;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use prometheus_client::registry::Registry;
+use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::registry::{Registry, Unit};
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::value::RawValue;
@@ -37,8 +38,10 @@ use crate::tls_ca::{SeedSlot, derive_root};
 use crate::workloads::WorkloadCache;
 
 mod admission;
+mod egress;
 
 pub use admission::{BodyBudget, RateLimiter, ReviewCache};
+pub use egress::Logged as EgressLogged;
 
 /// Audience of the projected token (spec §7.1).
 pub const AUDIENCE: &str = "mimic.platform.io";
@@ -51,19 +54,38 @@ const POD_NAME_CLAIM: &str = "authentication.kubernetes.io/pod-name";
 
 type Labels = Vec<(String, String)>;
 
-/// `mimic_sidecar_api_requests_total{endpoint,result}`.
-#[derive(Clone, Default)]
+/// `mimic_sidecar_api_requests_total{endpoint,result}` and the egress builds (spec §9).
+#[derive(Clone)]
 pub struct ApiMetrics {
     requests: Family<Labels, Counter>,
+    egress_builds: Family<Labels, Counter>,
+    egress_build_duration: Histogram,
 }
 
 impl ApiMetrics {
     pub fn register(registry: &mut Registry) -> ApiMetrics {
-        let metrics = ApiMetrics::default();
+        let metrics = ApiMetrics {
+            requests: Family::default(),
+            egress_builds: Family::default(),
+            egress_build_duration: Histogram::new([
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+        };
         registry.register(
             "sidecar_api_requests",
             "Requests answered by the sidecar API",
             metrics.requests.clone(),
+        );
+        registry.register(
+            "sidecar_api_egress_builds",
+            "Egress projections built, by result",
+            metrics.egress_builds.clone(),
+        );
+        registry.register_with_unit(
+            "sidecar_api_egress_build_duration",
+            "One egress projection, from the read of the stored bytes to the serialised set",
+            Unit::Seconds,
+            metrics.egress_build_duration.clone(),
         );
         metrics
     }
@@ -276,6 +298,13 @@ pub struct SidecarApi {
     pub max_report: usize,
     /// `MIMIC_STORE_MAX_PUSH_ENDPOINTS`.
     pub max_push_endpoints: usize,
+    /// `MIMIC_SIDECAR_API_MAX_EGRESS`.
+    pub max_egress: usize,
+    /// `MIMIC_SIDECAR_API_EGRESS_BUDGET`: what the egress cache will hold (F9 step 4).
+    #[allow(dead_code)] // read by the egress cache (F9 step 4)
+    pub egress_budget: u64,
+    /// What `egress_limit` warnings were written already.
+    pub egress_logged: egress::Logged,
 }
 
 pub fn router(api: Arc<SidecarApi>) -> Router {
@@ -299,6 +328,22 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
                     let peer = request.extensions().get::<Peer>().map(|peer| peer.0);
                     let headers = request.headers().clone();
                     api.report(&deployment, &headers, peer, request.into_body())
+                        .await
+                },
+            ),
+        )
+        .route(
+            "/v1/workloads/{deployment}/egress",
+            // `any`, not `get`: axum would answer HEAD too and list it in `Allow`.
+            any(
+                |State(api): State<Arc<SidecarApi>>,
+                 Path(deployment): Path<String>,
+                 request: axum::extract::Request| async move {
+                    if request.method() != Method::GET {
+                        return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, "GET")]).into_response();
+                    }
+                    let peer = request.extensions().get::<Peer>().map(|peer| peer.0);
+                    api.egress(&deployment, request.headers(), request.uri().query(), peer)
                         .await
                 },
             ),
@@ -609,7 +654,7 @@ impl SidecarApi {
         if length > self.max_report {
             return Err(TOO_LARGE);
         }
-        let _reservation = self.budget.reserve(length as u64).ok_or_else(|| {
+        let reservation = self.budget.reserve(length as u64).ok_or_else(|| {
             caller.error = Some("body budget spent".to_string());
             UNAVAILABLE
         })?;
@@ -641,10 +686,12 @@ impl SidecarApi {
         let push = Push {
             pod: pod.to_string(),
             seq,
-            report: report?,
+            json: report?,
         };
+        // The reservation goes with the push: the write goes on if the client disconnects, and
+        // so does the memory it holds (SHR-18).
         self.store
-            .push(&identity.namespace, deployment, push)
+            .push_holding(&identity.namespace, deployment, push, reservation)
             .await
             .map_err(|e| match e {
                 StoreError::Name => invalid("name"),
@@ -658,14 +705,15 @@ impl SidecarApi {
 }
 
 /// The envelope of a push, then its report: checked, re-redacted with the built-in rules
-/// and the names of the `MimicWorkload`s, and stamped with today (spec §7.3). Nothing of
-/// the push is logged before this is done.
+/// and the names of the `MimicWorkload`s, and stamped with today (spec §7.3), then written as
+/// JSON for the store, so that no parsed report waits for its write (#339). Nothing of the push
+/// is logged before this is done.
 fn prepare(
     bytes: &[u8],
     max_push_endpoints: usize,
     max_authorities: usize,
     extra: &[String],
-) -> (Option<SeqId>, Option<u64>, Result<Report, Refusal>) {
+) -> (Option<SeqId>, Option<u64>, Result<String, Refusal>) {
     let Ok(request) = serde_json::from_slice::<PushRequest>(bytes) else {
         return (None, None, Err(invalid("malformed")));
     };
@@ -701,6 +749,7 @@ fn prepare(
         report.stamp(today);
         report
     });
+    let report = report.and_then(|report| report.to_json().map_err(|_| UNAVAILABLE));
     (Some(seq), version, report)
 }
 
@@ -927,6 +976,9 @@ mod tests {
             workloads: Arc::new(WorkloadCache::new()),
             max_report: 1 << 20,
             max_push_endpoints: 256,
+            max_egress: 4 << 20,
+            egress_budget: 32 << 20,
+            egress_logged: egress::Logged::default(),
         });
         Setup {
             router: router(api),

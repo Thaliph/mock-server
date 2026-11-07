@@ -23,6 +23,10 @@ pub struct PushConfig {
     pub body_budget: u64,
     /// `MIMIC_STORE_MAX_PUSH_ENDPOINTS`.
     pub max_push_endpoints: usize,
+    /// `MIMIC_SIDECAR_API_MAX_EGRESS`, in bytes.
+    pub max_egress: usize,
+    /// `MIMIC_SIDECAR_API_EGRESS_BUDGET`, in bytes.
+    pub egress_budget: u64,
     pub store: StoreConfig,
     /// `MIMIC_STATUS_INTERVAL` (read by the status reconciler).
     pub status_interval: Duration,
@@ -37,6 +41,10 @@ impl PushConfig {
         let max_report = size(env, "MIMIC_SIDECAR_API_MAX_REPORT", 32 * MIB, 64 * KIB, GIB)?;
         let var = "MIMIC_SIDECAR_API_BODY_BUDGET";
         let body_budget = size(env, var, 32 * MIB, max_report, 4 * GIB)?;
+        let var = "MIMIC_SIDECAR_API_MAX_EGRESS";
+        let max_egress = size(env, var, 4 * MIB, 64 * KIB, GIB)?;
+        let var = "MIMIC_SIDECAR_API_EGRESS_BUDGET";
+        let egress_budget = size(env, var, 32 * MIB, max_egress, 4 * GIB)?;
         let max_endpoints = number(env, "MIMIC_STORE_MAX_ENDPOINTS", 512, 1, 10_000)?;
         let var = "MIMIC_STORE_MAX_PUSH_ENDPOINTS";
         let max_push_endpoints = number(env, var, 256, 1, max_endpoints)?;
@@ -45,6 +53,8 @@ impl PushConfig {
             max_report: usize_of(max_report),
             body_budget,
             max_push_endpoints,
+            max_egress: usize_of(max_egress),
+            egress_budget,
             store: StoreConfig {
                 ttl: duration(env, "MIMIC_STORE_TTL", 30 * DAY, 10, 365 * DAY)?,
                 limits: Limits {
@@ -298,5 +308,48 @@ mod tests {
             ("MIMIC_STORE_MAX_PUSH_ENDPOINTS", "100"),
         ]);
         assert!(PushConfig::from_env(&ok).is_ok());
+    }
+
+    #[test]
+    fn pul_11_the_egress_limits_have_defaults_and_bounds() {
+        let config = PushConfig::from_env(&env(&[])).expect("the defaults are valid");
+        assert_eq!(config.max_egress, 4 << 20);
+        assert_eq!(config.egress_budget, 32 << 20);
+        let invalid = [
+            ("MIMIC_SIDECAR_API_MAX_EGRESS", "0"),
+            ("MIMIC_SIDECAR_API_MAX_EGRESS", "63Ki"),
+            ("MIMIC_SIDECAR_API_MAX_EGRESS", "2Gi"),
+            ("MIMIC_SIDECAR_API_MAX_EGRESS", "abc"),
+            ("MIMIC_SIDECAR_API_EGRESS_BUDGET", "3Mi"),
+            ("MIMIC_SIDECAR_API_EGRESS_BUDGET", "5Gi"),
+            ("MIMIC_SIDECAR_API_EGRESS_BUDGET", "abc"),
+        ];
+        for (var, value) in invalid {
+            let error = PushConfig::from_env(&env(&[(var, value)]))
+                .err()
+                .unwrap_or_else(|| panic!("{var}={value} was accepted"));
+            assert!(error.to_string().contains(var), "{var}={value}: {error}");
+        }
+        // The budget must hold the largest projection.
+        let error = PushConfig::from_env(&env(&[
+            ("MIMIC_SIDECAR_API_MAX_EGRESS", "8Mi"),
+            ("MIMIC_SIDECAR_API_EGRESS_BUDGET", "4Mi"),
+        ]))
+        .err()
+        .expect("budget below the largest projection");
+        assert!(
+            error
+                .to_string()
+                .contains("MIMIC_SIDECAR_API_EGRESS_BUDGET")
+        );
+        let config = PushConfig::from_env(&env(&[
+            ("MIMIC_SIDECAR_API_MAX_EGRESS", "64Ki"),
+            ("MIMIC_SIDECAR_API_EGRESS_BUDGET", "64Ki"),
+        ]))
+        .expect("the minimums are valid");
+        assert_eq!(
+            (config.max_egress, config.egress_budget),
+            (64 << 10, 64 << 10)
+        );
     }
 }
