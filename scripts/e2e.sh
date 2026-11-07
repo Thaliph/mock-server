@@ -10,7 +10,10 @@
 #   CLUSTER=mimic-e2e                           kind cluster name
 #   NODE_IMAGE=kindest/node:v1.33.12@sha256:…    kind node image (default: kind's own)
 #   KEEP_CLUSTER=1                              keep the cluster afterwards (default: keep locally, delete in CI)
-set -euo pipefail
+set -Eeuo pipefail
+# A command that fails outside a condition ends the run: name it, so that no exit (141 from a SIGPIPE included) is
+# silent. errtrace (-E) carries the trap into functions and command substitutions.
+trap 'e2e_status=$?; echo "FAIL line $LINENO: \"$BASH_COMMAND\" exited with status $e2e_status" >&2' ERR
 cd "$(dirname "$0")/.."
 
 TAG=${TAG:-e2e-$(git rev-parse --short HEAD 2>/dev/null || echo local)-$$}
@@ -655,11 +658,9 @@ kubectl -n inj-13-up exec client -- python3 -c \
 kubectl -n inj-13 exec "$pod" -c app -- python3 -c \
   'import urllib.request; urllib.request.urlopen("http://echo.inj-13-up.svc:8080/prx14", timeout=10).read()' \
   || fail "prx_14: outbound HTTP request through the sidecar failed"
-want_pem=$(secret_key 'tls\.crt' | base64 -d) || fail "prx_14: cannot read the webhook certificate"
-want_fp=$(openssl x509 -outform DER <<<"$want_pem" | sha256sum | cut -d' ' -f1) \
-  || fail "prx_14: cannot read the webhook certificate"
 # The client prints the fingerprint of the certificate it saw, then that certificate as PEM (for a failed check).
-got_out=$(kubectl -n inj-13 exec -i "$pod" -c app -- python3 - "$webhook" <<'PY'
+prx14_seen() {
+  kubectl -n inj-13 exec -i "$pod" -c app -- python3 - "$webhook" <<'PY'
 import hashlib, socket, ssl, sys
 host = sys.argv[1]
 ctx = ssl.create_default_context()
@@ -679,10 +680,21 @@ with socket.create_connection((host, 8443), 10) as sock:
         except (OSError, ssl.SSLError):
             pass
 PY
-) || fail "prx_14: TLS connection to the webhook Service through the sidecar failed"
-got_fp=$(head -n 1 <<<"$got_out")
+}
+# The sidecar passes an unverifiable destination through, even on a first connection (TLS-18, #331): a mismatch
+# here is a rotation of the webhook certificate that one controller replica does not serve yet. Both sides are read
+# again until they agree; one that lasts 60 s fails with both certificates printed.
+for _ in $(seq 30); do
+  want_pem=$(secret_key 'tls\.crt' | base64 -d) || fail "prx_14: cannot read the webhook certificate"
+  want_fp=$(openssl x509 -outform DER <<<"$want_pem" | sha256sum | cut -d' ' -f1) \
+    || fail "prx_14: cannot read the webhook certificate"
+  got_out=$(prx14_seen) || fail "prx_14: TLS connection to the webhook Service through the sidecar failed"
+  got_fp=$(awk 'NR == 1' <<<"$got_out")
+  [[ $got_fp == "$want_fp" ]] && break
+  sleep 2
+done
 if [[ $got_fp != "$want_fp" ]]; then
-  # Diagnostics only, no retry (#331): both certificates and what the sidecar did with the connection.
+  # Both certificates and what the sidecar did with the connections (#331).
   {
     echo "prx_14: expected certificate (the webhook Secret), fingerprint $want_fp:"
     openssl x509 -noout -subject -issuer -dates <<<"$want_pem" || true
@@ -1258,7 +1270,7 @@ ui_forward() {
   local pod
   if [[ -n ${UI_PF:-} ]]; then kill "$UI_PF" 2>/dev/null || true; wait "$UI_PF" 2>/dev/null || true; fi
   pod=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller --field-selector=status.phase=Running \
-    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | head -n 1)
+    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}' | awk 'NR == 1')
   [[ -n $pod ]] || fail "ctl_20: no controller pod to forward to"
   kubectl -n "$NS" port-forward "pod/$pod" 18082:8080 >/dev/null 2>&1 &
   UI_PF=$!
@@ -1477,7 +1489,7 @@ while (( SECONDS < end )); do
   sleep 2
 done
 [[ ${row[2]:-} == 0 ]] || fail "ctl_19: a MimicWorkload without data prints '$idle_row', want 0 in the Endpoints column"
-header=$(kubectl -n disc-22 get mimicworkload users-a | head -n 1)
+header=$(kubectl -n disc-22 get mimicworkload users-a | awk 'NR == 1')
 [[ $header == *"MODE"*"ENDPOINTS"*"PODS"*"LAST PUSH"* ]] || fail "ctl_19: the printed columns are '$header'"
 kubectl -n disc-22 get mimicworkload users-a -o json --show-managed-fields \
   | jq -e '[.metadata.managedFields[] | select(.manager == "mimic-controller" and .operation == "Apply" and .subresource == "status")] | length == 1' >/dev/null \
@@ -1997,7 +2009,7 @@ egr_check_outbound() {
     || fail "egr_19: no scopes.outbound.\"$egr_authority\" in the merged report of front"
   jq -e '(.scopes.outbound | keys) | length == 1' "$egr_report" >/dev/null \
     || fail "egr_19: front has outbound scopes other than users: $(jq -c '.scopes.outbound | keys' "$egr_report")"
-  [[ $(endpoints "$egr_report" | jq -r --arg a "$egr_authority" '.[] | select(.direction == "outbound") | select(.port == $a) | "\(.method) \(.template)"' | sort | tr '\n' ';') \
+  [[ $(endpoints "$egr_report" | jq -r --arg a "$egr_authority" '.[] | select(.direction == "outbound") | select(.port == $a) | "\(.method) \(.template)"' | LC_ALL=C sort | tr '\n' ';') \
      == 'GET /missing;GET /users/{users_id};PUT /users/{users_id};' ]] \
     || fail "egr_19: the outbound endpoints of front are not GET /missing, GET and PUT /users/{users_id}: $(endpoints "$egr_report" | jq -c '[.[] | select(.direction == "outbound") | "\(.method) \(.template)"]')"
   out_status() { endpoints "$egr_report" | jq -r --arg m "$1" --arg t "$2" --arg s "$3" \
@@ -2052,7 +2064,7 @@ egr_check_canaries "$egr_merged" "the merged report of front"
 egr_check_discovery
 # The controller lists both pods.
 curl -fs --max-time 10 localhost:18082/v1/workloads/egr-19/front > "$WORK/egr19-summary.json" || fail "egr_19: cannot read the summary of front"
-[[ $(jq -r '.pods | keys | join(" ")' "$WORK/egr19-summary.json") == "$(tr ' ' '\n' <<<"$egr_pods" | sort | tr '\n' ' ' | sed 's/ $//')" ]] \
+[[ $(jq -r '.pods | keys | join(" ")' "$WORK/egr19-summary.json") == "$(tr ' ' '\n' <<<"$egr_pods" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')" ]] \
   || fail "egr_19: the controller does not list both front pods: $(jq -c '.pods | keys' "$WORK/egr19-summary.json")"
 
 # The documents: the outbound document of users, in the list of front's documents, with the operations, the server and
