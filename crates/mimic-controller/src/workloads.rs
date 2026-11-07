@@ -8,6 +8,8 @@ use futures::StreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::watcher::{self, Event};
+use mimic_core::mock;
+pub use mimic_core::mock::{Effective, MockSettings};
 use mimic_core::proxy::tls::MAX_EXCLUDES;
 
 /// `(namespace, name, spec.deployment, spec.tls.exclude, spec.discovery.redact)` of a
@@ -21,55 +23,6 @@ pub struct Target {
     pub name: String,
     pub deployment: String,
     pub status: Option<serde_json::Value>,
-}
-
-/// `spec.mode`, `spec.mock.latencyFactor` and `spec.mock.passthrough` of a `MimicWorkload`
-/// (spec §7).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MockSettings {
-    /// `spec.mode` is `mock`.
-    pub mock: bool,
-    /// `spec.mock.latencyFactor` in hundredths, rounded half up (0 to 10 000).
-    pub factor: u32,
-    pub passthrough: Vec<String>,
-}
-
-impl Default for MockSettings {
-    fn default() -> MockSettings {
-        MockSettings {
-            mock: false,
-            factor: 100,
-            passthrough: Vec::new(),
-        }
-    }
-}
-
-/// The mode of a deployment, from all its `MimicWorkload`s (spec §7 "Effective mode").
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Effective {
-    pub mock: bool,
-    /// Latency factor in hundredths.
-    pub factor: u32,
-    /// Sorted, deduplicated, at most [`MAX_EXCLUDES`] entries.
-    pub passthrough: Vec<String>,
-}
-
-impl Effective {
-    /// `Mimic-Mode` and `MIMIC_MODE`.
-    pub fn mode(&self) -> &'static str {
-        if self.mock { "mock" } else { "discovery" }
-    }
-
-    /// `Mimic-Latency-Factor` and `MIMIC_MOCK_LATENCY_FACTOR`: the shortest decimal that reads
-    /// back to the same value (`1`, `0.5`, `0.05`, `100`).
-    pub fn factor_text(&self) -> String {
-        let (whole, frac) = (self.factor / 100, self.factor % 100);
-        match frac {
-            0 => whole.to_string(),
-            f if f % 10 == 0 => format!("{whole}.{}", f / 10),
-            f => format!("{whole}.{f:02}"),
-        }
-    }
 }
 
 /// `spec.deployment`, `spec.tls.exclude` and `spec.discovery.redact` of a `MimicWorkload`.
@@ -150,28 +103,14 @@ impl WorkloadCache {
     /// the union of their passthrough lists.
     pub fn effective(&self, namespace: &str, deployment: &str) -> Effective {
         let state = self.read();
-        let mut effective = Effective {
-            mock: false,
-            factor: MockSettings::default().factor,
-            passthrough: Vec::new(),
-        };
-        let mut union = BTreeSet::new();
-        // `items` is sorted by `(namespace, name)`.
-        for (key, (d, _, _)) in &state.items {
-            if key.0 != namespace || d != deployment {
-                continue;
-            }
-            let Some(mock) = state.mocks.get(key) else {
-                continue;
-            };
-            if mock.mock && !effective.mock {
-                effective.mock = true;
-                effective.factor = mock.factor;
-            }
-            union.extend(mock.passthrough.iter().cloned());
-        }
-        effective.passthrough = union.into_iter().take(MAX_EXCLUDES).collect();
-        effective
+        // `items` is sorted by `(namespace, name)`, so the settings come in name order.
+        mock::effective(
+            state
+                .items
+                .iter()
+                .filter(|(key, (d, _, _))| key.0 == namespace && d == deployment)
+                .filter_map(|(key, _)| state.mocks.get(key)),
+        )
     }
 
     /// Records the `status.discovery` the cluster holds for a `MimicWorkload`.
@@ -585,11 +524,14 @@ mod tests {
     fn mck_01_no_workload_or_only_discovery_gives_discovery_factor_1_no_passthrough() {
         let cache = WorkloadCache::synced_with(&[("shop", "w1", "api")]);
         let none = cache.effective("shop", "web");
-        assert_eq!((none.mode(), none.factor_text()), ("discovery", "1".into()));
+        assert_eq!(
+            (none.mode().as_str(), none.factor_text()),
+            ("discovery", "1".into())
+        );
         assert!(none.passthrough.is_empty());
         cache.set_mock("shop", "w1", mock(false, 100, &[]));
         let found = cache.effective("shop", "api");
-        assert_eq!(found.mode(), "discovery");
+        assert_eq!(found.mode().as_str(), "discovery");
         assert_eq!(found.factor, 100);
     }
 
@@ -606,14 +548,14 @@ mod tests {
         cache.set_mock("shop", "a", mock(false, 700, &[]));
         cache.set_mock("other", "a", mock(true, 900, &[]));
         let found = cache.effective("shop", "api");
-        assert_eq!(found.mode(), "mock");
+        assert_eq!(found.mode().as_str(), "mock");
         assert_eq!(found.factor_text(), "0.5");
         // Another namespace never leaks in.
         assert_eq!(cache.effective("other", "api").factor, 900);
         cache.remove("shop", "b");
         assert_eq!(cache.effective("shop", "api").factor, 300);
         cache.remove("shop", "c");
-        assert_eq!(cache.effective("shop", "api").mode(), "discovery");
+        assert_eq!(cache.effective("shop", "api").mode().as_str(), "discovery");
     }
 
     #[test]

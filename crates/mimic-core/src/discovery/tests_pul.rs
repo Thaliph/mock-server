@@ -1,6 +1,7 @@
 //! PUL-01 to PUL-05: the egress set, its check, digest and ETag, and the local view
 //! (spec §7.7). Canaries never appear in assertion messages.
 
+use crate::Mode;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 use xxhash_rust::xxh3::xxh3_64;
@@ -667,7 +668,7 @@ proptest! {
         sketch_hashes(&serde_json::from_str(&r.to_json().unwrap()).unwrap(), &mut hashes);
         let set = EgressSet::project(&r);
         let json = set.to_json().unwrap();
-        let view = summary(Some((&set, "\"1-ab\"", "2026-01-01T00:00:00Z")));
+        let view = summary(Some((&set, "\"1-ab\"", "2026-01-01T00:00:00Z")), Mode::Discovery, 100);
         let needles = [canary.clone(), form(ua, &canary).1,
             form(etag_form, &canary).1];
         for needle in &needles {
@@ -765,18 +766,59 @@ fn pul_04_if_none_match_matches_one_entry_exactly() {
 #[test]
 fn pul_05_without_a_snapshot() {
     assert_eq!(
-        summary(None),
-        r#"{"authorities":{},"etag":null,"pulled":null}"#
+        summary(None, Mode::Discovery, 100),
+        r#"{"authorities":{},"etag":null,"latency_factor":1,"mode":"discovery","pulled":null}"#
     );
+}
+
+fn v_mode(text: &str) -> String {
+    let v: Value = serde_json::from_str(text).expect("json");
+    v["mode"].as_str().unwrap_or_default().to_string()
+}
+
+fn v_factor(text: &str) -> Value {
+    let v: Value = serde_json::from_str(text).expect("json");
+    v["latency_factor"].clone()
+}
+
+#[test]
+fn pul_05_the_factor_is_written_as_the_shortest_number() {
+    let text = |factor| summary(None, Mode::Mock, factor);
+    for (factor, written) in [
+        (100, "1"),
+        (50, "0.5"),
+        (0, "0"),
+        (10_000, "100"),
+        (5, "0.05"),
+        (130, "1.3"),
+        (101, "1.01"),
+    ] {
+        assert!(
+            text(factor).contains(&format!(r#""latency_factor":{written},"#)),
+            "{factor}"
+        );
+    }
 }
 
 #[test]
 fn pul_05_summary_of_a_snapshot() {
     let set = EgressSet::project(&mixed());
-    let text = summary(Some((&set, "\"1-ab\"", "2026-11-06T10:00:00Z")));
+    let text = summary(
+        Some((&set, "\"1-ab\"", "2026-11-06T10:00:00Z")),
+        Mode::Mock,
+        50,
+    );
     assert_eq!(
         text,
-        summary(Some((&set.clone(), "\"1-ab\"", "2026-11-06T10:00:00Z")))
+        summary(
+            Some((&set.clone(), "\"1-ab\"", "2026-11-06T10:00:00Z")),
+            Mode::Mock,
+            50
+        )
+    );
+    assert_eq!(
+        (v_mode(&text), v_factor(&text)),
+        ("mock".into(), json!(0.5))
     );
     let v: Value = serde_json::from_str(&text).expect("json");
     assert_eq!(v["etag"], "\"1-ab\"");
@@ -792,7 +834,7 @@ fn pul_05_summary_of_a_snapshot() {
     assert!(v["authorities"]["10.0.0.5:8080"].is_object());
     // Keys sorted at every level, and nothing but the five fields per endpoint.
     assert!(text.starts_with(r#"{"authorities":{"#));
-    assert!(text.contains(r#""etag":"\"1-ab\"","pulled":"#));
+    assert!(text.contains(r#""etag":"\"1-ab\"","latency_factor":0.5,"mode":"mock","pulled":"#));
     for e in api.as_array().unwrap() {
         let mut ks: Vec<_> = e.as_object().unwrap().keys().cloned().collect();
         ks.sort();
@@ -808,10 +850,16 @@ fn pul_05_summary_of_a_snapshot() {
     // The sample bodies and the field names are not in the view.
     assert!(!text.contains("x-request-id") && !text.contains("authorization"));
     assert!(!text.contains("id-1"));
-    let key_order: Vec<usize> = ["\"authorities\"", "\"etag\"", "\"pulled\""]
-        .iter()
-        .map(|k| text.find(k).expect("key"))
-        .collect();
+    let key_order: Vec<usize> = [
+        "\"authorities\"",
+        "\"etag\"",
+        "\"latency_factor\"",
+        "\"mode\"",
+        "\"pulled\"",
+    ]
+    .iter()
+    .map(|k| text.find(k).expect("key"))
+    .collect();
     assert!(key_order.windows(2).all(|w| w[0] < w[1]));
 }
 
@@ -819,7 +867,11 @@ fn pul_05_summary_of_a_snapshot() {
 fn pul_05_an_empty_snapshot_still_has_an_etag() {
     let set = EgressSet::project(&Report::new(None));
     assert_eq!(
-        summary(Some((&set, "\"1-ab\"", "2026-11-06T10:00:00Z"))),
-        r#"{"authorities":{},"etag":"\"1-ab\"","pulled":"2026-11-06T10:00:00Z"}"#
+        summary(
+            Some((&set, "\"1-ab\"", "2026-11-06T10:00:00Z")),
+            Mode::Discovery,
+            100
+        ),
+        r#"{"authorities":{},"etag":"\"1-ab\"","latency_factor":1,"mode":"discovery","pulled":"2026-11-06T10:00:00Z"}"#
     );
 }

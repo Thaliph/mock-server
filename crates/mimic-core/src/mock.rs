@@ -2,6 +2,7 @@
 //! snapshot, the tiers, the answer and the latency draw. No I/O, no clock: the sidecar owns
 //! the sockets and the timers, and hands the draw its random numbers.
 
+mod effective;
 mod index;
 mod latency;
 mod signature;
@@ -14,10 +15,11 @@ use std::sync::Arc;
 
 use crate::discovery::histogram::Histogram;
 
+pub use effective::{DEFAULT_FACTOR, Effective, MockSettings, effective};
 pub use index::Index;
 pub use latency::{
-    MAX_DELAY_MS, MAX_FACTOR, Random, draw, format_factor, parse_factor, parse_factor_header,
-    parse_mode_header, scale,
+    MAX_DELAY_MS, MAX_FACTOR, Random, draw, factor_number, format_factor, parse_factor,
+    parse_factor_header, parse_mode_header, scale,
 };
 pub use signature::{Signature, signature};
 

@@ -119,6 +119,16 @@ pub fn format_factor(hundredths: u32) -> String {
     }
 }
 
+/// A factor as a JSON number: `1`, `0.5`, `0.05` (the shortest form, as [`format_factor`]).
+pub fn factor_number(hundredths: u32) -> serde_json::Number {
+    if hundredths.is_multiple_of(100) {
+        serde_json::Number::from(hundredths / 100)
+    } else {
+        // Division of two integers is correctly rounded: it prints as the decimal written.
+        serde_json::Number::from_f64(f64::from(hundredths) / 100.0).unwrap_or_else(|| 0.into())
+    }
+}
+
 /// The `Mimic-Latency-Factor` of an answer, in hundredths: exactly one valid value.
 pub fn parse_factor_header(values: &[&str]) -> Option<u32> {
     match values {

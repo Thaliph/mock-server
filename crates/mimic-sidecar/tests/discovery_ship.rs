@@ -191,6 +191,13 @@ async fn fake_api(script: Vec<Reply>) -> FakeApi {
                             .unwrap_or_default()
                             .to_string();
                         let path = req.uri().path().to_string();
+                        // The egress pull of the sidecar (spec §7.7) is not a push.
+                        if path.ends_with("/egress") {
+                            return Ok(Response::builder()
+                                .status(404)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap());
+                        }
                         let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
                         let scripted = script.lock().unwrap().pop_front();
                         let reply = scripted.unwrap_or_else(|| {

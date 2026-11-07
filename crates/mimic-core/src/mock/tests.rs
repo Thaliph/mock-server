@@ -1004,3 +1004,78 @@ fn mck_06_mode_headers_are_read_exactly() {
         assert_eq!(format_factor(hundredths), factor);
     }
 }
+
+// --- MCK-01: the effective mode ----------------------------------------------------------
+
+fn settings(on: bool, factor: u32, passthrough: &[&str]) -> MockSettings {
+    MockSettings {
+        mock: on,
+        factor,
+        passthrough: passthrough.iter().map(|p| p.to_string()).collect(),
+    }
+}
+
+#[test]
+fn mck_01_no_workload_gives_discovery_factor_1_no_passthrough() {
+    let none = effective([]);
+    assert_eq!(
+        (none.mode(), none.factor_text()),
+        (Mode::Discovery, "1".into())
+    );
+    assert!(none.passthrough.is_empty());
+    let discovery = settings(false, 100, &[]);
+    assert_eq!(effective([&discovery]).mode(), Mode::Discovery);
+    assert_eq!(effective([&MockSettings::default()]), none);
+}
+
+#[test]
+fn mck_01_one_mock_workload_wins_and_the_first_in_order_gives_the_factor() {
+    let (a, b, c) = (
+        settings(false, 700, &[]),
+        settings(true, 50, &[]),
+        settings(true, 300, &[]),
+    );
+    let found = effective([&a, &b, &c]);
+    assert_eq!(
+        (found.mode(), found.factor_text()),
+        (Mode::Mock, "0.5".into())
+    );
+    assert_eq!(effective([&a, &c]).factor, 300);
+    assert_eq!(effective([&a]).mode(), Mode::Discovery);
+}
+
+#[test]
+fn mck_01_passthrough_is_the_sorted_deduplicated_union_cut_to_256() {
+    let (a, b) = (
+        settings(false, 100, &["b.test", "a.test"]),
+        settings(true, 100, &["b.test", "*.c.test"]),
+    );
+    assert_eq!(
+        effective([&a, &b]).passthrough,
+        ["*.c.test", "a.test", "b.test"]
+    );
+    let many: Vec<String> = (0..200).map(|i| format!("h{i:03}.test")).collect();
+    let more: Vec<String> = (100..300).map(|i| format!("h{i:03}.test")).collect();
+    fn refs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    let (a, b) = (
+        settings(false, 100, &refs(&many)),
+        settings(false, 100, &refs(&more)),
+    );
+    let union = effective([&a, &b]).passthrough;
+    assert_eq!(union.len(), 256);
+    assert_eq!(
+        (union[0].as_str(), union[255].as_str()),
+        ("h000.test", "h255.test")
+    );
+}
+
+#[test]
+fn mck_01_factor_text_is_the_shortest_decimal() {
+    let texts: Vec<String> = [100, 50, 0, 10_000, 5, 130, 101]
+        .into_iter()
+        .map(|f| effective([&settings(true, f, &[])]).factor_text())
+        .collect();
+    assert_eq!(texts, ["1", "0.5", "0", "100", "0.05", "1.3", "1.01"]);
+}
