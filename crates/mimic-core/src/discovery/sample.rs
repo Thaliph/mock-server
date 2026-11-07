@@ -6,6 +6,7 @@ use crate::compact::{Name, SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::check::Violation;
@@ -20,12 +21,75 @@ use super::volatile::Volatility;
 /// Samples kept per endpoint.
 pub const MAX_SAMPLES: usize = 20;
 
+/// A JSON value kept as its canonical text (compact, object keys sorted: what `serde_json`
+/// writes a `Value` as), which costs the length of the text instead of a tree of maps and
+/// strings (#339, SHR-22). Read again from any text, it is canonicalised; the redaction, the
+/// shape and the examples parse it for the time they need it.
+#[derive(Debug, Clone)]
+struct Text(Box<RawValue>);
+
+impl Text {
+    fn new(value: &Value) -> Self {
+        // Plain data: serialisation cannot fail, and its output is valid JSON.
+        let text = serde_json::to_string(value).unwrap_or_default();
+        Self(RawValue::from_string(text).unwrap_or_else(|_| null()))
+    }
+
+    fn value(&self) -> Value {
+        serde_json::from_str(self.0.get()).unwrap_or(Value::Null)
+    }
+
+    /// The length of the text, which is the serialised length of the value.
+    fn len(&self) -> usize {
+        self.0.get().len()
+    }
+}
+
+fn null() -> Box<RawValue> {
+    RawValue::NULL.to_owned()
+}
+
+impl PartialEq for Text {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.get() == other.0.get()
+    }
+}
+
+impl Eq for Text {}
+
+impl Serialize for Text {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Text {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Value::deserialize(deserializer).map(|value| Self::new(&value))
+    }
+}
+
+/// The pairs of a form value, an array of `[key, value]`.
+fn form_pairs(value: &Value) -> Vec<Pair> {
+    let items = value.as_array().map_or(&[][..], Vec::as_slice);
+    items
+        .iter()
+        .filter_map(|item| match item.as_array()?.as_slice() {
+            [Value::String(key), Value::String(value)] => Some(Pair {
+                key: key.clone(),
+                value: value.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A parsed body. Opaque and oversized bodies are not kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Body {
     media: String,
-    value: Value,
+    value: Text,
 }
 
 impl Body {
@@ -34,26 +98,14 @@ impl Body {
         if self.media != "application/x-www-form-urlencoded" {
             return None;
         }
-        let items = self.value.as_array().map_or(&[][..], Vec::as_slice);
-        Some(
-            items
-                .iter()
-                .filter_map(|item| match item.as_array()?.as_slice() {
-                    [Value::String(key), Value::String(value)] => Some(Pair {
-                        key: key.clone(),
-                        value: value.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect(),
-        )
+        Some(form_pairs(&self.value.value()))
     }
 
     /// The media type and the value as an example: a form is an object of field to value, a
     /// repeated field an array of values.
     fn example(&self) -> (&str, Value) {
         let Some(pairs) = self.form() else {
-            return (&self.media, self.value.clone());
+            return (&self.media, self.value.value());
         };
         let mut object = serde_json::Map::new();
         for Pair { key, value } in pairs {
@@ -70,17 +122,21 @@ impl Body {
         (&self.media, Value::Object(object))
     }
 
+    /// The body is parsed for the redaction only, and kept as text again.
     fn redact(&mut self, redactor: &Redactor) {
-        let Some(pairs) = self.form() else {
-            redactor.json(&mut self.value);
-            return;
-        };
-        // A form that does not have the shape the recorder gives it is not kept.
-        if self.value.as_array().is_none_or(|a| a.len() != pairs.len()) {
-            self.value = Value::String(MARKER.to_string());
+        let mut value = self.value.value();
+        if self.media != "application/x-www-form-urlencoded" {
+            redactor.json(&mut value);
+            self.value = Text::new(&value);
             return;
         }
-        self.value = Value::Array(
+        let pairs = form_pairs(&value);
+        // A form that does not have the shape the recorder gives it is not kept.
+        if value.as_array().is_none_or(|a| a.len() != pairs.len()) {
+            self.value = Text::new(&Value::String(MARKER.to_string()));
+            return;
+        }
+        self.value = Text::new(&Value::Array(
             pairs
                 .into_iter()
                 .map(|p| {
@@ -88,11 +144,13 @@ impl Body {
                     Value::Array(vec![p.key.into(), value.into()])
                 })
                 .collect(),
-        );
+        ));
     }
 
     fn shape(&self) -> u64 {
-        body_shape(&self.media, &self.value, self.form())
+        let value = self.value.value();
+        let form = (self.media == "application/x-www-form-urlencoded").then(|| form_pairs(&value));
+        body_shape(&self.media, &value, form)
     }
 }
 
@@ -149,7 +207,7 @@ fn body(parsed: Option<Parsed>) -> Option<Body> {
     };
     Some(Body {
         media: parsed.media,
-        value,
+        value: Text::new(&value),
     })
 }
 
@@ -248,7 +306,7 @@ impl Sample {
             if !parsed_media(&body.media) {
                 return Err(Violation::BodyMedia);
             }
-            if serde_json::to_vec(&body.value).map_or(usize::MAX, |v| v.len()) > MAX_BODY {
+            if body.value.len() > MAX_BODY {
                 return Err(Violation::BodySize);
             }
         }
@@ -337,7 +395,7 @@ impl Sample {
             let prefix = format!("{prefix}/{}", body.media);
             match body.form() {
                 Some(form) => observe_pairs(&mut fields, &mut seen, &prefix, &form),
-                None => observe_leaves(&mut fields, &mut seen, &prefix, "", &body.value, 1),
+                None => observe_leaves(&mut fields, &mut seen, &prefix, "", &body.value.value(), 1),
             }
         }
         fields
