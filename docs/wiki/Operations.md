@@ -51,7 +51,7 @@ pod on the controller.
 | `mimic_discovery_redactions_total` | counter | `location` (`path`, `query`, `header`, `body`), `rule` |
 | `mimic_discovery_endpoints` | gauge | `direction` |
 | `mimic_discovery_sample_bytes` | gauge | none |
-| `mimic_discovery_pushes_total` | counter | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`) |
+| `mimic_discovery_pushes_total` | counter | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`, `inbound_only`: a version 2 report answered `400` or `507`, followed by the inbound-only fallback) |
 | `mimic_discovery_last_push_timestamp_seconds` | gauge | none (0 before the first acknowledged push) |
 
 ### Controller

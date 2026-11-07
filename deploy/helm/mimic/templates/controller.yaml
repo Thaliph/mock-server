@@ -46,7 +46,8 @@ spec:
           command: ["/usr/local/bin/mimic-controller"]
           env:
             # Bounds the allocator's arenas: the controller holds reports of tens of megabytes
-            # (spec §7.3, SHR-18).
+            # (spec §7.3, SHR-18). It applies to glibc, which the image has: the controller is built
+            # on Debian and runs on distroless cc-debian13, with the default allocator.
             - name: MALLOC_ARENA_MAX
               value: "2"
             - name: MIMIC_LOG

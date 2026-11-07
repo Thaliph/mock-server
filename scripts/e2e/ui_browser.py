@@ -8,6 +8,8 @@
 #   buttons    the text of every button
 #   methods    the text of every operation method label
 #   xss_imgs   the number of img elements whose src holds "ui-xss"
+#   links      the text and href attribute of every link
+#   rows       the cell texts of every table row
 #   requests   the URL of every request the page made
 #   interceptor with --interceptor, the outcome of window.mimicRequestInterceptor on its URLs: for each, whether
 #              it threw (a refusal) or returned the request
@@ -193,6 +195,8 @@ COLLECT = """JSON.stringify({
   buttons: Array.from(document.querySelectorAll('button')).map((b) => b.innerText || b.textContent),
   methods: Array.from(document.querySelectorAll('.opblock-summary-method')).map((m) => m.textContent),
   xss_imgs: document.querySelectorAll('img[src*="ui-xss"]').length,
+  links: Array.from(document.querySelectorAll('a')).map((a) => ({text: a.textContent, href: a.getAttribute('href')})),
+  rows: Array.from(document.querySelectorAll('tr')).map((r) => Array.from(r.children).map((c) => c.textContent)),
 })"""
 
 
