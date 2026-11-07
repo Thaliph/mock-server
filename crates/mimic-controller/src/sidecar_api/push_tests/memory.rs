@@ -251,6 +251,16 @@ async fn work(dir: &str, budget: u64, concurrent: bool, pulled: bool) {
     }
     if pulled {
         eprintln!("PULLS={statuses:?}");
+        // A run in which every pull was refused measures nothing.
+        assert!(
+            statuses.get(&200).copied().unwrap_or(0) > 0,
+            "no pull got 200: {statuses:?}"
+        );
+        let builds = series(
+            &s.metrics,
+            "mimic_sidecar_api_egress_builds_total{result=\"ok\"}",
+        );
+        assert!(builds.unwrap_or(0.0) >= 1.0, "no build ran");
     }
     // A document of each kind per deployment, rendered at once.
     let ui = ui_router(s.api.store.clone(), UiMetrics::default());

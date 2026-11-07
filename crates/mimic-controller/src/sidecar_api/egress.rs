@@ -172,14 +172,27 @@ struct Flight {
 
 impl Flight {
     fn finish(self, served: Served) {
-        self.cache.lock().flights.remove(&self.key);
+        self.leave();
         self.tx.send_replace(Some(served));
+    }
+
+    /// Leaves the table, unless a newer flight of the same key took the place: that one is not
+    /// ours to remove.
+    fn leave(&self) {
+        let mut state = self.cache.lock();
+        if state
+            .flights
+            .get(&self.key)
+            .is_some_and(|tx| Arc::ptr_eq(tx, &self.tx))
+        {
+            state.flights.remove(&self.key);
+        }
     }
 }
 
 impl Drop for Flight {
     fn drop(&mut self) {
-        self.cache.lock().flights.remove(&self.key);
+        self.leave();
     }
 }
 
