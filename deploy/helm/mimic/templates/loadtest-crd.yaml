@@ -1,0 +1,198 @@
+{{- if .Values.loadTest.enabled }}
+# MimicLoadTest (spec §7.8, F11): one load test of a deployment in mock mode, in the deployment's
+# namespace. Its spec is immutable except `stop`, which may only go from false to true. The
+# controller writes the status through the status subresource only.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mimicloadtests.mimic.platform.io
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+  annotations:
+    # Kept on uninstall with the MimicWorkload CRD: removing the runs is explicit (spec §7.1).
+    helm.sh/resource-policy: keep
+spec:
+  group: mimic.platform.io
+  scope: Namespaced
+  names:
+    kind: MimicLoadTest
+    listKind: MimicLoadTestList
+    plural: mimicloadtests
+    singular: mimicloadtest
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Deployment
+          type: string
+          jsonPath: .spec.deployment
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Reason
+          type: string
+          jsonPath: .status.reason
+        - name: Requests
+          type: integer
+          jsonPath: .status.results.total.requests
+        - name: RPS
+          type: integer
+          jsonPath: .status.results.total.rps
+        - name: P99 µs
+          type: integer
+          jsonPath: .status.results.total.latencyMicros.p99
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            status:
+              description: Written by the controller (spec §7.8, Lifecycle and Results).
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Running, Succeeded, Failed, Aborted]
+                reason:
+                  type: string
+                message:
+                  description: "Human text: the names of fields, endpoints and limits only."
+                  type: string
+                startTime:
+                  type: string
+                  format: date-time
+                endTime:
+                  type: string
+                  format: date-time
+                targets:
+                  type: integer
+                  format: int64
+                pods:
+                  type: integer
+                  format: int64
+                skipped:
+                  description: Endpoints left out of the plan, by reason.
+                  type: object
+                  additionalProperties: {type: integer, format: int64}
+                results:
+                  description: Per endpoint and in total (spec §7.8, Results).
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+            spec:
+              type: object
+              required: [deployment, duration]
+              x-kubernetes-validations:
+                # Every field but stop is immutable; stop may only go from false to true (spec §7.8).
+                - rule: >-
+                    self.deployment == oldSelf.deployment
+                    && self.duration == oldSelf.duration
+                    && self.concurrency == oldSelf.concurrency
+                    && self.rampUp == oldSelf.rampUp
+                    && self.timeout == oldSelf.timeout
+                    && (has(self.rate) ? dyn(self.rate) : dyn(null)) == (has(oldSelf.rate) ? dyn(oldSelf.rate) : dyn(null))
+                    && (has(self.endpoints) ? dyn(self.endpoints) : dyn(null)) == (has(oldSelf.endpoints) ? dyn(oldSelf.endpoints) : dyn(null))
+                    && (has(self.credentials) ? dyn(self.credentials) : dyn(null)) == (has(oldSelf.credentials) ? dyn(oldSelf.credentials) : dyn(null))
+                    && (!oldSelf.stop || self.stop)
+                  message: "spec is immutable except stop, which may only go from false to true"
+              properties:
+                deployment:
+                  description: Name of the Deployment under test, in this namespace.
+                  type: string
+                  maxLength: 253
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                duration:
+                  description: How long requests are sent (10s to 24h; the controller also applies MIMIC_LOAD_MAX_DURATION).
+                  type: string
+                  maxLength: 16
+                  pattern: '^[0-9]+(ms|s|m|h)$'
+                  x-kubernetes-validations:
+                    - rule: "duration(self) >= duration('10s') && duration(self) <= duration('24h')"
+                      message: "duration must be between 10s and 24h"
+                concurrency:
+                  description: Requests in flight at most (1 to 4096; the controller also applies MIMIC_LOAD_MAX_CONCURRENCY).
+                  type: integer
+                  format: int64
+                  default: 10
+                  minimum: 1
+                  maximum: 4096
+                rate:
+                  description: Requests per second, open model (1 to 100000); absent for the closed model.
+                  type: integer
+                  format: int64
+                  minimum: 1
+                  maximum: 100000
+                rampUp:
+                  description: Time to reach the full concurrency or rate; at most duration.
+                  type: string
+                  maxLength: 16
+                  default: 0s
+                  pattern: '^[0-9]+(ms|s|m|h)$'
+                timeout:
+                  description: Time limit of one request (100ms to 60s).
+                  type: string
+                  maxLength: 16
+                  default: 10s
+                  pattern: '^[0-9]+(ms|s|m|h)$'
+                  x-kubernetes-validations:
+                    - rule: "duration(self) >= duration('100ms') && duration(self) <= duration('60s')"
+                      message: "timeout must be between 100ms and 60s"
+                endpoints:
+                  description: Entries "<METHOD> <template>" as in the discovery report; at most 64 of each list.
+                  type: object
+                  properties:
+                    include:
+                      type: array
+                      maxItems: 64
+                      items:
+                        type: string
+                        maxLength: 512
+                        pattern: '^[A-Z]{3,10} /.*$'
+                    exclude:
+                      type: array
+                      maxItems: 64
+                      items:
+                        type: string
+                        maxLength: 512
+                        pattern: '^[A-Z]{3,10} /.*$'
+                credentials:
+                  description: The Secret of this namespace the generator reads its credential values from (spec §7.8).
+                  type: object
+                  required: [secretName, fields]
+                  properties:
+                    secretName:
+                      type: string
+                      maxLength: 253
+                      pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                    fields:
+                      type: array
+                      minItems: 1
+                      maxItems: 32
+                      x-kubernetes-validations:
+                        - rule: "self.all(f, self.exists_one(g, g.field == f.field))"
+                          message: "each credentials field may appear once"
+                      items:
+                        type: object
+                        required: [field, key]
+                        properties:
+                          field:
+                            description: Where the value goes; header/<lower-case name>, query/<key> or body<JSON pointer>.
+                            type: string
+                            maxLength: 256
+                            pattern: '^(header/[a-z0-9-]+|query/.+|body/.*)$'
+                          key:
+                            description: The key of the Secret that holds the value.
+                            type: string
+                            minLength: 1
+                            maxLength: 253
+                            pattern: '^[-._a-zA-Z0-9]+$'
+                stop:
+                  description: Ends the run with reason Stopped; the results stay. May only go from false to true.
+                  type: boolean
+                  default: false
+{{- end }}

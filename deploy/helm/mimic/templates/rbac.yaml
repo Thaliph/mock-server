@@ -24,6 +24,29 @@ rules:
   - apiGroups: [authentication.k8s.io]
     resources: [tokenreviews]
     verbs: [create]
+  {{- if .Values.loadTest.enabled }}
+  # Load tests (spec §11, F11): the MimicLoadTest objects, the status of each, and the generator's
+  # Job and NetworkPolicy, which the ValidatingAdmissionPolicy of loadtest-policy.yaml restricts to
+  # the shape of spec §7.8 in injected namespaces. Pods and Secrets are not among them.
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicloadtests]
+    verbs: [get, list, watch]
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicloadtests/status]
+    verbs: [patch]
+  # The ready pod addresses of a deployment's Service endpoints (spec §7.8, Targets).
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, list, watch, delete]
+  {{- if .Values.loadTest.networkPolicy }}
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [create, delete]
+  {{- end }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
