@@ -7,7 +7,7 @@
 //! The JSON is what `Report::to_json` writes (the controller wrote it after the check): a key
 //! that appears twice is merged twice, where `from_json` keeps the last.
 
-use std::collections::BTreeMap;
+use crate::compact::SortedMap;
 use std::fmt;
 
 use serde::Deserialize;
@@ -31,6 +31,11 @@ impl Report {
         deserializer.end()
     }
 }
+
+// The seeds below are more lenient than `Report::from_json` (no `deny_unknown_fields`, and a
+// duplicated key is merged twice, where `from_json` keeps the last). That is accepted because
+// their input is always the controller's own `Report::to_json`, written after the check and the
+// re-redaction (SHR-21), never a body from the network.
 
 /// A seed that reads a JSON object with `visit_map`.
 macro_rules! map_seed {
@@ -136,7 +141,7 @@ impl<'de> Visitor<'de> for DirectionsSeed<'_> {
 
 /// The scopes of a direction.
 struct ScopesSeed<'a> {
-    into: &'a mut BTreeMap<ScopeKey, Scope>,
+    into: &'a mut SortedMap<ScopeKey, Scope>,
     max_literals: usize,
 }
 
@@ -202,8 +207,8 @@ impl<'de> Visitor<'de> for ScopeSeed<'_> {
                     }
                 }
                 ScopeField::Tunnels => {
-                    if let Some(tunnels) = map.next_value::<Option<BTreeMap<String, u64>>>()? {
-                        let mine = self.into.tunnels.get_or_insert_with(BTreeMap::new);
+                    if let Some(tunnels) = map.next_value::<Option<SortedMap<String, u64>>>()? {
+                        let mine = self.into.tunnels.get_or_insert_with(SortedMap::new);
                         for (kind, n) in tunnels {
                             let count = mine.entry(kind).or_default();
                             *count = count.saturating_add(n);
@@ -221,7 +226,7 @@ impl<'de> Visitor<'de> for ScopeSeed<'_> {
 }
 
 /// `raw`: path to method to stats.
-struct RawSeed<'a>(&'a mut BTreeMap<String, BTreeMap<String, Stats>>);
+struct RawSeed<'a>(&'a mut SortedMap<String, SortedMap<String, Stats>>);
 
 map_seed!(RawSeed<'_>);
 
@@ -241,7 +246,7 @@ impl<'de> Visitor<'de> for RawSeed<'_> {
 }
 
 /// Method to stats: each `Stats` is read whole, then merged.
-struct MethodsSeed<'a>(&'a mut BTreeMap<String, Stats>);
+struct MethodsSeed<'a>(&'a mut SortedMap<String, Stats>);
 
 map_seed!(MethodsSeed<'_>);
 
@@ -308,7 +313,7 @@ impl<'de> Visitor<'de> for NodeSeed<'_> {
 }
 
 struct LiteralsSeed<'a> {
-    into: &'a mut BTreeMap<String, Node>,
+    into: &'a mut SortedMap<String, Node>,
     max_literals: usize,
 }
 

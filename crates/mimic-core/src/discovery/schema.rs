@@ -2,7 +2,7 @@
 //! and headers. It holds types, formats and key names, never values. Merging is commutative
 //! and associative, so recording one exchange is merging a one-exchange schema.
 
-use std::collections::{BTreeMap, BTreeSet};
+use crate::compact::{SortedMap, SortedSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use percent_encoding::percent_decode_str;
@@ -159,8 +159,8 @@ impl Formats {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Object {
-    props: BTreeMap<String, Schema>,
-    required: BTreeSet<String>,
+    props: SortedMap<String, Schema>,
+    required: SortedSet<String>,
     /// Set once the object has too many keys: the merge of all its values, and no `props`.
     map: Option<Box<Schema>>,
 }
@@ -229,7 +229,7 @@ fn merge_all(schemas: impl Iterator<Item = Schema>) -> Schema {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schema {
-    kinds: BTreeSet<Kind>,
+    kinds: SortedSet<Kind>,
     format: Formats,
     items: Option<Box<Schema>>,
     object: Option<Object>,
@@ -250,7 +250,7 @@ fn is_full_cut(cut: &u8) -> bool {
 impl Default for Schema {
     fn default() -> Self {
         Self {
-            kinds: BTreeSet::new(),
+            kinds: SortedSet::new(),
             format: Formats::default(),
             items: None,
             object: None,
@@ -281,7 +281,7 @@ impl Schema {
         let Some(object) = &mut self.object else {
             return;
         };
-        for (name, schema) in &mut object.props {
+        for (name, schema) in object.props.iter_mut() {
             if redactor.name_matches(name) {
                 *schema = Self::marker();
             } else {
@@ -383,7 +383,7 @@ impl Schema {
                         ..Object::default()
                     }
                 } else {
-                    let mut props: BTreeMap<String, Schema> = BTreeMap::new();
+                    let mut props: SortedMap<String, Schema> = SortedMap::new();
                     for (k, v) in map {
                         let child = Self::infer_at(v, level + 1);
                         let slot = props.entry(cut_name(k).to_string()).or_default();
@@ -556,7 +556,7 @@ struct Param {
 #[serde(deny_unknown_fields)]
 pub struct Params {
     exchanges: u64,
-    keys: BTreeMap<String, Param>,
+    keys: SortedMap<String, Param>,
 }
 
 /// A decoded, redacted key and value.
@@ -607,9 +607,9 @@ pub fn kept_headers<'a>(headers: &[(&'a str, &'a str)]) -> Vec<(String, &'a str)
         .map(|(name, value)| (name.to_ascii_lowercase(), *value))
         .filter(|(key, _)| !key.starts_with(':') && !SKIPPED_HEADERS.contains(&key.as_str()))
         .collect();
-    let names: BTreeSet<&str> = kept.iter().map(|(key, _)| cut_name(key)).collect();
+    let names: SortedSet<&str> = kept.iter().map(|(key, _)| cut_name(key)).collect();
     if names.len() > MAX_PARAMS {
-        let first: BTreeSet<String> = names
+        let first: SortedSet<String> = names
             .into_iter()
             .take(MAX_PARAMS)
             .map(str::to_string)
@@ -622,7 +622,7 @@ pub fn kept_headers<'a>(headers: &[(&'a str, &'a str)]) -> Vec<(String, &'a str)
 impl Params {
     /// Gives a key under a redacted name the schema of the marker.
     pub(super) fn redact_names(&mut self, redactor: &Redactor) {
-        for (name, param) in &mut self.keys {
+        for (name, param) in self.keys.iter_mut() {
             if redactor.name_matches(name) {
                 param.schema = Schema::marker();
             }
@@ -632,7 +632,7 @@ impl Params {
     /// [`Params::redact_names`] for header names, which the outbound request view also
     /// redacts outside its allowlist.
     pub(super) fn redact_header_names(&mut self, redactor: &Redactor) {
-        for (name, param) in &mut self.keys {
+        for (name, param) in self.keys.iter_mut() {
             if redactor.header_name_matches(name) {
                 param.schema = Schema::marker();
             }
@@ -649,7 +649,7 @@ impl Params {
     }
 
     pub(super) fn from_pairs(pairs: &[Pair]) -> Self {
-        let mut keys: BTreeMap<String, Param> = BTreeMap::new();
+        let mut keys: SortedMap<String, Param> = SortedMap::new();
         for p in pairs {
             let value = Schema::infer(&Value::String(p.value.clone()));
             match keys.remove(&p.key) {

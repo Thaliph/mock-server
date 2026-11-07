@@ -1,7 +1,7 @@
 //! What one endpoint has shown of its query, headers and bodies (spec §6): schemas and
 //! volatility, merged as one value. Everything is redacted before it is inferred or hashed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use crate::compact::{SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -83,7 +83,7 @@ fn merge_opt<T>(a: Option<T>, b: Option<T>, f: impl FnOnce(T, T) -> T) -> Option
 #[serde(deny_unknown_fields)]
 struct Side {
     headers: Params,
-    bodies: BTreeMap<String, Media>,
+    bodies: SortedMap<String, Media>,
 }
 
 impl Side {
@@ -165,7 +165,7 @@ fn redacted(value: &str) -> bool {
 }
 
 /// The fields of one exchange that were counted already: `n` counts an exchange once.
-pub(super) type Seen = BTreeSet<String>;
+pub(super) type Seen = SortedSet<String>;
 
 fn observe(fields: &mut Volatility, seen: &mut Seen, field: String, value: &str, redacted: bool) {
     if seen.contains(&field) {
@@ -453,7 +453,7 @@ impl Observed {
         &mut self,
         request_redactor: &Redactor,
         response_redactor: &Redactor,
-        changed: &BTreeSet<String>,
+        changed: &SortedSet<String>,
     ) {
         self.query.redact_names(request_redactor);
         self.request.redact_names(request_redactor);

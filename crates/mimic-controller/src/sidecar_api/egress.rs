@@ -5,7 +5,7 @@
 //! place that reads `:outbound`, so that the cache, the single flight and the egress budget of
 //! F9 step 4 wrap that call and nothing else.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -86,7 +86,7 @@ fn project(stored: Option<Vec<u8>>, max: usize) -> Built {
     let hex = sha256_hex(stored.as_deref().unwrap_or_default());
     let set = match &stored {
         None => EgressSet {
-            authorities: BTreeMap::new(),
+            authorities: Default::default(),
             format: FORMAT,
         },
         Some(bytes) => match parse_outbound(bytes) {

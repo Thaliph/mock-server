@@ -226,6 +226,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "litemap"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+
+[[package]]
 name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -243,6 +249,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "k8s-openapi",
+ "litemap",
  "percent-encoding",
  "serde",
  "serde_json",

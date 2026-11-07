@@ -2,7 +2,7 @@
 //! bottom-32 sketch of the XXH3 hashes of the (redacted) values. Integer-only, so merging is
 //! exact and order-independent.
 
-use std::collections::{BTreeMap, BTreeSet};
+use crate::compact::{SortedMap, SortedSet};
 
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
@@ -19,7 +19,7 @@ pub const MAX_FIELDS: usize = 128;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sketch {
-    hashes: BTreeSet<u64>,
+    hashes: SortedSet<u64>,
 }
 
 impl Sketch {
@@ -77,7 +77,7 @@ impl Field {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Volatility {
-    fields: BTreeMap<String, Field>,
+    fields: SortedMap<String, Field>,
 }
 
 impl Volatility {
@@ -96,7 +96,7 @@ impl Volatility {
     fn add(&mut self, field: &str, value: &str, redacted: bool, first: bool) {
         if !self.fields.contains_key(field) {
             if self.fields.len() >= MAX_FIELDS {
-                match self.fields.last_key_value() {
+                match self.fields.last() {
                     Some((last, _)) if field < last.as_str() => {
                         self.fields.pop_last();
                     }
@@ -141,7 +141,7 @@ impl Volatility {
     }
 
     /// The fields that are not the same in `other`, in either.
-    pub(super) fn changed(&self, other: &Self) -> BTreeSet<String> {
+    pub(super) fn changed(&self, other: &Self) -> SortedSet<String> {
         self.fields
             .keys()
             .chain(other.fields.keys())

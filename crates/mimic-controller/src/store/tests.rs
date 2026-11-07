@@ -275,6 +275,36 @@ async fn ctl_09_applied_once_across_replicas() {
     assert!(conflicts > 0.0, "no contention happened");
 }
 
+/// The stored report changes between the read and the compare-and-set of a write: the retry
+/// merges the queued JSON again, on top of the new report.
+#[tokio::test]
+async fn ctl_09_conflict_retries_the_queued_json_on_the_new_report() {
+    let (a, metrics_a) = replica(None, config(Duration::from_secs(3600)));
+    let (b, _) = replica(None, config(Duration::from_secs(3600)));
+    let (ns, dep) = (unique("ctl09r"), "front");
+    let mine = push_of("pod-a", Some(1), &[("/a", 200), ("/c/1", 200)]);
+    let theirs = push_of("pod-b", Some(1), &[("/b", 200), ("/c/2", 404)]);
+    let mut expected = Report::new(None);
+    for push in [&theirs, &mine] {
+        let parsed = Report::from_json(&push.json).expect("reads");
+        expected = merge_bounded(expected, parsed, &LIMITS).report;
+    }
+    let (ns_b, dep_b) = (ns.clone(), dep.to_string());
+    a.intrude_once(Box::pin(async move {
+        let got = b.push(&ns_b, &dep_b, theirs).await;
+        assert_eq!(got, Ok(Outcome::Applied));
+    }));
+
+    let got = a.push(&ns, dep, mine).await;
+
+    assert_eq!(got, Ok(Outcome::Applied));
+    assert!(counter(&metrics_a, "store_writes_total", "conflict") >= 1.0);
+    let k = keys(&ns, dep).expect("keys");
+    let mut c = conn(None).await;
+    let stored: String = cmd(&mut c, &["GET", &k.report]).await;
+    assert_eq!(stored, expected.to_json().expect("json"));
+}
+
 #[tokio::test]
 async fn ctl_09_unreadable_stored_value_is_never_overwritten() {
     let (store, _) = replica(None, config(Duration::from_secs(3600)));
