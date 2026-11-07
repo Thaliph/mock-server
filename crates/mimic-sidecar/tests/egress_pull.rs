@@ -392,10 +392,7 @@ async fn pul_13_pulls_with_the_etag_held_and_follows_the_snapshot() {
     // The first pull comes within one interval, with no `If-None-Match`.
     wait(|| rig.api.count() >= 1).await;
     assert!(rig.api.at(0).duration_since(rig.started) <= INTERVAL + Duration::from_millis(500));
-    assert_eq!(
-        rig.api.target(0),
-        format!("https://{}/v1/workloads/pay/egress?format=1", rig.api.addr)
-    );
+    assert_eq!(rig.api.target(0), "/v1/workloads/pay/egress?format=1");
     assert_eq!(rig.api.if_none_match(0), None);
     assert_eq!(rig.api.authorization(0), format!("Bearer {TOKEN}"));
     // The token file changes between two pulls: the next pull carries the new one.

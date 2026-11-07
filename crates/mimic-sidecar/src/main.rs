@@ -10,6 +10,7 @@ use mimic_runtime::admin::{self, Readiness, Shutdown};
 use mimic_runtime::config::{CommonConfig, Env};
 use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig, ShipConfig};
+use mimic_sidecar::egress::{EgressConfig, EgressMetrics, Puller, Snapshot};
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 use mimic_sidecar::probes::{self, Probes};
 use mimic_sidecar::red::ProxyMetrics;
@@ -51,6 +52,10 @@ fn main() -> ExitCode {
         Ok(ship) => ship,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
+    let egress = match EgressConfig::from_env(&env) {
+        Ok(egress) => egress,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
     let pod = env.optional("MIMIC_POD_NAME").map(str::to_string);
     let mut log = mimic_runtime::logging::init(&config.log);
     // Before any key exists: no core dump, not readable through /proc by other processes.
@@ -59,7 +64,7 @@ fn main() -> ExitCode {
         log.finish();
         return ExitCode::FAILURE;
     }
-    let code = match run(config, tunnel, probes, tls, (discovery, ship, pod)) {
+    let code = match run(config, tunnel, probes, tls, (discovery, ship, egress, pod)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "sidecar stopped");
@@ -77,7 +82,7 @@ async fn run(
     tunnel: TunnelConfig,
     probes: Probes,
     tls: TlsConfig,
-    (discovery, ship, pod): (DiscoveryConfig, ShipConfig, Option<String>),
+    (discovery, ship, egress, pod): (DiscoveryConfig, ShipConfig, EgressConfig, Option<String>),
 ) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     // Registered before any listener is announced: an early SIGTERM is not lost.
@@ -90,6 +95,10 @@ async fn run(
     let discovery = Discovery::start(&discovery, pod)?;
     discovery.register(&mut metrics);
     let shipper = discovery.shipper(ship).map_err(std::io::Error::other)?;
+    let egress_metrics = EgressMetrics::default();
+    egress_metrics.register(&mut metrics);
+    let puller =
+        Puller::new(egress, egress_metrics, Snapshot::default()).map_err(std::io::Error::other)?;
     let metrics = Arc::new(metrics);
     // Readiness does not wait for the CA: until it holds an intermediate, TLS is passed through.
     let ca = start_ca(&tls, ca_metrics)?;
@@ -136,6 +145,11 @@ async fn run(
 
     let listener = admin::bind(config.admin_addr).await?;
     let grace = config.shutdown_grace;
+    // Pulling stops at the signal: a pull in flight is abandoned.
+    if let Some(puller) = puller {
+        let stop = shutdown.clone();
+        tokio::spawn(puller.run(async move { stop.wait().await }));
+    }
     // Responses in flight get the grace period too, in parallel with the admin drain; the
     // connections left at its end are closed.
     // Shipping stops at the signal; once the proxy has drained, what was recorded is flushed
