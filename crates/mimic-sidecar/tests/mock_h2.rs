@@ -151,6 +151,13 @@ async fn mck_12_mocked_h2_connections_advertise_256_concurrent_streams() {
         .await
         .unwrap()
         .unwrap();
+    // Until the server's SETTINGS arrive the limit is unbounded.
+    for _ in 0..100 {
+        if send.current_max_send_streams() != usize::MAX {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(send.current_max_send_streams(), 256);
 }
 

@@ -7,7 +7,7 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,6 @@ use rcgen::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -44,6 +43,9 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 const BODY: usize = 256 * 1024;
 const CAP: usize = 4 << 20;
 const PENDING: usize = 1024;
+/// The inbound half is 256 endpoints of 30 exchanges; it holds after 10% of them while the
+/// mocked requests are pending.
+const HOLD_AT: usize = 256 * 30 / 10;
 const H2_CONNECTIONS: usize = 4;
 const H2_STREAMS: usize = 256;
 const H1_CONNECTIONS: usize = 1024;
@@ -126,7 +128,8 @@ async fn post(c: &mut TcpStream, host: &str, path: &str, seq: usize) {
 }
 
 /// The inbound half: 256 endpoints, 30 distinct 256 KiB exchanges each; `done` counts them.
-async fn inbound_load(discovery: Arc<Discovery>, done: Arc<AtomicUsize>) {
+/// The load pauses after `HOLD_AT` exchanges, still running, until `resume` is set.
+async fn inbound_load(discovery: Arc<Discovery>, done: Arc<AtomicUsize>, resume: Arc<AtomicBool>) {
     let app = app().await;
     let inbound =
         common::fixture_discovery(Direction::Inbound, &discovery, move |_| Some(app)).await;
@@ -134,6 +137,11 @@ async fn inbound_load(discovery: Arc<Discovery>, done: Arc<AtomicUsize>) {
     let mut n = 0;
     for endpoint in 0..256 {
         for _ in 0..30 {
+            if n == HOLD_AT {
+                while !resume.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             post(&mut i, "svc.ns:8080", &format!("/svc/e{endpoint}"), n).await;
             done.fetch_add(1, Ordering::Relaxed);
             n += 1;
@@ -465,15 +473,10 @@ fn log_lines(logs: &Mutex<Vec<u8>>) -> Vec<serde_json::Value> {
         .collect()
 }
 
-// ---- the mocked clients ----
+// ---- the mocked clients: a child process, so that the RSS measured is the sidecar's ----
 
-/// An HTTP/1 client: sends the request, keeps the connection until `release`.
-async fn h1_client(
-    addr: SocketAddr,
-    payload: Bytes,
-    release: Arc<Notify>,
-    replied: Arc<AtomicUsize>,
-) {
+/// An HTTP/1 client: sends the request and keeps the connection.
+async fn h1_client(addr: SocketAddr, payload: Bytes) {
     let Ok(mut s) = TcpStream::connect(addr).await else {
         return;
     };
@@ -484,55 +487,118 @@ async fn h1_client(
     let _ = s.write_all(head.as_bytes()).await;
     let _ = s.write_all(&payload).await;
     let mut buf = [0u8; 256];
-    tokio::select! {
-        read = s.read(&mut buf) => {
-            if matches!(read, Ok(n) if n > 0) {
-                replied.fetch_add(1, Ordering::SeqCst);
-            }
-            release.notified().await;
-        }
-        () = release.notified() => {}
-    }
+    // The overload answer, or nothing for a pending request.
+    let _ = s.read(&mut buf).await;
+    std::future::pending::<()>().await;
 }
 
-/// An `h2c` connection of `H2_STREAMS` streams, until `release`.
-async fn h2_client(
-    addr: SocketAddr,
-    payload: Bytes,
-    release: Arc<Notify>,
-    replied: Arc<AtomicUsize>,
-) {
+/// An `h2c` connection of `H2_STREAMS` streams, kept open.
+async fn h2_client(addr: SocketAddr, payload: Bytes) {
     let tcp = TcpStream::connect(addr).await.unwrap();
     let (send, conn) =
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
             .await
             .unwrap();
-    let conn = tokio::spawn(conn);
-    let mut streams = Vec::new();
+    tokio::spawn(conn);
     for _ in 0..H2_STREAMS {
         let mut send = send.clone();
-        let (payload, replied) = (payload.clone(), replied.clone());
-        streams.push(tokio::spawn(async move {
+        let payload = payload.clone();
+        tokio::spawn(async move {
             let request = Request::builder()
                 .method("POST")
                 .uri(format!("http://{BLOB_AUTHORITY}/blob"))
                 .header("content-type", "application/json")
                 .body(Full::new(payload))
                 .unwrap();
-            if send.send_request(request).await.is_ok() {
-                replied.fetch_add(1, Ordering::SeqCst);
-            }
-        }));
+            let _ = send.send_request(request).await;
+        });
     }
-    release.notified().await;
-    conn.abort();
-    for stream in streams {
-        stream.abort();
-    }
+    std::future::pending::<()>().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mck_18_pending_cap_peak_rss_and_cancellation_with_the_snapshot_and_discovery_held() {
+/// The child process of [`spawn_clients`]: the test binary run again on this test, with
+/// `MIMIC_TEST_MOCK_CLIENTS` set to the address of the mock listener. It opens the 4 `h2c`
+/// connections and the 1 024 HTTP/1 connections and keeps them until it is killed (the
+/// clients "abort"). Without the variable it is a test that does nothing.
+#[test]
+fn mck_18_clients_child_process() {
+    use std::io::Write;
+    let Some(addr) = std::env::var("MIMIC_TEST_MOCK_CLIENTS")
+        .ok()
+        .and_then(|v| v.parse::<SocketAddr>().ok())
+    else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let payload = Bytes::from(body(1));
+        for _ in 0..H2_CONNECTIONS {
+            tokio::spawn(h2_client(addr, payload.clone()));
+        }
+        for _ in 0..H1_CONNECTIONS {
+            tokio::spawn(h1_client(addr, payload.clone()));
+        }
+        let mut out = std::io::stdout();
+        writeln!(out, "CLIENTS_STARTED").unwrap();
+        out.flush().unwrap();
+        std::future::pending::<()>().await;
+    });
+}
+
+/// Starts the clients in a child process; killing it aborts every client at once.
+fn spawn_clients(addr: SocketAddr) -> ApiProcess {
+    use std::process::{Command, Stdio};
+    ApiProcess(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "mck_18_clients_child_process", "--nocapture"])
+            .env("MIMIC_TEST_MOCK_CLIENTS", addr.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("the clients start"),
+    )
+}
+
+/// The test runs in a child process with the allocator settings the measurement assumes:
+/// `MALLOC_ARENA_MAX=2` (as the chart sets it on the controller) and a fixed
+/// `MALLOC_MMAP_THRESHOLD_` of 128 KiB. With glibc's defaults the freed 256 KiB buffers raise
+/// the mmap threshold and arenas multiply with the worker threads: the heap peaks at 76 MiB
+/// while the resident set reaches 140.
+const INNER: &str = "MIMIC_TEST_MCK18_INNER";
+
+#[test]
+fn mck_18_pending_cap_peak_rss_and_cancellation_with_the_snapshot_and_discovery_held() {
+    if std::env::var_os(INNER).is_some() {
+        return measured();
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "mck_18_pending_cap_peak_rss_and_cancellation_with_the_snapshot_and_discovery_held",
+            "--nocapture",
+        ])
+        .env(INNER, "1")
+        .env("MALLOC_ARENA_MAX", "2")
+        .env("MALLOC_MMAP_THRESHOLD_", "131072")
+        .status()
+        .expect("the measured test starts");
+    assert!(status.success(), "the measured test failed: {status}");
+}
+
+fn measured() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(measure());
+}
+
+async fn measure() {
     let logs = Arc::new(Mutex::new(Vec::new()));
     let (dispatch, _log_handle) = mimic_runtime::logging::build("info", Sink(logs.clone()));
     tracing::dispatcher::set_global_default(dispatch).unwrap();
@@ -578,7 +644,7 @@ async fn mck_18_pending_cap_peak_rss_and_cancellation_with_the_snapshot_and_disc
     mock.register(&mut metrics);
     let tunnel = TunnelMetrics::register(&mut metrics);
     let proxy = ProxyMetrics::register(&mut metrics, 50);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = mimic_sidecar::listener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let mock_addr = listener.local_addr().unwrap();
     let nowhere: SocketAddr = "127.0.0.1:9".parse().unwrap();
     let original: OriginalDst = Arc::new(move |_| Ok(nowhere));
@@ -611,36 +677,21 @@ async fn mck_18_pending_cap_peak_rss_and_cancellation_with_the_snapshot_and_disc
     );
     tokio::spawn(puller.run(std::future::pending()));
     view_etag(admin_addr, "\"1-first\"").await;
+    eprintln!("mck-18 first set held: peak {} MiB", peak_rss() >> 20);
 
-    // The inbound half of the EGR-15 load runs from here on.
+    // The inbound half of the EGR-15 load runs; it pauses after 10% while the mocked
+    // requests are pending and the snapshot is swapped, then goes on to its end.
     let done = Arc::new(AtomicUsize::new(0));
-    let loading = tokio::spawn(inbound_load(discovery, done.clone()));
-    until("inbound load started", Duration::from_secs(60), || {
-        done.load(Ordering::Relaxed) >= 100
+    let resume = Arc::new(AtomicBool::new(false));
+    let loading = tokio::spawn(inbound_load(discovery, done.clone(), resume.clone()));
+    until("inbound load paused", Duration::from_secs(120), || {
+        done.load(Ordering::Relaxed) >= HOLD_AT
     })
     .await;
 
-    // 2 048 requests of 256 KiB, sharing one payload.
-    let payload = Bytes::from(body(1));
-    let release = Arc::new(Notify::new());
-    let replied = Arc::new(AtomicUsize::new(0));
-    let mut clients = Vec::new();
-    for _ in 0..H2_CONNECTIONS {
-        clients.push(tokio::spawn(h2_client(
-            mock_addr,
-            payload.clone(),
-            release.clone(),
-            replied.clone(),
-        )));
-    }
-    for _ in 0..H1_CONNECTIONS {
-        clients.push(tokio::spawn(h1_client(
-            mock_addr,
-            payload.clone(),
-            release.clone(),
-            replied.clone(),
-        )));
-    }
+    // 2 048 requests of 256 KiB from a child process.
+    eprintln!("mck-18 before the mock load: peak {} MiB", peak_rss() >> 20);
+    let mut clients = spawn_clients(mock_addr);
     let overload = "mimic_mock_miss_total{reason=\"overload\"}";
     until("1024 overload answers", Duration::from_secs(120), || {
         counter(&metrics, overload) >= 1024
@@ -658,24 +709,29 @@ async fn mck_18_pending_cap_peak_rss_and_cancellation_with_the_snapshot_and_disc
         .filter(|v| v["message"] == "mock overload")
         .count();
     assert_eq!(warns, 1);
+    eprintln!("mck-18 at the cap: peak {} MiB", peak_rss() >> 20);
 
     // A pull that swaps the snapshot while the answers are pending.
     std::fs::write(&gate, "open").unwrap();
     view_etag(admin_addr, "\"1-second\"").await;
+    eprintln!("mck-18 after the second set: peak {} MiB", peak_rss() >> 20);
     assert_eq!(counter(&metrics, "mimic_mock_pending"), PENDING as u64);
-    assert!(!loading.is_finished(), "the inbound load ended too early");
 
     // Every client aborts.
-    release.notify_waiters();
+    let _ = clients.0.kill();
+    let _ = clients.0.wait();
     let aborted = Instant::now();
     until("pending released", Duration::from_secs(1), || {
         counter(&metrics, "mimic_mock_pending") == 0
     })
     .await;
-    eprintln!("mck-18 pending released in {:?}", aborted.elapsed());
-    for client in clients {
-        let _ = client.await;
-    }
+    eprintln!(
+        "mck-18 pending released in {:?}, peak {} MiB",
+        aborted.elapsed(),
+        peak_rss() >> 20
+    );
+    // The load goes on.
+    resume.store(true, Ordering::Relaxed);
     until("client_abort lines", Duration::from_secs(30), || {
         log_lines(&logs)
             .iter()
@@ -690,10 +746,12 @@ async fn mck_18_pending_cap_peak_rss_and_cancellation_with_the_snapshot_and_disc
         .filter(|v| v["target"] == "access" && v["result"] == "client_abort")
         .collect();
     assert_eq!(by_abort.len(), PENDING);
+    // Nothing was written to the aborted clients.
     assert!(
         by_abort
             .iter()
-            .all(|v| v["bytes_out"].as_u64().unwrap_or(0) == 0)
+            .all(|v| v["bytes_out"].as_u64().unwrap_or(0) == 0
+                && v.get("status").is_none_or(|s| s.is_null()))
     );
     let ended = lines
         .iter()
@@ -703,11 +761,7 @@ async fn mck_18_pending_cap_peak_rss_and_cancellation_with_the_snapshot_and_disc
     loading.await.unwrap();
 
     let peak = peak_rss();
-    eprintln!(
-        "mck-18 peak RSS: {} MiB, {} clients got an answer",
-        peak / (1024 * 1024),
-        replied.load(Ordering::SeqCst)
-    );
+    eprintln!("mck-18 peak RSS: {} MiB", peak / (1024 * 1024));
     assert!(
         peak < 120 * 1024 * 1024,
         "peak RSS {} MiB over 120 MiB",

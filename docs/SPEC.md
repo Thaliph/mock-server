@@ -1936,8 +1936,14 @@ random numbers it hands to the draw.
   first 256 KiB are kept for matching within `MIMIC_DISCOVERY_CAPTURE_BUDGET` (decoded and
   parsed as §6; a body over the limit, opaque, undecodable or that does not fit the budget is
   matched as absent), the rest is read and discarded. A request the server cannot parse closes
-  the connection (`result: unframed` or `rejected`, as §4.1). A `CONNECT` and a request that
-  asks for an upgrade (`Upgrade`, extended `CONNECT`) are misses (`connect`, `upgrade`).
+  the connection (`result: unframed` or `rejected`, as §4.1); the head limits of the server
+  are 64 KiB and 256 lines, as §4.1's. A parse error on a pipelined request, while an earlier
+  answer is still unflushed, can let `hyper`'s own `400` out: it carries no data and reaches no
+  destination, and the `unframed` line and count are written either way. The 30 s header-read
+  timeout also closes idle keep-alive connections on the mocked path (the no-idle-timeout rule
+  of §4.1 holds for forwarded connections only); `MIMIC_MAX_CONNECTIONS` is the real bound. A
+  `CONNECT` and a request that asks for an upgrade (`Upgrade`, extended `CONNECT`) are misses
+  (`connect`, `upgrade`).
 - **Request signature** (pure). Authority: the scope key of §6.1 (target authority, else SNI,
   else destination `ip:port`). Path: the concrete path redacted as samples are (§6 value
   detectors). Query pairs and body: redacted with the outbound request view (§6.1), as the

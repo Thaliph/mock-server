@@ -1,9 +1,10 @@
-//! Mock mode of the sidecar (spec §8): outbound HTTP/1 answered from the egress snapshot,
+//! Mock mode of the sidecar (spec §8): outbound HTTP/1, h2c and gRPC answered from the egress snapshot,
 //! with the drawn latency, the pending cap, the miss log and the `mimic_mock_*` metrics. The
 //! matching, the answer and the draw are pure and live in `mimic_core::mock`; this module
 //! owns the sockets, the timers and the random numbers.
 
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::error::Error;
 use std::future::Future;
 use std::io;
@@ -13,12 +14,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
-use hyper::header::{self, HeaderName, HeaderValue};
+use hyper::body::{Body, Bytes, Incoming};
+use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::service::Service as HyperService;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use mimic_core::Mode;
 use mimic_core::discovery::redact::{self, Redactor};
 use mimic_core::mock::{self, Miss, Random};
@@ -39,8 +41,19 @@ use crate::exchange::Ctx;
 use crate::transport::Stream;
 
 type BoxError = Box<dyn Error + Send + Sync>;
+type MockBody = BoxBody<Bytes, Infallible>;
 
 const PROTOCOL_H1: &str = "http1";
+const PROTOCOL_H2: &str = "h2";
+/// Head limits of the mocked server (spec §8 "Bounds"): 64 KiB and 256 lines, as the codec of
+/// §4.1.
+const MAX_HEAD: usize = 64 * 1024;
+const MAX_HEAD_LINES: usize = 256;
+/// Most bytes one read of an HTTP/1 mocked connection returns: under `hyper`'s initial read
+/// buffer of 8 KiB, so that the buffer never grows.
+const READ_CAP: usize = 4 * 1024;
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` of a mocked `h2` connection (spec §8 "Bounds").
+const H2_STREAMS: u32 = 256;
 /// Signatures written to the log per mode period (spec §8 "Miss").
 const MISS_LOG_LIMIT: usize = 256;
 const HTTP_PORT: u16 = 80;
@@ -318,9 +331,15 @@ impl AsyncRead for Timed {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(polled, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+        // Short reads keep `hyper`'s adaptive read buffer at its initial size: the buffer of a
+        // connection that waits for its answer is then 8 KiB, not the 64 KiB a flood of body
+        // bytes would grow it to (spec §8 "Bounds").
+        let want = buf.remaining().min(READ_CAP);
+        let mut short = ReadBuf::new(buf.initialize_unfilled_to(want));
+        let polled = Pin::new(&mut self.inner).poll_read(cx, &mut short);
+        let read = short.filled().len();
+        if matches!(polled, Poll::Ready(Ok(()))) && read > 0 {
+            buf.advance(read);
             self.clock.note();
         }
         polled
@@ -356,7 +375,7 @@ impl AsyncWrite for Timed {
 struct Service(Arc<Conn>);
 
 impl HyperService<Request<Incoming>> for Service {
-    type Response = Response<Full<Bytes>>;
+    type Response = Response<MockBody>;
     type Error = BoxError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, BoxError>> + Send>>;
 
@@ -370,7 +389,10 @@ impl HyperService<Request<Incoming>> for Service {
 struct Conn {
     mock: Mock,
     ctx: Ctx,
-    clock: Arc<Clock>,
+    /// Notes the first byte of each request of an HTTP/1 connection; an `h2` stream starts
+    /// when its head is delivered.
+    clock: Option<Arc<Clock>>,
+    protocol: &'static str,
 }
 
 /// An exchange being served. Dropped before it was answered, it is a client abort: the
@@ -405,31 +427,37 @@ impl Flight {
         self.answered = true;
         let head = self.started.elapsed();
         let ctx = &self.conn.ctx;
+        let protocol = self.conn.protocol;
         let bytes_out = response.body().len() as u64;
         ctx.proxy.request(
             ctx.direction,
-            PROTOCOL_H1,
+            protocol,
             &self.authority,
             Some(response.status),
             head,
         );
         ctx.proxy
-            .bytes(ctx.direction, PROTOCOL_H1, bytes_in, bytes_out);
+            .bytes(ctx.direction, protocol, bytes_in, bytes_out);
         self.conn
             .mock
             .0
             .requests
             .get_or_create(&ResultLabel { result: mock })
             .inc();
+        let grpc_status = response
+            .trailers
+            .iter()
+            .find(|(name, _)| name == "grpc-status")
+            .and_then(|(_, value)| value.parse().ok());
         access::exchange(&access::Exchange {
             direction: ctx.direction,
-            protocol: PROTOCOL_H1,
+            protocol,
             dst: ctx.dst,
             authority: std::mem::take(&mut self.authority),
             method: Some(std::mem::take(&mut self.method)),
             path: Some(std::mem::take(&mut self.path)).filter(|p| !p.is_empty()),
             status: Some(response.status),
-            grpc_status: None,
+            grpc_status,
             upgrade: false,
             tls: ctx.tls,
             outcome: Outcome::Ok,
@@ -440,8 +468,10 @@ impl Flight {
             mock: Some(mock),
             mock_miss: miss.map(Miss::as_str),
         });
-        self.conn.clock.owed.store(true, Ordering::Release);
-        self.conn.clock.release();
+        if let Some(clock) = &self.conn.clock {
+            clock.owed.store(true, Ordering::Release);
+            clock.release();
+        }
         // The slot goes with the flight, at the return of the answer.
         drop(self.slot.take());
     }
@@ -453,11 +483,12 @@ impl Drop for Flight {
             return;
         }
         let ctx = &self.conn.ctx;
+        let protocol = self.conn.protocol;
         ctx.proxy
-            .request_unobserved(ctx.direction, PROTOCOL_H1, &self.authority);
+            .request_unobserved(ctx.direction, protocol, &self.authority);
         access::exchange(&access::Exchange {
             direction: ctx.direction,
-            protocol: PROTOCOL_H1,
+            protocol,
             dst: ctx.dst,
             authority: std::mem::take(&mut self.authority),
             method: Some(std::mem::take(&mut self.method)),
@@ -474,17 +505,35 @@ impl Drop for Flight {
             mock: None,
             mock_miss: None,
         });
-        self.conn.clock.release();
+        if let Some(clock) = &self.conn.clock {
+            clock.release();
+        }
     }
 }
 
 /// The hyper response of a mocked answer. The body is the index's own bytes, not a copy.
-fn http_response(response: &mock::Response, close: bool) -> Response<Full<Bytes>> {
+fn http_response(response: &mock::Response, close: bool) -> Response<MockBody> {
     let body = response
         .shared_body()
         .filter(|b| !b.as_ref().is_empty())
         .map_or_else(Bytes::new, Bytes::from_owner);
-    let mut out = Response::new(Full::new(body));
+    let body = Full::new(body);
+    let body: MockBody = if response.trailers.is_empty() {
+        body.boxed()
+    } else {
+        let mut trailers = HeaderMap::new();
+        for (name, value) in &response.trailers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                trailers.append(name, value);
+            }
+        }
+        body.with_trailers(std::future::ready(Some(Ok(trailers))))
+            .boxed()
+    };
+    let mut out = Response::new(body);
     *out.status_mut() = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
     for (name, value) in &response.headers {
         if let (Ok(name), Ok(value)) = (
@@ -520,7 +569,8 @@ impl Mock {
         let conn = Arc::new(Conn {
             mock: self.clone(),
             ctx,
-            clock: clock.clone(),
+            clock: Some(clock.clone()),
+            protocol: PROTOCOL_H1,
         });
         let ctx = conn.ctx.clone();
         let service = Service(conn);
@@ -532,6 +582,8 @@ impl Mock {
         let served = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(stall)
+            .max_buf_size(MAX_HEAD)
+            .max_headers(MAX_HEAD_LINES)
             .serve_connection(io, service);
         let mut served = std::pin::pin!(served);
         let ended = tokio::select! {
@@ -556,6 +608,46 @@ impl Mock {
 }
 
 impl Mock {
+    /// Serves the HTTP/2 connection `stream` (the bytes read to detect it, the preface, are
+    /// its prefix) until it ends: each stream is answered on its own, `gRPC` included.
+    /// Nothing is sent to the destination.
+    pub(crate) async fn serve_h2(
+        &self,
+        ctx: Ctx,
+        stream: Stream,
+        stopped: impl Future<Output = ()>,
+        mut abort: Pin<&mut (impl Future<Output = ()> + Send)>,
+    ) {
+        let conn = Arc::new(Conn {
+            mock: self.clone(),
+            ctx,
+            clock: None,
+            protocol: PROTOCOL_H2,
+        });
+        let dst = conn.ctx.dst;
+        let served = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .max_concurrent_streams(H2_STREAMS)
+            .max_header_list_size(MAX_HEAD as u32)
+            .serve_connection(TokioIo::new(stream), Service(conn));
+        let mut served = std::pin::pin!(served);
+        let ended = tokio::select! {
+            r = served.as_mut() => Some(r),
+            () = stopped => {
+                // The streams open are answered, then the connection closes (`GOAWAY`).
+                served.as_mut().graceful_shutdown();
+                tokio::select! {
+                    r = served.as_mut() => Some(r),
+                    () = abort.as_mut() => None,
+                }
+            }
+            () = abort.as_mut() => None,
+        };
+        if let Some(Err(e)) = ended {
+            tracing::debug!(target: "mock", %dst, error = %e, "mocked h2 connection ended");
+        }
+    }
+
     /// A request the server cannot parse: the connection was closed without an answer, and
     /// the exchange counts with `status_class="none"` (spec §8, PRX-21).
     fn unframed(&self, ctx: &Ctx) {
@@ -588,8 +680,11 @@ impl Conn {
     async fn serve(
         self: &Arc<Conn>,
         request: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>, BoxError> {
-        let started = self.clock.start();
+    ) -> Result<Response<MockBody>, BoxError> {
+        let started = self
+            .clock
+            .as_ref()
+            .map_or_else(Instant::now, |clock| clock.start());
         let (parts, body) = request.into_parts();
         let target = target_authority(
             parts.uri.authority().map(|a| a.as_str()),
@@ -617,7 +712,10 @@ impl Conn {
         let Some(slot) = self.mock.admit() else {
             flight.miss(Miss::Overload);
             let response = Miss::Overload.response();
-            let out = http_response(&response, true);
+            // An HTTP/1 connection is closed (the unread body cannot be skipped); an h2
+            // stream is reset by `h2` with `NO_ERROR` once this answer ends, its body being
+            // dropped unread.
+            let out = http_response(&response, self.clock.is_some());
             flight.answer(&response, "miss", Some(Miss::Overload), 0);
             return Ok(out);
         };
@@ -684,7 +782,7 @@ impl Conn {
             tls: ctx.tls,
             sni: ctx.sni.as_deref(),
             dst: ctx.dst,
-            h2: false,
+            h2: self.clock.is_none(),
             path: parts.uri.path(),
             query: parts.uri.query().unwrap_or_default(),
             headers: &headers,
@@ -720,6 +818,18 @@ async fn read_body(
     let mut kept: Vec<u8> = Vec::new();
     let mut absent = false;
     let mut total = 0u64;
+    // A declared length is reserved at once and in full: a body that does not fit the budget
+    // is absent from the first byte, and the buffer is exact, with no growth slack.
+    let mut upfront = 0usize;
+    if let Some(declared) = body.size_hint().exact() {
+        match usize::try_from(declared) {
+            Ok(n) if n <= MAX_MATCHED_BODY && reservation.grow(n) => {
+                upfront = n;
+                kept.reserve_exact(n);
+            }
+            _ => absent = true,
+        }
+    }
     let stall = Duration::from_millis(mock.0.stall_ms.load(Ordering::Relaxed));
     loop {
         // A client that stops sending does not hold a pending slot for ever.
@@ -740,9 +850,11 @@ async fn read_body(
         if absent {
             continue;
         }
-        if kept.len() + data.len() > MAX_MATCHED_BODY || !reservation.grow(data.len()) {
+        if kept.len() + data.len() > MAX_MATCHED_BODY
+            || (upfront == 0 && !reservation.grow(data.len()))
+        {
             absent = true;
-            reservation.shrink(kept.len());
+            reservation.shrink(if upfront > 0 { upfront } else { kept.len() });
             kept = Vec::new();
             continue;
         }
