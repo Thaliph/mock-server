@@ -38,7 +38,9 @@ const FIELD_TTL_MS: u64 = DAY_SECS * 1000;
 
 /// A staged write that never reached its script (a crash, a lost connection) is gone after this.
 const STAGE_TTL_MS: u64 = 60_000;
-/// The bytes of a staged key sent per command: what redis-rs copies at once.
+/// The bytes of a staged key sent per command: what redis-rs copies at once. A write whose
+/// stage is not whole (the expiry cannot pass between two commands of one writer: each renews it)
+/// is refused by the script.
 const STAGE_CHUNK: usize = 1 << 20;
 
 /// The report and the outbound part are staged under temporary keys, `SET` then `APPEND`ed in
@@ -139,9 +141,9 @@ pub struct Keys {
 
 impl Keys {
     /// A temporary key of one write attempt (same hash tag as the other keys of the deployment).
-    fn staged(&self, id: u64, part: &str) -> String {
+    fn staged(&self, id: u128, part: &str) -> String {
         let base = self.meta.strip_suffix(":meta").unwrap_or(&self.meta);
-        format!("{base}:stage:{id:016x}:{part}")
+        format!("{base}:stage:{id:032x}:{part}")
     }
 }
 
@@ -342,6 +344,88 @@ impl StoreMetrics {
     fn write(&self, result: &str) {
         self.writes.get_or_create(&label("result", result)).inc();
     }
+}
+
+/// Stores `bytes` under the temporary `key`, a chunk per command. Every command renews the
+/// expiry of `key` and of `other` (the part staged before or after it), so that no staged key
+/// exists without one and none expires while the other part is sent.
+async fn stage(
+    conn: &mut MultiplexedConnection,
+    key: &str,
+    other: &str,
+    bytes: &[u8],
+) -> redis::RedisResult<()> {
+    for (i, chunk) in bytes.chunks(STAGE_CHUNK).enumerate() {
+        append_chunk(conn, key, other, chunk, i == 0).await?;
+    }
+    Ok(())
+}
+
+/// `SET` (the first chunk) or `APPEND`s `chunk` to `key`, and renews the expiry of both keys, in
+/// one pipeline: an `APPEND` that re-creates an expired key gives it an expiry too.
+async fn append_chunk(
+    conn: &mut MultiplexedConnection,
+    key: &str,
+    other: &str,
+    chunk: &[u8],
+    first: bool,
+) -> redis::RedisResult<()> {
+    let mut pipe = redis::pipe();
+    if first {
+        pipe.cmd("SET").arg(key).arg(chunk).ignore();
+    } else {
+        pipe.cmd("APPEND").arg(key).arg(chunk).ignore();
+    }
+    for k in [key, other] {
+        pipe.cmd("PEXPIRE").arg(k).arg(STAGE_TTL_MS).ignore();
+    }
+    pipe.query_async(conn).await
+}
+
+/// Deletes the staged keys of a write unless disarmed: [`StageGuard::clean`] on a failure, and the
+/// drop (a cancelled future) spawns the `DEL`, never blocking. What neither reaches (a crash, a
+/// lost connection) expires after [`STAGE_TTL_MS`].
+struct StageGuard {
+    conn: MultiplexedConnection,
+    keys: [String; 2],
+    armed: bool,
+}
+
+impl StageGuard {
+    fn new(conn: MultiplexedConnection, keys: [&str; 2]) -> StageGuard {
+        StageGuard {
+            conn,
+            keys: keys.map(str::to_string),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Best effort: bounded by the response timeout, failures ignored.
+    async fn clean(&mut self) {
+        if std::mem::take(&mut self.armed) {
+            delete(self.conn.clone(), self.keys.clone()).await;
+        }
+    }
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(delete(self.conn.clone(), self.keys.clone()));
+        }
+    }
+}
+
+async fn delete(mut conn: MultiplexedConnection, keys: [String; 2]) {
+    let mut del = redis::cmd("DEL");
+    del.arg(&keys[0]).arg(&keys[1]);
+    let _ = tokio::time::timeout(RESPONSE_TIMEOUT, del.query_async::<()>(&mut conn)).await;
 }
 
 struct Pending {
@@ -1237,15 +1321,22 @@ impl Store {
         };
         drop(outbound);
         let stored_bytes = json.len() + outbound_json.len();
-        let stage = rand::random::<u64>();
-        let (staged, staged_outbound) =
-            (keys.staged(stage, "report"), keys.staged(stage, "outbound"));
+        let id = rand::random::<u128>();
+        let (staged, staged_outbound) = (keys.staged(id, "report"), keys.staged(id, "outbound"));
+        // From here the staged keys are deleted on every way out but the script's answer.
+        let mut guard = StageGuard::new(conn.clone(), [&staged, &staged_outbound]);
         let sent = async {
-            self.stage(&mut conn, &staged, json.as_bytes()).await?;
-            self.stage(&mut conn, &staged_outbound, outbound_json.as_bytes())
-                .await
+            stage(&mut conn, &staged, &staged_outbound, json.as_bytes()).await?;
+            stage(
+                &mut conn,
+                &staged_outbound,
+                &staged,
+                outbound_json.as_bytes(),
+            )
+            .await
         };
         if let Err(e) = sent.await {
+            guard.clean().await;
             return Err(self.failed(e).await);
         }
 
@@ -1299,8 +1390,15 @@ impl Store {
         script.arg(sha256_hex(outbound_json.as_bytes()));
         drop((json, outbound_json));
         let result: i64 = match script.invoke_async(&mut conn).await {
-            Ok(result) => result,
-            Err(e) => return Err(self.failed(e).await),
+            Ok(result) => {
+                // Renamed, or deleted by the script's refusal.
+                guard.disarm();
+                result
+            }
+            Err(e) => {
+                guard.clean().await;
+                return Err(self.failed(e).await);
+            }
         };
         match result {
             1 => {}
@@ -1360,36 +1458,6 @@ impl Store {
                 .inc_by(*n);
         }
         Ok(Attempt::Done(outcomes))
-    }
-
-    /// Stores `bytes` under the temporary `key`, a chunk per command, for [`STAGE_TTL_MS`].
-    async fn stage(
-        &self,
-        conn: &mut MultiplexedConnection,
-        key: &str,
-        bytes: &[u8],
-    ) -> redis::RedisResult<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        for (i, chunk) in bytes.chunks(STAGE_CHUNK).enumerate() {
-            if i == 0 {
-                redis::cmd("SET")
-                    .arg(key)
-                    .arg(chunk)
-                    .arg("PX")
-                    .arg(STAGE_TTL_MS)
-                    .query_async::<()>(conn)
-                    .await?;
-            } else {
-                redis::cmd("APPEND")
-                    .arg(key)
-                    .arg(chunk)
-                    .query_async::<()>(conn)
-                    .await?;
-            }
-        }
-        Ok(())
     }
 
     fn count_pushes(&self, outcomes: &[Outcome]) {

@@ -500,19 +500,75 @@ async fn ctl_09_a_failed_script_leaves_no_staged_key() {
     assert!(staged(&mut c, &k).await.is_empty());
 }
 
-/// A part of several chunks is staged whole, with the TTL of the stage; the write keeps its own.
+/// A part of several chunks is staged whole, and its key and the other one expire.
 #[tokio::test]
 async fn ctl_09_chunked_stage_stores_every_byte() {
-    let (store, _) = replica(None, config(Duration::from_secs(3600)));
     let k = keys(&unique("ctl09c"), "front").expect("keys");
     let bytes: Vec<u8> = (0..3 * STAGE_CHUNK + 7).map(|i| (i % 251) as u8).collect();
-    let tmp = k.staged(2, "report");
+    let (tmp, other) = (k.staged(2, "report"), k.staged(2, "outbound"));
     let mut c = conn(None).await;
-    store.stage(&mut c, &tmp, &bytes).await.expect("staged");
+    let _: () = cmd(&mut c, &["SET", &other, "x"]).await;
+    stage(&mut c, &tmp, &other, &bytes).await.expect("staged");
     let stored: Vec<u8> = cmd(&mut c, &["GET", &tmp]).await;
     assert!(stored == bytes, "{} bytes of {}", stored.len(), bytes.len());
+    for key in [&tmp, &other] {
+        let ttl: i64 = cmd(&mut c, &["PTTL", key]).await;
+        assert!((1..=STAGE_TTL_MS as i64).contains(&ttl), "{ttl}");
+    }
+    let _: () = cmd(&mut c, &["DEL", &tmp, &other]).await;
+}
+
+/// A key that expired between two chunks is re-created by the `APPEND` with an expiry.
+#[tokio::test]
+async fn ctl_09_an_append_that_recreates_a_stage_key_gives_it_an_expiry() {
+    let k = keys(&unique("ctl09r2"), "front").expect("keys");
+    let (tmp, other) = (k.staged(3, "report"), k.staged(3, "outbound"));
+    let mut c = conn(None).await;
+    append_chunk(&mut c, &tmp, &other, b"tail", false)
+        .await
+        .expect("appended");
     let ttl: i64 = cmd(&mut c, &["PTTL", &tmp]).await;
     assert!((1..=STAGE_TTL_MS as i64).contains(&ttl), "{ttl}");
+    let _: () = cmd(&mut c, &["DEL", &tmp]).await;
+}
+
+/// A guard dropped armed (a cancelled write) deletes the staged keys, without blocking.
+#[tokio::test]
+async fn ctl_09_a_dropped_stage_guard_deletes_the_staged_keys() {
+    let k = keys(&unique("ctl09g"), "front").expect("keys");
+    let (tmp, tmp_out) = (k.staged(4, "report"), k.staged(4, "outbound"));
+    let mut c = conn(None).await;
+    stage(&mut c, &tmp, &tmp_out, b"half")
+        .await
+        .expect("staged");
+    stage(&mut c, &tmp_out, &tmp, b"half")
+        .await
+        .expect("staged");
+    assert_eq!(staged(&mut c, &k).await.len(), 2);
+    drop(StageGuard::new(c.clone(), [&tmp, &tmp_out]));
+    for _ in 0..100 {
+        if staged(&mut c, &k).await.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the staged keys are still there");
+}
+
+/// A disarmed guard leaves them.
+#[tokio::test]
+async fn ctl_09_a_disarmed_stage_guard_leaves_the_staged_keys() {
+    let k = keys(&unique("ctl09d"), "front").expect("keys");
+    let (tmp, tmp_out) = (k.staged(5, "report"), k.staged(5, "outbound"));
+    let mut c = conn(None).await;
+    stage(&mut c, &tmp, &tmp_out, b"half")
+        .await
+        .expect("staged");
+    let mut guard = StageGuard::new(c.clone(), [&tmp, &tmp_out]);
+    guard.disarm();
+    drop(guard);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(staged(&mut c, &k).await.len(), 1);
     let _: () = cmd(&mut c, &["DEL", &tmp]).await;
 }
 
