@@ -202,6 +202,11 @@ impl BodyBudget {
             })
     }
 
+    /// The most that can be reserved at once.
+    pub fn capacity(&self) -> u64 {
+        self.shared.capacity
+    }
+
     /// Bytes reserved now.
     #[cfg(test)]
     pub fn used(&self) -> u64 {
