@@ -25,7 +25,10 @@ fn shr_22_parsed_report_takes_at_most_1_6_times_its_json() {
         "SHR22 json={} live_bytes={bytes} live_blocks={blocks} ratio={ratio:.2}",
         json.len()
     );
-    assert!(ratio <= 1.6, "the parsed report costs {ratio:.2} times its JSON");
+    assert!(
+        ratio <= 1.6,
+        "the parsed report costs {ratio:.2} times its JSON"
+    );
     assert!(report.exchanges() > 0);
     assert!(json.len() > 20 << 20, "the report is at the store limits");
 }
