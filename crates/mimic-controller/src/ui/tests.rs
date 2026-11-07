@@ -82,7 +82,7 @@ fn push_of(pod: &str, seq: u64, paths: &[(&str, u16)]) -> Push {
     Push {
         pod: pod.to_string(),
         seq: Some(SeqId::parse(SESSION, seq).expect("valid seq")),
-        report,
+        json: report.to_json().expect("serialises"),
     }
 }
 

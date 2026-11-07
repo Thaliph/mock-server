@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mimic_core::discovery::report::{Direction, Limits, Report};
 use mimic_core::discovery::status::Meta as StatusMeta;
-use mimic_core::discovery::store::{Kind, Refusal, drop_expired, merge_bounded};
+use mimic_core::discovery::store::{Kind, Refusal, drop_expired, merge_bounded_json};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
@@ -177,11 +177,13 @@ pub fn decide(stored: Option<u64>, sequence: Option<u64>) -> Decision {
     }
 }
 
-/// A checked, re-redacted and stamped report, and who sent it.
+/// A checked, re-redacted and stamped report, and who sent it. The report waits as its JSON
+/// (`Report::to_json`): the write merges it into the stored report as it reads it, and reads it
+/// again if the write conflicts, so that no parsed copy and no backup is held (SHR-18, #339).
 pub struct Push {
     pub pod: String,
     pub seq: Option<SeqId>,
-    pub report: Report,
+    pub json: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1108,10 +1110,7 @@ impl Store {
         let mut outcomes = Vec::with_capacity(batch.len());
         let mut refused: BTreeMap<Refusal, u64> = BTreeMap::new();
         let mut evicted: BTreeMap<Kind, u64> = BTreeMap::new();
-        // A pushed report moves into the merge instead of being copied (at the store limits it
-        // is tens of megabytes, SHR-18). Its JSON is kept to put it back for the next attempt.
-        let mut backups: Vec<(usize, String)> = Vec::new();
-        for (index, pending) in batch.iter_mut().enumerate() {
+        for pending in batch.iter() {
             let push = &pending.push;
             let field = push.seq.as_ref().map(|s| s.field(&push.pod));
             let stored_seq = field.as_ref().and_then(|f| sequences.get(f)).copied();
@@ -1121,13 +1120,13 @@ impl Store {
                     if let (Some(field), Some(seq)) = (field, &push.seq) {
                         sequences.insert(field, seq.sequence);
                     }
-                    let backup = push.report.to_json().map_err(|error| {
-                        tracing::error!(%error, namespace, deployment, "report not serialisable");
-                        StoreError::Unavailable
-                    })?;
-                    backups.push((index, backup));
-                    let pushed = std::mem::replace(&mut pending.push.report, Report::new(None));
-                    let merged = merge_bounded(report, pushed, &self.config.limits);
+                    // Merged as it is read: at the store limits a parsed push is tens of
+                    // megabytes (SHR-18). The JSON stays for the next attempt.
+                    let merged = merge_bounded_json(report, &push.json, &self.config.limits)
+                        .map_err(|error| {
+                            tracing::error!(%error, namespace, deployment, "report not readable");
+                            StoreError::Unavailable
+                        })?;
                     report = merged.report;
                     for (reason, n) in merged.refused {
                         *refused.entry(reason).or_default() += n;
@@ -1241,15 +1240,7 @@ impl Store {
         };
         match result {
             1 => {}
-            0 => {
-                for (index, backup) in backups {
-                    batch[index].push.report = Report::from_json(&backup).map_err(|error| {
-                        tracing::error!(%error, namespace, deployment, "report not readable");
-                        StoreError::Unavailable
-                    })?;
-                }
-                return Ok(Attempt::Conflict);
-            }
+            0 => return Ok(Attempt::Conflict),
             _ => {
                 self.metrics.write("refused");
                 if self.once(namespace, deployment, "deployments") {

@@ -63,8 +63,10 @@ proptest! {
         endpoints in 1..12usize,
         authorities in 1..5usize,
         budget in 512..65_536usize,
+        literals in 1..9usize,
     ) {
-        let limits = limits(endpoints, authorities, budget);
+        // Few literals per node make the nodes absorb.
+        let limits = Limits { max_literals: literals, ..limits(endpoints, authorities, budget) };
         let all = [
             build(&a, &limits, 19_000),
             build(&b, &limits, 19_001),
