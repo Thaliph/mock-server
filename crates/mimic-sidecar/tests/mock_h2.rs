@@ -161,6 +161,50 @@ async fn mck_12_mocked_h2_connections_advertise_256_concurrent_streams() {
     assert_eq!(send.current_max_send_streams(), 256);
 }
 
+// --- idle timeout of a mocked h2 connection (spec §8) -------------------------------------
+
+#[tokio::test]
+async fn mck_12_an_h2_connection_silent_after_the_preface_is_closed() {
+    let rig = rig(users_set(5), 100, 1024).await;
+    rig.mock.set_stall(Duration::from_millis(300));
+    let mut tcp = TcpStream::connect(rig.addr).await.unwrap();
+    tcp.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    let started = Instant::now();
+    // The server's SETTINGS, then the end of the stream once the idle timeout is over.
+    let mut sink = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut sink))
+        .await
+        .expect("closed by the idle timeout")
+        .ok();
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert_eq!(rig.accepted.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mck_12_an_idle_h2_connection_with_no_stream_open_is_closed_but_not_while_busy() {
+    let rig = rig(users_set(5), 100, 1024).await;
+    rig.mock.set_stall(Duration::from_millis(400));
+    let mut sender = h2c(rig.addr).await;
+    // Requests spaced under the timeout keep the connection open for longer than the timeout.
+    let started = Instant::now();
+    for n in 1..=4 {
+        let (head, _, _) = send(&mut sender, get(n)).await;
+        assert_eq!(head.status(), 200);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(started.elapsed() > Duration::from_millis(400));
+    assert!(!sender.is_closed(), "closed while in use");
+    // Then silence: closed within the timeout and a margin.
+    let silent = Instant::now();
+    while !sender.is_closed() {
+        assert!(silent.elapsed() < Duration::from_secs(5), "never closed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rig.accepted.load(Ordering::SeqCst), 0);
+}
+
 // --- MCK-15 -----------------------------------------------------------------------------
 
 #[tokio::test]

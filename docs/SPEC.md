@@ -428,7 +428,12 @@ client or the destination sees, the connection is **passed through** untouched i
   is never called, §3), unless its SNI (or destination IP without SNI) matches
   `MIMIC_MOCK_PASSTHROUGH` (§8), in which case it is handled as in discovery. The decisions
   that need the destination (`upstream_untrusted`, `client_cert_requested`) cannot arise in
-  mock; `client_rejected` closes the connection as in discovery. In mock a leaf is issued for a
+  mock; `client_rejected` closes the connection as in discovery (and remembers the
+  destination). Every close by mock counts `mimic_tls_connections_total` under its decision
+  and `mimic_mock_connections_total{decision="closed"}`, and writes a `connection` line with
+  `result: mock_closed` and its `interception`. A decrypted stream that does not begin with
+  an HTTP/1.x request line or the HTTP/2 preface is closed the same way (no `interception`);
+  one that does is a mocked connection (`decision="mocked"`). In mock a leaf is issued for a
   name whose real certificate was never verified: it is only trusted by the pods of this
   deployment (its root is per deployment) and no traffic leaves, so it vouches for nothing
   outside the pod (§11.1).
@@ -1947,8 +1952,10 @@ random numbers it hands to the draw.
   are 64 KiB and 256 lines, as §4.1's. A parse error on a pipelined request, while an earlier
   answer is still unflushed, can let `hyper`'s own `400` out: it carries no data and reaches no
   destination, and the `unframed` line and count are written either way. The 30 s header-read
-  timeout also closes idle keep-alive connections on the mocked path (the no-idle-timeout rule
-  of §4.1 holds for forwarded connections only); `MIMIC_MAX_CONNECTIONS` is the real bound. A
+  timeout also closes idle keep-alive connections on the mocked path, and an HTTP/2 connection
+  with no stream open for 30 s (after the preface too) gets `GOAWAY` and is closed (the
+  no-idle-timeout rule of §4.1 holds for forwarded connections only); `MIMIC_MAX_CONNECTIONS`
+  is the real bound. A
   `CONNECT` and a request that asks for an upgrade (`Upgrade`, extended `CONNECT`) are misses
   (`connect`, `upgrade`).
 - **Request signature** (pure). Authority: the scope key of §6.1 (target authority, else SNI,
