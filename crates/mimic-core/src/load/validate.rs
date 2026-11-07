@@ -16,12 +16,15 @@ pub struct Params {
     pub timeout_ms: u64,
 }
 
-/// `MIMIC_LOAD_MAX_CONCURRENCY`, `MIMIC_LOAD_MAX_RATE`, `MIMIC_LOAD_MAX_DURATION`.
+/// `MIMIC_LOAD_MAX_CONCURRENCY`, `MIMIC_LOAD_MAX_RATE`, `MIMIC_LOAD_MAX_DURATION`,
+/// `MIMIC_LOAD_POD_CONCURRENCY`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub max_concurrency: u64,
     pub max_rate: u64,
     pub max_duration_ms: u64,
+    /// `MIMIC_LOAD_POD_CONCURRENCY`.
+    pub pod_concurrency: u64,
 }
 
 /// The field at fault and a message naming it and the limit; no value from the spec.
@@ -65,6 +68,17 @@ pub fn validate(params: &Params, limits: &Limits) -> Result<(), Invalid> {
                 "spec.rate must be 1 to {} (MIMIC_LOAD_MAX_RATE)",
                 limits.max_rate
             ),
+        );
+    }
+    if params
+        .rate
+        .is_some_and(|r| r < super::schedule::pods(params.concurrency, limits.pod_concurrency))
+    {
+        return invalid(
+            "spec.rate",
+            "spec.rate must be at least the number of generator pods \
+             (spec.concurrency / MIMIC_LOAD_POD_CONCURRENCY, rounded up)"
+                .to_string(),
         );
     }
     if !(MIN_DURATION_MS..=limits.max_duration_ms).contains(&params.duration_ms) {
