@@ -333,3 +333,107 @@ async fn mck_14_a_passthrough_ip_entry_matches_the_destination_of_an_h2c_connect
     assert_eq!(rig.accepted.load(Ordering::SeqCst), 1);
     assert_eq!(decision(&rig, "passthrough"), 1);
 }
+
+const PASS_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\ncontent-type: text/plain\r\n\r\nok";
+
+fn passthrough_options(stall: Option<Duration>) -> Options {
+    Options {
+        passthrough: "users.test",
+        stall,
+        dest: Dest::Hold {
+            greeting: b"",
+            reply: PASS_REPLY,
+        },
+        ..Options::default()
+    }
+}
+
+#[tokio::test]
+async fn mck_14_a_trickling_client_is_closed_at_one_deadline_from_its_first_byte() {
+    let rig = rig_with(
+        users_set(5),
+        100,
+        1024,
+        None,
+        passthrough_options(Some(Duration::from_millis(500))),
+    )
+    .await;
+    let mut tcp = TcpStream::connect(rig.addr).await.unwrap();
+    let started = Instant::now();
+    let head = b"GET /users/1 HTTP/1.1\r\nhost: users.test:8080\r\nx-slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut closed = false;
+    for byte in head {
+        if tcp.write_all(&[*byte]).await.is_err() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut probe = [0u8; 1];
+        if matches!(
+            tokio::time::timeout(Duration::from_millis(1), tcp.read(&mut probe)).await,
+            Ok(Ok(0) | Err(_))
+        ) {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "still open after {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(rig.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mck_14_a_head_split_after_the_silence_matches_a_passthrough_host() {
+    let rig = rig_with(users_set(5), 100, 1024, None, passthrough_options(None)).await;
+    let mut tcp = TcpStream::connect(rig.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(rig.accepted.load(Ordering::SeqCst), 1);
+    for part in [
+        "GET /users/1 HTT",
+        "P/1.1\r\nhost: user",
+        "s.test:8080\r\n\r\n",
+    ] {
+        tcp.write_all(part.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let answer = read_response(&mut tcp).await;
+    assert!(answer.ends_with("\r\n\r\nok"), "{answer}");
+    assert!(!answer.to_ascii_lowercase().contains("x-mimic-match"));
+    assert_eq!(*rig.received.lock().unwrap(), REQUEST.as_bytes());
+    assert_eq!(rig.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(decision(&rig, "passthrough"), 1);
+    assert_eq!(decision(&rig, "mocked"), 0);
+}
+
+#[tokio::test]
+async fn mck_14_a_head_that_stalls_after_the_silence_falls_back_to_the_mock() {
+    let rig = rig_with(
+        users_set(5),
+        100,
+        1024,
+        None,
+        passthrough_options(Some(Duration::from_millis(400))),
+    )
+    .await;
+    let mut tcp = TcpStream::connect(rig.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    tcp.write_all(b"GET /users/1 HTTP/1.1\r\nhost: users.test:8080\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(TIMEOUT, tcp.read_to_end(&mut out))
+        .await
+        .expect("closed in time");
+    assert!(!String::from_utf8_lossy(&out).contains("ok"));
+    eventually("the destination sees its socket closed", || {
+        rig.closed.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(rig.received.lock().unwrap().is_empty());
+    assert_eq!(decision(&rig, "mocked"), 1);
+    assert_eq!(decision(&rig, "passthrough"), 0);
+}
