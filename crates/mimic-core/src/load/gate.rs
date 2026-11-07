@@ -58,13 +58,17 @@ pub fn targets(slices: &[EndpointSlice], deployment: &str) -> Vec<Target> {
         .collect()
 }
 
-/// Whether `field` (`<mode> <ms>`) says `mock`, written within the window.
+/// How far in the future a `:pulls` timestamp may be (clock skew between replicas).
+const SKEW_MS: u64 = 60_000;
+
+/// Whether `field` (`<mode> <ms>`) says `mock`, written within the window and not further
+/// than `SKEW_MS` ahead of `now_ms`.
 fn pulled_mock(field: &str, now_ms: u64, window_ms: u64) -> bool {
     field.split_once(' ').is_some_and(|(mode, at)| {
         mode == Mode::Mock.as_str()
-            && at
-                .parse::<u64>()
-                .is_ok_and(|at| now_ms.saturating_sub(at) <= window_ms)
+            && at.parse::<u64>().is_ok_and(|at| {
+                at <= now_ms.saturating_add(SKEW_MS) && now_ms.saturating_sub(at) <= window_ms
+            })
     })
 }
 

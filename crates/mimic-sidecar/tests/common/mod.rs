@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod mock_rig;
+
 use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::listener::{Direction, OriginalDst, Shared, TunnelMetrics, spawn_listener};
 use mimic_sidecar::red::ProxyMetrics;

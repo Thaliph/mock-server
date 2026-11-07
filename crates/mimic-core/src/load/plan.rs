@@ -56,8 +56,8 @@ pub struct Spec {
     pub credentials: Vec<CredentialField>,
     /// `MIMIC_LOAD_MAX_ENDPOINTS`.
     pub max_endpoints: usize,
-    /// `MIMIC_LOAD_MAX_PLAN`, in bytes of the serialised plan; at least `MIN_PLAN` (see
-    /// `plan_limit`), else a plan shrunk to the limit may be unreadable.
+    /// `MIMIC_LOAD_MAX_PLAN`, in bytes of the serialised plan; `plan` raises a value below
+    /// `MIN_PLAN` (see `plan_limit`) to it, else a plan shrunk to the limit may be unreadable.
     pub max_plan: usize,
 }
 
@@ -240,6 +240,11 @@ fn host_ok(host: &str) -> bool {
 
 /// The plan of a stored inbound report.
 pub fn plan(report: &Report, spec: &Spec) -> Planned {
+    build(report, spec, spec.max_plan.max(MIN_PLAN))
+}
+
+/// `plan` with an explicit byte limit, not raised to `MIN_PLAN` (tests).
+pub(super) fn build(report: &Report, spec: &Spec, max_plan: usize) -> Planned {
     let supplied: BTreeSet<&str> = spec.credentials.iter().map(|c| c.field.as_str()).collect();
     let mut skipped: BTreeMap<&'static str, u64> = BTreeMap::new();
     // Usable endpoints in report order.
@@ -347,7 +352,7 @@ pub fn plan(report: &Report, spec: &Spec) -> Planned {
         credentials: spec.credentials.clone(),
         endpoints: usable,
     };
-    let emptied = shrink(&mut plan, spec.max_plan);
+    let emptied = shrink(&mut plan, max_plan);
     if emptied > 0 {
         *skipped.entry(PLAN_SIZE).or_default() += emptied;
     }

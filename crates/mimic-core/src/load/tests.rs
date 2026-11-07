@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use proptest::prelude::*;
 use serde_json::json;
 
-use super::plan::{CredentialField, Plan, Planned, Spec, plan};
+use super::plan::{CredentialField, Plan, Planned, Spec, build, plan};
 use super::request::{Context, Error, Request, request};
 use crate::discovery::observed::Observation;
 use crate::discovery::redact::{MARKER, Redactor};
@@ -332,9 +332,8 @@ mod plan_tests {
             .collect();
         hashes.sort_unstable();
 
-        let mut s = spec();
-        s.max_plan = size - 1;
-        let p = planned(&items, &s);
+        let s = spec();
+        let p = build(&report(&items), &s, size - 1);
         let after: BTreeSet<u64> = p
             .plan
             .endpoints
@@ -348,8 +347,7 @@ mod plan_tests {
         assert_eq!(kept, hashes[..kept.len()]);
 
         // A budget for the skeleton only empties every endpoint.
-        s.max_plan = 2;
-        let p = planned(&items, &s);
+        let p = build(&report(&items), &s, 2);
         assert!(p.plan.endpoints.is_empty());
         assert_eq!(skipped(&p), [("plan_size", 2)]);
     }
@@ -897,7 +895,7 @@ mod robustness {
                 };
                 accepted += 1;
                 for spec in &specs {
-                    let p = plan(&report, spec);
+                    let p = build(&report, spec, spec.max_plan);
                     assert!(p.plan.to_json().map_or(0, |j| j.len()) <= spec.max_plan.max(64));
                     for s in 0..4 {
                         if let Ok(r) = request(&p.plan, &ctx(&secrets, 0), s) {
@@ -1046,5 +1044,18 @@ mod follow_ups {
         // Even when everything is dropped.
         let empty = Plan::default().to_json().expect("json");
         assert!(Plan::from_json(&empty, MIN_PLAN).is_ok());
+    }
+
+    #[test]
+    fn ldt_01_a_plan_never_exceeds_the_floor_of_a_spec_limit_below_it() {
+        let items = [Ex::new("GET", "/me", 200)];
+        let mut s = spec();
+        s.max_plan = 2;
+        let p = planned(&items, &s);
+        // Raised to MIN_PLAN: the endpoint is kept and the plan reads back.
+        assert!(!p.plan.endpoints.is_empty());
+        let json = p.plan.to_json().expect("json");
+        assert!(Plan::from_json(&json, MIN_PLAN).is_ok());
+        assert!(p.skipped.is_empty());
     }
 }
