@@ -10,33 +10,33 @@ use sha2::{Digest, Sha256};
 use super::v2::{AUTHORITY, outbound_report};
 use super::*;
 
-const EGRESS: &str = "/v1/workloads/{deployment}/egress";
+pub(super) const EGRESS: &str = "/v1/workloads/{deployment}/egress";
 const EMPTY: &str = r#"{"authorities":{},"format":1}"#;
 /// Never in an answer, a log line or a metric.
 const CANARY: &str = "CANARYSECRET-91c4e7";
 
-struct Pulled {
-    status: u16,
-    headers: HeaderMap,
-    bytes: Vec<u8>,
+pub(super) struct Pulled {
+    pub(super) status: u16,
+    pub(super) headers: HeaderMap,
+    pub(super) bytes: Vec<u8>,
 }
 
 impl Pulled {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 
-    fn etag(&self) -> String {
+    pub(super) fn etag(&self) -> String {
         self.header("etag").expect("an ETag").to_string()
     }
 
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
 }
 
 /// One request to the egress route.
-async fn request(
+pub(super) async fn request(
     router: &Router,
     method: Method,
     token: Option<&str>,
@@ -67,7 +67,7 @@ async fn request(
 }
 
 /// A pull by the pod of `deployment` in the namespace of `s`, `format=1`.
-async fn pull(s: &Setup, deployment: &str, none_match: Option<&str>) -> Pulled {
+pub(super) async fn pull(s: &Setup, deployment: &str, none_match: Option<&str>) -> Pulled {
     let tok = token(&s.ns, deployment, "t");
     request(
         &s.router,
@@ -80,7 +80,7 @@ async fn pull(s: &Setup, deployment: &str, none_match: Option<&str>) -> Pulled {
     .await
 }
 
-async fn stored_outbound(s: &Setup, deployment: &str) -> Option<String> {
+pub(super) async fn stored_outbound(s: &Setup, deployment: &str) -> Option<String> {
     let key = keys(&s.ns, deployment).unwrap().outbound;
     redis::cmd("GET")
         .arg(key)
@@ -89,7 +89,7 @@ async fn stored_outbound(s: &Setup, deployment: &str) -> Option<String> {
         .unwrap()
 }
 
-async fn set_outbound(s: &Setup, deployment: &str, bytes: &str) {
+pub(super) async fn set_outbound(s: &Setup, deployment: &str, bytes: &str) {
     let key = keys(&s.ns, deployment).unwrap().outbound;
     let _: () = redis::cmd("SET")
         .arg(key)
@@ -99,7 +99,7 @@ async fn set_outbound(s: &Setup, deployment: &str, bytes: &str) {
         .unwrap();
 }
 
-async fn hset_meta(s: &Setup, deployment: &str, field: &str, value: &str) {
+pub(super) async fn hset_meta(s: &Setup, deployment: &str, field: &str, value: &str) {
     let key = keys(&s.ns, deployment).unwrap().meta;
     let _: i64 = redis::cmd("HSET")
         .arg(key)
@@ -110,7 +110,7 @@ async fn hset_meta(s: &Setup, deployment: &str, field: &str, value: &str) {
         .unwrap();
 }
 
-async fn hdel_meta(s: &Setup, deployment: &str, field: &str) {
+pub(super) async fn hdel_meta(s: &Setup, deployment: &str, field: &str) {
     let key = keys(&s.ns, deployment).unwrap().meta;
     let _: i64 = redis::cmd("HDEL")
         .arg(key)
@@ -133,7 +133,13 @@ fn projection_of(outbound: &str) -> String {
     EgressSet::project(&report).to_json().unwrap()
 }
 
-async fn push_report(s: &Setup, deployment: &str, session: &str, sequence: u64, report: &Report) {
+pub(super) async fn push_report(
+    s: &Setup,
+    deployment: &str,
+    session: &str,
+    sequence: u64,
+    report: &Report,
+) {
     let answer = push(s, deployment, payload(session, sequence, report)).await;
     assert_eq!(answer.status, 200, "{}", answer.text());
 }
@@ -146,7 +152,7 @@ impl Answer {
 
 /// An outbound report whose projection is large: 64 authorities, two statuses each, with a
 /// sample of about 1 KiB per status. Records `secret` as a request header and body field.
-fn fat_report(secret: &str) -> Report {
+pub(super) fn fat_report(secret: &str) -> Report {
     let mut report = Report::new(Some(pod_of("pay")));
     let filler = "x".repeat(1000);
     let body = format!(r#"{{"note":"{filler}","password":"{secret}"}}"#);
@@ -253,9 +259,11 @@ async fn pul_07_the_route_serves_the_projection_and_a_304_without_reading_outbou
         assert_eq!(cached.etag(), first.etag());
         assert!(cached.bytes.is_empty());
     }
-    // Weak validators and `*` do not match: the route reads, and finds the damage.
+    // Weak validators and `*` do not match: a 200, from the cache (step 4), which holds the
+    // projection of this digest and never reads the damaged bytes.
     for none_match in [format!("W/{}", first.etag()), "*".to_string()] {
-        assert_eq!(pull(&s, "pay", Some(&none_match)).await.status, 500);
+        let answer = pull(&s, "pay", Some(&none_match)).await;
+        assert_eq!((answer.status, answer.text()), (200, first.text()));
     }
     set_outbound(&s, "pay", &stored).await;
 

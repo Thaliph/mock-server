@@ -161,6 +161,7 @@ impl ReviewCache {
 }
 
 /// Bytes of push bodies being read at once, reserved from the declared `Content-Length`.
+#[derive(Clone)]
 pub struct BodyBudget {
     shared: Arc<Shared>,
 }

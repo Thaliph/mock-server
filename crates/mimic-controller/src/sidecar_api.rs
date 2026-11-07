@@ -26,6 +26,7 @@ use mimic_core::discovery::report::Report;
 use mimic_core::identity::pod_of_deployment;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::{Registry, Unit};
 use serde::Deserialize;
@@ -41,6 +42,7 @@ mod admission;
 mod egress;
 
 pub use admission::{BodyBudget, RateLimiter, ReviewCache};
+pub use egress::Cache as EgressCache;
 pub use egress::Logged as EgressLogged;
 
 /// Audience of the projected token (spec §7.1).
@@ -60,6 +62,7 @@ pub struct ApiMetrics {
     requests: Family<Labels, Counter>,
     egress_builds: Family<Labels, Counter>,
     egress_build_duration: Histogram,
+    egress_cache_bytes: Gauge,
 }
 
 impl ApiMetrics {
@@ -70,6 +73,7 @@ impl ApiMetrics {
             egress_build_duration: Histogram::new([
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
             ]),
+            egress_cache_bytes: Gauge::default(),
         };
         registry.register(
             "sidecar_api_requests",
@@ -86,6 +90,12 @@ impl ApiMetrics {
             "One egress projection, from the read of the stored bytes to the serialised set",
             Unit::Seconds,
             metrics.egress_build_duration.clone(),
+        );
+        registry.register_with_unit(
+            "sidecar_api_egress_cache",
+            "Bytes of the egress budget held by cached and in-flight projections",
+            Unit::Bytes,
+            metrics.egress_cache_bytes.clone(),
         );
         metrics
     }
@@ -300,9 +310,8 @@ pub struct SidecarApi {
     pub max_push_endpoints: usize,
     /// `MIMIC_SIDECAR_API_MAX_EGRESS`.
     pub max_egress: usize,
-    /// `MIMIC_SIDECAR_API_EGRESS_BUDGET`: what the egress cache will hold (F9 step 4).
-    #[allow(dead_code)] // read by the egress cache (F9 step 4)
-    pub egress_budget: u64,
+    /// Projections served, built once and held within `MIMIC_SIDECAR_API_EGRESS_BUDGET`.
+    pub egress: egress::Cache,
     /// What `egress_limit` warnings were written already.
     pub egress_logged: egress::Logged,
 }
@@ -352,6 +361,7 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
 }
 
 /// Why a request was refused: the status and the `result` label of the log line and metric.
+#[derive(Clone, Copy)]
 struct Refusal {
     status: StatusCode,
     result: &'static str,
@@ -948,12 +958,13 @@ mod tests {
     fn setup_limited(seed: Arc<SeedSlot>, limiter: ReviewLimiter) -> Setup {
         let (client, reviews) = api_server();
         let mut metrics = Metrics::new("controller", "test");
+        let api_metrics = ApiMetrics::register(metrics.registry_mut());
         let api = Arc::new(SidecarApi {
             seed: seed.clone(),
             reviewer: Arc::new(KubeReviewer::new(Arc::new(OnceCell::new_with(Some(
                 client,
             ))))),
-            metrics: ApiMetrics::register(metrics.registry_mut()),
+            metrics: api_metrics.clone(),
             limiter,
             rate: RateLimiter::new(10_000),
             reviews: ReviewCache::default(),
@@ -977,7 +988,7 @@ mod tests {
             max_report: 1 << 20,
             max_push_endpoints: 256,
             max_egress: 4 << 20,
-            egress_budget: 32 << 20,
+            egress: egress::Cache::new(32 << 20, &api_metrics),
             egress_logged: egress::Logged::default(),
         });
         Setup {

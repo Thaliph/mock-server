@@ -169,7 +169,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     let api = Arc::new(sidecar_api::SidecarApi {
         seed: seed.clone(),
         reviewer: Arc::new(sidecar_api::KubeReviewer::new(kube_client)),
-        metrics: api_metrics,
+        metrics: api_metrics.clone(),
         limiter: sidecar_api::ReviewLimiter::default(),
         rate: sidecar_api::RateLimiter::new(config.push.rate),
         reviews: sidecar_api::ReviewCache::default(),
@@ -179,7 +179,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         max_report: config.push.max_report,
         max_push_endpoints: config.push.max_push_endpoints,
         max_egress: config.push.max_egress,
-        egress_budget: config.push.egress_budget,
+        egress: sidecar_api::EgressCache::new(config.push.egress_budget, &api_metrics),
         egress_logged: sidecar_api::EgressLogged::default(),
     });
     let webhook_listener = tokio::net::TcpListener::bind(webhook.addr).await?;
