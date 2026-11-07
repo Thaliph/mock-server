@@ -90,7 +90,7 @@ pub(crate) async fn handle(
     };
     if let Some(mock) = mock {
         match mock_first(&mut client, stall, abort.as_mut()).await {
-            MockFirst::Http1(buf, first) => {
+            MockFirst::Http(h2, buf, first) => {
                 shared.metrics().count(direction, Outcome::Ok);
                 if let Err(e) = configure_socket(&client) {
                     tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
@@ -105,17 +105,18 @@ pub(crate) async fn handle(
                     sni: None,
                     interception: None,
                 };
+                let protocol = if h2 { "h2" } else { "http1" };
                 shared
                     .proxy()
-                    .connection(direction, "http1", &dst.to_string());
-                mock.serve_http1(
-                    conn.ctx(),
-                    Stream::plain_with_prefix(client, buf),
-                    first,
-                    shared.stopped(),
-                    abort.as_mut(),
-                )
-                .await;
+                    .connection(direction, protocol, &dst.to_string());
+                let stream = Stream::plain_with_prefix(client, buf);
+                if h2 {
+                    mock.serve_h2(conn.ctx(), stream, shared.stopped(), abort.as_mut())
+                        .await;
+                } else {
+                    mock.serve_http1(conn.ctx(), stream, first, shared.stopped(), abort.as_mut())
+                        .await;
+                }
                 return;
             }
             MockFirst::Other(buf) => read = buf,
@@ -212,8 +213,9 @@ fn tunnel_kind(interception: Option<&str>) -> &'static str {
 /// What the client said first on an outbound connection in mock mode, before any connection
 /// to the destination.
 enum MockFirst {
-    /// An HTTP/1.x request line, the bytes read, and when the first one arrived.
-    Http1(Vec<u8>, Instant),
+    /// An HTTP/1.x request line or the HTTP/2 preface (`true`), the bytes read, and when the
+    /// first one arrived.
+    Http(bool, Vec<u8>, Instant),
     /// Anything else: the bytes read so far (possibly none), to detect again once connected.
     Other(Vec<u8>),
     /// The client closed, failed or was told to stop: nothing is dialled.
@@ -245,8 +247,9 @@ async fn mock_first(
                     buf.extend_from_slice(&chunk[..n]);
                     match detect(&buf) {
                         Detection::NeedMore => {}
-                        Detection::Http1 => {
-                            return MockFirst::Http1(buf, first.unwrap_or_else(Instant::now));
+                        detection @ (Detection::Http1 | Detection::H2) => {
+                            let h2 = detection == Detection::H2;
+                            return MockFirst::Http(h2, buf, first.unwrap_or_else(Instant::now));
                         }
                         _ => return MockFirst::Other(buf),
                     }
