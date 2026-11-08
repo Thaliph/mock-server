@@ -2,6 +2,7 @@
 //! snapshot, the tiers, the answer and the latency draw. No I/O, no clock: the sidecar owns
 //! the sockets and the timers, and hands the draw its random numbers.
 
+mod convergence;
 mod effective;
 mod index;
 mod latency;
@@ -9,12 +10,15 @@ mod signature;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_convergence;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::discovery::histogram::Histogram;
 
+pub use convergence::{Convergence, convergence};
 pub use effective::{DEFAULT_FACTOR, Effective, MockSettings, effective};
 pub use index::Index;
 pub use latency::{

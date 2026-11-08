@@ -23,6 +23,8 @@ pub struct Target {
     pub name: String,
     pub deployment: String,
     pub status: Option<serde_json::Value>,
+    /// The `status.mode` the cluster holds for it.
+    pub mode_status: Option<serde_json::Value>,
 }
 
 /// `spec.deployment`, `spec.tls.exclude` and `spec.discovery.redact` of a `MimicWorkload`.
@@ -34,6 +36,8 @@ struct State {
     items: BTreeMap<(String, String), Settings>,
     /// `(namespace, MimicWorkload name)` to the `status.discovery` the cluster holds for it.
     statuses: BTreeMap<(String, String), serde_json::Value>,
+    /// `(namespace, MimicWorkload name)` to the `status.mode` the cluster holds for it.
+    mode_statuses: BTreeMap<(String, String), serde_json::Value>,
     /// `(namespace, MimicWorkload name)` to its mock settings (absent: the defaults).
     mocks: BTreeMap<(String, String), MockSettings>,
     synced: bool,
@@ -69,6 +73,7 @@ impl WorkloadCache {
         let key = (namespace.to_string(), name.to_string());
         state.items.remove(&key);
         state.statuses.remove(&key);
+        state.mode_statuses.remove(&key);
         state.mocks.remove(&key);
     }
 
@@ -80,6 +85,7 @@ impl WorkloadCache {
             .map(|(ns, n, d, e, r)| ((ns, n), (d, e, r)))
             .collect();
         state.statuses.clear();
+        state.mode_statuses.clear();
         state.mocks.clear();
         state.synced = true;
     }
@@ -126,6 +132,19 @@ impl WorkloadCache {
         };
     }
 
+    /// Records the `status.mode` the cluster holds for a `MimicWorkload`.
+    pub fn set_mode_status(&self, namespace: &str, name: &str, status: Option<serde_json::Value>) {
+        let mut state = self.write();
+        let key = (namespace.to_string(), name.to_string());
+        if !state.items.contains_key(&key) {
+            return;
+        }
+        match status {
+            Some(status) => state.mode_statuses.insert(key, status),
+            None => state.mode_statuses.remove(&key),
+        };
+    }
+
     /// Every `MimicWorkload` with the status it holds, sorted by namespace then name.
     pub fn targets(&self) -> Vec<Target> {
         let state = self.read();
@@ -137,6 +156,7 @@ impl WorkloadCache {
                 name: key.1.clone(),
                 deployment: deployment.clone(),
                 status: state.statuses.get(key).cloned(),
+                mode_status: state.mode_statuses.get(key).cloned(),
             })
             .collect()
     }
@@ -272,17 +292,20 @@ pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
         std::pin::pin!(watcher::watcher(api, watcher::Config::default()).default_backoff());
     let mut listing = Vec::new();
     let mut statuses = Vec::new();
+    let mut mode_statuses = Vec::new();
     let mut mocks = Vec::new();
     while let Some(event) = events.next().await {
         match event {
             Ok(Event::Init) => {
                 listing.clear();
                 statuses.clear();
+                mode_statuses.clear();
                 mocks.clear();
             }
             Ok(Event::InitApply(object)) => {
                 if let Some(found) = entry(&object) {
                     statuses.push((found.0.clone(), found.1.clone(), held_status(&object)));
+                    mode_statuses.push((found.0.clone(), found.1.clone(), held_mode(&object)));
                     mocks.push((found.0.clone(), found.1.clone(), mock_of(&object)));
                     listing.push(found);
                 }
@@ -291,6 +314,9 @@ pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
                 cache.replace(std::mem::take(&mut listing));
                 for (ns, name, status) in std::mem::take(&mut statuses) {
                     cache.set_status(&ns, &name, status);
+                }
+                for (ns, name, status) in std::mem::take(&mut mode_statuses) {
+                    cache.set_mode_status(&ns, &name, status);
                 }
                 for (ns, name, mock) in std::mem::take(&mut mocks) {
                     cache.set_mock(&ns, &name, mock);
@@ -301,6 +327,7 @@ pub async fn watch(client: kube::Client, cache: Arc<WorkloadCache>) {
                 Some((ns, name, deployment, exclude, redact)) => {
                     cache.apply(&ns, &name, &deployment, exclude, redact);
                     cache.set_status(&ns, &name, held_status(&object));
+                    cache.set_mode_status(&ns, &name, held_mode(&object));
                     cache.set_mock(&ns, &name, mock_of(&object));
                 }
                 None => remove(&cache, &object),
@@ -320,6 +347,11 @@ fn remove(cache: &WorkloadCache, object: &DynamicObject) {
 /// `status.discovery` of a `MimicWorkload`, as the cluster holds it.
 fn held_status(object: &DynamicObject) -> Option<serde_json::Value> {
     object.data.get("status")?.get("discovery").cloned()
+}
+
+/// `status.mode` of a `MimicWorkload`, as the cluster holds it.
+fn held_mode(object: &DynamicObject) -> Option<serde_json::Value> {
+    object.data.get("status")?.get("mode").cloned()
 }
 
 /// `spec.mode` and `spec.mock` of a `MimicWorkload`; what the CRD would refuse reads as the

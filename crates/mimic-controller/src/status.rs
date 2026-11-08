@@ -11,10 +11,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
 use mimic_core::discovery::status::discovery;
+use mimic_core::mock::convergence;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use tokio::sync::OnceCell;
 
@@ -43,13 +44,14 @@ impl StatusMetrics {
 
 pub type ApplyFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-/// Applies a `status.discovery` to a `MimicWorkload`.
+/// Applies a `status.discovery` and a `status.mode` to a `MimicWorkload`.
 pub trait StatusSink: Send + Sync {
     fn apply<'a>(
         &'a self,
         namespace: &'a str,
         name: &'a str,
         discovery: &'a Value,
+        mode: &'a Value,
     ) -> ApplyFuture<'a>;
 }
 
@@ -71,6 +73,7 @@ impl StatusSink for KubeSink {
         namespace: &'a str,
         name: &'a str,
         discovery: &'a Value,
+        mode: &'a Value,
     ) -> ApplyFuture<'a> {
         Box::pin(async move {
             let client = self.client.get().ok_or("no Kubernetes client yet")?;
@@ -84,7 +87,7 @@ impl StatusSink for KubeSink {
                 "apiVersion": "mimic.platform.io/v1alpha1",
                 "kind": "MimicWorkload",
                 "metadata": {"name": name},
-                "status": {"discovery": discovery},
+                "status": {"discovery": discovery, "mode": mode},
             });
             api.patch_status(name, &apply_params(), &Patch::Apply(&body))
                 .await
@@ -119,6 +122,17 @@ fn defaulted(status: &Value) -> Value {
     status
 }
 
+/// A `status.mode` as the cluster returns it: the CRD defaults both counts to 0.
+fn defaulted_mode(status: &Value) -> Value {
+    let mut status = status.clone();
+    if let Some(object) = status.as_object_mut() {
+        for count in ["pods", "otherPods"] {
+            object.entry(count).or_insert_with(|| Value::from(0u64));
+        }
+    }
+    status
+}
+
 /// How many status applies run at once (#293 note 25): a slow API server delays a pass by one
 /// timeout per batch, not per workload.
 const APPLY_CONCURRENCY: usize = 8;
@@ -140,49 +154,72 @@ impl Reconciler {
     pub async fn tick(&self, now_ms: u64) {
         let window_ms = u64::try_from(self.window.as_millis()).unwrap_or(u64::MAX);
         // One read per deployment, however many workloads name it.
-        let mut computed: BTreeMap<(String, String), Value> = BTreeMap::new();
+        let mut computed: BTreeMap<(String, String), (Value, Value)> = BTreeMap::new();
         let mut changed = Vec::new();
         for target in self.cache.targets() {
             let key = (target.namespace.clone(), target.deployment.clone());
-            let status = match computed.get(&key) {
-                Some(status) => status.clone(),
-                None => match self.store.status_input(&key.0, &key.1).await {
-                    Ok((meta, pods)) => {
-                        self.down.store(false, Ordering::SeqCst);
-                        let status = discovery(meta.as_ref(), &pods, window_ms, now_ms);
-                        computed.insert(key, status.clone());
-                        status
-                    }
-                    Err(ReadError::Unavailable) => {
-                        if !self.down.swap(true, Ordering::SeqCst) {
-                            tracing::warn!("status not updated");
+            let (status, mode) = match computed.get(&key) {
+                Some(found) => found.clone(),
+                None => {
+                    let read = match self.store.status_input(&key.0, &key.1).await {
+                        Ok((meta, pods)) => self
+                            .store
+                            .pulls(&key.0, &key.1)
+                            .await
+                            .map(|pulls| (meta, pods, pulls)),
+                        Err(e) => Err(e),
+                    };
+                    match read {
+                        Ok((meta, pods, pulls)) => {
+                            self.down.store(false, Ordering::SeqCst);
+                            let status = discovery(meta.as_ref(), &pods, window_ms, now_ms);
+                            let effective = self.cache.effective(&key.0, &key.1).mode();
+                            let found = convergence(effective, &pulls, window_ms, now_ms);
+                            self.store
+                                .pulls_unreadable(&key.0, &key.1, found.unreadable);
+                            let mode = json!({
+                                "mode": effective.as_str(),
+                                "pods": found.pods,
+                                "otherPods": found.other_pods,
+                            });
+                            computed.insert(key, (status.clone(), mode.clone()));
+                            (status, mode)
                         }
-                        // The reads that already succeeded in this pass are valid: their applies
-                        // (requests to the API server, not to Valkey) still run below. No
-                        // further read is attempted, so no later deployment is computed.
-                        break;
+                        Err(ReadError::Unavailable) => {
+                            if !self.down.swap(true, Ordering::SeqCst) {
+                                tracing::warn!("status not updated");
+                            }
+                            // The reads that already succeeded in this pass are valid: their
+                            // applies (requests to the API server, not to Valkey) still run
+                            // below. No further read is attempted, so no later deployment is
+                            // computed.
+                            break;
+                        }
+                        // Logged by the store; the other workloads still get their status.
+                        Err(_) => continue,
                     }
-                    // Logged by the store; the other workloads still get their status.
-                    Err(_) => continue,
-                },
+                }
             };
-            if target.status.as_ref().map(defaulted) == Some(defaulted(&status)) {
+            if target.status.as_ref().map(defaulted) == Some(defaulted(&status))
+                && target.mode_status.as_ref().map(defaulted_mode) == Some(defaulted_mode(&mode))
+            {
                 continue;
             }
-            changed.push((target, status));
+            changed.push((target, status, mode));
         }
         // At most APPLY_CONCURRENCY applies at once, each bounded by its own timeout.
         futures::stream::iter(changed)
-            .for_each_concurrent(APPLY_CONCURRENCY, |(target, status)| async move {
-                self.apply_one(&target, &status).await;
+            .for_each_concurrent(APPLY_CONCURRENCY, |(target, status, mode)| async move {
+                self.apply_one(&target, &status, &mode).await;
             })
             .await;
     }
 
-    async fn apply_one(&self, target: &crate::workloads::Target, status: &Value) {
+    async fn apply_one(&self, target: &crate::workloads::Target, status: &Value, mode: &Value) {
         let result = match tokio::time::timeout(
             self.apply_timeout,
-            self.sink.apply(&target.namespace, &target.name, status),
+            self.sink
+                .apply(&target.namespace, &target.name, status, mode),
         )
         .await
         {

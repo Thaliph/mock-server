@@ -37,6 +37,10 @@ spec:
         - name: Last push
           type: date
           jsonPath: .status.discovery.lastPushTime
+        # Pods whose last egress answer carried the effective mode (spec §7.4).
+        - name: Mode pods
+          type: integer
+          jsonPath: .status.mode.pods
       schema:
         openAPIV3Schema:
           type: object
@@ -45,6 +49,25 @@ spec:
             status:
               type: object
               properties:
+                mode:
+                  description: How many pods follow the effective mode of the Deployment (spec §7.4).
+                  type: object
+                  properties:
+                    mode:
+                      description: Effective mode of the Deployment.
+                      type: string
+                      enum: [discovery, mock]
+                    # Defaulted, so the Mode pods column reads 0 instead of nothing (spec §7.4).
+                    pods:
+                      description: Pods whose last egress answer is within MIMIC_STATUS_POD_WINDOW and carried `mode`.
+                      type: integer
+                      format: int64
+                      default: 0
+                    otherPods:
+                      description: Pods within the window whose last answer carried the other mode.
+                      type: integer
+                      format: int64
+                      default: 0
                 discovery:
                   description: What the controller holds of the Deployment's discovery data (spec §7.4).
                   type: object

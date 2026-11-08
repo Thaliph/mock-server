@@ -941,6 +941,38 @@ impl Store {
         Ok((Some(meta), pods))
     }
 
+    /// The `:pulls` fields of a deployment (pod to `<mode> <ms>`), unparsed.
+    pub async fn pulls(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<BTreeMap<String, String>, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        match redis::cmd("HGETALL")
+            .arg(&k.pulls)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(pulls) => Ok(pulls),
+            Err(e) => Err(self.read_failed(e).await),
+        }
+    }
+
+    /// Logs once per streak that the `:pulls` of a deployment hold a field that cannot be read;
+    /// `unreadable` 0 ends the streak.
+    pub fn pulls_unreadable(&self, namespace: &str, deployment: &str, unreadable: u64) {
+        const WHAT: &str = "stored pulls unreadable";
+        if unreadable == 0 {
+            lock(&self.logged).remove(&(namespace.into(), deployment.into(), WHAT.into()));
+        } else if self.once(namespace, deployment, WHAT) {
+            tracing::error!(namespace, deployment, "{WHAT}");
+        }
+    }
+
     /// The stored `:report` bytes, once they are known to parse.
     pub async fn report(&self, namespace: &str, deployment: &str) -> Result<Vec<u8>, ReadError> {
         let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
