@@ -2342,9 +2342,11 @@ it sets. The pod's index and the Job's pod count come from the load API (§7.8).
   - the `secret` volume's `secretName` equals the Job's annotation
     `mimic.platform.io/credentials-secret` (written by the controller from
     `credentials.secretName`), and the annotation is absent when the Job has no `secret`
-    volume. The policy cannot read the `MimicLoadTest`, so this ties the Secret to the Job
-    the controller wrote, not to the object; the author check of the `MimicLoadTest` policy
-    is what binds the Secret to the author (§11.1);
+    volume. This is a consistency check only: the policy cannot read the `MimicLoadTest`,
+    and the controller writes both the volume and the annotation, so a compromised
+    controller can mount any Secret of an injected namespace and the policy still admits
+    the Job. Tying the Secret to the author rests on the author check of the
+    `MimicLoadTest` policy (§11.1) and on the controller itself, not on this rule;
   - for a NetworkPolicy: the §7.8 shape (pod selector on the run's label, `policyTypes`
     `Ingress` and `Egress`, peers only the deployment's pods, the controller pods and the DNS
     selector).
