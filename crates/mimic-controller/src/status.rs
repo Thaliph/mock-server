@@ -43,13 +43,14 @@ impl StatusMetrics {
 
 pub type ApplyFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-/// Applies a `status.discovery` to a `MimicWorkload`.
+/// Applies a `status.discovery` and a `status.mode` to a `MimicWorkload`.
 pub trait StatusSink: Send + Sync {
     fn apply<'a>(
         &'a self,
         namespace: &'a str,
         name: &'a str,
         discovery: &'a Value,
+        mode: &'a Value,
     ) -> ApplyFuture<'a>;
 }
 
@@ -71,6 +72,7 @@ impl StatusSink for KubeSink {
         namespace: &'a str,
         name: &'a str,
         discovery: &'a Value,
+        mode: &'a Value,
     ) -> ApplyFuture<'a> {
         Box::pin(async move {
             let client = self.client.get().ok_or("no Kubernetes client yet")?;
@@ -84,7 +86,7 @@ impl StatusSink for KubeSink {
                 "apiVersion": "mimic.platform.io/v1alpha1",
                 "kind": "MimicWorkload",
                 "metadata": {"name": name},
-                "status": {"discovery": discovery},
+                "status": {"discovery": discovery, "mode": mode},
             });
             api.patch_status(name, &apply_params(), &Patch::Apply(&body))
                 .await
@@ -182,7 +184,8 @@ impl Reconciler {
     async fn apply_one(&self, target: &crate::workloads::Target, status: &Value) {
         let result = match tokio::time::timeout(
             self.apply_timeout,
-            self.sink.apply(&target.namespace, &target.name, status),
+            self.sink
+                .apply(&target.namespace, &target.name, status, &Value::Null),
         )
         .await
         {

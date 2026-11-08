@@ -25,6 +25,7 @@ const WINDOW: Duration = Duration::from_secs(300);
 #[derive(Default)]
 struct FakeSink {
     calls: Mutex<Vec<(String, String, Value)>>,
+    modes: Mutex<Vec<(String, String, Value)>>,
     fail: AtomicBool,
     hang: AtomicBool,
     in_flight: AtomicUsize,
@@ -44,10 +45,21 @@ impl FakeSink {
     fn calls(&self) -> Vec<(String, String, Value)> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// The `status.mode` of each apply, in the order of `calls`.
+    fn modes(&self) -> Vec<(String, String, Value)> {
+        self.modes.lock().unwrap().clone()
+    }
 }
 
 impl StatusSink for FakeSink {
-    fn apply<'a>(&'a self, ns: &'a str, name: &'a str, discovery: &'a Value) -> ApplyFuture<'a> {
+    fn apply<'a>(
+        &'a self,
+        ns: &'a str,
+        name: &'a str,
+        discovery: &'a Value,
+        mode: &'a Value,
+    ) -> ApplyFuture<'a> {
         Box::pin(async move {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
@@ -56,6 +68,10 @@ impl StatusSink for FakeSink {
                 .lock()
                 .unwrap()
                 .push((ns.into(), name.into(), discovery.clone()));
+            self.modes
+                .lock()
+                .unwrap()
+                .push((ns.into(), name.into(), mode.clone()));
             if self.hang.load(Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
@@ -522,4 +538,124 @@ async fn ctl_18_concurrent_applies_still_skip_unchanged_statuses() {
     }
     s.reconciler.tick(now_ms()).await;
     assert_eq!(s.sink.calls().len(), 2);
+}
+
+// --- MCK-09 -----------------------------------------------------------------------------
+
+async fn pulled(ns: &str, dep: &str, pod: &str, field: &str) {
+    let k = crate::store::keys(ns, dep).unwrap();
+    let mut conn = redis::Client::open(valkey_url().as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(k.pulls)
+        .arg(pod)
+        .arg(field)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+}
+
+fn mock_settings() -> mimic_core::mock::MockSettings {
+    mimic_core::mock::MockSettings {
+        mock: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn mck_09_status_mode_counts_the_pods_following_the_mode_and_the_others() {
+    let ns = unique("mck09");
+    let mut s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    s.reconciler.window = Duration::from_secs(10);
+    s.reconciler.cache.set_mock(&ns, "w1", mock_settings());
+    let now = now_ms();
+    pulled(&ns, "front", "front-a", &format!("mock {now}")).await;
+    pulled(&ns, "front", "front-b", &format!("mock {now}")).await;
+    pulled(&ns, "front", "front-c", &format!("discovery {now}")).await;
+    s.reconciler.tick(now).await;
+    let modes = s.sink.modes();
+    assert_eq!(modes.len(), 1);
+    assert_eq!(
+        modes[0].2,
+        json!({"mode": "mock", "pods": 2, "otherPods": 1})
+    );
+    // The two mock pods pull again; the third never does: past the window it is in no count.
+    let later = now + 40_000;
+    pulled(&ns, "front", "front-a", &format!("mock {}", later - 1000)).await;
+    pulled(&ns, "front", "front-b", &format!("mock {}", later - 1000)).await;
+    s.reconciler.tick(later).await;
+    let modes = s.sink.modes();
+    assert_eq!(modes.len(), 2);
+    assert_eq!(
+        modes[1].2,
+        json!({"mode": "mock", "pods": 2, "otherPods": 0})
+    );
+}
+
+#[tokio::test]
+async fn mck_09_a_deployment_without_pulls_gets_its_mode_and_zero_counts() {
+    let ns = unique("mck09");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    s.reconciler.tick(now_ms()).await;
+    assert_eq!(
+        s.sink.modes()[0].2,
+        json!({"mode": "discovery", "pods": 0, "otherPods": 0})
+    );
+}
+
+#[tokio::test]
+async fn mck_09_a_status_mode_that_changed_only_by_its_defaults_is_not_applied_again() {
+    let ns = unique("mck09");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    s.reconciler.cache.set_mock(&ns, "w1", mock_settings());
+    s.reconciler.tick(now_ms()).await;
+    let first = s.sink.calls();
+    s.reconciler
+        .cache
+        .set_status(&ns, "w1", Some(first[0].2.clone()));
+    // The cluster returns the defaults of `pods` and `otherPods` (0) whether stored or not.
+    s.reconciler
+        .cache
+        .set_mode_status(&ns, "w1", Some(json!({"mode": "mock"})));
+    s.reconciler.tick(now_ms()).await;
+    assert_eq!(s.sink.calls().len(), 1);
+    // A different mode is applied.
+    s.reconciler
+        .cache
+        .set_mode_status(&ns, "w1", Some(json!({"mode": "discovery"})));
+    s.reconciler.tick(now_ms()).await;
+    assert_eq!(s.sink.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn mck_09_an_unreadable_pulls_field_is_skipped_and_logged_once() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let ns = unique("mck09");
+    let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    let now = now_ms();
+    pulled(&ns, "front", "front-a", &format!("discovery {now}")).await;
+    pulled(&ns, "front", "front-b", "garbage").await;
+    s.reconciler.tick(now).await;
+    s.reconciler.tick(now).await;
+    assert_eq!(
+        s.sink.modes()[0].2,
+        json!({"mode": "discovery", "pods": 1, "otherPods": 0})
+    );
+    let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(raw.matches("stored pulls unreadable").count(), 1, "{raw}");
+}
+
+#[test]
+fn mck_09_the_crd_prints_a_mode_pods_column() {
+    let crd = include_str!("../../../../deploy/helm/mimic/templates/crd.yaml");
+    assert!(
+        crd.contains("- name: Mode pods\n          type: integer\n          jsonPath: .status.mode.pods"),
+        "printer column missing"
+    );
+    for field in ["mode:", "otherPods:"] {
+        assert!(crd.contains(field));
+    }
 }
