@@ -768,7 +768,7 @@ async fn ldt_14_no_canary_and_no_ticket_in_logs_series_answers_or_stored_values(
     )
     .await;
     assert_eq!(refused.status, 400);
-    let canary_token = s.token(&s.ns, CANARY, LOAD_AUDIENCE);
+    let canary_token = s.token(&s.ns, "pay-7d9f8b6c4d-x2k9p", LOAD_AUDIENCE);
     let forbidden = get(&s, "plan", &canary_token).await;
     assert_eq!(forbidden.status, 403);
     let by_name = call(

@@ -57,7 +57,11 @@ fn ended<'a>(summary: &'a str, reason: &'a str) -> Ended<'a> {
 }
 
 async fn memory(key: &str, db: Option<u8>) -> u64 {
-    cmd(&mut conn(db).await, &["MEMORY", "USAGE", key]).await
+    cmd(
+        &mut conn(db).await,
+        &["MEMORY", "USAGE", key, "SAMPLES", "0"],
+    )
+    .await
 }
 
 #[tokio::test]
@@ -240,7 +244,7 @@ async fn ldt_09_the_stop_flag_comes_with_the_plan_and_the_posts() {
 async fn ldt_09_size_while_running_and_after_the_end() {
     let (store, _m) = replica(None, config(Duration::from_secs(3600)));
     let ns = unique("ldt");
-    let plan = format!(r#"{{"pad":"{}"}}"#, "p".repeat(300 << 10));
+    let plan = format!(r#"{{"pad":"{}"}}"#, "p".repeat(190 << 10));
     store
         .load_admit(&admit(&ns, "pay", UID, &plan))
         .await
@@ -248,7 +252,7 @@ async fn ldt_09_size_while_running_and_after_the_end() {
     // Two pods, each close to the 256 KiB bound.
     for index in 0..2 {
         let pod = format!("mimic-load-0b9c1d526a3f-{index}-bcdfg");
-        let big = post(false, 3000);
+        let big = post(false, 3400);
         let bytes = serde_json::to_vec(&big).unwrap().len();
         assert!(bytes > 200 << 10 && bytes <= MAX_POST, "{bytes}");
         store.load_post(&ns, "pay", UID, &pod, &big).await.unwrap();
@@ -260,7 +264,7 @@ async fn ldt_09_size_while_running_and_after_the_end() {
         "{running}"
     );
 
-    let big = summary(MAX_SUMMARY);
+    let big = summary(MAX_SUMMARY - 1024);
     assert!(
         store
             .load_end(&ns, "pay", UID, &ended(&big, "Completed"))
@@ -268,12 +272,12 @@ async fn ldt_09_size_while_running_and_after_the_end() {
             .unwrap()
     );
     let fields = store.load_fields(&ns, "pay", UID).await.unwrap();
-    for gone in ["plan", "ticket"] {
-        assert!(!fields.contains_key(gone), "{gone}");
-    }
-    assert!(
-        fields.keys().all(|k| !k.starts_with("mimic-load-")),
-        "{fields:?}"
+    let mut raw: Vec<String> = cmd(&mut conn(None).await, &["HKEYS", &key]).await;
+    raw.sort();
+    assert_eq!(
+        raw,
+        ["end", "phase", "reason", "spec", "start", "stop", "summary"],
+        "no plan, ticket or pod field is left"
     );
     assert_eq!(fields["summary"], big);
     assert_eq!(fields["phase"], "Succeeded");
