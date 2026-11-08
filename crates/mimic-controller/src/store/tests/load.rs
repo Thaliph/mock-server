@@ -386,7 +386,8 @@ async fn ldt_09_loads_keep_20_runs_and_everything_expires() {
     assert_eq!(evicted, 0);
     for key in [loads, format!("mimic:v1:{{{ns}/pay}}:load:{}", uid(21))] {
         let pttl: i64 = cmd(&mut c, &["PTTL", &key]).await;
-        assert!(pttl > 0 && pttl <= 3_600_000, "{key}: {pttl}");
+        // The message leaves the key out: it holds a run uid (CodeQL rust/cleartext-logging).
+        assert!(pttl > 0 && pttl <= 3_600_000, "pttl {pttl}");
     }
 }
 
