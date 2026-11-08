@@ -2002,6 +2002,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimic-load"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "mimic-core",
+ "mimic-runtime",
+ "prometheus-client",
+ "rand",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "mimic-runtime"
 version = "0.1.0"
 dependencies = [

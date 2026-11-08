@@ -1866,7 +1866,10 @@ no `MimicLoadTest` and creates no Job).
   generate (`<job>-<index>-<5 chars of the §7.2 alphabet>`, else `403`); `404` for an unknown
   or ended run.
   - `GET …/plan` → `{"plan": <the plan stored at admission>, "ticket", "worker": <index
-    from the pod name>, "workers": <pods of the Job>}` (`application/json`).
+    from the pod name>, "workers": <pods of the Job>, "params": {"concurrency", "rate",
+    "durationMs", "rampUpMs", "timeoutMs", "startTimeoutMs"}}` (`application/json`); `params`
+    is the pod's own share (`split`: its `concurrency` and its `rate`, `null` in the closed
+    model) and the run's durations, so the Job needs no variable for them.
   - `GET …/targets` → `{"stop": <bool>, "targets": [{"ip", "pod"}]}`, sorted by pod.
   - `POST …/results` (at most 256 KiB, else `413`) `{"final": <bool>, "pod", "reason":
     null | "Completed" | "ModeLeft" | "Unverified" | "NoTargets", "results": <cumulative
