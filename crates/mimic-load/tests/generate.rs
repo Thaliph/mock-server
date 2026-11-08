@@ -260,9 +260,14 @@ fn ldt_14_no_canary_and_no_ticket_in_the_generator_outputs() {
     let mut outputs = generator.lines().to_vec();
     outputs.push(metrics);
     outputs.extend(rig.state().raw_posts());
-    for output in outputs {
-        for secret in [CANARY, ECHO, TICKET, "ticket-payload-3f9b", TOKEN] {
-            assert!(!output.contains(secret), "{secret} leaked in: {output}");
+    // The assert messages name only indexes: printing a canary would itself log it.
+    let secrets = [CANARY, ECHO, TICKET, "ticket-payload-3f9b", TOKEN];
+    for (o, output) in outputs.iter().enumerate() {
+        for (s, secret) in secrets.iter().enumerate() {
+            assert!(
+                !output.contains(secret),
+                "secret #{s} leaked in output #{o}"
+            );
         }
     }
 }
