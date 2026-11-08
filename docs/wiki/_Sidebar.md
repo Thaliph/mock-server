@@ -7,6 +7,7 @@
 - [Discovery and redaction](Discovery-and-redaction)
 - [Egress aggregation](Egress-aggregation)
 - [Egress endpoint](Egress-endpoint)
+- [Mock mode](Mock-mode)
 - [TLS interception](TLS-interception)
 
 **Run**
