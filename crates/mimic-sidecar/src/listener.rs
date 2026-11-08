@@ -130,6 +130,7 @@ pub struct Shared {
     tls: Interception,
     discovery: Option<crate::discovery::Tap>,
     mock: Option<Mock>,
+    load: Option<crate::load::Marker>,
     original_dst: OriginalDst,
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
@@ -181,6 +182,7 @@ impl Shared {
             tls: Interception::default(),
             discovery: None,
             mock: None,
+            load: None,
             original_dst,
             stop: watch::channel(false).0,
             abort: watch::channel(false).0,
@@ -287,6 +289,16 @@ impl Shared {
 
     pub(crate) fn mock(&self) -> Option<&Mock> {
         self.mock.as_ref()
+    }
+
+    /// Checks the load marker of the inbound requests (spec §7.8).
+    pub fn with_load(mut self, load: crate::load::Marker) -> Shared {
+        self.load = Some(load);
+        self
+    }
+
+    pub(crate) fn load(&self) -> Option<&crate::load::Marker> {
+        self.load.as_ref()
     }
 
     /// Intercepts outbound TLS as `tls` says instead of passing it all through.

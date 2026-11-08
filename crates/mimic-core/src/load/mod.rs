@@ -10,6 +10,7 @@ pub mod plan;
 pub mod request;
 pub mod schedule;
 pub mod summary;
+pub mod ticket;
 pub mod validate;
 
 #[cfg(test)]
