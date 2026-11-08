@@ -53,6 +53,25 @@ Split into stacked PRs only when the diff exceeds ~1500 lines.
 4. Close the loop: tick the feature in the issue, update memory with the feature status, tell the
    user in a few lines (what works now, how to try it, what is next).
 
+## Tooling (kept here so a fresh machine or session needs nothing else)
+
+- `ship.sh <pr>` (this directory) is the merge gate of step 4: it waits for `ci-ok`, checks the
+  last `mimic-review` marker is `APPROVE` and newer than the head, then merges. Run it in the
+  background. `IGNORE=<check name>` only when the maintainer decided a check does not block.
+- `test-valkey.sh` starts the local Valkey that `cargo test` needs and prints
+  `export MIMIC_TEST_VALKEY_URL=…`; pass that URL in every agent brief.
+- Local kind e2e (`scripts/e2e.sh`, `scripts/e2e-load.sh`):
+  - one run at a time (fixed ports, shared kubeconfig), and one `docker build` at a time on the
+    machine: the Dockerfile's cargo cache mount is shared. Agents never run either; the main
+    session runs them serially. A build failing with "unresolved import" of a committed module
+    means a polluted cache: `docker builder prune -f --filter type=exec.cachemount`.
+  - after a machine reboot the kept `mimic-e2e` cluster is stale: `kind delete cluster --name
+    mimic-e2e` before the first run (the script recreates it).
+- Background waits: never `pgrep -f <cmd>` (it matches itself); chain the steps in one command
+  and give long commands a `timeout`.
+- GitHub outages (a `504` or a checksum failure while downloading a release in CI) are not the
+  diff: wait, then re-run the failed jobs once.
+
 ## Cost rules
 
 - Read only the spec sections and files a step needs; prefer `gh … --json` with `-q`.
