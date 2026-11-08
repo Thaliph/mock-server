@@ -56,6 +56,18 @@ fn ended<'a>(summary: &'a str, reason: &'a str) -> Ended<'a> {
     }
 }
 
+/// The sum of `HSTRLEN` over the fields of a hash.
+async fn stored_bytes(key: &str) -> u64 {
+    let mut c = conn(None).await;
+    let fields: Vec<String> = cmd(&mut c, &["HKEYS", key]).await;
+    let mut total = 0;
+    for field in fields {
+        let n: u64 = cmd(&mut c, &["HSTRLEN", key, &field]).await;
+        total += n;
+    }
+    total
+}
+
 async fn memory(key: &str, db: Option<u8>) -> u64 {
     cmd(
         &mut conn(db).await,
@@ -244,27 +256,47 @@ async fn ldt_09_the_stop_flag_comes_with_the_plan_and_the_posts() {
 async fn ldt_09_size_while_running_and_after_the_end() {
     let (store, _m) = replica(None, config(Duration::from_secs(3600)));
     let ns = unique("ldt");
-    let plan = format!(r#"{{"pad":"{}"}}"#, "p".repeat(190 << 10));
+    // The criterion's plan: 64 endpoints whose templates are 2 KiB long.
+    let plan = {
+        use mimic_core::load::plan::{Endpoint, Plan};
+        let endpoint = |n: usize| Endpoint {
+            method: "GET".into(),
+            port: 80,
+            template: format!("/{n:02}{}", "a".repeat(2045)),
+            host: None,
+            weight: 1,
+            volatile: Vec::new(),
+            samples: Vec::new(),
+        };
+        Plan {
+            credentials: Vec::new(),
+            endpoints: (0..64).map(endpoint).collect(),
+        }
+        .to_json()
+        .unwrap()
+    };
     store
         .load_admit(&admit(&ns, "pay", UID, &plan))
         .await
         .unwrap();
-    // Two pods, each close to the 256 KiB bound.
+    // Two pods, each posting exactly the bound (the flag byte counts in the stored value).
     for index in 0..2 {
         let pod = format!("mimic-load-0b9c1d526a3f-{index}-bcdfg");
-        let big = post(false, 3400);
-        let bytes = serde_json::to_vec(&big).unwrap().len();
-        assert!(bytes > 200 << 10 && bytes <= MAX_POST, "{bytes}");
+        let mut big = post(false, 3400);
+        big.reason = Some(String::new());
+        let bytes = serde_json::to_vec(&big).unwrap().len() + 1;
+        big.reason = Some("x".repeat(MAX_POST - bytes));
+        assert_eq!(serde_json::to_vec(&big).unwrap().len() + 1, MAX_POST);
         store.load_post(&ns, "pay", UID, &pod, &big).await.unwrap();
     }
     let key = format!("mimic:v1:{{{ns}/pay}}:load:{UID}");
-    let running = memory(&key, None).await;
-    assert!(
-        running <= plan.len() as u64 + 2 * MAX_POST as u64 + (16 << 10),
-        "{running}"
-    );
+    let bound = (plan.len() + 2 * MAX_POST + (16 << 10)) as u64;
+    let (stored, running) = (stored_bytes(&key).await, memory(&key, None).await);
+    assert!(stored <= bound, "{stored} > {bound}");
+    assert!(running <= bound * 5 / 4 + (16 << 10), "{running}");
 
-    let big = summary(MAX_SUMMARY - 1024);
+    let big = summary(MAX_SUMMARY);
+    assert_eq!(big.len(), MAX_SUMMARY);
     assert!(
         store
             .load_end(&ns, "pay", UID, &ended(&big, "Completed"))
@@ -286,11 +318,10 @@ async fn ldt_09_size_while_running_and_after_the_end() {
     assert_eq!(fields["start"], "1000000");
     assert_eq!(fields["stop"], "0");
     assert!(fields["spec"].contains("pay"));
-    let ended_size = memory(&key, None).await;
-    assert!(
-        ended_size <= (MAX_SUMMARY + (16 << 10)) as u64,
-        "{ended_size}"
-    );
+    let bound = (MAX_SUMMARY + (16 << 10)) as u64;
+    let (stored, ended_size) = (stored_bytes(&key).await, memory(&key, None).await);
+    assert!(stored <= bound, "{stored} > {bound}");
+    assert!(ended_size <= bound * 5 / 4 + (16 << 10), "{ended_size}");
 
     // Gone from the active set and the reservations; a post is refused; a second end is a no-op.
     let mut c = conn(None).await;

@@ -3,7 +3,7 @@
 //!
 //! The reconciler (the next step) is the caller of most of it: until then the binary does not
 //! use it, only the tests do.
-#![allow(dead_code)]
+#![cfg_attr(not(test), expect(dead_code))]
 
 use std::collections::BTreeMap;
 

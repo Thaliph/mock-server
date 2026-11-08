@@ -494,6 +494,9 @@ async fn ldt_08_pod_namespace_and_run_are_checked() {
         post(&s, &token, post_body(&s.pod(0), true, 1)).await.status,
         404
     );
+    // A deleted `MimicLoadTest` leaves the index: unknown.
+    s.runs.remove(&s.ns, NAME);
+    assert_eq!(get(&s, "plan", &token).await.status, 404);
 }
 
 #[tokio::test]

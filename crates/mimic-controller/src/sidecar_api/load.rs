@@ -59,7 +59,10 @@ pub struct RunIndex {
     runs: RwLock<BTreeMap<(String, String), RunInfo>>,
 }
 
-#[allow(dead_code, reason = "the reconciler of the next step fills the index")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the reconciler of the next step fills the index")
+)]
 impl RunIndex {
     pub fn apply(&self, run: RunInfo) {
         self.runs
