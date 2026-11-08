@@ -274,6 +274,12 @@ async fn ctl_18_an_unchanged_status_sends_no_request() {
     s.reconciler
         .cache
         .set_status(&ns, "w1", Some(first[0].2.clone()));
+    // The watch delivers the applied `status.mode` back as well.
+    s.reconciler.cache.set_mode_status(
+        &ns,
+        "w1",
+        Some(json!({"mode": "discovery", "pods": 0, "otherPods": 0})),
+    );
     s.reconciler.tick(now + 1000).await;
     s.reconciler.tick(now + 2000).await;
     assert_eq!(s.sink.calls().len(), 1);
@@ -394,6 +400,12 @@ async fn ctl_18_a_status_without_the_defaulted_inbound_count_is_unchanged() {
         "w1",
         Some(json!({"endpoints": {"inbound": 0}, "totalEndpoints": 0, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
     );
+    // The watch delivers the applied `status.mode` back as well.
+    s.reconciler.cache.set_mode_status(
+        &ns,
+        "w1",
+        Some(json!({"mode": "discovery", "pods": 0, "otherPods": 0})),
+    );
     s.reconciler.tick(now_ms()).await;
     assert!(s.sink.calls().is_empty());
 }
@@ -407,6 +419,12 @@ async fn shr_12_a_status_without_the_defaulted_total_is_unchanged() {
         &ns,
         "w1",
         Some(json!({"endpoints": {}, "exchanges": 0, "sampleBytes": 0, "pods": 0})),
+    );
+    // The watch delivers the applied `status.mode` back as well.
+    s.reconciler.cache.set_mode_status(
+        &ns,
+        "w1",
+        Some(json!({"mode": "discovery", "pods": 0, "otherPods": 0})),
     );
     s.reconciler.tick(now_ms()).await;
     assert!(s.sink.calls().is_empty());
@@ -535,6 +553,9 @@ async fn ctl_18_concurrent_applies_still_skip_unchanged_statuses() {
         s.reconciler
             .cache
             .set_status(&ns, &call.1, Some(call.2.clone()));
+        s.reconciler
+            .cache
+            .set_mode_status(&ns, &call.1, Some(json!({"mode": "discovery"})));
     }
     s.reconciler.tick(now_ms()).await;
     assert_eq!(s.sink.calls().len(), 2);
@@ -652,7 +673,9 @@ async fn mck_09_an_unreadable_pulls_field_is_skipped_and_logged_once() {
 fn mck_09_the_crd_prints_a_mode_pods_column() {
     let crd = include_str!("../../../../deploy/helm/mimic/templates/crd.yaml");
     assert!(
-        crd.contains("- name: Mode pods\n          type: integer\n          jsonPath: .status.mode.pods"),
+        crd.contains(
+            "- name: Mode pods\n          type: integer\n          jsonPath: .status.mode.pods"
+        ),
         "printer column missing"
     );
     for field in ["mode:", "otherPods:"] {

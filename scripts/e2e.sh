@@ -336,9 +336,9 @@ denied "the controller adds an annotation" kubectl patch mutatingwebhookconfigur
   || fail "inj_12: restoring the caBundle failed"
 
 # CTL-19: the CRD has the status subresource and the printer columns of spec §7.4.
-log "ctl_19: the CRD has the status subresource and the printer columns Mode, Endpoints, Pods, Last push"
+log "ctl_19: the CRD has the status subresource and the printer columns Mode, Endpoints, Pods, Last push, Mode pods"
 crd_columns=$(kubectl get crd mimicworkloads.mimic.platform.io -o jsonpath='{range .spec.versions[0].additionalPrinterColumns[*]}{.name}{"|"}{end}')
-[[ $crd_columns == 'Mode|Endpoints|Pods|Last push|' ]] || fail "ctl_19: printer columns are '$crd_columns'"
+[[ $crd_columns == 'Mode|Endpoints|Pods|Last push|Mode pods|' ]] || fail "ctl_19: printer columns are '$crd_columns'"
 [[ $(kubectl get crd mimicworkloads.mimic.platform.io -o jsonpath='{.spec.versions[0].subresources.status}') == '{}' ]] \
   || fail "ctl_19: the CRD has no status subresource"
 
@@ -1472,7 +1472,7 @@ wait_status '.endpoints.inbound == 2 and .pods == 2 and (.lastPushTime | test("^
        fail "ctl_20: the status of users-a and users-b is not endpoints.inbound 2, pods 2 with a lastPushTime within ${status_wait}s"; }
 status_row=$(kubectl -n disc-22 get mimicworkload users-a --no-headers) || fail "ctl_19: cannot print users-a"
 read -r -a row <<< "$status_row"
-[[ ${row[1]} == discovery && ${row[2]} == 2 && ${row[3]} == 2 && ${row[4]} =~ ^[0-9]+[smhd]([0-9]+[smhd])?$ ]] \
+[[ ${row[5]:-} =~ ^[0-9]+$ && ${row[1]} == discovery && ${row[2]} == 2 && ${row[3]} == 2 && ${row[4]} =~ ^[0-9]+[smhd]([0-9]+[smhd])?$ ]] \
   || fail "ctl_20: kubectl get mimicworkload prints '$status_row', want Mode discovery, Endpoints 2, Pods 2 and a Last push age"
 # A deployment without data prints 0 in the Endpoints column, not a blank (the CRD defaults endpoints.inbound).
 kubectl apply -f - >/dev/null <<YAML
