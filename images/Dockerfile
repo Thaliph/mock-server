@@ -22,4 +22,4 @@ FROM eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdf
 
 # e2e: headless Chromium of the UI check (UI-12, scripts/e2e/ui_browser.py). The tag is 156.0.8078.36,
 # published 2026-10-20; the digest is the multi-arch index. Dependabot proposes later releases after its cooldown.
-FROM docker.io/chromedp/headless-shell:156.0.8078.36@sha256:53cc0f33c0598ff244f6e45458f6dfaf0ae4206d388ae7364903afd1d9d14f0a AS e2e-chromium
+FROM docker.io/chromedp/headless-shell:158.0.8106.0@sha256:7e9783a01393515a5b1998a92a1ae46959f56ad3e05de8b9c0500f2e24fc3887 AS e2e-chromium
