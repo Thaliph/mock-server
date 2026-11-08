@@ -18,7 +18,7 @@ apply to pods **created afterwards**: run `kubectl rollout restart` after a chan
 |---|---|---|---|---|
 | `spec.deployment` | string | required | DNS-1123 subdomain, max 253, **immutable** | Deployment of the same namespace this resource selects. |
 | `spec.mode` | `discovery` \| `mock` | `discovery` | enum | `mock` answers the outbound calls of the Deployment's pods from their recorded egress, and the switch is live. See [Mock mode](Mock-mode). |
-| `spec.mock.latencyFactor` | number | `1` | 0 to 100, rounded to the hundredth | Multiplies the recorded latency of a mocked answer; `0` answers at once. Applied to pods created afterwards. |
+| `spec.mock.latencyFactor` | number | `1` | 0 to 100, rounded to the hundredth | Multiplies the recorded latency of a mocked answer; `0` answers at once. Applied live: each pod gets it with its next egress pull (`Mimic-Latency-Factor`). |
 | `spec.mock.passthrough` | list of string | empty | max 256 entries, the `spec.tls.exclude` grammar | Destinations a mocked pod still reaches for real. Applied to pods created afterwards. |
 | `spec.tls.exclude` | list of string | empty | max 256 entries, each max 253 chars | Names never TLS-intercepted: exact host, `*.example.com` (below, not itself) or IP literal. See [TLS interception](TLS-interception). A union above 256 entries is cut to the first 256 in sorted order (WARN `tls exclude truncated`). |
 | `spec.discovery.redact` | list of string | empty | max 64 entries, each 1-64 chars of `A-Za-z0-9_-` | Extra names redacted by name, lower-cased by the webhook. See [Discovery and redaction](Discovery-and-redaction). |

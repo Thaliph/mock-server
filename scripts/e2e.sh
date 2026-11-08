@@ -2449,23 +2449,37 @@ def get(conn, path):
     r = conn.getresponse()
     r.read()
     return r.status, r.getheader("x-mimic-match")
-conn = http.client.HTTPConnection("users.disc-22.svc", 8080, timeout=30)
+def connect():
+    conn = http.client.HTTPConnection("users.disc-22.svc", 8080, timeout=30)
+    conn.connect()
+    return conn
+def port_of(conn):
+    return conn.sock.getsockname()[1] if conn.sock is not None else None
+conn = connect()
 emit(step="ready")
 status, match = get(conn, "/users/320001")
-emit(step="discovery", status=status, match=match)
+emit(step="discovery", status=status, match=match, port=port_of(conn))
 wait("to-mock")
-status, match = get(conn, "/users/320002")
-emit(step="mock", status=status, match=match)
+reconnected = False
+try:
+    status, match = get(conn, "/users/320002")
+except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+    # The sidecar closes an idle keep-alive connection of the mocked path after 30 s (spec §8): a new connection, reported.
+    conn.close()
+    conn = connect()
+    reconnected = True
+    status, match = get(conn, "/users/320002")
+emit(step="mock", status=status, match=match, port=port_of(conn), reconnected=reconnected)
 wait("to-discovery")
 try:
     status, match = get(conn, "/users/320003")
-    emit(step="old-connection", status=status, match=match)
+    emit(step="old-connection", status=status, match=match, port=port_of(conn))
 except (http.client.HTTPException, OSError):
     emit(step="old-connection", closed=True)
 conn.close()
-conn = http.client.HTTPConnection("users.disc-22.svc", 8080, timeout=30)
+conn = connect()
 status, match = get(conn, "/users/320004")
-emit(step="new-connection", status=status, match=match)
+emit(step="new-connection", status=status, match=match, port=port_of(conn))
 conn.close()
 emit(step="done")
 PY
@@ -2485,7 +2499,8 @@ live_wait() {
   return 1
 }
 live_wait ready 60 || fail "mck_19: the live connection process did not start"
-live_step discovery | jq -e '.status == 200 and .match == null' >/dev/null || fail "mck_19: the live connection in discovery was not forwarded: $(live_step discovery)"
+live_step discovery | jq -e '.status == 200 and .match == null and (.port | type == "number")' >/dev/null || fail "mck_19: the live connection in discovery was not forwarded: $(live_step discovery)"
+live_p1=$(live_step discovery | jq -r '.port')
 
 # mode_wait <mode> <pods> <otherPods> <seconds>: the status of front converges (status.mode, MCK-07, MCK-09).
 mode_wait() {
@@ -2507,8 +2522,11 @@ mode_wait mock 2 0 150 || fail "mck_19: status.mode did not converge to mock wit
 # The live connection: its next request, on the same connection, is answered by mock (MCK-16 on the cluster).
 kubectl -n mck-19 exec "$live_pod" -c app -- touch /tmp/mck-live/to-mock
 live_wait mock 60 || fail "mck_19: the live connection did not answer after the switch to mock"
-live_step mock | jq -e '.status == 200 and (.match == "exact" or .match == "endpoint" or .match == "fallback")' >/dev/null \
-  || fail "mck_19: the live connection in mock was not answered by mock: $(live_step mock)"
+live_step mock | jq -e --argjson p1 "$live_p1" '.status == 200 and (.match == "exact" or .match == "endpoint" or .match == "fallback")
+  and (.port == $p1 or .reconnected == true)' >/dev/null \
+  || fail "mck_19: the live connection in mock was not answered by mock on the discovery connection: $(live_step mock)"
+# The sidecar closes a mocked connection idle for 30 s: then the mock step used a new connection, and it is said so.
+if [[ $(live_step mock | jq -r '.reconnected') == true ]]; then log "mck_19: the live connection was closed while idle in mock (30 s); the mock step used a new one"; fi
 
 users_before_mock=$(mck_users 'true') || fail "mck_19: cannot count the access lines of the users pods"
 provider_before_mock=$(mck_provider 'true') || fail "mck_19: cannot count the access lines of the provider pod"
@@ -2570,8 +2588,8 @@ live_wait done 150 || fail "mck_19: the live connection process did not finish a
 wait "$live_pid" || fail "mck_19: the live connection process failed"
 [[ $(live_step old-connection | jq -r '(.closed // false) or (.match == null)') == true ]] \
   || fail "mck_19: the mocked connection answered after the switch to discovery: $(live_step old-connection)"
-live_step new-connection | jq -e '.status == 200 and .match == null' >/dev/null \
-  || fail "mck_19: the new connection after the switch was not forwarded: $(live_step new-connection)"
+live_step new-connection | jq -e --argjson p1 "$live_p1" '.status == 200 and .match == null and .port != $p1' >/dev/null \
+  || fail "mck_19: the new connection after the switch was not forwarded on a new TCP connection: $(live_step new-connection)"
 [[ $(mck_app_count disc-22 app=users app '.path == "/users/320001"') == 1 ]] || fail "mck_19: users did not get the forwarded live call before the switch"
 [[ $(mck_app_count disc-22 app=users app '.path == "/users/320002"') == 0 ]] || fail "mck_19: users got the live call that mock answered"
 [[ $(mck_app_count disc-22 app=users app '.path == "/users/320004"') == 1 ]] || fail "mck_19: users did not get the live call of the new connection"

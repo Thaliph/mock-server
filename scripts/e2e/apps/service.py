@@ -34,6 +34,10 @@ def access(method, path, status, peer):
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    # HTTP/1.1: keep-alive connections (the live connection of MCK-19 needs them). Every answer below sends
+    # Content-Length, which HTTP/1.1 requires for a connection that stays open.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *args):
         pass  # the access line is written by access()
 
