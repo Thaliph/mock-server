@@ -99,6 +99,8 @@ fn valid(root: &Root) -> String {
 /// What an app received: the request line (HTTP/1) and the headers, names in lower case.
 #[derive(Clone, Debug, Default)]
 struct Seen {
+    /// The head as received (HTTP/1), without its blank line.
+    raw: String,
     line: String,
     headers: Vec<(String, String)>,
 }
@@ -154,7 +156,11 @@ fn seen_of(head: &str) -> Seen {
         .filter_map(|l| l.split_once(':'))
         .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_string()))
         .collect();
-    Seen { line, headers }
+    Seen {
+        raw: head.to_string(),
+        line,
+        headers,
+    }
 }
 
 /// An HTTP/1 app: answers `200` with `extra` response head lines.
@@ -191,18 +197,68 @@ async fn app_h1(extra: &'static str) -> App {
     App { addr, seen, bytes }
 }
 
+/// A stream that counts the bytes read from it.
+struct Counting {
+    inner: TcpStream,
+    bytes: Arc<AtomicUsize>,
+}
+
+impl tokio::io::AsyncRead for Counting {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.bytes
+            .fetch_add(buf.filled().len() - before, Ordering::SeqCst);
+        polled
+    }
+}
+
+impl tokio::io::AsyncWrite for Counting {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// An h2c app: answers `200` with the `extra` headers.
 async fn app_h2(extra: &'static [(&'static str, &'static str)]) -> App {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let count = bytes.clone();
     tokio::spawn(async move {
         loop {
             let Ok((s, _)) = listener.accept().await else {
                 return;
             };
             let log = log.clone();
+            let s = Counting {
+                inner: s,
+                bytes: count.clone(),
+            };
             tokio::spawn(async move {
                 let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                     let log = log.clone();
@@ -213,6 +269,7 @@ async fn app_h2(extra: &'static [(&'static str, &'static str)]) -> App {
                             .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap().into()))
                             .collect();
                         log.lock().unwrap().push(Seen {
+                            raw: String::new(),
                             line: format!("{} {}", req.method(), req.uri().path()),
                             headers,
                         });
@@ -229,11 +286,7 @@ async fn app_h2(extra: &'static [(&'static str, &'static str)]) -> App {
             });
         }
     });
-    App {
-        addr,
-        seen,
-        bytes: Arc::new(AtomicUsize::new(0)),
-    }
+    App { addr, seen, bytes }
 }
 
 // --- the sidecar ------------------------------------------------------------------------
@@ -248,6 +301,17 @@ struct Rig {
 }
 
 async fn rig(app: &App, mode: Mode, root: Option<&Root>) -> Rig {
+    rig_with(app, mode, root, true, None).await
+}
+
+/// `enabled`: the pod has `MIMIC_LOAD_ENABLED`; `stall`: the detection stall.
+async fn rig_with(
+    app: &App,
+    mode: Mode,
+    root: Option<&Root>,
+    enabled: bool,
+    stall: Option<Duration>,
+) -> Rig {
     let logs = capture_logs();
     let mut metrics = Metrics::new("sidecar", "test");
     let mode = ModeState::start(
@@ -276,12 +340,16 @@ async fn rig(app: &App, mode: Mode, root: Option<&Root>) -> Rig {
     let addr = listener.local_addr().unwrap();
     let dst = app.addr;
     let original: OriginalDst = Arc::new(move |_| Ok(dst));
-    let shared = Arc::new(
-        Shared::new(vec![addr], tunnel, original)
-            .with_proxy_metrics(proxy)
-            .with_discovery(discovery.tap())
-            .with_load(marker.clone()),
-    );
+    let mut shared = Shared::new(vec![addr], tunnel, original)
+        .with_proxy_metrics(proxy)
+        .with_discovery(discovery.tap());
+    if enabled {
+        shared = shared.with_load(marker.clone());
+    }
+    if let Some(stall) = stall {
+        shared = shared.with_detect_stall(stall);
+    }
+    let shared = Arc::new(shared);
     spawn_listener(listener, Direction::Inbound, shared);
     Rig {
         addr,
@@ -618,7 +686,7 @@ async fn ldt_11_http1_refusals_answer_599_and_the_app_receives_no_byte() {
 }
 
 #[tokio::test]
-async fn ldt_11_h2c_refusals_answer_599_and_the_stream_never_reaches_the_app() {
+async fn ldt_11_h2c_refusals_answer_599_and_the_app_receives_no_byte() {
     let good = root("deployment root");
     for case in cases(&good) {
         let app = app_h2(&[]).await;
@@ -627,6 +695,7 @@ async fn ldt_11_h2c_refusals_answer_599_and_the_stream_never_reaches_the_app() {
         let answer = h2_call(&mut sender, Some(&case.ticket)).await;
         assert_refused(&answer, case.reason, case.name);
         assert!(app.seen.lock().unwrap().is_empty(), "{}", case.name);
+        assert_eq!(app.bytes.load(Ordering::SeqCst), 0, "{}", case.name);
         counted(
             &rig.metrics,
             &format!(
@@ -671,13 +740,15 @@ async fn ldt_11_a_marked_request_after_plain_ones_on_a_connection_is_checked_too
     c.write_all(&get(Some(&valid(&root)))).await.unwrap();
     let marked = read_answer(&mut c, &mut pending).await;
     assert_refused(&marked, "mode", "marked after a plain request");
-    // The connection goes on for plain requests.
-    c.write_all(&get(None)).await.unwrap();
-    let again = read_answer(&mut c, &mut pending).await;
-    assert_eq!(again.status, 200);
-    let seen = app.seen.lock().unwrap().clone();
-    assert_eq!(seen.len(), 2);
-    assert!(seen.iter().all(|s| s.header("mimic-load-run").is_empty()));
+    assert_eq!(marked.header("connection"), vec!["close"]);
+    // The refused connection is closed once answered.
+    let mut rest = Vec::new();
+    tokio::time::timeout(TIMEOUT, c.read_to_end(&mut rest))
+        .await
+        .expect("closed in time")
+        .ok();
+    assert!(rest.is_empty());
+    assert_eq!(app.seen.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -796,4 +867,263 @@ async fn ldt_11_get_load_answers_the_identity_and_the_mode() {
         let (status, _) = probe(&rig, method).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
     }
+}
+
+// --- LDT-11: the head is relayed in place -----------------------------------------------
+
+/// An app that records the raw heads it receives, answers `101` to a request with `Upgrade`
+/// and then echoes, and answers `200` to any other.
+async fn app_upgrade() -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let raw = Arc::new(Mutex::new(Vec::new()));
+    let log = raw.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut pending = Vec::new();
+                while let Some((head, _)) = read_message(&mut s, &mut pending).await {
+                    log.lock().unwrap().extend_from_slice(head.as_bytes());
+                    if head.to_ascii_lowercase().contains("upgrade: websocket") {
+                        let reply = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+                        if s.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let mut buf = [0u8; 64];
+                        while let Ok(n) = s.read(&mut buf).await {
+                            if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                    let reply = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                    if s.write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, raw)
+}
+
+const UPGRADE: &[u8] =
+    b"GET /ws HTTP/1.1\r\nHost: app.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+
+async fn upgrades(c: &mut TcpStream, pending: &mut Vec<u8>) {
+    c.write_all(UPGRADE).await.unwrap();
+    let answer = read_answer(c, pending).await;
+    assert_eq!(answer.status, 101);
+    c.write_all(b"ping").await.unwrap();
+    let mut echo = [0u8; 4];
+    tokio::time::timeout(TIMEOUT, c.read_exact(&mut echo))
+        .await
+        .expect("echoed in time")
+        .unwrap();
+    assert_eq!(&echo, b"ping");
+}
+
+/// An `App` view of an app at `addr`, for the rig.
+fn app_at(addr: SocketAddr) -> App {
+    App {
+        addr,
+        seen: Arc::default(),
+        bytes: Arc::default(),
+    }
+}
+
+#[tokio::test]
+async fn ldt_11_an_unmarked_upgrade_before_any_marked_request_still_upgrades() {
+    let root = root("deployment root");
+    let (addr, _) = app_upgrade().await;
+    let rig = rig(&app_at(addr), Mode::Mock, Some(&root)).await;
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    upgrades(&mut c, &mut Vec::new()).await;
+}
+
+#[tokio::test]
+async fn ldt_11_a_marked_request_followed_by_an_upgrade_on_the_same_connection() {
+    let root = root("deployment root");
+    let (addr, raw) = app_upgrade().await;
+    let rig = rig(&app_at(addr), Mode::Mock, Some(&root)).await;
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    let mut pending = Vec::new();
+    c.write_all(&get(Some(&valid(&root)))).await.unwrap();
+    let first = read_answer(&mut c, &mut pending).await;
+    assert_eq!(first.header("x-mimic-load"), vec!["ok"]);
+    upgrades(&mut c, &mut pending).await;
+    let raw = String::from_utf8(raw.lock().unwrap().clone()).unwrap();
+    assert!(!raw.contains("mimic-load-run"), "{raw}");
+}
+
+#[tokio::test]
+async fn ldt_11_the_head_is_rewritten_in_place_and_the_rest_is_untouched() {
+    let root = root("deployment root");
+    let app = app_h1("X-Answer-Case: Kept\r\nx-mimic-load: refused; reason=mode\r\n").await;
+    let rig = rig(&app, Mode::Mock, Some(&root)).await;
+    let request = format!(
+        "GET /pay?q=1 HTTP/1.1\r\nHost: app.test:8080\r\nX-Custom-Case: A\r\nMimic-Load-Run: {}\r\nAccept: */*\r\nX-Dup: 1\r\nX-Dup: 2\r\n\r\n",
+        valid(&root)
+    );
+    let answer = call(rig.addr, request.as_bytes()).await;
+    assert_eq!(answer.header("x-mimic-load"), vec!["ok"]);
+    assert_eq!(answer.header("x-answer-case"), vec!["Kept"]);
+    let seen = app.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen[0].raw,
+        "GET /pay?q=1 HTTP/1.1\r\nHost: app.test:8080\r\nX-Custom-Case: A\r\nAccept: */*\r\nX-Dup: 1\r\nX-Dup: 2"
+    );
+}
+
+#[tokio::test]
+async fn ldt_11_a_marked_post_keeps_its_body() {
+    let root = root("deployment root");
+    let app = app_h1("").await;
+    let rig = rig(&app, Mode::Mock, Some(&root)).await;
+    let request = format!(
+        "POST /pay HTTP/1.1\r\nHost: a\r\nmimic-load-run: {}\r\nContent-Length: 5\r\n\r\nhello",
+        valid(&root)
+    );
+    let answer = call(rig.addr, request.as_bytes()).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(app.seen.lock().unwrap().len(), 1);
+}
+
+/// An app that records every byte of a connection and never answers.
+async fn raw_app() -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let raw = Arc::new(Mutex::new(Vec::new()));
+    let log = raw.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    log.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+        }
+    });
+    (addr, raw)
+}
+
+async fn received(raw: &Arc<Mutex<Vec<u8>>>, want: usize) -> Vec<u8> {
+    for _ in 0..500 {
+        if raw.lock().unwrap().len() >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    raw.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn ldt_11_a_head_of_64_kib_without_its_end_reaches_the_app_unchanged() {
+    let root = root("deployment root");
+    let (addr, raw) = raw_app().await;
+    let rig = rig(&app_at(addr), Mode::Discovery, Some(&root)).await;
+    let mut head = format!(
+        "GET /pay HTTP/1.1\r\nHost: a\r\nmimic-load-run: {}\r\n",
+        valid(&root)
+    );
+    for n in 0..20 {
+        head.push_str(&format!("x-pad-{n}: {}\r\n", "a".repeat(4000)));
+    }
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    c.write_all(head.as_bytes()).await.unwrap();
+    let got = received(&raw, head.len()).await;
+    assert_eq!(got, head.as_bytes());
+    assert_eq!(rig.load_counter("refused_mode"), 0);
+}
+
+#[tokio::test]
+async fn ldt_11_a_head_that_never_completes_is_released_after_the_stall() {
+    let root = root("deployment root");
+    let (addr, raw) = raw_app().await;
+    let rig = rig_with(
+        &app_at(addr),
+        Mode::Discovery,
+        Some(&root),
+        true,
+        Some(Duration::from_millis(300)),
+    )
+    .await;
+    let partial = format!(
+        "GET /pay HTTP/1.1\r\nHost: a\r\nmimic-load-run: {}\r\nx-half: 1",
+        valid(&root)
+    );
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    c.write_all(partial.as_bytes()).await.unwrap();
+    let got = received(&raw, partial.len()).await;
+    assert_eq!(got, partial.as_bytes());
+    drop(c);
+}
+
+#[tokio::test]
+async fn ldt_11_a_client_closing_mid_head_sees_its_bytes_forwarded() {
+    let root = root("deployment root");
+    let (addr, raw) = raw_app().await;
+    let rig = rig(&app_at(addr), Mode::Discovery, Some(&root)).await;
+    let partial = format!(
+        "GET /pay HTTP/1.1\r\nHost: a\r\nmimic-load-run: {}\r\nx-half: 1",
+        valid(&root)
+    );
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    c.write_all(partial.as_bytes()).await.unwrap();
+    c.shutdown().await.unwrap();
+    let got = received(&raw, partial.len()).await;
+    assert_eq!(got, partial.as_bytes());
+}
+
+#[tokio::test]
+async fn ldt_11_a_header_name_with_a_space_before_the_colon_is_no_marker() {
+    let root = root("deployment root");
+    let (addr, raw) = raw_app().await;
+    let rig = rig(&app_at(addr), Mode::Discovery, Some(&root)).await;
+    let request = format!(
+        "GET /pay HTTP/1.1\r\nHost: a\r\nmimic-load-run : {}\r\n\r\n",
+        valid(&root)
+    );
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    c.write_all(request.as_bytes()).await.unwrap();
+    let got = received(&raw, request.len()).await;
+    assert_eq!(got, request.as_bytes());
+    assert_eq!(rig.load_counter("refused_mode"), 0);
+}
+
+#[tokio::test]
+async fn ldt_11_without_load_enabled_the_header_is_an_ordinary_one() {
+    let root = root("deployment root");
+    let app = app_h1("").await;
+    let rig = rig_with(&app, Mode::Discovery, Some(&root), false, None).await;
+    let ticket = valid(&root);
+    let answer = call(rig.addr, &get(Some(&ticket))).await;
+    assert_eq!(answer.status, 200);
+    assert!(answer.header("x-mimic-load").is_empty());
+    let seen = app.seen.lock().unwrap().clone();
+    assert_eq!(seen[0].header("mimic-load-run"), vec![ticket.as_str()]);
+}
+
+#[tokio::test]
+async fn ldt_11_without_load_enabled_a_partial_head_is_forwarded_at_once() {
+    let root = root("deployment root");
+    let (addr, raw) = raw_app().await;
+    let rig = rig_with(&app_at(addr), Mode::Discovery, Some(&root), false, None).await;
+    let partial = b"GET /a HTTP/1.1\r\nHost: a\r\nx-half: 1";
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    c.write_all(partial).await.unwrap();
+    assert_eq!(received(&raw, partial.len()).await, partial);
 }
