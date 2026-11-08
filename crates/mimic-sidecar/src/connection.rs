@@ -133,6 +133,7 @@ pub(crate) async fn handle(
         tls: false,
         sni: None,
         interception: None,
+        mock: None,
     };
     let mut upstream = upstream;
     let first = first_bytes(&mut client, &mut upstream, read, stall, abort.as_mut()).await;
@@ -168,6 +169,13 @@ pub(crate) async fn handle(
         }
         (first, _) => first,
     };
+    if direction == Direction::Outbound
+        && !passthrough
+        && let (Some(mock), First::Client(detection, buf)) = (shared.mock(), &first)
+        && !matches!(pick(mock, detection, buf, dst, false), Pick::Passthrough)
+    {
+        conn.mock = Some(mock.clone());
+    }
     let served = match first {
         First::Client(detection, buf) => {
             tracing::debug!(direction = direction.as_str(), %dst, ?detection, "protocol detected");
@@ -263,6 +271,7 @@ async fn serve_mock(
         tls: false,
         sni: None,
         interception: None,
+        mock: None,
     };
     match route {
         MockRoute::Http(h2, buf, first) => {
@@ -470,6 +479,9 @@ struct Conn<'a> {
     sni: Option<String>,
     /// Why an outbound TLS connection is not intercepted.
     interception: Option<&'static str>,
+    /// Set on a forwarded outbound connection that follows a switch to mock (spec §8
+    /// "Switching"); not on `MIMIC_MOCK_PASSTHROUGH` ones, nor on non-HTTP cleartext tunnels.
+    mock: Option<Mock>,
 }
 
 impl Conn<'_> {
@@ -516,6 +528,7 @@ impl Conn<'_> {
                     &mut upstream,
                     buf,
                     tap.is_some(),
+                    self.mock.clone(),
                     |event| tracker.event(event),
                     self.shared.stopped(),
                     abort.as_mut(),
@@ -524,6 +537,26 @@ impl Conn<'_> {
                 tracker.finish(relayed.outcome, relayed.partial_body);
                 if let Some(e) = &relayed.error {
                     tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
+                }
+                if let Some(mock) = &self.mock {
+                    if relayed.outcome == access::Outcome::MockClosed {
+                        mock.connection("closed");
+                    }
+                    if let Some((bytes, first)) = relayed.handover {
+                        // The destination connection is closed; the client's next request and
+                        // all after it are the mock's (spec §8 "Switching").
+                        drop(upstream);
+                        mock.connection("mocked");
+                        mock.serve_http1(
+                            self.ctx(),
+                            client.with_prefix(bytes),
+                            first,
+                            self.shared.stopped(),
+                            abort.as_mut(),
+                        )
+                        .await;
+                        return;
+                    }
                 }
                 if relayed.outcome == access::Outcome::Shutdown {
                     tracing::debug!(direction = direction.as_str(), %dst, unanswered = relayed.unanswered, "http relay closed at the end of the grace");
@@ -534,7 +567,7 @@ impl Conn<'_> {
                 proxy.connection(direction, "h2", &self.authority(false));
                 let tap = self.shared.discovery();
                 let relayed = tokio::select! {
-                    r = h2::relay_with(client, upstream, buf, self.ctx(), tap.cloned(), self.shared.stopped()) => r,
+                    r = h2::relay_with(client, upstream, buf, self.ctx(), tap.cloned(), self.mock.clone(), self.shared.stopped()) => r,
                     () = abort.as_mut() => Ok(()),
                 };
                 if let Err(e) = relayed {
@@ -554,6 +587,9 @@ impl Conn<'_> {
             let kind = tunnel_kind(self.interception);
             tap.tunnel(kind, dst, self.tls, self.sni.clone(), None);
         }
+        // TLS passed through and decrypted opaque streams are not kept by the mock; non-HTTP
+        // cleartext tunnels are (spec §8 "Switching").
+        let closes = self.mock.as_ref().filter(|_| protocol == "tls" || self.tls);
         let tunnelled = opaque::tunnel(
             &mut client,
             &mut upstream,
@@ -561,8 +597,19 @@ impl Conn<'_> {
             to_client,
             early,
             abort.as_mut(),
+            async {
+                match closes {
+                    Some(mock) => mock.entered().await,
+                    None => std::future::pending().await,
+                }
+            },
         )
         .await;
+        if tunnelled.outcome == access::Outcome::MockClosed
+            && let Some(mock) = closes
+        {
+            mock.connection("closed");
+        }
         if let Some(e) = &tunnelled.error {
             tracing::debug!(direction = direction.as_str(), %dst, error = %e, "tunnel ended");
         }

@@ -91,10 +91,13 @@ pub enum Early {
 enum Ended {
     Failed(Side, io::Error),
     Shutdown,
+    /// The mode switched to mock, which does not keep this tunnel (spec §8 "Switching").
+    MockClosed,
 }
 
 /// Writes the bytes read during detection to their side, then relays until both sides are done,
-/// a side fails (the other one gets a reset) or `abort` resolves (both are closed).
+/// a side fails (the other one gets a reset), `abort` resolves (both are closed) or
+/// `mock_close` resolves (both are closed, outcome `MockClosed`).
 pub async fn tunnel(
     client: &mut Stream,
     upstream: &mut Stream,
@@ -102,6 +105,7 @@ pub async fn tunnel(
     to_client: Vec<u8>,
     early: Option<Early>,
     abort_signal: impl Future<Output = ()>,
+    mock_close: impl Future<Output = ()>,
 ) -> Tunnelled {
     let (client_socket, upstream_socket) = (client.socket(), upstream.socket());
     let up_count = AtomicU64::new(to_upstream.len() as u64);
@@ -127,6 +131,7 @@ pub async fn tunnel(
                         (side, e) = failed(client_socket.tcp(), Side::Client) => Err(Ended::Failed(side, e)),
                         (side, e) = failed(upstream_socket.tcp(), Side::Upstream) => Err(Ended::Failed(side, e)),
                         () = abort_signal => Err(Ended::Shutdown),
+                        () = mock_close => Err(Ended::MockClosed),
                     }
                 }
             }
@@ -135,6 +140,7 @@ pub async fn tunnel(
     let (outcome, error) = match result {
         Ok(()) => (Outcome::Ok, None),
         Err(Ended::Shutdown) => (Outcome::Shutdown, None),
+        Err(Ended::MockClosed) => (Outcome::MockClosed, None),
         Err(Ended::Failed(side, e)) => {
             // The other side sees what this one did: a reset.
             match side {
