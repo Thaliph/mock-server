@@ -20,6 +20,7 @@ use crate::exchange::{Ctx, Http1Tracker};
 use crate::h2;
 use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
+use crate::load::{self, Marker};
 use crate::mock::Mock;
 use crate::opaque::{self, Early, Side};
 use crate::tls::intercept::{AcceptError, ConnectError, Plan};
@@ -485,6 +486,13 @@ struct Conn<'a> {
 }
 
 impl Conn<'_> {
+    /// The load marker check, on inbound connections (spec §7.8).
+    fn load(&self) -> Option<&Marker> {
+        self.shared
+            .load()
+            .filter(|_| self.direction == Direction::Inbound)
+    }
+
     fn ctx(&self) -> Ctx {
         Ctx {
             direction: self.direction,
@@ -523,12 +531,13 @@ impl Conn<'_> {
                 // (spec §6, §6.1).
                 let tap = self.shared.discovery();
                 let mut tracker = Http1Tracker::new(self.ctx()).with_tap(tap.cloned());
-                let relayed = http1::relay_with(
+                let mut relayed = http1::relay_with(
                     &mut client,
                     &mut upstream,
                     buf,
                     tap.is_some(),
                     self.mock.clone(),
+                    self.load().is_some(),
                     |event| tracker.event(event),
                     self.shared.stopped(),
                     abort.as_mut(),
@@ -537,6 +546,24 @@ impl Conn<'_> {
                 tracker.finish(relayed.outcome, relayed.partial_body);
                 if let Some(e) = &relayed.error {
                     tracing::debug!(direction = direction.as_str(), %dst, error = %e, "http relay ended");
+                }
+                if relayed.load
+                    && let (Some(marker), Some((bytes, _))) = (self.load(), relayed.handover.take())
+                {
+                    // A request carries the load marker (spec §7.8): the destination
+                    // connection is closed, and this request and all after it are checked.
+                    drop(upstream);
+                    load::serve_http1(
+                        marker.clone(),
+                        self.ctx(),
+                        tap.cloned(),
+                        client.with_prefix(bytes),
+                        dst,
+                        self.shared.stopped(),
+                        abort.as_mut(),
+                    )
+                    .await;
+                    return;
                 }
                 if let Some(mock) = &self.mock {
                     if relayed.outcome == access::Outcome::MockClosed {
@@ -567,7 +594,7 @@ impl Conn<'_> {
                 proxy.connection(direction, "h2", &self.authority(false));
                 let tap = self.shared.discovery();
                 let relayed = tokio::select! {
-                    r = h2::relay_with(client, upstream, buf, self.ctx(), tap.cloned(), self.mock.clone(), self.shared.stopped()) => r,
+                    r = h2::relay_with(client, upstream, buf, self.ctx(), (tap.cloned(), self.mock.clone(), self.load().cloned()), self.shared.stopped()) => r,
                     () = abort.as_mut() => Ok(()),
                 };
                 if let Err(e) = relayed {

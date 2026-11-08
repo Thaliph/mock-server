@@ -66,6 +66,8 @@ pub struct Exchange {
     pub mock: Option<&'static str>,
     /// Why a mocked request was a miss.
     pub mock_miss: Option<&'static str>,
+    /// The uid of the load test run that sent the request (spec §7.8).
+    pub load_run: Option<String>,
 }
 
 /// One finished opaque or TLS connection.
@@ -120,6 +122,7 @@ pub fn exchange(e: &Exchange) {
         bytes_out = e.bytes_out,
         mock = e.mock,
         mock_miss = e.mock_miss,
+        load_run = e.load_run.as_deref(),
         "http exchange"
     );
 }

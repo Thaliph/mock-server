@@ -13,8 +13,6 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 
 use http_body_util::BodyExt;
-use http_body_util::combinators::UnsyncBoxBody;
-use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Request, Response, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -22,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, ReqBody, Tracker};
+use crate::load::{Body, Marker, mark_answer, refused, screen};
 use crate::mock::{self, Mock};
 use crate::transport::Stream;
 
@@ -83,10 +82,9 @@ struct State {
     mocked: OnceLock<Arc<mock::Conn>>,
     /// The destination connection was let go on purpose: its end is no failure.
     switched: AtomicBool,
+    /// Inbound connections: the check of the load marker of every stream (spec §7.8).
+    load: Option<Marker>,
 }
-
-/// The body of a forwarded or mocked answer.
-type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// Relays the HTTP/2 streams of `client` (whose first bytes, `replay`, were already read) to
 /// `upstream` until one side closes. A stream the destination fails is reset alone.
@@ -97,17 +95,18 @@ pub async fn relay(
     ctx: Ctx,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    relay_with(client, upstream, replay, ctx, None, None, stop).await
+    relay_with(client, upstream, replay, ctx, (None, None, None), stop).await
 }
 
-/// Like [`relay`], with the exchanges also handed to the discovery `tap` (spec §6).
+/// Like [`relay`], with the exchanges also handed to the discovery `tap` (spec §6), the `mock`
+/// that takes the streams opened after a switch to `mock` (outbound) and the load marker check
+/// (inbound).
 pub(crate) async fn relay_with(
     client: Stream,
     upstream: Stream,
     replay: Vec<u8>,
     ctx: Ctx,
-    tap: Option<Tap>,
-    mock: Option<Mock>,
+    (tap, mock, load): (Option<Tap>, Option<Mock>, Option<Marker>),
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let (sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -121,6 +120,7 @@ pub(crate) async fn relay_with(
         mock,
         mocked: OnceLock::new(),
         switched: AtomicBool::new(false),
+        load,
     });
     let shared = state.clone();
     let left = state.mock.clone();
@@ -235,14 +235,34 @@ async fn forward(
         // discovery since: the client opens a new connection.
         return Err("destination connection closed".into());
     };
-    let (tracker, req) = Tracker::start(&state.ctx, PROTOCOL, state.tap.as_ref(), req);
+    let mut req = req;
+    // A load request is checked, loses its ticket, is not discovered, and its answer is marked.
+    let load_run = match &state.load {
+        Some(marker) => match screen(marker, state.tap.as_ref(), req.headers_mut()) {
+            Ok(run) => run,
+            Err(refusal) => return Ok(refused(refusal)),
+        },
+        None => None,
+    };
+    let tap = state.tap.as_ref().filter(|_| load_run.is_none());
+    let (mut tracker, req) = Tracker::start(&state.ctx, PROTOCOL, tap, req);
+    let marked = load_run.is_some();
+    if let Some(uid) = load_run {
+        tracker.load_run(uid);
+    }
     let sent = async {
         sender.ready().await?;
         sender.send_request(req).await
     }
     .await;
     match sent {
-        Ok(response) => Ok(tracker.answered(response).map(BodyExt::boxed_unsync)),
+        Ok(response) => {
+            let mut answered = tracker.answered(response).map(BodyExt::boxed_unsync);
+            if marked {
+                mark_answer(answered.headers_mut());
+            }
+            Ok(answered)
+        }
         Err(e) => {
             tracker.failed();
             Err(e.into())

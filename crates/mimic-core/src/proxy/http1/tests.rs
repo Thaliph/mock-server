@@ -983,3 +983,23 @@ fn prx_27_cut_values_do_not_keep_their_capacity() {
         c.retained_bytes()
     );
 }
+
+#[test]
+fn ldt_11_one_request_at_a_time_stops_at_the_end_of_each_request() {
+    let first = b"POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc";
+    let second = b"GET /b HTTP/1.1\r\nHost: h\r\nmimic-load-run: t\r\n\r\n";
+    let all = [first.as_slice(), second.as_slice()].concat();
+    let mut c = Codec::new().one_request_at_a_time();
+    let (used, events) = c.client_bytes_limited(&all);
+    assert_eq!(used, first.len());
+    assert!(events.iter().any(|e| matches!(e, Event::RequestEnd { .. })));
+    assert!(c.between_requests());
+    // The next request starts at the first byte it is given, however the bytes were cut.
+    let (used, _) = c.client_bytes_limited(&second[..10]);
+    assert_eq!(used, 10);
+    let (used, _) = c.client_bytes_limited(&second[10..]);
+    assert_eq!(used, second.len() - 10);
+    // Without it, the call goes on into the next request.
+    let mut c = Codec::new();
+    assert_eq!(c.client_bytes_limited(&all).0, all.len());
+}

@@ -12,6 +12,7 @@ use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig, ShipConfig};
 use mimic_sidecar::egress::{EgressConfig, EgressMetrics, Puller, Snapshot};
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
+use mimic_sidecar::load::{LoadConfig, Marker};
 use mimic_sidecar::mock::Mock;
 use mimic_sidecar::mode::{ModeConfig, ModeState};
 use mimic_sidecar::probes::{self, Probes};
@@ -63,6 +64,7 @@ fn main() -> ExitCode {
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
     let pod = env.optional("MIMIC_POD_NAME").map(str::to_string);
+    let load = LoadConfig::from_env(&env, &tls);
     let mut log = mimic_runtime::logging::init(&config.log);
     // Before any key exists: no core dump, not readable through /proc by other processes.
     if let Err(e) = mimic_sidecar::hardening::harden() {
@@ -76,6 +78,7 @@ fn main() -> ExitCode {
         probes,
         tls,
         (discovery, ship, egress, mode, pod),
+        load,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -101,6 +104,7 @@ async fn run(
         ModeConfig,
         Option<String>,
     ),
+    load: LoadConfig,
 ) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     // Registered before any listener is announced: an early SIGTERM is not lost.
@@ -119,6 +123,7 @@ async fn run(
     let max_pending = mode.max_pending;
     let passthrough = mode.passthrough.clone();
     let mode = ModeState::start(&mode, &mut metrics).await;
+    let load = Marker::new(load, mode.clone(), &mut metrics);
     let snapshot = Snapshot::new(mode);
     let mock = Mock::with_budget(
         snapshot.clone(),
@@ -158,6 +163,7 @@ async fn run(
         .with_proxy_metrics(proxy_metrics)
         .with_discovery(discovery.tap())
         .with_mock(mock)
+        .with_load(load.clone())
         .with_tls(interception),
     );
     // The listeners stop accepting and the relays wind down on the signal.
@@ -218,6 +224,7 @@ async fn run(
             admin::router(metrics, Readiness::always())
                 .merge(probes::router(Arc::new(probes)))
                 .merge(discovery.router())
+                .merge(load.router())
                 .merge(snapshot.router()),
             grace,
             shutdown.clone().wait(),

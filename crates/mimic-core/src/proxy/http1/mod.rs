@@ -392,6 +392,8 @@ pub struct Codec {
     capture: bool,
     req_cap: Cap,
     resp_cap: Cap,
+    /// [`Codec::client_bytes_limited`] stops after each complete request.
+    one_request: bool,
 }
 
 impl Codec {
@@ -405,6 +407,14 @@ impl Codec {
             capture: true,
             ..Self::default()
         }
+    }
+
+    /// A codec whose [`Codec::client_bytes_limited`] uses no byte of a request after the end of
+    /// the previous one in the same call, so that the relay sees every request start (the
+    /// load marker of spec §7.8 is judged there, before any byte of the head is forwarded).
+    pub fn one_request_at_a_time(mut self) -> Self {
+        self.one_request = true;
+        self
     }
 
     /// Bytes read from the client, all of them used. Without the relay's flow control: a
@@ -564,7 +574,15 @@ impl Codec {
     /// Feed client bytes; returns how many were used (all of them unless `limited`).
     fn feed_requests(&mut self, mut data: &[u8], limited: bool, events: &mut Vec<Event>) -> usize {
         let total = data.len();
+        let first_request = self.next_seq;
         while !data.is_empty() && !self.opaque {
+            if limited
+                && self.one_request
+                && self.next_seq != first_request
+                && matches!(&self.req, ReqState::Head(scanner) if scanner.is_fresh())
+            {
+                break;
+            }
             // Only a fresh head can wait: the count grows when a head completes.
             if matches!(self.req, ReqState::Head(_)) && self.pending.len() >= READ_AHEAD {
                 if limited {

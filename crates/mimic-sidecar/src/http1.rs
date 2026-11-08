@@ -17,11 +17,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use mimic_core::proxy::http1::{Codec, Event};
+use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::access::Outcome;
+use crate::load::REQUEST_HEADER;
 use crate::mock::Mock;
 use crate::opaque::{Side, abort, failed};
 use crate::transport::Stream;
@@ -49,6 +50,9 @@ pub struct Relayed {
     /// forwarded, and when the first of them arrived. The destination connection is closed;
     /// the client side is left as it is, for the mock to continue.
     pub handover: Option<(Vec<u8>, Instant)>,
+    /// The handover is for a request that carries the load marker (spec §7.8): the rest of the
+    /// connection is the load layer's, whatever the mode.
+    pub load: bool,
 }
 
 type Failure = (Side, io::Error);
@@ -86,6 +90,53 @@ struct Relay<F> {
     handed: Notify,
     /// The connection became a tunnel (or unframed) after the switch: mock does not keep it.
     mock_close: Notify,
+    /// Inbound connections: every request head is read whole before any byte of it is
+    /// forwarded, to hand a request that carries the load marker over (spec §7.8).
+    watch_load: bool,
+    /// The client pump stopped for a marked request, not for the mock.
+    load_handover: AtomicBool,
+}
+
+/// What the lines read so far of a request head say about the load marker.
+#[derive(Debug, PartialEq, Eq)]
+enum Marked {
+    /// The head is not complete and the marker has not been seen.
+    Open,
+    /// The head carries `mimic-load-run`.
+    Yes,
+    /// The head does not (or is too large to tell: the codec gives up on it).
+    No,
+}
+
+/// Looks for the marker header in the complete lines of a request head, as the codec reads
+/// them (leading blank lines skipped, `CRLF` or `LF` line ends).
+fn marked(held: &[u8]) -> Marked {
+    let mut started = false;
+    let mut rest = held;
+    while let Some(end) = rest.iter().position(|&b| b == b'\n') {
+        let line = rest[..end].strip_suffix(b"\r").unwrap_or(&rest[..end]);
+        rest = &rest[end + 1..];
+        if line.is_empty() {
+            if started {
+                return Marked::No;
+            }
+            continue;
+        }
+        if !started {
+            started = true;
+            continue;
+        }
+        if let Some(colon) = line.iter().position(|&b| b == b':')
+            && line[..colon].eq_ignore_ascii_case(REQUEST_HEADER.as_bytes())
+        {
+            return Marked::Yes;
+        }
+    }
+    if held.len() >= HEAD_LIMIT {
+        Marked::No
+    } else {
+        Marked::Open
+    }
 }
 
 impl<F: FnMut(Event)> Relay<F> {
@@ -146,6 +197,8 @@ impl<F: FnMut(Event)> Relay<F> {
         let mut buf = vec![0u8; CHUNK];
         let mut held = first;
         let mut read_at = Instant::now();
+        // The client ended in the middle of a head: what was held goes on its way.
+        let mut ended = false;
         self.to_upstream
             .fetch_add(held.len() as u64, Ordering::Relaxed);
         loop {
@@ -178,6 +231,44 @@ impl<F: FnMut(Event)> Relay<F> {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((held, read_at));
                 self.handed.notify_one();
                 return Ok(());
+            }
+            if self.watch_load
+                && !ended
+                && self.with(|codec| (codec.between_requests(), Vec::new()))
+            {
+                match marked(&held) {
+                    Marked::Open => {
+                        // Held, not forwarded: the connection is not between two messages.
+                        self.primed.store(false, Ordering::Release);
+                        let n = client.read(&mut buf).await.map_err(|e| (Side::Client, e))?;
+                        if n == 0 {
+                            ended = true;
+                        } else {
+                            self.to_upstream.fetch_add(n as u64, Ordering::Relaxed);
+                            held.extend_from_slice(&buf[..n]);
+                        }
+                        continue;
+                    }
+                    Marked::Yes => {
+                        // The earlier requests are answered first, as for a switch to mock.
+                        while self.with(|codec| (codec.pending() > 0, Vec::new()))
+                            && !self.server_closed.load(Ordering::Acquire)
+                        {
+                            self.unblocked.notified().await;
+                        }
+                        self.to_upstream
+                            .fetch_sub(held.len() as u64, Ordering::Relaxed);
+                        self.load_handover.store(true, Ordering::Release);
+                        *self
+                            .handover
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some((held, read_at));
+                        self.handed.notify_one();
+                        return Ok(());
+                    }
+                    Marked::No => {}
+                }
             }
             let used = self.with(|codec| codec.client_bytes_limited(&held));
             if used == 0 {
@@ -291,6 +382,7 @@ pub async fn relay(
         first,
         false,
         None,
+        false,
         on_event,
         stop,
         abort_signal,
@@ -301,7 +393,9 @@ pub async fn relay(
 /// [`relay`], with a codec that also reports [`Event::Captured`] when `capture` is set (the
 /// discovery tap, spec §6). With a `mock`, the relay ends when the mode switches to `mock`:
 /// before the first byte of the next request (see [`Relayed::handover`]), or at once for a
-/// connection that became a tunnel (outcome `MockClosed`).
+/// connection that became a tunnel (outcome `MockClosed`). With `watch_load` (inbound), the
+/// relay also ends before the first byte of a request that carries `mimic-load-run`, with a
+/// handover whose [`Relayed::load`] is set.
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_with(
     client: &mut Stream,
@@ -309,6 +403,7 @@ pub async fn relay_with(
     first: Vec<u8>,
     capture: bool,
     mock: Option<Mock>,
+    watch_load: bool,
     on_event: impl FnMut(Event) + Send,
     stop: impl Future<Output = ()> + Send,
     abort_signal: impl Future<Output = ()> + Send,
@@ -316,10 +411,17 @@ pub async fn relay_with(
     let (client_socket, upstream_socket) = (client.socket(), upstream.socket());
     let relay = Relay {
         state: Mutex::new(State {
-            codec: if capture {
-                Codec::with_capture()
-            } else {
-                Codec::new()
+            codec: {
+                let codec = if capture {
+                    Codec::with_capture()
+                } else {
+                    Codec::new()
+                };
+                if watch_load {
+                    codec.one_request_at_a_time()
+                } else {
+                    codec
+                }
             },
             on_event,
         }),
@@ -335,6 +437,8 @@ pub async fn relay_with(
         handover: Mutex::new(None),
         handed: Notify::new(),
         mock_close: Notify::new(),
+        watch_load,
+        load_handover: AtomicBool::new(false),
     };
     let mut mock_closed = false;
     let mut handed = false;
@@ -439,6 +543,7 @@ pub async fn relay_with(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(),
+        load: relay.load_handover.load(Ordering::Acquire),
     }
 }
 
