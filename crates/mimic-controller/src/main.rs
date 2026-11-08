@@ -40,6 +40,8 @@ struct Config {
     tls_ca: tls_ca::TlsCaConfig,
     sidecar_api_addr: SocketAddr,
     push: push_config::PushConfig,
+    /// `MIMIC_LOAD_MAX_RUNS`: 0 disables load tests (spec §7.8).
+    load_max_runs: u64,
 }
 
 fn config(env: &Env) -> Result<Config, ConfigError> {
@@ -50,7 +52,20 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
         tls_ca: tls_ca::TlsCaConfig::from_env(env)?,
         sidecar_api_addr: env.parse_or("MIMIC_SIDECAR_API_ADDR", DEFAULT_SIDECAR_API)?,
         push: push_config::PushConfig::from_env(env)?,
+        load_max_runs: load_max_runs(env)?,
     })
+}
+
+fn load_max_runs(env: &Env) -> Result<u64, ConfigError> {
+    let runs: u64 = env.parse_or("MIMIC_LOAD_MAX_RUNS", 0)?;
+    if runs > 100 {
+        return Err(ConfigError::invalid(
+            "MIMIC_LOAD_MAX_RUNS",
+            &runs.to_string(),
+            "must be 0 to 100",
+        ));
+    }
+    Ok(runs)
 }
 
 fn main() -> ExitCode {
@@ -99,6 +114,17 @@ async fn run(config: Config) -> std::io::Result<()> {
     let seed = Arc::new(tls_ca::SeedSlot::new());
     // The cluster client, for the sidecar API's `TokenReview`s, once it is available.
     let kube_client = Arc::new(tokio::sync::OnceCell::new());
+    // The load API (spec §7.8) exists only when load tests are enabled.
+    let load = (config.load_max_runs > 0).then(|| sidecar_api::load::LoadApi {
+        reviewer: Arc::new(sidecar_api::KubeReviewer::with_audience(
+            kube_client.clone(),
+            sidecar_api::load::LOAD_AUDIENCE,
+        )),
+        reviews: sidecar_api::ReviewCache::default(),
+        runs: Arc::new(sidecar_api::load::RunIndex::default()),
+        slices: Arc::new(sidecar_api::load::SliceCache::default()),
+    });
+    let slices = load.as_ref().map(|load| load.slices.clone());
     tokio::spawn({
         let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
         let kube_client = kube_client.clone();
@@ -113,6 +139,9 @@ async fn run(config: Config) -> std::io::Result<()> {
             let client = workloads::client().await;
             let _ = kube_client.set(client.clone());
             tokio::spawn(workloads::watch(client.clone(), cache));
+            if let Some(slices) = slices {
+                tokio::spawn(sidecar_api::load::watch_slices(client.clone(), slices));
+            }
             tokio::spawn(tls_ca::manage(client.clone(), tls_ca, seed, seed_metrics));
             cert_manager::manage(client, certificates, cert, cert_metrics).await;
         }
@@ -181,6 +210,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         max_egress: config.push.max_egress,
         egress: sidecar_api::EgressCache::new(config.push.egress_budget, &api_metrics),
         egress_logged: sidecar_api::EgressLogged::default(),
+        load,
     });
     let webhook_listener = tokio::net::TcpListener::bind(webhook.addr).await?;
     tracing::info!(addr = %webhook_listener.local_addr()?, "webhook listening");

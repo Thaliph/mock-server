@@ -40,6 +40,7 @@ use crate::workloads::WorkloadCache;
 
 mod admission;
 mod egress;
+pub mod load;
 
 pub use admission::{BodyBudget, RateLimiter, ReviewCache};
 pub use egress::Cache as EgressCache;
@@ -121,12 +122,21 @@ pub trait Reviewer: Send + Sync {
 /// `TokenReview` against the Kubernetes API server.
 pub struct KubeReviewer {
     client: Arc<OnceCell<kube::Client>>,
+    audience: &'static str,
 }
 
 impl KubeReviewer {
     /// `client` is set once the cluster client is available; reviews fail until then.
     pub fn new(client: Arc<OnceCell<kube::Client>>) -> KubeReviewer {
-        KubeReviewer { client }
+        KubeReviewer::with_audience(client, AUDIENCE)
+    }
+
+    /// Reviews for another audience (the load API's, spec §7.8).
+    pub fn with_audience(
+        client: Arc<OnceCell<kube::Client>>,
+        audience: &'static str,
+    ) -> KubeReviewer {
+        KubeReviewer { client, audience }
     }
 }
 
@@ -136,7 +146,7 @@ impl Reviewer for KubeReviewer {
             let review = TokenReview {
                 spec: TokenReviewSpec {
                     token: Some(token.to_string()),
-                    audiences: Some(vec![AUDIENCE.to_string()]),
+                    audiences: Some(vec![self.audience.to_string()]),
                 },
                 ..TokenReview::default()
             };
@@ -150,7 +160,7 @@ impl Reviewer for KubeReviewer {
             let audience = status
                 .audiences
                 .as_ref()
-                .is_some_and(|audiences| audiences.iter().any(|a| a == AUDIENCE));
+                .is_some_and(|audiences| audiences.iter().any(|a| a == self.audience));
             let user = status.user.unwrap_or_default();
             let pod = user
                 .extra
@@ -314,6 +324,8 @@ pub struct SidecarApi {
     pub egress: egress::Cache,
     /// What `egress_limit` warnings were written already.
     pub egress_logged: egress::Logged,
+    /// The load routes (spec §7.8); absent when load tests are disabled.
+    pub load: Option<load::LoadApi>,
 }
 
 pub fn router(api: Arc<SidecarApi>) -> Router {
@@ -357,6 +369,16 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
                 },
             ),
         )
+        .route(
+            "/v1/load/{name}/{uid}/{route}",
+            any(
+                |State(api): State<Arc<SidecarApi>>,
+                 Path((name, uid, route)): Path<(String, String, String)>,
+                 request: axum::extract::Request| async move {
+                    api.load_route(&name, &uid, &route, request).await
+                },
+            ),
+        )
         .with_state(api)
 }
 
@@ -392,6 +414,7 @@ const fn refusal(status: StatusCode, result: &'static str) -> Refusal {
 
 const UNAUTHENTICATED: Refusal = refusal(StatusCode::UNAUTHORIZED, "unauthenticated");
 const FORBIDDEN: Refusal = refusal(StatusCode::FORBIDDEN, "forbidden");
+const NOT_FOUND: Refusal = refusal(StatusCode::NOT_FOUND, "not_found");
 const TOO_LARGE: Refusal = refusal(StatusCode::PAYLOAD_TOO_LARGE, "too_large");
 const PUSH_LIMIT: Refusal = refusal(StatusCode::INSUFFICIENT_STORAGE, "push_limit");
 const DEPLOYMENT_LIMIT: Refusal = refusal(StatusCode::INSUFFICIENT_STORAGE, "deployment_limit");
@@ -511,22 +534,36 @@ impl SidecarApi {
         peer: Option<std::net::IpAddr>,
         caller: &mut Caller,
     ) -> Result<Identity, Refusal> {
+        self.authenticate_with(&*self.reviewer, &self.reviews, headers, peer, caller)
+            .await
+    }
+
+    /// [`Self::authenticate`] with the reviewer and the review cache of an audience: the load
+    /// routes have their own (spec §7.8), so that a token of one audience never opens the other.
+    async fn authenticate_with(
+        &self,
+        reviewer: &dyn Reviewer,
+        reviews: &ReviewCache,
+        headers: &HeaderMap,
+        peer: Option<std::net::IpAddr>,
+        caller: &mut Caller,
+    ) -> Result<Identity, Refusal> {
         let token = bearer(headers).ok_or(UNAUTHENTICATED)?;
-        let review = match self.reviews.get(token) {
+        let review = match reviews.get(token) {
             Some(review) => review,
             None => {
                 if !self.limiter.allow(peer) {
                     caller.error = Some("token review budget spent".to_string());
                     return Err(UNAVAILABLE);
                 }
-                let review = self.reviewer.review(token).await.map_err(|e| {
+                let review = reviewer.review(token).await.map_err(|e| {
                     caller.error = Some(e);
                     UNAVAILABLE
                 })?;
                 if !review.authenticated {
                     return Err(UNAUTHENTICATED);
                 }
-                self.reviews.put(token, review.clone());
+                reviews.put(token, review.clone());
                 review
             }
         };
@@ -822,6 +859,8 @@ async fn read_exact(body: Body, length: usize) -> Result<Vec<u8>, Refusal> {
 }
 
 #[cfg(test)]
+mod load_tests;
+#[cfg(test)]
 mod push_tests;
 
 #[cfg(test)]
@@ -990,6 +1029,7 @@ mod tests {
             max_egress: 4 << 20,
             egress: egress::Cache::new(32 << 20, &api_metrics),
             egress_logged: egress::Logged::default(),
+            load: None,
         });
         Setup {
             router: router(api),

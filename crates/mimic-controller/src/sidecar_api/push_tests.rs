@@ -154,6 +154,7 @@ fn setup(options: Options) -> Setup {
         max_egress: options.max_egress,
         egress: EgressCache::new(options.egress_budget, &api_metrics),
         egress_logged: EgressLogged::default(),
+        load: None,
     });
     Setup {
         router: router(api.clone()),

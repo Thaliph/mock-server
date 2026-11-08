@@ -12,6 +12,11 @@ fn in_alphabet(s: &str) -> bool {
     s.chars().all(|c| ALPHABET.contains(c))
 }
 
+/// Whether `s` is the random suffix of a generated pod name: 5 characters of the alphabet.
+pub fn generated_suffix(s: &str) -> bool {
+    s.len() == SUFFIX_LEN && in_alphabet(s)
+}
+
 /// Whether `pod` is a name the ReplicaSet of `deployment` can generate:
 /// `<deployment>-<pod-template-hash>-<5 chars>`, the part before the 5 chars truncated to 58.
 pub fn pod_of_deployment(pod: &str, deployment: &str) -> bool {
