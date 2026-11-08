@@ -4,9 +4,6 @@
 //! answer carries one `x-mimic-load` header. Anything else is answered `599` by the sidecar.
 
 use std::collections::VecDeque;
-use std::future::Future;
-use std::net::SocketAddr;
-use std::pin::pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,15 +14,12 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
-use hyper::body::{Bytes, Incoming};
-use hyper::client::conn::http1::SendRequest;
+use hyper::body::Bytes;
 use hyper::header::{self, HeaderMap, HeaderValue};
-use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper::{Response, StatusCode};
 use mimic_core::Mode;
 use mimic_core::load::ticket::{self, Payload};
-use mimic_runtime::config::Env;
+use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -33,10 +27,8 @@ use prometheus_client::metrics::family::Family;
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
 
 use crate::discovery::Tap;
-use crate::exchange::{Ctx, ReqBody, Tracker};
 use crate::mode::ModeState;
 use crate::tls::TlsConfig;
-use crate::transport::Stream;
 
 /// The request header that carries the ticket.
 pub const REQUEST_HEADER: &str = "mimic-load-run";
@@ -44,6 +36,7 @@ pub const REQUEST_HEADER: &str = "mimic-load-run";
 pub const MARKER_HEADER: &str = "x-mimic-load";
 /// Verified tickets kept, the last seen: a request costs a lookup.
 const MAX_VERIFIED: usize = 16;
+const ENABLED_VAR: &str = "MIMIC_LOAD_ENABLED";
 
 /// Who this sidecar is, and the key that signs the load tickets it accepts.
 #[derive(Debug, Clone, Default)]
@@ -56,16 +49,25 @@ pub struct LoadConfig {
 }
 
 impl LoadConfig {
-    /// `MIMIC_POD_NAMESPACE`, `MIMIC_WORKLOAD` and `MIMIC_POD_NAME` (all set by the injection
-    /// patch; without them no ticket names this pod) and the root of `MIMIC_TLS_CA`.
-    pub fn from_env(env: &Env, tls: &TlsConfig) -> LoadConfig {
+    /// `None` unless `MIMIC_LOAD_ENABLED=1` (`0` or absent: load testing is off on this pod,
+    /// spec §4.1). Else `MIMIC_POD_NAMESPACE`, `MIMIC_WORKLOAD` and `MIMIC_POD_NAME` (all set by
+    /// the injection patch; without them no ticket names this pod) and the root of
+    /// `MIMIC_TLS_CA`.
+    pub fn from_env(env: &Env, tls: &TlsConfig) -> Result<Option<LoadConfig>, ConfigError> {
+        match env.optional(ENABLED_VAR) {
+            None | Some("0") => return Ok(None),
+            Some("1") => {}
+            Some(other) => {
+                return Err(ConfigError::invalid(ENABLED_VAR, other, "expected 0 or 1"));
+            }
+        }
         let text = |name| env.optional(name).unwrap_or_default().to_string();
-        LoadConfig {
+        Ok(Some(LoadConfig {
             namespace: text("MIMIC_POD_NAMESPACE"),
             deployment: text("MIMIC_WORKLOAD"),
             pod: text("MIMIC_POD_NAME"),
             root_der: tls.ca.as_ref().map(|ca| ca.root_der.clone()),
-        }
+        }))
     }
 }
 
@@ -172,7 +174,17 @@ impl Marker {
     /// Judges the `mimic-load-run` headers of a request, counts the result and, for a refusal,
     /// writes the warning of its reason once per mode period. `Ok` is the run's uid.
     pub fn admit(&self, headers: &HeaderMap) -> Result<String, Refusal> {
-        let decided = self.decide(headers);
+        let values: Vec<&[u8]> = headers
+            .get_all(REQUEST_HEADER)
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect();
+        self.admit_values(&values)
+    }
+
+    /// [`Marker::admit`] for the values of the `mimic-load-run` headers of a request head.
+    pub fn admit_values(&self, values: &[&[u8]]) -> Result<String, Refusal> {
+        let decided = self.decide(values);
         let result = match decided {
             Ok(_) => "forwarded",
             Err(refusal) => refusal.result(),
@@ -190,14 +202,13 @@ impl Marker {
     }
 
     /// Ticket first (a bad one says nothing about the pod), then the pod, then the mode.
-    fn decide(&self, headers: &HeaderMap) -> Result<String, Refusal> {
-        let mut values = headers.get_all(REQUEST_HEADER).iter();
-        let (Some(value), None) = (values.next(), values.next()) else {
+    fn decide(&self, values: &[&[u8]]) -> Result<String, Refusal> {
+        let [value] = values else {
             return Err(Refusal::Ticket);
         };
-        let payload = value
-            .to_str()
+        let payload = std::str::from_utf8(value)
             .ok()
+            .map(str::trim)
             .and_then(|ticket| self.verify(ticket))
             .ok_or(Refusal::Ticket)?;
         let config = &self.0.config;
@@ -323,128 +334,41 @@ pub(crate) fn screen(
     Ok(Some(run))
 }
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Headers about the hop that sent them: a load request is rebuilt for the app's connection.
-const HOP_BY_HOP: [&str; 6] = [
-    "connection",
-    "keep-alive",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "upgrade",
-];
-
-/// What the HTTP/1 service of a connection handed over by the relay shares between requests.
-struct Http1 {
-    marker: Marker,
-    ctx: Ctx,
-    tap: Option<Tap>,
-    dst: SocketAddr,
-    /// The connection to the app, opened by the first request and kept while it lives.
-    app: tokio::sync::Mutex<Option<SendRequest<ReqBody>>>,
+/// What an inbound HTTP/1 relay needs of the load marker (spec §4.1): the check, the discovery
+/// tap that counts the load exchanges, how long a head may stay incomplete, and the runs of the
+/// requests read, in order, for the exchange tracker.
+#[derive(Clone)]
+pub struct Watch {
+    pub(crate) marker: Marker,
+    pub(crate) tap: Option<Tap>,
+    pub(crate) stall: Duration,
+    runs: Arc<Mutex<VecDeque<Option<String>>>>,
 }
 
-/// Serves the rest of an inbound HTTP/1 connection from the first request that carries the load
-/// marker (`client` replays the bytes read): each request is checked, and forwarded to `dst`
-/// over one connection kept for the client's. The relay is byte-exact; this is not, which is
-/// why it only takes a connection that has shown a marker.
-pub(crate) async fn serve_http1(
-    marker: Marker,
-    ctx: Ctx,
-    tap: Option<Tap>,
-    client: Stream,
-    dst: SocketAddr,
-    stop: impl Future<Output = ()>,
-    abort: impl Future<Output = ()>,
-) {
-    let state = Arc::new(Http1 {
-        marker,
-        ctx,
-        tap,
-        dst,
-        app: tokio::sync::Mutex::new(None),
-    });
-    let service = service_fn(move |req| forward(state.clone(), req));
-    let served = hyper::server::conn::http1::Builder::new()
-        .auto_date_header(false)
-        .serve_connection(TokioIo::new(client), service);
-    let mut served = pin!(served);
-    let mut stop = pin!(stop);
-    let mut abort = pin!(abort);
-    let mut stopping = false;
-    loop {
-        tokio::select! {
-            result = served.as_mut() => {
-                if let Err(e) = result {
-                    tracing::debug!(error = %e, "load connection ended");
-                }
-                return;
-            }
-            () = &mut stop, if !stopping => {
-                stopping = true;
-                served.as_mut().graceful_shutdown();
-            }
-            () = &mut abort => return,
+impl Watch {
+    pub fn new(marker: Marker, tap: Option<Tap>, stall: Duration) -> Watch {
+        Watch {
+            marker,
+            tap,
+            stall,
+            runs: Arc::default(),
         }
     }
-}
 
-async fn forward(
-    state: Arc<Http1>,
-    req: Request<Incoming>,
-) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut req = req;
-    let run = match screen(&state.marker, state.tap.as_ref(), req.headers_mut()) {
-        Ok(run) => run,
-        Err(refusal) => return Ok(refused(refusal)),
-    };
-    if run.is_some() {
-        for name in HOP_BY_HOP {
-            req.headers_mut().remove(name);
-        }
+    /// A request head was passed on: `Some(run)` when it carried an admitted ticket.
+    pub(crate) fn pushed(&self, run: Option<String>) {
+        self.runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(run);
     }
-    let tap = state.tap.as_ref().filter(|_| run.is_none());
-    let (mut tracker, req) = Tracker::start(&state.ctx, "http1", tap, req);
-    let marked = run.is_some();
-    if let Some(run) = run {
-        tracker.load_run(run);
-    }
-    let sent = async {
-        let mut app = state.app.lock().await;
-        let mut sender = match app.take() {
-            Some(sender) if !sender.is_closed() => sender,
-            _ => connect(state.dst).await?,
-        };
-        sender.ready().await?;
-        let response = sender.send_request(req).await?;
-        *app = Some(sender);
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(response)
-    }
-    .await;
-    match sent {
-        Ok(response) => {
-            let mut answered = tracker.answered(response).map(BodyExt::boxed_unsync);
-            if marked {
-                mark_answer(answered.headers_mut());
-            }
-            Ok(answered)
-        }
-        Err(e) => {
-            tracker.failed();
-            Err(e)
-        }
-    }
-}
 
-/// A new HTTP/1 connection to the app.
-async fn connect(
-    dst: SocketAddr,
-) -> Result<SendRequest<ReqBody>, Box<dyn std::error::Error + Send + Sync>> {
-    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(dst)).await??;
-    let (sender, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(Stream::plain(tcp))).await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(sender)
+    /// The run of the next request the codec reports.
+    pub(crate) fn next_request(&self) -> Option<String> {
+        self.runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .flatten()
+    }
 }

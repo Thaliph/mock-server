@@ -10,6 +10,7 @@
 //! connection is closed, nothing added, as soon as the codec is between two messages: a FIN on
 //! both sides, after what the peers still sent was read and dropped (no reset).
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::pin;
@@ -17,12 +18,12 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT};
+use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT, READ_AHEAD};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::access::Outcome;
-use crate::load::REQUEST_HEADER;
+use crate::load::{MARKER_HEADER, REQUEST_HEADER, Refusal, Watch};
 use crate::mock::Mock;
 use crate::opaque::{Side, abort, failed};
 use crate::transport::Stream;
@@ -50,9 +51,9 @@ pub struct Relayed {
     /// forwarded, and when the first of them arrived. The destination connection is closed;
     /// the client side is left as it is, for the mock to continue.
     pub handover: Option<(Vec<u8>, Instant)>,
-    /// The handover is for a request that carries the load marker (spec §7.8): the rest of the
-    /// connection is the load layer's, whatever the mode.
-    pub load: bool,
+    /// A request carried a load marker that was refused (spec §4.1): nothing of it was
+    /// forwarded and the earlier answers are written; the caller answers it and closes.
+    pub refused: Option<Refusal>,
 }
 
 type Failure = (Side, io::Error);
@@ -90,35 +91,48 @@ struct Relay<F> {
     handed: Notify,
     /// The connection became a tunnel (or unframed) after the switch: mock does not keep it.
     mock_close: Notify,
-    /// Inbound connections: every request head is read whole before any byte of it is
-    /// forwarded, to hand a request that carries the load marker over (spec §7.8).
-    watch_load: bool,
-    /// The client pump stopped for a marked request, not for the mock.
-    load_handover: AtomicBool,
+    /// Inbound connections with load testing on: every request head is read whole before any
+    /// byte of it is forwarded, and the marker is judged and removed there (spec §4.1).
+    watch: Option<Watch>,
+    /// Per request read, whether it carried an admitted marker: its final response is marked.
+    answers: Mutex<VecDeque<bool>>,
+    /// The marker of a request was refused.
+    refused: Mutex<Option<Refusal>>,
 }
 
-/// What the lines read so far of a request head say about the load marker.
+/// What the bytes read so far of a request head say about the load marker.
 #[derive(Debug, PartialEq, Eq)]
 enum Marked {
-    /// The head is not complete and the marker has not been seen.
+    /// The head is not complete.
     Open,
-    /// The head carries `mimic-load-run`.
-    Yes,
-    /// The head does not (or is too large to tell: the codec gives up on it).
+    /// The head is complete (its length) and carries `mimic-load-run`.
+    Yes(usize),
+    /// The head does not, or is not one the codec frames, or is too large to tell.
     No,
 }
 
-/// Looks for the marker header in the complete lines of a request head, as the codec reads
-/// them (leading blank lines skipped, `CRLF` or `LF` line ends).
+fn is_token(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// Looks for the marker header in a request head, as the codec reads it (leading blank lines
+/// skipped, `CRLF` or `LF` line ends). A head with a line the codec rejects is `No`: it is
+/// relayed unchanged.
 fn marked(held: &[u8]) -> Marked {
     let mut started = false;
-    let mut rest = held;
-    while let Some(end) = rest.iter().position(|&b| b == b'\n') {
-        let line = rest[..end].strip_suffix(b"\r").unwrap_or(&rest[..end]);
-        rest = &rest[end + 1..];
+    let mut found = false;
+    let mut at = 0;
+    while let Some(end) = held[at..].iter().position(|&b| b == b'\n') {
+        let next = at + end + 1;
+        let line = &held[at..next - 1];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        at = next;
         if line.is_empty() {
             if started {
-                return Marked::No;
+                return if found { Marked::Yes(at) } else { Marked::No };
             }
             continue;
         }
@@ -126,17 +140,81 @@ fn marked(held: &[u8]) -> Marked {
             started = true;
             continue;
         }
-        if let Some(colon) = line.iter().position(|&b| b == b':')
-            && line[..colon].eq_ignore_ascii_case(REQUEST_HEADER.as_bytes())
-        {
-            return Marked::Yes;
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            return Marked::No;
+        };
+        if !is_token(&line[..colon]) {
+            return Marked::No;
         }
+        found |= line[..colon].eq_ignore_ascii_case(REQUEST_HEADER.as_bytes());
     }
     if held.len() >= HEAD_LIMIT {
         Marked::No
     } else {
         Marked::Open
     }
+}
+
+/// The value of every line of `head` named `name`, outer whitespace removed.
+fn values<'a>(head: &'a [u8], name: &str) -> Vec<&'a [u8]> {
+    head.split(|&b| b == b'\n')
+        .skip(1)
+        .filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let colon = line.iter().position(|&b| b == b':')?;
+            line[..colon]
+                .eq_ignore_ascii_case(name.as_bytes())
+                .then(|| line[colon + 1..].trim_ascii())
+        })
+        .collect()
+}
+
+/// `head` without its lines named `name` (and the folded lines that follow them), and with
+/// `add` (a complete line) before the blank line that ends it. `None` for a head with a folded
+/// line: it is left as it is.
+fn edited(head: &[u8], name: &str, add: Option<&[u8]>) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(head.len() + add.map_or(0, <[u8]>::len));
+    let lines: Vec<&[u8]> = head.split_inclusive(|&b| b == b'\n').collect();
+    let (last, lines) = lines.split_last()?;
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 && matches!(line.first(), Some(b' ' | b'\t')) {
+            return None;
+        }
+        let colon = line.iter().position(|&b| b == b':');
+        let named = index > 0
+            && colon.is_some_and(|colon| line[..colon].eq_ignore_ascii_case(name.as_bytes()));
+        if !named {
+            out.extend_from_slice(line);
+        }
+    }
+    if let Some(add) = add {
+        out.extend_from_slice(add);
+    }
+    out.extend_from_slice(last);
+    Some(out)
+}
+
+/// The end of the response head at the start of `held`, and its status.
+fn response_head(held: &[u8]) -> Option<(usize, u16)> {
+    let mut at = 0;
+    let mut status = None;
+    while let Some(end) = held[at..].iter().position(|&b| b == b'\n') {
+        let line = &held[at..at + end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        at += end + 1;
+        if line.is_empty() {
+            return status.map(|status| (at, status));
+        }
+        if status.is_none() {
+            status = std::str::from_utf8(line)
+                .ok()?
+                .split(' ')
+                .nth(1)
+                .and_then(|code| code.parse().ok());
+            status?;
+        }
+    }
+    None
 }
 
 impl<F: FnMut(Event)> Relay<F> {
@@ -232,42 +310,77 @@ impl<F: FnMut(Event)> Relay<F> {
                 self.handed.notify_one();
                 return Ok(());
             }
-            if self.watch_load
+            if let Some(watch) = self.watch.as_ref()
                 && !ended
                 && self.with(|codec| (codec.between_requests(), Vec::new()))
             {
-                match marked(&held) {
+                // A head waits for room first, so that it is judged once.
+                if self.with(|codec| (codec.pending() >= READ_AHEAD, Vec::new()))
+                    && !self.server_closed.load(Ordering::Acquire)
+                {
+                    self.unblocked.notified().await;
+                    continue;
+                }
+                let verdict = match marked(&held) {
                     Marked::Open => {
                         // Held, not forwarded: the connection is not between two messages.
                         self.primed.store(false, Ordering::Release);
-                        let n = client.read(&mut buf).await.map_err(|e| (Side::Client, e))?;
-                        if n == 0 {
-                            ended = true;
-                        } else {
-                            self.to_upstream.fetch_add(n as u64, Ordering::Relaxed);
-                            held.extend_from_slice(&buf[..n]);
+                        match tokio::time::timeout(watch.stall, client.read(&mut buf)).await {
+                            // Nothing came for the stall: what is held goes on its way.
+                            Err(_) => Marked::No,
+                            Ok(read) => {
+                                let n = read.map_err(|e| (Side::Client, e))?;
+                                if n == 0 {
+                                    ended = true;
+                                } else {
+                                    self.to_upstream.fetch_add(n as u64, Ordering::Relaxed);
+                                    held.extend_from_slice(&buf[..n]);
+                                }
+                                continue;
+                            }
                         }
-                        continue;
                     }
-                    Marked::Yes => {
-                        // The earlier requests are answered first, as for a switch to mock.
-                        while self.with(|codec| (codec.pending() > 0, Vec::new()))
-                            && !self.server_closed.load(Ordering::Acquire)
+                    verdict => verdict,
+                };
+                match verdict {
+                    Marked::Yes(end) => {
+                        match watch
+                            .marker
+                            .admit_values(&values(&held[..end], REQUEST_HEADER))
                         {
-                            self.unblocked.notified().await;
+                            Err(refusal) => {
+                                // The earlier requests are answered first, as for a switch.
+                                while self.with(|codec| (codec.pending() > 0, Vec::new()))
+                                    && !self.server_closed.load(Ordering::Acquire)
+                                {
+                                    self.unblocked.notified().await;
+                                }
+                                *self
+                                    .refused
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(refusal);
+                                self.handed.notify_one();
+                                return Ok(());
+                            }
+                            Ok(run) => {
+                                if let Some(tap) = &watch.tap {
+                                    tap.load_exchange();
+                                }
+                                if let Some(head) = edited(&held[..end], REQUEST_HEADER, None) {
+                                    self.to_upstream
+                                        .fetch_sub((end - head.len()) as u64, Ordering::Relaxed);
+                                    held.splice(..end, head);
+                                }
+                                self.answered(true);
+                                watch.pushed(Some(run));
+                            }
                         }
-                        self.to_upstream
-                            .fetch_sub(held.len() as u64, Ordering::Relaxed);
-                        self.load_handover.store(true, Ordering::Release);
-                        *self
-                            .handover
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some((held, read_at));
-                        self.handed.notify_one();
-                        return Ok(());
                     }
-                    Marked::No => {}
+                    _ => {
+                        self.answered(false);
+                        watch.pushed(None);
+                    }
                 }
             }
             let used = self.with(|codec| codec.client_bytes_limited(&held));
@@ -295,6 +408,9 @@ impl<F: FnMut(Event)> Relay<F> {
         upstream: &mut (impl AsyncRead + Unpin),
         client: &mut (impl AsyncWrite + Unpin),
     ) -> Result<(), Failure> {
+        if let Some(watch) = &self.watch {
+            return self.server_pump_marked(watch, upstream, client).await;
+        }
         let mut buf = vec![0u8; CHUNK];
         loop {
             let n = upstream
@@ -318,6 +434,109 @@ impl<F: FnMut(Event)> Relay<F> {
                 .await
                 .map_err(|e| (Side::Client, e))?;
             if answered {
+                self.unblocked.notify_one();
+            }
+            self.close_if_idle();
+        }
+    }
+
+    /// A request head was passed on: whether its final response is a load request's.
+    fn answered(&self, load: bool) {
+        self.answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(load);
+    }
+
+    /// Destination to client when load testing is on: the head of the final response to a load
+    /// request is held whole to lose its `x-mimic-load` lines and gain one `ok`; every other
+    /// byte goes through as in [`Relay::server_pump`].
+    async fn server_pump_marked(
+        &self,
+        watch: &Watch,
+        upstream: &mut (impl AsyncRead + Unpin),
+        client: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<(), Failure> {
+        let mut buf = vec![0u8; CHUNK];
+        let mut held: Vec<u8> = Vec::new();
+        let mut release = false;
+        loop {
+            if held.is_empty() {
+                release = false;
+                let n = upstream
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| (Side::Upstream, e))?;
+                if n == 0 {
+                    self.first_to_close(SERVER);
+                    self.with(|codec| ((), codec.server_eof()));
+                    self.server_closed.store(true, Ordering::Release);
+                    self.unblocked.notify_one();
+                    return fin(client, Side::Client).await;
+                }
+                self.to_client.fetch_add(n as u64, Ordering::Relaxed);
+                held.extend_from_slice(&buf[..n]);
+            }
+            let load = self
+                .answers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .front()
+                .copied()
+                .unwrap_or(false);
+            if load && !release && self.with(|codec| (codec.between_responses(), Vec::new())) {
+                match response_head(&held) {
+                    None if held.len() < HEAD_LIMIT => {
+                        match tokio::time::timeout(watch.stall, upstream.read(&mut buf)).await {
+                            Ok(Ok(0)) | Err(_) => release = true,
+                            Ok(Ok(n)) => {
+                                self.to_client.fetch_add(n as u64, Ordering::Relaxed);
+                                held.extend_from_slice(&buf[..n]);
+                            }
+                            Ok(Err(e)) => return Err((Side::Upstream, e)),
+                        }
+                        continue;
+                    }
+                    // An interim response is not the answer.
+                    Some((end, status)) if status >= 200 || status == 101 => {
+                        let ok = format!("{MARKER_HEADER}: ok\r\n");
+                        if let Some(head) = edited(&held[..end], MARKER_HEADER, Some(ok.as_bytes()))
+                        {
+                            held.splice(..end, head);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let ((used, popped, seen), ()) = {
+                let out = self.with(|codec| {
+                    let before = codec.pending();
+                    let (used, events) = codec.server_bytes_limited(&held);
+                    (
+                        (
+                            used,
+                            before.saturating_sub(codec.pending()),
+                            !events.is_empty(),
+                        ),
+                        events,
+                    )
+                });
+                (out, ())
+            };
+            {
+                let mut answers = self
+                    .answers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for _ in 0..popped {
+                    answers.pop_front();
+                }
+            }
+            send(client, &held[..used])
+                .await
+                .map_err(|e| (Side::Client, e))?;
+            held.drain(..used);
+            if popped > 0 || seen {
                 self.unblocked.notify_one();
             }
             self.close_if_idle();
@@ -364,6 +583,18 @@ async fn close_upstream(upstream: &mut Stream) {
     .await;
 }
 
+/// Answers a refused load request (spec §4.1) and closes: the answer, a FIN, then what the
+/// client still sends is read and dropped (at most [`IDLE_DRAIN`]), so that it is no reset.
+pub async fn refuse(client: &mut Stream, refusal: Refusal) {
+    let answer = format!(
+        "HTTP/1.1 599 Refused\r\n{MARKER_HEADER}: refused; reason={}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        refusal.as_str()
+    );
+    if send(client, answer.as_bytes()).await.is_ok() {
+        close_upstream(client).await;
+    }
+}
+
 /// Relays one HTTP/1 connection until both sides are done, a side fails (the other one gets a
 /// reset), `stop` resolves and the connection is idle (no byte added: both sides see a FIN),
 /// or `abort_signal` resolves. `first` are the client bytes already read (by protocol
@@ -382,7 +613,7 @@ pub async fn relay(
         first,
         false,
         None,
-        false,
+        None,
         on_event,
         stop,
         abort_signal,
@@ -393,9 +624,10 @@ pub async fn relay(
 /// [`relay`], with a codec that also reports [`Event::Captured`] when `capture` is set (the
 /// discovery tap, spec §6). With a `mock`, the relay ends when the mode switches to `mock`:
 /// before the first byte of the next request (see [`Relayed::handover`]), or at once for a
-/// connection that became a tunnel (outcome `MockClosed`). With `watch_load` (inbound), the
-/// relay also ends before the first byte of a request that carries `mimic-load-run`, with a
-/// handover whose [`Relayed::load`] is set.
+/// connection that became a tunnel (outcome `MockClosed`). With a `watch` (inbound, load
+/// testing on) each request head is held whole and judged for `mimic-load-run`, rewritten in
+/// place when admitted, and the relay ends before any byte of a refused one
+/// ([`Relayed::refused`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_with(
     client: &mut Stream,
@@ -403,7 +635,7 @@ pub async fn relay_with(
     first: Vec<u8>,
     capture: bool,
     mock: Option<Mock>,
-    watch_load: bool,
+    watch: Option<Watch>,
     on_event: impl FnMut(Event) + Send,
     stop: impl Future<Output = ()> + Send,
     abort_signal: impl Future<Output = ()> + Send,
@@ -417,7 +649,7 @@ pub async fn relay_with(
                 } else {
                     Codec::new()
                 };
-                if watch_load {
+                if watch.is_some() {
                     codec.one_request_at_a_time()
                 } else {
                     codec
@@ -437,8 +669,9 @@ pub async fn relay_with(
         handover: Mutex::new(None),
         handed: Notify::new(),
         mock_close: Notify::new(),
-        watch_load,
-        load_handover: AtomicBool::new(false),
+        watch,
+        answers: Mutex::new(VecDeque::new()),
+        refused: Mutex::new(None),
     };
     let mut mock_closed = false;
     let mut handed = false;
@@ -543,7 +776,11 @@ pub async fn relay_with(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(),
-        load: relay.load_handover.load(Ordering::Acquire),
+        refused: relay
+            .refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
     }
 }
 

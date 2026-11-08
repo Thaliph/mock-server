@@ -392,7 +392,8 @@ pub struct Codec {
     capture: bool,
     req_cap: Cap,
     resp_cap: Cap,
-    /// [`Codec::client_bytes_limited`] stops after each complete request.
+    /// [`Codec::client_bytes_limited`] stops after each complete request, and
+    /// [`Codec::server_bytes_limited`] after each complete response.
     one_request: bool,
 }
 
@@ -432,9 +433,30 @@ impl Codec {
     }
 
     /// Bytes read from the destination.
-    pub fn server_bytes(&mut self, mut data: &[u8]) -> Vec<Event> {
+    pub fn server_bytes(&mut self, data: &[u8]) -> Vec<Event> {
+        self.feed_responses(data, false).1
+    }
+
+    /// Like [`Codec::server_bytes`], but on a codec made with
+    /// [`Codec::one_request_at_a_time`] it uses no byte after the end of a response: returns
+    /// how many bytes were used, so that the relay sees every response start.
+    pub fn server_bytes_limited(&mut self, data: &[u8]) -> (usize, Vec<Event>) {
+        self.feed_responses(data, true)
+    }
+
+    fn feed_responses(&mut self, mut data: &[u8], limited: bool) -> (usize, Vec<Event>) {
+        let total = data.len();
         let mut events = Vec::new();
         while !data.is_empty() && !self.opaque {
+            if limited
+                && self.one_request
+                && events
+                    .iter()
+                    .any(|e| matches!(e, Event::ResponseEnd { .. }))
+                && matches!(&self.resp, RespState::Head(scanner) if scanner.is_fresh())
+            {
+                break;
+            }
             match mem::take(&mut self.resp) {
                 RespState::Head(mut scanner) => {
                     let (n, scan) = scanner.feed(data);
@@ -467,7 +489,12 @@ impl Codec {
                 }
             }
         }
-        events
+        let used = if self.opaque {
+            total
+        } else {
+            total - data.len()
+        };
+        (used, events)
     }
 
     /// The destination closed (FIN): ends a close-delimited response.
@@ -528,6 +555,12 @@ impl Codec {
     /// a request (responses to earlier ones may be pending).
     pub fn between_requests(&self) -> bool {
         !self.opaque && matches!(&self.req, ReqState::Head(scanner) if scanner.is_fresh())
+    }
+
+    /// No response is half-read and the connection is still framed: the next destination byte
+    /// starts a response (or an interim one).
+    pub fn between_responses(&self) -> bool {
+        !self.opaque && matches!(&self.resp, RespState::Head(scanner) if scanner.is_fresh())
     }
 
     /// Unframed or tunnelled: the codec no longer parses.

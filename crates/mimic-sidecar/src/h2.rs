@@ -84,6 +84,54 @@ struct State {
     switched: AtomicBool,
     /// Inbound connections: the check of the load marker of every stream (spec §7.8).
     load: Option<Marker>,
+    /// With a load check, the destination socket stays unused (not one byte written) until
+    /// the first stream is forwarded: a refused stream leaves the app with nothing.
+    unopened: tokio::sync::Mutex<Option<Stream>>,
+    /// The lazily opened destination connection ended.
+    driver_ended: Arc<tokio::sync::Notify>,
+    driver_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl State {
+    /// Opens the destination connection if it is not yet (the first forwarded stream).
+    async fn open(&self) -> io::Result<()> {
+        let mut unopened = self.unopened.lock().await;
+        let Some(upstream) = unopened.take() else {
+            return Ok(());
+        };
+        let (sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake::<_, ReqBody>(TokioIo::new(upstream))
+            .await
+            .map_err(io::Error::other)?;
+        *self.sender.lock().unwrap_or_else(PoisonError::into_inner) = Some(sender);
+        let ended = self.driver_ended.clone();
+        let task = tokio::spawn(async move {
+            let _ = driver.await;
+            ended.notify_one();
+        });
+        *self
+            .driver_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(task);
+        Ok(())
+    }
+}
+
+/// Ends the lazily opened destination connection with the relay.
+struct Closing(Arc<State>);
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .0
+            .driver_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
 }
 
 /// Relays the HTTP/2 streams of `client` (whose first bytes, `replay`, were already read) to
@@ -109,20 +157,30 @@ pub(crate) async fn relay_with(
     (tap, mock, load): (Option<Tap>, Option<Mock>, Option<Marker>),
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    let (sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .handshake::<_, ReqBody>(TokioIo::new(upstream))
-        .await
-        .map_err(io::Error::other)?;
+    let lazy = load.is_some();
+    let (sender, driver, unopened) = if lazy {
+        (None, None, Some(upstream))
+    } else {
+        let (sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake::<_, ReqBody>(TokioIo::new(upstream))
+            .await
+            .map_err(io::Error::other)?;
+        (Some(sender), Some(Box::pin(driver)), None)
+    };
     let state = Arc::new(State {
         ctx: ctx.clone(),
         tap,
-        sender: Mutex::new(Some(sender)),
+        sender: Mutex::new(sender),
         mock,
         mocked: OnceLock::new(),
         switched: AtomicBool::new(false),
         load,
+        unopened: tokio::sync::Mutex::new(unopened),
+        driver_ended: Arc::default(),
+        driver_task: Mutex::new(None),
     });
     let shared = state.clone();
+    let _closing = Closing(state.clone());
     let left = state.mock.clone();
     let service = service_fn(move |req| forward(state.clone(), req));
     let io = TokioIo::new(Replay {
@@ -136,7 +194,7 @@ pub(crate) async fn relay_with(
     let mut server = pin!(server);
     // Dropped as soon as it is done: a finished client connection still holds its handle on
     // the destination socket, which would stay open.
-    let mut driver = Some(Box::pin(driver));
+    let mut driver = driver;
 
     let mut stop = pin!(stop);
     let mut stopping = false;
@@ -163,7 +221,12 @@ pub(crate) async fn relay_with(
                 // Back to discovery: the mocked streams in flight finish, then GOAWAY.
                 server.as_mut().graceful_shutdown();
             }
-            () = connection_done(&mut driver), if !driver_done => {
+            () = async {
+                tokio::select! {
+                    () = connection_done(&mut driver) => {}
+                    () = shared.driver_ended.notified() => {}
+                }
+            }, if !driver_done => {
                 driver_done = true;
                 // The destination connection ended: streams in flight finish or fail, and
                 // the client is told to open no new one (GOAWAY), unless it was let go of
@@ -225,6 +288,16 @@ async fn forward(
         let answered = conn.serve(req).await?;
         return Ok(answered.map(|body| body.map_err(|never| match never {}).boxed_unsync()));
     }
+    let mut req = req;
+    // A load request is checked, loses its ticket, is not discovered, and its answer is marked.
+    let load_run = match &state.load {
+        Some(marker) => match screen(marker, state.tap.as_ref(), req.headers_mut()) {
+            Ok(run) => run,
+            Err(refusal) => return Ok(refused(refusal)),
+        },
+        None => None,
+    };
+    state.open().await?;
     let sender = state
         .sender
         .lock()
@@ -234,15 +307,6 @@ async fn forward(
         // The destination connection was let go of by a switch, and the mode went back to
         // discovery since: the client opens a new connection.
         return Err("destination connection closed".into());
-    };
-    let mut req = req;
-    // A load request is checked, loses its ticket, is not discovered, and its answer is marked.
-    let load_run = match &state.load {
-        Some(marker) => match screen(marker, state.tap.as_ref(), req.headers_mut()) {
-            Ok(run) => run,
-            Err(refusal) => return Ok(refused(refusal)),
-        },
-        None => None,
     };
     let tap = state.tap.as_ref().filter(|_| load_run.is_none());
     let (mut tracker, req) = Tracker::start(&state.ctx, PROTOCOL, tap, req);

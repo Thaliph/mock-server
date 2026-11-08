@@ -64,7 +64,10 @@ fn main() -> ExitCode {
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
     let pod = env.optional("MIMIC_POD_NAME").map(str::to_string);
-    let load = LoadConfig::from_env(&env, &tls);
+    let load = match LoadConfig::from_env(&env, &tls) {
+        Ok(load) => load,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
     let mut log = mimic_runtime::logging::init(&config.log);
     // Before any key exists: no core dump, not readable through /proc by other processes.
     if let Err(e) = mimic_sidecar::hardening::harden() {
@@ -104,7 +107,7 @@ async fn run(
         ModeConfig,
         Option<String>,
     ),
-    load: LoadConfig,
+    load: Option<LoadConfig>,
 ) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     // Registered before any listener is announced: an early SIGTERM is not lost.
@@ -123,7 +126,7 @@ async fn run(
     let max_pending = mode.max_pending;
     let passthrough = mode.passthrough.clone();
     let mode = ModeState::start(&mode, &mut metrics).await;
-    let load = Marker::new(load, mode.clone(), &mut metrics);
+    let load = load.map(|config| Marker::new(config, mode.clone(), &mut metrics));
     let snapshot = Snapshot::new(mode);
     let mock = Mock::with_budget(
         snapshot.clone(),
@@ -153,19 +156,20 @@ async fn run(
     let inbound = listener::bind_all(Direction::Inbound, &tunnel.inbound, ipv6)?;
     let outbound = listener::bind_all(Direction::Outbound, &tunnel.outbound, ipv6)?;
     let bound = inbound.iter().chain(&outbound).map(|(_, a)| *a).collect();
-    let shared = Arc::new(
-        Shared::new(
-            bound,
-            tunnel_metrics,
-            Arc::new(listener::kernel_original_dst),
-        )
-        .with_max_connections(tunnel.max_connections)
-        .with_proxy_metrics(proxy_metrics)
-        .with_discovery(discovery.tap())
-        .with_mock(mock)
-        .with_load(load.clone())
-        .with_tls(interception),
-    );
+    let mut shared = Shared::new(
+        bound,
+        tunnel_metrics,
+        Arc::new(listener::kernel_original_dst),
+    )
+    .with_max_connections(tunnel.max_connections)
+    .with_proxy_metrics(proxy_metrics)
+    .with_discovery(discovery.tap())
+    .with_mock(mock)
+    .with_tls(interception);
+    if let Some(load) = &load {
+        shared = shared.with_load(load.clone());
+    }
+    let shared = Arc::new(shared);
     // The listeners stop accepting and the relays wind down on the signal.
     tokio::spawn({
         let (shared, stop) = (shared.clone(), shutdown.clone());
@@ -218,17 +222,15 @@ async fn run(
             shipper.flush(grace.saturating_sub(begun.elapsed())).await;
         }
     };
+    let mut admin_router = admin::router(metrics, Readiness::always())
+        .merge(probes::router(Arc::new(probes)))
+        .merge(discovery.router())
+        .merge(snapshot.router());
+    if let Some(load) = &load {
+        admin_router = admin_router.merge(load.router());
+    }
     let (served, ()) = tokio::join!(
-        admin::serve_until(
-            listener,
-            admin::router(metrics, Readiness::always())
-                .merge(probes::router(Arc::new(probes)))
-                .merge(discovery.router())
-                .merge(load.router())
-                .merge(snapshot.router()),
-            grace,
-            shutdown.clone().wait(),
-        ),
+        admin::serve_until(listener, admin_router, grace, shutdown.clone().wait(),),
         drain
     );
     served

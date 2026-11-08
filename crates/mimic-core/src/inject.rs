@@ -246,6 +246,9 @@ pub struct InjectConfig {
     pub sidecar_log: String,
     /// `MIMIC_CONTROLLER_URL` given to the sidecar (spec §7.1).
     pub controller_url: String,
+    /// Load testing is on (`MIMIC_LOAD_MAX_RUNS` above 0): the sidecar gets
+    /// `MIMIC_LOAD_ENABLED=1` (spec §10.3).
+    pub load_enabled: bool,
 }
 
 /// What differs per pod in the TLS wiring (spec §7.1, §5).
@@ -316,6 +319,9 @@ pub fn patch(
             .push(json!({"name": "MIMIC_TLS_EXCLUDE", "value": literal(&tls.exclude.join(","))}));
     }
     sidecar_env.push(json!({"name": "MIMIC_MODE", "value": literal(&tls.mode)}));
+    if cfg.load_enabled {
+        sidecar_env.push(json!({"name": "MIMIC_LOAD_ENABLED", "value": "1"}));
+    }
     if tls.latency_factor != "1" {
         sidecar_env.push(
             json!({"name": "MIMIC_MOCK_LATENCY_FACTOR", "value": literal(&tls.latency_factor)}),
@@ -953,6 +959,7 @@ mod tests {
             .unwrap(),
             sidecar_log: "debug".into(),
             controller_url: "https://mimic.mimic-system.svc:8444".into(),
+            load_enabled: false,
         }
     }
 
@@ -1169,6 +1176,21 @@ mod tests {
             apply(&p)["metadata"]["labels"]["mimic.platform.io/deployment"],
             "shop-api"
         );
+    }
+
+    #[test]
+    fn ldt_11_the_sidecar_gets_load_enabled_only_with_load_testing_on() {
+        let env = |load_enabled: bool| {
+            let cfg = InjectConfig {
+                load_enabled,
+                ..cfg()
+            };
+            let ops = patch(&pod(), "shop-api", &cfg, &wiring()).unwrap();
+            let ops = serde_json::to_value(&ops).unwrap();
+            ops.to_string().contains("MIMIC_LOAD_ENABLED")
+        };
+        assert!(!env(false));
+        assert!(env(true));
     }
 
     #[test]

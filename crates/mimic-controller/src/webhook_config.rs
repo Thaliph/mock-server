@@ -53,6 +53,7 @@ impl WebhookConfig {
                 sidecar_resources,
                 sidecar_log: sidecar_log.to_string(),
                 controller_url,
+                load_enabled: env.parse_or("MIMIC_LOAD_MAX_RUNS", 0_u32)? > 0,
             },
         })
     }

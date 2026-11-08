@@ -21,6 +21,7 @@ use mimic_core::proxy::http1::{CAPTURE_BODY_LIMIT, Captured, Event, RequestHead,
 use crate::access::{self, Outcome};
 use crate::discovery::{Capture, Meta, Tap};
 use crate::listener::Direction;
+use crate::load::Watch;
 use crate::red::ProxyMetrics;
 
 /// Default port of a `Host` header on plain HTTP, removed by the authority normalisation.
@@ -576,6 +577,8 @@ struct Open {
     counted: bool,
     /// The bytes discovery captures (spec §6), when it is on for this connection.
     capture: Option<Capture>,
+    /// The load test run that sent the request (spec §7.8).
+    load_run: Option<String>,
 }
 
 impl Open {
@@ -592,6 +595,7 @@ impl Open {
             tunnel: false,
             counted: false,
             capture: None,
+            load_run: None,
         }
     }
 }
@@ -604,6 +608,8 @@ pub(crate) struct Http1Tracker {
     open: VecDeque<Open>,
     /// Where the exchanges go for discovery.
     tap: Option<Tap>,
+    /// Inbound with load testing on: which requests are a load test's (spec §7.8).
+    watch: Option<Watch>,
 }
 
 impl Http1Tracker {
@@ -612,7 +618,15 @@ impl Http1Tracker {
             ctx,
             open: VecDeque::new(),
             tap: None,
+            watch: None,
         }
+    }
+
+    /// Takes the load runs of the requests from `watch`: those exchanges are not discovered
+    /// and their access line says the run.
+    pub(crate) fn with_watch(mut self, watch: Option<Watch>) -> Http1Tracker {
+        self.watch = watch;
+        self
     }
 
     /// Hands the exchanges to discovery as well.
@@ -633,13 +647,15 @@ impl Http1Tracker {
     pub(crate) fn event(&mut self, event: Event) {
         match event {
             Event::Request(head) => {
+                let run = self.watch.as_ref().and_then(Watch::next_request);
                 let capture = self
                     .tap
                     .as_ref()
-                    .filter(|_| !head.connect)
+                    .filter(|_| !head.connect && run.is_none())
                     .map(Tap::capture);
                 let mut open = Open::new(Some(head));
                 open.capture = capture;
+                open.load_run = run;
                 self.open.push_back(open);
             }
             Event::Captured(captured) => self.captured(captured),
@@ -856,7 +872,7 @@ impl Http1Tracker {
             bytes_out: open.bytes_out,
             mock: None,
             mock_miss: None,
-            load_run: None,
+            load_run: open.load_run.take(),
         });
     }
 }

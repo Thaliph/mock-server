@@ -443,6 +443,7 @@ pub(crate) mod tests {
                 sidecar_resources: ResourceRequirements::default(),
                 sidecar_log: "info".into(),
                 controller_url: "https://mimic.mimic-system.svc:8444".into(),
+                load_enabled: false,
             },
             cache: Arc::new(cache),
             seed: seed.clone(),
