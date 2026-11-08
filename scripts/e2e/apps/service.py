@@ -7,6 +7,8 @@
 #             the Authorization, X-Tenant-Key and Content-Type headers, and the upstream status and body
 #             are returned. Without it, /users/<id> answers JSON (GET and PUT) and any other path 404s, and a
 #             `delay_ms` query parameter (0 to 5000) delays the answer by that many milliseconds.
+#   PROVIDER  optional base URL (an HTTPS provider, MCK-19). With it, /front/provider/<path> is forwarded to
+#             PROVIDER/<path> the same way as /front/<path> to UPSTREAM.
 #
 # Each request writes one JSON access line to stdout: app, method, path, status, peer. Never headers or
 # bodies, so the logs of a test can be checked for canaries.
@@ -22,6 +24,7 @@ import urllib.request
 
 NAME = os.environ.get("APP_NAME", "app")
 UPSTREAM = os.environ.get("UPSTREAM", "").rstrip("/")
+PROVIDER = os.environ.get("PROVIDER", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "8080"))
 FORWARDED = ("Authorization", "X-Tenant-Key", "Content-Type")
 
@@ -59,8 +62,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._route(self._body())
 
     def _route(self, body):
+        if PROVIDER and self.path.startswith("/front/provider/"):
+            return self._forward(body, PROVIDER, "/front/provider")
         if UPSTREAM and self.path.startswith("/front/"):
-            return self._forward(body)
+            return self._forward(body, UPSTREAM, "/front")
         if not UPSTREAM:
             time.sleep(self._delay_ms() / 1000)
         parts = self.path.split("?", 1)[0].split("/")
@@ -75,8 +80,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         values = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("delay_ms", [])
         return min(int(values[0]), 5000) if values and values[0].isdigit() else 0
 
-    def _forward(self, body):
-        target = UPSTREAM + self.path[len("/front"):]
+    def _forward(self, body, base, prefix):
+        target = base + self.path[len(prefix):]
         headers = {name: self.headers[name] for name in FORWARDED if self.headers.get(name)}
         request = urllib.request.Request(
             target, data=None if self.command == "GET" else body, method=self.command, headers=headers

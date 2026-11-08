@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19).
+# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -2252,6 +2252,351 @@ done
 users_after=$(users_log_count) || fail "shr_20: cannot count the access lines of the users pods after the browser run"
 [[ $users_before == "$users_after" ]] || fail "shr_20: the users pods logged $((users_after - users_before)) request(s) during the browser run"
 docker rm -f "$CHROME" >/dev/null 2>&1 || true
+
+# --- Mock mode (F10, spec §8, §12.11 MCK-19; MCK-16 on a live connection) --------------------------------------------
+# front (injected, 2 pods) in mck-19 calls users (disc-22) and an HTTPS provider (mck-19-provider, not injected) in
+# discovery until the egress is pulled. spec.mode mock then answers its calls, a pod created by a scale-up starts in
+# mock, and spec.mode discovery brings the calls back. A keep-alive connection of front's app to users is open across
+# both switches (MCK-16 in the cluster). Each switch waits up to 2 pull intervals (60 s by default) and a status pass.
+log "mck_19: front in discovery calls users and an HTTPS provider; its egress is pulled"
+ns_fresh mck-19 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+ns_fresh mck-19-provider
+issue mck-provider e2e-ca provider.mck-19-provider.svc
+kubectl -n mck-19-provider create secret tls provider-cert --cert="$WORK/mck-provider.crt" --key="$WORK/mck-provider.key" >/dev/null
+kubectl -n mck-19-provider create configmap provider-code --from-file=provider.py=scripts/e2e/apps/provider.py >/dev/null
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: provider, namespace: mck-19-provider}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: provider}}
+  template:
+    metadata: {labels: {app: provider}}
+    spec:
+      containers:
+        - name: provider
+          image: $PY
+          command: [python3, /code/provider.py]
+          ports: [{containerPort: 8443}]
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: certs, mountPath: /certs, readOnly: true}
+      volumes:
+        - {name: code, configMap: {name: provider-code}}
+        - {name: certs, secret: {secretName: provider-cert}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: provider, namespace: mck-19-provider}
+spec:
+  selector: {app: provider}
+  ports: [{name: https, port: 443, targetPort: 8443}]
+YAML
+kubectl -n mck-19-provider rollout status deploy/provider --timeout=2m >/dev/null || fail "mck_19: the provider did not roll out"
+
+# front: the python image derived with the e2e CA (tls_25), so that its HTTPS calls to the provider trust the
+# destination through mimic exactly as the TLS clients do. A MimicWorkload with no mode: discovery.
+kubectl -n mck-19 create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py >/dev/null
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: front, namespace: mck-19}
+spec: {deployment: front}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: front, namespace: mck-19}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: front}}
+  template:
+    metadata: {labels: {app: front}}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: mimic-e2e-python:$TAG
+          imagePullPolicy: Never
+          command: [python3, /code/service.py]
+          env:
+            - {name: APP_NAME, value: front}
+            - {name: UPSTREAM, value: "http://users.disc-22.svc:8080"}
+            - {name: PROVIDER, value: "https://provider.mck-19-provider.svc"}
+          ports: [{name: api, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: api}, periodSeconds: 1}
+          volumeMounts: [{name: code, mountPath: /code, readOnly: true}]
+      volumes:
+        - {name: code, configMap: {name: apps-code}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: front, namespace: mck-19}
+spec:
+  selector: {app: front}
+  ports: [{name: api, port: 8080, targetPort: api}]
+YAML
+kubectl -n mck-19 rollout status deploy/front --timeout=3m >/dev/null \
+  || { kubectl -n mck-19 describe pods -l app=front >&2 || true; fail "mck_19: deployment front did not roll out"; }
+has_mimic mck-19 app=front || fail "mck_19: front was not injected"
+mck_pods=$(kubectl -n mck-19 get pods -l app=front -o jsonpath='{.items[*].metadata.name}')
+[[ $(wc -w <<<"$mck_pods") == 2 ]] || fail "mck_19: front has not 2 pods: '$mck_pods'"
+
+# mck_app_count <namespace> <label> <container> <jq boolean>: the access lines of the pods' container for which the
+# boolean holds, summed over the pods. A failed read is fatal (no pipe hides it).
+mck_app_count() {
+  local pods p log n total=0
+  pods=$(kubectl -n "$1" get pods -l "$2" -o jsonpath='{.items[*].metadata.name}') || return 1
+  [[ -n $pods ]] || return 1
+  for p in $pods; do
+    log=$(kubectl -n "$1" logs "$p" -c "$3") || return 1
+    n=$(jq -R -s "split(\"\n\") | map(fromjson? | select(. != null and (.method? != null) and ($4))) | length" <<< "$log") || return 1
+    total=$((total + n))
+  done
+  echo "$total"
+}
+# mck_users <boolean> / mck_provider <boolean>: the access lines of users (disc-22) and of the provider.
+mck_users() { mck_app_count disc-22 app=users app "$1"; }
+mck_provider() { mck_app_count mck-19-provider app=provider provider "$1"; }
+# mck_sidecar <boolean>: the outbound access lines of the front sidecars for which the boolean holds (summed).
+mck_sidecar() {
+  local p log n total=0
+  for p in $mck_pods_now; do
+    log=$(kubectl -n mck-19 logs "$p" -c mimic-sidecar) || return 1
+    n=$(jq -R -s "split(\"\n\") | map(fromjson? | select(. != null and .target == \"access\" and .direction == \"outbound\" and ($1))) | length" <<< "$log") || return 1
+    total=$((total + n))
+  done
+  echo "$total"
+}
+
+# The calls of front, from the client pod: GETs of users and of the provider, each on a new connection (so that the
+# Service spreads them over both pods), with a canary in the Authorization header. In mock the answers are the
+# recorded ones (any id matches the endpoint); with $3 = 1 one call goes to a path no endpoint has (a miss).
+mck_canary="mck19-$(openssl rand -hex 16)"
+mck_batch() {
+  kubectl -n disc-22-client exec -i client -- python3 - "$mck_canary" "$1" "$2" <<'PY'
+import json, sys, urllib.error, urllib.request
+canary, first, unrecorded = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+base = "http://front.mck-19.svc:8080/front"
+auth = {"Authorization": f"Bearer {canary}", "X-Tenant-Key": canary}
+def get(path):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(base + path, headers=auth), timeout=20) as r:
+            r.read()
+            return r.status
+    except urllib.error.HTTPError as e:
+        e.read()
+        return e.code
+users = [get(f"/users/{first + n}") for n in range(12)]
+provider = [get(f"/provider/rates/{n}") for n in range(4)]
+unrec = get(f"/users/{first}/unrecorded/deep") if unrecorded else None
+print(json.dumps({"users": users, "provider": provider, "unrecorded": unrec}))
+PY
+}
+# mck_batch_ok <json> <expected status>: every call of the batch got that status (the 599 of the unrecorded call aside).
+mck_batch_ok() {
+  jq -e --argjson s "$2" '([.users[], .provider[]] | all(. == $s)) and (.unrecorded == null or .unrecorded == 599)' <<< "$1" >/dev/null
+}
+
+# The egress of a front pod (its sidecar's /egress, loopback through a port-forward) holds the users and the provider.
+mck_snapshot() {
+  local out
+  out=$(sidecar_get mck-19 "$1" /egress) || return 1
+  jq -e '(.authorities | keys | any(startswith("users.disc-22.svc:8080"))) and (.authorities | keys | any(startswith("provider.mck-19-provider.svc")))' <<< "$out" >/dev/null
+}
+
+mck_pods_now=$mck_pods
+# The predicate of a mocked exchange (the access line's `mock` is exact, endpoint or fallback for an answer).
+MOCKED='.mock == "exact" or .mock == "endpoint" or .mock == "fallback"'
+before_users=$(mck_users 'true') || fail "mck_19: cannot count the access lines of the users pods"
+before_provider=$(mck_provider 'true') || fail "mck_19: cannot count the access lines of the provider pod"
+before_mock=$(mck_sidecar '.mock != null') || fail "mck_19: cannot read the sidecar access lines of front"
+discovery_json=$(mck_batch 310000 0) || fail "mck_19: the calls of front in discovery failed"
+mck_batch_ok "$discovery_json" 200 || fail "mck_19: front did not get 200 for every call in discovery: $discovery_json"
+[[ $(mck_users 'true') == $((before_users + 12)) ]] || fail "mck_19: users did not receive the 12 calls of front in discovery"
+[[ $(mck_provider 'true') == $((before_provider + 4)) ]] || fail "mck_19: the provider did not receive the 4 calls of front in discovery"
+[[ $(mck_sidecar '.mock != null') == "$before_mock" ]] || fail "mck_19: a discovery call was counted as mocked"
+
+snap=0
+end=$((SECONDS + 240))
+while (( SECONDS < end )); do
+  all=1
+  for p in $mck_pods; do
+    if ! mck_snapshot "$p"; then all=0; break; fi
+  done
+  if (( all )); then snap=1; break; fi
+  sleep 5
+done
+(( snap )) || fail "mck_19: the egress of front does not hold users and the provider within 4 minutes"
+
+# The live connection: an app-level keep-alive connection of front's app to users, opened in a front pod and driven
+# by a process that waits for files in the container (touch in /tmp/mck-live). Its answers show x-mimic-match.
+live_pod=${mck_pods%% *}
+mck_live_py=$(cat <<'PY'
+import http.client, json, os, time
+D = "/tmp/mck-live"
+os.makedirs(D, exist_ok=True)
+def emit(**kw):
+    print(json.dumps(kw), flush=True)
+def wait(name):
+    end = time.time() + 400
+    while not os.path.exists(f"{D}/{name}"):
+        if time.time() > end:
+            raise SystemExit(f"timeout waiting for {name}")
+        time.sleep(0.2)
+def get(conn, path):
+    conn.request("GET", path, headers={"Authorization": "Bearer live"})
+    r = conn.getresponse()
+    r.read()
+    return r.status, r.getheader("x-mimic-match")
+conn = http.client.HTTPConnection("users.disc-22.svc", 8080, timeout=30)
+emit(step="ready")
+status, match = get(conn, "/users/320001")
+emit(step="discovery", status=status, match=match)
+wait("to-mock")
+status, match = get(conn, "/users/320002")
+emit(step="mock", status=status, match=match)
+wait("to-discovery")
+try:
+    status, match = get(conn, "/users/320003")
+    emit(step="old-connection", status=status, match=match)
+except (http.client.HTTPException, OSError):
+    emit(step="old-connection", closed=True)
+conn.close()
+conn = http.client.HTTPConnection("users.disc-22.svc", 8080, timeout=30)
+status, match = get(conn, "/users/320004")
+emit(step="new-connection", status=status, match=match)
+conn.close()
+emit(step="done")
+PY
+)
+kubectl -n mck-19 exec "$live_pod" -c app -- python3 -u -c "$mck_live_py" > "$WORK/mck19-live.out" 2>&1 &
+live_pid=$!
+PIDS+=("$live_pid")
+# live_step <step>: the JSON line of the live process with that step, or nothing.
+live_step() { jq -R -s --arg s "$1" 'split("\n") | map(fromjson? | select(. != null and .step == $s)) | .[0] // empty' "$WORK/mck19-live.out"; }
+# live_wait <step> <seconds>: polls until the live process printed the step.
+live_wait() {
+  local end=$((SECONDS + $2))
+  while (( SECONDS < end )); do
+    [[ -z $(live_step "$1") ]] || return 0
+    sleep 1
+  done
+  return 1
+}
+live_wait ready 60 || fail "mck_19: the live connection process did not start"
+live_step discovery | jq -e '.status == 200 and .match == null' >/dev/null || fail "mck_19: the live connection in discovery was not forwarded: $(live_step discovery)"
+
+# mode_wait <mode> <pods> <otherPods> <seconds>: the status of front converges (status.mode, MCK-07, MCK-09).
+mode_wait() {
+  local end=$((SECONDS + $4)) s
+  while (( SECONDS < end )); do
+    s=$(kubectl -n mck-19 get mimicworkload front -o jsonpath='{.status.mode}') || return 1
+    if jq -e --arg m "$1" --argjson p "$2" --argjson o "$3" '.mode == $m and .pods == $p and .otherPods == $o' <<< "$s" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+log "mck_19: spec.mode mock makes status.mode converge to mock with 2 pods, and front's calls are answered by mock"
+mock_before_switch=$(mck_sidecar "$MOCKED") || fail "mck_19: cannot read the sidecar access lines of front"
+kubectl -n mck-19 patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}' >/dev/null
+mode_wait mock 2 0 150 || fail "mck_19: status.mode did not converge to mock with 2 pods within 2 pull intervals: $(kubectl -n mck-19 get mimicworkload front -o jsonpath='{.status.mode}')"
+# The live connection: its next request, on the same connection, is answered by mock (MCK-16 on the cluster).
+kubectl -n mck-19 exec "$live_pod" -c app -- touch /tmp/mck-live/to-mock
+live_wait mock 60 || fail "mck_19: the live connection did not answer after the switch to mock"
+live_step mock | jq -e '.status == 200 and (.match == "exact" or .match == "endpoint" or .match == "fallback")' >/dev/null \
+  || fail "mck_19: the live connection in mock was not answered by mock: $(live_step mock)"
+
+users_before_mock=$(mck_users 'true') || fail "mck_19: cannot count the access lines of the users pods"
+provider_before_mock=$(mck_provider 'true') || fail "mck_19: cannot count the access lines of the provider pod"
+mock_json=$(mck_batch 330000 0) || fail "mck_19: the calls of front in mock failed"
+mck_batch_ok "$mock_json" 200 || fail "mck_19: front did not get 200 for every call in mock: $mock_json"
+[[ $(mck_users 'true') == "$users_before_mock" ]] || fail "mck_19: users logged $(( $(mck_users 'true') - users_before_mock )) request(s) in mock"
+[[ $(mck_provider 'true') == "$provider_before_mock" ]] || fail "mck_19: the provider logged a request in mock"
+mocked=$(mck_sidecar "$MOCKED") || fail "mck_19: cannot read the sidecar access lines of front"
+(( mocked - mock_before_switch >= 17 )) || fail "mck_19: the sidecars logged $((mocked - mock_before_switch)) mocked exchanges after the switch, expected 16 (the batch) and the live call"
+# A call to a path no endpoint has gets 599 from mock, and no request leaves for users.
+mock_miss_json=$(mck_batch 330100 1) || fail "mck_19: the call to an unrecorded path failed"
+[[ $(jq -r '.unrecorded' <<< "$mock_miss_json") == 599 ]] || fail "mck_19: a call to an unrecorded path did not get 599: $mock_miss_json"
+misses=$(mck_sidecar '.mock == "miss" and .mock_miss == "endpoint"') || fail "mck_19: cannot read the sidecar access lines of front"
+(( misses >= 1 )) || fail "mck_19: no endpoint miss in the sidecar access lines of front"
+[[ $(mck_users 'true') == "$users_before_mock" ]] || fail "mck_19: users logged a request for the unrecorded path"
+
+log "mck_19: a pod created by a scale-up starts in mock and its first call is answered by mock"
+kubectl -n mck-19 scale deploy/front --replicas=3 >/dev/null
+kubectl -n mck-19 rollout status deploy/front --timeout=3m >/dev/null || fail "mck_19: front did not scale to 3"
+new_pod=""
+for p in $(kubectl -n mck-19 get pods -l app=front -o jsonpath='{.items[*].metadata.name}'); do
+  case " $mck_pods " in *" $p "*) ;; *) new_pod=$p ;; esac
+done
+[[ -n $new_pod ]] || fail "mck_19: no new front pod after the scale-up"
+[[ $(jp mck-19 "$new_pod" '{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_MODE")].value}') == mock ]] \
+  || fail "mck_19: the scale-up pod $new_pod has no MIMIC_MODE=mock"
+mck_pods_now=$(kubectl -n mck-19 get pods -l app=front -o jsonpath='{.items[*].metadata.name}')
+mck_pods=$mck_pods_now
+# Its sidecar started in mock from the environment, not from a pull.
+kubectl -n mck-19 logs "$new_pod" -c mimic-sidecar \
+  | jq -R -e -s 'split("\n") | map(fromjson? | select(. != null and .message == "mode changed" and .mode == "mock" and .source == "env")) | length > 0' >/dev/null \
+  || fail "mck_19: the sidecar of $new_pod did not log mode changed to mock from the environment"
+end=$((SECONDS + 120))
+new_snap=0
+while (( SECONDS < end )); do
+  if mck_snapshot "$new_pod"; then new_snap=1; break; fi
+  sleep 3
+done
+(( new_snap )) || fail "mck_19: the scale-up pod did not pull the egress with users and the provider"
+mode_wait mock 3 0 150 || fail "mck_19: status.mode did not show 3 pods in mock: $(kubectl -n mck-19 get mimicworkload front -o jsonpath='{.status.mode}')"
+new_users_before=$(mck_users 'true') || fail "mck_19: cannot count the access lines of the users pods"
+new_call=$(kubectl -n mck-19 exec "$new_pod" -c app -- python3 -c '
+import json, urllib.request, urllib.error
+try:
+    with urllib.request.urlopen("http://users.disc-22.svc:8080/users/340001", timeout=20) as r:
+        r.read(); print(json.dumps({"status": r.status, "match": r.headers.get("x-mimic-match")}))
+except urllib.error.HTTPError as e:
+    print(json.dumps({"status": e.code, "match": None}))
+' 2>&1) || fail "mck_19: the first call of $new_pod failed"
+jq -e '.status == 200 and (.match == "exact" or .match == "endpoint" or .match == "fallback")' <<< "$new_call" >/dev/null \
+  || fail "mck_19: the first call of $new_pod was not answered by mock: $new_call"
+[[ $(mck_users 'true') == "$new_users_before" ]] || fail "mck_19: users logged the first call of $new_pod"
+
+log "mck_19: spec.mode discovery brings the calls back to users and the provider, and the live connection is forwarded again"
+kubectl -n mck-19 patch mimicworkload front --type merge -p '{"spec":{"mode":"discovery"}}' >/dev/null
+mode_wait discovery 3 0 150 || fail "mck_19: status.mode did not converge to discovery with otherPods 0 within 2 pull intervals: $(kubectl -n mck-19 get mimicworkload front -o jsonpath='{.status.mode}')"
+kubectl -n mck-19 exec "$live_pod" -c app -- touch /tmp/mck-live/to-discovery
+live_wait done 150 || fail "mck_19: the live connection process did not finish after the switch to discovery"
+wait "$live_pid" || fail "mck_19: the live connection process failed"
+[[ $(live_step old-connection | jq -r '(.closed // false) or (.match == null)') == true ]] \
+  || fail "mck_19: the mocked connection answered after the switch to discovery: $(live_step old-connection)"
+live_step new-connection | jq -e '.status == 200 and .match == null' >/dev/null \
+  || fail "mck_19: the new connection after the switch was not forwarded: $(live_step new-connection)"
+[[ $(mck_app_count disc-22 app=users app '.path == "/users/320001"') == 1 ]] || fail "mck_19: users did not get the forwarded live call before the switch"
+[[ $(mck_app_count disc-22 app=users app '.path == "/users/320002"') == 0 ]] || fail "mck_19: users got the live call that mock answered"
+[[ $(mck_app_count disc-22 app=users app '.path == "/users/320004"') == 1 ]] || fail "mck_19: users did not get the live call of the new connection"
+
+users_before_disc=$(mck_users 'true') || fail "mck_19: cannot count the access lines of the users pods"
+provider_before_disc=$(mck_provider 'true') || fail "mck_19: cannot count the access lines of the provider pod"
+mock_before_disc=$(mck_sidecar '.mock != null') || fail "mck_19: cannot read the sidecar access lines of front"
+disc_json=$(mck_batch 350000 0) || fail "mck_19: the calls of front after the switch failed"
+mck_batch_ok "$disc_json" 200 || fail "mck_19: front did not get 200 for every call after the switch: $disc_json"
+[[ $(mck_users 'true') == $((users_before_disc + 12)) ]] || fail "mck_19: users did not receive the 12 calls of front after the switch"
+[[ $(mck_provider 'true') == $((provider_before_disc + 4)) ]] || fail "mck_19: the provider did not receive the 4 calls of front after the switch"
+[[ $(mck_sidecar '.mock != null') == "$mock_before_disc" ]] || fail "mck_19: a call after the switch to discovery was mocked"
+
+# No canary that front sends is in a log line of the cluster: front, users, the provider, the client and the controller.
+for ns in mck-19 mck-19-provider disc-22 disc-22-client; do
+  for p in $(kubectl -n "$ns" get pods -o jsonpath='{.items[*].metadata.name}'); do
+    kubectl -n "$ns" logs "$p" --all-containers --tail=-1 > "$WORK/mck19-$ns-$p.log" || fail "mck_19: cannot read the logs of $p"
+    if found -F "$mck_canary" "$WORK/mck19-$ns-$p.log"; then fail "mck_19: a canary of front appears in the logs of $p"; fi
+  done
+done
+kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/mck19-controller.log" \
+  || fail "mck_19: cannot read the controller logs"
+if found -F "$mck_canary" "$WORK/mck19-controller.log"; then fail "mck_19: a canary of front appears in the controller logs"; fi
+
+kubectl delete namespace mck-19 mck-19-provider --wait=false >/dev/null
 
 kubectl delete namespace disc-22 disc-22-client egr-19 --wait=false >/dev/null
 
