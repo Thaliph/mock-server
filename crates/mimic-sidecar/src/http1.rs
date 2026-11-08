@@ -15,13 +15,14 @@ use std::io;
 use std::pin::pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mimic_core::proxy::http1::{Codec, Event};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::access::Outcome;
+use crate::mock::Mock;
 use crate::opaque::{Side, abort, failed};
 use crate::transport::Stream;
 
@@ -44,6 +45,10 @@ pub struct Relayed {
     pub unanswered: usize,
     /// Payload bytes of the request body left incomplete, and of the response body.
     pub partial_body: (u64, u64),
+    /// The mode switched to `mock` between two requests: the client bytes read and not
+    /// forwarded, and when the first of them arrived. The destination connection is closed;
+    /// the client side is left as it is, for the mock to continue.
+    pub handover: Option<(Vec<u8>, Instant)>,
 }
 
 type Failure = (Side, io::Error);
@@ -73,6 +78,14 @@ struct Relay<F> {
     closed_first: AtomicU8,
     to_upstream: AtomicU64,
     to_client: AtomicU64,
+    /// Outbound discovery connections: the mock that takes the connection when the mode
+    /// switches to `mock` (spec §8 "Switching").
+    mock: Option<Mock>,
+    /// The client pump stopped before the first byte of a request read after the switch.
+    handover: Mutex<Option<(Vec<u8>, Instant)>>,
+    handed: Notify,
+    /// The connection became a tunnel (or unframed) after the switch: mock does not keep it.
+    mock_close: Notify,
 }
 
 impl<F: FnMut(Event)> Relay<F> {
@@ -86,7 +99,25 @@ impl<F: FnMut(Event)> Relay<F> {
         for event in events {
             (state.on_event)(event);
         }
+        let opaque = state.codec.is_opaque();
+        drop(state);
+        if opaque {
+            self.close_if_mock();
+        }
         out
+    }
+
+    /// An opaque connection (a tunnel, or unframed) is closed once the mode is `mock`.
+    fn close_if_mock(&self) {
+        if self.mock.as_ref().is_some_and(Mock::active) {
+            self.mock_close.notify_one();
+        }
+    }
+
+    /// Whether the mode is `mock` and the next client byte starts a request.
+    fn switching(&self) -> bool {
+        self.mock.as_ref().is_some_and(Mock::active)
+            && self.with(|codec| (codec.between_requests(), Vec::new()))
     }
 
     /// While stopping, ends the relay once nothing is pending and nothing is half-read.
@@ -114,6 +145,7 @@ impl<F: FnMut(Event)> Relay<F> {
     ) -> Result<(), Failure> {
         let mut buf = vec![0u8; CHUNK];
         let mut held = first;
+        let mut read_at = Instant::now();
         self.to_upstream
             .fetch_add(held.len() as u64, Ordering::Relaxed);
         loop {
@@ -127,7 +159,25 @@ impl<F: FnMut(Event)> Relay<F> {
                     return fin(upstream, Side::Upstream).await;
                 }
                 self.to_upstream.fetch_add(n as u64, Ordering::Relaxed);
+                read_at = Instant::now();
                 held.extend_from_slice(&buf[..n]);
+            }
+            // The mode is read when a request's first byte is read: after a switch to mock
+            // the request is not forwarded. The earlier ones are answered first.
+            if self.switching() {
+                while self.with(|codec| (codec.pending() > 0, Vec::new()))
+                    && !self.server_closed.load(Ordering::Acquire)
+                {
+                    self.unblocked.notified().await;
+                }
+                self.to_upstream
+                    .fetch_sub(held.len() as u64, Ordering::Relaxed);
+                *self
+                    .handover
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((held, read_at));
+                self.handed.notify_one();
+                return Ok(());
             }
             let used = self.with(|codec| codec.client_bytes_limited(&held));
             if used == 0 {
@@ -212,6 +262,17 @@ async fn close_idle(client: &mut Stream, upstream: &mut Stream) {
     .await;
 }
 
+/// Closes the destination side with a FIN once every answer was read, then reads and drops
+/// what it still sends until it closes (or [`IDLE_DRAIN`] passes): no reset.
+async fn close_upstream(upstream: &mut Stream) {
+    let _ = tokio::time::timeout(IDLE_DRAIN, async {
+        let _ = upstream.shutdown().await;
+        let mut buf = vec![0u8; CHUNK];
+        while matches!(upstream.read(&mut buf).await, Ok(n) if n > 0) {}
+    })
+    .await;
+}
+
 /// Relays one HTTP/1 connection until both sides are done, a side fails (the other one gets a
 /// reset), `stop` resolves and the connection is idle (no byte added: both sides see a FIN),
 /// or `abort_signal` resolves. `first` are the client bytes already read (by protocol
@@ -224,16 +285,30 @@ pub async fn relay(
     stop: impl Future<Output = ()> + Send,
     abort_signal: impl Future<Output = ()> + Send,
 ) -> Relayed {
-    relay_with(client, upstream, first, false, on_event, stop, abort_signal).await
+    relay_with(
+        client,
+        upstream,
+        first,
+        false,
+        None,
+        on_event,
+        stop,
+        abort_signal,
+    )
+    .await
 }
 
 /// [`relay`], with a codec that also reports [`Event::Captured`] when `capture` is set (the
-/// discovery tap, spec §6).
+/// discovery tap, spec §6). With a `mock`, the relay ends when the mode switches to `mock`:
+/// before the first byte of the next request (see [`Relayed::handover`]), or at once for a
+/// connection that became a tunnel (outcome `MockClosed`).
+#[allow(clippy::too_many_arguments)]
 pub async fn relay_with(
     client: &mut Stream,
     upstream: &mut Stream,
     first: Vec<u8>,
     capture: bool,
+    mock: Option<Mock>,
     on_event: impl FnMut(Event) + Send,
     stop: impl Future<Output = ()> + Send,
     abort_signal: impl Future<Output = ()> + Send,
@@ -256,12 +331,25 @@ pub async fn relay_with(
         closed_first: AtomicU8::new(NONE),
         to_upstream: AtomicU64::new(0),
         to_client: AtomicU64::new(0),
+        mock,
+        handover: Mutex::new(None),
+        handed: Notify::new(),
+        mock_close: Notify::new(),
     };
+    let mut mock_closed = false;
+    let mut handed = false;
     let ended = {
         let mut abort_signal = pin!(abort_signal);
         let mut stop = pin!(stop);
         let mut stopping = false;
         let mut idle_close = false;
+        let mut entered = pin!(async {
+            match &relay.mock {
+                Some(mock) => mock.entered().await,
+                None => std::future::pending().await,
+            }
+        });
+        let mut entered_seen = false;
         let (mut client_read, mut client_write) = tokio::io::split(&mut *client);
         let (mut upstream_read, mut upstream_write) = tokio::io::split(&mut *upstream);
         let mut pumps = pin!(async {
@@ -285,6 +373,21 @@ pub async fn relay_with(
                     idle_close = true;
                     break Ok(());
                 }
+                () = &mut entered, if !entered_seen => {
+                    entered_seen = true;
+                    // A tunnel is not kept by the mock (a request is handed over when it is read).
+                    if relay.with(|codec| (codec.is_opaque(), Vec::new())) {
+                        relay.close_if_mock();
+                    }
+                }
+                () = relay.mock_close.notified() => {
+                    mock_closed = true;
+                    break Ok(());
+                }
+                () = relay.handed.notified() => {
+                    handed = true;
+                    break Ok(());
+                }
             }
         }
         .map(|()| idle_close)
@@ -293,6 +396,9 @@ pub async fn relay_with(
     // sides, and what the client sent meanwhile is read and dropped before the caller closes.
     if matches!(ended, Ok(true)) {
         close_idle(client, upstream).await;
+    }
+    if handed {
+        close_upstream(upstream).await;
     }
     let ended = ended.map(|_| ());
     let unanswered = relay.with(|codec| (codec.pending(), Vec::new()));
@@ -303,6 +409,7 @@ pub async fn relay_with(
         )
     });
     let (outcome, error) = match ended {
+        Ok(()) if mock_closed => (Outcome::MockClosed, None),
         Ok(()) if unanswered > 0 && relay.closed_first.load(Ordering::Relaxed) == CLIENT => {
             (Outcome::ClientAbort, None)
         }
@@ -327,6 +434,11 @@ pub async fn relay_with(
         to_client: relay.to_client.load(Ordering::Relaxed),
         unanswered,
         partial_body,
+        handover: relay
+            .handover
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
     }
 }
 

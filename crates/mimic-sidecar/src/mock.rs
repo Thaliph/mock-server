@@ -42,7 +42,7 @@ use crate::exchange::Ctx;
 use crate::transport::Stream;
 
 type BoxError = Box<dyn Error + Send + Sync>;
-type MockBody = BoxBody<Bytes, Infallible>;
+pub(crate) type MockBody = BoxBody<Bytes, Infallible>;
 
 const PROTOCOL_H1: &str = "http1";
 const PROTOCOL_H2: &str = "h2";
@@ -195,6 +195,16 @@ impl Mock {
     /// True while the sidecar answers outbound traffic itself.
     pub(crate) fn active(&self) -> bool {
         self.0.snapshot.mode().mode() == Mode::Mock
+    }
+
+    /// Resolves once the mode is `mock`, at once when it is.
+    pub(crate) async fn entered(&self) {
+        self.0.snapshot.mode().reaches(Mode::Mock).await;
+    }
+
+    /// Resolves once the mode is `discovery`, at once when it is.
+    pub(crate) async fn left(&self) {
+        self.0.snapshot.mode().reaches(Mode::Discovery).await;
     }
 
     pub(crate) fn connection(&self, decision: &'static str) {
@@ -444,7 +454,7 @@ impl Drop for Open<'_> {
 }
 
 /// One mocked connection.
-struct Conn {
+pub(crate) struct Conn {
     streams: Streams,
     mock: Mock,
     ctx: Ctx,
@@ -646,6 +656,13 @@ impl Mock {
             .max_headers(MAX_HEAD_LINES)
             .serve_connection(io, service);
         let mut served = std::pin::pin!(served);
+        // The end of the grace, or a switch back to discovery (spec §8 "Switching").
+        let stopped = async {
+            tokio::select! {
+                () = stopped => {}
+                () = self.left() => {}
+            }
+        };
         let ended = tokio::select! {
             r = served.as_mut() => Some(r),
             () = stopped => {
@@ -693,6 +710,12 @@ impl Mock {
             .max_header_list_size(MAX_HEAD as u32)
             .serve_connection(TokioIo::new(stream), Service(conn.clone()));
         let mut served = std::pin::pin!(served);
+        let stopped = async {
+            tokio::select! {
+                () = stopped => {}
+                () = self.left() => {}
+            }
+        };
         let mut stopped = std::pin::pin!(stopped);
         // A connection with no stream open for `idle` gets `GOAWAY`, as the header-read
         // timeout of an HTTP/1 mocked connection closes it (spec §8): one deadline, moved
@@ -766,8 +789,23 @@ impl Mock {
     }
 }
 
+impl Mock {
+    /// The mocked side of a forwarded `h2` connection that switched to mock: its next streams
+    /// are answered by [`Conn::serve`].
+    pub(crate) fn switched_h2(&self, ctx: Ctx) -> Arc<Conn> {
+        self.connection("mocked");
+        Arc::new(Conn {
+            streams: Streams::new(),
+            mock: self.clone(),
+            ctx,
+            clock: None,
+            protocol: PROTOCOL_H2,
+        })
+    }
+}
+
 impl Conn {
-    async fn serve(
+    pub(crate) async fn serve(
         self: &Arc<Conn>,
         request: Request<Incoming>,
     ) -> Result<Response<MockBody>, BoxError> {

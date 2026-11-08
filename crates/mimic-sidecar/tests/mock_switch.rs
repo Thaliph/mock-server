@@ -120,7 +120,10 @@ async fn mck_16_http1_keep_alive_request_after_the_switch_is_mocked_and_the_dest
     switch(&rig, Mode::Mock).await;
     tcp.write_all(REQUEST.as_bytes()).await.unwrap();
     let second = read_response(&mut tcp).await;
-    assert!(second.starts_with("HTTP/1.1 200") && matched(&second), "{second}");
+    assert!(
+        second.starts_with("HTTP/1.1 200") && matched(&second),
+        "{second}"
+    );
     eventually("the destination sees its connection closed", || {
         rig.closed.load(Ordering::SeqCst) == 1
     })
@@ -130,6 +133,26 @@ async fn mck_16_http1_keep_alive_request_after_the_switch_is_mocked_and_the_dest
     tcp.write_all(REQUEST.as_bytes()).await.unwrap();
     assert!(matched(&read_response(&mut tcp).await));
     assert_eq!(rig.accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn mck_16_a_passthrough_connection_keeps_forwarding_after_the_switch() {
+    let rig = forwarding_rig(Options {
+        passthrough: "users.test",
+        ..Options::default()
+    })
+    .await;
+    let mut tcp = TcpStream::connect(rig.addr).await.unwrap();
+    tcp.write_all(REQUEST.as_bytes()).await.unwrap();
+    let first = read_response(&mut tcp).await;
+    assert!(first.ends_with("ok"), "{first}");
+    switch(&rig, Mode::Mock).await;
+    tcp.write_all(REQUEST.as_bytes()).await.unwrap();
+    eventually("the second request reaches the destination", || {
+        rig.received.lock().unwrap().len() == 2 * REQUEST.len()
+    })
+    .await;
+    assert_eq!(rig.closed.load(Ordering::SeqCst), 0);
 }
 
 /// An `h2c` destination that counts its connections, requests and ended connections.
@@ -163,7 +186,9 @@ async fn h2_destination() -> H2Dest {
             tokio::spawn(async move {
                 let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
                     requests.fetch_add(1, Ordering::SeqCst);
-                    async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok")))) }
+                    async {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    }
                 });
                 let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(tcp), service)

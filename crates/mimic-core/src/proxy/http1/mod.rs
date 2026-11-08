@@ -514,6 +514,17 @@ impl Codec {
             && matches!(&self.resp, RespState::Head(scanner) if scanner.is_fresh())
     }
 
+    /// No request is half-read and the connection is still framed: the next client byte starts
+    /// a request (responses to earlier ones may be pending).
+    pub fn between_requests(&self) -> bool {
+        !self.opaque && matches!(&self.req, ReqState::Head(scanner) if scanner.is_fresh())
+    }
+
+    /// Unframed or tunnelled: the codec no longer parses.
+    pub fn is_opaque(&self) -> bool {
+        self.opaque
+    }
+
     /// Payload bytes of the request body being read, 0 between two requests.
     pub fn request_body_bytes(&self) -> u64 {
         match &self.req {

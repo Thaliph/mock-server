@@ -168,6 +168,8 @@ struct Inner {
     gauge: Gauge,
     /// Counts the changes of mode: a period of the miss log (spec §8) is one value.
     epoch: AtomicU64,
+    /// The mode, for the connections that wait for a change of it (spec §8 "Switching").
+    watch: tokio::sync::watch::Sender<Mode>,
 }
 
 /// The mode and latency factor of the sidecar, shared between the pull client and its readers.
@@ -193,6 +195,7 @@ impl ModeState {
             state_file: config.state_file.clone(),
             gauge: Gauge::default(),
             epoch: AtomicU64::new(0),
+            watch: tokio::sync::watch::Sender::new(config.mode),
         }))
     }
 
@@ -224,6 +227,7 @@ impl ModeState {
             }
         }
         let (mode, factor) = state.get();
+        state.0.watch.send_replace(mode);
         state.0.gauge.set(i64::from(mode == Mode::Mock));
         changed(mode, None, factor, source);
         state
@@ -248,6 +252,14 @@ impl ModeState {
     /// Changes with each change of mode.
     pub fn epoch(&self) -> u64 {
         self.0.epoch.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the mode is `mode` (at once when it is). Used by open connections to
+    /// notice a switch.
+    pub async fn reaches(&self, mode: Mode) {
+        let mut watch = self.0.watch.subscribe();
+        // The sender lives as long as `self`.
+        let _ = watch.wait_for(|current| *current == mode).await;
     }
 
     /// The latency factor in hundredths.
@@ -287,6 +299,7 @@ impl ModeState {
                 self.0.epoch.fetch_add(1, Ordering::AcqRel);
             }
         }
+        self.0.watch.send_replace(mode);
         self.0.gauge.set(i64::from(mode == Mode::Mock));
         changed(mode, Some(previous), factor, Source::Pull);
     }

@@ -8,16 +8,21 @@
 use std::future::Future;
 use std::io;
 use std::pin::{Pin, pin};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 
+use http_body_util::BodyExt;
+use http_body_util::combinators::UnsyncBoxBody;
+use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Request, Response, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::discovery::Tap;
-use crate::exchange::{self, Ctx, ReqBody, RespBody, Tracker};
+use crate::exchange::{self, Ctx, ReqBody, Tracker};
+use crate::mock::{self, Mock};
 use crate::transport::Stream;
 
 const PROTOCOL: &str = "h2";
@@ -69,8 +74,19 @@ impl AsyncWrite for Replay {
 struct State {
     ctx: Ctx,
     tap: Option<Tap>,
-    sender: hyper::client::conn::http2::SendRequest<ReqBody>,
+    /// Taken when the connection switches to mock (spec §8 "Switching"): the destination
+    /// connection ends once the streams in flight have.
+    sender: Mutex<Option<hyper::client::conn::http2::SendRequest<ReqBody>>>,
+    /// Outbound discovery connections only: the mock that takes the streams opened after a
+    /// switch to `mock`.
+    mock: Option<Mock>,
+    mocked: OnceLock<Arc<mock::Conn>>,
+    /// The destination connection was let go on purpose: its end is no failure.
+    switched: AtomicBool,
 }
+
+/// The body of a forwarded or mocked answer.
+type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// Relays the HTTP/2 streams of `client` (whose first bytes, `replay`, were already read) to
 /// `upstream` until one side closes. A stream the destination fails is reset alone.
@@ -81,7 +97,7 @@ pub async fn relay(
     ctx: Ctx,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    relay_with(client, upstream, replay, ctx, None, stop).await
+    relay_with(client, upstream, replay, ctx, None, None, stop).await
 }
 
 /// Like [`relay`], with the exchanges also handed to the discovery `tap` (spec §6).
@@ -91,6 +107,7 @@ pub(crate) async fn relay_with(
     replay: Vec<u8>,
     ctx: Ctx,
     tap: Option<Tap>,
+    mock: Option<Mock>,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let (sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -100,8 +117,12 @@ pub(crate) async fn relay_with(
     let state = Arc::new(State {
         ctx: ctx.clone(),
         tap,
-        sender,
+        sender: Mutex::new(Some(sender)),
+        mock,
+        mocked: OnceLock::new(),
+        switched: AtomicBool::new(false),
     });
+    let shared = state.clone();
     let service = service_fn(move |req| forward(state.clone(), req));
     let io = TokioIo::new(Replay {
         prefix: replay,
@@ -112,12 +133,17 @@ pub(crate) async fn relay_with(
         .auto_date_header(false)
         .serve_connection(io, service);
     let mut server = pin!(server);
-    let mut driver = pin!(driver);
+    // Dropped as soon as it is done: a finished client connection still holds its handle on
+    // the destination socket, which would stay open.
+    let mut driver = Some(Box::pin(driver));
 
     let mut stop = pin!(stop);
     let mut stopping = false;
     let mut driver_done = false;
     loop {
+        if driver_done {
+            driver = None;
+        }
         tokio::select! {
             served = server.as_mut() => return finish(&ctx, served),
             () = &mut stop, if !stopping => {
@@ -125,13 +151,26 @@ pub(crate) async fn relay_with(
                 // Shutdown: GOAWAY, streams in flight finish.
                 server.as_mut().graceful_shutdown();
             }
-            _ = &mut driver, if !driver_done => {
+            () = connection_done(&mut driver), if !driver_done => {
                 driver_done = true;
                 // The destination connection ended: streams in flight finish or fail, and
-                // the client is told to open no new one (GOAWAY).
-                server.as_mut().graceful_shutdown();
+                // the client is told to open no new one (GOAWAY), unless it was let go of
+                // because the connection continues as mocked.
+                if !shared.switched.load(Ordering::Acquire) {
+                    server.as_mut().graceful_shutdown();
+                }
             }
         }
+    }
+}
+
+/// Resolves when the destination connection ends; never when it is gone already.
+async fn connection_done<F: Future + Unpin>(connection: &mut Option<F>) {
+    match connection {
+        Some(connection) => {
+            let _ = connection.await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -159,19 +198,42 @@ fn finish(ctx: &Ctx, served: Result<(), hyper::Error>) -> io::Result<()> {
 async fn forward(
     state: Arc<State>,
     req: Request<hyper::body::Incoming>,
-) -> Result<Response<RespBody>, hyper::Error> {
+) -> Result<Response<Body>, Box<dyn std::error::Error + Send + Sync>> {
+    // A stream opened after the switch to mock is never forwarded (spec §8 "Switching").
+    if let Some(mock) = state.mock.as_ref().filter(|mock| mock.active()) {
+        state.switched.store(true, Ordering::Release);
+        state
+            .sender
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let conn = state
+            .mocked
+            .get_or_init(|| mock.switched_h2(state.ctx.clone()));
+        let answered = conn.serve(req).await?;
+        return Ok(answered.map(|body| body.map_err(|never| match never {}).boxed_unsync()));
+    }
+    let sender = state
+        .sender
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let Some(mut sender) = sender else {
+        // The destination connection was let go of by a switch, and the mode went back to
+        // discovery since: the client opens a new connection.
+        return Err("destination connection closed".into());
+    };
     let (tracker, req) = Tracker::start(&state.ctx, PROTOCOL, state.tap.as_ref(), req);
-    let mut sender = state.sender.clone();
     let sent = async {
         sender.ready().await?;
         sender.send_request(req).await
     }
     .await;
     match sent {
-        Ok(response) => Ok(tracker.answered(response)),
+        Ok(response) => Ok(tracker.answered(response).map(BodyExt::boxed_unsync)),
         Err(e) => {
             tracker.failed();
-            Err(e)
+            Err(e.into())
         }
     }
 }
