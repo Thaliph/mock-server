@@ -901,4 +901,5 @@ fn ctl_18_the_logged_set_stays_bounded_for_deployments_that_never_come_back() {
 }
 
 mod digest;
+mod load;
 mod v2;

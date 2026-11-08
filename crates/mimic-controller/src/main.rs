@@ -181,6 +181,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         max_egress: config.push.max_egress,
         egress: sidecar_api::EgressCache::new(config.push.egress_budget, &api_metrics),
         egress_logged: sidecar_api::EgressLogged::default(),
+        load: None,
     });
     let webhook_listener = tokio::net::TcpListener::bind(webhook.addr).await?;
     tracing::info!(addr = %webhook_listener.local_addr()?, "webhook listening");

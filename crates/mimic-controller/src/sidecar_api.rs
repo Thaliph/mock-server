@@ -40,6 +40,7 @@ use crate::workloads::WorkloadCache;
 
 mod admission;
 mod egress;
+pub mod load;
 
 pub use admission::{BodyBudget, RateLimiter, ReviewCache};
 pub use egress::Cache as EgressCache;
@@ -314,6 +315,8 @@ pub struct SidecarApi {
     pub egress: egress::Cache,
     /// What `egress_limit` warnings were written already.
     pub egress_logged: egress::Logged,
+    /// The load routes (spec §7.8); absent when load tests are disabled.
+    pub load: Option<load::LoadApi>,
 }
 
 pub fn router(api: Arc<SidecarApi>) -> Router {
@@ -822,6 +825,8 @@ async fn read_exact(body: Body, length: usize) -> Result<Vec<u8>, Refusal> {
 }
 
 #[cfg(test)]
+mod load_tests;
+#[cfg(test)]
 mod push_tests;
 
 #[cfg(test)]
@@ -990,6 +995,7 @@ mod tests {
             max_egress: 4 << 20,
             egress: egress::Cache::new(32 << 20, &api_metrics),
             egress_logged: egress::Logged::default(),
+            load: None,
         });
         Setup {
             router: router(api),
