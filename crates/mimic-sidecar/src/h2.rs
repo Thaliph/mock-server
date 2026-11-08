@@ -123,6 +123,7 @@ pub(crate) async fn relay_with(
         switched: AtomicBool::new(false),
     });
     let shared = state.clone();
+    let left = state.mock.clone();
     let service = service_fn(move |req| forward(state.clone(), req));
     let io = TokioIo::new(Replay {
         prefix: replay,
@@ -140,6 +141,7 @@ pub(crate) async fn relay_with(
     let mut stop = pin!(stop);
     let mut stopping = false;
     let mut driver_done = false;
+    let mut leaving = false;
     loop {
         if driver_done {
             driver = None;
@@ -149,6 +151,16 @@ pub(crate) async fn relay_with(
             () = &mut stop, if !stopping => {
                 stopping = true;
                 // Shutdown: GOAWAY, streams in flight finish.
+                server.as_mut().graceful_shutdown();
+            }
+            () = async {
+                match &left {
+                    Some(mock) => mock.left().await,
+                    None => std::future::pending().await,
+                }
+            }, if !leaving && shared.switched.load(Ordering::Acquire) => {
+                leaving = true;
+                // Back to discovery: the mocked streams in flight finish, then GOAWAY.
                 server.as_mut().graceful_shutdown();
             }
             () = connection_done(&mut driver), if !driver_done => {
