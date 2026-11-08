@@ -469,9 +469,12 @@ for object in job/plain-job networkpolicy/plain-np; do
   found -F "metadata labels must be those of spec 7.8" <<<"$out" \
     || fail "ldt_17: the refusal of the delete of $object does not name the labels: $out"
 done
-jq '.spec.suspend = true' "$WORK/job.json" > "$WORK/job-own.json"
+# Without the owner reference: its MimicLoadTest does not exist, so the garbage collector
+# would delete the objects before the controller does.
+jq '.spec.suspend = true | del(.metadata.ownerReferences)' "$WORK/job.json" > "$WORK/job-own.json"
+jq 'del(.metadata.ownerReferences)' "$WORK/np.json" > "$WORK/np-own.json"
 kubectl create -f "$WORK/job-own.json" >/dev/null || fail "ldt_17: the controller's Job was not created by the admin"
-kubectl create -f "$WORK/np.json" >/dev/null || fail "ldt_17: the controller's NetworkPolicy was not created by the admin"
+kubectl create -f "$WORK/np-own.json" >/dev/null || fail "ldt_17: the controller's NetworkPolicy was not created by the admin"
 jq --arg ns "$PLAIN_NS" '.metadata.namespace = $ns | .metadata.name = "orphan-job"' "$WORK/job-own.json" > "$WORK/orphan.json"
 kubectl create -f "$WORK/orphan.json" >/dev/null || fail "ldt_17: the orphan Job was not created by the admin"
 kubectl --as="$CTL" delete -n "$LOAD_NS" job/mimic-load-550e8400e29b >/dev/null \
