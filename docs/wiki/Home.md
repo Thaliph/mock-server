@@ -37,6 +37,7 @@ the spec disagree, the spec wins.
 | Page | Content |
 |---|---|
 | [Concepts](Concepts) | Components, data flow, injection, discovery and mock modes |
+| [Mock mode](Mock-mode) | Answering outbound calls from the recorded egress, and switching it live |
 | [Install](Install) | Requirements, `helm install` from a clone, upgrade, uninstall, the PVC upgrade note |
 | [Quick start](Quick-start) | Two Python services, discovery, the merged report |
 | [Configuration](Configuration) | `MimicWorkload` fields, Helm values, `MIMIC_*` variables |
@@ -55,8 +56,6 @@ the spec disagree, the spec wins.
 Planned, **not available yet**; nothing in this wiki depends on it.
 
 - **F6, UI.** OpenAPI 3.1 document and Swagger UI per deployment, on the read API listener.
-- **F10, mock mode.** Answer a deployment's egress calls from recorded responses, and switch back to
-  discovery.
 - **F11, load testing** of one workload in isolation.
 
 Traces are out of scope; mesh traffic management is a later version.

@@ -22,8 +22,8 @@ Yes, for HTTP and intercepted HTTPS: each sidecar records the calls and the cont
 deployment. See [Egress aggregation](Egress-aggregation).
 
 **Can I mock a dependency or load-test?**
-Not yet: mock mode (F10) and load testing (F11) are planned. `spec.mode: mock` is accepted but does
-nothing.
+Mock mode (F10) is available: `spec.mode: mock` answers a Deployment's outbound calls from its recorded egress,
+and the real destination is not called. See [Mock mode](Mock-mode). Load testing (F11) is still planned.
 
 **Is there a UI or an OpenAPI file?**
 Planned (F6). Today use the JSON [read API](Reading-the-API).
