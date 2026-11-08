@@ -423,6 +423,21 @@ pub fn patch(
                 json!({ DEPLOYMENT_LABEL: deployment }),
             ));
         }
+    } else if pod
+        .metadata
+        .labels
+        .as_ref()
+        .is_some_and(|labels| labels.contains_key(DEPLOYMENT_LABEL))
+    {
+        // No label for a name too long for one, and the pod's own label under the key would
+        // make it a target of another deployment: it goes (INJ-03). Only when present, since
+        // `remove` of an absent path fails the whole patch.
+        let key = DEPLOYMENT_LABEL.replace('/', "~1");
+        ops.push(JsonPatchOp {
+            op: "remove",
+            path: format!("/metadata/labels/{key}"),
+            value: serde_json::Value::Null,
+        });
     }
     for (i, c) in spec.iter().flat_map(|s| &s.containers).enumerate() {
         for (field, kind, probe) in probes_of(c) {
@@ -1194,6 +1209,43 @@ mod tests {
             doc["metadata"]["labels"]
                 .get("mimic.platform.io/deployment")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn ldt_20_a_long_name_removes_a_deployment_label_the_pod_carries() {
+        // When the deployment name is too long for a label, a label under the key that the pod
+        // carries itself (say, for another deployment) is removed, so the pod is no load test
+        // target. Only then: `remove` of an absent path would fail the whole patch (§7.8, INJ-03).
+        let long = "a".repeat(64);
+        let mut p = pod();
+        p.metadata
+            .labels
+            .get_or_insert_default()
+            .insert("mimic.platform.io/deployment".into(), "other".into());
+        let ops = patch(&p, &long, &cfg(), &wiring()).unwrap();
+        let removes: Vec<&JsonPatchOp> = ops.iter().filter(|op| op.op == "remove").collect();
+        assert_eq!(removes.len(), 1, "{ops:?}");
+        assert_eq!(
+            removes[0].path,
+            "/metadata/labels/mimic.platform.io~1deployment"
+        );
+        let doc = apply_with_deployment(&p, &long);
+        assert!(
+            doc["metadata"]["labels"]
+                .get("mimic.platform.io/deployment")
+                .is_none()
+        );
+        assert_eq!(doc["metadata"]["labels"]["pod-template-hash"], "5d8f7c9b6");
+        // No such label on the pod: no remove, and a 63-character name still gets its label.
+        let ops = patch(&pod(), &long, &cfg(), &wiring()).unwrap();
+        assert!(ops.iter().all(|op| op.op != "remove"), "{ops:?}");
+        let name = "a".repeat(63);
+        let ops = patch(&p, &name, &cfg(), &wiring()).unwrap();
+        assert!(ops.iter().all(|op| op.op != "remove"), "{ops:?}");
+        assert_eq!(
+            apply_with_deployment(&p, &name)["metadata"]["labels"]["mimic.platform.io/deployment"],
+            name
         );
     }
 
