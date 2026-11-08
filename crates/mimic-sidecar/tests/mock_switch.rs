@@ -400,3 +400,47 @@ async fn mck_16_a_mocked_h2c_connection_gets_goaway_after_its_pending_stream() {
         .unwrap();
     assert!(sender.send_request(request).await.is_err());
 }
+
+#[tokio::test]
+async fn mck_16_a_forwarded_h2c_connection_switched_to_mock_and_back_gets_goaway() {
+    let dest = h2_destination().await;
+    let rig = forwarding_rig(Options {
+        dst: Some(dest.addr),
+        ..Options::default()
+    })
+    .await;
+    let tcp = TcpStream::connect(rig.addr).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .unwrap();
+    let driver = tokio::spawn(conn);
+    assert!(
+        h2_get(&mut sender)
+            .await
+            .headers()
+            .get("x-mimic-match")
+            .is_none()
+    );
+    switch(&rig, Mode::Mock).await;
+    assert!(
+        h2_get(&mut sender)
+            .await
+            .headers()
+            .get("x-mimic-match")
+            .is_some()
+    );
+
+    switch(&rig, Mode::Discovery).await;
+    // GOAWAY: the connection ends and no new stream is accepted.
+    let ended = tokio::time::timeout(TIMEOUT, driver)
+        .await
+        .expect("the connection ended after GOAWAY")
+        .unwrap();
+    assert!(ended.is_ok(), "{ended:?}");
+    let request = Request::builder()
+        .uri(format!("http://{AUTHORITY}/users/3"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    assert!(sender.send_request(request).await.is_err());
+}
