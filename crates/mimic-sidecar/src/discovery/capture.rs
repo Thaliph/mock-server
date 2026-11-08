@@ -271,6 +271,11 @@ impl Tap {
         }
     }
 
+    /// Counts an inbound load test request: forwarded, and not recorded (spec §7.8).
+    pub(crate) fn load_exchange(&self) {
+        self.metrics.exchange("inbound", "load");
+    }
+
     /// The budget the captures are taken from.
     pub fn budget(&self) -> CaptureBudget {
         CaptureBudget(self.budget.clone())

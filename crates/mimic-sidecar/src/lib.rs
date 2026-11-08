@@ -9,6 +9,7 @@ pub mod h2;
 pub mod hardening;
 pub mod http1;
 pub mod listener;
+pub mod load;
 pub mod mock;
 pub mod mode;
 pub mod opaque;

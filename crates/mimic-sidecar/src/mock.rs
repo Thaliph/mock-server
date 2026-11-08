@@ -536,6 +536,7 @@ impl Flight {
             bytes_out,
             mock: Some(mock),
             mock_miss: miss.map(Miss::as_str),
+            load_run: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.owed.store(true, Ordering::Release);
@@ -573,6 +574,7 @@ impl Drop for Flight {
             bytes_out: 0,
             mock: None,
             mock_miss: None,
+            load_run: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.release();
@@ -785,6 +787,7 @@ impl Mock {
             bytes_out: 0,
             mock: None,
             mock_miss: None,
+            load_run: None,
         });
     }
 }

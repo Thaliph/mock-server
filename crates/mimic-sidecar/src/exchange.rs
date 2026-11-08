@@ -21,6 +21,7 @@ use mimic_core::proxy::http1::{CAPTURE_BODY_LIMIT, Captured, Event, RequestHead,
 use crate::access::{self, Outcome};
 use crate::discovery::{Capture, Meta, Tap};
 use crate::listener::Direction;
+use crate::load::Watch;
 use crate::red::ProxyMetrics;
 
 /// Default port of a `Host` header on plain HTTP, removed by the authority normalisation.
@@ -196,6 +197,8 @@ pub(crate) struct Tracker {
     tap: Option<Tap>,
     /// The authority the request named, normalised.
     named_authority: Option<String>,
+    /// The load test run of a request carrying the load marker (spec §7.8).
+    load_run: Option<String>,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -280,6 +283,7 @@ impl Tracker {
             capture: capture.clone(),
             tap: tap.cloned(),
             named_authority,
+            load_run: None,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -295,6 +299,11 @@ impl Tracker {
             tee,
         };
         (tracker, Request::from_parts(parts, body))
+    }
+
+    /// The request is a load test's: its access line says which run.
+    pub(crate) fn load_run(&mut self, uid: String) {
+        self.load_run = Some(uid);
     }
 
     /// The destination did not answer: the exchange ends here.
@@ -419,6 +428,7 @@ impl Tracker {
             bytes_out,
             mock: None,
             mock_miss: None,
+            load_run: self.load_run.take(),
         });
     }
 }
@@ -543,6 +553,7 @@ pub(crate) fn rejected(ctx: &Ctx) {
         bytes_out: 0,
         mock: None,
         mock_miss: None,
+        load_run: None,
     });
 }
 
@@ -566,6 +577,8 @@ struct Open {
     counted: bool,
     /// The bytes discovery captures (spec §6), when it is on for this connection.
     capture: Option<Capture>,
+    /// The load test run that sent the request (spec §7.8).
+    load_run: Option<String>,
 }
 
 impl Open {
@@ -582,6 +595,7 @@ impl Open {
             tunnel: false,
             counted: false,
             capture: None,
+            load_run: None,
         }
     }
 }
@@ -594,6 +608,8 @@ pub(crate) struct Http1Tracker {
     open: VecDeque<Open>,
     /// Where the exchanges go for discovery.
     tap: Option<Tap>,
+    /// Inbound with load testing on: which requests are a load test's (spec §7.8).
+    watch: Option<Watch>,
 }
 
 impl Http1Tracker {
@@ -602,7 +618,15 @@ impl Http1Tracker {
             ctx,
             open: VecDeque::new(),
             tap: None,
+            watch: None,
         }
+    }
+
+    /// Takes the load runs of the requests from `watch`: those exchanges are not discovered
+    /// and their access line says the run.
+    pub(crate) fn with_watch(mut self, watch: Option<Watch>) -> Http1Tracker {
+        self.watch = watch;
+        self
     }
 
     /// Hands the exchanges to discovery as well.
@@ -623,13 +647,15 @@ impl Http1Tracker {
     pub(crate) fn event(&mut self, event: Event) {
         match event {
             Event::Request(head) => {
+                let run = self.watch.as_ref().and_then(Watch::next_request);
                 let capture = self
                     .tap
                     .as_ref()
-                    .filter(|_| !head.connect)
+                    .filter(|_| !head.connect && run.is_none())
                     .map(Tap::capture);
                 let mut open = Open::new(Some(head));
                 open.capture = capture;
+                open.load_run = run;
                 self.open.push_back(open);
             }
             Event::Captured(captured) => self.captured(captured),
@@ -846,6 +872,7 @@ impl Http1Tracker {
             bytes_out: open.bytes_out,
             mock: None,
             mock_miss: None,
+            load_run: open.load_run.take(),
         });
     }
 }
