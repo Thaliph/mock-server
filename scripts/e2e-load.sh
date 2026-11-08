@@ -286,6 +286,7 @@ can yes "create jobs in an injected namespace" create jobs.batch -n "$LOAD_NS"
 can yes "list endpointslices" list endpointslices.discovery.k8s.io -n "$LOAD_NS"
 can yes "watch endpointslices" watch endpointslices.discovery.k8s.io -A
 can yes "create networkpolicies" create networkpolicies.networking.k8s.io -n "$LOAD_NS"
+can yes "delete jobs" delete jobs.batch -n "$LOAD_NS"
 can yes "delete networkpolicies" delete networkpolicies.networking.k8s.io -n "$LOAD_NS"
 can yes "patch mimicloadtests/status" patch mimicloadtests.mimic.platform.io --subresource=status -n "$LOAD_NS"
 can yes "list mimicloadtests" list mimicloadtests.mimic.platform.io -A
@@ -378,6 +379,22 @@ refuse "nodeName must be absent" job '.spec.template.spec.nodeName = "mimic-e2e-
 refuse "tolerations must be absent" job '.spec.template.spec.tolerations = [{"operator": "Exists"}]'
 refuse "hostAliases must be absent" job '.spec.template.spec.hostAliases = [{"ip": "10.0.0.1", "hostnames": ["x"]}]'
 
+log "ldt_17: the Job policy refuses the fields the generator never sets (priority, runtime class, scheduler, affinity, SELinux, AppArmor, parallelism)"
+refuse "priorityClassName must be absent" job '.spec.template.spec.priorityClassName = "system-cluster-critical"'
+refuse "runtimeClassName must be absent" job '.spec.template.spec.runtimeClassName = "gvisor"'
+refuse "affinity must be absent" job '.spec.template.spec.affinity = {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [{"topologyKey": "kubernetes.io/hostname"}]}}'
+refuse "seLinuxOptions must be absent" job '.spec.template.spec.securityContext.seLinuxOptions = {"type": "spc_t"}'
+refuse "seLinuxOptions must be absent" job '.spec.template.spec.containers[0].securityContext.seLinuxOptions = {"type": "spc_t"}'
+refuse "appArmorProfile must be absent" job '.spec.template.spec.securityContext.appArmorProfile = {"type": "Unconfined"}'
+refuse "appArmorProfile must be absent" job '.spec.template.spec.containers[0].securityContext.appArmorProfile = {"type": "Unconfined"}'
+refuse "schedulerName must be default-scheduler" job '.spec.template.spec.schedulerName = "other-scheduler"'
+refuse "parallelism must equal completions" job '.spec.parallelism = 2'
+
+log "ldt_17: the Secret volume is the one the annotation names, and the annotation goes with a Secret volume"
+refuse "the Secret volume must be the credentials Secret" job-secret '.spec.template.spec.volumes |= map(if .name == "credentials" then .secret.secretName = "other-secret" else . end)'
+refuse "the Secret volume must be the credentials Secret" job-secret 'del(.metadata.annotations["mimic.platform.io/credentials-secret"])'
+refuse "the Secret volume must be the credentials Secret" job '.metadata.annotations["mimic.platform.io/credentials-secret"] = "payment-load"'
+
 log "ldt_17: the Job policy refuses a privileged or root container, an added capability, a weaker security context"
 # allowPrivilegeEscalation must go with it: the API server refuses privileged with it set to false.
 refuse "privileged must be" job '.spec.template.spec.containers[0].securityContext.privileged = true | .spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation = true'
@@ -425,6 +442,46 @@ admitted "the NetworkPolicy with the metrics source" "$WORK/np-metrics.json"
 refuse "the metrics source on the admin port only" np '.spec.ingress = [{"from": [{"podSelector": {"matchLabels": {"app": "scrape"}}}], "ports": [{"protocol": "TCP", "port": 80}]}]'
 refuse "the metrics source on the admin port only" np '.spec.ingress = [{"from": [{"podSelector": {"matchLabels": {"app": "other"}}}], "ports": [{"protocol": "TCP", "port": 15100}]}]'
 refuse "ingress must be absent" np '.spec.ingress = [{"ports": [{"protocol": "TCP", "port": 15100}]}]'
+
+# DELETE (spec §11): the controller may delete the objects that carry the §7.8 labels, in any namespace,
+# and no other Job or NetworkPolicy. The cluster administrator's objects are created here, as admin.
+log "ldt_17: the controller may delete its own Job and NetworkPolicy, also in a namespace that is not injected; not the Job or NetworkPolicy of another user"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: batch/v1
+kind: Job
+metadata: {name: plain-job, namespace: $LOAD_NS}
+spec:
+  suspend: true
+  template:
+    spec:
+      restartPolicy: Never
+      containers: [{name: plain, image: "$mimic_ref"}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: plain-np, namespace: $LOAD_NS}
+spec: {podSelector: {matchLabels: {app: plain}}}
+YAML
+for object in job/plain-job networkpolicy/plain-np; do
+  if out=$(kubectl --as="$CTL" delete -n "$LOAD_NS" "$object" --dry-run=server 2>&1); then
+    fail "ldt_17: the controller may delete $object, which has no load test labels"
+  fi
+  found -F "metadata labels must be those of spec 7.8" <<<"$out" \
+    || fail "ldt_17: the refusal of the delete of $object does not name the labels: $out"
+done
+jq '.spec.suspend = true' "$WORK/job.json" > "$WORK/job-own.json"
+kubectl create -f "$WORK/job-own.json" >/dev/null || fail "ldt_17: the controller's Job was not created by the admin"
+kubectl create -f "$WORK/np.json" >/dev/null || fail "ldt_17: the controller's NetworkPolicy was not created by the admin"
+jq --arg ns "$PLAIN_NS" '.metadata.namespace = $ns | .metadata.name = "orphan-job"' "$WORK/job-own.json" > "$WORK/orphan.json"
+kubectl create -f "$WORK/orphan.json" >/dev/null || fail "ldt_17: the orphan Job was not created by the admin"
+kubectl --as="$CTL" delete -n "$LOAD_NS" job/mimic-load-550e8400e29b >/dev/null \
+  || fail "ldt_17: the controller could not delete its own Job"
+kubectl --as="$CTL" delete -n "$LOAD_NS" networkpolicy/mimic-load-550e8400e29b >/dev/null \
+  || fail "ldt_17: the controller could not delete its own NetworkPolicy"
+kubectl --as="$CTL" delete -n "$PLAIN_NS" job/orphan-job >/dev/null \
+  || fail "ldt_17: the controller could not delete its own Job in a namespace without injection"
+kubectl -n "$LOAD_NS" delete job/plain-job networkpolicy/plain-np --wait=true >/dev/null
+
 install || fail "ldt_17: helm install back to the default"
 
 log "e2e-load passed on kubernetes $(kubectl version -o json | jq -r '.serverVersion.gitVersion')"

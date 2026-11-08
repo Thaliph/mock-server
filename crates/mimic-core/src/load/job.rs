@@ -13,6 +13,8 @@ const ADMIN_PORT: u16 = 15100;
 const UID: u64 = 65532;
 /// Where the credentials Secret is mounted.
 const CREDENTIALS_DIR: &str = "/mimic/credentials";
+/// The Job annotation naming the credentials Secret (spec §7.8, §11).
+const CREDENTIALS_ANNOTATION: &str = "mimic.platform.io/credentials-secret";
 /// The projected token: its directory and file name (`MIMIC_LOAD_TOKEN_FILE`).
 const TOKEN_DIR: &str = "/var/run/secrets/mimic.platform.io";
 const TOKEN_FILE: &str = "load-token";
@@ -116,15 +118,20 @@ pub fn job(input: &JobInput<'_>) -> Value {
         .map(|(name, value)| json!({"name": name, "value": value}))
         .collect();
     let deadline = input.duration_ms.div_ceil(1000) + input.start_timeout_ms.div_ceil(1000) + 60;
+    let mut metadata = json!({
+        "name": job_name(input.uid),
+        "namespace": input.namespace,
+        "labels": labels(input.name),
+        "ownerReferences": owner(input.name, input.uid),
+    });
+    // The policy checks the Secret volume against this annotation (spec §11, LDT-17).
+    if let Some(secret) = input.secret_name {
+        metadata["annotations"] = json!({CREDENTIALS_ANNOTATION: secret});
+    }
     json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {
-            "name": job_name(input.uid),
-            "namespace": input.namespace,
-            "labels": labels(input.name),
-            "ownerReferences": owner(input.name, input.uid),
-        },
+        "metadata": metadata,
         "spec": {
             "completionMode": "Indexed",
             "parallelism": n,

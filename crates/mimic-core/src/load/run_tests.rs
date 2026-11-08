@@ -796,6 +796,14 @@ fn job_admitted(job: &Value, image: &str) -> Result<(), String> {
     if secrets > 1 {
         return Err("secret volumes".into());
     }
+    let annotated = job["metadata"]["annotations"]["mimic.platform.io/credentials-secret"].as_str();
+    let volume = pod["volumes"]
+        .as_array()
+        .and_then(|vs| vs.iter().find(|v| v["secret"].is_object()))
+        .map(|v| v["secret"]["secretName"].as_str());
+    if annotated != volume.flatten() {
+        return Err("credentials secret: the volume and the annotation differ".into());
+    }
     Ok(())
 }
 
@@ -891,6 +899,10 @@ mod object_tests {
         assert_eq!(env["MIMIC_LOAD_REPORT_INTERVAL"], "5s");
         assert_eq!(env["MIMIC_LOAD_MAX_PLAN"], (8 << 20).to_string());
         assert!(!env.contains_key("MIMIC_LOAD_CREDENTIALS_DIR"));
+        assert!(
+            j["metadata"]["annotations"].is_null(),
+            "no credentials, no annotation"
+        );
         assert_eq!(job_admitted(&j, input(&r, None).image), Ok(()));
         // Same input, same object.
         assert_eq!(j, job(&input(&r, None)));
@@ -921,6 +933,11 @@ mod object_tests {
         assert_eq!(
             env_of(&j)["MIMIC_LOAD_CREDENTIALS_DIR"],
             "/mimic/credentials"
+        );
+        // The policy ties the volume to this annotation (spec §11, LDT-17).
+        assert_eq!(
+            j["metadata"]["annotations"]["mimic.platform.io/credentials-secret"],
+            "payment-load"
         );
         assert_eq!(job_admitted(&j, input(&r, None).image), Ok(()));
     }
@@ -970,6 +987,14 @@ mod object_tests {
                 image
             )
             .is_err()
+        );
+        let with_secret = job(&input(&r, Some("payment-load")));
+        assert_eq!(job_admitted(&with_secret, image), Ok(()));
+        let mut other = with_secret.clone();
+        other["metadata"]["annotations"]["mimic.platform.io/credentials-secret"] = json!("other");
+        assert!(
+            job_admitted(&other, image).is_err(),
+            "a Secret the annotation does not name"
         );
         assert!(
             job_admitted(

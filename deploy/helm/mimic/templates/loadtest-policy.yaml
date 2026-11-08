@@ -29,22 +29,28 @@ spec:
     resourceRules:
       - apiGroups: [batch]
         apiVersions: [v1]
-        operations: [CREATE, UPDATE]
+        operations: [CREATE, UPDATE, DELETE]
         resources: [jobs]
       - apiGroups: [networking.k8s.io]
         apiVersions: [v1]
-        operations: [CREATE, UPDATE]
+        operations: [CREATE, UPDATE, DELETE]
         resources: [networkpolicies]
   matchConditions:
     - name: controller-service-account
       expression: 'request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-controller"'
   variables:
+    # DELETE (spec §11): only the labels of the deleted object (oldObject) are checked; the shape
+    # and the namespace rules are for CREATE and UPDATE.
+    - name: isDelete
+      expression: 'request.operation == "DELETE"'
+    - name: target
+      expression: 'variables.isDelete ? oldObject : object'
     - name: isJob
-      expression: 'request.resource.resource == "jobs"'
+      expression: 'request.resource.resource == "jobs" && !variables.isDelete'
     - name: isPolicy
-      expression: 'request.resource.resource == "networkpolicies"'
+      expression: 'request.resource.resource == "networkpolicies" && !variables.isDelete'
     - name: labels
-      expression: 'has(object.metadata.labels) ? object.metadata.labels : dyn({})'
+      expression: 'has(variables.target.metadata.labels) ? variables.target.metadata.labels : dyn({})'
     - name: namespaceLabels
       expression: 'has(namespaceObject.metadata.labels) ? namespaceObject.metadata.labels : dyn({})'
     # Jobs only: the lazy variables below are evaluated only behind `!variables.isJob ||`.
@@ -62,6 +68,11 @@ spec:
       expression: 'has(variables.pod.volumes) ? variables.pod.volumes : []'
     - name: secrets
       expression: 'variables.volumes.filter(v, has(v.secret))'
+    # The annotation the controller writes with the credentials Secret's name (spec §7.8, §11).
+    - name: credentialsAnnotated
+      expression: 'has(object.metadata.annotations) && "mimic.platform.io/credentials-secret" in object.metadata.annotations'
+    - name: credentialsSecret
+      expression: 'variables.credentialsAnnotated ? object.metadata.annotations["mimic.platform.io/credentials-secret"] : ""'
     - name: projected
       expression: 'variables.volumes.filter(v, has(v.projected))'
     # NetworkPolicy only.
@@ -72,8 +83,9 @@ spec:
   validations:
     # Both kinds.
     - expression: >-
+        variables.isDelete || (
         'mimic.platform.io/inject' in variables.namespaceLabels
-        && variables.namespaceLabels['mimic.platform.io/inject'] in ['enabled', 'selected']
+        && variables.namespaceLabels['mimic.platform.io/inject'] in ['enabled', 'selected'])
       message: "the namespace must have mimic.platform.io/inject enabled or selected (spec §7.1)"
     - expression: >-
         'app.kubernetes.io/managed-by' in variables.labels
@@ -137,6 +149,27 @@ spec:
         && has(variables.container.volumeMounts)
         && variables.container.volumeMounts.exists(m, m.name == variables.secrets[0].name && m.mountPath == '/mimic/credentials'))
       message: "load job: the Secret volume must be mounted at /mimic/credentials"
+    - expression: >-
+        !variables.isJob || (size(variables.secrets) == 0 ? !variables.credentialsAnnotated
+        : (variables.credentialsAnnotated && has(variables.secrets[0].secret.secretName)
+        && variables.secrets[0].secret.secretName != "" && variables.credentialsSecret == variables.secrets[0].secret.secretName))
+      message: "load job: the Secret volume must be the credentials Secret named by the annotation mimic.platform.io/credentials-secret, and the annotation goes only with a Secret volume"
+    # Fields the generator never sets (the API server sets none of them on a Job's template,
+    # except schedulerName, which it defaults).
+    - expression: '!variables.isJob || (!has(variables.pod.priorityClassName) || variables.pod.priorityClassName == "")'
+      message: "load job: priorityClassName must be absent"
+    - expression: '!variables.isJob || (!has(variables.pod.runtimeClassName) || variables.pod.runtimeClassName == "")'
+      message: "load job: runtimeClassName must be absent"
+    - expression: '!variables.isJob || !has(variables.pod.affinity)'
+      message: "load job: affinity must be absent"
+    - expression: '!variables.isJob || (!has(variables.psc.seLinuxOptions) && !has(variables.sc.seLinuxOptions))'
+      message: "load job: seLinuxOptions must be absent"
+    - expression: '!variables.isJob || (!has(variables.psc.appArmorProfile) && !has(variables.sc.appArmorProfile))'
+      message: "load job: appArmorProfile must be absent"
+    - expression: '!variables.isJob || (!has(variables.pod.schedulerName) || variables.pod.schedulerName == "default-scheduler")'
+      message: "load job: schedulerName must be default-scheduler"
+    - expression: '!variables.isJob || (has(object.spec.parallelism) && has(object.spec.completions) && object.spec.parallelism == object.spec.completions && object.spec.completions <= 4096)'
+      message: "load job: parallelism must equal completions, at most 4096"
     - expression: '!variables.isJob || (size(variables.pod.containers) == 1 && (!has(variables.container.volumeMounts) || variables.container.volumeMounts.all(m, has(m.readOnly) && m.readOnly == true)))'
       message: "load job: every volume mount must be read-only"
     - expression: '!variables.isJob || (!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false)'
