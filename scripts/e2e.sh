@@ -203,6 +203,11 @@ kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 # ns_fresh <namespace> [key=value...]: the namespace recreated with the given labels.
 ns_fresh() {
   kubectl delete namespace "$1" --ignore-not-found --wait=true --timeout=2m >/dev/null
+  # The kept cluster's Valkey outlives the namespace: drop what an earlier run stored for its
+  # deployments, or merged counts (ctl_20) add up across runs. No Valkey yet: nothing to drop.
+  kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- sh -c \
+    'valkey-cli --raw --scan --pattern "mimic:v1:{$0/*" | xargs -r valkey-cli DEL' "$1" \
+    >/dev/null 2>&1 || true
   kubectl create namespace "$1" >/dev/null
   if [[ $# -gt 1 ]]; then kubectl label namespace "$1" "${@:2}" >/dev/null; fi
 }
