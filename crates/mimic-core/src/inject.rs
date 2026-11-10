@@ -20,6 +20,8 @@ pub const DEPLOYMENT_LABEL: &str = "mimic.platform.io/deployment";
 const LABEL_VALUE_MAX: usize = 63;
 /// Sidecar admin port (probes, `/app-health`).
 const ADMIN_PORT: i32 = 15100;
+/// Name of the admin port, so that a `PodMonitor` can scrape it (spec §7.1, MON-03).
+const ADMIN_PORT_NAME: &str = "mimic-admin";
 /// Ports the sidecar owns in the pod's network namespace.
 pub const RESERVED_PORTS: [i32; 3] = [15001, 15006, 15100];
 /// UID of the sidecar, which the app must not use.
@@ -341,6 +343,7 @@ pub fn patch(
         "image": cfg.sidecar_image,
         "command": ["/usr/local/bin/mimic-sidecar"],
         "restartPolicy": "Always",
+        "ports": [{"name": ADMIN_PORT_NAME, "containerPort": ADMIN_PORT, "protocol": "TCP"}],
         "env": sidecar_env,
         "volumeMounts": [
             {"name": TRUST_VOLUME, "mountPath": "/mimic"},
@@ -1299,6 +1302,16 @@ mod tests {
         );
         assert!(init.get("volumeMounts").is_none());
         assert!(init.get("restartPolicy").is_none());
+    }
+
+    #[test]
+    fn mon_03_the_sidecar_declares_the_named_admin_port() {
+        let a = apply(&pod());
+        assert_eq!(
+            a["spec"]["initContainers"][1]["ports"],
+            json!([{"name": "mimic-admin", "containerPort": 15100, "protocol": "TCP"}])
+        );
+        assert_eq!(a, apply(&pod()));
     }
 
     #[test]

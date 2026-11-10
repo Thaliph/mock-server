@@ -49,6 +49,47 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      {{- if .Values.valkey.metrics.enabled }}
+      # The ACL file, built at each pod start from the Secrets (spec §10.7): Valkey loads its users from the file
+      # alone, so the default user is on the Valkey password and the exporter user on its own (#378). Only SHA-256
+      # hashes are written and no password is printed. Mode 0440, in memory, read-only in the valkey container.
+      initContainers:
+        - name: valkey-acl
+          image: {{ include "mimic.valkeyImage" . }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              [ -n "$VALKEY_PASSWORD" ] || { echo "valkey-acl: the Valkey password is empty" >&2; exit 1; }
+              [ -n "$EXPORTER_PASSWORD" ] || { echo "valkey-acl: the exporter password is empty" >&2; exit 1; }
+              umask 0226
+              hash() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+              printf 'user default on #%s ~* &* +@all\nuser mimic-exporter on #%s +info +ping resetkeys resetchannels\n' "$(hash "$VALKEY_PASSWORD")" "$(hash "$EXPORTER_PASSWORD")" > /etc/valkey-acl/aclfile.tmp
+              mv /etc/valkey-acl/aclfile.tmp /etc/valkey-acl/aclfile
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mimic.valkeySecret" . }}
+                  key: password
+            - name: EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mimic.valkeyExporterSecret" . }}
+                  key: password
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            {{- include "mimic.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: acl
+              mountPath: /etc/valkey-acl
+      {{- end }}
       containers:
         - name: valkey
           image: {{ include "mimic.valkeyImage" . }}
@@ -61,12 +102,20 @@ spec:
             - /data
             - --appendonly
             - "yes"
+            {{- if not .Values.valkey.metrics.enabled }}
             - --requirepass
             - $(VALKEY_PASSWORD)
+            {{- end }}
             - --maxmemory
             - {{ include "mimic.valkeyMaxmemory" . | quote }}
             - --maxmemory-policy
             - noeviction
+            {{- if .Values.valkey.metrics.enabled }}
+            # One source of users (spec §10.7): the ACL file built by the valkey-acl init container defines
+            # the default user, so there is no --requirepass.
+            - --aclfile
+            - /etc/valkey-acl/aclfile
+            {{- end }}
           env:
             - name: VALKEY_PASSWORD
               valueFrom:
@@ -95,6 +144,43 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.valkey.metrics.enabled }}
+            - name: acl
+              mountPath: /etc/valkey-acl
+              readOnly: true
+            {{- end }}
+        {{- if .Values.valkey.metrics.enabled }}
+        # Redis exporter (spec §10.7): reads INFO as mimic-exporter on localhost; no key, value or client
+        # list is read. Fixed arguments; the password comes from a Secret, never from args.
+        - name: exporter
+          image: {{ include "mimic.valkeyExporterImage" . }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - --web.listen-address=0.0.0.0:9121
+            - --redis.addr=redis://localhost:6379
+          env:
+            - name: REDIS_USER
+              value: mimic-exporter
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mimic.valkeyExporterSecret" . }}
+                  key: password
+          ports:
+            - name: metrics
+              containerPort: 9121
+          livenessProbe:
+            tcpSocket: {port: metrics}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.valkey.metrics.resources | nindent 12 }}
+          securityContext:
+            {{- include "mimic.containerSecurity" . | nindent 12 }}
+            runAsUser: 65532
+        {{- end }}
       {{- with .Values.valkey.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -103,10 +189,18 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if not .Values.valkey.persistence.enabled }}
+      {{- if or (not .Values.valkey.persistence.enabled) .Values.valkey.metrics.enabled }}
       volumes:
+        {{- if not .Values.valkey.persistence.enabled }}
         - name: data
           emptyDir: {}
+        {{- end }}
+        {{- if .Values.valkey.metrics.enabled }}
+        - name: acl
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        {{- end }}
       {{- end }}
   {{- if .Values.valkey.persistence.enabled }}
   volumeClaimTemplates:
@@ -159,6 +253,20 @@ spec:
               app.kubernetes.io/name: mimic-controller
       ports:
         - port: 6379
+    {{- if .Values.valkey.metrics.enabled }}
+    # The exporter's scrape (spec §10.7): the release namespace and the metrics namespaces only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+        {{- with .Values.networkPolicy.metricsNamespaceSelector }}
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+        {{- end }}
+      ports:
+        - port: 9121
+          protocol: TCP
+    {{- end }}
   # Valkey calls nothing.
   egress: []
 {{- end }}

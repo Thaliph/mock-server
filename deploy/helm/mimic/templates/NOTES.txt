@@ -8,3 +8,9 @@ Check the controller:
 Read the discovered APIs (OpenAPI and Swagger UI, loopback of the pod):
   kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ .Release.Name }}-controller 8080:8080
   open http://localhost:8080/ui/
+
+{{- if .Values.valkey.metrics.enabled }}
+Valkey metrics: the Redis exporter runs in the Valkey pod (port 9121, ACL user mimic-exporter).
+Enabling or changing it restarts Valkey once{{ if not .Values.valkey.persistence.enabled }}; with
+valkey.persistence.enabled=false the store is lost on that restart{{ end }}.
+{{- end }}
