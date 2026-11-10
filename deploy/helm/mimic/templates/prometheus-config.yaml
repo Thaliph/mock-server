@@ -1,0 +1,13 @@
+{{- if .Values.monitoring.prometheus.enabled }}
+# The configuration of the bundled Prometheus (spec §10.7, #379): the scrape jobs of mimic.scrapeTargets, the same
+# targets as the ServiceMonitor and the PodMonitors (MON-17). The pod mounts it read-only at /etc/prometheus.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-prometheus
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+data:
+  prometheus.yml: |
+    {{- include "mimic.prometheusConfig" . | nindent 4 }}
+{{- end }}

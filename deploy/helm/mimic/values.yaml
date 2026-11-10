@@ -136,3 +136,11 @@ metrics:
     # MimicWorkload alone.
     namespaceSelector:
       any: true
+
+# The bundled Prometheus and Grafana (spec §10.7, #379): for a demo or a dev cluster only, off by default.
+monitoring:
+  prometheus:
+    enabled: false
+    # Namespaces of the sidecar and load jobs, besides the release namespace. Empty: every namespace, through
+    # a ClusterRole. A list: a Role in each of them and in the release namespace.
+    namespaces: []

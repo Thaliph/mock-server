@@ -1,17 +1,17 @@
 {{- if .Values.metrics.serviceMonitor.enabled }}
+{{- $controller := include "mimic.scrapeTarget" (dict "root" . "job" (printf "%s-controller" .Release.Name)) | fromJson }}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ .Release.Name }}-controller
+  name: {{ $controller.name }}
   labels:
     {{- include "mimic.labels" . | nindent 4 }}
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/name: mimic-controller
+      {{- toYaml $controller.matchLabels | nindent 6 }}
   endpoints:
-    - port: admin
+    - port: {{ $controller.port }}
       path: /metrics
-      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      interval: {{ $controller.interval }}
 {{- end }}

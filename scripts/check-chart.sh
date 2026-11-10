@@ -26,6 +26,13 @@ lint podMonitor --set metrics.podMonitor.enabled=true
 lint valkey.metrics --set valkey.metrics.enabled=true
 lint both --set metrics.podMonitor.enabled=true --set valkey.metrics.enabled=true
 lint loadTest.podMonitor --set loadTest.enabled=true --set image.digest="$digest" --set metrics.podMonitor.enabled=true
+# #379 (MON-14): the bundled monitoring lints strictly, alone and with the monitors and the load test.
+lint prometheus --set monitoring.prometheus.enabled=true
+lint prometheus.namespaces --set monitoring.prometheus.enabled=true --set 'monitoring.prometheus.namespaces[0]=apps'
+lint prometheus.monitors --set monitoring.prometheus.enabled=true --set metrics.serviceMonitor.enabled=true \
+  --set metrics.podMonitor.enabled=true --set valkey.metrics.enabled=true
+lint prometheus.loadTest --set monitoring.prometheus.enabled=true --set loadTest.enabled=true \
+  --set image.digest="$digest" --set metrics.podMonitor.enabled=true
 
 # MON-01, default: identical to the golden render (deploy/helm/golden/default.yaml, rendered from main), blank
 # lines aside: helm 3 and helm 4 separate the documents with different blank lines.
@@ -245,5 +252,91 @@ render --set loadTest.enabled=true --set image.digest="$digest" --set loadTest.n
 [[ -z $(load_env "$tmp/no-netpol.yaml") ]] || fail "mon_01: MIMIC_LOAD_NETWORK_POLICY is set with loadTest.networkPolicy false"
 [[ -z $(load_env "$tmp/default.yaml") ]] || fail "mon_01: MIMIC_LOAD_NETWORK_POLICY is set in the default render"
 echo "mon_01: MIMIC_LOAD_NETWORK_POLICY is absent without loadTest.networkPolicy and in the default render"
+
+# MON-14 (off part, #379): the bundled Prometheus and Grafana are absent by default and with the monitors on.
+for f in default pm on load-pm; do
+  if yq -r '.metadata.name' "$tmp/$f.yaml" | grep -qE '^mimic-(prometheus|grafana)'; then
+    fail "mon_14: a bundled monitoring object is rendered with monitoring off ($f)"
+  fi
+done
+echo "mon_14: no bundled monitoring object with monitoring off"
+
+# MON-17 (#379): mon_17 <render> <jobs, in order> <monitors: yes|no>. prometheus.yml has exactly those jobs, all
+# pods role, with the selector, port, path, interval and target labels of the monitor of the same name (the
+# ServiceMonitor or PodMonitor; with "yes" it must exist). namespace and pod are the Operator's implicit target
+# labels, which prometheus.yml sets for every job, so they are left out of the comparison.
+mon_17() {
+  local file=$1 expected=$2 monitors=$3 cfg jobs job j m msel psel mport pport mpath ppath mint pint mrel prel
+  cfg=$(yq 'select(.kind == "ConfigMap" and .metadata.name == "mimic-prometheus") | .data["prometheus.yml"]' "$file")
+  [[ -n $cfg ]] || fail "mon_17: no prometheus.yml in the ConfigMap mimic-prometheus"
+  jobs=$(yq -r '.scrape_configs[].job_name' <<<"$cfg" | tr '\n' ' ')
+  [[ $jobs == "$expected " ]] || fail "mon_17: the jobs are '$jobs', expected '$expected'"
+  [[ $(yq -r '.scrape_configs[].kubernetes_sd_configs[].role' <<<"$cfg" | sort -u) == pod ]] \
+    || fail "mon_17: a job discovers other than pods"
+  ! grep -qE 'authorization|basic_auth|bearer_token|oauth2|tls_config|nodes|cadvisor|kubelet' <<<"$cfg" \
+    || fail "mon_17: prometheus.yml holds credentials or scrapes a node"
+  for job in $expected; do
+    j=$(yq ".scrape_configs[] | select(.job_name == \"$job\")" <<<"$cfg")
+    [[ $(yq -r '.relabel_configs[] | select(.action == "drop") | .regex' <<<"$j") == "Succeeded|Failed" ]] \
+      || fail "mon_17: $job does not drop the Succeeded and Failed pods"
+    [[ $(yq -r '.metrics_path' <<<"$j") == /metrics ]] || fail "mon_17: $job path is not /metrics"
+    pport=$(yq -r '.relabel_configs[] | select(.action == "keep") | .regex' <<<"$j")
+    psel=$(yq -r '.kubernetes_sd_configs[0].selectors[0].label' <<<"$j")
+    pint=$(yq -r '.scrape_interval' <<<"$j")
+    prel=$(yq -r '[.relabel_configs[] | select(.target_label != null and .target_label != "namespace" and .target_label != "pod") | ((.source_labels // []) | join(",")) + "|" + .target_label + "|" + (.replacement // "")] | join(";")' <<<"$j")
+    m=$(yq "select((.kind == \"ServiceMonitor\" or .kind == \"PodMonitor\") and .metadata.name == \"$job\")" "$file")
+    if [[ -z $m ]]; then
+      [[ $monitors == no ]] || fail "mon_17: no ServiceMonitor or PodMonitor $job"
+      continue
+    fi
+    mlabels=$(yq -r '(.spec.selector.matchLabels // {}) | to_entries | sort_by(.key) | map(.key + "=" + .value) | join(",")' <<<"$m")
+    mexist=$(yq -r '(.spec.selector.matchExpressions // []) | map(.key) | join(",")' <<<"$m")
+    msel=$(printf '%s\n' "$mlabels" "$mexist" | grep -v '^$' | paste -sd, - || true)
+    [[ $msel == "$psel" ]] || fail "mon_17: $job selects '$psel', its monitor '$msel'"
+    [[ $(yq -r '(.spec.podMetricsEndpoints // .spec.endpoints)[0].port' <<<"$m") == "$pport" ]] \
+      || fail "mon_17: $job scrapes port '$pport', its monitor another"
+    [[ $(yq -r '(.spec.podMetricsEndpoints // .spec.endpoints)[0].path' <<<"$m") == "$(yq -r '.metrics_path' <<<"$j")" ]] \
+      || fail "mon_17: $job path differs from its monitor"
+    [[ $(yq -r '(.spec.podMetricsEndpoints // .spec.endpoints)[0].interval' <<<"$m") == "$pint" ]] \
+      || fail "mon_17: $job interval differs from its monitor"
+    mrel=$(yq -r '((.spec.podMetricsEndpoints // .spec.endpoints)[0].relabelings // []) | map(select(.targetLabel != "namespace" and .targetLabel != "pod") | ((.sourceLabels // []) | join(",")) + "|" + .targetLabel + "|" + (.replacement // "")) | join(";")' <<<"$m")
+    [[ $mrel == "$prel" ]] || fail "mon_17: $job relabels '$prel', its monitor '$mrel'"
+    echo "mon_17: $job has the selector, port, path, interval and target labels of its monitor"
+  done
+}
+
+# The four jobs with every monitor on; the valkey job only with valkey.metrics; the namespaces of each job.
+render --set monitoring.prometheus.enabled=true --set metrics.serviceMonitor.enabled=true \
+  --set metrics.podMonitor.enabled=true --set valkey.metrics.enabled=true > "$tmp/prom.yaml"
+mon_17 "$tmp/prom.yaml" "mimic-controller mimic-sidecar mimic-load mimic-valkey" yes
+
+render --set monitoring.prometheus.enabled=true --set metrics.serviceMonitor.enabled=true \
+  --set metrics.podMonitor.enabled=true > "$tmp/prom-novalkey.yaml"
+mon_17 "$tmp/prom-novalkey.yaml" "mimic-controller mimic-sidecar mimic-load" yes
+[[ $(yq 'select(.kind == "PodMonitor" and .metadata.name == "mimic-valkey")' "$tmp/prom-novalkey.yaml") == "" ]] \
+  || fail "mon_17: the Valkey PodMonitor is rendered without valkey.metrics.enabled"
+
+render --set monitoring.prometheus.enabled=true > "$tmp/prom-only.yaml"
+mon_17 "$tmp/prom-only.yaml" "mimic-controller mimic-sidecar mimic-load" no
+
+# Namespaces (§10.7): the controller job is the release namespace; the pod jobs are every namespace (no names key)
+# unless monitoring.prometheus.namespaces is set, then those namespaces and the release namespace.
+prom_cfg() {
+  yq 'select(.kind == "ConfigMap" and .metadata.name == "mimic-prometheus") | .data["prometheus.yml"]' "$1"
+}
+job_names() { # job_names <render> <job>: the namespaces names of one job, comma-joined ("" when all)
+  yq ".scrape_configs[] | select(.job_name == \"$2\") | .kubernetes_sd_configs[0].namespaces.names // [] | join(\",\")" <<<"$(prom_cfg "$1")"
+}
+[[ $(job_names "$tmp/prom-only.yaml" mimic-controller) == mimic-system ]] \
+  || fail "mon_17: the controller job is not in the release namespace only"
+[[ -z $(job_names "$tmp/prom-only.yaml" mimic-sidecar) ]] || fail "mon_17: the sidecar job is not in every namespace"
+render --set monitoring.prometheus.enabled=true --set 'monitoring.prometheus.namespaces[0]=apps' > "$tmp/prom-ns.yaml"
+[[ $(job_names "$tmp/prom-ns.yaml" mimic-sidecar) == "apps,mimic-system" ]] \
+  || fail "mon_17: the sidecar job does not select the listed namespaces and the release namespace"
+[[ $(job_names "$tmp/prom-ns.yaml" mimic-load) == "apps,mimic-system" ]] \
+  || fail "mon_17: the load job does not select the listed namespaces and the release namespace"
+[[ $(job_names "$tmp/prom-ns.yaml" mimic-controller) == mimic-system ]] \
+  || fail "mon_17: the controller job leaves the release namespace"
+echo "mon_17: the scrape jobs and the monitors agree, and the namespaces follow monitoring.prometheus.namespaces"
 
 echo "chart checks passed"
