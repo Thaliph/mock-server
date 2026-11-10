@@ -50,4 +50,10 @@ spec:
       ports:
         - {port: 443, protocol: TCP}
         - {port: 6443, protocol: TCP}
+    # An external datasource (monitoring.grafana.datasourceUrl) is reachable through these rules only (spec §10.7).
+    {{- if .Values.monitoring.grafana.datasourceUrl }}
+    {{- with .Values.monitoring.grafana.datasourceEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- end }}
 {{- end }}

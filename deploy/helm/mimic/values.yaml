@@ -178,6 +178,9 @@ monitoring:
       digest: sha256:092dbe0c335fba9af414a27630ca68f34df6185784fa847d9954187e69dbfdd7
     # URL of the provisioned Prometheus datasource. Empty: the bundled Prometheus, http://<release>-prometheus:9090.
     datasourceUrl: ""
+    # NetworkPolicy egress rules for an external datasource, appended to the Grafana policy only when datasourceUrl is set
+    # (spec §10.7). Required with networkPolicy.enabled for an external datasource.
+    datasourceEgress: []
     resources:
       requests: {cpu: 50m, memory: 128Mi}
       limits: {memory: 256Mi}

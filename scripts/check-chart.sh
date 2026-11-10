@@ -559,6 +559,9 @@ render --set monitoring.grafana.enabled=true --set monitoring.prometheus.enabled
   --set monitoring.grafana.datasourceUrl=http://other:9090 > "$tmp/grafana-url.yaml"
 gcs() { yq -r 'select(.kind == "Deployment" and .metadata.name == "mimic-grafana") | .spec.template.metadata.annotations["checksum/config"]' "$1"; }
 [[ $(gcs "$tmp/grafana.yaml") != "$(gcs "$tmp/grafana-url.yaml")" ]] || fail "mon_19: the checksum does not follow the datasource"
+[[ $(yq -r '.spec.template.spec.securityContext.fsGroup' <<<"$gdep") == 472 \
+  && $(yq -r '.spec.template.spec.securityContext.supplementalGroups | join(",")' <<<"$gdep") == 472 ]] \
+  || fail "mon_19: the pod has no fsGroup 472 and supplementalGroups [472]"
 echo "mon_19: the Grafana pod, its Secret, its configuration and its Service have the shape of §10.7"
 
 # MON-18 (Grafana part): the sidecar's Role lists and watches ConfigMaps of the release namespace only, bound to its own
@@ -608,5 +611,19 @@ render --set monitoring.grafana.enabled=true --set networkPolicy.enabled=false >
 [[ -z $(yq 'select(.kind == "NetworkPolicy" and (.metadata.name == "mimic-grafana" or .metadata.name == "mimic-prometheus"))' "$tmp/np-grafana-off.yaml") ]] \
   || fail "mon_20: a monitoring NetworkPolicy is rendered with networkPolicy.enabled false"
 echo "mon_20: the Grafana NetworkPolicy admits 3000 from the release namespace, and Prometheus admits 9090 from Grafana only"
+
+# MON-20 (#379, datasourceEgress): the rules of datasourceEgress are appended only with datasourceUrl set.
+ext=(--set monitoring.grafana.enabled=true --set networkPolicy.enabled=true
+  --set 'monitoring.grafana.datasourceEgress[0].to[0].ipBlock.cidr=10.20.0.0/16'
+  --set 'monitoring.grafana.datasourceEgress[0].ports[0].port=9090'
+  --set 'monitoring.grafana.datasourceEgress[0].ports[0].protocol=TCP')
+render "${ext[@]}" --set monitoring.grafana.datasourceUrl=https://prom.example:9090 > "$tmp/ext-url.yaml"
+render "${ext[@]}" > "$tmp/ext-nourl.yaml"
+gegress() { yq -r 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-grafana") | .spec.egress | length' "$1"; }
+[[ $(gegress "$tmp/ext-url.yaml") == 4 ]] || fail "mon_20: the datasourceEgress rule is not appended with datasourceUrl set"
+[[ $(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-grafana") | .spec.egress[3].to[0].ipBlock.cidr' "$tmp/ext-url.yaml") == 10.20.0.0/16 ]] \
+  || fail "mon_20: the appended datasourceEgress rule is not the one given"
+[[ $(gegress "$tmp/ext-nourl.yaml") == 3 ]] || fail "mon_20: datasourceEgress is rendered with datasourceUrl empty"
+echo "mon_20: datasourceEgress is appended only with datasourceUrl set"
 
 echo "chart checks passed"
