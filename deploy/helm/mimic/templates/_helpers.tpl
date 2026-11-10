@@ -120,3 +120,13 @@ else, with metrics.podMonitor.enabled, the namespace peer of networkPolicy.metri
 []
 {{- end -}}
 {{- end -}}
+
+{{/*
+MIMIC_LOAD_NETWORK_POLICY of the controller (spec §10.2, §7.8): the peers of each run's generator
+NetworkPolicy as JSON. metricsFrom is the same helper the load test admission policy reads
+(mimic.loadMetricsFrom), so the two cannot diverge.
+*/}}
+{{- define "mimic.loadNetworkPolicy" -}}
+{{- $controller := dict "app.kubernetes.io/instance" .Release.Name "app.kubernetes.io/name" "mimic-controller" -}}
+{{- dict "controllerLabels" $controller "dnsNamespace" .Values.loadTest.dnsSelector.namespace "dnsLabels" .Values.loadTest.dnsSelector.podLabels "metricsFrom" (include "mimic.loadMetricsFrom" . | fromJsonArray) | toJson -}}
+{{- end -}}
