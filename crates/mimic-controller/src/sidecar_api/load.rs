@@ -59,10 +59,6 @@ pub struct RunIndex {
     runs: RwLock<BTreeMap<(String, String), RunInfo>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the reconciler of the next step fills the index")
-)]
 impl RunIndex {
     pub fn apply(&self, run: RunInfo) {
         self.runs
@@ -91,6 +87,7 @@ impl RunIndex {
 #[derive(Default)]
 pub struct SliceCache {
     slices: RwLock<BTreeMap<(String, String), EndpointSlice>>,
+    synced: std::sync::atomic::AtomicBool,
 }
 
 impl SliceCache {
@@ -106,7 +103,7 @@ impl SliceCache {
             .insert(key, slice);
     }
 
-    /// Replaces the whole content after a (re)list.
+    /// Replaces the whole content after a (re)list and marks the cache synced.
     pub fn replace(&self, slices: impl IntoIterator<Item = EndpointSlice>) {
         self.slices
             .write()
@@ -115,6 +112,16 @@ impl SliceCache {
         for slice in slices {
             self.apply(slice);
         }
+        self.mark_synced();
+    }
+
+    pub fn mark_synced(&self) {
+        self.synced.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the first listing arrived: before it, an empty target list says nothing.
+    pub fn is_synced(&self) -> bool {
+        self.synced.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
@@ -375,6 +382,10 @@ impl SidecarApi {
                     Ok(None) => return Err(NOT_FOUND),
                     Err(_) => return Err(unavailable(caller, "store unavailable")),
                 };
+                // Before the first listing an empty list would read as `NoTargets`.
+                if !load.slices.is_synced() {
+                    return Err(unavailable(caller, "EndpointSlice cache not synced"));
+                }
                 let targets: Vec<serde_json::Value> = load
                     .slices
                     .targets(namespace, deployment)
@@ -420,7 +431,7 @@ impl SidecarApi {
                 };
                 match self
                     .store
-                    .load_post(namespace, deployment, uid, pod, &stored)
+                    .load_post(namespace, deployment, uid, &worker.to_string(), &stored)
                     .await
                 {
                     Ok(Some(stop)) => Ok(json_response(

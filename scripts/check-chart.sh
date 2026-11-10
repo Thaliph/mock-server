@@ -204,4 +204,46 @@ render --set metrics.podMonitor.enabled=true > "$tmp/pm-default.yaml"
   || fail "mon_01: the PodMonitors changed a NetworkPolicy"
 echo "mon_01: the sidecar and load PodMonitors scrape mimic-admin with their target labels; the values apply"
 
+# MIMIC_LOAD_NETWORK_POLICY of the controller (spec §10.2, §7.8, LDT-05, LDT-06): with loadTest.enabled the env holds
+# the peers of the generator NetworkPolicy as JSON; its metricsFrom is the peers of the load test admission policy
+# (the same helper), with and without loadTest.metricsFrom set.
+load_env() {
+  yq -r 'select(.kind == "Deployment" and .metadata.name == "mimic-controller") | .spec.template.spec.containers[0].env[] | select(.name == "MIMIC_LOAD_NETWORK_POLICY") | .value' "$1"
+}
+# netpol_check <name> [helm flags...]: the env of one render with loadTest.enabled is the policy's peers.
+netpol_check() {
+  local name=$1; shift
+  render --set loadTest.enabled=true --set image.digest="$digest" "$@" > "$tmp/$name.yaml"
+  local env_json peers expr
+  env_json=$(load_env "$tmp/$name.yaml")
+  [[ -n $env_json ]] || fail "mon_01: $name: MIMIC_LOAD_NETWORK_POLICY is not set with loadTest.enabled"
+  yq -p json -o json -I0 '.' <<<"$env_json" >/dev/null 2>&1 || fail "mon_01: $name: MIMIC_LOAD_NETWORK_POLICY is not JSON"
+  [[ $(yq -p json -o json -I0 '.controllerLabels' <<<"$env_json") == '{"app.kubernetes.io/instance":"mimic","app.kubernetes.io/name":"mimic-controller"}' ]] \
+    || fail "mon_01: $name: the controller labels are not the controller pods' labels"
+  [[ $(yq -p json -r '.dnsNamespace' <<<"$env_json") == kube-system ]] || fail "mon_01: $name: dnsNamespace is not loadTest.dnsSelector.namespace"
+  [[ $(yq -p json -o json -I0 '.dnsLabels' <<<"$env_json") == '{"k8s-app":"kube-dns"}' ]] || fail "mon_01: $name: dnsLabels is not loadTest.dnsSelector.podLabels"
+  peers=$(yq -p json -o json -I0 '.metricsFrom' <<<"$env_json")
+  expr=$(load_expression "$tmp/$name.yaml")
+  if [[ $peers == "[]" ]]; then
+    grep -qF 'variables.ingress == []' <<<"$expr" || fail "mon_01: $name: the admission policy admits a peer the controller does not"
+  else
+    grep -qF "variables.ingress[0].from == $peers " <<<"$expr" \
+      || fail "mon_01: $name: the admission policy's peers are not the controller's metricsFrom $peers"
+  fi
+  echo "mon_01: $name: MIMIC_LOAD_NETWORK_POLICY is JSON, and metricsFrom $peers is the admission policy's peers"
+}
+netpol_check fallback-none
+netpol_check fallback-podmonitor --set metrics.podMonitor.enabled=true
+netpol_check fallback-selector --set metrics.podMonitor.enabled=true \
+  --set 'networkPolicy.metricsNamespaceSelector.matchLabels.team=ops'
+netpol_check set-metricsfrom --set metrics.podMonitor.enabled=true \
+  --set 'loadTest.metricsFrom[0].podSelector.matchLabels.app=scrape'
+netpol_check set-metricsfrom-no-podmonitor --set 'loadTest.metricsFrom[0].podSelector.matchLabels.app=scrape'
+
+# networkPolicy off: no env; the default render (loadTest disabled) has none either (golden above).
+render --set loadTest.enabled=true --set image.digest="$digest" --set loadTest.networkPolicy=false > "$tmp/no-netpol.yaml"
+[[ -z $(load_env "$tmp/no-netpol.yaml") ]] || fail "mon_01: MIMIC_LOAD_NETWORK_POLICY is set with loadTest.networkPolicy false"
+[[ -z $(load_env "$tmp/default.yaml") ]] || fail "mon_01: MIMIC_LOAD_NETWORK_POLICY is set in the default render"
+echo "mon_01: MIMIC_LOAD_NETWORK_POLICY is absent without loadTest.networkPolicy and in the default render"
+
 echo "chart checks passed"

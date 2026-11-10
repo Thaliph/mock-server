@@ -403,3 +403,31 @@ async fn ldt_09_names_that_are_not_dns_1123_are_refused() {
         Err(AdmitError::Name)
     );
 }
+
+#[tokio::test]
+async fn ldt_09_the_end_refuses_a_summary_over_the_cap_and_keeps_the_run_active() {
+    let (store, _m) = replica(None, config(Duration::from_secs(3600)));
+    let ns = unique("ldt");
+    store
+        .load_admit(&admit(&ns, "pay", UID, "{}"))
+        .await
+        .unwrap();
+    let big = summary(MAX_SUMMARY + 1);
+    assert_eq!(
+        store
+            .load_end(&ns, "pay", UID, &ended(&big, "Completed"))
+            .await,
+        Err(StoreError::TooLarge)
+    );
+    assert_eq!(
+        store.load_active(&ns, "pay", UID).await.unwrap(),
+        Some(false)
+    );
+    let exact = summary(MAX_SUMMARY);
+    assert_eq!(
+        store
+            .load_end(&ns, "pay", UID, &ended(&exact, "Completed"))
+            .await,
+        Ok(true)
+    );
+}

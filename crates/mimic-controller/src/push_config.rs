@@ -8,9 +8,9 @@ use mimic_runtime::config::{ConfigError, Env};
 
 use crate::store::StoreConfig;
 
-const KIB: u64 = 1024;
-const MIB: u64 = 1024 * KIB;
-const GIB: u64 = 1024 * MIB;
+pub(crate) const KIB: u64 = 1024;
+pub(crate) const MIB: u64 = 1024 * KIB;
+pub(crate) const GIB: u64 = 1024 * MIB;
 const DAY: u64 = 86_400;
 const DEFAULT_UI: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 
@@ -78,12 +78,12 @@ impl PushConfig {
     }
 }
 
-fn usize_of(n: u64) -> usize {
+pub(crate) fn usize_of(n: u64) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 /// An integer of `min..=max`.
-fn number<T>(env: &Env, var: &str, default: T, min: T, max: T) -> Result<T, ConfigError>
+pub(crate) fn number<T>(env: &Env, var: &str, default: T, min: T, max: T) -> Result<T, ConfigError>
 where
     T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
     T::Err: std::fmt::Display,
@@ -101,7 +101,13 @@ where
 }
 
 /// `<n>`, `<n>Ki`, `<n>Mi` or `<n>Gi` bytes, from `min` to `max`.
-fn size(env: &Env, var: &str, default: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
+pub(crate) fn size(
+    env: &Env,
+    var: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, ConfigError> {
     let Some(value) = env.optional(var) else {
         return Ok(default);
     };
@@ -139,7 +145,7 @@ fn human(bytes: u64) -> String {
 }
 
 /// A duration from `min` to `max` seconds.
-fn duration(
+pub(crate) fn duration(
     env: &Env,
     var: &str,
     default: u64,

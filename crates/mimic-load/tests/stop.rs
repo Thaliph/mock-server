@@ -117,6 +117,27 @@ fn ldt_13_without_the_controller_for_three_intervals_the_generator_stops() {
 }
 
 #[test]
+fn ldt_10_a_404_on_targets_or_results_is_a_stop_without_further_posts() {
+    let rig = Rig::new(&simple_plan(), &Params::closed(4, 60_000), &[Probe::Good]);
+    rig.targets[0].set_delay(Duration::from_millis(20));
+    let mut generator = rig.spawn("1s", &[]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(rig.targets[0].count() > 0);
+    let ended = Instant::now();
+    rig.state().ended.store(true, Ordering::SeqCst);
+    let status = generator.wait_exit(Duration::from_secs(15));
+    assert_eq!(status.code(), Some(1));
+    assert!(
+        ended.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        ended.elapsed()
+    );
+    // The run is gone: at most the post of the report that saw the 404 itself, no retries.
+    assert!(rig.state().late.load(Ordering::SeqCst) <= 1);
+    silent_after(&rig, ended, Duration::from_secs(3));
+}
+
+#[test]
 fn ldt_13_fnd_01_invalid_values_exit_2_before_listening() {
     let rig = Rig::new(&simple_plan(), &Params::closed(1, 1_000), &[Probe::Good]);
     let cases = [
