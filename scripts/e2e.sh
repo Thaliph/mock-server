@@ -2721,9 +2721,26 @@ mon02_ns=mon-02
 ns_fresh $mon02_ns mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
 admin_forward
 [[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "mon_02: the controller is not ready after the Valkey restart"
-# MON-13: one scrape of the controller has a TYPE line for each of its metrics of §9 and a mimic_limit series per name.
-ctl_body=$(curl -fs --max-time 10 localhost:18081/metrics) || ctl_body=""
-[[ -n $ctl_body ]] || fail "mon_02: the controller's /metrics does not answer"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: mon02, namespace: $mon02_ns}
+spec: {deployment: mon02-app}
+YAML
+deploy_sleeper $mon02_ns mon02-app
+kubectl -n $mon02_ns rollout status deploy/mon02-app --timeout=3m
+# MON-13: the controller pods together have a TYPE line for each of their metrics of §9 and a mimic_limit series per
+# name. Every pod is scraped, after the app's rollout: a labelled family has no TYPE line before its first series, and
+# the one admission since the Valkey restart went to one replica only.
+ctl_body=""
+for p in $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller -o name); do
+  kubectl -n "$NS" port-forward "$p" 18091:8081 >/dev/null 2>&1 &
+  pf=$!
+  for _ in $(seq 50); do curl -fs --max-time 2 -o /dev/null localhost:18091/readyz && break; sleep 0.2; done
+  ctl_body+=$(curl -fs --max-time 10 localhost:18091/metrics || true)$'\n'
+  kill "$pf" 2>/dev/null || true; wait "$pf" 2>/dev/null || true
+done
+[[ -n ${ctl_body//[[:space:]]/} ]] || fail "mon_02: the controller's /metrics does not answer"
 missing=$(mon02_missing "$ctl_body" process_cpu_seconds_total process_resident_memory_bytes process_open_fds \
   process_max_fds process_start_time_seconds mimic_webhook_admissions_total \
   mimic_webhook_certificate_expiry_timestamp_seconds mimic_webhook_admission_duration_seconds \
@@ -2738,14 +2755,6 @@ for n in webhook_max_connections sidecar_api_rate sidecar_api_max_report_bytes s
   grep -qF "mimic_limit{name=\"$n\"}" <<<"$ctl_body" || missing+="$n "
 done
 [[ -z $missing ]] || fail "mon_02: the controller's /metrics has no mimic_limit series for: $missing"
-kubectl apply -f - >/dev/null <<YAML
-apiVersion: mimic.platform.io/v1alpha1
-kind: MimicWorkload
-metadata: {name: mon02, namespace: $mon02_ns}
-spec: {deployment: mon02-app}
-YAML
-deploy_sleeper $mon02_ns mon02-app
-kubectl -n $mon02_ns rollout status deploy/mon02-app --timeout=3m
 # The namespace and its MimicWorkload are new, so any status was written after the Valkey restart: status.mode.pods
 # comes from the pod's pull fields in Valkey. Either replica may apply it (the other then sees no change, CTL-18),
 # so the check reads the object, not one replica's counter.
