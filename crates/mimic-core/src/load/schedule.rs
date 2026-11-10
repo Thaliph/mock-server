@@ -46,8 +46,16 @@ pub fn planned_rate(
     duration_ms: u64,
     elapsed_ms: u64,
 ) -> Option<f64> {
-    let _ = (rate, ramp_up_ms, duration_ms, elapsed_ms);
-    None
+    let rate = rate? as f64;
+    if elapsed_ms >= duration_ms {
+        return Some(0.0);
+    }
+    let ramp = ramp_up_ms.min(duration_ms);
+    if elapsed_ms < ramp {
+        Some(rate * elapsed_ms as f64 / ramp as f64)
+    } else {
+        Some(rate)
+    }
 }
 
 /// Closed model workers at `elapsed_ms`: 0 from `duration_ms` on.

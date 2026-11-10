@@ -5,12 +5,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use base64::Engine;
@@ -22,7 +24,8 @@ use mimic_core::inject::{
 };
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use prometheus_client::registry::Registry;
+use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::registry::{Registry, Unit};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -38,22 +41,50 @@ const SKIPPED_ANNOTATION: &str = "mimic.platform.io/skipped";
 
 type Labels = Vec<(String, String)>;
 
-/// `mimic_webhook_admissions_total{result,reason}`.
-#[derive(Clone, Default)]
+/// Admissions are sub-5 ms: the buckets start at 1 ms.
+const DURATION_BUCKETS: [f64; 13] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// `mimic_webhook_admissions_total{result,reason}` and
+/// `mimic_webhook_admission_duration_seconds`.
+#[derive(Clone)]
 pub struct AdmissionMetrics {
     admissions: Family<Labels, Counter>,
+    duration: Histogram,
 }
 
 impl AdmissionMetrics {
     pub fn register(registry: &mut Registry) -> AdmissionMetrics {
-        let metrics = AdmissionMetrics::default();
+        let metrics = AdmissionMetrics {
+            admissions: Family::default(),
+            duration: Histogram::new(DURATION_BUCKETS),
+        };
         registry.register(
             "webhook_admissions",
             "Admission reviews answered by the injection webhook",
             metrics.admissions.clone(),
         );
+        registry.register_with_unit(
+            "webhook_admission_duration",
+            "Time to answer one admission request",
+            Unit::Seconds,
+            metrics.duration.clone(),
+        );
         metrics
     }
+}
+
+/// Times a request to `/inject/*`, from the head read to the response handed to the codec.
+async fn timed(
+    State(metrics): State<AdmissionMetrics>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let start = Instant::now();
+    let response = next.run(request).await;
+    metrics.duration.observe(start.elapsed().as_secs_f64());
+    response
 }
 
 /// A root certificate (PEM) with the seed it was derived from.
@@ -124,6 +155,10 @@ pub fn router(admission: Arc<Admission>) -> Router {
         .route("/inject/namespace", endpoint(NamespaceMode::Enabled))
         .route("/inject/workload", endpoint(NamespaceMode::Selected))
         .route("/inject/pod", endpoint(NamespaceMode::Absent))
+        .route_layer(middleware::from_fn_with_state(
+            admission.metrics.clone(),
+            timed,
+        ))
         .with_state(admission)
 }
 
@@ -928,7 +963,10 @@ pub(crate) mod tests {
         let spec = include_str!("../../../docs/SPEC.md");
         let row = spec
             .lines()
-            .find(|l| l.trim_start().starts_with("| `mimic_webhook_admissions_total`"))
+            .find(|l| {
+                l.trim_start()
+                    .starts_with("| `mimic_webhook_admissions_total`")
+            })
             .expect("the §9 row");
         let listed: std::collections::BTreeSet<&str> = row
             .split("`reason`:")
