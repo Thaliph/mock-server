@@ -2741,8 +2741,10 @@ kubectl -n "$NS" delete pod mon02-scraper --wait=false >/dev/null
 
 # --- MON-21 (spec §12.13, §10.7, #379): the bundled Prometheus and Grafana, enabled by an upgrade -------------------
 # The upgrade enables monitoring.prometheus, monitoring.grafana and valkey.metrics (the exporter target). The checks run
-# in a pod of the release namespace through kubectl exec, so no host port is used. Grafana is queried with the admin
-# password, which is read from its Secret into a variable and sent on stdin: it is never printed and never in argv.
+# in pods of the release namespace through kubectl exec, so no host port is used. The Prometheus API is called from the
+# pod the Prometheus NetworkPolicy admits (mon21-prom), and an unlabelled pod is refused (mon21-client). Grafana is
+# queried with the admin password, which is read from its Secret into a variable and sent on stdin: it is never
+# printed and never in argv.
 # A successful login proves the admin password file is mounted; the provisioned datasource and the dashboard both prove
 # the provisioning and the /tmp/dashboards mounts on the read-only root. Ready pods prove that the images start with no
 # command override (the Deployment sets none).
@@ -2759,24 +2761,31 @@ kubectl -n "$NS" rollout status deploy/$RELEASE-grafana --timeout=3m || fail "mo
 grafana_pw=$(kubectl -n "$NS" get secret $RELEASE-grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d)
 [[ ${#grafana_pw} == 32 ]] || fail "mon_21: the admin password Secret does not hold 32 characters"
 
-# The client: the Python image, restricted, in the release namespace.
-kubectl apply -f - >/dev/null <<YAML
-apiVersion: v1
-kind: Pod
-metadata: {name: mon21-client, namespace: $NS}
-spec:
-  automountServiceAccountToken: false
-  securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
-  containers:
-    - name: client
-      image: $PY
-      command: [sleep, "900"]
-      securityContext:
-        allowPrivilegeEscalation: false
-        readOnlyRootFilesystem: true
-        capabilities: {drop: [ALL]}
-YAML
+# The clients: the Python image, restricted, in the release namespace (MON-21). mon21-client has no labels, so the
+# Prometheus NetworkPolicy refuses it; it queries Grafana (admitted from the release namespace) and proves the refusal.
+# mon21-prom carries exactly the labels of the Prometheus policy's ingress selector, read from the live NetworkPolicy
+# (never hard-coded): the policy admits it, and every Prometheus API call of this section goes through it.
+# client_pod <name> <labels JSON>: create one client pod.
+client_pod() {
+  jq -n --arg name "$1" --arg ns "$NS" --arg image "$PY" --argjson labels "$2" '{
+    apiVersion: "v1", kind: "Pod",
+    metadata: {name: $name, namespace: $ns, labels: $labels},
+    spec: {
+      automountServiceAccountToken: false,
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: "RuntimeDefault"}},
+      containers: [{
+        name: "client", image: $image, command: ["sleep", "900"],
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}
+      }]
+    }
+  }' | kubectl apply -f - >/dev/null
+}
+prom_labels=$(kubectl -n "$NS" get networkpolicy $RELEASE-prometheus -o jsonpath='{.spec.ingress[0].from[0].podSelector.matchLabels}')
+[[ -n $prom_labels && $prom_labels != null ]] || fail "mon_21: the Prometheus NetworkPolicy admits no labelled pod"
+client_pod mon21-client '{}'
+client_pod mon21-prom "$prom_labels"
 kubectl -n "$NS" wait --for=condition=Ready pod/mon21-client --timeout=2m >/dev/null || fail "mon_21: the client pod is not Ready"
+kubectl -n "$NS" wait --for=condition=Ready pod/mon21-prom --timeout=2m >/dev/null || fail "mon_21: the Prometheus client pod is not Ready"
 
 # mon21_py: GET argv[1] and print its status on the first line, then the body. With a second argument the admin
 # password is read from stdin and sent as Basic auth. Connection failures print status 0.
@@ -2796,14 +2805,18 @@ except OSError:
 sys.stdout.write("%d\n%s" % (code, body.decode("utf-8", "replace")))
 PY
 )
-# mon21_get <url> [auth]: the response of a GET from the client pod (status line, then body). Empty on a failure.
-mon21_get() {
-  if [[ ${2:-} == auth ]]; then
-    printf '%s' "$grafana_pw" | kubectl -n "$NS" exec -i mon21-client -- python3 -I -c "$mon21_py" "$1" auth 2>/dev/null || true
+# mon21_fetch <pod> <url> [auth]: the response of a GET from the client pod <pod> (status line, then body). Empty when
+# the exec fails.
+mon21_fetch() {
+  local pod=$1 url=$2
+  if [[ ${3:-} == auth ]]; then
+    printf '%s' "$grafana_pw" | kubectl -n "$NS" exec -i "$pod" -- python3 -I -c "$mon21_py" "$url" auth 2>/dev/null || true
   else
-    kubectl -n "$NS" exec mon21-client -- python3 -I -c "$mon21_py" "$1" 2>/dev/null || true
+    kubectl -n "$NS" exec "$pod" -- python3 -I -c "$mon21_py" "$url" 2>/dev/null || true
   fi
 }
+# mon21_get <url> [auth]: the same from mon21-client (the Grafana checks).
+mon21_get() { mon21_fetch mon21-client "$@"; }
 mon21_status() { head -n 1 <<<"$1"; }
 mon21_body() { tail -n +2 <<<"$1"; }
 
@@ -2844,8 +2857,12 @@ targets_up() {
       and any($up[]; .labels.job == "mimic-sidecar" and .labels.namespace == $ns and .labels.deployment == "mon21-app")
   ' >/dev/null 2>&1 <<<"$1"
 }
-ready=$(mon21_get http://$RELEASE-prometheus:9090/-/ready)
-[[ $(mon21_status "$ready") == 200 ]] || fail "mon_21: Prometheus /-/ready does not answer 200"
+ready=$(mon21_fetch mon21-prom http://$RELEASE-prometheus:9090/-/ready)
+[[ $(mon21_status "$ready") == 200 ]] || fail "mon_21: Prometheus /-/ready does not answer 200 from the admitted pod"
+# The negative check (MON-21): the unlabelled pod gets no HTTP answer from 9090, only a timeout or a connection failure
+# (status 0). It runs after the admitted pod got 200, so the name resolves and the refusal is the policy's.
+refused=$(mon21_fetch mon21-client http://$RELEASE-prometheus:9090/-/ready)
+[[ $(mon21_status "$refused") == 0 ]] || fail "mon_21: the unlabelled pod got an HTTP answer from the Prometheus API on 9090"
 # Within 120 s (MON-21): the deadline is on the clock, since each request takes time of its own.
 targets=""
 deadline=$((SECONDS + 120))
@@ -2896,7 +2913,7 @@ except OSError:
     code = 0
 print(code)'
 for path in /-/reload /api/v1/admin/tsdb/snapshot; do
-  code=$(kubectl -n "$NS" exec mon21-client -- python3 -I -c "$mon21_post" "http://$RELEASE-prometheus:9090$path" 2>/dev/null || echo 0)
+  code=$(kubectl -n "$NS" exec mon21-prom -- python3 -I -c "$mon21_post" "http://$RELEASE-prometheus:9090$path" 2>/dev/null || echo 0)
   (( code >= 400 && code < 600 )) || fail "mon_21: POST $path answered $code, not a refusal"
 done
 
@@ -2923,7 +2940,7 @@ echo "mon_21: Prometheus targets up, Grafana healthy and provisioned, the dashbo
 
 # Back to the defaults: the later sections see the chart without the bundled monitoring.
 kubectl delete namespace $mon21_ns --wait=false >/dev/null
-kubectl -n "$NS" delete pod mon21-client --wait=false >/dev/null
+kubectl -n "$NS" delete pod mon21-client mon21-prom --wait=false >/dev/null
 kubectl -n "$NS" delete configmap mon21-dashboard mon21-dashboard-off --ignore-not-found >/dev/null
 install || fail "mon_21: helm upgrade back to the defaults"
 kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
