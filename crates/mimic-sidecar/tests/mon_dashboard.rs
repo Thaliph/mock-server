@@ -198,7 +198,7 @@ fn overhead(metrics: &Metrics, direction: &str) -> (f64, f64) {
     );
     let le = sum(
         metrics,
-        &format!("mimic_proxy_overhead_seconds_bucket{{direction=\"{direction}\",le=\"0.1\"}}"),
+        &format!("mimic_proxy_overhead_seconds_bucket{{le=\"0.1\",direction=\"{direction}\"}}"),
     );
     (count, le)
 }

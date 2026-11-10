@@ -1747,10 +1747,10 @@ async fn mon_10_the_last_new_endpoint_time_is_set_by_a_new_endpoint_only() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(metric(&rig, LAST_NEW_INBOUND), first);
     let (stop, task) = rig.start();
-    wait(|| rig.api.acknowledged() == 1).await;
+    wait(|| rig.api.acknowledged() == 2).await;
     wait(|| rig.discovery.report().exchanges() == 0).await;
     rig.call("users", 3).await;
-    wait(|| rig.api.acknowledged() == 2).await;
+    wait(|| rig.api.acknowledged() == 3).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(metric(&rig, LAST_NEW_INBOUND), first);
 

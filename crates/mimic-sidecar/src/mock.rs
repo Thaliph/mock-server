@@ -472,6 +472,10 @@ struct Flight {
     method: String,
     path: String,
     started: Instant,
+    /// When the request was handed over, and the time spent waiting for the simulated latency:
+    /// the sidecar's own time (spec §9) is the difference.
+    entered: Instant,
+    slept: Duration,
     answered: bool,
     /// Held until the answer is returned.
     slot: Option<Pending>,
@@ -496,6 +500,10 @@ impl Flight {
         self.answered = true;
         let head = self.started.elapsed();
         let ctx = &self.conn.ctx;
+        ctx.proxy.overhead(
+            ctx.direction,
+            self.entered.elapsed().saturating_sub(self.slept),
+        );
         let protocol = self.conn.protocol;
         let bytes_out = response.body().len() as u64;
         ctx.proxy.request(
@@ -813,6 +821,7 @@ impl Conn {
         request: Request<Incoming>,
     ) -> Result<Response<MockBody>, BoxError> {
         let _open = Open::new(&self.streams);
+        let entered = Instant::now();
         let started = self
             .clock
             .as_ref()
@@ -837,6 +846,8 @@ impl Conn {
             method: parts.method.as_str().to_string(),
             path: parts.uri.path().to_string(),
             started,
+            entered,
+            slept: Duration::ZERO,
             answered: false,
             slot: None,
         };
@@ -878,7 +889,9 @@ impl Conn {
         }
         if delay > 0 {
             let due = tokio::time::Instant::from_std(started) + Duration::from_millis(delay);
+            let sleeping = Instant::now();
             tokio::time::sleep_until(due).await;
+            flight.slept = sleeping.elapsed();
         }
         let out = http_response(&response, false);
         flight.answer(&response, label, miss, bytes_in);

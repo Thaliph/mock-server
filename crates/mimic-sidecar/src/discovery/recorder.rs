@@ -96,6 +96,10 @@ pub(super) struct Recorder {
     known: BTreeSet<Key>,
     /// Likewise for the egress report.
     egress_known: BTreeSet<Key>,
+    /// The endpoints this process has recorded, across freezes (the shape survives a push,
+    /// spec §7.2), for `mimic_discovery_last_new_endpoint_timestamp_seconds`: a template stands
+    /// for the literals it covers, and the set is bounded.
+    seen: BTreeSet<Key>,
     sample_budget_full: bool,
     /// The directions whose limit was logged: each logs it once.
     endpoint_limit_logged: BTreeSet<&'static str>,
@@ -242,19 +246,22 @@ fn status_ok(record: &Record) -> bool {
 
 /// How many parameters `template` has when it matches `path`, `None` when it does not.
 fn matches(template: &str, path: &str) -> Option<usize> {
-    let (t, p): (Vec<_>, Vec<_>) = (template.split('/').collect(), path.split('/').collect());
-    if t.len() != p.len() {
-        return None;
-    }
+    // No allocation: it runs for every endpoint the recorder knows, at each new one.
+    let (mut t, mut p) = (template.split('/'), path.split('/'));
     let mut params = 0;
-    for (a, b) in t.iter().zip(&p) {
-        if a.starts_with('{') && a.ends_with('}') {
-            params += 1;
-        } else if a != b {
-            return None;
+    loop {
+        match (t.next(), p.next()) {
+            (None, None) => return Some(params),
+            (Some(a), Some(b)) => {
+                if a.starts_with('{') && a.ends_with('}') {
+                    params += 1;
+                } else if a != b {
+                    return None;
+                }
+            }
+            _ => return None,
         }
     }
-    Some(params)
 }
 
 impl Recorder {
@@ -276,6 +283,7 @@ impl Recorder {
             epoch: 0,
             known: BTreeSet::new(),
             egress_known: BTreeSet::new(),
+            seen: BTreeSet::new(),
             sample_budget_full: false,
             endpoint_limit_logged: BTreeSet::new(),
             authority_limit_logged: false,
@@ -598,6 +606,41 @@ impl Recorder {
         } else {
             &mut self.known
         };
+        let scope = authority.cloned().unwrap_or(ScopeKey::Port(record.port));
+        let covered = self.seen.iter().any(|(d, s, method, template)| {
+            *d == record.direction
+                && *s == scope
+                && *method == request.method
+                && matches(template, &request.path).is_some()
+        });
+        if !covered {
+            self.metrics.new_endpoint(direction);
+        }
+        // What the tree lost to absorption leaves the set; the endpoint of this exchange
+        // joins it, and a template drops the literals it covers.
+        for key in known.difference(&now) {
+            self.seen.remove(key);
+        }
+        let own = now
+            .iter()
+            .filter(|(d, s, method, _)| {
+                *d == record.direction && *s == scope && *method == request.method
+            })
+            .filter_map(|key| Some((matches(&key.3, &request.path)?, key)))
+            .min()
+            .map(|(_, key)| key.clone());
+        if let Some(own) = own {
+            self.seen.retain(|(d, s, method, template)| {
+                !(*d == own.0
+                    && *s == own.1
+                    && *method == own.2
+                    && *template != own.3
+                    && matches(&own.3, template).is_some())
+            });
+            if !covered && self.seen.len() < self.limits.max_endpoints.saturating_mul(4) {
+                self.seen.insert(own);
+            }
+        }
         let removed: Vec<&Key> = known.difference(&now).collect();
         if removed.is_empty() {
             for (d, scope, method, template) in now.difference(known) {

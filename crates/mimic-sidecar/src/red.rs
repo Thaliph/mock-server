@@ -23,6 +23,16 @@ const DURATION_BUCKETS: [f64; 13] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Time spent in the sidecar per exchange, upstream wait excluded: 100 µs to 100 ms.
+const OVERHEAD_BUCKETS: [f64; 10] = [
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct DirectionLabel {
+    direction: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct RequestLabels {
     direction: &'static str,
@@ -58,6 +68,10 @@ fn new_histogram() -> Histogram {
     Histogram::new(DURATION_BUCKETS)
 }
 
+fn new_overhead() -> Histogram {
+    Histogram::new(OVERHEAD_BUCKETS)
+}
+
 /// The proxy's request, connection and byte counters.
 #[derive(Clone)]
 pub struct ProxyMetrics {
@@ -65,6 +79,10 @@ pub struct ProxyMetrics {
     durations: Durations,
     connections: Family<ConnectionLabels, Counter>,
     bytes: Family<BytesLabels, Counter>,
+    /// `mimic_proxy_overhead_seconds`, one histogram per direction (inbound, outbound), held
+    /// here so that an observation looks nothing up and allocates nothing.
+    overhead: [Histogram; 2],
+    overhead_family: Family<DirectionLabel, Histogram, fn() -> Histogram>,
     /// One budget per (metric, direction); the set restarts empty with the process.
     budgets: Arc<Mutex<BTreeMap<(&'static str, &'static str), AuthorityBudget>>>,
     max_authorities: usize,
@@ -79,7 +97,17 @@ impl Default for ProxyMetrics {
 impl ProxyMetrics {
     /// Metrics that are not exposed anywhere.
     pub fn new(max_authorities: usize) -> ProxyMetrics {
+        let overhead_family = Family::new_with_constructor(new_overhead as fn() -> Histogram);
+        let overhead = [Direction::Inbound, Direction::Outbound].map(|direction| {
+            overhead_family
+                .get_or_create(&DirectionLabel {
+                    direction: direction.as_str(),
+                })
+                .clone()
+        });
         ProxyMetrics {
+            overhead,
+            overhead_family,
             requests: Family::default(),
             durations: Family::new_with_constructor(new_histogram as fn() -> Histogram),
             connections: Family::default(),
@@ -112,6 +140,12 @@ impl ProxyMetrics {
             "proxy_bytes",
             "Bytes relayed (body bytes for HTTP)",
             proxy.bytes.clone(),
+        );
+        registry.register_with_unit(
+            "proxy_overhead",
+            "Time spent in the sidecar per HTTP exchange, upstream wait excluded",
+            Unit::Seconds,
+            proxy.overhead_family.clone(),
         );
         proxy
     }
@@ -153,6 +187,16 @@ impl ProxyMetrics {
                 status_class: class,
             })
             .observe(head.as_secs_f64());
+    }
+
+    /// The sidecar's own time for one exchange answered with a response head (spec §9).
+    pub(crate) fn overhead(&self, direction: Direction, spent: Duration) {
+        self.overhead[usize::from(direction == Direction::Outbound)].observe(spent.as_secs_f64());
+    }
+
+    /// The histogram of `direction`, for a relay that observes it without the whole registry.
+    pub(crate) fn overhead_histogram(&self, direction: Direction) -> Histogram {
+        self.overhead[usize::from(direction == Direction::Outbound)].clone()
     }
 
     /// One HTTP request that never got a response head (`status_class="none"`) and that is

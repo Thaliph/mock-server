@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT, READ_AHEAD};
+use prometheus_client::metrics::histogram::Histogram;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
@@ -61,6 +62,28 @@ type Failure = (Side, io::Error);
 struct State<F> {
     codec: Codec,
     on_event: F,
+    overhead: Option<Overhead>,
+}
+
+/// `mimic_proxy_overhead_seconds` of the connection: the time the sidecar spent on the request
+/// head of each exchange (the codec and the observation of its events), kept until the
+/// response head comes, and then observed with the time spent on that one. Waits (for the
+/// upstream, for the pacing of the pipeline) and socket writes are not in it.
+struct Overhead {
+    histogram: Histogram,
+    requests: VecDeque<Duration>,
+}
+
+impl Overhead {
+    fn exchanges(&mut self, spent: Duration, requests: usize, responses: usize) {
+        for _ in 0..requests {
+            self.requests.push_back(spent);
+        }
+        for _ in 0..responses {
+            let request = self.requests.pop_front().unwrap_or_default();
+            self.histogram.observe((request + spent).as_secs_f64());
+        }
+    }
 }
 
 struct Relay<F> {
@@ -219,14 +242,26 @@ fn response_head(held: &[u8]) -> Option<(usize, u16)> {
 
 impl<F: FnMut(Event)> Relay<F> {
     fn with<T>(&self, f: impl FnOnce(&mut Codec) -> (T, Vec<Event>)) -> T {
+        let began = Instant::now();
         // A poisoned lock means the sink panicked: the relay task is gone anyway.
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (out, events) = f(&mut state.codec);
+        let (mut requests, mut responses) = (0, 0);
         for event in events {
+            match event {
+                Event::Request(_) => requests += 1,
+                Event::Response(_) => responses += 1,
+                _ => {}
+            }
             (state.on_event)(event);
+        }
+        if requests + responses > 0
+            && let Some(overhead) = state.overhead.as_mut()
+        {
+            overhead.exchanges(began.elapsed(), requests, responses);
         }
         let opaque = state.codec.is_opaque();
         drop(state);
@@ -614,6 +649,7 @@ pub async fn relay(
         false,
         None,
         None,
+        None,
         on_event,
         stop,
         abort_signal,
@@ -636,6 +672,7 @@ pub async fn relay_with(
     capture: bool,
     mock: Option<Mock>,
     watch: Option<Watch>,
+    overhead: Option<Histogram>,
     on_event: impl FnMut(Event) + Send,
     stop: impl Future<Output = ()> + Send,
     abort_signal: impl Future<Output = ()> + Send,
@@ -656,6 +693,10 @@ pub async fn relay_with(
                 }
             },
             on_event,
+            overhead: overhead.map(|histogram| Overhead {
+                histogram,
+                requests: VecDeque::new(),
+            }),
         }),
         unblocked: Notify::new(),
         stopping: AtomicBool::new(false),
