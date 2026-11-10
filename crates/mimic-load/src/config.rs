@@ -32,6 +32,8 @@ pub struct Config {
     pub credentials_dir: Option<PathBuf>,
     pub interval: Duration,
     pub max_plan: usize,
+    /// `MIMIC_LOAD_PROBE_PORT`: the targets' admin port (spec §10.6).
+    pub probe_port: u16,
     /// The pod's own name (`MIMIC_POD_NAME`, else the host name).
     pub pod: String,
 }
@@ -119,6 +121,7 @@ impl Config {
             Some(value) => plan_limit(value)
                 .map_err(|e| ConfigError::invalid("MIMIC_LOAD_MAX_PLAN", value, e))?,
         };
+        let probe_port = env.parse_or("MIMIC_LOAD_PROBE_PORT", crate::http::PROBE_PORT)?;
         let pod = env
             .optional("MIMIC_POD_NAME")
             .map(str::to_string)
@@ -142,6 +145,7 @@ impl Config {
                 .map(PathBuf::from),
             interval,
             max_plan,
+            probe_port,
             pod,
         })
     }

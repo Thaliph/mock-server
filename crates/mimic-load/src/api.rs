@@ -23,6 +23,8 @@ pub enum ApiError {
     /// `404`: the run is unknown or ended.
     Gone,
     Status(u16),
+    /// The answer is over the limit of its route.
+    TooLarge,
     Transport(String),
 }
 
@@ -31,6 +33,7 @@ impl std::fmt::Display for ApiError {
         match self {
             ApiError::Gone => f.write_str("run unknown or ended (404)"),
             ApiError::Status(code) => write!(f, "status {code}"),
+            ApiError::TooLarge => f.write_str("answer too large"),
             ApiError::Transport(message) => f.write_str(message),
         }
     }
@@ -92,6 +95,7 @@ struct PostAnswer {
     stop: bool,
 }
 
+#[derive(Clone)]
 pub struct Api {
     http: reqwest::Client,
     base: String,
@@ -168,7 +172,7 @@ impl Api {
             .map_err(|e| ApiError::Transport(e.without_url().to_string()))?
         {
             if bytes.len() + chunk.len() > cap {
-                return Err(ApiError::Transport("answer too large".into()));
+                return Err(ApiError::TooLarge);
             }
             bytes.extend_from_slice(&chunk);
         }

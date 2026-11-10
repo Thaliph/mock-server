@@ -2330,6 +2330,7 @@ it sets. The pod's index and the Job's pod count come from the load API (§7.8).
 | `MIMIC_LOAD_CREDENTIALS_DIR` | `/mimic/credentials` | Mounted credentials Secret; absent when the spec has none. |
 | `MIMIC_LOAD_REPORT_INTERVAL` | `5s` | Period of the targets poll and the results post, 1s–1m. |
 | `MIMIC_LOAD_MAX_PLAN` | `8Mi` | Largest plan read (same syntax as the controller's). |
+| `MIMIC_LOAD_PROBE_PORT` | `15100` | The targets' admin port, where the probe of §7.8 is sent. The Job never sets it (the admission policy lists the allowed names); it is for tests. |
 
 `mimic-load` has the common variables (§10.1) and admin listener (`0.0.0.0:15100`).
 

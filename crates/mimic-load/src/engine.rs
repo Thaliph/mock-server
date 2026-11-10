@@ -236,7 +236,14 @@ impl Shared {
         for (ip, pod) in list {
             let shared = self.clone();
             probes.spawn(async move {
-                let result = probe(ip, &shared.config.run, &shared.config.deployment, &pod).await;
+                let result = probe(
+                    ip,
+                    shared.config.probe_port,
+                    &shared.config.run,
+                    &shared.config.deployment,
+                    &pod,
+                )
+                .await;
                 (pod, result)
             });
         }
@@ -261,8 +268,10 @@ impl Shared {
 
     fn release(&self, ip: IpAddr, port: u16, conn: Conn) {
         let mut pool = lock(&self.pool);
+        // Idle connections are bounded per target and together.
+        let total: usize = pool.values().map(Vec::len).sum();
         let idle = pool.entry((ip, port)).or_default();
-        if (idle.len() as u64) < self.params.concurrency {
+        if (idle.len() as u64) < self.params.concurrency && total < MAX_IDLE {
             idle.push(conn);
         }
     }
@@ -272,7 +281,15 @@ impl Shared {
         if let Some(conn) = self.pooled(ip, port) {
             return Acquired::Conn(conn, true);
         }
-        match probe(ip, &self.config.run, &self.config.deployment, pod).await {
+        match probe(
+            ip,
+            self.config.probe_port,
+            &self.config.run,
+            &self.config.deployment,
+            pod,
+        )
+        .await
+        {
             Ok(()) => self.touch_verified(),
             Err(why) => {
                 self.unverified(pod, why);
@@ -545,23 +562,35 @@ async fn pause(duration: Duration, shutdown: &Shutdown) -> bool {
 }
 
 /// The plan, retried for three intervals.
+/// Why there is no plan to run.
+enum PlanError {
+    /// Read, but not to be run: the generator posts and exits.
+    Refused(String),
+    Missing(String),
+}
+
 async fn fetch_plan(
     api: &Api,
     interval: Duration,
     shutdown: &Shutdown,
-) -> Result<crate::api::PlanAnswer, String> {
+) -> Result<crate::api::PlanAnswer, PlanError> {
+    let missing = |why: &str| PlanError::Missing(why.to_string());
     let begun = Instant::now();
     loop {
         match api.plan().await {
             Ok(answer) => return Ok(answer),
-            Err(ApiError::Gone) => return Err("the run is unknown or ended".into()),
+            Err(ApiError::Gone) => return Err(missing("the run is unknown or ended")),
+            // A plan over the limit never gets smaller: refuse it, with a final post.
+            Err(ApiError::TooLarge) => {
+                return Err(PlanError::Refused("plan over MIMIC_LOAD_MAX_PLAN".into()));
+            }
             Err(error) => {
                 tracing::warn!(error = %error, "plan not read");
                 if begun.elapsed() >= interval * CONTROL_INTERVALS {
-                    return Err("no plan for three intervals".into());
+                    return Err(missing("no plan for three intervals"));
                 }
                 if !pause(interval, shutdown).await {
-                    return Err("stopped before the plan was read".into());
+                    return Err(missing("stopped before the plan was read"));
                 }
             }
         }
@@ -597,6 +626,9 @@ async fn post_final(api: &Api, shared: &Shared, reason: Reason, grace: Duration)
     }
 }
 
+/// Idle connections kept in all, over every target.
+const MAX_IDLE: usize = 512;
+
 /// A plan or parameters the generator will not run: no request, a final post, exit code 1.
 async fn refuse(api: &Api, config: &Config, why: String) -> u8 {
     tracing::error!(error = %why, "plan refused");
@@ -630,7 +662,8 @@ pub async fn generate(
     };
     let answer = match fetch_plan(&api, interval, &shutdown).await {
         Ok(answer) => answer,
-        Err(error) => {
+        Err(PlanError::Refused(why)) => return refuse(&api, &config, why).await,
+        Err(PlanError::Missing(error)) => {
             tracing::error!(error = %error, "no plan");
             return 1;
         }
@@ -732,11 +765,21 @@ async fn supervise(shared: &Arc<Shared>, api: &Api, shutdown: &Shutdown, begun: 
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
+    // The poll and the post run beside the loop: a slow controller never delays a stop.
+    // The last answer came before the probes, which can take 2 s: the run starts a new count.
+    let _ = control;
+    let control = Arc::new(Mutex::new(Instant::now()));
+    let mut reporting: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                report(shared, api, &mut control).await;
-                if control.elapsed() >= interval * CONTROL_INTERVALS {
+                if reporting.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
+                    let (shared, api, control) = (shared.clone(), api.clone(), control.clone());
+                    reporting = Some(tokio::spawn(async move {
+                        report(&shared, &api, &control).await;
+                    }));
+                }
+                if lock(&control).elapsed() >= interval * CONTROL_INTERVALS {
                     shared.halt(Reason::ControlLost);
                 }
                 if lock(&shared.verified_at).elapsed() >= start_timeout {
@@ -753,6 +796,9 @@ async fn supervise(shared: &Arc<Shared>, api: &Api, shutdown: &Shutdown, begun: 
             break;
         }
     }
+    if let Some(handle) = reporting {
+        handle.abort();
+    }
     let reason = shared.reason().unwrap_or(Reason::Completed);
     if !load.is_finished() && tokio::time::timeout(WIND_DOWN, &mut load).await.is_err() {
         load.abort();
@@ -761,10 +807,10 @@ async fn supervise(shared: &Arc<Shared>, api: &Api, shutdown: &Shutdown, begun: 
 }
 
 /// One poll of the targets and one post of the results; `control` is the last answer.
-async fn report(shared: &Arc<Shared>, api: &Api, control: &mut Instant) {
+async fn report(shared: &Arc<Shared>, api: &Api, control: &Mutex<Instant>) {
     match api.targets().await {
         Ok(answer) => {
-            *control = Instant::now();
+            *lock(control) = Instant::now();
             if answer.stop {
                 shared.halt(Reason::Stopped);
             } else {
@@ -783,7 +829,7 @@ async fn report(shared: &Arc<Shared>, api: &Api, control: &mut Instant) {
     };
     match api.post(&post).await {
         Ok(stop) => {
-            *control = Instant::now();
+            *lock(control) = Instant::now();
             if stop {
                 shared.halt(Reason::Stopped);
             }
