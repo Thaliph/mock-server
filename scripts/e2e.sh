@@ -2719,9 +2719,13 @@ done
 (( grown == 1 )) || fail "mon_02: no status pass of the controller succeeded after the Valkey restart"
 
 # The sidecar's /metrics answers from the scraper pod in the release namespace (no policy on 15100 by design).
-sidecar_ip=$(kubectl -n $mon02_ns get pods -l app=mon02-app -o jsonpath='{.items[0].status.podIP}')
+sidecar_pod=$(kubectl -n $mon02_ns get pods -l app=mon02-app -o jsonpath='{.items[0].metadata.name}')
+sidecar_ip=$(kubectl -n $mon02_ns get pod "$sidecar_pod" -o jsonpath='{.status.podIP}')
 [[ -n $sidecar_ip ]] || fail "mon_02: the injected pod has no IP"
-sidecar_body=$(mon02_get "http://$sidecar_ip:15100/metrics")
+# The port by its name (MON-03): the sidecar container declares mimic-admin on 15100, the port a PodMonitor scrapes.
+sidecar_port=$(kubectl -n $mon02_ns get pod "$sidecar_pod" -o jsonpath='{.spec.containers[?(@.name=="mimic-sidecar")].ports[?(@.name=="mimic-admin")].containerPort}')
+[[ $sidecar_port == 15100 ]] || fail "mon_02: the sidecar container does not declare the port mimic-admin on 15100"
+sidecar_body=$(mon02_get "http://$sidecar_ip:$sidecar_port/metrics")
 grep -qF 'mimic_build_info{component="sidecar"' <<<"$sidecar_body" \
   || fail "mon_02: the sidecar's /metrics on 15100 does not answer from the release namespace"
 
