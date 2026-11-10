@@ -2667,6 +2667,15 @@ mon02_get() {
   kubectl -n "$NS" exec mon02-scraper -- python3 -c \
     'import sys, urllib.request; sys.stdout.write(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())' "$1" 2>/dev/null || true
 }
+# mon02_missing <body> <names...>: prints each name with no "# TYPE" line in the Prometheus text <body> (MON-13). A counter
+# is matched with or without its _total suffix, since encoders differ on whether the TYPE line keeps it.
+mon02_missing() {
+  local body=$1 n
+  shift
+  for n in "$@"; do
+    grep -qE "^# TYPE ${n%_total}(_total)? " <<<"$body" || printf '%s\n' "$n"
+  done
+}
 exporter_body=""
 for _ in $(seq 30); do
   exporter_body=$(mon02_get "http://$exporter_ip:9121/metrics")
@@ -2687,6 +2696,12 @@ exporter_body=$(mon02_get "http://$exporter_ip:9121/metrics")
 grep -qx 'redis_up 1' <<<"$exporter_body" || fail "mon_02: the exporter does not see Valkey after the canary write"
 if grep -qF -- "$canary_value" <<<"$exporter_body"; then fail "mon_02: the exporter's /metrics holds the canary value"; fi
 if grep -qF -- "$exporter_pw" <<<"$exporter_body"; then fail "mon_02: the exporter's /metrics holds the exporter password"; fi
+# MON-13: the exporter's last scrape has a TYPE line for every series of the exporter list of §9.
+missing=$(mon02_missing "$exporter_body" redis_up redis_uptime_in_seconds redis_instance_info redis_memory_used_bytes \
+  redis_memory_max_bytes redis_mem_fragmentation_ratio redis_evicted_keys_total redis_expired_keys_total \
+  redis_commands_processed_total redis_commands_duration_seconds_total redis_connected_clients \
+  redis_rejected_connections_total redis_db_keys redis_aof_last_write_status | tr '\n' ' ')
+[[ -z $missing ]] || fail "mon_02: the exporter's /metrics lacks the TYPE line of: $missing"
 
 # The exporter user, with its password on stdin (not in argv): INFO answers, the canary key is refused.
 exporter_cli() {
@@ -2706,6 +2721,23 @@ mon02_ns=mon-02
 ns_fresh $mon02_ns mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
 admin_forward
 [[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "mon_02: the controller is not ready after the Valkey restart"
+# MON-13: one scrape of the controller has a TYPE line for each of its metrics of §9 and a mimic_limit series per name.
+ctl_body=$(curl -fs --max-time 10 localhost:18081/metrics) || ctl_body=""
+[[ -n $ctl_body ]] || fail "mon_02: the controller's /metrics does not answer"
+missing=$(mon02_missing "$ctl_body" process_cpu_seconds_total process_resident_memory_bytes process_open_fds \
+  process_max_fds process_start_time_seconds mimic_webhook_admissions_total \
+  mimic_webhook_certificate_expiry_timestamp_seconds mimic_webhook_admission_duration_seconds \
+  mimic_store_deployments mimic_limit | tr '\n' ' ')
+[[ -z $missing ]] || fail "mon_02: the controller's /metrics lacks the TYPE line of: $missing"
+missing=""
+for n in webhook_max_connections sidecar_api_rate sidecar_api_max_report_bytes sidecar_api_body_budget_bytes \
+  sidecar_api_max_egress_bytes sidecar_api_egress_budget_bytes store_max_deployments store_max_endpoints \
+  store_max_push_endpoints store_max_literals store_max_authorities store_sample_budget_bytes load_max_runs \
+  load_max_namespace_runs load_max_pending load_max_concurrency load_max_rate load_max_endpoints \
+  load_pod_concurrency load_max_plan_bytes load_store_budget_bytes; do
+  grep -qF "mimic_limit{name=\"$n\"}" <<<"$ctl_body" || missing+="$n "
+done
+[[ -z $missing ]] || fail "mon_02: the controller's /metrics has no mimic_limit series for: $missing"
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
@@ -2735,6 +2767,12 @@ sidecar_port=$(kubectl -n $mon02_ns get pod "$sidecar_pod" -o jsonpath='{.spec.i
 sidecar_body=$(mon02_get "http://$sidecar_ip:$sidecar_port/metrics")
 grep -qF 'mimic_build_info{component="sidecar"' <<<"$sidecar_body" \
   || fail "mon_02: the sidecar's /metrics on 15100 does not answer from the release namespace"
+# MON-13: the same scrape has a TYPE line for each sidecar metric of §9, process_open_fds included (TLS-16).
+missing=$(mon02_missing "$sidecar_body" process_cpu_seconds_total process_resident_memory_bytes process_open_fds \
+  process_max_fds process_start_time_seconds mimic_proxy_active_connections mimic_proxy_overhead_seconds \
+  mimic_discovery_last_new_endpoint_timestamp_seconds mimic_mock_mode_switches_total mimic_mock_latency_factor \
+  mimic_limit | tr '\n' ' ')
+[[ -z $missing ]] || fail "mon_02: the sidecar's /metrics lacks the TYPE line of: $missing"
 
 kubectl delete namespace $mon02_ns --wait=false >/dev/null
 kubectl -n "$NS" delete pod mon02-scraper --wait=false >/dev/null
