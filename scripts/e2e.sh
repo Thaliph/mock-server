@@ -2634,6 +2634,12 @@ valkey_pod=$RELEASE-valkey-0
   || fail "mon_02: the exporter container is not Ready"
 [[ $(kubectl -n "$NS" get pod "$valkey_pod" -o jsonpath='{.spec.containers[?(@.name=="exporter")].securityContext.runAsUser}') == 65532 ]] \
   || fail "mon_02: the exporter container does not run as UID 65532"
+# Valkey loads its users from the ACL file only: the default user must still need a password (NOAUTH without one),
+# and the controller, which authenticates with it, must roll out Ready after the restart (#378). No password is printed.
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m \
+  || fail "mon_02: the controller Deployment does not roll out Ready after the Valkey restart"
+noauth_out=$(kubectl -n "$NS" exec "$valkey_pod" -c valkey -- sh -c 'unset REDISCLI_AUTH; exec valkey-cli PING' 2>&1 || true)
+grep -q NOAUTH <<<"$noauth_out" || fail "mon_02: an unauthenticated PING in Valkey is not refused with NOAUTH"
 exporter_ip=$(kubectl -n "$NS" get pod "$valkey_pod" -o jsonpath='{.status.podIP}')
 [[ -n $exporter_ip ]] || fail "mon_02: the Valkey pod has no IP"
 

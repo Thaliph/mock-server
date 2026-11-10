@@ -67,14 +67,28 @@ env_names=$(printf '%s\n' "$exporter" | yq -r '.env[].name' | sort | tr '\n' ' '
 valkey_args=$(printf '%s\n' "$valkey" | yq -r '.args[]')
 grep -qx -- '--aclfile' <<<"$valkey_args" || fail "mon_01: Valkey has no --aclfile"
 grep -qx -- '/etc/valkey-acl/aclfile' <<<"$valkey_args" || fail "mon_01: Valkey does not read the ACL file of the Secret"
+! grep -qx -- '--requirepass' <<<"$valkey_args" || fail "mon_01: Valkey has --requirepass with --aclfile (one source of users)"
 [[ $(printf '%s\n' "$sts" | yq -r '.spec.template.spec.volumes[] | select(.name == "acl") | .secret.secretName') == mimic-valkey-acl ]] \
   || fail "mon_01: the ACL volume is not the Secret mimic-valkey-acl"
 
-# The ACL file: the exporter user with the SHA-256 of the exporter password, +info +ping, no key access.
-password=$(doc '.kind == "Secret" and .metadata.name == "mimic-valkey-exporter"' | yq -r '.data.password' | base64 -d)
+# The ACL file (spec §10.7, §11.1): two lines. The default user on the hash of the Valkey password, with no nopass
+# (Valkey recreates default as open when the file lacks it); the exporter user with the SHA-256 of the exporter
+# password, +info +ping, no key access.
 acl=$(doc '.kind == "Secret" and .metadata.name == "mimic-valkey-acl"' | yq -r '.data.aclfile' | base64 -d)
+[[ $(printf '%s\n' "$acl" | wc -l) -eq 2 ]] || fail "mon_01: the ACL file does not have exactly two users"
+grep -Eqx 'user default on #[0-9a-f]{64} ~\* &\* \+@all' <<<"$(sed -n 1p <<<"$acl")" \
+  || fail "mon_01: the ACL file has no user default line on a 64-hex hash"
+! grep -qF nopass <<<"$acl" || fail "mon_01: the ACL file has nopass"
+password=$(doc '.kind == "Secret" and .metadata.name == "mimic-valkey-exporter"' | yq -r '.data.password' | base64 -d)
 want="user mimic-exporter on #$(printf '%s' "$password" | sha256sum | cut -d' ' -f1) +info +ping resetkeys resetchannels"
-[[ $acl == "$want" ]] || fail "mon_01: the ACL file is not the exporter user of §10.7"
+[[ $(sed -n 2p <<<"$acl") == "$want" ]] || fail "mon_01: the ACL file is not the exporter user of §10.7"
+
+# The default user's hash is the hash of the Valkey Secret's password: a render without existingSecret holds both.
+fresh=$(helm template mimic "$chart" -n mimic-system --set valkey.metrics.enabled=true)
+vpw=$(yq -r 'select(.kind == "Secret" and .metadata.name == "mimic-valkey") | .data.password' <<<"$fresh" | base64 -d)
+facl=$(yq -r 'select(.kind == "Secret" and .metadata.name == "mimic-valkey-acl") | .data.aclfile' <<<"$fresh" | base64 -d)
+[[ $(sed -n 1p <<<"$facl") == "user default on #$(printf '%s' "$vpw" | sha256sum | cut -d' ' -f1) ~* &* +@all" ]] \
+  || fail "mon_01: the default user of the ACL file is not the hash of the Valkey password"
 
 # The Valkey NetworkPolicy: 6379 from the controller, 9121 from the release namespace.
 netpol=$(doc '.kind == "NetworkPolicy" and .metadata.name == "mimic-valkey"')
