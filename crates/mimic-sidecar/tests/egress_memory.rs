@@ -430,10 +430,14 @@ fn spawn_fake_api() -> (ApiProcess, SocketAddr, String) {
             .expect("the fake API starts"),
     );
     let stdout = api.0.stdout.take().unwrap();
-    for line in BufReader::new(stdout).lines() {
+    let mut lines = BufReader::new(stdout).lines();
+    for line in lines.by_ref() {
         let line = line.unwrap();
         if let Some(rest) = line.strip_prefix("FAKE_API ") {
             let (addr, ca) = rest.split_once(' ').unwrap();
+            // The child's stdout keeps being read: libtest there prints "has been running for over 60 seconds",
+            // and a closed pipe would end the child (EPIPE) and with it the fake API, failing every later pull.
+            std::thread::spawn(move || lines.for_each(drop));
             return (api, addr.parse().unwrap(), ca.replace('|', "\n"));
         }
     }
@@ -516,15 +520,22 @@ async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_und
     assert!(level("second set", &done) >= PULLS_FROM);
     assert_ne!(first["authorities"], second["authorities"]);
     // The third body is refused, and the second set is still held.
-    let refused = "mimic_egress_pulls_total{result=\"invalid\"} 1";
+    // The sidecar keeps asking with "1-second", so the refused body may be served again: the counter is read as a
+    // number (at least 1), not matched as a string.
+    let refused = |text: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix("mimic_egress_pulls_total{result=\"invalid\"} "))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .is_some_and(|v| v >= 1.0)
+    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     while tokio::time::Instant::now() < deadline {
-        if metrics.encode().contains(refused) {
+        if refused(&metrics.encode()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(metrics.encode().contains(refused), "{}", metrics.encode());
+    assert!(refused(&metrics.encode()), "{}", metrics.encode());
     assert!(
         level("refused body", &done) < TOTAL,
         "the load ended before the refused pull"
