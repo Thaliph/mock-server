@@ -2740,7 +2740,10 @@ for p in $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller 
   kubectl -n "$NS" port-forward "$p" 18091:8081 >/dev/null 2>&1 &
   pf=$!
   for _ in $(seq 50); do curl -fs --max-time 2 -o /dev/null localhost:18091/readyz && break; sleep 0.2; done
-  ctl_body+=$(curl -fs --max-time 10 localhost:18091/metrics || true)$'\n'
+  body=$(curl -fs --max-time 10 localhost:18091/metrics || true)
+  # A pod that does not answer is logged, not failed: the other replicas still count (#406 item 7).
+  if [[ -z ${body//[[:space:]]/} ]]; then echo "WARN mon_02: controller pod $p does not answer its scrape"; fi
+  ctl_body+=$body$'\n'
   kill "$pf" 2>/dev/null || true; wait "$pf" 2>/dev/null || true
 done
 [[ -n ${ctl_body//[[:space:]]/} ]] || fail "mon_02: the controller's /metrics does not answer"
