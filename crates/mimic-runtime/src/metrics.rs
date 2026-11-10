@@ -125,6 +125,25 @@ impl Collector for ProcessMetrics {
     }
 }
 
+/// `process_max_fds` for a soft `RLIMIT_NOFILE`: unlimited is `+Inf`.
+#[cfg(target_os = "linux")]
+fn max_fds_value(soft: &procfs::process::LimitValue) -> f64 {
+    let _ = soft;
+    0.0
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use procfs::process::LimitValue;
+
+    #[test]
+    fn mon_04_max_fds_is_the_soft_limit_or_infinite_when_unlimited() {
+        assert_eq!(max_fds_value(&LimitValue::Value(1024)), 1024.0);
+        assert_eq!(max_fds_value(&LimitValue::Unlimited), f64::INFINITY);
+    }
+}
+
 pub struct Metrics {
     registry: Registry,
     /// Unprefixed: the `process_*` names are those of the Prometheus client libraries.
