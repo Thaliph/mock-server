@@ -79,6 +79,11 @@ env_names=$(printf '%s\n' "$exporter" | yq -r '.env[].name' | sort | tr '\n' ' '
 [[ $(printf '%s\n' "$exporter" | yq -r '.securityContext.seccompProfile.type') == RuntimeDefault ]] || fail "mon_01: the exporter seccomp is not RuntimeDefault"
 [[ $(printf '%s\n' "$exporter" | yq -r '.ports[] | select(.name == "metrics") | .containerPort') == 9121 ]] \
   || fail "mon_01: the exporter port 9121 is not named metrics"
+# #399: liveness only. A readiness of the exporter would take the Valkey pod's Service endpoint away on a restart.
+[[ $(printf '%s\n' "$exporter" | yq -r '.livenessProbe.tcpSocket.port') == metrics ]] \
+  || fail "mon_01: the exporter has no TCP liveness probe on metrics"
+[[ $(printf '%s\n' "$exporter" | yq -r '.readinessProbe') == null ]] \
+  || fail "mon_01: the exporter has a readinessProbe (its restart would drop the Valkey endpoint)"
 
 valkey_args=$(printf '%s\n' "$valkey" | yq -r '.args[]')
 grep -qx -- '--aclfile' <<<"$valkey_args" || fail "mon_01: Valkey has no --aclfile"
