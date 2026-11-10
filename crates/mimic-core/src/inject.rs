@@ -1302,6 +1302,16 @@ mod tests {
     }
 
     #[test]
+    fn mon_03_the_sidecar_declares_the_named_admin_port() {
+        let a = apply(&pod());
+        assert_eq!(
+            a["spec"]["initContainers"][1]["ports"],
+            json!([{"name": "mimic-admin", "containerPort": 15100, "protocol": "TCP"}])
+        );
+        assert_eq!(a, apply(&pod()));
+    }
+
+    #[test]
     fn inj_03_sidecar_container() {
         let doc = apply(&pod());
         let sc = &doc["spec"]["initContainers"][1];
