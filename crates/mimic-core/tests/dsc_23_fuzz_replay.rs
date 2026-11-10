@@ -174,7 +174,7 @@ fn run(data: &[u8]) {
     let json = merged.to_json().expect("a report serialises");
     push(&merged, &String::from_utf8_lossy(data));
     let mut bytes = json.clone().into_bytes();
-    for write in data.chunks_exact(3) {
+    for write in data.as_chunks::<3>().0 {
         if let Some(at) = usize::from(write[0])
             .checked_mul(256)
             .and_then(|n| n.checked_add(usize::from(write[1])))

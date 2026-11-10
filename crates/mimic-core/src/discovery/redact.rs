@@ -560,8 +560,9 @@ impl Redactor {
     fn url_token(&self, token: &str, rules: &mut Vec<Rule>) -> String {
         let start = match token.find("://") {
             Some(i) => token[..i]
-                .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-                .map_or(0, |j| j + 1),
+                .char_indices()
+                .rfind(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+                .map_or(0, |(j, c)| j + c.len_utf8()),
             None if token.contains(['/', '?', '#']) => 0,
             None => return token.to_string(),
         };
