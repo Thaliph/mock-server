@@ -15,6 +15,8 @@ use p256::ecdsa::signature::Verifier;
 use p256::pkcs8::DecodePublicKey;
 use serde_json::{Value, json};
 
+use std::sync::atomic::Ordering;
+
 use super::*;
 use crate::store::load::{MAX_SUMMARY, StoredPost};
 use crate::store::{Push, StoreConfig, StoreMetrics};
@@ -61,6 +63,7 @@ struct FakeCluster {
     deleted: Mutex<Vec<(String, &'static str, String)>>,
     statuses: Mutex<BTreeMap<(String, String), Value>>,
     states: Mutex<BTreeMap<String, JobState>>,
+    fail_create: std::sync::atomic::AtomicBool,
 }
 
 fn kind_of(kind: Kind) -> &'static str {
@@ -73,6 +76,9 @@ fn kind_of(kind: Kind) -> &'static str {
 impl Cluster for FakeCluster {
     fn create<'a>(&'a self, ns: &'a str, kind: Kind, object: &'a Value) -> ClusterFuture<'a, bool> {
         Box::pin(async move {
+            if self.fail_create.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("refused".to_string());
+            }
             let name = object["metadata"]["name"].as_str().unwrap_or_default();
             let key = (ns.to_string(), kind_of(kind), name.to_string());
             let mut objects = self.objects.lock().unwrap();
@@ -996,4 +1002,61 @@ async fn ldt_09_the_slot_lasts_until_the_run_deadline_and_no_longer() {
         .await
         .unwrap();
     assert_eq!(score as u64, t0 + 1000 + (60 + 300 + 60) * 1000);
+}
+
+#[tokio::test]
+async fn ldt_09_the_replica_that_loses_the_end_leaves_the_status_of_the_winner() {
+    let f = fx(Some(9), |_| {}).await;
+    let g = f.replica(valkey(Some(9)));
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 1000).await;
+    f.post(&test, 0, false, None, 5).await;
+    let stale = f.rec.tests.list().remove(0);
+    f.edit(&test, |t| t.stop = true);
+    f.pass(t0 + 2000).await;
+    assert_eq!(f.phase(&test), ("Aborted".into(), "Stopped".into()));
+    assert_eq!(f.status(&test)["results"]["total"]["requests"], 5);
+    // The other replica decided on the same event, with a stale view, and lost the end script.
+    let mut stale = stale;
+    stale.stop = true;
+    g.rec.end(&stale, "Aborted", "ModeLeft", "", t0 + 2001, true).await;
+    assert_eq!(f.phase(&test), ("Aborted".into(), "Stopped".into()));
+    assert_eq!(f.status(&test)["results"]["total"]["requests"], 5);
+}
+
+#[tokio::test]
+async fn ldt_07_an_admitted_run_whose_job_was_not_created_is_ended_not_left_in_valkey() {
+    for variant in ["stop", "timeout"] {
+        let f = fx(None, |c| c.start_timeout = Duration::from_secs(5)).await;
+        let ns = running_fixture_ns();
+        f.deployment(&ns, "pay", true).await;
+        let t0 = now_ms();
+        let test = f.test(&ns, "t1", "pay", t0);
+        f.cluster.fail_create.store(true, Ordering::SeqCst);
+        f.pass(t0 + 1000).await;
+        // Admitted (slot, plan, ticket stored) but the Job was refused: still Pending.
+        assert_eq!(f.phase(&test).0, "", "{variant}");
+        assert_eq!(f.active(&test).await, Some(false), "{variant}");
+        f.cluster.fail_create.store(false, Ordering::SeqCst);
+        let (phase, reason) = if variant == "stop" {
+            f.edit(&test, |t| t.stop = true);
+            ("Aborted", "Stopped")
+        } else {
+            f.rec.workloads.set_mock(&ns, "pay-w", MockSettings::default());
+            ("Failed", "NotMock")
+        };
+        f.pass(t0 + 6000).await;
+        assert_eq!(f.phase(&test), (phase.into(), reason.into()), "{variant}");
+        assert_eq!(f.active(&test).await, None, "{variant}");
+        assert!(f.cluster.was_deleted("Job", &job_name(&test.uid)), "{variant}");
+        // The slot is free: another run on the deployment is not Busy.
+        f.rec.workloads.set_mock(&ns, "pay-w", MockSettings { mock: true, ..MockSettings::default() });
+        f.pull(&ns, "pay", "pay-5d9c8f7b6-bcdfg", "mock").await;
+        let next = f.test(&ns, "t2", "pay", t0 + 7000);
+        f.pass(t0 + 7000).await;
+        assert_eq!(f.phase(&next).0, "Running", "{variant}");
+    }
 }

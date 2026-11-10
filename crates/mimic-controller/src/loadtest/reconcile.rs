@@ -645,7 +645,7 @@ impl Reconciler {
     /// Ends a run: stops its generators and removes its Job (`cleanup`), keeps the results as
     /// the summary, releases the slot, applies the final status.
     #[allow(clippy::too_many_arguments)]
-    async fn end(
+    pub(super) async fn end(
         &self,
         test: &Test,
         phase: &str,
