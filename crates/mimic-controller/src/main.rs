@@ -83,12 +83,15 @@ fn limits(config: &Config) -> BTreeMap<&'static str, u64> {
     let (push, load) = (&config.push, &config.load);
     BTreeMap::from([
         ("webhook_max_connections", n(config.webhook.max_connections)),
+        ("sidecar_api_rate", n(push.rate)),
         ("sidecar_api_max_report_bytes", n(push.max_report)),
         ("sidecar_api_body_budget_bytes", n(push.body_budget)),
         ("sidecar_api_max_egress_bytes", n(push.max_egress)),
         ("sidecar_api_egress_budget_bytes", n(push.egress_budget)),
         ("store_max_deployments", n(push.store.max_deployments)),
         ("store_max_endpoints", n(push.store.limits.max_endpoints)),
+        ("store_max_push_endpoints", n(push.max_push_endpoints)),
+        ("store_max_literals", n(push.store.limits.max_literals)),
         (
             "store_max_authorities",
             n(push.store.limits.max_authorities),
