@@ -1,0 +1,64 @@
+{{- if .Values.monitoring.prometheus.enabled }}
+# RBAC of the bundled Prometheus (spec §10.7, §11.1, MON-18): list and watch on pods, and nothing else. No services,
+# endpoints, nodes, nodes/metrics, nodes/proxy, configmaps or secrets: the controller is discovered as its pods.
+# Pod objects show literal env values to Prometheus, the accepted limit of §11.1. Without monitoring.prometheus.namespaces
+# this is a ClusterRole; with a list, a Role and a RoleBinding in each of those namespaces and the release namespace.
+{{- if not .Values.monitoring.prometheus.namespaces }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-prometheus
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-prometheus
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-prometheus
+    namespace: {{ .Release.Namespace }}
+{{- else }}
+{{- range $ns := uniq (sortAlpha (concat .Values.monitoring.prometheus.namespaces (list .Release.Namespace))) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $.Release.Name }}-prometheus
+  namespace: {{ $ns }}
+  labels:
+    {{- include "mimic.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $.Release.Name }}-prometheus
+  namespace: {{ $ns }}
+  labels:
+    {{- include "mimic.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $.Release.Name }}-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: {{ $.Release.Name }}-prometheus
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- end }}

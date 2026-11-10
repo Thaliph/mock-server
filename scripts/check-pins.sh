@@ -20,10 +20,18 @@ if [ "$exporter_chart" != "$exporter_pin" ]; then
   exit 1
 fi
 
+# #379 (MON-15): the bundled Prometheus image of the chart (monitoring.prometheus.image) is the stage prometheus.
+prometheus_chart=$(yq '.monitoring.prometheus.image.repository + ":" + .monitoring.prometheus.image.tag + "@" + .monitoring.prometheus.image.digest' deploy/helm/mimic/values.yaml)
+prometheus_pin=$(scripts/pinned-image.sh prometheus)
+if [ "$prometheus_chart" != "$prometheus_pin" ]; then
+  echo "values.yaml monitoring.prometheus.image is $prometheus_chart, images/Dockerfile says $prometheus_pin" >&2
+  exit 1
+fi
+
 kind_pin=$(scripts/pinned-image.sh kind-node)
 if ! grep -qF "node_image: $kind_pin" .github/workflows/ci.yml; then
   echo "ci.yml does not use the kind node image of images/Dockerfile: $kind_pin" >&2
   exit 1
 fi
 
-echo "pins: the Valkey image, the Valkey exporter image and the kind node image match images/Dockerfile"
+echo "pins: the Valkey image, the Valkey exporter image, the Prometheus image and the kind node image match images/Dockerfile"

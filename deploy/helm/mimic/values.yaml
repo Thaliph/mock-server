@@ -144,3 +144,17 @@ monitoring:
     # Namespaces of the sidecar and load jobs, besides the release namespace. Empty: every namespace, through
     # a ClusterRole. A list: a Role in each of them and in the release namespace.
     namespaces: []
+    image:
+      repository: quay.io/prometheus/prometheus
+      tag: v3.15.1
+      # Pinned in images/Dockerfile (stage prometheus); scripts/check-pins.sh keeps the two equal.
+      digest: sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    # --storage.tsdb.retention.time, and --storage.tsdb.retention.size below the emptyDir limit, so that the kubelet
+    # never evicts the pod for its data.
+    retention: 24h
+    retentionSize: 800MB
+    # sizeLimit of the emptyDir that holds the TSDB. No persistent volume: the data are lost on a pod restart.
+    storageSizeLimit: 1Gi
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {memory: 512Mi}

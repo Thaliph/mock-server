@@ -339,4 +339,81 @@ render --set monitoring.prometheus.enabled=true --set 'monitoring.prometheus.nam
   || fail "mon_17: the controller job leaves the release namespace"
 echo "mon_17: the scrape jobs and the monitors agree, and the namespaces follow monitoring.prometheus.namespaces"
 
+# MON-16 (#379): the Prometheus Deployment, its Service and the arguments of §10.7; the security context and the volumes.
+render --set monitoring.prometheus.enabled=true --set metrics.podMonitor.enabled=true > "$tmp/prom-deploy.yaml"
+prom_dep=$(yq 'select(.kind == "Deployment" and .metadata.name == "mimic-prometheus")' "$tmp/prom-deploy.yaml")
+[[ -n $prom_dep ]] || fail "mon_16: no Deployment mimic-prometheus"
+ctr=$(yq '.spec.template.spec.containers[0]' <<<"$prom_dep")
+pod_sc=$(yq '.spec.template.spec.securityContext' <<<"$prom_dep")
+[[ $(yq -r '.spec.replicas' <<<"$prom_dep") == 1 ]] || fail "mon_16: the Deployment has not 1 replica"
+[[ $(yq -r '.spec.strategy.type' <<<"$prom_dep") == Recreate ]] || fail "mon_16: the strategy is not Recreate"
+[[ $(yq -r '.image' <<<"$ctr") == quay.io/prometheus/prometheus:v3.15.1@sha256:* ]] || fail "mon_16: the image is not the pinned Prometheus"
+[[ $(yq -r '.args | join(" ")' <<<"$ctr") == "--config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=24h --storage.tsdb.retention.size=800MB --web.listen-address=:9090 --log.format=json" ]] \
+  || fail "mon_16: the Prometheus arguments are not those of §10.7: $(yq -r '.args | join(" ")' <<<"$ctr")"
+grep -qE 'enable-admin-api|enable-lifecycle|remote-write|otlp' <<<"$ctr" && fail "mon_16: an admin, lifecycle, remote-write or OTLP flag is set"
+cs() { yq -r 'select(.kind == "Deployment" and .metadata.name == "mimic-prometheus") | .spec.template.metadata.annotations["checksum/config"]' "$1"; }
+render --set monitoring.prometheus.enabled=true --set metrics.podMonitor.enabled=true \
+  --set metrics.podMonitor.interval=45s > "$tmp/prom-45s.yaml"
+[[ -n $(cs "$tmp/prom-deploy.yaml") && $(cs "$tmp/prom-deploy.yaml") != "$(cs "$tmp/prom-45s.yaml")" ]] \
+  || fail "mon_16: the checksum annotation does not change with metrics.podMonitor.interval"
+[[ $(yq -r '.runAsUser' <<<"$pod_sc") == 65534 && $(yq -r '.runAsGroup' <<<"$pod_sc") == 65534 \
+  && $(yq -r '.runAsNonRoot' <<<"$pod_sc") == true && $(yq -r '.seccompProfile.type' <<<"$pod_sc") == RuntimeDefault ]] \
+  || fail "mon_16: the pod security context is not UID 65534, non-root, RuntimeDefault"
+[[ $(yq -r '.securityContext.runAsUser' <<<"$ctr") == 65534 && $(yq -r '.securityContext.readOnlyRootFilesystem' <<<"$ctr") == true \
+  && $(yq -r '.securityContext.allowPrivilegeEscalation' <<<"$ctr") == false \
+  && $(yq -r '.securityContext.capabilities.drop | join(",")' <<<"$ctr") == ALL \
+  && $(yq -r '.securityContext.seccompProfile.type' <<<"$ctr") == RuntimeDefault ]] \
+  || fail "mon_16: the container security context is not restricted"
+[[ $(yq -r '.resources.requests.cpu' <<<"$ctr") == 100m && $(yq -r '.resources.requests.memory' <<<"$ctr") == 256Mi \
+  && $(yq -r '.resources.limits.memory' <<<"$ctr") == 512Mi ]] || fail "mon_16: the Prometheus resources are not those of the values"
+[[ $(yq -r '.readinessProbe.httpGet.path' <<<"$ctr") == /-/ready && $(yq -r '.livenessProbe.httpGet.path' <<<"$ctr") == /-/healthy ]] \
+  || fail "mon_16: the probes are not /-/ready and /-/healthy"
+[[ $(yq -r '.volumeMounts[] | select(.name == "config") | .mountPath + " " + (.readOnly | tostring)' <<<"$ctr") == "/etc/prometheus true" ]] \
+  || fail "mon_16: the configuration is not mounted read-only at /etc/prometheus"
+[[ $(yq -r '.volumeMounts[] | select(.name == "data") | .mountPath' <<<"$ctr") == /prometheus ]] || fail "mon_16: the TSDB is not mounted at /prometheus"
+[[ $(yq -r '.spec.template.spec.volumes[] | select(.name == "data") | .emptyDir.sizeLimit' <<<"$prom_dep") == 1Gi ]] \
+  || fail "mon_16: the TSDB emptyDir has not sizeLimit 1Gi"
+[[ $(yq -r '.spec.template.spec.volumes[] | select(.name == "config") | .configMap.name' <<<"$prom_dep") == mimic-prometheus ]] \
+  || fail "mon_16: the configuration volume is not the ConfigMap mimic-prometheus"
+prom_svc=$(yq 'select(.kind == "Service" and .metadata.name == "mimic-prometheus")' "$tmp/prom-deploy.yaml")
+[[ $(yq -r '.spec.type' <<<"$prom_svc") == ClusterIP && $(yq -r '.spec.ports | length' <<<"$prom_svc") == 1 \
+  && $(yq -r '.spec.ports[0].port' <<<"$prom_svc") == 9090 ]] || fail "mon_16: the Service is not ClusterIP on 9090 only"
+echo "mon_16: the Prometheus Deployment has the arguments, the security context, the resources and the volumes of §10.7"
+
+# MON-18 (#379, Prometheus part): list and watch on pods only, in a ClusterRole when namespaces is empty.
+cr=$(yq 'select(.kind == "ClusterRole" and .metadata.name == "mimic-prometheus")' "$tmp/prom-deploy.yaml")
+[[ -n $cr ]] || fail "mon_18: no ClusterRole mimic-prometheus"
+[[ $(yq -r '.rules | length' <<<"$cr") == 1 ]] || fail "mon_18: the ClusterRole has more than one rule"
+[[ $(yq -r '.rules[0] | [(.apiGroups | join(",")), (.resources | join(",")), (.verbs | join(","))] | join("|")' <<<"$cr") == "|pods|list,watch" ]] \
+  || fail "mon_18: the ClusterRole is not list and watch on pods"
+crb=$(yq 'select(.kind == "ClusterRoleBinding" and .metadata.name == "mimic-prometheus")' "$tmp/prom-deploy.yaml")
+[[ $(yq -r '.roleRef.name' <<<"$crb") == mimic-prometheus && $(yq -r '.subjects[0].name' <<<"$crb") == mimic-prometheus \
+  && $(yq -r '.subjects[0].namespace' <<<"$crb") == mimic-system ]] || fail "mon_18: the ClusterRoleBinding does not bind the ServiceAccount"
+[[ -z $(yq 'select(.kind == "Role" and .metadata.name == "mimic-prometheus")' "$tmp/prom-deploy.yaml") ]] \
+  || fail "mon_18: a Role mimic-prometheus is rendered with namespaces empty"
+
+# With namespaces: a Role and a RoleBinding in each listed namespace and in the release namespace, each once.
+render --set monitoring.prometheus.enabled=true --set 'monitoring.prometheus.namespaces[0]=apps' \
+  --set 'monitoring.prometheus.namespaces[1]=mimic-system' > "$tmp/prom-rbac-ns.yaml"
+[[ -z $(yq 'select(.kind == "ClusterRole" and .metadata.name == "mimic-prometheus")' "$tmp/prom-rbac-ns.yaml") ]] \
+  || fail "mon_18: a ClusterRole is rendered with namespaces set"
+roles=$(yq 'select(.kind == "Role" and .metadata.name == "mimic-prometheus") | .metadata.namespace' "$tmp/prom-rbac-ns.yaml" | grep -v -e "^---$" -e "^$" | tr "\n" " ")
+rbs=$(yq 'select(.kind == "RoleBinding" and .metadata.name == "mimic-prometheus") | .metadata.namespace' "$tmp/prom-rbac-ns.yaml" | grep -v -e "^---$" -e "^$" | tr "\n" " ")
+[[ $roles == "apps mimic-system " && $rbs == "apps mimic-system " ]] \
+  || fail "mon_18: the Roles are '$roles' and the RoleBindings '$rbs', expected apps and mimic-system once each"
+[[ $(yq -r 'select(.kind == "Role" and .metadata.name == "mimic-prometheus") | [(.rules | length), (.rules[0].resources | join(",")), (.rules[0].verbs | join(","))] | join("|")' "$tmp/prom-rbac-ns.yaml" | grep -v -e "^---$" -e "^$" | sort -u) == "1|pods|list,watch" ]] \
+  || fail "mon_18: a namespaced Role is not the single rule list and watch on pods"
+[[ $(yq -r 'select(.kind == "RoleBinding" and .metadata.name == "mimic-prometheus") | .subjects[0].namespace + "/" + .subjects[0].name' "$tmp/prom-rbac-ns.yaml" | grep -v -e "^---$" -e "^$" | sort -u) == "mimic-system/mimic-prometheus" ]] \
+  || fail "mon_18: a RoleBinding does not bind the ServiceAccount of the release"
+echo "mon_18: the Prometheus RBAC is list and watch on pods, cluster-wide or in the listed namespaces"
+
+# MON-18, all: no monitoring object of the render names secrets, nodes, a subresource, a wildcard or a write verb.
+for f in "$tmp/prom-deploy.yaml" "$tmp/prom-rbac-ns.yaml"; do
+  rules=$(yq 'select((.kind == "ClusterRole" or .kind == "Role") and (.metadata.name == "mimic-prometheus")) | .rules' "$f")
+  if grep -qE 'secrets|nodes|/|\*|create|update|patch|delete|escalate|bind|impersonate|get' <<<"$rules"; then
+    fail "mon_18: a Prometheus rule names secrets, nodes, a subresource, a wildcard or a verb other than list and watch"
+  fi
+done
+echo "mon_18: no Prometheus rule names secrets, nodes, a subresource or a verb other than list and watch"
+
 echo "chart checks passed"

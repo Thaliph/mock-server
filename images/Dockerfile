@@ -8,6 +8,10 @@
 # Valkey exporter (#378): the chart's valkey.metrics image (deploy/helm/mimic/values.yaml), v1.95.0 published 2026-10-21.
 FROM docker.io/oliver006/redis_exporter:v1.95.0@sha256:afb21407aba3df1b4010899f155fc6b1ba2026c97b725d72aca4019d772e7b6b AS redis-exporter
 
+# Bundled Prometheus (#379, spec §10.7): the chart's monitoring.prometheus.image, v3.15.1 published 2026-10-21
+# (GitHub release), outside the 14-day cooldown.
+FROM quay.io/prometheus/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2 AS prometheus
+
 # Valkey: the chart's default (deploy/helm/mimic/values.yaml, valkey.image), also scanned by Trivy in CI.
 FROM docker.io/valkey/valkey:9.0-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416 AS valkey
 

@@ -45,6 +45,11 @@ valkey.metrics.enabled.
 {{- toJson (dict "targets" $targets) -}}
 {{- end -}}
 
+{{/* The bundled Prometheus image, pinned by digest (spec §10.7, MON-15). */}}
+{{- define "mimic.prometheusImage" -}}
+{{ .Values.monitoring.prometheus.image.repository }}:{{ .Values.monitoring.prometheus.image.tag }}{{ with .Values.monitoring.prometheus.image.digest }}@{{ . }}{{ end }}
+{{- end -}}
+
 {{/* One target of mimic.scrapeTargets as JSON. Arguments: dict "root" (the root context) and "job" (the job label). */}}
 {{- define "mimic.scrapeTarget" -}}
 {{- range (include "mimic.scrapeTargets" .root | fromJson).targets -}}
