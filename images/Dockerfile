@@ -5,6 +5,9 @@
 #   scripts/check-pins.sh             checks that values.yaml and ci.yml carry the same references
 # Changing a digest here is the only way to change these images.
 
+# Valkey exporter (#378): the chart's valkey.metrics image (deploy/helm/mimic/values.yaml), v1.95.0 published 2026-10-21.
+FROM docker.io/oliver006/redis_exporter:v1.95.0@sha256:afb21407aba3df1b4010899f155fc6b1ba2026c97b725d72aca4019d772e7b6b AS redis-exporter
+
 # Valkey: the chart's default (deploy/helm/mimic/values.yaml, valkey.image), also scanned by Trivy in CI.
 FROM docker.io/valkey/valkey:9.0-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416 AS valkey
 
@@ -20,6 +23,6 @@ FROM python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915
 FROM node:22-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS e2e-node
 FROM eclipse-temurin:21-jdk@sha256:ebfbb18d11ff163ee83b21258acf12248af48d22a0fdfdc68fa1a1516c05976a AS e2e-jdk
 
-# e2e: headless Chromium of the UI check (UI-12, scripts/e2e/ui_browser.py). The tag is 156.0.8078.36,
-# published 2026-10-20; the digest is the multi-arch index. Dependabot proposes later releases after its cooldown.
-FROM docker.io/chromedp/headless-shell:156.0.8078.36@sha256:53cc0f33c0598ff244f6e45458f6dfaf0ae4206d388ae7364903afd1d9d14f0a AS e2e-chromium
+# e2e: headless Chromium of the UI check (UI-12, scripts/e2e/ui_browser.py). The digest is the multi-arch index
+# of the pinned tag. Dependabot proposes later releases after its cooldown.
+FROM docker.io/chromedp/headless-shell:158.0.8106.0@sha256:7e9783a01393515a5b1998a92a1ae46959f56ad3e05de8b9c0500f2e24fc3887 AS e2e-chromium

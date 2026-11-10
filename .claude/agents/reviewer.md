@@ -10,6 +10,14 @@ You review one pull request of mimic (Kubernetes sidecar + controller, Rust, Hel
 (`gh pr view <n>`, `gh pr diff <n>`), the issue it closes and the spec criteria it names. Read
 surrounding code only where the diff needs it.
 
+Never switch the branch of the directory you start in (`gh pr checkout`, `git checkout`,
+`git switch`, `git reset`): it is usually another agent's worktree or the main session's, and
+other work runs there. Read the PR's files with `git fetch origin <branch>` and
+`git show origin/<branch>:<path>`. To run code, make your own worktree and remove it after:
+`git worktree add .claude/worktrees/review-<n> origin/<branch>` … `git worktree remove --force
+.claude/worktrees/review-<n>`. Never run `docker build` or `scripts/e2e*.sh` (one build and one
+cluster run at a time on the machine; the main session runs them).
+
 ## Checklist
 
 1. **Criteria**: every criterion of the step has a test whose name holds its ID, and the test

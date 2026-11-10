@@ -827,6 +827,16 @@ mod object_tests {
     use super::*;
 
     #[test]
+    fn mon_03_the_generator_declares_the_named_admin_port() {
+        let r = resources();
+        let j = job(&input(&r, None));
+        assert_eq!(
+            j["spec"]["template"]["spec"]["containers"][0]["ports"],
+            json!([{"name": "mimic-admin", "containerPort": 15100, "protocol": "TCP"}])
+        );
+    }
+
+    #[test]
     fn ldt_05_the_job_for_concurrency_300_has_the_shape_of_the_spec() {
         let r = resources();
         let j = job(&input(&r, None));

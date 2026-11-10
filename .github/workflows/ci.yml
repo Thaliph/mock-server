@@ -102,6 +102,8 @@ jobs:
       - run: scripts/check-release-chart.sh
       # #273: the Valkey image of values.yaml and the kind node image match images/Dockerfile.
       - run: scripts/check-pins.sh
+      # #378: the chart variants lint strictly, the default render is the golden file, the exporter and PodMonitor shape (MON-01).
+      - run: scripts/check-chart.sh
 
   security:
     runs-on: ubuntu-24.04

@@ -9,6 +9,8 @@ use super::schedule::pods;
 
 /// The sidecar admin port, on which the probe answers (spec §4).
 const ADMIN_PORT: u16 = 15100;
+/// Name of the admin port, so that a `PodMonitor` can scrape it (spec §7.8, MON-03).
+const ADMIN_PORT_NAME: &str = "mimic-admin";
 /// Uid the generator runs as.
 const UID: u64 = 65532;
 /// Where the credentials Secret is mounted.
@@ -158,6 +160,7 @@ pub fn job(input: &JobInput<'_>) -> Value {
                         "name": "mimic-load",
                         "image": input.image,
                         "command": ["/usr/local/bin/mimic-load"],
+                        "ports": [{"name": ADMIN_PORT_NAME, "containerPort": ADMIN_PORT, "protocol": "TCP"}],
                         "env": env,
                         "resources": input.resources,
                         "securityContext": {

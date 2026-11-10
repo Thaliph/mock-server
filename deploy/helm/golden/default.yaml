@@ -1,0 +1,881 @@
+---
+# Source: mimic/templates/controller-networkpolicy.yaml
+# Ingress to the controller (spec §11). The webhook port is open to any source by default, since the
+# API server's source address depends on the cluster (networkPolicy.webhookFrom narrows it); the
+# sidecar API port likewise (networkPolicy.sidecarApiFrom). The admin port serves health,
+# readiness and metrics: the release namespace and the namespaces in
+# networkPolicy.metricsNamespaceSelector only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mimic-controller
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: mimic
+      app.kubernetes.io/name: mimic-controller
+  policyTypes: [Ingress]
+  ingress:
+    -
+      ports:
+        - {port: 8443, protocol: TCP}
+    # Sidecar API (spec §7.2, §11): injected pods, in any namespace unless sidecarApiFrom narrows it.
+    -
+      ports:
+        - {port: 8444, protocol: TCP}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: mimic-system
+      ports:
+        - {port: 8081, protocol: TCP}
+
+---
+# Source: mimic/templates/valkey.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mimic-valkey
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: mimic
+      app.kubernetes.io/name: mimic-valkey
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: mimic
+              app.kubernetes.io/name: mimic-controller
+      ports:
+        - port: 6379
+  # Valkey calls nothing.
+  egress: []
+
+---
+# Source: mimic/templates/pdb.yaml
+# At most one controller pod down at a time: the webhook fails closed (spec §7.1), so a drain
+# must not take both replicas at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mimic-controller
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: mimic
+      app.kubernetes.io/name: mimic-controller
+
+---
+# Source: mimic/templates/controller.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mimic-controller
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+# The controller talks to the API server (MimicWorkload cache, webhook Secret and caBundle).
+automountServiceAccountToken: true
+
+---
+# Source: mimic/templates/webhook.yaml
+# Admission webhook for pod injection (spec §7.1): the Secret the controller keeps its CA and
+# serving certificate in, the MutatingWebhookConfiguration (its caBundle is written by the
+# controller, not by Helm), and a ValidatingAdmissionPolicy that lets only the controller's
+# service account change that caBundle.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mimic-webhook-tls
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+# Empty: the controller generates the CA and the serving certificate on first start.
+type: Opaque
+
+---
+# Source: mimic/templates/webhook.yaml
+# The TLS seed (spec §5): empty here, filled by the controller on first start, removed with the
+# release so that no CA outlives the install.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mimic-tls-ca
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+type: Opaque
+
+---
+# Source: mimic/templates/crd.yaml
+# MimicWorkload (spec §7, §7.1): spec.deployment, spec.mode, (F10) spec.mock, (F3) spec.tls.exclude and (F4) spec.discovery.redact, (F5) status.discovery.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mimicworkloads.mimic.platform.io
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+  annotations:
+    # `helm uninstall` leaves the CRD and every MimicWorkload (spec §7.1); removing them is explicit.
+    helm.sh/resource-policy: keep
+spec:
+  group: mimic.platform.io
+  scope: Namespaced
+  names:
+    kind: MimicWorkload
+    listKind: MimicWorkloadList
+    plural: mimicworkloads
+    singular: mimicworkload
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      # Written by the controller only, through the status subresource (spec §7.4).
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Mode
+          type: string
+          jsonPath: .spec.mode
+        # Inbound + outbound endpoints; 0 until a controller of F8 or later applies a status (spec §7.4).
+        - name: Endpoints
+          type: integer
+          jsonPath: .status.discovery.totalEndpoints
+        - name: Pods
+          type: integer
+          jsonPath: .status.discovery.pods
+        - name: Last push
+          type: date
+          jsonPath: .status.discovery.lastPushTime
+        # Pods whose last egress answer carried the effective mode (spec §7.4).
+        - name: Mode pods
+          type: integer
+          jsonPath: .status.mode.pods
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            status:
+              type: object
+              properties:
+                mode:
+                  description: How many pods follow the effective mode of the Deployment (spec §7.4).
+                  type: object
+                  properties:
+                    mode:
+                      description: Effective mode of the Deployment.
+                      type: string
+                      enum: [discovery, mock]
+                    # Defaulted, so the Mode pods column reads 0 instead of nothing (spec §7.4).
+                    pods:
+                      description: Pods whose last egress answer is within MIMIC_STATUS_POD_WINDOW and carried `mode`.
+                      type: integer
+                      format: int64
+                      default: 0
+                    otherPods:
+                      description: Pods within the window whose last answer carried the other mode.
+                      type: integer
+                      format: int64
+                      default: 0
+                discovery:
+                  description: What the controller holds of the Deployment's discovery data (spec §7.4).
+                  type: object
+                  properties:
+                    endpoints:
+                      description: Endpoints per direction; a direction without any is omitted.
+                      type: object
+                      properties:
+                        # Defaulted (spec §7.4).
+                        inbound: {type: integer, format: int64, default: 0}
+                        outbound: {type: integer, format: int64}
+                    # Defaulted, so the Endpoints column reads 0 instead of nothing (spec §7.4).
+                    totalEndpoints: {type: integer, format: int64, default: 0}
+                    exchanges:
+                      description: Exchanges currently held, both directions. Not a running total.
+                      type: integer
+                      format: int64
+                    sampleBytes: {type: integer, format: int64}
+                    pods:
+                      description: Pods whose last push is within MIMIC_STATUS_POD_WINDOW.
+                      type: integer
+                      format: int64
+                    lastPushTime:
+                      description: Last applied push, UTC, in seconds. Absent without data.
+                      type: string
+                      format: date-time
+            spec:
+              type: object
+              required: [deployment]
+              properties:
+                deployment:
+                  description: Name of the Deployment, in the same namespace, that this MimicWorkload selects. Immutable.
+                  type: string
+                  maxLength: 253
+                  # DNS-1123 subdomain, the rule Kubernetes applies to Deployment names.
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: "spec.deployment is immutable"
+                mode:
+                  description: Mimic mode of the Deployment's pods.
+                  type: string
+                  enum: [discovery, mock]
+                  default: discovery
+                tls:
+                  description: TLS interception settings of the Deployment's pods (spec §5). Applied to pods created afterwards.
+                  type: object
+                  properties:
+                    exclude:
+                      description: >-
+                        Names whose TLS connections are never intercepted: an exact host, a suffix pattern
+                        `*.example.com` (below `example.com`, not itself) or an IP literal.
+                      type: array
+                      maxItems: 256
+                      items:
+                        type: string
+                        maxLength: 253
+                        # A DNS name (labels of letters, digits, `-`, `_`), optionally `*.` first, or an IPv6 literal.
+                        pattern: '^((\*\.)?[A-Za-z0-9_]([-A-Za-z0-9_]{0,61}[A-Za-z0-9_])?(\.[A-Za-z0-9_]([-A-Za-z0-9_]{0,61}[A-Za-z0-9_])?)*\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]+)$'
+                mock:
+                  description: >-
+                    Mock mode settings of the Deployment's pods (spec §7, §8). `spec.mode: mock` turns them on;
+                    the effective mode of a Deployment is `mock` as soon as one of its MimicWorkloads says so.
+                  type: object
+                  properties:
+                    latencyFactor:
+                      description: Multiplies the latency drawn from the recorded histogram of an endpoint; 0 answers at once. Rounded to the nearest hundredth.
+                      type: number
+                      minimum: 0
+                      maximum: 100
+                      default: 1
+                    passthrough:
+                      description: >-
+                        Destinations a mocked pod still reaches for real: an exact host, a suffix pattern
+                        `*.example.com` or an IP literal (the `spec.tls.exclude` grammar). Applied to pods created afterwards.
+                      type: array
+                      maxItems: 256
+                      items:
+                        type: string
+                        maxLength: 253
+                        pattern: '^((\*\.)?[A-Za-z0-9_]([-A-Za-z0-9_]{0,61}[A-Za-z0-9_])?(\.[A-Za-z0-9_]([-A-Za-z0-9_]{0,61}[A-Za-z0-9_])?)*\.?|[0-9A-Fa-f.]*:[0-9A-Fa-f:.]+)$'
+                discovery:
+                  description: Endpoint discovery settings of the Deployment's pods (spec §6). Applied to pods created afterwards.
+                  type: object
+                  properties:
+                    redact:
+                      description: >-
+                        Extra names redacted by name in discovered headers, query keys, form fields and JSON keys,
+                        on top of the built-in ones. Compared like the built-in names (case ignored, matched on token boundaries: `-`, `_`, `.` and case changes). Lower-cased by the webhook.
+                      type: array
+                      maxItems: 64
+                      items:
+                        type: string
+                        minLength: 1
+                        maxLength: 64
+                        pattern: '^[A-Za-z0-9_-]+$'
+
+---
+# Source: mimic/templates/rbac.yaml
+# Least privilege for the controller (spec §11): every grant is limited to the names this
+# release creates. The only create is TokenReview (sidecar API authentication, spec §7.2).
+# No pods, no Deployments, no other Secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mimic-controller
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+rules:
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicworkloads]
+    verbs: [get, list, watch]
+  # The status of a MimicWorkload (spec §7.4), by server-side apply; no update of the object itself.
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicworkloads/status]
+    verbs: [patch]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [mutatingwebhookconfigurations]
+    # list and watch are limited by name too: the controller watches only its own configuration.
+    resourceNames: [mimic-injector]
+    verbs: [get, list, watch, patch]
+  # Authenticates the sidecar API callers: the API server checks their projected token (spec §7.2).
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+
+---
+# Source: mimic/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mimic-controller
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mimic-controller
+subjects:
+  - kind: ServiceAccount
+    name: mimic-controller
+    namespace: mimic-system
+
+---
+# Source: mimic/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+rules:
+  # Read and replace the webhook Secret; the chart creates it, the controller fills it.
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [mimic-webhook-tls]
+    verbs: [get, update]
+  # Same for the TLS seed Secret (spec §5, §11); no other Secret.
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [mimic-tls-ca]
+    verbs: [get, update]
+
+---
+# Source: mimic/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mimic-controller
+  namespace: mimic-system
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mimic-controller
+subjects:
+  - kind: ServiceAccount
+    name: mimic-controller
+    namespace: mimic-system
+
+---
+# Source: mimic/templates/controller.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimic-controller
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+    app.kubernetes.io/name: mimic-controller
+spec:
+  selector:
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/name: mimic-controller
+  ports:
+    - name: admin
+      port: 8081
+      targetPort: admin
+    # Admission webhook (spec §7.1); the MutatingWebhookConfiguration calls this port.
+    - name: webhook
+      port: 8443
+      targetPort: webhook
+    # Sidecar API (spec §7.2): sidecars of injected pods call it with their projected token.
+    - name: sidecar-api
+      port: 8444
+      targetPort: sidecar-api
+
+---
+# Source: mimic/templates/valkey.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimic-valkey
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+    app.kubernetes.io/name: mimic-valkey
+spec:
+  selector:
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/name: mimic-valkey
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: valkey
+
+---
+# Source: mimic/templates/controller.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mimic-controller
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+    app.kubernetes.io/name: mimic-controller
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: mimic
+      app.kubernetes.io/name: mimic-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: mimic
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/instance: mimic
+        app.kubernetes.io/version: "0.1.0"
+        helm.sh/chart: mimic-0.1.0
+        app.kubernetes.io/name: mimic-controller
+    spec:
+      serviceAccountName: mimic-controller
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: ghcr.io/thaliph/mimic:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/mimic-controller"]
+          env:
+            # Bounds the allocator's arenas: the controller holds reports of tens of megabytes
+            # (spec §7.3, SHR-18). It applies to glibc, which the image has: the controller is built
+            # on Debian and runs on distroless cc-debian13, with the default allocator.
+            - name: MALLOC_ARENA_MAX
+              value: "2"
+            - name: MIMIC_LOG
+              value: "info"
+            - name: MIMIC_ADMIN_ADDR
+              value: "0.0.0.0:8081"
+            - name: MIMIC_VALKEY_URL
+              value: "redis://mimic-valkey:6379"
+            - name: MIMIC_VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: golden
+                  key: password
+            - name: MIMIC_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            - name: MIMIC_WEBHOOK_ADDR
+              value: "0.0.0.0:8443"
+            - name: MIMIC_SIDECAR_API_ADDR
+              value: "0.0.0.0:8444"
+            - name: MIMIC_WEBHOOK_SERVICE
+              value: "mimic-controller"
+            - name: MIMIC_WEBHOOK_SECRET
+              value: "mimic-webhook-tls"
+            - name: MIMIC_TLS_CA_SECRET
+              value: "mimic-tls-ca"
+            - name: MIMIC_WEBHOOK_CONFIGURATION
+              value: "mimic-injector"
+            - name: MIMIC_WEBHOOK_MAX_CONNECTIONS
+              value: "256"
+            - name: MIMIC_WEBHOOK_REQUEST_TIMEOUT
+              value: "5s"
+            - name: MIMIC_STATUS_INTERVAL
+              value: "30s"
+            - name: MIMIC_STATUS_POD_WINDOW
+              value: "5m"
+            # Load test runs active at once in the cluster (spec §10.2): 0 disables load tests.
+            - name: MIMIC_LOAD_MAX_RUNS
+              value: "0"
+            - name: MIMIC_INJECT_SIDECAR_IMAGE
+              value: "ghcr.io/thaliph/mimic:0.1.0"
+            - name: MIMIC_INJECT_INIT_IMAGE
+              value: "ghcr.io/thaliph/mimic-init:0.1.0"
+            - name: MIMIC_INJECT_SIDECAR_RESOURCES
+              value: "{\"limits\":{\"memory\":\"128Mi\"},\"requests\":{\"cpu\":\"50m\",\"memory\":\"64Mi\"}}"
+            - name: MIMIC_INJECT_SIDECAR_LOG
+              value: "info"
+          ports:
+            - name: admin
+              containerPort: 8081
+            - name: webhook
+              containerPort: 8443
+            - name: sidecar-api
+              containerPort: 8444
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: admin}
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 768Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+      affinity:
+        # Replicas on different nodes when the cluster allows it (preferred, so a single-node cluster still runs them).
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: mimic
+                    app.kubernetes.io/name: mimic-controller
+
+---
+# Source: mimic/templates/valkey.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mimic-valkey
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+    app.kubernetes.io/name: mimic-valkey
+spec:
+  serviceName: mimic-valkey
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: mimic
+      app.kubernetes.io/name: mimic-valkey
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: mimic
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/instance: mimic
+        app.kubernetes.io/version: "0.1.0"
+        helm.sh/chart: mimic-0.1.0
+        app.kubernetes.io/name: mimic-valkey
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: valkey
+          image: docker.io/valkey/valkey:9.0-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+          imagePullPolicy: IfNotPresent
+          command: ["valkey-server"]
+          # $(VALKEY_PASSWORD) is expanded by the kubelet; it never appears in the pod spec.
+          # maxmemory is 75 % of the memory limit; noeviction makes a full store refuse writes (spec §7.3).
+          args:
+            - --dir
+            - /data
+            - --appendonly
+            - "yes"
+            - --requirepass
+            - $(VALKEY_PASSWORD)
+            - --maxmemory
+            - "805306368"
+            - --maxmemory-policy
+            - noeviction
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: golden
+                  key: password
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: golden
+                  key: password
+          ports:
+            - name: valkey
+              containerPort: 6379
+          livenessProbe:
+            tcpSocket: {port: valkey}
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["valkey-cli", "ping"]
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              cpu: 50m
+              memory: 768Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 4Gi
+
+---
+# Source: mimic/templates/webhook.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: mimic-injector
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+# caBundle is owned by the controller: it is not set here, so `helm upgrade` leaves it alone.
+webhooks:
+  # Namespace labelled enabled: every pod is injected unless it is labelled disabled.
+  - name: namespace.inject.mimic.platform.io
+    clientConfig:
+      service:
+        name: mimic-controller
+        namespace: mimic-system
+        port: 8443
+        path: /inject/namespace
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: mimic.platform.io/inject
+          operator: In
+          values: [enabled]
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system","kube-public","kube-node-lease","mimic-system"]
+    failurePolicy: Fail
+    sideEffects: None
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    admissionReviewVersions: [v1]
+  # Namespace labelled selected: only pods of a deployment named by a MimicWorkload.
+  - name: workload.inject.mimic.platform.io
+    clientConfig:
+      service:
+        name: mimic-controller
+        namespace: mimic-system
+        port: 8443
+        path: /inject/workload
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: mimic.platform.io/inject
+          operator: In
+          values: [selected]
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system","kube-public","kube-node-lease","mimic-system"]
+    failurePolicy: Fail
+    sideEffects: None
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    admissionReviewVersions: [v1]
+  # Pod labelled enabled, in any namespace: injected even when the namespace is not labelled.
+  - name: pod.inject.mimic.platform.io
+    clientConfig:
+      service:
+        name: mimic-controller
+        namespace: mimic-system
+        port: 8443
+        path: /inject/pod
+    rules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE]
+        resources: [pods]
+        scope: Namespaced
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system","kube-public","kube-node-lease","mimic-system"]
+    objectSelector:
+      matchLabels:
+        mimic.platform.io/inject: enabled
+    failurePolicy: Fail
+    sideEffects: None
+    reinvocationPolicy: IfNeeded
+    timeoutSeconds: 5
+    admissionReviewVersions: [v1]
+
+---
+# Source: mimic/templates/webhook.yaml
+# Only the controller's service account is restricted, and only in its own configuration.
+# Everything but clientConfig.caBundle (and the labels and annotations) must stay as it is.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mimic-injector-cabundle-only
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [admissionregistration.k8s.io]
+        apiVersions: [v1]
+        operations: [UPDATE]
+        resources: [mutatingwebhookconfigurations]
+        resourceNames: [mimic-injector]
+  matchConditions:
+    - name: controller-service-account
+      expression: 'request.userInfo.username == "system:serviceaccount:mimic-system:mimic-controller"'
+  variables:
+    # Every field of each webhook except clientConfig.caBundle, projected into a map.
+    - name: webhooks
+      expression: |
+        object.webhooks.map(w, {
+          "name": dyn(w.name),
+          "service": dyn(has(w.clientConfig.service) ? w.clientConfig.service : null),
+          "url": dyn(has(w.clientConfig.url) ? w.clientConfig.url : null),
+          "rules": dyn(has(w.rules) ? w.rules : null),
+          "namespaceSelector": dyn(has(w.namespaceSelector) ? w.namespaceSelector : null),
+          "objectSelector": dyn(has(w.objectSelector) ? w.objectSelector : null),
+          "failurePolicy": dyn(has(w.failurePolicy) ? w.failurePolicy : null),
+          "sideEffects": dyn(has(w.sideEffects) ? w.sideEffects : null),
+          "reinvocationPolicy": dyn(has(w.reinvocationPolicy) ? w.reinvocationPolicy : null),
+          "timeoutSeconds": dyn(has(w.timeoutSeconds) ? w.timeoutSeconds : null),
+          "admissionReviewVersions": dyn(has(w.admissionReviewVersions) ? w.admissionReviewVersions : null),
+          "matchPolicy": dyn(has(w.matchPolicy) ? w.matchPolicy : null)
+        })
+    - name: oldWebhooks
+      expression: |
+        oldObject.webhooks.map(w, {
+          "name": dyn(w.name),
+          "service": dyn(has(w.clientConfig.service) ? w.clientConfig.service : null),
+          "url": dyn(has(w.clientConfig.url) ? w.clientConfig.url : null),
+          "rules": dyn(has(w.rules) ? w.rules : null),
+          "namespaceSelector": dyn(has(w.namespaceSelector) ? w.namespaceSelector : null),
+          "objectSelector": dyn(has(w.objectSelector) ? w.objectSelector : null),
+          "failurePolicy": dyn(has(w.failurePolicy) ? w.failurePolicy : null),
+          "sideEffects": dyn(has(w.sideEffects) ? w.sideEffects : null),
+          "reinvocationPolicy": dyn(has(w.reinvocationPolicy) ? w.reinvocationPolicy : null),
+          "timeoutSeconds": dyn(has(w.timeoutSeconds) ? w.timeoutSeconds : null),
+          "admissionReviewVersions": dyn(has(w.admissionReviewVersions) ? w.admissionReviewVersions : null),
+          "matchPolicy": dyn(has(w.matchPolicy) ? w.matchPolicy : null)
+        })
+  validations:
+    - expression: "variables.webhooks == variables.oldWebhooks"
+      message: "the controller may only change clientConfig.caBundle of its webhook configuration"
+    - expression: "(has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})"
+      message: "the controller may not change the labels of its webhook configuration"
+    - expression: "(has(object.metadata.annotations) ? object.metadata.annotations : {}) == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {})"
+      message: "the controller may not change the annotations of its webhook configuration"
+
+---
+# Source: mimic/templates/webhook.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mimic-injector-cabundle-only
+  labels:
+    app.kubernetes.io/part-of: mimic
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/instance: mimic
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: mimic-0.1.0
+spec:
+  policyName: mimic-injector-cabundle-only
+  validationActions: [Deny]
