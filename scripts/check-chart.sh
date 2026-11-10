@@ -126,4 +126,52 @@ expr=$(load_expression "$tmp/load-set.yaml")
 grep -qF '"app":"scrape"' <<<"$expr" || fail "mon_01: a set loadTest.metricsFrom does not win over the fallback"
 echo "mon_01: loadTest.metricsFrom falls back, and a set value wins"
 
+# MON-01, PodMonitors (#378, MON-03): the sidecar and load monitors scrape the named port mimic-admin, with the target
+# labels of §10.7; the interval and the namespace selector come from the values; the default has none of them; the
+# Valkey monitor exists only with valkey.metrics; no NetworkPolicy changes with the monitors.
+render --set metrics.podMonitor.enabled=true --set metrics.podMonitor.interval=45s \
+  --set metrics.podMonitor.namespaceSelector.any=false --set 'metrics.podMonitor.namespaceSelector.matchNames[0]=apps' > "$tmp/pm.yaml"
+# pmdoc <name>: one PodMonitor of the monitor render.
+pmdoc() { yq "select(.kind == \"PodMonitor\" and .metadata.name == \"$1\")" "$tmp/pm.yaml"; }
+sidecar=$(pmdoc mimic-sidecar)
+load=$(pmdoc mimic-load)
+[[ -n $sidecar && -n $load ]] || fail "mon_01: the sidecar and load PodMonitors are not rendered"
+[[ $(pmdoc mimic-valkey) == "" ]] || fail "mon_01: the Valkey PodMonitor is rendered without valkey.metrics.enabled"
+
+[[ $(printf '%s\n' "$sidecar" | yq -r '.spec.selector.matchExpressions[0].key') == mimic.platform.io/deployment ]] \
+  && [[ $(printf '%s\n' "$sidecar" | yq -r '.spec.selector.matchExpressions[0].operator') == Exists ]] \
+  || fail "mon_01: the sidecar PodMonitor does not select mimic.platform.io/deployment Exists"
+[[ $(printf '%s\n' "$sidecar" | yq -r '.spec.podMetricsEndpoints[0].port') == mimic-admin ]] \
+  || fail "mon_01: the sidecar PodMonitor does not scrape the port named mimic-admin"
+[[ $(printf '%s\n' "$sidecar" | yq -r '.spec.podMetricsEndpoints[0].path') == /metrics ]] \
+  || fail "mon_01: the sidecar PodMonitor path is not /metrics"
+[[ $(printf '%s\n' "$sidecar" | yq -r '.spec.podMetricsEndpoints[0].interval') == 45s ]] \
+  || fail "mon_01: the sidecar PodMonitor ignores metrics.podMonitor.interval"
+targets=$(printf '%s\n' "$sidecar" | yq -r '.spec.podMetricsEndpoints[0].relabelings[].targetLabel' | sort | tr '\n' ' ')
+[[ $targets == "deployment job namespace pod " ]] || fail "mon_01: the sidecar target labels are not namespace, pod, deployment, job: $targets"
+[[ $(printf '%s\n' "$sidecar" | yq -r '.spec.podMetricsEndpoints[0].relabelings[] | select(.targetLabel == "deployment") | .sourceLabels[0]') == __meta_kubernetes_pod_label_mimic_platform_io_deployment ]] \
+  || fail "mon_01: the deployment target label is not the pod label mimic.platform.io/deployment"
+[[ $(printf '%s\n' "$sidecar" | yq -r '.spec.podMetricsEndpoints[0].relabelings[] | select(.targetLabel == "job") | .replacement') == mimic-sidecar ]] \
+  || fail "mon_01: the sidecar job is not mimic-sidecar"
+[[ $(printf '%s\n' "$sidecar" | yq -r '.spec.namespaceSelector.matchNames[0]') == apps ]] \
+  || fail "mon_01: the sidecar PodMonitor ignores metrics.podMonitor.namespaceSelector"
+
+[[ $(printf '%s\n' "$load" | yq -r '.spec.selector.matchExpressions[0].key') == mimic.platform.io/load-test ]] \
+  && [[ $(printf '%s\n' "$load" | yq -r '.spec.selector.matchExpressions[0].operator') == Exists ]] \
+  || fail "mon_01: the load PodMonitor does not select mimic.platform.io/load-test Exists"
+[[ $(printf '%s\n' "$load" | yq -r '.spec.podMetricsEndpoints[0].port') == mimic-admin ]] \
+  || fail "mon_01: the load PodMonitor does not scrape the port named mimic-admin"
+[[ $(printf '%s\n' "$load" | yq -r '.spec.podMetricsEndpoints[0].relabelings[] | select(.targetLabel == "load_test") | .sourceLabels[0]') == __meta_kubernetes_pod_label_mimic_platform_io_load_test ]] \
+  || fail "mon_01: the load_test target label is not the pod label mimic.platform.io/load-test"
+[[ $(printf '%s\n' "$load" | yq -r '.spec.podMetricsEndpoints[0].relabelings[] | select(.targetLabel == "job") | .replacement') == mimic-load ]] \
+  || fail "mon_01: the load job is not mimic-load"
+
+# Default monitors: the namespace selector is every namespace, and the NetworkPolicies are those of the default render.
+render --set metrics.podMonitor.enabled=true > "$tmp/pm-default.yaml"
+[[ $(yq -r 'select(.kind == "PodMonitor" and .metadata.name == "mimic-sidecar") | .spec.namespaceSelector.any' "$tmp/pm-default.yaml") == true ]] \
+  || fail "mon_01: the default PodMonitor namespace selector is not any: true"
+[[ $(yq 'select(.kind == "NetworkPolicy")' "$tmp/pm-default.yaml") == "$(yq 'select(.kind == "NetworkPolicy")' "$tmp/default.yaml")" ]] \
+  || fail "mon_01: the PodMonitors changed a NetworkPolicy"
+echo "mon_01: the sidecar and load PodMonitors scrape mimic-admin with their target labels; the values apply"
+
 echo "chart checks passed"

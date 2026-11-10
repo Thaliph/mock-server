@@ -1,6 +1,68 @@
-{{- if and .Values.metrics.podMonitor.enabled .Values.valkey.metrics.enabled }}
-# Prometheus Operator PodMonitor of the Valkey exporter (spec §10.7, #378): the Valkey pods of this release,
-# port `metrics` (9121). Scraped in the release namespace only.
+{{- if .Values.metrics.podMonitor.enabled }}
+# Prometheus Operator PodMonitors (spec §10.7, MON-01, #378). Each scrapes the admin port by its name `mimic-admin`
+# (15100), which the injected sidecar and the load generator declare (MON-03). Pods are selected by a label:
+# the injection label `mimic.platform.io/deployment` (set on every injected pod, LDT-20) and the load test label
+# `mimic.platform.io/load-test` (on every generator pod). The sidecar's series carry no namespace, pod or
+# deployment by design, so the target labels add them.
+# The sidecar monitor: injected pods.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ .Release.Name }}-sidecar
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  namespaceSelector:
+    {{- toYaml .Values.metrics.podMonitor.namespaceSelector | nindent 4 }}
+  selector:
+    matchExpressions:
+      - key: mimic.platform.io/deployment
+        operator: Exists
+  podMetricsEndpoints:
+    - port: mimic-admin
+      path: /metrics
+      interval: {{ .Values.metrics.podMonitor.interval }}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_label_mimic_platform_io_deployment]
+          targetLabel: deployment
+        - targetLabel: job
+          replacement: mimic-sidecar
+---
+# The load generator monitor: mimic-load pods of a MimicLoadTest run (§7.8), labelled with their load test.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ .Release.Name }}-load
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  namespaceSelector:
+    {{- toYaml .Values.metrics.podMonitor.namespaceSelector | nindent 4 }}
+  selector:
+    matchExpressions:
+      - key: mimic.platform.io/load-test
+        operator: Exists
+  podMetricsEndpoints:
+    - port: mimic-admin
+      path: /metrics
+      interval: {{ .Values.metrics.podMonitor.interval }}
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_label_mimic_platform_io_load_test]
+          targetLabel: load_test
+        - targetLabel: job
+          replacement: mimic-load
+{{- if .Values.valkey.metrics.enabled }}
+---
+# The Valkey exporter monitor (spec §10.7, #378): the Valkey pods of this release, port `metrics` (9121), in the
+# release namespace only.
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
@@ -21,4 +83,5 @@ spec:
       relabelings:
         - targetLabel: job
           replacement: mimic-valkey
+{{- end }}
 {{- end }}
