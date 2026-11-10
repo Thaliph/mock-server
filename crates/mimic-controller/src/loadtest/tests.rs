@@ -975,3 +975,25 @@ async fn ldt_14_no_ticket_or_credential_name_value_reaches_the_status() {
     }
     assert_eq!(f.phase(&test).0, "Succeeded");
 }
+
+#[tokio::test]
+async fn ldt_09_the_slot_lasts_until_the_run_deadline_and_no_longer() {
+    let f = fx(None, |c| c.start_timeout = Duration::from_secs(300)).await;
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 1000).await;
+    assert_eq!(f.phase(&test).0, "Running");
+    // A missed delete event leaks nothing: the member's score is start + duration + start
+    // timeout + 60 s (the Job's `activeDeadlineSeconds`), and the next admission drops it.
+    let member = format!("{ns}/pay/{}", test.uid);
+    let mut conn = f.conn().await;
+    let score: f64 = redis::cmd("ZSCORE")
+        .arg("mimic:v1:loads:active")
+        .arg(&member)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(score as u64, t0 + 1000 + (60 + 300 + 60) * 1000);
+}

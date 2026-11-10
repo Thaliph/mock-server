@@ -150,6 +150,8 @@ struct Shared {
     results: Mutex<PodResults>,
     stop: watch::Sender<Option<Reason>>,
     pool: Mutex<BTreeMap<(IpAddr, u16), Vec<Conn>>>,
+    /// The controller answered `404`: the run is over, nothing more is posted.
+    gone: AtomicBool,
     /// The last time a probe passed or a response carried the marker.
     verified_at: Mutex<Instant>,
     in_flight: AtomicU64,
@@ -599,6 +601,9 @@ async fn fetch_plan(
 
 /// Posts the final results; a few tries, within the grace period.
 async fn post_final(api: &Api, shared: &Shared, reason: Reason, grace: Duration) {
+    if shared.gone.load(Ordering::SeqCst) {
+        return;
+    }
     let results = shared.snapshot();
     let post = Post {
         final_post: true,
@@ -715,6 +720,7 @@ pub async fn generate(
         verified_at: Mutex::new(Instant::now()),
         in_flight: AtomicU64::new(0),
         unbuilt_logged: AtomicBool::new(false),
+        gone: AtomicBool::new(false),
     });
     ready.store(true, Ordering::SeqCst);
 
@@ -740,7 +746,10 @@ async fn supervise(shared: &Arc<Shared>, api: &Api, shutdown: &Shutdown, begun: 
                 }
                 shared.set_targets(answer.addresses());
             }
-            Err(ApiError::Gone) => return Reason::Stopped,
+            Err(ApiError::Gone) => {
+                shared.gone.store(true, Ordering::SeqCst);
+                return Reason::Stopped;
+            }
             Err(error) => tracing::warn!(error = %error, "targets not read"),
         }
         shared.verify_targets().await;
@@ -817,7 +826,10 @@ async fn report(shared: &Arc<Shared>, api: &Api, control: &Mutex<Instant>) {
                 shared.set_targets(answer.addresses());
             }
         }
-        Err(ApiError::Gone) => shared.halt(Reason::Stopped),
+        Err(ApiError::Gone) => {
+            shared.gone.store(true, Ordering::SeqCst);
+            shared.halt(Reason::Stopped);
+        }
         Err(error) => tracing::warn!(error = %error, "targets not read"),
     }
     let results = shared.snapshot();
@@ -834,7 +846,10 @@ async fn report(shared: &Arc<Shared>, api: &Api, control: &Mutex<Instant>) {
                 shared.halt(Reason::Stopped);
             }
         }
-        Err(ApiError::Gone) => shared.halt(Reason::Stopped),
+        Err(ApiError::Gone) => {
+            shared.gone.store(true, Ordering::SeqCst);
+            shared.halt(Reason::Stopped);
+        }
         Err(error) => tracing::warn!(error = %error, "results not posted"),
     }
 }
