@@ -310,8 +310,17 @@ async fn fake_api(set: Bytes) -> (SocketAddr, String, Arc<AtomicUsize>) {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
                 };
-                let service = service_fn(move |_: Request<Incoming>| {
-                    let (set, n) = (set.clone(), pulls.fetch_add(1, Ordering::SeqCst));
+                let service = service_fn(move |request: Request<Incoming>| {
+                    // The answer follows the validator the sidecar holds, not the number of
+                    // requests: a pull that failed and is retried must get the same set.
+                    let n = match request.headers().get("if-none-match") {
+                        None => 0,
+                        Some(v) if v == "\"1-first\"" => 1,
+                        Some(v) if v == "\"1-second\"" => 2,
+                        Some(_) => 3,
+                    };
+                    pulls.fetch_add(1, Ordering::SeqCst);
+                    let set = set.clone();
                     async move {
                         let variant = [Variant::First, Variant::Second, Variant::Refused].get(n);
                         let Some(variant) = variant else {
@@ -376,15 +385,17 @@ async fn egress_view(admin: SocketAddr) -> serde_json::Value {
     serde_json::from_str(&body).unwrap()
 }
 
-async fn view_etag(admin: SocketAddr, etag: &str) -> serde_json::Value {
-    for _ in 0..1500 {
+async fn view_etag(admin: SocketAddr, etag: &str, metrics: &Metrics) -> serde_json::Value {
+    // A generous deadline: parsing runs beside the load on a busy machine.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    while tokio::time::Instant::now() < deadline {
         let view = egress_view(admin).await;
         if view["etag"] == etag {
             return view;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("/egress never showed {etag}");
+    panic!("/egress never showed {etag}\n{}", metrics.encode());
 }
 
 /// The child process of [`spawn_fake_api`]: the test binary run again on this test, with
@@ -419,10 +430,14 @@ fn spawn_fake_api() -> (ApiProcess, SocketAddr, String) {
             .expect("the fake API starts"),
     );
     let stdout = api.0.stdout.take().unwrap();
-    for line in BufReader::new(stdout).lines() {
+    let mut lines = BufReader::new(stdout).lines();
+    for line in lines.by_ref() {
         let line = line.unwrap();
         if let Some(rest) = line.strip_prefix("FAKE_API ") {
             let (addr, ca) = rest.split_once(' ').unwrap();
+            // The child's stdout keeps being read: libtest there prints "has been running for over 60 seconds",
+            // and a closed pipe would end the child (EPIPE) and with it the fake API, failing every later pull.
+            std::thread::spawn(move || lines.for_each(drop));
             return (api, addr.parse().unwrap(), ca.replace('|', "\n"));
         }
     }
@@ -449,7 +464,7 @@ async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_und
     let config = EgressConfig {
         interval: Duration::from_millis(300),
         max_bytes: CAP,
-        timeout: Duration::from_secs(30),
+        timeout: Duration::from_secs(120),
         target: Some(Target {
             url: format!("https://{addr}"),
             ca,
@@ -499,20 +514,28 @@ async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_und
     tokio::spawn(puller.run(std::future::pending()));
 
     // After each accepted pull `/egress` shows the new set, the load still running.
-    let first = view_etag(admin_addr, "\"1-first\"").await;
+    let first = view_etag(admin_addr, "\"1-first\"", &metrics).await;
     assert!(level("first set", &done) >= PULLS_FROM);
-    let second = view_etag(admin_addr, "\"1-second\"").await;
+    let second = view_etag(admin_addr, "\"1-second\"", &metrics).await;
     assert!(level("second set", &done) >= PULLS_FROM);
     assert_ne!(first["authorities"], second["authorities"]);
     // The third body is refused, and the second set is still held.
-    let refused = "mimic_egress_pulls_total{result=\"invalid\"} 1";
-    for _ in 0..1500 {
-        if metrics.encode().contains(refused) {
+    // The sidecar keeps asking with "1-second", so the refused body may be served again: the counter is read as a
+    // number (at least 1), not matched as a string.
+    let refused = |text: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix("mimic_egress_pulls_total{result=\"invalid\"} "))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .is_some_and(|v| v >= 1.0)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    while tokio::time::Instant::now() < deadline {
+        if refused(&metrics.encode()) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(metrics.encode().contains(refused), "{}", metrics.encode());
+    assert!(refused(&metrics.encode()), "{}", metrics.encode());
     assert!(
         level("refused body", &done) < TOTAL,
         "the load ended before the refused pull"
