@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (MON-02, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19).
+# End-to-end checks on kind (MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -2738,6 +2738,168 @@ grep -qF 'mimic_build_info{component="sidecar"' <<<"$sidecar_body" \
 
 kubectl delete namespace $mon02_ns --wait=false >/dev/null
 kubectl -n "$NS" delete pod mon02-scraper --wait=false >/dev/null
+
+# --- MON-21 (spec §12.13, §10.7, #379): the bundled Prometheus and Grafana, enabled by an upgrade -------------------
+# The upgrade enables monitoring.prometheus, monitoring.grafana and valkey.metrics (the exporter target). The checks run
+# in a pod of the release namespace through kubectl exec, so no host port is used. Grafana is queried with the admin
+# password, which is read from its Secret into a variable and sent on stdin: it is never printed and never in argv.
+# A successful login proves the admin password file is mounted; the provisioned datasource and the dashboard both prove
+# the provisioning and the /tmp/dashboards mounts on the read-only root. Ready pods prove that the images start with no
+# command override (the Deployment sets none).
+log "mon_21: the bundled Prometheus and Grafana are enabled by an upgrade"
+install --set valkey.metrics.enabled=true --set monitoring.prometheus.enabled=true --set monitoring.grafana.enabled=true \
+  || fail "mon_21: helm upgrade with the bundled monitoring"
+kubectl -n "$NS" rollout status deploy/$RELEASE-prometheus --timeout=3m || fail "mon_21: Prometheus is not Ready"
+kubectl -n "$NS" rollout status deploy/$RELEASE-grafana --timeout=3m || fail "mon_21: Grafana is not Ready"
+[[ $(kubectl -n "$NS" get deploy $RELEASE-grafana -o jsonpath='{.spec.template.spec.containers[?(@.name=="grafana")].command}') == "" ]] \
+  || fail "mon_21: the grafana container overrides the image command"
+[[ $(kubectl -n "$NS" get pod -l app.kubernetes.io/name=mimic-grafana -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="grafana")].restartCount}') == 0 ]] \
+  || fail "mon_21: the grafana container restarted"
+
+grafana_pw=$(kubectl -n "$NS" get secret $RELEASE-grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d)
+[[ ${#grafana_pw} == 32 ]] || fail "mon_21: the admin password Secret does not hold 32 characters"
+
+# The client: the Python image, restricted, in the release namespace.
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: mon21-client, namespace: $NS}
+spec:
+  automountServiceAccountToken: false
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: client
+      image: $PY
+      command: [sleep, "900"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL]}
+YAML
+kubectl -n "$NS" wait --for=condition=Ready pod/mon21-client --timeout=2m >/dev/null || fail "mon_21: the client pod is not Ready"
+
+# mon21_py: GET argv[1] and print its status on the first line, then the body. With a second argument the admin
+# password is read from stdin and sent as Basic auth. Connection failures print status 0.
+mon21_py=$(cat <<'PY'
+import base64, sys, urllib.error, urllib.request
+req = urllib.request.Request(sys.argv[1])
+if len(sys.argv) > 2:
+    pw = sys.stdin.read()
+    req.add_header("Authorization", "Basic " + base64.b64encode(("admin:" + pw).encode()).decode())
+try:
+    r = urllib.request.urlopen(req, timeout=10)
+    code, body = r.status, r.read()
+except urllib.error.HTTPError as e:
+    code, body = e.code, e.read()
+except OSError:
+    code, body = 0, b""
+sys.stdout.write("%d\n%s" % (code, body.decode("utf-8", "replace")))
+PY
+)
+# mon21_get <url> [auth]: the response of a GET from the client pod (status line, then body). Empty on a failure.
+mon21_get() {
+  if [[ ${2:-} == auth ]]; then
+    printf '%s' "$grafana_pw" | kubectl -n "$NS" exec -i mon21-client -- python3 -I -c "$mon21_py" "$1" auth 2>/dev/null || true
+  else
+    kubectl -n "$NS" exec mon21-client -- python3 -I -c "$mon21_py" "$1" 2>/dev/null || true
+  fi
+}
+mon21_status() { head -n 1 <<<"$1"; }
+mon21_body() { tail -n +2 <<<"$1"; }
+
+# Grafana: health, no anonymous access, and the admin login (the password file is mounted).
+health=$(mon21_get http://$RELEASE-grafana:3000/api/health)
+[[ $(mon21_status "$health") == 200 ]] && grep -q '"database": "ok"' <<<"$(mon21_body "$health")" \
+  || fail "mon_21: Grafana /api/health is not ok"
+[[ $(mon21_status "$(mon21_get http://$RELEASE-grafana:3000/api/search)") == 401 ]] \
+  || fail "mon_21: Grafana answers without credentials other than 401"
+ds_health=""
+for _ in $(seq 60); do
+  ds_health=$(mon21_get http://$RELEASE-grafana:3000/api/datasources/uid/mimic-prometheus/health auth)
+  [[ $(mon21_status "$ds_health") == 200 ]] && jq -e '.status == "OK"' <<<"$(mon21_body "$ds_health")" >/dev/null && break
+  sleep 2
+done
+[[ $(mon21_status "$ds_health") == 200 ]] && jq -e '.status == "OK"' <<<"$(mon21_body "$ds_health")" >/dev/null \
+  || fail "mon_21: the provisioned Prometheus datasource is not healthy through Grafana"
+
+# The Prometheus targets, through the Grafana proxy of the datasource: the controller, a sidecar of an injected pod in
+# its own namespace (with its namespace, pod and deployment labels), and the Valkey exporter, all up.
+mon21_ns=mon-21
+ns_fresh $mon21_ns mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: mon21, namespace: $mon21_ns}
+spec: {deployment: mon21-app}
+YAML
+deploy_sleeper $mon21_ns mon21-app
+kubectl -n $mon21_ns rollout status deploy/mon21-app --timeout=3m
+
+# targets_up <targets JSON>: the three jobs have an up target, and the sidecar target carries the labels of its pod.
+targets_up() {
+  jq -e --arg ns "$mon21_ns" '
+    [.data.activeTargets[] | select(.health == "up")] as $up
+    | ($up | map(.labels.job)) as $jobs
+    | ($jobs | index("mimic-controller")) and ($jobs | index("mimic-valkey")) and ($jobs | index("mimic-sidecar"))
+      and any($up[]; .labels.job == "mimic-sidecar" and .labels.namespace == $ns and .labels.deployment == "mon21-app")
+  ' >/dev/null 2>&1 <<<"$1"
+}
+targets=""
+for _ in $(seq 60); do
+  targets=$(mon21_get http://$RELEASE-grafana:3000/api/datasources/proxy/uid/mimic-prometheus/api/v1/targets auth)
+  [[ $(mon21_status "$targets") == 200 ]] && targets_up "$(mon21_body "$targets")" && break
+  sleep 2
+done
+[[ $(mon21_status "$targets") == 200 ]] && targets_up "$(mon21_body "$targets")" \
+  || fail "mon_21: the controller, sidecar and Valkey exporter targets are not all up in Prometheus"
+
+# The dashboards: a ConfigMap labelled grafana_dashboard "1" is listed by Grafana within 60 s, one labelled "0" is not.
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: mon21-dashboard, namespace: $NS, labels: {grafana_dashboard: "1"}}
+data:
+  mon21.json: '{"uid": "mimic-e2e", "title": "mimic e2e", "schemaVersion": 39, "panels": []}'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: mon21-dashboard-off, namespace: $NS, labels: {grafana_dashboard: "0"}}
+data:
+  mon21-off.json: '{"uid": "mimic-e2e-off", "title": "mimic off", "schemaVersion": 39, "panels": []}'
+YAML
+found_dash=0
+for _ in $(seq 30); do
+  search=$(mon21_get "http://$RELEASE-grafana:3000/api/search?query=mimic" auth)
+  if [[ $(mon21_status "$search") == 200 ]] && jq -e 'any(.[]; .uid == "mimic-e2e")' >/dev/null <<<"$(mon21_body "$search")"; then
+    found_dash=1
+    break
+  fi
+  sleep 2
+done
+(( found_dash == 1 )) || fail "mon_21: the dashboard of the labelled ConfigMap is not listed by Grafana"
+jq -e 'any(.[]; .uid == "mimic-e2e-off") | not' >/dev/null <<<"$(mon21_body "$search")" \
+  || fail "mon_21: the dashboard of the ConfigMap labelled 0 is listed by Grafana"
+
+# The admin password is in no log of the release namespace (never printed: the check is grep -qF on a variable).
+logs=$(kubectl -n "$NS" logs --all-containers --selector "app.kubernetes.io/instance=$RELEASE" --tail=-1 2>/dev/null || true)
+if grep -qF -- "$grafana_pw" <<<"$logs"; then fail "mon_21: the admin password appears in a log of the release namespace"; fi
+
+# The Prometheus and Grafana ServiceAccounts cannot read Secrets, in the release namespace or the injected one.
+for sa in $RELEASE-prometheus $RELEASE-grafana; do
+  for ns in $NS $mon21_ns; do
+    [[ $(kubectl auth can-i get secrets -n "$ns" --as=system:serviceaccount:$NS:$sa || true) == no ]] \
+      || fail "mon_21: $sa may get secrets in $ns"
+  done
+done
+echo "mon_21: Prometheus targets up, Grafana healthy and provisioned, the dashboard listed, no password in a log"
+
+# Back to the defaults: the later sections see the chart without the bundled monitoring.
+kubectl delete namespace $mon21_ns --wait=false >/dev/null
+kubectl -n "$NS" delete pod mon21-client --wait=false >/dev/null
+kubectl -n "$NS" delete configmap mon21-dashboard mon21-dashboard-off --ignore-not-found >/dev/null
+install || fail "mon_21: helm upgrade back to the defaults"
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
+if kubectl -n "$NS" get deploy $RELEASE-grafana >/dev/null 2>&1; then fail "mon_21: Grafana is still rendered with the defaults"; fi
 
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"
 kubectl apply -f - >/dev/null <<YAML
