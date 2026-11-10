@@ -236,6 +236,8 @@ pub enum StoreError {
     Deployments,
     /// Valkey unavailable, too many conflicts or an unreadable stored value: `503`.
     Unavailable,
+    /// A load test summary over its cap (spec §7.8 "End").
+    TooLarge,
 }
 
 /// Why a read failed.
@@ -1209,7 +1211,7 @@ impl Store {
         ReadError::Unavailable
     }
 
-    async fn connection(&self) -> Result<MultiplexedConnection, StoreError> {
+    pub(crate) async fn connection(&self) -> Result<MultiplexedConnection, StoreError> {
         let mut guard = self.connection.lock().await;
         if let Some(conn) = guard.as_ref() {
             return Ok(conn.clone());

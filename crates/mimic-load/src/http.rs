@@ -250,9 +250,15 @@ pub fn verify(
 }
 
 /// `GET http://<ip>:15100/load`, on a connection of its own.
-pub async fn probe(ip: IpAddr, run: &RunId, deployment: &str, pod: &str) -> Result<(), Unverified> {
+pub async fn probe(
+    ip: IpAddr,
+    port: u16,
+    run: &RunId,
+    deployment: &str,
+    pod: &str,
+) -> Result<(), Unverified> {
     let exchange = async {
-        let addr = SocketAddr::new(ip, PROBE_PORT);
+        let addr = SocketAddr::new(ip, port);
         let tcp = TcpStream::connect(addr).await.ok()?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(tcp)).await.ok()?;
         let driver = tokio::spawn(async move {

@@ -162,6 +162,10 @@ pub struct ApiState {
     pub stop: AtomicBool,
     /// Every route answers `503`.
     pub down: AtomicBool,
+    /// The run ended: `targets` and `results` answer `404`.
+    pub ended: AtomicBool,
+    /// Results posts received after the end.
+    pub late: std::sync::atomic::AtomicUsize,
     pub posts: Mutex<Vec<Post>>,
     pub authorizations: Mutex<Vec<String>>,
 }
@@ -297,6 +301,12 @@ async fn api_route(
         return Ok(reply(404, "{}".into()));
     };
     let stop = state.stop.load(Ordering::SeqCst);
+    if state.ended.load(Ordering::SeqCst) && route != "plan" {
+        if route == "results" {
+            state.late.fetch_add(1, Ordering::SeqCst);
+        }
+        return Ok(reply(404, "{}".into()));
+    }
     Ok(match (method.as_str(), route) {
         ("GET", "plan") => reply(200, state.plan.lock().unwrap().clone()),
         ("GET", "targets") => {

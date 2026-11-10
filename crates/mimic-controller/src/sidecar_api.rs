@@ -743,6 +743,7 @@ impl SidecarApi {
             .map_err(|e| match e {
                 StoreError::Name => invalid("name"),
                 StoreError::Deployments => DEPLOYMENT_LIMIT,
+                StoreError::TooLarge => invalid("size"),
                 StoreError::Unavailable => {
                     caller.error = Some("store unavailable".to_string());
                     UNAVAILABLE

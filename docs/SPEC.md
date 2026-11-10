@@ -869,6 +869,9 @@ logic in `mimic-core` (`discovery` module).
   is handled once (idempotence below). Only pods of a Deployment are injected (owner
   ReplicaSet named `<deployment>-<pod-template-hash>`); the deployment name is the workload
   identity.
+- **Admin port name** (#378, MON-03): the `mimic-sidecar` container declares `containerPort` 15100,
+  `protocol: TCP`, named `mimic-admin`, so that a `PodMonitor` can scrape it by port name. The
+  declaration is informational (no `hostPort`) and does not change the redirect rules.
 - **Skipped** pods are admitted unchanged except for the annotation
   `mimic.platform.io/skipped: <reason>`: `host-network`, `unsupported-owner`, `port-conflict`
   (an app container declares port 15001, 15006 or 15100), `uid-conflict` (an app container or
@@ -1120,10 +1123,10 @@ logic in `mimic-core` (`discovery` module).
   | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
   | `mimic:v1:{<ns>/<dep>}:pulls` | hash | (F10) field `<pod>` → `<mode> <ms>`: the mode the last `200` or `304` egress answer to that pod carried and when (§7.7) | same as `:pods` fields; the key itself `MIMIC_STORE_TTL` after its last write |
   | `mimic:v1:ns:<ns>` | sorted set | member `<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
-  | `mimic:v1:{<ns>/<dep>}:load:<uid>` | hash | (F11) a load test run (§7.8): `spec` (the `MimicLoadTest` name and spec, no Secret value), `stop` (`0`/`1`), `start` and `end` (ms), `phase`, `reason`; while active `plan`, `ticket` and per generator pod `<pod>` → its last cumulative results (at most 256 KiB each); once ended only `summary` (at most 192 KiB) besides the small fields | `MIMIC_STORE_TTL` after its last write |
+  | `mimic:v1:{<ns>/<dep>}:load:<uid>` | hash | (F11) a load test run (§7.8): `spec` (the `MimicLoadTest` name and spec, no Secret value), `stop` (`0`/`1`), `start` and `end` (ms), `phase`, `reason`; while active `plan`, `ticket` and per generator worker index `<i>` → its last cumulative results (at most 256 KiB each); once ended only `summary` (at most 192 KiB, enforced by the end script) besides the small fields; ended runs together hold at most deployments × 20 × 192 KiB at the defaults (each expires `MIMIC_STORE_TTL` after its last write) | `MIMIC_STORE_TTL` after its last write |
   | `mimic:v1:{<ns>/<dep>}:loads` | sorted set | (F11) member `<uid>`, score = start ms; at most 20, the oldest ended run (and its `:load:<uid>`) removed by each admission | `MIMIC_STORE_TTL` after the last write |
   | `mimic:v1:loads:active` | sorted set | (F11) member `<ns>/<dep>/<uid>`, score = the run's deadline (ms: start + `activeDeadlineSeconds`); the admission script removes members past their score, then refuses a member of a deployment already present (`Busy`) or past `MIMIC_LOAD_MAX_RUNS` members (`ClusterBusy`); the end of a run removes it | none (members expire by score) |
-  | `mimic:v1:loads:reserved` | hash | (F11) field `<ns>/<dep>/<uid>` → bytes reserved by an active run (§7.8 "Admission"); same lifetime as its `:active` member (the admission script drops fields whose member is gone) | none |
+  | `mimic:v1:loads:reserved` | hash | (F11) field `<ns>/<dep>/<uid>` → bytes reserved by an active run (§7.8 "Admission"); same lifetime as its `:active` member (the admission script drops fields whose member is gone). The admission script reads `loads:active` and `loads:reserved` together with a deployment's keys, which are not in one hash slot: it needs the standalone Valkey of §3 (cluster mode is not supported) | none |
   | `mimic:v1:workloads` | sorted set | member `<ns>/<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
 
 - **Push processing**: structural check of the posted report, then re-redaction, then
@@ -1761,9 +1764,12 @@ no `MimicLoadTest` and creates no Job).
      `plan`, `ticket` and per-pod fields are deleted and replaced by `summary` (the `results`
      of the status below, at most 192 KiB: 64 endpoints of templates up to 2 KiB), the slot
      and the reservation are released, and `status.endTime` set; a post arriving afterwards
-     is `404`.
+     is `404`. The end script refuses a summary over 192 KiB; the controller keeps its summary at
+     most 184 KiB by dropping the per-endpoint rows (the total stays) when the full one is larger.
      Deleting the `MimicLoadTest` deletes the Job (owner reference, `blockOwnerDeletion:
-     false`) and releases the slot.
+     false`) and releases the slot. A delete event a replica misses leaks nothing: the slot's
+     `loads:active` score is the run's deadline (start + `activeDeadlineSeconds`), and the next
+     admission drops the member and its reservation once it is past (LDT-09).
 - **Targets**: the ready endpoints (`conditions.ready` true or absent) of every
   `EndpointSlice` of the namespace whose `targetRef` is a `Pod` with a name the deployment's
   ReplicaSets can generate (the §7.2 check), one address per pod (the first), deduplicated.
@@ -1855,7 +1861,8 @@ no `MimicLoadTest` and creates no Job).
   - *Controller*: the effective mode leaving `mock` ends the run (`Aborted`/`ModeLeft`) as in
     step 5.
 - **Generator** `mimic-load` (in the `mimic` image), one Job per run in the deployment's
-  namespace. Pod: `automountServiceAccountToken: false`, the namespace's `default` service
+  namespace. The container declares its metrics port 15100, `protocol: TCP`, named
+  `mimic-admin` (as the sidecar, §7.1, MON-03; no `hostPort`). Pod: `automountServiceAccountToken: false`, the namespace's `default` service
   account, a projected token of audience `mimic.platform.io/load` (600 s) as the only
   credential towards mimic, UID 65532, `runAsNonRoot`, read-only root, all capabilities
   dropped, `RuntimeDefault`, `MIMIC_LOAD_RESOURCES`, labels `mimic.platform.io/inject:
@@ -1892,11 +1899,14 @@ no `MimicLoadTest` and creates no Job).
     "durationMs", "rampUpMs", "timeoutMs", "startTimeoutMs"}}` (`application/json`); `params`
     is the pod's own share (`split`: its `concurrency` and its `rate`, `null` in the closed
     model) and the run's durations, so the Job needs no variable for them.
-  - `GET …/targets` → `{"stop": <bool>, "targets": [{"ip", "pod"}]}`, sorted by pod.
+  - `GET …/targets` → `{"stop": <bool>, "targets": [{"ip", "pod"}]}`, sorted by pod; `503` while the
+    controller's `EndpointSlice` cache has not synced (an empty list would read as `NoTargets`).
   - `POST …/results` (at most 256 KiB, else `413`) `{"final": <bool>, "pod", "reason":
     null | "Completed" | "ModeLeft" | "Unverified" | "NoTargets", "results": <cumulative
-    results of this pod>}` → `200` `{"stop": <bool>}`. A post replaces the pod's previous
-    results (cumulative, so a retry never double-counts).
+    results of this pod>}` → `200` `{"stop": <bool>}`. A post replaces the previous results
+    of the same worker index (cumulative, so a retry never double-counts; the results are kept per
+    index, so a generator pod that the Job replaces takes over its predecessor's field and the
+    stored bytes stay within the bound of LDT-09).
 - **Results** (pure, `load::summary`). Per endpoint (method, port, template) and in total:
   `requests`, `missed`, `statuses` by class (`2xx` … `5xx`), `errors` by kind (`timeout`,
   `connect`, `reset`, `protocol`, `refused`, `unverified`), `rps` (requests × 1000 / elapsed
@@ -2158,7 +2168,7 @@ random numbers it hands to the draw.
 | `mimic_sidecar_api_egress_builds_total` | counter (F9, controller; the sidecar's pull metrics are `mimic_egress_*`), egress projections built (§7.7); `too_large` also counts a pull refused `507` before its build | `result` (`ok`, `too_large`, `unreadable`, `error`) |
 | `mimic_sidecar_api_egress_build_duration_seconds` | histogram (F9, controller), read, check, projection and serialisation of one build; buckets as `mimic_store_write_duration_seconds` | — |
 | `mimic_sidecar_api_egress_cache_bytes` | gauge (F9, controller), bytes of `MIMIC_SIDECAR_API_EGRESS_BUDGET` held by projections, cached or being sent (a build refused by this budget is still counted `ok` in `mimic_sidecar_api_egress_builds_total`) | — |
-| `mimic_load_runs_total` | counter (F11, controller), load test runs ended (§7.8) | `phase` (`Succeeded`, `Failed`, `Aborted`), `reason` |
+| `mimic_load_runs_total` | counter (F11, controller), load test runs ended (§7.8); a run that fails before its admission is counted by every replica that writes its status, so two replicas can count it twice in a rare race (an admitted run is counted once, by the replica whose end script wins) | `phase` (`Succeeded`, `Failed`, `Aborted`), `reason` |
 | `mimic_load_active_runs` | gauge (F11, controller), members of `mimic:v1:loads:active` at the last status pass | — |
 
   `mimic-load` (F11) exposes on its admin port, besides the common metrics:
@@ -2217,6 +2227,13 @@ random numbers it hands to the draw.
   and they never take a budget slot. The set restarts empty with the process.
   `mimic_http_request_duration_seconds` observes the exchanges whose response head was read;
   `unframed` and `rejected` exchanges are counted in `mimic_http_requests_total` only.
+- **Valkey exporter** (#378, §10.7): with `valkey.metrics.enabled` the Valkey pod's exporter
+  (`oliver006/redis_exporter`, port 9121) reads `INFO` only, as the ACL user `mimic-exporter`
+  (`+info +ping`, no key access, §11). It exposes no key, value or client list. The dashboards use
+  only the series listed under "Exporter metrics used" above.
+- **Aggregation** (#378): the controller's series are summed across its replicas (there is no
+  leader), except the gauges set by a status pass (`mimic_load_active_runs`), which are read with
+  `max`.
 - **Health**: `/healthz` (process alive) and `/readyz` (ready to serve) on the admin port.
 - No traces.
 
@@ -2293,6 +2310,7 @@ random numbers it hands to the draw.
 | `MIMIC_LOAD_MAX_PLAN` | `8Mi` | (F11) Largest serialised plan (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–256Mi). The floor leaves room for the plan's skeleton (about 34 bytes without endpoint) so that a shrunk plan is always readable; a smaller value is invalid (exit 2, like any invalid `MIMIC_*` value). `load::plan` itself never builds a plan over a limit below 64Ki: it uses 64Ki. |
 | `MIMIC_LOAD_START_TIMEOUT` | `5m` | (F11) Longest wait in `Pending` for the gate, and for a verified target (§7.8), 5s–1h. |
 | `MIMIC_LOAD_RESOURCES` | `{"requests":{"cpu":"500m","memory":"128Mi"},"limits":{"cpu":"2","memory":"256Mi"}}` | (F11) Generator pod `resources`, JSON. |
+| `MIMIC_LOAD_NETWORK_POLICY` | absent | (F11) JSON `{"controllerLabels": {…}, "dnsNamespace": "…", "dnsLabels": {…}, "metricsFrom": […]}`: when set, each run also gets the NetworkPolicy of §7.8 built from these peers (the controller pods' labels, the DNS pods' namespace and labels, the NetworkPolicy peers allowed on the admin port: the chart's effective `loadTest.metricsFrom` of §10.7, which, when empty and `metrics.podMonitor.enabled`, falls back to the namespace peer `networkPolicy.metricsNamespaceSelector`; the admission policy checks the same value); absent: no NetworkPolicy. The chart sets it when `loadTest.networkPolicy`. |
 | `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API (§7.5) and, from F6, UI listener (pages, OpenAPI documents, embedded Swagger UI); plain HTTP, loopback peers only. |
 
 ### 10.3 Sidecar variables
@@ -2365,8 +2383,46 @@ it sets. The pod's index and the Job's pod count come from the load API (§7.8).
 | `MIMIC_LOAD_CREDENTIALS_DIR` | `/mimic/credentials` | Mounted credentials Secret; absent when the spec has none. |
 | `MIMIC_LOAD_REPORT_INTERVAL` | `5s` | Period of the targets poll and the results post, 1s–1m. |
 | `MIMIC_LOAD_MAX_PLAN` | `8Mi` | Largest plan read (same syntax as the controller's). |
+| `MIMIC_LOAD_PROBE_PORT` | `15100` | The targets' admin port, where the probe of §7.8 is sent. The Job never sets it (the admission policy lists the allowed names); it is for tests. |
 
 `mimic-load` has the common variables (§10.1) and admin listener (`0.0.0.0:15100`).
+
+### 10.7 Monitoring values (Helm, #378)
+
+Chart values of the scrape objects, all off by default. Nothing of them is rendered unless enabled,
+so the default render is the one of §12.13 (MON-01).
+
+| Value | Default | Meaning |
+|---|---|---|
+| `valkey.metrics.enabled` | `false` | The Redis exporter as a container of the Valkey pod, with the Secret `<release>-valkey-exporter` (its password, kept on upgrade), and the init container `valkey-acl` builds the ACL file at each pod start (§10.7). Enabling restarts Valkey once; with `valkey.persistence.enabled: false` the store is lost on that restart. |
+| `valkey.metrics.image` | `docker.io/oliver006/redis_exporter:v1.95.0@sha256:afb2…` | Pinned by digest in `images/Dockerfile` (stage `redis-exporter`, checked by `scripts/check-pins.sh`). Released 2026-10-21, outside the 14-day cooldown. |
+| `valkey.metrics.resources` | requests 10m CPU and 16Mi memory, limit 32Mi memory | Resources of the exporter container. |
+| `metrics.podMonitor.enabled` | `false` | Prometheus Operator PodMonitors, the admin port by its name `mimic-admin` (15100): `<release>-sidecar` (job `mimic-sidecar`) of the injected pods, selected by `mimic.platform.io/deployment` Exists, with the target labels `namespace`, `pod` and `deployment`; `<release>-load` (job `mimic-load`) of the generator pods, selected by `mimic.platform.io/load-test` Exists, with the target label `load_test`; and, when `valkey.metrics.enabled`, `<release>-valkey` (job `mimic-valkey`, port `metrics`, 9121) of the Valkey pods in the release namespace. Needs the `monitoring.coreos.com` CRDs at install; the bundled Prometheus of #379 does not read it. No NetworkPolicy is added for the sidecar port (§11.1). |
+| `metrics.podMonitor.interval` | `30s` | Scrape interval of the PodMonitors. |
+| `metrics.podMonitor.namespaceSelector` | `{any: true}` | Namespaces the PodMonitors select pods in: `any: true`, or `matchNames` / `matchLabels`. The default is every namespace, since a pod can be injected through a `MimicWorkload` alone. |
+| `loadTest.metricsFrom` | `[]` | NetworkPolicy peers that may scrape a generator on 15100. Empty while `metrics.podMonitor.enabled` is true: the namespace peer `networkPolicy.metricsNamespaceSelector` (the release namespace when that is empty). A set value wins. |
+
+The exporter's arguments are fixed: `--web.listen-address=0.0.0.0:9121` and
+`--redis.addr=redis://localhost:6379`. Its env holds `REDIS_USER` (`mimic-exporter`) and
+`REDIS_PASSWORD` (a `secretKeyRef`) and nothing else. No flag reads keys, values or client lists
+(`--check-keys`, `--check-single-keys`, `--check-streams`, `--script`, `--export-client-list` and
+`--include-config-metrics` are never given). The exporter reaches Valkey on `localhost`, so the
+Valkey port needs no new ingress rule.
+
+With `valkey.metrics.enabled` the Valkey pod gets `--aclfile` and no `--requirepass`: the file is its
+only source of users, and Valkey recreates `default` as `on nopass` when the file lacks it (the store
+open, the controller's AUTH failing; #378). An init container `valkey-acl` (the pinned Valkey image, the
+restricted security context of the valkey container, a read-only root) builds the file at each pod start
+from the Secrets, into an in-memory emptyDir mounted read-only in Valkey, mode 0440. It holds two lines
+and SHA-256 hashes only: `user default on #<sha256 of VALKEY_PASSWORD> ~* &* +@all`, where VALKEY_PASSWORD
+is the Valkey password of `valkey.existingSecret` or of Secret `<release>-valkey`, and
+`user mimic-exporter on #<sha256 of EXPORTER_PASSWORD> +info +ping resetkeys resetchannels`, where
+EXPORTER_PASSWORD is the password of Secret `<release>-valkey-exporter`. The init container exits non-zero
+when a password is empty and never prints one. No line says `nopass`. No Secret holds the file, so a
+render needs no lookup for it, and the file follows `valkey.existingSecret` and a rotated Secret after a
+restart of the Valkey pod. This settles item 2 of #399 for the default user; the exporter's password is
+still a lookup (#399). With `valkey.metrics.enabled` false the default user keeps `--requirepass` and
+there is no ACL file.
 
 ## 11. Security baseline
 
@@ -2709,6 +2765,13 @@ it sets. The pod's index and the Job's pod count come from the load API (§7.8).
   percentiles are bucket bounds (at most 4.43 % high).
 - (F11) A run without targets behind a Service cannot be load-tested (targets come from
   `EndpointSlice`s, so that the controller reads neither pods nor Deployments).
+- (#378) The chart adds no NetworkPolicy on the sidecar's admin port (15100) in app namespaces:
+  they belong to their owners, and a policy that selects app pods with `policyTypes: [Ingress]`
+  would isolate them. The port is reachable from any pod that reaches the pod IP, as before; the
+  namespace owner adds the policy.
+- (#378) The exporter's NetworkPolicy (9121 from the release namespace and
+  `networkPolicy.metricsNamespaceSelector`) needs a CNI that enforces NetworkPolicy, as the other
+  policies of the chart do (FND-08). kind's default CNI does not.
 
 ## 12. Delivery plan
 
@@ -3109,7 +3172,7 @@ with no `mimic-load-run` header unchanged).
 | LDT-07 | **I** (controller). Lifecycle (§7.8): a run on a deployment in `discovery` is `Pending`/`WaitingForMock` with no Job, then `Failed`/`NotMock` after `MIMIC_LOAD_START_TIMEOUT` (set to 5 s); once the `MimicWorkload` says `mock` and the target pods' `:pulls` say `mock`, the Job of LDT-05 is created and the run is `Running`; a second run on the same deployment is `Failed`/`Busy`; a third active run in one namespace (`MIMIC_LOAD_MAX_NAMESPACE_RUNS=2`) `Failed`/`NamespaceBusy`; past `MIMIC_LOAD_MAX_RUNS` `Failed`/`ClusterBusy`; with `MIMIC_LOAD_STORE_BUDGET=2Mi` and a 1.5 MiB plan, the second such run on another deployment is `Failed`/`StoreFull` and is admitted once the first ended; with `MIMIC_LOAD_MAX_PENDING=2`, the third `Pending` run of a namespace (by `creationTimestamp`) is `Failed`/`TooManyPending` while the first two keep waiting; two controller processes on one Valkey create one Job per run and never admit more than `MIMIC_LOAD_MAX_RUNS` runs; a value above a limit is `Failed`/`Invalid`; no stored report `NoReport`; no plannable endpoint `NoEndpoints` with `status.skipped`; `MIMIC_LOAD_MAX_RUNS=0` `Disabled`. One INFO `load test started` (namespace, name, deployment, uid, concurrency, rate, duration, targets) and one INFO `load test ended` (phase, reason, requests, errors) per run; `mimic_load_runs_total{phase,reason}` counts each end. |
 | LDT-08 | **I** (controller). Load API (§7.8): plan, targets and results answer for a pod of the run's Job with a `mimic.platform.io/load` token; a sidecar token is `401` there and a load token is `401` on `POST /v1/workloads/<dep>/report` and the egress route; a pod name of another Job is `403`, a token of another namespace `404`; a results body over 256 KiB is `413` before it is read; a malformed one `400`; the plan route serves the plan stored at admission even after the report changed, with the ticket and `worker` = the index in the pod name (`mimic-load-…-2-xxxxx` gets 2) and `workers` = the Job's pods; targets follow `EndpointSlice` changes (a pod turning not ready leaves the list) and answer `stop: true` after `spec.stop` or the mode leaving `mock`. Admission order, rate limit and `TokenReview` limits are those of §7.2 (`429` past the rate, no `TokenReview`). |
 | LDT-09 | **I** (controller). Results and status (§7.8): cumulative posts from 2 pods are merged into `status.results` as `load::summary` computes; posting the same body twice changes nothing; the run is `Succeeded`/`Completed` once both pods posted `final`, `Aborted`/`ModeLeft` at a final post with that reason; the Job failing is `Failed`/`JobFailed` with the results posted so far; `:load:<uid>` and `:loads` hold the run with the expiry of §7.3 and the 21st run of a deployment evicts the oldest ended one. Size, with a plan of 64 endpoints whose templates are 2 KiB long, posts of exactly 256 KiB and a summary of exactly 192 KiB: while `Running` with 2 pods, the stored bytes of `:load:<uid>` (the sum of `HSTRLEN` over its fields) are at most the plan's bytes + 2 × 256 KiB + 16 KiB; after any end (`Completed`, `ModeLeft`, `Stopped`, `JobFailed`) it holds no `plan`, `ticket` or pod field and its stored bytes are at most 192 KiB + 16 KiB; `MEMORY USAGE` of the key (all samples) is at most 1.25 × those bounds + 16 KiB (allocator size classes); `mimic:v1:loads:reserved` has no field for it and a results post afterwards is `404`. |
-| LDT-10 | **I** (controller). Stop (§7.8): while `Running`, setting the `MimicWorkload` to `discovery` deletes the Job within 2 s of the watch event and makes the run `Aborted`/`ModeLeft`; `spec.stop: true` does the same with `Stopped`; in both cases the next targets and results answers carry `stop: true` and the slot is free (a new run on the deployment is admitted). |
+| LDT-10 | **I** (controller). Stop (§7.8): while `Running`, setting the `MimicWorkload` to `discovery` deletes the Job within 2 s of the watch event and makes the run `Aborted`/`ModeLeft`; `spec.stop: true` does the same with `Stopped`; in both cases the stop flag is set (and kept) before the Job is deleted, and the run ends in the same pass: the slot is free (a new run on the deployment is admitted) and the generators' next `targets` and `results` calls get `404`, which `mimic-load` treats as a stop (`Stopped`, exit 1, no further post, no retry). |
 | LDT-11 | **I** (sidecar). Load marker (§7.8), tickets signed with the root of the test's `MIMIC_TLS_CA`: in `mock`, an inbound HTTP/1 request and an `h2c` stream with a valid ticket naming the sidecar's deployment reach the app without the header, their answers carry exactly one `x-mimic-load` header, `ok`, also when the app's answer sets `x-mimic-load: ok` or `refused` itself, they are counted in `mimic_http_requests_total{direction="inbound"}`, `mimic_load_inbound_total{result="forwarded"}` and `mimic_discovery_exchanges_total{direction="inbound",result="load"}`, their access lines carry `load_run`, and `/discovery` does not change. In `discovery` (`reason=mode`), with a ticket of another deployment or namespace (`workload`), and with a ticket whose payload was changed (another `uid`), whose signature is by another deployment's root, that is expired, malformed, or sent to a sidecar without `MIMIC_TLS_CA` (`ticket`), they get `599`, `x-mimic-load: refused; reason=<reason>`, `content-length: 0`, the app receives no byte, `mimic_load_inbound_total{result="refused_mode"}`, `refused_workload` or `refused_ticket` counts them and one WARN `load request refused` is written per reason per mode period. After a pull switches to `discovery`, the next request on the same keep-alive connection is refused. Requests without the header behave as before. `GET /load` on the admin port answers `{"deployment","mode","namespace","pod"}`; other methods `405`. On HTTP/1 the app receives no byte of a refused request (also none on `h2c`: the connection to the app is opened by the first forwarded stream), the refused connection is closed after the `599`, and the rest is relayed in place: header case and order, bodies, an unmarked or marked request with `Upgrade` (the later `101` tunnel included) are untouched, and a marked request after plain ones, or before an `Upgrade` one, on the same connection is judged on its own. Heads that are forwarded unchanged as non-load: 64 KiB or more without their end (the existing limit behaviour), cut by the client's close (the held bytes are forwarded), never completed (released after the 30 s detection stall), and `mimic-load-run : t` (space before the colon, which the codec does not frame). Without `MIMIC_LOAD_ENABLED=1` (a pod injected while `loadTest.enabled` is false) the header is relayed unchanged, nothing is held back, and `GET /load` answers `404`. |
 | LDT-12 | **I** (`mimic-load`). Generation (§7.8), 2 fake targets: rate 200 for 10 s sends between 1900 and 2100 requests spread over both (counted by the fake targets; the run's own clock bounds it, so a slow runner gives fewer sends counted `missed`, never more); closed model with concurrency 8 never has more than 8 in flight; every request carries the marker and fresh volatile values; credentials come from `MIMIC_LOAD_CREDENTIALS_DIR`; results are posted every `MIMIC_LOAD_REPORT_INTERVAL`, cumulative, then once with `final` and `Completed`, and the process exits 0. No connection is opened to any address but the controller and the targets' probe and request ports; a target whose probe answers another deployment, the right deployment with another pod name, `mode: discovery`, `404` or nothing within 2 s receives no connection on its request port; a target whose probe passes but whose request port answers `x-mimic-load: refused; reason=workload` or `reason=ticket` (a connection that landed on another pod) stops the run with `Unverified`. `/metrics` exposes `mimic_load_requests_total{endpoint,result}`, `mimic_load_request_duration_seconds{endpoint}`, `mimic_load_in_flight`, `mimic_load_missed_total` and `mimic_load_targets`, `endpoint` being `<METHOD> <template>` of the plan. |
 | LDT-13 | **I** (`mimic-load`). Stop (§7.8): one answer with `x-mimic-load: refused; reason=mode` stops all requests within 2 s of that answer (measured by the fake target: no request arrives later than that, on any target), the final post carries `ModeLeft` and the exit code is 1; an answer without `x-mimic-load` does the same with `Unverified`; a targets answer with `stop: true` stops within one interval; `SIGTERM` sends the final post within `MIMIC_SHUTDOWN_GRACE`; with the controller unreachable for 3 intervals the generator stops (no load without control) with exit 1. FND-01, FND-02 and FND-03 hold for `mimic-load` and its variables of §10.6. |
@@ -3127,6 +3190,9 @@ Levels as in §12.2. The chart criteria are checked by `scripts/check-chart.sh` 
 
 | ID | Criterion |
 |---|---|
+| MON-01 | **E** (`helm template`, no cluster). With the defaults, the render with `valkey.existingSecret=golden` is byte-identical to `deploy/helm/golden/default.yaml`, which holds no exporter, ACL Secret or PodMonitor. With `valkey.metrics.enabled` the Valkey pod has the container `exporter`, port 9121 named `metrics`, with exactly the arguments of §10.7, an env of `REDIS_USER` (`mimic-exporter`) and `REDIS_PASSWORD` (`secretKeyRef`) and nothing else, `runAsUser` 65532, `runAsNonRoot`, a read-only root filesystem, `drop: [ALL]` and `RuntimeDefault`; the Valkey container has `--aclfile` and no `--requirepass`; its init container `valkey-acl` reads VALKEY_PASSWORD (the Valkey Secret, `valkey.existingSecret` resolved) and EXPORTER_PASSWORD (`<release>-valkey-exporter`), writes the two hash lines of §10.7 with `umask 0226` (mode 0440) into the in-memory volume `acl`, and refuses an empty password; no line says `nopass`, no Secret holds an ACL file, and the render works with `valkey.existingSecret` set (a render without it reads the chart's own Valkey Secret). The Valkey NetworkPolicy admits 9121 from the release namespace and `networkPolicy.metricsNamespaceSelector` only, and no rule of a new object names `secrets` or `nodes/*`. With `metrics.podMonitor.enabled`, the PodMonitors `<release>-sidecar` (selector `mimic.platform.io/deployment` Exists, port `mimic-admin`, target labels `namespace`, `pod`, `deployment`, job `mimic-sidecar`) and `<release>-load` (selector `mimic.platform.io/load-test` Exists, port `mimic-admin`, target label `load_test`, job `mimic-load`) are rendered, with the namespace selector and interval of the values; with `valkey.metrics.enabled` too, `<release>-valkey` selects the Valkey pods on port `metrics` in the release namespace. The default render has none of them. `loadTest.metricsFrom` falls back to the namespace peer of `networkPolicy.metricsNamespaceSelector` (the release namespace when empty) unless set. `helm lint --strict` passes for the default, `podMonitor`, `valkey.metrics`, both, and `loadTest.enabled` with `podMonitor`. |
+| MON-02 | **E** (kind, `scripts/e2e.sh` section `mon_02`). After an upgrade with `valkey.metrics.enabled` (the Valkey pod restarts once): the exporter container is Ready; `/metrics` on 9121, read from a pod of the release namespace, answers `redis_up 1`; with a canary key and value written as the default user, that `/metrics` holds neither the canary value nor the exporter password; as `mimic-exporter`, `INFO` answers and `GET` and `SET` of the canary key fail with `NOPERM`; the controller is ready and its status passes still succeed after the restart (`mimic_status_updates_total{result="ok"}` grows); the sidecar `/metrics` of an injected pod answers to a pod of the release namespace on the port named `mimic-admin` (resolved from the pod spec, MON-03), with `mimic_build_info{component="sidecar"}`. After the same upgrade the controller Deployment rolls out Ready, and an unauthenticated `PING` in the Valkey pod answers `NOAUTH` (the password is never printed). The PodMonitor target labels are not checked here: kind has no Prometheus Operator. |
+| MON-03 | **U.** The injection patch gives the `mimic-sidecar` container exactly one port, `{"name":"mimic-admin","containerPort":15100,"protocol":"TCP"}`, and the generator Job of §7.8 gives its container the same single port; the patch stays byte-identical for the same input. |
 | MON-04 | **I** (`mimic-runtime`, Linux). The `/metrics` of an admin listener holds `process_cpu_seconds_total` (counter), `process_resident_memory_bytes` > 0, `process_open_fds`, `process_max_fds` equal to the soft `RLIMIT_NOFILE`, and `process_start_time_seconds` between the test start minus 60 s and now, each with the §9 help text, no label and no `mimic_` prefix; `process_open_fds` grows by 1 while the test holds one more open file; `process_cpu_seconds_total` does not decrease between two scrapes around a busy loop; a canary set in the process environment and in its arguments is not in the output. The `mimic_*` part of the output is unchanged (FND-03 still passes). |
 | MON-05 | **I** (controller). After N requests to `/inject/*` (injected, skipped, untouched, `400` malformed, `413` too large, `405`), `mimic_webhook_admission_duration_seconds_count` is N, with exactly the §9 buckets and no label. **U.** Every reason the webhook can count (each skip and untouched reason of `mimic-core`, each error reason of the webhook) is in the §9 list of its `result`, and the list has no other value. |
 | MON-06 | **U** (next to the configuration of each binary). The `mimic_limit` series built from a parsed configuration are exactly the §9 names of that component, sorted, with the parsed values (`MIMIC_SIDECAR_API_EGRESS_BUDGET=16Mi` gives `sidecar_api_egress_budget_bytes` 16777216, `MIMIC_MAX_CONNECTIONS=100` gives `max_connections` 100), the defaults of §10 when unset, and equal outputs for equal inputs. **I** (sidecar). The sidecar's `/metrics` holds them, unchanged across two scrapes. |

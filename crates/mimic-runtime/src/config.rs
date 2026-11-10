@@ -87,7 +87,7 @@ impl Env {
     }
 }
 
-fn parse_duration(value: &str) -> Option<Duration> {
+pub fn parse_duration(value: &str) -> Option<Duration> {
     let (digits, unit_ms) = if let Some(ms) = value.strip_suffix("ms") {
         (ms, 1)
     } else {

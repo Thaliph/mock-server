@@ -96,3 +96,37 @@ capabilities:
 seccompProfile:
   type: RuntimeDefault
 {{- end -}}
+
+{{- define "mimic.valkeyExporterImage" -}}
+{{ .Values.valkey.metrics.image.repository }}:{{ .Values.valkey.metrics.image.tag }}{{ with .Values.valkey.metrics.image.digest }}@{{ . }}{{ end }}
+{{- end -}}
+
+{{- define "mimic.valkeyExporterSecret" -}}
+{{ .Release.Name }}-valkey-exporter
+{{- end -}}
+
+{{/*
+loadTest.metricsFrom as JSON peers of the generator NetworkPolicy (spec §10.7): the value when set;
+else, with metrics.podMonitor.enabled, the namespace peer of networkPolicy.metricsNamespaceSelector
+(the release namespace when that is empty); else none ("[]").
+*/}}
+{{- define "mimic.loadMetricsFrom" -}}
+{{- if .Values.loadTest.metricsFrom -}}
+{{- toJson .Values.loadTest.metricsFrom -}}
+{{- else if .Values.metrics.podMonitor.enabled -}}
+{{- $sel := .Values.networkPolicy.metricsNamespaceSelector | default (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Release.Namespace)) -}}
+{{- toJson (list (dict "namespaceSelector" $sel)) -}}
+{{- else -}}
+[]
+{{- end -}}
+{{- end -}}
+
+{{/*
+MIMIC_LOAD_NETWORK_POLICY of the controller (spec §10.2, §7.8): the peers of each run's generator
+NetworkPolicy as JSON. metricsFrom is the same helper the load test admission policy reads
+(mimic.loadMetricsFrom), so the two cannot diverge.
+*/}}
+{{- define "mimic.loadNetworkPolicy" -}}
+{{- $controller := dict "app.kubernetes.io/instance" .Release.Name "app.kubernetes.io/name" "mimic-controller" -}}
+{{- dict "controllerLabels" $controller "dnsNamespace" .Values.loadTest.dnsSelector.namespace "dnsLabels" .Values.loadTest.dnsSelector.podLabels "metricsFrom" (include "mimic.loadMetricsFrom" . | fromJsonArray) | toJson -}}
+{{- end -}}

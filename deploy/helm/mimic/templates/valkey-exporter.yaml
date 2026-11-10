@@ -1,0 +1,23 @@
+{{- if .Values.valkey.metrics.enabled }}
+{{- $name := include "mimic.valkeyExporterSecret" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
+{{- $password := "" }}
+{{- if and $existing $existing.data (index $existing.data "password") }}
+{{- $password = b64dec (index $existing.data "password") }}
+{{- else }}
+{{- $password = randAlphaNum 40 }}
+{{- end }}
+# The exporter's password (spec §10.7). Kept like the Valkey password: the same value on upgrade.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+  annotations:
+    # Never deleted by helm, so the exporter keeps its password across a reinstall.
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  password: {{ $password | b64enc }}
+{{- end }}

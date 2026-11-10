@@ -98,9 +98,18 @@ pub struct Root {
     certificate: String,
     #[allow(dead_code)]
     public_key: Vec<u8>,
+    /// Signs load tickets (spec §7.8); the same key as the certificate's.
+    signer: p256::ecdsa::SigningKey,
 }
 
 impl Root {
+    /// The fixed-length `r‖s` ECDSA P-256 SHA-256 signature of `message`.
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        use p256::ecdsa::signature::Signer;
+        let signature: p256::ecdsa::Signature = self.signer.sign(message);
+        signature.to_bytes().to_vec()
+    }
+
     #[allow(dead_code)]
     pub fn certificate_pem(&self) -> &str {
         &self.certificate
@@ -159,6 +168,7 @@ pub fn derive_root(seed: &Seed, namespace: &str, deployment: &str) -> Result<Roo
             p256::SecretKey::from_slice(&scalar[..]).ok()
         })
         .ok_or("derive key: no valid scalar")?;
+    let signer = p256::ecdsa::SigningKey::from(&secret);
     let der = secret
         .to_pkcs8_der()
         .map_err(|e| format!("root key: {e}"))?;
@@ -189,6 +199,7 @@ pub fn derive_root(seed: &Seed, namespace: &str, deployment: &str) -> Result<Roo
         issuer: Issuer::new(params, key),
         certificate,
         public_key,
+        signer,
     })
 }
 

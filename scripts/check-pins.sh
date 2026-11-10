@@ -13,10 +13,17 @@ if [ "$valkey_chart" != "$valkey_pin" ]; then
   exit 1
 fi
 
+exporter_chart=$(yq '.valkey.metrics.image.repository + ":" + .valkey.metrics.image.tag + "@" + .valkey.metrics.image.digest' deploy/helm/mimic/values.yaml)
+exporter_pin=$(scripts/pinned-image.sh redis-exporter)
+if [ "$exporter_chart" != "$exporter_pin" ]; then
+  echo "values.yaml valkey.metrics.image is $exporter_chart, images/Dockerfile says $exporter_pin" >&2
+  exit 1
+fi
+
 kind_pin=$(scripts/pinned-image.sh kind-node)
 if ! grep -qF "node_image: $kind_pin" .github/workflows/ci.yml; then
   echo "ci.yml does not use the kind node image of images/Dockerfile: $kind_pin" >&2
   exit 1
 fi
 
-echo "pins: the Valkey image and the kind node image match images/Dockerfile"
+echo "pins: the Valkey image, the Valkey exporter image and the kind node image match images/Dockerfile"
