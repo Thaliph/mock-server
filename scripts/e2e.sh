@@ -2704,6 +2704,12 @@ kubectl -n "$NS" exec "$valkey_pod" -c valkey -- valkey-cli DEL "$canary_key" >/
 # The controller still stores and reads after the Valkey restart: it stays ready and its status passes succeed.
 mon02_ns=mon-02
 ns_fresh $mon02_ns mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+# The baseline is read before the MimicWorkload exists: a status is applied only when it changes (CTL-18), so its
+# first apply may land while the app still rolls out.
+admin_forward
+[[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "mon_02: the controller is not ready after the Valkey restart"
+status_ok() { curl -fs localhost:18081/metrics | awk 'index($0, "mimic_status_updates_total{result=\"ok\"}") == 1 { print int($2) }' | tail -n 1; }
+status_before=$(status_ok); status_before=${status_before:-0}
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
@@ -2712,10 +2718,6 @@ spec: {deployment: mon02-app}
 YAML
 deploy_sleeper $mon02_ns mon02-app
 kubectl -n $mon02_ns rollout status deploy/mon02-app --timeout=3m
-admin_forward
-[[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "mon_02: the controller is not ready after the Valkey restart"
-status_ok() { curl -fs localhost:18081/metrics | awk 'index($0, "mimic_status_updates_total{result=\"ok\"}") == 1 { print int($2) }' | tail -n 1; }
-status_before=$(status_ok); status_before=${status_before:-0}
 grown=0
 for _ in $(seq 45); do
   status_now=$(status_ok); status_now=${status_now:-0}
