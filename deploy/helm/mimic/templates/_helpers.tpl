@@ -96,3 +96,31 @@ capabilities:
 seccompProfile:
   type: RuntimeDefault
 {{- end -}}
+
+{{- define "mimic.valkeyExporterImage" -}}
+{{ .Values.valkey.metrics.image.repository }}:{{ .Values.valkey.metrics.image.tag }}{{ with .Values.valkey.metrics.image.digest }}@{{ . }}{{ end }}
+{{- end -}}
+
+{{- define "mimic.valkeyExporterSecret" -}}
+{{ .Release.Name }}-valkey-exporter
+{{- end -}}
+
+{{- define "mimic.valkeyAclSecret" -}}
+{{ .Release.Name }}-valkey-acl
+{{- end -}}
+
+{{/*
+loadTest.metricsFrom as JSON peers of the generator NetworkPolicy (spec §10.7): the value when set;
+else, with metrics.podMonitor.enabled, the namespace peer of networkPolicy.metricsNamespaceSelector
+(the release namespace when that is empty); else none ("[]").
+*/}}
+{{- define "mimic.loadMetricsFrom" -}}
+{{- if .Values.loadTest.metricsFrom -}}
+{{- toJson .Values.loadTest.metricsFrom -}}
+{{- else if .Values.metrics.podMonitor.enabled -}}
+{{- $sel := .Values.networkPolicy.metricsNamespaceSelector | default (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Release.Namespace)) -}}
+{{- toJson (list (dict "namespaceSelector" $sel)) -}}
+{{- else -}}
+[]
+{{- end -}}
+{{- end -}}

@@ -78,6 +78,19 @@ valkey:
     limits: {memory: 1Gi}
   nodeSelector: {}
   tolerations: []
+  # The Redis exporter as a container of the Valkey pod (spec §10.7, #378). It reaches Valkey on
+  # localhost as the ACL user mimic-exporter (+info +ping, no key access). Off by default; enabling
+  # restarts Valkey once.
+  metrics:
+    enabled: false
+    image:
+      repository: docker.io/oliver006/redis_exporter
+      tag: v1.95.0
+      # Pinned in images/Dockerfile (stage redis-exporter); scripts/check-pins.sh keeps the two equal.
+      digest: sha256:afb21407aba3df1b4010899f155fc6b1ba2026c97b725d72aca4019d772e7b6b
+    resources:
+      requests: {cpu: 10m, memory: 16Mi}
+      limits: {memory: 32Mi}
 
 # NetworkPolicies of Valkey (ingress from the controller only) and of the controller.
 networkPolicy:
@@ -100,7 +113,9 @@ loadTest:
   # NetworkPolicy of each generator pod (spec §7.8): egress only to the deployment, the controller and DNS.
   # A CNI without NetworkPolicy support ignores it (spec §11.1).
   networkPolicy: true
-  # NetworkPolicy peers allowed to scrape the generator's admin port (15100). Empty: none.
+  # NetworkPolicy peers allowed to scrape the generator's admin port (15100). Empty: none, unless
+  # metrics.podMonitor.enabled, which admits the namespace peer of networkPolicy.metricsNamespaceSelector
+  # (the release namespace when that is empty). A set value wins (spec §10.7).
   metricsFrom: []
   # DNS of the generator's controller name lookups: the namespace and the labels of the DNS pods.
   dnsSelector:
@@ -112,3 +127,12 @@ metrics:
   serviceMonitor:
     enabled: false
     interval: 30s
+  # Prometheus Operator PodMonitor (monitoring.coreos.com/v1, needs its CRDs at install). Off by
+  # default. The bundled Prometheus does not read it.
+  podMonitor:
+    enabled: false
+    interval: 30s
+    # Namespaces the PodMonitors select pods in. any: true: a pod can be injected through a
+    # MimicWorkload alone.
+    namespaceSelector:
+      any: true

@@ -7,8 +7,9 @@
 {{- $controllerPeer := printf "[{\"namespaceSelector\": {\"matchLabels\": {\"kubernetes.io/metadata.name\": %q}}, \"podSelector\": {\"matchLabels\": %s}}]" .Release.Namespace $controller }}
 {{- $dnsPeer := printf "[{\"namespaceSelector\": {\"matchLabels\": {\"kubernetes.io/metadata.name\": %q}}, \"podSelector\": {\"matchLabels\": %s}}]" $dns.namespace (toJson $dns.podLabels) }}
 {{- $ingressCheck := "variables.ingress == []" }}
-{{- if .Values.loadTest.metricsFrom }}
-{{- $ingressCheck = printf "size(variables.ingress) == 1 && has(variables.ingress[0].from) && variables.ingress[0].from == %s && has(variables.ingress[0].ports) && size(variables.ingress[0].ports) == 1 && variables.ingress[0].ports[0].port == 15100 && (!has(variables.ingress[0].ports[0].protocol) || variables.ingress[0].ports[0].protocol == 'TCP')" (toJson .Values.loadTest.metricsFrom) }}
+{{- $metricsFrom := include "mimic.loadMetricsFrom" . }}
+{{- if ne $metricsFrom "[]" }}
+{{- $ingressCheck = printf "size(variables.ingress) == 1 && has(variables.ingress[0].from) && variables.ingress[0].from == %s && has(variables.ingress[0].ports) && size(variables.ingress[0].ports) == 1 && variables.ingress[0].ports[0].port == 15100 && (!has(variables.ingress[0].ports[0].protocol) || variables.ingress[0].ports[0].protocol == 'TCP')" $metricsFrom }}
 {{- end }}
 # The admission policies of the load test (spec §7.8, §11, LDT-06, LDT-17). Both bind to the
 # objects only: the Job and NetworkPolicy policy matches the controller's account alone, so a
