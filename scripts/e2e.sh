@@ -2730,8 +2730,9 @@ done
 sidecar_pod=$(kubectl -n $mon02_ns get pods -l app=mon02-app -o jsonpath='{.items[0].metadata.name}')
 sidecar_ip=$(kubectl -n $mon02_ns get pod "$sidecar_pod" -o jsonpath='{.status.podIP}')
 [[ -n $sidecar_ip ]] || fail "mon_02: the injected pod has no IP"
-# The port by its name (MON-03): the sidecar container declares mimic-admin on 15100, the port a PodMonitor scrapes.
-sidecar_port=$(kubectl -n $mon02_ns get pod "$sidecar_pod" -o jsonpath='{.spec.containers[?(@.name=="mimic-sidecar")].ports[?(@.name=="mimic-admin")].containerPort}')
+# The port by its name (MON-03): the sidecar (a native sidecar, so an init container) declares mimic-admin on 15100,
+# the port a PodMonitor scrapes.
+sidecar_port=$(kubectl -n $mon02_ns get pod "$sidecar_pod" -o jsonpath='{.spec.initContainers[?(@.name=="mimic-sidecar")].ports[?(@.name=="mimic-admin")].containerPort}')
 [[ $sidecar_port == 15100 ]] || fail "mon_02: the sidecar container does not declare the port mimic-admin on 15100"
 sidecar_body=$(mon02_get "http://$sidecar_ip:$sidecar_port/metrics")
 grep -qF 'mimic_build_info{component="sidecar"' <<<"$sidecar_body" \
