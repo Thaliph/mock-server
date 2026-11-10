@@ -2876,6 +2876,9 @@ health=$(mon21_get http://$RELEASE-grafana:3000/api/health)
   || fail "mon_21: Grafana /api/health is not ok"
 [[ $(mon21_status "$(mon21_get http://$RELEASE-grafana:3000/api/search)") == 401 ]] \
   || fail "mon_21: Grafana answers without credentials other than 401"
+# The default login is refused: the admin password comes from the Secret, never Grafana's built-in "admin".
+[[ $(mon21_status "$(grafana_pw=admin mon21_get http://$RELEASE-grafana:3000/api/org auth)") == 401 ]] \
+  || fail "mon_21: Grafana accepts the default admin:admin login"
 ds_health=""
 for _ in $(seq 60); do
   ds_health=$(mon21_get http://$RELEASE-grafana:3000/api/datasources/uid/mimic-prometheus/health auth)
