@@ -616,10 +616,11 @@ impl Recorder {
         if !covered {
             self.metrics.new_endpoint(direction);
         }
+        let removed: Vec<&Key> = known.difference(&now).collect();
         // What the tree lost to absorption leaves the set; the endpoint of this exchange
         // joins it, and a template drops the literals it covers.
-        for key in known.difference(&now) {
-            self.seen.remove(key);
+        for key in &removed {
+            self.seen.remove(*key);
         }
         let own = now
             .iter()
@@ -630,18 +631,19 @@ impl Recorder {
             .min()
             .map(|(_, key)| key.clone());
         if let Some(own) = own {
-            self.seen.retain(|(d, s, method, template)| {
-                !(*d == own.0
-                    && *s == own.1
-                    && *method == own.2
-                    && *template != own.3
-                    && matches(&own.3, template).is_some())
-            });
+            if own.3.contains('{') {
+                self.seen.retain(|(d, s, method, template)| {
+                    !(*d == own.0
+                        && *s == own.1
+                        && *method == own.2
+                        && *template != own.3
+                        && matches(&own.3, template).is_some())
+                });
+            }
             if !covered && self.seen.len() < self.limits.max_endpoints.saturating_mul(4) {
                 self.seen.insert(own);
             }
         }
-        let removed: Vec<&Key> = known.difference(&now).collect();
         if removed.is_empty() {
             for (d, scope, method, template) in now.difference(known) {
                 match scope {
