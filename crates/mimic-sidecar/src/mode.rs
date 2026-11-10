@@ -323,7 +323,7 @@ impl ModeState {
             return;
         }
         // Saved before it is applied, so that a restart never resumes an older mode.
-        let saved = self.save(mode, factor).await;
+        self.save(mode, factor).await;
         {
             let mut current = self.current();
             (current.mode, current.factor) = (mode, factor);
@@ -334,8 +334,8 @@ impl ModeState {
         self.0.watch.send_replace(mode);
         self.0.gauge.set(i64::from(mode == Mode::Mock));
         self.0.factor_gauge.set(f64::from(factor) / 100.0);
-        // A change whose state file was not written is not counted (spec §9).
-        if mode != previous && saved {
+        // Counted when applied, whether or not the state file was written (spec §9).
+        if mode != previous {
             self.0
                 .switches
                 .get_or_create(&ToLabel { to: mode.as_str() })
@@ -345,8 +345,8 @@ impl ModeState {
     }
 
     /// Writes the state file through a temporary file and a rename. A failure is one warning
-    /// per streak and changes nothing else. Whether the file was written.
-    async fn save(&self, mode: Mode, factor: u32) -> bool {
+    /// per streak and changes nothing else.
+    async fn save(&self, mode: Mode, factor: u32) {
         let path = self.0.state_file.clone();
         let failure = tokio::task::spawn_blocking(move || write_state(&path, mode, factor))
             .await
@@ -354,16 +354,12 @@ impl ModeState {
             .err();
         let mut current = self.current();
         match failure {
-            None => {
-                current.unsaved = false;
-                true
-            }
+            None => current.unsaved = false,
             Some(reason) => {
                 if !std::mem::replace(&mut current.unsaved, true) {
                     drop(current);
                     tracing::warn!(target: "mock", reason, "mode state not saved");
                 }
-                false
             }
         }
     }
