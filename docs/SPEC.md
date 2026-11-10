@@ -2177,6 +2177,18 @@ random numbers it hands to the draw.
   and they never take a budget slot. The set restarts empty with the process.
   `mimic_http_request_duration_seconds` observes the exchanges whose response head was read;
   `unframed` and `rejected` exchanges are counted in `mimic_http_requests_total` only.
+- **Valkey exporter** (#378, §10.7): with `valkey.metrics.enabled` the Valkey pod's exporter
+  (`oliver006/redis_exporter`, port 9121) reads `INFO` only, as the ACL user `mimic-exporter`
+  (`+info +ping`, no key access, §11). It exposes no key, value or client list. The dashboards use
+  these series of it (exporter metrics used): `redis_up`, `redis_uptime_in_seconds`,
+  `redis_instance_info`, `redis_memory_used_bytes`, `redis_memory_max_bytes`,
+  `redis_mem_fragmentation_ratio`, `redis_evicted_keys_total`, `redis_expired_keys_total`,
+  `redis_commands_processed_total`, `redis_commands_duration_seconds_total{cmd}`,
+  `redis_connected_clients`, `redis_rejected_connections_total`, `redis_db_keys{db}`,
+  `redis_aof_last_write_status`.
+- **Aggregation** (#378): the controller's series are summed across its replicas (there is no
+  leader), except the gauges set by a status pass (`mimic_load_active_runs`), which are read with
+  `max`.
 - **Health**: `/healthz` (process alive) and `/readyz` (ready to serve) on the admin port.
 - No traces.
 
@@ -2327,6 +2339,29 @@ it sets. The pod's index and the Job's pod count come from the load API (§7.8).
 | `MIMIC_LOAD_MAX_PLAN` | `8Mi` | Largest plan read (same syntax as the controller's). |
 
 `mimic-load` has the common variables (§10.1) and admin listener (`0.0.0.0:15100`).
+
+### 10.7 Monitoring values (Helm, #378)
+
+Chart values of the scrape objects, all off by default. Nothing of them is rendered unless enabled,
+so the default render is the one of §12.13 (MON-01).
+
+| Value | Default | Meaning |
+|---|---|---|
+| `valkey.metrics.enabled` | `false` | The Redis exporter as a container of the Valkey pod, with the Secrets `<release>-valkey-exporter` (its password, kept on upgrade) and `<release>-valkey-acl` (the ACL file of the exporter user). Enabling restarts Valkey once; with `valkey.persistence.enabled: false` the store is lost on that restart. |
+| `valkey.metrics.image` | `docker.io/oliver006/redis_exporter:v1.95.0@sha256:afb2…` | Pinned by digest in `images/Dockerfile` (stage `redis-exporter`, checked by `scripts/check-pins.sh`). Released 2026-10-21, outside the 14-day cooldown. |
+| `valkey.metrics.resources` | requests 10m CPU and 16Mi memory, limit 32Mi memory | Resources of the exporter container. |
+| `metrics.podMonitor.enabled` | `false` | Prometheus Operator PodMonitor `<release>-valkey` (job `mimic-valkey`, port `metrics`, 9121) of the Valkey pods, created with `valkey.metrics.enabled`. Needs the `monitoring.coreos.com` CRDs at install; the bundled Prometheus of #379 does not read it. |
+| `metrics.podMonitor.interval` | `30s` | Scrape interval of the PodMonitors. |
+| `metrics.podMonitor.namespaceSelector` | `{any: true}` | Namespaces the PodMonitors select pods in: `any: true`, or `matchNames` / `matchLabels`. The default is every namespace, since a pod can be injected through a `MimicWorkload` alone. |
+| `loadTest.metricsFrom` | `[]` | NetworkPolicy peers that may scrape a generator on 15100. Empty while `metrics.podMonitor.enabled` is true: the namespace peer `networkPolicy.metricsNamespaceSelector` (the release namespace when that is empty). A set value wins. |
+
+The exporter's arguments are fixed: `--web.listen-address=0.0.0.0:9121` and
+`--redis.addr=redis://localhost:6379`. Its env holds `REDIS_USER` (`mimic-exporter`) and
+`REDIS_PASSWORD` (a `secretKeyRef`) and nothing else. No flag reads keys, values or client lists
+(`--check-keys`, `--check-single-keys`, `--check-streams`, `--script`, `--export-client-list` and
+`--include-config-metrics` are never given). The Valkey pod gets `--aclfile` only when
+`valkey.metrics.enabled`; the default user keeps `--requirepass`. The exporter reaches Valkey on
+`localhost`, so the Valkey port needs no new ingress rule.
 
 ## 11. Security baseline
 
@@ -2664,6 +2699,13 @@ it sets. The pod's index and the Job's pod count come from the load API (§7.8).
   percentiles are bucket bounds (at most 4.43 % high).
 - (F11) A run without targets behind a Service cannot be load-tested (targets come from
   `EndpointSlice`s, so that the controller reads neither pods nor Deployments).
+- (#378) The chart adds no NetworkPolicy on the sidecar's admin port (15100) in app namespaces:
+  they belong to their owners, and a policy that selects app pods with `policyTypes: [Ingress]`
+  would isolate them. The port is reachable from any pod that reaches the pod IP, as before; the
+  namespace owner adds the policy.
+- (#378) The exporter's NetworkPolicy (9121 from the release namespace and
+  `networkPolicy.metricsNamespaceSelector`) needs a CNI that enforces NetworkPolicy, as the other
+  policies of the chart do (FND-08). kind's default CNI does not.
 
 ## 12. Delivery plan
 
@@ -3075,6 +3117,15 @@ with no `mimic-load-run` header unchanged).
 | LDT-18 | **C.** A fuzz target feeds reports accepted by `Report::from_json` and arbitrary specs to the plan and request builders: no panic, and every request satisfies the LDT-02 property. Same CI schedule as DSC-23. |
 | LDT-19 | **I** (controller). Read API (§7.5): `GET /v1/workloads/<ns>/<dep>/loadtests` lists the stored runs (uid, name, phase, reason, start, end, total) newest first; `…/loadtests/<uid>` answers the run with its stored summary (per-endpoint results); `404` for an unknown uid, `400` for a uid outside the UUID grammar; headers and loopback rules of §7.5. **E.** The deployment page shows a "Load tests" table filled from these routes (pinned headless Chromium, §12.7). |
 | LDT-20 | **U.** Load ticket and injection label (§7.8): a ticket signed with a deployment's root verifies with its root certificate's public key and yields the payload; one byte changed in the payload or signature, another deployment's root, an `exp` in the past or a ticket without the `v1.` prefix do not verify; the signed bytes start with `mimic-load-ticket\0`; the same inputs give a ticket that verifies (ECDSA signatures are randomised, the payload is canonical). The injection patch also adds the label `mimic.platform.io/deployment: <deployment>` (INJ-03 amended), creating `metadata.labels` when absent and replacing a value the pod set. |
+
+### 12.13 Monitoring (#378)
+
+Levels as in §12.2. The chart criteria are checked by `scripts/check-chart.sh` on rendered output.
+
+| ID | Criterion |
+|---|---|
+| MON-01 | **E** (`helm template`, no cluster). With the defaults, the render with `valkey.existingSecret=golden` is byte-identical to `deploy/helm/golden/default.yaml`, which holds no exporter, ACL Secret or PodMonitor. With `valkey.metrics.enabled` the Valkey pod has the container `exporter`, port 9121 named `metrics`, with exactly the arguments of §10.7, an env of `REDIS_USER` (`mimic-exporter`) and `REDIS_PASSWORD` (`secretKeyRef`) and nothing else, `runAsUser` 65532, `runAsNonRoot`, a read-only root filesystem, `drop: [ALL]` and `RuntimeDefault`; the Valkey container has `--aclfile`, and the Secret `<release>-valkey-acl` holds `user mimic-exporter on #<sha256 of the exporter password> +info +ping resetkeys resetchannels`. The Valkey NetworkPolicy admits 9121 from the release namespace and `networkPolicy.metricsNamespaceSelector` only, and no rule of a new object names `secrets` or `nodes/*`. With `metrics.podMonitor.enabled` and `valkey.metrics.enabled`, the PodMonitor `<release>-valkey` selects the Valkey pods on port `metrics` in the release namespace; `loadTest.metricsFrom` falls back to the namespace peer of `networkPolicy.metricsNamespaceSelector` (the release namespace when empty) unless set. `helm lint --strict` passes for the default, `podMonitor`, `valkey.metrics`, both, and `loadTest.enabled` with `podMonitor`. |
+| MON-02 | **E** (kind, `scripts/e2e.sh` section `mon_02`). After an upgrade with `valkey.metrics.enabled` (the Valkey pod restarts once): the exporter container is Ready; `/metrics` on 9121, read from a pod of the release namespace, answers `redis_up 1`; with a canary key and value written as the default user, that `/metrics` holds neither the canary value nor the exporter password; as `mimic-exporter`, `INFO` answers and `GET` and `SET` of the canary key fail with `NOPERM`; the controller is ready and its status passes still succeed after the restart (`mimic_status_updates_total{result="ok"}` grows); the sidecar `/metrics` on 15100 of an injected pod answers to a pod of the release namespace, with `mimic_build_info{component="sidecar"}`. The PodMonitor target labels are not checked here: kind has no Prometheus Operator. |
 
 ## 13. Test strategy
 
