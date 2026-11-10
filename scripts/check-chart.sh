@@ -25,6 +25,7 @@ lint default
 lint podMonitor --set metrics.podMonitor.enabled=true
 lint valkey.metrics --set valkey.metrics.enabled=true
 lint both --set metrics.podMonitor.enabled=true --set valkey.metrics.enabled=true
+lint valkey.metrics.existingSecret --set valkey.metrics.enabled=true --set valkey.metrics.existingSecret=gitops-exporter
 lint loadTest.podMonitor --set loadTest.enabled=true --set image.digest="$digest" --set metrics.podMonitor.enabled=true
 # #379 (MON-14): the bundled monitoring lints strictly, alone and with the monitors and the load test.
 lint prometheus --set monitoring.prometheus.enabled=true
@@ -124,6 +125,34 @@ fresh_init=$(yq 'select(.kind == "StatefulSet" and .metadata.name == "mimic-valk
 [[ $(printf '%s\n' "$fresh_init" | yq -r '.env[] | select(.name == "VALKEY_PASSWORD") | .valueFrom.secretKeyRef.name') == mimic-valkey ]] \
   || fail "mon_01: without existingSecret the init container does not read the chart's Valkey Secret"
 echo "mon_01: the ACL init container builds the file from the Secrets; no Secret holds it"
+
+# #399: the exporter's password. Without valkey.metrics.existingSecret the chart renders its Secret; with it, none, and the
+# exporter and valkey-acl read the key password of that Secret. Neither StatefulSet carries a pod annotation (no checksum),
+# so a render never restarts Valkey.
+exporter_secret_ref() { # exporter_secret_ref <yq doc of the StatefulSet>: the secretKeyRef of the exporter and of valkey-acl
+  yq -r '[(.spec.template.spec.containers[] | select(.name == "exporter") | .env[] | select(.name == "REDIS_PASSWORD") | .valueFrom.secretKeyRef),
+    (.spec.template.spec.initContainers[] | select(.name == "valkey-acl") | .env[] | select(.name == "EXPORTER_PASSWORD") | .valueFrom.secretKeyRef)]
+    | map(.name + "/" + .key) | join(" ")' <<<"$1"
+}
+[[ -n $(doc '.kind == "Secret" and .metadata.name == "mimic-valkey-exporter"') ]] \
+  || fail "mon_01: no exporter Secret mimic-valkey-exporter is rendered by default"
+[[ $(exporter_secret_ref "$sts") == "mimic-valkey-exporter/password mimic-valkey-exporter/password" ]] \
+  || fail "mon_01: the exporter and valkey-acl do not read the exporter Secret by default"
+[[ $(printf '%s\n' "$sts" | yq -r '.spec.template.metadata.annotations') == null ]] \
+  || fail "mon_01: the Valkey pod template has an annotation (a checksum would restart Valkey on a render)"
+ext=$(render --set valkey.metrics.enabled=true --set valkey.metrics.existingSecret=gitops-exporter)
+ext_sts=$(yq 'select(.kind == "StatefulSet" and .metadata.name == "mimic-valkey")' <<<"$ext")
+[[ -z $(yq 'select(.kind == "Secret" and .metadata.name == "mimic-valkey-exporter")' <<<"$ext") ]] \
+  || fail "mon_01: an exporter Secret is rendered with valkey.metrics.existingSecret"
+[[ -z $(yq 'select(.kind == "Secret" and .metadata.name == "gitops-exporter")' <<<"$ext") ]] \
+  || fail "mon_01: the existing exporter Secret is rendered by the chart"
+[[ $(exporter_secret_ref "$ext_sts") == "gitops-exporter/password gitops-exporter/password" ]] \
+  || fail "mon_01: with valkey.metrics.existingSecret the exporter and valkey-acl do not read that Secret's key password"
+[[ $(printf '%s\n' "$ext_sts" | yq -r '.spec.template.metadata.annotations') == null ]] \
+  || fail "mon_01: the Valkey pod template has an annotation with valkey.metrics.existingSecret"
+[[ $(yq -r '.spec.template.spec.containers[] | select(.name == "valkey") | .args | join(" ")' <<<"$ext_sts") == *"--aclfile /etc/valkey-acl/aclfile"* ]] \
+  || fail "mon_01: Valkey does not read the ACL file with valkey.metrics.existingSecret"
+echo "mon_01: valkey.metrics.existingSecret: no exporter Secret is rendered, and both readers use its key password"
 
 # The Valkey NetworkPolicy: 6379 from the controller, 9121 from the release namespace.
 netpol=$(doc '.kind == "NetworkPolicy" and .metadata.name == "mimic-valkey"')

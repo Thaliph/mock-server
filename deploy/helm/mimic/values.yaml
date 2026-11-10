@@ -91,6 +91,9 @@ valkey:
     resources:
       requests: {cpu: 10m, memory: 16Mi}
       limits: {memory: 32Mi}
+    # Secret holding the exporter's password under the key `password`, for GitOps users (spec §10.7, #399). Set: the
+    # chart renders no exporter Secret and reads this one. Empty: the chart's Secret <release>-valkey-exporter, kept by lookup.
+    existingSecret: ""
 
 # NetworkPolicies of Valkey (ingress from the controller only) and of the controller.
 networkPolicy:
