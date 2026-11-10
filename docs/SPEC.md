@@ -869,6 +869,9 @@ logic in `mimic-core` (`discovery` module).
   is handled once (idempotence below). Only pods of a Deployment are injected (owner
   ReplicaSet named `<deployment>-<pod-template-hash>`); the deployment name is the workload
   identity.
+- **Admin port name** (#378, MON-03): the `mimic-sidecar` container declares `containerPort` 15100,
+  `protocol: TCP`, named `mimic-admin`, so that a `PodMonitor` can scrape it by port name. The
+  declaration is informational (no `hostPort`) and does not change the redirect rules.
 - **Skipped** pods are admitted unchanged except for the annotation
   `mimic.platform.io/skipped: <reason>`: `host-network`, `unsupported-owner`, `port-conflict`
   (an app container declares port 15001, 15006 or 15100), `uid-conflict` (an app container or
@@ -1855,7 +1858,8 @@ no `MimicLoadTest` and creates no Job).
   - *Controller*: the effective mode leaving `mock` ends the run (`Aborted`/`ModeLeft`) as in
     step 5.
 - **Generator** `mimic-load` (in the `mimic` image), one Job per run in the deployment's
-  namespace. Pod: `automountServiceAccountToken: false`, the namespace's `default` service
+  namespace. The container declares its metrics port 15100, `protocol: TCP`, named
+  `mimic-admin` (as the sidecar, §7.1, MON-03; no `hostPort`). Pod: `automountServiceAccountToken: false`, the namespace's `default` service
   account, a projected token of audience `mimic.platform.io/load` (600 s) as the only
   credential towards mimic, UID 65532, `runAsNonRoot`, read-only root, all capabilities
   dropped, `RuntimeDefault`, `MIMIC_LOAD_RESOURCES`, labels `mimic.platform.io/inject:
@@ -3126,6 +3130,7 @@ Levels as in §12.2. The chart criteria are checked by `scripts/check-chart.sh` 
 |---|---|
 | MON-01 | **E** (`helm template`, no cluster). With the defaults, the render with `valkey.existingSecret=golden` is byte-identical to `deploy/helm/golden/default.yaml`, which holds no exporter, ACL Secret or PodMonitor. With `valkey.metrics.enabled` the Valkey pod has the container `exporter`, port 9121 named `metrics`, with exactly the arguments of §10.7, an env of `REDIS_USER` (`mimic-exporter`) and `REDIS_PASSWORD` (`secretKeyRef`) and nothing else, `runAsUser` 65532, `runAsNonRoot`, a read-only root filesystem, `drop: [ALL]` and `RuntimeDefault`; the Valkey container has `--aclfile`, and the Secret `<release>-valkey-acl` holds `user mimic-exporter on #<sha256 of the exporter password> +info +ping resetkeys resetchannels`. The Valkey NetworkPolicy admits 9121 from the release namespace and `networkPolicy.metricsNamespaceSelector` only, and no rule of a new object names `secrets` or `nodes/*`. With `metrics.podMonitor.enabled` and `valkey.metrics.enabled`, the PodMonitor `<release>-valkey` selects the Valkey pods on port `metrics` in the release namespace; `loadTest.metricsFrom` falls back to the namespace peer of `networkPolicy.metricsNamespaceSelector` (the release namespace when empty) unless set. `helm lint --strict` passes for the default, `podMonitor`, `valkey.metrics`, both, and `loadTest.enabled` with `podMonitor`. |
 | MON-02 | **E** (kind, `scripts/e2e.sh` section `mon_02`). After an upgrade with `valkey.metrics.enabled` (the Valkey pod restarts once): the exporter container is Ready; `/metrics` on 9121, read from a pod of the release namespace, answers `redis_up 1`; with a canary key and value written as the default user, that `/metrics` holds neither the canary value nor the exporter password; as `mimic-exporter`, `INFO` answers and `GET` and `SET` of the canary key fail with `NOPERM`; the controller is ready and its status passes still succeed after the restart (`mimic_status_updates_total{result="ok"}` grows); the sidecar `/metrics` on 15100 of an injected pod answers to a pod of the release namespace, with `mimic_build_info{component="sidecar"}`. The PodMonitor target labels are not checked here: kind has no Prometheus Operator. |
+| MON-03 | **U.** The injection patch gives the `mimic-sidecar` container exactly one port, `{"name":"mimic-admin","containerPort":15100,"protocol":"TCP"}`, and the generator Job of §7.8 gives its container the same single port; the patch stays byte-identical for the same input. |
 
 ## 13. Test strategy
 
