@@ -182,8 +182,9 @@ monitoring:
     # (spec §10.7). Required with networkPolicy.enabled for an external datasource.
     datasourceEgress: []
     resources:
-      requests: {cpu: 50m, memory: 128Mi}
-      limits: {memory: 256Mi}
+      # Measured on grafana 13.2.4: about 180 MiB with only the Prometheus datasource plugin, 324 MiB with all (#379).
+      requests: {cpu: 50m, memory: 192Mi}
+      limits: {memory: 384Mi}
     # Measured on k8s-sidecar 2.14.1: 66 to 78 MiB after start, about 90 MiB steady with 30 dashboards of 150 KB (#379).
     sidecarResources:
       requests: {cpu: 10m, memory: 64Mi}

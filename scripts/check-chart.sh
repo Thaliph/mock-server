@@ -509,7 +509,7 @@ for c in gctr dctr; do
 done
 [[ $(yq -r '.securityContext.runAsUser' <<<"$gctr") == 472 ]] || fail "mon_19: grafana is not UID 472"
 [[ $(yq -r '.securityContext.runAsUser' <<<"$dctr") == 65534 ]] || fail "mon_19: dashboards is not UID 65534"
-[[ $(yq -r '.resources.requests.cpu + " " + .resources.limits.memory' <<<"$gctr") == "50m 256Mi" ]] \
+[[ $(yq -r '.resources.requests.cpu + " " + .resources.limits.memory' <<<"$gctr") == "50m 384Mi" ]] \
   || fail "mon_19: the grafana resources are not those of the values"
 
 # The admin password: a Secret of 32 alphanumeric characters, a file in grafana only, no env value, in no other object.
@@ -534,6 +534,9 @@ grep -q 'secretKeyRef' <<<"$gdep" && fail "mon_19: an env reads a Secret key"
 
 # grafana.ini and the provisioning (§10.7).
 ini=$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "mimic-grafana") | .data["grafana.ini"]' "$tmp/grafana.yaml")
+disabled=$(sed -n 's/^disable_plugins = //p' <<<"$ini")
+[[ -n $disabled ]] && ! tr ',' '\n' <<<"$disabled" | grep -qx prometheus \
+  || fail "mon_19: grafana.ini does not disable the unused datasource plugins, or disables prometheus"
 for line in "reporting_enabled = false" "check_for_updates = false" "check_for_plugin_updates = false" \
   "news_feed_enabled = false" "preinstall_disabled = true" "enabled = false" "allow_sign_up = false" \
   "disable_gravatar = true" "mode = console" "format = json" "admin_user = admin"; do

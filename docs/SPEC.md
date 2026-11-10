@@ -2448,7 +2448,7 @@ storage, ingress and the dashboards themselves (#380 to #384) are out of scope. 
 | `monitoring.grafana.sidecarImage` | `quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:092d…` | The dashboard sidecar. Pinned by digest in `images/Dockerfile` (stage `k8s-sidecar`, checked by `scripts/check-pins.sh`). Built 2026-10-08. |
 | `monitoring.grafana.datasourceUrl` | `""` | URL of the provisioned Prometheus datasource. Empty: `http://<release>-prometheus:9090`, the bundled Prometheus, also when it is off. An external datasource needs `datasourceEgress` as well, with `networkPolicy.enabled`. |
 | `monitoring.grafana.datasourceEgress` | `[]` | NetworkPolicy egress rules appended to the Grafana NetworkPolicy, rendered only when `datasourceUrl` is set. Required for an external datasource with `networkPolicy.enabled`: the bundled policy admits only the bundled Prometheus, the DNS and the API server, so without a rule the datasource is unreachable. Each entry is a NetworkPolicy egress rule (`to`, `ports`), for example `{to: [{ipBlock: {cidr: 10.20.0.0/16}}], ports: [{port: 9090, protocol: TCP}]}`. Nothing is added when empty. |
-| `monitoring.grafana.resources` | requests 50m CPU and 128Mi memory, limit 256Mi memory | Resources of the `grafana` container. |
+| `monitoring.grafana.resources` | requests 50m CPU and 192Mi memory, limit 384Mi memory (about 180 MiB measured with the plugins of §10.7) | Resources of the `grafana` container. |
 | `monitoring.grafana.sidecarResources` | requests 10m CPU and 64Mi memory, limit 128Mi memory | Resources of the `dashboards` container. Measured on k8s-sidecar 2.14.1 (Python client): 66 to 78 MiB after start with 8 dashboards of 60 KB, about 90 MiB steady with 30 of 150 KB; the former 64Mi limit was OOMKilled in a loop. |
 | `networkPolicy.apiServerCIDR` | `""` | The `ipBlock` of the API server in the egress rules of Prometheus and Grafana (TCP 443 and 6443). Empty: any destination on those two ports, since the API server's address depends on the cluster. |
 
@@ -2496,7 +2496,7 @@ The Grafana Deployment:
   every login with the Secret answers `401 password-auth.invalid` (reproduced with the pinned image).
 - `grafana.ini`: `analytics.reporting_enabled = false`, `analytics.check_for_updates = false`,
   `analytics.check_for_plugin_updates = false`, `news.news_feed_enabled = false`,
-  `plugins.preinstall_disabled = true`, `auth.anonymous.enabled = false`, `security.disable_gravatar =
+  `plugins.preinstall_disabled = true`, `plugins.disable_plugins` listing every bundled datasource plugin but `prometheus` (each runs as a process of about 30 MiB), `auth.anonymous.enabled = false`, `security.disable_gravatar =
   true`, `users.allow_sign_up = false`, `log.mode = console`, `log.console.format = json`. No plugin is
   installed. Nothing in Grafana calls the internet.
 - Provisioning: one datasource, `type: prometheus`, `uid: mimic-prometheus` (the dashboards of #380 to
