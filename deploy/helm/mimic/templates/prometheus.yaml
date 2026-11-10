@@ -1,0 +1,107 @@
+{{- if .Values.monitoring.prometheus.enabled }}
+# The bundled Prometheus (spec §10.7, §11, #379): one replica, for a demo or a dev cluster only. It reads the scrape
+# jobs of prometheus-config.yaml and has no admin, lifecycle, remote-write or OTLP endpoint (no flag enables one).
+# Pod Security restricted, a read-only root filesystem, and the TSDB in an emptyDir, so no PersistentVolume is needed.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-prometheus
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+# Service discovery lists the pods of the scrape jobs, so the token is mounted (RBAC in prometheus-rbac.yaml).
+automountServiceAccountToken: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-prometheus
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mimic-prometheus
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mimic-prometheus
+  template:
+    metadata:
+      labels:
+        {{- include "mimic.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mimic-prometheus
+      annotations:
+        # Prometheus has no reload endpoint here (no --web.enable-lifecycle): a change of the scrape jobs rolls the pod.
+        checksum/config: {{ include "mimic.prometheusConfig" . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-prometheus
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        # The image names its user nobody, which the kubelet cannot check as non-root: the UID is set here.
+        runAsUser: 65534
+        runAsGroup: 65534
+        # The emptyDir of the TSDB is writable by the user.
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: {{ include "mimic.prometheusImage" . }}
+          imagePullPolicy: IfNotPresent
+          # The entrypoint of the image is the prometheus binary: these are its arguments (spec §10.7).
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time={{ .Values.monitoring.prometheus.retention }}
+            - --storage.tsdb.retention.size={{ .Values.monitoring.prometheus.retentionSize }}
+            - --web.listen-address=:9090
+            - --log.format=json
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet: {path: /-/ready, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /-/healthy, port: http}
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.monitoring.prometheus.resources | nindent 12 }}
+          securityContext:
+            {{- include "mimic.containerSecurity" . | nindent 12 }}
+            runAsUser: 65534
+            runAsGroup: 65534
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-prometheus
+        - name: data
+          emptyDir:
+            sizeLimit: {{ .Values.monitoring.prometheus.storageSizeLimit }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-prometheus
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mimic-prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: mimic-prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+{{- end }}

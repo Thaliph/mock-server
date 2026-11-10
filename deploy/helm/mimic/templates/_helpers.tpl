@@ -107,13 +107,13 @@ seccompProfile:
 
 {{/*
 loadTest.metricsFrom as JSON peers of the generator NetworkPolicy (spec §10.7): the value when set;
-else, with metrics.podMonitor.enabled, the namespace peer of networkPolicy.metricsNamespaceSelector
-(the release namespace when that is empty); else none ("[]").
+else, with metrics.podMonitor.enabled or the bundled Prometheus (monitoring.prometheus.enabled, #379), the namespace
+peer of networkPolicy.metricsNamespaceSelector (the release namespace when that is empty); else none ("[]").
 */}}
 {{- define "mimic.loadMetricsFrom" -}}
 {{- if .Values.loadTest.metricsFrom -}}
 {{- toJson .Values.loadTest.metricsFrom -}}
-{{- else if .Values.metrics.podMonitor.enabled -}}
+{{- else if or .Values.metrics.podMonitor.enabled .Values.monitoring.prometheus.enabled -}}
 {{- $sel := .Values.networkPolicy.metricsNamespaceSelector | default (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Release.Namespace)) -}}
 {{- toJson (list (dict "namespaceSelector" $sel)) -}}
 {{- else -}}

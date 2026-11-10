@@ -14,6 +14,7 @@
 - [Install](Install)
 - [Configuration](Configuration)
 - [Operations](Operations)
+- [Monitoring](Monitoring)
 - [Security](Security)
 - [Troubleshooting](Troubleshooting)
 

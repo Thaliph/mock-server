@@ -104,6 +104,9 @@ networkPolicy:
   # Sources of the sidecar API port (controller.sidecarApiPort), as NetworkPolicy `from` peers.
   # Empty: any source, since injected pods can be in any namespace. Set it to narrow the port.
   sidecarApiFrom: []
+  # The API server's address as an ipBlock CIDR, for the egress of the bundled Prometheus and Grafana to TCP 443
+  # and 6443 (spec §10.7, #379). Empty: any destination on those ports, since the address depends on the cluster.
+  apiServerCIDR: ""
 
 # Load tests of a deployment in mock mode (spec §7.8, F11). Off by default: it adds the
 # MimicLoadTest CRD, Job and EndpointSlice RBAC and two ValidatingAdmissionPolicies. Needs image.digest:
@@ -114,8 +117,8 @@ loadTest:
   # A CNI without NetworkPolicy support ignores it (spec §11.1).
   networkPolicy: true
   # NetworkPolicy peers allowed to scrape the generator's admin port (15100). Empty: none, unless
-  # metrics.podMonitor.enabled, which admits the namespace peer of networkPolicy.metricsNamespaceSelector
-  # (the release namespace when that is empty). A set value wins (spec §10.7).
+  # metrics.podMonitor.enabled or monitoring.prometheus.enabled, which admit the namespace peer of
+  # networkPolicy.metricsNamespaceSelector (the release namespace when that is empty). A set value wins (spec §10.7).
   metricsFrom: []
   # DNS of the generator's controller name lookups: the namespace and the labels of the DNS pods.
   dnsSelector:
@@ -136,3 +139,53 @@ metrics:
     # MimicWorkload alone.
     namespaceSelector:
       any: true
+
+# The bundled Prometheus and Grafana (spec §10.7, #379): for a demo or a dev cluster only, off by default.
+monitoring:
+  prometheus:
+    enabled: false
+    # Namespaces of the sidecar and load jobs, besides the release namespace. Empty: every namespace, through
+    # a ClusterRole. A list: a Role in each of them and in the release namespace.
+    namespaces: []
+    image:
+      repository: quay.io/prometheus/prometheus
+      tag: v3.15.1
+      # Pinned in images/Dockerfile (stage prometheus); scripts/check-pins.sh keeps the two equal.
+      digest: sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    # --storage.tsdb.retention.time, and --storage.tsdb.retention.size below the emptyDir limit, so that the kubelet
+    # never evicts the pod for its data.
+    retention: 24h
+    retentionSize: 800MB
+    # sizeLimit of the emptyDir that holds the TSDB. No persistent volume: the data are lost on a pod restart.
+    storageSizeLimit: 1Gi
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {memory: 512Mi}
+  # Grafana (spec §10.7, #379): the dashboards of the mimic dashboard ConfigMaps (#380 to #384) are read from the
+  # ConfigMaps labelled grafana_dashboard: "1" in the release namespace. Off by default.
+  grafana:
+    enabled: false
+    image:
+      repository: docker.io/grafana/grafana
+      tag: 13.2.4-distroless
+      # Pinned in images/Dockerfile (stage grafana); scripts/check-pins.sh keeps the two equal.
+      digest: sha256:ae3d3add290adbe6a88412229f5d76fd7bb82743050881698642d3d62f277e35
+    # The dashboard sidecar: it writes the dashboard files and never calls Grafana (no credential).
+    sidecarImage:
+      repository: quay.io/kiwigrid/k8s-sidecar
+      tag: 2.14.1
+      # Pinned in images/Dockerfile (stage k8s-sidecar).
+      digest: sha256:092dbe0c335fba9af414a27630ca68f34df6185784fa847d9954187e69dbfdd7
+    # URL of the provisioned Prometheus datasource. Empty: the bundled Prometheus, http://<release>-prometheus:9090.
+    datasourceUrl: ""
+    # NetworkPolicy egress rules for an external datasource, appended to the Grafana policy only when datasourceUrl is set
+    # (spec §10.7). Required with networkPolicy.enabled for an external datasource.
+    datasourceEgress: []
+    resources:
+      # Measured on grafana 13.2.4: about 180 MiB with only the Prometheus datasource plugin, 324 MiB with all (#379).
+      requests: {cpu: 50m, memory: 192Mi}
+      limits: {memory: 384Mi}
+    # Measured on k8s-sidecar 2.14.1: 66 to 78 MiB after start, about 90 MiB steady with 30 dashboards of 150 KB (#379).
+    sidecarResources:
+      requests: {cpu: 10m, memory: 64Mi}
+      limits: {memory: 128Mi}

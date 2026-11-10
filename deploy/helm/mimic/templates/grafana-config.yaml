@@ -1,0 +1,25 @@
+{{- if .Values.monitoring.grafana.enabled }}
+# The configuration of the bundled Grafana (spec §10.7, #379): grafana.ini, and the provisioning of the datasource and
+# of the dashboards provider. The admin password is not here: it is the Secret of grafana-secret.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+data:
+  grafana.ini: |
+    {{- include "mimic.grafanaIni" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-grafana-provisioning
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+data:
+  datasources.yaml: |
+    {{- include "mimic.grafanaDatasources" . | nindent 4 }}
+  dashboards.yaml: |
+    {{- include "mimic.grafanaDashboards" . | nindent 4 }}
+{{- end }}

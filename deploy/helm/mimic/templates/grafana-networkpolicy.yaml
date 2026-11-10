@@ -1,0 +1,59 @@
+{{- if and .Values.monitoring.grafana.enabled .Values.networkPolicy.enabled }}
+# The NetworkPolicy of the bundled Grafana (spec §10.7, §11, MON-20, #379): dashboards are served on 3000 to the release
+# namespace only (a port-forward is not blocked, §11.1). Egress: Prometheus (9090), DNS (loadTest.dnsSelector) and the
+# API server (443, 6443), which the dashboard sidecar needs to watch the ConfigMaps. Nothing else leaves the pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mimic-grafana
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
+      ports:
+        - {port: 3000, protocol: TCP}
+  egress:
+    # The bundled Prometheus. With monitoring.grafana.datasourceUrl set elsewhere, this rule admits nothing outside the cluster.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/name: mimic-prometheus
+      ports:
+        - {port: 9090, protocol: TCP}
+    # DNS of the datasource's Service name, in the namespace and with the labels of loadTest.dnsSelector.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.loadTest.dnsSelector.namespace | quote }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.loadTest.dnsSelector.podLabels | nindent 14 }}
+      ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+    # The API server, for the dashboard sidecar: any destination unless networkPolicy.apiServerCIDR names it.
+    - {{- with .Values.networkPolicy.apiServerCIDR }}
+      to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      {{- end }}
+      ports:
+        - {port: 443, protocol: TCP}
+        - {port: 6443, protocol: TCP}
+    # An external datasource (monitoring.grafana.datasourceUrl) is reachable through these rules only (spec §10.7).
+    {{- if .Values.monitoring.grafana.datasourceUrl }}
+    {{- with .Values.monitoring.grafana.datasourceEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- end }}
+{{- end }}

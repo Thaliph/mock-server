@@ -5,10 +5,11 @@
 # `mimic.platform.io/load-test` (on every generator pod). The sidecar's series carry no namespace, pod or
 # deployment by design, so the target labels add them.
 # The sidecar monitor: injected pods.
+{{- $sidecar := include "mimic.scrapeTarget" (dict "root" . "job" "mimic-sidecar") | fromJson }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
-  name: {{ .Release.Name }}-sidecar
+  name: {{ $sidecar.name }}
   labels:
     {{- include "mimic.labels" . | nindent 4 }}
 spec:
@@ -16,27 +17,31 @@ spec:
     {{- toYaml .Values.metrics.podMonitor.namespaceSelector | nindent 4 }}
   selector:
     matchExpressions:
-      - key: mimic.platform.io/deployment
+      {{- range $sidecar.exists }}
+      - key: {{ . }}
         operator: Exists
+      {{- end }}
   podMetricsEndpoints:
-    - port: mimic-admin
+    - port: {{ $sidecar.port }}
       path: /metrics
-      interval: {{ .Values.metrics.podMonitor.interval }}
+      interval: {{ $sidecar.interval }}
       relabelings:
-        - sourceLabels: [__meta_kubernetes_namespace]
-          targetLabel: namespace
-        - sourceLabels: [__meta_kubernetes_pod_name]
-          targetLabel: pod
-        - sourceLabels: [__meta_kubernetes_pod_label_mimic_platform_io_deployment]
-          targetLabel: deployment
-        - targetLabel: job
-          replacement: mimic-sidecar
+        {{- range $sidecar.relabel }}
+        {{- if .source }}
+        - sourceLabels: [{{ .source }}]
+          targetLabel: {{ .target }}
+        {{- else }}
+        - targetLabel: {{ .target }}
+          replacement: {{ .replacement }}
+        {{- end }}
+        {{- end }}
 ---
 # The load generator monitor: mimic-load pods of a MimicLoadTest run (§7.8), labelled with their load test.
+{{- $load := include "mimic.scrapeTarget" (dict "root" . "job" "mimic-load") | fromJson }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
-  name: {{ .Release.Name }}-load
+  name: {{ $load.name }}
   labels:
     {{- include "mimic.labels" . | nindent 4 }}
 spec:
@@ -44,29 +49,33 @@ spec:
     {{- toYaml .Values.metrics.podMonitor.namespaceSelector | nindent 4 }}
   selector:
     matchExpressions:
-      - key: mimic.platform.io/load-test
+      {{- range $load.exists }}
+      - key: {{ . }}
         operator: Exists
+      {{- end }}
   podMetricsEndpoints:
-    - port: mimic-admin
+    - port: {{ $load.port }}
       path: /metrics
-      interval: {{ .Values.metrics.podMonitor.interval }}
+      interval: {{ $load.interval }}
       relabelings:
-        - sourceLabels: [__meta_kubernetes_namespace]
-          targetLabel: namespace
-        - sourceLabels: [__meta_kubernetes_pod_name]
-          targetLabel: pod
-        - sourceLabels: [__meta_kubernetes_pod_label_mimic_platform_io_load_test]
-          targetLabel: load_test
-        - targetLabel: job
-          replacement: mimic-load
+        {{- range $load.relabel }}
+        {{- if .source }}
+        - sourceLabels: [{{ .source }}]
+          targetLabel: {{ .target }}
+        {{- else }}
+        - targetLabel: {{ .target }}
+          replacement: {{ .replacement }}
+        {{- end }}
+        {{- end }}
 {{- if .Values.valkey.metrics.enabled }}
 ---
 # The Valkey exporter monitor (spec §10.7, #378): the Valkey pods of this release, port `metrics` (9121), in the
 # release namespace only.
+{{- $valkey := include "mimic.scrapeTarget" (dict "root" . "job" "mimic-valkey") | fromJson }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
-  name: {{ .Release.Name }}-valkey
+  name: {{ $valkey.name }}
   labels:
     {{- include "mimic.labels" . | nindent 4 }}
 spec:
@@ -74,14 +83,15 @@ spec:
     matchNames: [{{ .Release.Namespace | quote }}]
   selector:
     matchLabels:
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/name: mimic-valkey
+      {{- toYaml $valkey.matchLabels | nindent 6 }}
   podMetricsEndpoints:
-    - port: metrics
+    - port: {{ $valkey.port }}
       path: /metrics
-      interval: {{ .Values.metrics.podMonitor.interval }}
+      interval: {{ $valkey.interval }}
       relabelings:
-        - targetLabel: job
-          replacement: mimic-valkey
+        {{- range $valkey.relabel }}
+        - targetLabel: {{ .target }}
+          replacement: {{ .replacement }}
+        {{- end }}
 {{- end }}
 {{- end }}
