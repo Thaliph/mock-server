@@ -39,7 +39,7 @@ news_feed_enabled = false
 [plugins]
 preinstall_disabled = true
 # Only the Prometheus datasource is used: each other bundled backend plugin is a process of about 30 MiB.
-disable_plugins = loki,tempo,elasticsearch,grafana-postgresql-datasource,mysql,mssql,influxdb,cloudwatch,grafana-pyroscope-datasource,grafana-testdata-datasource,grafana-opensearch-datasource,opentsdb,graphite,jaeger,zipkin,grafana-azure-monitor-datasource,stackdriver,parca
+disable_plugins = loki,tempo,elasticsearch,grafana-postgresql-datasource,postgres,mysql,mssql,influxdb,cloudwatch,grafana-pyroscope-datasource,grafana-testdata-datasource,grafana-opensearch-datasource,opentsdb,graphite,jaeger,zipkin,grafana-azure-monitor-datasource,stackdriver,parca
 
 [auth.anonymous]
 enabled = false

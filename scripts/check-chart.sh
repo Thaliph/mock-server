@@ -529,6 +529,8 @@ dctr=$(yq '.spec.template.spec.containers[] | select(.name == "dashboards")' <<<
 tmpvol=$(yq -r '.volumeMounts[] | select(.mountPath == "/tmp") | .name' <<<"$gctr")
 [[ -n $tmpvol && $(yq -r ".spec.template.spec.volumes[] | select(.name == \"$tmpvol\") | .emptyDir.medium" <<<"$gdep") == Memory ]] \
   || fail "mon_19: grafana has no memory emptyDir on /tmp (its backend plugins need it on the read-only root)"
+[[ $(yq -r ".spec.template.spec.volumes[] | select(.name == \"$tmpvol\") | .emptyDir.sizeLimit" <<<"$gdep") == 16Mi ]] \
+  || fail "mon_19: the /tmp emptyDir of grafana has not sizeLimit 16Mi (§10.7)"
 [[ $(yq -r '.spec.template.spec.containers[] | select(.volumeMounts[]?.name == "kube-api-access") | .name' <<<"$gdep") == dashboards ]] \
   || fail "mon_19: the projected token is not mounted in dashboards only"
 [[ $(yq -r '.spec.template.spec.volumes[] | select(.name == "kube-api-access") | .projected.sources[0] | has("serviceAccountToken")' <<<"$gdep") == true ]] \
@@ -571,6 +573,8 @@ ini=$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "mimic-grafana") 
 disabled=$(sed -n 's/^disable_plugins = //p' <<<"$ini")
 [[ -n $disabled ]] && ! tr ',' '\n' <<<"$disabled" | grep -qx prometheus \
   || fail "mon_19: grafana.ini does not disable the unused datasource plugins, or disables prometheus"
+# #407: the legacy postgres plugin ID is disabled as well (grafana-postgresql-datasource is the current one).
+tr ',' '\n' <<<"$disabled" | grep -qx postgres || fail "mon_19: plugins.disable_plugins does not list the legacy postgres plugin"
 for line in "reporting_enabled = false" "check_for_updates = false" "check_for_plugin_updates = false" \
   "news_feed_enabled = false" "preinstall_disabled = true" "enabled = false" "allow_sign_up = false" \
   "disable_gravatar = true" "mode = console" "format = json" "admin_user = admin"; do
