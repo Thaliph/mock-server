@@ -133,15 +133,43 @@ impl Reconciler {
         }
     }
 
-    /// A run that ends before it was admitted.
-    async fn fail(&self, test: &Test, reason: &str, message: &str, now_ms: u64) {
-        let mut status = status_of("Failed", reason, message);
+    /// A run that ends in `Pending`: one that was admitted already (its Job was refused, or the
+    /// view of this replica is stale) is ended in the store with its Job deleted; any other
+    /// has nothing but its status.
+    async fn terminate(&self, test: &Test, phase: &str, reason: &str, message: &str, now_ms: u64) {
+        match self
+            .store
+            .load_active(&test.namespace, &test.deployment, &test.uid)
+            .await
+        {
+            Ok(Some(_)) => return self.end(test, phase, reason, message, now_ms, true).await,
+            Ok(None) => {}
+            Err(_) => return,
+        }
+        self.status_only(test, phase, reason, message, now_ms).await;
+    }
+
+    /// The final status of a run the store holds no state for.
+    async fn status_only(
+        &self,
+        test: &Test,
+        phase: &str,
+        reason: &str,
+        message: &str,
+        now_ms: u64,
+    ) {
+        let mut status = status_of(phase, reason, message);
         status["endTime"] = json!(rfc3339(now_ms));
         if let Some(skipped) = test.status.get("skipped") {
             status["skipped"] = skipped.clone();
         }
         self.set_status(test, status).await;
-        self.count("Failed", reason);
+        self.count(phase, reason);
+    }
+
+    async fn fail(&self, test: &Test, reason: &str, message: &str, now_ms: u64) {
+        self.terminate(test, "Failed", reason, message, now_ms)
+            .await;
     }
 
     fn count(&self, phase: &str, reason: &str) {
@@ -177,11 +205,10 @@ impl Reconciler {
             return self.fail(test, "Invalid", &invalid.message, now_ms).await;
         }
         if test.stop {
-            let mut status = status_of("Aborted", "Stopped", "stopped before it started");
-            status["endTime"] = json!(rfc3339(now_ms));
-            self.set_status(test, status).await;
-            self.count("Aborted", "Stopped");
-            return;
+            let message = "stopped before it started";
+            return self
+                .terminate(test, "Aborted", "Stopped", message, now_ms)
+                .await;
         }
         if rank >= cfg.max_pending {
             let message = "too many Pending runs in the namespace (MIMIC_LOAD_MAX_PENDING)";
@@ -698,7 +725,8 @@ impl Reconciler {
                     "load test ended"
                 );
             }
-            Ok(false) => {}
+            // Another replica ended it first: its phase, reason and summary are the stored ones.
+            Ok(false) => return self.recover(test, now_ms).await,
             Err(_) => return,
         }
         let mut status = status_of(phase, reason, message);
@@ -727,7 +755,7 @@ impl Reconciler {
         };
         let (Some(phase), Some(reason)) = (fields.get("phase"), fields.get("reason")) else {
             return self
-                .fail(test, "JobFailed", "the run state is gone", now_ms)
+                .status_only(test, "Failed", "JobFailed", "the run state is gone", now_ms)
                 .await;
         };
         let end_ms = fields

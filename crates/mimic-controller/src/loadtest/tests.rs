@@ -1022,7 +1022,9 @@ async fn ldt_09_the_replica_that_loses_the_end_leaves_the_status_of_the_winner()
     // The other replica decided on the same event, with a stale view, and lost the end script.
     let mut stale = stale;
     stale.stop = true;
-    g.rec.end(&stale, "Aborted", "ModeLeft", "", t0 + 2001, true).await;
+    g.rec
+        .end(&stale, "Aborted", "ModeLeft", "", t0 + 2001, true)
+        .await;
     assert_eq!(f.phase(&test), ("Aborted".into(), "Stopped".into()));
     assert_eq!(f.status(&test)["results"]["total"]["requests"], 5);
 }
@@ -1045,15 +1047,27 @@ async fn ldt_07_an_admitted_run_whose_job_was_not_created_is_ended_not_left_in_v
             f.edit(&test, |t| t.stop = true);
             ("Aborted", "Stopped")
         } else {
-            f.rec.workloads.set_mock(&ns, "pay-w", MockSettings::default());
+            f.rec
+                .workloads
+                .set_mock(&ns, "pay-w", MockSettings::default());
             ("Failed", "NotMock")
         };
         f.pass(t0 + 6000).await;
         assert_eq!(f.phase(&test), (phase.into(), reason.into()), "{variant}");
         assert_eq!(f.active(&test).await, None, "{variant}");
-        assert!(f.cluster.was_deleted("Job", &job_name(&test.uid)), "{variant}");
+        assert!(
+            f.cluster.was_deleted("Job", &job_name(&test.uid)),
+            "{variant}"
+        );
         // The slot is free: another run on the deployment is not Busy.
-        f.rec.workloads.set_mock(&ns, "pay-w", MockSettings { mock: true, ..MockSettings::default() });
+        f.rec.workloads.set_mock(
+            &ns,
+            "pay-w",
+            MockSettings {
+                mock: true,
+                ..MockSettings::default()
+            },
+        );
         f.pull(&ns, "pay", "pay-5d9c8f7b6-bcdfg", "mock").await;
         let next = f.test(&ns, "t2", "pay", t0 + 7000);
         f.pass(t0 + 7000).await;
