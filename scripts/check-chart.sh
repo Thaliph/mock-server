@@ -27,10 +27,12 @@ lint valkey.metrics --set valkey.metrics.enabled=true
 lint both --set metrics.podMonitor.enabled=true --set valkey.metrics.enabled=true
 lint loadTest.podMonitor --set loadTest.enabled=true --set image.digest="$digest" --set metrics.podMonitor.enabled=true
 
-# MON-01, default: byte-identical to the golden render (deploy/helm/golden/default.yaml, rendered from main).
+# MON-01, default: identical to the golden render (deploy/helm/golden/default.yaml, rendered from main), blank
+# lines aside: helm 3 and helm 4 separate the documents with different blank lines.
+nonblank() { grep -v '^[[:space:]]*$' "$1"; }
 render > "$tmp/default.yaml"
-if ! cmp -s "$tmp/default.yaml" deploy/helm/golden/default.yaml; then
-  diff -u deploy/helm/golden/default.yaml "$tmp/default.yaml" >&2 || true
+if ! cmp -s <(nonblank "$tmp/default.yaml") <(nonblank deploy/helm/golden/default.yaml); then
+  diff -u <(nonblank deploy/helm/golden/default.yaml) <(nonblank "$tmp/default.yaml") >&2 || true
   fail "mon_01: the default render differs from deploy/helm/golden/default.yaml"
 fi
 echo "mon_01: the default render is the golden file"
