@@ -38,6 +38,18 @@ pub fn sends_due(rate: u64, ramp_up_ms: u64, duration_ms: u64, elapsed_ms: u64) 
     u64::try_from(due).unwrap_or(u64::MAX)
 }
 
+/// Requests per second the schedule asks of one pod at `elapsed_ms`; `None` in the closed
+/// model (`rate` absent), where no rate is planned.
+pub fn planned_rate(
+    rate: Option<u64>,
+    ramp_up_ms: u64,
+    duration_ms: u64,
+    elapsed_ms: u64,
+) -> Option<f64> {
+    let _ = (rate, ramp_up_ms, duration_ms, elapsed_ms);
+    None
+}
+
 /// Closed model workers at `elapsed_ms`: 0 from `duration_ms` on.
 pub fn workers(concurrency: u64, ramp_up_ms: u64, duration_ms: u64, elapsed_ms: u64) -> u64 {
     if elapsed_ms >= duration_ms {

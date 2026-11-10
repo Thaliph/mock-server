@@ -72,6 +72,12 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
     })
 }
 
+/// The `mimic_limit{name}` series (spec §9): the limits of a parsed configuration.
+fn limits(config: &Config) -> std::collections::BTreeMap<&'static str, u64> {
+    let _ = config;
+    std::collections::BTreeMap::new()
+}
+
 fn main() -> ExitCode {
     if let Some(code) = mimic_runtime::version_flag(BINARY, VERSION) {
         return code;
@@ -288,4 +294,101 @@ async fn run(config: Config) -> std::io::Result<()> {
     );
     tokio::try_join!(webhook_server, api_server, ui_server, admin_server)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(extra: &[(&str, &str)]) -> Config {
+        let required = [
+            ("MIMIC_NAMESPACE", "mimic-system"),
+            ("MIMIC_WEBHOOK_SERVICE", "mimic"),
+            ("MIMIC_WEBHOOK_SECRET", "mimic-webhook-tls"),
+            ("MIMIC_WEBHOOK_CONFIGURATION", "mimic-injector"),
+            ("MIMIC_INJECT_SIDECAR_IMAGE", "sidecar:1"),
+            ("MIMIC_INJECT_INIT_IMAGE", "init:1"),
+            ("MIMIC_TLS_CA_SECRET", "mimic-tls-ca"),
+            ("MIMIC_VALKEY_URL", "redis://127.0.0.1:6379"),
+        ];
+        let env = Env::from_pairs(
+            required
+                .iter()
+                .chain(extra)
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        config(&env).expect("valid configuration")
+    }
+
+    #[test]
+    fn mon_06_the_limits_are_the_spec_names_with_the_parsed_values() {
+        let names = [
+            "load_max_concurrency",
+            "load_max_endpoints",
+            "load_max_namespace_runs",
+            "load_max_pending",
+            "load_max_plan_bytes",
+            "load_max_rate",
+            "load_max_runs",
+            "load_pod_concurrency",
+            "load_store_budget_bytes",
+            "sidecar_api_body_budget_bytes",
+            "sidecar_api_egress_budget_bytes",
+            "sidecar_api_max_egress_bytes",
+            "sidecar_api_max_report_bytes",
+            "store_max_authorities",
+            "store_max_deployments",
+            "store_max_endpoints",
+            "store_sample_budget_bytes",
+            "webhook_max_connections",
+        ];
+        let defaults = limits(&parsed(&[]));
+        assert_eq!(defaults.keys().copied().collect::<Vec<_>>(), names);
+        assert_eq!(defaults["webhook_max_connections"], 256);
+        assert_eq!(defaults["sidecar_api_max_report_bytes"], 32 << 20);
+        assert_eq!(defaults["store_max_deployments"], 50);
+        assert_eq!(defaults["load_max_runs"], 0);
+        assert_eq!(defaults["load_max_plan_bytes"], 8 << 20);
+        assert_eq!(defaults["load_max_rate"], 2000);
+
+        let set = limits(&parsed(&[
+            ("MIMIC_SIDECAR_API_EGRESS_BUDGET", "16Mi"),
+            ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "100"),
+            ("MIMIC_LOAD_MAX_RUNS", "4"),
+            ("MIMIC_LOAD_MAX_PENDING", "7"),
+            ("MIMIC_LOAD_POD_CONCURRENCY", "64"),
+        ]));
+        assert_eq!(set["sidecar_api_egress_budget_bytes"], 16_777_216);
+        assert_eq!(set["webhook_max_connections"], 100);
+        assert_eq!(set["load_max_runs"], 4);
+        assert_eq!(set["load_max_pending"], 7);
+        assert_eq!(set["load_pod_concurrency"], 64);
+        assert_eq!(limits(&parsed(&[])), defaults);
+    }
+
+    #[test]
+    fn mon_06_the_spec_lists_exactly_these_controller_names() {
+        let spec = include_str!("../../../docs/SPEC.md");
+        let row = spec
+            .lines()
+            .find(|l| l.trim_start().starts_with("| `mimic_limit`"))
+            .expect("the §9 row");
+        let controller = row
+            .split("controller `")
+            .nth(1)
+            .and_then(|t| t.split("; sidecar").next())
+            .expect("controller names");
+        let listed: std::collections::BTreeSet<String> = format!("`{controller}")
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| t.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .map(str::to_string)
+            .collect();
+        let code: std::collections::BTreeSet<String> = limits(&parsed(&[]))
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
+        assert_eq!(listed, code);
+    }
 }

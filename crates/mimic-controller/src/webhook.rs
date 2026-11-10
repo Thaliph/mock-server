@@ -864,6 +864,111 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn mon_05_every_request_to_inject_is_timed_without_label() {
+        let (router, metrics) = setup(true, &[]);
+        let object = pod();
+        // injected, skipped, untouched
+        admit(&router, "/inject/namespace", review("a", "shop", &object)).await;
+        let mut host = object.clone();
+        host["spec"]["hostNetwork"] = json!(true);
+        admit(&router, "/inject/namespace", review("b", "shop", &host)).await;
+        admit(&router, "/inject/workload", review("c", "shop", &object)).await;
+        // 400, 413, 405
+        let (status, _) = call(&router, Method::POST, "/inject/pod", b"nope".to_vec()).await;
+        assert_eq!(status, 400);
+        let (status, _) = call(
+            &router,
+            Method::POST,
+            "/inject/pod",
+            vec![b' '; MAX_BODY + 1],
+        )
+        .await;
+        assert_eq!(status, 413);
+        let (status, _) = call(&router, Method::GET, "/inject/pod", Vec::new()).await;
+        assert_eq!(status, 405);
+        // Not a request to /inject/*: not timed.
+        let (status, _) = call(&router, Method::POST, "/inject", Vec::new()).await;
+        assert_eq!(status, 404);
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("# TYPE mimic_webhook_admission_duration_seconds histogram"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nmimic_webhook_admission_duration_seconds_count 6\n"),
+            "{text}"
+        );
+        let bounds: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("mimic_webhook_admission_duration_seconds_bucket{le=\""))
+            .filter_map(|l| l.split('"').next())
+            .collect();
+        assert_eq!(
+            bounds,
+            [
+                "0.001", "0.0025", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1.0",
+                "2.5", "5.0", "10.0", "+Inf"
+            ]
+        );
+    }
+
+    /// The quoted string after each `marker` in the production code of this file.
+    fn after<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {
+        source
+            .split(marker)
+            .skip(1)
+            .filter_map(|rest| rest.strip_prefix('"')?.split('"').next())
+            .collect()
+    }
+
+    #[test]
+    fn mon_05_the_reasons_of_the_webhook_are_the_spec_list() {
+        use mimic_core::inject::{SkipReason, Untouched};
+        let spec = include_str!("../../../docs/SPEC.md");
+        let row = spec
+            .lines()
+            .find(|l| l.trim_start().starts_with("| `mimic_webhook_admissions_total`"))
+            .expect("the §9 row");
+        let listed: std::collections::BTreeSet<&str> = row
+            .split("`reason`:")
+            .nth(1)
+            .expect("the reason list")
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| !["injected", "skipped", "error"].contains(t))
+            .collect();
+        let mut code: std::collections::BTreeSet<&str> = ["ok"].into();
+        code.extend(
+            [
+                SkipReason::HostNetwork,
+                SkipReason::UnsupportedOwner,
+                SkipReason::PortConflict,
+                SkipReason::UidConflict,
+                SkipReason::NameConflict,
+            ]
+            .map(SkipReason::as_str),
+        );
+        code.extend(
+            [
+                Untouched::ExcludedNamespace,
+                Untouched::PodDisabled,
+                Untouched::NotSelected,
+                Untouched::AlreadyInjected,
+            ]
+            .map(Untouched::as_str),
+        );
+        let source = include_str!("webhook.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        code.extend(after(production, "reason: "));
+        code.extend(after(production, "\"error\", "));
+        // `read_body` failures pick between these two.
+        code.extend(["too-large", "unreadable"]);
+        assert_eq!(listed, code);
+    }
+
+    #[tokio::test]
     async fn inj_09_error_before_the_pod_is_known_is_logged_and_counted() {
         let (capture, _guard) = capture_logs();
         let (router, metrics) = setup(true, &[]);
