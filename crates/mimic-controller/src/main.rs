@@ -377,9 +377,12 @@ mod tests {
             "sidecar_api_egress_budget_bytes",
             "sidecar_api_max_egress_bytes",
             "sidecar_api_max_report_bytes",
+            "sidecar_api_rate",
             "store_max_authorities",
             "store_max_deployments",
             "store_max_endpoints",
+            "store_max_literals",
+            "store_max_push_endpoints",
             "store_sample_budget_bytes",
             "webhook_max_connections",
         ];
