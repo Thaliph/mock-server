@@ -1705,3 +1705,61 @@ async fn ctl_17_sigterm_with_a_silent_api_exits_within_the_grace_and_counts_the_
     assert_eq!(lines[0]["level"], "WARN");
     assert_eq!(lines[0]["exchanges"], 2);
 }
+
+// ---------------------------------------------------------------------------------------
+// MON-10: the time an endpoint was last added to the template tree (spec §9, #385).
+
+const LAST_NEW_INBOUND: &str =
+    "mimic_discovery_last_new_endpoint_timestamp_seconds{direction=\"inbound\"}";
+const LAST_NEW_OUTBOUND: &str =
+    "mimic_discovery_last_new_endpoint_timestamp_seconds{direction=\"outbound\"}";
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[tokio::test]
+async fn mon_10_the_last_new_endpoint_time_is_set_by_a_new_endpoint_only() {
+    let _logs = capture_logs();
+    let rig = Rig::new(vec![], INTERVAL, DiscoveryConfig::default()).await;
+    assert_eq!(metric(&rig, LAST_NEW_INBOUND), 0);
+    assert_eq!(metric(&rig, LAST_NEW_OUTBOUND), 0);
+
+    let before = unix_now();
+    rig.call("users", 1).await;
+    wait(|| metric(&rig, LAST_NEW_INBOUND) > 0).await;
+    let first = metric(&rig, LAST_NEW_INBOUND);
+    assert!(
+        (before..=unix_now()).contains(&first),
+        "{first} not in {before}..={}",
+        unix_now()
+    );
+    assert_eq!(metric(&rig, LAST_NEW_OUTBOUND), 0);
+
+    // The same endpoint again: unchanged, also across an acknowledged push. The pause makes a
+    // wrong update visible (the value has a resolution of one second).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    rig.call("users", 2).await;
+    rig.recorded(2).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(metric(&rig, LAST_NEW_INBOUND), first);
+    let (stop, task) = rig.start();
+    wait(|| rig.api.acknowledged() == 1).await;
+    wait(|| rig.discovery.report().exchanges() == 0).await;
+    rig.call("users", 3).await;
+    wait(|| rig.api.acknowledged() == 2).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(metric(&rig, LAST_NEW_INBOUND), first);
+
+    // A new endpoint moves it, outbound has its own.
+    rig.call("orders", 1).await;
+    wait(|| metric(&rig, LAST_NEW_INBOUND) > first).await;
+    assert_eq!(metric(&rig, LAST_NEW_OUTBOUND), 0);
+    rig.outbound_call(1).await;
+    wait(|| metric(&rig, LAST_NEW_OUTBOUND) > 0).await;
+    drop(stop);
+    task.await.unwrap();
+}
