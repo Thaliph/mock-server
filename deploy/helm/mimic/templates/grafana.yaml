@@ -76,10 +76,7 @@ spec:
         - name: grafana
           image: {{ include "mimic.grafanaImage" . }}
           imagePullPolicy: IfNotPresent
-          env:
-            # The admin password is read from the file in the Secret, never from an env value (MON-19).
-            - name: GF_SECURITY_ADMIN_PASSWORD__FILE
-              value: /etc/grafana-admin/admin-password
+          # No env: the admin password is read from the Secret's file by grafana.ini (security.admin_password, MON-19).
           ports:
             - name: http
               containerPort: 3000

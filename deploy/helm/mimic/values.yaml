@@ -184,6 +184,7 @@ monitoring:
     resources:
       requests: {cpu: 50m, memory: 128Mi}
       limits: {memory: 256Mi}
+    # Measured on k8s-sidecar 2.14.1: 66 to 78 MiB after start, about 90 MiB steady with 30 dashboards of 150 KB (#379).
     sidecarResources:
-      requests: {cpu: 10m, memory: 32Mi}
-      limits: {memory: 64Mi}
+      requests: {cpu: 10m, memory: 64Mi}
+      limits: {memory: 128Mi}

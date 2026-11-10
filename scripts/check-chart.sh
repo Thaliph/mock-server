@@ -517,11 +517,12 @@ pw=$(yq -r '.data["admin-password"] | @base64d' <<<"$sec")
 b64=$(yq -r '.data["admin-password"]' <<<"$sec")
 [[ $(grep -cF -- "$b64" "$tmp/grafana.yaml") == 1 ]] || fail "mon_19: the admin password is in another object"
 ! grep -qF -- "$pw" "$tmp/grafana.yaml" || fail "mon_19: the admin password is in plain text in the render"
-[[ $(yq -r '.env[].name' <<<"$gctr" | paste -sd, -) == GF_SECURITY_ADMIN_PASSWORD__FILE ]] \
-  || fail "mon_19: the grafana env is not the password file alone"
+# The password reaches Grafana through grafana.ini (security.admin_password = $__file{...}), not through an env:
+# the GF_SECURITY_ADMIN_PASSWORD__FILE form leaves the default admin on "admin" (reproduced with grafana 13.2.4).
+[[ $(yq -r '.env // [] | length' <<<"$gctr") == 0 ]] || fail "mon_19: the grafana container has an env"
 [[ $(yq -r '.env[].name' <<<"$dctr" | grep -c PASSWORD || true) == 0 ]] || fail "mon_19: the sidecar has a password env"
-[[ $(yq -r '.env[] | select(.name == "GF_SECURITY_ADMIN_PASSWORD__FILE") | .value' <<<"$gctr") == /etc/grafana-admin/admin-password ]] \
-  || fail "mon_19: the password file is not /etc/grafana-admin/admin-password"
+[[ $(yq -r '.resources.limits.memory' <<<"$dctr") == 128Mi ]] \
+  || fail "mon_19: the dashboards memory limit is not that of the values (128Mi, the sidecar needs about 90Mi)"
 [[ $(yq -r '[.volumeMounts[].name] | join(",")' <<<"$gctr") == "admin,grafana-ini,provisioning-datasources,provisioning-dashboards,data,dashboard-files" ]] \
   || fail "mon_19: the grafana mounts are not those of the spec"
 grep -q 'secretKeyRef' <<<"$gdep" && fail "mon_19: an env reads a Secret key"
@@ -535,6 +536,8 @@ for line in "reporting_enabled = false" "check_for_updates = false" "check_for_p
   "disable_gravatar = true" "mode = console" "format = json" "admin_user = admin"; do
   grep -qxF -- "$line" <<<"$ini" || fail "mon_19: grafana.ini lacks '$line'"
 done
+grep -qxF -- 'admin_password = $__file{/etc/grafana-admin/admin-password}' <<<"$ini" \
+  || fail "mon_19: grafana.ini does not read the admin password from the Secret file"
 prov=$(yq 'select(.kind == "ConfigMap" and .metadata.name == "mimic-grafana-provisioning")' "$tmp/grafana.yaml")
 ds=$(yq -r '.data["datasources.yaml"]' <<<"$prov")
 [[ $(yq -r '.datasources[0] | [.uid, .type, .url, (.editable | tostring)] | join(" ")' <<<"$ds") == "mimic-prometheus prometheus http://mimic-prometheus:9090 false" ]] \

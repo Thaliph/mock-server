@@ -1599,7 +1599,10 @@ old_pods=$(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].meta
 mkdir -p "$WORK/churn-logs"
 (
   while true; do
-    for p in $(kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    # The names go to a file, not to a command substitution: a kubectl that ends early (141, SIGPIPE, or any error
+    # while the pods are changing) is then only a loop that lists nothing this second, not a failure of the script.
+    kubectl -n disc-22 get pods -l app=users -o jsonpath='{.items[*].metadata.name}' >"$WORK/churn-pods" 2>/dev/null || true
+    for p in $(cat "$WORK/churn-pods"); do
       [[ -e "$WORK/churn-logs/$p.seen" ]] && continue
       : > "$WORK/churn-logs/$p.seen"
       # Until a stream ends cleanly (the container exited): one that fails, while the container is still

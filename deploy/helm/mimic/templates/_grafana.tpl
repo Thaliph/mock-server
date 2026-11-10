@@ -24,7 +24,8 @@ http://{{ .Release.Name }}-prometheus:9090
 
 {{/*
 grafana.ini (spec §10.7): no analytics, update check, news, plugin install, anonymous access or sign-up, and JSON logs
-on the console. The admin user is admin; the password comes from the Secret, as a file (GF_SECURITY_ADMIN_PASSWORD__FILE).
+on the console. The admin user is admin; the password is read from the Secret's file through $__file{} (not the
+GF_SECURITY_ADMIN_PASSWORD__FILE env: with Grafana 13.2.4 the default admin keeps the password admin).
 */}}
 {{- define "mimic.grafanaIni" -}}
 [analytics]
@@ -43,6 +44,7 @@ enabled = false
 
 [security]
 admin_user = admin
+admin_password = $__file{/etc/grafana-admin/admin-password}
 disable_gravatar = true
 
 [users]
