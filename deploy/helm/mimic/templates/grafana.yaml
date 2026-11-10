@@ -109,6 +109,10 @@ spec:
               readOnly: true
             - name: data
               mountPath: /var/lib/grafana
+            # The backend plugins (the Prometheus datasource among them) create their sockets in /tmp: the root is
+            # read-only.
+            - name: tmp
+              mountPath: /tmp
             - name: dashboard-files
               mountPath: /tmp/dashboards
               readOnly: true
@@ -166,6 +170,10 @@ spec:
                 path: dashboards.yaml
         - name: data
           emptyDir: {}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
         - name: dashboard-files
           emptyDir: {}
         # The token, the cluster CA and the namespace of the sidecar's API calls, in the dashboards container only.

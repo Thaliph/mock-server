@@ -492,6 +492,9 @@ gctr=$(yq '.spec.template.spec.containers[] | select(.name == "grafana")' <<<"$g
 dctr=$(yq '.spec.template.spec.containers[] | select(.name == "dashboards")' <<<"$gdep")
 [[ $(yq -r '.image' <<<"$gctr") == docker.io/grafana/grafana:13.2.4-distroless@sha256:* ]] || fail "mon_19: the grafana image is not the pinned one"
 [[ $(yq -r '.image' <<<"$dctr") == quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:* ]] || fail "mon_19: the sidecar image is not the pinned one"
+tmpvol=$(yq -r '.volumeMounts[] | select(.mountPath == "/tmp") | .name' <<<"$gctr")
+[[ -n $tmpvol && $(yq -r ".spec.template.spec.volumes[] | select(.name == \"$tmpvol\") | .emptyDir.medium" <<<"$gdep") == Memory ]] \
+  || fail "mon_19: grafana has no memory emptyDir on /tmp (its backend plugins need it on the read-only root)"
 [[ $(yq -r '.spec.template.spec.containers[] | select(.volumeMounts[]?.name == "kube-api-access") | .name' <<<"$gdep") == dashboards ]] \
   || fail "mon_19: the projected token is not mounted in dashboards only"
 [[ $(yq -r '.spec.template.spec.volumes[] | select(.name == "kube-api-access") | .projected.sources[0] | has("serviceAccountToken")' <<<"$gdep") == true ]] \
@@ -523,7 +526,7 @@ b64=$(yq -r '.data["admin-password"]' <<<"$sec")
 [[ $(yq -r '.env[].name' <<<"$dctr" | grep -c PASSWORD || true) == 0 ]] || fail "mon_19: the sidecar has a password env"
 [[ $(yq -r '.resources.limits.memory' <<<"$dctr") == 128Mi ]] \
   || fail "mon_19: the dashboards memory limit is not that of the values (128Mi, the sidecar needs about 90Mi)"
-[[ $(yq -r '[.volumeMounts[].name] | join(",")' <<<"$gctr") == "admin,grafana-ini,provisioning-datasources,provisioning-dashboards,data,dashboard-files" ]] \
+[[ $(yq -r '[.volumeMounts[].name] | join(",")' <<<"$gctr") == "admin,grafana-ini,provisioning-datasources,provisioning-dashboards,data,tmp,dashboard-files" ]] \
   || fail "mon_19: the grafana mounts are not those of the spec"
 grep -q 'secretKeyRef' <<<"$gdep" && fail "mon_19: an env reads a Secret key"
 [[ $(yq -r '.spec.template.spec.volumes[] | select(.name == "admin") | .secret.secretName' <<<"$gdep") == mimic-grafana-admin ]] \
