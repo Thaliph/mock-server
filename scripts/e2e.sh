@@ -2844,10 +2844,14 @@ targets_up() {
       and any($up[]; .labels.job == "mimic-sidecar" and .labels.namespace == $ns and .labels.deployment == "mon21-app")
   ' >/dev/null 2>&1 <<<"$1"
 }
+ready=$(mon21_get http://$RELEASE-prometheus:9090/-/ready)
+[[ $(mon21_status "$ready") == 200 ]] || fail "mon_21: Prometheus /-/ready does not answer 200"
+# Within 120 s (MON-21): the deadline is on the clock, since each request takes time of its own.
 targets=""
-for _ in $(seq 60); do
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
   targets=$(mon21_get http://$RELEASE-grafana:3000/api/datasources/proxy/uid/mimic-prometheus/api/v1/targets auth)
-  [[ $(mon21_status "$targets") == 200 ]] && targets_up "$(mon21_body "$targets")" && break
+  if [[ $(mon21_status "$targets") == 200 ]] && targets_up "$(mon21_body "$targets")"; then break; fi
   sleep 2
 done
 [[ $(mon21_status "$targets") == 200 ]] && targets_up "$(mon21_body "$targets")" \
@@ -2868,7 +2872,8 @@ data:
   mon21-off.json: '{"uid": "mimic-e2e-off", "title": "mimic off", "schemaVersion": 39, "panels": []}'
 YAML
 found_dash=0
-for _ in $(seq 30); do
+deadline=$((SECONDS + 60))
+while (( SECONDS < deadline )); do
   search=$(mon21_get "http://$RELEASE-grafana:3000/api/search?query=mimic" auth)
   if [[ $(mon21_status "$search") == 200 ]] && jq -e 'any(.[]; .uid == "mimic-e2e")' >/dev/null <<<"$(mon21_body "$search")"; then
     found_dash=1
@@ -2879,6 +2884,29 @@ done
 (( found_dash == 1 )) || fail "mon_21: the dashboard of the labelled ConfigMap is not listed by Grafana"
 jq -e 'any(.[]; .uid == "mimic-e2e-off") | not' >/dev/null <<<"$(mon21_body "$search")" \
   || fail "mon_21: the dashboard of the ConfigMap labelled 0 is listed by Grafana"
+
+# The lifecycle and admin APIs are off (MON-16): Prometheus refuses a reload and a TSDB snapshot with a 4xx or 5xx.
+mon21_post='import sys, urllib.error, urllib.request
+req = urllib.request.Request(sys.argv[1], data=b"", method="POST")
+try:
+    code = urllib.request.urlopen(req, timeout=10).status
+except urllib.error.HTTPError as e:
+    code = e.code
+except OSError:
+    code = 0
+print(code)'
+for path in /-/reload /api/v1/admin/tsdb/snapshot; do
+  code=$(kubectl -n "$NS" exec mon21-client -- python3 -I -c "$mon21_post" "http://$RELEASE-prometheus:9090$path" 2>/dev/null || echo 0)
+  (( code >= 400 && code < 600 )) || fail "mon_21: POST $path answered $code, not a refusal"
+done
+
+# A second upgrade with the same values keeps the admin Secret: the hash of its password value is unchanged (the value
+# is never printed).
+secret_hash() { kubectl -n "$NS" get secret $RELEASE-grafana-admin -o jsonpath='{.data.admin-password}' | sha256sum; }
+before=$(secret_hash)
+install --set valkey.metrics.enabled=true --set monitoring.prometheus.enabled=true --set monitoring.grafana.enabled=true \
+  || fail "mon_21: the second helm upgrade with the same values failed"
+[[ $(secret_hash) == "$before" ]] || fail "mon_21: the second helm upgrade changed the Grafana admin Secret"
 
 # The admin password is in no log of the release namespace (never printed: the check is grep -qF on a variable).
 logs=$(kubectl -n "$NS" logs --all-containers --selector "app.kubernetes.io/instance=$RELEASE" --tail=-1 2>/dev/null || true)
