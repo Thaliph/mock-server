@@ -59,10 +59,6 @@ pub struct RunIndex {
     runs: RwLock<BTreeMap<(String, String), RunInfo>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the reconciler of the next step fills the index")
-)]
 impl RunIndex {
     pub fn apply(&self, run: RunInfo) {
         self.runs
@@ -386,6 +382,10 @@ impl SidecarApi {
                     Ok(None) => return Err(NOT_FOUND),
                     Err(_) => return Err(unavailable(caller, "store unavailable")),
                 };
+                // Before the first listing an empty list would read as `NoTargets`.
+                if !load.slices.is_synced() {
+                    return Err(unavailable(caller, "EndpointSlice cache not synced"));
+                }
                 let targets: Vec<serde_json::Value> = load
                     .slices
                     .targets(namespace, deployment)
@@ -431,7 +431,7 @@ impl SidecarApi {
                 };
                 match self
                     .store
-                    .load_post(namespace, deployment, uid, pod, &stored)
+                    .load_post(namespace, deployment, uid, &worker.to_string(), &stored)
                     .await
                 {
                     Ok(Some(stop)) => Ok(json_response(

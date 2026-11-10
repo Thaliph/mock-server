@@ -159,7 +159,8 @@ mod tests {
         let mut bytes = parsed.signature.clone();
         bytes[0] ^= 1;
         assert!(
-            Signature::from_slice(&bytes).map_or(true, |s| public.verify(&parsed.signed, &s).is_err())
+            Signature::from_slice(&bytes)
+                .map_or(true, |s| public.verify(&parsed.signed, &s).is_err())
         );
         let other = VerifyingKey::from(&SigningKey::from_slice(&[9u8; 32]).unwrap());
         assert!(other.verify(&parsed.signed, &signature).is_err());

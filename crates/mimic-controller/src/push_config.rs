@@ -101,7 +101,13 @@ where
 }
 
 /// `<n>`, `<n>Ki`, `<n>Mi` or `<n>Gi` bytes, from `min` to `max`.
-pub(crate) fn size(env: &Env, var: &str, default: u64, min: u64, max: u64) -> Result<u64, ConfigError> {
+pub(crate) fn size(
+    env: &Env,
+    var: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, ConfigError> {
     let Some(value) = env.optional(var) else {
         return Ok(default);
     };

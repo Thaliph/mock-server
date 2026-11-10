@@ -860,14 +860,23 @@ async fn ldt_09_a_replaced_generator_pod_takes_over_the_field_of_its_index() {
     let replacement_pod = format!("{}-0-xzzzz", s.job);
     let second = s.token(&s.ns, &replacement_pod, LOAD_AUDIENCE);
     assert_eq!(
-        post(&s, &first, post_body(&s.pod(0), false, 3)).await.status,
+        post(&s, &first, post_body(&s.pod(0), false, 3))
+            .await
+            .status,
         200
     );
     assert_eq!(
-        post(&s, &second, post_body(&replacement_pod, false, 4)).await.status,
+        post(&s, &second, post_body(&replacement_pod, false, 4))
+            .await
+            .status,
         200
     );
-    let posts = s.api.store.load_posts(&s.ns, DEPLOYMENT, &s.uid).await.unwrap();
+    let posts = s
+        .api
+        .store
+        .load_posts(&s.ns, DEPLOYMENT, &s.uid)
+        .await
+        .unwrap();
     assert_eq!(posts.keys().map(String::as_str).collect::<Vec<_>>(), ["0"]);
     assert_eq!(posts["0"].results.endpoints[0].requests, 4);
 }

@@ -1,9 +1,5 @@
 //! Load test runs in the store (spec §7.3 `:load:<uid>`, `:loads`, `loads:active`,
 //! `loads:reserved`; §7.8 "Admission" and "End").
-//!
-//! The reconciler (the next step) is the caller of most of it: until then the binary does not
-//! use it, only the tests do.
-#![cfg_attr(not(test), expect(dead_code))]
 
 use std::collections::BTreeMap;
 
@@ -406,6 +402,9 @@ impl Store {
         uid: &str,
         ended: &Ended<'_>,
     ) -> Result<bool, StoreError> {
+        if ended.summary.len() > MAX_SUMMARY {
+            return Err(StoreError::TooLarge);
+        }
         let key = run_key(namespace, deployment, uid).map_err(|_| StoreError::Name)?;
         let member = format!("{namespace}/{deployment}/{uid}");
         let mut conn = self.connection().await?;

@@ -252,6 +252,10 @@ impl Fx {
     /// A deployment with a mock (or discovery) `MimicWorkload`, one ready pod, a stored report
     /// of one endpoint (`GET /a`) and a pull of that pod in the mode.
     async fn deployment(&self, ns: &str, dep: &str, mock: bool) {
+        self.deployment_with(ns, dep, mock, false).await;
+    }
+
+    async fn deployment_with(&self, ns: &str, dep: &str, mock: bool, grpc: bool) {
         let name = format!("{dep}-w");
         self.rec.workloads.apply(ns, &name, dep, vec![], vec![]);
         self.rec.workloads.set_mock(
@@ -262,7 +266,7 @@ impl Fx {
                 ..MockSettings::default()
             },
         );
-        let pod = format!("{dep}-5d9c8f7b6-abcde");
+        let pod = format!("{dep}-5d9c8f7b6-bcdfg");
         let slice: k8s_openapi::api::discovery::v1::EndpointSlice = serde_json::from_value(json!({
             "apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice",
             "metadata": {"name": format!("{dep}-s"), "namespace": ns},
@@ -275,7 +279,7 @@ impl Fx {
         self.rec.slices.mark_synced();
         self.pull(ns, dep, &pod, if mock { "mock" } else { "discovery" })
             .await;
-        self.report(ns, dep, false).await;
+        self.report(ns, dep, grpc).await;
     }
 
     async fn pull(&self, ns: &str, dep: &str, pod: &str, mode: &str) {
@@ -294,7 +298,7 @@ impl Fx {
     }
 
     async fn report(&self, ns: &str, dep: &str, grpc: bool) {
-        let pod = format!("{dep}-5d9c8f7b6-abcde");
+        let pod = format!("{dep}-5d9c8f7b6-bcdfg");
         let mut report = Report::new(Some(pod.clone()));
         report.record(
             &LIMITS,
@@ -348,7 +352,13 @@ impl Fx {
 
     /// The test as the cluster would hold it after the last status apply.
     fn settle(&self, test: &Test) -> Test {
-        let mut test = self.rec.tests.list().into_iter().find(|t| t.name == test.name && t.namespace == test.namespace).unwrap();
+        let mut test = self
+            .rec
+            .tests
+            .list()
+            .into_iter()
+            .find(|t| t.name == test.name && t.namespace == test.namespace)
+            .unwrap();
         test.status = self.cluster.status(&test.namespace, &test.name);
         self.rec.tests.apply(test.clone());
         test
@@ -375,12 +385,25 @@ impl Fx {
     }
 
     fn edit(&self, test: &Test, change: impl FnOnce(&mut Test)) {
-        let mut current = self.rec.tests.list().into_iter().find(|t| t.name == test.name && t.namespace == test.namespace).unwrap();
+        let mut current = self
+            .rec
+            .tests
+            .list()
+            .into_iter()
+            .find(|t| t.name == test.name && t.namespace == test.namespace)
+            .unwrap();
         change(&mut current);
         self.rec.tests.apply(current);
     }
 
-    async fn post(&self, test: &Test, index: u64, final_post: bool, reason: Option<&str>, requests: u64) {
+    async fn post(
+        &self,
+        test: &Test,
+        index: u64,
+        final_post: bool,
+        reason: Option<&str>,
+        requests: u64,
+    ) {
         let mut stats = Stats::default();
         for _ in 0..requests {
             stats.response(200, 1500);
@@ -388,11 +411,19 @@ impl Fx {
         let post = StoredPost {
             final_post,
             reason: reason.map(str::to_string),
-            results: PodResults { endpoints: vec![stats] },
+            results: PodResults {
+                endpoints: vec![stats],
+            },
         };
         self.rec
             .store
-            .load_post(&test.namespace, &test.deployment, &test.uid, &index.to_string(), &post)
+            .load_post(
+                &test.namespace,
+                &test.deployment,
+                &test.uid,
+                &index.to_string(),
+                &post,
+            )
             .await
             .unwrap();
     }
@@ -435,7 +466,10 @@ async fn ldt_07_a_deployment_without_a_target_waits_then_has_no_targets() {
     let t0 = now_ms();
     let test = f.test(&ns, "t1", "pay", t0);
     f.pass(t0 + 1000).await;
-    assert_eq!(f.phase(&test), ("Pending".into(), "WaitingForTargets".into()));
+    assert_eq!(
+        f.phase(&test),
+        ("Pending".into(), "WaitingForTargets".into())
+    );
     f.pass(t0 + 6000).await;
     assert_eq!(f.phase(&test), ("Failed".into(), "NoTargets".into()));
 }
@@ -453,17 +487,27 @@ async fn ldt_07_mock_and_mock_pulls_create_the_job_and_the_run_is_running() {
     f.pass(t0 + 1000).await;
     assert_eq!(f.phase(&test), ("Running".into(), "".into()));
     let name = job_name(&test.uid);
-    assert_eq!(f.cluster.jobs(), [name.clone()]);
-    assert_eq!(f.cluster.of("NetworkPolicy"), [name.clone()]);
+    assert_eq!(f.cluster.jobs(), std::slice::from_ref(&name));
+    assert_eq!(f.cluster.of("NetworkPolicy"), std::slice::from_ref(&name));
     let job = f.cluster.objects.lock().unwrap()[&(ns.clone(), "Job", name)].clone();
     assert_eq!(job["spec"]["parallelism"], 2);
-    assert_eq!(job["spec"]["template"]["spec"]["containers"][0]["image"], "mimic@sha256:00");
+    assert_eq!(
+        job["spec"]["template"]["spec"]["containers"][0]["image"],
+        "mimic@sha256:00"
+    );
     let status = f.status(&test);
-    assert!(status["startTime"].as_str().is_some_and(|s| s.ends_with('Z')));
+    assert!(
+        status["startTime"]
+            .as_str()
+            .is_some_and(|s| s.ends_with('Z'))
+    );
     assert_eq!(status["targets"], 1);
     assert_eq!(f.active(&test).await, Some(false));
     // The load API knows the run.
-    assert_eq!(f.rec.runs.get(&ns, "t1").map(|r| r.uid), Some(test.uid.clone()));
+    assert_eq!(
+        f.rec.runs.get(&ns, "t1").map(|r| r.uid),
+        Some(test.uid.clone())
+    );
     // One start line, with the fields of the criterion and no ticket.
     f.pass(t0 + 2000).await;
     let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
@@ -487,7 +531,13 @@ async fn ldt_20_the_ticket_is_signed_by_the_current_root_of_the_deployment() {
     let t0 = now_ms();
     let first = f.test(&ns, "t1", "pay", t0);
     f.pass(t0 + 1000).await;
-    let stored = f.rec.store.load_run(&ns, "pay", &first.uid).await.unwrap().unwrap();
+    let stored = f
+        .rec
+        .store
+        .load_run(&ns, "pay", &first.uid)
+        .await
+        .unwrap()
+        .unwrap();
     let parsed = ticket::parse(&stored.ticket).expect("a ticket");
     assert_eq!(parsed.payload.namespace, ns);
     assert_eq!(parsed.payload.deployment, "pay");
@@ -508,7 +558,13 @@ async fn ldt_20_the_ticket_is_signed_by_the_current_root_of_the_deployment() {
     let second = f.test(&ns, "t2", "other", t0);
     f.deployment(&ns, "other", true).await;
     f.pass(t0 + 2000).await;
-    let stored = f.rec.store.load_run(&ns, "other", &second.uid).await.unwrap().unwrap();
+    let stored = f
+        .rec
+        .store
+        .load_run(&ns, "other", &second.uid)
+        .await
+        .unwrap()
+        .unwrap();
     let parsed = ticket::parse(&stored.ticket).expect("a ticket");
     let current = f.rec.seed.get().unwrap();
     let root = derive_root(&current, &ns, "other").unwrap();
@@ -628,25 +684,39 @@ async fn ldt_07_invalid_values_no_report_no_endpoints_and_disabled_fail_with_the
     f.rec.tests.apply(big.clone());
     // No stored report.
     f.rec.workloads.apply(&ns, "w2", "bare", vec![], vec![]);
-    f.rec.workloads.set_mock(&ns, "w2", MockSettings { mock: true, ..MockSettings::default() });
-    f.pull(&ns, "bare", "bare-5d9c8f7b6-abcde", "mock").await;
+    f.rec.workloads.set_mock(
+        &ns,
+        "w2",
+        MockSettings {
+            mock: true,
+            ..MockSettings::default()
+        },
+    );
+    f.pull(&ns, "bare", "bare-5d9c8f7b6-bcdfg", "mock").await;
     let slice: k8s_openapi::api::discovery::v1::EndpointSlice = serde_json::from_value(json!({
         "apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice",
         "metadata": {"name": "bare-s", "namespace": ns}, "addressType": "IPv4",
         "endpoints": [{"addresses": ["10.0.0.8"], "conditions": {"ready": true},
-                       "targetRef": {"kind": "Pod", "name": "bare-5d9c8f7b6-abcde"}}],
+                       "targetRef": {"kind": "Pod", "name": "bare-5d9c8f7b6-bcdfg"}}],
     }))
     .unwrap();
     f.rec.slices.apply(slice);
     let bare = f.test(&ns, "bare", "bare", t0 + 1);
     // Only a gRPC endpoint.
-    f.deployment(&ns, "rpc", true).await;
-    f.report(&ns, "rpc", true).await;
+    f.deployment_with(&ns, "rpc", true, true).await;
     let rpc = f.test(&ns, "rpc", "rpc", t0 + 2);
     f.pass(t0 + 1000).await;
     let invalid = f.status(&big);
-    assert_eq!((invalid["phase"].as_str(), invalid["reason"].as_str()), (Some("Failed"), Some("Invalid")));
-    assert!(invalid["message"].as_str().unwrap().contains("spec.concurrency"));
+    assert_eq!(
+        (invalid["phase"].as_str(), invalid["reason"].as_str()),
+        (Some("Failed"), Some("Invalid"))
+    );
+    assert!(
+        invalid["message"]
+            .as_str()
+            .unwrap()
+            .contains("spec.concurrency")
+    );
     assert_eq!(f.phase(&bare), ("Failed".into(), "NoReport".into()));
     assert_eq!(f.phase(&rpc), ("Failed".into(), "NoEndpoints".into()));
     assert_eq!(f.status(&rpc)["skipped"], json!({"grpc": 1}));
@@ -687,22 +757,52 @@ async fn ldt_09_posts_of_two_pods_merge_into_the_status_and_the_run_completes() 
     f.post(&test, 1, true, Some("Completed"), 7).await;
     f.pass(t0 + 14_000).await;
     let status = f.status(&test);
-    assert_eq!((status["phase"].as_str(), status["reason"].as_str()), (Some("Succeeded"), Some("Completed")));
+    assert_eq!(
+        (status["phase"].as_str(), status["reason"].as_str()),
+        (Some("Succeeded"), Some("Completed"))
+    );
     assert_eq!(status["results"]["total"]["requests"], 12);
     assert!(status["endTime"].as_str().is_some());
     // The stored run keeps the summary only; the slot and the reservation are gone.
     let mut conn = f.conn().await;
     let key = format!("mimic:v1:{{{ns}/pay}}:load:{}", test.uid);
-    let mut fields: Vec<String> = redis::cmd("HKEYS").arg(&key).query_async(&mut conn).await.unwrap();
+    let mut fields: Vec<String> = redis::cmd("HKEYS")
+        .arg(&key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     fields.sort();
-    assert_eq!(fields, ["end", "phase", "reason", "spec", "start", "stop", "summary"]);
+    assert_eq!(
+        fields,
+        ["end", "phase", "reason", "spec", "start", "stop", "summary"]
+    );
     let member = format!("{ns}/pay/{}", test.uid);
-    let reserved: Option<String> = redis::cmd("HGET").arg("mimic:v1:loads:reserved").arg(&member).query_async(&mut conn).await.unwrap();
+    let reserved: Option<String> = redis::cmd("HGET")
+        .arg("mimic:v1:loads:reserved")
+        .arg(&member)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(reserved, None);
-    let late = StoredPost { final_post: false, reason: None, results: PodResults::default() };
-    assert_eq!(f.rec.store.load_post(&ns, "pay", &test.uid, "0", &late).await.unwrap(), None);
+    let late = StoredPost {
+        final_post: false,
+        reason: None,
+        results: PodResults::default(),
+    };
+    assert_eq!(
+        f.rec
+            .store
+            .load_post(&ns, "pay", &test.uid, "0", &late)
+            .await
+            .unwrap(),
+        None
+    );
     // One end line and one count.
-    assert!(f.metrics.encode().contains("load_runs_total{phase=\"Succeeded\",reason=\"Completed\"} 1"));
+    assert!(
+        f.metrics
+            .encode()
+            .contains("load_runs_total{phase=\"Succeeded\",reason=\"Completed\"} 1")
+    );
 }
 
 #[tokio::test]
@@ -735,7 +835,11 @@ async fn ldt_09_a_failed_job_fails_the_run_with_the_results_posted_so_far() {
     let test = f.test(&ns, "t1", "pay", t0);
     f.pass(t0 + 1000).await;
     f.post(&test, 0, false, None, 4).await;
-    f.cluster.states.lock().unwrap().insert(job_name(&test.uid), JobState::Failed);
+    f.cluster
+        .states
+        .lock()
+        .unwrap()
+        .insert(job_name(&test.uid), JobState::Failed);
     f.pass(t0 + 2000).await;
     assert_eq!(f.phase(&test), ("Failed".into(), "JobFailed".into()));
     assert_eq!(f.status(&test)["results"]["total"]["requests"], 4);
@@ -780,19 +884,33 @@ async fn ldt_10_the_mode_leaving_mock_deletes_the_job_and_frees_the_slot() {
     let test = f.test(&ns, "t1", "pay", t0);
     f.pass(t0 + 1000).await;
     assert_eq!(f.phase(&test).0, "Running");
-    f.rec.workloads.set_mock(&ns, "pay-w", MockSettings::default());
+    f.rec
+        .workloads
+        .set_mock(&ns, "pay-w", MockSettings::default());
     f.pass(t0 + 1500).await;
     assert_eq!(f.phase(&test), ("Aborted".into(), "ModeLeft".into()));
     let name = job_name(&test.uid);
     assert!(f.cluster.was_deleted("Job", &name));
     assert!(f.cluster.was_deleted("NetworkPolicy", &name));
     // The stop flag was set (and is kept) and the run is no longer active.
-    let fields = f.rec.store.load_fields(&ns, "pay", &test.uid).await.unwrap();
+    let fields = f
+        .rec
+        .store
+        .load_fields(&ns, "pay", &test.uid)
+        .await
+        .unwrap();
     assert_eq!(fields["stop"], "1");
     assert_eq!(f.active(&test).await, None);
     // A new run on the deployment is admitted once it is back in mock.
-    f.rec.workloads.set_mock(&ns, "pay-w", MockSettings { mock: true, ..MockSettings::default() });
-    f.pull(&ns, "pay", "pay-5d9c8f7b6-abcde", "mock").await;
+    f.rec.workloads.set_mock(
+        &ns,
+        "pay-w",
+        MockSettings {
+            mock: true,
+            ..MockSettings::default()
+        },
+    );
+    f.pull(&ns, "pay", "pay-5d9c8f7b6-bcdfg", "mock").await;
     let next = f.test(&ns, "t2", "pay", t0 + 2000);
     f.pass(t0 + 3000).await;
     assert_eq!(f.phase(&next).0, "Running");
@@ -810,7 +928,14 @@ async fn ldt_10_spec_stop_aborts_as_stopped_and_deleting_the_object_frees_the_sl
     f.pass(t0 + 1500).await;
     assert_eq!(f.phase(&test), ("Aborted".into(), "Stopped".into()));
     assert!(f.cluster.was_deleted("Job", &job_name(&test.uid)));
-    assert_eq!(f.rec.store.load_fields(&ns, "pay", &test.uid).await.unwrap()["stop"], "1");
+    assert_eq!(
+        f.rec
+            .store
+            .load_fields(&ns, "pay", &test.uid)
+            .await
+            .unwrap()["stop"],
+        "1"
+    );
     // Deleted object: the run is released, the index forgets it.
     let other = f.test(&ns, "t2", "pay", t0 + 2000);
     f.pass(t0 + 3000).await;
@@ -830,12 +955,20 @@ async fn ldt_14_no_ticket_or_credential_name_value_reaches_the_status() {
     let t0 = now_ms();
     let mut test = f.test(&ns, "t1", "pay", t0);
     test.spec.secret_name = Some("canary-secret-name".into());
-    test.spec.credentials = vec![CredentialField { field: "header/authorization".into(), key: "token".into() }];
+    test.spec.credentials = vec![CredentialField {
+        field: "header/authorization".into(),
+        key: "token".into(),
+    }];
     f.rec.tests.apply(test.clone());
     f.pass(t0 + 1000).await;
     f.post(&test, 0, true, Some("Completed"), 2).await;
     f.pass(t0 + 2000).await;
-    let stored = f.rec.store.load_fields(&ns, "pay", &test.uid).await.unwrap();
+    let stored = f
+        .rec
+        .store
+        .load_fields(&ns, "pay", &test.uid)
+        .await
+        .unwrap();
     let status = f.status(&test).to_string();
     for text in [status, stored["summary"].clone(), stored["spec"].clone()] {
         assert!(!text.contains("v1.") && !text.contains("Bearer"), "{text}");

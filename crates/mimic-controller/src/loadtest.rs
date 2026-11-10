@@ -130,15 +130,15 @@ impl Config {
             .ok_or_else(|| ConfigError::invalid(var, resources, "expected a JSON object"))?;
         let var = "MIMIC_LOAD_NETWORK_POLICY";
         let network = match env.optional(var) {
-            Some(value) => Some(
-                serde_json::from_str(value).map_err(|e| ConfigError::invalid(var, value, e))?,
-            ),
+            Some(value) => {
+                Some(serde_json::from_str(value).map_err(|e| ConfigError::invalid(var, value, e))?)
+            }
             None => None,
         };
         Ok(Config {
             max_runs,
-            max_namespace_runs: number(env, "MIMIC_LOAD_MAX_NAMESPACE_RUNS", 2, 1, 100)
-                .and_then(|n| {
+            max_namespace_runs: number(env, "MIMIC_LOAD_MAX_NAMESPACE_RUNS", 2, 1, 100).and_then(
+                |n| {
                     if n <= namespace_ceiling {
                         Ok(n)
                     } else {
@@ -148,7 +148,8 @@ impl Config {
                             "at most MIMIC_LOAD_MAX_RUNS",
                         ))
                     }
-                })?,
+                },
+            )?,
             max_pending: number(env, "MIMIC_LOAD_MAX_PENDING", 16, 1, 1000)?,
             store_budget,
             limits: Limits {
@@ -374,17 +375,13 @@ type Labels = Vec<(String, String)>;
 #[derive(Clone, Default)]
 pub struct LoadMetrics {
     runs: Family<Labels, Counter>,
-    active: Gauge,
+    active: Gauge<i64>,
 }
 
 impl LoadMetrics {
     pub fn register(registry: &mut Registry) -> LoadMetrics {
         let metrics = LoadMetrics::default();
-        registry.register(
-            "load_runs",
-            "Load test runs ended",
-            metrics.runs.clone(),
-        );
+        registry.register("load_runs", "Load test runs ended", metrics.runs.clone());
         registry.register(
             "load_active_runs",
             "Load test runs this replica sees running",
@@ -396,7 +393,7 @@ impl LoadMetrics {
 
 /// What a replica remembers of a run between passes.
 #[derive(Default)]
-pub(crate) struct RunState {
+pub struct RunState {
     /// The parsed plan, for the endpoint rows of the summary.
     pub plan: Option<Arc<mimic_core::load::plan::Plan>>,
     pub start_ms: Option<u64>,
@@ -416,7 +413,7 @@ pub struct Reconciler {
     pub seed: Arc<SeedSlot>,
     pub cert: Arc<CertSlot>,
     pub metrics: LoadMetrics,
-    pub(crate) state: Mutex<BTreeMap<String, RunState>>,
+    pub state: Mutex<BTreeMap<String, RunState>>,
 }
 
 /// The reconciliation period; the stop of a run is seen within it (LDT-10).
@@ -429,8 +426,19 @@ fn status_of(phase: &str, reason: &str, message: &str) -> Value {
     json!({"phase": phase, "reason": reason, "message": message})
 }
 
+/// Most bytes of the summary the reconciler stores: a little below the store's cap.
+pub const CAP_SUMMARY: usize = crate::store::load::MAX_SUMMARY - 8 * KIB as usize;
+
 /// The summary as stored and shown, at most [`CAP_SUMMARY`] bytes: past it the per-endpoint rows
 /// go and the total stays (spec §7.8 "End").
 pub fn summary_json(summary: &mimic_core::load::summary::Summary) -> String {
-    String::new()
+    let full = serde_json::to_string(summary).unwrap_or_default();
+    if !full.is_empty() && full.len() <= CAP_SUMMARY {
+        return full;
+    }
+    let total = mimic_core::load::summary::Summary {
+        total: summary.total.clone(),
+        endpoints: Vec::new(),
+    };
+    serde_json::to_string(&total).unwrap_or_else(|_| "{}".to_string())
 }

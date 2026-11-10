@@ -41,32 +41,35 @@ struct Config {
     tls_ca: tls_ca::TlsCaConfig,
     sidecar_api_addr: SocketAddr,
     push: push_config::PushConfig,
-    /// `MIMIC_LOAD_MAX_RUNS`: 0 disables load tests (spec §7.8).
-    load_max_runs: u64,
+    /// The `MIMIC_LOAD_*` settings; `max_runs` 0 disables load tests (spec §7.8).
+    load: loadtest::Config,
 }
 
 fn config(env: &Env) -> Result<Config, ConfigError> {
+    let webhook = WebhookConfig::from_env(env, VERSION)?;
+    let sidecar_api_addr: SocketAddr =
+        env.parse_or("MIMIC_SIDECAR_API_ADDR", DEFAULT_SIDECAR_API)?;
+    let push = push_config::PushConfig::from_env(env)?;
+    let load = loadtest::Config::from_env(
+        env,
+        &loadtest::Context {
+            image: &webhook.inject.sidecar_image,
+            controller_url: &webhook.inject.controller_url,
+            controller_namespace: &webhook.namespace,
+            controller_port: sidecar_api_addr.port(),
+            status_interval: push.status_interval,
+            pod_window: push.pod_window,
+        },
+    )?;
     Ok(Config {
         common: CommonConfig::from_env(env, DEFAULT_ADMIN)?,
         valkey: valkey::client_from_env(env)?,
-        webhook: WebhookConfig::from_env(env, VERSION)?,
+        webhook,
         tls_ca: tls_ca::TlsCaConfig::from_env(env)?,
-        sidecar_api_addr: env.parse_or("MIMIC_SIDECAR_API_ADDR", DEFAULT_SIDECAR_API)?,
-        push: push_config::PushConfig::from_env(env)?,
-        load_max_runs: load_max_runs(env)?,
+        sidecar_api_addr,
+        push,
+        load,
     })
-}
-
-fn load_max_runs(env: &Env) -> Result<u64, ConfigError> {
-    let runs: u64 = env.parse_or("MIMIC_LOAD_MAX_RUNS", 0)?;
-    if runs > 100 {
-        return Err(ConfigError::invalid(
-            "MIMIC_LOAD_MAX_RUNS",
-            &runs.to_string(),
-            "must be 0 to 100",
-        ));
-    }
-    Ok(runs)
 }
 
 fn main() -> ExitCode {
@@ -100,6 +103,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     let store_metrics = store::StoreMetrics::register(metrics.registry_mut());
     let ui_metrics = ui::UiMetrics::register(metrics.registry_mut());
     let status_metrics = status::StatusMetrics::register(metrics.registry_mut());
+    let load_metrics = loadtest::LoadMetrics::register(metrics.registry_mut());
     let metrics = Arc::new(metrics);
     let webhook = config.webhook;
     tracing::info!(
@@ -116,7 +120,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     // The cluster client, for the sidecar API's `TokenReview`s, once it is available.
     let kube_client = Arc::new(tokio::sync::OnceCell::new());
     // The load API (spec §7.8) exists only when load tests are enabled.
-    let load = (config.load_max_runs > 0).then(|| sidecar_api::load::LoadApi {
+    let load = (config.load.max_runs > 0).then(|| sidecar_api::load::LoadApi {
         reviewer: Arc::new(sidecar_api::KubeReviewer::with_audience(
             kube_client.clone(),
             sidecar_api::load::LOAD_AUDIENCE,
@@ -126,6 +130,9 @@ async fn run(config: Config) -> std::io::Result<()> {
         slices: Arc::new(sidecar_api::load::SliceCache::default()),
     });
     let slices = load.as_ref().map(|load| load.slices.clone());
+    let load_parts = load
+        .as_ref()
+        .map(|load| (load.runs.clone(), load.slices.clone()));
     tokio::spawn({
         let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
         let kube_client = kube_client.clone();
@@ -148,6 +155,32 @@ async fn run(config: Config) -> std::io::Result<()> {
         }
     });
     let store = store::Store::new(config.valkey.clone(), config.push.store, store_metrics);
+    if let Some((runs, slices)) = load_parts {
+        let reconciler = Arc::new(loadtest::Reconciler {
+            config: config.load.clone(),
+            store: store.clone(),
+            workloads: cache.clone(),
+            tests: Arc::new(loadtest::Tests::default()),
+            runs,
+            slices,
+            cluster: Arc::new(loadtest::KubeCluster::new(kube_client.clone())),
+            seed: seed.clone(),
+            cert: cert.clone(),
+            metrics: load_metrics,
+            state: Default::default(),
+        });
+        let kube_client = kube_client.clone();
+        tokio::spawn(async move {
+            let client = loop {
+                if let Some(client) = kube_client.get() {
+                    break client.clone();
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            };
+            tokio::spawn(loadtest::watch(client, reconciler.clone()));
+            reconciler.run().await;
+        });
+    }
     let ui_router = ui::router(store.clone(), ui_metrics);
     tokio::spawn(
         status::Reconciler {
