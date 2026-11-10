@@ -5,6 +5,9 @@
 #   scripts/check-pins.sh             checks that values.yaml and ci.yml carry the same references
 # Changing a digest here is the only way to change these images.
 
+# Valkey exporter (#378): the chart's valkey.metrics image (deploy/helm/mimic/values.yaml), v1.95.0 published 2026-10-21.
+FROM docker.io/oliver006/redis_exporter:v1.95.0@sha256:afb21407aba3df1b4010899f155fc6b1ba2026c97b725d72aca4019d772e7b6b AS redis-exporter
+
 # Valkey: the chart's default (deploy/helm/mimic/values.yaml, valkey.image), also scanned by Trivy in CI.
 FROM docker.io/valkey/valkey:9.0-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416 AS valkey
 
