@@ -522,7 +522,7 @@ async fn mon_11_a_restart_with_a_saved_mock_mode_counts_no_switch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mon_11_a_change_whose_state_file_cannot_be_written_is_not_counted() {
+async fn mon_11_a_switch_whose_state_file_cannot_be_written_is_applied_and_counted_once() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("mimic")).unwrap();
     // A file where the directory should be.
@@ -530,5 +530,6 @@ async fn mon_11_a_change_whose_state_file_cannot_be_written_is_not_counted() {
     let api = fake_api(vec![], Reply::Ok(Some("mock"), None)).await;
     let (_process, admin) = sidecar(&api, dir.path(), "1s", &[]);
     wait_for("three pulls", || api.count() >= 3);
-    assert_eq!(switches(admin, "mock"), 0.0);
+    assert_eq!(mode_gauge(admin).as_deref(), Some("1"));
+    assert_eq!(switches(admin, "mock"), 1.0);
 }
