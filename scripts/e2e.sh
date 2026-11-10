@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19).
+# End-to-end checks on kind (MON-02, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -2622,6 +2622,111 @@ if found -F "$mck_canary" "$WORK/mck19-controller.log"; then fail "mck_19: a can
 kubectl delete namespace mck-19 mck-19-provider --wait=false >/dev/null
 
 kubectl delete namespace disc-22 disc-22-client egr-19 --wait=false >/dev/null
+
+# --- MON-02 (spec §12.13, §10.7, #378): the Valkey exporter, and a sidecar's /metrics from another pod ----------------
+# The upgrade enables valkey.metrics: the Valkey pod restarts once. The scraper is a pod of the release namespace (the
+# metrics namespace of the exporter's NetworkPolicy), restricted-compliant, that reads both endpoints by pod IP.
+log "mon_02: the Valkey exporter is enabled by an upgrade, its container is Ready as UID 65532"
+install --set valkey.metrics.enabled=true || fail "mon_02: helm upgrade with valkey.metrics.enabled"
+kubectl -n "$NS" rollout status statefulset/$RELEASE-valkey --timeout=3m
+valkey_pod=$RELEASE-valkey-0
+[[ $(kubectl -n "$NS" get pod "$valkey_pod" -o jsonpath='{.status.containerStatuses[?(@.name=="exporter")].ready}') == true ]] \
+  || fail "mon_02: the exporter container is not Ready"
+[[ $(kubectl -n "$NS" get pod "$valkey_pod" -o jsonpath='{.spec.containers[?(@.name=="exporter")].securityContext.runAsUser}') == 65532 ]] \
+  || fail "mon_02: the exporter container does not run as UID 65532"
+exporter_ip=$(kubectl -n "$NS" get pod "$valkey_pod" -o jsonpath='{.status.podIP}')
+[[ -n $exporter_ip ]] || fail "mon_02: the Valkey pod has no IP"
+
+# The scraper: the Python image, restricted, in the release namespace.
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: mon02-scraper, namespace: $NS}
+spec:
+  automountServiceAccountToken: false
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: scraper
+      image: $PY
+      command: [sleep, "900"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL]}
+YAML
+kubectl -n "$NS" wait --for=condition=Ready pod/mon02-scraper --timeout=2m >/dev/null || fail "mon_02: the scraper pod is not Ready"
+
+# mon02_get <url>: the body of a GET from the scraper pod. Empty on failure.
+mon02_get() {
+  kubectl -n "$NS" exec mon02-scraper -- python3 -c \
+    'import sys, urllib.request; sys.stdout.write(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())' "$1" 2>/dev/null || true
+}
+exporter_body=""
+for _ in $(seq 30); do
+  exporter_body=$(mon02_get "http://$exporter_ip:9121/metrics")
+  grep -qx 'redis_up 1' <<<"$exporter_body" && break
+  sleep 2
+done
+grep -qx 'redis_up 1' <<<"$exporter_body" || fail "mon_02: the exporter's /metrics from the release namespace does not answer redis_up 1"
+
+# A canary key and value as the default user. Neither may reach the exporter's /metrics, and the exporter password
+# neither (values are never printed).
+canary_key="mon02-key-$RANDOM$RANDOM"
+canary_value="mon02-$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+exporter_pw=$(kubectl -n "$NS" get secret $RELEASE-valkey-exporter -o jsonpath='{.data.password}' | base64 -d)
+[[ -n $exporter_pw && -n $canary_value ]] || fail "mon_02: no exporter password or canary value"
+[[ $(kubectl -n "$NS" exec "$valkey_pod" -c valkey -- valkey-cli SET "$canary_key" "$canary_value") == OK ]] \
+  || fail "mon_02: the canary key was not written as the default user"
+exporter_body=$(mon02_get "http://$exporter_ip:9121/metrics")
+grep -qx 'redis_up 1' <<<"$exporter_body" || fail "mon_02: the exporter does not see Valkey after the canary write"
+if grep -qF -- "$canary_value" <<<"$exporter_body"; then fail "mon_02: the exporter's /metrics holds the canary value"; fi
+if grep -qF -- "$exporter_pw" <<<"$exporter_body"; then fail "mon_02: the exporter's /metrics holds the exporter password"; fi
+
+# The exporter user, with its password on stdin (not in argv): INFO answers, the canary key is refused.
+exporter_cli() {
+  printf '%s\n' "$exporter_pw" | kubectl -n "$NS" exec -i "$valkey_pod" -c valkey -- \
+    sh -c 'read -r p; REDISCLI_AUTH="$p" valkey-cli --no-auth-warning --user mimic-exporter "$@"' sh "$@" 2>&1 || true
+}
+info_out=$(exporter_cli INFO server)
+grep -q '^# Server' <<<"$info_out" || fail "mon_02: mimic-exporter cannot run INFO"
+get_out=$(exporter_cli GET "$canary_key")
+grep -q NOPERM <<<"$get_out" || fail "mon_02: mimic-exporter can GET a key"
+set_out=$(exporter_cli SET "$canary_key" x)
+grep -q NOPERM <<<"$set_out" || fail "mon_02: mimic-exporter can SET a key"
+kubectl -n "$NS" exec "$valkey_pod" -c valkey -- valkey-cli DEL "$canary_key" >/dev/null || true
+
+# The controller still stores and reads after the Valkey restart: it stays ready and its status passes succeed.
+mon02_ns=mon-02
+ns_fresh $mon02_ns mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: mon02, namespace: $mon02_ns}
+spec: {deployment: mon02-app}
+YAML
+deploy_sleeper $mon02_ns mon02-app
+kubectl -n $mon02_ns rollout status deploy/mon02-app --timeout=3m
+admin_forward
+[[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "mon_02: the controller is not ready after the Valkey restart"
+status_ok() { curl -fs localhost:18081/metrics | awk 'index($0, "mimic_status_updates_total{result=\"ok\"}") == 1 { print int($2) }' | tail -n 1; }
+status_before=$(status_ok); status_before=${status_before:-0}
+grown=0
+for _ in $(seq 45); do
+  status_now=$(status_ok); status_now=${status_now:-0}
+  if (( status_now > status_before )); then grown=1; break; fi
+  sleep 2
+done
+(( grown == 1 )) || fail "mon_02: no status pass of the controller succeeded after the Valkey restart"
+
+# The sidecar's /metrics answers from the scraper pod in the release namespace (no policy on 15100 by design).
+sidecar_ip=$(kubectl -n $mon02_ns get pods -l app=mon02-app -o jsonpath='{.items[0].status.podIP}')
+[[ -n $sidecar_ip ]] || fail "mon_02: the injected pod has no IP"
+sidecar_body=$(mon02_get "http://$sidecar_ip:15100/metrics")
+grep -qF 'mimic_build_info{component="sidecar"' <<<"$sidecar_body" \
+  || fail "mon_02: the sidecar's /metrics on 15100 does not answer from the release namespace"
+
+kubectl delete namespace $mon02_ns --wait=false >/dev/null
+kubectl -n "$NS" delete pod mon02-scraper --wait=false >/dev/null
 
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"
 kubectl apply -f - >/dev/null <<YAML
