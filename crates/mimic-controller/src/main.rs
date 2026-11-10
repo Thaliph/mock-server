@@ -3,6 +3,7 @@
 
 mod cert_manager;
 mod certs;
+mod loadtest;
 mod push_config;
 mod sidecar_api;
 mod status;

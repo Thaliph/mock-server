@@ -136,4 +136,32 @@ mod tests {
         );
         assert!(parse(&reordered).is_none());
     }
+
+    #[test]
+    fn ldt_20_a_signed_ticket_verifies_with_the_public_key_of_its_signer() {
+        use p256::ecdsa::signature::{Signer, Verifier};
+        use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+        let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let ticket = issue(&payload(), |input| {
+            let signature: Signature = key.sign(input);
+            signature.to_bytes().to_vec()
+        });
+        let parsed = parse(&ticket).unwrap();
+        assert_eq!(parsed.signature.len(), 64);
+        let public = VerifyingKey::from(&key);
+        let signature = Signature::from_slice(&parsed.signature).unwrap();
+        assert!(public.verify(&parsed.signed, &signature).is_ok());
+        assert_eq!(parsed.payload, payload());
+        // One changed byte of the payload or the signature, another key: not verified.
+        let mut changed = parsed.signed.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        assert!(public.verify(&changed, &signature).is_err());
+        let mut bytes = parsed.signature.clone();
+        bytes[0] ^= 1;
+        assert!(
+            Signature::from_slice(&bytes).map_or(true, |s| public.verify(&parsed.signed, &s).is_err())
+        );
+        let other = VerifyingKey::from(&SigningKey::from_slice(&[9u8; 32]).unwrap());
+        assert!(other.verify(&parsed.signed, &signature).is_err());
+    }
 }

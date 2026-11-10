@@ -235,6 +235,7 @@ impl Setup {
         }))
         .expect("a slice");
         self.slices.apply(slice);
+        self.slices.mark_synced();
     }
 }
 
@@ -585,10 +586,10 @@ async fn ldt_08_results_are_stored_cumulatively_per_pod() {
         .await
         .unwrap();
     assert_eq!(posts.len(), 2);
-    assert_eq!(posts[&s.pod(0)].results.endpoints[0].requests, 5);
-    assert!(!posts[&s.pod(0)].final_post);
-    assert_eq!(posts[&s.pod(1)].results.endpoints[0].requests, 7);
-    assert!(posts[&s.pod(1)].final_post);
+    assert_eq!(posts["0"].results.endpoints[0].requests, 5);
+    assert!(!posts["0"].final_post);
+    assert_eq!(posts["1"].results.endpoints[0].requests, 7);
+    assert!(posts["1"].final_post);
 
     // A reason is stored with the post.
     let body = serde_json::to_vec(&json!({
@@ -602,7 +603,7 @@ async fn ldt_08_results_are_stored_cumulatively_per_pod() {
         .load_posts(&s.ns, DEPLOYMENT, &s.uid)
         .await
         .unwrap();
-    assert_eq!(posts[&s.pod(0)].reason.as_deref(), Some("ModeLeft"));
+    assert_eq!(posts["0"].reason.as_deref(), Some("ModeLeft"));
 }
 
 #[tokio::test]
@@ -836,4 +837,37 @@ async fn ldt_14_no_canary_and_no_ticket_in_logs_series_answers_or_stored_values(
     assert!(series.contains(r#"endpoint="/v1/load/plan""#), "{series}");
     // The bearer tokens are not in the logs either.
     assert!(!logs.contains(&token));
+}
+
+#[tokio::test]
+async fn ldt_08_targets_are_not_ready_before_the_slice_cache_synced() {
+    let s = setup(10_000).await;
+    s.admit(PLAN).await;
+    let token = s.load_token(0);
+    // No listing yet: an empty list would read as `NoTargets`.
+    assert_eq!(get(&s, "targets", &token).await.status, 503);
+    s.slices.replace(vec![]);
+    let answer = get(&s, "targets", &token).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.json()["targets"], json!([]));
+}
+
+#[tokio::test]
+async fn ldt_09_a_replaced_generator_pod_takes_over_the_field_of_its_index() {
+    let s = setup(10_000).await;
+    s.admit(PLAN).await;
+    let first = s.load_token(0);
+    let replacement_pod = format!("{}-0-xzzzz", s.job);
+    let second = s.token(&s.ns, &replacement_pod, LOAD_AUDIENCE);
+    assert_eq!(
+        post(&s, &first, post_body(&s.pod(0), false, 3)).await.status,
+        200
+    );
+    assert_eq!(
+        post(&s, &second, post_body(&replacement_pod, false, 4)).await.status,
+        200
+    );
+    let posts = s.api.store.load_posts(&s.ns, DEPLOYMENT, &s.uid).await.unwrap();
+    assert_eq!(posts.keys().map(String::as_str).collect::<Vec<_>>(), ["0"]);
+    assert_eq!(posts["0"].results.endpoints[0].requests, 4);
 }

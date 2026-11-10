@@ -91,6 +91,7 @@ impl RunIndex {
 #[derive(Default)]
 pub struct SliceCache {
     slices: RwLock<BTreeMap<(String, String), EndpointSlice>>,
+    synced: std::sync::atomic::AtomicBool,
 }
 
 impl SliceCache {
@@ -106,7 +107,7 @@ impl SliceCache {
             .insert(key, slice);
     }
 
-    /// Replaces the whole content after a (re)list.
+    /// Replaces the whole content after a (re)list and marks the cache synced.
     pub fn replace(&self, slices: impl IntoIterator<Item = EndpointSlice>) {
         self.slices
             .write()
@@ -115,6 +116,16 @@ impl SliceCache {
         for slice in slices {
             self.apply(slice);
         }
+        self.mark_synced();
+    }
+
+    pub fn mark_synced(&self) {
+        self.synced.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the first listing arrived: before it, an empty target list says nothing.
+    pub fn is_synced(&self) -> bool {
+        self.synced.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
