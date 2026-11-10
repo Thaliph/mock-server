@@ -2098,8 +2098,8 @@ random numbers it hands to the draw.
   `target` and `message`. Access logs (one line per exchange, `target` = `access`) and
   component logs. Level from `MIMIC_LOG` (`tracing` filter syntax, default `info`).
 - **Metrics**: OpenMetrics text format (Prometheus-compatible) on the admin port at `/metrics`. Every component exposes
-  `mimic_build_info{component,version} 1` and `mimic_log_lines_dropped_total` (§4.1). The
-  sidecar exposes RED metrics with bounded cardinality:
+  `mimic_build_info{component,version} 1` and `mimic_log_lines_dropped_total` (§4.1), and from
+  #385 the `process_*` metrics below. The sidecar exposes RED metrics with bounded cardinality:
 
   | Metric | Type | Labels |
   |---|---|---|
@@ -2167,6 +2167,46 @@ random numbers it hands to the draw.
   `mimic_http_request_duration_seconds`), `mimic_load_in_flight`, `mimic_load_missed_total`
   and `mimic_load_targets` (verified targets). `endpoint` is `<METHOD> <template>` of the plan,
   at most `MIMIC_LOAD_MAX_ENDPOINTS` values; one process serves one run.
+
+  **Dashboard metrics** (#385). They add no `MIMIC_*` variable, and no label value comes from
+  traffic, a Kubernetes object or a secret: every label below is a fixed enumeration.
+
+  | Metric | Component | Type, help text and meaning | Labels |
+  |---|---|---|---|
+  | `process_cpu_seconds_total` | all with an admin listener (controller, sidecar, `mimic-load`) | counter, "Total user and system CPU time spent in seconds" | — |
+  | `process_resident_memory_bytes` | same | gauge, "Resident memory size in bytes" | — |
+  | `process_open_fds` | same | gauge, "Number of open file descriptors" | — |
+  | `process_max_fds` | same | gauge, "Maximum number of open file descriptors" (the soft `RLIMIT_NOFILE`) | — |
+  | `process_start_time_seconds` | same | gauge, "Start time of the process since unix epoch in seconds" | — |
+  | `mimic_webhook_admissions_total` | controller (F1, INJ-09) | counter, "Pod admissions by result and reason" | `result` (`injected`, `skipped`, `error`), `reason`: with `injected` `ok`; with `skipped` the skip reasons of §7.1 (`host-network`, `unsupported-owner`, `port-conflict`, `uid-conflict`, `name-conflict`) and the untouched ones (`excluded-namespace`, `pod-disabled`, `not-selected`, `already-injected`); with `error` `too-large`, `unreadable`, `malformed`, `cache-not-synced`, `seed-not-loaded`, `ca-not-loaded`, `root`, `patch` |
+  | `mimic_webhook_certificate_expiry_timestamp_seconds` | controller (F1, INJ-11) | gauge, "Expiry of the webhook serving certificate, in seconds since the Unix epoch": `notAfter` of the loaded serving certificate, 0 before one is loaded | — |
+  | `mimic_webhook_admission_duration_seconds` | controller | histogram, "Time to answer one admission request": from the request head read on `/inject/*` to the response handed to the HTTP codec (body read, decision, patch), for every answered request, `4xx` included; the TLS handshake is not included; buckets 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 | — |
+  | `mimic_store_deployments` | controller | gauge, "Deployments with data in the store at the last status pass": members of `mimic:v1:workloads` (all namespaces) counted by each status pass (§7.4), 0 before the first | — |
+  | `mimic_limit` | controller, sidecar | gauge, "Configured limit, by name": the parsed value of a `MIMIC_*` variable (sizes in bytes), set at start, constant for the process; `name` is the variable without `MIMIC_`, lower case, with `_bytes` added to sizes | `name`: controller `webhook_max_connections`, `sidecar_api_max_report_bytes`, `sidecar_api_body_budget_bytes`, `sidecar_api_max_egress_bytes`, `sidecar_api_egress_budget_bytes`, `store_max_deployments` (per namespace), `store_max_endpoints`, `store_max_authorities`, `store_sample_budget_bytes`, `load_max_runs` (0: disabled), `load_max_namespace_runs`, `load_store_budget_bytes`; sidecar `max_connections` (per direction), `metrics_max_authorities`, `discovery_max_endpoints` (per direction), `discovery_max_authorities`, `discovery_sample_budget_bytes`, `discovery_capture_budget_bytes`, `discovery_queue`, `egress_max_bytes`, `mock_max_pending` |
+  | `mimic_proxy_active_connections` | sidecar | gauge, "Client connections open": connections accepted on the direction's listeners and not closed yet, the count `MIMIC_MAX_CONNECTIONS` bounds (§4.1), tunnels included | `direction` |
+  | `mimic_proxy_overhead_seconds` | sidecar | histogram, "Time spent in the sidecar per HTTP exchange, upstream wait excluded": from the request head handed over by the client codec to the request handed to the upstream connection, plus from the response head handed over by the upstream connection to the response handed to the client codec; in mock, from the request handed over (with the body bytes the match reads, §8) to the answer handed back, minus the simulated latency. Observed for every exchange answered with a response head (by the destination or the mock, `599` included); tunnels, `unframed` and `rejected` exchanges are not. Connection setup (connect, TLS handshakes), body streaming and socket writes are not included. Buckets 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1 | `direction` |
+  | `mimic_discovery_last_new_endpoint_timestamp_seconds` | sidecar | gauge, "Time an endpoint was last added to the template tree": time of the last recorded exchange whose endpoint (method and template; outbound, also its authority scope, §6.1) was not in the tree before it, a template made by absorption (§6) included; 0 before. The tree shape survives pushes (§7.2), so an endpoint seen again after a push is not new | `direction` |
+  | `mimic_mock_mode_switches_total` | sidecar (F10) | counter, "Mode changes applied": +1 each time the sidecar applies a mode other than the one it had (§8 "Mode state"); the mode taken at start, a change of factor only and a change not applied (state file not written) are not counted | `to` (`mock`, `discovery`) |
+  | `mimic_mock_latency_factor` | sidecar (F10) | gauge, "Latency factor held": the factor of §8 as a decimal (hundredths / 100, e.g. 1.5), set at start and at each change, in both modes (it applies only in mock) | — |
+  | `mimic_load_planned_rate` | `mimic-load` (F11) | gauge, "Requests per second the schedule asks for now": in the open model, the pod's rate × elapsed / `rampUp` during `rampUp`, the pod's rate after it until `duration`, 0 before the pod's schedule starts and after `duration` (`load::schedule`, computed at each scrape from the elapsed monotonic time); the sum over a run's pods is the run's planned rate. Not exposed in the closed model (no rate is planned) | — |
+
+  The `process_*` names and help texts are those of the Prometheus client libraries, without the
+  `mimic_` prefix and without labels. They are read from `/proc/self/stat`, `/proc/self/limits`,
+  `/proc/self/fd` and the `btime` of `/proc/stat` at each scrape, never from `environ`,
+  `cmdline` or memory maps; outside Linux, or when a read fails, the family is left out of that
+  scrape (one DEBUG line `process metrics unavailable` with `file`). `mimic_limit` and
+  `mimic_store_deployments` hold the same value on every controller replica: dashboards read
+  them with `max`, like `mimic_load_active_runs`.
+
+  **Exporter metrics used** (#378, #384): the Valkey dashboard reads only these series of the
+  Valkey exporter, so that the dashboard check can verify every name: `redis_up`,
+  `redis_uptime_in_seconds`, `redis_instance_info`, `redis_memory_used_bytes`,
+  `redis_memory_max_bytes`, `redis_mem_fragmentation_ratio`, `redis_evicted_keys_total`,
+  `redis_expired_keys_total`, `redis_commands_processed_total`,
+  `redis_commands_duration_seconds_total{cmd}`, `redis_connected_clients`,
+  `redis_rejected_connections_total`, `redis_db_keys{db}`, `redis_aof_last_write_status`.
+  `redis_db_keys` is the total of the database (mimic is its only user); per-prefix counts would
+  need `--check-keys`, which puts key names into labels, and are not used.
 
   `authority` is the normalised target authority of §4.1 (lower case, no trailing dot, default
   port removed, `(invalid)` when it is not a host name or IP literal; an HTTP/1 `Host` value or
@@ -2440,6 +2480,11 @@ it sets. The pod's index and the Job's pod count come from the load API (§7.8).
 
 ### 11.1 Accepted limits
 
+- (#385) Whoever can reach an admin port (§9) reads the process's resource use, its configured
+  limits (`mimic_limit`) and the time its discovery last found a new endpoint. They are numbers
+  under fixed labels, no name or value of the traffic, and the RED counters already show as
+  much activity; `mimic_proxy_overhead_seconds` gives no timing that the response time does
+  not already give a client.
 - While the relay holds the client's bytes behind an upgrade or `CONNECT` request, or at the
   read-ahead of 32 requests, it does not read the client socket, so a bare client FIN is not
   seen until the destination answers or closes, or the client resets: the destination holds
@@ -3075,6 +3120,23 @@ with no `mimic-load-run` header unchanged).
 | LDT-18 | **C.** A fuzz target feeds reports accepted by `Report::from_json` and arbitrary specs to the plan and request builders: no panic, and every request satisfies the LDT-02 property. Same CI schedule as DSC-23. |
 | LDT-19 | **I** (controller). Read API (§7.5): `GET /v1/workloads/<ns>/<dep>/loadtests` lists the stored runs (uid, name, phase, reason, start, end, total) newest first; `…/loadtests/<uid>` answers the run with its stored summary (per-endpoint results); `404` for an unknown uid, `400` for a uid outside the UUID grammar; headers and loopback rules of §7.5. **E.** The deployment page shows a "Load tests" table filled from these routes (pinned headless Chromium, §12.7). |
 | LDT-20 | **U.** Load ticket and injection label (§7.8): a ticket signed with a deployment's root verifies with its root certificate's public key and yields the payload; one byte changed in the payload or signature, another deployment's root, an `exp` in the past or a ticket without the `v1.` prefix do not verify; the signed bytes start with `mimic-load-ticket\0`; the same inputs give a ticket that verifies (ECDSA signatures are randomised, the payload is canonical). The injection patch also adds the label `mimic.platform.io/deployment: <deployment>` (INJ-03 amended), creating `metadata.labels` when absent and replacing a value the pod set. |
+
+### 12.13 Monitoring (#378)
+
+Levels as in §12.2. The chart criteria are checked by `scripts/check-chart.sh` on rendered output.
+
+| ID | Criterion |
+|---|---|
+| MON-04 | **I** (`mimic-runtime`, Linux). The `/metrics` of an admin listener holds `process_cpu_seconds_total` (counter), `process_resident_memory_bytes` > 0, `process_open_fds`, `process_max_fds` equal to the soft `RLIMIT_NOFILE`, and `process_start_time_seconds` between the test start minus 60 s and now, each with the §9 help text, no label and no `mimic_` prefix; `process_open_fds` grows by 1 while the test holds one more open file; `process_cpu_seconds_total` does not decrease between two scrapes around a busy loop; a canary set in the process environment and in its arguments is not in the output. The `mimic_*` part of the output is unchanged (FND-03 still passes). |
+| MON-05 | **I** (controller). After N requests to `/inject/*` (injected, skipped, untouched, `400` malformed, `413` too large, `405`), `mimic_webhook_admission_duration_seconds_count` is N, with exactly the §9 buckets and no label. **U.** Every reason the webhook can count (each skip and untouched reason of `mimic-core`, each error reason of the webhook) is in the §9 list of its `result`, and the list has no other value. |
+| MON-06 | **U** (next to the configuration of each binary). The `mimic_limit` series built from a parsed configuration are exactly the §9 names of that component, sorted, with the parsed values (`MIMIC_SIDECAR_API_EGRESS_BUDGET=16Mi` gives `sidecar_api_egress_budget_bytes` 16777216, `MIMIC_MAX_CONNECTIONS=100` gives `max_connections` 100), the defaults of §10 when unset, and equal outputs for equal inputs. **I** (sidecar). The sidecar's `/metrics` holds them, unchanged across two scrapes. |
+| MON-07 | **I** (controller, test Valkey). `mimic_store_deployments` is 0 before the first status pass; after pushes for 3 deployments in 2 namespaces and one status pass it is 3; after one of them is removed from `mimic:v1:workloads` and the next pass, it is 2. |
+| MON-08 | **I** (sidecar). With 3 inbound and 2 outbound keep-alive connections open (one of them an opaque TCP tunnel), `mimic_proxy_active_connections` is 3 and 2 per `direction`; within 1 s after they are closed both are 0; with `MIMIC_MAX_CONNECTIONS=2` and 4 inbound connections attempted, the inbound value never exceeds 2. |
+| MON-09 | **I** (sidecar). Through an upstream that waits 200 ms before its response head, 20 inbound and 20 outbound HTTP/1.1 exchanges and 20 HTTP/2 streams: `mimic_proxy_overhead_seconds_count` per `direction` equals the exchanges answered, every observation is at most 0.1 (the `le="0.1"` bucket equals the count) while `mimic_http_request_duration_seconds` observes at least 0.2 for each; an opaque tunnel and an `unframed` exchange add no observation. In mock with an egress sample whose latency is 200 ms and factor 1, the overhead of each mocked exchange is also at most 0.1. |
+| MON-10 | **U.** The recorder (§6) tells whether a recorded exchange added an endpoint: true for the first `GET /a`, false for a second `GET /a`, true for `POST /a`, true for the exchange whose literal makes `/u/{u_id}` by absorption, false for an exchange that is not recorded (`not_found`, `invalid`, `load`); outbound, the same path under a new authority scope is new. **I** (sidecar, fake sidecar API). `mimic_discovery_last_new_endpoint_timestamp_seconds` is 0 per `direction` at start, set to a time between the request and its scrape after the first inbound exchange (outbound still 0), unchanged by a repeat of the same endpoint before and after an acknowledged push. |
+| MON-11 | **I** (sidecar, fake sidecar API). Started with `MIMIC_MODE=discovery` and `MIMIC_MOCK_LATENCY_FACTOR=1.5`, `mimic_mock_latency_factor` is 1.5 and no `mimic_mock_mode_switches_total` series is above 0; pull answers `mock`, `mock`, `mock` with factor 2, then `discovery` give `{to="mock"}` 1 and `{to="discovery"}` 1, and the factor 2 from the third answer on; a restart with the state file holding `mock` counts no switch; with the state directory read-only, a pull answer `mock` counts nothing and the mode stays `discovery` (`mimic_mock_mode` 0). |
+| MON-12 | **U.** `load::schedule` planned rate: open model, pod rate 100, `rampUp` 10 s, duration 20 s gives 0 at the start, 50 at 5 s, 100 from 10 s to 20 s, 0 after 20 s; rate 1001 over 3 pods gives 334, 334 and 333 at full rate; the closed model has none. **I** (`mimic-load`, fake load API). During an open-model run `mimic_load_planned_rate` is above 0 and at most the pod's rate; in a closed-model run the family is absent. |
+| MON-13 | **E** (kind, folded into `scripts/e2e.sh` section `mon_02`). One scrape of the controller has a `# TYPE` line for every controller metric of the #385 table of §9 and a `mimic_limit` series for each controller name; one scrape of an injected sidecar has the same for the sidecar, `process_open_fds` included although the sidecar is non-dumpable (TLS-16); one scrape of the Valkey exporter has every name of the exporter list of §9. |
 
 ## 13. Test strategy
 
