@@ -104,6 +104,9 @@ networkPolicy:
   # Sources of the sidecar API port (controller.sidecarApiPort), as NetworkPolicy `from` peers.
   # Empty: any source, since injected pods can be in any namespace. Set it to narrow the port.
   sidecarApiFrom: []
+  # The API server's address as an ipBlock CIDR, for the egress of the bundled Prometheus and Grafana to TCP 443
+  # and 6443 (spec §10.7, #379). Empty: any destination on those ports, since the address depends on the cluster.
+  apiServerCIDR: ""
 
 # Load tests of a deployment in mock mode (spec §7.8, F11). Off by default: it adds the
 # MimicLoadTest CRD, Job and EndpointSlice RBAC and two ValidatingAdmissionPolicies. Needs image.digest:
@@ -114,8 +117,8 @@ loadTest:
   # A CNI without NetworkPolicy support ignores it (spec §11.1).
   networkPolicy: true
   # NetworkPolicy peers allowed to scrape the generator's admin port (15100). Empty: none, unless
-  # metrics.podMonitor.enabled, which admits the namespace peer of networkPolicy.metricsNamespaceSelector
-  # (the release namespace when that is empty). A set value wins (spec §10.7).
+  # metrics.podMonitor.enabled or monitoring.prometheus.enabled, which admit the namespace peer of
+  # networkPolicy.metricsNamespaceSelector (the release namespace when that is empty). A set value wins (spec §10.7).
   metricsFrom: []
   # DNS of the generator's controller name lookups: the namespace and the labels of the DNS pods.
   dnsSelector:

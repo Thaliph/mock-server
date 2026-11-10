@@ -1,0 +1,61 @@
+{{- if and .Values.monitoring.prometheus.enabled .Values.networkPolicy.enabled }}
+# The NetworkPolicy of the bundled Prometheus (spec §10.7, §11, MON-20, #379). Its HTTP API has no authentication and
+# reads every series, so it admits no ingress until Grafana (a later step) is rendered; `kubectl port-forward` is not
+# blocked by a NetworkPolicy (§11.1). Egress: the scrape of the pods (15100 in the namespaces of its jobs), the
+# controller (8081), the Valkey exporter (9121, with valkey.metrics) and the API server (443, 6443). No DNS: it
+# scrapes pod IPs.
+{{- $controller := include "mimic.scrapeTarget" (dict "root" . "job" (printf "%s-controller" .Release.Name)) | fromJson }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-prometheus
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mimic-prometheus
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    # The scrape of the injected and generator pods: every namespace, or the namespaces of monitoring.prometheus.namespaces
+    # and the release namespace (which holds the controller and Valkey).
+    - to:
+        {{- if .Values.monitoring.prometheus.namespaces }}
+        {{- range $ns := uniq (sortAlpha (concat .Values.monitoring.prometheus.namespaces (list .Release.Namespace))) }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns | quote }}
+        {{- end }}
+        {{- else }}
+        - namespaceSelector: {}
+        {{- end }}
+      ports:
+        - {port: 15100, protocol: TCP}
+    # The controller's pods (the scrape reaches them by pod, not through the Service), in the release namespace.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml $controller.matchLabels | nindent 14 }}
+      ports:
+        - {port: 8081, protocol: TCP}
+    {{- if .Values.valkey.metrics.enabled }}
+    {{- $valkey := include "mimic.scrapeTarget" (dict "root" . "job" "mimic-valkey") | fromJson }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml $valkey.matchLabels | nindent 14 }}
+      ports:
+        - {port: 9121, protocol: TCP}
+    {{- end }}
+    # The API server, for service discovery: any destination unless networkPolicy.apiServerCIDR names it.
+    - {{- with .Values.networkPolicy.apiServerCIDR }}
+      to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      {{- end }}
+      ports:
+        - {port: 443, protocol: TCP}
+        - {port: 6443, protocol: TCP}
+{{- end }}

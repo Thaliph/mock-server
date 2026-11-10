@@ -33,6 +33,8 @@ lint prometheus.monitors --set monitoring.prometheus.enabled=true --set metrics.
   --set metrics.podMonitor.enabled=true --set valkey.metrics.enabled=true
 lint prometheus.loadTest --set monitoring.prometheus.enabled=true --set loadTest.enabled=true \
   --set image.digest="$digest" --set metrics.podMonitor.enabled=true
+lint prometheus.netpol --set monitoring.prometheus.enabled=true --set valkey.metrics.enabled=true \
+  --set networkPolicy.apiServerCIDR=10.96.0.0/16
 
 # MON-01, default: identical to the golden render (deploy/helm/golden/default.yaml, rendered from main), blank
 # lines aside: helm 3 and helm 4 separate the documents with different blank lines.
@@ -415,5 +417,54 @@ for f in "$tmp/prom-deploy.yaml" "$tmp/prom-rbac-ns.yaml"; do
   fi
 done
 echo "mon_18: no Prometheus rule names secrets, nodes, a subresource or a verb other than list and watch"
+
+# MON-20 (#379, Prometheus part): the NetworkPolicy of the bundled Prometheus. No ingress until Grafana is rendered;
+# egress exactly to 15100, 8081, 9121 (with valkey.metrics) and 443 and 6443; no DNS.
+render --set monitoring.prometheus.enabled=true --set valkey.metrics.enabled=true > "$tmp/np-prom.yaml"
+npp=$(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$tmp/np-prom.yaml")
+[[ -n $npp ]] || fail "mon_20: no NetworkPolicy mimic-prometheus"
+[[ $(yq -r '.spec.policyTypes | join(",")' <<<"$npp") == Ingress,Egress ]] || fail "mon_20: the policy types are not Ingress and Egress"
+[[ $(yq -r '.spec.podSelector.matchLabels["app.kubernetes.io/name"]' <<<"$npp") == mimic-prometheus ]] \
+  || fail "mon_20: the policy does not select the Prometheus pods"
+[[ $(yq -r '.spec.ingress | length' <<<"$npp") == 0 ]] || fail "mon_20: the Prometheus policy admits ingress before Grafana is rendered"
+[[ $(yq -r '[.spec.egress[].ports[].port] | join(",")' <<<"$npp") == "15100,8081,9121,443,6443" ]] \
+  || fail "mon_20: the Prometheus egress ports are not 15100, 8081, 9121, 443 and 6443: $(yq -r '[.spec.egress[].ports[].port] | join(",")' <<<"$npp")"
+[[ $(yq -r '.spec.egress[0].to[0].namespaceSelector | tojson' <<<"$npp") == "{}" ]] \
+  || fail "mon_20: the 15100 egress is not to every namespace"
+[[ $(yq -r '.spec.egress[1].to[0].podSelector.matchLabels["app.kubernetes.io/name"]' <<<"$npp") == mimic-controller ]] \
+  || fail "mon_20: the 8081 egress is not to the controller pods"
+[[ $(yq -r '.spec.egress[2].to[0].podSelector.matchLabels["app.kubernetes.io/name"]' <<<"$npp") == mimic-valkey ]] \
+  || fail "mon_20: the 9121 egress is not to the Valkey pods"
+[[ $(yq -r '.spec.egress[3].to | tojson' <<<"$npp") == null ]] || fail "mon_20: the API server egress has a peer with no apiServerCIDR"
+grep -qE 'secrets|nodes/' <<<"$npp" && fail "mon_20: the Prometheus policy names secrets or nodes/*"
+
+render --set monitoring.prometheus.enabled=true > "$tmp/np-prom-novalkey.yaml"
+[[ $(yq -r '[.spec.egress[].ports[].port] | join(",")' <(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$tmp/np-prom-novalkey.yaml")) == "15100,8081,443,6443" ]] \
+  || fail "mon_20: the Valkey egress is present without valkey.metrics.enabled"
+
+render --set monitoring.prometheus.enabled=true --set networkPolicy.apiServerCIDR=10.96.0.0/16 \
+  --set 'monitoring.prometheus.namespaces[0]=apps' > "$tmp/np-prom-cidr.yaml"
+npc=$(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$tmp/np-prom-cidr.yaml")
+[[ $(yq -r '.spec.egress[-1].to[0].ipBlock.cidr' <<<"$npc") == 10.96.0.0/16 ]] \
+  || fail "mon_20: networkPolicy.apiServerCIDR is not the API server peer"
+[[ $(yq -r '.spec.egress[0].to[] | .namespaceSelector.matchLabels["kubernetes.io/metadata.name"]' <<<"$npc" | sort | paste -sd, -) == "apps,mimic-system" ]] \
+  || fail "mon_20: the 15100 egress does not follow monitoring.prometheus.namespaces"
+
+render --set monitoring.prometheus.enabled=true --set networkPolicy.enabled=false > "$tmp/np-off.yaml"
+[[ -z $(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$tmp/np-off.yaml") ]] \
+  || fail "mon_20: the Prometheus policy is rendered with networkPolicy.enabled false"
+echo "mon_20: the Prometheus NetworkPolicy admits nothing in, and egresses to the scrape, controller, exporter and API server only"
+
+# MON-20 (loadTest.metricsFrom): the bundled Prometheus falls back to the namespace peer as the PodMonitor does; a set value wins.
+render --set loadTest.enabled=true --set image.digest="$digest" --set monitoring.prometheus.enabled=true > "$tmp/load-prom.yaml"
+expr=$(load_expression "$tmp/load-prom.yaml")
+grep -qF '[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"mimic-system"}}}]' <<<"$expr" \
+  || fail "mon_20: loadTest.metricsFrom does not fall back to the release namespace with monitoring.prometheus.enabled"
+render --set loadTest.enabled=true --set image.digest="$digest" --set monitoring.prometheus.enabled=true \
+  --set 'loadTest.metricsFrom[0].podSelector.matchLabels.app=scrape' > "$tmp/load-prom-set.yaml"
+expr=$(load_expression "$tmp/load-prom-set.yaml")
+grep -qF 'variables.ingress[0].from == [{"podSelector":{"matchLabels":{"app":"scrape"}}}]' <<<"$expr" \
+  || fail "mon_20: a set loadTest.metricsFrom does not win over the Prometheus fallback"
+echo "mon_20: loadTest.metricsFrom falls back to the release namespace with the bundled Prometheus, and a set value wins"
 
 echo "chart checks passed"
