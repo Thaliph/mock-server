@@ -2393,14 +2393,10 @@ there is no ACL file.
 
 For a demo or a dev cluster only: a production install brings its own monitoring and uses the
 ServiceMonitor, the PodMonitors and the dashboard ConfigMaps. Both are off by default, and with both
-off the render is the one of MON-01 (MON-14). Prometheus is rendered by the chart's own templates;
-Grafana is the Helm dependency `grafana` (`grafana-community/grafana` 14.0.1 from
-`https://grafana-community.github.io/helm-charts`, `condition: monitoring.grafana.enabled`). `Chart.lock`
-is committed, `charts/` is built with `helm dependency build` and git-ignored, and the sha256 of the
-fetched archive must equal the one in `deploy/helm/mimic/charts.sha256`. A Helm subchart reads its values
-under its own name, so the Grafana settings live under the top-level `grafana:` key and only the switch
-under `monitoring.grafana`. Alerting, long-term storage, ingress and the dashboards themselves (#380 to
-#384) are out of scope. The bundled Prometheus does not scrape the kubelet or cAdvisor, which needs
+off the render is the one of MON-01 (MON-14). Both are rendered by the chart's own templates, with no
+Helm dependency: the chart has no `dependencies`, no `Chart.lock` and no `charts/`, so a render needs no
+`helm dependency build` and the published chart vendors no third-party archive. Alerting, long-term
+storage, ingress and the dashboards themselves (#380 to #384) are out of scope. The bundled Prometheus does not scrape the kubelet or cAdvisor, which needs
 `nodes/proxy`; resource use comes from the `process_*` series of mimic (#385).
 
 | Value | Default | Meaning |
@@ -2412,8 +2408,12 @@ under `monitoring.grafana`. Alerting, long-term storage, ingress and the dashboa
 | `monitoring.prometheus.storageSizeLimit` | `1Gi` | `sizeLimit` of the `emptyDir` that holds the TSDB. There is no persistent volume: the data are lost when the pod restarts. |
 | `monitoring.prometheus.resources` | requests 100m CPU and 256Mi memory, limit 512Mi memory | Resources of the Prometheus container. |
 | `monitoring.prometheus.namespaces` | `[]` | Namespaces of the sidecar and load jobs. Empty: every namespace, through a ClusterRole. A list: those namespaces and the release namespace, through a Role and a RoleBinding in each (each namespace must exist at install). |
-| `monitoring.grafana.enabled` | `false` | The `condition` of the Grafana dependency, and the switch of the chart's own Grafana objects: the Secret `<release>-grafana-admin`, the Role and RoleBinding `<release>-grafana-dashboards` and, with `networkPolicy.enabled`, the NetworkPolicy `<release>-grafana`. Grafana can be enabled without the bundled Prometheus; its datasource still points to `<release>-prometheus` unless `grafana.datasources` is overridden. |
-| `grafana.*` | see below | Values of the subchart. The chart ships the settings listed below; a user may override them, MON-19 checks the shipped ones. |
+| `monitoring.grafana.enabled` | `false` | Renders `<release>-grafana`: a Deployment (1 replica, `Recreate`) with the containers `grafana` and `dashboards` (the k8s-sidecar), a Service `ClusterIP` on 3000 only, the ConfigMaps `<release>-grafana` (`grafana.ini`) and `<release>-grafana-provisioning` (the datasource and the dashboards provider), the Secret `<release>-grafana-admin`, a ServiceAccount, the Role and RoleBinding `<release>-grafana-dashboards` and, with `networkPolicy.enabled`, a NetworkPolicy (§11). Grafana can be enabled without the bundled Prometheus (see `datasourceUrl`). |
+| `monitoring.grafana.image` | `docker.io/grafana/grafana:13.2.4-distroless@sha256:ae3d…` | Pinned by digest in `images/Dockerfile` (stage `grafana`, checked by `scripts/check-pins.sh`). Built 2026-10-12, outside the 14-day cooldown. |
+| `monitoring.grafana.sidecarImage` | `quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:092d…` | The dashboard sidecar. Pinned by digest in `images/Dockerfile` (stage `k8s-sidecar`, checked by `scripts/check-pins.sh`). Built 2026-10-08. |
+| `monitoring.grafana.datasourceUrl` | `""` | URL of the provisioned Prometheus datasource. Empty: `http://<release>-prometheus:9090`, the bundled Prometheus, also when it is off. |
+| `monitoring.grafana.resources` | requests 50m CPU and 128Mi memory, limit 256Mi memory | Resources of the `grafana` container. |
+| `monitoring.grafana.sidecarResources` | requests 10m CPU and 32Mi memory, limit 64Mi memory | Resources of the `dashboards` container. |
 | `networkPolicy.apiServerCIDR` | `""` | The `ipBlock` of the API server in the egress rules of Prometheus and Grafana (TCP 443 and 6443). Empty: any destination on those two ports, since the API server's address depends on the cluster. |
 
 Prometheus runs with exactly the arguments `--config.file=/etc/prometheus/prometheus.yml`,
@@ -2448,41 +2448,41 @@ ClusterRoleBinding `<release>-prometheus`, or a Role and a RoleBinding per names
 `monitoring.prometheus.namespaces` is set. The controller is discovered as pods, not through its
 Service, so neither `services`, `endpoints` nor `endpointslices` is granted.
 
-The chart's Grafana values (subchart 14.0.1):
+The Grafana Deployment:
 
-- Images: `image.sha` is the digest of `docker.io/grafana/grafana:13.2.4-distroless` (`sha256:ae3d…`,
-  stage `grafana` of `images/Dockerfile`), `sidecar.image.sha` the digest of
-  `quay.io/kiwigrid/k8s-sidecar:2.14.1` (`sha256:092d…`, stage `k8s-sidecar`); both checked by
-  `scripts/check-pins.sh`.
-- Admin: `admin.existingSecret: "{{ .Release.Name }}-grafana-admin"`. The chart renders that Secret with
-  `admin-user: admin` and a 32-character `randAlphaNum` `admin-password`, kept across upgrades by
-  `lookup` as the Valkey Secret is. The password is never a value, an argument or a log field.
-- `grafana.ini`: `analytics.reporting_enabled: false`, `analytics.check_for_updates: false`,
-  `analytics.check_for_plugin_updates: false`, `news.news_feed_enabled: false`,
-  `plugins.preinstall_disabled: true`, `auth.anonymous.enabled: false`, `security.disable_gravatar: true`,
-  `log.mode: console`, `log.console.format: json`; `plugins: []`. Nothing in Grafana calls the internet.
-- `datasources`: one provisioned datasource, `type: prometheus`, `uid: mimic-prometheus` (the dashboards of
-  #380 to #384 refer to it), `url: http://{{ .Release.Name }}-prometheus:9090`, `access: proxy`,
-  `isDefault: true`, `editable: false`.
-- Dashboard sidecar: `sidecar.dashboards.enabled: true`, `label: grafana_dashboard`, `labelValue: "1"`,
-  `resource: configmap`, `searchNamespace` unset (the release namespace only); resources requests 10m CPU
-  and 32Mi memory, limit 64Mi.
-- RBAC: `rbac.create: false`. The upstream Role of the dashboard sidecar grants `configmaps` **and
-  `secrets`**, which would let Grafana read the Valkey password. The chart renders its own Role
-  `<release>-grafana-dashboards` (`get`, `list`, `watch` on `configmaps` in the release namespace) and a
-  RoleBinding to the Grafana ServiceAccount (its name follows the subchart's `grafana.fullname` rule).
-- Pods: `securityContext` and `containerSecurityContext` (Grafana and the sidecar) with `runAsNonRoot`,
-  `runAsUser` 472, a read-only root filesystem, no privilege escalation, `drop: [ALL]`, `RuntimeDefault`;
-  `enableServiceLinks: false`; `persistence.enabled: false` (the Grafana database is an emptyDir);
-  `initChownData.enabled: false`; `testFramework.enabled: false`; `service.type: ClusterIP`;
-  `ingress.enabled: false` and no route or listener set; `networkPolicy.enabled: false` (the chart's own
-  NetworkPolicy replaces it); resources requests 50m CPU and 128Mi memory, limit 256Mi.
+- Admin: the Secret `<release>-grafana-admin` holds `admin-password`, 32 `randAlphaNum` characters, kept
+  across upgrades by `lookup` as the Valkey Secret is (a render without a cluster draws a new one, §11.1).
+  It is mounted read-only into the `grafana` container only, which reads it with
+  `GF_SECURITY_ADMIN_PASSWORD__FILE`; the user is `admin` (`security.admin_user`). The password is never a
+  value, an argument, an env value or a log field.
+- `grafana.ini`: `analytics.reporting_enabled = false`, `analytics.check_for_updates = false`,
+  `analytics.check_for_plugin_updates = false`, `news.news_feed_enabled = false`,
+  `plugins.preinstall_disabled = true`, `auth.anonymous.enabled = false`, `security.disable_gravatar =
+  true`, `users.allow_sign_up = false`, `log.mode = console`, `log.console.format = json`. No plugin is
+  installed. Nothing in Grafana calls the internet.
+- Provisioning: one datasource, `type: prometheus`, `uid: mimic-prometheus` (the dashboards of #380 to
+  #384 refer to it), the URL of `datasourceUrl`, `access: proxy`, `isDefault: true`, `editable: false`; one
+  dashboards provider of type `file` on `/tmp/dashboards`, `updateIntervalSeconds: 30`,
+  `allowUiUpdates: false`.
+- Dashboard sidecar (`dashboards` container, k8s-sidecar): env `LABEL=grafana_dashboard`, `LABEL_VALUE=1`,
+  `RESOURCE=configmap`, `NAMESPACE=<release namespace>`, `METHOD=WATCH`, `FOLDER=/tmp/dashboards`, and no
+  `REQ_URL`: it only writes the files, which the provider picks up, so it never calls Grafana and holds no
+  Grafana credential.
+- Token: `automountServiceAccountToken: false` on the pod; a projected volume (service account token,
+  `kube-root-ca.crt`, the namespace) is mounted at `/var/run/secrets/kubernetes.io/serviceaccount` in the
+  `dashboards` container only, so the `grafana` container has no Kubernetes token.
+- RBAC: the Role `<release>-grafana-dashboards` (`get`, `list`, `watch` on `configmaps` in the release
+  namespace, nothing else) and its RoleBinding to the ServiceAccount `<release>-grafana`.
+- Security context of both containers: `runAsNonRoot`, `runAsUser` and `runAsGroup` 472 (`grafana`) and
+  65534 (`dashboards`), a read-only root filesystem, no privilege escalation, `drop: [ALL]`,
+  `RuntimeDefault`; `fsGroup` 472; `enableServiceLinks: false`. Writable paths are emptyDirs:
+  `/var/lib/grafana` (the database: lost on restart) and `/tmp/dashboards` (shared by the two containers).
+  Probes: `/api/health` on 3000. A change of a ConfigMap rolls the pod through a checksum annotation.
 
-Dependabot has an entry `package-ecosystem: helm` on `/deploy/helm/mimic` with the 14-day cooldown, and
-`scripts/check-cooldown.py` also reads `deploy/helm/mimic/Chart.lock`: a chart version that a change adds
-or bumps must have been `created` in its repository index at least 14 days before. A bump of the Grafana
-chart updates `Chart.yaml`, `Chart.lock` and `charts.sha256` together. The published chart vendors the
-Grafana archive (`helm package` after `helm dependency build`).
+Pins and updates: the three images are stages of `images/Dockerfile` (`prometheus`, `grafana`,
+`k8s-sidecar`), as Valkey and the exporter are. Dependabot's existing `docker` entry on `/images` (14-day
+cooldown) proposes their bumps from the `FROM` lines; `scripts/check-pins.sh` fails until `values.yaml`
+carries the same reference, so a bump PR updates both. No new Dependabot entry and no new cooldown check.
 
 ## 11. Security baseline
 
@@ -2849,13 +2849,14 @@ Grafana archive (`helm package` after `helm dependency build`).
   (RBAC `pods/portforward` in the release namespace) bypasses it by design: it is how the demo is
   reached.
 - (#379) **Grafana has one admin user** and no SSO. Its password is in the Secret
-  `<release>-grafana-admin` and in the env of the Grafana and dashboard sidecar containers
-  (whoever reads that Secret or execs into the pod has it). A render without a cluster (`helm
-  template`, GitOps tools) cannot `lookup` and draws a new password each time, as for Valkey.
+  `<release>-grafana-admin`, mounted as a file in the `grafana` container (whoever reads that
+  Secret or execs into that container has it). A render without a cluster (`helm template`,
+  GitOps tools) cannot `lookup` and draws a new password at each render, which rotates it at each
+  sync and restarts Grafana, as for Valkey.
   The Grafana database is an emptyDir: users, preferences and edited dashboards are lost on restart.
-- (#379) The dashboard sidecar (and so the Grafana pod, which shares the token) can read every
-  ConfigMap of the release namespace, not only the labelled ones: RBAC cannot filter by label.
-  The chart puts no secret in a ConfigMap.
+- (#379) The dashboard sidecar can read every ConfigMap of the release namespace, not only the
+  labelled ones: RBAC cannot filter by label. The chart puts no secret in a ConfigMap, and the
+  token is mounted in the sidecar container only.
 - (#379) The bundled Prometheus keeps 24 hours on an emptyDir and runs one replica: data are lost
   on restart, there is no high availability. Its image (`quay.io/prometheus/prometheus`) is built
   on busybox, not distroless (upstream ships no distroless image), so it holds a shell.
@@ -2864,8 +2865,9 @@ Grafana archive (`helm package` after `helm dependency build`).
 - (#379) The NetworkPolicies of Prometheus and Grafana are checked as rendered objects only (MON-20):
   kind's default CNI does not enforce them, so their reachability is not tested end to end (follow-up:
   an enforcing CNI in the e2e).
-- (#379) The published chart vendors the Grafana chart archive, pinned by version and sha256; it is
-  used only with `monitoring.grafana.enabled`.
+- (#379) The Prometheus and Grafana templates are the chart's own: their upgrades (new flags,
+  configuration changes of a major version) are carried by hand with the image bump, which
+  Dependabot proposes and MON-21 tests.
 
 ## 12. Delivery plan
 
@@ -3287,12 +3289,12 @@ Levels as in §12.2. The chart criteria are checked by `scripts/check-chart.sh` 
 | MON-01 | **E** (`helm template`, no cluster). With the defaults, the render with `valkey.existingSecret=golden` is byte-identical to `deploy/helm/golden/default.yaml`, which holds no exporter, ACL Secret or PodMonitor. With `valkey.metrics.enabled` the Valkey pod has the container `exporter`, port 9121 named `metrics`, with exactly the arguments of §10.7, an env of `REDIS_USER` (`mimic-exporter`) and `REDIS_PASSWORD` (`secretKeyRef`) and nothing else, `runAsUser` 65532, `runAsNonRoot`, a read-only root filesystem, `drop: [ALL]` and `RuntimeDefault`; the Valkey container has `--aclfile` and no `--requirepass`; its init container `valkey-acl` reads VALKEY_PASSWORD (the Valkey Secret, `valkey.existingSecret` resolved) and EXPORTER_PASSWORD (`<release>-valkey-exporter`), writes the two hash lines of §10.7 with `umask 0226` (mode 0440) into the in-memory volume `acl`, and refuses an empty password; no line says `nopass`, no Secret holds an ACL file, and the render works with `valkey.existingSecret` set (a render without it reads the chart's own Valkey Secret). The Valkey NetworkPolicy admits 9121 from the release namespace and `networkPolicy.metricsNamespaceSelector` only, and no rule of a new object names `secrets` or `nodes/*`. With `metrics.podMonitor.enabled`, the PodMonitors `<release>-sidecar` (selector `mimic.platform.io/deployment` Exists, port `mimic-admin`, target labels `namespace`, `pod`, `deployment`, job `mimic-sidecar`) and `<release>-load` (selector `mimic.platform.io/load-test` Exists, port `mimic-admin`, target label `load_test`, job `mimic-load`) are rendered, with the namespace selector and interval of the values; with `valkey.metrics.enabled` too, `<release>-valkey` selects the Valkey pods on port `metrics` in the release namespace. The default render has none of them. `loadTest.metricsFrom` falls back to the namespace peer of `networkPolicy.metricsNamespaceSelector` (the release namespace when empty) unless set. `helm lint --strict` passes for the default, `podMonitor`, `valkey.metrics`, both, and `loadTest.enabled` with `podMonitor`. |
 | MON-02 | **E** (kind, `scripts/e2e.sh` section `mon_02`). After an upgrade with `valkey.metrics.enabled` (the Valkey pod restarts once): the exporter container is Ready; `/metrics` on 9121, read from a pod of the release namespace, answers `redis_up 1`; with a canary key and value written as the default user, that `/metrics` holds neither the canary value nor the exporter password; as `mimic-exporter`, `INFO` answers and `GET` and `SET` of the canary key fail with `NOPERM`; the controller is ready and its status passes still succeed after the restart (`mimic_status_updates_total{result="ok"}` grows); the sidecar `/metrics` of an injected pod answers to a pod of the release namespace on the port named `mimic-admin` (resolved from the pod spec, MON-03), with `mimic_build_info{component="sidecar"}`. After the same upgrade the controller Deployment rolls out Ready, and an unauthenticated `PING` in the Valkey pod answers `NOAUTH` (the password is never printed). The PodMonitor target labels are not checked here: kind has no Prometheus Operator. |
 | MON-03 | **U.** The injection patch gives the `mimic-sidecar` container exactly one port, `{"name":"mimic-admin","containerPort":15100,"protocol":"TCP"}`, and the generator Job of §7.8 gives its container the same single port; the patch stays byte-identical for the same input. |
-| MON-14 | **E** (`helm template`, `scripts/check-chart.sh`, after `helm dependency build`). Bundled monitoring off (#379): with the defaults the render is still the golden file of MON-01, and the renders with `metrics.podMonitor.enabled`, `valkey.metrics.enabled` or `loadTest.enabled` hold no object named `<release>-prometheus*` or `<release>-grafana*` and no object labelled `app.kubernetes.io/name: grafana`. `Chart.yaml` has exactly one dependency: `grafana`, version `14.0.1`, repository `https://grafana-community.github.io/helm-charts`, condition `monitoring.grafana.enabled`; `Chart.lock` matches it; the sha256 of `charts/grafana-14.0.1.tgz` equals `deploy/helm/mimic/charts.sha256`. `helm lint --strict` passes for Prometheus on, Grafana on, both, and both with `valkey.metrics.enabled`, `metrics.podMonitor.enabled` and `loadTest.enabled`. |
-| MON-15 | **E** (`scripts/check-pins.sh`, `scripts/check-release-chart.sh`, `scripts/test_check_cooldown.py`). The Prometheus, Grafana and k8s-sidecar references of `values.yaml` (`monitoring.prometheus.image`, `grafana.image`, `grafana.sidecar.image`) equal the stages `prometheus`, `grafana` and `k8s-sidecar` of `images/Dockerfile`, and a mismatch fails the check. With both enabled, every `image:` of the render (release chart as published, Grafana subchart included) has `@sha256:`. `.github/dependabot.yml` has a `helm` entry on `/deploy/helm/mimic` with `cooldown: {default-days: 14}`. `check-cooldown.py` given a `Chart.lock` whose bumped chart version was created 3 days before `--now` exits 1, 20 days before exits 0, and an index that cannot be read exits 1. |
+| MON-14 | **E** (`helm template`, `scripts/check-chart.sh`). Bundled monitoring off (#379): with the defaults the render is still the golden file of MON-01, and the renders with `metrics.podMonitor.enabled`, `valkey.metrics.enabled` or `loadTest.enabled` hold no object named `<release>-prometheus*` or `<release>-grafana*`. `Chart.yaml` has no `dependencies`, and there is no `Chart.lock` or `charts/` in the chart directory. `helm lint --strict` passes for Prometheus on, Grafana on, both, and both with `valkey.metrics.enabled`, `metrics.podMonitor.enabled` and `loadTest.enabled`. |
+| MON-15 | **E** (`scripts/check-pins.sh`, `scripts/check-release-chart.sh`). The Prometheus, Grafana and k8s-sidecar references of `values.yaml` (`monitoring.prometheus.image`, `monitoring.grafana.image`, `monitoring.grafana.sidecarImage`) equal the stages `prometheus`, `grafana` and `k8s-sidecar` of `images/Dockerfile`, and a mismatch (a copy with one digest changed) fails the check. With both enabled, every `image:` of the render of the chart as published has `@sha256:`. |
 | MON-16 | **E** (`helm template`, `scripts/check-chart.sh`). With `monitoring.prometheus.enabled`: the Deployment `<release>-prometheus` has 1 replica, strategy `Recreate`, the image of the values, exactly the six arguments of §10.7 (none of the four disabled flags), a checksum annotation that changes when `metrics.podMonitor.interval` changes, `runAsUser` and `runAsGroup` 65534, `runAsNonRoot`, a read-only root filesystem, `allowPrivilegeEscalation: false`, `drop: [ALL]`, `RuntimeDefault`, the resources of the values, an emptyDir with `sizeLimit` `1Gi` mounted at `/prometheus`, the ConfigMap mounted read-only at `/etc/prometheus`, and probes on `/-/ready` and `/-/healthy`; the Service `<release>-prometheus` is `ClusterIP` with the single port 9090. |
 | MON-17 | **E** (`helm template`, `scripts/check-chart.sh`). The jobs of `prometheus.yml` are exactly those of the §10.7 table: names, `role: pod`, label selectors, namespaces (the release namespace; for `mimic-sidecar` and `mimic-load` none, i.e. all, or the set of `monitoring.prometheus.namespaces` plus the release namespace), port names, path `/metrics`, intervals, the drop of `Succeeded` and `Failed` pods, and target labels; `mimic-valkey` is present only with `valkey.metrics.enabled`. Equivalence: with `metrics.serviceMonitor.enabled`, `metrics.podMonitor.enabled` and `valkey.metrics.enabled` also on, for each ServiceMonitor and PodMonitor the job of the same `job` value has the same selector labels, port name, path, interval and the same `(source labels, target label, replacement)` relabel rules as the monitor; a monitor changed in a copy of the chart without its job fails the check. No job scrapes a node, the kubelet, cAdvisor, the API server or Prometheus, and the file has none of `authorization`, `basic_auth`, `bearer_token`, `bearer_token_file`, `oauth2`, `tls_config`. |
-| MON-18 | **E** (`helm template`, `scripts/check-chart.sh`). RBAC: with `monitoring.prometheus.enabled` and `namespaces: []`, one ClusterRole `<release>-prometheus` with the single rule `apiGroups: [""]`, `resources: [pods]`, `verbs: [list, watch]`, bound by a ClusterRoleBinding to the ServiceAccount `<release>-prometheus`, and no Role; with `namespaces: [a, b]`, a Role and a RoleBinding with that rule in `a`, `b` and the release namespace (each once, also when the release namespace is listed) and no ClusterRole. With `monitoring.grafana.enabled`, the subchart renders no Role, ClusterRole or binding; the Role `<release>-grafana-dashboards` in the release namespace has the single rule `get`, `list`, `watch` on `configmaps`, and its RoleBinding names the ServiceAccount the subchart renders (release names `mimic` and `grafana-demo`). Over every render of MON-14, no rule names `secrets`, `nodes`, `nodes/*`, `pods/exec`, `pods/log`, `pods/portforward` or `*`, or a verb other than `get`, `list`, `watch` in a monitoring object. |
-| MON-19 | **E** (`helm template`, `scripts/check-chart.sh`). With `monitoring.grafana.enabled`: the Secret `<release>-grafana-admin` has `admin-user` `admin` and a 32-character alphanumeric `admin-password` (its template reads the existing Secret with `lookup` first, as the Valkey one does; kept across upgrades, MON-21); that password appears in no other rendered object, and the Grafana and sidecar containers refer to the Secret by `secretKeyRef` only. The rendered `grafana.ini` holds every setting of §10.7 (anonymous off, analytics, update checks, news and plugin preinstall off, JSON console logs); there is no plugin; the provisioned datasource has `uid` `mimic-prometheus`, `type` `prometheus`, URL `http://<release>-prometheus:9090` and `editable: false`; the dashboard sidecar has the label `grafana_dashboard`, value `1`, resource `configmap` and no `NAMESPACE` other than the release namespace. The Service is `ClusterIP`; there is no Ingress, HTTPRoute, ListenerSet, PersistentVolumeClaim, test pod or `init-chown-data` container; the images are the pinned digests; every container has `runAsNonRoot`, a read-only root filesystem, `allowPrivilegeEscalation: false`, `drop: [ALL]` and `RuntimeDefault` (Pod Security `restricted`, FND-08). |
+| MON-18 | **E** (`helm template`, `scripts/check-chart.sh`). RBAC: with `monitoring.prometheus.enabled` and `namespaces: []`, one ClusterRole `<release>-prometheus` with the single rule `apiGroups: [""]`, `resources: [pods]`, `verbs: [list, watch]`, bound by a ClusterRoleBinding to the ServiceAccount `<release>-prometheus`, and no Role; with `namespaces: [a, b]`, a Role and a RoleBinding with that rule in `a`, `b` and the release namespace (each once, also when the release namespace is listed) and no ClusterRole. With `monitoring.grafana.enabled`, the Role `<release>-grafana-dashboards` in the release namespace has the single rule `get`, `list`, `watch` on `configmaps`, its RoleBinding names the ServiceAccount `<release>-grafana`, and no ClusterRole or other Role names that ServiceAccount. Over every render of MON-14, no rule names `secrets`, `nodes`, `nodes/*`, `pods/exec`, `pods/log`, `pods/portforward` or `*`, or a verb other than `get`, `list`, `watch` in a monitoring object. |
+| MON-19 | **E** (`helm template`, `scripts/check-chart.sh`). With `monitoring.grafana.enabled`: the Deployment `<release>-grafana` has 1 replica, strategy `Recreate`, exactly the containers `grafana` and `dashboards` with the pinned images of the values, no init container, a checksum annotation that changes with `grafana.ini` and with the provisioning, `automountServiceAccountToken: false`, and the projected token volume mounted in `dashboards` only. The Secret `<release>-grafana-admin` has a 32-character alphanumeric `admin-password` (its template reads the existing Secret with `lookup` first, as the Valkey one does; kept across upgrades, MON-21); it is mounted read-only in `grafana` only, `GF_SECURITY_ADMIN_PASSWORD__FILE` points to it, no env of any container holds or references the password, and the password appears in no other rendered object. The rendered `grafana.ini` holds every setting of §10.7; the provisioned datasource has `uid` `mimic-prometheus`, `type` `prometheus`, URL `http://<release>-prometheus:9090` (the value of `monitoring.grafana.datasourceUrl` when set) and `editable: false`; the provider reads `/tmp/dashboards`; the `dashboards` container has `LABEL=grafana_dashboard`, `LABEL_VALUE=1`, `RESOURCE=configmap`, `NAMESPACE` the release namespace and no `REQ_URL`, `REQ_USERNAME` or `REQ_PASSWORD`. The Service `<release>-grafana` is `ClusterIP` with the single port 3000; there is no Ingress, HTTPRoute or PersistentVolumeClaim; both containers have `runAsNonRoot`, the UIDs of §10.7, a read-only root filesystem, `allowPrivilegeEscalation: false`, `drop: [ALL]`, `RuntimeDefault` and the resources of the values (Pod Security `restricted`, FND-08). |
 | MON-20 | **E** (`helm template`, `scripts/check-chart.sh`). With `networkPolicy.enabled` and Prometheus on, the NetworkPolicy `<release>-prometheus` selects the Prometheus pods with `policyTypes: [Ingress, Egress]`; its ingress is TCP 9090 from the Grafana pods of the release when Grafana is on, and empty otherwise; its egress is exactly TCP 15100 to every namespace (or to the namespaces of `monitoring.prometheus.namespaces` and the release namespace), TCP 8081 to the controller pods, TCP 9121 to the Valkey pods only with `valkey.metrics.enabled`, and TCP 443 and 6443 to `networkPolicy.apiServerCIDR` (no peer when empty). With Grafana on, `<release>-grafana` selects the Grafana pods with both types; ingress TCP 3000 from the release namespace; egress exactly TCP 9090 to the Prometheus pods, UDP and TCP 53 to `loadTest.dnsSelector`, and TCP 443 and 6443 as above. With `networkPolicy.enabled: false` neither is rendered. With `loadTest.enabled` and Prometheus on, `loadTest.metricsFrom` empty falls back to the namespace peer as with `metrics.podMonitor.enabled` (MON-01), and a set value wins. The controller and Valkey NetworkPolicies are the same as with monitoring off. |
 | MON-21 | **E** (kind, `scripts/e2e.sh` section `mon_21`, after `mon_02`). After an upgrade with `monitoring.prometheus.enabled` and `monitoring.grafana.enabled` (and `valkey.metrics.enabled` of `mon_02`), checked from a pod of the release namespace: within 120 s Prometheus `/-/ready` answers 200 and `/api/v1/targets` lists the `<release>-controller`, `mimic-sidecar` and `mimic-valkey` targets with health `up`, the injected pod's target carrying its `namespace`, `pod` and `deployment`; `POST /-/reload` and `POST /api/v1/admin/tsdb/snapshot` answer non-2xx. Grafana `/api/search` without credentials answers 401; with the admin credentials (read from the Secret into a variable, never printed) `/api/datasources/uid/mimic-prometheus/health` answers status `OK`, and a dashboard (uid `mimic-e2e`) put in a ConfigMap labelled `grafana_dashboard: "1"` by the test is listed by `/api/search` within 60 s, while one labelled `"0"` is not. The admin password appears in no log of any container of the release namespace (`grep -qF`, never printed), and a second `helm upgrade` with the same values keeps it (the sha256 of the Secret's data is unchanged). `kubectl auth can-i get secrets` answers `no` as the Prometheus and the Grafana ServiceAccounts, in the release namespace and in the app namespace. |
 
