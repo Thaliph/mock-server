@@ -16,6 +16,7 @@ mod webhook;
 mod webhook_config;
 mod workloads;
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -24,6 +25,8 @@ use std::time::Duration;
 use mimic_runtime::admin::{self, Readiness};
 use mimic_runtime::config::{CommonConfig, ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use webhook_config::WebhookConfig;
 
 const BINARY: &str = "mimic-controller";
@@ -72,6 +75,43 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
     })
 }
 
+/// The `mimic_limit{name}` series (spec §9): the limits of a parsed configuration.
+fn limits(config: &Config) -> BTreeMap<&'static str, u64> {
+    fn n(value: impl TryInto<u64>) -> u64 {
+        value.try_into().unwrap_or(u64::MAX)
+    }
+    let (push, load) = (&config.push, &config.load);
+    BTreeMap::from([
+        ("webhook_max_connections", n(config.webhook.max_connections)),
+        ("sidecar_api_rate", n(push.rate)),
+        ("sidecar_api_max_report_bytes", n(push.max_report)),
+        ("sidecar_api_body_budget_bytes", n(push.body_budget)),
+        ("sidecar_api_max_egress_bytes", n(push.max_egress)),
+        ("sidecar_api_egress_budget_bytes", n(push.egress_budget)),
+        ("store_max_deployments", n(push.store.max_deployments)),
+        ("store_max_endpoints", n(push.store.limits.max_endpoints)),
+        ("store_max_push_endpoints", n(push.max_push_endpoints)),
+        ("store_max_literals", n(push.store.limits.max_literals)),
+        (
+            "store_max_authorities",
+            n(push.store.limits.max_authorities),
+        ),
+        (
+            "store_sample_budget_bytes",
+            n(push.store.limits.sample_budget),
+        ),
+        ("load_max_runs", n(load.max_runs)),
+        ("load_max_namespace_runs", n(load.max_namespace_runs)),
+        ("load_max_pending", n(load.max_pending)),
+        ("load_max_concurrency", n(load.limits.max_concurrency)),
+        ("load_max_rate", n(load.limits.max_rate)),
+        ("load_max_endpoints", n(load.max_endpoints)),
+        ("load_pod_concurrency", n(load.limits.pod_concurrency)),
+        ("load_max_plan_bytes", n(load.max_plan)),
+        ("load_store_budget_bytes", n(load.store_budget)),
+    ])
+}
+
 fn main() -> ExitCode {
     if let Some(code) = mimic_runtime::version_flag(BINARY, VERSION) {
         return code;
@@ -104,6 +144,16 @@ async fn run(config: Config) -> std::io::Result<()> {
     let ui_metrics = ui::UiMetrics::register(metrics.registry_mut());
     let status_metrics = status::StatusMetrics::register(metrics.registry_mut());
     let load_metrics = loadtest::LoadMetrics::register(metrics.registry_mut());
+    // Constant for the process: set once, from the parsed configuration.
+    let limit = Family::<Vec<(String, String)>, Gauge>::default();
+    metrics
+        .registry_mut()
+        .register("limit", "Configured limit, by name", limit.clone());
+    for (name, value) in limits(&config) {
+        limit
+            .get_or_create(&vec![("name".to_string(), name.to_string())])
+            .set(i64::try_from(value).unwrap_or(i64::MAX));
+    }
     let metrics = Arc::new(metrics);
     let webhook = config.webhook;
     tracing::info!(
@@ -288,4 +338,102 @@ async fn run(config: Config) -> std::io::Result<()> {
     );
     tokio::try_join!(webhook_server, api_server, ui_server, admin_server)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(extra: &[(&str, &str)]) -> Config {
+        let required = [
+            ("MIMIC_NAMESPACE", "mimic-system"),
+            ("MIMIC_WEBHOOK_SERVICE", "mimic"),
+            ("MIMIC_WEBHOOK_SECRET", "mimic-webhook-tls"),
+            ("MIMIC_WEBHOOK_CONFIGURATION", "mimic-injector"),
+            ("MIMIC_INJECT_SIDECAR_IMAGE", "sidecar:1"),
+            ("MIMIC_INJECT_INIT_IMAGE", "init:1"),
+            ("MIMIC_TLS_CA_SECRET", "mimic-tls-ca"),
+            ("MIMIC_VALKEY_URL", "redis://127.0.0.1:6379"),
+        ];
+        let env = Env::from_pairs(
+            required
+                .iter()
+                .chain(extra)
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        config(&env).expect("valid configuration")
+    }
+
+    #[test]
+    fn mon_06_the_limits_are_the_spec_names_with_the_parsed_values() {
+        let names = [
+            "load_max_concurrency",
+            "load_max_endpoints",
+            "load_max_namespace_runs",
+            "load_max_pending",
+            "load_max_plan_bytes",
+            "load_max_rate",
+            "load_max_runs",
+            "load_pod_concurrency",
+            "load_store_budget_bytes",
+            "sidecar_api_body_budget_bytes",
+            "sidecar_api_egress_budget_bytes",
+            "sidecar_api_max_egress_bytes",
+            "sidecar_api_max_report_bytes",
+            "sidecar_api_rate",
+            "store_max_authorities",
+            "store_max_deployments",
+            "store_max_endpoints",
+            "store_max_literals",
+            "store_max_push_endpoints",
+            "store_sample_budget_bytes",
+            "webhook_max_connections",
+        ];
+        let defaults = limits(&parsed(&[]));
+        assert_eq!(defaults.keys().copied().collect::<Vec<_>>(), names);
+        assert_eq!(defaults["webhook_max_connections"], 256);
+        assert_eq!(defaults["sidecar_api_max_report_bytes"], 32 << 20);
+        assert_eq!(defaults["store_max_deployments"], 50);
+        assert_eq!(defaults["load_max_runs"], 0);
+        assert_eq!(defaults["load_max_plan_bytes"], 8 << 20);
+        assert_eq!(defaults["load_max_rate"], 2000);
+
+        let set = limits(&parsed(&[
+            ("MIMIC_SIDECAR_API_EGRESS_BUDGET", "16Mi"),
+            ("MIMIC_WEBHOOK_MAX_CONNECTIONS", "100"),
+            ("MIMIC_LOAD_MAX_RUNS", "4"),
+            ("MIMIC_LOAD_MAX_PENDING", "7"),
+            ("MIMIC_LOAD_POD_CONCURRENCY", "64"),
+        ]));
+        assert_eq!(set["sidecar_api_egress_budget_bytes"], 16_777_216);
+        assert_eq!(set["webhook_max_connections"], 100);
+        assert_eq!(set["load_max_runs"], 4);
+        assert_eq!(set["load_max_pending"], 7);
+        assert_eq!(set["load_pod_concurrency"], 64);
+        assert_eq!(limits(&parsed(&[])), defaults);
+    }
+
+    #[test]
+    fn mon_06_the_spec_lists_exactly_these_controller_names() {
+        let spec = include_str!("../../../docs/SPEC.md");
+        let row = spec
+            .lines()
+            .find(|l| l.trim_start().starts_with("| `mimic_limit`"))
+            .expect("the §9 row");
+        let controller = row
+            .split("controller `")
+            .nth(1)
+            .and_then(|t| t.split("; sidecar").next())
+            .expect("controller names");
+        let listed: std::collections::BTreeSet<String> = format!("`{controller}")
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| t.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .map(str::to_string)
+            .collect();
+        let code: std::collections::BTreeSet<String> =
+            limits(&parsed(&[])).keys().map(|k| k.to_string()).collect();
+        assert_eq!(listed, code);
+    }
 }

@@ -9,7 +9,7 @@ use super::gate::{Gate, Target, gate, targets};
 use super::histogram::Histogram;
 use super::job::{JobInput, PolicyInput, job, job_name, network_policy};
 use super::plan::{Endpoint, Plan};
-use super::schedule::{Pacer, Share, pods, sends_due, split, workers};
+use super::schedule::{Pacer, Share, planned_rate, pods, sends_due, split, workers};
 use super::summary::{Class, ErrorKind, PodResults, Stats, summary};
 use super::validate::{Limits, Params, validate};
 use crate::Mode;
@@ -32,6 +32,31 @@ mod schedule_tests {
         assert_eq!(due(3_600_000), due(20_000));
         // Without ramp the rate is constant.
         assert_eq!(sends_due(100, 0, 20_000, 1_000), 100);
+    }
+
+    #[test]
+    fn mon_12_planned_rate_ramps_holds_and_stops() {
+        let at = |t| planned_rate(Some(100), 10_000, 20_000, t).expect("open model");
+        assert_eq!(at(0), 0.0);
+        assert_eq!(at(5_000), 50.0);
+        assert_eq!(at(10_000), 100.0);
+        assert_eq!(at(19_999), 100.0);
+        assert_eq!(at(20_001), 0.0);
+        assert_eq!(at(3_600_000), 0.0);
+        // Without ramp the rate holds from the start.
+        assert_eq!(planned_rate(Some(100), 0, 20_000, 0), Some(100.0));
+    }
+
+    #[test]
+    fn mon_12_the_pods_of_a_run_plan_their_share_and_the_closed_model_none() {
+        let shares = split(300, Some(1001), 100);
+        let rates: Vec<_> = shares
+            .iter()
+            .map(|s| planned_rate(s.rate, 0, 10_000, 5_000))
+            .collect();
+        assert_eq!(rates, vec![Some(334.0), Some(334.0), Some(333.0)]);
+        assert_eq!(planned_rate(None, 0, 10_000, 5_000), None);
+        assert_eq!(split(300, None, 100)[0].rate, None);
     }
 
     #[test]

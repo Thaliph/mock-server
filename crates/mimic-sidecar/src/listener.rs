@@ -15,6 +15,7 @@ use nix::sys::socket::{getsockopt, sockopt};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use socket2::{Domain, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -81,11 +82,13 @@ struct Labels {
     result: &'static str,
 }
 
-/// `mimic_tcp_connections_total{direction,result}` and `mimic_accept_errors_total{direction}`.
+/// `mimic_tcp_connections_total{direction,result}`, `mimic_accept_errors_total{direction}` and
+/// `mimic_proxy_active_connections{direction}`.
 #[derive(Clone, Default)]
 pub struct TunnelMetrics {
     connections: Family<Labels, Counter>,
     accept_errors: Family<DirectionLabel, Counter>,
+    active: Family<DirectionLabel, Gauge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
@@ -106,7 +109,24 @@ impl TunnelMetrics {
             "Failed accept calls on the sidecar listeners",
             tunnel.accept_errors.clone(),
         );
+        // Both series exist from the start, at 0.
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let _ = tunnel.active_gauge(direction);
+        }
+        metrics.registry_mut().register(
+            "proxy_active_connections",
+            "Client connections open",
+            tunnel.active.clone(),
+        );
         tunnel
+    }
+
+    fn active_gauge(&self, direction: Direction) -> Gauge {
+        self.active
+            .get_or_create(&DirectionLabel {
+                direction: direction.as_str(),
+            })
+            .clone()
     }
 
     pub(crate) fn count(&self, direction: Direction, result: Outcome) {
@@ -144,11 +164,13 @@ pub struct Shared {
 pub(crate) struct Active(
     watch::Sender<usize>,
     #[allow(dead_code)] OwnedSemaphorePermit,
+    Gauge,
 );
 
 impl Drop for Active {
     fn drop(&mut self) {
         self.0.send_modify(|n| *n -= 1);
+        self.2.dec();
     }
 }
 
@@ -240,9 +262,11 @@ impl Shared {
         let _ = self.active.subscribe().wait_for(|n| *n == 0).await;
     }
 
-    fn track(&self, slot: OwnedSemaphorePermit) -> Active {
+    fn track(&self, direction: Direction, slot: OwnedSemaphorePermit) -> Active {
         self.active.send_modify(|n| *n += 1);
-        Active(self.active.clone(), slot)
+        let gauge = self.metrics.active_gauge(direction);
+        gauge.inc();
+        Active(self.active.clone(), slot, gauge)
     }
 
     /// Uses `proxy` for the RED metrics instead of unregistered ones.
@@ -506,7 +530,7 @@ pub async fn accept_loop(
         };
         match accepted {
             Ok((stream, _)) => {
-                let active = shared.track(slot);
+                let active = shared.track(direction, slot);
                 tokio::spawn(connection::handle(
                     stream,
                     direction,

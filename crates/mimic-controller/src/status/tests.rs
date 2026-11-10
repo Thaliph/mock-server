@@ -682,3 +682,63 @@ fn mck_09_the_crd_prints_a_mode_pods_column() {
         assert!(crd.contains(field));
     }
 }
+
+fn deployments_gauge(metrics: &Metrics) -> i64 {
+    metrics
+        .encode()
+        .lines()
+        .find_map(|l| l.strip_prefix("mimic_store_deployments "))
+        .and_then(|v| v.parse().ok())
+        .expect("mimic_store_deployments is exposed")
+}
+
+/// `ZCARD mimic:v1:workloads`, read around a pass: the key is shared with the other tests.
+async fn workloads_card(url: &str) -> i64 {
+    let client = redis::Client::open(url).expect("valid URL");
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("ZCARD")
+        .arg("mimic:v1:workloads")
+        .query_async(&mut conn)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn mon_07_the_deployments_gauge_counts_the_workloads_set_at_each_pass() {
+    let url = valkey_url();
+    let (ns1, ns2) = (unique("mon07a"), unique("mon07b"));
+    let s = setup(&url, &[]);
+    assert_eq!(deployments_gauge(&s.metrics), 0, "0 before the first pass");
+    let store = &s.reconciler.store;
+    push(store, &ns1, "a", "a-1", &["/a"]).await;
+    push(store, &ns1, "b", "b-1", &["/a"]).await;
+    push(store, &ns2, "a", "a-1", &["/a"]).await;
+
+    let before = workloads_card(&url).await;
+    s.reconciler.tick(now_ms()).await;
+    let after = workloads_card(&url).await;
+    let value = deployments_gauge(&s.metrics);
+    assert!(before >= 3, "{before}");
+    assert!(
+        (before.min(after)..=before.max(after)).contains(&value),
+        "{value} not in {before}..{after}"
+    );
+
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let removed: i64 = redis::cmd("ZREM")
+        .arg("mimic:v1:workloads")
+        .arg(format!("{ns1}/b"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+    let before = workloads_card(&url).await;
+    s.reconciler.tick(now_ms()).await;
+    let after = workloads_card(&url).await;
+    let next = deployments_gauge(&s.metrics);
+    assert!(
+        (before.min(after)..=before.max(after)).contains(&next),
+        "{next} not in {before}..{after}"
+    );
+}

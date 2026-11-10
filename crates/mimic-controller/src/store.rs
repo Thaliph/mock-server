@@ -796,6 +796,20 @@ impl Store {
         Err(StoreError::Unavailable)
     }
 
+    /// Members of `mimic:v1:workloads`, all namespaces (`mimic_store_deployments`).
+    pub async fn workload_count(&self) -> Result<u64, ReadError> {
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        // Not logged: the status pass that follows reports the outage once.
+        redis::cmd("ZCARD")
+            .arg("mimic:v1:workloads")
+            .query_async(&mut conn)
+            .await
+            .map_err(|_| ReadError::Unavailable)
+    }
+
     /// The deployments with data, sorted by namespace then deployment.
     /// The second value counts the entries left out because their `:meta` is unreadable.
     pub async fn list(&self) -> Result<(Vec<Summary>, u64), ReadError> {
