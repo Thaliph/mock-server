@@ -28,6 +28,8 @@ mod tests_egress;
 #[cfg(test)]
 mod tests_followup;
 #[cfg(test)]
+mod tests_new_endpoint;
+#[cfg(test)]
 mod tests_openapi;
 #[cfg(test)]
 mod tests_openapi_ops;

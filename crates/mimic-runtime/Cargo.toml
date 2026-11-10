@@ -16,6 +16,9 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { version = "0.18.0", default-features = false }
+
 [lints]
 workspace = true
 

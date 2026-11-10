@@ -8,6 +8,7 @@ pub mod exchange;
 pub mod h2;
 pub mod hardening;
 pub mod http1;
+pub mod limits;
 pub mod listener;
 pub mod load;
 pub mod mock;

@@ -57,6 +57,7 @@ pub struct DiscoveryMetrics {
     samples: Family<SampleLabels, Counter>,
     redactions: Family<RedactionLabels, Counter>,
     endpoints: Family<DirectionLabels, Gauge>,
+    last_new: Family<DirectionLabels, Gauge>,
     authorities: Gauge,
     tunnels: Family<TunnelLabels, Counter>,
     sample_bytes: Gauge,
@@ -78,7 +79,17 @@ impl DiscoveryMetrics {
         ] {
             let _ = self.pushes.get_or_create(&ResultLabel { result });
         }
+        // Both series exist from the start, at 0.
+        for direction in ["inbound", "outbound"] {
+            let _ = self.last_new.get_or_create(&DirectionLabels { direction });
+        }
         let registry = metrics.registry_mut();
+        registry.register_with_unit(
+            "discovery_last_new_endpoint_timestamp",
+            "Time an endpoint was last added to the template tree, 0 before",
+            Unit::Seconds,
+            self.last_new.clone(),
+        );
         registry.register(
             "discovery_exchanges",
             "HTTP exchanges seen by discovery, by result",
@@ -174,6 +185,16 @@ impl DiscoveryMetrics {
         self.endpoints
             .get_or_create(&labels)
             .set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+
+    /// An exchange added an endpoint that this process had not recorded before.
+    pub(super) fn new_endpoint(&self, direction: &'static str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.last_new
+            .get_or_create(&DirectionLabels { direction })
+            .set(i64::try_from(now).unwrap_or(i64::MAX));
     }
 
     pub(super) fn tunnel(&self, kind: &'static str, result: &'static str) {

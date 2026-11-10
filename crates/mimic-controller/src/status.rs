@@ -14,6 +14,7 @@ use mimic_core::discovery::status::discovery;
 use mimic_core::mock::convergence;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use serde_json::{Value, json};
 
@@ -24,10 +25,11 @@ use crate::workloads::WorkloadCache;
 
 type Labels = Vec<(String, String)>;
 
-/// `mimic_status_updates_total`.
+/// `mimic_status_updates_total` and `mimic_store_deployments`.
 #[derive(Clone, Default)]
 pub struct StatusMetrics {
     updates: Family<Labels, Counter>,
+    deployments: Gauge,
 }
 
 impl StatusMetrics {
@@ -37,6 +39,11 @@ impl StatusMetrics {
             "status_updates",
             "MimicWorkload status applies",
             metrics.updates.clone(),
+        );
+        registry.register(
+            "store_deployments",
+            "Deployments with data in the store at the last status pass",
+            metrics.deployments.clone(),
         );
         metrics
     }
@@ -153,6 +160,12 @@ impl Reconciler {
     /// One pass at `now_ms` (Unix milliseconds).
     pub async fn tick(&self, now_ms: u64) {
         let window_ms = u64::try_from(self.window.as_millis()).unwrap_or(u64::MAX);
+        // Left at its last value while Valkey is unreachable (the reads below log the outage).
+        if let Ok(count) = self.store.workload_count().await {
+            self.metrics
+                .deployments
+                .set(i64::try_from(count).unwrap_or(i64::MAX));
+        }
         // One read per deployment, however many workloads name it.
         let mut computed: BTreeMap<(String, String), (Value, Value)> = BTreeMap::new();
         let mut changed = Vec::new();

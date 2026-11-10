@@ -543,6 +543,7 @@ impl Conn<'_> {
                     tap.is_some(),
                     self.mock.clone(),
                     watch,
+                    Some(proxy.overhead_histogram(direction)),
                     |event| tracker.event(event),
                     self.shared.stopped(),
                     abort.as_mut(),

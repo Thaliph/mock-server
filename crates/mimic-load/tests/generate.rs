@@ -230,6 +230,40 @@ fn ldt_12_metrics_expose_the_generator_series() {
 }
 
 #[test]
+fn mon_12_the_planned_rate_is_exposed_in_the_open_model_only() {
+    let open = Rig::new(
+        &simple_plan(),
+        &Params::open(20, 100, 6_000),
+        &[Probe::Good],
+    );
+    let mut generator = open.spawn("1s", &[]);
+    let admin = generator.admin_addr();
+    std::thread::sleep(Duration::from_millis(2_500));
+    let (status, metrics) = http_get(admin, "/metrics");
+    assert_eq!(status, 200);
+    assert!(
+        metrics.contains("# TYPE mimic_load_planned_rate gauge"),
+        "{metrics}"
+    );
+    let planned: f64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("mimic_load_planned_rate "))
+        .and_then(|v| v.parse().ok())
+        .expect("a value");
+    assert!(planned > 0.0 && planned <= 100.0, "{planned}");
+    assert!(generator.wait_exit(Duration::from_secs(20)).success());
+
+    let closed = Rig::new(&simple_plan(), &Params::closed(2, 3_000), &[Probe::Good]);
+    let mut generator = closed.spawn("1s", &[]);
+    let admin = generator.admin_addr();
+    std::thread::sleep(Duration::from_millis(1_500));
+    let (_, metrics) = http_get(admin, "/metrics");
+    assert!(metrics.contains("mimic_load_targets 1"), "{metrics}");
+    assert!(!metrics.contains("mimic_load_planned_rate"), "{metrics}");
+    assert!(generator.wait_exit(Duration::from_secs(20)).success());
+}
+
+#[test]
 fn ldt_14_no_canary_and_no_ticket_in_the_generator_outputs() {
     let rig = Rig::new(
         &credentials_plan(),

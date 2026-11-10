@@ -682,6 +682,9 @@ pub async fn generate(
     if let Err(why) = check_params(&params) {
         return refuse(&api, &config, why.to_string()).await;
     }
+    if let Some(rate) = params.rate {
+        metrics.plan_open(rate, params.ramp_up_ms, params.duration_ms);
+    }
     let secrets = match read_secrets(&config, &plan) {
         Ok(secrets) => secrets,
         Err(why) => return refuse(&api, &config, why).await,
@@ -770,6 +773,7 @@ async fn supervise(shared: &Arc<Shared>, api: &Api, shutdown: &Shutdown, begun: 
     tracing::info!("load started");
     shared.touch_verified();
     let run_begun = Instant::now();
+    shared.metrics.begin(run_begun);
     let mut load = shared.start(run_begun);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

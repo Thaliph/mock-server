@@ -15,6 +15,9 @@ use mimic_core::mock::{
 use mimic_core::proxy::tls::Exclusions;
 use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
+use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 
 const MODE_VAR: &str = "MIMIC_MODE";
@@ -153,6 +156,11 @@ impl Source {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ToLabel {
+    to: &'static str,
+}
+
 struct Current {
     mode: Mode,
     factor: u32,
@@ -166,6 +174,10 @@ struct Inner {
     current: Mutex<Current>,
     state_file: PathBuf,
     gauge: Gauge,
+    /// `mimic_mock_latency_factor`: the factor held as a decimal, in both modes.
+    factor_gauge: Gauge<f64, AtomicU64>,
+    /// `mimic_mock_mode_switches_total{to}`.
+    switches: Family<ToLabel, Counter>,
     /// Counts the changes of mode: a period of the miss log (spec §8) is one value.
     epoch: AtomicU64,
     /// The mode, for the connections that wait for a change of it (spec §8 "Switching").
@@ -194,6 +206,8 @@ impl ModeState {
             }),
             state_file: config.state_file.clone(),
             gauge: Gauge::default(),
+            factor_gauge: Gauge::default(),
+            switches: Family::default(),
             epoch: AtomicU64::new(0),
             watch: tokio::sync::watch::Sender::new(config.mode),
         }))
@@ -207,6 +221,23 @@ impl ModeState {
             "mock_mode",
             "1 when the sidecar is in mock mode, 0 in discovery mode",
             state.0.gauge.clone(),
+        );
+        // Both series exist from the start, at 0.
+        for mode in [Mode::Mock, Mode::Discovery] {
+            let _ = state
+                .0
+                .switches
+                .get_or_create(&ToLabel { to: mode.as_str() });
+        }
+        metrics.registry_mut().register(
+            "mock_mode_switches",
+            "Mode changes applied, by the mode taken",
+            state.0.switches.clone(),
+        );
+        metrics.registry_mut().register(
+            "mock_latency_factor",
+            "Latency factor held (it applies in mock mode only)",
+            state.0.factor_gauge.clone(),
         );
         let mut source = Source::Env;
         if !config.state_file.as_os_str().is_empty() {
@@ -229,6 +260,7 @@ impl ModeState {
         let (mode, factor) = state.get();
         state.0.watch.send_replace(mode);
         state.0.gauge.set(i64::from(mode == Mode::Mock));
+        state.0.factor_gauge.set(f64::from(factor) / 100.0);
         changed(mode, None, factor, source);
         state
     }
@@ -301,6 +333,14 @@ impl ModeState {
         }
         self.0.watch.send_replace(mode);
         self.0.gauge.set(i64::from(mode == Mode::Mock));
+        self.0.factor_gauge.set(f64::from(factor) / 100.0);
+        // Counted when applied, whether or not the state file was written (spec §9).
+        if mode != previous {
+            self.0
+                .switches
+                .get_or_create(&ToLabel { to: mode.as_str() })
+                .inc();
+        }
         changed(mode, Some(previous), factor, Source::Pull);
     }
 

@@ -435,3 +435,101 @@ async fn mck_10_a_state_path_that_is_not_a_regular_file_is_ignored_without_block
     assert_eq!(count(&mut process, "mode state ignored"), 1);
     assert_eq!(egress(admin)["mode"], "discovery");
 }
+
+// MON-11: the mode switches and the latency factor as metrics (spec §9, #385).
+
+/// The value of the series whose line starts with `series` (a name with its labels), if any.
+fn series(admin: SocketAddr, series: &str) -> Option<f64> {
+    let (_, text) = http_get(admin, "/metrics");
+    text.lines()
+        .find(|l| l.starts_with(series) && l[series.len()..].starts_with(' '))
+        .and_then(|l| l.rsplit(' ').next()?.parse().ok())
+}
+
+fn switches(admin: SocketAddr, to: &str) -> f64 {
+    let name = format!("mimic_mock_mode_switches_total{{to=\"{to}\"}}");
+    series(admin, &name).unwrap_or(0.0)
+}
+
+fn factor(admin: SocketAddr) -> Option<f64> {
+    series(admin, "mimic_mock_latency_factor")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mon_11_the_factor_at_start_is_exposed_and_the_start_mode_is_not_a_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = fake_api(vec![], Reply::Silent).await;
+    let (_process, admin) = sidecar(
+        &api,
+        dir.path(),
+        "60s",
+        &[
+            ("MIMIC_MODE", "discovery"),
+            ("MIMIC_MOCK_LATENCY_FACTOR", "1.5"),
+        ],
+    );
+    assert_eq!(factor(admin), Some(1.5));
+    assert_eq!(switches(admin, "mock"), 0.0);
+    assert_eq!(switches(admin, "discovery"), 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mon_11_each_applied_change_of_mode_counts_once_and_the_factor_follows() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = fake_api(
+        vec![
+            Reply::Ok(Some("mock"), None),
+            Reply::NotModified(Some("mock"), None),
+            Reply::NotModified(Some("mock"), Some("2")),
+        ],
+        Reply::NotModified(Some("discovery"), None),
+    )
+    .await;
+    let (_process, admin) = sidecar(
+        &api,
+        dir.path(),
+        "1s",
+        &[("MIMIC_MOCK_LATENCY_FACTOR", "1.5")],
+    );
+    wait_for("mock", || mode_gauge(admin).as_deref() == Some("1"));
+    assert_eq!(switches(admin, "mock"), 1.0);
+    // The third answer changes the factor only: no switch.
+    wait_for("the factor 2", || factor(admin) == Some(2.0));
+    assert_eq!(switches(admin, "mock"), 1.0);
+    wait_for("discovery", || mode_gauge(admin).as_deref() == Some("0"));
+    assert_eq!(switches(admin, "mock"), 1.0);
+    assert_eq!(switches(admin, "discovery"), 1.0);
+    assert_eq!(factor(admin), Some(2.0));
+    wait_for("more pulls", || api.count() >= 6);
+    assert_eq!(switches(admin, "discovery"), 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mon_11_a_restart_with_a_saved_mock_mode_counts_no_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("mimic/state")).unwrap();
+    std::fs::write(
+        state_file(dir.path()),
+        r#"{"latency_factor":0.5,"mode":"mock"}"#,
+    )
+    .unwrap();
+    let api = fake_api(vec![], Reply::Silent).await;
+    let (_process, admin) = sidecar(&api, dir.path(), "60s", &[("MIMIC_MODE", "discovery")]);
+    assert_eq!(mode_gauge(admin).as_deref(), Some("1"));
+    assert_eq!(factor(admin), Some(0.5));
+    assert_eq!(switches(admin, "mock"), 0.0);
+    assert_eq!(switches(admin, "discovery"), 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mon_11_a_switch_whose_state_file_cannot_be_written_is_applied_and_counted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("mimic")).unwrap();
+    // A file where the directory should be.
+    std::fs::write(dir.path().join("mimic/state"), "x").unwrap();
+    let api = fake_api(vec![], Reply::Ok(Some("mock"), None)).await;
+    let (_process, admin) = sidecar(&api, dir.path(), "1s", &[]);
+    wait_for("three pulls", || api.count() >= 3);
+    assert_eq!(mode_gauge(admin).as_deref(), Some("1"));
+    assert_eq!(switches(admin, "mock"), 1.0);
+}

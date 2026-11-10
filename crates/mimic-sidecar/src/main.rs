@@ -2,6 +2,7 @@
 //! (configuration, logs, admin listener, graceful shutdown), the connection layer (INJ-07, PRX-05) and
 //! the `/app-health` probe forwarder (INJ-18).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use mimic_runtime::config::{CommonConfig, Env};
 use mimic_runtime::metrics::Metrics;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig, ShipConfig};
 use mimic_sidecar::egress::{EgressConfig, EgressMetrics, Puller, Snapshot};
+use mimic_sidecar::limits;
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 use mimic_sidecar::load::{LoadConfig, Marker};
 use mimic_sidecar::mock::Mock;
@@ -75,6 +77,7 @@ fn main() -> ExitCode {
         log.finish();
         return ExitCode::FAILURE;
     }
+    let limits = limits::limits(&tunnel, &discovery, &egress, &mode);
     let code = match run(
         config,
         tunnel,
@@ -82,6 +85,7 @@ fn main() -> ExitCode {
         tls,
         (discovery, ship, egress, mode, pod),
         load,
+        &limits,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -108,11 +112,13 @@ async fn run(
         Option<String>,
     ),
     load: Option<LoadConfig>,
+    limits: &BTreeMap<&'static str, u64>,
 ) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
     // Registered before any listener is announced: an early SIGTERM is not lost.
     let shutdown = Shutdown::install()?;
     let mut metrics = Metrics::new("sidecar", VERSION);
+    limits::register(&mut metrics, limits);
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
     let proxy_metrics = ProxyMetrics::register(&mut metrics, tunnel.max_authorities);
     let ca_metrics = CaMetrics::register(&mut metrics);

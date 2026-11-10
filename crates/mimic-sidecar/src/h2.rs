@@ -11,6 +11,7 @@ use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use http_body_util::BodyExt;
 use hyper::service::service_fn;
@@ -288,6 +289,9 @@ async fn forward(
         let answered = conn.serve(req).await?;
         return Ok(answered.map(|body| body.map_err(|never| match never {}).boxed_unsync()));
     }
+    // The sidecar's own time (spec §9): the request leg, then the response leg; the connection
+    // setup, the wait for the stream window and the destination's time are left out.
+    let began = Instant::now();
     let mut req = req;
     // A load request is checked, loses its ticket, is not discovered, and its answer is marked.
     let load_run = match &state.load {
@@ -297,7 +301,9 @@ async fn forward(
         },
         None => None,
     };
+    let mut spent = began.elapsed();
     state.open().await?;
+    let resumed = Instant::now();
     let sender = state
         .sender
         .lock()
@@ -314,6 +320,7 @@ async fn forward(
     if let Some(uid) = load_run {
         tracker.load_run(uid);
     }
+    spent += resumed.elapsed();
     let sent = async {
         sender.ready().await?;
         sender.send_request(req).await
@@ -321,10 +328,13 @@ async fn forward(
     .await;
     match sent {
         Ok(response) => {
+            let resumed = Instant::now();
             let mut answered = tracker.answered(response).map(BodyExt::boxed_unsync);
             if marked {
                 mark_answer(answered.headers_mut());
             }
+            spent += resumed.elapsed();
+            state.ctx.proxy.overhead(state.ctx.direction, spent);
             Ok(answered)
         }
         Err(e) => {

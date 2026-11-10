@@ -5,12 +5,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use base64::Engine;
@@ -22,7 +24,8 @@ use mimic_core::inject::{
 };
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use prometheus_client::registry::Registry;
+use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::registry::{Registry, Unit};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -38,22 +41,50 @@ const SKIPPED_ANNOTATION: &str = "mimic.platform.io/skipped";
 
 type Labels = Vec<(String, String)>;
 
-/// `mimic_webhook_admissions_total{result,reason}`.
-#[derive(Clone, Default)]
+/// Admissions are sub-5 ms: the buckets start at 1 ms.
+const DURATION_BUCKETS: [f64; 13] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// `mimic_webhook_admissions_total{result,reason}` and
+/// `mimic_webhook_admission_duration_seconds`.
+#[derive(Clone)]
 pub struct AdmissionMetrics {
     admissions: Family<Labels, Counter>,
+    duration: Histogram,
 }
 
 impl AdmissionMetrics {
     pub fn register(registry: &mut Registry) -> AdmissionMetrics {
-        let metrics = AdmissionMetrics::default();
+        let metrics = AdmissionMetrics {
+            admissions: Family::default(),
+            duration: Histogram::new(DURATION_BUCKETS),
+        };
         registry.register(
             "webhook_admissions",
             "Admission reviews answered by the injection webhook",
             metrics.admissions.clone(),
         );
+        registry.register_with_unit(
+            "webhook_admission_duration",
+            "Time to answer one admission request",
+            Unit::Seconds,
+            metrics.duration.clone(),
+        );
         metrics
     }
+}
+
+/// Times a request to `/inject/*`, from the head read to the response handed to the codec.
+async fn timed(
+    State(metrics): State<AdmissionMetrics>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let start = Instant::now();
+    let response = next.run(request).await;
+    metrics.duration.observe(start.elapsed().as_secs_f64());
+    response
 }
 
 /// A root certificate (PEM) with the seed it was derived from.
@@ -124,6 +155,10 @@ pub fn router(admission: Arc<Admission>) -> Router {
         .route("/inject/namespace", endpoint(NamespaceMode::Enabled))
         .route("/inject/workload", endpoint(NamespaceMode::Selected))
         .route("/inject/pod", endpoint(NamespaceMode::Absent))
+        .route_layer(middleware::from_fn_with_state(
+            admission.metrics.clone(),
+            timed,
+        ))
         .with_state(admission)
 }
 
@@ -861,6 +896,114 @@ pub(crate) mod tests {
         ] {
             assert!(text.contains(line), "{line}\n{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn mon_05_every_request_to_inject_is_timed_without_label() {
+        let (router, metrics) = setup(true, &[]);
+        let object = pod();
+        // injected, skipped, untouched
+        admit(&router, "/inject/namespace", review("a", "shop", &object)).await;
+        let mut host = object.clone();
+        host["spec"]["hostNetwork"] = json!(true);
+        admit(&router, "/inject/namespace", review("b", "shop", &host)).await;
+        admit(&router, "/inject/workload", review("c", "shop", &object)).await;
+        // 400, 413, 405
+        let (status, _) = call(&router, Method::POST, "/inject/pod", b"nope".to_vec()).await;
+        assert_eq!(status, 400);
+        let (status, _) = call(
+            &router,
+            Method::POST,
+            "/inject/pod",
+            vec![b' '; MAX_BODY + 1],
+        )
+        .await;
+        assert_eq!(status, 413);
+        let (status, _) = call(&router, Method::GET, "/inject/pod", Vec::new()).await;
+        assert_eq!(status, 405);
+        // Not a request to /inject/*: not timed.
+        let (status, _) = call(&router, Method::POST, "/inject", Vec::new()).await;
+        assert_eq!(status, 404);
+
+        let text = metrics.encode();
+        assert!(
+            text.contains("# TYPE mimic_webhook_admission_duration_seconds histogram"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nmimic_webhook_admission_duration_seconds_count 6\n"),
+            "{text}"
+        );
+        let bounds: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("mimic_webhook_admission_duration_seconds_bucket{le=\""))
+            .filter_map(|l| l.split('"').next())
+            .collect();
+        assert_eq!(
+            bounds,
+            [
+                "0.001", "0.0025", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1.0",
+                "2.5", "5.0", "10.0", "+Inf"
+            ]
+        );
+    }
+
+    /// The quoted string after each `marker` in the production code of this file.
+    fn after<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {
+        source
+            .split(marker)
+            .skip(1)
+            .filter_map(|rest| rest.strip_prefix('"')?.split('"').next())
+            .collect()
+    }
+
+    #[test]
+    fn mon_05_the_reasons_of_the_webhook_are_the_spec_list() {
+        use mimic_core::inject::{SkipReason, Untouched};
+        let spec = include_str!("../../../docs/SPEC.md");
+        let row = spec
+            .lines()
+            .find(|l| {
+                l.trim_start()
+                    .starts_with("| `mimic_webhook_admissions_total`")
+            })
+            .expect("the §9 row");
+        let listed: std::collections::BTreeSet<&str> = row
+            .split("`reason`:")
+            .nth(1)
+            .expect("the reason list")
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| !["injected", "skipped", "error"].contains(t))
+            .collect();
+        let mut code: std::collections::BTreeSet<&str> = ["ok"].into();
+        code.extend(
+            [
+                SkipReason::HostNetwork,
+                SkipReason::UnsupportedOwner,
+                SkipReason::PortConflict,
+                SkipReason::UidConflict,
+                SkipReason::NameConflict,
+            ]
+            .map(SkipReason::as_str),
+        );
+        code.extend(
+            [
+                Untouched::ExcludedNamespace,
+                Untouched::PodDisabled,
+                Untouched::NotSelected,
+                Untouched::AlreadyInjected,
+            ]
+            .map(Untouched::as_str),
+        );
+        let source = include_str!("webhook.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        code.extend(after(production, "reason: "));
+        code.extend(after(production, "\"error\", "));
+        // `read_body` failures pick between these two.
+        code.extend(["too-large", "unreadable"]);
+        assert_eq!(listed, code);
     }
 
     #[tokio::test]
