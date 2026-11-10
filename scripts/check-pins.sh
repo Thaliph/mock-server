@@ -28,10 +28,25 @@ if [ "$prometheus_chart" != "$prometheus_pin" ]; then
   exit 1
 fi
 
+# #379 (MON-15): the bundled Grafana and its dashboard sidecar (monitoring.grafana.image, monitoring.grafana.sidecarImage).
+grafana_chart=$(yq '.monitoring.grafana.image.repository + ":" + .monitoring.grafana.image.tag + "@" + .monitoring.grafana.image.digest' deploy/helm/mimic/values.yaml)
+grafana_pin=$(scripts/pinned-image.sh grafana)
+if [ "$grafana_chart" != "$grafana_pin" ]; then
+  echo "values.yaml monitoring.grafana.image is $grafana_chart, images/Dockerfile says $grafana_pin" >&2
+  exit 1
+fi
+
+sidecar_chart=$(yq '.monitoring.grafana.sidecarImage.repository + ":" + .monitoring.grafana.sidecarImage.tag + "@" + .monitoring.grafana.sidecarImage.digest' deploy/helm/mimic/values.yaml)
+sidecar_pin=$(scripts/pinned-image.sh k8s-sidecar)
+if [ "$sidecar_chart" != "$sidecar_pin" ]; then
+  echo "values.yaml monitoring.grafana.sidecarImage is $sidecar_chart, images/Dockerfile says $sidecar_pin" >&2
+  exit 1
+fi
+
 kind_pin=$(scripts/pinned-image.sh kind-node)
 if ! grep -qF "node_image: $kind_pin" .github/workflows/ci.yml; then
   echo "ci.yml does not use the kind node image of images/Dockerfile: $kind_pin" >&2
   exit 1
 fi
 
-echo "pins: the Valkey image, the Valkey exporter image, the Prometheus image and the kind node image match images/Dockerfile"
+echo "pins: the Valkey image, the Valkey exporter image, the Prometheus and Grafana images and the kind node image match images/Dockerfile"

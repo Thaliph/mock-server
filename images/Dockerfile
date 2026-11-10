@@ -12,6 +12,14 @@ FROM docker.io/oliver006/redis_exporter:v1.95.0@sha256:afb21407aba3df1b4010899f1
 # (GitHub release), outside the 14-day cooldown.
 FROM quay.io/prometheus/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2 AS prometheus
 
+# Bundled Grafana (#379, spec §10.7): the chart's monitoring.grafana.image, v13.2.4 published 2026-10-13 (GitHub
+# release), outside the 14-day cooldown.
+FROM docker.io/grafana/grafana:13.2.4-distroless@sha256:ae3d3add290adbe6a88412229f5d76fd7bb82743050881698642d3d62f277e35 AS grafana
+
+# Dashboard sidecar of the bundled Grafana (#379): the chart's monitoring.grafana.sidecarImage, 2.14.1 published
+# 2026-10-08 (GitHub release), outside the 14-day cooldown.
+FROM quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:092dbe0c335fba9af414a27630ca68f34df6185784fa847d9954187e69dbfdd7 AS k8s-sidecar
+
 # Valkey: the chart's default (deploy/helm/mimic/values.yaml, valkey.image), also scanned by Trivy in CI.
 FROM docker.io/valkey/valkey:9.0-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416 AS valkey
 

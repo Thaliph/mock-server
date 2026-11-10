@@ -1,0 +1,208 @@
+{{- if .Values.monitoring.grafana.enabled }}
+# The bundled Grafana (spec §10.7, §11, #379): one pod with two containers. grafana serves the dashboards on 3000 with
+# anonymous access, plugins, analytics and update checks off, and holds no Kubernetes token. dashboards (the k8s-sidecar)
+# copies the dashboard ConfigMaps labelled grafana_dashboard: "1" into /tmp/dashboards with the Role below (configmaps
+# only, in the release namespace) and the only projected token of the pod; it never calls Grafana.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-grafana-dashboards
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-grafana-dashboards
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-grafana-dashboards
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-grafana
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mimic-grafana
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: mimic-grafana
+  template:
+    metadata:
+      labels:
+        {{- include "mimic.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mimic-grafana
+      annotations:
+        # A change of grafana.ini or of the provisioning rolls the pod: the mounts are read at start.
+        checksum/config: {{ include "mimic.grafanaConfigChecksum" . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-grafana
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        # fsGroup: the data and dashboard emptyDirs are writable by the group 472 (grafana).
+        fsGroup: 472
+        # The dashboards container (65534) writes /tmp/dashboards, owned by the group 472: it joins that group.
+        supplementalGroups: [472]
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: grafana
+          image: {{ include "mimic.grafanaImage" . }}
+          imagePullPolicy: IfNotPresent
+          env:
+            # The admin password is read from the file in the Secret, never from an env value (MON-19).
+            - name: GF_SECURITY_ADMIN_PASSWORD__FILE
+              value: /etc/grafana-admin/admin-password
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet: {path: /api/health, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /api/health, port: http}
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.monitoring.grafana.resources | nindent 12 }}
+          securityContext:
+            {{- include "mimic.containerSecurity" . | nindent 12 }}
+            runAsUser: 472
+            runAsGroup: 472
+          volumeMounts:
+            - name: admin
+              mountPath: /etc/grafana-admin
+              readOnly: true
+            - name: grafana-ini
+              mountPath: /etc/grafana/grafana.ini
+              subPath: grafana.ini
+              readOnly: true
+            - name: provisioning-datasources
+              mountPath: /etc/grafana/provisioning/datasources
+              readOnly: true
+            - name: provisioning-dashboards
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: dashboard-files
+              mountPath: /tmp/dashboards
+              readOnly: true
+        # The dashboard sidecar (spec §10.7): watches the ConfigMaps labelled grafana_dashboard: "1" of the release
+        # namespace (Role grafana-dashboards), writes them to /tmp/dashboards, and never calls Grafana.
+        - name: dashboards
+          image: {{ include "mimic.grafanaSidecarImage" . }}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LABEL
+              value: grafana_dashboard
+            - name: LABEL_VALUE
+              value: "1"
+            - name: RESOURCE
+              value: configmap
+            - name: NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: METHOD
+              value: WATCH
+            - name: FOLDER
+              value: /tmp/dashboards
+          resources:
+            {{- toYaml .Values.monitoring.grafana.sidecarResources | nindent 12 }}
+          securityContext:
+            {{- include "mimic.containerSecurity" . | nindent 12 }}
+            runAsUser: 65534
+            runAsGroup: 65534
+          volumeMounts:
+            - name: dashboard-files
+              mountPath: /tmp/dashboards
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: admin
+          secret:
+            secretName: {{ include "mimic.grafanaAdminSecret" . }}
+        - name: grafana-ini
+          configMap:
+            name: {{ .Release.Name }}-grafana
+            items:
+              - key: grafana.ini
+                path: grafana.ini
+        - name: provisioning-datasources
+          configMap:
+            name: {{ .Release.Name }}-grafana-provisioning
+            items:
+              - key: datasources.yaml
+                path: datasources.yaml
+        - name: provisioning-dashboards
+          configMap:
+            name: {{ .Release.Name }}-grafana-provisioning
+            items:
+              - key: dashboards.yaml
+                path: dashboards.yaml
+        - name: data
+          emptyDir: {}
+        - name: dashboard-files
+          emptyDir: {}
+        # The token, the cluster CA and the namespace of the sidecar's API calls, in the dashboards container only.
+        - name: kube-api-access
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "mimic.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mimic-grafana
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: mimic-grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+{{- end }}

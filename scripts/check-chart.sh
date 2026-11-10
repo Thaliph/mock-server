@@ -35,6 +35,11 @@ lint prometheus.loadTest --set monitoring.prometheus.enabled=true --set loadTest
   --set image.digest="$digest" --set metrics.podMonitor.enabled=true
 lint prometheus.netpol --set monitoring.prometheus.enabled=true --set valkey.metrics.enabled=true \
   --set networkPolicy.apiServerCIDR=10.96.0.0/16
+lint grafana --set monitoring.grafana.enabled=true
+lint grafana.prometheus --set monitoring.grafana.enabled=true --set monitoring.prometheus.enabled=true
+lint grafana.all --set monitoring.grafana.enabled=true --set monitoring.prometheus.enabled=true \
+  --set valkey.metrics.enabled=true --set metrics.podMonitor.enabled=true --set loadTest.enabled=true \
+  --set image.digest="$digest"
 
 # MON-01, default: identical to the golden render (deploy/helm/golden/default.yaml, rendered from main), blank
 # lines aside: helm 3 and helm 4 separate the documents with different blank lines.
@@ -263,6 +268,11 @@ for f in default pm on load-pm; do
 done
 echo "mon_14: no bundled monitoring object with monitoring off"
 
+# MON-14 (#379): the chart has no Helm dependency: no dependencies in Chart.yaml, no Chart.lock and no charts/ directory.
+[[ $(yq -r '.dependencies // [] | length' "$chart/Chart.yaml") == 0 ]] || fail "mon_14: Chart.yaml declares a dependency"
+[[ ! -e $chart/Chart.lock && ! -e $chart/charts ]] || fail "mon_14: the chart vendors a Chart.lock or charts/"
+echo "mon_14: the chart has no Helm dependency"
+
 # MON-17 (#379): mon_17 <render> <jobs, in order> <monitors: yes|no>. prometheus.yml has exactly those jobs, all
 # pods role, with the selector, port, path, interval and target labels of the monitor of the same name (the
 # ServiceMonitor or PodMonitor; with "yes" it must exist). namespace and pod are the Operator's implicit target
@@ -466,5 +476,105 @@ expr=$(load_expression "$tmp/load-prom-set.yaml")
 grep -qF 'variables.ingress[0].from == [{"podSelector":{"matchLabels":{"app":"scrape"}}}]' <<<"$expr" \
   || fail "mon_20: a set loadTest.metricsFrom does not win over the Prometheus fallback"
 echo "mon_20: loadTest.metricsFrom falls back to the release namespace with the bundled Prometheus, and a set value wins"
+
+# MON-19 (#379): the bundled Grafana: a Deployment of the grafana and dashboards containers, the admin Secret as a file in
+# grafana only, grafana.ini and the provisioning, the dashboards sidecar without credentials, and a ClusterIP Service.
+render --set monitoring.grafana.enabled=true --set monitoring.prometheus.enabled=true > "$tmp/grafana.yaml"
+gdep=$(yq 'select(.kind == "Deployment" and .metadata.name == "mimic-grafana")' "$tmp/grafana.yaml")
+[[ -n $gdep ]] || fail "mon_19: no Deployment mimic-grafana"
+[[ $(yq -r '.spec.replicas' <<<"$gdep") == 1 && $(yq -r '.spec.strategy.type' <<<"$gdep") == Recreate ]] \
+  || fail "mon_19: the Grafana Deployment is not 1 replica with strategy Recreate"
+[[ $(yq -r '.spec.template.spec.containers[].name' <<<"$gdep" | paste -sd, -) == grafana,dashboards ]] \
+  || fail "mon_19: the containers are not grafana and dashboards"
+[[ $(yq -r '.spec.template.spec.initContainers' <<<"$gdep") == null ]] || fail "mon_19: the Grafana pod has an init container"
+[[ $(yq -r '.spec.template.spec.automountServiceAccountToken' <<<"$gdep") == false ]] || fail "mon_19: the token is automounted"
+gctr=$(yq '.spec.template.spec.containers[] | select(.name == "grafana")' <<<"$gdep")
+dctr=$(yq '.spec.template.spec.containers[] | select(.name == "dashboards")' <<<"$gdep")
+[[ $(yq -r '.image' <<<"$gctr") == docker.io/grafana/grafana:13.2.4-distroless@sha256:* ]] || fail "mon_19: the grafana image is not the pinned one"
+[[ $(yq -r '.image' <<<"$dctr") == quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:* ]] || fail "mon_19: the sidecar image is not the pinned one"
+[[ $(yq -r '.spec.template.spec.containers[] | select(.volumeMounts[]?.name == "kube-api-access") | .name' <<<"$gdep") == dashboards ]] \
+  || fail "mon_19: the projected token is not mounted in dashboards only"
+[[ $(yq -r '.spec.template.spec.volumes[] | select(.name == "kube-api-access") | .projected.sources[0] | has("serviceAccountToken")' <<<"$gdep") == true ]] \
+  || fail "mon_19: the projected volume has no service account token"
+for c in gctr dctr; do
+  ctr_var=${!c}
+  [[ $(yq -r '.securityContext.runAsNonRoot' <<<"$ctr_var") == true && $(yq -r '.securityContext.readOnlyRootFilesystem' <<<"$ctr_var") == true \
+    && $(yq -r '.securityContext.allowPrivilegeEscalation' <<<"$ctr_var") == false \
+    && $(yq -r '.securityContext.capabilities.drop | join(",")' <<<"$ctr_var") == ALL \
+    && $(yq -r '.securityContext.seccompProfile.type' <<<"$ctr_var") == RuntimeDefault ]] \
+    || fail "mon_19: a Grafana container is not restricted ($c)"
+done
+[[ $(yq -r '.securityContext.runAsUser' <<<"$gctr") == 472 ]] || fail "mon_19: grafana is not UID 472"
+[[ $(yq -r '.securityContext.runAsUser' <<<"$dctr") == 65534 ]] || fail "mon_19: dashboards is not UID 65534"
+[[ $(yq -r '.resources.requests.cpu + " " + .resources.limits.memory' <<<"$gctr") == "50m 256Mi" ]] \
+  || fail "mon_19: the grafana resources are not those of the values"
+
+# The admin password: a Secret of 32 alphanumeric characters, a file in grafana only, no env value, in no other object.
+sec=$(yq 'select(.kind == "Secret" and .metadata.name == "mimic-grafana-admin")' "$tmp/grafana.yaml")
+[[ -n $sec ]] || fail "mon_19: no Secret mimic-grafana-admin"
+pw=$(yq -r '.data["admin-password"] | @base64d' <<<"$sec")
+[[ $pw =~ ^[A-Za-z0-9]{32}$ ]] || fail "mon_19: the admin password is not 32 alphanumeric characters"
+b64=$(yq -r '.data["admin-password"]' <<<"$sec")
+[[ $(grep -cF -- "$b64" "$tmp/grafana.yaml") == 1 ]] || fail "mon_19: the admin password is in another object"
+! grep -qF -- "$pw" "$tmp/grafana.yaml" || fail "mon_19: the admin password is in plain text in the render"
+[[ $(yq -r '.env[].name' <<<"$gctr" | paste -sd, -) == GF_SECURITY_ADMIN_PASSWORD__FILE ]] \
+  || fail "mon_19: the grafana env is not the password file alone"
+[[ $(yq -r '.env[].name' <<<"$dctr" | grep -c PASSWORD || true) == 0 ]] || fail "mon_19: the sidecar has a password env"
+[[ $(yq -r '.env[] | select(.name == "GF_SECURITY_ADMIN_PASSWORD__FILE") | .value' <<<"$gctr") == /etc/grafana-admin/admin-password ]] \
+  || fail "mon_19: the password file is not /etc/grafana-admin/admin-password"
+[[ $(yq -r '[.volumeMounts[].name] | join(",")' <<<"$gctr") == "admin,grafana-ini,provisioning-datasources,provisioning-dashboards,data,dashboard-files" ]] \
+  || fail "mon_19: the grafana mounts are not those of the spec"
+grep -q 'secretKeyRef' <<<"$gdep" && fail "mon_19: an env reads a Secret key"
+[[ $(yq -r '.spec.template.spec.volumes[] | select(.name == "admin") | .secret.secretName' <<<"$gdep") == mimic-grafana-admin ]] \
+  || fail "mon_19: the admin volume is not the Secret"
+
+# grafana.ini and the provisioning (§10.7).
+ini=$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "mimic-grafana") | .data["grafana.ini"]' "$tmp/grafana.yaml")
+for line in "reporting_enabled = false" "check_for_updates = false" "check_for_plugin_updates = false" \
+  "news_feed_enabled = false" "preinstall_disabled = true" "enabled = false" "allow_sign_up = false" \
+  "disable_gravatar = true" "mode = console" "format = json" "admin_user = admin"; do
+  grep -qxF -- "$line" <<<"$ini" || fail "mon_19: grafana.ini lacks '$line'"
+done
+prov=$(yq 'select(.kind == "ConfigMap" and .metadata.name == "mimic-grafana-provisioning")' "$tmp/grafana.yaml")
+ds=$(yq -r '.data["datasources.yaml"]' <<<"$prov")
+[[ $(yq -r '.datasources[0] | [.uid, .type, .url, (.editable | tostring)] | join(" ")' <<<"$ds") == "mimic-prometheus prometheus http://mimic-prometheus:9090 false" ]] \
+  || fail "mon_19: the provisioned datasource is not the bundled Prometheus with uid mimic-prometheus"
+dash=$(yq -r '.data["dashboards.yaml"]' <<<"$prov")
+[[ $(yq -r '.providers[0] | [.type, .options.path, (.updateIntervalSeconds | tostring), (.allowUiUpdates | tostring)] | join(" ")' <<<"$dash") == "file /tmp/dashboards 30 false" ]] \
+  || fail "mon_19: the dashboards provider is not a file provider on /tmp/dashboards, 30 s, no UI updates"
+[[ $(yq -r '.spec.template.metadata.annotations["checksum/config"]' <<<"$gdep") != null ]] || fail "mon_19: no checksum annotation"
+
+# The sidecar: the label, the value, the resource and the namespace; no REQ_URL, REQ_USERNAME or REQ_PASSWORD.
+[[ $(yq -r '[.env[] | .name + "=" + (.value // "")] | join(" ")' <<<"$dctr") == "LABEL=grafana_dashboard LABEL_VALUE=1 RESOURCE=configmap NAMESPACE=mimic-system METHOD=WATCH FOLDER=/tmp/dashboards" ]] \
+  || fail "mon_19: the sidecar environment is not the one of the spec"
+
+# Service and objects: ClusterIP on 3000 only; no Ingress, HTTPRoute or PersistentVolumeClaim.
+gsvc=$(yq 'select(.kind == "Service" and .metadata.name == "mimic-grafana")' "$tmp/grafana.yaml")
+[[ $(yq -r '.spec.type' <<<"$gsvc") == ClusterIP && $(yq -r '.spec.ports | length' <<<"$gsvc") == 1 \
+  && $(yq -r '.spec.ports[0].port' <<<"$gsvc") == 3000 ]] || fail "mon_19: the Grafana Service is not ClusterIP on 3000 only"
+! grep -qE '^kind: (Ingress|HTTPRoute|PersistentVolumeClaim)$' "$tmp/grafana.yaml" || fail "mon_19: an Ingress, HTTPRoute or PVC is rendered"
+
+# The checksum follows the provisioning (the bundled datasource URL).
+render --set monitoring.grafana.enabled=true --set monitoring.prometheus.enabled=true \
+  --set monitoring.grafana.datasourceUrl=http://other:9090 > "$tmp/grafana-url.yaml"
+gcs() { yq -r 'select(.kind == "Deployment" and .metadata.name == "mimic-grafana") | .spec.template.metadata.annotations["checksum/config"]' "$1"; }
+[[ $(gcs "$tmp/grafana.yaml") != "$(gcs "$tmp/grafana-url.yaml")" ]] || fail "mon_19: the checksum does not follow the datasource"
+echo "mon_19: the Grafana pod, its Secret, its configuration and its Service have the shape of §10.7"
+
+# MON-18 (Grafana part): the sidecar's Role lists and watches ConfigMaps of the release namespace only, bound to its own
+# ServiceAccount, and no other binding names that ServiceAccount.
+grole=$(yq 'select(.kind == "Role" and .metadata.name == "mimic-grafana-dashboards")' "$tmp/grafana.yaml")
+[[ $(yq -r '.rules | length' <<<"$grole") == 1 \
+  && $(yq -r '.rules[0] | [(.apiGroups | join(",")), (.resources | join(",")), (.verbs | join(","))] | join("|")' <<<"$grole") == "|configmaps|get,list,watch" ]] \
+  || fail "mon_18: the Grafana Role is not get, list and watch on configmaps"
+grb=$(yq 'select(.kind == "RoleBinding" and .metadata.name == "mimic-grafana-dashboards")' "$tmp/grafana.yaml")
+[[ $(yq -r '.roleRef.name' <<<"$grb") == mimic-grafana-dashboards && $(yq -r '.subjects[0].name' <<<"$grb") == mimic-grafana \
+  && $(yq -r '.subjects[0].namespace' <<<"$grb") == mimic-system ]] || fail "mon_18: the Grafana RoleBinding does not bind its ServiceAccount"
+bindings=$(yq -r 'select(.kind == "RoleBinding" or .kind == "ClusterRoleBinding") | .kind + " " + .metadata.name + " " + ([.subjects[]?.name] | join(","))' "$tmp/grafana.yaml" | grep -v '^$' || true)
+[[ $(grep -c 'mimic-grafana$' <<<"$bindings") == 1 ]] && grep -q '^RoleBinding mimic-grafana-dashboards ' <<<"$bindings" \
+  || fail "mon_18: another binding names the Grafana ServiceAccount"
+! grep -qE 'secrets|nodes|\*' <<<"$(yq 'select(.kind == "Role" and .metadata.name == "mimic-grafana-dashboards") | .rules' "$tmp/grafana.yaml")" \
+  || fail "mon_18: the Grafana Role names secrets, nodes or a wildcard"
+echo "mon_18: the Grafana Role reads configmaps of the release namespace only, and no other binding names its ServiceAccount"
 
 echo "chart checks passed"
