@@ -1,7 +1,7 @@
 {{- if and .Values.monitoring.prometheus.enabled .Values.networkPolicy.enabled }}
 # The NetworkPolicy of the bundled Prometheus (spec §10.7, §11, MON-20, #379). Its HTTP API has no authentication and
-# reads every series, so it admits no ingress until Grafana (a later step) is rendered; `kubectl port-forward` is not
-# blocked by a NetworkPolicy (§11.1). Egress: the scrape of the pods (15100 in the namespaces of its jobs), the
+# reads every series, so it admits ingress from the Grafana pods only (none without Grafana); `kubectl port-forward` is
+# not blocked by a NetworkPolicy (§11.1). Egress: the scrape of the pods (15100 in the namespaces of its jobs), the
 # controller (8081), the Valkey exporter (9121, with valkey.metrics) and the API server (443, 6443). No DNS: it
 # scrapes pod IPs.
 {{- $controller := include "mimic.scrapeTarget" (dict "root" . "job" (printf "%s-controller" .Release.Name)) | fromJson }}
@@ -17,7 +17,19 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/name: mimic-prometheus
   policyTypes: [Ingress, Egress]
+  {{- if .Values.monitoring.grafana.enabled }}
+  # The queries of the Grafana pods only (MON-20).
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/name: mimic-grafana
+      ports:
+        - {port: 9090, protocol: TCP}
+  {{- else }}
   ingress: []
+  {{- end }}
   egress:
     # The scrape of the injected and generator pods: every namespace, or the namespaces of monitoring.prometheus.namespaces
     # and the release namespace (which holds the controller and Valkey).

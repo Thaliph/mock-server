@@ -577,4 +577,36 @@ bindings=$(yq -r 'select(.kind == "RoleBinding" or .kind == "ClusterRoleBinding"
   || fail "mon_18: the Grafana Role names secrets, nodes or a wildcard"
 echo "mon_18: the Grafana Role reads configmaps of the release namespace only, and no other binding names its ServiceAccount"
 
+# MON-20 (#379, Grafana part): the Grafana NetworkPolicy, and the Prometheus ingress from the Grafana pods.
+gnp=$(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-grafana")' "$tmp/grafana.yaml")
+[[ -n $gnp ]] || fail "mon_20: no NetworkPolicy mimic-grafana"
+[[ $(yq -r '.spec.policyTypes | join(",")' <<<"$gnp") == Ingress,Egress ]] || fail "mon_20: the Grafana policy types are not Ingress and Egress"
+[[ $(yq -r '.spec.podSelector.matchLabels["app.kubernetes.io/name"]' <<<"$gnp") == mimic-grafana ]] || fail "mon_20: the policy does not select the Grafana pods"
+[[ $(yq -r '[.spec.ingress[].ports[].port] | join(",")' <<<"$gnp") == 3000 \
+  && $(yq -r '.spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]' <<<"$gnp") == mimic-system ]] \
+  || fail "mon_20: the Grafana ingress is not TCP 3000 from the release namespace"
+[[ $(yq -r '.spec.egress[0].to[0].podSelector.matchLabels["app.kubernetes.io/name"]' <<<"$gnp") == mimic-prometheus \
+  && $(yq -r '.spec.egress[0].ports[0].port' <<<"$gnp") == 9090 ]] || fail "mon_20: the Grafana egress is not 9090 to Prometheus"
+[[ $(yq -r '.spec.egress[1].to[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]' <<<"$gnp") == kube-system \
+  && $(yq -r '.spec.egress[1].to[0].podSelector.matchLabels["k8s-app"]' <<<"$gnp") == kube-dns \
+  && $(yq -r '[.spec.egress[1].ports[] | .port + "/" + .protocol] | join(",")' <<<"$gnp") == "53/UDP,53/TCP" ]] \
+  || fail "mon_20: the Grafana DNS egress is not UDP and TCP 53 to loadTest.dnsSelector"
+[[ $(yq -r '[.spec.egress[2].ports[].port] | join(",")' <<<"$gnp") == "443,6443" && $(yq -r '.spec.egress[2].to | tojson' <<<"$gnp") == null ]] \
+  || fail "mon_20: the API server egress of Grafana is not 443 and 6443 with no peer"
+[[ $(yq -r '.spec.egress | length' <<<"$gnp") == 3 ]] || fail "mon_20: the Grafana egress has rules beyond Prometheus, DNS and the API server"
+grep -qE 'secrets|nodes/' <<<"$gnp" && fail "mon_20: the Grafana policy names secrets or nodes/*"
+
+# The Prometheus ingress: 9090 from the Grafana pods only, and none without Grafana.
+[[ $(yq -r '.spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/name"]' <<<"$(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$tmp/grafana.yaml")") == mimic-grafana ]] \
+  || fail "mon_20: the Prometheus ingress is not from the Grafana pods"
+[[ $(yq -r '[.spec.ingress[].ports[].port] | join(",")' <<<"$(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$tmp/grafana.yaml")") == 9090 ]] \
+  || fail "mon_20: the Prometheus ingress is not TCP 9090"
+render --set monitoring.prometheus.enabled=true --set networkPolicy.enabled=true > "$tmp/np-prom-nog.yaml"
+[[ $(yq -r '.spec.ingress | length' <<<"$(yq 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-prometheus")' "$tmp/np-prom-nog.yaml")") == 0 ]] \
+  || fail "mon_20: the Prometheus policy admits ingress without Grafana"
+render --set monitoring.grafana.enabled=true --set networkPolicy.enabled=false > "$tmp/np-grafana-off.yaml"
+[[ -z $(yq 'select(.kind == "NetworkPolicy" and (.metadata.name == "mimic-grafana" or .metadata.name == "mimic-prometheus"))' "$tmp/np-grafana-off.yaml") ]] \
+  || fail "mon_20: a monitoring NetworkPolicy is rendered with networkPolicy.enabled false"
+echo "mon_20: the Grafana NetworkPolicy admits 3000 from the release namespace, and Prometheus admits 9090 from Grafana only"
+
 echo "chart checks passed"
