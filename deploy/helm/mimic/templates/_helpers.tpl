@@ -105,10 +105,6 @@ seccompProfile:
 {{ .Release.Name }}-valkey-exporter
 {{- end -}}
 
-{{- define "mimic.valkeyAclSecret" -}}
-{{ .Release.Name }}-valkey-acl
-{{- end -}}
-
 {{/*
 loadTest.metricsFrom as JSON peers of the generator NetworkPolicy (spec §10.7): the value when set;
 else, with metrics.podMonitor.enabled, the namespace peer of networkPolicy.metricsNamespaceSelector

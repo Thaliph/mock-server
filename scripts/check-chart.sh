@@ -68,27 +68,41 @@ valkey_args=$(printf '%s\n' "$valkey" | yq -r '.args[]')
 grep -qx -- '--aclfile' <<<"$valkey_args" || fail "mon_01: Valkey has no --aclfile"
 grep -qx -- '/etc/valkey-acl/aclfile' <<<"$valkey_args" || fail "mon_01: Valkey does not read the ACL file of the Secret"
 ! grep -qx -- '--requirepass' <<<"$valkey_args" || fail "mon_01: Valkey has --requirepass with --aclfile (one source of users)"
-[[ $(printf '%s\n' "$sts" | yq -r '.spec.template.spec.volumes[] | select(.name == "acl") | .secret.secretName') == mimic-valkey-acl ]] \
-  || fail "mon_01: the ACL volume is not the Secret mimic-valkey-acl"
 
-# The ACL file (spec §10.7, §11.1): two lines. The default user on the hash of the Valkey password, with no nopass
-# (Valkey recreates default as open when the file lacks it); the exporter user with the SHA-256 of the exporter
-# password, +info +ping, no key access.
-acl=$(doc '.kind == "Secret" and .metadata.name == "mimic-valkey-acl"' | yq -r '.data.aclfile' | base64 -d)
-[[ $(printf '%s\n' "$acl" | wc -l) -eq 2 ]] || fail "mon_01: the ACL file does not have exactly two users"
-grep -Eqx 'user default on #[0-9a-f]{64} ~\* &\* \+@all' <<<"$(sed -n 1p <<<"$acl")" \
-  || fail "mon_01: the ACL file has no user default line on a 64-hex hash"
-! grep -qF nopass <<<"$acl" || fail "mon_01: the ACL file has nopass"
-password=$(doc '.kind == "Secret" and .metadata.name == "mimic-valkey-exporter"' | yq -r '.data.password' | base64 -d)
-want="user mimic-exporter on #$(printf '%s' "$password" | sha256sum | cut -d' ' -f1) +info +ping resetkeys resetchannels"
-[[ $(sed -n 2p <<<"$acl") == "$want" ]] || fail "mon_01: the ACL file is not the exporter user of §10.7"
+# The ACL file is built by the valkey-acl init container at each pod start from the Secrets (spec §10.7, #378), so
+# no Secret holds it, and the render works whatever existingSecret resolves to.
+init=$(printf '%s\n' "$sts" | yq '.spec.template.spec.initContainers[] | select(.name == "valkey-acl")')
+[[ -n $init ]] || fail "mon_01: no valkey-acl init container builds the ACL file"
+[[ $(printf '%s\n' "$init" | yq -r '.image') == "$(printf '%s\n' "$valkey" | yq -r '.image')" ]] \
+  || fail "mon_01: the ACL init container is not the pinned Valkey image"
+[[ $(printf '%s\n' "$init" | yq -r '.env[] | select(.name == "VALKEY_PASSWORD") | .valueFrom.secretKeyRef.name') == golden ]] \
+  || fail "mon_01: the ACL init container does not read the Valkey password from the Valkey Secret"
+[[ $(printf '%s\n' "$init" | yq -r '.env[] | select(.name == "EXPORTER_PASSWORD") | .valueFrom.secretKeyRef.name') == mimic-valkey-exporter ]] \
+  || fail "mon_01: the ACL init container does not read the exporter password from the exporter Secret"
+[[ $(printf '%s\n' "$init" | yq -r '.securityContext.readOnlyRootFilesystem') == true ]] \
+  || fail "mon_01: the ACL init container root filesystem is writable"
+[[ $(printf '%s\n' "$init" | yq -r '.securityContext.allowPrivilegeEscalation') == false ]] \
+  || fail "mon_01: the ACL init container allows privilege escalation"
+[[ $(printf '%s\n' "$init" | yq -r '.securityContext.capabilities.drop | join(",")') == ALL ]] \
+  || fail "mon_01: the ACL init container does not drop ALL capabilities"
+[[ $(printf '%s\n' "$sts" | yq -r '.spec.template.spec.volumes[] | select(.name == "acl") | .emptyDir.medium') == Memory ]] \
+  || fail "mon_01: the ACL volume is not an in-memory emptyDir"
+init_script=$(printf '%s\n' "$init" | yq -r '.args[0]')
+grep -qF 'user default on #%s ~* &* +@all' <<<"$init_script" || fail "mon_01: the ACL init container writes no default user line"
+grep -qF 'user mimic-exporter on #%s +info +ping resetkeys resetchannels' <<<"$init_script" \
+  || fail "mon_01: the ACL init container writes no exporter user line"
+grep -qF 'umask 0226' <<<"$init_script" || fail "mon_01: the ACL file is not mode 0440"
+grep -qF '[ -n "$VALKEY_PASSWORD" ]' <<<"$init_script" && grep -qF '[ -n "$EXPORTER_PASSWORD" ]' <<<"$init_script" \
+  || fail "mon_01: the ACL init container does not refuse an empty password"
+! grep -qi nopass <<<"$init_script" || fail "mon_01: the ACL init container writes nopass"
+! grep -q aclfile <<<"$(doc '.kind == "Secret"')" || fail "mon_01: a Secret holds an ACL file"
 
-# The default user's hash is the hash of the Valkey Secret's password: a render without existingSecret holds both.
+# A render without existingSecret: the init container reads the chart's own Valkey Secret.
 fresh=$(helm template mimic "$chart" -n mimic-system --set valkey.metrics.enabled=true)
-vpw=$(yq -r 'select(.kind == "Secret" and .metadata.name == "mimic-valkey") | .data.password' <<<"$fresh" | base64 -d)
-facl=$(yq -r 'select(.kind == "Secret" and .metadata.name == "mimic-valkey-acl") | .data.aclfile' <<<"$fresh" | base64 -d)
-[[ $(sed -n 1p <<<"$facl") == "user default on #$(printf '%s' "$vpw" | sha256sum | cut -d' ' -f1) ~* &* +@all" ]] \
-  || fail "mon_01: the default user of the ACL file is not the hash of the Valkey password"
+fresh_init=$(yq 'select(.kind == "StatefulSet" and .metadata.name == "mimic-valkey") | .spec.template.spec.initContainers[] | select(.name == "valkey-acl")' <<<"$fresh")
+[[ $(printf '%s\n' "$fresh_init" | yq -r '.env[] | select(.name == "VALKEY_PASSWORD") | .valueFrom.secretKeyRef.name') == mimic-valkey ]] \
+  || fail "mon_01: without existingSecret the init container does not read the chart's Valkey Secret"
+echo "mon_01: the ACL init container builds the file from the Secrets; no Secret holds it"
 
 # The Valkey NetworkPolicy: 6379 from the controller, 9121 from the release namespace.
 netpol=$(doc '.kind == "NetworkPolicy" and .metadata.name == "mimic-valkey"')
@@ -112,7 +126,7 @@ pm=$(doc '.kind == "PodMonitor" and .metadata.name == "mimic-valkey"')
   || fail "mon_01: the PodMonitor leaves the release namespace"
 [[ $(printf '%s\n' "$pm" | yq -r '.spec.podMetricsEndpoints[0].relabelings[0].replacement') == mimic-valkey ]] \
   || fail "mon_01: the PodMonitor job is not mimic-valkey"
-echo "mon_01: the exporter, its Secrets, the ACL, the NetworkPolicy and the PodMonitor have the shape of §10.7"
+echo "mon_01: the exporter, its Secret, the ACL init container, the NetworkPolicy and the PodMonitor have the shape of §10.7"
 
 # The exporter alone adds no PodMonitor.
 render --set valkey.metrics.enabled=true > "$tmp/exporter-only.yaml"

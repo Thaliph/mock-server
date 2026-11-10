@@ -1,24 +1,10 @@
-{{- /*
-The Valkey password (spec §11.1) and the exporter's password (spec §10.7) are drawn once per render, here, so the
-Secrets and the ACL file share them. Each is kept from the cluster on upgrade (lookup).
-*/}}
-{{- $valkeyName := include "mimic.valkeySecret" . }}
-{{- $valkeyExisting := lookup "v1" "Secret" .Release.Namespace $valkeyName }}
-{{- $password := randAlphaNum 40 }}
-{{- if and $valkeyExisting $valkeyExisting.data (index $valkeyExisting.data "password") }}
-{{- $password = b64dec (index $valkeyExisting.data "password") }}
-{{- end }}
-{{- $exporterName := include "mimic.valkeyExporterSecret" . }}
-{{- $exporterExisting := lookup "v1" "Secret" .Release.Namespace $exporterName }}
-{{- $exporterPassword := randAlphaNum 40 }}
-{{- if and $exporterExisting $exporterExisting.data (index $exporterExisting.data "password") }}
-{{- $exporterPassword = b64dec (index $exporterExisting.data "password") }}
-{{- end }}
 {{- if not .Values.valkey.existingSecret }}
+{{- $name := include "mimic.valkeySecret" . }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $name }}
 apiVersion: v1
 kind: Secret
 metadata:
-  name: {{ $valkeyName }}
+  name: {{ $name }}
   labels:
     {{- include "mimic.labels" . | nindent 4 }}
   annotations:
@@ -26,36 +12,11 @@ metadata:
     helm.sh/resource-policy: keep
 type: Opaque
 data:
-  password: {{ $password | b64enc }}
----
-{{- end }}
-{{- if .Values.valkey.metrics.enabled }}
-# The exporter's password (spec §10.7). Kept like the Valkey password: the same value on upgrade.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $exporterName }}
-  labels:
-    {{- include "mimic.labels" . | nindent 4 }}
-  annotations:
-    # Never deleted by helm, so the exporter keeps its password across a reinstall.
-    helm.sh/resource-policy: keep
-type: Opaque
-data:
-  password: {{ $exporterPassword | b64enc }}
----
-# The ACL file, mounted into Valkey (--aclfile, spec §10.7). It holds SHA-256 hashes only: the default user on the
-# Valkey password (the controller's AUTH and the probes), and the exporter user with `+info +ping`,
-# `resetkeys resetchannels`, so the exporter reads no key and no channel.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ include "mimic.valkeyAclSecret" . }}
-  labels:
-    {{- include "mimic.labels" . | nindent 4 }}
-type: Opaque
-data:
-  aclfile: {{ printf "user default on #%s ~* &* +@all\nuser mimic-exporter on #%s +info +ping resetkeys resetchannels\n" (sha256sum $password) (sha256sum $exporterPassword) | b64enc }}
+  {{- if and $existing $existing.data (index $existing.data "password") }}
+  password: {{ index $existing.data "password" }}
+  {{- else }}
+  password: {{ randAlphaNum 40 | b64enc }}
+  {{- end }}
 ---
 {{- end }}
 apiVersion: apps/v1
@@ -88,6 +49,47 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      {{- if .Values.valkey.metrics.enabled }}
+      # The ACL file, built at each pod start from the Secrets (spec §10.7): Valkey loads its users from the file
+      # alone, so the default user is on the Valkey password and the exporter user on its own (#378). Only SHA-256
+      # hashes are written and no password is printed. Mode 0440, in memory, read-only in the valkey container.
+      initContainers:
+        - name: valkey-acl
+          image: {{ include "mimic.valkeyImage" . }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              [ -n "$VALKEY_PASSWORD" ] || { echo "valkey-acl: the Valkey password is empty" >&2; exit 1; }
+              [ -n "$EXPORTER_PASSWORD" ] || { echo "valkey-acl: the exporter password is empty" >&2; exit 1; }
+              umask 0226
+              hash() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+              printf 'user default on #%s ~* &* +@all\nuser mimic-exporter on #%s +info +ping resetkeys resetchannels\n' "$(hash "$VALKEY_PASSWORD")" "$(hash "$EXPORTER_PASSWORD")" > /etc/valkey-acl/aclfile.tmp
+              mv /etc/valkey-acl/aclfile.tmp /etc/valkey-acl/aclfile
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mimic.valkeySecret" . }}
+                  key: password
+            - name: EXPORTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mimic.valkeyExporterSecret" . }}
+                  key: password
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            {{- include "mimic.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: acl
+              mountPath: /etc/valkey-acl
+      {{- end }}
       containers:
         - name: valkey
           image: {{ include "mimic.valkeyImage" . }}
@@ -109,7 +111,8 @@ spec:
             - --maxmemory-policy
             - noeviction
             {{- if .Values.valkey.metrics.enabled }}
-            # One source of users (spec §10.7): the ACL file defines the default user, so no --requirepass.
+            # One source of users (spec §10.7): the ACL file built by the valkey-acl init container defines
+            # the default user, so there is no --requirepass.
             - --aclfile
             - /etc/valkey-acl/aclfile
             {{- end }}
@@ -194,8 +197,9 @@ spec:
         {{- end }}
         {{- if .Values.valkey.metrics.enabled }}
         - name: acl
-          secret:
-            secretName: {{ include "mimic.valkeyAclSecret" . }}
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         {{- end }}
       {{- end }}
   {{- if .Values.valkey.persistence.enabled }}
