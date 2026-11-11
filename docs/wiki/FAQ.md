@@ -23,10 +23,10 @@ deployment. See [Egress aggregation](Egress-aggregation).
 
 **Can I mock a dependency or load-test?**
 Mock mode (F10) is available: `spec.mode: mock` answers a Deployment's outbound calls from its recorded egress,
-and the real destination is not called. See [Mock mode](Mock-mode). Load testing (F11) is still planned.
+and the real destination is not called. See [Mock mode](Mock-mode). Load testing (F11) is available too, off by default: see [Load test](Load-test).
 
 **Is there a UI or an OpenAPI file?**
-Planned (F6). Today use the JSON [read API](Reading-the-API).
+Yes: an OpenAPI 3.1 document and a Swagger UI per deployment. See [Reading the API](Reading-the-API).
 
 **How do I see what was discovered?**
 `kubectl port-forward` to a controller pod and `GET /v1/workloads/<ns>/<dep>/report`, or
