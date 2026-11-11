@@ -101,8 +101,9 @@ seccompProfile:
 {{ .Values.valkey.metrics.image.repository }}:{{ .Values.valkey.metrics.image.tag }}{{ with .Values.valkey.metrics.image.digest }}@{{ . }}{{ end }}
 {{- end -}}
 
+{{/* The exporter's Secret: valkey.metrics.existingSecret (#399), else the chart's own (spec §10.7). */}}
 {{- define "mimic.valkeyExporterSecret" -}}
-{{ .Release.Name }}-valkey-exporter
+{{ .Values.valkey.metrics.existingSecret | default (printf "%s-valkey-exporter" .Release.Name) }}
 {{- end -}}
 
 {{/*

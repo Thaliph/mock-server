@@ -15,6 +15,12 @@ PodMonitors instead.
 
 All three are off by default, so the default render is unchanged.
 
+The PodMonitors select pods in **every namespace** by default (`metrics.podMonitor.namespaceSelector: {any: true}`),
+since a pod can be injected through a `MimicWorkload` alone. The Prometheus that reads them needs `list` and `watch`
+on `pods` in each namespace with injected pods (a ClusterRole, or a Role per namespace). Without that RBAC the
+namespace has no target and Prometheus logs forbidden errors. To narrow the scrape, set the selector with
+`matchNames` (or `matchLabels`) to the namespaces that run injected pods.
+
 ## The bundled Prometheus and Grafana
 
 For a demo or a dev cluster only. Both are off by default and rendered by the chart's own templates: there is no

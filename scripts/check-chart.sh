@@ -25,6 +25,7 @@ lint default
 lint podMonitor --set metrics.podMonitor.enabled=true
 lint valkey.metrics --set valkey.metrics.enabled=true
 lint both --set metrics.podMonitor.enabled=true --set valkey.metrics.enabled=true
+lint valkey.metrics.existingSecret --set valkey.metrics.enabled=true --set valkey.metrics.existingSecret=gitops-exporter
 lint loadTest.podMonitor --set loadTest.enabled=true --set image.digest="$digest" --set metrics.podMonitor.enabled=true
 # #379 (MON-14): the bundled monitoring lints strictly, alone and with the monitors and the load test.
 lint prometheus --set monitoring.prometheus.enabled=true
@@ -79,6 +80,11 @@ env_names=$(printf '%s\n' "$exporter" | yq -r '.env[].name' | sort | tr '\n' ' '
 [[ $(printf '%s\n' "$exporter" | yq -r '.securityContext.seccompProfile.type') == RuntimeDefault ]] || fail "mon_01: the exporter seccomp is not RuntimeDefault"
 [[ $(printf '%s\n' "$exporter" | yq -r '.ports[] | select(.name == "metrics") | .containerPort') == 9121 ]] \
   || fail "mon_01: the exporter port 9121 is not named metrics"
+# #399: liveness only. A readiness of the exporter would take the Valkey pod's Service endpoint away on a restart.
+[[ $(printf '%s\n' "$exporter" | yq -r '.livenessProbe.tcpSocket.port') == metrics ]] \
+  || fail "mon_01: the exporter has no TCP liveness probe on metrics"
+[[ $(printf '%s\n' "$exporter" | yq -r '.readinessProbe') == null ]] \
+  || fail "mon_01: the exporter has a readinessProbe (its restart would drop the Valkey endpoint)"
 
 valkey_args=$(printf '%s\n' "$valkey" | yq -r '.args[]')
 grep -qx -- '--aclfile' <<<"$valkey_args" || fail "mon_01: Valkey has no --aclfile"
@@ -119,6 +125,34 @@ fresh_init=$(yq 'select(.kind == "StatefulSet" and .metadata.name == "mimic-valk
 [[ $(printf '%s\n' "$fresh_init" | yq -r '.env[] | select(.name == "VALKEY_PASSWORD") | .valueFrom.secretKeyRef.name') == mimic-valkey ]] \
   || fail "mon_01: without existingSecret the init container does not read the chart's Valkey Secret"
 echo "mon_01: the ACL init container builds the file from the Secrets; no Secret holds it"
+
+# #399: the exporter's password. Without valkey.metrics.existingSecret the chart renders its Secret; with it, none, and the
+# exporter and valkey-acl read the key password of that Secret. Neither StatefulSet carries a pod annotation (no checksum),
+# so a render never restarts Valkey.
+exporter_secret_ref() { # exporter_secret_ref <yq doc of the StatefulSet>: the secretKeyRef of the exporter and of valkey-acl
+  yq -r '[(.spec.template.spec.containers[] | select(.name == "exporter") | .env[] | select(.name == "REDIS_PASSWORD") | .valueFrom.secretKeyRef),
+    (.spec.template.spec.initContainers[] | select(.name == "valkey-acl") | .env[] | select(.name == "EXPORTER_PASSWORD") | .valueFrom.secretKeyRef)]
+    | map(.name + "/" + .key) | join(" ")' <<<"$1"
+}
+[[ -n $(doc '.kind == "Secret" and .metadata.name == "mimic-valkey-exporter"') ]] \
+  || fail "mon_01: no exporter Secret mimic-valkey-exporter is rendered by default"
+[[ $(exporter_secret_ref "$sts") == "mimic-valkey-exporter/password mimic-valkey-exporter/password" ]] \
+  || fail "mon_01: the exporter and valkey-acl do not read the exporter Secret by default"
+[[ $(printf '%s\n' "$sts" | yq -r '.spec.template.metadata.annotations') == null ]] \
+  || fail "mon_01: the Valkey pod template has an annotation (a checksum would restart Valkey on a render)"
+ext=$(render --set valkey.metrics.enabled=true --set valkey.metrics.existingSecret=gitops-exporter)
+ext_sts=$(yq 'select(.kind == "StatefulSet" and .metadata.name == "mimic-valkey")' <<<"$ext")
+[[ -z $(yq 'select(.kind == "Secret" and .metadata.name == "mimic-valkey-exporter")' <<<"$ext") ]] \
+  || fail "mon_01: an exporter Secret is rendered with valkey.metrics.existingSecret"
+[[ -z $(yq 'select(.kind == "Secret" and .metadata.name == "gitops-exporter")' <<<"$ext") ]] \
+  || fail "mon_01: the existing exporter Secret is rendered by the chart"
+[[ $(exporter_secret_ref "$ext_sts") == "gitops-exporter/password gitops-exporter/password" ]] \
+  || fail "mon_01: with valkey.metrics.existingSecret the exporter and valkey-acl do not read that Secret's key password"
+[[ $(printf '%s\n' "$ext_sts" | yq -r '.spec.template.metadata.annotations') == null ]] \
+  || fail "mon_01: the Valkey pod template has an annotation with valkey.metrics.existingSecret"
+[[ $(yq -r '.spec.template.spec.containers[] | select(.name == "valkey") | .args | join(" ")' <<<"$ext_sts") == *"--aclfile /etc/valkey-acl/aclfile"* ]] \
+  || fail "mon_01: Valkey does not read the ACL file with valkey.metrics.existingSecret"
+echo "mon_01: valkey.metrics.existingSecret: no exporter Secret is rendered, and both readers use its key password"
 
 # The Valkey NetworkPolicy: 6379 from the controller, 9121 from the release namespace.
 netpol=$(doc '.kind == "NetworkPolicy" and .metadata.name == "mimic-valkey"')
@@ -495,6 +529,8 @@ dctr=$(yq '.spec.template.spec.containers[] | select(.name == "dashboards")' <<<
 tmpvol=$(yq -r '.volumeMounts[] | select(.mountPath == "/tmp") | .name' <<<"$gctr")
 [[ -n $tmpvol && $(yq -r ".spec.template.spec.volumes[] | select(.name == \"$tmpvol\") | .emptyDir.medium" <<<"$gdep") == Memory ]] \
   || fail "mon_19: grafana has no memory emptyDir on /tmp (its backend plugins need it on the read-only root)"
+[[ $(yq -r ".spec.template.spec.volumes[] | select(.name == \"$tmpvol\") | .emptyDir.sizeLimit" <<<"$gdep") == 16Mi ]] \
+  || fail "mon_19: the /tmp emptyDir of grafana has not sizeLimit 16Mi (§10.7)"
 [[ $(yq -r '.spec.template.spec.containers[] | select(.volumeMounts[]?.name == "kube-api-access") | .name' <<<"$gdep") == dashboards ]] \
   || fail "mon_19: the projected token is not mounted in dashboards only"
 [[ $(yq -r '.spec.template.spec.volumes[] | select(.name == "kube-api-access") | .projected.sources[0] | has("serviceAccountToken")' <<<"$gdep") == true ]] \
@@ -537,6 +573,8 @@ ini=$(yq -r 'select(.kind == "ConfigMap" and .metadata.name == "mimic-grafana") 
 disabled=$(sed -n 's/^disable_plugins = //p' <<<"$ini")
 [[ -n $disabled ]] && ! tr ',' '\n' <<<"$disabled" | grep -qx prometheus \
   || fail "mon_19: grafana.ini does not disable the unused datasource plugins, or disables prometheus"
+# #407: the legacy postgres plugin ID is disabled as well (grafana-postgresql-datasource is the current one).
+tr ',' '\n' <<<"$disabled" | grep -qx postgres || fail "mon_19: plugins.disable_plugins does not list the legacy postgres plugin"
 for line in "reporting_enabled = false" "check_for_updates = false" "check_for_plugin_updates = false" \
   "news_feed_enabled = false" "preinstall_disabled = true" "enabled = false" "allow_sign_up = false" \
   "disable_gravatar = true" "mode = console" "format = json" "admin_user = admin"; do

@@ -169,11 +169,10 @@ spec:
           ports:
             - name: metrics
               containerPort: 9121
+          # Liveness only: a readiness of the exporter would make the Valkey pod unready and drop its Service
+          # endpoint on each exporter restart (spec §10.7, #399).
           livenessProbe:
             tcpSocket: {port: metrics}
-            periodSeconds: 10
-          readinessProbe:
-            httpGet: {path: /metrics, port: metrics}
             periodSeconds: 10
           resources:
             {{- toYaml .Values.valkey.metrics.resources | nindent 12 }}
