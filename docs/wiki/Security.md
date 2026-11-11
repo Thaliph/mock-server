@@ -103,7 +103,7 @@ The main ones (full list: spec §11.1):
   pod is not.
 - GitOps tools must ignore the `caBundle` of the webhook configuration and the data of the two Secrets.
 - Emptying the seed Secret rotates every root CA; running sidecars pass TLS through until recreated.
-- **Capture is not a security boundary** (F10): an app container with `NET_ADMIN`, or whose image runs as
+- **Capture is not a security boundary** (F1, F3): an app container with `NET_ADMIN`, or whose image runs as
   UID 1337 without declaring it, escapes the redirection.
 - **Mock (F10).** Whoever may create or edit a `MimicWorkload` in a namespace decides the egress of every
   Deployment there. A mock replays samples with no state across calls. Roll back mimic only out of mock.

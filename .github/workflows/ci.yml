@@ -169,6 +169,7 @@ jobs:
           python3 -I scripts/test_vendor_swagger_ui.py
           python3 -I scripts/test_check_cooldown.py
           python3 -I scripts/test_check_dashboards.py
+          python3 -I scripts/test_release_notes.py
       - name: Swagger UI vendoring check
         run: python3 -I scripts/vendor-swagger-ui.py --check
 
