@@ -7,6 +7,33 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Features
+
+- **F13, readable placeholders (#424).** Redacted values are written as a typed placeholder
+  `mimic-<type>` (`Bearer mimic-token`, `a=mimic-cookie`, `mimic-jwt`, 13 types in all) instead of
+  `<redacted>`, chosen by the rule that fired, never by the value. Mock answers replay the
+  placeholders, and a load test sends them by default: `credentials` replaces them with the values of
+  a Secret, or the test environment accepts mimic's placeholders (wiki Load test, *Testing with
+  credentials*). `<redacted>` remains only in the host of a redacted outbound authority.
+
+### Fixed
+
+- F11 follow-ups: load test and mock fixes from the reviews of steps 7 to 9 (#420, via #425 and #426).
+- The distroless base image is bumped to a digest without the `zlib1g` finding, and its Trivy
+  exceptions are removed (#371, via #423).
+- `jsonschema` 0.60.2 (#396).
+
+### Upgrade notes
+
+- Data written by 0.2.0-alpha.1 holds `<redacted>`: it is upgraded on read (the field name gives the
+  placeholder, else `mimic-secret`) and rewritten at the next push; nothing needs a migration, and
+  untouched data expires with `MIMIC_STORE_TTL`.
+- A load test without `credentials` now sends placeholders to the endpoints that were skipped as
+  `credentials` before: they may answer `4xx` unless the test environment accepts them or a Secret
+  is mapped.
+- Rolling back to 0.2.0-alpha.1 treats placeholders as ordinary strings and degrades matching, without
+  leaking anything (spec §11.1).
+
 ## [0.2.0-alpha.1] - 2026-11-11
 
 First pre-release of mimic v2, a ground-up rewrite. It replaces the legacy `v0.1.0` product, which

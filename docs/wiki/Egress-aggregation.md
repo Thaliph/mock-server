@@ -9,7 +9,7 @@ controller, per deployment, next to the inbound endpoints.
 The sidecar of every pod records its outbound HTTP exchanges (cleartext, and HTTPS when it is
 [intercepted](TLS-interception)) in a bounded local report, in a scope of its own per **authority**: the
 host and port the app called (`users.disc-22.svc:8080`). The same redaction rules as for inbound apply,
-with a stricter view for outbound: request headers outside a short allowlist are shown as `<redacted>`,
+with a stricter view for outbound: request headers outside a short allowlist are shown as `mimic-secret` (and `Authorization: Bearer mimic-token`),
 so a credential in any header, query parameter or body never leaves the pod. A connection that cannot be
 decrypted (a tunnel, a refused interception) is counted per authority and kind, without any endpoint.
 

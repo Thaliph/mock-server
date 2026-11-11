@@ -57,10 +57,35 @@ slot is busy, a send is counted as `missed`, not queued.
 
 The controller builds a plan from the stored inbound report: each endpoint is drawn by weight (its recorded
 exchanges), then one of its recorded samples. Fields that discovery marked volatile (timestamps, UUIDs, ids)
-get fresh values that keep their shape. Values that were redacted are not replayed: an endpoint that needs one
-is skipped unless `credentials.fields` supplies it from your Secret, which the author of the object must be
-allowed to `get`. Skipped endpoints are counted by reason in `status.skipped` (`grpc`, `upgrade`, `excluded`,
+get fresh values that keep their shape. Values that were redacted are sent as their placeholder
+(`Authorization: Bearer mimic-token`), unless `credentials.fields` supplies the real value from your Secret,
+which the author of the object must be allowed to `get` (see [Testing with credentials](#testing-with-credentials)).
+Only a placeholder in a name or a path segment cannot be replayed: that endpoint is skipped as `credentials`. Skipped endpoints are counted by reason in `status.skipped` (`grpc`, `upgrade`, `excluded`,
 `no_sample`, `credentials`, `opaque_body`, `limit`, `plan_size`). HTTP/1.1 cleartext only; gRPC is skipped.
+
+## Testing with credentials
+
+An authenticated endpoint rejects a request that carries a placeholder, unless you choose one of two ways.
+Without either, it answers `4xx`.
+
+1. **A Secret with real test values**, mapped with `credentials.fields`. Each entry replaces the whole value of
+   one field with the bytes of a Secret key (a trailing newline removed); the other credential fields keep
+   their placeholder. The Secret is read only by the generator, never reaches sidecars or Valkey.
+
+   ```yaml
+   spec:
+     deployment: payments
+     credentials:
+       secretName: payment-load      # key `token` holds `Bearer <test token>`
+       fields:
+         - {field: header/authorization, key: token}
+   ```
+
+2. **A test environment that accepts mimic's placeholders**, for example a test identity provider or a gateway
+   rule that accepts `Authorization: Bearer mimic-token`. The 13 placeholders are `mimic-auth`, `mimic-token`,
+   `mimic-jwt`, `mimic-api-key`, `mimic-password`, `mimic-private-key`, `mimic-secret`, `mimic-session`,
+   `mimic-cookie`, `mimic-signature`, `mimic-card`, `mimic-iban` and `mimic-ssn`; see
+   [Discovery and redaction](Discovery-and-redaction).
 
 ## Safety: mock only
 

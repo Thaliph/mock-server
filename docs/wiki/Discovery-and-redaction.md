@@ -79,7 +79,34 @@ class.
 ## Redaction
 
 Applied in the sidecar before anything is stored, logged or sent, and **again** in the controller
-before anything reaches Valkey. The marker is the constant `<redacted>` (no hash of a secret is kept).
+before anything reaches Valkey. The marker is a readable **placeholder** `mimic-<type>`: one constant per
+type, chosen by the rule that fired and never by the value, so no byte, length or hash of a secret is kept.
+
+| Placeholder | Given by |
+|---|---|
+| `mimic-auth` | names `authorization`, `proxy-authorization`, `auth`, `credential`; the credential after a scheme other than `Bearer` (`Basic mimic-auth`) |
+| `mimic-token` | name `token`; the credential after `Bearer` (`Bearer mimic-token`); `ghp_`, `glpat-`, `xox*-` tokens |
+| `mimic-jwt` | a JWT found by value |
+| `mimic-api-key` | name `apikey`; AWS and Google API keys; `sk-`, `sk_live_`, `rk_live_` |
+| `mimic-password` | names `password`, `passwd`; the password of a URL's userinfo |
+| `mimic-private-key` | name `privatekey`; a PEM block |
+| `mimic-secret` | name `secret`; names of `spec.discovery.redact`; unlisted outbound headers |
+| `mimic-session` | name `session` |
+| `mimic-cookie` | each value of `Cookie` and `Set-Cookie` (`a=mimic-cookie; b=mimic-cookie`) |
+| `mimic-signature` | name `signature` |
+| `mimic-card` | names `cardnumber`, `pan`, `cvv`, `cvc`; a card number found by value |
+| `mimic-iban` | name `iban` |
+| `mimic-ssn` | name `ssn` |
+
+A name rule wins over a value rule (`token: <JWT>` gives `mimic-token`, `note: <JWT>` gives `mimic-jwt`);
+when several names match, the one that ends last wins (`session_token` gives `mimic-token`). Placeholders are
+valid wherever a value can sit (header token, cookie value, URL, JSON string) and no detector catches them, so
+redaction is idempotent.
+
+`<redacted>` is the **legacy marker**: data written up to 0.2.0-alpha.1 holds it. Every reader upgrades it to
+a placeholder on read (the field name gives the type, else `mimic-secret`), and data is rewritten with
+placeholders at the next push. The only place where `<redacted>` remains is the host of a redacted outbound
+authority (`<redacted>:443`): a scope key, never a value that gets sent.
 
 **By name** (header name, query key, form field, JSON key). Names are split into tokens (at `-`, `_`,
 `.`, case changes, letters/digits) and compared in lower case. Built-in names: `authorization`,
@@ -89,7 +116,7 @@ before anything reaches Valkey. The marker is the constant `<redacted>` (no hash
 others also match inside a token (`JSESSIONID`, `csrftoken`, `clientsecret`). So `X-Api-Key`,
 `auth_token`, `client_secret`, `Session-Id` are redacted; `company`, `author`, `panel` are not. The
 whole value (a JSON subtree included) becomes the marker, except `Authorization` keeps its scheme
-(`Bearer <redacted>`), `Cookie` keeps cookie names, `Set-Cookie` keeps name and attributes.
+(`Bearer mimic-token`), `Cookie` keeps cookie names, `Set-Cookie` keeps name and attributes.
 
 **By value** (every other string and number): JWTs, PEM blocks, `Bearer`/`Basic` credentials, 13-19
 digit card numbers passing Luhn, AWS access key ids (`AKIA`/`ASIA`), tokens with a known prefix
@@ -117,7 +144,7 @@ added later applies to stored data from the next push.
 
 - Opaque bodies (only media type and size).
 - Header values, queries, bodies or samples in logs: no log line holds them.
-- A hash of a redacted value.
+- A hash of a redacted value, or any byte of it: a placeholder only names the kind of secret (accepted limit).
 - Keys, seed and tokens.
 - Query strings in the access log.
 

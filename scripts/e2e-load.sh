@@ -329,6 +329,23 @@ suite_main() {
   [[ $(exchanges) == "$exch0" ]] || fail "ldt_16: the discovery exchanges of front grew during run A"
   if found -F -e "$canary" "$WORK/run-a.json"; then fail "ldt_16: a canary of the credentials Secret is in the status of run A"; fi
 
+  # PLH-09, PLH-10: with credentials no endpoint is skipped for a redacted value (placeholders are planned, the Secret
+  # replaces two of them); the run without credentials sends the placeholders (`Bearer mimic-token`), so it plans the same
+  # endpoints. The targets' request headers are not observable here: the unit and integration tests (PLH-08, PLH-09) check them.
+  jq -e '((.status.skipped // {}) | has("credentials") | not)' "$WORK/run-a.json" >/dev/null \
+    || fail "ldt_16: run A skipped endpoints as credentials: $(jq -c '.status.skipped' "$WORK/run-a.json")"
+  log "ldt_16: run D, without credentials, sends the placeholders and completes"
+  run_create mck-19 ldt16-d front ""
+  job_d=$(job_of mck-19 ldt16-d) || fail "ldt_16: no uid of run D"
+  wait_for 240 run_is mck-19 ldt16-d 'Succeeded/Completed' \
+    || fail "ldt_16: run D ended $(run_status mck-19 ldt16-d), not Succeeded/Completed"
+  kubectl -n mck-19 get mimicloadtest ldt16-d -o json > "$WORK/run-d.json" || fail "ldt_16: cannot read run D"
+  jq -e '((.status.skipped // {}) | has("credentials") | not) and ((.status.results.endpoints | length) == (input.status.results.endpoints | length))' \
+    "$WORK/run-d.json" "$WORK/run-a.json" >/dev/null \
+    || fail "ldt_16: run D skipped endpoints as credentials or planned another set than run A: $(jq -c '.status.skipped' "$WORK/run-d.json")"
+  [[ -n $job_d ]] || fail "ldt_16: run D has no Job"
+  if found -F -e "$canary" "$WORK/run-d.json"; then fail "ldt_16: a canary of the credentials Secret is in the status of run D"; fi
+
   # Run B: switched out of mock 20 s after its start.
   log "ldt_16: run B is switched to discovery 20 s after its start: Aborted/ModeLeft, its Job gone within 10 s"
   run_create mck-19 ldt16-b front "$creds"
@@ -366,7 +383,7 @@ suite_main() {
   absent networkpolicy "$job_c" -n disc-22 || fail "ldt_16: run C has a NetworkPolicy after Failed/NotMock"
 
   log "ldt_16: deleting the runs removes run A's Job and NetworkPolicy"
-  kubectl -n mck-19 delete mimicloadtest ldt16-a ldt16-b >/dev/null || fail "ldt_16: cannot delete runs A and B"
+  kubectl -n mck-19 delete mimicloadtest ldt16-a ldt16-b ldt16-d >/dev/null || fail "ldt_16: cannot delete runs A and B"
   kubectl -n disc-22 delete mimicloadtest ldt16-c >/dev/null || fail "ldt_16: cannot delete run C"
   wait_for 90 absent job "$job_a" -n mck-19 || fail "ldt_16: the Job of run A is there after its MimicLoadTest was deleted"
   wait_for 90 absent networkpolicy "$job_a" -n mck-19 \
