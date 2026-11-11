@@ -256,6 +256,14 @@ suite_main() {
   helm upgrade "$RELEASE" deploy/helm/mimic -n "$NS" --reuse-values --set loadTest.enabled=true \
     --set image.digest="$digest" --wait --timeout 4m >/dev/null || fail "ldt_16: helm upgrade with loadTest.enabled"
   kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
+  # The webhook sets MIMIC_LOAD_ENABLED on the sidecars it injects while load testing is on (§10.3): the pods of front
+  # were injected before, so they are restarted to get it (§10.3: a pod injected before keeps its env).
+  kubectl -n mck-19 rollout restart deploy/front >/dev/null
+  kubectl -n mck-19 rollout status deploy/front --timeout=3m >/dev/null || fail "ldt_16: front did not roll out after enabling load tests"
+  for p in $(kubectl -n mck-19 get pods -l app=front -o name); do
+    [[ $(kubectl -n mck-19 get "$p" -o jsonpath='{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_LOAD_ENABLED")].value}') == 1 ]] \
+      || fail "ldt_16: $p has no MIMIC_LOAD_ENABLED=1 after enabling load tests"
+  done
 
   # The Secret of the credentials: a canary, held by the Secret and by the generator's requests only.
   canary="ldt16-$(openssl rand -hex 16)"
