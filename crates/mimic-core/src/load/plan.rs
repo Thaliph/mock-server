@@ -245,7 +245,6 @@ pub fn plan(report: &Report, spec: &Spec) -> Planned {
 
 /// `plan` with an explicit byte limit, not raised to `MIN_PLAN` (tests).
 pub(super) fn build(report: &Report, spec: &Spec, max_plan: usize) -> Planned {
-    let supplied: BTreeSet<&str> = spec.credentials.iter().map(|c| c.field.as_str()).collect();
     let mut skipped: BTreeMap<&'static str, u64> = BTreeMap::new();
     // Usable endpoints in report order.
     let mut usable: Vec<Endpoint> = Vec::new();
@@ -286,11 +285,11 @@ pub(super) fn build(report: &Report, spec: &Spec, max_plan: usize) -> Planned {
             if opaque_body(sample) {
                 continue;
             }
+            // A credential field is sent as its placeholder, or the Secret's value; only a
+            // name that cannot be supplied makes the sample unusable.
             match needs(sample) {
-                Some(n) if n.iter().all(|f| supplied.contains(f.as_str())) => {
-                    samples.push(plan_sample(hash, sample));
-                }
-                _ => credential_refused = true,
+                Some(_) => samples.push(plan_sample(hash, sample)),
+                None => credential_refused = true,
             }
         }
         if samples.is_empty() {

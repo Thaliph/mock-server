@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::check::Violation;
 use super::histogram::Histogram;
+use super::redact::{MARKER, Redactor};
 use super::report::{Direction, MAX_PATH, MAX_SEGMENTS, Report};
 use super::sample::{MAX_SAMPLES, Sample};
 use super::scope::ScopeKey;
@@ -176,7 +178,40 @@ impl EgressSet {
                 }
             }
         }
-        Ok(set)
+        Ok(set.upgraded())
+    }
+
+    /// The placeholder upgrade (spec §6) of an egress set written up to F12: a sample that
+    /// holds the legacy marker is redacted again, as an outbound request and its response, and
+    /// samples that become equal are one. A set without the marker is returned as it is.
+    pub fn upgraded(mut self) -> Self {
+        let request = Redactor::default().outbound_request();
+        let response = Redactor::default();
+        for endpoint in self
+            .authorities
+            .values_mut()
+            .flat_map(|a| a.endpoints.iter_mut())
+        {
+            let legacy = |s: &Sample| serde_json::to_string(s).is_ok_and(|t| t.contains(MARKER));
+            if !endpoint.samples.iter().any(legacy) {
+                continue;
+            }
+            let mut keyed: Vec<(u64, Sample)> = Vec::new();
+            for mut sample in std::mem::take(&mut endpoint.samples) {
+                if legacy(&sample) {
+                    sample.redact(&request, &response);
+                    // A body that grows past the limit takes its sample with it.
+                    if sample.check().is_err_and(|v| v == Violation::BodySize) {
+                        continue;
+                    }
+                }
+                keyed.push((sample.reseal(), sample));
+            }
+            keyed.sort_by_key(|(hash, _)| *hash);
+            keyed.dedup_by_key(|(hash, _)| *hash);
+            endpoint.samples = keyed.into_iter().map(|(_, s)| s).collect();
+        }
+        self
     }
 
     /// Canonical JSON: sorted keys, so equal sets give equal bytes.

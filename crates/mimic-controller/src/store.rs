@@ -551,16 +551,27 @@ enum Part {
     Outbound,
 }
 
-/// A stored part, once it parses, passes the structural check and is of its kind.
+/// True when stored bytes may hold the legacy marker of up to F12 (authority hosts hold it too).
+fn legacy_marker(bytes: &[u8]) -> bool {
+    let marker = mimic_core::discovery::redact::MARKER.as_bytes();
+    bytes.windows(marker.len()).any(|w| w == marker)
+}
+
+/// A stored part, once it parses, passes the structural check and is of its kind. A part written
+/// up to F12 is upgraded to placeholders (spec §6): reads never write it back.
 fn read_part(bytes: &[u8], part: Part) -> Option<Report> {
-    let report = std::str::from_utf8(bytes)
-        .ok()
-        .and_then(|json| Report::parse_checked(json, usize::MAX, usize::MAX).ok())?;
+    let json = std::str::from_utf8(bytes).ok()?;
+    let mut report = Report::parse_checked(json, usize::MAX, usize::MAX).ok()?;
     match part {
         Part::Inbound => report.version() == 1,
         Part::Outbound => report.version() == 2 && !report.holds_inbound(),
     }
-    .then_some(report)
+    .then(|| {
+        if legacy_marker(bytes) {
+            mimic_core::discovery::placeholder::upgrade(&mut report);
+        }
+        report
+    })
 }
 
 /// A stored `:outbound` once it parses, passes the structural check and is of its kind.
@@ -1021,8 +1032,14 @@ impl Store {
         };
         let inbound = read_part(&bytes, Part::Inbound).ok_or_else(|| unreadable("report"))?;
         let Some(outbound) = outbound else {
-            // F7 bytes: the stored report as it is.
-            return Ok(bytes);
+            // F7 bytes: the stored report as it is, unless it holds the legacy marker.
+            if !legacy_marker(&bytes) {
+                return Ok(bytes);
+            }
+            return inbound
+                .to_json()
+                .map(String::into_bytes)
+                .map_err(|_| unreadable("report"));
         };
         let outbound =
             read_part(&outbound, Part::Outbound).ok_or_else(|| unreadable("outbound"))?;

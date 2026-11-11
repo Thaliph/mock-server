@@ -358,7 +358,11 @@ impl Sample {
 
     /// The §6 redaction again on the path, query, headers and bodies. True when something
     /// changed.
-    fn redact(&mut self, request_redactor: &Redactor, response_redactor: &Redactor) -> bool {
+    pub(super) fn redact(
+        &mut self,
+        request_redactor: &Redactor,
+        response_redactor: &Redactor,
+    ) -> bool {
         let before = (self.request.clone(), self.response.clone());
         self.request.path = redact::path(&self.request.path);
         for (key, value) in &mut self.request.query {
@@ -386,7 +390,7 @@ impl Sample {
 
     /// Size and content hash from the content, as `new` computes them: nothing a pod declares
     /// is trusted.
-    fn reseal(&mut self) -> u64 {
+    pub(super) fn reseal(&mut self) -> u64 {
         // Plain data: serialisation cannot fail.
         let content = serde_json::to_vec(&(&self.request, &self.response)).unwrap_or_default();
         let head_ms = std::mem::take(&mut self.head_ms);

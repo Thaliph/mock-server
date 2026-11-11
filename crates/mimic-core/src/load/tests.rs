@@ -228,35 +228,39 @@ mod plan_tests {
     }
 
     #[test]
-    fn ldt_01_a_bearer_endpoint_needs_its_credential_field() {
+    fn ldt_01_a_bearer_endpoint_is_planned_with_and_without_its_credential_field() {
         let items =
             [Ex::new("GET", "/me", 200).header("authorization", &format!("Bearer {CANARY}"))];
+        // PLH-08: no `credentials` is needed; the sample carries its placeholder.
         let p = planned(&items, &spec());
-        assert!(p.plan.endpoints.is_empty());
-        assert_eq!(skipped(&p), [("credentials", 1)]);
+        assert_eq!(keys(&p.plan), ["GET /me"]);
+        assert!(p.skipped.is_empty());
+        let header = &p.plan.endpoints[0].samples[0].headers;
+        assert!(header.contains(&(
+            "authorization".to_string(),
+            "Bearer mimic-token".to_string()
+        )));
 
         let mut s = spec();
         s.credentials = vec![credential("header/authorization", "token")];
         let p = planned(&items, &s);
         assert_eq!(keys(&p.plan), ["GET /me"]);
         assert!(p.skipped.is_empty());
-
-        // Another field does not help.
-        s.credentials = vec![credential("query/api_key", "token")];
-        assert_eq!(skipped(&planned(&items, &s)), [("credentials", 1)]);
+        // The plan holds no secret and no canary either way.
+        let text = serde_json::to_string(&p.plan).unwrap_or_default();
+        assert!(!text.contains(CANARY));
     }
 
     #[test]
-    fn ldt_01_a_query_or_body_credential_is_supplied_by_its_field() {
+    fn ldt_01_a_query_or_body_credential_is_planned_with_its_placeholder() {
         let items = [Ex::new("POST", "/pay", 200)
             .query(&format!("api_key={CANARY}"))
             .json(&json!({"card": {"token": CANARY}, "amount": 5}))];
-        let mut s = spec();
-        s.credentials = vec![credential("query/api_key", "k")];
-        assert_eq!(skipped(&planned(&items, &s)), [("credentials", 1)]);
-        s.credentials.push(credential("body/card/token", "t"));
-        let p = planned(&items, &s);
+        let p = planned(&items, &spec());
         assert_eq!(keys(&p.plan), ["POST /pay"]);
+        assert!(p.skipped.is_empty());
+        let sample = &p.plan.endpoints[0].samples[0];
+        assert_eq!(sample.query[0], ("api_key".into(), "mimic-api-key".into()));
     }
 
     #[test]
@@ -648,6 +652,72 @@ mod request_tests {
         assert_eq!(body["amount"], 5);
         assert!(well_formed(&r));
         assert!(!String::from_utf8_lossy(&r.body).contains(CANARY));
+    }
+
+    #[test]
+    fn plh_08_credential_fields_are_sent_as_placeholders_unless_supplied() {
+        let items = [Ex::new("POST", "/pay", 200)
+            .header("authorization", &format!("Bearer {CANARY}"))
+            .query(&format!("api_key={CANARY}&x=1"))
+            .json(&json!({"card": {"token": CANARY}, "amount": 5}))];
+        let r = one(&items, &spec(), &BTreeMap::new());
+        assert_eq!(header(&r, "authorization"), ["Bearer mimic-token"]);
+        assert!(r.target.contains("api_key=mimic-api-key"), "{}", r.target);
+        let body: serde_json::Value = serde_json::from_slice(&r.body).expect("json");
+        assert_eq!(body["card"]["token"], "mimic-token");
+        let text = format!("{r:?}{}", String::from_utf8_lossy(&r.body));
+        assert!(!text.contains(CANARY) && !text.contains(MARKER));
+
+        // A supplied field carries the Secret's bytes and no placeholder.
+        let mut s = spec();
+        s.credentials = vec![credential("header/authorization", "auth")];
+        let secrets: BTreeMap<String, String> =
+            [("auth".to_string(), format!("Bearer {SECRET}\n"))].into();
+        let r = one(&items, &s, &secrets);
+        assert_eq!(header(&r, "authorization"), [format!("Bearer {SECRET}")]);
+        assert!(r.target.contains("api_key=mimic-api-key"));
+    }
+
+    #[test]
+    fn plh_08_a_placeholder_is_never_refreshed_as_a_volatile_field() {
+        let items = [Ex::new("POST", "/pay", 200)
+            .header("x-trace", "abc123def456")
+            .json(&json!({"card": {"token": CANARY}}))];
+        let mut p = planned(&items, &spec()).plan;
+        for field in [
+            "request.body/application/json/card/token",
+            "request.header/x-trace",
+        ] {
+            p.endpoints[0].volatile.push(field.to_string());
+        }
+        for seed in 0..20 {
+            let r = request(&p, &ctx(&BTreeMap::new(), 0), seed).expect("a request");
+            let body: serde_json::Value = serde_json::from_slice(&r.body).expect("json");
+            assert_eq!(body["card"]["token"], "mimic-token");
+        }
+    }
+
+    #[test]
+    fn plh_08_a_plan_with_legacy_markers_builds_requests_with_placeholders() {
+        let items = [Ex::new("POST", "/pay", 200)
+            .header("authorization", "Bearer abc")
+            .query("api_key=abc")
+            .json(&json!({"card": {"token": "abc"}, "note": "n"}))];
+        let mut p = planned(&items, &spec()).plan;
+        let sample = &mut p.endpoints[0].samples[0];
+        for (_, v) in sample.headers.iter_mut().chain(sample.query.iter_mut()) {
+            *v = v
+                .replace("mimic-token", MARKER)
+                .replace("mimic-api-key", MARKER);
+        }
+        if let Some(super::super::plan::Body::Json { text, .. }) = &mut sample.body {
+            *text = text.replace("mimic-token", MARKER);
+        }
+        let r = request(&p, &ctx(&BTreeMap::new(), 0), 1).expect("a request");
+        assert_eq!(header(&r, "authorization"), ["Bearer mimic-token"]);
+        assert!(r.target.contains("api_key=mimic-api-key"), "{}", r.target);
+        let body = String::from_utf8_lossy(&r.body).into_owned();
+        assert!(body.contains("mimic-token") && !body.contains(MARKER));
     }
 
     #[test]
