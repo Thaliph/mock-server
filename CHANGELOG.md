@@ -7,6 +7,8 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+## [0.2.0-alpha.2] - 2026-11-11
+
 ### Features
 
 - **F13, readable placeholders (#424).** Redacted values are written as a typed placeholder
@@ -15,15 +17,22 @@ All notable changes to mimic are documented in this file. The format follows
   placeholders, and a load test sends them by default: `credentials` replaces them with the values of
   a Secret, or the test environment accepts mimic's placeholders (wiki Load test, *Testing with
   credentials*). `<redacted>` remains only in the host of a redacted outbound authority.
-
-### Fixed
-
 - Load test reconciler and read API follow-ups of the F11 reviews (#420, via #425 and #426): the
   generator policy pins `fsGroup` and the credentials Secret mode, the final verdict re-reads the
   posts, outages are logged once per reason, and the e2e checks are tighter.
 - The distroless base image moves to a rebuild with the fixed `zlib1g`, and the two Trivy exceptions
   are removed (#371, via #423).
 - Dependency: `jsonschema` 0.59.0 to 0.60.2, which fixes a stack overflow on `$ref` cycles (#396).
+- CI runs only the jobs a change needs, and `ci-ok` fails closed on any skip its gates did not
+  allow (#428, via #429).
+
+### Accepted limits
+
+Unchanged from 0.2.0-alpha.1 (see
+[`docs/SPEC.md`](https://github.com/Thaliph/mock-server/blob/v0.2.0-alpha.2/docs/SPEC.md#111-accepted-limits)
+and the wiki Security page), plus one: a real value exactly equal to a placeholder (for example
+`mimic-token`) is taken for a placeholder, so mock matching skips that field and a load test treats
+it as a credential field. Placeholders are public constants, not secrets.
 
 ### Upgrade notes
 

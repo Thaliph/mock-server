@@ -11,7 +11,7 @@ Off by default, because it adds Job and EndpointSlice RBAC, the `MimicLoadTest` 
 ValidatingAdmissionPolicies. It needs the mimic image pinned by digest, which a released chart has:
 
 ```bash
-helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.1 -n mimic-system \
+helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system \
   --reuse-values --set loadTest.enabled=true
 ```
 
@@ -86,6 +86,10 @@ Without either, it answers `4xx`.
    `mimic-jwt`, `mimic-api-key`, `mimic-password`, `mimic-private-key`, `mimic-secret`, `mimic-session`,
    `mimic-cookie`, `mimic-signature`, `mimic-card`, `mimic-iban` and `mimic-ssn`; see
    [Discovery and redaction](Discovery-and-redaction).
+
+Limit (spec §11.1): a real value exactly equal to a placeholder, for example a field that really holds
+`mimic-token`, is treated as a placeholder. Mock matching skips that field and a load test treats it as a
+credential field. Placeholders are public constants, not secrets.
 
 ## Safety: mock only
 

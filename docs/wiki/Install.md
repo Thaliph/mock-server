@@ -1,6 +1,6 @@
 # Install
 
-Audience: ops. Covers the chart of release 0.2.0-alpha.1. Values are listed in [Configuration](Configuration).
+Audience: ops. Covers the chart of release 0.2.0-alpha.2. Values are listed in [Configuration](Configuration).
 
 ## Requirements
 
@@ -21,7 +21,7 @@ Install a released version from the OCI registry. A pre-release chart is only in
 explicit `--version`:
 
 ```bash
-helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.1 -n mimic-system --create-namespace
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace
 kubectl -n mimic-system rollout status deploy/mimic-controller
 kubectl -n mimic-system port-forward svc/mimic-controller 8081:8081 &
 curl -s localhost:8081/readyz
@@ -39,9 +39,9 @@ Images and chart are signed with cosign (keyless, GitHub OIDC); the signature na
 and the tag. Verify before installing:
 
 ```bash
-ID=https://github.com/Thaliph/mock-server/.github/workflows/release.yml@refs/tags/v0.2.0-alpha.1
+ID=https://github.com/Thaliph/mock-server/.github/workflows/release.yml@refs/tags/v0.2.0-alpha.2
 ISSUER=https://token.actions.githubusercontent.com
-for ref in ghcr.io/thaliph/mimic:0.2.0-alpha.1 ghcr.io/thaliph/mimic-init:0.2.0-alpha.1 ghcr.io/thaliph/charts/mimic:0.2.0-alpha.1; do
+for ref in ghcr.io/thaliph/mimic:0.2.0-alpha.2 ghcr.io/thaliph/mimic-init:0.2.0-alpha.2 ghcr.io/thaliph/charts/mimic:0.2.0-alpha.2; do
   cosign verify "$ref" --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER"
 done
 ```
@@ -64,7 +64,7 @@ kubectl label namespace mimic-system \
 Common overrides (all values: [Configuration](Configuration#helm-values)):
 
 ```bash
-helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.1 -n mimic-system --create-namespace \
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
   --set valkey.persistence.size=8Gi \
   --set valkey.resources.limits.memory=2Gi \
   --set metrics.serviceMonitor.enabled=true
@@ -82,7 +82,7 @@ cluster-wide, the CRD, the `MutatingWebhookConfiguration` `<release>-injector` a
 
 ```bash
 kubectl -n mimic-system create secret generic my-valkey --from-literal=password="$(openssl rand -base64 30)"
-helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.1 -n mimic-system --create-namespace \
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
   --set valkey.existingSecret=my-valkey
 ```
 

@@ -84,7 +84,7 @@ type, chosen by the rule that fired and never by the value, so no byte, length o
 
 | Placeholder | Given by |
 |---|---|
-| `mimic-auth` | names `authorization`, `proxy-authorization`, `auth`, `credential`; the credential after a scheme other than `Bearer` (`Basic mimic-auth`) |
+| `mimic-auth` | names `authorization`, `proxy-authorization`, `auth`, `credential`; the credential after a scheme other than `Bearer` (`Basic mimic-auth`); a `Bearer `/`Basic ` credential found by value (`Bearer x` under a neutral header) |
 | `mimic-token` | name `token`; the credential after `Bearer` (`Bearer mimic-token`); `ghp_`, `glpat-`, `xox*-` tokens |
 | `mimic-jwt` | a JWT found by value |
 | `mimic-api-key` | name `apikey`; AWS and Google API keys; `sk-`, `sk_live_`, `rk_live_` |
