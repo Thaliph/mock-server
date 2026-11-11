@@ -568,14 +568,14 @@ mod redaction {
         };
         for s in secrets {
             let want = placeholder(s);
-            assert!(value_rule(s).is_some(), "{s:?} should be detected");
-            assert_eq!(r.header("x-custom", s), want, "header {s:?}");
-            assert_eq!(r.field("q", s), want, "query {s:?}");
+            assert!(value_rule(s).is_some(), "a secret form is not detected");
+            assert_eq!(r.header("x-custom", s), want, "header");
+            assert_eq!(r.field("q", s), want, "query");
             let mut v = json!({ "k": s });
             r.json(&mut v);
-            assert_eq!(v, json!({ "k": want }), "json {s:?}");
+            assert_eq!(v, json!({ "k": want }), "json");
             if !s.contains(['/', '\n']) {
-                assert_eq!(path(&format!("/a/{s}")), format!("/a/{want}"), "path {s:?}");
+                assert_eq!(path(&format!("/a/{s}")), format!("/a/{want}"), "path");
             }
         }
         let near = [
@@ -589,7 +589,7 @@ mod redaction {
             "12345",
         ];
         for s in near {
-            assert!(value_rule(s).is_none(), "{s:?} should be kept");
+            assert!(value_rule(s).is_none(), "a near miss is detected");
             assert_eq!(r.header("x-custom", s), s);
         }
         // A card as a JSON number.
@@ -606,7 +606,7 @@ mod redaction {
             "ghp_abc",
             "AKIAIOSFODNN7EXAMPLE",
         ] {
-            assert!(is_param(s), "{s}");
+            assert!(is_param(s), "a redacted segment is not a parameter");
         }
         assert_eq!(path("/reset/ghp_a"), path("/reset/ghp_b"));
         assert_eq!(path("/reset/ghp_a"), "/reset/mimic-token");

@@ -142,10 +142,12 @@ impl EgressSet {
                     volatile: names(&|f| fields.is_volatile(f)),
                 });
         }
+        // The upgraded form, so that every set is canonical: it reads back byte for byte.
         EgressSet {
             authorities,
             format: FORMAT,
         }
+        .upgraded()
     }
 
     /// Reads a set and checks it (spec §7.7). Never panics, whatever the input.
