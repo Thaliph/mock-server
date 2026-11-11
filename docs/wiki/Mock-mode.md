@@ -5,35 +5,104 @@ calls of its Deployment's pods are answered from the egress the pods already hol
 [Egress endpoint](Egress-endpoint)). The real destination is not called: a load test can run against its
 own app without hitting a provider, paying for its calls or hitting its rate limits.
 
+Step 3 of [Get started](Home#get-started). The examples use the [Quick start](Quick-start) apps in the namespace
+`demo`: `front`, which calls `users`, so `front` is the one that is mocked. Its `MimicWorkload` needs the
+recorded calls to `users` (the outbound rows of its `endpoints` list).
+
+## Try it: `front` without `users`
+
+First a call in discovery, to compare. The client reaches `front`; `front` calls `users`. The caller of
+`front` never sees the headers of the answer of `users` (`front` returns only its status and body), so the
+second command makes the call from `front`'s own container, to see what its app gets:
+
+```bash
+kubectl -n demo exec client -- python3 -c '
+import urllib.request
+print(urllib.request.urlopen("http://front.demo.svc:8080/front/users/7", timeout=10).read().decode())'
+kubectl -n demo exec deploy/front -c app -- python3 -c '
+import urllib.request
+r = urllib.request.urlopen("http://users.demo.svc:8080/users/7", timeout=10)
+print(r.status, r.headers.get("x-mimic-match"), r.read().decode())'
+# {"id": "7", "name": "user 7", "active": true, "score": 1.5}
+# 200 None {"id": "7", ...}
+```
+
+Switch `front` to mock and wait until its pod follows (up to one pull interval; the wait loop is
+[below](#turn-it-on-and-off)):
+
+```bash
+kubectl -n demo patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}'
+for i in $(seq 60); do
+  kubectl -n demo get mimicworkload front -o json |
+    jq -e '.status.mode | .mode == "mock" and .otherPods == 0 and .pods == 1' >/dev/null && break
+  sleep 3
+done
+```
+
+Now switch `users` off, and call `front` again. It still answers: its sidecar answers the call to `users` from
+the recording.
+
+```bash
+kubectl -n demo scale deploy/users --replicas=0
+kubectl -n demo exec client -- python3 -c '
+import urllib.request
+print(urllib.request.urlopen("http://front.demo.svc:8080/front/users/7", timeout=10).read().decode())'
+kubectl -n demo exec deploy/front -c app -- python3 -c '
+import urllib.request
+r = urllib.request.urlopen("http://users.demo.svc:8080/users/7", timeout=10)
+print(r.status, r.headers.get("x-mimic-match"), r.read().decode())'
+# 200 endpoint {"id": "...", "name": "user ...", ...}
+```
+
+The answer is a recorded one: its body is a sample of `GET /users/{users_id}`, so the id may not be the one
+you asked for. `x-mimic-match` (`exact`, `endpoint` or `fallback`) says it was mocked, and is visible to the
+app that made the call, here `front`'s app. If the answer is `599` with `x-mimic-miss: 1` instead, the sidecar
+has not pulled the recording yet: wait a minute and retry. The same fact is in the access log of `front`'s
+sidecar, the line has a `mock` field:
+
+```bash
+kubectl -n demo logs deploy/front -c mimic-sidecar | grep '"mock"' | tail -n 2
+```
+
+Switch `users` back on:
+
+```bash
+kubectl -n demo scale deploy/users --replicas=2
+kubectl -n demo rollout status deploy/users --timeout=3m
+```
+
+`front` stays in mock for the [Load test](Load-test), which needs it. To go back to live calls (the `users` pods
+must be running first): `kubectl -n demo patch mimicworkload front --type merge -p '{"spec":{"mode":"discovery"}}'`.
+
 ## Turn it on and off
 
 ```bash
-# the Quick start app (demo/users); replace the namespace and the name with your own MimicWorkload
-kubectl -n demo patch mimicworkload users --type merge -p '{"spec":{"mode":"mock"}}'
-kubectl -n demo patch mimicworkload users --type merge -p '{"spec":{"mode":"discovery"}}'
+# the Quick start apps (demo/front calls demo/users); replace the namespace and the name with your own MimicWorkload
+kubectl -n demo patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}'
+kubectl -n demo patch mimicworkload front --type merge -p '{"spec":{"mode":"discovery"}}'
 ```
 
 - **The switch is live.** Pods pick the mode up from the sidecar's next egress pull (`MIMIC_EGRESS_PULL_INTERVAL`,
   60 s by default): within one interval a pod answers from its snapshot, and back in discovery it records again.
   No pod is restarted. Connections that are open at the switch follow the rules below.
-- **Convergence.** `kubectl -n demo get mimicworkload users` prints `Mode` and `Mode pods`. `status.mode` says how many
+- **Convergence.** `kubectl -n demo get mimicworkload front` prints `Mode` and `Mode pods`. `status.mode` says how many
   pods follow the effective mode (`pods`) and how many still carry the other one (`otherPods`). A load test can
   start when `otherPods` is `0` and `pods` equals the ready replicas. To wait for it from a shell (the
-  [Quick start](Quick-start) app, `users` with 2 replicas; it takes up to one pull interval, and gives up after
+  [Quick start](Quick-start) app, `front` with 1 replica; it takes up to one pull interval, and gives up after
   3 minutes):
 
   ```bash
-  kubectl -n demo patch mimicworkload users --type merge -p '{"spec":{"mode":"mock"}}'
+  kubectl -n demo patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}'
   for i in $(seq 60); do
-    kubectl -n demo get mimicworkload users -o json |
-      jq -e '.status.mode | .mode == "mock" and .otherPods == 0 and .pods == 2' >/dev/null && break
+    kubectl -n demo get mimicworkload front -o json |
+      jq -e '.status.mode | .mode == "mock" and .otherPods == 0 and .pods == 1' >/dev/null && break
     sleep 3
   done
-  kubectl -n demo get mimicworkload users -o jsonpath='{.status.mode}{"\n"}'   # {"mode":"mock","otherPods":0,"pods":2}
+  kubectl -n demo get mimicworkload front -o jsonpath='{.status.mode}{"\n"}'   # {"mode":"mock","otherPods":0,"pods":1}
   ```
 
-  An app that makes no outbound calls, like `users`, has nothing to mock: the switch is still valid, and it is
-  what a load test needs.
+  An app that makes no outbound calls, like `users`, has nothing to mock: the switch is valid, but only an
+  app that calls others, like `front`, shows the effect.
 - **New pods** start in the right mode: the webhook sets `MIMIC_MODE` (and the latency factor and passthrough
   list) on the sidecar of every pod it creates in mock.
 - **Several MimicWorkloads** for one Deployment: the Deployment is in mock if any of them says so.

@@ -58,9 +58,9 @@ List names that must never be intercepted (internal services, mTLS to a provider
 ```yaml
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
-metadata: {name: payments, namespace: shop}
+metadata: {name: front, namespace: demo}
 spec:
-  deployment: payments
+  deployment: front
   tls:
     exclude:
       - api.example.com        # exact host
@@ -70,7 +70,7 @@ spec:
 
 At most 256 entries; compared case-insensitively without trailing dot. The webhook gives the sidecar
 the union of all `MimicWorkload`s naming the deployment in `MIMIC_TLS_EXCLUDE`. It applies to pods
-created afterwards: `kubectl -n shop rollout restart deploy/payments`.
+created afterwards: `kubectl -n demo rollout restart deploy/front`.
 
 ## Pass-through cases
 

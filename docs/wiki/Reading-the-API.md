@@ -1,6 +1,6 @@
 # Reading the API
 
-You read the discovered data as JSON, as an
+Step 5 of [Get started](Home#get-started). You read the discovered data as JSON, as an
 OpenAPI 3.1 document per port, or in the browser ([the UI](#the-ui)).
 
 ## Reaching it
@@ -133,16 +133,16 @@ curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET
 
 The result of a [load test](Load-test) is kept in Valkey (the last 20 runs per deployment) and served under
 `loadtests`. The `<uid>` in the path is the `metadata.uid` of the `MimicLoadTest`, **not its name**: a name
-answers `400`. To list the runs, then print the per-endpoint summary of one (here the run `users-1` of the
-[Load test](Load-test) page):
+answers `400`. To list the runs, then print the per-endpoint summary of one (here the run `front-1` of the
+[Load test](Load-test) page, on the deployment `front`):
 
 ```bash
-curl -s localhost:8080/v1/workloads/demo/users/loadtests | jq -c '.loadtests[] | {uid, name, phase, reason}'
-uid=$(kubectl -n demo get mimicloadtest users-1 -o jsonpath='{.metadata.uid}')
-curl -s localhost:8080/v1/workloads/demo/users/loadtests/$uid |
+curl -s localhost:8080/v1/workloads/demo/front/loadtests | jq -c '.loadtests[] | {uid, name, phase, reason}'
+uid=$(kubectl -n demo get mimicloadtest front-1 -o jsonpath='{.metadata.uid}')
+curl -s localhost:8080/v1/workloads/demo/front/loadtests/$uid |
   jq -r '.summary.endpoints[] | [.method, .template, .requests, .rps, .latencyMicros.p99] | @tsv'
-# GET   /users/{users_id}   2440   40   2290
-# PUT   /users/{users_id}    310    5   1980
+# GET   /front/users/{users_id}   2440   40   2290
+# PUT   /front/users/{users_id}    310    5   1980
 ```
 
 (Illustrative numbers for a one-minute run: the plan is weighted by what discovery recorded, 40 `GET`s to 5
@@ -151,7 +151,7 @@ curl -s localhost:8080/v1/workloads/demo/users/loadtests/$uid |
 Every row (`summary.total` and each entry of `summary.endpoints`) holds `requests`, `missed`, `statuses` (by
 class: `2xx`, `3xx`, `4xx`, `5xx`), `errors` (by kind), `rps` and `latencyMicros` (`p50`, `p90`, `p99`, `max`,
 in microseconds). An endpoint row also has `method`, `port` and `template`. Times are UTC (RFC 3339). The
-same numbers are in `kubectl get mimicloadtest users-1 -o jsonpath='{.status.results}'` while the object
+same numbers are in `kubectl get mimicloadtest front-1 -o jsonpath='{.status.results}'` while the object
 exists; the read API keeps them after it is deleted.
 
 ## OpenAPI documents
@@ -207,3 +207,16 @@ See [Troubleshooting](Troubleshooting) for the fix.
 ## `MimicWorkload` status
 
 The summary is also in `kubectl get mimicworkload` and `status.discovery` ([Configuration](Configuration)).
+
+## Clean up
+
+The last step of Get started. Stop a port-forward you still have running (Ctrl-C, or `kill $PF` in the shell that
+started it), then delete the demo. Deleting the namespace is enough, whatever mode the apps are in:
+
+```bash
+kubectl delete namespace demo
+cd .. && rm -r mimic-demo
+```
+
+On kind, `kind delete cluster --name mimic` removes everything, mimic included. On a cluster you keep, see
+[Uninstall](Install#uninstall).

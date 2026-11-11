@@ -1,6 +1,9 @@
 # Install
 
-Audience: ops. Covers the chart of release 0.2.0-alpha.2. Values are listed in [Configuration](Configuration).
+Step 1 of [Get started](Home#get-started): everyone starts here, developers and ops. Developers need
+only [Try it on kind](#try-it-on-kind) and [Install](#install); the sections marked *ops* are for whoever
+runs mimic on a shared cluster. Covers the chart of release 0.2.0-alpha.2. Values are listed in
+[Configuration](Configuration).
 
 ## Requirements
 
@@ -26,10 +29,11 @@ kind create cluster --name mimic
 
 Use a kind recent enough that its default node image is Kubernetes 1.33 or later (`kubectl version` shows it).
 It has a default StorageClass (`standard`) for Valkey, and the `iptables-nft` requirement was met on kind
-0.33 (node 1.37), where the whole of this wiki's Quick start and Load test pages ran as written. One
-requirement is not met: kind's default CNI does not enforce NetworkPolicy, so the policies that isolate
-Valkey, restrict the controller's ports and confine the load generators are created but inert. mimic works
-without it for a demo; production clusters should run a CNI that enforces NetworkPolicy. Then follow [Install](#install) below and the
+0.33 (node 1.37), where the whole of this wiki's Quick start and Load test pages ran as written. kind's
+default CNI (kindnet) enforces NetworkPolicy on current versions of kind, so the policies that isolate Valkey,
+restrict the controller's ports and confine the load generators are active (the project's own end-to-end
+tests on a default kind cluster check that a pod outside the controller cannot reach Valkey). If your kind is
+old, or you replaced its CNI, check that yours does. Then follow [Install](#install) below and the
 [Quick start](Quick-start). To remove everything: `kind delete cluster --name mimic`.
 
 ## Install
@@ -38,9 +42,13 @@ Install a released version from the OCI registry. A pre-release chart is only in
 explicit `--version`:
 
 ```bash
-helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
+  --set loadTest.enabled=true
 kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=5m
 ```
+
+`--set loadTest.enabled=true` is there for the [Load test](Load-test) page of Get started; load tests are off by
+default ([Enable load tests](#enable-load-tests)), so leave the flag out if you will not run any.
 
 `rollout status` returns when the controller is ready (the first start also waits for Valkey and pulls the
 images). To check it from outside, forward the **admin port**, 8081 (`/readyz`, `/healthz`, `/metrics`), which is
@@ -98,7 +106,7 @@ All names in this wiki (`mimic-controller`, `mimic-valkey-0`, `data-mimic-valkey
 `mimic-valkey`, ...) assume the release is called `mimic`; replace `mimic` with your release name
 otherwise.
 
-To enforce Pod Security on the release namespace as the chart's tests do:
+*Ops.* To enforce Pod Security on the release namespace as the chart's tests do:
 
 ```bash
 kubectl label namespace mimic-system \
@@ -124,6 +132,8 @@ cluster-wide, the CRD, the `MutatingWebhookConfiguration` `<release>-injector` a
 
 ### Use your own Valkey password
 
+*Ops.* The chart generates a random password by default; to bring your own:
+
 ```bash
 kubectl -n mimic-system create secret generic my-valkey --from-literal=password="$(openssl rand -base64 30)"
 helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
@@ -147,6 +157,8 @@ A pod label `mimic.platform.io/inject: disabled` always opts a pod out. The full
 `kubectl -n demo rollout restart deploy/<name>`.
 
 ## Upgrade
+
+*Ops.*
 
 ```bash
 helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version <new-version> -n mimic-system
@@ -190,6 +202,8 @@ is immutable, so `helm upgrade` of such an install fails with an error such as
   ```
 
 ## Uninstall
+
+*Ops* on a shared cluster; on kind, deleting the cluster does it.
 
 ```bash
 helm uninstall mimic -n mimic-system

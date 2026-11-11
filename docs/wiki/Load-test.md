@@ -1,6 +1,6 @@
 # Load test
 
-A `MimicLoadTest` replays the
+Step 4 of [Get started](Home#get-started). A `MimicLoadTest` replays the
 inbound endpoints that mimic discovered on one Deployment against that Deployment's pods, with no scenario to
 write. It runs **only while the Deployment is in [mock mode](Mock-mode)**, so the load does not reach the
 real destinations the application calls.
@@ -20,22 +20,32 @@ kubectl -n mimic-system rollout status deploy/mimic-controller
 ```
 
 Pods injected before the switch do not honour the load marker: `rollout restart` the Deployments you want to
-test (`kubectl -n demo rollout restart deploy/users`; do it before the first run, so turn the option on before
+test (`kubectl -n demo rollout restart deploy/front`; do it before the first run, so turn the option on before
 you deploy your apps). `loadTest.networkPolicy` (default `true`) gives each generator a NetworkPolicy; it needs a
-CNI that enforces NetworkPolicy, and is simply inert where there is none (kind, see
-[Try it on kind](Install#try-it-on-kind)).
+CNI that enforces NetworkPolicy, and is simply inert where there is none. kind's default CNI enforces it, so
+it is active on the cluster of [Try it on kind](Install#try-it-on-kind).
 
 ## Run one
 
-The examples use the app of the [Quick start](Quick-start): the Deployment `users` in the namespace `demo`, with
-its `MimicWorkload` `users` and the traffic you sent. The Deployment needs discovered inbound traffic, a
-`MimicWorkload`, mock mode, and at least one ready pod behind a Service (targets come from EndpointSlices).
+The examples use the apps of the [Quick start](Quick-start) and [Mock mode](Mock-mode): the Deployment `front` in
+the namespace `demo`, with its `MimicWorkload` `front` and the traffic you sent. `front` is the one that is
+load-tested, **in mock**: its calls to `users` are answered by its sidecar, so `users` is not part of the test
+and is never called. The Deployment needs discovered inbound traffic, a `MimicWorkload`, mock mode, and at
+least one ready pod behind a Service (targets come from EndpointSlices).
 
-First switch it to mock and wait until the pods follow ([Mock mode](Mock-mode#turn-it-on-and-off) has the
-wait loop; the load test would also wait, in `WaitingForMock`):
+First switch it to mock and wait until the pod follows ([Mock mode](Mock-mode#turn-it-on-and-off) has the
+wait loop; the load test would also wait, in `WaitingForMock`). Skip this if `front` is still in mock from the
+previous page:
 
 ```bash
-kubectl -n demo patch mimicworkload users --type merge -p '{"spec":{"mode":"mock"}}'
+kubectl -n demo patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}'
+```
+
+To show that `users` is not called, count its access lines now and after the run (each request to `users`
+writes one line; `--tail=-1` because a selector prints 10 lines by default):
+
+```bash
+kubectl -n demo logs -l app=users -c app --tail=-1 | wc -l
 ```
 
 Then create the run. This one lasts a minute:
@@ -44,43 +54,45 @@ Then create the run. This one lasts a minute:
 kubectl apply -f - <<'EOF'
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicLoadTest
-metadata: {name: users-1, namespace: demo}
+metadata: {name: front-1, namespace: demo}
 spec:
-  deployment: users
+  deployment: front
   duration: 1m
   concurrency: 10
   rate: 50
   rampUp: 10s
 EOF
-kubectl -n demo get mimicloadtest users-1 -w
+kubectl -n demo get mimicloadtest front-1 -w
 ```
 
-Stop the watch with Ctrl-C once `Phase` is `Succeeded`. All the fields:
+Stop the watch with Ctrl-C once `Phase` is `Succeeded`, then count the access lines of `users` again: the number
+is the same, the load test never reached it (it would be the same with `users` scaled to 0). The plan comes
+from the inbound endpoints of `front`: `GET` and `PUT /front/users/{users_id}`. All the fields:
 
 ```yaml
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicLoadTest
-metadata: {name: users-1, namespace: demo}
+metadata: {name: front-1, namespace: demo}
 spec:
-  deployment: users        # required
+  deployment: front        # required
   duration: 5m             # required, 10s to MIMIC_LOAD_MAX_DURATION (30m)
   concurrency: 10          # requests in flight at most, default 10, up to 256
   rate: 200                # optional requests/s, up to 2000; absent: closed model
   rampUp: 30s              # default 0s
   timeout: 10s             # per request
   endpoints:
-    include: ["GET /users/{users_id}"]     # absent: every usable endpoint
-    exclude: ["PUT /users/{users_id}"]
+    include: ["GET /front/users/{users_id}"]     # absent: every usable endpoint
+    exclude: ["PUT /front/users/{users_id}"]
   credentials:             # optional, see "Testing with credentials"
-    secretName: users-load
+    secretName: front-load
     fields:
       - {field: header/authorization, key: token}
   stop: false              # set to true to stop the run
 ```
 
 Every field but `stop` is immutable. `kubectl get mimicloadtest -n demo` prints `Deployment`, `Phase`,
-`Reason`, `Requests`, `RPS`, `P99 µs` and `Age` (until #431 renames it, kubectl shows the column as `P99 ΜS`, with a
-capital Greek Mu: it is the same column). With a `rate` the open model applies: when every concurrency
+`Reason`, `Requests`, `RPS`, `P99 Micros` and `Age` (kubectl upper-cases the header: `P99 MICROS`; the value is
+the p99 latency in microseconds). With a `rate` the open model applies: when every concurrency
 slot is busy, a send is counted as `missed`, not queued. The `RPS` of a run is its requests over its whole
 duration, ramp-up included, so it stays a little under `rate`.
 
@@ -107,41 +119,41 @@ Without either, it answers `4xx`.
    environment accepts):
 
    ```bash
-   kubectl -n demo create secret generic users-load \
+   kubectl -n demo create secret generic front-load \
      --from-literal=token='Bearer dummy-test-token' --from-literal=password='dummy-test-password'
    ```
 
-   The Quick start `PUT`s also send a `password` in their JSON body, so the Secret has a second key for it. An
+   The Quick start `PUT`s that `front` received also carry a `password` in their JSON body, so the Secret has a second key for it. An
    endpoint is never skipped because of a credential value: a field you do not map is sent with its
    placeholder (`mimic-password` here).
 
    Then a complete run that uses it. Every field but `stop` is immutable, so a change of spec needs a **new
-   name** (`users-2`, not `users-1`):
+   name** (`front-2`, not `front-1`):
 
    ```bash
    kubectl apply -f - <<'EOF'
    apiVersion: mimic.platform.io/v1alpha1
    kind: MimicLoadTest
-   metadata: {name: users-2, namespace: demo}
+   metadata: {name: front-2, namespace: demo}
    spec:
-     deployment: users
+     deployment: front
      duration: 1m
      concurrency: 10
      rate: 50
      rampUp: 10s
      credentials:
-       secretName: users-load        # key `token` holds `Bearer <test token>`
+       secretName: front-load        # key `token` holds `Bearer <test token>`
        fields:
          - {field: header/authorization, key: token}
          - {field: body/password, key: password}
    EOF
-   kubectl -n demo get mimicloadtest users-2 -w     # runs until Ctrl-C; stop it once Phase is Succeeded
+   kubectl -n demo get mimicloadtest front-2 -w     # runs until Ctrl-C; stop it once Phase is Succeeded
    ```
 
    **Checking that the credential was used.** Only a request whose recorded sample carried the field gets the
-   Secret value: in the Quick start app only the 5 `PUT`s sent an `Authorization` header, so the `GET`s are
-   unchanged. `users` does not check authentication, so the two runs look the same; to see a difference, use an
-   app that rejects a wrong token (the run without credentials then counts `4xx` on those endpoints, the run
+   Secret value: in the Quick start only the 5 `PUT`s sent an `Authorization` header (and a `password` in
+   the body), so the `GET`s are unchanged. `front` does not check authentication, so the two runs look the
+   same; to see a difference, use an app that rejects a wrong token (the run without credentials then counts `4xx` on those endpoints, the run
    with them `2xx`). The token itself is never in `status`, in the read API or in the logs.
 
    `field` names the value to replace: `header/<lower-case header name>`, `query/<key>` or
@@ -170,10 +182,10 @@ credential field. Placeholders are public constants, not secrets.
 
 ## Results
 
-While the object exists, `kubectl -n demo get mimicloadtest users-1 -o json | jq .status.results` prints them.
+While the object exists, `kubectl -n demo get mimicloadtest front-1 -o json | jq .status.results` prints them.
 The run also stays readable after the object is deleted: see
 [Load test runs in Reading the API](Reading-the-API#load-test-runs) for the routes
-(`/v1/workloads/demo/users/loadtests/<uid>`, where the uid is the object's `metadata.uid`, not its name) and a
+(`/v1/workloads/demo/front/loadtests/<uid>`, where the uid is the object's `metadata.uid`, not its name) and a
 command that prints the per-endpoint summary.
 
 A run goes `Pending` (`WaitingForMock` while the mode converges) to `Running` to `Succeeded`, or `Failed` or
@@ -199,3 +211,8 @@ destinations (at most the concurrency); the application's real datastores and `s
 destinations are loaded too; load and credentials cross the network in cleartext; a secret that redaction
 misses is replayed, so add `spec.discovery.redact`; the namespace is the trust domain of a run. See
 [Security](Security#accepted-limits).
+
+## Next
+
+Step 5 of Get started: [Reading the API](Reading-the-API) reads the run that you just made from the read API, and
+ends with the clean-up.
