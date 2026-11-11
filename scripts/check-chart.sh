@@ -651,7 +651,7 @@ render > "$tmp/dash-off.yaml"
 render --set monitoring.dashboards.enabled=true --set monitoring.dashboards.annotations.grafana_folder=Mimic > "$tmp/dash-on.yaml"
 render --set monitoring.grafana.enabled=true > "$tmp/dash-grafana.yaml"
 for f in dash-on dash-grafana; do
-  [[ $(yq "$isdash | .metadata.name" "$tmp/$f.yaml" | grep -c .) == "$files" ]] || fail "mon_23: $f has not $files dashboard ConfigMaps"
+  [[ $(yq "$isdash | .metadata.name" "$tmp/$f.yaml" | grep -vc '^---$') == "$files" ]] || fail "mon_23: $f has not $files dashboard ConfigMaps"
   for json in "$chart"/dashboards/*.json; do
     base=$(basename "$json" .json)
     cm=$(yq "$isdash | select(.metadata.name == \"mimic-dashboard-$base\")" "$tmp/$f.yaml")
@@ -662,8 +662,8 @@ for f in dash-on dash-grafana; do
   done
 done
 # The annotations are on the dashboard ConfigMaps and on no other object; the two renders differ by them only.
-[[ $(yq 'select(.metadata.annotations.grafana_folder == "Mimic") | .metadata.name' "$tmp/dash-on.yaml" | grep -c .) == "$files" \
-  && $(yq "$isdash | select(.metadata.annotations.grafana_folder == \"Mimic\") | .metadata.name" "$tmp/dash-on.yaml" | grep -c .) == "$files" ]] \
+[[ $(yq 'select(.metadata.annotations.grafana_folder == "Mimic") | .metadata.name' "$tmp/dash-on.yaml" | grep -vc '^---$') == "$files" \
+  && $(yq "$isdash | select(.metadata.annotations.grafana_folder == \"Mimic\") | .metadata.name" "$tmp/dash-on.yaml" | grep -vc '^---$') == "$files" ]] \
   || fail "mon_23: monitoring.dashboards.annotations are not on the dashboard ConfigMaps only"
 notdash='select(((.metadata.labels.grafana_dashboard // "") == "1") | not)'
 cmp -s <(yq "$notdash" "$tmp/dash-on.yaml") <(yq "$notdash" "$tmp/dash-off.yaml") \
