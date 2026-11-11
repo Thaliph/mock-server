@@ -79,7 +79,8 @@ spec:
 ```
 
 Every field but `stop` is immutable. `kubectl get mimicloadtest -n demo` prints `Deployment`, `Phase`,
-`Reason`, `Requests`, `RPS`, `P99 µs` and `Age`. With a `rate` the open model applies: when every concurrency
+`Reason`, `Requests`, `RPS`, `P99 µs` and `Age` (until #431 renames it, kubectl shows the column as `P99 ΜS`, with a
+capital Greek Mu: it is the same column). With a `rate` the open model applies: when every concurrency
 slot is busy, a send is counted as `missed`, not queued. The `RPS` of a run is its requests over its whole
 duration, ramp-up included, so it stays a little under `rate`.
 
@@ -109,14 +110,33 @@ Without either, it answers `4xx`.
    kubectl -n demo create secret generic users-load --from-literal=token='Bearer dummy-test-token'
    ```
 
-   ```yaml
+   Then a complete run that uses it. Every field but `stop` is immutable, so a change of spec needs a **new
+   name** (`users-2`, not `users-1`):
+
+   ```bash
+   kubectl apply -f - <<'EOF'
+   apiVersion: mimic.platform.io/v1alpha1
+   kind: MimicLoadTest
+   metadata: {name: users-2, namespace: demo}
    spec:
      deployment: users
+     duration: 1m
+     concurrency: 10
+     rate: 50
+     rampUp: 10s
      credentials:
        secretName: users-load        # key `token` holds `Bearer <test token>`
        fields:
          - {field: header/authorization, key: token}
+   EOF
+   kubectl -n demo get mimicloadtest users-2 -w     # runs until Ctrl-C; stop it once Phase is Succeeded
    ```
+
+   **Checking that the credential was used.** Only a request whose recorded sample carried the field gets the
+   Secret value: in the Quick start app only the 5 `PUT`s sent an `Authorization` header, so the `GET`s are
+   unchanged. `users` does not check authentication, so the two runs look the same; to see a difference, use an
+   app that rejects a wrong token (the run without credentials then counts `4xx` on those endpoints, the run
+   with them `2xx`). The token itself is never in `status`, in the read API or in the logs.
 
    `field` names the value to replace: `header/<lower-case header name>`, `query/<key>` or
    `body<JSON pointer>` (for example `body/card/token`); up to 32 distinct fields, each with the Secret `key`

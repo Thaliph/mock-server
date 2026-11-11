@@ -206,13 +206,15 @@ kubectl -n demo get mimicworkload users -o jsonpath='{.status}' | jq
 
 ```json
 {"discovery": {"endpoints": {"inbound": 2}, "exchanges": 45, "lastPushTime": "2026-11-02T10:00:21Z",
- "pods": 2, "sampleBytes": 41230}}
+ "pods": 2, "sampleBytes": 41230, "totalEndpoints": 2},
+ "mode": {"mode": "discovery", "otherPods": 0, "pods": 2}}
 ```
 
 ## 8. Clean up
 
 ```bash
 kill $PF 2>/dev/null
+# no need to switch back to discovery first if you tried mock mode: deleting the namespace (or the kind cluster) is enough
 kubectl delete namespace demo demo-client
 cd .. && rm -r mimic-demo
 ```

@@ -8,14 +8,15 @@ own app without hitting a provider, paying for its calls or hitting its rate lim
 ## Turn it on and off
 
 ```bash
-kubectl -n shop patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}'
-kubectl -n shop patch mimicworkload front --type merge -p '{"spec":{"mode":"discovery"}}'
+# the Quick start app (demo/users); replace the namespace and the name with your own MimicWorkload
+kubectl -n demo patch mimicworkload users --type merge -p '{"spec":{"mode":"mock"}}'
+kubectl -n demo patch mimicworkload users --type merge -p '{"spec":{"mode":"discovery"}}'
 ```
 
 - **The switch is live.** Pods pick the mode up from the sidecar's next egress pull (`MIMIC_EGRESS_PULL_INTERVAL`,
   60 s by default): within one interval a pod answers from its snapshot, and back in discovery it records again.
   No pod is restarted. Connections that are open at the switch follow the rules below.
-- **Convergence.** `kubectl get mimicworkload front` prints `Mode` and `Mode pods`. `status.mode` says how many
+- **Convergence.** `kubectl -n demo get mimicworkload users` prints `Mode` and `Mode pods`. `status.mode` says how many
   pods follow the effective mode (`pods`) and how many still carry the other one (`otherPods`). A load test can
   start when `otherPods` is `0` and `pods` equals the ready replicas. To wait for it from a shell (the
   [Quick start](Quick-start) app, `users` with 2 replicas; it takes up to one pull interval, and gives up after

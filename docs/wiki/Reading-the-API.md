@@ -141,9 +141,12 @@ curl -s localhost:8080/v1/workloads/demo/users/loadtests | jq -c '.loadtests[] |
 uid=$(kubectl -n demo get mimicloadtest users-1 -o jsonpath='{.metadata.uid}')
 curl -s localhost:8080/v1/workloads/demo/users/loadtests/$uid |
   jq -r '.summary.endpoints[] | [.method, .template, .requests, .rps, .latencyMicros.p99] | @tsv'
-# GET   /users/{users_id}   2200   36   2290
-# PUT   /users/{users_id}    550    9   1980
+# GET   /users/{users_id}   2440   40   2290
+# PUT   /users/{users_id}    310    5   1980
 ```
+
+(Illustrative numbers for a one-minute run: the plan is weighted by what discovery recorded, 40 `GET`s to 5
+`PUT`s in the Quick start, so expect about eight `GET`s for each `PUT`; yours will differ.)
 
 Every row (`summary.total` and each entry of `summary.endpoints`) holds `requests`, `missed`, `statuses` (by
 class: `2xx`, `3xx`, `4xx`, `5xx`), `errors` (by kind), `rps` and `latencyMicros` (`p50`, `p90`, `p99`, `max`,
