@@ -217,7 +217,7 @@ async fn mon_09_http1_overhead_excludes_the_upstream_wait() {
         let (count, seconds) = overhead(&f.metrics, d);
         // The 200 ms upstream wait of each exchange is not in the overhead.
         assert!(
-            count == 20.0 && seconds < 20.0 * 0.2,
+            count == 20.0 && seconds < 20.0 * 0.1,
             "{direction:?}: {count} {seconds}"
         );
         // The upstream wait is in the request duration, not in the overhead.
@@ -295,7 +295,7 @@ async fn mon_09_h2_overhead_excludes_the_upstream_wait() {
     })
     .await;
     let (count, seconds) = overhead(&f.metrics, "inbound");
-    assert!(count == 20.0 && seconds < 20.0 * 0.2, "{count} {seconds}");
+    assert!(count == 20.0 && seconds < 20.0 * 0.1, "{count} {seconds}");
     let total = sum(
         &f.metrics,
         "mimic_http_request_duration_seconds_sum{direction=\"inbound\"",

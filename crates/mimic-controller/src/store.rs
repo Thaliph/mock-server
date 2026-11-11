@@ -25,10 +25,10 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot};
 
 pub mod load;
 
-/// Deployments written at once per replica (memory bound).
 /// The sorted set of the deployments with data (spec §8).
 const WORKLOADS_KEY: &str = "mimic:v1:workloads";
 
+/// Deployments written at once per replica (memory bound).
 const MAX_WRITERS: usize = 2;
 /// `:pulls` writes in flight at once; a pull over that is not recorded (spec §7.7).
 const MAX_PULL_WRITES: usize = 16;
