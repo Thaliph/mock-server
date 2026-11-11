@@ -1,12 +1,16 @@
 name: ci
 
 # Dependent stages (spec FND-10):
+#   changes ──▶ classifies the change (scripts/ci_plan.py, tested first); a job below runs only when a gate
+#               of its categories is set. Every other event, an unknown path, a change under .github/ or to
+#               scripts/ci_plan.py, and an empty diff set every gate.
 #   lint ──▶ test ──▶ image ──▶ e2e
-#   chart ─────────────────────▲
+#   chart ─────────────────────▲   (e2e-load runs with e2e)
 #   security (cargo deny, zizmor); supply chain (cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql)
-#   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; skipped unless a PR touches the codec)
+#   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; its gate is the codec paths)
 #           └─▶ fuzz-discovery (a matrix: recorder, egress set, mock and load plan, spec DSC-23, PUL-20, MCK-20, LDT-18; same rule for their own paths)
-# `ci-ok` sums them up; it is the only required check on main.
+# `ci-ok` sums them up; it is the only required check on main. It accepts a skipped job only when that
+# job's gate is off, and never a skipped job of the ungated ones (gitleaks, dependency-review).
 #
 # Actions allowed in the repository settings (#273; Settings → Actions → General, or
 # `gh api repos/Thaliph/mock-server/actions/permissions/selected-actions`). Keep this list and the
@@ -40,12 +44,63 @@ env:
   INIT_IMAGE: ghcr.io/thaliph/mimic-init:ci
 
 jobs:
-  lint:
+  # The path filter (spec FND-10): scripts/ci_plan.py sets one gate per job, and the jobs below read
+  # them. The tests of the classification run first, so a broken classifier fails here.
+  changes:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      full: ${{ steps.plan.outputs.full }}
+      gate_lint: ${{ steps.plan.outputs.gate_lint }}
+      gate_test: ${{ steps.plan.outputs.gate_test }}
+      gate_codeql_rust: ${{ steps.plan.outputs.gate_codeql_rust }}
+      gate_codeql_actions: ${{ steps.plan.outputs.gate_codeql_actions }}
+      gate_security: ${{ steps.plan.outputs.gate_security }}
+      gate_cooldown: ${{ steps.plan.outputs.gate_cooldown }}
+      gate_vendored_ui: ${{ steps.plan.outputs.gate_vendored_ui }}
+      gate_chart: ${{ steps.plan.outputs.gate_chart }}
+      gate_trivy_config: ${{ steps.plan.outputs.gate_trivy_config }}
+      gate_image: ${{ steps.plan.outputs.gate_image }}
+      gate_e2e: ${{ steps.plan.outputs.gate_e2e }}
+      gate_e2e_load: ${{ steps.plan.outputs.gate_e2e_load }}
+      gate_fuzz_http1: ${{ steps.plan.outputs.gate_fuzz_http1 }}
+      gate_fuzz_discovery: ${{ steps.plan.outputs.gate_fuzz_discovery }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0 # the base commit must be in the history to diff against it
+          persist-credentials: false
+      - name: Classification tests (spec FND-10)
+        run: python3 -I scripts/test_ci_plan.py
+      - id: plan
+        name: Classify the change
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed="$RUNNER_TEMP/changed.z"
+          # --no-renames lists both sides of a rename; -z keeps every name intact.
+          if [ "$EVENT" = pull_request ]; then
+            git diff -z --name-only --no-renames "$BASE" HEAD > "$changed"
+          else
+            : > "$changed" # not read: every other event runs everything
+          fi
+          python3 -I scripts/ci_plan.py --event "$EVENT" --changed "$changed" >> "$GITHUB_OUTPUT"
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.gate_lint == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # The added lines of the change (scripts/check-test-messages.sh): the pull request's base, or the previous tip of a push.
+      BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the base commit must be in the history to diff against it
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
@@ -56,9 +111,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }} # zizmor: ignore[cache-poisoning] cache written from main only, nothing is published by this job
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked
+      # The asserts that a change adds must not print a secret-like or raw value (CodeQL cleartext logging).
+      - name: Self-test of the assert message check
+        run: bash scripts/test_check_test_messages.sh
+      - name: Assert messages of the change
+        run: scripts/check-test-messages.sh "$BASE"
 
   test:
-    needs: lint
+    needs: [changes, lint]
+    if: needs.changes.outputs.gate_test == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -90,6 +151,10 @@ jobs:
       - run: cargo test --workspace --locked
 
   chart:
+    # Its gate also covers docs and spec: check-release.sh reads the wiki and check-chart.sh reads SPEC.md.
+    # It runs before e2e too, so that e2e never waits on a skipped chart stage.
+    needs: changes
+    if: needs.changes.outputs.gate_chart == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -108,6 +173,9 @@ jobs:
       - run: scripts/check-release.sh
 
   security:
+    # cargo deny checks the Cargo files (rust); zizmor checks the workflows (workflows).
+    needs: changes
+    if: needs.changes.outputs.gate_security == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -121,13 +189,15 @@ jobs:
         with:
           advanced-security: false
 
-  # #269 (spec FND-10): the supply-chain checks, beyond the advisories of cargo deny. All of them run
-  # on every event, so `ci-ok` needs them to succeed (none is skipped).
+  # #269 (spec FND-10): the supply-chain checks, beyond the advisories of cargo deny. Their gates are
+  # listed in scripts/ci_plan.py; the ungated ones (dependency-review, gitleaks) run on every event.
   cooldown:
     # A crate version that this change adds or bumps in a lockfile must be 14 days old on crates.io,
     # and so must an npm version in the Swagger UI lockfile (#239, UI-13), unless
     # scripts/cooldown-allowlist.toml lists it with a reason. A pull request is compared with
     # its base, a push with the previous tip; a schedule changes nothing to compare.
+    needs: changes
+    if: needs.changes.outputs.gate_cooldown == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -156,6 +226,8 @@ jobs:
   # offline tests of the script run first; then the check downloads the locked tarball from the npm
   # registry, verifies its sha512 and compares the committed files with it.
   vendored-ui:
+    needs: changes
+    if: needs.changes.outputs.gate_vendored_ui == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -173,6 +245,7 @@ jobs:
       - name: Swagger UI vendoring check
         run: python3 -I scripts/vendor-swagger-ui.py --check
 
+  # Ungated: cheap, and a docs-only change can add a dependency or a secret too.
   dependency-review:
     # Adding a crate or an action with a known vulnerability, or a licence outside the policy of
     # deny.toml, fails a pull request; the run summary lists the dependencies that it adds.
@@ -189,6 +262,7 @@ jobs:
           fail-on-severity: low
           allow-licenses: Apache-2.0, Apache-2.0 WITH LLVM-exception, MIT, MIT-0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, 0BSD, BSL-1.0, CC0-1.0, Unicode-3.0, CDLA-Permissive-2.0
 
+  # Ungated: no secret in the commits under review, whatever they change.
   gitleaks:
     # No secret in the commits under review (the pull request's, or the commits of a push).
     runs-on: ubuntu-24.04
@@ -205,6 +279,8 @@ jobs:
   trivy-config:
     # Misconfigurations of the rendered chart and of the Dockerfile fail on HIGH and CRITICAL.
     # Accepted findings are listed, each with its reason, in .trivyignore.yaml.
+    needs: changes
+    if: needs.changes.outputs.gate_trivy_config == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -232,32 +308,55 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
 
-  codeql:
-    # CodeQL for the Rust code and the GitHub Actions workflows; findings go to code scanning.
-    name: codeql (${{ matrix.language }})
+  # CodeQL for the Rust code (rust) and for the GitHub Actions workflows (workflows); findings go to
+  # code scanning. Two jobs, one per language, so that each has its own gate.
+  codeql-rust:
+    name: codeql (rust)
+    needs: changes
+    if: needs.changes.outputs.gate_codeql_rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
       security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [rust, actions]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
-          languages: ${{ matrix.language }}
+          languages: rust
           build-mode: none
       - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
-          category: /language:${{ matrix.language }}
+          category: /language:rust
+
+  codeql-actions:
+    name: codeql (actions)
+    needs: changes
+    if: needs.changes.outputs.gate_codeql_actions == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: actions
+          build-mode: none
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:actions
 
   image:
-    needs: test
+    # Runs for a change to the Rust code, the image inputs, the chart or e2e (the e2e stages need its
+    # artifact). It waits for test when test runs; a chart-only change skips test, which is no failure.
+    needs: [changes, test]
+    if: ${{ !failure() && !cancelled() && needs.changes.outputs.gate_image == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -315,7 +414,9 @@ jobs:
 
   e2e:
     name: e2e (${{ matrix.name }})
-    needs: [image, chart]
+    # Runs with the image artifact and the chart stage it deploys; both must have succeeded.
+    needs: [changes, image, chart]
+    if: ${{ !failure() && !cancelled() && needs.changes.outputs.gate_e2e == 'true' && needs.image.result == 'success' && needs.chart.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -350,7 +451,8 @@ jobs:
   # generator's objects, RBAC of the controller). LDT-16 and LDT-19 (E) run inside e2e, after its F10 section.
   e2e-load:
     name: e2e-load (${{ matrix.name }})
-    needs: [image, chart]
+    needs: [changes, image, chart]
+    if: ${{ !failure() && !cancelled() && needs.changes.outputs.gate_e2e_load == 'true' && needs.image.result == 'success' && needs.chart.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -388,44 +490,15 @@ jobs:
         env:
           SKIP_BUILD: "1"
 
-  # Path filters for the fuzz jobs: only a pull request that touches the HTTP/1 codec (its
-  # module, `proxy.rs` that declares it, the Cargo files that pin its dependencies) or the
-  # discovery or mock module, or the fuzz crate runs the matching job. Other events leave them false.
-  changes:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 2
-    outputs:
-      codec: ${{ steps.filter.outputs.codec }}
-      discovery: ${{ steps.filter.outputs.discovery }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # the base commit must be in the history to diff against it
-          persist-credentials: false
-      - id: filter
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          codec=false
-          discovery=false
-          if [ "$EVENT" = pull_request ]; then
-            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/proxy/http1 crates/mimic-core/src/proxy.rs Cargo.toml Cargo.lock fuzz)" ]; then
-              codec=true
-            fi
-            if [ -n "$(git diff --name-only "$BASE" HEAD -- crates/mimic-core/src/discovery crates/mimic-core/src/mock crates/mimic-core/src/mock.rs crates/mimic-core/src/load fuzz)" ]; then
-              discovery=true
-            fi
-          fi
-          echo "codec=$codec" >> "$GITHUB_OUTPUT"
-          echo "discovery=$discovery" >> "$GITHUB_OUTPUT"
-
+  # Path filters for the fuzz jobs (spec PRX-28, DSC-23, PUL-20, MCK-20, LDT-18): the gates come from
+  # scripts/ci_plan.py, which lists the paths of each target (the codec, the discovery, mock and load
+  # modules, and the fuzz crate).
   fuzz:
     # PRX-28: 60 s on a pull request that touches the codec, 10 min on the weekly schedule.
-    # Skipped otherwise; `ci-ok` accepts that skip (and only that one).
+    # Skipped otherwise; `ci-ok` accepts that skip, as its gate is off.
     name: fuzz (http1)
     needs: changes
-    if: github.event_name == 'schedule' || (github.event_name == 'pull_request' && needs.changes.outputs.codec == 'true')
+    if: needs.changes.outputs.gate_fuzz_http1 == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -477,11 +550,11 @@ jobs:
   fuzz-discovery:
     # DSC-23, PUL-20, MCK-20, LDT-18: one job per target (the recorder, the egress set, the mock, the load plan), so that
     # each has its own time limit and corpus: 60 s on a pull request that touches the discovery
-    # or mock modules, 10 min on the weekly schedule. Skipped otherwise; `ci-ok` accepts that skip
-    # (and only that one), and sums the three jobs up as one result.
+    # or mock modules, 10 min on the weekly schedule. Skipped otherwise; `ci-ok` accepts that skip,
+    # as its gate is off, and sums the matrix jobs up as one result.
     name: fuzz (${{ matrix.target }})
     needs: changes
-    if: github.event_name == 'schedule' || (github.event_name == 'pull_request' && needs.changes.outputs.discovery == 'true')
+    if: needs.changes.outputs.gate_fuzz_discovery == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
@@ -537,10 +610,13 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, chart, security, cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql, image, e2e, e2e-load, changes, fuzz, fuzz-discovery]
+    needs: [changes, lint, test, chart, security, cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql-rust, codeql-actions, image, e2e, e2e-load, fuzz, fuzz-discovery]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
+    permissions:
+      contents: read
     env:
+      CHANGES: ${{ needs.changes.result }}
       LINT: ${{ needs.lint.result }}
       TEST: ${{ needs.test.result }}
       CHART: ${{ needs.chart.result }}
@@ -550,30 +626,62 @@ jobs:
       DEPENDENCY_REVIEW: ${{ needs.dependency-review.result }}
       GITLEAKS: ${{ needs.gitleaks.result }}
       TRIVY_CONFIG: ${{ needs.trivy-config.result }}
-      CODEQL: ${{ needs.codeql.result }}
+      CODEQL_RUST: ${{ needs.codeql-rust.result }}
+      CODEQL_ACTIONS: ${{ needs.codeql-actions.result }}
       IMAGE: ${{ needs.image.result }}
       E2E: ${{ needs.e2e.result }}
       E2E_LOAD: ${{ needs.e2e-load.result }}
-      CHANGES: ${{ needs.changes.result }}
       FUZZ: ${{ needs.fuzz.result }}
       FUZZ_DISCOVERY: ${{ needs.fuzz-discovery.result }}
-      CODEC: ${{ needs.changes.outputs.codec }}
-      DISCOVERY: ${{ needs.changes.outputs.discovery }}
+      # The gates, as the change set them ("true" or "false"); a gate is "" when `changes` failed.
+      GATE_LINT: ${{ needs.changes.outputs.gate_lint }}
+      GATE_TEST: ${{ needs.changes.outputs.gate_test }}
+      GATE_CHART: ${{ needs.changes.outputs.gate_chart }}
+      GATE_SECURITY: ${{ needs.changes.outputs.gate_security }}
+      GATE_COOLDOWN: ${{ needs.changes.outputs.gate_cooldown }}
+      GATE_VENDORED_UI: ${{ needs.changes.outputs.gate_vendored_ui }}
+      GATE_TRIVY_CONFIG: ${{ needs.changes.outputs.gate_trivy_config }}
+      GATE_CODEQL_RUST: ${{ needs.changes.outputs.gate_codeql_rust }}
+      GATE_CODEQL_ACTIONS: ${{ needs.changes.outputs.gate_codeql_actions }}
+      GATE_IMAGE: ${{ needs.changes.outputs.gate_image }}
+      GATE_E2E: ${{ needs.changes.outputs.gate_e2e }}
+      GATE_E2E_LOAD: ${{ needs.changes.outputs.gate_e2e_load }}
+      GATE_FUZZ_HTTP1: ${{ needs.changes.outputs.gate_fuzz_http1 }}
+      GATE_FUZZ_DISCOVERY: ${{ needs.changes.outputs.gate_fuzz_discovery }}
     steps:
       - name: All stages passed
         run: |
-          echo "lint=$LINT test=$TEST chart=$CHART security=$SECURITY cooldown=$COOLDOWN vendored-ui=$VENDORED_UI dependency-review=$DEPENDENCY_REVIEW gitleaks=$GITLEAKS trivy-config=$TRIVY_CONFIG codeql=$CODEQL image=$IMAGE e2e=$E2E e2e-load=$E2E_LOAD changes=$CHANGES fuzz=$FUZZ codec=$CODEC fuzz-discovery=$FUZZ_DISCOVERY discovery=$DISCOVERY"
-          for r in "$LINT" "$TEST" "$CHART" "$SECURITY" "$COOLDOWN" "$VENDORED_UI" "$DEPENDENCY_REVIEW" "$GITLEAKS" "$TRIVY_CONFIG" "$CODEQL" "$IMAGE" "$E2E" "$E2E_LOAD" "$CHANGES"; do
-            [ "$r" = success ] || exit 1
-          done
-          # fuzz may be skipped by its path filter; it may not be skipped when the codec changed.
-          case "$FUZZ" in
-            success) ;;
-            skipped) [ "$CODEC" != true ] || exit 1 ;;
-            *) exit 1 ;;
-          esac
-          case "$FUZZ_DISCOVERY" in
-            success) ;;
-            skipped) [ "$DISCOVERY" != true ] || exit 1 ;;
-            *) exit 1 ;;
-          esac
+          fail=0
+          # check <job> <result> <gate>: the job succeeded, or it was skipped while its gate is off.
+          # An empty gate (an ungated job, or a missing output) never accepts a skip.
+          check() {
+            case "$2" in
+              success) ;;
+              skipped)
+                if [ "$3" != false ]; then
+                  echo "$1: skipped, but its gate is '$3'" >&2
+                  fail=1
+                fi
+                ;;
+              *) echo "$1: $2" >&2; fail=1 ;;
+            esac
+          }
+          check changes "$CHANGES" ""
+          check lint "$LINT" "$GATE_LINT"
+          check test "$TEST" "$GATE_TEST"
+          check chart "$CHART" "$GATE_CHART"
+          check security "$SECURITY" "$GATE_SECURITY"
+          check cooldown "$COOLDOWN" "$GATE_COOLDOWN"
+          check vendored-ui "$VENDORED_UI" "$GATE_VENDORED_UI"
+          check dependency-review "$DEPENDENCY_REVIEW" ""
+          check gitleaks "$GITLEAKS" ""
+          check trivy-config "$TRIVY_CONFIG" "$GATE_TRIVY_CONFIG"
+          check codeql-rust "$CODEQL_RUST" "$GATE_CODEQL_RUST"
+          check codeql-actions "$CODEQL_ACTIONS" "$GATE_CODEQL_ACTIONS"
+          check image "$IMAGE" "$GATE_IMAGE"
+          check e2e "$E2E" "$GATE_E2E"
+          check e2e-load "$E2E_LOAD" "$GATE_E2E_LOAD"
+          check fuzz "$FUZZ" "$GATE_FUZZ_HTTP1"
+          check fuzz-discovery "$FUZZ_DISCOVERY" "$GATE_FUZZ_DISCOVERY"
+          echo "gates: lint=$GATE_LINT test=$GATE_TEST chart=$GATE_CHART security=$GATE_SECURITY cooldown=$GATE_COOLDOWN vendored-ui=$GATE_VENDORED_UI trivy-config=$GATE_TRIVY_CONFIG codeql-rust=$GATE_CODEQL_RUST codeql-actions=$GATE_CODEQL_ACTIONS image=$GATE_IMAGE e2e=$GATE_E2E e2e-load=$GATE_E2E_LOAD fuzz=$GATE_FUZZ_HTTP1 fuzz-discovery=$GATE_FUZZ_DISCOVERY"
+          exit "$fail"
