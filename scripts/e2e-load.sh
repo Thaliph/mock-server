@@ -260,10 +260,13 @@ suite_main() {
   # were injected before, so they are restarted to get it (§10.3: a pod injected before keeps its env).
   kubectl -n mck-19 rollout restart deploy/front >/dev/null
   kubectl -n mck-19 rollout status deploy/front --timeout=3m >/dev/null || fail "ldt_16: front did not roll out after enabling load tests"
-  for p in $(kubectl -n mck-19 get pods -l app=front -o name); do
-    [[ $(kubectl -n mck-19 get "$p" -o jsonpath='{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_LOAD_ENABLED")].value}') == 1 ]] \
-      || fail "ldt_16: $p has no MIMIC_LOAD_ENABLED=1 after enabling load tests"
-  done
+  # The old pods may still be listed right after the rollout: wait until every pod of front has the variable.
+  front_load_enabled() {
+    local envs
+    envs=$(kubectl -n mck-19 get pods -l app=front -o json | jq -r '[.items[] | [.spec.initContainers[]? | select(.name == "mimic-sidecar") | .env[]? | select(.name == "MIMIC_LOAD_ENABLED") | .value][0] // "none"] | join(" ")') || return 1
+    [[ -n $envs && $envs != *none* ]]
+  }
+  wait_for 120 front_load_enabled || fail "ldt_16: the pods of front have no MIMIC_LOAD_ENABLED=1 120 s after the restart"
 
   # The Secret of the credentials: a canary, held by the Secret and by the generator's requests only.
   canary="ldt16-$(openssl rand -hex 16)"
