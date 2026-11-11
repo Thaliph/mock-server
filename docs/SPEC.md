@@ -1786,7 +1786,7 @@ no `MimicLoadTest` and creates no Job).
   `ValidatingAdmissionPolicy` refuses a create or update naming `credentials.secretName`
   unless the requesting user may `get` that Secret (CEL `authorizer`), so a `MimicLoadTest`
   never sends a Secret its author could not read. `kubectl get mimicloadtest` prints
-  `Deployment`, `Phase`, `Reason`, `Requests`, `RPS`, `P99 µs` and `Age`.
+  `Deployment`, `Phase`, `Reason`, `Requests`, `RPS`, `P99 Micros` (kubectl upper-cases column names, which would turn `µ` into a Greek capital Mu; #431) and `Age`.
 - **Lifecycle** (controller, both replicas, no leader: every step is idempotent). Phases
   `Pending` → `Running` → `Succeeded`, or `Failed` / `Aborted`, with a `reason`:
   1. *Validation* (pure): a value above a `MIMIC_LOAD_*` limit or `rampUp` > `duration` →

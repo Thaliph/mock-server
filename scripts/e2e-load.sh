@@ -617,7 +617,7 @@ lt_spec_base='{"deployment": "front", "duration": "5m"}'
 log "ldt_06: the CRD has the printer columns of spec §7.8 and the status subresource"
 columns=$(kubectl get crd mimicloadtests.mimic.platform.io \
   -o jsonpath='{range .spec.versions[0].additionalPrinterColumns[*]}{.name}{"|"}{end}')
-[[ $columns == 'Deployment|Phase|Reason|Requests|RPS|P99 µs|Age|' ]] || fail "ldt_06: printer columns are '$columns'"
+[[ $columns == 'Deployment|Phase|Reason|Requests|RPS|P99 Micros|Age|' ]] || fail "ldt_06: printer columns are '$columns'"
 [[ $(kubectl get crd mimicloadtests.mimic.platform.io -o jsonpath='{.spec.versions[0].subresources.status}') == '{}' ]] \
   || fail "ldt_06: the CRD has no status subresource"
 
