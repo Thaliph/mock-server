@@ -8,7 +8,8 @@ use serde_json::{Map, Value, json};
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::check::Violation;
-use super::redact::{MARKER, Redactor};
+use super::placeholder::is_marked;
+use super::redact::Redactor;
 use super::schema::{
     MAX_NAME, MAX_NODES, MAX_PARAMS, Pair, Params, Schema, cut_name, header_pairs, query_pairs,
 };
@@ -159,9 +160,10 @@ pub struct Observed {
     fields: Volatility,
 }
 
-/// True when a redacted value carries the marker (the whole value or a part of it).
+/// True when a redacted value carries a placeholder or the legacy marker (the whole value or a
+/// part of it).
 fn redacted(value: &str) -> bool {
-    value.contains(MARKER)
+    is_marked(value)
 }
 
 /// The fields of one exchange that were counted already: `n` counts an exchange once.

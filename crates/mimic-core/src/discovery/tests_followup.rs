@@ -86,7 +86,7 @@ fn dsc_06_percent_encoded_path_segments_are_detected() {
     assert_eq!(segment_rule("%41"), None);
     assert_eq!(
         path(&format!("/reset/{JWT_ENCODED}/done")),
-        "/reset/<redacted>/done"
+        "/reset/mimic-jwt/done"
     );
     // A kept segment stays as received.
     assert_eq!(path("/a%20b/%41"), "/a%20b/%41");
@@ -99,7 +99,7 @@ fn dsc_06_percent_encoded_query_values_in_header_urls() {
     let r = Redactor::default();
     assert_eq!(
         r.header("Location", &format!("https://h/x?v={JWT_ENCODED}&k=a%20b")),
-        "https://h/x?v=<redacted>&k=a%20b"
+        "https://h/x?v=mimic-jwt&k=a%20b"
     );
 }
 
@@ -108,19 +108,19 @@ fn dsc_05_relative_urls_in_header_values() {
     let r = Redactor::default();
     assert_eq!(
         r.header("Location", "reset?code=SplxlOBeZQQ&access_token=abc"),
-        "reset?code=SplxlOBeZQQ&access_token=<redacted>"
+        "reset?code=SplxlOBeZQQ&access_token=mimic-token"
     );
     assert_eq!(
         r.header("Link", "<cb?token=T>; rel=next"),
-        "<cb?token=<redacted>>; rel=next"
+        "<cb?token=mimic-token>; rel=next"
     );
     assert_eq!(
         r.header("Location", &format!("../reset/{JWT}")),
-        "../reset/<redacted>"
+        "../reset/mimic-jwt"
     );
     assert_eq!(
         r.header("Location", "cb#access_token=T"),
-        "cb#access_token=<redacted>"
+        "cb#access_token=mimic-token"
     );
     assert_eq!(
         r.header("Content-Type", "text/html; charset=utf-8"),

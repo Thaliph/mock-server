@@ -10,6 +10,7 @@ use axum::body::Bytes;
 use axum::http::{Method, Request};
 use http_body_util::BodyExt;
 use mimic_core::discovery::observed::Observation;
+use mimic_core::discovery::placeholder::PLACEHOLDERS;
 use mimic_core::discovery::redact::{MARKER, Redactor};
 use mimic_core::discovery::report::{Direction, Exchange, Limits, Report};
 use mimic_core::discovery::store::merge_bounded;
@@ -691,24 +692,33 @@ const CARD: &str = "4111111111111111";
 const GITHUB: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 const NAMED: &str = "CANARYnamedvalue12345";
 
-/// Replaces every redaction marker of `value` by `secret`, as a faulty sidecar would send it,
+/// Every redaction placeholder, and the legacy marker of authority hosts.
+fn markers() -> impl Iterator<Item = &'static str> {
+    PLACEHOLDERS.into_iter().chain([MARKER])
+}
+
+/// Replaces every placeholder of `value` by `secret`, as a faulty sidecar would send it,
 /// with the size of each sample that holds one kept true (the check verifies it).
 fn plant(value: &mut Value, secret: &str) {
     match value {
-        Value::String(s) if s.contains(MARKER) => *s = s.replace(MARKER, secret),
+        Value::String(s) => *s = markers().fold(s.clone(), |text, p| text.replace(p, secret)),
         Value::Array(items) => items.iter_mut().for_each(|i| plant(i, secret)),
         Value::Object(map) => {
             let planted = map.contains_key("request_shape").then(|| {
-                Value::Object(map.clone())
-                    .to_string()
-                    .matches(MARKER)
-                    .count()
+                let text = Value::Object(map.clone()).to_string();
+                markers()
+                    .map(|p| {
+                        text.matches(p).count() as i64 * (secret.len() as i64 - p.len() as i64)
+                    })
+                    .sum::<i64>()
             });
             map.values_mut().for_each(|i| plant(i, secret));
-            if let (Some(count), Some(bytes)) = (planted, map.get("bytes").and_then(Value::as_u64))
+            if let (Some(grown), Some(bytes)) = (planted, map.get("bytes").and_then(Value::as_u64))
             {
-                let grown = count * (secret.len() - MARKER.len());
-                map.insert("bytes".to_string(), json!(bytes + grown as u64));
+                map.insert(
+                    "bytes".to_string(),
+                    json!(bytes.saturating_add_signed(grown)),
+                );
             }
         }
         _ => {}

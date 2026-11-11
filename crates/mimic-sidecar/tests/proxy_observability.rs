@@ -773,6 +773,6 @@ async fn dsc_21_inbound_access_line_redacts_path_secrets() {
         .unwrap();
     assert_eq!(read_exact(&mut c, response.len()).await, response);
     let lines = logs.access_exactly(1).await;
-    assert_eq!(lines[0]["path"], "/reset/<redacted>");
+    assert_eq!(lines[0]["path"], "/reset/mimic-jwt");
     assert!(!logs.text().contains(JWT), "{}", logs.text());
 }

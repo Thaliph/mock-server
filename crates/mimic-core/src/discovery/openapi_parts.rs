@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
+use super::placeholder::{Placeholder, is_marked, upgrade_text};
 use super::redact::{MARKER, auth_scheme};
 use super::report::Endpoint;
 use super::sample::Sample;
@@ -86,10 +87,17 @@ fn params(
             if values.is_empty() {
                 continue;
             }
-            // A redacted field shows the marker only, whatever a sample holds.
+            // A redacted field shows a placeholder only, whatever a sample holds.
+            let shown = |v: &String| {
+                if is_marked(v) {
+                    upgrade_text(v)
+                } else {
+                    Placeholder::Secret.to_string()
+                }
+            };
             let value = match (redacted, array) {
-                (true, true) => json!([MARKER]),
-                (true, false) => json!(MARKER),
+                (true, true) => json!(values.iter().map(|v| shown(v)).collect::<Vec<_>>()),
+                (true, false) => json!(shown(values[0])),
                 (false, true) => json!(values),
                 (false, false) => json!(values[0]),
             };
@@ -224,8 +232,9 @@ pub(super) fn responses(e: &Endpoint<'_>, observed: &Value) -> Value {
 }
 
 /// The security schemes the samples' `authorization` headers show, by their key in
-/// `components.securitySchemes`: `http_<scheme>` for `<Scheme> <redacted>` (a token of
-/// `a-z0-9-`), `authorization` (an API key) for a bare `<redacted>`.
+/// `components.securitySchemes`: `http_<scheme>` for `<Scheme> <placeholder>` (a token of
+/// `a-z0-9-`), `authorization` (an API key) for a bare placeholder; the legacy marker
+/// `<redacted>` reads as a placeholder.
 pub(super) fn schemes(e: &Endpoint<'_>) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     for (_, sample) in e.stats.samples().iter() {
@@ -233,14 +242,14 @@ pub(super) fn schemes(e: &Endpoint<'_>) -> BTreeMap<String, Value> {
             if name != "authorization" {
                 continue;
             }
-            if value == MARKER {
+            if value == MARKER || value == Placeholder::Auth.as_str() {
                 out.insert(
                     "authorization".to_string(),
                     json!({"type": "apiKey", "in": "header", "name": "Authorization"}),
                 );
             } else if let Some((scheme, rest)) = value.split_once(' ') {
                 // Only a registered scheme is kept, in its lower-case spelling.
-                if let (Some(scheme), true) = (auth_scheme(scheme), rest == MARKER) {
+                if let (Some(scheme), true) = (auth_scheme(scheme), credential(rest)) {
                     let scheme = scheme.to_ascii_lowercase();
                     out.insert(
                         format!("http_{scheme}"),
@@ -251,6 +260,11 @@ pub(super) fn schemes(e: &Endpoint<'_>) -> BTreeMap<String, Value> {
         }
     }
     out
+}
+
+/// The credential after a scheme: a placeholder of §6, or the legacy marker.
+fn credential(rest: &str) -> bool {
+    rest == MARKER || rest == Placeholder::Token.as_str() || rest == Placeholder::Auth.as_str()
 }
 
 /// The reason phrase of the IANA HTTP status code registry.

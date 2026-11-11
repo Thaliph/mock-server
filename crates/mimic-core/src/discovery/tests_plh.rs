@@ -168,7 +168,7 @@ proptest! {
             7 => r.field("note", &format!("Bearer {canary}")),
             8 => r.field("note", &format!("sk-{canary}")),
             9 => format!("/x/{}", super::redact::segment(&jwt)),
-            10 => r.header("x-note", &format!("AIza{}", &canary[..31]).replace("AIza", "AIzaSy")),
+            10 => r.header("x-note", &format!("AIza{canary}abc")),
             11 => {
                 let mut v = json!({"note": jwt, "password": canary});
                 r.json(&mut v);
@@ -271,11 +271,20 @@ fn plh_02_type_by_value_under_a_neutral_name() {
         assert_eq!(json_of(&r, "note", json!(value)), json!(want), "{want}");
     }
     assert_eq!(redact_path(&format!("/reset/{jwt}")), "/reset/mimic-jwt");
-    assert_eq!(redact_path("/reset/%65yJhbGciOiJIUzI1NiJ9.e30.c2ln"), "/reset/mimic-jwt");
-    assert_eq!(redact_path("/pay/4111111111111111"), "/pay/mimic-card");
-    assert_eq!(json_of(&r, "note", json!(4111111111111111u64)), json!("mimic-card"));
     assert_eq!(
-        r.header("location", &format!("https://h/reset/{jwt}?code=C&access_token=T")),
+        redact_path("/reset/%65yJhbGciOiJIUzI1NiJ9.e30.c2ln"),
+        "/reset/mimic-jwt"
+    );
+    assert_eq!(redact_path("/pay/4111111111111111"), "/pay/mimic-card");
+    assert_eq!(
+        json_of(&r, "note", json!(4111111111111111u64)),
+        json!("mimic-card")
+    );
+    assert_eq!(
+        r.header(
+            "location",
+            &format!("https://h/reset/{jwt}?code=C&access_token=T")
+        ),
         "https://h/reset/mimic-jwt?code=C&access_token=mimic-token"
     );
 }
@@ -360,7 +369,11 @@ fn leaky(redactor: &Redactor, canary: &str) -> Report {
         ("x-api-key", canary.to_string()),
         ("x-custom-code", canary.to_string()),
         ("x-note", jwt.clone()),
-        ("location", format!("https://h/cb/{jwt}?code={canary}&token={canary}")),
+        (
+            "location",
+            format!("https://h/cb/{jwt}?session={canary}&token={canary}"),
+        ),
+        ("content-type", "application/json".to_string()),
     ];
     let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
     let body = format!(
@@ -374,7 +387,7 @@ fn leaky(redactor: &Redactor, canary: &str) -> Report {
             query: &format!("token={canary}&tenant_code={canary}&k=ghp_{canary}"),
             req_headers: &headers,
             req_body: Some(body.as_bytes()),
-            resp_headers: &headers[..2],
+            resp_headers: &headers,
             resp_body: Some(body.as_bytes()),
         },
     )
@@ -388,7 +401,7 @@ proptest! {
         let redactor = Redactor::new(["tenantcode", "customcode"]);
         let mut r = leaky(&redactor, &canary);
         let once = r.to_json().unwrap();
-        prop_assert!(hash_free(&once, &canary));
+        prop_assert!(hash_free(&once, &canary), "{once}");
         prop_assert!(!once.contains(MARKER));
         r.re_redact(&redactor);
         prop_assert_eq!(&once, &r.to_json().unwrap());
@@ -449,6 +462,7 @@ fn plh_05_the_upgrade_gives_the_type_of_the_field() {
         ("cookie", "a=1; b=2"),
         ("x-note", "ghp_x"),
         ("proxy-authorization", "Basic x"),
+        ("content-type", "application/json"),
     ];
     let body = br#"{"password":"p","card_number":[1,2],"note":"ghp_x"}"#;
     let original = recorded(

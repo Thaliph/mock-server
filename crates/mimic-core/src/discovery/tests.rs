@@ -348,7 +348,7 @@ fn dsc_09_hosts_capped() {
 }
 
 mod redaction {
-    use super::super::redact::{MARKER, Redactor, path, value_rule};
+    use super::super::redact::{Redactor, path, value_rule};
     use super::super::report::{Exchange, Report};
     use super::super::template::is_param;
     use serde_json::json;
@@ -409,30 +409,30 @@ mod redaction {
                 "Location",
                 "https://h/cb?code=SplxlOBeZQQ&access_token=abc123&state=ok"
             ),
-            "https://h/cb?code=SplxlOBeZQQ&access_token=<redacted>&state=ok"
+            "https://h/cb?code=SplxlOBeZQQ&access_token=mimic-token&state=ok"
         );
         assert_eq!(
             r.header("Location", "https://h/cb?token=a&page=2#access_token=T&x=1"),
-            "https://h/cb?token=<redacted>&page=2#access_token=<redacted>&x=1"
+            "https://h/cb?token=mimic-token&page=2#access_token=mimic-token&x=1"
         );
         assert_eq!(
             r.header("Referer", "https://h/reset?token=abcdef123456"),
-            "https://h/reset?token=<redacted>"
+            "https://h/reset?token=mimic-token"
         );
         assert_eq!(
             r.header(
                 "Link",
                 "<https://api/x?api_key=zzz>; rel=next, </p?page=2>; rel=prev"
             ),
-            "<https://api/x?api_key=<redacted>>; rel=next, </p?page=2>; rel=prev"
+            "<https://api/x?api_key=mimic-api-key>; rel=next, </p?page=2>; rel=prev"
         );
         assert_eq!(
             r.header("Content-Location", "/a/b?secret=1"),
-            "/a/b?secret=<redacted>"
+            "/a/b?secret=mimic-secret"
         );
         assert_eq!(
             r.header("Refresh", "0; url=https://h/x?auth=1"),
-            "0; url=https://h/x?auth=<redacted>"
+            "0; url=https://h/x?auth=mimic-auth"
         );
         assert_eq!(
             r.header("Content-Type", "application/json; charset=utf-8"),
@@ -448,13 +448,13 @@ mod redaction {
                 "Location",
                 &format!("https://h/reset/{JWT}/done?next=/home")
             ),
-            "https://h/reset/<redacted>/done?next=/home"
+            "https://h/reset/mimic-jwt/done?next=/home"
         );
         assert_eq!(
             r.header("Referer", &format!("https://h/x?v={JWT}")),
-            "https://h/x?v=<redacted>"
+            "https://h/x?v=mimic-jwt"
         );
-        assert_eq!(r.header("Location", "https://u:p@h/x"), MARKER);
+        assert_eq!(r.header("Location", "https://u:p@h/x"), "mimic-password");
         assert_eq!(
             r.header("Location", "https://h/plain/path"),
             "https://h/plain/path"
@@ -465,36 +465,39 @@ mod redaction {
     fn dsc_05_authorization_scheme_allowlist() {
         let r = r();
         for name in ["Authorization", "Proxy-Authorization"] {
-            assert_eq!(r.header(name, "Bearer x"), "Bearer <redacted>");
-            assert_eq!(r.header(name, "bearer x"), "Bearer <redacted>");
-            assert_eq!(r.header(name, "DIGEST realm=r"), "Digest <redacted>");
+            assert_eq!(r.header(name, "Bearer x"), "Bearer mimic-token");
+            assert_eq!(r.header(name, "bearer x"), "Bearer mimic-token");
+            assert_eq!(r.header(name, "DIGEST realm=r"), "Digest mimic-auth");
             assert_eq!(
                 r.header(name, "aws4-hmac-sha256 a=b"),
-                "AWS4-HMAC-SHA256 <redacted>"
+                "AWS4-HMAC-SHA256 mimic-auth"
             );
-            assert_eq!(r.header(name, "NotAScheme x"), MARKER);
-            assert_eq!(r.header(name, "sk1a2b3c4d5e6f x"), MARKER);
+            assert_eq!(r.header(name, "NotAScheme x"), "mimic-auth");
+            assert_eq!(r.header(name, "sk1a2b3c4d5e6f x"), "mimic-auth");
         }
     }
 
     #[test]
     fn dsc_05_headers_queries_forms() {
         let r = r();
-        assert_eq!(r.header("X-Api-Key", "abc"), MARKER);
-        assert_eq!(r.header("Authorization", "Bearer x"), "Bearer <redacted>");
-        assert_eq!(r.header("Authorization", "x"), MARKER);
+        assert_eq!(r.header("X-Api-Key", "abc"), "mimic-api-key");
+        assert_eq!(r.header("Authorization", "Bearer x"), "Bearer mimic-token");
+        assert_eq!(r.header("Authorization", "x"), "mimic-auth");
         assert_eq!(
             r.header("Proxy-Authorization", "Basic eDp5"),
-            "Basic <redacted>"
+            "Basic mimic-auth"
         );
-        assert_eq!(r.header("Cookie", "a=1; b=2"), "a=<redacted>; b=<redacted>");
+        assert_eq!(
+            r.header("Cookie", "a=1; b=2"),
+            "a=mimic-cookie; b=mimic-cookie"
+        );
         assert_eq!(
             r.header("Set-Cookie", "s=1; Path=/; HttpOnly"),
-            "s=<redacted>; Path=/; HttpOnly"
+            "s=mimic-cookie; Path=/; HttpOnly"
         );
         assert_eq!(r.header("x-custom", "plain"), "plain");
-        assert_eq!(r.field("token", "abc"), MARKER);
-        assert_eq!(r.field("refreshToken", "abc"), MARKER);
+        assert_eq!(r.field("token", "abc"), "mimic-token");
+        assert_eq!(r.field("refreshToken", "abc"), "mimic-token");
         assert_eq!(r.field("page", "2"), "2");
     }
 
@@ -516,9 +519,9 @@ mod redaction {
                 "id": 1,
                 "name": "n",
                 "amount": 5,
-                "password": MARKER,
-                "user": {"client_secret": MARKER, "ok": true},
-                "list": [{"refreshToken": MARKER, "id": 2}],
+                "password": "mimic-password",
+                "user": {"client_secret": "mimic-secret", "ok": true},
+                "list": [{"refreshToken": "mimic-token", "id": 2}],
             })
         );
     }
@@ -553,15 +556,26 @@ mod redaction {
             "https://u:p@h/",
         ];
         let r = r();
+        let placeholder = |s: &str| match s {
+            s if s == JWT => "mimic-jwt",
+            s if s.starts_with("-----BEGIN") => "mimic-private-key",
+            s if s.starts_with("Bearer") || s.starts_with("Basic") => "mimic-auth",
+            s if s.starts_with(|c: char| c.is_ascii_digit()) => "mimic-card",
+            s if s.starts_with("AKIA") || s.starts_with("ASIA") => "mimic-api-key",
+            s if s.starts_with("sk") || s.starts_with("rk") => "mimic-api-key",
+            s if s.starts_with("https://") => "mimic-password",
+            _ => "mimic-token",
+        };
         for s in secrets {
+            let want = placeholder(s);
             assert!(value_rule(s).is_some(), "{s:?} should be detected");
-            assert_eq!(r.header("x-custom", s), MARKER, "header {s:?}");
-            assert_eq!(r.field("q", s), MARKER, "query {s:?}");
+            assert_eq!(r.header("x-custom", s), want, "header {s:?}");
+            assert_eq!(r.field("q", s), want, "query {s:?}");
             let mut v = json!({ "k": s });
             r.json(&mut v);
-            assert_eq!(v, json!({ "k": MARKER }), "json {s:?}");
+            assert_eq!(v, json!({ "k": want }), "json {s:?}");
             if !s.contains(['/', '\n']) {
-                assert_eq!(path(&format!("/a/{s}")), "/a/<redacted>", "path {s:?}");
+                assert_eq!(path(&format!("/a/{s}")), format!("/a/{want}"), "path {s:?}");
             }
         }
         let near = [
@@ -581,7 +595,7 @@ mod redaction {
         // A card as a JSON number.
         let mut v = json!({"n": 4111111111111111u64, "m": 4111111111111112u64});
         r.json(&mut v);
-        assert_eq!(v, json!({"n": MARKER, "m": 4111111111111112u64}));
+        assert_eq!(v, json!({"n": "mimic-card", "m": 4111111111111112u64}));
     }
 
     #[test]
@@ -595,7 +609,7 @@ mod redaction {
             assert!(is_param(s), "{s}");
         }
         assert_eq!(path("/reset/ghp_a"), path("/reset/ghp_b"));
-        assert_eq!(path("/reset/ghp_a"), "/reset/<redacted>");
+        assert_eq!(path("/reset/ghp_a"), "/reset/mimic-token");
     }
 
     #[test]
@@ -609,7 +623,7 @@ mod redaction {
         report.record(&super::limits(50), &Redactor::default(), &exchange);
         let json = report.to_json().unwrap();
         assert!(!json.contains(JWT), "{json}");
-        assert!(json.contains("/pkg.Svc/<redacted>"), "{json}");
+        assert!(json.contains("/pkg.Svc/mimic-jwt"), "{json}");
         // Not templated: an id-like segment stays literal.
         report.record(
             &super::limits(50),
@@ -624,10 +638,10 @@ mod redaction {
 
     #[test]
     fn dsc_21_path_segment_by_segment() {
-        assert_eq!(path(&format!("/reset/{JWT}")), "/reset/<redacted>");
+        assert_eq!(path(&format!("/reset/{JWT}")), "/reset/mimic-jwt");
         assert_eq!(path("/a/b/c"), "/a/b/c");
         assert_eq!(path("/a//b/"), "/a//b/");
         assert_eq!(path("/"), "/");
-        assert_eq!(path("/pay/4111-1111-1111-1111/ok"), "/pay/<redacted>/ok");
+        assert_eq!(path("/pay/4111-1111-1111-1111/ok"), "/pay/mimic-card/ok");
     }
 }

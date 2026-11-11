@@ -7,7 +7,8 @@ use serde_json::Value;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::discovery::observed::{Content, MAX_ITEMS, MAX_LEVEL, parse, pointer_token};
-use crate::discovery::redact::{self, MARKER, Redactor};
+use crate::discovery::placeholder::is_marked;
+use crate::discovery::redact::{self, Redactor};
 use crate::discovery::schema::{cut_name, query_pairs};
 use crate::discovery::scope::authority_key;
 use crate::discovery::template::split_path;
@@ -44,7 +45,7 @@ fn hash_values(values: &[String]) -> u64 {
 
 impl Fields {
     fn add(&mut self, name: String, star: String, value: String) {
-        let marked = value.contains(MARKER);
+        let marked = is_marked(&value);
         let entry = self.entries.entry(name).or_insert_with(|| Entry {
             star,
             values: Vec::new(),
@@ -131,7 +132,7 @@ impl Fields {
         let (segments, positions) = path;
         for position in positions {
             if let Some(segment) = segments.get(*position) {
-                let marked = segment.contains(MARKER);
+                let marked = is_marked(segment);
                 push(
                     &format!("path/{}", position + 1),
                     std::slice::from_ref(segment),

@@ -111,14 +111,14 @@ fn egr_06_outbound_request_headers_keep_only_the_allowlist() {
     );
     let (req, _, _) = sample_of(&r);
     for name in ["ocp-apim-subscription-key", "x-tenant-key", "x-anything"] {
-        assert_eq!(header(&req, name), MARKER);
+        assert_eq!(header(&req, name), "mimic-secret");
     }
     assert_eq!(header(&req, "accept"), "application/json");
     assert_eq!(header(&req, "content-type"), "text/plain");
     assert_eq!(header(&req, "user-agent"), "app/1.0");
     assert_eq!(header(&req, "if-none-match"), "\"abc\"");
-    assert_eq!(header(&req, "authorization"), format!("Basic {MARKER}"));
-    assert_eq!(header(&req, "cookie"), format!("a={MARKER}"));
+    assert_eq!(header(&req, "authorization"), "Basic mimic-auth");
+    assert_eq!(header(&req, "cookie"), "a=mimic-cookie");
     assert!(!r.to_json().unwrap().contains(CANARY));
     let v = json(&r);
     let fields = &v["scopes"]["outbound"][AUTHORITY]["root"]["literals"]["x"]["endpoints"]["POST"]
@@ -140,10 +140,10 @@ fn egr_06_the_rule_is_outbound_header_and_names_keep_their_rules() {
     assert_eq!(Rule::OutboundHeader.as_str(), "outbound_header");
     assert!(out.header_rules("accept", "text/html").is_empty());
     assert_eq!(out.header_rules("authorization", "Bearer x"), [Rule::Name]);
-    assert_eq!(out.header("authorization", "Frobnicate x"), MARKER);
+    assert_eq!(out.header("authorization", "Frobnicate x"), "mimic-auth");
     assert_eq!(
         out.header("proxy-authorization", "Digest x"),
-        format!("Digest {MARKER}")
+        "Digest mimic-auth"
     );
     // The view is for requests only.
     let plain = Redactor::default();
@@ -226,7 +226,7 @@ fn egr_06_a_google_api_key_is_redacted_by_value_in_both_directions() {
             },
         );
         let (_, q, _) = sample_of(&r);
-        assert_eq!(q.iter().find(|(k, _)| k == "q").unwrap().1, MARKER);
+        assert_eq!(q.iter().find(|(k, _)| k == "q").unwrap().1, "mimic-api-key");
         assert_eq!(
             q.iter().find(|(k, _)| k == "short").unwrap().1,
             key[..key.len() - 1]
@@ -299,17 +299,20 @@ fn egr_06_re_redaction_applies_the_outbound_view() {
     let text = r.to_json().unwrap();
     let leaked = text
         .replace(
-            r#"["x-custom","<redacted>"]"#,
+            r#"["x-custom","mimic-secret"]"#,
             &format!(r#"["x-custom","{CANARY}"]"#),
         )
-        .replace(r#"["key","<redacted>"]"#, &format!(r#"["key","{CANARY}"]"#));
+        .replace(
+            r#"["key","mimic-api-key"]"#,
+            &format!(r#"["key","{CANARY}"]"#),
+        );
     assert!(leaked.contains(CANARY));
     let mut back = Report::from_json(&leaked).unwrap();
     back.re_redact(&Redactor::default());
     let after = back.to_json().unwrap();
     assert!(!after.contains(CANARY));
     let (req, q, _) = sample_of(&back);
-    assert_eq!(header(&req, "x-custom"), MARKER);
+    assert_eq!(header(&req, "x-custom"), "mimic-secret");
     assert_eq!(header(&req, "accept"), "a/b");
     assert_eq!(q.iter().find(|(k, _)| k == "ok").unwrap().1, "w");
     // The same text as an inbound request is not touched.

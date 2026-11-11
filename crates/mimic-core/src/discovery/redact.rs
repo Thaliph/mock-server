@@ -1,5 +1,6 @@
-//! Redaction (spec §6), by name and by value. The marker is a constant: no hash of a secret is
-//! ever kept, so two secrets cannot be told apart.
+//! Redaction (spec §6), by name and by value. What a redacted value becomes is a placeholder,
+//! a constant of the type of the rule that fired: no byte, length or hash of a secret is ever
+//! kept, so two secrets cannot be told apart.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -10,7 +11,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 
-/// What a redacted value becomes.
+use super::placeholder::{PLACEHOLDERS, Placeholder, upgrade_text};
+
+/// The legacy marker of up to F12 (spec §6): read and upgraded, and still the host of a redacted
+/// outbound authority. A redacted value is a [`Placeholder`].
 pub const MARKER: &str = "<redacted>";
 
 /// HTTP authentication schemes kept by `Authorization` and `Proxy-Authorization`, in their
@@ -154,24 +158,38 @@ impl Rule {
 
 /// The value detector that catches `s`, if any.
 pub fn value_rule(s: &str) -> Option<Rule> {
+    value_hit(s).map(|(rule, _)| rule)
+}
+
+/// The prefixes that give `mimic-api-key` rather than `mimic-token`.
+const API_KEY_PREFIXES: &[&str] = &["sk_live_", "rk_live_", "sk-"];
+
+/// The value detector that catches `s` and the placeholder it gives.
+fn value_hit(s: &str) -> Option<(Rule, Placeholder)> {
     if is_jwt(s) {
-        Some(Rule::Jwt)
+        Some((Rule::Jwt, Placeholder::Jwt))
     } else if s.contains("-----BEGIN ") {
-        Some(Rule::Pem)
+        Some((Rule::Pem, Placeholder::PrivateKey))
     } else if is_credential(s) {
-        Some(Rule::Credential)
+        Some((Rule::Credential, Placeholder::Auth))
     } else if is_card(s) {
-        Some(Rule::Card)
+        Some((Rule::Card, Placeholder::Card))
     } else if is_aws(s) {
-        Some(Rule::Aws)
-    } else if is_google_key(s)
-        || TOKEN_PREFIXES
-            .iter()
-            .any(|p| s.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
+        Some((Rule::Aws, Placeholder::ApiKey))
+    } else if is_google_key(s) {
+        Some((Rule::TokenPrefix, Placeholder::ApiKey))
+    } else if let Some(prefix) = TOKEN_PREFIXES
+        .iter()
+        .find(|p| s.strip_prefix(**p).is_some_and(|rest| !rest.is_empty()))
     {
-        Some(Rule::TokenPrefix)
+        let placeholder = if API_KEY_PREFIXES.contains(prefix) {
+            Placeholder::ApiKey
+        } else {
+            Placeholder::Token
+        };
+        Some((Rule::TokenPrefix, placeholder))
     } else if has_userinfo_password(s) {
-        Some(Rule::Userinfo)
+        Some((Rule::Userinfo, Placeholder::Password))
     } else {
         None
     }
@@ -204,8 +222,12 @@ fn is_credential(s: &str) -> bool {
     let Some((scheme, rest)) = s.split_once(' ') else {
         return false;
     };
+    // A placeholder after the scheme is what a redaction left: the value is redacted already.
+    let rest = rest.trim();
     (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic"))
-        && !rest.trim().is_empty()
+        && !rest.is_empty()
+        && rest != MARKER
+        && !PLACEHOLDERS.contains(&rest)
 }
 
 /// 13 to 19 digits, single spaces or dashes allowed between them, passing Luhn.
@@ -277,11 +299,15 @@ fn has_userinfo_password(s: &str) -> bool {
 /// The value detector that catches a path segment, which is percent-decoded first (the
 /// segment itself is kept as received).
 pub fn segment_rule(s: &str) -> Option<Rule> {
-    if let Some(rule) = value_rule(s) {
-        return Some(rule);
+    segment_hit(s).map(|(rule, _)| rule)
+}
+
+fn segment_hit(s: &str) -> Option<(Rule, Placeholder)> {
+    if let Some(hit) = value_hit(s) {
+        return Some(hit);
     }
     match percent_decode_str(s).decode_utf8_lossy() {
-        Cow::Owned(decoded) => value_rule(&decoded),
+        Cow::Owned(decoded) => value_hit(&decoded),
         Cow::Borrowed(_) => None,
     }
 }
@@ -300,21 +326,20 @@ pub fn path(path: &str) -> String {
 
 /// A path segment with the value detectors applied.
 pub fn segment(seg: &str) -> String {
-    if segment_rule(seg).is_some() {
-        MARKER.to_string()
-    } else {
-        seg.to_string()
+    match segment_hit(seg) {
+        Some((_, placeholder)) => placeholder.to_string(),
+        None => upgrade_text(seg),
     }
 }
 
 fn path_with(path: &str, rules: &mut Vec<Rule>) -> String {
     path.split('/')
-        .map(|seg| match segment_rule(seg) {
-            Some(rule) => {
+        .map(|seg| match segment_hit(seg) {
+            Some((rule, placeholder)) => {
                 rules.push(rule);
-                MARKER
+                placeholder.to_string()
             }
-            None => seg,
+            None => upgrade_text(seg),
         })
         .collect::<Vec<_>>()
         .join("/")
@@ -434,39 +459,81 @@ impl Redactor {
         self.name_matches(name) || (self.outbound_request && !outbound_header_kept(name))
     }
 
-    /// True when a header name, query key, form field or JSON key is redacted by name: a run
-    /// of its tokens, joined, is a listed name, or a listed name followed by `s`.
+    /// True when a header name, query key, form field or JSON key is redacted by name.
     pub fn name_matches(&self, name: &str) -> bool {
+        self.name_placeholder(name).is_some()
+    }
+
+    /// The placeholder of the name rule that fires on `name`, if any: a run of its tokens,
+    /// joined, is a listed name, or a listed name followed by `s`, or a built-in name is glued
+    /// into one token. When several match, the one that ends last in the name wins, then the
+    /// longest (`session_token` is a token, `token_secret` a secret).
+    pub fn name_placeholder(&self, name: &str) -> Option<Placeholder> {
         let tokens = tokens(name);
-        if self.outbound_request && tokens.iter().any(|t| t == "key" || t == "sig") {
-            return true;
-        }
-        // A built-in name glued into a token (`JSESSIONID`, `csrftoken`), except the short
-        // ones, which would match words like `company` or `author`.
-        let glued = tokens.iter().any(|t| {
-            NAMES
-                .iter()
-                .filter(|n| !WHOLE_TOKEN.contains(n))
-                .any(|n| t.contains(n))
-        });
-        glued
-            || (0..tokens.len()).any(|start| {
-                let mut joined = String::new();
-                for token in &tokens[start..] {
-                    joined.push_str(token);
-                    if joined.len() > self.max_len + 1 {
-                        return false;
-                    }
-                    if self.names.contains(&joined)
-                        || joined
-                            .strip_suffix('s')
-                            .is_some_and(|plural| self.names.contains(plural))
-                    {
-                        return true;
-                    }
+        // (end, length, placeholder) of the best match.
+        let mut best: Option<(usize, usize, Placeholder)> = None;
+        let mut consider = |end: usize, len: usize, placeholder: Placeholder| {
+            if best.is_none_or(|(e, l, _)| (end, len) > (e, l)) {
+                best = Some((end, len, placeholder));
+            }
+        };
+        let mut starts = Vec::with_capacity(tokens.len());
+        let mut offset = 0;
+        for token in &tokens {
+            starts.push(offset);
+            let end = offset + token.len();
+            if self.outbound_request && token == "key" {
+                consider(end, 3, Placeholder::ApiKey);
+            }
+            if self.outbound_request && token == "sig" {
+                consider(end, 3, Placeholder::Signature);
+            }
+            // A built-in name glued into a token (`JSESSIONID`, `csrftoken`), except the short
+            // ones, which would match words like `company` or `author`.
+            for n in NAMES.iter().filter(|n| !WHOLE_TOKEN.contains(n)) {
+                if let Some(at) = token.rfind(n) {
+                    consider(offset + at + n.len(), n.len(), self.type_of(n));
                 }
-                false
-            })
+            }
+            offset = end;
+        }
+        for i in 0..tokens.len() {
+            let mut joined = String::new();
+            for (token, start) in tokens[i..].iter().zip(&starts[i..]) {
+                joined.push_str(token);
+                if joined.len() > self.max_len + 1 {
+                    break;
+                }
+                let end = start + token.len();
+                if self.names.contains(&joined) {
+                    consider(end, joined.len(), self.type_of(&joined));
+                } else if let Some(plural) = joined.strip_suffix('s')
+                    && self.names.contains(plural)
+                {
+                    consider(end - 1, plural.len(), self.type_of(plural));
+                }
+            }
+        }
+        best.map(|(_, _, placeholder)| placeholder)
+    }
+
+    /// The placeholder of a listed name: the type of a built-in one, `mimic-secret` for the
+    /// names of `MIMIC_DISCOVERY_REDACT_NAMES`.
+    fn type_of(&self, name: &str) -> Placeholder {
+        match name {
+            "authorization" | "proxyauthorization" | "auth" | "credential" => Placeholder::Auth,
+            "cookie" | "setcookie" => Placeholder::Cookie,
+            "password" | "passwd" => Placeholder::Password,
+            "token" => Placeholder::Token,
+            "apikey" => Placeholder::ApiKey,
+            "session" => Placeholder::Session,
+            "signature" => Placeholder::Signature,
+            "privatekey" => Placeholder::PrivateKey,
+            "cvv" | "cvc" | "cardnumber" | "pan" => Placeholder::Card,
+            "iban" => Placeholder::Iban,
+            "ssn" => Placeholder::Ssn,
+            _ => Placeholder::Secret,
+        }
     }
 
     /// A header value: `Authorization` keeps its scheme, `Cookie` and `Set-Cookie` keep the
@@ -490,10 +557,11 @@ impl Redactor {
                 rules.push(Rule::Name);
                 match value.split_once(' ') {
                     Some((scheme, _)) => match auth_scheme(scheme) {
-                        Some(known) => format!("{known} {MARKER}"),
-                        None => MARKER.to_string(),
+                        Some("Bearer") => format!("Bearer {}", Placeholder::Token),
+                        Some(known) => format!("{known} {}", Placeholder::Auth),
+                        None => Placeholder::Auth.to_string(),
                     },
-                    None => MARKER.to_string(),
+                    None => Placeholder::Auth.to_string(),
                 }
             }
             "cookie" => {
@@ -501,8 +569,8 @@ impl Redactor {
                 value
                     .split(';')
                     .map(|pair| match pair.trim().split_once('=') {
-                        Some((n, _)) => format!("{n}={MARKER}"),
-                        None => MARKER.to_string(),
+                        Some((n, _)) => format!("{n}={}", Placeholder::Cookie),
+                        None => Placeholder::Cookie.to_string(),
                     })
                     .collect::<Vec<_>>()
                     .join("; ")
@@ -514,8 +582,8 @@ impl Redactor {
                     None => (value, None),
                 };
                 let first = match pair.split_once('=') {
-                    Some((n, _)) => format!("{n}={MARKER}"),
-                    None => MARKER.to_string(),
+                    Some((n, _)) => format!("{n}={}", Placeholder::Cookie),
+                    None => Placeholder::Cookie.to_string(),
                 };
                 match attrs {
                     Some(a) => format!("{first};{a}"),
@@ -525,13 +593,15 @@ impl Redactor {
             _ => {
                 if self.outbound_request && !outbound_header_kept(name) {
                     rules.push(Rule::OutboundHeader);
-                    MARKER.to_string()
-                } else if self.name_matches(name) {
+                    Placeholder::Secret.to_string()
+                } else if let Some(placeholder) = self.name_placeholder(name) {
                     rules.push(Rule::Name);
-                    MARKER.to_string()
-                } else if let Some(rule) = value_rule(value) {
+                    placeholder.to_string()
+                } else if let Some((rule, placeholder)) = value_hit(value) {
                     rules.push(rule);
-                    MARKER.to_string()
+                    placeholder.to_string()
+                } else if value == MARKER {
+                    Placeholder::Secret.to_string()
                 } else {
                     self.urls(value, rules)
                 }
@@ -605,33 +675,38 @@ impl Redactor {
                     None => (pair, None),
                 };
                 let decoded_key = decode_query(key);
-                let by_name = || self.name_matches(&decoded_key).then_some(Rule::Name);
-                let rule = match value {
-                    Some(v) => by_name().or_else(|| value_rule(&decode_query(v))),
-                    None => value_rule(&decoded_key).or_else(by_name),
+                let by_name = || {
+                    self.name_placeholder(&decoded_key)
+                        .map(|placeholder| (Rule::Name, placeholder))
                 };
-                match (rule, value) {
-                    (Some(rule), Some(_)) => {
+                let hit = match value {
+                    Some(v) => by_name().or_else(|| value_hit(&decode_query(v))),
+                    None => value_hit(&decoded_key).or_else(by_name),
+                };
+                match (hit, value) {
+                    (Some((rule, placeholder)), Some(_)) => {
                         rules.push(rule);
-                        format!("{key}={MARKER}")
+                        format!("{key}={placeholder}")
                     }
-                    (Some(rule), None) => {
+                    (Some((rule, placeholder)), None) => {
                         rules.push(rule);
-                        MARKER.to_string()
+                        placeholder.to_string()
                     }
-                    (None, _) => pair.to_string(),
+                    (None, _) => upgrade_text(pair),
                 }
             })
             .collect::<Vec<_>>()
             .join("&")
     }
 
-    /// A query value or form field: the marker when the name or the value is sensitive.
+    /// A query value or form field: the placeholder when the name or the value is sensitive.
     pub fn field(&self, name: &str, value: &str) -> String {
-        if self.name_matches(name) || value_rule(value).is_some() {
-            MARKER.to_string()
+        if let Some(placeholder) = self.name_placeholder(name) {
+            placeholder.to_string()
+        } else if let Some((_, placeholder)) = value_hit(value) {
+            placeholder.to_string()
         } else {
-            value.to_string()
+            upgrade_text(value)
         }
     }
 
@@ -642,25 +717,27 @@ impl Redactor {
 
     fn walk(&self, value: &mut Value, depth: usize) {
         if depth > MAX_DEPTH {
-            *value = Value::String(MARKER.to_string());
+            *value = Value::String(Placeholder::Secret.to_string());
             return;
         }
         match value {
             Value::String(s) => {
-                if value_rule(s).is_some() {
-                    *s = MARKER.to_string();
+                if let Some((_, placeholder)) = value_hit(s) {
+                    *s = placeholder.to_string();
+                } else if s.contains(MARKER) {
+                    *s = upgrade_text(s);
                 }
             }
             Value::Number(n) => {
                 if is_card(&n.to_string()) {
-                    *value = Value::String(MARKER.to_string());
+                    *value = Value::String(Placeholder::Card.to_string());
                 }
             }
             Value::Array(items) => items.iter_mut().for_each(|v| self.walk(v, depth + 1)),
             Value::Object(map) => {
                 for (k, v) in map.iter_mut() {
-                    if self.name_matches(k) {
-                        *v = Value::String(MARKER.to_string());
+                    if let Some(placeholder) = self.name_placeholder(k) {
+                        *v = Value::String(placeholder.to_string());
                     } else {
                         self.walk(v, depth + 1);
                     }
