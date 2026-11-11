@@ -187,6 +187,18 @@ fn ldt_12_without_a_verified_target_the_run_ends_with_no_targets() {
 }
 
 #[test]
+fn ldt_12_three_probe_rounds_without_a_verified_target_end_the_run_early() {
+    let mut params = Params::closed(4, 60_000);
+    params.start_timeout_ms = 300_000;
+    let rig = Rig::new(&simple_plan(), &params, &[Probe::NotFound, Probe::NotFound]);
+    let mut generator = rig.spawn("1s", &[]);
+    let status = generator.wait_exit(Duration::from_secs(12));
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(rig.state().final_post().unwrap()["reason"], "NoTargets");
+    assert!(rig.targets.iter().all(|t| t.accepted() == 0));
+}
+
+#[test]
 fn ldt_12_a_connection_that_landed_on_another_pod_stops_the_run_unverified() {
     for reason in ["workload", "ticket"] {
         let rig = Rig::new(
