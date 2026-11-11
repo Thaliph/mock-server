@@ -109,7 +109,8 @@
     Promise.all([
       api(apiPath(ns, dep)),
       api(apiPath(ns, dep, "/endpoints")),
-      api(apiPath(ns, dep, "/openapi"))
+      api(apiPath(ns, dep, "/openapi")),
+      api(apiPath(ns, dep, "/loadtests"))
     ]).then(function (results) {
       var summary = results[0];
       var title = el("h1", ns + "/" + dep);
@@ -127,6 +128,7 @@
           document.createTextNode(" (" + doc.endpoints + " endpoints" + tunnels + ")")
         ]);
       }));
+      var runs = (results[3] && results[3].loadtests) || [];
       show([
         title,
         table(["Endpoints", "Exchanges", "Sample bytes", "Last push"],
@@ -147,6 +149,17 @@
               e.authority, workloadPath(ns, dep) + "/openapi/" + enc(e.document));
             return [e.direction, e.port, authority, e.method, e.template, e.exchanges,
               pairs(e.statuses), latency.p50, latency.p90, latency.p99, e.last_seen];
+          })
+        ),
+        el("h2", "Load tests"),
+        table(
+          ["Name", "Phase", "Reason", "Start", "End", "Requests", "Missed", "Statuses", "Errors",
+            "RPS", "p99 \u00b5s"],
+          runs.map(function (r) {
+            var total = r.total || {};
+            var latency = total.latencyMicros || {};
+            return [r.name, r.phase, r.reason, r.start, r.end, total.requests, total.missed,
+              pairs(total.statuses), pairs(total.errors), total.rps, latency.p99];
           })
         )
       ]);
