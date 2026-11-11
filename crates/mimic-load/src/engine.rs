@@ -36,7 +36,7 @@ pub enum Reason {
     ModeLeft,
     /// A target refused otherwise, or answered without the marker.
     Unverified,
-    /// No verified target for `startTimeoutMs`.
+    /// No verified target for `startTimeoutMs`, or for three probe rounds.
     NoTargets,
     /// The controller said `stop`, or the run is gone.
     Stopped,
@@ -203,6 +203,10 @@ impl Shared {
         }
         let pick = usable[rand::random_range(0..usable.len())];
         Some((pick.ip, pick.pod.clone()))
+    }
+
+    fn has_targets(&self) -> bool {
+        !lock(&self.targets).is_empty()
     }
 
     fn has_usable(&self) -> bool {
@@ -738,6 +742,8 @@ async fn supervise(shared: &Arc<Shared>, api: &Api, shutdown: &Shutdown, begun: 
     let interval = shared.config.interval;
     let start_timeout = Duration::from_millis(shared.params.start_timeout_ms);
     let mut control = Instant::now();
+    // Consecutive rounds where targets were listed and none passed the probe.
+    let mut failed_rounds = 0;
 
     // A verified target before the clock of the run starts.
     loop {
@@ -758,6 +764,14 @@ async fn supervise(shared: &Arc<Shared>, api: &Api, shutdown: &Shutdown, begun: 
         shared.verify_targets().await;
         if shared.has_usable() {
             break;
+        }
+        if shared.has_targets() {
+            failed_rounds += 1;
+            if failed_rounds >= CONTROL_INTERVALS {
+                return Reason::NoTargets;
+            }
+        } else {
+            failed_rounds = 0;
         }
         if begun.elapsed() >= start_timeout {
             return Reason::NoTargets;

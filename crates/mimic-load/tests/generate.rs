@@ -187,6 +187,39 @@ fn ldt_12_without_a_verified_target_the_run_ends_with_no_targets() {
 }
 
 #[test]
+fn ldt_12_three_probe_rounds_without_a_verified_target_end_the_run_early() {
+    let mut params = Params::closed(4, 60_000);
+    params.start_timeout_ms = 300_000;
+    let rig = Rig::new(&simple_plan(), &params, &[Probe::NotFound, Probe::NotFound]);
+    let mut generator = rig.spawn("1s", &[]);
+    let status = generator.wait_exit(Duration::from_secs(12));
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(rig.state().final_post().unwrap()["reason"], "NoTargets");
+    let finals = rig
+        .state()
+        .posts()
+        .iter()
+        .filter(|p| p["final"] == true)
+        .count();
+    assert_eq!(finals, 1);
+    assert!(rig.targets.iter().all(|t| t.accepted() == 0));
+}
+
+#[test]
+fn ldt_12_an_empty_targets_list_ends_the_run_at_the_start_timeout() {
+    let mut params = Params::closed(4, 60_000);
+    params.start_timeout_ms = 5_000;
+    let rig = Rig::new(&simple_plan(), &params, &[]);
+    let begun = Instant::now();
+    let mut generator = rig.spawn("1s", &[]);
+    let status = generator.wait_exit(Duration::from_secs(20));
+    // The 3-round rule (about 3 s) does not apply: no target was ever listed.
+    assert!(begun.elapsed() >= Duration::from_millis(4_900));
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(rig.state().final_post().unwrap()["reason"], "NoTargets");
+}
+
+#[test]
 fn ldt_12_a_connection_that_landed_on_another_pod_stops_the_run_unverified() {
     for reason in ["workload", "ticket"] {
         let rig = Rig::new(
