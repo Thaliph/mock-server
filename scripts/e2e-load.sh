@@ -102,9 +102,9 @@ CHROME_PORT=19224
 canary=""
 digest=""
 users0=""; prov0=""; exch0=""
-# The start timeout of a run (MIMIC_LOAD_START_TIMEOUT, 300 s by default) and the margin that the Pending re-check of run C keeps
-# from it; c_t0 is the SECONDS of its creation.
-START_TIMEOUT=300
+# The start timeout of a run (the controller's effective MIMIC_LOAD_START_TIMEOUT, read by suite_main) and the margin that the
+# Pending re-check of run C keeps from it; c_t0 is the SECONDS of its creation.
+START_TIMEOUT=0
 START_MARGIN=60
 c_t0=0
 
@@ -227,22 +227,55 @@ snapshot_generator_logs() {
     rm -f "$dir/$p.tmp"
   done
 }
-# wait_run_logged <ns> <run> <Job> <pattern> <seconds> <dir>: wait_for run_is, snapshotting the generator logs every 2 s.
+# wait_run_logged <ns> <run> <Job> <pattern> <seconds> <dir>: waits for the run to match the pattern, snapshotting the generator
+# logs every second. The controller deletes the run's Job before it stores the end, and a generator's final lines come before
+# its pod ends, so one more snapshot is taken once the run has ended. What a pod wrote after its last snapshot is lost.
 wait_run_logged() {
-  local ns=$1 run=$2 job=$3 pattern=$4 end=$((SECONDS + $5)) dir=$6
-  until run_is "$ns" "$run" "$pattern"; do
+  local ns=$1 run=$2 job=$3 pattern=$4 end=$((SECONDS + $5)) dir=$6 status=1
+  while :; do
     snapshot_generator_logs "$ns" "$job" "$dir"
-    (( SECONDS < end )) || return 1
-    sleep 2
+    if run_is "$ns" "$run" "$pattern"; then status=0; break; fi
+    (( SECONDS < end )) || break
+    sleep 1
   done
+  snapshot_generator_logs "$ns" "$job" "$dir"
+  return $status
 }
 # snapshot_for <ns> <Job> <dir> <seconds>: snapshots the generator logs for the given time.
 snapshot_for() {
   local ns=$1 job=$2 dir=$3 end=$((SECONDS + $4))
   while (( SECONDS < end )); do
     snapshot_generator_logs "$ns" "$job" "$dir"
-    sleep 2
+    sleep 1
   done
+  snapshot_generator_logs "$ns" "$job" "$dir"
+}
+# check_run_logs <dir> <run>: the run's log snapshots hold a non-empty log and no canary of the credentials Secret (LDT-16).
+check_run_logs() {
+  local snap nonempty=0
+  for snap in "$1"/*.log; do
+    [[ -e $snap ]] || continue
+    if [[ -s $snap ]]; then nonempty=1; fi
+    if found -F -e "$canary" "$snap"; then fail "ldt_16: a canary of the credentials Secret is in the logs of a generator pod of run $2"; fi
+  done
+  (( nonempty == 1 )) || fail "ldt_16: the log snapshots of run $2 are empty or missing"
+}
+# start_timeout_seconds: the effective MIMIC_LOAD_START_TIMEOUT of the controller (its env in the controller Deployment; the chart
+# renders none, so the controller's default of 300 s applies, loadtest.rs). Seconds, minutes and hours are read.
+start_timeout_seconds() {
+  local v n unit
+  v=$(kubectl -n "$NS" get deploy "$RELEASE-controller" \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MIMIC_LOAD_START_TIMEOUT")].value}') \
+    || fail "ldt_16: cannot read the controller's environment"
+  v=${v:-300s}
+  [[ $v =~ ^([0-9]+)([smh])$ ]] || fail "ldt_16: MIMIC_LOAD_START_TIMEOUT '$v' is not seconds, minutes or hours"
+  n=${BASH_REMATCH[1]}
+  unit=${BASH_REMATCH[2]}
+  case $unit in
+    s) echo "$n" ;;
+    m) echo $((n * 60)) ;;
+    h) echo $((n * 3600)) ;;
+  esac
 }
 # ui_forward_start <label>: a port-forward to the read API of a controller pod on UI_PORT, unless one is up.
 ui_forward_start() {
@@ -302,6 +335,7 @@ suite_main() {
   clusters=$(kind get clusters) || fail "ldt_16: kind get clusters failed"
   found -x "$CLUSTER" <<<"$clusters" || fail "ldt_16: no kind cluster $CLUSTER: --suite runs after scripts/e2e.sh"
   kubectl config use-context "kind-$CLUSTER" >/dev/null
+  START_TIMEOUT=$(start_timeout_seconds)
   kubectl -n mck-19 get mimicworkload front >/dev/null 2>&1 && kubectl -n disc-22 get mimicworkload users-a >/dev/null 2>&1 \
     || fail "ldt_16: the MCK-19 setup is not there: --suite runs from scripts/e2e.sh after its F10 section"
 
@@ -372,7 +406,7 @@ suite_main() {
   # The generator pods' logs are read while the run runs: the controller deletes the Job when the run ends (the sweep reads them).
   wait_run_logged mck-19 ldt16-a "$job_a" 'Succeeded/Completed' 240 "$WORK/gen-a" \
     || fail "ldt_16: run A ended $(run_status mck-19 ldt16-a), not Succeeded/Completed"
-  [[ -n $(ls -A "$WORK/gen-a" 2>/dev/null) ]] || fail "ldt_16: no log of a generator pod of run A was read while it ran"
+  check_run_logs "$WORK/gen-a" ldt16-a
   kubectl -n mck-19 get mimicloadtest ldt16-a -o json > "$WORK/run-a.json" || fail "ldt_16: cannot read run A"
   jq -e '(.status.results.endpoints | length) > 0' "$WORK/run-a.json" >/dev/null \
     || fail "ldt_16: run A has no planned endpoint in its results"
@@ -383,9 +417,10 @@ suite_main() {
   ui_forward_start ldt_16
   curl -fs --max-time 10 "localhost:$UI_PORT/v1/workloads/mck-19/front/endpoints" > "$WORK/front-endpoints.json" \
     || fail "ldt_16: cannot read the endpoints of front"
-  jq -r '[.endpoints[] | select(.direction == "inbound") | "\(.method) \(.template)"] | sort | .[]' "$WORK/front-endpoints.json" \
+  # The keys are port, method and template: the same template on two ports is two endpoints.
+  jq -r '[.endpoints[] | select(.direction == "inbound") | "\(.port) \(.method) \(.template)"] | sort | .[]' "$WORK/front-endpoints.json" \
     > "$WORK/plan-endpoints.txt"
-  jq -r '[.status.results.endpoints[] | "\(.method) \(.template)"] | sort | .[]' "$WORK/run-a.json" > "$WORK/run-a-endpoints.txt"
+  jq -r '[.status.results.endpoints[] | "\(.port) \(.method) \(.template)"] | sort | .[]' "$WORK/run-a.json" > "$WORK/run-a-endpoints.txt"
   [[ -s $WORK/plan-endpoints.txt ]] || fail "ldt_16: front has no inbound endpoint to plan"
   # status.skipped gives counts by reason, not endpoints: run A's endpoints are inbound endpoints of front (no endpoint of
   # the run is not one of front's), and the inbound endpoints the run leaves out are exactly those counted as skipped.
@@ -421,6 +456,7 @@ suite_main() {
   kubectl -n mck-19 patch mimicworkload front --type merge -p '{"spec":{"mode":"discovery"}}' >/dev/null
   wait_run_logged mck-19 ldt16-b "$job_b" 'Aborted/ModeLeft' 150 "$WORK/gen-b" \
     || fail "ldt_16: run B ended $(run_status mck-19 ldt16-b), not Aborted/ModeLeft"
+  check_run_logs "$WORK/gen-b" ldt16-b
   wait_for 10 absent job "$job_b" -n mck-19 || fail "ldt_16: the Job of run B is still there 10 s after it ended"
   wait_for 10 absent networkpolicy "$job_b" -n mck-19 || fail "ldt_16: the NetworkPolicy of run B is still there 10 s after it ended"
   sleep 5
