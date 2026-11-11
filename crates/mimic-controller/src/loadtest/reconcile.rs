@@ -43,6 +43,43 @@ fn rfc3339(ms: u64) -> String {
         .unwrap_or_default()
 }
 
+/// What the pods' final posts decide, as (phase, reason, message, cleanup): a generator that saw
+/// the target leave mock mode, or not answer as the deployment, aborts the run; every worker
+/// posted a final result and it succeeds; otherwise nothing yet.
+fn final_verdict(
+    posts: &BTreeMap<String, StoredPost>,
+    workers: u64,
+) -> Option<(&'static str, &'static str, &'static str, bool)> {
+    let stop = posts
+        .values()
+        .filter(|p| p.final_post)
+        .find_map(|p| match p.reason.as_deref() {
+            Some("ModeLeft") => Some((
+                "Aborted",
+                "ModeLeft",
+                "a generator saw the target leave mock mode",
+                true,
+            )),
+            Some("Unverified") => Some((
+                "Aborted",
+                "Unverified",
+                "a target did not answer as the deployment under test",
+                true,
+            )),
+            Some("NoTargets") => Some(("Failed", "NoTargets", "no verified target", true)),
+            _ => None,
+        });
+    if stop.is_some() {
+        return stop;
+    }
+    (posts.len() as u64 >= workers && posts.values().all(|p| p.final_post)).then_some((
+        "Succeeded",
+        "Completed",
+        "",
+        false,
+    ))
+}
+
 fn clock_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, ms)
 }
@@ -152,10 +189,11 @@ impl Reconciler {
         self.status_only(test, phase, reason, message, now_ms).await;
     }
 
-    /// Logs (WARN, `message`) the first pass of an outage that keeps a run from going on; the
-    /// next passes retry without a line, until [`Reconciler::progressed`].
+    /// Logs (WARN, `message`) the first pass of an outage of `reason` that keeps a run from going
+    /// on; the next passes retry without a line, until [`Reconciler::progressed`]. Each reason
+    /// has its own state: a change of reason during an outage logs the new one.
     fn outage(&self, test: &Test, reason: &'static str, message: &str) {
-        let first = self.with_state(&test.uid, |s| s.waiting.replace(reason).is_none());
+        let first = self.with_state(&test.uid, |s| s.waiting.insert(reason));
         if first {
             tracing::warn!(
                 namespace = test.namespace,
@@ -168,7 +206,12 @@ impl Reconciler {
 
     /// The run got past what it waited for: the next outage logs again.
     fn progressed(&self, test: &Test) {
-        self.with_state(&test.uid, |s| s.waiting = None);
+        self.with_state(&test.uid, |s| s.waiting.clear());
+    }
+
+    /// The outage of `reason` is over: it logs again if it comes back.
+    fn recovered(&self, test: &Test, reason: &'static str) {
+        self.with_state(&test.uid, |s| s.waiting.remove(reason));
     }
 
     /// The final status of a run the store holds no state for.
@@ -604,30 +647,9 @@ impl Reconciler {
             return;
         };
         let workers = pods(test.spec.concurrency, self.config.limits.pod_concurrency);
-        let verdict =
-            posts
-                .values()
-                .filter(|p| p.final_post)
-                .find_map(|p| match p.reason.as_deref() {
-                    Some("ModeLeft") => Some((
-                        "Aborted",
-                        "ModeLeft",
-                        "a generator saw the target leave mock mode",
-                    )),
-                    Some("Unverified") => Some((
-                        "Aborted",
-                        "Unverified",
-                        "a target did not answer as the deployment under test",
-                    )),
-                    Some("NoTargets") => Some(("Failed", "NoTargets", "no verified target")),
-                    _ => None,
-                });
-        if let Some((phase, reason, message)) = verdict {
-            return self.end(test, phase, reason, message, now_ms, true).await;
-        }
-        if posts.len() as u64 >= workers && posts.values().all(|p| p.final_post) {
+        if let Some((phase, reason, message, cleanup)) = final_verdict(&posts, workers) {
             return self
-                .end(test, "Succeeded", "Completed", "", now_ms, false)
+                .end(test, phase, reason, message, now_ms, cleanup)
                 .await;
         }
         let due = self.with_state(uid, |s| {
@@ -668,22 +690,22 @@ impl Reconciler {
                         .await;
                 }
                 Ok(Ok(JobState::Complete)) => {
-                    // The posts above may be a held read older than the last final post:
-                    // read them again before deciding that a worker never reported.
-                    let fresh = self.with_state(uid, |s| {
-                        let fresh = s.posts.as_ref().is_some_and(|p| p.at_ms == now_ms);
-                        if !fresh {
-                            s.posts = None;
-                            s.last_job_check_ms = None;
-                        }
-                        fresh
-                    });
-                    if !fresh {
+                    // The posts above may be older than the last final post (it can land
+                    // after the read): read them again before deciding that a worker never
+                    // reported.
+                    let Some(posts) = self.read_posts(test, now_ms).await else {
+                        self.with_state(uid, |s| s.last_job_check_ms = None);
                         return;
-                    }
-                    let message = "the generator Job completed without every final report";
+                    };
+                    let (phase, reason, message, cleanup) = final_verdict(&posts, workers)
+                        .unwrap_or((
+                            "Failed",
+                            "NoReport",
+                            "the generator Job completed without every final report",
+                            false,
+                        ));
                     return self
-                        .end(test, "Failed", "NoReport", message, now_ms, false)
+                        .end(test, phase, reason, message, now_ms, cleanup)
                         .await;
                 }
                 _ => {}
@@ -728,11 +750,21 @@ impl Reconciler {
         if held.is_some() {
             return held;
         }
-        let posts = self
+        self.read_posts(test, now_ms).await
+    }
+
+    /// Reads the pods' results now and sets the wait before the next read; a failed read is
+    /// logged once per outage.
+    async fn read_posts(&self, test: &Test, now_ms: u64) -> Option<BTreeMap<String, StoredPost>> {
+        let read = self
             .store
             .load_posts(&test.namespace, &test.deployment, &test.uid)
-            .await
-            .ok()?;
+            .await;
+        let Ok(posts) = read else {
+            self.outage(test, "posts", "load test posts unreadable");
+            return None;
+        };
+        self.recovered(test, "posts");
         self.with_state(&test.uid, |s| {
             let wait_ms = match &s.posts {
                 Some(last) if last.posts == posts => match last.wait_ms {
@@ -901,21 +933,20 @@ impl Reconciler {
             .iter()
             .map(|t| (t.namespace.clone(), t.name.clone()))
             .collect();
-        for gone in self
-            .tests
-            .list()
-            .into_iter()
-            .filter(|t| !listed.contains(&(t.namespace.clone(), t.name.clone())))
-        {
-            self.tests.remove(&gone.namespace, &gone.name);
-            self.deleted(&gone).await;
+        for (namespace, name) in self.tests.keys() {
+            if listed.contains(&(namespace.clone(), name.clone())) {
+                continue;
+            }
+            if let Some(gone) = self.tests.remove(&namespace, &name) {
+                self.deleted(&gone).await;
+            }
         }
         // Recreated under the same name while the watch was down: the old uid's run ends.
         for new in &listing {
-            if let Some(old) =
-                self.tests.list().into_iter().find(|t| {
-                    t.namespace == new.namespace && t.name == new.name && t.uid != new.uid
-                })
+            if let Some(old) = self
+                .tests
+                .get(&new.namespace, &new.name)
+                .filter(|t| t.uid != new.uid)
             {
                 self.deleted(&old).await;
             }
@@ -929,10 +960,10 @@ impl Reconciler {
     /// One whose name a held object has with another uid (the Delete event was missed) ends the
     /// old uid's run first, as [`Reconciler::resync`] does.
     pub async fn applied(&self, test: Test) {
-        let held =
-            self.tests.list().into_iter().find(|t| {
-                t.namespace == test.namespace && t.name == test.name && t.uid != test.uid
-            });
+        let held = self
+            .tests
+            .get(&test.namespace, &test.name)
+            .filter(|t| t.uid != test.uid);
         if let Some(old) = held {
             self.deleted(&old).await;
         }
