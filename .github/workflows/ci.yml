@@ -4,7 +4,8 @@ name: ci
 #   changes ──▶ classifies the change (scripts/ci_plan.py, tested first); a job below runs only when a gate
 #               of its categories is set. Every other event, an unknown path, a change under .github/ or to
 #               scripts/ci_plan.py, and an empty diff set every gate.
-#   lint ──▶ test ──▶ image ──▶ e2e
+#   lint ──▶ test                (in parallel:)
+#   lint ──▶ image ──▶ e2e        e2e waits for the image and the chart stage, not for the tests
 #   chart ─────────────────────▲   (e2e-load runs with e2e)
 #   security (cargo deny, zizmor); supply chain (cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql)
 #   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; its gate is the codec paths)
@@ -354,8 +355,9 @@ jobs:
 
   image:
     # Runs for a change to the Rust code, the image inputs, the chart or e2e (the e2e stages need its
-    # artifact). It waits for test when test runs; a chart-only change skips test, which is no failure.
-    needs: [changes, test]
+    # artifact). It runs in parallel with test: it waits for lint (the cheap format and clippy check) and for
+    # changes only. ci-ok still requires test to succeed.
+    needs: [changes, lint]
     if: ${{ !failure() && !cancelled() && needs.changes.outputs.gate_image == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
