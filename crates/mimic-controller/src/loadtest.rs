@@ -315,6 +315,25 @@ impl Tests {
             .remove(&(namespace.to_string(), name.to_string()))
     }
 
+    /// The test of this namespace and name.
+    pub fn get(&self, namespace: &str, name: &str) -> Option<Test> {
+        self.items
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(namespace.to_string(), name.to_string()))
+            .cloned()
+    }
+
+    /// The namespace and name of every test.
+    pub fn keys(&self) -> Vec<(String, String)> {
+        self.items
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Every test, oldest first (then by namespace and name).
     pub fn list(&self) -> Vec<Test> {
         let mut tests: Vec<Test> = self
@@ -404,8 +423,8 @@ pub struct RunState {
     pub posts: Option<PostsRead>,
     /// The plan of a `Pending` run, built once however many passes the admission waits.
     pub built: Option<Arc<Built>>,
-    /// Why the admission waits, once logged for the outage.
-    pub waiting: Option<&'static str>,
+    /// The reasons of the outage already logged: each is logged once, until the run progresses.
+    pub waiting: std::collections::BTreeSet<&'static str>,
 }
 
 /// The longest wait between two reads of the pods' results of a run (spec §7.8).

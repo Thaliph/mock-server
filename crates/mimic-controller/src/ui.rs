@@ -1,6 +1,7 @@
 //! Read API on `MIMIC_UI_ADDR` (spec §7.5, §7.6): the stored discovery data of a deployment
 //! and its OpenAPI documents, on loopback peers only. Reads go through the `store` module.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -448,25 +449,26 @@ fn uuid(uid: &str) -> bool {
 /// One stored run as the read API shows it (spec §7.5): names, phases, times and numbers only;
 /// `None` for a run whose hash has expired. The summary is parsed and written again, so nothing
 /// but its numbers and endpoint names can reach the page.
-async fn run_object(
-    store: &Store,
+fn run_object(
+    fields: &BTreeMap<String, String>,
     namespace: &str,
     deployment: &str,
     uid: &str,
-) -> Result<Option<(Map<String, Value>, Option<LoadSummary>)>, ReadError> {
-    let fields = store.load_fields(namespace, deployment, uid).await?;
-    let Some(phase) = fields.get("phase") else {
-        return Ok(None);
-    };
+) -> Option<(Map<String, Value>, Option<LoadSummary>)> {
+    let phase = fields.get("phase")?;
     let name = fields
         .get("spec")
         .and_then(|spec| serde_json::from_str::<Value>(spec).ok())
         .and_then(|spec| spec.get("name")?.as_str().map(str::to_string))
         .unwrap_or_default();
     let ms = |field: &str| fields.get(field)?.parse::<u64>().ok();
-    let summary = fields
-        .get("summary")
-        .and_then(|text| serde_json::from_str::<LoadSummary>(text).ok());
+    let summary = fields.get("summary").and_then(|text| {
+        let parsed = serde_json::from_str::<LoadSummary>(text);
+        if parsed.is_err() && first_unreadable(uid) {
+            tracing::error!(namespace, deployment, uid, "load test summary unreadable");
+        }
+        parsed.ok()
+    });
     let Value::Object(map) = json!({
         "uid": uid,
         "name": name,
@@ -478,7 +480,20 @@ async fn run_object(
     }) else {
         unreachable!("an object literal")
     };
-    Ok(Some((map, summary)))
+    Some((map, summary))
+}
+
+/// True the first time a run's summary is found unreadable by this process: one line per run,
+/// not per read.
+fn first_unreadable(uid: &str) -> bool {
+    static SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    let mut seen = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.len() >= 1024 {
+        seen.clear();
+    }
+    seen.insert(uid.to_string())
 }
 
 async fn loadtests(
@@ -486,8 +501,10 @@ async fn loadtests(
     Path((namespace, deployment)): Path<(String, String)>,
 ) -> Result<Json, ReadError> {
     let mut runs = Vec::new();
-    for uid in store.load_uids(&namespace, &deployment).await? {
-        if let Some((map, _)) = run_object(&store, &namespace, &deployment, &uid).await? {
+    let uids = store.load_uids(&namespace, &deployment).await?;
+    let fields = store.load_fields_of(&namespace, &deployment, &uids).await?;
+    for (uid, fields) in uids.iter().zip(&fields) {
+        if let Some((map, _)) = run_object(fields, &namespace, &deployment, uid) {
             runs.push(Value::Object(map));
         }
     }
@@ -502,9 +519,9 @@ async fn loadtest(
     if !uuid(&uid) {
         return Err(ReadError::Name);
     }
-    let (mut map, summary) = run_object(&store, &namespace, &deployment, &uid)
-        .await?
-        .ok_or(ReadError::NotFound)?;
+    let fields = store.load_fields(&namespace, &deployment, &uid).await?;
+    let (mut map, summary) =
+        run_object(&fields, &namespace, &deployment, &uid).ok_or(ReadError::NotFound)?;
     map.insert("summary".to_string(), json!(summary));
     Ok(Json(Value::Object(map)))
 }

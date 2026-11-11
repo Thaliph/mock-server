@@ -83,8 +83,8 @@ fn ldt_12_open_model_sends_the_rate_over_both_targets() {
     let posts = rig.state().posts();
     assert!(posts.len() >= 8, "{} posts", posts.len());
     let mut last = 0;
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
     for post in &posts {
-        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
         assert_eq!(post["pod"], hostname.trim());
         let seen = total_requests(post);
         assert!(seen >= last, "results must be cumulative");

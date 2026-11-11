@@ -1465,7 +1465,9 @@ logic in `mimic-core` (`discovery` module).
   authenticated read of a sidecar's own deployment on the sidecar API (§7.2) for egress
   recordings and the mode (F10); F11 reads ingress templates, samples, schemas and volatility
   through the same `store` module (§7.8) and adds the `loadtests` routes and a "Load tests"
-  table on the deployment page.
+  table on the deployment page. A stored summary that does not parse is answered as `null`
+  and logged once per run (ERROR `load test summary unreadable`, with the `uid`, no content);
+  the list reads the fields of its runs in one pipeline.
 
 ### 7.6 OpenAPI mapping (F6)
 
@@ -1782,11 +1784,16 @@ no `MimicLoadTest` and creates no Job).
   6. *Pacing and outages*. A pass runs every 500 ms. A replica reads a running run's pods'
      results (`load_posts`) every 500 ms while they change; when a read finds them unchanged
      the interval doubles, up to 4 s, and returns to 500 ms at the next change (a final post
-     is therefore seen within 4 s). While a run in `Pending` waits for the signing seed, the
+     is therefore seen within 4 s plus one 500 ms pass). When the Job is `Complete`, the
+     pods' results are read again whatever the pacing before the run is judged: a final post
+     that landed after the last read counts, and `NoReport` is only for a run still missing
+     one after that read. A failed read of the results is logged once per outage as one WARN
+     `load test posts unreadable`, and retried at the next pass. While a run in `Pending` waits for the signing seed, the
      webhook CA or Valkey, its plan is built once and kept for the next passes (never rebuilt
      at every pass), and the wait is logged once per outage as one WARN `load test admission
      waiting` (`reason`: `seed`, `ca` or `valkey`), the next one only after the run has
-     progressed.
+     progressed; each reason is logged once per outage on its own, so a change of reason
+     during an outage still logs the new one.
 - **Targets**: the ready endpoints (`conditions.ready` true or absent) of every
   `EndpointSlice` of the namespace whose `targetRef` is a `Pod` with a name the deployment's
   ReplicaSets can generate (the §7.2 check), one address per pod (the first), deduplicated.

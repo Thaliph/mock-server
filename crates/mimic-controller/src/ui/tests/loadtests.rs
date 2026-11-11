@@ -166,3 +166,39 @@ fn ldt_19_the_page_script_fills_a_load_tests_table_from_the_routes() {
     assert!(script.contains("Load tests"));
     assert!(script.contains("/loadtests"));
 }
+
+#[tokio::test]
+async fn ldt_19_an_unparseable_stored_summary_is_null_and_logged_once_as_an_error() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let store = store(&valkey_url());
+    let ns = unique("ldt19s");
+    run(&store, &ns, OLD, "first", 1_000_000, None).await;
+    store
+        .load_end(
+            &ns,
+            "pay",
+            OLD,
+            &Ended {
+                phase: "Failed",
+                reason: "NoReport",
+                summary: "{not json",
+                end_ms: 1_100_000,
+            },
+        )
+        .await
+        .expect("ended");
+    for _ in 0..3 {
+        let answer = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests/{OLD}")).await;
+        assert_eq!(answer.status, 200);
+        assert_eq!(answer.json()["summary"], Value::Null);
+    }
+    let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    let lines: Vec<Value> = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["message"] == "load test summary unreadable" && v["uid"] == OLD)
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "ERROR");
+    assert!(!raw.contains("not json"), "the content reached a log");
+}
