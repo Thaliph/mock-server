@@ -61,13 +61,23 @@ async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
 }
 
 async fn metrics_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    // The `process_*` families read `/proc`: off the async workers.
+    let metrics = state.metrics;
+    let body = match tokio::task::spawn_blocking(move || metrics.encode()).await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%error, "metrics encoding failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     (
         [(
             header::CONTENT_TYPE,
             "application/openmetrics-text; version=1.0.0; charset=utf-8",
         )],
-        state.metrics.encode(),
+        body,
     )
+        .into_response()
 }
 
 /// `SIGTERM` or `SIGINT`, registered once when installed, so that a signal arriving before a

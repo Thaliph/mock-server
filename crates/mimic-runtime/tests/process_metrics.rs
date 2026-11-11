@@ -26,7 +26,10 @@ fn soft_nofile() -> f64 {
         .lines()
         .find(|l| l.starts_with("Max open files"))
         .unwrap();
-    line.split_whitespace().nth(3).unwrap().parse().unwrap()
+    match line.split_whitespace().nth(3).unwrap() {
+        "unlimited" => f64::INFINITY,
+        soft => soft.parse().unwrap(),
+    }
 }
 
 #[test]
@@ -109,15 +112,16 @@ fn mon_04_open_fds_grows_with_one_more_open_file() {
 }
 
 #[test]
-fn mon_04_cpu_seconds_do_not_decrease_around_a_busy_loop() {
+fn mon_04_cpu_seconds_grow_around_a_busy_loop() {
     let before = value(&encode(), "process_cpu_seconds_total");
     let started = std::time::Instant::now();
     let mut x = 1u64;
-    while started.elapsed().as_millis() < 200 {
+    while started.elapsed().as_millis() < 300 {
         x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
     }
     let after = value(&encode(), "process_cpu_seconds_total");
-    assert!(after >= before, "{before} -> {after}");
+    // 300 ms of busy loop is 30 ticks of 10 ms: the counter must have moved.
+    assert!(after > before, "{before} -> {after}");
 }
 
 #[test]
