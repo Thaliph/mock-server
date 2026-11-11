@@ -1,6 +1,6 @@
 # Egress aggregation
 
-Covers F7 and F8. Reference: spec §6.1, §7.2, §7.3, §7.5. The calls an injected deployment **makes** (to
+The calls an injected deployment **makes** (to
 other services of the cluster or to external APIs) are recorded by each pod's sidecar and merged by the
 controller, per deployment, next to the inbound endpoints.
 
@@ -8,7 +8,7 @@ controller, per deployment, next to the inbound endpoints.
 
 The sidecar of every pod records its outbound HTTP exchanges (cleartext, and HTTPS when it is
 [intercepted](TLS-interception)) in a bounded local report, in a scope of its own per **authority**: the
-host and port the app called (`users.disc-22.svc:8080`). The same redaction rules as for inbound apply,
+host and port the app called (`users.demo.svc:8080`). The same redaction rules as for inbound apply,
 with a stricter view for outbound: request headers outside a short allowlist are shown as `mimic-secret` (and `Authorization: Bearer mimic-token`),
 so a credential in any header, query parameter or body never leaves the pod. A connection that cannot be
 decrypted (a tunnel, a refused interception) is counted per authority and kind, without any endpoint.
@@ -18,12 +18,12 @@ decrypted (a tunnel, a refused interception) is counted per authority and kind, 
 ## What the controller holds
 
 Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (30 s) a sidecar posts its report to the controller. A report with outbound
-data is **version 2**; one without is version 1, byte for byte as before F8. The controller merges the
+data is **version 2**; one without is version 1. The controller merges the
 pushes of all the pods of a deployment, so the stored report is the **union over the pods**: one
-outbound endpoint (`GET /users/{users_id}` on `users.disc-22.svc:8080`) counts the calls of every replica.
+outbound endpoint (`GET /users/{users_id}` on `users.demo.svc:8080`) counts the calls of every replica.
 The sidecar clears what the controller acknowledged, as it does for inbound.
 
-The merge is bounded (spec §7.3): at most `MIMIC_STORE_MAX_AUTHORITIES` outbound scopes per deployment
+The merge is bounded: at most `MIMIC_STORE_MAX_AUTHORITIES` outbound scopes per deployment
 (default 128, twice the sidecar's 64, since the store holds the union of the pods) and the per-direction
 endpoint limits. When the limits bite, what is kept is chosen by traffic: authorities with the most exchanges (and
 tunnel counts) first, then those already stored, so a burst of new authorities cannot push out the
@@ -57,7 +57,7 @@ applied, the outbound part is dropped rather than counted twice
 
 ## Pulling it back
 
-Each sidecar pulls its deployment's aggregated egress from the controller and holds it in memory (F9): see
+Each sidecar pulls its deployment's aggregated egress from the controller and holds it in memory: see
 [Egress endpoint](Egress-endpoint).
 
 ## Checking it
