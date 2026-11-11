@@ -16,7 +16,7 @@
 #   KEEP_CLUSTER=1                              keep the cluster afterwards (default: keep locally, delete in CI; --suite: kept)
 #
 # The chart needs image.digest with loadTest.enabled: the digest is the one the node's containerd
-# holds for IMAGE, read with crictl. The Job and NetworkPolicy checked below are the objects that
+# holds for IMAGE, read with crictl (or ctr, see image_digest). The Job and NetworkPolicy checked below are the objects that
 # mimic_core::load::job builds (examples/load_objects.rs), created as the controller account with a
 # server-side dry run, so the chart's ValidatingAdmissionPolicy is what decides.
 set -Eeuo pipefail
@@ -74,12 +74,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# image_digest <tag>: the manifest digest that the node's containerd holds for the tag.
+# image_digest <tag>: the manifest digest that the node's containerd holds for the tag: the repo digest crictl lists
+# for it, or, when the node lists none (seen on kindest/node v1.37 in CI, images from the artifact), the target
+# digest of the tag in containerd, which is the same image.
 image_digest() {
-  docker exec "$CLUSTER-control-plane" crictl images --digests -o json \
+  local digest
+  digest=$(docker exec "$CLUSTER-control-plane" crictl images --digests -o json \
     | jq -r --arg tag "$1" '.images[] | select(.repoTags | index($tag)) | .repoDigests[]' \
     | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' \
-    | head -n 1
+    | head -n 1)
+  if [[ -z $digest ]]; then
+    digest=$(docker exec "$CLUSTER-control-plane" ctr -n k8s.io images ls \
+      | awk -v ref="$1" '$1 == ref { print $3; exit }')
+  fi
+  printf '%s\n' "$digest"
 }
 
 # --- --suite: LDT-16 and LDT-19 (E), spec §12.12 -----------------------------------------------------------
