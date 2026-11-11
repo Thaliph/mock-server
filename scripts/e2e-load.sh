@@ -102,6 +102,11 @@ CHROME_PORT=19224
 canary=""
 digest=""
 users0=""; prov0=""; exch0=""
+# The start timeout of a run (the controller's effective MIMIC_LOAD_START_TIMEOUT, read by suite_main) and the margin that the
+# Pending re-check of run C keeps from it; c_t0 is the SECONDS of its creation.
+START_TIMEOUT=0
+START_MARGIN=60
+c_t0=0
 
 # wait_for <seconds> <command...>: the command succeeds within the time. Its errors are no failure while it polls.
 wait_for() {
@@ -200,6 +205,92 @@ sweep_logs() {
       fail "ldt_16: a canary of the credentials Secret is in a log line of pod $pod in $ns"
     fi
   done < "$WORK/pods.txt"
+  # The generator pods of the runs are gone by now (the controller deletes a run's Job when it ends): their logs are
+  # the snapshots taken while the runs ran (snapshot_generator_logs).
+  local snap
+  for snap in "$WORK"/gen-*/*.log; do
+    [[ -e $snap ]] || continue
+    if found -F -e "$canary" "$snap"; then
+      fail "ldt_16: a canary of the credentials Secret is in the logs of a generator pod of run $(basename "$(dirname "$snap")" | sed 's/^gen-//')"
+    fi
+  done
+}
+# snapshot_generator_logs <ns> <Job> <dir>: keeps the newest logs of each pod of the Job in <dir>, one file per pod. A
+# read that fails keeps the previous snapshot (a pod may go between two reads).
+snapshot_generator_logs() {
+  local ns=$1 job=$2 dir=$3 p
+  mkdir -p "$dir"
+  for p in $(kubectl -n "$ns" get pods -l "job-name=$job" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    if kubectl -n "$ns" logs "$p" --all-containers --tail=-1 > "$dir/$p.tmp" 2>/dev/null; then
+      mv "$dir/$p.tmp" "$dir/$p.log"
+    fi
+    rm -f "$dir/$p.tmp"
+  done
+}
+# wait_run_logged <ns> <run> <Job> <pattern> <seconds> <dir>: waits for the run to match the pattern, snapshotting the generator
+# logs every second. The controller deletes the run's Job before it stores the end, and a generator's final lines come before
+# its pod ends, so one more snapshot is taken once the run has ended. What a pod wrote after its last snapshot is lost.
+wait_run_logged() {
+  local ns=$1 run=$2 job=$3 pattern=$4 end=$((SECONDS + $5)) dir=$6 status=1
+  while :; do
+    snapshot_generator_logs "$ns" "$job" "$dir"
+    if run_is "$ns" "$run" "$pattern"; then status=0; break; fi
+    (( SECONDS < end )) || break
+    sleep 1
+  done
+  snapshot_generator_logs "$ns" "$job" "$dir"
+  return $status
+}
+# snapshot_for <ns> <Job> <dir> <seconds>: snapshots the generator logs for the given time.
+snapshot_for() {
+  local ns=$1 job=$2 dir=$3 end=$((SECONDS + $4))
+  while (( SECONDS < end )); do
+    snapshot_generator_logs "$ns" "$job" "$dir"
+    sleep 1
+  done
+  snapshot_generator_logs "$ns" "$job" "$dir"
+}
+# check_run_logs <dir> <run>: the run's log snapshots hold a non-empty log and no canary of the credentials Secret (LDT-16).
+check_run_logs() {
+  local snap nonempty=0
+  for snap in "$1"/*.log; do
+    [[ -e $snap ]] || continue
+    if [[ -s $snap ]]; then nonempty=1; fi
+    if found -F -e "$canary" "$snap"; then fail "ldt_16: a canary of the credentials Secret is in the logs of a generator pod of run $2"; fi
+  done
+  (( nonempty == 1 )) || fail "ldt_16: the log snapshots of run $2 are empty or missing"
+}
+# start_timeout_seconds: the effective MIMIC_LOAD_START_TIMEOUT of the controller (its env in the controller Deployment; the chart
+# renders none, so the controller's default of 300 s applies, loadtest.rs). Seconds, minutes and hours are read.
+start_timeout_seconds() {
+  local v n unit
+  v=$(kubectl -n "$NS" get deploy "$RELEASE-controller" \
+    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="MIMIC_LOAD_START_TIMEOUT")].value}') \
+    || fail "ldt_16: cannot read the controller's environment"
+  v=${v:-300s}
+  [[ $v =~ ^([0-9]+)([smh])$ ]] || fail "ldt_16: MIMIC_LOAD_START_TIMEOUT '$v' is not seconds, minutes or hours"
+  n=${BASH_REMATCH[1]}
+  unit=${BASH_REMATCH[2]}
+  case $unit in
+    s) echo "$n" ;;
+    m) echo $((n * 60)) ;;
+    h) echo $((n * 3600)) ;;
+  esac
+}
+# ui_forward_start <label>: a port-forward to the read API of a controller pod on UI_PORT, unless one is up.
+ui_forward_start() {
+  local pod
+  [[ -z $UI_PF ]] || return 0
+  pod=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}') || fail "$1: cannot list the controller pods"
+  [[ -n $pod ]] || fail "$1: no running controller pod"
+  kubectl -n "$NS" port-forward "pod/$pod" "$UI_PORT:8080" >/dev/null 2>&1 &
+  UI_PF=$!
+  wait_for 30 ui_up || fail "$1: port-forward to the read API of a controller pod"
+}
+ui_forward_stop() {
+  [[ -z $UI_PF ]] || kill "$UI_PF" 2>/dev/null || true
+  UI_PF=""
 }
 devtools_up() { curl -fs "127.0.0.1:$CHROME_PORT/json/version" >/dev/null; }
 ui_up() { curl -fs "localhost:$UI_PORT/v1/workloads" >/dev/null; }
@@ -207,13 +298,7 @@ ui_up() { curl -fs "localhost:$UI_PORT/v1/workloads" >/dev/null; }
 # ldt_19_check: the deployment page of front, in pinned headless Chromium, shows the "Load tests" table with runs A and
 # B (LDT-19 E). It reads the same routes as the browser does, through a port-forward to a controller pod.
 ldt_19_check() {
-  local pod
-  pod=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller --field-selector=status.phase=Running \
-    -o jsonpath='{.items[0].metadata.name}') || fail "ldt_19: cannot list the controller pods"
-  [[ -n $pod ]] || fail "ldt_19: no running controller pod"
-  kubectl -n "$NS" port-forward "pod/$pod" "$UI_PORT:8080" >/dev/null 2>&1 &
-  UI_PF=$!
-  wait_for 30 ui_up || fail "ldt_19: port-forward to the read API of a controller pod"
+  ui_forward_start ldt_19
   # The container holds no capability and writes only to its tmpfs; --no-sandbox as in UI-12 (the container is the sandbox).
   local chrome_image
   chrome_image=$(scripts/pinned-image.sh e2e-chromium)
@@ -241,8 +326,7 @@ ldt_19_check() {
   if found -F -e "$canary" "$WORK/browse.json"; then fail "ldt_19: a canary of the credentials Secret is on the deployment page"; fi
   docker rm -f "$CHROME" >/dev/null 2>&1 || true
   CHROME=""
-  kill "$UI_PF" 2>/dev/null || true
-  UI_PF=""
+  ui_forward_stop
 }
 
 # suite_main: LDT-16 and LDT-19 (E) on the cluster of scripts/e2e.sh.
@@ -251,6 +335,7 @@ suite_main() {
   clusters=$(kind get clusters) || fail "ldt_16: kind get clusters failed"
   found -x "$CLUSTER" <<<"$clusters" || fail "ldt_16: no kind cluster $CLUSTER: --suite runs after scripts/e2e.sh"
   kubectl config use-context "kind-$CLUSTER" >/dev/null
+  START_TIMEOUT=$(start_timeout_seconds)
   kubectl -n mck-19 get mimicworkload front >/dev/null 2>&1 && kubectl -n disc-22 get mimicworkload users-a >/dev/null 2>&1 \
     || fail "ldt_16: the MCK-19 setup is not there: --suite runs from scripts/e2e.sh after its F10 section"
 
@@ -294,6 +379,7 @@ suite_main() {
   # Run C: a deployment in discovery (users). Created first, so that its start timeout (MIMIC_LOAD_START_TIMEOUT, 5 min)
   # runs alongside runs A and B.
   log "ldt_16: a run on users, in discovery, is Pending without a Job, then ends Failed/NotMock"
+  c_t0=$SECONDS
   run_create disc-22 ldt16-c users ""
   job_c=$(job_of disc-22 ldt16-c) || fail "ldt_16: no uid of run C"
   wait_for 60 run_is disc-22 ldt16-c 'Pending/WaitingForMock' \
@@ -317,17 +403,46 @@ suite_main() {
   owned_by mck-19 "job/$job_a" ldt16-a || fail "ldt_16: the Job of run A is not owned by the run"
   owned_by mck-19 "networkpolicy/$job_a" ldt16-a || fail "ldt_16: the NetworkPolicy of run A is not owned by the run"
   psa_restricted mck-19 "$job_a" || fail "ldt_16: the pod of the Job of run A does not pass Pod Security restricted"
-  wait_for 240 run_is mck-19 ldt16-a 'Succeeded/Completed' \
+  # The generator pods' logs are read while the run runs: the controller deletes the Job when the run ends (the sweep reads them).
+  wait_run_logged mck-19 ldt16-a "$job_a" 'Succeeded/Completed' 240 "$WORK/gen-a" \
     || fail "ldt_16: run A ended $(run_status mck-19 ldt16-a), not Succeeded/Completed"
+  check_run_logs "$WORK/gen-a" ldt16-a
   kubectl -n mck-19 get mimicloadtest ldt16-a -o json > "$WORK/run-a.json" || fail "ldt_16: cannot read run A"
   jq -e '(.status.results.endpoints | length) > 0' "$WORK/run-a.json" >/dev/null \
     || fail "ldt_16: run A has no planned endpoint in its results"
-  missing=$(jq '[.status.results.endpoints[] | select(.requests == 0 or .latencyMicros.p99 == 0)] | length' "$WORK/run-a.json")
-  [[ $missing == 0 ]] || fail "ldt_16: $missing planned endpoint(s) of run A have no request or no p99"
+  # requests and p99 are numbers above 0 (a null or a missing field is not a result).
+  missing=$(jq '[.status.results.endpoints[] | select(([.requests, .latencyMicros.p99] | all(type == "number" and . > 0)) | not)] | length' "$WORK/run-a.json")
+  [[ $missing == 0 ]] || fail "ldt_16: $missing planned endpoint(s) of run A have no request or no p99 above 0"
+  # The endpoints of the run are the plan's: the inbound endpoints of front, as its read API lists them.
+  ui_forward_start ldt_16
+  curl -fs --max-time 10 "localhost:$UI_PORT/v1/workloads/mck-19/front/endpoints" > "$WORK/front-endpoints.json" \
+    || fail "ldt_16: cannot read the endpoints of front"
+  # The keys are port, method and template: the same template on two ports is two endpoints.
+  jq -r '[.endpoints[] | select(.direction == "inbound") | "\(.port) \(.method) \(.template)"] | sort | .[]' "$WORK/front-endpoints.json" \
+    > "$WORK/plan-endpoints.txt"
+  jq -r '[.status.results.endpoints[] | "\(.port) \(.method) \(.template)"] | sort | .[]' "$WORK/run-a.json" > "$WORK/run-a-endpoints.txt"
+  [[ -s $WORK/plan-endpoints.txt ]] || fail "ldt_16: front has no inbound endpoint to plan"
+  # status.skipped gives counts by reason, not endpoints: run A's endpoints are inbound endpoints of front (no endpoint of
+  # the run is not one of front's), and the inbound endpoints the run leaves out are exactly those counted as skipped.
+  LC_ALL=C sort -o "$WORK/plan-endpoints.txt" "$WORK/plan-endpoints.txt"
+  LC_ALL=C sort -o "$WORK/run-a-endpoints.txt" "$WORK/run-a-endpoints.txt"
+  [[ -z $(LC_ALL=C sort "$WORK/run-a-endpoints.txt" | uniq -d) ]] || fail "ldt_16: run A lists an endpoint twice"
+  extra=$(LC_ALL=C comm -13 "$WORK/plan-endpoints.txt" "$WORK/run-a-endpoints.txt")
+  [[ -z $extra ]] || fail "ldt_16: run A has endpoint(s) that front does not have as inbound: $(tr '\n' ';' <<<"$extra")"
+  skipped_sum=$(jq '[.status.skipped // {} | .[]] | add // 0' "$WORK/run-a.json")
+  inbound_n=$(wc -l < "$WORK/plan-endpoints.txt")
+  results_n=$(wc -l < "$WORK/run-a-endpoints.txt")
+  (( inbound_n - results_n == skipped_sum )) \
+    || fail "ldt_16: run A has $results_n endpoints of $inbound_n inbound ones of front, but $skipped_sum skipped: $(jq -c '.status.skipped' "$WORK/run-a.json")"
   [[ $(calls disc-22 app=users app) == "$users0" ]] || fail "ldt_16: users logged calls during run A"
   [[ $(calls mck-19-provider app=provider provider) == "$prov0" ]] || fail "ldt_16: the provider logged calls during run A"
   [[ $(exchanges) == "$exch0" ]] || fail "ldt_16: the discovery exchanges of front grew during run A"
   if found -F -e "$canary" "$WORK/run-a.json"; then fail "ldt_16: a canary of the credentials Secret is in the status of run A"; fi
+  # Run C is still Pending, with no Job, within its start timeout: checked a margin before the timeout, not after it.
+  (( SECONDS - c_t0 < START_TIMEOUT - START_MARGIN )) \
+    || fail "ldt_16: the Pending re-check of run C comes $((SECONDS - c_t0)) s after its creation, not within $((START_TIMEOUT - START_MARGIN)) s"
+  run_is disc-22 ldt16-c 'Pending/*' || fail "ldt_16: run C is no longer Pending: $(run_status disc-22 ldt16-c)"
+  absent job "$job_c" -n disc-22 || fail "ldt_16: run C has a Job while it is Pending"
 
   # PLH-09, PLH-10: with credentials no endpoint is skipped for a redacted value (placeholders are planned, the Secret
   # replaces two of them); the run without credentials sends the placeholders (`Bearer mimic-token`), so it plans the same
@@ -351,24 +466,25 @@ suite_main() {
   run_create mck-19 ldt16-b front "$creds"
   job_b=$(job_of mck-19 ldt16-b) || fail "ldt_16: no uid of run B"
   wait_for 240 run_is mck-19 ldt16-b 'Running/*' || fail "ldt_16: run B did not start: $(run_status mck-19 ldt16-b)"
-  sleep 20
+  snapshot_for mck-19 "$job_b" "$WORK/gen-b" 20
   users1=$(calls disc-22 app=users app) || fail "ldt_16: cannot count the calls of users"
   prov1=$(calls mck-19-provider app=provider provider) || fail "ldt_16: cannot count the calls of the provider"
   [[ $users1 == "$users0" && $prov1 == "$prov0" ]] || fail "ldt_16: users or the provider logged calls before the switch of run B"
   kubectl -n mck-19 patch mimicworkload front --type merge -p '{"spec":{"mode":"discovery"}}' >/dev/null
-  wait_for 150 run_is mck-19 ldt16-b 'Aborted/ModeLeft' \
+  wait_run_logged mck-19 ldt16-b "$job_b" 'Aborted/ModeLeft' 150 "$WORK/gen-b" \
     || fail "ldt_16: run B ended $(run_status mck-19 ldt16-b), not Aborted/ModeLeft"
+  check_run_logs "$WORK/gen-b" ldt16-b
   wait_for 10 absent job "$job_b" -n mck-19 || fail "ldt_16: the Job of run B is still there 10 s after it ended"
   wait_for 10 absent networkpolicy "$job_b" -n mck-19 || fail "ldt_16: the NetworkPolicy of run B is still there 10 s after it ended"
   sleep 5
   users2=$(calls disc-22 app=users app) || fail "ldt_16: cannot count the calls of users"
   prov2=$(calls mck-19-provider app=provider provider) || fail "ldt_16: cannot count the calls of the provider"
-  sent=$(( (users2 - users1) + (prov2 - prov1) ))
-  (( sent <= 8 )) || fail "ldt_16: users and the provider logged $sent calls from front after the switch (at most 8)"
-  log "ldt_16: $sent call(s) reached users and the provider after the switch of run B (at most 8)"
-
-  absent job "$job_c" -n disc-22 || fail "ldt_16: run C has a Job while it is Pending"
-  run_is disc-22 ldt16-c 'Pending/*' || fail "ldt_16: run C is no longer Pending: $(run_status disc-22 ldt16-c)"
+  # Each is bounded on its own: a call to users must not hide behind a missing one to the provider, or the reverse.
+  sent_users=$(( users2 - users1 ))
+  sent_prov=$(( prov2 - prov1 ))
+  (( sent_users <= 8 )) || fail "ldt_16: users logged $sent_users calls from front after the switch of run B (at most 8)"
+  (( sent_prov <= 8 )) || fail "ldt_16: the provider logged $sent_prov calls from front after the switch of run B (at most 8)"
+  log "ldt_16: $sent_users call(s) reached users and $sent_prov the provider after the switch of run B (at most 8 each)"
 
   log "ldt_19: the deployment page of front shows the Load tests table with runs A and B"
   ldt_19_check
@@ -740,6 +856,10 @@ refuse "readOnlyRootFilesystem must be true" job '.spec.template.spec.containers
 refuse "capabilities must drop ALL" job '.spec.template.spec.containers[0].securityContext.capabilities.add = ["NET_ADMIN"]'
 refuse "capabilities must drop ALL" job '.spec.template.spec.containers[0].securityContext.capabilities.drop = []'
 refuse "seccompProfile must be RuntimeDefault" job '.spec.template.spec.securityContext.seccompProfile.type = "Unconfined"'
+
+log "ldt_17: the Job policy refuses another fsGroup, and a credentials Secret not read by the group at 0440"
+refuse "fsGroup must be 65532" job '.spec.template.spec.securityContext.fsGroup = 0'
+refuse "defaultMode must be 0440" job-secret '.spec.template.spec.volumes |= map(if .secret then .secret.defaultMode = 420 else . end)'
 
 log "ldt_17: the Job policy refuses Jobs without the labels of spec 7.8, and namespaces without the injection label"
 refuse "metadata labels must" job 'del(.metadata.labels["mimic.platform.io/load-test"])'

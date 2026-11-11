@@ -458,6 +458,39 @@ impl Store {
             .collect())
     }
 
+    /// [`Store::load_fields`] of several runs of a deployment, in one pipeline and in the order
+    /// of `uids`.
+    pub async fn load_fields_of(
+        &self,
+        namespace: &str,
+        deployment: &str,
+        uids: &[String],
+    ) -> Result<Vec<BTreeMap<String, String>>, ReadError> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipeline = redis::pipe();
+        for uid in uids {
+            let key = run_key(namespace, deployment, uid).map_err(|_| ReadError::Name)?;
+            let command = pipeline.cmd("HMGET").arg(&key);
+            for field in KEPT {
+                command.arg(field);
+            }
+        }
+        let mut conn = self.read_connection().await?;
+        let all: Vec<Vec<Option<String>>> =
+            self.read_of(pipeline.query_async(&mut conn).await).await?;
+        Ok(all
+            .into_iter()
+            .map(|values| {
+                KEPT.iter()
+                    .zip(values)
+                    .filter_map(|(field, value)| Some(((*field).to_string(), value?)))
+                    .collect()
+            })
+            .collect())
+    }
+
     /// The uids of a deployment's runs in `:loads`, newest first (spec §7.5).
     pub async fn load_uids(
         &self,

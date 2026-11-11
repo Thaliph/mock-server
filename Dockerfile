@@ -5,7 +5,7 @@
 #     (nft backend) and the libraries they load. The pod runs it as UID 0 with NET_ADMIN/NET_RAW.
 # Base images are pinned by digest; Dependabot keeps them current.
 ARG RUST_IMAGE=rust:1.99.1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc
-ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:cc66d222f0a7ec996b78a99fe76a969bc80b539a5016ad866c14d1949bc6d0ab
 
 FROM ${RUST_IMAGE} AS build
 ARG TARGETARCH

@@ -64,6 +64,9 @@ struct FakeCluster {
     statuses: Mutex<BTreeMap<(String, String), Value>>,
     states: Mutex<BTreeMap<String, JobState>>,
     fail_create: std::sync::atomic::AtomicBool,
+    /// A post that lands while `job_state` is being answered: after the pass read the pods'
+    /// results and before it judges the Job.
+    late_post: Mutex<Option<(Arc<Store>, Test, StoredPost)>>,
 }
 
 fn kind_of(kind: Kind) -> &'static str {
@@ -97,6 +100,11 @@ impl Cluster for FakeCluster {
 
     fn job_state<'a>(&'a self, _ns: &'a str, name: &'a str) -> ClusterFuture<'a, JobState> {
         Box::pin(async move {
+            let late = self.late_post.lock().unwrap().take();
+            if let Some((store, test, post)) = late {
+                let (ns, dep, uid) = (&test.namespace, &test.deployment, &test.uid);
+                store.load_post(ns, dep, uid, "0", &post).await.unwrap();
+            }
             Ok(*self
                 .states
                 .lock()
@@ -1267,4 +1275,95 @@ async fn ldt_10_an_apply_with_another_uid_ends_the_run_of_the_old_one() {
     assert_eq!(f.phase(&new).0, "Running");
     f.rec.applied(f.rec.tests.list().remove(0)).await;
     assert_eq!(f.active(&new).await, Some(false));
+}
+
+#[tokio::test]
+async fn ldt_09_a_final_post_landing_before_the_job_check_is_not_no_report() {
+    let f = fx(None, |_| {}).await;
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 1000).await;
+    let post = StoredPost {
+        final_post: true,
+        reason: Some("Completed".to_string()),
+        results: PodResults {
+            endpoints: vec![Stats::default()],
+        },
+    };
+    *f.cluster.late_post.lock().unwrap() = Some((f.rec.store.clone(), test.clone(), post));
+    f.cluster
+        .states
+        .lock()
+        .unwrap()
+        .insert(job_name(&test.uid), JobState::Complete);
+    // The pass reads no post, then the final one lands, then the Job is seen `Complete`.
+    f.pass(t0 + 2000).await;
+    assert_eq!(f.phase(&test), ("Succeeded".into(), "Completed".into()));
+}
+
+#[tokio::test]
+async fn ldt_07_a_change_of_reason_during_an_outage_logs_the_new_reason() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let mut f = fx(None, |_| {}).await;
+    let seed = f.rec.seed.clone();
+    f.rec.seed = Arc::new(SeedSlot::new());
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 500).await;
+    f.rec.seed = seed;
+    f.rec.cert = Arc::new(CertSlot::new());
+    f.pass(t0 + 1000).await;
+    f.pass(t0 + 1500).await;
+    let lines = lines_of(&capture, "load test admission waiting", &ns);
+    let reasons: Vec<&Value> = lines.iter().map(|l| &l["reason"]).collect();
+    assert_eq!(reasons, ["seed", "ca"], "{lines:?}");
+    assert_eq!(f.phase(&test).0, "");
+}
+
+#[tokio::test]
+async fn ldt_09_unreadable_pods_results_log_once_per_outage() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let f = fx(None, |_| {}).await;
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 1000).await;
+    let key = format!("mimic:v1:{{{ns}/pay}}:load:{}", test.uid);
+    let mut conn = valkey(None)
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let hset = |value: &'static str| {
+        let mut command = redis::cmd("HSET");
+        command.arg(&key).arg("0").arg(value);
+        command
+    };
+    hset("garbage").query_async::<()>(&mut conn).await.unwrap();
+    for i in 2..=4 {
+        f.pass(t0 + i * 500).await;
+    }
+    let lines = lines_of(&capture, "load test posts unreadable", &ns);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "WARN");
+    // The read works again, then fails again: a new outage, a new line.
+    redis::cmd("HDEL")
+        .arg(&key)
+        .arg("0")
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+    f.pass(t0 + 2500).await;
+    hset("garbage").query_async::<()>(&mut conn).await.unwrap();
+    f.pass(t0 + 3000).await;
+    f.pass(t0 + 3500).await;
+    assert_eq!(
+        lines_of(&capture, "load test posts unreadable", &ns).len(),
+        2
+    );
+    assert_eq!(f.phase(&test).0, "Running");
 }
