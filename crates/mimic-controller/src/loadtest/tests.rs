@@ -1334,16 +1334,16 @@ async fn ldt_09_unreadable_pods_results_log_once_per_outage() {
     let test = f.test(&ns, "t1", "pay", t0);
     f.pass(t0 + 1000).await;
     let key = format!("mimic:v1:{{{ns}/pay}}:load:{}", test.uid);
-    let mut conn = valkey(None).get_multiplexed_async_connection().await.unwrap();
+    let mut conn = valkey(None)
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
     let hset = |value: &'static str| {
         let mut command = redis::cmd("HSET");
         command.arg(&key).arg("0").arg(value);
         command
     };
-    hset("garbage")
-        .query_async::<()>(&mut conn)
-        .await
-        .unwrap();
+    hset("garbage").query_async::<()>(&mut conn).await.unwrap();
     for i in 2..=4 {
         f.pass(t0 + i * 500).await;
     }
@@ -1358,10 +1358,7 @@ async fn ldt_09_unreadable_pods_results_log_once_per_outage() {
         .await
         .unwrap();
     f.pass(t0 + 2500).await;
-    hset("garbage")
-        .query_async::<()>(&mut conn)
-        .await
-        .unwrap();
+    hset("garbage").query_async::<()>(&mut conn).await.unwrap();
     f.pass(t0 + 3000).await;
     f.pass(t0 + 3500).await;
     assert_eq!(
