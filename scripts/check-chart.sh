@@ -668,9 +668,11 @@ done
 notdash='select(((.metadata.labels.grafana_dashboard // "") == "1") | not)'
 cmp -s <(yq "$notdash" "$tmp/dash-on.yaml") <(yq "$notdash" "$tmp/dash-off.yaml") \
   || fail "mon_23: dashboards.enabled changes more than the dashboard ConfigMaps"
-# One byte of a dashboard changed in a copy of the chart: the Grafana checksum does not move.
+# A dashboard changed in a copy of the chart: the Grafana checksum does not move.
 cp -r "$chart" "$tmp/chart-copy"
-printf ' ' >> "$tmp/chart-copy/dashboards/mimic-controller.json"
+# A change inside the JSON (the title), not trailing whitespace: YAML block chomping drops a trailing blank line.
+sed -i 's/"title": "Mimic \/ Controller"/"title": "Mimic \/ Controller changed"/' "$tmp/chart-copy/dashboards/mimic-controller.json"
+grep -q 'Mimic / Controller changed' "$tmp/chart-copy/dashboards/mimic-controller.json" || fail "mon_23: the copy was not changed"
 helm template mimic "$tmp/chart-copy" -n mimic-system --set valkey.existingSecret=golden --set monitoring.grafana.enabled=true > "$tmp/dash-copy.yaml"
 [[ $(gcs "$tmp/dash-grafana.yaml") == "$(gcs "$tmp/dash-copy.yaml")" ]] || fail "mon_23: a dashboard change moves the Grafana checksum"
 cmp -s <(yq "$isdash" "$tmp/dash-copy.yaml") <(yq "$isdash" "$tmp/dash-grafana.yaml") && fail "mon_23: the changed copy renders the same dashboard"
