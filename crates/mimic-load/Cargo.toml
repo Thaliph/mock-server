@@ -11,8 +11,8 @@ bytes = "1.12.1"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
-mimic-core = { version = "0.1.0", path = "../mimic-core" }
-mimic-runtime = { version = "0.1.0", path = "../mimic-runtime" }
+mimic-core = { path = "../mimic-core" }
+mimic-runtime = { path = "../mimic-runtime" }
 prometheus-client = "0.25.2"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }

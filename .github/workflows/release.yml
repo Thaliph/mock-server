@@ -1,66 +1,104 @@
 name: release
 
-# On a v* tag: multi-arch images (mimic and mimic-init), native amd64 and arm64 runners, each
-# signed with cosign keyless, with SBOM and provenance; then the Helm chart, pinned to the digests of
-# mimic and mimic-init (#271), pushed as an OCI artifact and signed (spec §10, FND-10, INJ-17). A tag
-# that is not on main is refused first (#272). Everything lands on ghcr.io, free for a public repository.
+# Spec §12.14 (REL-04 to REL-12), #364:
+#
+#   gates ──▶ build (app|init × amd64|arm64, native runners: push by digest, image checks, scan)
+#         ──▶ e2e (kind, amd64 digests pulled by digest)
+#         ──▶ publish (tag push only: indexes tagged <version>, cosign keyless, chart, GitHub release)
+#         ──▶ verify (tag push only: what was published is what was tested)
+#
+# A push of a v*.*.* tag runs every job. A workflow_dispatch on main is the dry run: gates, build,
+# e2e and a summary, and nothing is tagged, signed or released (`publish` and `verify` are
+# skipped, and `publish` is the only job that can write to the repository or sign). The images are
+# built here, from the tagged commit and without a cache; the per-platform digests that pass the
+# checks, the scan and the e2e are the ones the indexes then reference. Everything lands on
+# ghcr.io, free for a public repository. The tag reaches shell only through env:.
 
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   REPO: ghcr.io/thaliph/mimic
   INIT_REPO: ghcr.io/thaliph/mimic-init
   CHARTS: ghcr.io/thaliph/charts
+  # The identity the signatures carry: this workflow at the release tag (REL-07).
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
 
 jobs:
-  # #272: a release is cut from main only. The tagged commit must be an ancestor of main (or main
-  # itself); a tag on a branch or on an unreviewed commit fails here before anything is built.
-  on-main:
+  # REL-04: every gate of scripts/release-gates.sh, before anything is built.
+  gates:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+      packages: read # a package of this repository that exists must be readable by the registry gate
+    outputs:
+      version: ${{ steps.gates.outputs.version }}
+      prerelease: ${{ steps.gates.outputs.prerelease }}
     steps:
-      - name: Tagged commit is on main
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: gates
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-        run: |
-          # Comparing main with the tagged commit: "behind" means the commit is an ancestor of
-          # main, "identical" means it is main.
-          status=$(gh api "repos/$REPO/compare/main...$SHA" --jq .status)
-          case "$status" in
-            behind|identical) echo "$SHA is on main ($status)" ;;
-            *) echo "refusing to release $SHA: not on main (compare status: $status)"; exit 1 ;;
-          esac
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: scripts/release-gates.sh
 
+  # REL-05: per image and platform, on a native runner. Built from the run's commit with no
+  # cache, pushed by digest only (no tag), then pulled by that digest and checked and scanned. The
+  # digest file is uploaded only when every check passed.
   build:
-    needs: on-main
+    needs: gates
     strategy:
+      fail-fast: true
       matrix:
         include:
           - target: app
             repo: ghcr.io/thaliph/mimic
+            check: scripts/check-image.sh
+            arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
           - target: app
             repo: ghcr.io/thaliph/mimic
+            check: scripts/check-image.sh
+            arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
           - target: init
             repo: ghcr.io/thaliph/mimic-init
+            check: scripts/check-init-image.sh
+            arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
           - target: init
             repo: ghcr.io/thaliph/mimic-init
+            check: scripts/check-init-image.sh
+            arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -68,12 +106,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Tag matches the workspace version
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "v$version" = "$TAG" ] || { echo "tag $TAG != Cargo.toml $version"; exit 1; }
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -86,30 +118,155 @@ jobs:
           context: .
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
+          no-cache: true
           outputs: type=image,name=${{ matrix.repo }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
-      - name: Export digest
+      - name: Pull by digest and check the image
+        env:
+          IMAGE: ${{ matrix.repo }}@${{ steps.build.outputs.digest }}
+          CHECK: ${{ matrix.check }}
+        run: |
+          docker pull "$IMAGE"
+          "$CHECK" "$IMAGE"
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.repo }}@${{ steps.build.outputs.digest }}
+          trivyignores: .trivyignore.yaml
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Hand on the digest that passed
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
         run: |
+          [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "not a digest: $DIGEST"; exit 1; }
           mkdir -p digests
-          touch "digests/$TARGET-${DIGEST#sha256:}"
+          echo "$DIGEST" > "digests/$TARGET-$ARCH"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: digest-${{ matrix.target }}-${{ matrix.runner }}
+          name: digest-${{ matrix.target }}-${{ matrix.arch }}
           path: digests/*
           retention-days: 1
 
-  publish:
-    needs: build
+  # REL-06: the amd64 digests, pulled by digest, on the same Kubernetes matrix as ci.yml.
+  e2e:
+    name: e2e (${{ matrix.name }})
+    needs: [gates, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: kubernetes-1.33
+            node_image: kindest/node:v1.33.12@sha256:3f5c8443c620245e4d355cfe09e96a91ead32ceaa569d3f1ca9edf0cb2fe2ff4
+          - name: kubernetes-latest
+            node_image: ""
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull the amd64 digests
+        run: |
+          # The digest is the reference that is pulled; the local tag is only the name that
+          # scripts/e2e.sh passes to kind and helm (repository and tag).
+          for pair in "$REPO app e2e-app" "$INIT_REPO init e2e-init"; do
+            read -r repo target tag <<<"$pair"
+            digest=$(<"digests/$target-amd64")
+            [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "not a digest: $digest"; exit 1; }
+            docker pull "$repo@$digest"
+            docker tag "$repo@$digest" "$repo:$tag"
+          done
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          node_image: ${{ matrix.node_image }}
+          cluster_name: mimic-e2e
+      - run: ./scripts/e2e.sh
+        env:
+          SKIP_BUILD: "1"
+          IMAGE: ghcr.io/thaliph/mimic:e2e-app
+          INIT_IMAGE: ghcr.io/thaliph/mimic-init:e2e-init
+
+  # REL-11: the dry run ends here: the notes and the indexes that publish would create, in the
+  # job summary. Nothing is pushed (imagetools --dry-run).
+  dry-run-summary:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [gates, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Release notes and indexes (dry run)
+        env:
+          VERSION: ${{ needs.gates.outputs.version }}
+        run: |
+          {
+            echo "## Dry run of $VERSION"
+            echo
+            echo "Nothing was tagged, signed or released."
+            echo
+            echo "### Release notes"
+            echo
+            python3 -I scripts/release-notes.py "$VERSION"
+            for pair in "$REPO app" "$INIT_REPO init"; do
+              read -r repo target <<<"$pair"
+              echo
+              echo "### \`$repo:$VERSION\` (imagetools create --dry-run)"
+              echo
+              echo '```json'
+              docker buildx imagetools create --dry-run -t "$repo:$VERSION" \
+                "$repo@$(<"digests/$target-amd64")" "$repo@$(<"digests/$target-arm64")"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # REL-07 to REL-09: tag push only. The only job that can write to the repository or sign.
+  publish:
+    if: github.event_name == 'push'
+    needs: [gates, build, e2e]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: write
       packages: write
       id-token: write
+    outputs:
+      app_digest: ${{ steps.index.outputs.app_digest }}
+      init_digest: ${{ steps.index.outputs.init_digest }}
+      chart_digest: ${{ steps.chart.outputs.chart_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,48 +283,142 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-      - name: Multi-arch indexes, signed
+      - name: Multi-arch indexes, tagged with the version only, signed
         id: index
         env:
-          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.gates.outputs.version }}
         run: |
-          version=${TAG#v}
-          # index <repo> <target> <output>: one manifest list from the per-platform digests of
-          # <target> (files named <target>-<digest>), pushed under the version tag and signed.
+          # index <repo> <target> <output>: one index from exactly the two per-platform digests
+          # that passed the build job and the e2e (files digests/<target>-<arch>), tagged
+          # <version> and nothing else, checked, then signed.
           index() {
-            local repo=$1 target=$2 output=$3 digest
-            docker buildx imagetools create -t "$repo:$version" \
-              $(for d in digests/"$target"-*; do echo "$repo@sha256:${d##*/$target-}"; done)
-            digest=$(docker buildx imagetools inspect "$repo:$version" --format '{{json .Manifest}}' | jq -r .digest)
+            local repo=$1 target=$2 output=$3 amd arm digest
+            amd=$(<"digests/$target-amd64")
+            arm=$(<"digests/$target-arm64")
+            for d in "$amd" "$arm"; do
+              [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "not a digest: $d"; exit 1; }
+            done
+            [ "$(ls digests | grep -c "^$target-")" = 2 ] || { echo "unexpected digests for $target"; exit 1; }
+            docker buildx imagetools create -t "$repo:$VERSION" "$repo@$amd" "$repo@$arm"
+            digest=$(docker buildx imagetools inspect "$repo:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+            [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no index digest for $repo:$VERSION"; exit 1; }
+            scripts/check-index.sh "$repo@$digest"
             cosign sign --yes "$repo@$digest"
             echo "$output=$digest" >> "$GITHUB_OUTPUT"
           }
           index "$REPO" app app_digest
           index "$INIT_REPO" init init_digest
-      - name: Helm chart, pinned to both image digests, signed
+      - name: Helm chart, pinned to both index digests, signed
+        id: chart
         env:
-          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.gates.outputs.version }}
           DIGEST: ${{ steps.index.outputs.app_digest }}
           INIT_DIGEST: ${{ steps.index.outputs.init_digest }}
           GH_ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          version=${TAG#v}
           # #271: image.digest and inject.initImage.digest (yq, key paths matched exactly; fails if a
           # digest is not sha256:<64 hex> or does not land).
           scripts/pin-chart.sh deploy/helm/mimic/values.yaml "$DIGEST" "$INIT_DIGEST"
-          helm package deploy/helm/mimic --version "$version" --app-version "$version" -d dist
+          helm package deploy/helm/mimic --version "$VERSION" --app-version "$VERSION" -d dist
           # The packaged values carry both digests (what the signed chart will deploy).
-          tar -xzOf "dist/mimic-$version.tgz" mimic/values.yaml |
+          tar -xzOf "dist/mimic-$VERSION.tgz" mimic/values.yaml |
             DIGEST="$DIGEST" INIT_DIGEST="$INIT_DIGEST" \
             yq -e '.image.digest == strenv(DIGEST) and .inject.initImage.digest == strenv(INIT_DIGEST)' > /dev/null
           echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
-          out=$(helm push "dist/mimic-$version.tgz" "oci://$CHARTS" 2>&1)
+          out=$(helm push "dist/mimic-$VERSION.tgz" "oci://$CHARTS" 2>&1)
           echo "$out"
           chart_digest=$(echo "$out" | sed -n 's/^Digest: //p')
+          [[ $chart_digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no chart digest in the helm push output"; exit 1; }
           cosign sign --yes "$CHARTS/mimic@$chart_digest"
+          echo "chart_digest=$chart_digest" >> "$GITHUB_OUTPUT"
       - name: GitHub release
         env:
           TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.gates.outputs.version }}
+          PRERELEASE: ${{ needs.gates.outputs.prerelease }}
+          APP_DIGEST: ${{ steps.index.outputs.app_digest }}
+          INIT_DIGEST: ${{ steps.index.outputs.init_digest }}
+          CHART_DIGEST: ${{ steps.chart.outputs.chart_digest }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$TAG" --generate-notes --verify-tag dist/*.tgz
+        run: |
+          # The body is the reviewed CHANGELOG section and the artefacts; no generated notes.
+          { python3 -I scripts/release-notes.py "$VERSION"; scripts/release-artefacts.sh "$VERSION" "$APP_DIGEST" "$INIT_DIGEST" "$CHART_DIGEST"; } > notes.md
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags=(--prerelease --latest=false); fi
+          gh release create "$TAG" --verify-tag --title "mimic $VERSION" --notes-file notes.md "${flags[@]}" "dist/mimic-$VERSION.tgz"
+
+  # REL-10: re-reads what was published; read-only. A mismatch fails the run.
+  verify:
+    if: github.event_name == 'push'
+    needs: [gates, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Images, signatures and chart as published
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.gates.outputs.version }}
+          APP_DIGEST: ${{ needs.publish.outputs.app_digest }}
+          INIT_DIGEST: ${{ needs.publish.outputs.init_digest }}
+          CHART_DIGEST: ${{ needs.publish.outputs.chart_digest }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PRERELEASE: ${{ needs.gates.outputs.prerelease }}
+        run: |
+          identity="https://github.com/Thaliph/mock-server/.github/workflows/release.yml@refs/tags/$TAG"
+          verify() {
+            cosign verify "$1" --certificate-identity "$identity" --certificate-oidc-issuer "$OIDC_ISSUER" > /dev/null
+          }
+          # The version tags resolve to the indexes that publish created, and those hold the two
+          # platforms with their attestations.
+          for pair in "$REPO $APP_DIGEST" "$INIT_REPO $INIT_DIGEST"; do
+            read -r repo expected <<<"$pair"
+            resolved=$(docker buildx imagetools inspect "$repo:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+            [ "$resolved" = "$expected" ] || { echo "$repo:$VERSION is $resolved, publish created $expected"; exit 1; }
+            scripts/check-index.sh "$repo@$expected"
+            verify "$repo@$expected"
+          done
+          verify "$CHARTS/mimic@$CHART_DIGEST"
+          # The chart, pulled by version: its digest, its appVersion and both pins.
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          mkdir pulled
+          out=$(helm pull "oci://$CHARTS/mimic" --version "$VERSION" -d pulled 2>&1)
+          echo "$out"
+          pulled=$(echo "$out" | sed -n 's/^Digest: //p')
+          [ "$pulled" = "$CHART_DIGEST" ] || { echo "chart $VERSION is '$pulled', publish pushed $CHART_DIGEST"; exit 1; }
+          tgz="pulled/mimic-$VERSION.tgz"
+          tar -xzOf "$tgz" mimic/Chart.yaml |
+            VERSION="$VERSION" yq -e '.version == strenv(VERSION) and .appVersion == strenv(VERSION)' > /dev/null
+          tar -xzOf "$tgz" mimic/values.yaml |
+            DIGEST="$APP_DIGEST" INIT_DIGEST="$INIT_DIGEST" \
+            yq -e '.image.digest == strenv(DIGEST) and .inject.initImage.digest == strenv(INIT_DIGEST)' > /dev/null
+          # The GitHub release: title, pre-release and latest flags, only asset, artefacts in the body.
+          release=$(gh release view "$TAG" --json name,isDraft,isPrerelease,assets,body)
+          want_pre=false
+          [[ $VERSION == *-* ]] && want_pre=true
+          jq -e --arg title "mimic $VERSION" --argjson pre "$want_pre" --arg asset "mimic-$VERSION.tgz" \
+            '.name == $title and .isDraft == false and .isPrerelease == $pre and ([.assets[].name] == [$asset])' <<<"$release" > /dev/null \
+            || { echo "release $TAG: title, flags or assets differ from what publish created"; exit 1; }
+          for digest in "$APP_DIGEST" "$INIT_DIGEST" "$CHART_DIGEST"; do
+            jq -e --arg d "$digest" '.body | contains($d)' <<<"$release" > /dev/null || { echo "release $TAG: $digest is not in the notes"; exit 1; }
+          done
+          if [ "$want_pre" = true ]; then
+            latest=$(gh release list --json tagName,isLatest --jq '.[] | select(.isLatest) | .tagName')
+            [ "$latest" != "$TAG" ] || { echo "release $TAG is marked latest"; exit 1; }
+          fi
+          echo "verified $TAG: $REPO@$APP_DIGEST $INIT_REPO@$INIT_DIGEST $CHARTS/mimic@$CHART_DIGEST"

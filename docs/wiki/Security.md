@@ -103,3 +103,13 @@ The main ones (full list: spec §11.1):
   pod is not.
 - GitOps tools must ignore the `caBundle` of the webhook configuration and the data of the two Secrets.
 - Emptying the seed Secret rotates every root CA; running sidecars pass TLS through until recreated.
+- **Capture is not a security boundary** (F1, F3): an app container with `NET_ADMIN`, or whose image runs as
+  UID 1337 without declaring it, escapes the redirection.
+- **Mock (F10).** Whoever may create or edit a `MimicWorkload` in a namespace decides the egress of every
+  Deployment there. A mock replays samples with no state across calls. Roll back mimic only out of mock.
+- **Load tests (F11).** Requests in flight at a switch out of mock can reach real destinations; the
+  application's real datastores are loaded too; load and credentials travel in cleartext. See
+  [Load test](Load-test#limits).
+- **Release (F12).** Images are rebuilt from the tagged commit; arm64 gets image checks and a scan but no kind
+  e2e; repository admins can bypass the tag ruleset (a signature names its tag); signing depends on the public
+  Sigstore service. This wiki is not versioned: `docs/wiki/` at a release tag documents that release.
