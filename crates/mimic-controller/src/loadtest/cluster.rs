@@ -171,7 +171,7 @@ pub async fn watch(client: kube::Client, reconciler: Arc<Reconciler>) {
                 tracing::info!("MimicLoadTest cache synced");
             }
             Ok(Event::Apply(object)) => match parse(&object) {
-                Some(test) => tests.apply(test),
+                Some(test) => reconciler.applied(test).await,
                 None => tracing::warn!("MimicLoadTest ignored: its spec does not parse"),
             },
             Ok(Event::Delete(object)) => {

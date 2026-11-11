@@ -911,6 +911,11 @@ impl Reconciler {
         }
     }
 
+    /// A `MimicLoadTest` was added or changed.
+    pub async fn applied(&self, test: Test) {
+        self.tests.apply(test);
+    }
+
     /// A `MimicLoadTest` was deleted: the Job goes (also by owner reference) and the slot is
     /// released.
     pub async fn deleted(&self, test: &Test) {

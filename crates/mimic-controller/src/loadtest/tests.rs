@@ -1223,3 +1223,28 @@ async fn ldt_07_a_run_waiting_for_valkey_logs_once() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0]["reason"], "valkey");
 }
+
+#[tokio::test]
+async fn ldt_10_an_apply_with_another_uid_ends_the_run_of_the_old_one() {
+    let f = fx(Some(12), |_| {}).await;
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let old = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 1000).await;
+    assert_eq!(f.active(&old).await, Some(false));
+    // The Delete event was missed: the next one is the Apply of the recreated object.
+    let mut new = old.clone();
+    new.uid = format!("{}-6a3f-4c58-9e11-2f7d3a8b4c62", hex(4));
+    new.status = Value::Null;
+    new.created_ms = t0 + 1500;
+    f.rec.applied(new.clone()).await;
+    assert_eq!(f.active(&old).await, None);
+    assert!(f.cluster.was_deleted("Job", &job_name(&old.uid)));
+    assert_eq!(f.rec.tests.list()[0].uid, new.uid);
+    // A plain update of the same uid ends nothing.
+    f.pass(t0 + 2000).await;
+    assert_eq!(f.phase(&new).0, "Running");
+    f.rec.applied(f.rec.tests.list().remove(0)).await;
+    assert_eq!(f.active(&new).await, Some(false));
+}
