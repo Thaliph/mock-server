@@ -956,7 +956,13 @@ mod object_tests {
             .expect("a secret volume");
         assert_eq!(secret["secret"]["secretName"], "payment-load");
         assert_eq!(secret["secret"]["optional"], false);
-        assert_eq!(secret["secret"]["defaultMode"], 0o400);
+        // The key must be readable by the non-root UID through fsGroup (#414).
+        assert_eq!(secret["secret"]["defaultMode"], 0o440);
+        assert_eq!(pod["securityContext"]["fsGroup"], 65532);
+        assert_eq!(
+            pod["securityContext"]["fsGroupChangePolicy"],
+            "OnRootMismatch"
+        );
         let mount = pod["containers"][0]["volumeMounts"]
             .as_array()
             .expect("mounts")
