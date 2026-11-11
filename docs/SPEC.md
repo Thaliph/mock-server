@@ -1123,7 +1123,7 @@ logic in `mimic-core` (`discovery` module).
   | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
   | `mimic:v1:{<ns>/<dep>}:pulls` | hash | (F10) field `<pod>` → `<mode> <ms>`: the mode the last `200` or `304` egress answer to that pod carried and when (§7.7) | same as `:pods` fields; the key itself `MIMIC_STORE_TTL` after its last write |
   | `mimic:v1:ns:<ns>` | sorted set | member `<dep>`, score = `updated` | `MIMIC_STORE_TTL` after the last write; members older than it removed by each write |
-  | `mimic:v1:{<ns>/<dep>}:load:<uid>` | hash | (F11) a load test run (§7.8): `spec` (the `MimicLoadTest` name and spec, no Secret value), `stop` (`0`/`1`), `start` and `end` (ms), `phase`, `reason`; while active `plan`, `ticket` and per generator worker index `<i>` → its last cumulative results (at most 256 KiB each); once ended only `summary` (at most 192 KiB, enforced by the end script) besides the small fields; ended runs together hold at most deployments × 20 × 192 KiB at the defaults (each expires `MIMIC_STORE_TTL` after its last write) | `MIMIC_STORE_TTL` after its last write |
+  | `mimic:v1:{<ns>/<dep>}:load:<uid>` | hash | (F11) a load test run (§7.8): `spec` (the `MimicLoadTest` name and spec, no Secret value), `stop` (`0`/`1`), `start` and `end` (ms), `phase`, `reason`; while active `plan`, `ticket` and per generator worker index `<i>` → its last cumulative results (at most 256 KiB each); once ended only `summary` (at most 192 KiB, enforced by the end script) and `pods` (the number of pod fields the end script found) besides the small fields; ended runs together hold at most deployments × 20 × 192 KiB at the defaults (each expires `MIMIC_STORE_TTL` after its last write) | `MIMIC_STORE_TTL` after its last write |
   | `mimic:v1:{<ns>/<dep>}:loads` | sorted set | (F11) member `<uid>`, score = start ms; at most 20, the oldest ended run (and its `:load:<uid>`) removed by each admission | `MIMIC_STORE_TTL` after the last write |
   | `mimic:v1:loads:active` | sorted set | (F11) member `<ns>/<dep>/<uid>`, score = the run's deadline (ms: start + `activeDeadlineSeconds`); the admission script removes members past their score, then refuses a member of a deployment already present (`Busy`) or past `MIMIC_LOAD_MAX_RUNS` members (`ClusterBusy`); the end of a run removes it | none (members expire by score) |
   | `mimic:v1:loads:reserved` | hash | (F11) field `<ns>/<dep>/<uid>` → bytes reserved by an active run (§7.8 "Admission"); same lifetime as its `:active` member (the admission script drops fields whose member is gone). The admission script reads `loads:active` and `loads:reserved` together with a deployment's keys, which are not in one hash slot: it needs the standalone Valkey of §3 (cluster mode is not supported) | none |
@@ -1769,7 +1769,22 @@ no `MimicLoadTest` and creates no Job).
      Deleting the `MimicLoadTest` deletes the Job (owner reference, `blockOwnerDeletion:
      false`) and releases the slot. A delete event a replica misses leaks nothing: the slot's
      `loads:active` score is the run's deadline (start + `activeDeadlineSeconds`), and the next
-     admission drops the member and its reservation once it is past (LDT-09).
+     admission drops the member and its reservation once it is past (LDT-09). A replica that
+     loses the end script, or finds the run ended, copies `phase`, `reason`, `summary` and
+     `pods` from the stored run, never from its own (possibly stale) view of the status.
+     A re-list of the `MimicLoadTest`s after a watch gap compares uids: an object that is
+     gone, or has been recreated under the same name with another uid, ends the old uid's run
+     as if it had been deleted (Job deleted, `Aborted`/`Stopped`, slot released). A run ending
+     in `Pending` whose slot cannot be read (Valkey down) logs one WARN `load test end
+     deferred` per outage and is retried at the next pass.
+  6. *Pacing and outages*. A pass runs every 500 ms. A replica reads a running run's pods'
+     results (`load_posts`) every 500 ms while they change; when a read finds them unchanged
+     the interval doubles, up to 4 s, and returns to 500 ms at the next change (a final post
+     is therefore seen within 4 s). While a run in `Pending` waits for the signing seed, the
+     webhook CA or Valkey, its plan is built once and kept for the next passes (never rebuilt
+     at every pass), and the wait is logged once per outage as one WARN `load test admission
+     waiting` (`reason`: `seed`, `ca` or `valkey`), the next one only after the run has
+     progressed.
 - **Targets**: the ready endpoints (`conditions.ready` true or absent) of every
   `EndpointSlice` of the namespace whose `targetRef` is a `Pod` with a name the deployment's
   ReplicaSets can generate (the §7.2 check), one address per pod (the first), deduplicated.

@@ -777,6 +777,27 @@ impl Reconciler {
         self.set_status(test, status).await;
     }
 
+    /// Replaces the cache by a fresh listing. Objects deleted while the watch was down are not
+    /// in it.
+    pub async fn resync(&self, listing: Vec<Test>) {
+        let listed: std::collections::BTreeSet<_> = listing
+            .iter()
+            .map(|t| (t.namespace.clone(), t.name.clone()))
+            .collect();
+        for gone in self
+            .tests
+            .list()
+            .into_iter()
+            .filter(|t| !listed.contains(&(t.namespace.clone(), t.name.clone())))
+        {
+            self.tests.remove(&gone.namespace, &gone.name);
+            self.deleted(&gone).await;
+        }
+        for test in listing {
+            self.tests.apply(test);
+        }
+    }
+
     /// A `MimicLoadTest` was deleted: the Job goes (also by owner reference) and the slot is
     /// released.
     pub async fn deleted(&self, test: &Test) {

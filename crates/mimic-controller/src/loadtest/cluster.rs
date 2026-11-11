@@ -168,22 +168,7 @@ pub async fn watch(client: kube::Client, reconciler: Arc<Reconciler>) {
             Ok(Event::Init) => listing.clear(),
             Ok(Event::InitApply(object)) => listing.extend(parse(&object)),
             Ok(Event::InitDone) => {
-                // Objects deleted while the watch was down are not in the listing.
-                let listed: BTreeSet<_> = listing
-                    .iter()
-                    .map(|t| (t.namespace.clone(), t.name.clone()))
-                    .collect();
-                for gone in tests
-                    .list()
-                    .into_iter()
-                    .filter(|t| !listed.contains(&(t.namespace.clone(), t.name.clone())))
-                {
-                    tests.remove(&gone.namespace, &gone.name);
-                    reconciler.deleted(&gone).await;
-                }
-                for test in std::mem::take(&mut listing) {
-                    tests.apply(test);
-                }
+                reconciler.resync(std::mem::take(&mut listing)).await;
                 tracing::info!("MimicLoadTest cache synced");
             }
             Ok(Event::Apply(object)) => match parse(&object) {

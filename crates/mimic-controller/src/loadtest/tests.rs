@@ -780,7 +780,7 @@ async fn ldt_09_posts_of_two_pods_merge_into_the_status_and_the_run_completes() 
     fields.sort();
     assert_eq!(
         fields,
-        ["end", "phase", "reason", "spec", "start", "stop", "summary"]
+        ["end", "phase", "pods", "reason", "spec", "start", "stop", "summary"]
     );
     let member = format!("{ns}/pay/{}", test.uid);
     let reserved: Option<String> = redis::cmd("HGET")
@@ -1073,4 +1073,151 @@ async fn ldt_07_an_admitted_run_whose_job_was_not_created_is_ended_not_left_in_v
         f.pass(t0 + 7000).await;
         assert_eq!(f.phase(&next).0, "Running", "{variant}");
     }
+}
+
+fn lines_of(capture: &crate::webhook::tests::Capture, message: &str, ns: &str) -> Vec<Value> {
+    let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    raw.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["message"] == message && v["namespace"] == ns)
+        .collect()
+}
+
+#[tokio::test]
+async fn ldt_09_the_replica_that_loses_the_end_takes_the_pods_of_the_stored_run() {
+    let f = fx(Some(10), |_| {}).await;
+    let g = f.replica(valkey(Some(10)));
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let mut test = f.test(&ns, "t1", "pay", t0);
+    test.spec.concurrency = 200;
+    f.rec.tests.apply(test.clone());
+    f.pass(t0 + 1000).await;
+    let stale = f.rec.tests.list().remove(0);
+    assert_eq!(stale.status["pods"], 0);
+    f.post(&test, 0, false, None, 5).await;
+    f.post(&test, 1, false, None, 7).await;
+    f.edit(&test, |t| t.stop = true);
+    f.pass(t0 + 2000).await;
+    assert_eq!(f.status(&test)["pods"], 2);
+    // The other replica lost the end script with a status from before the posts.
+    g.rec
+        .end(&stale, "Aborted", "ModeLeft", "", t0 + 2001, true)
+        .await;
+    let status = f.status(&test);
+    assert_eq!(status["reason"], "Stopped");
+    assert_eq!(status["pods"], 2);
+}
+
+#[tokio::test]
+async fn ldt_10_a_pending_end_that_cannot_read_the_slot_logs_once_and_is_retried() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    // A Valkey nobody listens on.
+    let f = fx_on(redis::Client::open("redis://127.0.0.1:1").unwrap(), |_| {});
+    let ns = running_fixture_ns();
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    f.edit(&test, |t| t.stop = true);
+    f.pass(t0 + 1000).await;
+    f.pass(t0 + 1500).await;
+    f.pass(t0 + 2000).await;
+    assert_eq!(f.phase(&test).0, "");
+    let lines = lines_of(&capture, "load test end deferred", &ns);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "WARN");
+}
+
+#[tokio::test]
+async fn ldt_10_a_relist_with_another_uid_ends_the_run_of_the_old_one() {
+    let f = fx(Some(11), |_| {}).await;
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let old = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 1000).await;
+    assert_eq!(f.active(&old).await, Some(false));
+    // Deleted and recreated under the same name while the watch was down.
+    let mut new = old.clone();
+    new.uid = format!("{}-6a3f-4c58-9e11-2f7d3a8b4c61", hex(4));
+    new.status = Value::Null;
+    new.created_ms = t0 + 1500;
+    f.rec.resync(vec![new.clone()]).await;
+    assert_eq!(f.active(&old).await, None);
+    assert!(f.cluster.was_deleted("Job", &job_name(&old.uid)));
+    let kept = f.rec.tests.list();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].uid, new.uid);
+    // The slot is free for the new object.
+    f.pass(t0 + 2000).await;
+    assert_eq!(f.phase(&new).0, "Running");
+    assert_eq!(f.active(&new).await, Some(false));
+}
+
+#[tokio::test]
+async fn ldt_09_the_pods_of_a_run_are_read_back_off_while_nothing_changes() {
+    let f = fx(None, |_| {}).await;
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 1000).await;
+    // Reads at +2000, +2500, +3500, +5500, then every 4 s: the last is +17500.
+    let mut t = t0 + 2000;
+    while t <= t0 + 17_500 {
+        f.pass(t).await;
+        t += 500;
+    }
+    f.post(&test, 0, true, Some("Completed"), 3).await;
+    while t < t0 + 21_500 {
+        f.pass(t).await;
+        assert_eq!(f.phase(&test).0, "Running", "at +{}", t - t0);
+        t += 500;
+    }
+    f.pass(t).await;
+    assert_eq!(f.phase(&test), ("Succeeded".into(), "Completed".into()));
+}
+
+#[tokio::test]
+async fn ldt_07_a_run_waiting_for_the_seed_logs_once_and_goes_on_when_it_comes() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let mut f = fx(None, |_| {}).await;
+    let seed = f.rec.seed.clone();
+    f.rec.seed = Arc::new(SeedSlot::new());
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    for i in 1..=4 {
+        f.pass(t0 + i * 500).await;
+    }
+    assert_eq!(f.phase(&test).0, "");
+    let lines = lines_of(&capture, "load test admission waiting", &ns);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "WARN");
+    assert_eq!(lines[0]["reason"], "seed");
+    f.rec.seed = seed;
+    f.pass(t0 + 3000).await;
+    assert_eq!(f.phase(&test).0, "Running");
+    assert_eq!(
+        lines_of(&capture, "load test admission waiting", &ns).len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn ldt_07_a_run_waiting_for_valkey_logs_once() {
+    let (capture, _guard) = crate::webhook::tests::capture_logs();
+    let f = fx_on(redis::Client::open("redis://127.0.0.1:1").unwrap(), |_| {});
+    f.rec.slices.mark_synced();
+    let ns = running_fixture_ns();
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    for i in 1..=4 {
+        f.pass(t0 + i * 500).await;
+    }
+    assert_eq!(f.phase(&test).0, "");
+    let lines = lines_of(&capture, "load test admission waiting", &ns);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["reason"], "valkey");
 }
