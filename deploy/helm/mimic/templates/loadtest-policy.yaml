@@ -155,6 +155,12 @@ spec:
         : (variables.credentialsAnnotated && has(variables.secrets[0].secret.secretName)
         && variables.secrets[0].secret.secretName != "" && variables.credentialsSecret == variables.secrets[0].secret.secretName))
       message: "load job: the Secret volume must be the credentials Secret named by the annotation mimic.platform.io/credentials-secret, and the annotation goes only with a Secret volume"
+    # The generator's UID reads the credentials through the pod's fsGroup and the Secret's mode (spec §7.8, #414).
+    - expression: '!variables.isJob || (has(variables.psc.fsGroup) ? variables.psc.fsGroup : 0) == 65532'
+      message: "load job: the pod's fsGroup must be 65532"
+    # 0440 in octal, 288 in decimal (CEL has no octal literal).
+    - expression: '!variables.isJob || variables.secrets.all(v, has(v.secret.defaultMode) && v.secret.defaultMode == 288)'
+      message: "load job: the Secret volume's defaultMode must be 0440 (288)"
     # Fields the generator never sets (the API server sets none of them on a Job's template,
     # except schedulerName, which it defaults).
     - expression: '!variables.isJob || (!has(variables.pod.priorityClassName) || variables.pod.priorityClassName == "")'
