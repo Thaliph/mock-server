@@ -104,6 +104,8 @@ jobs:
       - run: scripts/check-pins.sh
       # #378: the chart variants lint strictly, the default render is the golden file, the exporter and PodMonitor shape (MON-01).
       - run: scripts/check-chart.sh
+      # #364 (REL-01): the workspace version, the chart version and appVersion are one semver version.
+      - run: scripts/check-release.sh
 
   security:
     runs-on: ubuntu-24.04

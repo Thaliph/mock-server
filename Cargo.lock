@@ -1935,7 +1935,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mimic-controller"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "mimic-core"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "base64 0.23.1",
  "compact_str",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "mimic-init"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "mimic-core",
  "mimic-runtime",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "mimic-load"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "mimic-runtime"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "axum",
  "http-body-util",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "mimic-sidecar"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2079,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "mimic-trust"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 dependencies = [
  "mimic-core",
  "mimic-runtime",

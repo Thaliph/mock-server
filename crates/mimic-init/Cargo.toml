@@ -7,8 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-mimic-core = { version = "0.1.0", path = "../mimic-core" }
-mimic-runtime = { version = "0.1.0", path = "../mimic-runtime" }
+mimic-core = { path = "../mimic-core" }
+mimic-runtime = { path = "../mimic-runtime" }
 tracing = "0.1.44"
 
 [lints]
