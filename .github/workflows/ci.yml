@@ -323,8 +323,9 @@ jobs:
           - name: kubernetes-latest
             node_image: ""
     runs-on: ubuntu-24.04
-    # The full suite takes about 20 minutes since the bundled monitoring (mon_21, #379, #380); room for runner variance.
-    timeout-minutes: 35
+    # The full suite takes about 35 minutes since the load test of F11 (ldt_16, #259) and the bundled monitoring
+    # (mon_21, #379, #380); room for runner variance.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
