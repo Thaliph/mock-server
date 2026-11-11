@@ -48,8 +48,17 @@ EXPECTED_VARIABLES = {
     ],
 }
 # uid -> {annotation name: expression} that section 9.1 fixes.
+PROCESS_STARTED = "count(time() - process_start_time_seconds{%s} < 60) > 0"
+MODE_ANNOTATIONS = {
+    "Process started": PROCESS_STARTED % "S",
+    "Mode switch": "sum by (to) (increase(mimic_mock_mode_switches_total{S}[2m])) > 0",
+    "Latency factor changed": "max(mimic_mock_latency_factor{S}) != max(mimic_mock_latency_factor{S} offset 2m)",
+}
 EXPECTED_ANNOTATIONS = {
-    "mimic-controller": {"Process started": "count(time() - process_start_time_seconds{C} < 60) > 0"},
+    "mimic-controller": {"Process started": PROCESS_STARTED % "C"},
+    "mimic-sidecar": {"Process started": PROCESS_STARTED % "S"},
+    "mimic-discovery": MODE_ANNOTATIONS,
+    "mimic-mock-load": MODE_ANNOTATIONS,
 }
 
 AGGREGATIONS = {
