@@ -854,6 +854,26 @@ async fn ldt_09_a_failed_job_fails_the_run_with_the_results_posted_so_far() {
     assert_eq!(f.active(&test).await, None);
 }
 
+#[tokio::test]
+async fn ldt_09_a_completed_job_without_every_final_post_is_no_report() {
+    let f = fx(None, |_| {}).await;
+    let ns = running_fixture_ns();
+    f.deployment(&ns, "pay", true).await;
+    let t0 = now_ms();
+    let test = f.test(&ns, "t1", "pay", t0);
+    f.pass(t0 + 1000).await;
+    f.post(&test, 0, false, None, 4).await;
+    f.cluster
+        .states
+        .lock()
+        .unwrap()
+        .insert(job_name(&test.uid), JobState::Complete);
+    f.pass(t0 + 2000).await;
+    f.pass(t0 + 3000).await;
+    assert_eq!(f.phase(&test), ("Failed".into(), "NoReport".into()));
+    assert_eq!(f.active(&test).await, None);
+}
+
 #[test]
 fn ldt_09_a_summary_over_the_cap_keeps_the_total_and_drops_the_rows() {
     let row = |n: usize| EndpointRow {

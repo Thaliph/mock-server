@@ -84,7 +84,8 @@ fn ldt_12_open_model_sends_the_rate_over_both_targets() {
     assert!(posts.len() >= 8, "{} posts", posts.len());
     let mut last = 0;
     for post in &posts {
-        assert_eq!(post["pod"], "mimic-load-3f2b8c1e0000-0-abcde");
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        assert_eq!(post["pod"], hostname.trim());
         let seen = total_requests(post);
         assert!(seen >= last, "results must be cumulative");
         last = seen;

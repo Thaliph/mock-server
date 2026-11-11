@@ -608,7 +608,8 @@ impl Rig {
         dir
     }
 
-    /// The variables of the Job (spec §10.6).
+    /// The variables of the Job (spec §10.6): literal values only, so no `MIMIC_POD_NAME`; the
+    /// generator names itself by the host name, as in the Job.
     pub fn vars(&self, interval: &str) -> Vec<(String, String)> {
         let token = self.dir.path().join("token");
         [
@@ -622,10 +623,6 @@ impl Rig {
             ("MIMIC_LOAD_TOKEN_FILE", token.to_str().unwrap().to_string()),
             ("MIMIC_LOAD_REPORT_INTERVAL", interval.to_string()),
             ("MIMIC_ADMIN_ADDR", "127.0.0.1:0".to_string()),
-            (
-                "MIMIC_POD_NAME",
-                "mimic-load-3f2b8c1e0000-0-abcde".to_string(),
-            ),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
