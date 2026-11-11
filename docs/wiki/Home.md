@@ -7,7 +7,7 @@ readable through a small API.
 
 This wiki documents mimic **0.2.0-alpha.2** (pre-release).
 
-It covers features F0 to F11 and the monitoring work. The wiki is not versioned: it describes the
+The wiki is not versioned: it describes the
 release it was last published from, and `docs/wiki/` at a release tag documents that release. The reference is
 [`docs/SPEC.md`](https://github.com/Thaliph/mock-server/blob/main/docs/SPEC.md); when the wiki and
 the spec disagree, the spec wins.
@@ -50,14 +50,14 @@ the spec disagree, the spec wins.
 |---|---|
 | [Concepts](Concepts) | Components, data flow, injection, discovery and mock modes |
 | [Mock mode](Mock-mode) | Answering outbound calls from the recorded egress, and switching it live |
-| [Install](Install) | Requirements, `helm install` of a released version from OCI, verifying images and chart, upgrade, uninstall |
-| [Quick start](Quick-start) | Two Python services, discovery, the merged report |
+| [Install](Install) | Requirements, trying it on kind, `helm install` of a released version from OCI, enabling load tests, verifying images and chart, upgrade, uninstall |
+| [Quick start](Quick-start) | Two Python services, discovery, the merged report (downloads its demo files; no clone needed) |
 | [Configuration](Configuration) | `MimicWorkload` fields, Helm values, `MIMIC_*` variables |
 | [TLS interception](TLS-interception) | How it works, trust injection, exclusions, pass-through |
 | [Discovery and redaction](Discovery-and-redaction) | What is recorded, templating, limits, what is never stored |
 | [Egress endpoint](Egress-endpoint) | What each sidecar pulls from the controller |
 | [Egress aggregation](Egress-aggregation) | Outbound calls per pod, merged by the controller, outbound documents, fallback to older controllers |
-| [Reading the API](Reading-the-API) | The read API endpoints and example output |
+| [Reading the API](Reading-the-API) | The read API endpoints (reports, OpenAPI documents, load test runs) and example output |
 | [Load test](Load-test) | Load-testing a mocked deployment: the `MimicLoadTest`, safety guarantees, results |
 | [Monitoring](Monitoring) | Scrape objects, Valkey exporter, bundled Prometheus and Grafana, dashboards |
 | [Operations](Operations) | Metrics, logs, probes, sizing, Valkey, retention, scaling, shutdown |
@@ -72,5 +72,8 @@ the spec disagree, the spec wins.
 there is no upgrade from the legacy `v0.1.0`. See the
 [CHANGELOG](https://github.com/Thaliph/mock-server/blob/main/CHANGELOG.md) and the accepted limits in
 [Security](Security).
+
+For contributors: this release covers the features F0 to F11 of the delivery plan in the spec, and the
+monitoring work.
 
 Traces are out of scope; mesh traffic management is a later version.

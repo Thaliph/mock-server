@@ -1,6 +1,6 @@
 # Security
 
-Covers F0 to F5. Reference: spec §11 and §11.1 (the authoritative list of accepted limits). To report a
+The authoritative list of accepted limits is [section 11.1 of the spec](https://github.com/Thaliph/mock-server/blob/main/docs/SPEC.md#111-accepted-limits). To report a
 vulnerability, see `SECURITY.md` in the repository.
 
 ## Threat model summary
@@ -49,7 +49,7 @@ Controller (ClusterRole / Role):
 | Resource | Verbs |
 |---|---|
 | `mimicworkloads` | `get`, `list`, `watch` |
-| `mimicworkloads/status` | `patch` (F5 status) |
+| `mimicworkloads/status` | `patch` |
 | `mutatingwebhookconfigurations`, only its own by name | `get`, `list`, `watch`, `patch` (a `ValidatingAdmissionPolicy` limits changes to `caBundle`) |
 | `tokenreviews` | `create` |
 | Secrets, only `<release>-webhook-tls` and `<release>-tls-ca` in its namespace | `get`, `update` |
@@ -79,7 +79,7 @@ NetworkPolicies need a CNI that enforces them.
 
 ## Accepted limits
 
-The main ones (full list: spec §11.1):
+The main ones (full list: [the spec](https://github.com/Thaliph/mock-server/blob/main/docs/SPEC.md#111-accepted-limits)):
 
 - **Workload identity is not strongly bound.** A user who can create pods in a namespace can obtain a
   sidecar named after another Deployment of the *same namespace*, push reports into it (within store
@@ -103,13 +103,13 @@ The main ones (full list: spec §11.1):
   pod is not.
 - GitOps tools must ignore the `caBundle` of the webhook configuration and the data of the two Secrets.
 - Emptying the seed Secret rotates every root CA; running sidecars pass TLS through until recreated.
-- **Capture is not a security boundary** (F1, F3): an app container with `NET_ADMIN`, or whose image runs as
+- **Capture is not a security boundary**: an app container with `NET_ADMIN`, or whose image runs as
   UID 1337 without declaring it, escapes the redirection.
-- **Mock (F10).** Whoever may create or edit a `MimicWorkload` in a namespace decides the egress of every
+- **Mock.** Whoever may create or edit a `MimicWorkload` in a namespace decides the egress of every
   Deployment there. A mock replays samples with no state across calls. Roll back mimic only out of mock.
-- **Load tests (F11).** Requests in flight at a switch out of mock can reach real destinations; the
+- **Load tests.** Requests in flight at a switch out of mock can reach real destinations; the
   application's real datastores are loaded too; load and credentials travel in cleartext. See
   [Load test](Load-test#limits).
-- **Release (F12).** Images are rebuilt from the tagged commit; arm64 gets image checks and a scan but no kind
+- **Release.** Images are rebuilt from the tagged commit; arm64 gets image checks and a scan but no kind
   e2e; repository admins can bypass the tag ruleset (a signature names its tag); signing depends on the public
   Sigstore service. This wiki is not versioned: `docs/wiki/` at a release tag documents that release.

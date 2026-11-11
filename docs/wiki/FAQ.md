@@ -22,8 +22,8 @@ Yes, for HTTP and intercepted HTTPS: each sidecar records the calls and the cont
 deployment. See [Egress aggregation](Egress-aggregation).
 
 **Can I mock a dependency or load-test?**
-Mock mode (F10) is available: `spec.mode: mock` answers a Deployment's outbound calls from its recorded egress,
-and the real destination is not called. See [Mock mode](Mock-mode). Load testing (F11) is available too, off by default: see [Load test](Load-test).
+Mock mode is available: `spec.mode: mock` answers a Deployment's outbound calls from its recorded egress,
+and the real destination is not called. See [Mock mode](Mock-mode). Load testing is available too, off by default: see [Load test](Load-test).
 
 **Is there a UI or an OpenAPI file?**
 Yes: an OpenAPI 3.1 document and a Swagger UI per deployment. See [Reading the API](Reading-the-API).

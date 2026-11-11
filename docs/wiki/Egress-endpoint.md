@@ -1,8 +1,8 @@
 # Egress endpoint
 
-Covers F9. Reference: spec §7.7. The controller serves every sidecar the **egress** of its own deployment (the
-[outbound endpoints it aggregated](Egress-aggregation)), and the sidecar keeps it in memory. F9 changes no
-traffic: the snapshot is held, measured and summarised, never used to answer a request. From F10 it is what
+The controller serves every sidecar the **egress** of its own deployment (the
+[outbound endpoints it aggregated](Egress-aggregation)), and the sidecar keeps it in memory. This changes no
+traffic: the snapshot is held, measured and summarised, never used to answer a request. In mock mode it is what
 the sidecar mocks outbound calls from.
 
 ## What it serves
@@ -13,7 +13,7 @@ authentication: the pod's projected token, the namespace from the token). A pod 
 The answer is a **projection** of the stored outbound part, and nothing more than a mock needs:
 
 ```json
-{"format": 1, "authorities": {"users.disc-22.svc:8080": {"endpoints": [
+{"format": 1, "authorities": {"users.demo.svc:8080": {"endpoints": [
   {"method": "GET", "template": "/users/{users_id}", "grpc": false, "statuses": {"200": 12},
    "latency": {...}, "volatile": ["..."], "redacted": ["..."], "samples": [...]}]}}}
 ```
@@ -82,7 +82,7 @@ snapshot.
 have pushed (wait two push intervals), then the sidecar pulls (up to one `MIMIC_EGRESS_PULL_INTERVAL`). Check the
 `etag` and `pulled` fields, and `mimic_egress_pulls_total`.
 
-**`pulled` is empty and the pulls count `unsupported`.** The controller is older than F9 (`404`/`405`). Upgrade
+**`pulled` is empty and the pulls count `unsupported`.** The controller is too old to serve it (`404`/`405`). Upgrade
 it first.
 
 **Pulls count `too_large`.** The set is over `MIMIC_EGRESS_MAX_BYTES` (sidecar), or the controller answered `507`
@@ -100,6 +100,6 @@ fails the structural check; it is never overwritten. See [Troubleshooting](Troub
 
 ## Checking it
 
-`scripts/e2e.sh` checks that both pods of an injected `front` hold `users.disc-22.svc:8080` with its endpoints and
+`scripts/e2e.sh` checks that both pods of an injected `front` hold `users.demo.svc:8080` with its endpoints and
 the same `etag`, that a second pull gets `304`, that a pod of another deployment sees no authority, that no
 canary secret appears in `/egress` or in any log, and that the called service's access lines do not change.

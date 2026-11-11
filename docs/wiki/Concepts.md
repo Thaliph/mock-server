@@ -1,7 +1,5 @@
 # Concepts
 
-Covers F0 to F5. Reference: spec §2 to §7.
-
 ## Components
 
 | Component | Kind | Role |
@@ -98,8 +96,8 @@ selects it and the settings are merged (union).
 
 | Mode | Behaviour | Status |
 |---|---|---|
-| **discovery** (default) | Traffic is forwarded unchanged and recorded. | Available. Inbound exchanges are recorded (F4, F5). |
-| **mock** | Outbound calls are answered from the Deployment's recorded egress (spec §8) instead of being forwarded; the real destination is not called. | Available (F10). Switched with `spec.mode`, live, within one egress pull interval. See [Mock mode](Mock-mode). |
+| **discovery** (default) | Traffic is forwarded unchanged and recorded. | Available. Inbound exchanges are recorded. |
+| **mock** | Outbound calls are answered from the Deployment's recorded egress instead of being forwarded; the real destination is not called. | Available. Switched with `spec.mode`, live, within one egress pull interval. See [Mock mode](Mock-mode). |
 
 ## Valkey
 

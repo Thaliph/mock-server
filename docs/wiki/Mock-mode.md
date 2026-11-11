@@ -1,6 +1,6 @@
 # Mock mode
 
-Covers F10. Reference: spec §7, §7.4, §8, §12.11. With `spec.mode: mock` on a `MimicWorkload`, the outbound
+With `spec.mode: mock` on a `MimicWorkload`, the outbound
 calls of its Deployment's pods are answered from the egress the pods already hold (see
 [Egress endpoint](Egress-endpoint)). The real destination is not called: a load test can run against its
 own app without hitting a provider, paying for its calls or hitting its rate limits.
@@ -17,7 +17,22 @@ kubectl -n shop patch mimicworkload front --type merge -p '{"spec":{"mode":"disc
   No pod is restarted. Connections that are open at the switch follow the rules below.
 - **Convergence.** `kubectl get mimicworkload front` prints `Mode` and `Mode pods`. `status.mode` says how many
   pods follow the effective mode (`pods`) and how many still carry the other one (`otherPods`). A load test can
-  start when `otherPods` is `0` and `pods` equals the ready replicas.
+  start when `otherPods` is `0` and `pods` equals the ready replicas. To wait for it from a shell (the
+  [Quick start](Quick-start) app, `users` with 2 replicas; it takes up to one pull interval, and gives up after
+  3 minutes):
+
+  ```bash
+  kubectl -n demo patch mimicworkload users --type merge -p '{"spec":{"mode":"mock"}}'
+  for i in $(seq 60); do
+    kubectl -n demo get mimicworkload users -o json |
+      jq -e '.status.mode | .mode == "mock" and .otherPods == 0 and .pods == 2' >/dev/null && break
+    sleep 3
+  done
+  kubectl -n demo get mimicworkload users -o jsonpath='{.status.mode}{"\n"}'   # {"mode":"mock","otherPods":0,"pods":2}
+  ```
+
+  An app that makes no outbound calls, like `users`, has nothing to mock: the switch is still valid, and it is
+  what a load test needs.
 - **New pods** start in the right mode: the webhook sets `MIMIC_MODE` (and the latency factor and passthrough
   list) on the sidecar of every pod it creates in mock.
 - **Several MimicWorkloads** for one Deployment: the Deployment is in mock if any of them says so.

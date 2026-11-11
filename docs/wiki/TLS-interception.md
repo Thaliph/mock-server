@@ -1,6 +1,6 @@
 # TLS interception
 
-Covers F3. Reference: spec §5, §7.1. Only **outbound** TLS is intercepted. Inbound TLS is never
+Only **outbound** TLS is intercepted. Inbound TLS is never
 intercepted (the sidecar has no key of your app) and is seen at connection level only: SNI, bytes,
 duration. Inbound HTTPS is therefore not discovered.
 

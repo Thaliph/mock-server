@@ -1,6 +1,6 @@
 # Reading the API
 
-Covers F5 and F6. Reference: spec §7.5, §7.6, §7.4, §6. You read the discovered data as JSON, as an
+You read the discovered data as JSON, as an
 OpenAPI 3.1 document per port, or in the browser ([the UI](#the-ui)).
 
 ## Reaching it
@@ -10,8 +10,15 @@ It is not behind a Service. Reach it with a port-forward; Kubernetes RBAC on `po
 release namespace is the authentication:
 
 ```bash
-kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080
+kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080 >/dev/null &
+PF=$!
+# wait until the forward answers (a few seconds), then use it; `kill $PF` stops it
+for i in $(seq 30); do curl -fs localhost:8080/v1/workloads >/dev/null && break; sleep 1; done
 ```
+
+The controller has two HTTP ports: **8081** is the admin port (`/healthz`, `/readyz`, `/metrics`) and is on the
+`mimic-controller` Service; **8080** is this read API and the UI, on the loopback of the pod only, so forward
+`deploy/mimic-controller`, not `svc/mimic-controller`.
 
 All replicas read the same Valkey, so any pod gives the same answer. Safeguards: a peer that is not
 loopback gets `403`; so does a request whose `Host` is missing or not `localhost`, `127.0.0.1` or
@@ -27,6 +34,8 @@ deleted: data leaves by expiry ([Operations](Operations#retention)).
 | `GET /v1/workloads/<ns>/<dep>` | The same summary plus `pods`. |
 | `GET /v1/workloads/<ns>/<dep>/report` | The stored merged report. |
 | `GET /v1/workloads/<ns>/<dep>/endpoints` | Every endpoint: direction, port, method, template, exchanges, statuses, latency quantiles, hosts, last seen and the `document` that holds it. |
+| `GET /v1/workloads/<ns>/<dep>/loadtests` | The stored [load test](Load-test) runs of the deployment, newest first: `uid`, `name`, `phase`, `reason`, `start`, `end` and `total`. |
+| `GET /v1/workloads/<ns>/<dep>/loadtests/<uid>` | One run, with its `summary`: the totals and one row per endpoint (`400` for a uid that is not a UUID, `404` for an unknown one). |
 | `GET /v1/workloads/<ns>/<dep>/openapi` | The documents of the deployment: `inbound-<port>`, one per listening port. |
 | `GET /v1/workloads/<ns>/<dep>/openapi/<id>` | The OpenAPI 3.1 document `<id>` (`400` for an invalid id, `404` for one the report does not hold). |
 
@@ -120,6 +129,28 @@ curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET
 curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET.samples | length'
 ```
 
+## Load test runs
+
+The result of a [load test](Load-test) is kept in Valkey (the last 20 runs per deployment) and served under
+`loadtests`. The `<uid>` in the path is the `metadata.uid` of the `MimicLoadTest`, **not its name**: a name
+answers `400`. To list the runs, then print the per-endpoint summary of one (here the run `users-1` of the
+[Load test](Load-test) page):
+
+```bash
+curl -s localhost:8080/v1/workloads/demo/users/loadtests | jq -c '.loadtests[] | {uid, name, phase, reason}'
+uid=$(kubectl -n demo get mimicloadtest users-1 -o jsonpath='{.metadata.uid}')
+curl -s localhost:8080/v1/workloads/demo/users/loadtests/$uid |
+  jq -r '.summary.endpoints[] | [.method, .template, .requests, .rps, .latencyMicros.p99] | @tsv'
+# GET   /users/{users_id}   2200   36   2290
+# PUT   /users/{users_id}    550    9   1980
+```
+
+Every row (`summary.total` and each entry of `summary.endpoints`) holds `requests`, `missed`, `statuses` (by
+class: `2xx`, `3xx`, `4xx`, `5xx`), `errors` (by kind), `rps` and `latencyMicros` (`p50`, `p90`, `p99`, `max`,
+in microseconds). An endpoint row also has `method`, `port` and `template`. Times are UTC (RFC 3339). The
+same numbers are in `kubectl get mimicloadtest users-1 -o jsonpath='{.status.results}'` while the object
+exists; the read API keeps them after it is deleted.
+
 ## OpenAPI documents
 
 ```bash
@@ -141,6 +172,7 @@ The same listener serves a small read-only UI. With the port-forward above, open
 
 - `/ui/` lists the deployments with data;
 - `/ui/workloads/<ns>/<dep>` shows the summary, the pods, the endpoints and one link per document;
+- the deployment page also has a "Load tests" table, filled from the routes above;
 - `/ui/workloads/<ns>/<dep>/openapi/<id>` shows the document in Swagger UI, with a link to the raw JSON.
 
 Swagger UI is embedded in the controller (no CDN, nothing fetched from the internet) and has no "Try

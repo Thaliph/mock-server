@@ -23,12 +23,12 @@ apply to pods **created afterwards**: run `kubectl rollout restart` after a chan
 | `spec.tls.exclude` | list of string | empty | max 256 entries, each max 253 chars | Names never TLS-intercepted: exact host, `*.example.com` (below, not itself) or IP literal. See [TLS interception](TLS-interception). A union above 256 entries is cut to the first 256 in sorted order (WARN `tls exclude truncated`). |
 | `spec.discovery.redact` | list of string | empty | max 64 entries, each 1-64 chars of `A-Za-z0-9_-` | Extra names redacted by name, lower-cased by the webhook. See [Discovery and redaction](Discovery-and-redaction). |
 
-Status (written by the controller only, through the status subresource; F5):
+Status (written by the controller only, through the status subresource):
 
 | Field | Meaning |
 |---|---|
 | `status.discovery.endpoints.inbound` / `.outbound` | Endpoints per direction in the merged report. |
-| `status.discovery.totalEndpoints` | Inbound + outbound endpoints; the `Endpoints` column of `kubectl get` (`0` until an F8 controller applies a status). |
+| `status.discovery.totalEndpoints` | Inbound + outbound endpoints; the `Endpoints` column of `kubectl get` (`0` until the controller applies a status). |
 | `status.discovery.exchanges` | Exchanges currently held, both directions. Not a running total: it decreases when outbound scopes expire or are evicted. |
 | `status.discovery.sampleBytes` | Bytes held by samples. |
 | `status.discovery.pods` | Pods whose last push is within `MIMIC_STATUS_POD_WINDOW`. |
@@ -57,8 +57,8 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `controller.webhook.maxConnections` | `256` | 1-65535. `MIMIC_WEBHOOK_MAX_CONNECTIONS`. |
 | `controller.webhook.requestTimeout` | `5s` | `<n>s` or `<n>ms`, greater than 0. |
 | `controller.sidecarApiPort` | `8444` | Port of the sidecar API; also given to sidecars. |
-| `controller.status.interval` | `30s` | 1s-1h. `MIMIC_STATUS_INTERVAL`. (F5 status.) |
-| `controller.status.podWindow` | `5m` | 1s-24h. `MIMIC_STATUS_POD_WINDOW`. (F5 status.) |
+| `controller.status.interval` | `30s` | 1s-1h. `MIMIC_STATUS_INTERVAL`. |
+| `controller.status.podWindow` | `5m` | 1s-24h. `MIMIC_STATUS_POD_WINDOW`. |
 | `inject.initImage.repository` | `ghcr.io/thaliph/mimic-init` | |
 | `inject.initImage.tag` / `.digest` | `""` / `""` | Tag defaults to the appVersion; digest wins. |
 | `inject.sidecarResources` | requests `50m` / `64Mi`; limit memory `128Mi` | Resources of `mimic-sidecar` in injected pods (JSON in `MIMIC_INJECT_SIDECAR_RESOURCES`). |
@@ -114,7 +114,7 @@ sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 | `MIMIC_SIDECAR_API_RATE` | `10` | Requests/s per source address, burst twice that. 1-10000. |
 | `MIMIC_SIDECAR_API_MAX_REPORT` | `32Mi` | Largest push body. 64Ki-1Gi. |
 | `MIMIC_SIDECAR_API_BODY_BUDGET` | `32Mi` | Push bodies being read at once; at least `MAX_REPORT`, at most 4Gi. |
-| `MIMIC_SIDECAR_API_MAX_EGRESS` | `4Mi` | Largest egress set answered (F9); larger gets `507`. 64Ki-1Gi. See [Egress endpoint](Egress-endpoint). |
+| `MIMIC_SIDECAR_API_MAX_EGRESS` | `4Mi` | Largest egress set answered; larger gets `507`. 64Ki-1Gi. See [Egress endpoint](Egress-endpoint). |
 | `MIMIC_SIDECAR_API_EGRESS_BUDGET` | `32Mi` | Egress sets cached or being sent at once; at least `MAX_EGRESS`, at most 4Gi. |
 | `MIMIC_STORE_TTL` | `30d` | Retention after last push / last seen. 10s-365d. |
 | `MIMIC_STORE_MAX_ENDPOINTS` | `512` | Per direction and deployment. 1-10000. |
@@ -152,12 +152,12 @@ Set by the webhook; the defaults are what it sets unless noted.
 | `MIMIC_DISCOVERY_CAPTURE_BUDGET` | `8Mi` | Body bytes captured in flight and queued. 1Mi-1Gi. Not set by the webhook. |
 | `MIMIC_DISCOVERY_QUEUE` | `1024` | Records waiting for the recorder. 1-65536. Not set by the webhook. |
 | `MIMIC_DISCOVERY_PUSH_INTERVAL` | `30s` | 1s-1h. Not set by the webhook. |
-| `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | Period of the egress pull (F9). 1s-1h. Not set by the webhook. |
-| `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | Largest egress set read (F9). 64Ki-1Gi. Raising it needs a larger sidecar memory limit. Not set by the webhook. |
-| `MIMIC_MODE` | `discovery` | (F10) `discovery` or `mock` at start, set by the webhook from the effective mode. Then the controller's answers switch it live. See [Mock mode](Mock-mode). |
-| `MIMIC_MOCK_LATENCY_FACTOR` | `1` | (F10) Latency factor until the first pull answer, 0 to 100 with at most 2 fractional digits. Set by the webhook when it is not 1. |
-| `MIMIC_MOCK_PASSTHROUGH` | empty | (F10) Destinations a mocked pod still reaches for real, the `spec.tls.exclude` grammar. Set by the webhook from `spec.mock.passthrough`. |
-| `MIMIC_MOCK_MAX_PENDING` | `1024` | (F10) Mocked requests pending at once; more get `599` (`overload`). 1-65536. Sized with the 128 Mi sidecar limit. |
+| `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | Period of the egress pull. 1s-1h. Not set by the webhook. |
+| `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | Largest egress set read. 64Ki-1Gi. Raising it needs a larger sidecar memory limit. Not set by the webhook. |
+| `MIMIC_MODE` | `discovery` | `discovery` or `mock` at start, set by the webhook from the effective mode. Then the controller's answers switch it live. See [Mock mode](Mock-mode). |
+| `MIMIC_MOCK_LATENCY_FACTOR` | `1` | Latency factor until the first pull answer, 0 to 100 with at most 2 fractional digits. Set by the webhook when it is not 1. |
+| `MIMIC_MOCK_PASSTHROUGH` | empty | Destinations a mocked pod still reaches for real, the `spec.tls.exclude` grammar. Set by the webhook from `spec.mock.passthrough`. |
+| `MIMIC_MOCK_MAX_PENDING` | `1024` | Mocked requests pending at once; more get `599` (`overload`). 1-65536. Sized with the 128 Mi sidecar limit. |
 | `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Set by the webhook from `spec.discovery.redact`. At most 64 names. |
 
 ### `mimic-init` and `mimic-trust`

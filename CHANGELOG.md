@@ -7,6 +7,15 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Documentation
+
+- Wiki onboarding fixes: the load test read API (`/v1/workloads/<ns>/<dep>/loadtests`) is documented in
+  Reading the API; the Quick start downloads its demo files at the release tag and says how to wait for
+  readiness and mock mode; a "Try it on kind" section; the Load test examples reuse the Quick start app and
+  create the credentials Secret; Install says load tests are off by default and how to enable them;
+  port-forward snippets wait until the forward answers; internal feature and criterion IDs are gone from
+  the user pages.
+
 ## [0.2.0-alpha.2] - 2026-11-11
 
 ### Features

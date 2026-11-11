@@ -1,6 +1,6 @@
 # Monitoring
 
-Covers #378 to #385. Reference: spec §9, §9.1, §10.7, §11, §11.1, §12.13 (MON-01 to MON-24). mimic exposes Prometheus
+mimic exposes Prometheus
 metrics on its admin port, and the chart can scrape them. A **bundled Prometheus and Grafana** are an option for a
 demo or a dev cluster. A production install brings its own monitoring and uses the ServiceMonitor and the
 PodMonitors instead.
@@ -63,7 +63,7 @@ Five dashboards ship with the chart in `deploy/helm/mimic/dashboards/`: `mimic-c
 (traffic), `mimic-discovery`, `mimic-mock-load` (mock mode and load tests) and `mimic-valkey`. With
 `monitoring.grafana.enabled`, or `monitoring.dashboards.enabled` for your own Grafana, the chart renders one
 ConfigMap per file, labelled `grafana_dashboard: "1"`; `monitoring.dashboards.annotations` is added to each
-(for example `grafana_folder: Mimic`). They are tagged `mimic` and read the metrics of the spec's §9.
+(for example `grafana_folder: Mimic`). They are tagged `mimic` and read the metrics listed above.
 
 ## Network and an external datasource
 
@@ -89,6 +89,6 @@ monitoring:
 ## Limits
 
 - The bundled Prometheus reads pod objects, which show literal env values to it. This is accepted for a demo
-  (spec §11.1). It does not scrape the kubelet or cAdvisor, which need `nodes/proxy`: use the `process_*` series.
+  (an accepted limit, see [Security](Security#accepted-limits)). It does not scrape the kubelet or cAdvisor, which need `nodes/proxy`: use the `process_*` series.
 - The Prometheus data are lost on a pod restart. Grafana's database is in an emptyDir as well.
 - Alerting, long-term storage and ingress are out of scope.
