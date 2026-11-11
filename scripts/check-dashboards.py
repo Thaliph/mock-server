@@ -140,7 +140,7 @@ class Spec:
     def _read_metrics(self, section):
         for m in NAME_RE.finditer(section):
             labels = {x.strip() for x in (m.group(2) or "").split(",") if x.strip()}
-            self._add(m.group(1), labels, section[m.end() : m.end() + 12] == " (histogram")
+            self._add(m.group(1), labels, section[m.end() : m.end() + 14].lstrip("`").startswith(" (histogram"))
         for line in section.splitlines():
             cells = split_cells(line)
             if not cells or len(cells) not in (3, 4):
