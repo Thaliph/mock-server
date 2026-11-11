@@ -653,6 +653,17 @@ async fn ldt_08_a_results_body_is_bounded_and_checked() {
     assert_eq!(bad(serde_json::to_vec(&reason).unwrap()).await, 400);
     // Another pod's name in the body.
     assert_eq!(bad(post_body(&s.pod(1), false, 1)).await, 400);
+    // Another job, a garbage name, the hostname of another index.
+    assert_eq!(
+        bad(post_body("mimic-load-ffffffffffff-0-bcdfg", false, 1)).await,
+        400
+    );
+    assert_eq!(bad(post_body("garbage", false, 1)).await, 400);
+    assert_eq!(bad(post_body(&format!("{}-1", s.job), false, 1)).await, 400);
+    assert_eq!(
+        bad(post_body(&format!("{}-0-", s.job), false, 1)).await,
+        400
+    );
     // No Content-Length.
     let answer = call(
         &s.router,
@@ -879,4 +890,18 @@ async fn ldt_09_a_replaced_generator_pod_takes_over_the_field_of_its_index() {
         .unwrap();
     assert_eq!(posts.keys().map(String::as_str).collect::<Vec<_>>(), ["0"]);
     assert_eq!(posts["0"].results.endpoints[0].requests, 4);
+}
+
+#[tokio::test]
+async fn ldt_08_a_post_may_carry_the_indexed_job_hostname_of_the_token_pod() {
+    let s = setup(10_000).await;
+    s.admit(PLAN).await;
+    let token = s.load_token(0);
+    let hostname = format!("{}-0", s.job);
+    assert_eq!(
+        post(&s, &token, post_body(&hostname, false, 1))
+            .await
+            .status,
+        200
+    );
 }

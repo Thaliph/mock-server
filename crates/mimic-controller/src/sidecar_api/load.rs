@@ -200,6 +200,22 @@ fn worker_index(pod: &str, job: &str, workers: u64) -> Option<u64> {
     (generated_suffix(suffix) && index < workers).then_some(index)
 }
 
+/// Whether `posted` names the generator pod `pod` of the Job `job`: the pod's own name, or the
+/// hostname the Indexed Job gives it (`<job>-<index>`, what the generator reads without
+/// `MIMIC_POD_NAME`), with the same index as `pod`.
+fn same_worker(posted: &str, pod: &str, job: &str, workers: u64) -> bool {
+    let Some(index) = worker_index(pod, job, workers) else {
+        return false;
+    };
+    if worker_index(posted, job, workers) == Some(index) {
+        return true;
+    }
+    posted
+        .strip_prefix(job)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|digits| digits == index.to_string())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Params {
@@ -411,7 +427,7 @@ impl SidecarApi {
                 // Parse errors quote the offending value: they are never logged or returned.
                 let posted: Posted =
                     serde_json::from_slice(&bytes).map_err(|_| invalid("malformed"))?;
-                if posted.pod != pod {
+                if !same_worker(&posted.pod, pod, &job_name(uid), workers) {
                     return Err(invalid("pod"));
                 }
                 if posted
