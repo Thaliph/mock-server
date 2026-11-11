@@ -16,11 +16,13 @@ pub const MAX_SUMMARY: usize = 192 << 10;
 /// Runs of a deployment kept in `:loads` (spec §7.3).
 const KEEP_RUNS: usize = 20;
 /// Fields of the run hash that are not a generator pod's results.
-const FIXED: [&str; 9] = [
-    "spec", "stop", "start", "end", "phase", "reason", "plan", "ticket", "summary",
+const FIXED: [&str; 10] = [
+    "spec", "stop", "start", "end", "phase", "reason", "plan", "ticket", "summary", "pods",
 ];
 /// What stays once the run ended.
-const KEPT: [&str; 7] = ["spec", "stop", "start", "end", "phase", "reason", "summary"];
+const KEPT: [&str; 8] = [
+    "spec", "stop", "start", "end", "phase", "reason", "summary", "pods",
+];
 
 const ACTIVE: &str = "mimic:v1:loads:active";
 const RESERVED: &str = "mimic:v1:loads:reserved";
@@ -103,11 +105,16 @@ const END: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
 if redis.call('HEXISTS', KEYS[1], 'plan') == 0 then return 0 end
 local keep = {spec = 1, stop = 1, start = 1, ['end'] = 1, phase = 1, reason = 1, summary = 1}
+local plan = {plan = 1, ticket = 1}
+local pods = 0
 for _, f in ipairs(redis.call('HKEYS', KEYS[1])) do
-  if not keep[f] then redis.call('HDEL', KEYS[1], f) end
+  if not keep[f] then
+    if not plan[f] then pods = pods + 1 end
+    redis.call('HDEL', KEYS[1], f)
+  end
 end
 redis.call('HSET', KEYS[1], 'phase', ARGV[2], 'reason', ARGV[3], 'end', ARGV[4],
-  'summary', ARGV[5])
+  'summary', ARGV[5], 'pods', pods)
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
 redis.call('PEXPIRE', KEYS[1], ARGV[6])

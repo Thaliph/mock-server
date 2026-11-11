@@ -399,6 +399,29 @@ pub struct RunState {
     pub start_ms: Option<u64>,
     pub last_status_ms: Option<u64>,
     pub last_job_check_ms: Option<u64>,
+    /// The pods' results as last read, with the time of the read and the wait before the next
+    /// one (it grows while they do not change, [`POSTS_MAX_WAIT_MS`]).
+    pub posts: Option<PostsRead>,
+    /// The plan of a `Pending` run, built once however many passes the admission waits.
+    pub built: Option<Arc<Built>>,
+    /// Why the admission waits, once logged for the outage.
+    pub waiting: Option<&'static str>,
+}
+
+/// The longest wait between two reads of the pods' results of a run (spec §7.8).
+pub(crate) const POSTS_MAX_WAIT_MS: u64 = 4_000;
+
+pub struct PostsRead {
+    pub at_ms: u64,
+    pub wait_ms: u64,
+    pub posts: BTreeMap<String, crate::store::load::StoredPost>,
+}
+
+/// A plan as serialised for the store, with its ports and the skipped endpoints.
+pub struct Built {
+    pub json: String,
+    pub ports: Vec<u16>,
+    pub skipped: BTreeMap<String, u64>,
 }
 
 /// The reconciler.
