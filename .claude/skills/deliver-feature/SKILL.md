@@ -58,6 +58,11 @@ Split into stacked PRs only when the diff exceeds ~1500 lines.
 - `ship.sh <pr>` (this directory) is the merge gate of step 4: it waits for `ci-ok`, checks the
   last `mimic-review` marker is `APPROVE` and newer than the head, then merges. Run it in the
   background. `IGNORE=<check name>` only when the maintainer decided a check does not block.
+- Pre-push check of the assert messages: `scripts/check-test-messages.sh origin/main` (the lint
+  job runs it too). It fails on an added `assert!`/`assert_eq!`/`prop_assert*!` line whose message
+  interpolates a secret-like or raw value (`{raw}`, `{json}`, `{body}`, `{text}`, `{line}`,
+  `{canary}`, `{token}`, `{jwt}`, `{secret}`, `{password}`); pre-existing hits on main are not
+  reported. Its self-test: `bash scripts/test_check_test_messages.sh`.
 - `test-valkey.sh` starts the local Valkey that `cargo test` needs and prints
   `export MIMIC_TEST_VALKEY_URL=…`; pass that URL in every agent brief.
 - Local kind e2e (`scripts/e2e.sh`, `scripts/e2e-load.sh`):
