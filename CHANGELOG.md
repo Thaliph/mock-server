@@ -18,10 +18,12 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Fixed
 
-- F11 follow-ups: load test and mock fixes from the reviews of steps 7 to 9 (#420, via #425 and #426).
-- The distroless base image is bumped to a digest without the `zlib1g` finding, and its Trivy
-  exceptions are removed (#371, via #423).
-- `jsonschema` 0.60.2 (#396).
+- Load test reconciler and read API follow-ups of the F11 reviews (#420, via #425 and #426): the
+  generator policy pins `fsGroup` and the credentials Secret mode, the final verdict re-reads the
+  posts, outages are logged once per reason, and the e2e checks are tighter.
+- The distroless base image moves to a rebuild with the fixed `zlib1g`, and the two Trivy exceptions
+  are removed (#371, via #423).
+- Dependency: `jsonschema` 0.59.0 to 0.60.2, which fixes a stack overflow on `$ref` cycles (#396).
 
 ### Upgrade notes
 

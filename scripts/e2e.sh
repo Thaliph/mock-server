@@ -1506,6 +1506,21 @@ for p in $dsc_pods; do
     if found -F "$c" "$WORK/discovery-$p.json"; then fail "dsc_22: a canary appears in the /discovery of $p"; fi
   done
 done
+# PLH-10: a request to /reset/<JWT-shaped value> through the injected users app. Its sidecar's access line shows
+# /reset/mimic-jwt and never the JWT (the app's own log holds the raw path and is not read here).
+b64u() { printf '%s' "$1" | base64 -w0 | tr '+/' '-_' | tr -d '='; }
+plh_jwt="$(b64u '{"alg":"HS256","typ":"JWT"}').$(b64u "{\"sub\":\"plh10-$(openssl rand -hex 6)\"}").$(openssl rand -hex 16)"
+kubectl -n disc-22-client exec client -- python3 -c '
+import sys, urllib.error, urllib.request
+try:
+    urllib.request.urlopen("http://users.disc-22.svc:8080/reset/" + sys.argv[1], timeout=10).read()
+except urllib.error.HTTPError:
+    pass
+' "$plh_jwt" || fail "plh_10: the request to /reset/<JWT> failed"
+sleep 2
+for p in $dsc_pods; do kubectl -n disc-22 logs "$p" -c mimic-sidecar --tail=-1; done > "$WORK/plh10-sidecar.log"
+found -F -e '"path":"/reset/mimic-jwt"' "$WORK/plh10-sidecar.log" || fail "plh_10: no sidecar access line for /reset/mimic-jwt: not found"
+if found -F -e "$plh_jwt" "$WORK/plh10-sidecar.log"; then fail "plh_10: the JWT is in a sidecar log: found"; fi
 {
   for p in $dsc_pods; do kubectl -n disc-22 logs "$p" --all-containers; done
   kubectl -n disc-22-client logs deploy/front --all-containers
@@ -2586,13 +2601,14 @@ new_call=$(kubectl -n mck-19 exec "$new_pod" -c app -- python3 -c '
 import json, urllib.request, urllib.error
 try:
     with urllib.request.urlopen("http://users.disc-22.svc:8080/users/340001", timeout=20) as r:
-        body = r.read(); print(json.dumps({"status": r.status, "match": r.headers.get("x-mimic-match"), "legacy": b"<redacted>" in body}))
+        body = r.read(); print(json.dumps({"status": r.status, "match": r.headers.get("x-mimic-match"), "legacy": b"<redacted>" in body, "cookie": r.headers.get("set-cookie")}))
 except urllib.error.HTTPError as e:
     print(json.dumps({"status": e.code, "match": None}))
 ' 2>&1) || fail "mck_19: the first call of $new_pod failed"
 jq -e '.status == 200 and (.match == "exact" or .match == "endpoint" or .match == "fallback")' <<< "$new_call" >/dev/null \
   || fail "mck_19: the first call of $new_pod was not answered by mock: $new_call"
-jq -e '.legacy == false' <<< "$new_call" >/dev/null || fail "mck_19: a mock answer carries <redacted> (PLH-10)"
+jq -e '.legacy == false and .cookie == "sid=mimic-cookie"' <<< "$new_call" >/dev/null \
+  || fail "mck_19: a mock answer carries <redacted>, or its set-cookie is not sid=mimic-cookie (PLH-07, PLH-10)"
 [[ $(mck_users 'true') == "$new_users_before" ]] || fail "mck_19: users logged the first call of $new_pod"
 
 log "mck_19: spec.mode discovery brings the calls back to users and the provider, and the live connection is forwarded again"
