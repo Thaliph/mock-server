@@ -2702,7 +2702,7 @@ if grep -qF -- "$exporter_pw" <<<"$exporter_body"; then fail "mon_02: the export
 # MON-13: the exporter's last scrape has a TYPE line for every series of the exporter list of §9.
 missing=$(mon02_missing "$exporter_body" redis_up redis_uptime_in_seconds redis_instance_info redis_memory_used_bytes \
   redis_memory_max_bytes redis_mem_fragmentation_ratio redis_evicted_keys_total redis_expired_keys_total \
-  redis_commands_processed_total redis_commands_duration_seconds_total redis_connected_clients \
+  redis_commands_processed_total redis_commands_total redis_commands_duration_seconds_total redis_connected_clients \
   redis_rejected_connections_total redis_db_keys redis_aof_last_write_status | tr '\n' ' ')
 [[ -z $missing ]] || fail "mon_02: the exporter's /metrics lacks the TYPE line of: $missing"
 
