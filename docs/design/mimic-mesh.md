@@ -531,7 +531,10 @@ set), the `x-mimic-error` header of upstream responses.
   a destination reveals that Service's ports and pod IPs to the namespace's sidecars (not to the
   app): **accepted limit** — pod IPs are not secrets, NetworkPolicy stays the access control,
   and DNS already reveals ClusterIPs. Faults and admission limits can only degrade the
-  attacker's own Services.
+  attacker's own Services. A mirror sends copies of requests, credentials included, to a
+  backend chosen by the route's author: a producer route's author owns the Service and already
+  receives those requests; a consumer route's author only mirrors its own namespace's calls
+  (accepted limit, written in the spec by issue 15).
 - *On the network*: mesh traffic is cleartext pod to pod as without mimic (no mTLS, non-goal);
   the view travels over the verified sidecar API TLS; a forged view is impossible without the
   controller's certificate.
