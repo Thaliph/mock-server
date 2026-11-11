@@ -9,6 +9,9 @@ The read API is plain HTTP on `MIMIC_UI_ADDR`, default `127.0.0.1:8080` **inside
 It is not behind a Service. Reach it with a port-forward; Kubernetes RBAC on `pods/portforward` in the
 release namespace is the authentication:
 
+If a forward on 8080 from an earlier step is still running, a new one fails with "address already in use" while
+`curl` quietly talks to the old one. Check `jobs` first, or stop it with `pkill -f 'port-forward.*8080'`.
+
 ```bash
 kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080 >/dev/null &
 PF=$!
@@ -36,7 +39,7 @@ deleted: data leaves by expiry ([Operations](Operations#retention)).
 | `GET /v1/workloads/<ns>/<dep>/endpoints` | Every endpoint: direction, port, method, template, exchanges, statuses, latency quantiles, hosts, last seen and the `document` that holds it. |
 | `GET /v1/workloads/<ns>/<dep>/loadtests` | The stored [load test](Load-test) runs of the deployment, newest first: `uid`, `name`, `phase`, `reason`, `start`, `end` and `total`. |
 | `GET /v1/workloads/<ns>/<dep>/loadtests/<uid>` | One run, with its `summary`: the totals and one row per endpoint (`400` for a uid that is not a UUID, `404` for an unknown one). |
-| `GET /v1/workloads/<ns>/<dep>/openapi` | The documents of the deployment: `inbound-<port>`, one per listening port. |
+| `GET /v1/workloads/<ns>/<dep>/openapi` | The documents of the deployment: `inbound-<port>`, one per listening port, and `outbound-<authority>`, one per destination it called (`front` has `outbound-users.demo.svc:8080`). |
 | `GET /v1/workloads/<ns>/<dep>/openapi/<id>` | The OpenAPI 3.1 document `<id>` (`400` for an invalid id, `404` for one the report does not hold). |
 
 Status codes: `404` deployment without data, `400` a name that is not DNS-1123, `503` Valkey
@@ -123,8 +126,9 @@ Useful `jq` one-liners:
 R=localhost:8080/v1/workloads/demo/users/report
 # methods and status counts under /users/{param}
 curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints | map_values(.statuses)'
-# redacted fields
-curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET.observed.fields.fields | map_values(select(.redacted)) | keys'
+# redacted fields (with the Quick start traffic: the GET shows only the response cookie, the PUT also the
+# Authorization header and the password, the only requests that sent them)
+curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints | map_values(.observed.fields.fields | map_values(select(.redacted)) | keys)'
 # samples of one endpoint
 curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET.samples | length'
 ```
@@ -211,7 +215,9 @@ The summary is also in `kubectl get mimicworkload` and `status.discovery` ([Conf
 ## Clean up
 
 The last step of Get started. Stop a port-forward you still have running (Ctrl-C, or `kill $PF` in the shell that
-started it), then delete the demo. Deleting the namespace is enough, whatever mode the apps are in:
+started it), then delete the demo. Deleting the namespace is enough, whatever mode the apps are in. The read API keeps the `demo/*` entries until
+they expire (`MIMIC_STORE_TTL`, 30 days after the last push by default, [Operations](Operations#retention));
+there is nothing to do about it:
 
 ```bash
 kubectl delete namespace demo

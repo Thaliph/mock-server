@@ -151,6 +151,9 @@ The read API listens on port 8080, on the loopback of each controller pod only (
 the one on the Service). Reach it with a port-forward (Kubernetes RBAC on `pods/portforward` in the release
 namespace is the authentication); the loop waits until the forward answers:
 
+If a forward on 8080 from an earlier step is still running, a new one fails with "address already in use" while
+`curl` quietly talks to the old one. Check `jobs` first, or stop it with `pkill -f 'port-forward.*8080'`.
+
 ```bash
 kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080 >/dev/null &
 PF=$!
@@ -230,7 +233,7 @@ front   discovery   4           1      25s         1
 users   discovery   2           2      25s         2
 ```
 
-`MODE PODS` is the number of pods that follow the mode ([Mock mode](Mock-mode)). `ENDPOINTS` is the inbound endpoint count, `PODS` the pods that pushed within the last 5 minutes
+`MODE PODS` is the number of pods that follow the mode ([Mock mode](Mock-mode)). `ENDPOINTS` is the count of inbound and outbound endpoints together (`front` shows 4: 2 it exposes and 2 it calls), `PODS` the pods that pushed within the last 5 minutes
 (`MIMIC_STATUS_POD_WINDOW`), `LAST PUSH` the age of the last applied push. The full status of `users` (`front` also has
 `endpoints.outbound: 2`):
 
@@ -247,7 +250,7 @@ kubectl -n demo get mimicworkload users -o jsonpath='{.status}' | jq
 The port-forward is no longer needed; stop it (later pages start it again when they need it):
 
 ```bash
-kill $PF 2>/dev/null
+kill $PF; wait $PF 2>/dev/null
 ```
 
 ## Next

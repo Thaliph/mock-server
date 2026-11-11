@@ -62,10 +62,11 @@ spec:
   rate: 50
   rampUp: 10s
 EOF
-kubectl -n demo get mimicloadtest front-1 -w
+kubectl -n demo wait mimicloadtest/front-1 --for=jsonpath='{.status.phase}'=Succeeded --timeout=5m
 ```
 
-Stop the watch with Ctrl-C once `Phase` is `Succeeded`, then count the access lines of `users` again: the number
+To watch it live instead, `kubectl -n demo get mimicloadtest front-1 -w` (Ctrl-C to stop). When `Phase` is
+`Succeeded`, count the access lines of `users` again: the number
 is the same, the load test never reached it (it would be the same with `users` scaled to 0). The plan comes
 from the inbound endpoints of `front`: `GET` and `PUT /front/users/{users_id}`. All the fields:
 
@@ -147,14 +148,14 @@ Without either, it answers `4xx`.
          - {field: header/authorization, key: token}
          - {field: body/password, key: password}
    EOF
-   kubectl -n demo get mimicloadtest front-2 -w     # runs until Ctrl-C; stop it once Phase is Succeeded
+   kubectl -n demo wait mimicloadtest/front-2 --for=jsonpath='{.status.phase}'=Succeeded --timeout=5m
    ```
 
    **Checking that the credential was used.** Only a request whose recorded sample carried the field gets the
    Secret value: in the Quick start only the 5 `PUT`s sent an `Authorization` header (and a `password` in
-   the body), so the `GET`s are unchanged. `front` does not check authentication, so the two runs look the
-   same; to see a difference, use an app that rejects a wrong token (the run without credentials then counts `4xx` on those endpoints, the run
-   with them `2xx`). The token itself is never in `status`, in the read API or in the logs.
+   the body), so the `GET`s are unchanged. The demo apps do not check authentication, so a run with and
+   without credentials look the same here. With your own app, compare `statuses` in the results of the two runs
+   (for example `4xx` for 401s without credentials, `2xx` with them) to confirm that the credentials work. The token itself is never in `status`, in the read API or in the logs.
 
    `field` names the value to replace: `header/<lower-case header name>`, `query/<key>` or
    `body<JSON pointer>` (for example `body/card/token`); up to 32 distinct fields, each with the Secret `key`

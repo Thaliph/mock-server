@@ -51,11 +51,13 @@ kubectl -n demo exec deploy/front -c app -- python3 -c '
 import urllib.request
 r = urllib.request.urlopen("http://users.demo.svc:8080/users/7", timeout=10)
 print(r.status, r.headers.get("x-mimic-match"), r.read().decode())'
-# 200 endpoint {"id": "...", "name": "user ...", ...}
+# 200 fallback {"id": "...", "name": "user ...", ...}
 ```
 
 The answer is a recorded one: its body is a sample of `GET /users/{users_id}`, so the id may not be the one
-you asked for. `x-mimic-match` (`exact`, `endpoint` or `fallback`) says it was mocked, and is visible to the
+you asked for, and it is serialised again (compact, sorted keys), not byte for byte. `x-mimic-match` says it
+was mocked, and which tier matched: `exact`, `endpoint` or `fallback`, depending on how close your request is
+to a recorded one. With the Quick start traffic and an id it never sent, you get `fallback`. It is visible to the
 app that made the call, here `front`'s app. If the answer is `599` with `x-mimic-miss: 1` instead, the sidecar
 has not pulled the recording yet: wait a minute and retry. The same fact is in the access log of `front`'s
 sidecar, the line has a `mock` field:
