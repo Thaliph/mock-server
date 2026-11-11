@@ -622,8 +622,11 @@ mod redaction {
         let mut report = Report::new(None);
         report.record(&super::limits(50), &Redactor::default(), &exchange);
         let json = report.to_json().unwrap();
-        assert!(!json.contains(JWT), "{json}");
-        assert!(json.contains("/pkg.Svc/mimic-jwt"), "{json}");
+        assert!(!json.contains(JWT), "the JWT survives in the report");
+        assert!(
+            json.contains("/pkg.Svc/mimic-jwt"),
+            "the gRPC path is not redacted to mimic-jwt"
+        );
         // Not templated: an id-like segment stays literal.
         report.record(
             &super::limits(50),
