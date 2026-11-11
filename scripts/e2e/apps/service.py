@@ -43,6 +43,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _reply(self, status, body, content_type="application/json"):
         self.send_response(status)
+        if not UPSTREAM and self.path.startswith("/users/") and status == 200:
+            self.send_header("Set-Cookie", "sid=e2e-session")  # recorded as sid=mimic-cookie, replayed by mock (PLH-07)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

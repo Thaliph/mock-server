@@ -95,7 +95,7 @@ tracking, with `redacted` marks), `samples` and `last_seen`. Trimmed excerpt of 
         "fields": {"fields": {"request.header/authorization": {"n": 4, "redacted": true}}}},
       "samples": {"814356248389461051": {
         "request":  {"method": "GET", "path": "/users/4", "query": [],
-                     "headers": [["authorization", "Bearer <redacted>"], ["accept", "application/json"]],
+                     "headers": [["authorization", "Bearer mimic-token"], ["accept", "application/json"]],
                      "body": null},
         "response": {"status": 200, "headers": [["content-type", "application/json"]],
                      "body": {"media": "application/json",
@@ -131,7 +131,7 @@ The document is inferred from observed traffic and built from the stored, redact
 are the discovered templates (`/users/{users_id}`), with parameters, bodies and responses taken from
 the recorded schemas and up to 20 samples as `examples`. `servers` lists the hosts the sidecar saw
 (documentation of how to reach the service; nothing calls it), `security` follows the `Authorization`
-schemes seen (the credential itself is never stored), and `x-mimic-*` fields carry counts, latency
+schemes seen (the credential itself is never stored: samples show `Bearer mimic-token`), and `x-mimic-*` fields carry counts, latency
 quantiles, hosts and last-seen days. Import the JSON into any OpenAPI 3.1 tool.
 
 ## The UI

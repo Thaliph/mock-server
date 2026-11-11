@@ -7,7 +7,8 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Number, Value};
 
 use super::plan::{Body, Endpoint, Plan, Sample};
-use crate::discovery::redact::MARKER;
+use crate::discovery::placeholder::is_marked;
+use crate::discovery::redact::{MARKER, Redactor};
 
 /// What the caller supplies besides the plan. `Debug` prints the Secret's key names only.
 #[derive(Clone)]
@@ -206,6 +207,10 @@ fn clock(now_ms: u64) -> (String, u64, u64) {
 
 /// A fresh value shaped like `value`.
 fn fresh_text(value: &str, rng: &mut Rng, now_ms: u64) -> String {
+    // A placeholder is a credential field: it is never refreshed.
+    if is_marked(value) {
+        return value.to_string();
+    }
     let b = value.as_bytes();
     let (date, secs, ms) = clock(now_ms);
     if let Some(fraction) = datetime_fraction(b) {
@@ -477,6 +482,35 @@ struct Built {
     body: Vec<u8>,
 }
 
+/// A sample written up to F12 holds the legacy marker: its values become the placeholders their
+/// fields give (spec §6), so that no request holds `<redacted>`.
+fn upgrade(parts: &mut Parts, content: &mut Option<Content>) {
+    let redactor = Redactor::default();
+    for (name, value) in &mut parts.headers {
+        if value.contains(MARKER) {
+            *value = redactor.header(name, value);
+        }
+    }
+    for (key, value) in &mut parts.query {
+        if value.contains(MARKER) {
+            *value = redactor.field(key, value);
+        }
+    }
+    match content {
+        Some(Content::Json(_, value)) if value.to_string().contains(MARKER) => {
+            redactor.json(value);
+        }
+        Some(Content::Form(_, pairs)) => {
+            for (key, value) in pairs {
+                if value.contains(MARKER) {
+                    *value = redactor.field(key, value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn build(
     plan: &Plan,
     endpoint: &Endpoint,
@@ -497,6 +531,7 @@ fn build(
         Some(Body::Form { media, pairs }) => Some(Content::Form(media, pairs)),
         None => None,
     };
+    upgrade(&mut parts, &mut content);
     volatile(endpoint, &mut parts, &mut content, rng, ctx.now_ms);
     credentials(plan, ctx, &mut parts, &mut content)?;
     let body = match &content {

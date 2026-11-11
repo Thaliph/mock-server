@@ -445,7 +445,7 @@ async fn egr_17_no_canary_leaves_the_sidecar_from_cleartext_outbound_exchanges()
             .to_vec(),
     )
     .unwrap();
-    assert!(served.contains("<redacted>"));
+    assert!(served.contains("mimic-secret"));
     // The names stay, the values do not.
     for name in ["x-api-key", "ocp-apim-subscription-key", "x-custom"] {
         assert!(served.contains(name));

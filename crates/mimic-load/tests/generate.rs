@@ -418,3 +418,62 @@ fn generator_exited(generator: &mut mimic_runtime::testing::Process) -> Option<b
     }
     Some(generator.wait_exit(Duration::from_secs(5)).success())
 }
+
+/// A plan whose only sample carries the placeholders the recorder writes.
+fn placeholder_plan() -> Plan {
+    let mut plan = simple_plan();
+    let sample = &mut plan.endpoints[0].samples[0];
+    sample.headers = vec![(
+        "authorization".to_string(),
+        "Bearer mimic-token".to_string(),
+    )];
+    sample.query = vec![("api_key".to_string(), "mimic-api-key".to_string())];
+    plan
+}
+
+#[test]
+fn plh_09_a_run_without_credentials_sends_the_placeholders() {
+    let rig = Rig::new(
+        &placeholder_plan(),
+        &Params::closed(2, 2_000),
+        &[Probe::Good],
+    );
+    let mut generator = rig.spawn("1s", &[]);
+    assert!(generator.wait_exit(Duration::from_secs(20)).success());
+    let seen = rig.targets[0].state.seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|s| {
+        s.headers["authorization"] == "Bearer mimic-token"
+            && s.target.contains("api_key=mimic-api-key")
+    }));
+}
+
+#[test]
+fn plh_09_credentials_replace_only_the_supplied_field() {
+    let mut plan = placeholder_plan();
+    plan.credentials = vec![credential("header/authorization", "token")];
+    let rig = Rig::new(&plan, &Params::closed(2, 4_000), &[Probe::Good]);
+    let dir = rig.credentials_dir();
+    std::fs::write(dir.join("token"), format!("Bearer {CANARY}\n")).unwrap();
+    let mut generator = rig.spawn(
+        "1s",
+        &[
+            ("MIMIC_LOAD_CREDENTIALS_DIR", dir.to_str().unwrap()),
+            ("MIMIC_LOG", "debug"),
+        ],
+    );
+    let admin = generator.admin_addr();
+    std::thread::sleep(Duration::from_millis(2_000));
+    let metrics = http_get(admin, "/metrics").1;
+    assert!(generator.wait_exit(Duration::from_secs(20)).success());
+    let seen = rig.targets[0].state.seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|s| {
+        s.headers["authorization"] == format!("Bearer {CANARY}")
+            && s.target.contains("api_key=mimic-api-key")
+    }));
+    drop(seen);
+    let mut outputs = generator.lines().to_vec();
+    outputs.push(metrics);
+    assert!(outputs.iter().all(|o| !o.contains(CANARY)));
+}

@@ -13,7 +13,8 @@ use super::check::Violation;
 use super::observed::{
     Content, MAX_BODY, Parsed, Seen, body_shape, observe_leaves, observe_pairs, parsed_media,
 };
-use super::redact::{self, MARKER, Redactor};
+use super::placeholder::Placeholder;
+use super::redact::{self, Redactor};
 use super::report::Exchange;
 use super::schema::{Pair, header_pairs, query_pairs};
 use super::volatile::Volatility;
@@ -150,7 +151,7 @@ impl Body {
         let pairs = form_pairs(&value);
         // A form that does not have the shape the recorder gives it is not kept.
         if value.as_array().is_none_or(|a| a.len() != pairs.len()) {
-            self.value = Text::new(&Value::String(MARKER.to_string()));
+            self.value = Text::new(&Value::String(Placeholder::Secret.to_string()));
             return;
         }
         self.value = Text::new(&Value::Array(
@@ -357,7 +358,11 @@ impl Sample {
 
     /// The §6 redaction again on the path, query, headers and bodies. True when something
     /// changed.
-    fn redact(&mut self, request_redactor: &Redactor, response_redactor: &Redactor) -> bool {
+    pub(super) fn redact(
+        &mut self,
+        request_redactor: &Redactor,
+        response_redactor: &Redactor,
+    ) -> bool {
         let before = (self.request.clone(), self.response.clone());
         self.request.path = redact::path(&self.request.path);
         for (key, value) in &mut self.request.query {
@@ -385,7 +390,7 @@ impl Sample {
 
     /// Size and content hash from the content, as `new` computes them: nothing a pod declares
     /// is trusted.
-    fn reseal(&mut self) -> u64 {
+    pub(super) fn reseal(&mut self) -> u64 {
         // Plain data: serialisation cannot fail.
         let content = serde_json::to_vec(&(&self.request, &self.response)).unwrap_or_default();
         let head_ms = std::mem::take(&mut self.head_ms);
@@ -514,6 +519,10 @@ impl Samples {
             let original = sample.clone();
             if sample.redact(request_redactor, response_redactor) {
                 fields.extend(original.volatility().changed(&sample.volatility()));
+            }
+            // A body that grows past the limit is not kept: the sample goes with it.
+            if sample.check().is_err_and(|v| v == Violation::BodySize) {
+                continue;
             }
             let hash = sample.reseal();
             self.absorb(hash, sample);

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::discovery::placeholder::is_marked;
 use crate::discovery::redact::MARKER;
 use crate::discovery::report::{Direction, Report};
 use crate::discovery::sample::{self as recorded, Payload};
@@ -134,13 +135,12 @@ fn token(key: &str) -> String {
 /// Returns `false` when an object key holds the marker: a name cannot be supplied.
 fn marked_leaves(pointer: &str, value: &Value, out: &mut BTreeSet<String>) -> bool {
     match value {
-        Value::String(s) if s.contains(MARKER) => {
+        Value::String(s) if is_marked(s) => {
             out.insert(format!("body{pointer}"));
         }
         Value::Object(map) => {
             for (k, v) in map {
-                if k.contains(MARKER) || !marked_leaves(&format!("{pointer}/{}", token(k)), v, out)
-                {
+                if is_marked(k) || !marked_leaves(&format!("{pointer}/{}", token(k)), v, out) {
                     return false;
                 }
             }
@@ -160,23 +160,23 @@ fn marked_leaves(pointer: &str, value: &Value, out: &mut BTreeSet<String>) -> bo
 /// The credential fields a sample needs, or `None` when it needs one that cannot be supplied
 /// (a redacted path segment, header name, query key, form key or JSON object key).
 fn needs(sample: &recorded::Sample) -> Option<BTreeSet<String>> {
-    if sample.path().contains(MARKER) {
+    if is_marked(sample.path()) {
         return None;
     }
     let mut out = BTreeSet::new();
     for (name, value) in sample.request_headers() {
-        if name.contains(MARKER) {
+        if is_marked(name) {
             return None;
         }
-        if value.contains(MARKER) {
+        if is_marked(value) {
             out.insert(format!("header/{name}"));
         }
     }
     for (key, value) in sample.query() {
-        if key.contains(MARKER) {
+        if is_marked(key) {
             return None;
         }
-        if value.contains(MARKER) {
+        if is_marked(value) {
             out.insert(format!("query/{key}"));
         }
     }
@@ -189,10 +189,10 @@ fn needs(sample: &recorded::Sample) -> Option<BTreeSet<String>> {
         }
         Some((_, Payload::Form(pairs))) => {
             for (key, value) in pairs {
-                if key.contains(MARKER) {
+                if is_marked(&key) {
                     return None;
                 }
-                if value.contains(MARKER) {
+                if is_marked(&value) {
                     out.insert(format!("body/{key}"));
                 }
             }
@@ -245,7 +245,6 @@ pub fn plan(report: &Report, spec: &Spec) -> Planned {
 
 /// `plan` with an explicit byte limit, not raised to `MIN_PLAN` (tests).
 pub(super) fn build(report: &Report, spec: &Spec, max_plan: usize) -> Planned {
-    let supplied: BTreeSet<&str> = spec.credentials.iter().map(|c| c.field.as_str()).collect();
     let mut skipped: BTreeMap<&'static str, u64> = BTreeMap::new();
     // Usable endpoints in report order.
     let mut usable: Vec<Endpoint> = Vec::new();
@@ -286,11 +285,11 @@ pub(super) fn build(report: &Report, spec: &Spec, max_plan: usize) -> Planned {
             if opaque_body(sample) {
                 continue;
             }
+            // A credential field is sent as its placeholder, or the Secret's value; only a
+            // name that cannot be supplied makes the sample unusable.
             match needs(sample) {
-                Some(n) if n.iter().all(|f| supplied.contains(f.as_str())) => {
-                    samples.push(plan_sample(hash, sample));
-                }
-                _ => credential_refused = true,
+                Some(_) => samples.push(plan_sample(hash, sample)),
+                None => credential_refused = true,
             }
         }
         if samples.is_empty() {

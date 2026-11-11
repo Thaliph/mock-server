@@ -181,7 +181,11 @@ fn shr_02_a_detected_form_in_an_allowlisted_header_is_redacted_by_value() {
             .find(|(n, _)| n == "user-agent")
             .unwrap()
             .1;
-        assert_eq!(ua_value, MARKER, "form {ua}");
+        assert_eq!(
+            ua_value,
+            ["mimic-jwt", "mimic-api-key", "mimic-token", "mimic-card"][ua],
+            "form {ua}"
+        );
     }
 }
 
@@ -213,7 +217,7 @@ fn shr_02_response_side_canaries_are_redacted() {
         .iter()
         .find(|(n, _)| n == "x-api-key")
         .unwrap();
-    assert_eq!(api_key.1, MARKER);
+    assert_eq!(api_key.1, "mimic-api-key");
     assert!(hash_free(&r.to_json().unwrap(), canary));
 }
 
@@ -233,8 +237,8 @@ fn shr_02_outbound_response_and_inbound_request_keep_their_values() {
     let mut r = Report::from_json(&text).unwrap();
     r.re_redact(&Redactor::default());
     let (_, s) = r.endpoints()[0].stats.samples().iter().next().unwrap();
-    assert_eq!(s.request_headers()[0].1, MARKER, "outbound request");
-    assert_eq!(s.query()[0].1, MARKER, "outbound request ?key=");
+    assert_eq!(s.request_headers()[0].1, "mimic-secret", "outbound request");
+    assert_eq!(s.query()[0].1, "mimic-api-key", "outbound request ?key=");
     assert_eq!(s.response_headers()[0].1, "v", "outbound response");
 }
 

@@ -7,6 +7,7 @@ pub mod histogram;
 pub mod observed;
 pub mod openapi;
 mod openapi_parts;
+pub mod placeholder;
 pub mod redact;
 pub mod report;
 pub mod sample;
@@ -37,6 +38,8 @@ mod tests_openapi_ops;
 mod tests_outbound_openapi;
 #[cfg(test)]
 mod tests_outbound_view;
+#[cfg(test)]
+mod tests_plh;
 #[cfg(test)]
 mod tests_pul;
 #[cfg(test)]

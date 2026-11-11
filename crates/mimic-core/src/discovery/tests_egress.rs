@@ -602,3 +602,22 @@ fn egr_02_origin_dst_writes_port_zero_as_one_like_the_scope_key() {
     );
     assert_eq!(Report::from_json(&r.to_json().unwrap()).unwrap(), r);
 }
+
+/// The fuzz invariant (PUL-20): a projected set reads back byte for byte, also when the report
+/// still holds the legacy marker of up to F12 (the projection is the upgraded form).
+#[test]
+fn plh_07_a_projection_of_a_legacy_report_reads_back_byte_for_byte() {
+    use super::egress::EgressSet;
+    let path = format!(
+        "{}/tests/fixtures/f12-golden/single-below.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let report = Report::from_json(&std::fs::read_to_string(path).expect("fixture")).expect("ok");
+    assert!(report.to_json().expect("json").contains("<redacted>"));
+    let set = EgressSet::project(&report);
+    let json = set.to_json().expect("serialises");
+    let back = EgressSet::from_json(&json).expect("accepted");
+    assert_eq!(back.to_json().expect("serialises"), json);
+    // Only the authority hosts keep the marker.
+    assert!(!json.replace("<redacted>:", "").contains("<redacted>"));
+}

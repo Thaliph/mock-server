@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::observed::Observation;
 use super::openapi::{DESCRIPTION, document};
-use super::redact::{MARKER, Redactor};
+use super::redact::Redactor;
 use super::report::{Direction, Exchange, Report, merge};
 use super::schema::Schema;
 use super::tests_openapi::{LIMITS, assert_valid, errors, refs_ok};
@@ -252,7 +252,7 @@ fn ui_03_volatile_and_redacted_flags() {
         .values()
         .map(|e| &e["value"])
         .collect();
-    assert_eq!(values, [&json!(MARKER)]);
+    assert_eq!(values, [&json!("mimic-token")]);
     let plain = parameter(o, "query", "plain");
     assert!(plain.get("x-mimic-volatile").is_none());
     assert!(plain.get("x-mimic-redacted").is_none());
@@ -462,7 +462,7 @@ fn ui_05_security_scheme_outside_the_token_set_is_ignored() {
         .to_json()
         .expect("serialises");
     for scheme in ["Bea_rer", "Béarer", "Be\\u0020arer"] {
-        let forged = json.replace("Bearer <redacted>", &format!("{scheme} <redacted>"));
+        let forged = json.replace("Bearer mimic-token", &format!("{scheme} mimic-token"));
         let d = doc(&Report::from_json(&forged).expect("parses"));
         assert!(d.get("components").is_none(), "{scheme}");
         assert!(op(&d, "/p", "get").get("security").is_none(), "{scheme}");
@@ -525,14 +525,14 @@ proptest! {
         word in "[a-z0-9]{10,24}",
         registered in prop::sample::select(vec!["Bearer", "Basic"]),
     ) {
-        // An older or faulty sidecar may store `authorization: <word> <redacted>`.
+        // An older or faulty sidecar may store `authorization: <word> mimic-auth`.
         let canary = format!("cnry{word}");
         let stored = report_of(&[authorized(&format!("{registered} abc"))])
             .to_json()
             .expect("serialises");
         let forged = stored.replace(
-            &format!("{registered} <redacted>"),
-            &format!("{canary} <redacted>"),
+            &format!("{registered} {}", if registered == "Bearer" { "mimic-token" } else { "mimic-auth" }),
+            &format!("{canary} mimic-auth"),
         );
         prop_assert_ne!(&forged, &stored);
         let d = doc(&Report::from_json(&forged).expect("parses"));

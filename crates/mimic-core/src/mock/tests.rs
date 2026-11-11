@@ -72,6 +72,11 @@ impl Ex {
         self
     }
 
+    fn req_header(mut self, name: &str, value: &str) -> Self {
+        self.req_headers.push((name.into(), value.into()));
+        self
+    }
+
     fn resp_header(mut self, name: &str, value: &str) -> Self {
         self.resp_headers.push((name.into(), value.into()));
         self
@@ -1078,4 +1083,116 @@ fn mck_01_factor_text_is_the_shortest_decimal() {
         .map(|f| effective([&settings(true, f, &[])]).factor_text())
         .collect();
     assert_eq!(texts, ["1", "0.5", "0", "100", "0.05", "1.3", "1.01"]);
+}
+
+// --- PLH-07 -----------------------------------------------------------------------------
+
+/// The set as an F12 controller serves it: every placeholder is the legacy marker, and the
+/// size of each sample follows.
+fn legacy_set(set: &EgressSet) -> String {
+    use crate::discovery::placeholder::PLACEHOLDERS;
+    const MARKER: &str = "<redacted>";
+    fn walk(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::String(s) => {
+                *s = PLACEHOLDERS
+                    .iter()
+                    .fold(s.clone(), |t, p| t.replace(p, MARKER));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            serde_json::Value::Object(map) => {
+                let grown = map.contains_key("request_shape").then(|| {
+                    let text = serde_json::Value::Object(map.clone()).to_string();
+                    PLACEHOLDERS
+                        .iter()
+                        .map(|p| {
+                            text.matches(p).count() as i64 * (MARKER.len() as i64 - p.len() as i64)
+                        })
+                        .sum::<i64>()
+                });
+                map.values_mut().for_each(walk);
+                if let (Some(grown), Some(bytes)) =
+                    (grown, map.get("bytes").and_then(serde_json::Value::as_u64))
+                {
+                    map.insert("bytes".into(), bytes.saturating_add_signed(grown).into());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(set).expect("a value");
+    walk(&mut value);
+    value.to_string()
+}
+
+fn token_set() -> EgressSet {
+    record(&[
+        ex("POST", "/oauth/token", 200)
+            .req_json(r#"{"grant":"client_credentials","client_secret":"zz"}"#)
+            .resp(
+                JSON,
+                r#"{"access_token":"CANARYtokenvalue0123456789","expires_in":3600}"#,
+            )
+            .resp_header("set-cookie", "sid=CANARYcookievalue0123; Path=/"),
+        ex("GET", "/orders", 200)
+            .req_header("authorization", "Bearer CANARYtokenvalue0123456789")
+            .resp(JSON, r#"{"orders":[]}"#),
+    ])
+}
+
+#[test]
+fn plh_07_an_f12_set_gives_the_upgraded_set() {
+    let set = token_set();
+    let old = legacy_set(&set);
+    assert!(old.contains("<redacted>"));
+    let upgraded = EgressSet::from_json(&old).expect("accepted");
+    assert_eq!(upgraded, set);
+    // Idempotent: the current form is read as it is.
+    assert_eq!(EgressSet::from_json(&set.to_json().unwrap()).unwrap(), set);
+}
+
+#[test]
+fn plh_07_the_answers_carry_placeholders() {
+    let set = token_set();
+    let old = EgressSet::from_json(&legacy_set(&set)).expect("accepted");
+    for set in [set, old] {
+        let index = index(&set);
+        let r = req("POST", "/oauth/token")
+            .json(r#"{"grant":"client_credentials","client_secret":"x"}"#);
+        let (_, response) = ask(&index, &r).expect("an answer");
+        let body = text(&response);
+        assert!(body.contains(r#""access_token":"mimic-token""#), "{body}");
+        assert!(!body.contains("<redacted>") && !body.contains("CANARY"));
+        assert_eq!(
+            header(&response, "set-cookie"),
+            Some("sid=mimic-cookie; Path=/")
+        );
+    }
+}
+
+#[test]
+fn plh_07_a_field_holding_a_placeholder_is_not_compared() {
+    let set = record(&[ex("POST", "/pay", 200)
+        .req_json(r#"{"memo":"ghp_CANARYabcdef0123456789","item":"a"}"#)
+        .resp(JSON, r#"{"ok":true}"#)]);
+    let old = EgressSet::from_json(&legacy_set(&set)).expect("accepted");
+    for set in [set, old] {
+        let index = index(&set);
+        for memo in ["mimic-token", "something else"] {
+            let r = req("POST", "/pay").json(&format!(r#"{{"memo":"{memo}","item":"a"}}"#));
+            let (tier, _) = ask(&index, &r).expect("an answer");
+            assert_eq!(tier, Tier::Exact, "{memo}");
+        }
+    }
+}
+
+#[test]
+fn plh_07_the_app_replays_the_token_it_was_given() {
+    // The token endpoint answers `mimic-token`; the next call carries it as `Bearer mimic-token`.
+    let set = token_set();
+    let index = index(&set);
+    let r = req("GET", "/orders").header("authorization", "Bearer mimic-token");
+    let (tier, response) = ask(&index, &r).expect("an answer");
+    assert_eq!(tier, Tier::Exact);
+    assert_eq!(text(&response), r#"{"orders":[]}"#);
 }

@@ -1372,6 +1372,22 @@ impl Report {
         });
     }
 
+    /// The placeholder upgrade (spec §6): a report that holds the legacy marker in a sample or
+    /// in a template is redacted again, which gives each legacy marker the placeholder of its
+    /// field (`mimic-secret` when no name gives one). A report without one is left as it is.
+    pub(super) fn upgrade_placeholders(&mut self) {
+        let legacy = self.endpoints().iter().any(|e| {
+            e.template.contains(MARKER)
+                || e.stats
+                    .samples()
+                    .iter()
+                    .any(|(_, s)| serde_json::to_string(s).is_ok_and(|t| t.contains(MARKER)))
+        });
+        if legacy {
+            self.re_redact(&Redactor::default());
+        }
+    }
+
     /// The authority hosts (scope keys) and the SNIs of the outbound scopes, redacted again:
     /// scopes whose key becomes equal merge, a caught SNI is removed.
     fn re_redact_authorities(&mut self) {

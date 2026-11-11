@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::observed::Observation;
+use super::placeholder::{PLACEHOLDERS, is_marked};
 use super::redact::{MARKER, Redactor};
 use super::report::{Direction, Exchange, Limits, Report, merge};
 
@@ -368,10 +369,15 @@ fn ctl_03_sketch_without_a_sample_is_kept() {
     assert_eq!(fields.sketch_len("request.header/x-note"), Some(1));
 }
 
-/// Replaces `MARKER` by `secret` in every string value (not key) of `v`.
+/// Replaces every placeholder by `secret` in every string value (not key) of `v`.
 fn plant(v: &mut Value, secret: &str) {
     match v {
-        Value::String(s) if s.contains(MARKER) => *s = s.replace(MARKER, secret),
+        Value::String(s) if is_marked(s) => {
+            *s = PLACEHOLDERS
+                .iter()
+                .chain([&MARKER])
+                .fold(s.clone(), |text, p| text.replace(p, secret));
+        }
         Value::Array(items) => items.iter_mut().for_each(|i| plant(i, secret)),
         Value::Object(map) => map.values_mut().for_each(|i| plant(i, secret)),
         _ => {}
@@ -490,7 +496,7 @@ fn ctl_03_sample_path() {
     let mut value: Value = serde_json::from_str(&truth.to_json().unwrap()).unwrap();
     let mut samples = 0;
     for (_, s) in samples_of(&truth) {
-        assert!(s.to_string().contains(MARKER));
+        assert!(is_marked(&s.to_string()));
         samples += 1;
     }
     assert_eq!(samples, 1);
@@ -777,8 +783,8 @@ fn ctl_03_authorization_canary() {
         let mut value: Value = serde_json::from_str(&report.to_json().unwrap()).unwrap();
         plant_value(
             &mut value,
-            "Bearer <redacted>",
-            &format!("{AUTH_CANARY} <redacted>"),
+            "Bearer mimic-token",
+            &format!("{AUTH_CANARY} mimic-token"),
         );
         let mut report = Report::from_json(&value.to_string()).unwrap();
         assert!(

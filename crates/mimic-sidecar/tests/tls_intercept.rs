@@ -909,7 +909,7 @@ async fn dsc_21_intercepted_outbound_access_line_redacts_path_secrets() {
     eventually("the access line", || !logs.access().is_empty()).await;
     let lines = logs.access();
     assert_eq!(lines[0]["tls"], true);
-    assert_eq!(lines[0]["path"], "/reset/<redacted>");
+    assert_eq!(lines[0]["path"], "/reset/mimic-jwt");
     assert!(!logs.text().contains(jwt), "{}", logs.text());
 }
 

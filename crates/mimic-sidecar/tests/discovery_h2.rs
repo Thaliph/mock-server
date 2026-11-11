@@ -307,7 +307,7 @@ async fn dsc_15_no_leak_end_to_end_over_h2() {
     assert!(seen[0].0.contains("x-api-key: CANARY-APIKEY"));
     assert!(seen[0].0.contains("token=CANARY-QUERY"));
     let json = discovery.report().to_json().unwrap();
-    assert!(json.contains("<redacted>"), "{json}");
+    assert!(json.contains("mimic-token"), "{json}");
     assert_no_leak("/discovery", &json);
     assert_no_leak("the metrics", &f.metrics.encode());
     // The access lines go through the log queue.
@@ -323,7 +323,7 @@ async fn dsc_15_no_leak_end_to_end_over_h2() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(paths.iter().any(|p| p == "/users/<redacted>"), "{paths:?}");
+    assert!(paths.iter().any(|p| p == "/users/mimic-jwt"), "{paths:?}");
     assert!(!paths.iter().any(|p| p.contains("eyJ")), "{paths:?}");
     assert_no_leak("the logs", &logs.text());
 }

@@ -1077,7 +1077,7 @@ mod names {
         let cut = &name[..128];
         let mut body = json!({ name.clone(): "plain-value" });
         Redactor::default().json(&mut body);
-        assert_eq!(body[&name], json!("<redacted>"));
+        assert_eq!(body[&name], json!("mimic-token"));
 
         let q = format!("{name}=plain-value");
         let hdr = [(name.as_str(), "plain-value")];

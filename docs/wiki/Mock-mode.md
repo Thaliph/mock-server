@@ -31,7 +31,10 @@ The sidecar answers from the **egress snapshot** of its own Deployment, and from
    that gives a sample wins: `exact` (same fields and body), `endpoint` (the sample sharing the most fields),
    `fallback` (the endpoint's most frequent status). The answer carries `x-mimic-match: exact|endpoint|fallback`.
 2. **Answer.** The recorded status and headers, and the recorded body serialised again. Redacted values come back
-   as `<redacted>`; mimic never rebuilds a secret.
+   as their placeholder (`{"access_token": "mimic-token"}`, `set-cookie: sid=mimic-cookie`); mimic never rebuilds
+   a secret and no Secret replaces a placeholder in a mock answer. A request field that holds a placeholder is
+   not compared, so an app that sends `Authorization: Bearer mimic-token` still matches. A test that needs real
+   values uses the [load test](Load-test) credentials instead.
 3. **Latency.** A delay drawn from the recorded latency histogram of the endpoint, times the latency factor
    (`spec.mock.latencyFactor`, default 1, capped at 300 s). `0` answers at once.
 4. **Miss.** No authority, endpoint or matching status: `599` with `x-mimic-miss: 1` and an empty body, at once.

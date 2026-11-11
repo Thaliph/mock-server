@@ -145,8 +145,8 @@ Check that the secrets are not there:
 
 ```bash
 grep -c 's3cret-value' report.json    # 0
-grep -o 'Bearer <redacted>' report.json | sort -u
-# Bearer <redacted>
+grep -o 'Bearer mimic-token' report.json | sort -u
+# Bearer mimic-token
 ```
 
 Or look at it in the browser, with the same port-forward: open <http://localhost:8080/ui/>, pick

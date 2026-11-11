@@ -37,7 +37,7 @@ A parameter is named after the preceding literal segment; positions with no lite
 `{param<n>}`.
 
 **Are secrets stored?**
-Known credential names and forms are replaced by `<redacted>` in the sidecar and again in the
+Known credential names and forms are replaced by a placeholder (`mimic-token`, `mimic-cookie`, ...) in the sidecar and again in the
 controller. A secret under an unlisted name in an unrecognised form is not caught: add its name to
 `spec.discovery.redact`. See [Discovery and redaction](Discovery-and-redaction) and
 [Security](Security).

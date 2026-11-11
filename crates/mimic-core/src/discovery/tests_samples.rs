@@ -285,7 +285,7 @@ mod samples {
         let json = r.to_json().unwrap();
         assert!(!json.contains("hunter2") && !json.contains("t0k3n"));
         assert!(!json.contains("abc.def"));
-        assert!(json.contains("<redacted>") && json.contains("page"));
+        assert!(json.contains("mimic-token") && json.contains("page"));
     }
 }
 

@@ -1416,15 +1416,15 @@ pod_gets() {
     | jq -R -s 'split("\n") | map(fromjson? | select(. != null and .method == "GET" and .status == 200 and (.path | startswith("/users/")) and .path != "/users/0")) | length'
 }
 # users_ready <report file>: GET /users/{users_id} has a 200, a response schema with a name, samples whose
-# x-tenant-key is <redacted> and whose Authorization is Bearer <redacted>.
+# x-tenant-key (a name of spec.discovery.redact) is mimic-secret and whose Authorization is Bearer mimic-token (PLH-10).
 users_ready() {
   endpoints "$1" | jq -e '
     .[] | select(.direction == "inbound" and .method == "GET" and .template == "/users/{users_id}")
     | select((.stats.statuses["200"] // 0) > 0
       and ((.stats.observed.response.bodies["application/json"].json.object.props // {}) | has("name"))
       and ((.stats.samples | length) > 0)
-      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "x-tenant-key") | .[1]] | any(. == "<redacted>"))
-      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "authorization") | .[1]] | any(. == "Bearer <redacted>")))
+      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "x-tenant-key") | .[1]] | any(. == "mimic-secret"))
+      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "authorization") | .[1]] | any(. == "Bearer mimic-token")))
   ' >/dev/null
 }
 log "ctl_20: within 2 push intervals the merged report, read through the controller, holds the calls of both pods"
@@ -1506,6 +1506,21 @@ for p in $dsc_pods; do
     if found -F "$c" "$WORK/discovery-$p.json"; then fail "dsc_22: a canary appears in the /discovery of $p"; fi
   done
 done
+# PLH-10: a request to /reset/<JWT-shaped value> through the injected users app. Its sidecar's access line shows
+# /reset/mimic-jwt and never the JWT (the app's own log holds the raw path and is not read here).
+b64u() { printf '%s' "$1" | base64 -w0 | tr '+/' '-_' | tr -d '='; }
+plh_jwt="$(b64u '{"alg":"HS256","typ":"JWT"}').$(b64u "{\"sub\":\"plh10-$(openssl rand -hex 6)\"}").$(openssl rand -hex 16)"
+kubectl -n disc-22-client exec client -- python3 -c '
+import sys, urllib.error, urllib.request
+try:
+    urllib.request.urlopen("http://users.disc-22.svc:8080/reset/" + sys.argv[1], timeout=10).read()
+except urllib.error.HTTPError:
+    pass
+' "$plh_jwt" || fail "plh_10: the request to /reset/<JWT> failed"
+sleep 2
+for p in $dsc_pods; do kubectl -n disc-22 logs "$p" -c mimic-sidecar --tail=-1; done > "$WORK/plh10-sidecar.log"
+found -F -e '"path":"/reset/mimic-jwt"' "$WORK/plh10-sidecar.log" || fail "plh_10: no sidecar access line for /reset/mimic-jwt: not found"
+if found -F -e "$plh_jwt" "$WORK/plh10-sidecar.log"; then fail "plh_10: the JWT is in a sidecar log: found"; fi
 {
   for p in $dsc_pods; do kubectl -n disc-22 logs "$p" --all-containers; done
   kubectl -n disc-22-client logs deploy/front --all-containers
@@ -1523,6 +1538,9 @@ for c in "${canaries[@]}"; do
   if found -F "$c" "$WORK/valkey.dump"; then fail "ctl_20: a canary appears in a Valkey value"; fi
   if found -F "$c" "$WORK/controller.log"; then fail "ctl_20: a canary appears in the controller logs"; fi
 done
+# PLH-10: the merged inbound report holds no legacy marker (the e2e deployments are not authority scopes).
+jq -e '[.. | strings | select(contains("<redacted>"))] | length == 0' "$WORK/merged.json" >/dev/null \
+  || fail "plh_10: the merged report of the e2e deployment holds <redacted>"
 # The logs explain the traffic: B logs its GETs, A logs its forwarded calls.
 jq -R -e 'fromjson? | select(.app == "users" and .method == "GET" and .status == 200 and (.path | startswith("/users/")))' \
   "$WORK/dsc22.log" >/dev/null || fail "dsc_22: no access line for GET /users/<id> in the users pods"
@@ -2042,9 +2060,12 @@ egr_check_outbound() {
   # The samples: the credentials are redacted by the outbound allowlist, whatever the names.
   endpoints "$egr_report" | jq -e '.[] | select(.direction == "outbound" and .method == "GET" and .template == "/users/{users_id}")
     | select((.stats.samples | length) > 0
-      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "x-tenant-key") | .[1]] | (length > 0 and all(. == "<redacted>")))
-      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "authorization") | .[1]] | (length > 0 and all(. == "Bearer <redacted>"))))' \
-    >/dev/null || fail "egr_19: the outbound GET samples do not hold Authorization: Bearer <redacted> and X-Tenant-Key: <redacted>"
+      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "x-tenant-key") | .[1]] | (length > 0 and all(. == "mimic-secret")))
+      and ([.stats.samples[].request.headers[] | select((.[0] | ascii_downcase) == "authorization") | .[1]] | (length > 0 and all(. == "Bearer mimic-token"))))' \
+    >/dev/null || fail "egr_19: the outbound GET samples do not hold Authorization: Bearer mimic-token and X-Tenant-Key: mimic-secret (PLH-10)"
+  # PLH-10: no legacy marker in the report but in authority hosts (an authority is a scope key, never a value).
+  jq -e '[.. | strings | select(contains("<redacted>") and (test("^<redacted>:[0-9]+$") | not))] | length == 0' "$egr_report" >/dev/null \
+    || fail "egr_19: the report holds <redacted> outside an authority host (PLH-10)"
   endpoints "$egr_report" | jq -e '.[] | select(.direction == "outbound" and .method == "PUT" and .template == "/users/{users_id}")
     | select((.stats.samples | length) > 0)' >/dev/null || fail "egr_19: the outbound PUT has no sample"
 }
@@ -2580,12 +2601,14 @@ new_call=$(kubectl -n mck-19 exec "$new_pod" -c app -- python3 -c '
 import json, urllib.request, urllib.error
 try:
     with urllib.request.urlopen("http://users.disc-22.svc:8080/users/340001", timeout=20) as r:
-        r.read(); print(json.dumps({"status": r.status, "match": r.headers.get("x-mimic-match")}))
+        body = r.read(); print(json.dumps({"status": r.status, "match": r.headers.get("x-mimic-match"), "legacy": b"<redacted>" in body, "cookie": r.headers.get("set-cookie")}))
 except urllib.error.HTTPError as e:
     print(json.dumps({"status": e.code, "match": None}))
 ' 2>&1) || fail "mck_19: the first call of $new_pod failed"
 jq -e '.status == 200 and (.match == "exact" or .match == "endpoint" or .match == "fallback")' <<< "$new_call" >/dev/null \
   || fail "mck_19: the first call of $new_pod was not answered by mock: $new_call"
+jq -e '.legacy == false and .cookie == "sid=mimic-cookie"' <<< "$new_call" >/dev/null \
+  || fail "mck_19: a mock answer carries <redacted>, or its set-cookie is not sid=mimic-cookie (PLH-07, PLH-10)"
 [[ $(mck_users 'true') == "$new_users_before" ]] || fail "mck_19: users logged the first call of $new_pod"
 
 log "mck_19: spec.mode discovery brings the calls back to users and the provider, and the live connection is forwarded again"
