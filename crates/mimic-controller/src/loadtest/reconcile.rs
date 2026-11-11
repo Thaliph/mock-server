@@ -912,7 +912,16 @@ impl Reconciler {
     }
 
     /// A `MimicLoadTest` was added or changed.
+    /// One whose name a held object has with another uid (the Delete event was missed) ends the
+    /// old uid's run first, as [`Reconciler::resync`] does.
     pub async fn applied(&self, test: Test) {
+        let held =
+            self.tests.list().into_iter().find(|t| {
+                t.namespace == test.namespace && t.name == test.name && t.uid != test.uid
+            });
+        if let Some(old) = held {
+            self.deleted(&old).await;
+        }
         self.tests.apply(test);
     }
 
