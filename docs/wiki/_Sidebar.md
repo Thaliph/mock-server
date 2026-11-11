@@ -8,6 +8,7 @@
 - [Egress aggregation](Egress-aggregation)
 - [Egress endpoint](Egress-endpoint)
 - [Mock mode](Mock-mode)
+- [Load test](Load-test)
 - [TLS interception](TLS-interception)
 
 **Run**

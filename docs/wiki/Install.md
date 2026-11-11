@@ -1,6 +1,6 @@
 # Install
 
-Audience: ops. Covers the chart at F5. Values are listed in [Configuration](Configuration).
+Audience: ops. Covers the chart of release 0.2.0-alpha.1. Values are listed in [Configuration](Configuration).
 
 ## Requirements
 
@@ -17,21 +17,38 @@ The release namespace itself runs at `restricted`: every pod the chart creates s
 
 ## Install
 
-No v2 release is published yet, so install the chart from a clone of the repository:
+Install a released version from the OCI registry. A pre-release chart is only installed with an
+explicit `--version`:
 
 ```bash
-git clone https://github.com/Thaliph/mock-server.git && cd mock-server
-helm install mimic deploy/helm/mimic -n mimic-system --create-namespace
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.1 -n mimic-system --create-namespace
 kubectl -n mimic-system rollout status deploy/mimic-controller
 kubectl -n mimic-system port-forward svc/mimic-controller 8081:8081 &
 curl -s localhost:8081/readyz
 ```
 
-The chart's images default to `ghcr.io/thaliph/mimic` and `ghcr.io/thaliph/mimic-init` at the chart
-appVersion tag. Until a v2 release is published, build and load your own images (see
-[Developing](Developing#end-to-end-on-kind) and `scripts/e2e.sh`) and set `image.*` and
-`inject.initImage.*`. Once a v2 release is published, the chart is also available as
-`oci://ghcr.io/thaliph/charts/mimic`, and `deploy/helm/mimic` below can be replaced by that reference.
+The chart pins both images by digest (`image.digest`, `inject.initImage.digest`), so installing by
+version runs the released digests. To work from a checkout instead, replace the OCI reference with
+`deploy/helm/mimic` in the commands below; the images then come from `ghcr.io/thaliph/mimic` and
+`ghcr.io/thaliph/mimic-init` at the chart appVersion tag, or from your own build (see
+[Developing](Developing#end-to-end-on-kind) and `scripts/e2e.sh`).
+
+### Verify the release
+
+Images and chart are signed with cosign (keyless, GitHub OIDC); the signature names the release workflow
+and the tag. Verify before installing:
+
+```bash
+ID=https://github.com/Thaliph/mock-server/.github/workflows/release.yml@refs/tags/v0.2.0-alpha.1
+ISSUER=https://token.actions.githubusercontent.com
+for ref in ghcr.io/thaliph/mimic:0.2.0-alpha.1 ghcr.io/thaliph/mimic-init:0.2.0-alpha.1 ghcr.io/thaliph/charts/mimic:0.2.0-alpha.1; do
+  cosign verify "$ref" --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER"
+done
+```
+
+To pin what you verified, resolve each tag to its digest (`docker buildx imagetools inspect <ref>` or
+`crane digest <ref>`) and verify `<repo>@<digest>`; the release notes list the digests. Images are
+tagged with the version only (no `latest`). Signing and verifying use the public Sigstore service.
 
 All names in this wiki (`mimic-controller`, `mimic-valkey-0`, `data-mimic-valkey-0`, the Secret
 `mimic-valkey`, ...) assume the release is called `mimic`; replace `mimic` with your release name
@@ -47,7 +64,7 @@ kubectl label namespace mimic-system \
 Common overrides (all values: [Configuration](Configuration#helm-values)):
 
 ```bash
-helm install mimic deploy/helm/mimic -n mimic-system --create-namespace \
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.1 -n mimic-system --create-namespace \
   --set valkey.persistence.size=8Gi \
   --set valkey.resources.limits.memory=2Gi \
   --set metrics.serviceMonitor.enabled=true
@@ -65,7 +82,7 @@ cluster-wide, the CRD, the `MutatingWebhookConfiguration` `<release>-injector` a
 
 ```bash
 kubectl -n mimic-system create secret generic my-valkey --from-literal=password="$(openssl rand -base64 30)"
-helm install mimic deploy/helm/mimic -n mimic-system --create-namespace \
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.1 -n mimic-system --create-namespace \
   --set valkey.existingSecret=my-valkey
 ```
 
@@ -88,16 +105,18 @@ A pod label `mimic.platform.io/inject: disabled` always opts a pod out. The full
 ## Upgrade
 
 ```bash
-helm upgrade mimic deploy/helm/mimic -n mimic-system
+helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version <new-version> -n mimic-system
 ```
 
+There is no upgrade from the legacy `v0.1.0`: uninstall it and install fresh. Roll back only out of mock: switch
+every `MimicWorkload` back to `discovery` before a `helm rollback`, or recreated pods forward for real.
 Running pods keep the sidecar version they were created with; `rollout restart` them to pick up a new
 one. The Valkey password Secret is kept across upgrades. The CRD is not removed or reset.
 
 ### Known issue: upgrading a chart installed from an earlier `main` build (#293)
 
-(The tag `v0.1.0` is the legacy v1 product and has no chart; this affects only a chart installed from
-`main` or a checkout before the change, for example a cluster left by an earlier `scripts/e2e.sh`.)
+(This affects only a chart installed from `main` or a checkout before the change, for example a cluster left
+by an earlier `scripts/e2e.sh`; a released chart already has `4Gi`.)
 
 The default `valkey.persistence.size` went from `1Gi` to `4Gi`. A StatefulSet's `volumeClaimTemplates`
 is immutable, so `helm upgrade` of such an install fails with an error such as

@@ -1,6 +1,6 @@
 # Monitoring
 
-Covers #378 and #379. Reference: spec §10.7, §11, §11.1, §12.13 (MON-01 to MON-21). mimic exposes Prometheus
+Covers #378 to #385. Reference: spec §9, §9.1, §10.7, §11, §11.1, §12.13 (MON-01 to MON-24). mimic exposes Prometheus
 metrics on its admin port, and the chart can scrape them. A **bundled Prometheus and Grafana** are an option for a
 demo or a dev cluster. A production install brings its own monitoring and uses the ServiceMonitor and the
 PodMonitors instead.
@@ -56,6 +56,14 @@ helm upgrade --install mimic deploy/helm/mimic -n mimic-system \
   ```
 
   Then open `http://localhost:3000`, log in as `admin` with the password above.
+
+## Dashboards
+
+Five dashboards ship with the chart in `deploy/helm/mimic/dashboards/`: `mimic-controller`, `mimic-sidecar`
+(traffic), `mimic-discovery`, `mimic-mock-load` (mock mode and load tests) and `mimic-valkey`. With
+`monitoring.grafana.enabled`, or `monitoring.dashboards.enabled` for your own Grafana, the chart renders one
+ConfigMap per file, labelled `grafana_dashboard: "1"`; `monitoring.dashboards.annotations` is added to each
+(for example `grafana_folder: Mimic`). They are tagged `mimic` and read the metrics of the spec's §9.
 
 ## Network and an external datasource
 
