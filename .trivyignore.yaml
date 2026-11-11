@@ -17,8 +17,12 @@ vulnerabilities:
   # so the package is never loaded. Extended once (#371): bump the digest after its cooldown and
   # remove both entries then; the scan fails again on 2026-12-05 if that has not happened.
   - id: CVE-2026-76844
+    purls:
+      - pkg:deb/debian/zlib1g
     expired_at: 2026-12-05
     statement: zlib1g in the distroless base, not linked by mimic binaries (#369)
   - id: CVE-2026-85091
+    purls:
+      - pkg:deb/debian/zlib1g
     expired_at: 2026-12-05
     statement: zlib1g in the distroless base, not linked by mimic binaries (#369)
