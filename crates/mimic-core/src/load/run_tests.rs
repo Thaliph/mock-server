@@ -778,6 +778,10 @@ fn job_admitted(job: &Value, image: &str) -> Result<(), String> {
     {
         return Err("service account".into());
     }
+    // The UID reads the credentials through the pod's fsGroup and the Secret's mode (#414).
+    if pod["securityContext"]["fsGroup"] != json!(65532) {
+        return Err("fsGroup must be 65532".into());
+    }
     let sc = &c["securityContext"];
     if sc["runAsNonRoot"] != json!(true)
         || sc["runAsUser"] != json!(65532)
@@ -804,6 +808,9 @@ fn job_admitted(job: &Value, image: &str) -> Result<(), String> {
             }
         } else if v["secret"].is_object() {
             secrets += 1;
+            if v["secret"]["defaultMode"] != json!(0o440) {
+                return Err("defaultMode must be 0440".into());
+            }
             let m = c["volumeMounts"]
                 .as_array()
                 .ok_or("mounts")?
@@ -1065,6 +1072,29 @@ mod object_tests {
                 image
             )
             .is_err()
+        );
+        // The UID reads the credentials through fsGroup 65532 and the Secret's mode 0440 (LDT-17, #414).
+        assert!(
+            job_admitted(
+                &with(&format!("{p}/securityContext/fsGroup"), json!(0)),
+                image
+            )
+            .is_err(),
+            "a pod fsGroup other than 65532"
+        );
+        let mut wide_mode = with_secret.clone();
+        for v in wide_mode["spec"]["template"]["spec"]["volumes"]
+            .as_array_mut()
+            .expect("volumes")
+            .iter_mut()
+        {
+            if v["secret"].is_object() {
+                v["secret"]["defaultMode"] = json!(0o644);
+            }
+        }
+        assert!(
+            job_admitted(&wide_mode, image).is_err(),
+            "a Secret volume not of mode 0440"
         );
     }
 
