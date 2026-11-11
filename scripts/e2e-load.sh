@@ -387,8 +387,18 @@ suite_main() {
     > "$WORK/plan-endpoints.txt"
   jq -r '[.status.results.endpoints[] | "\(.method) \(.template)"] | sort | .[]' "$WORK/run-a.json" > "$WORK/run-a-endpoints.txt"
   [[ -s $WORK/plan-endpoints.txt ]] || fail "ldt_16: front has no inbound endpoint to plan"
-  cmp -s "$WORK/plan-endpoints.txt" "$WORK/run-a-endpoints.txt" \
-    || fail "ldt_16: the endpoints of run A are not the inbound endpoints of front: $(diff "$WORK/plan-endpoints.txt" "$WORK/run-a-endpoints.txt" | tr '\n' ' ')"
+  # status.skipped gives counts by reason, not endpoints: run A's endpoints are inbound endpoints of front (no endpoint of
+  # the run is not one of front's), and the inbound endpoints the run leaves out are exactly those counted as skipped.
+  LC_ALL=C sort -o "$WORK/plan-endpoints.txt" "$WORK/plan-endpoints.txt"
+  LC_ALL=C sort -o "$WORK/run-a-endpoints.txt" "$WORK/run-a-endpoints.txt"
+  [[ -z $(LC_ALL=C sort "$WORK/run-a-endpoints.txt" | uniq -d) ]] || fail "ldt_16: run A lists an endpoint twice"
+  extra=$(LC_ALL=C comm -13 "$WORK/plan-endpoints.txt" "$WORK/run-a-endpoints.txt")
+  [[ -z $extra ]] || fail "ldt_16: run A has endpoint(s) that front does not have as inbound: $(tr '\n' ';' <<<"$extra")"
+  skipped_sum=$(jq '[.status.skipped // {} | .[]] | add // 0' "$WORK/run-a.json")
+  inbound_n=$(wc -l < "$WORK/plan-endpoints.txt")
+  results_n=$(wc -l < "$WORK/run-a-endpoints.txt")
+  (( inbound_n - results_n == skipped_sum )) \
+    || fail "ldt_16: run A has $results_n endpoints of $inbound_n inbound ones of front, but $skipped_sum skipped: $(jq -c '.status.skipped' "$WORK/run-a.json")"
   [[ $(calls disc-22 app=users app) == "$users0" ]] || fail "ldt_16: users logged calls during run A"
   [[ $(calls mck-19-provider app=provider provider) == "$prov0" ]] || fail "ldt_16: the provider logged calls during run A"
   [[ $(exchanges) == "$exch0" ]] || fail "ldt_16: the discovery exchanges of front grew during run A"
