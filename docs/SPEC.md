@@ -2148,7 +2148,7 @@ random numbers it hands to the draw.
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
   opaque decrypted tunnel), with the SNI as `authority` when present; a passed-through one
-  under `tls` as before. The controller exposes `mimic_sidecar_api_requests_total` (§7.2) and
+  under `tls` as before. The controller exposes `mimic_sidecar_api_requests_total{endpoint,result}` (§7.2) and
   `mimic_tls_seed_loaded` (gauge, 1 once the seed is loaded), and from F5 (no label carries a
   namespace, deployment or pod, so cardinality stays fixed):
 
@@ -2210,11 +2210,15 @@ random numbers it hands to the draw.
 
   **Exporter metrics used** (#378, #384): the Valkey dashboard reads only these series of the
   Valkey exporter, so that the dashboard check can verify every name: `redis_up`,
-  `redis_uptime_in_seconds`, `redis_instance_info`, `redis_memory_used_bytes`,
+  `redis_uptime_in_seconds`, `redis_instance_info{redis_version,maxmemory_policy}` (the dashboards
+  read only these two of its labels; `run_id` and `process_id` change at each restart and are never
+  used), `redis_memory_used_bytes`,
   `redis_memory_max_bytes`, `redis_mem_fragmentation_ratio`, `redis_evicted_keys_total`,
   `redis_expired_keys_total`, `redis_commands_processed_total`,
+  `redis_commands_total{cmd}` (#384: with the next name it gives the mean latency per command),
   `redis_commands_duration_seconds_total{cmd}`, `redis_connected_clients`,
   `redis_rejected_connections_total`, `redis_db_keys{db}`, `redis_aof_last_write_status`.
+  `cmd` is bounded by Valkey's command set; it never holds a key or an argument.
   `redis_db_keys` is the total of the database (mimic is its only user); per-prefix counts would
   need `--check-keys`, which puts key names into labels, and are not used.
 
@@ -2236,6 +2240,209 @@ random numbers it hands to the draw.
   `max`.
 - **Health**: `/healthz` (process alive) and `/readyz` (ready to serve) on the admin port.
 - No traces.
+
+### 9.1 Dashboards (#380 to #384)
+
+Five Grafana dashboards ship with the chart as JSON files `deploy/helm/mimic/dashboards/<uid>.json`,
+one ConfigMap each (§10.7 "Dashboards"). They read only the series of §9 and the `up` series that
+Prometheus adds to every target, through the jobs and target labels of §10.7, so they work with
+the bundled Prometheus and with a Prometheus Operator reading the ServiceMonitor and PodMonitors.
+They hold no data, no secret and no value of a deployment: only queries.
+
+**Conventions** (every file, checked by MON-22):
+
+- `uid` is the file's base name: `mimic-controller`, `mimic-valkey`, `mimic-sidecar`,
+  `mimic-discovery`, `mimic-mock-load`. `title` is `Mimic / <Name>`, `tags` is `["mimic"]`,
+  `id` is `null`, `editable` is `false`, `time` is `now-1h` to `now`, `refresh` is `30s` (the
+  default scrape interval: a faster refresh shows nothing new), `graphTooltip` is 1 (shared
+  crosshair). One `links` entry, of type `dashboards`, tag `mimic`, `asDropdown`, `keepTime` and
+  `includeVars`: the five dashboards link to each other and to nothing else.
+- Datasource: a variable `datasource` of type `datasource`, query `prometheus`, with no default
+  value (Grafana picks its default datasource; the bundled one is `isDefault`, §10.7). Every panel,
+  target, variable and annotation names `{"type": "prometheus", "uid": "${datasource}"}`. No
+  datasource uid is written in a file (`mimic-prometheus` included), so a production Grafana uses
+  its own Prometheus without an edit.
+- Selection variables, all of type `query`, refreshed on time-range change, sorted, single value
+  unless stated:
+  - `controller` = `label_values(mimic_build_info{component="controller"}, job)`: the job
+    `<release>-controller` of §10.7, so two releases in one Prometheus stay apart. Controller
+    panels select `job="$controller"` (written **C** below).
+  - `namespace` and `deployment` (sidecar dashboards) =
+    `label_values(mimic_build_info{job="mimic-sidecar"}, namespace)` and
+    `label_values(mimic_build_info{job="mimic-sidecar", namespace="$namespace"}, deployment)`.
+    Sidecar panels select `job="mimic-sidecar", namespace="$namespace", deployment="$deployment"`
+    (**S**) and aggregate over the deployment's pods.
+  - `namespace` (Valkey dashboard) = `label_values(mimic_build_info{job="$controller"}, namespace)`,
+    the release namespace; Valkey panels select `job="mimic-valkey", namespace="$namespace"` (**V**).
+  - `load_test` (mock and load dashboard) =
+    `label_values(mimic_load_in_flight{job="mimic-load", namespace="$namespace"}, load_test)`,
+    multi-value with "All"; generator panels select
+    `job="mimic-load", namespace="$namespace", load_test=~"$load_test"` (**L**).
+- Queries: a counter is read only through `rate(…[$__rate_interval])`, or `increase(…[$__range])`
+  in a stat or table "over the time range"; a quantile is
+  `histogram_quantile(q, sum by (le, …) (rate(<name>_bucket{…}[$__rate_interval])))` with q 0.5 and
+  0.99; the controller's counters are summed over its replicas and its status-pass gauges and
+  `mimic_limit` read with `max` (§9 "Aggregation"); a "time since" is `time() - <timestamp gauge>`
+  with the 0 ("never") values filtered out by `> 0` first. A label name in a matcher is a label of
+  that metric in §9 (its Labels column, or the `{…}` written after its name); one in `by (…)` is a
+  label of a metric inside that aggregation; the target labels of §10.7 (`job`, `namespace`, `pod`,
+  `deployment`, `load_test`) are always allowed, and `le` on a `_bucket` series. No `without`, no
+  `label_replace` or `label_join`, no regex matcher on `authority` (its values come from traffic).
+- Units (Grafana unit ids): `s` for durations and ages, `bytes` for sizes, `Bps` for byte rates,
+  `reqps` for request rates, `ops` for other event rates, `percentunit` for ratios, `short` for
+  counts and CPU cores. A limit drawn next to a gauge is a second query on `mimic_limit`, shown as
+  a dashed red series named `limit`.
+- Panels are of the core types `timeseries`, `stat`, `table`, `bargauge` and `text` (markdown
+  mode only); no plugin, no HTML, no link to a URL outside Grafana, no alert rule.
+- Annotations: `Process started` (`count(time() - process_start_time_seconds{S} < 60) > 0`, step
+  60 s; **C** on `mimic-controller`), which marks restarts and rollouts (a new pod is a new series);
+  on `mimic-discovery` and `mimic-mock-load` also `Mode switch`
+  (`sum by (to) (increase(mimic_mock_mode_switches_total{S}[2m])) > 0`) and `Latency factor changed`
+  (`max(mimic_mock_latency_factor{S}) != max(mimic_mock_latency_factor{S} offset 2m)`). There is no
+  generic "configuration changes" annotation (#382, decided 2026-11-07).
+- Each file is at most 150 KiB (the k8s-sidecar sizing of §10.7, far below the 1 MiB ConfigMap
+  limit), with 2-space indentation and sorted keys, so that a diff of a dashboard reads.
+
+In the tables below `\|` stands for `|`. A panel written "p50, p99" has the two quantile queries
+(the 0.99 one is shown); a panel with queries separated by `;` has all of them, in that order.
+A panel may be added later only with a query that passes MON-22.
+
+**`mimic-controller`** (#380, cluster-wide: controller series carry no namespace or deployment).
+`mimic-init` exits and has no metrics: a text panel points to `kubectl get pods` and the
+`mimic.platform.io/skipped` annotation instead.
+
+| Row | Panel | Unit | Query |
+|---|---|---|---|
+| Overview | Replicas up | short | `sum(up{C})` |
+| Overview | Versions | short | `count by (version) (mimic_build_info{C})` (table) |
+| Overview | TLS seed loaded | short | `min(mimic_tls_seed_loaded{C})` (0 red, 1 green) |
+| Overview | Log lines dropped | ops | `sum(rate(mimic_log_lines_dropped_total{C}[$__rate_interval]))` |
+| Webhook | Admissions by result and reason | reqps | `sum by (result, reason) (rate(mimic_webhook_admissions_total{C}[$__rate_interval]))` |
+| Webhook | Admission error ratio | percentunit | `sum(rate(mimic_webhook_admissions_total{C, result="error"}[$__rate_interval])) / sum(rate(mimic_webhook_admissions_total{C}[$__rate_interval]))` |
+| Webhook | Admission latency p50, p99 | s | `histogram_quantile(0.99, sum by (le) (rate(mimic_webhook_admission_duration_seconds_bucket{C}[$__rate_interval])))` |
+| Webhook | Serving certificate expires in | s | `min(mimic_webhook_certificate_expiry_timestamp_seconds{C} > 0) - time()` (red below 7 days) |
+| Sidecar API | Requests by endpoint and result | reqps | `sum by (endpoint, result) (rate(mimic_sidecar_api_requests_total{C}[$__rate_interval]))` |
+| Sidecar API | Egress builds by result | ops | `sum by (result) (rate(mimic_sidecar_api_egress_builds_total{C}[$__rate_interval]))` |
+| Sidecar API | Egress build latency p50, p99 | s | `histogram_quantile(0.99, sum by (le) (rate(mimic_sidecar_api_egress_build_duration_seconds_bucket{C}[$__rate_interval])))` |
+| Sidecar API | Egress cache per replica, budget | bytes | `max by (pod) (mimic_sidecar_api_egress_cache_bytes{C})`; `max(mimic_limit{C, name="sidecar_api_egress_budget_bytes"})` |
+| Store | Writes by result | ops | `sum by (result) (rate(mimic_store_writes_total{C}[$__rate_interval]))` |
+| Store | Write latency p50, p99 | s | `histogram_quantile(0.99, sum by (le) (rate(mimic_store_write_duration_seconds_bucket{C}[$__rate_interval])))` |
+| Store | Pushes by result | ops | `sum by (result) (rate(mimic_store_pushes_total{C}[$__rate_interval]))` |
+| Store | Growth refused | ops | `sum by (kind, reason) (rate(mimic_store_refused_total{C}[$__rate_interval]))` |
+| Store | Evicted, expired | ops | `sum by (kind) (rate(mimic_store_evicted_total{C}[$__rate_interval]))`; `sum by (kind) (rate(mimic_store_expired_total{C}[$__rate_interval]))` |
+| Store | Report size p50, p99 | bytes | `histogram_quantile(0.99, sum by (le) (rate(mimic_store_report_bytes_bucket{C}[$__rate_interval])))` |
+| Store | Stored deployments | short | `max(mimic_store_deployments{C})` (no limit line: `MIMIC_STORE_MAX_DEPLOYMENTS` is per namespace; the description says so) |
+| Store | Status updates by result | ops | `sum by (result) (rate(mimic_status_updates_total{C}[$__rate_interval]))` |
+| UI | Requests by route and code | reqps | `sum by (route, code) (rate(mimic_ui_requests_total{C}[$__rate_interval]))` |
+| UI | Render latency p99 by route | s | `histogram_quantile(0.99, sum by (le, route) (rate(mimic_ui_render_duration_seconds_bucket{C}[$__rate_interval])))` |
+| UI | Workloads skipped | ops | `sum by (reason) (rate(mimic_ui_skipped_total{C}[$__rate_interval]))` |
+| Load tests | Active runs, limit | short | `max(mimic_load_active_runs{C})`; `max(mimic_limit{C, name="load_max_runs"})` |
+| Load tests | Runs ended | short | `sum by (phase, reason) (increase(mimic_load_runs_total{C}[$__range]))` (table) |
+| Process | Memory per replica | bytes | `max by (pod) (process_resident_memory_bytes{C})` |
+| Process | CPU per replica | short | `sum by (pod) (rate(process_cpu_seconds_total{C}[$__rate_interval]))` |
+| Process | File descriptors used | percentunit | `max by (pod) (process_open_fds{C}) / max by (pod) (process_max_fds{C})` |
+| Process | Restarts | short | `sum by (pod) (changes(process_start_time_seconds{C}[$__range]))` |
+
+**`mimic-valkey`** (#384, one store per release; variables `datasource`, `controller`, `namespace`).
+`redis_db_keys` is the whole `mimic:v1:*` count (§9); no panel can show a key, a value or a client.
+
+| Row | Panel | Unit | Query |
+|---|---|---|---|
+| Store | Up | short | `max(redis_up{V})` |
+| Store | Uptime | s | `max(redis_uptime_in_seconds{V})` |
+| Store | Version, eviction policy | short | `max by (redis_version, maxmemory_policy) (redis_instance_info{V})` (table; a policy other than `noeviction` is red) |
+| Store | AOF last write | short | `min(redis_aof_last_write_status{V})` (1 green, 0 red) |
+| Memory | Used of maxmemory | percentunit | `max(redis_memory_used_bytes{V}) / max(redis_memory_max_bytes{V} > 0)` (orange 0.8, red 0.95: at 1 writes fail, §7.3) |
+| Memory | Used, maxmemory | bytes | `max(redis_memory_used_bytes{V})`; `max(redis_memory_max_bytes{V})` |
+| Memory | Fragmentation ratio | short | `max(redis_mem_fragmentation_ratio{V})` |
+| Memory | Evicted keys (must stay 0) | short | `sum(increase(redis_evicted_keys_total{V}[$__range]))` (red above 0) |
+| Memory | Expired keys | ops | `sum(rate(redis_expired_keys_total{V}[$__rate_interval]))` |
+| Load | Commands | ops | `sum(rate(redis_commands_processed_total{V}[$__rate_interval]))` |
+| Load | Mean latency by command | s | `sum by (cmd) (rate(redis_commands_duration_seconds_total{V}[$__rate_interval])) / sum by (cmd) (rate(redis_commands_total{V}[$__rate_interval]))` |
+| Load | Clients, rejected connections | short, ops | `max(redis_connected_clients{V})`; `sum(rate(redis_rejected_connections_total{V}[$__rate_interval]))` |
+| Contents | Keys | short | `sum(redis_db_keys{V})` |
+| Contents | Stored deployments | short | `max(mimic_store_deployments{C})` |
+| Controller side | Write latency p99 | s | `histogram_quantile(0.99, sum by (le) (rate(mimic_store_write_duration_seconds_bucket{C}[$__rate_interval])))` |
+| Controller side | Failed writes | ops | `sum by (result) (rate(mimic_store_writes_total{C, result=~"error\|conflict\|refused\|dropped"}[$__rate_interval]))` |
+| Controller side | Growth refused | ops | `sum by (kind, reason) (rate(mimic_store_refused_total{C}[$__rate_interval]))` |
+
+**`mimic-sidecar`** (#381, per deployment; variables `datasource`, `namespace`, `deployment`).
+The restarts come from `process_start_time_seconds`, so no kube-state-metrics series is needed.
+
+| Row | Panel | Unit | Query |
+|---|---|---|---|
+| Overview | Pods up | short | `sum(up{S})` |
+| Overview | Versions | short | `count by (version) (mimic_build_info{S})` (table) |
+| Traffic | Requests by direction and authority | reqps | `sum by (direction, authority) (rate(mimic_http_requests_total{S}[$__rate_interval]))` |
+| Traffic | Error ratio by direction | percentunit | `sum by (direction) (rate(mimic_http_requests_total{S, status_class=~"5xx\|none"}[$__rate_interval])) / sum by (direction) (rate(mimic_http_requests_total{S}[$__rate_interval]))` |
+| Traffic | Status classes | reqps | `sum by (direction, status_class) (rate(mimic_http_requests_total{S}[$__rate_interval]))` |
+| Traffic | Latency p50, p99 by direction | s | `histogram_quantile(0.99, sum by (le, direction) (rate(mimic_http_request_duration_seconds_bucket{S}[$__rate_interval])))` |
+| Traffic | Outbound latency p99 by authority | s | `histogram_quantile(0.99, sum by (le, authority) (rate(mimic_http_request_duration_seconds_bucket{S, direction="outbound"}[$__rate_interval])))` |
+| Traffic | Authorities over the label budget | percentunit | `sum by (direction) (rate(mimic_http_requests_total{S, authority="(other)"}[$__rate_interval])) / sum by (direction) (rate(mimic_http_requests_total{S}[$__rate_interval]))` |
+| Traffic | Connections by protocol | ops | `sum by (direction, protocol) (rate(mimic_proxy_connections_total{S}[$__rate_interval]))` |
+| Traffic | TCP connections by result | ops | `sum by (direction, result) (rate(mimic_tcp_connections_total{S}[$__rate_interval]))` |
+| Traffic | Bytes | Bps | `sum by (direction, flow) (rate(mimic_proxy_bytes_total{S}[$__rate_interval]))` |
+| Cost | Sidecar overhead p50, p99 | s | `histogram_quantile(0.99, sum by (le, direction) (rate(mimic_proxy_overhead_seconds_bucket{S}[$__rate_interval])))` |
+| Cost | Active connections (busiest pod), limit | short | `max by (direction) (mimic_proxy_active_connections{S})`; `max(mimic_limit{S, name="max_connections"})` |
+| Cost | Accept errors, log lines dropped | ops | `sum by (direction) (rate(mimic_accept_errors_total{S}[$__rate_interval]))`; `sum(rate(mimic_log_lines_dropped_total{S}[$__rate_interval]))` |
+| Cost | Memory per pod | bytes | `max by (pod) (process_resident_memory_bytes{S})` (the description gives the 128 Mi default limit of `MIMIC_INJECT_SIDECAR_RESOURCES`, which is not a series) |
+| Cost | CPU per pod | short | `sum by (pod) (rate(process_cpu_seconds_total{S}[$__rate_interval]))` |
+| Cost | Restarts | short | `sum by (pod) (changes(process_start_time_seconds{S}[$__range]))` |
+| TLS | Outbound TLS by decision | ops | `sum by (interception) (rate(mimic_tls_connections_total{S}[$__rate_interval]))` |
+| TLS | Remembered passthrough destinations | short | `max by (pod) (mimic_tls_passthrough_destinations{S})` |
+| TLS | Intermediate expires in | s | `min(mimic_tls_intermediate_expiry_timestamp_seconds{S} > 0) - time()` |
+| TLS | Intermediate requests by result | ops | `sum by (result) (rate(mimic_tls_intermediate_requests_total{S}[$__rate_interval]))` |
+| Load | Load requests received by result | reqps | `sum by (result) (rate(mimic_load_inbound_total{S}[$__rate_interval]))` |
+
+**`mimic-discovery`** (#382; variables `datasource`, `controller`, `namespace`, `deployment`).
+
+| Row | Panel | Unit | Query |
+|---|---|---|---|
+| Learning | Endpoints by direction, limit | short | `max by (direction) (mimic_discovery_endpoints{S})`; `max(mimic_limit{S, name="discovery_max_endpoints"})` |
+| Learning | Time since the last new endpoint | s | `time() - max by (direction) (mimic_discovery_last_new_endpoint_timestamp_seconds{S} > 0)` |
+| Learning | Exchanges by result | ops | `sum by (direction, result) (rate(mimic_discovery_exchanges_total{S}[$__rate_interval]))` |
+| Truncation | Exchanges not recorded | ops | `sum by (direction, result) (rate(mimic_discovery_exchanges_total{S, result=~"endpoint_limit\|authority_limit\|dropped\|invalid\|panic"}[$__rate_interval]))` |
+| Truncation | Samples by result | ops | `sum by (direction, result) (rate(mimic_discovery_samples_total{S}[$__rate_interval]))` |
+| Truncation | Bodies by result | ops | `sum by (direction, part, result) (rate(mimic_discovery_bodies_total{S}[$__rate_interval]))` |
+| Truncation | Sample bytes (largest pod), budget | bytes | `max(mimic_discovery_sample_bytes{S})`; `max(mimic_limit{S, name="discovery_sample_budget_bytes"})` |
+| Truncation | Outbound scopes (largest pod), limit | short | `max(mimic_discovery_authorities{S})`; `max(mimic_limit{S, name="discovery_max_authorities"})` |
+| Content | Redactions by location and rule | short | `sum by (location, rule) (increase(mimic_discovery_redactions_total{S}[$__range]))` (table) |
+| Content | Opaque connections | ops | `sum by (kind, result) (rate(mimic_discovery_tunnels_total{S}[$__rate_interval]))` |
+| Shipping | Pushes by result | ops | `sum by (result) (rate(mimic_discovery_pushes_total{S}[$__rate_interval]))` |
+| Shipping | Time since the last push (oldest pod) | s | `time() - min(mimic_discovery_last_push_timestamp_seconds{S} > 0)` |
+| Shipping | Outbound parts dropped | ops | `sum(rate(mimic_discovery_outbound_dropped_total{S}[$__rate_interval]))` |
+| Egress back | Pulls by result | ops | `sum by (result) (rate(mimic_egress_pulls_total{S}[$__rate_interval]))` |
+| Egress back | Time since the last pull (oldest pod) | s | `time() - min(mimic_egress_last_pull_timestamp_seconds{S} > 0)` |
+| Egress back | Snapshot endpoints, bytes, limit | short, bytes | `min(mimic_egress_endpoints{S})`; `max(mimic_egress_bytes{S})`; `max(mimic_limit{S, name="egress_max_bytes"})` |
+| Store (cluster-wide) | Pushes applied | ops | `sum by (result) (rate(mimic_store_pushes_total{C}[$__rate_interval]))` |
+| Store (cluster-wide) | Growth refused | ops | `sum by (kind, reason) (rate(mimic_store_refused_total{C}[$__rate_interval]))` |
+| Store (cluster-wide) | Report size p99 | bytes | `histogram_quantile(0.99, sum by (le) (rate(mimic_store_report_bytes_bucket{C}[$__rate_interval])))` |
+
+**`mimic-mock-load`** (#383; variables `datasource`, `controller`, `namespace`, `deployment`,
+`load_test`). The generator panels have data only while a Job pod is scraped (`loadTest.metricsFrom`,
+§10.7); the last values of a finished Job can be lost (§11.1).
+
+| Row | Panel | Unit | Query |
+|---|---|---|---|
+| Mode | Mode (min, max over pods) | short | `min(mimic_mock_mode{S})`; `max(mimic_mock_mode{S})` (value mapping 0 `discovery`, 1 `mock`; the two differ while the pods converge) |
+| Mode | Mode switches | short | `sum by (to) (increase(mimic_mock_mode_switches_total{S}[$__range]))` |
+| Mode | Latency factor (min, max over pods) | short | `min(mimic_mock_latency_factor{S})`; `max(mimic_mock_latency_factor{S})` |
+| Mock | Answers by tier | reqps | `sum by (result) (rate(mimic_mock_requests_total{S}[$__rate_interval]))` |
+| Mock | Miss ratio | percentunit | `sum(rate(mimic_mock_requests_total{S, result="miss"}[$__rate_interval])) / sum(rate(mimic_mock_requests_total{S}[$__rate_interval]))` |
+| Mock | Misses by reason | reqps | `sum by (reason) (rate(mimic_mock_miss_total{S}[$__rate_interval]))` |
+| Mock | Connections by decision | ops | `sum by (decision) (rate(mimic_mock_connections_total{S}[$__rate_interval]))` |
+| Mock | Pending (busiest pod), limit | short | `max(mimic_mock_pending{S})`; `max(mimic_limit{S, name="mock_max_pending"})` |
+| Mock | Snapshot age (oldest pod), endpoints | s, short | `time() - min(mimic_egress_last_pull_timestamp_seconds{S} > 0)`; `min(mimic_egress_endpoints{S})` |
+| Mock | Pulls by result | ops | `sum by (result) (rate(mimic_egress_pulls_total{S}[$__rate_interval]))` |
+| Load (controller) | Active runs, limit | short | `max(mimic_load_active_runs{C})`; `max(mimic_limit{C, name="load_max_runs"})` |
+| Load (controller) | Runs ended | short | `sum by (phase, reason) (increase(mimic_load_runs_total{C}[$__range]))` (table) |
+| Load (generator) | Achieved and planned rate | reqps | `sum by (load_test) (rate(mimic_load_requests_total{L}[$__rate_interval]))`; `sum by (load_test) (mimic_load_planned_rate{L})` (dashed) |
+| Load (generator) | Results | reqps | `sum by (load_test, result) (rate(mimic_load_requests_total{L}[$__rate_interval]))` |
+| Load (generator) | Rate by endpoint | reqps | `sum by (endpoint) (rate(mimic_load_requests_total{L}[$__rate_interval]))` |
+| Load (generator) | Latency p50, p99 by endpoint | s | `histogram_quantile(0.99, sum by (le, endpoint) (rate(mimic_load_request_duration_seconds_bucket{L}[$__rate_interval])))` |
+| Load (generator) | In flight, missed, targets | short, ops | `sum by (load_test) (mimic_load_in_flight{L})`; `sum by (load_test) (rate(mimic_load_missed_total{L}[$__rate_interval]))`; `max by (load_test) (mimic_load_targets{L})` |
+| Load (generator) | Generator memory and CPU per pod | bytes, short | `max by (pod) (process_resident_memory_bytes{L})`; `sum by (pod) (rate(process_cpu_seconds_total{L}[$__rate_interval]))` |
+| Load (sidecar) | Load requests received by result | reqps | `sum by (result) (rate(mimic_load_inbound_total{S}[$__rate_interval]))` |
 
 ## 10. Configuration and runtime (12-factor)
 
@@ -2387,7 +2594,7 @@ it sets. The pod's index and the Job's pod count come from the load API (§7.8).
 
 `mimic-load` has the common variables (§10.1) and admin listener (`0.0.0.0:15100`).
 
-### 10.7 Monitoring values (Helm, #378, #379)
+### 10.7 Monitoring values (Helm, #378, #379, #380)
 
 Chart values of the scrape objects, all off by default. Nothing of them is rendered unless enabled,
 so the default render is the one of §12.13 (MON-01).
@@ -2442,7 +2649,7 @@ ServiceMonitor, the PodMonitors and the dashboard ConfigMaps. Both are off by de
 off the render is the one of MON-01 (MON-14). Both are rendered by the chart's own templates, with no
 Helm dependency: the chart has no `dependencies`, no `Chart.lock` and no `charts/`, so a render needs no
 `helm dependency build` and the published chart vendors no third-party archive. Alerting, long-term
-storage, ingress and the dashboards themselves (#380 to #384) are out of scope. The bundled Prometheus does not scrape the kubelet or cAdvisor, which needs
+storage and ingress are out of scope; the dashboards are those of §9.1, shipped as below. The bundled Prometheus does not scrape the kubelet or cAdvisor, which needs
 `nodes/proxy`; resource use comes from the `process_*` series of mimic (#385).
 
 | Value | Default | Meaning |
@@ -2539,6 +2746,29 @@ Pins and updates: the three images are stages of `images/Dockerfile` (`prometheu
 `k8s-sidecar`), as Valkey and the exporter are. Dependabot's existing `docker` entry on `/images` (14-day
 cooldown) proposes their bumps from the `FROM` lines; `scripts/check-pins.sh` fails until `values.yaml`
 carries the same reference, so a bump PR updates both. No new Dependabot entry and no new cooldown check.
+
+#### Dashboards (#380 to #384)
+
+The dashboards of §9.1 are files of the mimic chart, `deploy/helm/mimic/dashboards/<uid>.json`, rendered
+by one template, `templates/dashboards.yaml`, through `.Files.Glob "dashboards/*.json"`: one ConfigMap per
+file, so adding a dashboard is adding a file.
+
+| Value | Default | Meaning |
+|---|---|---|
+| `monitoring.dashboards.enabled` | `false` | Renders the dashboard ConfigMaps. They are also rendered whenever `monitoring.grafana.enabled` is true, whatever this value: the bundled Grafana exists to show them. A production Grafana whose dashboard sidecar watches the release namespace (kube-prometheus-stack: `sidecar.dashboards.searchNamespace`) sets this value only. |
+| `monitoring.dashboards.annotations` | `{}` | Annotations added to every dashboard ConfigMap, for a production sidecar that files dashboards into folders (for example `grafana_folder: Mimic`). The bundled Grafana ignores them. |
+
+Each ConfigMap is named `<release>-dashboard-<basename>` (for example `mimic-dashboard-mimic-sidecar`), lives
+in the release namespace, carries the chart's labels plus `grafana_dashboard: "1"` (the label and value the
+bundled sidecar watches, and the kube-prometheus-stack default), and holds one key `<basename>.json` with the
+file's bytes unchanged (`.Files.Get`, no templating inside the JSON, so `${datasource}` and `$__rate_interval`
+reach Grafana as written). They are not part of the Grafana checksum annotation: the sidecar picks a change up
+without a restart, within the provider's `updateIntervalSeconds`. Nothing else is rendered for them: no RBAC,
+no Secret, no hook.
+
+Default off, because a dashboard is useless without a Grafana that reads the release namespace, the default
+render stays the golden file of MON-01, and a production Grafana that watches every namespace would otherwise
+receive them unasked; on with the bundled Grafana, because that is its only purpose.
 
 ## 11. Security baseline
 
@@ -2918,6 +3148,22 @@ carries the same reference, so a bump PR updates both. No new Dependabot entry a
 - (#379) The dashboard sidecar can read every ConfigMap of the release namespace, not only the
   labelled ones: RBAC cannot filter by label. The chart puts no secret in a ConfigMap, and the
   token is mounted in the sidecar container only.
+- (#380) **Whoever can write a ConfigMap labelled `grafana_dashboard: "1"` in the release namespace
+  can add or replace a dashboard** of the bundled Grafana (a production sidecar that watches every
+  namespace widens this to every namespace; that is its operator's setting). A planted dashboard
+  runs queries with the viewer's datasource and can show a misleading panel, but Grafana's HTML
+  sanitising (`disable_sanitize_html` stays false) keeps script out of text panels, and the
+  datasource reads only what Prometheus already exposes. The chart's own dashboards are checked
+  for markdown-only text panels, no external link and the `${datasource}` variable (MON-22).
+- (#380) **Dashboards show label values** (authorities, endpoint templates, namespace, deployment,
+  pod and load test names) to every Grafana viewer, as the Prometheus API does (above). No label
+  holds a secret or a request value (§9).
+- (#380) **Generator series end with the Job.** A finished load test's last values are kept only
+  if a scrape happened before its pod ended; the run's result is in its `MimicLoadTest` status
+  (§7.8), not in the dashboard.
+- (#380) **No resource limits as series.** The memory panels show `process_resident_memory_bytes`
+  without the pod's limit, which is a Kubernetes object (kube-state-metrics, outside §9); the panel
+  description gives the chart's default limit.
 - (#379) The bundled Prometheus keeps 24 hours on an emptyDir and runs one replica: data are lost
   on restart, there is no high availability. Its image (`quay.io/prometheus/prometheus`) is built
   on busybox, not distroless (upstream ships no distroless image), so it holds a shell.
@@ -3341,7 +3587,7 @@ with no `mimic-load-run` header unchanged).
 | LDT-19 | **I** (controller). Read API (§7.5): `GET /v1/workloads/<ns>/<dep>/loadtests` lists the stored runs (uid, name, phase, reason, start, end, total) newest first; `…/loadtests/<uid>` answers the run with its stored summary (per-endpoint results); `404` for an unknown uid, `400` for a uid outside the UUID grammar; headers and loopback rules of §7.5. **E.** The deployment page shows a "Load tests" table filled from these routes (pinned headless Chromium, §12.7). |
 | LDT-20 | **U.** Load ticket and injection label (§7.8): a ticket signed with a deployment's root verifies with its root certificate's public key and yields the payload; one byte changed in the payload or signature, another deployment's root, an `exp` in the past or a ticket without the `v1.` prefix do not verify; the signed bytes start with `mimic-load-ticket\0`; the same inputs give a ticket that verifies (ECDSA signatures are randomised, the payload is canonical). The injection patch also adds the label `mimic.platform.io/deployment: <deployment>` (INJ-03 amended), creating `metadata.labels` when absent and replacing a value the pod set. |
 
-### 12.13 Monitoring (#378)
+### 12.13 Monitoring (#378 to #385)
 
 Levels as in §12.2. The chart criteria are checked by `scripts/check-chart.sh` on rendered output.
 
@@ -3368,6 +3614,9 @@ Levels as in §12.2. The chart criteria are checked by `scripts/check-chart.sh` 
 | MON-19 | **E** (`helm template`, `scripts/check-chart.sh`). With `monitoring.grafana.enabled`: the Deployment `<release>-grafana` has 1 replica, strategy `Recreate`, exactly the containers `grafana` and `dashboards` with the pinned images of the values, no init container, a checksum annotation that changes with `grafana.ini` and with the provisioning, `automountServiceAccountToken: false`, and the projected token volume mounted in `dashboards` only. The Secret `<release>-grafana-admin` has a 32-character alphanumeric `admin-password` (its template reads the existing Secret with `lookup` first, as the Valkey one does; kept across upgrades, MON-21); it is mounted read-only in `grafana` only, `grafana.ini` sets `security.admin_password` to `$__file{/etc/grafana-admin/admin-password}` (the `grafana` container has no env), no env of any container holds or references the password, and the password appears in no other rendered object. The rendered `grafana.ini` holds every setting of §10.7, and its `plugins.disable_plugins` lists every bundled datasource plugin but `prometheus`, the legacy `postgres` ID included (#407); the provisioned datasource has `uid` `mimic-prometheus`, `type` `prometheus`, URL `http://<release>-prometheus:9090` (the value of `monitoring.grafana.datasourceUrl` when set) and `editable: false`; the provider reads `/tmp/dashboards`; the `dashboards` container has `LABEL=grafana_dashboard`, `LABEL_VALUE=1`, `RESOURCE=configmap`, `NAMESPACE` the release namespace and no `REQ_URL`, `REQ_USERNAME` or `REQ_PASSWORD`. The Service `<release>-grafana` is `ClusterIP` with the single port 3000; there is no Ingress, HTTPRoute or PersistentVolumeClaim; `grafana` mounts a memory emptyDir on `/tmp`; the pod has `fsGroup` 472 and `supplementalGroups` [472] (§10.7: the sidecar writes the emptyDir of grafana's dashboards); both containers have `runAsNonRoot`, the UIDs of §10.7, a read-only root filesystem, `allowPrivilegeEscalation: false`, `drop: [ALL]`, `RuntimeDefault` and the resources of the values (Pod Security `restricted`, FND-08). |
 | MON-20 | **E** (`helm template`, `scripts/check-chart.sh`). With `networkPolicy.enabled`, Grafana on and `datasourceUrl` set, the Grafana NetworkPolicy has the rules of `datasourceEgress` after its DNS and API server rules, and with `datasourceUrl` empty it has none of them; with `datasourceUrl` empty the 9090 rule admits the bundled Prometheus only (MON-20 covers both cases). With `networkPolicy.enabled` and Prometheus on, the NetworkPolicy `<release>-prometheus` selects the Prometheus pods with `policyTypes: [Ingress, Egress]`; its ingress is TCP 9090 from the Grafana pods of the release when Grafana is on, and empty otherwise; its egress is exactly TCP 15100 to every namespace (or to the namespaces of `monitoring.prometheus.namespaces` and the release namespace), TCP 8081 to the controller pods, TCP 9121 to the Valkey pods only with `valkey.metrics.enabled`, and TCP 443 and 6443 to `networkPolicy.apiServerCIDR` (no peer when empty). With Grafana on, `<release>-grafana` selects the Grafana pods with both types; ingress TCP 3000 from the release namespace; egress exactly TCP 9090 to the Prometheus pods, UDP and TCP 53 to `loadTest.dnsSelector`, and TCP 443 and 6443 as above. With `networkPolicy.enabled: false` neither is rendered. With `loadTest.enabled` and Prometheus on, `loadTest.metricsFrom` empty falls back to the namespace peer as with `metrics.podMonitor.enabled` (MON-01), and a set value wins. The controller and Valkey NetworkPolicies are the same as with monitoring off. |
 | MON-21 | **E** (kind, `scripts/e2e.sh` section `mon_21`, after `mon_02`). After an upgrade with `monitoring.prometheus.enabled` and `monitoring.grafana.enabled` (and `valkey.metrics.enabled` of `mon_02`), checked from pods of the release namespace. The Prometheus API is reached from a pod that the Prometheus NetworkPolicy admits: a pod carrying exactly the labels of that policy's ingress selector (the Grafana pods' labels, read from the live NetworkPolicy, not hard-coded). Within 120 s Prometheus `/-/ready` answers 200 from that pod and `/api/v1/targets` lists the `<release>-controller`, `mimic-sidecar` and `mimic-valkey` targets with health `up`, the injected pod's target carrying its `namespace`, `pod` and `deployment`; `POST /-/reload` and `POST /api/v1/admin/tsdb/snapshot` from that pod answer non-2xx. An unlabelled pod of the release namespace gets no HTTP answer from port 9090 (a timeout or a connection failure, status 0), so the policy is enforced, not vacuous. Grafana `/api/search` without credentials answers 401; with the admin credentials (read from the Secret into a variable, never printed) `/api/datasources/uid/mimic-prometheus/health` answers status `OK`, and a dashboard (uid `mimic-e2e`) put in a ConfigMap labelled `grafana_dashboard: "1"` by the test is listed by `/api/search` within 60 s, while one labelled `"0"` is not. The admin password appears in no log of any container of the release namespace (`grep -qF`, never printed), and a second `helm upgrade` with the same values keeps it (the sha256 of the Secret's data is unchanged). `kubectl auth can-i get secrets` answers `no` as the Prometheus and the Grafana ServiceAccounts, in the release namespace and in the app namespace.; the default login `admin:admin` gets 401. |
+| MON-22 | **E** (no cluster: `scripts/check-dashboards.py`, Python 3 standard library run with `python3 -I`, called by `scripts/check-chart.sh`). For every `deploy/helm/mimic/dashboards/*.json`: the file parses as JSON, is at most 150 KiB and equals its own re-serialisation with 2-space indentation and sorted keys; it holds every convention of §9.1 (`uid` equal to the base name and unique across files, `title`, `tags`, `id` null, `editable` false, `refresh` `30s`, `time`, `graphTooltip` 1, the single `dashboards` link, the variables of its dashboard with their queries); every `datasource` object anywhere in the file is `{"type": "prometheus", "uid": "${datasource}"}` and the string `mimic-prometheus` does not occur; panel types are in the §9.1 list, text panels are in `markdown` mode, no panel or link has a `url` and no panel has `alert`; every panel's unit is in the §9.1 list. Every PromQL expression (targets, variable queries, annotations), with `$__rate_interval` read as `1m`, `$__range` as `1h` and `$<var>` / `${<var>}` as a placeholder value, is tokenised; every metric name in it is a name of §9 (the backticked `mimic_*`, `process_*` and `redis_*` names of §9, the exporter list included) or `up`, with `_bucket`, `_count` and `_sum` accepted only after a §9 histogram; every label name obeys the §9.1 rule (labels of that metric, or of a metric inside the aggregation for `by`, the target labels, `le` on `_bucket`), and `without`, `label_replace`, `label_join` and a regex matcher on `authority` are absent. The panels of each file, by row and title, are exactly the rows of its §9.1 table, and every query the table lists for a panel is a query of that panel, once **C**, **S**, **V** and **L** are expanded and the table's escaped pipes read as plain ones. **U** (`scripts/test_check_dashboards.py`, run in CI with the other script tests): the shipped files pass, and a copy with each of these changes fails with a message naming the file and the cause: an unknown metric (`mimic_nope_total`), `_bucket` after a counter, an unknown label (`pod_ip` on `mimic_http_requests_total`), `by (authority)` over `mimic_store_writes_total`, a datasource uid `mimic-prometheus`, an `html` text panel, a duplicated `uid`, keys out of order, a file of 151 KiB, a panel missing from the §9.1 table. |
+| MON-23 | **E** (`helm template`, `scripts/check-chart.sh`). With the defaults no ConfigMap carries `grafana_dashboard` (the render is still the golden file of MON-01). With `monitoring.dashboards.enabled`, and also with `monitoring.grafana.enabled` alone, the render has exactly one ConfigMap per file of `dashboards/` (five), named `<release>-dashboard-<basename>`, in the release namespace, with the chart's labels and `grafana_dashboard: "1"`, and a single data key `<basename>.json` whose value is byte-identical to the file; `monitoring.dashboards.annotations` appear on each of them and on no other object. The two renders with and without `monitoring.dashboards.enabled` (Grafana off) differ by these ConfigMaps only. In a copy of the chart with one byte of a dashboard changed, the Grafana Deployment's checksum annotation is unchanged. `helm lint --strict` passes for `monitoring.dashboards.enabled`, and for it with `monitoring.grafana.enabled` and `monitoring.prometheus.enabled`. |
+| MON-24 | **E** (kind, folded into `scripts/e2e.sh` section `mon_21`, after its checks). With the admin credentials (never printed), Grafana `/api/search?tag=mimic` lists exactly the uids `mimic-controller`, `mimic-valkey`, `mimic-sidecar`, `mimic-discovery` and `mimic-mock-load` within 60 s, each with its §9.1 title. From the pod admitted by the Prometheus policy (MON-21), `/api/v1/label/job/values?match[]=mimic_build_info{component="controller"}` holds `<release>-controller`, and every expression of every dashboard file, with **C**, **S**, **V** and **L** set to the release, the release namespace, the injected deployment of `mon_02` and an empty `load_test` (`$__rate_interval` `2m`, `$__range` `1h`), answers `status: success` from `/api/v1/query` (a real PromQL parse; an empty result is allowed). After requests are sent through the injected deployment, the first query of the `mimic-sidecar` panel "Requests by direction and authority", posted through Grafana `/api/ds/query` with the datasource uid `mimic-prometheus` (the e2e's own value, not a dashboard's), returns within 120 s at least one frame with a value above 0. |
 
 ## 13. Test strategy
 

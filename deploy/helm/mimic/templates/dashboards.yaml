@@ -1,0 +1,23 @@
+{{- if or .Values.monitoring.dashboards.enabled .Values.monitoring.grafana.enabled }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+{{- $base := base $path | trimSuffix ".json" }}
+---
+# A Grafana dashboard of spec section 9.1, picked up by the dashboard sidecar through its label. The file is copied
+# unchanged: no templating inside the JSON, so ${datasource} and $__rate_interval reach Grafana as written.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $.Release.Name }}-dashboard-{{ $base }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "mimic.labels" $ | nindent 4 }}
+    grafana_dashboard: "1"
+  {{- with $.Values.monitoring.dashboards.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{ $base }}.json: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

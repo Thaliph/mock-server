@@ -145,6 +145,14 @@ metrics:
 
 # The bundled Prometheus and Grafana (spec §10.7, #379): for a demo or a dev cluster only, off by default.
 monitoring:
+  # The dashboards of spec section 9.1, one ConfigMap per file of dashboards/ (spec §10.7). Also rendered whenever
+  # monitoring.grafana.enabled is true. Set enabled for a production Grafana whose dashboard sidecar reads the release
+  # namespace.
+  dashboards:
+    enabled: false
+    # Annotations of every dashboard ConfigMap, for a sidecar that files dashboards into folders
+    # (for example grafana_folder: Mimic).
+    annotations: {}
   prometheus:
     enabled: false
     # Namespaces of the sidecar and load jobs, besides the release namespace. Empty: every namespace, through

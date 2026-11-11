@@ -2702,7 +2702,7 @@ if grep -qF -- "$exporter_pw" <<<"$exporter_body"; then fail "mon_02: the export
 # MON-13: the exporter's last scrape has a TYPE line for every series of the exporter list of §9.
 missing=$(mon02_missing "$exporter_body" redis_up redis_uptime_in_seconds redis_instance_info redis_memory_used_bytes \
   redis_memory_max_bytes redis_mem_fragmentation_ratio redis_evicted_keys_total redis_expired_keys_total \
-  redis_commands_processed_total redis_commands_duration_seconds_total redis_connected_clients \
+  redis_commands_processed_total redis_commands_total redis_commands_duration_seconds_total redis_connected_clients \
   redis_rejected_connections_total redis_db_keys redis_aof_last_write_status | tr '\n' ' ')
 [[ -z $missing ]] || fail "mon_02: the exporter's /metrics lacks the TYPE line of: $missing"
 
@@ -2903,6 +2903,31 @@ spec: {deployment: mon21-app}
 YAML
 deploy_sleeper $mon21_ns mon21-app
 kubectl -n $mon21_ns rollout status deploy/mon21-app --timeout=3m
+# The target of the requests that MON-24 sends through mon21-app: a plain HTTP server in the same namespace.
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mon21-echo, namespace: $mon21_ns}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mon21-echo}}
+  template:
+    metadata: {labels: {app: mon21-echo}}
+    spec:
+      containers:
+        - name: echo
+          image: $PY
+          command: [sh, -c, "mkdir -p /www && touch /www/ok && exec python3 -m http.server 8080 -d /www"]
+          ports: [{containerPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mon21-echo, namespace: $mon21_ns}
+spec:
+  selector: {app: mon21-echo}
+  ports: [{port: 8080}]
+YAML
+kubectl -n $mon21_ns rollout status deploy/mon21-echo --timeout=3m
 
 # targets_up <targets JSON>: the three jobs have an up target, and the sidecar target carries the labels of its pod.
 targets_up() {
@@ -2957,6 +2982,111 @@ done
 (( found_dash == 1 )) || fail "mon_21: the dashboard of the labelled ConfigMap is not listed by Grafana"
 jq -e 'any(.[]; .uid == "mimic-e2e-off") | not' >/dev/null <<<"$(mon21_body "$search")" \
   || fail "mon_21: the dashboard of the ConfigMap labelled 0 is listed by Grafana"
+
+# MON-24 (#380): the chart's dashboards. Grafana lists exactly the five tagged mimic, with their titles, within 60 s.
+dash_dir=deploy/helm/mimic/dashboards
+want_dashboards=$(for f in "$dash_dir"/*.json; do jq -c '{uid, title}' "$f"; done | jq -s -c 'sort_by(.uid)')
+found_dash=0
+deadline=$((SECONDS + 60))
+while (( SECONDS < deadline )); do
+  search=$(mon21_get "http://$RELEASE-grafana:3000/api/search?tag=mimic" auth)
+  if [[ $(mon21_status "$search") == 200 ]] \
+    && [[ $(jq -c '[.[] | {uid, title}] | sort_by(.uid)' <<<"$(mon21_body "$search")" 2>/dev/null) == "$want_dashboards" ]]; then
+    found_dash=1
+    break
+  fi
+  sleep 2
+done
+(( found_dash == 1 )) || fail "mon_21: Grafana /api/search?tag=mimic does not list exactly the dashboards of the chart with their titles"
+
+# The controller job of the variable query is the release's.
+controller_match=$(jq -rn '"mimic_build_info{component=\"controller\"}" | @uri')
+found_job=0
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
+  jobs=$(mon21_fetch mon21-prom "http://$RELEASE-prometheus:9090/api/v1/label/job/values?match%5B%5D=$controller_match")
+  if [[ $(mon21_status "$jobs") == 200 ]] && jq -e --arg j "$RELEASE-controller" '.data | index($j)' >/dev/null 2>&1 <<<"$(mon21_body "$jobs")"; then
+    found_job=1
+    break
+  fi
+  sleep 2
+done
+(( found_job == 1 )) || fail "mon_21: the label values of job for mimic_build_info{component=\"controller\"} lack $RELEASE-controller"
+
+# Every expression of every dashboard parses on the real Prometheus (status success; an empty result is allowed), with
+# the selectors set to the release, the injected deployment of mon_02 and an empty load test.
+dash_exprs=$(for f in "$dash_dir"/*.json; do
+  jq -c --arg d "$(basename "$f" .json)" --arg c "$RELEASE-controller" --arg ns "$mon21_ns" --arg rel "$NS" --arg dep mon21-app '
+    [.. | objects | select((.expr? | type) == "string") | .expr]
+    | map(gsub("\\$__rate_interval"; "2m") | gsub("\\$__range"; "1h") | gsub("\\$controller"; $c)
+        | gsub("\\$namespace"; (if $d == "mimic-valkey" then $rel else $ns end)) | gsub("\\$deployment"; $dep)
+        | gsub("\\$load_test"; ""))
+    | map({d: $d, e: .})[]' "$f"
+done | jq -s -c .)
+mon21_expr_py=$(cat <<'PY'
+import json, sys, urllib.error, urllib.parse, urllib.request
+bad = 0
+items = json.load(sys.stdin)
+for it in items:
+    url = sys.argv[1] + "/api/v1/query?" + urllib.parse.urlencode({"query": it["e"]})
+    try:
+        body = json.load(urllib.request.urlopen(url, timeout=30))
+        ok, err = body.get("status") == "success", body.get("error", "")
+    except urllib.error.HTTPError as e:
+        ok, err = False, e.read().decode("utf-8", "replace")[:300]
+    except OSError as e:
+        ok, err = False, str(e)
+    if not ok:
+        bad += 1
+        print("FAIL", it["d"], it["e"], err)
+print("checked", len(items), "bad", bad)
+PY
+)
+expr_out=$(printf '%s' "$dash_exprs" | kubectl -n "$NS" exec -i mon21-prom -- python3 -I -c "$mon21_expr_py" "http://$RELEASE-prometheus:9090" 2>&1 || true)
+[[ $(tail -n 1 <<<"$expr_out") =~ ^checked\ [1-9][0-9]*\ bad\ 0$ ]] \
+  || fail "mon_21: a dashboard expression is not accepted by Prometheus: $(grep '^FAIL' <<<"$expr_out" | head -n 3)"
+
+# One panel query of mimic-sidecar through Grafana, with the datasource uid of this test, after requests through the
+# injected deployment: at least one frame holds a value above 0 within 120 s. The password goes on stdin with the body.
+mon21_ds_py=$(cat <<'PY'
+import base64, sys, urllib.error, urllib.request
+pw, _, body = sys.stdin.read().partition("\n")
+auth = "Basic " + base64.b64encode(("admin:" + pw).encode()).decode()
+req = urllib.request.Request(sys.argv[1], data=body.encode(), method="POST",
+                             headers={"Content-Type": "application/json", "Authorization": auth})
+try:
+    r = urllib.request.urlopen(req, timeout=30)
+    code, out = r.status, r.read()
+except urllib.error.HTTPError as e:
+    code, out = e.code, e.read()
+except OSError:
+    code, out = 0, b""
+sys.stdout.write("%d\n%s" % (code, out.decode("utf-8", "replace")))
+PY
+)
+panel_expr=$(jq -r --arg ns "$mon21_ns" --arg dep mon21-app '
+  .panels[] | select(.title == "Requests by direction and authority") | .targets[0].expr
+  | gsub("\\$__rate_interval"; "2m") | gsub("\\$namespace"; $ns) | gsub("\\$deployment"; $dep)' "$dash_dir/mimic-sidecar.json")
+[[ -n $panel_expr ]] || fail "mon_21: the mimic-sidecar panel Requests by direction and authority has no query"
+ds_body=$(jq -n -c --arg e "$panel_expr" '{queries: [{refId: "A", datasource: {type: "prometheus", uid: "mimic-prometheus"},
+  expr: $e, range: true, instant: false, intervalMs: 15000, maxDataPoints: 100}], from: "now-10m", to: "now"}')
+traffic='import urllib.request
+for _ in range(5):
+    urllib.request.urlopen("http://mon21-echo:8080/ok", timeout=10).read()'
+has_value=0
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
+  kubectl -n "$mon21_ns" exec deploy/mon21-app -- python3 -c "$traffic" >/dev/null 2>&1 || true
+  ds=$(printf '%s\n%s' "$grafana_pw" "$ds_body" | kubectl -n "$NS" exec -i mon21-client -- python3 -I -c "$mon21_ds_py" \
+    "http://$RELEASE-grafana:3000/api/ds/query" 2>/dev/null || true)
+  if [[ $(mon21_status "$ds") == 200 ]] \
+    && jq -e '[.results.A.frames[]?.data.values[1]?[]? | select(. != null and . > 0)] | length > 0' >/dev/null 2>&1 <<<"$(mon21_body "$ds")"; then
+    has_value=1
+    break
+  fi
+  sleep 5
+done
+(( has_value == 1 )) || fail "mon_21: the mimic-sidecar panel query through Grafana returns no value above 0"
 
 # The lifecycle and admin APIs are off (MON-16): Prometheus refuses a reload and a TSDB snapshot with a 4xx or 5xx.
 mon21_post='import sys, urllib.error, urllib.request
