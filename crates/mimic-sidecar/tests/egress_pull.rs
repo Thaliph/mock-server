@@ -1118,3 +1118,150 @@ async fn pul_15_a_held_snapshot_changes_no_traffic() {
     assert!(plain_recorded.contains("/v1/ping"), "{plain_recorded}");
     assert_eq!(plain_lines, held_lines);
 }
+
+// --- PLH-07 (integration): an F12 egress set through the pull path ---------------------------
+
+/// The egress set of a token endpoint and an authenticated call, as an F12 controller serves it:
+/// every placeholder is the legacy marker, and the size of each sample follows.
+fn f12_set() -> (EgressSet, String) {
+    use mimic_core::discovery::placeholder::PLACEHOLDERS;
+    const MARKER: &str = "<redacted>";
+    let mut report = Report::new(None);
+    let json = [("content-type", "application/json")];
+    type Call<'a> = (
+        &'a str,
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        &'a [(&'a str, &'a str)],
+        &'a str,
+    );
+    let calls: [Call<'_>; 2] = [
+        (
+            "POST",
+            "/oauth/token",
+            &json,
+            &[
+                ("content-type", "application/json"),
+                ("set-cookie", "sid=CANARYcookie0123456789; Path=/"),
+            ],
+            r#"{"access_token":"CANARYtoken0123456789"}"#,
+        ),
+        (
+            "GET",
+            "/orders",
+            &[("authorization", "Bearer CANARYtoken0123456789")],
+            &json,
+            r#"{"orders":[]}"#,
+        ),
+    ];
+    for (method, path, req_headers, resp_headers, body) in calls {
+        report.record_at(
+            ScopeKey::Authority("api.example.com:443".into()),
+            &Via {
+                tls: true,
+                sni: Some("api.example.com"),
+                dst: None,
+            },
+            &limits(),
+            &Redactor::default().outbound_request(),
+            &Exchange {
+                direction: Direction::Outbound,
+                port: 443,
+                method,
+                path,
+                status: 200,
+                head_ms: 3,
+                host: None,
+                grpc: false,
+                observation: Observation {
+                    query: "",
+                    req_headers,
+                    req_body: None,
+                    resp_headers,
+                    resp_body: Some(body.as_bytes()),
+                },
+            },
+        );
+    }
+    let set = EgressSet::project(&report);
+    fn walk(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::String(s) => {
+                *s = PLACEHOLDERS
+                    .iter()
+                    .fold(s.clone(), |t, p| t.replace(p, MARKER));
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            serde_json::Value::Object(map) => {
+                let grown = map.contains_key("request_shape").then(|| {
+                    let text = serde_json::Value::Object(map.clone()).to_string();
+                    PLACEHOLDERS
+                        .iter()
+                        .map(|p| {
+                            text.matches(p).count() as i64 * (MARKER.len() as i64 - p.len() as i64)
+                        })
+                        .sum::<i64>()
+                });
+                map.values_mut().for_each(walk);
+                if let (Some(grown), Some(bytes)) =
+                    (grown, map.get("bytes").and_then(serde_json::Value::as_u64))
+                {
+                    map.insert("bytes".into(), bytes.saturating_add_signed(grown).into());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(&set).unwrap();
+    walk(&mut value);
+    (set, value.to_string())
+}
+
+#[tokio::test]
+async fn plh_07_an_f12_set_is_upgraded_by_the_pull_and_the_mock_answers_placeholders() {
+    use mimic_core::mock::Request;
+    let (current, legacy) = f12_set();
+    assert!(legacy.contains("<redacted>"));
+    let rig = Rig::start(vec![], ok(&legacy, "\"1-aa\"")).await;
+    wait(|| rig.snapshot.etag().as_deref() == Some("\"1-aa\"")).await;
+    let index = rig.snapshot.index().expect("a snapshot");
+    let ask = |method: &str, path: &str, headers: &[(&str, &str)]| {
+        let request = Request {
+            method,
+            target: Some("api.example.com"),
+            tls: true,
+            sni: None,
+            dst: "10.0.0.5:443".parse().unwrap(),
+            h2: false,
+            path,
+            query: "",
+            headers,
+            body: None,
+        };
+        let hit = index
+            .lookup(&Redactor::default(), &request)
+            .map_err(|_| "a miss")
+            .unwrap();
+        (hit.tier, hit.response(method))
+    };
+    // The token endpoint answers placeholders, never the legacy marker.
+    let (_, token) = ask("POST", "/oauth/token", &[]);
+    let body = String::from_utf8_lossy(token.body()).into_owned();
+    assert_eq!(body, r#"{"access_token":"mimic-token"}"#);
+    let cookie = token.headers.iter().find(|(n, _)| n == "set-cookie");
+    assert_eq!(
+        cookie.map(|(_, v)| v.as_str()),
+        Some("sid=mimic-cookie; Path=/")
+    );
+    // The app replays what it was given: `Bearer mimic-token` is not compared, and the call is
+    // answered with that endpoint's sample.
+    let (tier, orders) = ask("GET", "/orders", &[("authorization", "Bearer mimic-token")]);
+    assert_eq!(tier, mimic_core::mock::Tier::Exact);
+    assert_eq!(orders.body(), br#"{"orders":[]}"#);
+    // The pulled set is the upgraded one.
+    assert_eq!(
+        mimic_core::discovery::egress::EgressSet::from_json(&legacy).unwrap(),
+        current
+    );
+    rig.stop().await;
+}
