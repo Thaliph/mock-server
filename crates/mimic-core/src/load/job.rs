@@ -111,7 +111,7 @@ pub fn job(input: &JobInput<'_>) -> Value {
         env.push(("MIMIC_LOAD_CREDENTIALS_DIR", CREDENTIALS_DIR.to_string()));
         volumes.push(json!({
             "name": "credentials",
-            "secret": {"secretName": secret, "optional": false, "defaultMode": 0o400},
+            "secret": {"secretName": secret, "optional": false, "defaultMode": 0o440},
         }));
         mounts.push(json!({"name": "credentials", "mountPath": CREDENTIALS_DIR, "readOnly": true}));
     }
@@ -154,6 +154,9 @@ pub fn job(input: &JobInput<'_>) -> Value {
                     "securityContext": {
                         "runAsNonRoot": true,
                         "runAsUser": UID,
+                        // Group-read on the Secret files (mode 0440) needs the group (#414).
+                        "fsGroup": UID,
+                        "fsGroupChangePolicy": "OnRootMismatch",
                         "seccompProfile": {"type": "RuntimeDefault"},
                     },
                     "containers": [{
