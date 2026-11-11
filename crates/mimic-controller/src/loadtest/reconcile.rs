@@ -668,8 +668,22 @@ impl Reconciler {
                         .await;
                 }
                 Ok(Ok(JobState::Complete)) => {
+                    // The posts above may be a held read older than the last final post:
+                    // read them again before deciding that a worker never reported.
+                    let fresh = self.with_state(uid, |s| {
+                        let fresh = s.posts.as_ref().is_some_and(|p| p.at_ms == now_ms);
+                        if !fresh {
+                            s.posts = None;
+                            s.last_job_check_ms = None;
+                        }
+                        fresh
+                    });
+                    if !fresh {
+                        return;
+                    }
+                    let message = "the generator Job completed without every final report";
                     return self
-                        .end(test, "Succeeded", "Completed", "", now_ms, false)
+                        .end(test, "Failed", "NoReport", message, now_ms, false)
                         .await;
                 }
                 _ => {}
