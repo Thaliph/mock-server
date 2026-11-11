@@ -196,7 +196,7 @@ sweep_logs() {
       if found -e NotFound -e 'waiting to start' -e PodInitializing "$WORK/pod.err"; then continue; fi
       fail "ldt_16: cannot read the logs of pod $pod in $ns"
     fi
-    if found -F "$canary" "$WORK/pod.log"; then
+    if found -F -e "$canary" "$WORK/pod.log"; then
       fail "ldt_16: a canary of the credentials Secret is in a log line of pod $pod in $ns"
     fi
   done < "$WORK/pods.txt"
@@ -238,7 +238,7 @@ ldt_19_check() {
     ([.rows[] | select(.[0] == $a and .[1] == "Succeeded" and .[2] == "Completed" and ((.[5] | tonumber? // 0) > 0))] | length == 1)
     and ([.rows[] | select(.[0] == $b and .[1] == "Aborted" and .[2] == "ModeLeft")] | length == 1)' "$WORK/browse.json" >/dev/null \
     || fail "ldt_19: the Load tests table lacks run A (Succeeded/Completed with requests) or run B (Aborted/ModeLeft)"
-  if found -F "$canary" "$WORK/browse.json"; then fail "ldt_19: a canary of the credentials Secret is on the deployment page"; fi
+  if found -F -e "$canary" "$WORK/browse.json"; then fail "ldt_19: a canary of the credentials Secret is on the deployment page"; fi
   docker rm -f "$CHROME" >/dev/null 2>&1 || true
   CHROME=""
   kill "$UI_PF" 2>/dev/null || true
@@ -327,7 +327,7 @@ suite_main() {
   [[ $(calls disc-22 app=users app) == "$users0" ]] || fail "ldt_16: users logged calls during run A"
   [[ $(calls mck-19-provider app=provider provider) == "$prov0" ]] || fail "ldt_16: the provider logged calls during run A"
   [[ $(exchanges) == "$exch0" ]] || fail "ldt_16: the discovery exchanges of front grew during run A"
-  if found -F "$canary" "$WORK/run-a.json"; then fail "ldt_16: a canary of the credentials Secret is in the status of run A"; fi
+  if found -F -e "$canary" "$WORK/run-a.json"; then fail "ldt_16: a canary of the credentials Secret is in the status of run A"; fi
 
   # Run B: switched out of mock 20 s after its start.
   log "ldt_16: run B is switched to discovery 20 s after its start: Aborted/ModeLeft, its Job gone within 10 s"
@@ -386,7 +386,7 @@ fi
 log "ldt_06: the default chart installs no load test object and no load test RBAC or policy"
 off=$(helm template "$RELEASE" deploy/helm/mimic -n "$NS")
 for word in MimicLoadTest mimicloadtests endpointslices networkpolicies "kind: Job" "-load-job" "-load-secret"; do
-  if found -F "$word" <<<"$off"; then fail "ldt_06: the default chart renders $word"; fi
+  if found -F -e "$word" <<<"$off"; then fail "ldt_06: the default chart renders $word"; fi
 done
 [[ $(grep -c '^kind: ValidatingAdmissionPolicy$' <<<"$off" || true) == 1 ]] \
   || fail "ldt_06: the default chart renders a ValidatingAdmissionPolicy besides the injector's"
@@ -398,7 +398,7 @@ if helm template "$RELEASE" deploy/helm/mimic -n "$NS" --set loadTest.enabled=tr
   fail "ldt_06: loadTest.enabled with a tag only rendered"
 fi
 tag_only=$(helm template "$RELEASE" deploy/helm/mimic -n "$NS" --set loadTest.enabled=true --set image.tag=v1 2>&1 || true)
-found -F "image.digest" <<<"$tag_only" || fail "ldt_06: the message does not name image.digest: $tag_only"
+found -F -e "image.digest" <<<"$tag_only" || fail "ldt_06: the message does not name image.digest: $tag_only"
 
 log "ldt_06: with loadTest.enabled and a digest the chart adds the CRD and the two policies"
 on=$(helm template "$RELEASE" deploy/helm/mimic -n "$NS" --set loadTest.enabled=true \
@@ -650,7 +650,7 @@ refuse() {
   if out=$(kubectl --as="$CTL" create --dry-run=server -f "$WORK/refused.json" 2>&1); then
     fail "ldt_17: an object refused for '$key' was admitted"
   fi
-  found -F "$key" <<<"$out" || fail "ldt_17: the refusal does not name '$key': $out"
+  found -F -e "$key" <<<"$out" || fail "ldt_17: the refusal does not name '$key': $out"
 }
 
 log "ldt_17: the objects of the controller are admitted (the Job with and without a Secret, the NetworkPolicy)"
@@ -784,7 +784,7 @@ for object in job/plain-job networkpolicy/plain-np; do
   if out=$(kubectl --as="$CTL" delete -n "$LOAD_NS" "$object" --dry-run=server 2>&1); then
     fail "ldt_17: the controller may delete $object, which has no load test labels"
   fi
-  found -F "metadata labels must be those of spec 7.8" <<<"$out" \
+  found -F -e "metadata labels must be those of spec 7.8" <<<"$out" \
     || fail "ldt_17: the refusal of the delete of $object does not name the labels: $out"
 done
 # Without the owner reference: its MimicLoadTest does not exist, so the garbage collector
