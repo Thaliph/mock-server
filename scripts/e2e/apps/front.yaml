@@ -1,7 +1,9 @@
 # Service A of the e2e apps (scripts/e2e/apps/service.py) and the client that calls it. A forwards
-# /front/<path> to UPSTREAM, the Service of B (`users` in the namespace disc-22, see users.yaml). Apply
-# with `kubectl -n <namespace> apply -f` to a namespace that mimic does not inject: its traffic is the
-# client's, not a mimic-observed one. Pinned: python:3.13-slim by digest.
+# /front/<path> to UPSTREAM, the Service of B (`users` in the namespace disc-22, see users.yaml), and
+# the bare `client` pod only sleeps: the Quick start and the e2e script exec into it to send calls to
+# front. Apply with `kubectl -n <namespace> apply -f` to a namespace that mimic does not inject: its
+# traffic is the client's, not a mimic-observed one (front-injected.yaml is the injected variant).
+# Pinned: python:3.13-slim by digest.
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: front}

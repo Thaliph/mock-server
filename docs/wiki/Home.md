@@ -5,7 +5,7 @@ which other services it calls, without touching the application code. It then an
 calls from the recording, so you can load-test the service alone, without its dependencies, and without
 calling a real provider.
 
-This wiki documents mimic **0.2.0-alpha.2** (pre-release).
+This wiki documents mimic **0.2.0-alpha.3** (pre-release).
 
 The wiki is not versioned: it describes the
 release it was last published from, and `docs/wiki/` at a release tag documents that release. The reference is
@@ -86,7 +86,7 @@ readable through a small API. [Concepts](Concepts) explains the parts.
 
 ## Release status
 
-`0.2.0-alpha.2` is a pre-release: the `v1alpha1` CRDs may change incompatibly before `0.2.0`, and
+`0.2.0-alpha.3` is a pre-release: the `v1alpha1` CRDs may change incompatibly before `0.2.0`, and
 there is no upgrade from the legacy `v0.1.0`. See the
 [CHANGELOG](https://github.com/Thaliph/mock-server/blob/main/CHANGELOG.md) and the accepted limits in
 [Security](Security).
