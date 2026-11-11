@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19).
+# End-to-end checks on kind (MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -2621,6 +2621,11 @@ done
 kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/mck19-controller.log" \
   || fail "mck_19: cannot read the controller logs"
 if found -F "$mck_canary" "$WORK/mck19-controller.log"; then fail "mck_19: a canary of front appears in the controller logs"; fi
+
+# LDT-16 and LDT-19 (E), spec §12.12 (F11): a load test of front on this setup, in mock, and the deployment page with its
+# runs. It needs mck-19, disc-22 and mck-19-provider, so it runs before the teardown below removes them.
+CLUSTER=$CLUSTER TAG=$TAG IMAGE=$IMAGE INIT_IMAGE=$INIT_IMAGE scripts/e2e-load.sh --suite \
+  || fail "ldt_16: scripts/e2e-load.sh --suite failed"
 
 kubectl delete namespace mck-19 mck-19-provider --wait=false >/dev/null
 

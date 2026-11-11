@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# End-to-end checks of the load test on kind (LDT-06, LDT-17; spec §7.8, §11).
+# End-to-end checks of the load test on kind (LDT-06, LDT-17, LDT-16, LDT-19 E; spec §7.8, §11, §12.12).
 # Idempotent: reuses the cluster if it exists and upgrades the release mimic in place. It
 # shares the cluster and the release with scripts/e2e.sh: never run the two at the same time.
 #
+#   scripts/e2e-load.sh            LDT-06 and LDT-17 on a cluster of its own (builds and installs)
+#   scripts/e2e-load.sh --suite    LDT-16 and LDT-19 (E), called by scripts/e2e.sh after its F10 section: it needs
+#                                  the MCK-19 setup of e2e.sh (front in mck-19, users in disc-22, the provider in
+#                                  mck-19-provider, all in mock or discovery) and the cluster and images of that run
+#
 #   TAG=e2e-load-<sha>-<pid>                    tag of the images built here (unique per run)
-#   IMAGE=ghcr.io/thaliph/mimic:$TAG            image to test (built here unless SKIP_BUILD=1)
+#   IMAGE=ghcr.io/thaliph/mimic:$TAG            image to test (built here unless SKIP_BUILD=1; --suite: the one e2e.sh loaded)
 #   INIT_IMAGE=ghcr.io/thaliph/mimic-init:$TAG  mimic-init image (built here unless SKIP_BUILD=1)
 #   CLUSTER=mimic-e2e                           kind cluster name
 #   NODE_IMAGE=kindest/node:v1.33.12@sha256:…    kind node image (default: kind's own)
-#   KEEP_CLUSTER=1                              keep the cluster afterwards (default: keep locally, delete in CI)
+#   KEEP_CLUSTER=1                              keep the cluster afterwards (default: keep locally, delete in CI; --suite: kept)
 #
 # The chart needs image.digest with loadTest.enabled: the digest is the one the node's containerd
 # holds for IMAGE, read with crictl. The Job and NetworkPolicy checked below are the objects that
@@ -19,6 +24,12 @@ set -Eeuo pipefail
 trap 'e2e_status=$?; echo "FAIL line $LINENO: \"$BASH_COMMAND\" exited with status $e2e_status" >&2' ERR
 cd "$(dirname "$0")/.."
 
+SUITE=0
+case ${1:-} in
+  "") ;;
+  --suite) SUITE=1 ;;
+  *) echo "usage: $0 [--suite]" >&2; exit 2 ;;
+esac
 TAG=${TAG:-e2e-load-$(git rev-parse --short HEAD 2>/dev/null || echo local)-$$}
 IMAGE=${IMAGE:-ghcr.io/thaliph/mimic:$TAG}
 INIT_IMAGE=${INIT_IMAGE:-ghcr.io/thaliph/mimic-init:$TAG}
@@ -29,7 +40,11 @@ LOAD_NS=load-e2e
 PLAIN_NS=load-plain
 CTL="system:serviceaccount:$NS:$RELEASE-controller"
 KEEP_CLUSTER=${KEEP_CLUSTER:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)}
+# --suite leaves the cluster to scripts/e2e.sh.
+(( SUITE == 0 )) || KEEP_CLUSTER=1
 BUILT=0
+UI_PF=""
+CHROME=""
 WORK=$(mktemp -d)
 
 # found <grep args>: 0 on a match, 1 on none; an error of grep stops the script.
@@ -52,10 +67,301 @@ fail() {
 }
 cleanup() {
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
+  [[ -z $UI_PF ]] || kill "$UI_PF" 2>/dev/null || true
+  [[ -z $CHROME ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
   rm -rf "$WORK"
   [[ $KEEP_CLUSTER == 1 ]] || kind delete cluster --name "$CLUSTER"
 }
 trap cleanup EXIT
+
+# image_digest <tag>: the manifest digest that the node's containerd holds for the tag.
+image_digest() {
+  docker exec "$CLUSTER-control-plane" crictl images --digests -o json \
+    | jq -r --arg tag "$1" '.images[] | select(.repoTags | index($tag)) | .repoDigests[]' \
+    | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' \
+    | head -n 1
+}
+
+# --- --suite: LDT-16 and LDT-19 (E), spec §12.12 -----------------------------------------------------------
+# scripts/e2e.sh calls this after its F10 section, before that section removes its namespaces. There mck-19 holds front
+# (in discovery, 3 pods, injected), disc-22 users (discovery) and mck-19-provider. The run below switches front to mock
+# (spec.mode), so the names and the numbers of this part are those of e2e.sh's MCK-19 setup. The release is upgraded with
+# loadTest.enabled; the values of e2e.sh are reused, and its later installs do not reuse values, so loadTest goes off again.
+PSA_NS=ldt-16-psa
+UI_PORT=18083
+CHROME_PORT=19224
+# Set by suite_main: the Secret's canary (never printed), the digest of IMAGE and the run objects' names.
+canary=""
+digest=""
+users0=""; prov0=""; exch0=""
+
+# wait_for <seconds> <command...>: the command succeeds within the time. Its errors are no failure while it polls.
+wait_for() {
+  local end=$((SECONDS + $1))
+  shift
+  until "$@" 2>/dev/null; do
+    (( SECONDS < end )) || return 1
+    sleep 2
+  done
+}
+# exists <kubectl get arguments>: the object is there.
+exists() { kubectl get "$@" -o name >/dev/null 2>&1; }
+# absent <kubectl get arguments>: the object is NotFound; any other error is not an absence.
+absent() {
+  local out
+  if out=$(kubectl get "$@" -o name 2>&1); then return 1; fi
+  [[ $out == *NotFound* ]]
+}
+# run_status <ns> <name>: phase/reason of a MimicLoadTest.
+run_status() { kubectl -n "$1" get mimicloadtest "$2" -o jsonpath='{.status.phase}/{.status.reason}' 2>/dev/null; }
+# run_is <ns> <name> <pattern>: the status of the run matches the glob pattern (Running/*, Aborted/ModeLeft).
+run_is() {
+  local s
+  s=$(run_status "$1" "$2") || return 1
+  # shellcheck disable=SC2053 # the pattern is a glob on purpose
+  [[ $s == $3 ]]
+}
+# job_of <ns> <run>: the name of the run's Job and NetworkPolicy, mimic-load-<12 hex digits of the uid> (spec §7.8).
+job_of() {
+  local uid
+  uid=$(kubectl -n "$1" get mimicloadtest "$2" -o jsonpath='{.metadata.uid}') || return 1
+  uid=${uid//-/}
+  echo "mimic-load-${uid:0:12}"
+}
+# owned_by <ns> <kind/name> <run>: the object is owned by the run.
+owned_by() {
+  [[ $(kubectl -n "$1" get "$2" -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}' 2>/dev/null) \
+    == "MimicLoadTest/$3" ]]
+}
+# calls <ns> <label> <container>: the access lines (with a method, the /users/0 probes aside) of the pods' container,
+# summed. A failed read is an error: no pipe hides it.
+calls() {
+  local pods p log n total=0
+  pods=$(kubectl -n "$1" get pods -l "$2" -o jsonpath='{.items[*].metadata.name}') || return 1
+  [[ -n $pods ]] || return 1
+  for p in $pods; do
+    log=$(kubectl -n "$1" logs "$p" -c "$3") || return 1
+    n=$(jq -R -s 'split("\n") | map(fromjson? | select(. != null and (.method? != null) and (.path? != "/users/0"))) | length' <<< "$log") || return 1
+    total=$((total + n))
+  done
+  echo "$total"
+}
+# exchanges: the discovery exchanges of front (status of its MimicWorkload).
+exchanges() { kubectl -n mck-19 get mimicworkload front -o jsonpath='{.status.discovery.exchanges}'; }
+# front_in_mock: every pod of front is in mock (status.mode of its MimicWorkload, as e2e.sh's MCK-07 wait).
+front_in_mock() {
+  kubectl -n mck-19 get mimicworkload front -o jsonpath='{.status.mode}' 2>/dev/null \
+    | jq -e '.mode == "mock" and .otherPods == 0' >/dev/null 2>&1
+}
+# run_create <ns> <name> <deployment> <credentials YAML or empty>: a run of the shape of LDT-16 (8 in flight, 50 rps,
+# 60 s, rampUp 10 s).
+run_create() {
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicLoadTest
+metadata: {name: $2, namespace: $1}
+spec:
+  deployment: $3
+  duration: 60s
+  concurrency: 8
+  rate: 50
+  rampUp: 10s
+$4
+YAML
+}
+# psa_restricted <ns> <Job>: the Job's pod template is admitted as a Pod in a namespace of Pod Security restricted
+# (server dry run, so the pod is not created).
+psa_restricted() {
+  kubectl -n "$1" get job "$2" -o json \
+    | jq --arg ns "$PSA_NS" '{apiVersion: "v1", kind: "Pod", metadata: {generateName: "psa-", namespace: $ns, labels: .spec.template.metadata.labels}, spec: .spec.template.spec}' \
+    > "$WORK/psa-pod.json" || return 1
+  kubectl create --dry-run=server -f "$WORK/psa-pod.json" -o name >/dev/null
+}
+# sweep_logs: no log line of any pod of the cluster holds the canary of the credentials Secret (LDT-16, LDT-14).
+sweep_logs() {
+  local ns pod
+  kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' > "$WORK/pods.txt" \
+    || fail "ldt_16: cannot list the pods"
+  while read -r ns pod; do
+    if ! kubectl -n "$ns" logs "$pod" --all-containers --tail=-1 > "$WORK/pod.log" 2> "$WORK/pod.err"; then
+      # A pod that is gone, or whose containers do not run yet, has no log to read.
+      if found -e NotFound -e 'waiting to start' -e PodInitializing "$WORK/pod.err"; then continue; fi
+      fail "ldt_16: cannot read the logs of pod $pod in $ns"
+    fi
+    if found -F "$canary" "$WORK/pod.log"; then
+      fail "ldt_16: a canary of the credentials Secret is in a log line of pod $pod in $ns"
+    fi
+  done < "$WORK/pods.txt"
+}
+devtools_up() { curl -fs "127.0.0.1:$CHROME_PORT/json/version" >/dev/null; }
+ui_up() { curl -fs "localhost:$UI_PORT/v1/workloads" >/dev/null; }
+
+# ldt_19_check: the deployment page of front, in pinned headless Chromium, shows the "Load tests" table with runs A and
+# B (LDT-19 E). It reads the same routes as the browser does, through a port-forward to a controller pod.
+ldt_19_check() {
+  local pod
+  pod=$(kubectl -n "$NS" get pods -l app.kubernetes.io/name=mimic-controller --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}') || fail "ldt_19: cannot list the controller pods"
+  [[ -n $pod ]] || fail "ldt_19: no running controller pod"
+  kubectl -n "$NS" port-forward "pod/$pod" "$UI_PORT:8080" >/dev/null 2>&1 &
+  UI_PF=$!
+  wait_for 30 ui_up || fail "ldt_19: port-forward to the read API of a controller pod"
+  # The container holds no capability and writes only to its tmpfs; --no-sandbox as in UI-12 (the container is the sandbox).
+  local chrome_image
+  chrome_image=$(scripts/pinned-image.sh e2e-chromium)
+  CHROME=mimic-e2e-load-chromium-$$
+  docker run -d --rm --name "$CHROME" --network host --cap-drop=ALL --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp --tmpfs /root --entrypoint /headless-shell/headless-shell "$chrome_image" \
+    --no-sandbox --user-data-dir=/tmp/chrome --disable-gpu --remote-debugging-address=127.0.0.1 --remote-debugging-port=$CHROME_PORT \
+    --host-resolver-rules='MAP * ~NOTFOUND , EXCLUDE localhost' about:blank >/dev/null || fail "ldt_19: cannot start Chromium"
+  wait_for 30 devtools_up || fail "ldt_19: Chromium does not answer on its DevTools port"
+  python3 -I scripts/e2e/ui_browser.py "$CHROME_PORT" "http://localhost:$UI_PORT/ui/workloads/mck-19/front" \
+    --wait "Load tests" --wait ldt16-a --wait ldt16-b > "$WORK/browse.json" \
+    || fail "ldt_19: the browser did not show the Load tests table of front"
+  [[ $(jq '.violations | length' "$WORK/browse.json") == 0 ]] || fail "ldt_19: CSP violations on the deployment page"
+  [[ $(jq --arg o "http://localhost:$UI_PORT/" '[.requests[] | select((startswith($o) or startswith("data:")) | not)] | length' "$WORK/browse.json") == 0 ]] \
+    || fail "ldt_19: the deployment page requested something outside the read API"
+  [[ $(jq '.requests | length' "$WORK/browse.json") -gt 0 ]] || fail "ldt_19: the browser recorded no request"
+  [[ $(jq '[.buttons[] | select(test("try it out|execute"; "i"))] | length' "$WORK/browse.json") == 0 ]] \
+    || fail "ldt_19: a Try it out or Execute button is shown"
+  # The rows: run A is Succeeded/Completed with requests, run B is Aborted/ModeLeft (the cells: name, phase, reason, start,
+  # end, requests, missed, statuses, errors, RPS, p99).
+  jq -e --arg a ldt16-a --arg b ldt16-b '
+    ([.rows[] | select(.[0] == $a and .[1] == "Succeeded" and .[2] == "Completed" and ((.[5] | tonumber? // 0) > 0))] | length == 1)
+    and ([.rows[] | select(.[0] == $b and .[1] == "Aborted" and .[2] == "ModeLeft")] | length == 1)' "$WORK/browse.json" >/dev/null \
+    || fail "ldt_19: the Load tests table lacks run A (Succeeded/Completed with requests) or run B (Aborted/ModeLeft)"
+  if found -F "$canary" "$WORK/browse.json"; then fail "ldt_19: a canary of the credentials Secret is on the deployment page"; fi
+  docker rm -f "$CHROME" >/dev/null 2>&1 || true
+  CHROME=""
+  kill "$UI_PF" 2>/dev/null || true
+  UI_PF=""
+}
+
+# suite_main: LDT-16 and LDT-19 (E) on the cluster of scripts/e2e.sh.
+suite_main() {
+  local clusters repo mimic_ref users1 prov1 users2 prov2 sent missing job_a job_b job_c creds
+  clusters=$(kind get clusters) || fail "ldt_16: kind get clusters failed"
+  found -x "$CLUSTER" <<<"$clusters" || fail "ldt_16: no kind cluster $CLUSTER: --suite runs after scripts/e2e.sh"
+  kubectl config use-context "kind-$CLUSTER" >/dev/null
+  kubectl -n mck-19 get mimicworkload front >/dev/null 2>&1 && kubectl -n disc-22 get mimicworkload users-a >/dev/null 2>&1 \
+    || fail "ldt_16: the MCK-19 setup is not there: --suite runs from scripts/e2e.sh after its F10 section"
+
+  log "ldt_16: helm upgrade with loadTest.enabled, the digest of the image under test"
+  digest=$(image_digest "$IMAGE" || true)
+  [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || fail "ldt_16: no digest of $IMAGE on the node (got '$digest')"
+  repo=${IMAGE%:*}
+  mimic_ref="$repo@$digest"
+  # As in the standalone run: containerd knows the image by its tag only; the digest reference is an alias of it.
+  docker exec "$CLUSTER-control-plane" ctr -n k8s.io images tag --force "$IMAGE" "$mimic_ref" >/dev/null
+  helm upgrade "$RELEASE" deploy/helm/mimic -n "$NS" --reuse-values --set loadTest.enabled=true \
+    --set image.digest="$digest" --wait --timeout 4m >/dev/null || fail "ldt_16: helm upgrade with loadTest.enabled"
+  kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
+
+  # The Secret of the credentials: a canary, held by the Secret and by the generator's requests only.
+  canary="ldt16-$(openssl rand -hex 16)"
+  kubectl -n mck-19 create secret generic front-load --from-literal=token="$canary" --from-literal=tenant="$canary" >/dev/null \
+    || fail "ldt_16: cannot create the credentials Secret"
+  creds='  credentials:
+    secretName: front-load
+    fields:
+      - {field: header/authorization, key: token}
+      - {field: header/x-tenant-key, key: tenant}'
+
+  kubectl delete namespace "$PSA_NS" --ignore-not-found --wait=true --timeout=2m >/dev/null
+  kubectl create namespace "$PSA_NS" >/dev/null
+  kubectl label namespace "$PSA_NS" pod-security.kubernetes.io/enforce=restricted >/dev/null
+  wait_for 30 exists serviceaccount default -n "$PSA_NS" || fail "ldt_16: no default service account in $PSA_NS"
+
+  # Run C: a deployment in discovery (users). Created first, so that its start timeout (MIMIC_LOAD_START_TIMEOUT, 5 min)
+  # runs alongside runs A and B.
+  log "ldt_16: a run on users, in discovery, is Pending without a Job, then ends Failed/NotMock"
+  run_create disc-22 ldt16-c users ""
+  job_c=$(job_of disc-22 ldt16-c) || fail "ldt_16: no uid of run C"
+  wait_for 60 run_is disc-22 ldt16-c 'Pending/WaitingForMock' \
+    || fail "ldt_16: run C is not Pending/WaitingForMock: $(run_status disc-22 ldt16-c)"
+  absent job "$job_c" -n disc-22 || fail "ldt_16: run C has a Job while it is Pending"
+
+  log "ldt_16: front goes to mock; run A runs against it"
+  kubectl -n mck-19 patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}' >/dev/null
+  wait_for 150 front_in_mock || fail "ldt_16: front did not converge to mock within 150 s"
+  sleep 10
+  users0=$(calls disc-22 app=users app) || fail "ldt_16: cannot count the calls of users"
+  prov0=$(calls mck-19-provider app=provider provider) || fail "ldt_16: cannot count the calls of the provider"
+  exch0=$(exchanges) || fail "ldt_16: cannot read the exchanges of front"
+
+  # Run A: concurrency 8, rate 50, 60 s, rampUp 10 s on front.
+  run_create mck-19 ldt16-a front "$creds"
+  job_a=$(job_of mck-19 ldt16-a) || fail "ldt_16: no uid of run A"
+  wait_for 240 run_is mck-19 ldt16-a 'Running/*' || fail "ldt_16: run A did not start: $(run_status mck-19 ldt16-a)"
+  wait_for 30 exists job "$job_a" -n mck-19 || fail "ldt_16: run A has no Job in mck-19"
+  exists networkpolicy "$job_a" -n mck-19 || fail "ldt_16: run A has no NetworkPolicy in mck-19"
+  owned_by mck-19 "job/$job_a" ldt16-a || fail "ldt_16: the Job of run A is not owned by the run"
+  owned_by mck-19 "networkpolicy/$job_a" ldt16-a || fail "ldt_16: the NetworkPolicy of run A is not owned by the run"
+  psa_restricted mck-19 "$job_a" || fail "ldt_16: the pod of the Job of run A does not pass Pod Security restricted"
+  wait_for 240 run_is mck-19 ldt16-a 'Succeeded/Completed' \
+    || fail "ldt_16: run A ended $(run_status mck-19 ldt16-a), not Succeeded/Completed"
+  kubectl -n mck-19 get mimicloadtest ldt16-a -o json > "$WORK/run-a.json" || fail "ldt_16: cannot read run A"
+  jq -e '(.status.results.endpoints | length) > 0' "$WORK/run-a.json" >/dev/null \
+    || fail "ldt_16: run A has no planned endpoint in its results"
+  missing=$(jq '[.status.results.endpoints[] | select(.requests == 0 or .latencyMicros.p99 == 0)] | length' "$WORK/run-a.json")
+  [[ $missing == 0 ]] || fail "ldt_16: $missing planned endpoint(s) of run A have no request or no p99"
+  [[ $(calls disc-22 app=users app) == "$users0" ]] || fail "ldt_16: users logged calls during run A"
+  [[ $(calls mck-19-provider app=provider provider) == "$prov0" ]] || fail "ldt_16: the provider logged calls during run A"
+  [[ $(exchanges) == "$exch0" ]] || fail "ldt_16: the discovery exchanges of front grew during run A"
+  if found -F "$canary" "$WORK/run-a.json"; then fail "ldt_16: a canary of the credentials Secret is in the status of run A"; fi
+
+  # Run B: switched out of mock 20 s after its start.
+  log "ldt_16: run B is switched to discovery 20 s after its start: Aborted/ModeLeft, its Job gone within 10 s"
+  run_create mck-19 ldt16-b front "$creds"
+  job_b=$(job_of mck-19 ldt16-b) || fail "ldt_16: no uid of run B"
+  wait_for 240 run_is mck-19 ldt16-b 'Running/*' || fail "ldt_16: run B did not start: $(run_status mck-19 ldt16-b)"
+  sleep 20
+  users1=$(calls disc-22 app=users app) || fail "ldt_16: cannot count the calls of users"
+  prov1=$(calls mck-19-provider app=provider provider) || fail "ldt_16: cannot count the calls of the provider"
+  [[ $users1 == "$users0" && $prov1 == "$prov0" ]] || fail "ldt_16: users or the provider logged calls before the switch of run B"
+  kubectl -n mck-19 patch mimicworkload front --type merge -p '{"spec":{"mode":"discovery"}}' >/dev/null
+  wait_for 150 run_is mck-19 ldt16-b 'Aborted/ModeLeft' \
+    || fail "ldt_16: run B ended $(run_status mck-19 ldt16-b), not Aborted/ModeLeft"
+  wait_for 10 absent job "$job_b" -n mck-19 || fail "ldt_16: the Job of run B is still there 10 s after it ended"
+  wait_for 10 absent networkpolicy "$job_b" -n mck-19 || fail "ldt_16: the NetworkPolicy of run B is still there 10 s after it ended"
+  sleep 5
+  users2=$(calls disc-22 app=users app) || fail "ldt_16: cannot count the calls of users"
+  prov2=$(calls mck-19-provider app=provider provider) || fail "ldt_16: cannot count the calls of the provider"
+  sent=$(( (users2 - users1) + (prov2 - prov1) ))
+  (( sent <= 8 )) || fail "ldt_16: users and the provider logged $sent calls from front after the switch (at most 8)"
+  log "ldt_16: $sent call(s) reached users and the provider after the switch of run B (at most 8)"
+
+  absent job "$job_c" -n disc-22 || fail "ldt_16: run C has a Job while it is Pending"
+  run_is disc-22 ldt16-c 'Pending/*' || fail "ldt_16: run C is no longer Pending: $(run_status disc-22 ldt16-c)"
+
+  log "ldt_19: the deployment page of front shows the Load tests table with runs A and B"
+  ldt_19_check
+
+  log "ldt_16: no canary of the credentials Secret in a log line of the cluster"
+  sweep_logs
+
+  log "ldt_16: run C ends Failed/NotMock at its start timeout, without a Job or NetworkPolicy"
+  wait_for 420 run_is disc-22 ldt16-c 'Failed/NotMock' \
+    || fail "ldt_16: run C ended $(run_status disc-22 ldt16-c), not Failed/NotMock"
+  absent job "$job_c" -n disc-22 || fail "ldt_16: run C has a Job after Failed/NotMock"
+  absent networkpolicy "$job_c" -n disc-22 || fail "ldt_16: run C has a NetworkPolicy after Failed/NotMock"
+
+  log "ldt_16: deleting the runs removes run A's Job and NetworkPolicy"
+  kubectl -n mck-19 delete mimicloadtest ldt16-a ldt16-b >/dev/null || fail "ldt_16: cannot delete runs A and B"
+  kubectl -n disc-22 delete mimicloadtest ldt16-c >/dev/null || fail "ldt_16: cannot delete run C"
+  wait_for 90 absent job "$job_a" -n mck-19 || fail "ldt_16: the Job of run A is there after its MimicLoadTest was deleted"
+  wait_for 90 absent networkpolicy "$job_a" -n mck-19 \
+    || fail "ldt_16: the NetworkPolicy of run A is there after its MimicLoadTest was deleted"
+
+  kubectl -n mck-19 delete secret front-load >/dev/null || true
+  kubectl delete namespace "$PSA_NS" --wait=false >/dev/null || true
+}
+
+if (( SUITE == 1 )); then
+  suite_main
+  log "e2e-load --suite passed (LDT-16, LDT-19 E)"
+  exit 0
+fi
 
 # --- the chart without a cluster (LDT-06) -----------------------------------------------------
 log "ldt_06: the default chart installs no load test object and no load test RBAC or policy"
@@ -101,13 +407,6 @@ if [[ ${SKIP_BUILD:-0} != 1 ]]; then
 fi
 kind load docker-image --name "$CLUSTER" "$IMAGE" "$INIT_IMAGE"
 
-# image_digest <tag>: the manifest digest that the node's containerd holds for the tag.
-image_digest() {
-  docker exec "$CLUSTER-control-plane" crictl images --digests -o json \
-    | jq -r --arg tag "$1" '.images[] | select(.repoTags | index($tag)) | .repoDigests[]' \
-    | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' \
-    | head -n 1
-}
 digest=$(image_digest "$IMAGE" || true)
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || fail "ldt_06: no digest of $IMAGE on the node (got '$digest')"
 repo=${IMAGE%:*}; init_repo=${INIT_IMAGE%:*}; init_tag=${INIT_IMAGE##*:}
