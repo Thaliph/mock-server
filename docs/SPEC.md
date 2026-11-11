@@ -1879,11 +1879,12 @@ no `MimicLoadTest` and creates no Job).
   namespace. The container declares its metrics port 15100, `protocol: TCP`, named
   `mimic-admin` (as the sidecar, §7.1, MON-03; no `hostPort`). Pod: `automountServiceAccountToken: false`, the namespace's `default` service
   account, a projected token of audience `mimic.platform.io/load` (600 s) as the only
-  credential towards mimic, UID 65532, `runAsNonRoot`, read-only root, all capabilities
+  credential towards mimic, UID 65532, `fsGroup` 65532 with `fsGroupChangePolicy: OnRootMismatch` (the Secret files are group-readable),
+  `runAsNonRoot`, read-only root, all capabilities
   dropped, `RuntimeDefault`, `MIMIC_LOAD_RESOURCES`, labels `mimic.platform.io/inject:
   disabled`, `app.kubernetes.io/managed-by: mimic`, `mimic.platform.io/load-test: <name>`, the
   credentials Secret (when given) mounted at `/mimic/credentials` (`optional: false`, mode
-  0400), and then the Job annotation `mimic.platform.io/credentials-secret: <secretName>`
+  0440, read through `fsGroup`), and then the Job annotation `mimic.platform.io/credentials-secret: <secretName>`
   (§11). Job: `backoffLimit: 0` (a retried pod would send unplanned load),
   `activeDeadlineSeconds` = `duration` + `MIMIC_LOAD_START_TIMEOUT` + 60 s,
   `ttlSecondsAfterFinished: 3600`, owner reference to the `MimicLoadTest`. Container
