@@ -654,10 +654,16 @@ async fn ldt_08_a_results_body_is_bounded_and_checked() {
     // Another pod's name in the body.
     assert_eq!(bad(post_body(&s.pod(1), false, 1)).await, 400);
     // Another job, a garbage name, the hostname of another index.
-    assert_eq!(bad(post_body("mimic-load-ffffffffffff-0-bcdfg", false, 1)).await, 400);
+    assert_eq!(
+        bad(post_body("mimic-load-ffffffffffff-0-bcdfg", false, 1)).await,
+        400
+    );
     assert_eq!(bad(post_body("garbage", false, 1)).await, 400);
     assert_eq!(bad(post_body(&format!("{}-1", s.job), false, 1)).await, 400);
-    assert_eq!(bad(post_body(&format!("{}-0-", s.job), false, 1)).await, 400);
+    assert_eq!(
+        bad(post_body(&format!("{}-0-", s.job), false, 1)).await,
+        400
+    );
     // No Content-Length.
     let answer = call(
         &s.router,
@@ -893,7 +899,9 @@ async fn ldt_08_a_post_may_carry_the_indexed_job_hostname_of_the_token_pod() {
     let token = s.load_token(0);
     let hostname = format!("{}-0", s.job);
     assert_eq!(
-        post(&s, &token, post_body(&hostname, false, 1)).await.status,
+        post(&s, &token, post_body(&hostname, false, 1))
+            .await
+            .status,
         200
     );
 }
