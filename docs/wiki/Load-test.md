@@ -50,7 +50,7 @@ spec:
 ```
 
 Every field but `stop` is immutable. `kubectl get mimicloadtest -n shop` prints `Deployment`, `Phase`,
-`Reason`, `Requests`, `RPS`, `P99 MICROS` and `Age`. With a `rate` the open model applies: when every concurrency
+`Reason`, `Requests`, `RPS`, `P99 Micros` (kubectl prints it `P99 MICROS`) and `Age`. With a `rate` the open model applies: when every concurrency
 slot is busy, a send is counted as `missed`, not queued.
 
 ## What is sent
