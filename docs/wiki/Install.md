@@ -27,9 +27,9 @@ kind create cluster --name mimic
 Use a kind recent enough that its default node image is Kubernetes 1.33 or later (`kubectl version` shows it).
 It has a default StorageClass (`standard`) for Valkey, and the `iptables-nft` requirement was met on kind
 0.33 (node 1.37), where the whole of this wiki's Quick start and Load test pages ran as written. One
-requirement is not met: kind's default CNI does not reliably enforce NetworkPolicy, so the policies that
-isolate Valkey, restrict the controller's ports and confine the load generators are created but inert. That is
-fine for a demo and not for anything shared. Then follow [Install](#install) below and the
+requirement is not met: kind's default CNI does not enforce NetworkPolicy, so the policies that isolate
+Valkey, restrict the controller's ports and confine the load generators are created but inert. mimic works
+without it for a demo; production clusters should run a CNI that enforces NetworkPolicy. Then follow [Install](#install) below and the
 [Quick start](Quick-start). To remove everything: `kind delete cluster --name mimic`.
 
 ## Install
@@ -56,6 +56,12 @@ kill $PF
 The controller has a second port, **8080**: the read API and the UI, served on the loopback of the pod only. It is
 not on the Service, so it is reached through `deploy/mimic-controller` ([Reading the API](Reading-the-API#reaching-it)).
 
+The chart pins both images by digest (`image.digest`, `inject.initImage.digest`), so installing by
+version runs the released digests. To work from a checkout instead, replace the OCI reference with
+`deploy/helm/mimic` in the commands below; the images then come from `ghcr.io/thaliph/mimic` and
+`ghcr.io/thaliph/mimic-init` at the chart appVersion tag, or from your own build (see
+[Developing](Developing#end-to-end-on-kind) and `scripts/e2e.sh`).
+
 ### Enable load tests
 
 Load tests are **off by default** (they add RBAC, a CRD and admission policies). To use the
@@ -66,13 +72,8 @@ helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n
   --reuse-values --set loadTest.enabled=true
 ```
 
-Do it before you deploy the apps you want to test: pods injected before the switch must be restarted.
-
-The chart pins both images by digest (`image.digest`, `inject.initImage.digest`), so installing by
-version runs the released digests. To work from a checkout instead, replace the OCI reference with
-`deploy/helm/mimic` in the commands below; the images then come from `ghcr.io/thaliph/mimic` and
-`ghcr.io/thaliph/mimic-init` at the chart appVersion tag, or from your own build (see
-[Developing](Developing#end-to-end-on-kind) and `scripts/e2e.sh`).
+Do it before you deploy the apps you want to test: pods injected before the switch must be restarted. The
+option needs the images pinned by digest, which a released chart has.
 
 ### Verify the release
 

@@ -107,8 +107,13 @@ Without either, it answers `4xx`.
    environment accepts):
 
    ```bash
-   kubectl -n demo create secret generic users-load --from-literal=token='Bearer dummy-test-token'
+   kubectl -n demo create secret generic users-load \
+     --from-literal=token='Bearer dummy-test-token' --from-literal=password='dummy-test-password'
    ```
+
+   The Quick start `PUT`s also send a `password` in their JSON body, so the Secret has a second key for it. An
+   endpoint is never skipped because of a credential value: a field you do not map is sent with its
+   placeholder (`mimic-password` here).
 
    Then a complete run that uses it. Every field but `stop` is immutable, so a change of spec needs a **new
    name** (`users-2`, not `users-1`):
@@ -128,6 +133,7 @@ Without either, it answers `4xx`.
        secretName: users-load        # key `token` holds `Bearer <test token>`
        fields:
          - {field: header/authorization, key: token}
+         - {field: body/password, key: password}
    EOF
    kubectl -n demo get mimicloadtest users-2 -w     # runs until Ctrl-C; stop it once Phase is Succeeded
    ```
