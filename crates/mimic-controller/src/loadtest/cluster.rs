@@ -1,7 +1,6 @@
 //! The cluster side of the reconciler: Job and NetworkPolicy calls, the status apply, and the
 //! watch that feeds [`Tests`].
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use futures::StreamExt;

@@ -16,11 +16,11 @@ use mimic_core::load::validate::{Params, validate};
 use serde_json::{Value, json};
 
 use super::{
-    JobState, Kind, POST_RESERVE, REPORT_INTERVAL_MS, Reconciler, RunState, TICK, Test, status_of,
-    summary_json,
+    Built, JobState, Kind, POST_RESERVE, POSTS_MAX_WAIT_MS, PostsRead, REPORT_INTERVAL_MS,
+    Reconciler, RunState, TICK, Test, status_of, summary_json,
 };
 use crate::sidecar_api::load::RunInfo;
-use crate::store::load::{Admit, AdmitError, AdmitLimits, Ended, MAX_SUMMARY};
+use crate::store::load::{Admit, AdmitError, AdmitLimits, Ended, MAX_SUMMARY, StoredPost};
 use crate::store::{Half, ReadError};
 
 /// A call to the cluster that takes longer is abandoned.
@@ -144,9 +144,31 @@ impl Reconciler {
         {
             Ok(Some(_)) => return self.end(test, phase, reason, message, now_ms, true).await,
             Ok(None) => {}
-            Err(_) => return,
+            Err(_) => {
+                self.outage(test, "valkey", "load test end deferred");
+                return;
+            }
         }
         self.status_only(test, phase, reason, message, now_ms).await;
+    }
+
+    /// Logs (WARN, `message`) the first pass of an outage that keeps a run from going on; the
+    /// next passes retry without a line, until [`Reconciler::progressed`].
+    fn outage(&self, test: &Test, reason: &'static str, message: &str) {
+        let first = self.with_state(&test.uid, |s| s.waiting.replace(reason).is_none());
+        if first {
+            tracing::warn!(
+                namespace = test.namespace,
+                name = test.name,
+                reason,
+                "{message}"
+            );
+        }
+    }
+
+    /// The run got past what it waited for: the next outage logs again.
+    fn progressed(&self, test: &Test) {
+        self.with_state(&test.uid, |s| s.waiting = None);
     }
 
     /// The final status of a run the store holds no state for.
@@ -224,7 +246,9 @@ impl Reconciler {
             let targets = self.slices.targets(&test.namespace, &test.deployment);
             let pulls = match self.store.pulls(&test.namespace, &test.deployment).await {
                 Ok(pulls) => pulls,
-                Err(ReadError::Unavailable) => return,
+                Err(ReadError::Unavailable) => {
+                    return self.outage(test, "valkey", "load test admission waiting");
+                }
                 Err(_) => BTreeMap::new(),
             };
             let mode = self
@@ -249,6 +273,7 @@ impl Reconciler {
                 ),
             }
         };
+        self.progressed(test);
         if now_ms.saturating_sub(test.created_ms) >= ms(cfg.start_timeout) {
             self.fail(test, failed, message, now_ms).await;
         } else {
@@ -260,49 +285,75 @@ impl Reconciler {
     async fn admit(&self, test: &Test, targets: usize, now_ms: u64) {
         let cfg = &self.config;
         let (ns, dep) = (&test.namespace, &test.deployment);
-        let stored = match self.store.stored_report(ns, dep, Half::Inbound).await {
-            Ok(stored) => stored,
-            Err(ReadError::Unavailable) => return,
-            Err(ReadError::NotFound) => {
-                return self
-                    .fail(
-                        test,
-                        "NoReport",
-                        "no stored report for the deployment",
-                        now_ms,
-                    )
-                    .await;
+        let cached = self.with_state(&test.uid, |s| s.built.clone());
+        let built = match cached {
+            Some(built) => built,
+            None => {
+                let stored = match self.store.stored_report(ns, dep, Half::Inbound).await {
+                    Ok(stored) => stored,
+                    Err(ReadError::Unavailable) => {
+                        return self.outage(test, "valkey", "load test admission waiting");
+                    }
+                    Err(ReadError::NotFound) => {
+                        return self
+                            .fail(
+                                test,
+                                "NoReport",
+                                "no stored report for the deployment",
+                                now_ms,
+                            )
+                            .await;
+                    }
+                    Err(_) => {
+                        return self
+                            .fail(test, "NoReport", "the stored report is unreadable", now_ms)
+                            .await;
+                    }
+                };
+                let spec = plan::Spec {
+                    include: test.spec.include.clone(),
+                    exclude: test.spec.exclude.clone(),
+                    credentials: test.spec.credentials.clone(),
+                    max_endpoints: cfg.max_endpoints,
+                    max_plan: cfg.max_plan,
+                };
+                let built = tokio::task::spawn_blocking(move || {
+                    let report = stored.parse()?;
+                    let planned = plan::plan(&report, &spec);
+                    let json = planned.plan.to_json().ok()?;
+                    let ports: Vec<u16> = planned.plan.endpoints.iter().map(|e| e.port).collect();
+                    let skipped = planned
+                        .skipped
+                        .into_iter()
+                        .map(|(reason, count)| (reason.to_string(), count))
+                        .collect();
+                    Some(Built {
+                        json,
+                        ports,
+                        skipped,
+                    })
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(built) = built else {
+                    return self
+                        .fail(test, "NoReport", "the stored report is unreadable", now_ms)
+                        .await;
+                };
+                let built = Arc::new(built);
+                self.with_state(&test.uid, |s| s.built = Some(built.clone()));
+                built
             }
-            Err(_) => {
-                return self
-                    .fail(test, "NoReport", "the stored report is unreadable", now_ms)
-                    .await;
-            }
         };
-        let spec = plan::Spec {
-            include: test.spec.include.clone(),
-            exclude: test.spec.exclude.clone(),
-            credentials: test.spec.credentials.clone(),
-            max_endpoints: cfg.max_endpoints,
-            max_plan: cfg.max_plan,
-        };
-        let built = tokio::task::spawn_blocking(move || {
-            let report = stored.parse()?;
-            let planned = plan::plan(&report, &spec);
-            let json = planned.plan.to_json().ok()?;
-            let ports: Vec<u16> = planned.plan.endpoints.iter().map(|e| e.port).collect();
-            Some((json, ports, planned.skipped))
-        })
-        .await
-        .ok()
-        .flatten();
-        let Some((plan_json, ports, skipped)) = built else {
-            return self
-                .fail(test, "NoReport", "the stored report is unreadable", now_ms)
-                .await;
-        };
-        let skipped: BTreeMap<&str, u64> = skipped.into_iter().collect();
+        let (plan_json, ports) = (&built.json, &built.ports);
+        let skipped: BTreeMap<&str, u64> = built
+            .skipped
+            .iter()
+            .map(|(reason, count)| (reason.as_str(), *count))
+            .collect();
         if ports.is_empty() {
+            self.progressed(test);
             let mut status = status_of(
                 "Failed",
                 "NoEndpoints",
@@ -316,7 +367,12 @@ impl Reconciler {
         }
         // Without the seed or the webhook CA the run waits: neither is a reason to fail it.
         let (Some(seed), Some(ca)) = (self.seed.get(), self.cert.ca_pem()) else {
-            return;
+            let missing = if self.seed.get().is_none() {
+                "seed"
+            } else {
+                "ca"
+            };
+            return self.outage(test, missing, "load test admission waiting");
         };
         let Ok(root) = crate::tls_ca::derive_root(&seed, ns, dep) else {
             tracing::error!(
@@ -350,11 +406,11 @@ impl Reconciler {
                 deployment: dep,
                 uid: &test.uid,
                 spec: &spec_json,
-                plan: &plan_json,
+                plan: plan_json,
                 ticket: &ticket,
                 now_ms,
                 deadline_ms,
-                reserve: plan_json.len() as u64 + workers * POST_RESERVE + MAX_SUMMARY as u64,
+                reserve: built.json.len() as u64 + workers * POST_RESERVE + MAX_SUMMARY as u64,
                 limits: AdmitLimits {
                     max_runs: cfg.max_runs,
                     max_namespace_runs: cfg.max_namespace_runs,
@@ -362,13 +418,19 @@ impl Reconciler {
                 },
             })
             .await;
+        if admitted != Err(AdmitError::Unavailable) {
+            self.progressed(test);
+            self.with_state(&test.uid, |s| s.built = None);
+        }
         let (reason, message) = match admitted {
             Ok(()) => {
                 return self
-                    .start(test, &ports, targets, &skipped, &ca, now_ms)
+                    .start(test, ports, targets, &skipped, &ca, now_ms)
                     .await;
             }
-            Err(AdmitError::Unavailable) => return,
+            Err(AdmitError::Unavailable) => {
+                return self.outage(test, "valkey", "load test admission waiting");
+            }
             Err(AdmitError::Busy) => ("Busy", "the deployment has an active run"),
             Err(AdmitError::NamespaceBusy) => (
                 "NamespaceBusy",
@@ -538,7 +600,7 @@ impl Reconciler {
                 .end(test, "Aborted", "ModeLeft", message, now_ms, true)
                 .await;
         }
-        let Ok(posts) = self.store.load_posts(ns, dep, uid).await else {
+        let Some(posts) = self.posts_of(test, now_ms).await else {
             return;
         };
         let workers = pods(test.spec.concurrency, self.config.limits.pod_concurrency);
@@ -638,6 +700,40 @@ impl Reconciler {
         status["targets"] = json!(self.slices.targets(ns, dep).len());
         status["results"] = serde_json::from_str(&summary_json(&summary)).unwrap_or(Value::Null);
         self.set_status(test, status).await;
+    }
+
+    /// The pods' results: read again after a wait that doubles (from 1 s to
+    /// [`POSTS_MAX_WAIT_MS`]) while a read finds them unchanged, and none at all while it lasts.
+    async fn posts_of(&self, test: &Test, now_ms: u64) -> Option<BTreeMap<String, StoredPost>> {
+        let held = self.with_state(&test.uid, |s| {
+            s.posts
+                .as_ref()
+                .filter(|p| now_ms.saturating_sub(p.at_ms) < p.wait_ms)
+                .map(|p| p.posts.clone())
+        });
+        if held.is_some() {
+            return held;
+        }
+        let posts = self
+            .store
+            .load_posts(&test.namespace, &test.deployment, &test.uid)
+            .await
+            .ok()?;
+        self.with_state(&test.uid, |s| {
+            let wait_ms = match &s.posts {
+                Some(last) if last.posts == posts => match last.wait_ms {
+                    0 => 1_000,
+                    wait => (wait * 2).min(POSTS_MAX_WAIT_MS),
+                },
+                _ => 0,
+            };
+            s.posts = Some(PostsRead {
+                at_ms: now_ms,
+                wait_ms,
+                posts: posts.clone(),
+            });
+        });
+        Some(posts)
     }
 
     async fn plan_of(&self, test: &Test) -> Option<Arc<Plan>> {
@@ -765,10 +861,17 @@ impl Reconciler {
         let mut status = status_of(phase, reason, "");
         status["startTime"] = test.status.get("startTime").cloned().unwrap_or(Value::Null);
         status["endTime"] = json!(rfc3339(end_ms));
-        for field in ["targets", "pods", "skipped"] {
+        for field in ["targets", "skipped"] {
             if let Some(value) = test.status.get(field) {
                 status[field] = value.clone();
             }
+        }
+        // The pods that posted come from the stored run: the status of this replica may be
+        // older than the final one the winner applied.
+        if let Some(pods) = fields.get("pods").and_then(|p| p.parse::<u64>().ok()) {
+            status["pods"] = json!(pods);
+        } else if let Some(pods) = test.status.get("pods") {
+            status["pods"] = pods.clone();
         }
         status["results"] = fields
             .get("summary")
@@ -792,6 +895,16 @@ impl Reconciler {
         {
             self.tests.remove(&gone.namespace, &gone.name);
             self.deleted(&gone).await;
+        }
+        // Recreated under the same name while the watch was down: the old uid's run ends.
+        for new in &listing {
+            if let Some(old) =
+                self.tests.list().into_iter().find(|t| {
+                    t.namespace == new.namespace && t.name == new.name && t.uid != new.uid
+                })
+            {
+                self.deleted(&old).await;
+            }
         }
         for test in listing {
             self.tests.apply(test);

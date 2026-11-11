@@ -780,7 +780,9 @@ async fn ldt_09_posts_of_two_pods_merge_into_the_status_and_the_run_completes() 
     fields.sort();
     assert_eq!(
         fields,
-        ["end", "phase", "pods", "reason", "spec", "start", "stop", "summary"]
+        [
+            "end", "phase", "pods", "reason", "spec", "start", "stop", "summary"
+        ]
     );
     let member = format!("{ns}/pay/{}", test.uid);
     let reserved: Option<String> = redis::cmd("HGET")

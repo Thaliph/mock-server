@@ -308,7 +308,9 @@ async fn ldt_09_size_while_running_and_after_the_end() {
     raw.sort();
     assert_eq!(
         raw,
-        ["end", "phase", "reason", "spec", "start", "stop", "summary"],
+        [
+            "end", "phase", "pods", "reason", "spec", "start", "stop", "summary"
+        ],
         "no plan, ticket or pod field is left"
     );
     assert_eq!(fields["summary"], big);
