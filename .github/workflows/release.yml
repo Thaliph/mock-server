@@ -164,7 +164,8 @@ jobs:
           - name: kubernetes-latest
             node_image: ""
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    # As the e2e job of ci.yml: the full suite takes about 38 minutes with the LDT-16 load test (#259).
+    timeout-minutes: 50
     permissions:
       contents: read
       packages: read
