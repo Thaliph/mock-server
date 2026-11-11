@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use mimic_core::discovery::openapi;
 use mimic_core::discovery::report::Report;
+use mimic_core::load::summary::Summary as LoadSummary;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
@@ -22,7 +23,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
-use crate::store::{Half, ReadError, Store, Summary};
+use crate::store::{Half, ReadError, Store, Summary, keys};
 
 mod assets;
 
@@ -139,6 +140,14 @@ fn build(store: Arc<Store>, metrics: UiMetrics, hook: Option<Hook>) -> Router {
         .route(
             "/v1/workloads/{namespace}/{deployment}/openapi/{id}",
             get(openapi_document),
+        )
+        .route(
+            "/v1/workloads/{namespace}/{deployment}/loadtests",
+            get(loadtests),
+        )
+        .route(
+            "/v1/workloads/{namespace}/{deployment}/loadtests/{uid}",
+            get(loadtest),
         )
         .layer(middleware::from_fn(loopback_only))
         .layer(middleware::from_fn_with_state(ui.clone(), count))
@@ -425,6 +434,79 @@ async fn openapi_document(
         move |report, version| openapi::document(report, &ns, &dep, version, &id),
     )
     .await
+}
+
+/// A Kubernetes uid: 8-4-4-4-12 lower-case hex digits.
+fn uuid(uid: &str) -> bool {
+    uid.len() == 36
+        && uid.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+        })
+}
+
+/// One stored run as the read API shows it (spec §7.5): names, phases, times and numbers only;
+/// `None` for a run whose hash has expired. The summary is parsed and written again, so nothing
+/// but its numbers and endpoint names can reach the page.
+async fn run_object(
+    store: &Store,
+    namespace: &str,
+    deployment: &str,
+    uid: &str,
+) -> Result<Option<(Map<String, Value>, Option<LoadSummary>)>, ReadError> {
+    let fields = store.load_fields(namespace, deployment, uid).await?;
+    let Some(phase) = fields.get("phase") else {
+        return Ok(None);
+    };
+    let name = fields
+        .get("spec")
+        .and_then(|spec| serde_json::from_str::<Value>(spec).ok())
+        .and_then(|spec| spec.get("name")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let ms = |field: &str| fields.get(field)?.parse::<u64>().ok();
+    let summary = fields
+        .get("summary")
+        .and_then(|text| serde_json::from_str::<LoadSummary>(text).ok());
+    let Value::Object(map) = json!({
+        "uid": uid,
+        "name": name,
+        "phase": phase,
+        "reason": fields.get("reason").cloned().unwrap_or_default(),
+        "start": ms("start").map(rfc3339),
+        "end": ms("end").map(rfc3339),
+        "total": summary.as_ref().map(|s| &s.total),
+    }) else {
+        unreachable!("an object literal")
+    };
+    Ok(Some((map, summary)))
+}
+
+async fn loadtests(
+    State(Ui { store, .. }): State<Ui>,
+    Path((namespace, deployment)): Path<(String, String)>,
+) -> Result<Json, ReadError> {
+    let mut runs = Vec::new();
+    for uid in store.load_uids(&namespace, &deployment).await? {
+        if let Some((map, _)) = run_object(&store, &namespace, &deployment, &uid).await? {
+            runs.push(Value::Object(map));
+        }
+    }
+    Ok(Json(json!({ "loadtests": runs })))
+}
+
+async fn loadtest(
+    State(Ui { store, .. }): State<Ui>,
+    Path((namespace, deployment, uid)): Path<(String, String, String)>,
+) -> Result<Json, ReadError> {
+    keys(&namespace, &deployment).map_err(|_| ReadError::Name)?;
+    if !uuid(&uid) {
+        return Err(ReadError::Name);
+    }
+    let (mut map, summary) = run_object(&store, &namespace, &deployment, &uid)
+        .await?
+        .ok_or(ReadError::NotFound)?;
+    map.insert("summary".to_string(), json!(summary));
+    Ok(Json(Value::Object(map)))
 }
 
 struct Json(Value);

@@ -450,4 +450,24 @@ impl Store {
             .filter_map(|(field, value)| Some(((*field).to_string(), value?)))
             .collect())
     }
+
+    /// The uids of a deployment's runs in `:loads`, newest first (spec §7.5).
+    pub async fn load_uids(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<Vec<String>, ReadError> {
+        check_name(namespace).map_err(|_| ReadError::Name)?;
+        check_name(deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self.read_connection().await?;
+        self.read_of(
+            redis::cmd("ZREVRANGE")
+                .arg(format!("mimic:v1:{{{namespace}/{deployment}}}:loads"))
+                .arg(0)
+                .arg(KEEP_RUNS - 1)
+                .query_async(&mut conn)
+                .await,
+        )
+        .await
+    }
 }
