@@ -1,6 +1,6 @@
 # Load test
 
-Covers F11. Reference: spec §7.8, §10.2, §11.1, §12.12 (LDT-01 to LDT-20). A `MimicLoadTest` replays the
+Step 4 of [Get started](Home#get-started). A `MimicLoadTest` replays the
 inbound endpoints that mimic discovered on one Deployment against that Deployment's pods, with no scenario to
 write. It runs **only while the Deployment is in [mock mode](Mock-mode)**, so the load does not reach the
 real destinations the application calls.
@@ -8,50 +8,94 @@ real destinations the application calls.
 ## Turn it on
 
 Off by default, because it adds Job and EndpointSlice RBAC, the `MimicLoadTest` CRD and two
-ValidatingAdmissionPolicies. It needs the mimic image pinned by digest, which a released chart has:
+ValidatingAdmissionPolicies. It needs the mimic image pinned by digest, which a released chart has. Turn it on
+at install time with `--set loadTest.enabled=true` ([Install](Install#enable-load-tests)), or on a running
+release:
 
 ```bash
 helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system \
   --reuse-values --set loadTest.enabled=true
+kubectl wait --for=condition=Established crd/mimicloadtests.mimic.platform.io --timeout=60s
+kubectl -n mimic-system rollout status deploy/mimic-controller
 ```
 
 Pods injected before the switch do not honour the load marker: `rollout restart` the Deployments you want to
-test. `loadTest.networkPolicy` (default `true`) gives each generator a NetworkPolicy; it needs a CNI that
-enforces NetworkPolicy.
+test (`kubectl -n demo rollout restart deploy/front`; do it before the first run, so turn the option on before
+you deploy your apps). `loadTest.networkPolicy` (default `true`) gives each generator a NetworkPolicy; it needs a
+CNI that enforces NetworkPolicy, and is simply inert where there is none. kind's default CNI enforces it, so
+it is active on the cluster of [Try it on kind](Install#try-it-on-kind).
 
 ## Run one
 
-The Deployment needs discovered inbound traffic, a `MimicWorkload`, mock mode, and at least one ready pod
-behind a Service (targets come from EndpointSlices):
+The examples use the apps of the [Quick start](Quick-start) and [Mock mode](Mock-mode): the Deployment `front` in
+the namespace `demo`, with its `MimicWorkload` `front` and the traffic you sent. `front` is the one that is
+load-tested, **in mock**: its calls to `users` are answered by its sidecar, so `users` is not part of the test
+and is never called. The Deployment needs discovered inbound traffic, a `MimicWorkload`, mock mode, and at
+least one ready pod behind a Service (targets come from EndpointSlices).
+
+First switch it to mock and wait until the pod follows ([Mock mode](Mock-mode#turn-it-on-and-off) has the
+wait loop; the load test would also wait, in `WaitingForMock`). Skip this if `front` is still in mock from the
+previous page:
 
 ```bash
-kubectl -n shop patch mimicworkload payment --type merge -p '{"spec":{"mode":"mock"}}'
+kubectl -n demo patch mimicworkload front --type merge -p '{"spec":{"mode":"mock"}}'
 ```
+
+To show that `users` is not called, count its access lines now and after the run (each request to `users`
+writes one line; `--tail=-1` because a selector prints 10 lines by default):
+
+```bash
+kubectl -n demo logs -l app=users -c app --tail=-1 | wc -l
+```
+
+Then create the run. This one lasts a minute:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicLoadTest
+metadata: {name: front-1, namespace: demo}
+spec:
+  deployment: front
+  duration: 1m
+  concurrency: 10
+  rate: 50
+  rampUp: 10s
+EOF
+kubectl -n demo wait mimicloadtest/front-1 --for=jsonpath='{.status.phase}'=Succeeded --timeout=5m
+```
+
+To watch it live instead, `kubectl -n demo get mimicloadtest front-1 -w` (Ctrl-C to stop). When `Phase` is
+`Succeeded`, count the access lines of `users` again: the number
+is the same, the load test never reached it (it would be the same with `users` scaled to 0). The plan comes
+from the inbound endpoints of `front`: `GET` and `PUT /front/users/{users_id}`. All the fields:
 
 ```yaml
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicLoadTest
-metadata: {name: payment-1, namespace: shop}
+metadata: {name: front-1, namespace: demo}
 spec:
-  deployment: payment      # required
+  deployment: front        # required
   duration: 5m             # required, 10s to MIMIC_LOAD_MAX_DURATION (30m)
   concurrency: 10          # requests in flight at most, default 10, up to 256
   rate: 200                # optional requests/s, up to 2000; absent: closed model
   rampUp: 30s              # default 0s
   timeout: 10s             # per request
   endpoints:
-    include: ["POST /payments"]            # absent: every usable endpoint
-    exclude: ["DELETE /payments/{payments_id}"]
-  credentials:             # optional
-    secretName: payment-load
+    include: ["GET /front/users/{users_id}"]     # absent: every usable endpoint
+    exclude: ["PUT /front/users/{users_id}"]
+  credentials:             # optional, see "Testing with credentials"
+    secretName: front-load
     fields:
       - {field: header/authorization, key: token}
   stop: false              # set to true to stop the run
 ```
 
-Every field but `stop` is immutable. `kubectl get mimicloadtest -n shop` prints `Deployment`, `Phase`,
-`Reason`, `Requests`, `RPS`, `P99 Micros` (kubectl prints it `P99 MICROS`) and `Age`. With a `rate` the open model applies: when every concurrency
-slot is busy, a send is counted as `missed`, not queued.
+Every field but `stop` is immutable. `kubectl get mimicloadtest -n demo` prints `Deployment`, `Phase`,
+`Reason`, `Requests`, `RPS`, `P99 Micros` and `Age` (kubectl upper-cases the header: `P99 MICROS`; the value is
+the p99 latency in microseconds). With a `rate` the open model applies: when every concurrency
+slot is busy, a send is counted as `missed`, not queued. The `RPS` of a run is its requests over its whole
+duration, ramp-up included, so it stays a little under `rate`.
 
 ## What is sent
 
@@ -72,14 +116,50 @@ Without either, it answers `4xx`.
    one field with the bytes of a Secret key (a trailing newline removed); the other credential fields keep
    their placeholder. The Secret is read only by the generator, never reaches sidecars or Valkey.
 
-   ```yaml
+   Create the Secret in the namespace of the `MimicLoadTest` (a dummy value here; use a token that your test
+   environment accepts):
+
+   ```bash
+   kubectl -n demo create secret generic front-load \
+     --from-literal=token='Bearer dummy-test-token' --from-literal=password='dummy-test-password'
+   ```
+
+   The Quick start `PUT`s that `front` received also carry a `password` in their JSON body, so the Secret has a second key for it. An
+   endpoint is never skipped because of a credential value: a field you do not map is sent with its
+   placeholder (`mimic-password` here).
+
+   Then a complete run that uses it. Every field but `stop` is immutable, so a change of spec needs a **new
+   name** (`front-2`, not `front-1`):
+
+   ```bash
+   kubectl apply -f - <<'EOF'
+   apiVersion: mimic.platform.io/v1alpha1
+   kind: MimicLoadTest
+   metadata: {name: front-2, namespace: demo}
    spec:
-     deployment: payments
+     deployment: front
+     duration: 1m
+     concurrency: 10
+     rate: 50
+     rampUp: 10s
      credentials:
-       secretName: payment-load      # key `token` holds `Bearer <test token>`
+       secretName: front-load        # key `token` holds `Bearer <test token>`
        fields:
          - {field: header/authorization, key: token}
+         - {field: body/password, key: password}
+   EOF
+   kubectl -n demo wait mimicloadtest/front-2 --for=jsonpath='{.status.phase}'=Succeeded --timeout=5m
    ```
+
+   **Checking that the credential was used.** Only a request whose recorded sample carried the field gets the
+   Secret value: in the Quick start only the 5 `PUT`s sent an `Authorization` header (and a `password` in
+   the body), so the `GET`s are unchanged. The demo apps do not check authentication, so a run with and
+   without credentials look the same here. With your own app, compare `statuses` in the results of the two runs
+   (for example `4xx` for 401s without credentials, `2xx` with them) to confirm that the credentials work. The token itself is never in `status`, in the read API or in the logs.
+
+   `field` names the value to replace: `header/<lower-case header name>`, `query/<key>` or
+   `body<JSON pointer>` (for example `body/card/token`); up to 32 distinct fields, each with the Secret `key`
+   that holds its value.
 
 2. **A test environment that accepts mimic's placeholders**, for example a test identity provider or a gateway
    rule that accepts `Authorization: Bearer mimic-token`. The 13 placeholders are `mimic-auth`, `mimic-token`,
@@ -87,7 +167,7 @@ Without either, it answers `4xx`.
    `mimic-cookie`, `mimic-signature`, `mimic-card`, `mimic-iban` and `mimic-ssn`; see
    [Discovery and redaction](Discovery-and-redaction).
 
-Limit (spec §11.1): a real value exactly equal to a placeholder, for example a field that really holds
+Limit: a real value exactly equal to a placeholder, for example a field that really holds
 `mimic-token`, is treated as a placeholder. Mock matching skips that field and a load test treats it as a
 credential field. Placeholders are public constants, not secrets.
 
@@ -103,11 +183,17 @@ credential field. Placeholders are public constants, not secrets.
 
 ## Results
 
+While the object exists, `kubectl -n demo get mimicloadtest front-1 -o json | jq .status.results` prints them.
+The run also stays readable after the object is deleted: see
+[Load test runs in Reading the API](Reading-the-API#load-test-runs) for the routes
+(`/v1/workloads/demo/front/loadtests/<uid>`, where the uid is the object's `metadata.uid`, not its name) and a
+command that prints the per-endpoint summary.
+
 A run goes `Pending` (`WaitingForMock` while the mode converges) to `Running` to `Succeeded`, or `Failed` or
 `Aborted` with a `reason`. `status.results` holds, in total and per endpoint, the requests, missed sends,
 statuses by class, errors by kind, requests per second and p50, p90, p99 and max latency in microseconds. They
-are also in Valkey (the last 20 runs per deployment, shown in the UI), in the generator's `/metrics`, and in
-the [Mock mode and load tests dashboard](Monitoring#dashboards). Latencies are bucket bounds, at most 4.4 %
+are also in Valkey (the last 20 runs per deployment, shown in the UI and served by the read API), in the
+generator's `/metrics`, and in the [Mock mode and load tests dashboard](Monitoring#dashboards). Latencies are bucket bounds, at most 4.4 %
 high, and measured by the client, so they include the network and the generator.
 
 ## Limits
@@ -121,8 +207,13 @@ high, and measured by the client, so they include the network and the generator.
 
 A run over a limit fails with `Busy`, `NamespaceBusy`, `ClusterBusy`, `StoreFull` or `Invalid`.
 
-Accepted limits (spec §11.1): requests in flight when the deployment leaves mock can still reach real
+Accepted limits: requests in flight when the deployment leaves mock can still reach real
 destinations (at most the concurrency); the application's real datastores and `spec.mock.passthrough`
 destinations are loaded too; load and credentials cross the network in cleartext; a secret that redaction
 misses is replayed, so add `spec.discovery.redact`; the namespace is the trust domain of a run. See
 [Security](Security#accepted-limits).
+
+## Next
+
+Step 5 of Get started: [Reading the API](Reading-the-API) reads the run that you just made from the read API, and
+ends with the clean-up.

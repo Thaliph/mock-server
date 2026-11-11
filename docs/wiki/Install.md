@@ -1,6 +1,9 @@
 # Install
 
-Audience: ops. Covers the chart of release 0.2.0-alpha.2. Values are listed in [Configuration](Configuration).
+Step 1 of [Get started](Home#get-started): everyone starts here, developers and ops. Developers need
+only [Try it on kind](#try-it-on-kind) and [Install](#install); the sections marked *ops* are for whoever
+runs mimic on a shared cluster. Covers the chart of release 0.2.0-alpha.2. Values are listed in
+[Configuration](Configuration).
 
 ## Requirements
 
@@ -15,17 +18,51 @@ Audience: ops. Covers the chart of release 0.2.0-alpha.2. Values are listed in [
 
 The release namespace itself runs at `restricted`: every pod the chart creates satisfies it.
 
+## Try it on kind
+
+To try mimic on a laptop you need [kind](https://kind.sigs.k8s.io/) and Docker. The defaults are enough for
+discovery, mock mode and load tests; one command creates the cluster:
+
+```bash
+kind create cluster --name mimic
+```
+
+Use a kind recent enough that its default node image is Kubernetes 1.33 or later (`kubectl version` shows it).
+It has a default StorageClass (`standard`) for Valkey, and the `iptables-nft` requirement was met on kind
+0.33 (node 1.37), where the whole of this wiki's Quick start and Load test pages ran as written. kind's
+default CNI (kindnet) enforces NetworkPolicy on current versions of kind, so the policies that isolate Valkey,
+restrict the controller's ports and confine the load generators are active (the project's own end-to-end
+tests on a default kind cluster check that a pod outside the controller cannot reach Valkey). If your kind is
+old, or you replaced its CNI, check that yours does. Then follow [Install](#install) below and the
+[Quick start](Quick-start). To remove everything: `kind delete cluster --name mimic`.
+
 ## Install
 
 Install a released version from the OCI registry. A pre-release chart is only installed with an
 explicit `--version`:
 
 ```bash
-helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace
-kubectl -n mimic-system rollout status deploy/mimic-controller
-kubectl -n mimic-system port-forward svc/mimic-controller 8081:8081 &
-curl -s localhost:8081/readyz
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
+  --set loadTest.enabled=true
+kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=5m
 ```
+
+`--set loadTest.enabled=true` is there for the [Load test](Load-test) page of Get started; load tests are off by
+default ([Enable load tests](#enable-load-tests)), so leave the flag out if you will not run any.
+
+`rollout status` returns when the controller is ready (the first start also waits for Valkey and pulls the
+images). To check it from outside, forward the **admin port**, 8081 (`/readyz`, `/healthz`, `/metrics`), which is
+on the `mimic-controller` Service, and wait for the forward before the request:
+
+```bash
+kubectl -n mimic-system port-forward svc/mimic-controller 8081:8081 >/dev/null &
+PF=$!
+for i in $(seq 30); do curl -fs localhost:8081/readyz && break; sleep 1; done   # prints: ready
+kill $PF
+```
+
+The controller has a second port, **8080**: the read API and the UI, served on the loopback of the pod only. It is
+not on the Service, so it is reached through `deploy/mimic-controller` ([Reading the API](Reading-the-API#reaching-it)).
 
 The chart pins both images by digest (`image.digest`, `inject.initImage.digest`), so installing by
 version runs the released digests. To work from a checkout instead, replace the OCI reference with
@@ -33,10 +70,25 @@ version runs the released digests. To work from a checkout instead, replace the 
 `ghcr.io/thaliph/mimic-init` at the chart appVersion tag, or from your own build (see
 [Developing](Developing#end-to-end-on-kind) and `scripts/e2e.sh`).
 
+### Enable load tests
+
+Load tests are **off by default** (they add RBAC, a CRD and admission policies). To use the
+[Load test](Load-test) page, add `--set loadTest.enabled=true` to the install, or switch it on later:
+
+```bash
+helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system \
+  --reuse-values --set loadTest.enabled=true
+```
+
+Do it before you deploy the apps you want to test: pods injected before the switch must be restarted. The
+option needs the images pinned by digest, which a released chart has.
+
 ### Verify the release
 
 Images and chart are signed with cosign (keyless, GitHub OIDC); the signature names the release workflow
-and the tag. Verify before installing:
+and the tag. Verifying is recommended for anything shared and optional for a local try-out; if you skip it,
+go on to the next section. To verify, install [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+(for example `brew install cosign`, or download the binary of its releases page), then, before installing:
 
 ```bash
 ID=https://github.com/Thaliph/mock-server/.github/workflows/release.yml@refs/tags/v0.2.0-alpha.2
@@ -46,7 +98,7 @@ for ref in ghcr.io/thaliph/mimic:0.2.0-alpha.2 ghcr.io/thaliph/mimic-init:0.2.0-
 done
 ```
 
-To pin what you verified, resolve each tag to its digest (`docker buildx imagetools inspect <ref>` or
+To pin what you verified (optional), resolve each tag to its digest (`docker buildx imagetools inspect <ref>` or
 `crane digest <ref>`) and verify `<repo>@<digest>`; the release notes list the digests. Images are
 tagged with the version only (no `latest`). Signing and verifying use the public Sigstore service.
 
@@ -54,7 +106,7 @@ All names in this wiki (`mimic-controller`, `mimic-valkey-0`, `data-mimic-valkey
 `mimic-valkey`, ...) assume the release is called `mimic`; replace `mimic` with your release name
 otherwise.
 
-To enforce Pod Security on the release namespace as the chart's tests do:
+*Ops.* To enforce Pod Security on the release namespace as the chart's tests do:
 
 ```bash
 kubectl label namespace mimic-system \
@@ -80,6 +132,8 @@ cluster-wide, the CRD, the `MutatingWebhookConfiguration` `<release>-injector` a
 
 ### Use your own Valkey password
 
+*Ops.* The chart generates a random password by default; to bring your own:
+
 ```bash
 kubectl -n mimic-system create secret generic my-valkey --from-literal=password="$(openssl rand -base64 30)"
 helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
@@ -103,6 +157,8 @@ A pod label `mimic.platform.io/inject: disabled` always opts a pod out. The full
 `kubectl -n demo rollout restart deploy/<name>`.
 
 ## Upgrade
+
+*Ops.*
 
 ```bash
 helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version <new-version> -n mimic-system
@@ -146,6 +202,8 @@ is immutable, so `helm upgrade` of such an install fails with an error such as
   ```
 
 ## Uninstall
+
+*Ops* on a shared cluster; on kind, deleting the cluster does it.
 
 ```bash
 helm uninstall mimic -n mimic-system

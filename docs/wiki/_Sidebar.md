@@ -1,18 +1,20 @@
 **[Home](Home)**
 
+**Get started**
+1. [Install](Install)
+2. [Quick start](Quick-start)
+3. [Mock mode](Mock-mode)
+4. [Load test](Load-test)
+5. [Reading the API](Reading-the-API)
+
 **Use**
 - [Concepts](Concepts)
-- [Quick start](Quick-start)
-- [Reading the API](Reading-the-API)
 - [Discovery and redaction](Discovery-and-redaction)
 - [Egress aggregation](Egress-aggregation)
 - [Egress endpoint](Egress-endpoint)
-- [Mock mode](Mock-mode)
-- [Load test](Load-test)
 - [TLS interception](TLS-interception)
 
 **Run**
-- [Install](Install)
 - [Configuration](Configuration)
 - [Operations](Operations)
 - [Monitoring](Monitoring)

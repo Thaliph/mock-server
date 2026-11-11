@@ -1,7 +1,7 @@
 # Discovery and redaction
 
-Covers F4 and F5. Reference: spec §6, §7.3, §11. Discovery records **inbound** exchanges (the
-endpoints a deployment exposes) and, from F7, **outbound** ones: see [Egress aggregation](Egress-aggregation).
+Discovery records **inbound** exchanges (the
+endpoints a deployment exposes) and, **outbound** ones: see [Egress aggregation](Egress-aggregation).
 
 ## What is recorded
 

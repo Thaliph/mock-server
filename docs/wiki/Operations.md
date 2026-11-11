@@ -2,7 +2,7 @@
 
 Names assume the Helm release is called `mimic`; replace `mimic` with your release name otherwise.
 
-Audience: ops. Covers F0 to F5. Reference: spec §7.3, §9, §10, §11.
+Audience: ops.
 
 ## Health probes
 
@@ -67,7 +67,7 @@ pod on the controller.
 | `mimic_store_refused_total` | counter | `kind` (`endpoint`, `sample`), `reason` (`endpoint_limit`, `budget`) |
 | `mimic_store_evicted_total` | counter | `kind` |
 | `mimic_store_expired_total` | counter | `kind` |
-| `mimic_status_updates_total` | counter | `result` (`ok`, `error`) (F5 status) |
+| `mimic_status_updates_total` | counter | `result` (`ok`, `error`) |
 | `mimic_ui_requests_total` | counter | `route` (route pattern or `other`), `code` (read API and UI listener) |
 | `mimic_ui_render_duration_seconds` | histogram | `route` (parse and render of a stored report for `endpoints`, `openapi` and a document) |
 | `mimic_ui_skipped_total` | counter | `reason` (`meta-unreadable`: a list entry left out) |

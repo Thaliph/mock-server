@@ -1,54 +1,75 @@
 # Quick start
 
-Audience: developers. You will inject two small Python services, send traffic, and read the API that
-mimic discovered. About 10 minutes. Covers F0 to F5.
+Step 2 of [Get started](Home#get-started). You will inject two small Python services, one calling the other,
+send traffic, and read what mimic discovered about both. About 10 minutes.
 
-You need a cluster with mimic installed ([Install](Install)), `kubectl`, `curl`, `jq`, and a clone of
-the repository (the services are in `scripts/e2e/apps/`; they are the ones the end-to-end tests use).
+You need a cluster with mimic installed ([Install](Install); on a laptop, [Try it on kind](Install#try-it-on-kind)),
+`kubectl`, `curl` and `jq`. No clone of the repository is needed: the two demo services are three small files
+(`service.py`, `users.yaml`, `front.yaml`) that you download at the tag of the release you installed.
 
 ```
-client pod --> front (service A, namespace demo-client, not injected)
+client pod --> front (service A, 1 replica, injected)
                  |  GET /front/users/<id>  -->  forwards to users
                  v
-               users (service B, namespace demo, 2 replicas, injected)  <-- mimic records these
+               users (service B, 2 replicas, injected)
 ```
 
-`front` forwards `/front/<path>` to `users`, passing `Authorization`, `X-Tenant-Key` and
-`Content-Type`. `users` answers `GET` and `PUT /users/<id>` with JSON. Both run stdlib Python from a
-ConfigMap, so no image is built.
+All in one namespace, `demo`. `front` forwards `/front/<path>` to `users`, passing `Authorization`,
+`X-Tenant-Key` and `Content-Type`. `users` answers `GET` and `PUT /users/<id>` with JSON. Both run stdlib
+Python from a ConfigMap, so no image is built. mimic records, for `users`, what it exposes (its inbound
+endpoints) and, for `front`, what it exposes and what it calls (its outbound calls to `users`): the next pages
+answer those calls from the recording.
 
-## 1. Namespaces
+## 1. Namespace
 
-`users` lives in a namespace that mimic injects; `front` and the client live in a plain one.
+The namespace is labelled so that mimic injects every Deployment created in it.
 
 ```bash
 kubectl create namespace demo
 kubectl label namespace demo mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
-kubectl create namespace demo-client
 ```
 
 ## 2. Deploy the services
 
+The files are the test services of the project; their comments mention names used by its own tests, which you
+can ignore. Download them at the tag of the release (here `0.2.0-alpha.2`) into a scratch directory:
+
 ```bash
-kubectl -n demo create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py
-kubectl -n demo apply -f scripts/e2e/apps/users.yaml
+APPS=https://raw.githubusercontent.com/Thaliph/mock-server/v0.2.0-alpha.2/scripts/e2e/apps
+mkdir -p mimic-demo && cd mimic-demo
+curl -fsSLO $APPS/service.py && curl -fsSLO $APPS/users.yaml && curl -fsSLO $APPS/front.yaml
+```
 
-kubectl -n demo-client create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py
-sed 's/users\.disc-22\.svc/users.demo.svc/' scripts/e2e/apps/front.yaml | kubectl -n demo-client apply -f -
+`front.yaml` calls `users` by its full name, `users.disc-22.svc`: `disc-22` is the namespace of the project's own
+tests. The `sed` below replaces it with the namespace you created above (`demo`); if you picked another name for
+that namespace, put it there instead. `front.yaml` also holds a bare `client` pod that only sleeps and that we call
+`front` from; a pod with no Deployment is left alone by the webhook (it gets the annotation
+`mimic.platform.io/skipped: unsupported-owner`).
 
+```bash
+kubectl -n demo create configmap apps-code --from-file=service.py
+kubectl -n demo apply -f users.yaml
+sed 's/users\.disc-22\.svc/users.demo.svc/' front.yaml | kubectl -n demo apply -f -
+```
+
+Wait until everything is ready (the first start pulls the Python image):
+
+```bash
 kubectl -n demo rollout status deploy/users --timeout=3m
-kubectl -n demo-client rollout status deploy/front --timeout=3m
-kubectl -n demo-client wait --for=condition=Ready pod/client --timeout=180s
+kubectl -n demo rollout status deploy/front --timeout=3m
+kubectl -n demo wait --for=condition=Ready pod/client --timeout=180s
 ```
 
 Check the injection:
 
 ```bash
-kubectl -n demo get pod -l app=users -o jsonpath='{.items[0].spec.initContainers[*].name}{"\n"}'
-# mimic-init mimic-sidecar mimic-trust-0
+for app in users front; do
+  kubectl -n demo get pod -l app=$app -o jsonpath='{.items[0].spec.initContainers[*].name}{"\n"}'
+done
+# mimic-init mimic-sidecar mimic-trust-0   (once for each app)
 ```
 
-## 3. Turn discovery on for `users`
+## 3. Turn discovery on for `users` and `front`
 
 Discovery is the default mode. Creating a `MimicWorkload` is what gives you a status to look at (and
 is how you set per-deployment options, see [Configuration](Configuration)):
@@ -60,21 +81,27 @@ kind: MimicWorkload
 metadata: {name: users, namespace: demo}
 spec:
   deployment: users
+---
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: front, namespace: demo}
+spec:
+  deployment: front
 EOF
 ```
 
 In an `enabled` namespace the `MimicWorkload` is not needed for injection; had you labelled the
 namespace `selected`, only Deployments named by a `MimicWorkload` would be injected, and the pods
-would need a restart (`kubectl -n demo rollout restart deploy/users`).
+would need a restart (`kubectl -n demo rollout restart deploy/users deploy/front`).
 
 ## 4. Send traffic
 
 40 `GET`s, then 5 `PUT`s with a body that contains a password and a bearer token:
 
 ```bash
-kubectl -n demo-client exec -i client -- python3 - <<'PY'
+kubectl -n demo exec -i client -- python3 - <<'PY'
 import json, urllib.request
-base = "http://front.demo-client.svc:8080/front/users"
+base = "http://front.demo.svc:8080/front/users"
 for n in range(1, 41):
     urllib.request.urlopen(f"{base}/{n}", timeout=10).read()
 for n in range(1, 6):
@@ -92,27 +119,45 @@ PY
 
 Each sidecar posts its report every 30 s (`MIMIC_DISCOVERY_PUSH_INTERVAL`; the first push comes after
 a random delay within that interval). The `MimicWorkload` status refreshes every 30 s more
-(`MIMIC_STATUS_INTERVAL`). Wait about a minute.
+(`MIMIC_STATUS_INTERVAL`). Wait about a minute, or let a loop wait until `users` shows the 45 requests and
+`front` its 2 outbound endpoints (it gives up after 3 minutes):
+
+```bash
+for i in $(seq 36); do
+  [ "$(kubectl -n demo get mimicworkload users -o jsonpath='{.status.discovery.exchanges}')" -ge 45 ] 2>/dev/null &&
+  [ "$(kubectl -n demo get mimicworkload front -o jsonpath='{.status.discovery.endpoints.outbound}')" -ge 2 ] 2>/dev/null && break
+  sleep 5
+done
+```
 
 Optional: look at what one pod holds *before* it is shipped. `/discovery` is served on the sidecar
 admin port to loopback peers only, so use a port-forward:
 
 ```bash
 pod=$(kubectl -n demo get pod -l app=users -o jsonpath='{.items[0].metadata.name}')
-kubectl -n demo port-forward "pod/$pod" 15100:15100 &
+kubectl -n demo port-forward "pod/$pod" 15100:15100 >/dev/null &
+PF1=$!
+for i in $(seq 30); do curl -fs localhost:15100/discovery >/dev/null && break; sleep 1; done
 curl -s localhost:15100/discovery | jq '.exchanges'
+kill $PF1
 ```
 
 After a push is acknowledged, the shipped counters and samples leave the local report, so this number
 drops back to what was recorded since.
 
-## 6. Read the merged report
+## 6. Read the merged reports
 
-The read API listens on the loopback of each controller pod (`127.0.0.1:8080`); reach it with a
-port-forward (Kubernetes RBAC on `pods/portforward` in the release namespace is the authentication):
+The read API listens on port 8080, on the loopback of each controller pod only (port 8081, the admin port, is
+the one on the Service). Reach it with a port-forward (Kubernetes RBAC on `pods/portforward` in the release
+namespace is the authentication); the loop waits until the forward answers:
+
+If a forward on 8080 from an earlier step is still running, a new one fails with "address already in use" while
+`curl` quietly talks to the old one. Check `jobs` first, or stop it with `pkill -f 'port-forward.*8080'`.
 
 ```bash
-kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080 &
+kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080 >/dev/null &
+PF=$!
+for i in $(seq 30); do curl -fs localhost:8080/v1/workloads >/dev/null && break; sleep 1; done
 
 curl -s localhost:8080/v1/workloads | jq
 curl -s localhost:8080/v1/workloads/demo/users | jq
@@ -121,14 +166,17 @@ curl -s localhost:8080/v1/workloads/demo/users | jq
 ```json
 {
   "workloads": [
+    {"deployment": "front", "endpoints": 4, "exchanges": 90, "last_push": "2026-11-02T10:00:20.000Z",
+     "namespace": "demo", "sample_bytes": 83900},
     {"deployment": "users", "endpoints": 2, "exchanges": 45, "last_push": "2026-11-02T10:00:21.000Z",
      "namespace": "demo", "sample_bytes": 41230}
   ]
 }
 ```
 
-(Numbers and times in the outputs below are illustrative.) The merged report is the stored report document. List the endpoints it holds (inbound, by the
-application port `8080`), with their status counts:
+(Numbers and times in the outputs below are illustrative.) `front` has 4 endpoints: the 2 it exposes and the 2 it
+calls. First `users`, what it exposes. The merged report is the stored report document. List the endpoints it
+holds (inbound, by the application port `8080`), with their status counts:
 
 ```bash
 curl -s localhost:8080/v1/workloads/demo/users/report > report.json
@@ -141,7 +189,26 @@ named after the preceding segment. The report also holds the response schemas, v
 latency histograms and up to 20 redacted samples per endpoint. More in
 [Reading the API](Reading-the-API).
 
-Check that the secrets are not there:
+Now `front`: the endpoint list tells the inbound endpoints (what `front` exposes) from the outbound ones (what it
+calls, with the `authority` it called):
+
+```bash
+curl -s localhost:8080/v1/workloads/demo/front/endpoints |
+  jq -c '.endpoints[] | {direction, authority, method, template, exchanges}'
+```
+
+```
+{"direction":"inbound","authority":null,"method":"GET","template":"/front/users/{users_id}","exchanges":40}
+{"direction":"inbound","authority":null,"method":"PUT","template":"/front/users/{users_id}","exchanges":5}
+{"direction":"outbound","authority":"users.demo.svc:8080","method":"GET","template":"/users/{users_id}","exchanges":40}
+{"direction":"outbound","authority":"users.demo.svc:8080","method":"PUT","template":"/users/{users_id}","exchanges":5}
+```
+
+The outbound rows are the egress of `front`, recorded per destination ([Egress aggregation](Egress-aggregation)):
+it is what mock mode answers from, on the next page. Their OpenAPI document is `outbound-<authority>`
+(`curl -s localhost:8080/v1/workloads/demo/front/openapi | jq -c .documents` lists the ids).
+
+Check that the secrets are not there (in `users`; `front` is the same):
 
 ```bash
 grep -c 's3cret-value' report.json    # 0
@@ -150,7 +217,7 @@ grep -o 'Bearer mimic-token' report.json | sort -u
 ```
 
 Or look at it in the browser, with the same port-forward: open <http://localhost:8080/ui/>, pick
-`demo/users`, then its document. Swagger UI shows `GET` and `PUT /users/{users_id}` with the recorded
+`demo/users`, then its document; `demo/front` lists its outbound calls with an Authority column. Swagger UI shows `GET` and `PUT /users/{users_id}` with the recorded
 examples and the `http_bearer` security scheme (never the token). The raw OpenAPI 3.1 file is
 `curl -s localhost:8080/v1/workloads/demo/users/openapi/inbound-8080`.
 
@@ -161,12 +228,14 @@ kubectl -n demo get mimicworkload
 ```
 
 ```
-NAME    MODE        ENDPOINTS   PODS   LAST PUSH
-users   discovery   2           2      25s
+NAME    MODE        ENDPOINTS   PODS   LAST PUSH   MODE PODS
+front   discovery   4           1      25s         1
+users   discovery   2           2      25s         2
 ```
 
-`ENDPOINTS` is the inbound endpoint count, `PODS` the pods that pushed within the last 5 minutes
-(`MIMIC_STATUS_POD_WINDOW`), `LAST PUSH` the age of the last applied push. The full status:
+`MODE PODS` is the number of pods that follow the mode ([Mock mode](Mock-mode)). `ENDPOINTS` is the count of inbound and outbound endpoints together (`front` shows 4: 2 it exposes and 2 it calls), `PODS` the pods that pushed within the last 5 minutes
+(`MIMIC_STATUS_POD_WINDOW`), `LAST PUSH` the age of the last applied push. The full status of `users` (`front` also has
+`endpoints.outbound: 2`):
 
 ```bash
 kubectl -n demo get mimicworkload users -o jsonpath='{.status}' | jq
@@ -174,20 +243,23 @@ kubectl -n demo get mimicworkload users -o jsonpath='{.status}' | jq
 
 ```json
 {"discovery": {"endpoints": {"inbound": 2}, "exchanges": 45, "lastPushTime": "2026-11-02T10:00:21Z",
- "pods": 2, "sampleBytes": 41230}}
+ "pods": 2, "sampleBytes": 41230, "totalEndpoints": 2},
+ "mode": {"mode": "discovery", "otherPods": 0, "pods": 2}}
 ```
 
-(The status subresource is F5; on a chart without it, use the read API.)
-
-## 8. Clean up
+The port-forward is no longer needed; stop it (later pages start it again when they need it):
 
 ```bash
-kill %1 %2 2>/dev/null
-kubectl delete namespace demo demo-client
+kill $PF; wait $PF 2>/dev/null
 ```
 
 ## Next
 
+Do not delete anything yet: the next pages reuse `demo/users` and `demo/front`; the clean-up is the last step of
+[Reading the API](Reading-the-API#clean-up).
+
+- Step 3 of Get started: answer the outbound calls of `front` from what was recorded, with `users` switched off:
+  [Mock mode](Mock-mode). Then [Load test](Load-test).
 - Hide more header or field names: `spec.discovery.redact` in [Configuration](Configuration).
 - Why `GET /users/{users_id}` and not one endpoint per id: [Discovery and redaction](Discovery-and-redaction).
 - Nothing shows up: [Troubleshooting](Troubleshooting).

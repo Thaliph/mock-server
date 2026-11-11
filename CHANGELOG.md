@@ -11,6 +11,10 @@ All notable changes to mimic are documented in this file. The format follows
 
 - `kubectl get mimicloadtest` shows the p99 latency column as `P99 MICROS` instead of `P99 ΜS`: kubectl upper-cases column names, and the micro sign became a Greek capital Mu (#431).
 
+### Documentation
+
+- Wiki onboarding: a five-page "Get started" path (Install, Quick start, Mock mode, Load test, Reading the API) whose demo injects `front` and `users`, mocks `front` with `users` scaled to 0 and load-tests `front` alone; the load test read API, kind and install accuracy, and plain wording on the user pages.
+
 ## [0.2.0-alpha.2] - 2026-11-11
 
 ### Features

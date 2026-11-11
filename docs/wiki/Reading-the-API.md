@@ -1,6 +1,6 @@
 # Reading the API
 
-Covers F5 and F6. Reference: spec §7.5, §7.6, §7.4, §6. You read the discovered data as JSON, as an
+Step 5 of [Get started](Home#get-started). You read the discovered data as JSON, as an
 OpenAPI 3.1 document per port, or in the browser ([the UI](#the-ui)).
 
 ## Reaching it
@@ -9,9 +9,19 @@ The read API is plain HTTP on `MIMIC_UI_ADDR`, default `127.0.0.1:8080` **inside
 It is not behind a Service. Reach it with a port-forward; Kubernetes RBAC on `pods/portforward` in the
 release namespace is the authentication:
 
+If a forward on 8080 from an earlier step is still running, a new one fails with "address already in use" while
+`curl` quietly talks to the old one. Check `jobs` first, or stop it with `pkill -f 'port-forward.*8080'`.
+
 ```bash
-kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080
+kubectl -n mimic-system port-forward deploy/mimic-controller 8080:8080 >/dev/null &
+PF=$!
+# wait until the forward answers (a few seconds), then use it; `kill $PF` stops it
+for i in $(seq 30); do curl -fs localhost:8080/v1/workloads >/dev/null && break; sleep 1; done
 ```
+
+The controller has two HTTP ports: **8081** is the admin port (`/healthz`, `/readyz`, `/metrics`) and is on the
+`mimic-controller` Service; **8080** is this read API and the UI, on the loopback of the pod only, so forward
+`deploy/mimic-controller`, not `svc/mimic-controller`.
 
 All replicas read the same Valkey, so any pod gives the same answer. Safeguards: a peer that is not
 loopback gets `403`; so does a request whose `Host` is missing or not `localhost`, `127.0.0.1` or
@@ -27,7 +37,9 @@ deleted: data leaves by expiry ([Operations](Operations#retention)).
 | `GET /v1/workloads/<ns>/<dep>` | The same summary plus `pods`. |
 | `GET /v1/workloads/<ns>/<dep>/report` | The stored merged report. |
 | `GET /v1/workloads/<ns>/<dep>/endpoints` | Every endpoint: direction, port, method, template, exchanges, statuses, latency quantiles, hosts, last seen and the `document` that holds it. |
-| `GET /v1/workloads/<ns>/<dep>/openapi` | The documents of the deployment: `inbound-<port>`, one per listening port. |
+| `GET /v1/workloads/<ns>/<dep>/loadtests` | The stored [load test](Load-test) runs of the deployment, newest first: `uid`, `name`, `phase`, `reason`, `start`, `end` and `total`. |
+| `GET /v1/workloads/<ns>/<dep>/loadtests/<uid>` | One run, with its `summary`: the totals and one row per endpoint (`400` for a uid that is not a UUID, `404` for an unknown one). |
+| `GET /v1/workloads/<ns>/<dep>/openapi` | The documents of the deployment: `inbound-<port>`, one per listening port, and `outbound-<authority>`, one per destination it called (`front` has `outbound-users.demo.svc:8080`). |
 | `GET /v1/workloads/<ns>/<dep>/openapi/<id>` | The OpenAPI 3.1 document `<id>` (`400` for an invalid id, `404` for one the report does not hold). |
 
 Status codes: `404` deployment without data, `400` a name that is not DNS-1123, `503` Valkey
@@ -114,11 +126,37 @@ Useful `jq` one-liners:
 R=localhost:8080/v1/workloads/demo/users/report
 # methods and status counts under /users/{param}
 curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints | map_values(.statuses)'
-# redacted fields
-curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET.observed.fields.fields | map_values(select(.redacted)) | keys'
+# redacted fields (with the Quick start traffic: the GET shows only the response cookie, the PUT also the
+# Authorization header and the password, the only requests that sent them)
+curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints | map_values(.observed.fields.fields | map_values(select(.redacted)) | keys)'
 # samples of one endpoint
 curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET.samples | length'
 ```
+
+## Load test runs
+
+The result of a [load test](Load-test) is kept in Valkey (the last 20 runs per deployment) and served under
+`loadtests`. The `<uid>` in the path is the `metadata.uid` of the `MimicLoadTest`, **not its name**: a name
+answers `400`. To list the runs, then print the per-endpoint summary of one (here the run `front-1` of the
+[Load test](Load-test) page, on the deployment `front`):
+
+```bash
+curl -s localhost:8080/v1/workloads/demo/front/loadtests | jq -c '.loadtests[] | {uid, name, phase, reason}'
+uid=$(kubectl -n demo get mimicloadtest front-1 -o jsonpath='{.metadata.uid}')
+curl -s localhost:8080/v1/workloads/demo/front/loadtests/$uid |
+  jq -r '.summary.endpoints[] | [.method, .template, .requests, .rps, .latencyMicros.p99] | @tsv'
+# GET   /front/users/{users_id}   2440   40   2290
+# PUT   /front/users/{users_id}    310    5   1980
+```
+
+(Illustrative numbers for a one-minute run: the plan is weighted by what discovery recorded, 40 `GET`s to 5
+`PUT`s in the Quick start, so expect about eight `GET`s for each `PUT`; yours will differ.)
+
+Every row (`summary.total` and each entry of `summary.endpoints`) holds `requests`, `missed`, `statuses` (by
+class: `2xx`, `3xx`, `4xx`, `5xx`), `errors` (by kind), `rps` and `latencyMicros` (`p50`, `p90`, `p99`, `max`,
+in microseconds). An endpoint row also has `method`, `port` and `template`. Times are UTC (RFC 3339). The
+same numbers are in `kubectl get mimicloadtest front-1 -o jsonpath='{.status.results}'` while the object
+exists; the read API keeps them after it is deleted.
 
 ## OpenAPI documents
 
@@ -141,6 +179,7 @@ The same listener serves a small read-only UI. With the port-forward above, open
 
 - `/ui/` lists the deployments with data;
 - `/ui/workloads/<ns>/<dep>` shows the summary, the pods, the endpoints and one link per document;
+- the deployment page also has a "Load tests" table, filled from the routes above;
 - `/ui/workloads/<ns>/<dep>/openapi/<id>` shows the document in Swagger UI, with a link to the raw JSON.
 
 Swagger UI is embedded in the controller (no CDN, nothing fetched from the internet) and has no "Try
@@ -172,3 +211,18 @@ See [Troubleshooting](Troubleshooting) for the fix.
 ## `MimicWorkload` status
 
 The summary is also in `kubectl get mimicworkload` and `status.discovery` ([Configuration](Configuration)).
+
+## Clean up
+
+The last step of Get started. Stop a port-forward you still have running (Ctrl-C, or `kill $PF` in the shell that
+started it), then delete the demo. Deleting the namespace is enough, whatever mode the apps are in. The read API keeps the `demo/*` entries until
+they expire (`MIMIC_STORE_TTL`, 30 days after the last push by default, [Operations](Operations#retention));
+there is nothing to do about it:
+
+```bash
+kubectl delete namespace demo
+cd .. && rm -r mimic-demo
+```
+
+On kind, `kind delete cluster --name mimic` removes everything, mimic included. On a cluster you keep, see
+[Uninstall](Install#uninstall).
