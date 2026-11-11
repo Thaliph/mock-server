@@ -5,3 +5,4 @@
 # Core dumps (a crash while the disk was full put some in commits, #313)
 core
 core.[0-9]*
+__pycache__/

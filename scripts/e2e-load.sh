@@ -499,7 +499,7 @@ suite_main() {
   absent networkpolicy "$job_c" -n disc-22 || fail "ldt_16: run C has a NetworkPolicy after Failed/NotMock"
 
   log "ldt_16: deleting the runs removes run A's Job and NetworkPolicy"
-  kubectl -n mck-19 delete mimicloadtest ldt16-a ldt16-b ldt16-d >/dev/null || fail "ldt_16: cannot delete runs A and B"
+  kubectl -n mck-19 delete mimicloadtest ldt16-a ldt16-b ldt16-d >/dev/null || fail "ldt_16: cannot delete runs A, B and D"
   kubectl -n disc-22 delete mimicloadtest ldt16-c >/dev/null || fail "ldt_16: cannot delete run C"
   wait_for 90 absent job "$job_a" -n mck-19 || fail "ldt_16: the Job of run A is there after its MimicLoadTest was deleted"
   wait_for 90 absent networkpolicy "$job_a" -n mck-19 \

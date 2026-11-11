@@ -7,6 +7,7 @@ use super::*;
 const OLD: &str = "11111111-1111-4111-8111-111111111111";
 const NEW: &str = "22222222-2222-4222-8222-222222222222";
 const LIVE: &str = "33333333-3333-4333-8333-333333333333";
+const BAD: &str = "44444444-4444-4444-8444-444444444444";
 
 const SUMMARY: &str = r#"{"total":{"requests":30,"missed":1,"statuses":{"2xx":29,"5xx":1},"errors":{"timeout":2},"rps":15,"latencyMicros":{"p50":900,"p90":2000,"p99":5000,"max":9000}},"endpoints":[{"method":"GET","port":8080,"template":"/a","requests":30,"missed":1,"statuses":{"2xx":29,"5xx":1},"errors":{"timeout":2},"rps":15,"latencyMicros":{"p50":900,"p90":2000,"p99":5000,"max":9000}}]}"#;
 
@@ -172,12 +173,12 @@ async fn ldt_19_an_unparseable_stored_summary_is_null_and_logged_once_as_an_erro
     let (capture, _guard) = crate::webhook::tests::capture_logs();
     let store = store(&valkey_url());
     let ns = unique("ldt19s");
-    run(&store, &ns, OLD, "first", 1_000_000, None).await;
+    run(&store, &ns, BAD, "first", 1_000_000, None).await;
     store
         .load_end(
             &ns,
             "pay",
-            OLD,
+            BAD,
             &Ended {
                 phase: "Failed",
                 reason: "NoReport",
@@ -188,7 +189,7 @@ async fn ldt_19_an_unparseable_stored_summary_is_null_and_logged_once_as_an_erro
         .await
         .expect("ended");
     for _ in 0..3 {
-        let answer = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests/{OLD}")).await;
+        let answer = get(&store, &format!("/v1/workloads/{ns}/pay/loadtests/{BAD}")).await;
         assert_eq!(answer.status, 200);
         assert_eq!(answer.json()["summary"], Value::Null);
     }
@@ -196,7 +197,7 @@ async fn ldt_19_an_unparseable_stored_summary_is_null_and_logged_once_as_an_erro
     let lines: Vec<Value> = raw
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["message"] == "load test summary unreadable" && v["uid"] == OLD)
+        .filter(|v| v["message"] == "load test summary unreadable" && v["uid"] == BAD)
         .collect();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0]["level"], "ERROR");

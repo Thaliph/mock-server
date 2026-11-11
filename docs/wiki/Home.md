@@ -5,7 +5,7 @@ A sidecar is injected into your Deployments, observes the traffic that crosses e
 controller merges what every pod saw into one description per Deployment, stored in Valkey and
 readable through a small API.
 
-This wiki documents mimic **0.2.0-alpha.1** (pre-release).
+This wiki documents mimic **0.2.0-alpha.2** (pre-release).
 
 It covers features F0 to F11 and the monitoring work. The wiki is not versioned: it describes the
 release it was last published from, and `docs/wiki/` at a release tag documents that release. The reference is
@@ -68,7 +68,7 @@ the spec disagree, the spec wins.
 
 ## Release status
 
-`0.2.0-alpha.1` is a pre-release: the `v1alpha1` CRDs may change incompatibly before `0.2.0`, and
+`0.2.0-alpha.2` is a pre-release: the `v1alpha1` CRDs may change incompatibly before `0.2.0`, and
 there is no upgrade from the legacy `v0.1.0`. See the
 [CHANGELOG](https://github.com/Thaliph/mock-server/blob/main/CHANGELOG.md) and the accepted limits in
 [Security](Security).

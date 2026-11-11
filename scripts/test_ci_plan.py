@@ -88,8 +88,9 @@ class Fnd10Classification(unittest.TestCase):
         self.assertFalse(r["gate_codeql_actions"])
 
     def test_fnd_10_docs_read_by_check_release_open_the_chart_gate(self):
-        # scripts/check-release.sh (the chart job) reads the wiki and SECURITY.md; the chart gate
-        # covers docs, so each of these alone runs that job.
+        # scripts/check-release.sh (the chart job) reads SECURITY.md and docs/wiki; CHANGELOG.md is
+        # read by release-gates.sh and README.md by neither. The chart gate covers every doc, so
+        # each of these alone runs that job.
         for path in ("SECURITY.md", "README.md", "CHANGELOG.md", "docs/wiki/Install.md"):
             with self.subTest(path=path):
                 r = run([path])

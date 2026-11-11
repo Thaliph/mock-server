@@ -1847,11 +1847,11 @@ no `MimicLoadTest` and creates no Job).
      pods' results are read again whatever the pacing before the run is judged: a final post
      that landed after the last read counts, and `NoReport` is only for a run still missing
      one after that read. A failed read of the results is logged once per outage as one WARN
-     `load test posts unreadable`, and retried at the next pass. While a run in `Pending` waits for the signing seed, the
-     webhook CA or Valkey, its plan is built once and kept for the next passes (never rebuilt
-     at every pass), and the wait is logged once per outage as one WARN `load test admission
-     waiting` (`reason`: `seed`, `ca` or `valkey`), the next one only after the run has
-     progressed; each reason is logged once per outage on its own, so a change of reason
+     `load test posts unreadable`, and retried at the next pass. While a run in `Pending`
+     waits for the signing seed, the webhook CA or Valkey, its plan is built once and kept for
+     the next passes (never rebuilt at every pass), and the wait is logged once per outage as
+     one WARN `load test admission waiting` (`reason`: `seed`, `ca` or `valkey`), the next one
+     only after the run has progressed; each reason is logged once per outage on its own, so a change of reason
      during an outage still logs the new one.
 - **Targets**: the ready endpoints (`conditions.ready` true or absent) of every
   `EndpointSlice` of the namespace whose `targetRef` is a `Pod` with a name the deployment's
