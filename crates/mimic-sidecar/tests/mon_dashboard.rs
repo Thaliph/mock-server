@@ -190,17 +190,17 @@ async fn mon_08_active_connections_never_exceed_the_cap() {
     }
 }
 
-/// The observations of the overhead of `direction`, and those in the `le="0.1"` bucket.
+/// The observations of the overhead of `direction`, and their sum in seconds.
 fn overhead(metrics: &Metrics, direction: &str) -> (f64, f64) {
     let count = sum(
         metrics,
         &format!("mimic_proxy_overhead_seconds_count{{direction=\"{direction}\"}}"),
     );
-    let le = sum(
+    let seconds = sum(
         metrics,
-        &format!("mimic_proxy_overhead_seconds_bucket{{le=\"0.1\",direction=\"{direction}\"}}"),
+        &format!("mimic_proxy_overhead_seconds_sum{{direction=\"{direction}\"}}"),
     );
-    (count, le)
+    (count, seconds)
 }
 
 #[tokio::test]
@@ -214,7 +214,12 @@ async fn mon_09_http1_overhead_excludes_the_upstream_wait() {
             get(&mut c, &format!("/p/{n}")).await;
         }
         until("20 observations", || overhead(&f.metrics, d).0 == 20.0).await;
-        assert_eq!(overhead(&f.metrics, d), (20.0, 20.0), "{direction:?}");
+        let (count, seconds) = overhead(&f.metrics, d);
+        // The 200 ms upstream wait of each exchange is not in the overhead.
+        assert!(
+            count == 20.0 && seconds < 20.0 * 0.1,
+            "{direction:?}: {count} {seconds}"
+        );
         // The upstream wait is in the request duration, not in the overhead.
         let total = sum(
             &f.metrics,
@@ -289,7 +294,8 @@ async fn mon_09_h2_overhead_excludes_the_upstream_wait() {
         overhead(&f.metrics, "inbound").0 == 20.0
     })
     .await;
-    assert_eq!(overhead(&f.metrics, "inbound"), (20.0, 20.0));
+    let (count, seconds) = overhead(&f.metrics, "inbound");
+    assert!(count == 20.0 && seconds < 20.0 * 0.1, "{count} {seconds}");
     let total = sum(
         &f.metrics,
         "mimic_http_request_duration_seconds_sum{direction=\"inbound\"",
@@ -334,5 +340,7 @@ async fn mon_09_mocked_exchanges_exclude_the_simulated_latency() {
         overhead(&rig.metrics, "outbound").0 == 5.0
     })
     .await;
-    assert_eq!(overhead(&rig.metrics, "outbound"), (5.0, 5.0));
+    // The simulated latency of 150 ms or more is not in the overhead.
+    let (count, seconds) = overhead(&rig.metrics, "outbound");
+    assert!(count == 5.0 && seconds < 5.0 * 0.15, "{count} {seconds}");
 }

@@ -25,6 +25,9 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot};
 
 pub mod load;
 
+/// The sorted set of the deployments with data (spec §8).
+const WORKLOADS_KEY: &str = "mimic:v1:workloads";
+
 /// Deployments written at once per replica (memory bound).
 const MAX_WRITERS: usize = 2;
 /// `:pulls` writes in flight at once; a pull over that is not recorded (spec §7.7).
@@ -166,7 +169,7 @@ pub fn keys(namespace: &str, deployment: &str) -> Result<Keys, NameError> {
         pulls: format!("{base}:pulls"),
         seq: format!("{base}:seq"),
         ns_index: format!("mimic:v1:ns:{namespace}"),
-        workloads: "mimic:v1:workloads".to_string(),
+        workloads: WORKLOADS_KEY.to_string(),
     })
 }
 
@@ -804,7 +807,7 @@ impl Store {
             .map_err(|_| ReadError::Unavailable)?;
         // Not logged: the status pass that follows reports the outage once.
         redis::cmd("ZCARD")
-            .arg("mimic:v1:workloads")
+            .arg(WORKLOADS_KEY)
             .query_async(&mut conn)
             .await
             .map_err(|_| ReadError::Unavailable)
@@ -820,7 +823,7 @@ impl Store {
         let floor =
             now_ms().saturating_sub(u64::try_from(self.config.ttl.as_millis()).unwrap_or(u64::MAX));
         let members: Vec<String> = match redis::cmd("ZRANGEBYSCORE")
-            .arg("mimic:v1:workloads")
+            .arg(WORKLOADS_KEY)
             .arg(floor)
             .arg("+inf")
             .query_async(&mut conn)

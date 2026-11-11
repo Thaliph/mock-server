@@ -101,16 +101,14 @@ impl Collector for ProcessMetrics {
         }
         match process.limits() {
             Ok(limits) => {
-                if let procfs::process::LimitValue::Value(soft) = limits.max_open_files.soft_limit {
-                    let max = ConstGauge::new(soft as i64);
-                    let metric = encoder.encode_descriptor(
-                        "process_max_fds",
-                        "Maximum number of open file descriptors",
-                        None,
-                        max.metric_type(),
-                    )?;
-                    max.encode(metric)?;
-                }
+                let max = ConstGauge::new(max_fds_value(&limits.max_open_files.soft_limit));
+                let metric = encoder.encode_descriptor(
+                    "process_max_fds",
+                    "Maximum number of open file descriptors",
+                    None,
+                    max.metric_type(),
+                )?;
+                max.encode(metric)?;
             }
             Err(error) => Self::unavailable("/proc/self/limits", &error),
         }
@@ -123,6 +121,53 @@ impl Collector for ProcessMetrics {
     fn encode(&self, _encoder: DescriptorEncoder) -> std::fmt::Result {
         Ok(())
     }
+}
+
+/// `process_max_fds` for a soft `RLIMIT_NOFILE`: unlimited is `+Inf`.
+#[cfg(target_os = "linux")]
+fn max_fds_value(soft: &procfs::process::LimitValue) -> f64 {
+    match soft {
+        procfs::process::LimitValue::Value(soft) => *soft as f64,
+        procfs::process::LimitValue::Unlimited => f64::INFINITY,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use procfs::process::LimitValue;
+
+    #[derive(Debug)]
+    struct InfGauge(prometheus_client::metrics::gauge::ConstGauge<f64>);
+
+    impl Collector for InfGauge {
+        fn encode(&self, mut encoder: DescriptorEncoder) -> std::fmt::Result {
+            let metric = encoder.encode_descriptor("x", "x", None, self.0.metric_type())?;
+            self.0.encode(metric)
+        }
+    }
+
+    #[test]
+    fn mon_04_max_fds_is_the_soft_limit_or_infinite_when_unlimited() {
+        assert_eq!(max_fds_value(&LimitValue::Value(1024)), 1024.0);
+        assert_eq!(max_fds_value(&LimitValue::Unlimited), f64::INFINITY);
+        let gauge = prometheus_client::metrics::gauge::ConstGauge::new(f64::INFINITY);
+        let mut registry = Registry::default();
+        registry.register_collector(Box::new(InfGauge(gauge)));
+        let mut out = String::new();
+        encode_registry(&mut out, &registry).unwrap();
+        assert!(open_metrics_inf(&out).contains("x +Inf\n"), "{out}");
+    }
+}
+
+/// The client library writes an infinite float as `inf`; OpenMetrics spells it `+Inf`.
+fn open_metrics_inf(text: &str) -> String {
+    text.lines()
+        .map(|line| match line.strip_suffix(" inf") {
+            Some(series) => format!("{series} +Inf\n"),
+            None => format!("{line}\n"),
+        })
+        .collect()
 }
 
 pub struct Metrics {
@@ -162,7 +207,9 @@ impl Metrics {
         let mut out = String::new();
         // Writing into a String cannot fail.
         let _ = encode_registry(&mut out, &self.registry);
-        let _ = encode_registry(&mut out, &self.process);
+        let mut process = String::new();
+        let _ = encode_registry(&mut process, &self.process);
+        out.push_str(&open_metrics_inf(&process));
         let _ = encode_eof(&mut out);
         out
     }
