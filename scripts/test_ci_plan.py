@@ -7,6 +7,7 @@ fails the run instead of skipping jobs.
 """
 
 import importlib.util
+import posixpath
 import re
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci_plan.py"
 CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
+# include_str!, include_bytes! and include! with a string literal path (not include_… of another name).
+INCLUDE = re.compile(r'(?<![\w])include(?:_str|_bytes)?!\(\s*"([^"]+)"')
 
 SPEC = importlib.util.spec_from_file_location("ci_plan", SCRIPT)
 plan = importlib.util.module_from_spec(SPEC)
@@ -64,13 +67,58 @@ class Fnd10Classification(unittest.TestCase):
         for gate in ("gate_image", "gate_e2e", "gate_e2e_load", "gate_lint", "gate_test"):
             self.assertFalse(r[gate], gate)
 
-    def test_fnd_10_spec_only_runs_the_dashboard_and_chart_checks(self):
-        # check-dashboards.py and its test read section 9 of docs/SPEC.md.
+    def test_fnd_10_spec_only_runs_the_dashboard_chart_and_rust_checks(self):
+        # check-dashboards.py and its test read section 9 of docs/SPEC.md; the Rust tests of
+        # mon_05 and mon_06 include it at compile time, so the rust gates run too.
         r = run(["docs/SPEC.md"])
         self.assertFalse(r["full"])
-        self.assertTrue(r["spec"] and r["docs"])
-        self.assertTrue(on(r, "chart", "vendored_ui"))
+        self.assertTrue(r["spec"] and r["docs"] and r["rust"])
+        self.assertTrue(
+            on(r, "lint", "test", "codeql_rust", "security", "cooldown", "vendored_ui", "chart")
+        )
         self.assertFalse(r["gate_image"])
+        self.assertFalse(r["gate_e2e"])
+
+    def test_fnd_10_crd_template_runs_the_chart_and_rust_checks(self):
+        # mck_09 includes the CRD template at compile time (the printer columns it asserts on).
+        r = run(["deploy/helm/mimic/templates/crd.yaml"])
+        self.assertFalse(r["full"])
+        self.assertTrue(r["rust"] and r["chart"])
+        self.assertTrue(r["gate_test"] and r["gate_lint"] and r["gate_chart"])
+        self.assertFalse(r["gate_codeql_actions"])
+
+    def test_fnd_10_docs_read_by_check_release_open_the_chart_gate(self):
+        # scripts/check-release.sh (the chart job) reads the wiki and SECURITY.md; the chart gate
+        # covers docs, so each of these alone runs that job.
+        for path in ("SECURITY.md", "README.md", "CHANGELOG.md", "docs/wiki/Install.md"):
+            with self.subTest(path=path):
+                r = run([path])
+                self.assertFalse(r["full"])
+                self.assertTrue(r["gate_chart"])
+                self.assertFalse(r["gate_lint"])
+
+    def test_fnd_10_include_targets_outside_their_crate_are_rust(self):
+        # A Rust test that includes a file of another directory (include_str!, include_bytes!,
+        # include!) must run when that file changes: the target has to be classified rust, or a
+        # change to it skips the tests that read it. Scans crates/ and fuzz/ (each its own crate).
+        outside = {}
+        for top in ("crates", "fuzz"):
+            for src in sorted((ROOT / top).rglob("*.rs")):
+                rel_src = src.relative_to(ROOT).as_posix()
+                crate = "/".join(rel_src.split("/")[:2]) if top == "crates" else "fuzz"
+                text = src.read_text(encoding="utf-8")
+                for target in INCLUDE.findall(text):
+                    rel = posixpath.normpath(posixpath.join(posixpath.dirname(rel_src), target))
+                    if rel == crate or rel.startswith(crate + "/"):
+                        continue
+                    outside.setdefault(rel, set()).add(rel_src)
+        # The scan must see the known cases, or it is not looking at what it claims to check.
+        for known in ("docs/SPEC.md", "deploy/helm/mimic/templates/crd.yaml"):
+            self.assertIn(known, outside)
+        for rel, users in sorted(outside.items()):
+            with self.subTest(target=rel):
+                self.assertTrue((ROOT / rel).is_file(), f"include target {rel} does not exist")
+                self.assertIn("rust", plan.categories_of(rel), f"included by {sorted(users)}")
 
     def test_fnd_10_chart_only_builds_and_runs_e2e(self):
         # e2e deploys the chart with the images, so a chart change needs both.
@@ -196,7 +244,7 @@ class Fnd10Cli(unittest.TestCase):
             return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
     def test_fnd_10_cli_prints_key_value_lines_for_github_output(self):
-        proc = self.run_cli("--event", "pull_request", paths=["docs/SPEC.md"])
+        proc = self.run_cli("--event", "pull_request", paths=["docs/wiki/Home.md"])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = dict(line.split("=", 1) for line in proc.stdout.splitlines() if line)
         self.assertEqual(lines["gate_lint"], "false")

@@ -33,6 +33,10 @@ RUST_FILES = frozenset(
         "scripts/test_vendor_swagger_ui.py",
         "scripts/check-test-messages.sh",
         "scripts/test_check_test_messages.sh",
+        # Read by Rust tests at compile time (include_str!), so their assertions run with the rust gates:
+        # mon_05 and mon_06 read the §9 metrics of SPEC.md, mck_09 the printer columns of the CRD.
+        "docs/SPEC.md",
+        "deploy/helm/mimic/templates/crd.yaml",
     }
 )
 

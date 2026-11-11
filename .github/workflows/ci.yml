@@ -116,7 +116,16 @@ jobs:
       - name: Self-test of the assert message check
         run: bash scripts/test_check_test_messages.sh
       - name: Assert messages of the change
-        run: scripts/check-test-messages.sh "$BASE"
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          # A push with no previous tip (first or force push: github.event.before is all zeros, or the
+          # commit is no longer in the history) has no base to diff against: nothing to compare, as cooldown.
+          if [[ $EVENT == push ]] && { [[ $BASE =~ ^0+$ ]] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; }; then
+            echo "no previous tip on this push ($BASE): nothing to compare"
+            exit 0
+          fi
+          scripts/check-test-messages.sh "$BASE"
 
   test:
     needs: [changes, lint]
