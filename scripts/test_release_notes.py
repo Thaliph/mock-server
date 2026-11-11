@@ -111,6 +111,30 @@ class ReleaseNotes(unittest.TestCase):
         r = fails(GOOD, "latest")
         self.assertEqual(r.returncode, 1)
 
+    def test_rel_02_duplicate_version_section(self):
+        dup = GOOD + GOOD[GOOD.index(f"## [{VERSION}]") : GOOD.index("## [0.1.0]")]
+        r = fails(dup)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("twice", r.stderr)
+        self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+
+    def test_rel_02_heading_in_code_fence_is_ignored(self):
+        fenced = GOOD.replace("- Fresh install.\n", "- Fresh install.\n\n```sh\n### Features\n## [9.9.9] - 2026-01-01\n```\n")
+        r = fails(fenced)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("### Features\n## [9.9.9]", r.stdout)
+        r = fails(GOOD.replace("### Upgrade notes", "```\n### Upgrade notes\n```"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("subsections", r.stderr)
+
+    def test_rel_02_each_feature_entry_names_its_issue(self):
+        body = notes.extract(CHANGELOG.read_text(encoding="utf-8"), VERSION)
+        features = body.split("### Accepted limits")[0].split("### Features")[1]
+        entries = re.split(r"^- ", features, flags=re.M)[1:]
+        self.assertGreaterEqual(len(entries), 13)
+        for entry in entries:
+            self.assertRegex(entry, r"#[0-9]+", f"entry without an issue: {entry[:40]!r}")
+
     def test_rel_02_shipped_changelog(self):
         text = CHANGELOG.read_text(encoding="utf-8")
         body = notes.extract(text, VERSION)

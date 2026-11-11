@@ -30,8 +30,15 @@ def extract(text, version):
         raise NotesError(f"version {version!r} is not a semantic version")
     lines = text.splitlines()
     sections = []  # (line index, name, date)
+    fenced = [False] * len(lines)  # inside a ``` fence: no heading there is structure
+    inside = False
     for i, line in enumerate(lines):
-        m = SECTION.match(line)
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            fenced[i] = True
+        else:
+            fenced[i] = inside
+        m = None if fenced[i] else SECTION.match(line)
         if m:
             sections.append((i, m.group(1), m.group(2)))
     if not sections or sections[0][1] != "Unreleased":
@@ -39,6 +46,8 @@ def extract(text, version):
     found = [s for s in sections if s[1] == version]
     if not found:
         raise NotesError(f"CHANGELOG.md: no section [{version}]")
+    if len(found) > 1:
+        raise NotesError(f"CHANGELOG.md: section [{version}] appears twice")
     start, _, date = found[0]
     if date is None or not DATE.match(date):
         raise NotesError(f"CHANGELOG.md: section [{version}] has no date (YYYY-MM-DD)")
@@ -48,7 +57,11 @@ def extract(text, version):
     # Link reference definitions at the end of the file belong to no section.
     while body and (not body[-1].strip() or re.match(r"^\[[^\]]+\]: ", body[-1])):
         body.pop()
-    headings = [line[4:].strip() for line in body if line.startswith("### ")]
+    headings = [
+        line[4:].strip()
+        for k, line in enumerate(body, start + 1)
+        if line.startswith("### ") and not fenced[k]
+    ]
     if headings != SUBSECTIONS:
         raise NotesError(
             f"CHANGELOG.md: section [{version}] has subsections {headings}, want {SUBSECTIONS}"
