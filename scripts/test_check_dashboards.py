@@ -108,7 +108,8 @@ class CheckDashboards(unittest.TestCase):
     def test_mon_22_keys_out_of_order(self):
         path = self.dir / NAME
         doc = json.loads(path.read_text())
-        path.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n")
+        reversed_doc = dict(reversed(list(doc.items())))
+        path.write_text(json.dumps(reversed_doc, indent=2, sort_keys=False, ensure_ascii=False) + "\n")
         self.assert_fails("sorted keys")
 
     def test_mon_22_file_of_151_kib(self):

@@ -40,6 +40,10 @@ lint grafana.prometheus --set monitoring.grafana.enabled=true --set monitoring.p
 lint grafana.all --set monitoring.grafana.enabled=true --set monitoring.prometheus.enabled=true \
   --set valkey.metrics.enabled=true --set metrics.podMonitor.enabled=true --set loadTest.enabled=true \
   --set image.digest="$digest"
+# #380 (MON-23): the dashboard ConfigMaps lint strictly, alone and with the bundled monitoring.
+lint dashboards --set monitoring.dashboards.enabled=true
+lint dashboards.grafana.prometheus --set monitoring.dashboards.enabled=true --set monitoring.grafana.enabled=true \
+  --set monitoring.prometheus.enabled=true
 
 # MON-01, default: identical to the golden render (deploy/helm/golden/default.yaml, rendered from main), blank
 # lines aside: helm 3 and helm 4 separate the documents with different blank lines.
@@ -634,5 +638,42 @@ gegress() { yq -r 'select(.kind == "NetworkPolicy" and .metadata.name == "mimic-
   || fail "mon_20: the appended datasourceEgress rule is not the one given"
 [[ $(gegress "$tmp/ext-nourl.yaml") == 3 ]] || fail "mon_20: datasourceEgress is rendered with datasourceUrl empty"
 echo "mon_20: datasourceEgress is appended only with datasourceUrl set"
+
+# MON-22: the dashboards of deploy/helm/mimic/dashboards hold the conventions, the metrics and the panels of §9.1.
+python3 -I scripts/check-dashboards.py || fail "mon_22: scripts/check-dashboards.py"
+python3 -I scripts/test_check_dashboards.py >/dev/null 2>&1 || fail "mon_22: scripts/test_check_dashboards.py"
+
+# MON-23: one ConfigMap per dashboard file, with monitoring.dashboards.enabled or the bundled Grafana, none by default.
+files=$(ls "$chart"/dashboards/*.json | wc -l)
+isdash='select(.kind == "ConfigMap" and (.metadata.labels.grafana_dashboard // "") == "1")'
+render > "$tmp/dash-off.yaml"
+[[ -z $(yq "$isdash" "$tmp/dash-off.yaml") ]] || fail "mon_23: a dashboard ConfigMap is rendered by default"
+render --set monitoring.dashboards.enabled=true --set monitoring.dashboards.annotations.grafana_folder=Mimic > "$tmp/dash-on.yaml"
+render --set monitoring.grafana.enabled=true > "$tmp/dash-grafana.yaml"
+for f in dash-on dash-grafana; do
+  [[ $(yq "$isdash | .metadata.name" "$tmp/$f.yaml" | grep -c .) == "$files" ]] || fail "mon_23: $f has not $files dashboard ConfigMaps"
+  for json in "$chart"/dashboards/*.json; do
+    base=$(basename "$json" .json)
+    cm=$(yq "$isdash | select(.metadata.name == \"mimic-dashboard-$base\")" "$tmp/$f.yaml")
+    [[ -n $cm ]] || fail "mon_23: $f has no ConfigMap mimic-dashboard-$base"
+    [[ $(yq -r '.metadata.namespace' <<<"$cm") == mimic-system && $(yq -r '.metadata.labels["app.kubernetes.io/part-of"]' <<<"$cm") == mimic \
+      && $(yq -r '.data | keys | join(",")' <<<"$cm") == "$base.json" ]] || fail "mon_23: $f, $base: namespace, labels or data key"
+    cmp -s <(yq -r ".data[\"$base.json\"]" <<<"$cm") <(cat "$json"; echo) || fail "mon_23: $f, $base: the data differs from the file"
+  done
+done
+# The annotations are on the dashboard ConfigMaps and on no other object; the two renders differ by them only.
+[[ $(yq 'select(.metadata.annotations.grafana_folder == "Mimic") | .metadata.name' "$tmp/dash-on.yaml" | grep -c .) == "$files" \
+  && $(yq "$isdash | select(.metadata.annotations.grafana_folder == \"Mimic\") | .metadata.name" "$tmp/dash-on.yaml" | grep -c .) == "$files" ]] \
+  || fail "mon_23: monitoring.dashboards.annotations are not on the dashboard ConfigMaps only"
+notdash='select(((.metadata.labels.grafana_dashboard // "") == "1") | not)'
+cmp -s <(yq "$notdash" "$tmp/dash-on.yaml") <(yq "$notdash" "$tmp/dash-off.yaml") \
+  || fail "mon_23: dashboards.enabled changes more than the dashboard ConfigMaps"
+# One byte of a dashboard changed in a copy of the chart: the Grafana checksum does not move.
+cp -r "$chart" "$tmp/chart-copy"
+printf ' ' >> "$tmp/chart-copy/dashboards/mimic-controller.json"
+helm template mimic "$tmp/chart-copy" -n mimic-system --set valkey.existingSecret=golden --set monitoring.grafana.enabled=true > "$tmp/dash-copy.yaml"
+[[ $(gcs "$tmp/dash-grafana.yaml") == "$(gcs "$tmp/dash-copy.yaml")" ]] || fail "mon_23: a dashboard change moves the Grafana checksum"
+cmp -s <(yq "$isdash" "$tmp/dash-copy.yaml") <(yq "$isdash" "$tmp/dash-grafana.yaml") && fail "mon_23: the changed copy renders the same dashboard"
+echo "mon_22, mon_23: the dashboards pass the checker and render as one ConfigMap per file"
 
 echo "chart checks passed"
