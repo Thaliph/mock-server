@@ -41,7 +41,7 @@ spec:
         - name: RPS
           type: integer
           jsonPath: .status.results.total.rps
-        - name: P99 µs
+        - name: P99 Micros
           type: integer
           jsonPath: .status.results.total.latencyMicros.p99
         - name: Age

@@ -7,6 +7,10 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Features
+
+- `kubectl get mimicloadtest` shows the p99 latency column as `P99 MICROS` instead of `P99 ΜS`: kubectl upper-cases column names, and the micro sign became a Greek capital Mu (#431).
+
 ## [0.2.0-alpha.2] - 2026-11-11
 
 ### Features
