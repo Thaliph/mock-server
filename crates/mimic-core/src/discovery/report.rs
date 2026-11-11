@@ -1372,6 +1372,9 @@ impl Report {
         });
     }
 
+    /// The placeholder upgrade (spec §6).
+    pub(super) fn upgrade_placeholders(&mut self) {}
+
     /// The authority hosts (scope keys) and the SNIs of the outbound scopes, redacted again:
     /// scopes whose key becomes equal merge, a caught SNI is removed.
     fn re_redact_authorities(&mut self) {
