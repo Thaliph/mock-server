@@ -100,30 +100,78 @@ fn distinct(n: u8) -> String {
 #[test]
 fn grp_14_entropy_thresholds() {
     let m = msg(vec![
-        f(1, s(&distinct(23))),
+        f(1, s(&distinct(16))),
         f(2, s(&distinct(22))),
-        f(3, s(&"a".repeat(4096))),
-        f(4, s(&format!("{}{}", distinct(26), "0123456"))),
+        f(3, s(&distinct(32))),
+        f(4, s(&distinct(15))),
+        f(5, s("the quick brown fox")),
+        f(6, s("a quick brown fox jumps over the lazy dog")),
+        f(7, s("ORDER_STATUS_PENDING")),
+        f(8, s(&"a".repeat(4096))),
     ]);
     let out = run(&plain(), &m);
-    assert_eq!(out.fields[0].value, s("mimic-secret"));
-    assert_eq!(out.fields[1].value, s(&distinct(22)));
-    assert_eq!(out.fields[2].value, s(&"a".repeat(4096)));
-    assert_eq!(out.fields[3].value, s("mimic-secret"));
+    for i in 0..3 {
+        assert_eq!(out.fields[i].value, s("mimic-secret"));
+    }
+    for i in 3..8 {
+        assert_eq!(out.fields[i].value, m.fields[i].value);
+    }
 
-    let twice: Vec<u8> = (0..128u8).chain(0..128u8).collect();
-    let mut almost: Vec<u8> = (0..127u8).collect();
-    almost.push(0);
-    almost.extend(0..127u8);
+    let all: Vec<u8> = (0..=255u8).collect();
     let m = msg(vec![
-        f(1, Value::Bytes(twice)),
-        f(2, Value::Bytes(almost.clone())),
-        f(3, Value::Bytes((0..15).collect())),
+        f(1, Value::Bytes((0..16).collect())),
+        f(2, Value::Bytes((0..32).collect())),
+        f(3, Value::Bytes(all)),
+        f(4, Value::Bytes(vec![9; 16])),
+        f(5, Value::Bytes((0..15).collect())),
     ]);
     let out = run(&plain(), &m);
-    assert_eq!(out.fields[0].value, s("mimic-secret"));
-    assert_eq!(out.fields[1].value, Value::Bytes(almost));
-    assert_eq!(out.fields[2].value, Value::Bytes((0..15).collect()));
+    for i in 0..3 {
+        assert_eq!(out.fields[i].value, s("mimic-secret"));
+    }
+    for i in 3..5 {
+        assert_eq!(out.fields[i].value, m.fields[i].value);
+    }
+}
+
+#[test]
+fn grp_13_detectors_on_bytes_and_fixed64() {
+    let pem = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----";
+    let cases: [(&str, &str); 3] = [
+        (JWT, "mimic-jwt"),
+        (CARD, "mimic-card"),
+        (pem, "mimic-private-key"),
+    ];
+    for (text, placeholder) in cases {
+        let bytes = text.as_bytes();
+        let variants = [
+            bytes.to_vec(),
+            [&[0xff][..], bytes].concat(),
+            [bytes, &[0xfe][..]].concat(),
+            [&[0xc3][..], bytes, &[0x80, 0xff][..]].concat(),
+        ];
+        for v in variants {
+            assert!(std::str::from_utf8(&v).is_err() || v == bytes);
+            let out = run(&plain(), &msg(vec![f(1, Value::Bytes(v))]));
+            assert_eq!(out.fields[0].value, s(placeholder));
+        }
+    }
+    let kept = Value::Bytes([&[0xff][..], b"hello"].concat());
+    assert_eq!(
+        run(&plain(), &msg(vec![f(1, kept.clone())])).fields[0].value,
+        kept
+    );
+    let out = run(
+        &plain(),
+        &msg(vec![
+            f(1, Value::Fixed64(4_111_111_111_111_111)),
+            f(2, Value::Fixed64(4_111_111_111_111_112)),
+            f(3, Value::Fixed64(7)),
+        ]),
+    );
+    assert_eq!(out.fields[0].value, s("mimic-card"));
+    assert_eq!(out.fields[1].value, Value::Fixed64(4_111_111_111_111_112));
+    assert_eq!(out.fields[2].value, Value::Fixed64(7));
 }
 
 fn rule(method: &str, direction: Direction, path: &str) -> FieldRule {
