@@ -1849,7 +1849,7 @@ jq -e '.text | contains("Spec") and contains("deployment: \"users\"")' "$WORK/br
   || fail "exp_07: the resource view does not show the spec of users-a as YAML"
 browse tab-map /ui/map --wait 'not available yet'
 browse tab-endpoints /ui/endpoints --wait 'Pick a deployment'
-browse tab-loadtests /ui/loadtests --wait 'not available yet'
+browse tab-loadtests /ui/loadtests --wait 'not available here yet'
 browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand --interceptor
 jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-document.json" >/dev/null \
   || fail "ui_12: the document page lists the operations $(jq -c .methods "$WORK/browse-document.json"), not GET and PUT"
