@@ -130,7 +130,7 @@ fn hex_of(bytes: &[u8]) -> String {
 /// What the route must answer for stored `:outbound` bytes.
 fn projection_of(outbound: &str) -> String {
     let report = Report::parse_checked(outbound, usize::MAX, usize::MAX).expect("a stored part");
-    EgressSet::project(&report).to_json().unwrap()
+    EgressSet::project_as(&report, 1).to_json().unwrap()
 }
 
 pub(super) async fn push_report(
@@ -188,6 +188,7 @@ pub(super) fn fat_report(secret: &str) -> Report {
                         req_body: Some(body.as_bytes()),
                         resp_headers: &resp_headers,
                         resp_body: Some(body.as_bytes()),
+                        resp_trailers: &[],
                     },
                 },
             );
@@ -214,7 +215,10 @@ async fn pul_06_after_an_f8_style_write_the_route_answers_the_stored_bytes_with_
     .await;
     let foreign = stored_outbound(&s, "web").await.unwrap();
     set_outbound(&s, "pay", &foreign).await;
-    let expected = (projection_of(&foreign), etag(&hex_of(foreign.as_bytes())));
+    let expected = (
+        projection_of(&foreign),
+        etag(1, &hex_of(foreign.as_bytes())),
+    );
 
     // The digest was removed.
     hdel_meta(&s, "pay", "outbound_digest").await;
@@ -248,7 +252,7 @@ async fn pul_07_the_route_serves_the_projection_and_a_304_without_reading_outbou
     assert_eq!(first.header("content-type"), Some("application/json"));
     assert_eq!(first.header("cache-control"), Some("no-store"));
     assert_eq!(first.text(), projection_of(&stored));
-    assert_eq!(first.etag(), etag(&hex_of(stored.as_bytes())));
+    assert_eq!(first.etag(), etag(1, &hex_of(stored.as_bytes())));
 
     // `:outbound` is unreadable now: only an answer that never reads it can be a 304.
     set_outbound(&s, "pay", "not a report").await;
@@ -334,7 +338,7 @@ async fn pul_08_refusals_by_identity_and_request() {
     assert_eq!(get(Some("no-claim"), "pay", "?format=1").await.status, 403);
     // The request: `format`, the name.
     let tok = token(&s.ns, "pay", "t");
-    for query in ["", "?format=2", "?format=abc", "?other=1", "?format="] {
+    for query in ["", "?format=3", "?format=abc", "?other=1", "?format="] {
         let answer = request(&s.router, Method::GET, Some(&tok), "pay", query, None).await;
         assert_eq!(answer.status, 400, "{query}");
     }
@@ -517,7 +521,7 @@ async fn pul_10_one_line_per_pull_and_the_series_follow_without_a_secret() {
     let steps = [
         (None, "pay", "?format=1", 401),
         (Some("other-pod"), "pay", "?format=1", 403),
-        (Some(tok.as_str()), "pay", "?format=2", 400),
+        (Some(tok.as_str()), "pay", "?format=3", 400),
     ];
     for (credential, deployment, query, status) in steps {
         let answer = request(&s.router, Method::GET, credential, deployment, query, None).await;

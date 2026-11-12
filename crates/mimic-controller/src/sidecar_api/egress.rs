@@ -1,4 +1,4 @@
-//! `GET /v1/workloads/<deployment>/egress?format=1` (spec §7.7): the egress set of the
+//! `GET /v1/workloads/<deployment>/egress?format=1|2` (spec §7.7): the egress set of the
 //! caller's own deployment, built from the stored `:outbound`.
 //!
 //! The answer to one pull is `authorize_and_answer`; building a projection is `Job::build`, the
@@ -17,7 +17,7 @@ use axum::body::Bytes;
 use axum::http::HeaderName;
 use axum::http::HeaderValue;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
-use mimic_core::discovery::egress::{EgressSet, FORMAT, etag, matches_etag};
+use mimic_core::discovery::egress::{EgressSet, etag, matches_etag};
 use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{Semaphore, watch};
 
@@ -113,8 +113,8 @@ type Served = Result<Arc<Projection>, Denied>;
 type Slot = Option<Served>;
 /// Namespace, deployment, format.
 type EntryKey = (String, String, u32);
-/// Namespace, deployment and the digest `:meta` gave (`None`: stale).
-type FlightKey = (String, String, Option<String>);
+/// Namespace, deployment, format and the digest `:meta` gave (`None`: stale).
+type FlightKey = (String, String, u32, Option<String>);
 
 struct Entry {
     digest: String,
@@ -224,11 +224,12 @@ impl Cache {
     /// The cached projection of `digest`, a build to wait for, or the lead of a new one. The
     /// cache is read under the lock that guards the flights, and a build caches before it
     /// leaves them: a pull never starts a build that has just ended.
-    fn join(&self, namespace: &str, deployment: &str, digest: Option<&str>) -> Joined {
+    fn join(&self, namespace: &str, deployment: &str, format: u32, digest: Option<&str>) -> Joined {
         let mut state = self.lock();
         let key = (
             namespace.to_string(),
             deployment.to_string(),
+            format,
             digest.map(str::to_string),
         );
         if let Some(tx) = state.flights.get(&key) {
@@ -237,7 +238,7 @@ impl Cache {
         if let Some(digest) = digest {
             state.tick += 1;
             let tick = state.tick;
-            let entry_key = (key.0.clone(), key.1.clone(), FORMAT);
+            let entry_key = (key.0.clone(), key.1.clone(), format);
             if let Some(entry) = state.entries.get_mut(&entry_key)
                 && entry.digest == digest
             {
@@ -265,12 +266,13 @@ impl Cache {
         &self,
         namespace: &str,
         deployment: &str,
+        format: u32,
         hex: &str,
         body: Vec<u8>,
     ) -> Option<Arc<Projection>> {
         let size = body.len() as u64;
         let mut state = self.lock();
-        let key = (namespace.to_string(), deployment.to_string(), FORMAT);
+        let key = (namespace.to_string(), deployment.to_string(), format);
         state.entries.remove(&key);
         while self.held.used.load(Ordering::Acquire).saturating_add(size) > self.held.budget {
             let victim = state
@@ -284,7 +286,7 @@ impl Cache {
         self.held.used.fetch_add(size, Ordering::AcqRel);
         self.held.gauge.inc_by(size as i64);
         let projection = Arc::new(Projection {
-            etag: etag(hex),
+            etag: etag(format, hex),
             body,
             held: self.held.clone(),
         });
@@ -374,15 +376,15 @@ impl io::Write for Capped {
 
 /// The projection of stored `:outbound` bytes (none: the empty set) with the hash of the bytes,
 /// for a blocking thread: parsing and serialising are CPU work.
-fn project(stored: Option<Vec<u8>>, max: usize) -> Built {
+fn project(stored: Option<Vec<u8>>, format: u32, max: usize) -> Built {
     let hex = sha256_hex(stored.as_deref().unwrap_or_default());
     let set = match &stored {
         None => EgressSet {
             authorities: Default::default(),
-            format: FORMAT,
+            format,
         },
         Some(bytes) => match parse_outbound(bytes) {
-            Some(report) => EgressSet::project(&report),
+            Some(report) => EgressSet::project_as(&report, format),
             None => return Built::Unreadable,
         },
     };
@@ -403,13 +405,17 @@ fn project(stored: Option<Vec<u8>>, max: usize) -> Built {
     }
 }
 
-/// Whether the query asks for `format=1`, the only format there is.
-fn wants_format_one(query: Option<&str>) -> bool {
-    query
+/// The format the query asks for: `format=1` or `format=2`, nothing else (spec §7.7).
+fn wanted_format(query: Option<&str>) -> Option<u32> {
+    let value = query
         .into_iter()
         .flat_map(|q| q.split('&'))
-        .find_map(|pair| pair.strip_prefix("format="))
-        .is_some_and(|value| value == FORMAT.to_string())
+        .find_map(|pair| pair.strip_prefix("format="))?;
+    match value {
+        "1" => Some(1),
+        "2" => Some(2),
+        _ => None,
+    }
 }
 
 /// Why a read of the store gave no answer.
@@ -468,7 +474,7 @@ impl Job {
     /// It holds a share of the body budget, the stored size plus the largest projection, from
     /// before the read until the set holds its egress share (or is refused): the share moves
     /// into the blocking task, so it lasts until that task ends (spec §7.7).
-    async fn build(&self, namespace: &str, deployment: &str) -> Served {
+    async fn build(&self, namespace: &str, deployment: &str, format: u32) -> Served {
         let _permit = self
             .cache
             .builds
@@ -504,8 +510,8 @@ impl Job {
             let _share = reservation;
             #[cfg(test)]
             let _running = cache.gate();
-            match project(bytes, max) {
-                Built::Set(hex, body) => Ok(cache.admit(&ns, &dep, &hex, body)),
+            match project(bytes, format, max) {
+                Built::Set(hex, body) => Ok(cache.admit(&ns, &dep, format, &hex, body)),
                 other => Err(other),
             }
         })
@@ -649,9 +655,9 @@ impl SidecarApi {
         if !pod_of_deployment(pod, deployment) {
             return Err(FORBIDDEN);
         }
-        if !wants_format_one(query) {
+        let Some(format) = wanted_format(query) else {
             return Err(invalid("format"));
-        }
+        };
 
         let namespace = identity.namespace.as_str();
         // `:outbound` is read only when the digest cannot answer.
@@ -661,7 +667,7 @@ impl SidecarApi {
             .await
             .map_err(|e| refuse(read_denied(e), caller))?;
         if let Some(hex) = &digest {
-            let current = etag(hex);
+            let current = etag(format, hex);
             // Every value of every header (RFC 9110 §13.1.2).
             let mut held = headers
                 .get_all(IF_NONE_MATCH)
@@ -673,7 +679,7 @@ impl SidecarApi {
             }
         }
         let projection = self
-            .projection(namespace, deployment, digest.as_deref())
+            .projection(namespace, deployment, format, digest.as_deref())
             .await
             .map_err(|denied| refuse(denied, caller))?;
         caller.bytes = Some(projection.body.len());
@@ -682,8 +688,14 @@ impl SidecarApi {
 
     /// The projection for a digest: from the cache, from the build that is running, or from a
     /// build this pull starts. The build is a task of its own that ends on its own.
-    async fn projection(&self, namespace: &str, deployment: &str, digest: Option<&str>) -> Served {
-        let mut rx = match self.egress.join(namespace, deployment, digest) {
+    async fn projection(
+        &self,
+        namespace: &str,
+        deployment: &str,
+        format: u32,
+        digest: Option<&str>,
+    ) -> Served {
+        let mut rx = match self.egress.join(namespace, deployment, format, digest) {
             Joined::Cached(projection) => return Ok(projection),
             Joined::Wait(rx) => rx,
             Joined::Lead(rx, flight) => {
@@ -697,7 +709,7 @@ impl SidecarApi {
                 };
                 let (ns, dep) = (namespace.to_string(), deployment.to_string());
                 tokio::spawn(async move {
-                    let served = job.build(&ns, &dep).await;
+                    let served = job.build(&ns, &dep, format).await;
                     flight.finish(served);
                 });
                 rx
@@ -722,17 +734,17 @@ mod tests {
     #[test]
     fn pul_09_an_old_flight_that_drops_leaves_the_newer_one_of_its_key() {
         let cache = Cache::new(1 << 20, &ApiMetrics::register(&mut Registry::default()));
-        let Joined::Lead(_rx, old) = cache.join("shop", "pay", None) else {
+        let Joined::Lead(_rx, old) = cache.join("shop", "pay", 1, None) else {
             panic!("the first pull leads");
         };
         // The old build failed and left the table; a new pull starts a build of the same key.
         cache.lock().flights.remove(&old.key);
-        let Joined::Lead(_rx, _new) = cache.join("shop", "pay", None) else {
+        let Joined::Lead(_rx, _new) = cache.join("shop", "pay", 1, None) else {
             panic!("a new build starts");
         };
         drop(old);
         assert!(
-            matches!(cache.join("shop", "pay", None), Joined::Wait(_)),
+            matches!(cache.join("shop", "pay", 1, None), Joined::Wait(_)),
             "the old guard removed the newer flight: a duplicate build would start"
         );
     }

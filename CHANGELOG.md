@@ -11,6 +11,11 @@ All notable changes to mimic are documented in this file. The format follows
 
 - The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).
+- gRPC unary calls are recorded with their messages: the samples of a gRPC endpoint hold the first request and response message (read without a schema, keyed by field number) and the response trailers, redacted before anything leaves the sidecar (JWTs, tokens, cards, high-entropy values, `-bin` metadata) and again by the controller; the OpenAPI document shows the message, and `mimic_discovery_bodies_total` counts gRPC messages as `parsed`, `opaque`, `too_large` or `encoding`. A report with such a sample is `"version": 3` and the egress set has a `format` 2 (a pull of `format=1`, which sidecars up to 0.2.0-alpha.3 make, is served without the gRPC parts); a sidecar whose controller answers `400` to version 3 posts the report again without them (`mimic_discovery_pushes_total{result="grpc_dropped"}`). Streams, per-field rules, reflection and replay are later steps (#461).
+
+### Upgrade notes
+
+- Upgrade the controller before the pods: a controller of 0.2.0-alpha.3 or earlier cannot read a stored report with a version 3 part (a rollback after gRPC data was stored answers `500` for that deployment until its keys expire, `MIMIC_STORE_TTL`).
 
 ### Documentation
 

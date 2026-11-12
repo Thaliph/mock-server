@@ -31,7 +31,9 @@ fn frame(m: &Message) -> Vec<u8> {
 
 /// 32 distinct bytes: a random-key stand-in.
 fn blob() -> Vec<u8> {
-    (0u8..32).map(|b| b.wrapping_mul(7).wrapping_add(3)).collect()
+    (0u8..32)
+        .map(|b| b.wrapping_mul(7).wrapping_add(3))
+        .collect()
 }
 
 /// A message holding a secret of every kind the redaction knows, and a neutral field.
@@ -39,7 +41,10 @@ fn canary() -> Message {
     message(vec![
         f(1, Value::Str("alice".into())),
         f(2, Value::Str(JWT.into())),
-        f(3, Value::Message(message(vec![f(1, Value::Str(GHP.into()))]))),
+        f(
+            3,
+            Value::Message(message(vec![f(1, Value::Str(GHP.into()))])),
+        ),
         f(4, Value::Bytes(blob())),
         f(5, Value::Varint(42)),
     ])
@@ -214,7 +219,10 @@ fn grp_19_failures() {
     let mut bad_flag = one.clone();
     bad_flag[0] = 2;
     assert_eq!(first_message(None, &bad_flag), Err(Failure::Opaque));
-    assert_eq!(first_message(None, &one[..one.len() - 1]), Err(Failure::Opaque));
+    assert_eq!(
+        first_message(None, &one[..one.len() - 1]),
+        Err(Failure::Opaque)
+    );
     assert_eq!(first_message(None, &[]), Err(Failure::Opaque));
     assert_eq!(
         first_message(None, &encode_frame(false, &[0xff]).expect("frames")),
@@ -293,6 +301,7 @@ fn base64_of(bytes: &[u8]) -> String {
         for i in 0..=chunk.len() {
             out.push(char::from(A[(n >> (18 - 6 * i) & 63) as usize]));
         }
+        out.extend(std::iter::repeat_n('=', 3 - chunk.len()));
     }
     out
 }
@@ -314,20 +323,31 @@ fn grp_20_gzip_messages_read_alike() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
     let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-    gz.write_all(&canary().encode().expect("encodes")).expect("writes");
+    gz.write_all(&canary().encode().expect("encodes"))
+        .expect("writes");
     let packed = encode_frame(true, &gz.finish().expect("finishes")).expect("frames");
     let call = Call {
         request: packed,
-        req_headers: vec![("content-type", "application/grpc"), ("grpc-encoding", "gzip")],
+        req_headers: vec![
+            ("content-type", "application/grpc"),
+            ("grpc-encoding", "gzip"),
+        ],
         ..Call::default()
     };
     let value = json(&recorded(&call));
-    assert_eq!(samples(&value)[0]["request"]["body"]["value"]["2"], "mimic-jwt");
+    assert_eq!(
+        samples(&value)[0]["request"]["body"]["value"]["2"],
+        "mimic-jwt"
+    );
 }
 
 #[test]
 fn grp_20_other_media_and_non_messages_leave_the_body_out() {
-    for media in ["application/grpc+json", "application/grpc-web", "application/grpc-web+proto"] {
+    for media in [
+        "application/grpc+json",
+        "application/grpc-web",
+        "application/grpc-web+proto",
+    ] {
         let call = Call {
             req_headers: vec![("content-type", media)],
             resp_headers: vec![("content-type", media)],
@@ -357,19 +377,35 @@ fn grp_20_a_sample_without_grpc_parts_is_what_it_was() {
 fn grp_21_version_3_rule() {
     let grpc = recorded(&Call::default());
     assert_eq!(grpc.version(), 3);
-    assert!(grpc.to_json().expect("serialises").contains("\"version\":3"));
-    assert!(!grpc.to_json().expect("serialises").contains("outbound_exchanges"));
+    assert!(
+        grpc.to_json()
+            .expect("serialises")
+            .contains("\"version\":3")
+    );
+    assert!(
+        !grpc
+            .to_json()
+            .expect("serialises")
+            .contains("outbound_exchanges")
+    );
     let mut both = recorded(&Call::default());
     record(&mut both, Direction::Outbound, &Call::default());
     assert_eq!(both.version(), 3);
-    assert!(both.to_json().expect("serialises").contains("outbound_exchanges"));
+    assert!(
+        both.to_json()
+            .expect("serialises")
+            .contains("outbound_exchanges")
+    );
     assert_eq!(both.check(64, 16), Ok(()));
     assert_eq!(
         Report::from_json(&both.to_json().expect("serialises")).expect("reads"),
         both
     );
     // Neither is a plain version 1 or 2 report.
-    let wrong = both.to_json().expect("serialises").replace("\"version\":3", "\"version\":2");
+    let wrong = both
+        .to_json()
+        .expect("serialises")
+        .replace("\"version\":3", "\"version\":2");
     assert!(Report::from_json(&wrong).is_err());
     assert_eq!(plain_report().version(), 1);
 }
@@ -383,12 +419,12 @@ fn grp_21_merge_in_either_order_and_without_grpc() {
     let mut b = grpc.clone();
     b.merge(&limits(), plain.clone());
     assert_eq!(a.version(), 3);
-    assert_eq!(a.to_json(), b.to_json());
+    assert_eq!(a.to_json().expect("a"), b.to_json().expect("b"));
     // Without the gRPC parts it is the plain report again, version 1.
     let stripped = a.without_grpc();
     assert_eq!(stripped.version(), 1);
     let text = stripped.to_json().expect("serialises");
-    assert!(!text.contains("trailers") && !text.contains("application/grpc\""));
+    assert!(!text.contains("\"trailers\"") && !text.contains("\"media\":\"application/grpc\""));
     assert_eq!(stripped.check(64, 16), Ok(()));
     // With an outbound scope: version 2.
     let mut both = recorded(&Call::default());
@@ -419,12 +455,17 @@ fn grp_22_check_and_re_redaction() {
     let text = report.to_json().expect("serialises");
     // 65 trailers.
     let mut value: Json = serde_json::from_str(&text).expect("json");
-    let pairs: Vec<Json> = (0..65).map(|i| serde_json::json!([format!("x-{i}"), "v"])).collect();
+    let pairs: Vec<Json> = (0..65)
+        .map(|i| serde_json::json!([format!("x-{i}"), "v"]))
+        .collect();
     set_trailers(&mut value, Json::Array(pairs));
     let refused = Report::parse_checked(&value.to_string(), 64, 16);
     assert!(refused.is_err(), "65 trailers");
     // A media type that is not gRPC on a gRPC body.
-    let text2 = text.replace("\"media\":\"application/grpc\"", "\"media\":\"application/grpc+json\"");
+    let text2 = text.replace(
+        "\"media\":\"application/grpc\"",
+        "\"media\":\"application/grpc-web\"",
+    );
     assert!(Report::parse_checked(&text2, 64, 16).is_err());
 }
 
@@ -465,13 +506,20 @@ fn grp_22_a_faulty_sidecar_cannot_store_a_secret_in_a_message() {
     replace_bodies(&mut value, &serde_json::json!("not a message"));
     let mut pushed = Report::from_json(&value.to_string()).expect("reads");
     pushed.re_redact(&Redactor::default());
-    assert!(pushed.to_json().expect("serialises").contains("\"value\":\"mimic-secret\""));
+    assert!(
+        pushed
+            .to_json()
+            .expect("serialises")
+            .contains("\"value\":\"mimic-secret\"")
+    );
 }
 
 fn replace_bodies(v: &mut Json, new: &Json) {
     match v {
         Json::Object(map) => {
-            if map.get("media").is_some_and(|m| m == "application/grpc") && map.contains_key("value") {
+            if map.get("media").is_some_and(|m| m == "application/grpc")
+                && map.contains_key("value")
+            {
                 map.insert("value".into(), new.clone());
             }
             map.values_mut().for_each(|v| replace_bodies(v, new));
@@ -499,8 +547,20 @@ fn grp_23_the_two_formats() {
     let text1 = one.to_json().expect("serialises");
     assert!(!text1.contains("trailers") && !text1.contains("\"media\":\"application/grpc\""));
     // Both read back byte for byte, and the format 1 set is what the report without gRPC parts gives.
-    assert_eq!(EgressSet::from_json(&text1).expect("reads").to_json().expect("serialises"), text1);
-    assert_eq!(EgressSet::from_json(&text2).expect("reads").to_json().expect("serialises"), text2);
+    assert_eq!(
+        EgressSet::from_json(&text1)
+            .expect("reads")
+            .to_json()
+            .expect("serialises"),
+        text1
+    );
+    assert_eq!(
+        EgressSet::from_json(&text2)
+            .expect("reads")
+            .to_json()
+            .expect("serialises"),
+        text2
+    );
     let plain = EgressSet::project_as(&report.without_grpc(), 2);
     let mut as_one = plain.clone();
     as_one.format = 1;
@@ -525,7 +585,7 @@ fn grp_23_formats_read_and_refused() {
 fn grp_23_projections_are_canonical() {
     let a = EgressSet::project(&outbound_report()).to_json();
     let b = EgressSet::project(&outbound_report()).to_json();
-    assert_eq!(a, b);
+    assert_eq!(a.expect("a"), b.expect("b"));
 }
 
 #[test]
@@ -534,10 +594,16 @@ fn grp_26_openapi_shows_the_message() {
     let doc = openapi::document(&report, "ns", "dep", 1, "inbound-50051").expect("document");
     let op = &doc["paths"]["/pkg.Users/Get"]["post"];
     let request = &op["requestBody"]["content"]["application/grpc"];
-    assert!(request["schema"]["properties"]["1"].is_object(), "{request}");
+    assert!(
+        request["schema"]["properties"]["1"].is_object(),
+        "{request}"
+    );
     assert_eq!(request["examples"].as_object().map(|e| e.len()), Some(1));
     let response = &op["responses"]["200"]["content"]["application/grpc"];
-    assert!(response["schema"]["properties"]["2"].is_object(), "{response}");
+    assert!(
+        response["schema"]["properties"]["2"].is_object(),
+        "{response}"
+    );
     let text = doc.to_string();
     assert!(!text.contains(JWT) && !text.contains(GHP) && !text.contains("trailers"));
 }

@@ -106,7 +106,7 @@ async fn mck_08_refusals_carry_no_mode_header() {
     let steps = [
         (None, "?format=1", 401),
         (Some("other-pod"), "?format=1", 403),
-        (Some(tok.as_str()), "?format=2", 400),
+        (Some(tok.as_str()), "?format=3", 400),
     ];
     for (credential, query, status) in steps {
         let answer = request(&s.router, Method::GET, credential, "pay", query, None).await;

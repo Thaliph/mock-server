@@ -552,7 +552,7 @@ fn summary(
 enum Part {
     /// `:report`: version 1.
     Inbound,
-    /// `:outbound`: version 2, outbound scopes only.
+    /// `:outbound`: version 2 (3 with a gRPC sample), outbound scopes only.
     Outbound,
 }
 
@@ -568,8 +568,8 @@ fn read_part(bytes: &[u8], part: Part) -> Option<Report> {
     let json = std::str::from_utf8(bytes).ok()?;
     let mut report = Report::parse_checked(json, usize::MAX, usize::MAX).ok()?;
     match part {
-        Part::Inbound => report.version() == 1,
-        Part::Outbound => report.version() == 2 && !report.holds_inbound(),
+        Part::Inbound => !report.holds_outbound(),
+        Part::Outbound => report.holds_outbound() && !report.holds_inbound(),
     }
     .then(|| {
         if legacy_marker(bytes) {

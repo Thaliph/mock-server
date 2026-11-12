@@ -287,10 +287,10 @@ impl From<WireReport> for Report {
 impl Serialize for Report {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         WireRef {
-            version: self.version,
+            version: self.computed_version(),
             pod: &self.pod,
             exchanges: self.exchanges,
-            outbound_exchanges: (self.version == 2).then_some(self.outbound_exchanges),
+            outbound_exchanges: self.has_authorities().then_some(self.outbound_exchanges),
             scopes: &self.scopes,
         }
         .serialize(serializer)
@@ -804,7 +804,7 @@ impl Report {
     /// A version 1 report carries no outbound exchange, and no report more than it counts.
     fn counter_ok(&self) -> bool {
         self.outbound_exchanges <= self.exchanges
-            && (self.version == 2 || self.outbound_exchanges == 0)
+            && (self.has_authorities() || self.outbound_exchanges == 0)
     }
 
     /// The endpoints of one direction, or of both.
@@ -1028,7 +1028,7 @@ impl Report {
         self.sample_bytes_of(None)
     }
 
-    fn sample_bytes_of(&self, only: Option<Direction>) -> usize {
+    pub fn sample_bytes_of(&self, only: Option<Direction>) -> usize {
         let mut n = 0;
         self.for_each_stats_of(only, |s| n = usize::saturating_add(n, s.samples.bytes()));
         n
@@ -1253,13 +1253,44 @@ impl Report {
             .is_some_and(|scopes| scopes.keys().any(|k| matches!(k, ScopeKey::Authority(_))))
     }
 
-    /// Version 2 when the report holds an outbound scope, else 1 (spec §6.1). A report that
-    /// holds none no longer counts the exchanges of its outbound scopes: they go with them.
-    fn sync_version(&mut self) {
-        if self.has_authorities() {
-            self.version = 2;
+    /// A sample holds a gRPC message or trailers (spec §6.4).
+    fn has_grpc(&self) -> bool {
+        let mut found = false;
+        self.for_each_stats_of(None, |s| found = found || s.samples.any_grpc());
+        found
+    }
+
+    /// 3 when a sample holds a gRPC message or trailers (spec §6.4), else 2 when the report
+    /// holds an outbound scope, else 1 (spec §6.1).
+    fn computed_version(&self) -> u32 {
+        if self.has_grpc() {
+            3
+        } else if self.has_authorities() {
+            2
         } else {
-            self.version = 1;
+            1
+        }
+    }
+
+    /// Whether the report holds an outbound scope.
+    pub fn holds_outbound(&self) -> bool {
+        self.has_authorities()
+    }
+
+    /// The report without the gRPC parts of its samples (spec §6.4, §7.2): what a controller
+    /// up to F13 accepts. Samples that become equal are one.
+    pub fn without_grpc(&self) -> Report {
+        let mut report = self.clone();
+        report.for_each_stats_mut(|stats| stats.samples.without_grpc());
+        report.sync_version();
+        report
+    }
+
+    /// Set from the content (spec §6.1, §6.4). A report that holds no outbound scope no longer
+    /// counts the exchanges of its outbound scopes: they go with them.
+    fn sync_version(&mut self) {
+        self.version = self.computed_version();
+        if !self.has_authorities() {
             self.exchanges = self.exchanges.saturating_sub(self.outbound_exchanges);
             self.outbound_exchanges = 0;
         }
@@ -1279,6 +1310,7 @@ impl Report {
     /// spec §7.2).
     pub fn drop_samples(&mut self) {
         self.for_each_stats_mut(|stats| stats.samples = Samples::default());
+        self.sync_version();
     }
 
     /// Sets `last_seen` to `day` on every endpoint and sample (spec §7.3, stamping).
@@ -1370,6 +1402,7 @@ impl Report {
         self.for_each_stats_of_mut(Some(Direction::Outbound), |stats| {
             stats.re_redact(&outbound, redactor);
         });
+        self.sync_version();
     }
 
     /// The placeholder upgrade (spec §6): a report that holds the legacy marker in a sample or
@@ -1441,6 +1474,8 @@ impl Report {
         outbound.exchanges = self.outbound_exchanges.min(self.exchanges);
         outbound.outbound_exchanges = outbound.exchanges;
         inbound.exchanges = self.exchanges - outbound.exchanges;
+        inbound.sync_version();
+        outbound.sync_version();
         (inbound, (!outbound.scopes.is_empty()).then_some(outbound))
     }
 
@@ -1508,9 +1543,10 @@ impl Report {
         self.stats_at(&routed).map(|_| routed)
     }
 
-    /// 1, or 2 when the report holds outbound scopes (spec §6.1).
+    /// 1, 2 when the report holds outbound scopes (spec §6.1), 3 when a sample holds a gRPC
+    /// message or trailers (spec §6.4).
     pub fn version(&self) -> u32 {
-        self.version
+        self.computed_version()
     }
 
     /// Within the bounds of spec §6 and, per direction, at most `max_push_endpoints`
@@ -1526,8 +1562,8 @@ impl Report {
         {
             return Err(Violation::Authority);
         }
-        // Version 2 iff the report holds an outbound scope (spec §6.1).
-        if self.version != if self.has_authorities() { 2 } else { 1 } {
+        // The version follows the content (spec §6.1, §6.4).
+        if self.version != self.computed_version() {
             return Err(Violation::Version);
         }
         if !self.counter_ok() {
@@ -1623,11 +1659,11 @@ impl Report {
     pub fn from_json(json: &str) -> Result<Self, String> {
         let report: Report =
             serde_json::from_str(json).map_err(|e| format!("invalid report: {e}"))?;
-        if !matches!(report.version, 1 | 2) {
+        if !matches!(report.version, 1..=3) {
             return Err(format!("unsupported report version {}", report.version));
         }
         let outbound = report.scopes.get(&Direction::Outbound);
-        if (report.version == 2) != report.has_authorities() {
+        if report.version != report.computed_version() {
             return Err(format!(
                 "report version {} does not match its scopes",
                 report.version

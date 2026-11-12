@@ -17,8 +17,10 @@ use super::template::split_path;
 use crate::Mode;
 use crate::mock::factor_number;
 
-/// The only format there is.
-pub const FORMAT: u32 = 1;
+/// The first format: the samples of a sidecar up to F13.
+pub const FORMAT_1: u32 = 1;
+/// The format of F14: format 1 plus the gRPC parts of the samples (spec §6.4, §7.7).
+pub const FORMAT: u32 = 2;
 /// Most authorities in a set.
 pub const MAX_AUTHORITIES: usize = 10_000;
 /// Most endpoints in a set, all authorities together.
@@ -106,6 +108,11 @@ impl EgressSet {
     /// The projection of a report (spec §7.7): the outbound scopes that hold an endpoint and,
     /// per endpoint, what a mock needs. A pure function of the outbound part.
     pub fn project(report: &Report) -> Self {
+        Self::project_as(report, FORMAT)
+    }
+
+    /// As [`EgressSet::project`], in `format`: format 1 leaves the gRPC parts out of the samples.
+    pub fn project_as(report: &Report, format: u32) -> Self {
         let mut authorities: SortedMap<Name, Authority> = SortedMap::new();
         for e in report.endpoints() {
             let Some(authority) = e.authority.filter(|_| e.direction == Direction::Outbound) else {
@@ -135,7 +142,13 @@ impl EgressSet {
                         .stats
                         .samples()
                         .iter()
-                        .map(|(_, s)| s.unstamped())
+                        .map(|(_, s)| {
+                            if format == FORMAT_1 && s.is_grpc() {
+                                s.without_grpc().1.unstamped()
+                            } else {
+                                s.unstamped()
+                            }
+                        })
                         .collect(),
                     statuses: e.stats.statuses.clone(),
                     template: e.template,
@@ -145,7 +158,7 @@ impl EgressSet {
         // The upgraded form, so that every set is canonical: it reads back byte for byte.
         EgressSet {
             authorities,
-            format: FORMAT,
+            format,
         }
         .upgraded()
     }
@@ -153,7 +166,8 @@ impl EgressSet {
     /// Reads a set and checks it (spec §7.7). Never panics, whatever the input.
     pub fn from_json(json: &str) -> Result<Self, Refusal> {
         let head: Head = serde_json::from_str(json).map_err(|_| Refusal::Malformed)?;
-        if head.format.and_then(|f| f.as_u64()) != Some(u64::from(FORMAT)) {
+        let format = head.format.and_then(|f| f.as_u64());
+        if !matches!(format, Some(1 | 2)) {
             return Err(Refusal::Format);
         }
         let set: EgressSet = serde_json::from_str(json).map_err(|_| Refusal::Malformed)?;
@@ -169,6 +183,17 @@ impl EgressSet {
         }
         if set.endpoint_count() > MAX_ENDPOINTS {
             return Err(Refusal::Limit);
+        }
+        // Format 1 is what a sidecar up to F13 reads: no gRPC part.
+        if set.format == FORMAT_1
+            && set
+                .authorities
+                .values()
+                .flat_map(|a| &a.endpoints)
+                .flat_map(|e| &e.samples)
+                .any(Sample::is_grpc)
+        {
+            return Err(Refusal::Malformed);
         }
         for authority in set.authorities.values() {
             // A mock picks an endpoint by method and template: twice would be ambiguous.
@@ -251,8 +276,8 @@ pub fn fresh_hex(digest: Option<&str>, version: u64) -> Option<&str> {
 }
 
 /// `"<format>-<hex>"`, quotes included.
-pub fn etag(hex: &str) -> String {
-    format!("\"{FORMAT}-{hex}\"")
+pub fn etag(format: u32, hex: &str) -> String {
+    format!("\"{format}-{hex}\"")
 }
 
 /// An `If-None-Match` list that holds `etag` as one of its entries, byte for byte: weak
