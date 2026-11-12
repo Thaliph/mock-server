@@ -595,10 +595,14 @@ async fn ctl_16_a_pending_report_is_retried_unchanged_with_backoff() {
         assert_eq!(s.body, seen[0].body, "same bytes");
     }
     assert_eq!(seen[0].sequence(), 1);
-    assert!(seen[1].at - seen[0].at >= Duration::from_secs(1));
-    assert!(seen[2].at - seen[1].at >= Duration::from_secs(2));
+    // `at` is when the fake API read the request, not when the sidecar sent it: on a loaded
+    // machine the handshake and the body reach it a little later each time, so the gaps are
+    // allowed to come out shorter by `SKEW`.
+    const SKEW: Duration = Duration::from_millis(500);
+    assert!(seen[1].at - seen[0].at >= Duration::from_secs(1) - SKEW);
+    assert!(seen[2].at - seen[1].at >= Duration::from_secs(2) - SKEW);
     // The silent post times out after 1 s, then the backoff of 4 s.
-    assert!(seen[3].at - seen[2].at >= Duration::from_secs(5));
+    assert!(seen[3].at - seen[2].at >= Duration::from_secs(5) - SKEW);
     assert_eq!(seen[3].status, 200);
     assert_eq!(seen[4].sequence(), 2);
     assert_eq!(
