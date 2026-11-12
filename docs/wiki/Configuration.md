@@ -68,6 +68,7 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `controller.status.interval` | `30s` | 1s-1h. `MIMIC_STATUS_INTERVAL`. |
 | `controller.status.podWindow` | `5m` | 1s-24h. `MIMIC_STATUS_POD_WINDOW`. |
 | `mesh.enabled` | `true` | Kill switch of the mesh view: `false` sets `MIMIC_MESH=off` on the controller; it serves no view (`404`), watches nothing and its ClusterRole drops the mesh rules. |
+| `mesh.staleAfter`, `mesh.startupWait` | `60s`, `2s` | `MIMIC_MESH_STALE_AFTER` and `MIMIC_MESH_STARTUP_WAIT`: the controller hands them to the sidecars it injects, with `MIMIC_MESH` (from `mesh.enabled`). A sidecar's view is stale after `staleAfter` without contact; a sidecar without a view waits `startupWait` for its first one before `/readyz` answers `200`. |
 | `mesh.clusterName`, `mesh.watchTimeout`, `mesh.debounce`, `mesh.viewCacheBytes`, `mesh.maxServices`, `mesh.maxEndpoints`, `mesh.maxViewBytes`, `mesh.maxWatches` | `local`, `30s`, `100ms`, `64Mi`, `1024`, `10000`, `4Mi`, `10000` | The variables of the same names below (`MIMIC_CLUSTER_NAME`, `MIMIC_MESH_WATCH_TIMEOUT`, ...). |
 | `inject.initImage.repository` | `ghcr.io/thaliph/mimic-init` | |
 | `inject.initImage.tag` / `.digest` | `""` / `""` | Tag defaults to the appVersion; digest wins. |
@@ -150,6 +151,7 @@ sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 | `MIMIC_MESH_DEBOUNCE` | `100ms` | Changes are coalesced for this long, doubled up to 1s while they keep arriving. 10ms-1s. |
 | `MIMIC_MESH_VIEW_CACHE_BYTES` | `64Mi` | Built views cached per replica, least recently used out first. At least `MIMIC_MESH_MAX_VIEW_BYTES`, at most 4Gi. |
 | `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS`, `MIMIC_MESH_MAX_VIEW_BYTES` | `1024`, `10000`, `4Mi` | Bounds of one view: 1-100000, 1-1000000, 64Ki-256Mi. A view over a bound is served truncated (`mimic_mesh_view_truncated_total`). |
+| `MIMIC_MESH_STALE_AFTER`, `MIMIC_MESH_STARTUP_WAIT` | `60s`, `2s` | Not used by the controller: written to the sidecars it injects (1s-1h and 0s-1m). The sidecars also read `MIMIC_MESH` (always written by the webhook; `off` when unset) and, when they differ from the defaults, the three bounds above. |
 | `MIMIC_SIDECAR_API_MAX_WATCHES` | `10000` | Held view requests at once per replica, 1-1000000; over it `503` with `Retry-After: 1`. |
 | `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API; plain HTTP, loopback peers only. |
 

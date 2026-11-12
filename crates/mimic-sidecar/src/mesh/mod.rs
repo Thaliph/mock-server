@@ -48,7 +48,7 @@ const OLDER_GRACE: Duration = Duration::from_secs(10);
 /// Where the view comes from, and how it ages.
 #[derive(Debug, Clone)]
 pub struct MeshConfig {
-    /// `MIMIC_MESH`: `off` pulls no view and classifies nothing.
+    /// `MIMIC_MESH`: `off` (also unset) pulls no view and classifies nothing.
     pub enabled: bool,
     /// `MIMIC_MESH_STALE_AFTER`.
     pub stale_after: Duration,
@@ -69,7 +69,7 @@ pub struct MeshConfig {
 impl Default for MeshConfig {
     fn default() -> MeshConfig {
         MeshConfig {
-            enabled: true,
+            enabled: false,
             stale_after: Duration::from_secs(60),
             startup_wait: Duration::from_secs(2),
             limits: Limits::default(),
@@ -85,8 +85,9 @@ impl MeshConfig {
     pub fn from_env(env: &Env, trust_dir: &Path) -> Result<MeshConfig, ConfigError> {
         let defaults = MeshConfig::default();
         let enabled = match env.optional(MESH_VAR) {
-            None | Some("on") => true,
-            Some("off") => false,
+            Some("on") => true,
+            // Unset: as before M1. The webhook always writes it (spec §10.3).
+            None | Some("off") => false,
             Some(other) => {
                 return Err(ConfigError::invalid(MESH_VAR, other, "expected on or off"));
             }

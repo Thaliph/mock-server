@@ -19,7 +19,7 @@ fn config(pairs: &[(&str, &str)]) -> Result<MeshConfig, String> {
 #[test]
 fn msh_31_defaults() {
     let config = config(&[]).unwrap();
-    assert!(config.enabled);
+    assert!(!config.enabled);
     assert_eq!(config.stale_after, Duration::from_secs(60));
     assert_eq!(config.startup_wait, Duration::from_secs(2));
     assert_eq!(config.limits, Limits::default());
@@ -33,7 +33,7 @@ fn msh_31_defaults() {
 #[test]
 fn msh_31_values_are_read() {
     let config = config(&[
-        ("MIMIC_MESH", "off"),
+        ("MIMIC_MESH", "on"),
         ("MIMIC_MESH_STALE_AFTER", "1s"),
         ("MIMIC_MESH_STARTUP_WAIT", "0s"),
         ("MIMIC_MESH_MAX_SERVICES", "100000"),
@@ -41,7 +41,7 @@ fn msh_31_values_are_read() {
         ("MIMIC_MESH_MAX_VIEW_BYTES", "256Mi"),
     ])
     .unwrap();
-    assert!(!config.enabled);
+    assert!(config.enabled);
     assert_eq!(config.stale_after, Duration::from_secs(1));
     assert_eq!(config.startup_wait, Duration::ZERO);
     assert_eq!(config.limits.max_services, 100_000);

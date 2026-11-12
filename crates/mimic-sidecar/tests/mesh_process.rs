@@ -53,7 +53,9 @@ fn sidecar(api: &MeshApi, dir: &Path, extra: &[(&str, &str)]) -> Process {
         ("MIMIC_TLS_TOKEN_FILE", token.to_str().unwrap()),
         ("MIMIC_TRUST_DIR", dir.to_str().unwrap()),
         ("MIMIC_WORKLOAD", "pay"),
+        ("MIMIC_MESH", "on"),
     ];
+    // A later entry of the same name wins: the child reads its environment once.
     env.extend_from_slice(extra);
     Process::spawn(BIN, &env)
 }

@@ -106,6 +106,25 @@ and `MimicConfig.spec.mesh.enabled`).
 | **discovery** | Traffic is forwarded unchanged and recorded. | Available. Inbound and outbound exchanges are recorded. |
 | **mock** | Outbound calls are answered from the Deployment's recorded egress instead of being forwarded; the real destination is not called. | Available. Switched with `spec.mode`, live, within one egress pull interval. See [Mock mode](Mock-mode). |
 
+## The mesh view
+
+The controller builds, for each Deployment, a **view**: the Services of its own namespace with their ClusterIPs,
+ports and endpoints (ready ones, with the zone), plus the Services it declares in a `MimicConfig`
+(`spec.destinations`) when the destination namespace consents with a `ReferenceGrant`. The sidecar follows it with a
+long-poll (a change reaches it within about a second), keeps it in memory and in `/mimic/state/mesh.json`, and builds
+a table from `<ClusterIP>:<port>` to Service. The view also carries the workload's mode and its `mesh` switch.
+
+In this release the table is used to **classify** only. An outbound connection whose destination is a Service port
+of the view is *in scope*; any other is *unscoped* and counted in `mimic_mesh_unscoped_connections_total`. Nothing is
+routed: every connection still goes to the destination the app addressed, so a call to a Service outside the scope
+works exactly as before. To bring a Service of another namespace into the scope, declare it in a `MimicConfig` and
+create the `ReferenceGrant` in its namespace. `mesh.enabled: false` (`MIMIC_MESH=off`) and
+`MimicConfig.spec.mesh.enabled: false` keep the plain relay and the classification off.
+
+A restarted sidecar container reloads its last view and keeps its mode (from the mode state file, never from the
+absence of a view); the view is *stale* after `MIMIC_MESH_STALE_AFTER` without contact with the controller
+(`mimic_mesh_view_age_seconds`, one warning).
+
 ## Valkey
 
 The controller is the only reader and writer. Keys are `mimic:v1:{<ns>/<dep>}:report`, `:meta`,

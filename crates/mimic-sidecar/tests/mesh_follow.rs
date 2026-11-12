@@ -30,7 +30,12 @@ struct Rig {
 }
 
 fn config(api: &MeshApi, dir: &std::path::Path, vars: &[(&str, &str)]) -> MeshConfig {
-    let env = Env::from_pairs(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let env = Env::from_pairs(
+        [("MIMIC_MESH", "on")]
+            .iter()
+            .chain(vars)
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
     let mut config = MeshConfig::from_env(&env, dir).unwrap();
     let token = dir.join("token");
     std::fs::write(&token, TOKEN).unwrap();
@@ -167,7 +172,7 @@ async fn msh_33_the_first_request_and_the_view_applied() {
         .filter_map(|l| serde_json::from_str(l).ok())
         .filter(|v: &serde_json::Value| v["message"] == "mesh view applied")
         .collect();
-    assert_eq!(applied.len(), 1, "{}", logs.text());
+    assert_eq!(applied.len(), 1, "one mesh view applied line");
     assert_eq!(applied[0]["level"], "INFO");
     assert_eq!(applied[0]["services"], 2);
     assert_eq!(applied[0]["endpoints"], 2);
@@ -254,7 +259,7 @@ async fn msh_33_an_invalid_view_is_refused_and_the_previous_one_kept() {
         .lines()
         .filter(|l| l.contains("mesh view rejected"))
         .count();
-    assert_eq!(rejected, 1, "{}", logs.text());
+    assert_eq!(rejected, 1, "one warning for the streak");
     rig.stop().await;
 }
 
@@ -497,7 +502,12 @@ async fn msh_36_an_applied_view_is_persisted_atomically() {
 }
 
 async fn restored(dir: &std::path::Path, vars: &[(&str, &str)]) -> (MeshState, Arc<Metrics>) {
-    let env = Env::from_pairs(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let env = Env::from_pairs(
+        [("MIMIC_MESH", "on")]
+            .iter()
+            .chain(vars)
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
     let config = MeshConfig::from_env(&env, dir).unwrap();
     let state = MeshState::new(&config);
     let mut metrics = Metrics::new("sidecar", "test");
@@ -538,7 +548,11 @@ async fn msh_36_a_persisted_view_is_reloaded_aged_and_goes_stale_once() {
     assert!(value(&metrics, "mimic_mesh_view_age_seconds") >= 119.0);
     logs.settled().await;
     let text = logs.text();
-    assert_eq!(text.matches("mesh view stale").count(), 1, "{text}");
+    assert_eq!(
+        text.matches("mesh view stale").count(),
+        1,
+        "one stale warning"
+    );
     let applied = text
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -590,7 +604,7 @@ async fn msh_36_a_file_that_does_not_parse_is_ignored_with_one_warning() {
             .lines()
             .filter(|l| l.contains("mesh state ignored"))
             .count();
-        assert_eq!(warnings, 1, "{what}: {}", logs.text());
+        assert_eq!(warnings, 1, "{what}: one warning");
     }
     // Not a regular file.
     let logs = capture_logs();
