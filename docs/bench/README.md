@@ -82,3 +82,43 @@ sidecar socket), files `2026-11-12-nodelay-<setup>.json`. Highest 1-minute load 
 | 2026-11-12 | discovery | h2c | 50 | 49.98 | 9.91 | 11.7 | 14.78 | 16.98 | 0 | 0.066 | 0.064 | 14.2 | 14.2 |
 | 2026-11-12 | discovery | h2c | 100 | 99.96 | 9.65 | 10.95 | 13.92 | 23.75 | 0 | 0.125 | 0.12 | 14.3 | 14.6 |
 | 2026-11-12 | discovery | h2c | 200 | 199.92 | 9.66 | 11.1 | 14.55 | 20.27 | 0 | 0.252 | 0.243 | 14.6 | 14.6 |
+
+## M0: mode none (#439)
+
+Same machine and conditions, from `mesh/439-mode-none` at `cc41e2a`, 18 runs (setups `plain`, `none`,
+`discovery`), files `2026-11-12-m0-<setup>.json`. Highest 1-minute load average sampled every 30 s
+during the runs: 7.2.
+
+Budget (design §14): `none` adds at most 60 % of `discovery`'s added p50 and uses at most 70 % of its
+CPU, at 200 rps. Added p50 is the setup's p50 minus `plain`'s; CPU is caller plus callee sidecar.
+
+| Protocol | Added p50, none / discovery | Ratio (≤ 60 %) | CPU, none / discovery (cores) | Ratio (≤ 70 %) |
+|---|---|---|---|---|
+| http1 | 1.43 / 1.75 ms | **82 %, not met** | 0.183 / 0.329 | 56 %, met |
+| h2c | 2.76 / 3.12 ms | **88 %, not met** | 0.333 / 0.497 | 67 %, met |
+
+The CPU budget holds. The latency budget does not: recording costs about 0.3 ms of p50, and most of the
+added latency is the proxy hop itself (accept, protocol detection, HTTP re-framing, connect), which
+`none` keeps. The budget assumed recording dominated. It is kept as the target, and the hop is
+investigated in #490; #439 stays open until the row holds.
+
+| Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-12 | plain | http1 | 50 | 49.99 | 6.36 | 6.92 | 8.67 | 11.16 | 0 | - | - | - | - |
+| 2026-11-12 | plain | http1 | 100 | 99.98 | 6.36 | 6.89 | 7.61 | 8.88 | 0 | - | - | - | - |
+| 2026-11-12 | plain | http1 | 200 | 199.94 | 6.25 | 6.88 | 8.02 | 9.38 | 0 | - | - | - | - |
+| 2026-11-12 | plain | h2c | 50 | 49.99 | 6.59 | 7.44 | 8.77 | 9.94 | 0 | - | - | - | - |
+| 2026-11-12 | plain | h2c | 100 | 99.97 | 6.57 | 7.28 | 7.99 | 9.19 | 0 | - | - | - | - |
+| 2026-11-12 | plain | h2c | 200 | 199.95 | 6.58 | 7.37 | 8.62 | 11.5 | 0 | - | - | - | - |
+| 2026-11-12 | none | http1 | 50 | 49.99 | 7.79 | 8.89 | 12.19 | 20.69 | 0 | 0.025 | 0.023 | 12.9 | 13 |
+| 2026-11-12 | none | http1 | 100 | 99.96 | 7.8 | 8.84 | 9.93 | 12.32 | 0 | 0.049 | 0.047 | 13 | 13.1 |
+| 2026-11-12 | none | http1 | 200 | 199.94 | 7.68 | 8.7 | 9.79 | 12.57 | 0 | 0.093 | 0.09 | 13.3 | 13.1 |
+| 2026-11-12 | none | h2c | 50 | 49.98 | 9.28 | 10.56 | 14.61 | 23.2 | 0 | 0.046 | 0.042 | 13.8 | 14.4 |
+| 2026-11-12 | none | h2c | 100 | 99.96 | 9.36 | 10.64 | 14.69 | 18.35 | 0 | 0.091 | 0.084 | 14.3 | 14.5 |
+| 2026-11-12 | none | h2c | 200 | 199.93 | 9.34 | 10.95 | 20.75 | 36.43 | 0 | 0.172 | 0.161 | 14.3 | 14.6 |
+| 2026-11-12 | discovery | http1 | 50 | 49.98 | 8.25 | 9.41 | 12.68 | 20.56 | 0 | 0.043 | 0.042 | 12.9 | 12.9 |
+| 2026-11-12 | discovery | http1 | 100 | 99.97 | 8.24 | 9.32 | 10.91 | 18.29 | 0 | 0.084 | 0.083 | 13.1 | 13.3 |
+| 2026-11-12 | discovery | http1 | 200 | 199.94 | 8 | 9.04 | 11.3 | 13.7 | 0 | 0.165 | 0.164 | 13.4 | 13.3 |
+| 2026-11-12 | discovery | h2c | 50 | 49.98 | 9.62 | 11.37 | 15.16 | 20.88 | 0 | 0.064 | 0.061 | 14.3 | 14.2 |
+| 2026-11-12 | discovery | h2c | 100 | 99.96 | 9.67 | 11.28 | 14.36 | 19 | 0 | 0.127 | 0.122 | 14.5 | 14.6 |
+| 2026-11-12 | discovery | h2c | 200 | 199.92 | 9.7 | 11.08 | 13.89 | 24.09 | 0 | 0.252 | 0.245 | 14.6 | 14.7 |

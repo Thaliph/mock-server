@@ -56,7 +56,7 @@ spec:
                     mode:
                       description: Effective mode of the Deployment.
                       type: string
-                      enum: [discovery, mock]
+                      enum: [none, discovery, mock]
                     # Defaulted, so the Mode pods column reads 0 instead of nothing (spec §7.4).
                     pods:
                       description: Pods whose last egress answer is within MIMIC_STATUS_POD_WINDOW and carried `mode`.
@@ -108,10 +108,13 @@ spec:
                     - rule: "self == oldSelf"
                       message: "spec.deployment is immutable"
                 mode:
-                  description: Mimic mode of the Deployment's pods.
+                  description: >-
+                    Mimic mode of the Deployment's pods: `none` proxies and records nothing (the default, spec §3),
+                    `discovery` records, `mock` answers outbound HTTP from the recordings. Objects created before
+                    the default became `none` hold the `discovery` the API server stored at their creation.
                   type: string
-                  enum: [discovery, mock]
-                  default: discovery
+                  enum: [none, discovery, mock]
+                  default: none
                 tls:
                   description: TLS interception settings of the Deployment's pods (spec §5). Applied to pods created afterwards.
                   type: object

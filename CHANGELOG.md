@@ -7,7 +7,25 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Mode `none` is the new default (#439).** A Deployment injected by label with no `MimicWorkload` is now in
+  `none`: proxied, nothing recorded, no report shipped, outbound TLS passed through. It was in `discovery`. To
+  record it, create a `MimicWorkload` with `spec.mode: discovery`; pods follow within one egress pull interval,
+  with no restart. `MimicWorkload`s created before this release keep the `spec.mode: discovery` the API server
+  stored at their creation (defaults are persisted on write), so they keep recording. `none` means "proxy only,
+  nothing recorded"; it does not mean "no mesh" (the mesh, when it arrives, has its own switches).
+  The persisted `discovery` is not a manifest default: recreating a `MimicWorkload` from a manifest without
+  `spec.mode` (a GitOps prune and resync, delete and apply, a PUT) gives `none`. Set `spec.mode: discovery`
+  explicitly in your manifests.
+
 ### Features
+
+- Mode `none` (#439): `spec.mode` accepts `none`, `discovery` and `mock` and defaults to `none` for new objects. The
+  effective mode of a Deployment is `mock` over `discovery` over `none`. A sidecar in `none` records nothing,
+  intercepts no TLS (`interception: mode_none`) and ships nothing, still pulls its mode and follows a switch without
+  a restart; new metric `mimic_mode{mode}` and `none` in `mimic_mock_mode_switches_total{to}`; `status.mode` counts
+  `none` pods.
 
 - The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).

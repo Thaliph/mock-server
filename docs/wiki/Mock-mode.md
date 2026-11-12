@@ -172,7 +172,7 @@ A server-first protocol that sends nothing within 1 s is connected to, as in dis
 
 | Where | Setting | Default | Meaning |
 |---|---|---|---|
-| `MimicWorkload` | `spec.mode` | `discovery` | `discovery` or `mock`. |
+| `MimicWorkload` | `spec.mode` | `none` | `none`, `discovery` or `mock`. Leave `mock` for `discovery` or `none` and mocked connections close once their answers are sent. A pod in `none` records nothing, so a deployment must be in `discovery` first to have recordings to mock. |
 | `MimicWorkload` | `spec.mock.latencyFactor` | `1` | Multiplies the recorded latency (0 to 100). |
 | `MimicWorkload` | `spec.mock.passthrough` | empty | Destinations that stay real in mock. |
 | Sidecar | `MIMIC_MOCK_MAX_PENDING` | `1024` | Pending mocked answers; more get `599` with reason `overload`. |

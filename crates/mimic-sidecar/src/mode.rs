@@ -1,11 +1,11 @@
-//! The mode state of the sidecar (spec §3, §8 "Mode state"): `discovery` or `mock`, with the
+//! The mode state of the sidecar (spec §3, §8 "Mode state"): `none`, `discovery` or `mock`, with the
 //! latency factor. It starts from the state file of the pod, else from `MIMIC_MODE`, and
 //! follows the `Mimic-Mode` and `Mimic-Latency-Factor` headers of the egress pulls (§7.7). The
 //! mock (`crate::mock`) reads it when an outbound connection begins.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mimic_core::Mode;
@@ -161,6 +161,14 @@ struct ToLabel {
     to: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ModeLabel {
+    mode: &'static str,
+}
+
+/// Every mode, for the series that exist from the start.
+const MODES: [Mode; 3] = [Mode::None, Mode::Discovery, Mode::Mock];
+
 struct Current {
     mode: Mode,
     factor: u32,
@@ -174,6 +182,10 @@ struct Inner {
     current: Mutex<Current>,
     state_file: PathBuf,
     gauge: Gauge,
+    /// `mimic_mode{mode}`: 1 for the current mode, 0 for the others.
+    modes: Family<ModeLabel, Gauge>,
+    /// True unless the mode is `none`: what discovery reads to decide whether to record.
+    recording: Arc<AtomicBool>,
     /// `mimic_mock_latency_factor`: the factor held as a decimal, in both modes.
     factor_gauge: Gauge<f64, AtomicU64>,
     /// `mimic_mock_mode_switches_total{to}`.
@@ -206,6 +218,8 @@ impl ModeState {
             }),
             state_file: config.state_file.clone(),
             gauge: Gauge::default(),
+            modes: Family::default(),
+            recording: Arc::new(AtomicBool::new(config.mode != Mode::None)),
             factor_gauge: Gauge::default(),
             switches: Family::default(),
             epoch: AtomicU64::new(0),
@@ -219,11 +233,16 @@ impl ModeState {
         let state = ModeState::new(config);
         metrics.registry_mut().register(
             "mock_mode",
-            "1 when the sidecar is in mock mode, 0 in discovery mode",
+            "1 when the sidecar is in mock mode, 0 in discovery and none",
             state.0.gauge.clone(),
         );
-        // Both series exist from the start, at 0.
-        for mode in [Mode::Mock, Mode::Discovery] {
+        metrics.registry_mut().register(
+            "mode",
+            "1 for the mode the sidecar is in (none, discovery or mock), 0 for the others",
+            state.0.modes.clone(),
+        );
+        // All series exist from the start, at 0.
+        for mode in MODES {
             let _ = state
                 .0
                 .switches
@@ -259,10 +278,31 @@ impl ModeState {
         }
         let (mode, factor) = state.get();
         state.0.watch.send_replace(mode);
-        state.0.gauge.set(i64::from(mode == Mode::Mock));
-        state.0.factor_gauge.set(f64::from(factor) / 100.0);
+        state.publish(mode, factor);
         changed(mode, None, factor, source);
         state
+    }
+
+    /// Shows `mode` and `factor` in the gauges and to discovery.
+    fn publish(&self, mode: Mode, factor: u32) {
+        self.0
+            .recording
+            .store(mode != Mode::None, Ordering::Release);
+        self.0.gauge.set(i64::from(mode == Mode::Mock));
+        for known in MODES {
+            self.0
+                .modes
+                .get_or_create(&ModeLabel {
+                    mode: known.as_str(),
+                })
+                .set(i64::from(known == mode));
+        }
+        self.0.factor_gauge.set(f64::from(factor) / 100.0);
+    }
+
+    /// False while the mode is `none`: nothing is recorded, nothing is kept for discovery.
+    pub fn recording(&self) -> Arc<AtomicBool> {
+        self.0.recording.clone()
     }
 
     fn current(&self) -> MutexGuard<'_, Current> {
@@ -292,6 +332,12 @@ impl ModeState {
         let mut watch = self.0.watch.subscribe();
         // The sender lives as long as `self`.
         let _ = watch.wait_for(|current| *current == mode).await;
+    }
+
+    /// Resolves once the mode is not `mode` (at once when it already is not).
+    pub async fn leaves(&self, mode: Mode) {
+        let mut watch = self.0.watch.subscribe();
+        let _ = watch.wait_for(|current| *current != mode).await;
     }
 
     /// The latency factor in hundredths.
@@ -332,8 +378,7 @@ impl ModeState {
             }
         }
         self.0.watch.send_replace(mode);
-        self.0.gauge.set(i64::from(mode == Mode::Mock));
-        self.0.factor_gauge.set(f64::from(factor) / 100.0);
+        self.publish(mode, factor);
         // Counted when applied, whether or not the state file was written (spec §9).
         if mode != previous {
             self.0

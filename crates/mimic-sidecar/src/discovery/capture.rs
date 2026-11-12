@@ -4,7 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 
 use mimic_core::discovery::report::Direction;
@@ -269,6 +269,8 @@ pub struct Tap {
     queue: SyncSender<Item>,
     budget: Arc<Budget>,
     metrics: DiscoveryMetrics,
+    /// False in mode `none` (spec §3): the relay captures and records nothing. Absent: always on.
+    recording: Option<Arc<AtomicBool>>,
 }
 
 impl Tap {
@@ -281,7 +283,21 @@ impl Tap {
             queue,
             budget,
             metrics,
+            recording: None,
         }
+    }
+
+    /// The same tap, on while `recording` is true (the mode of the sidecar is not `none`).
+    pub fn gated(mut self, recording: Arc<AtomicBool>) -> Tap {
+        self.recording = Some(recording);
+        self
+    }
+
+    /// False in mode `none`: the relay starts no capture, and `submit` and `tunnel` do nothing.
+    pub(crate) fn active(&self) -> bool {
+        self.recording
+            .as_ref()
+            .is_none_or(|recording| recording.load(Ordering::Acquire))
     }
 
     /// Counts an inbound load test request: forwarded, and not recorded (spec §7.8).
@@ -316,6 +332,10 @@ impl Tap {
 
     /// Queues the exchange for the recorder; a full queue or a lost head drops it, counted.
     pub(crate) fn submit(&self, capture: Capture, meta: Meta) {
+        // Switched to `none` while the exchange was under way: it is not recorded.
+        if !self.active() {
+            return;
+        }
         let (direction, label) = if meta.outbound {
             (Direction::Outbound, "outbound")
         } else {
@@ -373,6 +393,9 @@ impl Tap {
         sni: Option<String>,
         target: Option<String>,
     ) {
+        if !self.active() {
+            return;
+        }
         let tunnel = Tunnel {
             kind,
             dst,

@@ -1133,6 +1133,7 @@ pub(crate) mod tests {
         ]);
         let mock = |factor, passthrough: &[&str]| MockSettings {
             mock: true,
+            discovery: false,
             factor,
             passthrough: passthrough.iter().map(|p| p.to_string()).collect(),
         };
@@ -1148,8 +1149,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn mck_01_a_deployment_in_discovery_gets_the_mode_and_nothing_else() {
+    async fn non_06_a_deployment_without_a_mode_gets_none_and_nothing_else() {
         let (router, _, _) = setup_tls(true, &[("shop", "w1", "shop", &[])], true);
+        let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
+        let env = sidecar_env(&out);
+        assert_eq!(env["MIMIC_MODE"], "none");
+        assert!(!env.contains_key("MIMIC_MOCK_LATENCY_FACTOR"));
+        assert!(!env.contains_key("MIMIC_MOCK_PASSTHROUGH"));
+    }
+
+    #[tokio::test]
+    async fn non_06_a_deployment_in_discovery_gets_the_mode_and_nothing_else() {
+        use crate::workloads::MockSettings;
+        let cache = WorkloadCache::synced_with_settings(&[("shop", "w1", "shop", &[], &[])]);
+        cache.set_mock(
+            "shop",
+            "w1",
+            MockSettings {
+                discovery: true,
+                ..MockSettings::default()
+            },
+        );
+        let (router, _, _) = setup_cache(cache, true);
         let out = admit(&router, "/inject/namespace", review("u", "shop", &pod())).await;
         let env = sidecar_env(&out);
         assert_eq!(env["MIMIC_MODE"], "discovery");

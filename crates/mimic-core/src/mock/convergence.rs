@@ -29,7 +29,7 @@ pub fn convergence(
     let mut found = Convergence::default();
     for field in pulls.values() {
         let read = field.split_once(' ').and_then(|(mode, at)| {
-            let mode = [Mode::Discovery, Mode::Mock]
+            let mode = [Mode::None, Mode::Discovery, Mode::Mock]
                 .into_iter()
                 .find(|m| m.as_str() == mode)?;
             Some((mode, at.parse::<u64>().ok()?))
