@@ -35,6 +35,7 @@ struct Ex {
     status: u16,
     resp_headers: Vec<(String, String)>,
     resp_body: Option<Vec<u8>>,
+    resp_trailers: Vec<(String, String)>,
     grpc: bool,
     head_ms: u64,
 }
@@ -49,6 +50,7 @@ fn ex(method: &str, path: &str, status: u16) -> Ex {
         status,
         resp_headers: Vec::new(),
         resp_body: None,
+        resp_trailers: Vec::new(),
         grpc: false,
         head_ms: 5,
     }
@@ -103,6 +105,11 @@ fn record_in(authority: &str, exchanges: &[Ex]) -> EgressSet {
     for e in exchanges {
         let borrow = |h: &[(String, String)]| -> Vec<(String, String)> { h.to_vec() };
         let (req, resp) = (borrow(&e.req_headers), borrow(&e.resp_headers));
+        let trailers = borrow(&e.resp_trailers);
+        let trailers: Vec<(&str, &str)> = trailers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
         let req: Vec<(&str, &str)> = req.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
         let resp: Vec<(&str, &str)> = resp.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
         report.record_at(
@@ -125,7 +132,7 @@ fn record_in(authority: &str, exchanges: &[Ex]) -> EgressSet {
                     req_body: e.req_body.as_deref(),
                     resp_headers: &resp,
                     resp_body: e.resp_body.as_deref(),
-                    resp_trailers: &[],
+                    resp_trailers: &trailers,
                 },
             },
         );
@@ -605,38 +612,33 @@ fn mck_04_a_grpc_answer_is_ok_with_an_empty_message_and_trailers() {
 }
 
 #[test]
-fn grp_27_recorded_grpc_messages_do_not_change_the_answer() {
-    // A framed message `{1: "alice"}`.
-    let framed = vec![0, 0, 0, 0, 7, 0x0a, 0x05, b'a', b'l', b'i', b'c', b'e'];
+fn grp_27_a_sample_without_a_message_is_answered_with_the_empty_message() {
+    // A recorded body that is not a message (opaque) leaves no message in the sample.
     let mut call = ex("POST", "/pkg.Svc/Get", 200);
     call.req_headers
         .push(("content-type".into(), "application/grpc".into()));
-    call.req_body = Some(framed.clone());
+    call.req_body = Some(vec![0, 0, 0, 0, 1, 0xff]);
     call.resp_headers
         .push(("content-type".into(), "application/grpc".into()));
-    call.resp_body = Some(framed.clone());
+    call.resp_body = Some(vec![0, 0, 0, 0, 1, 0xff]);
     call.grpc = true;
-    let set = record(&[call]);
-    // The sample holds the message (format 2), the mock ignores it.
-    assert!(set.to_json().expect("serialises").contains("\"alice\""));
-    let index = index(&set);
-    for body in [None, Some(framed)] {
-        let mut r = req("POST", "/pkg.Svc/Get").header("content-type", "application/grpc");
-        r.h2 = true;
-        r.body = body;
-        let (tier, response) = ask(&index, &r).expect("an answer");
-        assert_eq!(tier, Tier::Exact);
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body(), [0u8; 5]);
-        assert_eq!(
-            response.trailers,
-            vec![("grpc-status".to_string(), "0".to_string())]
-        );
-    }
+    let index = index(&record(&[call]));
+    let mut r = req("POST", "/pkg.Svc/Get").header("content-type", "application/grpc");
+    r.h2 = true;
+    let (tier, response) = ask(&index, &r).expect("an answer");
+    assert_eq!(tier, Tier::Exact);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body(), [0u8; 5]);
+    assert_eq!(
+        response.trailers,
+        vec![("grpc-status".to_string(), "0".to_string())]
+    );
 }
 
 #[test]
 fn mck_04_a_grpc_answer_drops_the_status_headers_of_its_sample() {
+    // A trailers-only error: the status is in the response headers, and the answer sends it
+    // as a trailer (GRP-31), not as a header.
     let mut call = ex("POST", "/pkg.Svc/Get", 200)
         .resp("application/grpc", "")
         .resp_header("grpc-status", "5")
@@ -650,8 +652,12 @@ fn mck_04_a_grpc_answer_drops_the_status_headers_of_its_sample() {
     assert!(header(&response, "grpc-message").is_none());
     assert_eq!(
         response.trailers,
-        vec![("grpc-status".to_string(), "0".to_string())]
+        vec![
+            ("grpc-status".to_string(), "5".to_string()),
+            ("grpc-message".to_string(), "not found".to_string())
+        ]
     );
+    assert!(response.body().is_empty());
 }
 
 #[test]
@@ -1227,4 +1233,230 @@ fn plh_07_the_app_replays_the_token_it_was_given() {
     let (tier, response) = ask(&index, &r).expect("an answer");
     assert_eq!(tier, Tier::Exact);
     assert_eq!(text(&response), r#"{"orders":[]}"#);
+}
+
+// --- GRP-31, GRP-32: replay of gRPC messages (#463) ---------------------------------------
+
+use crate::grpc::frame::{Parser, encode_frame};
+use crate::grpc::wire::Message;
+
+/// The frame of a message given as canonical JSON.
+fn framed(json: &str) -> Vec<u8> {
+    let value: serde_json::Value = serde_json::from_str(json).expect("json");
+    let payload = Message::from_json(&value)
+        .expect("a message")
+        .encode()
+        .expect("encodes");
+    encode_frame(false, &payload).expect("a frame")
+}
+
+/// The JSON of the only message of a framed body.
+fn unframed(body: &[u8]) -> serde_json::Value {
+    let pushed = Parser::new().push(body);
+    assert!(pushed.error.is_none());
+    assert_eq!(pushed.frames.len(), 1);
+    let frame = &pushed.frames[0];
+    assert!(!frame.compressed);
+    Message::decode(&frame.payload)
+        .expect("a message")
+        .to_json()
+}
+
+fn call(path: &str, request: &str, response: &str) -> Ex {
+    let mut call = ex("POST", path, 200)
+        .req_header("content-type", "application/grpc")
+        .resp_header("content-type", "application/grpc");
+    call.req_body = Some(framed(request));
+    call.resp_body = Some(framed(response));
+    call.resp_trailers = vec![("grpc-status".into(), "0".into())];
+    call.grpc = true;
+    call
+}
+
+fn grpc_req(path: &str, body: Option<Vec<u8>>) -> Req {
+    let mut r = req("POST", path).header("content-type", "application/grpc");
+    r.h2 = true;
+    r.body = body;
+    r
+}
+
+#[test]
+fn grp_31_a_recorded_message_is_replayed_framed() {
+    let message = r#"{"1":"alice","2":{"1":5},"3":[1,2]}"#;
+    let index = index(&record(&[call("/pkg.Svc/Get", r#"{"1":"q"}"#, message)]));
+    let (tier, response) = ask(&index, &grpc_req("/pkg.Svc/Get", None)).expect("an answer");
+    assert_eq!(tier, Tier::Exact);
+    assert_eq!(response.status, 200);
+    assert_eq!(header(&response, "content-type"), Some("application/grpc"));
+    assert_eq!(
+        header(&response, "content-length"),
+        Some(response.body().len().to_string().as_str())
+    );
+    assert_eq!(response.body(), framed(message));
+    assert_eq!(unframed(response.body()).to_string(), message);
+    assert_eq!(
+        response.trailers,
+        vec![("grpc-status".to_string(), "0".to_string())]
+    );
+}
+
+#[test]
+fn grp_31_the_recorded_trailers_are_replayed_in_order_without_bin_and_framing_names() {
+    let mut c = call("/pkg.Svc/Get", r#"{"1":"q"}"#, r#"{"1":"x"}"#);
+    c.resp_trailers = vec![
+        ("x-neutral".into(), "v".into()),
+        ("grpc-message".into(), "not found".into()),
+        ("x-trace-bin".into(), "AAEC".into()),
+        ("grpc-status".into(), "5".into()),
+        ("content-length".into(), "9".into()),
+    ];
+    let index = index(&record(&[c]));
+    let (_, response) = ask(&index, &grpc_req("/pkg.Svc/Get", None)).expect("an answer");
+    assert_eq!(
+        response.trailers,
+        vec![
+            ("grpc-status".to_string(), "5".to_string()),
+            ("grpc-message".to_string(), "not found".to_string()),
+            ("x-neutral".to_string(), "v".to_string()),
+        ]
+    );
+    // The message is still sent: the sample holds one.
+    assert_eq!(unframed(response.body()).to_string(), r#"{"1":"x"}"#);
+}
+
+#[test]
+fn grp_31_a_status_zero_sample_without_a_message_gets_the_empty_message() {
+    let mut c = ex("POST", "/pkg.Svc/Get", 200).resp("application/grpc", "");
+    c.grpc = true;
+    c.resp_trailers = vec![("x-neutral".into(), "v".into())];
+    let index = index(&record(&[c]));
+    let (_, response) = ask(&index, &grpc_req("/pkg.Svc/Get", None)).expect("an answer");
+    assert_eq!(response.body(), [0u8; 5]);
+    assert_eq!(
+        response.trailers,
+        vec![
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-neutral".to_string(), "v".to_string())
+        ]
+    );
+}
+
+#[test]
+fn grp_31_placeholders_are_replayed_as_strings_and_nothing_else() {
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let response = format!(
+        r#"{{"1":"{jwt}","2":"plain","3":"ghp_{}"}}"#,
+        "a".repeat(36)
+    );
+    let index = index(&record(&[call("/pkg.Svc/Get", r#"{"1":"q"}"#, &response)]));
+    let (_, answer) = ask(&index, &grpc_req("/pkg.Svc/Get", None)).expect("an answer");
+    let message = unframed(answer.body());
+    assert_eq!(message["1"], "mimic-jwt");
+    assert_eq!(message["2"], "plain");
+    assert_eq!(message["3"], "mimic-token");
+    let bytes = String::from_utf8_lossy(answer.body()).into_owned();
+    assert!(!bytes.contains("eyJ") && !bytes.contains("ghp_"));
+}
+
+fn two_methods() -> Index {
+    index(&record(&[
+        call("/pkg.Svc/Get", r#"{"1":"a"}"#, r#"{"1":"first"}"#),
+        call("/pkg.Svc/Get", r#"{"1":"b"}"#, r#"{"1":"second"}"#),
+    ]))
+}
+
+fn reply_of(index: &Index, body: Option<Vec<u8>>) -> (Tier, String) {
+    let (tier, response) = ask(index, &grpc_req("/pkg.Svc/Get", body)).expect("an answer");
+    (
+        tier,
+        unframed(response.body())["1"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+#[test]
+fn grp_32_the_request_message_chooses_the_sample() {
+    let index = two_methods();
+    assert_eq!(
+        reply_of(&index, Some(framed(r#"{"1":"b"}"#))),
+        (Tier::Exact, "second".to_string())
+    );
+    assert_eq!(
+        reply_of(&index, Some(framed(r#"{"1":"a"}"#))),
+        (Tier::Exact, "first".to_string())
+    );
+    assert_eq!(
+        reply_of(&index, Some(framed(r#"{"1":"b","2":7}"#))),
+        (Tier::Endpoint, "second".to_string())
+    );
+    assert_eq!(
+        reply_of(&index, Some(framed(r#"{"1":"zzz"}"#))),
+        (Tier::Fallback, "first".to_string())
+    );
+    assert_eq!(
+        reply_of(&index, None),
+        (Tier::Fallback, "first".to_string())
+    );
+}
+
+#[test]
+fn grp_32_a_gzip_message_matches_as_the_plain_one_and_unreadable_ones_match_nothing() {
+    use std::io::Write;
+    let index = two_methods();
+    let plain = Message::from_json(&serde_json::json!({"1": "b"}))
+        .expect("a message")
+        .encode()
+        .expect("encodes");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&plain).expect("writes");
+    let body = encode_frame(true, &gz.finish().expect("gzip")).expect("a frame");
+    let mut r = grpc_req("/pkg.Svc/Get", Some(body.clone()));
+    r.headers.push(("grpc-encoding".into(), "gzip".into()));
+    let (tier, response) = ask(&index, &r).expect("an answer");
+    assert_eq!(tier, Tier::Exact);
+    assert_eq!(unframed(response.body())["1"], "second");
+    // The same frame under `br` is not read: no fields, the fallback.
+    let mut r = grpc_req("/pkg.Svc/Get", Some(body));
+    r.headers.push(("grpc-encoding".into(), "br".into()));
+    assert_eq!(ask(&index, &r).expect("an answer").0, Tier::Fallback);
+    // A truncated frame and a frame over 256 KiB give no fields either.
+    let mut cut = framed(r#"{"1":"b"}"#);
+    cut.truncate(7);
+    assert_eq!(
+        ask(&index, &grpc_req("/pkg.Svc/Get", Some(cut)))
+            .expect("an answer")
+            .0,
+        Tier::Fallback
+    );
+    let mut big = vec![0, 0, 4, 0, 1];
+    big.extend(vec![0x41; 256 * 1024 + 1]);
+    assert_eq!(
+        ask(&index, &grpc_req("/pkg.Svc/Get", Some(big)))
+            .expect("an answer")
+            .0,
+        Tier::Fallback
+    );
+}
+
+#[test]
+fn grp_32_a_placeholder_field_is_never_compared() {
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let index = index(&record(&[
+        call(
+            "/pkg.Svc/Get",
+            &format!(r#"{{"1":"a","2":"{jwt}"}}"#),
+            r#"{"1":"first"}"#,
+        ),
+        call("/pkg.Svc/Get", r#"{"1":"b"}"#, r#"{"1":"second"}"#),
+    ]));
+    // Field 2 is a token in the sample (a placeholder there) and another one here: the
+    // sample still matches on field 1 alone.
+    let other = jwt.replace("dBjf", "xxxx");
+    let body = framed(&format!(r#"{{"1":"a","2":"{other}"}}"#));
+    assert_eq!(
+        reply_of(&index, Some(body)),
+        (Tier::Exact, "first".to_string())
+    );
 }

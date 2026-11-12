@@ -234,6 +234,12 @@ fn limits() -> Limits {
 
 /// The egress set of GET exchanges on `paths`, with a sample each when `body`.
 fn set_json(paths: &[&str], body: bool) -> String {
+    EgressSet::project_as(&report_of(paths, body), 1)
+        .to_json()
+        .unwrap()
+}
+
+fn report_of(paths: &[&str], body: bool) -> Report {
     let mut report = Report::new(None);
     let text = "{\"id\":\"a\",\"ok\":true}";
     let resp = [("content-type", "application/json")];
@@ -267,7 +273,65 @@ fn set_json(paths: &[&str], body: bool) -> String {
             },
         );
     }
-    EgressSet::project_as(&report, 1).to_json().unwrap()
+    report
+}
+
+/// The set of `paths` and the gRPC call `/pkg.Greeter/Hello` that holds a message, in `format`.
+fn set_json_as(paths: &[&str], format: u32) -> String {
+    let mut report = report_of(paths, false);
+    let message = mimic_core::grpc::frame::encode_frame(false, &[0x0a, 0x02, b'h', b'i']).unwrap();
+    let grpc = [("content-type", "application/grpc")];
+    report.record_at(
+        ScopeKey::Authority("api.example.com:443".into()),
+        &Via {
+            tls: true,
+            sni: Some("api.example.com"),
+            dst: None,
+        },
+        &limits(),
+        &Redactor::default(),
+        &Exchange {
+            direction: Direction::Outbound,
+            port: 8080,
+            method: "POST",
+            path: "/pkg.Greeter/Hello",
+            status: 200,
+            head_ms: 3,
+            host: None,
+            grpc: true,
+            observation: Observation {
+                query: "",
+                req_headers: &grpc,
+                req_body: None,
+                resp_headers: &grpc,
+                resp_body: Some(&message),
+                resp_trailers: &[("grpc-status", "0")],
+            },
+        },
+    );
+    EgressSet::project_as(&report, format).to_json().unwrap()
+}
+
+/// The body of the answer to a gRPC call of `/pkg.Greeter/Hello`, from the snapshot.
+fn hello(snapshot: &Snapshot) -> Vec<u8> {
+    let index = snapshot.index().expect("a snapshot");
+    let headers = [("content-type", "application/grpc")];
+    let request = mimic_core::mock::Request {
+        method: "POST",
+        target: Some("api.example.com"),
+        tls: true,
+        sni: None,
+        dst: "10.0.0.5:443".parse().unwrap(),
+        h2: true,
+        path: "/pkg.Greeter/Hello",
+        query: "",
+        headers: &headers,
+        body: None,
+    };
+    let hit = index
+        .lookup(&Redactor::default(), &request)
+        .expect("an answer");
+    hit.response("POST").body().to_vec()
 }
 
 fn target(api: &FakeApi, token: &std::path::Path) -> Target {
@@ -393,7 +457,7 @@ async fn pul_13_pulls_with_the_etag_held_and_follows_the_snapshot() {
     // The first pull comes within one interval, with no `If-None-Match`.
     wait(|| rig.api.count() >= 1).await;
     assert!(rig.api.at(0).duration_since(rig.started) <= INTERVAL + Duration::from_millis(500));
-    assert_eq!(rig.api.target(0), "/v1/workloads/pay/egress?format=1");
+    assert_eq!(rig.api.target(0), "/v1/workloads/pay/egress?format=2");
     assert_eq!(rig.api.if_none_match(0), None);
     assert_eq!(rig.api.authorization(0), format!("Bearer {TOKEN}"));
     // The token file changes between two pulls: the next pull carries the new one.
@@ -1266,5 +1330,82 @@ async fn plh_07_an_f12_set_is_upgraded_by_the_pull_and_the_mock_answers_placehol
         mimic_core::discovery::egress::EgressSet::from_json(&legacy).unwrap(),
         current
     );
+    rig.stop().await;
+}
+
+// --- GRP-34 (#463): format 2, and the fallback to format 1 ------------------------------
+
+#[tokio::test]
+async fn grp_34_a_controller_that_serves_format_2_is_asked_for_it_and_its_etag_is_held() {
+    let two = set_json_as(&["/v1/ping"], 2);
+    let rig = Rig::start(vec![ok(&two, "\"2-aa\"")], Reply::NotModified).await;
+    wait(|| rig.api.count() >= 2).await;
+    assert_eq!(rig.api.target(0), "/v1/workloads/pay/egress?format=2");
+    assert_eq!(rig.api.target(1), "/v1/workloads/pay/egress?format=2");
+    assert_eq!(rig.api.if_none_match(1).as_deref(), Some("\"2-aa\""));
+    // The message of the gRPC call is replayed: `{1: "hi"}`.
+    assert_eq!(
+        hello(&rig.snapshot),
+        [0, 0, 0, 0, 4, 0x0a, 0x02, b'h', b'i']
+    );
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn grp_34_a_400_to_format_2_is_answered_by_format_1_at_once_and_format_2_is_tried_again_later()
+ {
+    let logs = capture_logs();
+    let one = set_json_as(&["/v1/ping"], 1);
+    let two = set_json_as(&["/v1/ping"], 2);
+    // A controller of F13: `400` to format 2, the set to format 1; then it is upgraded.
+    let mut script = vec![Reply::Status(400), ok(&one, "\"1-aa\"")];
+    script.extend(vec![Reply::NotModified; 9]);
+    script.push(ok(&two, "\"2-bb\""));
+    let rig = Rig::start(script, Reply::NotModified).await;
+    wait(|| rig.api.count() >= 2).await;
+    assert_eq!(rig.api.target(0), "/v1/workloads/pay/egress?format=2");
+    assert_eq!(rig.api.target(1), "/v1/workloads/pay/egress?format=1");
+    // At once: no interval between the two, and no `If-None-Match` before a set is held.
+    assert!(rig.api.at(1).duration_since(rig.api.at(0)) < INTERVAL.mul_f32(0.5));
+    assert_eq!(rig.api.if_none_match(1), None);
+    wait(|| rig.snapshot.endpoints() == 2).await;
+    // The set of format 1 holds the call without its message: the empty message.
+    assert_eq!(hello(&rig.snapshot), [0u8; 5]);
+    assert_eq!(rig.pulls("ok"), 1);
+    assert_eq!(rig.pulls("error"), 0);
+    // The next nine pulls ask for format 1; the tenth asks for format 2 first.
+    wait(|| rig.api.count() >= 12).await;
+    for n in 2..=10 {
+        assert_eq!(
+            rig.api.target(n),
+            "/v1/workloads/pay/egress?format=1",
+            "{n}"
+        );
+    }
+    assert_eq!(rig.api.target(11), "/v1/workloads/pay/egress?format=2");
+    wait(|| rig.snapshot.etag().as_deref() == Some("\"2-bb\"")).await;
+    assert_eq!(
+        hello(&rig.snapshot),
+        [0, 0, 0, 0, 4, 0x0a, 0x02, b'h', b'i']
+    );
+    wait(|| rig.api.count() >= 13).await;
+    assert_eq!(rig.api.target(12), "/v1/workloads/pay/egress?format=2");
+    logs.settled().await;
+    let text = logs.text();
+    let refused = text
+        .matches("egress format 2 refused, using format 1")
+        .count();
+    assert_eq!(refused, 1, "{text}");
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn grp_34_a_400_to_format_1_too_is_a_failed_pull() {
+    let rig = Rig::start(vec![], Reply::Status(400)).await;
+    wait(|| rig.api.count() >= 2).await;
+    assert_eq!(rig.api.target(0), "/v1/workloads/pay/egress?format=2");
+    assert_eq!(rig.api.target(1), "/v1/workloads/pay/egress?format=1");
+    wait(|| rig.pulls("error") >= 1).await;
+    assert_eq!(rig.snapshot.endpoints(), 0);
     rig.stop().await;
 }
