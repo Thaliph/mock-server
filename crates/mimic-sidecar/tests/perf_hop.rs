@@ -26,7 +26,10 @@ fn service() -> Duration {
     )
 }
 fn conns() -> usize {
-    std::env::var("MIMIC_PERF_CONNS").ok().and_then(|s| s.parse().ok()).unwrap_or(8)
+    std::env::var("MIMIC_PERF_CONNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
 }
 const RPS: u64 = 200;
 
@@ -139,7 +142,10 @@ fn overhead() {
         };
         let (sum, count) = (get("sum"), get("count"));
         if count > 0.0 {
-            println!("sidecar {i}: overhead {:.1} us/exchange over {count}", sum / count * 1e6);
+            println!(
+                "sidecar {i}: overhead {:.1} us/exchange over {count}",
+                sum / count * 1e6
+            );
         }
     }
 }
@@ -191,7 +197,11 @@ fn report(label: &str, mut v: Vec<Duration>) {
 }
 
 async fn load_http1(target: SocketAddr) -> Vec<Duration> {
-    let total = if service().is_zero() { 5000 * conns() as u64 } else { secs() * RPS };
+    let total = if service().is_zero() {
+        5000 * conns() as u64
+    } else {
+        secs() * RPS
+    };
     let per = total / conns() as u64;
     let gap = Duration::from_secs_f64(conns() as f64 / RPS as f64);
     let mut tasks = vec![];
@@ -207,7 +217,9 @@ async fn load_http1(target: SocketAddr) -> Vec<Duration> {
                     tokio::time::sleep_until(start + gap * k as u32).await;
                 }
                 let t = Instant::now();
-                s.write_all(b"GET /x HTTP/1.1\r\nhost: a\r\n\r\n").await.unwrap();
+                s.write_all(b"GET /x HTTP/1.1\r\nhost: a\r\n\r\n")
+                    .await
+                    .unwrap();
                 let mut got = 0;
                 while got < 41 + 1024 {
                     got += s.read(&mut buf).await.unwrap();
@@ -225,7 +237,11 @@ async fn load_http1(target: SocketAddr) -> Vec<Duration> {
 }
 
 async fn load_h2(target: SocketAddr) -> Vec<Duration> {
-    let total = if service().is_zero() { 5000 * conns() as u64 } else { secs() * RPS };
+    let total = if service().is_zero() {
+        5000 * conns() as u64
+    } else {
+        secs() * RPS
+    };
     let per = total / conns() as u64;
     let gap = Duration::from_secs_f64(conns() as f64 / RPS as f64);
     let mut tasks = vec![];
@@ -315,7 +331,9 @@ impl Client {
     async fn call(&mut self) {
         match self {
             Client::Http1(s) => {
-                s.write_all(b"GET /x HTTP/1.1\r\nhost: a\r\n\r\n").await.unwrap();
+                s.write_all(b"GET /x HTTP/1.1\r\nhost: a\r\n\r\n")
+                    .await
+                    .unwrap();
                 let mut buf = vec![0u8; 4096];
                 let mut got = 0;
                 while got < 41 + 1024 {
@@ -333,7 +351,11 @@ impl Client {
 
 /// One request at a time, taking turns between the paths, so that every path sees the same machine.
 async fn interleaved(h2: bool) {
-    let server = if h2 { h2_server().await } else { http1_server().await };
+    let server = if h2 {
+        h2_server().await
+    } else {
+        http1_server().await
+    };
     let one = proxy(server, Direction::Inbound).await;
     let callee = proxy(server, Direction::Inbound).await;
     let caller = proxy(callee, Direction::Outbound).await;

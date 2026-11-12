@@ -980,14 +980,14 @@ mod tests {
     }
 
     /// PRX-33: the observation of a response (access line, metrics, discovery) comes after its
-    /// bytes were written to the client, so a slow sink cannot delay them.
+    /// bytes were written to the client: a sink that waits for the client to have the response
+    /// cannot delay it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn prx_33_response_bytes_do_not_wait_for_their_observation() {
         const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
         let ((mut client, mut relay_client), (mut dest, mut relay_dest)) =
             (pair().await, pair().await);
-        let observed = Arc::new(AtomicBool::new(false));
-        let seen = Arc::clone(&observed);
+        let (release, released) = std::sync::mpsc::channel::<()>();
         let relayed = tokio::spawn(async move {
             relay(
                 &mut relay_client,
@@ -995,9 +995,7 @@ mod tests {
                 Vec::new(),
                 move |event| {
                     if matches!(event, Event::Response(_)) {
-                        // A sink that takes 500 ms, as a recorder under load could.
-                        std::thread::sleep(Duration::from_millis(500));
-                        seen.store(true, Ordering::SeqCst);
+                        let _ = released.recv_timeout(Duration::from_secs(10));
                     }
                 },
                 std::future::pending(),
@@ -1011,12 +1009,11 @@ mod tests {
         dest.read_exact(&mut got).await.unwrap();
         dest.write_all(RESPONSE).await.unwrap();
         let mut answer = vec![0u8; RESPONSE.len()];
-        timeout(Duration::from_millis(250), client.read_exact(&mut answer))
-            .await
-            .expect("the response waited for its observation")
+        let read = timeout(Duration::from_secs(5), client.read_exact(&mut answer)).await;
+        let _ = release.send(());
+        read.expect("the response waited for its observation")
             .unwrap();
         assert_eq!(answer, RESPONSE);
-        assert!(!observed.load(Ordering::SeqCst), "the sink was not slow");
         drop((client, dest));
         let _ = relayed.await;
     }
