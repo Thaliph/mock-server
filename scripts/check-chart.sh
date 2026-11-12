@@ -716,4 +716,23 @@ helm template mimic "$tmp/chart-copy" -n mimic-system --set valkey.existingSecre
 cmp -s <(yq "$isdash" "$tmp/dash-copy.yaml") <(yq "$isdash" "$tmp/dash-grafana.yaml") && fail "mon_23: the changed copy renders the same dashboard"
 echo "mon_22, mon_23: the dashboards pass the checker and render as one ConfigMap per file"
 
+# UI-14 (#437, spec §12.7): the controller container declares mimic-ui on 8080/TCP, for information only. The read API
+# stays on loopback (no MIMIC_UI_ADDR in the chart), and no Service or NetworkPolicy names the port or uses 8080.
+# The 403 for a non-loopback peer is CTL-13 (ctl_13_a_peer_that_is_not_loopback_gets_403), a Rust test.
+ui_ctr=$(yq 'select(.kind == "Deployment" and .metadata.name == "mimic-controller") | .spec.template.spec.containers[] | select(.name == "controller")' "$tmp/default.yaml")
+[[ -n $ui_ctr ]] || fail "ui_14: no controller container in the default render"
+[[ $(printf '%s\n' "$ui_ctr" | yq -r '[.ports[] | select(.name == "mimic-ui")] | length') == 1 ]] \
+  || fail "ui_14: the controller container does not declare exactly one port named mimic-ui"
+[[ $(printf '%s\n' "$ui_ctr" | yq -r '.ports[] | select(.name == "mimic-ui") | .containerPort') == 8080 ]] \
+  || fail "ui_14: mimic-ui is not containerPort 8080"
+[[ $(printf '%s\n' "$ui_ctr" | yq -r '.ports[] | select(.name == "mimic-ui") | .protocol') == TCP ]] \
+  || fail "ui_14: mimic-ui is not TCP"
+[[ $(printf '%s\n' "$ui_ctr" | yq -r '[.env[]? | select(.name == "MIMIC_UI_ADDR")] | length') == 0 ]] \
+  || fail "ui_14: the chart sets MIMIC_UI_ADDR (the read API must stay on loopback by default)"
+ui_exposed=$(yq 'select(.kind == "Service" or .kind == "NetworkPolicy")' "$tmp/default.yaml")
+! grep -q 'mimic-ui' <<<"$ui_exposed" || fail "ui_14: a Service or NetworkPolicy names mimic-ui"
+[[ $(yq -r '[.. | select(tag == "!!int" and . == 8080)] | length' <<<"$ui_exposed" | awk '{ s += $1 } END { print s + 0 }') == 0 ]] \
+  || fail "ui_14: a Service or NetworkPolicy uses port 8080"
+echo "ui_14: the controller declares mimic-ui on 8080/TCP; no Service or NetworkPolicy exposes it"
+
 echo "chart checks passed"
