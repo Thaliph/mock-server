@@ -256,8 +256,9 @@ proptest! {
         seed in any::<u64>(),
         max_services in 1usize..6,
         max_endpoints in 1usize..20,
+        max_view_bytes in 100usize..1500,
     ) {
-        let limits = Limits { max_services, max_endpoints, ..Limits::default() };
+        let limits = Limits { max_services, max_endpoints, max_view_bytes };
         let other = reordered(&s, seed);
         prop_assert_eq!(statuses(&s), statuses(&other));
         for n in NS {
@@ -267,6 +268,9 @@ proptest! {
                 prop_assert_eq!(&a.json, &b.json);
                 prop_assert_eq!(&a.etag, &b.etag);
                 prop_assert_eq!(a.truncated, b.truncated);
+                prop_assert_eq!(&a.skipped, &b.skipped);
+                prop_assert_eq!(a.skipped.len(), a.truncated.min(16));
+                prop_assert!(a.json.len() <= max_view_bytes || a.view.services.is_empty());
                 prop_assert!(a.view.services.len() <= max_services);
                 prop_assert!(a.view.endpoint_count() <= max_endpoints);
             }

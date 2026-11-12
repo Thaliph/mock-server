@@ -154,6 +154,8 @@ pub struct Built {
     pub etag: String,
     /// Services left out because of a bound.
     pub truncated: usize,
+    /// Keys of the first Services left out (at most `MAX_SKIPPED_NAMES`), in order.
+    pub skipped: Vec<String>,
 }
 
 /// What the Services and slices of a snapshot are looked up by.
@@ -284,6 +286,7 @@ pub fn build(
             view,
             json,
             truncated: 0,
+            skipped: Vec::new(),
         };
     }
     let lookup = Lookup::new(snapshot);
@@ -336,6 +339,7 @@ pub fn build(
                 view,
                 json,
                 truncated: candidates.len() - taken,
+                skipped: Vec::new(),
             };
         }
         bytes += entry;
@@ -348,5 +352,6 @@ pub fn build(
         view,
         json,
         truncated: 0,
+        skipped: Vec::new(),
     }
 }
