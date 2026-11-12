@@ -15,5 +15,5 @@ a { color: #0b5cad; }
 pre { background: #f3f5f7; padding: 0.6rem; overflow-x: auto; font-size: 0.85rem; }
 ul.plain { list-style: none; padding-left: 0; margin: 0; }
 .mode-mock { font-weight: bold; }
-.placeholder { color: #555; }
+.map { overflow: auto; border: 1px solid #ddd; }
 .filters { display: flex; flex-wrap: wrap; gap: 1rem; }

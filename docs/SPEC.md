@@ -1712,7 +1712,7 @@ the recorder keeps the first message of each side:
   deployment without data is served and shows "no data" from the `404` of its JSON route.
 - **Explorer shell and Workloads tab (F15).** Every page carries the same four tabs, in this
   order: Map (`/ui/map`), Workloads (`/ui/`), Endpoints (`/ui/endpoints`), Load tests
-  (`/ui/loadtests`); Map is a placeholder until its own feature.
+  (`/ui/loadtests`).
   The deployment page and the document page of F6 stay as they are. The Workloads tab lists every
   deployment with its namespace, mode, pods, last push and the mimic resources that configure it
   (`MimicWorkload`, `MimicLoadTest`, from #440 `MimicConfig`), each linking to
@@ -1769,6 +1769,56 @@ the recorder keeps the first message of each side:
   field, value or Secret key can reach it. Starting or stopping a run from the UI is not
   offered. The read routes of §7.5 do not change. `/v1/features` and the run page count in
   `mimic_ui_requests_total` by route pattern.
+- **Map tab (F15).** `/ui/map` is a static page like the others; `mimic.js` reads
+  `GET /v1/map?format=svg` and shows the SVG the controller rendered, with "No calls recorded" when
+  the graph has no node. The map is a pure function (`mimic_core::ui::map`) of the stored reports
+  and of the mesh hub's last published snapshot, read per request: no Kubernetes call, no new
+  permission, nothing but the Valkey reads of the other routes (the reports' `:outbound` halves,
+  parsed on the blocking threads of the render limit) and the caches of #441.
+  - *Nodes.* One per deployment with stored data (`dep:<ns>/<dep>`), one per in-cluster Service
+    no such deployment answers for (`svc:<ns>/<name>`), one per external authority
+    (`ext:<authority>`).
+  - *Edges.* One per (calling deployment, destination node), summing the exchanges of every
+    outbound authority of the caller that resolves to the destination: `exchanges` (the stored
+    counter, a total, not a rate: reports keep no clock), `errors` (the exchanges whose recorded
+    status is 5xx) and `error_permille` (`errors * 1000 / exchanges`, rounded down). An edge from a
+    node to itself is not drawn. Tunnelled connections carry no status and are not counted.
+  - *Resolution of an authority* (port ignored, host lower-cased, one trailing dot dropped):
+    (1) an IP address equal to a `clusterIP` of a watched Service is that Service (an IPv6 one
+    with or without brackets); (2) `<svc>.<ns>.svc` followed by anything (`.cluster.local` or
+    another cluster domain) is the Service `<ns>/<svc>`, known or not; (3) `<svc>.<ns>` and a bare
+    `<svc>` (the caller's namespace) are that Service only when a watched Service or a deployment
+    with data has that namespace and name; (4) anything else, an unparsable name and any name
+    whose labels are not DNS-1123 labels is external. A Service resolves to the deployment of the
+    same namespace and name when it has data, else it is a Service node. The map does not match
+    Service selectors to Deployments: the mesh view carries none (§7.9).
+  - *Not declared* (design §4.4). When the hub has completed its lists, an edge from a deployment
+    to a Service of another namespace is flagged `"declared": false` unless the `MimicConfig`
+    that wins the caller (§7.9, MSH-08) lists the Service in `spec.destinations` and its namespace
+    consents (`ReferenceGrant`, as the view). Same-namespace and external edges are never flagged;
+    with the mesh off or the lists incomplete nothing is flagged.
+  - *Layout* (pure, no clock, no randomness): layers by repeated removal of the nodes whose
+    callers are all placed (a cycle is broken at the node with the lowest id), order inside a
+    layer by four barycentre sweeps with ties by id, integer coordinates. The same data in any
+    order gives byte-identical JSON and SVG.
+  - *Bounds.* At most 1000 deployment nodes (the first by namespace then name), 200 other nodes
+    (the most exchanges first, then id) and 2000 edges (the most exchanges first, then ids);
+    an edge with a dropped end is dropped. `dropped` says how many nodes and edges were left out,
+    and the SVG writes it. Labels are cut at 48 characters with `…` in the SVG; every
+    authority is cut at 255 characters before it is used anywhere.
+  - *Output.* `GET /v1/map` → `{"nodes": [{"id", "kind", "namespace", "name", "label", "layer",
+    "x", "y", "href"}], "edges": [{"from", "to", "exchanges", "errors", "error_permille",
+    "declared", "href"}], "dropped": {"nodes", "edges"}, "width", "height"}`, sorted by id
+    (edges by `from`, `to`), `application/json`; `?format=svg` → the SVG, `image/svg+xml`; any
+    other query is `400`; `503` while Valkey is unavailable. `href` of a deployment node is
+    `/ui/workloads/<ns>/<dep>` (the deployment page of the Workloads tab) and of an edge
+    `/ui/endpoints?deployment=<ns>%2F<dep>` of its caller (the Endpoints tab); the other nodes
+    have none. Every label is XML-escaped (`&`, `<`, `>`, `"`, `'`, and the characters XML 1.0
+    cannot hold replaced by U+FFFD) and every part of a link is percent-encoded. The SVG has no
+    script, no style attribute, no event attribute and no external reference; `mimic.js` parses
+    it with `DOMParser` and copies the allowlisted elements and attributes into the page (links
+    only to `/ui/`), never with `innerHTML`. The routes count in `mimic_ui_requests_total` by
+    route pattern (`/v1/map`, `/ui/map`) and the render in `mimic_ui_render_duration_seconds`.
 - **Swagger UI configuration** (in `mimic.js`, nothing inline): `url` = the document route;
   `supportedSubmitMethods: []` (no "Try it out" button, so the UI never sends a request to a
   workload); `tryItOutEnabled: false`; `validatorUrl: null` (no call to
@@ -4400,6 +4450,23 @@ The Load tests tab of §7.5 (*Load tests tab*). Levels as in §12.2.
 | EXP-15 | **I.** `mimic.js` (read as text, UI-09 rules): the Load tests tab no longer shows the placeholder text; it reads `/v1/features`, `/v1/workloads`, `/v1/resources` and the `/loadtests` routes, has the texts `Load testing is disabled`, `No load test runs` and `No such run`, routes `parts[4] === "loadtests"` under `parts[1] === "workloads"`, builds its links through `enc(`, writes the keys of `errors` and `statuses` as text, and contains no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write` or `eval`, and no `http://` or `https://`. |
 | EXP-16 | **E.** Browser (the Chromium of UI-12). On the cluster of `scripts/e2e.sh` (load tests disabled) `/ui/loadtests` shows "Load testing is disabled" and no table, with no CSP violation and no request outside the port-forward. On the cluster of `scripts/e2e-load.sh` (`loadTest.enabled`), `/ui/loadtests` lists runs `ldt16-a` (`Succeeded`, `Completed`) and `ldt16-b` (`Aborted`, `ModeLeft`) of `mck-19/front`, the link of `ldt16-a` opens the run page, which shows the endpoint table; the canary of the credentials Secret appears on neither page. |
 | EXP-17 | **D** (review). `docs/wiki/Reading-the-API.md` documents `/v1/features` and the tab, `docs/wiki/Load-test.md` points to it; `CHANGELOG.md` `[Unreleased]` names the tab; the security review finds no credential value, no markup built from a recorded value and no query value used unvalidated. |
+
+#### Map tab (#468)
+
+The Map tab of §7.5 (*Map tab*); design `docs/design/mimic-mesh.md` §4.4, §17.2. Levels as in
+§12.2. The unit tests are in `mimic-core` `ui::map`.
+
+| ID | Criterion |
+|---|---|
+| EXP-18 | **U.** Graph and resolution: deployments `front` and `users` of `shop`, a Service `users` (`10.96.0.7`) and calls of `front` to `users.shop.svc.cluster.local:8080`, `users.shop.svc:8080` and `10.96.0.7:8080` give one edge `front` → `users` with the three authorities' exchanges and 5xx errors summed and `error_permille` rounded down; `[fd00::7]:80` and `fd00::7` resolve to a Service whose `clusterIP` is `fd00::7`; `users` alone and `users.shop` resolve for `front` only when `users` is a Service or a deployment with data, else are external; `<redacted>:443`, `api.example.com:443`, a name with an upper-case or invalid label and an authority of 300 characters are external leaves (cut at 255); a Service without deployment is a `svc:` node; a call to itself draws no edge; duplicated and re-ordered inputs give the same graph; tunnels are not counted. |
+| EXP-19 | **U.** Not declared: a call from `shop/front` to `risk/scoring` has `declared` false with a snapshot where no `MimicConfig` lists it, where one lists it without a `ReferenceGrant`, and where the `ReferenceGrant` exists but the `MimicConfig` that lists it is not the winner of `front`; it is `true` with a listing by the winner and a grant `from` `shop` (`name` empty or `scoring`); a same-namespace Service, a deployment of the same namespace and an external authority are never flagged; without a snapshot (mesh off or lists incomplete) nothing is flagged. |
+| EXP-20 | **U** (`proptest`). Layout: the same generated graph with its sources, calls, Services and configs in any order gives byte-identical JSON and SVG; every edge between two nodes not on a cycle goes from a lower layer to a higher one; no two boxes overlap and every box lies inside the width and height; a cycle of three deployments, a self call and a node with no edge are laid out; an empty input gives an empty graph and a valid SVG. |
+| EXP-21 | **U.** SVG escaping: authorities and names `<img src=x onerror=alert(1)>`, `"><script>`, `a&b`, `it's`, a control character and `</text>` appear in the SVG only escaped (no `<img`, `<script` or unescaped `"` inside a text or attribute value), the SVG is well-formed (every element closed, only the elements `svg`, `defs`, `marker`, `path`, `g`, `a`, `rect`, `text` and `title`, no `style`, no `on*` attribute, no `xlink`, no `http://` outside the one `xmlns`), a label of 100 characters is cut to 48 ending in `…` on a character boundary (a multi-byte one included), every `href` is `/ui/workloads/<ns>/<dep>` or `/ui/endpoints?deployment=<ns>%2F<dep>`, and a deployment name is never written unencoded in an `href`. |
+| EXP-22 | **U.** Bounds: 1100 deployments give exactly 1000 deployment nodes (the first by name) and drop every edge with a dropped end; 300 external authorities of one deployment give 200 other nodes, the heaviest; 3540 edges between 60 deployments give 2000 edges, the heaviest; in each case `dropped.nodes` and `dropped.edges` are exact and the SVG says what was dropped; 200 deployments with 5 outbound authorities each are built, laid out and rendered (JSON and SVG) in at most 200 ms (the figure of the day is recorded on the PR). |
+| EXP-23 | **I** (real Valkey). `GET /v1/map` with `front` (outbound `users.<ns>.svc:8080`, one 500 among 4 exchanges, each recorded 1000 times so that the edge outweighs those of a shared store, and `api.example.com:443`) and `users` stored and a hub holding the Service `users`: `200` `application/json` with the nodes `dep:<ns>/front`, `dep:<ns>/users`, `ext:api.example.com:443`, the edge `front` → `users` with `exchanges` 4000, `errors` 1000, `error_permille` 250, `declared` true and the two `href`s above; `?format=svg` is `200` `image/svg+xml` holding the same labels; a stored redacted host (`<redacted>:443`, the one stored authority with markup characters) is escaped in the SVG and unchanged in the JSON; a cross-namespace Service call is `declared` false with a ready hub and true without a hub; a deployment with no outbound data is a node with no edge; `400` for `?format=png`; `503` with Valkey stopped; `HEAD`, `405` and the `403` cases of UI-07 and the UI-08 headers hold; `mimic_ui_requests_total` holds `/v1/map` and `/ui/map` and no name of the request. |
+| EXP-24 | **I.** `mimic.js` (read as text, UI-09 rules): the Map tab no longer shows the placeholder text; it reads `/v1/map?format=svg`, parses with `DOMParser`, copies allowlisted elements and attributes, accepts an `href` only under `/ui/`, has the text `No calls recorded`, and contains no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write` or `eval`, and no `http://` or `https://` (the namespace of the copied elements is the one of the parsed document). |
+| EXP-25 | **E.** Browser (the Chromium of UI-12), after EGR-19 on the cluster of `scripts/e2e.sh`: `/ui/map` shows a node `front` of `egr-19` and a node `users` of `disc-22`, the edge between them with its exchange count, a link on `front` to its deployment page and a link on the edge to `/ui/endpoints?deployment=egr-19%2Ffront`; no CSP violation, no request outside the port-forward. |
+| EXP-26 | **D** (review). `docs/wiki/Reading-the-API.md` describes the Map tab, its edges (totals, 5xx share), the resolution rules, the "not declared" flag and the bounds; `CHANGELOG.md` `[Unreleased]` names the tab; the security review of #468 finds every label escaped and bounded, the SVG rebuilt from an allowlist in the browser, the graph bounded, and no new permission or Kubernetes call. |
 
 ### 12.18 Production values (#438)
 
