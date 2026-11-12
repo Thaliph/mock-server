@@ -2517,8 +2517,16 @@ no insignificant whitespace):
   `:authority` it sent, never the pod's address), the `dst` of the access line stays the
   original destination, and the line gains `backend` (`<namespace>/<name>:<port>` of the
   Service port) and `upstream` (`<pod IP>:<port>`), absent on lines of relayed connections. No
-  header is added to a request or a response. A connection stays on the path it started on when
-  the view, the kill switches or the mode change; the next connection takes the new one.
+  header is added to a request or a response. The **mode applies per request** on a
+  mesh-routed connection, as it does on the byte relay (§8 "Switching"): while it is `mock`, each
+  request is answered by the mock exactly as on the byte relay (same matching, recording of
+  misses, `mimic_mock_*` metrics, nothing sent to a pod or the ClusterIP; a passthrough
+  destination is never mocked); when it leaves `mock` the next request of the same connection is
+  balanced again; and in `none` or `discovery` recording follows the mode for each exchange (§3).
+  The view applies per request too: a request finding the view stale, or `"mesh": false` since the
+  connection was routed, goes to the ClusterIP like a fallback; a kill switch thus never leaves a
+  connection erroring. Whether a connection is mesh-routed is decided when it is accepted (a
+  connection on the byte relay stays on it).
   A request whose pooled connection the pod had closed before the request was written (nothing
   was sent) is sent once more on a new connection to the
   same pod, whatever its method, and counted in `mimic_mesh_reconnects_total`; it is not a retry
@@ -4657,6 +4665,7 @@ MSH-18 to MSH-30 are #441 (the watches, the route, the chart), MSH-31 to MSH-42 
 | MSH-58 | **I.** A server that speaks first, behind an in-scope Service port: on an opaque port the client has the banner at once and no pod of the view is used; on another port the banner reaches the client in under 300 ms (not 1 s) through the byte relay to the original destination, the bytes are unchanged both ways, and no pod is used. HTTP on a non-opaque port is balanced as in MSH-48. |
 | MSH-59 | **I.** A pod that closes its connections right after each answer, and one that closes them when idle: 200 sequential requests on one client connection all succeed. A pod that reads a request head and closes without answering: the request is not sent again (the pod sees it once), the client's connection is closed without an answer, `mimic_mesh_requests_total` counts it with `status_class="none"` and `mimic_mesh_reconnects_total` stays 0. A pooled connection that fails before anything is written (driven through a hook that hands out an already closed connection), HTTP/1 and `h2c`: the request is sent once more on a new connection (HTTP/2: not the one that failed) and answered, the pod sees it once, `mimic_mesh_reconnects_total` is 1. |
 | MSH-61 | **I.** Fallback: with the only endpoint refusing connections and the ClusterIP answering, every request is answered by the ClusterIP and `mimic_mesh_fallbacks_total` counts them (access line `upstream` the ClusterIP); with two endpoints, one refusing, every request is answered by the other and no fallback is counted; with the ClusterIP refusing too the answer is `503` `connect-failed`. With a view older than `MIMIC_MESH_STALE_AFTER` (200 ms in the test) a new connection and the next request of an open mesh-routed connection are answered by the ClusterIP and no pod of the view is used. |
+| MSH-62 | **I** (in process, the mode flipped as a pull does, `ModeState::observe`). On a mesh-routed connection, HTTP/1 keep-alive and `h2c`, started in `discovery`: a request is balanced to a pod; after the switch to `mock` the next request on the same connection is answered by the mock (`x-mimic-match`, `mimic_mock_requests_total` counts it, no pod and no ClusterIP connection sees it); after the switch back to `discovery` the next request of the same connection is balanced again (the pod got 2 of the 3 requests, one connection to it). A connection to a passthrough destination is never mocked. A request after the view became `"mesh": false` goes to the ClusterIP. |
 | MSH-60 | **I.** After one ordinary request on a mesh-routed HTTP/1 connection, a request with `Upgrade: websocket` goes to a pod of the view; the pod's `101` reaches the client with its headers, bytes then flow both ways untouched (an echo), the access line says `upgrade: true`, closing the client closes the pod's connection, and the pod's connection is not reused. The same for `CONNECT` answered `200`. A pod that declines the upgrade (`200`) leaves a plain keep-alive connection. An HTTP/2 `CONNECT` is answered `501`. |
 
 ## 13. Test strategy
