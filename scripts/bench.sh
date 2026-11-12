@@ -7,7 +7,8 @@
 #
 # Environment (defaults in brackets):
 #   CLUSTER=mimic-bench            kind cluster: created when absent, reused otherwise
-#   SETUPS="plain discovery"       plain: no sidecar; discovery: the sidecar in discovery mode
+#   SETUPS="plain none discovery"  plain: no sidecar; none: the sidecar in mode none (proxy only, M0);
+#                                  discovery: the sidecar in discovery mode
 #   PROTOCOLS="http1 h2c"          HTTP/1.1 keep-alive; h2c (HTTP/2 over cleartext)
 #   RATES="50 100 200"             requests per second, each 1 to 200
 #   DURATION=30s                   one fortio run, 1 to 300 s
@@ -34,7 +35,7 @@ case $# in
 esac
 
 CLUSTER=${CLUSTER-mimic-bench}
-SETUPS=${SETUPS-"plain discovery"}
+SETUPS=${SETUPS-"plain none discovery"}
 PROTOCOLS=${PROTOCOLS-"http1 h2c"}
 RATES=${RATES-"50 100 200"}
 DURATION=${DURATION-30s}
@@ -70,7 +71,7 @@ read -ra RATE_LIST <<<"$RATES"
 ((${#PROTOCOL_LIST[@]} > 0)) || config_error PROTOCOLS "empty"
 ((${#RATE_LIST[@]} > 0)) || config_error RATES "empty"
 for setup in "${SETUP_LIST[@]}"; do
-  contains "$setup" plain discovery || config_error SETUPS "$setup is not plain or discovery"
+  contains "$setup" plain none discovery || config_error SETUPS "$setup is not plain, none or discovery"
 done
 for protocol in "${PROTOCOL_LIST[@]}"; do
   contains "$protocol" http1 h2c || config_error PROTOCOLS "$protocol is not http1 or h2c"
@@ -105,7 +106,7 @@ SKIP_BUILD=${SKIP_BUILD-0}
 
 # The setups run in this order whatever the order of SETUPS: plain first, then the namespace is labelled.
 ORDERED_SETUPS=()
-for setup in plain discovery; do
+for setup in plain none discovery; do
   contains "$setup" "${SETUP_LIST[@]}" && ORDERED_SETUPS+=("$setup")
 done
 
@@ -335,17 +336,18 @@ pod_of() {
   kubectl -n "$NS" get pods -l "app=$1" -o jsonpath='{.items[0].metadata.name}'
 }
 
-# prepare_setup <setup>: plain runs without the sidecar, discovery with it (namespace label + restart).
+# prepare_setup <setup>: plain runs without the sidecar, none and discovery with it (namespace label, a
+# MimicWorkload of that mode, restart).
 prepare_setup() {
-  if [[ $1 == discovery ]]; then
+  if [[ $1 != plain ]]; then
     kubectl label --overwrite namespace "$NS" mimic.platform.io/inject=enabled
-    # A deployment injected by label alone is in mode none since M0: this setup records.
+    # The mode is explicit: a deployment injected by label alone is in none since M0.
     for app in fortio-server fortio-client; do
       kubectl apply -f - <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: $app, namespace: $NS}
-spec: {deployment: $app, mode: discovery}
+spec: {deployment: $app, mode: $1}
 YAML
     done
     sleep 5
@@ -356,7 +358,7 @@ YAML
   local pod containers
   for pod in "$(pod_of fortio-server)" "$(pod_of fortio-client)"; do
     containers=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.initContainers[*].name}')
-    if [[ $1 == discovery ]] && ! grep -qw mimic-sidecar <<<"$containers"; then
+    if [[ $1 != plain ]] && ! grep -qw mimic-sidecar <<<"$containers"; then
       echo "FAIL $pod has no mimic-sidecar" >&2
       exit 1
     fi
@@ -406,7 +408,7 @@ run_one() {
   fortio_args "$protocol" "$rate"
   caller=$(pod_of fortio-client)
   callee=$(pod_of fortio-server)
-  if [[ $setup == discovery ]]; then
+  if [[ $setup != plain ]]; then
     cb=$(scrape "$caller" process_cpu_seconds_total)
     callee_before=$(scrape "$callee" process_cpu_seconds_total)
   fi
@@ -414,7 +416,7 @@ run_one() {
   raw=$(kubectl -n "$NS" exec "$caller" -c fortio -- /usr/bin/fortio "${FORTIO_ARGS[@]}" 2>>"$WORK/fortio.log") \
     || { echo "FAIL fortio run $index failed, see $WORK/fortio.log" >&2; exit 1; }
   jq -e '.DurationHistogram.Count' <<<"$raw" >/dev/null || { echo "FAIL run $index printed no fortio JSON" >&2; exit 1; }
-  if [[ $setup == discovery ]]; then
+  if [[ $setup != plain ]]; then
     ca=$(scrape "$caller" process_cpu_seconds_total)
     cr=$(scrape "$caller" process_resident_memory_bytes)
     caller_json=$(sidecar_json "$cb" "$ca" "$cr" "$DURATION_S")
