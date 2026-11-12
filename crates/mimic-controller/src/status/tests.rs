@@ -617,13 +617,31 @@ async fn mck_09_status_mode_counts_the_pods_following_the_mode_and_the_others() 
 }
 
 #[tokio::test]
+async fn non_06_status_mode_counts_the_pods_in_none() {
+    let ns = unique("non06");
+    let mut s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
+    s.reconciler.window = Duration::from_secs(10);
+    let now = now_ms();
+    pulled(&ns, "front", "front-a", &format!("none {now}")).await;
+    pulled(&ns, "front", "front-b", &format!("none {now}")).await;
+    pulled(&ns, "front", "front-c", &format!("discovery {now}")).await;
+    s.reconciler.tick(now).await;
+    let modes = s.sink.modes();
+    assert_eq!(modes.len(), 1);
+    assert_eq!(
+        modes[0].2,
+        json!({"mode": "none", "pods": 2, "otherPods": 1})
+    );
+}
+
+#[tokio::test]
 async fn mck_09_a_deployment_without_pulls_gets_its_mode_and_zero_counts() {
     let ns = unique("mck09");
     let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
     s.reconciler.tick(now_ms()).await;
     assert_eq!(
         s.sink.modes()[0].2,
-        json!({"mode": "discovery", "pods": 0, "otherPods": 0})
+        json!({"mode": "none", "pods": 0, "otherPods": 0})
     );
 }
 

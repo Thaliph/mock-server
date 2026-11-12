@@ -17,10 +17,21 @@ fn workload(s: &Setup, namespace: &str, name: &str, mock: bool, factor: u32) {
         name,
         MockSettings {
             mock,
+            discovery: !mock,
             factor,
             passthrough: Vec::new(),
         },
     );
+}
+
+/// Sets `spec.mode` of a `MimicWorkload` naming `pay` to `none`.
+fn silent_workload(s: &Setup, namespace: &str, name: &str) {
+    s.api
+        .workloads
+        .apply(namespace, name, "pay", vec![], vec![]);
+    s.api
+        .workloads
+        .set_mock(namespace, name, MockSettings::default());
 }
 
 fn modes(answer: &Pulled) -> (Option<&str>, Option<&str>) {
@@ -96,6 +107,47 @@ async fn mck_08_200_and_304_carry_the_mode_outside_the_etag() {
     let other = request(&s.router, Method::GET, Some(&tok), "pay", "?format=1", None).await;
     assert_eq!(other.status, 200);
     assert_eq!(modes(&other), (Some("discovery"), None));
+}
+
+#[tokio::test]
+async fn non_06_a_deployment_without_a_workload_is_none_and_follows_its_workloads() {
+    let s = setup(Options::default());
+    push_report(&s, "pay", SESSION, 1, &outbound_report(&[AUTHORITY])).await;
+
+    // No `MimicWorkload`: `none`, and no factor.
+    let first = pull(&s, "pay", None).await;
+    assert_eq!(first.status, 200, "{}", first.text());
+    assert_eq!(modes(&first), (Some("none"), None));
+    let held = first.etag();
+
+    // A `MimicWorkload` saying `none` changes nothing.
+    silent_workload(&s, &s.ns, "pay-workload");
+    let same = pull(&s, "pay", Some(&held)).await;
+    assert_eq!((same.status, modes(&same)), (304, (Some("none"), None)));
+
+    // `discovery`, then `mock`, then the workload deleted: every answer keeps the ETag.
+    workload(&s, &s.ns, "pay-workload", false, 100);
+    let discovery = pull(&s, "pay", Some(&held)).await;
+    assert_eq!(
+        (discovery.status, discovery.etag(), modes(&discovery)),
+        (304, held.clone(), (Some("discovery"), None))
+    );
+    workload(&s, &s.ns, "pay-workload", true, 100);
+    let mock = pull(&s, "pay", Some(&held)).await;
+    assert_eq!(
+        (mock.status, modes(&mock)),
+        (304, (Some("mock"), Some("1")))
+    );
+    s.api.workloads.remove(&s.ns, "pay-workload");
+    let gone = pull(&s, "pay", Some(&held)).await;
+    assert_eq!((gone.status, modes(&gone)), (304, (Some("none"), None)));
+
+    // `:pulls` records the mode the pod was told.
+    let found = pulls_when(&s, "pay", |p| {
+        p.values().any(|field| field.starts_with("none "))
+    })
+    .await;
+    assert!(found.values().all(|field| !field.starts_with("turbo ")));
 }
 
 #[tokio::test]
