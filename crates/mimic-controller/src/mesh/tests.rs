@@ -549,6 +549,10 @@ async fn msh_26_a_truncated_view_is_counted_and_warned_once_per_build_not_per_re
         .collect();
     assert_eq!(warns.len(), 1, "one WARN per build");
     assert!(warns[0].contains(r#""left_out":3"#) && warns[0].contains(r#""namespace":"shop""#));
+    assert!(
+        warns[0].contains(r#""skipped":"shop/c,shop/d,shop/e""#),
+        "the WARN names the Services left out"
+    );
 }
 
 #[tokio::test]

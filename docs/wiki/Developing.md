@@ -55,6 +55,40 @@ cargo test --workspace
 Run all three checks before pushing. Chart changes: `helm lint --strict deploy/helm/mimic`. Workflow
 changes: `zizmor --offline .github/workflows`. Image, chart or cluster changes: `scripts/e2e.sh`.
 
+### Local image builds and the build cache
+
+The build stage of the `Dockerfile` keeps the Rust target in a cache mount (`/src/target`) that every
+local build on the daemon shares: there is no per-checkout key. Cargo decides freshness by mtime, and
+`COPY` keeps the checkout's mtimes, so a build could reuse artifacts another source tree left in the
+cache (#496). The build therefore touches every file under `crates/` to the build time right before
+`cargo build`. Sources are then never older than a cached artifact.
+
+The trade-off: every local build that runs the build stage recompiles the workspace crates (`mimic-*`),
+not the registry dependencies. The root manifests and `Cargo.lock` are not touched on purpose: cargo
+keys the dependencies' artifacts on their versions, features, profile and toolchain, and touching the
+lock file made it recompile the dependencies too. A per-checkout cache key was the other option; it
+would make every branch and every edit start cold. CI and the release build start from an empty cache
+and are not affected.
+
+Measured on a 12-core machine with the local cache warm (#496):
+
+| Local build | Original `Dockerfile` | With the touch |
+|---|---|---|
+| Same tree, nothing changed | 4 s (image layer cache) | 4 s |
+| Another tree (another branch) | wrong code (reused artifacts) | 108 s |
+| One line changed in `mimic-trust` | 30 s | 123 s |
+| Empty cache | about 5 min | about 5 min |
+
+The two-tree check, run by hand after a change to the `Dockerfile` or to the build stage:
+
+```bash
+scripts/check-build-cache.sh   # builds two trees of the working copy on this daemon; asserts each runs its own code
+```
+
+It takes two image builds (minutes) and is not part of CI. The cache is shared, so a run next to
+`scripts/e2e.sh` slows both down. Local builds with a `Dockerfile` from before this change still reuse
+the cache without the touch: the check fails for them, until their branch has this change.
+
 ### Tests that need Valkey
 
 The store, push API and read API integration tests use a real Valkey 9.0 or later whose URL is in
