@@ -1548,7 +1548,7 @@ fn grp_41_a_stream_is_the_first_frame_then_the_steps() {
     }
     assert_eq!(
         steps.iter().map(|s| s.delay_ms).collect::<Vec<_>>(),
-        [108, 108, 305]
+        [107, 107, 304]
     );
     // The length is not announced, and the trailers are the unary ones.
     assert_eq!(header(&response, "content-length"), None);
@@ -1576,10 +1576,10 @@ fn grp_41_a_sample_without_a_stream_is_answered_as_before() {
 
 #[test]
 fn grp_41_offsets_are_the_scaled_delays_summed_and_capped() {
-    assert_eq!(offsets(&[108, 108, 305], 100), [108, 216, 521]);
-    assert_eq!(offsets(&[108, 108, 305], 250), [270, 540, 1303]);
-    assert_eq!(offsets(&[108, 108, 305], 0), [0, 0, 0]);
-    assert_eq!(offsets(&[108, 108, 305], 10_000), [10_800, 21_600, 52_100]);
+    assert_eq!(offsets(&[107, 107, 304], 100), [107, 214, 518]);
+    assert_eq!(offsets(&[107, 107, 304], 250), [268, 536, 1296]);
+    assert_eq!(offsets(&[107, 107, 304], 0), [0, 0, 0]);
+    assert_eq!(offsets(&[107, 107, 304], 10_000), [10_700, 21_400, 51_800]);
     assert_eq!(
         offsets(&[131_072, 131_072, 131_072], 10_000),
         [300_000, 300_000, 300_000]

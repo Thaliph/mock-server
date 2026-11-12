@@ -227,11 +227,10 @@ async fn grp_42_a_server_stream_is_relayed_unchanged_and_recorded_as_steps() {
     assert_eq!(trailers.get("grpc-status").unwrap(), "0");
     assert_eq!(trailers.get("x-trace-bin").unwrap(), "Q0FOQVJZVFJBQ0U");
     assert_eq!(chunks.len(), 5, "{chunks:?}");
-    for pair in chunks.windows(2) {
-        let gap = pair[1].0 - pair[0].0;
-        assert!(gap >= GAP - Duration::from_millis(20), "{gap:?}");
-        assert!(gap <= GAP + Duration::from_millis(100), "{gap:?}");
-    }
+    // Paced as the server sent them (a gap may be short when the one before was late).
+    let span = chunks[4].0 - chunks[0].0;
+    assert!(span >= 4 * GAP - Duration::from_millis(50), "{span:?}");
+    assert!(span <= 4 * GAP + Duration::from_millis(150), "{span:?}");
     counted(
         &f.metrics,
         "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"recorded\"} 1",
@@ -249,14 +248,17 @@ async fn grp_42_a_server_stream_is_relayed_unchanged_and_recorded_as_steps() {
     assert_eq!(response["body"]["value"]["2"], "mimic-token");
     let stream = response["stream"].as_array().expect("a stream");
     assert_eq!(stream.len(), 4);
+    let mut total = 0;
     for (i, step) in stream.iter().enumerate() {
         assert_eq!(step["message"]["1"], i as u64 + 2);
         assert_eq!(step["message"]["2"], "mimic-token");
-        // The bucket bound above 100 ms, never the exact time and never less than the gap.
+        // A bucket bound, never the exact time.
         let delay = step["delay_ms"].as_u64().unwrap();
-        assert!((100..=140).contains(&delay), "{delay}");
         assert_eq!(delay, mimic_core::grpc::record::bucketed(delay));
+        total += delay;
     }
+    // The pace of the stream: 4 gaps of 100 ms.
+    assert!((380..=600).contains(&total), "{total}");
     assert_eq!(
         response["trailers"][0],
         serde_json::json!(["grpc-status", "0"])
@@ -301,7 +303,7 @@ async fn grp_42_a_stream_over_256_kib_is_relayed_whole_and_recorded_without_mess
     let f = fixture_discovery(Direction::Inbound, &discovery, move |_| Some(app)).await;
     let mut sender = client(f.addr).await;
     let (_, body, trailers) = call(&mut sender, message(0)).await;
-    assert_eq!(body.len(), 5 * 60_005);
+    assert_eq!(body.len(), 5 * 60_009);
     assert_eq!(trailers.get("grpc-status").unwrap(), "0");
     counted(
         &f.metrics,

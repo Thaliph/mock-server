@@ -9,13 +9,14 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::grpc::record::is_protobuf_media;
+use crate::grpc::record::{MAX_MESSAGES, bucketed, is_protobuf_media, single_message, steps};
 use crate::grpc::redact::{Direction, FieldNames, GrpcRedactor};
 use crate::grpc::wire::Message;
 
 use super::check::Violation;
 use super::observed::{
-    Content, MAX_BODY, Parsed, Seen, body_shape, observe_leaves, observe_pairs, parsed_media,
+    Content, MAX_BODY, Parsed, Seen, body_shape, grpc_redacted, observe_leaves, observe_pairs,
+    parsed_media,
 };
 use super::placeholder::Placeholder;
 use super::redact::{self, Redactor};
@@ -27,6 +28,8 @@ use super::volatile::Volatility;
 pub const MAX_SAMPLES: usize = 20;
 /// Trailers kept per sample (spec §6.4).
 pub const MAX_TRAILERS: usize = 64;
+/// Stream steps kept per sample: the messages after the first (spec §6.4).
+pub const MAX_STEPS: usize = MAX_MESSAGES - 1;
 
 /// A JSON value kept as its canonical text (compact, object keys sorted: what `serde_json`
 /// writes a `Value` as), which costs the length of the text instead of a tree of maps and
@@ -210,6 +213,65 @@ struct Response {
     /// HTTP/2 trailers, redacted as gRPC metadata; written only when there are some (spec §6.4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     trailers: Vec<(String, String)>,
+    /// The gRPC messages after the first, with their bucketed delays (spec §6.4); written only
+    /// when there are some.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stream: Vec<Step>,
+}
+
+/// A response message after the first of a gRPC stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Step {
+    /// The time since the message before it, at the upper bound of its latency bucket.
+    delay_ms: u64,
+    message: Text,
+}
+
+/// A gRPC message as its canonical JSON read again and redacted (spec §6.3); what is not a
+/// message is the secret placeholder.
+fn redact_message(redactor: &Redactor, message: &Text) -> Text {
+    let redacted = Message::from_json(&message.value())
+        .ok()
+        .and_then(|m| grpc_redacted(redactor, &m));
+    Text::new(&redacted.unwrap_or_else(|| Value::String(Placeholder::Secret.to_string())))
+}
+
+/// The steps of a gRPC stream (spec §6.4): the messages after the first of the response, read
+/// and redacted as the first is, within 256 KiB of canonical JSON with it.
+fn stream_steps(
+    redactor: &Redactor,
+    o: &super::observed::Observation<'_>,
+    first: Option<&Body>,
+) -> Vec<Step> {
+    let (Some(first), Some(request), Some(response)) = (first, o.req_body, o.resp_body) else {
+        return Vec::new();
+    };
+    if !is_protobuf_media(&first.media) || !single_message(request) {
+        return Vec::new();
+    }
+    let encoding = o
+        .resp_headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("grpc-encoding"))
+        .map(|(_, v)| *v);
+    let mut size = first.value.len();
+    let mut out = Vec::new();
+    for step in steps(encoding, response, o.resp_marks) {
+        let Some(value) = grpc_redacted(redactor, &step.message) else {
+            break;
+        };
+        let message = Text::new(&value);
+        size = size.saturating_add(message.len());
+        if size > MAX_BODY {
+            break;
+        }
+        out.push(Step {
+            delay_ms: step.delay_ms,
+            message,
+        });
+    }
+    out
 }
 
 /// One redacted exchange.
@@ -290,11 +352,13 @@ impl Sample {
             headers: pairs(header_pairs(response_redactor, o.resp_headers)),
             body: body(response_body),
             trailers: pairs(header_pairs(response_redactor, o.resp_trailers)),
+            stream: Vec::new(),
         };
         if grpc_call(&request.headers) {
             bin_values(request_redactor, &mut request.headers);
             bin_values(response_redactor, &mut response.headers);
             bin_values(response_redactor, &mut response.trailers);
+            response.stream = stream_steps(response_redactor, o, response.body.as_ref());
         } else {
             response.trailers.clear();
         }
@@ -392,7 +456,8 @@ impl Sample {
     /// The gRPC response messages after the first: the bucketed delay since the message before
     /// and the canonical JSON (spec §6.4).
     pub fn response_stream(&self) -> Vec<(u64, Value)> {
-        Vec::new()
+        let step = |s: &Step| (s.delay_ms, s.message.value());
+        self.response.stream.iter().map(step).collect()
     }
 
     /// The response trailers, redacted (HTTP/2, gRPC).
@@ -404,6 +469,7 @@ impl Sample {
     /// does not know (spec §6.4): the report that holds it is version 3.
     pub fn is_grpc(&self) -> bool {
         !self.response.trailers.is_empty()
+            || !self.response.stream.is_empty()
             || [&self.request.body, &self.response.body]
                 .into_iter()
                 .flatten()
@@ -415,6 +481,7 @@ impl Sample {
     pub(super) fn without_grpc(&self) -> (u64, Sample) {
         let mut sample = self.clone();
         sample.response.trailers.clear();
+        sample.response.stream.clear();
         for body in [&mut sample.request.body, &mut sample.response.body] {
             if body.as_ref().is_some_and(|b| is_protobuf_media(&b.media)) {
                 *body = None;
@@ -443,6 +510,7 @@ impl Sample {
         if self.response.trailers.len() > MAX_TRAILERS {
             return Err(Violation::Malformed);
         }
+        self.check_stream()?;
         // `bytes` is what the sample budget counts: it must be the size of the content.
         let total = serde_json::to_vec(self).map_or(usize::MAX, |v| v.len());
         let digits = |n: String| n.len();
@@ -457,6 +525,33 @@ impl Sample {
             .saturating_add(2);
         if content != self.bytes {
             return Err(Violation::SampleBytes);
+        }
+        Ok(())
+    }
+
+    /// The steps of a stream (spec §7.3): at most 63, after a gRPC response message, at bucket
+    /// delays, and within 256 KiB with the first message.
+    fn check_stream(&self) -> Result<(), Violation> {
+        let stream = &self.response.stream;
+        if stream.is_empty() {
+            return Ok(());
+        }
+        let first = self
+            .response
+            .body
+            .as_ref()
+            .filter(|b| is_protobuf_media(&b.media));
+        let Some(first) = first else {
+            return Err(Violation::Malformed);
+        };
+        if stream.len() > MAX_STEPS || stream.iter().any(|s| bucketed(s.delay_ms) != s.delay_ms) {
+            return Err(Violation::Malformed);
+        }
+        let size = stream
+            .iter()
+            .fold(first.value.len(), |n, s| n.saturating_add(s.message.len()));
+        if size > MAX_BODY {
+            return Err(Violation::BodySize);
         }
         Ok(())
     }
@@ -495,6 +590,9 @@ impl Sample {
         }
         if let Some(body) = &mut self.response.body {
             body.redact(response_redactor);
+        }
+        for step in &mut self.response.stream {
+            step.message = redact_message(response_redactor, &step.message);
         }
         let changed = before != (self.request.clone(), self.response.clone());
         if changed {

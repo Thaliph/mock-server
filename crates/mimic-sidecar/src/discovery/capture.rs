@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 
 use mimic_core::discovery::report::Direction;
+use mimic_core::grpc::record::Mark;
 use mimic_core::proxy::http1::Captured;
 
 use super::metrics::DiscoveryMetrics;
@@ -144,6 +145,8 @@ pub(super) struct Record {
     pub(super) response: Part,
     /// The response trailers as header lines (gRPC, spec §6.4).
     pub(super) response_trailers: Vec<u8>,
+    /// When the bytes of a gRPC response arrived (spec §6.4).
+    pub(super) response_marks: Vec<Mark>,
     _reservation: Reservation,
 }
 
@@ -192,12 +195,28 @@ pub(crate) struct Capture {
     request_total: Option<u64>,
     response_total: Option<u64>,
     response_trailers: Vec<u8>,
+    response_marks: Vec<Mark>,
 }
 
 /// Most bytes of response trailers kept (spec §6.4).
 const MAX_TRAILERS: usize = 16 * 1024;
+/// Most arrival marks kept for one streamed response (spec §6.4).
+const MAX_MARKS: usize = 256;
 
 impl Capture {
+    /// `end` bytes of the response body have arrived `ms` milliseconds after its head. Marks
+    /// of one millisecond are one; past the limit, or the budget, the last mark grows to cover
+    /// what arrives, so the pace of the rest is lost and never its order.
+    pub(crate) fn mark(&mut self, end: usize, ms: u64) {
+        let full = self.response_marks.len() >= MAX_MARKS
+            || self.response_marks.last().is_some_and(|m| m.ms == ms);
+        if let Some(last) = self.response_marks.last_mut().filter(|_| full) {
+            last.end = end;
+        } else if self.reservation.grow(std::mem::size_of::<Mark>()) {
+            self.response_marks.push(Mark { end, ms });
+        }
+    }
+
     /// The response trailers as `name: value` lines; dropped when over the limit or the budget.
     pub(crate) fn trailers(&mut self, lines: Vec<u8>) {
         if lines.len() <= MAX_TRAILERS && self.reservation.grow(lines.len()) {
@@ -327,6 +346,7 @@ impl Tap {
             request_total: None,
             response_total: None,
             response_trailers: Vec::new(),
+            response_marks: Vec::new(),
         }
     }
 
@@ -376,6 +396,7 @@ impl Tap {
                 Part::Absent
             },
             response_trailers: capture.response_trailers,
+            response_marks: capture.response_marks,
             _reservation: capture.reservation,
         };
         if self.queue.try_send(Item::Exchange(record)).is_err() {

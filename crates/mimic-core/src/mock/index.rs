@@ -17,6 +17,7 @@ use crate::discovery::template::split_path;
 use crate::grpc::frame::encode_frame;
 use crate::grpc::wire::Message;
 
+use super::Step;
 use super::signature::{Fields, Hashed, Signature, signature};
 use super::{Answer, Hit, Miss, Request, Response, Tier};
 
@@ -154,13 +155,27 @@ fn grpc_answer(sample: &Sample) -> Answer {
         None if status == "0" => Box::new(EMPTY_MESSAGE),
         None => Box::default(),
     };
+    // The messages after the first, as frames of their own; the list ends at one that does not
+    // encode (the recorder wrote canonical messages, so none).
+    let steps = sample
+        .response_stream()
+        .into_iter()
+        .map_while(|(delay_ms, json)| {
+            let payload = Message::from_json(&json).ok()?.encode().ok()?;
+            let frame = encode_frame(false, &payload).ok()?;
+            Some(Step {
+                delay_ms,
+                frame: frame.into(),
+            })
+        })
+        .collect();
     Answer {
         status: 200,
         headers,
         body,
         grpc: true,
         trailers,
-        steps: Vec::new(),
+        steps,
     }
 }
 
@@ -470,7 +485,10 @@ pub(super) fn respond(answer: &Arc<Answer>, tier: Tier, method: &str) -> Respons
         .iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect();
-    headers.push(("content-length".to_string(), length.to_string()));
+    // The length of a stream is not announced (spec §8).
+    if bodiless || answer.steps.is_empty() {
+        headers.push(("content-length".to_string(), length.to_string()));
+    }
     headers.push(("x-mimic-match".to_string(), tier.as_str().to_string()));
     let trailers = answer
         .trailers

@@ -159,9 +159,23 @@ Fields that hold more than one value are arrays; a field that is not a string or
 with one key that starts with `$` (`{"$bytes": "<base64>"}`, `{"$fixed32": n}`, `{"$fixed64": n}`). A
 message that is compressed with an encoding other than `gzip`, over 256 KiB, or not a protobuf message
 is left out (`mimic_discovery_bodies_total{result}` says which: `opaque`, `too_large`, `encoding`).
-Streams are recorded by their first message; a mock replays the response message of a unary call
+A mock replays the response message of a unary call and the sequence of a server stream
 (see [Mock mode](Mock-mode)). The OpenAPI document of a gRPC operation shows the message as an
 `application/grpc` request and response with the field numbers as property names.
+
+**Server streaming.** When the request holds exactly one message, the response messages after the first
+(at most 63, so 64 in all, and 256 KiB of JSON together) are the `stream` of the response, a list of
+`{"delay_ms": 108, "message": {...}}`: each message is redacted exactly like the first, and `delay_ms` is the
+time since the message before it, rounded up to the bound of its latency bucket (`0`, `1`, `2`, ... `54`, `108`,
+`216`...: never an exact time). A client-streaming or bidirectional call is recorded by its first messages as
+above and has no `stream`. Only the report (and its `format` 2 egress set) holds the steps; the OpenAPI
+document shows the first message.
+
+```json
+"response": {"status": 200, "body": {"media": "application/grpc", "value": {"1": 1}},
+             "stream": [{"delay_ms": 108, "message": {"1": 2}}, {"delay_ms": 108, "message": {"1": 3}}],
+             "trailers": [["grpc-status", "0"]]}
+```
 
 A report that holds no gRPC message is the same as before, and the controller keeps serving sidecars of
 earlier versions: the egress set (`/egress`, a sidecar's view of the calls its app makes) is served as

@@ -135,6 +135,11 @@ impl Answer {
         std::mem::size_of::<Self>()
             + self.body.len()
             + self
+                .steps
+                .iter()
+                .map(|s| std::mem::size_of::<Step>() + s.frame.len())
+                .sum::<usize>()
+            + self
                 .headers
                 .iter()
                 .chain(&self.trailers)
@@ -178,6 +183,28 @@ impl Response {
 /// copying them.
 #[derive(Debug, Clone)]
 pub struct SharedBody(Arc<Answer>);
+
+impl SharedBody {
+    /// The messages after the first of a streamed answer.
+    pub fn steps(&self) -> &[Step] {
+        &self.0.steps
+    }
+
+    /// The frame of step `index`, as an owner of the shared answer: no copy.
+    pub fn frame(&self, index: usize) -> Option<SharedFrame> {
+        (index < self.0.steps.len()).then(|| SharedFrame(Arc::clone(&self.0), index))
+    }
+}
+
+/// The frame of one step, handed to a transport without copying it.
+#[derive(Debug, Clone)]
+pub struct SharedFrame(Arc<Answer>, usize);
+
+impl AsRef<[u8]> for SharedFrame {
+    fn as_ref(&self) -> &[u8] {
+        self.0.steps.get(self.1).map_or(&[], |s| &s.frame)
+    }
+}
 
 impl AsRef<[u8]> for SharedBody {
     fn as_ref(&self) -> &[u8] {

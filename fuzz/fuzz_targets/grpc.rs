@@ -12,7 +12,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use mimic_core::grpc::record::first_message;
+use mimic_core::grpc::record::{Mark, bucketed, first_message, single_message, steps};
 use mimic_core::grpc::frame::{Encoding, Frame, FrameError, HEADER, MAX_MESSAGE, Parser, Payload};
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::grpc::redact::{Direction, FieldNames, FieldRule, GrpcRedactor};
@@ -73,9 +73,33 @@ fn first(data: &[u8]) {
     }
 }
 
+/// The steps of a streamed body (GRP-47): at most 63, every delay a bucket bound, whatever the
+/// bytes, the encoding and the order of the marks.
+fn steps_of(data: &[u8]) {
+    let (head, body) = data.split_at(data.len().min(16));
+    let marks: Vec<Mark> = head
+        .chunks(2)
+        .map(|c| Mark {
+            end: usize::from(c[0]) * body.len() / 128,
+            ms: u64::from(*c.get(1).unwrap_or(&0)) * 997,
+        })
+        .collect();
+    let _ = single_message(body);
+    for encoding in [None, Some("gzip"), Some("br")] {
+        let found = steps(encoding, body, &marks);
+        assert!(found.len() <= 63);
+        for step in &found {
+            assert_eq!(bucketed(step.delay_ms), step.delay_ms);
+        }
+        // Without marks there is no delay.
+        assert!(steps(encoding, body, &[]).iter().all(|s| s.delay_ms == 0));
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     payload(data);
     first(data);
+    steps_of(data);
 
     let (cuts, bytes) = data.split_at(data.len().min(4));
     let (whole, whole_end) = stream(&mut Parser::new(), &[bytes]);

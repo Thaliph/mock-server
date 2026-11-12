@@ -71,7 +71,7 @@ fn grp_38_steps_are_the_messages_after_the_first_with_bucketed_delays() {
         (ends[4], 400),
     ]);
     let found = steps(None, &bytes, &marks);
-    assert_eq!(delays(&found), [54, 54, 0, 305]);
+    assert_eq!(delays(&found), [53, 53, 0, 304]);
     let messages: Vec<Message> = found.into_iter().map(|s| s.message).collect();
     assert_eq!(messages, five()[1..]);
     assert_eq!(first_message(None, &bytes).expect("reads"), num(1));
@@ -90,7 +90,7 @@ fn grp_38_chunks_that_hold_several_frames_or_part_of_one() {
         (ends[1], 110),
         (bytes.len(), 110),
     ]);
-    assert_eq!(delays(&steps(None, &bytes, &split)), [108, 0, 0, 0]);
+    assert_eq!(delays(&steps(None, &bytes, &split)), [107, 0, 0, 0]);
     // No marks: no delay.
     assert_eq!(delays(&steps(None, &bytes, &[])), [0, 0, 0, 0]);
 }
@@ -150,7 +150,17 @@ fn grp_38_what_cannot_be_read_ends_the_list() {
 
 #[test]
 fn grp_38_bucketed_delays() {
-    for (ms, want) in [(0, 0), (1, 1), (2, 2), (50, 54), (100, 108), (300, 305)] {
+    for (ms, want) in [
+        (0, 0),
+        (1, 1),
+        (2, 2),
+        (50, 53),
+        (100, 107),
+        (300, 304),
+        (5, 5),
+        (6, 6),
+        (7, 8),
+    ] {
         assert_eq!(bucketed(ms), want, "{ms}");
     }
     for ms in [131_073, 1 << 40, u64::MAX] {
@@ -283,10 +293,10 @@ fn grp_39_a_server_stream_is_the_first_message_and_steps() {
     assert_eq!(
         stream_of(&report),
         serde_json::json!([
-            {"delay_ms": 54, "message": {"1": 2}},
-            {"delay_ms": 54, "message": {"1": 3}},
+            {"delay_ms": 53, "message": {"1": 2}},
+            {"delay_ms": 53, "message": {"1": 3}},
             {"delay_ms": 0, "message": {"1": 4}},
-            {"delay_ms": 305, "message": {"1": 5}},
+            {"delay_ms": 304, "message": {"1": 5}},
         ])
     );
     assert_eq!(

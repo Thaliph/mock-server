@@ -325,14 +325,22 @@ fn named_secret(redactor: &Redactor, field: &str) -> Option<String> {
     None
 }
 
-/// The canonical JSON of the redacted first message of a gRPC body (spec §6.4).
-fn grpc_value(redactor: &Redactor, encoding: Option<&str>, body: &[u8]) -> Option<Value> {
+/// The canonical JSON of the redacted message, as §6.4 keeps it.
+pub(super) fn grpc_redacted(
+    redactor: &Redactor,
+    message: &crate::grpc::wire::Message,
+) -> Option<Value> {
     use crate::grpc::redact::{Direction, FieldNames, GrpcRedactor};
-    let message = crate::grpc::record::first_message(encoding, body).ok()?;
     let redacted = GrpcRedactor::new(redactor.clone(), Vec::new())
-        .message("", Direction::Request, &message, &FieldNames::new())
+        .message("", Direction::Request, message, &FieldNames::new())
         .ok()?;
     Some(redacted.to_json())
+}
+
+/// The canonical JSON of the redacted first message of a gRPC body (spec §6.4).
+fn grpc_value(redactor: &Redactor, encoding: Option<&str>, body: &[u8]) -> Option<Value> {
+    let message = crate::grpc::record::first_message(encoding, body).ok()?;
+    grpc_redacted(redactor, &message)
 }
 
 /// Parses a body (already content-decoded) by its `content-type`; nothing without one.

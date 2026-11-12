@@ -342,7 +342,7 @@ async fn grp_43_a_stream_is_stored_in_the_overlay_only() {
         1
     );
     assert_eq!(parse_outbound(outbound.as_bytes()).unwrap().version(), 2);
-    assert!(overlay.contains("\"stream\"") && overlay.contains("mimic-token"));
+    assert!(overlay.contains("\"stream\"") && overlay.contains("mimic-jwt"));
     assert!(!overlay.contains(JWT) && !overlay.contains("alice\",\"2\":\"eyJ"));
     // The report route answers the union with the steps.
     let merged = String::from_utf8(s.api.store.report(&s.ns, "pay").await.unwrap()).unwrap();

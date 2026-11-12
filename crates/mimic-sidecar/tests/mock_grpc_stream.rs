@@ -171,7 +171,7 @@ async fn grp_44_the_messages_come_in_order_at_the_recorded_pace_then_the_trailer
         ]
     );
     for gap in gaps(&at) {
-        assert!((88..=128).contains(&gap), "{gap}");
+        assert!((87..=127).contains(&gap), "{gap}");
     }
     let trailers = trailers.expect("trailers");
     assert_eq!(trailers["grpc-status"], "0");
@@ -189,7 +189,7 @@ async fn grp_44_the_latency_factor_scales_the_pace() {
     let (_, at, data, _) = replayed(200).await;
     assert_eq!(data.len(), 5);
     for gap in gaps(&at) {
-        assert!((196..=236).contains(&gap), "{gap}");
+        assert!((194..=234).contains(&gap), "{gap}");
     }
     let (_, at, data, trailers) = replayed(0).await;
     assert_eq!(data.len(), 5);
@@ -226,7 +226,7 @@ async fn pending_is_zero_within(rig: &Rig, within: Duration) {
 
 #[tokio::test]
 async fn grp_45_a_reset_stream_stops_the_replay_and_frees_its_slot() {
-    // 540 ms between messages: the cancel comes well before the third.
+    // 535 ms between messages: the cancel comes well before the third.
     let rig = rig(recorded(), 500, 1024).await;
     let mut sender = h2c(&rig).await;
     let response = start(&mut sender).await;
