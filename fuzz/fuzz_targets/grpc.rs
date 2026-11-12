@@ -6,12 +6,15 @@
 //! maximal payload held. Every frame is decoded under each encoding (the gzip inflation stays
 //! within the cap). As a payload: the whole input and every decoded payload go to the wire
 //! reader; what it reads writes JSON that reads back, and the encoding of that is a fixed
-//! point (decode, encode and decode again give the same bytes).
+//! point (decode, encode and decode again give the same bytes). What it reads is also redacted
+//! (GRP-18): a fixed point whose encoding decodes.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use mimic_core::grpc::frame::{Encoding, Frame, FrameError, HEADER, MAX_MESSAGE, Parser, Payload};
+use mimic_core::discovery::redact::Redactor;
+use mimic_core::grpc::redact::{Direction, FieldNames, FieldRule, GrpcRedactor};
 use mimic_core::grpc::wire::{MAX_PAYLOAD, Message};
 
 fn stream(parser: &mut Parser, pieces: &[&[u8]]) -> (Vec<Frame>, Option<FrameError>) {
@@ -27,6 +30,23 @@ fn stream(parser: &mut Parser, pieces: &[&[u8]]) -> (Vec<Frame>, Option<FrameErr
     (frames, parser.finish().err())
 }
 
+/// A decoded payload redacted (GRP-18): redaction is a fixed point and its output encodes.
+fn redaction(message: &Message) {
+    let rule = FieldRule::new("p.S/M", Direction::Request, "1.2").expect("a rule");
+    let redactor = GrpcRedactor::new(Redactor::default(), vec![rule]);
+    let names = FieldNames::new();
+    let once = redactor
+        .message("p.S/M", Direction::Request, message, &names)
+        .expect("a decoded payload is within the bounds");
+    let twice = redactor
+        .message("p.S/M", Direction::Request, &once, &names)
+        .expect("a redacted payload is within the bounds");
+    assert_eq!(once, twice);
+    let encoded = once.encode().expect("a redacted payload encodes");
+    assert!(encoded.len() <= MAX_PAYLOAD);
+    Message::decode(&encoded).expect("an encoding decodes");
+}
+
 fn payload(bytes: &[u8]) {
     assert!(bytes.len() <= MAX_PAYLOAD || Message::decode(bytes).is_err());
     let Ok(message) = Message::decode(bytes) else {
@@ -36,6 +56,7 @@ fn payload(bytes: &[u8]) {
     let Ok(read) = Message::from_json(&json) else {
         panic!("the JSON of a decoded payload does not read back");
     };
+    redaction(&message);
     let encoded = read.encode().expect("a decoded payload encodes");
     assert!(encoded.len() <= bytes.len());
     let again = Message::decode(&encoded).expect("an encoding decodes");

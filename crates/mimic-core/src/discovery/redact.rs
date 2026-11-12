@@ -161,6 +161,11 @@ pub fn value_rule(s: &str) -> Option<Rule> {
     value_hit(s).map(|(rule, _)| rule)
 }
 
+/// The placeholder of the value detector that catches `s`, if any.
+pub fn value_placeholder(s: &str) -> Option<Placeholder> {
+    value_hit(s).map(|(_, placeholder)| placeholder)
+}
+
 /// The prefixes that give `mimic-api-key` rather than `mimic-token`.
 const API_KEY_PREFIXES: &[&str] = &["sk_live_", "rk_live_", "sk-"];
 
