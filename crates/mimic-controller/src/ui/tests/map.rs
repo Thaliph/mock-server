@@ -216,16 +216,45 @@ async fn exp_23_a_deployment_without_outbound_data_is_a_node_without_edge() {
 }
 
 #[tokio::test]
-async fn exp_23_a_query_other_than_format_json_or_svg_is_400() {
+async fn exp_23_a_query_other_than_format_svg_is_400() {
     let (app, _) = app_with(&store("redis://127.0.0.1:1"), None);
     for path in [
         "/v1/map?format=png",
+        "/v1/map?format=json",
         "/v1/map?format=",
         "/v1/map?x=1",
         "/v1/map?format=svg&format=json",
     ] {
         assert_eq!(fetch(&app, path).await.status, 400, "{path}");
     }
+}
+
+#[tokio::test]
+async fn exp_23_only_the_first_deployments_by_name_are_read() {
+    let store = store(&valkey_url());
+    let ns = first("exp23c");
+    for dep in ["d", "a", "c", "b"] {
+        seed_calls(&store, &ns, dep, &[("x.example.com:443", 200, 1)]).await;
+    }
+    let mut metrics = Metrics::new("controller", "test");
+    let ui = Ui {
+        store: store.clone(),
+        metrics: UiMetrics::register(metrics.registry_mut()),
+        renders: Arc::new(Semaphore::new(MAX_RENDERS)),
+        hook: None,
+        resources: ResourceCache::new(),
+        mesh: None,
+    };
+    let (summaries, _) = store.list().await.expect("lists");
+    let ours: Vec<_> = summaries
+        .into_iter()
+        .filter(|s| s.namespace == ns)
+        .collect();
+    assert_eq!(ours.len(), 4);
+    let read = read_sources(&ui, ours, 2).await.expect("reads");
+    let names: Vec<&str> = read.iter().map(|s| s.deployment.as_str()).collect();
+    assert_eq!(names, ["a", "b"]);
+    assert_eq!(read[0].calls.len(), 1);
 }
 
 #[tokio::test]
@@ -300,6 +329,18 @@ fn exp_24_the_map_tab_reads_the_svg_and_copies_an_allowlist() {
     ] {
         assert!(js.contains(needle), "mimic.js lacks {needle}");
     }
+    for rule in [
+        "\\\\",
+        "\"..\"",
+        "decodeURIComponent",
+        "indexOf(\"//\")",
+        "namespaceURI",
+        "SVG_NAMESPACE",
+    ] {
+        assert!(js.contains(rule), "mimic.js lacks the rule {rule}");
+    }
+    // The one URL allowed is the SVG namespace constant.
+    let rest = js.replace("http://www.w3.org/2000/svg", "");
     for banned in [
         "innerHTML",
         "outerHTML",
@@ -310,6 +351,6 @@ fn exp_24_the_map_tab_reads_the_svg_and_copies_an_allowlist() {
         "http://",
         "https://",
     ] {
-        assert!(!js.contains(banned), "mimic.js holds {banned}");
+        assert!(!rest.contains(banned), "mimic.js holds {banned}");
     }
 }
