@@ -23,9 +23,9 @@ controller:
   # Empty: preferred pod anti-affinity on kubernetes.io/hostname (spread replicas across nodes).
   affinity: {}
   # topologySpreadConstraints of the controller pods (a list, passed through). Empty: none. The production
-  # overlay spreads them across zones and nodes (values-production.yaml, spec §12.16).
+  # overlay spreads them across zones and nodes (values-production.yaml, spec §12.18).
   topologySpreadConstraints: []
-  # PriorityClass of the controller pods (a name; the cluster must have the class). Empty: none (spec §12.16).
+  # PriorityClass of the controller pods (a name; the cluster must have the class). Empty: none (spec §12.18).
   priorityClassName: ""
   # Admission webhook limits (spec §10.2). Both must be set; invalid values exit the controller with 2.
   webhook:
@@ -83,7 +83,7 @@ valkey:
     limits: {memory: 1Gi}
   nodeSelector: {}
   tolerations: []
-  # PriorityClass of the Valkey pod (a name; the cluster must have the class). Empty: none (spec §12.16).
+  # PriorityClass of the Valkey pod (a name; the cluster must have the class). Empty: none (spec §12.18).
   priorityClassName: ""
   # The Redis exporter as a container of the Valkey pod (spec §10.7, #378). It reaches Valkey on
   # localhost as the ACL user mimic-exporter (+info +ping, no key access). Off by default; enabling

@@ -563,6 +563,11 @@ spec:
               containerPort: 8443
             - name: sidecar-api
               containerPort: 8444
+            # The read API and UI (spec §7.5) listen on MIMIC_UI_ADDR, 127.0.0.1:8080 by default: loopback only, reached
+            # with kubectl port-forward. Declared for information; no Service or NetworkPolicy port exposes it (UI-14).
+            - name: mimic-ui
+              containerPort: 8080
+              protocol: TCP
           livenessProbe:
             httpGet: {path: /healthz, port: admin}
             periodSeconds: 10

@@ -126,6 +126,9 @@ kubectl -n mimic-system logs deploy/mimic-controller | jq -c 'select(.level != "
 kubectl -n demo logs <pod> -c mimic-sidecar | jq -c 'select(.target=="access")'
 ```
 
+Every field of the access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and
+load-marked requests, are on [Access logs](Access-logs).
+
 Key messages:
 
 | Level | Message | Source | Meaning / action |

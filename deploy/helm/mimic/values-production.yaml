@@ -1,4 +1,4 @@
-# Production overlay of the mimic chart (spec §12.16, #438). Install with the defaults replaced by this file:
+# Production overlay of the mimic chart (spec §12.18, #438). Install with the defaults replaced by this file:
 #   helm install mimic oci://ghcr.io/thaliph/charts/mimic --version <version> -n mimic-system --create-namespace \
 #     -f values-production.yaml
 # (from a checkout: helm install mimic deploy/helm/mimic -n mimic-system -f deploy/helm/mimic/values-production.yaml).
