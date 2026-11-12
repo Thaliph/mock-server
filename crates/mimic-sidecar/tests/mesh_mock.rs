@@ -114,7 +114,7 @@ async fn msh_62_an_h2c_mesh_routed_connection_follows_the_mode_per_request() {
             .await
             .unwrap();
     tokio::spawn(conn);
-    let mut get = async |sender: &mut hyper::client::conn::http2::SendRequest<Full<Bytes>>| {
+    let get = async |sender: &mut hyper::client::conn::http2::SendRequest<Full<Bytes>>| {
         let request = Request::builder()
             .uri(format!("http://{AUTHORITY}/users/3"))
             .body(Full::new(Bytes::new()))

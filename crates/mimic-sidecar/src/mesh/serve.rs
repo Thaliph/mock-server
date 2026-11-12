@@ -5,10 +5,12 @@
 
 use std::future::Future;
 use std::pin::{Pin, pin};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use http_body_util::BodyExt;
+use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::service::service_fn;
@@ -23,6 +25,7 @@ use super::pool::{Lease, Protocol, Sent};
 use super::router::{Backend, InFlight};
 use crate::discovery::Tap;
 use crate::exchange::{Ctx, RespBody, Tracker};
+use crate::mock::{self, Mock};
 use crate::transport::Stream;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -33,6 +36,10 @@ pub(crate) struct Serving {
     pub backend: Arc<Backend>,
     pub ctx: Ctx,
     pub tap: Option<Tap>,
+    /// The mock that answers each request while the mode is `mock`; none for a passthrough
+    /// destination.
+    mock: Option<Mock>,
+    mocked: OnceLock<Arc<mock::Conn>>,
     /// The task relaying the tunnel an `Upgrade` or `CONNECT` request became.
     tunnel: Mutex<Option<JoinHandle<()>>>,
 }
@@ -55,12 +62,15 @@ impl Serving {
         backend: Arc<Backend>,
         ctx: Ctx,
         tap: Option<Tap>,
+        mock: Option<Mock>,
     ) -> Serving {
         Serving {
             mesh,
             backend,
             ctx,
             tap,
+            mock,
+            mocked: OnceLock::new(),
             tunnel: Mutex::new(None),
         }
     }
@@ -76,6 +86,7 @@ struct Hold {
 /// The body of a response: the pod's, or none for an answer of the sidecar.
 pub(crate) struct MeshBody {
     upstream: Option<RespBody>,
+    mocked: Option<UnsyncBoxBody<Bytes, hyper::Error>>,
     _hold: Option<Hold>,
 }
 
@@ -83,6 +94,7 @@ impl MeshBody {
     fn empty() -> MeshBody {
         MeshBody {
             upstream: None,
+            mocked: None,
             _hold: None,
         }
     }
@@ -96,20 +108,28 @@ impl Body for MeshBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
-        match self.get_mut().upstream.as_mut() {
-            Some(body) => Pin::new(body).poll_frame(cx),
-            None => Poll::Ready(None),
+        let this = self.get_mut();
+        match (this.upstream.as_mut(), this.mocked.as_mut()) {
+            (Some(body), _) => Pin::new(body).poll_frame(cx),
+            (None, Some(body)) => Pin::new(body).poll_frame(cx),
+            (None, None) => Poll::Ready(None),
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.upstream.as_ref().is_none_or(Body::is_end_stream)
+        match (&self.upstream, &self.mocked) {
+            (Some(body), _) => body.is_end_stream(),
+            (None, Some(body)) => body.is_end_stream(),
+            (None, None) => true,
+        }
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.upstream
-            .as_ref()
-            .map_or_else(|| SizeHint::with_exact(0), Body::size_hint)
+        match (&self.upstream, &self.mocked) {
+            (Some(body), _) => body.size_hint(),
+            (None, Some(body)) => body.size_hint(),
+            (None, None) => SizeHint::with_exact(0),
+        }
     }
 }
 
@@ -201,6 +221,19 @@ impl Serving {
     ) -> Result<Response<MeshBody>, BoxError> {
         let http1 = protocol == Protocol::Http1;
         let label = if http1 { "http1" } else { "h2" };
+        // The mode applies per request: while it is `mock` the mock answers, as on the byte
+        // relay (spec §7.9).
+        if let Some(mock) = self.mock.as_ref().filter(|m| m.active()) {
+            let conn = self
+                .mocked
+                .get_or_init(|| mock.switched_mesh(self.ctx.clone(), !http1));
+            let answered = conn.serve(req).await?;
+            return Ok(answered.map(|body| MeshBody {
+                upstream: None,
+                mocked: Some(body.map_err(|never| match never {}).boxed_unsync()),
+                _hold: None,
+            }));
+        }
         let connect = req.method() == Method::CONNECT;
         let upgrade = connect || (http1 && req.headers().contains_key(header::UPGRADE));
         if upgrade && !http1 {
@@ -238,7 +271,7 @@ impl Serving {
         };
         // A stale view is not used for pod addresses (spec §7.9).
         let mut chosen: Option<(InFlight, Lease)> = None;
-        if !self.mesh.stale() {
+        if !self.mesh.stale() && !self.mesh.off() {
             let Some(first) = self.backend.pick(router) else {
                 self.count(None, StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", began);
                 tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
@@ -322,6 +355,7 @@ impl Serving {
                     *self.tunnel.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
                     return Ok(answered.map(|body| MeshBody {
                         upstream: Some(body),
+                        mocked: None,
                         _hold: None,
                     }));
                 }
@@ -332,6 +366,7 @@ impl Serving {
                 self.count(pick.as_ref(), answered.status(), "none", began);
                 Ok(answered.map(|body| MeshBody {
                     upstream: Some(body),
+                    mocked: None,
                     _hold: Some(Hold {
                         _in_flight: pick,
                         _lease: lease,

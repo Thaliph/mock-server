@@ -588,6 +588,12 @@ impl MeshState {
         self.0.router.pools.poison_next();
     }
 
+    /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
+    pub(crate) fn off(&self) -> bool {
+        let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);
+        table.loaded && !table.enabled
+    }
+
     /// The view is older than `MIMIC_MESH_STALE_AFTER`: its pod addresses are not used.
     pub(crate) fn stale(&self) -> bool {
         lock(&self.0.contact)

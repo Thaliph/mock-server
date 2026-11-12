@@ -308,7 +308,18 @@ async fn serve_mesh(
         if h2 { "h2" } else { "http1" },
         &conn.authority(false),
     );
-    let serving = Serving::new(mesh, backend, conn.ctx(), shared.discovery().cloned());
+    // A passthrough destination is never mocked (spec §8), as on the byte relay.
+    let detection = if h2 { Detection::H2 } else { Detection::Http1 };
+    let mock = shared
+        .mock()
+        .filter(|mock| {
+            !matches!(
+                pick(mock, &detection, &first, dst, false),
+                Pick::Passthrough
+            )
+        })
+        .cloned();
+    let serving = Serving::new(mesh, backend, conn.ctx(), shared.discovery().cloned(), mock);
     let stream = Stream::plain_with_prefix(client, first);
     if let Err(e) = mesh::serve(serving, stream, h2, shared.stopped(), abort).await {
         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "mesh connection ended");
