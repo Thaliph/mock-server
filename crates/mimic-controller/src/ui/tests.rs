@@ -1085,6 +1085,7 @@ async fn ui_10_a_panicking_render_is_a_500_with_one_error() {
 mod explorer;
 mod loadtab;
 mod loadtests;
+mod map;
 mod outbound;
 mod pages;
 

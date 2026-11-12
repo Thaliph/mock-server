@@ -13,6 +13,7 @@ pub mod mock;
 pub mod proxy;
 pub mod redirect;
 pub mod trust;
+pub mod ui;
 
 use std::fmt;
 use std::str::FromStr;

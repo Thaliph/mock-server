@@ -258,7 +258,7 @@ async fn run(config: Config) -> std::io::Result<()> {
             reconciler.run().await;
         });
     }
-    let ui_router = ui::router_with(store.clone(), ui_metrics, resources);
+    let ui_router = ui::router_mesh(store.clone(), ui_metrics, resources, mesh.clone());
     tokio::spawn(
         status::Reconciler {
             store: store.clone(),

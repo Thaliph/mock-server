@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
-use axum::extract::{ConnectInfo, MatchedPath, Path, Request, State};
+use axum::extract::{ConnectInfo, MatchedPath, Path, RawQuery, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
+use crate::mesh::Hub;
 use crate::resources::ResourceCache;
 use crate::store::{Half, ReadError, Store, Summary, keys};
 
@@ -100,21 +101,37 @@ struct Ui {
     renders: Arc<Semaphore>,
     hook: Option<Hook>,
     resources: Arc<ResourceCache>,
+    mesh: Option<Arc<Hub>>,
 }
 
 /// The router with the mimic resources of the cluster's watches (spec §7.5, explorer shell).
-pub fn router_with(store: Arc<Store>, metrics: UiMetrics, resources: Arc<ResourceCache>) -> Router {
-    build(store, metrics, None, resources)
+#[cfg(test)]
+pub(crate) fn router_with(
+    store: Arc<Store>,
+    metrics: UiMetrics,
+    resources: Arc<ResourceCache>,
+) -> Router {
+    build(store, metrics, None, resources, None)
+}
+
+/// The router with the mesh hub too, for the Map tab (`None`: the mesh is off).
+pub fn router_mesh(
+    store: Arc<Store>,
+    metrics: UiMetrics,
+    resources: Arc<ResourceCache>,
+    mesh: Option<Arc<Hub>>,
+) -> Router {
+    build(store, metrics, None, resources, mesh)
 }
 
 #[cfg(test)]
 pub(crate) fn router(store: Arc<Store>, metrics: UiMetrics) -> Router {
-    build(store, metrics, None, ResourceCache::new())
+    build(store, metrics, None, ResourceCache::new(), None)
 }
 
 #[cfg(test)]
 pub(crate) fn router_with_hook(store: Arc<Store>, metrics: UiMetrics, hook: Hook) -> Router {
-    build(store, metrics, Some(hook), ResourceCache::new())
+    build(store, metrics, Some(hook), ResourceCache::new(), None)
 }
 
 fn build(
@@ -122,6 +139,7 @@ fn build(
     metrics: UiMetrics,
     hook: Option<Hook>,
     resources: Arc<ResourceCache>,
+    mesh: Option<Arc<Hub>>,
 ) -> Router {
     let ui = Ui {
         store,
@@ -129,6 +147,7 @@ fn build(
         renders: Arc::new(Semaphore::new(MAX_RENDERS)),
         hook,
         resources,
+        mesh,
     };
     Router::new()
         .route("/", get(|| async { Redirect::permanent("/ui/") }))
@@ -156,6 +175,7 @@ fn build(
         .route("/v1/workloads", get(list))
         .route("/v1/resources", get(overview))
         .route("/v1/features", get(features))
+        .route("/v1/map", get(map))
         .route(
             "/v1/workloads/{namespace}/{deployment}/resources",
             get(held_resources),
@@ -598,6 +618,16 @@ async fn loadtest(
         run_object(&fields, &namespace, &deployment, &uid).ok_or(ReadError::NotFound)?;
     map.insert("summary".to_string(), json!(summary));
     Ok(Json(Value::Object(map)))
+}
+
+/// The Map tab (spec §7.5): the graph of the stored outbound counters and the hub's snapshot.
+async fn map(
+    State(ui): State<Ui>,
+    matched: MatchedPath,
+    RawQuery(query): RawQuery,
+) -> Result<Response, ReadError> {
+    let _ = (&ui, &matched, &query);
+    Err(ReadError::Unreadable)
 }
 
 struct Json(Value);
