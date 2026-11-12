@@ -1017,7 +1017,7 @@ the recorder keeps the first message of each side:
   object: a `namespace` key is rejected by the CRD) attach it. Fields that fit a `Deployment` target
   only: `destinations` (at most 256 `{namespace, name}` Services, §7.9) and `mesh.enabled` (default
   `true`; `false` turns the mesh off for that workload, design §3.4); a Service target only:
-  `loadBalancer.slowStart` (`<n>s`, 0 to 3600 s, default 30 s, `0s` disables). A field that fits no
+  `loadBalancer.slowStart` (`<n>s`, 0 to 3600 s, bounded by CEL, default 30 s, `0s` disables). A field that fits no
   target kind of the object is rejected by CEL. Retries, breaker, faults and admission are added by
   later milestones. `status.conditions`: `Accepted` (False: `Conflicted`, `TargetNotFound`,
   `Invalid`) and `ResolvedRefs` (False: `RefNotPermitted`). **Precedence** (pure, `mimic-core`
@@ -2283,7 +2283,9 @@ no insignificant whitespace):
   port, without duplicates, with the `zone` when there is one; the `generations` of those
   EndpointSlices; the `policy` of the winning `MimicConfig` of the Service (§7), defaults when none.
   `mesh: false` (the winning config of `d` says so) gives a view without Services and without
-  `generations`. The top-level `generations` hold the winning `MimicConfig` of `d`. The view holds no
+  `generations`. The top-level `generations` hold the winning `MimicConfig` of `d`. The `generations` of a consented Service name its winning `MimicConfig` of the destination's namespace
+  (`mimicconfig/<namespace>/<name>`): decided, kept as is, because the consent already shares that
+  Service's policy and the name is not a secret. The view holds no
   Secret, label or annotation value: the input structs have no field for them.
 - **Bounds** (`mesh::view::Limits`, defaults and ranges of `MIMIC_MESH_MAX_SERVICES`,
   `MIMIC_MESH_MAX_ENDPOINTS` and `MIMIC_MESH_MAX_VIEW_BYTES`, §10.2): the Services of `n` come
@@ -4271,7 +4273,7 @@ and the sidecar's use of the view are #441 and #442.
 | MSH-14 | **B** (criterion micro-benchmark `mesh_view`, results in `docs/bench/`). Building the view of 1000 Services with 10 000 endpoints in all is measured, with the machine's load noted; no budget is set yet. |
 | MSH-15 | **E** (chart, `scripts/check-chart.sh`). The chart renders the CRD `mimicconfigs.mimic.platform.io` with `helm.sh/resource-policy: keep`, a `status` subresource, version `v1alpha1`, `targetRefs` 1 to 16, `destinations` at most 256, `mesh.enabled` default `true`, `loadBalancer.slowStart`, and CEL rules that reject a `namespace` in a `targetRef`, `destinations` or `mesh` without a Deployment target, and `loadBalancer` without a Service target; `helm lint --strict` passes; the default render is the golden file. |
 | MSH-16 | **D** (security review). No view holds another namespace's data without its `ReferenceGrant` (MSH-03, MSH-04); the input structs have no field for a Secret, label or annotation value; CEL forbids cross-namespace `targetRefs`; `from_json` is bounded and refuses unknown fields. |
-| MSH-17 | **E** (kind, `scripts/e2e.sh` section `msh_17`, objects of that section only). The API server evaluates the CEL rules and the schema of the `MimicConfig` CRD: a valid object with both target kinds, `mesh: {}` (which defaults `enabled` to `true`), 16 `targetRefs` and 256 `destinations` are accepted; refused are no, 0 and 17 `targetRefs`, a `targetRef` with a `namespace` (on a Deployment and on a Service), a kind other than `Deployment`/`Service`, a `Service` in group `apps`, a `Deployment` in the core group, a `targetRef` without a name, 257 `destinations`, `destinations` or `mesh` without a Deployment target, `loadBalancer` without a Service target, a `slowStart` that is not `<n>s`, a destination without a name, and a non-boolean `mesh.enabled`. |
+| MSH-17 | **E** (kind, `scripts/e2e.sh` section `msh_17`, objects of that section only). The API server evaluates the CEL rules and the schema of the `MimicConfig` CRD: a valid object with both target kinds, `mesh: {}` (which defaults `enabled` to `true`), 16 `targetRefs` and 256 `destinations` are accepted; refused are no, 0 and 17 `targetRefs`, a `targetRef` with a `namespace` (on a Deployment and on a Service), a kind other than `Deployment`/`Service`, a `Service` in group `apps`, a `Deployment` in the core group, a `targetRef` without a name, 257 `destinations`, `destinations` or `mesh` without a Deployment target, `loadBalancer` without a Service target, a `slowStart` that is not `<n>s` or is over 3600 s, a `targetRef` with an empty `namespace`, a destination without a name, and a non-boolean `mesh.enabled`. |
 
 ## 13. Test strategy
 

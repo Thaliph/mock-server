@@ -856,6 +856,8 @@ mc_spec=$(printf '%s\n' "$mc" | yq '.spec.versions[0].schema.openAPIV3Schema.pro
   || fail "msh_15: mesh.enabled does not default to true"
 [[ $(printf '%s\n' "$mc_spec" | yq -r '.properties.loadBalancer.properties.slowStart.type') == string ]] \
   || fail "msh_15: no loadBalancer.slowStart"
+[[ $(printf '%s\n' "$mc_spec" | yq -r '.properties.loadBalancer["x-kubernetes-validations"][0].rule') == "!has(self.slowStart) || int(self.slowStart.replace('s', '')) <= 3600" ]] \
+  || fail "msh_15: loadBalancer.slowStart is not bounded to 3600s by CEL"
 cel=$(printf '%s\n' "$mc_spec" | yq -r '[.properties.targetRefs.items["x-kubernetes-validations"][].rule, .["x-kubernetes-validations"][].rule] | join("\n")')
 for rule in '!has(self.namespace)' "!has(self.destinations) || self.targetRefs.exists(t, t.kind == 'Deployment')" \
   "!has(self.mesh) || self.targetRefs.exists(t, t.kind == 'Deployment')" "!has(self.loadBalancer) || self.targetRefs.exists(t, t.kind == 'Service')"; do

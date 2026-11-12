@@ -414,6 +414,9 @@ mc_denied "loadBalancer with only a Deployment target" msh-d13 "$mc_dep
   loadBalancer: {slowStart: 30s}"
 mc_denied "a slowStart that is not <n>s" msh-d14 "$mc_svc
   loadBalancer: {slowStart: 5m}"
+mc_denied "a slowStart over 3600s" msh-d17 "$mc_svc
+  loadBalancer: {slowStart: 9999s}"
+mc_denied "a targetRef with an empty namespace" msh-d18 '  targetRefs: [{group: apps, kind: Deployment, name: cart, namespace: ""}]'
 mc_denied "a destination without a name" msh-d15 "$mc_dep
   destinations: [{namespace: risk}]"
 mc_denied "a mesh.enabled that is not a boolean" msh-d16 "$mc_dep

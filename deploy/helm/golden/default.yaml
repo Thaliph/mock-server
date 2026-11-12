@@ -447,6 +447,9 @@ spec:
                       description: Slow start window of new endpoints, `<n>s`, 0s to 3600s; `0s` disables. Default 30s.
                       type: string
                       pattern: '^[0-9]{1,4}s$'
+                  x-kubernetes-validations:
+                    - rule: "!has(self.slowStart) || int(self.slowStart.replace('s', '')) <= 3600"
+                      message: "loadBalancer.slowStart is at most 3600s"
               x-kubernetes-validations:
                 - rule: "!has(self.destinations) || self.targetRefs.exists(t, t.kind == 'Deployment')"
                   message: "destinations fit a Deployment target only"
