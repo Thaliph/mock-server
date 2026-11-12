@@ -2318,11 +2318,11 @@ docker rm -f "$CHROME" >/dev/null 2>&1 || true
 # A Python gRPC pair in an enabled namespace: A (grpc-a) calls pkg.Users/Get on B (grpc-b) once a second. The sidecars
 # record the unary messages and the trailers redacted, the controller's report for B (inbound) and for A (outbound)
 # holds them as version 3, and its document shows the message. The image is the pinned python:3.13-slim plus grpcio
-# (scripts/e2e/apps/grpc.py), built here like the TLS client images.
+# (scripts/e2e/apps/grpc_app.py), built here like the TLS client images.
 log "grp_28: a Python gRPC pair A to B: the reports of both hold the redacted messages and trailers, version 3, and no canary"
 derive grpc "$PY_SLIM" 'pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt' "" scripts/e2e/apps/grpc-requirements.txt
 ns_fresh grpc-28 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
-kubectl -n grpc-28 create configmap grpc-code --from-file=grpc.py=scripts/e2e/apps/grpc.py >/dev/null
+kubectl -n grpc-28 create configmap grpc-code --from-file=grpc_app.py=scripts/e2e/apps/grpc_app.py >/dev/null
 grpc_jwt="eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ$(openssl rand -hex 8)In0.$(openssl rand -hex 16)"
 grpc_bearer="grp28-bearer-$(openssl rand -hex 12)"
 grpc_token="ghp_$(openssl rand -hex 18)"
@@ -2351,7 +2351,7 @@ spec:
       containers:
         - name: app
           image: mimic-e2e-grpc:$TAG
-          command: [python3, /code/grpc.py]
+          command: [python3, /code/grpc_app.py]
           env:
             - {name: ROLE, value: $role}
             - {name: APP_NAME, value: $name}
