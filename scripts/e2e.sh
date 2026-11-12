@@ -1948,7 +1948,11 @@ jq -e '.rows | map(join(" ")) | any(test("disc-22 users discovery"))' "$WORK/bro
 browse resource /ui/workloads/disc-22/users/resources/MimicWorkload/users-a --wait 'deployment: "users"' --wait x-tenant-key
 jq -e '.text | contains("Spec") and contains("deployment: \"users\"")' "$WORK/browse-resource.json" >/dev/null \
   || fail "exp_07: the resource view does not show the spec of users-a as YAML"
-browse tab-map /ui/map --wait 'not available yet'
+# exp_25 (first half): the Map tab draws the deployments with data, here users of disc-22, linked to their page.
+browse tab-map /ui/map --wait 'external hosts'
+jq -e '[.links[] | select(.href == "/ui/workloads/disc-22/users" and .text == "disc-22/users")] | length == 1' \
+  "$WORK/browse-tab-map.json" >/dev/null \
+  || fail "exp_25: the Map tab has no node linking to disc-22/users: $(jq -c '[.links[] | select(.href | startswith("/ui/workloads/"))]' "$WORK/browse-tab-map.json")"
 browse tab-endpoints /ui/endpoints --wait 'Pick a deployment' --wait disc-22/users
 # exp_11: the Endpoints tab lists the endpoints of a deployment, and its filters narrow the table in the browser.
 browse ep-users '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --wait inbound
@@ -2418,6 +2422,18 @@ browse ep-front-authority '/ui/endpoints?deployment=egr-19/front' --wait '/missi
 jq -e --arg a "$egr_authority" '([.rows[] | select(.[0] == "inbound")] | length == 0) and ([.rows[] | select(.[0] == "outbound" and .[2] == $a)] | length == 3)' \
   "$WORK/browse-ep-front-authority.json" >/dev/null \
   || fail "exp_11: the authority filter does not keep exactly the outbound rows: $(jq -c .rows "$WORK/browse-ep-front-authority.json")"
+# exp_25: the Map tab draws the edge front (egr-19) -> users (disc-22) from the stored outbound counters, with the
+# exchange count, the node of each end linked to its page and the edge to the Endpoints tab of its caller.
+browse map /ui/map --wait 'external hosts'
+jq -e '([.links[] | select(.href == "/ui/workloads/egr-19/front" and .text == "egr-19/front")] | length) == 1
+  and ([.links[] | select(.href == "/ui/workloads/disc-22/users" and .text == "disc-22/users")] | length) == 1
+  and ([.links[] | select(.href == "/ui/endpoints?deployment=egr-19%2Ffront" and (.text | test("^[0-9]+ calls")))] | length) >= 1' \
+  "$WORK/browse-map.json" >/dev/null \
+  || fail "exp_25: the Map tab does not draw the edge from egr-19/front to disc-22/users: $(jq -c '.links' "$WORK/browse-map.json")"
+curl -fs --max-time 10 localhost:18082/v1/map > "$WORK/map.json" || fail "exp_25: cannot read /v1/map"
+jq -e '[.edges[] | select(.from == "dep:egr-19/front" and .to == "dep:disc-22/users" and .exchanges > 0)] | length == 1' \
+  "$WORK/map.json" >/dev/null \
+  || fail "exp_25: /v1/map has no edge from egr-19/front to disc-22/users: $(jq -c '.edges' "$WORK/map.json")"
 browse outbound "$egr_href" --wait '/users/{users_id}' --expand
 jq -e '(.methods | map(ascii_upcase) | unique) == ["GET", "PUT"]' "$WORK/browse-outbound.json" >/dev/null \
   || fail "shr_20: the outbound document page lists the operations $(jq -c .methods "$WORK/browse-outbound.json")"

@@ -12,9 +12,11 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+use futures::{StreamExt, TryStreamExt};
 use mimic_core::discovery::openapi;
-use mimic_core::discovery::report::Report;
+use mimic_core::discovery::report::{Direction, Report};
 use mimic_core::load::summary::Summary as LoadSummary;
+use mimic_core::ui::map::{Call as MapCall, Limits as MapLimits, Source as MapSource};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::Histogram;
@@ -620,14 +622,134 @@ async fn loadtest(
     Ok(Json(Value::Object(map)))
 }
 
-/// The Map tab (spec §7.5): the graph of the stored outbound counters and the hub's snapshot.
+/// What the Map tab reads of one deployment: the exchanges and 5xx it sent to each authority.
+fn calls_of(report: &Report) -> Vec<MapCall> {
+    let mut sums: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for endpoint in report.endpoints() {
+        let (Direction::Outbound, Some(authority)) = (endpoint.direction, endpoint.authority)
+        else {
+            continue;
+        };
+        let sum = sums.entry(authority).or_default();
+        for (status, count) in endpoint.stats.statuses.iter() {
+            sum.0 = sum.0.saturating_add(*count);
+            if *status >= 500 {
+                sum.1 = sum.1.saturating_add(*count);
+            }
+        }
+    }
+    sums.into_iter()
+        .map(|(authority, (exchanges, errors))| MapCall {
+            authority: authority.to_string(),
+            exchanges,
+            errors,
+        })
+        .collect()
+}
+
+/// One deployment with its calls: its `:outbound` half read and parsed under the render limit.
+/// A deployment without that half, or whose stored data does not read, is a node with no call.
+async fn map_source(ui: &Ui, summary: &Summary) -> Result<MapSource, ReadError> {
+    let (namespace, deployment) = (&summary.namespace, &summary.deployment);
+    let mut source = MapSource {
+        namespace: namespace.clone(),
+        deployment: deployment.clone(),
+        calls: Vec::new(),
+    };
+    let stored = match ui
+        .store
+        .stored_report(namespace, deployment, Half::Outbound)
+        .await
+    {
+        Ok(stored) => stored,
+        Err(ReadError::Unavailable) => return Err(ReadError::Unavailable),
+        Err(_) => return Ok(source),
+    };
+    let permit = ui
+        .renders
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ReadError::Unreadable)?;
+    let parsed = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        stored.parse().map(|report| calls_of(&report))
+    })
+    .await;
+    match parsed {
+        Ok(Some(calls)) => source.calls = calls,
+        Ok(None) => tracing::error!(
+            namespace = namespace.as_str(),
+            deployment = deployment.as_str(),
+            "stored report unreadable"
+        ),
+        Err(_) => return Err(ReadError::Unreadable),
+    }
+    Ok(source)
+}
+
+/// How many reports the Map tab reads at once.
+const MAP_READS: usize = 8;
+
+/// The Map tab (spec §7.5): the graph of the stored outbound counters and the hub's snapshot,
+/// as JSON or, with `?format=svg`, as SVG. No call to the API server.
 async fn map(
     State(ui): State<Ui>,
     matched: MatchedPath,
     RawQuery(query): RawQuery,
 ) -> Result<Response, ReadError> {
-    let _ = (&ui, &matched, &query);
-    Err(ReadError::Unreadable)
+    let svg = match query.as_deref() {
+        None => false,
+        Some("format=svg") => true,
+        Some(_) => return Err(ReadError::Name),
+    };
+    let started = Instant::now();
+    let (summaries, skipped) = ui.store.list().await?;
+    ui.metrics
+        .skipped
+        .get_or_create(&labels(&[("reason", "meta-unreadable")]))
+        .inc_by(skipped);
+    let sources: Vec<MapSource> = futures::stream::iter(summaries)
+        .map(|summary| {
+            let ui = ui.clone();
+            async move { map_source(&ui, &summary).await }
+        })
+        .buffered(MAP_READS)
+        .try_collect()
+        .await?;
+    // The view of the hub counts only once every list is complete (spec §7.5, *Not declared*).
+    let published = ui
+        .mesh
+        .as_ref()
+        .map(|hub| hub.published())
+        .filter(|p| p.synced);
+    let permit = ui
+        .renders
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ReadError::Unreadable)?;
+    let body = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let map = mimic_core::ui::map::build(
+            &sources,
+            published.as_deref().map(|p| &p.snapshot),
+            &MapLimits::default(),
+        );
+        if svg { map.to_svg() } else { map.to_json() }
+    })
+    .await
+    .map_err(|_| ReadError::Unreadable)?;
+    ui.metrics
+        .renders
+        .get_or_create(&labels(&[("route", matched.as_str())]))
+        .observe(started.elapsed().as_secs_f64());
+    let content_type = if svg {
+        "image/svg+xml"
+    } else {
+        "application/json"
+    };
+    Ok(([(header::CONTENT_TYPE, content_type)], body).into_response())
 }
 
 struct Json(Value);

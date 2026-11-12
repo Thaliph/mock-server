@@ -102,8 +102,64 @@
     });
   }
 
-  function placeholder(title, text) {
-    show([el("h1", title), el("p", text, { class: "placeholder" })]);
+  // The Map tab: the SVG the controller rendered is parsed and copied element by element, from
+  // an allowlist of elements and attributes, with links only under /ui/. Nothing of it is ever
+  // handed to the page as markup.
+  var SVG_ELEMENTS = ["svg", "defs", "marker", "path", "g", "a", "rect", "text"];
+  var SVG_ATTRIBUTES = ["class", "x", "y", "width", "height", "viewBox", "d", "fill", "stroke",
+    "stroke-width", "stroke-dasharray", "marker-end", "id", "markerWidth", "markerHeight", "refX",
+    "refY", "orient", "href", "role", "aria-label", "text-anchor", "font-size", "font-family", "rx"];
+
+  function copySvg(source, ns) {
+    var node = document.createElementNS(ns, source.localName);
+    Array.prototype.forEach.call(source.attributes, function (attr) {
+      if (SVG_ATTRIBUTES.indexOf(attr.name) < 0) {
+        return;
+      }
+      if (attr.name === "href" && attr.value.indexOf("/ui/") !== 0) {
+        return;
+      }
+      node.setAttribute(attr.name, attr.value);
+    });
+    Array.prototype.forEach.call(source.childNodes, function (child) {
+      if (child.nodeType === 3) {
+        node.appendChild(document.createTextNode(child.nodeValue));
+      } else if (child.nodeType === 1 && child.namespaceURI === ns &&
+          SVG_ELEMENTS.indexOf(child.localName) >= 0) {
+        node.appendChild(copySvg(child, ns));
+      }
+    });
+    return node;
+  }
+
+  function mapPage() {
+    fetch("/v1/map?format=svg", { credentials: "omit", headers: { Accept: "image/svg+xml" } }).then(
+      function (response) {
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+        return response.text();
+      }
+    ).then(function (text) {
+      var doc = new DOMParser().parseFromString(text, "image/svg+xml");
+      var root = doc.documentElement;
+      if (!root || root.localName !== "svg" || doc.getElementsByTagName("parsererror").length > 0) {
+        throw new Error("the map is not readable");
+      }
+      if (root.getElementsByTagName("rect").length === 0) {
+        show([el("h1", "Map"), el("p", "No calls recorded")]);
+        return;
+      }
+      var holder = el("div", null, { class: "map" });
+      holder.appendChild(copySvg(root, root.namespaceURI));
+      show([
+        el("h1", "Map"),
+        el("p", "Deployments, Services and external hosts, with the calls the sidecars recorded " +
+          "between them: totals, and the share of 5xx answers. A dashed red arrow is a call to a " +
+          "Service of another namespace that is not declared."),
+        holder
+      ]);
+    }).catch(failed);
   }
 
   // The Workloads tab: every deployment with data in the store or named by a mimic resource.
@@ -517,7 +573,7 @@
       listPage();
     } else if (parts.length === 2 && parts[1] === "map") {
       markTab("/ui/map");
-      placeholder("Map", "The map of calls between deployments is not available yet.");
+      mapPage();
     } else if (parts.length === 2 && parts[1] === "endpoints") {
       markTab("/ui/endpoints");
       endpointsPage();

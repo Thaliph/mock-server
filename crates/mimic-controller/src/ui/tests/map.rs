@@ -10,32 +10,45 @@ use crate::mesh::tests as mesh;
 /// The one stored authority that holds markup characters: a redacted host (spec §6.1).
 const REDACTED: &str = "<redacted>:443";
 
-/// One v2 push of `dep`: an inbound `/a` and, per `(authority, status)`, one outbound exchange.
-async fn seed_calls(store: &Arc<Store>, ns: &str, dep: &str, calls: &[(&str, u16)]) {
+/// A namespace that sorts before the others of the shared Valkey: the map keeps the first 1000
+/// deployments by name.
+fn first(prefix: &str) -> String {
+    format!("0{}", unique(prefix))
+}
+
+/// Exchanges that win a place among the other nodes of a shared Valkey (the map keeps the
+/// heaviest 200).
+const HEAVY: usize = 1000;
+
+/// One v2 push of `dep`: an inbound `/a` and, per `(authority, status, times)`, that many
+/// outbound exchanges.
+async fn seed_calls(store: &Arc<Store>, ns: &str, dep: &str, calls: &[(&str, u16, usize)]) {
     let mut push = push_of("front-1", 1, &[("/a", 200)]);
     let mut report = Report::from_json(&push.json).expect("reads");
-    for (authority, status) in calls {
-        report.record_at(
-            ScopeKey::Authority((*authority).to_string()),
-            &Via {
-                tls: false,
-                sni: None,
-                dst: None,
-            },
-            &LIMITS,
-            &Redactor::default(),
-            &Exchange {
-                direction: Direction::Outbound,
-                port: 80,
-                method: "GET",
-                path: "/x",
-                status: *status,
-                head_ms: 3,
-                host: None,
-                grpc: false,
-                observation: Observation::default(),
-            },
-        );
+    for (authority, status, times) in calls {
+        for _ in 0..*times {
+            report.record_at(
+                ScopeKey::Authority((*authority).to_string()),
+                &Via {
+                    tls: false,
+                    sni: None,
+                    dst: None,
+                },
+                &LIMITS,
+                &Redactor::default(),
+                &Exchange {
+                    direction: Direction::Outbound,
+                    port: 80,
+                    method: "GET",
+                    path: "/x",
+                    status: *status,
+                    head_ms: 3,
+                    host: None,
+                    grpc: false,
+                    observation: Observation::default(),
+                },
+            );
+        }
     }
     let today = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -80,17 +93,15 @@ fn node<'a>(body: &'a Value, id: &str) -> Option<&'a Value> {
 #[tokio::test]
 async fn exp_23_the_map_route_answers_the_graph() {
     let store = store(&valkey_url());
-    let ns = unique("exp23");
+    let ns = first("exp23");
     seed_calls(
         &store,
         &ns,
         "front",
         &[
-            (&format!("users.{ns}.svc:8080"), 200),
-            (&format!("users.{ns}.svc:8080"), 200),
-            (&format!("users.{ns}.svc:8080"), 200),
-            (&format!("users.{ns}.svc:8080"), 500),
-            ("api.example.com:443", 200),
+            (&format!("users.{ns}.svc:8080"), 200, 3 * HEAVY),
+            (&format!("users.{ns}.svc:8080"), 500, HEAVY),
+            ("api.example.com:443", 200, HEAVY),
         ],
     )
     .await;
@@ -103,7 +114,7 @@ async fn exp_23_the_map_route_answers_the_graph() {
     assert_eq!(answer.headers["x-content-type-options"], "nosniff");
     let body = json_of(&answer);
     let (front, users) = (format!("dep:{ns}/front"), format!("dep:{ns}/users"));
-    assert!(node(&body, &front).is_some(), "{body}");
+    assert!(node(&body, &front).is_some(), "no node for front");
     assert!(node(&body, &users).is_some());
     assert_eq!(
         node(&body, &front).unwrap()["href"],
@@ -116,8 +127,8 @@ async fn exp_23_the_map_route_answers_the_graph() {
         .iter()
         .find(|e| e["from"] == front.as_str() && e["to"] == users.as_str())
         .expect("the edge");
-    assert_eq!(edge["exchanges"], 4);
-    assert_eq!(edge["errors"], 1);
+    assert_eq!(edge["exchanges"], 4 * HEAVY);
+    assert_eq!(edge["errors"], HEAVY);
     assert_eq!(edge["error_permille"], 250);
     assert_eq!(edge["declared"], true);
     assert_eq!(
@@ -132,7 +143,7 @@ async fn exp_23_the_map_route_answers_the_graph() {
     let text = String::from_utf8(svg.body).unwrap();
     assert!(
         text.starts_with("<svg ") && text.contains("api.example.com:443"),
-        "{text:.200}"
+        "the SVG does not start as an svg element"
     );
     assert!(text.contains(&format!("{ns}/front")));
 }
@@ -140,8 +151,8 @@ async fn exp_23_the_map_route_answers_the_graph() {
 #[tokio::test]
 async fn exp_23_a_redacted_host_is_escaped_in_the_svg_and_unchanged_in_the_json() {
     let store = store(&valkey_url());
-    let ns = unique("exp23h");
-    seed_calls(&store, &ns, "front", &[(REDACTED, 200)]).await;
+    let ns = first("exp23h");
+    seed_calls(&store, &ns, "front", &[(REDACTED, 200, HEAVY)]).await;
     let (app, _) = app_with(&store, None);
     let svg = String::from_utf8(fetch(&app, "/v1/map?format=svg").await.body).unwrap();
     assert!(!svg.contains("<redacted"), "an unescaped name");
@@ -153,10 +164,10 @@ async fn exp_23_a_redacted_host_is_escaped_in_the_svg_and_unchanged_in_the_json(
 #[tokio::test]
 async fn exp_23_not_declared_needs_a_ready_hub() {
     let store = store(&valkey_url());
-    let ns = unique("exp23n");
+    let ns = first("exp23n");
     let other = unique("exp23o");
     let authority = format!("scoring.{other}.svc:80");
-    seed_calls(&store, &ns, "front", &[(&authority, 200)]).await;
+    seed_calls(&store, &ns, "front", &[(&authority, 200, HEAVY)]).await;
     let to = format!("svc:{other}/scoring");
     let declared = |body: &Value| {
         body["edges"]
@@ -190,7 +201,7 @@ async fn exp_23_not_declared_needs_a_ready_hub() {
 #[tokio::test]
 async fn exp_23_a_deployment_without_outbound_data_is_a_node_without_edge() {
     let store = store(&valkey_url());
-    let ns = unique("exp23i");
+    let ns = first("exp23i");
     seed(&store, &ns, "quiet", &["quiet-1"]).await;
     let (app, _) = app_with(&store, None);
     let body = json_of(&fetch(&app, "/v1/map").await);

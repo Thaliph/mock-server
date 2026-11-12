@@ -323,7 +323,6 @@ impl Hub {
         &self.metrics
     }
 
-    #[cfg(test)]
     pub fn published(&self) -> Arc<Published> {
         self.published.borrow().clone()
     }

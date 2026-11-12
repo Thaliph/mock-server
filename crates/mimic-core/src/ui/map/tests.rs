@@ -461,10 +461,11 @@ fn hostile_map() -> Map {
 fn exp_21_hostile_authorities_appear_only_escaped() {
     let svg = hostile_map().to_svg();
     well_formed(&svg).expect("well-formed");
-    for raw in ["<img", "<script", "\"><", "</text><text>", "\u{1}"] {
-        assert!(!svg.contains(raw), "{raw:?} in the SVG");
+    for raw in ["<img", "<script", "</text><text>", "\u{1}"] {
+        assert!(!svg.contains(raw), "an unescaped sequence in the SVG");
     }
     assert!(svg.contains("&lt;img src=x onerror=alert(1)&gt;:80"));
+    assert!(svg.contains("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;:80"));
     assert!(svg.contains("a&amp;b.example.com:80"));
     assert!(svg.contains("it&apos;s.example.com:80"));
     assert!(svg.contains('\u{FFFD}'));
