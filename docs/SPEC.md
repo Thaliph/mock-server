@@ -3963,6 +3963,30 @@ such as `<img src=x onerror=alert(1)>`.
 | EXP-07 | **E.** Browser (the Chromium of UI-12): `/ui/` shows the four tabs; the Workloads tab lists the e2e deployment `users` of `disc-22` with its mode and its `MimicWorkload`, whose link opens the resource view showing the spec as YAML; each tab path shows its heading; no CSP violation, no request outside the port-forward, no Try it out button. |
 | EXP-08 | **D** (review). `docs/wiki/Reading-the-API.md` documents the two new routes and the resource view, and `docs/wiki/Quick-start.md` the tabs. |
 
+### 12.18 Production values (#438)
+
+`deploy/helm/mimic/values-production.yaml` is the reviewed overlay of a production install:
+`helm install mimic deploy/helm/mimic -f deploy/helm/mimic/values-production.yaml`, with its placeholders
+(`networkPolicy.webhookFrom`, `valkey.persistence.storageClass`) filled in by the operator. The overlay
+changes no default: the default render stays the golden file of MON-01. Three knobs are new, all empty by
+default and passed through to the pod spec: `controller.priorityClassName`, `valkey.priorityClassName` and
+`controller.topologySpreadConstraints`. The checks read the render of the overlay (`helm template` with
+`valkey.existingSecret=golden`, as MON-01).
+
+Levels as in §12.2, plus **M** (main session, recorded on the PR).
+
+| ID | Criterion |
+|---|---|
+| CHT-01 | **E** (`helm lint`, `scripts/check-chart.sh`). `helm lint --strict deploy/helm/mimic -f deploy/helm/mimic/values-production.yaml` passes. |
+| CHT-02 | **E** (`helm template`, `scripts/check-chart.sh`). Pod Security `restricted` for every pod template of the overlay render: no `hostNetwork`, `hostPID`, `hostIPC` or `hostPath` volume; `runAsNonRoot: true` and `seccompProfile.type: RuntimeDefault` on the pod or on each container; every container and init container has `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` and no `capabilities.add`. The overlay adds no privilege: no rendered container adds a capability (`mimic-init`, which needs `NET_ADMIN` and `NET_RAW`, is injected, not rendered). |
+| CHT-03 | **E** (`helm template`, `scripts/check-chart.sh`). Every container and init container of the overlay render has `resources.requests` with `cpu` and `memory`, and `resources.limits` with `memory`. The controller, Valkey and exporter containers and the injected sidecar (`MIMIC_INJECT_SIDECAR_RESOURCES`) also have `limits.cpu`. Two containers are outside this check: `mimic-init` (added to injected pods by the webhook, which sets no resources: a gap of the injection patch, §7.1) and `mimic-load` (resources from the controller's `MIMIC_LOAD_RESOURCES` default, not a chart value). They are not in the render. |
+| CHT-04 | **E** (`helm template`, `scripts/check-chart.sh`). Every `image` of the overlay render, and the values of `MIMIC_INJECT_SIDECAR_IMAGE` and `MIMIC_INJECT_INIT_IMAGE`, is `repository@sha256:` followed by 64 lowercase hex digits; no reference is by tag alone. `image.digest` and `inject.initImage.digest` of the overlay are set. |
+| CHT-05 | **E** (`helm template`, `scripts/check-chart.sh`). The overlay render has: the controller Deployment with 3 replicas and two `topologySpreadConstraints` (`maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, on `topology.kubernetes.io/zone` and on `kubernetes.io/hostname`, selecting `app.kubernetes.io/name: mimic-controller`); the PodDisruptionBudget `<release>-controller` with `maxUnavailable: 1`; `priorityClassName: mimic-critical` on the controller and Valkey pods; the ServiceMonitor `<release>-controller`, the PodMonitors `<release>-sidecar` and `<release>-valkey`, and the Valkey exporter; no object `<release>-prometheus*` or `<release>-grafana*`, no MimicLoadTest CRD and no ValidatingAdmissionPolicy `mimic-load-job` (the one of `<release>-injector` stays); `networkPolicy.webhookFrom` holds one `ipBlock`; `MIMIC_LOG` of the controller and `MIMIC_LOG` of the injected sidecars are `info`; `valkey.persistence.enabled` is true. |
+| CHT-06 | **E** (`scripts/check-chart.sh`). `values-production.yaml` holds no secret: no non-empty scalar at a key path that names a password, passwd, token, secret, credential or private key, and no PEM block (`-----BEGIN`) or known token prefix (`AKIA`, `ghp_`, `sk_live_`). |
+| CHT-07 | **M** (main session, recorded on the PR). `trivy config` on a directory holding the overlay render (`helm template … -f values-production.yaml`) reports no HIGH or CRITICAL finding. |
+| CHT-08 | **E** (kind, `scripts/e2e.sh` section `cht_08`). One install with the overlay, with the kind adaptations listed in the script header (locally built images by tag, no Prometheus Operator CRDs, no webhook source CIDR, a PriorityClass `mimic-critical` created by the script): the controller Deployment has 3 Ready replicas, the Valkey StatefulSet is Ready, and the live PodDisruptionBudget, topology spread constraints and priority class are those of CHT-05. |
+| CHT-09 | **D** (review). `docs/wiki/Install.md` has a section *Production install* that explains each value of the overlay and each placeholder; `docs/wiki/Configuration.md` lists `controller.priorityClassName`, `valkey.priorityClassName` and `controller.topologySpreadConstraints`, and the overlay's values that differ from the defaults. |
+
 ## 13. Test strategy
 
 - **Unit** tests in `mimic-core` (pure logic) and next to the code.

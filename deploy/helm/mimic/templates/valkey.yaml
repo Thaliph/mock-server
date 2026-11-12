@@ -41,6 +41,9 @@ spec:
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
+      {{- with .Values.valkey.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
