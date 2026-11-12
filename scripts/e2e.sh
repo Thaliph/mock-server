@@ -3705,27 +3705,40 @@ kubectl -n msh-28-b delete referencegrant allow-web >/dev/null
 msh_until 60 "the destination kept its endpoints after the ReferenceGrant was deleted" no_destination
 msh_until 60 "web-cfg is not RefNotPermitted again" reason_is RefNotPermitted
 
-# A scale: a request held on the current view is answered within the debounce plus 2 s of the new endpoint becoming ready
-# (the 0.5 s of slack is the poll of this script).
+# A scale: held requests follow the view. A held request answers on the first change of the view (the new pod
+# appears before it is ready), so the script keeps long-polling with each new ETag; the view that holds both endpoints
+# is served within the debounce plus 2 s of the second endpoint becoming ready (0.5 s of slack: the poll of this script).
 msh_curl web "$WORK/msh.json" >/dev/null
 etag=$(msh_etag "$WORK/msh.json")
-rm -f "$WORK/msh-scaled.end"
-( code=$(msh_curl web "$WORK/msh-scaled.json" -H "If-None-Match: $etag"); echo "$code $(date +%s.%N)" > "$WORK/msh-scaled.end" ) &
-held_pid=$!
-PIDS+=("$held_pid")
-sleep 1
-kubectl -n msh-28-a scale deploy/web --replicas=2 >/dev/null
 ready_endpoints() { kubectl -n msh-28-a get endpointslices -l kubernetes.io/service-name=web -o json | jq '[.items[].endpoints[] | select(.conditions.ready == true)] | length'; }
-for _ in $(seq 120); do [[ $(ready_endpoints) == 2 ]] && break; sleep 0.2; done
-ready_at=$(date +%s.%N)
-[[ $(ready_endpoints) == 2 ]] || fail "msh_28: the scaled deployment never had two ready endpoints"
-wait "$held_pid" || true
-read -r code ended < "$WORK/msh-scaled.end"
-[[ $code == 200 ]] || fail "msh_28: the held request ended $code after the scale, not 200"
-late=$(awk -v e="$ended" -v r="$ready_at" 'BEGIN { printf "%.2f", e - r }')
-awk -v late="$late" 'BEGIN { exit !(late <= 2.6) }' || fail "msh_28: the held request was answered ${late}s after the endpoint became ready"
-[[ $(jq '.services["msh-28-a/web"].endpoints["80"] | length' "$WORK/msh-scaled.json") == 2 ]] \
-  || fail "msh_28: the served view of web does not have two endpoints after the scale"
+rm -f "$WORK/msh-ready.at"
+# When the API server shows both endpoints ready, in the background while the script long-polls.
+( for _ in $(seq 300); do [[ $(ready_endpoints) == 2 ]] && { date +%s.%N > "$WORK/msh-ready.at"; exit 0; }; sleep 0.2; done ) &
+ready_pid=$!
+PIDS+=("$ready_pid")
+kubectl -n msh-28-a scale deploy/web --replicas=2 >/dev/null
+scaled_at=
+for _ in $(seq 12); do
+  code=$(msh_curl web "$WORK/msh-scaled.json" -H "If-None-Match: $etag")
+  answered=$(date +%s.%N)
+  case $code in
+    304) continue ;;
+    200) ;;
+    *) fail "msh_28: a held request ended $code after the scale, not 200 or 304" ;;
+  esac
+  etag=$(msh_etag "$WORK/msh-scaled.json")
+  if [[ $(jq '.services["msh-28-a/web"].endpoints["80"] | length' "$WORK/msh-scaled.json") == 2 ]]; then
+    scaled_at=$answered
+    break
+  fi
+done
+[[ -n $scaled_at ]] || fail "msh_28: the served view of web never had two endpoints after the scale"
+wait "$ready_pid" || true
+[[ -s $WORK/msh-ready.at ]] || fail "msh_28: the scaled deployment never had two ready endpoints"
+ready_at=$(<"$WORK/msh-ready.at")
+late=$(awk -v e="$scaled_at" -v r="$ready_at" 'BEGIN { printf "%.2f", e - r }')
+awk -v late="$late" 'BEGIN { exit !(late <= 2.6) }' \
+  || fail "msh_28: the view with both endpoints was served ${late}s after the second endpoint became ready"
 kubectl delete namespace msh-28-a msh-28-b --wait=false >/dev/null
 [[ -z ${MSH_28_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
 MSH_28_CLEANUP=
