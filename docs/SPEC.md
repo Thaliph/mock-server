@@ -1604,7 +1604,7 @@ the recorder keeps the first message of each side:
   deployment without data is served and shows "no data" from the `404` of its JSON route.
 - **Explorer shell and Workloads tab (F15).** Every page carries the same four tabs, in this
   order: Map (`/ui/map`), Workloads (`/ui/`), Endpoints (`/ui/endpoints`), Load tests
-  (`/ui/loadtests`); Map and Load tests are placeholders until their own features.
+  (`/ui/loadtests`); Map is a placeholder until its own feature.
   The deployment page and the document page of F6 stay as they are. The Workloads tab lists every
   deployment with its namespace, mode, pods, last push and the mimic resources that configure it
   (`MimicWorkload`, `MimicLoadTest`, from #440 `MimicConfig`), each linking to
@@ -1640,6 +1640,27 @@ the recorder keeps the first message of each side:
   its document, `/ui/workloads/<ns>/<dep>/openapi/<document>` (inbound `inbound-<port>`,
   outbound `outbound-<authority>`), every part passed through `encodeURIComponent`. A deployment
   without data shows "No data". The documents and the read routes do not change.
+- **Load tests tab (F15).** `/ui/loadtests` is a static page like the others; `mimic.js` first
+  reads `GET /v1/features`, `{"loadTest": {"enabled": <bool>}}`, true when `MIMIC_LOAD_MAX_RUNS`
+  is above 0 (chart `loadTest.enabled`, §10.7): a constant of the process, answered with no
+  Valkey and no API server call. When it is false the tab shows its heading and the text "Load
+  testing is disabled", which names the chart value `loadTest.enabled`, and requests nothing
+  else. When it is true the tab reads `GET /v1/workloads` and `GET /v1/resources`, takes every
+  deployment either names (sorted by namespace then deployment), reads
+  `GET /v1/workloads/<ns>/<dep>/loadtests` for each and shows one row per stored run, the
+  runs of a deployment newest first: deployment (a link to its page), name (a link to the run
+  page), phase, reason, requests, RPS, p99 in microseconds, start and end; "No load test
+  runs" when there is none. The run page `GET /ui/workloads/<ns>/<dep>/loadtests/<uid>` (the
+  same static bytes; `400` for a name outside DNS-1123 or a `<uid>` that is not 8-4-4-4-12
+  lower-case hex) is filled from `…/loadtests/<uid>`: the name, phase, reason, start and end,
+  the total row, the error kinds of the run with their counts (the keys of `errors`, written as
+  text whatever they are) and a table with one row per endpoint of the summary (method, port,
+  template, requests, missed, RPS, statuses, errors, p50, p90, p99 and max in microseconds);
+  "No such run" from a `404`. Every part of a link goes through `encodeURIComponent`. The
+  routes carry numbers, names and phases only, and the page shows nothing else: no credential
+  field, value or Secret key can reach it. Starting or stopping a run from the UI is not
+  offered. The read routes of §7.5 do not change. `/v1/features` and the run page count in
+  `mimic_ui_requests_total` by route pattern.
 - **Swagger UI configuration** (in `mimic.js`, nothing inline): `url` = the document route;
   `supportedSubmitMethods: []` (no "Try it out" button, so the UI never sends a request to a
   workload); `tryItOutEnabled: false`; `validatorUrl: null` (no call to
@@ -4084,6 +4105,18 @@ U+0085, U+2028 and U+2029, and `exp_04_…` for the resource page route requirin
 | EXP-10 | **I.** `mimic.js` (read as text, UI-09 rules): the Endpoints tab no longer shows the placeholder text; it reads `/v1/workloads` and the `/endpoints` route, links to `/openapi/` through `enc(` and `encodeURIComponent`, has the four filters (method, template, authority, status class) and the `No endpoint matches` and `No data` texts; it contains no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write` or `eval`, and no `http://` or `https://`; the CSP of UI-08 is unchanged. |
 | EXP-11 | **E.** Browser (the Chromium of UI-12): `/ui/endpoints?deployment=disc-22/users` lists the endpoints `GET /users/{users_id}` and `PUT /users/{users_id}` (inbound, port 8080) and `?deployment=egr-19/front` its outbound ones with their authority; the method filter set to `PUT` leaves only the `PUT` row and the template filter `missing` only the matching rows; a status class matching nothing shows `No endpoint matches`; the row link opens the Swagger UI page of its document (no Try it out button); no CSP violation and no request outside the port-forward. |
 | EXP-12 | **D** (review). `docs/wiki/Reading-the-API.md` describes the Endpoints tab and its filters, and notes that annotation values of the resource view are shown as set by their authors (text, loopback-only UI); the security review of #466 finds no markup built from a template or an authority. |
+
+#### Load tests tab (#467)
+
+The Load tests tab of §7.5 (*Load tests tab*). Levels as in §12.2.
+
+| ID | Criterion |
+|---|---|
+| EXP-13 | **I.** `GET /v1/features` answers `{"loadTest": {"enabled": false}}` by default and `{"loadTest": {"enabled": true}}` when the controller runs with load tests enabled, as `application/json` with `X-Content-Type-Options: nosniff`, with Valkey stopped. `/ui/workloads/<ns>/<dep>/loadtests/<uid>` is `200` `text/html; charset=utf-8` (the bytes of `/ui/`) for a DNS-1123 namespace and deployment and a lower-case uid, `400` for another uid or name; UI-07 (`HEAD`, `405`), the `403` cases and the UI-08 headers hold on both routes, and `mimic_ui_requests_total` holds the patterns `/v1/features` and `/ui/workloads/{namespace}/{deployment}/loadtests/{uid}` with no name of the request. |
+| EXP-14 | **I** (real Valkey). For a deployment with an ended run (a summary with two endpoints and the error kinds `timeout` and `reset`) and a live one, `…/loadtests` gives each row the members the tab reads (`uid`, `name`, `phase`, `reason`, `start`, `end`, `total.requests`, `total.rps`, `total.latencyMicros.p99`), newest first, and `…/loadtests/<uid>` gives `summary.endpoints` with `method`, `port`, `template`, `requests`, `missed`, `rps`, `statuses`, `errors` and `latencyMicros` `p50`, `p90`, `p99`, `max`, and `summary.total.errors`; neither answer holds a credential field, a Secret name or a ticket. |
+| EXP-15 | **I.** `mimic.js` (read as text, UI-09 rules): the Load tests tab no longer shows the placeholder text; it reads `/v1/features`, `/v1/workloads`, `/v1/resources` and the `/loadtests` routes, has the texts `Load testing is disabled`, `No load test runs` and `No such run`, routes `parts[4] === "loadtests"` under `parts[1] === "workloads"`, builds its links through `enc(`, writes the keys of `errors` and `statuses` as text, and contains no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write` or `eval`, and no `http://` or `https://`. |
+| EXP-16 | **E.** Browser (the Chromium of UI-12). On the cluster of `scripts/e2e.sh` (load tests disabled) `/ui/loadtests` shows "Load testing is disabled" and no table, with no CSP violation and no request outside the port-forward. On the cluster of `scripts/e2e-load.sh` (`loadTest.enabled`), `/ui/loadtests` lists runs `ldt16-a` (`Succeeded`, `Completed`) and `ldt16-b` (`Aborted`, `ModeLeft`) of `mck-19/front`, the link of `ldt16-a` opens the run page, which shows the endpoint table; the canary of the credentials Secret appears on neither page. |
+| EXP-17 | **D** (review). `docs/wiki/Reading-the-API.md` documents `/v1/features` and the tab, `docs/wiki/Load-test.md` points to it; `CHANGELOG.md` `[Unreleased]` names the tab; the security review finds no credential value, no markup built from a recorded value and no query value used unvalidated. |
 
 ### 12.18 Production values (#438)
 
