@@ -2325,7 +2325,7 @@ jq -e --arg a "$egr_authority" '[.rows[] | select(.[0] == "outbound" and .[2] ==
   "$WORK/browse-ep-front.json" >/dev/null \
   || fail "exp_11: the Endpoints tab does not list front's outbound endpoints: $(jq -c .rows "$WORK/browse-ep-front.json")"
 browse ep-front-authority '/ui/endpoints?deployment=egr-19/front' --wait '/missing' --set filter-authority=users.disc-22
-jq -e --arg a "$egr_authority" '[.rows[] | select(.[0] == "inbound")] | length == 0 and ([.rows[] | select(.[0] == "outbound" and .[2] == $a)] | length == 3)' \
+jq -e --arg a "$egr_authority" '([.rows[] | select(.[0] == "inbound")] | length == 0) and ([.rows[] | select(.[0] == "outbound" and .[2] == $a)] | length == 3)' \
   "$WORK/browse-ep-front-authority.json" >/dev/null \
   || fail "exp_11: the authority filter does not keep exactly the outbound rows: $(jq -c .rows "$WORK/browse-ep-front-authority.json")"
 browse outbound "$egr_href" --wait '/users/{users_id}' --expand
