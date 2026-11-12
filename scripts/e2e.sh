@@ -3258,14 +3258,19 @@ for p in $non08_pods; do
 done
 # non08_keys: the Valkey keys of users in non-08 (the keys of its pods, report and egress, and its pulls).
 non08_keys() {
-  kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw --scan --pattern 'mimic:v1:{non-08/users}*' | sort
+  local keys
+  keys=$(kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw --scan --pattern 'mimic:v1:{non-08/users}*') || return 1
+  sort <<<"$keys"
 }
 non08_restarts() { kubectl -n non-08 get pods -l app=users -o jsonpath='{range .items[*]}{.metadata.name}{"="}{range .status.initContainerStatuses[*]}{.restartCount}{","}{end}{"\n"}{end}'; }
 # In none the controller holds no discovery data: no report (404 on the read API) and no key but the pulls of the pods.
 ui_forward
 [[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 localhost:18082/v1/workloads/non-08/users/report) == 404 ]] \
   || fail "non_08: the controller holds a report for a deployment in none"
-non08_other=$(non08_keys | grep -v ':pulls$' || true)
+non08_all=$(non08_keys) || fail "non_08: the Valkey key scan failed"
+# Not vacuous: the pods' pulls are there (the scan reached the right keyspace).
+grep -q ':pulls$' <<<"$non08_all" || fail "non_08: no pulls key for a deployment in none (scan: '$non08_all')"
+non08_other=$(grep -v ':pulls$' <<<"$non08_all" || true)
 [[ -z $non08_other ]] || fail "non_08: Valkey holds keys for a deployment in none besides its pulls: $non08_other"
 non08_before=$(non08_restarts)
 kubectl apply -f - >/dev/null <<YAML
