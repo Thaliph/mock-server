@@ -70,7 +70,9 @@ ben_02_invalid_configuration_refused() {
   local case
   for case in "SETUPS=none" "PROTOCOLS=http2" "RATES=0" "RATES=201" "RATES=1.5" "RATES=" \
     "DURATION=0s" "DURATION=301s" "DURATION=30" "CONNECTIONS=0" "CONNECTIONS=65" "PAUSE=-1" \
-    "CLUSTER=Bad_Name" "NODE_IMAGE=kindest/node:v1.33.12"; do
+    "CLUSTER=Bad_Name" "CLUSTER=mimic-e2e" "CLUSTER=mimic-e2e2" "NODE_IMAGE=kindest/node:v1.33.12" \
+    "RATES=9223372036854775808" "RATES=18446744073709551616" "RATES=0200" \
+    "CONNECTIONS=18446744073709551617" "CONNECTIONS=064"; do
     run "$case" -- --dry-run
     local name=${case%%=*}
     check "$case: exits 2" rc_is 2

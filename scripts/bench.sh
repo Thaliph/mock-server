@@ -76,19 +76,22 @@ for protocol in "${PROTOCOL_LIST[@]}"; do
   contains "$protocol" http1 h2c || config_error PROTOCOLS "$protocol is not http1 or h2c"
 done
 for rate in "${RATE_LIST[@]}"; do
-  [[ $rate =~ ^[1-9][0-9]*$ ]] || config_error RATES "$rate is not a positive integer"
+  # At most 3 digits before any arithmetic: a longer number would overflow bash integers past the cap.
+  [[ $rate =~ ^[1-9][0-9]{0,2}$ ]] || config_error RATES "$rate is not an integer from 1 to $RATE_CAP"
   ((rate <= RATE_CAP)) || config_error RATES "$rate rps is above the cap of $RATE_CAP rps"
 done
 [[ $DURATION =~ ^[1-9][0-9]{0,2}s$ ]] || config_error DURATION "$DURATION is not <n>s with 1 <= n <= 300"
 DURATION_S=${DURATION%s}
 ((DURATION_S <= 300)) || config_error DURATION "$DURATION is above 300 s"
-if ! [[ $CONNECTIONS =~ ^[1-9][0-9]*$ ]] || ((CONNECTIONS > 64)); then
+if ! [[ $CONNECTIONS =~ ^[1-9][0-9]?$ ]] || ((CONNECTIONS > 64)); then
   config_error CONNECTIONS "$CONNECTIONS is not 1 to 64"
 fi
 if ! [[ $PAUSE =~ ^(0|[1-9][0-9]{0,2})$ ]] || ((PAUSE > 600)); then
   config_error PAUSE "$PAUSE is not 0 to 600"
 fi
 [[ $CLUSTER =~ ^[a-z0-9-]+$ ]] || config_error CLUSTER "$CLUSTER does not match ^[a-z0-9-]+\$"
+# The e2e clusters (scripts/e2e.sh, and the one an owner keeps for manual tests) are never benchmarked or deleted.
+[[ $CLUSTER == mimic-e2e* ]] && config_error CLUSTER "$CLUSTER is an e2e cluster"
 [[ $KEEP_CLUSTER == 0 || $KEEP_CLUSTER == 1 ]] || config_error KEEP_CLUSTER "$KEEP_CLUSTER is not 0 or 1"
 
 # The pinned images: the kind node image and the fortio image (BEN-05, scripts/pinned-image.sh).
