@@ -582,6 +582,10 @@ impl MeshState {
         c.stale_warned = false;
     }
 
+    /// Test hook (#443): the next pooled checkout hands out a connection that is already
+    /// closed, as a pod closing it between the readiness check and the write would.
+    pub fn poison_next_checkout(&self) {}
+
     /// Removes the per-pod series of the endpoints that left the view 5 minutes before `now`.
     pub fn evict(&self, now: Instant) {
         self.0.router.metrics.evict(now);

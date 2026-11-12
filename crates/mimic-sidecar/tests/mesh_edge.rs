@@ -149,12 +149,119 @@ async fn msh_59_requests_succeed_against_pods_that_close_their_connections() {
                 tokio::time::sleep(Duration::from_millis(80)).await;
             }
         }
-        let metrics = f.metrics.encode();
-        assert!(
-            metrics.contains("mimic_mesh_reconnects"),
-            "the counter is registered"
-        );
     }
+}
+
+/// A pod that reads each request head and closes without answering; the count is of heads.
+async fn silent_closer() -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let heads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = heads.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut pending = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                    pending.extend_from_slice(&buf[..n]);
+                    if pending.windows(4).any(|w| w == b"\r\n\r\n") {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, heads)
+}
+
+fn counter(metrics: &str, prefix: &str) -> f64 {
+    metrics
+        .lines()
+        .filter(|l| l.starts_with(prefix))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
+#[tokio::test]
+async fn msh_59_a_request_the_pod_read_is_not_sent_again() {
+    let _logs = capture_logs();
+    let (pod, heads) = silent_closer().await;
+    let state = state_for(common::mesh_pods::cluster_ip(), &[pod], |_| {});
+    let f = fixture_mesh(common::mesh_pods::cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(b"POST /x HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: 2\r\n\r\nab")
+        .await;
+    assert!(
+        client.read().await.is_none(),
+        "the connection is closed, no answer"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        heads.load(Ordering::SeqCst),
+        1,
+        "the pod saw the request once"
+    );
+    let metrics = f.metrics.encode();
+    assert_eq!(
+        counter(&metrics, "mimic_mesh_reconnects_total"),
+        0.0,
+        "reconnects"
+    );
+    let none = "mimic_mesh_requests_total{service=\"shop/cart\",route=\"none\",backend=\"shop/cart:80\",status_class=\"none\"";
+    assert_eq!(counter(&metrics, none), 1.0, "requests without a response");
+}
+
+#[tokio::test]
+async fn msh_59_an_unwritten_request_is_sent_again_once_on_a_new_http1_connection() {
+    let _logs = capture_logs();
+    let pod = Pod::http1("a", 0).await;
+    let state = state_for(common::mesh_pods::cluster_ip(), &[pod.addr], |_| {});
+    let f = fixture_mesh(common::mesh_pods::cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client.get("/one").await;
+    state.poison_next_checkout();
+    let (head, body) = client.get("/two").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, "a");
+    assert_eq!(
+        pod.counts.requests(),
+        2,
+        "each request reached the pod once"
+    );
+    let reconnects = counter(&f.metrics.encode(), "mimic_mesh_reconnects_total");
+    assert_eq!(reconnects, 1.0, "reconnects");
+    // The pooled connection, the one handed out closed, and the new one.
+    settled(|| pod.counts.accepted() == 3).await;
+}
+
+#[tokio::test]
+async fn msh_59_an_unwritten_request_is_sent_again_once_on_a_new_h2_connection() {
+    let _logs = capture_logs();
+    let pod = Pod::h2c("a", 0, None).await;
+    let state = state_for(common::mesh_pods::cluster_ip(), &[pod.addr], |_| {});
+    let f = fixture_mesh(common::mesh_pods::cluster_ip(), &state, None).await;
+    assert_eq!(common::mesh_pods::h2c_calls(f.addr, 1, 1).await, vec!["a"]);
+    state.poison_next_checkout();
+    assert_eq!(common::mesh_pods::h2c_calls(f.addr, 1, 1).await, vec!["a"]);
+    assert_eq!(
+        pod.counts.requests(),
+        2,
+        "each request reached the pod once"
+    );
+    let reconnects = counter(&f.metrics.encode(), "mimic_mesh_reconnects_total");
+    assert_eq!(reconnects, 1.0, "reconnects");
+    // The first connection, the one handed out closed, and a new one (not the first again).
+    settled(|| pod.counts.accepted() == 3).await;
 }
 
 /// A pod that answers `200 ok` to a request and, to one with `Upgrade` (or `CONNECT`), `101`
