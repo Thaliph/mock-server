@@ -322,9 +322,10 @@ EOF
 }
 {
   # The server answers 1 KiB after a fixed 5 ms delay (the echo defaults of fortio's server).
-  workload fortio-server '["server", "-http-port", "8080", "-ui-path", "", "-echo-server-default-params", "size=1024&delay=5ms"]' 8080
+  # `-redirect-port disabled`: fortio's server otherwise also listens on 8081 (an https redirector).
+  workload fortio-server '["server", "-http-port", "8080", "-redirect-port", "disabled", "-ui-path", "", "-echo-server-default-params", "size=1024&delay=5ms"]' 8080
   # The client runs fortio's server only to stay up; the load is started with kubectl exec.
-  workload fortio-client '["server", "-http-port", "8081", "-ui-path", ""]' 8081
+  workload fortio-client '["server", "-http-port", "8081", "-redirect-port", "disabled", "-ui-path", ""]' 8081
 } | kubectl apply -f -
 kubectl -n "$NS" rollout status deploy/fortio-server --timeout=180s
 kubectl -n "$NS" rollout status deploy/fortio-client --timeout=180s
