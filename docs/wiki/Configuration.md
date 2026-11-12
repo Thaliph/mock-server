@@ -67,6 +67,8 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `controller.sidecarApiPort` | `8444` | Port of the sidecar API; also given to sidecars. |
 | `controller.status.interval` | `30s` | 1s-1h. `MIMIC_STATUS_INTERVAL`. |
 | `controller.status.podWindow` | `5m` | 1s-24h. `MIMIC_STATUS_POD_WINDOW`. |
+| `mesh.enabled` | `true` | Kill switch of the mesh view: `false` sets `MIMIC_MESH=off` on the controller; it serves no view (`404`), watches nothing and its ClusterRole drops the mesh rules. |
+| `mesh.clusterName`, `mesh.watchTimeout`, `mesh.debounce`, `mesh.viewCacheBytes`, `mesh.maxServices`, `mesh.maxEndpoints`, `mesh.maxViewBytes`, `mesh.maxWatches` | `local`, `30s`, `100ms`, `64Mi`, `1024`, `10000`, `4Mi`, `10000` | The variables of the same names below (`MIMIC_CLUSTER_NAME`, `MIMIC_MESH_WATCH_TIMEOUT`, ...). |
 | `inject.initImage.repository` | `ghcr.io/thaliph/mimic-init` | |
 | `inject.initImage.tag` / `.digest` | `""` / `""` | Tag defaults to the appVersion; digest wins. |
 | `inject.sidecarResources` | requests `50m` / `64Mi`; limit memory `128Mi` | Resources of `mimic-sidecar` in injected pods (JSON in `MIMIC_INJECT_SIDECAR_RESOURCES`). |
@@ -142,6 +144,13 @@ sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 | `MIMIC_STORE_MAX_DEPLOYMENTS` | `50` | Deployments with data per namespace. 1-100000. |
 | `MIMIC_STATUS_INTERVAL` | `30s` | 1s-1h (chart: `controller.status.interval`). |
 | `MIMIC_STATUS_POD_WINDOW` | `5m` | 1s-24h (chart: `controller.status.podWindow`). |
+| `MIMIC_MESH` | `on` | `on` or `off` (chart: `mesh.enabled`). `off`: `GET /v1/workloads/<deployment>/mesh` answers `404` and nothing is watched. |
+| `MIMIC_CLUSTER_NAME` | `local` | Name of the cluster in the view. 1-63 characters of `a-z`, `0-9`, `-`. |
+| `MIMIC_MESH_WATCH_TIMEOUT` | `30s` | A held view request ends `304` after this long without a change. 100ms-10m. |
+| `MIMIC_MESH_DEBOUNCE` | `100ms` | Changes are coalesced for this long, doubled up to 1s while they keep arriving. 10ms-1s. |
+| `MIMIC_MESH_VIEW_CACHE_BYTES` | `64Mi` | Built views cached per replica, least recently used out first. At least `MIMIC_MESH_MAX_VIEW_BYTES`, at most 4Gi. |
+| `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS`, `MIMIC_MESH_MAX_VIEW_BYTES` | `1024`, `10000`, `4Mi` | Bounds of one view: 1-100000, 1-1000000, 64Ki-256Mi. A view over a bound is served truncated (`mimic_mesh_view_truncated_total`). |
+| `MIMIC_SIDECAR_API_MAX_WATCHES` | `10000` | Held view requests at once per replica, 1-1000000; over it `503` with `Retry-After: 1`. |
 | `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API; plain HTTP, loopback peers only. |
 
 ### Sidecar

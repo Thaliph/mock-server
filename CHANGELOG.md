@@ -21,6 +21,13 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- The controller serves the mesh view (#441, M1): both replicas watch Services, EndpointSlices, Deployment metadata,
+  `MimicConfig`s, `MimicWorkload`s and, when its CRD exists, `ReferenceGrant`s, and a sidecar fetches its own
+  deployment's view with `GET /v1/workloads/<deployment>/mesh?format=1` (long-poll, `ETag`, gzip, debounced,
+  cached, with a watch budget of its own). `MimicConfig` statuses (`Accepted`, `ResolvedRefs`, `RefNotPermitted`
+  without a `ReferenceGrant`) are written by server-side apply, field manager `mimic-mesh`. Chart: `mesh.enabled`
+  (`false` sets `MIMIC_MESH=off`: `404`, nothing watched) and the bounds; the ClusterRole gains read-only watches
+  on those kinds and `patch` on `mimicconfigs/status`. No Secret access. Nothing consumes the view until #442.
 - `MimicConfig` CRD and the pure mesh view (#440, M1): the chart installs `mimicconfigs.mimic.platform.io` (kept on
   uninstall; no controller acts on it yet) and `mimic-core` gains `mesh::policy` and `mesh::view`, the scoped
   view of a deployment with the consent rule for destinations of other namespaces (a `ReferenceGrant` from

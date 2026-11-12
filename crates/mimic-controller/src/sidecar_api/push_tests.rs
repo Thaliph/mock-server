@@ -156,6 +156,7 @@ fn setup(options: Options) -> Setup {
         egress: EgressCache::new(options.egress_budget, &api_metrics),
         egress_logged: EgressLogged::default(),
         load: None,
+        mesh: None,
     });
     Setup {
         router: router(api.clone()),

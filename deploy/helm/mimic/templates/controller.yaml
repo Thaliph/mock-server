@@ -87,6 +87,25 @@ spec:
               value: {{ .Values.controller.status.interval | quote }}
             - name: MIMIC_STATUS_POD_WINDOW
               value: {{ .Values.controller.status.podWindow | quote }}
+            # The mesh view (spec §7.2, §10.2); off: no view is served (404) and nothing is watched.
+            - name: MIMIC_MESH
+              value: {{ ternary "on" "off" .Values.mesh.enabled | quote }}
+            - name: MIMIC_CLUSTER_NAME
+              value: {{ .Values.mesh.clusterName | quote }}
+            - name: MIMIC_MESH_WATCH_TIMEOUT
+              value: {{ .Values.mesh.watchTimeout | quote }}
+            - name: MIMIC_MESH_DEBOUNCE
+              value: {{ .Values.mesh.debounce | quote }}
+            - name: MIMIC_MESH_VIEW_CACHE_BYTES
+              value: {{ .Values.mesh.viewCacheBytes | quote }}
+            - name: MIMIC_MESH_MAX_SERVICES
+              value: {{ .Values.mesh.maxServices | quote }}
+            - name: MIMIC_MESH_MAX_ENDPOINTS
+              value: {{ .Values.mesh.maxEndpoints | quote }}
+            - name: MIMIC_MESH_MAX_VIEW_BYTES
+              value: {{ .Values.mesh.maxViewBytes | quote }}
+            - name: MIMIC_SIDECAR_API_MAX_WATCHES
+              value: {{ .Values.mesh.maxWatches | quote }}
             # Load test runs active at once in the cluster (spec §10.2): 0 disables load tests.
             - name: MIMIC_LOAD_MAX_RUNS
               value: {{ ternary "4" "0" .Values.loadTest.enabled | quote }}

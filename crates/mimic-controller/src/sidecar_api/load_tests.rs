@@ -162,6 +162,7 @@ async fn setup(rate: u32) -> Setup {
             runs: runs.clone(),
             slices: slices.clone(),
         }),
+        mesh: None,
     });
     Setup {
         router: router(api.clone()),

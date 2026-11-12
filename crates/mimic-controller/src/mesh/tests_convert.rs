@@ -75,7 +75,10 @@ fn msh_27_a_slice_has_its_service_generation_ports_and_endpoints() {
     assert_eq!(key, ("shop".to_string(), "cart-x7k2p".to_string()));
     assert_eq!((s.service.as_str(), s.generation), ("cart", 41));
     assert_eq!(s.ports.len(), 2);
-    assert_eq!((s.ports[0].name.as_deref(), s.ports[0].port), (Some("http"), 8080));
+    assert_eq!(
+        (s.ports[0].name.as_deref(), s.ports[0].port),
+        (Some("http"), 8080)
+    );
     assert_eq!((s.ports[1].name.as_deref(), s.ports[1].port), (None, 9000));
     assert_eq!(s.endpoints.len(), 3);
     assert!(s.endpoints[0].ready && s.endpoints[0].serving);
@@ -121,13 +124,22 @@ fn msh_27_a_mimicconfig_has_its_targets_destinations_switches_and_times() {
     assert_eq!(
         c.targets,
         [
-            Target { kind: TargetKind::Deployment, name: "cart".into() },
-            Target { kind: TargetKind::Service, name: "cart".into() },
+            Target {
+                kind: TargetKind::Deployment,
+                name: "cart".into()
+            },
+            Target {
+                kind: TargetKind::Service,
+                name: "cart".into()
+            },
         ]
     );
     assert_eq!(
         c.destinations,
-        Some(vec![Destination { namespace: "risk".into(), name: "scoring".into() }])
+        Some(vec![Destination {
+            namespace: "risk".into(),
+            name: "scoring".into()
+        }])
     );
     assert_eq!(c.mesh_enabled, Some(false));
     assert_eq!(c.slow_start, Some(45));
@@ -143,7 +155,10 @@ fn msh_27_a_mimicconfig_that_sets_nothing_has_none_and_a_malformed_one_is_still_
         "spec": {"targetRefs": [{"group": "apps", "kind": "Deployment", "name": "cart"}]}
     }));
     let (_, c) = convert::config(&bare).unwrap();
-    assert_eq!((c.destinations, c.mesh_enabled, c.slow_start), (None, None, None));
+    assert_eq!(
+        (c.destinations, c.mesh_enabled, c.slow_start),
+        (None, None, None)
+    );
     // A spec the schema would refuse (the object may predate a stricter CRD): no target, so
     // `Invalid` in the statuses, never a panic and never skipped silently.
     let odd = dynamic(json!({
@@ -169,13 +184,25 @@ fn msh_27_a_referencegrant_has_its_from_and_to() {
     assert_eq!(g.namespace, "risk");
     assert_eq!(
         g.from,
-        [GrantFrom { group: "mimic.platform.io".into(), kind: "MimicConfig".into(), namespace: "shop".into() }]
+        [GrantFrom {
+            group: "mimic.platform.io".into(),
+            kind: "MimicConfig".into(),
+            namespace: "shop".into()
+        }]
     );
     assert_eq!(
         g.to,
         [
-            GrantTo { group: String::new(), kind: "Service".into(), name: None },
-            GrantTo { group: String::new(), kind: "Service".into(), name: Some("scoring".into()) },
+            GrantTo {
+                group: String::new(),
+                kind: "Service".into(),
+                name: None
+            },
+            GrantTo {
+                group: String::new(),
+                kind: "Service".into(),
+                name: Some("scoring".into())
+            },
         ]
     );
     assert!(!format!("{g:?}").contains(CANARY));

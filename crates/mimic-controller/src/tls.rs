@@ -20,7 +20,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::PoisonError;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
@@ -152,7 +152,18 @@ pub async fn serve(
         let _ = stream.set_nodelay(true);
         let (acceptor, router, stop) = (acceptor.clone(), router.clone(), stop_rx.clone());
         connections.spawn(async move {
-            connection(stream, peer.ip(), acceptor, router, limits, stop).await;
+            // The connection's slot: a held request can give it back (see [`Hold`]).
+            let permit = Arc::new(Mutex::new(Some(permit)));
+            connection(
+                stream,
+                peer.ip(),
+                acceptor,
+                router,
+                limits,
+                permit.clone(),
+                stop,
+            )
+            .await;
             drop(permit);
         });
     }
@@ -175,6 +186,8 @@ enum Phase {
     Idle(Instant),
     /// A request started (first byte read) at this instant and is not answered yet.
     Request(Instant),
+    /// A request that is held on purpose (a long-poll): no deadline until it is answered.
+    Held,
 }
 
 #[derive(Default)]
@@ -202,6 +215,10 @@ impl Cycle {
             let deadline = match phase {
                 Phase::Idle(since) => since + limits.idle_timeout,
                 Phase::Request(since) => since + limits.request_timeout,
+                Phase::Held => {
+                    self.changed.notified().await;
+                    continue;
+                }
             };
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => {
@@ -261,12 +278,37 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
     }
 }
 
+/// Handed to every request in its extensions. A handler that holds a request on purpose calls
+/// [`Hold::start`] once the caller is authenticated: from then on the connection counts neither
+/// against `Limits::max_connections` nor against the request timeout, until the request is
+/// answered. The holder bounds the requests it holds with a budget of its own (the mesh
+/// long-poll, `MIMIC_SIDECAR_API_MAX_WATCHES`).
+#[derive(Clone)]
+pub struct Hold {
+    cycle: Arc<Cycle>,
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+}
+
+impl Hold {
+    pub fn start(&self) {
+        self.cycle.set(Phase::Held);
+        // Frees the slot of the connection for the next client.
+        drop(
+            self.permit
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
 async fn connection(
     stream: TcpStream,
     peer: std::net::IpAddr,
     acceptor: TlsAcceptor,
     router: Router,
     limits: Limits,
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
     mut stop: watch::Receiver<bool>,
 ) {
     let handshake = tokio::time::timeout(limits.request_timeout, acceptor.accept(stream));
@@ -285,6 +327,10 @@ async fn connection(
     let service = service_fn({
         let cycle = cycle.clone();
         move |mut request: hyper::Request<hyper::body::Incoming>| {
+            request.extensions_mut().insert(Hold {
+                cycle: cycle.clone(),
+                permit: permit.clone(),
+            });
             // The sidecar API limits by source; the other routes ignore it.
             request
                 .extensions_mut()
@@ -342,7 +388,11 @@ mod tests {
         start_with(router, max_connections, idle_timeout).await
     }
 
-    async fn start_with(router: Router, max_connections: usize, idle_timeout: Duration) -> Listener {
+    async fn start_with(
+        router: Router,
+        max_connections: usize,
+        idle_timeout: Duration,
+    ) -> Listener {
         let stored =
             certs::issue(&Stored::default(), Decision::NewCa, NAME, SystemTime::now()).unwrap();
         let slot = Arc::new(CertSlot::new());
@@ -475,21 +525,21 @@ mod tests {
 
     #[tokio::test]
     async fn msh_23_a_held_request_counts_neither_against_the_cap_nor_the_request_timeout() {
-        let router = Router::new()
-            .route("/ok", get(|| async { "ok" }))
-            .route(
-                "/hold",
-                get(|request: axum::extract::Request| async move {
-                    let hold = request.extensions().get::<Hold>().cloned().expect("a hold");
-                    hold.start();
-                    // Three times the request timeout.
-                    tokio::time::sleep(TIMEOUT * 3).await;
-                    "held"
-                }),
-            );
+        let router = Router::new().route("/ok", get(|| async { "ok" })).route(
+            "/hold",
+            get(|request: axum::extract::Request| async move {
+                let hold = request.extensions().get::<Hold>().cloned().expect("a hold");
+                hold.start();
+                // Three times the request timeout.
+                tokio::time::sleep(TIMEOUT * 3).await;
+                "held"
+            }),
+        );
         let server = start_with(router, 1, Duration::from_secs(60)).await;
         let mut held = server.tls().await;
-        held.write_all(b"GET /hold HTTP/1.1\r\nhost: x\r\n\r\n").await.unwrap();
+        held.write_all(b"GET /hold HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         // The only slot is free again: a second connection is served at once.
         let started = Instant::now();
@@ -498,8 +548,14 @@ mod tests {
         assert!(started.elapsed() < TIMEOUT, "{:?}", started.elapsed());
         // The held request outlives the request timeout and is answered.
         let mut buffer = [0; 512];
-        let n = tokio::time::timeout(TIMEOUT * 4, held.read(&mut buffer)).await.unwrap().unwrap();
+        let n = tokio::time::timeout(TIMEOUT * 4, held.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
         let answer = String::from_utf8_lossy(&buffer[..n]).into_owned();
-        assert!(answer.starts_with("HTTP/1.1 200") && answer.ends_with("held"), "{answer}");
+        assert!(
+            answer.starts_with("HTTP/1.1 200") && answer.ends_with("held"),
+            "{answer}"
+        );
     }
 }

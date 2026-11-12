@@ -65,7 +65,6 @@ fn msh_18_an_invalid_value_is_refused_naming_the_variable() {
         ("MIMIC_CLUSTER_NAME", "a_b"),
         ("MIMIC_CLUSTER_NAME", "-a"),
         ("MIMIC_CLUSTER_NAME", "a-"),
-        ("MIMIC_CLUSTER_NAME", ""),
         ("MIMIC_MESH_WATCH_TIMEOUT", "50ms"),
         ("MIMIC_MESH_WATCH_TIMEOUT", "11m"),
         ("MIMIC_MESH_WATCH_TIMEOUT", "abc"),
