@@ -128,8 +128,24 @@ The sidecar answers from the **egress snapshot** of its own Deployment, and from
    The destination is still not called. Each distinct miss is logged once per mock period (WARN `mock miss`, the
    path without its query).
 
-gRPC calls are answered with status `200`, the recorded headers and one empty message, then `grpc-status: 0`:
-recorded messages are opaque, so the content of a gRPC answer is not replayed.
+### gRPC calls
+
+A unary gRPC call (HTTP/2, `content-type: application/grpc`) is matched on its method path, then on its first
+request message (the fields of the message, by field number, like the fields of a JSON body; fields that vary
+between calls are not compared, so with few recorded calls the first sample answers). The answer is status `200`,
+the recorded headers, the recorded **response message** framed as gRPC expects (5-byte prefix, uncompressed,
+`content-type: application/grpc`), and the recorded trailers: `grpc-status`, `grpc-message` and the others, in
+HTTP/2 trailers. A recorded error (`grpc-status` other than 0, no message) is answered with its status and message
+and no message. `-bin` trailers are not replayed.
+
+The message is what was recorded, so it is redacted: a JWT, a token, a card or any high-entropy value is the
+placeholder (`mimic-jwt`, `mimic-token`, `mimic-secret`…), sent as a string in that field. A client that reads the
+field as a string gets the placeholder; one that reads it as a number sees an unknown field and so the default
+value. A call whose message was never recorded (a compressed message under an encoding other than `gzip`, over
+256 KiB, or recorded by a release before F14) gets one empty message and `grpc-status: 0`. A method that was never
+recorded is a miss: `599`, which a gRPC client sees as an HTTP error. The sidecar asks the controller for the
+egress set of `format` 2 (the one with the messages); against a controller of an earlier release (it answers `400`)
+it falls back to `format` 1 and gRPC calls get the empty message. Streams are not replayed yet.
 
 An empty snapshot (nothing recorded yet) misses every call. Turn the mode on once the Deployment has traffic
 behind it: [Egress aggregation](Egress-aggregation) shows what has been recorded.

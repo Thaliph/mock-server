@@ -41,9 +41,10 @@ fn unframed(body: &[u8]) -> String {
         .to_json_string()
 }
 
-/// One recorded call of `/pkg.Greeter/Hello`.
+/// One recorded call of `path`.
 fn record(
     report: &mut Report,
+    path: &str,
     request: &str,
     response: Option<&str>,
     headers: &[(&str, &str)],
@@ -66,7 +67,7 @@ fn record(
             direction: Direction::Outbound,
             port: 8080,
             method: "POST",
-            path: "/pkg.Greeter/Hello",
+            path,
             status: 200,
             head_ms: 1,
             host: None,
@@ -88,6 +89,7 @@ fn recorded() -> EgressSet {
     let trailers = [("grpc-status", "0"), ("x-neutral", "v")];
     record(
         &mut report,
+        "/pkg.Greeter/Hello",
         r#"{"1":"alice"}"#,
         Some(&format!(r#"{{"1":"hello alice","2":"{JWT}","3":7}}"#)),
         &[],
@@ -95,14 +97,18 @@ fn recorded() -> EgressSet {
     );
     record(
         &mut report,
+        "/pkg.Greeter/Hello",
         r#"{"1":"bob"}"#,
         Some(r#"{"1":"hello bob"}"#),
         &[],
         &trailers,
     );
-    // A failed call: trailers only, the status in the response headers.
+    // A failed call: trailers only, the status in the response headers, on a method of its own:
+    // a field that three calls of one method give mostly different values is volatile and never
+    // compared (spec §6), so the matching above is tried with two calls.
     record(
         &mut report,
+        "/pkg.Greeter/Fail",
         r#"{"1":"nobody"}"#,
         None,
         &[("grpc-status", "5"), ("grpc-message", "not found")],
@@ -191,7 +197,7 @@ async fn grp_33_a_recorded_error_status_is_replayed_with_no_frame() {
     let mut sender = h2c(&rig).await;
     let (head, body, trailers) = call(
         &mut sender,
-        "/pkg.Greeter/Hello",
+        "/pkg.Greeter/Fail",
         framed(r#"{"1":"nobody"}"#),
     )
     .await;

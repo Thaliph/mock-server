@@ -2302,7 +2302,7 @@ random numbers it hands to the draw.
   by index), so the tiers below choose, among the samples of the method, the one whose request
   message is the same (`exact`) or shares the most leaves (`endpoint`). A message that cannot
   be read (compressed under an encoding that is not decoded, over the bounds of §6.2, not a
-  message, no body) gives no body fields, as a request without body. A field whose §6
+  message, no body) gives no body fields, as a request without body. As for a JSON body, a leaf that the endpoint's exchanges give volatile values (at least 3 observations, at least half of them distinct, §6) is not compared: with a few calls recorded, a message field that differs between them is volatile, and the first sample answers. A field whose §6
   name (array indices written `*`) is in the endpoint's `volatile` or `redacted` list, or whose
   value holds a placeholder (or the legacy marker `<redacted>`), is left out on both sides: it
   is never compared.

@@ -1284,7 +1284,8 @@ fn grpc_req(path: &str, body: Option<Vec<u8>>) -> Req {
 fn grp_31_a_recorded_message_is_replayed_framed() {
     let message = r#"{"1":"alice","2":{"1":5},"3":[1,2]}"#;
     let index = index(&record(&[call("/pkg.Svc/Get", r#"{"1":"q"}"#, message)]));
-    let (tier, response) = ask(&index, &grpc_req("/pkg.Svc/Get", None)).expect("an answer");
+    let body = Some(framed(r#"{"1":"q"}"#));
+    let (tier, response) = ask(&index, &grpc_req("/pkg.Svc/Get", body)).expect("an answer");
     assert_eq!(tier, Tier::Exact);
     assert_eq!(response.status, 200);
     assert_eq!(header(&response, "content-type"), Some("application/grpc"));
@@ -1326,7 +1327,9 @@ fn grp_31_the_recorded_trailers_are_replayed_in_order_without_bin_and_framing_na
 
 #[test]
 fn grp_31_a_status_zero_sample_without_a_message_gets_the_empty_message() {
-    let mut c = ex("POST", "/pkg.Svc/Get", 200).resp("application/grpc", "");
+    let mut c = ex("POST", "/pkg.Svc/Get", 200)
+        .req_header("content-type", "application/grpc")
+        .resp("application/grpc", "");
     c.grpc = true;
     c.resp_trailers = vec![("x-neutral".into(), "v".into())];
     let index = index(&record(&[c]));
