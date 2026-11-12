@@ -654,7 +654,7 @@ a micro-benchmark (`criterion`) covers the pure code.
 | Milestone | Budget (at 200 rps unless said) |
 |---|---|
 | B0 | Recorded, not judged: direct vs `discovery` sidecar, p50/p99 latency, CPU, RSS of caller and callee sidecars. |
-| M0 | `none` adds at most 60 % of `discovery`'s added p50, and uses at most 70 % of its CPU. |
+| M0 | At 200 rps over a 5 ms service, the `none` sidecar pair (caller and callee) adds at most 1.5 ms p50 over HTTP/1.1 and 3.0 ms over h2c, and uses at most 70 % of `discovery`'s CPU. (Was "≤ 60 % of `discovery`'s added p50": a ratio of hop / (hop + recording) that worsens whenever recording gets cheaper, and that #490 measured as dominated by the kernel and wake-up cost of the pod legs, not by sidecar code.) |
 | M1 | Mesh-routed call adds ≤ B0 + 0.5 ms p50 and ≤ B0 + 2 ms p99; sidecar RSS ≤ B0 + 16 MiB with a 100-service/1000-endpoint view; EndpointSlice change → sidecar applies it in ≤ 2 s p99; controller RSS ≤ 256 MiB with 1000 Services/10 000 endpoints (synthetic objects), view cache included; rollout of a 50-pod deployment in a namespace of 200 sidecars: each sidecar receives ≤ 1 view/s and the controller averages ≤ 0.5 core during the rollout. P2C pick ≤ 2 µs (criterion). |
 | M2 | No failure: no change vs M1 beyond noise (≤ 0.2 ms p50). One of three pods refusing connections: error rate seen by the client 0 %, p99 ≤ M1 + 5 ms. |
 | M3 | Route match ≤ 10 µs for 100 rules (criterion); canary 90/10 within ±2 % over 10 000 requests; mirror adds ≤ 0.2 ms p50 to the primary call. |
