@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Baseline benchmarks of the sidecar (BEN-01 to BEN-10, docs/SPEC.md §12.16, #436). Run by hand on a quiet
+# Baseline benchmarks of the sidecar (BEN-01 to BEN-10, docs/SPEC.md §12.19, #436). Run by hand on a quiet
 # machine; not a CI job.
 #
 #   scripts/bench.sh               the default matrix: 12 runs of 30 s, about 8 minutes, plus the cluster

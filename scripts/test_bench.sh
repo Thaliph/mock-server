@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2329 # the helpers and ben_* tests are called by name, from the loop at the end
-# Self-test of scripts/bench.sh (BEN-01 to BEN-09, docs/SPEC.md §12.16). Every test runs the script
+# Self-test of scripts/bench.sh (BEN-01 to BEN-09, docs/SPEC.md §12.19). Every test runs the script
 # with --dry-run and reads its plan. Stub docker, kind, kubectl and helm come first on PATH and record
 # any call: a dry run must record none. Run from anywhere: bash scripts/test_bench.sh
 set -euo pipefail

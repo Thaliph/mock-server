@@ -716,4 +716,118 @@ helm template mimic "$tmp/chart-copy" -n mimic-system --set valkey.existingSecre
 cmp -s <(yq "$isdash" "$tmp/dash-copy.yaml") <(yq "$isdash" "$tmp/dash-grafana.yaml") && fail "mon_23: the changed copy renders the same dashboard"
 echo "mon_22, mon_23: the dashboards pass the checker and render as one ConfigMap per file"
 
+# #438 (CHT, spec §12.18): the production overlay lints strictly; its render is Pod Security restricted, has requests and
+# limits on every container, digests on every image and the shape of CHT-05; and the file holds no secret.
+overlay=$chart/values-production.yaml
+[[ -f $overlay ]] || fail "cht_01: $overlay does not exist"
+lint production -f "$overlay"
+
+helm template mimic "$chart" -n mimic-system --set valkey.existingSecret=golden -f "$overlay" > "$tmp/prod.yaml" \
+  || fail "cht_02: the overlay does not render"
+# docs: the rendered objects as one JSON array; pods: the pod specs of the Deployments and StatefulSets.
+docs=$(yq -o=json -I0 '.' "$tmp/prod.yaml" | jq -cs '[.[] | select(. != null)]')
+pods=$(jq -c '[.[] | select(.kind == "Deployment" or .kind == "StatefulSet") | .spec.template.spec]' <<<"$docs")
+# obj <kind> <name>: the rendered object, as JSON, or nothing.
+obj() { jq -c --arg k "$1" --arg n "$2" '.[] | select(.kind == $k and .metadata.name == $n)' <<<"$docs"; }
+
+# CHT-02, Pod Security restricted: no host namespace or hostPath; runAsNonRoot and seccomp RuntimeDefault on each
+# container (its own setting, else the pod's); allowPrivilegeEscalation false, drop ALL, no added capability.
+violations=$(jq -r '
+  def eff($sc; $p; $f): if ($sc | has($f)) then $sc[$f] else ($p.securityContext[$f]) end;
+  .[] | . as $p
+  | (if ($p.hostNetwork // false) or ($p.hostPID // false) or ($p.hostIPC // false) then "host namespace" else empty end),
+    ((.volumes // [])[] | select(has("hostPath")) | "hostPath volume \(.name)"),
+    (((.containers // []) + (.initContainers // []))[] | . as $c | ($c.securityContext // {}) as $sc
+      | (if eff($sc; $p; "runAsNonRoot") == true then empty else "\($c.name): not runAsNonRoot" end),
+        (if (eff($sc; $p; "seccompProfile") // {}).type == "RuntimeDefault" then empty else "\($c.name): seccomp is not RuntimeDefault" end),
+        (if $sc.allowPrivilegeEscalation == false then empty else "\($c.name): allowPrivilegeEscalation is not false" end),
+        (if (($sc.capabilities.drop // []) | index("ALL")) != null then empty else "\($c.name): capabilities are not dropped ALL" end),
+        (if (($sc.capabilities.add // []) | length) == 0 then empty else "\($c.name): a capability is added" end))
+' <<<"$pods")
+[[ -z $violations ]] || fail "cht_02: Pod Security restricted: $(tr '\n' ';' <<<"$violations")"
+echo "cht_02: every pod of the overlay render is Pod Security restricted"
+
+# CHT-03: requests (cpu, memory) and a memory limit on every container and init container; a cpu limit on the
+# controller, Valkey, exporter and the injected sidecar.
+missing=$(jq -r '.[] | ((.containers // []) + (.initContainers // []))[]
+  | select(.resources.requests.cpu == null or .resources.requests.memory == null or .resources.limits.memory == null) | .name' <<<"$pods")
+[[ -z $missing ]] || fail "cht_03: containers without requests or a memory limit: $(tr '\n' ' ' <<<"$missing")"
+nocpu=$(jq -r '.[] | (.containers // [])[] | select(.name == "controller" or .name == "valkey" or .name == "exporter")
+  | select(.resources.limits.cpu == null) | .name' <<<"$pods")
+[[ -z $nocpu ]] || fail "cht_03: no cpu limit on: $(tr '\n' ' ' <<<"$nocpu")"
+sidecar=$(jq -r '.[] | select(.kind == "Deployment" and .metadata.name == "mimic-controller") | .spec.template.spec.containers[0].env[]
+  | select(.name == "MIMIC_INJECT_SIDECAR_RESOURCES") | .value' <<<"$docs")
+jq -e '.requests.cpu and .requests.memory and .limits.cpu and .limits.memory' <<<"$sidecar" >/dev/null \
+  || fail "cht_03: MIMIC_INJECT_SIDECAR_RESOURCES lacks requests or limits: $sidecar"
+echo "cht_03: every container has requests and a memory limit; the controller, Valkey, exporter and sidecar have a cpu limit"
+
+# CHT-04: every image of the render and the two MIMIC_INJECT_* images is repository@sha256:<64 hex>, and the overlay pins both.
+digest_re='^sha256:[0-9a-f]{64}$'
+[[ $(jq '[.. | objects | select(has("image"))] | length' <<<"$docs") -gt 0 ]] || fail "cht_04: the render has no image"
+badimg=$(jq -r '.. | objects | select(has("image")) | .image | select(type == "string" and test("@sha256:[0-9a-f]{64}$") | not)' <<<"$docs")
+[[ -z $badimg ]] || fail "cht_04: an image is not pinned by digest: $badimg"
+badenv=$(jq -r '.. | objects | select(.name? == "MIMIC_INJECT_SIDECAR_IMAGE" or .name? == "MIMIC_INJECT_INIT_IMAGE") | .value
+  | select(test("@sha256:[0-9a-f]{64}$") | not)' <<<"$docs")
+[[ -z $badenv ]] || fail "cht_04: an injected image is not pinned by digest: $badenv"
+[[ $(yq -r '.image.digest' "$overlay") =~ $digest_re && $(yq -r '.inject.initImage.digest' "$overlay") =~ $digest_re ]] \
+  || fail "cht_04: the overlay does not pin image.digest and inject.initImage.digest"
+echo "cht_04: every image of the overlay render is pinned by digest"
+
+# CHT-05: the shape of the production install.
+jq -e '.spec.replicas == 3' <<<"$(obj Deployment mimic-controller)" >/dev/null || fail "cht_05: the controller does not run 3 replicas"
+spread=$(jq -c '.spec.template.spec.topologySpreadConstraints // []' <<<"$(obj Deployment mimic-controller)")
+jq -e 'length == 2 and ([.[].topologyKey] | sort) == ["kubernetes.io/hostname", "topology.kubernetes.io/zone"]
+  and all(.[]; .maxSkew == 1 and .whenUnsatisfiable == "ScheduleAnyway" and .labelSelector.matchLabels["app.kubernetes.io/name"] == "mimic-controller")' \
+  <<<"$spread" >/dev/null || fail "cht_05: the controller topology spread is not zone and hostname, maxSkew 1, ScheduleAnyway: $spread"
+jq -e '.spec.maxUnavailable == 1' <<<"$(obj PodDisruptionBudget mimic-controller)" >/dev/null \
+  || fail "cht_05: the PodDisruptionBudget mimic-controller is not maxUnavailable 1"
+jq -e '.spec.template.spec.priorityClassName == "mimic-critical"' <<<"$(obj Deployment mimic-controller)" >/dev/null \
+  || fail "cht_05: the controller has no priorityClassName mimic-critical"
+jq -e '.spec.template.spec.priorityClassName == "mimic-critical"' <<<"$(obj StatefulSet mimic-valkey)" >/dev/null \
+  || fail "cht_05: Valkey has no priorityClassName mimic-critical"
+[[ -n $(obj ServiceMonitor mimic-controller) ]] || fail "cht_05: no ServiceMonitor mimic-controller"
+[[ -n $(obj PodMonitor mimic-sidecar) && -n $(obj PodMonitor mimic-valkey) ]] || fail "cht_05: no PodMonitor of the sidecar and of Valkey"
+[[ -n $(obj StatefulSet mimic-valkey | jq -c '.spec.template.spec.containers[] | select(.name == "exporter")') ]] \
+  || fail "cht_05: the Valkey exporter is not enabled"
+bundled=$(jq -r '[.[] | .metadata.name? // empty | select(test("^mimic-(prometheus|grafana)"))] | join(" ")' <<<"$docs")
+[[ -z $bundled ]] || fail "cht_05: a bundled monitoring object is rendered: $bundled"
+[[ -z $(obj CustomResourceDefinition mimicloadtests.mimic.platform.io) ]] || fail "cht_05: the MimicLoadTest CRD is rendered with loadTest off"
+[[ -z $(jq -c '.[] | select(.kind == "ValidatingAdmissionPolicy" and .metadata.name == "mimic-load-job")' <<<"$docs") ]] \
+  || fail "cht_05: the load test admission policy is rendered with loadTest off"
+jq -e '.spec.ingress[0].from | length == 1 and (.[0].ipBlock.cidr | type == "string")' \
+  <<<"$(obj NetworkPolicy mimic-controller)" >/dev/null || fail "cht_05: networkPolicy.webhookFrom is not one ipBlock"
+[[ $(jq -r '.[] | select(.kind == "Deployment" and .metadata.name == "mimic-controller") | .spec.template.spec.containers[0].env[] | select(.name == "MIMIC_LOG") | .value' <<<"$docs") == info ]] \
+  || fail "cht_05: the controller MIMIC_LOG is not info"
+[[ $(jq -r '.[] | select(.kind == "Deployment" and .metadata.name == "mimic-controller") | .spec.template.spec.containers[0].env[] | select(.name == "MIMIC_INJECT_SIDECAR_LOG") | .value' <<<"$docs") == info ]] \
+  || fail "cht_05: MIMIC_INJECT_SIDECAR_LOG is not info"
+[[ $(jq '[.[] | select(.kind == "StatefulSet" and .metadata.name == "mimic-valkey") | .spec.volumeClaimTemplates | length] | .[0]' <<<"$docs") == 1 ]] \
+  || fail "cht_05: Valkey has no persistent volume claim"
+echo "cht_05: 3 spread controllers with a PDB, priority class, monitors, no bundled monitoring, no load test, webhook narrowed"
+
+# CHT-06: no secret in the file: no non-empty scalar at a key named like a secret, and no key material or token.
+secrets=$(yq -o=json '.' "$overlay" | jq -r '[paths(scalars) as $p | {k: ($p | map(tostring) | join(".")), v: getpath($p)}]
+  | .[] | select(.k | test("pass|token|secret|credential|private"; "i")) | select(.v != "" and .v != null and .v != false) | .k')
+[[ -z $secrets ]] || fail "cht_06: values-production.yaml sets a secret-like value: $secrets"
+if grep -qE -- '-----BEGIN|AKIA|ghp_|sk_live_' "$overlay"; then fail "cht_06: values-production.yaml holds key or token material"; fi
+echo "cht_06: values-production.yaml holds no secret"
+
+# UI-14 (#437, spec §12.7): the controller container declares mimic-ui on 8080/TCP, for information only. The read API
+# stays on loopback (no MIMIC_UI_ADDR in the chart), and no Service or NetworkPolicy names the port or uses 8080.
+# The 403 for a non-loopback peer is CTL-13 (ctl_13_a_peer_that_is_not_loopback_gets_403), a Rust test.
+ui_ctr=$(yq 'select(.kind == "Deployment" and .metadata.name == "mimic-controller") | .spec.template.spec.containers[] | select(.name == "controller")' "$tmp/default.yaml")
+[[ -n $ui_ctr ]] || fail "ui_14: no controller container in the default render"
+[[ $(printf '%s\n' "$ui_ctr" | yq -r '[.ports[] | select(.name == "mimic-ui")] | length') == 1 ]] \
+  || fail "ui_14: the controller container does not declare exactly one port named mimic-ui"
+[[ $(printf '%s\n' "$ui_ctr" | yq -r '.ports[] | select(.name == "mimic-ui") | .containerPort') == 8080 ]] \
+  || fail "ui_14: mimic-ui is not containerPort 8080"
+[[ $(printf '%s\n' "$ui_ctr" | yq -r '.ports[] | select(.name == "mimic-ui") | .protocol') == TCP ]] \
+  || fail "ui_14: mimic-ui is not TCP"
+[[ $(printf '%s\n' "$ui_ctr" | yq -r '[.env[]? | select(.name == "MIMIC_UI_ADDR")] | length') == 0 ]] \
+  || fail "ui_14: the chart sets MIMIC_UI_ADDR (the read API must stay on loopback by default)"
+ui_exposed=$(yq 'select(.kind == "Service" or .kind == "NetworkPolicy")' "$tmp/default.yaml")
+! grep -q 'mimic-ui' <<<"$ui_exposed" || fail "ui_14: a Service or NetworkPolicy names mimic-ui"
+[[ $(yq -r '[.. | select(tag == "!!int" and . == 8080)] | length' <<<"$ui_exposed" | awk '{ s += $1 } END { print s + 0 }') == 0 ]] \
+  || fail "ui_14: a Service or NetworkPolicy uses port 8080"
+echo "ui_14: the controller declares mimic-ui on 8080/TCP; no Service or NetworkPolicy exposes it"
+
 echo "chart checks passed"

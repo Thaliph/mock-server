@@ -39,6 +39,8 @@ deleted: data leaves by expiry ([Operations](Operations#retention)).
 | `GET /v1/workloads/<ns>/<dep>/endpoints` | Every endpoint: direction, port, method, template, exchanges, statuses, latency quantiles, hosts, last seen and the `document` that holds it. |
 | `GET /v1/workloads/<ns>/<dep>/loadtests` | The stored [load test](Load-test) runs of the deployment, newest first: `uid`, `name`, `phase`, `reason`, `start`, `end` and `total`. |
 | `GET /v1/workloads/<ns>/<dep>/loadtests/<uid>` | One run, with its `summary`: the totals and one row per endpoint (`400` for a uid that is not a UUID, `404` for an unknown one). |
+| `GET /v1/resources` | Every deployment named by a `MimicWorkload` (or a `MimicLoadTest`), with its `mode` and the `kind` and `name` of those resources. Read from the controller's watch, not from the store, so a deployment with no data yet is listed. |
+| `GET /v1/workloads/<ns>/<dep>/resources` | The mimic custom resources that configure the deployment, sorted by kind then name: `metadata` (creation time, generation, labels, annotations), `spec` and its read-only `yaml`, the status `conditions` and, for a `MimicLoadTest`, its `phase`. `managedFields` and the `last-applied` annotation are left out, and a load test's `credentials` shows the Secret's name and the fields it fills, never a key or a value. `400` for an invalid name; an empty list when nothing configures it. |
 | `GET /v1/workloads/<ns>/<dep>/openapi` | The documents of the deployment: `inbound-<port>`, one per listening port, and `outbound-<authority>`, one per destination it called (`front` has `outbound-users.demo.svc:8080`). |
 | `GET /v1/workloads/<ns>/<dep>/openapi/<id>` | The OpenAPI 3.1 document `<id>` (`400` for an invalid id, `404` for one the report does not hold). |
 
@@ -177,7 +179,9 @@ quantiles, hosts and last-seen days. Import the JSON into any OpenAPI 3.1 tool.
 The same listener serves a small read-only UI. With the port-forward above, open
 `http://localhost:8080/ui/`:
 
-- `/ui/` lists the deployments with data;
+- the header has four tabs: Map, Workloads, Endpoints and Load tests. Map, Endpoints and Load tests are placeholders for now;
+- `/ui/` is the Workloads tab: every deployment with its mode, pods, endpoints, last push and a link to each mimic resource that configures it (`MimicWorkload`, `MimicLoadTest`);
+- `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` is the resource view: the spec as read-only YAML, the labels and annotations, and the status conditions;
 - `/ui/workloads/<ns>/<dep>` shows the summary, the pods, the endpoints and one link per document;
 - the deployment page also has a "Load tests" table, filled from the routes above;
 - `/ui/workloads/<ns>/<dep>/openapi/<id>` shows the document in Swagger UI, with a link to the raw JSON.

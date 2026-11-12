@@ -9,9 +9,16 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
+- The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).
+- Production overlay `deploy/helm/mimic/values-production.yaml` (#438): three controllers spread over zones and nodes, a priority class, requests and limits on every rendered container, images by digest, the Valkey exporter and the PodMonitors on, bundled monitoring and load tests off. The chart gains `controller.topologySpreadConstraints`, `controller.priorityClassName` and `valkey.priorityClassName`, empty by default.
 - Benchmarks of the sidecar: `scripts/bench.sh` runs fortio against an echo server with and without the
   sidecar at 50, 100 and 200 rps (never above), records the latencies and the sidecar CPU and RSS in
-  `docs/bench/`, and cleans up its namespace on exit. Baseline B0 pending (#436).
+  `docs/bench/`, and cleans up its namespace on exit. Baseline B0 of 2026-11-12 in `docs/bench/README.md` (#436).
+
+### Documentation
+
+- Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
 
 ## [0.2.0-alpha.3] - 2026-11-11
 

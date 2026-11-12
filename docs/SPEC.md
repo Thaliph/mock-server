@@ -289,6 +289,7 @@ would see without mimic, except for the limits listed at the end of this section
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
   | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown`, (F10) `mock_closed` (§8) |
   | `mock`, `mock_miss` | (F10) outbound in mock only: `exact` \| `endpoint` \| `fallback` \| `miss`, and the miss reason (§8) | — |
+  | `load_run` | (F11) the uid of the load test run that sent a request carrying the load marker (§7.8); absent otherwise | — |
   | `duration_ms`, `head_ms` | until the response end; until the final (non-`1xx`) response head; both absent for `unframed` and `rejected` | `duration_ms` |
   | `bytes_in`, `bytes_out` | request / response body bytes | client → destination / destination → client |
 
@@ -856,6 +857,67 @@ logic in `mimic-core` (`discovery` module).
   `sample budget full` carries `direction` (outbound: when its half fills). Authorities are
   logged, as in access lines; never a header value, query, body or sample.
 
+### 6.2 gRPC messages, decoded form (F14, #459)
+
+A gRPC body is a sequence of length-prefixed messages (`mimic_core::grpc::frame`): a flag
+byte (0 plain, 1 compressed), a 4-byte big-endian length, the payload. A frame longer than
+256 KiB, or any other flag, makes the rest of the stream opaque. A compressed payload is
+inflated when `grpc-encoding` is `gzip` (output capped at 256 KiB, a larger one is an error);
+`identity` and a flag of 0 need no decoding; any other encoding leaves the payload opaque
+(no Brotli).
+
+`mimic_core::grpc::wire` reads a payload without a schema. Fields are `(number, value)`
+with numbers 1 to 2^29-1; wire types 0 (varint, up to 10 bytes), 1 (fixed64), 2
+(length-delimited) and 5 (fixed32) are read, the group types 3 and 4 and any other type make
+the payload not a message. A length-delimited value is, in this order: empty, the string `""`;
+a **nested message** when its bytes parse fully as fields; a **string** when valid UTF-8;
+else **bytes**. Bounds: nesting depth 32 (below it a value is a string or bytes), 4096
+fields per payload tree, 256 KiB per payload; beyond them a top-level payload is an error and
+a nested one stays a string or bytes. No recursion on untrusted depth other than the bound.
+
+Canonical JSON, keys in field-number order: a message is an object keyed by the decimal
+field number (`{"1": "abc", "2": {"1": 5}}`); a field that occurs more than once is an array
+of its values in wire order; a varint is a JSON integer; a string is a JSON string; the other
+types are objects whose only key starts with `$`: `{"$bytes": "<base64>"}`,
+`{"$fixed32": n}`, `{"$fixed64": n}`. `from_json` and `encode` are the inverse: a canonical
+encoding (fields in ascending number order, repeats adjacent, shortest varints) round-trips
+byte for byte.
+
+### 6.3 gRPC redaction (F14, #460)
+
+Pure, `mimic_core::grpc::redact`, applied to a decoded message and to its metadata before
+anything is recorded, logged or sent. It writes the placeholders of §6 and never keeps a byte,
+length or hash of what it replaces.
+
+- **Metadata**: the header rules of §6 (names, value detectors, `Authorization` schemes,
+  cookies); in addition every `-bin` metadata value is replaced, whatever its name, by the
+  placeholder of the name rule that fires on the name without `-bin`, else `mimic-secret`.
+- **Wire-format strings**: the value detectors of §6 (JWT, PEM, card, cloud keys, token
+  prefixes, credentials) on every string field at any depth; a varint holding a card number
+  (Luhn) is replaced as a card. A replaced value becomes the string of its placeholder,
+  whatever its wire type.
+- **High entropy**: a string or a bytes value of at least 16 bytes whose Shannon entropy `H`
+  (bits per byte) is at least `min(T, 0.95 * log2(len))` becomes `mimic-secret`, with `T` 4.5
+  for a string and 7 for bytes. The entropy of `len` bytes cannot exceed `log2(len)`, so the
+  length factor makes a random 16-byte, 22-byte or 32-byte key reachable while a plain
+  phrase, an enum-like name or a repeated character stays below the bar.
+- **Bytes and detectors**: the value detectors also run on each maximal valid UTF-8 run of a
+  bytes value, so that one invalid byte does not hide a JWT, a PEM block or a card; a hit
+  replaces the whole value by its placeholder. A fixed64, like a varint, holding a card number
+  (Luhn, 13 to 19 digits) is replaced as a card.
+- **Field names** (when descriptors are known, from reflection): a field whose name fires a
+  name rule of §6 (`password`, `token`, ...) is replaced, whatever its type and also a nested
+  message (the whole subtree), by that rule's placeholder.
+- **Per-field rules** (`MimicWorkload.spec.discovery.grpc.redact`): a rule is a method
+  `<package.Service>/<Method>`, a direction (`request` or `response`) and a field path, dotted
+  segments each a field number (`3.1`) or, when descriptors are known, a field name; every
+  occurrence of a matching field, also in a repeated field, becomes `mimic-secret`.
+- **Bounds**: the walk keeps the depth bound (32) and the field bound (4096) of §6.2 for a
+  message that was built by hand; a message that breaks one is an error
+  (`WireError::TooDeep`, `TooManyFields`), never a partial result and never a `null`.
+  Redaction is idempotent and deterministic, and its output does not depend on the length or
+  bytes of a secret.
+
 ## 7. Controller and storage
 
 - `MimicWorkload` (namespaced CRD, `mimic.platform.io/v1alpha1`): selects the deployment named
@@ -1414,7 +1476,8 @@ logic in `mimic-core` (`discovery` module).
   `403` whatever the bind address, and so does a request whose `Host` is missing or is not
   `localhost`, `127.0.0.1` or `[::1]` (with or without a port), so that a web page cannot
   reach an open port-forward through DNS rebinding; an empty port (`127.0.0.1:`) is not a port
-  and gets `403` as well. `GET` and, from F6, `HEAD` (RFC 9110: the same status and headers as
+  and gets `403` as well. The chart declares the port on the controller container as `mimic-ui`
+  8080/TCP, for information only (UI-14). `GET` and, from F6, `HEAD` (RFC 9110: the same status and headers as
   `GET`, no body); every other method gets `405` with `Allow: GET, HEAD`. In F5 `HEAD` got `405`
   (`Allow: GET`); F6 serves it because browsers and link checkers expect it wherever `GET` is
   served (#293 note 28). JSON, sorted keys:
@@ -1474,6 +1537,28 @@ logic in `mimic-core` (`discovery` module).
 
   `400` for a name or id outside its grammar (no page is served for it). A page of a
   deployment without data is served and shows "no data" from the `404` of its JSON route.
+- **Explorer shell and Workloads tab (F15).** Every page carries the same four tabs, in this
+  order: Map (`/ui/map`), Workloads (`/ui/`), Endpoints (`/ui/endpoints`), Load tests
+  (`/ui/loadtests`); Map, Endpoints and Load tests are placeholders until their own features.
+  The deployment page and the document page of F6 stay as they are. The Workloads tab lists every
+  deployment with its namespace, mode, pods, last push and the mimic resources that configure it
+  (`MimicWorkload`, `MimicLoadTest`, from #440 `MimicConfig`), each linking to
+  `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` (`<kind>` one of those three, `<name>` a
+  DNS-1123 subdomain, else `400`), the resource view: its spec as read-only YAML, its labels and
+  annotations, its status conditions. Data comes from two routes served from the controller's
+  watch caches (no call to the API server per request, no Valkey): `GET /v1/resources`
+  (`{"workloads": [{"namespace", "deployment", "mode", "resources": [{"kind", "name"}]}]}`, sorted)
+  and `GET /v1/workloads/<ns>/<dep>/resources` (`{"resources": [{"kind", "namespace", "name",
+  "metadata": {"creationTimestamp", "generation", "labels", "annotations"}, "spec", "yaml",
+  "conditions": [{"type", "status", "reason", "message", "lastTransitionTime"}], "phase"}]}`,
+  sorted by kind then name; `phase` only for a `MimicLoadTest`). A resource belongs to the
+  deployment named by its `spec.deployment`. Nothing is copied but `metadata` (those four
+  fields), `spec` and the status conditions: `managedFields`, `ownerReferences`, `finalizers`
+  and the `last-applied-configuration` annotation are dropped, and a `MimicLoadTest`'s
+  `credentials` is reduced to `secretName` and the `field` of each entry (never `key`). The YAML
+  is rendered by the controller, deterministically: keys in byte order, every string
+  double-quoted in JSON syntax. The browser writes it with `textContent`. The routes count in
+  `mimic_ui_requests_total` by route pattern like the others.
 - **Swagger UI configuration** (in `mimic.js`, nothing inline): `url` = the document route;
   `supportedSubmitMethods: []` (no "Try it out" button, so the UI never sends a request to a
   workload); `tryItOutEnabled: false`; `validatorUrl: null` (no call to
@@ -3343,6 +3428,8 @@ names contain the criterion ID (`fnd_02_…`).
 | F11 | Load test of a mocked deployment | (added 2026-10-31) |
 | F12 | First alpha release `v0.2.0-alpha.1`: versioned images and chart, changelog, release notes, wiki | (added 2026-11-07) |
 | F13 | Readable typed placeholders for redacted values (`mimic-token`), and testing with them (#424) | (added 2026-11-11) |
+| F14 | gRPC: message framing and wire-format decoding, redaction, recording, reflection, mock (#459 and following) | (added 2026-11-12) |
+| F15 | Explorer UI: tab shell and the Workloads tab linking the mimic custom resources (#465) | (added 2026-11-12) |
 
 ### 12.1 F0 — Foundations
 
@@ -3357,7 +3444,7 @@ names contain the criterion ID (`fnd_02_…`).
 | FND-07 | The image runs as UID 65532, contains no shell, and both binaries answer `--version` with the crate version. |
 | FND-08 | `helm lint` passes; every rendered pod is Pod Security `restricted` (non-root, read-only root filesystem, no capability, `RuntimeDefault` seccomp, no privilege escalation). Valkey requires a password generated at install and kept on upgrade, and only accepts connections from the controller (NetworkPolicy; needs a CNI that enforces NetworkPolicy, as kind's default does). |
 | FND-09 | On kind (Kubernetes ≥ 1.33), `helm install` brings the controller and Valkey to Ready, and the controller's `/readyz` and `/metrics` answer through a port-forward. |
-| FND-10 | CI runs as dependent stages: lint → unit and integration tests, and lint → image build and scan (in parallel with the tests; the image builds its own Rust) → kind e2e (after the image and the chart stage; not after the tests), plus a chart stage (`helm lint --strict`; the release-pinned chart renders both mimic images by digest, `scripts/check-release-chart.sh`; the pins of `images/Dockerfile` match `values.yaml` and the kind node image in ci.yml, `scripts/check-pins.sh`) and a supply-chain stage: `cargo deny` (advisories, licences, sources, and the bans of `deny.toml`, which deny the Brotli crates), `zizmor`, `actions/dependency-review-action` on a pull request, a dependency cooldown (`scripts/check-cooldown.py`: a crate that a pull request adds or bumps in a `Cargo.lock` must be published at least 14 days before, unless `scripts/cooldown-allowlist.toml` lists it with a reason), gitleaks on a pull request, `trivy config` on the rendered chart and on the Dockerfile (HIGH and CRITICAL fail), and CodeQL for Rust and GitHub Actions. The image job scans the mimic, mimic-init and Valkey images with Trivy; an accepted finding is listed in `.trivyignore.yaml` with its reason, its issue and an expiry date, after which the scan fails again. A weekly and a push-to-main OpenSSF Scorecard run reports its result without gating. The lint stage also runs `scripts/check-test-messages.sh` on the added lines of a change: an assert whose message interpolates a secret-like or raw value fails (CodeQL's cleartext logging), and its own self-test runs first. A `changes` job runs first and classifies the files of a pull request with `scripts/ci_plan.py` (its offline tests, `scripts/test_ci_plan.py`, run in the same job before it). A file sets the categories `rust` (`crates/`, `fuzz/`, the Cargo files, `deny.toml`, the cooldown and Swagger UI scripts), `image` (the `rust` files, `Dockerfile`, `.dockerignore`, `images/`, `.trivyignore.yaml`, the image scripts), `chart` (`deploy/`, `images/`, the workspace `Cargo.toml`, the chart scripts), `e2e` (`scripts/e2e.sh`, `scripts/e2e-load.sh`, `scripts/e2e/`), `workflows` (`.github/`), `docs` (`docs/`, every `*.md`, the release notes and wiki scripts) and `spec` (`docs/SPEC.md`); a file of no category sets `other`. A job runs only when its gate is set: lint, test and the Rust CodeQL leg on `rust`; security on `rust` or `workflows`; cooldown on `rust`; vendored-ui on `rust`, `chart`, `docs` or `spec`; chart on `chart`, `docs`, `spec`, `image` or `e2e`; trivy-config on `chart` or `image`; image, e2e and e2e-load on `image`, `chart` or `e2e`; the HTTP/1 codec fuzz job (PRX-28) on a change under `crates/mimic-core/src/proxy/http1/`, `crates/mimic-core/src/proxy.rs`, the workspace `Cargo.toml` and `Cargo.lock`, or `fuzz/`; the discovery fuzz job (one matrix job per target: the recorder, the egress set, the mock and the load plan; DSC-23, PUL-20, MCK-20 and LDT-18) on a change under `crates/mimic-core/src/discovery/`, `crates/mimic-core/src/mock/`, `crates/mimic-core/src/mock.rs`, `crates/mimic-core/src/load/` or `fuzz/`. Gitleaks, dependency review, `changes` and `ci-ok` run on every event, so a docs-only pull request runs no build, scan or kind run. Every gate is set, so everything runs, for `other`, a change under `.github/`, a push to `main`, a schedule, a workflow dispatch, and a pull request with no changed file; the diff lists both sides of a rename. `ci-ok` sums up every job except Scorecard: it fails if any job fails or is cancelled, and accepts a skipped job only when that job's gate is off. A `v*` tag is released only from a commit on `main`; it publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart pinned to the digests of both mimic images. From F12 the release workflow also gates on `ci-ok`, tests its own digests before tagging them, and has a dry run (REL-04 to REL-11). From F6 the cooldown also covers the npm lockfile of the vendored Swagger UI, and the supply-chain stage checks the vendored files against it (UI-13). |
+| FND-10 | CI runs as dependent stages: lint → unit and integration tests, and lint → image build and scan (in parallel with the tests; the image builds its own Rust) → kind e2e (after the image and the chart stage; not after the tests), plus a chart stage (`helm lint --strict`; the release-pinned chart renders both mimic images by digest, `scripts/check-release-chart.sh`; the pins of `images/Dockerfile` match `values.yaml` and the kind node image in ci.yml, `scripts/check-pins.sh`) and a supply-chain stage: `cargo deny` (advisories, licences, sources, and the bans of `deny.toml`, which deny the Brotli crates), `zizmor`, `actions/dependency-review-action` on a pull request, a dependency cooldown (`scripts/check-cooldown.py`: a crate that a pull request adds or bumps in a `Cargo.lock` must be published at least 14 days before, unless `scripts/cooldown-allowlist.toml` lists it with a reason), gitleaks on a pull request, `trivy config` on the rendered chart and on the Dockerfile (HIGH and CRITICAL fail), and CodeQL for Rust and GitHub Actions. The image job scans the mimic, mimic-init and Valkey images with Trivy; an accepted finding is listed in `.trivyignore.yaml` with its reason, its issue and an expiry date, after which the scan fails again. A weekly and a push-to-main OpenSSF Scorecard run reports its result without gating. The lint stage also runs `scripts/check-test-messages.sh` on the added lines of a change: an assert whose message interpolates a secret-like or raw value fails (CodeQL's cleartext logging), and its own self-test runs first. A `changes` job runs first and classifies the files of a pull request with `scripts/ci_plan.py` (its offline tests, `scripts/test_ci_plan.py`, run in the same job before it). A file sets the categories `rust` (`crates/`, `fuzz/`, the Cargo files, `deny.toml`, the cooldown and Swagger UI scripts), `image` (the `rust` files, `Dockerfile`, `.dockerignore`, `images/`, `.trivyignore.yaml`, the image scripts), `chart` (`deploy/`, `images/`, the workspace `Cargo.toml`, the chart scripts), `e2e` (`scripts/e2e.sh`, `scripts/e2e-load.sh`, `scripts/e2e/`), `workflows` (`.github/`), `docs` (`docs/`, every `*.md`, the release notes and wiki scripts) and `spec` (`docs/SPEC.md`); a file of no category sets `other`. A job runs only when its gate is set: lint, test and the Rust CodeQL leg on `rust`; security on `rust` or `workflows`; cooldown on `rust`; vendored-ui on `rust`, `chart`, `docs` or `spec`; chart on `chart`, `docs`, `spec`, `image` or `e2e`; trivy-config on `chart` or `image`; image, e2e and e2e-load on `image`, `chart` or `e2e`; the HTTP/1 codec fuzz job (PRX-28) on a change under `crates/mimic-core/src/proxy/http1/`, `crates/mimic-core/src/proxy.rs`, the workspace `Cargo.toml` and `Cargo.lock`, or `fuzz/`; the discovery fuzz job (one matrix job per target: the recorder, the egress set, the mock, the load plan and the gRPC codec; DSC-23, PUL-20, MCK-20, LDT-18 and GRP-10) on a change under `crates/mimic-core/src/discovery/`, `crates/mimic-core/src/mock/`, `crates/mimic-core/src/mock.rs`, `crates/mimic-core/src/load/` or `fuzz/`; the gRPC codec target (GRP-10) also on a change under `crates/mimic-core/src/grpc/` or `crates/mimic-core/src/grpc.rs`. Gitleaks, dependency review, `changes` and `ci-ok` run on every event, so a docs-only pull request runs no build, scan or kind run. Every gate is set, so everything runs, for `other`, a change under `.github/`, a push to `main`, a schedule, a workflow dispatch, and a pull request with no changed file; the diff lists both sides of a rename. `ci-ok` sums up every job except Scorecard: it fails if any job fails or is cancelled, and accepts a skipped job only when that job's gate is off. A `v*` tag is released only from a commit on `main`; it publishes multi-arch signed images with SBOM and provenance, and the signed Helm chart pinned to the digests of both mimic images. From F12 the release workflow also gates on `ci-ok`, tests its own digests before tagging them, and has a dry run (REL-04 to REL-11). From F6 the cooldown also covers the npm lockfile of the vendored Swagger UI, and the supply-chain stage checks the vendored files against it (UI-13). |
 
 ### 12.2 F1 — Injection
 
@@ -3559,6 +3646,7 @@ name but `localhost`. A *canary* is as in §12.5.
 | UI-11 | **E.** On kind with the CTL-20 apps and traffic (a canary bearer token, a canary in a `PUT` body), through `kubectl port-forward` to a controller pod: `/v1/workloads/<ns>/users/openapi` lists `inbound-<users port>`; that document has `/users/{users_id}` with `get` and `put`, a `200` response with an example taken from a sample, the `http_bearer` scheme required by `get`, and `servers` naming the `users` Service host seen by the sidecar; `/endpoints` lists both endpoints with their counts. No canary is in any document, endpoint list or page. `HEAD /ui/` answers `200`. |
 | UI-12 | **E.** Browser: the headless Chromium loads `/ui/`, the `users` deployment page and its document page through the port-forward and dumps each DOM: they list the deployment, its two endpoints and the operations `GET /users/{users_id}` and `PUT /users/{users_id}`; there is no "Try it out" or "Execute" button; Chromium's log shows no Content Security Policy violation and no request to an origin other than the port-forward. A body recorded with the key and value `<img src=/ui-xss onerror=alert(1)>` shows as text, with no `img` element of that `src` in the DOM; a body recorded as `{"$ref": "http://localhost:<canary port>/ref"}` makes no request reach a server listening on that port. The `users` pods log no access line during the browser run (the UI sends no traffic to workloads). |
 | UI-13 | **C.** Supply chain: `scripts/vendor-swagger-ui.py --check` passes on the committed tree, fails when one vendored byte is changed and when the tarball does not match the lockfile's `sha512` (offline test with a fixture tarball); it runs in the supply-chain stage and `ci-ok` requires it. `scripts/check-cooldown.py` refuses a `swagger-ui-dist` version that a pull request adds or bumps in `crates/mimic-controller/ui/package-lock.json` when it was published less than 14 days before (`--now`), accepts it when the allowlist names it, and fails closed when the npm registry cannot be read. `.github/dependabot.yml` has an `npm` entry for `crates/mimic-controller/ui` with a 14-day cooldown; `zizmor` passes. |
+| UI-14 | **E** (`helm template`, `scripts/check-chart.sh`). The rendered controller Deployment declares on its `controller` container a port named `mimic-ui` with `containerPort` 8080 and protocol `TCP`, for information only: no Service port and no NetworkPolicy port of the chart names it, and the read API stays on loopback (`MIMIC_UI_ADDR`, §7.5), so the UI still answers `403` to a non-loopback peer (CTL-13, `ctl_13_a_peer_that_is_not_loopback_gets_403`). The e2e check of §12.7 (`ui_14` in `scripts/e2e.sh`) reaches the UI through `kubectl port-forward deploy/<release>-controller`. Test: `ui_14` in `scripts/check-chart.sh`. |
 
 ### 12.8 F7 — Egress recording in the sidecar
 
@@ -3832,7 +3920,74 @@ Golden files are regenerated in the step that changes their bytes, and the diff 
 | PLH-10 | **E.** On kind (`scripts/e2e.sh`): the outbound samples of EGR-19 hold `Authorization: Bearer mimic-token` and `X-Tenant-Key: mimic-secret`; the inbound samples of DSC-22 and the documents of the e2e deployments hold no `<redacted>`; an access line of a request to `/reset/<JWT>` shows `/reset/mimic-jwt`. |
 | PLH-11 | **D** (review). `docs/wiki/Discovery-and-redaction.md` lists the 13 placeholders and the rules that give them, says that `<redacted>` is the legacy marker (data written up to F12, upgraded on read) and the authority host marker; `docs/wiki/Mock-mode.md` says that answers carry placeholders and that no Secret replaces them; `docs/wiki/Load-test.md` has a section *Testing with credentials* with the two ways: (1) a Secret with real test values through `credentials.fields`, with an example for `header/authorization`, (2) a test environment that accepts mimic's placeholders (for example a test identity provider or gateway rule that accepts `Bearer mimic-token`), and says that without either an authenticated endpoint answers `4xx`; `Quick-start.md`, `Reading-the-API.md`, `FAQ.md` and `Egress-aggregation.md` show placeholders where they showed `<redacted>`. `CHANGELOG.md` `[Unreleased]` names the change and the load test's new default under an upgrade note. |
 
-### 12.16 Benchmarks (#436)
+### 12.16 F14 — gRPC (#459 and following)
+
+Levels as in §12.2, plus **F**, a fuzz target run by CI. Criteria `GRP-xx`; the decoding is
+§6.2, the later steps (redaction, recording, reflection, mock) add their own.
+
+| ID | Criterion |
+|---|---|
+| GRP-01 | **U.** Framing (§6.2): one frame, several frames in one read and an empty payload are read as the messages sent, with their compressed flag; a stream cut at every byte offset (and, as a property, at any set of offsets) gives the same messages as the whole; a flag other than 0 or 1 is an error; `finish` after a partial frame is an error and after whole frames is not; once an error is returned the parser returns it again. `encode_frame` is the inverse. |
+| GRP-02 | **U.** Frame size: a header announcing 256 KiB is read, one announcing 256 KiB + 1 is refused from its five header bytes, before the body arrives, and the parser never holds more than 5 bytes of a refused frame. |
+| GRP-03 | **U.** Encodings: `identity`, an absent header and `gzip` (any case) are decoded; a compressed frame under `identity` is an error; `br`, `deflate`, `zstd`, `snappy` and an unknown name leave a compressed frame opaque and a plain frame readable; a corrupt gzip is an error; a gzip bomb (a few hundred bytes inflating to more than 256 KiB) is an error and inflates to no more than 256 KiB + 1 bytes; exactly 256 KiB is accepted. |
+| GRP-04 | **U.** Wire types: varint (0, 1, 300, `u64::MAX` in 10 bytes; an 11-byte or overflowing varint is an error), fixed32, fixed64 (little-endian), length-delimited; field number 2^29-1 is read, 0 and 2^29 are errors; a truncated value of each type, a length beyond the payload, and the group types 3 and 4 are errors at the top level. |
+| GRP-05 | **U.** Ambiguity (§6.2): an empty value is `""`; bytes that parse fully as fields are a nested message (also when they are valid UTF-8); `hello` is a string; invalid UTF-8 that does not parse is bytes; bytes holding a group tag or a truncated field are not a message; two occurrences of a field number render as an array. |
+| GRP-06 | **U.** Bounds: 32 nested messages are read as messages and the 33rd level is a string or bytes; 4096 fields are read and 4097 are an error at the top level and leave a nested payload as bytes; 256 KiB is read and 256 KiB + 1 is an error; a 200 000-level nested input does not overflow the stack; no input panics (property, random bytes). |
+| GRP-07 | **U.** Canonical JSON (§6.2): `{"1": "abc", "2": {"1": 5}}` for its encoding; repeats as arrays; `$bytes`, `$fixed32` and `$fixed64` forms; keys in numeric order; the same bytes always give the same text. |
+| GRP-08 | **U.** Round trip: for a canonical encoding, `encode(from_json(to_json(decode(b))))` is `b` (property, ≥ 10 000 random trees); `from_json` refuses a depth beyond 32, a key that is not a canonical field number (`0`, `01`, `a`), a negative or fractional number, a boolean, a null, an empty array, a nested array, an unknown `$` key, and an encoding beyond 256 KiB. |
+| GRP-09 | **U.** A recorded 4 KiB message (a fixture holding every wire type, nested messages, a repeated field and a string) decodes to its expected JSON, the decoder allocates less than 8 times the input, and the JSON re-encodes to the fixture. |
+| GRP-10 | **F.** A fuzz target `grpc` feeds arbitrary bytes, split at arbitrary offsets, to the frame parser (the same messages whatever the split) and each payload to the wire reader and the gzip decoder: no panic, no allocation beyond the bounds of §6.2, and a payload that decodes writes JSON that reads back, whose encoding decodes and re-encodes to the same bytes. Same CI schedule as DSC-23. |
+| GRP-11 | **D** (review). §6.2 describes the decoded form; the security review of #459 finds no recursion beyond depth 32, no allocation beyond the bounds, and a bounded gzip inflation. |
+| GRP-12 | **U.** Metadata (§6.3): `authorization: Bearer x` gives `Bearer mimic-token`, `x-api-key` gives `mimic-api-key`, a neutral name and value are kept; any `-bin` value (`trace-bin`, `x-note-bin`, any case) gives `mimic-secret`, and `authorization-bin` gives `mimic-auth`; a name of the extra names gives `mimic-secret`. |
+| GRP-13 | **U.** Value detectors (§6.3): strings holding a JWT, a PEM block, a Luhn card, `ghp_…`, `AKIA…` at depth 1, at depth 5, and as one value of a repeated field give `mimic-jwt`, `mimic-private-key`, `mimic-card`, `mimic-token`, `mimic-api-key`; the same text in a bytes value, also with an invalid UTF-8 byte before, after or inside the run around it, gives the placeholder; a varint or a fixed64 holding a Luhn card gives the string `mimic-card`, one that does not is kept; a message with nothing sensitive is returned equal to its input. |
+| GRP-14 | **U.** Entropy (§6.3): a string of 16, 22 and 32 distinct characters (random-key stand-ins at 4.0, 4.46 and 5 bits) and a bytes value of 16 and 32 distinct bytes are `mimic-secret`; a string of 15 bytes, the phrases `the quick brown fox` and `a quick brown fox jumps over the lazy dog`, `ORDER_STATUS_PENDING` and a 4 KiB string of one repeated character are kept; a bytes value holding every value 0 to 255 is `mimic-secret`, one of 16 bytes of the same value and one of 15 distinct bytes are kept. |
+| GRP-15 | **U.** Per-field rules (§6.3): `3.1` redacts that field only, in every occurrence of a repeated parent and in a repeated leaf, as a subtree when it is a message; a rule for another method, another direction or another path changes nothing; a name segment matches only with the name known for its path; a rule path longer than the message or a rule on a field that does not exist changes nothing. |
+| GRP-16 | **U.** Field names (§6.3): with the name `password` known for field 2, `token` for 3.1 and `note` for 4, a string, a varint, a bytes value and a nested message under 2 give `mimic-password`, 3.1 gives `mimic-token` and 4 is kept; without names nothing is redacted by name. |
+| GRP-17 | **U.** Bounds and errors (§6.3): a hand-built message nested 33 levels (and 10 000 levels, with no stack overflow in the redaction) is `Err(TooDeep)` and 32 levels is accepted; one with 4097 fields is `Err(TooManyFields)`; redacting twice gives the first result; two secrets of different length give byte-identical output; the result encodes; no input panics (property, random messages). |
+| GRP-18 | **F.** The `grpc` fuzz target also redacts every payload that decodes, with a canary-free rule set and a small non-empty set of field names: no panic, the redacted message is a fixed point of redaction, encodes within `MAX_PAYLOAD` and decodes again. |
+
+### 12.17 F15 — Explorer UI shell and the Workloads tab (#465)
+
+The UI of §7.5 gains four tabs and the Workloads tab (§7.5, *Explorer shell*); the design is
+`docs/design/mimic-mesh.md` §17.2. Levels as in §12.2. A *hostile* value is one holding markup,
+such as `<img src=x onerror=alert(1)>`.
+
+| ID | Criterion |
+|---|---|
+| EXP-01 | **U.** The read-only YAML rendering of §7.5 is a pure function of a JSON value: byte-identical across calls, keys in byte order, two-space indent, every string double-quoted in JSON syntax (so a hostile string, a multi-line string and a string that looks like a boolean, a number or `null` stay strings), a key quoted unless it is `[A-Za-z_][A-Za-z0-9_./-]*` and not a YAML 1.1 boolean or null word (`true`, `false`, `null`, `yes`, `no`, `on`, `off`, `y`, `n`, any case), `{}` and `[]` for empty containers. |
+| EXP-02 | **U.** The sanitiser of §7.5 on a `MimicWorkload`, a `MimicLoadTest` and an object without `spec.deployment`: `managedFields`, `ownerReferences`, `finalizers` and the `kubectl.kubernetes.io/last-applied-configuration` annotation never appear; labels and the other annotations are kept; `status.conditions` keep the string fields `type`, `status`, `reason`, `message` and `lastTransitionTime`, sorted by `type`; a `MimicLoadTest` `credentials` keeps `secretName` and the `field` of each entry and drops `key`; an object without a string `spec.deployment` is not held. |
+| EXP-03 | **I.** `GET /v1/workloads/<ns>/<dep>/resources` answers `200` `{"resources": [...]}` sorted by kind then name, each with `kind`, `namespace`, `name`, `metadata`, `spec`, `yaml`, `conditions` and, for a `MimicLoadTest`, `phase`; only the resources whose `spec.deployment` is `<dep>` in `<ns>`; an empty list for a deployment without resource; `400` for a name that is not DNS-1123. It reads the cache only: it answers with Valkey stopped. `GET /v1/resources` answers `{"workloads": [{"namespace", "deployment", "mode", "resources": [{"kind", "name"}]}]}` sorted by namespace then deployment, for every deployment a held resource names, `mode` being `mock` when any of its `MimicWorkload`s says so and `discovery` otherwise. |
+| EXP-04 | **I.** Shell: `/ui/` (Workloads), `/ui/map`, `/ui/endpoints` and `/ui/loadtests` answer `200` `text/html; charset=utf-8`, each holding the four tab links `/ui/map`, `/ui/`, `/ui/endpoints` and `/ui/loadtests` in that order, with the UI-09 rules (no inline script, no `on*` or `style` attribute, assets from `/ui/assets/` only, no `http://` or `https://`); `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` is `200` for `MimicWorkload`, `MimicLoadTest` and `MimicConfig` with a DNS-1123 name, `400` for another kind or name; UI-07 (`HEAD`, `405`) and the `403` cases hold on every new route; UI-08 headers hold. |
+| EXP-05 | **I.** Escaping and secrets: a resource with hostile labels, annotations and condition `message` is answered as JSON strings, unchanged (parsed back equal to the input), as `application/json` with `X-Content-Type-Options: nosniff`; a `MimicLoadTest` with `credentials` `{secretName: payment-load, fields: [{field: header/authorization, key: token}]}` shows `payment-load` and `header/authorization`, and the answer holds no `key` member and no Secret value; `mimic.js` has no `innerHTML` (UI-09) and builds the new links with `encodeURIComponent`. |
+| EXP-06 | **I.** Metrics: after a known sequence of requests to the new routes `mimic_ui_requests_total` holds the route patterns `/v1/resources`, `/v1/workloads/{namespace}/{deployment}/resources`, `/ui/map`, `/ui/endpoints`, `/ui/loadtests` and `/ui/workloads/{namespace}/{deployment}/resources/{kind}/{name}` with the codes answered, and no label holds a name from the request. |
+| EXP-07 | **E.** Browser (the Chromium of UI-12): `/ui/` shows the four tabs; the Workloads tab lists the e2e deployment `users` of `disc-22` with its mode and its `MimicWorkload`, whose link opens the resource view showing the spec as YAML; each tab path shows its heading; no CSP violation, no request outside the port-forward, no Try it out button. |
+| EXP-08 | **D** (review). `docs/wiki/Reading-the-API.md` documents the two new routes and the resource view, and `docs/wiki/Quick-start.md` the tabs. |
+
+### 12.18 Production values (#438)
+
+`deploy/helm/mimic/values-production.yaml` is the reviewed overlay of a production install:
+`helm install mimic deploy/helm/mimic -f deploy/helm/mimic/values-production.yaml`, with its placeholders
+(`networkPolicy.webhookFrom`, `valkey.persistence.storageClass`) filled in by the operator. The overlay
+changes no default: the default render stays the golden file of MON-01. Three knobs are new, all empty by
+default and passed through to the pod spec: `controller.priorityClassName`, `valkey.priorityClassName` and
+`controller.topologySpreadConstraints`. The checks read the render of the overlay (`helm template` with
+`valkey.existingSecret=golden`, as MON-01).
+
+Levels as in §12.2, plus **M** (main session, recorded on the PR).
+
+| ID | Criterion |
+|---|---|
+| CHT-01 | **E** (`helm lint`, `scripts/check-chart.sh`). `helm lint --strict deploy/helm/mimic -f deploy/helm/mimic/values-production.yaml` passes. |
+| CHT-02 | **E** (`helm template`, `scripts/check-chart.sh`). Pod Security `restricted` for every pod template of the overlay render: no `hostNetwork`, `hostPID`, `hostIPC` or `hostPath` volume; `runAsNonRoot: true` and `seccompProfile.type: RuntimeDefault` on the pod or on each container; every container and init container has `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` and no `capabilities.add`. The overlay adds no privilege: no rendered container adds a capability (`mimic-init`, which needs `NET_ADMIN` and `NET_RAW`, is injected, not rendered). |
+| CHT-03 | **E** (`helm template`, `scripts/check-chart.sh`). Every container and init container of the overlay render has `resources.requests` with `cpu` and `memory`, and `resources.limits` with `memory`. The controller, Valkey and exporter containers and the injected sidecar (`MIMIC_INJECT_SIDECAR_RESOURCES`) also have `limits.cpu`. Two containers are outside this check: `mimic-init` (added to injected pods by the webhook, which sets no resources: a gap of the injection patch, §7.1) and `mimic-load` (resources from the controller's `MIMIC_LOAD_RESOURCES` default, not a chart value). They are not in the render. |
+| CHT-04 | **E** (`helm template`, `scripts/check-chart.sh`). Every `image` of the overlay render, and the values of `MIMIC_INJECT_SIDECAR_IMAGE` and `MIMIC_INJECT_INIT_IMAGE`, is `repository@sha256:` followed by 64 lowercase hex digits; no reference is by tag alone. `image.digest` and `inject.initImage.digest` of the overlay are set. |
+| CHT-05 | **E** (`helm template`, `scripts/check-chart.sh`). The overlay render has: the controller Deployment with 3 replicas and two `topologySpreadConstraints` (`maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, on `topology.kubernetes.io/zone` and on `kubernetes.io/hostname`, selecting `app.kubernetes.io/name: mimic-controller`); the PodDisruptionBudget `<release>-controller` with `maxUnavailable: 1`; `priorityClassName: mimic-critical` on the controller and Valkey pods; the ServiceMonitor `<release>-controller`, the PodMonitors `<release>-sidecar` and `<release>-valkey`, and the Valkey exporter; no object `<release>-prometheus*` or `<release>-grafana*`, no MimicLoadTest CRD and no ValidatingAdmissionPolicy `mimic-load-job` (the one of `<release>-injector` stays); `networkPolicy.webhookFrom` holds one `ipBlock`; `MIMIC_LOG` of the controller and `MIMIC_LOG` of the injected sidecars are `info`; `valkey.persistence.enabled` is true. |
+| CHT-06 | **E** (`scripts/check-chart.sh`). `values-production.yaml` holds no secret: no non-empty scalar at a key path that names a password, passwd, token, secret, credential or private key, and no PEM block (`-----BEGIN`) or known token prefix (`AKIA`, `ghp_`, `sk_live_`). |
+| CHT-07 | **M** (main session, recorded on the PR). `trivy config` on a directory holding the overlay render (`helm template … -f values-production.yaml`) reports no HIGH or CRITICAL finding. |
+| CHT-08 | **E** (kind, `scripts/e2e.sh` section `cht_08`). One install with the overlay, with the kind adaptations listed in the script header (locally built images by tag, no Prometheus Operator CRDs, no webhook source CIDR, a PriorityClass `mimic-critical` created by the script): the controller Deployment has 3 Ready replicas, the Valkey StatefulSet is Ready, and the live PodDisruptionBudget, topology spread constraints and priority class are those of CHT-05. |
+| CHT-09 | **D** (review). `docs/wiki/Install.md` has a section *Production install* that explains each value of the overlay and each placeholder; `docs/wiki/Configuration.md` lists `controller.priorityClassName`, `valkey.priorityClassName` and `controller.topologySpreadConstraints`, and the overlay's values that differ from the defaults. |
+
+### 12.19 Benchmarks (#436)
 
 A baseline of what the sidecar costs (design `docs/design/mimic-mesh.md` §14, §17.3), run by hand
 on a quiet machine with `scripts/bench.sh` and recorded in `docs/bench/`. It is not a CI job: shared

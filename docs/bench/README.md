@@ -1,6 +1,6 @@
 # Sidecar baseline (B0)
 
-Results of `scripts/bench.sh` (#436, [SPEC §12.16](../SPEC.md#1216-benchmarks-436)): what the sidecar
+Results of `scripts/bench.sh` (#436, [SPEC §12.19](../SPEC.md#1219-benchmarks-436)): what the sidecar
 costs on a quiet machine, before the mesh milestones. Each setup writes `<date>-<setup>.json` (the
 machine description, every run, the sidecar CPU and RSS); each run adds one row to the table at the
 end of this file. How to run it and read the numbers: [Developing](../wiki/Developing.md#benchmarks).

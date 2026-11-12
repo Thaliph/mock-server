@@ -17,6 +17,7 @@
 **Run**
 - [Configuration](Configuration)
 - [Operations](Operations)
+- [Access logs](Access-logs)
 - [Monitoring](Monitoring)
 - [Security](Security)
 - [Troubleshooting](Troubleshooting)
