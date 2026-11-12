@@ -182,8 +182,7 @@ async fn tunnel_pod(
             tokio::spawn(async move {
                 let mut pending = Vec::new();
                 let mut buf = [0u8; 4096];
-                'conn: loop {
-                    let Ok(n) = s.read(&mut buf).await else { break };
+                'conn: while let Ok(n) = s.read(&mut buf).await {
                     if n == 0 {
                         break;
                     }
