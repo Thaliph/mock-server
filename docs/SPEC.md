@@ -1539,12 +1539,12 @@ length or hash of what it replaces.
   deployment without data is served and shows "no data" from the `404` of its JSON route.
 - **Explorer shell and Workloads tab (F15).** Every page carries the same four tabs, in this
   order: Map (`/ui/map`), Workloads (`/ui/`), Endpoints (`/ui/endpoints`), Load tests
-  (`/ui/loadtests`); Map, Endpoints and Load tests are placeholders until their own features.
+  (`/ui/loadtests`); Map and Load tests are placeholders until their own features.
   The deployment page and the document page of F6 stay as they are. The Workloads tab lists every
   deployment with its namespace, mode, pods, last push and the mimic resources that configure it
   (`MimicWorkload`, `MimicLoadTest`, from #440 `MimicConfig`), each linking to
-  `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` (`<kind>` one of those three, `<name>` a
-  DNS-1123 subdomain, else `400`), the resource view: its spec as read-only YAML, its labels and
+  `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` (the fifth segment is the word `resources`;
+  `<kind>` one of those three, `<name>` a DNS-1123 subdomain, else `400`), the resource view: its spec as read-only YAML, its labels and
   annotations, its status conditions. Data comes from two routes served from the controller's
   watch caches (no call to the API server per request, no Valkey): `GET /v1/resources`
   (`{"workloads": [{"namespace", "deployment", "mode", "resources": [{"kind", "name"}]}]}`, sorted)
@@ -1557,8 +1557,24 @@ length or hash of what it replaces.
   and the `last-applied-configuration` annotation are dropped, and a `MimicLoadTest`'s
   `credentials` is reduced to `secretName` and the `field` of each entry (never `key`). The YAML
   is rendered by the controller, deterministically: keys in byte order, every string
-  double-quoted in JSON syntax. The browser writes it with `textContent`. The routes count in
+  double-quoted in JSON syntax, with U+0085, U+2028 and U+2029 escaped (`\u0085`, `\u2028`,
+  `\u2029`: YAML 1.1 reads them as line breaks and JSON leaves them raw). The browser writes it
+  with `textContent`; annotation values are shown as set by their authors, as text. The routes count in
   `mimic_ui_requests_total` by route pattern like the others.
+- **Endpoints tab (F15).** `/ui/endpoints` is a static page like the others; `mimic.js` fills
+  it from `GET /v1/workloads` (the deployment picker, one `<ns>/<dep>` option per deployment
+  with data, sorted) and, for the picked deployment, `GET /v1/workloads/<ns>/<dep>/endpoints`:
+  one table row per endpoint, inbound and outbound, with direction, port or authority, method,
+  template, exchanges, statuses, latency quantiles and last seen. The pick is kept in the query
+  string (`?deployment=<ns>/<dep>`, read back on load, so a view can be linked) and no
+  deployment is picked by default. Four filters narrow the table in the browser, with no new
+  request: method (an exact choice among the methods listed), template and authority (a
+  case-insensitive substring), and status class (`2xx`, `3xx`, `4xx`, `5xx`: the endpoint has at
+  least one recorded status of that class). A filter that matches nothing shows "No
+  endpoint matches". Each row links, through its `document` member, to the Swagger UI page of
+  its document, `/ui/workloads/<ns>/<dep>/openapi/<document>` (inbound `inbound-<port>`,
+  outbound `outbound-<authority>`), every part passed through `encodeURIComponent`. A deployment
+  without data shows "No data". The documents and the read routes do not change.
 - **Swagger UI configuration** (in `mimic.js`, nothing inline): `url` = the document route;
   `supportedSubmitMethods: []` (no "Try it out" button, so the UI never sends a request to a
   workload); `tryItOutEnabled: false`; `validatorUrl: null` (no call to
@@ -3963,6 +3979,20 @@ such as `<img src=x onerror=alert(1)>`.
 | EXP-06 | **I.** Metrics: after a known sequence of requests to the new routes `mimic_ui_requests_total` holds the route patterns `/v1/resources`, `/v1/workloads/{namespace}/{deployment}/resources`, `/ui/map`, `/ui/endpoints`, `/ui/loadtests` and `/ui/workloads/{namespace}/{deployment}/resources/{kind}/{name}` with the codes answered, and no label holds a name from the request. |
 | EXP-07 | **E.** Browser (the Chromium of UI-12): `/ui/` shows the four tabs; the Workloads tab lists the e2e deployment `users` of `disc-22` with its mode and its `MimicWorkload`, whose link opens the resource view showing the spec as YAML; each tab path shows its heading; no CSP violation, no request outside the port-forward, no Try it out button. |
 | EXP-08 | **D** (review). `docs/wiki/Reading-the-API.md` documents the two new routes and the resource view, and `docs/wiki/Quick-start.md` the tabs. |
+
+#### Endpoints tab (#466)
+
+The Endpoints tab of §7.5 (*Endpoints tab*), and the follow-ups of the review of #473 (#474),
+whose tests are named after the criteria they extend: `exp_01_…` for the YAML escaping of
+U+0085, U+2028 and U+2029, and `exp_04_…` for the resource page route requiring the word
+`resources`. Levels as in §12.2.
+
+| ID | Criterion |
+|---|---|
+| EXP-09 | **I** (real Valkey). For a deployment with an inbound endpoint and outbound endpoints (a local authority, an IPv6 one and a redacted host), `GET /v1/workloads/<ns>/<dep>/endpoints` gives each row the members the tab reads: `direction`, `port` (inbound) or `authority` (outbound), `method`, `template`, `exchanges`, `statuses` and a `document` that is `inbound-<port>` or the `outbound-` id of the authority; and the route named by `document` under `/openapi/` answers `200` for each row, as `mimic.js` builds it with percent-encoding; `/ui/endpoints` is `200` and holds no deployment name (static bytes). |
+| EXP-10 | **I.** `mimic.js` (read as text, UI-09 rules): the Endpoints tab no longer shows the placeholder text; it reads `/v1/workloads` and the `/endpoints` route, links to `/openapi/` through `enc(` and `encodeURIComponent`, has the four filters (method, template, authority, status class) and the `No endpoint matches` and `No data` texts; it contains no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write` or `eval`, and no `http://` or `https://`; the CSP of UI-08 is unchanged. |
+| EXP-11 | **E.** Browser (the Chromium of UI-12): `/ui/endpoints?deployment=disc-22/users` lists the endpoints `GET /users/{users_id}` and `PUT /users/{users_id}` (inbound, port 8080) and `?deployment=egr-19/front` its outbound ones with their authority; the method filter set to `PUT` leaves only the `PUT` row and the template filter `missing` only the matching rows; a status class matching nothing shows `No endpoint matches`; the row link opens the Swagger UI page of its document (no Try it out button); no CSP violation and no request outside the port-forward. |
+| EXP-12 | **D** (review). `docs/wiki/Reading-the-API.md` describes the Endpoints tab and its filters, and notes that annotation values of the resource view are shown as set by their authors (text, loopback-only UI); the security review of #466 finds no markup built from a template or an authority. |
 
 ### 12.18 Production values (#438)
 

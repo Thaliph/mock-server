@@ -20,8 +20,15 @@ All notable changes to mimic are documented in this file. The format follows
 
 - Every TCP socket of the sidecar (accepted, connected to the destination, pass-through) and of the controller's listeners and Valkey connections sets `TCP_NODELAY`: HTTP/2 through the sidecar no longer pays a ~40 ms Nagle and delayed-ACK stall per request (#480).
 
+- The Endpoints tab lists the inbound and outbound endpoints of a picked deployment (`/ui/endpoints?deployment=<ns>/<dep>`), filtered in the browser by method, template, authority and status class, each row linking to the Swagger UI page of its document (#466).
+
+### Fixes
+
+- The read-only YAML of the resource view escapes U+0085, U+2028 and U+2029 in strings and keys (YAML 1.1 line breaks); the UI router serves the resource view only under `/ui/workloads/<ns>/<dep>/resources/` and the document page only under `/openapi/` (#474).
+
 ### Documentation
 
+- Wiki "Reading the API": the Endpoints tab and its filters; annotation values of the resource view are shown as set by their authors (#466, #474).
 - Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
 
 ## [0.2.0-alpha.3] - 2026-11-11
