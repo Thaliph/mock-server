@@ -1231,7 +1231,7 @@ the recorder keeps the first message of each side:
   **Fallback from version 3** (F14). A `400` to a pending report of version 3 (a controller up
   to F13) makes the sidecar post, with the same session and sequence, the same report without
   the gRPC parts of its samples (`Report::without_grpc`: no `trailers`, no gRPC body; the
-  version is then 1 or 2 by §6.1), which follows the rules above, `outbound` fallback included;
+  version is then 1 or 2 by §6.1; any `400` triggers it, the cause is not told), which follows the rules above, `outbound` fallback included;
   counted `grpc_dropped` in `mimic_discovery_pushes_total`, one WARN `grpc not shipped`
   (`status`) per process. The unknown-outcome rule of the outbound fallback applies to it alike
   (the gRPC parts are then lost, not merged back). The next freeze tries version 3 again.
@@ -1274,6 +1274,7 @@ the recorder keeps the first message of each side:
   |---|---|---|---|
   | `mimic:v1:{<ns>/<dep>}:report` | string | merged report: canonical §6 JSON, `pod` null, with `last_seen`; from F8 its inbound part only, always `"version": 1` | `MIMIC_STORE_TTL` after the last applied push |
   | `mimic:v1:{<ns>/<dep>}:outbound` | string | (F8) merged outbound part: canonical §6.1 JSON, `"version": 2`, outbound scopes only, `pod` null, with `last_seen`; absent while the deployment has no outbound scope | same |
+  | `mimic:v1:{<ns>/<dep>}:grpc` | string | (F14) the gRPC overlay: `{"version": 1, "scopes": {"<direction>": {"<scope>": {"<path>": {"<method>": {"<hash>": <§6 sample>}}}}}}`, the full samples (with message and trailers) of the gRPC endpoints, which `:report` and `:outbound` hold without their gRPC parts; absent while no sample holds one. `:meta` `grpc_digest` is the hex SHA-256 of its bytes (absent with it) | same |
   | `mimic:v1:{<ns>/<dep>}:meta` | hash | `version` (write counter), `updated` (ms of the last applied push), `exchanges`, `endpoints_inbound`, `endpoints_outbound`, `sample_bytes`, `report_bytes` (from F8 of `:report` and `:outbound` together), from F9 `outbound_digest` (`<version>:<hex SHA-256 of :outbound>`, §7.7) | same |
   | `mimic:v1:{<ns>/<dep>}:pods` | hash | field `<pod>` → ms of its last push (applied or not) | each field min(24 h, `MIMIC_STORE_TTL`) after its last write |
   | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
@@ -1289,7 +1290,7 @@ the recorder keeps the first message of each side:
   stamping, then the write. Nothing of a push is stored or logged before its re-redaction.
   - *Structural check* (pure, `mimic-core`): `"version": 1` (from F8, the version rule of §6.1:
     1 without an outbound scope, 2 with one; from F14 3 when a sample holds a gRPC message or
-    trailers, §6.4; reason `version`) and every bound of §6 — at most
+    trailers, §6.4, in a push only: the stored parts never are; reason `version`) and every bound of §6 — at most
     `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints per direction (else `507`, reason
     `push_limit`, so that one pod cannot fill the store in one push), 20 samples and 16 hosts (each at most
     1024 bytes) per endpoint, statuses 100–599, histogram buckets within the §6 range, at most
@@ -1333,7 +1334,8 @@ the recorder keeps the first message of each side:
     removed (the sidecar never records one). A sidecar of an older version, or a faulty one,
     cannot put a value into Valkey that the controller's rules redact. From F14 a sample's gRPC body is read back as a message and redacted by §6.3
     again (a body that is not a message is replaced by `mimic-secret`), and its trailers as
-    metadata, so a faulty sidecar cannot store a value that §6.3 replaces. From F13 re-redaction
+    metadata, and every `-bin` header value, whatever the `content-type` of the request (a
+    sample with trailers and a request that is not gRPC is redacted the same way), so a faulty sidecar cannot store a value that §6.3 replaces. From F13 re-redaction
     starts with the placeholder upgrade of §6, so a push of an F12 sidecar is stored with
     placeholders; no value detector catches a placeholder and a name rule gives the same one
     again, so re-redaction stays idempotent.
@@ -1448,9 +1450,19 @@ the recorder keeps the first message of each side:
   one outbound scope remains. When the last one goes, the report drops to version 1 and its
   outbound exchanges leave with it (§6.1), so none is counted as inbound. The inbound part
   never carries the counter (it holds no outbound scope); the union of the parts adds them back.
-  From F14 `:report` is version 1 or 3 and `:outbound` version 2 or 3 (3 when one of their
-  samples holds a gRPC message or trailers, §6.4); a controller up to F13 cannot read a part of
-  version 3 (a rollback after gRPC data was stored: `500` until the keys expire).
+  From F14 `:report` and `:outbound` stay in the formats of F13 (version 1 and 2): a sample that
+  holds a gRPC message or trailers is stored there without them (`Report::split_grpc`: the
+  sample as `without_grpc` makes it), and in full in `:grpc`, which a controller up to F13 never
+  reads, so a mixed set of controller replicas during a rolling upgrade, and a rollback, keep
+  serving every workload (a rollback loses the gRPC data only). Every write reads `:grpc`
+  with the parts, applies it (`Report::apply_grpc`: each full sample replaces the sample that
+  `without_grpc` makes of it; an endpoint that is gone drops its entry), merges the push, and
+  splits again, so `:grpc` obeys the same bounds, sample budget, expiry, `MIMIC_STORE_TTL` and
+  re-redaction as the parts and is written, renamed into place and expired with them by the
+  same script. A write by a controller up to F13 leaves `:grpc` as it was (stale samples stay
+  until the keys expire). The reads of §7.5 (report, documents, endpoint list, load plan) and
+  the egress set of format 2 (§7.7) apply it; format 1 never does. An unreadable `:grpc` is
+  `stored report unreadable` (`key` `grpc`) like the parts.
 - **Pod churn**: no pod is read. A deleted pod's data stays merged (the deployment's API is
   the union over its life) and it ships its last report at `SIGTERM`; the pods of a rolling
   update push into the same key; a deleted pod's `:pods` and `:seq` fields expire after
@@ -1796,7 +1808,10 @@ held, measured and summarised, never used to answer a request.
   `<version>` differs from `:meta` `version`, or an absent one, was left by a controller up to
   F8 (which writes `:outbound` without it) and is *stale*: no `304` is possible, and the pull
   goes through a build (below), which hashes the `:outbound` bytes it reads under the same
-  body-budget share. The `ETag` of an answer is `"<format>-<hex digest>"`, so the two formats never share a `304`. The digest decides: a corruption of `:outbound` under an unchanged digest is not detected, neither for a `304` nor for a cached projection.
+  body-budget share. The `ETag` of an answer is `"<format>-<hex digest>"`, so the two formats never share a `304`. The digest of format 2 is the SHA-256 of
+  `<outbound hex>:<grpc hex>` when `:grpc` exists (the `:meta` `grpc_digest`), else the outbound
+  hex; format 1 stays the outbound hex. The cache keeps one entry per format and deployment, so
+  a workload pulled in both formats holds two (the budget evicts the least recently served). The digest decides: a corruption of `:outbound` under an unchanged digest is not detected, neither for a `304` nor for a cached projection.
 - **Route**: `GET /v1/workloads/<deployment>/egress?format=1|2` on the sidecar API (§7.2), with
   the admission, authentication and authorisation of §7.2 (deployment in the path, namespace
   from the token: a pod reads its own deployment only); there is no body to read. The
@@ -4012,14 +4027,15 @@ Levels as in §12.2, plus **F**, a fuzz target run by CI. Criteria `GRP-xx`; the
 | GRP-19 | **U.** First message (§6.4, `grpc::record::first_message`): one identity frame, a gzip frame and a body of three frames give the first message; a trailing partial frame is ignored; a compressed frame under `grpc-encoding` `br` or `zstd` is `Encoding`; a frame announcing 256 KiB + 1, a gzip payload inflating past 256 KiB and a payload of 4097 fields are `TooLarge`; a flag of 2, a first frame cut short, an empty body and a payload that is not a message (`0xff`) are `Opaque`; no input panics (property). |
 | GRP-20 | **U.** Sample (§6.4), an inbound and an outbound gRPC exchange built by the recorder: the request and the response body are `application/grpc` JSON of the redacted message (a JWT, a `ghp_` token and a 32-byte random bytes field of the canary message give `mimic-jwt`, `mimic-token`, `mimic-secret`), `response.trailers` holds `grpc-status`, `grpc-message`, a neutral name and `x-trace-bin` as `mimic-secret`, a `-bin` request header is redacted, `authorization` is `Bearer mimic-token`; the serialised report holds no canary, no base64 of a frame and no length prefix; `grpc-encoding: gzip` messages read alike; `application/grpc+json`, `application/grpc-web` and a message that is not protobuf leave the body out; a non-gRPC sample serialises byte for byte as before (no `trailers`). |
 | GRP-21 | **U.** Version (§6.1, §6.4): a report with a gRPC sample is `"version": 3` (with `outbound_exchanges` only when it holds an outbound scope), also after a merge with a version 1 or 2 report in either order and after the gRPC sample is evicted (it drops back to 1 or 2, byte-identical to the same report without it); `from_json` and the push check refuse a version that does not follow the rule (`version`); a report without gRPC sample is byte-identical to F13; the parts of `split` are version 1 or 3 (inbound) and 2 or 3 (outbound) and `join` gives the report back; `without_grpc` of a version 3 report is the same report without the gRPC parts, version 1 or 2, holds no `trailers` and no body of a gRPC media type, and passes the structural check. |
-| GRP-22 | **U.** Check and re-redaction (§7.3): a sample with 65 trailers (`malformed`), a gRPC body over 256 KiB (`body_size`) and a gRPC body of a media type other than the two (`body_media`) are refused; a pushed sample whose message holds a JWT string, a `ghp_` token and a 32-byte high-entropy bytes field, or a trailer `x-trace-bin`, is stored with their placeholders, and one whose gRPC body is not a message is stored as `mimic-secret`; re-redaction is idempotent and a sample that becomes equal to another merges with it. |
+| GRP-22 | **U.** Check and re-redaction (§7.3): a sample with 65 trailers (`malformed`), a gRPC body over 256 KiB (`body_size`) and a gRPC body of a media type other than the two (`body_media`) are refused; a pushed sample whose message holds a JWT string, a `ghp_` token and a 32-byte high-entropy bytes field, and, as raw values, a trailer `x-trace-bin`, a trailer `x-token` holding a JWT and a `-bin` request header, also on a sample whose request is JSON (not gRPC), are stored with their placeholders, and one whose gRPC body is not a message is stored as `mimic-secret`; re-redaction is idempotent and a sample that becomes equal to another merges with it. |
 | GRP-23 | **U.** Egress formats (§7.7): `project(report)` is format 2 and holds the trailers and gRPC bodies; `project_as(report, 1)` holds neither, its samples serialise exactly as the samples of a report without gRPC parts would (no `trailers`, no gRPC body, recomputed `bytes`), and it reads back with `from_json` byte for byte; `from_json` reads formats 1 and 2 and refuses 0 and 3 (`format`) and a format 1 set with trailers or a gRPC body (`malformed`); the `ETag`s of the two formats of one digest differ; both are canonical (equal reports give equal bytes). |
-| GRP-24 | **I** (controller, real Valkey). A push of version 3 is `200`; one of version 1 and 2 (F13 form, also with outbound scopes) is `200` and stored as before; `:report` and `:outbound` hold the redacted messages and trailers and no raw payload byte, and a message edited after its sample was sized is refused (`sample_bytes`); the report and document routes answer them; `GET egress?format=2` answers the set of format 2 and `?format=1` the one of format 1 (what a sidecar up to F13 reads), each with its own `ETag`, `304` on its own and not on the other's; `format=3` and `format=0` are `400` (`format`); the cache does not serve one format for the other. |
+| GRP-24 | **I** (controller, real Valkey). A push of version 3 is `200`; one of version 1 and 2 (F13 form, also with outbound scopes) is `200` and stored as before; `:grpc` holds the redacted messages and trailers and no raw payload byte, `:report` and `:outbound` hold none of them (version 1 and 2), and a message edited after its sample was sized is refused (`sample_bytes`); the report and document routes answer them; `GET egress?format=2` answers the set of format 2 and `?format=1` the one of format 1 (what a sidecar up to F13 reads), each with its own `ETag`, `304` on its own and not on the other's; `format=3` and `format=0` are `400` (`format`); the cache does not serve one format for the other. |
 | GRP-25 | **I** (sidecar, a real `h2c` gRPC server). Through the inbound listener a unary call with a request message, response message and trailers is relayed unchanged (bytes, trailers and `grpc-status` as the server sent them); the next push is version 3 and holds the redacted request and response messages and the trailers, and no canary; `mimic_discovery_bodies_total{part,result="parsed"}` counts both messages, `grpc-web` is `opaque` and an oversize request message `too_large` (`encoding` is GRP-19's); a controller of F13 (fake: `400` to version 3, accepts 1 and 2) gets the same report again without the gRPC parts, `mimic_discovery_pushes_total{result="grpc_dropped"}` is 1 and WARN `grpc not shipped` is written once; outbound alike (GRP-20). |
 | GRP-26 | **U.** OpenAPI (§7.6): a gRPC operation with message samples has `requestBody.content["application/grpc"]` with a schema whose properties are field numbers and the sample message as example, and the same under its `200` response; the document holds no trailer and no canary; a report without gRPC samples gives the same document as before. |
 | GRP-27 | **U.** Mock and load (§6.4): a mock built from a set whose gRPC samples hold messages answers a gRPC call with status 200, the empty message and `grpc-status: 0`, as without them, and the request matching ignores the recorded message (the load plan skips `grpc` endpoints, LDT-01). |
 | GRP-28 | **E.** On kind (`scripts/e2e.sh`): a Python gRPC pair A→B (`grpc.health.v1` is not used): A calls B's unary method with a message holding a secret-looking field; the controller's report for B holds the redacted request and response messages (field numbers, `mimic-` placeholders, no canary) and `grpc-status` in the trailers, version 3, the document of B shows the `application/grpc` content, and the report of A holds the same message on the outbound side. |
 | GRP-29 | **D** (review). Security review of #461: no raw message or frame byte, length or hash reaches Valkey, a log or a metric label (redaction runs before the sample exists, the controller redacts again), the budgets of §7.3 apply to the new fields, the version rule leaves F13 data byte-identical; `docs/wiki/Reading-the-API.md` has a gRPC section; `CHANGELOG.md` `[Unreleased]` names version 3, `format: 2` and the fallback. |
+| GRP-30 | **U** and **I** (controller, real Valkey). Upgrade safety (§7.3): everything a controller writes after pushes of gRPC traffic (inbound, outbound, both) is read by the rules of F13 (`:report` version 1 and `:outbound` version 2 and holds no inbound scope, no `trailers`, no gRPC body, no unknown field), `:grpc` is absent without gRPC samples and has the bounds and the TTL of the parts, the reads of §7.5 and `format=2` hold the messages, `format=1` does not, a write by the F13 rules (parts only) leaves `:grpc` in place and the next F14 read still answers, `split_grpc` then `apply_grpc` gives the report back, and the `format=2` `ETag` changes when only `:grpc` changes. |
 
 ### 12.17 F15 — Explorer UI shell and the Workloads tab (#465)
 

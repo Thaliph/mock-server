@@ -607,3 +607,96 @@ fn grp_26_openapi_shows_the_message() {
     let text = doc.to_string();
     assert!(!text.contains(JWT) && !text.contains(GHP) && !text.contains("trailers"));
 }
+
+fn set_in_samples(v: &mut Json, f: &dyn Fn(&mut Json)) {
+    match v {
+        Json::Object(map) => {
+            if let Some(Json::Object(samples)) = map.get_mut("samples") {
+                samples.values_mut().for_each(f);
+            }
+            map.values_mut().for_each(|v| set_in_samples(v, f));
+        }
+        Json::Array(items) => items.iter_mut().for_each(|v| set_in_samples(v, f)),
+        _ => {}
+    }
+}
+
+#[test]
+fn grp_22_raw_trailers_and_bin_values_are_redacted_whatever_the_request() {
+    let report = recorded(&Call::default());
+    let mut value = json(&report);
+    // A sample pushed with raw metadata, and a request that is JSON, not gRPC.
+    set_in_samples(&mut value, &|sample| {
+        sample["request"]["headers"] = serde_json::json!([
+            ["content-type", "application/json"],
+            ["x-note-bin", "QUJD"],
+            ["x-neutral", "kept"]
+        ]);
+        sample["response"]["trailers"] = serde_json::json!([
+            ["x-trace-bin", "QUJD"],
+            ["x-token", JWT],
+            ["grpc-status", "0"]
+        ]);
+    });
+    let mut pushed = Report::from_json(&value.to_string()).expect("reads");
+    pushed.re_redact(&Redactor::default());
+    let text = pushed.to_json().expect("serialises");
+    assert!(!text.contains(JWT) && !text.contains("QUJD"));
+    let after = json(&pushed);
+    let sample = samples(&after)[0].clone();
+    assert_eq!(
+        sample["response"]["trailers"],
+        serde_json::json!([
+            ["x-trace-bin", "mimic-secret"],
+            ["x-token", "mimic-jwt"],
+            ["grpc-status", "0"]
+        ])
+    );
+    assert!(sample["request"]["headers"].to_string().contains("kept"));
+    let mut again = pushed.clone();
+    again.re_redact(&Redactor::default());
+    assert_eq!(again, pushed);
+}
+
+fn both_ways() -> Report {
+    let mut report = recorded(&Call::default());
+    record(&mut report, Direction::Outbound, &Call::default());
+    report.merge(&limits(), plain_report());
+    report
+}
+
+#[test]
+fn grp_30_the_stored_parts_are_in_the_formats_of_f13() {
+    use mimic_core::discovery::overlay::GrpcOverlay;
+    let full = both_ways();
+    assert_eq!(full.version(), 3);
+    let (stripped, overlay) = full.clone().split_grpc();
+    assert!(stripped.version() <= 2);
+    let (inbound, outbound) = stripped.clone().into_split();
+    let outbound = outbound.expect("an outbound part");
+    for part in [inbound.to_json().unwrap(), outbound.to_json().unwrap()] {
+        assert!(!part.contains("\"trailers\"") && !part.contains("\"media\":\"application/grpc\""));
+        assert!(!part.contains("\"version\":3"));
+    }
+    assert_eq!((inbound.version(), outbound.version()), (1, 2));
+    // The overlay is JSON with the full samples; it reads back, and applying it gives the report.
+    assert!(!overlay.is_empty());
+    let text = overlay.to_json().expect("serialises");
+    assert!(text.contains("\"trailers\"") && !text.contains(JWT));
+    let back = GrpcOverlay::from_json(&text).expect("reads");
+    assert_eq!(back.to_json().unwrap(), text);
+    let mut joined = stripped.clone();
+    joined.apply_grpc(back);
+    assert_eq!(joined.to_json().unwrap(), full.to_json().unwrap());
+    // Without gRPC samples the overlay is empty, and applying it changes nothing.
+    let (plain, none) = plain_report().split_grpc();
+    assert!(none.is_empty());
+    let mut same = plain.clone();
+    same.apply_grpc(none);
+    assert_eq!(same, plain);
+    // An entry for an endpoint that is gone is dropped; another version is refused.
+    let mut gone = Report::new(None);
+    gone.apply_grpc(GrpcOverlay::from_json(&text).unwrap());
+    assert_eq!(gone.version(), 1);
+    assert!(GrpcOverlay::from_json(&text.replacen("\"version\":1", "\"version\":2", 1)).is_err());
+}

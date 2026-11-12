@@ -49,4 +49,15 @@ if ! grep -qF "node_image: $kind_pin" .github/workflows/ci.yml; then
   exit 1
 fi
 
-echo "pins: the Valkey image, the Valkey exporter image, the Prometheus and Grafana images and the kind node image match images/Dockerfile"
+# GRP-28: the Python packages of the e2e gRPC image are pinned by version and sha256 (pip --require-hashes).
+req=scripts/e2e/apps/grpc-requirements.txt
+if ! grep -qx 'grpcio==.*' <(sed -n 's/ *\\$//p' "$req" | grep -v '^#' | grep -v '^ *--hash'); then
+  echo "$req does not pin grpcio by version" >&2
+  exit 1
+fi
+if [ "$(grep -c '^[a-z].*==' "$req")" != "$(grep -c '^[a-z].*==.*\\$' "$req")" ] || ! grep -q -- '--hash=sha256:[0-9a-f]\{64\}' "$req"; then
+  echo "$req: every requirement must be pinned with its --hash=sha256" >&2
+  exit 1
+fi
+
+echo "pins: the e2e gRPC requirements are hashed; the Valkey image, the Valkey exporter image, the Prometheus and Grafana images and the kind node image match images/Dockerfile"

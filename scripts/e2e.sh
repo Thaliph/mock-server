@@ -890,7 +890,7 @@ issue() {
   openssl x509 -req -in "$WORK/$1.csr" -CA "$WORK/$2.crt" -CAkey "$WORK/$2.key" -CAcreateserial \
     -days 30 -extfile "$WORK/$1.ext" -out "$WORK/$1.crt" 2>/dev/null
 }
-# derive <name> <base image> <RUN instruction> [ENV line]: the client image mimic-e2e-<name> with the
+# derive <name> <base image> <RUN instruction> [ENV line] [requirements file, copied to /tmp/requirements.txt]: the client image mimic-e2e-<name> with the
 # e2e CA in its system store (Debian and Ubuntu: update-ca-certificates; the curl image: its bundle).
 # Node does not read the system store: its ENV names the CA file too (NODE_EXTRA_CA_CERTS). mimic's
 # sidecar takes an image's system store as upstream roots, but not NODE_EXTRA_CA_CERTS (spec §7.1).
@@ -901,6 +901,10 @@ derive() {
   {
     printf 'FROM %s\nUSER root\n' "$2"
     printf 'COPY mimic-e2e-ca.crt /usr/local/share/ca-certificates/mimic-e2e.crt\n'
+    if [[ -n ${5:-} ]]; then
+      cp "$5" "$dir/requirements.txt"
+      printf 'COPY requirements.txt /tmp/requirements.txt\n'
+    fi
     [[ -z ${3:-} ]] || printf 'RUN %s\n' "$3"
     [[ -z ${4:-} ]] || printf 'ENV %s\n' "$4"
   } > "$dir/Dockerfile"
@@ -2316,7 +2320,7 @@ docker rm -f "$CHROME" >/dev/null 2>&1 || true
 # holds them as version 3, and its document shows the message. The image is the pinned python:3.13-slim plus grpcio
 # (scripts/e2e/apps/grpc.py), built here like the TLS client images.
 log "grp_28: a Python gRPC pair A to B: the reports of both hold the redacted messages and trailers, version 3, and no canary"
-derive grpc "$PY_SLIM" 'pip install --no-cache-dir grpcio==1.85.0'
+derive grpc "$PY_SLIM" 'pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt' "" scripts/e2e/apps/grpc-requirements.txt
 ns_fresh grpc-28 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
 kubectl -n grpc-28 create configmap grpc-code --from-file=grpc.py=scripts/e2e/apps/grpc.py >/dev/null
 grpc_jwt="eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ$(openssl rand -hex 8)In0.$(openssl rand -hex 16)"
