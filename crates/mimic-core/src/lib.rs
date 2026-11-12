@@ -8,6 +8,7 @@ pub mod grpc;
 pub mod identity;
 pub mod inject;
 pub mod load;
+pub mod mesh;
 pub mod mock;
 pub mod proxy;
 pub mod redirect;
