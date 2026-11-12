@@ -1337,6 +1337,9 @@ async fn plh_07_an_f12_set_is_upgraded_by_the_pull_and_the_mock_answers_placehol
 
 #[tokio::test]
 async fn grp_34_a_controller_that_serves_format_2_is_asked_for_it_and_its_etag_is_held() {
+    // Every test that can reach the INFO line captures logs: a callsite first hit with no
+    // dispatcher stays disabled for the tests that run next to it.
+    let _logs = capture_logs();
     let two = set_json_as(&["/v1/ping"], 2);
     let rig = Rig::start(vec![ok(&two, "\"2-aa\"")], Reply::NotModified).await;
     wait(|| rig.api.count() >= 2).await;
@@ -1401,6 +1404,9 @@ async fn grp_34_a_400_to_format_2_is_answered_by_format_1_at_once_and_format_2_i
 
 #[tokio::test]
 async fn grp_34_a_400_to_format_1_too_is_a_failed_pull() {
+    // Every test that can reach the INFO line captures logs: a callsite first hit with no
+    // dispatcher stays disabled for the tests that run next to it.
+    let _logs = capture_logs();
     let rig = Rig::start(vec![], Reply::Status(400)).await;
     wait(|| rig.api.count() >= 2).await;
     assert_eq!(rig.api.target(0), "/v1/workloads/pay/egress?format=2");
