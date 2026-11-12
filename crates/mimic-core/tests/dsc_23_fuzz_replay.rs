@@ -136,6 +136,7 @@ fn run(data: &[u8]) {
                 resp_headers: &resp,
                 resp_body: Some(get(6)),
                 resp_trailers: &[],
+                resp_marks: &[],
             },
         };
         if outbound {

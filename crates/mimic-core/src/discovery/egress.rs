@@ -138,18 +138,14 @@ impl EgressSet {
                     latency: e.stats.latency.clone(),
                     method: e.method.to_string(),
                     redacted: names(&|f| fields.is_redacted(f)),
-                    samples: e
-                        .stats
-                        .samples()
-                        .iter()
-                        .map(|(_, s)| {
-                            if format == FORMAT_1 && s.is_grpc() {
-                                s.without_grpc().1.unstamped()
-                            } else {
-                                s.unstamped()
-                            }
-                        })
-                        .collect(),
+                    samples: {
+                        let mut samples = e.stats.samples().clone();
+                        // Samples that differ by their gRPC parts only are one in format 1.
+                        if format == FORMAT_1 && samples.any_grpc() {
+                            samples.without_grpc();
+                        }
+                        samples.iter().map(|(_, s)| s.unstamped()).collect()
+                    },
                     statuses: e.stats.statuses.clone(),
                     template: e.template,
                     volatile: names(&|f| fields.is_volatile(f)),

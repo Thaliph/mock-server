@@ -6,7 +6,7 @@ No. Injection adds containers and, for TLS, environment variables and a CA bundl
 
 **Which workloads are supported?**
 Pods owned by a Deployment. HTTP/1.x and HTTP/2 are understood; other TCP protocols are tunnelled and
-logged and measured at connection level. gRPC streaming, WebSocket and SSE are passed through.
+logged and measured at connection level. gRPC client and bidirectional streaming, WebSocket and SSE are passed through (server streaming is recorded and replayed).
 
 **Does mimic slow my traffic or break it?**
 It forwards bytes unchanged and never refuses or synthesises a response; discovery (when on) is best effort

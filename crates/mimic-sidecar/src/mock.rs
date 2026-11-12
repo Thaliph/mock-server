@@ -16,14 +16,14 @@ use std::time::{Duration, Instant};
 
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Body, Bytes, Incoming};
+use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::service::Service as HyperService;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use mimic_core::Mode;
 use mimic_core::discovery::redact::{self, Redactor};
-use mimic_core::mock::{self, Miss, Random};
+use mimic_core::mock::{self, Miss, Random, SharedBody};
 use mimic_core::proxy::authority::{normalise_authority, target_authority};
 use mimic_core::proxy::http1::CAPTURE_BODY_LIMIT;
 use mimic_core::proxy::tls::Exclusions;
@@ -33,6 +33,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::Sleep;
 
 use crate::access::{self, Outcome, truncate_path};
 use crate::discovery::CaptureBudget;
@@ -605,16 +606,7 @@ fn http_response(response: &mock::Response, close: bool) -> Response<MockBody> {
     let body: MockBody = if response.trailers.is_empty() {
         body.boxed()
     } else {
-        let mut trailers = HeaderMap::new();
-        for (name, value) in &response.trailers {
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                trailers.append(name, value);
-            }
-        }
-        body.with_trailers(std::future::ready(Some(Ok(trailers))))
+        body.with_trailers(std::future::ready(Some(Ok(trailer_map(response)))))
             .boxed()
     };
     let mut out = Response::new(body);
@@ -632,6 +624,89 @@ fn http_response(response: &mock::Response, close: bool) -> Response<MockBody> {
             .insert(header::CONNECTION, HeaderValue::from_static("close"));
     }
     out
+}
+
+/// The body of a replayed gRPC stream (spec §8, "Answer"): the first message, then each step
+/// at its due time after the head, then the trailers. It holds the shared answer, one timer
+/// and the pending slot of the request; dropping it (the stream ended, the client reset it or
+/// closed the connection, the connection was torn down) releases all three.
+struct Replay {
+    conn: Arc<Conn>,
+    body: SharedBody,
+    /// When each step is due, in milliseconds after `head`.
+    offsets: Vec<u64>,
+    head: tokio::time::Instant,
+    first_sent: bool,
+    next: usize,
+    timer: Option<Pin<Box<Sleep>>>,
+    trailers: Option<HeaderMap>,
+    /// Bytes of the steps written, added to the byte counters when the stream is over.
+    written: u64,
+    _slot: Option<Pending>,
+}
+
+impl Body for Replay {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let this = &mut *self;
+        if !this.first_sent {
+            this.first_sent = true;
+            let first = Bytes::from_owner(this.body.clone());
+            return Poll::Ready(Some(Ok(Frame::data(first))));
+        }
+        if let Some(offset) = this.offsets.get(this.next) {
+            let due = this.head + Duration::from_millis(*offset);
+            let timer = this
+                .timer
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(due)));
+            if timer.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.timer = None;
+            let frame = this.body.frame(this.next);
+            this.next += 1;
+            if let Some(frame) = frame {
+                this.written += AsRef::<[u8]>::as_ref(&frame).len() as u64;
+                return Poll::Ready(Some(Ok(Frame::data(Bytes::from_owner(frame)))));
+            }
+        }
+        Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.first_sent && self.next >= self.offsets.len() && self.trailers.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
+}
+
+impl Drop for Replay {
+    fn drop(&mut self) {
+        let ctx = &self.conn.ctx;
+        ctx.proxy
+            .bytes(ctx.direction, self.conn.protocol, 0, self.written);
+    }
+}
+
+/// The trailers of a mocked answer, as hyper sends them.
+fn trailer_map(response: &mock::Response) -> HeaderMap {
+    let mut trailers = HeaderMap::new();
+    for (name, value) in &response.trailers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            trailers.append(name, value);
+        }
+    }
+    trailers
 }
 
 impl Mock {
@@ -885,7 +960,8 @@ impl Conn {
         }
 
         let (matched, reservation, bytes_in) = read_body(&self.mock, body).await?;
-        let (response, label, miss, delay) = self.decide(&parts, target, matched.as_deref());
+        let (response, label, miss, delay, offsets) =
+            self.decide(&parts, target, matched.as_deref());
         // From here the answer is all that is held: the body and the index are let go before
         // the wait (spec §8 "Bounds").
         drop((matched, reservation, parts));
@@ -898,7 +974,23 @@ impl Conn {
             tokio::time::sleep_until(due).await;
             flight.slept = sleeping.elapsed();
         }
-        let out = http_response(&response, false);
+        let mut out = http_response(&response, false);
+        if let Some(body) = response.shared_body().filter(|b| !b.steps().is_empty()) {
+            // A stream: the slot goes with the body, to the end of the replay.
+            *out.body_mut() = Replay {
+                conn: self.clone(),
+                body,
+                offsets,
+                head: tokio::time::Instant::now(),
+                first_sent: false,
+                next: 0,
+                timer: None,
+                trailers: Some(trailer_map(&response)),
+                written: 0,
+                _slot: flight.slot.take(),
+            }
+            .boxed();
+        }
         flight.answer(&response, label, miss, bytes_in);
         Ok(out)
     }
@@ -912,7 +1004,7 @@ impl Conn {
         parts: &hyper::http::request::Parts,
         target: Option<&str>,
         body: Option<&[u8]>,
-    ) -> (mock::Response, &'static str, Option<Miss>, u64) {
+    ) -> (mock::Response, &'static str, Option<Miss>, u64, Vec<u64>) {
         let ctx = &self.ctx;
         let decoded = body.and_then(|data| {
             let encoding = parts
@@ -940,20 +1032,29 @@ impl Conn {
         };
         let inner = &self.mock.0;
         let Some(index) = inner.snapshot.index() else {
-            return (Miss::Authority.response(), "miss", Some(Miss::Authority), 0);
+            return (
+                Miss::Authority.response(),
+                "miss",
+                Some(Miss::Authority),
+                0,
+                Vec::new(),
+            );
         };
         match index.lookup(&inner.redactor, &request) {
             Ok(hit) => {
                 let factor = inner.snapshot.mode().factor();
                 let delay = mock::draw(hit.latency, factor, &mut ThreadRandom);
+                let response = hit.response(parts.method.as_str());
+                let delays: Vec<u64> = response.steps().iter().map(|s| s.delay_ms).collect();
                 (
-                    hit.response(parts.method.as_str()),
+                    response,
                     hit.tier.as_str(),
                     None,
                     delay,
+                    mock::offsets(&delays, factor),
                 )
             }
-            Err(reason) => (reason.response(), "miss", Some(reason), 0),
+            Err(reason) => (reason.response(), "miss", Some(reason), 0, Vec::new()),
         }
     }
 }

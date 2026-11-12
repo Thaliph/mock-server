@@ -142,6 +142,18 @@ fuzz_target!(|data: &[u8]| {
             };
             report.record_tunnel(&LIMITS, ScopeKey::Authority(key.clone()), &kind);
         }
+        // Arrival marks of the response, for a gRPC stream (spec §6.4).
+        let body = get(6);
+        let marks = [
+            mimic_core::grpc::record::Mark {
+                end: body.len() / 2,
+                ms: u64::from(byte(10, 0)),
+            },
+            mimic_core::grpc::record::Mark {
+                end: body.len(),
+                ms: u64::from(byte(11, 0)) * 50,
+            },
+        ];
         let exchange = Exchange {
             direction: if outbound {
                 Direction::Outbound
@@ -162,6 +174,7 @@ fuzz_target!(|data: &[u8]| {
                 resp_headers: &resp,
                 resp_body: Some(get(6)),
                 resp_trailers: if flags & 0x20 != 0 { resp.as_slice() } else { &[] },
+                resp_marks: if flags & 0x01 != 0 { &marks } else { &[] },
             },
         };
         if outbound {

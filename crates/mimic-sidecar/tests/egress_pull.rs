@@ -269,6 +269,7 @@ fn report_of(paths: &[&str], body: bool) -> Report {
                     resp_headers: &resp,
                     resp_body: body.then_some(text.as_bytes()),
                     resp_trailers: &[],
+                    resp_marks: &[],
                 },
             },
         );
@@ -306,6 +307,7 @@ fn set_json_as(paths: &[&str], format: u32) -> String {
                 resp_headers: &grpc,
                 resp_body: Some(&message),
                 resp_trailers: &[("grpc-status", "0")],
+                resp_marks: &[],
             },
         },
     );
@@ -963,6 +965,7 @@ fn canary_set() -> String {
                 resp_headers: &resp,
                 resp_body: Some(text.as_bytes()),
                 resp_trailers: &[],
+                resp_marks: &[],
             },
         },
     );
@@ -1246,6 +1249,7 @@ fn f12_set() -> (EgressSet, String) {
                     resp_headers,
                     resp_body: Some(body.as_bytes()),
                     resp_trailers: &[],
+                    resp_marks: &[],
                 },
             },
         );

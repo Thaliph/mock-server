@@ -145,7 +145,15 @@ value. A call whose message was never recorded (a compressed message under an en
 256 KiB, or recorded by a release before F14) gets one empty message and `grpc-status: 0`. A method that was never
 recorded is a miss: `599`, which a gRPC client sees as an HTTP error. The sidecar asks the controller for the
 egress set of `format` 2 (the one with the messages); against a controller of an earlier release (it answers `400`)
-it falls back to `format` 1 and gRPC calls get the empty message. Streams are not replayed yet.
+it falls back to `format` 1 and gRPC calls get the empty message.
+
+**Server streaming.** A call that was recorded as a stream (one request message, several response messages) is
+replayed as one: the first message right after the head, then each next message after its recorded delay
+multiplied by the latency factor (the pace is the recorded one, rounded up to a latency bucket, not drawn), then
+the trailers. The answer has no `content-length`. The whole replay is capped at 300 s, and one stream holds one
+timer and one pending slot (`mimic_mock_pending`) until it ends. When the client cancels the call (`RST_STREAM`)
+or closes the connection the replay stops at once and nothing more is written. Client and bidirectional streams
+are not replayed as sequences: the sample of such a call answers as a unary one (its first response message).
 
 An empty snapshot (nothing recorded yet) misses every call. Turn the mode on once the Deployment has traffic
 behind it: [Egress aggregation](Egress-aggregation) shows what has been recorded.

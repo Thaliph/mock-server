@@ -81,6 +81,7 @@ pub fn record(report: &mut Report, ex: &Ex<'_>) {
                 resp_headers: &resp,
                 resp_body: ex.resp_body.map(str::as_bytes),
                 resp_trailers: &[],
+                resp_marks: &[],
             },
         },
     );

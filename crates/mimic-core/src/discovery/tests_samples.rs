@@ -95,6 +95,7 @@ impl Owned {
                     resp_headers: &resp,
                     resp_body: self.resp_body.as_deref(),
                     resp_trailers: &[],
+                    resp_marks: &[],
                 },
             },
         )

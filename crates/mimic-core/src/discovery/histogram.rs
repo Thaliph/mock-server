@@ -97,6 +97,31 @@ impl Histogram {
     }
 }
 
+/// A delay in the bucket it falls in, as that bucket's largest whole number of milliseconds
+/// (spec §6.4): 0 stays 0, a delay over 131 072 ms is 131 072. Idempotent, and never below its
+/// input up to 131 072, so a sample shows the pace of a stream and no exact time.
+pub fn bucketed(ms: u64) -> u64 {
+    match ms {
+        0 => 0,
+        m if m > 1 << 17 => 1 << 17,
+        m => {
+            let bucket = bucket_index(m);
+            // The largest `x` with `x^4 <= 2^bucket`.
+            let limit = 1u128 << bucket;
+            let (mut low, mut high) = (1u64, 1u64 << 17);
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if u128::from(mid).pow(4) <= limit {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            low
+        }
+    }
+}
+
 /// Upper bound of bucket `i` in milliseconds, rounded up: the smallest `m` with `m^4 >= 2^i`.
 fn upper_bound(bucket: u8) -> u64 {
     let (mut low, mut high) = (1u64, 1 << 17);

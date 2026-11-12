@@ -105,6 +105,7 @@ pub(super) fn leak_all(p: &Places<'_>, authority: &str, sni: &[&str]) -> String 
             resp_headers: &resp,
             resp_body: Some(p.resp_body),
             resp_trailers: &[],
+            resp_marks: &[],
         },
         authority,
         sni,

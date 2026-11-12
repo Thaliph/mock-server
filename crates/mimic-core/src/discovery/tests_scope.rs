@@ -68,6 +68,7 @@ pub(super) fn v1_report() -> Report {
                     resp_headers: &h,
                     resp_body: Some(br#"{"ok":true}"#),
                     resp_trailers: &[],
+                    resp_marks: &[],
                 },
             },
         );

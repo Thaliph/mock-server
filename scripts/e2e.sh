@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, GRP-35, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, GRP-35, GRP-46, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -2503,7 +2503,7 @@ done
 (( grpc_ok )) || fail "grp_28: the reports of grpc-a and grpc-b do not hold a version 3 sample: $(head -c 600 "$WORK/grp28-grpc-b.json" 2>/dev/null)"
 # The messages and the trailers, redacted: B's inbound samples and A's outbound ones.
 for d in grpc-b grpc-a; do
-  jq -e '[.. | objects | select(has("samples")) | .samples[]] | all(
+  jq -e '[.. | objects | select(has("samples")) | .samples[] | select(.request.path == "/pkg.Users/Get")] | all(
       .request.body.media == "application/grpc"
       and .request.body.value["1"] == "ann"
       and .request.body.value["2"] == "mimic-jwt"
@@ -2540,6 +2540,34 @@ for c in "${grpc_canaries[@]}"; do
   done
 done
 
+# --- gRPC server streaming, recorded (#464, spec §6.4, §12.16 GRP-46) --------------------------------------------------------
+# The client of grpc-a also calls the server-streaming pkg.Users/Watch (5 messages 200 ms apart, the third holding the real
+# token) once a second: the reports of grpc-b (inbound) and grpc-a (outbound) hold it as the first message and 4 steps, the
+# token a placeholder, the delays bucket values that add up to the pace of the stream.
+log "grp_46: the reports hold the server-streaming call as steps"
+# grpc_stream <deployment>: the merged report, once every Watch sample holds its 4 steps.
+grpc_stream() {
+  curl -fs --max-time 10 "localhost:18082/v1/workloads/grpc-28/$1/report" > "$WORK/grp46-$1.json" 2>/dev/null \
+    && jq -e '[.. | objects | select(has("samples")) | .samples[] | select(.request.path == "/pkg.Users/Watch")]
+      | length >= 1 and all(
+        .request.body.value["1"] == "ann"
+        and .response.body.value["1"] == 1
+        and (.response.stream | length == 4 and (map(.message["1"]) == [2, 3, 4, 5])
+          and .[1].message["2"] == "mimic-token" and ((map(.delay_ms) | add) >= 600) and all(.[]; (.delay_ms | type) == "number")))' \
+      "$WORK/grp46-$1.json" >/dev/null
+}
+grpc_stream_ok=0
+for _ in $(seq 40); do
+  if grpc_stream grpc-b && grpc_stream grpc-a; then grpc_stream_ok=1; break; fi
+  sleep 3
+done
+(( grpc_stream_ok )) || fail "grp_46: the reports do not hold the stream as 4 steps: $(jq -c '[.. | objects | select(has("samples")) | .samples[] | select(.request.path == "/pkg.Users/Watch")][0].response' "$WORK/grp46-grpc-b.json" 2>/dev/null | head -c 800)"
+for c in "${grpc_canaries[@]}"; do
+  for f in "$WORK/grp46-grpc-a.json" "$WORK/grp46-grpc-b.json"; do
+    if found -F "$c" "$f"; then fail "grp_46: a canary appears in ${f##*/}"; fi
+  done
+done
+
 # --- gRPC mock replay (#463, spec §8, §12.16 GRP-35) ------------------------------------------------------------------------
 # The pair of grp_28 goes on: grpc-a is switched to mock and grpc-b is scaled to 0. The sidecar of grpc-a answers the call
 # from the egress set it pulled (format 2), so the client still gets OK and the recorded message, whose token field is
@@ -2565,6 +2593,11 @@ sleep 8
 kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=-1 | jq -R -s -e --argjson n "$grpc_seen" \
   '[split("\n")[] | fromjson? | select(. != null)] | .[$n:] | length >= 3 and all(.status == "OK" and .mocked == true)' >/dev/null \
   || fail "grp_35: a call of grpc-a failed or was not the recorded message with grpc-b at 0: $(kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=5)"
+# The server-streaming call is replayed as the sequence (GRP-46): the 5 messages in order, over the recorded pace.
+kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=-1 | jq -R -s -e --argjson n "$grpc_seen" \
+  '[split("\n")[] | fromjson? | select(. != null)] | .[$n:] | map(select(.method == "/pkg.Users/Watch"))
+    | length >= 2 and all(.status == "OK" and .mocked == true and .order == [1, 2, 3, 4, 5] and .span_ms >= 600)' >/dev/null \
+  || fail "grp_46: the stream was not replayed in order at its pace with grpc-b at 0: $(kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=4)"
 {
   for p in $(kubectl -n grpc-28 get pods -o jsonpath='{.items[*].metadata.name}'); do kubectl -n grpc-28 logs "$p" --all-containers --tail=-1; done
 } > "$WORK/grp35-logs.txt"
