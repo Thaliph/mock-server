@@ -79,6 +79,7 @@ fn record(
                 resp_headers: &resp,
                 resp_body: response.as_deref(),
                 resp_trailers: trailers,
+                resp_marks: &[],
             },
         },
     );

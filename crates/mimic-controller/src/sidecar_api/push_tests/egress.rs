@@ -189,6 +189,7 @@ pub(super) fn fat_report(secret: &str) -> Report {
                         resp_headers: &resp_headers,
                         resp_body: Some(body.as_bytes()),
                         resp_trailers: &[],
+                        resp_marks: &[],
                     },
                 },
             );

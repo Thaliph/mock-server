@@ -1,5 +1,5 @@
 //! F14 (#461): version 3 pushes and the two formats of the egress set (spec §6.4, §7.3, §7.7):
-//! GRP-24.
+//! GRP-24, and from #464 the streams of GRP-43.
 
 use mimic_core::discovery::report::Via;
 use mimic_core::discovery::scope::ScopeKey;
@@ -72,6 +72,7 @@ fn grpc_report_of(path: &str, outbound: bool) -> Report {
                     resp_headers: &headers,
                     resp_body: Some(&body),
                     resp_trailers: &trailers,
+                    resp_marks: &[],
                 },
             },
         );
@@ -257,4 +258,159 @@ async fn grp_30_the_etag_of_format_2_follows_the_overlay_alone() {
     assert_eq!(one.etag(), one_after.etag());
     assert!(two_after.text().contains("\"trailers\""));
     assert!(!one_after.text().contains("trailers"));
+}
+
+/// An inbound and an outbound server-streaming call: one request message, three response
+/// messages 100 ms apart.
+fn stream_report_of(path: &str, outbound: bool) -> Report {
+    use mimic_core::grpc::record::Mark;
+    let mut report = Report::new(Some(pod_of("pay")));
+    let request = framed();
+    let one = framed();
+    let body = [one.clone(), one.clone(), one.clone()].concat();
+    let marks: Vec<Mark> = (0..3)
+        .map(|i| Mark {
+            end: one.len() * (i + 1),
+            ms: 100 * i as u64,
+        })
+        .collect();
+    let headers = [("content-type", "application/grpc")];
+    for (direction, key) in [
+        (Direction::Inbound, ScopeKey::Port(50051)),
+        (Direction::Outbound, ScopeKey::Authority(AUTHORITY.into())),
+    ]
+    .into_iter()
+    .filter(|(d, _)| outbound || *d == Direction::Inbound)
+    {
+        report.record_at(
+            key,
+            &Via {
+                tls: false,
+                sni: None,
+                dst: None,
+            },
+            &LIMITS,
+            &Redactor::default(),
+            &Exchange {
+                direction,
+                port: 50051,
+                method: "POST",
+                path,
+                status: 200,
+                head_ms: 3,
+                host: None,
+                grpc: true,
+                observation: Observation {
+                    query: "",
+                    req_headers: &headers,
+                    req_body: Some(&request),
+                    resp_headers: &headers,
+                    resp_body: Some(&body),
+                    resp_trailers: &[("grpc-status", "0")],
+                    resp_marks: &marks,
+                },
+            },
+        );
+    }
+    report
+}
+
+#[tokio::test]
+async fn grp_43_a_stream_is_stored_in_the_overlay_only() {
+    let s = setup(Options::default());
+    let report = stream_report_of("/pkg.Users/Watch", true);
+    assert_eq!(report.version(), 3);
+    assert!(report.to_json().unwrap().contains("\"stream\""));
+    let answer = push(&s, "pay", payload(SESSION, 1, &report)).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.bytes)
+    );
+    let inbound = stored_report(&s, "pay").await.unwrap();
+    let outbound = stored_outbound(&s, "pay").await.unwrap();
+    let overlay = stored_grpc(&s, "pay").await.unwrap();
+    // Read by the rules of F13: no stream, no trailer, no unknown field.
+    for stored in [&inbound, &outbound] {
+        assert!(!stored.contains("stream") && !stored.contains("\"trailers\""));
+    }
+    assert_eq!(
+        Report::parse_checked(&inbound, usize::MAX, usize::MAX)
+            .unwrap()
+            .version(),
+        1
+    );
+    assert_eq!(parse_outbound(outbound.as_bytes()).unwrap().version(), 2);
+    assert!(overlay.contains("\"stream\"") && overlay.contains("mimic-token"));
+    assert!(!overlay.contains(JWT) && !overlay.contains("alice\",\"2\":\"eyJ"));
+    // The report route answers the union with the steps.
+    let merged = String::from_utf8(s.api.store.report(&s.ns, "pay").await.unwrap()).unwrap();
+    assert!(merged.contains("\"stream\""));
+}
+
+#[tokio::test]
+async fn grp_43_a_stream_over_the_bounds_is_refused() {
+    let s = setup(Options::default());
+    let text = String::from_utf8(payload(
+        SESSION,
+        1,
+        &stream_report_of("/pkg.Users/Watch", false),
+    ))
+    .unwrap();
+    let mut value: Value = serde_json::from_str(&text).unwrap();
+    fn walk(v: &mut Value) {
+        match v {
+            Value::Object(map) => {
+                if let Some(Value::Object(samples)) = map.get_mut("samples") {
+                    for sample in samples.values_mut() {
+                        let step = json!({"delay_ms": 0, "message": {"1": 1}});
+                        sample["response"]["stream"] = Value::Array(vec![step; 64]);
+                    }
+                }
+                map.values_mut().for_each(walk);
+            }
+            Value::Array(items) => items.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    walk(&mut value);
+    assert_eq!(
+        push(&s, "pay", value.to_string().into_bytes()).await.status,
+        400
+    );
+}
+
+#[tokio::test]
+async fn grp_43_the_egress_formats_hold_the_steps_or_not() {
+    let s = setup(Options::default());
+    push(
+        &s,
+        "pay",
+        payload(SESSION, 1, &stream_report_of("/pkg.Users/Watch", true)),
+    )
+    .await;
+    let tok = token(&s.ns, "pay", "t");
+    let get = |query: &'static str| {
+        let (router, tok) = (s.router.clone(), tok.clone());
+        async move { request(&router, Method::GET, Some(&tok), "pay", query, None).await }
+    };
+    let (two, one) = (get("?format=2").await, get("?format=1").await);
+    assert_eq!((two.status, one.status), (200, 200));
+    assert!(two.text().contains("\"stream\"") && two.text().contains("\"trailers\""));
+    assert!(!one.text().contains("stream") && !one.text().contains("trailers"));
+    let set = mimic_core::discovery::egress::EgressSet::from_json(&one.text()).unwrap();
+    assert_eq!(set.format, 1);
+    let set = mimic_core::discovery::egress::EgressSet::from_json(&two.text()).unwrap();
+    assert_eq!(set.format, 2);
+    // Only `:grpc` changes with another inbound stream: format 2 has a new `ETag`, format 1 not.
+    push(
+        &s,
+        "pay",
+        payload(SESSION_2, 1, &stream_report_of("/pkg.Users/Follow", false)),
+    )
+    .await;
+    let (two_after, one_after) = (get("?format=2").await, get("?format=1").await);
+    assert_ne!(two.etag(), two_after.etag());
+    assert_eq!(one.etag(), one_after.etag());
 }

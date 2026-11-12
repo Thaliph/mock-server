@@ -96,6 +96,7 @@ fn record(report: &mut Report, direction: Direction, call: &Call<'_>) {
             resp_headers: &call.resp_headers,
             resp_body: Some(&call.response),
             resp_trailers: &call.trailers,
+            resp_marks: &[],
         },
     };
     let via = Via {
@@ -134,6 +135,7 @@ fn plain_report() -> Report {
             resp_headers: &[("content-type", "application/json")],
             resp_body: Some(b"{\"a\":1}"),
             resp_trailers: &[],
+            resp_marks: &[],
         },
     };
     let via = Via {

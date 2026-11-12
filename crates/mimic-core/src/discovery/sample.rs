@@ -389,6 +389,12 @@ impl Sample {
             .map(|b| (b.media.as_str(), b.value.value()))
     }
 
+    /// The gRPC response messages after the first: the bucketed delay since the message before
+    /// and the canonical JSON (spec §6.4).
+    pub fn response_stream(&self) -> Vec<(u64, Value)> {
+        Vec::new()
+    }
+
     /// The response trailers, redacted (HTTP/2, gRPC).
     pub fn trailers(&self) -> &[(String, String)] {
         &self.response.trailers

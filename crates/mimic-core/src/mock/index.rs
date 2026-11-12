@@ -160,6 +160,7 @@ fn grpc_answer(sample: &Sample) -> Answer {
         body,
         grpc: true,
         trailers,
+        steps: Vec::new(),
     }
 }
 
@@ -184,6 +185,7 @@ fn answer_of(sample: &Sample, grpc: bool) -> Answer {
         body,
         grpc: false,
         trailers: Vec::new(),
+        steps: Vec::new(),
     }
 }
 
@@ -208,6 +210,7 @@ fn bare_answer(status: u16, grpc: bool) -> Answer {
         } else {
             Vec::new()
         },
+        steps: Vec::new(),
     }
 }
 

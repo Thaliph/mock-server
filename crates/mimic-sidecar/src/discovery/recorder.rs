@@ -413,6 +413,7 @@ impl Recorder {
                     .as_ref()
                     .and_then(|(_, bytes)| bytes.as_deref()),
                 resp_trailers: &trailers,
+                resp_marks: &[],
             },
         };
         let outbound = record.direction == Direction::Outbound;

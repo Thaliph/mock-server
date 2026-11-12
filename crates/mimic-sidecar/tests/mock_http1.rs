@@ -77,6 +77,7 @@ fn record(report: &mut Report, ex: &Ex<'_>) {
                 resp_headers: &resp,
                 resp_body: Some(ex.resp_body.as_bytes()),
                 resp_trailers: &[],
+                resp_marks: &[],
             },
         },
     );

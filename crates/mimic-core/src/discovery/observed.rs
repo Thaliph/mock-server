@@ -51,6 +51,8 @@ pub struct Observation<'a> {
     pub resp_body: Option<&'a [u8]>,
     /// HTTP/2 response trailers (gRPC, spec §6.4); empty without.
     pub resp_trailers: &'a [(&'a str, &'a str)],
+    /// When the response body bytes arrived, for a gRPC stream (spec §6.4); empty without.
+    pub resp_marks: &'a [crate::grpc::record::Mark],
 }
 
 /// The bodies of one media type.
