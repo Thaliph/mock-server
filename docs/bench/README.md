@@ -99,8 +99,18 @@ CPU, at 200 rps. Added p50 is the setup's p50 minus `plain`'s; CPU is caller plu
 
 The CPU budget holds. The latency budget does not: recording costs about 0.3 ms of p50, and most of the
 added latency is the proxy hop itself (accept, protocol detection, HTTP re-framing, connect), which
-`none` keeps. The budget assumed recording dominated. It is kept as the target, and the hop is
-investigated in #490; #439 stays open until the row holds.
+`none` keeps. The budget assumed recording dominated.
+
+**Budget revised (#490).** The loopback profile of #490 puts the sidecar's own time at about 9 µs
+(http1) and 5 µs (h2c) per exchange; the rest of the pair's added latency is the pod legs (veth,
+netfilter, conntrack) and core wake-ups at a gentle rate, which no sidecar change removes. The ratio
+`hop / (hop + recording)` also worsens whenever recording gets cheaper. Design §14 now states an
+absolute M0 budget: at 200 rps over a 5 ms service, the `none` pair adds at most 1.5 ms p50 over
+HTTP/1.1 and 3.0 ms over h2c (measured above: 1.43 and 2.76 ms, met), CPU unchanged (met). These
+limits were set from this first measurement with a 5–8 % margin, not derived independently: they pin
+today's hop so that a regression shows, and they are tightened when a change cuts the hop (#493). #490
+also moves the HTTP/1.1 observation (access line, metrics, recording) after the response bytes
+(PRX-33); its kind-level gain is measured by the next run.
 
 | Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|

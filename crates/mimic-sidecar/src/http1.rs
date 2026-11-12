@@ -63,6 +63,12 @@ struct State<F> {
     codec: Codec,
     on_event: F,
     overhead: Option<Overhead>,
+    /// Events of bytes that were fed to the codec and are not yet written to their side: they
+    /// are observed once the write is done (`with_deferred`, `flush`), in order, before any
+    /// later event.
+    deferred: Vec<Event>,
+    /// The time the codec took on the bytes behind `deferred`.
+    carried: Duration,
 }
 
 /// `mimic_proxy_overhead_seconds` of the connection: the time the sidecar spent on the request
@@ -242,15 +248,37 @@ fn response_head(held: &[u8]) -> Option<(usize, u16)> {
 
 impl<F: FnMut(Event)> Relay<F> {
     fn with<T>(&self, f: impl FnOnce(&mut Codec) -> (T, Vec<Event>)) -> T {
+        self.run(f, false)
+    }
+
+    /// Like [`Relay::with`], but the events are only kept: the caller writes the bytes first
+    /// and then calls [`Relay::flush`], so that the observation of an exchange (access line,
+    /// metrics, discovery) never delays the bytes it describes (spec §4.1, PRX-33).
+    fn with_deferred<T>(&self, f: impl FnOnce(&mut Codec) -> (T, Vec<Event>)) -> T {
+        self.run(f, true)
+    }
+
+    /// Observes the deferred events.
+    fn flush(&self) {
+        self.run(|_| ((), Vec::new()), false);
+    }
+
+    fn run<T>(&self, f: impl FnOnce(&mut Codec) -> (T, Vec<Event>), defer: bool) -> T {
         let began = Instant::now();
         // A poisoned lock means the sink panicked: the relay task is gone anyway.
-        let mut state = self
+        let mut guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = &mut *guard;
         let (out, events) = f(&mut state.codec);
+        state.deferred.extend(events);
+        if defer {
+            state.carried += began.elapsed();
+            return out;
+        }
         let (mut requests, mut responses) = (0, 0);
-        for event in events {
+        for event in state.deferred.drain(..) {
             match event {
                 Event::Request(_) => requests += 1,
                 Event::Response(_) => responses += 1,
@@ -258,13 +286,14 @@ impl<F: FnMut(Event)> Relay<F> {
             }
             (state.on_event)(event);
         }
+        let carried = std::mem::take(&mut state.carried);
         if requests + responses > 0
             && let Some(overhead) = state.overhead.as_mut()
         {
-            overhead.exchanges(began.elapsed(), requests, responses);
+            overhead.exchanges(carried + began.elapsed(), requests, responses);
         }
         let opaque = state.codec.is_opaque();
-        drop(state);
+        drop(guard);
         if opaque {
             self.close_if_mock();
         }
@@ -418,7 +447,7 @@ impl<F: FnMut(Event)> Relay<F> {
                     }
                 }
             }
-            let used = self.with(|codec| codec.client_bytes_limited(&held));
+            let used = self.with_deferred(|codec| codec.client_bytes_limited(&held));
             if used == 0 {
                 // The destination is gone: what is held has nowhere to go (an upgrade or
                 // read-ahead gate would never open). The relay ends, both sockets close.
@@ -433,6 +462,7 @@ impl<F: FnMut(Event)> Relay<F> {
             send(upstream, &held[..used])
                 .await
                 .map_err(|e| (Side::Upstream, e))?;
+            self.flush();
             held.drain(..used);
         }
     }
@@ -460,7 +490,7 @@ impl<F: FnMut(Event)> Relay<F> {
                 return fin(client, Side::Client).await;
             }
             self.to_client.fetch_add(n as u64, Ordering::Relaxed);
-            let answered = self.with(|codec| {
+            let answered = self.with_deferred(|codec| {
                 let before = codec.pending();
                 let events = codec.server_bytes(&buf[..n]);
                 (codec.pending() < before || !events.is_empty(), events)
@@ -468,6 +498,7 @@ impl<F: FnMut(Event)> Relay<F> {
             send(client, &buf[..n])
                 .await
                 .map_err(|e| (Side::Client, e))?;
+            self.flush();
             if answered {
                 self.unblocked.notify_one();
             }
@@ -697,6 +728,8 @@ pub async fn relay_with(
                 histogram,
                 requests: VecDeque::new(),
             }),
+            deferred: Vec::new(),
+            carried: Duration::ZERO,
         }),
         unblocked: Notify::new(),
         stopping: AtomicBool::new(false),
@@ -944,5 +977,44 @@ mod tests {
         end_of(&mut client).await.expect("a FIN to the client");
         end_of(&mut dest).await.expect("a FIN to the destination");
         assert_eq!(relayed.await.unwrap(), Outcome::Ok);
+    }
+
+    /// PRX-33: the observation of a response (access line, metrics, discovery) comes after its
+    /// bytes were written to the client: a sink that waits for the client to have the response
+    /// cannot delay it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prx_33_response_bytes_do_not_wait_for_their_observation() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+        let ((mut client, mut relay_client), (mut dest, mut relay_dest)) =
+            (pair().await, pair().await);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let relayed = tokio::spawn(async move {
+            relay(
+                &mut relay_client,
+                &mut relay_dest,
+                Vec::new(),
+                move |event| {
+                    if matches!(event, Event::Response(_)) {
+                        let _ = released.recv_timeout(Duration::from_secs(10));
+                    }
+                },
+                std::future::pending(),
+                std::future::pending(),
+            )
+            .await
+            .outcome
+        });
+        client.write_all(REQUEST).await.unwrap();
+        let mut got = vec![0u8; REQUEST.len()];
+        dest.read_exact(&mut got).await.unwrap();
+        dest.write_all(RESPONSE).await.unwrap();
+        let mut answer = vec![0u8; RESPONSE.len()];
+        let read = timeout(Duration::from_secs(5), client.read_exact(&mut answer)).await;
+        let _ = release.send(());
+        read.expect("the response waited for its observation")
+            .unwrap();
+        assert_eq!(answer, RESPONSE);
+        drop((client, dest));
+        let _ = relayed.await;
     }
 }

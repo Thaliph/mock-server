@@ -273,6 +273,10 @@ would see without mimic, except for the limits listed at the end of this section
   1048576) when the hard limit is unlimited; when `accept` fails (e.g. no descriptor left) it
   counts the error, logs it at most once per second and retries, without touching
   established connections.
+- **Observation never delays bytes (HTTP/1).** The relay writes the bytes it read to the other
+  side before it observes what they carried (access line, metrics, discovery capture): the
+  response (or request) bytes of an exchange are written first, its observation follows, in
+  order. A slow recorder or log sink lengthens neither the response nor the request.
 - **Overload: forward, never refuse.** No admission control. Log lines go through a bounded
   in-memory queue; when stdout cannot keep up, lines are dropped and counted
   (`mimic_log_lines_dropped_total`) instead of slowing traffic.
@@ -3665,6 +3669,7 @@ in-process with an injected original destination, as the F1 tunnel tests do.
 | PRX-30 | **I.** Bounded read-ahead: against a destination that reads everything and never answers, a client that pipelines 100 requests in one write has exactly 32 of them delivered to the destination; each response the destination then sends lets one more through, and all 100 are eventually answered in order. A client that sends a 10 MiB header line without a line end has all its bytes delivered to the destination unchanged and gets one `unframed` line (its memory bound is PRX-27's). |
 | PRX-31 | **I.** With `MIMIC_MAX_CONNECTIONS=2`, a third connection is accepted by the kernel but not served until one of the two ends, then served, and a full inbound side does not delay an outbound connection; an invalid value exits with code 2 (FND-01). A client that sends an incomplete prefix of a protocol (`GE`) and goes silent is reset after the stall duration (injectable; 30 s in production) while a connection that sent nothing is not. |
 | PRX-32 | **I.** `TCP_NODELAY`: after one exchange through the proxy, both sockets of the connection (the accepted client socket and the connection to the destination) have `TCP_NODELAY` set, inbound and outbound, and so have the connections accepted by the admin listener; HTTP/2 frames (HEADERS, DATA, `WINDOW_UPDATE`) must not wait for a delayed ACK (~40 ms). The same holds for the controller's listeners and its Valkey connections. |
+| PRX-33 | **I.** Observation after the bytes (HTTP/1): with an event sink that blocks on every response until the client has read it, the client receives the response (the bytes are written before the exchange is observed). |
 
 ### 12.4 F3 — TLS interception
 
