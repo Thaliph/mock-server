@@ -134,7 +134,7 @@ pub(crate) fn put_grant(hub: &Hub, name: &str, g: ReferenceGrant) {
 }
 
 pub(crate) async fn body_of(hub: &Hub, ns: &str, deployment: &str, mode: Mode) -> (String, String) {
-    match hub.answer(ns, deployment, &move || mode, &[]).await {
+    match hub.answer(ns, deployment, &move || mode, &[], &|| {}).await {
         Answer::View(entry) => (entry.etag.clone(), entry.json.to_string()),
         _ => panic!("no view"),
     }
@@ -588,4 +588,33 @@ async fn msh_27_a_relist_replaces_what_the_watch_held_and_a_delete_removes_its_k
     hub.feed_services(Event::Delete(key("shop", "old")));
     hub.publish_now();
     assert!(names(&body_of(&hub, "shop", "x", Mode::None).await.1).is_empty());
+}
+
+#[tokio::test]
+async fn msh_26_the_gzip_copy_of_a_cached_view_is_counted_in_the_cache() {
+    let hub = hub(MeshConfig::default());
+    namespaces(&hub, 1, 20);
+    let Answer::View(entry) = hub.answer("ns0", "a", &|| Mode::None, &[], &|| {}).await else {
+        panic!("no view");
+    };
+    let plain = hub.metrics().cache_bytes.get() as usize;
+    assert_eq!(plain, entry.json.len());
+    hub.compress(&entry);
+    hub.compress(&entry);
+    assert_eq!(
+        hub.metrics().cache_bytes.get() as usize,
+        entry.json.len() + entry.gzip().len(),
+        "counted once"
+    );
+    // Over the budget with its copy: the view is served and dropped from the cache.
+    let small = super::hub::Hub::new(
+        config_with(entry.json.len() as u64 + 1),
+        MeshMetrics::default(),
+    );
+    namespaces(&small, 1, 20);
+    let Answer::View(entry) = small.answer("ns0", "a", &|| Mode::None, &[], &|| {}).await else {
+        panic!("no view");
+    };
+    small.compress(&entry);
+    assert_eq!(small.metrics().cache_bytes.get(), 0);
 }

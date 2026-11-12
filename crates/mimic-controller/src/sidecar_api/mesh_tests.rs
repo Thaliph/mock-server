@@ -563,3 +563,80 @@ async fn msh_25_a_grant_wakes_a_held_request_with_the_destination_and_its_deleti
     assert_eq!(revoked.status, 200);
     assert!(!revoked.text().contains("10.244.7.7") && !revoked.text().contains("risk/"));
 }
+
+/// A view request whose connection is `hold`.
+async fn get_with(router: &Router, hold: &crate::tls::Hold, headers: &[(&str, &str)]) -> Resp {
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/workloads/cart/mesh?format=1")
+        .header("authorization", format!("Bearer {}", token("shop", "cart")));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let mut request = request.body(Body::empty()).unwrap();
+    request
+        .extensions_mut()
+        .insert(Peer("10.1.1.1".parse().unwrap()));
+    request.extensions_mut().insert(hold.clone());
+    let response = router.clone().oneshot(request).await.unwrap();
+    let (parts, body) = response.into_parts();
+    Resp {
+        status: parts.status.as_u16(),
+        headers: parts.headers,
+        bytes: body.collect().await.unwrap().to_bytes().to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn msh_23_only_a_request_that_is_held_leaves_the_connection_cap() {
+    let s = setup_with(Some(config(300, 1)), 10_000, false);
+    let first = get(&s, "cart", "shop", &[]).await;
+    let current = first.etag();
+    // A plain answer, a stale `If-None-Match`: the slot stays.
+    for headers in [vec![], vec![("if-none-match", "\"1-stale\"")]] {
+        let hold = crate::tls::Hold::detached();
+        assert_eq!(get_with(&s.router, &hold, &headers).await.status, 200);
+        assert!(!hold.started());
+    }
+    // The watch budget is spent: `503`, and the slot stays.
+    let holder = tokio::spawn({
+        let (router, current) = (s.router.clone(), current.clone());
+        async move {
+            get_with(
+                &router,
+                &crate::tls::Hold::detached(),
+                &[("if-none-match", &current)],
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let busy = crate::tls::Hold::detached();
+    assert_eq!(
+        get_with(&s.router, &busy, &[("if-none-match", &current)])
+            .await
+            .status,
+        503
+    );
+    assert!(!busy.started());
+    assert_eq!(holder.await.unwrap().status, 304);
+    // Held: the connection leaves the cap.
+    let held = crate::tls::Hold::detached();
+    assert_eq!(
+        get_with(&s.router, &held, &[("if-none-match", &current)])
+            .await
+            .status,
+        304
+    );
+    assert!(held.started());
+    // Not synced: the slot stays.
+    let unsynced = build(Some(config(300, 1)), 10_000, false, false);
+    let hold = crate::tls::Hold::detached();
+    assert_eq!(
+        get_with(&unsynced.router, &hold, &[("if-none-match", &current)])
+            .await
+            .status,
+        503
+    );
+    assert!(!hold.started());
+}

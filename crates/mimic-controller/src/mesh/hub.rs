@@ -136,10 +136,22 @@ pub struct Entry {
     pub etag: String,
     pub json: String,
     gzip: OnceLock<Vec<u8>>,
+    /// The gzip copy was counted in the cache (see [`Hub::compress`]).
+    charged: std::sync::atomic::AtomicBool,
 }
 
 impl Entry {
-    /// The view, gzip-compressed (at most as large again as the view, held with it).
+    /// What it weighs in the cache: the view, and its gzip copy once that is counted.
+    fn cost(&self) -> u64 {
+        let zipped = if self.charged.load(std::sync::atomic::Ordering::SeqCst) {
+            self.gzip.get().map_or(0, Vec::len)
+        } else {
+            0
+        };
+        (self.json.len() + zipped) as u64
+    }
+
+    /// The view, gzip-compressed; go through [`Hub::compress`] first so that the cache counts it.
     pub fn gzip(&self) -> &[u8] {
         self.gzip.get_or_init(|| {
             let mut encoder =
@@ -207,6 +219,8 @@ pub struct Hub {
     dirty: watch::Sender<u64>,
     published: watch::Sender<Arc<Published>>,
     cache: Mutex<Cache>,
+    /// One lock per view being built: the others of that key wait for it, the other keys do not.
+    gates: Mutex<BTreeMap<CacheKey, Arc<Mutex<()>>>>,
     watches: Arc<Semaphore>,
     closed: watch::Sender<bool>,
 }
@@ -241,6 +255,7 @@ impl Hub {
             }))
             .0,
             cache: Mutex::default(),
+            gates: Mutex::default(),
             watches,
             closed: watch::channel(false).0,
         })
@@ -399,15 +414,53 @@ impl Hub {
             .get(&(namespace.to_string(), deployment.to_string()))
             .cloned();
         let key = (namespace.to_string(), mode, own);
+        if let Some(entry) = self.cached(&key, published.epoch) {
+            return entry;
+        }
+        let gate = lock(&self.gates).entry(key.clone()).or_default().clone();
+        let entry = {
+            let _building = lock(&gate);
+            // Another request may have built it while this one waited.
+            match self.cached(&key, published.epoch) {
+                Some(entry) => entry,
+                None => {
+                    let entry = self.build_entry(published, namespace, deployment, mode);
+                    let mut cache = lock(&self.cache);
+                    cache.tick += 1;
+                    let tick = cache.tick;
+                    self.admit(&mut cache, key.clone(), published.epoch, tick, &entry);
+                    entry
+                }
+            }
+        };
+        let mut gates = lock(&self.gates);
+        // The map and this request hold it: nobody else waits.
+        if Arc::strong_count(&gate) == 2 {
+            gates.remove(&key);
+        }
+        entry
+    }
+
+    fn cached(&self, key: &CacheKey, epoch: u64) -> Option<Arc<Entry>> {
         let mut cache = lock(&self.cache);
         cache.tick += 1;
         let tick = cache.tick;
-        if let Some(slot) = cache.slots.get_mut(&key)
-            && slot.epoch == published.epoch
-        {
-            slot.used = tick;
-            return slot.entry.clone();
-        }
+        let slot = cache
+            .slots
+            .get_mut(key)
+            .filter(|slot| slot.epoch == epoch)?;
+        slot.used = tick;
+        Some(slot.entry.clone())
+    }
+
+    /// Builds a view, outside the lock of the cache.
+    fn build_entry(
+        &self,
+        published: &Published,
+        namespace: &str,
+        deployment: &str,
+        mode: Mode,
+    ) -> Arc<Entry> {
         let started = Instant::now();
         let built = build(
             &published.snapshot,
@@ -437,35 +490,22 @@ impl Hub {
                 "mesh view truncated"
             );
         }
-        let entry = Arc::new(Entry {
+        Arc::new(Entry {
             etag: built.etag,
             json: built.json,
             gzip: OnceLock::new(),
-        });
-        self.admit(&mut cache, key, published.epoch, tick, &entry);
-        entry
+            charged: Default::default(),
+        })
     }
 
     /// Caches a view, least recently used out first; a view over the whole budget is not cached.
     fn admit(&self, cache: &mut Cache, key: CacheKey, epoch: u64, tick: u64, entry: &Arc<Entry>) {
         if let Some(old) = cache.slots.remove(&key) {
-            cache.bytes -= old.entry.json.len() as u64;
+            cache.bytes -= old.entry.cost();
         }
-        let size = entry.json.len() as u64;
+        let size = entry.cost();
         if size <= self.config.cache_bytes {
-            while cache.bytes + size > self.config.cache_bytes {
-                let Some(oldest) = cache
-                    .slots
-                    .iter()
-                    .min_by_key(|(_, slot)| slot.used)
-                    .map(|(key, _)| key.clone())
-                else {
-                    break;
-                };
-                if let Some(slot) = cache.slots.remove(&oldest) {
-                    cache.bytes -= slot.entry.json.len() as u64;
-                }
-            }
+            self.make_room(cache, size, None);
             cache.bytes += size;
             cache.slots.insert(
                 key,
@@ -481,15 +521,64 @@ impl Hub {
             .set(i64::try_from(cache.bytes).unwrap_or(i64::MAX));
     }
 
+    /// Evicts the least recently used slots (not `keep`) until `size` more bytes fit.
+    fn make_room(&self, cache: &mut Cache, size: u64, keep: Option<&CacheKey>) {
+        while cache.bytes + size > self.config.cache_bytes {
+            let Some(oldest) = cache
+                .slots
+                .iter()
+                .filter(|(key, _)| Some(*key) != keep)
+                .min_by_key(|(_, slot)| slot.used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(slot) = cache.slots.remove(&oldest) {
+                cache.bytes -= slot.entry.cost();
+            }
+        }
+    }
+
+    /// Compresses a view for a sidecar that accepts gzip, and counts the copy in the cache budget
+    /// while the view is cached (a copy of a view that is not cached lives with its answer).
+    pub fn compress(&self, entry: &Arc<Entry>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let size = entry.gzip().len() as u64;
+        if entry.charged.swap(true, SeqCst) {
+            return;
+        }
+        let mut cache = lock(&self.cache);
+        let Some(key) = cache
+            .slots
+            .iter()
+            .find(|(_, slot)| Arc::ptr_eq(&slot.entry, entry))
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        self.make_room(&mut cache, size, Some(&key));
+        cache.bytes += size;
+        if cache.bytes > self.config.cache_bytes
+            && let Some(slot) = cache.slots.remove(&key)
+        {
+            // Alone it is over the budget: the view is served, not kept.
+            cache.bytes -= slot.entry.cost();
+        }
+        self.metrics
+            .cache_bytes
+            .set(i64::try_from(cache.bytes).unwrap_or(i64::MAX));
+    }
+
     /// Answers a request for the view of `deployment` of `namespace`. `held` are the values of
     /// `If-None-Match`: when one is the current `ETag` the request waits for a change, up to
-    /// `MIMIC_MESH_WATCH_TIMEOUT`. `mode` is read at every look, so a mode that changes wakes it.
+    /// `MIMIC_MESH_WATCH_TIMEOUT`; `on_hold` is called once it is held. `mode` is read at every look, so a mode that changes wakes it.
     pub async fn answer(
         &self,
         namespace: &str,
         deployment: &str,
         mode: &(dyn Fn() -> Mode + Send + Sync),
         held: &[&str],
+        on_hold: &(dyn Fn() + Send + Sync),
     ) -> Answer {
         let mut changes = self.published.subscribe();
         // The snapshot is not kept while the request waits: a view is all it needs.
@@ -509,6 +598,8 @@ impl Hub {
             return Answer::Busy;
         };
         let _watch = Watch::new(permit, self.metrics.watches.clone());
+        // Only now, with a share of the watch budget, may the connection leave the listener's cap.
+        on_hold();
         let deadline = tokio::time::Instant::now() + self.config.watch_timeout;
         let mut closed = self.closed.subscribe();
         loop {

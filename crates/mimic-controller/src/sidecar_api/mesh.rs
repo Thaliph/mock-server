@@ -163,18 +163,24 @@ impl SidecarApi {
             .iter()
             .filter_map(|v| v.to_str().ok())
             .collect();
-        // Only an authorised caller gets here: its connection stops counting against the
-        // listener's cap while the request may be held (the watch budget bounds it instead).
-        if !held.is_empty()
-            && let Some(hold) = &hold
-        {
-            hold.start();
-        }
         let mode = || self.workloads.effective(namespace, deployment).mode();
-        match hub.answer(namespace, deployment, &mode, &held).await {
+        // Only an authorised caller, with a share of the watch budget, leaves the listener's cap.
+        let start = || {
+            if let Some(hold) = &hold {
+                hold.start();
+            }
+        };
+        match hub
+            .answer(namespace, deployment, &mode, &held, &start)
+            .await
+        {
             Held::View(entry) => {
                 caller.bytes = Some(entry.json.len());
-                Ok(Answered::View(entry, accepts_gzip(headers)))
+                let gzip = accepts_gzip(headers);
+                if gzip {
+                    hub.compress(&entry);
+                }
+                Ok(Answered::View(entry, gzip))
             }
             Held::NotModified(etag) => {
                 caller.bytes = Some(0);
