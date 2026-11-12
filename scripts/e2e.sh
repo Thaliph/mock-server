@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -1766,6 +1766,20 @@ for h in "x-content-type-options: nosniff" "referrer-policy: no-referrer" "x-fra
   if ! found -Fx "$h" "$WORK/ui-headers.lower"; then fail "ui_11: /ui/ lacks the header '$h'"; fi
 done
 if found -F 'access-control-allow' "$WORK/ui-headers.lower"; then fail "ui_11: /ui/ has an Access-Control-Allow header"; fi
+
+# UI-14 (spec §12.7): the controller container declares mimic-ui on 8080, and a port-forward to the deployment reaches
+# the UI (a forward to a Service or a deployment picks one pod, and the peer is that pod's loopback, so the UI answers).
+log "ui_14: the controller declares mimic-ui on 8080, and kubectl port-forward deploy/$RELEASE-controller reaches the UI"
+[[ $(kubectl -n "$NS" get deploy "$RELEASE-controller" -o jsonpath='{.spec.template.spec.containers[?(@.name=="controller")].ports[?(@.name=="mimic-ui")].containerPort}') == 8080 ]] \
+  || fail "ui_14: the controller container does not declare mimic-ui on 8080"
+kubectl -n "$NS" port-forward "deploy/$RELEASE-controller" 18083:8080 >/dev/null 2>&1 &
+deploy_pf=$!
+PIDS+=("$deploy_pf")
+for _ in $(seq 30); do curl -fs localhost:18083/v1/workloads >/dev/null && break; sleep 1; done
+[[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18083/ui/) == 200 ]] \
+  || fail "ui_14: /ui/ through kubectl port-forward deploy/$RELEASE-controller is not 200"
+kill "$deploy_pf" 2>/dev/null || true
+wait "$deploy_pf" 2>/dev/null || true
 
 log "ui_12: a pinned headless Chromium, with no name but localhost resolvable, loads the pages"
 CHROME_IMAGE=$(scripts/pinned-image.sh e2e-chromium)

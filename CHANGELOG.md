@@ -9,12 +9,30 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).
-- `kubectl get mimicloadtest` shows the p99 latency column as `P99 MICROS` instead of `P99 ΜS`: kubectl upper-cases column names, and the micro sign became a Greek capital Mu (#431).
 
 ### Documentation
 
+- Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
+
+## [0.2.0-alpha.3] - 2026-11-11
+
+### Features
+
+- `kubectl get mimicloadtest` shows the p99 latency column as `P99 MICROS` instead of `P99 ΜS`: kubectl upper-cases column names, and the micro sign became a Greek capital Mu (#431).
 - Wiki onboarding: a five-page "Get started" path (Install, Quick start, Mock mode, Load test, Reading the API) whose demo injects `front` and `users`, mocks `front` with `users` scaled to 0 and load-tests `front` alone; the load test read API, kind and install accuracy, and plain wording on the user pages.
+
+### Accepted limits
+
+Unchanged from 0.2.0-alpha.2 (see
+[`docs/SPEC.md`](https://github.com/Thaliph/mock-server/blob/v0.2.0-alpha.3/docs/SPEC.md#111-accepted-limits)
+and the wiki Security page).
+
+### Upgrade notes
+
+- Nothing to migrate from 0.2.0-alpha.2: upgrade with `helm upgrade --version 0.2.0-alpha.3`. The
+  printer column rename only changes the output of `kubectl get mimicloadtest`.
 
 ## [0.2.0-alpha.2] - 2026-11-11
 

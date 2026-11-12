@@ -1,7 +1,7 @@
 # Troubleshooting
 
 Symptom, then cause and fix. Messages are the ones mimic logs; see [Operations](Operations#logs) for how
-to read the logs.
+to read the logs, and [Access logs](Access-logs) for the sidecar's access lines.
 
 ## Injection
 

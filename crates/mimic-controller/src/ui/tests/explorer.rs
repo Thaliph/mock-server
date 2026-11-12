@@ -1,4 +1,4 @@
-//! EXP-03 to EXP-06: the explorer shell and the Workloads tab (spec §7.5, §12.16). No Valkey:
+//! EXP-03 to EXP-06: the explorer shell and the Workloads tab (spec §7.5, §12.17). No Valkey:
 //! the resource routes and the pages read the watch caches and static bytes only, so the store
 //! points at a closed port.
 

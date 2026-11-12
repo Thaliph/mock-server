@@ -2,7 +2,7 @@
 
 Step 1 of [Get started](Home#get-started): everyone starts here, developers and ops. Developers need
 only [Try it on kind](#try-it-on-kind) and [Install](#install); the sections marked *ops* are for whoever
-runs mimic on a shared cluster. Covers the chart of release 0.2.0-alpha.2. Values are listed in
+runs mimic on a shared cluster. Covers the chart of release 0.2.0-alpha.3. Values are listed in
 [Configuration](Configuration).
 
 ## Requirements
@@ -42,7 +42,7 @@ Install a released version from the OCI registry. A pre-release chart is only in
 explicit `--version`:
 
 ```bash
-helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.3 -n mimic-system --create-namespace \
   --set loadTest.enabled=true
 kubectl -n mimic-system rollout status deploy/mimic-controller --timeout=5m
 ```
@@ -76,7 +76,7 @@ Load tests are **off by default** (they add RBAC, a CRD and admission policies).
 [Load test](Load-test) page, add `--set loadTest.enabled=true` to the install, or switch it on later:
 
 ```bash
-helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system \
+helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.3 -n mimic-system \
   --reuse-values --set loadTest.enabled=true
 ```
 
@@ -91,9 +91,9 @@ go on to the next section. To verify, install [cosign](https://docs.sigstore.dev
 (for example `brew install cosign`, or download the binary of its releases page), then, before installing:
 
 ```bash
-ID=https://github.com/Thaliph/mock-server/.github/workflows/release.yml@refs/tags/v0.2.0-alpha.2
+ID=https://github.com/Thaliph/mock-server/.github/workflows/release.yml@refs/tags/v0.2.0-alpha.3
 ISSUER=https://token.actions.githubusercontent.com
-for ref in ghcr.io/thaliph/mimic:0.2.0-alpha.2 ghcr.io/thaliph/mimic-init:0.2.0-alpha.2 ghcr.io/thaliph/charts/mimic:0.2.0-alpha.2; do
+for ref in ghcr.io/thaliph/mimic:0.2.0-alpha.3 ghcr.io/thaliph/mimic-init:0.2.0-alpha.3 ghcr.io/thaliph/charts/mimic:0.2.0-alpha.3; do
   cosign verify "$ref" --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER"
 done
 ```
@@ -116,7 +116,7 @@ kubectl label namespace mimic-system \
 Common overrides (all values: [Configuration](Configuration#helm-values)):
 
 ```bash
-helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.3 -n mimic-system --create-namespace \
   --set valkey.persistence.size=8Gi \
   --set valkey.resources.limits.memory=2Gi \
   --set metrics.serviceMonitor.enabled=true
@@ -136,7 +136,7 @@ cluster-wide, the CRD, the `MutatingWebhookConfiguration` `<release>-injector` a
 
 ```bash
 kubectl -n mimic-system create secret generic my-valkey --from-literal=password="$(openssl rand -base64 30)"
-helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system --create-namespace \
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.3 -n mimic-system --create-namespace \
   --set valkey.existingSecret=my-valkey
 ```
 

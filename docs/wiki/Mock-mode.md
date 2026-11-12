@@ -49,7 +49,7 @@ import urllib.request
 print(urllib.request.urlopen("http://front.demo.svc:8080/front/users/7", timeout=10).read().decode())'
 kubectl -n demo exec deploy/front -c app -- python3 -c '
 import urllib.request
-r = urllib.request.urlopen("http://users.demo.svc:8080/users/7", timeout=10)
+r = urllib.request.urlopen("http://users.demo.svc:8080/users/99", timeout=10)
 print(r.status, r.headers.get("x-mimic-match"), r.read().decode())'
 # 200 fallback {"id": "...", "name": "user ...", ...}
 ```
