@@ -129,6 +129,7 @@ fn full_report(salt: usize) -> Report {
                     resp_headers: &headers,
                     resp_body: Some(body.as_bytes()),
                     resp_trailers: &[],
+                    resp_marks: &[],
                 },
             };
             let via = Via {

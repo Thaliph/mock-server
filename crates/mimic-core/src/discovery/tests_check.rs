@@ -46,6 +46,7 @@ fn valid() -> Value {
                 resp_headers: &headers,
                 resp_body: Some(body.as_bytes()),
                 resp_trailers: &[],
+                resp_marks: &[],
                 ..Observation::default()
             },
         },
@@ -636,6 +637,7 @@ fn record_all(l: &Limits, items: &[Ex]) -> Report {
                 resp_headers: &headers,
                 resp_body: e.body.as_deref().map(str::as_bytes),
                 resp_trailers: &[],
+                resp_marks: &[],
             },
         };
         if e.outbound {

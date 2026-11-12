@@ -22,7 +22,7 @@ pub use convergence::{Convergence, convergence};
 pub use effective::{DEFAULT_FACTOR, Effective, MockSettings, effective};
 pub use index::Index;
 pub use latency::{
-    MAX_DELAY_MS, MAX_FACTOR, Random, draw, factor_number, format_factor, parse_factor,
+    MAX_DELAY_MS, MAX_FACTOR, Random, draw, factor_number, format_factor, offsets, parse_factor,
     parse_factor_header, parse_mode_header, scale,
 };
 pub use signature::{Signature, signature};
@@ -113,6 +113,16 @@ pub struct Answer {
     pub(crate) grpc: bool,
     /// gRPC: the trailers, `grpc-status` first (spec §8, "Answer").
     pub(crate) trailers: Vec<(Box<str>, Box<str>)>,
+    /// gRPC server streaming: the messages after the first, framed, with their recorded delay.
+    pub(crate) steps: Vec<Step>,
+}
+
+/// A message of a streamed answer after the first: its frame, and the recorded delay since the
+/// message before it (spec §8, "Answer").
+#[derive(Debug, PartialEq, Eq)]
+pub struct Step {
+    pub delay_ms: u64,
+    pub frame: Box<[u8]>,
 }
 
 impl Answer {
@@ -124,6 +134,11 @@ impl Answer {
     pub fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.body.len()
+            + self
+                .steps
+                .iter()
+                .map(|s| std::mem::size_of::<Step>() + s.frame.len())
+                .sum::<usize>()
             + self
                 .headers
                 .iter()
@@ -157,12 +172,39 @@ impl Response {
     pub fn body(&self) -> &[u8] {
         self.body.as_deref().map_or(&[], |a| &a.body)
     }
+
+    /// The messages after the first of a streamed answer (none for any other).
+    pub fn steps(&self) -> &[Step] {
+        self.body.as_deref().map_or(&[], |a| &a.steps)
+    }
 }
 
 /// The body of a response, shared with the index: it hands the bytes to a transport without
 /// copying them.
 #[derive(Debug, Clone)]
 pub struct SharedBody(Arc<Answer>);
+
+impl SharedBody {
+    /// The messages after the first of a streamed answer.
+    pub fn steps(&self) -> &[Step] {
+        &self.0.steps
+    }
+
+    /// The frame of step `index`, as an owner of the shared answer: no copy.
+    pub fn frame(&self, index: usize) -> Option<SharedFrame> {
+        (index < self.0.steps.len()).then(|| SharedFrame(Arc::clone(&self.0), index))
+    }
+}
+
+/// The frame of one step, handed to a transport without copying it.
+#[derive(Debug, Clone)]
+pub struct SharedFrame(Arc<Answer>, usize);
+
+impl AsRef<[u8]> for SharedFrame {
+    fn as_ref(&self) -> &[u8] {
+        self.0.steps.get(self.1).map_or(&[], |s| &s.frame)
+    }
+}
 
 impl AsRef<[u8]> for SharedBody {
     fn as_ref(&self) -> &[u8] {

@@ -72,6 +72,8 @@ struct Tee {
     request: bool,
     kept: usize,
     ended: bool,
+    /// A gRPC response: when each chunk arrived, from the response head (spec §6.4).
+    clock: Option<Instant>,
 }
 
 impl Tee {
@@ -81,7 +83,14 @@ impl Tee {
             request,
             kept: 0,
             ended: false,
+            clock: None,
         }
+    }
+
+    /// Notes when the chunks of the body arrive.
+    fn timed(mut self) -> Self {
+        self.clock = Some(Instant::now());
+        self
     }
 
     fn with(&self, f: impl FnOnce(&mut Capture)) {
@@ -103,7 +112,16 @@ impl Tee {
         } else {
             Captured::ResponseBody(bytes)
         };
-        self.with(|capture| capture.push(captured));
+        let end = self.kept;
+        let ms = self
+            .clock
+            .map(|clock| u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX));
+        self.with(|capture| {
+            capture.push(captured);
+            if let Some(ms) = ms {
+                capture.mark(end, ms);
+            }
+        });
     }
 
     /// The response trailers, as header lines (spec §6.4).
@@ -353,7 +371,15 @@ impl Tracker {
             head,
         );
         let (parts, inner) = response.into_parts();
-        let mut tee = self.capture.as_ref().map(|c| Tee::new(c, false));
+        let grpc = parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/grpc"));
+        let mut tee = self.capture.as_ref().map(|c| {
+            let tee = Tee::new(c, false);
+            if grpc { tee.timed() } else { tee }
+        });
         if let (Some(tee), Some(capture)) = (tee.as_mut(), self.capture.as_ref()) {
             let line = format!("HTTP/1.1 {status}");
             if let Some(capture) = capture

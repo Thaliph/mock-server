@@ -199,6 +199,7 @@ fn dsc_04_n_counts_an_exchange_once() {
                     resp_headers: &headers,
                     resp_body: Some(body.as_bytes()),
                     resp_trailers: &[],
+                    resp_marks: &[],
                     ..Observation::default()
                 },
             ),
@@ -226,6 +227,7 @@ fn report_with(paths: &[&str], status: u16, l: &Limits) -> Report {
                 resp_headers: &headers,
                 resp_body: Some(body.as_bytes()),
                 resp_trailers: &[],
+                resp_marks: &[],
                 ..Observation::default()
             },
         );

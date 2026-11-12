@@ -45,6 +45,7 @@ fn record(
         resp_headers: &resp,
         resp_body: body.then_some(body_text.as_bytes()),
         resp_trailers: &[],
+        resp_marks: &[],
     };
     let exchange = Exchange {
         direction,

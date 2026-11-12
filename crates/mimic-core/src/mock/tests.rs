@@ -15,6 +15,7 @@ use crate::discovery::redact::Redactor;
 use crate::discovery::report::{Direction, Exchange, Limits, Report, Via};
 use crate::discovery::sample::Payload;
 use crate::discovery::scope::ScopeKey;
+use crate::grpc::record::Mark;
 
 use super::*;
 
@@ -36,6 +37,7 @@ struct Ex {
     resp_headers: Vec<(String, String)>,
     resp_body: Option<Vec<u8>>,
     resp_trailers: Vec<(String, String)>,
+    resp_marks: Vec<Mark>,
     grpc: bool,
     head_ms: u64,
 }
@@ -51,6 +53,7 @@ fn ex(method: &str, path: &str, status: u16) -> Ex {
         resp_headers: Vec::new(),
         resp_body: None,
         resp_trailers: Vec::new(),
+        resp_marks: Vec::new(),
         grpc: false,
         head_ms: 5,
     }
@@ -133,6 +136,7 @@ fn record_in(authority: &str, exchanges: &[Ex]) -> EgressSet {
                     resp_headers: &resp,
                     resp_body: e.resp_body.as_deref(),
                     resp_trailers: &trailers,
+                    resp_marks: &e.resp_marks,
                 },
             },
         );
@@ -1496,4 +1500,94 @@ fn grp_32_a_placeholder_field_is_never_compared() {
         reply_of(&index, Some(body)),
         (Tier::Exact, "first".to_string())
     );
+}
+
+// --- GRP-41: server streaming ------------------------------------------------------------
+
+/// A server-streaming call: one request message and `messages` answered, `marks` as the
+/// sidecar saw them arrive (an end offset per message and the millisecond).
+fn streamed(messages: &[&str], arrival: &[u64]) -> Ex {
+    let mut call = call("/pkg.Svc/Watch", r#"{"1":"q"}"#, messages[0]);
+    let mut body = Vec::new();
+    let mut marks = Vec::new();
+    for (message, ms) in messages.iter().zip(arrival) {
+        body.extend(framed(message));
+        marks.push(Mark {
+            end: body.len(),
+            ms: *ms,
+        });
+    }
+    call.resp_body = Some(body);
+    call.resp_marks = marks;
+    call
+}
+
+fn watch(index: &Index) -> Response {
+    let body = Some(framed(r#"{"1":"q"}"#));
+    ask(index, &grpc_req("/pkg.Svc/Watch", body))
+        .expect("an answer")
+        .1
+}
+
+#[test]
+fn grp_41_a_stream_is_the_first_frame_then_the_steps() {
+    let messages = [
+        r#"{"1":"a"}"#,
+        r#"{"1":"b"}"#,
+        r#"{"1":"c"}"#,
+        r#"{"1":"d"}"#,
+    ];
+    let index = index(&record(&[streamed(&messages, &[0, 100, 200, 500])]));
+    let response = watch(&index);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body(), framed(messages[0]));
+    let steps = response.steps();
+    assert_eq!(steps.len(), 3);
+    for (step, message) in steps.iter().zip(&messages[1..]) {
+        assert_eq!(&*step.frame, framed(message));
+    }
+    assert_eq!(
+        steps.iter().map(|s| s.delay_ms).collect::<Vec<_>>(),
+        [107, 107, 304]
+    );
+    // The length is not announced, and the trailers are the unary ones.
+    assert_eq!(header(&response, "content-length"), None);
+    assert_eq!(header(&response, "x-mimic-match"), Some("exact"));
+    assert_eq!(
+        response.trailers,
+        vec![("grpc-status".to_string(), "0".to_string())]
+    );
+}
+
+#[test]
+fn grp_41_a_sample_without_a_stream_is_answered_as_before() {
+    let index = index(&record(&[call(
+        "/pkg.Svc/Watch",
+        r#"{"1":"q"}"#,
+        r#"{"1":"a"}"#,
+    )]));
+    let response = watch(&index);
+    assert!(response.steps().is_empty());
+    assert_eq!(
+        header(&response, "content-length"),
+        Some(response.body().len().to_string().as_str())
+    );
+}
+
+#[test]
+fn grp_41_offsets_are_the_scaled_delays_summed_and_capped() {
+    assert_eq!(offsets(&[107, 107, 304], 100), [107, 214, 518]);
+    assert_eq!(offsets(&[107, 107, 304], 250), [268, 536, 1296]);
+    assert_eq!(offsets(&[107, 107, 304], 0), [0, 0, 0]);
+    assert_eq!(offsets(&[107, 107, 304], 10_000), [10_700, 21_400, 51_800]);
+    assert_eq!(
+        offsets(&[131_072, 131_072, 131_072], 10_000),
+        [300_000, 300_000, 300_000]
+    );
+    assert_eq!(
+        offsets(&[131_072, 131_072, 1], 100),
+        [131_072, 262_144, 262_145]
+    );
+    assert_eq!(offsets(&[], 100), Vec::<u64>::new());
+    assert_eq!(offsets(&[300_000, 300_000], 100), [300_000, 300_000]);
 }

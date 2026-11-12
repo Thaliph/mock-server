@@ -32,8 +32,9 @@ SRE, without any change to application code:
 - Traces (no OpenTelemetry spans).
 - Traffic management (retries, routing, fault injection beyond mock latency) and mesh security
   (mTLS between workloads, authorization policies): candidate v2, "mesh" features.
-- Recording or mocking WebSocket, SSE, gRPC streaming or non-HTTP TCP: passed through, logged
-  and measured only.
+- Recording or mocking WebSocket, SSE, gRPC client streaming and bidirectional streaming or
+  non-HTTP TCP: passed through, logged and measured only (a gRPC call is recorded by its first
+  request message; server streaming is recorded and replayed from F14, #464, §6.4, §8).
 - Fail-open when the sidecar is down (would need a privileged node agent): v2.
 - Kubernetes older than 1.33 (native sidecars are required).
 
@@ -964,9 +965,8 @@ the recorder keeps the first message of each side:
   `mimic_discovery_bodies_total` is `parsed`, `too_large` (a frame or an inflated payload over
   256 KiB, or a payload over the wire bounds of §6.2), `encoding` (a compressed frame whose
   `grpc-encoding` is not `gzip`) or `opaque` (a bad flag, a truncated first frame, a payload
-  that is not a message); `empty`, `budget` and `absent` are the capture's. A stream is
-  recorded by its first message until it gets a step of its own (#464); a trailing partial
-  frame is ignored.
+  that is not a message); `empty`, `budget` and `absent` are the capture's. A trailing partial
+  frame is ignored. The response messages after the first are read as a stream (below).
 - **Redact** (§6.3, `GrpcRedactor::message` with the rules and names known: none before
   reflection and per-field rules) the message **before** it is kept; metadata is redacted with
   `GrpcRedactor::metadata` for request and response headers and for the trailers. No frame, no
@@ -978,6 +978,26 @@ the recorder keeps the first message of each side:
   captured within 16 KiB, the capture budget applies); written only when not empty. `grpc-status`
   and `grpc-message` of a trailers-only response are in `response.headers`, as for any
   response.
+- **Streams** (#464). When the request body of an exchange holds exactly one message (a unary
+  call or a server-streaming one: a client-streaming or a bidirectional call, whose request holds
+  none or several messages, is recorded by its first message as above and stays passed through,
+  §1.2) the response body is read as a sequence (`mimic_core::grpc::record::steps`): its first
+  message is the `body` as above, the next ones are the sample field `response.stream`, a list
+  of `{"delay_ms": <n>, "message": <canonical JSON of §6.2>}` in order, written only when not
+  empty. At most 64 messages are kept in all (the first and 63 steps; the others are dropped,
+  the trailers are still recorded) and the canonical JSON of all of them together is at most
+  256 KiB (a message that would pass the bound ends the list). Each message is read and
+  redacted exactly as the first one is (`GrpcRedactor::message` before the sample exists; a
+  message that cannot be read ends the list, the ones before it are kept). `delay_ms` is the
+  time between the arrival of a message and of the one before it, a message arriving with the
+  last byte of its frame, as the sidecar saw the bytes of the response pass; it is never kept
+  exactly: it is rounded up to the largest whole number of milliseconds of its bucket of the latency
+  histogram (4 per doubling, so 50 ms is 53 and 100 ms is 107; `0` stays `0`, a delay over 131 072 ms is 131 072), so that the sample shows the
+  pace of the stream and no timestamp. The capture limits of §6 apply (a body over 256 KiB is
+  `too_large` and keeps no message), and the sidecar keeps for each streamed response at most
+  256 arrival marks (a byte offset and a millisecond count each) in the capture budget until the
+  exchange is recorded. The step list is part of the sample, so of its size, its hash and the
+  budgets of §7.3.
 - **Version 3.** A sample with trailers or a body of a gRPC media type makes the report
   `"version": 3` (§6.1). Nothing else changes in a report: a report without such a sample is
   byte-identical to F13. A sidecar that cannot post version 3 (a controller up to F13 answers
@@ -1380,8 +1400,10 @@ the recorder keeps the first message of each side:
     bytes, at most 64 query keys and 64 headers, 128 volatile fields and 32 hashes per
     sketch, paths and templates of at most 2048 bytes and 32 segments, 16 media types per
     side, sample bodies only for parsed media types (from F14 `application/grpc` and
-    `application/grpc+proto`) and of at most 256 KiB, at most 64 `trailers` per sample, no unknown
-    field.
+    `application/grpc+proto`) and of at most 256 KiB, at most 64 `trailers` per sample, from #464 at most 63 `stream` steps per sample (only
+    with a gRPC response body; each message a canonical message within 256 KiB, all messages
+    of the sample together within 256 KiB, each `delay_ms` a bucket bound of §6.4: reason
+    `malformed`), no unknown field.
     A template's length counts each literal segment's bytes plus its `/`, and a parameter as
     its `/` alone (the rendered `{name}` can be longer than the raw path); the `{}` that marks
     a schema's cut level is not a level.
@@ -1415,8 +1437,8 @@ the recorder keeps the first message of each side:
     `tunnels` included, as path keys do), and an `origin.sni` value that a detector catches is
     removed (the sidecar never records one). A sidecar of an older version, or a faulty one,
     cannot put a value into Valkey that the controller's rules redact. From F14 a sample's gRPC body is read back as a message and redacted by §6.3
-    again (a body that is not a message is replaced by `mimic-secret`), and its trailers as
-    metadata, and every `-bin` header value, whatever the `content-type` of the request (a
+    again (a body that is not a message is replaced by `mimic-secret`; so is each message of its
+    `stream`), and its trailers as metadata, and every `-bin` header value, whatever the `content-type` of the request (a
     sample with trailers and a request that is not gRPC is redacted the same way), so a faulty sidecar cannot store a value that §6.3 replaces. From F13 re-redaction
     starts with the placeholder upgrade of §6, so a push of an F12 sidecar is stored with
     placeholders; no value detector catches a placeholder and a name rule gives the same one
@@ -1916,8 +1938,9 @@ held, measured and summarised, never used to answer a request.
   range, at most 20 samples each passing the sample check of §7.3, at most 128 names in
   `volatile` and `redacted` together, each at most 128 bytes (`malformed`). A new format gets a
   new number; a controller keeps serving every format that a released sidecar asks for.
-  **Format 2** (F14) is format 1 plus the gRPC parts of the samples (§6.4: `response.trailers`
-  and bodies of `application/grpc` media); **format 1**, which the sidecars up to F13 ask for,
+  **Format 2** (F14) is format 1 plus the gRPC parts of the samples (§6.4: `response.trailers`,
+  bodies of `application/grpc` media and, from #464, `response.stream`; F14 is not released, so
+  the stream steps join format 2 and no format 3 exists); **format 1**, which the sidecars up to F13 ask for,
   is the same projection with those parts left out of every sample (`Sample::without_grpc`: sizes and
   keys recomputed, so that it passes the check of a released sidecar), and a format 1 set that
   holds one is `malformed`. `EgressSet::project` writes format 2, `project_as(report, 1)` format 1.
@@ -2489,7 +2512,20 @@ random numbers it hands to the draw.
   so a client whose schema declares that field as a number reads it as an unknown field, that is
   its default value (protobuf implementations skip a wire type that does not match), and a
   string field reads `mimic-token`. A sample without a recorded message (opaque, over the
-  bounds, or recorded before F14) gives the empty message. A mock never returns a raw message
+  bounds, or recorded before F14) gives the empty message. **Server streaming** (from #464): a
+  sample with a `stream` (§6.4) is answered with its first message right after the head (as
+  above), then each step as one frame of its own (flag 0) after the step's `delay_ms` scaled by
+  the latency factor (`(d × f + 50) / 100`, as "Latency", no draw: the recorded pace), counted
+  from the previous message, then the trailers; its answer has no `content-length` (its length
+  is not announced) and its replay is over within 300 s of its head: a message whose due time
+  would pass that bound is sent at the bound. One timer is held at a time, never one per step.
+  The stream holds its pending slot ("Bounds") and the shared answer until it ends. A client
+  that cancels the stream (`RST_STREAM`) or closes the connection stops the replay at once: the
+  timer, the shared answer and the slot are released and nothing more is written, no trailer
+  included. The access line is written with the head (status, first message); the bytes of the
+  later messages are added to `mimic_proxy_bytes_total` when the stream ends or is cancelled.
+  Client and bidirectional streaming calls are not recorded as sequences, and a mock answers
+  the sample of such a call as a unary one. A mock never returns a raw message
   or a raw trailer: the report never held one.
 - **Latency.** Drawn from the endpoint's recorded histogram (§6), never from the sample: a
   bucket with probability count / total, then a whole number of milliseconds uniformly within
@@ -4254,6 +4290,17 @@ Levels as in §12.2, plus **F**, a fuzz target run by CI. Criteria `GRP-xx`; the
 | GRP-35 | **E.** On kind (`scripts/e2e.sh`, after GRP-28): `grpc-a`'s `MimicWorkload` set to `mock` and `grpc-b` scaled to 0, the client of `grpc-a` still gets `OK` and the recorded response message (placeholders as strings, field numbers) for its call, with no canary; `grpc-b` receives nothing. |
 | GRP-36 | **D** (review). Security review of #463: a replay holds placeholders only (the report never held a raw value; the mock re-encodes what it was given), no Secret overrides it, `-bin` trailers are not replayed, the message is bounded by §6.2, and a request message is redacted before it is compared and never logged; `docs/wiki/Mock-mode.md` has a gRPC section; `CHANGELOG.md` `[Unreleased]` names the replay, `format=2` as the default pull and the fallback to `format=1`. |
 | GRP-37 | **I** (sidecar, a real `h2c` gRPC server, which writes its SETTINGS at accept). Inbound, in discovery: the client's preface sent 10 ms after the connection is opened is detected as HTTP/2, the call is relayed and recorded (`mimic_discovery_exchanges_total{direction="inbound",result="recorded"}` 1, a version 3 report); a destination that writes a banner (`220 hello\r\n`) is tunnelled with no added wait (the banner reaches the client in under 500 ms on loopback, far below the 30 s detection stall a wait would cost). **U** (`could_be_h2_settings`): a SETTINGS header with length 0, 6 and 18, and its prefixes, are accepted; another type, a flag, a stream id, a length of 7 or over 16384, and a banner are not. |
+| GRP-38 | **U.** Steps (§6.4, `grpc::record::steps`): a body of 5 frames and marks that show them arriving at 0, 50, 100, 100 and 400 ms gives 4 steps whose messages are the 2nd to 5th, with `delay_ms` 53, 53, 0 and 304 (the largest whole number of the bucket of 50, 50, 0 and 300); several frames in one chunk have delay 0; a message split over chunks arrives with its last chunk; no marks give delay 0; 70 frames give 63 steps; a gzip frame under `grpc-encoding: gzip` is read, one under `br` ends the list; a frame that is not a message, a bad flag and a partial last frame end the list with the steps before them; `bucketed` (the delay rounding) gives 0 for 0, 1 for 1, 2 for 2, 53 for 50, 107 for 100, 131 072 for 131 073 and more, is idempotent and never below its input up to 131 072; `single_message` is true for one frame and false for none, two, a partial one and a bad flag. |
+| GRP-39 | **U.** Recording (§6.4, the recorder's sample): a unary exchange has no `stream`; a server-streaming one (one request message, 5 response messages, delays) has 4 steps; each message is redacted as the first (a JWT, a `ghp_` token and a 32-byte random bytes field of the canary message are placeholders in the step, no canary in the serialised sample); a request of two messages (client or bidirectional streaming) gives a sample with the first response message and no `stream`; a message that cannot be read ends the list; 64 messages give 63 steps and 65 give 63; messages of 100 KiB each stop the list before the sum of their JSON passes 256 KiB; the sample's `bytes` is its serialised size and two streams that differ by one message or by one delay are two samples (two hashes) while the same stream seen twice is one. |
+| GRP-40 | **U.** Check, merge, formats (§7.3, §7.7): a sample with 64 steps, a `stream` without gRPC response body, a `delay_ms` of 51, messages over 256 KiB in all, a wrong `bytes` and an unknown field in a step are refused (`malformed`, `malformed`, `body_size`, `sample_bytes`, `unknown_field`); a step message holding a JWT string, pushed, is stored as `mimic-jwt`, one that is not a message as `mimic-secret`; the sample is `is_grpc` and its report version 3; `without_grpc` has no `stream` and its size and hash are recomputed; `project(report)` (format 2) holds the `stream` and `project_as(report, 1)` does not (its samples serialise as those of a report without gRPC parts, and a format 1 set that holds a `stream` is `malformed`); two samples that differ by their `stream` only are one sample in format 1. |
+| GRP-41 | **U.** Replay (§8, `mimic_core::mock`): a sample with a response message and 3 steps is answered with the first frame as `body`, the three step frames in order (flag 0, `Message::from_json(..).encode()`), delays `(d × f + 50) / 100` for factors 100, 250, 0 and 10 000 (the sums `stream_offsets` gives are cumulative, 0 for factor 0), a cumulative offset capped at 300 000 ms, trailers as for a unary sample, and no `content-length`; a sample without `stream` is answered byte for byte as before #464 (with `content-length`). |
+| GRP-42 | **I** (sidecar, a real `h2c` gRPC server that sends 5 messages 100 ms apart, then `grpc-status: 0`, `-bin` trailer included). Inbound, in discovery: the call is relayed unchanged (bytes, order, trailers, timing within 50 ms); the next push is version 3 and its sample holds 4 steps with `delay_ms` values that are bucket bounds from 107 up (no exact time) and the redacted messages, the `grpc-status` trailer; a client-streaming call (3 request messages, one response) and a bidirectional one (2 and 2) are relayed and recorded as before: the first response message and no `stream`; a stream whose body is over 256 KiB is relayed whole and recorded without messages (`too_large`). |
+| GRP-43 | **I** (controller, real Valkey). A version 3 push whose sample holds a `stream` is `200`; `:grpc` holds the redacted steps and no raw byte, `:report` and `:outbound` hold the sample without them (a controller of 0.2.0-alpha.3 or F13 reads both as before: version 1 or 2, the check passes, no `stream`, no trailers); a push that holds a JWT in a step is stored as `mimic-jwt`; `?format=2` of the egress route holds the steps and `?format=1` does not; `?format=2` follows a change of `:grpc` alone with a new `ETag` and `?format=1` does not; a stream over the bounds in a push is `400`. |
+| GRP-44 | **I** (sidecar in mock, real `h2c` client, `mock_rig`). A set recorded by the recorder from a server-streaming call of 5 messages 100 ms apart is answered over h2c: status 200, the 5 messages in order, then the trailers (`grpc-status: 0`, `x-neutral`, no `-bin`); the first message arrives with the head and each next one 107 ms ± 20 ms after the one before (factor 100), 214 ms ± 20 ms with factor 200, together with no delay with factor 0; no `content-length`; `mimic_mock_pending` is 1 during the replay and 0 after it; the access line is written once with `mock` `exact` and `grpc_status` 0. |
+| GRP-45 | **I** (sidecar in mock, as GRP-44). A client that resets the stream (`RST_STREAM`) after the 2nd message stops the replay: no more message is written within 500 ms, `mimic_mock_pending` is 0 within 500 ms, the connection serves another call, and 100 streams reset the same way leave the task count and the pending gauge as they were; a connection closed by the client during a replay does the same. |
+| GRP-46 | **E.** On kind (`scripts/e2e.sh`, after GRP-28 and GRP-35): a server-streaming method of the Python gRPC service (5 messages 200 ms apart, one of them holding a secret-looking field) is called by `grpc-a`'s client through `grpc-b`; the report for `grpc-b` holds 4 steps (placeholders, no canary, `delay_ms` bucket values); with `grpc-a` in `mock` and `grpc-b` scaled to 0 the client gets the 5 messages in order (the first as recorded, the others over at least 600 ms in all) and `OK`. |
+| GRP-47 | **F.** The `grpc` fuzz target also feeds arbitrary bytes and arbitrary marks to `steps`: no panic, at most 63 steps, every `delay_ms` a bucket bound, marks in any order give steps in order, no allocation beyond the bounds of §6.2. |
+| GRP-48 | **D** (review). Security review of #464: memory per stream is bounded (64 messages, 256 KiB, 256 marks in the capture budget; a replay holds a shared answer, one timer and one slot), no timer is unbounded (300 s), a cancel frees them, no exact timestamp or raw message reaches Valkey, a log or a label, steps are redacted before the sample exists and again by the controller, the stream joins the unreleased format 2 and `format=1` stays what a sidecar of 0.2.0-alpha.3 reads; `docs/wiki/Mock-mode.md` and `docs/wiki/Reading-the-API.md` describe streams; `CHANGELOG.md` `[Unreleased]` names them. |
 
 ### 12.17 F15 — Explorer UI shell and the Workloads tab (#465)
 

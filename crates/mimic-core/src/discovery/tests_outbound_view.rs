@@ -186,6 +186,7 @@ fn egr_06_key_and_sig_are_redacted_by_name_in_outbound_requests_only() {
             resp_headers: &resp_headers,
             resp_body: Some(resp_body),
             resp_trailers: &[],
+            resp_marks: &[],
             ..Observation::default()
         },
     );
@@ -547,6 +548,7 @@ proptest! {
                     resp_headers: &rs,
                     resp_body: Some(&resp_body),
                     resp_trailers: &[],
+                    resp_marks: &[],
                 },
             );
             hs.pop();

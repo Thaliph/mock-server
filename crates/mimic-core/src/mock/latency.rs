@@ -44,6 +44,19 @@ pub fn scale(d: u64, factor: u32) -> u64 {
     u64::try_from(scaled).map_or(MAX_DELAY_MS, |ms| ms.min(MAX_DELAY_MS))
 }
 
+/// When each step of a stream is due, in milliseconds after the head: the sum of the recorded
+/// `delays` each scaled by `factor`, at most 300 s (spec §8, "Answer").
+pub fn offsets(delays: &[u64], factor: u32) -> Vec<u64> {
+    let mut at = 0u64;
+    delays
+        .iter()
+        .map(|delay| {
+            at = at.saturating_add(scale(*delay, factor)).min(MAX_DELAY_MS);
+            at
+        })
+        .collect()
+}
+
 /// A whole number of milliseconds in bucket `i`: the integers in (2^((i-1)/4), 2^(i/4)],
 /// bucket 0 holding 0 and 1, the overflow bucket 131 072. A bucket between two integers (the
 /// first ones are) holds none: it gives the integer above its bound.
