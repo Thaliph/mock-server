@@ -3,4 +3,5 @@
 //! input.
 
 pub mod frame;
+pub mod redact;
 pub mod wire;
