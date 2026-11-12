@@ -4,6 +4,7 @@
 mod cert_manager;
 mod certs;
 mod loadtest;
+mod mesh;
 mod push_config;
 mod resources;
 mod sidecar_api;

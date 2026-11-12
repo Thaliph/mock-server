@@ -862,6 +862,8 @@ async fn read_exact(body: Body, length: usize) -> Result<Vec<u8>, Refusal> {
 #[cfg(test)]
 mod load_tests;
 #[cfg(test)]
+mod mesh_tests;
+#[cfg(test)]
 mod push_tests;
 
 #[cfg(test)]

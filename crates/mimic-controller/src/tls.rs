@@ -338,6 +338,11 @@ mod tests {
     }
 
     async fn start(max_connections: usize, idle_timeout: Duration) -> Listener {
+        let router = Router::new().route("/ok", get(|| async { "ok" }));
+        start_with(router, max_connections, idle_timeout).await
+    }
+
+    async fn start_with(router: Router, max_connections: usize, idle_timeout: Duration) -> Listener {
         let stored =
             certs::issue(&Stored::default(), Decision::NewCa, NAME, SystemTime::now()).unwrap();
         let slot = Arc::new(CertSlot::new());
@@ -353,7 +358,6 @@ mod tests {
             .with_no_client_auth();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let router = Router::new().route("/ok", get(|| async { "ok" }));
         let limits = Limits {
             max_connections,
             request_timeout: TIMEOUT,
@@ -467,5 +471,35 @@ mod tests {
         assert!(!closed_within(&mut tls, TIMEOUT + Duration::from_millis(300)).await);
         assert!(closed_within(&mut tls, idle).await);
         assert!(started.elapsed() >= idle - Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn msh_23_a_held_request_counts_neither_against_the_cap_nor_the_request_timeout() {
+        let router = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .route(
+                "/hold",
+                get(|request: axum::extract::Request| async move {
+                    let hold = request.extensions().get::<Hold>().cloned().expect("a hold");
+                    hold.start();
+                    // Three times the request timeout.
+                    tokio::time::sleep(TIMEOUT * 3).await;
+                    "held"
+                }),
+            );
+        let server = start_with(router, 1, Duration::from_secs(60)).await;
+        let mut held = server.tls().await;
+        held.write_all(b"GET /hold HTTP/1.1\r\nhost: x\r\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The only slot is free again: a second connection is served at once.
+        let started = Instant::now();
+        let mut other = server.tls().await;
+        assert!(get_ok(&mut other).await.starts_with("HTTP/1.1 200"));
+        assert!(started.elapsed() < TIMEOUT, "{:?}", started.elapsed());
+        // The held request outlives the request timeout and is answered.
+        let mut buffer = [0; 512];
+        let n = tokio::time::timeout(TIMEOUT * 4, held.read(&mut buffer)).await.unwrap().unwrap();
+        let answer = String::from_utf8_lossy(&buffer[..n]).into_owned();
+        assert!(answer.starts_with("HTTP/1.1 200") && answer.ends_with("held"), "{answer}");
     }
 }
