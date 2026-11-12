@@ -883,6 +883,35 @@ types are objects whose only key starts with `$`: `{"$bytes": "<base64>"}`,
 encoding (fields in ascending number order, repeats adjacent, shortest varints) round-trips
 byte for byte.
 
+### 6.3 gRPC redaction (F14, #460)
+
+Pure, `mimic_core::grpc::redact`, applied to a decoded message and to its metadata before
+anything is recorded, logged or sent. It writes the placeholders of §6 and never keeps a byte,
+length or hash of what it replaces.
+
+- **Metadata**: the header rules of §6 (names, value detectors, `Authorization` schemes,
+  cookies); in addition every `-bin` metadata value is replaced, whatever its name, by the
+  placeholder of the name rule that fires on the name without `-bin`, else `mimic-secret`.
+- **Wire-format strings**: the value detectors of §6 (JWT, PEM, card, cloud keys, token
+  prefixes, credentials) on every string field at any depth; a varint holding a card number
+  (Luhn) is replaced as a card. A replaced value becomes the string of its placeholder,
+  whatever its wire type.
+- **High entropy**: a string of at least 16 bytes whose Shannon entropy is at least 4.5
+  bits per byte, or a bytes value of at least 16 bytes whose entropy is at least 7 bits per
+  byte, becomes `mimic-secret`.
+- **Field names** (when descriptors are known, from reflection): a field whose name fires a
+  name rule of §6 (`password`, `token`, ...) is replaced, whatever its type and also a nested
+  message (the whole subtree), by that rule's placeholder.
+- **Per-field rules** (`MimicWorkload.spec.discovery.grpc.redact`): a rule is a method
+  `<package.Service>/<Method>`, a direction (`request` or `response`) and a field path, dotted
+  segments each a field number (`3.1`) or, when descriptors are known, a field name; every
+  occurrence of a matching field, also in a repeated field, becomes `mimic-secret`.
+- **Bounds**: the walk keeps the depth bound (32) and the field bound (4096) of §6.2 for a
+  message that was built by hand; a message that breaks one is an error
+  (`WireError::TooDeep`, `TooManyFields`), never a partial result and never a `null`.
+  Redaction is idempotent and deterministic, and its output does not depend on the length or
+  bytes of a secret.
+
 ## 7. Controller and storage
 
 - `MimicWorkload` (namespaced CRD, `mimic.platform.io/v1alpha1`): selects the deployment named
@@ -3880,6 +3909,13 @@ Levels as in §12.2, plus **F**, a fuzz target run by CI. Criteria `GRP-xx`; the
 | GRP-09 | **U.** A recorded 4 KiB message (a fixture holding every wire type, nested messages, a repeated field and a string) decodes to its expected JSON, the decoder allocates less than 8 times the input, and the JSON re-encodes to the fixture. |
 | GRP-10 | **F.** A fuzz target `grpc` feeds arbitrary bytes, split at arbitrary offsets, to the frame parser (the same messages whatever the split) and each payload to the wire reader and the gzip decoder: no panic, no allocation beyond the bounds of §6.2, and a payload that decodes writes JSON that reads back, whose encoding decodes and re-encodes to the same bytes. Same CI schedule as DSC-23. |
 | GRP-11 | **D** (review). §6.2 describes the decoded form; the security review of #459 finds no recursion beyond depth 32, no allocation beyond the bounds, and a bounded gzip inflation. |
+| GRP-12 | **U.** Metadata (§6.3): `authorization: Bearer x` gives `Bearer mimic-token`, `x-api-key` gives `mimic-api-key`, a neutral name and value are kept; any `-bin` value (`trace-bin`, `x-note-bin`, any case) gives `mimic-secret`, and `authorization-bin` gives `mimic-auth`; a name of the extra names gives `mimic-secret`. |
+| GRP-13 | **U.** Value detectors (§6.3): strings holding a JWT, a PEM block, a Luhn card, `ghp_…`, `AKIA…` at depth 1, at depth 5, and as one value of a repeated field give `mimic-jwt`, `mimic-private-key`, `mimic-card`, `mimic-token`, `mimic-api-key`; a varint holding a Luhn card gives the string `mimic-card`, one that does not is kept; a message with nothing sensitive is returned equal to its input. |
+| GRP-14 | **U.** Entropy (§6.3): a string of 23 distinct characters (4.52 bits) and one of 32 are `mimic-secret`, one of 22 distinct characters (4.46 bits) and a 4 KiB string of one repeated character are kept; a bytes value holding every value 0 to 127 twice (7 bits) is `mimic-secret`, one holding 0 to 126 plus a repeat (below 7 bits) and 15 bytes are kept. |
+| GRP-15 | **U.** Per-field rules (§6.3): `3.1` redacts that field only, in every occurrence of a repeated parent and in a repeated leaf, as a subtree when it is a message; a rule for another method, another direction or another path changes nothing; a name segment matches only with the name known for its path; a rule path longer than the message or a rule on a field that does not exist changes nothing. |
+| GRP-16 | **U.** Field names (§6.3): with the name `password` known for field 2, `token` for 3.1 and `note` for 4, a string, a varint, a bytes value and a nested message under 2 give `mimic-password`, 3.1 gives `mimic-token` and 4 is kept; without names nothing is redacted by name. |
+| GRP-17 | **U.** Bounds and errors (§6.3): a hand-built message nested 33 levels (and 10 000 levels, with no stack overflow in the redaction) is `Err(TooDeep)` and 32 levels is accepted; one with 4097 fields is `Err(TooManyFields)`; redacting twice gives the first result; two secrets of different length give byte-identical output; the result encodes; no input panics (property, random messages). |
+| GRP-18 | **F.** The `grpc` fuzz target also redacts every payload that decodes, with a canary-free rule set: no panic, the redacted message is a fixed point of redaction, encodes within `MAX_PAYLOAD` and decodes again. |
 
 ## 13. Test strategy
 
