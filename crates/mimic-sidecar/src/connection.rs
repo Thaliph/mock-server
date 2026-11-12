@@ -33,6 +33,9 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_PROBES: u32 = 4;
 const READ_CHUNK: usize = 4096;
 /// How long a mocked-or-not connection waits for the client's first byte before it connects.
+/// How long an in-scope connection waits for its client's first bytes before the byte relay
+/// connects and watches for a server-first protocol (spec §7.9).
+const MESH_WAIT: Duration = Duration::from_millis(50);
 const MOCK_WAIT: Duration = Duration::from_secs(1);
 /// Default port of a TLS server name, removed by the authority normalisation.
 const TLS_PORT: u16 = 443;
@@ -305,12 +308,7 @@ async fn serve_mesh(
         if h2 { "h2" } else { "http1" },
         &conn.authority(false),
     );
-    let serving = Serving {
-        mesh,
-        backend,
-        ctx: conn.ctx(),
-        tap: shared.discovery().cloned(),
-    };
+    let serving = Serving::new(mesh, backend, conn.ctx(), shared.discovery().cloned());
     let stream = Stream::plain_with_prefix(client, first);
     if let Err(e) = mesh::serve(serving, stream, h2, shared.stopped(), abort).await {
         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "mesh connection ended");
@@ -328,8 +326,8 @@ enum MeshFirst {
     Gone,
 }
 
-/// Waits for the first bytes of the client without connecting: at most [`MOCK_WAIT`] for the
-/// first byte (a server-first protocol), then the usual stall of an incomplete prefix, and for
+/// Waits for the first bytes of the client without connecting: at most [`MESH_WAIT`] for the
+/// first byte (after that the byte relay connects and detects a server-first protocol), then the usual stall of an incomplete prefix, and for
 /// an HTTP/1 request until its head is whole.
 async fn mesh_first(
     client: &mut TcpStream,
@@ -338,7 +336,7 @@ async fn mesh_first(
 ) -> MeshFirst {
     let mut abort = pin!(abort);
     let mut buf = Vec::new();
-    let silent = tokio::time::sleep(MOCK_WAIT);
+    let silent = tokio::time::sleep(MESH_WAIT);
     let mut silent = pin!(silent);
     let deadline = tokio::time::sleep(stall);
     let mut deadline = pin!(deadline);

@@ -200,6 +200,7 @@ impl Router {
                 let backend = previous
                     .remove(&label)
                     .unwrap_or_else(|| Arc::new(Backend::new(key, label.clone())));
+                self.metrics.backend_seen(&label);
                 for gone in backend.update(&addrs, window, age, &self.metrics) {
                     self.metrics.left(&backend.label, gone, now);
                 }

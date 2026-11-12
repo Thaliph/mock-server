@@ -232,6 +232,8 @@ pub(crate) struct Tracker {
     /// Mesh-routed: the backend and the pod the request went to (spec §7.9).
     backend: Option<Arc<str>>,
     upstream: Option<SocketAddr>,
+    /// The exchange became a tunnel.
+    upgrade: bool,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -319,6 +321,7 @@ impl Tracker {
             load_run: None,
             backend: None,
             upstream: None,
+            upgrade: false,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -345,6 +348,11 @@ impl Tracker {
     pub(crate) fn route(&mut self, backend: &Arc<str>, upstream: SocketAddr) {
         self.backend = Some(backend.clone());
         self.upstream = Some(upstream);
+    }
+
+    /// The response switches the connection to a tunnel (`101`, `2xx` to `CONNECT`).
+    pub(crate) fn mark_upgrade(&mut self) {
+        self.upgrade = true;
     }
 
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
@@ -486,7 +494,7 @@ impl Tracker {
             path: Some(std::mem::take(&mut self.path)),
             status: self.status,
             grpc_status: self.grpc_status,
-            upgrade: false,
+            upgrade: self.upgrade,
             tls: self.ctx.tls,
             outcome,
             duration: Some(self.started.elapsed()),

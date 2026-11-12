@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::pin::{Pin, pin};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -15,10 +15,11 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::proxy::authority::status_class;
+use tokio::task::JoinHandle;
 
 use super::MeshState;
 use super::metrics::Call;
-use super::pool::{Lease, Protocol};
+use super::pool::{Lease, Protocol, Sent};
 use super::router::{Backend, InFlight};
 use crate::discovery::Tap;
 use crate::exchange::{Ctx, RespBody, Tracker};
@@ -32,6 +33,25 @@ pub(crate) struct Serving {
     pub backend: Arc<Backend>,
     pub ctx: Ctx,
     pub tap: Option<Tap>,
+    /// The task relaying the tunnel an `Upgrade` or `CONNECT` request became.
+    tunnel: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Serving {
+    pub(crate) fn new(
+        mesh: MeshState,
+        backend: Arc<Backend>,
+        ctx: Ctx,
+        tap: Option<Tap>,
+    ) -> Serving {
+        Serving {
+            mesh,
+            backend,
+            ctx,
+            tap,
+            tunnel: Mutex::new(None),
+        }
+    }
 }
 
 /// The connection to the pod and the request counted in flight, released when the response
@@ -81,7 +101,8 @@ impl Body for MeshBody {
     }
 }
 
-/// Serves `client` until it closes, `stop` completes (graceful) or `abort` completes.
+/// Serves `client` until it closes, `stop` completes (graceful) or `abort` completes. A
+/// connection that became a tunnel is served until the tunnel ends.
 pub(crate) async fn serve(
     serving: Serving,
     client: Stream,
@@ -91,19 +112,22 @@ pub(crate) async fn serve(
 ) -> Result<(), hyper::Error> {
     let serving = Arc::new(serving);
     let protocol = if h2 { Protocol::Http2 } else { Protocol::Http1 };
-    let service = service_fn(move |req| forward(serving.clone(), req, protocol));
+    let service = {
+        let serving = serving.clone();
+        service_fn(move |req| forward(serving.clone(), req, protocol))
+    };
     let io = TokioIo::new(client);
     let mut stop = pin!(stop);
     let mut abort = pin!(abort);
     let mut stopping = false;
-    if h2 {
+    let served = if h2 {
         let connection = server::conn::http2::Builder::new(TokioExecutor::new())
             .auto_date_header(false)
             .serve_connection(io, service);
         let mut connection = pin!(connection);
         loop {
             tokio::select! {
-                served = connection.as_mut() => return served,
+                served = connection.as_mut() => break served,
                 () = &mut stop, if !stopping => {
                     stopping = true;
                     connection.as_mut().graceful_shutdown();
@@ -115,11 +139,12 @@ pub(crate) async fn serve(
         let connection = server::conn::http1::Builder::new()
             .preserve_header_case(true)
             .auto_date_header(false)
-            .serve_connection(io, service);
+            .serve_connection(io, service)
+            .with_upgrades();
         let mut connection = pin!(connection);
         loop {
             tokio::select! {
-                served = connection.as_mut() => return served,
+                served = connection.as_mut() => break served,
                 () = &mut stop, if !stopping => {
                     stopping = true;
                     connection.as_mut().graceful_shutdown();
@@ -127,7 +152,19 @@ pub(crate) async fn serve(
                 () = &mut abort => return Ok(()),
             }
         }
+    };
+    let tunnel = serving
+        .tunnel
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(mut task) = tunnel {
+        tokio::select! {
+            _ = &mut task => {}
+            () = &mut abort => task.abort(),
+        }
     }
+    served
 }
 
 async fn forward(
@@ -146,17 +183,24 @@ impl Serving {
     ) -> Result<Response<MeshBody>, BoxError> {
         let http1 = protocol == Protocol::Http1;
         let label = if http1 { "http1" } else { "h2" };
-        // Until #443 step 2 moves such a connection to the byte relay (spec §4.1).
-        if req.method() == Method::CONNECT || (http1 && req.headers().contains_key(header::UPGRADE))
-        {
-            return Ok(answer(StatusCode::NOT_IMPLEMENTED, "unsupported", http1));
+        let connect = req.method() == Method::CONNECT;
+        let upgrade = connect || (http1 && req.headers().contains_key(header::UPGRADE));
+        if upgrade && !http1 {
+            return Ok(answer(StatusCode::NOT_IMPLEMENTED, "unsupported", false));
         }
         let began = Instant::now();
         let mut req = req;
+        // A request that asks for a tunnel keeps `Connection` and `Upgrade` (spec §4.1).
+        let on_client = upgrade.then(|| hyper::upgrade::on(&mut req));
         if http1 {
-            strip_hop_by_hop(req.headers_mut(), true);
+            strip_hop_by_hop(req.headers_mut(), true, upgrade);
         }
-        let (mut tracker, req) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
+        let (mut tracker, req) = Tracker::start(
+            &self.ctx,
+            label,
+            self.tap.as_ref().filter(|_| !upgrade),
+            req,
+        );
         let router = self.mesh.router();
         let Some(pick) = self.backend.pick(router) else {
             self.count(None, StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", began);
@@ -169,29 +213,68 @@ impl Serving {
         };
         let upstream = pick.endpoint().addr;
         tracker.route(&self.backend.label, upstream);
-        let mut lease = match router.pools.checkout(upstream, protocol).await {
-            Ok(lease) => lease,
-            Err(e) => {
-                tracing::debug!(%upstream, error = %e, "connect to the pod failed");
-                self.count(
-                    Some(&pick),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "connect-failed",
-                    began,
-                );
-                tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-                return Ok(answer(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "connect-failed",
-                    false,
-                ));
-            }
+        let connect_failed = |tracker: Tracker, e: std::io::Error, pick: &InFlight| {
+            tracing::debug!(%upstream, error = %e, "connect to the pod failed");
+            self.count(
+                Some(pick),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connect-failed",
+                began,
+            );
+            tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+            Ok(answer(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connect-failed",
+                false,
+            ))
         };
-        match lease.send(req).await {
-            Ok(response) => {
+        let mut lease = match router.pools.checkout(upstream, protocol, false).await {
+            Ok(lease) => lease,
+            Err(e) => return connect_failed(tracker, e, &pick),
+        };
+        // Nothing written to a connection the pod had closed: once more on a new one, whatever
+        // the method (spec §7.9).
+        let mut sent = lease.send(req).await;
+        if let Sent::Unsent(again) = sent {
+            router.metrics.reconnect(&self.backend.label);
+            lease = match router.pools.checkout(upstream, protocol, true).await {
+                Ok(lease) => lease,
+                Err(e) => return connect_failed(tracker, e, &pick),
+            };
+            sent = lease.send(again).await;
+        }
+        match sent {
+            Sent::Response(mut response) => {
+                let tunnel = on_client.filter(|_| {
+                    if connect {
+                        response.status().is_success()
+                    } else {
+                        response.status() == StatusCode::SWITCHING_PROTOCOLS
+                    }
+                });
+                if let Some(on_client) = tunnel {
+                    let on_pod = hyper::upgrade::on(&mut response);
+                    tracker.mark_upgrade();
+                    let answered = tracker.answered(response);
+                    self.count(Some(&pick), answered.status(), "none", began);
+                    lease.discard();
+                    let task = tokio::spawn(async move {
+                        let (client, pod) = tokio::join!(on_client, on_pod);
+                        if let (Ok(client), Ok(pod)) = (client, pod) {
+                            let (mut client, mut pod) = (TokioIo::new(client), TokioIo::new(pod));
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut pod).await;
+                        }
+                        drop((pick, lease));
+                    });
+                    *self.tunnel.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+                    return Ok(answered.map(|body| MeshBody {
+                        upstream: Some(body),
+                        _hold: None,
+                    }));
+                }
                 let mut answered = tracker.answered(response);
                 if http1 {
-                    strip_hop_by_hop(answered.headers_mut(), false);
+                    strip_hop_by_hop(answered.headers_mut(), false, false);
                 }
                 self.count(Some(&pick), answered.status(), "none", began);
                 Ok(answered.map(|body| MeshBody {
@@ -202,7 +285,7 @@ impl Serving {
                     }),
                 }))
             }
-            Err(e) if e.is_parse() || e.is_parse_status() || e.is_parse_too_large() => {
+            Sent::Failed(e) if e.is_parse() || e.is_parse_status() || e.is_parse_too_large() => {
                 tracing::debug!(%upstream, error = %e, "the pod's response head was refused");
                 self.count(
                     Some(&pick),
@@ -213,11 +296,17 @@ impl Serving {
                 tracker.synthetic(StatusCode::BAD_GATEWAY.as_u16());
                 Ok(answer(StatusCode::BAD_GATEWAY, "invalid-response", false))
             }
-            Err(e) => {
+            Sent::Failed(e) => {
                 tracing::debug!(%upstream, error = %e, "the pod did not answer");
                 self.count_none(&pick, began);
                 tracker.failed();
                 Err(e.into())
+            }
+            Sent::Unsent(_) => {
+                tracing::debug!(%upstream, "the request could not be written twice");
+                self.count_none(&pick, began);
+                tracker.failed();
+                Err("connection closed".into())
             }
         }
     }
@@ -272,7 +361,12 @@ fn answer(status: StatusCode, reason: &'static str, close: bool) -> Response<Mes
 /// Removes the fields that concern one hop (RFC 9110 §7.6.1): `Connection` and the fields it
 /// names, `Keep-Alive`, `Proxy-Connection`, and `TE` but for `trailers` on a request. The
 /// fields that frame or address the message are never removed by a `Connection` naming them.
-fn strip_hop_by_hop(headers: &mut HeaderMap, request: bool) {
+fn strip_hop_by_hop(headers: &mut HeaderMap, request: bool, upgrade: bool) {
+    if upgrade {
+        headers.remove("keep-alive");
+        headers.remove("proxy-connection");
+        return;
+    }
     let named: Vec<HeaderName> = headers
         .get_all(header::CONNECTION)
         .iter()

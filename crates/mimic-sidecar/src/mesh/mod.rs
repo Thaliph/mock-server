@@ -43,6 +43,7 @@ const SERVICES_VAR: &str = "MIMIC_MESH_MAX_SERVICES";
 const ENDPOINTS_VAR: &str = "MIMIC_MESH_MAX_ENDPOINTS";
 const BYTES_VAR: &str = "MIMIC_MESH_MAX_VIEW_BYTES";
 const POOL_IDLE_VAR: &str = "MIMIC_MESH_POOL_IDLE_TIMEOUT";
+const OPAQUE_VAR: &str = "MIMIC_MESH_OPAQUE_PORTS";
 const ENDPOINT_LABELS_VAR: &str = "MIMIC_METRICS_MAX_ENDPOINTS";
 
 const KIB: usize = 1024;
@@ -147,9 +148,36 @@ impl MeshConfig {
                 defaults.max_endpoint_labels,
                 10_000,
             )?,
+            opaque_ports: opaque_ports(env)?,
             ..defaults
         })
     }
+}
+
+/// `MIMIC_MESH_OPAQUE_PORTS`: at most 256 ports from 1 to 65535, or `none` (an empty value is
+/// unset, like any variable).
+fn opaque_ports(env: &Env) -> Result<std::collections::BTreeSet<u16>, ConfigError> {
+    let Some(value) = env.optional(OPAQUE_VAR) else {
+        return Ok(DEFAULT_OPAQUE_PORTS.into_iter().collect());
+    };
+    let invalid = |why: &str| ConfigError::invalid(OPAQUE_VAR, value, why.to_string());
+    let mut ports = std::collections::BTreeSet::new();
+    if value.trim() == "none" {
+        return Ok(ports);
+    }
+    let entries: Vec<&str> = value.split(',').collect();
+    if entries.len() > 256 {
+        return Err(invalid("expected at most 256 ports"));
+    }
+    for entry in entries {
+        match entry.trim().parse::<u16>() {
+            Ok(port) if port > 0 => {
+                ports.insert(port);
+            }
+            _ => return Err(invalid("expected comma-separated ports from 1 to 65535")),
+        }
+    }
+    Ok(ports)
 }
 
 fn duration(
@@ -326,6 +354,7 @@ struct Inner {
     age: Gauge,
     unscoped: Counter,
     router: Router,
+    opaque_ports: std::collections::BTreeSet<u16>,
     /// Set once a view is held: readiness stays.
     seen: AtomicBool,
 }
@@ -370,6 +399,7 @@ impl MeshState {
             endpoints: Gauge::default(),
             age: Gauge::default(),
             unscoped: Counter::default(),
+            opaque_ports: config.opaque_ports.clone(),
             router: Router::new(
                 config.pool_idle_timeout,
                 config.max_endpoint_labels,
@@ -421,6 +451,9 @@ impl MeshState {
     /// The balancing state of the Service port `dst` is the ClusterIP and port of, when it is
     /// in the view and the mesh is on for this workload.
     pub(crate) fn route(&self, dst: SocketAddr) -> Option<Arc<Backend>> {
+        if self.0.opaque_ports.contains(&dst.port()) {
+            return None;
+        }
         let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);
         if !table.enabled {
             return None;

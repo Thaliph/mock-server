@@ -282,7 +282,7 @@ fn msh_57_opaque_ports_default_and_override() {
         ports(config(&[("MIMIC_MESH_OPAQUE_PORTS", " 8080 , 9 ,8080")]).unwrap()),
         vec![9, 8080]
     );
-    assert!(ports(config(&[("MIMIC_MESH_OPAQUE_PORTS", "")]).unwrap()).is_empty());
+    assert!(ports(config(&[("MIMIC_MESH_OPAQUE_PORTS", "none")]).unwrap()).is_empty());
 }
 
 #[test]

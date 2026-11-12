@@ -68,24 +68,43 @@ pub(crate) enum Lease {
 
 impl Lease {
     /// Sends the request. A failed HTTP/1 connection is not handed back.
-    pub(crate) async fn send(
-        &mut self,
-        req: Request<ReqBody>,
-    ) -> Result<Response<hyper::body::Incoming>, hyper::Error> {
-        match self {
+    pub(crate) async fn send(&mut self, req: Request<ReqBody>) -> Sent {
+        let sent = match self {
             Lease::Http1 { sender, .. } => {
                 let Some(live) = sender.as_mut() else {
                     unreachable!("a lease sends once");
                 };
-                let sent = live.send_request(req).await;
-                if sent.is_err() {
-                    sender.take();
-                }
-                sent
+                live.try_send_request(req).await
             }
-            Lease::Http2 { sender, .. } => sender.send_request(req).await,
+            Lease::Http2 { sender, .. } => sender.try_send_request(req).await,
+        };
+        match sent {
+            Ok(response) => Sent::Response(response),
+            Err(mut failed) => {
+                self.discard();
+                match failed.take_message() {
+                    Some(request) => Sent::Unsent(request),
+                    None => Sent::Failed(failed.into_error()),
+                }
+            }
         }
     }
+
+    /// The connection is not handed back to the pool (it failed, or became a tunnel).
+    pub(crate) fn discard(&mut self) {
+        if let Lease::Http1 { sender, .. } = self {
+            sender.take();
+        }
+    }
+}
+
+/// What came of sending a request.
+pub(crate) enum Sent {
+    Response(Response<hyper::body::Incoming>),
+    /// Nothing of the request was written: it is returned, whole.
+    Unsent(Request<ReqBody>),
+    /// The request was written (or partly) and no response came.
+    Failed(hyper::Error),
 }
 
 impl Drop for Lease {
@@ -161,12 +180,12 @@ impl H1Pool {
         None
     }
 
-    async fn checkout(self: &Arc<Self>) -> io::Result<Lease> {
+    async fn checkout(self: &Arc<Self>, fresh: bool) -> io::Result<Lease> {
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
-            while let Some(mut sender) = self.take_idle() {
+            while let Some(mut sender) = self.take_idle().filter(|_| !fresh) {
                 if let Ok(Ok(())) = tokio::time::timeout(READY_WAIT, sender.ready()).await {
                     return Ok(self.lease(sender));
                 }
@@ -203,7 +222,7 @@ impl H1Pool {
             .map_err(io::Error::other)?;
         let pool = self.clone();
         tokio::spawn(async move {
-            let _ = connection.await;
+            let _ = connection.with_upgrades().await;
             pool.open.fetch_sub(1, Ordering::AcqRel);
             pool.freed.notify_one();
         });
@@ -478,6 +497,7 @@ impl Pools {
         self: &Arc<Self>,
         addr: SocketAddr,
         protocol: Protocol,
+        fresh: bool,
     ) -> io::Result<Lease> {
         self.ensure_sweeper();
         let pool = lock(&self.pools)
@@ -490,7 +510,7 @@ impl Pools {
             })
             .clone();
         match &*pool {
-            Pool::Http1(pool) => pool.checkout().await,
+            Pool::Http1(pool) => pool.checkout(fresh).await,
             Pool::Http2(pool) => pool.checkout().await,
         }
     }
