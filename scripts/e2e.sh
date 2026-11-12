@@ -2336,7 +2336,10 @@ spec: {deployment: $d}
 YAML
 done
 grpc_deploy() {
-  local name=$1 role=$2 env=$3
+  local name=$1 role=$2 env=$3 listen=""
+  # Only the server listens: the client has no port and no readiness probe.
+  [[ $role == server ]] && listen="          ports: [{name: api, containerPort: 50051}]
+          readinessProbe: {tcpSocket: {port: api}, periodSeconds: 1}"
   kubectl apply -f - >/dev/null <<YAML
 apiVersion: apps/v1
 kind: Deployment
@@ -2356,8 +2359,7 @@ spec:
             - {name: ROLE, value: $role}
             - {name: APP_NAME, value: $name}
 $env
-          ports: [{name: api, containerPort: 50051}]
-          readinessProbe: {tcpSocket: {port: api}, periodSeconds: 1}
+$listen
           volumeMounts: [{name: code, mountPath: /code, readOnly: true}]
       volumes:
         - {name: code, configMap: {name: grpc-code}}
@@ -2367,7 +2369,7 @@ kind: Service
 metadata: {name: $name, namespace: grpc-28}
 spec:
   selector: {app: $name}
-  ports: [{name: api, port: 50051, targetPort: api}]
+  ports: [{name: api, port: 50051, targetPort: 50051}]
 YAML
 }
 grpc_deploy grpc-b server "            - {name: RESPONSE_TOKEN, value: $grpc_token}"
