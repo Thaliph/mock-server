@@ -1124,7 +1124,10 @@ the recorder keeps the first message of each side:
     (the webhook CA, PEM); from F10 also `MIMIC_MODE`, `MIMIC_MOCK_LATENCY_FACTOR` and
     `MIMIC_MOCK_PASSTHROUGH` (the effective mode, factor and passthrough list of §7 at
     admission; the last two absent when they are the default or empty, `MIMIC_MODE` always
-    set); always `MALLOC_ARENA_MAX=2` and `MALLOC_MMAP_THRESHOLD_=131072` (bound the glibc
+    set); from M1 also `MIMIC_MESH`, `MIMIC_MESH_STALE_AFTER` and `MIMIC_MESH_STARTUP_WAIT`
+    (the controller's own values, §10.2) and, when they differ from the defaults,
+    `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS` and `MIMIC_MESH_MAX_VIEW_BYTES`
+    (the sidecar must read what the controller may serve); always `MALLOC_ARENA_MAX=2` and `MALLOC_MMAP_THRESHOLD_=131072` (bound the glibc
     allocator, MCK-18). Before it is ready it copies the static `mimic-trust` binary to
     `/mimic/bin/mimic-trust` and its image's system store to `/mimic/bin/fallback-ca.pem`.
   - `mimic-trust-<n>` (n = 0, 1, … in order of first appearance of the image among the init
@@ -2349,9 +2352,9 @@ Deployments, the effective mode (§7) and the cluster name. It holds, as canonic
 no insignificant whitespace):
 
 ```json
-{"cluster":"local","format":1,"generations":{"mimicconfig/shop/cart":3},"mesh":true,"mode":"none",
+{"cluster":"local","format":1,"generations":{"mimicconfig/shop/cart@5b1c":3},"mesh":true,"mode":"none",
  "services":{"shop/cart":{"endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},
-  "generations":{"endpointslice/shop/cart-x7k2p":41},"ips":["10.96.12.7"],
+  "generations":{"endpointslice/shop/cart-x7k2p@9f3a":41},"ips":["10.96.12.7"],
   "policy":{"loadBalancer":{"slowStartSeconds":30}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}
 ```
 
@@ -2371,7 +2374,7 @@ no insignificant whitespace):
   EndpointSlices; the `policy` of the winning `MimicConfig` of the Service (§7), defaults when none.
   `mesh: false` (the winning config of `d` says so) gives a view without Services and without
   `generations`. The top-level `generations` hold the winning `MimicConfig` of `d`. The `generations` of a consented Service name its winning `MimicConfig` of the destination's namespace
-  (`mimicconfig/<namespace>/<name>`): decided, kept as is, because the consent already shares that
+  (`mimicconfig/<namespace>/<name>@<uid>`): decided, kept as is, because the consent already shares that
   Service's policy and the name is not a secret. The view holds no
   Secret, label or annotation value: the input structs have no field for them.
 - **Bounds** (`mesh::view::Limits`, defaults and ranges of `MIMIC_MESH_MAX_SERVICES`,
@@ -2387,6 +2390,45 @@ no insignificant whitespace):
 - **`View::from_json`** (what a sidecar reads): refuses unknown fields at every level, a `format`
   other than 1, an unknown mode, an address or port that does not parse, a Service key that is not
   `<namespace>/<name>`, and a document over the bounds of the `Limits` it is given.
+- **The sidecar follows its view** (M1, #442; no traffic changes in this step). With
+  `MIMIC_MESH=on` and a controller URL the sidecar long-polls `GET /v1/workloads/<deployment>/mesh?format=1`
+  (§7.2) with `If-None-Match` set to the `ETag` it holds and `Accept-Encoding: gzip`, one request
+  at a time, the projected token read again for each request. After a `200` or `304` the next
+  request follows after 100 ms at least; after a failure (no answer, a status other than `200`
+  and `304`, a refused body) after 1, 2, 4 … 30 s, each multiplied by a random factor of 0.5 to
+  1 and not below 1 s, or the `Retry-After` when it is longer. The body is read up to
+  `MIMIC_MESH_MAX_VIEW_BYTES` (compressed and uncompressed) and parsed by `View::from_json` with the
+  `Limits` of the `MIMIC_MESH_MAX_*` variables; a view that does not parse is refused
+  (`mimic_mesh_view_pulls_total{result="invalid"}`, one WARN `mesh view rejected` per streak) and the
+  one held is kept. A **generation check** refuses a view in which an object of the held view has a
+  lower generation (top-level `generations` and those of each Service; `result="older"`; two replicas
+  may lag each other, design §4.3). The keys of `generations` carry the object's UID, so an
+  object deleted and created again (generation back at 1) is another key, never older; a key
+  that is gone from the new view is fine; a view refused as older is refused every time it is
+  served, however long. The accepted view
+  replaces the held one in one step: connections read either the old table or the new one, never a
+  mix. The **table** maps `<ClusterIP>:<port>` of each Service port of the view to the Service; a
+  headless Service has no entry. `mode` of an accepted view is applied as a pulled mode (`mode
+  changed`, `source: pull`, §8 "Mode state"); the mode is never inferred from the absence of a view.
+  With `"mesh": false` the table is empty and nothing is classified. With `MIMIC_MESH=off` no
+  view is pulled, no table exists and the egress pull alone gives the mode.
+- **Persisted view.** Each accepted view is written to `<MIMIC_TRUST_DIR>/state/mesh.json`,
+  `{"fetchedAt":<unix seconds>,"view":<the view>}`, through a temporary file and a rename. At
+  start the file is read (regular file, at most `MIMIC_MESH_MAX_VIEW_BYTES` plus 1 KiB, the view
+  parsed as above) and its view is held as pulled at `fetchedAt`; a file that does not parse is
+  ignored with one WARN `mesh state ignored`. Its mode is not applied: the mode comes from the mode
+  state file, then `MIMIC_MODE` (§8 "Mode state").
+- **Classification.** Each outbound connection is classified when it is accepted: `in-scope` when
+  its original destination is a `<ClusterIP>:<port>` of the table, `unscoped` otherwise (also before
+  the first view); `mimic_mesh_unscoped_connections_total` counts the second. In this step it
+  changes nothing: every byte still goes to the original destination, as with the byte relay.
+  The work per connection is one read of the table and one hash lookup; nothing is added per
+  exchange, and with `MIMIC_MESH=off` nothing at all.
+- **Age and readiness.** `mimic_mesh_view_age_seconds` is the time since the last `200` or `304`
+  (or since `fetchedAt` for a view read from the file), updated every second; when it reaches
+  `MIMIC_MESH_STALE_AFTER` one WARN `mesh view stale` is written (again after the view was
+  fresh in between). `/readyz` answers `200` once the listeners accept connections and, when the
+  sidecar follows a view, once a view is held or `MIMIC_MESH_STARTUP_WAIT` has passed since the start.
 
 ## 8. Mock
 
@@ -2637,6 +2679,10 @@ random numbers it hands to the draw.
   | `mimic_mock_pending` | gauge (F10), mocked requests pending (§8 "Bounds") | — |
   | `mimic_mock_connections_total` | counter (F10), outbound connections whose kind was decided in mock | `decision` (`mocked`, `tunnel`: non-HTTP relayed, `passthrough`, `closed`) |
   | `mimic_load_inbound_total` | counter (F11, sidecar), inbound requests carrying `mimic-load-run` (§7.8) | `result` (`forwarded`, `refused_mode`, `refused_workload`, `refused_ticket`) |
+  | `mimic_mesh_view_pulls_total` | counter (M1, sidecar), mesh view requests (§7.9) | `result` (`ok`, `not_modified`, `older`, `invalid`, `error`) |
+  | `mimic_mesh_view_age_seconds` | gauge (M1, sidecar), seconds since the last `200` or `304` of the mesh view, 0 without a view | — |
+  | `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauge (M1, sidecar), Services and endpoints of the view held, 0 without one | — |
+  | `mimic_mesh_unscoped_connections_total` | counter (M1, sidecar), outbound connections whose destination is not a Service port of the view | — |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -3016,6 +3062,8 @@ The restarts come from `process_start_time_seconds`, so no kube-state-metrics se
 | `MIMIC_MESH_WATCH_TIMEOUT` | `30s` | (M1) How long a held `GET /v1/workloads/<deployment>/mesh` waits for a change before it answers `304` (§7.2), 100ms–10m. |
 | `MIMIC_MESH_DEBOUNCE` | `100ms` | (M1) Coalescing of changes of the watched objects; doubled up to 1 s while changes keep arriving (§7.2), 10ms–1s. |
 | `MIMIC_MESH_VIEW_CACHE_BYTES` | `64Mi` | (M1) Bytes of built views cached per replica (the views and their gzip copies, built when a sidecar asks for gzip), least recently used evicted first (§7.2; same syntax, at least `MIMIC_MESH_MAX_VIEW_BYTES`, at most 4Gi). |
+| `MIMIC_MESH_STALE_AFTER` | `60s` | (M1) After this long without a `200` or `304` a sidecar's view is stale (§7.9), 1s–1h. The controller does not use it: it passes it to the sidecars it injects (§7.1). |
+| `MIMIC_MESH_STARTUP_WAIT` | `2s` | (M1) How long a sidecar without a view waits for its first one before it is ready (§7.9), 0s–1m. Passed to the sidecars like the previous one. |
 | `MIMIC_SIDECAR_API_MAX_WATCHES` | `10000` | (M1) Held mesh requests at once per replica (§7.2), 1–1000000; over it `503` with `Retry-After: 1`. |
 | `MIMIC_LOAD_MAX_RUNS` | `0` | (F11) Load test runs active at once in the cluster (§7.8), 0–100; `0` disables load tests. The chart sets `4` when `loadTest.enabled`. |
 | `MIMIC_LOAD_MAX_NAMESPACE_RUNS` | `2` | (F11) Active runs per namespace, 1–100, at most `MIMIC_LOAD_MAX_RUNS` when that is not 0. |
@@ -3066,6 +3114,10 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_MOCK_LATENCY_FACTOR` | `1` | (F10) Latency factor until the first pull answer (§8), a decimal 0–100 with at most 2 fractional digits. Set by the webhook when the effective factor is not 1. |
 | `MIMIC_MOCK_MAX_PENDING` | `1024` | (F10) Mocked requests pending at once (§8 "Bounds"), 1–65536; more are answered `599` (`overload`). Not set by the webhook. Sized with the 128 Mi sidecar limit (MCK-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
 | `MIMIC_MOCK_PASSTHROUGH` | empty | (F10) Destinations handled as in discovery while in mock (§8), comma-separated, the `MIMIC_TLS_EXCLUDE` grammar; an invalid entry or more than 256 exits with code 2. The webhook sets the union of `spec.mock.passthrough` (§7), absent when empty. |
+| `MIMIC_MESH` | `off` | (M1) `on` or `off` (anything else exits 2). `off`: no mesh view is pulled, nothing is classified (§7.9). The webhook always sets it from the controller's own `MIMIC_MESH` (default `on`, §10.2); the sidecar's own default when it is unset stays `off`, as before M1 (a pod injected before M1 pulls nothing). |
+| `MIMIC_MESH_STALE_AFTER` | `60s` | (M1) Age of the view after which it is stale (§7.9), 1s–1h. Set by the webhook. |
+| `MIMIC_MESH_STARTUP_WAIT` | `2s` | (M1) Wait for the first view before `/readyz` answers `200` (§7.9), 0s–1m. Set by the webhook. |
+| `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS`, `MIMIC_MESH_MAX_VIEW_BYTES` | `1024`, `10000`, `4Mi` | (M1) The bounds of §10.2 with the same ranges, applied to the view read from the controller (`View::from_json`). Set by the webhook when they differ from the defaults. |
 | `MIMIC_LOAD_ENABLED` | absent | (F11) `1`: the sidecar honours the load marker of inbound requests and answers `GET /load` (§4.1, §7.8). The webhook sets it when `MIMIC_LOAD_MAX_RUNS` is above 0 (chart `loadTest.enabled`); absent otherwise. A pod injected before load testing was enabled keeps its env: it is no target (its `/load` answers 404) until a rollout restarts it. |
 
 ### 10.4 `mimic-init` variables
@@ -4416,11 +4468,11 @@ is M1; here `none` only stops recording, intercepting and shipping.
 | NON-10 | **M** (main session, `scripts/bench.sh`). The setup `none` meets the M0 budget of design §14, results committed under `docs/bench/`. |
 | NON-11 | **D** (security review). In `none` no plaintext of an outbound TLS stream is read, no capture buffer is allocated, and no report, sample or egress recording is built or sent; the `none` series adds no label with a request value. |
 
-### 12.21 M1 — `MimicConfig`, the mesh view and its controller (#440, #441)
+### 12.21 M1 — `MimicConfig`, the mesh view, its controller and its sidecar (#440, #441, #442)
 
 Design: `docs/design/mimic-mesh.md` §3.4, §4.2, §4.3, §6, §16. Spec text: §7 (`MimicConfig`),
 §7.2 (the route), §7.9 (the view), §10.2. Levels as in §12.2, plus **M** (main session). MSH-01 to MSH-17 are #440,
-MSH-18 and after #441 (the watches, the route, the chart); the sidecar's use of the view is #442.
+MSH-18 to MSH-30 are #441 (the watches, the route, the chart), MSH-31 and after #442 (the sidecar follows the view, §7.9).
 
 | ID | Criterion |
 |---|---|
@@ -4429,13 +4481,13 @@ MSH-18 and after #441 (the watches, the route, the chart); the sidecar's use of 
 | MSH-03 | **U** (consent, review B2 of #469). A cross-namespace destination is in the view and the config is `ResolvedRefs: True` only with a `ReferenceGrant` in the destination's namespace with `from` (`mimic.platform.io`, `MimicConfig`, the source namespace) and `to` (`""`, `Service`, name absent, empty or equal). Each of these leaves it out and gives `ResolvedRefs: False`, `RefNotPermitted`, the message naming `<namespace>/<name>`: `from` namespace wrong, `from` kind wrong, `from` group wrong, `to` kind wrong, `to` group wrong, `to` name of another Service, the grant in a third namespace or in the source namespace, no grant at all, the `ReferenceGrant` CRD absent. With the grant the destination is present; without it again, it is gone. The outcome is the same when the Service does not exist. |
 | MSH-04 | **U.** Isolation: the serialised view of `(n, d)`, with and without a grant for one namespace, contains no address, port, zone, name or readiness of a namespace that has no grant for `n`; a `MimicConfig` of another namespace never changes the view of `(n, d)`, whatever its name or targets. |
 | MSH-05 | **U.** `mesh`: `true` without a config or with `mesh.enabled` unset; `false` when the winning config of `d` sets `false` (a losing one does not), and then the view has no Service and no `generations`; the `mode` and `cluster` given are in the view. |
-| MSH-06 | **U.** `generations`: each Service lists `endpointslice/<ns>/<name>` of the slices it was built from; the view lists `mimicconfig/<ns>/<name>` of the winning config of `d` and each Service entry that of its winning config; a change of a generation changes the ETag; a slice of another Service or namespace is not listed. |
+| MSH-06 | **U.** `generations`: each Service lists `endpointslice/<ns>/<name>@<uid>` of the slices it was built from (`<uid>` is `metadata.uid`: an object deleted and created again is another key); the view lists `mimicconfig/<ns>/<name>@<uid>` of the winning config of `d` and each Service entry that of its winning config; a change of a generation changes the ETag; a slice of another Service or namespace is not listed. |
 | MSH-07 | **U** (`mesh::policy`). `loadBalancer.slowStart` of the winning `MimicConfig` targeting a Service is in the view as `policy.loadBalancer.slowStartSeconds`, also for a consented Service of another namespace (its own namespace's config); the default is 30; `0s` is 0. |
 | MSH-08 | **U** (`mesh::policy`). Precedence: among valid configs on one target the oldest `creationTimestamp` wins, ties by name; the others are `Accepted: False`, `Conflicted`; a config can win one target and lose another; an invalid one takes no part. `Invalid`: no target, over 16 targets, over 256 destinations, a destination without namespace or name, `destinations` or `mesh` without a Deployment target, `loadBalancer` without a Service target, `slowStart` over 3600 s. `TargetNotFound` names the missing target (a Deployment not in the input, a Service not in the input). Reason order `Invalid`, `TargetNotFound`, `Conflicted`; else `Accepted: True`. A target is always in the namespace of its config. |
 | MSH-09 | **U** (`proptest`). Any permutation of the Services, EndpointSlices (and the endpoints and ports in them), `MimicConfig`s, `ReferenceGrant`s and Deployments gives byte-identical view JSON, the same ETag and the same statuses. |
 | MSH-10 | **U.** The JSON is canonical: `format` is 1, keys are sorted, there is no whitespace; the ETag is `"1-<sha256 hex>"` of the bytes; any change of content, mode or cluster changes it; the same input gives the same bytes in two calls. |
 | MSH-11 | **U.** Bounds: with the limits of `Limits`, a view never has more Services, endpoints or bytes than allowed (a byte limit below the size of the view without Services leaves none); the Services of `n` come first in name order, then destinations in key order; a Service that does not fit the remaining budget is skipped and the next ones are still tried (a large Service among small ones leaves the small ones after it in), `truncated` counts the Services left out and `skipped` lists at most 16 of their keys in order; below the bounds `truncated` is 0; the result is the same for any order of the input. |
-| MSH-12 | **U.** `View::from_json` reads back what `build` wrote (equal `View`, same bytes on re-serialising); it refuses: an unknown field at the top level, in a Service, a port, an endpoint, the policy and the generations; `format` 0 or 2; an unknown mode; a bad address, port or key; a missing field; trailing bytes; a document over `max_view_bytes`, or with more Services or endpoints than the limits; every error message is at most 200 bytes, whatever the input. |
+| MSH-12 | **U.** `View::from_json` reads back what `build` wrote (equal `View`, same bytes on re-serialising); it refuses: an unknown field at the top level, in a Service, a port, an endpoint, the policy and the generations; `format` 0 or 2; an unknown mode; a bad address, port or key (a `generations` key must be `<kind>/<namespace>/<name>@<uid>` with a non-empty `<uid>`); a missing field; trailing bytes; a document over `max_view_bytes`, or with more Services or endpoints than the limits; every error message is at most 200 bytes, whatever the input. |
 | MSH-13 | **F** (fuzz target `mesh`, in the discovery fuzz job). `View::from_json` on arbitrary bytes never panics; a document it accepts holds the bounds, re-serialises, and reads back equal; its ETag is stable. The job runs 60 s on a pull request touching `mimic-core` `mesh`; `scripts/ci_plan.py` gates it on those paths. |
 | MSH-14 | **B** (criterion micro-benchmark `mesh_view`, results in `docs/bench/`). Building the view of 1000 Services with 10 000 endpoints in all is measured, with the machine's load noted; no budget is set yet. |
 | MSH-15 | **E** (chart, `scripts/check-chart.sh`). The chart renders the CRD `mimicconfigs.mimic.platform.io` with `helm.sh/resource-policy: keep`, a `status` subresource, version `v1alpha1`, `targetRefs` 1 to 16, `destinations` at most 256, `mesh.enabled` default `true`, `loadBalancer.slowStart`, and CEL rules that reject a `namespace` in a `targetRef`, `destinations` or `mesh` without a Deployment target, and `loadBalancer` without a Service target; `helm lint --strict` passes; the default render is the golden file. |
@@ -4454,6 +4506,18 @@ MSH-18 and after #441 (the watches, the route, the chart); the sidecar's use of 
 | MSH-28 | **E** (kind, `scripts/e2e.sh` section `msh_28`, objects of that section only; the pinned standard Gateway API CRDs are installed by the script). In two namespaces: the sidecar API answers a pod's token with the view of its own deployment, `403` for another; a destination of a `MimicConfig` into the other namespace is `ResolvedRefs: False` `RefNotPermitted` and absent from the view until a `ReferenceGrant` is created, present after, absent again after it is deleted; a held request returns `304` at the timeout; after a Deployment of the section is scaled, a held request answers on each change of the view (the new pod may first appear not ready), and following the ETags the view holding the new endpoint is served within the debounce plus 2 s of the endpoint becoming ready. |
 | MSH-29 | **E** (chart, `scripts/check-chart.sh`). The ClusterRole grants `get`, `list`, `watch` on `services`, `endpointslices`, `mimicconfigs`, `mimicworkloads`, `referencegrants` and `deployments` (the controller reads their metadata only) and `patch` on `mimicconfigs/status`, nothing on `secrets` beyond the two named ones of the Role; `mesh.enabled` (default `true`) renders `MIMIC_MESH` `on`, `false` renders `off`; `mesh.clusterName`, `mesh.watchTimeout`, `mesh.debounce`, `mesh.viewCacheBytes`, `mesh.maxServices`, `mesh.maxEndpoints`, `mesh.maxViewBytes` and `mesh.maxWatches`, when set, render their variables; `helm lint --strict` passes; the default render is the golden file. |
 | MSH-30 | **D** (security review). The route keeps the admission, authentication and authorisation of §7.2 (MSH-19); cross-namespace endpoints only through `mesh::policy::consents` (MSH-25); no Secret, label or annotation is read into the objects (MSH-27); memory is bounded by the view cache, the watch budget and the `Limits` (MSH-23, MSH-26); a held request holds no lock and is released when its connection ends. |
+| MSH-31 | **U** (sidecar configuration). Unset: `MIMIC_MESH` `off`, `MIMIC_MESH_STALE_AFTER` 60 s, `MIMIC_MESH_STARTUP_WAIT` 2 s, the `MIMIC_MESH_MAX_*` the `Limits` defaults. Exit 2 (FND-01) for: `MIMIC_MESH` other than `on`/`off`; a stale time below 1s or over 1h; a startup wait over 1m; `MIMIC_MESH_MAX_SERVICES` 0 or 100001; `MIMIC_MESH_MAX_ENDPOINTS` 0 or 1000001; `MIMIC_MESH_MAX_VIEW_BYTES` 1Ki or 512Mi. The retry delay: 1, 2, 4 … 30 s, times a factor of 0.5 to 1, never below 1 s. |
+| MSH-32 | **U** (table). The table of a view maps `<ClusterIP>:<port>` of each port of each Service (IPv4 and IPv6, an IPv4-mapped address as the IPv4 one) to its Service key and nothing else; a headless Service, a pod IP and a Service port that is not in `ports` have no entry; a view with `"mesh": false` gives an empty table and classifies nothing; before the first view every destination is `unscoped`; a table swapped while a lookup runs gives that lookup the old or the new table, never a mix. |
+| MSH-33 | **I** (sidecar against a fake sidecar API over TLS). The first request is `GET /v1/workloads/<MIMIC_WORKLOAD>/mesh?format=1` with the bearer token, `Accept-Encoding: gzip` and no `If-None-Match`; a `200` (plain or gzip) is applied (`mimic_mesh_view_services` and `_endpoints` equal the view's, INFO `mesh view applied` with `services`, `endpoints`, `etag`) and the next request carries its `ETag`, not before 100 ms; a `304` keeps the view (`not_modified`); the token file is read for each request (a changed token is the next bearer, no token in a log); an invalid view (not JSON, an unknown field, over a bound, a gzip body that expands past the bound) is `invalid`, WARN `mesh view rejected` once per streak, the previous view kept and the next request after a retry delay; a `5xx`, a `404`, a reset and an unreachable API are `error` with the retry delay (and `Retry-After` when longer), the view kept, the delay back to 1 s after a `200`. |
+| MSH-34 | **I.** A view in which an object of the held view has a lower generation (top-level or of a Service) is `older`, not applied, and the next request follows after a retry delay; a view with equal or higher generations, or with objects the held one does not know or no longer has, is applied; an object deleted and created again (a `MimicConfig`, an EndpointSlice: new UID, generation 1) is another key and is applied; a stale replica serving the same older view again and again is refused every time (`older` each time, the view held kept). |
+| MSH-35 | **I.** The `mode` of an applied view is applied as a pulled mode (`mode changed`, `source: pull`, state file written); a view with `"mesh": false` applies it too; a view refused as invalid or older does not; with the controller silent a sidecar keeps its mode; with `MIMIC_MESH=off` no request to `/mesh` is made. |
+| MSH-36 | **I.** Persistence: an applied view is in `state/mesh.json` (written through a temporary file and a rename: no `mesh.tmp` is left); a restarted sidecar with a silent controller holds the view (`mimic_mesh_view_services`), applies no mode from it (a `mock` state file stays `mock`, a state file of `none` too), has `mimic_mesh_view_age_seconds` of at least the time since `fetchedAt` and writes WARN `mesh view stale` once when that is over `MIMIC_MESH_STALE_AFTER`; a file that does not parse, is over the bound, holds a view with an unknown field or is not a regular file is ignored with one WARN `mesh state ignored` and the sidecar starts without a view. |
+| MSH-37 | **I** (process). With a fake API that never answers, `/readyz` is `503` until `MIMIC_MESH_STARTUP_WAIT` has passed and `200` after; with a view answered it is `200` at once; with a persisted view `200` at once; with `MIMIC_MESH=off` or no controller URL it does not wait. |
+| MSH-38 | **I** (in-process listener, original destination faked). An outbound connection to a `<ClusterIP>:<port>` of the view does not count in `mimic_mesh_unscoped_connections_total`, one to any other destination (also before the first view, and one to a pod IP) does; in both cases the bytes reach the original destination unchanged, in both directions, as without the mesh (the existing PRX tests are untouched and green); inbound connections are not classified; with a view of `"mesh": false`, without the mesh state (`MIMIC_MESH=off`), nothing is counted and the relay is the same. |
+| MSH-39 | **I** (controller, webhook patch). The patch sets `MIMIC_MESH` (`on`, `off` when the controller's `MIMIC_MESH` is `off`), `MIMIC_MESH_STALE_AFTER` and `MIMIC_MESH_STARTUP_WAIT` from the controller's variables (defaults `60s`, `2s`), and `MIMIC_MESH_MAX_SERVICES`, `_MAX_ENDPOINTS`, `_MAX_VIEW_BYTES` only when they differ from the defaults; the controller exits 2 for a stale time below 1s or over 1h and a startup wait over 1m. |
+| MSH-40 | **E** (chart, `scripts/check-chart.sh`). `mesh.staleAfter` (default `60s`) and `mesh.startupWait` (default `2s`) render `MIMIC_MESH_STALE_AFTER` and `MIMIC_MESH_STARTUP_WAIT` on the controller; `helm lint --strict` passes; the default render is the golden file. |
+| MSH-41 | **E** (kind, `scripts/e2e.sh` section `msh_41`, objects of that section only). A sidecar gets its view: `mimic_mesh_view_services` equals the Service count of its namespace and `mimic_mesh_view_pulls_total{result="ok"}` is at least 1; a call from the app to a Service of the section that is declared by no one and outside the namespace is counted in `mimic_mesh_unscoped_connections_total` while the call still works; after the controller pods are deleted (restarted) the sidecar keeps its view and, when its container is restarted during the outage, reloads it from `mesh.json` (`mimic_mesh_view_services` unchanged, `restartCount` of the sidecar container 1 and of the app 0), then pulls again when the controller is back. |
+| MSH-42 | **D** (security and performance review). Parsing is bounded (body read capped before and after decompression, `View::from_json` with the limits, a persisted file read capped and only if regular); the token is handled as for the egress pull (read per request, never logged); nothing of another namespace enters the table, which is built from the view only; the persisted file holds what the controller served and is in the pod's `emptyDir`; the per-connection cost is one table read and one lookup, nothing per exchange (PRX, TLS, GRP, MCK, NON tests unchanged; the M0 benchmark is not worse than its recorded results). |
 
 ## 13. Test strategy
 

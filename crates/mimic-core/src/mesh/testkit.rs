@@ -64,6 +64,7 @@ pub fn slice(
         namespace: ns.into(),
         name: name.into(),
         service: service.into(),
+        uid: format!("uid-{name}"),
         generation,
         ports: vec![SlicePort {
             name: Some("http".into()),
@@ -78,6 +79,7 @@ pub fn cfg(ns: &str, name: &str, created: i64, targets: &[(TargetKind, &str)]) -
         namespace: ns.into(),
         name: name.into(),
         created,
+        uid: format!("uid-{name}"),
         generation: 1,
         targets: targets
             .iter()

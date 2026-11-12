@@ -320,10 +320,13 @@ fn msh_06_generations_list_the_slices_of_each_service_and_the_winning_config() {
     s.configs[0].generation = 3;
     let b = view_of(&s, "shop", "cart");
     assert_eq!(b.view.generations.len(), 1);
-    assert_eq!(b.view.generations["mimicconfig/shop/w"], 3);
+    assert_eq!(b.view.generations["mimicconfig/shop/w@uid-w"], 3);
     let cart = &b.view.services["shop/cart"];
     assert_eq!(cart.generations.len(), 1);
-    assert_eq!(cart.generations["endpointslice/shop/cart-x7k2p"], 41);
+    assert_eq!(
+        cart.generations["endpointslice/shop/cart-x7k2p@uid-cart-x7k2p"],
+        41
+    );
     assert!(b.view.services["shop/db"].generations.is_empty());
     s.slices[0].generation = 42;
     assert_ne!(view_of(&s, "shop", "cart").etag, b.etag);
@@ -332,7 +335,7 @@ fn msh_06_generations_list_the_slices_of_each_service_and_the_winning_config() {
 const GOLDEN: &str = concat!(
     r#"{"cluster":"local","format":1,"generations":{},"mesh":true,"mode":"none","services":{"shop/cart":{"#,
     r#""endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},"#,
-    r#""generations":{"endpointslice/shop/cart-x7k2p":41},"ips":["10.96.12.7"],"#,
+    r#""generations":{"endpointslice/shop/cart-x7k2p@uid-cart-x7k2p":41},"ips":["10.96.12.7"],"#,
     r#""policy":{"loadBalancer":{"slowStartSeconds":30}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}"#
 );
 

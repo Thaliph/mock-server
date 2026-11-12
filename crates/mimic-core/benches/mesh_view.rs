@@ -30,6 +30,7 @@ fn cluster(services: usize, endpoints_each: usize) -> Snapshot {
             namespace: "shop".into(),
             name: format!("{name}-x7k2p"),
             service: name,
+            uid: "u".into(),
             generation: 1,
             ports: vec![SlicePort {
                 name: Some("http".into()),
@@ -50,6 +51,7 @@ fn cluster(services: usize, endpoints_each: usize) -> Snapshot {
         namespace: "shop".into(),
         name: "slow".into(),
         created: 1,
+        uid: "u".into(),
         generation: 1,
         targets: vec![Target {
             kind: TargetKind::Service,

@@ -154,6 +154,7 @@ pub struct Shared {
     discovery: Option<crate::discovery::Tap>,
     mock: Option<Mock>,
     load: Option<crate::load::Marker>,
+    mesh: Option<crate::mesh::MeshState>,
     original_dst: OriginalDst,
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
@@ -209,6 +210,7 @@ impl Shared {
             discovery: None,
             mock: None,
             load: None,
+            mesh: None,
             original_dst,
             stop: watch::channel(false).0,
             abort: watch::channel(false).0,
@@ -344,6 +346,16 @@ impl Shared {
 
     pub(crate) fn load(&self) -> Option<&crate::load::Marker> {
         self.load.as_ref()
+    }
+
+    /// Classifies each outbound connection by the mesh view (spec §7.9); nothing is routed.
+    pub fn with_mesh(mut self, mesh: crate::mesh::MeshState) -> Shared {
+        self.mesh = Some(mesh);
+        self
+    }
+
+    pub(crate) fn mesh(&self) -> Option<&crate::mesh::MeshState> {
+        self.mesh.as_ref()
     }
 
     /// Intercepts outbound TLS as `tls` says instead of passing it all through.

@@ -251,6 +251,9 @@ pub struct InjectConfig {
     /// Load testing is on (`MIMIC_LOAD_MAX_RUNS` above 0): the sidecar gets
     /// `MIMIC_LOAD_ENABLED=1` (spec §10.3).
     pub load_enabled: bool,
+    /// The `MIMIC_MESH*` variables of the sidecar, in order (spec §7.1, M1): the controller's
+    /// own values, so that the pods follow what the cluster says.
+    pub mesh_env: Vec<(String, String)>,
 }
 
 /// What differs per pod in the TLS wiring (spec §7.1, §5).
@@ -321,6 +324,9 @@ pub fn patch(
             .push(json!({"name": "MIMIC_TLS_EXCLUDE", "value": literal(&tls.exclude.join(","))}));
     }
     sidecar_env.push(json!({"name": "MIMIC_MODE", "value": literal(&tls.mode)}));
+    for (name, value) in &cfg.mesh_env {
+        sidecar_env.push(json!({"name": name, "value": literal(value)}));
+    }
     if cfg.load_enabled {
         sidecar_env.push(json!({"name": "MIMIC_LOAD_ENABLED", "value": "1"}));
     }
@@ -978,6 +984,7 @@ mod tests {
             sidecar_log: "debug".into(),
             controller_url: "https://mimic.mimic-system.svc:8444".into(),
             load_enabled: false,
+            mesh_env: Vec::new(),
         }
     }
 
@@ -1660,6 +1667,31 @@ mod tests {
         let env = env_of(&doc["spec"]["initContainers"][1]);
         assert_eq!(env["MALLOC_ARENA_MAX"]["value"], "2");
         assert_eq!(env["MALLOC_MMAP_THRESHOLD_"]["value"], "131072");
+    }
+
+    #[test]
+    fn msh_39_the_sidecar_gets_the_mesh_variables_of_the_controller() {
+        let env = |cfg: &InjectConfig| {
+            let ops = patch(&pod(), "shop-api", cfg, &wiring()).unwrap();
+            let mut doc = serde_json::to_value(pod()).unwrap();
+            let ops: json_patch::Patch =
+                serde_json::from_value(serde_json::to_value(&ops).unwrap()).unwrap();
+            json_patch::patch(&mut doc, &ops).unwrap();
+            env_of(&doc["spec"]["initContainers"][1])
+        };
+        // Nothing the controller did not give.
+        assert!(!env(&cfg()).contains_key("MIMIC_MESH"));
+        let mut with = cfg();
+        with.mesh_env = vec![
+            ("MIMIC_MESH".into(), "off".into()),
+            ("MIMIC_MESH_STALE_AFTER".into(), "90s".into()),
+            ("MIMIC_MESH_STARTUP_WAIT".into(), "$2s".into()),
+        ];
+        let found = env(&with);
+        assert_eq!(found["MIMIC_MESH"]["value"], "off");
+        assert_eq!(found["MIMIC_MESH_STALE_AFTER"]["value"], "90s");
+        // As every literal: `$` is escaped for the kubelet.
+        assert_eq!(found["MIMIC_MESH_STARTUP_WAIT"]["value"], "$$2s");
     }
 
     #[test]

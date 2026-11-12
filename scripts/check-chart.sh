@@ -893,4 +893,11 @@ done
 lint mesh.off --set mesh.enabled=false
 echo "msh_29: the mesh RBAC is read-only on what it watches, patch on mimicconfigs/status; the mesh values render their variables"
 
+# MSH-40 (#442): the values the controller hands to the sidecars it injects.
+[[ $(mesh_env MIMIC_MESH_STALE_AFTER) == 60s ]] || fail "msh_40: MIMIC_MESH_STALE_AFTER is not 60s by default"
+[[ $(mesh_env MIMIC_MESH_STARTUP_WAIT) == 2s ]] || fail "msh_40: MIMIC_MESH_STARTUP_WAIT is not 2s by default"
+[[ $(mesh_env MIMIC_MESH_STALE_AFTER --set mesh.staleAfter=90s) == 90s ]] || fail "msh_40: mesh.staleAfter does not render MIMIC_MESH_STALE_AFTER"
+[[ $(mesh_env MIMIC_MESH_STARTUP_WAIT --set mesh.startupWait=500ms) == 500ms ]] || fail "msh_40: mesh.startupWait does not render MIMIC_MESH_STARTUP_WAIT"
+echo "msh_40: mesh.staleAfter and mesh.startupWait render the variables the sidecars get"
+
 echo "chart checks passed"

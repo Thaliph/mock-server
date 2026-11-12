@@ -64,6 +64,7 @@ fn slice_of() -> impl Strategy<Value = EndpointSlice> {
             namespace: n.into(),
             name: format!("{svc}-1"),
             service: svc.into(),
+            uid: "u".into(),
             generation,
             ports: ports
                 .into_iter()
@@ -92,6 +93,7 @@ fn config() -> impl Strategy<Value = Config> {
                 namespace: n.into(),
                 name: nm.into(),
                 created,
+                uid: "u".into(),
                 generation: created + 1,
                 targets: targets
                     .into_iter()

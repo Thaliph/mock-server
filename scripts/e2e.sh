@@ -65,6 +65,11 @@ cleanup() {
     # Only the CRDs this run installed: a cluster that had them keeps them.
     [[ -z ${MSH_28_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${MSH_41_CLEANUP:-} ]]; then
+    kubectl delete namespace msh-41 msh-41-out --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    # The controller may be scaled to 0 by the section: back to what the chart says.
+    kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="${controller_replicas:-2}" >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -3810,6 +3815,112 @@ kubectl delete namespace msh-28-a msh-28-b --wait=false >/dev/null
 MSH_28_CLEANUP=
 MSH_28_CRDS=
 echo "msh_28: the view is per deployment, follows the ReferenceGrant and the scale, and the long-poll ends 304 at the timeout"
+
+# --- The sidecar follows its mesh view (#442, spec §12.21 MSH-41) ----------------------------------------------------------
+# Objects of this section only: msh-41 (injected: web, which calls, peer, a Service of its namespace) and msh-41-out (not
+# injected: out, a Service that nobody declares). The pod shares its process namespace so that the app container can kill
+# the sidecar (a restart of the sidecar container alone, with the controller away).
+log "msh_41: a sidecar gets its view, classifies an undeclared destination as unscoped, and survives a controller outage and its own restart"
+MSH_41_CLEANUP=1
+ns_fresh msh-41 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+ns_fresh msh-41-out
+msh_41_app() { # msh_41_app <namespace> <name> [extra pod spec line]: a Deployment answering on 8080 and its Service on 80
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $2, namespace: $1}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: $2}}
+  template:
+    metadata: {labels: {app: $2}}
+    spec:
+      shareProcessNamespace: true
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -m, http.server, "8080"]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: http}, periodSeconds: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: $2, namespace: $1}
+spec:
+  selector: {app: $2}
+  ports: [{name: http, port: 80, targetPort: http}]
+YAML
+}
+msh_41_app msh-41 web
+msh_41_app msh-41 peer
+msh_41_app msh-41-out out
+for dep in web peer; do kubectl -n msh-41 rollout status deploy/$dep --timeout=3m >/dev/null || fail "msh_41: $dep did not roll out Ready"; done
+kubectl -n msh-41-out rollout status deploy/out --timeout=3m >/dev/null || fail "msh_41: out did not roll out Ready"
+msh_41_pod=$(kubectl -n msh-41 get pods -l app=web -o jsonpath='{.items[0].metadata.name}')
+# msh_41_metric <series>: the value of a series of the sidecar of web ("name" or "name{label=\"v\"}"), empty when absent.
+msh_41_metric() { sidecar_metrics msh-41 "$msh_41_pod" | awk -v n="$1" 'index($0, n " ") == 1 { print $2; exit }'; }
+# msh_41_until <timeout seconds> <description> <command...>
+msh_41_until() {
+  local limit=$1 desc=$2; shift 2
+  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
+  fail "msh_41: $desc"
+}
+msh_41_two_services() { [[ $(msh_41_metric mimic_mesh_view_services) == 2 ]]; }
+msh_41_until 60 "the sidecar of web never held a view of the 2 Services of its namespace" msh_41_two_services
+[[ $(msh_41_metric 'mimic_mesh_view_pulls_total{result="ok"}') -ge 1 ]] || fail "msh_41: no view was pulled (result ok)"
+# msh_41_call <url>: a GET from the app container of web, through the sidecar.
+msh_41_call() {
+  kubectl -n msh-41 exec deploy/web -c app -- python3 -c \
+    'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=10).read()' "$1" >/dev/null
+}
+before=$(msh_41_metric mimic_mesh_unscoped_connections_total)
+msh_41_call http://peer.msh-41.svc/ || fail "msh_41: a call to a Service of the namespace failed"
+[[ $(msh_41_metric mimic_mesh_unscoped_connections_total) == "$before" ]] \
+  || fail "msh_41: a call to a Service of the view was counted unscoped"
+msh_41_call http://out.msh-41-out.svc/ || fail "msh_41: a call to an undeclared Service must still work (traffic is unchanged)"
+(( $(msh_41_metric mimic_mesh_unscoped_connections_total) > before )) \
+  || fail "msh_41: a call to an undeclared Service was not counted unscoped"
+# The controller goes away; the sidecar keeps its view, and a restart of its container reloads it from mesh.json.
+controller_replicas=$(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.spec.replicas}')
+kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas=0 >/dev/null
+kubectl -n "$NS" wait --for=delete pod -l app.kubernetes.io/name=mimic-controller --timeout=120s >/dev/null \
+  || fail "msh_41: the controller pods did not go away"
+msh_41_two_services || fail "msh_41: the view was lost with the controller away"
+kubectl -n msh-41 exec deploy/web -c app -- python3 -c '
+import os, signal
+# Only a process whose program (argv[0]) is the sidecar binary; never this script, whose own command line
+# holds the name too.
+me = os.getpid()
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    if int(pid) == me:
+        continue
+    try:
+        argv0 = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")[0]
+        if os.path.basename(argv0) == b"mimic-sidecar":
+            os.kill(int(pid), signal.SIGKILL)
+    except OSError:
+        pass
+' || fail "msh_41: cannot stop the sidecar container"
+sidecar_restarted() { [[ $(jp msh-41 "$msh_41_pod" '{.status.initContainerStatuses[?(@.name=="mimic-sidecar")].restartCount}') == 1 ]]; }
+msh_41_until 90 "the sidecar container did not restart" sidecar_restarted
+sidecar_ready() { [[ $(jp msh-41 "$msh_41_pod" '{.status.initContainerStatuses[?(@.name=="mimic-sidecar")].ready}') == true ]]; }
+msh_41_until 90 "the sidecar container is not ready again with the controller away" sidecar_ready
+msh_41_until 30 "the restarted sidecar did not reload its view from mesh.json" msh_41_two_services
+[[ $(jp msh-41 "$msh_41_pod" '{.status.containerStatuses[?(@.name=="app")].restartCount}') == 0 ]] \
+  || fail "msh_41: the app container restarted"
+kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="$controller_replicas" >/dev/null
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m >/dev/null || fail "msh_41: the controller did not come back"
+msh_41_pulled() {
+  local ok not_modified
+  ok=$(msh_41_metric 'mimic_mesh_view_pulls_total{result="ok"}')
+  not_modified=$(msh_41_metric 'mimic_mesh_view_pulls_total{result="not_modified"}')
+  (( ${ok:-0} + ${not_modified:-0} >= 1 ))
+}
+msh_41_until 90 "the restarted sidecar did not reach the controller again" msh_41_pulled
+msh_41_two_services || fail "msh_41: the view changed after the controller came back"
+kubectl delete namespace msh-41 msh-41-out --wait=false >/dev/null
+MSH_41_CLEANUP=
+echo "msh_41: the sidecar holds its view, counts an undeclared destination unscoped, keeps the view through a controller outage and a container restart"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The

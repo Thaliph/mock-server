@@ -21,6 +21,16 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- The sidecar follows its mesh view (#442, M1): with a controller URL it long-polls
+  `GET /v1/workloads/<deployment>/mesh` (backoff 1 to 30 s with jitter, token read again for each request, view
+  validated and bounded, an older generation refused), keeps the last view in `/mimic/state/mesh.json` for a
+  container restart, and classifies each outbound connection as in the view or unscoped
+  (`mimic_mesh_unscoped_connections_total`). The mode of the view is applied like a pulled mode. No traffic
+  changes: every byte still goes to its original destination. New metrics `mimic_mesh_view_pulls_total`,
+  `mimic_mesh_view_age_seconds`, `mimic_mesh_view_services`, `mimic_mesh_view_endpoints`; new variables
+  `MIMIC_MESH`, `MIMIC_MESH_STALE_AFTER`, `MIMIC_MESH_STARTUP_WAIT` (chart: `mesh.enabled`, `mesh.staleAfter`,
+  `mesh.startupWait`, written to the sidecars by the webhook). `/readyz` waits for the first view, at most
+  `MIMIC_MESH_STARTUP_WAIT`. Pods injected before this release have no `MIMIC_MESH` and keep today's behaviour (the sidecar's own default is `off`) until they are recreated.
 - The controller serves the mesh view (#441, M1): both replicas watch Services, EndpointSlices, Deployment metadata,
   `MimicConfig`s, `MimicWorkload`s and, when its CRD exists, `ReferenceGrant`s, and a sidecar fetches its own
   deployment's view with `GET /v1/workloads/<deployment>/mesh?format=1` (long-poll, `ETag`, gzip, debounced,

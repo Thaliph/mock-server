@@ -85,3 +85,32 @@ fn msh_18_an_invalid_value_is_refused_naming_the_variable() {
         assert!(error.contains(var), "{var}={value}: {error}");
     }
 }
+
+#[test]
+fn msh_39_stale_after_and_startup_wait_for_the_sidecars() {
+    let c = parse(&[]).expect("defaults");
+    assert_eq!(c.stale_after, Duration::from_secs(60));
+    assert_eq!(c.startup_wait, Duration::from_secs(2));
+    let c = parse(&[
+        ("MIMIC_MESH_STALE_AFTER", "1s"),
+        ("MIMIC_MESH_STARTUP_WAIT", "0s"),
+    ])
+    .expect("lower bounds");
+    assert_eq!(c.stale_after, Duration::from_secs(1));
+    assert_eq!(c.startup_wait, Duration::ZERO);
+    let c = parse(&[
+        ("MIMIC_MESH_STALE_AFTER", "1h"),
+        ("MIMIC_MESH_STARTUP_WAIT", "1m"),
+    ])
+    .expect("upper bounds");
+    assert_eq!(c.stale_after, Duration::from_secs(3600));
+    assert_eq!(c.startup_wait, Duration::from_secs(60));
+    for (var, value) in [
+        ("MIMIC_MESH_STALE_AFTER", "999ms"),
+        ("MIMIC_MESH_STALE_AFTER", "3601s"),
+        ("MIMIC_MESH_STARTUP_WAIT", "61s"),
+    ] {
+        let error = parse(&[(var, value)]).expect_err(var);
+        assert!(error.contains(var), "{error}");
+    }
+}

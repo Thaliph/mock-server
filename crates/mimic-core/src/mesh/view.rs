@@ -101,6 +101,15 @@ impl View {
         if view.endpoint_count() > limits.max_endpoints {
             return Err(format!("view over {} endpoints", limits.max_endpoints));
         }
+        for key in view
+            .generations
+            .keys()
+            .chain(view.services.values().flat_map(|s| s.generations.keys()))
+        {
+            if !generation_key(key) {
+                return Err("a generations key is not <kind>/<namespace>/<name>@<uid>".into());
+            }
+        }
         for (key, service) in &view.services {
             match key.split_once('/') {
                 Some((ns, name)) if !ns.is_empty() && !name.is_empty() && !name.contains('/') => {}
@@ -126,6 +135,16 @@ impl ServiceView {
     fn endpoint_count(&self) -> usize {
         self.endpoints.values().map(Vec::len).sum()
     }
+}
+
+/// `<kind>/<namespace>/<name>@<uid>`: the identity of an object including its UID, so that an
+/// object deleted and created again is another key (spec §7.9).
+fn generation_key(key: &str) -> bool {
+    let Some((id, uid)) = key.rsplit_once('@') else {
+        return false;
+    };
+    let parts: Vec<&str> = id.split('/').collect();
+    key.len() <= 600 && !uid.is_empty() && parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
 }
 
 /// An error message cut to 200 bytes: a parser's message may quote the input.
@@ -204,7 +223,7 @@ fn service_view(lookup: &Lookup<'_>, service: &Service, policy: Policy) -> Servi
         .iter()
         .map(|s| {
             (
-                format!("endpointslice/{}/{}", s.namespace, s.name),
+                format!("endpointslice/{}/{}@{}", s.namespace, s.name, s.uid),
                 s.generation,
             )
         })
@@ -277,7 +296,7 @@ pub fn build(
     };
     if let Some(c) = own {
         view.generations.insert(
-            format!("mimicconfig/{}/{}", c.namespace, c.name),
+            format!("mimicconfig/{}/{}@{}", c.namespace, c.name, c.uid),
             c.generation,
         );
     }
@@ -330,7 +349,7 @@ pub fn build(
             let mut sv = service_view(&lookup, service, policy);
             if let Some(c) = winners.get(TargetKind::Service, &service.namespace, &service.name) {
                 sv.generations.insert(
-                    format!("mimicconfig/{}/{}", c.namespace, c.name),
+                    format!("mimicconfig/{}/{}@{}", c.namespace, c.name, c.uid),
                     c.generation,
                 );
             }

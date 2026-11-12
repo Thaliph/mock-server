@@ -82,6 +82,12 @@ pub(crate) async fn handle(
             return;
         }
     };
+    // One table read and one lookup per outbound connection, nothing per exchange (spec §7.9).
+    if direction == Direction::Outbound
+        && let Some(mesh) = shared.mesh()
+    {
+        mesh.classify(dst);
+    }
     let mut abort = pin!(shared.aborted());
     let mut client = client;
     let stall = shared.detect_stall();

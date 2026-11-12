@@ -11,6 +11,7 @@ pub mod http1;
 pub mod limits;
 pub mod listener;
 pub mod load;
+pub mod mesh;
 pub mod mock;
 pub mod mode;
 pub mod opaque;

@@ -276,7 +276,7 @@ two replicas with the same objects serve byte-identical views. Draft:
  "services": {"shop/cart": {
     "ips": ["10.96.12.7"], "ports": {"80": {"name": "http", "targetPort": "http"}},
     "endpoints": {"80": [{"ip": "10.244.1.17", "port": 8080, "ready": true, "zone": "a"}]},
-    "generations": {"endpointslice/shop/cart-x7k2p": 41},
+    "generations": {"endpointslice/shop/cart-x7k2p@9f3a": 41},
     "routes": [{"name": "shop/cart-canary", "rules": [<compiled HTTPRoute rule>]}],
     "policy": {"retries": {...}, "outlierDetection": {...}, "circuitBreaker": {...},
                "loadBalancer": {...}, "faults": [...]}}}}
@@ -318,7 +318,7 @@ second instead of one `MIMIC_EGRESS_PULL_INTERVAL`; the egress pull remains for 
 - **Generations across replicas**: two replicas may lag each other, so a sidecar could get an
   older view after a newer one. The view lists the `metadata.generation` of each EndpointSlice,
   HTTPRoute and MimicConfig it was built from (the API server increments them on every change);
-  the sidecar refuses a view in which an object it already knows has a lower generation, keeps
+  the sidecar refuses a view in which an object it already knows (keyed with its UID: a recreated object is a new key, never older) has a lower generation, keeps
   the current one and polls again (`mimic_mesh_view_pulls_total{result="older"}`). Services and
   deletions carry no comparable counter: a regression there lasts at most the lagging replica's
   watch delay (accepted limit).

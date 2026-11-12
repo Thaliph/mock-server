@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use mimic_core::inject::InjectConfig;
+use mimic_core::mesh::view::Limits;
 use mimic_runtime::config::{ConfigError, Env};
+
+use crate::mesh::MeshConfig;
 
 const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8443);
 const DEFAULT_API_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8444);
@@ -37,6 +40,7 @@ impl WebhookConfig {
         let namespace = env.required("MIMIC_NAMESPACE")?;
         let service = env.required("MIMIC_WEBHOOK_SERVICE")?;
         let api_addr: SocketAddr = env.parse_or("MIMIC_SIDECAR_API_ADDR", DEFAULT_API_ADDR)?;
+        let mesh = MeshConfig::from_env(env)?;
         let controller_url = format!("https://{service}.{namespace}.svc:{}", api_addr.port());
         Ok(WebhookConfig {
             addr: env.parse_or("MIMIC_WEBHOOK_ADDR", DEFAULT_ADDR)?,
@@ -54,9 +58,59 @@ impl WebhookConfig {
                 sidecar_log: sidecar_log.to_string(),
                 controller_url,
                 load_enabled: env.parse_or("MIMIC_LOAD_MAX_RUNS", 0_u32)? > 0,
+                mesh_env: mesh_env(&mesh),
             },
         })
     }
+}
+
+/// The `MIMIC_MESH*` variables the sidecars get (spec §7.1): the switch and the ages always, the
+/// bounds of the view only when they are not the defaults.
+fn mesh_env(mesh: &MeshConfig) -> Vec<(String, String)> {
+    let seconds = |d: Duration| {
+        if d.subsec_millis() == 0 {
+            format!("{}s", d.as_secs())
+        } else {
+            format!("{}ms", d.as_millis())
+        }
+    };
+    let mut env = vec![
+        (
+            "MIMIC_MESH".to_string(),
+            if mesh.enabled { "on" } else { "off" }.to_string(),
+        ),
+        (
+            "MIMIC_MESH_STALE_AFTER".to_string(),
+            seconds(mesh.stale_after),
+        ),
+        (
+            "MIMIC_MESH_STARTUP_WAIT".to_string(),
+            seconds(mesh.startup_wait),
+        ),
+    ];
+    let defaults = Limits::default();
+    for (name, value, default) in [
+        (
+            "MIMIC_MESH_MAX_SERVICES",
+            mesh.limits.max_services,
+            defaults.max_services,
+        ),
+        (
+            "MIMIC_MESH_MAX_ENDPOINTS",
+            mesh.limits.max_endpoints,
+            defaults.max_endpoints,
+        ),
+        (
+            "MIMIC_MESH_MAX_VIEW_BYTES",
+            mesh.limits.max_view_bytes,
+            defaults.max_view_bytes,
+        ),
+    ] {
+        if value != default {
+            env.push((name.to_string(), value.to_string()));
+        }
+    }
+    env
 }
 
 fn max_connections(env: &Env) -> Result<usize, ConfigError> {
@@ -117,6 +171,53 @@ mod tests {
         assert_eq!(cfg.inject.version, "1.2.3");
         let limits = cfg.inject.sidecar_resources.limits.unwrap();
         assert_eq!(limits["memory"].0, "128Mi");
+    }
+
+    #[test]
+    fn msh_39_the_mesh_variables_for_the_sidecars() {
+        let cfg = WebhookConfig::from_env(&env(&[]), "1").unwrap();
+        fn pairs(cfg: &WebhookConfig) -> Vec<(&str, &str)> {
+            cfg.inject
+                .mesh_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect()
+        }
+        assert_eq!(
+            pairs(&cfg),
+            [
+                ("MIMIC_MESH", "on"),
+                ("MIMIC_MESH_STALE_AFTER", "60s"),
+                ("MIMIC_MESH_STARTUP_WAIT", "2s"),
+            ]
+        );
+        let extra = [
+            ("MIMIC_MESH", "off"),
+            ("MIMIC_MESH_STALE_AFTER", "90s"),
+            ("MIMIC_MESH_STARTUP_WAIT", "500ms"),
+            ("MIMIC_MESH_MAX_SERVICES", "7"),
+            ("MIMIC_MESH_MAX_VIEW_BYTES", "64Ki"),
+        ];
+        let cfg = WebhookConfig::from_env(&env(&extra), "1").unwrap();
+        assert_eq!(
+            pairs(&cfg),
+            [
+                ("MIMIC_MESH", "off"),
+                ("MIMIC_MESH_STALE_AFTER", "90s"),
+                ("MIMIC_MESH_STARTUP_WAIT", "500ms"),
+                ("MIMIC_MESH_MAX_SERVICES", "7"),
+                ("MIMIC_MESH_MAX_VIEW_BYTES", "65536"),
+            ]
+        );
+        // An invalid value exits 2 (the controller's own parsing).
+        for (var, value) in [
+            ("MIMIC_MESH_STALE_AFTER", "0s"),
+            ("MIMIC_MESH_STALE_AFTER", "2h"),
+            ("MIMIC_MESH_STARTUP_WAIT", "61s"),
+        ] {
+            let err = WebhookConfig::from_env(&env(&[(var, value)]), "1").err();
+            assert!(err.is_some_and(|e| e.to_string().contains(var)), "{var}");
+        }
     }
 
     #[test]
