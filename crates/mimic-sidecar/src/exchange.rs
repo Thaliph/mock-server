@@ -229,6 +229,9 @@ pub(crate) struct Tracker {
     named_authority: Option<String>,
     /// The load test run of a request carrying the load marker (spec §7.8).
     load_run: Option<String>,
+    /// Mesh-routed: the backend and the pod the request went to (spec §7.9).
+    backend: Option<Arc<str>>,
+    upstream: Option<SocketAddr>,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -314,6 +317,8 @@ impl Tracker {
             tap: tap.cloned(),
             named_authority,
             load_run: None,
+            backend: None,
+            upstream: None,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -334,6 +339,30 @@ impl Tracker {
     /// The request is a load test's: its access line says which run.
     pub(crate) fn load_run(&mut self, uid: String) {
         self.load_run = Some(uid);
+    }
+
+    /// The request was balanced to `upstream` of `backend` (spec §7.9): the access line says so.
+    pub(crate) fn route(&mut self, backend: &Arc<str>, upstream: SocketAddr) {
+        self.backend = Some(backend.clone());
+        self.upstream = Some(upstream);
+    }
+
+    /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
+    /// logged like a response, and never handed to discovery.
+    pub(crate) fn synthetic(mut self, status: u16) {
+        let head = self.started.elapsed();
+        self.status = Some(status);
+        self.head = Some(head);
+        self.counted = true;
+        self.capture = None;
+        self.ctx.proxy.request(
+            self.ctx.direction,
+            self.protocol,
+            &self.authority,
+            Some(status),
+            head,
+        );
+        self.finish(Outcome::Ok, 0);
     }
 
     /// The destination did not answer: the exchange ends here.
@@ -467,6 +496,8 @@ impl Tracker {
             mock: None,
             mock_miss: None,
             load_run: self.load_run.take(),
+            backend: self.backend.take().map(|b| b.to_string()),
+            upstream: self.upstream,
         });
     }
 }
@@ -595,6 +626,8 @@ pub(crate) fn rejected(ctx: &Ctx) {
         mock: None,
         mock_miss: None,
         load_run: None,
+        backend: None,
+        upstream: None,
     });
 }
 
@@ -914,6 +947,8 @@ impl Http1Tracker {
             mock: None,
             mock_miss: None,
             load_run: open.load_run.take(),
+            backend: None,
+            upstream: None,
         });
     }
 }

@@ -70,6 +70,9 @@ cleanup() {
     # The controller may be scaled to 0 by the section: back to what the chart says.
     kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="${controller_replicas:-2}" >/dev/null 2>&1 || true
   fi
+  if [[ -n ${MSH_55_CLEANUP:-} ]]; then
+    kubectl delete namespace msh-55 msh-55-out --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -3921,6 +3924,148 @@ msh_41_two_services || fail "msh_41: the view changed after the controller came 
 kubectl delete namespace msh-41 msh-41-out --wait=false >/dev/null
 MSH_41_CLEANUP=
 echo "msh_41: the sidecar holds its view, counts an undeclared destination unscoped, keeps the view through a controller outage and a container restart"
+
+# --- Load balancing over pod IPs (#443, MSH-55) ------------------------------------------------------------------------
+# Objects of this section only: msh-55 (injected: pods, a Service of 3 replicas that count their requests, and client, which
+# calls) and msh-55-out (not injected: out, a Service that nobody declares). Nothing is scaled or deleted outside them.
+log "msh_55: one keep-alive client is balanced over the 3 pods of a Service, the access lines name the pods, an undeclared Service still works"
+MSH_55_CLEANUP=1
+ns_fresh msh-55 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+ns_fresh msh-55-out
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: pods, namespace: msh-55}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: pods}}
+  template:
+    metadata: {labels: {app: pods}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command:
+            - python3
+            - -c
+            - |
+              import http.server, os
+              n = 0
+              class H(http.server.BaseHTTPRequestHandler):
+                  protocol_version = "HTTP/1.1"
+                  def do_GET(self):
+                      global n
+                      if self.path == "/count":
+                          body = str(n).encode()
+                      else:
+                          n += 1
+                          body = os.environ.get("HOSTNAME", "pod").encode()
+                      self.send_response(200)
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  def log_message(self, *args):
+                      pass
+              http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: http}, periodSeconds: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: pods, namespace: msh-55}
+spec:
+  selector: {app: pods}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: msh-55}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: out, namespace: msh-55-out}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: out}}
+  template:
+    metadata: {labels: {app: out}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -m, http.server, "8080"]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: http}, periodSeconds: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: out, namespace: msh-55-out}
+spec:
+  selector: {app: out}
+  ports: [{name: http, port: 80, targetPort: http}]
+YAML
+kubectl -n msh-55 rollout status deploy/pods --timeout=3m >/dev/null || fail "msh_55: pods did not roll out Ready"
+kubectl -n msh-55 rollout status deploy/client --timeout=3m >/dev/null || fail "msh_55: client did not roll out Ready"
+kubectl -n msh-55-out rollout status deploy/out --timeout=3m >/dev/null || fail "msh_55: out did not roll out Ready"
+msh_55_client=$(kubectl -n msh-55 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+msh_55_ips=$(kubectl -n msh-55 get pods -l app=pods -o jsonpath='{.items[*].status.podIP}')
+[[ $(wc -w <<<"$msh_55_ips") == 3 ]] || fail "msh_55: pods does not have 3 pod IPs ($msh_55_ips)"
+msh_55_cluster_ip=$(kubectl -n msh-55 get svc pods -o jsonpath='{.spec.clusterIP}')
+# msh_55_metric <series>: the value of a series of the sidecar of client, empty when absent.
+msh_55_metric() { sidecar_metrics msh-55 "$msh_55_client" | awk -v n="$1" 'index($0, n " ") == 1 { print $2; exit }'; }
+msh_55_view() { [[ $(msh_55_metric mimic_mesh_view_endpoints) == 3 ]]; }
+for _ in $(seq 60); do msh_55_view && break; sleep 1; done
+msh_55_view || fail "msh_55: the sidecar of client never held a view with the 3 endpoints of pods"
+# One keep-alive connection, 300 requests (a Python client that reuses its connection).
+kubectl -n msh-55 exec deploy/client -c app -- python3 -c '
+import http.client
+conn = http.client.HTTPConnection("pods.msh-55.svc", 80, timeout=10)
+for _ in range(300):
+    conn.request("GET", "/")
+    r = conn.getresponse()
+    assert r.status == 200, r.status
+    r.read()
+' || fail "msh_55: the 300 requests did not all get a 200"
+msh_55_total=0
+for ip in $msh_55_ips; do
+  got=$(kubectl -n msh-55 exec deploy/client -c app -- python3 -c \
+    'import sys, urllib.request; print(urllib.request.urlopen(f"http://{sys.argv[1]}:8080/count", timeout=10).read().decode())' "$ip") \
+    || fail "msh_55: cannot read the count of $ip"
+  (( got >= 70 && got <= 130 )) || fail "msh_55: the pod $ip received $got of 300 requests (expected 100 +- 30)"
+  msh_55_total=$((msh_55_total + got))
+  series=$(msh_55_metric "mimic_mesh_endpoint_requests_total{backend=\"msh-55/pods:80\",endpoint=\"$ip:8080\",status_class=\"2xx\"}")
+  [[ ${series%.*} == "$got" ]] || fail "msh_55: the sidecar counted ${series:-nothing} requests to $ip, the pod counted $got"
+done
+(( msh_55_total == 300 )) || fail "msh_55: the pods received $msh_55_total requests, not 300"
+msh_55_logs() { kubectl -n msh-55 logs "$msh_55_client" -c mimic-sidecar 2>/dev/null; }
+for ip in $msh_55_ips; do
+  for _ in $(seq 30); do
+    msh_55_logs | grep '"target":"access"' | grep "\"backend\":\"msh-55/pods:80\"" | grep "\"upstream\":\"$ip:8080\"" \
+      | grep -q "\"dst\":\"$msh_55_cluster_ip:80\"" && break
+    sleep 1
+  done
+  msh_55_logs | grep '"target":"access"' | grep "\"upstream\":\"$ip:8080\"" | grep "\"dst\":\"$msh_55_cluster_ip:80\"" \
+    | grep -q "\"backend\":\"msh-55/pods:80\"" || fail "msh_55: no access line with backend, upstream $ip and dst $msh_55_cluster_ip"
+done
+before=$(msh_55_metric mimic_mesh_unscoped_connections_total)
+kubectl -n msh-55 exec deploy/client -c app -- python3 -c \
+  'import urllib.request; urllib.request.urlopen("http://out.msh-55-out.svc/", timeout=10).read()' >/dev/null \
+  || fail "msh_55: a call to an undeclared Service must still work"
+(( $(msh_55_metric mimic_mesh_unscoped_connections_total) > ${before:-0} )) \
+  || fail "msh_55: a call to an undeclared Service was not counted unscoped"
+kubectl delete namespace msh-55 msh-55-out --wait=false >/dev/null
+MSH_55_CLEANUP=
+echo "msh_55: 300 requests of one keep-alive client were spread over the 3 pods (each 100 +- 30), the sidecar's counters and access lines name them, and an undeclared Service still works"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The

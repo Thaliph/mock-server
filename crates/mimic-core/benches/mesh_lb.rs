@@ -36,11 +36,7 @@ fn pick(c: &mut Criterion) {
                         state ^= state << 17;
                         (state % m as u64) as usize
                     };
-                    black_box(set.pick(
-                        black_box(Duration::from_secs(5)),
-                        |i| load[i],
-                        &mut draw,
-                    ))
+                    black_box(set.pick(black_box(Duration::from_secs(5)), |i| load[i], &mut draw))
                 });
             });
         }

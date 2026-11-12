@@ -49,6 +49,16 @@ All notable changes to mimic are documented in this file. The format follows
   a restart; new metric `mimic_mode{mode}` and `none` in `mimic_mock_mode_switches_total{to}`; `status.mode` counts
   `none` pods.
 
+- Client-side load balancing, step 1 (#443, M1): an outbound connection to a Service of the mesh view whose client
+  speaks cleartext HTTP/1 or `h2c` is balanced per request over the pod IPs of the Service (power of two choices on
+  the least request, slow start for new pods, pools per pod with `MIMIC_MESH_POOL_IDLE_TIMEOUT`). Discovery still
+  records one exchange under the app's authority; the access line gains `backend` and `upstream`; new metrics
+  `mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_endpoint_requests_total`,
+  `mimic_mesh_endpoint_in_flight` (pods capped by `MIMIC_METRICS_MAX_ENDPOINTS`, evicted 5 minutes after they leave
+  the view). Everything else, and every connection with the mesh switched off (`MIMIC_MESH=off`, `"mesh": false`), keeps
+  the byte relay. A mesh-routed HTTP/1 connection has the accepted limits of spec §4.1 (header order across names,
+  chunk extensions, hop-by-hop fields consumed, a rejected request answered `400`, a later `Upgrade` answered `501`).
+
 - The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).
 - Production overlay `deploy/helm/mimic/values-production.yaml` (#438): three controllers spread over zones and nodes, a priority class, requests and limits on every rendered container, images by digest, the Valkey exporter and the PodMonitors on, bundled monitoring and load tests off. The chart gains `controller.topologySpreadConstraints`, `controller.priorityClassName` and `valkey.priorityClassName`, empty by default.

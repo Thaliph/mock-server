@@ -122,7 +122,6 @@ async fn msh_53_a_request_hyper_rejects_is_answered_400_and_the_connection_close
     for bad in [
         &b"GET / HTTP/1.1\r\nHost: cart.shop.svc\r\nBad Header: 1\r\n\r\n"[..],
         b"GET / HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab",
-        b"GET / HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n",
     ] {
         let mut client = H1Client::connect(f.addr).await;
         client.send(bad).await;
@@ -177,11 +176,11 @@ async fn msh_53_the_answers_of_the_mesh_itself() {
     let text = f.metrics.encode();
     assert!(
         text.contains("status_class=\"5xx\",reason=\"connect-failed\"} 1"),
-        "{text}"
+        "the metrics"
     );
     assert!(
         text.contains("status_class=\"5xx\",reason=\"no-endpoint\"} 1"),
-        "{text}"
+        "the metrics"
     );
     drop(logs);
 
@@ -274,4 +273,21 @@ async fn msh_53_a_later_upgrade_request_on_a_mesh_routed_connection_is_answered_
     );
     assert!(client.read().await.is_none(), "the connection closes");
     assert_eq!(pod.counts.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn msh_53_content_length_with_chunked_is_forwarded_chunked_only() {
+    let _logs = capture_logs();
+    let pod = RawPod::start(echo_path).await;
+    let state = state_for(cluster_ip(), &[pod.addr]);
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(b"POST / HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n")
+        .await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let seen = lower(&pod.received());
+    assert!(seen.contains("transfer-encoding: chunked"), "{seen}");
+    assert!(!seen.contains("content-length"), "{seen}");
 }

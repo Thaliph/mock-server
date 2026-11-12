@@ -68,6 +68,10 @@ pub struct Exchange {
     pub mock_miss: Option<&'static str>,
     /// The uid of the load test run that sent the request (spec §7.8).
     pub load_run: Option<String>,
+    /// Mesh-routed requests only (spec §7.9): `<namespace>/<name>:<port>` of the Service port.
+    pub backend: Option<String>,
+    /// Mesh-routed requests only: the pod the request went to.
+    pub upstream: Option<SocketAddr>,
 }
 
 /// One finished opaque or TLS connection.
@@ -123,6 +127,8 @@ pub fn exchange(e: &Exchange) {
         mock = e.mock,
         mock_miss = e.mock_miss,
         load_run = e.load_run.as_deref(),
+        backend = e.backend.as_deref(),
+        upstream = e.upstream.map(|a| a.to_string()).as_deref(),
         "http exchange"
     );
 }

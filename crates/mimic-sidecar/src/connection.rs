@@ -21,6 +21,7 @@ use crate::h2;
 use crate::http1;
 use crate::listener::{Active, Direction, Outcome, Shared};
 use crate::load::{Marker, Watch};
+use crate::mesh::{self, Backend, MeshState, Scope, Serving};
 use crate::mock::Mock;
 use crate::opaque::{self, Early, Side};
 use crate::tls::intercept::{AcceptError, ConnectError, Plan};
@@ -83,10 +84,12 @@ pub(crate) async fn handle(
         }
     };
     // One table read and one lookup per outbound connection, nothing per exchange (spec §7.9).
+    let mut route = None;
     if direction == Direction::Outbound
         && let Some(mesh) = shared.mesh()
+        && mesh.classify(dst) == Scope::InScope
     {
-        mesh.classify(dst);
+        route = mesh.route(dst).map(|backend| (mesh.clone(), backend));
     }
     let mut abort = pin!(shared.aborted());
     let mut client = client;
@@ -113,6 +116,25 @@ pub(crate) async fn handle(
             }
             MockFirst::Other(buf) => read = buf,
             MockFirst::Gone => return,
+        }
+    }
+    // An in-scope Service is balanced per request when the client speaks cleartext HTTP (spec
+    // §7.9): what it sends first decides, so the original destination is not dialled yet.
+    let route = if mock.is_none() { route } else { None };
+    if let Some((mesh, backend)) = route {
+        match mesh_first(&mut client, stall, abort.as_mut()).await {
+            MeshFirst::Http(h2, buf) => {
+                let routed = Routed {
+                    mesh,
+                    backend,
+                    dst,
+                    started,
+                };
+                serve_mesh(&shared, routed, client, h2, buf, abort.as_mut()).await;
+                return;
+            }
+            MeshFirst::Other(buf) => read = buf,
+            MeshFirst::Gone => return,
         }
     }
     let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await;
@@ -238,6 +260,119 @@ pub(crate) async fn handle(
         abort.as_mut(),
     )
     .await;
+}
+
+/// An in-scope connection the mesh balances.
+struct Routed {
+    mesh: MeshState,
+    backend: Arc<Backend>,
+    dst: SocketAddr,
+    started: Instant,
+}
+
+/// Serves a connection per request over the pods of its Service (spec §7.9).
+async fn serve_mesh(
+    shared: &Arc<Shared>,
+    routed: Routed,
+    client: TcpStream,
+    h2: bool,
+    first: Vec<u8>,
+    abort: Pin<&mut (impl Future<Output = ()> + Send)>,
+) {
+    let direction = Direction::Outbound;
+    let Routed {
+        mesh,
+        backend,
+        dst,
+        started,
+    } = routed;
+    shared.metrics().count(direction, Outcome::Ok);
+    if let Err(e) = shared.prepare_socket(&client) {
+        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot configure socket");
+    }
+    let conn = Conn {
+        shared,
+        direction,
+        dst,
+        started,
+        tls: false,
+        sni: None,
+        interception: None,
+        mock: None,
+    };
+    shared.proxy().connection(
+        direction,
+        if h2 { "h2" } else { "http1" },
+        &conn.authority(false),
+    );
+    let serving = Serving {
+        mesh,
+        backend,
+        ctx: conn.ctx(),
+        tap: shared.discovery().cloned(),
+    };
+    let stream = Stream::plain_with_prefix(client, first);
+    if let Err(e) = mesh::serve(serving, stream, h2, shared.stopped(), abort).await {
+        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "mesh connection ended");
+    }
+}
+
+/// What the client of an in-scope connection said first.
+enum MeshFirst {
+    /// Cleartext HTTP the mesh balances: `true` for HTTP/2, and the bytes read.
+    Http(bool, Vec<u8>),
+    /// Anything else, or an HTTP/1 head that must stay on the byte relay: the bytes read so
+    /// far (possibly none), to detect again once connected.
+    Other(Vec<u8>),
+    /// The client closed, failed or was told to stop: nothing is dialled.
+    Gone,
+}
+
+/// Waits for the first bytes of the client without connecting: at most [`MOCK_WAIT`] for the
+/// first byte (a server-first protocol), then the usual stall of an incomplete prefix, and for
+/// an HTTP/1 request until its head is whole.
+async fn mesh_first(
+    client: &mut TcpStream,
+    stall: Duration,
+    abort: impl Future<Output = ()>,
+) -> MeshFirst {
+    let mut abort = pin!(abort);
+    let mut buf = Vec::new();
+    let silent = tokio::time::sleep(MOCK_WAIT);
+    let mut silent = pin!(silent);
+    let deadline = tokio::time::sleep(stall);
+    let mut deadline = pin!(deadline);
+    loop {
+        let mut chunk = [0u8; READ_CHUNK];
+        let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
+        tokio::select! {
+            () = &mut silent, if buf.is_empty() => return MeshFirst::Other(buf),
+            () = &mut deadline, if !buf.is_empty() => return MeshFirst::Other(buf),
+            read = client.read(&mut chunk[..want]) => match read {
+                Ok(n) if n > 0 => {
+                    if buf.is_empty() {
+                        deadline.as_mut().reset(tokio::time::Instant::now() + stall);
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    match detect(&buf) {
+                        Detection::NeedMore => {}
+                        Detection::H2 => return MeshFirst::Http(true, buf),
+                        Detection::Http1 => match mesh::head_kind(&buf) {
+                            mesh::Head::Partial => {}
+                            mesh::Head::Relay => return MeshFirst::Other(buf),
+                            mesh::Head::Routed => return MeshFirst::Http(false, buf),
+                        },
+                        _ => return MeshFirst::Other(buf),
+                    }
+                    if buf.len() >= DETECT_LIMIT {
+                        return MeshFirst::Other(buf);
+                    }
+                }
+                _ => return MeshFirst::Gone,
+            },
+            () = &mut abort => return MeshFirst::Gone,
+        }
+    }
 }
 
 /// What the mock does with a connection whose first bytes are HTTP or TLS.

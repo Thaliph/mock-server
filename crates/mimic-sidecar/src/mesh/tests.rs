@@ -234,3 +234,39 @@ fn msh_47_invalid_pool_and_endpoint_label_values_are_refused() {
         assert!(error.contains(var), "{error}");
     }
 }
+
+#[test]
+fn msh_53_the_first_head_says_whether_the_connection_stays_on_the_byte_relay() {
+    use super::{Head, head_kind};
+    assert_eq!(head_kind(b""), Head::Partial);
+    assert_eq!(head_kind(b"GET / HTTP/1.1\r\nHost: a\r\n"), Head::Partial);
+    assert_eq!(
+        head_kind(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"),
+        Head::Routed
+    );
+    assert_eq!(head_kind(b"GET / HTTP/1.1\nHost: a\n\n"), Head::Routed);
+    assert_eq!(
+        head_kind(b"POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nab"),
+        Head::Routed
+    );
+    for relay in [
+        &b"GET /ws HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"[..],
+        b"GET /ws HTTP/1.1\r\nHost: a\r\nupgrade: h2c\r\n\r\n",
+        b"GET /ws HTTP/1.1\r\nHost: a\r\nUPGRADE : h2c\r\n\r\n",
+        b"GET /ws HTTP/1.1\nHost: a\nUpgrade: websocket\n\n",
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        b"connect example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+    ] {
+        assert_eq!(
+            head_kind(relay),
+            Head::Relay,
+            "{}",
+            String::from_utf8_lossy(relay)
+        );
+    }
+    // A value that mentions upgrade is not the field.
+    assert_eq!(
+        head_kind(b"GET / HTTP/1.1\r\nHost: a\r\nX-Note: Upgrade: now\r\n\r\n"),
+        Head::Routed
+    );
+}

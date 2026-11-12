@@ -385,11 +385,11 @@ async fn msh_52_discovery_records_one_exchange_under_the_apps_authority() {
 
     let lines = logs.access_exactly(1).await;
     let line = &lines[0];
-    assert_eq!(line["dst"], "127.0.0.1:80", "{line}");
-    assert_eq!(line["backend"], "shop/cart:80", "{line}");
-    assert_eq!(line["upstream"], pod.addr.to_string(), "{line}");
-    assert_eq!(line["authority"], "cart.shop.svc:80", "{line}");
-    assert_eq!(line["status"], 200, "{line}");
+    assert_eq!(line["dst"], "127.0.0.1:80", "the access line");
+    assert_eq!(line["backend"], "shop/cart:80", "the access line");
+    assert_eq!(line["upstream"], pod.addr.to_string(), "the access line");
+    assert_eq!(line["authority"], "cart.shop.svc", "the access line");
+    assert_eq!(line["status"], 200, "the access line");
 }
 
 #[tokio::test]
@@ -413,14 +413,18 @@ async fn msh_54_metrics_count_cap_and_evict() {
     };
     assert!(
         text.contains("mimic_mesh_requests_total{service=\"shop/cart\",route=\"none\",backend=\"shop/cart:80\",status_class=\"2xx\",reason=\"none\"} 30"),
-        "{text}"
+        "the metrics"
     );
     assert_eq!(
         count("mimic_mesh_request_duration_seconds_count"),
         30.0,
-        "{text}"
+        "the metrics"
     );
-    assert_eq!(count("mimic_mesh_endpoint_requests_total"), 30.0, "{text}");
+    assert_eq!(
+        count("mimic_mesh_endpoint_requests_total"),
+        30.0,
+        "the metrics"
+    );
     let endpoints: std::collections::BTreeSet<&str> = text
         .lines()
         .filter(|l| l.starts_with("mimic_mesh_endpoint_requests_total{"))
@@ -432,7 +436,7 @@ async fn msh_54_metrics_count_cap_and_evict() {
         text.contains(
             "mimic_mesh_endpoint_in_flight{backend=\"shop/cart:80\",endpoint=\"other\"} 0"
         ),
-        "{text}"
+        "the metrics"
     );
 
     // A pod with a label of its own leaves the view: its series stay 4 minutes, and are gone
