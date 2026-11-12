@@ -842,4 +842,25 @@ crd_props=$(yq 'select(.kind == "CustomResourceDefinition" and .metadata.name ==
   || fail "non_07: status.mode.mode does not accept none, discovery and mock"
 echo "non_07: the MimicWorkload CRD accepts none, discovery and mock and defaults to none"
 
+# MSH-15 (#440): the MimicConfig CRD of the mesh view (spec §7, §7.9).
+mc=$(yq 'select(.kind == "CustomResourceDefinition" and .metadata.name == "mimicconfigs.mimic.platform.io")' "$tmp/default.yaml")
+[[ -n $mc ]] || fail "msh_15: the default render has no MimicConfig CRD"
+[[ $(printf '%s\n' "$mc" | yq -r '.metadata.annotations["helm.sh/resource-policy"]') == keep ]] \
+  || fail "msh_15: the MimicConfig CRD is not kept on uninstall"
+[[ $(printf '%s\n' "$mc" | yq -o=json -I=0 '.spec.versions[0] | [.name, .served, .storage, .subresources]') == '["v1alpha1",true,true,{"status":{}}]' ]] \
+  || fail "msh_15: the MimicConfig CRD is not v1alpha1 with a status subresource"
+mc_spec=$(printf '%s\n' "$mc" | yq '.spec.versions[0].schema.openAPIV3Schema.properties.spec')
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 '[.properties.targetRefs.minItems, .properties.targetRefs.maxItems, .properties.destinations.maxItems]') == '[1,16,256]' ]] \
+  || fail "msh_15: targetRefs is not 1 to 16 or destinations is not at most 256"
+[[ $(printf '%s\n' "$mc_spec" | yq -r '.properties.mesh.properties.enabled.default') == true ]] \
+  || fail "msh_15: mesh.enabled does not default to true"
+[[ $(printf '%s\n' "$mc_spec" | yq -r '.properties.loadBalancer.properties.slowStart.type') == string ]] \
+  || fail "msh_15: no loadBalancer.slowStart"
+cel=$(printf '%s\n' "$mc_spec" | yq -r '[.properties.targetRefs.items["x-kubernetes-validations"][].rule, .["x-kubernetes-validations"][].rule] | join("\n")')
+for rule in '!has(self.namespace)' "!has(self.destinations) || self.targetRefs.exists(t, t.kind == 'Deployment')" \
+  "!has(self.mesh) || self.targetRefs.exists(t, t.kind == 'Deployment')" "!has(self.loadBalancer) || self.targetRefs.exists(t, t.kind == 'Service')"; do
+  grep -qxF -- "$rule" <<<"$cel" || fail "msh_15: the MimicConfig CRD lacks the CEL rule $rule"
+done
+echo "msh_15: the MimicConfig CRD is kept, has a status subresource, bounded fields and the CEL rules"
+
 echo "chart checks passed"

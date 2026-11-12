@@ -6,7 +6,6 @@ use proptest::prelude::*;
 
 use super::input::*;
 use super::policy::statuses;
-use super::testkit::*;
 use super::view::{Limits, build};
 use crate::Mode;
 

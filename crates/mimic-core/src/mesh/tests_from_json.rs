@@ -86,10 +86,13 @@ fn msh_12_a_missing_field_trailing_bytes_and_non_objects_are_refused() {
     let json = rich().json;
     assert!(read(&json.replacen(r#""mesh":true,"#, "", 1)).is_err());
     assert!(read(&json.replacen(r#""cluster":"local","#, "", 1)).is_err());
-    assert!(read(&format!("{json} x")).is_err());
-    assert!(read(&format!("{json}{json}")).is_err());
-    for text in ["", "null", "[]", "1", "\"x\"", "{", "{}"] {
-        assert!(read(text).is_err(), "{text}");
+    assert!(read(&[json.as_str(), " x"].concat()).is_err());
+    assert!(read(&[json.as_str(), json.as_str()].concat()).is_err());
+    for (i, text) in ["", "null", "[]", "1", "\"x\"", "{", "{}"]
+        .iter()
+        .enumerate()
+    {
+        assert!(read(text).is_err(), "document {i}");
     }
 }
 

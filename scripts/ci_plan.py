@@ -104,11 +104,11 @@ GATES = {
     "e2e_load": ("image", "chart", "e2e"),
 }
 
-# The fuzz jobs (PRX-28, DSC-23, PUL-20, MCK-20, LDT-18, GRP-10): a directory entry matches itself and what is under it.
+# The fuzz jobs (PRX-28, DSC-23, PUL-20, MCK-20, LDT-18, GRP-10, MSH-13): a directory entry matches itself and what is under it.
 CODEC_DIRS = ("crates/mimic-core/src/proxy/http1", "fuzz")
 CODEC_FILES = frozenset({"crates/mimic-core/src/proxy.rs", "Cargo.toml", "Cargo.lock"})
-DISCOVERY_DIRS = ("crates/mimic-core/src/discovery", "crates/mimic-core/src/mock", "crates/mimic-core/src/load", "crates/mimic-core/src/grpc", "fuzz")
-DISCOVERY_FILES = frozenset({"crates/mimic-core/src/mock.rs", "crates/mimic-core/src/grpc.rs"})
+DISCOVERY_DIRS = ("crates/mimic-core/src/discovery", "crates/mimic-core/src/mock", "crates/mimic-core/src/load", "crates/mimic-core/src/grpc", "crates/mimic-core/src/mesh", "fuzz")
+DISCOVERY_FILES = frozenset({"crates/mimic-core/src/mock.rs", "crates/mimic-core/src/grpc.rs", "crates/mimic-core/src/mesh.rs"})
 
 
 def categories_of(path):

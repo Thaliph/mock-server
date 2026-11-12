@@ -27,3 +27,8 @@ json-patch = "4.2.0"
 jsonschema = { version = "0.60.2", default-features = false }
 p256 = "0.14.0"
 proptest = "1.12.0"
+criterion = { version = "0.8.2", default-features = false }
+
+[[bench]]
+name = "mesh_view"
+harness = false
