@@ -13,7 +13,7 @@ at install time with `--set loadTest.enabled=true` ([Install](Install#enable-loa
 release:
 
 ```bash
-helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.2 -n mimic-system \
+helm upgrade mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.3 -n mimic-system \
   --reuse-values --set loadTest.enabled=true
 kubectl wait --for=condition=Established crd/mimicloadtests.mimic.platform.io --timeout=60s
 kubectl -n mimic-system rollout status deploy/mimic-controller
@@ -104,7 +104,7 @@ exchanges), then one of its recorded samples. Fields that discovery marked volat
 get fresh values that keep their shape. Values that were redacted are sent as their placeholder
 (`Authorization: Bearer mimic-token`), unless `credentials.fields` supplies the real value from your Secret,
 which the author of the object must be allowed to `get` (see [Testing with credentials](#testing-with-credentials)).
-Only a placeholder in a name or a path segment cannot be replayed: that endpoint is skipped as `credentials`. Skipped endpoints are counted by reason in `status.skipped` (`grpc`, `upgrade`, `excluded`,
+A placeholder that is not a value cannot be replayed: a sample with one in a path segment, a header name, a query key, a form key or a JSON object key is unusable, and an endpoint with no usable sample is skipped as `credentials`. Skipped endpoints are counted by reason in `status.skipped` (`grpc`, `upgrade`, `excluded`,
 `no_sample`, `credentials`, `opaque_body`, `limit`, `plan_size`). HTTP/1.1 cleartext only; gRPC is skipped.
 
 ## Testing with credentials
