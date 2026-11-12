@@ -14,6 +14,9 @@ use crate::Mode;
 /// The view format this code writes and reads.
 pub const FORMAT: u32 = 1;
 
+/// How many skipped Services `Built::skipped` names.
+pub const MAX_SKIPPED_NAMES: usize = 16;
+
 /// `MIMIC_MESH_MAX_*` (spec §10.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
@@ -154,6 +157,8 @@ pub struct Built {
     pub etag: String,
     /// Services left out because of a bound.
     pub truncated: usize,
+    /// Keys of the first Services left out (at most `MAX_SKIPPED_NAMES`), in order.
+    pub skipped: Vec<String>,
 }
 
 /// What the Services and slices of a snapshot are looked up by.
@@ -284,6 +289,7 @@ pub fn build(
             view,
             json,
             truncated: 0,
+            skipped: Vec::new(),
         };
     }
     let lookup = Lookup::new(snapshot);
@@ -311,42 +317,51 @@ pub fn build(
 
     let empty = view.to_json().len();
     let (mut bytes, mut endpoints) = (empty, 0);
-    for (taken, service) in candidates.iter().enumerate() {
-        let policy = effective(winners.get(TargetKind::Service, &service.namespace, &service.name));
-        let mut sv = service_view(&lookup, service, policy);
+    let mut skipped = Vec::new();
+    let mut truncated = 0;
+    for service in &candidates {
         let key = service_key(&service.namespace, &service.name);
-        if let Some(c) = winners.get(TargetKind::Service, &service.namespace, &service.name) {
-            sv.generations.insert(
-                format!("mimicconfig/{}/{}", c.namespace, c.name),
-                c.generation,
-            );
+        // Once `max_services` is reached nothing else fits: no need to build the rest.
+        let fitted = if view.services.len() >= limits.max_services {
+            None
+        } else {
+            let policy =
+                effective(winners.get(TargetKind::Service, &service.namespace, &service.name));
+            let mut sv = service_view(&lookup, service, policy);
+            if let Some(c) = winners.get(TargetKind::Service, &service.namespace, &service.name) {
+                sv.generations.insert(
+                    format!("mimicconfig/{}/{}", c.namespace, c.name),
+                    c.generation,
+                );
+            }
+            let entry = serde_json::to_string(&key).unwrap_or_default().len()
+                + 1
+                + serde_json::to_string(&sv).unwrap_or_default().len()
+                + usize::from(!view.services.is_empty());
+            let count = sv.endpoint_count();
+            (endpoints + count <= limits.max_endpoints && bytes + entry <= limits.max_view_bytes)
+                .then_some((sv, entry, count))
+        };
+        match fitted {
+            Some((sv, entry, count)) => {
+                bytes += entry;
+                endpoints += count;
+                view.services.insert(key, sv);
+            }
+            None => {
+                truncated += 1;
+                if skipped.len() < MAX_SKIPPED_NAMES {
+                    skipped.push(key);
+                }
+            }
         }
-        let entry = serde_json::to_string(&key).unwrap_or_default().len()
-            + 1
-            + serde_json::to_string(&sv).unwrap_or_default().len()
-            + usize::from(taken > 0);
-        let count = sv.endpoint_count();
-        if taken >= limits.max_services
-            || endpoints + count > limits.max_endpoints
-            || bytes + entry > limits.max_view_bytes
-        {
-            let json = view.to_json();
-            return Built {
-                etag: etag(&json),
-                view,
-                json,
-                truncated: candidates.len() - taken,
-            };
-        }
-        bytes += entry;
-        endpoints += count;
-        view.services.insert(key, sv);
     }
     let json = view.to_json();
     Built {
         etag: etag(&json),
         view,
         json,
-        truncated: 0,
+        truncated,
+        skipped,
     }
 }

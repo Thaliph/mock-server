@@ -462,3 +462,63 @@ fn msh_11_the_view_never_exceeds_the_byte_limit() {
 fn msh_11_below_the_bounds_nothing_is_truncated() {
     assert_eq!(view_of(&many(20, 5), "shop", "s00").truncated, 0);
 }
+
+/// `many` with the endpoints of `big` multiplied.
+fn with_big(n: usize, big: usize, big_endpoints: usize) -> Snapshot {
+    let mut s = many(n, 1);
+    let name = format!("s{big:02}");
+    let eps = (0..big_endpoints)
+        .map(|e| ep(&format!("10.250.0.{}", e + 1), true))
+        .collect();
+    s.slices.retain(|sl| sl.service != name);
+    s.slices
+        .push(slice("shop", &format!("{name}-1"), &name, 1, 8080, eps));
+    s
+}
+
+#[test]
+fn msh_11_a_large_service_is_skipped_and_the_small_ones_after_it_still_fit() {
+    let s = with_big(5, 1, 50); // s01 alone has 50 endpoints
+    let limits = Limits {
+        max_endpoints: 8,
+        ..Limits::default()
+    };
+    let b = build(&s, "shop", "s00", Mode::None, &limits);
+    assert_eq!(keys(&b), ["shop/s00", "shop/s02", "shop/s03", "shop/s04"]);
+    assert_eq!(b.truncated, 1);
+    assert_eq!(b.skipped, ["shop/s01"]);
+    assert!(b.view.endpoint_count() <= 8);
+}
+
+#[test]
+fn msh_11_a_service_over_the_byte_budget_is_skipped_and_the_etag_is_stable() {
+    let s = with_big(5, 2, 40);
+    let small = view_of(&many(5, 1), "shop", "s00");
+    let limits = Limits {
+        max_view_bytes: small.json.len() + 100,
+        ..Limits::default()
+    };
+    let b = build(&s, "shop", "s00", Mode::None, &limits);
+    assert!(!keys(&b).contains(&"shop/s02"));
+    assert!(keys(&b).contains(&"shop/s03"));
+    assert_eq!(b.skipped, ["shop/s02"]);
+    assert!(b.json.len() <= limits.max_view_bytes);
+    let again = build(&s, "shop", "s00", Mode::None, &limits);
+    assert_eq!((&b.json, &b.etag), (&again.json, &again.etag));
+}
+
+#[test]
+fn msh_11_the_skipped_names_are_bounded_and_the_count_is_not() {
+    let s = many(40, 1);
+    let limits = Limits {
+        max_services: 2,
+        ..Limits::default()
+    };
+    let b = build(&s, "shop", "s00", Mode::None, &limits);
+    assert_eq!(b.truncated, 38);
+    assert_eq!(b.skipped.len(), 16);
+    assert_eq!(
+        (b.skipped[0].as_str(), b.skipped[15].as_str()),
+        ("shop/s02", "shop/s17")
+    );
+}

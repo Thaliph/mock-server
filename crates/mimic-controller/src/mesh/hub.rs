@@ -511,6 +511,7 @@ impl Hub {
                 namespace,
                 deployment,
                 left_out = built.truncated,
+                skipped = built.skipped.join(","),
                 "mesh view truncated"
             );
         }
