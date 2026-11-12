@@ -918,9 +918,26 @@ async fn read_watch(upstream: Option<&mut Stream>, into: &mut [u8]) -> io::Resul
     }
 }
 
-/// How long a destination that wrote first waits for the client's first bytes before the
-/// connection is a server-first tunnel.
-const SERVER_FIRST_GRACE: Duration = Duration::from_millis(50);
+/// Whether `bytes`, the start of what a destination wrote first, can be the header of the
+/// initial SETTINGS frame of an HTTP/2 server: a length that is a multiple of 6 up to 16384,
+/// type 4, no flag, stream 0.
+fn could_be_h2_settings(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let fits = |i: usize, ok: &dyn Fn(u8) -> bool| bytes.get(i).is_none_or(|b| ok(*b));
+    let length_ok = if bytes.len() >= 3 {
+        let length =
+            usize::from(bytes[0]) << 16 | usize::from(bytes[1]) << 8 | usize::from(bytes[2]);
+        length <= 16384 && length % 6 == 0
+    } else {
+        fits(0, &|b| b == 0) && fits(1, &|b| b <= 0x40)
+    };
+    length_ok
+        && fits(3, &|b| b == 4)
+        && fits(4, &|b| b == 0)
+        && (5..9).all(|i| fits(i, &|b| b == 0))
+}
 
 /// Reads until the protocol is known, within [`DETECT_LIMIT`] and with no timeout but the
 /// stall of an incomplete prefix. The bytes
@@ -977,13 +994,27 @@ async fn first_bytes(
                     return First::Opaque { to_upstream: buf, to_client: Vec::new(), early };
                 }
             },
-            // The destination wrote first. It is a server-first protocol unless the client's
-            // first bytes follow within the grace (spec §4.1): an HTTP/2 server's SETTINGS
-            // do not make an opaque tunnel of a gRPC connection.
+            // The destination wrote first: a server-first protocol, tunnelled at once, unless it
+            // wrote the SETTINGS frame of an HTTP/2 server (spec §4.1), which comes before the
+            // client's preface: then the client's first bytes are waited for, as without mimic.
             _ = upstream.readable() => {
                 if !graced {
                     graced = true;
-                    if tokio::time::timeout(SERVER_FIRST_GRACE, client.readable()).await.is_ok() {
+                    let mut head = [0u8; 9];
+                    // A reset is an answer of its own: it reaches the client as one.
+                    let peeked = match upstream.peek(&mut head).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return First::Opaque {
+                                to_upstream: buf,
+                                to_client: Vec::new(),
+                                early: Some(Early::Failed(Side::Upstream, e)),
+                            };
+                        }
+                    };
+                    if could_be_h2_settings(&head[..peeked])
+                        && tokio::time::timeout(stall, client.readable()).await.is_ok()
+                    {
                         continue;
                     }
                 }
@@ -998,6 +1029,39 @@ async fn first_bytes(
                     early,
                 };
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::could_be_h2_settings;
+
+    #[test]
+    fn grp_37_only_the_header_of_a_settings_frame_is_one() {
+        for ok in [
+            &[0, 0, 0, 4, 0, 0, 0, 0, 0][..],
+            &[0, 0, 6, 4, 0, 0, 0, 0, 0],
+            &[0, 0, 18, 4, 0, 0, 0, 0, 0],
+            &[0, 0, 18, 4, 0, 0, 0, 0, 0, 0, 3],
+            &[0],
+            &[0, 0, 6, 4],
+        ] {
+            assert!(could_be_h2_settings(ok), "{ok:?}");
+        }
+        for bad in [
+            &[][..],
+            &[0, 0, 0, 1, 0, 0, 0, 0, 0],
+            &[0, 0, 0, 4, 1, 0, 0, 0, 0],
+            &[0, 0, 0, 4, 0, 0, 0, 0, 1],
+            &[0, 0, 7, 4, 0, 0, 0, 0, 0],
+            &[0, 0x40, 6, 4, 0, 0, 0, 0, 0],
+            &[1, 0, 0, 4, 0, 0, 0, 0, 0],
+            b"220 hello\r\n",
+            b"SSH-2.0-x\r\n",
+            &[0x4a, 0, 0, 0, 0],
+        ] {
+            assert!(!could_be_h2_settings(bad), "{bad:?}");
         }
     }
 }

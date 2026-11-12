@@ -264,3 +264,42 @@ async fn grp_37_a_server_that_speaks_first_with_h2_settings_is_still_h2_and_reco
     .await;
     assert_eq!(discovery.report().version(), 3);
 }
+
+#[tokio::test]
+async fn grp_37_a_server_first_banner_is_tunnelled_with_no_added_wait() {
+    let _logs = capture_logs();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let app = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut s, b"220 hello\r\n").await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+        }
+    });
+    let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
+    let f = fixture_discovery(Direction::Inbound, &discovery, move |_| Some(app)).await;
+    // The first connection warms the runtime; the second is timed.
+    for timed in [false, true] {
+        let mut tcp = TcpStream::connect(f.addr).await.unwrap();
+        let started = std::time::Instant::now();
+        let mut banner = [0u8; 11];
+        tokio::time::timeout(
+            TIMEOUT,
+            tokio::io::AsyncReadExt::read_exact(&mut tcp, &mut banner),
+        )
+        .await
+        .expect("the banner arrives")
+        .unwrap();
+        assert_eq!(&banner, b"220 hello\r\n");
+        if timed {
+            assert!(
+                started.elapsed() < Duration::from_millis(20),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+    }
+}
