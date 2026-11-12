@@ -132,3 +132,5 @@ also moves the HTTP/1.1 observation (access line, metrics, recording) after the 
 | 2026-11-12 | discovery | h2c | 50 | 49.98 | 9.62 | 11.37 | 15.16 | 20.88 | 0 | 0.064 | 0.061 | 14.3 | 14.2 |
 | 2026-11-12 | discovery | h2c | 100 | 99.96 | 9.67 | 11.28 | 14.36 | 19 | 0 | 0.127 | 0.122 | 14.5 | 14.6 |
 | 2026-11-12 | discovery | h2c | 200 | 199.92 | 9.7 | 11.08 | 13.89 | 24.09 | 0 | 0.252 | 0.245 | 14.6 | 14.7 |
+
+Other measurements: [mesh view build, M1](2026-11-12-m1-mesh-view.md).

@@ -200,6 +200,13 @@ class Fnd10Classification(unittest.TestCase):
             self.assertTrue(r["gate_fuzz_discovery"], path)
             self.assertFalse(r["gate_fuzz_http1"], path)
 
+    def test_msh_13_mesh_view_path_runs_the_discovery_fuzz_job_only(self):
+        for path in ("crates/mimic-core/src/mesh/view.rs", "crates/mimic-core/src/mesh.rs"):
+            r = run([path])
+            self.assertTrue(r["gate_fuzz_discovery"], path)
+            self.assertFalse(r["gate_fuzz_http1"], path)
+        self.assertFalse(run(["crates/mimic-core/src/mesh_extra.rs"])["gate_fuzz_discovery"])
+
     def test_fnd_10_proxy_rs_is_the_codec_fuzz_path_but_not_a_directory_prefix(self):
         self.assertTrue(run(["crates/mimic-core/src/proxy.rs"])["gate_fuzz_http1"])
         self.assertFalse(run(["crates/mimic-core/src/proxy_extra.rs"])["gate_fuzz_http1"])

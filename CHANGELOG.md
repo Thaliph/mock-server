@@ -21,6 +21,11 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- `MimicConfig` CRD and the pure mesh view (#440, M1): the chart installs `mimicconfigs.mimic.platform.io` (kept on
+  uninstall; no controller acts on it yet) and `mimic-core` gains `mesh::policy` and `mesh::view`, the scoped
+  view of a deployment with the consent rule for destinations of other namespaces (a `ReferenceGrant` from
+  `MimicConfig` to `Service` in the destination's namespace). Nothing changes at run time before the controller
+  and sidecar use them (#441, #442).
 - Mode `none` (#439): `spec.mode` accepts `none`, `discovery` and `mock` and defaults to `none` for new objects. The
   effective mode of a Deployment is `mock` over `discovery` over `none`. A sidecar in `none` records nothing,
   intercepts no TLS (`interception: mode_none`) and ships nothing, still pulls its mode and follows a switch without

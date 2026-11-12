@@ -1015,6 +1015,21 @@ the recorder keeps the first message of each side:
   `status.mode` from every read and from the next write of each object (a re-upgrade before a
   write gets them back from etcd), and the F9 controller sends no mode, so F10 sidecars keep
   their mode (§7.7) while pods recreated with the F9 image never mock (§11.1).
+- From M1, `MimicConfig` (namespaced CRD, `mimic.platform.io/v1alpha1`, status subresource, a chart
+  template kept on uninstall like the others; design §6). `spec.targetRefs` (1 to 16 of
+  `{group, kind, name}`, `apps/Deployment` or `core/Service` (`group: ""`), in the namespace of the
+  object: a `namespace` key is rejected by the CRD) attach it. Fields that fit a `Deployment` target
+  only: `destinations` (at most 256 `{namespace, name}` Services, §7.9) and `mesh.enabled` (default
+  `true`; `false` turns the mesh off for that workload, design §3.4); a Service target only:
+  `loadBalancer.slowStart` (`<n>s`, 0 to 3600 s, bounded by CEL, default 30 s, `0s` disables). A field that fits no
+  target kind of the object is rejected by CEL. Retries, breaker, faults and admission are added by
+  later milestones. `status.conditions`: `Accepted` (False: `Conflicted`, `TargetNotFound`,
+  `Invalid`) and `ResolvedRefs` (False: `RefNotPermitted`). **Precedence** (pure, `mimic-core`
+  `mesh::policy`): for each target object, the valid `MimicConfig`s that target it are ordered by
+  `creationTimestamp`, then by name; the first wins as a whole, the others are `Conflicted` (a config
+  with several targets can win one and lose another; it applies where it wins). An invalid object
+  takes no part in the precedence. `Accepted` reads `Invalid` before `TargetNotFound` before
+  `Conflicted`. Defaults without any `MimicConfig`: slow start 30 s, `mesh.enabled: true`.
 - From F11, `MimicLoadTest` (namespaced CRD, same group and version, only when the chart's
   `loadTest.enabled` is true): one load test of `spec.deployment` in its namespace, run by a
   `mimic-load` Job while the deployment is in mock, results in its `status` (§7.8).
@@ -2263,6 +2278,51 @@ no `MimicLoadTest` and creates no Job).
   `GET /v1/workloads/<ns>/<dep>/loadtests` and `…/loadtests/<uid>`, the stored summaries) and the deployment page shows them. Scripted multi-step scenarios, gRPC and
   inbound TLS load, and load across clusters are v2. Mesh traffic management is v2.
 
+### 7.9 The mesh view (M1)
+
+The **view** of a deployment `d` of namespace `n` (design §4.2) is a pure function of plain input
+structs (`mimic-core` `mesh::view`; the controller turns the watched objects into them, #441): the
+Services, EndpointSlices, `MimicConfig`s, `ReferenceGrant`s of the cluster, the existing
+Deployments, the effective mode (§7) and the cluster name. It holds, as canonical JSON (sorted keys,
+no insignificant whitespace):
+
+```json
+{"cluster":"local","format":1,"generations":{"mimicconfig/shop/cart":3},"mesh":true,"mode":"none",
+ "services":{"shop/cart":{"endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},
+  "generations":{"endpointslice/shop/cart-x7k2p":41},"ips":["10.96.12.7"],
+  "policy":{"loadBalancer":{"slowStartSeconds":30}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}
+```
+
+- **Scope**: every Service of `n`, and the Services declared in `spec.destinations` of the winning
+  `MimicConfig` of `d` (§7), when they exist and are in `n` or their namespace consents: a
+  `ReferenceGrant` of that namespace with `from: {group: mimic.platform.io, kind: MimicConfig,
+  namespace: <n>}` and `to: {group: "", kind: Service}` whose `name` is absent, empty or the
+  Service's. Without it, or when the `ReferenceGrant` CRD is not installed, the destination is left
+  out and the config gets `ResolvedRefs: False`, reason `RefNotPermitted`, the message naming each
+  destination (`risk/scoring`); the answer is the same whether the Service exists or not. A view
+  holds nothing of a namespace that did not consent: no IP, port, zone, readiness or name.
+  HTTPRoutes join the scope with #447.
+- **Content**: per Service the ClusterIPs (none for a headless one), the ports (`name`,
+  `targetPort`), per Service port the endpoints of its EndpointSlices with the same port name:
+  the ready ones, else the serving and terminating ones with `ready: false`, sorted by address and
+  port, without duplicates, with the `zone` when there is one; the `generations` of those
+  EndpointSlices; the `policy` of the winning `MimicConfig` of the Service (§7), defaults when none.
+  `mesh: false` (the winning config of `d` says so) gives a view without Services and without
+  `generations`. The top-level `generations` hold the winning `MimicConfig` of `d`. The `generations` of a consented Service name its winning `MimicConfig` of the destination's namespace
+  (`mimicconfig/<namespace>/<name>`): decided, kept as is, because the consent already shares that
+  Service's policy and the name is not a secret. The view holds no
+  Secret, label or annotation value: the input structs have no field for them.
+- **Bounds** (`mesh::view::Limits`, defaults and ranges of `MIMIC_MESH_MAX_SERVICES`,
+  `MIMIC_MESH_MAX_ENDPOINTS` and `MIMIC_MESH_MAX_VIEW_BYTES`, §10.2): the Services of `n` come
+  first, in name order, then the declared destinations in key order; the first Service that would
+  exceed a bound ends the list, and it and the rest are left out, counted (`truncated`) for the
+  controller to report.
+- **ETag**: `"1-"` plus the SHA-256 of the canonical bytes in hex, between double quotes: two
+  replicas with the same objects serve the same bytes and ETag, whatever the order of the lists.
+- **`View::from_json`** (what a sidecar reads): refuses unknown fields at every level, a `format`
+  other than 1, an unknown mode, an address or port that does not parse, a Service key that is not
+  `<namespace>/<name>`, and a document over the bounds of the `Limits` it is given.
+
 ## 8. Mock
 
 F10. The sidecar answers the app's outbound HTTP from the egress snapshot it pulled (§7.7),
@@ -2843,6 +2903,9 @@ The restarts come from `process_start_time_seconds`, so no kube-state-metrics se
 | `MIMIC_STORE_MAX_DEPLOYMENTS` | `50` | Deployments with data per namespace (§7.3), 1–100000. |
 | `MIMIC_STATUS_INTERVAL` | `30s` | Period of the `MimicWorkload` status update (§7.4), 1s–1h. |
 | `MIMIC_STATUS_POD_WINDOW` | `5m` | A pod counts in `status.discovery.pods` while its last push is this recent, 1s–24h. |
+| `MIMIC_MESH_MAX_SERVICES` | `1024` | (M1) Services in one mesh view (§7.9), 1–100000; the rest is left out. Read by the controller from #441; `mesh::view` enforces it. |
+| `MIMIC_MESH_MAX_ENDPOINTS` | `10000` | (M1) Endpoints in one mesh view, 1–1000000. |
+| `MIMIC_MESH_MAX_VIEW_BYTES` | `4Mi` | (M1) Largest serialised mesh view (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–256Mi). |
 | `MIMIC_LOAD_MAX_RUNS` | `0` | (F11) Load test runs active at once in the cluster (§7.8), 0–100; `0` disables load tests. The chart sets `4` when `loadTest.enabled`. |
 | `MIMIC_LOAD_MAX_NAMESPACE_RUNS` | `2` | (F11) Active runs per namespace, 1–100, at most `MIMIC_LOAD_MAX_RUNS` when that is not 0. |
 | `MIMIC_LOAD_MAX_PENDING` | `16` | (F11) `Pending` runs per namespace; newer ones fail `TooManyPending`, 1–1000. |
@@ -3583,6 +3646,7 @@ names contain the criterion ID (`fnd_02_…`).
 | F14 | gRPC: message framing and wire-format decoding, redaction, recording, reflection, mock (#459 and following) | (added 2026-11-12) |
 | F15 | Explorer UI: tab shell and the Workloads tab linking the mimic custom resources (#465) | (added 2026-11-12) |
 | M0 | Mode `none` (proxy only, nothing recorded), the new default (#439, design `docs/design/mimic-mesh.md` §2) | (added 2026-11-12) |
+| M1 | `MimicConfig` CRD and the pure mesh view (#440, design `docs/design/mimic-mesh.md` §4.2, §6, §16) | (added 2026-11-12) |
 
 ### 12.1 F0 — Foundations
 
@@ -4222,6 +4286,32 @@ is M1; here `none` only stops recording, intercepting and shipping.
 | NON-09 | **D** (review). Spec §3 states that `none` means "proxy only, nothing recorded", not "no mesh", and names the kill switches (`mesh.enabled`, `MimicConfig.spec.mesh.enabled`, design §3.4); `CHANGELOG.md` has an upgrade note under *Unreleased*: label-injected deployments without a `MimicWorkload` stop recording, existing `MimicWorkload`s keep the `discovery` persisted at their creation, how to get the old behaviour back (a `MimicWorkload` with `spec.mode: discovery`); `docs/wiki/Concepts.md`, `Quick-start.md`, `Configuration.md`, `Mock-mode.md` and `FAQ.md` describe `none`, the new default and its switch. |
 | NON-10 | **M** (main session, `scripts/bench.sh`). The setup `none` meets the M0 budget of design §14, results committed under `docs/bench/`. |
 | NON-11 | **D** (security review). In `none` no plaintext of an outbound TLS stream is read, no capture buffer is allocated, and no report, sample or egress recording is built or sent; the `none` series adds no label with a request value. |
+
+### 12.21 M1 — `MimicConfig` and the mesh view (#440)
+
+Design: `docs/design/mimic-mesh.md` §3.4, §4.2, §4.3, §6, §16. Spec text: §7 (`MimicConfig`),
+§7.9 (the view), §10.2. Levels as in §12.2, plus **M** (main session). The watches, the sidecar API
+and the sidecar's use of the view are #441 and #442.
+
+| ID | Criterion |
+|---|---|
+| MSH-01 | **U** (`mimic-core` `mesh::view`). The view of `(n, d)` holds every Service of `n` and no Service of another namespace; a Service has its ClusterIPs (none for a headless one), its ports, and per Service port the endpoints of the EndpointSlices of that Service with the same port name, with the target port number, `zone` when present; ready ones only, sorted by address and port, without duplicates; when none is ready the serving and terminating ones with `ready: false`; an endpoint whose address does not parse is dropped. |
+| MSH-02 | **U.** Destinations: a destination declared by the winning `MimicConfig` of `d` is in the view when it is in `n` (once) or consented; one declared by a config that lost, by a config targeting another deployment (also one of the same name in another namespace), by an invalid one, or naming a Service that does not exist, adds nothing. |
+| MSH-03 | **U** (consent, review B2 of #469). A cross-namespace destination is in the view and the config is `ResolvedRefs: True` only with a `ReferenceGrant` in the destination's namespace with `from` (`mimic.platform.io`, `MimicConfig`, the source namespace) and `to` (`""`, `Service`, name absent, empty or equal). Each of these leaves it out and gives `ResolvedRefs: False`, `RefNotPermitted`, the message naming `<namespace>/<name>`: `from` namespace wrong, `from` kind wrong, `from` group wrong, `to` kind wrong, `to` group wrong, `to` name of another Service, the grant in a third namespace or in the source namespace, no grant at all, the `ReferenceGrant` CRD absent. With the grant the destination is present; without it again, it is gone. The outcome is the same when the Service does not exist. |
+| MSH-04 | **U.** Isolation: the serialised view of `(n, d)`, with and without a grant for one namespace, contains no address, port, zone, name or readiness of a namespace that has no grant for `n`; a `MimicConfig` of another namespace never changes the view of `(n, d)`, whatever its name or targets. |
+| MSH-05 | **U.** `mesh`: `true` without a config or with `mesh.enabled` unset; `false` when the winning config of `d` sets `false` (a losing one does not), and then the view has no Service and no `generations`; the `mode` and `cluster` given are in the view. |
+| MSH-06 | **U.** `generations`: each Service lists `endpointslice/<ns>/<name>` of the slices it was built from; the view lists `mimicconfig/<ns>/<name>` of the winning config of `d` and each Service entry that of its winning config; a change of a generation changes the ETag; a slice of another Service or namespace is not listed. |
+| MSH-07 | **U** (`mesh::policy`). `loadBalancer.slowStart` of the winning `MimicConfig` targeting a Service is in the view as `policy.loadBalancer.slowStartSeconds`, also for a consented Service of another namespace (its own namespace's config); the default is 30; `0s` is 0. |
+| MSH-08 | **U** (`mesh::policy`). Precedence: among valid configs on one target the oldest `creationTimestamp` wins, ties by name; the others are `Accepted: False`, `Conflicted`; a config can win one target and lose another; an invalid one takes no part. `Invalid`: no target, over 16 targets, over 256 destinations, a destination without namespace or name, `destinations` or `mesh` without a Deployment target, `loadBalancer` without a Service target, `slowStart` over 3600 s. `TargetNotFound` names the missing target (a Deployment not in the input, a Service not in the input). Reason order `Invalid`, `TargetNotFound`, `Conflicted`; else `Accepted: True`. A target is always in the namespace of its config. |
+| MSH-09 | **U** (`proptest`). Any permutation of the Services, EndpointSlices (and the endpoints and ports in them), `MimicConfig`s, `ReferenceGrant`s and Deployments gives byte-identical view JSON, the same ETag and the same statuses. |
+| MSH-10 | **U.** The JSON is canonical: `format` is 1, keys are sorted, there is no whitespace; the ETag is `"1-<sha256 hex>"` of the bytes; any change of content, mode or cluster changes it; the same input gives the same bytes in two calls. |
+| MSH-11 | **U.** Bounds: with the limits of `Limits`, a view never has more Services, endpoints or bytes than allowed (a byte limit below the size of the view without Services leaves none); the Services of `n` come first in name order, then destinations in key order; the first that does not fit ends the list and `truncated` counts it and the rest; below the bounds `truncated` is 0; the result is the same for any order of the input. |
+| MSH-12 | **U.** `View::from_json` reads back what `build` wrote (equal `View`, same bytes on re-serialising); it refuses: an unknown field at the top level, in a Service, a port, an endpoint, the policy and the generations; `format` 0 or 2; an unknown mode; a bad address, port or key; a missing field; trailing bytes; a document over `max_view_bytes`, or with more Services or endpoints than the limits; every error message is at most 200 bytes, whatever the input. |
+| MSH-13 | **F** (fuzz target `mesh`, in the discovery fuzz job). `View::from_json` on arbitrary bytes never panics; a document it accepts holds the bounds, re-serialises, and reads back equal; its ETag is stable. The job runs 60 s on a pull request touching `mimic-core` `mesh`; `scripts/ci_plan.py` gates it on those paths. |
+| MSH-14 | **B** (criterion micro-benchmark `mesh_view`, results in `docs/bench/`). Building the view of 1000 Services with 10 000 endpoints in all is measured, with the machine's load noted; no budget is set yet. |
+| MSH-15 | **E** (chart, `scripts/check-chart.sh`). The chart renders the CRD `mimicconfigs.mimic.platform.io` with `helm.sh/resource-policy: keep`, a `status` subresource, version `v1alpha1`, `targetRefs` 1 to 16, `destinations` at most 256, `mesh.enabled` default `true`, `loadBalancer.slowStart`, and CEL rules that reject a `namespace` in a `targetRef`, `destinations` or `mesh` without a Deployment target, and `loadBalancer` without a Service target; `helm lint --strict` passes; the default render is the golden file. |
+| MSH-16 | **D** (security review). No view holds another namespace's data without its `ReferenceGrant` (MSH-03, MSH-04); the input structs have no field for a Secret, label or annotation value; CEL forbids cross-namespace `targetRefs`; `from_json` is bounded and refuses unknown fields. |
+| MSH-17 | **E** (kind, `scripts/e2e.sh` section `msh_17`, objects of that section only). The API server evaluates the CEL rules and the schema of the `MimicConfig` CRD: a valid object with both target kinds, `mesh: {}` (which defaults `enabled` to `true`), 16 `targetRefs` and 256 `destinations` are accepted; refused are no, 0 and 17 `targetRefs`, a `targetRef` with a `namespace` (on a Deployment and on a Service), a kind other than `Deployment`/`Service`, a `Service` in group `apps`, a `Deployment` in the core group, a `targetRef` without a name, 257 `destinations`, `destinations` or `mesh` without a Deployment target, `loadBalancer` without a Service target, a `slowStart` that is not `<n>s` or is over 3600 s, a `targetRef` with an empty `namespace`, a destination without a name, and a non-boolean `mesh.enabled`. |
 
 ## 13. Test strategy
 
