@@ -3778,7 +3778,8 @@ etag=$(msh_etag "$WORK/msh.json")
 ready_endpoints() { kubectl -n msh-28-a get endpointslices -l kubernetes.io/service-name=web -o json | jq '[.items[].endpoints[] | select(.conditions.ready == true)] | length'; }
 rm -f "$WORK/msh-ready.at"
 # When the API server shows both endpoints ready, in the background while the script long-polls.
-( for _ in $(seq 300); do [[ $(ready_endpoints) == 2 ]] && { date +%s.%N > "$WORK/msh-ready.at"; exit 0; }; sleep 0.2; done ) &
+# The time is taken before the API call, so the 0.2 s sleep of the loop is not counted as lag.
+( for _ in $(seq 300); do t=$(date +%s.%N); [[ $(ready_endpoints) == 2 ]] && { echo "$t" > "$WORK/msh-ready.at"; exit 0; }; sleep 0.2; done ) &
 ready_pid=$!
 PIDS+=("$ready_pid")
 kubectl -n msh-28-a scale deploy/web --replicas=2 >/dev/null
@@ -3802,8 +3803,8 @@ wait "$ready_pid" || true
 [[ -s $WORK/msh-ready.at ]] || fail "msh_28: the scaled deployment never had two ready endpoints"
 ready_at=$(<"$WORK/msh-ready.at")
 late=$(awk -v e="$scaled_at" -v r="$ready_at" 'BEGIN { printf "%.2f", e - r }')
-awk -v late="$late" 'BEGIN { exit !(late <= 2.6) }' \
-  || fail "msh_28: the view with both endpoints was served ${late}s after the second endpoint became ready"
+awk -v late="$late" 'BEGIN { exit !(late >= -1.0 && late <= 2.6) }' \
+  || fail "msh_28: the view with both endpoints was served ${late}s (expected -1.0 to 2.6) after the second endpoint became ready"
 kubectl delete namespace msh-28-a msh-28-b --wait=false >/dev/null
 [[ -z ${MSH_28_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
 MSH_28_CLEANUP=
