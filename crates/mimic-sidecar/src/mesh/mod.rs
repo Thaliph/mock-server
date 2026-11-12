@@ -51,6 +51,9 @@ const MIB: usize = 1024 * KIB;
 /// A held request lasts as long as the controller's `MIMIC_MESH_WATCH_TIMEOUT` (at most 10 m).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(11 * 60);
 
+/// The ports of server-first or never-HTTP protocols (spec §7.9).
+pub const DEFAULT_OPAQUE_PORTS: [u16; 10] = [25, 587, 3306, 4444, 5432, 6379, 9300, 11211, 22, 21];
+
 /// Where the view comes from, and how it ages.
 #[derive(Debug, Clone)]
 pub struct MeshConfig {
@@ -72,6 +75,8 @@ pub struct MeshConfig {
     pub pool_idle_timeout: Duration,
     /// `MIMIC_METRICS_MAX_ENDPOINTS`.
     pub max_endpoint_labels: usize,
+    /// `MIMIC_MESH_OPAQUE_PORTS`: in-scope connections to these ports keep the byte relay.
+    pub opaque_ports: std::collections::BTreeSet<u16>,
     /// A fixed seed for the random draws (tests); `None`: seeded from the system.
     pub seed: Option<u64>,
 }
@@ -88,6 +93,7 @@ impl Default for MeshConfig {
             timeout: REQUEST_TIMEOUT,
             pool_idle_timeout: Duration::from_secs(90),
             max_endpoint_labels: 256,
+            opaque_ports: DEFAULT_OPAQUE_PORTS.into_iter().collect(),
             seed: None,
         }
     }

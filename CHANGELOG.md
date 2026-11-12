@@ -57,7 +57,7 @@ All notable changes to mimic are documented in this file. The format follows
   `mimic_mesh_endpoint_in_flight` (pods capped by `MIMIC_METRICS_MAX_ENDPOINTS`, evicted 5 minutes after they leave
   the view). Everything else, and every connection with the mesh switched off (`MIMIC_MESH=off`, `"mesh": false`), keeps
   the byte relay. A mesh-routed HTTP/1 connection has the accepted limits of spec §4.1 (header order across names,
-  chunk extensions, hop-by-hop fields consumed, a rejected request answered `400`, a later `Upgrade` answered `501`).
+  chunk extensions, hop-by-hop fields consumed, a rejected request answered `400`). Ports 25, 587, 3306, 4444, 5432, 6379, 9300, 11211, 22 and 21 are opaque (byte relay, no detection wait; `MIMIC_MESH_OPAQUE_PORTS`).
 
 - The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).

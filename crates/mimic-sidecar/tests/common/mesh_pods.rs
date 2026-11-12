@@ -328,3 +328,19 @@ pub async fn h2c_calls(addr: SocketAddr, requests: usize, parallel: usize) -> Ve
     }
     out
 }
+
+impl H1Client {
+    /// Reads `n` raw bytes (a tunnel's), after what the head reader already holds.
+    pub async fn read_raw(&mut self, n: usize) -> Vec<u8> {
+        while self.pending.len() < n {
+            let mut buf = vec![0u8; 4096];
+            let read = tokio::time::timeout(Duration::from_secs(10), self.stream.read(&mut buf))
+                .await
+                .expect("bytes in time")
+                .unwrap();
+            assert!(read > 0, "the connection ended");
+            self.pending.extend_from_slice(&buf[..read]);
+        }
+        self.pending.drain(..n).collect()
+    }
+}

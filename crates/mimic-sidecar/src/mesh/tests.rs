@@ -270,3 +270,29 @@ fn msh_53_the_first_head_says_whether_the_connection_stays_on_the_byte_relay() {
         Head::Routed
     );
 }
+
+#[test]
+fn msh_57_opaque_ports_default_and_override() {
+    let ports = |c: MeshConfig| c.opaque_ports.into_iter().collect::<Vec<u16>>();
+    assert_eq!(
+        ports(config(&[]).unwrap()),
+        vec![21, 22, 25, 587, 3306, 4444, 5432, 6379, 9300, 11211]
+    );
+    assert_eq!(
+        ports(config(&[("MIMIC_MESH_OPAQUE_PORTS", " 8080 , 9 ,8080")]).unwrap()),
+        vec![9, 8080]
+    );
+    assert!(ports(config(&[("MIMIC_MESH_OPAQUE_PORTS", "")]).unwrap()).is_empty());
+}
+
+#[test]
+fn msh_57_invalid_opaque_ports_are_refused() {
+    let many = (1..=257)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    for value in ["0", "65536", "http", "80,,81", "80,", "-1", many.as_str()] {
+        let error = config(&[("MIMIC_MESH_OPAQUE_PORTS", value)]).expect_err(value);
+        assert!(error.contains("MIMIC_MESH_OPAQUE_PORTS"), "{error}");
+    }
+}

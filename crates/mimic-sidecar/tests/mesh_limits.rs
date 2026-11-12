@@ -254,28 +254,6 @@ async fn msh_53_a_first_upgrade_or_connect_request_keeps_the_byte_relay() {
 }
 
 #[tokio::test]
-async fn msh_53_a_later_upgrade_request_on_a_mesh_routed_connection_is_answered_501() {
-    let _logs = capture_logs();
-    let pod = RawPod::start(echo_path).await;
-    let state = state_for(cluster_ip(), &[pod.addr]);
-    let f = fixture_mesh(cluster_ip(), &state, None).await;
-    let mut client = H1Client::connect(f.addr).await;
-    client.get("/one").await;
-    client.get("/two").await;
-    client
-        .send(b"GET /ws HTTP/1.1\r\nHost: cart.shop.svc\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-        .await;
-    let (head, _) = client.read().await.expect("an answer");
-    assert!(head.starts_with("HTTP/1.1 501"), "{head}");
-    assert!(
-        lower(head.as_bytes()).contains("x-mimic-error: unsupported"),
-        "{head}"
-    );
-    assert!(client.read().await.is_none(), "the connection closes");
-    assert_eq!(pod.counts.requests.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
 async fn msh_53_content_length_with_chunked_is_forwarded_chunked_only() {
     let _logs = capture_logs();
     let pod = RawPod::start(echo_path).await;
