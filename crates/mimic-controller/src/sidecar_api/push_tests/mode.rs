@@ -151,6 +151,25 @@ async fn non_06_a_deployment_without_a_workload_is_none_and_follows_its_workload
 }
 
 #[tokio::test]
+async fn non_06_a_pod_in_none_leaves_nothing_in_valkey_but_its_pulls_field() {
+    let s = setup(Options::default());
+    let first = pull(&s, "pay", None).await;
+    assert_eq!(first.status, 200, "{}", first.text());
+    assert_eq!(modes(&first), (Some("none"), None));
+    let found = pulls_when(&s, "pay", |p| !p.is_empty()).await;
+    assert!(found.values().all(|field| field.starts_with("none ")));
+    // No `:pods`, report or egress key: the only key of the deployment is `:pulls`.
+    let pattern = format!("mimic:v1:{{{}/pay}}*", s.ns);
+    let mut keys: Vec<String> = redis::cmd("KEYS")
+        .arg(pattern)
+        .query_async(&mut conn().await)
+        .await
+        .unwrap();
+    keys.sort();
+    assert_eq!(keys, [format!("mimic:v1:{{{}/pay}}:pulls", s.ns)]);
+}
+
+#[tokio::test]
 async fn mck_08_refusals_carry_no_mode_header() {
     let s = setup(Options::default());
     workload(&s, &s.ns, "pay-workload", true, 100);

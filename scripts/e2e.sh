@@ -3256,7 +3256,17 @@ for p in $non08_pods; do
   non08_mode "$p" none || fail "non_08: the sidecar of $p does not show mimic_mode{mode=\"none\"} 1"
   [[ $(non08_exchanges "$p") == 0 ]] || fail "non_08: the sidecar of $p recorded exchanges in none"
 done
+# non08_keys: the Valkey keys of users in non-08 (the keys of its pods, report and egress, and its pulls).
+non08_keys() {
+  kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw --scan --pattern 'mimic:v1:{non-08/users}*' | sort
+}
 non08_restarts() { kubectl -n non-08 get pods -l app=users -o jsonpath='{range .items[*]}{.metadata.name}{"="}{range .status.initContainerStatuses[*]}{.restartCount}{","}{end}{"\n"}{end}'; }
+# In none the controller holds no discovery data: no report (404 on the read API) and no key but the pulls of the pods.
+ui_forward
+[[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 localhost:18082/v1/workloads/non-08/users/report) == 404 ]] \
+  || fail "non_08: the controller holds a report for a deployment in none"
+non08_other=$(non08_keys | grep -v ':pulls$' || true)
+[[ -z $non08_other ]] || fail "non_08: Valkey holds keys for a deployment in none besides its pulls: $non08_other"
 non08_before=$(non08_restarts)
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
@@ -3286,6 +3296,16 @@ for _ in $(seq 20); do
 done
 (( non08_total >= 20 )) || fail "non_08: the sidecars recorded $non08_total exchanges of the 20 calls after the switch to discovery"
 [[ $(non08_restarts) == "$non08_before" ]] || fail "non_08: a pod restarted with the switch: $non08_before then $(non08_restarts)"
+# The pods push every MIMIC_DISCOVERY_PUSH_INTERVAL: the controller then holds the report with the calls.
+ui_forward
+non08_report=$WORK/non08-report.json
+for _ in $(seq 40); do
+  curl -fs --max-time 10 localhost:18082/v1/workloads/non-08/users/report > "$non08_report" 2>/dev/null && break
+  sleep 5
+done
+jq -e . "$non08_report" >/dev/null 2>&1 || fail "non_08: the controller holds no report of users after the switch to discovery"
+found -e '/users' "$non08_report" || fail "non_08: the report of users does not hold the calls to /users"
+! found -F "$non08_canary" "$non08_report" || fail "non_08: the canary is in the report"
 kubectl -n non-08 patch mimicworkload users --type merge -p '{"spec":{"mode":"none"}}' >/dev/null
 mode_wait_non08 none 2 150 \
   || fail "non_08: status.mode did not converge to none with 2 pods: $(kubectl -n non-08 get mimicworkload users -o jsonpath='{.status.mode}')"
@@ -3298,6 +3318,8 @@ for p in $non08_pods; do non08_end=$((non08_end + $(non08_exchanges "$p"))); don
 [[ $non08_end == "$non08_after_switch" ]] || fail "non_08: the sidecars recorded $((non08_end - non08_after_switch)) exchanges after the switch back to none"
 [[ $(non08_restarts) == "$non08_before" ]] || fail "non_08: a pod restarted with the switch back to none"
 # No canary of the calls in any log of the namespace.
+kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/non08-controller.log"
+! found -F "$non08_canary" "$WORK/non08-controller.log" || fail "non_08: the canary is in the controller logs"
 for p in $non08_pods; do
   for c in app mimic-sidecar; do
     ! kubectl -n non-08 logs "$p" -c "$c" 2>/dev/null | grep -qF "$non08_canary" || fail "non_08: the canary is in the $c log of $p"

@@ -15,6 +15,9 @@ All notable changes to mimic are documented in this file. The format follows
   with no restart. `MimicWorkload`s created before this release keep the `spec.mode: discovery` the API server
   stored at their creation (defaults are persisted on write), so they keep recording. `none` means "proxy only,
   nothing recorded"; it does not mean "no mesh" (the mesh, when it arrives, has its own switches).
+  The persisted `discovery` is not a manifest default: recreating a `MimicWorkload` from a manifest without
+  `spec.mode` (a GitOps prune and resync, delete and apply, a PUT) gives `none`. Set `spec.mode: discovery`
+  explicitly in your manifests.
 
 ### Features
 
