@@ -106,7 +106,9 @@ added latency is the proxy hop itself (accept, protocol detection, HTTP re-frami
 netfilter, conntrack) and core wake-ups at a gentle rate, which no sidecar change removes. The ratio
 `hop / (hop + recording)` also worsens whenever recording gets cheaper. Design §14 now states an
 absolute M0 budget: at 200 rps over a 5 ms service, the `none` pair adds at most 1.5 ms p50 over
-HTTP/1.1 and 3.0 ms over h2c (measured above: 1.43 and 2.76 ms, met), CPU unchanged (met). #490
+HTTP/1.1 and 3.0 ms over h2c (measured above: 1.43 and 2.76 ms, met), CPU unchanged (met). These
+limits were set from this first measurement with a 5–8 % margin, not derived independently: they pin
+today's hop so that a regression shows, and they are tightened when a change cuts the hop (#493). #490
 also moves the HTTP/1.1 observation (access line, metrics, recording) after the response bytes
 (PRX-33); its kind-level gain is measured by the next run.
 
