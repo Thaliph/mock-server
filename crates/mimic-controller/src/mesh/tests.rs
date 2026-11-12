@@ -618,3 +618,37 @@ async fn msh_26_the_gzip_copy_of_a_cached_view_is_counted_in_the_cache() {
     small.compress(&entry);
     assert_eq!(small.metrics().cache_bytes.get(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn msh_26_concurrent_gzip_replacement_and_eviction_keep_the_cache_count_exact() {
+    let probe = hub(MeshConfig::default());
+    namespaces(&probe, 1, 20);
+    let one = body_of(&probe, "ns0", "a", Mode::None).await.1.len() as u64;
+    // Room for about two views with their copies, four namespaces competing.
+    let hub = hub(config_with(one * 2));
+    namespaces(&hub, 4, 20);
+    let tasks: Vec<_> = (0..4)
+        .map(|i| {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                for round in 0..150 {
+                    if i == 0 {
+                        // A new epoch: the next look replaces each key.
+                        hub.publish_now();
+                    }
+                    let ns = format!("ns{}", (i + round) % 4);
+                    if let Answer::View(entry) =
+                        hub.answer(&ns, "a", &|| Mode::None, &[], &|| {}).await
+                    {
+                        hub.compress(&entry);
+                    }
+                    assert!(hub.cache_consistent(), "the cache count drifted");
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+    assert!(hub.cache_consistent());
+}

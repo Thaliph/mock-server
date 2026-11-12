@@ -1242,7 +1242,7 @@ the recorder keeps the first message of each side:
   nor against the request timeout of the listener, so pushes and certificate requests are served
   with the watch budget full; any other answer (`200`, `503`) keeps the connection's slot, and when
   the held request is answered the connection takes a slot again before it serves another request,
-  or is closed if the cap is full. `400` for a `format` other than `1`; `404` when `MIMIC_MESH=off`
+  or is closed if the cap is full: a mass wake-up of more held requests than the cap leaves free turns into reconnects (`Connection: close`), which the sidecars retry. `400` for a `format` other than `1`; `404` when `MIMIC_MESH=off`
   (nothing is read, no `TokenReview`); `503` with `Retry-After: 1` until the watches of §7.9 are
   synced; `405` with `Allow: GET` for another method; `429` over the rate. Views are built from the
   controller's watches (`Service`, `EndpointSlice`, `MimicConfig`, `MimicWorkload`, Deployment

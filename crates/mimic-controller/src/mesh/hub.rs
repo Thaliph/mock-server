@@ -211,6 +211,23 @@ impl Drop for Watch {
     }
 }
 
+/// A view being built: leaves the map of gates when it ends, nobody else waiting.
+struct Gate<'a> {
+    hub: &'a Hub,
+    key: CacheKey,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Drop for Gate<'_> {
+    fn drop(&mut self) {
+        let mut gates = lock(&self.hub.gates);
+        // The map and this guard hold it: nobody waits.
+        if Arc::strong_count(&self.lock) == 2 {
+            gates.remove(&self.key);
+        }
+    }
+}
+
 pub struct Hub {
     config: MeshConfig,
     metrics: MeshMetrics,
@@ -220,9 +237,14 @@ pub struct Hub {
     published: watch::Sender<Arc<Published>>,
     cache: Mutex<Cache>,
     /// One lock per view being built: the others of that key wait for it, the other keys do not.
-    gates: Mutex<BTreeMap<CacheKey, Arc<Mutex<()>>>>,
+    gates: Mutex<BTreeMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
     watches: Arc<Semaphore>,
     closed: watch::Sender<bool>,
+}
+
+/// The newest publication; the guard of the channel does not live across an await.
+fn latest(changes: &mut watch::Receiver<Arc<Published>>) -> Arc<Published> {
+    changes.borrow_and_update().clone()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -402,7 +424,7 @@ impl Hub {
     }
 
     /// The view of `deployment` of `namespace`, built or cached.
-    fn view(
+    async fn view(
         &self,
         published: &Published,
         namespace: &str,
@@ -417,28 +439,30 @@ impl Hub {
         if let Some(entry) = self.cached(&key, published.epoch) {
             return entry;
         }
-        let gate = lock(&self.gates).entry(key.clone()).or_default().clone();
-        let entry = {
-            let _building = lock(&gate);
-            // Another request may have built it while this one waited.
-            match self.cached(&key, published.epoch) {
-                Some(entry) => entry,
-                None => {
-                    let entry = self.build_entry(published, namespace, deployment, mode);
-                    let mut cache = lock(&self.cache);
-                    cache.tick += 1;
-                    let tick = cache.tick;
-                    self.admit(&mut cache, key.clone(), published.epoch, tick, &entry);
-                    entry
-                }
-            }
+        let gate_lock = self.gate_of(&key);
+        let gate = Gate {
+            hub: self,
+            key: key.clone(),
+            lock: gate_lock,
         };
-        let mut gates = lock(&self.gates);
-        // The map and this request hold it: nobody else waits.
-        if Arc::strong_count(&gate) == 2 {
-            gates.remove(&key);
+        // Waits without blocking a worker; the gate leaves the map when this ends, also on a panic.
+        let _building = gate.lock.lock().await;
+        // Another request may have built it while this one waited.
+        if let Some(entry) = self.cached(&key, published.epoch) {
+            return entry;
+        }
+        let entry = self.build_entry(published, namespace, deployment, mode);
+        {
+            let mut cache = lock(&self.cache);
+            cache.tick += 1;
+            let tick = cache.tick;
+            self.admit(&mut cache, key, published.epoch, tick, &entry);
         }
         entry
+    }
+
+    fn gate_of(&self, key: &CacheKey) -> Arc<tokio::sync::Mutex<()>> {
+        lock(&self.gates).entry(key.clone()).or_default().clone()
     }
 
     fn cached(&self, key: &CacheKey, epoch: u64) -> Option<Arc<Entry>> {
@@ -501,7 +525,7 @@ impl Hub {
     /// Caches a view, least recently used out first; a view over the whole budget is not cached.
     fn admit(&self, cache: &mut Cache, key: CacheKey, epoch: u64, tick: u64, entry: &Arc<Entry>) {
         if let Some(old) = cache.slots.remove(&key) {
-            cache.bytes -= old.entry.cost();
+            cache.bytes = cache.bytes.saturating_sub(old.entry.cost());
         }
         let size = entry.cost();
         if size <= self.config.cache_bytes {
@@ -534,7 +558,7 @@ impl Hub {
                 break;
             };
             if let Some(slot) = cache.slots.remove(&oldest) {
-                cache.bytes -= slot.entry.cost();
+                cache.bytes = cache.bytes.saturating_sub(slot.entry.cost());
             }
         }
     }
@@ -544,9 +568,6 @@ impl Hub {
     pub fn compress(&self, entry: &Arc<Entry>) {
         use std::sync::atomic::Ordering::SeqCst;
         let size = entry.gzip().len() as u64;
-        if entry.charged.swap(true, SeqCst) {
-            return;
-        }
         let mut cache = lock(&self.cache);
         let Some(key) = cache
             .slots
@@ -556,17 +577,29 @@ impl Hub {
         else {
             return;
         };
+        // Under the lock, with the slot found: the flag and the bytes change together, so that no
+        // admit or eviction subtracts a copy that was not added.
+        if entry.charged.swap(true, SeqCst) {
+            return;
+        }
         self.make_room(&mut cache, size, Some(&key));
         cache.bytes += size;
         if cache.bytes > self.config.cache_bytes
             && let Some(slot) = cache.slots.remove(&key)
         {
             // Alone it is over the budget: the view is served, not kept.
-            cache.bytes -= slot.entry.cost();
+            cache.bytes = cache.bytes.saturating_sub(slot.entry.cost());
         }
         self.metrics
             .cache_bytes
             .set(i64::try_from(cache.bytes).unwrap_or(i64::MAX));
+    }
+
+    /// Tests: the cache holds exactly what its entries weigh.
+    #[cfg(test)]
+    pub fn cache_consistent(&self) -> bool {
+        let cache = lock(&self.cache);
+        cache.bytes == cache.slots.values().map(|s| s.entry.cost()).sum::<u64>()
     }
 
     /// Answers a request for the view of `deployment` of `namespace`. `held` are the values of
@@ -583,11 +616,11 @@ impl Hub {
         let mut changes = self.published.subscribe();
         // The snapshot is not kept while the request waits: a view is all it needs.
         let first = {
-            let published = changes.borrow_and_update().clone();
+            let published = latest(&mut changes);
             if published.epoch == 0 || !published.synced {
                 return Answer::NotReady;
             }
-            self.view(&published, namespace, deployment, mode())
+            self.view(&published, namespace, deployment, mode()).await
         };
         let mut entry = first;
         let current = |entry: &Entry| held.iter().any(|h| matches_etag(h, &entry.etag));
@@ -603,23 +636,19 @@ impl Hub {
         let deadline = tokio::time::Instant::now() + self.config.watch_timeout;
         let mut closed = self.closed.subscribe();
         loop {
-            tokio::select! {
-                changed = changes.changed() => {
-                    if changed.is_err() {
-                        return Answer::NotModified(entry.etag.clone());
-                    }
-                    let published = changes.borrow_and_update().clone();
-                    entry = self.view(&published, namespace, deployment, mode());
-                    if !current(&entry) {
-                        return Answer::View(entry);
-                    }
-                }
-                () = tokio::time::sleep_until(deadline) => {
-                    return Answer::NotModified(entry.etag.clone());
-                }
-                _ = closed.wait_for(|closed| *closed) => {
-                    return Answer::NotModified(entry.etag.clone());
-                }
+            // What woke it, as plain values: no guard of a channel lives across the awaits below.
+            let woken = tokio::select! {
+                changed = changes.changed() => changed.is_ok(),
+                () = tokio::time::sleep_until(deadline) => false,
+                () = async { let _ = closed.wait_for(|closed| *closed).await; } => false,
+            };
+            if !woken {
+                return Answer::NotModified(entry.etag.clone());
+            }
+            let published = latest(&mut changes);
+            entry = self.view(&published, namespace, deployment, mode()).await;
+            if !current(&entry) {
+                return Answer::View(entry);
             }
         }
     }

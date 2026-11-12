@@ -62,7 +62,8 @@ cleanup() {
   # msh_28 failed (or ended) with its namespaces and the Gateway API CRDs in the cluster: they are only its own.
   if [[ -n ${MSH_28_CLEANUP:-} ]]; then
     kubectl delete namespace msh-28-a msh-28-b --ignore-not-found --wait=false >/dev/null 2>&1 || true
-    kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    # Only the CRDs this run installed: a cluster that had them keeps them.
+    [[ -z ${MSH_28_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
@@ -3601,6 +3602,7 @@ curl -fsSL --max-time 120 -o "$WORK/gateway-standard.yaml" \
 [[ $(sha256sum "$WORK/gateway-standard.yaml" | cut -d' ' -f1) == "$gw_sha256" ]] \
   || fail "msh_28: the Gateway API standard CRDs do not match the pinned digest"
 MSH_28_CLEANUP=1
+if [[ -z $(kubectl get crd referencegrants.gateway.networking.k8s.io -o name 2>/dev/null || true) ]]; then MSH_28_CRDS=1; fi
 kubectl apply --server-side -f "$WORK/gateway-standard.yaml" >/dev/null
 kubectl wait --for=condition=Established crd/referencegrants.gateway.networking.k8s.io --timeout=60s >/dev/null
 ns_fresh msh-28-a
@@ -3725,8 +3727,9 @@ awk -v late="$late" 'BEGIN { exit !(late <= 2.6) }' || fail "msh_28: the held re
 [[ $(jq '.services["msh-28-a/web"].endpoints["80"] | length' "$WORK/msh-scaled.json") == 2 ]] \
   || fail "msh_28: the served view of web does not have two endpoints after the scale"
 kubectl delete namespace msh-28-a msh-28-b --wait=false >/dev/null
-kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
+[[ -z ${MSH_28_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
 MSH_28_CLEANUP=
+MSH_28_CRDS=
 echo "msh_28: the view is per deployment, follows the ReferenceGrant and the scale, and the long-poll ends 304 at the timeout"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
