@@ -142,6 +142,9 @@ impl TunnelMetrics {
 /// Returns the destination a redirected connection was addressed to.
 pub type OriginalDst = Arc<dyn Fn(&TcpStream) -> io::Result<SocketAddr> + Send + Sync>;
 
+/// Called with every socket of a connection once it is configured (tests, PRX-32).
+pub type SocketObserver = Arc<dyn Fn(&TcpStream) + Send + Sync>;
+
 /// State shared by every listener and connection.
 pub struct Shared {
     bound: Vec<SocketAddr>,
@@ -158,6 +161,7 @@ pub struct Shared {
     /// One permit per connection served at once, per direction (inbound, outbound).
     permits: [Arc<Semaphore>; 2],
     detect_stall: Duration,
+    socket_observer: Option<SocketObserver>,
 }
 
 /// Counts a connection as active until dropped, and holds its slot under the cap.
@@ -214,6 +218,7 @@ impl Shared {
                 Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
             ],
             detect_stall: DETECT_STALL,
+            socket_observer: None,
         }
     }
 
@@ -283,6 +288,22 @@ impl Shared {
 
     fn permits(&self, direction: Direction) -> Arc<Semaphore> {
         self.permits[usize::from(direction == Direction::Outbound)].clone()
+    }
+
+    /// Calls `observer` with each socket of a connection (the accepted one and the one to the
+    /// destination) after `TCP_NODELAY` and keepalive are set.
+    pub fn with_socket_observer(mut self, observer: SocketObserver) -> Shared {
+        self.socket_observer = Some(observer);
+        self
+    }
+
+    /// The one place that prepares a socket of a connection: `TCP_NODELAY`, keepalive.
+    pub(crate) fn prepare_socket(&self, socket: &TcpStream) -> io::Result<()> {
+        let configured = crate::connection::configure_socket(socket);
+        if let Some(observer) = &self.socket_observer {
+            observer(socket);
+        }
+        configured
     }
 
     /// Resets a connection stalled on an incomplete protocol prefix after `stall` (spec §4.1).
