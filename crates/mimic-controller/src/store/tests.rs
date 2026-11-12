@@ -345,6 +345,8 @@ async fn ctl_09_torn_staged_write_is_refused_and_never_visible() {
         .key(&k.outbound)
         .key(&tmp)
         .key(&tmp_out)
+        .key(&k.grpc)
+        .key(format!("{tmp}-grpc"))
         .arg(&version)
         .arg(3_600_000)
         .arg(1000)
@@ -362,6 +364,8 @@ async fn ctl_09_torn_staged_write_is_refused_and_never_visible() {
         .arg(0)
         .arg("")
         .arg("digest")
+        .arg("")
+        .arg("")
         .invoke_async(&mut c)
         .await
         .expect("the script runs");
@@ -393,6 +397,8 @@ async fn invoke(
         .key(&k.outbound)
         .key(tmp)
         .key(tmp_out)
+        .key(&k.grpc)
+        .key(format!("{tmp}-grpc"))
         .arg(&version)
         .arg(3_600_000)
         .arg(1000)
@@ -410,6 +416,8 @@ async fn invoke(
         .arg(0)
         .arg(out_len)
         .arg("digest")
+        .arg("")
+        .arg("")
         .invoke_async(c)
         .await
         .expect("the script runs")
