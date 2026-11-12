@@ -101,8 +101,14 @@ async fn exp_13_the_new_routes_count_by_pattern_without_names() {
     fetch(&app, "/ui/workloads/shop/front/loadtests/x").await;
     for (route, code) in [
         ("/v1/features", 200),
-        ("/ui/workloads/{namespace}/{deployment}/loadtests/{uid}", 200),
-        ("/ui/workloads/{namespace}/{deployment}/loadtests/{uid}", 400),
+        (
+            "/ui/workloads/{namespace}/{deployment}/loadtests/{uid}",
+            200,
+        ),
+        (
+            "/ui/workloads/{namespace}/{deployment}/loadtests/{uid}",
+            400,
+        ),
     ] {
         assert_eq!(requests(&metrics, route, code), Some(1), "{route} {code}");
     }
@@ -168,8 +174,11 @@ async fn exp_14_the_routes_give_the_tab_the_members_it_reads() {
     assert_eq!(list.status, 200);
     let body = list.json();
     let runs = body["loadtests"].as_array().expect("a list");
-    assert_eq!(runs.len(), 2, "{body}");
-    let ended = runs.iter().find(|r| r["uid"] == UID).expect("the ended run");
+    assert_eq!(runs.len(), 2, "the list holds two runs");
+    let ended = runs
+        .iter()
+        .find(|r| r["uid"] == UID)
+        .expect("the ended run");
     for member in ["name", "phase", "reason", "start", "end"] {
         assert!(ended[member].is_string(), "{member}: {ended}");
     }
@@ -199,7 +208,10 @@ async fn exp_14_the_routes_give_the_tab_the_members_it_reads() {
             "secret-ticket",
             "credentials",
         ] {
-            assert!(!text.contains(secret), "an answer holds {secret}");
+            assert!(
+                !text.contains(secret),
+                "an answer holds a credential member"
+            );
         }
     }
 }

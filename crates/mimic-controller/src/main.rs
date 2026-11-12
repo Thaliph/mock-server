@@ -182,6 +182,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     });
     let load_enabled = load.is_some();
     let resources = resources::ResourceCache::new();
+    resources.set_load_enabled(load_enabled);
     let slices = load.as_ref().map(|load| load.slices.clone());
     let load_parts = load
         .as_ref()

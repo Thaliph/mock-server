@@ -81,6 +81,16 @@ pub(super) async fn resource_page(
     served(HTML, PAGE)
 }
 
+/// The run page: the same page for every run, filled from `/loadtests/<uid>`.
+pub(super) async fn run_page(
+    Path((namespace, deployment, uid)): Path<(String, String, String)>,
+) -> Response {
+    if keys(&namespace, &deployment).is_err() || !super::uuid(&uid) {
+        return ReadError::Name.into_response();
+    }
+    served(HTML, PAGE)
+}
+
 pub(super) async fn openapi_page(
     Path((namespace, deployment, id)): Path<(String, String, String)>,
 ) -> Response {

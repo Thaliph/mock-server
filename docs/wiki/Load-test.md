@@ -188,6 +188,8 @@ The run also stays readable after the object is deleted: see
 [Load test runs in Reading the API](Reading-the-API#load-test-runs) for the routes
 (`/v1/workloads/demo/front/loadtests/<uid>`, where the uid is the object's `metadata.uid`, not its name) and a
 command that prints the per-endpoint summary.
+The UI lists the runs too: the Load tests tab (`/ui/loadtests`) shows every stored run and opens a run page with
+its per-endpoint results (see [Reading the API](Reading-the-API)).
 
 A run goes `Pending` (`WaitingForMock` while the mode converges) to `Running` to `Succeeded`, or `Failed` or
 `Aborted` with a `reason`. `status.results` holds, in total and per endpoint, the requests, missed sends,

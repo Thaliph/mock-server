@@ -420,6 +420,94 @@
     }).catch(failed);
   }
 
+  // The Load tests tab: the runs of every deployment, from the stored summaries. Hidden, with
+  // its reason, when the controller runs without load tests.
+  function runPath(ns, dep, uid) {
+    return workloadPath(ns, dep) + "/loadtests/" + enc(uid);
+  }
+
+  function loadTestsPage() {
+    api("/v1/features").then(function (features) {
+      var enabled = features && features.loadTest && features.loadTest.enabled === true;
+      if (!enabled) {
+        show([
+          el("h1", "Load tests"),
+          el("p", "Load testing is disabled in this install: set loadTest.enabled=true in the " +
+            "chart to run MimicLoadTest objects and list their runs here.")
+        ]);
+        return;
+      }
+      return Promise.all([api("/v1/workloads"), api("/v1/resources")]).then(function (results) {
+        var found = {};
+        ((results[0] && results[0].workloads) || []).concat(
+          (results[1] && results[1].workloads) || []).forEach(function (w) {
+          found[w.namespace + "/" + w.deployment] = [w.namespace, w.deployment];
+        });
+        var ids = Object.keys(found).sort();
+        return Promise.all(ids.map(function (id) {
+          return api(apiPath(found[id][0], found[id][1], "/loadtests"));
+        })).then(function (lists) {
+          var rows = [];
+          ids.forEach(function (id, i) {
+            var ns = found[id][0];
+            var dep = found[id][1];
+            ((lists[i] && lists[i].loadtests) || []).forEach(function (r) {
+              var total = r.total || {};
+              var latency = total.latencyMicros || {};
+              rows.push([link(id, workloadPath(ns, dep)), link(r.name || r.uid,
+                runPath(ns, dep, r.uid)), r.phase, r.reason, total.requests, total.rps,
+                latency.p99, r.start, r.end]);
+            });
+          });
+          if (rows.length === 0) {
+            show([el("h1", "Load tests"), el("p", "No load test runs")]);
+            return;
+          }
+          show([el("h1", "Load tests"), table(
+            ["Deployment", "Name", "Phase", "Reason", "Requests", "RPS", "p99 µs", "Start",
+              "End"], rows)]);
+        });
+      });
+    }).catch(failed);
+  }
+
+  // The run page: the total, the error kinds and one row per endpoint of the stored summary.
+  function runPage(ns, dep, uid) {
+    api(apiPath(ns, dep, "/loadtests/" + enc(uid))).then(function (run) {
+      var back = add(el("p"), [link("Back to Load tests", "/ui/loadtests")]);
+      if (run === null) {
+        show([el("h1", "Load test " + uid), back, el("p", "No such run")]);
+        return;
+      }
+      var summary = run.summary || {};
+      var total = summary.total || {};
+      var latency = total.latencyMicros || {};
+      var kinds = Object.keys(total.errors || {}).sort();
+      show([
+        el("h1", "Load test " + (run.name || uid)),
+        back,
+        table(["Deployment", "Phase", "Reason", "Start", "End"],
+          [[ns + "/" + dep, run.phase, run.reason, run.start, run.end]]),
+        el("h2", "Total"),
+        table(["Requests", "Missed", "RPS", "Statuses", "p50 µs", "p90 µs", "p99 µs",
+          "max µs"], [[total.requests, total.missed, total.rps, pairs(total.statuses),
+          latency.p50, latency.p90, latency.p99, latency.max]]),
+        el("h2", "Error kinds"),
+        table(["Kind", "Count"], kinds.map(function (kind) {
+          return [kind, total.errors[kind]];
+        })),
+        el("h2", "Endpoints"),
+        table(["Method", "Port", "Template", "Requests", "Missed", "RPS", "Statuses", "Errors",
+          "p50 µs", "p90 µs", "p99 µs", "max µs"],
+        (summary.endpoints || []).map(function (e) {
+          var l = e.latencyMicros || {};
+          return [e.method, e.port, e.template, e.requests, e.missed, e.rps, pairs(e.statuses),
+            pairs(e.errors), l.p50, l.p90, l.p99, l.max];
+        }))
+      ]);
+    }).catch(failed);
+  }
+
   function route() {
     var parts = window.location.pathname.split("/").filter(function (p) {
       return p !== "";
@@ -435,10 +523,13 @@
       endpointsPage();
     } else if (parts.length === 2 && parts[1] === "loadtests") {
       markTab("/ui/loadtests");
-      placeholder("Load tests", "The runs of every deployment are not available here yet.");
+      loadTestsPage();
     } else if (parts.length === 4 && parts[1] === "workloads") {
       markTab("/ui/");
       workloadPage(parts[2], parts[3]);
+    } else if (parts.length === 6 && parts[1] === "workloads" && parts[4] === "loadtests") {
+      markTab("/ui/loadtests");
+      runPage(parts[2], parts[3], parts[5]);
     } else if (parts.length === 6 && parts[1] === "workloads" && parts[4] === "openapi") {
       markTab("/ui/");
       openapiPage(parts[2], parts[3], parts[5]);

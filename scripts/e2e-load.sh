@@ -324,6 +324,29 @@ ldt_19_check() {
     and ([.rows[] | select(.[0] == $b and .[1] == "Aborted" and .[2] == "ModeLeft")] | length == 1)' "$WORK/browse.json" >/dev/null \
     || fail "ldt_19: the Load tests table lacks run A (Succeeded/Completed with requests) or run B (Aborted/ModeLeft)"
   if found -F -e "$canary" "$WORK/browse.json"; then fail "ldt_19: a canary of the credentials Secret is on the deployment page"; fi
+  # exp_16: the Load tests tab lists both runs and the link of run A opens its run page with the endpoint table.
+  python3 -I scripts/e2e/ui_browser.py "$CHROME_PORT" "http://localhost:$UI_PORT/ui/loadtests" \
+    --wait ldt16-a --wait ldt16-b --wait mck-19/front > "$WORK/browse-tab.json" \
+    || fail "exp_16: the browser did not show the Load tests tab"
+  [[ $(jq '.violations | length' "$WORK/browse-tab.json") == 0 ]] || fail "exp_16: CSP violations on the Load tests tab"
+  [[ $(jq --arg o "http://localhost:$UI_PORT/" '[.requests[] | select((startswith($o) or startswith("data:")) | not)] | length' "$WORK/browse-tab.json") == 0 ]] \
+    || fail "exp_16: the Load tests tab requested something outside the read API"
+  jq -e --arg a ldt16-a --arg b ldt16-b '
+    ([.rows[] | select(.[1] == $a and .[2] == "Succeeded" and .[3] == "Completed")] | length == 1)
+    and ([.rows[] | select(.[1] == $b and .[2] == "Aborted" and .[3] == "ModeLeft")] | length == 1)' "$WORK/browse-tab.json" >/dev/null \
+    || fail "exp_16: the Load tests tab lacks run A (Succeeded/Completed) or run B (Aborted/ModeLeft): $(jq -c .rows "$WORK/browse-tab.json")"
+  local run_href
+  run_href=$(jq -r --arg a ldt16-a '[.links[] | select(.text == $a)][0].href' "$WORK/browse-tab.json")
+  [[ $run_href == /ui/workloads/mck-19/front/loadtests/* ]] || fail "exp_16: the link of run A is $run_href"
+  python3 -I scripts/e2e/ui_browser.py "$CHROME_PORT" "http://localhost:$UI_PORT$run_href" \
+    --wait Endpoints --wait Template > "$WORK/browse-run.json" \
+    || fail "exp_16: the browser did not show the run page of run A"
+  [[ $(jq '.violations | length' "$WORK/browse-run.json") == 0 ]] || fail "exp_16: CSP violations on the run page"
+  jq -e '[.rows[] | select(.[0] == "Method")] | length >= 1' "$WORK/browse-run.json" >/dev/null \
+    || fail "exp_16: the run page has no endpoint table"
+  for page in tab run; do
+    if found -F -e "$canary" "$WORK/browse-$page.json"; then fail "exp_16: a canary of the credentials Secret is on the $page page"; fi
+  done
   docker rm -f "$CHROME" >/dev/null 2>&1 || true
   CHROME=""
   ui_forward_stop
