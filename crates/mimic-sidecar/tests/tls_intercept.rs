@@ -985,6 +985,8 @@ async fn tls_27_unreadable_and_unparsable_root_files_are_logged() {
     let sidecar = sidecar(&dest, Some(ca), "").await;
     let mut tls = connect(&sidecar, &root, api(), &[]).await.unwrap();
     assert_eq!(exchange(&mut tls, REQUEST).await, RESPONSE);
+    // The log worker writes asynchronously: wait for it before reading the text.
+    logs.settled().await;
     let text = logs.text();
     assert_eq!(text.matches("tls roots skipped").count(), 2, "{text}");
     assert!(text.contains("trust/1/image-ca.pem") && text.contains("trust/2/image-ca.pem"));
