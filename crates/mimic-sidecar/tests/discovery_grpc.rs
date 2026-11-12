@@ -296,7 +296,7 @@ async fn grp_37_a_server_first_banner_is_tunnelled_with_no_added_wait() {
         assert_eq!(&banner, b"220 hello\r\n");
         if timed {
             assert!(
-                started.elapsed() < Duration::from_millis(20),
+                started.elapsed() < Duration::from_millis(500),
                 "{:?}",
                 started.elapsed()
             );

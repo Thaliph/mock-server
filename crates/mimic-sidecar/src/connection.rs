@@ -1012,10 +1012,22 @@ async fn first_bytes(
                             };
                         }
                     };
-                    if could_be_h2_settings(&head[..peeked])
-                        && tokio::time::timeout(stall, client.readable()).await.is_ok()
-                    {
-                        continue;
+                    if could_be_h2_settings(&head[..peeked]) {
+                        // Bounded by the stall, and a shutdown ends the wait (spec §4.1).
+                        let waited = tokio::select! {
+                            biased;
+                            () = &mut abort => {
+                                return First::Opaque {
+                                    to_upstream: buf,
+                                    to_client: Vec::new(),
+                                    early: Some(Early::Shutdown),
+                                };
+                            }
+                            ready = tokio::time::timeout(stall, client.readable()) => ready.is_ok(),
+                        };
+                        if waited {
+                            continue;
+                        }
                     }
                 }
                 let read = upstream.read(&mut from_upstream).await;
