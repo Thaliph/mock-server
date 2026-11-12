@@ -3305,7 +3305,9 @@ mode_wait_non08() {
 }
 mode_wait_non08 discovery 2 150 \
   || fail "non_08: status.mode did not converge to discovery with 2 pods within 2 pull intervals: $(kubectl -n non-08 get mimicworkload users -o jsonpath='{.status.mode}')"
-non08_ok=$(non08_calls 20 "$non08_canary") || fail "non_08: the calls to users in discovery failed"
+# In discovery the header is recorded as sent (x-tenant-key has no redaction rule here, and a redact list
+# would only reach new pods): these calls carry a plain value, the canary is only sent while in none.
+non08_ok=$(non08_calls 20 non08-tenant-plain) || fail "non_08: the calls to users in discovery failed"
 [[ $non08_ok == 20 ]] || fail "non_08: users answered $non08_ok of 20 calls with 200 in discovery"
 non08_total=0
 for _ in $(seq 20); do
