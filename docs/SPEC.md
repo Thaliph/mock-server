@@ -312,6 +312,7 @@ would see without mimic, except for the limits listed at the end of this section
   | `status` | response status, absent when none | — |
   | `grpc_status` | HTTP/2 only: from the trailers, when present | — |
   | `upgrade` | `true` when the exchange became a tunnel | — |
+  | `backend`, `upstream` | (M1) mesh-routed requests only (§7.9): `<namespace>/<name>:<port>` of the Service port and the pod `ip:port` the request went to | — |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
   | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown`, (F10) `mock_closed` (§8) |
@@ -362,6 +363,40 @@ Accepted limits of the proxy:
   HTTP request line (for example `ping` with no space or line end) stays in detection until it
   sends more: such a client that waits for a reply first is stalled. Protocols that end their
   first message with a line end or send binary data are not affected.
+- **Mesh-routed HTTP (M1, #443, §7.9).** An outbound connection the mesh routes (cleartext
+  HTTP/1 and `h2c` to an in-scope Service) is the one place besides the load marker where HTTP/1
+  is not byte-exact: it goes through `hyper` on both sides (header case preserved, no header
+  added, no `Date` or `Server` added), and requests are balanced one by one. Everything not
+  in the view, TLS, other protocols and every connection with the mesh switched off
+  keep the byte relay above. The accepted limits of a mesh-routed HTTP/1 connection:
+  1. A request `hyper` rejects (header names that are not tokens, bare `LF`, `obs-fold`, a `NUL`
+     or `CR` in a value, duplicate or conflicting `Content-Length`, `Content-Length` with
+     `Transfer-Encoding`, a `Transfer-Encoding` whose last coding is not `chunked`) is answered
+     `400` by the sidecar and the connection closes, where the byte relay would have forwarded it.
+  2. The order of header fields of different names is not kept; the order of the fields of one
+     name and the case of the names are.
+  3. Chunk extensions are dropped; `chunked` stays `chunked` and a `Content-Length` body stays
+     `Content-Length`; a response with neither (read until the server closes) is sent to the app
+     `chunked`. Trailers are forwarded only as `hyper` does.
+  4. Pipelined requests are serialised: request *n+1* goes upstream after response *n*, each
+     possibly to another pod; the answers come back in order.
+  5. Keep-alive is per hop: `Connection`, the fields it names, `Keep-Alive`, `Proxy-Connection`
+     and `TE` (but `trailers`) are consumed by the sidecar and not forwarded, in both
+     directions; the app's `Connection: close` closes the app side only and the upstream
+     connection is pooled.
+  6. `Expect: 100-continue` is forwarded, and `hyper` answers the app's `100 Continue` itself
+     when the request body is first read; the body is not held back until the upstream asks
+     for it.
+  7. A response head with `obs-fold` is unfolded to one space; a response head `hyper` rejects
+     is answered `502` `x-mimic-error: invalid-response`; the order of response header fields of
+     different names is not kept.
+  8. A first request carrying `Upgrade` or `CONNECT` keeps the connection on the byte relay. A
+     later request on a mesh-routed connection that carries `Upgrade` or is a `CONNECT` is
+     answered `501` `x-mimic-error: unsupported` and the connection closes (until #443 step 2
+     moves it to the relay).
+  The mesh adds answers of its own: `503` `x-mimic-error: no-endpoint` (the Service port has
+  no endpoint) and `503` `x-mimic-error: connect-failed`, `502` `x-mimic-error:
+  invalid-response`, all with `content-length: 0`. They are not recorded by discovery.
 
 ## 5. TLS interception
 
@@ -2390,7 +2425,7 @@ no insignificant whitespace):
 - **`View::from_json`** (what a sidecar reads): refuses unknown fields at every level, a `format`
   other than 1, an unknown mode, an address or port that does not parse, a Service key that is not
   `<namespace>/<name>`, and a document over the bounds of the `Limits` it is given.
-- **The sidecar follows its view** (M1, #442; no traffic changes in this step). With
+- **The sidecar follows its view** (M1, #442). With
   `MIMIC_MESH=on` and a controller URL the sidecar long-polls `GET /v1/workloads/<deployment>/mesh?format=1`
   (§7.2) with `If-None-Match` set to the `ETag` it holds and `Accept-Encoding: gzip`, one request
   at a time, the projected token read again for each request. After a `200` or `304` the next
@@ -2420,15 +2455,67 @@ no insignificant whitespace):
   state file, then `MIMIC_MODE` (§8 "Mode state").
 - **Classification.** Each outbound connection is classified when it is accepted: `in-scope` when
   its original destination is a `<ClusterIP>:<port>` of the table, `unscoped` otherwise (also before
-  the first view); `mimic_mesh_unscoped_connections_total` counts the second. In this step it
-  changes nothing: every byte still goes to the original destination, as with the byte relay.
-  The work per connection is one read of the table and one hash lookup; nothing is added per
-  exchange, and with `MIMIC_MESH=off` nothing at all.
+  the first view); `mimic_mesh_unscoped_connections_total` counts the second. An `unscoped`
+  connection, and every connection with the mesh switched off (`MIMIC_MESH=off`, a view with
+  `"mesh": false`), keeps the byte relay of §4.1: every byte goes to the original destination.
+  An `in-scope` one is served as "Load balancing" below says. The work per connection is one
+  read of the table and one hash lookup; with `MIMIC_MESH=off` nothing at all.
 - **Age and readiness.** `mimic_mesh_view_age_seconds` is the time since the last `200` or `304`
   (or since `fetchedAt` for a view read from the file), updated every second; when it reaches
   `MIMIC_MESH_STALE_AFTER` one WARN `mesh view stale` is written (again after the view was
   fresh in between). `/readyz` answers `200` once the listeners accept connections and, when the
   sidecar follows a view, once a view is held or `MIMIC_MESH_STARTUP_WAIT` has passed since the start.
+- **Load balancing** (M1, #443, step 1: cleartext HTTP/1 and `h2c` only; design §3.1, §3.2).
+  An outbound connection to an `in-scope` `<ClusterIP>:<port>`, while the mode is not `mock`,
+  waits for the client's first bytes without connecting (a silent client is waited for 1 s, then
+  the connection is a byte relay as before). When they are the HTTP/2 preface, or an HTTP/1
+  request head that is not an `Upgrade` or a `CONNECT`, the connection is **mesh-routed**: it is
+  parsed by `hyper` and **each request** goes to a pod of the Service chosen by the caller's
+  sidecar, over a pooled connection to `<pod IP>:<target port>`; anything else (TLS, other
+  protocols, a first request with `Upgrade` or `CONNECT`) is relayed to the original destination as before
+  (L4 balancing of those is #443 step 2, intercepted TLS step 3). The pod is chosen in
+  `mimic-core` `mesh::lb` by **power of two choices, least request**: two distinct endpoints are
+  drawn at random (one endpoint: that one, none: `503` `x-mimic-error: no-endpoint`) and the one
+  with the lower `(in_flight + 1) / weight` is taken, the first draw on a tie; `in_flight` counts
+  the requests of this sidecar sent to the endpoint whose response is not complete. **Slow
+  start**: an endpoint first seen in a view after the first one applied has weight
+  `max(0.1, min(1, age / window))`, `age` the time since that view and `window` the Service's
+  `policy.loadBalancer.slowStartSeconds` (0: always 1); the endpoints of the first view applied
+  (also one read from the state file) have weight 1; an endpoint that leaves the view and
+  comes back is new again. The endpoints are those of the view for the Service port (ready
+  ones, or the serving and terminating ones when none is ready, §7.9).
+  **Pools** are per (pod IP, port, protocol), the protocol being the one the app spoke
+  (HTTP/1 or HTTP/2, never upgraded). HTTP/2: connections multiplexed, a new one (at most 16 per
+  pod) when none has a free stream (the peer's `MAX_CONCURRENT_STREAMS` is reached). HTTP/1: one
+  request at a time per connection, at most 1024 connections per pod (a request over that waits
+  for one to be free), `hyper`'s client with `preserve_header_case`. A connection idle for
+  `MIMIC_MESH_POOL_IDLE_TIMEOUT` is closed. An endpoint that leaves the view stops being chosen
+  at once; its requests in flight finish, its idle connections close and its pool is dropped.
+  Connecting has the 10 s timeout of the relay and the socket options of §4.1; a failure is
+  answered `503` with `x-mimic-error: connect-failed` and `content-length: 0` (no retry: #445).
+  Discovery records **one exchange per request under the app's authority** (the `Host` or
+  `:authority` it sent, never the pod's address), the `dst` of the access line stays the
+  original destination, and the line gains `backend` (`<namespace>/<name>:<port>` of the
+  Service port) and `upstream` (`<pod IP>:<port>`), absent on lines of relayed connections. No
+  header is added to a request or a response. A connection stays on the path it started on when
+  the view, the kill switches or the mode change; the next connection takes the new one.
+  Mesh-routed HTTP/1 has the accepted limits listed at the end of §4.1.
+  **Metrics** (sidecar, only with `MIMIC_MESH=on`; `service` and `backend` are
+  `<namespace>/<name>` and `<namespace>/<name>:<port>`; no route exists yet: `route="none"`;
+  `reason` is `none` or the `x-mimic-error` of an answer of the sidecar):
+
+  | Metric | Type | Labels |
+  |---|---|---|
+  | `mimic_mesh_requests_total` | counter, one per mesh-routed request | `service`, `route`, `backend`, `status_class` (`1xx` to `5xx`, `none` when no response), `reason` |
+  | `mimic_mesh_request_duration_seconds` | histogram, buckets of `mimic_http_request_duration_seconds`, until the response head | `service`, `backend`, `status_class` |
+  | `mimic_mesh_endpoint_requests_total` | counter, per pod | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
+  | `mimic_mesh_endpoint_in_flight` | gauge, per pod | `backend`, `endpoint` |
+
+  At most `MIMIC_METRICS_MAX_ENDPOINTS` distinct endpoints have a label of their own, the next ones
+  are `other`; the series of an endpoint that left the view are removed 5 minutes after it left
+  (a scrape sees their last values first) and their slots are free again; an endpoint that
+  comes back within the 5 minutes keeps its series. No label carries a path, a header or any
+  caller-controlled string.
 
 ## 8. Mock
 
@@ -2683,6 +2770,7 @@ random numbers it hands to the draw.
   | `mimic_mesh_view_age_seconds` | gauge (M1, sidecar), seconds since the last `200` or `304` of the mesh view, 0 without a view | — |
   | `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauge (M1, sidecar), Services and endpoints of the view held, 0 without one | — |
   | `mimic_mesh_unscoped_connections_total` | counter (M1, sidecar), outbound connections whose destination is not a Service port of the view | — |
+  | `mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_endpoint_requests_total`, `mimic_mesh_endpoint_in_flight` | (M1, #443, sidecar) mesh-routed requests, in total, their duration, and per pod; labels, bounds and eviction in §7.9 "Load balancing" | `service`, `route`, `backend`, `endpoint`, `status_class`, `reason` |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -3118,6 +3206,8 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_MESH_STALE_AFTER` | `60s` | (M1) Age of the view after which it is stale (§7.9), 1s–1h. Set by the webhook. |
 | `MIMIC_MESH_STARTUP_WAIT` | `2s` | (M1) Wait for the first view before `/readyz` answers `200` (§7.9), 0s–1m. Set by the webhook. |
 | `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS`, `MIMIC_MESH_MAX_VIEW_BYTES` | `1024`, `10000`, `4Mi` | (M1) The bounds of §10.2 with the same ranges, applied to the view read from the controller (`View::from_json`). Set by the webhook when they differ from the defaults. |
+| `MIMIC_MESH_POOL_IDLE_TIMEOUT` | `90s` | (M1) A pooled connection to a pod idle for this long is closed (§7.9 "Load balancing"), 1s–1h. Not set by the webhook. |
+| `MIMIC_METRICS_MAX_ENDPOINTS` | `256` | (M1) Endpoints with a label of their own in the per-pod mesh metrics (§7.9), 1–10000; the next ones are `other`. Not set by the webhook. |
 | `MIMIC_LOAD_ENABLED` | absent | (F11) `1`: the sidecar honours the load marker of inbound requests and answers `GET /load` (§4.1, §7.8). The webhook sets it when `MIMIC_LOAD_MAX_RUNS` is above 0 (chart `loadTest.enabled`); absent otherwise. A pod injected before load testing was enabled keeps its env: it is no target (its `/load` answers 404) until a rollout restarts it. |
 
 ### 10.4 `mimic-init` variables
@@ -4472,7 +4562,7 @@ is M1; here `none` only stops recording, intercepting and shipping.
 
 Design: `docs/design/mimic-mesh.md` §3.4, §4.2, §4.3, §6, §16. Spec text: §7 (`MimicConfig`),
 §7.2 (the route), §7.9 (the view), §10.2. Levels as in §12.2, plus **M** (main session). MSH-01 to MSH-17 are #440,
-MSH-18 to MSH-30 are #441 (the watches, the route, the chart), MSH-31 and after #442 (the sidecar follows the view, §7.9).
+MSH-18 to MSH-30 are #441 (the watches, the route, the chart), MSH-31 to MSH-42 are #442 (the sidecar follows the view, §7.9), MSH-43 and after #443 (load balancing, §7.9, §4.1).
 
 | ID | Criterion |
 |---|---|
@@ -4518,6 +4608,20 @@ MSH-18 to MSH-30 are #441 (the watches, the route, the chart), MSH-31 and after 
 | MSH-40 | **E** (chart, `scripts/check-chart.sh`). `mesh.staleAfter` (default `60s`) and `mesh.startupWait` (default `2s`) render `MIMIC_MESH_STALE_AFTER` and `MIMIC_MESH_STARTUP_WAIT` on the controller; `helm lint --strict` passes; the default render is the golden file. |
 | MSH-41 | **E** (kind, `scripts/e2e.sh` section `msh_41`, objects of that section only). A sidecar gets its view: `mimic_mesh_view_services` equals the Service count of its namespace and `mimic_mesh_view_pulls_total{result="ok"}` is at least 1; a call from the app to a Service of the section that is declared by no one and outside the namespace is counted in `mimic_mesh_unscoped_connections_total` while the call still works; after the controller pods are deleted (restarted) the sidecar keeps its view and, when its container is restarted during the outage, reloads it from `mesh.json` (`mimic_mesh_view_services` unchanged, `restartCount` of the sidecar container 1 and of the app 0), then pulls again when the controller is back. |
 | MSH-42 | **D** (security and performance review). Parsing is bounded (body read capped before and after decompression, `View::from_json` with the limits, a persisted file read capped and only if regular); the token is handled as for the egress pull (read per request, never logged); nothing of another namespace enters the table, which is built from the view only; the persisted file holds what the controller served and is in the pod's `emptyDir`; the per-connection cost is one table read and one lookup, nothing per exchange (PRX, TLS, GRP, MCK, NON tests unchanged; the M0 benchmark is not worse than its recorded results). |
+| MSH-43 | **U** (`mimic-core` `mesh::lb`, draws and clock passed in). Pick: with two or more endpoints two distinct indices are drawn and the one with the lower `(in_flight + 1) / weight` is returned, the first draw on a tie, whatever the order of the draws; one endpoint is returned without a draw; none gives `None`; the draw is called with `n` then `n - 1`, and an index is never out of range. |
+| MSH-44 | **U** (`proptest`). With a feedback loop (requests that complete after a random time) over any endpoints, weights and seeds: no pick is out of range, an endpoint with a lower in-flight count than all others is never passed over for a loaded one it was drawn against, the busiest endpoint never receives more than twice the mean over 10 000 picks with equal weights, and an endpoint of weight 1 receives more than one of weight 0.1 under the same load. |
+| MSH-45 | **U.** Slow start: weight `max(0.1, min(1, age / window))`: 0.1 at age 0, 0.5 at half the window, 1 from the window on, never above 1; the endpoints of the first view have weight 1 and those added by a later one start at 0.1; a known endpoint keeps its first-seen time across updates, one that left and came back is new; window 0 gives 1 always; the update is the same for any order of the endpoints given. |
+| MSH-46 | **B** (criterion micro-benchmark `mesh_lb`, results in `docs/bench/`). The pick over 3, 100 and 1000 endpoints takes at most 2 µs (design §14). |
+| MSH-47 | **U** (sidecar configuration). Unset: `MIMIC_MESH_POOL_IDLE_TIMEOUT` 90 s, `MIMIC_METRICS_MAX_ENDPOINTS` 256. Exit 2 (FND-01) for a pool idle timeout below 1s or over 1h and for `MIMIC_METRICS_MAX_ENDPOINTS` 0 or 10001. |
+| MSH-48 | **I** (in-process sidecar, view with one Service of three fake pods on local listeners, original destination faked to the ClusterIP). One HTTP/1 keep-alive client sending 3000 requests one after the other: each pod gets 1000 ± 10 %, every request is answered with its pod's response, and `mimic_mesh_endpoint_requests_total` per pod equals what the pod counted. An `h2c` client over one connection with 3000 requests, 8 at a time: the same spread. |
+| MSH-49 | **I.** With one of the three pods answering 50 ms slower than the others and 8 requests in flight at a time, it gets fewer requests than each other pod (at most 60 % of the lowest of the others over 600 requests); a pod added to the view while traffic flows gets requests after its slow-start window (view policy 1 s) and not above 20 % of the traffic during the first 200 ms; a pod removed from the view gets no new request, finishes the requests it has in flight (none fails) and its idle connections are closed. |
+| MSH-50 | **I.** Pools: sequential HTTP/1 requests to one pod use one connection to it (the pod accepted one connection); concurrent ones use as many as are in flight at once; a connection idle for `MIMIC_MESH_POOL_IDLE_TIMEOUT` (set to 300 ms) is closed by the sidecar; HTTP/2: concurrent streams share one connection, and with a pod that allows 2 concurrent streams 5 slow concurrent requests all succeed over more than one connection, at most 3. |
+| MSH-51 | **I.** Out of scope and kill switches: a connection to a destination outside the view, with `MIMIC_MESH=off`, and with a view of `"mesh": false`, reaches the original destination with the same bytes as the byte relay, in both directions (a request with odd header case and order, a pipelined pair, a `Connection: close`, a non-HTTP stream); no mesh metric is created and no `backend` or `upstream` is logged. |
+| MSH-52 | **I.** Discovery and the access line: a mesh-routed request is recorded once, in `GET /discovery`, under the authority the app sent (`cart.shop.svc:8080`, not a pod address); the access line has `dst` the ClusterIP, `backend` `<ns>/<name>:<port>` and `upstream` the pod's address; the response bytes the app sees equal the pod's (no header added, header case kept). |
+| MSH-53 | **I.** Accepted limits of §4.1 as built: header names keep their case and fields of one name their order; `Connection: close` from the app closes the app side while the pod connection is reused by the next request of another client; `Connection`, `Keep-Alive` and a header named by `Connection` do not reach the pod; two pipelined requests are answered in order; a request with a bare-`LF` head is answered `400`; a pod that refuses connections gives `503` `x-mimic-error: connect-failed`; a Service port without endpoints gives `503` `no-endpoint`; a response head `hyper` rejects gives `502` `invalid-response`; a first request with `Upgrade` and one with `CONNECT` reach the original destination as received (byte relay) and a later `Upgrade` request on a mesh-routed connection is answered `501`. |
+| MSH-54 | **I** (metrics). After a known set of requests `mimic_mesh_requests_total`, the `_count` of `mimic_mesh_request_duration_seconds` and `mimic_mesh_endpoint_requests_total` have the exact values with the labels of §7.9, `mimic_mesh_endpoint_in_flight` is 0 when they are done and equals the requests in flight while they run; with `MIMIC_METRICS_MAX_ENDPOINTS=2` the third pod is `other`; the series of a pod that left the view are present 4 minutes later and gone 5 minutes after it left (clock passed in), the slot is reusable, and a pod back within the 5 minutes keeps its series; with `MIMIC_MESH=off` none of these metrics is registered. |
+| MSH-55 | **E** (kind, `scripts/e2e.sh` section `msh_55`, objects of that section only). A Service of 3 replicas and a client pod of the section (injected, in the view): 300 requests from one keep-alive client reach each replica 100 ± 30 times (counted by the replicas' own counters), the access lines of the client's sidecar carry `backend` and `upstream` naming the replicas' pod IPs and `dst` the ClusterIP, `mimic_mesh_endpoint_requests_total` of the client's sidecar has one series per replica summing to 300, and the same call to a Service outside the view still works and is counted `unscoped`. |
+| MSH-56 | **D** (security and performance review). Pool bounds (1024 HTTP/1 connections and 16 HTTP/2 connections per pod, pools dropped with the endpoint, idle timeout); no header added or removed beyond the hop-by-hop ones of RFC 9110 §7.6.1; label cardinality bounded and evicted (MSH-54); nothing of a request in a metric label or a log field besides the existing access-line ones; the byte relay is untouched for everything out of scope (MSH-51); the pick is O(1) (MSH-46). |
 
 ## 13. Test strategy
 
