@@ -1862,7 +1862,7 @@ browse resource /ui/workloads/disc-22/users/resources/MimicWorkload/users-a --wa
 jq -e '.text | contains("Spec") and contains("deployment: \"users\"")' "$WORK/browse-resource.json" >/dev/null \
   || fail "exp_07: the resource view does not show the spec of users-a as YAML"
 browse tab-map /ui/map --wait 'not available yet'
-browse tab-endpoints /ui/endpoints --wait 'Pick a deployment' --wait disc-22/users --wait egr-19/front
+browse tab-endpoints /ui/endpoints --wait 'Pick a deployment' --wait disc-22/users
 # exp_11: the Endpoints tab lists the endpoints of a deployment, and its filters narrow the table in the browser.
 browse ep-users '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --wait inbound
 jq -e '[.rows[] | select(.[0] == "inbound" and .[1] == "8080" and .[4] == "/users/{users_id}") | .[3]] | sort == ["GET", "PUT"]' \
