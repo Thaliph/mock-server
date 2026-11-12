@@ -648,7 +648,7 @@ fn grp_22_raw_trailers_and_bin_values_are_redacted_whatever_the_request() {
         sample["response"]["trailers"],
         serde_json::json!([
             ["x-trace-bin", "mimic-secret"],
-            ["x-token", "mimic-jwt"],
+            ["x-token", "mimic-token"],
             ["grpc-status", "0"]
         ])
     );

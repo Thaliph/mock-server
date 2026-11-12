@@ -15,7 +15,7 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Upgrade notes
 
-- Upgrade the controller before the pods: a controller of 0.2.0-alpha.3 or earlier cannot read a stored report with a version 3 part (a rollback after gRPC data was stored answers `500` for that deployment until its keys expire, `MIMIC_STORE_TTL`).
+- The gRPC messages and trailers are stored in a key of their own (`mimic:v1:{<ns>/<dep>}:grpc`); `:report` and `:outbound` keep the formats that 0.2.0-alpha.3 reads, so a rolling controller upgrade or a rollback keeps every workload served and only loses the gRPC data (the keys expire after `MIMIC_STORE_TTL`).
 
 ### Documentation
 

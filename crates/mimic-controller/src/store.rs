@@ -56,13 +56,14 @@ const STAGE_CHUNK: usize = 1 << 20;
 /// sees the old value or the new one, never a part of it. Every refusal deletes them.
 const WRITE: &str = r"
 local function refuse(code)
-  redis.call('DEL', KEYS[8], KEYS[9])
+  redis.call('DEL', KEYS[8], KEYS[9], KEYS[11])
   return code
 end
 local n_pods = tonumber(ARGV[14])
 local seq_at = 15 + n_pods
 local n_seq = tonumber(ARGV[seq_at])
 local out_at = seq_at + 1 + n_seq * 3
+local grpc_len = ARGV[out_at + 2]
 local current = redis.call('HGET', KEYS[2], 'version')
 if (current or '0') ~= ARGV[1] then return refuse(0) end
 for i = 0, n_seq - 1 do
@@ -71,6 +72,9 @@ for i = 0, n_seq - 1 do
 end
 if redis.call('STRLEN', KEYS[8]) ~= tonumber(ARGV[8]) then return refuse(0) end
 if ARGV[out_at] ~= '' and redis.call('STRLEN', KEYS[9]) ~= tonumber(ARGV[out_at]) then
+  return refuse(0)
+end
+if grpc_len ~= '' and redis.call('STRLEN', KEYS[11]) ~= tonumber(grpc_len) then
   return refuse(0)
 end
 local ttl = tonumber(ARGV[2])
@@ -90,6 +94,14 @@ if ARGV[out_at] ~= '' then
   redis.call('PEXPIRE', KEYS[7], ttl)
 else
   redis.call('DEL', KEYS[7])
+end
+if grpc_len ~= '' then
+  redis.call('RENAME', KEYS[11], KEYS[10])
+  redis.call('PEXPIRE', KEYS[10], ttl)
+  redis.call('HSET', KEYS[2], 'grpc_digest', ARGV[out_at + 3])
+else
+  redis.call('DEL', KEYS[10])
+  redis.call('HDEL', KEYS[2], 'grpc_digest')
 end
 local version = redis.call('HINCRBY', KEYS[2], 'version', 1)
 redis.call('HSET', KEYS[2], 'updated', now, 'exchanges', ARGV[9],
@@ -144,6 +156,8 @@ pub struct Keys {
     pub report: String,
     /// The outbound part of the report (F8).
     pub outbound: String,
+    /// The gRPC overlay (F14).
+    pub grpc: String,
     pub meta: String,
     pub pods: String,
     /// The mode each pod's last egress pull carried (F10).
@@ -169,6 +183,7 @@ pub fn keys(namespace: &str, deployment: &str) -> Result<Keys, NameError> {
     Ok(Keys {
         report: format!("{base}:report"),
         outbound: format!("{base}:outbound"),
+        grpc: format!("{base}:grpc"),
         meta: format!("{base}:meta"),
         pods: format!("{base}:pods"),
         pulls: format!("{base}:pulls"),
@@ -404,15 +419,18 @@ async fn append_chunk(
 /// lost connection) expires after [`STAGE_TTL_MS`].
 struct StageGuard {
     conn: MultiplexedConnection,
-    keys: [String; 2],
+    keys: Vec<String>,
     armed: bool,
 }
 
 impl StageGuard {
-    fn new(conn: MultiplexedConnection, keys: [&str; 2]) -> StageGuard {
+    fn new<S: AsRef<str>>(
+        conn: MultiplexedConnection,
+        keys: impl IntoIterator<Item = S>,
+    ) -> StageGuard {
         StageGuard {
             conn,
-            keys: keys.map(str::to_string),
+            keys: keys.into_iter().map(|k| k.as_ref().to_string()).collect(),
             armed: true,
         }
     }
@@ -439,9 +457,9 @@ impl Drop for StageGuard {
     }
 }
 
-async fn delete(mut conn: MultiplexedConnection, keys: [String; 2]) {
+async fn delete(mut conn: MultiplexedConnection, keys: Vec<String>) {
     let mut del = redis::cmd("DEL");
-    del.arg(&keys[0]).arg(&keys[1]);
+    del.arg(&keys);
     let _ = tokio::time::timeout(RESPONSE_TIMEOUT, del.query_async::<()>(&mut conn)).await;
 }
 
@@ -457,8 +475,12 @@ enum Attempt {
     Conflict,
 }
 
-/// What one write reads: `:report`, `:outbound`, the `:meta` version and the `:seq` fields.
+/// What a read of the parts gets: `:report`, `:outbound` and `:grpc`.
+type ReadParts = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// What one write reads: `:report`, `:outbound`, `:grpc`, the `:meta` version and the `:seq` fields.
 type Read = (
+    Option<Vec<u8>>,
     Option<Vec<u8>>,
     Option<Vec<u8>>,
     Option<String>,
@@ -552,7 +574,7 @@ fn summary(
 enum Part {
     /// `:report`: version 1.
     Inbound,
-    /// `:outbound`: version 2 (3 with a gRPC sample), outbound scopes only.
+    /// `:outbound`: version 2, outbound scopes only.
     Outbound,
 }
 
@@ -568,8 +590,9 @@ fn read_part(bytes: &[u8], part: Part) -> Option<Report> {
     let json = std::str::from_utf8(bytes).ok()?;
     let mut report = Report::parse_checked(json, usize::MAX, usize::MAX).ok()?;
     match part {
-        Part::Inbound => !report.holds_outbound(),
-        Part::Outbound => report.holds_outbound() && !report.holds_inbound(),
+        // The rules of F13: a part never holds a gRPC sample (spec §7.3, `:grpc`).
+        Part::Inbound => report.version() == 1,
+        Part::Outbound => report.version() == 2 && !report.holds_inbound(),
     }
     .then(|| {
         if legacy_marker(bytes) {
@@ -577,6 +600,11 @@ fn read_part(bytes: &[u8], part: Part) -> Option<Report> {
         }
         report
     })
+}
+
+/// A stored `:grpc` once it parses and passes its check.
+pub fn read_overlay(bytes: &[u8]) -> Option<mimic_core::discovery::overlay::GrpcOverlay> {
+    mimic_core::discovery::overlay::GrpcOverlay::from_json(std::str::from_utf8(bytes).ok()?).ok()
 }
 
 /// A stored `:outbound` once it parses, passes the structural check and is of its kind.
@@ -589,6 +617,7 @@ pub fn parse_outbound(bytes: &[u8]) -> Option<Report> {
 pub struct StoredReport {
     inbound: Option<Vec<u8>>,
     outbound: Option<Vec<u8>>,
+    grpc: Option<Vec<u8>>,
     pub version: u64,
 }
 
@@ -617,10 +646,14 @@ impl StoredReport {
             None => None,
         };
         drop(self.outbound);
-        match inbound {
-            Some(inbound) => Some(Report::join(inbound, outbound)),
-            None => outbound,
+        let mut report = match inbound {
+            Some(inbound) => Report::join(inbound, outbound),
+            None => outbound?,
+        };
+        if let Some(bytes) = &self.grpc {
+            report.apply_grpc(read_overlay(bytes)?);
         }
+        Some(report)
     }
 }
 
@@ -1018,12 +1051,14 @@ impl Store {
             .await
             .map_err(|_| ReadError::Unavailable)?;
         // One transaction: a write between two GETs could join an old part with a new one.
-        let (stored, outbound): (Option<Vec<u8>>, Option<Vec<u8>>) = match redis::pipe()
+        let (stored, outbound, grpc): ReadParts = match redis::pipe()
             .atomic()
             .cmd("GET")
             .arg(&k.report)
             .cmd("GET")
             .arg(&k.outbound)
+            .cmd("GET")
+            .arg(&k.grpc)
             .query_async(&mut conn)
             .await
         {
@@ -1036,19 +1071,31 @@ impl Store {
             ReadError::Unreadable
         };
         let inbound = read_part(&bytes, Part::Inbound).ok_or_else(|| unreadable("report"))?;
+        let overlay = match &grpc {
+            Some(bytes) => Some(read_overlay(bytes).ok_or_else(|| unreadable("grpc"))?),
+            None => None,
+        };
         let Some(outbound) = outbound else {
-            // F7 bytes: the stored report as it is, unless it holds the legacy marker.
-            if !legacy_marker(&bytes) {
+            // F7 bytes: the stored report as it is, unless it holds the legacy marker or gRPC samples.
+            if overlay.is_none() && !legacy_marker(&bytes) {
                 return Ok(bytes);
             }
-            return inbound
+            let mut report = inbound;
+            if let Some(overlay) = overlay {
+                report.apply_grpc(overlay);
+            }
+            return report
                 .to_json()
                 .map(String::into_bytes)
                 .map_err(|_| unreadable("report"));
         };
         let outbound =
             read_part(&outbound, Part::Outbound).ok_or_else(|| unreadable("outbound"))?;
-        Report::join(inbound, Some(outbound))
+        let mut report = Report::join(inbound, Some(outbound));
+        if let Some(overlay) = overlay {
+            report.apply_grpc(overlay);
+        }
+        report
             .to_json()
             .map(String::into_bytes)
             .map_err(|_| unreadable("report"))
@@ -1077,12 +1124,14 @@ impl Store {
         if half != Half::Inbound {
             pipe.cmd("GET").arg(&k.outbound);
         }
+        pipe.cmd("GET").arg(&k.grpc);
         pipe.cmd("HGET").arg(&k.meta).arg("version");
         let mut read: Vec<Option<Vec<u8>>> = match pipe.query_async(&mut conn).await {
             Ok(read) => read,
             Err(e) => return Err(self.read_failed(e).await),
         };
         let version = read.pop().flatten();
+        let grpc = read.pop().flatten();
         let mut read = read.into_iter();
         let inbound = if half == Half::Outbound {
             None
@@ -1113,6 +1162,7 @@ impl Store {
         Ok(StoredReport {
             inbound,
             outbound,
+            grpc,
             version,
         })
     }
@@ -1141,6 +1191,66 @@ impl Store {
             Err(e) => return Err(self.read_failed(e).await),
         };
         Ok(fresh_digest(version.as_deref(), digest.as_deref()))
+    }
+
+    /// The hex SHA-256 of the stored `:grpc` bytes, from `:meta` `grpc_digest`; `None` without
+    /// an overlay (spec §7.3, §7.7).
+    pub async fn grpc_digest(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<Option<String>, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        let digest: Option<String> = match redis::cmd("HGET")
+            .arg(&k.meta)
+            .arg("grpc_digest")
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(read) => read,
+            Err(e) => return Err(self.read_failed(e).await),
+        };
+        let well_formed =
+            |d: &str| d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        Ok(digest.filter(|d| well_formed(d)))
+    }
+
+    /// The size of the stored `:grpc` in bytes, 0 when there is none.
+    pub async fn grpc_len(&self, namespace: &str, deployment: &str) -> Result<u64, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        match redis::cmd("STRLEN")
+            .arg(&k.grpc)
+            .query_async(&mut conn)
+            .await
+        {
+            Ok(len) => Ok(len),
+            Err(e) => Err(self.read_failed(e).await),
+        }
+    }
+
+    /// The stored `:grpc` bytes, unparsed.
+    pub async fn grpc_bytes(
+        &self,
+        namespace: &str,
+        deployment: &str,
+    ) -> Result<Option<Vec<u8>>, ReadError> {
+        let k = keys(namespace, deployment).map_err(|_| ReadError::Name)?;
+        let mut conn = self
+            .connection()
+            .await
+            .map_err(|_| ReadError::Unavailable)?;
+        match redis::cmd("GET").arg(&k.grpc).query_async(&mut conn).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => Err(self.read_failed(e).await),
+        }
     }
 
     /// The size of the stored `:outbound` in bytes (`STRLEN`), 0 when there is none: what a
@@ -1333,11 +1443,13 @@ impl Store {
         if fields.is_empty() {
             fields.push(String::new());
         }
-        let (stored, stored_outbound, version, seqs): Read = match redis::pipe()
+        let (stored, stored_outbound, stored_grpc, version, seqs): Read = match redis::pipe()
             .cmd("GET")
             .arg(&keys.report)
             .cmd("GET")
             .arg(&keys.outbound)
+            .cmd("GET")
+            .arg(&keys.grpc)
             .cmd("HGET")
             .arg(&keys.meta)
             .arg("version")
@@ -1371,6 +1483,9 @@ impl Store {
             }
         };
         let mut report = Report::join(inbound, outbound);
+        if let Some(bytes) = stored_grpc {
+            report.apply_grpc(read_overlay(&bytes).ok_or_else(|| unreadable("grpc"))?);
+        }
         let version: u64 = match version {
             None => 0,
             Some(v) => v.parse().map_err(|_| unreadable("report"))?,
@@ -1463,6 +1578,14 @@ impl Store {
         );
         let (exchanges, sample_bytes) = (report.exchanges(), report.sample_bytes());
         // `:report` keeps the F7 format (inbound, version 1); outbound goes in its own key.
+        // The gRPC parts go to `:grpc`, which a controller up to F13 never reads (spec §7.3).
+        let (report, overlay) = report.split_grpc();
+        let grpc_json = if overlay.is_empty() {
+            String::new()
+        } else {
+            overlay.to_json().map_err(unserialisable)?
+        };
+        drop(overlay);
         let (inbound, outbound) = report.into_split();
         let json = inbound.to_json().map_err(unserialisable)?;
         drop(inbound);
@@ -1471,11 +1594,12 @@ impl Store {
             None => String::new(),
         };
         drop(outbound);
-        let stored_bytes = json.len() + outbound_json.len();
+        let stored_bytes = json.len() + outbound_json.len() + grpc_json.len();
         let id = rand::random::<u128>();
         let (staged, staged_outbound) = (keys.staged(id, "report"), keys.staged(id, "outbound"));
+        let staged_grpc = keys.staged(id, "grpc");
         // From here the staged keys are deleted on every way out but the script's answer.
-        let mut guard = StageGuard::new(conn.clone(), [&staged, &staged_outbound]);
+        let mut guard = StageGuard::new(conn.clone(), [&staged, &staged_outbound, &staged_grpc]);
         let sent = async {
             stage(&mut conn, &staged, &staged_outbound, json.as_bytes()).await?;
             stage(
@@ -1484,7 +1608,8 @@ impl Store {
                 &staged,
                 outbound_json.as_bytes(),
             )
-            .await
+            .await?;
+            stage(&mut conn, &staged_grpc, &staged, grpc_json.as_bytes()).await
         };
         if let Err(e) = sent.await {
             guard.clean().await;
@@ -1502,6 +1627,8 @@ impl Store {
             .key(&keys.outbound)
             .key(&staged)
             .key(&staged_outbound)
+            .key(&keys.grpc)
+            .key(&staged_grpc)
             .arg(version)
             .arg(ttl_ms)
             .arg(field_ttl)
@@ -1539,7 +1666,13 @@ impl Store {
         });
         // The digest of §7.7: the script prefixes it with the version it writes.
         script.arg(sha256_hex(outbound_json.as_bytes()));
-        drop((json, outbound_json));
+        script.arg(if grpc_json.is_empty() {
+            String::new()
+        } else {
+            grpc_json.len().to_string()
+        });
+        script.arg(sha256_hex(grpc_json.as_bytes()));
+        drop((json, outbound_json, grpc_json));
         let result: i64 = match script.invoke_async(&mut conn).await {
             Ok(result) => {
                 // Renamed, or deleted by the script's refusal.

@@ -459,9 +459,12 @@ impl Sample {
         for (name, value) in &mut self.response.headers {
             *value = response_redactor.header(name, value);
         }
-        if grpc_call(&self.request.headers) {
+        // Trailers make it a gRPC sample whatever the request says (a faulty sidecar may not tell).
+        if grpc_call(&self.request.headers) || !self.response.trailers.is_empty() {
             bin_values(request_redactor, &mut self.request.headers);
             bin_values(response_redactor, &mut self.response.headers);
+        }
+        if !self.response.trailers.is_empty() {
             let grpc = GrpcRedactor::new(response_redactor.clone(), Vec::new());
             for (name, value) in &mut self.response.trailers {
                 *value = grpc.metadata(name, value);
@@ -621,6 +624,28 @@ impl Samples {
             self.absorb(hash, sample);
         }
         fields
+    }
+
+    /// The samples that hold a gRPC message or trailers.
+    pub(super) fn grpc_only(&self) -> Samples {
+        Samples(
+            self.0
+                .iter()
+                .filter(|(_, s)| s.is_grpc())
+                .map(|(h, s)| (*h, s.clone()))
+                .collect(),
+        )
+    }
+
+    /// Puts the full samples of `overlay` in place of the samples that `without_grpc` makes of
+    /// them (spec §7.3, `:grpc`); a sample that has no counterpart joins while there is room.
+    pub(super) fn apply(&mut self, overlay: Samples) {
+        for (hash, sample) in overlay.0 {
+            let (stripped, _) = sample.without_grpc();
+            if self.0.remove(&stripped).is_some() || self.0.len() < MAX_SAMPLES {
+                self.0.insert(hash, sample);
+            }
+        }
     }
 
     /// Whether a sample holds a gRPC message or trailers.

@@ -1449,6 +1449,52 @@ impl Report {
         self.clone().into_split()
     }
 
+    /// The report as `:report` and `:outbound` keep it (no gRPC part in a sample, version 1 or
+    /// 2) and the overlay that holds the full gRPC samples (spec §7.3).
+    pub fn split_grpc(mut self) -> (Report, super::overlay::GrpcOverlay) {
+        let mut overlay = super::overlay::GrpcOverlay::new();
+        if self.has_grpc() {
+            for (direction, scopes) in &self.scopes {
+                for (key, scope) in scopes {
+                    for (path, methods) in &scope.raw {
+                        for (method, stats) in methods {
+                            let samples = stats.samples.grpc_only();
+                            if !samples.is_empty() {
+                                overlay.insert(
+                                    *direction,
+                                    key.clone(),
+                                    path.clone(),
+                                    method.clone(),
+                                    samples,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            self.for_each_stats_mut(|stats| stats.samples.without_grpc());
+            self.sync_version();
+        }
+        (self, overlay)
+    }
+
+    /// The inverse of [`Report::split_grpc`]: each full sample takes the place of the one that
+    /// stands for it; an entry whose endpoint is gone is dropped.
+    pub fn apply_grpc(&mut self, overlay: super::overlay::GrpcOverlay) {
+        for (direction, key, path, method, samples) in overlay.entries() {
+            let stats = self
+                .scopes
+                .get_mut(&direction)
+                .and_then(|s| s.get_mut(&key))
+                .and_then(|s| s.raw.get_mut(&path))
+                .and_then(|m| m.get_mut(&method));
+            if let Some(stats) = stats {
+                stats.samples.apply(samples);
+            }
+        }
+        self.sync_version();
+    }
+
     /// [`Report::split`] without copying the scopes: the controller's write holds a report of
     /// tens of megabytes at the store limits (SHR-18).
     pub fn into_split(mut self) -> (Report, Option<Report>) {

@@ -17,7 +17,7 @@ use axum::body::Bytes;
 use axum::http::HeaderName;
 use axum::http::HeaderValue;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
-use mimic_core::discovery::egress::{EgressSet, etag, matches_etag};
+use mimic_core::discovery::egress::{EgressSet, composite_hex, etag, matches_etag};
 use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{Semaphore, watch};
 
@@ -376,15 +376,26 @@ impl io::Write for Capped {
 
 /// The projection of stored `:outbound` bytes (none: the empty set) with the hash of the bytes,
 /// for a blocking thread: parsing and serialising are CPU work.
-fn project(stored: Option<Vec<u8>>, format: u32, max: usize) -> Built {
-    let hex = sha256_hex(stored.as_deref().unwrap_or_default());
+fn project(stored: Option<Vec<u8>>, grpc: Option<Vec<u8>>, format: u32, max: usize) -> Built {
+    let mut hex = sha256_hex(stored.as_deref().unwrap_or_default());
+    if let Some(bytes) = &grpc {
+        hex = composite_hex(&hex, Some(&sha256_hex(bytes)));
+    }
     let set = match &stored {
         None => EgressSet {
             authorities: Default::default(),
             format,
         },
         Some(bytes) => match parse_outbound(bytes) {
-            Some(report) => EgressSet::project_as(&report, format),
+            Some(mut report) => {
+                if let Some(bytes) = &grpc {
+                    match crate::store::read_overlay(bytes) {
+                        Some(overlay) => report.apply_grpc(overlay),
+                        None => return Built::Unreadable,
+                    }
+                }
+                EgressSet::project_as(&report, format)
+            }
             None => return Built::Unreadable,
         },
     };
@@ -487,6 +498,16 @@ impl Job {
             .outbound_len(namespace, deployment)
             .await
             .map_err(read_denied)?;
+        // Format 2 reads the gRPC overlay too (spec §7.7).
+        let grpc_len = if format == 2 {
+            self.store
+                .grpc_len(namespace, deployment)
+                .await
+                .map_err(read_denied)?
+        } else {
+            0
+        };
+        let stored = stored.saturating_add(grpc_len);
         let share = stored.saturating_add(self.max_egress as u64);
         // It could never be served: refused without a read, and not `503`, which is retried.
         if share > self.budget.capacity() {
@@ -502,6 +523,14 @@ impl Job {
             .outbound_bytes(namespace, deployment)
             .await
             .map_err(read_denied)?;
+        let grpc = if format == 2 && grpc_len > 0 {
+            self.store
+                .grpc_bytes(namespace, deployment)
+                .await
+                .map_err(read_denied)?
+        } else {
+            None
+        };
         let max = self.max_egress;
         let cache = self.cache.clone();
         let (ns, dep) = (namespace.to_string(), deployment.to_string());
@@ -510,7 +539,7 @@ impl Job {
             let _share = reservation;
             #[cfg(test)]
             let _running = cache.gate();
-            match project(bytes, format, max) {
+            match project(bytes, grpc, format, max) {
                 Built::Set(hex, body) => Ok(cache.admit(&ns, &dep, format, &hex, body)),
                 other => Err(other),
             }
@@ -666,6 +695,18 @@ impl SidecarApi {
             .outbound_digest(namespace, deployment)
             .await
             .map_err(|e| refuse(read_denied(e), caller))?;
+        // The digest of format 2 holds the gRPC overlay's (spec §7.7).
+        let digest = match digest {
+            Some(hex) if format == 2 => {
+                let grpc = self
+                    .store
+                    .grpc_digest(namespace, deployment)
+                    .await
+                    .map_err(|e| refuse(read_denied(e), caller))?;
+                Some(composite_hex(&hex, grpc.as_deref()))
+            }
+            other => other,
+        };
         if let Some(hex) = &digest {
             let current = etag(format, hex);
             // Every value of every header (RFC 9110 §13.1.2).

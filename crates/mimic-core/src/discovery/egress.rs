@@ -275,6 +275,16 @@ pub fn fresh_hex(digest: Option<&str>, version: u64) -> Option<&str> {
     (well_formed && written == version.to_string()).then_some(hex)
 }
 
+/// The digest of a format 2 answer (spec §7.7): the outbound hex alone without a `:grpc`, else
+/// the SHA-256 of `<outbound hex>:<grpc hex>`, so that a change of either changes the `ETag`.
+pub fn composite_hex(outbound_hex: &str, grpc_hex: Option<&str>) -> String {
+    let Some(grpc) = grpc_hex else {
+        return outbound_hex.to_string();
+    };
+    let hash = Sha256::digest(format!("{outbound_hex}:{grpc}").as_bytes());
+    hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// `"<format>-<hex>"`, quotes included.
 pub fn etag(format: u32, hex: &str) -> String {
     format!("\"{format}-{hex}\"")
