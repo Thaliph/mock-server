@@ -12,9 +12,10 @@ Findings:
 
 - **HTTP/1.1:** the discovery sidecar (caller and callee) adds about 2 ms at p50 and 4 ms at p99 over the
   5 ms service, from 50 to 200 rps; sidecar CPU about 0.04 core per 50 rps, RSS 13 MiB.
-- **h2c:** the sidecar adds about 45 ms per request and 200 rps is not reached (162 rps with 8
-  connections). This is a bug, not a cost: the sidecar's proxied sockets do not set `TCP_NODELAY`
-  (Nagle and delayed ACKs, #480). The h2c budgets are taken after its fix and a re-run.
+- **h2c:** the first run added about 45 ms per request and stopped at 162 rps: the sidecar's sockets
+  did not set `TCP_NODELAY` (Nagle and delayed ACKs, #480). After the fix (#481) the sidecar adds about
+  3 ms at p50 and 5.7 ms at p99 over h2c, and 200 rps is reached; see *B0 after #480* below. The h2c
+  budgets are taken from that run.
 - 200 rps over HTTP/1.1 is clean on this machine (no errors, measured rate within 0.1 %).
 
 ## Conditions
@@ -60,3 +61,24 @@ Latencies in milliseconds, errors are the responses that are not 200, sidecar CP
 | 2026-11-12 | discovery | h2c | 50 | 49.98 | 10.41 | 51.61 | 53.47 | 53.65 | 0 | 0.068 | 0.063 | 14 | 14.2 |
 | 2026-11-12 | discovery | h2c | 100 | 99.82 | 51.75 | 58.39 | 59.89 | 71.25 | 0 | 0.141 | 0.12 | 14.1 | 14.3 |
 | 2026-11-12 | discovery | h2c | 200 | 162.22 | 48 | 53.97 | 59.41 | 59.95 | 0 | 0.244 | 0.214 | 14.2 | 14.3 |
+
+## B0 after #480
+
+Same machine, conditions and matrix, from `main` at the merge of #481 (`TCP_NODELAY` on every
+sidecar socket), files `2026-11-12-nodelay-<setup>.json`. Highest 1-minute load average during the
+12 runs (sampled every 30 s, including the kind cluster start-up): 13.6.
+
+| Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-12 | plain | http1 | 50 | 49.99 | 6.1 | 6.87 | 8.13 | 8.97 | 0 | - | - | - | - |
+| 2026-11-12 | plain | http1 | 100 | 99.97 | 6.38 | 6.9 | 7.64 | 11.5 | 0 | - | - | - | - |
+| 2026-11-12 | plain | http1 | 200 | 199.94 | 6.29 | 6.88 | 7.81 | 10.06 | 0 | - | - | - | - |
+| 2026-11-12 | plain | h2c | 50 | 49.98 | 6.62 | 7.68 | 9.11 | 9.8 | 0 | - | - | - | - |
+| 2026-11-12 | plain | h2c | 100 | 99.98 | 6.6 | 7.55 | 8.19 | 10 | 0 | - | - | - | - |
+| 2026-11-12 | plain | h2c | 200 | 199.94 | 6.59 | 7.53 | 8.73 | 11.57 | 0 | - | - | - | - |
+| 2026-11-12 | discovery | http1 | 50 | 49.98 | 8.24 | 9.3 | 13.73 | 23.6 | 0 | 0.043 | 0.043 | 13.1 | 13.1 |
+| 2026-11-12 | discovery | http1 | 100 | 99.96 | 8.27 | 9.35 | 13.52 | 21.93 | 0 | 0.086 | 0.086 | 13.2 | 13.1 |
+| 2026-11-12 | discovery | http1 | 200 | 199.94 | 8.02 | 8.97 | 12.56 | 25.71 | 0 | 0.165 | 0.167 | 13.4 | 13.2 |
+| 2026-11-12 | discovery | h2c | 50 | 49.98 | 9.91 | 11.7 | 14.78 | 16.98 | 0 | 0.066 | 0.064 | 14.2 | 14.2 |
+| 2026-11-12 | discovery | h2c | 100 | 99.96 | 9.65 | 10.95 | 13.92 | 23.75 | 0 | 0.125 | 0.12 | 14.3 | 14.6 |
+| 2026-11-12 | discovery | h2c | 200 | 199.92 | 9.66 | 11.1 | 14.55 | 20.27 | 0 | 0.252 | 0.243 | 14.6 | 14.6 |
