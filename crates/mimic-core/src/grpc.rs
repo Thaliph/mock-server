@@ -3,5 +3,6 @@
 //! input.
 
 pub mod frame;
+pub mod record;
 pub mod redact;
 pub mod wire;

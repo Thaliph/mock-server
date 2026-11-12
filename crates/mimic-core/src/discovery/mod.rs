@@ -7,6 +7,7 @@ pub mod histogram;
 pub mod observed;
 pub mod openapi;
 mod openapi_parts;
+pub mod overlay;
 pub mod placeholder;
 pub mod redact;
 pub mod report;

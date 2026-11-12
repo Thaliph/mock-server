@@ -76,6 +76,7 @@ impl DiscoveryMetrics {
             "rejected",
             "error",
             "inbound_only",
+            "grpc_dropped",
         ] {
             let _ = self.pushes.get_or_create(&ResultLabel { result });
         }

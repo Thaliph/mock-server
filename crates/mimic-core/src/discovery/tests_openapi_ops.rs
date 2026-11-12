@@ -65,6 +65,7 @@ fn record(report: &mut Report, redactor: &Redactor, x: &Rx) {
                 req_body: x.req_body.as_deref().map(str::as_bytes),
                 resp_headers: &resp,
                 resp_body: x.resp_body.as_deref().map(str::as_bytes),
+                resp_trailers: &[],
             },
         },
     );

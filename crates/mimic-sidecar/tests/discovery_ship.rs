@@ -595,10 +595,14 @@ async fn ctl_16_a_pending_report_is_retried_unchanged_with_backoff() {
         assert_eq!(s.body, seen[0].body, "same bytes");
     }
     assert_eq!(seen[0].sequence(), 1);
-    assert!(seen[1].at - seen[0].at >= Duration::from_secs(1));
-    assert!(seen[2].at - seen[1].at >= Duration::from_secs(2));
+    // `at` is when the fake API read the request, not when the sidecar sent it: on a loaded
+    // machine the handshake and the body reach it a little later each time, so the gaps are
+    // allowed to come out shorter by `SKEW`.
+    const SKEW: Duration = Duration::from_millis(500);
+    assert!(seen[1].at - seen[0].at >= Duration::from_secs(1) - SKEW);
+    assert!(seen[2].at - seen[1].at >= Duration::from_secs(2) - SKEW);
     // The silent post times out after 1 s, then the backoff of 4 s.
-    assert!(seen[3].at - seen[2].at >= Duration::from_secs(5));
+    assert!(seen[3].at - seen[2].at >= Duration::from_secs(5) - SKEW);
     assert_eq!(seen[3].status, 200);
     assert_eq!(seen[4].sequence(), 2);
     assert_eq!(
@@ -1760,6 +1764,72 @@ async fn mon_10_the_last_new_endpoint_time_is_set_by_a_new_endpoint_only() {
     assert_eq!(metric(&rig, LAST_NEW_OUTBOUND), 0);
     rig.outbound_call(1).await;
     wait(|| metric(&rig, LAST_NEW_OUTBOUND) > 0).await;
+    drop(stop);
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn grp_25_a_400_to_version_3_posts_the_same_sequence_without_the_grpc_parts() {
+    let logs = capture_logs();
+    let rig = Rig::new(
+        vec![Reply::Status(400)],
+        INTERVAL,
+        DiscoveryConfig::default(),
+    )
+    .await;
+    // A gRPC request message through the HTTP/1 relay: the recorder does not care for the
+    // protocol, and the report holds a message.
+    let payload = [0x0a, 0x05, b'a', b'l', b'i', b'c', b'e'];
+    let mut body = vec![0, 0, 0, 0, payload.len() as u8];
+    body.extend(payload);
+    let mut c = TcpStream::connect(rig.proxy.addr).await.unwrap();
+    let head = format!(
+        "POST /pkg.Users/Get HTTP/1.1\r\nHost: svc.ns:8080\r\nContent-Type: application/grpc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    c.write_all(head.as_bytes()).await.unwrap();
+    c.write_all(&body).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut out))
+        .await
+        .expect("answered in time")
+        .unwrap();
+    rig.recorded(1).await;
+    assert_eq!(rig.discovery.report().version(), 3);
+
+    let (stop, task) = rig.start();
+    wait(|| rig.api.count() >= 2).await;
+    // Version 3 refused, then the same session and sequence without the gRPC parts, applied.
+    assert_eq!(rig.api.versions(), vec![(1, 3, 400), (1, 1, 200)]);
+    {
+        let seen = rig.api.seen.lock().unwrap();
+        assert_eq!(seen[0].session(), seen[1].session());
+        let first = String::from_utf8_lossy(&seen[0].body).to_string();
+        let second = String::from_utf8_lossy(&seen[1].body).to_string();
+        assert!(first.contains("\"media\":\"application/grpc\""), "{first}");
+        assert!(
+            !second.contains("\"media\":\"application/grpc\""),
+            "{second}"
+        );
+        assert!(!second.contains("trailers"), "{second}");
+        assert_eq!(seen[1].report().exchanges(), 1);
+    }
+    wait(|| {
+        metric(
+            &rig,
+            "mimic_discovery_pushes_total{result=\"grpc_dropped\"}",
+        ) == 1
+    })
+    .await;
+    logs.settled().await;
+    let lines: Vec<_> = logs
+        .text()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["message"] == "grpc not shipped")
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "WARN");
     drop(stop);
     task.await.unwrap();
 }

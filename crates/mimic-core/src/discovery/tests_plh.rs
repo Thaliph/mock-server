@@ -349,6 +349,7 @@ fn plh_03_the_output_does_not_depend_on_the_secret() {
                 req_body: Some(body.as_bytes()),
                 resp_headers: &[],
                 resp_body: None,
+                resp_trailers: &[],
             },
         )
         .to_json()
@@ -389,6 +390,7 @@ fn leaky(redactor: &Redactor, canary: &str) -> Report {
             req_body: Some(body.as_bytes()),
             resp_headers: &headers,
             resp_body: Some(body.as_bytes()),
+            resp_trailers: &[],
         },
     )
 }
@@ -475,6 +477,7 @@ fn plh_05_the_upgrade_gives_the_type_of_the_field() {
             req_body: Some(body),
             resp_headers: &[],
             resp_body: None,
+            resp_trailers: &[],
         },
     );
     let mut old = legacy(&original);
@@ -540,6 +543,7 @@ fn plh_05_an_outbound_request_and_an_authority_host() {
                 req_body: None,
                 resp_headers: &[],
                 resp_body: None,
+                resp_trailers: &[],
             },
         ),
     );

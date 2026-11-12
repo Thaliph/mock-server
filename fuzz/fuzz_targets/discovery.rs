@@ -161,6 +161,7 @@ fuzz_target!(|data: &[u8]| {
                 req_body: Some(get(4)),
                 resp_headers: &resp,
                 resp_body: Some(get(6)),
+                resp_trailers: if flags & 0x20 != 0 { resp.as_slice() } else { &[] },
             },
         };
         if outbound {

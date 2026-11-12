@@ -135,6 +135,7 @@ fn run(data: &[u8]) {
                 req_body: Some(get(4)),
                 resp_headers: &resp,
                 resp_body: Some(get(6)),
+                resp_trailers: &[],
             },
         };
         if outbound {

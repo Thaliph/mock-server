@@ -94,6 +94,7 @@ impl Owned {
                     req_body: self.req_body.as_deref(),
                     resp_headers: &resp,
                     resp_body: self.resp_body.as_deref(),
+                    resp_trailers: &[],
                 },
             },
         )

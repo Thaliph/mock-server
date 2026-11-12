@@ -1025,6 +1025,7 @@ async fn ctl_12_one_line_per_push_and_the_expected_metrics() {
 mod disconnect;
 mod egress;
 mod egress_cache;
+mod grpc;
 mod memory;
 mod mode;
 mod v2;

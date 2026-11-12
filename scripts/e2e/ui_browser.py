@@ -1,8 +1,9 @@
 # Loads one page in a headless Chromium through the DevTools protocol and prints what it saw as JSON (UI-12).
 # Stdlib only (a minimal WebSocket client), run by scripts/e2e.sh with python3 -I. Usage:
-#   ui_browser.py <devtools port> <url> [--wait TEXT]... [--expand] [--interceptor]
+#   ui_browser.py <devtools port> <url> [--wait TEXT]... [--set ID=VALUE]... [--expand] [--interceptor]
 # It waits until the page text holds every TEXT (up to 45 s), with --expand opens every operation and walks
-# every example selector, settles for 3 s so that a stray request would show, then prints:
+# every example selector, with --set gives each form control of that id the value (and fires its input and change
+# events) once the waits are met, then waits 1 s for the page to react; settles for 3 s so that a stray request would show, then prints:
 #   text       the page text (innerText), with --expand also what each selector option showed
 #   dom        the DOM (outerHTML)
 #   buttons    the text of every button
@@ -200,6 +201,16 @@ COLLECT = """JSON.stringify({
 })"""
 
 
+SET = """(() => {
+  const control = document.getElementById(%s);
+  if (!control) return false;
+  control.value = %s;
+  control.dispatchEvent(new Event('input', { bubbles: true }));
+  control.dispatchEvent(new Event('change', { bubbles: true }));
+  return true;
+})()"""
+
+
 INTERCEPTOR = """(() => {
   const o = window.location.origin;
   const urls = {
@@ -264,6 +275,7 @@ def main():
     port, url, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
     waits = [rest[i + 1] for i, a in enumerate(rest) if a == "--wait"]
     expand = "--expand" in rest
+    sets = [rest[i + 1].split("=", 1) for i, a in enumerate(rest) if a == "--set"]
     request = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?about:blank", method="PUT")
     with urllib.request.urlopen(request, timeout=30) as r:
         target = json.load(r)
@@ -283,6 +295,13 @@ def main():
     else:
         print(f"ui_browser: {url}: the page never showed {waits}; it shows {text[:500]!r}", file=sys.stderr)
         sys.exit(1)
+    for control, value in sets:
+        found = cdp.eval(SET % (json.dumps(control), json.dumps(value)))
+        if not found:
+            print(f"ui_browser: {url}: no form control {control!r} to set", file=sys.stderr)
+            sys.exit(1)
+    if sets:
+        cdp.drain(1)
     extra = cdp.eval(EXPAND) if expand else []
     interceptor = cdp.eval(INTERCEPTOR) if "--interceptor" in rest else None
     if interceptor is not None:

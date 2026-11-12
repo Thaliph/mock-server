@@ -320,6 +320,7 @@ mod bodies {
         let obs = observed(&Observation {
             resp_headers: &[("content-type", "application/problem+json")],
             resp_body: Some(br#"{"title": "x"}"#),
+            resp_trailers: &[],
             ..Default::default()
         });
         let b = body_json(&obs, "response");
@@ -615,6 +616,7 @@ mod no_leak {
                 ("set-cookie", "sid=setcookie-secret-value; HttpOnly"),
             ],
             resp_body: Some(form.as_bytes()),
+            resp_trailers: &[],
         });
         obs = obs.clone().merge(obs);
         for wire in [
@@ -752,6 +754,7 @@ fn with_observation<R>(o: &Owned, f: impl FnOnce(&Observation<'_>) -> R) -> R {
         req_body: o.req_body.as_deref(),
         resp_headers: &resp,
         resp_body: o.resp_body.as_deref(),
+        resp_trailers: &[],
     })
 }
 
@@ -1007,6 +1010,7 @@ mod cap {
                         req_body: Some(body.as_bytes()),
                         resp_headers: &[],
                         resp_body: None,
+                        resp_trailers: &[],
                     });
                 }
                 o
@@ -1089,6 +1093,7 @@ mod names {
             req_body: None,
             resp_headers: &ct,
             resp_body: Some(&body),
+            resp_trailers: &[],
         };
         let f = observed(&o).to_json()["fields"].clone();
         for field in [
@@ -1113,6 +1118,7 @@ mod names {
             req_body: Some(&body),
             resp_headers: &hdr,
             resp_body: Some(&body),
+            resp_trailers: &[],
         };
         let json = observed(&o).to_json().to_string();
         assert!(!json.contains(&"é".repeat(65)), "a name was not cut");

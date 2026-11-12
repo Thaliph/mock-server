@@ -33,14 +33,22 @@ All notable changes to mimic are documented in this file. The format follows
 - Benchmarks of the sidecar: `scripts/bench.sh` runs fortio against an echo server with and without the
   sidecar at 50, 100 and 200 rps (never above), records the latencies and the sidecar CPU and RSS in
   `docs/bench/`, and cleans up its namespace on exit. Baseline B0 of 2026-11-12 in `docs/bench/README.md` (#436).
+- gRPC unary calls are recorded with their messages: the samples of a gRPC endpoint hold the first request and response message (read without a schema, keyed by field number) and the response trailers, redacted before anything leaves the sidecar (JWTs, tokens, cards, high-entropy values, `-bin` metadata) and again by the controller; the OpenAPI document shows the message, and `mimic_discovery_bodies_total` counts gRPC messages as `parsed`, `opaque`, `too_large` or `encoding`. A report with such a sample is `"version": 3` and the egress set has a `format` 2 (a pull of `format=1`, which sidecars up to 0.2.0-alpha.3 make, is served without the gRPC parts); a sidecar whose controller answers `400` to version 3 posts the report again without them (`mimic_discovery_pushes_total{result="grpc_dropped"}`). Streams, per-field rules, reflection and replay are later steps (#461).
+- The Endpoints tab lists the inbound and outbound endpoints of a picked deployment (`/ui/endpoints?deployment=<ns>/<dep>`), filtered in the browser by method, template, authority and status class, each row linking to the Swagger UI page of its document (#466).
 
 ### Fixed
 
 - Every TCP socket of the sidecar (accepted, connected to the destination, pass-through) and of the controller's listeners and Valkey connections sets `TCP_NODELAY`: HTTP/2 through the sidecar no longer pays a ~40 ms Nagle and delayed-ACK stall per request (#480).
+- The read-only YAML of the resource view escapes U+0085, U+2028 and U+2029 in strings and keys (YAML 1.1 line breaks); the UI router serves the resource view only under `/ui/workloads/<ns>/<dep>/resources/` and the document page only under `/openapi/` (#474).
 
 ### Documentation
 
+- Wiki "Reading the API": the Endpoints tab and its filters; annotation values of the resource view are shown as set by their authors (#466, #474).
 - Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
+
+### Upgrade notes
+
+- The gRPC messages and trailers are stored in a key of their own (`mimic:v1:{<ns>/<dep>}:grpc`); `:report` and `:outbound` keep the formats that 0.2.0-alpha.3 reads, so a rolling controller upgrade or a rollback keeps every workload served and only loses the gRPC data (the keys expire after `MIMIC_STORE_TTL`).
 
 ## [0.2.0-alpha.3] - 2026-11-11
 

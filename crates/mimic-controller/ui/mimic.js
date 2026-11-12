@@ -298,6 +298,128 @@
     });
   }
 
+  // The Endpoints tab: the deployment picker and four filters, applied in the browser to the
+  // rows of the picked deployment's endpoint list. Nothing is requested when a filter changes.
+  function statusClasses(statuses) {
+    return Object.keys(statuses || {}).map(function (code) {
+      return code.charAt(0) + "xx";
+    });
+  }
+
+  function endpointsPage() {
+    var wanted = new URLSearchParams(window.location.search).get("deployment") || "";
+    api("/v1/workloads").then(function (data) {
+      var ids = ((data && data.workloads) || []).map(function (w) {
+        return w.namespace + "/" + w.deployment;
+      }).sort();
+      var picker = el("select", null, { id: "filter-deployment" });
+      add(picker, [el("option", "Pick a deployment", { value: "" })].concat(ids.map(function (id) {
+        return el("option", id, { value: id });
+      })));
+      picker.value = ids.indexOf(wanted) >= 0 ? wanted : "";
+      var method = el("select", null, { id: "filter-method" });
+      var template = el("input", null, { id: "filter-template", type: "text" });
+      var authority = el("input", null, { id: "filter-authority", type: "text" });
+      var status = el("select", null, { id: "filter-status" });
+      add(status, ["", "2xx", "3xx", "4xx", "5xx"].map(function (c) {
+        return el("option", c === "" ? "Any status" : c, { value: c });
+      }));
+      var result = el("div");
+      var rows = [];
+      var ns = "";
+      var dep = "";
+
+      function label(text, control) {
+        return add(el("label"), [document.createTextNode(text + " "), control]);
+      }
+
+      function render() {
+        var shown = rows.filter(function (e) {
+          return (method.value === "" || e.method === method.value) &&
+            (template.value === "" ||
+              String(e.template).toLowerCase().indexOf(template.value.toLowerCase()) >= 0) &&
+            (authority.value === "" ||
+              String(e.authority || "").toLowerCase().indexOf(authority.value.toLowerCase()) >= 0) &&
+            (status.value === "" || statusClasses(e.statuses).indexOf(status.value) >= 0);
+        });
+        if (shown.length === 0) {
+          fill(result, [el("p", "No endpoint matches")]);
+          return;
+        }
+        fill(result, [table(
+          ["Direction", "Port", "Authority", "Method", "Template", "Exchanges", "Statuses",
+            "p50 ms", "p90 ms", "p99 ms", "Last seen", "Document"],
+          shown.map(function (e) {
+            var latency = e.latency_ms || {};
+            return [e.direction, e.port, e.authority, e.method, e.template, e.exchanges,
+              pairs(e.statuses), latency.p50, latency.p90, latency.p99, e.last_seen,
+              link(e.document, workloadPath(ns, dep) + "/openapi/" + enc(e.document))];
+          })
+        )]);
+      }
+
+      function fill(parent, nodes) {
+        while (parent.firstChild) {
+          parent.removeChild(parent.firstChild);
+        }
+        add(parent, nodes);
+      }
+
+      function load() {
+        var id = picker.value;
+        var slash = id.indexOf("/");
+        fill(result, []);
+        if (id === "") {
+          return Promise.resolve();
+        }
+        ns = id.slice(0, slash);
+        dep = id.slice(slash + 1);
+        return api(apiPath(ns, dep, "/endpoints")).then(function (list) {
+          if (list === null) {
+            fill(result, [el("p", "No data")]);
+            return;
+          }
+          rows = list.endpoints || [];
+          var methods = {};
+          rows.forEach(function (e) {
+            methods[e.method] = true;
+          });
+          fill(method, [el("option", "Any method", { value: "" })].concat(
+            Object.keys(methods).sort().map(function (m) {
+              return el("option", m, { value: m });
+            })));
+          render();
+        });
+      }
+
+      picker.addEventListener("change", function () {
+        var url = window.location.pathname +
+          (picker.value === "" ? "" : "?deployment=" + enc(picker.value).replace(/%2F/g, "/"));
+        window.history.replaceState(null, "", url);
+        load().catch(failed);
+      });
+      [method, status].forEach(function (control) {
+        control.addEventListener("change", render);
+      });
+      [template, authority].forEach(function (control) {
+        control.addEventListener("input", render);
+      });
+      show([
+        el("h1", "Endpoints"),
+        add(el("p", null, { class: "filters" }), [
+          label("Deployment", picker), label("Method", method), label("Template", template),
+          label("Authority", authority), label("Status", status)
+        ]),
+        result
+      ]);
+      if (ids.length === 0) {
+        fill(result, [el("p", "No data")]);
+        return;
+      }
+      return load();
+    }).catch(failed);
+  }
+
   function route() {
     var parts = window.location.pathname.split("/").filter(function (p) {
       return p !== "";
@@ -310,17 +432,17 @@
       placeholder("Map", "The map of calls between deployments is not available yet.");
     } else if (parts.length === 2 && parts[1] === "endpoints") {
       markTab("/ui/endpoints");
-      placeholder("Endpoints", "Pick a deployment in the Workloads tab to see its endpoints.");
+      endpointsPage();
     } else if (parts.length === 2 && parts[1] === "loadtests") {
       markTab("/ui/loadtests");
       placeholder("Load tests", "The runs of every deployment are not available here yet.");
-    } else if (parts.length === 4) {
+    } else if (parts.length === 4 && parts[1] === "workloads") {
       markTab("/ui/");
       workloadPage(parts[2], parts[3]);
-    } else if (parts.length === 6) {
+    } else if (parts.length === 6 && parts[1] === "workloads" && parts[4] === "openapi") {
       markTab("/ui/");
       openapiPage(parts[2], parts[3], parts[5]);
-    } else if (parts.length === 7) {
+    } else if (parts.length === 7 && parts[1] === "workloads" && parts[4] === "resources") {
       markTab("/ui/");
       resourcePage(parts[2], parts[3], parts[5], parts[6]);
     }

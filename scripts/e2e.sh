@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -893,7 +893,7 @@ issue() {
   openssl x509 -req -in "$WORK/$1.csr" -CA "$WORK/$2.crt" -CAkey "$WORK/$2.key" -CAcreateserial \
     -days 30 -extfile "$WORK/$1.ext" -out "$WORK/$1.crt" 2>/dev/null
 }
-# derive <name> <base image> <RUN instruction> [ENV line]: the client image mimic-e2e-<name> with the
+# derive <name> <base image> <RUN instruction> [ENV line] [requirements file, copied to /tmp/requirements.txt]: the client image mimic-e2e-<name> with the
 # e2e CA in its system store (Debian and Ubuntu: update-ca-certificates; the curl image: its bundle).
 # Node does not read the system store: its ENV names the CA file too (NODE_EXTRA_CA_CERTS). mimic's
 # sidecar takes an image's system store as upstream roots, but not NODE_EXTRA_CA_CERTS (spec §7.1).
@@ -904,6 +904,10 @@ derive() {
   {
     printf 'FROM %s\nUSER root\n' "$2"
     printf 'COPY mimic-e2e-ca.crt /usr/local/share/ca-certificates/mimic-e2e.crt\n'
+    if [[ -n ${5:-} ]]; then
+      cp "$5" "$dir/requirements.txt"
+      printf 'COPY requirements.txt /tmp/requirements.txt\n'
+    fi
     [[ -z ${3:-} ]] || printf 'RUN %s\n' "$3"
     [[ -z ${4:-} ]] || printf 'ENV %s\n' "$4"
   } > "$dir/Dockerfile"
@@ -1876,7 +1880,30 @@ browse resource /ui/workloads/disc-22/users/resources/MimicWorkload/users-a --wa
 jq -e '.text | contains("Spec") and contains("deployment: \"users\"")' "$WORK/browse-resource.json" >/dev/null \
   || fail "exp_07: the resource view does not show the spec of users-a as YAML"
 browse tab-map /ui/map --wait 'not available yet'
-browse tab-endpoints /ui/endpoints --wait 'Pick a deployment'
+browse tab-endpoints /ui/endpoints --wait 'Pick a deployment' --wait disc-22/users
+# exp_11: the Endpoints tab lists the endpoints of a deployment, and its filters narrow the table in the browser.
+browse ep-users '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --wait inbound
+jq -e '[.rows[] | select(.[0] == "inbound" and .[1] == "8080" and .[4] == "/users/{users_id}") | .[3]] | sort == ["GET", "PUT"]' \
+  "$WORK/browse-ep-users.json" >/dev/null \
+  || fail "exp_11: the Endpoints tab does not list GET and PUT /users/{users_id} on port 8080: $(jq -c .rows "$WORK/browse-ep-users.json")"
+jq -e '[.links[] | select(.text == "inbound-8080" and .href == "/ui/workloads/disc-22/users/openapi/inbound-8080")] | length >= 2' \
+  "$WORK/browse-ep-users.json" >/dev/null \
+  || fail "exp_11: the endpoint rows do not link to the inbound-8080 document: $(jq -c .links "$WORK/browse-ep-users.json")"
+browse ep-put '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-method=PUT
+jq -e '[.rows[] | select(.[0] == "inbound") | .[3]] == ["PUT"]' "$WORK/browse-ep-put.json" >/dev/null \
+  || fail "exp_11: the method filter PUT does not leave only the PUT row: $(jq -c .rows "$WORK/browse-ep-put.json")"
+browse ep-none '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-template=no-such-template
+jq -e '[.rows[] | select(.[0] == "inbound")] | length == 0' "$WORK/browse-ep-none.json" >/dev/null \
+  || fail "exp_11: a template filter that matches nothing leaves rows: $(jq -c .rows "$WORK/browse-ep-none.json")"
+jq -e '.text | contains("No endpoint matches")' "$WORK/browse-ep-none.json" >/dev/null \
+  || fail "exp_11: a template filter that matches nothing does not say so"
+browse ep-class '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-status=5xx
+jq -e '(.text | contains("No endpoint matches")) and ([.rows[] | select(.[0] == "inbound")] | length == 0)' "$WORK/browse-ep-class.json" >/dev/null \
+  || fail "exp_11: a status class that matches nothing shows rows or does not say so: $(jq -c .rows "$WORK/browse-ep-class.json")"
+ep_href=$(jq -r '[.links[] | select(.text == "inbound-8080")][0].href' "$WORK/browse-ep-users.json")
+browse ep-document "$ep_href" --wait '/users/{users_id}' --expand
+jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-ep-document.json" >/dev/null \
+  || fail "exp_11: the row link does not open the Swagger UI page of its document: $(jq -c .methods "$WORK/browse-ep-document.json")"
 browse tab-loadtests /ui/loadtests --wait 'not available here yet'
 browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand --interceptor
 jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-document.json" >/dev/null \
@@ -2310,6 +2337,15 @@ jq -e '[.links[] | select(.text | startswith("outbound-users.disc-22.svc"))] | l
   || fail "shr_20: the deployment page does not list the outbound document"
 # Following the link: the document page of the document that the link names.
 egr_href=$(jq -r --arg a "$egr_authority" '[.links[] | select(.text == $a)][0].href' "$WORK/browse-front.json")
+# exp_11: the Endpoints tab lists front's outbound endpoints with their authority, linking to the outbound document.
+browse ep-front '/ui/endpoints?deployment=egr-19/front' --wait "$egr_authority" --wait '/missing'
+jq -e --arg a "$egr_authority" '[.rows[] | select(.[0] == "outbound" and .[2] == $a) | .[3] + " " + .[4]] | sort == ["GET /missing", "GET /users/{users_id}", "PUT /users/{users_id}"]' \
+  "$WORK/browse-ep-front.json" >/dev/null \
+  || fail "exp_11: the Endpoints tab does not list front's outbound endpoints: $(jq -c .rows "$WORK/browse-ep-front.json")"
+browse ep-front-authority '/ui/endpoints?deployment=egr-19/front' --wait '/missing' --set filter-authority=users.disc-22
+jq -e --arg a "$egr_authority" '([.rows[] | select(.[0] == "inbound")] | length == 0) and ([.rows[] | select(.[0] == "outbound" and .[2] == $a)] | length == 3)' \
+  "$WORK/browse-ep-front-authority.json" >/dev/null \
+  || fail "exp_11: the authority filter does not keep exactly the outbound rows: $(jq -c .rows "$WORK/browse-ep-front-authority.json")"
 browse outbound "$egr_href" --wait '/users/{users_id}' --expand
 jq -e '(.methods | map(ascii_upcase) | unique) == ["GET", "PUT"]' "$WORK/browse-outbound.json" >/dev/null \
   || fail "shr_20: the outbound document page lists the operations $(jq -c .methods "$WORK/browse-outbound.json")"
@@ -2323,6 +2359,125 @@ done
 users_after=$(users_log_count) || fail "shr_20: cannot count the access lines of the users pods after the browser run"
 [[ $users_before == "$users_after" ]] || fail "shr_20: the users pods logged $((users_after - users_before)) request(s) during the browser run"
 docker rm -f "$CHROME" >/dev/null 2>&1 || true
+
+# --- gRPC (F14, spec §6.4, §12.16 GRP-28) ----------------------------------------------------------------------------------
+# A Python gRPC pair in an enabled namespace: A (grpc-a) calls pkg.Users/Get on B (grpc-b) once a second. The sidecars
+# record the unary messages and the trailers redacted, the controller's report for B (inbound) and for A (outbound)
+# holds them as version 3, and its document shows the message. The image is the pinned python:3.13-slim plus grpcio
+# (scripts/e2e/apps/grpc_app.py), built here like the TLS client images.
+log "grp_28: a Python gRPC pair A to B: the reports of both hold the redacted messages and trailers, version 3, and no canary"
+derive grpc "$PY_SLIM" 'pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt' "" scripts/e2e/apps/grpc-requirements.txt
+ns_fresh grpc-28 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl -n grpc-28 create configmap grpc-code --from-file=grpc_app.py=scripts/e2e/apps/grpc_app.py >/dev/null
+grpc_jwt="eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ$(openssl rand -hex 8)In0.$(openssl rand -hex 16)"
+grpc_bearer="grp28-bearer-$(openssl rand -hex 12)"
+grpc_token="ghp_$(openssl rand -hex 18)"
+grpc_canaries=("$grpc_jwt" "$grpc_bearer" "$grpc_token" e2e-trace-canary e2e-note-canary ZTJlLXRyYWNlLWNhbmFyeQ ZTJlLW5vdGUtY2FuYXJ5)
+for d in grpc-a grpc-b; do
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: $d, namespace: grpc-28}
+spec: {deployment: $d, mode: discovery}
+YAML
+done
+grpc_deploy() {
+  local name=$1 role=$2 env=$3 listen=""
+  # Only the server listens: the client has no port and no readiness probe.
+  [[ $role == server ]] && listen="          ports: [{name: api, containerPort: 50051}]
+          readinessProbe: {tcpSocket: {port: api}, periodSeconds: 1}"
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $name, namespace: grpc-28}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: $name}}
+  template:
+    metadata: {labels: {app: $name}}
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: app
+          image: mimic-e2e-grpc:$TAG
+          command: [python3, /code/grpc_app.py]
+          env:
+            - {name: ROLE, value: $role}
+            - {name: APP_NAME, value: $name}
+$env
+$listen
+          volumeMounts: [{name: code, mountPath: /code, readOnly: true}]
+      volumes:
+        - {name: code, configMap: {name: grpc-code}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: $name, namespace: grpc-28}
+spec:
+  selector: {app: $name}
+  ports: [{name: api, port: 50051, targetPort: 50051}]
+YAML
+}
+grpc_deploy grpc-b server "            - {name: RESPONSE_TOKEN, value: $grpc_token}"
+kubectl -n grpc-28 rollout status deploy/grpc-b --timeout=3m >/dev/null \
+  || { kubectl -n grpc-28 describe pods -l app=grpc-b >&2 || true; fail "grp_28: deployment grpc-b did not roll out"; }
+grpc_deploy grpc-a client "            - {name: TARGET, value: \"grpc-b.grpc-28.svc:50051\"}
+            - {name: REQUEST_JWT, value: $grpc_jwt}
+            - {name: REQUEST_BEARER, value: $grpc_bearer}"
+kubectl -n grpc-28 rollout status deploy/grpc-a --timeout=3m >/dev/null \
+  || { kubectl -n grpc-28 describe pods -l app=grpc-a >&2 || true; fail "grp_28: deployment grpc-a did not roll out"; }
+has_mimic grpc-28 app=grpc-a || fail "grp_28: grpc-a was not injected"
+has_mimic grpc-28 app=grpc-b || fail "grp_28: grpc-b was not injected"
+# grpc_report <deployment>: the merged report, once it holds a version 3 sample of the method with 3 exchanges.
+grpc_report() {
+  curl -fs --max-time 10 "localhost:18082/v1/workloads/grpc-28/$1/report" > "$WORK/grp28-$1.json" 2>/dev/null \
+    && jq -e '.version == 3 and ([.. | objects | select(has("samples")) | .samples[]] | length >= 1)
+      and (.exchanges >= 3)' "$WORK/grp28-$1.json" >/dev/null
+}
+grpc_ok=0
+for _ in $(seq 40); do
+  if grpc_report grpc-b && grpc_report grpc-a; then grpc_ok=1; break; fi
+  sleep 3
+done
+(( grpc_ok )) || fail "grp_28: the reports of grpc-a and grpc-b do not hold a version 3 sample: $(head -c 600 "$WORK/grp28-grpc-b.json" 2>/dev/null)"
+# The messages and the trailers, redacted: B's inbound samples and A's outbound ones.
+for d in grpc-b grpc-a; do
+  jq -e '[.. | objects | select(has("samples")) | .samples[]] | all(
+      .request.body.media == "application/grpc"
+      and .request.body.value["1"] == "ann"
+      and .request.body.value["2"] == "mimic-jwt"
+      and .response.body.value["1"] == "ann"
+      and .response.body.value["2"] == "mimic-token"
+      and .response.body.value["3"]["1"] == 7
+      and (.response.trailers | map(select(.[0] == "grpc-status" and .[1] == "0")) | length == 1)
+      and (.response.trailers | map(select(.[0] == "x-trace-bin" and .[1] == "mimic-secret")) | length == 1)
+      and (.response.trailers | map(select(.[0] == "x-request-id" and .[1] == "r-1")) | length == 1))' \
+    "$WORK/grp28-$d.json" >/dev/null \
+    || fail "grp_28: the samples of $d are not the redacted messages: $(jq -c '[.. | objects | select(has("samples")) | .samples[]][0]' "$WORK/grp28-$d.json")"
+done
+jq -e '[.scopes.outbound // {} | keys[]] | length == 1' "$WORK/grp28-grpc-a.json" >/dev/null \
+  || fail "grp_28: grpc-a holds no outbound scope for grpc-b"
+# The document of B shows the message as the schema (field numbers) and an example.
+curl -fs --max-time 10 "localhost:18082/v1/workloads/grpc-28/grpc-b/openapi/inbound-50051" > "$WORK/grp28-doc.json" \
+  || fail "grp_28: cannot read the document of grpc-b"
+jq -e '.paths["/pkg.Users/Get"].post.requestBody.content["application/grpc"].schema.properties["1"] != null
+  and (.paths["/pkg.Users/Get"].post.responses["200"].content["application/grpc"].examples | length) >= 1' \
+  "$WORK/grp28-doc.json" >/dev/null || fail "grp_28: the document of grpc-b does not show the message: $(head -c 800 "$WORK/grp28-doc.json")"
+# Neither the app's calls nor the answers changed: A logs OK only; no canary in the reports, the documents, the store
+# or any log.
+grpc_log=$(kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=-1) || fail "grp_28: cannot read the log of grpc-a"
+[[ $(jq -R -s 'split("\n") | map(fromjson? | select(. != null and .status != "OK")) | length' <<<"$grpc_log") == 0 ]] \
+  || fail "grp_28: a call of grpc-a failed through the sidecars"
+valkey_dump > "$WORK/grp28-valkey.txt"
+{
+  for p in $(kubectl -n grpc-28 get pods -o jsonpath='{.items[*].metadata.name}'); do kubectl -n grpc-28 logs "$p" --all-containers --tail=-1; done
+  kubectl -n "$NS" logs deploy/$RELEASE-controller --tail=-1
+} > "$WORK/grp28-logs.txt"
+for c in "${grpc_canaries[@]}"; do
+  for f in "$WORK"/grp28-grpc-a.json "$WORK"/grp28-grpc-b.json "$WORK/grp28-doc.json" "$WORK/grp28-valkey.txt" "$WORK/grp28-logs.txt"; do
+    if found -F "$c" "$f"; then fail "grp_28: a canary appears in ${f##*/}"; fi
+  done
+done
 
 # --- Mock mode (F10, spec §8, §12.11 MCK-19; MCK-16 on a live connection) --------------------------------------------
 # front (injected, 2 pods) in mck-19 calls users (disc-22) and an HTTPS provider (mck-19-provider, not injected) in

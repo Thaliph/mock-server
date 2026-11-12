@@ -12,6 +12,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use mimic_core::grpc::record::first_message;
 use mimic_core::grpc::frame::{Encoding, Frame, FrameError, HEADER, MAX_MESSAGE, Parser, Payload};
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::grpc::redact::{Direction, FieldNames, FieldRule, GrpcRedactor};
@@ -65,8 +66,16 @@ fn payload(bytes: &[u8]) {
     assert_eq!(again.encode().expect("encodes"), encoded);
 }
 
+/// The first message of a captured body (GRP-19): whatever the bytes and the encoding, no panic.
+fn first(data: &[u8]) {
+    for encoding in [None, Some("gzip"), Some("br")] {
+        let _ = first_message(encoding, data);
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     payload(data);
+    first(data);
 
     let (cuts, bytes) = data.split_at(data.len().min(4));
     let (whole, whole_end) = stream(&mut Parser::new(), &[bytes]);

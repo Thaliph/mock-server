@@ -229,6 +229,7 @@ fn big_set() -> Bytes {
                             req_body: None,
                             resp_headers: &resp,
                             resp_body: Some(text.as_bytes()),
+                            resp_trailers: &[],
                         },
                     },
                 );

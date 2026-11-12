@@ -80,7 +80,7 @@ versioned tree, not an OpenAPI file:
 
 | Key | Content |
 |---|---|
-| `version` | `1` |
+| `version` | `1`; `2` when the report holds outbound scopes; `3` when a sample holds a gRPC message or trailers (see "gRPC calls") |
 | `pod` | `null` in the merged report |
 | `exchanges` | Exchanges covered |
 | `scopes.<direction>.<port>.root` | Path template tree: `literals` (name to child node), `param` (child node for parameters), `absorbing`, and `endpoints` (method to stats) |
@@ -135,6 +135,39 @@ curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints | m
 curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET.samples | length'
 ```
 
+### gRPC calls
+
+A call whose `content-type` is `application/grpc` (or `application/grpc+proto`) is recorded like any
+other, as an endpoint of `scopes.<direction>.<port>.raw` keyed by its path (`/pkg.Users/Get`), and from
+version 3 its samples hold the **first message** of the request and of the response, and the response
+**trailers**. A message is read without a schema, so its fields are keyed by number, and it is
+redacted before anything is stored: JWTs, tokens, keys and cards become their placeholders
+(`mimic-jwt`, `mimic-token`, ...), a string or bytes value that looks like a random key becomes
+`mimic-secret`, and the values of `-bin` metadata are never kept. No raw frame is stored. Trimmed
+excerpt of a sample:
+
+```json
+{"request":  {"method": "POST", "path": "/pkg.Users/Get", "query": [],
+              "headers": [["authorization", "Bearer mimic-token"], ["content-type", "application/grpc"]],
+              "body": {"media": "application/grpc", "value": {"1": "ann", "2": "mimic-jwt"}}},
+ "response": {"status": 200, "headers": [["content-type", "application/grpc"]],
+              "body": {"media": "application/grpc", "value": {"1": "ann", "3": {"1": 7}}},
+              "trailers": [["grpc-status", "0"], ["x-trace-bin", "mimic-secret"]]}}
+```
+
+Fields that hold more than one value are arrays; a field that is not a string or a number is an object
+with one key that starts with `$` (`{"$bytes": "<base64>"}`, `{"$fixed32": n}`, `{"$fixed64": n}`). A
+message that is compressed with an encoding other than `gzip`, over 256 KiB, or not a protobuf message
+is left out (`mimic_discovery_bodies_total{result}` says which: `opaque`, `too_large`, `encoding`).
+Streams are recorded by their first message; a mock still answers a gRPC call with an empty message
+(replaying the messages is planned). The OpenAPI document of a gRPC operation shows the message as an
+`application/grpc` request and response with the field numbers as property names.
+
+A report that holds no gRPC message is the same as before, and the controller keeps serving sidecars of
+earlier versions: the egress set (`/egress`, a sidecar's view of the calls its app makes) is served as
+`format` 1, which leaves the gRPC parts out, to a sidecar that asks for it and as `format` 2 to one that
+asks for the gRPC parts.
+
 ## Load test runs
 
 The result of a [load test](Load-test) is kept in Valkey (the last 20 runs per deployment) and served under
@@ -179,9 +212,10 @@ quantiles, hosts and last-seen days. Import the JSON into any OpenAPI 3.1 tool.
 The same listener serves a small read-only UI. With the port-forward above, open
 `http://localhost:8080/ui/`:
 
-- the header has four tabs: Map, Workloads, Endpoints and Load tests. Map, Endpoints and Load tests are placeholders for now;
+- the header has four tabs: Map, Workloads, Endpoints and Load tests. Map and Load tests are placeholders for now;
 - `/ui/` is the Workloads tab: every deployment with its mode, pods, endpoints, last push and a link to each mimic resource that configures it (`MimicWorkload`, `MimicLoadTest`);
-- `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` is the resource view: the spec as read-only YAML, the labels and annotations, and the status conditions;
+- `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` is the resource view: the spec as read-only YAML, the labels and annotations, and the status conditions. Annotation values are shown as their authors set them, as plain text (the UI is loopback-only and writes every value as text, never as markup);
+- `/ui/endpoints` is the Endpoints tab: pick a deployment (the pick is kept in the address, `/ui/endpoints?deployment=<ns>/<dep>`, so you can bookmark or share a view) to list its inbound and outbound endpoints, each with a link to the Swagger UI page of its document. Four filters narrow the table in the browser, without a new request: method, template and authority (case-insensitive substring), and status class (`2xx` to `5xx`: the endpoint has at least one recorded status of that class);
 - `/ui/workloads/<ns>/<dep>` shows the summary, the pods, the endpoints and one link per document;
 - the deployment page also has a "Load tests" table, filled from the routes above;
 - `/ui/workloads/<ns>/<dep>/openapi/<id>` shows the document in Swagger UI, with a link to the raw JSON.
