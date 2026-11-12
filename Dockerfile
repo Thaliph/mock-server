@@ -12,6 +12,13 @@ ARG TARGETARCH
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
+# The target cache below is shared by every local build on the daemon, and cargo's freshness check
+# compares mtimes only. COPY keeps the checkout's mtimes, which may be older than artifacts that
+# another source tree left in the cache, so cargo would reuse them. The build therefore touches the
+# sources to the build time before cargo runs (#496): the workspace crates are recompiled by every
+# build that runs this step, the registry dependencies are not. Only crates/ is touched: the root
+# manifests and Cargo.lock are not sources, and touching them would recompile the dependencies too
+# (cargo keys the dependencies' artifacts on version, features, profile and toolchain).
 # mimic-trust runs inside arbitrary app images (spec §7.1, §10.5): it is built for the musl
 # target of the image's architecture, which makes it static (no PT_INTERP, no DT_NEEDED).
 # The rustup musl targets are self-contained (own crt objects and libc), so no musl toolchain
@@ -25,6 +32,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       *) echo "unsupported TARGETARCH '$TARGETARCH'" >&2; exit 1 ;; \
     esac; \
     rustup target add "$triple"; \
+    find crates -type f -exec touch {} +; \
     cargo build --release --locked --bin mimic-sidecar --bin mimic-controller --bin mimic-load --bin mimic-init; \
     cargo build --release --locked --target "$triple" --package mimic-trust --bin mimic-trust; \
     mkdir /out /out-init; \
