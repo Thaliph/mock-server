@@ -32,10 +32,10 @@ kubectl label namespace demo mimic.platform.io/inject=enabled pod-security.kuber
 ## 2. Deploy the services
 
 The files are the test services of the project; their comments mention names used by its own tests, which you
-can ignore. Download them at the tag of the release (here `0.2.0-alpha.2`) into a scratch directory:
+can ignore. Download them at the tag of the release (here `0.2.0-alpha.3`) into a scratch directory:
 
 ```bash
-APPS=https://raw.githubusercontent.com/Thaliph/mock-server/v0.2.0-alpha.2/scripts/e2e/apps
+APPS=https://raw.githubusercontent.com/Thaliph/mock-server/v0.2.0-alpha.3/scripts/e2e/apps
 mkdir -p mimic-demo && cd mimic-demo
 curl -fsSLO $APPS/service.py && curl -fsSLO $APPS/users.yaml && curl -fsSLO $APPS/front.yaml
 ```

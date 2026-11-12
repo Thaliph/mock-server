@@ -7,13 +7,23 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+## [0.2.0-alpha.3] - 2026-11-11
+
 ### Features
 
 - `kubectl get mimicloadtest` shows the p99 latency column as `P99 MICROS` instead of `P99 ΜS`: kubectl upper-cases column names, and the micro sign became a Greek capital Mu (#431).
-
-### Documentation
-
 - Wiki onboarding: a five-page "Get started" path (Install, Quick start, Mock mode, Load test, Reading the API) whose demo injects `front` and `users`, mocks `front` with `users` scaled to 0 and load-tests `front` alone; the load test read API, kind and install accuracy, and plain wording on the user pages.
+
+### Accepted limits
+
+Unchanged from 0.2.0-alpha.2 (see
+[`docs/SPEC.md`](https://github.com/Thaliph/mock-server/blob/v0.2.0-alpha.3/docs/SPEC.md#111-accepted-limits)
+and the wiki Security page).
+
+### Upgrade notes
+
+- Nothing to migrate from 0.2.0-alpha.2: upgrade with `helm upgrade --version 0.2.0-alpha.3`. The
+  printer column rename only changes the output of `kubectl get mimicloadtest`.
 
 ## [0.2.0-alpha.2] - 2026-11-11
 
