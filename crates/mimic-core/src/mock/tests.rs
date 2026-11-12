@@ -1053,22 +1053,56 @@ fn mck_06_mode_headers_are_read_exactly() {
 fn settings(on: bool, factor: u32, passthrough: &[&str]) -> MockSettings {
     MockSettings {
         mock: on,
+        discovery: true,
         factor,
         passthrough: passthrough.iter().map(|p| p.to_string()).collect(),
     }
 }
 
+/// A `MimicWorkload` with `spec.mode: none`.
+fn silent() -> MockSettings {
+    MockSettings::default()
+}
+
 #[test]
-fn mck_01_no_workload_gives_discovery_factor_1_no_passthrough() {
-    let none = effective([]);
+fn mck_01_no_workload_gives_none_factor_1_no_passthrough() {
+    let found = effective([]);
     assert_eq!(
-        (none.mode(), none.factor_text()),
-        (Mode::Discovery, "1".into())
+        (found.mode(), found.factor_text()),
+        (Mode::None, "1".into())
     );
-    assert!(none.passthrough.is_empty());
+    assert!(found.passthrough.is_empty());
     let discovery = settings(false, 100, &[]);
     assert_eq!(effective([&discovery]).mode(), Mode::Discovery);
-    assert_eq!(effective([&MockSettings::default()]), none);
+    assert_eq!(effective([&MockSettings::default()]), found);
+}
+
+#[test]
+fn non_01_effective_mode_is_mock_over_discovery_over_none() {
+    let (none, discovery, mock) = (silent(), settings(false, 100, &[]), settings(true, 50, &[]));
+    assert_eq!(effective([&none]).mode(), Mode::None);
+    assert_eq!(effective([&none, &none]).mode(), Mode::None);
+    assert_eq!(effective([&none, &discovery]).mode(), Mode::Discovery);
+    assert_eq!(effective([&discovery, &none]).mode(), Mode::Discovery);
+    assert_eq!(effective([&none, &discovery, &mock]).mode(), Mode::Mock);
+    assert_eq!(effective([&mock, &none]).mode(), Mode::Mock);
+    // A `none` workload does not take the factor of a `mock` one, nor its passthrough away.
+    let found = effective([&none, &mock]);
+    assert_eq!(found.factor, 50);
+    let listed = settings(false, 100, &["a.test"]);
+    assert_eq!(effective([&none, &listed]).passthrough, ["a.test"]);
+}
+
+#[test]
+fn non_01_mode_names_round_trip_and_none_is_accepted_where_a_mode_is_read() {
+    for mode in [Mode::None, Mode::Discovery, Mode::Mock] {
+        assert_eq!(mode.to_string().parse::<Mode>(), Ok(mode));
+        assert_eq!(parse_mode_header(&[mode.as_str()]), Some(mode));
+    }
+    assert_eq!("none".parse::<Mode>(), Ok(Mode::None));
+    assert_eq!(parse_mode_header(&["None"]), None);
+    assert_eq!(parse_mode_header(&["none", "none"]), None);
+    assert!("record".parse::<Mode>().is_err());
 }
 
 #[test]

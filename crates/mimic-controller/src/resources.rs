@@ -200,13 +200,16 @@ impl ResourceCache {
                 .or_insert_with(|| Overview {
                     namespace: resource.namespace.clone(),
                     deployment: resource.deployment.clone(),
-                    mode: "discovery",
+                    mode: "none",
                     resources: Vec::new(),
                 });
-            if resource.kind == "MimicWorkload"
-                && resource.spec.get("mode").and_then(Value::as_str) == Some("mock")
-            {
-                entry.mode = "mock";
+            // The effective mode (spec §7): `mock` over `discovery` over `none`.
+            if resource.kind == "MimicWorkload" {
+                match resource.spec.get("mode").and_then(Value::as_str) {
+                    Some("mock") => entry.mode = "mock",
+                    Some("discovery") if entry.mode == "none" => entry.mode = "discovery",
+                    _ => {}
+                }
             }
             entry
                 .resources
@@ -422,5 +425,20 @@ mod tests {
         assert_eq!(cache.overview()[1].mode, "discovery");
         cache.replace("MimicWorkload", vec![]);
         assert_eq!(cache.overview().len(), 1, "the load test still names front");
+    }
+
+    #[test]
+    fn non_06_the_overview_mode_is_none_without_a_workload_in_discovery_or_mock() {
+        let cache = ResourceCache::new();
+        cache.apply(held("MimicLoadTest", "shop", "t", "front", ""));
+        assert_eq!(cache.overview()[0].mode, "none");
+        cache.apply(held("MimicWorkload", "shop", "a", "front", "none"));
+        assert_eq!(cache.overview()[0].mode, "none");
+        cache.apply(held("MimicWorkload", "shop", "b", "front", "discovery"));
+        assert_eq!(cache.overview()[0].mode, "discovery");
+        cache.apply(held("MimicWorkload", "shop", "c", "front", "none"));
+        assert_eq!(cache.overview()[0].mode, "discovery");
+        cache.apply(held("MimicWorkload", "shop", "d", "front", "mock"));
+        assert_eq!(cache.overview()[0].mode, "mock");
     }
 }

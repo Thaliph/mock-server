@@ -265,7 +265,7 @@ impl Tracker {
         let request = Arc::new(RequestCount::default());
         // An extended `CONNECT` is a tunnel, not an exchange.
         let capture = tap
-            .filter(|_| req.method() != hyper::Method::CONNECT)
+            .filter(|tap| tap.active() && req.method() != hyper::Method::CONNECT)
             .map(|tap| {
                 let mut capture = tap.capture();
                 let target = req
@@ -666,7 +666,7 @@ impl Http1Tracker {
                 let capture = self
                     .tap
                     .as_ref()
-                    .filter(|_| !head.connect && run.is_none())
+                    .filter(|tap| tap.active() && !head.connect && run.is_none())
                     .map(Tap::capture);
                 let mut open = Open::new(Some(head));
                 open.capture = capture;

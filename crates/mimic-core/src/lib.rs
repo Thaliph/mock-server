@@ -19,6 +19,9 @@ use std::str::FromStr;
 /// Operating mode of a deployment's sidecars (spec §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Mode {
+    /// Proxy only: forward inbound and outbound traffic, record nothing, pass outbound TLS
+    /// through (M0).
+    None,
     /// Forward and record inbound and outbound traffic.
     #[default]
     Discovery,
@@ -29,6 +32,7 @@ pub enum Mode {
 impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Mode::None => "none",
             Mode::Discovery => "discovery",
             Mode::Mock => "mock",
         }
@@ -46,9 +50,12 @@ impl FromStr for Mode {
 
     fn from_str(s: &str) -> Result<Mode, String> {
         match s {
+            "none" => Ok(Mode::None),
             "discovery" => Ok(Mode::Discovery),
             "mock" => Ok(Mode::Mock),
-            _ => Err(format!("unknown mode {s:?}, expected discovery or mock")),
+            _ => Err(format!(
+                "unknown mode {s:?}, expected none, discovery or mock"
+            )),
         }
     }
 }
@@ -77,7 +84,7 @@ mod tests {
 
     #[test]
     fn mode_round_trips_through_its_name() {
-        for mode in [Mode::Discovery, Mode::Mock] {
+        for mode in [Mode::None, Mode::Discovery, Mode::Mock] {
             assert_eq!(mode.to_string().parse::<Mode>(), Ok(mode));
         }
         assert_eq!(Mode::default(), Mode::Discovery);

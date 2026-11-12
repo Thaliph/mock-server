@@ -159,7 +159,10 @@ pub struct Options {
     /// The stall of an incomplete protocol prefix and of a mocked connection.
     pub stall: Option<Duration>,
     pub dest: Dest,
+    /// The discovery tap, gated by the mode of the rig as `main.rs` does.
     pub discovery: Option<Tap>,
+    /// The direction of the listener (default outbound).
+    pub direction: Option<Direction>,
     /// The mode at start (default `mock`).
     pub mode: Option<Mode>,
     /// The destination of every connection, instead of the rig's own listener.
@@ -265,6 +268,7 @@ pub async fn rig_with(
         stall,
         dest,
         discovery,
+        direction,
         mode: start,
         dst: fixed,
     } = options;
@@ -313,10 +317,14 @@ pub async fn rig_with(
         shared = shared.with_detect_stall(stall);
     }
     if let Some(tap) = discovery {
-        shared = shared.with_discovery(tap);
+        shared = shared.with_discovery(tap.gated(mode.recording()));
     }
     let shared = Arc::new(shared);
-    spawn_listener(listener, Direction::Outbound, shared.clone());
+    spawn_listener(
+        listener,
+        direction.unwrap_or(Direction::Outbound),
+        shared.clone(),
+    );
     Rig {
         addr,
         metrics: Arc::new(metrics),

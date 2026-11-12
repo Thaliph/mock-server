@@ -197,14 +197,19 @@ impl Mock {
         self.0.snapshot.mode().mode() == Mode::Mock
     }
 
+    /// True while the mode is `none` (spec §3): no TLS is intercepted, nothing is recorded.
+    pub(crate) fn silent(&self) -> bool {
+        self.0.snapshot.mode().mode() == Mode::None
+    }
+
     /// Resolves once the mode is `mock`, at once when it is.
     pub(crate) async fn entered(&self) {
         self.0.snapshot.mode().reaches(Mode::Mock).await;
     }
 
-    /// Resolves once the mode is `discovery`, at once when it is.
+    /// Resolves once the mode is not `mock`, at once when it is not.
     pub(crate) async fn left(&self) {
-        self.0.snapshot.mode().reaches(Mode::Discovery).await;
+        self.0.snapshot.mode().leaves(Mode::Mock).await;
     }
 
     pub(crate) fn connection(&self, decision: &'static str) {

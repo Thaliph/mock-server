@@ -192,7 +192,12 @@ pub(crate) async fn handle(
                             Parsed::Hello(hello) => hello,
                             _ => ClientHello::default(),
                         };
-                        match shared.tls().decide(&hello, dst) {
+                        let decided = if shared.mock().is_some_and(Mock::silent) {
+                            Err(Reason::ModeNone)
+                        } else {
+                            shared.tls().decide(&hello, dst)
+                        };
+                        match decided {
                             Ok(plan) => {
                                 intercept(conn, client, upstream, buf, plan, abort.as_mut()).await;
                                 return;

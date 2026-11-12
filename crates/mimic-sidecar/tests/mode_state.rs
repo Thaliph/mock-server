@@ -533,3 +533,84 @@ async fn mon_11_a_switch_whose_state_file_cannot_be_written_is_applied_and_count
     assert_eq!(mode_gauge(admin).as_deref(), Some("1"));
     assert_eq!(switches(admin, "mock"), 1.0);
 }
+
+/// The `mimic_mode` series of `admin`, by mode.
+fn mode_series(admin: SocketAddr) -> [Option<f64>; 3] {
+    ["none", "discovery", "mock"]
+        .map(|mode| series(admin, &format!("mimic_mode{{mode=\"{mode}\"}}")))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_02_the_env_mode_none_is_applied_and_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = fake_api(vec![], Reply::Silent).await;
+    let (mut process, admin) = sidecar(&api, dir.path(), "60s", &[("MIMIC_MODE", "none")]);
+    wait_for("first pull", || api.count() >= 1);
+    assert_eq!(changes(&mut process), [row("none", "1", "env")]);
+    assert_eq!(egress(admin)["mode"], "none");
+    assert_eq!(mode_gauge(admin).as_deref(), Some("0"));
+    assert_eq!(mode_series(admin), [Some(1.0), Some(0.0), Some(0.0)]);
+    assert!(!state_file(dir.path()).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_02_the_state_file_accepts_none_and_a_restart_resumes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("mimic/state")).unwrap();
+    std::fs::write(
+        state_file(dir.path()),
+        r#"{"latency_factor":1,"mode":"none"}"#,
+    )
+    .unwrap();
+    let api = fake_api(vec![], Reply::Silent).await;
+    let (mut process, admin) = sidecar(&api, dir.path(), "60s", &[("MIMIC_MODE", "discovery")]);
+    wait_for("first pull", || api.count() >= 1);
+    assert_eq!(changes(&mut process), [row("none", "1", "state")]);
+    assert_eq!(mode_series(admin), [Some(1.0), Some(0.0), Some(0.0)]);
+    assert_eq!(count(&mut process, "mode state ignored"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_05_pulled_switches_between_none_discovery_and_mock_are_applied_and_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = fake_api(
+        vec![
+            Reply::Ok(Some("discovery"), None),
+            Reply::NotModified(Some("mock"), None),
+        ],
+        Reply::NotModified(Some("none"), None),
+    )
+    .await;
+    let (mut process, admin) = sidecar(&api, dir.path(), "1s", &[("MIMIC_MODE", "none")]);
+    wait_for("the end of the script", || api.count() >= 4);
+    wait_for("none again", || {
+        mode_series(admin) == [Some(1.0), Some(0.0), Some(0.0)] && switches(admin, "none") == 1.0
+    });
+    assert_eq!(
+        changes(&mut process)
+            .into_iter()
+            .map(|(mode, _, source)| (mode, source))
+            .collect::<Vec<_>>(),
+        [
+            ("none".to_string(), "env".to_string()),
+            ("discovery".to_string(), "pull".to_string()),
+            ("mock".to_string(), "pull".to_string()),
+            ("none".to_string(), "pull".to_string()),
+        ]
+    );
+    assert_eq!(switches(admin, "discovery"), 1.0);
+    assert_eq!(switches(admin, "mock"), 1.0);
+    assert_eq!(mode_gauge(admin).as_deref(), Some("0"));
+    assert_eq!(egress(admin)["mode"], "none");
+    assert_eq!(
+        std::fs::read_to_string(state_file(dir.path())).unwrap(),
+        r#"{"latency_factor":1,"mode":"none"}"#
+    );
+    // The previous mode is in the log line.
+    let last = process
+        .logs()
+        .into_iter()
+        .rfind(|v| v["message"] == "mode changed")
+        .unwrap();
+    assert_eq!(last["previous"], "mock");
+}

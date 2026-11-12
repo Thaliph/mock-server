@@ -129,7 +129,7 @@ async fn exp_03_the_overview_lists_every_named_deployment_with_its_mode() {
     assert_eq!(
         json_of(&answer),
         json!({"workloads": [
-            {"namespace": "bank", "deployment": "pay", "mode": "discovery",
+            {"namespace": "bank", "deployment": "pay", "mode": "none",
              "resources": [{"kind": "MimicWorkload", "name": "w"}]},
             {"namespace": "shop", "deployment": "front", "mode": "mock",
              "resources": [

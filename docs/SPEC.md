@@ -70,11 +70,28 @@ from F1 `mimic-init`, from F3 `mimic-trust` and from F11 `mimic-load`. `mimic-co
 
 | Mode | Inbound | Outbound |
 |---|---|---|
-| `discovery` (default) | forwarded to the app, recorded | forwarded to the destination, recorded |
+| `none` (default, M0) | forwarded to the app, not recorded | forwarded to the destination, not recorded; outbound TLS passed through, never intercepted (§5) |
+| `discovery` | forwarded to the app, recorded | forwarded to the destination, recorded |
 | `mock` | forwarded to the app, recorded | HTTP answered from recordings, never forwarded nor recorded; non-HTTP cleartext TCP and `spec.mock.passthrough` destinations forwarded and recorded; other TLS closed (§8) |
 
 The mode is set per deployment on its `MimicWorkload` (`spec.mode`); when several
-`MimicWorkload`s name the deployment, it is `mock` as soon as one of them says `mock` (§7).
+`MimicWorkload`s name the deployment, it is `mock` as soon as one of them says `mock`, else
+`discovery` as soon as one says `discovery`, else `none` (§7). A deployment injected by label
+without any `MimicWorkload` is in `none`.
+
+**`none` means "proxy only, nothing recorded"; it does not mean "no mesh".** In `none` the
+sidecar still proxies every connection byte for byte (§4.1), installs the trust of §5 (the
+webhook is unchanged, so a switch to `discovery` needs no restart), and keeps pulling its mode
+and the egress snapshot (§7.7). It runs no recorder: no exchange, no tunnel and no sample is
+captured, nothing is held in memory for discovery, no report is shipped (§6 "Shipping"), and
+outbound TLS is passed through with `interception: mode_none` (§5), so no plaintext is ever
+read. The mimic mesh (design `docs/design/mimic-mesh.md` §3, available from M1) is independent
+of the mode: it works the same in `none` and `discovery`, and has its own kill switches, the
+chart value `mesh.enabled` and `MimicConfig.spec.mesh.enabled` (design §3.4). Switching `none`
+⇄ `discovery` ⇄ `mock` never restarts a pod. A connection kept open across a switch to `none`
+stops being recorded from its next exchange; one switched from `none` to `discovery` is recorded
+from its next exchange, but an outbound TLS connection opened in `none` stays passed through
+until it closes.
 Every pod of the deployment follows it, including pods created later, without a restart
 (F10): the webhook gives a new pod the mode of the moment in `MIMIC_MODE`, and every sidecar
 learns changes from its egress pull (§7.7), which carries the mode with the snapshot of the
@@ -359,6 +376,10 @@ client or the destination sees, the connection is **passed through** untouched i
   | the destination asks for a client certificate (`CertificateRequest`) | `client_cert_requested` | yes |
   | the client answers the sidecar's certificate with an alert, or closes the connection right after it | `client_rejected` | yes |
   | otherwise | `intercepted` | — |
+
+  In mode `none` (§3) every outbound TLS connection is passed through before any other case is
+  evaluated, with `interception: mode_none`: not remembered, no handshake of the sidecar's own,
+  no leaf issued. The first row of the table above applies from `discovery` on.
 
   The sidecar handshakes with the destination **before** answering the client: it offers the
   client's SNI and the client's ALPN list restricted to `h2` and `http/1.1` (client order),
@@ -719,7 +740,9 @@ Everything below except the capture tap, content decoding and the recorder threa
   with the same pure merge; the controller re-applies templating on the union, so a position
   that each pod sees below the literal limit but the deployment sees above it is absorbed.
   Key layout, retention (30 days) and the API are in §7.3 and §7.2. From F8 the push also
-  carries the outbound part (§6.1 "Shipping").
+  carries the outbound part (§6.1 "Shipping"). (M0) In mode `none` nothing is recorded (§3), so
+  there is nothing to freeze and no post is made; what was recorded before a switch to `none`
+  is still shipped (it was recorded in `discovery` or `mock`, redacted as ever).
 - **Consumers.** F6 renders stored reports as OpenAPI 3.1 (§7.6). F7 records egress with the same engine.
   F10 mock matching ignores volatile and redacted fields (§8) and answers placeholders where a
   value was redacted. F11 (load test) builds requests from ingress samples and volatility;
@@ -960,7 +983,7 @@ the recorder keeps the first message of each side:
 
 - `MimicWorkload` (namespaced CRD, `mimic.platform.io/v1alpha1`): selects the deployment named
   by `spec.deployment` (required, DNS-1123 name, immutable) in its namespace, holds
-  `spec.mode` (`discovery` | `mock`, default `discovery`), `spec.tls.exclude` (F3, §5),
+  `spec.mode` (`none` | `discovery` | `mock`, default `none` from M0, §3), `spec.tls.exclude` (F3, §5),
   `spec.discovery.redact` (F4, §6: extra names redacted by name, at most 64, each of `a-z`, `A-Z`, `0-9`, `-`, `_`,
   lower-cased by the webhook, applied like `spec.tls.exclude` to pods created afterwards),
   from F10 `spec.mock.latencyFactor` (number, 0–100, default 1, §8; the controller rounds it
@@ -970,12 +993,19 @@ the recorder keeps the first message of each side:
   (F5, §7.4) and from F10 mode convergence. F1 introduces the CRD with `spec.deployment` and `spec.mode` only; other fields arrive
   with their feature. When several `MimicWorkload`s name the same deployment, any of them
   selects it for injection. **Effective mode** (F10, pure, `mimic-core` `mock::effective`):
-  `mock` when at least one of them has `spec.mode: mock`, else `discovery` (a deployment
-  injected by label without any `MimicWorkload` is in `discovery`); the latency factor is the
+  `mock` when at least one of them has `spec.mode: mock`, else `discovery` when at least one
+  has `spec.mode: discovery`, else `none` (M0: `mock` > `discovery` > `none`; a deployment
+  injected by label without any `MimicWorkload` is in `none`, it was `discovery` up to F15; a
+  `MimicWorkload` without `spec.mode`, which the API server never stores, reads as `none`);
+  the latency factor is the
   `spec.mock.latencyFactor` of the first `mock` one in name order; `spec.mock.passthrough` is
   the sorted, deduplicated union over all of them (cut to its first 256, as `spec.tls.exclude`).
   Mock wins so that nobody's load test calls a real provider because another
-  `MimicWorkload` still says `discovery`. *Upgrade and rollback* (F10): the CRD is a chart
+  `MimicWorkload` still says `discovery`. *Upgrade to M0*: the CRD default becomes `none`, but
+  the API server persists defaults when it writes an object, so every `MimicWorkload` created
+  before M0 holds the `spec.mode: discovery` it was given at its creation and keeps recording;
+  only new objects without `spec.mode`, and deployments injected by label without any
+  `MimicWorkload`, are in `none` (`CHANGELOG.md` says so). *Upgrade and rollback* (F10): the CRD is a chart
   template (`deploy/helm/mimic/templates/crd.yaml`, kept on uninstall), not a `crds/` file, so
   `helm upgrade` applies the new schema with `spec.mock` and `status.mode`. `helm rollback` to
   a chart up to F9 applies the old schema: the API server then prunes `spec.mock` and
@@ -1524,7 +1554,7 @@ the recorder keeps the first message of each side:
   ```yaml
   status:
     mode:
-      mode: mock        # effective mode of the deployment (§7), from the controller's cache
+      mode: mock        # effective mode of the deployment (§7): none, discovery or mock, from the controller's cache
       pods: 2           # pods whose last egress answer is within MIMIC_STATUS_POD_WINDOW and carried `mode`
       otherPods: 1      # pods within the window whose last answer carried the other mode
   ```
@@ -2233,7 +2263,8 @@ random numbers it hands to the draw.
   WARN `mode state ignored`; a failed write is one WARN `mode state not saved` and changes
   nothing in traffic. One INFO `mode changed` (`target` = `mock`, `mode`, `previous`,
   `latency_factor`, `source`: `env` | `state` | `pull`) at start and at each change of mode or
-  factor. The latency factor is a number of hundredths, 0–10000 (the controller and the
+  factor; the `mode` and `previous` values are `none`, `discovery` or `mock` (M0: the state file
+  and `MIMIC_MODE` accept `none`). The latency factor is a number of hundredths, 0–10000 (the controller and the
   sidecar round a written factor to the nearest hundredth, halves up). The snapshot is pulled and refreshed in both
   modes; an empty snapshot in mock answers every request `599`.
 - **Connections in mock.** The sidecar does not connect to the destination before it knows
@@ -2423,7 +2454,7 @@ random numbers it hands to the draw.
   | `mimic_proxy_bytes_total` | counter | `direction`, `protocol`, `flow` (`to_upstream`, `to_client`) |
   | `mimic_tcp_connections_total` | counter (F1) | `direction`, `result` (`ok`, `connect_error`, `loop`, `no_original_dst`) |
   | `mimic_accept_errors_total` | counter | `direction` |
-  | `mimic_tls_connections_total` | counter, outbound TLS connections by §5 decision | `interception` (`intercepted`, `excluded`, `no_ca`, `unsupported`, `upstream_untrusted`, `client_cert_requested`, `client_rejected`) |
+  | `mimic_tls_connections_total` | counter, outbound TLS connections by §5 decision | `interception` (`intercepted`, `excluded`, `no_ca`, `unsupported`, `upstream_untrusted`, `client_cert_requested`, `client_rejected`, and from M0 `mode_none`) |
   | `mimic_tls_passthrough_destinations` | gauge, remembered destinations (§5) | — |
   | `mimic_tls_intermediate_expiry_timestamp_seconds` | gauge, `notAfter` of the current intermediate, 0 when none | — |
   | `mimic_tls_intermediate_requests_total` | counter | `result` (`ok`, `error`, `mismatch`) |
@@ -2442,7 +2473,8 @@ random numbers it hands to the draw.
   | `mimic_egress_endpoints` | gauge (F9, sidecar), endpoints in the egress snapshot | — |
   | `mimic_egress_bytes` | gauge (F9, sidecar), size of the snapshot's body as received, 0 without one | — |
   | `mimic_egress_last_pull_timestamp_seconds` | gauge (F9, sidecar), time of the last `200` or `304` pull, 0 before | — |
-  | `mimic_mock_mode` | gauge (F10, sidecar), 1 in mock, 0 in discovery (§8) | — |
+  | `mimic_mock_mode` | gauge (F10, sidecar), 1 in mock, 0 in `discovery` and `none` (§8) | — |
+  | `mimic_mode` | gauge (M0, sidecar), 1 for the mode the sidecar is in, 0 for the other two; the three series exist from the start (§3) | `mode` (`none`, `discovery`, `mock`) |
   | `mimic_mock_requests_total` | counter (F10), outbound requests answered by the mock (§8) | `result` (`exact`, `endpoint`, `fallback`, `miss`) |
   | `mimic_mock_miss_total` | counter (F10), misses answered `599` | `reason` (`authority`, `endpoint`, `connect`, `upgrade`, `overload`) |
   | `mimic_mock_pending` | gauge (F10), mocked requests pending (§8 "Bounds") | — |
@@ -2500,7 +2532,7 @@ random numbers it hands to the draw.
   | `mimic_proxy_active_connections` | sidecar | gauge, "Client connections open": connections accepted on the direction's listeners and not closed yet, the count `MIMIC_MAX_CONNECTIONS` bounds (§4.1), tunnels included | `direction` |
   | `mimic_proxy_overhead_seconds` | sidecar | histogram, "Time spent in the sidecar per HTTP exchange, upstream wait excluded": from the request head handed over by the client codec to the request handed to the upstream connection, plus from the response head handed over by the upstream connection to the response handed to the client codec; in mock, from the request handed over (with the body bytes the match reads, §8) to the answer handed back, minus the simulated latency. Observed for every exchange answered with a response head (by the destination or the mock, `599` included); tunnels, `unframed` and `rejected` exchanges are not. Connection setup (connect, TLS handshakes), body streaming and socket writes are not included. Buckets 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1 | `direction` |
   | `mimic_discovery_last_new_endpoint_timestamp_seconds` | sidecar | gauge, "Time an endpoint was last added to the template tree": time of the last recorded exchange whose endpoint (method and template; outbound, also its authority scope, §6.1) was not in the tree before it, a template made by absorption (§6) included; 0 before. The tree shape survives pushes (§7.2), so an endpoint seen again after a push is not new | `direction` |
-  | `mimic_mock_mode_switches_total` | sidecar (F10) | counter, "Mode changes applied": +1 each time the sidecar applies a mode other than the one it had (§8 "Mode state"); the mode taken at start, a change of factor only are not counted; a switch counts when applied, whether or not the state file could be written (§8, MCK-10) | `to` (`mock`, `discovery`) |
+  | `mimic_mock_mode_switches_total` | sidecar (F10) | counter, "Mode changes applied": +1 each time the sidecar applies a mode other than the one it had (§8 "Mode state"); the mode taken at start, a change of factor only are not counted; a switch counts when applied, whether or not the state file could be written (§8, MCK-10) | `to` (`none`, `discovery`, `mock`) |
   | `mimic_mock_latency_factor` | sidecar (F10) | gauge, "Latency factor held": the factor of §8 as a decimal (hundredths / 100, e.g. 1.5), set at start and at each change, in both modes (it applies only in mock) | — |
   | `mimic_load_planned_rate` | `mimic-load` (F11) | gauge, "Requests per second the schedule asks for now": in the open model, the pod's rate × elapsed / `rampUp` during `rampUp`, the pod's rate after it until `duration`, 0 before the pod's schedule starts and after `duration` (`load::schedule`, computed at each scrape from the elapsed monotonic time); the sum over a run's pods is the run's planned rate. Not exposed in the closed model (no rate is planned) | — |
 
@@ -2858,7 +2890,7 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_DISCOVERY_REDACT_NAMES` | empty | Extra names redacted by name (§6), comma-separated, at most 64, each 1–64 characters of `a-z0-9-_` (compared like the built-in names); the webhook sets the sorted, deduplicated union, lower-cased, of `spec.discovery.redact` of every `MimicWorkload` naming the deployment. |
 | `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | (F9) Period of the egress pull (§7.7), 1s–1h. Not set by the webhook. |
 | `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | (F9) Largest egress set read from the controller (§7.7; `<n>`, `<n>Ki`, `<n>Mi`, `<n>Gi`; 64Ki–1Gi). Not set by the webhook. Sized so that the pull peak and the discovery worst case fit the 128 Mi sidecar limit (PUL-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
-| `MIMIC_MODE` | `discovery` | (F10) Mode until the first pull answer (§3, §8): `discovery` or `mock`. The webhook always sets it to the effective mode at admission (§7). |
+| `MIMIC_MODE` | `discovery` | (F10) Mode until the first pull answer (§3, §8): `none` (M0), `discovery` or `mock`. The webhook always sets it to the effective mode at admission (§7), `none` for a deployment without a `MimicWorkload`; the sidecar's own default when it is unset stays `discovery`. |
 | `MIMIC_MOCK_LATENCY_FACTOR` | `1` | (F10) Latency factor until the first pull answer (§8), a decimal 0–100 with at most 2 fractional digits. Set by the webhook when the effective factor is not 1. |
 | `MIMIC_MOCK_MAX_PENDING` | `1024` | (F10) Mocked requests pending at once (§8 "Bounds"), 1–65536; more are answered `599` (`overload`). Not set by the webhook. Sized with the 128 Mi sidecar limit (MCK-18): raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. |
 | `MIMIC_MOCK_PASSTHROUGH` | empty | (F10) Destinations handled as in discovery while in mock (§8), comma-separated, the `MIMIC_TLS_EXCLUDE` grammar; an invalid entry or more than 256 exits with code 2. The webhook sets the union of `spec.mock.passthrough` (§7), absent when empty. |
@@ -3552,6 +3584,7 @@ names contain the criterion ID (`fnd_02_…`).
 | F13 | Readable typed placeholders for redacted values (`mimic-token`), and testing with them (#424) | (added 2026-11-11) |
 | F14 | gRPC: message framing and wire-format decoding, redaction, recording, reflection, mock (#459 and following) | (added 2026-11-12) |
 | F15 | Explorer UI: tab shell and the Workloads tab linking the mimic custom resources (#465) | (added 2026-11-12) |
+| M0 | Mode `none` (proxy only, nothing recorded), the new default (#439, design `docs/design/mimic-mesh.md` §2) | (added 2026-11-12) |
 
 ### 12.1 F0 — Foundations
 
@@ -3586,7 +3619,7 @@ Levels: **U** unit in `mimic-core`, **I** integration in `crates/*/tests`, **E**
 | INJ-09 | **I.** Each admission writes one log line (`target` = `webhook`) with namespace, pod name or `generateName`, deployment, `result` (`injected`, `skipped`, `error`) and `reason`, and increments `mimic_webhook_admissions_total{result,reason}`. Neither the logs nor the metrics contain any env value, annotation value or other pod spec content (checked with a canary env value). |
 | INJ-10 | **U.** The certificate decision is a pure function of the stored certificates and the current time (passed in): no or unparsable CA → new CA and serving certificate; serving certificate missing, expiring within 30 days or with the wrong SAN → new serving certificate signed by the existing CA; otherwise keep. |
 | INJ-11 | **E.** After install, the webhook Secret holds a CA and a serving certificate for `<service>.<namespace>.svc`, the `caBundle` equals the CA, and `mimic_webhook_certificate_expiry_timestamp_seconds` is exposed. With 2 controller replicas both serve the same certificate; after a restart and a `helm upgrade` the certificate and `caBundle` are unchanged. The controller is unready until its CA is in every webhook's `caBundle`, the certificate is loaded (in that order) and the `MimicWorkload` cache is synced. |
-| INJ-12 | **E.** The chart installs the `MimicWorkload` CRD (an invalid `spec.mode` or a missing or invalid `spec.deployment` is rejected, a change of `spec.deployment` is rejected, `spec.mode` defaults to `discovery`), a `MutatingWebhookConfiguration` with the three webhooks of §7.1 (`failurePolicy: Fail`, `sideEffects: None`, `reinvocationPolicy: IfNeeded`, pod `CREATE` only, excluded namespaces), and the RBAC of §11: `kubectl auth can-i` as the controller service account is `yes` exactly for the listed verbs and `no` for creating Secrets, reading other Secrets, reading pods and patching another webhook configuration. Patching anything but `caBundle` of its own configuration as that account is denied by the `ValidatingAdmissionPolicy`. |
+| INJ-12 | **E.** The chart installs the `MimicWorkload` CRD (an invalid `spec.mode` or a missing or invalid `spec.deployment` is rejected, a change of `spec.deployment` is rejected, `spec.mode` defaults to `discovery` up to F15 and to `none` from M0, NON-05), a `MutatingWebhookConfiguration` with the three webhooks of §7.1 (`failurePolicy: Fail`, `sideEffects: None`, `reinvocationPolicy: IfNeeded`, pod `CREATE` only, excluded namespaces), and the RBAC of §11: `kubectl auth can-i` as the controller service account is `yes` exactly for the listed verbs and `no` for creating Secrets, reading other Secrets, reading pods and patching another webhook configuration. Patching anything but `caBundle` of its own configuration as that account is denied by the `ValidatingAdmissionPolicy`. |
 | INJ-13 | **E.** In a namespace labelled `enabled` (Pod Security `privileged`), a Deployment with an HTTP readiness and liveness probe on its API port, a `tcpSocket` probe on a second port (rewritten to `/app-health/…` and its port still intercepted: a connection to it from another pod increments the inbound counter) and an init container that opens a TCP connection to a Service rolls out Ready: `mimic-init` terminated with exit code 0, `mimic-sidecar` running, the injected annotation present, no restart. A request from another pod to the app Service succeeds and increments the sidecar's `mimic_tcp_connections_total{direction="inbound",result="ok"}`; a request from the app container to another Service succeeds and increments `{direction="outbound",result="ok"}`. The pod's readiness probe points to `/app-health/…` on 15100. When the app's readiness path starts failing, the pod becomes NotReady, and Ready again when the path recovers. |
 | INJ-18 | **I.** The sidecar serves `GET /app-health/<container>/<kind>` on its admin port only for the probes in `MIMIC_APP_PROBES`, and 404 for any other path under `/app-health/`. For a `tcpSocket` probe it answers 200 when it connects to the port and 503 when the connection is refused or exceeds `timeoutSeconds`; for a `grpc` probe it answers 200 only when `grpc.health.v1.Health/Check` (h2c, the probe's `service`) answers `SERVING`, and 503 for `NOT_SERVING`, `UNKNOWN`, a gRPC error, a non-gRPC server, a refused connection or a timeout. For an `httpGet` probe: It forwards the original method, path, port and headers and answers the app's status code (2xx, 3xx without following, 4xx and 5xx unchanged). It answers 503 when the app refuses the connection or exceeds the probe's `timeoutSeconds`, and talks HTTPS without verifying the certificate when the probe's scheme is HTTPS. An invalid `MIMIC_APP_PROBES` exits with code 2 (FND-01). |
 | INJ-14 | **E.** From an injected app container, a UDP datagram to port 443 is refused (connected socket reports `ECONNREFUSED`), while DNS resolution over UDP 53 works. |
@@ -3888,7 +3921,7 @@ Controller integration tests run against a real Valkey and the fake API server a
 
 | ID | Criterion |
 |---|---|
-| MCK-01 | **U.** Effective mode (§7): no `MimicWorkload` gives `discovery`, factor 1, no passthrough; `discovery` + `mock` gives `mock`; the factor is that of the first `mock` one in name order; `spec.mock.passthrough` is the sorted, deduplicated union, cut to its first 256. The injection patch always sets `MIMIC_MODE` to the effective mode, sets `MIMIC_MOCK_LATENCY_FACTOR` only when the factor is not 1 and `MIMIC_MOCK_PASSTHROUGH` only when the union is not empty. **E.** The CRD defaults `spec.mock.latencyFactor` to 1 when `spec.mock` is given, accepts 0, 0.5 and 100, rejects -1, 101 and a string, and rejects a `spec.mock.passthrough` entry `*` and 257 entries. |
+| MCK-01 | **U.** Effective mode (§7): no `MimicWorkload` gives `discovery` up to F15 and `none` from M0 (NON-01), factor 1, no passthrough; `discovery` + `mock` gives `mock`; the factor is that of the first `mock` one in name order; `spec.mock.passthrough` is the sorted, deduplicated union, cut to its first 256. The injection patch always sets `MIMIC_MODE` to the effective mode, sets `MIMIC_MOCK_LATENCY_FACTOR` only when the factor is not 1 and `MIMIC_MOCK_PASSTHROUGH` only when the union is not empty. **E.** The CRD defaults `spec.mock.latencyFactor` to 1 when `spec.mock` is given, accepts 0, 0.5 and 100, rejects -1, 101 and a string, and rejects a `spec.mock.passthrough` entry `*` and 257 entries. |
 | MCK-02 | **U.** Endpoint lookup (§8): an authority absent from the set is a miss `authority` (an empty set too); `GET /users/42` takes `GET /users/{users_id}`; `GET /users/me` takes `GET /users/me` before `GET /users/{users_id}` whatever their order in the set; `HEAD /users/42`, `POST /users/42` and `GET /users/42/x` are misses `endpoint`; a gRPC request on `/pkg.Svc/Get` takes only the `grpc` endpoint of that exact path; `Host: API.Example.COM.` on a cleartext connection to port 80 looks up `api.example.com:80`, and without `Host` on an intercepted connection the SNI with the destination port; a path segment holding a JWT matches the template whose segment at that position is a parameter. |
 | MCK-03 | **U.** Tiers (§8), on sets built by the recorder: a request equal to a sample but for a volatile query key, a redacted JSON field, a field whose sample value is a placeholder or the legacy marker `<redacted>` and any header value is `exact` with that sample; a request differing in one non-volatile body leaf is `endpoint` with the sample sharing the most fields, ties going to the first in set order; a request sharing no field is `fallback` with the first sample of the most frequent status (statuses `{200: 5, 404: 5}` give `200`); an endpoint whose most frequent status has no sample answers that status with an empty body; a `101` sample or status is never used, and an endpoint holding only `101` is a miss `endpoint`. The result is the same for the same set and request (deterministic) and never depends on the order of the request's query keys of different names. |
 | MCK-04 | **U.** Answer (§8): the sample's status and headers in order without `content-length`, `content-encoding`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer`, `upgrade` and `proxy-connection`, plus `content-length` equal to the body length and `x-mimic-match`; a JSON body serialised compactly reads back to the sample's value; a form body encodes its pairs in order; a sample without body, and `HEAD`, `204` and `304`, give an empty body; a gRPC answer without a recorded message is status 200 with the sample's `content-type`, the body `00 00 00 00 00` and trailers `grpc-status: 0`, and with a recorded message the answers of GRP-27 and GRP-31; a miss is `599` with `x-mimic-miss: 1`, `content-length: 0` and nothing else. Property (`proptest`, ≥ 10 000 cases, any set and request): every header and body value of an answer comes from one sample of the request's authority and endpoint in that set or from the fixed values above, and a canary (a random string of 32 characters of `A-Za-z0-9`, drawn per case) placed in the request's headers, query or body is not in the answer. |
@@ -4097,7 +4130,7 @@ such as `<img src=x onerror=alert(1)>`.
 |---|---|
 | EXP-01 | **U.** The read-only YAML rendering of §7.5 is a pure function of a JSON value: byte-identical across calls, keys in byte order, two-space indent, every string double-quoted in JSON syntax (so a hostile string, a multi-line string and a string that looks like a boolean, a number or `null` stay strings), a key quoted unless it is `[A-Za-z_][A-Za-z0-9_./-]*` and not a YAML 1.1 boolean or null word (`true`, `false`, `null`, `yes`, `no`, `on`, `off`, `y`, `n`, any case), `{}` and `[]` for empty containers. |
 | EXP-02 | **U.** The sanitiser of §7.5 on a `MimicWorkload`, a `MimicLoadTest` and an object without `spec.deployment`: `managedFields`, `ownerReferences`, `finalizers` and the `kubectl.kubernetes.io/last-applied-configuration` annotation never appear; labels and the other annotations are kept; `status.conditions` keep the string fields `type`, `status`, `reason`, `message` and `lastTransitionTime`, sorted by `type`; a `MimicLoadTest` `credentials` keeps `secretName` and the `field` of each entry and drops `key`; an object without a string `spec.deployment` is not held. |
-| EXP-03 | **I.** `GET /v1/workloads/<ns>/<dep>/resources` answers `200` `{"resources": [...]}` sorted by kind then name, each with `kind`, `namespace`, `name`, `metadata`, `spec`, `yaml`, `conditions` and, for a `MimicLoadTest`, `phase`; only the resources whose `spec.deployment` is `<dep>` in `<ns>`; an empty list for a deployment without resource; `400` for a name that is not DNS-1123. It reads the cache only: it answers with Valkey stopped. `GET /v1/resources` answers `{"workloads": [{"namespace", "deployment", "mode", "resources": [{"kind", "name"}]}]}` sorted by namespace then deployment, for every deployment a held resource names, `mode` being `mock` when any of its `MimicWorkload`s says so and `discovery` otherwise. |
+| EXP-03 | **I.** `GET /v1/workloads/<ns>/<dep>/resources` answers `200` `{"resources": [...]}` sorted by kind then name, each with `kind`, `namespace`, `name`, `metadata`, `spec`, `yaml`, `conditions` and, for a `MimicLoadTest`, `phase`; only the resources whose `spec.deployment` is `<dep>` in `<ns>`; an empty list for a deployment without resource; `400` for a name that is not DNS-1123. It reads the cache only: it answers with Valkey stopped. `GET /v1/resources` answers `{"workloads": [{"namespace", "deployment", "mode", "resources": [{"kind", "name"}]}]}` sorted by namespace then deployment, for every deployment a held resource names, `mode` being the effective mode of §7 read from its `MimicWorkload`s: `mock` when any says so, else `discovery` when any does, else `none`. |
 | EXP-04 | **I.** Shell: `/ui/` (Workloads), `/ui/map`, `/ui/endpoints` and `/ui/loadtests` answer `200` `text/html; charset=utf-8`, each holding the four tab links `/ui/map`, `/ui/`, `/ui/endpoints` and `/ui/loadtests` in that order, with the UI-09 rules (no inline script, no `on*` or `style` attribute, assets from `/ui/assets/` only, no `http://` or `https://`); `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` is `200` for `MimicWorkload`, `MimicLoadTest` and `MimicConfig` with a DNS-1123 name, `400` for another kind or name; UI-07 (`HEAD`, `405`) and the `403` cases hold on every new route; UI-08 headers hold. |
 | EXP-05 | **I.** Escaping and secrets: a resource with hostile labels, annotations and condition `message` is answered as JSON strings, unchanged (parsed back equal to the input), as `application/json` with `X-Content-Type-Options: nosniff`; a `MimicLoadTest` with `credentials` `{secretName: payment-load, fields: [{field: header/authorization, key: token}]}` shows `payment-load` and `header/authorization`, and the answer holds no `key` member and no Secret value; `mimic.js` has no `innerHTML` (UI-09) and builds the new links with `encodeURIComponent`. |
 | EXP-06 | **I.** Metrics: after a known sequence of requests to the new routes `mimic_ui_requests_total` holds the route patterns `/v1/resources`, `/v1/workloads/{namespace}/{deployment}/resources`, `/ui/map`, `/ui/endpoints`, `/ui/loadtests` and `/ui/workloads/{namespace}/{deployment}/resources/{kind}/{name}` with the codes answered, and no label holds a name from the request. |
@@ -4155,15 +4188,35 @@ does not take it yet, so until it does, e2e and benchmark runs are kept apart by
 | ID | Criterion |
 |---|---|
 | BEN-01 | **D.** `scripts/bench.sh --dry-run` exits 0 and prints the plan without running any command that changes state. No argument starts a run; any other argument, or a second one, exits 2 with one usage line and starts nothing. |
-| BEN-02 | **D.** Invalid configuration exits 2 before any cluster command, with one line naming the variable: a setup or protocol outside `plain discovery` and `http1 h2c`; a rate that is not an integer of at most 3 digits from 1 to 200 rps (the cap; the digit bound comes before any arithmetic, so no overflow wraps past it); an empty `RATES`; a `DURATION` that is not `<n>s` with 1 ≤ n ≤ 300; a `CONNECTIONS` that is not 1 to 64 written with at most 2 digits; a `PAUSE` that is not an integer from 0 to 600; a `CLUSTER` not matching `^[a-z0-9-]+$` or starting with `mimic-e2e` (the e2e clusters are never benchmarked or deleted); a `NODE_IMAGE` without a digest; an output file that already exists. |
+| BEN-02 | **D.** Invalid configuration exits 2 before any cluster command, with one line naming the variable: a setup or protocol outside `plain none discovery` and `http1 h2c`; a rate that is not an integer of at most 3 digits from 1 to 200 rps (the cap; the digit bound comes before any arithmetic, so no overflow wraps past it); an empty `RATES`; a `DURATION` that is not `<n>s` with 1 ≤ n ≤ 300; a `CONNECTIONS` that is not 1 to 64 written with at most 2 digits; a `PAUSE` that is not an integer from 0 to 600; a `CLUSTER` not matching `^[a-z0-9-]+$` or starting with `mimic-e2e` (the e2e clusters are never benchmarked or deleted); a `NODE_IMAGE` without a digest; an output file that already exists. |
 | BEN-03 | **D.** Rate cap: the plan lists one fortio run per setup, protocol and rate, each with `-qps` equal to its configured rate and never above 200; 200 itself is accepted. Runs are sequential (one fortio process at a time) and the plan puts a pause of `PAUSE` seconds after every run but the last. |
-| BEN-04 | **D.** Defaults: `CLUSTER` is `mimic-bench`, the namespace is `mimic-bench`, `DURATION` is 30 s, `PAUSE` is 10 s, and the default matrix is 12 runs: setups `plain` and `discovery`, protocols `http1` and `h2c`, rates 50, 100 and 200 rps. |
+| BEN-04 | **D.** Defaults: `CLUSTER` is `mimic-bench`, the namespace is `mimic-bench`, `DURATION` is 30 s, `PAUSE` is 10 s, and the default matrix is 18 runs: setups `plain`, `none` (M0) and `discovery`, protocols `http1` and `h2c`, rates 50, 100 and 200 rps. |
 | BEN-05 | **D.** Images are pinned by digest: the fortio image of the plan is the reference that `scripts/pinned-image.sh fortio` prints (a digest-pinned stage of `images/Dockerfile`, checked by `scripts/check-pins.sh`); the kind node image defaults to the `kind-node` stage. The plan pulls nothing. |
 | BEN-06 | **D.** Lock: when the lock of `scripts/e2e.sh` (`$MIMIC_LOCK_DIR/mimic-e2e.lock`) or of the benchmark (`$MIMIC_LOCK_DIR/mimic-bench.lock`) is held by a live process, the script exits 3 before any cluster command and names the lock. A lock whose process is gone is stale: the plan says it would be reclaimed, and the run takes it. |
 | BEN-07 | **D.** Outputs: each setup writes `docs/bench/<date>-<setup>.json` once all its runs have finished, holding the machine description, the runs and the sidecar CPU and RSS, and one table row per run is appended to the results table of `docs/bench/README.md`. The dry run writes neither file. |
 | BEN-08 | **D.** Cleanup: the plan ends with the deletion of the namespace `mimic-bench` as an EXIT trap, so that it also runs after a failed run; the cluster is kept unless `KEEP_CLUSTER=0`. |
 | BEN-09 | **D.** Machine description: the plan lists the fields it records (CPU model, cores, RAM, kernel, Docker, kind, Kubernetes, node image) and no host identity (hostname, user, address). |
 | BEN-10 | **M** (main session, recorded on #436). The B0 results are committed in `docs/bench/` with the machine description filled in. If 200 rps is not clean on that machine (errors, or a measured rate below the configured one), `docs/bench/README.md` says so and the budgets of the mesh milestones are taken at 100 rps. |
+
+### 12.20 M0 — Mode `none` (#439)
+
+Design: `docs/design/mimic-mesh.md` §2, §3.4, §14. Spec text: §3, §5, §6 "Shipping", §7, §8, §9
+and §10. Levels as in §12.2, plus **M** (main session, recorded on the issue). The mesh itself
+is M1; here `none` only stops recording, intercepting and shipping.
+
+| ID | Criterion |
+|---|---|
+| NON-01 | **U.** `Mode` has `none`, `discovery` and `mock`, round-trips through its name, and `none` is accepted wherever a mode is read (`Mimic-Mode`, `MIMIC_MODE`, the state file); `record` is still refused. The effective mode (§7, `mimic-core` `mock::effective`) is `mock` > `discovery` > `none`: no `MimicWorkload` gives `none`, factor 1, no passthrough; `none` alone gives `none`; `none` + `discovery` gives `discovery`; `none` + `discovery` + `mock` gives `mock`, the factor being that of the first `mock` one in name order; the passthrough union is unchanged by the modes. |
+| NON-02 | **U.** Mode convergence (§7.4) counts a `:pulls` field `none <ms>` like any other mode: with the effective mode `none`, such a field within the window is in `pods`, a `discovery` one in `otherPods`. The mode state file (§8) accepts `{"latency_factor":1,"mode":"none"}`, writes it for a switch to `none`, and a sidecar with `MIMIC_MODE=none` and no file starts in `none` (`mode changed` with `mode: none`, `source: env`). `MIMIC_MODE=record` still exits 2. |
+| NON-03 | **I** (sidecar, fake sidecar API, fake destination). In `none`: inbound and outbound HTTP/1 requests are forwarded byte for byte and answered as in `discovery`; the report (`GET /discovery`) stays equal to an empty one and no capture byte is held (the shipper posts nothing for an empty report, CTL-14), also after a non-HTTP connection (no tunnel is recorded); the same holds for inbound traffic. |
+| NON-04 | **I** (sidecar with a test CA and a TLS destination). In `none` an outbound TLS connection is passed through: the destination receives the client's ClientHello byte for byte and makes no second handshake, the client sees the destination's own certificate, no leaf is issued, the `connection` line says `interception: mode_none`, `mimic_tls_connections_total{interception="mode_none"}` counts it, nothing is remembered, and no plaintext of the stream appears in `GET /discovery`. After a pull switches the sidecar to `discovery`, the next connection to the same destination is intercepted (`intercepted`). |
+| NON-05 | **I** (sidecar; fake sidecar API for the pulls, in process for the traffic). Pulled switches without a restart: starting in `none`, pull answers `Mimic-Mode: discovery`, then `mock`, then `none` are applied and logged as `mode changed` (`mode`, `previous`, `source: pull`); the `mimic_mode{mode}` gauge is 1 for the current mode and 0 for the other two from the start (three series); `mimic_mock_mode` is 1 only in `mock`; `mimic_mock_mode_switches_total` counts `{to="discovery"}`, `{to="mock"}` and `{to="none"}`; `/egress` shows `mode: none`; the state file holds the last mode. After a switch to `discovery` the same inbound traffic is recorded, after the switch back to `none` new exchanges are not (what was recorded before is kept for shipping, §6). |
+| NON-06 | **I** (controller, fake API server). A deployment without any `MimicWorkload` has effective mode `none`: the injection patch sets `MIMIC_MODE=none` and no factor, passthrough or other env change; the egress answers (§7.7) carry `Mimic-Mode: none` and no factor; a `MimicWorkload` `spec.mode: discovery` created for it turns the next answer to `discovery`, `mock` to `mock`, and deleting it back to `none`, all with the same `ETag` and a `304` for an unchanged snapshot; `status.mode` is `{mode: none, pods: n, otherPods: 0}` for pods that pulled `none`. A `MimicWorkload` already in the cache with `spec.mode: discovery` stays `discovery` (an upgrade does not flip it). Nothing is written to Valkey for a pod in `none` (no `:pods`, report or egress key) beyond the `:pulls` field of §7.7. |
+| NON-07 | **E** (chart, `scripts/check-chart.sh`, `helm template`). The `MimicWorkload` CRD accepts `spec.mode` `none`, `discovery` and `mock` and rejects another value, defaults it to `none`, and accepts `none` in `status.mode.mode`; the schema change does not alter an object stored with `spec.mode: discovery`. |
+| NON-08 | **E** (kind, `scripts/e2e.sh` section `non_08`). A deployment injected by label with no `MimicWorkload` has `MIMIC_MODE=none`; after traffic through it the controller holds no discovery data for it (`GET /v1/workloads/<ns>/<dep>/report` is `404`, and `valkey-cli --scan` shows no key of the deployment but `:pulls`); after the switch the report holds the calls; a `MimicWorkload` with `spec.mode: discovery` makes `status.mode` `{mode: discovery, pods: 2, otherPods: 0}` (the two replicas of the test deployment) and the same traffic recorded within 2 pull intervals plus one push interval, with no restart of the pod (`restartCount` unchanged); `spec.mode: none` stops it again. No canary of the traffic sent while in `none` is in the report, in a log line of the pods or in the controller logs. |
+| NON-09 | **D** (review). Spec §3 states that `none` means "proxy only, nothing recorded", not "no mesh", and names the kill switches (`mesh.enabled`, `MimicConfig.spec.mesh.enabled`, design §3.4); `CHANGELOG.md` has an upgrade note under *Unreleased*: label-injected deployments without a `MimicWorkload` stop recording, existing `MimicWorkload`s keep the `discovery` persisted at their creation, how to get the old behaviour back (a `MimicWorkload` with `spec.mode: discovery`); `docs/wiki/Concepts.md`, `Quick-start.md`, `Configuration.md`, `Mock-mode.md` and `FAQ.md` describe `none`, the new default and its switch. |
+| NON-10 | **M** (main session, `scripts/bench.sh`). The setup `none` meets the M0 budget of design §14, results committed under `docs/bench/`. |
+| NON-11 | **D** (security review). In `none` no plaintext of an outbound TLS stream is read, no capture buffer is allocated, and no report, sample or egress recording is built or sent; the `none` series adds no label with a request value. |
 
 ## 13. Test strategy
 

@@ -81,6 +81,7 @@ label of `mimic_tls_connections_total` and the `interception` field of the conne
 |---|---|---|
 | `unsupported` | SNI is not a valid DNS name; no TLS 1.2/1.3 offered; or ALPN offered without `h2` or `http/1.1` | no |
 | `excluded` | SNI (or destination IP) matches `spec.tls.exclude` | |
+| `mode_none` | the pod is in mode `none` (the default): nothing would read the plaintext, so nothing is intercepted. Checked before every other case | no |
 | `no_ca` | the sidecar has no valid intermediate (none yet, expired, mismatch, trust volume not published) | no |
 | `upstream_untrusted` | the sidecar's own handshake with the destination fails (unknown issuer, expired, wrong name, alert) | yes |
 | `client_cert_requested` | the destination asks for a client certificate (mTLS) | yes |

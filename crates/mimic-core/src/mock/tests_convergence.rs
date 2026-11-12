@@ -65,3 +65,17 @@ fn mck_07_no_fields_give_zero_counts() {
     let c = convergence(Mode::Mock, &BTreeMap::new(), WINDOW, NOW);
     assert_eq!(c, Convergence::default());
 }
+
+#[test]
+fn non_02_a_none_field_counts_like_any_other_mode() {
+    let p = pulls(&[
+        ("a", "none 999000"),
+        ("b", "none 995000"),
+        ("c", "discovery 999500"),
+        ("old", "none 100"),
+    ]);
+    let c = convergence(Mode::None, &p, WINDOW, NOW);
+    assert_eq!((c.pods, c.other_pods, c.unreadable), (2, 1, 0));
+    let c = convergence(Mode::Discovery, &p, WINDOW, NOW);
+    assert_eq!((c.pods, c.other_pods), (1, 2));
+}
