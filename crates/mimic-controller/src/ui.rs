@@ -663,7 +663,15 @@ async fn map_source(ui: &Ui, summary: &Summary) -> Result<MapSource, ReadError> 
     {
         Ok(stored) => stored,
         Err(ReadError::Unavailable) => return Err(ReadError::Unavailable),
-        Err(_) => return Ok(source),
+        Err(e) => {
+            tracing::warn!(
+                namespace = namespace.as_str(),
+                deployment = deployment.as_str(),
+                error = ?e,
+                "stored outbound calls not read"
+            );
+            return Ok(source);
+        }
     };
     let permit = ui
         .renders
@@ -691,6 +699,23 @@ async fn map_source(ui: &Ui, summary: &Summary) -> Result<MapSource, ReadError> 
 /// How many reports the Map tab reads at once.
 const MAP_READS: usize = 8;
 
+/// The sources of the first `cap` deployments of `summaries` (already sorted by name): the
+/// others are not read, so one request does not cost more as the store grows.
+async fn read_sources(
+    ui: &Ui,
+    summaries: Vec<Summary>,
+    cap: usize,
+) -> Result<Vec<MapSource>, ReadError> {
+    futures::stream::iter(summaries.into_iter().take(cap))
+        .map(|summary| {
+            let ui = ui.clone();
+            async move { map_source(&ui, &summary).await }
+        })
+        .buffered(MAP_READS)
+        .try_collect()
+        .await
+}
+
 /// The Map tab (spec §7.5): the graph of the stored outbound counters and the hub's snapshot,
 /// as JSON or, with `?format=svg`, as SVG. No call to the API server.
 async fn map(
@@ -709,14 +734,8 @@ async fn map(
         .skipped
         .get_or_create(&labels(&[("reason", "meta-unreadable")]))
         .inc_by(skipped);
-    let sources: Vec<MapSource> = futures::stream::iter(summaries)
-        .map(|summary| {
-            let ui = ui.clone();
-            async move { map_source(&ui, &summary).await }
-        })
-        .buffered(MAP_READS)
-        .try_collect()
-        .await?;
+    let limits = MapLimits::default();
+    let sources = read_sources(&ui, summaries, limits.max_deployments).await?;
     // The view of the hub counts only once every list is complete (spec §7.5, *Not declared*).
     let published = ui
         .mesh
@@ -734,7 +753,7 @@ async fn map(
         let map = mimic_core::ui::map::build(
             &sources,
             published.as_deref().map(|p| &p.snapshot),
-            &MapLimits::default(),
+            &limits,
         );
         if svg { map.to_svg() } else { map.to_json() }
     })

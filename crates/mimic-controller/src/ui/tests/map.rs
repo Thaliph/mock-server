@@ -339,8 +339,6 @@ fn exp_24_the_map_tab_reads_the_svg_and_copies_an_allowlist() {
     ] {
         assert!(js.contains(rule), "mimic.js lacks the rule {rule}");
     }
-    // The one URL allowed is the SVG namespace constant.
-    let rest = js.replace("http://www.w3.org/2000/svg", "");
     for banned in [
         "innerHTML",
         "outerHTML",
@@ -351,6 +349,6 @@ fn exp_24_the_map_tab_reads_the_svg_and_copies_an_allowlist() {
         "http://",
         "https://",
     ] {
-        assert!(!rest.contains(banned), "mimic.js holds {banned}");
+        assert!(!js.contains(banned), "mimic.js holds {banned}");
     }
 }
