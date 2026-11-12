@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, GRP-35, GRP-46, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (MSH-28, CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, GRP-35, GRP-46, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -59,6 +59,12 @@ fail() {
 }
 cleanup() {
   for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+  # msh_28 failed (or ended) with its namespaces and the Gateway API CRDs in the cluster: they are only its own.
+  if [[ -n ${MSH_28_CLEANUP:-} ]]; then
+    kubectl delete namespace msh-28-a msh-28-b --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    # Only the CRDs this run installed: a cluster that had them keeps them.
+    [[ -z ${MSH_28_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -3647,6 +3653,162 @@ kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 [[ $(kubectl -n default get mimicworkload kept -o jsonpath='{.spec.deployment}' 2>/dev/null) == api ]] \
   || fail "inj_23: the MimicWorkload was not kept by the reinstall"
 kubectl -n default delete mimicworkload kept --ignore-not-found >/dev/null
+
+# --- Mesh view (#441, spec §12.21 MSH-28) ---------------------------------------------------------------------------------
+# The sidecar API's mesh route and the controller's watches, with objects of this section only: two namespaces, the pinned
+# standard Gateway API CRDs (installed here, removed at the end), a MimicConfig, a ReferenceGrant, one Deployment and
+# Service per namespace. The CRDs come after the controller started: it must notice them without a restart.
+log "msh_28: the mesh view is served per deployment, follows a ReferenceGrant and a scale, and long-polls"
+gw_version=v1.4.1
+gw_sha256=73b91b77f6be023a8c92c969fc664e5bd3b1a28aea59eac9ebc904607354dad2
+curl -fsSL --max-time 120 -o "$WORK/gateway-standard.yaml" \
+  "https://github.com/kubernetes-sigs/gateway-api/releases/download/$gw_version/standard-install.yaml" \
+  || fail "msh_28: cannot download the Gateway API $gw_version standard CRDs"
+[[ $(sha256sum "$WORK/gateway-standard.yaml" | cut -d' ' -f1) == "$gw_sha256" ]] \
+  || fail "msh_28: the Gateway API standard CRDs do not match the pinned digest"
+MSH_28_CLEANUP=1
+if [[ -z $(kubectl get crd referencegrants.gateway.networking.k8s.io -o name 2>/dev/null || true) ]]; then MSH_28_CRDS=1; fi
+kubectl apply --server-side -f "$WORK/gateway-standard.yaml" >/dev/null
+kubectl wait --for=condition=Established crd/referencegrants.gateway.networking.k8s.io --timeout=60s >/dev/null
+ns_fresh msh-28-a
+ns_fresh msh-28-b
+msh_app() { # msh_app <namespace> <name>: a Deployment of one pod answering on port http, and its Service
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $2, namespace: $1}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: $2}}
+  template:
+    metadata: {labels: {app: $2}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -m, http.server, "8080"]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: http}, periodSeconds: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: $2, namespace: $1}
+spec:
+  selector: {app: $2}
+  ports: [{name: http, port: 80, targetPort: http}]
+YAML
+}
+msh_app msh-28-a web
+msh_app msh-28-b scoring
+kubectl -n msh-28-a rollout status deploy/web --timeout=3m >/dev/null
+kubectl -n msh-28-b rollout status deploy/scoring --timeout=3m >/dev/null
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: web-cfg, namespace: msh-28-a}
+spec:
+  targetRefs: [{group: apps, kind: Deployment, name: web}]
+  destinations: [{namespace: msh-28-b, name: scoring}]
+YAML
+msh_pod() { kubectl -n "$1" get pods -l "app=$2" -o jsonpath='{.items[0].metadata.name}'; }
+msh_token=$(kubectl -n msh-28-a create token default --audience mimic.platform.io \
+  --bound-object-kind Pod --bound-object-name "$(msh_pod msh-28-a web)" --duration 30m) || fail "msh_28: cannot create a token"
+secret_key 'ca\.crt' | base64 -d > "$WORK/webhook-ca-msh.crt"
+kubectl -n "$NS" port-forward svc/$RELEASE-controller 18445:8444 >/dev/null 2>&1 &
+PIDS+=("$!")
+# msh_curl <deployment> <body file> [curl args...]: the status of a view request with the token of the web pod; the
+# response headers go to <body file>.h.
+msh_curl() {
+  local dep=$1 out=$2; shift 2
+  curl -s -o "$out" -D "$out.h" -w '%{http_code}' --max-time 45 --cacert "$WORK/webhook-ca-msh.crt" \
+    --resolve "$RELEASE-controller.$NS.svc:18445:127.0.0.1" -H "Authorization: Bearer $msh_token" "$@" \
+    "https://$RELEASE-controller.$NS.svc:18445/v1/workloads/$dep/mesh?format=1" || true
+}
+msh_etag() { tr -d '\r' < "$1.h" | sed -n 's/^[Ee][Tt]ag: //p'; }
+# msh_until <timeout seconds> <description> <command...>: polls the command once a second.
+msh_until() {
+  local limit=$1 desc=$2; shift 2
+  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
+  fail "msh_28: $desc"
+}
+view_ok() { [[ $(msh_curl web "$WORK/msh.json") == 200 ]]; }
+msh_until 90 "the controller never served the view of web" view_ok
+grep -q '"msh-28-a/web"' "$WORK/msh.json" || fail "msh_28: the view of web lacks its own Service"
+if grep -q 'msh-28-b' "$WORK/msh.json"; then fail "msh_28: the view holds the other namespace without a ReferenceGrant"; fi
+[[ $(msh_curl other "$WORK/msh-other.json") == 403 ]] || fail "msh_28: a token of web read the view of another deployment"
+scoring_ip=$(kubectl -n msh-28-b get pods -l app=scoring -o jsonpath='{.items[0].status.podIP}')
+
+cfg_reason() { kubectl -n msh-28-a get mimicconfig web-cfg -o jsonpath='{.status.conditions[?(@.type=="ResolvedRefs")].reason}'; }
+reason_is() { [[ $(cfg_reason) == "$1" ]]; }
+msh_until 60 "web-cfg is not ResolvedRefs RefNotPermitted without a ReferenceGrant" reason_is RefNotPermitted
+kubectl -n msh-28-a get mimicconfig web-cfg --show-managed-fields -o json \
+  | jq -e '[.metadata.managedFields[] | select(.manager == "mimic-mesh" and .subresource == "status")] | length > 0' >/dev/null \
+  || fail "msh_28: the status of web-cfg is not owned by the field manager mimic-mesh"
+
+# 304 at the timeout (MIMIC_MESH_WATCH_TIMEOUT 30s), then 200 after the change.
+msh_curl web "$WORK/msh.json" >/dev/null
+etag=$(msh_etag "$WORK/msh.json")
+[[ -n $etag ]] || fail "msh_28: the view has no ETag"
+started=$(date +%s)
+[[ $(msh_curl web "$WORK/msh-held.json" -H "If-None-Match: $etag") == 304 ]] || fail "msh_28: the held request did not end 304"
+held=$(( $(date +%s) - started ))
+(( held >= 25 && held <= 40 )) || fail "msh_28: the held request ended after ${held}s, not at the 30s timeout"
+
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: allow-web, namespace: msh-28-b}
+spec:
+  from: [{group: mimic.platform.io, kind: MimicConfig, namespace: msh-28-a}]
+  to: [{group: "", kind: Service}]
+YAML
+has_destination() { msh_curl web "$WORK/msh.json" >/dev/null; grep -q "$scoring_ip" "$WORK/msh.json"; }
+no_destination() { msh_curl web "$WORK/msh.json" >/dev/null; ! grep -q "$scoring_ip" "$WORK/msh.json"; }
+msh_until 90 "the destination did not gain its endpoints with the ReferenceGrant" has_destination
+msh_until 60 "web-cfg is not ResolvedRefs True with the ReferenceGrant" reason_is ResolvedRefs
+kubectl -n msh-28-b delete referencegrant allow-web >/dev/null
+msh_until 60 "the destination kept its endpoints after the ReferenceGrant was deleted" no_destination
+msh_until 60 "web-cfg is not RefNotPermitted again" reason_is RefNotPermitted
+
+# A scale: held requests follow the view. A held request answers on the first change of the view (the new pod
+# appears before it is ready), so the script keeps long-polling with each new ETag; the view that holds both endpoints
+# is served within the debounce plus 2 s of the second endpoint becoming ready (0.5 s of slack: the poll of this script).
+msh_curl web "$WORK/msh.json" >/dev/null
+etag=$(msh_etag "$WORK/msh.json")
+ready_endpoints() { kubectl -n msh-28-a get endpointslices -l kubernetes.io/service-name=web -o json | jq '[.items[].endpoints[] | select(.conditions.ready == true)] | length'; }
+rm -f "$WORK/msh-ready.at"
+# When the API server shows both endpoints ready, in the background while the script long-polls.
+( for _ in $(seq 300); do [[ $(ready_endpoints) == 2 ]] && { date +%s.%N > "$WORK/msh-ready.at"; exit 0; }; sleep 0.2; done ) &
+ready_pid=$!
+PIDS+=("$ready_pid")
+kubectl -n msh-28-a scale deploy/web --replicas=2 >/dev/null
+scaled_at=
+for _ in $(seq 12); do
+  code=$(msh_curl web "$WORK/msh-scaled.json" -H "If-None-Match: $etag")
+  answered=$(date +%s.%N)
+  case $code in
+    304) continue ;;
+    200) ;;
+    *) fail "msh_28: a held request ended $code after the scale, not 200 or 304" ;;
+  esac
+  etag=$(msh_etag "$WORK/msh-scaled.json")
+  if [[ $(jq '.services["msh-28-a/web"].endpoints["80"] | length' "$WORK/msh-scaled.json") == 2 ]]; then
+    scaled_at=$answered
+    break
+  fi
+done
+[[ -n $scaled_at ]] || fail "msh_28: the served view of web never had two endpoints after the scale"
+wait "$ready_pid" || true
+[[ -s $WORK/msh-ready.at ]] || fail "msh_28: the scaled deployment never had two ready endpoints"
+ready_at=$(<"$WORK/msh-ready.at")
+late=$(awk -v e="$scaled_at" -v r="$ready_at" 'BEGIN { printf "%.2f", e - r }')
+awk -v late="$late" 'BEGIN { exit !(late <= 2.6) }' \
+  || fail "msh_28: the view with both endpoints was served ${late}s after the second endpoint became ready"
+kubectl delete namespace msh-28-a msh-28-b --wait=false >/dev/null
+[[ -z ${MSH_28_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
+MSH_28_CLEANUP=
+MSH_28_CRDS=
+echo "msh_28: the view is per deployment, follows the ReferenceGrant and the scale, and the long-poll ends 304 at the timeout"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The

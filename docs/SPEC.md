@@ -1253,6 +1253,33 @@ the recorder keeps the first message of each side:
 - `GET /v1/workloads/<deployment>/egress?format=1` (F9), `format=2` (F14): the deployment's
   egress set, with `ETag` and `304`, under the memory bounds of §7.7. It shares the admission, authentication
   and `TokenReview` limits above; it has no body.
+- `GET /v1/workloads/<deployment>/mesh?format=1` (M1, #441): the mesh view of §7.9 for the
+  caller's own deployment, with `ETag` and `Content-Type: application/json`. Same admission,
+  authentication and authorisation as the egress pull (the namespace comes from the token, a pod
+  reads its own deployment's view only: `403` otherwise), no body. It is a **long-poll**: when
+  `If-None-Match` holds the current `ETag` the request is held until the view changes or
+  `MIMIC_MESH_WATCH_TIMEOUT` passes (`304` with the `ETag`); otherwise the answer is the `200`
+  view at once. Changes are coalesced: `MIMIC_MESH_DEBOUNCE` after a quiet period, doubled up to
+  1 s while changes keep arriving, so a held request is answered within the debounce after a change
+  and a sidecar receives at most about one view per second. The body is gzip-compressed when
+  `Accept-Encoding` lists `gzip` (the `ETag` is that of the uncompressed bytes). Held requests have
+  a budget of their own, `MIMIC_SIDECAR_API_MAX_WATCHES`: a request that would be held when it is
+  spent gets `503` with `Retry-After: 1`; a request that is held (it has a share of that budget) counts neither against the connection cap
+  nor against the request timeout of the listener, so pushes and certificate requests are served
+  with the watch budget full; any other answer (`200`, `503`) keeps the connection's slot, and when
+  the held request is answered the connection takes a slot again before it serves another request,
+  or is closed if the cap is full: a mass wake-up of more held requests than the cap leaves free turns into reconnects (`Connection: close`), which the sidecars retry. `400` for a `format` other than `1`; `404` when `MIMIC_MESH=off`
+  (nothing is read, no `TokenReview`); `503` with `Retry-After: 1` until the watches of §7.9 are
+  synced; `405` with `Allow: GET` for another method; `429` over the rate. Views are built from the
+  controller's watches (`Service`, `EndpointSlice`, `MimicConfig`, `MimicWorkload`, Deployment
+  metadata, `ReferenceGrant` when its CRD exists) on both replicas, so two replicas with the same
+  objects serve the same bytes. A view is cached per input key (namespace, effective mode, winning
+  `MimicConfig` of the deployment and its generation) in an LRU bounded by
+  `MIMIC_MESH_VIEW_CACHE_BYTES`; a view that holds more than a bound of §7.9 is served truncated,
+  counted (`mimic_mesh_view_truncated_total`) and logged once per build. The controller writes
+  `status.conditions` of every `MimicConfig` (§7, `Accepted`, `ResolvedRefs` with
+  `RefNotPermitted` for a destination without a `ReferenceGrant`) by server-side apply on the
+  status subresource, field manager `mimic-mesh`, when they differ from what it last applied (both replicas apply the same body, which changes nothing in the cluster: accepted). The ClusterRole reads Deployments whole, as RBAC cannot restrict a read to metadata; the controller asks for metadata only (accepted).
 - **Shipping client** (sidecar, F5). Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (the first one after
   a random delay within one interval, so that the pods of a rollout do not push together),
   the sidecar freezes the report recorded since its last acknowledged push into a *pending*
@@ -2630,6 +2657,12 @@ random numbers it hands to the draw.
 | `mimic_sidecar_api_egress_builds_total` | counter (F9, controller; the sidecar's pull metrics are `mimic_egress_*`), egress projections built (§7.7); `too_large` also counts a pull refused `507` before its build | `result` (`ok`, `too_large`, `unreadable`, `error`) |
 | `mimic_sidecar_api_egress_build_duration_seconds` | histogram (F9, controller), read, check, projection and serialisation of one build; buckets as `mimic_store_write_duration_seconds` | — |
 | `mimic_sidecar_api_egress_cache_bytes` | gauge (F9, controller), bytes of `MIMIC_SIDECAR_API_EGRESS_BUDGET` held by projections, cached or being sent (a build refused by this budget is still counted `ok` in `mimic_sidecar_api_egress_builds_total`) | — |
+| `mimic_mesh_objects` | gauge (M1, controller), objects held by the mesh watches at the last publication | `kind` (`service`, `endpointslice`, `mimicconfig`, `referencegrant`, `deployment`) |
+| `mimic_mesh_view_builds_total` | counter (M1, controller), mesh views built (a cached view is not a build) | `result` (`ok`, `truncated`) |
+| `mimic_mesh_view_build_duration_seconds` | histogram (M1, controller), one view build, canonical JSON and ETag included; buckets as `mimic_sidecar_api_egress_build_duration_seconds` | — |
+| `mimic_mesh_watches` | gauge (M1, controller), requests of `GET /v1/workloads/<deployment>/mesh` held now, at most `MIMIC_SIDECAR_API_MAX_WATCHES` | — |
+| `mimic_mesh_view_truncated_total` | counter (M1, controller), Services left out of built views because of a bound of §7.9 | — |
+| `mimic_mesh_view_cache_bytes` | gauge (M1, controller), bytes held by the view cache, at most `MIMIC_MESH_VIEW_CACHE_BYTES` | — |
 | `mimic_load_runs_total` | counter (F11, controller), load test runs ended (§7.8); a run that fails before its admission is counted by every replica that writes its status, so two replicas can count it twice in a rare race (an admitted run is counted once, by the replica whose end script wins) | `phase` (`Succeeded`, `Failed`, `Aborted`), `reason` |
 | `mimic_load_active_runs` | gauge (F11, controller), members of `mimic:v1:loads:active` at the last status pass | — |
 
@@ -2971,9 +3004,15 @@ The restarts come from `process_start_time_seconds`, so no kube-state-metrics se
 | `MIMIC_STORE_MAX_DEPLOYMENTS` | `50` | Deployments with data per namespace (§7.3), 1–100000. |
 | `MIMIC_STATUS_INTERVAL` | `30s` | Period of the `MimicWorkload` status update (§7.4), 1s–1h. |
 | `MIMIC_STATUS_POD_WINDOW` | `5m` | A pod counts in `status.discovery.pods` while its last push is this recent, 1s–24h. |
-| `MIMIC_MESH_MAX_SERVICES` | `1024` | (M1) Services in one mesh view (§7.9), 1–100000; the rest is left out. Read by the controller from #441; `mesh::view` enforces it. |
+| `MIMIC_MESH_MAX_SERVICES` | `1024` | (M1) Services in one mesh view (§7.9), 1–100000; the rest is left out. Read by the controller (#441); `mesh::view` enforces it. |
 | `MIMIC_MESH_MAX_ENDPOINTS` | `10000` | (M1) Endpoints in one mesh view, 1–1000000. |
 | `MIMIC_MESH_MAX_VIEW_BYTES` | `4Mi` | (M1) Largest serialised mesh view (`<n>`, `<n>Ki`, `<n>Mi`; 64Ki–256Mi). |
+| `MIMIC_MESH` | `on` | (M1) `on` or `off`. `off`: no mesh view is served (`404`, §7.2) and the watches of §7.9 are not started; the chart sets it from `mesh.enabled` (design §3.4). |
+| `MIMIC_CLUSTER_NAME` | `local` | (M1) Name of the cluster in the `cluster` field of the view (§7.9), 1–63 characters of `a-z`, `0-9`, `-`, starting and ending with a letter or digit. |
+| `MIMIC_MESH_WATCH_TIMEOUT` | `30s` | (M1) How long a held `GET /v1/workloads/<deployment>/mesh` waits for a change before it answers `304` (§7.2), 100ms–10m. |
+| `MIMIC_MESH_DEBOUNCE` | `100ms` | (M1) Coalescing of changes of the watched objects; doubled up to 1 s while changes keep arriving (§7.2), 10ms–1s. |
+| `MIMIC_MESH_VIEW_CACHE_BYTES` | `64Mi` | (M1) Bytes of built views cached per replica (the views and their gzip copies, built when a sidecar asks for gzip), least recently used evicted first (§7.2; same syntax, at least `MIMIC_MESH_MAX_VIEW_BYTES`, at most 4Gi). |
+| `MIMIC_SIDECAR_API_MAX_WATCHES` | `10000` | (M1) Held mesh requests at once per replica (§7.2), 1–1000000; over it `503` with `Retry-After: 1`. |
 | `MIMIC_LOAD_MAX_RUNS` | `0` | (F11) Load test runs active at once in the cluster (§7.8), 0–100; `0` disables load tests. The chart sets `4` when `loadTest.enabled`. |
 | `MIMIC_LOAD_MAX_NAMESPACE_RUNS` | `2` | (F11) Active runs per namespace, 1–100, at most `MIMIC_LOAD_MAX_RUNS` when that is not 0. |
 | `MIMIC_LOAD_MAX_PENDING` | `16` | (F11) `Pending` runs per namespace; newer ones fail `TooManyPending`, 1–1000. |
@@ -4373,11 +4412,11 @@ is M1; here `none` only stops recording, intercepting and shipping.
 | NON-10 | **M** (main session, `scripts/bench.sh`). The setup `none` meets the M0 budget of design §14, results committed under `docs/bench/`. |
 | NON-11 | **D** (security review). In `none` no plaintext of an outbound TLS stream is read, no capture buffer is allocated, and no report, sample or egress recording is built or sent; the `none` series adds no label with a request value. |
 
-### 12.21 M1 — `MimicConfig` and the mesh view (#440)
+### 12.21 M1 — `MimicConfig`, the mesh view and its controller (#440, #441)
 
 Design: `docs/design/mimic-mesh.md` §3.4, §4.2, §4.3, §6, §16. Spec text: §7 (`MimicConfig`),
-§7.9 (the view), §10.2. Levels as in §12.2, plus **M** (main session). The watches, the sidecar API
-and the sidecar's use of the view are #441 and #442.
+§7.2 (the route), §7.9 (the view), §10.2. Levels as in §12.2, plus **M** (main session). MSH-01 to MSH-17 are #440,
+MSH-18 and after #441 (the watches, the route, the chart); the sidecar's use of the view is #442.
 
 | ID | Criterion |
 |---|---|
@@ -4398,6 +4437,19 @@ and the sidecar's use of the view are #441 and #442.
 | MSH-15 | **E** (chart, `scripts/check-chart.sh`). The chart renders the CRD `mimicconfigs.mimic.platform.io` with `helm.sh/resource-policy: keep`, a `status` subresource, version `v1alpha1`, `targetRefs` 1 to 16, `destinations` at most 256, `mesh.enabled` default `true`, `loadBalancer.slowStart`, and CEL rules that reject a `namespace` in a `targetRef`, `destinations` or `mesh` without a Deployment target, and `loadBalancer` without a Service target; `helm lint --strict` passes; the default render is the golden file. |
 | MSH-16 | **D** (security review). No view holds another namespace's data without its `ReferenceGrant` (MSH-03, MSH-04); the input structs have no field for a Secret, label or annotation value; CEL forbids cross-namespace `targetRefs`; `from_json` is bounded and refuses unknown fields. |
 | MSH-17 | **E** (kind, `scripts/e2e.sh` section `msh_17`, objects of that section only). The API server evaluates the CEL rules and the schema of the `MimicConfig` CRD: a valid object with both target kinds, `mesh: {}` (which defaults `enabled` to `true`), 16 `targetRefs` and 256 `destinations` are accepted; refused are no, 0 and 17 `targetRefs`, a `targetRef` with a `namespace` (on a Deployment and on a Service), a kind other than `Deployment`/`Service`, a `Service` in group `apps`, a `Deployment` in the core group, a `targetRef` without a name, 257 `destinations`, `destinations` or `mesh` without a Deployment target, `loadBalancer` without a Service target, a `slowStart` that is not `<n>s` or is over 3600 s, a `targetRef` with an empty `namespace`, a destination without a name, and a non-boolean `mesh.enabled`. |
+| MSH-18 | **U** (controller configuration). Unset: `MIMIC_MESH` `on`, `MIMIC_CLUSTER_NAME` `local`, `MIMIC_MESH_WATCH_TIMEOUT` 30 s, `MIMIC_MESH_DEBOUNCE` 100 ms, `MIMIC_MESH_VIEW_CACHE_BYTES` 64Mi, `MIMIC_SIDECAR_API_MAX_WATCHES` 10000, and the `MIMIC_MESH_MAX_*` of §10.2 give the `Limits` defaults. Exit 2 (FND-01) for: `MIMIC_MESH` other than `on`/`off`; a cluster name over 63 characters, with an upper-case letter, `_` or a leading `-`; a timeout of 50ms or over 10m; a debounce of 5ms or over 1s; a cache below `MIMIC_MESH_MAX_VIEW_BYTES` or over 4Gi; `MIMIC_SIDECAR_API_MAX_WATCHES` 0 or 1000001; `MIMIC_MESH_MAX_SERVICES` 0 or 100001; `MIMIC_MESH_MAX_ENDPOINTS` 0; `MIMIC_MESH_MAX_VIEW_BYTES` 1Ki or 512Mi. |
+| MSH-19 | **I** (in-process router, fake `TokenReview`). `GET /v1/workloads/<d>/mesh?format=1` has the admission of §7.2: missing, invalid and foreign-audience tokens `401`; a pod of another deployment or without a bound-pod claim `403`; a name that is not DNS-1123 or a `format` other than `1`, or absent, `400`; `POST` `405` with `Allow: GET`; over the rate `429` with no `TokenReview`; the watches not synced `503` with `Retry-After: 1`. The `200` of a pod of deployment `d` holds the Services of the token's namespace and no object of another namespace without a grant, whatever the deployment name in the path (a deployment that exists only in another namespace gets the view of the token's namespace, never the other's); the view of a deployment with another winning `MimicConfig` is not the same bytes. |
+| MSH-20 | **I.** The `200` has `ETag`, `Content-Type: application/json` and `Cache-Control: no-store`; its body is `mesh::view::build` of the fed objects, parsed by `View::from_json`; with `Accept-Encoding: gzip` the body is gzip, the `ETag` the same and the uncompressed bytes equal. Two hubs fed the same objects in different orders serve byte-identical bodies and the same `ETag`. The effective mode of the deployment (a `MimicWorkload` in `mock`) is in the view and its change changes the `ETag`. |
+| MSH-21 | **I** (held requests, real clock, `MIMIC_MESH_WATCH_TIMEOUT` 400 ms, debounce 50 ms in the test). `If-None-Match` with a stale `ETag` gets the `200` at once; with the current one the request is held and ends `304` with the `ETag` after the timeout; a change of an EndpointSlice of the namespace wakes it with a `200` within the debounce plus 500 ms, the new endpoint in the body; a change of an object of another namespace does not wake it before the timeout; `If-None-Match` is read as for the egress pull (§7.7): an entry of a list matches byte for byte, a weak validator or `*` never does. |
+| MSH-22 | **U** (paused clock). Debounce: a change on a quiet hub is published after `MIMIC_MESH_DEBOUNCE`; while changes keep arriving every 10 ms, the waits between publications double (100, 200, 400, 800 ms) up to 1 s and stay there; after a quiet period the next change waits `MIMIC_MESH_DEBOUNCE` again; a burst of 1000 changes within one wait is one publication. |
+| MSH-23 | **I.** Watch budget: with `MIMIC_SIDECAR_API_MAX_WATCHES` 2, two held requests make `mimic_mesh_watches` 2 and a third that would be held gets `503` with `Retry-After: 1`; a request answered at once takes no share; the gauge is 0 again when they end; a push and a certificate request are served while the budget is full. **I** (TLS listener): with a connection cap of 1, a held request does not count against the cap (a second connection is served) and is not closed by the request timeout; once it is answered the connection takes a slot again, or ends with its answer (`Connection: close`) when the cap is full, so it never lives outside the cap. A `200`, a `503` (budget spent, not synced) never frees the slot. |
+| MSH-24 | **I.** `MIMIC_MESH=off`: the route answers `404` with no `TokenReview`, whatever the headers; the other routes work. |
+| MSH-25 | **I.** Consent: a destination of the winning `MimicConfig` of `d` declared in namespace `risk` has no endpoints in the view of `d` until a `ReferenceGrant` of `risk` is fed, gets them (and wakes a held request) when it is, and loses them when the grant is deleted; with the `ReferenceGrant` CRD absent it has none. The statuses are applied by server-side apply with the field manager `mimic-mesh`: `ResolvedRefs: False`, `RefNotPermitted`, the message naming `risk/<name>`, then `True` after the grant; a status equal to the last applied one is not applied again; a failed apply is retried at the next pass. |
+| MSH-26 | **U.** View cache: it holds at most `MIMIC_MESH_VIEW_CACHE_BYTES` of views (`mimic_mesh_view_cache_bytes`), the least recently used is evicted first, a view larger than the budget is served but not cached, deployments with the same inputs share one entry (one `mimic_mesh_view_builds_total` for 50 pods of a namespace), and an evicted view is rebuilt at its next request. Truncation: a view over a bound is served with what fits, `mimic_mesh_view_truncated_total` grows by the Services left out at each build and one WARN `mesh view truncated` (`namespace`, `deployment`, `left_out`) is written per build, not per request. |
+| MSH-27 | **U** (next to the adapters). The watched objects convert to the input structs of `mesh::input`: Service (ClusterIPs, ports with `targetPort`), EndpointSlice (Service from the label `kubernetes.io/service-name`, `conditions.ready` missing read as `true`, zone, ports), `MimicConfig` (targets, destinations, `mesh.enabled`, `slowStart`, creation time, generation), `ReferenceGrant` (`from`, `to`); a label, annotation or Secret value of the source is in no struct. A relist replaces what a watch held (an object deleted while the watch was down disappears); a `Delete` removes its key. |
+| MSH-28 | **E** (kind, `scripts/e2e.sh` section `msh_28`, objects of that section only; the pinned standard Gateway API CRDs are installed by the script). In two namespaces: the sidecar API answers a pod's token with the view of its own deployment, `403` for another; a destination of a `MimicConfig` into the other namespace is `ResolvedRefs: False` `RefNotPermitted` and absent from the view until a `ReferenceGrant` is created, present after, absent again after it is deleted; a held request returns `304` at the timeout; after a Deployment of the section is scaled, a held request answers on each change of the view (the new pod may first appear not ready), and following the ETags the view holding the new endpoint is served within the debounce plus 2 s of the endpoint becoming ready. |
+| MSH-29 | **E** (chart, `scripts/check-chart.sh`). The ClusterRole grants `get`, `list`, `watch` on `services`, `endpointslices`, `mimicconfigs`, `mimicworkloads`, `referencegrants` and `deployments` (the controller reads their metadata only) and `patch` on `mimicconfigs/status`, nothing on `secrets` beyond the two named ones of the Role; `mesh.enabled` (default `true`) renders `MIMIC_MESH` `on`, `false` renders `off`; `mesh.clusterName`, `mesh.watchTimeout`, `mesh.debounce`, `mesh.viewCacheBytes`, `mesh.maxServices`, `mesh.maxEndpoints`, `mesh.maxViewBytes` and `mesh.maxWatches`, when set, render their variables; `helm lint --strict` passes; the default render is the golden file. |
+| MSH-30 | **D** (security review). The route keeps the admission, authentication and authorisation of §7.2 (MSH-19); cross-namespace endpoints only through `mesh::policy::consents` (MSH-25); no Secret, label or annotation is read into the objects (MSH-27); memory is bounded by the view cache, the watch budget and the `Limits` (MSH-23, MSH-26); a held request holds no lock and is released when its connection ends. |
 
 ## 13. Test strategy
 

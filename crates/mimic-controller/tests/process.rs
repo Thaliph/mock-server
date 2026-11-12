@@ -285,6 +285,13 @@ struct KubeState {
 }
 
 const SECRET_PATH: &str = "/api/v1/namespaces/mimic-system/secrets/mimic-webhook-tls";
+/// What the mesh reflectors list and watch (MIMIC_MESH defaults to on).
+const MESH_PATHS: [&str; 4] = [
+    "/api/v1/services",
+    "/apis/discovery.k8s.io/v1/endpointslices",
+    "/apis/apps/v1/deployments",
+    "/apis/mimic.platform.io/v1alpha1/mimicconfigs",
+];
 const SEED_PATH: &str = "/api/v1/namespaces/mimic-system/secrets/mimic-tls-ca";
 const CONFIGS_PATH: &str = "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations";
 const CONFIG_PATH: &str =
@@ -459,6 +466,24 @@ fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
                 }
                 let list = serde_json::json!({"apiVersion": "mimic.platform.io/v1alpha1",
                     "kind": "MimicWorkloadList", "metadata": {"resourceVersion": "1"}, "items": []});
+                (200, list)
+            }
+            // The mesh watches (#441): nothing in the cluster, and no `ReferenceGrant` CRD.
+            ("GET", "/apis/gateway.networking.k8s.io/v1beta1/referencegrants") => (
+                404,
+                serde_json::json!({"apiVersion": "v1", "kind": "Status",
+                "status": "Failure", "reason": "NotFound", "code": 404, "message": "no"}),
+            ),
+            ("GET", path) if MESH_PATHS.contains(&path) => {
+                if query.contains("watch=true") {
+                    drop(state);
+                    let _ =
+                        writer.write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n");
+                    thread::sleep(Duration::from_secs(120));
+                    return;
+                }
+                let list = serde_json::json!({"apiVersion": "v1", "kind": "List",
+                    "metadata": {"resourceVersion": "1"}, "items": []});
                 (200, list)
             }
             _ => {
@@ -734,6 +759,27 @@ fn shr_11_an_invalid_max_authorities_exits_2_before_listening() {
             stderr.contains("MIMIC_STORE_MAX_AUTHORITIES"),
             "{value:?}: {stderr}"
         );
+    }
+}
+
+#[test]
+fn msh_18_an_invalid_mesh_setting_exits_2_before_listening() {
+    for (var, value) in [
+        ("MIMIC_MESH", "maybe"),
+        ("MIMIC_CLUSTER_NAME", "Prod"),
+        ("MIMIC_MESH_WATCH_TIMEOUT", "50ms"),
+        ("MIMIC_MESH_DEBOUNCE", "2s"),
+        ("MIMIC_MESH_VIEW_CACHE_BYTES", "1Mi"),
+        ("MIMIC_SIDECAR_API_MAX_WATCHES", "0"),
+        ("MIMIC_MESH_MAX_SERVICES", "0"),
+    ] {
+        let (status, _, stderr) = run(
+            BIN,
+            &[],
+            &env(&[("MIMIC_VALKEY_URL", "redis://127.0.0.1:1"), (var, value)]),
+        );
+        assert_eq!(status.code(), Some(2), "{var}={value:?}");
+        assert!(stderr.contains(var), "{var}={value:?}: {stderr}");
     }
 }
 

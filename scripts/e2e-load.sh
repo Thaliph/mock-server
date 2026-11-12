@@ -541,9 +541,13 @@ fi
 # --- the chart without a cluster (LDT-06) -----------------------------------------------------
 log "ldt_06: the default chart installs no load test object and no load test RBAC or policy"
 off=$(helm template "$RELEASE" deploy/helm/mimic -n "$NS")
-for word in MimicLoadTest mimicloadtests endpointslices networkpolicies "kind: Job" "-load-job" "-load-secret"; do
+for word in MimicLoadTest mimicloadtests networkpolicies "kind: Job" "-load-job" "-load-secret"; do
   if found -F -e "$word" <<<"$off"; then fail "ldt_06: the default chart renders $word"; fi
 done
+# endpointslices: the mesh (on by default, #441) reads them through the controller's ClusterRole; the load test
+# RBAC must not add them, so the check is made on the default chart without the mesh.
+mesh_off=$(helm template "$RELEASE" deploy/helm/mimic -n "$NS" --set mesh.enabled=false)
+if found -F -e endpointslices <<<"$mesh_off"; then fail "ldt_06: the default chart without the mesh renders endpointslices"; fi
 [[ $(grep -c '^kind: ValidatingAdmissionPolicy$' <<<"$off" || true) == 1 ]] \
   || fail "ldt_06: the default chart renders a ValidatingAdmissionPolicy besides the injector's"
 [[ $(awk '/name: MIMIC_LOAD_MAX_RUNS/ { getline; print }' <<<"$off") == *'"0"'* ]] \

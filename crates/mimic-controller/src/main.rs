@@ -4,6 +4,7 @@
 mod cert_manager;
 mod certs;
 mod loadtest;
+mod mesh;
 mod push_config;
 mod resources;
 mod sidecar_api;
@@ -47,6 +48,8 @@ struct Config {
     push: push_config::PushConfig,
     /// The `MIMIC_LOAD_*` settings; `max_runs` 0 disables load tests (spec §7.8).
     load: loadtest::Config,
+    /// The `MIMIC_MESH*` and `MIMIC_CLUSTER_NAME` settings (spec §10.2).
+    mesh: mesh::MeshConfig,
 }
 
 fn config(env: &Env) -> Result<Config, ConfigError> {
@@ -73,6 +76,7 @@ fn config(env: &Env) -> Result<Config, ConfigError> {
         sidecar_api_addr,
         push,
         load,
+        mesh: mesh::MeshConfig::from_env(env)?,
     })
 }
 
@@ -145,6 +149,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     let ui_metrics = ui::UiMetrics::register(metrics.registry_mut());
     let status_metrics = status::StatusMetrics::register(metrics.registry_mut());
     let load_metrics = loadtest::LoadMetrics::register(metrics.registry_mut());
+    let mesh_metrics = mesh::MeshMetrics::register(metrics.registry_mut());
     // Constant for the process: set once, from the parsed configuration.
     let limit = Family::<Vec<(String, String)>, Gauge>::default();
     metrics
@@ -164,6 +169,11 @@ async fn run(config: Config) -> std::io::Result<()> {
         "webhook configured"
     );
     let cache = Arc::new(workloads::WorkloadCache::new());
+    // Off: no hub, no watch, and the route answers 404 (design §3.4).
+    let mesh = config
+        .mesh
+        .enabled
+        .then(|| mesh::Hub::new(config.mesh, mesh_metrics));
     // The serving certificate is loaded into this slot by the certificate manager.
     let cert = Arc::new(tls::CertSlot::new());
     // The TLS seed (spec §5) is loaded into this slot by `tls_ca::manage`.
@@ -190,6 +200,7 @@ async fn run(config: Config) -> std::io::Result<()> {
     tokio::spawn({
         let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
         let (kube_client, resources) = (kube_client.clone(), resources.clone());
+        let mesh = mesh.clone();
         let tls_ca = config.tls_ca;
         let certificates = cert_manager::CertConfig {
             namespace: webhook.namespace.clone(),
@@ -200,7 +211,7 @@ async fn run(config: Config) -> std::io::Result<()> {
         async move {
             let client = workloads::client().await;
             let _ = kube_client.set(client.clone());
-            tokio::spawn(workloads::watch(client.clone(), cache));
+            tokio::spawn(workloads::watch(client.clone(), cache.clone()));
             tokio::spawn(resources::watch(
                 client.clone(),
                 resources.clone(),
@@ -211,6 +222,10 @@ async fn run(config: Config) -> std::io::Result<()> {
             }
             if let Some(slices) = slices {
                 tokio::spawn(sidecar_api::load::watch_slices(client.clone(), slices));
+            }
+            if let Some(mesh) = mesh {
+                let sink = Arc::new(mesh::status::KubeSink::new(kube_client.clone()));
+                mesh::spawn(client.clone(), mesh, cache.changes(), sink);
             }
             tokio::spawn(tls_ca::manage(client.clone(), tls_ca, seed, seed_metrics));
             cert_manager::manage(client, certificates, cert, cert_metrics).await;
@@ -307,7 +322,16 @@ async fn run(config: Config) -> std::io::Result<()> {
         egress: sidecar_api::EgressCache::new(config.push.egress_budget, &api_metrics),
         egress_logged: sidecar_api::EgressLogged::default(),
         load,
+        mesh: mesh.clone(),
     });
+    // The held requests end with the process, within the grace period.
+    if let Some(mesh) = mesh {
+        let stop = shutdown.clone().wait();
+        tokio::spawn(async move {
+            stop.await;
+            mesh.close();
+        });
+    }
     let webhook_listener = tokio::net::TcpListener::bind(webhook.addr).await?;
     tracing::info!(addr = %webhook_listener.local_addr()?, "webhook listening");
     let grace = config.common.shutdown_grace;

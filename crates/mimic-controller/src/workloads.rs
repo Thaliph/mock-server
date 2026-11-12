@@ -43,14 +43,34 @@ struct State {
     synced: bool,
 }
 
-#[derive(Default)]
 pub struct WorkloadCache {
     state: RwLock<State>,
+    /// Counts the changes that can change a mode (the mesh view carries it).
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for WorkloadCache {
+    fn default() -> WorkloadCache {
+        WorkloadCache {
+            state: RwLock::default(),
+            changes: tokio::sync::watch::channel(0).0,
+        }
+    }
 }
 
 impl WorkloadCache {
     pub fn new() -> WorkloadCache {
         WorkloadCache::default()
+    }
+
+    /// Ticks when a `MimicWorkload` is added, removed or changes what its deployment's mode
+    /// is made of (not for a status).
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn changed(&self) {
+        self.changes.send_modify(|n| *n += 1);
     }
 
     /// Adds or updates a `MimicWorkload`.
@@ -62,19 +82,28 @@ impl WorkloadCache {
         exclude: Vec<String>,
         redact: Vec<String>,
     ) {
-        self.write().items.insert(
-            (namespace.into(), name.into()),
-            (deployment.into(), exclude, redact),
-        );
+        let settings = (deployment.to_string(), exclude, redact);
+        let key = (namespace.to_string(), name.to_string());
+        let mut state = self.write();
+        let same = state.items.get(&key) == Some(&settings);
+        state.items.insert(key, settings);
+        drop(state);
+        if !same {
+            self.changed();
+        }
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
         let mut state = self.write();
         let key = (namespace.to_string(), name.to_string());
-        state.items.remove(&key);
+        let existed = state.items.remove(&key).is_some();
         state.statuses.remove(&key);
         state.mode_statuses.remove(&key);
         state.mocks.remove(&key);
+        drop(state);
+        if existed {
+            self.changed();
+        }
     }
 
     /// Replaces the whole content after a (re)list and marks the cache synced.
@@ -88,6 +117,8 @@ impl WorkloadCache {
         state.mode_statuses.clear();
         state.mocks.clear();
         state.synced = true;
+        drop(state);
+        self.changed();
     }
 
     /// Records the mock settings of a `MimicWorkload`.
@@ -97,10 +128,16 @@ impl WorkloadCache {
         if !state.items.contains_key(&key) {
             return;
         }
+        let before = state.mocks.get(&key).cloned();
         if mock == MockSettings::default() {
             state.mocks.remove(&key);
         } else {
-            state.mocks.insert(key, mock);
+            state.mocks.insert(key.clone(), mock);
+        }
+        let changed = before.as_ref() != state.mocks.get(&key);
+        drop(state);
+        if changed {
+            self.changed();
         }
     }
 

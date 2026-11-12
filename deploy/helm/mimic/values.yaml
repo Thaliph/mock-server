@@ -43,6 +43,27 @@ controller:
     # A pod counts in status.discovery.pods while its last push is this recent (1s to 24h).
     podWindow: 5m
 
+# The mimic mesh (spec §7.2, §7.9, design `docs/design/mimic-mesh.md` §3.4). Each value is the variable of
+# the same name in spec §10.2; invalid values exit the controller with 2.
+mesh:
+  # false (the kill switch of the cluster): the controller serves no mesh view (404), watches nothing and asks
+  # for no Service, EndpointSlice, Deployment, MimicConfig or ReferenceGrant; sidecars keep today's relay.
+  enabled: true
+  # Name of the cluster in the view (MIMIC_CLUSTER_NAME).
+  clusterName: local
+  # A held view request ends 304 after this long without a change (100ms to 10m).
+  watchTimeout: 30s
+  # Changes are coalesced for this long, doubled up to 1s while they keep arriving (10ms to 1s).
+  debounce: 100ms
+  # Bytes of built views cached per replica (at least maxViewBytes, at most 4Gi).
+  viewCacheBytes: 64Mi
+  # Bounds of one view: Services, endpoints, bytes (spec §7.9).
+  maxServices: 1024
+  maxEndpoints: 10000
+  maxViewBytes: 4Mi
+  # Held view requests at once per replica; over it 503 with Retry-After.
+  maxWatches: 10000
+
 # Pod injection (spec §7.1). The sidecar image is `image` above.
 inject:
   # mimic-init, the init container that installs the traffic redirection in injected pods.

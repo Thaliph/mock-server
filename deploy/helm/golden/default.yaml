@@ -462,7 +462,7 @@ spec:
 # Source: mimic/templates/rbac.yaml
 # Least privilege for the controller (spec §11): every grant is limited to the names this
 # release creates. The only create is TokenReview (sidecar API authentication, spec §7.2).
-# No pods, no Deployments, no other Secrets.
+# No pods, no other Secrets; Deployments are read for their metadata only (the mesh view, below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -490,6 +490,28 @@ rules:
   - apiGroups: [authentication.k8s.io]
     resources: [tokenreviews]
     verbs: [create]
+  # The mesh view (spec §7.2, §7.9, M1): read-only watches on what a view is built from (a Deployment is
+  # watched for its metadata only), the ReferenceGrants that let a namespace consent to a destination (the
+  # Gateway API CRD may not exist: the rule is harmless then), and the status of a MimicConfig by server-side
+  # apply. No Secret, no write on what is watched.
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch]
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicconfigs]
+    verbs: [get, list, watch]
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicconfigs/status]
+    verbs: [patch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [referencegrants]
+    verbs: [get, list, watch]
 
 ---
 # Source: mimic/templates/rbac.yaml
@@ -694,6 +716,25 @@ spec:
               value: "30s"
             - name: MIMIC_STATUS_POD_WINDOW
               value: "5m"
+            # The mesh view (spec §7.2, §10.2); off: no view is served (404) and nothing is watched.
+            - name: MIMIC_MESH
+              value: "on"
+            - name: MIMIC_CLUSTER_NAME
+              value: "local"
+            - name: MIMIC_MESH_WATCH_TIMEOUT
+              value: "30s"
+            - name: MIMIC_MESH_DEBOUNCE
+              value: "100ms"
+            - name: MIMIC_MESH_VIEW_CACHE_BYTES
+              value: "64Mi"
+            - name: MIMIC_MESH_MAX_SERVICES
+              value: "1024"
+            - name: MIMIC_MESH_MAX_ENDPOINTS
+              value: "10000"
+            - name: MIMIC_MESH_MAX_VIEW_BYTES
+              value: "4Mi"
+            - name: MIMIC_SIDECAR_API_MAX_WATCHES
+              value: "10000"
             # Load test runs active at once in the cluster (spec §10.2): 0 disables load tests.
             - name: MIMIC_LOAD_MAX_RUNS
               value: "0"

@@ -52,9 +52,11 @@ Controller (ClusterRole / Role):
 | `mimicworkloads/status` | `patch` |
 | `mutatingwebhookconfigurations`, only its own by name | `get`, `list`, `watch`, `patch` (a `ValidatingAdmissionPolicy` limits changes to `caBundle`) |
 | `tokenreviews` | `create` |
+| `services`, `endpointslices`, `deployments` (metadata only), `mimicconfigs`, `referencegrants` (when `mesh.enabled`, the default) | `get`, `list`, `watch` |
+| `mimicconfigs/status` (when `mesh.enabled`) | `patch` (server-side apply, field manager `mimic-mesh`) |
 | Secrets, only `<release>-webhook-tls` and `<release>-tls-ca` in its namespace | `get`, `update` |
 
-No access to pods, Deployments, ReplicaSets or other Secrets. Whoever can `exec`/`get` the two Secrets
+No access to pods, ReplicaSets or other Secrets, no write on Deployments. The mesh view a sidecar fetches holds the Services of its own namespace and the destinations its `MimicConfig` declares in a namespace that consents with a `ReferenceGrant`; a pod reads its own deployment's view only, and no Secret, label or annotation reaches a view. Whoever can `exec`/`get` the two Secrets
 or the controller pods can obtain the TLS seed: restrict that access. Whoever can use `pods/portforward`
 in the release namespace can read every discovered report.
 

@@ -41,6 +41,7 @@ use crate::workloads::WorkloadCache;
 mod admission;
 mod egress;
 pub mod load;
+mod mesh;
 
 pub use admission::{BodyBudget, RateLimiter, ReviewCache};
 pub use egress::Cache as EgressCache;
@@ -326,6 +327,8 @@ pub struct SidecarApi {
     pub egress_logged: egress::Logged,
     /// The load routes (spec §7.8); absent when load tests are disabled.
     pub load: Option<load::LoadApi>,
+    /// The mesh view (spec §7.2); absent with `MIMIC_MESH=off`: the route answers `404`.
+    pub mesh: Option<Arc<crate::mesh::Hub>>,
 }
 
 pub fn router(api: Arc<SidecarApi>) -> Router {
@@ -366,6 +369,31 @@ pub fn router(api: Arc<SidecarApi>) -> Router {
                     let peer = request.extensions().get::<Peer>().map(|peer| peer.0);
                     api.egress(&deployment, request.headers(), request.uri().query(), peer)
                         .await
+                },
+            ),
+        )
+        .route(
+            mesh::ENDPOINT,
+            any(
+                |State(api): State<Arc<SidecarApi>>,
+                 Path(deployment): Path<String>,
+                 request: axum::extract::Request| async move {
+                    if api.mesh.is_none() {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    if request.method() != Method::GET {
+                        return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, "GET")]).into_response();
+                    }
+                    let peer = request.extensions().get::<Peer>().map(|peer| peer.0);
+                    let hold = request.extensions().get::<crate::tls::Hold>().cloned();
+                    api.mesh(
+                        &deployment,
+                        request.headers(),
+                        request.uri().query(),
+                        peer,
+                        hold,
+                    )
+                    .await
                 },
             ),
         )
@@ -510,7 +538,8 @@ impl SidecarApi {
                 )
             };
         }
-        if result == "rate_limited" {
+        // A long-poll answers every 30 s per sidecar at least: not a line each.
+        if result == "rate_limited" || (endpoint == mesh::ENDPOINT && result == "not_modified") {
             line!(debug);
         } else {
             line!(info);
@@ -862,6 +891,8 @@ async fn read_exact(body: Body, length: usize) -> Result<Vec<u8>, Refusal> {
 #[cfg(test)]
 mod load_tests;
 #[cfg(test)]
+mod mesh_tests;
+#[cfg(test)]
 mod push_tests;
 
 #[cfg(test)]
@@ -1031,6 +1062,7 @@ mod tests {
             egress: egress::Cache::new(32 << 20, &api_metrics),
             egress_logged: egress::Logged::default(),
             load: None,
+            mesh: None,
         });
         Setup {
             router: router(api),

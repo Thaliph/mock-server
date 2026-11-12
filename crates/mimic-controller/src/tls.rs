@@ -20,7 +20,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::PoisonError;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
@@ -151,8 +151,21 @@ pub async fn serve(
         // Small writes must not wait for a delayed ACK (PRX-32).
         let _ = stream.set_nodelay(true);
         let (acceptor, router, stop) = (acceptor.clone(), router.clone(), stop_rx.clone());
+        let slots = slots.clone();
         connections.spawn(async move {
-            connection(stream, peer.ip(), acceptor, router, limits, stop).await;
+            // The connection's slot: a held request can give it back (see [`Hold`]).
+            let permit = Arc::new(Mutex::new(Some(permit)));
+            connection(
+                stream,
+                peer.ip(),
+                acceptor,
+                router,
+                limits,
+                permit.clone(),
+                slots,
+                stop,
+            )
+            .await;
             drop(permit);
         });
     }
@@ -175,6 +188,8 @@ enum Phase {
     Idle(Instant),
     /// A request started (first byte read) at this instant and is not answered yet.
     Request(Instant),
+    /// A request that is held on purpose (a long-poll): no deadline until it is answered.
+    Held,
 }
 
 #[derive(Default)]
@@ -202,6 +217,10 @@ impl Cycle {
             let deadline = match phase {
                 Phase::Idle(since) => since + limits.idle_timeout,
                 Phase::Request(since) => since + limits.request_timeout,
+                Phase::Held => {
+                    self.changed.notified().await;
+                    continue;
+                }
             };
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => {
@@ -261,12 +280,60 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
     }
 }
 
+/// Handed to every request in its extensions. A handler that holds a request on purpose calls
+/// [`Hold::start`] once the caller is authenticated and its own budget for held requests has
+/// granted a share (the mesh long-poll, `MIMIC_SIDECAR_API_MAX_WATCHES`): until the request is
+/// answered the connection counts neither against `Limits::max_connections` nor against the
+/// request timeout. When the answer is ready the connection takes a slot again before it serves
+/// another request, or is closed if the cap is full: a keep-alive connection never lives outside
+/// the cap.
+#[derive(Clone)]
+pub struct Hold {
+    cycle: Arc<Cycle>,
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Hold {
+    pub fn start(&self) {
+        self.cycle.set(Phase::Held);
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Frees the slot of the connection for the next client.
+        drop(
+            self.permit
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    /// Tests: a hold on no connection.
+    #[cfg(test)]
+    pub fn detached() -> Hold {
+        Hold {
+            cycle: Arc::new(Cycle::default()),
+            permit: Arc::new(Mutex::new(None)),
+            released: Arc::default(),
+        }
+    }
+
+    /// Tests: whether [`Hold::start`] ran.
+    #[cfg(test)]
+    pub fn started(&self) -> bool {
+        self.released.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn connection(
     stream: TcpStream,
     peer: std::net::IpAddr,
     acceptor: TlsAcceptor,
     router: Router,
     limits: Limits,
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    slots: Arc<Semaphore>,
     mut stop: watch::Receiver<bool>,
 ) {
     let handshake = tokio::time::timeout(limits.request_timeout, acceptor.accept(stream));
@@ -285,6 +352,13 @@ async fn connection(
     let service = service_fn({
         let cycle = cycle.clone();
         move |mut request: hyper::Request<hyper::body::Incoming>| {
+            let hold = Hold {
+                cycle: cycle.clone(),
+                permit: permit.clone(),
+                released: Arc::default(),
+            };
+            request.extensions_mut().insert(hold.clone());
+            let (permit, slots) = (permit.clone(), slots.clone());
             // The sidecar API limits by source; the other routes ignore it.
             request
                 .extensions_mut()
@@ -293,6 +367,23 @@ async fn connection(
             async move {
                 let response = answer.await;
                 cycle.set(Phase::Idle(Instant::now()));
+                if hold.released.load(std::sync::atomic::Ordering::SeqCst) {
+                    match slots.try_acquire_owned() {
+                        Ok(slot) => {
+                            *permit.lock().unwrap_or_else(PoisonError::into_inner) = Some(slot);
+                        }
+                        // The cap is full: this connection ends with its answer.
+                        Err(_) => {
+                            return response.map(|mut r| {
+                                r.headers_mut().insert(
+                                    hyper::header::CONNECTION,
+                                    hyper::header::HeaderValue::from_static("close"),
+                                );
+                                r
+                            });
+                        }
+                    }
+                }
                 response
             }
         }
@@ -338,6 +429,15 @@ mod tests {
     }
 
     async fn start(max_connections: usize, idle_timeout: Duration) -> Listener {
+        let router = Router::new().route("/ok", get(|| async { "ok" }));
+        start_with(router, max_connections, idle_timeout).await
+    }
+
+    async fn start_with(
+        router: Router,
+        max_connections: usize,
+        idle_timeout: Duration,
+    ) -> Listener {
         let stored =
             certs::issue(&Stored::default(), Decision::NewCa, NAME, SystemTime::now()).unwrap();
         let slot = Arc::new(CertSlot::new());
@@ -353,7 +453,6 @@ mod tests {
             .with_no_client_auth();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let router = Router::new().route("/ok", get(|| async { "ok" }));
         let limits = Limits {
             max_connections,
             request_timeout: TIMEOUT,
@@ -467,5 +566,51 @@ mod tests {
         assert!(!closed_within(&mut tls, TIMEOUT + Duration::from_millis(300)).await);
         assert!(closed_within(&mut tls, idle).await);
         assert!(started.elapsed() >= idle - Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn msh_23_a_held_request_counts_neither_against_the_cap_nor_the_request_timeout() {
+        let router = Router::new().route("/ok", get(|| async { "ok" })).route(
+            "/hold",
+            get(|request: axum::extract::Request| async move {
+                let hold = request.extensions().get::<Hold>().cloned().expect("a hold");
+                hold.start();
+                // Four times the request timeout.
+                tokio::time::sleep(TIMEOUT * 3).await;
+                "held"
+            }),
+        );
+        let server = start_with(router, 1, Duration::from_secs(60)).await;
+        let mut held = server.tls().await;
+        held.write_all(b"GET /hold HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The only slot is free while it is held: a second connection is served at once.
+        let started = Instant::now();
+        let mut other = server.tls().await;
+        assert!(get_ok(&mut other).await.starts_with("HTTP/1.1 200"));
+        assert!(started.elapsed() < TIMEOUT, "{:?}", started.elapsed());
+        drop(other);
+        // The server sees the close, and the slot is free before the held request ends.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // The held request outlives the request timeout and is answered.
+        let mut buffer = [0; 512];
+        let n = tokio::time::timeout(TIMEOUT * 6, held.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let answer = String::from_utf8_lossy(&buffer[..n]).into_owned();
+        assert!(
+            answer.starts_with("HTTP/1.1 200") && answer.ends_with("held"),
+            "{answer}"
+        );
+        // Answered with the cap full (the slot went to the next client the listener waits for):
+        // the connection ends with its answer instead of living outside the cap.
+        assert!(
+            answer.to_ascii_lowercase().contains("connection: close"),
+            "the answer does not close the connection"
+        );
+        assert!(closed_within(&mut held, MARGIN).await);
     }
 }

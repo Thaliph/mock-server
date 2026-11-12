@@ -1,6 +1,6 @@
 # Least privilege for the controller (spec §11): every grant is limited to the names this
 # release creates. The only create is TokenReview (sidecar API authentication, spec §7.2).
-# No pods, no Deployments, no other Secrets.
+# No pods, no other Secrets; Deployments are read for their metadata only (the mesh view, below).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -24,6 +24,30 @@ rules:
   - apiGroups: [authentication.k8s.io]
     resources: [tokenreviews]
     verbs: [create]
+  {{- if .Values.mesh.enabled }}
+  # The mesh view (spec §7.2, §7.9, M1): read-only watches on what a view is built from (a Deployment is
+  # watched for its metadata only), the ReferenceGrants that let a namespace consent to a destination (the
+  # Gateway API CRD may not exist: the rule is harmless then), and the status of a MimicConfig by server-side
+  # apply. No Secret, no write on what is watched.
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch]
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicconfigs]
+    verbs: [get, list, watch]
+  - apiGroups: [mimic.platform.io]
+    resources: [mimicconfigs/status]
+    verbs: [patch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [referencegrants]
+    verbs: [get, list, watch]
+  {{- end }}
   {{- if .Values.loadTest.enabled }}
   # Load tests (spec §11, F11): the MimicLoadTest objects, the status of each, and the generator's
   # Job and NetworkPolicy, which the ValidatingAdmissionPolicy of loadtest-policy.yaml restricts to

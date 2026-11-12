@@ -865,4 +865,32 @@ for rule in '!has(self.namespace)' "!has(self.destinations) || self.targetRefs.e
 done
 echo "msh_15: the MimicConfig CRD is kept, has a status subresource, bounded fields and the CEL rules"
 
+# MSH-29 (#441): the controller's RBAC for the mesh watches, and the variables the mesh values render.
+role=$(yq 'select(.kind == "ClusterRole" and .metadata.name == "mimic-controller")' "$tmp/default.yaml")
+rule_verbs() { # rule_verbs <resource>: the verbs of the rules that name the resource, one line each
+  printf '%s\n' "$role" | yq -r ".rules[] | select(.resources[] == \"$1\") | .verbs | join(\",\")"
+}
+for resource in services endpointslices mimicconfigs mimicworkloads referencegrants deployments; do
+  [[ $(rule_verbs "$resource") == get,list,watch ]] || fail "msh_29: the controller does not have exactly get, list, watch on $resource"
+done
+[[ $(rule_verbs mimicconfigs/status) == patch ]] || fail "msh_29: the controller does not have exactly patch on mimicconfigs/status"
+[[ -z $(printf '%s\n' "$role" | yq -r '.rules[] | select(.resources[] == "secrets")') ]] \
+  || fail "msh_29: the ClusterRole has a rule on secrets"
+[[ -z $(printf '%s\n' "$role" | yq -r '.rules[] | select(.resources[] == "services" or .resources[] == "endpointslices" or .resources[] == "referencegrants" or .resources[] == "deployments") | .verbs[] | select(. != "get" and . != "list" and . != "watch")') ]] \
+  || fail "msh_29: the controller can write what it only watches"
+mesh_env() { # mesh_env <variable> [helm flags...]: the value of a controller variable
+  local var=$1; shift
+  render "$@" | yq -r "select(.kind == \"Deployment\" and .metadata.name == \"mimic-controller\") | .spec.template.spec.containers[0].env[] | select(.name == \"$var\") | .value"
+}
+[[ $(mesh_env MIMIC_MESH) == on ]] || fail "msh_29: MIMIC_MESH is not on by default"
+[[ $(mesh_env MIMIC_MESH --set mesh.enabled=false) == off ]] || fail "msh_29: mesh.enabled=false does not render MIMIC_MESH=off"
+for pair in MIMIC_CLUSTER_NAME:mesh.clusterName:eu1 MIMIC_MESH_WATCH_TIMEOUT:mesh.watchTimeout:10s MIMIC_MESH_DEBOUNCE:mesh.debounce:200ms \
+  MIMIC_MESH_VIEW_CACHE_BYTES:mesh.viewCacheBytes:8Mi MIMIC_MESH_MAX_SERVICES:mesh.maxServices:7 MIMIC_MESH_MAX_ENDPOINTS:mesh.maxEndpoints:9 \
+  MIMIC_MESH_MAX_VIEW_BYTES:mesh.maxViewBytes:128Ki MIMIC_SIDECAR_API_MAX_WATCHES:mesh.maxWatches:5; do
+  IFS=: read -r var value want <<<"$pair"
+  [[ $(mesh_env "$var" --set "$value=$want") == "$want" ]] || fail "msh_29: $value does not render $var"
+done
+lint mesh.off --set mesh.enabled=false
+echo "msh_29: the mesh RBAC is read-only on what it watches, patch on mimicconfigs/status; the mesh values render their variables"
+
 echo "chart checks passed"
