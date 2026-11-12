@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod mesh_pods;
 pub mod mock_rig;
 
 use mimic_runtime::metrics::Metrics;
@@ -103,6 +104,36 @@ pub async fn fixture_discovery(
             .with_discovery(discovery.tap()),
     );
     spawn_listener(listener, direction, shared.clone());
+    Fixture {
+        addr,
+        shared,
+        metrics: Arc::new(metrics),
+    }
+}
+
+/// An outbound listener whose original destination is `dst`, with the mesh `state` (its
+/// metrics registered) and, when given, discovery.
+pub async fn fixture_mesh(
+    dst: SocketAddr,
+    state: &mimic_sidecar::mesh::MeshState,
+    discovery: Option<&mimic_sidecar::discovery::Discovery>,
+) -> Fixture {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut metrics = Metrics::new("sidecar", "test");
+    let tunnel_metrics = TunnelMetrics::register(&mut metrics);
+    let original_dst: OriginalDst = Arc::new(move |_| Ok(dst));
+    let proxy = ProxyMetrics::register(&mut metrics, 50);
+    state.register(&mut metrics);
+    let mut shared = Shared::new(vec![addr], tunnel_metrics, original_dst)
+        .with_proxy_metrics(proxy)
+        .with_mesh(state.clone());
+    if let Some(discovery) = discovery {
+        discovery.register(&mut metrics);
+        shared = shared.with_discovery(discovery.tap());
+    }
+    let shared = Arc::new(shared);
+    spawn_listener(listener, Direction::Outbound, shared.clone());
     Fixture {
         addr,
         shared,

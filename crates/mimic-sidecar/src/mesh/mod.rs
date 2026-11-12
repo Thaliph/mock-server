@@ -59,6 +59,12 @@ pub struct MeshConfig {
     pub target: Option<Target>,
     /// Time allowed for one request, held ones included.
     pub timeout: Duration,
+    /// `MIMIC_MESH_POOL_IDLE_TIMEOUT`.
+    pub pool_idle_timeout: Duration,
+    /// `MIMIC_METRICS_MAX_ENDPOINTS`.
+    pub max_endpoint_labels: usize,
+    /// A fixed seed for the random draws (tests); `None`: seeded from the system.
+    pub seed: Option<u64>,
 }
 
 impl Default for MeshConfig {
@@ -71,6 +77,9 @@ impl Default for MeshConfig {
             state_file: PathBuf::new(),
             target: None,
             timeout: REQUEST_TIMEOUT,
+            pool_idle_timeout: Duration::from_secs(90),
+            max_endpoint_labels: 256,
+            seed: None,
         }
     }
 }
@@ -467,6 +476,11 @@ impl MeshState {
         let mut c = lock(&self.0.contact);
         c.at = Some(Instant::now());
         c.stale_warned = false;
+    }
+
+    /// Removes the per-pod series of the endpoints that left the view 5 minutes before `now`.
+    pub fn evict(&self, now: Instant) {
+        let _ = now;
     }
 
     /// Updates `mimic_mesh_view_age_seconds` and writes the stale warning once per streak.

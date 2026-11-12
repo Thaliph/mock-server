@@ -199,3 +199,38 @@ fn msh_32_a_swapped_table_never_mixes_with_the_old_one() {
     assert_eq!(after.lookup(ip("10.96.0.10"), 80), None);
     assert_eq!(after.lookup(ip("10.96.0.11"), 80), Some("shop/pay"));
 }
+
+#[test]
+fn msh_47_pool_and_endpoint_label_defaults_and_values() {
+    let defaults = config(&[]).unwrap();
+    assert_eq!(defaults.pool_idle_timeout, Duration::from_secs(90));
+    assert_eq!(defaults.max_endpoint_labels, 256);
+    let set = config(&[
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "1s"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "10000"),
+    ])
+    .unwrap();
+    assert_eq!(set.pool_idle_timeout, Duration::from_secs(1));
+    assert_eq!(set.max_endpoint_labels, 10_000);
+    assert_eq!(
+        config(&[("MIMIC_MESH_POOL_IDLE_TIMEOUT", "1h")])
+            .unwrap()
+            .pool_idle_timeout,
+        Duration::from_secs(3600)
+    );
+}
+
+#[test]
+fn msh_47_invalid_pool_and_endpoint_label_values_are_refused() {
+    for (var, value) in [
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "999ms"),
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "3601s"),
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "soon"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "0"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "10001"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "many"),
+    ] {
+        let error = config(&[(var, value)]).expect_err(&format!("{var}={value}"));
+        assert!(error.contains(var), "{error}");
+    }
+}
