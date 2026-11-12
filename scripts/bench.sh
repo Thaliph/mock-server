@@ -436,7 +436,8 @@ write_results() {
     "$WORK/$setup.jsonl" >"$file"
   jq -r --arg date "$TODAY" --arg setup "$setup" '
     def v: if . == null then "-" else tostring end;
-    "| \($date) | \($setup) | \(.protocol) | \(.rate) | \(.latency_ms.p50 | v) | \(.latency_ms.p90 | v) | \(.latency_ms.p99 | v) | \(.latency_ms["p99.9"] | v) | \(.errors) | \(.sidecar.caller.cpu_cores | v) | \(.sidecar.callee.cpu_cores | v) | \(.sidecar.caller.rss_mib | v) | \(.sidecar.callee.rss_mib | v) |"' \
+    def r2: if . == null then "-" else (. * 100 | round / 100 | tostring) end;
+    "| \($date) | \($setup) | \(.protocol) | \(.rate) | \(.fortio.ActualQPS | r2) | \(.latency_ms.p50 | r2) | \(.latency_ms.p90 | r2) | \(.latency_ms.p99 | r2) | \(.latency_ms["p99.9"] | r2) | \(.errors) | \(.sidecar.caller.cpu_cores | v) | \(.sidecar.callee.cpu_cores | v) | \(.sidecar.caller.rss_mib | v) | \(.sidecar.callee.rss_mib | v) |"' \
     "$WORK/$setup.jsonl" >>"$OUT_DIR/README.md"
   echo "wrote $file"
 }
