@@ -1395,7 +1395,7 @@ async fn grp_34_a_400_to_format_2_is_answered_by_format_1_at_once_and_format_2_i
     let refused = text
         .matches("egress format 2 refused, using format 1")
         .count();
-    assert_eq!(refused, 1, "{text}");
+    assert_eq!(refused, 1, "the fallback is logged once");
     rig.stop().await;
 }
 
