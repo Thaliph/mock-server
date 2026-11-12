@@ -3208,8 +3208,23 @@ if kubectl -n "$NS" get deploy $RELEASE-grafana >/dev/null 2>&1; then fail "mon_
 # pass, with no restart; spec.mode none stops it again.
 log "non_08: a deployment injected by label with no MimicWorkload is in none and records nothing; spec.mode discovery records it without a restart"
 ns_fresh non-08 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+# Its own client, in a namespace mimic does not inject (disc-22-client is gone by now).
+ns_fresh non-08-client
+kubectl -n non-08-client apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: client, labels: {app: client}}
+spec:
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: client
+      image: $(yq -r 'select(.kind == "Pod") | .spec.containers[0].image' scripts/e2e/apps/front.yaml)
+      command: [sleep, "3600"]
+YAML
 kubectl -n non-08 create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py >/dev/null
 kubectl -n non-08 apply -f scripts/e2e/apps/users.yaml >/dev/null
+kubectl -n non-08-client wait --for=condition=Ready pod/client --timeout=180s >/dev/null \
+  || fail "non_08: client pod not Ready"
 kubectl -n non-08 rollout status deploy/users --timeout=3m >/dev/null \
   || { kubectl -n non-08 describe pods -l app=users >&2 || true; fail "non_08: deployment users did not roll out"; }
 has_mimic non-08 app=users || fail "non_08: users was not injected"
@@ -3234,9 +3249,9 @@ text = urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read(
 sys.exit(0 if f'mimic_mode{{mode="{sys.argv[1]}"}} 1' in text else 1)
 PY
 }
-# non08_calls <n> <canary>: n GETs of users from the client of disc-22 (outside the injected namespaces).
+# non08_calls <n> <canary>: n GETs of users from the non-08-client pod (outside the injected namespaces).
 non08_calls() {
-  kubectl -n disc-22-client exec -i client -- python3 - "$1" "$2" <<'PY'
+  kubectl -n non-08-client exec -i client -- python3 - "$1" "$2" <<'PY'
 import sys, urllib.request
 n, canary = int(sys.argv[1]), sys.argv[2]
 ok = 0
@@ -3330,7 +3345,7 @@ for p in $non08_pods; do
     ! kubectl -n non-08 logs "$p" -c "$c" 2>/dev/null | grep -qF "$non08_canary" || fail "non_08: the canary is in the $c log of $p"
   done
 done
-kubectl delete namespace non-08 --wait=false >/dev/null
+kubectl delete namespace non-08 non-08-client --wait=false >/dev/null
 
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"
 kubectl apply -f - >/dev/null <<YAML
