@@ -2478,11 +2478,11 @@ no insignificant whitespace):
   drawn at random (one endpoint: that one, none: `503` `x-mimic-error: no-endpoint`) and the one
   with the lower `(in_flight + 1) / weight` is taken, the first draw on a tie; `in_flight` counts
   the requests of this sidecar sent to the endpoint whose response is not complete. **Slow
-  start**: an endpoint first seen in a view after the first one applied has weight
-  `max(0.1, min(1, age / window))`, `age` the time since that view and `window` the Service's
-  `policy.loadBalancer.slowStartSeconds` (0: always 1); the endpoints of the first view applied
-  (also one read from the state file) have weight 1; an endpoint that leaves the view and
-  comes back is new again. The endpoints are those of the view for the Service port (ready
+  start**: an endpoint that joins a Service port after the sidecar first saw that port has weight
+  `max(0.1, min(1, age / window))`, `age` the time since the view that brought it and `window`
+  the Service's `policy.loadBalancer.slowStartSeconds` (0: always 1); the endpoints a port has
+  when the sidecar first sees it (the first view applied, also one read from the state file)
+  have weight 1; an endpoint that leaves the view and comes back is new again. The endpoints are those of the view for the Service port (ready
   ones, or the serving and terminating ones when none is ready, §7.9).
   **Pools** are per (pod IP, port, protocol), the protocol being the one the app spoke
   (HTTP/1 or HTTP/2, never upgraded). HTTP/2: connections multiplexed, a new one (at most 16 per
@@ -4610,7 +4610,7 @@ MSH-18 to MSH-30 are #441 (the watches, the route, the chart), MSH-31 to MSH-42 
 | MSH-42 | **D** (security and performance review). Parsing is bounded (body read capped before and after decompression, `View::from_json` with the limits, a persisted file read capped and only if regular); the token is handled as for the egress pull (read per request, never logged); nothing of another namespace enters the table, which is built from the view only; the persisted file holds what the controller served and is in the pod's `emptyDir`; the per-connection cost is one table read and one lookup, nothing per exchange (PRX, TLS, GRP, MCK, NON tests unchanged; the M0 benchmark is not worse than its recorded results). |
 | MSH-43 | **U** (`mimic-core` `mesh::lb`, draws and clock passed in). Pick: with two or more endpoints two distinct indices are drawn and the one with the lower `(in_flight + 1) / weight` is returned, the first draw on a tie, whatever the order of the draws; one endpoint is returned without a draw; none gives `None`; the draw is called with `n` then `n - 1`, and an index is never out of range. |
 | MSH-44 | **U** (`proptest`). With a feedback loop (requests that complete after a random time) over any endpoints, weights and seeds: no pick is out of range, an endpoint with a lower in-flight count than all others is never passed over for a loaded one it was drawn against, the busiest endpoint never receives more than twice the mean over 10 000 picks with equal weights, and an endpoint of weight 1 receives more than one of weight 0.1 under the same load. |
-| MSH-45 | **U.** Slow start: weight `max(0.1, min(1, age / window))`: 0.1 at age 0, 0.5 at half the window, 1 from the window on, never above 1; the endpoints of the first view have weight 1 and those added by a later one start at 0.1; a known endpoint keeps its first-seen time across updates, one that left and came back is new; window 0 gives 1 always; the update is the same for any order of the endpoints given. |
+| MSH-45 | **U.** Slow start: weight `max(0.1, min(1, age / window))`: 0.1 at age 0, 0.5 at half the window, 1 from the window on, never above 1; the endpoints of the first update have weight 1 and those added by a later one start at 0.1; a known endpoint keeps its first-seen time across updates, one that left and came back is new; window 0 gives 1 always; the update is the same for any order of the endpoints given. |
 | MSH-46 | **B** (criterion micro-benchmark `mesh_lb`, results in `docs/bench/`). The pick over 3, 100 and 1000 endpoints takes at most 2 µs (design §14). |
 | MSH-47 | **U** (sidecar configuration). Unset: `MIMIC_MESH_POOL_IDLE_TIMEOUT` 90 s, `MIMIC_METRICS_MAX_ENDPOINTS` 256. Exit 2 (FND-01) for a pool idle timeout below 1s or over 1h and for `MIMIC_METRICS_MAX_ENDPOINTS` 0 or 10001. |
 | MSH-48 | **I** (in-process sidecar, view with one Service of three fake pods on local listeners, original destination faked to the ClusterIP). One HTTP/1 keep-alive client sending 3000 requests one after the other: each pod gets 1000 ± 10 %, every request is answered with its pod's response, and `mimic_mesh_endpoint_requests_total` per pod equals what the pod counted. An `h2c` client over one connection with 3000 requests, 8 at a time: the same spread. |

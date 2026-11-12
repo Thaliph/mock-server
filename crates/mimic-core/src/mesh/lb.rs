@@ -26,47 +26,91 @@ struct Member {
 impl Endpoints {
     /// No endpoint yet; the first [`Endpoints::update`] is the first view.
     pub fn new(window: Duration) -> Endpoints {
-        let _ = window;
-        unimplemented!()
+        Endpoints {
+            window,
+            members: Vec::new(),
+            seen: false,
+        }
     }
 
+    /// Changes the slow-start window; zero disables the slow start.
     pub fn set_window(&mut self, window: Duration) {
-        let _ = window;
-        unimplemented!()
+        self.window = window;
     }
 
-    /// Replaces the endpoints by `addrs` at `now`.
+    /// Replaces the endpoints by `addrs` at `now` (any order, duplicates ignored). An endpoint
+    /// already known keeps its first-seen time; the endpoints of the first update have full
+    /// weight, the ones that join later start in slow start.
     pub fn update(&mut self, addrs: &[SocketAddr], now: Duration) {
-        let _ = (addrs, now);
-        unimplemented!()
+        let mut sorted = addrs.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let first = !self.seen;
+        let members = sorted
+            .into_iter()
+            .map(|addr| {
+                let born = match self.members.binary_search_by_key(&addr, |m| m.addr) {
+                    Ok(known) => self.members[known].born,
+                    Err(_) if first => None,
+                    Err(_) => Some(now),
+                };
+                Member { addr, born }
+            })
+            .collect();
+        self.members = members;
+        self.seen = true;
     }
 
     pub fn len(&self) -> usize {
-        unimplemented!()
+        self.members.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        unimplemented!()
+        self.members.is_empty()
     }
 
     pub fn addr(&self, index: usize) -> Option<SocketAddr> {
-        let _ = index;
-        unimplemented!()
+        self.members.get(index).map(|m| m.addr)
     }
 
+    /// `max(0.1, min(1, age / window))` for an endpoint in slow start, 1 otherwise.
     pub fn weight(&self, index: usize, now: Duration) -> f64 {
-        let _ = (index, now);
-        unimplemented!()
+        let Some(born) = self.members.get(index).and_then(|m| m.born) else {
+            return 1.0;
+        };
+        if self.window.is_zero() {
+            return 1.0;
+        }
+        let age = now.saturating_sub(born);
+        (age.as_secs_f64() / self.window.as_secs_f64()).clamp(MIN_WEIGHT, 1.0)
     }
 
-    /// The index of the endpoint to send a request to.
+    /// The index of the endpoint to send a request to: two distinct endpoints are drawn
+    /// (`draw(n)` returns a number below `n`) and the one with the lower
+    /// `(in_flight + 1) / weight` wins, the first draw on a tie. One endpoint is taken without
+    /// a draw, none gives `None`.
     pub fn pick(
         &self,
         now: Duration,
         in_flight: impl Fn(usize) -> u32,
         draw: &mut impl FnMut(usize) -> usize,
     ) -> Option<usize> {
-        let _ = (now, in_flight, draw);
-        unimplemented!()
+        let n = self.members.len();
+        match n {
+            0 => return None,
+            1 => return Some(0),
+            _ => {}
+        }
+        let first = draw(n).min(n - 1);
+        let mut second = draw(n - 1).min(n - 2);
+        if second >= first {
+            second += 1;
+        }
+        let score = |i: usize| (f64::from(in_flight(i)) + 1.0) / self.weight(i, now);
+        Some(if score(second) < score(first) {
+            second
+        } else {
+            first
+        })
     }
 }
