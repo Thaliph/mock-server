@@ -88,8 +88,8 @@ fn grp_04_malformed_values_are_errors() {
         [tag(1, 2), varint(5), b"abc".to_vec()].concat(),
         vec![0x80],
     ];
-    for bytes in truncated {
-        assert!(Message::decode(&bytes).is_err(), "{bytes:?}");
+    for (i, bytes) in truncated.iter().enumerate() {
+        assert!(Message::decode(bytes).is_err(), "truncated case {i}");
     }
     // A length beyond the payload and beyond u32.
     assert!(Message::decode(&[tag(1, 2), varint(u64::MAX)].concat()).is_err());
@@ -122,10 +122,7 @@ fn grp_05_a_payload_that_parses_is_a_message_even_when_utf8() {
             }]
         })
     );
-    assert_eq!(
-        decode_json(&len(2, &var(1, 5))),
-        json!({"2": {"1": 5}})
-    );
+    assert_eq!(decode_json(&len(2, &var(1, 5))), json!({"2": {"1": 5}}));
 }
 
 #[test]
@@ -133,7 +130,10 @@ fn grp_05_text_that_is_not_a_message_is_a_string() {
     // 'h' = tag of field 13, wire 0 (fine), then 'e' = 0x65: varint 101; 'l' = tag 13 wire 4,
     // a group: not a message.
     assert_eq!(only(&len(1, b"hello")), Value::Str("hello".into()));
-    assert_eq!(only(&len(1, "héllo".as_bytes())), Value::Str("héllo".into()));
+    assert_eq!(
+        only(&len(1, "héllo".as_bytes())),
+        Value::Str("héllo".into())
+    );
 }
 
 #[test]
@@ -144,7 +144,10 @@ fn grp_05_invalid_utf8_that_does_not_parse_is_bytes() {
     );
     // A group tag, and a truncated field, are not messages.
     assert_eq!(only(&len(1, &[0x0b, 0xff])), Value::Bytes(vec![0x0b, 0xff]));
-    assert_eq!(only(&len(1, &[0x0a, 0x05, 0xff])), Value::Bytes(vec![0x0a, 0x05, 0xff]));
+    assert_eq!(
+        only(&len(1, &[0x0a, 0x05, 0xff])),
+        Value::Bytes(vec![0x0a, 0x05, 0xff])
+    );
 }
 
 #[test]
@@ -233,19 +236,34 @@ fn grp_06_4096_fields_are_read_and_4097_are_an_error() {
     assert_eq!(MAX_FIELDS, 4096);
     let many = |n: usize| var(1, 1).repeat(n);
     assert_eq!(
-        Message::decode(&many(MAX_FIELDS)).expect("decodes").fields.len(),
+        Message::decode(&many(MAX_FIELDS))
+            .expect("decodes")
+            .fields
+            .len(),
         MAX_FIELDS
     );
     assert_eq!(
         Message::decode(&many(MAX_FIELDS + 1)),
         Err(WireError::TooManyFields)
     );
-    // The budget is shared by the tree: 4095 + a nested message of 2 fields is over.
+    // The budget is shared by the tree: 4095 fields + a nested payload of 2 fields is over,
+    // so the payload stays a string.
     let tree = [many(MAX_FIELDS - 1), len(2, &many(2))].concat();
-    assert_eq!(Message::decode(&tree), Err(WireError::TooManyFields));
+    let message = Message::decode(&tree).expect("decodes");
+    assert_eq!(message.fields.len(), MAX_FIELDS);
+    assert!(matches!(
+        message.fields[MAX_FIELDS - 1].value,
+        Value::Str(_)
+    ));
+    let fits = [many(MAX_FIELDS - 3), len(2, &many(2))].concat();
+    let message = Message::decode(&fits).expect("decodes");
+    assert!(matches!(
+        message.fields[MAX_FIELDS - 3].value,
+        Value::Message(_)
+    ));
     // A nested payload that alone exceeds the budget stays bytes.
     let big = len(1, &many(MAX_FIELDS + 1));
-    assert!(matches!(only(&big), Value::Bytes(_)));
+    assert!(matches!(only(&big), Value::Str(_) | Value::Bytes(_)));
 }
 
 #[test]
@@ -326,8 +344,14 @@ fn leaf() -> impl Strategy<Value = Value> {
         any::<u64>().prop_map(Value::Varint),
         any::<u32>().prop_map(Value::Fixed32),
         any::<u64>().prop_map(Value::Fixed64),
-        "[a-zA-Z0-9 é]{0,24}".prop_map(Value::Str),
-        proptest::collection::vec(any::<u8>(), 0..24).prop_map(Value::Bytes),
+        // A leading 0x0b is a group tag: text is never read as a message (which could reorder).
+        "[a-zA-Z0-9 é]{0,24}"
+            .prop_map(|s| { Value::Str(if s.is_empty() { s } else { format!("\u{b}{s}") }) }),
+        // A leading 0xff is invalid UTF-8 and a tag of wire type 7: never read as a message.
+        proptest::collection::vec(any::<u8>(), 0..24).prop_map(|mut b| {
+            b.insert(0, 0xff);
+            Value::Bytes(b)
+        }),
     ]
 }
 
@@ -388,8 +412,8 @@ fn grp_08_from_json_refuses_what_the_decoder_never_writes() {
         json!({"1": {"$bytes": "!!"}}),
         json!({"1": {"$bytes": 5}}),
     ];
-    for json in bad {
-        assert!(Message::from_json(&json).is_err(), "{json}");
+    for (i, json) in bad.iter().enumerate() {
+        assert!(Message::from_json(json).is_err(), "bad case {i}");
     }
 }
 

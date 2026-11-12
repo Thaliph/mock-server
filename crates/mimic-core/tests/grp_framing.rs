@@ -59,7 +59,10 @@ fn grp_01_frames_are_read_as_sent() {
     assert_eq!(parser.finish(), Ok(()));
     assert_eq!(parser.buffered(), 0);
     // One frame alone, and an empty stream.
-    assert_eq!(Parser::new().push(&bytes[..8]).frames, [frame(false, b"abc")]);
+    assert_eq!(
+        Parser::new().push(&bytes[..8]).frames,
+        [frame(false, b"abc")]
+    );
     assert_eq!(Parser::new().finish(), Ok(()));
 }
 
@@ -164,7 +167,11 @@ fn grp_03_identity_absent_and_gzip_are_decoded() {
     assert_eq!(Encoding::from_header(Some("gzip")), Encoding::Gzip);
     assert_eq!(Encoding::from_header(Some("GZip")), Encoding::Gzip);
     for other in ["br", "deflate", "zstd", "snappy", "x-unknown", ""] {
-        assert_eq!(Encoding::from_header(Some(other)), Encoding::Other, "{other}");
+        assert_eq!(
+            Encoding::from_header(Some(other)),
+            Encoding::Other,
+            "encoding {other:?}"
+        );
     }
     let plain = frame(false, b"hello");
     for encoding in [Encoding::Identity, Encoding::Gzip, Encoding::Other] {

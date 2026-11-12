@@ -49,3 +49,10 @@ path = "fuzz_targets/load.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "grpc"
+path = "fuzz_targets/grpc.rs"
+test = false
+doc = false
+bench = false
