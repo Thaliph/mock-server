@@ -1,5 +1,6 @@
 //! Connection to Valkey, the controller's only state (spec §7, FND-06).
 
+use redis::IntoConnectionInfo;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -38,7 +39,13 @@ pub fn client_from_env(env: &Env) -> Result<redis::Client, ConfigError> {
         None => url.to_string(),
     };
     // The parse error may echo the URL, which now holds the password: keep only its kind.
-    redis::Client::open(full).map_err(|e| ConfigError::invalid(VAR, url, format!("{:?}", e.kind())))
+    let invalid = |e: redis::RedisError| ConfigError::invalid(VAR, url, format!("{:?}", e.kind()));
+    // Commands are small request/response pairs: no Nagle (PRX-32; redis defaults to it on).
+    let info = full
+        .into_connection_info()
+        .map_err(invalid)?
+        .set_tcp_settings(redis::io::tcp::TcpSettings::default().set_nodelay(true));
+    redis::Client::open(info).map_err(invalid)
 }
 
 fn percent_encode(value: &str) -> String {

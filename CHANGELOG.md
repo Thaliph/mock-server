@@ -12,6 +12,10 @@ All notable changes to mimic are documented in this file. The format follows
 - The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).
 
+### Fixed
+
+- Every TCP socket of the sidecar (accepted, connected to the destination, pass-through) and of the controller's listeners and Valkey connections sets `TCP_NODELAY`: HTTP/2 through the sidecar no longer pays a ~40 ms Nagle and delayed-ACK stall per request (#480).
+
 ### Documentation
 
 - Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
