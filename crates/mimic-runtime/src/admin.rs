@@ -136,6 +136,10 @@ pub async fn serve_until(
     let mut drain_rx = stop_tx.subscribe();
     // Peer addresses are available to the handlers (`/discovery` is loopback only).
     let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    // Small writes must not wait for a delayed ACK (PRX-32).
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     let server = axum::serve(listener, service).with_graceful_shutdown(async move {
         let _ = stop_rx.wait_for(|stop| *stop).await;
     });

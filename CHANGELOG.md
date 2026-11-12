@@ -16,6 +16,10 @@ All notable changes to mimic are documented in this file. The format follows
   sidecar at 50, 100 and 200 rps (never above), records the latencies and the sidecar CPU and RSS in
   `docs/bench/`, and cleans up its namespace on exit. Baseline B0 of 2026-11-12 in `docs/bench/README.md` (#436).
 
+### Fixed
+
+- Every TCP socket of the sidecar (accepted, connected to the destination, pass-through) and of the controller's listeners and Valkey connections sets `TCP_NODELAY`: HTTP/2 through the sidecar no longer pays a ~40 ms Nagle and delayed-ACK stall per request (#480).
+
 ### Documentation
 
 - Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
