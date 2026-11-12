@@ -148,9 +148,14 @@ fn build(
             "/ui/workloads/{namespace}/{deployment}/resources/{kind}/{name}",
             get(assets::resource_page),
         )
+        .route(
+            "/ui/workloads/{namespace}/{deployment}/loadtests/{uid}",
+            get(assets::run_page),
+        )
         .route("/ui/assets/{*path}", get(assets::asset))
         .route("/v1/workloads", get(list))
         .route("/v1/resources", get(overview))
+        .route("/v1/features", get(features))
         .route(
             "/v1/workloads/{namespace}/{deployment}/resources",
             get(held_resources),
@@ -344,6 +349,12 @@ async fn overview(State(Ui { resources, .. }): State<Ui>) -> Json {
         })
         .collect();
     Json(json!({ "workloads": workloads }))
+}
+
+/// What the install offers, for the tabs that hide themselves (spec §7.5): a constant of the
+/// process, no Valkey.
+async fn features(State(Ui { resources, .. }): State<Ui>) -> Json {
+    Json(json!({ "loadTest": { "enabled": resources.load_enabled() } }))
 }
 
 async fn held_resources(

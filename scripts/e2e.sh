@@ -1904,7 +1904,10 @@ ep_href=$(jq -r '[.links[] | select(.text == "inbound-8080")][0].href' "$WORK/br
 browse ep-document "$ep_href" --wait '/users/{users_id}' --expand
 jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-ep-document.json" >/dev/null \
   || fail "exp_11: the row link does not open the Swagger UI page of its document: $(jq -c .methods "$WORK/browse-ep-document.json")"
-browse tab-loadtests /ui/loadtests --wait 'not available here yet'
+# exp_16: this cluster runs without loadTest.enabled, so the Load tests tab explains that and shows no table.
+browse tab-loadtests /ui/loadtests --wait 'Load testing is disabled'
+jq -e '(.rows | length) == 0' "$WORK/browse-tab-loadtests.json" >/dev/null \
+  || fail "exp_16: the Load tests tab shows a table while load tests are disabled: $(jq -c .rows "$WORK/browse-tab-loadtests.json")"
 browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand --interceptor
 jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-document.json" >/dev/null \
   || fail "ui_12: the document page lists the operations $(jq -c .methods "$WORK/browse-document.json"), not GET and PUT"

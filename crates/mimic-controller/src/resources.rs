@@ -3,6 +3,7 @@
 //! `last-applied` annotation or a Secret key), indexed by the deployment they configure.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use futures::StreamExt;
@@ -141,11 +142,22 @@ pub struct Overview {
 #[derive(Default)]
 pub struct ResourceCache {
     items: RwLock<BTreeMap<(String, String, String), Resource>>,
+    load_enabled: AtomicBool,
 }
 
 impl ResourceCache {
     pub fn new() -> Arc<ResourceCache> {
         Arc::new(ResourceCache::default())
+    }
+
+    /// Whether load tests are enabled in this install (`MIMIC_LOAD_MAX_RUNS` above 0); the
+    /// Load tests tab reads it from `/v1/features`.
+    pub fn set_load_enabled(&self, enabled: bool) {
+        self.load_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn load_enabled(&self) -> bool {
+        self.load_enabled.load(Ordering::Relaxed)
     }
 
     pub fn apply(&self, resource: Resource) {
