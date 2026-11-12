@@ -14,6 +14,8 @@ use crate::discovery::histogram::Histogram;
 use crate::discovery::redact::Redactor;
 use crate::discovery::sample::{Payload, Sample};
 use crate::discovery::template::split_path;
+use crate::grpc::frame::encode_frame;
+use crate::grpc::wire::Message;
 
 use super::signature::{Fields, Hashed, Signature, signature};
 use super::{Answer, Hit, Miss, Request, Response, Tier};
@@ -99,27 +101,89 @@ fn encode_form(pairs: &[(String, String)]) -> Vec<u8> {
     out
 }
 
-fn answer_of(sample: &Sample, grpc: bool) -> Answer {
-    let headers = sample
+/// Whether a recorded header or trailer is replayed in a gRPC answer: not `-bin` metadata (its
+/// value is a placeholder, not base64), not a framing name, not a pseudo-header.
+fn replayed(name: &str) -> bool {
+    !DROPPED.contains(&name) && !name.ends_with("-bin") && !name.starts_with(':')
+}
+
+/// The answer to a gRPC call (spec §8): status 200, the headers, the response message framed,
+/// and the trailers with `grpc-status` first.
+fn grpc_answer(sample: &Sample) -> Answer {
+    let mut headers: Vec<(Box<str>, Box<str>)> = sample
         .response_headers()
         .iter()
         .filter(|(name, _)| {
-            !DROPPED.contains(&name.as_str())
-                && !(grpc && matches!(name.as_str(), "grpc-status" | "grpc-message"))
+            replayed(name) && !matches!(name.as_str(), "grpc-status" | "grpc-message")
         })
         .map(|(name, value)| (name.as_str().into(), value.as_str().into()))
         .collect();
+    if !headers.iter().any(|(name, _)| &**name == "content-type") {
+        headers.insert(0, ("content-type".into(), "application/grpc".into()));
+    }
+    // The status and the message: the trailers, else the response headers of a trailers-only
+    // response.
+    let find = |name: &str| {
+        let from = |list: &[(String, String)]| {
+            list.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+        from(sample.trailers()).or_else(|| from(sample.response_headers()))
+    };
+    let status = find("grpc-status").unwrap_or_else(|| "0".to_string());
+    let mut trailers: Vec<(Box<str>, Box<str>)> =
+        vec![("grpc-status".into(), status.as_str().into())];
+    if let Some(message) = find("grpc-message") {
+        trailers.push(("grpc-message".into(), message.into()));
+    }
+    trailers.extend(
+        sample
+            .trailers()
+            .iter()
+            .filter(|(name, _)| {
+                replayed(name) && !matches!(name.as_str(), "grpc-status" | "grpc-message")
+            })
+            .map(|(name, value)| (name.as_str().into(), value.as_str().into())),
+    );
+    let message = sample.response_message().and_then(|(_, json)| {
+        let payload = Message::from_json(&json).ok()?.encode().ok()?;
+        encode_frame(false, &payload).ok()
+    });
+    let body: Box<[u8]> = match message {
+        Some(frame) => frame.into(),
+        // No recorded message: the empty one after a success, none after an error.
+        None if status == "0" => Box::new(EMPTY_MESSAGE),
+        None => Box::default(),
+    };
+    Answer {
+        status: 200,
+        headers,
+        body,
+        grpc: true,
+        trailers,
+    }
+}
+
+fn answer_of(sample: &Sample, grpc: bool) -> Answer {
+    if grpc {
+        return grpc_answer(sample);
+    }
+    let headers = sample
+        .response_headers()
+        .iter()
+        .filter(|(name, _)| !DROPPED.contains(&name.as_str()))
+        .map(|(name, value)| (name.as_str().into(), value.as_str().into()))
+        .collect();
     let body: Box<[u8]> = match sample.response_payload() {
-        _ if grpc => Box::new(EMPTY_MESSAGE),
         Some((_, Payload::Json(text))) => text.as_bytes().into(),
         Some((_, Payload::Form(pairs))) => encode_form(&pairs).into(),
         None => Box::default(),
     };
     Answer {
-        status: if grpc { 200 } else { sample.status() },
+        status: sample.status(),
         headers,
         body,
-        grpc,
+        grpc: false,
+        trailers: Vec::new(),
     }
 }
 
@@ -139,6 +203,11 @@ fn bare_answer(status: u16, grpc: bool) -> Answer {
             Box::default()
         },
         grpc,
+        trailers: if grpc {
+            vec![("grpc-status".into(), "0".into())]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -162,6 +231,9 @@ fn index_sample(
                 fields.form(m, pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             }
         }
+        media = Some(m.into());
+    } else if let Some((m, json)) = sample.request_message() {
+        fields.json(m, &json);
         media = Some(m.into());
     }
     let segments: Vec<String> = split_path(sample.path())
@@ -397,11 +469,11 @@ pub(super) fn respond(answer: &Arc<Answer>, tier: Tier, method: &str) -> Respons
         .collect();
     headers.push(("content-length".to_string(), length.to_string()));
     headers.push(("x-mimic-match".to_string(), tier.as_str().to_string()));
-    let trailers = if answer.grpc {
-        vec![("grpc-status".to_string(), "0".to_string())]
-    } else {
-        Vec::new()
-    };
+    let trailers = answer
+        .trailers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
     Response {
         status: answer.status,
         headers,

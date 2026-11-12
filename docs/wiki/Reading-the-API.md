@@ -159,8 +159,8 @@ Fields that hold more than one value are arrays; a field that is not a string or
 with one key that starts with `$` (`{"$bytes": "<base64>"}`, `{"$fixed32": n}`, `{"$fixed64": n}`). A
 message that is compressed with an encoding other than `gzip`, over 256 KiB, or not a protobuf message
 is left out (`mimic_discovery_bodies_total{result}` says which: `opaque`, `too_large`, `encoding`).
-Streams are recorded by their first message; a mock still answers a gRPC call with an empty message
-(replaying the messages is planned). The OpenAPI document of a gRPC operation shows the message as an
+Streams are recorded by their first message; a mock replays the response message of a unary call
+(see [Mock mode](Mock-mode)). The OpenAPI document of a gRPC operation shows the message as an
 `application/grpc` request and response with the field numbers as property names.
 
 A report that holds no gRPC message is the same as before, and the controller keeps serving sidecars of

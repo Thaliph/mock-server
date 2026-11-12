@@ -362,7 +362,7 @@ impl Sample {
 
     /// The media type and content of the parsed request body.
     pub fn request_payload(&self) -> Option<(&str, Payload<'_>)> {
-        // A gRPC message is not replayed before #463 (spec §6.4).
+        // A gRPC message is read through `request_message` (spec §6.4).
         let body = self.request.body.as_ref();
         body.filter(|b| !is_protobuf_media(&b.media))
             .map(Body::payload)
@@ -373,6 +373,20 @@ impl Sample {
         let body = self.response.body.as_ref();
         body.filter(|b| !is_protobuf_media(&b.media))
             .map(Body::payload)
+    }
+
+    /// The media type and canonical JSON of the first gRPC request message (spec §6.4).
+    pub fn request_message(&self) -> Option<(&str, Value)> {
+        let body = self.request.body.as_ref();
+        body.filter(|b| is_protobuf_media(&b.media))
+            .map(|b| (b.media.as_str(), b.value.value()))
+    }
+
+    /// As `request_message`, for the response.
+    pub fn response_message(&self) -> Option<(&str, Value)> {
+        let body = self.response.body.as_ref();
+        body.filter(|b| is_protobuf_media(&b.media))
+            .map(|b| (b.media.as_str(), b.value.value()))
     }
 
     /// The response trailers, redacted (HTTP/2, gRPC).
