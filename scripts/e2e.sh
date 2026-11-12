@@ -365,6 +365,61 @@ kubectl -n default delete mimicworkload t6 t7 --ignore-not-found >/dev/null
 denied "a change of spec.deployment" kubectl -n default patch mimicworkload t5 --type=merge -p '{"spec":{"deployment":"web"}}'
 kubectl -n default delete mimicworkload t5 --ignore-not-found >/dev/null
 
+# MSH-17 (#440): the MimicConfig CRD's schema and CEL rules, evaluated by the API server. Objects of this section only,
+# in the default namespace, all deleted at its end.
+log "msh_17: the MimicConfig CRD accepts a valid object and the API server refuses what the CEL rules and the schema forbid"
+mimicconfig() {
+  printf 'apiVersion: mimic.platform.io/v1alpha1\nkind: MimicConfig\nmetadata: {name: %s, namespace: default}\nspec:\n%s\n' "$1" "$2" \
+    | kubectl apply -f - >/dev/null
+}
+mc_accepted() { local desc=$1; shift; mimicconfig "$@" 2>/dev/null || fail "msh_17: $desc was rejected"; }
+mc_denied() { local desc=$1; shift; if mimicconfig "$@" 2>/dev/null; then fail "msh_17: $desc was accepted"; fi; }
+mc_dep='  targetRefs: [{group: apps, kind: Deployment, name: cart}]'
+mc_svc='  targetRefs: [{group: "", kind: Service, name: cart}]'
+mc_refs() { # mc_refs <n>: a block of n Service targetRefs
+  local i; printf '  targetRefs:\n'; for ((i = 0; i < $1; i++)); do printf '    - {group: "", kind: Service, name: s%d}\n' "$i"; done
+}
+mc_dests() { # mc_dests <n>: a block of n destinations
+  local i; printf '  destinations:\n'; for ((i = 0; i < $1; i++)); do printf '    - {namespace: risk, name: s%d}\n' "$i"; done
+}
+mc_accepted "a valid MimicConfig with both target kinds" msh1 '  targetRefs:
+    - {group: apps, kind: Deployment, name: cart}
+    - {group: "", kind: Service, name: cart}
+  destinations: [{namespace: risk, name: scoring}]
+  mesh: {enabled: false}
+  loadBalancer: {slowStart: 30s}'
+[[ $(kubectl -n default get mimicconfig msh1 -o jsonpath='{.spec.mesh.enabled}') == false ]] || fail "msh_17: spec.mesh.enabled was not kept"
+mc_accepted "a MimicConfig with mesh set and no enabled" msh2 "$mc_dep
+  mesh: {}"
+[[ $(kubectl -n default get mimicconfig msh2 -o jsonpath='{.spec.mesh.enabled}') == true ]] || fail "msh_17: spec.mesh.enabled does not default to true"
+mc_accepted "a MimicConfig with 16 targetRefs" msh3 "$(mc_refs 16)"
+mc_accepted "a MimicConfig with 256 destinations" msh4 "$mc_dep
+$(mc_dests 256)"
+mc_denied "a MimicConfig without targetRefs" msh-d1 '  mesh: {enabled: true}'
+mc_denied "a MimicConfig with 0 targetRefs" msh-d2 '  targetRefs: []'
+mc_denied "a MimicConfig with 17 targetRefs" msh-d3 "$(mc_refs 17)"
+mc_denied "a targetRef with a namespace" msh-d4 '  targetRefs: [{group: apps, kind: Deployment, name: cart, namespace: other}]'
+mc_denied "a targetRef with a namespace on a Service" msh-d5 '  targetRefs: [{group: "", kind: Service, name: cart, namespace: other}]'
+mc_denied "a targetRef of kind StatefulSet" msh-d6 '  targetRefs: [{group: apps, kind: StatefulSet, name: cart}]'
+mc_denied "a Service targetRef in group apps" msh-d7 '  targetRefs: [{group: apps, kind: Service, name: cart}]'
+mc_denied "a Deployment targetRef in the core group" msh-d8 '  targetRefs: [{group: "", kind: Deployment, name: cart}]'
+mc_denied "a targetRef without a name" msh-d9 '  targetRefs: [{group: apps, kind: Deployment}]'
+mc_denied "257 destinations" msh-d10 "$mc_dep
+$(mc_dests 257)"
+mc_denied "destinations with only a Service target" msh-d11 "$mc_svc
+  destinations: [{namespace: risk, name: scoring}]"
+mc_denied "mesh with only a Service target" msh-d12 "$mc_svc
+  mesh: {enabled: false}"
+mc_denied "loadBalancer with only a Deployment target" msh-d13 "$mc_dep
+  loadBalancer: {slowStart: 30s}"
+mc_denied "a slowStart that is not <n>s" msh-d14 "$mc_svc
+  loadBalancer: {slowStart: 5m}"
+mc_denied "a destination without a name" msh-d15 "$mc_dep
+  destinations: [{namespace: risk}]"
+mc_denied "a mesh.enabled that is not a boolean" msh-d16 "$mc_dep
+  mesh: {enabled: maybe}"
+kubectl -n default delete mimicconfig msh1 msh2 msh3 msh4 --ignore-not-found >/dev/null
+
 # The webhook configuration: three webhooks, one per path, fail closed, pods only, system namespaces excluded.
 hooks=$(kubectl get mutatingwebhookconfiguration $cfg -o jsonpath='{range .webhooks[*]}{.failurePolicy} {.sideEffects} {.reinvocationPolicy} {.timeoutSeconds} {.rules[0].operations[*]} {.rules[0].resources[*]} {.clientConfig.service.path} {.clientConfig.service.port}{"\n"}{end}')
 want_hooks=$(printf '%s\n' "Fail None IfNeeded 5 CREATE pods /inject/namespace 8443" \
