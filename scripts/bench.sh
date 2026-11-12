@@ -332,8 +332,10 @@ kubectl -n "$NS" rollout status deploy/fortio-server --timeout=180s
 kubectl -n "$NS" rollout status deploy/fortio-client --timeout=180s
 
 # pod_of <app>: the pod of a workload.
+# pod_of <app>: the running pod of the app; a pod still terminating after a rollout restart is skipped.
 pod_of() {
-  kubectl -n "$NS" get pods -l "app=$1" -o jsonpath='{.items[0].metadata.name}'
+  kubectl -n "$NS" get pods -l "app=$1" -o json \
+    | jq -er '[.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")][0].metadata.name'
 }
 
 # prepare_setup <setup>: plain runs without the sidecar, none and discovery with it (namespace label, a
