@@ -24,9 +24,11 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
 
+use crate::resources::ResourceCache;
 use crate::store::{Half, ReadError, Store, Summary, keys};
 
 mod assets;
+mod yaml;
 
 /// Renders at once per replica (spec §7.5).
 const MAX_RENDERS: usize = 2;
@@ -97,23 +99,36 @@ struct Ui {
     metrics: UiMetrics,
     renders: Arc<Semaphore>,
     hook: Option<Hook>,
+    resources: Arc<ResourceCache>,
 }
 
-pub fn router(store: Arc<Store>, metrics: UiMetrics) -> Router {
-    build(store, metrics, None)
+/// The router with the mimic resources of the cluster's watches (spec §7.5, explorer shell).
+pub fn router_with(store: Arc<Store>, metrics: UiMetrics, resources: Arc<ResourceCache>) -> Router {
+    build(store, metrics, None, resources)
+}
+
+#[cfg(test)]
+pub(crate) fn router(store: Arc<Store>, metrics: UiMetrics) -> Router {
+    build(store, metrics, None, ResourceCache::new())
 }
 
 #[cfg(test)]
 pub(crate) fn router_with_hook(store: Arc<Store>, metrics: UiMetrics, hook: Hook) -> Router {
-    build(store, metrics, Some(hook))
+    build(store, metrics, Some(hook), ResourceCache::new())
 }
 
-fn build(store: Arc<Store>, metrics: UiMetrics, hook: Option<Hook>) -> Router {
+fn build(
+    store: Arc<Store>,
+    metrics: UiMetrics,
+    hook: Option<Hook>,
+    resources: Arc<ResourceCache>,
+) -> Router {
     let ui = Ui {
         store,
         metrics,
         renders: Arc::new(Semaphore::new(MAX_RENDERS)),
         hook,
+        resources,
     };
     Router::new()
         .route("/", get(|| async { Redirect::permanent("/ui/") }))

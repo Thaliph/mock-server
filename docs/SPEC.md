@@ -1474,6 +1474,28 @@ logic in `mimic-core` (`discovery` module).
 
   `400` for a name or id outside its grammar (no page is served for it). A page of a
   deployment without data is served and shows "no data" from the `404` of its JSON route.
+- **Explorer shell and Workloads tab (F14).** Every page carries the same four tabs, in this
+  order: Map (`/ui/map`), Workloads (`/ui/`), Endpoints (`/ui/endpoints`), Load tests
+  (`/ui/loadtests`); Map, Endpoints and Load tests are placeholders until their own features.
+  The deployment page and the document page of F6 stay as they are. The Workloads tab lists every
+  deployment with its namespace, mode, pods, last push and the mimic resources that configure it
+  (`MimicWorkload`, `MimicLoadTest`, from #440 `MimicConfig`), each linking to
+  `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` (`<kind>` one of those three, `<name>` a
+  DNS-1123 subdomain, else `400`), the resource view: its spec as read-only YAML, its labels and
+  annotations, its status conditions. Data comes from two routes served from the controller's
+  watch caches (no call to the API server per request, no Valkey): `GET /v1/resources`
+  (`{"workloads": [{"namespace", "deployment", "mode", "resources": [{"kind", "name"}]}]}`, sorted)
+  and `GET /v1/workloads/<ns>/<dep>/resources` (`{"resources": [{"kind", "namespace", "name",
+  "metadata": {"creationTimestamp", "generation", "labels", "annotations"}, "spec", "yaml",
+  "conditions": [{"type", "status", "reason", "message", "lastTransitionTime"}], "phase"}]}`,
+  sorted by kind then name; `phase` only for a `MimicLoadTest`). A resource belongs to the
+  deployment named by its `spec.deployment`. Nothing is copied but `metadata` (those four
+  fields), `spec` and the status conditions: `managedFields`, `ownerReferences`, `finalizers`
+  and the `last-applied-configuration` annotation are dropped, and a `MimicLoadTest`'s
+  `credentials` is reduced to `secretName` and the `field` of each entry (never `key`). The YAML
+  is rendered by the controller, deterministically: keys in byte order, every string
+  double-quoted in JSON syntax. The browser writes it with `textContent`. The routes count in
+  `mimic_ui_requests_total` by route pattern like the others.
 - **Swagger UI configuration** (in `mimic.js`, nothing inline): `url` = the document route;
   `supportedSubmitMethods: []` (no "Try it out" button, so the UI never sends a request to a
   workload); `tryItOutEnabled: false`; `validatorUrl: null` (no call to
@@ -3343,6 +3365,7 @@ names contain the criterion ID (`fnd_02_…`).
 | F11 | Load test of a mocked deployment | (added 2026-10-31) |
 | F12 | First alpha release `v0.2.0-alpha.1`: versioned images and chart, changelog, release notes, wiki | (added 2026-11-07) |
 | F13 | Readable typed placeholders for redacted values (`mimic-token`), and testing with them (#424) | (added 2026-11-11) |
+| F14 | Explorer UI: tab shell and the Workloads tab linking the mimic custom resources (#465) | (added 2026-11-12) |
 
 ### 12.1 F0 — Foundations
 
@@ -3831,6 +3854,23 @@ Golden files are regenerated in the step that changes their bytes, and the diff 
 | PLH-09 | **I** (`mimic-load`, fake targets). A run without `credentials` against a plan whose samples carry `authorization: Bearer mimic-token` and `?api_key=mimic-api-key`: every request the fake target receives carries exactly those values; a run with `credentials` for `header/authorization` (Secret file `Bearer <canary>\n`) sends `Bearer <canary>` in that header and `mimic-api-key` in the query; neither run's logs nor `/metrics` hold the canary. |
 | PLH-10 | **E.** On kind (`scripts/e2e.sh`): the outbound samples of EGR-19 hold `Authorization: Bearer mimic-token` and `X-Tenant-Key: mimic-secret`; the inbound samples of DSC-22 and the documents of the e2e deployments hold no `<redacted>`; an access line of a request to `/reset/<JWT>` shows `/reset/mimic-jwt`. |
 | PLH-11 | **D** (review). `docs/wiki/Discovery-and-redaction.md` lists the 13 placeholders and the rules that give them, says that `<redacted>` is the legacy marker (data written up to F12, upgraded on read) and the authority host marker; `docs/wiki/Mock-mode.md` says that answers carry placeholders and that no Secret replaces them; `docs/wiki/Load-test.md` has a section *Testing with credentials* with the two ways: (1) a Secret with real test values through `credentials.fields`, with an example for `header/authorization`, (2) a test environment that accepts mimic's placeholders (for example a test identity provider or gateway rule that accepts `Bearer mimic-token`), and says that without either an authenticated endpoint answers `4xx`; `Quick-start.md`, `Reading-the-API.md`, `FAQ.md` and `Egress-aggregation.md` show placeholders where they showed `<redacted>`. `CHANGELOG.md` `[Unreleased]` names the change and the load test's new default under an upgrade note. |
+
+### 12.16 F14 — Explorer UI shell and the Workloads tab (#465)
+
+The UI of §7.5 gains four tabs and the Workloads tab (§7.5, *Explorer shell*); the design is
+`docs/design/mimic-mesh.md` §17.2. Levels as in §12.2. A *hostile* value is one holding markup,
+such as `<img src=x onerror=alert(1)>`.
+
+| ID | Criterion |
+|---|---|
+| EXP-01 | **U.** The read-only YAML rendering of §7.5 is a pure function of a JSON value: byte-identical across calls, keys in byte order, two-space indent, every string double-quoted in JSON syntax (so a hostile string, a multi-line string and a string that looks like a boolean, a number or `null` stay strings), a key quoted unless it is `[A-Za-z_][A-Za-z0-9_./-]*` and not a YAML boolean or null word, `{}` and `[]` for empty containers. |
+| EXP-02 | **U.** The sanitiser of §7.5 on a `MimicWorkload`, a `MimicLoadTest` and an object without `spec.deployment`: `managedFields`, `ownerReferences`, `finalizers` and the `kubectl.kubernetes.io/last-applied-configuration` annotation never appear; labels and the other annotations are kept; `status.conditions` keep the string fields `type`, `status`, `reason`, `message` and `lastTransitionTime`, sorted by `type`; a `MimicLoadTest` `credentials` keeps `secretName` and the `field` of each entry and drops `key`; an object without a string `spec.deployment` is not held. |
+| EXP-03 | **I.** `GET /v1/workloads/<ns>/<dep>/resources` answers `200` `{"resources": [...]}` sorted by kind then name, each with `kind`, `namespace`, `name`, `metadata`, `spec`, `yaml`, `conditions` and, for a `MimicLoadTest`, `phase`; only the resources whose `spec.deployment` is `<dep>` in `<ns>`; an empty list for a deployment without resource; `400` for a name that is not DNS-1123. It reads the cache only: it answers with Valkey stopped. `GET /v1/resources` answers `{"workloads": [{"namespace", "deployment", "mode", "resources": [{"kind", "name"}]}]}` sorted by namespace then deployment, for every deployment a held resource names, `mode` being `mock` when any of its `MimicWorkload`s says so and `discovery` otherwise. |
+| EXP-04 | **I.** Shell: `/ui/` (Workloads), `/ui/map`, `/ui/endpoints` and `/ui/loadtests` answer `200` `text/html; charset=utf-8`, each holding the four tab links `/ui/map`, `/ui/`, `/ui/endpoints` and `/ui/loadtests` in that order, with the UI-09 rules (no inline script, no `on*` or `style` attribute, assets from `/ui/assets/` only, no `http://` or `https://`); `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` is `200` for `MimicWorkload`, `MimicLoadTest` and `MimicConfig` with a DNS-1123 name, `400` for another kind or name; UI-07 (`HEAD`, `405`) and the `403` cases hold on every new route; UI-08 headers hold. |
+| EXP-05 | **I.** Escaping and secrets: a resource with hostile labels, annotations and condition `message` is answered as JSON strings, unchanged and escaped (the body parses and holds no unescaped `<`); a `MimicLoadTest` with `credentials` `{secretName: payment-load, fields: [{field: header/authorization, key: token}]}` shows `payment-load` and `header/authorization`, and the answer holds no `key` member and no Secret value; `mimic.js` has no `innerHTML` (UI-09) and builds the new links with `encodeURIComponent`. |
+| EXP-06 | **I.** Metrics: after a known sequence of requests to the new routes `mimic_ui_requests_total` holds the route patterns `/v1/resources`, `/v1/workloads/{namespace}/{deployment}/resources`, `/ui/map`, `/ui/endpoints`, `/ui/loadtests` and `/ui/workloads/{namespace}/{deployment}/resources/{kind}/{name}` with the codes answered, and no label holds a name from the request. |
+| EXP-07 | **E.** Browser (the Chromium of UI-12): `/ui/` shows the four tabs; the Workloads tab lists the e2e deployment `users` of `disc-22` with its mode and its `MimicWorkload`, whose link opens the resource view showing the spec as YAML; each tab path shows its heading; no CSP violation, no request outside the port-forward, no Try it out button. |
+| EXP-08 | **D** (review). `docs/wiki/Reading-the-API.md` documents the two new routes and the resource view, and `docs/wiki/Quick-start.md` the tabs. |
 
 ## 13. Test strategy
 

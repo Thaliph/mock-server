@@ -5,6 +5,7 @@ mod cert_manager;
 mod certs;
 mod loadtest;
 mod push_config;
+mod resources;
 mod sidecar_api;
 mod status;
 mod store;
@@ -231,7 +232,7 @@ async fn run(config: Config) -> std::io::Result<()> {
             reconciler.run().await;
         });
     }
-    let ui_router = ui::router(store.clone(), ui_metrics);
+    let ui_router = ui::router_with(store.clone(), ui_metrics, resources::ResourceCache::new());
     tokio::spawn(
         status::Reconciler {
             store: store.clone(),
