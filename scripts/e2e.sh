@@ -68,7 +68,7 @@ cleanup() {
   if [[ -n ${MSH_41_CLEANUP:-} ]]; then
     kubectl delete namespace msh-41 msh-41-out --ignore-not-found --wait=false >/dev/null 2>&1 || true
     # The controller may be scaled to 0 by the section: back to what the chart says.
-    kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="${controller_replicas:-1}" >/dev/null 2>&1 || true
+    kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="${controller_replicas:-2}" >/dev/null 2>&1 || true
   fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
