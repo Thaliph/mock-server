@@ -7,6 +7,12 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Features
+
+- Benchmarks of the sidecar: `scripts/bench.sh` runs fortio against an echo server with and without the
+  sidecar at 50, 100 and 200 rps (never above), records the latencies and the sidecar CPU and RSS in
+  `docs/bench/`, and cleans up its namespace on exit. Baseline B0 pending (#436).
+
 ## [0.2.0-alpha.3] - 2026-11-11
 
 ### Features
