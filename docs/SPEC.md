@@ -3987,6 +3987,29 @@ Levels as in §12.2, plus **M** (main session, recorded on the PR).
 | CHT-08 | **E** (kind, `scripts/e2e.sh` section `cht_08`). One install with the overlay, with the kind adaptations listed in the script header (locally built images by tag, no Prometheus Operator CRDs, no webhook source CIDR, a PriorityClass `mimic-critical` created by the script): the controller Deployment has 3 Ready replicas, the Valkey StatefulSet is Ready, and the live PodDisruptionBudget, topology spread constraints and priority class are those of CHT-05. |
 | CHT-09 | **D** (review). `docs/wiki/Install.md` has a section *Production install* that explains each value of the overlay and each placeholder; `docs/wiki/Configuration.md` lists `controller.priorityClassName`, `valkey.priorityClassName` and `controller.topologySpreadConstraints`, and the overlay's values that differ from the defaults. |
 
+### 12.19 Benchmarks (#436)
+
+A baseline of what the sidecar costs (design `docs/design/mimic-mesh.md` §14, §17.3), run by hand
+on a quiet machine with `scripts/bench.sh` and recorded in `docs/bench/`. It is not a CI job: shared
+runners are too noisy for latency numbers. Levels as in §12.2, plus **D**, the dry-run self-test
+`scripts/test_bench.sh` (it runs `scripts/bench.sh --dry-run` and reads its plan; no cluster, no
+Docker, no `kind`, `kubectl` or `helm` is started), and **M**, a run the main session performs by hand
+and records on #436. The lock of BEN-06 is the one a run of either script must respect; `scripts/e2e.sh`
+does not take it yet, so until it does, e2e and benchmark runs are kept apart by hand.
+
+| ID | Criterion |
+|---|---|
+| BEN-01 | **D.** `scripts/bench.sh --dry-run` exits 0 and prints the plan without running any command that changes state. No argument starts a run; any other argument, or a second one, exits 2 with one usage line and starts nothing. |
+| BEN-02 | **D.** Invalid configuration exits 2 before any cluster command, with one line naming the variable: a setup or protocol outside `plain discovery` and `http1 h2c`; a rate that is not an integer of at most 3 digits from 1 to 200 rps (the cap; the digit bound comes before any arithmetic, so no overflow wraps past it); an empty `RATES`; a `DURATION` that is not `<n>s` with 1 ≤ n ≤ 300; a `CONNECTIONS` that is not 1 to 64 written with at most 2 digits; a `PAUSE` that is not an integer from 0 to 600; a `CLUSTER` not matching `^[a-z0-9-]+$` or starting with `mimic-e2e` (the e2e clusters are never benchmarked or deleted); a `NODE_IMAGE` without a digest; an output file that already exists. |
+| BEN-03 | **D.** Rate cap: the plan lists one fortio run per setup, protocol and rate, each with `-qps` equal to its configured rate and never above 200; 200 itself is accepted. Runs are sequential (one fortio process at a time) and the plan puts a pause of `PAUSE` seconds after every run but the last. |
+| BEN-04 | **D.** Defaults: `CLUSTER` is `mimic-bench`, the namespace is `mimic-bench`, `DURATION` is 30 s, `PAUSE` is 10 s, and the default matrix is 12 runs: setups `plain` and `discovery`, protocols `http1` and `h2c`, rates 50, 100 and 200 rps. |
+| BEN-05 | **D.** Images are pinned by digest: the fortio image of the plan is the reference that `scripts/pinned-image.sh fortio` prints (a digest-pinned stage of `images/Dockerfile`, checked by `scripts/check-pins.sh`); the kind node image defaults to the `kind-node` stage. The plan pulls nothing. |
+| BEN-06 | **D.** Lock: when the lock of `scripts/e2e.sh` (`$MIMIC_LOCK_DIR/mimic-e2e.lock`) or of the benchmark (`$MIMIC_LOCK_DIR/mimic-bench.lock`) is held by a live process, the script exits 3 before any cluster command and names the lock. A lock whose process is gone is stale: the plan says it would be reclaimed, and the run takes it. |
+| BEN-07 | **D.** Outputs: each setup writes `docs/bench/<date>-<setup>.json` once all its runs have finished, holding the machine description, the runs and the sidecar CPU and RSS, and one table row per run is appended to the results table of `docs/bench/README.md`. The dry run writes neither file. |
+| BEN-08 | **D.** Cleanup: the plan ends with the deletion of the namespace `mimic-bench` as an EXIT trap, so that it also runs after a failed run; the cluster is kept unless `KEEP_CLUSTER=0`. |
+| BEN-09 | **D.** Machine description: the plan lists the fields it records (CPU model, cores, RAM, kernel, Docker, kind, Kubernetes, node image) and no host identity (hostname, user, address). |
+| BEN-10 | **M** (main session, recorded on #436). The B0 results are committed in `docs/bench/` with the machine description filled in. If 200 rps is not clean on that machine (errors, or a measured rate below the configured one), `docs/bench/README.md` says so and the budgets of the mesh milestones are taken at 100 rps. |
+
 ## 13. Test strategy
 
 - **Unit** tests in `mimic-core` (pure logic) and next to the code.
