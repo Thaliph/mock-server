@@ -40,6 +40,7 @@ const TLS_PORT: u16 = 443;
 /// ~40 ms to each exchange, PRX-32) and TCP keepalive (idle 300 s, interval 30 s, 4 probes) so
 /// that a vanished peer is noticed without any idle timeout on live connections.
 pub fn configure_socket(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)?;
     let keepalive = TcpKeepalive::new()
         .with_time(KEEPALIVE_IDLE)
         .with_interval(KEEPALIVE_INTERVAL)
