@@ -12,8 +12,15 @@ All notable changes to mimic are documented in this file. The format follows
 - The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).
 
+- The Endpoints tab lists the inbound and outbound endpoints of a picked deployment (`/ui/endpoints?deployment=<ns>/<dep>`), filtered in the browser by method, template, authority and status class, each row linking to the Swagger UI page of its document (#466).
+
+### Fixes
+
+- The read-only YAML of the resource view escapes U+0085, U+2028 and U+2029 in strings and keys (YAML 1.1 line breaks); the UI router serves the resource view only under `/ui/workloads/<ns>/<dep>/resources/` and the document page only under `/openapi/` (#474).
+
 ### Documentation
 
+- Wiki "Reading the API": the Endpoints tab and its filters; annotation values of the resource view are shown as set by their authors (#466, #474).
 - Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
 
 ## [0.2.0-alpha.3] - 2026-11-11

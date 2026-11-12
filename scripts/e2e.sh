@@ -1862,7 +1862,30 @@ browse resource /ui/workloads/disc-22/users/resources/MimicWorkload/users-a --wa
 jq -e '.text | contains("Spec") and contains("deployment: \"users\"")' "$WORK/browse-resource.json" >/dev/null \
   || fail "exp_07: the resource view does not show the spec of users-a as YAML"
 browse tab-map /ui/map --wait 'not available yet'
-browse tab-endpoints /ui/endpoints --wait 'Pick a deployment'
+browse tab-endpoints /ui/endpoints --wait 'Pick a deployment' --wait disc-22/users --wait egr-19/front
+# exp_11: the Endpoints tab lists the endpoints of a deployment, and its filters narrow the table in the browser.
+browse ep-users '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --wait inbound
+jq -e '[.rows[] | select(.[0] == "inbound" and .[1] == "8080" and .[4] == "/users/{users_id}") | .[3]] | sort == ["GET", "PUT"]' \
+  "$WORK/browse-ep-users.json" >/dev/null \
+  || fail "exp_11: the Endpoints tab does not list GET and PUT /users/{users_id} on port 8080: $(jq -c .rows "$WORK/browse-ep-users.json")"
+jq -e '[.links[] | select(.text == "inbound-8080" and .href == "/ui/workloads/disc-22/users/openapi/inbound-8080")] | length >= 2' \
+  "$WORK/browse-ep-users.json" >/dev/null \
+  || fail "exp_11: the endpoint rows do not link to the inbound-8080 document: $(jq -c .links "$WORK/browse-ep-users.json")"
+browse ep-put '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-method=PUT
+jq -e '[.rows[] | select(.[0] == "inbound") | .[3]] == ["PUT"]' "$WORK/browse-ep-put.json" >/dev/null \
+  || fail "exp_11: the method filter PUT does not leave only the PUT row: $(jq -c .rows "$WORK/browse-ep-put.json")"
+browse ep-none '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-template=no-such-template
+jq -e '[.rows[] | select(.[0] == "inbound")] | length == 0' "$WORK/browse-ep-none.json" >/dev/null \
+  || fail "exp_11: a template filter that matches nothing leaves rows: $(jq -c .rows "$WORK/browse-ep-none.json")"
+jq -e '.text | contains("No endpoint matches")' "$WORK/browse-ep-none.json" >/dev/null \
+  || fail "exp_11: a template filter that matches nothing does not say so"
+browse ep-class '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-status=5xx
+jq -e '(.text | contains("No endpoint matches")) and ([.rows[] | select(.[0] == "inbound")] | length == 0)' "$WORK/browse-ep-class.json" >/dev/null \
+  || fail "exp_11: a status class that matches nothing shows rows or does not say so: $(jq -c .rows "$WORK/browse-ep-class.json")"
+ep_href=$(jq -r '[.links[] | select(.text == "inbound-8080")][0].href' "$WORK/browse-ep-users.json")
+browse ep-document "$ep_href" --wait '/users/{users_id}' --expand
+jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-ep-document.json" >/dev/null \
+  || fail "exp_11: the row link does not open the Swagger UI page of its document: $(jq -c .methods "$WORK/browse-ep-document.json")"
 browse tab-loadtests /ui/loadtests --wait 'not available here yet'
 browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand --interceptor
 jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-document.json" >/dev/null \
@@ -2296,6 +2319,15 @@ jq -e '[.links[] | select(.text | startswith("outbound-users.disc-22.svc"))] | l
   || fail "shr_20: the deployment page does not list the outbound document"
 # Following the link: the document page of the document that the link names.
 egr_href=$(jq -r --arg a "$egr_authority" '[.links[] | select(.text == $a)][0].href' "$WORK/browse-front.json")
+# exp_11: the Endpoints tab lists front's outbound endpoints with their authority, linking to the outbound document.
+browse ep-front '/ui/endpoints?deployment=egr-19/front' --wait "$egr_authority" --wait '/missing'
+jq -e --arg a "$egr_authority" '[.rows[] | select(.[0] == "outbound" and .[2] == $a) | .[3] + " " + .[4]] | sort == ["GET /missing", "GET /users/{users_id}", "PUT /users/{users_id}"]' \
+  "$WORK/browse-ep-front.json" >/dev/null \
+  || fail "exp_11: the Endpoints tab does not list front's outbound endpoints: $(jq -c .rows "$WORK/browse-ep-front.json")"
+browse ep-front-authority '/ui/endpoints?deployment=egr-19/front' --wait '/missing' --set filter-authority=users.disc-22
+jq -e --arg a "$egr_authority" '[.rows[] | select(.[0] == "inbound")] | length == 0 and ([.rows[] | select(.[0] == "outbound" and .[2] == $a)] | length == 3)' \
+  "$WORK/browse-ep-front-authority.json" >/dev/null \
+  || fail "exp_11: the authority filter does not keep exactly the outbound rows: $(jq -c .rows "$WORK/browse-ep-front-authority.json")"
 browse outbound "$egr_href" --wait '/users/{users_id}' --expand
 jq -e '(.methods | map(ascii_upcase) | unique) == ["GET", "PUT"]' "$WORK/browse-outbound.json" >/dev/null \
   || fail "shr_20: the outbound document page lists the operations $(jq -c .methods "$WORK/browse-outbound.json")"

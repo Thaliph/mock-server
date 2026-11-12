@@ -29,9 +29,13 @@ fn scalar(value: &Value) -> String {
     }
 }
 
-/// JSON syntax is valid YAML: escapes keep a newline or a quote inside its string.
+/// JSON syntax is valid YAML: escapes keep a newline or a quote inside its string. YAML 1.1 also
+/// reads U+0085, U+2028 and U+2029 as line breaks, which JSON leaves raw: they are escaped too.
 fn quoted(text: &str) -> String {
-    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
+    let json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    json.replace('\u{85}', "\\u0085")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn key(name: &str) -> String {
