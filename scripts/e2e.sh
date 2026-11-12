@@ -3888,9 +3888,15 @@ kubectl -n "$NS" wait --for=delete pod -l app.kubernetes.io/name=mimic-controlle
 msh_41_two_services || fail "msh_41: the view was lost with the controller away"
 kubectl -n msh-41 exec deploy/web -c app -- python3 -c '
 import os, signal
+# Only a process whose program (argv[0]) is the sidecar binary; never this script, whose own command line
+# holds the name too.
+me = os.getpid()
 for pid in filter(str.isdigit, os.listdir("/proc")):
+    if int(pid) == me:
+        continue
     try:
-        if b"mimic-sidecar" in open(f"/proc/{pid}/cmdline", "rb").read():
+        argv0 = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")[0]
+        if os.path.basename(argv0) == b"mimic-sidecar":
             os.kill(int(pid), signal.SIGKILL)
     except OSError:
         pass
