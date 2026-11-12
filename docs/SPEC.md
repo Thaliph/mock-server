@@ -289,6 +289,7 @@ would see without mimic, except for the limits listed at the end of this section
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
   | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown`, (F10) `mock_closed` (§8) |
   | `mock`, `mock_miss` | (F10) outbound in mock only: `exact` \| `endpoint` \| `fallback` \| `miss`, and the miss reason (§8) | — |
+  | `load_run` | (F11) the uid of the load test run that sent a request carrying the load marker (§7.8); absent otherwise | — |
   | `duration_ms`, `head_ms` | until the response end; until the final (non-`1xx`) response head; both absent for `unframed` and `rejected` | `duration_ms` |
   | `bytes_in`, `bytes_out` | request / response body bytes | client → destination / destination → client |
 
@@ -1414,7 +1415,8 @@ logic in `mimic-core` (`discovery` module).
   `403` whatever the bind address, and so does a request whose `Host` is missing or is not
   `localhost`, `127.0.0.1` or `[::1]` (with or without a port), so that a web page cannot
   reach an open port-forward through DNS rebinding; an empty port (`127.0.0.1:`) is not a port
-  and gets `403` as well. `GET` and, from F6, `HEAD` (RFC 9110: the same status and headers as
+  and gets `403` as well. The chart declares the port on the controller container as `mimic-ui`
+  8080/TCP, for information only (UI-14). `GET` and, from F6, `HEAD` (RFC 9110: the same status and headers as
   `GET`, no body); every other method gets `405` with `Allow: GET, HEAD`. In F5 `HEAD` got `405`
   (`Allow: GET`); F6 serves it because browsers and link checkers expect it wherever `GET` is
   served (#293 note 28). JSON, sorted keys:
@@ -3559,6 +3561,7 @@ name but `localhost`. A *canary* is as in §12.5.
 | UI-11 | **E.** On kind with the CTL-20 apps and traffic (a canary bearer token, a canary in a `PUT` body), through `kubectl port-forward` to a controller pod: `/v1/workloads/<ns>/users/openapi` lists `inbound-<users port>`; that document has `/users/{users_id}` with `get` and `put`, a `200` response with an example taken from a sample, the `http_bearer` scheme required by `get`, and `servers` naming the `users` Service host seen by the sidecar; `/endpoints` lists both endpoints with their counts. No canary is in any document, endpoint list or page. `HEAD /ui/` answers `200`. |
 | UI-12 | **E.** Browser: the headless Chromium loads `/ui/`, the `users` deployment page and its document page through the port-forward and dumps each DOM: they list the deployment, its two endpoints and the operations `GET /users/{users_id}` and `PUT /users/{users_id}`; there is no "Try it out" or "Execute" button; Chromium's log shows no Content Security Policy violation and no request to an origin other than the port-forward. A body recorded with the key and value `<img src=/ui-xss onerror=alert(1)>` shows as text, with no `img` element of that `src` in the DOM; a body recorded as `{"$ref": "http://localhost:<canary port>/ref"}` makes no request reach a server listening on that port. The `users` pods log no access line during the browser run (the UI sends no traffic to workloads). |
 | UI-13 | **C.** Supply chain: `scripts/vendor-swagger-ui.py --check` passes on the committed tree, fails when one vendored byte is changed and when the tarball does not match the lockfile's `sha512` (offline test with a fixture tarball); it runs in the supply-chain stage and `ci-ok` requires it. `scripts/check-cooldown.py` refuses a `swagger-ui-dist` version that a pull request adds or bumps in `crates/mimic-controller/ui/package-lock.json` when it was published less than 14 days before (`--now`), accepts it when the allowlist names it, and fails closed when the npm registry cannot be read. `.github/dependabot.yml` has an `npm` entry for `crates/mimic-controller/ui` with a 14-day cooldown; `zizmor` passes. |
+| UI-14 | **E** (`helm template`, `scripts/check-chart.sh`). The rendered controller Deployment declares on its `controller` container a port named `mimic-ui` with `containerPort` 8080 and protocol `TCP`, for information only: no Service port and no NetworkPolicy port of the chart names it, and the read API stays on loopback (`MIMIC_UI_ADDR`, §7.5), so the UI still answers `403` to a non-loopback peer (CTL-13, `ctl_13_a_peer_that_is_not_loopback_gets_403`). The e2e check of §12.7 (`ui_14` in `scripts/e2e.sh`) reaches the UI through `kubectl port-forward deploy/<release>-controller`. Test: `ui_14` in `scripts/check-chart.sh`. |
 
 ### 12.8 F7 — Egress recording in the sidecar
 

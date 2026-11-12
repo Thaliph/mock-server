@@ -7,6 +7,14 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Features
+
+- The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
+
+### Documentation
+
+- Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
+
 ## [0.2.0-alpha.3] - 2026-11-11
 
 ### Features
