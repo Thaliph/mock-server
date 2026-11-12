@@ -133,6 +133,11 @@ fn check_name(name: &str) -> Result<(), NameError> {
     ok.then_some(()).ok_or(NameError)
 }
 
+/// True for a DNS-1123 subdomain, the grammar of every name the UI routes take.
+pub fn valid_name(name: &str) -> bool {
+    check_name(name).is_ok()
+}
+
 /// The keys of one deployment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keys {

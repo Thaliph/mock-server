@@ -5,8 +5,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use kube::api::DynamicObject;
-use serde_json::Value;
+use futures::StreamExt;
+use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
+use kube::runtime::WatchStreamExt;
+use kube::runtime::watcher::{self, Event};
+use serde_json::{Value, json};
 
 /// The kinds the explorer links, in display order.
 pub const KINDS: [&str; 3] = ["MimicWorkload", "MimicLoadTest", "MimicConfig"];
@@ -28,15 +31,100 @@ pub struct Resource {
     pub phase: Option<String>,
 }
 
+/// Set by `kubectl apply`: a copy of the whole object, which a user may have put anything in.
+const LAST_APPLIED: &str = "kubectl.kubernetes.io/last-applied-configuration";
+
+/// The `status.conditions` members the UI shows.
+const CONDITION_FIELDS: [&str; 5] = ["type", "status", "reason", "message", "lastTransitionTime"];
+
 impl Resource {
     /// `None` for an object without a name, a namespace or a string `spec.deployment`.
-    pub fn from_object(_kind: &str, _object: &DynamicObject) -> Option<Resource> {
-        todo!()
+    pub fn from_object(kind: &str, object: &DynamicObject) -> Option<Resource> {
+        let meta = &object.metadata;
+        let (name, namespace) = (meta.name.clone()?, meta.namespace.clone()?);
+        let mut spec = object.data.get("spec")?.clone();
+        let deployment = spec.get("deployment")?.as_str()?.to_string();
+        if kind == "MimicLoadTest" {
+            strip_credentials(&mut spec);
+        }
+        let annotations: BTreeMap<_, _> = meta
+            .annotations
+            .iter()
+            .flatten()
+            .filter(|(name, _)| name.as_str() != LAST_APPLIED)
+            .collect();
+        let metadata = json!({
+            "creationTimestamp": meta.creation_timestamp,
+            "generation": meta.generation,
+            "labels": meta.labels.clone().unwrap_or_default(),
+            "annotations": annotations,
+        });
+        let status = object.data.get("status");
+        let mut conditions: Vec<Value> = status
+            .and_then(|status| status.get("conditions")?.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .map(|condition| {
+                Value::Object(
+                    condition
+                        .iter()
+                        .filter(|(name, value)| {
+                            CONDITION_FIELDS.contains(&name.as_str()) && value.is_string()
+                        })
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        conditions.sort_by(|a, b| a["type"].as_str().cmp(&b["type"].as_str()));
+        let phase = (kind == "MimicLoadTest")
+            .then(|| status?.get("phase")?.as_str().map(str::to_string))
+            .flatten();
+        Some(Resource {
+            kind: kind.to_string(),
+            namespace,
+            name,
+            deployment,
+            metadata,
+            spec,
+            conditions,
+            phase,
+        })
     }
 
     /// The JSON of `GET /v1/workloads/<ns>/<dep>/resources`, YAML included.
     pub fn to_json(&self) -> Value {
-        todo!()
+        let mut value = json!({
+            "kind": self.kind,
+            "namespace": self.namespace,
+            "name": self.name,
+            "metadata": self.metadata,
+            "spec": self.spec,
+            "yaml": crate::ui::yaml::render(&self.spec),
+            "conditions": self.conditions,
+        });
+        if let (Some(phase), Some(map)) = (&self.phase, value.as_object_mut()) {
+            map.insert("phase".to_string(), Value::String(phase.clone()));
+        }
+        value
+    }
+}
+
+/// A Secret's key names say which entries a run reads: only the Secret's name and the fields
+/// they fill are shown.
+fn strip_credentials(spec: &mut Value) {
+    let Some(credentials) = spec.get_mut("credentials").and_then(Value::as_object_mut) else {
+        return;
+    };
+    credentials.retain(|name, _| matches!(name.as_str(), "secretName" | "fields"));
+    if let Some(fields) = credentials.get_mut("fields").and_then(Value::as_array_mut) {
+        for entry in fields {
+            *entry = match entry.get("field") {
+                Some(field) => json!({ "field": field }),
+                None => json!({}),
+            };
+        }
     }
 }
 
@@ -94,13 +182,74 @@ impl ResourceCache {
     }
 
     /// The resources of a deployment, by kind then name.
-    pub fn of(&self, _namespace: &str, _deployment: &str) -> Vec<Resource> {
-        todo!()
+    pub fn of(&self, namespace: &str, deployment: &str) -> Vec<Resource> {
+        self.read()
+            .values()
+            .filter(|r| r.namespace == namespace && r.deployment == deployment)
+            .cloned()
+            .collect()
     }
 
     /// Every deployment a held resource names, by namespace then deployment.
     pub fn overview(&self) -> Vec<Overview> {
-        todo!()
+        let mut found: BTreeMap<(String, String), Overview> = BTreeMap::new();
+        // `items` is sorted by kind, namespace, name: resources come in display order.
+        for resource in self.read().values() {
+            let entry = found
+                .entry((resource.namespace.clone(), resource.deployment.clone()))
+                .or_insert_with(|| Overview {
+                    namespace: resource.namespace.clone(),
+                    deployment: resource.deployment.clone(),
+                    mode: "discovery",
+                    resources: Vec::new(),
+                });
+            if resource.kind == "MimicWorkload"
+                && resource.spec.get("mode").and_then(Value::as_str) == Some("mock")
+            {
+                entry.mode = "mock";
+            }
+            entry
+                .resources
+                .push((resource.kind.clone(), resource.name.clone()));
+        }
+        found.into_values().collect()
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<(String, String, String), Resource>> {
+        self.items.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Keeps `cache` in line with the objects of `kind` in the cluster, for ever. The watch is the
+/// UI's only source: a request never calls the API server.
+pub async fn watch(client: kube::Client, cache: Arc<ResourceCache>, kind: &'static str) {
+    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "mimic.platform.io",
+        "v1alpha1",
+        kind,
+    ));
+    let api = Api::<DynamicObject>::all_with(client, &resource);
+    let mut events =
+        std::pin::pin!(watcher::watcher(api, watcher::Config::default()).default_backoff());
+    let mut listing = Vec::new();
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(Event::Init) => listing.clear(),
+            Ok(Event::InitApply(object)) => listing.extend(Resource::from_object(kind, &object)),
+            Ok(Event::InitDone) => cache.replace(kind, std::mem::take(&mut listing)),
+            Ok(Event::Apply(object)) => match Resource::from_object(kind, &object) {
+                Some(resource) => cache.apply(resource),
+                None => forget(&cache, kind, &object),
+            },
+            Ok(Event::Delete(object)) => forget(&cache, kind, &object),
+            Err(e) => tracing::warn!(error = %e, kind, "resource watch error"),
+        }
+    }
+}
+
+fn forget(cache: &ResourceCache, kind: &str, object: &DynamicObject) {
+    if let (Some(namespace), Some(name)) = (&object.metadata.namespace, &object.metadata.name) {
+        cache.remove(kind, namespace, name);
     }
 }
 

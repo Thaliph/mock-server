@@ -180,13 +180,15 @@ async fn run(config: Config) -> std::io::Result<()> {
         runs: Arc::new(sidecar_api::load::RunIndex::default()),
         slices: Arc::new(sidecar_api::load::SliceCache::default()),
     });
+    let load_enabled = load.is_some();
+    let resources = resources::ResourceCache::new();
     let slices = load.as_ref().map(|load| load.slices.clone());
     let load_parts = load
         .as_ref()
         .map(|load| (load.runs.clone(), load.slices.clone()));
     tokio::spawn({
         let (cache, cert, seed) = (cache.clone(), cert.clone(), seed.clone());
-        let kube_client = kube_client.clone();
+        let (kube_client, resources) = (kube_client.clone(), resources.clone());
         let tls_ca = config.tls_ca;
         let certificates = cert_manager::CertConfig {
             namespace: webhook.namespace.clone(),
@@ -198,6 +200,14 @@ async fn run(config: Config) -> std::io::Result<()> {
             let client = workloads::client().await;
             let _ = kube_client.set(client.clone());
             tokio::spawn(workloads::watch(client.clone(), cache));
+            tokio::spawn(resources::watch(
+                client.clone(),
+                resources.clone(),
+                "MimicWorkload",
+            ));
+            if load_enabled {
+                tokio::spawn(resources::watch(client.clone(), resources, "MimicLoadTest"));
+            }
             if let Some(slices) = slices {
                 tokio::spawn(sidecar_api::load::watch_slices(client.clone(), slices));
             }
@@ -232,7 +242,7 @@ async fn run(config: Config) -> std::io::Result<()> {
             reconciler.run().await;
         });
     }
-    let ui_router = ui::router_with(store.clone(), ui_metrics, resources::ResourceCache::new());
+    let ui_router = ui::router_with(store.clone(), ui_metrics, resources);
     tokio::spawn(
         status::Reconciler {
             store: store.clone(),

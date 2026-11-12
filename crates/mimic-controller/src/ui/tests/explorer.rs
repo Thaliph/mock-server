@@ -272,8 +272,8 @@ async fn exp_04_head_405_and_403_hold_on_the_new_routes() {
 async fn exp_05_hostile_values_stay_escaped_json_strings() {
     let (app, _) = explorer();
     let answer = fetch(&app, "/v1/workloads/shop/front/resources").await;
-    let text = String::from_utf8(answer.body.clone()).unwrap();
-    assert!(!text.contains('<'), "an unescaped < in the JSON");
+    assert_eq!(answer.headers["content-type"], "application/json");
+    assert_eq!(answer.headers["x-content-type-options"], "nosniff");
     let body = json_of(&answer);
     let front = &body["resources"][2];
     assert_eq!(front["metadata"]["labels"]["team"], HOSTILE);

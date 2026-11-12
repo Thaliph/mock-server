@@ -216,7 +216,9 @@ grep -o 'Bearer mimic-token' report.json | sort -u
 # Bearer mimic-token
 ```
 
-Or look at it in the browser, with the same port-forward: open <http://localhost:8080/ui/>, pick
+Or look at it in the browser, with the same port-forward: open <http://localhost:8080/ui/>. The
+Workloads tab lists `demo/front` and `demo/users` with their mode and a link to the `MimicWorkload` that
+configures each (its spec as YAML and its status); pick
 `demo/users`, then its document; `demo/front` lists its outbound calls with an Authority column. Swagger UI shows `GET` and `PUT /users/{users_id}` with the recorded
 examples and the `http_bearer` security scheme (never the token). The raw OpenAPI 3.1 file is
 `curl -s localhost:8080/v1/workloads/demo/users/openapi/inbound-8080`.

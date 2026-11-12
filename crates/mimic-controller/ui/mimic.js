@@ -88,20 +88,107 @@
     }).join(", ");
   }
 
+  function resourcePath(ns, dep, kind, name) {
+    return workloadPath(ns, dep) + "/resources/" + enc(kind) + "/" + enc(name);
+  }
+
+  // Marks the tab of the current page; the tabs themselves are static HTML.
+  function markTab(path) {
+    var tabs = document.querySelectorAll("#tabs a");
+    Array.prototype.forEach.call(tabs, function (tab) {
+      if (tab.getAttribute("href") === path) {
+        tab.setAttribute("aria-current", "page");
+      }
+    });
+  }
+
+  function placeholder(title, text) {
+    show([el("h1", title), el("p", text, { class: "placeholder" })]);
+  }
+
+  // The Workloads tab: every deployment with data in the store or named by a mimic resource.
   function listPage() {
-    api("/v1/workloads").then(function (data) {
-      var workloads = (data && data.workloads) || [];
-      if (workloads.length === 0) {
+    Promise.all([api("/v1/workloads"), api("/v1/resources")]).then(function (results) {
+      var rows = {};
+      function row(ns, dep) {
+        var id = ns + "/" + dep;
+        if (!rows[id]) {
+          rows[id] = { ns: ns, dep: dep, resources: [] };
+        }
+        return rows[id];
+      }
+      ((results[0] && results[0].workloads) || []).forEach(function (w) {
+        row(w.namespace, w.deployment).stored = w;
+      });
+      ((results[1] && results[1].workloads) || []).forEach(function (w) {
+        var r = row(w.namespace, w.deployment);
+        r.mode = w.mode;
+        r.resources = w.resources;
+      });
+      var ids = Object.keys(rows).sort();
+      if (ids.length === 0) {
         show([el("h1", "Workloads"), el("p", "No data")]);
         return;
       }
-      show([el("h1", "Workloads"), table(
-        ["Namespace", "Deployment", "Endpoints", "Exchanges", "Last push"],
-        workloads.map(function (w) {
-          return [w.namespace, link(w.deployment, workloadPath(w.namespace, w.deployment)),
-            w.endpoints, w.exchanges, w.last_push];
-        })
-      )]);
+      return Promise.all(ids.map(function (id) {
+        var r = rows[id];
+        return r.stored ? api(apiPath(r.ns, r.dep)) : Promise.resolve(null);
+      })).then(function (details) {
+        show([el("h1", "Workloads"), table(
+          ["Namespace", "Deployment", "Mode", "Pods", "Endpoints", "Exchanges", "Last push",
+            "Resources"],
+          ids.map(function (id, i) {
+            var r = rows[id];
+            var stored = r.stored || {};
+            var pods = details[i] ? Object.keys(details[i].pods || {}).length : "";
+            var links = add(el("ul", null, { class: "plain" }), r.resources.map(function (res) {
+              return add(el("li"), [link(res.kind + " " + res.name,
+                resourcePath(r.ns, r.dep, res.kind, res.name))]);
+            }));
+            return [r.ns, link(r.dep, workloadPath(r.ns, r.dep)), r.mode || "", pods,
+              stored.endpoints, stored.exchanges, stored.last_push, links];
+          })
+        )]);
+      });
+    }).catch(failed);
+  }
+
+  // The resource view: the spec as read-only YAML, labels, annotations and status conditions.
+  function resourcePage(ns, dep, kind, name) {
+    api(apiPath(ns, dep, "/resources")).then(function (data) {
+      var found = ((data && data.resources) || []).filter(function (r) {
+        return r.kind === kind && r.name === name;
+      })[0];
+      var title = el("h1", kind + " " + name);
+      var back = el("p", null);
+      add(back, [link("Back to " + ns + "/" + dep, workloadPath(ns, dep))]);
+      if (!found) {
+        show([title, back, el("p", "No such resource")]);
+        return;
+      }
+      var meta = found.metadata || {};
+      show([
+        title,
+        back,
+        table(["Namespace", "Created", "Generation"],
+          [[found.namespace, meta.creationTimestamp, meta.generation]]),
+        el("h2", "Labels"),
+        table(["Name", "Value"], Object.keys(meta.labels || {}).sort().map(function (k) {
+          return [k, meta.labels[k]];
+        })),
+        el("h2", "Annotations"),
+        table(["Name", "Value"], Object.keys(meta.annotations || {}).sort().map(function (k) {
+          return [k, meta.annotations[k]];
+        })),
+        el("h2", "Spec"),
+        el("pre", found.yaml),
+        el("h2", "Status"),
+        found.phase ? el("p", "Phase: " + found.phase) : el("p", null),
+        table(["Type", "Status", "Reason", "Message", "Last transition"],
+          (found.conditions || []).map(function (c) {
+            return [c.type, c.status, c.reason, c.message, c.lastTransitionTime];
+          }))
+      ]);
     }).catch(failed);
   }
 
@@ -216,11 +303,26 @@
       return p !== "";
     }).map(decodeURIComponent);
     if (parts.length === 1) {
+      markTab("/ui/");
       listPage();
+    } else if (parts.length === 2 && parts[1] === "map") {
+      markTab("/ui/map");
+      placeholder("Map", "The map of calls between deployments is not available yet.");
+    } else if (parts.length === 2 && parts[1] === "endpoints") {
+      markTab("/ui/endpoints");
+      placeholder("Endpoints", "Pick a deployment in the Workloads tab to see its endpoints.");
+    } else if (parts.length === 2 && parts[1] === "loadtests") {
+      markTab("/ui/loadtests");
+      placeholder("Load tests", "The runs of every deployment are not available here yet.");
     } else if (parts.length === 4) {
+      markTab("/ui/");
       workloadPage(parts[2], parts[3]);
     } else if (parts.length === 6) {
+      markTab("/ui/");
       openapiPage(parts[2], parts[3], parts[5]);
+    } else if (parts.length === 7) {
+      markTab("/ui/");
+      resourcePage(parts[2], parts[3], parts[5], parts[6]);
     }
   }
 

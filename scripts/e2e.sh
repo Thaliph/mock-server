@@ -1836,6 +1836,20 @@ browse list /ui/ --wait disc-22 --wait users
 browse deployment /ui/workloads/disc-22/users --wait '/users/{users_id}' --wait GET --wait PUT
 jq -e '.text | test("GET\\s+/users/\\{users_id\\}") and test("PUT\\s+/users/\\{users_id\\}")' "$WORK/browse-deployment.json" >/dev/null \
   || fail "ui_12: the deployment page lacks the GET and PUT /users/{users_id} rows"
+# EXP-07: the explorer tabs, the Workloads tab with the mimic resources of users, and the resource view.
+browse tabs /ui/ --wait disc-22 --wait users --wait users-a --wait users-b --wait Map --wait Endpoints --wait 'Load tests'
+jq -e '.links | map(.href) | contains(["/ui/map", "/ui/endpoints", "/ui/loadtests",
+  "/ui/workloads/disc-22/users/resources/MimicWorkload/users-a", "/ui/workloads/disc-22/users/resources/MimicWorkload/users-b"])' \
+  "$WORK/browse-tabs.json" >/dev/null \
+  || fail "exp_07: the Workloads tab lacks the tab links or the links to the MimicWorkloads of users: $(jq -c '[.links[].href]' "$WORK/browse-tabs.json")"
+jq -e '.rows | map(join(" ")) | any(test("disc-22 users discovery"))' "$WORK/browse-tabs.json" >/dev/null \
+  || fail "exp_07: the Workloads tab has no row for disc-22/users in discovery: $(jq -c .rows "$WORK/browse-tabs.json")"
+browse resource /ui/workloads/disc-22/users/resources/MimicWorkload/users-a --wait 'deployment: "users"' --wait x-tenant-key
+jq -e '.text | contains("Spec") and contains("deployment: \"users\"")' "$WORK/browse-resource.json" >/dev/null \
+  || fail "exp_07: the resource view does not show the spec of users-a as YAML"
+browse tab-map /ui/map --wait 'not available yet'
+browse tab-endpoints /ui/endpoints --wait 'Pick a deployment'
+browse tab-loadtests /ui/loadtests --wait 'not available yet'
 browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand --interceptor
 jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-document.json" >/dev/null \
   || fail "ui_12: the document page lists the operations $(jq -c .methods "$WORK/browse-document.json"), not GET and PUT"

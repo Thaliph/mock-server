@@ -6,7 +6,8 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use mimic_core::discovery::openapi;
 
-use crate::store::{ReadError, keys};
+use crate::resources::KINDS;
+use crate::store::{ReadError, keys, valid_name};
 
 /// The pinned `swagger-ui-dist` version (`ui/package.json`; a test checks they agree).
 const SWAGGER_VERSION: &str = "5.34.0";
@@ -53,7 +54,7 @@ fn served(content_type: &'static str, body: &'static [u8]) -> Response {
     ([(header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
-/// `/ui/` and the deployment page: static, so `Valkey` is not involved.
+/// `/ui/`, the other tabs and the deployment page: static, so `Valkey` is not involved.
 pub(super) async fn list_page() -> Response {
     served(HTML, PAGE)
 }
@@ -62,6 +63,19 @@ pub(super) async fn workload_page(
     Path((namespace, deployment)): Path<(String, String)>,
 ) -> Response {
     if keys(&namespace, &deployment).is_err() {
+        return ReadError::Name.into_response();
+    }
+    served(HTML, PAGE)
+}
+
+/// The resource view: the same page for every resource, filled from `/resources`.
+pub(super) async fn resource_page(
+    Path((namespace, deployment, kind, name)): Path<(String, String, String, String)>,
+) -> Response {
+    if keys(&namespace, &deployment).is_err()
+        || !KINDS.contains(&kind.as_str())
+        || !valid_name(&name)
+    {
         return ReadError::Name.into_response();
     }
     served(HTML, PAGE)
