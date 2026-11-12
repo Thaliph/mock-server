@@ -163,8 +163,11 @@ would see without mimic, except for the limits listed at the end of this section
 
 - **Detection.** The sidecar connects to the original destination first (as in F1), then waits
   until one side sends bytes. If the destination speaks first (server-first protocols: SMTP,
-  MySQL, SSH), or the client's first bytes are neither a TLS ClientHello, an HTTP/1.x request
-  line nor the HTTP/2 preface, the connection is an opaque tunnel. Detection has no timeout,
+  MySQL, SSH) and the client sends nothing within 50 ms of it, or the client's first bytes are neither a TLS ClientHello, an HTTP/1.x request
+  line nor the HTTP/2 preface, the connection is an opaque tunnel. A client byte that is ready
+  with the destination's, or that follows it within the 50 ms, is read first: an HTTP/2 server
+  (gRPC) writes its SETTINGS as soon as it accepts, before the client's preface, and its
+  connection is HTTP/2 (#463). Detection has no other timeout,
   reads at most 16 KiB, and the bytes it read are forwarded unchanged.
 - **Listeners**: the accept queue (`listen` backlog) is `/proc/sys/net/core/somaxconn` when
   readable and valid, else 1024.
@@ -4119,6 +4122,7 @@ Levels as in §12.2, plus **F**, a fuzz target run by CI. Criteria `GRP-xx`; the
 | GRP-34 | **I** (sidecar pull, fake controller). The pull asks `?format=2`; a fake controller of F13 or of 0.2.0-alpha.3 (`400` to every format but 1, `format=1` served) makes the same pull ask `?format=1` at once, with no wait between the two requests, and the snapshot is the set of format 1 (a gRPC call is answered with the empty message); the next pulls ask `format=1` and every 10th pulls `format=2` first; one INFO `egress format 2 refused, using format 1` is written; once the fake answers format 2 the sidecar holds the set of format 2 and replays the message; a `400` to `format=1` too is a failed pull (`mimic_egress_pulls_total{result="error"}`); a controller of this version answers `format=2` at the first request, with the `ETag` `"2-…"`. |
 | GRP-35 | **E.** On kind (`scripts/e2e.sh`, after GRP-28): `grpc-a`'s `MimicWorkload` set to `mock` and `grpc-b` scaled to 0, the client of `grpc-a` still gets `OK` and the recorded response message (placeholders as strings, field numbers) for its call, with no canary; `grpc-b` receives nothing. |
 | GRP-36 | **D** (review). Security review of #463: a replay holds placeholders only (the report never held a raw value; the mock re-encodes what it was given), no Secret overrides it, `-bin` trailers are not replayed, the message is bounded by §6.2, and a request message is redacted before it is compared and never logged; `docs/wiki/Mock-mode.md` has a gRPC section; `CHANGELOG.md` `[Unreleased]` names the replay, `format=2` as the default pull and the fallback to `format=1`. |
+| GRP-37 | **I** (sidecar, a real `h2c` gRPC server, which writes its SETTINGS at accept). Inbound, in discovery: the client's preface sent 10 ms after the connection is opened is detected as HTTP/2, the call is relayed and recorded (`mimic_discovery_exchanges_total{direction="inbound",result="recorded"}` 1, a version 3 report); a destination that writes a banner and a client that stays silent are still a tunnel after 50 ms (PRX-05). |
 
 ### 12.17 F15 — Explorer UI shell and the Workloads tab (#465)
 

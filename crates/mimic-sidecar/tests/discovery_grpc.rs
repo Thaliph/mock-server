@@ -239,3 +239,28 @@ async fn grp_25_other_encodings_media_and_sizes_are_counted_not_kept() {
     assert_eq!(sum(&text, &["part=\"request\"", "result=\"opaque\""]), 1);
     assert_eq!(sum(&text, &["part=\"request\"", "result=\"too_large\""]), 1);
 }
+
+#[tokio::test]
+async fn grp_37_a_server_that_speaks_first_with_h2_settings_is_still_h2_and_recorded() {
+    let _logs = capture_logs();
+    let app = server().await;
+    let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
+    let f = fixture_discovery(Direction::Inbound, &discovery, move |_| Some(app)).await;
+    // An HTTP/2 server writes its SETTINGS as soon as it accepts (RFC 9113 §3.4: both sides
+    // send a preface), and the client's preface comes a few milliseconds later.
+    let tcp = TcpStream::connect(f.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(tcp))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let (body, _) = call(&mut sender, "application/grpc", request_message()).await;
+    assert_eq!(body, response_message());
+    counted(
+        &f.metrics,
+        "mimic_discovery_exchanges_total{direction=\"inbound\",result=\"recorded\"} 1",
+    )
+    .await;
+    assert_eq!(discovery.report().version(), 3);
+}

@@ -918,6 +918,10 @@ async fn read_watch(upstream: Option<&mut Stream>, into: &mut [u8]) -> io::Resul
     }
 }
 
+/// How long a destination that wrote first waits for the client's first bytes before the
+/// connection is a server-first tunnel.
+const SERVER_FIRST_GRACE: Duration = Duration::from_millis(50);
+
 /// Reads until the protocol is known, within [`DETECT_LIMIT`] and with no timeout but the
 /// stall of an incomplete prefix. The bytes
 /// read are returned to be forwarded unchanged. A reset on either side is returned as such, to
@@ -937,11 +941,22 @@ async fn first_bytes(
             found => return First::Client(found, buf),
         }
     }
+    let mut graced = false;
     loop {
         let mut from_client = [0u8; READ_CHUNK];
         let mut from_upstream = [0u8; READ_CHUNK];
         let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
+        // The client first when both are ready: an HTTP/2 server writes its SETTINGS before
+        // the client's preface, and the client's bytes are the ones that name the protocol.
         tokio::select! {
+            biased;
+            () = &mut abort => {
+                return First::Opaque {
+                    to_upstream: buf,
+                    to_client: Vec::new(),
+                    early: Some(Early::Shutdown),
+                };
+            }
             () = stalled(!buf.is_empty(), stall) => {
                 let timeout = io::Error::new(io::ErrorKind::TimedOut, "stalled on a protocol prefix");
                 let early = Some(Early::Failed(Side::Client, timeout));
@@ -962,7 +977,17 @@ async fn first_bytes(
                     return First::Opaque { to_upstream: buf, to_client: Vec::new(), early };
                 }
             },
-            read = upstream.read(&mut from_upstream) => {
+            // The destination wrote first. It is a server-first protocol unless the client's
+            // first bytes follow within the grace (spec §4.1): an HTTP/2 server's SETTINGS
+            // do not make an opaque tunnel of a gRPC connection.
+            _ = upstream.readable() => {
+                if !graced {
+                    graced = true;
+                    if tokio::time::timeout(SERVER_FIRST_GRACE, client.readable()).await.is_ok() {
+                        continue;
+                    }
+                }
+                let read = upstream.read(&mut from_upstream).await;
                 let (n, early) = match read {
                     Ok(n) => (n, None),
                     Err(e) => (0, Some(Early::Failed(Side::Upstream, e))),
@@ -971,13 +996,6 @@ async fn first_bytes(
                     to_upstream: buf,
                     to_client: from_upstream[..n].to_vec(),
                     early,
-                };
-            }
-            () = &mut abort => {
-                return First::Opaque {
-                    to_upstream: buf,
-                    to_client: Vec::new(),
-                    early: Some(Early::Shutdown),
                 };
             }
         }
