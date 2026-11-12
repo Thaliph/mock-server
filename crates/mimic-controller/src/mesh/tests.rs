@@ -37,6 +37,7 @@ pub(crate) fn slice(ns: &str, service: &str, name: &str, ips: &[&str]) -> Endpoi
         namespace: ns.into(),
         name: name.into(),
         service: service.into(),
+        uid: "u".into(),
         generation: 1,
         ports: vec![SlicePort {
             name: Some("http".into()),
@@ -60,6 +61,7 @@ pub(crate) fn config(ns: &str, name: &str, deployment: &str, dests: &[(&str, &st
         namespace: ns.into(),
         name: name.into(),
         created: 100,
+        uid: "u".into(),
         generation: 1,
         targets: vec![Target {
             kind: TargetKind::Deployment,

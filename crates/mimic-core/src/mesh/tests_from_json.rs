@@ -127,3 +127,44 @@ fn msh_12_an_error_message_is_short_whatever_the_input() {
         assert!(e.len() <= 200, "{} bytes", e.len());
     }
 }
+
+#[test]
+fn msh_12_a_generations_key_without_a_uid_is_refused() {
+    let b = rich();
+    let key = r#""mimicconfig/shop/c@uid-c""#;
+    assert!(b.json.contains(key));
+    for bad in [
+        r#""mimicconfig/shop/c""#,
+        r#""mimicconfig/shop/c@""#,
+        r#""mimicconfig/c@uid-c""#,
+        r#""mimicconfig/shop//c@uid-c""#,
+    ] {
+        assert!(read(&b.json.replacen(key, bad, 1)).is_err(), "{bad}");
+    }
+    let slice = r#""endpointslice/shop/cart-1@uid-cart-1""#;
+    assert!(b.json.contains(slice));
+    assert!(read(&b.json.replacen(slice, r#""endpointslice/shop/cart-1""#, 1)).is_err());
+}
+
+#[test]
+fn msh_06_an_object_created_again_has_another_generations_key() {
+    let first = rich();
+    let mut s = snapshot();
+    s.services = vec![http_svc("shop", "cart", "10.96.12.7")];
+    let mut config = cfg("shop", "c", 1, &[(TargetKind::Deployment, "cart")]);
+    config.uid = "uid-c-recreated".into();
+    config.generation = 1;
+    s.configs = vec![config];
+    let again = build(&s, "shop", "cart", Mode::Mock, &Limits::default());
+    assert_eq!(first.view.generations["mimicconfig/shop/c@uid-c"], 1);
+    assert_eq!(
+        again.view.generations["mimicconfig/shop/c@uid-c-recreated"],
+        1
+    );
+    assert!(
+        !again
+            .view
+            .generations
+            .contains_key("mimicconfig/shop/c@uid-c")
+    );
+}

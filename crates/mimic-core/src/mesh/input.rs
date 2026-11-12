@@ -56,6 +56,8 @@ pub struct EndpointSlice {
     pub namespace: String,
     pub name: String,
     pub service: String,
+    /// `metadata.uid`: a recreated object has another one, so its generation restarts unseen.
+    pub uid: String,
     pub generation: i64,
     pub ports: Vec<SlicePort>,
     pub endpoints: Vec<Endpoint>,
@@ -88,6 +90,8 @@ pub struct Config {
     pub name: String,
     /// `metadata.creationTimestamp`, seconds since the epoch.
     pub created: i64,
+    /// `metadata.uid`, as for the slices.
+    pub uid: String,
     pub generation: i64,
     pub targets: Vec<Target>,
     pub destinations: Option<Vec<Destination>>,

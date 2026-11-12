@@ -115,6 +115,7 @@ pub fn slice(object: &KubeSlice) -> Option<(Key, EndpointSlice)> {
         namespace: key.0.clone(),
         name: key.1.clone(),
         service,
+        uid: object.metadata.uid.clone().unwrap_or_default(),
         generation: object.metadata.generation.unwrap_or(0),
         ports,
         endpoints,
@@ -170,6 +171,7 @@ pub fn config(object: &DynamicObject) -> Option<(Key, Config)> {
             .creation_timestamp
             .as_ref()
             .map_or(0, |t| t.0.as_second()),
+        uid: object.metadata.uid.clone().unwrap_or_default(),
         generation: object.metadata.generation.unwrap_or(0),
         targets,
         destinations,

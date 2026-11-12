@@ -138,7 +138,7 @@ fn two() -> String {
         ],
         "discovery",
         true,
-        &[("mimicconfig/shop/cart", 3)],
+        &[("mimicconfig/shop/cart@u1", 3)],
     )
 }
 
@@ -315,7 +315,7 @@ fn gens(a: i64) -> String {
         &[("shop/cart", "10.96.0.10", 80)],
         "discovery",
         true,
-        &[("mimicconfig/shop/cart", a)],
+        &[("mimicconfig/shop/cart@u1", a)],
     )
 }
 
@@ -328,7 +328,7 @@ async fn msh_34_an_older_generation_is_refused_and_the_view_kept() {
         ],
         "discovery",
         true,
-        &[("mimicconfig/shop/cart", 4)],
+        &[("mimicconfig/shop/cart@u1", 4)],
     );
     let rig = Rig::start(
         vec![
@@ -364,7 +364,10 @@ async fn msh_34_equal_higher_and_unknown_generations_are_applied() {
                     ],
                     "discovery",
                     true,
-                    &[("mimicconfig/shop/cart", 6), ("mimicconfig/shop/pay", 1)],
+                    &[
+                        ("mimicconfig/shop/cart@u1", 6),
+                        ("mimicconfig/shop/pay@u1", 1),
+                    ],
                 ),
                 "\"1-d\"",
             ),
@@ -382,8 +385,8 @@ async fn msh_34_equal_higher_and_unknown_generations_are_applied() {
 async fn msh_34_a_service_generation_counts() {
     // The Service's slice goes from generation 1 to 0 in the second view.
     let lower = gens(1).replace(
-        "\"endpointslice/shop/cart-x\":1",
-        "\"endpointslice/shop/cart-x\":0",
+        "\"endpointslice/shop/cart-x@u1\":1",
+        "\"endpointslice/shop/cart-x@u1\":0",
     );
     let rig = Rig::start(
         vec![
@@ -399,7 +402,38 @@ async fn msh_34_a_service_generation_counts() {
 }
 
 #[tokio::test]
-async fn msh_34_the_same_older_view_served_again_after_the_grace_is_applied() {
+async fn msh_34_an_object_created_again_has_a_new_uid_and_is_not_older() {
+    // The MimicConfig was deleted and created again: another UID, generation 1.
+    let recreated = view_json(
+        &[
+            ("shop/cart", "10.96.0.10", 80),
+            ("shop/pay", "10.96.0.11", 80),
+        ],
+        "discovery",
+        true,
+        &[("mimicconfig/shop/cart@u2", 1)],
+    );
+    // And a slice of the Service, with the same name and another UID.
+    let slice_again = recreated.replace("cart-x@u1", "cart-x@u2");
+    let rig = Rig::start(
+        vec![
+            Reply::View(gens(5), "\"1-a\""),
+            Reply::View(recreated, "\"1-b\""),
+            Reply::View(slice_again, "\"1-c\""),
+            // A known UID that is gone from the view is fine.
+            Reply::View(view_json(&[], "discovery", true, &[]), "\"1-d\""),
+        ],
+        Reply::Hold,
+    )
+    .await;
+    wait("four views", || rig.pulls("ok") == 4).await;
+    assert_eq!(rig.pulls("older"), 0);
+    assert_eq!(rig.services(), 0);
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn msh_34_a_stale_replica_serving_the_same_old_view_is_never_accepted() {
     let older = view_json(
         &[
             ("shop/cart", "10.96.0.10", 80),
@@ -407,19 +441,17 @@ async fn msh_34_the_same_older_view_served_again_after_the_grace_is_applied() {
         ],
         "discovery",
         true,
-        &[("mimicconfig/shop/cart", 1)],
+        &[("mimicconfig/shop/cart@u1", 4)],
     );
-    let rig = Rig::with(
+    let rig = Rig::start(
         vec![Reply::View(gens(5), "\"1-aaa\"")],
-        Reply::View(older, "\"1-recreated\""),
-        |config| config.older_grace = Duration::from_millis(1500),
+        Reply::View(older, "\"1-stale\""),
     )
     .await;
-    wait("the refusal", || rig.pulls("older") >= 1).await;
+    // Served again and again, longer than any grace the sidecar could have: refused each time.
+    wait("four refusals", || rig.pulls("older") >= 4).await;
     assert_eq!(rig.services(), 1);
-    let refused_at = Instant::now();
-    wait("the view is applied", || rig.services() == 2).await;
-    assert!(refused_at.elapsed() < Duration::from_secs(4));
+    assert_eq!(rig.pulls("ok"), 1);
     rig.stop().await;
 }
 

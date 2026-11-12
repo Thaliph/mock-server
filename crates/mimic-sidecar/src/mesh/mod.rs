@@ -41,9 +41,6 @@ const MIB: usize = 1024 * KIB;
 
 /// A held request lasts as long as the controller's `MIMIC_MESH_WATCH_TIMEOUT` (at most 10 m).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(11 * 60);
-/// A view refused as older is applied when the same `ETag` is served this long after it was
-/// first refused: an object deleted and created again restarts its generation.
-const OLDER_GRACE: Duration = Duration::from_secs(10);
 
 /// Where the view comes from, and how it ages.
 #[derive(Debug, Clone)]
@@ -56,8 +53,6 @@ pub struct MeshConfig {
     pub startup_wait: Duration,
     /// `MIMIC_MESH_MAX_*`.
     pub limits: Limits,
-    /// How long a view refused as older stays refused (tests shorten it).
-    pub older_grace: Duration,
     /// `<MIMIC_TRUST_DIR>/state/mesh.json`.
     pub state_file: PathBuf,
     /// `None` without `MIMIC_CONTROLLER_URL`: nothing is pulled.
@@ -73,7 +68,6 @@ impl Default for MeshConfig {
             stale_after: Duration::from_secs(60),
             startup_wait: Duration::from_secs(2),
             limits: Limits::default(),
-            older_grace: OLDER_GRACE,
             state_file: PathBuf::new(),
             target: None,
             timeout: REQUEST_TIMEOUT,
@@ -253,12 +247,6 @@ struct Held {
     etag: String,
 }
 
-/// A view refused as older, and since when.
-struct Refused {
-    etag: String,
-    since: Instant,
-}
-
 struct Contact {
     /// The last `200` or `304`, or the `fetchedAt` of a view read from the file.
     at: Option<Instant>,
@@ -269,14 +257,12 @@ struct Contact {
 struct Inner {
     table: RwLock<Arc<Table>>,
     held: Mutex<Option<Held>>,
-    refused: Mutex<Option<Refused>>,
     contact: Mutex<Contact>,
     started: Instant,
     /// The sidecar pulls a view: readiness waits for it.
     follows: bool,
     stale_after: Duration,
     startup_wait: Duration,
-    older_grace: Duration,
     limits: Limits,
     state_file: PathBuf,
     pulls: Family<ResultLabel, Counter>,
@@ -313,7 +299,6 @@ impl MeshState {
         MeshState(Arc::new(Inner {
             table: RwLock::new(Arc::default()),
             held: Mutex::new(None),
-            refused: Mutex::new(None),
             contact: Mutex::new(Contact {
                 at: None,
                 stale_warned: false,
@@ -322,7 +307,6 @@ impl MeshState {
             follows: config.enabled && config.target.is_some(),
             stale_after: config.stale_after,
             startup_wait: config.startup_wait,
-            older_grace: config.older_grace,
             limits: config.limits.clone(),
             state_file: config.state_file.clone(),
             pulls: Family::default(),
@@ -418,7 +402,8 @@ impl MeshState {
         self.install(Arc::new(view), etag, Instant::now(), "pull");
     }
 
-    /// Whether `view` has a lower generation than the view held for an object both know.
+    /// Whether `view` has a lower generation than the view held for an object both know. The keys
+    /// name the object with its UID, so a recreated object is unknown, never older.
     fn regresses(&self, view: &View) -> bool {
         let held = lock(&self.0.held);
         let Some(held) = held.as_ref() else {
@@ -439,26 +424,11 @@ impl MeshState {
 
     /// Applies a pulled view unless it is older than the one held (design §4.3).
     pub(crate) fn offer(&self, view: Arc<View>, etag: &str) -> bool {
-        if self.regresses(&view) && !self.refused_long_enough(etag) {
+        if self.regresses(&view) {
             return false;
         }
         self.install(view, etag, Instant::now(), "pull");
         true
-    }
-
-    /// Records a refusal of `etag`; true when it has been refused for the grace already.
-    fn refused_long_enough(&self, etag: &str) -> bool {
-        let mut refused = lock(&self.0.refused);
-        match refused.as_ref() {
-            Some(r) if r.etag == etag => r.since.elapsed() >= self.0.older_grace,
-            _ => {
-                *refused = Some(Refused {
-                    etag: etag.to_string(),
-                    since: Instant::now(),
-                });
-                false
-            }
-        }
     }
 
     fn install(&self, view: Arc<View>, etag: &str, contact: Instant, source: &'static str) {
@@ -476,7 +446,6 @@ impl MeshState {
             etag: etag.to_string(),
         });
         drop(previous);
-        *lock(&self.0.refused) = None;
         self.0.seen.store(true, Ordering::Release);
         {
             let mut c = lock(&self.0.contact);

@@ -191,7 +191,7 @@ pub async fn mesh_api(script: Vec<Reply>, fallback: Reply) -> MeshApi {
 }
 
 /// A view document: Services `(key, ip, port)` with one endpoint each, the `mode`, the
-/// `mesh` switch and the top-level `generations` (`mimicconfig/<ns>/<name>` → n).
+/// `mesh` switch and the top-level `generations` (`mimicconfig/<ns>/<name>@<uid>` → n).
 pub fn view_json(
     services: &[(&str, &str, u16)],
     mode: &str,
@@ -202,7 +202,7 @@ pub fn view_json(
         .iter()
         .map(|(key, ip, port)| {
             format!(
-                r#""{key}":{{"endpoints":{{"{port}":[{{"ip":"10.1.0.7","port":8080,"ready":true}}]}},"generations":{{"endpointslice/{key}-x":1}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":30}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#
+                r#""{key}":{{"endpoints":{{"{port}":[{{"ip":"10.1.0.7","port":8080,"ready":true}}]}},"generations":{{"endpointslice/{key}-x@u1":1}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":30}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#
             )
         })
         .collect();
