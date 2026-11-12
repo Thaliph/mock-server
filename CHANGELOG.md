@@ -11,6 +11,7 @@ All notable changes to mimic are documented in this file. The format follows
 
 - The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The UI is an explorer with four tabs (Map, Workloads, Endpoints, Load tests; the first and the last two are placeholders). The Workloads tab lists every deployment with its mode, pods and last push and links the `MimicWorkload` and `MimicLoadTest` that configure it, each with its spec as read-only YAML and its status conditions; new read routes `GET /v1/resources` and `GET /v1/workloads/<ns>/<dep>/resources` (#465).
+- Production overlay `deploy/helm/mimic/values-production.yaml` (#438): three controllers spread over zones and nodes, a priority class, requests and limits on every rendered container, images by digest, the Valkey exporter and the PodMonitors on, bundled monitoring and load tests off. The chart gains `controller.topologySpreadConstraints`, `controller.priorityClassName` and `valkey.priorityClassName`, empty by default.
 
 - The Endpoints tab lists the inbound and outbound endpoints of a picked deployment (`/ui/endpoints?deployment=<ns>/<dep>`), filtered in the browser by method, template, authority and status class, each row linking to the Swagger UI page of its document (#466).
 

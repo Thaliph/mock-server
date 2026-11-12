@@ -29,6 +29,9 @@ spec:
       serviceAccountName: {{ .Release.Name }}-controller
       automountServiceAccountToken: true
       enableServiceLinks: false
+      {{- with .Values.controller.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -145,6 +148,10 @@ spec:
                     app.kubernetes.io/instance: {{ .Release.Name }}
                     app.kubernetes.io/name: mimic-controller
         {{- end }}
+      {{- with .Values.controller.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

@@ -53,6 +53,8 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `controller.logLevel` | `info` | `MIMIC_LOG` of the controller (`tracing` filter syntax). |
 | `controller.resources` | requests `50m` / `64Mi`; limit memory `768Mi` | Sized for the pushes the body budget lets through at once, each at the store limits, plus allocator headroom. |
 | `controller.nodeSelector`, `controller.tolerations` | `{}`, `[]` | |
+| `controller.topologySpreadConstraints` | `[]` | Topology spread constraints of the controller pods, passed through as given. The production overlay spreads them over zones and nodes ([Production install](Install#production-install)). |
+| `controller.priorityClassName` | `""` | PriorityClass of the controller pods; the class must exist. Empty: none. The production overlay uses `mimic-critical`. |
 | `controller.affinity` | `{}` | Empty: preferred pod anti-affinity on `kubernetes.io/hostname`. |
 | `controller.webhook.maxConnections` | `256` | 1-65535. `MIMIC_WEBHOOK_MAX_CONNECTIONS`. |
 | `controller.webhook.requestTimeout` | `5s` | `<n>s` or `<n>ms`, greater than 0. |
@@ -70,12 +72,22 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `valkey.persistence.storageClass` | `""` | Empty: cluster default. |
 | `valkey.resources` | requests `50m` / `768Mi` (= `maxmemory`); limit memory `1Gi` | `maxmemory` = 75 % of the memory limit (a whole quantity such as `1Gi` is required), policy `noeviction`. |
 | `valkey.nodeSelector`, `valkey.tolerations` | `{}`, `[]` | |
+| `valkey.priorityClassName` | `""` | PriorityClass of the Valkey pod; the class must exist. Empty: none. The production overlay uses `mimic-critical`. |
 | `networkPolicy.enabled` | `true` | Valkey: ingress from the controller only, no egress. Controller: see below. |
 | `networkPolicy.webhookFrom` | `[]` | `from` peers for port 8443. Empty: any source (the API server's address depends on the cluster). |
 | `networkPolicy.metricsNamespaceSelector` | `{}` | Namespaces allowed to scrape port 8081, in addition to the release namespace. |
 | `networkPolicy.sidecarApiFrom` | `[]` | `from` peers for the sidecar API port. Empty: any source (injected pods can be anywhere). |
 | `metrics.serviceMonitor.enabled` | `false` | Prometheus Operator `ServiceMonitor` for the controller admin port. |
 | `metrics.serviceMonitor.interval` | `30s` | |
+
+The production overlay (`values-production.yaml`, [Production install](Install#production-install)) differs from the
+defaults in these values only: `image.digest` and `inject.initImage.digest` (set), `controller.replicas` (`3`),
+`controller.resources` and `inject.sidecarResources` (CPU limits added), `controller.topologySpreadConstraints`,
+`controller.priorityClassName` and `valkey.priorityClassName` (`mimic-critical`), `valkey.persistence.size` (`8Gi`),
+`valkey.resources` (`1536Mi` request, `2Gi` limit, 1 CPU limit), `valkey.metrics.enabled` (`true`, with its
+`valkey.metrics.resources` CPU limit), `networkPolicy.webhookFrom` (a placeholder `ipBlock`), and
+`metrics.serviceMonitor.enabled` and `metrics.podMonitor.enabled` (`true`). `valkey.persistence.storageClass` and
+`networkPolicy.webhookFrom` are placeholders to fill in.
 
 The chart does **not** expose `MIMIC_STORE_*`, `MIMIC_SIDECAR_API_*`, `MIMIC_UI_ADDR` or the
 sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
