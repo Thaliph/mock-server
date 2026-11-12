@@ -255,7 +255,7 @@ impl<F: FnMut(Event)> Relay<F> {
     /// and then calls [`Relay::flush`], so that the observation of an exchange (access line,
     /// metrics, discovery) never delays the bytes it describes (spec §4.1, PRX-33).
     fn with_deferred<T>(&self, f: impl FnOnce(&mut Codec) -> (T, Vec<Event>)) -> T {
-        self.run(f, false)
+        self.run(f, true)
     }
 
     /// Observes the deferred events.
