@@ -120,6 +120,53 @@ mod tests {
     }
 
     #[test]
+    fn msh_39_the_mesh_variables_for_the_sidecars() {
+        let cfg = WebhookConfig::from_env(&env(&[]), "1").unwrap();
+        let pairs = |cfg: &WebhookConfig| {
+            cfg.inject
+                .mesh_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pairs(&cfg),
+            [
+                ("MIMIC_MESH", "on"),
+                ("MIMIC_MESH_STALE_AFTER", "60s"),
+                ("MIMIC_MESH_STARTUP_WAIT", "2s"),
+            ]
+        );
+        let extra = [
+            ("MIMIC_MESH", "off"),
+            ("MIMIC_MESH_STALE_AFTER", "90s"),
+            ("MIMIC_MESH_STARTUP_WAIT", "500ms"),
+            ("MIMIC_MESH_MAX_SERVICES", "7"),
+            ("MIMIC_MESH_MAX_VIEW_BYTES", "64Ki"),
+        ];
+        let cfg = WebhookConfig::from_env(&env(&extra), "1").unwrap();
+        assert_eq!(
+            pairs(&cfg),
+            [
+                ("MIMIC_MESH", "off"),
+                ("MIMIC_MESH_STALE_AFTER", "90s"),
+                ("MIMIC_MESH_STARTUP_WAIT", "500ms"),
+                ("MIMIC_MESH_MAX_SERVICES", "7"),
+                ("MIMIC_MESH_MAX_VIEW_BYTES", "65536"),
+            ]
+        );
+        // An invalid value exits 2 (the controller's own parsing).
+        for (var, value) in [
+            ("MIMIC_MESH_STALE_AFTER", "0s"),
+            ("MIMIC_MESH_STALE_AFTER", "2h"),
+            ("MIMIC_MESH_STARTUP_WAIT", "61s"),
+        ] {
+            let err = WebhookConfig::from_env(&env(&[(var, value)]), "1").err();
+            assert!(err.is_some_and(|e| e.to_string().contains(var)), "{var}");
+        }
+    }
+
+    #[test]
     fn tls_12_controller_url_names_the_service_and_the_sidecar_api_port() {
         let cfg = WebhookConfig::from_env(&env(&[]), "1").unwrap();
         assert_eq!(

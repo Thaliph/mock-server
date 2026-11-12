@@ -978,6 +978,7 @@ mod tests {
             sidecar_log: "debug".into(),
             controller_url: "https://mimic.mimic-system.svc:8444".into(),
             load_enabled: false,
+            mesh_env: Vec::new(),
         }
     }
 
@@ -1660,6 +1661,31 @@ mod tests {
         let env = env_of(&doc["spec"]["initContainers"][1]);
         assert_eq!(env["MALLOC_ARENA_MAX"]["value"], "2");
         assert_eq!(env["MALLOC_MMAP_THRESHOLD_"]["value"], "131072");
+    }
+
+    #[test]
+    fn msh_39_the_sidecar_gets_the_mesh_variables_of_the_controller() {
+        let env = |cfg: &InjectConfig| {
+            let ops = patch(&pod(), "shop-api", cfg, &wiring()).unwrap();
+            let mut doc = serde_json::to_value(pod()).unwrap();
+            let ops: json_patch::Patch =
+                serde_json::from_value(serde_json::to_value(&ops).unwrap()).unwrap();
+            json_patch::patch(&mut doc, &ops).unwrap();
+            env_of(&doc["spec"]["initContainers"][1])
+        };
+        // Nothing the controller did not give.
+        assert!(!env(&cfg()).contains_key("MIMIC_MESH"));
+        let mut with = cfg();
+        with.mesh_env = vec![
+            ("MIMIC_MESH".into(), "off".into()),
+            ("MIMIC_MESH_STALE_AFTER".into(), "90s".into()),
+            ("MIMIC_MESH_STARTUP_WAIT".into(), "$2s".into()),
+        ];
+        let found = env(&with);
+        assert_eq!(found["MIMIC_MESH"]["value"], "off");
+        assert_eq!(found["MIMIC_MESH_STALE_AFTER"]["value"], "90s");
+        // As every literal: `$` is escaped for the kubelet.
+        assert_eq!(found["MIMIC_MESH_STARTUP_WAIT"]["value"], "$$2s");
     }
 
     #[test]
