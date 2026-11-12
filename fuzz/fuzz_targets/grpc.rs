@@ -34,7 +34,9 @@ fn stream(parser: &mut Parser, pieces: &[&[u8]]) -> (Vec<Frame>, Option<FrameErr
 fn redaction(message: &Message) {
     let rule = FieldRule::new("p.S/M", Direction::Request, "1.2").expect("a rule");
     let redactor = GrpcRedactor::new(Redactor::default(), vec![rule]);
-    let names = FieldNames::new();
+    let mut names = FieldNames::new();
+    names.insert(vec![2], "password".to_string());
+    names.insert(vec![1, 1], "refreshToken".to_string());
     let once = redactor
         .message("p.S/M", Direction::Request, message, &names)
         .expect("a decoded payload is within the bounds");

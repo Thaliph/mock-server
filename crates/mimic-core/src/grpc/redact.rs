@@ -9,11 +9,14 @@ use super::wire::{Field, MAX_DEPTH, MAX_FIELD_NUMBER, MAX_FIELDS, Message, Value
 use crate::discovery::placeholder::Placeholder;
 use crate::discovery::redact::{Redactor, Rule, value_placeholder, value_rule};
 
-/// Entropy, in bits per byte, from which a string of at least `MIN_BLOB` bytes is a secret.
+/// Entropy, in bits per byte, that caps the bar for a string of at least `MIN_BLOB` bytes.
 const STRING_ENTROPY: f64 = 4.5;
-/// Entropy, in bits per byte, from which a bytes value of at least `MIN_BLOB` bytes is a secret.
+/// Entropy, in bits per byte, that caps the bar for a bytes value of at least `MIN_BLOB` bytes.
 const BYTES_ENTROPY: f64 = 7.0;
 const MIN_BLOB: usize = 16;
+/// The entropy of `len` bytes cannot exceed `log2(len)`: the bar is this share of it when that
+/// is lower than the cap, so a short random key is reachable.
+const LENGTH_SHARE: f64 = 0.95;
 
 /// Which side of a call a message belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,23 +192,40 @@ impl Walk<'_> {
 
     /// A value that is not a message: the value detectors, then the entropy rule.
     fn leaf(&self, value: &Value) -> Value {
+        let secret = || Value::Str(Placeholder::Secret.to_string());
         match value {
             Value::Str(text) => match value_placeholder(text) {
                 Some(placeholder) => Value::Str(placeholder.to_string()),
-                None if text.len() >= MIN_BLOB && entropy(text.as_bytes()) >= STRING_ENTROPY => {
-                    Value::Str(Placeholder::Secret.to_string())
-                }
+                None if high_entropy(text.as_bytes(), STRING_ENTROPY) => secret(),
                 None => value.clone(),
             },
-            Value::Bytes(bytes) if bytes.len() >= MIN_BLOB && entropy(bytes) >= BYTES_ENTROPY => {
-                Value::Str(Placeholder::Secret.to_string())
+            Value::Bytes(bytes) => {
+                // Each maximal valid UTF-8 run: one invalid byte must not hide a secret.
+                let hit = bytes
+                    .utf8_chunks()
+                    .find_map(|chunk| value_placeholder(chunk.valid()));
+                match hit {
+                    Some(placeholder) => Value::Str(placeholder.to_string()),
+                    None if high_entropy(bytes, BYTES_ENTROPY) => secret(),
+                    None => value.clone(),
+                }
             }
-            Value::Varint(v) if value_rule(&v.to_string()) == Some(Rule::Card) => {
+            Value::Varint(v) | Value::Fixed64(v) if is_card(*v) => {
                 Value::Str(Placeholder::Card.to_string())
             }
             other => other.clone(),
         }
     }
+}
+
+fn is_card(number: u64) -> bool {
+    value_rule(&number.to_string()) == Some(Rule::Card)
+}
+
+/// True when `bytes` is a blob of at least `MIN_BLOB` bytes whose entropy reaches
+/// `min(cap, LENGTH_SHARE * log2(len))`.
+fn high_entropy(bytes: &[u8], cap: f64) -> bool {
+    bytes.len() >= MIN_BLOB && entropy(bytes) >= cap.min(LENGTH_SHARE * (bytes.len() as f64).log2())
 }
 
 /// Shannon entropy of `bytes`, in bits per byte.
