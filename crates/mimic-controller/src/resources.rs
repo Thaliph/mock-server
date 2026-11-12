@@ -148,6 +148,8 @@ impl ResourceCache {
         Arc::new(ResourceCache::default())
     }
 
+    pub fn set_load_enabled(&self, _enabled: bool) {}
+
     pub fn apply(&self, resource: Resource) {
         let key = (
             resource.kind.clone(),
