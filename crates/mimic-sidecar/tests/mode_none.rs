@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use common::mock_rig::{Dest, Options, Rig, TlsSetup, rig_with, users_set};
 use mimic_core::Mode;
+use mimic_core::discovery::report::Report;
 use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
 use mimic_sidecar::listener::Direction;
 use mimic_sidecar::mode::Announced;
@@ -82,8 +83,7 @@ async fn call(rig: &Rig, request: &[u8]) -> String {
 
 fn empty(discovery: &Discovery) -> bool {
     let report = discovery.report();
-    report.exchanges() == 0
-        && report.to_json() == mimic_core::discovery::report::Report::new(None).to_json()
+    report.exchanges() == 0 && report.to_json().ok() == Report::new(None).to_json().ok()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

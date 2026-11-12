@@ -339,6 +339,16 @@ pod_of() {
 prepare_setup() {
   if [[ $1 == discovery ]]; then
     kubectl label --overwrite namespace "$NS" mimic.platform.io/inject=enabled
+    # A deployment injected by label alone is in mode none since M0: this setup records.
+    for app in fortio-server fortio-client; do
+      kubectl apply -f - <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: $app, namespace: $NS}
+spec: {deployment: $app, mode: discovery}
+YAML
+    done
+    sleep 5
     kubectl -n "$NS" rollout restart deploy/fortio-server deploy/fortio-client
     kubectl -n "$NS" rollout status deploy/fortio-server --timeout=180s
     kubectl -n "$NS" rollout status deploy/fortio-client --timeout=180s

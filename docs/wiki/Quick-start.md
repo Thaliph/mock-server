@@ -71,8 +71,10 @@ done
 
 ## 3. Turn discovery on for `users` and `front`
 
-Discovery is the default mode. Creating a `MimicWorkload` is what gives you a status to look at (and
-is how you set per-deployment options, see [Configuration](Configuration)):
+A Deployment injected by label is in mode `none` by default: proxied, nothing recorded. Creating a
+`MimicWorkload` with `spec.mode: discovery` turns recording on, live and without a restart of the pods
+(within one pull interval, 60 s by default), and gives you a status to look at (it is also how you set
+per-deployment options, see [Configuration](Configuration)):
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -81,12 +83,14 @@ kind: MimicWorkload
 metadata: {name: users, namespace: demo}
 spec:
   deployment: users
+  mode: discovery
 ---
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: front, namespace: demo}
 spec:
   deployment: front
+  mode: discovery
 EOF
 ```
 

@@ -90,13 +90,20 @@ spec:
 It selects the Deployment for injection in `selected` namespaces, carries per-deployment settings
 (`spec.tls.exclude`, `spec.discovery.redact`) and shows what the controller holds in `status`. See
 [Configuration](Configuration). When several `MimicWorkload`s name the same deployment, any of them
-selects it and the settings are merged (union).
+selects it and the settings are merged (union). A Deployment injected by label with no `MimicWorkload`
+is in `none`: it is proxied and nothing is recorded until you ask for `discovery` or `mock` with
+`spec.mode`. With several `MimicWorkload`s, `mock` wins over `discovery`, which wins over `none`.
+
+`none` means "proxy only, nothing recorded". It does not mean "no mesh": the mimic mesh (a later
+milestone) is independent of the mode and has its own switches (the chart value `mesh.enabled`
+and `MimicConfig.spec.mesh.enabled`).
 
 ## Modes
 
 | Mode | Behaviour | Status |
 |---|---|---|
-| **discovery** (default) | Traffic is forwarded unchanged and recorded. | Available. Inbound exchanges are recorded. |
+| **none** (default) | Proxy only: traffic is forwarded unchanged, nothing is recorded, nothing is sent to the controller, and outbound TLS is passed through (never intercepted). | Available. Pods in `none` still pull their mode, so a switch needs no restart. |
+| **discovery** | Traffic is forwarded unchanged and recorded. | Available. Inbound and outbound exchanges are recorded. |
 | **mock** | Outbound calls are answered from the Deployment's recorded egress instead of being forwarded; the real destination is not called. | Available. Switched with `spec.mode`, live, within one egress pull interval. See [Mock mode](Mock-mode). |
 
 ## Valkey

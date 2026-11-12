@@ -536,7 +536,8 @@ async fn mon_11_a_switch_whose_state_file_cannot_be_written_is_applied_and_count
 
 /// The `mimic_mode` series of `admin`, by mode.
 fn mode_series(admin: SocketAddr) -> [Option<f64>; 3] {
-    ["none", "discovery", "mock"].map(|mode| series(admin, &format!("mimic_mode{{mode=\"{mode}\"}}")))
+    ["none", "discovery", "mock"]
+        .map(|mode| series(admin, &format!("mimic_mode{{mode=\"{mode}\"}}")))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -609,8 +610,7 @@ async fn non_05_pulled_switches_between_none_discovery_and_mock_are_applied_and_
     let last = process
         .logs()
         .into_iter()
-        .filter(|v| v["message"] == "mode changed")
-        .next_back()
+        .rfind(|v| v["message"] == "mode changed")
         .unwrap();
     assert_eq!(last["previous"], "mock");
 }

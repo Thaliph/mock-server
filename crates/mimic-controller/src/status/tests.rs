@@ -278,7 +278,7 @@ async fn ctl_18_an_unchanged_status_sends_no_request() {
     s.reconciler.cache.set_mode_status(
         &ns,
         "w1",
-        Some(json!({"mode": "discovery", "pods": 0, "otherPods": 0})),
+        Some(json!({"mode": "none", "pods": 0, "otherPods": 0})),
     );
     s.reconciler.tick(now + 1000).await;
     s.reconciler.tick(now + 2000).await;
@@ -404,7 +404,7 @@ async fn ctl_18_a_status_without_the_defaulted_inbound_count_is_unchanged() {
     s.reconciler.cache.set_mode_status(
         &ns,
         "w1",
-        Some(json!({"mode": "discovery", "pods": 0, "otherPods": 0})),
+        Some(json!({"mode": "none", "pods": 0, "otherPods": 0})),
     );
     s.reconciler.tick(now_ms()).await;
     assert!(s.sink.calls().is_empty());
@@ -424,7 +424,7 @@ async fn shr_12_a_status_without_the_defaulted_total_is_unchanged() {
     s.reconciler.cache.set_mode_status(
         &ns,
         "w1",
-        Some(json!({"mode": "discovery", "pods": 0, "otherPods": 0})),
+        Some(json!({"mode": "none", "pods": 0, "otherPods": 0})),
     );
     s.reconciler.tick(now_ms()).await;
     assert!(s.sink.calls().is_empty());
@@ -555,7 +555,7 @@ async fn ctl_18_concurrent_applies_still_skip_unchanged_statuses() {
             .set_status(&ns, &call.1, Some(call.2.clone()));
         s.reconciler
             .cache
-            .set_mode_status(&ns, &call.1, Some(json!({"mode": "discovery"})));
+            .set_mode_status(&ns, &call.1, Some(json!({"mode": "none"})));
     }
     s.reconciler.tick(now_ms()).await;
     assert_eq!(s.sink.calls().len(), 2);
@@ -675,13 +675,13 @@ async fn mck_09_an_unreadable_pulls_field_is_skipped_and_logged_once() {
     let ns = unique("mck09");
     let s = setup(&valkey_url(), &[(&ns, "w1", "front")]);
     let now = now_ms();
-    pulled(&ns, "front", "front-a", &format!("discovery {now}")).await;
+    pulled(&ns, "front", "front-a", &format!("none {now}")).await;
     pulled(&ns, "front", "front-b", "garbage").await;
     s.reconciler.tick(now).await;
     s.reconciler.tick(now).await;
     assert_eq!(
         s.sink.modes()[0].2,
-        json!({"mode": "discovery", "pods": 1, "otherPods": 0})
+        json!({"mode": "none", "pods": 1, "otherPods": 0})
     );
     let raw = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert_eq!(raw.matches("stored pulls unreadable").count(), 1, "{raw}");

@@ -193,6 +193,8 @@ pub enum Reason {
     UpstreamUntrusted,
     ClientCertRequested,
     ClientRejected,
+    /// The mode is `none` (spec §3): nothing would read the plaintext. Never remembered.
+    ModeNone,
 }
 
 impl Reason {
@@ -204,6 +206,7 @@ impl Reason {
             Reason::UpstreamUntrusted => "upstream_untrusted",
             Reason::ClientCertRequested => "client_cert_requested",
             Reason::ClientRejected => "client_rejected",
+            Reason::ModeNone => "mode_none",
         }
     }
 }

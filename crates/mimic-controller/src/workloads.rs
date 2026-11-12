@@ -354,15 +354,17 @@ fn held_mode(object: &DynamicObject) -> Option<serde_json::Value> {
     object.data.get("status")?.get("mode").cloned()
 }
 
-/// `spec.mode` and `spec.mock` of a `MimicWorkload`; what the CRD would refuse reads as the
-/// default.
+/// `spec.mode` and `spec.mock` of a `MimicWorkload`; what the CRD would refuse, and a missing mode, read as
+/// the default (`none`, spec §7).
 pub fn mock_of(object: &DynamicObject) -> MockSettings {
     let Some(spec) = object.data.get("spec") else {
         return MockSettings::default();
     };
     let mock = spec.get("mock");
+    let mode = spec.get("mode").and_then(|m| m.as_str());
     MockSettings {
-        mock: spec.get("mode").and_then(|m| m.as_str()) == Some("mock"),
+        mock: mode == Some("mock"),
+        discovery: mode == Some("discovery"),
         factor: mock
             .and_then(|m| m.get("latencyFactor"))
             .and_then(|f| f.as_f64())
@@ -625,7 +627,7 @@ mod tests {
         cache.remove("shop", "b");
         assert_eq!(cache.effective("shop", "api").factor, 300);
         cache.remove("shop", "c");
-        assert_eq!(cache.effective("shop", "api").mode().as_str(), "none");
+        assert_eq!(cache.effective("shop", "api").mode().as_str(), "discovery");
     }
 
     #[test]
