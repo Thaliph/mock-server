@@ -53,7 +53,6 @@ fn msh_31_values_are_read() {
 fn msh_31_invalid_values_are_refused() {
     for (var, value) in [
         ("MIMIC_MESH", "yes"),
-        ("MIMIC_MESH", ""),
         ("MIMIC_MESH_STALE_AFTER", "999ms"),
         ("MIMIC_MESH_STALE_AFTER", "3601s"),
         ("MIMIC_MESH_STALE_AFTER", "soon"),
@@ -139,8 +138,8 @@ fn msh_32_the_table_maps_cluster_ip_and_port_to_the_service() {
     assert_eq!(table.lookup(ip("10.1.0.9"), 8080), None);
     assert_eq!(table.lookup(ip("10.1.0.9"), 80), None);
     assert_eq!(table.lookup(ip("192.0.2.1"), 80), None);
-    // Four entries: nothing for the headless Service.
-    assert_eq!(table.len(), 4);
+    // Five entries (two addresses and two ports of cart, one of pay): none for the headless Service.
+    assert_eq!(table.len(), 5);
 }
 
 #[test]

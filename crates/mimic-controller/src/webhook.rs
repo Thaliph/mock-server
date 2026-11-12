@@ -479,6 +479,7 @@ pub(crate) mod tests {
                 sidecar_log: "info".into(),
                 controller_url: "https://mimic.mimic-system.svc:8444".into(),
                 load_enabled: false,
+                mesh_env: Vec::new(),
             },
             cache: Arc::new(cache),
             seed: seed.clone(),

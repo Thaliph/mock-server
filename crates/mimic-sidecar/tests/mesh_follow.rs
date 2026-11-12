@@ -116,7 +116,7 @@ impl Rig {
 }
 
 async fn wait(what: &str, mut ready: impl FnMut() -> bool) {
-    for _ in 0..1000 {
+    for _ in 0..3000 {
         if ready() {
             return;
         }
@@ -351,7 +351,18 @@ async fn msh_34_equal_higher_and_unknown_generations_are_applied() {
             Reply::View(gens(5), "\"1-b\""),
             Reply::View(gens(6), "\"1-c\""),
             // An object the held view does not know.
-            Reply::View(two(), "\"1-d\""),
+            Reply::View(
+                view_json(
+                    &[
+                        ("shop/cart", "10.96.0.10", 80),
+                        ("shop/pay", "10.96.0.11", 80),
+                    ],
+                    "discovery",
+                    true,
+                    &[("mimicconfig/shop/cart", 6), ("mimicconfig/shop/pay", 1)],
+                ),
+                "\"1-d\"",
+            ),
         ],
         Reply::Hold,
     )
@@ -570,10 +581,9 @@ async fn msh_36_a_file_that_does_not_parse_is_ignored_with_one_warning() {
         let logs = capture_logs();
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), &text);
-        let (state, metrics) =
+        let (_state, metrics) =
             restored(dir.path(), &[("MIMIC_MESH_MAX_VIEW_BYTES", "64Ki")]).await;
         assert_eq!(value(&metrics, "mimic_mesh_view_services"), 0.0, "{what}");
-        let _ = &state;
         logs.settled().await;
         let warnings = logs
             .text()

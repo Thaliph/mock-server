@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -161,10 +161,9 @@ pub async fn mesh_api(script: Vec<Reply>, fallback: Reply) -> MeshApi {
                                 tokio::time::sleep(Duration::from_secs(3600)).await;
                                 return Err("held");
                             }
-                            Reply::View(text, etag) => (
-                                response.status(200).header("etag", etag),
-                                Bytes::from(text),
-                            ),
+                            Reply::View(text, etag) => {
+                                (response.status(200).header("etag", etag), Bytes::from(text))
+                            }
                             Reply::Gzip(text, etag) => (
                                 response
                                     .status(200)

@@ -90,7 +90,11 @@ async fn msh_37_readiness_waits_for_the_first_view_or_the_startup_wait() {
     let (status, _) = http_get(admin, "/readyz");
     assert_eq!(status, 503);
     wait_status(admin, "/readyz", 200, Duration::from_secs(10));
-    assert!(begun.elapsed() >= Duration::from_secs(1), "{:?}", begun.elapsed());
+    assert!(
+        begun.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        begun.elapsed()
+    );
     drop(process);
 
     // A view arrives: ready long before a startup wait of 30 s.

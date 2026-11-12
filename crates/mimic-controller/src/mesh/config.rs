@@ -23,6 +23,10 @@ pub struct MeshConfig {
     pub max_watches: usize,
     /// `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS` and `MIMIC_MESH_MAX_VIEW_BYTES`.
     pub limits: Limits,
+    /// `MIMIC_MESH_STALE_AFTER`: not used here, handed to the sidecars (spec §7.1).
+    pub stale_after: Duration,
+    /// `MIMIC_MESH_STARTUP_WAIT`: handed to the sidecars like the previous one.
+    pub startup_wait: Duration,
 }
 
 impl Default for MeshConfig {
@@ -35,6 +39,8 @@ impl Default for MeshConfig {
             cache_bytes: 64 * MIB,
             max_watches: 10_000,
             limits: Limits::default(),
+            stale_after: Duration::from_secs(60),
+            startup_wait: Duration::from_secs(2),
         }
     }
 }
@@ -119,6 +125,20 @@ impl MeshConfig {
                 )?,
                 max_view_bytes: usize_of(max_view_bytes),
             },
+            stale_after: millis(
+                env,
+                "MIMIC_MESH_STALE_AFTER",
+                defaults.stale_after,
+                Duration::from_secs(1),
+                Duration::from_secs(3600),
+            )?,
+            startup_wait: millis(
+                env,
+                "MIMIC_MESH_STARTUP_WAIT",
+                defaults.startup_wait,
+                Duration::ZERO,
+                Duration::from_secs(60),
+            )?,
         })
     }
 }

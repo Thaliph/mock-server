@@ -251,6 +251,9 @@ pub struct InjectConfig {
     /// Load testing is on (`MIMIC_LOAD_MAX_RUNS` above 0): the sidecar gets
     /// `MIMIC_LOAD_ENABLED=1` (spec §10.3).
     pub load_enabled: bool,
+    /// The `MIMIC_MESH*` variables of the sidecar, in order (spec §7.1, M1): the controller's
+    /// own values, so that the pods follow what the cluster says.
+    pub mesh_env: Vec<(String, String)>,
 }
 
 /// What differs per pod in the TLS wiring (spec §7.1, §5).
@@ -321,6 +324,9 @@ pub fn patch(
             .push(json!({"name": "MIMIC_TLS_EXCLUDE", "value": literal(&tls.exclude.join(","))}));
     }
     sidecar_env.push(json!({"name": "MIMIC_MODE", "value": literal(&tls.mode)}));
+    for (name, value) in &cfg.mesh_env {
+        sidecar_env.push(json!({"name": name, "value": literal(value)}));
+    }
     if cfg.load_enabled {
         sidecar_env.push(json!({"name": "MIMIC_LOAD_ENABLED", "value": "1"}));
     }

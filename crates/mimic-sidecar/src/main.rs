@@ -15,6 +15,7 @@ use mimic_sidecar::egress::{EgressConfig, EgressMetrics, Puller, Snapshot};
 use mimic_sidecar::limits;
 use mimic_sidecar::listener::{self, Direction, Shared, TunnelConfig, TunnelMetrics};
 use mimic_sidecar::load::{LoadConfig, Marker};
+use mimic_sidecar::mesh::{Follower, MeshConfig, MeshState};
 use mimic_sidecar::mock::Mock;
 use mimic_sidecar::mode::{ModeConfig, ModeState};
 use mimic_sidecar::probes::{self, Probes};
@@ -65,6 +66,10 @@ fn main() -> ExitCode {
         Ok(mode) => mode,
         Err(e) => return mimic_runtime::config_failure(BINARY, &e),
     };
+    let mesh = match MeshConfig::from_env(&env, &tls.trust_dir) {
+        Ok(mesh) => mesh,
+        Err(e) => return mimic_runtime::config_failure(BINARY, &e),
+    };
     let pod = env.optional("MIMIC_POD_NAME").map(str::to_string);
     let load = match LoadConfig::from_env(&env, &tls) {
         Ok(load) => load,
@@ -84,7 +89,7 @@ fn main() -> ExitCode {
         probes,
         tls,
         (discovery, ship, egress, mode, pod),
-        load,
+        (load, mesh),
         &limits,
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -111,7 +116,7 @@ async fn run(
         ModeConfig,
         Option<String>,
     ),
-    load: Option<LoadConfig>,
+    (load, mesh): (Option<LoadConfig>, MeshConfig),
     limits: &BTreeMap<&'static str, u64>,
 ) -> std::io::Result<()> {
     tracing::info!(version = VERSION, "sidecar starting");
@@ -132,6 +137,21 @@ async fn run(
     let max_pending = mode.max_pending;
     let passthrough = mode.passthrough.clone();
     let mode = ModeState::start(&mode, &mut metrics).await;
+    // With the mesh off nothing of it exists: no state, no metric, no classification.
+    let mesh_state = if mesh.enabled {
+        let state = MeshState::new(&mesh);
+        state.register(&mut metrics);
+        state.restore().await;
+        Some(state)
+    } else {
+        None
+    };
+    let follower = match &mesh_state {
+        Some(state) => {
+            Follower::new(mesh, state.clone(), mode.clone()).map_err(std::io::Error::other)?
+        }
+        None => None,
+    };
     // In mode `none` nothing is recorded (spec §3).
     let recording = mode.recording();
     let load = load.map(|config| Marker::new(config, mode.clone(), &mut metrics));
@@ -177,6 +197,9 @@ async fn run(
     if let Some(load) = &load {
         shared = shared.with_load(load.clone());
     }
+    if let Some(state) = &mesh_state {
+        shared = shared.with_mesh(state.clone());
+    }
     let shared = Arc::new(shared);
     // The listeners stop accepting and the relays wind down on the signal.
     tokio::spawn({
@@ -199,6 +222,14 @@ async fn run(
     if let Some(puller) = puller {
         let stop = shutdown.clone();
         tokio::spawn(puller.run(async move { stop.wait().await }));
+    }
+    if let Some(follower) = follower {
+        let stop = shutdown.clone();
+        tokio::spawn(follower.run(async move { stop.wait().await }));
+    }
+    if let Some(state) = mesh_state.clone() {
+        let stop = shutdown.clone();
+        tokio::spawn(state.run_age(async move { stop.wait().await }));
     }
     // Responses in flight get the grace period too, in parallel with the admin drain; the
     // connections left at its end are closed.
@@ -230,7 +261,16 @@ async fn run(
             shipper.flush(grace.saturating_sub(begun.elapsed())).await;
         }
     };
-    let mut admin_router = admin::router(metrics, Readiness::always())
+    // Ready once the listeners accept connections and the first view is in, or has been waited
+    // for (spec §7.9).
+    let readiness = match mesh_state {
+        Some(state) => Readiness::new(move || {
+            let state = state.clone();
+            async move { state.ready() }
+        }),
+        None => Readiness::always(),
+    };
+    let mut admin_router = admin::router(metrics, readiness)
         .merge(probes::router(Arc::new(probes)))
         .merge(discovery.router())
         .merge(snapshot.router());

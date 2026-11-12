@@ -30,9 +30,15 @@ fn view_with(port: u16, mesh: bool) -> View {
 
 /// Sends `payload` through a listener whose original destination is `dst`, and returns what
 /// came back from the destination (an echo server).
-async fn through(state: &MeshState, direction: Direction, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+async fn through(
+    state: &MeshState,
+    direction: Direction,
+    dst: SocketAddr,
+    payload: &[u8],
+) -> Vec<u8> {
     let mesh = state.clone();
-    let fixture = fixture_configured(direction, move |_| Some(dst), move |s| s.with_mesh(mesh)).await;
+    let fixture =
+        fixture_configured(direction, move |_| Some(dst), move |s| s.with_mesh(mesh)).await;
     let mut client = TcpStream::connect(fixture.addr).await.unwrap();
     client.write_all(payload).await.unwrap();
     let mut back = vec![0u8; payload.len()];
@@ -54,17 +60,29 @@ async fn msh_38_in_scope_and_unscoped_connections_reach_the_destination_unchange
     let state = MeshState::default();
 
     // Before the first view every call is unscoped.
-    assert_eq!(through(&state, Direction::Outbound, scoped, &payload()).await, payload());
+    assert_eq!(
+        through(&state, Direction::Outbound, scoped, &payload()).await,
+        payload()
+    );
     assert_eq!(state.unscoped_connections(), 1);
 
     state.hold(view_with(scoped.port(), true), "\"1-a\"");
-    assert_eq!(through(&state, Direction::Outbound, scoped, &payload()).await, payload());
+    assert_eq!(
+        through(&state, Direction::Outbound, scoped, &payload()).await,
+        payload()
+    );
     assert_eq!(state.unscoped_connections(), 1, "a Service of the view");
 
     // A destination that is no Service port of the view, a pod IP for instance.
-    assert_eq!(through(&state, Direction::Outbound, other, &payload()).await, payload());
+    assert_eq!(
+        through(&state, Direction::Outbound, other, &payload()).await,
+        payload()
+    );
     assert_eq!(state.unscoped_connections(), 2);
-    assert_eq!(through(&state, Direction::Outbound, other, b"hello").await, b"hello");
+    assert_eq!(
+        through(&state, Direction::Outbound, other, &payload()[..1024]).await,
+        &payload()[..1024]
+    );
     assert_eq!(state.unscoped_connections(), 3);
 }
 
@@ -73,7 +91,10 @@ async fn msh_38_inbound_connections_are_not_classified() {
     let other = echo_server().await;
     let state = MeshState::default();
     state.hold(view_with(1, true), "\"1-a\"");
-    assert_eq!(through(&state, Direction::Inbound, other, b"hello").await, b"hello");
+    assert_eq!(
+        through(&state, Direction::Inbound, other, &payload()[..1024]).await,
+        &payload()[..1024]
+    );
     assert_eq!(state.unscoped_connections(), 0);
 }
 
@@ -82,7 +103,10 @@ async fn msh_38_a_view_with_the_mesh_off_classifies_nothing() {
     let other = echo_server().await;
     let state = MeshState::default();
     state.hold(view_with(1, false), "\"1-a\"");
-    assert_eq!(through(&state, Direction::Outbound, other, &payload()).await, payload());
+    assert_eq!(
+        through(&state, Direction::Outbound, other, &payload()).await,
+        payload()
+    );
     assert_eq!(state.unscoped_connections(), 0);
 }
 

@@ -63,6 +63,12 @@ mesh:
   maxViewBytes: 4Mi
   # Held view requests at once per replica; over it 503 with Retry-After.
   maxWatches: 10000
+  # A sidecar's view is stale after this long without contact with the controller (1s to 1h); handed to the
+  # injected sidecars (MIMIC_MESH_STALE_AFTER).
+  staleAfter: 60s
+  # A sidecar without a view waits this long for its first one before it is ready (0s to 1m); handed to the
+  # injected sidecars (MIMIC_MESH_STARTUP_WAIT).
+  startupWait: 2s
 
 # Pod injection (spec §7.1). The sidecar image is `image` above.
 inject:
