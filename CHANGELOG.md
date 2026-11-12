@@ -7,6 +7,10 @@ All notable changes to mimic are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Production overlay `deploy/helm/mimic/values-production.yaml` (#438): three controllers spread over zones and nodes, a priority class, requests and limits on every rendered container, images by digest, the Valkey exporter and the PodMonitors on, bundled monitoring and load tests off. The chart gains `controller.topologySpreadConstraints`, `controller.priorityClassName` and `valkey.priorityClassName`, empty by default.
+
 ## [0.2.0-alpha.3] - 2026-11-11
 
 ### Features

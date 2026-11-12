@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (CHT-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, EGR-19, SHR-19, SHR-20, PUL-19, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -3177,5 +3177,44 @@ kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 [[ $(kubectl -n default get mimicworkload kept -o jsonpath='{.spec.deployment}' 2>/dev/null) == api ]] \
   || fail "inj_23: the MimicWorkload was not kept by the reinstall"
 kubectl -n default delete mimicworkload kept --ignore-not-found >/dev/null
+
+# --- Production overlay (#438, spec §12.16 CHT-08) -------------------------------------------------------------------
+# One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
+# overlay's values are kept, except these kind adaptations (each is about what kind does not have):
+#   image.digest, inject.initImage.digest: empty. The images are built here and loaded by tag (install sets the tag,
+#     pullPolicy Never).
+#   networkPolicy.webhookFrom: null (the chart default, any source). The overlay's documentation CIDR is not the address
+#     the kind control plane calls the webhook from.
+#   metrics.serviceMonitor, metrics.podMonitor: off. kind has no Prometheus Operator CRDs.
+#   valkey.persistence.size: 4Gi, the size of the claim this cluster already has. A StatefulSet's claim template is
+#     immutable (wiki Install, #293), so an 8Gi overlay cannot be applied over the default install.
+#   The PriorityClass mimic-critical is created here: the chart does not create it.
+log "cht_08: helm upgrade with the production overlay"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: {name: mimic-critical}
+value: 1000000
+description: mimic production overlay, e2e only
+YAML
+install -f deploy/helm/mimic/values-production.yaml \
+  --set image.digest= --set inject.initImage.digest= --set networkPolicy.webhookFrom=null \
+  --set metrics.serviceMonitor.enabled=false --set metrics.podMonitor.enabled=false \
+  --set valkey.persistence.size=4Gi || fail "cht_08: helm upgrade with the production overlay"
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
+kubectl -n "$NS" rollout status statefulset/$RELEASE-valkey --timeout=2m
+[[ $(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.status.readyReplicas}') == 3 ]] \
+  || fail "cht_08: the controller does not run 3 Ready replicas"
+[[ $(kubectl -n "$NS" get pdb $RELEASE-controller -o jsonpath='{.spec.maxUnavailable}') == 1 ]] \
+  || fail "cht_08: the PodDisruptionBudget is not maxUnavailable 1"
+[[ $(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.spec.template.spec.topologySpreadConstraints[*].topologyKey}') == "topology.kubernetes.io/zone kubernetes.io/hostname" ]] \
+  || fail "cht_08: the controller has no zone and hostname spread constraints"
+[[ $(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.spec.template.spec.priorityClassName}') == mimic-critical ]] \
+  || fail "cht_08: the controller has no priority class mimic-critical"
+[[ $(kubectl -n "$NS" get statefulset $RELEASE-valkey -o jsonpath='{.spec.template.spec.priorityClassName}') == mimic-critical ]] \
+  || fail "cht_08: Valkey has no priority class mimic-critical"
+admin_forward
+[[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "cht_08: /readyz not 200 with the overlay"
+echo "cht_08: the overlay install runs 3 Ready controllers, with the PDB, spread constraints and priority class"
 
 log "e2e passed on kubernetes $server"
