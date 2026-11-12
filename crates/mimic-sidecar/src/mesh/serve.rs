@@ -38,6 +38,18 @@ pub(crate) struct Serving {
 }
 
 impl Serving {
+    /// Ends the tunnel an upgrade request became, if one was started.
+    fn abort_tunnel(&self) {
+        if let Some(task) = self
+            .tunnel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
+
     pub(crate) fn new(
         mesh: MeshState,
         backend: Arc<Backend>,
@@ -57,7 +69,7 @@ impl Serving {
 /// The connection to the pod and the request counted in flight, released when the response
 /// body ends or is dropped.
 struct Hold {
-    _in_flight: InFlight,
+    _in_flight: Option<InFlight>,
     _lease: Lease,
 }
 
@@ -132,7 +144,10 @@ pub(crate) async fn serve(
                     stopping = true;
                     connection.as_mut().graceful_shutdown();
                 }
-                () = &mut abort => return Ok(()),
+                () = &mut abort => {
+                    serving.abort_tunnel();
+                    return Ok(());
+                }
             }
         }
     } else {
@@ -149,7 +164,10 @@ pub(crate) async fn serve(
                     stopping = true;
                     connection.as_mut().graceful_shutdown();
                 }
-                () = &mut abort => return Ok(()),
+                () = &mut abort => {
+                    serving.abort_tunnel();
+                    return Ok(());
+                }
             }
         }
     };
@@ -202,21 +220,11 @@ impl Serving {
             req,
         );
         let router = self.mesh.router();
-        let Some(pick) = self.backend.pick(router) else {
-            self.count(None, StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", began);
-            tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-            return Ok(answer(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no-endpoint",
-                false,
-            ));
-        };
-        let upstream = pick.endpoint().addr;
-        tracker.route(&self.backend.label, upstream);
-        let connect_failed = |tracker: Tracker, e: std::io::Error, pick: &InFlight| {
-            tracing::debug!(%upstream, error = %e, "connect to the pod failed");
+        let cluster = self.ctx.dst;
+        let connect_failed = |tracker: Tracker, e: std::io::Error, pick: Option<&InFlight>| {
+            tracing::debug!(error = %e, "connect failed");
             self.count(
-                Some(pick),
+                pick,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "connect-failed",
                 began,
@@ -228,10 +236,55 @@ impl Serving {
                 false,
             ))
         };
-        let mut lease = match router.pools.checkout(upstream, protocol, false).await {
-            Ok(lease) => lease,
-            Err(e) => return connect_failed(tracker, e, &pick),
+        // A stale view is not used for pod addresses (spec §7.9).
+        let mut chosen: Option<(InFlight, Lease)> = None;
+        if !self.mesh.stale() {
+            let Some(first) = self.backend.pick(router) else {
+                self.count(None, StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", began);
+                tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                return Ok(answer(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no-endpoint",
+                    false,
+                ));
+            };
+            let first_addr = first.endpoint().addr;
+            match router.pools.checkout(first_addr, protocol, false).await {
+                Ok(lease) => chosen = Some((first, lease)),
+                Err(e) => {
+                    tracing::debug!(upstream = %first_addr, error = %e, "connect to the pod failed");
+                    // Nothing was written: one other endpoint, if there is one.
+                    let other = (0..4).find_map(|_| {
+                        self.backend
+                            .pick(router)
+                            .filter(|p| p.endpoint().addr != first_addr)
+                    });
+                    drop(first);
+                    if let Some(other) = other
+                        && let Ok(lease) = router
+                            .pools
+                            .checkout(other.endpoint().addr, protocol, false)
+                            .await
+                    {
+                        chosen = Some((other, lease));
+                    }
+                }
+            }
+        }
+        let (pick, mut lease) = match chosen {
+            Some((pick, lease)) => (Some(pick), lease),
+            None => {
+                // The original destination, as without the mesh.
+                router.metrics.fallback(&self.backend.label);
+                tracker.route(&self.backend.label, cluster);
+                match router.pools.checkout(cluster, protocol, false).await {
+                    Ok(lease) => (None, lease),
+                    Err(e) => return connect_failed(tracker, e, None),
+                }
+            }
         };
+        let upstream = pick.as_ref().map_or(cluster, |p| p.endpoint().addr);
+        tracker.route(&self.backend.label, upstream);
         // Nothing written to a connection the pod had closed: once more on a new one, whatever
         // the method (spec §7.9).
         let mut sent = lease.send(req).await;
@@ -239,7 +292,7 @@ impl Serving {
             router.metrics.reconnect(&self.backend.label);
             lease = match router.pools.checkout(upstream, protocol, true).await {
                 Ok(lease) => lease,
-                Err(e) => return connect_failed(tracker, e, &pick),
+                Err(e) => return connect_failed(tracker, e, pick.as_ref()),
             };
             sent = lease.send(again).await;
         }
@@ -256,7 +309,7 @@ impl Serving {
                     let on_pod = hyper::upgrade::on(&mut response);
                     tracker.mark_upgrade();
                     let answered = tracker.answered(response);
-                    self.count(Some(&pick), answered.status(), "none", began);
+                    self.count(pick.as_ref(), answered.status(), "none", began);
                     lease.discard();
                     let task = tokio::spawn(async move {
                         let (client, pod) = tokio::join!(on_client, on_pod);
@@ -276,7 +329,7 @@ impl Serving {
                 if http1 {
                     strip_hop_by_hop(answered.headers_mut(), false, false);
                 }
-                self.count(Some(&pick), answered.status(), "none", began);
+                self.count(pick.as_ref(), answered.status(), "none", began);
                 Ok(answered.map(|body| MeshBody {
                     upstream: Some(body),
                     _hold: Some(Hold {
@@ -288,7 +341,7 @@ impl Serving {
             Sent::Failed(e) if e.is_parse() || e.is_parse_status() || e.is_parse_too_large() => {
                 tracing::debug!(%upstream, error = %e, "the pod's response head was refused");
                 self.count(
-                    Some(&pick),
+                    pick.as_ref(),
                     StatusCode::BAD_GATEWAY,
                     "invalid-response",
                     began,
@@ -298,13 +351,13 @@ impl Serving {
             }
             Sent::Failed(e) => {
                 tracing::debug!(%upstream, error = %e, "the pod did not answer");
-                self.count_none(&pick, began);
+                self.count_none(pick.as_ref(), began);
                 tracker.failed();
                 Err(e.into())
             }
             Sent::Unsent(_) => {
                 tracing::debug!(%upstream, "the request could not be written twice");
-                self.count_none(&pick, began);
+                self.count_none(pick.as_ref(), began);
                 tracker.failed();
                 Err("connection closed".into())
             }
@@ -331,12 +384,12 @@ impl Serving {
     }
 
     /// A request that got no response.
-    fn count_none(&self, pick: &InFlight, began: Instant) {
+    fn count_none(&self, pick: Option<&InFlight>, began: Instant) {
         self.mesh.router().metrics.request(
             &Call {
                 service: &self.backend.service,
                 backend: &self.backend.label,
-                endpoint: Some(&pick.endpoint().label),
+                endpoint: pick.map(|p| &*p.endpoint().label),
                 status_class: "none",
                 reason: "none",
             },

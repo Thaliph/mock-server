@@ -451,7 +451,7 @@ impl MeshState {
     /// The balancing state of the Service port `dst` is the ClusterIP and port of, when it is
     /// in the view and the mesh is on for this workload.
     pub(crate) fn route(&self, dst: SocketAddr) -> Option<Arc<Backend>> {
-        if self.0.opaque_ports.contains(&dst.port()) {
+        if self.0.opaque_ports.contains(&dst.port()) || self.stale() {
             return None;
         }
         let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);
@@ -584,7 +584,16 @@ impl MeshState {
 
     /// Test hook (#443): the next pooled checkout hands out a connection that is already
     /// closed, as a pod closing it between the readiness check and the write would.
-    pub fn poison_next_checkout(&self) {}
+    pub fn poison_next_checkout(&self) {
+        self.0.router.pools.poison_next();
+    }
+
+    /// The view is older than `MIMIC_MESH_STALE_AFTER`: its pod addresses are not used.
+    pub(crate) fn stale(&self) -> bool {
+        lock(&self.0.contact)
+            .at
+            .is_some_and(|at| at.elapsed() >= self.0.stale_after)
+    }
 
     /// Removes the per-pod series of the endpoints that left the view 5 minutes before `now`.
     pub fn evict(&self, now: Instant) {

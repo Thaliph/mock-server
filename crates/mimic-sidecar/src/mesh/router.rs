@@ -205,6 +205,13 @@ impl Router {
                     self.metrics.left(&backend.label, gone, now);
                 }
                 live.extend(backend.addrs());
+                // The pools of the original destination (the fallback) stay.
+                live.extend(
+                    service
+                        .ips
+                        .iter()
+                        .map(|ip| SocketAddr::new(ip.to_canonical(), *port)),
+                );
                 backends.insert(label, backend);
             }
         }

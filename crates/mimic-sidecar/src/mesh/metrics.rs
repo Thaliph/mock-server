@@ -84,6 +84,7 @@ pub(crate) struct MeshMetrics {
     endpoint_requests: Family<EndpointLabels, Counter>,
     in_flight: Family<InFlightLabels, Gauge>,
     reconnects: Family<BackendLabels, Counter>,
+    fallbacks: Family<BackendLabels, Counter>,
     slots: Mutex<Slots>,
     max_labels: usize,
 }
@@ -96,6 +97,7 @@ impl MeshMetrics {
             endpoint_requests: Family::default(),
             in_flight: Family::default(),
             reconnects: Family::default(),
+            fallbacks: Family::default(),
             slots: Mutex::new(Slots::default()),
             max_labels,
         }
@@ -124,17 +126,33 @@ impl MeshMetrics {
             self.in_flight.clone(),
         );
         registry.register(
+            "mesh_fallbacks",
+            "Requests sent to the original destination instead of a pod",
+            self.fallbacks.clone(),
+        );
+        registry.register(
             "mesh_reconnects",
             "Requests sent again on a new connection because nothing of them was written",
             self.reconnects.clone(),
         );
     }
 
+    /// A request sent to the original destination instead of a pod.
+    pub(crate) fn fallback(&self, backend: &str) {
+        self.fallbacks
+            .get_or_create(&BackendLabels {
+                backend: backend.to_string(),
+            })
+            .inc();
+    }
+
     /// The series of a backend exists from the moment it is in the view, at 0.
     pub(crate) fn backend_seen(&self, backend: &str) {
-        let _ = self.reconnects.get_or_create(&BackendLabels {
+        let labels = BackendLabels {
             backend: backend.to_string(),
-        });
+        };
+        let _ = self.reconnects.get_or_create(&labels);
+        let _ = self.fallbacks.get_or_create(&labels);
     }
 
     /// A request that was sent again on a new connection.

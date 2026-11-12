@@ -205,6 +205,17 @@ impl H1Pool {
         }
     }
 
+    /// A lease on a connection whose driver is gone (test hook).
+    async fn closed_lease(self: &Arc<Self>) -> io::Result<Lease> {
+        let stream = dial(self.addr).await?;
+        let (sender, connection) = http1::Builder::new()
+            .handshake(TokioIo::new(stream))
+            .await
+            .map_err(io::Error::other)?;
+        drop(connection);
+        Ok(self.lease(sender))
+    }
+
     fn lease(self: &Arc<Self>, sender: http1::SendRequest<ReqBody>) -> Lease {
         Lease::Http1 {
             sender: Some(sender),
@@ -271,6 +282,22 @@ impl H2Pool {
         }
     }
 
+    /// A lease on a connection whose driver is gone (test hook).
+    async fn closed_lease(&self) -> io::Result<Lease> {
+        let stream = dial(self.addr).await?;
+        let (sender, connection) = http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(stream))
+            .await
+            .map_err(io::Error::other)?;
+        drop(connection);
+        Ok(Lease::Http2 {
+            sender,
+            active: Arc::new(AtomicUsize::new(1)),
+            last_used: Arc::new(AtomicU64::new(0)),
+            since: self.started,
+        })
+    }
+
     fn lease(&self, conn: &Conn) -> Lease {
         conn.active.fetch_add(1, Ordering::AcqRel);
         Lease::Http2 {
@@ -293,12 +320,12 @@ impl H2Pool {
             .map(|c| self.lease(c))
     }
 
-    async fn checkout(&self) -> io::Result<Lease> {
-        if let Some(lease) = self.free() {
+    async fn checkout(&self, fresh: bool) -> io::Result<Lease> {
+        if let Some(lease) = self.free().filter(|_| !fresh) {
             return Ok(lease);
         }
         let _opening = self.connecting.lock().await;
-        if let Some(lease) = self.free() {
+        if let Some(lease) = self.free().filter(|_| !fresh) {
             return Ok(lease);
         }
         if lock(&self.conns).len() < MAX_H2_CONNECTIONS {
@@ -481,6 +508,8 @@ pub(crate) struct Pools {
     idle_timeout: Duration,
     pools: Mutex<HashMap<(SocketAddr, Protocol), Arc<Pool>>>,
     sweeping: AtomicBool,
+    /// Checkouts left that hand out a closed connection (test hook).
+    poison: AtomicUsize,
 }
 
 impl Pools {
@@ -489,6 +518,7 @@ impl Pools {
             idle_timeout,
             pools: Mutex::new(HashMap::new()),
             sweeping: AtomicBool::new(false),
+            poison: AtomicUsize::new(0),
         })
     }
 
@@ -509,10 +539,26 @@ impl Pools {
                 })
             })
             .clone();
+        let poisoned = !fresh
+            && self
+                .poison
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok();
+        if poisoned {
+            return match &*pool {
+                Pool::Http1(pool) => pool.closed_lease().await,
+                Pool::Http2(pool) => pool.closed_lease().await,
+            };
+        }
         match &*pool {
             Pool::Http1(pool) => pool.checkout(fresh).await,
-            Pool::Http2(pool) => pool.checkout().await,
+            Pool::Http2(pool) => pool.checkout(fresh).await,
         }
+    }
+
+    /// The next checkout hands out a connection that is already closed.
+    pub(crate) fn poison_next(&self) {
+        self.poison.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Drains the pools of the endpoints that are not in `live`: their requests in flight
