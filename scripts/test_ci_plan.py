@@ -194,6 +194,12 @@ class Fnd10Classification(unittest.TestCase):
         self.assertTrue(r["gate_fuzz_http1"])
         self.assertFalse(r["gate_fuzz_discovery"])
 
+    def test_grp_10_grpc_codec_path_runs_the_discovery_fuzz_job_only(self):
+        for path in ("crates/mimic-core/src/grpc/wire.rs", "crates/mimic-core/src/grpc.rs"):
+            r = run([path])
+            self.assertTrue(r["gate_fuzz_discovery"], path)
+            self.assertFalse(r["gate_fuzz_http1"], path)
+
     def test_fnd_10_proxy_rs_is_the_codec_fuzz_path_but_not_a_directory_prefix(self):
         self.assertTrue(run(["crates/mimic-core/src/proxy.rs"])["gate_fuzz_http1"])
         self.assertFalse(run(["crates/mimic-core/src/proxy_extra.rs"])["gate_fuzz_http1"])
