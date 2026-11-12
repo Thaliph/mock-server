@@ -26,9 +26,39 @@ tunnel) is logged late, with its full duration. Each line also has `timestamp` (
 
 ## Sample lines
 
-> **Pending.** The sample lines of this section are to be captured from a kind run of the chart
-> (`scripts/e2e.sh`, check `ui_14`) and pasted here as they were logged, one inbound and one outbound
-> `http exchange` and one `connection`. They are not written by hand.
+Captured from the `mimic-sidecar` container of the injected `frontend` of the
+[OpenTelemetry demo](https://github.com/open-telemetry/opentelemetry-helm-charts/tree/main/charts/opentelemetry-demo)
+on kind, mimic 0.2.0-alpha.2, as they were logged (one line each, wrapped here for reading):
+
+An inbound request served by the app:
+
+```json
+{"timestamp":"2026-11-11T22:30:01.874837Z","level":"INFO","message":"http exchange","direction":"inbound",
+ "protocol":"http1","dst":"10.244.0.121:8080","authority":"localhost:8081","method":"GET","path":"/api/cart",
+ "status":200,"upgrade":false,"result":"ok","duration_ms":26,"head_ms":26,"bytes_in":0,"bytes_out":24,"target":"access"}
+```
+
+An outbound gRPC call forwarded to the real backend (discovery):
+
+```json
+{"timestamp":"2026-11-11T22:30:01.872736Z","level":"INFO","message":"http exchange","direction":"outbound",
+ "protocol":"h2","dst":"10.96.204.94:8080","authority":"cart:8080","method":"POST",
+ "path":"/oteldemo.CartService/GetCart","status":200,"grpc_status":0,"upgrade":false,"result":"ok",
+ "duration_ms":22,"head_ms":22,"bytes_in":43,"bytes_out":5,"target":"access"}
+```
+
+The same kind of call answered by mimic in mock mode (`mock` names the match tier):
+
+```json
+{"timestamp":"2026-11-11T22:32:21.146906Z","level":"INFO","message":"http exchange","direction":"outbound",
+ "protocol":"h2","dst":"10.96.105.82:4317","authority":"otel-collector:4317","method":"POST",
+ "path":"/opentelemetry.proto.collector.logs.v1.LogsService/Export","status":200,"grpc_status":0,
+ "upgrade":false,"result":"ok","duration_ms":58,"head_ms":58,"bytes_in":1648,"bytes_out":5,"mock":"exact",
+ "target":"access"}
+```
+
+That pod opened no plain TCP or passed-through TLS connection, so it logged no `connection` line; such a line
+carries the fields listed for `connection` above (`sni`, `interception`, `result`, `duration_ms`, bytes).
 
 ## Fields
 
