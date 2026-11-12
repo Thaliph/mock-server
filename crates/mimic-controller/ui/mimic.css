@@ -1,6 +1,9 @@
 body { font-family: system-ui, sans-serif; margin: 0; color: #1b1b1b; background: #fff; }
-header { padding: 0.6rem 1rem; background: #1b2a3a; }
+header { padding: 0.6rem 1rem; background: #1b2a3a; display: flex; gap: 1.5rem; align-items: baseline; }
 header a { color: #fff; font-weight: bold; text-decoration: none; }
+nav { display: flex; gap: 1rem; }
+nav a { font-weight: normal; opacity: 0.75; padding-bottom: 0.1rem; }
+nav a[aria-current="page"] { opacity: 1; border-bottom: 2px solid #fff; }
 main { padding: 0 1rem 1rem; }
 h1 { font-size: 1.4rem; }
 h2 { font-size: 1.1rem; margin-top: 1.5rem; }
@@ -9,3 +12,7 @@ th, td { border-bottom: 1px solid #ddd; padding: 0.3rem 0.5rem; text-align: left
 th { background: #f3f5f7; }
 a { color: #0b5cad; }
 .error { color: #a40000; }
+pre { background: #f3f5f7; padding: 0.6rem; overflow-x: auto; font-size: 0.85rem; }
+ul.plain { list-style: none; padding-left: 0; margin: 0; }
+.mode-mock { font-weight: bold; }
+.placeholder { color: #555; }
