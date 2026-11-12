@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{counted, echo_server, fixture};
+use common::{counted, echo_server, fixture, fixture_configured};
 use mimic_sidecar::connection::configure_socket;
 use mimic_sidecar::listener::{Direction, raise_fd_limit};
 use nix::sys::socket::{getsockopt, sockopt};
@@ -535,4 +535,48 @@ async fn prx_18_tls_destination_reset_reaches_the_client_as_a_reset() {
     reset(tcp);
     let took = expect_reset(tls.get_mut().0).await;
     assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
+async fn prx_32_configure_socket_sets_nodelay() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stream = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    assert!(!getsockopt(&stream, sockopt::TcpNoDelay).unwrap());
+    configure_socket(&stream).unwrap();
+    assert!(getsockopt(&stream, sockopt::TcpNoDelay).unwrap());
+}
+
+/// Both sockets of a proxied connection, inbound and outbound, have `TCP_NODELAY`.
+#[tokio::test]
+async fn prx_32_both_legs_of_a_connection_have_nodelay() {
+    let echo = echo_server().await;
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let f = fixture_configured(
+            direction,
+            move |_| Some(echo),
+            move |shared| {
+                shared.with_socket_observer(Arc::new(move |socket| {
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push(getsockopt(socket, sockopt::TcpNoDelay).unwrap());
+                }))
+            },
+        )
+        .await;
+        let mut client = TcpStream::connect(f.addr).await.unwrap();
+        client.write_all(b"ping\n").await.unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [true, true],
+            "{direction:?}: client leg, destination leg"
+        );
+    }
 }

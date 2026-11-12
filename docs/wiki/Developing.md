@@ -87,6 +87,32 @@ ID appears in CI logs. The script exercises the same `users` and `front` service
 [Quick start](Quick-start). Prefer an integration test in `crates/*/tests` when a behaviour is
 observable without a cluster: e2e minutes are the slowest part of CI.
 
+## Benchmarks
+
+`scripts/bench.sh` measures what the sidecar costs: fortio against an echo server with a fixed 5 ms
+delay, rates 50, 100 and 200 rps, HTTP/1.1 and h2c, with and without the sidecar. It is run by hand on
+a quiet machine, never in CI (shared runners are too noisy). Needs `kind`, `kubectl`, `helm`, `docker`
+and `jq`.
+
+```bash
+scripts/bench.sh --dry-run                       # the plan: 12 runs, nothing started
+scripts/bench.sh                                 # the matrix on cluster "mimic-bench" (cluster build first)
+RATES="50 100" PROTOCOLS=http1 scripts/bench.sh  # a smaller matrix
+KEEP_CLUSTER=0 scripts/bench.sh                  # delete the cluster afterwards
+```
+
+- Rates are capped at 200 rps; anything above, or a bad value, exits 2 before any cluster command.
+- It exits 3 while another run holds a lock (its own, `mimic-bench.lock`, or `mimic-e2e.lock`) and
+  takes its own lock for the run. Until `scripts/e2e.sh` takes the same lock, do not run the two at
+  once: they share fixed ports and the kubeconfig.
+- The namespace `mimic-bench` is deleted on exit, also after a failure. The cluster stays unless
+  `KEEP_CLUSTER=0`.
+- Results go to `docs/bench/<date>-<setup>.json`, and one row per run is added to the table of
+  `docs/bench/README.md`. Read the p50 to p99.9 latencies, the errors (non-200 responses), and the
+  sidecar CPU (cores) and RSS (MiB) of caller and callee. Commit the results with the machine
+  description, and say in the README when 200 rps is not clean.
+- `scripts/test_bench.sh` is the self-test of the script (dry run only, no cluster).
+
 ## Fuzzing
 
 `fuzz/fuzz_targets/http1.rs` and `discovery.rs` (needs `cargo-fuzz`); CI runs them on a schedule.

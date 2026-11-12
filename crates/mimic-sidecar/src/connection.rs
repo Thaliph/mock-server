@@ -36,9 +36,11 @@ const MOCK_WAIT: Duration = Duration::from_secs(1);
 /// Default port of a TLS server name, removed by the authority normalisation.
 const TLS_PORT: u16 = 443;
 
-/// TCP keepalive (idle 300 s, interval 30 s, 4 probes) so that a vanished peer is noticed
-/// without any idle timeout on live connections.
+/// `TCP_NODELAY` (HTTP/2 sends small frames back to back: Nagle plus a delayed ACK would add
+/// ~40 ms to each exchange, PRX-32) and TCP keepalive (idle 300 s, interval 30 s, 4 probes) so
+/// that a vanished peer is noticed without any idle timeout on live connections.
 pub fn configure_socket(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)?;
     let keepalive = TcpKeepalive::new()
         .with_time(KEEPALIVE_IDLE)
         .with_interval(KEEPALIVE_INTERVAL)
@@ -122,8 +124,8 @@ pub(crate) async fn handle(
     };
     shared.metrics().count(direction, Outcome::Ok);
     for socket in [&client, &upstream] {
-        if let Err(e) = configure_socket(socket) {
-            tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
+        if let Err(e) = shared.prepare_socket(socket) {
+            tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot configure socket");
         }
     }
     let mut conn = Conn {
@@ -261,8 +263,8 @@ async fn serve_mock(
 ) {
     let direction = Direction::Outbound;
     shared.metrics().count(direction, Outcome::Ok);
-    if let Err(e) = configure_socket(&client) {
-        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
+    if let Err(e) = shared.prepare_socket(&client) {
+        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot configure socket");
     }
     let mut conn = Conn {
         shared,
@@ -681,8 +683,8 @@ async fn intercept(
                     return;
                 }
             };
-            if let Err(e) = configure_socket(&fresh) {
-                tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot set keepalive");
+            if let Err(e) = conn.shared.prepare_socket(&fresh) {
+                tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot configure socket");
             }
             let served = Served::Tunnel("tls", hello, Vec::new(), None);
             conn.serve(served, Stream::plain(client), Stream::plain(fresh), abort)

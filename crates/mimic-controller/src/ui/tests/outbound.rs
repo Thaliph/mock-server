@@ -234,3 +234,45 @@ async fn shr_13_mimic_js_shows_the_authority_and_encodes_the_ids() {
         assert!(!js.contains(forbidden), "{forbidden}");
     }
 }
+
+#[tokio::test]
+async fn exp_09_every_endpoint_row_names_a_document_the_tab_can_open() {
+    let (_, app, ns) = seeded("exp09").await;
+    let base = format!("/v1/workloads/{ns}/front");
+    let list: Value = serde_json::from_slice(&fetch(&app, &format!("{base}/endpoints")).await.body)
+        .expect("JSON");
+    let rows = list["endpoints"].as_array().expect("rows");
+    assert_eq!(rows.len(), 4, "{list}");
+    let mut seen = Vec::new();
+    for row in rows {
+        for member in ["direction", "method", "template", "exchanges", "statuses"] {
+            assert!(!row[member].is_null(), "{member} in {row}");
+        }
+        let document = row["document"].as_str().expect("document");
+        match row["direction"].as_str().unwrap() {
+            "inbound" => {
+                assert_eq!(document, format!("inbound-{}", row["port"]), "{row}");
+            }
+            "outbound" => {
+                let authority = row["authority"].as_str().expect("authority");
+                assert_eq!(document, format!("outbound-{authority}"), "{row}");
+            }
+            other => panic!("direction {other}"),
+        }
+        let path = if let Some(authority) = document.strip_prefix("outbound-") {
+            encoded(authority)
+        } else {
+            document.to_string()
+        };
+        let answer = fetch(&app, &format!("{base}/openapi/{path}")).await;
+        assert_eq!(answer.status, 200, "{path}");
+        seen.push(document.to_string());
+    }
+    assert!(seen.iter().any(|d| d.starts_with("inbound-")), "{seen:?}");
+    for authority in [LOCAL, V6, REDACTED] {
+        assert!(seen.contains(&format!("outbound-{authority}")), "{seen:?}");
+    }
+    let page = fetch(&app, "/ui/endpoints").await;
+    assert_eq!(page.status, 200);
+    assert!(!text_of(&page).contains(&ns));
+}

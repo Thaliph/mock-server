@@ -321,9 +321,14 @@ jobs:
           # #271: image.digest and inject.initImage.digest (yq, key paths matched exactly; fails if a
           # digest is not sha256:<64 hex> or does not land).
           scripts/pin-chart.sh deploy/helm/mimic/values.yaml "$DIGEST" "$INIT_DIGEST"
+          # #438: the production overlay overrides the chart's digests, so it is pinned to the same release.
+          scripts/pin-chart.sh deploy/helm/mimic/values-production.yaml "$DIGEST" "$INIT_DIGEST"
           helm package deploy/helm/mimic --version "$VERSION" --app-version "$VERSION" -d dist
           # The packaged values carry both digests (what the signed chart will deploy).
           tar -xzOf "dist/mimic-$VERSION.tgz" mimic/values.yaml |
+            DIGEST="$DIGEST" INIT_DIGEST="$INIT_DIGEST" \
+            yq -e '.image.digest == strenv(DIGEST) and .inject.initImage.digest == strenv(INIT_DIGEST)' > /dev/null
+          tar -xzOf "dist/mimic-$VERSION.tgz" mimic/values-production.yaml |
             DIGEST="$DIGEST" INIT_DIGEST="$INIT_DIGEST" \
             yq -e '.image.digest == strenv(DIGEST) and .inject.initImage.digest == strenv(INIT_DIGEST)' > /dev/null
           echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin

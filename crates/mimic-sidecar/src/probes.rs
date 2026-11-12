@@ -282,6 +282,8 @@ async fn health_check(
     service: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let tcp = TcpStream::connect((host, port)).await?;
+    // h2c sends small frames back to back (PRX-32).
+    tcp.set_nodelay(true)?;
     let (mut sender, driver) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, Full<hyper::body::Bytes>>(TokioIo::new(tcp))
         .await?;

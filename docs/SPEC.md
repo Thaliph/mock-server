@@ -1604,12 +1604,12 @@ the recorder keeps the first message of each side:
   deployment without data is served and shows "no data" from the `404` of its JSON route.
 - **Explorer shell and Workloads tab (F15).** Every page carries the same four tabs, in this
   order: Map (`/ui/map`), Workloads (`/ui/`), Endpoints (`/ui/endpoints`), Load tests
-  (`/ui/loadtests`); Map, Endpoints and Load tests are placeholders until their own features.
+  (`/ui/loadtests`); Map and Load tests are placeholders until their own features.
   The deployment page and the document page of F6 stay as they are. The Workloads tab lists every
   deployment with its namespace, mode, pods, last push and the mimic resources that configure it
   (`MimicWorkload`, `MimicLoadTest`, from #440 `MimicConfig`), each linking to
-  `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` (`<kind>` one of those three, `<name>` a
-  DNS-1123 subdomain, else `400`), the resource view: its spec as read-only YAML, its labels and
+  `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` (the fifth segment is the word `resources`;
+  `<kind>` one of those three, `<name>` a DNS-1123 subdomain, else `400`), the resource view: its spec as read-only YAML, its labels and
   annotations, its status conditions. Data comes from two routes served from the controller's
   watch caches (no call to the API server per request, no Valkey): `GET /v1/resources`
   (`{"workloads": [{"namespace", "deployment", "mode", "resources": [{"kind", "name"}]}]}`, sorted)
@@ -1622,8 +1622,24 @@ the recorder keeps the first message of each side:
   and the `last-applied-configuration` annotation are dropped, and a `MimicLoadTest`'s
   `credentials` is reduced to `secretName` and the `field` of each entry (never `key`). The YAML
   is rendered by the controller, deterministically: keys in byte order, every string
-  double-quoted in JSON syntax. The browser writes it with `textContent`. The routes count in
+  double-quoted in JSON syntax, with U+0085, U+2028 and U+2029 escaped (`\u0085`, `\u2028`,
+  `\u2029`: YAML 1.1 reads them as line breaks and JSON leaves them raw). The browser writes it
+  with `textContent`; annotation values are shown as set by their authors, as text. The routes count in
   `mimic_ui_requests_total` by route pattern like the others.
+- **Endpoints tab (F15).** `/ui/endpoints` is a static page like the others; `mimic.js` fills
+  it from `GET /v1/workloads` (the deployment picker, one `<ns>/<dep>` option per deployment
+  with data, sorted) and, for the picked deployment, `GET /v1/workloads/<ns>/<dep>/endpoints`:
+  one table row per endpoint, inbound and outbound, with direction, port or authority, method,
+  template, exchanges, statuses, latency quantiles and last seen. The pick is kept in the query
+  string (`?deployment=<ns>/<dep>`, read back on load, so a view can be linked) and no
+  deployment is picked by default. Four filters narrow the table in the browser, with no new
+  request: method (an exact choice among the methods listed), template and authority (a
+  case-insensitive substring), and status class (`2xx`, `3xx`, `4xx`, `5xx`: the endpoint has at
+  least one recorded status of that class). A filter that matches nothing shows "No
+  endpoint matches". Each row links, through its `document` member, to the Swagger UI page of
+  its document, `/ui/workloads/<ns>/<dep>/openapi/<document>` (inbound `inbound-<port>`,
+  outbound `outbound-<authority>`), every part passed through `encodeURIComponent`. A deployment
+  without data shows "No data". The documents and the read routes do not change.
 - **Swagger UI configuration** (in `mimic.js`, nothing inline): `url` = the document route;
   `supportedSubmitMethods: []` (no "Try it out" button, so the UI never sends a request to a
   workload); `tryItOutEnabled: false`; `validatorUrl: null` (no call to
@@ -3594,6 +3610,7 @@ in-process with an injected original destination, as the F1 tunnel tests do.
 | PRX-29 | **U.** Each ambiguous or unparsable input of §4.1 "Unframed HTTP/1" (both `content-length` and `transfer-encoding`; differing or non-decimal `content-length`; request `transfer-encoding` not ending in `chunked`, or with HTTP/1.0; `obs-fold` in a framing header; a bare CR; a header line without `:`; an invalid or over-long chunk size; a head, chunk-size line or trailer section over its limit) gives `unframed` at the first byte that decides it. **I.** For a request with both `content-length` and `transfer-encoding`, a header line over 64 KiB and a head of 300 lines, the destination receives the client's bytes unchanged, the client receives the destination's answer unchanged, one access line has `result: unframed` (with `method`/`path` when known, no `status`), and later HTTP on that connection produces no exchange line. |
 | PRX-30 | **I.** Bounded read-ahead: against a destination that reads everything and never answers, a client that pipelines 100 requests in one write has exactly 32 of them delivered to the destination; each response the destination then sends lets one more through, and all 100 are eventually answered in order. A client that sends a 10 MiB header line without a line end has all its bytes delivered to the destination unchanged and gets one `unframed` line (its memory bound is PRX-27's). |
 | PRX-31 | **I.** With `MIMIC_MAX_CONNECTIONS=2`, a third connection is accepted by the kernel but not served until one of the two ends, then served, and a full inbound side does not delay an outbound connection; an invalid value exits with code 2 (FND-01). A client that sends an incomplete prefix of a protocol (`GE`) and goes silent is reset after the stall duration (injectable; 30 s in production) while a connection that sent nothing is not. |
+| PRX-32 | **I.** `TCP_NODELAY`: after one exchange through the proxy, both sockets of the connection (the accepted client socket and the connection to the destination) have `TCP_NODELAY` set, inbound and outbound, and so have the connections accepted by the admin listener; HTTP/2 frames (HEADERS, DATA, `WINDOW_UPDATE`) must not wait for a delayed ACK (~40 ms). The same holds for the controller's listeners and its Valkey connections. |
 
 ### 12.4 F3 — TLS interception
 
@@ -4053,6 +4070,67 @@ such as `<img src=x onerror=alert(1)>`.
 | EXP-06 | **I.** Metrics: after a known sequence of requests to the new routes `mimic_ui_requests_total` holds the route patterns `/v1/resources`, `/v1/workloads/{namespace}/{deployment}/resources`, `/ui/map`, `/ui/endpoints`, `/ui/loadtests` and `/ui/workloads/{namespace}/{deployment}/resources/{kind}/{name}` with the codes answered, and no label holds a name from the request. |
 | EXP-07 | **E.** Browser (the Chromium of UI-12): `/ui/` shows the four tabs; the Workloads tab lists the e2e deployment `users` of `disc-22` with its mode and its `MimicWorkload`, whose link opens the resource view showing the spec as YAML; each tab path shows its heading; no CSP violation, no request outside the port-forward, no Try it out button. |
 | EXP-08 | **D** (review). `docs/wiki/Reading-the-API.md` documents the two new routes and the resource view, and `docs/wiki/Quick-start.md` the tabs. |
+
+#### Endpoints tab (#466)
+
+The Endpoints tab of §7.5 (*Endpoints tab*), and the follow-ups of the review of #473 (#474),
+whose tests are named after the criteria they extend: `exp_01_…` for the YAML escaping of
+U+0085, U+2028 and U+2029, and `exp_04_…` for the resource page route requiring the word
+`resources`. Levels as in §12.2.
+
+| ID | Criterion |
+|---|---|
+| EXP-09 | **I** (real Valkey). For a deployment with an inbound endpoint and outbound endpoints (a local authority, an IPv6 one and a redacted host), `GET /v1/workloads/<ns>/<dep>/endpoints` gives each row the members the tab reads: `direction`, `port` (inbound) or `authority` (outbound), `method`, `template`, `exchanges`, `statuses` and a `document` that is `inbound-<port>` or the `outbound-` id of the authority; and the route named by `document` under `/openapi/` answers `200` for each row, as `mimic.js` builds it with percent-encoding; `/ui/endpoints` is `200` and holds no deployment name (static bytes). |
+| EXP-10 | **I.** `mimic.js` (read as text, UI-09 rules): the Endpoints tab no longer shows the placeholder text; it reads `/v1/workloads` and the `/endpoints` route, links to `/openapi/` through `enc(` and `encodeURIComponent`, has the four filters (method, template, authority, status class) and the `No endpoint matches` and `No data` texts; it contains no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write` or `eval`, and no `http://` or `https://`; the CSP of UI-08 is unchanged. |
+| EXP-11 | **E.** Browser (the Chromium of UI-12): `/ui/endpoints?deployment=disc-22/users` lists the endpoints `GET /users/{users_id}` and `PUT /users/{users_id}` (inbound, port 8080) and `?deployment=egr-19/front` its outbound ones with their authority; the method filter set to `PUT` leaves only the `PUT` row and the template filter `missing` only the matching rows; a status class matching nothing shows `No endpoint matches`; the row link opens the Swagger UI page of its document (no Try it out button); no CSP violation and no request outside the port-forward. |
+| EXP-12 | **D** (review). `docs/wiki/Reading-the-API.md` describes the Endpoints tab and its filters, and notes that annotation values of the resource view are shown as set by their authors (text, loopback-only UI); the security review of #466 finds no markup built from a template or an authority. |
+
+### 12.18 Production values (#438)
+
+`deploy/helm/mimic/values-production.yaml` is the reviewed overlay of a production install:
+`helm install mimic deploy/helm/mimic -f deploy/helm/mimic/values-production.yaml`, with its placeholders
+(`networkPolicy.webhookFrom`, `valkey.persistence.storageClass`) filled in by the operator. The overlay
+changes no default: the default render stays the golden file of MON-01. Three knobs are new, all empty by
+default and passed through to the pod spec: `controller.priorityClassName`, `valkey.priorityClassName` and
+`controller.topologySpreadConstraints`. The checks read the render of the overlay (`helm template` with
+`valkey.existingSecret=golden`, as MON-01).
+
+Levels as in §12.2, plus **M** (main session, recorded on the PR).
+
+| ID | Criterion |
+|---|---|
+| CHT-01 | **E** (`helm lint`, `scripts/check-chart.sh`). `helm lint --strict deploy/helm/mimic -f deploy/helm/mimic/values-production.yaml` passes. |
+| CHT-02 | **E** (`helm template`, `scripts/check-chart.sh`). Pod Security `restricted` for every pod template of the overlay render: no `hostNetwork`, `hostPID`, `hostIPC` or `hostPath` volume; `runAsNonRoot: true` and `seccompProfile.type: RuntimeDefault` on the pod or on each container; every container and init container has `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` and no `capabilities.add`. The overlay adds no privilege: no rendered container adds a capability (`mimic-init`, which needs `NET_ADMIN` and `NET_RAW`, is injected, not rendered). |
+| CHT-03 | **E** (`helm template`, `scripts/check-chart.sh`). Every container and init container of the overlay render has `resources.requests` with `cpu` and `memory`, and `resources.limits` with `memory`. The controller, Valkey and exporter containers and the injected sidecar (`MIMIC_INJECT_SIDECAR_RESOURCES`) also have `limits.cpu`. Two containers are outside this check: `mimic-init` (added to injected pods by the webhook, which sets no resources: a gap of the injection patch, §7.1) and `mimic-load` (resources from the controller's `MIMIC_LOAD_RESOURCES` default, not a chart value). They are not in the render. |
+| CHT-04 | **E** (`helm template`, `scripts/check-chart.sh`). Every `image` of the overlay render, and the values of `MIMIC_INJECT_SIDECAR_IMAGE` and `MIMIC_INJECT_INIT_IMAGE`, is `repository@sha256:` followed by 64 lowercase hex digits; no reference is by tag alone. `image.digest` and `inject.initImage.digest` of the overlay are set. |
+| CHT-05 | **E** (`helm template`, `scripts/check-chart.sh`). The overlay render has: the controller Deployment with 3 replicas and two `topologySpreadConstraints` (`maxSkew: 1`, `whenUnsatisfiable: ScheduleAnyway`, on `topology.kubernetes.io/zone` and on `kubernetes.io/hostname`, selecting `app.kubernetes.io/name: mimic-controller`); the PodDisruptionBudget `<release>-controller` with `maxUnavailable: 1`; `priorityClassName: mimic-critical` on the controller and Valkey pods; the ServiceMonitor `<release>-controller`, the PodMonitors `<release>-sidecar` and `<release>-valkey`, and the Valkey exporter; no object `<release>-prometheus*` or `<release>-grafana*`, no MimicLoadTest CRD and no ValidatingAdmissionPolicy `mimic-load-job` (the one of `<release>-injector` stays); `networkPolicy.webhookFrom` holds one `ipBlock`; `MIMIC_LOG` of the controller and `MIMIC_LOG` of the injected sidecars are `info`; `valkey.persistence.enabled` is true. |
+| CHT-06 | **E** (`scripts/check-chart.sh`). `values-production.yaml` holds no secret: no non-empty scalar at a key path that names a password, passwd, token, secret, credential or private key, and no PEM block (`-----BEGIN`) or known token prefix (`AKIA`, `ghp_`, `sk_live_`). |
+| CHT-07 | **M** (main session, recorded on the PR). `trivy config` on a directory holding the overlay render (`helm template … -f values-production.yaml`) reports no HIGH or CRITICAL finding. |
+| CHT-08 | **E** (kind, `scripts/e2e.sh` section `cht_08`). One install with the overlay, with the kind adaptations listed in the script header (locally built images by tag, no Prometheus Operator CRDs, no webhook source CIDR, a PriorityClass `mimic-critical` created by the script): the controller Deployment has 3 Ready replicas, the Valkey StatefulSet is Ready, and the live PodDisruptionBudget, topology spread constraints and priority class are those of CHT-05. |
+| CHT-09 | **D** (review). `docs/wiki/Install.md` has a section *Production install* that explains each value of the overlay and each placeholder; `docs/wiki/Configuration.md` lists `controller.priorityClassName`, `valkey.priorityClassName` and `controller.topologySpreadConstraints`, and the overlay's values that differ from the defaults. |
+
+### 12.19 Benchmarks (#436)
+
+A baseline of what the sidecar costs (design `docs/design/mimic-mesh.md` §14, §17.3), run by hand
+on a quiet machine with `scripts/bench.sh` and recorded in `docs/bench/`. It is not a CI job: shared
+runners are too noisy for latency numbers. Levels as in §12.2, plus **D**, the dry-run self-test
+`scripts/test_bench.sh` (it runs `scripts/bench.sh --dry-run` and reads its plan; no cluster, no
+Docker, no `kind`, `kubectl` or `helm` is started), and **M**, a run the main session performs by hand
+and records on #436. The lock of BEN-06 is the one a run of either script must respect; `scripts/e2e.sh`
+does not take it yet, so until it does, e2e and benchmark runs are kept apart by hand.
+
+| ID | Criterion |
+|---|---|
+| BEN-01 | **D.** `scripts/bench.sh --dry-run` exits 0 and prints the plan without running any command that changes state. No argument starts a run; any other argument, or a second one, exits 2 with one usage line and starts nothing. |
+| BEN-02 | **D.** Invalid configuration exits 2 before any cluster command, with one line naming the variable: a setup or protocol outside `plain discovery` and `http1 h2c`; a rate that is not an integer of at most 3 digits from 1 to 200 rps (the cap; the digit bound comes before any arithmetic, so no overflow wraps past it); an empty `RATES`; a `DURATION` that is not `<n>s` with 1 ≤ n ≤ 300; a `CONNECTIONS` that is not 1 to 64 written with at most 2 digits; a `PAUSE` that is not an integer from 0 to 600; a `CLUSTER` not matching `^[a-z0-9-]+$` or starting with `mimic-e2e` (the e2e clusters are never benchmarked or deleted); a `NODE_IMAGE` without a digest; an output file that already exists. |
+| BEN-03 | **D.** Rate cap: the plan lists one fortio run per setup, protocol and rate, each with `-qps` equal to its configured rate and never above 200; 200 itself is accepted. Runs are sequential (one fortio process at a time) and the plan puts a pause of `PAUSE` seconds after every run but the last. |
+| BEN-04 | **D.** Defaults: `CLUSTER` is `mimic-bench`, the namespace is `mimic-bench`, `DURATION` is 30 s, `PAUSE` is 10 s, and the default matrix is 12 runs: setups `plain` and `discovery`, protocols `http1` and `h2c`, rates 50, 100 and 200 rps. |
+| BEN-05 | **D.** Images are pinned by digest: the fortio image of the plan is the reference that `scripts/pinned-image.sh fortio` prints (a digest-pinned stage of `images/Dockerfile`, checked by `scripts/check-pins.sh`); the kind node image defaults to the `kind-node` stage. The plan pulls nothing. |
+| BEN-06 | **D.** Lock: when the lock of `scripts/e2e.sh` (`$MIMIC_LOCK_DIR/mimic-e2e.lock`) or of the benchmark (`$MIMIC_LOCK_DIR/mimic-bench.lock`) is held by a live process, the script exits 3 before any cluster command and names the lock. A lock whose process is gone is stale: the plan says it would be reclaimed, and the run takes it. |
+| BEN-07 | **D.** Outputs: each setup writes `docs/bench/<date>-<setup>.json` once all its runs have finished, holding the machine description, the runs and the sidecar CPU and RSS, and one table row per run is appended to the results table of `docs/bench/README.md`. The dry run writes neither file. |
+| BEN-08 | **D.** Cleanup: the plan ends with the deletion of the namespace `mimic-bench` as an EXIT trap, so that it also runs after a failed run; the cluster is kept unless `KEEP_CLUSTER=0`. |
+| BEN-09 | **D.** Machine description: the plan lists the fields it records (CPU model, cores, RAM, kernel, Docker, kind, Kubernetes, node image) and no host identity (hostname, user, address). |
+| BEN-10 | **M** (main session, recorded on #436). The B0 results are committed in `docs/bench/` with the machine description filled in. If 200 rps is not clean on that machine (errors, or a measured rate below the configured one), `docs/bench/README.md` says so and the budgets of the mesh milestones are taken at 100 rps. |
 
 ## 13. Test strategy
 

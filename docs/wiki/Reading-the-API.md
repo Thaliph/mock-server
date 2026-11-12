@@ -212,9 +212,10 @@ quantiles, hosts and last-seen days. Import the JSON into any OpenAPI 3.1 tool.
 The same listener serves a small read-only UI. With the port-forward above, open
 `http://localhost:8080/ui/`:
 
-- the header has four tabs: Map, Workloads, Endpoints and Load tests. Map, Endpoints and Load tests are placeholders for now;
+- the header has four tabs: Map, Workloads, Endpoints and Load tests. Map and Load tests are placeholders for now;
 - `/ui/` is the Workloads tab: every deployment with its mode, pods, endpoints, last push and a link to each mimic resource that configures it (`MimicWorkload`, `MimicLoadTest`);
-- `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` is the resource view: the spec as read-only YAML, the labels and annotations, and the status conditions;
+- `/ui/workloads/<ns>/<dep>/resources/<kind>/<name>` is the resource view: the spec as read-only YAML, the labels and annotations, and the status conditions. Annotation values are shown as their authors set them, as plain text (the UI is loopback-only and writes every value as text, never as markup);
+- `/ui/endpoints` is the Endpoints tab: pick a deployment (the pick is kept in the address, `/ui/endpoints?deployment=<ns>/<dep>`, so you can bookmark or share a view) to list its inbound and outbound endpoints, each with a link to the Swagger UI page of its document. Four filters narrow the table in the browser, without a new request: method, template and authority (case-insensitive substring), and status class (`2xx` to `5xx`: the endpoint has at least one recorded status of that class);
 - `/ui/workloads/<ns>/<dep>` shows the summary, the pods, the endpoints and one link per document;
 - the deployment page also has a "Load tests" table, filled from the routes above;
 - `/ui/workloads/<ns>/<dep>/openapi/<id>` shows the document in Swagger UI, with a link to the raw JSON.

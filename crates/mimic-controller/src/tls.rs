@@ -148,6 +148,8 @@ pub async fn serve(
                 continue;
             }
         };
+        // Small writes must not wait for a delayed ACK (PRX-32).
+        let _ = stream.set_nodelay(true);
         let (acceptor, router, stop) = (acceptor.clone(), router.clone(), stop_rx.clone());
         connections.spawn(async move {
             connection(stream, peer.ip(), acceptor, router, limits, stop).await;

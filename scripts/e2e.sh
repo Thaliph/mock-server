@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (CHT-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -1866,7 +1866,30 @@ browse resource /ui/workloads/disc-22/users/resources/MimicWorkload/users-a --wa
 jq -e '.text | contains("Spec") and contains("deployment: \"users\"")' "$WORK/browse-resource.json" >/dev/null \
   || fail "exp_07: the resource view does not show the spec of users-a as YAML"
 browse tab-map /ui/map --wait 'not available yet'
-browse tab-endpoints /ui/endpoints --wait 'Pick a deployment'
+browse tab-endpoints /ui/endpoints --wait 'Pick a deployment' --wait disc-22/users
+# exp_11: the Endpoints tab lists the endpoints of a deployment, and its filters narrow the table in the browser.
+browse ep-users '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --wait inbound
+jq -e '[.rows[] | select(.[0] == "inbound" and .[1] == "8080" and .[4] == "/users/{users_id}") | .[3]] | sort == ["GET", "PUT"]' \
+  "$WORK/browse-ep-users.json" >/dev/null \
+  || fail "exp_11: the Endpoints tab does not list GET and PUT /users/{users_id} on port 8080: $(jq -c .rows "$WORK/browse-ep-users.json")"
+jq -e '[.links[] | select(.text == "inbound-8080" and .href == "/ui/workloads/disc-22/users/openapi/inbound-8080")] | length >= 2' \
+  "$WORK/browse-ep-users.json" >/dev/null \
+  || fail "exp_11: the endpoint rows do not link to the inbound-8080 document: $(jq -c .links "$WORK/browse-ep-users.json")"
+browse ep-put '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-method=PUT
+jq -e '[.rows[] | select(.[0] == "inbound") | .[3]] == ["PUT"]' "$WORK/browse-ep-put.json" >/dev/null \
+  || fail "exp_11: the method filter PUT does not leave only the PUT row: $(jq -c .rows "$WORK/browse-ep-put.json")"
+browse ep-none '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-template=no-such-template
+jq -e '[.rows[] | select(.[0] == "inbound")] | length == 0' "$WORK/browse-ep-none.json" >/dev/null \
+  || fail "exp_11: a template filter that matches nothing leaves rows: $(jq -c .rows "$WORK/browse-ep-none.json")"
+jq -e '.text | contains("No endpoint matches")' "$WORK/browse-ep-none.json" >/dev/null \
+  || fail "exp_11: a template filter that matches nothing does not say so"
+browse ep-class '/ui/endpoints?deployment=disc-22/users' --wait '/users/{users_id}' --set filter-status=5xx
+jq -e '(.text | contains("No endpoint matches")) and ([.rows[] | select(.[0] == "inbound")] | length == 0)' "$WORK/browse-ep-class.json" >/dev/null \
+  || fail "exp_11: a status class that matches nothing shows rows or does not say so: $(jq -c .rows "$WORK/browse-ep-class.json")"
+ep_href=$(jq -r '[.links[] | select(.text == "inbound-8080")][0].href' "$WORK/browse-ep-users.json")
+browse ep-document "$ep_href" --wait '/users/{users_id}' --expand
+jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-ep-document.json" >/dev/null \
+  || fail "exp_11: the row link does not open the Swagger UI page of its document: $(jq -c .methods "$WORK/browse-ep-document.json")"
 browse tab-loadtests /ui/loadtests --wait 'not available here yet'
 browse document /ui/workloads/disc-22/users/openapi/inbound-8080 --wait '/users/{users_id}' --expand --interceptor
 jq -e '(.methods | map(ascii_upcase) | sort) == ["GET", "PUT"]' "$WORK/browse-document.json" >/dev/null \
@@ -2300,6 +2323,15 @@ jq -e '[.links[] | select(.text | startswith("outbound-users.disc-22.svc"))] | l
   || fail "shr_20: the deployment page does not list the outbound document"
 # Following the link: the document page of the document that the link names.
 egr_href=$(jq -r --arg a "$egr_authority" '[.links[] | select(.text == $a)][0].href' "$WORK/browse-front.json")
+# exp_11: the Endpoints tab lists front's outbound endpoints with their authority, linking to the outbound document.
+browse ep-front '/ui/endpoints?deployment=egr-19/front' --wait "$egr_authority" --wait '/missing'
+jq -e --arg a "$egr_authority" '[.rows[] | select(.[0] == "outbound" and .[2] == $a) | .[3] + " " + .[4]] | sort == ["GET /missing", "GET /users/{users_id}", "PUT /users/{users_id}"]' \
+  "$WORK/browse-ep-front.json" >/dev/null \
+  || fail "exp_11: the Endpoints tab does not list front's outbound endpoints: $(jq -c .rows "$WORK/browse-ep-front.json")"
+browse ep-front-authority '/ui/endpoints?deployment=egr-19/front' --wait '/missing' --set filter-authority=users.disc-22
+jq -e --arg a "$egr_authority" '([.rows[] | select(.[0] == "inbound")] | length == 0) and ([.rows[] | select(.[0] == "outbound" and .[2] == $a)] | length == 3)' \
+  "$WORK/browse-ep-front-authority.json" >/dev/null \
+  || fail "exp_11: the authority filter does not keep exactly the outbound rows: $(jq -c .rows "$WORK/browse-ep-front-authority.json")"
 browse outbound "$egr_href" --wait '/users/{users_id}' --expand
 jq -e '(.methods | map(ascii_upcase) | unique) == ["GET", "PUT"]' "$WORK/browse-outbound.json" >/dev/null \
   || fail "shr_20: the outbound document page lists the operations $(jq -c .methods "$WORK/browse-outbound.json")"
@@ -3328,5 +3360,44 @@ kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 [[ $(kubectl -n default get mimicworkload kept -o jsonpath='{.spec.deployment}' 2>/dev/null) == api ]] \
   || fail "inj_23: the MimicWorkload was not kept by the reinstall"
 kubectl -n default delete mimicworkload kept --ignore-not-found >/dev/null
+
+# --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
+# One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
+# overlay's values are kept, except these kind adaptations (each is about what kind does not have):
+#   image.digest, inject.initImage.digest: empty. The images are built here and loaded by tag (install sets the tag,
+#     pullPolicy Never).
+#   networkPolicy.webhookFrom: null (the chart default, any source). The overlay's documentation CIDR is not the address
+#     the kind control plane calls the webhook from.
+#   metrics.serviceMonitor, metrics.podMonitor: off. kind has no Prometheus Operator CRDs.
+#   valkey.persistence.size: 4Gi, the size of the claim this cluster already has. A StatefulSet's claim template is
+#     immutable (wiki Install, #293), so an 8Gi overlay cannot be applied over the default install.
+#   The PriorityClass mimic-critical is created here: the chart does not create it.
+log "cht_08: helm upgrade with the production overlay"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: {name: mimic-critical}
+value: 1000000
+description: mimic production overlay, e2e only
+YAML
+install -f deploy/helm/mimic/values-production.yaml \
+  --set image.digest= --set inject.initImage.digest= --set networkPolicy.webhookFrom=null \
+  --set metrics.serviceMonitor.enabled=false --set metrics.podMonitor.enabled=false \
+  --set valkey.persistence.size=4Gi || fail "cht_08: helm upgrade with the production overlay"
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
+kubectl -n "$NS" rollout status statefulset/$RELEASE-valkey --timeout=2m
+[[ $(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.status.readyReplicas}') == 3 ]] \
+  || fail "cht_08: the controller does not run 3 Ready replicas"
+[[ $(kubectl -n "$NS" get pdb $RELEASE-controller -o jsonpath='{.spec.maxUnavailable}') == 1 ]] \
+  || fail "cht_08: the PodDisruptionBudget is not maxUnavailable 1"
+[[ $(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.spec.template.spec.topologySpreadConstraints[*].topologyKey}') == "topology.kubernetes.io/zone kubernetes.io/hostname" ]] \
+  || fail "cht_08: the controller has no zone and hostname spread constraints"
+[[ $(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.spec.template.spec.priorityClassName}') == mimic-critical ]] \
+  || fail "cht_08: the controller has no priority class mimic-critical"
+[[ $(kubectl -n "$NS" get statefulset $RELEASE-valkey -o jsonpath='{.spec.template.spec.priorityClassName}') == mimic-critical ]] \
+  || fail "cht_08: Valkey has no priority class mimic-critical"
+admin_forward
+[[ $(curl -s -o /dev/null -w '%{http_code}' localhost:18081/readyz) == 200 ]] || fail "cht_08: /readyz not 200 with the overlay"
+echo "cht_08: the overlay install runs 3 Ready controllers, with the PDB, spread constraints and priority class"
 
 log "e2e passed on kubernetes $server"

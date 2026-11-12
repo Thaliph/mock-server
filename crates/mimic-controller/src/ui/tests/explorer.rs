@@ -352,3 +352,64 @@ async fn exp_06_the_new_routes_count_by_pattern_without_names() {
         );
     }
 }
+
+fn mimic_js() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/mimic.js")).unwrap()
+}
+
+#[test]
+fn exp_04_mimic_js_routes_the_resource_view_only_under_the_word_resources() {
+    let js = mimic_js();
+    assert!(
+        js.contains("parts[1] === \"workloads\""),
+        "route() does not require the workloads segment"
+    );
+    assert!(
+        js.contains("parts[4] === \"resources\""),
+        "route() does not require segment 4 to be resources"
+    );
+    assert!(
+        js.contains("parts[4] === \"openapi\""),
+        "route() does not require segment 4 to be openapi"
+    );
+}
+
+#[test]
+fn exp_10_the_endpoints_tab_reads_the_routes_and_has_the_four_filters() {
+    let js = mimic_js();
+    assert!(
+        !js.contains("Pick a deployment in the Workloads tab"),
+        "the placeholder is still there"
+    );
+    for needle in [
+        "/v1/workloads\"",
+        "\"/endpoints\"",
+        "/openapi/",
+        "e.document",
+        "encodeURIComponent",
+        "enc(",
+        "No endpoint matches",
+        "No data",
+        "deployment=",
+        "filter-method",
+        "filter-template",
+        "filter-authority",
+        "filter-status",
+        "2xx",
+        "5xx",
+    ] {
+        assert!(js.contains(needle), "mimic.js lacks {needle}");
+    }
+    for forbidden in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "Function(",
+        "http://",
+        "https://",
+    ] {
+        assert!(!js.contains(forbidden), "{forbidden}");
+    }
+}

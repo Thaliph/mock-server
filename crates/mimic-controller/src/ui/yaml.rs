@@ -29,9 +29,13 @@ fn scalar(value: &Value) -> String {
     }
 }
 
-/// JSON syntax is valid YAML: escapes keep a newline or a quote inside its string.
+/// JSON syntax is valid YAML: escapes keep a newline or a quote inside its string. YAML 1.1 also
+/// reads U+0085, U+2028 and U+2029 as line breaks, which JSON leaves raw: they are escaped too.
 fn quoted(text: &str) -> String {
-    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
+    let json = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    json.replace('\u{85}', "\\u0085")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn key(name: &str) -> String {
@@ -181,5 +185,13 @@ list:
     fn exp_01_an_empty_value_is_one_line() {
         assert_eq!(render(&json!({})), "{}\n");
         assert_eq!(render(&json!("x")), "\"x\"\n");
+    }
+
+    #[test]
+    fn exp_01_yaml_1_1_line_breaks_are_escaped_in_strings_and_keys() {
+        let out = render(&json!({"s": "a\u{85}b\u{2028}c\u{2029}d", "k\u{2028}": 1}));
+        assert_eq!(out, "\"k\\u2028\": 1\ns: \"a\\u0085b\\u2028c\\u2029d\"\n");
+        assert!(!out.contains(['\u{85}', '\u{2028}', '\u{2029}']));
+        assert_eq!(out.lines().count(), 2);
     }
 }

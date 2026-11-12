@@ -140,6 +140,55 @@ helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.3 -n
   --set valkey.existingSecret=my-valkey
 ```
 
+### Production install
+
+*Ops.* `values-production.yaml` is the reviewed overlay for a shared cluster. It ships with the chart, so it
+matches the release you install: download it with the chart, edit the placeholders, then install with it:
+
+```bash
+helm pull oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.3 --untar   # leaves mimic/values-production.yaml
+# edit mimic/values-production.yaml: the PLACEHOLDER entries below
+helm install mimic oci://ghcr.io/thaliph/charts/mimic --version 0.2.0-alpha.3 -n mimic-system --create-namespace \
+  -f mimic/values-production.yaml
+```
+
+Before the install, create the PriorityClass that the overlay names (the chart does not create it):
+
+```bash
+kubectl apply -f - <<'YAML'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata: {name: mimic-critical}
+value: 1000000
+globalDefault: false
+YAML
+```
+
+What the overlay sets, and why:
+
+| Value | Overlay | Why |
+|---|---|---|
+| `image.digest`, `inject.initImage.digest` | the digests of the release the overlay was written for | Images by digest, so a tag cannot move. A digest set in the overlay wins over the chart's own pins: when you move to a newer release, set both to that release's index digests (`docker buildx imagetools inspect ghcr.io/thaliph/mimic:<version>`). |
+| `controller.replicas` | `3` | The webhook fails closed: one pod down stalls pod creation in injected namespaces. Three pods survive a zone or node loss with one drained. |
+| `controller.topologySpreadConstraints` | zone and hostname, `maxSkew: 1`, `ScheduleAnyway` | Spreads the controllers across zones and nodes. `ScheduleAnyway` keeps a cluster with fewer zones or nodes than replicas schedulable. The selector is `app.kubernetes.io/name: mimic-controller`. |
+| `controller.priorityClassName`, `valkey.priorityClassName` | `mimic-critical` | Keeps the controller and Valkey ahead of application pods under node pressure. A pod stays Pending until the class exists. |
+| `controller.resources`, `valkey.resources`, `valkey.metrics.resources`, `inject.sidecarResources` | requests and limits, CPU limits as ceilings | Every container has requests and a memory limit (the chart's `valkey-acl` init container included). Valkey's memory request equals its `maxmemory` (75 % of the limit). |
+| `valkey.persistence.size` | `8Gi` | AOF rewrites need about twice the data. Immutable after install (see the [upgrade note](#known-issue-upgrading-a-chart-installed-from-an-earlier-main-build-293)): keep the size of an existing release. |
+| `valkey.persistence.storageClass` | PLACEHOLDER, empty | Empty uses the cluster default. Set it to a StorageClass whose reclaim policy keeps the data when a claim is deleted. |
+| `networkPolicy.webhookFrom` | PLACEHOLDER: one `ipBlock` | The source range of the API server's webhook calls (the control-plane nodes on most self-managed clusters; ask your provider on a managed one). The overlay carries a documentation range that admits no real source, so an unedited copy refuses pod creation in injected namespaces instead of admitting any source. The sidecar API port stays open to any source, because injected pods can be in any namespace (`networkPolicy.sidecarApiFrom` narrows it). |
+| `valkey.metrics.enabled` | `true` | The Valkey exporter (`redis_up`, memory, clients), read as `mimic-exporter`. Enabling it on an existing release restarts Valkey once. |
+| `metrics.serviceMonitor.enabled`, `metrics.podMonitor.enabled` | `true` | The controller, the sidecars, the load generators and Valkey are scraped by your Prometheus Operator. The CRDs `ServiceMonitor` and `PodMonitor` must exist, or the install fails with `no matches for kind`; set both to `false` otherwise. |
+| `monitoring.prometheus.enabled`, `monitoring.grafana.enabled`, `monitoring.dashboards.enabled` | `false` | The bundled Prometheus and Grafana are for a demo or a dev cluster. A production cluster uses its own stack. |
+| `loadTest.enabled` | `false` | Load tests add the CRD and admission policies. Switch them on as in [Enable load tests](#enable-load-tests). |
+| `controller.logLevel`, `inject.sidecarLogLevel` | `info` | JSON logs on stdout at `info`. |
+
+The overlay does not add privileges. `mimic-init` still needs `NET_ADMIN` and `NET_RAW` in injected pods (see the
+requirements above); the release namespace stays at Pod Security `restricted`.
+
+Two containers have no requests or limits from the chart: `mimic-init`, which the webhook adds to injected pods (the
+injection patch sets none), and the load generator `mimic-load`, whose resources come from the controller's default
+(`MIMIC_LOAD_RESOURCES`), not from a chart value. Both are known gaps of the injection and load paths, not settings of the overlay.
+
 ## Namespaces
 
 - **Release namespace** (`mimic-system` above): controller and Valkey. Never injected.
