@@ -7,7 +7,9 @@
 #   ROLE=client   A: every second, a unary pkg.Users/Get to TARGET with the message
 #                 {1: "ann", 2: $REQUEST_JWT} and the metadata authorization and x-note-bin.
 #
-# Each call writes one JSON access line to stdout (app, role, method, status), never a message or metadata.
+# Each call writes one JSON access line to stdout (app, role, method, status), never a message or metadata. A client
+# line also says whether the answer carries the placeholder `mimic-token` (`mocked`, GRP-35): the server of the e2e
+# sends a real token, which only a mock replaces by its placeholder.
 import json
 import os
 import sys
@@ -41,8 +43,11 @@ def message(number, inner):
     return varint(number << 3 | 2) + varint(len(inner)) + inner
 
 
-def log(status):
-    print(json.dumps({"app": NAME, "role": ROLE, "method": METHOD, "status": status}), flush=True)
+def log(status, mocked=None):
+    line = {"app": NAME, "role": ROLE, "method": METHOD, "status": status}
+    if mocked is not None:
+        line["mocked"] = mocked
+    print(json.dumps(line), flush=True)
 
 
 def serve():
@@ -71,8 +76,8 @@ def call():
     stub = channel.unary_unary(METHOD, request_serializer=None, response_deserializer=None)
     while True:
         try:
-            stub(request, metadata=metadata, timeout=5)
-            log("OK")
+            reply = stub(request, metadata=metadata, timeout=5)
+            log("OK", b"mimic-token" in reply)
         except grpc.RpcError as error:
             log(error.code().name)
         time.sleep(1)

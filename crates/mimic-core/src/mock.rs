@@ -111,6 +111,8 @@ pub struct Answer {
     pub(crate) headers: Vec<(Box<str>, Box<str>)>,
     pub(crate) body: Box<[u8]>,
     pub(crate) grpc: bool,
+    /// gRPC: the trailers, `grpc-status` first (spec §8, "Answer").
+    pub(crate) trailers: Vec<(Box<str>, Box<str>)>,
 }
 
 impl Answer {
@@ -125,6 +127,7 @@ impl Answer {
             + self
                 .headers
                 .iter()
+                .chain(&self.trailers)
                 .map(|(n, v)| n.len() + v.len() + 2 * std::mem::size_of::<Box<str>>())
                 .sum::<usize>()
     }

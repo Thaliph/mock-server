@@ -7,8 +7,10 @@ the sidecar mocks outbound calls from.
 
 ## What it serves
 
-`GET /v1/workloads/<deployment>/egress?format=1` on the sidecar API (the HTTPS listener of the pushes, same
+`GET /v1/workloads/<deployment>/egress?format=2` on the sidecar API (the HTTPS listener of the pushes, same
 authentication: the pod's projected token, the namespace from the token). A pod reads its own deployment only.
+`format=2` holds the gRPC messages and trailers of the samples; `format=1` leaves them out. The sidecar asks for
+`format=2` and falls back to `format=1` when the controller answers `400` (a controller up to 0.2.0-alpha.3).
 
 The answer is a **projection** of the stored outbound part, and nothing more than a mock needs:
 

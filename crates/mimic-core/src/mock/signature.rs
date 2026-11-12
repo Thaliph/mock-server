@@ -228,8 +228,6 @@ pub fn signature(redactor: &Redactor, req: &Request<'_>) -> Signature {
     {
         match &parsed.content {
             Content::Opaque => {}
-            // A gRPC message is not matched before #463 (spec §6.4).
-            Content::Json { .. } if crate::grpc::record::is_protobuf_media(&parsed.media) => {}
             Content::Json { value, .. } => {
                 fields.json(&parsed.media, value);
                 media = Some(parsed.media.clone());

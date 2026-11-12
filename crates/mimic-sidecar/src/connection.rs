@@ -918,6 +918,27 @@ async fn read_watch(upstream: Option<&mut Stream>, into: &mut [u8]) -> io::Resul
     }
 }
 
+/// Whether `bytes`, the start of what a destination wrote first, can be the header of the
+/// initial SETTINGS frame of an HTTP/2 server: a length that is a multiple of 6 up to 16384,
+/// type 4, no flag, stream 0.
+fn could_be_h2_settings(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let fits = |i: usize, ok: &dyn Fn(u8) -> bool| bytes.get(i).is_none_or(|b| ok(*b));
+    let length_ok = if bytes.len() >= 3 {
+        let length =
+            usize::from(bytes[0]) << 16 | usize::from(bytes[1]) << 8 | usize::from(bytes[2]);
+        length <= 16384 && length % 6 == 0
+    } else {
+        fits(0, &|b| b == 0) && fits(1, &|b| b <= 0x40)
+    };
+    length_ok
+        && fits(3, &|b| b == 4)
+        && fits(4, &|b| b == 0)
+        && (5..9).all(|i| fits(i, &|b| b == 0))
+}
+
 /// Reads until the protocol is known, within [`DETECT_LIMIT`] and with no timeout but the
 /// stall of an incomplete prefix. The bytes
 /// read are returned to be forwarded unchanged. A reset on either side is returned as such, to
@@ -937,11 +958,22 @@ async fn first_bytes(
             found => return First::Client(found, buf),
         }
     }
+    let mut graced = false;
     loop {
         let mut from_client = [0u8; READ_CHUNK];
         let mut from_upstream = [0u8; READ_CHUNK];
         let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
+        // The client first when both are ready: an HTTP/2 server writes its SETTINGS before
+        // the client's preface, and the client's bytes are the ones that name the protocol.
         tokio::select! {
+            biased;
+            () = &mut abort => {
+                return First::Opaque {
+                    to_upstream: buf,
+                    to_client: Vec::new(),
+                    early: Some(Early::Shutdown),
+                };
+            }
             () = stalled(!buf.is_empty(), stall) => {
                 let timeout = io::Error::new(io::ErrorKind::TimedOut, "stalled on a protocol prefix");
                 let early = Some(Early::Failed(Side::Client, timeout));
@@ -962,7 +994,43 @@ async fn first_bytes(
                     return First::Opaque { to_upstream: buf, to_client: Vec::new(), early };
                 }
             },
-            read = upstream.read(&mut from_upstream) => {
+            // The destination wrote first: a server-first protocol, tunnelled at once, unless it
+            // wrote the SETTINGS frame of an HTTP/2 server (spec §4.1), which comes before the
+            // client's preface: then the client's first bytes are waited for, as without mimic.
+            _ = upstream.readable() => {
+                if !graced {
+                    graced = true;
+                    let mut head = [0u8; 9];
+                    // A reset is an answer of its own: it reaches the client as one.
+                    let peeked = match upstream.peek(&mut head).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return First::Opaque {
+                                to_upstream: buf,
+                                to_client: Vec::new(),
+                                early: Some(Early::Failed(Side::Upstream, e)),
+                            };
+                        }
+                    };
+                    if could_be_h2_settings(&head[..peeked]) {
+                        // Bounded by the stall, and a shutdown ends the wait (spec §4.1).
+                        let waited = tokio::select! {
+                            biased;
+                            () = &mut abort => {
+                                return First::Opaque {
+                                    to_upstream: buf,
+                                    to_client: Vec::new(),
+                                    early: Some(Early::Shutdown),
+                                };
+                            }
+                            ready = tokio::time::timeout(stall, client.readable()) => ready.is_ok(),
+                        };
+                        if waited {
+                            continue;
+                        }
+                    }
+                }
+                let read = upstream.read(&mut from_upstream).await;
                 let (n, early) = match read {
                     Ok(n) => (n, None),
                     Err(e) => (0, Some(Early::Failed(Side::Upstream, e))),
@@ -973,13 +1041,39 @@ async fn first_bytes(
                     early,
                 };
             }
-            () = &mut abort => {
-                return First::Opaque {
-                    to_upstream: buf,
-                    to_client: Vec::new(),
-                    early: Some(Early::Shutdown),
-                };
-            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::could_be_h2_settings;
+
+    #[test]
+    fn grp_37_only_the_header_of_a_settings_frame_is_one() {
+        for ok in [
+            &[0, 0, 0, 4, 0, 0, 0, 0, 0][..],
+            &[0, 0, 6, 4, 0, 0, 0, 0, 0],
+            &[0, 0, 18, 4, 0, 0, 0, 0, 0],
+            &[0, 0, 18, 4, 0, 0, 0, 0, 0, 0, 3],
+            &[0],
+            &[0, 0, 6, 4],
+        ] {
+            assert!(could_be_h2_settings(ok), "{ok:?}");
+        }
+        for bad in [
+            &[][..],
+            &[0, 0, 0, 1, 0, 0, 0, 0, 0],
+            &[0, 0, 0, 4, 1, 0, 0, 0, 0],
+            &[0, 0, 0, 4, 0, 0, 0, 0, 1],
+            &[0, 0, 7, 4, 0, 0, 0, 0, 0],
+            &[0, 0x40, 6, 4, 0, 0, 0, 0, 0],
+            &[1, 0, 0, 4, 0, 0, 0, 0, 0],
+            b"220 hello\r\n",
+            b"SSH-2.0-x\r\n",
+            &[0x4a, 0, 0, 0, 0],
+        ] {
+            assert!(!could_be_h2_settings(bad), "{bad:?}");
         }
     }
 }

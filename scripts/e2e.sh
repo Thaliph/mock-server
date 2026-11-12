@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, MSH-28, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (MSH-28, CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, GRP-35, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -2544,6 +2544,38 @@ for c in "${grpc_canaries[@]}"; do
   for f in "$WORK"/grp28-grpc-a.json "$WORK"/grp28-grpc-b.json "$WORK/grp28-doc.json" "$WORK/grp28-valkey.txt" "$WORK/grp28-logs.txt"; do
     if found -F "$c" "$f"; then fail "grp_28: a canary appears in ${f##*/}"; fi
   done
+done
+
+# --- gRPC mock replay (#463, spec §8, §12.16 GRP-35) ------------------------------------------------------------------------
+# The pair of grp_28 goes on: grpc-a is switched to mock and grpc-b is scaled to 0. The sidecar of grpc-a answers the call
+# from the egress set it pulled (format 2), so the client still gets OK and the recorded message, whose token field is
+# the placeholder (the server sent a real one: only a replay shows `mimic-token`).
+log "grp_35: grpc-a in mock with grpc-b scaled to 0 still gets OK and the recorded message"
+kubectl -n grpc-28 patch mimicworkload grpc-a --type merge -p '{"spec":{"mode":"mock"}}' >/dev/null
+# grpc_mocked <since>: a line of grpc-a, after the first <since> lines, with status OK and the placeholder in the answer.
+grpc_mocked() {
+  kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=-1 2>/dev/null | jq -R -s -e --argjson n "$1" \
+    '[split("\n")[] | fromjson? | select(. != null)] | .[$n:] | map(select(.status == "OK" and .mocked == true)) | length >= 1' >/dev/null
+}
+grpc_mocked_ok=0
+for _ in $(seq 60); do
+  if grpc_mocked 0; then grpc_mocked_ok=1; break; fi
+  sleep 3
+done
+(( grpc_mocked_ok )) || fail "grp_35: grpc-a does not get the recorded message in mock within 3 minutes: $(kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=3)"
+kubectl -n grpc-28 scale deploy/grpc-b --replicas=0 >/dev/null
+kubectl -n grpc-28 wait --for=delete pod -l app=grpc-b --timeout=2m >/dev/null || fail "grp_35: the pod of grpc-b did not go away"
+grpc_seen=$(kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=-1 | grep -c '^{') || true
+sleep 8
+# Every call after the scale-down is OK and mocked: the real server is not there.
+kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=-1 | jq -R -s -e --argjson n "$grpc_seen" \
+  '[split("\n")[] | fromjson? | select(. != null)] | .[$n:] | length >= 3 and all(.status == "OK" and .mocked == true)' >/dev/null \
+  || fail "grp_35: a call of grpc-a failed or was not the recorded message with grpc-b at 0: $(kubectl -n grpc-28 logs deploy/grpc-a -c app --tail=5)"
+{
+  for p in $(kubectl -n grpc-28 get pods -o jsonpath='{.items[*].metadata.name}'); do kubectl -n grpc-28 logs "$p" --all-containers --tail=-1; done
+} > "$WORK/grp35-logs.txt"
+for c in "${grpc_canaries[@]}"; do
+  if found -F "$c" "$WORK/grp35-logs.txt"; then fail "grp_35: a canary appears in a log"; fi
 done
 
 # --- Mock mode (F10, spec §8, §12.11 MCK-19; MCK-16 on a live connection) --------------------------------------------

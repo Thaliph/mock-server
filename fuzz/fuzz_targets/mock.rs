@@ -26,6 +26,8 @@ use mimic_core::discovery::egress::EgressSet;
 use mimic_core::discovery::redact::Redactor;
 use mimic_core::discovery::report::Report;
 use mimic_core::discovery::sample::Payload;
+use mimic_core::grpc::frame::Parser;
+use mimic_core::grpc::wire::Message;
 use mimic_core::mock::{Index, MAX_DELAY_MS, Miss, Random, Request, draw, signature};
 
 const PUSH: usize = 16;
@@ -59,6 +61,14 @@ fn set_of(part: &[u8]) -> EgressSet {
     EgressSet::project(&report)
 }
 
+/// One uncompressed frame whose payload is a message (the replay of a gRPC sample, §8).
+fn is_message_frame(body: &[u8]) -> bool {
+    let pushed = Parser::new().push(body);
+    pushed.error.is_none()
+        && matches!(pushed.frames.as_slice(), [frame]
+            if !frame.compressed && Message::decode(&frame.payload).is_ok())
+}
+
 /// Every header and body value of an answer is a sample's of the authority, or fixed.
 fn check(
     set: &EgressSet,
@@ -86,12 +96,31 @@ fn check(
         if name == "content-length" || name == "x-mimic-match" {
             continue;
         }
+        // The fixed `content-type` of a gRPC answer whose sample has none (§8).
+        if name == "content-type" && value == "application/grpc" {
+            continue;
+        }
         assert!(
             samples.iter().any(|s| s
                 .response_headers()
                 .iter()
                 .any(|(n, v)| n == name && v == value)),
             "a header that no sample holds"
+        );
+    }
+    // Trailers (gRPC, #463): a sample's, or the fixed `grpc-status: 0`.
+    for (name, value) in &response.trailers {
+        if canary {
+            assert!(!value.contains(CANARY) && !name.contains(CANARY));
+        }
+        assert!(
+            (name == "grpc-status" && value == "0")
+                || samples.iter().any(|s| s
+                    .trailers()
+                    .iter()
+                    .chain(s.response_headers())
+                    .any(|(n, v)| n == name && v == value)),
+            "a trailer that no sample holds"
         );
     }
     let body = response.body();
@@ -107,6 +136,7 @@ fn check(
     assert!(
         body.is_empty()
             || body == [0u8; 5]
+            || is_message_frame(body)
             || samples.iter().any(|s| match s.response_payload() {
                 Some((_, Payload::Json(t))) => t.as_bytes() == body,
                 // The encoding is the index's: only that the bytes are a form's.
