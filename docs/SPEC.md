@@ -813,9 +813,11 @@ logic in `mimic-core` (`discovery` module).
   inbound samples may use the whole budget, as in F4.
 - **Report format, version 2.** Outbound scopes are under `scopes.outbound`, keyed by
   authority, each with its tree, gRPC paths, `origin` and `tunnels`. A report is
-  `"version": 2` if and only if it holds an outbound scope keyed by an authority, in `from_json`,
+  `"version": 2` if and only if it holds an outbound scope keyed by an authority (and no gRPC
+  message, §6.4), in `from_json`,
   the push check and serialisation alike; otherwise it is `"version": 1` and byte-identical to
-  F4/F5 (stored reports and pushes do not change). From F7 `Report::from_json` reads both and
+  F4/F5 (stored reports and pushes do not change). From F14 a report is `"version": 3` if and
+  only if a sample holds a gRPC message or trailers (§6.4), with or without outbound scopes. From F7 `Report::from_json` reads both and
   rejects a version that does not follow this rule, an inbound key that is not a port, an
   outbound key outside the grammar above (so an outbound scope keyed by a port is no valid
   report), `origin` or `tunnels` on an inbound scope, an `origin` with more than 16 `sni` or
@@ -825,7 +827,8 @@ logic in `mimic-core` (`discovery` module).
 - **Outbound exchange counter (F8).** A report has one `exchanges` counter for both
   directions. A version 2 report also carries `outbound_exchanges`, the exchanges of its
   outbound scopes (at most `exchanges`), so that the split of §7.3 is exact; it is present if
-  and only if the report is version 2, so a version 1 report stays byte-identical to F4/F5. The
+  and only if the report holds an outbound scope (version 2, or 3 with one), so a version 1
+  report stays byte-identical to F4/F5. The
   recorder counts it for each recorded outbound exchange (a tunnel is no exchange), the merge
   adds it (saturating), and the structural check rejects a version 1 report that carries a
   non-zero one and a version 2 report whose counter exceeds `exchanges` (`malformed`). An
@@ -917,6 +920,40 @@ length or hash of what it replaces.
   (`WireError::TooDeep`, `TooManyFields`), never a partial result and never a `null`.
   Redaction is idempotent and deterministic, and its output does not depend on the length or
   bytes of a secret.
+
+### 6.4 gRPC recording (F14, #461)
+
+For an exchange whose `content-type` is `application/grpc` or `application/grpc+proto` (other
+`application/grpc*` media, such as `grpc-web` or `+json`, stay opaque), inbound and outbound,
+the recorder keeps the first message of each side:
+
+- **Read** (`mimic_core::grpc::record::first_message`): the first frame of the captured body,
+  inflated per `grpc-encoding` (§6.2), then the wire reader. The result of
+  `mimic_discovery_bodies_total` is `parsed`, `too_large` (a frame or an inflated payload over
+  256 KiB, or a payload over the wire bounds of §6.2), `encoding` (a compressed frame whose
+  `grpc-encoding` is not `gzip`) or `opaque` (a bad flag, a truncated first frame, a payload
+  that is not a message); `empty`, `budget` and `absent` are the capture's. A stream is
+  recorded by its first message until it gets a step of its own (#464); a trailing partial
+  frame is ignored.
+- **Redact** (§6.3, `GrpcRedactor::message` with the rules and names known: none before
+  reflection and per-field rules) the message **before** it is kept; metadata is redacted with
+  `GrpcRedactor::metadata` for request and response headers and for the trailers. No frame, no
+  payload byte and no length of what was read is kept: the sample holds the canonical JSON of
+  §6.2 of the redacted message, as the `body` of the side with the media type of the
+  `content-type`, and its schema and examples follow §6 (keys are field numbers).
+- **Trailers** (HTTP/2): the response trailers are a sample field `response.trailers`, a list
+  of `[name, value]` in order, redacted as metadata, at most 64 pairs (the first 64 are kept;
+  captured within 16 KiB, the capture budget applies); written only when not empty. `grpc-status`
+  and `grpc-message` of a trailers-only response are in `response.headers`, as for any
+  response.
+- **Version 3.** A sample with trailers or a body of a gRPC media type makes the report
+  `"version": 3` (§6.1). Nothing else changes in a report: a report without such a sample is
+  byte-identical to F13. A sidecar that cannot post version 3 (a controller up to F13 answers
+  `400`) posts the report again without the gRPC parts of its samples, as version 1 or 2
+  (§7.2).
+- **Mock and load**: the message of a sample is not replayed before #463: a mock still answers a
+  gRPC call with an empty message (§8), `request_payload` and `response_payload` of a sample
+  hold no gRPC body, and the load plan skips `grpc` endpoints (§7.8).
 
 ## 7. Controller and storage
 
@@ -1115,7 +1152,8 @@ length or hash of what it replaces.
 - `POST /v1/workloads/<deployment>/report` (F5): the discovery push of §6 "Shipping". Headers
   `Authorization`, `Content-Type: application/json` and `Content-Length` (required); body
   `{"session": "<32 lower-case hex>", "sequence": <1 … 2^53>, "report": <§6 report>}` (from F8
-  version 1 or 2, §6.1; a controller up to F7 accepts version 1 only). The
+  version 1 or 2, §6.1, from F14 also 3, §6.4; a controller up to F7 accepts version 1 only,
+  up to F13 versions 1 and 2). The
   deployment is in the path, so it is authorised before the body is read. → `200`
   `{"applied": true}` once the push is merged into the deployment's store (§7.3), or
   `{"applied": false}` when this pod and session already had this or a later sequence
@@ -1137,8 +1175,8 @@ length or hash of what it replaces.
   From #339 a parsed report costs at most 1.6 times its JSON (SHR-22) and a write holds one
   parsed report, so two such pushes fit in memory at once (SHR-23); the default budget is
   unchanged.
-- `GET /v1/workloads/<deployment>/egress?format=1` (F9): the deployment's egress set, with
-  `ETag` and `304`, under the memory bounds of §7.7. It shares the admission, authentication
+- `GET /v1/workloads/<deployment>/egress?format=1` (F9), `format=2` (F14): the deployment's
+  egress set, with `ETag` and `304`, under the memory bounds of §7.7. It shares the admission, authentication
   and `TokenReview` limits above; it has no body.
 - **Shipping client** (sidecar, F5). Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (the first one after
   a random delay within one interval, so that the pods of a rollout do not push together),
@@ -1190,6 +1228,13 @@ length or hash of what it replaces.
   it is written even in a streak that has already written its own. The flush at `SIGTERM`
   applies the fallback too (within its deadline), posts the remaining inbound part and does not
   try version 2 again.
+  **Fallback from version 3** (F14). A `400` to a pending report of version 3 (a controller up
+  to F13) makes the sidecar post, with the same session and sequence, the same report without
+  the gRPC parts of its samples (`Report::without_grpc`: no `trailers`, no gRPC body; the
+  version is then 1 or 2 by §6.1; any `400` triggers it, the cause is not told), which follows the rules above, `outbound` fallback included;
+  counted `grpc_dropped` in `mimic_discovery_pushes_total`, one WARN `grpc not shipped`
+  (`status`) per process. The unknown-outcome rule of the outbound fallback applies to it alike
+  (the gRPC parts are then lost, not merged back). The next freeze tries version 3 again.
   *Rollout order*: the chart upgrades the controller; a sidecar changes only when its pod is
   recreated (the webhook sets the image at admission), so F8 sidecars meet F8 controllers in the
   normal order, and the fallback covers the window where both versions answer, and rollbacks.
@@ -1229,6 +1274,7 @@ length or hash of what it replaces.
   |---|---|---|---|
   | `mimic:v1:{<ns>/<dep>}:report` | string | merged report: canonical §6 JSON, `pod` null, with `last_seen`; from F8 its inbound part only, always `"version": 1` | `MIMIC_STORE_TTL` after the last applied push |
   | `mimic:v1:{<ns>/<dep>}:outbound` | string | (F8) merged outbound part: canonical §6.1 JSON, `"version": 2`, outbound scopes only, `pod` null, with `last_seen`; absent while the deployment has no outbound scope | same |
+  | `mimic:v1:{<ns>/<dep>}:grpc` | string | (F14) the gRPC overlay: `{"version": 1, "scopes": {"<direction>": {"<scope>": {"<path>": {"<method>": {"<hash>": <§6 sample>}}}}}}`, the full samples (with message and trailers) of the gRPC endpoints, which `:report` and `:outbound` hold without their gRPC parts; absent while no sample holds one. `:meta` `grpc_digest` is the hex SHA-256 of its bytes (absent with it) | same |
   | `mimic:v1:{<ns>/<dep>}:meta` | hash | `version` (write counter), `updated` (ms of the last applied push), `exchanges`, `endpoints_inbound`, `endpoints_outbound`, `sample_bytes`, `report_bytes` (from F8 of `:report` and `:outbound` together), from F9 `outbound_digest` (`<version>:<hex SHA-256 of :outbound>`, §7.7) | same |
   | `mimic:v1:{<ns>/<dep>}:pods` | hash | field `<pod>` → ms of its last push (applied or not) | each field min(24 h, `MIMIC_STORE_TTL`) after its last write |
   | `mimic:v1:{<ns>/<dep>}:seq` | hash | field `<pod>/<session>` → last applied sequence | same as `:pods` fields |
@@ -1243,14 +1289,17 @@ length or hash of what it replaces.
 - **Push processing**: structural check of the posted report, then re-redaction, then
   stamping, then the write. Nothing of a push is stored or logged before its re-redaction.
   - *Structural check* (pure, `mimic-core`): `"version": 1` (from F8, the version rule of §6.1:
-    1 without an outbound scope, 2 with one; reason `version`) and every bound of §6 — at most
+    1 without an outbound scope, 2 with one; from F14 3 when a sample holds a gRPC message or
+    trailers, §6.4, in a push only: the stored parts never are; reason `version`) and every bound of §6 — at most
     `MIMIC_STORE_MAX_PUSH_ENDPOINTS` endpoints per direction (else `507`, reason
     `push_limit`, so that one pod cannot fill the store in one push), 20 samples and 16 hosts (each at most
     1024 bytes) per endpoint, statuses 100–599, histogram buckets within the §6 range, at most
     512 nodes, 16 levels and a cut level of at most 16 per schema, names of at most 128
     bytes, at most 64 query keys and 64 headers, 128 volatile fields and 32 hashes per
     sketch, paths and templates of at most 2048 bytes and 32 segments, 16 media types per
-    side, sample bodies only for parsed media types and of at most 256 KiB, no unknown field.
+    side, sample bodies only for parsed media types (from F14 `application/grpc` and
+    `application/grpc+proto`) and of at most 256 KiB, at most 64 `trailers` per sample, no unknown
+    field.
     A template's length counts each literal segment's bytes plus its `/`, and a parameter as
     its `/` alone (the rendered `{name}` can be longer than the raw path); the `{}` that marks
     a schema's cut level is not a level.
@@ -1283,7 +1332,10 @@ length or hash of what it replaces.
     becomes the legacy marker (`<redacted>:<port>`; scopes that become equal merge, trees, `origin` and
     `tunnels` included, as path keys do), and an `origin.sni` value that a detector catches is
     removed (the sidecar never records one). A sidecar of an older version, or a faulty one,
-    cannot put a value into Valkey that the controller's rules redact. From F13 re-redaction
+    cannot put a value into Valkey that the controller's rules redact. From F14 a sample's gRPC body is read back as a message and redacted by §6.3
+    again (a body that is not a message is replaced by `mimic-secret`), and its trailers as
+    metadata, and every `-bin` header value, whatever the `content-type` of the request (a
+    sample with trailers and a request that is not gRPC is redacted the same way), so a faulty sidecar cannot store a value that §6.3 replaces. From F13 re-redaction
     starts with the placeholder upgrade of §6, so a push of an F12 sidecar is stored with
     placeholders; no value detector catches a placeholder and a name rule gives the same one
     again, so re-redaction stays idempotent.
@@ -1329,7 +1381,7 @@ length or hash of what it replaces.
     the write starts again (at most 5 attempts, 10–100 ms random backoff, then `503`). So a
     push is applied once, whichever replica receives it and however often it is retried
     (within the `:seq` field expiry, §11.1). A stored value that does not parse or fails the
-    structural check (a `:report` that is not version 1 or an `:outbound` that holds an inbound
+    structural check (a `:report` that holds an outbound scope or an `:outbound` that holds an inbound
     scope included) is never overwritten: ERROR `stored report unreadable` (`namespace`,
     `deployment`, from F8 `key`: `report` or `outbound`), push `503`, read `500`. Keeping
     the outbound part in its own key leaves `:report` readable by a controller up to F7: a
@@ -1397,7 +1449,20 @@ length or hash of what it replaces.
   exchanges stay counted on the outbound side and never turn into inbound ones, as long as
   one outbound scope remains. When the last one goes, the report drops to version 1 and its
   outbound exchanges leave with it (§6.1), so none is counted as inbound. The inbound part
-  never carries the counter (it is version 1); the union of the parts adds them back.
+  never carries the counter (it holds no outbound scope); the union of the parts adds them back.
+  From F14 `:report` and `:outbound` stay in the formats of F13 (version 1 and 2): a sample that
+  holds a gRPC message or trailers is stored there without them (`Report::split_grpc`: the
+  sample as `without_grpc` makes it), and in full in `:grpc`, which a controller up to F13 never
+  reads, so a mixed set of controller replicas during a rolling upgrade, and a rollback, keep
+  serving every workload (a rollback loses the gRPC data only). Every write reads `:grpc`
+  with the parts, applies it (`Report::apply_grpc`: each full sample replaces the sample that
+  `without_grpc` makes of it; an endpoint that is gone drops its entry), merges the push, and
+  splits again, so `:grpc` obeys the same bounds, sample budget, expiry, `MIMIC_STORE_TTL` and
+  re-redaction as the parts and is written, renamed into place and expired with them by the
+  same script. A write by a controller up to F13 leaves `:grpc` as it was (stale samples stay
+  until the keys expire). The reads of §7.5 (report, documents, endpoint list, load plan) and
+  the egress set of format 2 (§7.7) apply it; format 1 never does. An unreadable `:grpc` is
+  `stored report unreadable` (`key` `grpc`) like the parts.
 - **Pod churn**: no pod is read. A deleted pod's data stays merged (the deployment's API is
   the union over its life) and it ships its last report at `SIGTERM`; the pods of a rolling
   update push into the same key; a deleted pod's `:pods` and `:seq` fields expire after
@@ -1487,7 +1552,7 @@ length or hash of what it replaces.
   - `GET /v1/workloads/<ns>/<dep>` → the same object plus `"pods": {"<pod>": "<last push,
     RFC 3339>"}`;
   - `GET /v1/workloads/<ns>/<dep>/report` → the stored `:report` bytes; from F8, when
-    `:outbound` exists, the canonical serialisation of the union of both (`"version": 2`,
+    `:outbound` exists, the canonical serialisation of the union of both (`"version": 2`, or 3,
     rendered like the routes below), so the route always answers the deployment's whole
     merged report;
   - `GET /v1/workloads/<ns>/<dep>/endpoints` (F6) → `{"endpoints": [{"direction", "port",
@@ -1709,7 +1774,11 @@ written into a `description`, `summary` or `title` (Swagger UI renders those as 
     `x-mimic-last-seen` (`YYYY-MM-DD`, when stamped); `x-mimic-volatile` and
     `x-mimic-redacted`, the sorted §6 field names of the endpoint that are volatile and
     redacted; `x-mimic-grpc: true` and `tags: ["<package.Service>"]` (the first path segment)
-    for a gRPC path. No `operationId` (it would need disambiguation and nothing uses it).
+    for a gRPC path. From F14 the samples of a gRPC operation show their message: the
+    `requestBody` and the responses have a `content` entry `application/grpc` (or
+    `application/grpc+proto`) with the §6 schema of the decoded message (properties named by
+    field number, `{"$bytes": …}` and the other `$` forms as objects) and the samples' messages
+    as examples; the sample's trailers are not in the document. No `operationId` (it would need disambiguation and nothing uses it).
 - **Bounds.** The document is a function of a report that passed the §7.3 check, so its size
   is bounded by the store limits (at most 20 samples per endpoint, `MIMIC_STORE_SAMPLE_BUDGET`
   of sample bytes per deployment).
@@ -1724,7 +1793,7 @@ held, measured and summarised, never used to answer a request.
   is what a mock needs and nothing else:
 
   ```json
-  {"format": 1, "authorities": {"<authority>": {"endpoints": [
+  {"format": 2, "authorities": {"<authority>": {"endpoints": [
     {"method": "GET", "template": "/users/{users_id}", "grpc": false,
      "statuses": {"200": 12}, "latency": <§6 histogram>,
      "volatile": ["<field>"], "redacted": ["<field>"], "samples": [<§6 sample>]}]}}}
@@ -1738,20 +1807,28 @@ held, measured and summarised, never used to answer a request.
   no hash of a value. It is canonical JSON (sorted keys, `BTreeMap`) and a pure function of the
   outbound part, so equal `:outbound` bytes give byte-identical projections.
   `EgressSet::from_json` reads it back with `deny_unknown_fields` and checks, each failure with
-  its `reason`: `format` 1 (`format`); authorities of the §6.1 grammar (`authority`); at most
+  its `reason`: `format` 1 or 2 (`format`); authorities of the §6.1 grammar (`authority`); at most
   10 000 authorities and 10 000 endpoints in all (`limit`); per endpoint the §7.3 bounds that
   apply: templates of at most 2048 bytes and 32 segments, statuses 100–599, the §6 histogram
   range, at most 20 samples each passing the sample check of §7.3, at most 128 names in
   `volatile` and `redacted` together, each at most 128 bytes (`malformed`). A new format gets a
   new number; a controller keeps serving every format that a released sidecar asks for.
+  **Format 2** (F14) is format 1 plus the gRPC parts of the samples (§6.4: `response.trailers`
+  and bodies of `application/grpc` media); **format 1**, which the sidecars up to F13 ask for,
+  is the same projection with those parts left out of every sample (`Sample::without_grpc`: sizes and
+  keys recomputed, so that it passes the check of a released sidecar), and a format 1 set that
+  holds one is `malformed`. `EgressSet::project` writes format 2, `project_as(report, 1)` format 1.
 - **Digest** (store change, §7.3). Every write sets the `:meta` field `outbound_digest` to
   `<version>:<hex SHA-256 of the :outbound bytes written>` (of the empty string when there is no
   `:outbound`), `<version>` being the `version` the same script writes. A digest whose
   `<version>` differs from `:meta` `version`, or an absent one, was left by a controller up to
   F8 (which writes `:outbound` without it) and is *stale*: no `304` is possible, and the pull
   goes through a build (below), which hashes the `:outbound` bytes it reads under the same
-  body-budget share. The `ETag` of an answer is `"<format>-<hex digest>"`. The digest decides: a corruption of `:outbound` under an unchanged digest is not detected, neither for a `304` nor for a cached projection.
-- **Route**: `GET /v1/workloads/<deployment>/egress?format=1` on the sidecar API (§7.2), with
+  body-budget share. The `ETag` of an answer is `"<format>-<hex digest>"`, so the two formats never share a `304`. The digest of format 2 is the SHA-256 of
+  `<outbound hex>:<grpc hex>` when `:grpc` exists (the `:meta` `grpc_digest`), else the outbound
+  hex; format 1 stays the outbound hex. The cache keeps one entry per format and deployment, so
+  a workload pulled in both formats holds two (the budget evicts the least recently served). The digest decides: a corruption of `:outbound` under an unchanged digest is not detected, neither for a `304` nor for a cached projection.
+- **Route**: `GET /v1/workloads/<deployment>/egress?format=1|2` on the sidecar API (§7.2), with
   the admission, authentication and authorisation of §7.2 (deployment in the path, namespace
   from the token: a pod reads its own deployment only); there is no body to read. The
   controller then reads `:meta` `version` and `outbound_digest`:
@@ -1763,7 +1840,7 @@ held, measured and summarised, never used to answer a request.
     serialisation, on a blocking thread; the cache key and the `ETag` come from the bytes
     actually read, so a write between the two reads only makes the answer newer;
   - `200` `application/json`, `ETag`, `Cache-Control: no-store`, the projection. A deployment
-    without data or without `:outbound` answers `200` `{"authorities": {}, "format": 1}` (not
+    without data or without `:outbound` answers `200` `{"authorities": {}, "format": <asked>}` (not
     `404`: the sidecar needs no special case).
   - (F10) every `200` and `304` carries the deployment's effective mode (§7) from the
     controller's `MimicWorkload` cache, read when the answer is written: `Mimic-Mode:
@@ -1799,7 +1876,9 @@ held, measured and summarised, never used to answer a request.
   the least recently served cached projections that are not being sent are dropped; if it
   still does not fit, the pull gets `503`. A cached projection is dropped when a newer digest of
   its deployment is cached.
-- **Pull client** (sidecar). With `MIMIC_CONTROLLER_URL` set the sidecar pulls every
+- **Pull client** (sidecar). Up to #463 (the mock replays no gRPC message) the sidecar asks
+  `format=1`: it has no use for the gRPC parts of format 2, which the controller serves to
+  whoever asks (`format=2`). With `MIMIC_CONTROLLER_URL` set the sidecar pulls every
   `MIMIC_EGRESS_PULL_INTERVAL` in every mode, the first time after a random delay within one
   interval up to F9 and, from F10, at once at start (so that a pod learns its mode and gets a
   snapshot before its app sends much traffic); without it nothing is pulled (one INFO `egress pull disabled` at start). Each
@@ -2235,7 +2314,7 @@ random numbers it hands to the draw.
   (§7.7), so a set served by an F12 controller is answered with placeholders too, never with
   `<redacted>`. No Secret overrides a mock answer (§11.1). **gRPC**: status 200, the sample's headers (`content-type`
   kept), one message of length zero (5 bytes `00 00 00 00 00`, the default value of any
-  message), then trailers `grpc-status: 0`; recorded messages are opaque and not kept (§6), so
+  message), then trailers `grpc-status: 0`; recorded messages are kept decoded (§6.4) but not replayed before #463, so
   a gRPC mock always succeeds with an empty message.
 - **Latency.** Drawn from the endpoint's recorded histogram (§6), never from the sample: a
   bucket with probability count / total, then a whole number of milliseconds uniformly within
@@ -2329,7 +2408,7 @@ random numbers it hands to the draw.
   | `mimic_discovery_sample_bytes` | gauge (F4), bytes held by samples; after a freeze those of the pending and the current report together; from F7 the outbound part included | — |
   | `mimic_discovery_authorities` | gauge (F7), outbound scopes held (§6.1) | — |
   | `mimic_discovery_tunnels_total` | counter (F7), outbound connections without plaintext HTTP (§6.1) | `kind` (`tcp`, `connect`, `tls_excluded`, `tls_no_ca`, `tls_unsupported`, `tls_upstream_untrusted`, `tls_client_cert_requested`, `tls_client_rejected`), `result` (`recorded`, `authority_limit`, `dropped`) |
-  | `mimic_discovery_pushes_total` | counter (F5), settled or failed push attempts (§7.2) | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`, from F8 `inbound_only`: a version 2 report answered `400` or `507`, followed by the fallback of §7.2) |
+  | `mimic_discovery_pushes_total` | counter (F5), settled or failed push attempts (§7.2) | `result` (`ok`, `duplicate`, `too_large`, `rejected`, `error`, from F8 `inbound_only`: a version 2 report answered `400` or `507`, followed by the fallback of §7.2, from F14 `grpc_dropped`: a version 3 report answered `400`, posted again without its gRPC parts) |
   | `mimic_discovery_outbound_dropped_total` | counter (F8), outbound parts dropped by the inbound-only fallback after an attempt with an unknown outcome (§7.2) | — |
   | `mimic_discovery_last_push_timestamp_seconds` | gauge (F5), time of the last acknowledged push, 0 before | — |
   | `mimic_egress_pulls_total` | counter (F9, sidecar), egress pull attempts (§7.7) | `result` (`ok`, `not_modified`, `too_large`, `invalid`, `unsupported`, `error`) |
@@ -3748,7 +3827,7 @@ route in place.
 | ID | Criterion |
 |---|---|
 | PUL-01 | **U.** Projection (§7.7), for reports with inbound and outbound exchanges and tunnels built by the recorder and the bounded merge (`proptest`, ≥ 10 000 cases): one authority per outbound scope that holds an endpoint, tunnel-only scopes and the inbound part absent (the projection of the union equals that of its `:outbound` part); per endpoint `method`, `template`, `grpc`, `statuses` and `latency` equal to the report's, `samples` equal to the report's without `last_seen`, in report order, `volatile` and `redacted` equal to the `x-mimic-volatile` and `x-mimic-redacted` of the same endpoint's §7.6 document; no key `schema`, sketch, `origin`, `tunnels`, `hosts`, `last_seen` or `pod` at any depth; byte-identical output for equal input; a report without outbound scope gives `{"authorities":{},"format":1}`; `EgressSet::from_json` accepts every projection and serialises it back byte-identically. |
-| PUL-02 | **U.** Egress set check (§7.7) refuses, each with its `reason`: `format` 0, 2 or absent (`format`); an authority `A.example:80`, `a.example:080` or `a.example` (`authority`); 10 001 authorities, 10 001 endpoints in all (`limit`); a template of 2049 bytes or 33 segments, a status 99 or 600, a histogram bucket outside the §6 range, 21 samples, a sample whose `bytes` is not its serialised size, 129 field names, a field name of 129 bytes, an unknown field at any level, a body that is not JSON (`malformed`). |
+| PUL-02 | **U.** Egress set check (§7.7) refuses, each with its `reason`: `format` 0, 3 or absent (`format`); an authority `A.example:80`, `a.example:080` or `a.example` (`authority`); 10 001 authorities, 10 001 endpoints in all (`limit`); a template of 2049 bytes or 33 segments, a status 99 or 600, a histogram bucket outside the §6 range, 21 samples, a sample whose `bytes` is not its serialised size, 129 field names, a field name of 129 bytes, an unknown field at any level, a body that is not JSON (`malformed`). |
 | PUL-03 | **U.** No leak in the projection: reports that held a canary at a random place (the SHR-02 generator, inbound and outbound) re-redacted by §7.3 then projected contain neither the canary nor its XXH3 hash in decimal or hex, and no hash of any volatility sketch of the source report (`proptest`, ≥ 10 000 cases). |
 | PUL-04 | **U.** Digest and `ETag` (§7.7): the digest of version `v` and bytes `b` is `v:<hex SHA-256 of b>` (of the empty string without `:outbound`); the `ETag` is `"1-<hex>"`; a digest field that is absent, malformed or written for another `version` is stale; `If-None-Match` matches when one entry of its list equals the `ETag` exactly (`W/"…"` and `*` do not match). |
 | PUL-05 | **U.** Local view (§7.7): the summary is a function of the snapshot, its `ETag`, the `pulled` time and (from F10) the mode and latency factor; it lists every authority and endpoint with `method`, `template`, `grpc`, `exchanges` (the sum of `statuses`) and `statuses`, sorted keys, byte-identical for equal inputs (snapshot, `ETag`, `pulled`, mode and factor); it holds no sample, no field name and none of the PUL-03 canaries; without snapshot in discovery with factor 1 it is `{"authorities":{},"etag":null,"latency_factor":1,"mode":"discovery","pulled":null}` (amended by F10: up to F9 it was `{"authorities":{},"etag":null,"pulled":null}`). |
@@ -3760,7 +3839,7 @@ route in place.
 | PUL-11 | **I.** Controller configuration: `MIMIC_SIDECAR_API_MAX_EGRESS` at `0`, `63Ki`, `2Gi` or `abc`, and `MIMIC_SIDECAR_API_EGRESS_BUDGET` below `MIMIC_SIDECAR_API_MAX_EGRESS` or over `4Gi`, exit 2 before listening (FND-01); unset, they are `4Mi` and `32Mi`. |
 | PUL-12 | **I.** Controller memory: the SHR-18 scenario with default settings plus, during the two pushes, 32 concurrent pulls of each deployment at a new digest (each pull builds; a projection over `MIMIC_SIDECAR_API_MAX_EGRESS` is built, then refused), keeps the controller's peak RSS (`VmHWM`) under 672 MiB (96 MiB of headroom under the chart's 768 Mi limit); every pull gets `200`, `503` or `507`. The bound is 640 MiB (SHR-18) plus the 32 MiB egress budget: builds add nothing beyond the body budget SHR-18 already measures, since their share counts the stored bytes and the output buffer (`MIMIC_SIDECAR_API_MAX_EGRESS`) and displaces pushes. If it is missed, step 4 reports the measurement on #242 rather than raising the bound. |
 | PUL-13 | **I.** Pull client (§7.7), against the fake sidecar API with `MIMIC_EGRESS_PULL_INTERVAL=2s`: the first `GET /v1/workloads/<MIMIC_WORKLOAD>/egress?format=1` arrives within one interval of start, without `If-None-Match`, with the token the file holds at that moment (the file changes between two pulls and the next pull carries the new one); later pulls come once per interval with the `ETag` held; `304` keeps the snapshot and moves `pulled`; a new `200` replaces it; an empty set empties it; `/egress`, `mimic_egress_endpoints`, `mimic_egress_bytes`, `mimic_egress_last_pull_timestamp_seconds` and `mimic_egress_pulls_total{result="ok"|"not_modified"}` follow. |
-| PUL-14 | **I.** Pull failures keep the snapshot held (§7.7): `503`, a reset, an answer delayed past 30 s, `401`, `403` and `429` are `error` and retried after 1, 2, 4 … s (`Retry-After: 3` waits at least 3 s, `Retry-After: 900` waits 300 s); one WARN `egress pull failed` per streak and one INFO `egress pull recovered`; `404` and `405` are `unsupported` and the next pull comes one interval later, not sooner; a 1 GiB body is `too_large` and the sidecar stops reading at `MIMIC_EGRESS_MAX_BYTES` (its RSS grows by less than twice the cap); a body with `format` 2, one that is not JSON, and one with 21 samples in an endpoint are `invalid` with one WARN `egress rejected` carrying the PUL-02 `reason`; `507` is `too_large`. No line holds the token or snapshot content. |
+| PUL-14 | **I.** Pull failures keep the snapshot held (§7.7): `503`, a reset, an answer delayed past 30 s, `401`, `403` and `429` are `error` and retried after 1, 2, 4 … s (`Retry-After: 3` waits at least 3 s, `Retry-After: 900` waits 300 s); one WARN `egress pull failed` per streak and one INFO `egress pull recovered`; `404` and `405` are `unsupported` and the next pull comes one interval later, not sooner; a 1 GiB body is `too_large` and the sidecar stops reading at `MIMIC_EGRESS_MAX_BYTES` (its RSS grows by less than twice the cap); a body with `format` 3, one that is not JSON, and one with 21 samples in an endpoint are `invalid` with one WARN `egress rejected` carrying the PUL-02 `reason`; `507` is `too_large`. No line holds the token or snapshot content. |
 | PUL-15 | **I.** F9 changes no traffic: with a snapshot holding the authority and endpoint the app calls, the outbound calls still reach the destination and the app gets its answers unchanged (no `x-mimic-match` header); access lines, `/discovery` and the pushed reports are the same as with an empty snapshot (timings aside). Without `MIMIC_CONTROLLER_URL` nothing is pulled and one INFO `egress pull disabled` is written. At `SIGTERM` no pull starts after the signal, and a pull in flight to a silent fake does not delay the exit beyond the FND-05 bound. |
 | PUL-16 | **I.** `/egress` on the sidecar admin port: a non-loopback peer gets `403`; a loopback peer gets the PUL-05 summary of the snapshot held and (from F10) of the current mode and latency factor; with a snapshot whose samples hold canaries, no canary is in `/egress`, the sidecar's stdout or `/metrics`. |
 | PUL-17 | **I.** Sidecar configuration: `MIMIC_EGRESS_PULL_INTERVAL` at `0s`, `2h` or `abc`, and `MIMIC_EGRESS_MAX_BYTES` at `63Ki`, `2Gi` or `abc`, exit 2 before listening (FND-01); unset, they are `60s` and `4Mi`. |
@@ -3962,6 +4041,18 @@ Levels as in §12.2, plus **F**, a fuzz target run by CI. Criteria `GRP-xx`; the
 | GRP-16 | **U.** Field names (§6.3): with the name `password` known for field 2, `token` for 3.1 and `note` for 4, a string, a varint, a bytes value and a nested message under 2 give `mimic-password`, 3.1 gives `mimic-token` and 4 is kept; without names nothing is redacted by name. |
 | GRP-17 | **U.** Bounds and errors (§6.3): a hand-built message nested 33 levels (and 10 000 levels, with no stack overflow in the redaction) is `Err(TooDeep)` and 32 levels is accepted; one with 4097 fields is `Err(TooManyFields)`; redacting twice gives the first result; two secrets of different length give byte-identical output; the result encodes; no input panics (property, random messages). |
 | GRP-18 | **F.** The `grpc` fuzz target also redacts every payload that decodes, with a canary-free rule set and a small non-empty set of field names: no panic, the redacted message is a fixed point of redaction, encodes within `MAX_PAYLOAD` and decodes again. |
+| GRP-19 | **U.** First message (§6.4, `grpc::record::first_message`): one identity frame, a gzip frame and a body of three frames give the first message; a trailing partial frame is ignored; a compressed frame under `grpc-encoding` `br` or `zstd` is `Encoding`; a frame announcing 256 KiB + 1, a gzip payload inflating past 256 KiB and a payload of 4097 fields are `TooLarge`; a flag of 2, a first frame cut short, an empty body and a payload that is not a message (`0xff`) are `Opaque`; no input panics (property). |
+| GRP-20 | **U.** Sample (§6.4), an inbound and an outbound gRPC exchange built by the recorder: the request and the response body are `application/grpc` JSON of the redacted message (a JWT, a `ghp_` token and a 32-byte random bytes field of the canary message give `mimic-jwt`, `mimic-token`, `mimic-secret`), `response.trailers` holds `grpc-status`, `grpc-message`, a neutral name and `x-trace-bin` as `mimic-secret`, a `-bin` request header is redacted, `authorization` is `Bearer mimic-token`; the serialised report holds no canary, no base64 of a frame and no length prefix; `grpc-encoding: gzip` messages read alike; `application/grpc+json`, `application/grpc-web` and a message that is not protobuf leave the body out; a non-gRPC sample serialises byte for byte as before (no `trailers`). |
+| GRP-21 | **U.** Version (§6.1, §6.4): a report with a gRPC sample is `"version": 3` (with `outbound_exchanges` only when it holds an outbound scope), also after a merge with a version 1 or 2 report in either order and after the gRPC sample is evicted (it drops back to 1 or 2, byte-identical to the same report without it); `from_json` and the push check refuse a version that does not follow the rule (`version`); a report without gRPC sample is byte-identical to F13; the parts of `split` are version 1 or 3 (inbound) and 2 or 3 (outbound) and `join` gives the report back; `without_grpc` of a version 3 report is the same report without the gRPC parts, version 1 or 2, holds no `trailers` and no body of a gRPC media type, and passes the structural check. |
+| GRP-22 | **U.** Check and re-redaction (§7.3): a sample with 65 trailers (`malformed`), a gRPC body over 256 KiB (`body_size`) and a gRPC body of a media type other than the two (`body_media`) are refused; a pushed sample whose message holds a JWT string, a `ghp_` token and a 32-byte high-entropy bytes field, and, as raw values, a trailer `x-trace-bin`, a trailer `x-token` holding a JWT and a `-bin` request header, also on a sample whose request is JSON (not gRPC), are stored with their placeholders, and one whose gRPC body is not a message is stored as `mimic-secret`; re-redaction is idempotent and a sample that becomes equal to another merges with it. |
+| GRP-23 | **U.** Egress formats (§7.7): `project(report)` is format 2 and holds the trailers and gRPC bodies; `project_as(report, 1)` holds neither, its samples serialise exactly as the samples of a report without gRPC parts would (no `trailers`, no gRPC body, recomputed `bytes`), and it reads back with `from_json` byte for byte; `from_json` reads formats 1 and 2 and refuses 0 and 3 (`format`) and a format 1 set with trailers or a gRPC body (`malformed`); the `ETag`s of the two formats of one digest differ; both are canonical (equal reports give equal bytes). |
+| GRP-24 | **I** (controller, real Valkey). A push of version 3 is `200`; one of version 1 and 2 (F13 form, also with outbound scopes) is `200` and stored as before; `:grpc` holds the redacted messages and trailers and no raw payload byte, `:report` and `:outbound` hold none of them (version 1 and 2), and a message edited after its sample was sized is refused (`sample_bytes`); the report and document routes answer them; `GET egress?format=2` answers the set of format 2 and `?format=1` the one of format 1 (what a sidecar up to F13 reads), each with its own `ETag`, `304` on its own and not on the other's; `format=3` and `format=0` are `400` (`format`); the cache does not serve one format for the other. |
+| GRP-25 | **I** (sidecar, a real `h2c` gRPC server). Through the inbound listener a unary call with a request message, response message and trailers is relayed unchanged (bytes, trailers and `grpc-status` as the server sent them); the next push is version 3 and holds the redacted request and response messages and the trailers, and no canary; `mimic_discovery_bodies_total{part,result="parsed"}` counts both messages, `grpc-web` is `opaque` and an oversize request message `too_large` (`encoding` is GRP-19's); a controller of F13 (fake: `400` to version 3, accepts 1 and 2) gets the same report again without the gRPC parts, `mimic_discovery_pushes_total{result="grpc_dropped"}` is 1 and WARN `grpc not shipped` is written once; outbound alike (GRP-20). |
+| GRP-26 | **U.** OpenAPI (§7.6): a gRPC operation with message samples has `requestBody.content["application/grpc"]` with a schema whose properties are field numbers and the sample message as example, and the same under its `200` response; the document holds no trailer and no canary; a report without gRPC samples gives the same document as before. |
+| GRP-27 | **U.** Mock and load (§6.4): a mock built from a set whose gRPC samples hold messages answers a gRPC call with status 200, the empty message and `grpc-status: 0`, as without them, and the request matching ignores the recorded message (the load plan skips `grpc` endpoints, LDT-01). |
+| GRP-28 | **E.** On kind (`scripts/e2e.sh`): a Python gRPC pair A→B (`grpc.health.v1` is not used): A calls B's unary method with a message holding a secret-looking field; the controller's report for B holds the redacted request and response messages (field numbers, `mimic-` placeholders, no canary) and `grpc-status` in the trailers, version 3, the document of B shows the `application/grpc` content, and the report of A holds the same message on the outbound side. |
+| GRP-29 | **D** (review). Security review of #461: no raw message or frame byte, length or hash reaches Valkey, a log or a metric label (redaction runs before the sample exists, the controller redacts again), the budgets of §7.3 apply to the new fields, the version rule leaves F13 data byte-identical; `docs/wiki/Reading-the-API.md` has a gRPC section; `CHANGELOG.md` `[Unreleased]` names version 3, `format: 2` and the fallback. |
+| GRP-30 | **U** and **I** (controller, real Valkey). Upgrade safety (§7.3): everything a controller writes after pushes of gRPC traffic (inbound, outbound, both) is read by the rules of F13 (`:report` version 1 and `:outbound` version 2 and holds no inbound scope, no `trailers`, no gRPC body, no unknown field), `:grpc` is absent without gRPC samples and has the bounds and the TTL of the parts, the reads of §7.5 and `format=2` hold the messages, `format=1` does not, a later push without gRPC data keeps the messages (the write applies `:grpc` and splits again), `split_grpc` then `apply_grpc` gives the report back, and the `format=2` `ETag` changes when only `:grpc` changes while the `format=1` one does not. |
 
 ### 12.17 F15 — Explorer UI shell and the Workloads tab (#465)
 

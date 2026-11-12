@@ -106,6 +106,7 @@ impl Ex {
                     req_body: self.body.as_deref(),
                     resp_headers: &[],
                     resp_body: None,
+                    resp_trailers: &[],
                 },
             },
         );

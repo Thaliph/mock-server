@@ -125,6 +125,7 @@ fn record_in(authority: &str, exchanges: &[Ex]) -> EgressSet {
                     req_body: e.req_body.as_deref(),
                     resp_headers: &resp,
                     resp_body: e.resp_body.as_deref(),
+                    resp_trailers: &[],
                 },
             },
         );
@@ -601,6 +602,37 @@ fn mck_04_a_grpc_answer_is_ok_with_an_empty_message_and_trailers() {
         response.trailers,
         vec![("grpc-status".to_string(), "0".to_string())]
     );
+}
+
+#[test]
+fn grp_27_recorded_grpc_messages_do_not_change_the_answer() {
+    // A framed message `{1: "alice"}`.
+    let framed = vec![0, 0, 0, 0, 7, 0x0a, 0x05, b'a', b'l', b'i', b'c', b'e'];
+    let mut call = ex("POST", "/pkg.Svc/Get", 200);
+    call.req_headers
+        .push(("content-type".into(), "application/grpc".into()));
+    call.req_body = Some(framed.clone());
+    call.resp_headers
+        .push(("content-type".into(), "application/grpc".into()));
+    call.resp_body = Some(framed.clone());
+    call.grpc = true;
+    let set = record(&[call]);
+    // The sample holds the message (format 2), the mock ignores it.
+    assert!(set.to_json().expect("serialises").contains("\"alice\""));
+    let index = index(&set);
+    for body in [None, Some(framed)] {
+        let mut r = req("POST", "/pkg.Svc/Get").header("content-type", "application/grpc");
+        r.h2 = true;
+        r.body = body;
+        let (tier, response) = ask(&index, &r).expect("an answer");
+        assert_eq!(tier, Tier::Exact);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body(), [0u8; 5]);
+        assert_eq!(
+            response.trailers,
+            vec![("grpc-status".to_string(), "0".to_string())]
+        );
+    }
 }
 
 #[test]

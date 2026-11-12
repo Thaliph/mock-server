@@ -135,6 +135,7 @@ pub fn build(ops: &[Op], limits: &Limits, day: u64) -> Report {
                 req_body: request.as_deref(),
                 resp_headers: &json,
                 resp_body: response.as_deref(),
+                resp_trailers: &[],
             },
         };
         let via = Via {
@@ -204,6 +205,7 @@ pub fn full_report(salt: usize) -> Report {
                     req_body: Some(body.as_bytes()),
                     resp_headers: &headers,
                     resp_body: Some(body.as_bytes()),
+                    resp_trailers: &[],
                 },
             };
             let via = Via {

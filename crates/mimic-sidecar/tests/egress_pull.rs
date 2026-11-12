@@ -262,11 +262,12 @@ fn set_json(paths: &[&str], body: bool) -> String {
                     req_body: None,
                     resp_headers: &resp,
                     resp_body: body.then_some(text.as_bytes()),
+                    resp_trailers: &[],
                 },
             },
         );
     }
-    EgressSet::project(&report).to_json().unwrap()
+    EgressSet::project_as(&report, 1).to_json().unwrap()
 }
 
 fn target(api: &FakeApi, token: &std::path::Path) -> Target {
@@ -607,7 +608,7 @@ async fn pul_14_a_body_over_the_cap_is_too_large_and_the_read_stops_at_the_cap()
 async fn pul_14_a_refused_body_is_invalid_with_one_warning_and_leaves_the_snapshot() {
     let logs = capture_logs();
     let good = set_json(&["/v1/ping", CANARY_PATH], false);
-    let format2 = good.replace("\"format\":1", "\"format\":2");
+    let format2 = good.replace("\"format\":1", "\"format\":3");
     let mut with_sample: serde_json::Value =
         serde_json::from_str(&set_json(&["/v1/ping"], true)).unwrap();
     let endpoint = &mut with_sample["authorities"]["api.example.com:443"]["endpoints"][0];
@@ -897,6 +898,7 @@ fn canary_set() -> String {
                 req_body: None,
                 resp_headers: &resp,
                 resp_body: Some(text.as_bytes()),
+                resp_trailers: &[],
             },
         },
     );
@@ -1179,6 +1181,7 @@ fn f12_set() -> (EgressSet, String) {
                     req_body: None,
                     resp_headers,
                     resp_body: Some(body.as_bytes()),
+                    resp_trailers: &[],
                 },
             },
         );

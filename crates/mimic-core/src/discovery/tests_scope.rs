@@ -67,6 +67,7 @@ pub(super) fn v1_report() -> Report {
                     req_body: Some(br#"{"id":1}"#),
                     resp_headers: &h,
                     resp_body: Some(br#"{"ok":true}"#),
+                    resp_trailers: &[],
                 },
             },
         );

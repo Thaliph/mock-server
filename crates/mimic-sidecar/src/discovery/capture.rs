@@ -142,6 +142,8 @@ pub(super) struct Record {
     pub(super) response_head: Vec<u8>,
     pub(super) request: Part,
     pub(super) response: Part,
+    /// The response trailers as header lines (gRPC, spec §6.4).
+    pub(super) response_trailers: Vec<u8>,
     _reservation: Reservation,
 }
 
@@ -189,9 +191,20 @@ pub(crate) struct Capture {
     head_lost: bool,
     request_total: Option<u64>,
     response_total: Option<u64>,
+    response_trailers: Vec<u8>,
 }
 
+/// Most bytes of response trailers kept (spec §6.4).
+const MAX_TRAILERS: usize = 16 * 1024;
+
 impl Capture {
+    /// The response trailers as `name: value` lines; dropped when over the limit or the budget.
+    pub(crate) fn trailers(&mut self, lines: Vec<u8>) {
+        if lines.len() <= MAX_TRAILERS && self.reservation.grow(lines.len()) {
+            self.response_trailers = lines;
+        }
+    }
+
     pub(crate) fn push(&mut self, captured: Captured) {
         match captured {
             Captured::RequestHead(bytes) => {
@@ -297,6 +310,7 @@ impl Tap {
             head_lost: false,
             request_total: None,
             response_total: None,
+            response_trailers: Vec::new(),
         }
     }
 
@@ -341,6 +355,7 @@ impl Tap {
             } else {
                 Part::Absent
             },
+            response_trailers: capture.response_trailers,
             _reservation: capture.reservation,
         };
         if self.queue.try_send(Item::Exchange(record)).is_err() {

@@ -80,7 +80,7 @@ versioned tree, not an OpenAPI file:
 
 | Key | Content |
 |---|---|
-| `version` | `1` |
+| `version` | `1`; `2` when the report holds outbound scopes; `3` when a sample holds a gRPC message or trailers (see "gRPC calls") |
 | `pod` | `null` in the merged report |
 | `exchanges` | Exchanges covered |
 | `scopes.<direction>.<port>.root` | Path template tree: `literals` (name to child node), `param` (child node for parameters), `absorbing`, and `endpoints` (method to stats) |
@@ -134,6 +134,39 @@ curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints | m
 # samples of one endpoint
 curl -s $R | jq '.scopes.inbound["8080"].root.literals.users.param.endpoints.GET.samples | length'
 ```
+
+### gRPC calls
+
+A call whose `content-type` is `application/grpc` (or `application/grpc+proto`) is recorded like any
+other, as an endpoint of `scopes.<direction>.<port>.raw` keyed by its path (`/pkg.Users/Get`), and from
+version 3 its samples hold the **first message** of the request and of the response, and the response
+**trailers**. A message is read without a schema, so its fields are keyed by number, and it is
+redacted before anything is stored: JWTs, tokens, keys and cards become their placeholders
+(`mimic-jwt`, `mimic-token`, ...), a string or bytes value that looks like a random key becomes
+`mimic-secret`, and the values of `-bin` metadata are never kept. No raw frame is stored. Trimmed
+excerpt of a sample:
+
+```json
+{"request":  {"method": "POST", "path": "/pkg.Users/Get", "query": [],
+              "headers": [["authorization", "Bearer mimic-token"], ["content-type", "application/grpc"]],
+              "body": {"media": "application/grpc", "value": {"1": "ann", "2": "mimic-jwt"}}},
+ "response": {"status": 200, "headers": [["content-type", "application/grpc"]],
+              "body": {"media": "application/grpc", "value": {"1": "ann", "3": {"1": 7}}},
+              "trailers": [["grpc-status", "0"], ["x-trace-bin", "mimic-secret"]]}}
+```
+
+Fields that hold more than one value are arrays; a field that is not a string or a number is an object
+with one key that starts with `$` (`{"$bytes": "<base64>"}`, `{"$fixed32": n}`, `{"$fixed64": n}`). A
+message that is compressed with an encoding other than `gzip`, over 256 KiB, or not a protobuf message
+is left out (`mimic_discovery_bodies_total{result}` says which: `opaque`, `too_large`, `encoding`).
+Streams are recorded by their first message; a mock still answers a gRPC call with an empty message
+(replaying the messages is planned). The OpenAPI document of a gRPC operation shows the message as an
+`application/grpc` request and response with the field numbers as property names.
+
+A report that holds no gRPC message is the same as before, and the controller keeps serving sidecars of
+earlier versions: the egress set (`/egress`, a sidecar's view of the calls its app makes) is served as
+`format` 1, which leaves the gRPC parts out, to a sidecar that asks for it and as `format` 2 to one that
+asks for the gRPC parts.
 
 ## Load test runs
 

@@ -40,6 +40,7 @@ fn rec(r: &mut Report, l: &Limits, path: &str, status: u16, query: &str, times: 
                     query,
                     resp_headers: &headers,
                     resp_body: Some(body.as_bytes()),
+                    resp_trailers: &[],
                     ..Observation::default()
                 },
             },

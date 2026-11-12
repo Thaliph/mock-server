@@ -8,5 +8,5 @@ description = "redaction canaries in Rust tests"
 paths = [
   '''(^|/)crates/[^/]+/tests/.+\.rs$''',
   '''(^|/)crates/[^/]+/src/(.+/)?(tests?|[a-z0-9_]+_tests|tests_[a-z0-9_]+)\.rs$''',
-  '''(^|/)crates/[^/]+/src/(.+/)?tests/.+\.rs$''',
+  '''(^|/)crates/[^/]+/src/(.+/)?([a-z0-9_]+_)?tests/.+\.rs$''',
 ]

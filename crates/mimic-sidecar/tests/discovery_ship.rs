@@ -1767,3 +1767,69 @@ async fn mon_10_the_last_new_endpoint_time_is_set_by_a_new_endpoint_only() {
     drop(stop);
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn grp_25_a_400_to_version_3_posts_the_same_sequence_without_the_grpc_parts() {
+    let logs = capture_logs();
+    let rig = Rig::new(
+        vec![Reply::Status(400)],
+        INTERVAL,
+        DiscoveryConfig::default(),
+    )
+    .await;
+    // A gRPC request message through the HTTP/1 relay: the recorder does not care for the
+    // protocol, and the report holds a message.
+    let payload = [0x0a, 0x05, b'a', b'l', b'i', b'c', b'e'];
+    let mut body = vec![0, 0, 0, 0, payload.len() as u8];
+    body.extend(payload);
+    let mut c = TcpStream::connect(rig.proxy.addr).await.unwrap();
+    let head = format!(
+        "POST /pkg.Users/Get HTTP/1.1\r\nHost: svc.ns:8080\r\nContent-Type: application/grpc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    c.write_all(head.as_bytes()).await.unwrap();
+    c.write_all(&body).await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), c.read_to_end(&mut out))
+        .await
+        .expect("answered in time")
+        .unwrap();
+    rig.recorded(1).await;
+    assert_eq!(rig.discovery.report().version(), 3);
+
+    let (stop, task) = rig.start();
+    wait(|| rig.api.count() >= 2).await;
+    // Version 3 refused, then the same session and sequence without the gRPC parts, applied.
+    assert_eq!(rig.api.versions(), vec![(1, 3, 400), (1, 1, 200)]);
+    {
+        let seen = rig.api.seen.lock().unwrap();
+        assert_eq!(seen[0].session(), seen[1].session());
+        let first = String::from_utf8_lossy(&seen[0].body).to_string();
+        let second = String::from_utf8_lossy(&seen[1].body).to_string();
+        assert!(first.contains("\"media\":\"application/grpc\""), "{first}");
+        assert!(
+            !second.contains("\"media\":\"application/grpc\""),
+            "{second}"
+        );
+        assert!(!second.contains("trailers"), "{second}");
+        assert_eq!(seen[1].report().exchanges(), 1);
+    }
+    wait(|| {
+        metric(
+            &rig,
+            "mimic_discovery_pushes_total{result=\"grpc_dropped\"}",
+        ) == 1
+    })
+    .await;
+    logs.settled().await;
+    let lines: Vec<_> = logs
+        .text()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["message"] == "grpc not shipped")
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["level"], "WARN");
+    drop(stop);
+    task.await.unwrap();
+}

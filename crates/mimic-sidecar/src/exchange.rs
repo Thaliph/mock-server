@@ -106,6 +106,18 @@ impl Tee {
         self.with(|capture| capture.push(captured));
     }
 
+    /// The response trailers, as header lines (spec §6.4).
+    fn trailers(&self, trailers: &HeaderMap) {
+        let mut lines = Vec::new();
+        for (name, value) in trailers {
+            lines.extend_from_slice(name.as_str().as_bytes());
+            lines.extend_from_slice(b": ");
+            lines.extend_from_slice(value.as_bytes());
+            lines.extend_from_slice(b"\r\n");
+        }
+        self.with(|capture| capture.trailers(lines));
+    }
+
     /// The body is complete: `total` payload bytes went through.
     fn end(&mut self, total: u64) {
         if self.ended {
@@ -489,6 +501,9 @@ impl Body for RespBody {
                     }
                 } else if let Some(trailers) = frame.trailers_ref() {
                     this.trailers_seen = true;
+                    if let Some(tee) = this.tee.as_ref() {
+                        tee.trailers(trailers);
+                    }
                     if let (Some(tracker), Some(status)) =
                         (this.tracker.as_mut(), grpc_status(trailers))
                     {

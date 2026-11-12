@@ -44,6 +44,7 @@ fn record(
         req_body: body.then_some(body_text.as_bytes()),
         resp_headers: &resp,
         resp_body: body.then_some(body_text.as_bytes()),
+        resp_trailers: &[],
     };
     let exchange = Exchange {
         direction,
@@ -256,7 +257,7 @@ fn pul_01_projection_of_a_mixed_report() {
 
 #[test]
 fn pul_01_a_report_without_outbound_scope_is_the_empty_set() {
-    let empty = r#"{"authorities":{},"format":1}"#;
+    let empty = r#"{"authorities":{},"format":2}"#;
     assert_eq!(project_json(&Report::new(None)), empty);
     let mut inbound = Report::new(None);
     record(
@@ -298,7 +299,7 @@ fn pul_01_projection_is_byte_identical_and_reads_back() {
     assert_eq!(back.to_json().unwrap(), json);
     // Sorted keys at the top.
     assert!(json.starts_with(r#"{"authorities":{"#));
-    assert!(json.ends_with(r#""format":1}"#));
+    assert!(json.ends_with(r#""format":2}"#));
 }
 
 #[test]
@@ -383,7 +384,7 @@ fn pul_02_the_base_is_accepted() {
 fn pul_02_format() {
     for format in [
         json!(0),
-        json!(2),
+        json!(3),
         json!(4_294_967_296u64),
         json!("1"),
         json!(null),
@@ -704,8 +705,8 @@ fn pul_04_digest() {
 
 #[test]
 fn pul_04_etag() {
-    assert_eq!(etag("ab12"), "\"1-ab12\"");
-    assert_eq!(etag(HEX_ABC), format!("\"1-{HEX_ABC}\""));
+    assert_eq!(etag(1, "ab12"), "\"1-ab12\"");
+    assert_eq!(etag(1, HEX_ABC), format!("\"1-{HEX_ABC}\""));
 }
 
 #[test]
@@ -744,7 +745,7 @@ fn pul_04_a_digest_that_is_absent_malformed_or_for_another_version_is_stale() {
 
 #[test]
 fn pul_04_if_none_match_matches_one_entry_exactly() {
-    let tag = etag("ab");
+    let tag = etag(1, "ab");
     assert!(matches_etag(&tag, &tag));
     assert!(matches_etag("\"1-aa\", \"1-ab\"", &tag));
     assert!(matches_etag("\"1-aa\",\"1-ab\",\"1-ac\"", &tag));

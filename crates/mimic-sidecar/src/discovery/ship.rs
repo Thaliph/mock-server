@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mimic_core::discovery::report::{Limits, Report};
+use mimic_core::discovery::report::{Direction, Limits, Report};
 use mimic_core::proxy::tls::Backoff;
 use mimic_runtime::config::{ConfigError, Env};
 use serde::Serialize;
@@ -189,6 +189,8 @@ pub struct Shipper {
     /// The streak of fallbacks has written its `outbound not shipped` line; an acknowledged
     /// version 2 push ends it.
     fallback_logged: bool,
+    /// `grpc not shipped` was written (once per process).
+    grpc_logged: bool,
     /// Fallbacks so far.
     fallbacks: u64,
 }
@@ -215,6 +217,7 @@ impl Shipper {
             backoff: Backoff::default(),
             failures: 0,
             fallback_logged: false,
+            grpc_logged: false,
             fallbacks: 0,
         })
     }
@@ -471,13 +474,21 @@ impl Shipper {
                 self.encode();
                 Attempt::Again
             }
+            Answer::Status { code: 400, .. }
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.report.version() == 3) =>
+            {
+                self.drop_grpc()
+            }
             Answer::Status {
                 code: code @ (400 | 507),
                 ..
             } if self
                 .pending
                 .as_ref()
-                .is_some_and(|p| p.report.version() == 2) =>
+                .is_some_and(|p| p.report.holds_outbound()) =>
             {
                 self.fall_back(code)
             }
@@ -515,6 +526,31 @@ impl Shipper {
                 Attempt::Retry(self.failed(None, Some(message)))
             }
         }
+    }
+
+    /// Fallback from version 3 (spec §7.2): a `400` to a report with gRPC parts (a controller up
+    /// to F13). The same sequence is posted again without them, as version 1 or 2; the parts
+    /// are lost, never merged back.
+    fn drop_grpc(&mut self) -> Attempt {
+        let Some(pending) = &mut self.pending else {
+            return Attempt::Settled;
+        };
+        pending.report = pending.report.without_grpc();
+        let handoff = &self.parts.handoff;
+        handoff
+            .pending_samples
+            .store(pending.report.sample_bytes(), Ordering::Release);
+        handoff.pending_egress_samples.store(
+            pending.report.sample_bytes_of(Some(Direction::Outbound)),
+            Ordering::Release,
+        );
+        self.parts.metrics.push("grpc_dropped");
+        if !self.grpc_logged {
+            self.grpc_logged = true;
+            tracing::warn!(target: "discovery", status = 400u16, "grpc not shipped");
+        }
+        self.encode();
+        Attempt::Again
     }
 
     /// An attempt of the pending sequence may have been applied (spec §7.2).
@@ -665,7 +701,7 @@ impl Shipper {
         if self
             .pending
             .as_ref()
-            .is_some_and(|p| p.report.version() == 2)
+            .is_some_and(|p| p.report.holds_outbound())
         {
             self.fallback_logged = false;
         }

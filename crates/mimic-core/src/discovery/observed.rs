@@ -49,6 +49,8 @@ pub struct Observation<'a> {
     pub req_body: Option<&'a [u8]>,
     pub resp_headers: &'a [(&'a str, &'a str)],
     pub resp_body: Option<&'a [u8]>,
+    /// HTTP/2 response trailers (gRPC, spec §6.4); empty without.
+    pub resp_trailers: &'a [(&'a str, &'a str)],
 }
 
 /// The bodies of one media type.
@@ -269,6 +271,7 @@ pub(super) fn parsed_media(media: &str) -> bool {
     media == "application/json"
         || media.ends_with("+json")
         || media == "application/x-www-form-urlencoded"
+        || crate::grpc::record::is_protobuf_media(media)
 }
 
 /// XXH3 of the schema skeleton of a redacted body: a JSON value, or the pairs of a form.
@@ -320,6 +323,16 @@ fn named_secret(redactor: &Redactor, field: &str) -> Option<String> {
     None
 }
 
+/// The canonical JSON of the redacted first message of a gRPC body (spec §6.4).
+fn grpc_value(redactor: &Redactor, encoding: Option<&str>, body: &[u8]) -> Option<Value> {
+    use crate::grpc::redact::{Direction, FieldNames, GrpcRedactor};
+    let message = crate::grpc::record::first_message(encoding, body).ok()?;
+    let redacted = GrpcRedactor::new(redactor.clone(), Vec::new())
+        .message("", Direction::Request, &message, &FieldNames::new())
+        .ok()?;
+    Some(redacted.to_json())
+}
+
 /// Parses a body (already content-decoded) by its `content-type`; nothing without one.
 pub(crate) fn parse(redactor: &Redactor, headers: &[(&str, &str)], body: &[u8]) -> Option<Parsed> {
     let media = header(headers, "content-type")?
@@ -334,7 +347,14 @@ pub(crate) fn parse(redactor: &Redactor, headers: &[(&str, &str)], body: &[u8]) 
     let mut content = Content::Opaque;
     let mut shape = 0;
     if body.len() <= MAX_BODY {
-        if media == "application/json" || media.ends_with("+json") {
+        if crate::grpc::record::is_protobuf_media(&media) {
+            // The first message, redacted before anything keeps it (spec §6.4).
+            if let Some(value) = grpc_value(redactor, header(headers, "grpc-encoding"), body) {
+                let schema = Schema::infer(&value);
+                shape = xxh3_64(schema.to_json().to_string().as_bytes());
+                content = Content::Json { value, schema };
+            }
+        } else if media == "application/json" || media.ends_with("+json") {
             if let Ok(mut value) = serde_json::from_slice::<Value>(body) {
                 redactor.json(&mut value);
                 let schema = Schema::infer(&value);

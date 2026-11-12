@@ -1,0 +1,8 @@
+# Installed with `pip install --require-hashes` into the e2e gRPC image (scripts/e2e.sh, GRP-28): the
+# versions are older than the 14 days of the dependency cooldown, and each file is named by its sha256
+# (cp313, manylinux, x86_64 and aarch64; the pure Python wheel of typing-extensions).
+grpcio==1.85.0 \
+    --hash=sha256:55cee7cfe71b29f6b377681936f9a5f35e59f5c941a4d84e2712cb309753e7a9 \
+    --hash=sha256:fc2865f523feeac453f35c762a2e4155df58565229d77069b211f2e21de2e79a
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8

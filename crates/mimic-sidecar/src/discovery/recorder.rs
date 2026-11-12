@@ -15,6 +15,7 @@ use mimic_core::discovery::report::{
     Direction, Exchange, Limits, Outcome, Report, Sampled, Tunneled, Via,
 };
 use mimic_core::discovery::scope::{ScopeKey, authority_key};
+use mimic_core::grpc::record::first_message;
 
 use super::Handoff;
 use super::capture::{Item, Part, Record, Tunnel};
@@ -224,7 +225,13 @@ fn classify<'a>(
                 Err(failure) => return Some((failure.result(), None)),
             };
             let media = media(headers);
-            let result = if is_json(&media) {
+            let result = if mimic_core::grpc::record::is_protobuf_media(&media) {
+                // The first message, as the report will keep it (spec §6.4).
+                match first_message(header(headers, "grpc-encoding"), &bytes) {
+                    Ok(_) => "parsed",
+                    Err(failure) => failure.result(),
+                }
+            } else if is_json(&media) {
                 if serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_ok() {
                     "parsed"
                 } else {
@@ -360,6 +367,14 @@ impl Recorder {
         };
         let response_lines = lines(&record.response_head);
         let response_headers = header_pairs(&response_lines);
+        // `header_pairs` skips a first line, which trailers do not have.
+        let mut trailer_lines = lines(&record.response_trailers);
+        trailer_lines.insert(0, String::new());
+        let trailer_pairs = header_pairs(&trailer_lines);
+        let trailers: Vec<(&str, &str)> = trailer_pairs
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .collect();
         let request_body = classify(&record.request, &request.headers);
         let response_body = classify(&record.response, &response_headers);
         let req: Vec<(&str, &str)> = request
@@ -397,6 +412,7 @@ impl Recorder {
                 resp_body: response_body
                     .as_ref()
                     .and_then(|(_, bytes)| bytes.as_deref()),
+                resp_trailers: &trailers,
             },
         };
         let outbound = record.direction == Direction::Outbound;

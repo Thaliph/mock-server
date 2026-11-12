@@ -40,6 +40,8 @@ fn project(text: &str) {
     let set = EgressSet::project(&report);
     read_back(&set);
     assert_eq!(set, EgressSet::project(&report.clone()));
+    // Format 1, what a sidecar up to F13 reads: it has no gRPC part, and passes its check.
+    read_back(&EgressSet::project_as(&report, 1));
 }
 
 fuzz_target!(|data: &[u8]| {

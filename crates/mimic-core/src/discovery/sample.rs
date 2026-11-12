@@ -9,6 +9,10 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::grpc::record::is_protobuf_media;
+use crate::grpc::redact::{Direction, FieldNames, GrpcRedactor};
+use crate::grpc::wire::Message;
+
 use super::check::Violation;
 use super::observed::{
     Content, MAX_BODY, Parsed, Seen, body_shape, observe_leaves, observe_pairs, parsed_media,
@@ -21,6 +25,8 @@ use super::volatile::Volatility;
 
 /// Samples kept per endpoint.
 pub const MAX_SAMPLES: usize = 20;
+/// Trailers kept per sample (spec §6.4).
+pub const MAX_TRAILERS: usize = 64;
 
 /// A JSON value kept as its canonical text (compact, object keys sorted: what `serde_json`
 /// writes a `Value` as), which costs the length of the text instead of a tree of maps and
@@ -143,6 +149,19 @@ impl Body {
     /// The body is parsed for the redaction only, and kept as text again.
     fn redact(&mut self, redactor: &Redactor) {
         let mut value = self.value.value();
+        if is_protobuf_media(&self.media) {
+            // A message again (spec §7.3): what is not one is not kept.
+            let redacted = Message::from_json(&value).ok().and_then(|message| {
+                GrpcRedactor::new(redactor.clone(), Vec::new())
+                    .message("", Direction::Request, &message, &FieldNames::new())
+                    .ok()
+            });
+            self.value = Text::new(&redacted.map_or_else(
+                || Value::String(Placeholder::Secret.to_string()),
+                |m| m.to_json(),
+            ));
+            return;
+        }
         if self.media != "application/x-www-form-urlencoded" {
             redactor.json(&mut value);
             self.value = Text::new(&value);
@@ -188,6 +207,9 @@ struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: Option<Body>,
+    /// HTTP/2 trailers, redacted as gRPC metadata; written only when there are some (spec §6.4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trailers: Vec<(String, String)>,
 }
 
 /// One redacted exchange.
@@ -209,6 +231,21 @@ pub struct Sample {
 
 fn pairs(pairs: Vec<Pair>) -> Vec<(String, String)> {
     pairs.into_iter().map(|p| (p.key, p.value)).collect()
+}
+
+/// A `-bin` metadata value is redacted whatever its name (spec §6.3).
+fn bin_values(redactor: &Redactor, list: &mut [(String, String)]) {
+    let grpc = GrpcRedactor::new(redactor.clone(), Vec::new());
+    for (name, value) in list.iter_mut().filter(|(n, _)| n.ends_with("-bin")) {
+        *value = grpc.metadata(name, value);
+    }
+}
+
+/// A call whose `content-type` is `application/grpc*`.
+fn grpc_call(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(n, v)| n == "content-type" && v.starts_with("application/grpc"))
 }
 
 fn body(parsed: Option<Parsed>) -> Option<Body> {
@@ -241,18 +278,27 @@ impl Sample {
         let o = &exchange.observation;
         let request_shape = request_body.as_ref().map_or(0, |p| p.shape);
         let response_shape = response_body.as_ref().map_or(0, |p| p.shape);
-        let request = Request {
+        let mut request = Request {
             method: exchange.method.to_string(),
             path: redact::path(exchange.path),
             query: pairs(query_pairs(request_redactor, o.query)),
             headers: pairs(header_pairs(request_redactor, o.req_headers)),
             body: body(request_body),
         };
-        let response = Response {
+        let mut response = Response {
             status: exchange.status,
             headers: pairs(header_pairs(response_redactor, o.resp_headers)),
             body: body(response_body),
+            trailers: pairs(header_pairs(response_redactor, o.resp_trailers)),
         };
+        if grpc_call(&request.headers) {
+            bin_values(request_redactor, &mut request.headers);
+            bin_values(response_redactor, &mut response.headers);
+            bin_values(response_redactor, &mut response.trailers);
+        } else {
+            response.trailers.clear();
+        }
+        response.trailers.truncate(MAX_TRAILERS);
         // Plain data: serialisation cannot fail.
         let content = serde_json::to_vec(&(&request, &response)).unwrap_or_default();
         let hash = xxh3_64(&content);
@@ -316,12 +362,48 @@ impl Sample {
 
     /// The media type and content of the parsed request body.
     pub fn request_payload(&self) -> Option<(&str, Payload<'_>)> {
-        self.request.body.as_ref().map(Body::payload)
+        // A gRPC message is not replayed before #463 (spec §6.4).
+        let body = self.request.body.as_ref();
+        body.filter(|b| !is_protobuf_media(&b.media))
+            .map(Body::payload)
     }
 
     /// As `request_payload`, for the response.
     pub fn response_payload(&self) -> Option<(&str, Payload<'_>)> {
-        self.response.body.as_ref().map(Body::payload)
+        let body = self.response.body.as_ref();
+        body.filter(|b| !is_protobuf_media(&b.media))
+            .map(Body::payload)
+    }
+
+    /// The response trailers, redacted (HTTP/2, gRPC).
+    pub fn trailers(&self) -> &[(String, String)] {
+        &self.response.trailers
+    }
+
+    /// The sample holds a gRPC message or trailers, which a sidecar or controller up to F13
+    /// does not know (spec §6.4): the report that holds it is version 3.
+    pub fn is_grpc(&self) -> bool {
+        !self.response.trailers.is_empty()
+            || [&self.request.body, &self.response.body]
+                .into_iter()
+                .flatten()
+                .any(|b| is_protobuf_media(&b.media))
+    }
+
+    /// The sample as a sidecar up to F13 reads it: no trailers and no gRPC body, size and
+    /// shapes from what is left. With its content hash.
+    pub(super) fn without_grpc(&self) -> (u64, Sample) {
+        let mut sample = self.clone();
+        sample.response.trailers.clear();
+        for body in [&mut sample.request.body, &mut sample.response.body] {
+            if body.as_ref().is_some_and(|b| is_protobuf_media(&b.media)) {
+                *body = None;
+            }
+        }
+        sample.request_shape = sample.request.body.as_ref().map_or(0, Body::shape);
+        sample.response_shape = sample.response.body.as_ref().map_or(0, Body::shape);
+        let hash = sample.reseal();
+        (hash, sample)
     }
 
     /// A status in 100..=599; bodies of a parsed media type and at most `MAX_BODY` bytes.
@@ -337,6 +419,9 @@ impl Sample {
             if body.value.len() > MAX_BODY {
                 return Err(Violation::BodySize);
             }
+        }
+        if self.response.trailers.len() > MAX_TRAILERS {
+            return Err(Violation::Malformed);
         }
         // `bytes` is what the sample budget counts: it must be the size of the content.
         let total = serde_json::to_vec(self).map_or(usize::MAX, |v| v.len());
@@ -373,6 +458,17 @@ impl Sample {
         }
         for (name, value) in &mut self.response.headers {
             *value = response_redactor.header(name, value);
+        }
+        // Trailers make it a gRPC sample whatever the request says (a faulty sidecar may not tell).
+        if grpc_call(&self.request.headers) || !self.response.trailers.is_empty() {
+            bin_values(request_redactor, &mut self.request.headers);
+            bin_values(response_redactor, &mut self.response.headers);
+        }
+        if !self.response.trailers.is_empty() {
+            let grpc = GrpcRedactor::new(response_redactor.clone(), Vec::new());
+            for (name, value) in &mut self.response.trailers {
+                *value = grpc.metadata(name, value);
+            }
         }
         if let Some(body) = &mut self.request.body {
             body.redact(request_redactor);
@@ -528,6 +624,46 @@ impl Samples {
             self.absorb(hash, sample);
         }
         fields
+    }
+
+    /// The samples that hold a gRPC message or trailers.
+    pub(super) fn grpc_only(&self) -> Samples {
+        Samples(
+            self.0
+                .iter()
+                .filter(|(_, s)| s.is_grpc())
+                .map(|(h, s)| (*h, s.clone()))
+                .collect(),
+        )
+    }
+
+    /// Puts the full samples of `overlay` in place of the samples that `without_grpc` makes of
+    /// them (spec §7.3, `:grpc`); a sample that has no counterpart joins while there is room.
+    pub(super) fn apply(&mut self, overlay: Samples) {
+        for (hash, sample) in overlay.0 {
+            let (stripped, _) = sample.without_grpc();
+            if self.0.remove(&stripped).is_some() || self.0.len() < MAX_SAMPLES {
+                self.0.insert(hash, sample);
+            }
+        }
+    }
+
+    /// Whether a sample holds a gRPC message or trailers.
+    pub(super) fn any_grpc(&self) -> bool {
+        self.0.values().any(Sample::is_grpc)
+    }
+
+    /// The samples without their gRPC parts, keyed by their new hash (those that become the
+    /// same are one).
+    pub(super) fn without_grpc(&mut self) {
+        for (hash, sample) in std::mem::take(&mut self.0) {
+            let (hash, sample) = if sample.is_grpc() {
+                sample.without_grpc()
+            } else {
+                (hash, sample)
+            };
+            self.absorb(hash, sample);
+        }
     }
 
     fn absorb(&mut self, hash: u64, sample: Sample) {

@@ -71,6 +71,7 @@ fn record(redactor: &Redactor, input: &Input, times: usize) -> Report {
                     req_body: input.req_body.as_deref().map(str::as_bytes),
                     resp_headers: &resp,
                     resp_body: input.resp_body.as_deref().map(str::as_bytes),
+                    resp_trailers: &[],
                 },
             },
         );
