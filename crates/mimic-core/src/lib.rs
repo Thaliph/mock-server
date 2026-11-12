@@ -4,6 +4,7 @@
 pub mod compact;
 pub mod discovery;
 pub mod fd;
+pub mod grpc;
 pub mod identity;
 pub mod inject;
 pub mod load;
