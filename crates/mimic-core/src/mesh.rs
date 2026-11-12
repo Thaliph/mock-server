@@ -3,6 +3,7 @@
 //! (precedence, validation, defaults) and the scoped view of a deployment.
 
 pub mod input;
+pub mod lb;
 pub mod policy;
 pub mod view;
 
@@ -14,6 +15,8 @@ mod tests;
 mod tests_consent;
 #[cfg(test)]
 mod tests_from_json;
+#[cfg(test)]
+mod tests_lb;
 #[cfg(test)]
 mod tests_policy;
 #[cfg(test)]
