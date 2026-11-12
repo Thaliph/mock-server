@@ -830,4 +830,16 @@ ui_exposed=$(yq 'select(.kind == "Service" or .kind == "NetworkPolicy")' "$tmp/d
   || fail "ui_14: a Service or NetworkPolicy uses port 8080"
 echo "ui_14: the controller declares mimic-ui on 8080/TCP; no Service or NetworkPolicy exposes it"
 
+# NON-07 (#439): the MimicWorkload CRD accepts none, discovery and mock for spec.mode and status.mode.mode, and
+# defaults spec.mode to none (the API server persists defaults at creation, so older objects keep discovery).
+crd_props=$(yq 'select(.kind == "CustomResourceDefinition" and .metadata.name == "mimicworkloads.mimic.platform.io")
+  | .spec.versions[0].schema.openAPIV3Schema.properties' "$tmp/default.yaml")
+[[ $(printf '%s\n' "$crd_props" | yq -o=json -I=0 '.spec.properties.mode.enum') == '["none","discovery","mock"]' ]] \
+  || fail "non_07: spec.mode does not accept none, discovery and mock"
+[[ $(printf '%s\n' "$crd_props" | yq -r '.spec.properties.mode.default') == none ]] \
+  || fail "non_07: spec.mode does not default to none"
+[[ $(printf '%s\n' "$crd_props" | yq -o=json -I=0 '.status.properties.mode.properties.mode.enum') == '["none","discovery","mock"]' ]] \
+  || fail "non_07: status.mode.mode does not accept none, discovery and mock"
+echo "non_07: the MimicWorkload CRD accepts none, discovery and mock and defaults to none"
+
 echo "chart checks passed"

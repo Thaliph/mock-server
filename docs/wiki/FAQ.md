@@ -9,9 +9,19 @@ Pods owned by a Deployment. HTTP/1.x and HTTP/2 are understood; other TCP protoc
 logged and measured at connection level. gRPC streaming, WebSocket and SSE are passed through.
 
 **Does mimic slow my traffic or break it?**
-It forwards bytes unchanged and never refuses or synthesises a response; discovery is best effort and
-never waits. When the sidecar is down, redirected connections are refused (fail-closed). If the
+It forwards bytes unchanged and never refuses or synthesises a response; discovery (when on) is best effort
+and never waits. When the sidecar is down, redirected connections are refused (fail-closed). If the
 controller is down, new pods in scope cannot be created.
+
+**What does mode `none` do? Is it "no mesh"?**
+`none` is the default: the sidecar proxies every connection and records, intercepts and ships nothing
+(outbound TLS is passed through, never decrypted). Ask for recording with `spec.mode: discovery` on a
+`MimicWorkload`; no restart is needed. `none` means "proxy only, nothing recorded", not "no mesh": the mimic
+mesh is independent of the mode and has its own switches (`mesh.enabled`, `MimicConfig.spec.mesh.enabled`).
+
+**Why did my Deployment stop recording after an upgrade?**
+Deployments injected by label with no `MimicWorkload` used to be in `discovery` and are now in `none`. Create a
+`MimicWorkload` with `spec.mode: discovery` for them. `MimicWorkload`s that existed keep their `discovery`.
 
 **Is HTTPS visible?**
 Outbound HTTPS is, when the client trusts the injected bundle ([TLS interception](TLS-interception)).

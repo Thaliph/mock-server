@@ -137,7 +137,7 @@ pub fn parse_factor_header(values: &[&str]) -> Option<u32> {
     }
 }
 
-/// The `Mimic-Mode` of an answer: exactly one value, `discovery` or `mock`.
+/// The `Mimic-Mode` of an answer: exactly one value, `none`, `discovery` or `mock`.
 pub fn parse_mode_header(values: &[&str]) -> Option<Mode> {
     match values {
         [value] => value.parse().ok(),

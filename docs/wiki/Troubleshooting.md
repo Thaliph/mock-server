@@ -112,6 +112,10 @@ the failure add the host to `spec.tls.exclude` and restart.
 **WARN `tls passthrough` with `upstream_untrusted`.** The destination's certificate is not trusted by
 any CA in the pod's images; the app judges it itself. Visibility is lost for it.
 
+**No HTTPS visibility at all; `mimic_tls_connections_total{interception="mode_none"}`.** The pods are in mode
+`none` (the default): they record and intercept nothing. Set `spec.mode: discovery` on a `MimicWorkload` of the Deployment;
+no restart is needed.
+
 **No HTTPS visibility at all; `mimic_tls_connections_total{interception="no_ca"}`.** No valid
 intermediate: look for ERROR `tls ca mismatch` (the seed changed; recreate the pod), ERROR `trust volume
 not published`, or WARN `intermediate request failed` (sidecar API unreachable or `503` while the seed

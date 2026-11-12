@@ -354,15 +354,17 @@ fn held_mode(object: &DynamicObject) -> Option<serde_json::Value> {
     object.data.get("status")?.get("mode").cloned()
 }
 
-/// `spec.mode` and `spec.mock` of a `MimicWorkload`; what the CRD would refuse reads as the
-/// default.
+/// `spec.mode` and `spec.mock` of a `MimicWorkload`; what the CRD would refuse, and a missing mode, read as
+/// the default (`none`, spec §7).
 pub fn mock_of(object: &DynamicObject) -> MockSettings {
     let Some(spec) = object.data.get("spec") else {
         return MockSettings::default();
     };
     let mock = spec.get("mock");
+    let mode = spec.get("mode").and_then(|m| m.as_str());
     MockSettings {
-        mock: spec.get("mode").and_then(|m| m.as_str()) == Some("mock"),
+        mock: mode == Some("mock"),
+        discovery: mode == Some("discovery"),
         factor: mock
             .and_then(|m| m.get("latencyFactor"))
             .and_then(|f| f.as_f64())
@@ -544,27 +546,65 @@ mod tests {
         assert_eq!(exclude, ["a.test", "b.test"]);
     }
 
+    /// A `MimicWorkload` in `mock` (`on`) or in `discovery`.
     fn mock(on: bool, factor: u32, passthrough: &[&str]) -> MockSettings {
         MockSettings {
             mock: on,
+            discovery: !on,
             factor,
             passthrough: passthrough.iter().map(|p| p.to_string()).collect(),
         }
     }
 
     #[test]
-    fn mck_01_no_workload_or_only_discovery_gives_discovery_factor_1_no_passthrough() {
+    fn non_06_no_workload_gives_none_and_a_discovery_one_gives_discovery() {
         let cache = WorkloadCache::synced_with(&[("shop", "w1", "api")]);
         let none = cache.effective("shop", "web");
         assert_eq!(
             (none.mode().as_str(), none.factor_text()),
-            ("discovery", "1".into())
+            ("none", "1".into())
         );
         assert!(none.passthrough.is_empty());
+        // A workload that says nothing about its mode is `none` as well.
+        assert_eq!(cache.effective("shop", "api").mode().as_str(), "none");
         cache.set_mock("shop", "w1", mock(false, 100, &[]));
         let found = cache.effective("shop", "api");
         assert_eq!(found.mode().as_str(), "discovery");
         assert_eq!(found.factor, 100);
+    }
+
+    #[test]
+    fn non_06_mock_of_reads_none_discovery_and_mock_and_a_stored_discovery_stays() {
+        let object = |spec: serde_json::Value| -> DynamicObject {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "mimic.platform.io/v1alpha1", "kind": "MimicWorkload",
+                "metadata": {"name": "w", "namespace": "shop"}, "spec": spec,
+            }))
+            .unwrap()
+        };
+        let mode_of = |spec| {
+            let cache = WorkloadCache::synced_with(&[("shop", "w", "api")]);
+            cache.set_mock("shop", "w", mock_of(&object(spec)));
+            cache.effective("shop", "api").mode().as_str()
+        };
+        // What an object created before M0 holds: the default the API server persisted.
+        assert_eq!(
+            mode_of(serde_json::json!({"deployment": "api", "mode": "discovery"})),
+            "discovery"
+        );
+        assert_eq!(
+            mode_of(serde_json::json!({"deployment": "api", "mode": "none"})),
+            "none"
+        );
+        assert_eq!(
+            mode_of(serde_json::json!({"deployment": "api", "mode": "mock"})),
+            "mock"
+        );
+        assert_eq!(mode_of(serde_json::json!({"deployment": "api"})), "none");
+        assert_eq!(
+            mode_of(serde_json::json!({"deployment": "api", "mode": "record"})),
+            "none"
+        );
     }
 
     #[test]
@@ -619,6 +659,7 @@ mod tests {
         let text = |factor| {
             Effective {
                 mock: true,
+                discovery: false,
                 factor,
                 passthrough: Vec::new(),
             }

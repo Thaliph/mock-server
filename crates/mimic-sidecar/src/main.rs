@@ -132,6 +132,8 @@ async fn run(
     let max_pending = mode.max_pending;
     let passthrough = mode.passthrough.clone();
     let mode = ModeState::start(&mode, &mut metrics).await;
+    // In mode `none` nothing is recorded (spec §3).
+    let recording = mode.recording();
     let load = load.map(|config| Marker::new(config, mode.clone(), &mut metrics));
     let snapshot = Snapshot::new(mode);
     let mock = Mock::with_budget(
@@ -169,7 +171,7 @@ async fn run(
     )
     .with_max_connections(tunnel.max_connections)
     .with_proxy_metrics(proxy_metrics)
-    .with_discovery(discovery.tap())
+    .with_discovery(discovery.tap().gated(recording))
     .with_mock(mock)
     .with_tls(interception);
     if let Some(load) = &load {

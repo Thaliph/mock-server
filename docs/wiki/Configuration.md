@@ -17,7 +17,7 @@ apply to pods **created afterwards**: run `kubectl rollout restart` after a chan
 | Field | Type | Default | Constraints | Meaning |
 |---|---|---|---|---|
 | `spec.deployment` | string | required | DNS-1123 subdomain, max 253, **immutable** | Deployment of the same namespace this resource selects. |
-| `spec.mode` | `discovery` \| `mock` | `discovery` | enum | `mock` answers the outbound calls of the Deployment's pods from their recorded egress, and the switch is live. See [Mock mode](Mock-mode). |
+| `spec.mode` | `none` \| `discovery` \| `mock` | `none` | enum | `none` proxies and records nothing; `discovery` records; `mock` answers the outbound calls of the Deployment's pods from their recorded egress, and the switch is live. See [Mock mode](Mock-mode). |
 | `spec.mock.latencyFactor` | number | `1` | 0 to 100, rounded to the hundredth | Multiplies the recorded latency of a mocked answer; `0` answers at once. Applied live: each pod gets it with its next egress pull (`Mimic-Latency-Factor`). |
 | `spec.mock.passthrough` | list of string | empty | max 256 entries, the `spec.tls.exclude` grammar | Destinations a mocked pod still reaches for real. Applied to pods created afterwards. |
 | `spec.tls.exclude` | list of string | empty | max 256 entries, each max 253 chars | Names never TLS-intercepted: exact host, `*.example.com` (below, not itself) or IP literal. See [TLS interception](TLS-interception). A union above 256 entries is cut to the first 256 in sorted order (WARN `tls exclude truncated`). |
@@ -33,6 +33,12 @@ Status (written by the controller only, through the status subresource):
 | `status.discovery.sampleBytes` | Bytes held by samples. |
 | `status.discovery.pods` | Pods whose last push is within `MIMIC_STATUS_POD_WINDOW`. |
 | `status.discovery.lastPushTime` | Last applied push, UTC, seconds; absent without data. |
+
+Existing `MimicWorkload`s keep the `spec.mode` stored at their creation (the API server persists defaults when it
+writes an object), so the default changing from `discovery` to `none` does not stop them from recording. Only
+objects created without `spec.mode` afterwards, and Deployments injected by label with no `MimicWorkload`, are in
+`none`. Switching between `none`, `discovery` and `mock` restarts nothing; the sidecar exposes the mode it is in as
+`mimic_mode{mode}` and logs `mode changed`.
 
 `kubectl get mimicworkload` prints `Mode`, `Endpoints` (total: inbound + outbound), `Pods`, `Last push` (age) and `Mode pods`
 (`status.mode.pods`: pods whose last egress answer carried the effective mode). A deployment without data has zero
@@ -166,7 +172,7 @@ Set by the webhook; the defaults are what it sets unless noted.
 | `MIMIC_DISCOVERY_PUSH_INTERVAL` | `30s` | 1s-1h. Not set by the webhook. |
 | `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | Period of the egress pull. 1s-1h. Not set by the webhook. |
 | `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | Largest egress set read. 64Ki-1Gi. Raising it needs a larger sidecar memory limit. Not set by the webhook. |
-| `MIMIC_MODE` | `discovery` | `discovery` or `mock` at start, set by the webhook from the effective mode. Then the controller's answers switch it live. See [Mock mode](Mock-mode). |
+| `MIMIC_MODE` | `discovery` | `none`, `discovery` or `mock` at start, set by the webhook from the effective mode. Then the controller's answers switch it live. See [Mock mode](Mock-mode). |
 | `MIMIC_MOCK_LATENCY_FACTOR` | `1` | Latency factor until the first pull answer, 0 to 100 with at most 2 fractional digits. Set by the webhook when it is not 1. |
 | `MIMIC_MOCK_PASSTHROUGH` | empty | Destinations a mocked pod still reaches for real, the `spec.tls.exclude` grammar. Set by the webhook from `spec.mock.passthrough`. |
 | `MIMIC_MOCK_MAX_PENDING` | `1024` | Mocked requests pending at once; more get `599` (`overload`). 1-65536. Sized with the 128 Mi sidecar limit. |

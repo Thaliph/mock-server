@@ -68,7 +68,7 @@ ben_01_arguments_only_dry_run() {
 
 ben_02_invalid_configuration_refused() {
   local case
-  for case in "SETUPS=none" "PROTOCOLS=http2" "RATES=0" "RATES=201" "RATES=1.5" "RATES=" \
+  for case in "SETUPS=mock" "PROTOCOLS=http2" "RATES=0" "RATES=201" "RATES=1.5" "RATES=" \
     "DURATION=0s" "DURATION=301s" "DURATION=30" "CONNECTIONS=0" "CONNECTIONS=65" "PAUSE=-1" \
     "CLUSTER=Bad_Name" "CLUSTER=mimic-e2e" "CLUSTER=mimic-e2e2" "NODE_IMAGE=kindest/node:v1.33.12" \
     "RATES=9223372036854775808" "RATES=18446744073709551616" "RATES=0200" \
@@ -107,12 +107,13 @@ ben_04_defaults_are_the_matrix() {
   run -- --dry-run
   check "the default cluster is mimic-bench" has "cluster mimic-bench"
   check "the default namespace is mimic-bench" has "namespace mimic-bench"
-  check "the default matrix is 12 runs" runs_is 12
-  check "the default matrix pauses 11 times" pauses_is 11
+  check "the default matrix is 18 runs" runs_is 18
+  check "the default matrix pauses 17 times" pauses_is 17
   check "the default duration is 30s" has "-t 30s"
   check "the default pause is 10s" has "pause 10s"
   check "the default matrix has the plain setup" has "setup plain"
   check "the default matrix has the discovery setup" has "setup discovery"
+  check "the default matrix has the none setup" has "setup none "
   check "the default matrix has h2c" has "protocol h2c"
   check "the default matrix has rate 100" has "rate 100 "
   check "nothing is run" no_calls

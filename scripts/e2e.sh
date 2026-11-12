@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end checks on kind (CHT-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
+# End-to-end checks on kind (CHT-08, NON-08, MON-02, MON-21, FND-08, FND-09, INJ-11..INJ-17, INJ-23, PRX-14, TLS-24..TLS-26, DSC-20, DSC-22, CTL-19..CTL-21, UI-11, UI-12, UI-14, EGR-19, SHR-19, SHR-20, PUL-19, GRP-28, MCK-19, LDT-16, LDT-19 E via scripts/e2e-load.sh --suite).
 # Idempotent:
 # reuses the cluster if it exists; the scenario namespaces are recreated on each run.
 #
@@ -347,7 +347,7 @@ crd_columns=$(kubectl get crd mimicworkloads.mimic.platform.io -o jsonpath='{ran
 [[ $(kubectl get crd mimicworkloads.mimic.platform.io -o jsonpath='{.spec.versions[0].subresources.status}') == '{}' ]] \
   || fail "ctl_19: the CRD has no status subresource"
 
-# The CRD: spec.deployment is required, DNS-1123, immutable; spec.mode defaults to discovery.
+# The CRD: spec.deployment is required, DNS-1123, immutable; spec.mode defaults to none (M0).
 workload() {
   printf 'apiVersion: mimic.platform.io/v1alpha1\nkind: MimicWorkload\nmetadata: {name: %s, namespace: default}\n%s\n' "$1" "$2" \
     | kubectl apply -f - >/dev/null
@@ -357,8 +357,11 @@ denied "a MimicWorkload without spec.deployment" workload t2 "spec: {mode: mock}
 denied "a MimicWorkload with an invalid spec.deployment" workload t3 "spec: {deployment: Bad_Name}"
 denied "a MimicWorkload with an invalid spec.mode" workload t4 "spec: {deployment: api, mode: nope}"
 accepted "a valid MimicWorkload" workload t5 "spec: {deployment: api}"
-[[ $(kubectl -n default get mimicworkload t5 -o jsonpath='{.spec.mode}') == discovery ]] \
-  || fail "inj_12: spec.mode does not default to discovery"
+[[ $(kubectl -n default get mimicworkload t5 -o jsonpath='{.spec.mode}') == none ]] \
+  || fail "inj_12: spec.mode does not default to none"
+accepted "a MimicWorkload with spec.mode none, discovery and mock" workload t6 "spec: {deployment: api, mode: discovery}"
+accepted "a MimicWorkload with spec.mode none" workload t7 "spec: {deployment: api2, mode: none}"
+kubectl -n default delete mimicworkload t6 t7 --ignore-not-found >/dev/null
 denied "a change of spec.deployment" kubectl -n default patch mimicworkload t5 --type=merge -p '{"spec":{"deployment":"web"}}'
 kubectl -n default delete mimicworkload t5 --ignore-not-found >/dev/null
 
@@ -1119,6 +1122,17 @@ JAVA
 kubectl -n tls-clients create configmap tls-scripts --from-file=client.py="$WORK/client.py" \
   --from-file=client.mjs="$WORK/client.mjs" --from-file=Client.java="$WORK/Client.java" \
   --from-file=only-e2e.pem="$WORK/e2e-ca.crt" >/dev/null
+# Mode none (the default) passes TLS through: the clients are in discovery, and the controller's cache follows the API
+# server within seconds (as in INJ-15) before their pods are admitted.
+for c in curl python node jvm pinned; do
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: $c, namespace: tls-clients}
+spec: {deployment: $c, mode: discovery}
+YAML
+done
+sleep 5
 client_deploy curl "mimic-e2e-curl:$TAG"
 client_deploy python "mimic-e2e-python:$TAG"
 client_deploy node "mimic-e2e-node:$TAG"
@@ -1172,7 +1186,7 @@ kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: excluded, namespace: tls-clients}
-spec: {deployment: excluded, tls: {exclude: [$dest]}}
+spec: {deployment: excluded, mode: discovery, tls: {exclude: [$dest]}}
 YAML
 # The controller's MimicWorkload cache follows the API server within seconds (as in INJ-15).
 sleep 5
@@ -1330,12 +1344,12 @@ kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: users-a, namespace: disc-22}
-spec: {deployment: users, discovery: {redact: [x-tenant-key, pin]}}
+spec: {deployment: users, mode: discovery, discovery: {redact: [x-tenant-key, pin]}}
 ---
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: users-b, namespace: disc-22}
-spec: {deployment: users, discovery: {redact: [pin, badge]}}
+spec: {deployment: users, mode: discovery, discovery: {redact: [pin, badge]}}
 YAML
 # The controller's MimicWorkload cache follows the API server within seconds (as in INJ-15).
 sleep 5
@@ -1918,7 +1932,7 @@ kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: front, namespace: egr-19}
-spec: {deployment: front}
+spec: {deployment: front, mode: discovery}
 YAML
 kubectl -n egr-19 apply -f scripts/e2e/apps/front-injected.yaml >/dev/null
 kubectl -n egr-19 rollout status deploy/front --timeout=3m >/dev/null \
@@ -2364,7 +2378,7 @@ for d in grpc-a grpc-b; do
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: $d, namespace: grpc-28}
-spec: {deployment: $d}
+spec: {deployment: $d, mode: discovery}
 YAML
 done
 grpc_deploy() {
@@ -2508,13 +2522,13 @@ YAML
 kubectl -n mck-19-provider rollout status deploy/provider --timeout=2m >/dev/null || fail "mck_19: the provider did not roll out"
 
 # front: the python image derived with the e2e CA (tls_25), so that its HTTPS calls to the provider trust the
-# destination through mimic exactly as the TLS clients do. A MimicWorkload with no mode: discovery.
+# destination through mimic exactly as the TLS clients do. The MimicWorkload says mode discovery.
 kubectl -n mck-19 create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py >/dev/null
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: front, namespace: mck-19}
-spec: {deployment: front}
+spec: {deployment: front, mode: discovery}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -2939,7 +2953,7 @@ kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: mon02, namespace: $mon02_ns}
-spec: {deployment: mon02-app}
+spec: {deployment: mon02-app, mode: discovery}
 YAML
 deploy_sleeper $mon02_ns mon02-app
 kubectl -n $mon02_ns rollout status deploy/mon02-app --timeout=3m
@@ -3110,7 +3124,7 @@ kubectl apply -f - >/dev/null <<YAML
 apiVersion: mimic.platform.io/v1alpha1
 kind: MimicWorkload
 metadata: {name: mon21, namespace: $mon21_ns}
-spec: {deployment: mon21-app}
+spec: {deployment: mon21-app, mode: discovery}
 YAML
 deploy_sleeper $mon21_ns mon21-app
 kubectl -n $mon21_ns rollout status deploy/mon21-app --timeout=3m
@@ -3342,6 +3356,153 @@ kubectl -n "$NS" delete configmap mon21-dashboard mon21-dashboard-off --ignore-n
 install || fail "mon_21: helm upgrade back to the defaults"
 kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=2m
 if kubectl -n "$NS" get deploy $RELEASE-grafana >/dev/null 2>&1; then fail "mon_21: Grafana is still rendered with the defaults"; fi
+
+# --- Mode none (M0, spec §3, §12.20 NON-08) -----------------------------------------------------------------------
+# users (2 pods) in non-08, injected by label with no MimicWorkload: mode none, proxied, nothing recorded. A
+# MimicWorkload with spec.mode discovery makes the pods record within a pull interval (60 s by default) plus a status
+# pass, with no restart; spec.mode none stops it again.
+log "non_08: a deployment injected by label with no MimicWorkload is in none and records nothing; spec.mode discovery records it without a restart"
+ns_fresh non-08 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+# Its own client, in a namespace mimic does not inject (disc-22-client is gone by now).
+ns_fresh non-08-client
+kubectl -n non-08-client apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: client, labels: {app: client}}
+spec:
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: client
+      image: $(yq -r 'select(.kind == "Pod") | .spec.containers[0].image' scripts/e2e/apps/front.yaml)
+      command: [sleep, "3600"]
+YAML
+kubectl -n non-08 create configmap apps-code --from-file=service.py=scripts/e2e/apps/service.py >/dev/null
+kubectl -n non-08 apply -f scripts/e2e/apps/users.yaml >/dev/null
+kubectl -n non-08-client wait --for=condition=Ready pod/client --timeout=180s >/dev/null \
+  || fail "non_08: client pod not Ready"
+kubectl -n non-08 rollout status deploy/users --timeout=3m >/dev/null \
+  || { kubectl -n non-08 describe pods -l app=users >&2 || true; fail "non_08: deployment users did not roll out"; }
+has_mimic non-08 app=users || fail "non_08: users was not injected"
+non08_pods=$(kubectl -n non-08 get pods -l app=users -o jsonpath='{.items[*].metadata.name}')
+for p in $non08_pods; do
+  [[ $(jp non-08 "$p" '{.spec.initContainers[?(@.name=="mimic-sidecar")].env[?(@.name=="MIMIC_MODE")].value}') == none ]] \
+    || fail "non_08: pod $p of a deployment without a MimicWorkload does not carry MIMIC_MODE=none"
+done
+# non08_exchanges <pod>: the exchanges the sidecar of the pod counted, all results (read over loopback in the app).
+non08_exchanges() {
+  kubectl -n non-08 exec -i "$1" -c app -- python3 - <<'PY'
+import urllib.request
+text = urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read().decode()
+print(int(sum(float(l.rsplit(" ", 1)[1]) for l in text.splitlines() if l.startswith("mimic_discovery_exchanges_total{"))))
+PY
+}
+# non08_mode <pod> <mode>: the pod's sidecar has mimic_mode{mode} at 1.
+non08_mode() {
+  kubectl -n non-08 exec -i "$1" -c app -- python3 - "$2" <<'PY'
+import sys, urllib.request
+text = urllib.request.urlopen("http://127.0.0.1:15100/metrics", timeout=5).read().decode()
+sys.exit(0 if f'mimic_mode{{mode="{sys.argv[1]}"}} 1' in text else 1)
+PY
+}
+# non08_calls <n> <canary>: n GETs of users from the non-08-client pod (outside the injected namespaces).
+non08_calls() {
+  kubectl -n non-08-client exec -i client -- python3 - "$1" "$2" <<'PY'
+import sys, urllib.request
+n, canary = int(sys.argv[1]), sys.argv[2]
+ok = 0
+for i in range(1, n + 1):
+    req = urllib.request.Request(f"http://users.non-08.svc:8080/users/{i}", headers={"X-Tenant-Key": canary})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        r.read()
+        ok += r.status == 200
+print(ok)
+PY
+}
+non08_canary="non08-tenant-$(openssl rand -hex 12)"
+non08_ok=$(non08_calls 20 "$non08_canary") || fail "non_08: the calls to users failed"
+[[ $non08_ok == 20 ]] || fail "non_08: users answered $non08_ok of 20 calls with 200 through the sidecar in none"
+sleep 3
+for p in $non08_pods; do
+  non08_mode "$p" none || fail "non_08: the sidecar of $p does not show mimic_mode{mode=\"none\"} 1"
+  [[ $(non08_exchanges "$p") == 0 ]] || fail "non_08: the sidecar of $p recorded exchanges in none"
+done
+# non08_keys: the Valkey keys of users in non-08 (the keys of its pods, report and egress, and its pulls).
+non08_keys() {
+  local keys
+  keys=$(kubectl -n "$NS" exec statefulset/$RELEASE-valkey -- valkey-cli --raw --scan --pattern 'mimic:v1:{non-08/users}*') || return 1
+  sort <<<"$keys"
+}
+non08_restarts() { kubectl -n non-08 get pods -l app=users -o jsonpath='{range .items[*]}{.metadata.name}{"="}{range .status.initContainerStatuses[*]}{.restartCount}{","}{end}{"\n"}{end}'; }
+# In none the controller holds no discovery data: no report (404 on the read API) and no key but the pulls of the pods.
+ui_forward
+[[ $(curl -s -o /dev/null -w '%{http_code}' --max-time 10 localhost:18082/v1/workloads/non-08/users/report) == 404 ]] \
+  || fail "non_08: the controller holds a report for a deployment in none"
+non08_all=$(non08_keys) || fail "non_08: the Valkey key scan failed"
+# Not vacuous: the pods' pulls are there (the scan reached the right keyspace).
+grep -q ':pulls$' <<<"$non08_all" || fail "non_08: no pulls key for a deployment in none (scan: '$non08_all')"
+non08_other=$(grep -v ':pulls$' <<<"$non08_all" || true)
+[[ -z $non08_other ]] || fail "non_08: Valkey holds keys for a deployment in none besides its pulls: $non08_other"
+non08_before=$(non08_restarts)
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: users, namespace: non-08}
+spec: {deployment: users, mode: discovery}
+YAML
+mode_wait_non08() {
+  local end=$((SECONDS + $3)) s
+  while (( SECONDS < end )); do
+    s=$(kubectl -n non-08 get mimicworkload users -o jsonpath='{.status.mode}') || return 1
+    if jq -e --arg m "$1" --argjson p "$2" '.mode == $m and .pods == $p and .otherPods == 0' <<< "$s" >/dev/null 2>&1; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+mode_wait_non08 discovery 2 150 \
+  || fail "non_08: status.mode did not converge to discovery with 2 pods within 2 pull intervals: $(kubectl -n non-08 get mimicworkload users -o jsonpath='{.status.mode}')"
+# In discovery the header is recorded as sent (x-tenant-key has no redaction rule here, and a redact list
+# would only reach new pods): these calls carry a plain value, the canary is only sent while in none.
+non08_ok=$(non08_calls 20 non08-tenant-plain) || fail "non_08: the calls to users in discovery failed"
+[[ $non08_ok == 20 ]] || fail "non_08: users answered $non08_ok of 20 calls with 200 in discovery"
+non08_total=0
+for _ in $(seq 20); do
+  non08_total=0
+  for p in $non08_pods; do non08_total=$((non08_total + $(non08_exchanges "$p"))); done
+  (( non08_total >= 20 )) && break
+  sleep 2
+done
+(( non08_total >= 20 )) || fail "non_08: the sidecars recorded $non08_total exchanges of the 20 calls after the switch to discovery"
+[[ $(non08_restarts) == "$non08_before" ]] || fail "non_08: a pod restarted with the switch: $non08_before then $(non08_restarts)"
+# The pods push every MIMIC_DISCOVERY_PUSH_INTERVAL: the controller then holds the report with the calls.
+ui_forward
+non08_report=$WORK/non08-report.json
+for _ in $(seq 40); do
+  curl -fs --max-time 10 localhost:18082/v1/workloads/non-08/users/report > "$non08_report" 2>/dev/null && break
+  sleep 5
+done
+jq -e . "$non08_report" >/dev/null 2>&1 || fail "non_08: the controller holds no report of users after the switch to discovery"
+found -e '/users' "$non08_report" || fail "non_08: the report of users does not hold the calls to /users"
+! found -F "$non08_canary" "$non08_report" || fail "non_08: the canary is in the report"
+kubectl -n non-08 patch mimicworkload users --type merge -p '{"spec":{"mode":"none"}}' >/dev/null
+mode_wait_non08 none 2 150 \
+  || fail "non_08: status.mode did not converge to none with 2 pods: $(kubectl -n non-08 get mimicworkload users -o jsonpath='{.status.mode}')"
+non08_after_switch=0
+for p in $non08_pods; do non08_after_switch=$((non08_after_switch + $(non08_exchanges "$p"))); done
+non08_ok=$(non08_calls 20 "$non08_canary") || fail "non_08: the calls to users after the switch back to none failed"
+sleep 3
+non08_end=0
+for p in $non08_pods; do non08_end=$((non08_end + $(non08_exchanges "$p"))); done
+[[ $non08_end == "$non08_after_switch" ]] || fail "non_08: the sidecars recorded $((non08_end - non08_after_switch)) exchanges after the switch back to none"
+[[ $(non08_restarts) == "$non08_before" ]] || fail "non_08: a pod restarted with the switch back to none"
+# No canary of the calls in any log of the namespace.
+kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-containers --tail=-1 > "$WORK/non08-controller.log"
+! found -F "$non08_canary" "$WORK/non08-controller.log" || fail "non_08: the canary is in the controller logs"
+for p in $non08_pods; do
+  for c in app mimic-sidecar; do
+    ! kubectl -n non-08 logs "$p" -c "$c" 2>/dev/null | grep -qF "$non08_canary" || fail "non_08: the canary is in the $c log of $p"
+  done
+done
+kubectl delete namespace non-08 non-08-client --wait=false >/dev/null
 
 log "inj_23: helm uninstall leaves the CRD and a MimicWorkload; a reinstall with the same release name keeps it"
 kubectl apply -f - >/dev/null <<YAML
