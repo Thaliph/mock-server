@@ -500,11 +500,10 @@ async fn pul_18_discovery_worst_case_with_two_pulls_and_a_refused_body_stays_und
 
     let done = Arc::new(AtomicUsize::new(0));
     let loading = tokio::spawn(load(discovery.clone(), done.clone()));
-    // The pulls start when 90% of the exchanges are recorded.
-    for _ in 0..6000 {
-        if done.load(Ordering::Relaxed) >= PULLS_FROM {
-            break;
-        }
+    // The pulls start when 90% of the exchanges are recorded. The wait ends on the count, not
+    // on a fixed number of sleeps: a loaded machine records slower, not differently.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
+    while done.load(Ordering::Relaxed) < PULLS_FROM && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let level = |label: &str, done: &AtomicUsize| {

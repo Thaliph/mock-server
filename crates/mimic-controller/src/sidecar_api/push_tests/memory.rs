@@ -305,6 +305,13 @@ async fn shr_18_child_work() {
 /// Fills both deployments to the store limits, then runs the measured pushes in a child process;
 /// the peak RSS of the child, in bytes.
 async fn measure(budget: Option<u64>, pulled: bool) -> u64 {
+    // One measured child at a time (#492): the memory tests of this binary otherwise run their
+    // children together, and a loaded machine stretches each child's run and raises its peak
+    // (peaks of 217 to 367 MiB across these tests in runs under 12 busy loops, SHR-18's limit
+    // being 356 MiB).
+    // The spec budgets are unchanged; only the contention between the measured children goes.
+    static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _turn = ONE_AT_A_TIME.lock().await;
     // Everything but the measured work happens here: the bodies are built, and both
     // deployments are first filled to the store limits (a first push each), so that the
     // measured pushes merge into full stored reports.
