@@ -4026,6 +4026,9 @@ msh_55_metric() { sidecar_metrics msh-55 "$msh_55_client" | awk -v n="$1" 'index
 msh_55_view() { [[ $(msh_55_metric mimic_mesh_view_endpoints) == 3 ]]; }
 for _ in $(seq 60); do msh_55_view && break; sleep 1; done
 msh_55_view || fail "msh_55: the sidecar of client never held a view with the 3 endpoints of pods"
+# Slow start (default 30 s, spec §7.9): pods that became ready after the sidecar's first view ramp up from 10 %
+# of their weight. The spread is checked once every endpoint is past the window.
+sleep 31
 # One keep-alive connection, 300 requests (a Python client that reuses its connection).
 kubectl -n msh-55 exec deploy/client -c app -- python3 -c '
 import http.client
