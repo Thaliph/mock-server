@@ -21,6 +21,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
 use crate::exchange::ReqBody;
+use crate::tls::intercept::Origin;
+use crate::transport::Stream;
 
 /// HTTP/1 connections per pod (design §3.2, the default of `circuitBreaker.maxConnections`).
 pub(crate) const MAX_H1_CONNECTIONS: usize = 1024;
@@ -50,6 +52,68 @@ pub(crate) async fn dial(addr: SocketAddr, timeout: Duration) -> io::Result<TcpS
         tracing::debug!(upstream = %addr, error = %e, "cannot configure socket");
     }
     Ok(stream)
+}
+
+/// A connection to a pod: plain TCP, or TLS when the app's TLS is re-originated (spec §7.9).
+pub(crate) enum Wire {
+    Plain(TcpStream),
+    Tls(Stream),
+}
+
+impl AsyncRead for Wire {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            Wire::Plain(tcp) => Pin::new(tcp).poll_read(cx, buf),
+            Wire::Tls(tls) => Pin::new(tls).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Wire {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            Wire::Plain(tcp) => Pin::new(tcp).poll_write(cx, buf),
+            Wire::Tls(tls) => Pin::new(tls).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            Wire::Plain(tcp) => Pin::new(tcp).poll_flush(cx),
+            Wire::Tls(tls) => Pin::new(tls).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            Wire::Plain(tcp) => Pin::new(tcp).poll_shutdown(cx),
+            Wire::Tls(tls) => Pin::new(tls).poll_shutdown(cx),
+        }
+    }
+}
+
+/// [`dial`], then the TLS handshake of `origin` (the same timeout) when there is one: the
+/// certificate is verified against its name, and a failure is an error, never cleartext.
+async fn dial_wire(
+    addr: SocketAddr,
+    timeout: Duration,
+    origin: Option<&Origin>,
+) -> io::Result<Wire> {
+    let tcp = dial(addr, timeout).await?;
+    match origin {
+        None => Ok(Wire::Plain(tcp)),
+        Some(origin) => Ok(Wire::Tls(Stream::tls(
+            origin.connect(tcp, timeout).await?.into(),
+        ))),
+    }
 }
 
 /// A connection taken from a pool for one request; handed back when dropped.
@@ -147,6 +211,7 @@ struct Idle {
 
 pub(crate) struct H1Pool {
     addr: SocketAddr,
+    origin: Option<Arc<Origin>>,
     idle_timeout: Duration,
     connect_timeout: Duration,
     idle: Mutex<Vec<Idle>>,
@@ -157,9 +222,15 @@ pub(crate) struct H1Pool {
 }
 
 impl H1Pool {
-    fn new(addr: SocketAddr, idle_timeout: Duration, connect_timeout: Duration) -> H1Pool {
+    fn new(
+        addr: SocketAddr,
+        origin: Option<Arc<Origin>>,
+        idle_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> H1Pool {
         H1Pool {
             addr,
+            origin,
             idle_timeout,
             connect_timeout,
             idle: Mutex::new(Vec::new()),
@@ -218,7 +289,7 @@ impl H1Pool {
 
     /// A lease on a connection whose driver is gone (test hook).
     async fn closed_lease(self: &Arc<Self>) -> io::Result<Lease> {
-        let stream = dial(self.addr, self.connect_timeout).await?;
+        let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http1::Builder::new()
             .handshake(TokioIo::new(stream))
             .await
@@ -235,7 +306,7 @@ impl H1Pool {
     }
 
     async fn connect(self: &Arc<Self>) -> io::Result<http1::SendRequest<ReqBody>> {
-        let stream = dial(self.addr, self.connect_timeout).await?;
+        let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http1::Builder::new()
             .preserve_header_case(true)
             .allow_obsolete_multiline_headers_in_responses(true)
@@ -278,6 +349,7 @@ struct Conn {
 
 pub(crate) struct H2Pool {
     addr: SocketAddr,
+    origin: Option<Arc<Origin>>,
     idle_timeout: Duration,
     connect_timeout: Duration,
     started: Instant,
@@ -288,9 +360,15 @@ pub(crate) struct H2Pool {
 }
 
 impl H2Pool {
-    fn new(addr: SocketAddr, idle_timeout: Duration, connect_timeout: Duration) -> H2Pool {
+    fn new(
+        addr: SocketAddr,
+        origin: Option<Arc<Origin>>,
+        idle_timeout: Duration,
+        connect_timeout: Duration,
+    ) -> H2Pool {
         H2Pool {
             addr,
+            origin,
             idle_timeout,
             connect_timeout,
             started: Instant::now(),
@@ -302,7 +380,7 @@ impl H2Pool {
 
     /// A lease on a connection whose driver is gone (test hook).
     async fn closed_lease(&self) -> io::Result<Lease> {
-        let stream = dial(self.addr, self.connect_timeout).await?;
+        let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http2::Builder::new(TokioExecutor::new())
             .handshake(TokioIo::new(stream))
             .await
@@ -350,7 +428,7 @@ impl H2Pool {
             return Ok(lease);
         }
         if lock(&self.conns).len() < MAX_H2_CONNECTIONS {
-            let stream = dial(self.addr, self.connect_timeout).await?;
+            let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
             let max_streams = Arc::new(AtomicU32::new(u32::MAX));
             let (sender, connection) = http2::Builder::new(TokioExecutor::new())
                 .handshake(TokioIo::new(Snoop::new(stream, max_streams.clone())))
@@ -422,7 +500,7 @@ const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
 /// A client socket that reads the SETTINGS frames of the server to learn its
 /// `MAX_CONCURRENT_STREAMS`, which `hyper` does not expose. The bytes pass unchanged.
 struct Snoop {
-    inner: TcpStream,
+    inner: Wire,
     max_streams: Arc<AtomicU32>,
     head: [u8; 9],
     head_len: usize,
@@ -433,7 +511,7 @@ struct Snoop {
 }
 
 impl Snoop {
-    fn new(inner: TcpStream, max_streams: Arc<AtomicU32>) -> Snoop {
+    fn new(inner: Wire, max_streams: Arc<AtomicU32>) -> Snoop {
         Snoop {
             inner,
             max_streams,
@@ -545,9 +623,12 @@ impl Pool {
 }
 
 /// The pools of the sidecar.
+/// A pool is per pod address, protocol and, for re-originated TLS, the name verified.
+type PoolKey = (SocketAddr, Protocol, Option<Arc<str>>);
+
 pub(crate) struct Pools {
     idle_timeout: Duration,
-    pools: Mutex<HashMap<(SocketAddr, Protocol), Arc<Pool>>>,
+    pools: Mutex<HashMap<PoolKey, Arc<Pool>>>,
     sweeping: AtomicBool,
     /// Checkouts left that hand out a closed connection (test hook).
     poison: AtomicUsize,
@@ -573,6 +654,7 @@ impl Pools {
         self: &Arc<Self>,
         addr: SocketAddr,
         protocol: Protocol,
+        origin: Option<&Arc<Origin>>,
         again: Option<&Lease>,
         connect_timeout: Duration,
     ) -> io::Result<Lease> {
@@ -580,16 +662,19 @@ impl Pools {
         let again = again.map(Lease::id);
         self.ensure_sweeper();
         let pool = lock(&self.pools)
-            .entry((addr, protocol))
+            .entry((addr, protocol, origin.map(|o| o.key().clone())))
             .or_insert_with(|| {
+                let origin = origin.cloned();
                 Arc::new(match protocol {
                     Protocol::Http1 => Pool::Http1(Arc::new(H1Pool::new(
                         addr,
+                        origin,
                         self.idle_timeout,
                         connect_timeout,
                     ))),
                     Protocol::Http2 => Pool::Http2(Arc::new(H2Pool::new(
                         addr,
+                        origin,
                         self.idle_timeout,
                         connect_timeout,
                     ))),
@@ -635,7 +720,7 @@ impl Pools {
     /// finish, their idle connections close.
     pub(crate) fn retain(&self, live: &HashSet<SocketAddr>) {
         let mut pools = lock(&self.pools);
-        pools.retain(|(addr, _), pool| {
+        pools.retain(|(addr, ..), pool| {
             let keep = live.contains(addr);
             if !keep {
                 pool.drain();
@@ -647,10 +732,13 @@ impl Pools {
     /// Closes the idle HTTP/1 connections to `addr` (a connection of the app left `hyper` for
     /// it, spec §4.1 limit 8).
     pub(crate) fn close_idle(&self, addr: SocketAddr) {
-        if let Some(pool) = lock(&self.pools).get(&(addr, Protocol::Http1))
-            && let Pool::Http1(pool) = &**pool
-        {
-            pool.close_idle();
+        for ((at, protocol, _), pool) in lock(&self.pools).iter() {
+            if *at == addr
+                && *protocol == Protocol::Http1
+                && let Pool::Http1(pool) = &**pool
+            {
+                pool.close_idle();
+            }
         }
     }
 
@@ -687,7 +775,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::{Snoop, least_busy};
+    use super::{Snoop, Wire, least_busy};
 
     #[test]
     fn msh_69_at_the_h2_bound_a_resent_stream_never_takes_the_failed_connection() {
@@ -707,7 +795,7 @@ mod tests {
         let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
             .await
             .unwrap();
-        Snoop::new(stream, max.clone())
+        Snoop::new(Wire::Plain(stream), max.clone())
     }
 
     fn settings(values: &[(u16, u32)], flags: u8) -> Vec<u8> {

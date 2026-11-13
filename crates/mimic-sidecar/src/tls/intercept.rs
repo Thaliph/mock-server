@@ -242,11 +242,35 @@ impl Interception {
             Ok(Ok(stream)) => Ok(stream),
             // A TLS-level failure (certificate, alert, version, cipher) is the destination's
             // verdict; anything else is the connection failing under the handshake.
-            Ok(Err(e)) if e.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()) => {
-                Err(ConnectError::Reason(Reason::UpstreamUntrusted))
-            }
+            Ok(Err(e)) if is_tls_error(&e) => Err(ConnectError::Reason(Reason::UpstreamUntrusted)),
             Ok(Err(e)) | Err(e) => Err(ConnectError::Io(e)),
         }
+    }
+
+    /// The sidecar's TLS towards the pods of an in-scope Service (spec §7.9 "Intercepted TLS"):
+    /// the name verified and sent as SNI is the one the app sent, else `service`
+    /// (`<name>.<namespace>.svc`), never an IP; `alpn` is the only protocol offered.
+    pub(crate) async fn origin(
+        &self,
+        plan: &Plan,
+        service: &str,
+        alpn: Option<&'static [u8]>,
+    ) -> io::Result<Origin> {
+        let name = match plan.sni {
+            Some(_) => plan.server_name.clone(),
+            None => ServerName::try_from(service.to_string()).map_err(io::Error::other)?,
+        };
+        let mut config = ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
+            .with_root_certificates(self.roots().await?)
+            .with_no_client_auth();
+        config.alpn_protocols = alpn.into_iter().map(<[u8]>::to_vec).collect();
+        Ok(Origin {
+            key: Arc::from(name.to_str().as_ref()),
+            name,
+            connector: TlsConnector::from(Arc::new(config)),
+        })
     }
 
     /// Counts the connection under `reason` and remembers the destination of `plan`; the first
@@ -354,7 +378,53 @@ pub(crate) struct Plan {
     leaf: Arc<CertifiedKey>,
 }
 
+/// How the sidecar speaks TLS to a pod: the name it verifies the certificate against (and sends
+/// as SNI) and the roots, fixed for a connection of the app.
+pub(crate) struct Origin {
+    name: ServerName<'static>,
+    connector: TlsConnector,
+    key: Arc<str>,
+}
+
+impl Origin {
+    /// The name, which tells the pools of one pod apart.
+    pub(crate) fn key(&self) -> &Arc<str> {
+        &self.key
+    }
+
+    /// The handshake on `tcp` within `timeout`; the certificate is verified against the name.
+    pub(crate) async fn connect(
+        &self,
+        tcp: TcpStream,
+        timeout: Duration,
+    ) -> io::Result<client::TlsStream<Socket>> {
+        let handshake = self.connector.connect(self.name.clone(), Socket::new(tcp));
+        match tokio::time::timeout(timeout, handshake).await {
+            Ok(connected) => connected,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timeout")),
+        }
+    }
+}
+
+/// Whether a handshake failed on the certificate or another TLS rule (not the connection).
+pub(crate) fn is_tls_error(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<rustls::Error>())
+}
+
 impl Plan {
+    /// The SNI the app sent.
+    pub(crate) fn sni(&self) -> Option<&str> {
+        self.sni.as_deref()
+    }
+
+    /// The ALPN protocol a mesh-routed connection answers with: `http/1.1` when offered (the
+    /// sidecar pools its own connections to the pods), else `h2`, else none (spec §7.9).
+    pub(crate) fn mesh_alpn(&self) -> Option<&'static [u8]> {
+        [&b"http/1.1"[..], b"h2"]
+            .into_iter()
+            .find(|p| self.alpn.iter().any(|offered| offered.as_bytes() == *p))
+    }
+
     /// The ALPN protocol a mocked connection answers with: `h2` when offered, else `http/1.1`,
     /// else none (spec §5 "Mock mode").
     pub(crate) fn mock_alpn(&self) -> Option<Vec<u8>> {

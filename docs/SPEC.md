@@ -367,7 +367,7 @@ Accepted limits of the proxy:
   HTTP/1 and `h2c` to an in-scope Service) is the one place besides the load marker where HTTP/1
   is not byte-exact: it goes through `hyper` on both sides (header case preserved, no header
   added, no `Date` or `Server` added), and requests are balanced one by one. Everything not
-  in the view, TLS, other protocols and every connection with the mesh switched off
+  in the view, TLS that §5 does not intercept, other protocols and every connection with the mesh switched off
   keep the byte relay above (the sidecar balances what is not HTTP per connection, untouched:
   §7.9 "L4 balancing"). The accepted limits of a mesh-routed HTTP/1 connection:
   1. A **head reader** sits between the app's socket and `hyper` and judges each request head,
@@ -2561,9 +2561,10 @@ no insignificant whitespace):
   request head that is not an `Upgrade` or a `CONNECT`, the connection is **mesh-routed**: it is
   parsed by `hyper` and **each request** goes to a pod of the Service chosen by the caller's
   sidecar, over a pooled connection to `<pod IP>:<target port>`; a first HTTP/1 request with
-  `Upgrade` or `CONNECT` and TLS that §5 intercepts keep the byte relay to the original
-  destination (re-originating intercepted TLS is #443 step 3); anything else (TLS that is not
-  intercepted, other client-first protocols) is balanced per connection (**L4**, below). The pod is chosen in
+  `Upgrade` or `CONNECT` keeps the byte relay to the original destination; TLS that §5
+  intercepts is mesh-routed after decryption and re-originated to the pod (**intercepted TLS**,
+  below); anything else (TLS that is not intercepted, other client-first protocols) is
+  balanced per connection (**L4**, below). The pod is chosen in
   `mimic-core` `mesh::lb` by **power of two choices, least request**: two distinct endpoints are
   drawn at random (one endpoint: that one, none: `503` `x-mimic-error: no-endpoint`) and the one
   with the lower `(in_flight + 1) / weight` is taken, the first draw on a tie; `in_flight` counts
@@ -2623,7 +2624,9 @@ no insignificant whitespace):
   `hyper` (§4.1 limit 8): a pod is chosen for it like for any request, the head is written as
   received and the connection becomes a byte relay between the app and that pod (the access lines
   of §4.1, `upgrade: true` after a `101` or a `2xx` to `CONNECT`), never pooled. An answer that
-  declines the upgrade leaves a plain HTTP/1 connection on that pod. An HTTP/2 `CONNECT` is
+  declines the upgrade leaves a plain HTTP/1 connection on that pod. The idle pooled
+  connections of this sidecar to the chosen pod are closed when the connection leaves `hyper`,
+  so that the tunnel's is the app's only one there. An HTTP/2 `CONNECT` is
   answered `501` `x-mimic-error: unsupported`, counted (`mimic_mesh_requests_total`,
   `reason="unsupported"`) and logged.
   Mesh-routed HTTP/1 has the accepted limits listed at the end of §4.1.
@@ -2640,8 +2643,37 @@ no insignificant whitespace):
   `mimic_mesh_fallbacks_total`); when that fails too the connection is closed without a byte, as
   the byte relay does. The access line of the connection gains `backend` and `upstream`
   (§4.1). A stale view, `"mesh": false` and an opaque port are the byte relay as above. TLS that
-  §5 passes through (every ClientHello in `none`) is balanced this way; TLS that §5 intercepts is
-  not, until step 3.
+  §5 passes through (every ClientHello in `none`) is balanced this way; TLS that §5 intercepts
+  is not (next paragraph).
+  **Intercepted TLS** (#443 step 3). A connection to an in-scope Service whose ClientHello §5
+  intercepts (in `discovery`; in `mock` the mock answers) is not dialled to the original
+  destination first: the sidecar terminates the app's TLS as §5 says and each decrypted request
+  is balanced like a cleartext one, over a pooled connection to `<pod IP>:<target port>` that
+  the sidecar **re-originates over TLS**, with SNI the one the app sent (when it sent none, the
+  Service name `<name>.<namespace>.svc`) and the server certificate **verified against that same
+  name, never the pod IP**, against the trust roots of §5 for intercepted destinations.
+  Hostname verification is always on: no option, variable or fallback turns it off, and a pod
+  whose certificate does not verify is never spoken to in cleartext. A verification failure (or
+  any failed handshake) is a connect failure on that pod: it is avoided, one other pod is tried,
+  then the original destination (verified the same way, counted as a fallback); when every try
+  failed the request is answered `503` `x-mimic-error: connect-failed` inside the app's TLS
+  session, and the warn line `tls verification failed` carries `upstream` and `tls_error` (the
+  verification error, no certificate content). The pool of a pod is per (pod IP, port,
+  protocol, server name), so a connection verified for one name is never used for another.
+  ALPN: the app is answered `http/1.1` when it offered it, else `h2` when it offered it, else
+  none (HTTP/1), and the pod is offered only that protocol: the sidecar answers the app before
+  it connects, so it cannot follow the pod's ALPN as the byte relay does (a client offering
+  both speaks HTTP/1 to the sidecar, which keeps its own pooled connections to the pods). A
+  pod that requests a client certificate fails the handshake (`503`): exclude such a
+  destination in §5. A decrypted connection that is not HTTP (detected after decryption), or on
+  which a client that offered no ALPN stays silent for the detection wait, is relayed to one pod
+  over TLS verified as above (a failure closes it), not balanced per request. An `Upgrade` or
+  `CONNECT` (§4.1 limit 8) over intercepted TLS leaves `hyper` and goes to a pod over TLS the
+  same way. Access lines and exchanges are those of §4.1 (`tls: true`, `sni`, `backend`,
+  `upstream`). A client that rejects the leaf is remembered as in §5 and its next connection is
+  balanced per connection, untouched.
+  **Configuration**: the time a failed pod is avoided (5 s) is the `avoid_failed_for` field of
+  the sidecar's `MeshConfig`, not an environment variable: no `MIMIC_*` variable sets it.
   **Metrics** (sidecar, only with `MIMIC_MESH=on`; `service` and `backend` are
   `<namespace>/<name>` and `<namespace>/<name>:<port>`; no route exists yet: `route="none"`;
   `reason` is `none` or the `x-mimic-error` of an answer of the sidecar):
@@ -4800,6 +4832,15 @@ MSH-18 to MSH-30 are #441 (the watches, the route, the chart), MSH-31 to MSH-42 
 | MSH-69 | **I.** An unwritten request whose new connection to the pod fails (pod gone between the two connects, driven through the hook of MSH-59) goes to the original destination and is counted as a fallback and a reconnect, HTTP/1 and `h2c`; with the original destination refusing too the answer is `503` `connect-failed`. **U** (pool): at the HTTP/2 bound of 16 connections a stream sent again never takes the connection that failed, whichever is the least busy. An HTTP/2 `CONNECT` is counted in `mimic_mesh_requests_total` (`status_class="5xx"`, `reason="unsupported"`) and writes an access line with `status` 501. |
 | MSH-70 | **E** (kind, `scripts/e2e.sh` section `msh_70`, objects of that section only). A TCP echo Service of 3 replicas (each replica counts the connections it accepts, in its answer to a `count` command) and a client pod of the section in the view: after the slow-start window, 300 connections one after the other, each echoing a line, reach each replica 100 ± 40 times by the replicas' own counters, the access lines of the client's sidecar (`connection`) carry `backend` and `upstream` naming the replicas' pod IPs, and `mimic_mesh_fallbacks_total` stays 0. |
 | MSH-71 | **U** (sidecar configuration). Unset, `MIMIC_MESH_CONNECT_TIMEOUT` is 2 s; exit 2 (FND-01) below 100ms and over 10s. |
+
+#### M1 step 3: intercepted TLS (#443)
+
+| ID | Criterion |
+|---|---|
+| MSH-72 | **I** (in-process sidecar with a CA, three TLS pods whose certificate names `cart.shop.svc` and not the IP, signed by a CA of the trust directory; the app trusts the mimic root only). An HTTP/1 client with SNI `cart.shop.svc` and one with no SNI: 30 requests each are answered `200` and reach each of the 3 pods, every pod's handshake carrying SNI `cart.shop.svc`; the access lines have `tls: true`, `backend`, `upstream` a pod and `dst` the ClusterIP; an `h2`-only client is answered over `h2` and reaches the pods. |
+| MSH-73 | **I.** Verification: pods whose certificate is signed by an untrusted CA, or names another Service, or only their IP, are never given a byte of the request; the request is answered `503` `x-mimic-error: connect-failed` inside the app's TLS session, the warn line `tls verification failed` has `tls_error`; the original destination is tried after the pods (`mimic_mesh_fallbacks_total` counts it) and verified the same way; with one good pod and one bad pod every request is answered by the good one. No cleartext connection to a pod is made in any of these cases. |
+| MSH-74 | **I.** An `Upgrade` request over intercepted TLS reaches a pod over TLS and the bytes then flow both ways; a decrypted non-HTTP client-first protocol is relayed over TLS to one pod; a TLS client that rejects the mimic leaf is remembered and its next connection reaches a pod byte for byte (L4, MSH-63). |
+| MSH-75 | **E** (kind, `scripts/e2e.sh` section `msh_75`, own namespace, cleaned by a trap). A Service of 3 pods serving TLS with a certificate for its Service name, and a client pod of the section calling it by name over HTTPS: 60 requests are answered and each pod's own counter shows at least 5 of them, the client's sidecar writes access lines with `tls: true` and `upstream` the pods' IPs, and `mimic_mesh_fallbacks_total` stays 0; with the pods' certificate swapped for one signed by an unknown CA every request is answered `503` `connect-failed` and no pod received a request. |
 
 ## 13. Test strategy
 
