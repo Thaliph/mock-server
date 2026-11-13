@@ -551,6 +551,8 @@ impl Flight {
             mock: Some(mock),
             mock_miss: miss.map(Miss::as_str),
             load_run: None,
+            backend: None,
+            upstream: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.owed.store(true, Ordering::Release);
@@ -589,6 +591,8 @@ impl Drop for Flight {
             mock: None,
             mock_miss: None,
             load_run: None,
+            backend: None,
+            upstream: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.release();
@@ -876,6 +880,8 @@ impl Mock {
             mock: None,
             mock_miss: None,
             load_run: None,
+            backend: None,
+            upstream: None,
         });
     }
 }
@@ -891,6 +897,19 @@ impl Mock {
             ctx,
             clock: None,
             protocol: PROTOCOL_H2,
+        })
+    }
+
+    /// The mocked side of a mesh-routed connection (spec §7.9): each of its requests, HTTP/1 or
+    /// `h2`, is answered by [`Conn::serve`] while the mode is `mock`.
+    pub(crate) fn switched_mesh(&self, ctx: Ctx, h2: bool) -> Arc<Conn> {
+        self.connection("mocked");
+        Arc::new(Conn {
+            streams: Streams::new(),
+            mock: self.clone(),
+            ctx,
+            clock: None,
+            protocol: if h2 { PROTOCOL_H2 } else { PROTOCOL_H1 },
         })
     }
 }

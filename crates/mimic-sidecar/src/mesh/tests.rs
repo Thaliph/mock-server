@@ -199,3 +199,100 @@ fn msh_32_a_swapped_table_never_mixes_with_the_old_one() {
     assert_eq!(after.lookup(ip("10.96.0.10"), 80), None);
     assert_eq!(after.lookup(ip("10.96.0.11"), 80), Some("shop/pay"));
 }
+
+#[test]
+fn msh_47_pool_and_endpoint_label_defaults_and_values() {
+    let defaults = config(&[]).unwrap();
+    assert_eq!(defaults.pool_idle_timeout, Duration::from_secs(90));
+    assert_eq!(defaults.max_endpoint_labels, 256);
+    let set = config(&[
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "1s"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "10000"),
+    ])
+    .unwrap();
+    assert_eq!(set.pool_idle_timeout, Duration::from_secs(1));
+    assert_eq!(set.max_endpoint_labels, 10_000);
+    assert_eq!(
+        config(&[("MIMIC_MESH_POOL_IDLE_TIMEOUT", "1h")])
+            .unwrap()
+            .pool_idle_timeout,
+        Duration::from_secs(3600)
+    );
+}
+
+#[test]
+fn msh_47_invalid_pool_and_endpoint_label_values_are_refused() {
+    for (var, value) in [
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "999ms"),
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "3601s"),
+        ("MIMIC_MESH_POOL_IDLE_TIMEOUT", "soon"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "0"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "10001"),
+        ("MIMIC_METRICS_MAX_ENDPOINTS", "many"),
+    ] {
+        let error = config(&[(var, value)]).expect_err(&format!("{var}={value}"));
+        assert!(error.contains(var), "{error}");
+    }
+}
+
+#[test]
+fn msh_53_the_first_head_says_whether_the_connection_stays_on_the_byte_relay() {
+    use super::{Head, head_kind};
+    assert_eq!(head_kind(b""), Head::Partial);
+    assert_eq!(head_kind(b"GET / HTTP/1.1\r\nHost: a\r\n"), Head::Partial);
+    assert_eq!(
+        head_kind(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"),
+        Head::Routed
+    );
+    assert_eq!(head_kind(b"GET / HTTP/1.1\nHost: a\n\n"), Head::Routed);
+    assert_eq!(
+        head_kind(b"POST /u HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nab"),
+        Head::Routed
+    );
+    for relay in [
+        &b"GET /ws HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"[..],
+        b"GET /ws HTTP/1.1\r\nHost: a\r\nupgrade: h2c\r\n\r\n",
+        b"GET /ws HTTP/1.1\r\nHost: a\r\nUPGRADE : h2c\r\n\r\n",
+        b"GET /ws HTTP/1.1\nHost: a\nUpgrade: websocket\n\n",
+        b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        b"connect example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+    ] {
+        assert_eq!(
+            head_kind(relay),
+            Head::Relay,
+            "{}",
+            String::from_utf8_lossy(relay)
+        );
+    }
+    // A value that mentions upgrade is not the field.
+    assert_eq!(
+        head_kind(b"GET / HTTP/1.1\r\nHost: a\r\nX-Note: Upgrade: now\r\n\r\n"),
+        Head::Routed
+    );
+}
+
+#[test]
+fn msh_57_opaque_ports_default_and_override() {
+    let ports = |c: MeshConfig| c.opaque_ports.into_iter().collect::<Vec<u16>>();
+    assert_eq!(
+        ports(config(&[]).unwrap()),
+        vec![21, 22, 25, 587, 3306, 4444, 5432, 6379, 9300, 11211]
+    );
+    assert_eq!(
+        ports(config(&[("MIMIC_MESH_OPAQUE_PORTS", " 8080 , 9 ,8080")]).unwrap()),
+        vec![9, 8080]
+    );
+    assert!(ports(config(&[("MIMIC_MESH_OPAQUE_PORTS", "none")]).unwrap()).is_empty());
+}
+
+#[test]
+fn msh_57_invalid_opaque_ports_are_refused() {
+    let many = (1..=257)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    for value in ["0", "65536", "http", "80,,81", "80,", "-1", many.as_str()] {
+        let error = config(&[("MIMIC_MESH_OPAQUE_PORTS", value)]).expect_err(value);
+        assert!(error.contains("MIMIC_MESH_OPAQUE_PORTS"), "{error}");
+    }
+}

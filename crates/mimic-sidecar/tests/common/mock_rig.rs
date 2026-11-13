@@ -168,6 +168,8 @@ pub struct Options {
     pub mode: Option<Mode>,
     /// The destination of every connection, instead of the rig's own listener.
     pub dst: Option<SocketAddr>,
+    /// The mesh state of the listener (its metrics registered in the rig's).
+    pub mesh: Option<mimic_sidecar::mesh::MeshState>,
 }
 
 /// A destination that counts the connections it accepts.
@@ -272,6 +274,7 @@ pub async fn rig_with(
         direction,
         mode: start,
         dst: fixed,
+        mesh,
     } = options;
     let (dst, accepted, received, closed) = destination(dest).await;
     let dst = fixed.unwrap_or(dst);
@@ -319,6 +322,10 @@ pub async fn rig_with(
     }
     if let Some(tap) = discovery {
         shared = shared.with_discovery(tap.gated(mode.recording()));
+    }
+    if let Some(mesh) = mesh {
+        mesh.register(&mut metrics);
+        shared = shared.with_mesh(mesh);
     }
     let shared = Arc::new(shared);
     spawn_listener(

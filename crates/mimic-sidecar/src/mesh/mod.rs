@@ -1,9 +1,13 @@
 //! The sidecar follows its mesh view (spec §7.9, design §4.3): a long-poll client of
 //! `GET /v1/workloads/<deployment>/mesh`, the table of ClusterIP:port → Service it builds from
-//! the view, the persisted last view, and the classification of outbound connections. In this
-//! step the classification is a metric only: nothing is routed.
+//! the view, the persisted last view, the classification of outbound connections, and the
+//! balancing of the in-scope cleartext HTTP ones over the pods of the view (spec §7.9).
 
 mod follow;
+mod metrics;
+mod pool;
+mod router;
+mod serve;
 mod store;
 
 #[cfg(test)]
@@ -26,8 +30,11 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Unit;
 
 use crate::discovery::Target;
+use router::Router;
 
 pub use follow::Follower;
+pub(crate) use router::Backend;
+pub(crate) use serve::{Head, Serving, head_kind, serve};
 
 const MESH_VAR: &str = "MIMIC_MESH";
 const STALE_VAR: &str = "MIMIC_MESH_STALE_AFTER";
@@ -35,12 +42,18 @@ const STARTUP_VAR: &str = "MIMIC_MESH_STARTUP_WAIT";
 const SERVICES_VAR: &str = "MIMIC_MESH_MAX_SERVICES";
 const ENDPOINTS_VAR: &str = "MIMIC_MESH_MAX_ENDPOINTS";
 const BYTES_VAR: &str = "MIMIC_MESH_MAX_VIEW_BYTES";
+const POOL_IDLE_VAR: &str = "MIMIC_MESH_POOL_IDLE_TIMEOUT";
+const OPAQUE_VAR: &str = "MIMIC_MESH_OPAQUE_PORTS";
+const ENDPOINT_LABELS_VAR: &str = "MIMIC_METRICS_MAX_ENDPOINTS";
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 
 /// A held request lasts as long as the controller's `MIMIC_MESH_WATCH_TIMEOUT` (at most 10 m).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(11 * 60);
+
+/// The ports of server-first or never-HTTP protocols (spec §7.9).
+pub const DEFAULT_OPAQUE_PORTS: [u16; 10] = [25, 587, 3306, 4444, 5432, 6379, 9300, 11211, 22, 21];
 
 /// Where the view comes from, and how it ages.
 #[derive(Debug, Clone)]
@@ -59,6 +72,14 @@ pub struct MeshConfig {
     pub target: Option<Target>,
     /// Time allowed for one request, held ones included.
     pub timeout: Duration,
+    /// `MIMIC_MESH_POOL_IDLE_TIMEOUT`.
+    pub pool_idle_timeout: Duration,
+    /// `MIMIC_METRICS_MAX_ENDPOINTS`.
+    pub max_endpoint_labels: usize,
+    /// `MIMIC_MESH_OPAQUE_PORTS`: in-scope connections to these ports keep the byte relay.
+    pub opaque_ports: std::collections::BTreeSet<u16>,
+    /// A fixed seed for the random draws (tests); `None`: seeded from the system.
+    pub seed: Option<u64>,
 }
 
 impl Default for MeshConfig {
@@ -71,6 +92,10 @@ impl Default for MeshConfig {
             state_file: PathBuf::new(),
             target: None,
             timeout: REQUEST_TIMEOUT,
+            pool_idle_timeout: Duration::from_secs(90),
+            max_endpoint_labels: 256,
+            opaque_ports: DEFAULT_OPAQUE_PORTS.into_iter().collect(),
+            seed: None,
         }
     }
 }
@@ -110,9 +135,49 @@ impl MeshConfig {
             limits,
             state_file: trust_dir.join("state").join("mesh.json"),
             target: Target::from_env(env)?,
+            pool_idle_timeout: duration(
+                env,
+                POOL_IDLE_VAR,
+                defaults.pool_idle_timeout,
+                Duration::from_secs(1),
+                Duration::from_secs(3600),
+            )?,
+            max_endpoint_labels: number(
+                env,
+                ENDPOINT_LABELS_VAR,
+                defaults.max_endpoint_labels,
+                10_000,
+            )?,
+            opaque_ports: opaque_ports(env)?,
             ..defaults
         })
     }
+}
+
+/// `MIMIC_MESH_OPAQUE_PORTS`: at most 256 ports from 1 to 65535, or `none` (an empty value is
+/// unset, like any variable).
+fn opaque_ports(env: &Env) -> Result<std::collections::BTreeSet<u16>, ConfigError> {
+    let Some(value) = env.optional(OPAQUE_VAR) else {
+        return Ok(DEFAULT_OPAQUE_PORTS.into_iter().collect());
+    };
+    let invalid = |why: &str| ConfigError::invalid(OPAQUE_VAR, value, why.to_string());
+    let mut ports = std::collections::BTreeSet::new();
+    if value.trim() == "none" {
+        return Ok(ports);
+    }
+    let entries: Vec<&str> = value.split(',').collect();
+    if entries.len() > 256 {
+        return Err(invalid("expected at most 256 ports"));
+    }
+    for entry in entries {
+        match entry.trim().parse::<u16>() {
+            Ok(port) if port > 0 => {
+                ports.insert(port);
+            }
+            _ => return Err(invalid("expected comma-separated ports from 1 to 65535")),
+        }
+    }
+    Ok(ports)
 }
 
 fn duration(
@@ -195,16 +260,33 @@ pub enum Scope {
 
 /// The table of a view: `<ClusterIP>:<port>` of each port of each Service. Built whole and
 /// swapped whole, so a lookup reads one table or the other.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Table {
     /// A view was applied.
     loaded: bool,
     /// The view's `mesh` switch.
     enabled: bool,
     routes: HashMap<(IpAddr, u16), Arc<str>>,
+    /// The balancing state of each route, when the table is built with a router.
+    backends: HashMap<(IpAddr, u16), Arc<Backend>>,
 }
 
 impl Table {
+    /// The table of `view` with the balancing state `router` holds for each of its routes.
+    fn build_routed(view: &View, router: &Router) -> Table {
+        let mut table = Table::build(view);
+        for (key, service) in &view.services {
+            for ip in &service.ips {
+                for port in service.ports.keys() {
+                    if let Some(backend) = router.backend(key, *port) {
+                        table.backends.insert((ip.to_canonical(), *port), backend);
+                    }
+                }
+            }
+        }
+        table
+    }
+
     pub fn build(view: &View) -> Table {
         let mut routes = HashMap::new();
         for (key, service) in &view.services {
@@ -219,6 +301,7 @@ impl Table {
             loaded: true,
             enabled: view.mesh,
             routes,
+            backends: HashMap::new(),
         }
     }
 
@@ -270,6 +353,8 @@ struct Inner {
     endpoints: Gauge,
     age: Gauge,
     unscoped: Counter,
+    router: Router,
+    opaque_ports: std::collections::BTreeSet<u16>,
     /// Set once a view is held: readiness stays.
     seen: AtomicBool,
 }
@@ -314,6 +399,12 @@ impl MeshState {
             endpoints: Gauge::default(),
             age: Gauge::default(),
             unscoped: Counter::default(),
+            opaque_ports: config.opaque_ports.clone(),
+            router: Router::new(
+                config.pool_idle_timeout,
+                config.max_endpoint_labels,
+                config.seed,
+            ),
             seen: AtomicBool::new(false),
         }))
     }
@@ -350,6 +441,27 @@ impl MeshState {
             "Outbound connections whose destination is not a Service port of the mesh view",
             self.0.unscoped.clone(),
         );
+        self.0.router.metrics.register(registry);
+    }
+
+    pub(crate) fn router(&self) -> &Router {
+        &self.0.router
+    }
+
+    /// The balancing state of the Service port `dst` is the ClusterIP and port of, when it is
+    /// in the view and the mesh is on for this workload.
+    pub(crate) fn route(&self, dst: SocketAddr) -> Option<Arc<Backend>> {
+        if self.0.opaque_ports.contains(&dst.port()) || self.stale() {
+            return None;
+        }
+        let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);
+        if !table.enabled {
+            return None;
+        }
+        table
+            .backends
+            .get(&(dst.ip().to_canonical(), dst.port()))
+            .cloned()
     }
 
     pub(crate) fn pull(&self, result: &'static str) {
@@ -432,7 +544,8 @@ impl MeshState {
     }
 
     fn install(&self, view: Arc<View>, etag: &str, contact: Instant, source: &'static str) {
-        let table = Arc::new(Table::build(&view));
+        self.0.router.apply(&view);
+        let table = Arc::new(Table::build_routed(&view, &self.0.router));
         let (services, endpoints) = (view.services.len(), view.endpoint_count());
         *self.0.table.write().unwrap_or_else(PoisonError::into_inner) = table;
         self.0
@@ -469,8 +582,33 @@ impl MeshState {
         c.stale_warned = false;
     }
 
+    /// Test hook (#443): the next pooled checkout hands out a connection that is already
+    /// closed, as a pod closing it between the readiness check and the write would.
+    pub fn poison_next_checkout(&self) {
+        self.0.router.pools.poison_next();
+    }
+
+    /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
+    pub(crate) fn off(&self) -> bool {
+        let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);
+        table.loaded && !table.enabled
+    }
+
+    /// The view is older than `MIMIC_MESH_STALE_AFTER`: its pod addresses are not used.
+    pub(crate) fn stale(&self) -> bool {
+        lock(&self.0.contact)
+            .at
+            .is_some_and(|at| at.elapsed() >= self.0.stale_after)
+    }
+
+    /// Removes the per-pod series of the endpoints that left the view 5 minutes before `now`.
+    pub fn evict(&self, now: Instant) {
+        self.0.router.metrics.evict(now);
+    }
+
     /// Updates `mimic_mesh_view_age_seconds` and writes the stale warning once per streak.
     pub fn tick(&self) {
+        self.evict(Instant::now());
         let (age, warn) = {
             let mut c = lock(&self.0.contact);
             let Some(at) = c.at else {

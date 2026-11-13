@@ -49,6 +49,16 @@ All notable changes to mimic are documented in this file. The format follows
   a restart; new metric `mimic_mode{mode}` and `none` in `mimic_mock_mode_switches_total{to}`; `status.mode` counts
   `none` pods.
 
+- Client-side load balancing, step 1 (#443, M1): an outbound connection to a Service of the mesh view whose client
+  speaks cleartext HTTP/1 or `h2c` is balanced per request over the pod IPs of the Service (power of two choices on
+  the least request, slow start for new pods, pools per pod with `MIMIC_MESH_POOL_IDLE_TIMEOUT`). Discovery still
+  records one exchange under the app's authority; the access line gains `backend` and `upstream`; new metrics
+  `mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_endpoint_requests_total`,
+  `mimic_mesh_endpoint_in_flight` (pods capped by `MIMIC_METRICS_MAX_ENDPOINTS`, evicted 5 minutes after they leave
+  the view). Everything else, and every connection with the mesh switched off (`MIMIC_MESH=off`, `"mesh": false`), keeps
+  the byte relay. A mesh-routed HTTP/1 connection has the accepted limits of spec §4.1 (header order across names,
+  chunk extensions, hop-by-hop fields consumed, a rejected request answered `400`). A pod that cannot be connected is replaced by another endpoint once, then by the original ClusterIP (`mimic_mesh_fallbacks_total`), and a view older than `MIMIC_MESH_STALE_AFTER` is not used for pod addresses; there is no other retry until #445. A client silent for 50 ms after connecting stays on the byte relay. Ports 25, 587, 3306, 4444, 5432, 6379, 9300, 11211, 22 and 21 are opaque (byte relay, no detection wait; `MIMIC_MESH_OPAQUE_PORTS`).
+
 - The controller container declares the read API port `mimic-ui` (8080/TCP) in the pod spec, for information: it stays on loopback and no Service exposes it (#437).
 - The Map tab (#468): a deterministic layered graph of which deployment calls which, built from the stored outbound counters (exchanges and share of 5xx per edge) and the Services the controller watches, with external hosts as leaves, Services of other namespaces that the caller does not declare flagged `not declared`, links to the Workloads and Endpoints tabs, a bounded size (1000 deployments, 200 other nodes, 2000 edges) and every name escaped; new read route `GET /v1/map` (JSON, or SVG with `?format=svg`). No new Kubernetes permission.
 - Map tab follow-ups (#505): `GET /v1/map` reads the stored outbound calls of the first 1000 deployments only and logs a failed read at WARN; `mimic.js` also refuses links with `..`, `.` (percent-encoded too), `//` or a backslash and a root that is not an SVG-namespace `svg`.

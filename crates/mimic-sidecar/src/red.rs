@@ -19,7 +19,7 @@ use crate::listener::Direction;
 /// Authorities kept per direction and metric unless configured otherwise.
 pub const DEFAULT_MAX_AUTHORITIES: usize = 50;
 
-const DURATION_BUCKETS: [f64; 13] = [
+pub(crate) const DURATION_BUCKETS: [f64; 13] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
