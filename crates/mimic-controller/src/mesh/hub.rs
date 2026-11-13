@@ -189,17 +189,81 @@ struct Cache {
     tick: u64,
 }
 
+/// The held requests of each pod and of each namespace (spec §7.2, MSH-80).
+#[derive(Default)]
+struct Holds {
+    pods: BTreeMap<(String, String), usize>,
+    namespaces: BTreeMap<String, usize>,
+}
+
+/// One held request in the counts of its pod and namespace; they go down when it is dropped,
+/// whatever way the request ends (answered, timed out, cancelled).
+struct Share {
+    holds: Arc<Mutex<Holds>>,
+    namespace: String,
+    pod: String,
+}
+
+impl Share {
+    /// Counts a held request of `pod` of `namespace`, unless either is at its cap.
+    fn take(
+        holds: &Arc<Mutex<Holds>>,
+        namespace: &str,
+        pod: &str,
+        per_pod: usize,
+        per_namespace: usize,
+    ) -> Option<Share> {
+        let mut counts = lock(holds);
+        let in_namespace = counts.namespaces.get(namespace).copied().unwrap_or(0);
+        let key = (namespace.to_string(), pod.to_string());
+        let in_pod = counts.pods.get(&key).copied().unwrap_or(0);
+        if in_pod >= per_pod || in_namespace >= per_namespace {
+            return None;
+        }
+        counts.pods.insert(key, in_pod + 1);
+        counts
+            .namespaces
+            .insert(namespace.to_string(), in_namespace + 1);
+        Some(Share {
+            holds: holds.clone(),
+            namespace: namespace.to_string(),
+            pod: pod.to_string(),
+        })
+    }
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        let mut counts = lock(&self.holds);
+        let key = (self.namespace.clone(), self.pod.clone());
+        if let Some(n) = counts.pods.get_mut(&key) {
+            *n -= 1;
+            if *n == 0 {
+                counts.pods.remove(&key);
+            }
+        }
+        if let Some(n) = counts.namespaces.get_mut(&self.namespace) {
+            *n -= 1;
+            if *n == 0 {
+                counts.namespaces.remove(&self.namespace);
+            }
+        }
+    }
+}
+
 /// A held request: it holds a share of the watch budget and counts in `mimic_mesh_watches`.
 struct Watch {
     _permit: OwnedSemaphorePermit,
+    _share: Share,
     gauge: Gauge,
 }
 
 impl Watch {
-    fn new(permit: OwnedSemaphorePermit, gauge: Gauge) -> Watch {
+    fn new(permit: OwnedSemaphorePermit, share: Share, gauge: Gauge) -> Watch {
         gauge.inc();
         Watch {
             _permit: permit,
+            _share: share,
             gauge,
         }
     }
@@ -239,6 +303,9 @@ pub struct Hub {
     /// One lock per view being built: the others of that key wait for it, the other keys do not.
     gates: Mutex<BTreeMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
     watches: Arc<Semaphore>,
+    holds: Arc<Mutex<Holds>>,
+    /// What one namespace may hold: its share of the budget, at least the per-pod cap.
+    namespace_cap: usize,
     closed: watch::Sender<bool>,
 }
 
@@ -264,6 +331,9 @@ macro_rules! feeder {
 impl Hub {
     pub fn new(config: MeshConfig, metrics: MeshMetrics) -> Arc<Hub> {
         let watches = Arc::new(Semaphore::new(config.max_watches));
+        let namespace_cap = (config.max_watches * config.watch_namespace_percent / 100)
+            .max(config.max_watches_per_pod)
+            .min(config.max_watches);
         Arc::new(Hub {
             config,
             metrics,
@@ -279,6 +349,8 @@ impl Hub {
             cache: Mutex::default(),
             gates: Mutex::default(),
             watches,
+            holds: Arc::default(),
+            namespace_cap,
             closed: watch::channel(false).0,
         })
     }
@@ -605,9 +677,12 @@ impl Hub {
     /// Answers a request for the view of `deployment` of `namespace`. `held` are the values of
     /// `If-None-Match`: when one is the current `ETag` the request waits for a change, up to
     /// `MIMIC_MESH_WATCH_TIMEOUT`; `on_hold` is called once it is held. `mode` is read at every look, so a mode that changes wakes it.
+    /// `pod` is the pod that asks (of `namespace`): it holds at most
+    /// `MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD` requests, and its namespace a share of the budget.
     pub async fn answer(
         &self,
         namespace: &str,
+        pod: &str,
         deployment: &str,
         mode: &(dyn Fn() -> Mode + Send + Sync),
         held: &[&str],
@@ -627,10 +702,19 @@ impl Hub {
         if !current(&entry) {
             return Answer::View(entry);
         }
+        let Some(share) = Share::take(
+            &self.holds,
+            namespace,
+            pod,
+            self.config.max_watches_per_pod,
+            self.namespace_cap,
+        ) else {
+            return Answer::Busy;
+        };
         let Ok(permit) = self.watches.clone().try_acquire_owned() else {
             return Answer::Busy;
         };
-        let _watch = Watch::new(permit, self.metrics.watches.clone());
+        let _watch = Watch::new(permit, share, self.metrics.watches.clone());
         // Only now, with a share of the watch budget, may the connection leave the listener's cap.
         on_hold();
         let deadline = tokio::time::Instant::now() + self.config.watch_timeout;

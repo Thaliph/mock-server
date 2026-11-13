@@ -538,8 +538,11 @@ impl SidecarApi {
                 )
             };
         }
-        // A long-poll answers every 30 s per sidecar at least: not a line each.
-        if result == "rate_limited" || (endpoint == mesh::ENDPOINT && result == "not_modified") {
+        // A long-poll answers every 30 s per sidecar at least, and a view change makes every sidecar
+        // fetch the new view: not a line each. Refusals and errors stay at info.
+        if result == "rate_limited"
+            || (endpoint == mesh::ENDPOINT && matches!(result, "not_modified" | "ok"))
+        {
             line!(debug);
         } else {
             line!(info);
