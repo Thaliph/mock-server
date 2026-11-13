@@ -4499,6 +4499,15 @@ kubectl -n msh-87 exec -i "$msh_87_client" -c app -- python3 -c 'import sys; ope
 
 # 1. Both controller replicas away: 20 s of calls, every one answered 200.
 controller_replicas=$(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.spec.replicas}')
+# msh_87_pulls: the successful pulls (ok and not_modified) of the client's sidecar so far.
+msh_87_pulls() {
+  local ok not_modified
+  ok=$(msh_87_metric 'mimic_mesh_view_pulls_total{result="ok"}')
+  not_modified=$(msh_87_metric 'mimic_mesh_view_pulls_total{result="not_modified"}')
+  ok=${ok:-0} not_modified=${not_modified:-0}
+  echo $(( ${ok%.*} + ${not_modified%.*} ))
+}
+msh_87_before=$(msh_87_pulls)
 kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas=0 >/dev/null
 kubectl -n "$NS" wait --for=delete pod -l app.kubernetes.io/name=mimic-controller --timeout=120s >/dev/null \
   || fail "msh_87: the controller pods did not go away"
@@ -4510,12 +4519,8 @@ read -r _ msh_87_n msh_87_e <<<"$msh_87_away"
 msh_87_view || fail "msh_87: the view was lost with the controller away"
 kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="$controller_replicas" >/dev/null
 kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m >/dev/null || fail "msh_87: the controller did not come back"
-msh_87_pulled() {
-  local ok not_modified
-  ok=$(msh_87_metric 'mimic_mesh_view_pulls_total{result="ok"}')
-  not_modified=$(msh_87_metric 'mimic_mesh_view_pulls_total{result="not_modified"}')
-  (( ${ok:-0} + ${not_modified:-0} >= 1 ))
-}
+# The sidecar pulled again once its successful pulls rose above the count taken before the outage.
+msh_87_pulled() { (( $(msh_87_pulls) > msh_87_before )); }
 for _ in $(seq 90); do msh_87_pulled && break; sleep 1; done
 msh_87_pulled || fail "msh_87: the sidecar did not reach the controller again"
 
@@ -4531,7 +4536,7 @@ msh_87_end=$(date +%s.%N)
 sleep 12
 kubectl -n msh-87 exec "$msh_87_client" -c app -- touch /tmp/msh87.stop || fail "msh_87: cannot stop the client"
 wait "$msh_87_pid" || fail "msh_87: the client of the rollout failed"
-msh_87_counts=$(awk -v end="$msh_87_end" '$1 == "E" { n++; if ($2 > end) late++ } $1 == "N" { total = $2 } END { print total + 0, n + 0, late + 0 }' "$WORK/msh87.out")
+msh_87_counts=$(awk -v end="$msh_87_end" '$1 == "E" { n++; if ($2 > end && $2 <= end + 10) late++ } $1 == "N" { total = $2 } END { print total + 0, n + 0, late + 0 }' "$WORK/msh87.out")
 read -r msh_87_total msh_87_errors msh_87_late <<<"$msh_87_counts"
 (( msh_87_total > 0 )) || fail "msh_87: the client of the rollout made no request"
 echo "msh_87: rollout errors $msh_87_errors of $msh_87_total (the M2 baseline; $msh_87_late after the rollout ended)"
