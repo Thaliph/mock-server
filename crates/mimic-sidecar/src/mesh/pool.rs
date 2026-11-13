@@ -647,10 +647,10 @@ impl Pools {
     /// Closes the idle HTTP/1 connections to `addr` (a connection of the app left `hyper` for
     /// it, spec §4.1 limit 8).
     pub(crate) fn close_idle(&self, addr: SocketAddr) {
-        if let Some(pool) = lock(&self.pools).get(&(addr, Protocol::Http1)) {
-            if let Pool::Http1(pool) = &**pool {
-                pool.close_idle();
-            }
+        if let Some(pool) = lock(&self.pools).get(&(addr, Protocol::Http1))
+            && let Pool::Http1(pool) = &**pool
+        {
+            pool.close_idle();
         }
     }
 
