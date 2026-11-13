@@ -503,7 +503,12 @@ async fn msh_79_the_series_of_a_service_that_left_the_view_are_evicted_after_5_m
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     client.get("/").await;
-    assert_eq!(service_series(&f.metrics.encode()), 4, "{}", f.metrics.encode());
+    assert_eq!(
+        service_series(&f.metrics.encode()),
+        4,
+        "{}",
+        f.metrics.encode()
+    );
 
     // It leaves and comes back within the 5 minutes: nothing is removed.
     state.hold(view_text(&[], 0, false), "\"1-b\"");
