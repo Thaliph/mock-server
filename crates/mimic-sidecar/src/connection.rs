@@ -378,6 +378,7 @@ async fn serve_mesh(
         // for it and the connection goes on as the byte relay, the head as received.
         Ok(mesh::Ended::Leave { client, head }) => match mesh.dial(&backend, dst).await {
             Ok(dialed) => {
+                mesh.router().pools.close_idle(dialed.upstream);
                 let conn = Conn {
                     counted: true,
                     ..conn

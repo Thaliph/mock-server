@@ -259,6 +259,11 @@ impl H1Pool {
         self.draining.store(true, Ordering::Release);
         lock(&self.idle).clear();
     }
+
+    /// Closes the idle connections; the pool stays in use.
+    fn close_idle(&self) {
+        lock(&self.idle).clear();
+    }
 }
 
 struct Conn {
@@ -637,6 +642,16 @@ impl Pools {
             }
             keep
         });
+    }
+
+    /// Closes the idle HTTP/1 connections to `addr` (a connection of the app left `hyper` for
+    /// it, spec §4.1 limit 8).
+    pub(crate) fn close_idle(&self, addr: SocketAddr) {
+        if let Some(pool) = lock(&self.pools).get(&(addr, Protocol::Http1)) {
+            if let Pool::Http1(pool) = &**pool {
+                pool.close_idle();
+            }
+        }
     }
 
     /// Closes the connections idle for too long.

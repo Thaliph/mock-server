@@ -405,7 +405,8 @@ Accepted limits of the proxy:
      head reader inspects every later head of a mesh-routed HTTP/1 connection: one carrying
      `Upgrade` (whatever its value) or method `CONNECT` waits, with the bytes after it, until the
      answers to the earlier requests were delivered; then the connection leaves `hyper`: a pod is
-     chosen as for any request (connect retry and fallback as §7.9), the head is written to it
+     chosen as for any request (connect retry and fallback as §7.9; the idle pooled connections
+     of this sidecar to that pod are closed, so that the tunnel's is the app's only one there), the head is written to it
      **as received** (not re-framed; `Connection` and `Upgrade` kept, no retry once it was
      written) and the connection goes on as the byte relay above between the app and that pod,
      so its access lines are the relay's (`upgrade: true` after a `101` or a `2xx` to `CONNECT`,
@@ -2652,7 +2653,7 @@ no insignificant whitespace):
   | `mimic_mesh_endpoint_requests_total` | counter, per pod | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
   | `mimic_mesh_endpoint_in_flight` | gauge, per pod | `backend`, `endpoint` |
   | `mimic_mesh_reconnects_total` | counter, requests sent again on a new connection because nothing of them was written | `backend` |
-  | `mimic_mesh_fallbacks_total` | counter, requests sent to the original destination (the ClusterIP) because the pods could not be connected or the view is stale | `backend` |
+  | `mimic_mesh_fallbacks_total` | counter, requests and L4 connections sent to the original destination (the ClusterIP) because the pods could not be connected or the view is stale | `backend` |
 
   At most `MIMIC_METRICS_MAX_ENDPOINTS` distinct endpoints have a label of their own, the next ones
   are `other`; the series of an endpoint that left the view are removed 5 minutes after it left

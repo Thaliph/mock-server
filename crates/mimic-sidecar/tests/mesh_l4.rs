@@ -164,9 +164,20 @@ async fn msh_63_the_access_line_of_a_connection_names_the_backend_and_the_pod() 
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     assert_eq!(echoed(f.addr, BINARY).await, BINARY);
     let line = logs.access_exactly(1).await.remove(0);
-    assert_eq!(line["backend"], "shop/cart:80", "{line}");
-    assert_eq!(line["upstream"], pod.addr.to_string(), "{line}");
-    assert_eq!(line["dst"], cluster_ip().to_string(), "{line}");
+    assert_eq!(
+        line["backend"], "shop/cart:80",
+        "the backend of the access line"
+    );
+    assert_eq!(
+        line["upstream"],
+        pod.addr.to_string(),
+        "the upstream of the access line"
+    );
+    assert_eq!(
+        line["dst"],
+        cluster_ip().to_string(),
+        "the dst of the access line"
+    );
 }
 
 #[tokio::test]

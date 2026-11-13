@@ -163,8 +163,9 @@ async fn msh_67_the_mesh_path_differs_from_the_byte_relay_exactly_as_the_spec_sa
                 assert!(
                     text.starts_with("http/1.1 400")
                         && text.contains("x-mimic-error: invalid-request"),
-                    "{}: {text}",
-                    entry.name
+                    "{}: a 400 invalid-request, got {} bytes",
+                    entry.name,
+                    answer.len()
                 );
             }
         }

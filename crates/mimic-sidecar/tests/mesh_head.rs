@@ -74,8 +74,8 @@ async fn msh_65_a_refused_head_is_answered_by_the_sidecar_and_never_reaches_a_po
     assert!(pod.received().is_empty(), "no byte reached the pod");
     let lines = logs.access_exactly(BAD.len()).await;
     for line in &lines {
-        assert_eq!(line["status"], 400, "{line}");
-        assert_eq!(line["result"], "unframed", "{line}");
+        assert_eq!(line["status"], 400, "the status of the access line");
+        assert_eq!(line["result"], "unframed", "the result of the access line");
     }
     let metrics = f.metrics.encode();
     let refused = "mimic_mesh_requests_total{service=\"shop/cart\",route=\"none\",backend=\"shop/cart:80\",status_class=\"4xx\",reason=\"invalid-request\"}";
