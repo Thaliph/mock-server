@@ -52,12 +52,23 @@ fuzz_target!(|data: &[u8]| {
     assert!(input.starts_with(&whole.pass), "what passes is a prefix");
     if whole.stop.is_some() {
         assert_eq!(whole.pending, 0);
-        assert_eq!(&input[whole.pass.len()..], &whole.held[..], "nothing is lost");
+        assert_eq!(
+            &input[whole.pass.len()..],
+            &whole.held[..],
+            "nothing is lost"
+        );
     } else {
-        assert_eq!(whole.pass.len() + whole.pending, input.len(), "nothing is lost");
+        assert_eq!(
+            whole.pass.len() + whole.pending,
+            input.len(),
+            "nothing is lost"
+        );
     }
     let cut = run(input, upgrades, *seed, true);
-    assert_eq!(cut.stop, whole.stop, "the verdict does not depend on the reads");
+    assert_eq!(
+        cut.stop, whole.stop,
+        "the verdict does not depend on the reads"
+    );
     assert_eq!(cut.pass, whole.pass);
     assert_eq!(cut.held, whole.held);
     assert_eq!(cut.pending, whole.pending);
