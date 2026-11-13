@@ -18,6 +18,34 @@ Findings:
   budgets are taken from that run.
 - 200 rps over HTTP/1.1 is clean on this machine (no errors, measured rate within 0.1 %).
 
+## Mesh setups (#444): how to run
+
+Design §14 (M1) and [SPEC §12.19](../SPEC.md#1219-benchmarks-436), *Mesh setups*, BEN-11 to BEN-16.
+Run by hand, one run at a time, on a quiet machine; the rate caps and gentle defaults are the same.
+
+```sh
+SETUPS="mesh-lb mesh-churn" scripts/bench.sh                 # both mesh setups, 3 backend pods
+SETUPS=mesh-lb PROPAGATION_SAMPLES=0 scripts/bench.sh        # skip the propagation measure
+SETUPS="mesh-lb" RATES="200" PROTOCOLS="http1" scripts/bench.sh   # one rate, to look at a change
+scripts/bench.sh --dry-run                                   # the plan, nothing started
+```
+
+- `mesh-lb`: the backend (`fortio-server`) has 3 pods; the client sidecar's routing to each pod is
+  asserted from its metrics before and after the runs (`mimic_mesh_endpoint_requests_total`, and zero
+  `mimic_mesh_fallbacks_total`). Then: propagation of an EndpointSlice change to the client's
+  `mesh view applied` (N = `PROPAGATION_SAMPLES`, default 20, budget p99 ≤ 2 s), and the client sidecar's
+  RSS with a synthetic view of 100 Services × 10 endpoints, against its baseline in the same run
+  (budget baseline + 16 MiB). The synthetic objects are deleted at the end.
+- `mesh-churn`: the same 3-pod backend, with `kubectl rollout restart` of the backend just before each
+  fortio run, so that the rollout runs through the load. Errors and latency are the client's; fallbacks
+  and reconnects are recorded, not asserted.
+- Both sidecars run in mode `discovery`, as the B0 setup. The M1 latency budget (mesh-routed call adds
+  ≤ B0 + 0.5 ms p50, ≤ B0 + 2 ms p99) compares the `mesh-lb` rows with the `discovery` rows of the same
+  protocol and rate; the budgets on propagation and RSS are read from the `within_budget` fields of
+  `<date>-mesh-lb.json`. The script records them and does not fail on them.
+- The JSON files: `mesh` (see BEN-16) and one `rollout_restart` flag per run. Output files of today's
+  date must not exist yet (BEN-02).
+
 ## Conditions
 
 - Load: fortio `1.76.0` (digest-pinned in `images/Dockerfile`), 30 s per run, 8 connections,
