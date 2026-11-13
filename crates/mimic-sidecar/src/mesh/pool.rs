@@ -374,6 +374,14 @@ impl H2Pool {
     }
 }
 
+/// The index of the open connection with the fewest requests in flight, never the one `avoid`
+/// names (a resent stream must not take the connection that just failed). Each entry is
+/// `(id, in flight, closed)`.
+fn least_busy(conns: &[(usize, usize, bool)], avoid: Option<usize>) -> Option<usize> {
+    let _ = (conns, avoid);
+    None
+}
+
 /// The largest SETTINGS payload read for `MAX_CONCURRENT_STREAMS`.
 const MAX_SETTINGS_PAYLOAD: usize = 4096;
 const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
@@ -556,6 +564,9 @@ impl Pools {
         }
     }
 
+    /// The next fresh checkout fails as a refused connection would (test hook).
+    pub(crate) fn refuse_next_fresh(&self) {}
+
     /// The next checkout hands out a connection that is already closed.
     pub(crate) fn poison_next(&self) {
         self.poison.fetch_add(1, Ordering::AcqRel);
@@ -607,7 +618,20 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::Snoop;
+    use super::{Snoop, least_busy};
+
+    #[test]
+    fn msh_69_at_the_h2_bound_a_resent_stream_never_takes_the_failed_connection() {
+        // (id, requests in flight, closed)
+        let conns = [(1usize, 0usize, false), (2, 3, false), (3, 1, true)];
+        // No connection to avoid: the least busy one that is open.
+        assert_eq!(least_busy(&conns, None), Some(0));
+        // The least busy one failed: the next, never the failed one, never a closed one.
+        assert_eq!(least_busy(&conns, Some(1)), Some(1));
+        // Only the failed connection is left.
+        assert_eq!(least_busy(&conns[..1], Some(1)), None);
+        assert_eq!(least_busy(&[], None), None);
+    }
 
     async fn snoop(max: &Arc<AtomicU32>) -> Snoop {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

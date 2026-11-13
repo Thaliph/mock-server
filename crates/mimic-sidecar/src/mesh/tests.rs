@@ -296,3 +296,24 @@ fn msh_57_invalid_opaque_ports_are_refused() {
         assert!(error.contains("MIMIC_MESH_OPAQUE_PORTS"), "{error}");
     }
 }
+
+#[test]
+fn msh_71_connect_timeout_default_and_range() {
+    assert_eq!(config(&[]).unwrap().connect_timeout, Duration::from_secs(2));
+    assert_eq!(
+        config(&[("MIMIC_MESH_CONNECT_TIMEOUT", "100ms")])
+            .unwrap()
+            .connect_timeout,
+        Duration::from_millis(100)
+    );
+    assert_eq!(
+        config(&[("MIMIC_MESH_CONNECT_TIMEOUT", "10s")])
+            .unwrap()
+            .connect_timeout,
+        Duration::from_secs(10)
+    );
+    for value in ["99ms", "11s", "soon", "0s"] {
+        let error = config(&[("MIMIC_MESH_CONNECT_TIMEOUT", value)]).expect_err(value);
+        assert!(error.contains("MIMIC_MESH_CONNECT_TIMEOUT"), "{error}");
+    }
+}

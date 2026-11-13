@@ -3655,9 +3655,10 @@ kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-container
 ! found -F "$non08_canary" "$WORK/non08-controller.log" || fail "non_08: the canary is in the controller logs"
 for p in $non08_pods; do
   for c in app mimic-sidecar; do
-    # grep -c reads the whole log: `grep -q` would stop early, SIGPIPE kubectl, and under pipefail the
-    # pipeline's 141 would read as "no match" (a false negative).
-    [[ $(kubectl -n non-08 logs "$p" -c "$c" 2>/dev/null | grep -cF "$non08_canary" || true) == 0 ]] \
+    # The log is captured first and a failing `kubectl logs` fails the check: piped into `grep -c ... || true`
+    # it would read as "no canary" (a vacuous pass). grep -c reads the whole text, never stops early.
+    non08_log=$(kubectl -n non-08 logs "$p" -c "$c") || fail "non_08: cannot read the $c log of $p"
+    [[ $(grep -cF "$non08_canary" <<<"$non08_log" || true) == 0 ]] \
       || fail "non_08: the canary is in the $c log of $p"
   done
 done

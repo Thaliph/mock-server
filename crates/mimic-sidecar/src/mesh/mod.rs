@@ -43,6 +43,7 @@ const SERVICES_VAR: &str = "MIMIC_MESH_MAX_SERVICES";
 const ENDPOINTS_VAR: &str = "MIMIC_MESH_MAX_ENDPOINTS";
 const BYTES_VAR: &str = "MIMIC_MESH_MAX_VIEW_BYTES";
 const POOL_IDLE_VAR: &str = "MIMIC_MESH_POOL_IDLE_TIMEOUT";
+const CONNECT_VAR: &str = "MIMIC_MESH_CONNECT_TIMEOUT";
 const OPAQUE_VAR: &str = "MIMIC_MESH_OPAQUE_PORTS";
 const ENDPOINT_LABELS_VAR: &str = "MIMIC_METRICS_MAX_ENDPOINTS";
 
@@ -74,6 +75,11 @@ pub struct MeshConfig {
     pub timeout: Duration,
     /// `MIMIC_MESH_POOL_IDLE_TIMEOUT`.
     pub pool_idle_timeout: Duration,
+    /// `MIMIC_MESH_CONNECT_TIMEOUT`: time allowed to connect to a pod.
+    pub connect_timeout: Duration,
+    /// How long a pod whose connect failed is avoided by the choice (spec §7.9); a field, not a
+    /// variable: tests shorten it.
+    pub avoid_failed_for: Duration,
     /// `MIMIC_METRICS_MAX_ENDPOINTS`.
     pub max_endpoint_labels: usize,
     /// `MIMIC_MESH_OPAQUE_PORTS`: in-scope connections to these ports keep the byte relay.
@@ -93,6 +99,8 @@ impl Default for MeshConfig {
             target: None,
             timeout: REQUEST_TIMEOUT,
             pool_idle_timeout: Duration::from_secs(90),
+            connect_timeout: Duration::from_secs(2),
+            avoid_failed_for: Duration::from_secs(5),
             max_endpoint_labels: 256,
             opaque_ports: DEFAULT_OPAQUE_PORTS.into_iter().collect(),
             seed: None,
@@ -141,6 +149,13 @@ impl MeshConfig {
                 defaults.pool_idle_timeout,
                 Duration::from_secs(1),
                 Duration::from_secs(3600),
+            )?,
+            connect_timeout: duration(
+                env,
+                CONNECT_VAR,
+                defaults.connect_timeout,
+                Duration::from_millis(100),
+                Duration::from_secs(10),
             )?,
             max_endpoint_labels: number(
                 env,
@@ -584,8 +599,15 @@ impl MeshState {
 
     /// Test hook (#443): the next pooled checkout hands out a connection that is already
     /// closed, as a pod closing it between the readiness check and the write would.
+    #[doc(hidden)]
     pub fn poison_next_checkout(&self) {
         self.0.router.pools.poison_next();
+    }
+
+    /// Test hook (#443): the next fresh connection to a pod (a reconnect) is refused.
+    #[doc(hidden)]
+    pub fn refuse_next_reconnect(&self) {
+        self.0.router.pools.refuse_next_fresh();
     }
 
     /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
