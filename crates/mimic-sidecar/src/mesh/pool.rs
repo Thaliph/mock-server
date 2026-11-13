@@ -772,10 +772,140 @@ impl Pools {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::{Snoop, Wire, least_busy};
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{Lease, Pool, Pools, Protocol, Snoop, Wire, least_busy};
+    use crate::tls::intercept::Origin;
+
+    const TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// A listener that accepts connections, holds them, and counts them; with `close` it closes
+    /// them at once.
+    async fn pod(close: bool) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::AcqRel);
+                if !close {
+                    held.push(stream);
+                }
+            }
+        });
+        (addr, accepted)
+    }
+
+    fn open_of(pools: &Pools) -> usize {
+        pools
+            .pools
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| match &**p {
+                Pool::Http1(pool) => pool.open.load(Ordering::Acquire),
+                Pool::Http2(_) => 0,
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn msh_76_a_checkout_cancelled_while_connecting_gives_its_slot_back() {
+        let (addr, _) = pod(false).await;
+        let pools = Pools::new(Duration::from_secs(60));
+        let mut cancelled = 0;
+        for _ in 0..50 {
+            let before = open_of(&pools);
+            let mut checkout = Box::pin(pools.checkout(addr, Protocol::Http1, None, None, TIMEOUT));
+            // One poll starts the connect; a connect still pending is then cancelled.
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(checkout.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            if pending {
+                drop(checkout);
+                cancelled += 1;
+                assert_eq!(open_of(&pools), before, "a cancelled checkout holds a slot");
+            }
+        }
+        assert!(cancelled > 0, "no checkout was cancelled while connecting");
+        assert!(
+            pools
+                .checkout(addr, Protocol::Http1, None, None, TIMEOUT)
+                .await
+                .is_ok(),
+            "the next checkout"
+        );
+    }
+
+    #[tokio::test]
+    async fn msh_77_a_pod_has_at_most_8_pools_and_empty_ones_are_swept() {
+        let (addr, _) = pod(true).await;
+        let pools = Pools::new(Duration::from_secs(60));
+        let mut last = None;
+        for n in 0..9 {
+            let origin = Arc::new(Origin::for_test(&format!("n{n}.shop.svc")));
+            last = Some(
+                pools
+                    .checkout(addr, Protocol::Http1, Some(&origin), None, TIMEOUT)
+                    .await
+                    .err()
+                    .expect("the pod closes every handshake"),
+            );
+        }
+        assert_eq!(pools.pools.lock().unwrap().len(), 8, "pools of the pod");
+        let ninth = last.unwrap().to_string();
+        assert!(ninth.contains("too many pools"), "{ninth}");
+        // A pool with a connection stays, the empty ones go and their names can be used again.
+        let (plain, _) = pod(false).await;
+        let lease = pools
+            .checkout(plain, Protocol::Http1, None, None, TIMEOUT)
+            .await
+            .unwrap();
+        drop(lease);
+        pools.sweep();
+        assert_eq!(pools.pools.lock().unwrap().len(), 1, "after the sweep");
+        let origin = Arc::new(Origin::for_test("n8.shop.svc"));
+        let again = pools
+            .checkout(addr, Protocol::Http1, Some(&origin), None, TIMEOUT)
+            .await
+            .err()
+            .expect("the pod closes every handshake")
+            .to_string();
+        assert!(!again.contains("too many pools"), "{again}");
+    }
+
+    async fn get(pools: &Arc<Pools>, addr: SocketAddr, again: Option<&Lease>) -> Lease {
+        pools
+            .checkout(addr, Protocol::Http1, None, again, TIMEOUT)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn msh_78_a_fresh_checkout_keeps_a_healthy_idle_connection() {
+        let (addr, accepted) = pod(false).await;
+        let pools = Pools::new(Duration::from_secs(60));
+        let mut failed = get(&pools, addr, None).await;
+        let idle = get(&pools, addr, None).await;
+        drop(idle);
+        // The reconnect after the failed one opens a third connection and leaves the idle one.
+        failed.discard();
+        let fresh = get(&pools, addr, Some(&failed)).await;
+        drop(fresh);
+        drop(failed);
+        let (_a, _b) = (get(&pools, addr, None).await, get(&pools, addr, None).await);
+        // The pod counts a connection when it accepts it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(accepted.load(Ordering::Acquire), 3, "connections accepted");
+    }
 
     #[test]
     fn msh_69_at_the_h2_bound_a_resent_stream_never_takes_the_failed_connection() {

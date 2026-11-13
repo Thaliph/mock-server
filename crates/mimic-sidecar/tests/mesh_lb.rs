@@ -480,3 +480,43 @@ async fn msh_54_metrics_count_cap_and_evict() {
         f.metrics.encode()
     );
 }
+
+const SERVICE_FAMILIES: [&str; 4] = [
+    "mimic_mesh_requests_total{",
+    "mimic_mesh_request_duration_seconds_count{",
+    "mimic_mesh_fallbacks_total{",
+    "mimic_mesh_reconnects_total{",
+];
+
+fn service_series(text: &str) -> usize {
+    text.lines()
+        .filter(|l| SERVICE_FAMILIES.iter().any(|f| l.starts_with(f)))
+        .filter(|l| l.contains("backend=\"shop/cart:80\""))
+        .count()
+}
+
+#[tokio::test]
+async fn msh_79_the_series_of_a_service_that_left_the_view_are_evicted_after_5_minutes() {
+    let _logs = capture_logs();
+    let pod = Pod::http1("a", 0).await;
+    let state = state_with(&[pod.addr], |_| {});
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    client.get("/").await;
+    assert_eq!(service_series(&f.metrics.encode()), 4, "{}", f.metrics.encode());
+
+    // It leaves and comes back within the 5 minutes: nothing is removed.
+    state.hold(view_text(&[], 0, false), "\"1-b\"");
+    state.hold(view(&[pod.addr], 0), "\"1-c\"");
+    let now = Instant::now();
+    state.evict(now + Duration::from_secs(301));
+    assert_eq!(service_series(&f.metrics.encode()), 4, "kept when back");
+
+    // It leaves: kept 4 minutes, gone after 5.
+    state.hold(view_text(&[], 0, false), "\"1-d\"");
+    let now = Instant::now();
+    state.evict(now + Duration::from_secs(240));
+    assert_eq!(service_series(&f.metrics.encode()), 4, "kept for 4 minutes");
+    state.evict(now + Duration::from_secs(301));
+    assert_eq!(service_series(&f.metrics.encode()), 0, "gone after 5");
+}

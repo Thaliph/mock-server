@@ -2579,7 +2579,9 @@ no insignificant whitespace):
   (HTTP/1 or HTTP/2, never upgraded). HTTP/2: connections multiplexed, a new one (at most 16 per
   pod) when none has a free stream (the peer's `MAX_CONCURRENT_STREAMS` is reached). HTTP/1: one
   request at a time per connection, at most 1024 connections per pod (a request over that waits
-  for one to be free), `hyper`'s client with `preserve_header_case`. A connection idle for
+  for one to be free), `hyper`'s client with `preserve_header_case`. The slot of a connection
+  being opened is given back when the request that waits for it is cancelled. A reconnect after
+  an unwritten request keeps the healthy idle connections of the pool. A connection idle for
   `MIMIC_MESH_POOL_IDLE_TIMEOUT` is closed. An endpoint that leaves the view stops being chosen
   at once; its requests in flight finish, its idle connections close and its pool is dropped.
   Connecting to a pod has the `MIMIC_MESH_CONNECT_TIMEOUT` (2 s unless set) and the socket
@@ -2659,7 +2661,10 @@ no insignificant whitespace):
   failed the request is answered `503` `x-mimic-error: connect-failed` inside the app's TLS
   session, and the warn line `tls verification failed` carries `upstream` and `tls_error` (the
   verification error, no certificate content). The pool of a pod is per (pod IP, port,
-  protocol, server name), so a connection verified for one name is never used for another.
+  protocol, server name), so a connection verified for one name is never used for another;
+  a pod has at most 8 pools (the names the app sent are its own to choose): a request that
+  would need a ninth is answered as a failed connect to that pod (it is avoided, as above),
+  and a pool with no connection is removed by the idle sweep.
   ALPN: the app is answered `http/1.1` when it offered it, else `h2` when it offered it, else
   none (HTTP/1), and the pod is offered only that protocol: the sidecar answers the app before
   it connects, so it cannot follow the pod's ALPN as the byte relay does (a client offering
@@ -2690,7 +2695,9 @@ no insignificant whitespace):
   At most `MIMIC_METRICS_MAX_ENDPOINTS` distinct endpoints have a label of their own, the next ones
   are `other`; the series of an endpoint that left the view are removed 5 minutes after it left
   (a scrape sees their last values first) and their slots are free again; an endpoint that
-  comes back within the 5 minutes keeps its series. No label carries a path, a header or any
+  comes back within the 5 minutes keeps its series; likewise the series of a Service port that
+  left the view (`mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`,
+  `mimic_mesh_fallbacks_total`, `mimic_mesh_reconnects_total`). No label carries a path, a header or any
   caller-controlled string.
 
 ## 8. Mock
@@ -4841,6 +4848,15 @@ MSH-18 to MSH-30 are #441 (the watches, the route, the chart), MSH-31 to MSH-42 
 | MSH-73 | **I.** Verification: pods whose certificate is signed by an untrusted CA, or names another Service, or only their IP, are never given a byte of the request; the request is answered `503` `x-mimic-error: connect-failed` inside the app's TLS session, the warn line `tls verification failed` has `tls_error`; the original destination is tried after the pods (`mimic_mesh_fallbacks_total` counts it) and verified the same way; with one good pod and one bad pod every request is answered by the good one. No cleartext connection to a pod is made in any of these cases. |
 | MSH-74 | **I.** An `Upgrade` request over intercepted TLS reaches a pod over TLS and the bytes then flow both ways; a decrypted non-HTTP client-first protocol is relayed over TLS to one pod; a TLS client that rejects the mimic leaf is remembered and its next connection reaches a pod byte for byte (L4, MSH-63). |
 | MSH-75 | **E** (kind, `scripts/e2e.sh` section `msh_75`, own namespace, cleaned by a trap). A Service of 3 pods serving TLS with a certificate for its Service name, and a client pod of the section calling it by name over HTTPS: 60 requests are answered and each pod's own counter shows at least 5 of them, the client's sidecar writes access lines with `tls: true` and `upstream` the pods' IPs, and `mimic_mesh_fallbacks_total` stays 0; with the pods' certificate swapped for one signed by an unknown CA every request is answered `503` `connect-failed` and no pod received a request. |
+
+#### M1 review follow-ups (#443, MSH-56)
+
+| ID | Criterion |
+|---|---|
+| MSH-76 | **U** (pool). HTTP/1 checkouts cancelled while the connection to the pod is being opened (TCP connect or TLS handshake still pending), many times over, leave no connection counted: the pool has 0 open and the next checkout is served. |
+| MSH-77 | **U** (pool). Pools of one pod are bounded: checkouts for 9 different TLS names to one pod address create 8 pools and the ninth fails with an error; after the idle sweep a pool with no connection is gone (and a name can be used again), one with a connection stays. |
+| MSH-78 | **U** (pool). A fresh HTTP/1 checkout (a reconnect) opens a new connection and keeps a healthy idle one in the pool: the next ordinary checkout takes it, the pod having accepted 2 connections in all. |
+| MSH-79 | **I** (metrics). The series of a Service port that left the view (`mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_fallbacks_total`, `mimic_mesh_reconnects_total`) are present 4 minutes after it left and gone 5 minutes after (clock passed in); one that comes back within the 5 minutes keeps them. |
 
 ## 13. Test strategy
 
