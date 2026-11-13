@@ -3639,7 +3639,10 @@ kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-container
 ! found -F "$non08_canary" "$WORK/non08-controller.log" || fail "non_08: the canary is in the controller logs"
 for p in $non08_pods; do
   for c in app mimic-sidecar; do
-    ! kubectl -n non-08 logs "$p" -c "$c" 2>/dev/null | grep -qF "$non08_canary" || fail "non_08: the canary is in the $c log of $p"
+    # grep -c reads the whole log: `grep -q` would stop early, SIGPIPE kubectl, and under pipefail the
+    # pipeline's 141 would read as "no match" (a false negative).
+    [[ $(kubectl -n non-08 logs "$p" -c "$c" 2>/dev/null | grep -cF "$non08_canary" || true) == 0 ]] \
+      || fail "non_08: the canary is in the $c log of $p"
   done
 done
 kubectl delete namespace non-08 non-08-client --wait=false >/dev/null
@@ -3861,7 +3864,7 @@ for dep in web peer; do kubectl -n msh-41 rollout status deploy/$dep --timeout=3
 kubectl -n msh-41-out rollout status deploy/out --timeout=3m >/dev/null || fail "msh_41: out did not roll out Ready"
 msh_41_pod=$(kubectl -n msh-41 get pods -l app=web -o jsonpath='{.items[0].metadata.name}')
 # msh_41_metric <series>: the value of a series of the sidecar of web ("name" or "name{label=\"v\"}"), empty when absent.
-msh_41_metric() { sidecar_metrics msh-41 "$msh_41_pod" | awk -v n="$1" 'index($0, n " ") == 1 { print $2; exit }'; }
+msh_41_metric() { sidecar_metrics msh-41 "$msh_41_pod" | awk -v n="$1" '!found && index($0, n " ") == 1 { print $2; found = 1 }'; }
 # msh_41_until <timeout seconds> <description> <command...>
 msh_41_until() {
   local limit=$1 desc=$2; shift 2
@@ -4022,7 +4025,7 @@ msh_55_ips=$(kubectl -n msh-55 get pods -l app=pods -o jsonpath='{.items[*].stat
 [[ $(wc -w <<<"$msh_55_ips") == 3 ]] || fail "msh_55: pods does not have 3 pod IPs ($msh_55_ips)"
 msh_55_cluster_ip=$(kubectl -n msh-55 get svc pods -o jsonpath='{.spec.clusterIP}')
 # msh_55_metric <series>: the value of a series of the sidecar of client, empty when absent.
-msh_55_metric() { sidecar_metrics msh-55 "$msh_55_client" | awk -v n="$1" 'index($0, n " ") == 1 { print $2; exit }'; }
+msh_55_metric() { sidecar_metrics msh-55 "$msh_55_client" | awk -v n="$1" '!found && index($0, n " ") == 1 { print $2; found = 1 }'; }
 msh_55_view() { [[ $(msh_55_metric mimic_mesh_view_endpoints) == 3 ]]; }
 for _ in $(seq 60); do msh_55_view && break; sleep 1; done
 msh_55_view || fail "msh_55: the sidecar of client never held a view with the 3 endpoints of pods"
@@ -4051,14 +4054,18 @@ for ip in $msh_55_ips; do
 done
 (( msh_55_total == 300 )) || fail "msh_55: the pods received $msh_55_total requests, not 300"
 msh_55_logs() { kubectl -n msh-55 logs "$msh_55_client" -c mimic-sidecar 2>/dev/null; }
+# msh_55_lines <ip>: the access lines of the client's sidecar with the backend, that upstream and the ClusterIP as dst.
+# Counted with grep -c, which reads everything: a `grep -q` at the end would SIGPIPE the writers (status 141).
+msh_55_lines() {
+  msh_55_logs | grep '"target":"access"' | grep "\"backend\":\"msh-55/pods:80\"" | grep "\"upstream\":\"$1:8080\"" \
+    | grep -c "\"dst\":\"$msh_55_cluster_ip:80\"" || true
+}
 for ip in $msh_55_ips; do
   for _ in $(seq 30); do
-    msh_55_logs | grep '"target":"access"' | grep "\"backend\":\"msh-55/pods:80\"" | grep "\"upstream\":\"$ip:8080\"" \
-      | grep -q "\"dst\":\"$msh_55_cluster_ip:80\"" && break
+    (( $(msh_55_lines "$ip") > 0 )) && break
     sleep 1
   done
-  msh_55_logs | grep '"target":"access"' | grep "\"upstream\":\"$ip:8080\"" | grep "\"dst\":\"$msh_55_cluster_ip:80\"" \
-    | grep -q "\"backend\":\"msh-55/pods:80\"" || fail "msh_55: no access line with backend, upstream $ip and dst $msh_55_cluster_ip"
+  (( $(msh_55_lines "$ip") > 0 )) || fail "msh_55: no access line with backend, upstream $ip and dst $msh_55_cluster_ip"
 done
 before=$(msh_55_metric mimic_mesh_unscoped_connections_total)
 kubectl -n msh-55 exec deploy/client -c app -- python3 -c \
