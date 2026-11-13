@@ -54,7 +54,10 @@ fn check(name: &str, input: &[u8], upgrades: bool, seed: u8) {
         );
     }
     let cut = run(input, upgrades, seed, true);
-    assert_eq!(cut.stop, whole.stop, "{name}: the verdict follows the reads");
+    assert_eq!(
+        cut.stop, whole.stop,
+        "{name}: the verdict follows the reads"
+    );
     assert_eq!(cut.pass, whole.pass, "{name}");
     assert_eq!(cut.held, whole.held, "{name}");
     assert_eq!(cut.pending, whole.pending, "{name}");

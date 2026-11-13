@@ -11,6 +11,8 @@ use tokio::net::TcpStream;
 use super::MeshState;
 use super::pool::dial;
 use super::router::{Backend, InFlight};
+use crate::tls::intercept::Origin;
+use crate::transport::Stream;
 
 /// The connect timeout of the original destination: the relay's.
 pub(crate) const CLUSTER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,6 +69,38 @@ impl MeshState {
             stream,
             upstream: cluster,
             hold: None,
+        })
+    }
+}
+
+/// A TLS connection to a pod, or to the original destination after the pods failed.
+pub(crate) struct DialedTls {
+    pub stream: Stream,
+    pub upstream: SocketAddr,
+    pub hold: Option<InFlight>,
+}
+
+impl MeshState {
+    /// [`MeshState::dial`] for intercepted TLS (spec §7.9): the handshake with `origin` follows
+    /// the connect, the certificate verified against its name. A handshake that fails is an
+    /// error (nothing was sent), never a connection in cleartext.
+    pub(crate) async fn dial_tls(
+        &self,
+        backend: &Arc<Backend>,
+        cluster: SocketAddr,
+        origin: &Origin,
+    ) -> io::Result<DialedTls> {
+        let dialed = self.dial(backend, cluster).await?;
+        let timeout = if dialed.hold.is_some() {
+            self.router().connect_timeout
+        } else {
+            CLUSTER_CONNECT_TIMEOUT
+        };
+        let tls = origin.connect(dialed.stream, timeout).await?;
+        Ok(DialedTls {
+            stream: Stream::tls(tls.into()),
+            upstream: dialed.upstream,
+            hold: dialed.hold,
         })
     }
 }

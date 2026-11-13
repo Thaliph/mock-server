@@ -76,6 +76,9 @@ cleanup() {
   if [[ -n ${MSH_70_CLEANUP:-} ]]; then
     kubectl delete namespace msh-70 --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${MSH_75_CLEANUP:-} ]]; then
+    kubectl delete namespace msh-75 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -4210,6 +4213,170 @@ fallbacks=$(msh_70_metric mimic_mesh_fallbacks_total)
 kubectl delete namespace msh-70 --wait=false >/dev/null
 MSH_70_CLEANUP=
 echo "msh_70: 300 non-HTTP connections were spread over the 3 pods (each 100 +- 40), the access lines name the pods, no fallback"
+
+# --- Re-origination of intercepted TLS to the pods (#443 step 3, MSH-75) ---------------------------------------------
+# Objects of this section only: msh-75 (injected: cart, an HTTPS Service of 3 pods whose certificate names
+# cart.msh-75.svc under the e2e CA; cartbad, 2 pods whose certificate names cartbad.msh-75.svc under an unknown CA;
+# client, the e2e Python image, which trusts the e2e CA, so that the sidecar does too). It reuses the CAs and the
+# derived client image of tls_25. Nothing is scaled or deleted outside the section.
+log "msh_75: intercepted TLS is re-originated to the 3 pods of a Service with the certificate verified against its name; a wrong certificate is a 503"
+MSH_75_CLEANUP=1
+ns_fresh msh-75 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+issue msh75-cart e2e-ca cart.msh-75.svc
+issue msh75-bad untrusted-ca cartbad.msh-75.svc
+kubectl -n msh-75 create secret tls cart-cert --cert="$WORK/msh75-cart.crt" --key="$WORK/msh75-cart.key" >/dev/null
+kubectl -n msh-75 create secret tls cartbad-cert --cert="$WORK/msh75-bad.crt" --key="$WORK/msh75-bad.key" >/dev/null
+cat > "$WORK/msh75-pod.py" <<'PY'
+# An HTTPS pod: 200 with its own name for GET /a, one log line per request served (the proof of what reached it).
+import http.server
+import socket
+import ssl
+
+CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+CONTEXT.load_cert_chain("/certs/tls.crt", "/certs/tls.key")
+NAME = socket.gethostname().encode()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        self.request = CONTEXT.wrap_socket(self.request, server_side=True)
+        super().setup()
+
+    def do_GET(self):
+        print("served", self.path, flush=True)
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(NAME)))
+        self.end_headers()
+        self.wfile.write(NAME)
+
+    def log_message(self, *args):
+        pass
+
+
+http.server.ThreadingHTTPServer(("0.0.0.0", 8443), Handler).serve_forever()
+PY
+kubectl -n msh-75 create configmap pod-code --from-file=pod.py="$WORK/msh75-pod.py" >/dev/null
+for svc_replicas in cart:3 cartbad:2; do
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ${svc_replicas%%:*}, namespace: msh-75}
+spec:
+  replicas: ${svc_replicas##*:}
+  selector: {matchLabels: {app: ${svc_replicas%%:*}}}
+  template:
+    metadata: {labels: {app: ${svc_replicas%%:*}}}
+    spec:
+      containers:
+        - name: dest
+          image: $PY
+          command: [python3, /code/pod.py]
+          ports: [{name: https, containerPort: 8443}]
+          readinessProbe: {tcpSocket: {port: https}, periodSeconds: 1}
+          volumeMounts:
+            - {name: code, mountPath: /code, readOnly: true}
+            - {name: certs, mountPath: /certs, readOnly: true}
+      volumes:
+        - {name: code, configMap: {name: pod-code}}
+        - {name: certs, secret: {secretName: ${svc_replicas%%:*}-cert}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ${svc_replicas%%:*}, namespace: msh-75}
+spec:
+  selector: {app: ${svc_replicas%%:*}}
+  ports: [{name: https, port: 443, targetPort: https}]
+YAML
+done
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: msh-75}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: mimic-e2e-python:$TAG
+          imagePullPolicy: Never
+          command: [sleep, "3600"]
+YAML
+for d in cart cartbad client; do
+  kubectl -n msh-75 rollout status deploy/$d --timeout=3m >/dev/null || fail "msh_75: $d did not roll out Ready"
+done
+msh_75_client=$(kubectl -n msh-75 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+msh_75_ips=$(kubectl -n msh-75 get pods -l app=cart -o jsonpath='{.items[*].status.podIP}')
+[[ $(wc -w <<<"$msh_75_ips") == 3 ]] || fail "msh_75: cart does not have 3 pod IPs ($msh_75_ips)"
+# msh_75_metric <series>: the value of a series of the sidecar of client, empty when absent.
+msh_75_metric() { sidecar_metrics msh-75 "$msh_75_client" | awk -v n="$1" '!found && index($0, n " ") == 1 { print $2; found = 1 }'; }
+msh_75_ready() {
+  local metrics
+  metrics=$(sidecar_metrics msh-75 "$msh_75_client") || return 1
+  found -E '^mimic_tls_intermediate_expiry_timestamp_seconds [1-9]' <<<"$metrics" \
+    && found -E '^mimic_mesh_view_endpoints 5$' <<<"$metrics"
+}
+for _ in $(seq 90); do msh_75_ready && break; sleep 1; done
+msh_75_ready || fail "msh_75: the sidecar of client holds no intermediate, or no view with the 5 endpoints of cart and cartbad"
+# Slow start (default 30 s, spec §7.9): the spread is checked once every endpoint is past the window.
+sleep 31
+cat > "$WORK/msh75-client.py" <<'PY'
+# usage: client.py <host> <count>: GET https://<host>/a <count> times with the default trust of the app; prints
+# "<status> <body or x-mimic-error> <times>" per distinct answer.
+import collections
+import sys
+import urllib.error
+import urllib.request
+
+seen = collections.Counter()
+for _ in range(int(sys.argv[2])):
+    try:
+        with urllib.request.urlopen("https://%s/a" % sys.argv[1], timeout=10) as r:
+            seen[(r.status, r.read().decode().strip())] += 1
+    except urllib.error.HTTPError as e:
+        seen[(e.code, e.headers.get("x-mimic-error", ""))] += 1
+for (status, what), times in sorted(seen.items()):
+    print(status, what, times)
+PY
+# Copied through stdin: the image has no tar for `kubectl cp`.
+kubectl -n msh-75 exec -i deploy/client -c app -- sh -c 'cat > /tmp/client.py' < "$WORK/msh75-client.py" || fail "msh_75: cannot copy the client script"
+msh_75_good=$(kubectl -n msh-75 exec deploy/client -c app -- python3 /tmp/client.py cart.msh-75.svc 60) || fail "msh_75: the client script failed"
+msh_75_pods=$(kubectl -n msh-75 get pods -l app=cart -o jsonpath='{.items[*].metadata.name}')
+msh_75_total=0
+for pod in $msh_75_pods; do
+  # `grep -c` reads everything (no SIGPIPE) and exits 1 on no match, hence the `|| true`.
+  served=$(kubectl -n msh-75 logs "$pod" -c dest | grep -c '^served /a' || true)
+  (( served >= 5 )) || fail "msh_75: the pod $pod served $served of 60 requests (at least 5 expected)"
+  msh_75_total=$((msh_75_total + served))
+  answered=$(awk -v p="$pod" '$1 == 200 && $2 == p { n += $3 } END { print n + 0 }' <<<"$msh_75_good")
+  (( answered == served )) || fail "msh_75: the client got $answered answers of $pod, the pod served $served"
+done
+(( msh_75_total == 60 )) || fail "msh_75: the pods served $msh_75_total requests, not 60 (client saw: $msh_75_good)"
+msh_75_log=$(kubectl -n msh-75 logs "$msh_75_client" -c mimic-sidecar) || fail "msh_75: cannot read the logs of the sidecar of client"
+for ip in $msh_75_ips; do
+  lines=$(grep '"target":"access"' <<<"$msh_75_log" | grep '"tls":true' | grep '"backend":"msh-75/cart:443"' \
+    | grep -c "\"upstream\":\"$ip:8443\"" || true)
+  (( lines > 0 )) || fail "msh_75: no TLS access line with backend msh-75/cart:443 and upstream $ip:8443"
+done
+fallbacks=$(msh_75_metric mimic_mesh_fallbacks_total)
+[[ -z $fallbacks || ${fallbacks%.*} == 0 ]] || fail "msh_75: ${fallbacks} fallbacks to the ClusterIP with 3 healthy pods"
+# The pods of cartbad hold a certificate of an unknown CA: every request is a 503 of the sidecar, and no pod served any.
+msh_75_bad=$(kubectl -n msh-75 exec deploy/client -c app -- python3 /tmp/client.py cartbad.msh-75.svc 20) || fail "msh_75: the client script failed for cartbad"
+[[ $msh_75_bad == "503 connect-failed 20" ]] || fail "msh_75: cartbad was not answered 503 connect-failed 20 times: $msh_75_bad"
+for pod in $(kubectl -n msh-75 get pods -l app=cartbad -o jsonpath='{.items[*].metadata.name}'); do
+  served=$(kubectl -n msh-75 logs "$pod" -c dest | grep -c '^served' || true)
+  (( served == 0 )) || fail "msh_75: the pod $pod of cartbad served $served requests with a certificate that does not verify"
+done
+msh_75_log=$(kubectl -n msh-75 logs "$msh_75_client" -c mimic-sidecar) || fail "msh_75: cannot read the logs of the sidecar of client"
+verified=$(grep -c 'tls verification failed' <<<"$msh_75_log" || true)
+(( verified > 0 )) || fail "msh_75: the sidecar did not log the failed verification"
+kubectl delete namespace msh-75 --wait=false >/dev/null
+MSH_75_CLEANUP=
+echo "msh_75: 60 HTTPS requests reached the 3 pods (verified against the Service name, no fallback); a certificate of an unknown CA gave 503 and no pod served a request"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The

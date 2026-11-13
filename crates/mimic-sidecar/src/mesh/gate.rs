@@ -45,7 +45,15 @@ impl Progress {
 
     /// Whether every request given to `hyper` was answered; otherwise `waker` is woken when one is.
     fn idle(&self, waker: &Waker) -> bool {
+        if self.done() {
+            return true;
+        }
         *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
+        // Looked at again: a request may have finished before the waker was stored.
+        self.done()
+    }
+
+    fn done(&self) -> bool {
         self.finished.load(Ordering::Acquire) >= self.passed.load(Ordering::Acquire)
     }
 }

@@ -24,7 +24,7 @@ use crate::load::{Marker, Watch};
 use crate::mesh::{self, Backend, MeshState, Scope, Serving};
 use crate::mock::Mock;
 use crate::opaque::{self, Early, Side};
-use crate::tls::intercept::{AcceptError, ConnectError, Plan};
+use crate::tls::intercept::{AcceptError, ConnectError, Origin, Plan, is_tls_error};
 use crate::transport::Stream;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -135,18 +135,32 @@ pub(crate) async fn handle(
                     backend,
                     dst,
                     started,
+                    tls: None,
                 };
-                serve_mesh(&shared, routed, client, h2, buf, abort.as_mut()).await;
+                let stream = Stream::plain_with_prefix(client, buf.clone());
+                serve_mesh(&shared, routed, stream, &buf, h2, abort.as_mut()).await;
                 return;
             }
             MeshFirst::Relay(buf) => read = buf,
             MeshFirst::Other(buf) => {
                 read = buf;
-                // TLS that §5 intercepts keeps the byte relay until it is re-originated to a
-                // pod (#443 step 3); the rest goes to a pod.
-                decided = tls_decision(&shared, &read, dst);
-                if !matches!(decided, Some(Ok(_))) {
-                    balanced = Some((mesh, backend));
+                match tls_decision(&shared, &read, dst) {
+                    // TLS that §5 intercepts is decrypted and re-originated to the pods.
+                    Some(Ok(plan)) => {
+                        let routed = Routed {
+                            mesh,
+                            backend,
+                            dst,
+                            started,
+                            tls: None,
+                        };
+                        serve_mesh_tls(&shared, routed, client, read, plan, abort.as_mut()).await;
+                        return;
+                    }
+                    other => {
+                        decided = other;
+                        balanced = Some((mesh, backend));
+                    }
                 }
             }
             MeshFirst::Gone => return,
@@ -313,15 +327,25 @@ struct Routed {
     backend: Arc<Backend>,
     dst: SocketAddr,
     started: Instant,
+    /// Set when the app's TLS was intercepted: how TLS is spoken to the pods.
+    tls: Option<TlsRoute>,
 }
 
-/// Serves a connection per request over the pods of its Service (spec §7.9).
+/// The TLS side of a routed connection (spec §7.9 "Intercepted TLS").
+struct TlsRoute {
+    origin: Arc<Origin>,
+    /// The SNI the app sent, as the authority of its exchanges.
+    sni: Option<String>,
+}
+
+/// Serves a connection per request over the pods of its Service (spec §7.9); `client` starts
+/// with the bytes already read.
 async fn serve_mesh(
     shared: &Arc<Shared>,
     routed: Routed,
-    client: TcpStream,
+    client: Stream,
+    first: &[u8],
     h2: bool,
-    first: Vec<u8>,
     abort: Pin<&mut (impl Future<Output = ()> + Send)>,
 ) {
     let direction = Direction::Outbound;
@@ -330,9 +354,10 @@ async fn serve_mesh(
         backend,
         dst,
         started,
+        tls,
     } = routed;
     shared.metrics().count(direction, Outcome::Ok);
-    if let Err(e) = shared.prepare_socket(&client) {
+    if let Err(e) = shared.prepare_socket(client.socket().tcp()) {
         tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot configure socket");
     }
     let conn = Conn {
@@ -340,13 +365,14 @@ async fn serve_mesh(
         direction,
         dst,
         started,
-        tls: false,
-        sni: None,
+        tls: tls.is_some(),
+        sni: tls.as_ref().and_then(|t| t.sni.clone()),
         interception: None,
         mock: None,
         balanced: None,
         counted: false,
     };
+    let origin = tls.map(|t| t.origin);
     shared.proxy().connection(
         direction,
         if h2 { "h2" } else { "http1" },
@@ -356,52 +382,202 @@ async fn serve_mesh(
     let detection = if h2 { Detection::H2 } else { Detection::Http1 };
     let mock = shared
         .mock()
-        .filter(|mock| {
-            !matches!(
-                pick(mock, &detection, &first, dst, false),
-                Pick::Passthrough
-            )
-        })
+        .filter(|mock| !matches!(pick(mock, &detection, first, dst, false), Pick::Passthrough))
         .cloned();
     let serving = Serving::new(
         mesh.clone(),
         backend.clone(),
         conn.ctx(),
         shared.discovery().cloned(),
+        origin.clone(),
         mock,
     );
-    let stream = Stream::plain_with_prefix(client, first);
     let mut abort = abort;
-    match mesh::serve(serving, stream, h2, shared.stopped(), abort.as_mut()).await {
+    match mesh::serve(serving, client, h2, shared.stopped(), abort.as_mut()).await {
         Ok(mesh::Ended::Closed) => {}
         // An `Upgrade` or `CONNECT` request left `hyper` (spec §4.1 limit 8): a pod is chosen
         // for it and the connection goes on as the byte relay, the head as received.
-        Ok(mesh::Ended::Leave { client, head }) => match mesh.dial(&backend, dst).await {
-            Ok(dialed) => {
-                mesh.router().pools.close_idle(dialed.upstream);
-                let conn = Conn {
-                    counted: true,
-                    ..conn
-                };
-                let _in_flight = dialed.hold;
-                if let Err(e) = shared.prepare_socket(&dialed.stream) {
-                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot configure socket");
+        Ok(mesh::Ended::Leave { client, head }) => {
+            let (upstream, hold) = match &origin {
+                None => match mesh.dial(&backend, dst).await {
+                    Ok(dialed) => (
+                        Ok((Stream::plain(dialed.stream), dialed.upstream)),
+                        dialed.hold,
+                    ),
+                    Err(e) => (Err(e), None),
+                },
+                Some(origin) => match mesh.dial_tls(&backend, dst, origin).await {
+                    Ok(dialed) => (Ok((dialed.stream, dialed.upstream)), dialed.hold),
+                    Err(e) => (Err(e), None),
+                },
+            };
+            let _in_flight = hold;
+            match upstream {
+                Ok((upstream, at)) => {
+                    mesh.router().pools.close_idle(at);
+                    let conn = Conn {
+                        counted: true,
+                        ..conn
+                    };
+                    if let Err(e) = shared.prepare_socket(upstream.socket().tcp()) {
+                        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot configure socket");
+                    }
+                    conn.serve(Served::Http1(head), client, upstream, abort)
+                        .await;
                 }
-                conn.serve(
-                    Served::Http1(head),
-                    client,
-                    Stream::plain(dialed.stream),
-                    abort,
-                )
-                .await;
+                Err(e) => {
+                    // The app asked for an upgrade and gets a closed connection: said at warn.
+                    tracing::warn!(
+                        target: "access",
+                        direction = direction.as_str(),
+                        protocol = "http1",
+                        %dst,
+                        backend = &*backend.label,
+                        upgrade = true,
+                        result = "connect_error",
+                        error = %e,
+                        "upgrade connect failed"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::debug!(direction = direction.as_str(), %dst, error = %e, "connect failed");
-            }
-        },
+        }
         Err(e) => {
             tracing::debug!(direction = direction.as_str(), %dst, error = %e, "mesh connection ended");
         }
+    }
+}
+
+/// An in-scope connection whose TLS §5 intercepts (spec §7.9 "Intercepted TLS"): the app's
+/// handshake is answered at once, with the ALPN protocol the sidecar chooses, since no pod was
+/// connected yet; the decrypted requests go to the pods over TLS verified against the name
+/// the app called (its SNI, else the Service name), never the IP.
+async fn serve_mesh_tls(
+    shared: &Arc<Shared>,
+    routed: Routed,
+    client: TcpStream,
+    hello: Vec<u8>,
+    plan: Plan,
+    abort: Pin<&mut (impl Future<Output = ()> + Send)>,
+) {
+    let mut abort = abort;
+    let (direction, dst) = (Direction::Outbound, routed.dst);
+    let tls = shared.tls();
+    let service = service_name(&routed.backend.service);
+    let alpn = plan.mesh_alpn();
+    let origin = match tls.origin(&plan, &service, alpn).await {
+        Ok(origin) => Arc::new(origin),
+        Err(e) => {
+            tracing::warn!(target: "tls", %dst, error = %e, "cannot prepare the TLS to the pods");
+            return;
+        }
+    };
+    let sni = plan.sni().map(|name| normalise_authority(name, TLS_PORT));
+    let conn = Conn {
+        shared,
+        direction,
+        dst,
+        started: routed.started,
+        tls: true,
+        sni: sni.clone(),
+        interception: None,
+        mock: None,
+        balanced: None,
+        counted: false,
+    };
+    let accepted = tls
+        .accept(client, hello, &plan, alpn.map(<[u8]>::to_vec))
+        .await;
+    let client = match accepted {
+        Ok(client) => client,
+        Err(AcceptError::Rejected) => {
+            // The client gave up on this connection; the next one is balanced untouched.
+            tracing::debug!(direction = direction.as_str(), %dst, "client rejected the certificate");
+            tls.passthrough(&plan, Reason::ClientRejected, dst);
+            if let Some(tap) = shared.discovery() {
+                tap.tunnel("tls_client_rejected", dst, false, sni, None);
+            }
+            return;
+        }
+        Err(AcceptError::Failed(e)) => {
+            tracing::debug!(direction = direction.as_str(), %dst, error = %e, "handshake with the client failed");
+            return;
+        }
+    };
+    tls.count("intercepted");
+    let mut client = Stream::tls(client.into());
+    let routed = Routed {
+        tls: Some(TlsRoute { origin, sni }),
+        ..routed
+    };
+    if alpn == Some(b"h2") {
+        serve_mesh(shared, routed, client, &[], true, abort.as_mut()).await;
+        return;
+    }
+    // A client that agreed no ALPN may speak anything: what it sends first decides, and a
+    // silent one is a server-first protocol (below).
+    let stall = shared.detect_stall();
+    let found =
+        decrypted_first_bytes(&mut client, None, alpn.is_none(), stall, abort.as_mut()).await;
+    match found {
+        Decrypted::Found(detected @ (Detection::Http1 | Detection::H2), buf) => {
+            let h2 = detected == Detection::H2;
+            let stream = client.with_prefix(buf.clone());
+            serve_mesh(shared, routed, stream, &buf, h2, abort.as_mut()).await;
+        }
+        found => {
+            // Not HTTP: one pod, over TLS verified as above, and the bytes relayed.
+            let Routed {
+                mesh, backend, tls, ..
+            } = routed;
+            let Some(TlsRoute { origin, sni }) = tls else {
+                return;
+            };
+            let dialed = match mesh.dial_tls(&backend, dst, &origin).await {
+                Ok(dialed) => dialed,
+                Err(e) => {
+                    if is_tls_error(&e) {
+                        tracing::warn!(upstream = %dst, tls_error = %e, "tls verification failed");
+                    }
+                    shared.metrics().count(direction, Outcome::ConnectError);
+                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "connect failed");
+                    return;
+                }
+            };
+            shared.metrics().count(direction, Outcome::Ok);
+            let _in_flight = dialed.hold;
+            let mut upstream = dialed.stream;
+            let found = match found {
+                // The client was silent: the pod may speak first (a banner).
+                Decrypted::Closed(buf, Some(Early::Failed(Side::Client, e)))
+                    if buf.is_empty() && e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    decrypted_first_bytes(
+                        &mut client,
+                        Some(&mut upstream),
+                        false,
+                        stall,
+                        abort.as_mut(),
+                    )
+                    .await
+                }
+                found => found,
+            };
+            let conn = Conn {
+                sni,
+                balanced: Some((backend.label.clone(), dialed.upstream)),
+                ..conn
+            };
+            conn.serve(served_decrypted(found), client, upstream, abort)
+                .await;
+        }
+    }
+}
+
+/// `<name>.<namespace>.svc` for the `<namespace>/<name>` key of a Service.
+fn service_name(key: &str) -> String {
+    match key.split_once('/') {
+        Some((namespace, name)) => format!("{name}.{namespace}.svc"),
+        None => key.to_string(),
     }
 }
 
@@ -976,22 +1152,21 @@ async fn intercept(
     // protocol and its bytes make an opaque tunnel.
     let banner_watch = (!alpn_agreed).then_some(&mut upstream);
     let stall = conn.shared.detect_stall();
-    let served = match decrypted_first_bytes(
-        &mut client,
-        banner_watch,
-        false,
-        stall,
-        abort.as_mut(),
-    )
-    .await
-    {
+    let found =
+        decrypted_first_bytes(&mut client, banner_watch, false, stall, abort.as_mut()).await;
+    conn.serve(served_decrypted(found), client, upstream, abort)
+        .await;
+}
+
+/// What a decrypted connection is served as, once its first bytes were detected.
+fn served_decrypted(found: Decrypted) -> Served {
+    match found {
         Decrypted::Found(Detection::Http1, buf) => Served::Http1(buf),
         Decrypted::Found(Detection::H2, buf) => Served::H2(buf),
         Decrypted::Found(_, buf) => Served::Tunnel("tcp", buf, Vec::new(), None),
         Decrypted::Closed(buf, early) => Served::Tunnel("tcp", buf, Vec::new(), early),
         Decrypted::Upstream(buf, to_client, early) => Served::Tunnel("tcp", buf, to_client, early),
-    };
-    conn.serve(served, client, upstream, abort).await;
+    }
 }
 
 /// An outbound TLS connection in mock mode (spec §5 "Mock mode"): the leaf for the SNI is

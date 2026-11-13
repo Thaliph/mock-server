@@ -32,6 +32,7 @@ use super::router::{Backend, InFlight};
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, RespBody, Tracker};
 use crate::mock::{self, Mock};
+use crate::tls::intercept::{Origin, is_tls_error};
 use crate::transport::Stream;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -48,6 +49,8 @@ pub(crate) struct Serving {
     pub backend: Arc<Backend>,
     pub ctx: Ctx,
     pub tap: Option<Tap>,
+    /// How TLS is spoken to the pods when the app's TLS was intercepted (spec §7.9).
+    pub origin: Option<Arc<Origin>>,
     /// The mock that answers each request while the mode is `mock`; none for a passthrough
     /// destination.
     mock: Option<Mock>,
@@ -62,6 +65,7 @@ impl Serving {
         backend: Arc<Backend>,
         ctx: Ctx,
         tap: Option<Tap>,
+        origin: Option<Arc<Origin>>,
         mock: Option<Mock>,
     ) -> Serving {
         Serving {
@@ -69,6 +73,7 @@ impl Serving {
             backend,
             ctx,
             tap,
+            origin,
             mock,
             mocked: OnceLock::new(),
             progress: Arc::default(),
@@ -137,6 +142,16 @@ impl Body for MeshBody {
             (None, Some(body)) => body.size_hint(),
             (None, None) => SizeHint::with_exact(0),
         }
+    }
+}
+
+/// A failed connect to `upstream`: a handshake that did not verify (spec §7.9 "Intercepted TLS")
+/// is a warning with the TLS error, any other failure is routine.
+pub(super) fn connect_failed_log(upstream: &SocketAddr, e: &io::Error) {
+    if is_tls_error(e) {
+        tracing::warn!(%upstream, tls_error = %e, "tls verification failed");
+    } else {
+        tracing::debug!(%upstream, error = %e, "connect to the pod failed");
     }
 }
 
@@ -291,7 +306,13 @@ impl Serving {
                 let upstream = pick.endpoint().addr;
                 match router
                     .pools
-                    .checkout(upstream, protocol, None, router.connect_timeout)
+                    .checkout(
+                        upstream,
+                        protocol,
+                        self.origin.as_ref(),
+                        None,
+                        router.connect_timeout,
+                    )
                     .await
                 {
                     Ok(lease) => {
@@ -303,7 +324,7 @@ impl Serving {
                         });
                     }
                     Err(e) => {
-                        tracing::debug!(%upstream, error = %e, "connect to the pod failed");
+                        connect_failed_log(&upstream, &e);
                         router.failed(&pick);
                         failed = Some(upstream);
                     }
@@ -321,14 +342,23 @@ impl Serving {
         router.metrics.fallback(&self.backend.label);
         router
             .pools
-            .checkout(upstream, protocol, None, CLUSTER_CONNECT_TIMEOUT)
+            .checkout(
+                upstream,
+                protocol,
+                self.origin.as_ref(),
+                None,
+                CLUSTER_CONNECT_TIMEOUT,
+            )
             .await
             .map(|lease| Conn {
                 pick: None,
                 lease,
                 upstream,
             })
-            .map_err(Unreachable::Connect)
+            .map_err(|e| {
+                connect_failed_log(&upstream, &e);
+                Unreachable::Connect(e)
+            })
     }
 
     /// A new connection after nothing could be written to `failed`: to the same pod, never the
@@ -348,7 +378,13 @@ impl Serving {
         };
         match router
             .pools
-            .checkout(upstream, protocol, Some(&lease), timeout)
+            .checkout(
+                upstream,
+                protocol,
+                self.origin.as_ref(),
+                Some(&lease),
+                timeout,
+            )
             .await
         {
             Ok(lease) => Ok(Conn {
@@ -357,7 +393,7 @@ impl Serving {
                 upstream,
             }),
             Err(e) => {
-                tracing::debug!(%upstream, error = %e, "connect to the pod failed again");
+                connect_failed_log(&upstream, &e);
                 match pick {
                     Some(pick) => {
                         router.failed(&pick);
