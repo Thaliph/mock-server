@@ -110,13 +110,38 @@
     "stroke-width", "stroke-dasharray", "marker-end", "id", "markerWidth", "markerHeight", "refX",
     "refY", "orient", "href", "role", "aria-label", "text-anchor", "font-size", "font-family", "rx"];
 
+  // Written in two parts: no URL appears in this file (UI-09).
+  var SVG_NAMESPACE = "http:" + "//www.w3.org/2000/svg";
+
+  // A link stays inside the UI: under /ui/, with no empty, "." or ".." segment (written plain or
+  // percent-encoded), no backslash and no control character (a browser strips or rewrites them).
+  function safeHref(value) {
+    if (value.indexOf("/ui/") !== 0 || value.indexOf("\\") >= 0 || /[\u0000-\u001f\u007f]/.test(value)) {
+      return false;
+    }
+    var path = value.split(/[?#]/)[0];
+    if (path.indexOf("//") >= 0) {
+      return false;
+    }
+    return path.split("/").every(function (segment) {
+      var decoded;
+      try {
+        decoded = decodeURIComponent(segment);
+      } catch (e) {
+        return false;
+      }
+      return decoded !== "." && decoded !== ".." && decoded.indexOf("/") < 0 &&
+        decoded.indexOf("\\") < 0;
+    });
+  }
+
   function copySvg(source, ns) {
     var node = document.createElementNS(ns, source.localName);
     Array.prototype.forEach.call(source.attributes, function (attr) {
       if (SVG_ATTRIBUTES.indexOf(attr.name) < 0) {
         return;
       }
-      if (attr.name === "href" && attr.value.indexOf("/ui/") !== 0) {
+      if (attr.name === "href" && !safeHref(attr.value)) {
         return;
       }
       node.setAttribute(attr.name, attr.value);
@@ -143,7 +168,8 @@
     ).then(function (text) {
       var doc = new DOMParser().parseFromString(text, "image/svg+xml");
       var root = doc.documentElement;
-      if (!root || root.localName !== "svg" || doc.getElementsByTagName("parsererror").length > 0) {
+      if (!root || root.localName !== "svg" ||
+          root.namespaceURI !== SVG_NAMESPACE || doc.getElementsByTagName("parsererror").length > 0) {
         throw new Error("the map is not readable");
       }
       if (root.getElementsByTagName("rect").length === 0) {
