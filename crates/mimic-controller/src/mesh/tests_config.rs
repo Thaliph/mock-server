@@ -114,3 +114,25 @@ fn msh_39_stale_after_and_startup_wait_for_the_sidecars() {
         assert!(error.contains(var), "{error}");
     }
 }
+
+#[test]
+fn msh_83_the_watch_isolation_variables_have_defaults_and_bounds() {
+    let c = parse(&[]).expect("defaults");
+    assert_eq!(c.max_watches_per_pod, 2);
+    assert_eq!(c.watch_namespace_percent, 25);
+    let c = parse(&[
+        ("MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD", "100"),
+        ("MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT", "1"),
+    ])
+    .expect("bounds");
+    assert_eq!((c.max_watches_per_pod, c.watch_namespace_percent), (100, 1));
+    for (var, value) in [
+        ("MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD", "0"),
+        ("MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD", "101"),
+        ("MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT", "0"),
+        ("MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT", "101"),
+    ] {
+        let error = parse(&[(var, value)]).expect_err(&format!("{var}={value} was accepted"));
+        assert!(error.contains(var), "{var}={value}: {error}");
+    }
+}
