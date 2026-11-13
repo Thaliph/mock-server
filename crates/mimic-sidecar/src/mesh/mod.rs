@@ -3,7 +3,9 @@
 //! the view, the persisted last view, the classification of outbound connections, and the
 //! balancing of the in-scope cleartext HTTP ones over the pods of the view (spec §7.9).
 
+mod dial;
 mod follow;
+mod gate;
 mod metrics;
 mod pool;
 mod router;
@@ -34,7 +36,7 @@ use router::Router;
 
 pub use follow::Follower;
 pub(crate) use router::Backend;
-pub(crate) use serve::{Head, Serving, head_kind, serve};
+pub(crate) use serve::{Ended, Head, Serving, head_kind, serve};
 
 const MESH_VAR: &str = "MIMIC_MESH";
 const STALE_VAR: &str = "MIMIC_MESH_STALE_AFTER";
@@ -419,6 +421,8 @@ impl MeshState {
                 config.pool_idle_timeout,
                 config.max_endpoint_labels,
                 config.seed,
+                config.connect_timeout,
+                config.avoid_failed_for,
             ),
             seen: AtomicBool::new(false),
         }))

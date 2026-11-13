@@ -185,4 +185,16 @@ async fn msh_65_in_mock_an_upgrade_request_on_a_mesh_routed_connection_is_a_mock
     assert!(head.starts_with("HTTP/1.1 599"), "a mock miss: {head}");
     assert_eq!(pod.counts.requests(), 1, "the pod did not see it");
     assert_eq!(cluster.counts.requests(), 0, "nor the ClusterIP");
+    // Back in discovery, the reader no longer judges this connection: such a request is not
+    // served (spec §4.1 limit 8).
+    switch(&rig, Mode::Discovery).await;
+    client
+        .send(b"GET /ws HTTP/1.1\r\nhost: users.test:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+        .await;
+    let (head, _) = client.read().await.unwrap();
+    assert!(head.starts_with("HTTP/1.1 501"), "{head}");
+    assert!(
+        head.to_lowercase().contains("x-mimic-error: unsupported"),
+        "{head}"
+    );
 }

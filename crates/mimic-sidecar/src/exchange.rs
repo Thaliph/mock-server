@@ -232,8 +232,6 @@ pub(crate) struct Tracker {
     /// Mesh-routed: the backend and the pod the request went to (spec §7.9).
     backend: Option<Arc<str>>,
     upstream: Option<SocketAddr>,
-    /// The exchange became a tunnel.
-    upgrade: bool,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -321,7 +319,6 @@ impl Tracker {
             load_run: None,
             backend: None,
             upstream: None,
-            upgrade: false,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -348,11 +345,6 @@ impl Tracker {
     pub(crate) fn route(&mut self, backend: &Arc<str>, upstream: SocketAddr) {
         self.backend = Some(backend.clone());
         self.upstream = Some(upstream);
-    }
-
-    /// The response switches the connection to a tunnel (`101`, `2xx` to `CONNECT`).
-    pub(crate) fn mark_upgrade(&mut self) {
-        self.upgrade = true;
     }
 
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
@@ -494,7 +486,7 @@ impl Tracker {
             path: Some(std::mem::take(&mut self.path)),
             status: self.status,
             grpc_status: self.grpc_status,
-            upgrade: self.upgrade,
+            upgrade: false,
             tls: self.ctx.tls,
             outcome,
             duration: Some(self.started.elapsed()),
@@ -640,6 +632,41 @@ pub(crate) fn rejected(ctx: &Ctx) {
 }
 
 const PROTOCOL_H1: &str = "http1";
+
+/// A request head the mesh refused and answered `400` itself (spec §4.1 limit 1): counted and
+/// logged like an exchange the codec could not frame, with what is known of the request line.
+pub(crate) fn refused(ctx: &Ctx, request: Option<&RequestHead>) {
+    let authority = ctx.dst.to_string();
+    ctx.proxy.request(
+        ctx.direction,
+        PROTOCOL_H1,
+        &authority,
+        Some(400),
+        Duration::ZERO,
+    );
+    access::exchange(&access::Exchange {
+        direction: ctx.direction,
+        protocol: PROTOCOL_H1,
+        dst: ctx.dst,
+        authority,
+        method: request.map(|r| r.method.clone()),
+        path: request.map(|r| r.path.clone()),
+        status: Some(400),
+        grpc_status: None,
+        upgrade: false,
+        tls: ctx.tls,
+        outcome: Outcome::Unframed,
+        duration: None,
+        head: None,
+        bytes_in: 0,
+        bytes_out: 0,
+        mock: None,
+        mock_miss: None,
+        load_run: None,
+        backend: None,
+        upstream: None,
+    });
+}
 
 /// An HTTP/1 exchange seen by the codec and not written yet.
 struct Open {

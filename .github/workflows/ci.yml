@@ -9,7 +9,7 @@ name: ci
 #   chart ─────────────────────▲   (e2e-load runs with e2e)
 #   security (cargo deny, zizmor); supply chain (cooldown, vendored-ui, dependency-review, gitleaks, trivy-config, codeql)
 #   changes ──▶ fuzz (HTTP/1 codec, spec PRX-28; its gate is the codec paths)
-#           └─▶ fuzz-discovery (a matrix: recorder, egress set, mock, load plan and gRPC codec, spec DSC-23, PUL-20, MCK-20, LDT-18, GRP-10, MSH-13; same rule for their own paths)
+#           └─▶ fuzz-discovery (a matrix: recorder, egress set, mock, load plan and gRPC codec, spec DSC-23, PUL-20, MCK-20, LDT-18, GRP-10, MSH-13, MSH-66; same rule for their own paths)
 # `ci-ok` sums them up; it is the only required check on main. It accepts a skipped job only when that
 # job's gate is off, and never a skipped job of the ungated ones (gitleaks, dependency-review).
 #
@@ -574,7 +574,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [discovery, egress, mock, load, grpc, mesh]
+        target: [discovery, egress, mock, load, grpc, mesh, mesh_head]
     env:
       FUZZ_SECONDS: ${{ github.event_name == 'schedule' && 600 || 60 }}
       TARGET: ${{ matrix.target }}

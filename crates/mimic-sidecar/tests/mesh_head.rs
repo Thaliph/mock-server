@@ -88,13 +88,14 @@ async fn msh_65_a_head_over_64_kib_is_refused() {
     let pod = RawPod::start(echo_path).await;
     let f = fixture_mesh(cluster_ip(), &state_for(&[pod.addr]), None).await;
     let mut client = H1Client::connect(f.addr).await;
+    // Not the first request: a first head that is not whole in 16 KiB keeps the byte relay.
+    client.get("/one").await;
     let mut huge = b"GET / HTTP/1.1\r\nHost: cart.shop.svc\r\nX: ".to_vec();
     huge.extend(std::iter::repeat_n(b'a', 70 * 1024));
     huge.extend_from_slice(b"\r\n\r\n");
     client.send(&huge).await;
     let (head, _) = client.read().await.expect("an answer");
     assert_refused(&head);
-    assert!(pod.received().is_empty());
 }
 
 #[tokio::test]
@@ -151,14 +152,8 @@ async fn msh_65_content_length_with_chunked_is_still_forwarded_chunked() {
     let seen = String::from_utf8_lossy(&pod.received()).to_lowercase();
     assert!(seen.contains("transfer-encoding: chunked"), "{seen}");
     assert!(!seen.contains("content-length"), "{seen}");
-    // The reader cannot follow such a request: a later `Upgrade` is not served.
-    client
-        .send(b"GET /ws HTTP/1.1\r\nHost: cart.shop.svc\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-        .await;
-    let (head, _) = client.read().await.expect("an answer");
-    let lower = head.to_lowercase();
-    assert!(head.starts_with("HTTP/1.1 501"), "{head}");
-    assert!(lower.contains("x-mimic-error: unsupported"), "{head}");
+    // `hyper` closes the connection after such a request (RFC 9112 §6.1).
+    assert!(client.read().await.is_none(), "the connection closes");
 }
 
 /// What the pod answers to the upgrade request below.

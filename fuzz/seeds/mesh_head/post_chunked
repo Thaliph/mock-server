@@ -1,0 +1,8 @@
+POST /c HTTP/1.1
+Host: cart.shop.svc
+Transfer-Encoding: chunked
+
+5;ext=1
+hello
+0
+
