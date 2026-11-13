@@ -324,6 +324,13 @@ impl Tap {
         self.metrics.exchange("inbound", "load");
     }
 
+    /// Counts an answer the sidecar generated itself (a mesh `no-endpoint`, `connect-failed`…):
+    /// never recorded (spec §4.1 "Mesh-routed HTTP").
+    pub(crate) fn synthetic_exchange(&self, outbound: bool) {
+        self.metrics
+            .exchange(if outbound { "outbound" } else { "inbound" }, "synthetic");
+    }
+
     /// The budget the captures are taken from.
     pub fn budget(&self) -> CaptureBudget {
         CaptureBudget(self.budget.clone())

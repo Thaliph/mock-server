@@ -67,7 +67,10 @@ async fn msh_85_no_endpoint_is_synthetic_not_recorded_and_not_sent_to_the_cluste
     for _ in 0..2 {
         let (head, body) = client.get("/").await;
         assert!(head.starts_with("HTTP/1.1 503"), "{head}");
-        assert!(lower(&head).contains("x-mimic-error: no-endpoint"), "{head}");
+        assert!(
+            lower(&head).contains("x-mimic-error: no-endpoint"),
+            "{head}"
+        );
         assert!(lower(&head).contains("content-length: 0"), "{head}");
         assert!(body.is_empty());
     }
@@ -86,15 +89,18 @@ async fn msh_85_no_endpoint_is_synthetic_not_recorded_and_not_sent_to_the_cluste
     assert!(discovery.report().endpoints().is_empty());
     logs.access_exactly(2).await;
 
-    // A connect-failed answer is synthetic too.
+    // A connect-failed answer is synthetic too (the third, on the same discovery).
     let dead = closed_port().await;
     let state = state_for(dead, view_on(dead, &[closed_port().await], 0, true), |_| {});
     let f = fixture_mesh(dead, &state, Some(&discovery)).await;
     let (head, _) = H1Client::connect(f.addr).await.get("/").await;
-    assert!(lower(&head).contains("x-mimic-error: connect-failed"), "{head}");
+    assert!(
+        lower(&head).contains("x-mimic-error: connect-failed"),
+        "{head}"
+    );
     common::counted(
         &f.metrics,
-        "mimic_discovery_exchanges_total{direction=\"outbound\",result=\"synthetic\"} 1",
+        "mimic_discovery_exchanges_total{direction=\"outbound\",result=\"synthetic\"} 3",
     )
     .await;
     assert!(discovery.report().endpoints().is_empty());
@@ -105,7 +111,11 @@ async fn msh_85_serving_terminating_endpoints_are_balanced_when_none_is_ready() 
     let _logs = capture_logs();
     let cluster = Pod::http1("cluster", 0).await;
     let (a, b) = (Pod::http1("a", 0).await, Pod::http1("b", 0).await);
-    let state = state_for(cluster.addr, terminating(cluster.addr, &[a.addr, b.addr]), |_| {});
+    let state = state_for(
+        cluster.addr,
+        terminating(cluster.addr, &[a.addr, b.addr]),
+        |_| {},
+    );
     let f = fixture_mesh(cluster.addr, &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     for _ in 0..20 {
@@ -169,6 +179,9 @@ async fn msh_86_a_stale_view_with_a_refusing_cluster_ip_is_connect_failed_never_
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (head, _) = client.get("/").await;
     assert!(head.starts_with("HTTP/1.1 503"), "{head}");
-    assert!(lower(&head).contains("x-mimic-error: connect-failed"), "{head}");
+    assert!(
+        lower(&head).contains("x-mimic-error: connect-failed"),
+        "{head}"
+    );
     assert_eq!(pod.counts.requests(), 1, "a pod of the stale view was used");
 }

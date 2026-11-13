@@ -79,6 +79,11 @@ cleanup() {
   if [[ -n ${MSH_75_CLEANUP:-} ]]; then
     kubectl delete namespace msh-75 --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${MSH_87_CLEANUP:-} ]]; then
+    kubectl delete namespace msh-87 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    # The controller may be scaled to 0 by the section: back to what the chart says.
+    kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="${controller_replicas:-2}" >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -4387,6 +4392,153 @@ verified=$(grep -c 'tls verification failed' <<<"$msh_75_log" || true)
 kubectl delete namespace msh-75 --wait=false >/dev/null
 MSH_75_CLEANUP=
 echo "msh_75: 60 HTTPS requests reached the 3 pods (verified against the Service name, no fallback); a certificate of an unknown CA gave 503 and no pod served a request"
+
+# --- Failure modes (#444, MSH-87) ---------------------------------------------------------------------------------------
+# Objects of this section only: msh-87 (injected: pods, a Service of 3 replicas, and client, which calls it by name with a new
+# connection per request). The controller is scaled to 0 and back (the same Deployment msh_41 scales; restored by the trap).
+# Nothing else is scaled or deleted.
+log "msh_87: calls keep working with both controller replicas away; a rolling restart of the callee under a steady client is counted (the M2 baseline) and leaves no error after it ended"
+MSH_87_CLEANUP=1
+ns_fresh msh-87 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: pods, namespace: msh-87}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: pods}}
+  template:
+    metadata: {labels: {app: pods}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command:
+            - python3
+            - -c
+            - |
+              import http.server, socket
+              NAME = socket.gethostname().encode()
+              class H(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      self.send_response(200)
+                      self.send_header("Content-Length", str(len(NAME)))
+                      self.end_headers()
+                      self.wfile.write(NAME)
+                  def log_message(self, *args):
+                      pass
+              class S(http.server.ThreadingHTTPServer):
+                  allow_reuse_address = True
+              S(("", 8080), H).serve_forever()
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /, port: http}, periodSeconds: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: pods, namespace: msh-87}
+spec:
+  selector: {app: pods}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: msh-87}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+kubectl -n msh-87 rollout status deploy/pods --timeout=3m >/dev/null || fail "msh_87: pods did not roll out Ready"
+kubectl -n msh-87 rollout status deploy/client --timeout=3m >/dev/null || fail "msh_87: client did not roll out Ready"
+msh_87_client=$(kubectl -n msh-87 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+# msh_87_metric <series>: the value of a series of the sidecar of client, empty when absent.
+msh_87_metric() { sidecar_metrics msh-87 "$msh_87_client" | awk -v n="$1" '!found && index($0, n " ") == 1 { print $2; found = 1 }'; }
+msh_87_view() { [[ $(msh_87_metric mimic_mesh_view_endpoints) == 3 ]]; }
+for _ in $(seq 60); do msh_87_view && break; sleep 1; done
+msh_87_view || fail "msh_87: the sidecar of client never held a view with the 3 endpoints of pods"
+# The client: one request per 100 ms, each on a new connection (so each is balanced), until /tmp/msh87.stop exists. A line
+# `E <time> <what>` per request that did not get a 200; the last line is `N <requests> <errors>`.
+cat > "$WORK/msh87-client.py" <<'PY'
+import http.client
+import os
+import sys
+import time
+
+duration = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
+began = time.time()
+requests = errors = 0
+while True:
+    if duration and time.time() - began >= duration:
+        break
+    if not duration and os.path.exists("/tmp/msh87.stop"):
+        break
+    tick = time.time()
+    requests += 1
+    try:
+        c = http.client.HTTPConnection("pods.msh-87.svc", 80, timeout=3)
+        c.request("GET", "/")
+        r = c.getresponse()
+        r.read()
+        c.close()
+        if r.status != 200:
+            raise OSError("status %d" % r.status)
+    except Exception as e:
+        errors += 1
+        print("E %.3f %s" % (time.time(), type(e).__name__), flush=True)
+    time.sleep(max(0.0, 0.1 - (time.time() - tick)))
+print("N %d %d" % (requests, errors), flush=True)
+PY
+kubectl -n msh-87 exec -i "$msh_87_client" -c app -- python3 -c 'import sys; open("/tmp/msh87-client.py", "w").write(sys.stdin.read())' \
+  < "$WORK/msh87-client.py" || fail "msh_87: cannot copy the client script"
+
+# 1. Both controller replicas away: 20 s of calls, every one answered 200.
+controller_replicas=$(kubectl -n "$NS" get deploy $RELEASE-controller -o jsonpath='{.spec.replicas}')
+kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas=0 >/dev/null
+kubectl -n "$NS" wait --for=delete pod -l app.kubernetes.io/name=mimic-controller --timeout=120s >/dev/null \
+  || fail "msh_87: the controller pods did not go away"
+msh_87_away=$(kubectl -n msh-87 exec "$msh_87_client" -c app -- python3 /tmp/msh87-client.py 20) \
+  || fail "msh_87: the client failed with the controller away"
+[[ $msh_87_away == N\ * ]] || fail "msh_87: $msh_87_away"
+read -r _ msh_87_n msh_87_e <<<"$msh_87_away"
+(( msh_87_n >= 100 && msh_87_e == 0 )) || fail "msh_87: with the controller away $msh_87_e of $msh_87_n calls failed"
+msh_87_view || fail "msh_87: the view was lost with the controller away"
+kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="$controller_replicas" >/dev/null
+kubectl -n "$NS" rollout status deploy/$RELEASE-controller --timeout=3m >/dev/null || fail "msh_87: the controller did not come back"
+msh_87_pulled() {
+  local ok not_modified
+  ok=$(msh_87_metric 'mimic_mesh_view_pulls_total{result="ok"}')
+  not_modified=$(msh_87_metric 'mimic_mesh_view_pulls_total{result="not_modified"}')
+  (( ${ok:-0} + ${not_modified:-0} >= 1 ))
+}
+for _ in $(seq 90); do msh_87_pulled && break; sleep 1; done
+msh_87_pulled || fail "msh_87: the sidecar did not reach the controller again"
+
+# 2. A rolling restart of the callee under the steady client.
+kubectl -n msh-87 exec "$msh_87_client" -c app -- rm -f /tmp/msh87.stop
+kubectl -n msh-87 exec "$msh_87_client" -c app -- python3 /tmp/msh87-client.py > "$WORK/msh87.out" &
+msh_87_pid=$!
+PIDS+=("$msh_87_pid")
+sleep 5
+kubectl -n msh-87 rollout restart deploy/pods >/dev/null
+kubectl -n msh-87 rollout status deploy/pods --timeout=3m >/dev/null || fail "msh_87: pods did not roll out again"
+msh_87_end=$(date +%s.%N)
+sleep 12
+kubectl -n msh-87 exec "$msh_87_client" -c app -- touch /tmp/msh87.stop || fail "msh_87: cannot stop the client"
+wait "$msh_87_pid" || fail "msh_87: the client of the rollout failed"
+msh_87_counts=$(awk -v end="$msh_87_end" '$1 == "E" { n++; if ($2 > end) late++ } $1 == "N" { total = $2 } END { print total + 0, n + 0, late + 0 }' "$WORK/msh87.out")
+read -r msh_87_total msh_87_errors msh_87_late <<<"$msh_87_counts"
+(( msh_87_total > 0 )) || fail "msh_87: the client of the rollout made no request"
+echo "msh_87: rollout errors $msh_87_errors of $msh_87_total (the M2 baseline; $msh_87_late after the rollout ended)"
+(( msh_87_late == 0 )) || fail "msh_87: the client saw $msh_87_late errors after the rollout ended"
+kubectl delete namespace msh-87 --wait=false >/dev/null
+MSH_87_CLEANUP=
+echo "msh_87: calls were answered with both controller replicas away, and none failed after the rollout of the callee ended"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
