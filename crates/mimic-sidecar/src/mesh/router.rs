@@ -274,6 +274,7 @@ impl Router {
         }
         // A Service port that left the view: every endpoint of it left.
         for (_, backend) in previous {
+            self.metrics.backend_left(&backend.label, now);
             for addr in backend.addrs() {
                 self.metrics.left(&backend.label, addr, now);
             }

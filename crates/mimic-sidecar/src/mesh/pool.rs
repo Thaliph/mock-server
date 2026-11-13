@@ -28,6 +28,9 @@ use crate::transport::Stream;
 pub(crate) const MAX_H1_CONNECTIONS: usize = 1024;
 /// HTTP/2 connections per pod.
 pub(crate) const MAX_H2_CONNECTIONS: usize = 16;
+/// Pools per pod address: the TLS name of a pool is chosen by the app, so the pools of one pod
+/// are bounded as its connections are.
+pub(crate) const MAX_POOLS_PER_POD: usize = 8;
 /// How long a connection just handed back may take to be ready for its next request.
 const READY_WAIT: Duration = Duration::from_secs(1);
 
@@ -204,6 +207,17 @@ impl Drop for Lease {
     }
 }
 
+/// A slot of [`MAX_H1_CONNECTIONS`] taken for a connection being opened; given back when
+/// dropped, unless the driver task of the connection took it over (then it is forgotten).
+struct Slot<'a>(&'a H1Pool);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::AcqRel);
+        self.0.freed.notify_one();
+    }
+}
+
 struct Idle {
     sender: http1::SendRequest<ReqBody>,
     since: Instant,
@@ -267,20 +281,18 @@ impl H1Pool {
             let freed = self.freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
-            while let Some(mut sender) = self.take_idle().filter(|_| !fresh) {
+            // A reconnect (`fresh`) leaves the healthy idle connections alone.
+            while !fresh && let Some(mut sender) = self.take_idle() {
                 if let Ok(Ok(())) = tokio::time::timeout(READY_WAIT, sender.ready()).await {
                     return Ok(self.lease(sender));
                 }
             }
             if self.open.fetch_add(1, Ordering::AcqRel) < MAX_H1_CONNECTIONS {
-                return match self.connect().await {
-                    Ok(sender) => Ok(self.lease(sender)),
-                    Err(e) => {
-                        self.open.fetch_sub(1, Ordering::AcqRel);
-                        self.freed.notify_one();
-                        Err(e)
-                    }
-                };
+                // Dropped with the checkout (cancelled while connecting) or on an error, the
+                // guard gives the slot back; the driver task owns it once there is one.
+                let slot = Slot(self);
+                let sender = self.connect(slot).await?;
+                return Ok(self.lease(sender));
             }
             self.open.fetch_sub(1, Ordering::AcqRel);
             freed.await;
@@ -305,7 +317,7 @@ impl H1Pool {
         }
     }
 
-    async fn connect(self: &Arc<Self>) -> io::Result<http1::SendRequest<ReqBody>> {
+    async fn connect(self: &Arc<Self>, slot: Slot<'_>) -> io::Result<http1::SendRequest<ReqBody>> {
         let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http1::Builder::new()
             .preserve_header_case(true)
@@ -314,6 +326,7 @@ impl H1Pool {
             .await
             .map_err(io::Error::other)?;
         let pool = self.clone();
+        std::mem::forget(slot);
         tokio::spawn(async move {
             let _ = connection.with_upgrades().await;
             pool.open.fetch_sub(1, Ordering::AcqRel);
@@ -614,6 +627,14 @@ impl Pool {
         }
     }
 
+    /// No connection, open or being opened.
+    fn is_empty(&self) -> bool {
+        match self {
+            Pool::Http1(pool) => pool.open.load(Ordering::Acquire) == 0,
+            Pool::Http2(pool) => lock(&pool.conns).is_empty(),
+        }
+    }
+
     fn drain(&self) {
         match self {
             Pool::Http1(pool) => pool.drain(),
@@ -661,11 +682,17 @@ impl Pools {
         let fresh = again.is_some();
         let again = again.map(Lease::id);
         self.ensure_sweeper();
-        let pool = lock(&self.pools)
-            .entry((addr, protocol, origin.map(|o| o.key().clone())))
-            .or_insert_with(|| {
+        let key = (addr, protocol, origin.map(|o| o.key().clone()));
+        let pool = {
+            let mut pools = lock(&self.pools);
+            if let Some(pool) = pools.get(&key) {
+                pool.clone()
+            } else {
+                if pools.keys().filter(|(at, ..)| *at == addr).count() >= MAX_POOLS_PER_POD {
+                    return Err(io::Error::other("too many pools for the pod"));
+                }
                 let origin = origin.cloned();
-                Arc::new(match protocol {
+                let pool = Arc::new(match protocol {
                     Protocol::Http1 => Pool::Http1(Arc::new(H1Pool::new(
                         addr,
                         origin,
@@ -678,9 +705,11 @@ impl Pools {
                         self.idle_timeout,
                         connect_timeout,
                     ))),
-                })
-            })
-            .clone();
+                });
+                pools.insert(key, pool.clone());
+                pool
+            }
+        };
         if fresh
             && self
                 .refuse
@@ -742,12 +771,19 @@ impl Pools {
         }
     }
 
-    /// Closes the connections idle for too long.
+    /// Closes the connections idle for too long and drops the pools left with none.
     pub(crate) fn sweep(&self) {
         let pools: Vec<Arc<Pool>> = lock(&self.pools).values().cloned().collect();
         for pool in pools {
             pool.sweep();
         }
+        lock(&self.pools).retain(|_, pool| {
+            let empty = pool.is_empty();
+            if empty {
+                pool.drain();
+            }
+            !empty
+        });
     }
 
     /// Starts the task that sweeps idle connections, once, on the first pool.
