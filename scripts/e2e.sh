@@ -4290,6 +4290,15 @@ spec:
   ports: [{name: https, port: 443, targetPort: https}]
 YAML
 done
+# The client runs in discovery: in mode none TLS is not intercepted and takes the L4 path (MSH-70), not the re-origination.
+# The controller's MimicWorkload cache follows the API server within seconds (as in INJ-15), so the pod is created after.
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicWorkload
+metadata: {name: client, namespace: msh-75}
+spec: {deployment: client, mode: discovery}
+YAML
+sleep 5
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: apps/v1
 kind: Deployment
@@ -4318,10 +4327,11 @@ msh_75_ready() {
   local metrics
   metrics=$(sidecar_metrics msh-75 "$msh_75_client") || return 1
   found -E '^mimic_tls_intermediate_expiry_timestamp_seconds [1-9]' <<<"$metrics" \
+    && found -F 'mimic_mode{mode="discovery"} 1' <<<"$metrics" \
     && found -E '^mimic_mesh_view_endpoints 5$' <<<"$metrics"
 }
 for _ in $(seq 90); do msh_75_ready && break; sleep 1; done
-msh_75_ready || fail "msh_75: the sidecar of client holds no intermediate, or no view with the 5 endpoints of cart and cartbad"
+msh_75_ready || fail "msh_75: the sidecar of client holds no intermediate, is not in discovery, or has no view with the 5 endpoints of cart and cartbad"
 # Slow start (default 30 s, spec §7.9): the spread is checked once every endpoint is past the window.
 sleep 31
 cat > "$WORK/msh75-client.py" <<'PY'
