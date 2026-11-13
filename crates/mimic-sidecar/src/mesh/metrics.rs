@@ -2,7 +2,7 @@
 //! the per-pod series, bounded by `MIMIC_METRICS_MAX_ENDPOINTS` and evicted 5 minutes after an
 //! endpoint left the view.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -71,6 +71,15 @@ struct Slot {
     left: Option<Instant>,
 }
 
+/// What a backend (Service port) has made series of, to remove them when it leaves.
+#[derive(Default)]
+struct Series {
+    /// (`status_class`, `reason`) of the `mimic_mesh_requests_total` series.
+    requests: BTreeSet<(&'static str, &'static str)>,
+    /// When the backend left the view; `None` while it is in it.
+    left: Option<Instant>,
+}
+
 #[derive(Default)]
 struct Slots {
     map: BTreeMap<(String, SocketAddr), Slot>,
@@ -86,6 +95,8 @@ pub(crate) struct MeshMetrics {
     reconnects: Family<BackendLabels, Counter>,
     fallbacks: Family<BackendLabels, Counter>,
     slots: Mutex<Slots>,
+    /// By backend label.
+    series: Mutex<BTreeMap<String, Series>>,
     max_labels: usize,
 }
 
@@ -99,6 +110,7 @@ impl MeshMetrics {
             reconnects: Family::default(),
             fallbacks: Family::default(),
             slots: Mutex::new(Slots::default()),
+            series: Mutex::new(BTreeMap::new()),
             max_labels,
         }
     }
@@ -139,6 +151,7 @@ impl MeshMetrics {
 
     /// A request sent to the original destination instead of a pod.
     pub(crate) fn fallback(&self, backend: &str) {
+        self.track(backend, None);
         self.fallbacks
             .get_or_create(&BackendLabels {
                 backend: backend.to_string(),
@@ -153,10 +166,47 @@ impl MeshMetrics {
         };
         let _ = self.reconnects.get_or_create(&labels);
         let _ = self.fallbacks.get_or_create(&labels);
+        self.series
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(backend.to_string())
+            .or_default()
+            .left = None;
+    }
+
+    /// Notes that a series of `backend` exists. One made after the backend left the view (a
+    /// request that ends late) starts the 5 minutes anew.
+    fn track(&self, backend: &str, request: Option<(&'static str, &'static str)>) {
+        let mut all = self.series.lock().unwrap_or_else(PoisonError::into_inner);
+        if !all.contains_key(backend) {
+            all.insert(
+                backend.to_string(),
+                Series {
+                    left: Some(Instant::now()),
+                    ..Series::default()
+                },
+            );
+        }
+        if let (Some(series), Some(request)) = (all.get_mut(backend), request) {
+            series.requests.insert(request);
+        }
+    }
+
+    /// The backend left the view at `now`.
+    pub(crate) fn backend_left(&self, backend: &str, now: Instant) {
+        if let Some(series) = self
+            .series
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(backend)
+        {
+            series.left.get_or_insert(now);
+        }
     }
 
     /// A request that was sent again on a new connection.
     pub(crate) fn reconnect(&self, backend: &str) {
+        self.track(backend, None);
         self.reconnects
             .get_or_create(&BackendLabels {
                 backend: backend.to_string(),
@@ -198,6 +248,7 @@ impl MeshMetrics {
 
     /// Removes the series of the endpoints that left the view 5 minutes before `now`.
     pub(crate) fn evict(&self, now: Instant) {
+        self.evict_backends(now);
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let due: Vec<(String, SocketAddr)> = slots
             .map
@@ -228,6 +279,43 @@ impl MeshMetrics {
         }
     }
 
+    /// Removes the per-Service series of the backends that left the view 5 minutes before `now`.
+    fn evict_backends(&self, now: Instant) {
+        let mut all = self.series.lock().unwrap_or_else(PoisonError::into_inner);
+        all.retain(|backend, series| {
+            let due = series
+                .left
+                .is_some_and(|left| now.saturating_duration_since(left) >= EVICT_AFTER);
+            if !due {
+                return true;
+            }
+            // `<namespace>/<name>:<port>`.
+            let service = backend.rsplit_once(':').map_or(&**backend, |(s, _)| s);
+            for &(status_class, reason) in &series.requests {
+                self.requests.remove(&RequestLabels {
+                    service: service.to_string(),
+                    route: "none",
+                    backend: backend.clone(),
+                    status_class,
+                    reason,
+                });
+            }
+            for status_class in CLASSES {
+                self.durations.remove(&DurationLabels {
+                    service: service.to_string(),
+                    backend: backend.clone(),
+                    status_class,
+                });
+            }
+            let labels = BackendLabels {
+                backend: backend.clone(),
+            };
+            self.reconnects.remove(&labels);
+            self.fallbacks.remove(&labels);
+            false
+        });
+    }
+
     pub(crate) fn in_flight_gauge(&self, backend: &str, endpoint: &str) -> Gauge {
         self.in_flight
             .get_or_create(&InFlightLabels {
@@ -239,6 +327,7 @@ impl MeshMetrics {
 
     /// One mesh-routed request that got a response (or none: `status_class` `none`).
     pub(crate) fn request(&self, call: &Call<'_>, elapsed: Duration) {
+        self.track(call.backend, Some((call.status_class, call.reason)));
         self.requests
             .get_or_create(&RequestLabels {
                 service: call.service.to_string(),

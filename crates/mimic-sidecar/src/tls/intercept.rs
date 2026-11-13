@@ -387,6 +387,22 @@ pub(crate) struct Origin {
 }
 
 impl Origin {
+    /// An origin for `name` that trusts no root (pool tests).
+    #[cfg(test)]
+    pub(crate) fn for_test(name: &str) -> Origin {
+        let name = ServerName::try_from(name.to_string()).expect("a valid name");
+        let config = ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        Origin {
+            key: Arc::from(name.to_str().as_ref()),
+            name,
+            connector: TlsConnector::from(Arc::new(config)),
+        }
+    }
+
     /// The name, which tells the pools of one pod apart.
     pub(crate) fn key(&self) -> &Arc<str> {
         &self.key
