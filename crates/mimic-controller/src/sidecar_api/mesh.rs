@@ -171,7 +171,7 @@ impl SidecarApi {
             }
         };
         match hub
-            .answer(namespace, deployment, &mode, &held, &start)
+            .answer(namespace, pod, deployment, &mode, &held, &start)
             .await
         {
             Held::View(entry) => {

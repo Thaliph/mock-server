@@ -136,7 +136,10 @@ pub(crate) fn put_grant(hub: &Hub, name: &str, g: ReferenceGrant) {
 }
 
 pub(crate) async fn body_of(hub: &Hub, ns: &str, deployment: &str, mode: Mode) -> (String, String) {
-    match hub.answer(ns, deployment, &move || mode, &[], &|| {}).await {
+    match hub
+        .answer(ns, "pod", deployment, &move || mode, &[], &|| {})
+        .await
+    {
         Answer::View(entry) => (entry.etag.clone(), entry.json.to_string()),
         _ => panic!("no view"),
     }
@@ -600,7 +603,10 @@ async fn msh_27_a_relist_replaces_what_the_watch_held_and_a_delete_removes_its_k
 async fn msh_26_the_gzip_copy_of_a_cached_view_is_counted_in_the_cache() {
     let hub = hub(MeshConfig::default());
     namespaces(&hub, 1, 20);
-    let Answer::View(entry) = hub.answer("ns0", "a", &|| Mode::None, &[], &|| {}).await else {
+    let Answer::View(entry) = hub
+        .answer("ns0", "pod", "a", &|| Mode::None, &[], &|| {})
+        .await
+    else {
         panic!("no view");
     };
     let plain = hub.metrics().cache_bytes.get() as usize;
@@ -618,7 +624,10 @@ async fn msh_26_the_gzip_copy_of_a_cached_view_is_counted_in_the_cache() {
         MeshMetrics::default(),
     );
     namespaces(&small, 1, 20);
-    let Answer::View(entry) = small.answer("ns0", "a", &|| Mode::None, &[], &|| {}).await else {
+    let Answer::View(entry) = small
+        .answer("ns0", "pod", "a", &|| Mode::None, &[], &|| {})
+        .await
+    else {
         panic!("no view");
     };
     small.compress(&entry);
@@ -643,8 +652,9 @@ async fn msh_26_concurrent_gzip_replacement_and_eviction_keep_the_cache_count_ex
                         hub.publish_now();
                     }
                     let ns = format!("ns{}", (i + round) % 4);
-                    if let Answer::View(entry) =
-                        hub.answer(&ns, "a", &|| Mode::None, &[], &|| {}).await
+                    if let Answer::View(entry) = hub
+                        .answer(&ns, "pod", "a", &|| Mode::None, &[], &|| {})
+                        .await
                     {
                         hub.compress(&entry);
                     }

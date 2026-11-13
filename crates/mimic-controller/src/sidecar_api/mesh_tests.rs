@@ -751,12 +751,21 @@ async fn msh_82_a_request_dropped_while_held_releases_every_count() {
     let s = setup_with(Some(config_isolated(8, 2)), 10_000, false);
     let etag = get(&s, "cart", "shop", &[]).await.etag();
     let pod = "cart-7d9f8b6c4d-x2k9p";
-    let (a, b) = (hold_as(&s, "shop", pod, &etag), hold_as(&s, "shop", pod, &etag));
+    let (a, b) = (
+        hold_as(&s, "shop", pod, &etag),
+        hold_as(&s, "shop", pod, &etag),
+    );
     held_now(&s, 2).await;
     a.abort();
     b.abort();
     held_now(&s, 0).await;
-    let (c, d) = (hold_as(&s, "shop", pod, &etag), hold_as(&s, "shop", pod, &etag));
+    let (c, d) = (
+        hold_as(&s, "shop", pod, &etag),
+        hold_as(&s, "shop", pod, &etag),
+    );
     held_now(&s, 2).await;
-    assert_eq!((c.await.unwrap().status, d.await.unwrap().status), (304, 304));
+    assert_eq!(
+        (c.await.unwrap().status, d.await.unwrap().status),
+        (304, 304)
+    );
 }

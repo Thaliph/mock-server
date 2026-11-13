@@ -1,6 +1,7 @@
 # Least privilege for the controller (spec §11): every grant is limited to the names this
 # release creates. The only create is TokenReview (sidecar API authentication, spec §7.2).
-# No pods, no other Secrets; Deployments are read for their metadata only (the mesh view, below).
+# No pods, no other Secrets; Deployments are read for the mesh view (below): RBAC cannot limit a read to
+# metadata, so the grant covers whole Deployments cluster-wide, the controller only asks for their metadata.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -26,7 +27,8 @@ rules:
     verbs: [create]
   {{- if .Values.mesh.enabled }}
   # The mesh view (spec §7.2, §7.9, M1): read-only watches on what a view is built from (a Deployment is
-  # watched for its metadata only), the ReferenceGrants that let a namespace consent to a destination (the
+  # requested as metadata only by the code, but the grant is cluster-wide and covers the whole object), the
+  # ReferenceGrants that let a namespace consent to a destination (the
   # Gateway API CRD may not exist: the rule is harmless then), and the status of a MimicConfig by server-side
   # apply. No Secret, no write on what is watched.
   - apiGroups: [""]
@@ -58,10 +60,13 @@ rules:
   - apiGroups: [mimic.platform.io]
     resources: [mimicloadtests/status]
     verbs: [patch]
-  # The ready pod addresses of a deployment's Service endpoints (spec §7.8, Targets).
+  {{- if not .Values.mesh.enabled }}
+  # The ready pod addresses of a deployment's Service endpoints (spec §7.8, Targets); with the mesh on,
+  # its endpointslices rule above already covers them.
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [list, watch]
+  {{- end }}
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [create, get, list, watch, delete]
