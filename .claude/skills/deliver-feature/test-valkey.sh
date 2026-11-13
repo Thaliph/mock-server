@@ -11,7 +11,10 @@ field() { sed -n '/^valkey:/,/^[a-z]/p' "$values" | awk -v k="$1:" '$1 == k { pr
 image="$(field repository):$(field tag)@$(field digest)"
 if [[ $(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null) != true ]]; then
   docker rm -f "$name" >/dev/null 2>&1 || true
-  docker run -d --name "$name" --restart unless-stopped -p "127.0.0.1:$port:6379" "$image" >/dev/null
+  # Test data only: no RDB snapshot and no AOF, so the store never writes to disk (a 30 GB snapshot of
+  # accumulated test keys filled the disk on 2026-11-13).
+  docker run -d --name "$name" --restart unless-stopped -p "127.0.0.1:$port:6379" "$image" \
+    valkey-server --save "" --appendonly no >/dev/null
 fi
 for _ in $(seq 1 20); do
   [[ $(docker exec "$name" valkey-cli ping 2>/dev/null) == PONG ]] && break
