@@ -1,0 +1,5 @@
+POST /b HTTP/1.1
+Host: cart.shop.svc
+Content-Length: 5
+
+hello

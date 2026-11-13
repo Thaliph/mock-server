@@ -344,3 +344,153 @@ impl H1Client {
         self.pending.drain(..n).collect()
     }
 }
+
+/// A TCP server that echoes what it reads and counts the connections it accepts.
+pub struct EchoPod {
+    pub addr: SocketAddr,
+    pub accepted: Arc<AtomicUsize>,
+    /// Everything read, in the order it came.
+    pub received: Arc<std::sync::Mutex<Vec<u8>>>,
+    /// Connections open now.
+    pub open: Arc<AtomicUsize>,
+}
+
+impl EchoPod {
+    pub async fn start() -> EchoPod {
+        EchoPod::on(TcpListener::bind("127.0.0.1:0").await.unwrap(), false)
+    }
+
+    /// Reads what comes, then closes without answering.
+    pub async fn closer() -> EchoPod {
+        EchoPod::on(TcpListener::bind("127.0.0.1:0").await.unwrap(), true)
+    }
+
+    /// Serves on a listener that already exists (a revived pod).
+    pub fn on(listener: TcpListener, close_after_read: bool) -> EchoPod {
+        let addr = listener.local_addr().unwrap();
+        let pod = EchoPod {
+            addr,
+            accepted: Arc::default(),
+            received: Arc::default(),
+            open: Arc::default(),
+        };
+        let (accepted, received, open) =
+            (pod.accepted.clone(), pod.received.clone(), pod.open.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted.fetch_add(1, Ordering::SeqCst);
+                open.fetch_add(1, Ordering::SeqCst);
+                let (received, open) = (received.clone(), open.clone());
+                tokio::spawn(async move {
+                    let _open = OpenGuard(open);
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        received.lock().unwrap().extend_from_slice(&buf[..n]);
+                        if close_after_read || stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        pod
+    }
+
+    pub fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    pub fn open(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    pub fn received(&self) -> Vec<u8> {
+        self.received.lock().unwrap().clone()
+    }
+}
+
+/// An address whose accept queue is full, so that connecting to it hangs (neither accepted nor
+/// refused). `revive` serves on it.
+pub struct Blackhole {
+    pub addr: SocketAddr,
+    listener: TcpListener,
+    _fill: Vec<tokio::net::TcpStream>,
+}
+
+impl Blackhole {
+    pub async fn new() -> Blackhole {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut fill = Vec::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(
+                Duration::from_millis(150),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => fill.push(stream),
+                _ => break,
+            }
+        }
+        Blackhole {
+            addr,
+            listener,
+            _fill: fill,
+        }
+    }
+
+    /// Starts accepting (what queued is served too).
+    pub fn revive(self) -> EchoPod {
+        EchoPod::on(self.listener, false)
+    }
+}
+
+impl Blackhole {
+    /// Starts answering HTTP requests with `name` (what queued is served too).
+    pub fn revive_http(self, name: &'static str) -> Counts {
+        let counts = Counts::default();
+        let shared = counts.clone();
+        let listener = self.listener;
+        tokio::spawn(async move {
+            let _keep = self._fill;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let counts = shared.clone();
+                counts.accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut pending = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            return;
+                        }
+                        pending.extend_from_slice(&buf[..n]);
+                        while let Some(p) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                            pending.drain(..p + 4);
+                            counts.requests.fetch_add(1, Ordering::SeqCst);
+                            let body = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{name}",
+                                name.len()
+                            );
+                            if stream.write_all(body.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        counts
+    }
+}

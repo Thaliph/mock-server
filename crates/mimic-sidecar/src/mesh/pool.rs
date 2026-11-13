@@ -26,7 +26,6 @@ use crate::exchange::ReqBody;
 pub(crate) const MAX_H1_CONNECTIONS: usize = 1024;
 /// HTTP/2 connections per pod.
 pub(crate) const MAX_H2_CONNECTIONS: usize = 16;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a connection just handed back may take to be ready for its next request.
 const READY_WAIT: Duration = Duration::from_secs(1);
 
@@ -41,8 +40,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-async fn dial(addr: SocketAddr) -> io::Result<TcpStream> {
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+/// Connects to `addr` within `timeout` and sets the socket options of spec §4.1.
+pub(crate) async fn dial(addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    let stream = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
         Ok(connected) => connected?,
         Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
     };
@@ -67,6 +67,15 @@ pub(crate) enum Lease {
 }
 
 impl Lease {
+    /// What tells this connection from another of its pool, for a stream sent again that must
+    /// not take the one that failed (HTTP/2 only; 0 for HTTP/1, which opens a new one).
+    pub(crate) fn id(&self) -> usize {
+        match self {
+            Lease::Http1 { .. } => 0,
+            Lease::Http2 { active, .. } => Arc::as_ptr(active) as usize,
+        }
+    }
+
     /// Sends the request. A failed HTTP/1 connection is not handed back.
     pub(crate) async fn send(&mut self, req: Request<ReqBody>) -> Sent {
         let sent = match self {
@@ -139,6 +148,7 @@ struct Idle {
 pub(crate) struct H1Pool {
     addr: SocketAddr,
     idle_timeout: Duration,
+    connect_timeout: Duration,
     idle: Mutex<Vec<Idle>>,
     /// Connections open, idle or not.
     open: AtomicUsize,
@@ -147,10 +157,11 @@ pub(crate) struct H1Pool {
 }
 
 impl H1Pool {
-    fn new(addr: SocketAddr, idle_timeout: Duration) -> H1Pool {
+    fn new(addr: SocketAddr, idle_timeout: Duration, connect_timeout: Duration) -> H1Pool {
         H1Pool {
             addr,
             idle_timeout,
+            connect_timeout,
             idle: Mutex::new(Vec::new()),
             open: AtomicUsize::new(0),
             freed: Notify::new(),
@@ -207,7 +218,7 @@ impl H1Pool {
 
     /// A lease on a connection whose driver is gone (test hook).
     async fn closed_lease(self: &Arc<Self>) -> io::Result<Lease> {
-        let stream = dial(self.addr).await?;
+        let stream = dial(self.addr, self.connect_timeout).await?;
         let (sender, connection) = http1::Builder::new()
             .handshake(TokioIo::new(stream))
             .await
@@ -224,7 +235,7 @@ impl H1Pool {
     }
 
     async fn connect(self: &Arc<Self>) -> io::Result<http1::SendRequest<ReqBody>> {
-        let stream = dial(self.addr).await?;
+        let stream = dial(self.addr, self.connect_timeout).await?;
         let (sender, connection) = http1::Builder::new()
             .preserve_header_case(true)
             .allow_obsolete_multiline_headers_in_responses(true)
@@ -248,6 +259,11 @@ impl H1Pool {
         self.draining.store(true, Ordering::Release);
         lock(&self.idle).clear();
     }
+
+    /// Closes the idle connections; the pool stays in use.
+    fn close_idle(&self) {
+        lock(&self.idle).clear();
+    }
 }
 
 struct Conn {
@@ -263,6 +279,7 @@ struct Conn {
 pub(crate) struct H2Pool {
     addr: SocketAddr,
     idle_timeout: Duration,
+    connect_timeout: Duration,
     started: Instant,
     conns: Mutex<Vec<Conn>>,
     /// One connection is opened at a time, so that streams opened together share it.
@@ -271,10 +288,11 @@ pub(crate) struct H2Pool {
 }
 
 impl H2Pool {
-    fn new(addr: SocketAddr, idle_timeout: Duration) -> H2Pool {
+    fn new(addr: SocketAddr, idle_timeout: Duration, connect_timeout: Duration) -> H2Pool {
         H2Pool {
             addr,
             idle_timeout,
+            connect_timeout,
             started: Instant::now(),
             conns: Mutex::new(Vec::new()),
             connecting: tokio::sync::Mutex::new(()),
@@ -284,7 +302,7 @@ impl H2Pool {
 
     /// A lease on a connection whose driver is gone (test hook).
     async fn closed_lease(&self) -> io::Result<Lease> {
-        let stream = dial(self.addr).await?;
+        let stream = dial(self.addr, self.connect_timeout).await?;
         let (sender, connection) = http2::Builder::new(TokioExecutor::new())
             .handshake(TokioIo::new(stream))
             .await
@@ -320,7 +338,10 @@ impl H2Pool {
             .map(|c| self.lease(c))
     }
 
-    async fn checkout(&self, fresh: bool) -> io::Result<Lease> {
+    /// A connection with a free stream; with `again` (the id of the connection that failed) a
+    /// new one, or at the bound the least busy open one that is not the failed one.
+    async fn checkout(&self, again: Option<usize>) -> io::Result<Lease> {
+        let fresh = again.is_some();
         if let Some(lease) = self.free().filter(|_| !fresh) {
             return Ok(lease);
         }
@@ -329,7 +350,7 @@ impl H2Pool {
             return Ok(lease);
         }
         if lock(&self.conns).len() < MAX_H2_CONNECTIONS {
-            let stream = dial(self.addr).await?;
+            let stream = dial(self.addr, self.connect_timeout).await?;
             let max_streams = Arc::new(AtomicU32::new(u32::MAX));
             let (sender, connection) = http2::Builder::new(TokioExecutor::new())
                 .handshake(TokioIo::new(Snoop::new(stream, max_streams.clone())))
@@ -349,12 +370,20 @@ impl H2Pool {
             return Ok(lease);
         }
         // Every connection is full and the pod is at its bound: the stream waits for a slot
-        // on the least busy connection.
+        // on the least busy connection (never the one that failed).
         let conns = lock(&self.conns);
-        conns
+        let view: Vec<(usize, usize, bool)> = conns
             .iter()
-            .min_by_key(|c| c.active.load(Ordering::Acquire))
-            .map(|c| self.lease(c))
+            .map(|c| {
+                (
+                    Arc::as_ptr(&c.active) as usize,
+                    c.active.load(Ordering::Acquire),
+                    c.sender.is_closed(),
+                )
+            })
+            .collect();
+        least_busy(&view, again)
+            .map(|i| self.lease(&conns[i]))
             .ok_or_else(|| io::Error::other("no connection"))
     }
 
@@ -372,6 +401,18 @@ impl H2Pool {
         self.draining.store(true, Ordering::Release);
         lock(&self.conns).clear();
     }
+}
+
+/// The index of the open connection with the fewest requests in flight, never the one `avoid`
+/// names (a resent stream must not take the connection that just failed). Each entry is
+/// `(id, in flight, closed)`.
+fn least_busy(conns: &[(usize, usize, bool)], avoid: Option<usize>) -> Option<usize> {
+    conns
+        .iter()
+        .enumerate()
+        .filter(|(_, (id, _, closed))| !closed && Some(*id) != avoid)
+        .min_by_key(|(_, (_, active, _))| *active)
+        .map(|(i, _)| i)
 }
 
 /// The largest SETTINGS payload read for `MAX_CONCURRENT_STREAMS`.
@@ -510,6 +551,8 @@ pub(crate) struct Pools {
     sweeping: AtomicBool,
     /// Checkouts left that hand out a closed connection (test hook).
     poison: AtomicUsize,
+    /// Fresh checkouts left that are refused (test hook).
+    refuse: AtomicUsize,
 }
 
 impl Pools {
@@ -519,26 +562,48 @@ impl Pools {
             pools: Mutex::new(HashMap::new()),
             sweeping: AtomicBool::new(false),
             poison: AtomicUsize::new(0),
+            refuse: AtomicUsize::new(0),
         })
     }
 
-    /// A connection to `addr` for one request, from its pool or a new one.
+    /// A connection to `addr` for one request, from its pool or a new one. `again` is the lease
+    /// of the connection a request could not be written to: a new connection, never that one.
+    /// The pool of an address is created with `connect_timeout`.
     pub(crate) async fn checkout(
         self: &Arc<Self>,
         addr: SocketAddr,
         protocol: Protocol,
-        fresh: bool,
+        again: Option<&Lease>,
+        connect_timeout: Duration,
     ) -> io::Result<Lease> {
+        let fresh = again.is_some();
+        let again = again.map(Lease::id);
         self.ensure_sweeper();
         let pool = lock(&self.pools)
             .entry((addr, protocol))
             .or_insert_with(|| {
                 Arc::new(match protocol {
-                    Protocol::Http1 => Pool::Http1(Arc::new(H1Pool::new(addr, self.idle_timeout))),
-                    Protocol::Http2 => Pool::Http2(Arc::new(H2Pool::new(addr, self.idle_timeout))),
+                    Protocol::Http1 => Pool::Http1(Arc::new(H1Pool::new(
+                        addr,
+                        self.idle_timeout,
+                        connect_timeout,
+                    ))),
+                    Protocol::Http2 => Pool::Http2(Arc::new(H2Pool::new(
+                        addr,
+                        self.idle_timeout,
+                        connect_timeout,
+                    ))),
                 })
             })
             .clone();
+        if fresh
+            && self
+                .refuse
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+        }
         let poisoned = !fresh
             && self
                 .poison
@@ -552,8 +617,13 @@ impl Pools {
         }
         match &*pool {
             Pool::Http1(pool) => pool.checkout(fresh).await,
-            Pool::Http2(pool) => pool.checkout(fresh).await,
+            Pool::Http2(pool) => pool.checkout(again).await,
         }
+    }
+
+    /// The next fresh checkout fails as a refused connection would (test hook).
+    pub(crate) fn refuse_next_fresh(&self) {
+        self.refuse.fetch_add(1, Ordering::AcqRel);
     }
 
     /// The next checkout hands out a connection that is already closed.
@@ -572,6 +642,16 @@ impl Pools {
             }
             keep
         });
+    }
+
+    /// Closes the idle HTTP/1 connections to `addr` (a connection of the app left `hyper` for
+    /// it, spec §4.1 limit 8).
+    pub(crate) fn close_idle(&self, addr: SocketAddr) {
+        if let Some(pool) = lock(&self.pools).get(&(addr, Protocol::Http1))
+            && let Pool::Http1(pool) = &**pool
+        {
+            pool.close_idle();
+        }
     }
 
     /// Closes the connections idle for too long.
@@ -607,7 +687,20 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::Snoop;
+    use super::{Snoop, least_busy};
+
+    #[test]
+    fn msh_69_at_the_h2_bound_a_resent_stream_never_takes_the_failed_connection() {
+        // (id, requests in flight, closed)
+        let conns = [(1usize, 0usize, false), (2, 3, false), (3, 1, true)];
+        // No connection to avoid: the least busy one that is open.
+        assert_eq!(least_busy(&conns, None), Some(0));
+        // The least busy one failed: the next, never the failed one, never a closed one.
+        assert_eq!(least_busy(&conns, Some(1)), Some(1));
+        // Only the failed connection is left.
+        assert_eq!(least_busy(&conns[..1], Some(1)), None);
+        assert_eq!(least_busy(&[], None), None);
+    }
 
     async fn snoop(max: &Arc<AtomicU32>) -> Snoop {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -100,7 +100,7 @@ async fn msh_61_a_stale_view_is_not_used_for_pod_addresses() {
     let cluster = Pod::http1("cluster", 0).await;
     let pod = Pod::http1("pod", 0).await;
     let state = state_for(cluster.addr, &[pod.addr], |c| {
-        c.stale_after = Duration::from_millis(300)
+        c.stale_after = Duration::from_millis(200)
     });
     let f = fixture_mesh(cluster.addr, &state, None).await;
     let mut open = H1Client::connect(f.addr).await;

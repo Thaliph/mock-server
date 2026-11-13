@@ -124,6 +124,9 @@ pub(crate) async fn handle(
     // An in-scope Service is balanced per request when the client speaks cleartext HTTP (spec
     // §7.9): what it sends first decides, so the original destination is not dialled yet.
     let route = if mock.is_none() { route } else { None };
+    // Balanced per connection (spec §7.9 "L4 balancing"), and the §5 decision made on the way.
+    let mut balanced = None;
+    let mut decided = None;
     if let Some((mesh, backend)) = route {
         match mesh_first(&mut client, stall, abort.as_mut()).await {
             MeshFirst::Http(h2, buf) => {
@@ -136,22 +139,46 @@ pub(crate) async fn handle(
                 serve_mesh(&shared, routed, client, h2, buf, abort.as_mut()).await;
                 return;
             }
-            MeshFirst::Other(buf) => read = buf,
+            MeshFirst::Relay(buf) => read = buf,
+            MeshFirst::Other(buf) => {
+                read = buf;
+                // TLS that §5 intercepts keeps the byte relay until it is re-originated to a
+                // pod (#443 step 3); the rest goes to a pod.
+                decided = tls_decision(&shared, &read, dst);
+                if !matches!(decided, Some(Ok(_))) {
+                    balanced = Some((mesh, backend));
+                }
+            }
             MeshFirst::Gone => return,
         }
     }
-    let connected = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await;
+    let mut upstream_route = None;
+    let connected = match &balanced {
+        Some((mesh, backend)) => match mesh.dial(backend, dst).await {
+            Ok(dialed) => {
+                upstream_route = Some((backend.label.clone(), dialed.upstream, dialed.hold));
+                Ok(dialed.stream)
+            }
+            Err(e) => Err(e.to_string()),
+        },
+        None => match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await {
+            Ok(Ok(upstream)) => Ok(upstream),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("connect timeout".to_string()),
+        },
+    };
     let upstream = match connected {
-        Ok(Ok(upstream)) => upstream,
-        failure => {
+        Ok(upstream) => upstream,
+        Err(error) => {
             shared.metrics().count(direction, Outcome::ConnectError);
-            let error = match failure {
-                Ok(Err(e)) => e.to_string(),
-                _ => "connect timeout".to_string(),
-            };
             tracing::debug!(direction = direction.as_str(), %dst, %error, "connect failed");
             return;
         }
+    };
+    // The connection counts as a request in flight to its pod until it ends.
+    let (balanced, _in_flight) = match upstream_route {
+        Some((backend, upstream, hold)) => (Some((backend, upstream)), hold),
+        None => (None, None),
     };
     shared.metrics().count(direction, Outcome::Ok);
     for socket in [&client, &upstream] {
@@ -168,6 +195,8 @@ pub(crate) async fn handle(
         sni: None,
         interception: None,
         mock: None,
+        balanced,
+        counted: false,
     };
     let mut upstream = upstream;
     let first = first_bytes(&mut client, &mut upstream, read, stall, abort.as_mut()).await;
@@ -219,14 +248,9 @@ pub(crate) async fn handle(
                 Detection::Tls { sni } => {
                     conn.sni = sni.map(|name| normalise_authority(&name, TLS_PORT));
                     if direction == Direction::Outbound {
-                        let hello = match parse_client_hello(&buf) {
-                            Parsed::Hello(hello) => hello,
-                            _ => ClientHello::default(),
-                        };
-                        let decided = if shared.mock().is_some_and(Mock::silent) {
-                            Err(Reason::ModeNone)
-                        } else {
-                            shared.tls().decide(&hello, dst)
+                        let decided = match decided.take() {
+                            Some(decided) => decided,
+                            None => decide_tls(&shared, &buf, dst),
                         };
                         match decided {
                             Ok(plan) => {
@@ -263,6 +287,24 @@ pub(crate) async fn handle(
         abort.as_mut(),
     )
     .await;
+}
+
+/// The §5 decision for a ClientHello in `buf` sent to `dst`.
+fn decide_tls(shared: &Shared, buf: &[u8], dst: SocketAddr) -> Result<Plan, Reason> {
+    let hello = match parse_client_hello(buf) {
+        Parsed::Hello(hello) => hello,
+        _ => ClientHello::default(),
+    };
+    if shared.mock().is_some_and(Mock::silent) {
+        Err(Reason::ModeNone)
+    } else {
+        shared.tls().decide(&hello, dst)
+    }
+}
+
+/// The §5 decision when `buf` starts a TLS connection, `None` for anything else.
+fn tls_decision(shared: &Shared, buf: &[u8], dst: SocketAddr) -> Option<Result<Plan, Reason>> {
+    matches!(detect(buf), Detection::Tls { .. }).then(|| decide_tls(shared, buf, dst))
 }
 
 /// An in-scope connection the mesh balances.
@@ -302,6 +344,8 @@ async fn serve_mesh(
         sni: None,
         interception: None,
         mock: None,
+        balanced: None,
+        counted: false,
     };
     shared.proxy().connection(
         direction,
@@ -319,10 +363,45 @@ async fn serve_mesh(
             )
         })
         .cloned();
-    let serving = Serving::new(mesh, backend, conn.ctx(), shared.discovery().cloned(), mock);
+    let serving = Serving::new(
+        mesh.clone(),
+        backend.clone(),
+        conn.ctx(),
+        shared.discovery().cloned(),
+        mock,
+    );
     let stream = Stream::plain_with_prefix(client, first);
-    if let Err(e) = mesh::serve(serving, stream, h2, shared.stopped(), abort).await {
-        tracing::debug!(direction = direction.as_str(), %dst, error = %e, "mesh connection ended");
+    let mut abort = abort;
+    match mesh::serve(serving, stream, h2, shared.stopped(), abort.as_mut()).await {
+        Ok(mesh::Ended::Closed) => {}
+        // An `Upgrade` or `CONNECT` request left `hyper` (spec §4.1 limit 8): a pod is chosen
+        // for it and the connection goes on as the byte relay, the head as received.
+        Ok(mesh::Ended::Leave { client, head }) => match mesh.dial(&backend, dst).await {
+            Ok(dialed) => {
+                mesh.router().pools.close_idle(dialed.upstream);
+                let conn = Conn {
+                    counted: true,
+                    ..conn
+                };
+                let _in_flight = dialed.hold;
+                if let Err(e) = shared.prepare_socket(&dialed.stream) {
+                    tracing::debug!(direction = direction.as_str(), %dst, error = %e, "cannot configure socket");
+                }
+                conn.serve(
+                    Served::Http1(head),
+                    client,
+                    Stream::plain(dialed.stream),
+                    abort,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::debug!(direction = direction.as_str(), %dst, error = %e, "connect failed");
+            }
+        },
+        Err(e) => {
+            tracing::debug!(direction = direction.as_str(), %dst, error = %e, "mesh connection ended");
+        }
     }
 }
 
@@ -330,9 +409,13 @@ async fn serve_mesh(
 enum MeshFirst {
     /// Cleartext HTTP the mesh balances: `true` for HTTP/2, and the bytes read.
     Http(bool, Vec<u8>),
-    /// Anything else, or an HTTP/1 head that must stay on the byte relay: the bytes read so
-    /// far (possibly none), to detect again once connected.
+    /// A protocol that is not cleartext HTTP (TLS, client-first TCP): balanced per connection,
+    /// with the bytes read, to detect again once connected.
     Other(Vec<u8>),
+    /// What stays on the byte relay to the original destination: a silent client (a
+    /// server-first protocol), an incomplete prefix, a first `Upgrade` or `CONNECT`: the bytes
+    /// read so far (possibly none).
+    Relay(Vec<u8>),
     /// The client closed, failed or was told to stop: nothing is dialled.
     Gone,
 }
@@ -355,8 +438,8 @@ async fn mesh_first(
         let mut chunk = [0u8; READ_CHUNK];
         let want = READ_CHUNK.min(DETECT_LIMIT.saturating_sub(buf.len()).max(1));
         tokio::select! {
-            () = &mut silent, if buf.is_empty() => return MeshFirst::Other(buf),
-            () = &mut deadline, if !buf.is_empty() => return MeshFirst::Other(buf),
+            () = &mut silent, if buf.is_empty() => return MeshFirst::Relay(buf),
+            () = &mut deadline, if !buf.is_empty() => return MeshFirst::Relay(buf),
             read = client.read(&mut chunk[..want]) => match read {
                 Ok(n) if n > 0 => {
                     if buf.is_empty() {
@@ -368,13 +451,13 @@ async fn mesh_first(
                         Detection::H2 => return MeshFirst::Http(true, buf),
                         Detection::Http1 => match mesh::head_kind(&buf) {
                             mesh::Head::Partial => {}
-                            mesh::Head::Relay => return MeshFirst::Other(buf),
+                            mesh::Head::Relay => return MeshFirst::Relay(buf),
                             mesh::Head::Routed => return MeshFirst::Http(false, buf),
                         },
                         _ => return MeshFirst::Other(buf),
                     }
                     if buf.len() >= DETECT_LIMIT {
-                        return MeshFirst::Other(buf);
+                        return MeshFirst::Relay(buf);
                     }
                 }
                 _ => return MeshFirst::Gone,
@@ -430,6 +513,8 @@ async fn serve_mock(
         sni: None,
         interception: None,
         mock: None,
+        balanced: None,
+        counted: false,
     };
     match route {
         MockRoute::Http(h2, buf, first) => {
@@ -640,6 +725,10 @@ struct Conn<'a> {
     /// Set on a forwarded outbound connection that follows a switch to mock (spec §8
     /// "Switching"); not on `MIMIC_MOCK_PASSTHROUGH` ones, nor on non-HTTP cleartext tunnels.
     mock: Option<Mock>,
+    /// Balanced per connection (spec §7.9 "L4 balancing"): the Service port and where it went.
+    balanced: Option<(Arc<str>, SocketAddr)>,
+    /// The connection was counted in the connection metrics already (one that left `hyper`).
+    counted: bool,
 }
 
 impl Conn<'_> {
@@ -681,7 +770,9 @@ impl Conn<'_> {
         let proxy = self.shared.proxy();
         let (protocol, to_upstream, to_client, early) = match served {
             Served::Http1(buf) => {
-                proxy.connection(direction, "http1", &self.authority(false));
+                if !self.counted {
+                    proxy.connection(direction, "http1", &self.authority(false));
+                }
                 // At the end of the grace the relay closes both sockets, and the exchanges
                 // still open write their `shutdown` line.
                 // The exchanges the deployment serves, and those it sends, decrypted or not
@@ -808,6 +899,11 @@ impl Conn<'_> {
             duration: self.started.elapsed(),
             bytes_in: tunnelled.to_upstream,
             bytes_out: tunnelled.to_client,
+            backend: self
+                .balanced
+                .as_ref()
+                .map(|(backend, _)| backend.to_string()),
+            upstream: self.balanced.as_ref().map(|(_, upstream)| *upstream),
         });
     }
 }
@@ -991,6 +1087,8 @@ impl Conn<'_> {
             duration: self.started.elapsed(),
             bytes_in,
             bytes_out: 0,
+            backend: None,
+            upstream: None,
         });
     }
 }

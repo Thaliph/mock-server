@@ -86,6 +86,10 @@ pub struct Connection {
     pub duration: Duration,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// A connection balanced per connection (spec §7.9 "L4 balancing"): the Service port and
+    /// the pod, or the original destination after a fallback.
+    pub backend: Option<String>,
+    pub upstream: Option<SocketAddr>,
 }
 
 fn millis(d: Duration) -> u64 {
@@ -145,6 +149,8 @@ pub fn connection(c: &Connection) {
         duration_ms = millis(c.duration),
         bytes_in = c.bytes_in,
         bytes_out = c.bytes_out,
+        backend = c.backend.as_deref(),
+        upstream = c.upstream.map(|a| a.to_string()).as_deref(),
         "connection"
     );
 }

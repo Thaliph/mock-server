@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use mimic_core::mesh::lb::Endpoints;
@@ -20,13 +20,39 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Milliseconds since the first call, plus one (0 is "never").
+fn now_ms() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(BASE.get_or_init(Instant::now).elapsed().as_millis())
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1)
+}
+
+/// What the choice adds to the in-flight count of a pod whose connect failed (spec §7.9): it is
+/// picked only when no other endpoint can be.
+const AVOIDED: u32 = 1 << 20;
+
 /// One pod of a backend.
 pub(crate) struct Endpoint {
     pub addr: SocketAddr,
     /// The `endpoint` metric label: `ip:port` or `other`.
     pub label: Arc<str>,
     in_flight: AtomicU32,
+    /// Until when the choice avoids this pod (`now_ms`), 0 when it does not.
+    failed_until: AtomicU64,
     gauge: Gauge,
+}
+
+impl Endpoint {
+    /// The count the choice compares: requests in flight, and a penalty while avoided.
+    fn load(&self, now: u64) -> u32 {
+        let in_flight = self.in_flight.load(Ordering::Acquire);
+        if self.failed_until.load(Ordering::Acquire) > now {
+            in_flight.saturating_add(AVOIDED)
+        } else {
+            in_flight
+        }
+    }
 }
 
 /// A request in flight to an endpoint, counted until dropped.
@@ -97,6 +123,7 @@ impl Backend {
                     addr,
                     label,
                     in_flight: AtomicU32::new(0),
+                    failed_until: AtomicU64::new(0),
                     gauge,
                 })
             });
@@ -115,18 +142,25 @@ impl Backend {
     /// request in flight; `None` without an endpoint.
     pub(crate) fn pick(&self, router: &Router) -> Option<InFlight> {
         let now = router.started.elapsed();
+        let avoid_now = now_ms();
         let state = lock(&self.state);
         let mut draw = |n: usize| router.draw(n);
-        let index = state.set.pick(
-            now,
-            |i| state.endpoints[i].in_flight.load(Ordering::Acquire),
-            &mut draw,
-        )?;
+        let index = state
+            .set
+            .pick(now, |i| state.endpoints[i].load(avoid_now), &mut draw)?;
         let endpoint = state.endpoints[index].clone();
         drop(state);
         endpoint.in_flight.fetch_add(1, Ordering::AcqRel);
         endpoint.gauge.inc();
         Some(InFlight(endpoint))
+    }
+}
+
+impl Backend {
+    /// An endpoint other than `not` (after a connect to it failed), counted in flight; `None`
+    /// when the backend has no other one.
+    pub(crate) fn pick_other(&self, router: &Router, not: SocketAddr) -> Option<InFlight> {
+        (0..4).find_map(|_| self.pick(router).filter(|p| p.endpoint().addr != not))
     }
 }
 
@@ -137,17 +171,40 @@ pub(crate) struct Router {
     backends: RwLock<BTreeMap<String, Arc<Backend>>>,
     pub(crate) pools: Arc<Pools>,
     pub(crate) metrics: MeshMetrics,
+    /// `MIMIC_MESH_CONNECT_TIMEOUT`.
+    pub(crate) connect_timeout: Duration,
+    /// How long a pod whose connect failed is avoided.
+    avoid: Duration,
 }
 
 impl Router {
-    pub(crate) fn new(idle_timeout: Duration, max_labels: usize, seed: Option<u64>) -> Router {
+    pub(crate) fn new(
+        idle_timeout: Duration,
+        max_labels: usize,
+        seed: Option<u64>,
+        connect_timeout: Duration,
+        avoid: Duration,
+    ) -> Router {
         Router {
             started: Instant::now(),
             seed: AtomicU64::new(seed.unwrap_or_else(|| rand::random_range(0..=u64::MAX))),
             backends: RwLock::new(BTreeMap::new()),
             pools: Pools::new(idle_timeout),
             metrics: MeshMetrics::new(max_labels),
+            connect_timeout,
+            avoid,
         }
+    }
+
+    /// Connecting to the pod failed: the choice avoids it for a while.
+    pub(crate) fn failed(&self, pick: &InFlight) {
+        let until = now_ms().saturating_add(u64::try_from(self.avoid.as_millis()).unwrap_or(0));
+        pick.endpoint().failed_until.store(until, Ordering::Release);
+    }
+
+    /// A connection to the pod was had: it is not avoided any more.
+    pub(crate) fn succeeded(&self, pick: &InFlight) {
+        pick.endpoint().failed_until.store(0, Ordering::Release);
     }
 
     /// A number below `n`.

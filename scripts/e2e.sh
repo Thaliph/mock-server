@@ -73,6 +73,9 @@ cleanup() {
   if [[ -n ${MSH_55_CLEANUP:-} ]]; then
     kubectl delete namespace msh-55 msh-55-out --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${MSH_70_CLEANUP:-} ]]; then
+    kubectl delete namespace msh-70 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -3655,9 +3658,10 @@ kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --all-container
 ! found -F "$non08_canary" "$WORK/non08-controller.log" || fail "non_08: the canary is in the controller logs"
 for p in $non08_pods; do
   for c in app mimic-sidecar; do
-    # grep -c reads the whole log: `grep -q` would stop early, SIGPIPE kubectl, and under pipefail the
-    # pipeline's 141 would read as "no match" (a false negative).
-    [[ $(kubectl -n non-08 logs "$p" -c "$c" 2>/dev/null | grep -cF "$non08_canary" || true) == 0 ]] \
+    # The log is captured first and a failing `kubectl logs` fails the check: piped into `grep -c ... || true`
+    # it would read as "no canary" (a vacuous pass). grep -c reads the whole text, never stops early.
+    non08_log=$(kubectl -n non-08 logs "$p" -c "$c") || fail "non_08: cannot read the $c log of $p"
+    [[ $(grep -cF "$non08_canary" <<<"$non08_log" || true) == 0 ]] \
       || fail "non_08: the canary is in the $c log of $p"
   done
 done
@@ -4092,6 +4096,120 @@ kubectl -n msh-55 exec deploy/client -c app -- python3 -c \
 kubectl delete namespace msh-55 msh-55-out --wait=false >/dev/null
 MSH_55_CLEANUP=
 echo "msh_55: 300 requests of one keep-alive client were spread over the 3 pods (each 100 +- 30), the sidecar's counters and access lines name them, and an undeclared Service still works"
+
+# --- L4 balancing over pod IPs (#443 step 2, MSH-70) -------------------------------------------------------------------
+# Objects of this section only: msh-70 (injected: echo, a TCP Service of 3 replicas that count the connections they accept,
+# and client, which connects). Nothing is scaled or deleted outside it.
+log "msh_70: connections that are not HTTP are balanced per connection over the 3 pods of a Service, the access lines name the pods"
+MSH_70_CLEANUP=1
+ns_fresh msh-70 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: echo, namespace: msh-70}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: echo}}
+  template:
+    metadata: {labels: {app: echo}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command:
+            - python3
+            - -c
+            - |
+              import socketserver
+              n = 0
+              class H(socketserver.StreamRequestHandler):
+                  def handle(self):
+                      global n
+                      line = self.rfile.readline()
+                      if line == b"count\n":
+                          self.wfile.write(str(n).encode() + b"\n")
+                      elif line:
+                          # The kubelet's readiness probe connects and sends nothing: not counted.
+                          n += 1
+                          self.wfile.write(line)
+              class S(socketserver.ThreadingTCPServer):
+                  allow_reuse_address = True
+              S(("", 9000), H).serve_forever()
+          ports: [{name: tcp, containerPort: 9000}]
+          readinessProbe: {tcpSocket: {port: tcp}, periodSeconds: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo, namespace: msh-70}
+spec:
+  selector: {app: echo}
+  ports: [{name: tcp, port: 80, targetPort: tcp}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: msh-70}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+kubectl -n msh-70 rollout status deploy/echo --timeout=3m >/dev/null || fail "msh_70: echo did not roll out Ready"
+kubectl -n msh-70 rollout status deploy/client --timeout=3m >/dev/null || fail "msh_70: client did not roll out Ready"
+msh_70_client=$(kubectl -n msh-70 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+msh_70_ips=$(kubectl -n msh-70 get pods -l app=echo -o jsonpath='{.items[*].status.podIP}')
+[[ $(wc -w <<<"$msh_70_ips") == 3 ]] || fail "msh_70: echo does not have 3 pod IPs ($msh_70_ips)"
+msh_70_cluster_ip=$(kubectl -n msh-70 get svc echo -o jsonpath='{.spec.clusterIP}')
+# msh_70_metric <series>: the value of a series of the sidecar of client, empty when absent.
+msh_70_metric() { sidecar_metrics msh-70 "$msh_70_client" | awk -v n="$1" '!found && index($0, n " ") == 1 { print $2; found = 1 }'; }
+msh_70_view() { [[ $(msh_70_metric mimic_mesh_view_endpoints) == 3 ]]; }
+for _ in $(seq 60); do msh_70_view && break; sleep 1; done
+msh_70_view || fail "msh_70: the sidecar of client never held a view with the 3 endpoints of echo"
+# Slow start (default 30 s, spec §7.9): the spread is checked once every endpoint is past the window.
+sleep 31
+# 300 connections one after the other, each sending a line that is not HTTP and reading it back.
+kubectl -n msh-70 exec deploy/client -c app -- python3 -c '
+import socket
+for i in range(300):
+    with socket.create_connection(("echo.msh-70.svc", 80), timeout=10) as c:
+        c.sendall(b"line-%d\n" % i)
+        got = b""
+        while not got.endswith(b"\n"):
+            chunk = c.recv(100)
+            assert chunk, "the connection closed before the echo"
+            got += chunk
+        assert got == b"line-%d\n" % i, got
+' || fail "msh_70: the 300 connections were not all echoed"
+msh_70_total=0
+for ip in $msh_70_ips; do
+  got=$(kubectl -n msh-70 exec deploy/client -c app -- python3 -c '
+import socket, sys
+with socket.create_connection((sys.argv[1], 9000), timeout=10) as c:
+    c.sendall(b"count\n")
+    print(c.makefile().readline().strip())
+' "$ip") || fail "msh_70: cannot read the count of $ip"
+  (( got >= 60 && got <= 140 )) || fail "msh_70: the pod $ip accepted $got of 300 connections (expected 100 +- 40)"
+  msh_70_total=$((msh_70_total + got))
+done
+(( msh_70_total == 300 )) || fail "msh_70: the pods accepted $msh_70_total connections, not 300"
+# The access lines of the client's sidecar: `connection` lines with the backend, each pod as upstream, the ClusterIP as dst.
+# Counted with grep -c, which reads everything: a `grep -q` at the end would SIGPIPE the writers (status 141).
+msh_70_log=$(kubectl -n msh-70 logs "$msh_70_client" -c mimic-sidecar) || fail "msh_70: cannot read the logs of the sidecar of client"
+for ip in $msh_70_ips; do
+  lines=$(grep '"target":"access"' <<<"$msh_70_log" | grep "\"backend\":\"msh-70/echo:80\"" | grep "\"upstream\":\"$ip:9000\"" \
+    | grep -c "\"dst\":\"$msh_70_cluster_ip:80\"" || true)
+  (( lines > 0 )) || fail "msh_70: no access line with backend, upstream $ip:9000 and dst $msh_70_cluster_ip:80"
+done
+fallbacks=$(msh_70_metric mimic_mesh_fallbacks_total)
+[[ -z $fallbacks || ${fallbacks%.*} == 0 ]] || fail "msh_70: ${fallbacks} fallbacks to the ClusterIP with 3 healthy pods"
+kubectl delete namespace msh-70 --wait=false >/dev/null
+MSH_70_CLEANUP=
+echo "msh_70: 300 non-HTTP connections were spread over the 3 pods (each 100 +- 40), the access lines name the pods, no fallback"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
