@@ -4981,6 +4981,8 @@ rty_56_accepted || fail "rty_56: the MimicConfig with retries: 0 is not Accepted
 for _ in $(seq 30); do rty_56_applied && break; sleep 1; done
 rty_56_applied || fail "rty_56: the sidecar of client pulled no new view within 30 s of the MimicConfig"
 rty_56_retries=$(rty_metric_sum rty-56 "$rty_56_client" mimic_mesh_retries_total)
+# A failed pod stays avoided for 5 s (avoid_failed_for): wait it out so this run can reach the refusing pod.
+sleep 6
 rty_56_run "503 connect-failed" rty_56_failed
 (( rty_56_failed >= 1 )) || fail "rty_56: with retries: 0 no GET of 100 was answered 503 connect-failed"
 rty_56_after=$(rty_metric_sum rty-56 "$rty_56_client" mimic_mesh_retries_total)

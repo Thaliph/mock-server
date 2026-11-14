@@ -27,7 +27,8 @@ All notable changes to mimic are documented in this file. The format follows
   stay within `percent` of the requests plus `minPerSecond` per second; the defaults allow 100 retries per 10 s
   plus 20 % of the requests. A refused retry returns the failure as is, is counted in
   `mimic_mesh_retry_budget_exhausted_total{backend}` and logged as the warning `retry budget exhausted` (at most
-  once per second per backend). The view's `policy` carries both fields.
+  once per second per backend). The view's `policy` carries both fields: upgrade the controller before the
+  sidecars, since a sidecar refuses a view without them.
 - Retries of mesh-routed requests (#445, M2): a request whose failure happened before the app could process it
   is tried again on another pod, at most 3 times (4 tries), then on the original destination when every try
   failed to connect. Retried: connect failures and refused HTTP/2 streams for every method, a trusted refusal

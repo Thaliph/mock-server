@@ -233,7 +233,10 @@ async fn rty_49_retries_come_from_the_policy_of_each_service() {
     }
     logs.settled().await;
     for line in &logs.access()[before..] {
-        assert!(line["attempts"].as_u64().unwrap() <= 2, "{line}");
+        assert!(
+            line["attempts"].as_u64().unwrap() <= 2,
+            "at most 2 attempts per request"
+        );
     }
 }
 
@@ -308,7 +311,7 @@ async fn rty_51_the_warning_is_rate_limited_and_holds_no_request_data() {
             "window_retries",
             "suppressed",
         ] {
-            assert!(!line[field].is_null(), "{field} in {line}");
+            assert!(!line[field].is_null(), "a warning field is missing");
         }
         assert_eq!(line["backend"], "shop/cart:80");
         assert_eq!(line["service"], "shop/cart");
@@ -334,7 +337,7 @@ async fn rty_51_the_warning_is_rate_limited_and_holds_no_request_data() {
             .lines()
             .filter(|l| l.contains("retry budget exhausted"))
         {
-            assert!(!line.contains(needle), "{needle} in {line}");
+            assert!(!line.contains(needle), "the warning holds request data");
         }
     }
     drop(pods);
