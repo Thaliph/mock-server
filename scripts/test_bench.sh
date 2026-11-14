@@ -120,14 +120,17 @@ ben_04_defaults_are_the_matrix() {
 }
 
 ben_05_images_pinned_by_digest() {
-  local fortio kind_node
+  local fortio kind_node refusing
   fortio=$("$root/scripts/pinned-image.sh" fortio 2>/dev/null) || fortio=""
   kind_node=$("$root/scripts/pinned-image.sh" kind-node 2>/dev/null) || kind_node=""
+  refusing=$("$root/scripts/pinned-image.sh" e2e-app 2>/dev/null) || refusing=""
   run -- --dry-run
   check "the fortio image is the pinned stage" has "fortio image $fortio"
   check "the fortio image is pinned by digest" digest_in "$fortio"
   check "the node image is the pinned stage" has "kind node image $kind_node"
   check "the node image is pinned by digest" digest_in "$kind_node"
+  check "the refusing pod image is the pinned stage" has "refusing pod image $refusing"
+  check "the refusing pod image is pinned by digest" digest_in "$refusing"
   check "nothing is pulled" no_calls
 }
 
@@ -189,11 +192,71 @@ ben_09_machine_description_fields_no_host_identity() {
 }
 lacks_in_script() { ! grep -qE '(^|[^a-z_])(hostname|whoami|ip addr|ifconfig)([^a-z_]|$)' "$bench" 2>/dev/null; }
 
+# count_is <text> <n>: the plan has the text on exactly n lines.
+count_is() { [[ $(grep -c -- "$1" <<<"$out") -eq $2 ]]; }
+# results_named <dir> <setup...>: the plan names <dir>/<today>-<setup>.json for each setup.
+results_named() {
+  local dir=$1 setup
+  shift
+  for setup in "$@"; do
+    grep -qF -- "results $dir/$today-$setup.json" <<<"$out" || return 1
+  done
+}
+
+# ben_10: the mesh-refuse setup (RTY-23) is accepted, runs last among the mesh setups, and its plan line names
+# the two injected pods and the refusing one. The results go to the file of its own name.
+ben_10_mesh_refuse_setup_planned() {
+  mkdir -p "$tmp/out-refuse"
+  outdir="$tmp/out-refuse"
+  run "SETUPS=mesh-refuse" "PROTOCOLS=http1" "RATES=50" -- --dry-run
+  check "mesh-refuse is accepted" rc_is 0
+  check "one run of mesh-refuse" runs_is 1
+  check "the plan names the mesh-refuse run" has "run 1/1 setup mesh-refuse protocol http1 rate 50 rps"
+  check "the plan has 2 injected and 1 refusing pod" has "mesh-refuse: backend 3 pods, 2 injected and 1 not injected and refusing connections"
+  check "the results file of mesh-refuse is named" has "$today-mesh-refuse.json"
+  check "mesh-refuse has no propagation measure" lacks "propagation"
+  check "mesh-refuse has no synthetic view" lacks "synthetic view"
+  check "mesh-refuse is not a rollout restart" lacks "rollout restart"
+  # mesh-refuse runs after mesh-lb whatever the order of SETUPS: its refusing pod must not reach the others.
+  run "SETUPS=mesh-refuse mesh-lb" "PROTOCOLS=http1" "RATES=50" -- --dry-run
+  check "mesh-lb runs first whatever the order of SETUPS" has "run 1/2 setup mesh-lb protocol http1"
+  check "mesh-refuse runs last whatever the order of SETUPS" has "run 2/2 setup mesh-refuse protocol http1"
+  run "SETUPS=mesh-refuse-x" -- --dry-run
+  check "a misspelt mesh setup exits 2" rc_is 2
+  check "a misspelt mesh setup is named" has "mesh-refuse-x is not plain"
+  check "nothing is run" no_calls
+  outdir=""
+}
+
+# ben_11_16: the plan of the mesh setups (BEN-11 to BEN-16): the mode, the routing assertion, the propagation and
+# synthetic measures only for mesh-lb, the rollout restart only for mesh-churn, and one results file per setup.
+ben_11_16_mesh_setups_plan() {
+  mkdir -p "$tmp/out-mesh"
+  outdir="$tmp/out-mesh"
+  run "SETUPS=mesh-lb mesh-churn mesh-refuse" "PROTOCOLS=http1" "RATES=50" -- --dry-run
+  check "the three mesh setups are accepted" rc_is 0
+  check "BEN-11: the three mesh setups run in discovery mode" count_is "mode discovery" 3
+  check "BEN-11: every mesh setup has a backend of 3 pods" count_is "backend 3 pods" 3
+  check "BEN-12: the routing is asserted in every mesh setup" count_is "routing asserted before and after" 3
+  check "BEN-13: the propagation measure is planned for mesh-lb" has "mesh-lb propagation: 20 EndpointSlice changes"
+  check "BEN-15: the synthetic view is planned for mesh-lb" has "mesh-lb synthetic view: 100 Services"
+  check "BEN-14: the rollout restart is planned for mesh-churn" has "mesh-churn: backend 3 pods, mode discovery; rollout restart of the backend in every run; routing asserted before and after the runs"
+  check "BEN-16: one results file per mesh setup" results_named "$tmp/out-mesh" mesh-lb mesh-churn mesh-refuse
+  check "nothing is run" no_calls
+  run "SETUPS=mesh-churn mesh-refuse" "PROTOCOLS=http1" "RATES=50" -- --dry-run
+  outdir=""
+  check "BEN-13: no propagation measure without mesh-lb" lacks "propagation"
+  check "BEN-15: no synthetic view without mesh-lb" lacks "synthetic view"
+  check "BEN-14: the rollout restart is planned for mesh-churn only" count_is "rollout restart" 1
+  check "nothing is run without mesh-lb" no_calls
+}
+
 for name in ben_01_arguments_only_dry_run ben_02_invalid_configuration_refused \
   ben_03_rate_cap_and_sequential_runs ben_04_defaults_are_the_matrix \
   ben_05_images_pinned_by_digest ben_06_lock_held_refused_stale_reclaimed \
   ben_07_outputs_named_and_dry_run_writes_nothing ben_08_namespace_cleanup_trap_planned \
-  ben_09_machine_description_fields_no_host_identity; do
+  ben_09_machine_description_fields_no_host_identity ben_10_mesh_refuse_setup_planned \
+  ben_11_16_mesh_setups_plan; do
   lock="$tmp/locks-$name"
   mkdir -p "$lock"
   outdir=""

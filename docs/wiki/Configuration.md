@@ -89,6 +89,8 @@ Chart `deploy/helm/mimic` (`oci://ghcr.io/thaliph/charts/mimic` once a v2 releas
 | `metrics.serviceMonitor.enabled` | `false` | Prometheus Operator `ServiceMonitor` for the controller admin port. |
 | `metrics.serviceMonitor.interval` | `30s` | |
 
+The mesh values are the variables of the same name (an invalid one exits the controller with 2); see [Mesh](Mesh).
+
 The production overlay (`values-production.yaml`, [Production install](Install#production-install)) differs from the
 defaults in these values only: `image.digest` and `inject.initImage.digest` (set), `controller.replicas` (`3`),
 `controller.resources` and `inject.sidecarResources` (CPU limits added), `controller.topologySpreadConstraints`,
@@ -98,7 +100,7 @@ defaults in these values only: `image.digest` and `inject.initImage.digest` (set
 `metrics.serviceMonitor.enabled` and `metrics.podMonitor.enabled` (`true`). `valkey.persistence.storageClass` and
 `networkPolicy.webhookFrom` are placeholders to fill in.
 
-The chart does **not** expose `MIMIC_STORE_*`, `MIMIC_SIDECAR_API_*`, `MIMIC_UI_ADDR` or the
+The chart does **not** expose `MIMIC_STORE_*`, the other `MIMIC_SIDECAR_API_*` (including `MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD` and `MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT`), `MIMIC_UI_ADDR` or the
 sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 
 ## Environment variables
@@ -153,6 +155,8 @@ sidecar's `MIMIC_DISCOVERY_*` tunables: their defaults apply.
 | `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS`, `MIMIC_MESH_MAX_VIEW_BYTES` | `1024`, `10000`, `4Mi` | Bounds of one view: 1-100000, 1-1000000, 64Ki-256Mi. A view over a bound is served truncated (`mimic_mesh_view_truncated_total`). |
 | `MIMIC_MESH_STALE_AFTER`, `MIMIC_MESH_STARTUP_WAIT` | `60s`, `2s` | Not used by the controller: written to the sidecars it injects (1s-1h and 0s-1m). The sidecars also read `MIMIC_MESH` (always written by the webhook; `off` when unset) and, when they differ from the defaults, the three bounds above. |
 | `MIMIC_SIDECAR_API_MAX_WATCHES` | `10000` | Held view requests at once per replica, 1-1000000; over it `503` with `Retry-After: 1`. |
+| `MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD` | `2` | Held view requests at once per pod, 1-100; over it `503` `watch_limit` at once. Not set by the chart. |
+| `MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT` | `25` | Share of `MIMIC_SIDECAR_API_MAX_WATCHES` one namespace may hold at once, 1-100 %, at least the per-pod cap. Not set by the chart. |
 | `MIMIC_UI_ADDR` | `127.0.0.1:8080` | Read API; plain HTTP, loopback peers only. |
 
 ### Sidecar
@@ -184,6 +188,16 @@ Set by the webhook; the defaults are what it sets unless noted.
 | `MIMIC_EGRESS_PULL_INTERVAL` | `60s` | Period of the egress pull. 1s-1h. Not set by the webhook. |
 | `MIMIC_EGRESS_MAX_BYTES` | `4Mi` | Largest egress set read. 64Ki-1Gi. Raising it needs a larger sidecar memory limit. Not set by the webhook. |
 | `MIMIC_MODE` | `discovery` | `none`, `discovery` or `mock` at start, set by the webhook from the effective mode. Then the controller's answers switch it live. See [Mock mode](Mock-mode). |
+| `MIMIC_MESH` | `off` | `on` or `off` (anything else exits 2). `off`: no view is pulled, nothing is classified. The webhook always sets it from the controller's own `MIMIC_MESH`; a pod injected before M1 keeps the default and pulls nothing. See [Mesh](Mesh). |
+| `MIMIC_MESH_STALE_AFTER` | `60s` | 1s-1h. Set by the webhook. |
+| `MIMIC_MESH_STARTUP_WAIT` | `2s` | 0s-1m. Set by the webhook. |
+| `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS`, `MIMIC_MESH_MAX_VIEW_BYTES` | `1024`, `10000`, `4Mi` | Same bounds and ranges as the controller's, applied to the view read. Set by the webhook when they differ from the defaults. |
+| `MIMIC_MESH_CONNECT_TIMEOUT` | `2s` | Time allowed to connect to a pod, 100ms-10s. Not set by the webhook. |
+| `MIMIC_MESH_POOL_IDLE_TIMEOUT` | `90s` | A pooled connection to a pod idle this long is closed, 1s-1h. Not set by the webhook. |
+| `MIMIC_MESH_OPAQUE_PORTS` | `25,587,3306,4444,5432,6379,9300,11211,22,21` | Ports whose in-scope connections keep the byte relay with no detection wait: at most 256 numbers from 1 to 65535, or `none`. Not set by the webhook. |
+| `MIMIC_MESH_RETRY_BUFFER` | `64Ki` | Request body bytes held per request so that it can be retried (see [Mesh](Mesh#retries)); `<n>`, `<n>Ki`, `<n>Mi`, 0-1Mi (`0`: a request with a body is retried only after a connect failure). Not set by the webhook. |
+| `MIMIC_MESH_RETRY_BUFFER_TOTAL` | `8Mi` | Request body bytes held for replay by all requests together; same syntax, 1Mi-64Mi. Sized for the 128 Mi sidecar limit: raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. Not set by the webhook. |
+| `MIMIC_METRICS_MAX_ENDPOINTS` | `256` | Endpoints with a label of their own in the per-pod mesh metrics, 1-10000; the next ones are `other`. Not set by the webhook. |
 | `MIMIC_MOCK_LATENCY_FACTOR` | `1` | Latency factor until the first pull answer, 0 to 100 with at most 2 fractional digits. Set by the webhook when it is not 1. |
 | `MIMIC_MOCK_PASSTHROUGH` | empty | Destinations a mocked pod still reaches for real, the `spec.tls.exclude` grammar. Set by the webhook from `spec.mock.passthrough`. |
 | `MIMIC_MOCK_MAX_PENDING` | `1024` | Mocked requests pending at once; more get `599` (`overload`). 1-65536. Sized with the 128 Mi sidecar limit. |

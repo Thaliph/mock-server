@@ -94,8 +94,8 @@ selects it and the settings are merged (union). A Deployment injected by label w
 is in `none`: it is proxied and nothing is recorded until you ask for `discovery` or `mock` with
 `spec.mode`. With several `MimicWorkload`s, `mock` wins over `discovery`, which wins over `none`.
 
-`none` means "proxy only, nothing recorded". It does not mean "no mesh": the mimic mesh (a later
-milestone) is independent of the mode and has its own switches (the chart value `mesh.enabled`
+`none` means "proxy only, nothing recorded". It does not mean "no mesh": the [mimic mesh](Mesh) is
+independent of the mode and has its own switches (the chart value `mesh.enabled`
 and `MimicConfig.spec.mesh.enabled`).
 
 ## Modes

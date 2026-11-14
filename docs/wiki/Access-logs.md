@@ -77,6 +77,8 @@ decrypted or not. A field that has no value is absent from the line, not `null`.
 | `status` | The response status. Absent when no response was sent. |
 | `grpc_status` | HTTP/2 only, from the trailers, when present. `0` is OK. |
 | `upgrade` | `true` when the exchange became a tunnel (WebSocket, `CONNECT`). Always present on an HTTP exchange. |
+| `backend`, `upstream` | Mesh-routed requests (HTTP) and L4-balanced connections only, with `MIMIC_MESH=on` ([Mesh](Mesh)): `backend` is `<namespace>/<name>:<port>` of the Service port, `upstream` the pod `ip:port` of the last try (the ClusterIP after a fallback). `dst` stays the original destination. Absent on relayed connections. |
+| `attempts` | Mesh-routed requests: the number of tries (1 without a retry, at most 4, see [Mesh](Mesh#retries)). L4-balanced connections: the number of connects tried. Absent on relayed connections. |
 | `tls` | `true` when the exchange was decrypted by TLS interception. Absent otherwise. |
 | `interception` | Connection only, outbound TLS only: why the connection was not intercepted (a decision other than `intercepted`, which writes exchange lines instead). |
 | `result` | How it ended. Exchange: `ok`, `upstream_reset` (the destination reset it), `client_abort` (the app went away), `unframed` (HTTP/1 the codec cannot frame; the rest of the connection is a tunnel), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace). Connection: `ok`, `upstream_reset`, `client_abort`, `shutdown`, `mock_closed` (closed by the mock). |

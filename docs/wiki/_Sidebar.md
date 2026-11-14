@@ -13,6 +13,7 @@
 - [Egress aggregation](Egress-aggregation)
 - [Egress endpoint](Egress-endpoint)
 - [TLS interception](TLS-interception)
+- [Mesh](Mesh)
 
 **Run**
 - [Configuration](Configuration)
