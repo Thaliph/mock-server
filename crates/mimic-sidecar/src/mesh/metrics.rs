@@ -14,6 +14,8 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::{Registry, Unit};
 
+use mimic_core::mesh::retry::Outcome;
+
 use crate::red::DURATION_BUCKETS;
 
 /// The series of an endpoint that left the view stay this long.
@@ -21,6 +23,18 @@ pub(crate) const EVICT_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// The label of the endpoints past `MIMIC_METRICS_MAX_ENDPOINTS`.
 const OTHER: &str = "other";
+
+/// Every `result` of a try and `reason` of a retry or a skipped one, to remove the series of a
+/// backend that left the view.
+const RESULTS: [Outcome; 6] = [
+    Outcome::Ok,
+    Outcome::ConnectFailed,
+    Outcome::RefusedStream,
+    Outcome::Reset,
+    Outcome::Overloaded,
+    Outcome::QueueTimeout,
+];
+const SKIPS: [&str; 3] = ["exhausted", "method", "buffer"];
 
 /// Every `status_class` value, to remove the series of an evicted endpoint.
 const CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "none"];
@@ -59,6 +73,18 @@ struct BackendLabels {
     backend: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ResultLabels {
+    backend: String,
+    result: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+struct ReasonLabels {
+    backend: String,
+    reason: &'static str,
+}
+
 type Durations = Family<DurationLabels, Histogram, fn() -> Histogram>;
 
 fn new_histogram() -> Histogram {
@@ -94,6 +120,9 @@ pub(crate) struct MeshMetrics {
     in_flight: Family<InFlightLabels, Gauge>,
     reconnects: Family<BackendLabels, Counter>,
     fallbacks: Family<BackendLabels, Counter>,
+    attempts: Family<ResultLabels, Counter>,
+    retries: Family<ReasonLabels, Counter>,
+    skipped: Family<ReasonLabels, Counter>,
     /// `x-mimic-*` fields removed from app responses by the inbound side (spec §4.1).
     /// Without labels, and made by the first removal: nothing of the mesh shows until then
     /// (MSH-51).
@@ -115,6 +144,9 @@ impl MeshMetrics {
             in_flight: Family::default(),
             reconnects: Family::default(),
             fallbacks: Family::default(),
+            attempts: Family::default(),
+            retries: Family::default(),
+            skipped: Family::default(),
             stripped: Family::default(),
             unframed: Family::default(),
             slots: Mutex::new(Slots::default()),
@@ -151,6 +183,21 @@ impl MeshMetrics {
             self.fallbacks.clone(),
         );
         registry.register(
+            "mesh_attempts",
+            "Tries of mesh-routed requests, to a pod or to the original destination, by result",
+            self.attempts.clone(),
+        );
+        registry.register(
+            "mesh_retries",
+            "Tries after the first of a mesh-routed request, by the reason of the retry",
+            self.retries.clone(),
+        );
+        registry.register(
+            "mesh_retries_skipped",
+            "Failures of a retried kind that were not retried, by reason",
+            self.skipped.clone(),
+        );
+        registry.register(
             "mesh_reconnects",
             "Requests sent again on a new connection because nothing of them was written",
             self.reconnects.clone(),
@@ -183,6 +230,40 @@ impl MeshMetrics {
         self.fallbacks
             .get_or_create(&BackendLabels {
                 backend: backend.to_string(),
+            })
+            .inc();
+    }
+
+    /// One try of a request ended with `outcome`.
+    pub(crate) fn attempt(&self, backend: &str, outcome: Outcome) {
+        self.track(backend, None);
+        self.attempts
+            .get_or_create(&ResultLabels {
+                backend: backend.to_string(),
+                result: outcome.label(),
+            })
+            .inc();
+    }
+
+    /// A try after the first, because the one before ended with `outcome`.
+    pub(crate) fn retry(&self, backend: &str, outcome: Outcome) {
+        self.track(backend, None);
+        self.retries
+            .get_or_create(&ReasonLabels {
+                backend: backend.to_string(),
+                reason: outcome.label(),
+            })
+            .inc();
+    }
+
+    /// A failure of a retried kind that was not retried (`reason`: `Skip::label` or
+    /// `exhausted`).
+    pub(crate) fn skipped(&self, backend: &str, reason: &'static str) {
+        self.track(backend, None);
+        self.skipped
+            .get_or_create(&ReasonLabels {
+                backend: backend.to_string(),
+                reason,
             })
             .inc();
     }
@@ -340,6 +421,22 @@ impl MeshMetrics {
             };
             self.reconnects.remove(&labels);
             self.fallbacks.remove(&labels);
+            for outcome in RESULTS {
+                self.attempts.remove(&ResultLabels {
+                    backend: backend.clone(),
+                    result: outcome.label(),
+                });
+                self.retries.remove(&ReasonLabels {
+                    backend: backend.clone(),
+                    reason: outcome.label(),
+                });
+            }
+            for reason in SKIPS {
+                self.skipped.remove(&ReasonLabels {
+                    backend: backend.clone(),
+                    reason,
+                });
+            }
             false
         });
     }
@@ -372,15 +469,17 @@ impl MeshMetrics {
                 status_class: call.status_class,
             })
             .observe(elapsed.as_secs_f64());
-        if let Some(endpoint) = call.endpoint {
-            self.endpoint_requests
-                .get_or_create(&EndpointLabels {
-                    backend: call.backend.to_string(),
-                    endpoint: endpoint.to_string(),
-                    status_class: call.status_class,
-                })
-                .inc();
-        }
+    }
+
+    /// One try written to the pod `endpoint`, with the `status_class` of its answer.
+    pub(crate) fn endpoint_try(&self, backend: &str, endpoint: &str, status_class: &'static str) {
+        self.endpoint_requests
+            .get_or_create(&EndpointLabels {
+                backend: backend.to_string(),
+                endpoint: endpoint.to_string(),
+                status_class,
+            })
+            .inc();
     }
 }
 
@@ -388,7 +487,6 @@ impl MeshMetrics {
 pub(crate) struct Call<'a> {
     pub service: &'a str,
     pub backend: &'a str,
-    pub endpoint: Option<&'a str>,
     pub status_class: &'static str,
     pub reason: &'static str,
 }

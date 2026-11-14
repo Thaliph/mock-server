@@ -170,7 +170,12 @@ pub(crate) async fn handle(
     let connected = match &balanced {
         Some((mesh, backend)) => match mesh.dial(backend, dst).await {
             Ok(dialed) => {
-                upstream_route = Some((backend.label.clone(), dialed.upstream, dialed.hold));
+                upstream_route = Some((
+                    backend.label.clone(),
+                    dialed.upstream,
+                    dialed.attempts,
+                    dialed.hold,
+                ));
                 Ok(dialed.stream)
             }
             Err(e) => Err(e.to_string()),
@@ -191,7 +196,7 @@ pub(crate) async fn handle(
     };
     // The connection counts as a request in flight to its pod until it ends.
     let (balanced, _in_flight) = match upstream_route {
-        Some((backend, upstream, hold)) => (Some((backend, upstream)), hold),
+        Some((backend, upstream, attempts, hold)) => (Some((backend, upstream, attempts)), hold),
         None => (None, None),
     };
     shared.metrics().count(direction, Outcome::Ok);
@@ -564,7 +569,7 @@ async fn serve_mesh_tls(
             };
             let conn = Conn {
                 sni,
-                balanced: Some((backend.label.clone(), dialed.upstream)),
+                balanced: Some((backend.label.clone(), dialed.upstream, dialed.attempts)),
                 ..conn
             };
             conn.serve(served_decrypted(found), client, upstream, abort)
@@ -901,8 +906,9 @@ struct Conn<'a> {
     /// Set on a forwarded outbound connection that follows a switch to mock (spec §8
     /// "Switching"); not on `MIMIC_MOCK_PASSTHROUGH` ones, nor on non-HTTP cleartext tunnels.
     mock: Option<Mock>,
-    /// Balanced per connection (spec §7.9 "L4 balancing"): the Service port and where it went.
-    balanced: Option<(Arc<str>, SocketAddr)>,
+    /// Balanced per connection (spec §7.9 "L4 balancing"): the Service port, where it went and
+    /// the connects it took.
+    balanced: Option<(Arc<str>, SocketAddr, u32)>,
     /// The connection was counted in the connection metrics already (one that left `hyper`).
     counted: bool,
 }
@@ -1088,8 +1094,9 @@ impl Conn<'_> {
             backend: self
                 .balanced
                 .as_ref()
-                .map(|(backend, _)| backend.to_string()),
-            upstream: self.balanced.as_ref().map(|(_, upstream)| *upstream),
+                .map(|(backend, ..)| backend.to_string()),
+            upstream: self.balanced.as_ref().map(|(_, upstream, _)| *upstream),
+            attempts: self.balanced.as_ref().map(|(.., attempts)| *attempts),
         });
     }
 }
@@ -1274,6 +1281,7 @@ impl Conn<'_> {
             bytes_out: 0,
             backend: None,
             upstream: None,
+            attempts: None,
         });
     }
 }

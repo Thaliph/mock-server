@@ -153,6 +153,19 @@ impl Tee {
     }
 }
 
+#[cfg(test)]
+impl ReqBody {
+    /// A body over `inner` with no observation (tests).
+    pub(crate) fn plain(inner: Incoming) -> ReqBody {
+        ReqBody {
+            inner,
+            sized: false,
+            count: Arc::default(),
+            tee: None,
+        }
+    }
+}
+
 impl Body for ReqBody {
     type Data = Bytes;
     type Error = hyper::Error;
@@ -232,6 +245,8 @@ pub(crate) struct Tracker {
     /// Mesh-routed: the backend and the pod the request went to (spec §7.9).
     backend: Option<Arc<str>>,
     upstream: Option<SocketAddr>,
+    /// Mesh-routed: the number of tries.
+    attempts: Option<u32>,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -319,6 +334,7 @@ impl Tracker {
             load_run: None,
             backend: None,
             upstream: None,
+            attempts: None,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -342,9 +358,11 @@ impl Tracker {
     }
 
     /// The request was balanced to `upstream` of `backend` (spec §7.9): the access line says so.
-    pub(crate) fn route(&mut self, backend: &Arc<str>, upstream: SocketAddr) {
+    /// `attempts` is the number of tries so far, this one included.
+    pub(crate) fn route(&mut self, backend: &Arc<str>, upstream: SocketAddr, attempts: u32) {
         self.backend = Some(backend.clone());
         self.upstream = Some(upstream);
+        self.attempts = Some(attempts);
     }
 
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
@@ -366,6 +384,19 @@ impl Tracker {
             head,
         );
         self.finish(Outcome::Ok, 0);
+    }
+
+    /// A refusal of a pod passed on as received (spec §7.9 "Retries"): like an answer of the
+    /// sidecar it is counted as synthetic and never handed to discovery.
+    pub(crate) fn answered_unrecorded(
+        mut self,
+        response: Response<Incoming>,
+    ) -> Response<RespBody> {
+        self.capture = None;
+        if let Some(tap) = self.tap.as_ref().filter(|tap| tap.active()) {
+            tap.synthetic_exchange(self.ctx.direction == Direction::Outbound);
+        }
+        self.answered(response)
     }
 
     /// The destination did not answer: the exchange ends here.
@@ -501,6 +532,7 @@ impl Tracker {
             load_run: self.load_run.take(),
             backend: self.backend.take().map(|b| b.to_string()),
             upstream: self.upstream,
+            attempts: self.attempts,
         });
     }
 }
@@ -631,6 +663,7 @@ pub(crate) fn rejected(ctx: &Ctx) {
         load_run: None,
         backend: None,
         upstream: None,
+        attempts: None,
     });
 }
 
@@ -668,6 +701,7 @@ pub(crate) fn refused(ctx: &Ctx, request: Option<&RequestHead>) {
         load_run: None,
         backend: None,
         upstream: None,
+        attempts: None,
     });
 }
 
@@ -987,6 +1021,7 @@ impl Http1Tracker {
             load_run: open.load_run.take(),
             backend: None,
             upstream: None,
+            attempts: None,
         });
     }
 }

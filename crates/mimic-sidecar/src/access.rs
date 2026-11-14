@@ -72,6 +72,8 @@ pub struct Exchange {
     pub backend: Option<String>,
     /// Mesh-routed requests only: the pod the request went to.
     pub upstream: Option<SocketAddr>,
+    /// Mesh-routed requests only: the number of tries (spec §7.9 "Retries").
+    pub attempts: Option<u32>,
 }
 
 /// One finished opaque or TLS connection.
@@ -90,6 +92,8 @@ pub struct Connection {
     /// the pod, or the original destination after a fallback.
     pub backend: Option<String>,
     pub upstream: Option<SocketAddr>,
+    /// The connects it took (spec §7.9 "Retries").
+    pub attempts: Option<u32>,
 }
 
 fn millis(d: Duration) -> u64 {
@@ -133,6 +137,7 @@ pub fn exchange(e: &Exchange) {
         load_run = e.load_run.as_deref(),
         backend = e.backend.as_deref(),
         upstream = e.upstream.map(|a| a.to_string()).as_deref(),
+        attempts = e.attempts,
         "http exchange"
     );
 }
@@ -151,6 +156,7 @@ pub fn connection(c: &Connection) {
         bytes_out = c.bytes_out,
         backend = c.backend.as_deref(),
         upstream = c.upstream.map(|a| a.to_string()).as_deref(),
+        attempts = c.attempts,
         "connection"
     );
 }

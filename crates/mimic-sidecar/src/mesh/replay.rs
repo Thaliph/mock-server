@@ -2,11 +2,20 @@
 //! `MIMIC_MESH_RETRY_BUFFER` per request and `MIMIC_MESH_RETRY_BUFFER_TOTAL` for all the
 //! requests of the sidecar together.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
+use hyper::Request;
+use hyper::body::{Body, Frame, SizeHint};
+use hyper::header::HeaderMap;
+use hyper::http::request::Parts;
 use prometheus_client::metrics::gauge::Gauge;
+
+use crate::exchange::ReqBody;
 
 /// The bytes held by all the requests of the sidecar.
 pub struct ReplayBudget {
@@ -138,6 +147,227 @@ impl Drop for Replay {
     }
 }
 
+struct Shared {
+    body: ReqBody,
+    replay: Replay,
+    ended: bool,
+    trailers: Option<HeaderMap>,
+    /// A frame was read from the app.
+    read: bool,
+    /// The number of tries that took the body: only the last one reads it.
+    generation: u64,
+    /// The request ended before an answer was delivered: no try reads any more.
+    closed: bool,
+    /// An answer was delivered: the request is not retried and its last try goes on.
+    delivered: bool,
+    /// Wakes the try that last waited for the app's body.
+    waker: Option<Waker>,
+}
+
+/// The body of a request over its tries: what the app sends is read once, held for replay while
+/// it fits, and each try gets an [`Attempt`] that starts with what was held.
+pub(crate) struct Source {
+    shared: Arc<Mutex<Shared>>,
+    hint: SizeHint,
+}
+
+fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Source {
+    pub(crate) fn new(body: ReqBody, replay: Replay) -> Source {
+        let hint = body.size_hint();
+        Source {
+            shared: Arc::new(Mutex::new(Shared {
+                body,
+                replay,
+                ended: false,
+                trailers: None,
+                read: false,
+                generation: 0,
+                closed: false,
+                delivered: false,
+                waker: None,
+            })),
+            hint,
+        }
+    }
+
+    /// Every byte read from the app is still held (spec §7.9 "Bodies").
+    pub(crate) fn held(&self) -> bool {
+        lock(&self.shared).replay.is_held()
+    }
+
+    /// The request can be sent again whole: nothing was read, or all of it is held.
+    pub(crate) fn intact(&self) -> bool {
+        let shared = lock(&self.shared);
+        shared.replay.is_held() || !shared.read
+    }
+
+    /// The try in flight is given up because the request is to be tried again: it reads no more
+    /// of the body, and one waiting for the app is woken to fail. `false` (and nothing changes)
+    /// when the body is no longer held and some of it was read: the request cannot be sent again
+    /// whole.
+    pub(crate) fn detach(&self) -> bool {
+        let mut shared = lock(&self.shared);
+        if !shared.replay.is_held() && shared.read {
+            return false;
+        }
+        shared.generation += 1;
+        if let Some(waker) = shared.waker.take() {
+            waker.wake();
+        }
+        true
+    }
+
+    /// A response head came back: the bytes held are released.
+    pub(crate) fn release(&self) {
+        let mut shared = lock(&self.shared);
+        shared.delivered = true;
+        shared.replay.release();
+    }
+
+    /// The request for one try: `head` and a body that starts with the bytes held.
+    pub(crate) fn request(&self, head: &Parts) -> Request<Attempt> {
+        // The try before this one reads no more: the bytes it took are in the snapshot.
+        let (queue, generation) = {
+            let mut shared = lock(&self.shared);
+            shared.generation += 1;
+            (
+                shared.replay.chunks().iter().cloned().collect(),
+                shared.generation,
+            )
+        };
+        let mut request = Request::new(Attempt {
+            shared: self.shared.clone(),
+            generation,
+            queue,
+            hint: self.hint,
+            trailed: false,
+        });
+        *request.method_mut() = head.method.clone();
+        *request.uri_mut() = head.uri.clone();
+        *request.version_mut() = head.version;
+        *request.headers_mut() = head.headers.clone();
+        *request.extensions_mut() = head.extensions.clone();
+        request
+    }
+}
+
+impl Drop for Source {
+    /// A request that ends before its answer (the app left) frees the bytes held at once, and
+    /// the tries still pending fail their bodies.
+    fn drop(&mut self) {
+        let mut shared = lock(&self.shared);
+        if !shared.delivered {
+            shared.closed = true;
+            shared.replay.release();
+        }
+    }
+}
+
+/// The body of one try.
+pub(crate) struct Attempt {
+    shared: Arc<Mutex<Shared>>,
+    generation: u64,
+    /// What was held when the try began, still to send.
+    queue: VecDeque<Bytes>,
+    hint: SizeHint,
+    /// The trailers were handed over.
+    trailed: bool,
+}
+
+impl Attempt {
+    /// A later try took the body, or the request is over: this one fails and reads nothing.
+    fn stale(&self, shared: &Shared) -> bool {
+        shared.closed || shared.generation != self.generation
+    }
+}
+
+impl Body for Attempt {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        let this = self.get_mut();
+        let mut shared = lock(&this.shared);
+        if this.stale(&shared) {
+            // An error, never the end of the body: the connection of this try must not be able
+            // to complete a request that is cut (`hyper` closes an HTTP/1 connection, resets an
+            // HTTP/2 stream).
+            this.queue.clear();
+            return Poll::Ready(Some(Err(std::io::Error::other(
+                "the request went to another pod",
+            ))));
+        }
+        if let Some(chunk) = this.queue.pop_front() {
+            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        }
+        if shared.ended {
+            if !std::mem::replace(&mut this.trailed, true)
+                && let Some(trailers) = shared.trailers.clone()
+            {
+                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+            }
+            return Poll::Ready(None);
+        }
+        let polled = Pin::new(&mut shared.body).poll_frame(cx);
+        match polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                shared.read = true;
+                match frame.into_data() {
+                    Ok(data) => {
+                        shared.replay.push(&data);
+                        Poll::Ready(Some(Ok(Frame::data(data))))
+                    }
+                    Err(frame) => {
+                        shared.ended = true;
+                        this.trailed = true;
+                        if let Ok(trailers) = frame.into_trailers() {
+                            shared.trailers = Some(trailers.clone());
+                            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                        }
+                        Poll::Ready(None)
+                    }
+                }
+            }
+            Poll::Ready(None) => {
+                shared.ended = true;
+                this.trailed = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(std::io::Error::other(e)))),
+            Poll::Pending => {
+                shared.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        let shared = lock(&self.shared);
+        if self.stale(&shared) {
+            return false;
+        }
+        if !self.queue.is_empty() {
+            return false;
+        }
+        if shared.ended {
+            shared.trailers.is_none() || self.trailed
+        } else {
+            shared.body.is_end_stream()
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.hint
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +454,109 @@ mod tests {
     fn rty_14_a_body_with_no_chunk_is_held() {
         let (budget, _) = budget(1 << 20);
         assert!(budget.replay(64 * 1024).is_held());
+    }
+
+    /// A request body arriving from a connection: the request `hyper` serves for it.
+    async fn incoming(
+        client: &mut (impl tokio::io::AsyncWrite + Unpin),
+        server: tokio::io::DuplexStream,
+    ) -> hyper::body::Incoming {
+        use tokio::io::AsyncWriteExt;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Mutex::new(Some(tx));
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(move |req| {
+                let tx = tx.lock().unwrap().take();
+                async move {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(req);
+                    }
+                    std::future::pending::<
+                        Result<
+                            hyper::Response<http_body_util::Empty<Bytes>>,
+                            std::convert::Infallible,
+                        >,
+                    >()
+                    .await
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(server), service)
+                .await;
+        });
+        client
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+            )
+            .await
+            .unwrap();
+        rx.await.unwrap().into_body()
+    }
+
+    async fn next(body: &mut Attempt) -> Option<Result<Frame<Bytes>, std::io::Error>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
+    }
+
+    #[tokio::test]
+    async fn rty_14_a_superseded_try_reads_no_more_of_the_body() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let incoming = incoming(&mut client, server).await;
+        let (budget, _) = budget(1 << 20);
+        let source = Source::new(ReqBody::plain(incoming), budget.replay(64 * 1024));
+        let head = Request::new(()).into_parts().0;
+        let mut first = source.request(&head).into_body();
+        let got = next(&mut first).await.unwrap().unwrap();
+        assert_eq!(got.into_data().ok(), Some(Bytes::from_static(b"abc")));
+        // The first try waits for more, and a second try takes over the body.
+        assert!(
+            futures::poll!(std::pin::pin!(next(&mut first))).is_pending(),
+            "waiting for the app"
+        );
+        let mut second = source.request(&head).into_body();
+        client.write_all(b"3\r\ndef\r\n").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let old = next(&mut first).await;
+        assert!(
+            matches!(old, Some(Err(_))),
+            "the first try fails, it does not read"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), next(&mut second))
+                .await
+                .expect("a chunk, not a hole")
+                .unwrap()
+                .unwrap();
+            seen.extend_from_slice(&frame.into_data().unwrap());
+        }
+        assert_eq!(seen, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn rty_14_a_cut_body_is_not_detached_and_a_waiting_try_is_woken() {
+        let head = Request::new(()).into_parts().0;
+        // "abc" does not fit in 2 bytes: read and no longer held, so not to be retried.
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let body = incoming(&mut client, server).await;
+        let (total, _) = budget(1 << 20);
+        let source = Source::new(ReqBody::plain(body), total.replay(2));
+        let mut first = source.request(&head).into_body();
+        assert!(next(&mut first).await.unwrap().is_ok());
+        assert!(!source.detach());
+        // A try waiting for the app is woken by a detach and fails.
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let body = incoming(&mut client, server).await;
+        let source = Source::new(ReqBody::plain(body), total.replay(64 * 1024));
+        let mut waiter = source.request(&head).into_body();
+        assert!(next(&mut waiter).await.unwrap().is_ok());
+        let waiting = tokio::spawn(async move { next(&mut waiter).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(source.detach());
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("woken")
+            .unwrap();
+        assert!(matches!(ended, Some(Err(_))));
     }
 }
