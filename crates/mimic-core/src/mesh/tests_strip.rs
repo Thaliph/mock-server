@@ -50,7 +50,8 @@ fn rty_06_line_ends_and_other_folds_are_kept() {
 
 #[test]
 fn rty_06_the_fold_of_a_removed_field_goes_with_it() {
-    let head = b"HTTP/1.1 200 OK\r\nx-mimic-a: one\r\n two\r\n\tthree\r\nKeep: 1\r\n folded\r\n\r\n";
+    let head =
+        b"HTTP/1.1 200 OK\r\nx-mimic-a: one\r\n two\r\n\tthree\r\nKeep: 1\r\n folded\r\n\r\n";
     let (out, n) = run(head);
     assert_eq!(out, b"HTTP/1.1 200 OK\r\nKeep: 1\r\n folded\r\n\r\n");
     assert_eq!(n, 1, "one field, three lines");
