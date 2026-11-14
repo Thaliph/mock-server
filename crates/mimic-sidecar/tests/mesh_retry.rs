@@ -1227,7 +1227,9 @@ async fn rty_26_a_chunked_put_cut_by_its_client_never_reaches_the_next_pod_compl
     for _ in 0..8 {
         let mut client = H1Client::connect(f.addr).await;
         client
-            .send(b"PUT /doc/1 HTTP/1.1\r\nHost: cart.shop.svc\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .send(
+                b"PUT /doc/1 HTTP/1.1\r\nHost: cart.shop.svc\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
             .await;
         client.send(b"5\r\nhello\r\n").await;
         tokio::time::sleep(Duration::from_millis(100)).await;

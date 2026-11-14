@@ -5114,6 +5114,7 @@ it before M5).
 | RTY-27 | **U** (F2). 65 536 chunks of 1 byte held by one request cost at most their length plus a bounded overhead in the budget and in `mimic_mesh_retry_buffer_bytes` (not 32 times), and replay the same bytes in order. |
 | RTY-28 | **U** (F3). The address a planner picks resolves to its endpoint without a scan of the endpoints (the index of a sorted view), for every endpoint of a view of 1000. |
 | RTY-29 | **U** (F7). The `endpoint="other"` series of a backend are removed 5 minutes after its last endpoint with that label left; a backend that left the view keeps no endpoint series. |
+| RTY-30 | **I** (F8). A request whose tries meet certificates that do not verify (three pods) logs `tls verification failed` once, not once per try. |
 
 ## 13. Test strategy
 

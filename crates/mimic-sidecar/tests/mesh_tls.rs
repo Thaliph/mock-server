@@ -482,6 +482,28 @@ async fn msh_73_a_pod_whose_certificate_does_not_verify_gets_no_byte_and_the_ans
 }
 
 #[tokio::test]
+async fn rty_30_a_request_logs_a_failed_tls_verification_once_not_once_per_try() {
+    let logs = capture_logs();
+    let (_good_ca, good_root) = authority("good");
+    let (bad_ca, _) = authority("unknown");
+    let pods = [
+        tls_pod("bad-1", &bad_ca, names(&[NAME]), &[]).await,
+        tls_pod("bad-2", &bad_ca, names(&[NAME]), &[]).await,
+        tls_pod("bad-3", &bad_ca, names(&[NAME]), &[]).await,
+    ];
+    let clusterpod = tls_pod("cluster", &bad_ca, names(&[NAME]), &[]).await;
+    let addrs: Vec<SocketAddr> = pods.iter().map(|p| p.addr).collect();
+    let rig = rig(&good_root, clusterpod.addr, &addrs).await;
+    let refs: Vec<&TlsPod> = pods.iter().collect();
+    let text = refused_by(&logs, &rig, &refs, &[&clusterpod]).await;
+    assert_eq!(
+        text.matches("tls verification failed").count(),
+        1,
+        "one warning for the request, whatever its tries"
+    );
+}
+
+#[tokio::test]
 async fn msh_73_with_one_good_pod_and_one_bad_pod_every_request_is_answered_by_the_good_one() {
     let _logs = capture_logs();
     let (good_ca, good_root) = authority("good");

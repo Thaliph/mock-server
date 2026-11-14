@@ -368,11 +368,14 @@ impl MeshMetrics {
             })
             .map(|(key, _)| key.clone())
             .collect();
+        // Backends that lost an endpoint labelled `other`: the series goes with the last one.
+        let mut others = BTreeSet::new();
         for key in due {
             let Some(slot) = slots.map.remove(&key) else {
                 continue;
             };
             if &*slot.label == OTHER {
+                others.insert(key.0);
                 continue;
             }
             slots.labelled -= 1;
@@ -385,6 +388,26 @@ impl MeshMetrics {
                 });
             }
             self.in_flight.remove(&InFlightLabels { backend, endpoint });
+        }
+        for backend in others {
+            let used = slots
+                .map
+                .iter()
+                .any(|((b, _), slot)| *b == backend && &*slot.label == OTHER);
+            if used {
+                continue;
+            }
+            for status_class in CLASSES {
+                self.endpoint_requests.remove(&EndpointLabels {
+                    backend: backend.clone(),
+                    endpoint: OTHER.to_string(),
+                    status_class,
+                });
+            }
+            self.in_flight.remove(&InFlightLabels {
+                backend,
+                endpoint: OTHER.to_string(),
+            });
         }
     }
 
@@ -489,4 +512,69 @@ pub(crate) struct Call<'a> {
     pub backend: &'a str,
     pub status_class: &'static str,
     pub reason: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(metrics: &MeshMetrics) -> String {
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut out = String::new();
+        prometheus_client::encoding::text::encode(&mut out, &registry).unwrap();
+        out
+    }
+
+    fn addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, n], 80))
+    }
+
+    #[test]
+    fn rty_29_the_other_series_goes_with_the_last_endpoint_that_had_the_label() {
+        let metrics = MeshMetrics::new(1);
+        let backend = "shop/cart:80";
+        assert_eq!(&*metrics.slot(backend, addr(1)), "10.0.0.1:80");
+        let (b, c) = (
+            metrics.slot(backend, addr(2)),
+            metrics.slot(backend, addr(3)),
+        );
+        assert_eq!((&*b, &*c), ("other", "other"));
+        metrics.endpoint_try(backend, "other", "2xx");
+        let _ = metrics.in_flight_gauge(backend, "other");
+        assert!(text(&metrics).contains("endpoint=\"other\""));
+        let now = Instant::now();
+        let after = now + EVICT_AFTER;
+        // One of the two `other` endpoints left: the label is still in use.
+        metrics.left(backend, addr(2), now);
+        metrics.evict(after);
+        assert!(text(&metrics).contains("endpoint=\"other\""));
+        // The last one left.
+        metrics.left(backend, addr(3), now);
+        metrics.evict(after);
+        assert!(
+            !text(&metrics).contains("endpoint=\"other\""),
+            "{}",
+            text(&metrics)
+        );
+    }
+
+    #[test]
+    fn rty_29_a_backend_that_left_keeps_no_endpoint_series() {
+        let metrics = MeshMetrics::new(10);
+        let backend = "shop/cart:80";
+        let label = metrics.slot(backend, addr(1));
+        metrics.endpoint_try(backend, &label, "2xx");
+        let _ = metrics.in_flight_gauge(backend, &label);
+        metrics.backend_seen(backend);
+        let now = Instant::now();
+        metrics.backend_left(backend, now);
+        metrics.left(backend, addr(1), now);
+        metrics.evict(now + EVICT_AFTER);
+        assert!(
+            !text(&metrics).contains("10.0.0.1:80"),
+            "{}",
+            text(&metrics)
+        );
+    }
 }
