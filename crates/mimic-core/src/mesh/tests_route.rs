@@ -845,3 +845,120 @@ fn rte_03_values_the_view_refuses_make_the_route_unsupported() {
     edge.filters = vec![mirror("cart-shadow", None, Some((2, Some(2))))];
     assert!(plain(&simple(vec![edge])).programmed);
 }
+
+/// One item over each CRD maximum the view enforces makes the route unsupported (RTE-03, RTE-12);
+/// the maximum itself is programmed.
+#[test]
+fn rte_03_one_item_over_each_crd_maximum_makes_the_route_unsupported() {
+    let nm = |i: usize| NameMatch {
+        kind: "Exact".into(),
+        name: format!("x-{i}"),
+        value: "v".into(),
+    };
+    let backend = |weight: Option<u32>| BackendRef {
+        group: String::new(),
+        kind: "Service".into(),
+        namespace: None,
+        name: "cart".into(),
+        port: Some(80),
+        weight,
+        has_filters: false,
+    };
+    let modifier = |kind: &str, set: usize, add: usize, remove: usize| {
+        modifier_filter(
+            kind,
+            HeaderModifier {
+                set: (0..set).map(|i| pair(&format!("x-s{i}"), "v")).collect(),
+                add: (0..add).map(|i| pair(&format!("x-a{i}"), "v")).collect(),
+                remove: (0..remove).map(|i| format!("x-r{i}")).collect(),
+            },
+        )
+    };
+    let matches = |m: RouteMatch, n: usize| RouteRule {
+        matches: vec![m; n],
+        ..RouteRule::default()
+    };
+    let headers = |n: usize| RouteMatch {
+        headers: (0..n).map(nm).collect(),
+        ..RouteMatch::default()
+    };
+    let queries = |n: usize| RouteMatch {
+        query_params: (0..n).map(nm).collect(),
+        ..RouteMatch::default()
+    };
+    let backends = |n: usize| RouteRule {
+        backend_refs: vec![backend(Some(1)); n],
+        ..RouteRule::default()
+    };
+    let mirrors = |n: usize| RouteRule {
+        filters: vec![mirror("cart-shadow", None, None); n],
+        ..RouteRule::default()
+    };
+    let filter_rule = |f: RouteFilter| RouteRule {
+        filters: vec![f],
+        ..RouteRule::default()
+    };
+    let weighted = |w: u32| RouteRule {
+        backend_refs: vec![backend(Some(w))],
+        ..RouteRule::default()
+    };
+    // (rule at its maximum, rule one over, the path named)
+    let cases: Vec<(RouteRule, RouteRule, &str)> = vec![
+        (
+            matches(RouteMatch::default(), 64),
+            matches(RouteMatch::default(), 65),
+            "rules[0].matches",
+        ),
+        (
+            matches(headers(16), 1),
+            matches(headers(17), 1),
+            "rules[0].matches[0].headers",
+        ),
+        (
+            matches(queries(16), 1),
+            matches(queries(17), 1),
+            "rules[0].matches[0].queryParams",
+        ),
+        (backends(16), backends(17), "rules[0].backendRefs"),
+        (weighted(1_000_000), weighted(1_000_001), "rules[0].backendRefs[0].weight"),
+        (mirrors(16), mirrors(17), "rules[0].filters"),
+        (
+            filter_rule(modifier("RequestHeaderModifier", 16, 16, 16)),
+            filter_rule(modifier("RequestHeaderModifier", 17, 0, 0)),
+            "rules[0].filters[0].requestHeaderModifier.set",
+        ),
+        (
+            filter_rule(modifier("ResponseHeaderModifier", 16, 16, 16)),
+            filter_rule(modifier("ResponseHeaderModifier", 0, 17, 0)),
+            "rules[0].filters[0].responseHeaderModifier.add",
+        ),
+        (
+            filter_rule(modifier("RequestHeaderModifier", 16, 16, 16)),
+            filter_rule(modifier("RequestHeaderModifier", 0, 0, 17)),
+            "rules[0].filters[0].requestHeaderModifier.remove",
+        ),
+    ];
+    for (at_max, over, path) in cases {
+        let c = plain(&simple(vec![at_max]));
+        assert!(c.programmed, "at the maximum: {path}");
+        let (ok, reason, message) = first_unsupported(simple(vec![over]));
+        assert!(!ok, "{path}");
+        assert_eq!(reason, "UnsupportedValue");
+        assert_eq!(message, format!("unsupported: {path}"));
+    }
+    // Two modifiers of one type merge into one list, which the view bounds.
+    let two = RouteRule {
+        filters: vec![
+            modifier("RequestHeaderModifier", 9, 0, 0),
+            modifier("RequestHeaderModifier", 8, 0, 0),
+        ],
+        ..RouteRule::default()
+    };
+    assert!(!plain(&simple(vec![two])).programmed);
+    let rules = |n: usize| vec![RouteRule::default(); n];
+    assert!(plain(&simple(rules(16))).programmed);
+    let (ok, reason, message) = first_unsupported(simple(rules(17)));
+    assert!(!ok);
+    assert_eq!(reason, "UnsupportedValue");
+    assert_eq!(message, "unsupported: rules");
+}
