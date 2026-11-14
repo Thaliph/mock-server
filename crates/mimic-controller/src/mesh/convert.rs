@@ -487,3 +487,16 @@ pub fn route(object: &DynamicObject) -> Option<(Key, Route)> {
     };
     Some((key, route))
 }
+
+/// What the cluster holds of the status of an `HTTPRoute`: the `resourceVersion` the next patch
+/// is conditioned on, the generation the entries can be compared with, and `status.parents`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteObserved {
+    pub generation: i64,
+    pub resource_version: String,
+    pub parents: Vec<Value>,
+}
+
+pub fn route_observed(_object: &DynamicObject) -> Option<(Key, RouteObserved)> {
+    unimplemented!()
+}

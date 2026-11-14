@@ -22,6 +22,7 @@ pub struct MeshMetrics {
     pub(crate) cache_bytes: Gauge,
     pub(crate) gateway_api_present: Gauge,
     pub(crate) routes: Family<Labels, Gauge>,
+    pub(crate) route_status: Family<Labels, Counter>,
 }
 
 impl Default for MeshMetrics {
@@ -37,6 +38,7 @@ impl Default for MeshMetrics {
             cache_bytes: Gauge::default(),
             gateway_api_present: Gauge::default(),
             routes: Family::default(),
+            route_status: Family::default(),
         }
     }
 }

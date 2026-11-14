@@ -216,7 +216,7 @@ fn rte_13_an_object_without_namespace_or_name_is_skipped_and_a_bare_spec_convert
     assert!(r.parents.is_empty() && r.rules.is_empty() && r.unknown_fields.is_empty());
 }
 
-fn cart_route(name: &str, created: i64) -> Route {
+pub(crate) fn cart_route(name: &str, created: i64) -> Route {
     Route {
         namespace: "shop".into(),
         name: name.into(),

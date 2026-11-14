@@ -567,6 +567,44 @@ async fn msh_26_a_truncated_view_is_counted_and_warned_once_per_build_not_per_re
 }
 
 #[tokio::test]
+async fn rte_10_a_truncated_view_names_the_routes_left_out_in_its_warn() {
+    let lines = Lines::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(lines.clone())
+            .finish(),
+    );
+    let hub = hub(MeshConfig {
+        limits: Limits {
+            max_services: 1,
+            ..Limits::default()
+        },
+        ..MeshConfig::default()
+    });
+    synced(&hub);
+    put_service(&hub, svc("shop", "cart", "10.96.0.1"));
+    put_service(&hub, svc("shop", "cart-v1", "10.96.0.2"));
+    // Only `cart` fits: the route names `cart-v1`, so it is left out of the view and listed.
+    let mut r1 = super::tests_route::cart_route("r1", 100);
+    r1.rules[0].backend_refs[0].name = "cart-v1".into();
+    put_route(&hub, r1);
+    hub.publish_now();
+    body_of(&hub, "shop", "cart", Mode::None).await;
+    let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    let warns: Vec<_> = text
+        .lines()
+        .filter(|l| l.contains("mesh view truncated"))
+        .collect();
+    assert_eq!(warns.len(), 1, "{text}");
+    assert!(
+        warns[0].contains(r#""routes":"shop/r1""#),
+        "the WARN names the routes left out: {}",
+        warns[0]
+    );
+}
+
+#[tokio::test]
 async fn msh_27_a_relist_replaces_what_the_watch_held_and_a_delete_removes_its_key() {
     let hub = hub(MeshConfig::default());
     synced(&hub);

@@ -163,3 +163,72 @@ pub async fn run(hub: Arc<Hub>, sink: Arc<dyn StatusSink>) {
         }
     }
 }
+
+/// The controller of the entries of `status.parents[]` that are mimic's.
+pub const MIMIC_CONTROLLER: &str = "mimic.platform.io/mesh";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchError {
+    /// `409`: the route changed since it was read.
+    Conflict,
+    Other(String),
+}
+
+pub type PatchFuture<'a> = Pin<Box<dyn Future<Output = Result<(), PatchError>> + Send + 'a>>;
+
+/// Patches the status of an `HTTPRoute`.
+pub trait RouteSink: Send + Sync {
+    fn patch<'a>(&'a self, namespace: &'a str, name: &'a str, body: &'a Value) -> PatchFuture<'a>;
+}
+
+/// What to do with the status of one route.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Plan {
+    Keep,
+    Write(Vec<Value>),
+    /// The list would exceed the 32 entries of the CRD.
+    TooMany,
+}
+
+#[derive(Default)]
+pub struct RouteState {}
+
+pub fn route_patch_params() -> PatchParams {
+    unimplemented!()
+}
+
+pub fn route_body(_resource_version: &str, _parents: &[Value]) -> Value {
+    unimplemented!()
+}
+
+pub fn route_condition(
+    _kind: &str,
+    _c: &Condition,
+    _generation: i64,
+    _previous: Option<&Value>,
+    _now: &str,
+) -> Value {
+    unimplemented!()
+}
+
+pub fn plan_route(
+    _route: &mimic_core::mesh::input::Route,
+    _compiled: &mimic_core::mesh::route::Compiled,
+    _observed: &[Value],
+    _now: &str,
+) -> Plan {
+    unimplemented!()
+}
+
+pub async fn route_pass(
+    _hub: &Hub,
+    _state: &mut RouteState,
+    _sink: &dyn RouteSink,
+    _now: &str,
+) -> Option<tokio::time::Instant> {
+    unimplemented!()
+}
+
+pub async fn run_routes(_hub: Arc<Hub>, _sink: Arc<dyn RouteSink>) {
+    unimplemented!()
+}

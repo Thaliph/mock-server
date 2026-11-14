@@ -22,7 +22,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use super::config::MeshConfig;
-use super::convert::Key;
+use super::convert::{Key, RouteObserved};
 use super::metrics::{MeshMetrics, label};
 
 /// The longest wait between two publications while changes keep arriving.
@@ -410,6 +410,26 @@ impl Hub {
         }
     }
 
+    /// What the cluster holds of a route's status (RTE-14), fed by the same watch as the route.
+    pub fn feed_route_status(&self, _event: Event<RouteObserved>) {
+        unimplemented!()
+    }
+
+    /// What the cluster holds of the status of route `key`.
+    pub fn observed_route(&self, _key: &Key) -> Option<RouteObserved> {
+        unimplemented!()
+    }
+
+    /// Counts the changes of the observed route statuses; the status writer waits on it.
+    pub fn route_changes(&self) -> watch::Receiver<u64> {
+        unimplemented!()
+    }
+
+    /// `mimic_mesh_route_status_total`.
+    pub fn count_route_status(&self, _result: &str) {
+        unimplemented!()
+    }
+
     /// The `HTTPRoute` CRD is not installed (or no longer): there are no routes. Logged once per
     /// change, not once per look.
     pub fn routes_absent(&self) {
@@ -655,6 +675,7 @@ impl Hub {
                 deployment,
                 left_out = built.truncated,
                 skipped = built.skipped.join(","),
+                routes = built.skipped_routes.join(","),
                 "mesh view truncated"
             );
         }
