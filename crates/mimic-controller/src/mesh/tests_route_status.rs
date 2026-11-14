@@ -183,10 +183,20 @@ fn rte_14_last_transition_time_is_kept_while_the_status_is_unchanged() {
     );
     let parents = written(plan(&r, &[before], NOW));
     let conditions = &parents[0]["conditions"];
-    assert_eq!(conditions[0], cond("Accepted", true, "Accepted", "", 3, OLD));
+    assert_eq!(
+        conditions[0],
+        cond("Accepted", true, "Accepted", "", 3, OLD)
+    );
     assert_eq!(
         conditions[1],
-        cond("ResolvedRefs", false, "BackendNotFound", "shop/gone", 3, OLD)
+        cond(
+            "ResolvedRefs",
+            false,
+            "BackendNotFound",
+            "shop/gone",
+            3,
+            OLD
+        )
     );
     // ResolvedRefs was True: the status changes, the clock's value is written.
     let before = mimic("cart", ok_pair(2, OLD));
@@ -249,7 +259,7 @@ fn rte_14_entries_of_parents_gone_services_gone_and_routes_without_parents_are_r
     };
     let r = route("r", vec![gateway], vec![]);
     let held = [kept.clone(), mimic("cart", ok_pair(3, OLD))];
-    assert_eq!(written(plan(&r, &held, NOW)), [kept.clone()]);
+    assert_eq!(written(plan(&r, &held, NOW)), std::slice::from_ref(&kept));
     // ... and with none of mimic's there is nothing to write.
     assert_eq!(plan(&r, &[kept], NOW), Plan::Keep);
     assert_eq!(plan(&r, &[], NOW), Plan::Keep);
@@ -571,7 +581,10 @@ async fn rte_16_two_replicas_converge_on_the_entries_with_at_most_one_success_ea
         let objects = api.objects.lock().unwrap();
         let shared = &objects[&key("shop", "shared")].parents;
         assert_eq!(shared.len(), 2);
-        assert_eq!(shared[0], foreign, "the other controller's entry is unchanged");
+        assert_eq!(
+            shared[0], foreign,
+            "the other controller's entry is unchanged"
+        );
         assert_eq!(shared[1]["controllerName"], MIMIC_CONTROLLER);
     }
     // Converged: ten more publications send nothing.
@@ -582,7 +595,11 @@ async fn rte_16_two_replicas_converge_on_the_entries_with_at_most_one_success_ea
             pod.pass().await;
         }
     }
-    assert_eq!(api.sent.lock().unwrap().len(), before, "no patch once converged");
+    assert_eq!(
+        api.sent.lock().unwrap().len(),
+        before,
+        "no patch once converged"
+    );
 
     // A grant fed later: ResolvedRefs turns True, with one more patch per replica at most.
     let grant = ReferenceGrant {
@@ -638,7 +655,10 @@ struct Flaky {
 impl RouteSink for Flaky {
     fn patch<'a>(&'a self, namespace: &'a str, name: &'a str, _body: &'a Value) -> PatchFuture<'a> {
         Box::pin(async move {
-            self.attempts.lock().unwrap().push(format!("{namespace}/{name}"));
+            self.attempts
+                .lock()
+                .unwrap()
+                .push(format!("{namespace}/{name}"));
             if *self.fail.lock().unwrap() {
                 Err(PatchError::Other("500 Internal Server Error".into()))
             } else {

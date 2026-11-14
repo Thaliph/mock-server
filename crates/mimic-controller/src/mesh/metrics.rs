@@ -88,6 +88,11 @@ impl MeshMetrics {
             "HTTPRoutes with a Service parent, by state (programmed or unsupported)",
             metrics.routes.clone(),
         );
+        registry.register(
+            "mesh_route_status",
+            "status.parents patches of HTTPRoutes, by result (ok, conflict or error)",
+            metrics.route_status.clone(),
+        );
         metrics
     }
 }

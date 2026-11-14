@@ -386,11 +386,19 @@ async fn rte_19_the_metrics_are_registered_with_their_names() {
         .routes
         .get_or_create(&vec![("state".to_string(), "programmed".to_string())])
         .set(2);
+    metrics
+        .route_status
+        .get_or_create(&vec![("result".to_string(), "conflict".to_string())])
+        .inc();
     let mut text = String::new();
     prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
     assert!(text.contains("mesh_gateway_api_present 1"), "{text}");
     assert!(
         text.contains(r#"mesh_routes{state="programmed"} 2"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"mesh_route_status_total{result="conflict"} 1"#),
         "{text}"
     );
 }

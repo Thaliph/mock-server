@@ -225,7 +225,8 @@ async fn run(config: Config) -> std::io::Result<()> {
             }
             if let Some(mesh) = mesh {
                 let sink = Arc::new(mesh::status::KubeSink::new(kube_client.clone()));
-                mesh::spawn(client.clone(), mesh, cache.changes(), sink);
+                let routes = Arc::new(mesh::status::KubeRouteSink::new(kube_client.clone()));
+                mesh::spawn(client.clone(), mesh, cache.changes(), sink, routes);
             }
             tokio::spawn(tls_ca::manage(client.clone(), tls_ca, seed, seed_metrics));
             cert_manager::manage(client, certificates, cert, cert_metrics).await;

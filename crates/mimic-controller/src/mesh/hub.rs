@@ -40,6 +40,19 @@ pub enum Event<T> {
     Delete(Key),
 }
 
+impl<A, B> Event<(A, B)> {
+    /// The two halves of an event on a pair.
+    pub fn split(self) -> (Event<A>, Event<B>) {
+        match self {
+            Event::Init => (Event::Init, Event::Init),
+            Event::InitApply(k, (a, b)) => (Event::InitApply(k.clone(), a), Event::InitApply(k, b)),
+            Event::InitDone => (Event::InitDone, Event::InitDone),
+            Event::Apply(k, (a, b)) => (Event::Apply(k.clone(), a), Event::Apply(k, b)),
+            Event::Delete(k) => (Event::Delete(k.clone()), Event::Delete(k)),
+        }
+    }
+}
+
 struct Table<V> {
     items: BTreeMap<Key, V>,
     /// The objects of a relist that is not complete: the old content is served meanwhile.
@@ -110,6 +123,9 @@ struct Tables {
     /// The `ReferenceGrant` CRD is not installed: nobody consents.
     grants_absent: bool,
     routes: Table<Route>,
+    /// What the cluster holds of the status of each route: not part of a view, so a change of it
+    /// builds none.
+    route_status: Table<RouteObserved>,
     /// The `HTTPRoute` CRD is installed: `None` until the first look.
     gateway_api: Option<bool>,
 }
@@ -304,6 +320,8 @@ pub struct Hub {
     /// Counts the changes; the debouncer waits on it.
     dirty: watch::Sender<u64>,
     published: watch::Sender<Arc<Published>>,
+    /// Counts the changes of the observed route statuses; the status writer waits on it.
+    observed: watch::Sender<u64>,
     cache: Mutex<Cache>,
     /// One lock per view being built: the others of that key wait for it, the other keys do not.
     gates: Mutex<BTreeMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
@@ -354,6 +372,7 @@ impl Hub {
                 own: BTreeMap::new(),
             }))
             .0,
+            observed: watch::channel(0).0,
             cache: Mutex::default(),
             gates: Mutex::default(),
             watches,
@@ -411,23 +430,28 @@ impl Hub {
     }
 
     /// What the cluster holds of a route's status (RTE-14), fed by the same watch as the route.
-    pub fn feed_route_status(&self, _event: Event<RouteObserved>) {
-        unimplemented!()
+    pub fn feed_route_status(&self, event: Event<RouteObserved>) {
+        if lock(&self.tables).route_status.feed(event) {
+            self.observed.send_modify(|n| *n += 1);
+        }
     }
 
     /// What the cluster holds of the status of route `key`.
-    pub fn observed_route(&self, _key: &Key) -> Option<RouteObserved> {
-        unimplemented!()
+    pub fn observed_route(&self, key: &Key) -> Option<RouteObserved> {
+        lock(&self.tables).route_status.items.get(key).cloned()
     }
 
     /// Counts the changes of the observed route statuses; the status writer waits on it.
     pub fn route_changes(&self) -> watch::Receiver<u64> {
-        unimplemented!()
+        self.observed.subscribe()
     }
 
     /// `mimic_mesh_route_status_total`.
-    pub fn count_route_status(&self, _result: &str) {
-        unimplemented!()
+    pub fn count_route_status(&self, result: &str) {
+        self.metrics
+            .route_status
+            .get_or_create(&label("result", result))
+            .inc();
     }
 
     /// The `HTTPRoute` CRD is not installed (or no longer): there are no routes. Logged once per
@@ -440,6 +464,7 @@ impl Hub {
                 tracing::warn!("gateway api crds missing");
             }
             tables.routes = Table::default();
+            tables.route_status = Table::default();
             tables.gateway_api = Some(false);
             self.metrics.gateway_api_present.set(0);
             changed

@@ -168,7 +168,12 @@ pub(super) async fn routes(client: kube::Client, hub: Arc<Hub>) {
         match api.list(&ListParams::default().limit(1)).await {
             Ok(_) => {
                 let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-                forward(events, convert::route, |e| hub.feed_routes(e)).await;
+                forward(events, convert::route_and_status, |e| {
+                    let (route, status) = e.split();
+                    hub.feed_routes(route);
+                    hub.feed_route_status(status);
+                })
+                .await;
                 hub.routes_absent();
             }
             Err(kube::Error::Api(status)) if status.code == 404 => hub.routes_absent(),
@@ -185,12 +190,13 @@ async fn modes(mut changes: tokio::sync::watch::Receiver<u64>, hub: Arc<Hub>) {
     }
 }
 
-/// Starts the reflectors, the debouncer and the status writer.
+/// Starts the reflectors, the debouncer and the status writers.
 pub fn spawn(
     client: kube::Client,
     hub: Arc<Hub>,
     mode_changes: tokio::sync::watch::Receiver<u64>,
     sink: Arc<dyn super::status::StatusSink>,
+    route_sink: Arc<dyn super::status::RouteSink>,
 ) {
     tokio::spawn(services(client.clone(), hub.clone()));
     tokio::spawn(slices(client.clone(), hub.clone()));
@@ -200,5 +206,6 @@ pub fn spawn(
     tokio::spawn(routes(client, hub.clone()));
     tokio::spawn(modes(mode_changes, hub.clone()));
     tokio::spawn(hub.clone().run());
-    tokio::spawn(super::status::run(hub, sink));
+    tokio::spawn(super::status::run(hub.clone(), sink));
+    tokio::spawn(super::status::run_routes(hub, route_sink));
 }

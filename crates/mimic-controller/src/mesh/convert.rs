@@ -497,6 +497,21 @@ pub struct RouteObserved {
     pub parents: Vec<Value>,
 }
 
-pub fn route_observed(_object: &DynamicObject) -> Option<(Key, RouteObserved)> {
-    unimplemented!()
+pub fn route_observed(object: &DynamicObject) -> Option<(Key, RouteObserved)> {
+    let key = key(&object.metadata)?;
+    let status = object.data.get("status").unwrap_or(&Value::Null);
+    let observed = RouteObserved {
+        generation: object.metadata.generation.unwrap_or(0),
+        resource_version: object.metadata.resource_version.clone().unwrap_or_default(),
+        parents: list(status, "parents").to_vec(),
+    };
+    Some((key, observed))
+}
+
+/// A route and what the cluster holds of its status, from the one object (a single watch feeds
+/// both, so that they are never out of step).
+pub fn route_and_status(object: &DynamicObject) -> Option<(Key, (Route, RouteObserved))> {
+    let (key, route) = route(object)?;
+    let (_, observed) = route_observed(object)?;
+    Some((key, (route, observed)))
 }
