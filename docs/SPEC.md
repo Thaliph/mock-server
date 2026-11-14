@@ -374,6 +374,7 @@ would see without mimic, except for the limits listed at the end of this section
   | `upgrade` | `true` when the exchange became a tunnel | — |
   | `backend`, `upstream` | (M1) mesh-routed requests only (§7.9): `<namespace>/<name>:<port>` of the Service port and the pod `ip:port` the request went to | (M1) L4-balanced connections only (§7.9): the same two fields |
   | `attempts` | (M2) mesh-routed requests only: the number of tries (§7.9 "Retries"), 1 without a retry | (M2) L4-balanced connections only: the number of connects tried |
+  | `route`, `rule` | (M3, #448) mesh-routed requests that a route rule matched (§7.9 "Routing"): the route's `<namespace>/<name>` and the index of the rule in it (0 first); absent otherwise. `backend` is then the backend Service port drawn, absent when none was (a `no-route`, `no-backend` or `invalid-backend` answer) | — |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
   | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown`, (F10) `mock_closed` (§8) |
@@ -2614,7 +2615,7 @@ no insignificant whitespace):
   Service does not have, a `ports` entry the Service does not have, more items than the HTTPRoute
   CRD allows (16 rules per route, 64 matches per rule, 16 header and 16 query matches per match,
   16 backends per rule, 16 mirrors per rule, 16 `set`, 16 `add` and 16 `remove` per modifier), a
-  header name that is not a lower-case token, a refused modifier name ("Routes" below), a header or
+  header name that is not a lower-case token of 1 to 256 bytes (from #448), a refused modifier name ("Routes" below), a header or
   query value with a `CR`, `LF` or `NUL` or over 4096 bytes, a path value that does not start with
   `/` or is over 1024 bytes, a method not among the nine of the CRD, a weight over 1 000 000, a
   mirror fraction with a denominator of 0 or a numerator over it.
@@ -2708,8 +2709,9 @@ no insignificant whitespace):
     crds missing` per absence (also at start) and one INFO `gateway api crds found` when it comes;
     while absent, views hold no routes and every other part of the mesh is unchanged. With
     `MIMIC_MESH=off` routes are neither watched nor written.
-  - **Sidecar** (M3, #447): the sidecar reads and validates `routes` with the view and uses none of
-    them; matching, weights and header modifiers are #448, timeouts #449, mirrors #450.
+  - **Sidecar** (M3): the sidecar reads and validates `routes` with the view (#447) and applies
+    their matches, weights and header modifiers ("Routing" below, #448); `timeouts` are #449 and
+    `mirrors` #450: until then they are read, validated and not applied.
 - **The sidecar follows its view** (M1, #442). With
   `MIMIC_MESH=on` and a controller URL the sidecar long-polls `GET /v1/workloads/<deployment>/mesh?format=1`
   (§7.2) with `If-None-Match` set to the `ETag` it holds and `Accept-Encoding: gzip`, one request
@@ -2884,6 +2886,78 @@ no insignificant whitespace):
   same way. Access lines and exchanges are those of §4.1 (`tls: true`, `sni`, `backend`,
   `upstream`). A client that rejects the leaf is remembered as in §5 and its next connection is
   balanced per connection, untouched.
+  **Routing** (M3, #448; design §3.1, §5; Gateway API GAMMA). A request of a mesh-routed
+  connection (cleartext HTTP/1, `h2c` or intercepted TLS) whose Service port has **routes** (the
+  `routes` of the Service in the view whose `ports` is absent or holds the port of the original
+  destination) is routed by the routes before it is balanced; a Service port with no route is
+  balanced over the Service's own pods exactly as above. The choice is `mimic-core`
+  `mesh::route::Table` (pure, built once per Service port when a view is applied, never per
+  request; the random value is passed in):
+  - **Request seen by the match**: the method token; the path, the target without its query
+    (origin-form, or the path of an absolute-form target; `*` and an empty path match no path),
+    compared **byte for byte as received**: no percent-decoding, no dot-segment or `//`
+    normalisation, case-sensitive; the query split on `&`, each pair on its first `=` (none: an
+    empty value), name and value percent-decoded (`+` stays `+`; a pair with an invalid escape
+    is ignored), the first pair of a name being the one compared; the header fields by name in
+    any case, the value of a name being its field lines in the order received joined by `,`
+    (no space). The `Host` or `:authority` is never compared (`hostnames` are ignored, §7.9 "Routes").
+  - **A match holds** when all of its items hold: `path` `Exact` equal to the path; `PathPrefix`
+    `/` always, else the prefix with one trailing `/` removed equal to the path or to the start
+    of the path followed by `/` (so `/cart` matches `/cart`, `/cart/` and `/cart/1`, not
+    `/carts`); `method` equal; each header and query item equal (exact, case-sensitive values),
+    only the first item of a name being considered (the next ones of the same name in that match
+    are ignored, as the Gateway API says). A rule holds when one of its matches holds.
+  - **Precedence** (Gateway API): among every match of every rule of the port's routes, the
+    match that holds and has, in this order, an `Exact` path rather than a prefix; the longest
+    prefix value (bytes, as written); a `method`; the most header items; the most query items
+    (items counted once per name); then the oldest route (the order of `routes` in the view),
+    then the first rule of that route, then the first match of that rule. The matches are kept
+    sorted by that key, so the first that holds wins.
+  - **No match**: when the port has routes and none holds, the request is answered `404`,
+    `x-mimic-error: no-route`, `content-length: 0`, by the sidecar (nothing sent; the same
+    decision as Istio and Linkerd, recorded on #448): a catch-all rule (`PathPrefix` `/`, the
+    default of a rule without `matches`) whose backend is the Service itself gives the old
+    behaviour back explicitly.
+  - **Backend draw**: from the matched rule's `backends`, with weights `w₁ … wₙ` and total `W`:
+    `W = 0` (no backend, or every weight 0) is answered `500` `x-mimic-error: no-backend`; else
+    the drawn backend is the first whose running sum of weights exceeds `⌊r × W / 2⁶⁴⌋`, `r` a
+    uniform 64-bit random value, so a backend of weight 0 is never drawn and each one is drawn
+    with probability `wᵢ / W`. An invalid backend (`{"invalid":true}`, §7.9 "Routes") drawn is
+    answered `500` `x-mimic-error: invalid-backend` (its share of the requests, as the Gateway
+    API says). These three answers have `content-length: 0`, no try, no deposit on any budget,
+    are not retried and never recorded (`mimic_discovery_exchanges_total{result="synthetic"}`).
+  - **Then as without routes, on the backend**: the request goes to a pod of the drawn
+    backend Service port (its endpoints, slow start, avoidance and P2C as above), with the
+    **backend's** `policy` (`retries`, retry budget, slow start): the budget of #446 is the
+    backend Service's, every try of the request (retries and the fallback included) stays on that
+    backend (the backend is drawn once per request, never again for a retry), and the fallback
+    of "Retries" below is the backend's ClusterIP and port (the original destination when the
+    backend is the Service itself; a headless backend has no fallback: its last try is a pod). The
+    head sent to the backend keeps the app's `Host`/`:authority`, so a backend sees the parent
+    Service's name; over intercepted TLS its pods are verified against the name the app sent,
+    as for the Service itself. While the mode is `mock` the mock answers before any route
+    (unchanged); a stale view or `"mesh": false` sends the request to the original destination
+    as above, without any route.
+  - **Header modifiers** of the matched rule (`filters.requestHeaders`, `filters.responseHeaders`):
+    `set` removes every field line of the name and adds one with the value, `add` appends one
+    field line (a list value as the Gateway API's `foo,bar`: RFC 9110 §5.3 makes them equal),
+    `remove` removes every field line of the name; applied in the order `set`, `add`, `remove`,
+    each list in its order, names compared in any case and added in lower case. The request
+    modifier is applied **once**, before the first try: every try and retry sends the same
+    modified head (§7.9 "Retries", "Bodies"). The response modifier is applied to the final
+    response head received from a pod or a fallback, never to a `1xx` head, trailers or an
+    answer of the sidecar (`no-route`, `no-backend`, `invalid-backend`, `no-endpoint`,
+    `connect-failed`). The names a modifier may hold exclude by construction (§7.9 "Routes",
+    "`View::from_json`") pseudo-header fields (`:` is not a token character), `host`, every
+    framing and hop-by-hop field and `x-mimic-*`, so a route never changes the framing, the
+    authority or the mesh's own signals (a trusted refusal stays bound to its pod, the strip of
+    §4.1 still applies). Growth is bounded: a modifier adds at most 32 field lines (16 `set`,
+    16 `add`) of at most 256 + 4096 bytes each, once per request.
+  - **Discovery** records the request as the app sent it (before the request modifier) and the
+    response as the app received it (after the response modifier), under the app's authority:
+    a value a route sets on a request is never recorded.
+  - **Upgrade, `CONNECT` and L4** are not routed: an `Upgrade` or `CONNECT` request (§4.1 limit
+    8) and an L4-balanced connection go to the Service's own pods as without routes (§11.1).
   **Retries** (M2, #445; design §7). A mesh-routed request is tried again **only when its
   failure happened before the app could process it**: a response of an app (any status, `5xx`
   included) is never retried. The classification and the choice of the next try are `mimic-core`
@@ -2928,8 +3002,8 @@ no insignificant whitespace):
   - **Where**: each retry goes to a pod **not tried yet** for this request, chosen by the P2C
     above among those (avoidance applies); when every endpoint was tried, P2C over all of them.
     When every try so far failed to connect and either no untried endpoint is left or the next
-    try is the last one, that try goes to the **original destination** instead, at most once per
-    request, and it ends the tries (counted in `mimic_mesh_fallbacks_total`). So a Service with one
+    try is the last one, that try goes to the **original destination** instead (for a routed
+    request, the drawn backend's ClusterIP, "Routing" above), at most once per request, and it ends the tries (counted in `mimic_mesh_fallbacks_total`). So a Service with one
     endpoint is tried on it, then on the ClusterIP, as in M1, and a request never reaches more
     than `1 + retries` destinations.
   - **Trust needs a pod**: a try on the original destination (a fallback, a stale view, a view
@@ -3003,9 +3077,13 @@ no insignificant whitespace):
   retry budget come from the view's policy only (the `MeshConfig.retries` field of #445 is
   removed); no variable sets them.
   **Metrics** (sidecar, only with `MIMIC_MESH=on`; `service` and `backend` are
-  `<namespace>/<name>` and `<namespace>/<name>:<port>`; no route exists yet: `route="none"`;
-  `reason` is `none`, the `x-mimic-error` of an answer of the sidecar, or (M2) that of a trusted
-  refusal passed to the app):
+  `<namespace>/<name>` and `<namespace>/<name>:<port>`; `service` is the Service the app called
+  and `backend` the Service port the request went to: from #448 the drawn backend of a routed
+  request, `none` for a `no-route` or `no-backend` answer and `invalid` for an
+  `invalid-backend` one; `route` (from #448) is the matched route's `<namespace>/<name>`, `none`
+  when the Service port has no route or none matched; `reason` is `none`, the `x-mimic-error` of
+  an answer of the sidecar (from #448 also `no-route`, `no-backend`, `invalid-backend`), or (M2)
+  that of a trusted refusal passed to the app):
 
   | Metric | Type | Labels |
   |---|---|---|
@@ -3031,8 +3109,14 @@ no insignificant whitespace):
   left the view (`mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`,
   `mimic_mesh_fallbacks_total`, `mimic_mesh_reconnects_total`, and from M2
   `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, and
-  from #446 `mimic_mesh_retry_budget_exhausted_total`). No
-  label carries a path, a header or any caller-controlled string.
+  from #446 `mimic_mesh_retry_budget_exhausted_total`). From #448 at most 256 distinct routes
+  have a `route` label of their own, in the order the sidecar first counts them, the next ones
+  are `other`; the series of a route that left the view are removed 5 minutes after it left, as
+  above, and its slot is free again. A route adds at most one `backend` value per distinct
+  backend Service port of its rules, plus `none` and `invalid`, so the label sets stay bounded by
+  the view (`MIMIC_MESH_MAX_SERVICES`) and the 256 routes. No
+  label carries a path, a header or any caller-controlled string: a route name is the
+  configuration of the namespace's own authors, never a value of a request.
 
 ## 8. Mock
 
@@ -4476,6 +4560,23 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   more per replica, relisted with backoff by `kube-runtime` like the others) and polls for the
   CRD every 30 s with a `list` of one item while it is absent; a cluster with many routes costs
   one copy of each route of at most 64 KiB of `spec` per replica (larger ones are held as a key).
+- (M3, #448) **Routes are routing, not authorisation.** Paths are matched byte for byte, without
+  percent-decoding or dot-segment normalisation (§7.9 "Routing"), and the caller's app writes
+  the request: an app reaches whatever backend its own requests match (`/cart/../admin`, a
+  header it sets), as it reaches any pod IP directly without the mesh. A route never makes a
+  backend reachable that the caller could not call without it; access control stays the
+  callee's (or a NetworkPolicy's).
+- (M3, #448) **`Upgrade`, `CONNECT` and L4 traffic are not routed.** They are balanced over the
+  Service's own pods as without routes (§7.9 "Load balancing"), so a parent Service with no pods
+  of its own (a selector-less GAMMA parent) serves them as it does without routes. Routing them
+  is v2.
+- (M3, #448) **Backends see the parent's authority.** The `Host`/`:authority` is the one the app
+  sent, and over intercepted TLS a backend's pods must present a certificate valid for the name
+  the app sent (the parent Service's), as with other GAMMA meshes without mTLS.
+- (M3, #448) **A stale view routes nothing.** With a view older than `MIMIC_MESH_STALE_AFTER`
+  requests go to the original destination (the parent's ClusterIP): weights and matches are not
+  applied until a view is fresh again, so a canary weight shifted to 0 is not held while the
+  controller is unreachable.
 
 ## 12. Delivery plan
 
@@ -4504,7 +4605,7 @@ names contain the criterion ID (`fnd_02_…`).
 | M0 | Mode `none` (proxy only, nothing recorded), the new default (#439, design `docs/design/mimic-mesh.md` §2) | (added 2026-11-12) |
 | M1 | `MimicConfig` CRD and the pure mesh view (#440, design `docs/design/mimic-mesh.md` §4.2, §6, §16) | (added 2026-11-12) |
 | M2 | Retries of proxy-level failures on another pod (#445, design `docs/design/mimic-mesh.md` §7); the retry budget is #446 | (added 2026-11-14) |
-| M3 | Gateway API prerequisite and HTTPRoute (GAMMA) ingestion in the controller (#447, design `docs/design/mimic-mesh.md` §4.2, §5); routing in the sidecar is #448, timeouts #449, mirrors #450 | (added 2026-11-14) |
+| M3 | Gateway API prerequisite and HTTPRoute (GAMMA) ingestion in the controller (#447, design `docs/design/mimic-mesh.md` §4.2, §5); route matching, header modifiers and weighted backends in the sidecar (#448); timeouts #449, mirrors #450 | (added 2026-11-14) |
 
 ### 12.1 F0 — Foundations
 
@@ -5450,6 +5551,41 @@ controller's hub runs in process with objects fed to its reflector inputs and a 
 | RTE-26 | **E** (chart, `scripts/check-chart.sh`, as MSH-29). With `mesh.enabled` the ClusterRole grants `get`, `list`, `watch` on `httproutes` and `patch` on `httproutes/status` (`gateway.networking.k8s.io`), and on that group nothing else but `referencegrants` `get`, `list`, `watch`: no `create`, `update` or `delete`, no `gateways`, `gatewayclasses`; nothing on `customresourcedefinitions`; with `mesh.enabled: false` none of them; the default render is the golden file. |
 | RTE-27 | **D** (documentation review). `docs/wiki/Install.md` has a "Gateway API (optional)" prerequisite: standard channel ≥ v1.2, tested v1.7.0, the `kubectl apply --server-side` command with the pinned URL, what works without it; `docs/wiki/Mesh.md` has "Routes": what is supported and refused, producer and consumer routes, a `ReferenceGrant` `from: HTTPRoute` example, how to read the status, that the sidecar applies routes from #448, and the warning of §11.1 that route values reach callers' views; `Monitoring.md` lists the three new metrics and the new `kind`; `Troubleshooting.md` has `gateway api crds missing`, `UnsupportedValue` and `RefNotPermitted`; `CHANGELOG.md` *Unreleased* names the feature, the new RBAC and the prerequisite. |
 | RTE-28 | **D** (security review). Cross-namespace data only through `ReferenceGrant` (RTE-06, RTE-09); consumer routes affect only their namespace (RTE-07); routes cannot touch framing, `host` or `x-mimic-*` fields (RTE-03, RTE-12); memory bounded per route (RTE-13) and per view (RTE-10); no route value in logs or status messages (RTE-02, RTE-17); status writes idempotent and bounded (RTE-14, RTE-16); RBAC as RTE-26; the limits of §11.1 (M3) are written. |
+
+### 12.24 M3 — Route matching, header modifiers and weighted backends (#448)
+
+Design: `docs/design/mimic-mesh.md` §3.1, §5, §14 (M3 row). Spec text: §4.1 (access line
+`route`, `rule`), §7.9 ("`View::from_json`", "Routes", "Routing", "Retries", "Metrics"), §9,
+§11.1. Levels as in §12.2, plus **B** (criterion micro-benchmark, results in `docs/bench/`) and
+**D** (review). RTE-40 to RTE-59 are #448; timeouts (#449) and mirrors (#450) take RTE-60 and
+after. Decision recorded on #448: a request that no rule of the port's routes matches is
+answered `404` `no-route` (not sent to the Service). Out of scope: `timeouts` and `mirrors`
+(read, not applied), routing `Upgrade`, `CONNECT` and L4 traffic (v2), Gateway parents (M6),
+`GRPCRoute`. In the **I** tests the sidecar is fed views by a fake controller and its backends
+are in-process servers that echo the head they received and their own name, as MSH-33.
+
+| ID | Criterion |
+|---|---|
+| RTE-40 | **U** (`mimic-core` `mesh::route::Table`, the precedence table of the Gateway API). For one request matched by several rules: an `Exact` path beats a longer `PathPrefix`; a longer prefix value beats a shorter one (`/cart/items` over `/cart`, and `/cart/` over `/cart`: lengths as written); then a `method`; then more header items; then more query items; then the older route (first in `routes`), then the first rule, then the first match of the rule; a match with two header items of the same name counts one and its second item is ignored (a request failing it still matches); a route whose `ports` lacks the request's port takes no part; a port without any route gives "no routes" (not `no-route`). Each row of the table is one test case with the winning `(route, rule)` named. |
+| RTE-41 | **U** (paths). `PathPrefix` `/cart` and `/cart/` match `/cart`, `/cart/` and `/cart/1` and not `/carts` or `/Cart`; `/` matches every path; `Exact` `/cart` matches `/cart` only (not `/cart/`); the path is the target without its query, the path of an absolute-form target, and is never normalised: `/cart/../admin`, `//cart`, `/%63art` and `/cart%2F1` are compared as received (`/%63art` does not match `/cart`; `/cart/../admin` matches prefix `/cart`); `*` and an empty path match no path item. |
+| RTE-42 | **U** (headers, query, method). Header names match in any case, values exactly and case-sensitively; two field lines `a` and `b` of one name match the value `a,b` and neither `a` nor `a, b`; a missing header fails the item. Query `v=2&v=3` matches `v: 2` only (first pair); `q=a%20b` matches `a b`, `q=a+b` matches `a+b`; `x` alone matches the empty value; a pair with an invalid escape is ignored, so `q=%zz&q=1` matches `q: 1` and `q=%zz` alone fails the item; names are case-sensitive. `method` `GET` does not match `get` or `HEAD`. |
+| RTE-43 | **U** (weighted draw, `proptest`). For any 0 to 16 backends of weights 0 to 1 000 000 and any 64-bit `r`: a weight-0 backend is never drawn; `W = 0` gives `no-backend`; an invalid backend drawn gives `invalid-backend`; for `W ≤ 1000`, the values `r = ⌈k × 2⁶⁴ / W⌉` for `k` in `0..W` draw each backend exactly its weight times; `r = 0` draws the first backend of non-zero weight and `r = 2⁶⁴ − 1` the last. |
+| RTE-44 | **U** (header modifiers on a field list, in `mimic-core`). `set` of a name present twice leaves one line with the new value, of an absent name adds one; `add` keeps the existing lines and appends one; `remove` removes every line of the name, an absent one is a no-op; the order is `set`, `add`, `remove` (`set x` and `remove x` in one modifier leave no `x`; `add x` and `set x` leave two lines); names match in any case, added names are lower-case, the other fields keep their order and case; a modifier at the CRD maximum (16 `set`, 16 `add`, names of 256 bytes, values of 4096 bytes) adds at most 32 lines and 32 × 4356 bytes. |
+| RTE-45 | **U** (`View::from_json` and compile, bounded names). A modifier or match header name of 257 bytes is refused by both (compile: `UnsupportedValue` naming the field) and one of 256 accepted; `:authority`, `:path` and `:status` are refused (not tokens), as are the names of RTE-03; every RTE-12 case is still refused. |
+| RTE-46 | **B** (criterion micro-benchmark `mesh_route`). `Table::select` over 100 rules (10 routes of 10 rules, each match with a path, a method, 2 header and 1 query items) takes at most 10 µs for a request that matches the last rule in precedence and for one that matches none (design §14); building the table of those 100 rules is measured, no budget. |
+| RTE-47 | **I** (canary). A view routing `shop/cart:80` to `shop/cart-v1:80` weight 90 and `shop/cart-v2:80` weight 10: of 10 000 requests over keep-alive connections, HTTP/1 and `h2c`, `cart-v2` serves 1000 ± 200; `mimic_mesh_requests_total{service="shop/cart",route="shop/cart-canary",backend=…}` counts the same split and sums to 10 000; each access line has `route` `shop/cart-canary`, `rule` 0, `backend` the drawn port and `upstream` a pod of that backend; no request reaches a pod of `shop/cart`'s own endpoints that is in neither backend. |
+| RTE-48 | **I** (match and update). Rules `x-canary: 1` → `cart-v2` and catch-all → `cart-v1`: 100 requests with the header all reach `cart-v2`, 100 without all `cart-v1`; an `Exact` `/cart/checkout` rule wins over a `PathPrefix` `/cart` one. A new view with weights 0/100 applied (pull `result="ok"`): every request sent after it on the same connection goes to `cart-v2` (100 of 100); a view without the route gives back balancing over `shop/cart`'s pods; a route with `ports: [81]` leaves port 80 balanced as before. |
+| RTE-49 | **I** (sidecar answers). On a port with routes, a request no rule matches is answered `404`, exactly one `x-mimic-error: no-route`, `content-length: 0`, and no backend or ClusterIP receives anything; a rule with `backends: []` or every weight 0 gives `500` `no-backend`; a rule with one valid and one invalid backend of equal weight gives `500` `invalid-backend` to 50 % ± 5 % of 2000 requests and none of those reaches a pod. The metrics have `route="none",backend="none",reason="no-route"`, `route="shop/cart-canary",backend="none",reason="no-backend"` and `backend="invalid",reason="invalid-backend"`; each counts `mimic_discovery_exchanges_total{result="synthetic"}` and is never recorded; their access lines have no `backend` or `upstream`. |
+| RTE-50 | **I** (modifiers on the wire, HTTP/1 and `h2c`). The backend receives the head with `set`, `add` and `remove` applied and every other field, the target and the `Host`/`:authority` unchanged (HTTP/1: order and case of the other fields kept); the app receives the response with the response modifier applied, a `1xx` head and trailers unchanged; a `no-route` and a `503` `connect-failed` answer carry no modified field. A first try refused at connect then retried on another pod: the second pod receives the modified head once (one `add` line, not two). Discovery records the request without the fields the route set or added and with those it removed, and the response with the response modifier applied. |
+| RTE-51 | **I** (retries per backend). With `cart-v2`'s pods refusing connections: a request drawn to `cart-v2` is tried only on `cart-v2`'s pods and then `cart-v2`'s ClusterIP (`upstream`; `mimic_mesh_fallbacks_total{backend="shop/cart-v2:80"}`), never on `cart-v1`; `cart-v2`'s `policy.retries: 0` gives one try; the WARN `retry budget exhausted` and `mimic_mesh_retry_budget_exhausted_total` name `backend="shop/cart-v2:80"` while `cart-v1` requests are still retried within their own budget; `no-route`, `no-backend` and `invalid-backend` answers add nothing to any budget's `window_requests`. A headless backend whose pods all refuse is answered `503` `connect-failed` after its pods, without a fallback. |
+| RTE-52 | **I** (where routes do not apply). With a stale view the requests of a routed connection go to the original destination and none is answered `no-route`; in mode `mock` the mock answers and no route is matched; an HTTP/1 `Upgrade` request to a routed Service goes to a pod of the Service itself; `"mesh": false` routes nothing. |
+| RTE-53 | **I** (label bounds). A view with 300 routes on 300 Services, each matched once: 256 distinct `route` values and `other` on `mimic_mesh_requests_total`; once a route leaves the view, its series are gone 5 minutes later (the scrape before still has them) and a new route takes the free slot; no label value of any `mimic_mesh_*` series contains a path, a header or query value of a request or a route. |
+| RTE-54 | **U** (`proptest`, framing invariants). For any view `View::from_json` accepts and any request head (method, target, up to 32 fields including `host`, `content-length`, `transfer-encoding`, `te`, `upgrade` and `x-mimic-*`): the head after the request modifier has byte-identical field lines of `host`, every name of RTE-03 and every `x-mimic-*` name, the same method and target, and at most 32 more lines; the same holds for a response head with the response modifier. |
+| RTE-55 | **E** (kind, `scripts/e2e.sh` section `rte_55`, own namespace, cleaned by a trap, Python test services). Services `cart` (selecting `cart-v1` and `cart-v2` pods), `cart-v1` and `cart-v2`, and an HTTPRoute with parent `cart` and weights 90/10: of 1000 requests from an injected caller, `cart-v2` serves 100 ± 50; the route patched to 0/100: once the caller's state file holds the route's new generation, 100 of 100 requests go to `cart-v2`; a rule `x-canary: 1` sends every request with it to `cart-v2`; the route deleted, requests reach both versions again. |
+| RTE-56 | **E** (same section). With a route of the single rule `Exact` `/cart`, a request to `/other` from the caller gets `404` `x-mimic-error: no-route`, and its access line has `status` 404 and no `route`, `backend` or `upstream`; a request to `/cart` has `route`, `rule` 0 and `backend`. |
+| RTE-57 | **D** (documentation review). `docs/wiki/Mesh.md` "Routes" says the sidecar applies matches, weights and header modifiers (no longer "applies none yet") and has a canary walkthrough (`cart-v1`/`cart-v2`, 90/10, a header match, the shift to 0/100, how to read `mimic_mesh_requests_total{route,backend}`), the precedence rules, the `404` `no-route` default and the catch-all that gives the old behaviour; `Monitoring.md` documents the `route` label, its bound and the new `reason` values; `Troubleshooting.md` has `no-route`, `no-backend` and `invalid-backend`; `CHANGELOG.md` *Unreleased* names the feature and the `no-route` default. |
+| RTE-58 | **D** (security review). Modifiers cannot touch pseudo-headers, `host`, framing, hop-by-hop or `x-mimic-*` fields (RTE-44, RTE-45, RTE-54); header growth bounded and applied once per request (RTE-44, RTE-50, RTE-54); `route` and `backend` label sets bounded (RTE-53); the retry budget and `retries` are the drawn backend's and a request never leaves its backend (RTE-51); sidecar answers do no I/O (RTE-49); no request or route value in logs, metrics or what discovery records from a route (RTE-50, RTE-53); the §11.1 limits of #448 are written. |
+| RTE-59 | Reserved (#448). |
 
 ## 13. Test strategy
 
