@@ -153,6 +153,19 @@ impl Tee {
     }
 }
 
+#[cfg(test)]
+impl ReqBody {
+    /// A body over `inner` with no observation (tests).
+    pub(crate) fn plain(inner: Incoming) -> ReqBody {
+        ReqBody {
+            inner,
+            sized: false,
+            count: Arc::default(),
+            tee: None,
+        }
+    }
+}
+
 impl Body for ReqBody {
     type Data = Bytes;
     type Error = hyper::Error;

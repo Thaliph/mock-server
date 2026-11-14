@@ -1111,9 +1111,10 @@ async fn rty_14_a_slow_body_refused_early_reaches_the_next_pod_whole() {
         let state = state_for(cluster_ip(), &[refusing.addr, ok.addr], |_| {});
         let f = fixture_mesh(cluster_ip(), &state, None).await;
         for _ in 0..6 {
-            if h2 {
-                let stream = tokio::net::TcpStream::connect(f.addr).await.unwrap();
-                let (mut sender, connection) = hyper::client::conn::http2::Builder::new(
+            let one = async {
+                if h2 {
+                    let stream = tokio::net::TcpStream::connect(f.addr).await.unwrap();
+                    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(
                     TokioExecutor::new(),
                 )
                 .handshake::<_, http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>>(
@@ -1121,31 +1122,38 @@ async fn rty_14_a_slow_body_refused_early_reaches_the_next_pod_whole() {
                 )
                 .await
                 .unwrap();
-                tokio::spawn(connection);
-                let request = Request::post("http://cart.shop.svc/p")
-                    .body(http_body_util::StreamBody::new(slow_chunks(body.clone())).boxed_unsync())
-                    .unwrap();
-                let response = sender.send_request(request).await.unwrap();
-                assert_eq!(response.status(), 200);
-                let _ = response.into_body().collect().await;
-            } else {
-                let mut client = H1Client::connect(f.addr).await;
-                client
+                    tokio::spawn(connection);
+                    let request = Request::post("http://cart.shop.svc/p")
+                        .body(
+                            http_body_util::StreamBody::new(slow_chunks(body.clone()))
+                                .boxed_unsync(),
+                        )
+                        .unwrap();
+                    let response = sender.send_request(request).await.unwrap();
+                    assert_eq!(response.status(), 200);
+                    let _ = response.into_body().collect().await;
+                } else {
+                    let mut client = H1Client::connect(f.addr).await;
+                    client
                     .send(b"POST /p HTTP/1.1\r\nHost: cart.shop.svc\r\nTransfer-Encoding: chunked\r\n\r\n")
                     .await;
-                for (n, chunk) in body.chunks(8192).enumerate() {
-                    if n == 1 {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    for (n, chunk) in body.chunks(8192).enumerate() {
+                        if n == 1 {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        let mut part = format!("{:x}\r\n", chunk.len()).into_bytes();
+                        part.extend_from_slice(chunk);
+                        part.extend_from_slice(b"\r\n");
+                        client.send(&part).await;
                     }
-                    let mut part = format!("{:x}\r\n", chunk.len()).into_bytes();
-                    part.extend_from_slice(chunk);
-                    part.extend_from_slice(b"\r\n");
-                    client.send(&part).await;
+                    client.send(b"0\r\n\r\n").await;
+                    let (head, _) = client.read().await.expect("an answer");
+                    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
                 }
-                client.send(b"0\r\n\r\n").await;
-                let (head, _) = client.read().await.expect("an answer");
-                assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-            }
+            };
+            tokio::time::timeout(Duration::from_secs(10), one)
+                .await
+                .expect("an answer, not a stalled upload");
         }
         assert!(
             retries(&f.metrics.encode(), "overloaded") >= 1.0,

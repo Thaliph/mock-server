@@ -2723,7 +2723,7 @@ no insignificant whitespace):
   | Failure of one try | Retried | `result` of the try, `reason` of the retry |
   |---|---|---|
   | Connect refused, connect timeout, failed TLS handshake or verification, a ninth TLS pool of a pod: nothing was written | every method | `connect_failed` |
-  | HTTP/2 `RST_STREAM` with `REFUSED_STREAM`, or a `GOAWAY` whose last-stream-id is below the stream | every method | `refused_stream` |
+  | HTTP/2 `RST_STREAM` with `REFUSED_STREAM`, or a `GOAWAY` whose last-stream-id is 0 (no stream was processed; `h2` does not say which streams a larger id leaves out, so any other `GOAWAY` follows the next row) | every method | `refused_stream` |
   | A **trusted refusal**: status `503`, exactly one `x-mimic-error` field, `overloaded` or `queue-timeout`, and exactly one `x-mimic-endpoint` field whose value parses as `<ipv4>:<port>` or `[<ipv6>]:<port>` and equals the pod address of this try | every method | `overloaded`, `queue_timeout` |
   | The connection closed or reset, or the stream reset with another code, after the request was written (in part) and before any byte of a response head | `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE` only (method tokens compared exactly) | `reset` |
   | Any other response (a `503` that is not a trusted refusal, an `x-mimic-error` of another value, any other status), any failure after the response head | never | `ok` (a response head came back) |
@@ -2741,10 +2741,20 @@ no insignificant whitespace):
   - **Trust needs a pod**: a try on the original destination (a fallback, a stale view, a view
     that turned `"mesh": false`) has no pod address: none of its answers is a trusted refusal and
     it is never retried (the request is sent there once, MSH-86).
+  - **Trust needs cleartext**: on a try over intercepted TLS (§5) no answer is a trusted
+    refusal: the callee's sidecar cannot strip `x-mimic-*` from what it does not decrypt, so the
+    fields cannot be bound to its own sidecar. A `503` with them is an answer of the app, passed
+    as received and never retried; connect failures (a failed verification included) are retried
+    as on cleartext. Trust is evaluated on the complete final response head only, never on a `1xx`
+    interim head, an unframed response or an incomplete head (those are `invalid-response`, or a
+    reset).
   - **When**: connect failures, refused streams and resets are retried at once; a trusted refusal
     after a delay drawn uniformly between 12.5 and 37.5 ms (25 ms ± 50 %). The body of a refused
     try is read and discarded up to 64 KiB, the connection then going back to its pool; a longer
-    one closes that connection.
+    one closes that connection; that read, at most 2 s, comes before the delay, so a slow refusal
+    body adds to it. A try that a later one replaced fails its request body with an error (an
+    HTTP/1 connection closes without ending a chunked body, an HTTP/2 stream is reset): the
+    pod it went to never sees a complete request that is cut.
   - **Bodies**: a request is retried only while every byte of its body read from the app is
     still held for replay, at most `MIMIC_MESH_RETRY_BUFFER` (64 KiB) per request and
     `MIMIC_MESH_RETRY_BUFFER_TOTAL` (8 MiB) for all the requests of the sidecar together. A request
@@ -5064,7 +5074,7 @@ it before M5).
 | RTY-06 | **U** (`mimic-core`, the head stripper). On a response head: every line whose field name starts with `x-mimic-` in any case is removed with its line end, the count of removed fields is returned, every other byte is unchanged (status line, other names' case, order, duplicates, CRLF and bare LF line ends, `obs-fold` lines of other fields); a head with no such field gives "unchanged" (no copy); a continuation line (`obs-fold`) of a removed field goes with it; stripping a stripped head changes nothing (`proptest`). |
 | RTY-07 | **F** (fuzz target `mesh_strip`, in the discovery fuzz job). The stripper on arbitrary bytes never panics; its output is the input with whole lines removed, never longer, and no line of a head that parses starts with `x-mimic-` (any case) after it. |
 | RTY-08 | **I** (connect failures). Three pods, one refusing connections: 300 requests (`POST` with a 1 KiB body and `GET`, HTTP/1 keep-alive and `h2c`) are all answered `200` by the two others, the body each pod receives equals the one sent, `mimic_mesh_retries_total{reason="connect_failed"}` equals `mimic_mesh_attempts_total{result="connect_failed"}` and is at least 1, and no fallback is counted. Five pods all refusing and the ClusterIP answering: each request is answered by the ClusterIP after exactly 3 pod connects (the access line has `attempts` 4, `upstream` the ClusterIP), `mimic_mesh_fallbacks_total` counts 1 per request. The ClusterIP refusing too: `503` `x-mimic-error: connect-failed` after 4 tries, `mimic_mesh_retries_skipped_total{reason="exhausted"}` 1. |
-| RTY-09 | **I** (HTTP/2 refusals). An `h2c` pod that resets every stream with `REFUSED_STREAM`, and one that sends `GOAWAY` with a last-stream-id below the stream: a `POST` is answered `200` by another pod with the same body, counted `result="refused_stream"`; with every pod refusing, the app's stream is reset with `REFUSED_STREAM` after 4 tries. A pod that resets a stream with `INTERNAL_ERROR` before any head: a `GET` is answered by another pod, a `POST` is not sent again (the app's stream is reset, `mimic_mesh_retries_skipped_total{reason="method"}` 1). |
+| RTY-09 | **I** (HTTP/2 refusals). An `h2c` pod that resets every stream with `REFUSED_STREAM`, and one that sends `GOAWAY` with a last-stream-id of 0: a `POST` is answered `200` by another pod with the same body, counted `result="refused_stream"`; with every pod refusing, the app's stream is reset with `REFUSED_STREAM` after 4 tries. A pod that resets a stream with `INTERNAL_ERROR` before any head: a `GET` is answered by another pod, a `POST` is not sent again (the app's stream is reset, `mimic_mesh_retries_skipped_total{reason="method"}` 1). A `GOAWAY` whose last-stream-id covers the stream (here 1), followed by the pod closing: a `POST` is not retried (`mimic_mesh_retries_skipped_total{reason="method"}` 1, no `refused_stream`). |
 | RTY-10 | **I** (resets, HTTP/1). A pod that reads a request and closes (or resets) before answering: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` and `DELETE` are answered by another pod, the first pod having seen each once (`result="reset"`); a `POST` and a `PATCH` are not sent again (MSH-59: the app's connection closed without an answer). A pod that writes a response head then closes: a `GET` is not sent again and the app gets the partial response and the close, as in M1. |
 | RTY-11 | **I** (app statuses). A pod answering `503` without `x-mimic-error`, `503` with `x-mimic-error: connect-failed`, `500` and `502`: each is passed to the app as received (status, fields, body), the pod saw it once, `mimic_mesh_retries_total` stays 0 and the access line has `attempts` 1. |
 | RTY-12 | **I** (trusted refusals). With one refusing pod of three: every `POST` is answered `200` by another pod with the same body, the refusing pod's answer never reaches the app, the second try starts at least 12 ms after the refusal; counted `result="overloaded"` and `reason="overloaded"` (and `queue_timeout` for a pod answering `queue-timeout`). With all three refusing: 4 tries (one pod twice), the app gets the last refusal as received, with its `x-mimic-error` and `x-mimic-endpoint`; the access line has `status` 503 and `attempts` 4; `mimic_mesh_requests_total{reason="overloaded"}` counts it; `GET /discovery` records nothing for it and `result="synthetic"` counts it. |

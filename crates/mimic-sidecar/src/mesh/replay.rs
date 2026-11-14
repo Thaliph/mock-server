@@ -238,7 +238,7 @@ impl Source {
 
 impl Drop for Source {
     /// A request that ends before its answer (the app left) frees the bytes held at once, and
-    /// the tries still pending end their bodies.
+    /// the tries still pending fail their bodies.
     fn drop(&mut self) {
         let mut shared = lock(&self.shared);
         if !shared.delivered {
@@ -260,7 +260,7 @@ pub(crate) struct Attempt {
 }
 
 impl Attempt {
-    /// A later try took the body, or the request is over: this one ends and reads nothing.
+    /// A later try took the body, or the request is over: this one fails and reads nothing.
     fn stale(&self, shared: &Shared) -> bool {
         shared.closed || shared.generation != self.generation
     }
@@ -268,17 +268,22 @@ impl Attempt {
 
 impl Body for Attempt {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = std::io::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let this = self.get_mut();
         let mut shared = lock(&this.shared);
         if this.stale(&shared) {
+            // An error, never the end of the body: the connection of this try must not be able
+            // to complete a request that is cut (`hyper` closes an HTTP/1 connection, resets an
+            // HTTP/2 stream).
             this.queue.clear();
-            return Poll::Ready(None);
+            return Poll::Ready(Some(Err(std::io::Error::other(
+                "the request went to another pod",
+            ))));
         }
         if let Some(chunk) = this.queue.pop_front() {
             return Poll::Ready(Some(Ok(Frame::data(chunk))));
@@ -316,14 +321,15 @@ impl Body for Attempt {
                 this.trailed = true;
                 Poll::Ready(None)
             }
-            other => other,
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(std::io::Error::other(e)))),
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn is_end_stream(&self) -> bool {
         let shared = lock(&self.shared);
         if self.stale(&shared) {
-            return true;
+            return false;
         }
         if !self.queue.is_empty() {
             return false;
@@ -426,5 +432,82 @@ mod tests {
     fn rty_14_a_body_with_no_chunk_is_held() {
         let (budget, _) = budget(1 << 20);
         assert!(budget.replay(64 * 1024).is_held());
+    }
+
+    /// A request body arriving from a connection: the request `hyper` serves for it.
+    async fn incoming(
+        client: &mut (impl tokio::io::AsyncWrite + Unpin),
+        server: tokio::io::DuplexStream,
+    ) -> hyper::body::Incoming {
+        use tokio::io::AsyncWriteExt;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Mutex::new(Some(tx));
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(move |req| {
+                let tx = tx.lock().unwrap().take();
+                async move {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(req);
+                    }
+                    std::future::pending::<
+                        Result<
+                            hyper::Response<http_body_util::Empty<Bytes>>,
+                            std::convert::Infallible,
+                        >,
+                    >()
+                    .await
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(server), service)
+                .await;
+        });
+        client
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+            )
+            .await
+            .unwrap();
+        rx.await.unwrap().into_body()
+    }
+
+    async fn next(body: &mut Attempt) -> Option<Result<Frame<Bytes>, std::io::Error>> {
+        std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
+    }
+
+    #[tokio::test]
+    async fn rty_14_a_superseded_try_reads_no_more_of_the_body() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let incoming = incoming(&mut client, server).await;
+        let (budget, _) = budget(1 << 20);
+        let source = Source::new(ReqBody::plain(incoming), budget.replay(64 * 1024));
+        let head = Request::new(()).into_parts().0;
+        let mut first = source.request(&head).into_body();
+        let got = next(&mut first).await.unwrap().unwrap();
+        assert_eq!(got.into_data().ok(), Some(Bytes::from_static(b"abc")));
+        // The first try waits for more, and a second try takes over the body.
+        assert!(
+            futures::poll!(std::pin::pin!(next(&mut first))).is_pending(),
+            "waiting for the app"
+        );
+        let mut second = source.request(&head).into_body();
+        client.write_all(b"3\r\ndef\r\n").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let old = next(&mut first).await;
+        assert!(
+            matches!(old, Some(Err(_))),
+            "the first try fails, it does not read"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), next(&mut second))
+                .await
+                .expect("a chunk, not a hole")
+                .unwrap()
+                .unwrap();
+            seen.extend_from_slice(&frame.into_data().unwrap());
+        }
+        assert_eq!(seen, b"abcdef");
     }
 }
