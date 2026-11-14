@@ -256,7 +256,13 @@ fn rty_46_retries_and_the_retry_budget_convert_and_absent_fields_are_none() {
 #[test]
 fn rty_46_a_window_that_does_not_parse_makes_the_config_invalid_and_never_panics() {
     let target = json!([{"group": "", "kind": "Service", "name": "cart"}]);
-    for window in [json!("soon"), json!("10"), json!(10), json!("-1s"), json!("1e1s")] {
+    for window in [
+        json!("soon"),
+        json!("10"),
+        json!(10),
+        json!("-1s"),
+        json!("1e1s"),
+    ] {
         let c = service_config(json!({"targetRefs": target, "retryBudget": {"window": window}}));
         assert!(
             validate(&c).is_err(),

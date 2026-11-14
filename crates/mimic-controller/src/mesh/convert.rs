@@ -11,8 +11,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    Config, Destination, Endpoint, EndpointSlice, GrantFrom, GrantTo, ReferenceGrant, Service,
-    ServicePort, SlicePort, Target, TargetKind, TargetPort,
+    Config, Destination, Endpoint, EndpointSlice, GrantFrom, GrantTo, ReferenceGrant,
+    RetryBudgetSpec, Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
 };
 use serde_json::Value;
 
@@ -132,6 +132,14 @@ fn seconds(value: &str) -> Option<u32> {
     value.strip_suffix('s')?.parse().ok()
 }
 
+/// An integer field the object sets: a value that is not a `u32` (a string, a negative
+/// number) becomes `u32::MAX`, over every bound, so that `validate` refuses the object.
+fn bounded(value: &Value) -> u32 {
+    value
+        .as_u64()
+        .map_or(u32::MAX, |n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 pub fn config(object: &DynamicObject) -> Option<(Key, Config)> {
     let key = key(&object.metadata)?;
     let spec = object.data.get("spec").unwrap_or(&Value::Null);
@@ -184,6 +192,15 @@ pub fn config(object: &DynamicObject) -> Option<(Key, Config)> {
             .and_then(|l| l.get("slowStart"))
             .and_then(Value::as_str)
             .and_then(seconds),
+        retries: spec.get("retries").map(bounded),
+        retry_budget: spec.get("retryBudget").map(|b| RetryBudgetSpec {
+            percent: b.get("percent").map(bounded),
+            min_per_second: b.get("minPerSecond").map(bounded),
+            // Not `<n>s`: 0, which `validate` refuses (RTY-46).
+            window_seconds: b
+                .get("window")
+                .map(|w| w.as_str().and_then(seconds).unwrap_or(0)),
+        }),
     };
     Some((key, config))
 }

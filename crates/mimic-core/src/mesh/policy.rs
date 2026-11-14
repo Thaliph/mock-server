@@ -11,6 +11,22 @@ use super::input::{Config, MIMIC_GROUP, ReferenceGrant, Snapshot, TargetKind};
 pub const DEFAULT_SLOW_START_SECS: u32 = 30;
 /// Largest `loadBalancer.slowStart`, in seconds.
 pub const MAX_SLOW_START_SECS: u32 = 3600;
+/// `retries` when no `MimicConfig` sets it.
+pub const DEFAULT_RETRIES: u32 = 3;
+/// Largest `retries`.
+pub const MAX_RETRIES: u32 = 10;
+/// `retryBudget.percent` when no `MimicConfig` sets it.
+pub const DEFAULT_RETRY_PERCENT: u32 = 20;
+/// Largest `retryBudget.percent`.
+pub const MAX_RETRY_PERCENT: u32 = 100;
+/// `retryBudget.minPerSecond` when no `MimicConfig` sets it.
+pub const DEFAULT_RETRY_MIN_PER_SECOND: u32 = 10;
+/// Largest `retryBudget.minPerSecond`.
+pub const MAX_RETRY_MIN_PER_SECOND: u32 = 1000;
+/// `retryBudget.window` when no `MimicConfig` sets it, in seconds.
+pub const DEFAULT_RETRY_WINDOW_SECS: u32 = 10;
+/// Largest `retryBudget.window`, in seconds (the smallest is 1).
+pub const MAX_RETRY_WINDOW_SECS: u32 = 60;
 pub const MAX_TARGETS: usize = 16;
 pub const MAX_DESTINATIONS: usize = 256;
 
@@ -20,11 +36,31 @@ pub struct LoadBalancer {
     pub slow_start_seconds: u32,
 }
 
-/// The effective policy of a Service, as the view carries it.
+/// Field order is alphabetical: the JSON is canonical (sorted keys).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RetryBudget {
+    pub min_per_second: u32,
+    pub percent: u32,
+    pub window_seconds: u32,
+}
+
+/// The effective policy of a Service, as the view carries it. Field order is alphabetical.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Policy {
     pub load_balancer: LoadBalancer,
+    pub retries: u32,
+    pub retry_budget: RetryBudget,
+}
+
+impl RetryBudget {
+    /// Whether every field is inside its bound (the reader of a view uses it, MSH-12).
+    pub fn in_bounds(&self) -> bool {
+        self.percent <= MAX_RETRY_PERCENT
+            && self.min_per_second <= MAX_RETRY_MIN_PER_SECOND
+            && (1..=MAX_RETRY_WINDOW_SECS).contains(&self.window_seconds)
+    }
 }
 
 /// The policy of a Service no `MimicConfig` targets.
@@ -33,16 +69,35 @@ pub fn defaults() -> Policy {
         load_balancer: LoadBalancer {
             slow_start_seconds: DEFAULT_SLOW_START_SECS,
         },
+        retries: DEFAULT_RETRIES,
+        retry_budget: RetryBudget {
+            min_per_second: DEFAULT_RETRY_MIN_PER_SECOND,
+            percent: DEFAULT_RETRY_PERCENT,
+            window_seconds: DEFAULT_RETRY_WINDOW_SECS,
+        },
     }
 }
 
 /// The effective policy of a Service from its winning `MimicConfig`, if any.
 pub fn effective(winner: Option<&Config>) -> Policy {
+    let spec = winner.and_then(|c| c.retry_budget.as_ref());
     Policy {
         load_balancer: LoadBalancer {
             slow_start_seconds: winner
                 .and_then(|c| c.slow_start)
                 .unwrap_or(DEFAULT_SLOW_START_SECS),
+        },
+        retries: winner.and_then(|c| c.retries).unwrap_or(DEFAULT_RETRIES),
+        retry_budget: RetryBudget {
+            min_per_second: spec
+                .and_then(|b| b.min_per_second)
+                .unwrap_or(DEFAULT_RETRY_MIN_PER_SECOND),
+            percent: spec
+                .and_then(|b| b.percent)
+                .unwrap_or(DEFAULT_RETRY_PERCENT),
+            window_seconds: spec
+                .and_then(|b| b.window_seconds)
+                .unwrap_or(DEFAULT_RETRY_WINDOW_SECS),
         },
     }
 }
@@ -81,6 +136,38 @@ pub fn validate(config: &Config) -> Result<(), String> {
         }
         if secs > MAX_SLOW_START_SECS {
             return Err(format!("slowStart is over {MAX_SLOW_START_SECS}s"));
+        }
+    }
+    if let Some(retries) = config.retries {
+        if !has(TargetKind::Service) {
+            return Err("retries fit a Service target only".into());
+        }
+        if retries > MAX_RETRIES {
+            return Err(format!("retries is over {MAX_RETRIES}"));
+        }
+    }
+    if let Some(budget) = &config.retry_budget {
+        if !has(TargetKind::Service) {
+            return Err("retryBudget fits a Service target only".into());
+        }
+        if budget.percent.is_some_and(|p| p > MAX_RETRY_PERCENT) {
+            return Err(format!("retryBudget.percent is over {MAX_RETRY_PERCENT}"));
+        }
+        if budget
+            .min_per_second
+            .is_some_and(|m| m > MAX_RETRY_MIN_PER_SECOND)
+        {
+            return Err(format!(
+                "retryBudget.minPerSecond is over {MAX_RETRY_MIN_PER_SECOND}"
+            ));
+        }
+        if budget
+            .window_seconds
+            .is_some_and(|w| !(1..=MAX_RETRY_WINDOW_SECS).contains(&w))
+        {
+            return Err(format!(
+                "retryBudget.window is not 1s to {MAX_RETRY_WINDOW_SECS}s"
+            ));
         }
     }
     Ok(())

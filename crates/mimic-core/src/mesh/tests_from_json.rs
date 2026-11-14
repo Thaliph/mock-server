@@ -193,7 +193,10 @@ fn rty_45_from_json_reads_back_a_policy_with_retries_and_refuses_the_rest() {
     };
     bad(r#""retryBudget":{"#, r#""retryBudget":{"extra":1,"#);
     bad(r#""retries":3,"#, "");
-    bad(r#","retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}"#, "");
+    bad(
+        r#","retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}"#,
+        "",
+    );
     bad(r#""minPerSecond":10,"#, "");
     bad(r#""percent":20,"#, "");
     bad(r#""windowSeconds":10"#, r#""windowSeconds":10,"x":1"#);

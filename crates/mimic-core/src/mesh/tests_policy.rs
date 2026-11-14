@@ -332,7 +332,14 @@ fn rty_44_a_consented_service_carries_the_retries_of_its_own_namespace() {
     s.grants = Some(vec![grant("risk", "shop")]);
     s.configs = vec![
         dep_cfg("shop", "d", 1, "cart", &["risk/scoring"]),
-        retry_cfg("risk", "p", 1, "scoring", Some(7), Some(budget(Some(5), None, None))),
+        retry_cfg(
+            "risk",
+            "p",
+            1,
+            "scoring",
+            Some(7),
+            Some(budget(Some(5), None, None)),
+        ),
         retry_cfg("shop", "q", 1, "scoring", Some(9), None), // shop/scoring does not exist
     ];
     assert_eq!(
@@ -371,7 +378,11 @@ fn rty_44_validate_refuses_retries_out_of_bounds_and_on_a_deployment() {
     let err = validate(&svc(Some(11), None)).unwrap_err();
     assert!(err.contains("retries"), "{err}");
     let dep = |retries, b| on(TargetKind::Deployment, retries, b);
-    assert!(validate(&dep(Some(3), None)).unwrap_err().contains("retries"));
+    assert!(
+        validate(&dep(Some(3), None))
+            .unwrap_err()
+            .contains("retries")
+    );
     assert!(
         validate(&dep(None, Some(budget(None, None, None))))
             .unwrap_err()
@@ -384,7 +395,10 @@ fn rty_44_validate_refuses_retries_out_of_bounds_and_on_a_deployment() {
             "shop",
             "x",
             1,
-            &[(TargetKind::Deployment, "cart"), (TargetKind::Service, "cart")],
+            &[
+                (TargetKind::Deployment, "cart"),
+                (TargetKind::Service, "cart"),
+            ],
         )
     };
     assert!(validate(&both).is_ok());

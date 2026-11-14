@@ -202,7 +202,7 @@ pub fn view_json(
         .iter()
         .map(|(key, ip, port)| {
             format!(
-                r#""{key}":{{"endpoints":{{"{port}":[{{"ip":"10.1.0.7","port":8080,"ready":true}}]}},"generations":{{"endpointslice/{key}-x@u1":1}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":30}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#
+                r#""{key}":{{"endpoints":{{"{port}":[{{"ip":"10.1.0.7","port":8080,"ready":true}}]}},"generations":{{"endpointslice/{key}-x@u1":1}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":30}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#
             )
         })
         .collect();

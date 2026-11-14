@@ -227,7 +227,7 @@ pub fn view_on(
         .collect();
     let services = if mesh {
         format!(
-            r#""shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":{slow_start_seconds}}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#,
+            r#""shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":{slow_start_seconds}}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#,
             endpoints.join(",")
         )
     } else {

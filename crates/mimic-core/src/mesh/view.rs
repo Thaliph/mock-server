@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::input::{EndpointSlice, Service, Snapshot, TargetKind, TargetPort};
-use super::policy::{MAX_SLOW_START_SECS, Policy, Winners, consents, effective};
+use super::policy::{MAX_RETRIES, MAX_SLOW_START_SECS, Policy, Winners, consents, effective};
 use crate::Mode;
 
 /// The view format this code writes and reads.
@@ -117,6 +117,12 @@ impl View {
             }
             if service.policy.load_balancer.slow_start_seconds > MAX_SLOW_START_SECS {
                 return Err(format!("slowStartSeconds over {MAX_SLOW_START_SECS}"));
+            }
+            if service.policy.retries > MAX_RETRIES {
+                return Err(format!("retries over {MAX_RETRIES}"));
+            }
+            if !service.policy.retry_budget.in_bounds() {
+                return Err("retryBudget out of bounds".into());
             }
         }
         Ok(view)

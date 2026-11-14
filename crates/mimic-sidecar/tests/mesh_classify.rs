@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 fn view_with(port: u16, mesh: bool) -> View {
     let services = if mesh {
         format!(
-            r#""shop/echo":{{"endpoints":{{}},"generations":{{}},"ips":["127.0.0.1"],"policy":{{"loadBalancer":{{"slowStartSeconds":30}}}},"ports":{{"{port}":{{"targetPort":{port}}}}}}}"#
+            r#""shop/echo":{{"endpoints":{{}},"generations":{{}},"ips":["127.0.0.1"],"policy":{{"loadBalancer":{{"slowStartSeconds":30}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":{port}}}}}}}"#
         )
     } else {
         String::new()

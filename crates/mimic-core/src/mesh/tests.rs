@@ -543,7 +543,11 @@ fn rty_45_the_policy_holds_retries_and_every_budget_field_and_a_change_moves_the
     c.retries = Some(1);
     s.configs = vec![c.clone()];
     let first = view_of(&s, "shop", "cart");
-    assert!(first.json.contains(r#""retries":1,"retryBudget":{"minPerSecond":10"#));
+    assert!(
+        first
+            .json
+            .contains(r#""retries":1,"retryBudget":{"minPerSecond":10"#)
+    );
     assert_ne!(first.etag, base.etag);
     assert_eq!(
         first.view.services["shop/cart"].generations["mimicconfig/shop/c@uid-c"],
