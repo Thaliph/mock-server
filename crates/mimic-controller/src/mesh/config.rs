@@ -7,6 +7,9 @@ use mimic_runtime::config::{ConfigError, Env};
 
 use crate::push_config::{GIB, KIB, MIB, number, size, usize_of};
 
+/// The least time between two `200` views answered to one pod (spec §7.2).
+pub const MIN_VIEW_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
 pub struct MeshConfig {
     /// `MIMIC_MESH`: `off` serves no view and starts no watch.
@@ -17,6 +20,8 @@ pub struct MeshConfig {
     pub watch_timeout: Duration,
     /// `MIMIC_MESH_DEBOUNCE`.
     pub debounce: Duration,
+    /// `MIN_VIEW_INTERVAL` (spec §7.2): not an environment variable, only tests change it.
+    pub min_view_interval: Duration,
     /// `MIMIC_MESH_VIEW_CACHE_BYTES`.
     pub cache_bytes: u64,
     /// `MIMIC_SIDECAR_API_MAX_WATCHES`.
@@ -40,6 +45,7 @@ impl Default for MeshConfig {
             cluster: "local".to_string(),
             watch_timeout: Duration::from_secs(30),
             debounce: Duration::from_millis(100),
+            min_view_interval: MIN_VIEW_INTERVAL,
             cache_bytes: 64 * MIB,
             max_watches: 10_000,
             max_watches_per_pod: 2,
@@ -100,6 +106,7 @@ impl MeshConfig {
                 Duration::from_millis(10),
                 Duration::from_secs(1),
             )?,
+            min_view_interval: defaults.min_view_interval,
             cache_bytes: size(
                 env,
                 "MIMIC_MESH_VIEW_CACHE_BYTES",
