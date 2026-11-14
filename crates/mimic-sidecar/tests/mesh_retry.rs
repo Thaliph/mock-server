@@ -370,9 +370,9 @@ async fn rty_08_five_refusing_pods_end_on_the_cluster_ip_after_three_pod_connect
         4.0,
         "fallbacks"
     );
-    for line in logs.access_exactly(4).await {
-        assert_eq!(line["attempts"], 4, "{line}");
-        assert_eq!(line["upstream"], cluster.addr.to_string(), "{line}");
+    for entry in logs.access_exactly(4).await {
+        assert_eq!(entry["attempts"], 4, "{entry}");
+        assert_eq!(entry["upstream"], cluster.addr.to_string(), "{entry}");
     }
 }
 
@@ -611,8 +611,8 @@ async fn rty_11_answers_of_the_app_are_passed_as_received_and_never_retried() {
             "{scrape}"
         );
     }
-    for line in logs.access_exactly(4).await {
-        assert_eq!(line["attempts"], 1, "{line}");
+    for entry in logs.access_exactly(4).await {
+        assert_eq!(entry["attempts"], 1, "{entry}");
     }
 }
 
@@ -1001,7 +1001,7 @@ async fn rty_20_the_metrics_and_the_access_line_follow_the_tries() {
             "{name}"
         );
         assert!(
-            !text
+            !scrape
                 .lines()
                 .any(|l| l.starts_with(name) && l.contains("shop/cart:80")),
             "{name} series left:\n{scrape}"
