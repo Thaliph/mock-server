@@ -317,3 +317,55 @@ fn msh_71_connect_timeout_default_and_range() {
         assert!(error.contains("MIMIC_MESH_CONNECT_TIMEOUT"), "{error}");
     }
 }
+
+#[test]
+fn rty_05_defaults() {
+    let config = config(&[]).unwrap();
+    assert_eq!(config.retry_buffer, 64 * 1024);
+    assert_eq!(config.retry_buffer_total, 8 * 1024 * 1024);
+    assert_eq!(config.retries, 3);
+    assert_eq!(config.refusal_delay, Duration::from_millis(25));
+}
+
+#[test]
+fn rty_05_values_are_read() {
+    let config = config(&[
+        ("MIMIC_MESH_RETRY_BUFFER", "1Mi"),
+        ("MIMIC_MESH_RETRY_BUFFER_TOTAL", "64Mi"),
+    ])
+    .unwrap();
+    assert_eq!(config.retry_buffer, 1 << 20);
+    assert_eq!(config.retry_buffer_total, 64 << 20);
+    let config = self::config(&[
+        ("MIMIC_MESH_RETRY_BUFFER", "0"),
+        ("MIMIC_MESH_RETRY_BUFFER_TOTAL", "1Mi"),
+    ])
+    .unwrap();
+    assert_eq!(config.retry_buffer, 0, "0 is a valid buffer");
+    assert_eq!(config.retry_buffer_total, 1 << 20);
+    let config = self::config(&[
+        ("MIMIC_MESH_RETRY_BUFFER", "1024Ki"),
+        ("MIMIC_MESH_RETRY_BUFFER_TOTAL", "2048Ki"),
+    ])
+    .unwrap();
+    assert_eq!(config.retry_buffer, 1 << 20);
+    assert_eq!(config.retry_buffer_total, 2 << 20);
+}
+
+#[test]
+fn rty_05_invalid_values_are_refused() {
+    for (var, value) in [
+        ("MIMIC_MESH_RETRY_BUFFER", "1025Ki"),
+        ("MIMIC_MESH_RETRY_BUFFER", "2Mi"),
+        ("MIMIC_MESH_RETRY_BUFFER", "lots"),
+        ("MIMIC_MESH_RETRY_BUFFER", "4M"),
+        ("MIMIC_MESH_RETRY_BUFFER", "-1"),
+        ("MIMIC_MESH_RETRY_BUFFER_TOTAL", "1023Ki"),
+        ("MIMIC_MESH_RETRY_BUFFER_TOTAL", "0"),
+        ("MIMIC_MESH_RETRY_BUFFER_TOTAL", "65Mi"),
+        ("MIMIC_MESH_RETRY_BUFFER_TOTAL", "lots"),
+    ] {
+        let error = config(&[(var, value)]).expect_err(&format!("{var}={value}"));
+        assert!(error.contains(var), "{error}");
+    }
+}

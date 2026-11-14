@@ -8,6 +8,7 @@ mod follow;
 mod gate;
 mod metrics;
 mod pool;
+pub mod replay;
 mod router;
 mod serve;
 mod store;
@@ -86,6 +87,16 @@ pub struct MeshConfig {
     pub max_endpoint_labels: usize,
     /// `MIMIC_MESH_OPAQUE_PORTS`: in-scope connections to these ports keep the byte relay.
     pub opaque_ports: std::collections::BTreeSet<u16>,
+    /// `MIMIC_MESH_RETRY_BUFFER`: request body bytes held per request so that it can be retried.
+    pub retry_buffer: usize,
+    /// `MIMIC_MESH_RETRY_BUFFER_TOTAL`: the same for all the requests of the sidecar together.
+    pub retry_buffer_total: usize,
+    /// Retries after the first try of a request (spec §7.9 "Retries"); a field, not a variable
+    /// (`MimicConfig.retries` sets it from #446).
+    pub retries: u32,
+    /// The middle of the delay before a retry after a trusted refusal (±50 %); a field, not a
+    /// variable: tests shorten it.
+    pub refusal_delay: Duration,
     /// A fixed seed for the random draws (tests); `None`: seeded from the system.
     pub seed: Option<u64>,
 }
@@ -105,6 +116,10 @@ impl Default for MeshConfig {
             avoid_failed_for: Duration::from_secs(5),
             max_endpoint_labels: 256,
             opaque_ports: DEFAULT_OPAQUE_PORTS.into_iter().collect(),
+            retry_buffer: 64 * KIB,
+            retry_buffer_total: 8 * MIB,
+            retries: 3,
+            refusal_delay: Duration::from_millis(25),
             seed: None,
         }
     }
