@@ -1343,8 +1343,18 @@ the recorder keeps the first message of each side:
   `If-None-Match` holds the current `ETag` the request is held until the view changes or
   `MIMIC_MESH_WATCH_TIMEOUT` passes (`304` with the `ETag`); otherwise the answer is the `200`
   view at once. Changes are coalesced: `MIMIC_MESH_DEBOUNCE` after a quiet period, doubled up to
-  1 s while changes keep arriving, so a held request is answered within the debounce after a change
-  and a sidecar receives at most about one view per second. The body is gzip-compressed when
+  1 s while changes keep arriving, so a held request is answered within the debounce after a change.
+  **Pacing** (#441): a sidecar receives at most one `200` view per second. The controller keeps, per
+  pod (namespace and pod name from the `TokenReview`), the time of the last `200` view it answered
+  (`MIN_VIEW_INTERVAL`, 1 s, not an environment variable); a held request whose pod was answered less than
+  `MIN_VIEW_INTERVAL` ago is not answered with a changed view before that interval has passed since
+  that answer, and the answer then carries the latest view (changes in between are coalesced). The
+  time per pod, not per `ETag` chain, because the pod is the unit of the budget and a sidecar's
+  requests (it holds one, and may restart a pull after a `304` or a reconnect) carry no common
+  identity but the pod. Only held requests wait: a request with no `If-None-Match`, or with an
+  `ETag` that is not the current one, is answered at once (startup and catch-up are not slowed), and
+  the `304` on the watch timeout is not delayed. The entries are dropped once older than the
+  interval, so the memory is bounded by the pods answered in the last second. The body is gzip-compressed when
   `Accept-Encoding` lists `gzip` (the `ETag` is that of the uncompressed bytes). Held requests have
   a budget of their own, `MIMIC_SIDECAR_API_MAX_WATCHES`: a request that would be held when it is
   spent gets `503` with `Retry-After: 1`; the budget is shared out so that one caller cannot spend it
@@ -4908,7 +4918,7 @@ is M1; here `none` only stops recording, intercepting and shipping.
 
 Design: `docs/design/mimic-mesh.md` §3.4, §4.2, §4.3, §6, §16. Spec text: §7 (`MimicConfig`),
 §7.2 (the route), §7.9 (the view), §10.2. Levels as in §12.2, plus **M** (main session). MSH-01 to MSH-17 are #440,
-MSH-18 to MSH-30 and MSH-80 to MSH-84 are #441 (the watches, the route, the chart, the watch isolation), MSH-31 to MSH-42 are #442 (the sidecar follows the view, §7.9), MSH-43 and after #443 (load balancing, §7.9, §4.1).
+MSH-18 to MSH-30, MSH-80 to MSH-84 and MSH-88 are #441 (the watches, the route, the chart, the watch isolation, the view pacing), MSH-31 to MSH-42 are #442 (the sidecar follows the view, §7.9), MSH-43 and after #443 (load balancing, §7.9, §4.1).
 
 | ID | Criterion |
 |---|---|
@@ -5011,6 +5021,14 @@ MSH-18 to MSH-30 and MSH-80 to MSH-84 are #441 (the watches, the route, the char
 | MSH-82 | **I.** A held request whose client goes away (the request future is dropped) releases its share of the budget, of its pod and of its namespace: the gauge is 0 and the pod holds its 2 again. |
 | MSH-83 | **U** (controller configuration). Unset: `MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD` 2, `MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT` 25; exit 2 (FND-01) for a per-pod cap of 0 or 101 and a percentage of 0 or 101. |
 | MSH-84 | **E** (chart, `scripts/check-chart.sh`). With `mesh.enabled` and `loadTest.enabled` the ClusterRole has one rule on `endpointslices`. |
+
+#### M1 view pacing (#441)
+
+Measured on kind (`scripts/bench-controller.sh`, rollout of 50 pods among 200 sidecars): up to 1.54 views/s per sidecar against the design §14 budget of 1; the debounce alone lets bursts through and restarts at 100 ms after a quiet gap. The budget is checked on the sidecars present during the whole rollout.
+
+| ID | Criterion |
+|---|---|
+| MSH-88 | **I** (real clock, `MIN_VIEW_INTERVAL` 1 s, debounce 50 ms). A pod gets a `200` view; its next request, with that `ETag`, is held; a change 100 ms later does not answer it before 1 s has passed since the first answer, then it is answered `200` with the latest view (a second change in between is in that body, one answer in all); a request without `If-None-Match` or with another `ETag` is answered at once, also right after a `200`; a held request of another pod is not delayed by the first pod's answer; a pod answered more than 1 s ago is answered within the debounce plus 500 ms (MSH-21); the `304` on the watch timeout is not delayed. |
 
 #### M1 failure modes (#444)
 
