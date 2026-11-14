@@ -196,7 +196,11 @@ async fn tls_pod(name: &str, ca: &Authority, sans: Vec<SanType>, alpn: &[&[u8]])
                             return;
                         }
                         // A pod named `refuser` refuses as an overloaded sidecar does.
-                        let answer = if name == "refuser" {
+                        let answer = if name == "apprefuser" {
+                            format!(
+                                "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: connect-failed\r\nx-mimic-endpoint: {own}\r\nx-mimic-origin: inbound; pod=x\r\ncontent-length: 0\r\n\r\n"
+                            )
+                        } else if name == "refuser" {
                             format!(
                                 "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nx-mimic-endpoint: {own}\r\ncontent-length: 0\r\n\r\n"
                             )
@@ -672,6 +676,33 @@ async fn rty_17_a_refusal_over_intercepted_tls_is_not_trusted() {
         refuser.requests.load(Ordering::SeqCst),
         seen,
         "every request the refuser saw was answered by it, none retried"
+    );
+    let scrape = rig.metrics.encode();
+    assert_eq!(
+        counter(&scrape, "mimic_mesh_retries_total"),
+        0.0,
+        "{scrape}"
+    );
+}
+
+#[tokio::test]
+async fn rty_37_an_app_refusal_over_intercepted_tls_is_not_trusted() {
+    let _logs = capture_logs();
+    let (good_ca, good_root) = authority("good");
+    let refuser = tls_pod("apprefuser", &good_ca, names(&[NAME]), &[]).await;
+    let other = tls_pod("other", &good_ca, names(&[NAME]), &[]).await;
+    let rig = rig(&good_root, cluster(), &[refuser.addr, other.addr]).await;
+    let mut seen = 0;
+    for _ in 0..10 {
+        let mut tls = client(&rig, service(), &[]).await;
+        let (status, _) = get(&mut tls).await;
+        seen += usize::from(status == "HTTP/1.1 503 Service Unavailable");
+    }
+    assert!(seen >= 1, "the answer reached the app");
+    assert_eq!(
+        refuser.requests.load(Ordering::SeqCst),
+        seen,
+        "none retried"
     );
     let scrape = rig.metrics.encode();
     assert_eq!(

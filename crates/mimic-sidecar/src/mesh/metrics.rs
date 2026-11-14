@@ -26,13 +26,14 @@ const OTHER: &str = "other";
 
 /// Every `result` of a try and `reason` of a retry or a skipped one, to remove the series of a
 /// backend that left the view.
-const RESULTS: [Outcome; 6] = [
+const RESULTS: [Outcome; 7] = [
     Outcome::Ok,
     Outcome::ConnectFailed,
     Outcome::RefusedStream,
     Outcome::Reset,
     Outcome::Overloaded,
     Outcome::QueueTimeout,
+    Outcome::AppRefused,
 ];
 const SKIPS: [&str; 3] = ["exhausted", "method", "buffer"];
 
@@ -129,6 +130,8 @@ pub(crate) struct MeshMetrics {
     stripped: Family<Vec<(String, String)>, Counter>,
     /// Same as `stripped`: inbound connections closed on a response the codec cannot frame.
     unframed: Family<Vec<(String, String)>, Counter>,
+    /// Same as `stripped`: inbound connections answered `503` `connect-failed`.
+    inbound_refusals: Family<Vec<(String, String)>, Counter>,
     slots: Mutex<Slots>,
     /// By backend label.
     series: Mutex<BTreeMap<String, Series>>,
@@ -149,6 +152,7 @@ impl MeshMetrics {
             skipped: Family::default(),
             stripped: Family::default(),
             unframed: Family::default(),
+            inbound_refusals: Family::default(),
             slots: Mutex::new(Slots::default()),
             series: Mutex::new(BTreeMap::new()),
             max_labels,
@@ -212,6 +216,16 @@ impl MeshMetrics {
             "Inbound connections closed on a response of the app the codec cannot frame",
             self.unframed.clone(),
         );
+        registry.register(
+            "mesh_inbound_refusals",
+            "Inbound connections answered 503 connect-failed because the app refused the connection",
+            self.inbound_refusals.clone(),
+        );
+    }
+
+    /// An inbound connection answered `503` `connect-failed` (spec §4.1).
+    pub(crate) fn inbound_refusal(&self) {
+        self.inbound_refusals.get_or_create(&Vec::new()).inc();
     }
 
     /// An inbound connection closed on a response the codec cannot frame.

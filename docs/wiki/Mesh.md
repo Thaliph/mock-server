@@ -142,6 +142,7 @@ function `mesh::retry` of `mimic-core`.
 | Connect refused, connect timeout, failed TLS handshake or verification, a ninth TLS pool of a pod: nothing was written | every method | `connect_failed` |
 | HTTP/2 `RST_STREAM` with `REFUSED_STREAM`, or a `GOAWAY` whose last-stream-id is 0 (no stream was processed; any other `GOAWAY` follows the next row) | every method | `refused_stream` |
 | A **trusted refusal**: status `503`, exactly one `x-mimic-error` field, `overloaded` or `queue-timeout`, and exactly one `x-mimic-endpoint` field whose value parses as `<ipv4>:<port>` or `[<ipv6>]:<port>` and equals the pod address of this try | every method | `overloaded`, `queue_timeout` |
+| A **trusted app refusal**: status `503`, exactly one `x-mimic-error: connect-failed`, exactly one `x-mimic-origin` (`inbound` or `inbound; pod=<name>`) and exactly one `x-mimic-endpoint` equal to the pod address of this try. The callee's sidecar writes it when its app refuses the connection (cleartext HTTP/1 and `h2c` only) | every method | `app_refused` |
 | The connection closed or reset, or the stream reset with another code, after the request was written (in part) and before any byte of a response head | `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE` only (method tokens compared exactly) | `reset` |
 | Any other response (a `503` that is not a trusted refusal, an `x-mimic-error` of another value, any other status), any failure after the response head | never | `ok` (a response head came back) |
 
@@ -156,7 +157,7 @@ stale view, a view that turned `"mesh": false`) is never retried. On an L4 conne
 are retried (at most 4 connects; with every try failed the connection is closed without a byte): once a
 byte was sent to a pod, a close or reset is relayed.
 
-**Delays.** Connect failures, refused streams and resets are retried at once; a trusted refusal after a
+**Delays.** Connect failures, refused streams, app refusals and resets are retried at once; a trusted refusal after a
 delay drawn between 12.5 and 37.5 ms. The body of a refused try is read and discarded up to 64 KiB (at most
 2 s) before the delay.
 
@@ -227,11 +228,11 @@ Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `
 | `mimic_mesh_endpoint_requests_total` | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
 | `mimic_mesh_endpoint_in_flight` | `backend`, `endpoint` |
 | `mimic_mesh_reconnects_total`, `mimic_mesh_fallbacks_total` | `backend` |
-| `mimic_mesh_attempts_total` (every try, to a pod or to the original destination; a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
-| `mimic_mesh_retries_total` (tries after the first) | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
+| `mimic_mesh_attempts_total` (every try, to a pod or to the original destination; a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`) |
+| `mimic_mesh_retries_total` (tries after the first) | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`) |
 | `mimic_mesh_retries_skipped_total` (a retried kind of failure that was not retried) | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
 | `mimic_mesh_retry_buffer_bytes` (gauge, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL`) | none |
-| `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total` | none |
+| `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total`, `mimic_mesh_inbound_refusals_total` (one per inbound connection answered `503` `connect-failed` because the app refused it) | none |
 | `mimic_mesh_unscoped_connections_total` | none |
 | `mimic_mesh_view_pulls_total` | `result` (`ok`, `not_modified`, `older`, `invalid`, `error`) |
 | `mimic_mesh_view_age_seconds`, `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | none |
@@ -285,10 +286,11 @@ parse, once per streak), `tls verification failed`.
   one request twice. Until the retry budget (#446) nothing bounds this per caller but `retries`, so a reset
   that every tier propagates as a reset can cost 4 tries per tier; refusals and connect failures never reach
   an app twice, at any depth.
-- **An injected callee whose app refuses connections looks like a reset.** Its sidecar accepted the
-  connection and closes it without a byte, so the caller's sidecar sees the request written and the
-  connection closed: only the methods above are retried, a `POST` gets the close. A callee without sidecar
-  refuses the connect itself and every method is retried.
+- **An injected callee whose app refuses connections over TLS looks like a reset.** On cleartext HTTP/1 and
+  `h2c` its meshed sidecar answers `503` `x-mimic-error: connect-failed` with `x-mimic-endpoint` (its pod
+  address) and `x-mimic-origin: inbound; pod=<name>`, and every method is retried on another pod. Over inbound
+  TLS, which it does not decrypt, it closes the connection without a byte: only the idempotent methods
+  above are retried, a `POST` gets the close. With the mesh off nothing is answered.
 - **No timeout yet.** A try that gets neither an answer nor a close waits as long as the app's own connection
   does; per-try and per-request timeouts come with #449.
 - **Inbound heads are held when the mesh is on.** The inbound HTTP/1 relay writes a final response head once

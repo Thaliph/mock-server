@@ -24,6 +24,7 @@ use crate::load::{Marker, Watch};
 use crate::mesh::{self, Backend, MeshState, Scope, Serving};
 use crate::mock::Mock;
 use crate::opaque::{self, Early, Side};
+use crate::refuse;
 use crate::tls::intercept::{AcceptError, ConnectError, Origin, Plan, is_tls_error};
 use crate::transport::Stream;
 
@@ -191,6 +192,12 @@ pub(crate) async fn handle(
         Err(error) => {
             shared.metrics().count(direction, Outcome::ConnectError);
             tracing::debug!(direction = direction.as_str(), %dst, %error, "connect failed");
+            // A refused app of a meshed pod answers a cleartext HTTP caller (spec §4.1).
+            if direction == Direction::Inbound
+                && let Some(mesh) = shared.mesh().filter(|mesh| mesh.strips())
+            {
+                refuse::answer(client, dst, &error, mesh, stall, abort.as_mut()).await;
+            }
             return;
         }
     };

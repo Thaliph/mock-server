@@ -84,6 +84,9 @@ enum Mode {
     /// `503 overloaded` naming the pod itself twice.
     Twice,
     Status(u16, Option<&'static str>),
+    /// What a meshed inbound sidecar answers when its app refuses the connection (spec §4.1),
+    /// with this `x-mimic-origin` (none when `None`) and `x-mimic-endpoint` the pod's address.
+    AppRefused(Option<&'static str>),
 }
 
 /// (method, body, when) of every request.
@@ -141,6 +144,14 @@ impl Probe {
                             }
                             Mode::Names(other) => refusal(&mut builder, "overloaded", &[other]),
                             Mode::Twice => refusal(&mut builder, "overloaded", &[&own, &own]),
+                            Mode::AppRefused(origin) => {
+                                let status = refusal(&mut builder, "connect-failed", &[&own]);
+                                if let Some(origin) = origin {
+                                    builder = std::mem::take(&mut builder)
+                                        .header("x-mimic-origin", *origin);
+                                }
+                                status
+                            }
                             Mode::Status(code, error) => {
                                 if let Some(error) = error {
                                     builder = builder.header("x-mimic-error", *error);
@@ -1212,6 +1223,87 @@ async fn rty_14_a_body_that_outgrows_the_buffer_during_the_pause_is_not_cut() {
     // second try (200 to 600 ms), when the first try is no longer allowed to read it.
     for h2 in [false, true] {
         slow_upload(h2, 70 * 1024, 100, Duration::from_millis(400)).await;
+    }
+}
+
+#[tokio::test]
+async fn rty_37_a_post_refused_by_a_callee_app_is_retried_on_another_pod() {
+    let _logs = capture_logs();
+    for h2 in [false, true] {
+        let refusing = Probe::start("r", h2, Mode::AppRefused(Some("inbound; pod=cart-r"))).await;
+        let (a, b) = (
+            Probe::start("a", h2, Mode::Ok).await,
+            Probe::start("b", h2, Mode::Ok).await,
+        );
+        let state = state_for(cluster_ip(), &[refusing.addr, a.addr, b.addr], |_| {});
+        let f = fixture_mesh(cluster_ip(), &state, None).await;
+        let body = payload(1024);
+        let mut client = H1Client::connect(f.addr).await;
+        for n in 0..100 {
+            let method = if n % 2 == 0 { "POST" } else { "GET" };
+            let sent = if n % 2 == 0 { body.clone() } else { Vec::new() };
+            let (status, headers, got) = if h2 {
+                let (status, headers, got) = h2_call(f.addr, method, sent).await.unwrap();
+                (status, format!("{headers:?}"), got)
+            } else {
+                let (head, got) = h1_request(&mut client, method, &sent).await;
+                (head[9..12].parse().unwrap(), head, got)
+            };
+            assert_eq!(status, 200, "request {n} (h2 {h2})");
+            assert!(!lower(&headers).contains("x-mimic-"), "{headers}");
+            assert!(got == b"a" || got == b"b");
+        }
+        for pod in [&a, &b] {
+            for (method, got, _) in pod.seen.lock().unwrap().iter() {
+                let want = if method == "POST" { &body[..] } else { &[][..] };
+                assert_eq!(got, want, "the body of a {method}");
+            }
+        }
+        assert_eq!(a.count() + b.count(), 100);
+        let scrape = f.metrics.encode();
+        let refused = attempts(&scrape, "app_refused");
+        assert!(refused >= 1.0, "{scrape}");
+        assert_eq!(retries(&scrape, "app_refused"), refused, "{scrape}");
+        assert_eq!(metric(&scrape, "mimic_mesh_fallbacks_total", &[]), 0.0);
+    }
+}
+
+#[tokio::test]
+async fn rty_37_every_pod_refusing_passes_the_last_answer_after_four_tries() {
+    let _logs = capture_logs();
+    let pods = [
+        Probe::start("a", false, Mode::AppRefused(Some("inbound"))).await,
+        Probe::start("b", false, Mode::AppRefused(Some("inbound"))).await,
+        Probe::start("c", false, Mode::AppRefused(Some("inbound"))).await,
+    ];
+    let state = state_for(
+        cluster_ip(),
+        &[pods[0].addr, pods[1].addr, pods[2].addr],
+        |_| {},
+    );
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    let (head, _) = h1_request(&mut client, "POST", b"abc").await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    let tries: usize = pods.iter().map(Probe::count).sum();
+    assert_eq!(tries, 4, "1 + retries tries, one pod twice");
+    assert_eq!(attempts(&f.metrics.encode(), "app_refused"), 4.0);
+}
+
+#[tokio::test]
+async fn rty_37_a_connect_failed_without_a_valid_origin_is_passed_as_received() {
+    let _logs = capture_logs();
+    for origin in [None, Some("outbound"), Some("inbound; pod=A")] {
+        let pod = Probe::start("a", false, Mode::AppRefused(origin)).await;
+        let other = Probe::start("b", false, Mode::Ok).await;
+        let state = state_for(cluster_ip(), &[pod.addr], |_| {});
+        let f = fixture_mesh(cluster_ip(), &state, None).await;
+        let mut client = H1Client::connect(f.addr).await;
+        let (head, _) = h1_request(&mut client, "POST", b"abc").await;
+        assert!(head.starts_with("HTTP/1.1 503"), "{origin:?} {head}");
+        assert_eq!(pod.count(), 1, "{origin:?}");
+        assert_eq!(other.count(), 0);
+        assert_eq!(retries(&f.metrics.encode(), "app_refused"), 0.0);
     }
 }
 

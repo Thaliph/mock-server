@@ -442,3 +442,124 @@ proptest! {
 fn prop_assert_draw(n: usize) {
     assert!(n >= 1, "a draw over no candidate");
 }
+
+fn app_fields<'a>(origins: &'a [&'a str], endpoints: &'a [&'a str]) -> Vec<(&'a [u8], &'a [u8])> {
+    let mut out: Vec<(&[u8], &[u8])> = vec![(b"x-mimic-error", b"connect-failed")];
+    for v in origins {
+        out.push((b"X-Mimic-Origin", v.as_bytes()));
+    }
+    for v in endpoints {
+        out.push((b"x-mimic-endpoint", v.as_bytes()));
+    }
+    out
+}
+
+#[test]
+fn rty_33_a_connect_failed_with_a_valid_origin_bound_to_the_pod_is_trusted() {
+    let pod = Some(addr(1));
+    for origin in [
+        "inbound",
+        "inbound; pod=cart-7d9f-x2k",
+        "inbound; pod=a.b-c",
+    ] {
+        let origins = [origin];
+        let f = app_fields(&origins, &["10.0.0.1:8080"]);
+        assert_eq!(trusted(503, &f, pod), Some(Refusal::AppRefused), "{origin}");
+    }
+    let v6: SocketAddr = "[::1]:8080".parse().unwrap();
+    let f = app_fields(&["inbound; pod=a"], &["[::1]:8080"]);
+    assert_eq!(trusted(503, &f, Some(v6)), Some(Refusal::AppRefused));
+    let long = format!("inbound; pod={}", "a".repeat(253));
+    let longs = [long.as_str()];
+    let f = app_fields(&longs, &["10.0.0.1:8080"]);
+    assert_eq!(trusted(503, &f, pod), Some(Refusal::AppRefused));
+}
+
+#[test]
+fn rty_33_a_connect_failed_without_a_valid_origin_is_not_trusted() {
+    let pod = Some(addr(1));
+    let long = format!("inbound; pod={}", "a".repeat(254));
+    for origin in [
+        "Inbound",
+        "inbound;pod=a",
+        "inbound; pod=",
+        "inbound; pod=A",
+        "inbound; pod=a b",
+        "inbound; pod=a; x=1",
+        "inbound ",
+        "outbound",
+        "",
+        long.as_str(),
+    ] {
+        let origins = [origin];
+        let f = app_fields(&origins, &["10.0.0.1:8080"]);
+        assert_eq!(trusted(503, &f, pod), None, "{origin:?}");
+    }
+    let good = app_fields(&["inbound"], &["10.0.0.1:8080"]);
+    assert_eq!(
+        trusted(503, &app_fields(&[], &["10.0.0.1:8080"]), pod),
+        None
+    );
+    assert_eq!(
+        trusted(
+            503,
+            &app_fields(&["inbound", "inbound"], &["10.0.0.1:8080"]),
+            pod
+        ),
+        None
+    );
+    for status in [200, 500, 502] {
+        assert_eq!(trusted(status, &good, pod), None, "{status}");
+    }
+    assert_eq!(trusted(503, &good, None), None, "no pod");
+    assert_eq!(trusted(503, &good, Some(addr(2))), None, "another pod");
+    let two = app_fields(&["inbound"], &["10.0.0.1:8080", "10.0.0.1:8080"]);
+    assert_eq!(trusted(503, &two, pod), None);
+    let mut errors = app_fields(&["inbound"], &["10.0.0.1:8080"]);
+    errors.push((b"x-mimic-error", b"connect-failed"));
+    assert_eq!(trusted(503, &errors, pod), None);
+}
+
+#[test]
+fn rty_33_the_origin_does_not_change_overloaded_and_queue_timeout() {
+    let pod = Some(addr(1));
+    for origin in ["inbound", "outbound", "x", "inbound; pod=A"] {
+        let mut f = fields(&["overloaded"], &["10.0.0.1:8080"]);
+        f.push((b"x-mimic-origin", origin.as_bytes()));
+        assert_eq!(trusted(503, &f, pod), Some(Refusal::Overloaded), "{origin}");
+    }
+}
+
+#[test]
+fn rty_33_an_app_refusal_is_retried_for_every_method_at_once() {
+    for method in METHODS.iter().chain(["get"].iter()) {
+        let v = classify(Failure::Refusal(Refusal::AppRefused), method, true, true);
+        assert!(v.retry && v.skip.is_none(), "{method}");
+        assert_eq!(v.outcome, Outcome::AppRefused);
+        let v = classify(Failure::Refusal(Refusal::AppRefused), method, false, true);
+        assert_eq!(v.skip, Some(Skip::Buffer), "{method}");
+    }
+    assert_eq!(Outcome::AppRefused.label(), "app_refused");
+    assert_eq!(delay(Outcome::AppRefused, 0.9), Duration::ZERO);
+}
+
+#[test]
+fn rty_33_after_app_refusals_the_planner_never_ends_on_the_original_destination() {
+    let set = endpoints(2);
+    let mut planner = Planner::new(3);
+    let mut draw = |n: usize| n / 2;
+    let mut tried = Vec::new();
+    for _ in 0..4 {
+        let next = planner.next(&set, Duration::from_secs(100), |_| 0, &mut draw);
+        assert!(!matches!(next, Next::Original), "{next:?}");
+        if let Next::Pod(pod) = next {
+            tried.push(pod);
+            planner.failed(Outcome::AppRefused);
+        }
+    }
+    assert_eq!(tried.len(), 4);
+    assert_eq!(
+        planner.next(&set, Duration::from_secs(100), |_| 0, &mut draw),
+        Next::Stop
+    );
+}

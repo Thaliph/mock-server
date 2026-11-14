@@ -566,6 +566,7 @@ impl Serving {
                     let reason = refusal.map_or("none", |r| match r {
                         Refusal::Overloaded => "overloaded",
                         Refusal::QueueTimeout => "queue-timeout",
+                        Refusal::AppRefused => "app-refused",
                     });
                     self.count(answered.status(), reason, began);
                     return Ok(answered.map(|body| MeshBody {
@@ -712,6 +713,12 @@ fn refusal_of(
                 .get_all("x-mimic-endpoint")
                 .iter()
                 .map(|v| (&b"x-mimic-endpoint"[..], v.as_bytes())),
+        )
+        .chain(
+            headers
+                .get_all("x-mimic-origin")
+                .iter()
+                .map(|v| (&b"x-mimic-origin"[..], v.as_bytes())),
         )
         .collect();
     trusted(response.status().as_u16(), &fields, Some(pod))

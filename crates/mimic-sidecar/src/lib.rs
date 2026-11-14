@@ -17,5 +17,6 @@ pub mod mode;
 pub mod opaque;
 pub mod probes;
 pub mod red;
+pub mod refuse;
 pub mod tls;
 pub mod transport;
