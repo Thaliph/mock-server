@@ -16,10 +16,12 @@ use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
+use hyper::http::request::Parts;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::head::{Stop, leaves};
+use mimic_core::mesh::retry::{Failure, Outcome, Planner, Refusal, classify, delay, trusted};
 use mimic_core::proxy::authority::status_class;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -27,8 +29,9 @@ use super::MeshState;
 use super::dial::CLUSTER_CONNECT_TIMEOUT;
 use super::gate::{Gate, Progress};
 use super::metrics::Call;
-use super::pool::{Lease, Protocol, Sent};
-use super::router::{Backend, InFlight};
+use super::pool::{self, Lease, Protocol, Sent};
+use super::replay::Source;
+use super::router::{Backend, InFlight, Plan};
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, RespBody, Tracker};
 use crate::mock::{self, Mock};
@@ -270,139 +273,171 @@ impl Drop for Done {
     }
 }
 
-/// A connection for one request: the pod it goes to (counted in flight) or the original
+/// A connection for one try: the pod it goes to (counted in flight) or the original
 /// destination (`pick` none).
 struct Conn {
     pick: Option<InFlight>,
     lease: Lease,
-    upstream: SocketAddr,
 }
 
-/// Why no connection could be had.
-enum Unreachable {
-    NoEndpoint,
-    Connect(io::Error),
+/// How a try ended.
+enum Tried {
+    /// A response head came back.
+    Answer {
+        response: Response<hyper::body::Incoming>,
+        conn: Conn,
+    },
+    /// No response head. `error` is the failure of a request that was written.
+    Failed {
+        failure: Failure,
+        error: Option<hyper::Error>,
+        pick: Option<InFlight>,
+        written: bool,
+    },
 }
+
+impl Tried {
+    /// The connect failed, or the request could not be written: nothing is on the wire.
+    fn unwritten(pick: Option<InFlight>) -> Tried {
+        Tried::Failed {
+            failure: Failure::Connect,
+            error: None,
+            pick,
+            written: false,
+        }
+    }
+}
+
+/// The middle of the delay [`delay`] draws around, to scale it by `MeshConfig.refusal_delay`.
+const REFUSAL_DELAY: f64 = 0.025;
+/// The body of a refused try is read and discarded up to this much (spec §7.9 "Retries").
+const DISCARD_LIMIT: usize = 64 * 1024;
+/// How long that takes at most before the connection is given up.
+const DISCARD_TIME: Duration = Duration::from_secs(2);
 
 impl Serving {
-    /// A connection for a request: the pod P2C chooses, one other pod when connecting to it
-    /// fails, then the original destination (spec §7.9). A stale view or a view that says
-    /// `"mesh": false` goes to the original destination at once.
-    async fn connect(&self, protocol: Protocol) -> Result<Conn, Unreachable> {
+    /// One try on `pick` (a pod, counted in flight) or the original destination: a connection
+    /// from the pool and the request on it. An unwritten request, because the pod had closed the
+    /// connection, goes once more on a new one, which is part of the same try (spec §7.9).
+    async fn try_once(
+        &self,
+        protocol: Protocol,
+        pick: Option<InFlight>,
+        source: &Source,
+        head: &Parts,
+    ) -> Tried {
         let router = self.mesh.router();
-        if !self.mesh.stale() && !self.mesh.off() {
-            let mut failed = None;
-            for _ in 0..2 {
-                let pick = match failed {
-                    None => self.backend.pick(router),
-                    Some(addr) => self.backend.pick_other(router, addr),
-                };
-                let Some(pick) = pick else {
-                    if failed.is_none() {
-                        return Err(Unreachable::NoEndpoint);
-                    }
-                    break;
-                };
-                let upstream = pick.endpoint().addr;
-                match router
-                    .pools
-                    .checkout(
-                        upstream,
-                        protocol,
-                        self.origin.as_ref(),
-                        None,
-                        router.connect_timeout,
-                    )
-                    .await
-                {
-                    Ok(lease) => {
-                        router.succeeded(&pick);
-                        return Ok(Conn {
-                            pick: Some(pick),
-                            lease,
-                            upstream,
-                        });
-                    }
-                    Err(e) => {
-                        connect_failed_log(&upstream, &e);
-                        router.failed(&pick);
-                        failed = Some(upstream);
-                    }
-                }
-            }
-        }
-        self.fallback(protocol).await
-    }
-
-    /// The original destination, pooled like a pod, so that kube-proxy chooses as it does
-    /// without the mesh; counted as a fallback.
-    async fn fallback(&self, protocol: Protocol) -> Result<Conn, Unreachable> {
-        let router = self.mesh.router();
-        let upstream = self.ctx.dst;
-        router.metrics.fallback(&self.backend.label);
-        router
-            .pools
-            .checkout(
-                upstream,
-                protocol,
-                self.origin.as_ref(),
-                None,
-                CLUSTER_CONNECT_TIMEOUT,
-            )
-            .await
-            .map(|lease| Conn {
-                pick: None,
-                lease,
-                upstream,
-            })
-            .map_err(|e| {
-                connect_failed_log(&upstream, &e);
-                Unreachable::Connect(e)
-            })
-    }
-
-    /// A new connection after nothing could be written to `failed`: to the same pod, never the
-    /// connection that failed, and when that cannot be made either (nothing was written yet) to
-    /// the original destination.
-    async fn reconnect(&self, protocol: Protocol, failed: Conn) -> Result<Conn, Unreachable> {
-        let router = self.mesh.router();
-        let Conn {
-            pick,
-            lease,
-            upstream,
-        } = failed;
+        let upstream = pick.as_ref().map_or(self.ctx.dst, |p| p.endpoint().addr);
         let timeout = if pick.is_some() {
             router.connect_timeout
         } else {
             CLUSTER_CONNECT_TIMEOUT
         };
-        match router
+        let connected = router
             .pools
-            .checkout(
-                upstream,
-                protocol,
-                self.origin.as_ref(),
-                Some(&lease),
-                timeout,
-            )
-            .await
-        {
-            Ok(lease) => Ok(Conn {
-                pick,
-                lease,
-                upstream,
-            }),
+            .checkout(upstream, protocol, self.origin.as_ref(), None, timeout)
+            .await;
+        let mut lease = match connected {
+            Ok(lease) => {
+                if let Some(pick) = &pick {
+                    router.succeeded(pick);
+                }
+                lease
+            }
             Err(e) => {
                 connect_failed_log(&upstream, &e);
-                match pick {
-                    Some(pick) => {
-                        router.failed(&pick);
-                        drop(pick);
-                        self.fallback(protocol).await
+                if let Some(pick) = &pick {
+                    router.failed(pick);
+                }
+                return Tried::unwritten(pick);
+            }
+        };
+        let mut sent = lease.send(source.request(head)).await;
+        if let Sent::Unsent = sent {
+            if !source.intact() {
+                return Tried::Failed {
+                    failure: Failure::Reset,
+                    error: None,
+                    pick,
+                    written: true,
+                };
+            }
+            router.metrics.reconnect(&self.backend.label);
+            let again = router
+                .pools
+                .checkout(
+                    upstream,
+                    protocol,
+                    self.origin.as_ref(),
+                    Some(&lease),
+                    timeout,
+                )
+                .await;
+            match again {
+                Ok(new) => lease = new,
+                Err(e) => {
+                    connect_failed_log(&upstream, &e);
+                    if let Some(pick) = &pick {
+                        router.failed(pick);
                     }
-                    None => Err(Unreachable::Connect(e)),
+                    return Tried::unwritten(pick);
                 }
             }
+            sent = lease.send(source.request(head)).await;
+        }
+        match sent {
+            Sent::Response(response) => Tried::Answer {
+                response,
+                conn: Conn { pick, lease },
+            },
+            Sent::Failed(e) => Tried::Failed {
+                failure: pool::failure(&e),
+                error: Some(e),
+                pick,
+                written: true,
+            },
+            Sent::Unsent => {
+                tracing::debug!(%upstream, "the request could not be written twice");
+                Tried::unwritten(pick)
+            }
+        }
+    }
+
+    /// The next try after one failed: `Stop` without one left. A stale view, or one that says
+    /// `"mesh": false`, has the original destination for its only try (spec §7.9).
+    fn plan(&self, direct: bool, tries: u32, planner: &mut Planner) -> Plan {
+        if direct {
+            return if tries == 0 {
+                Plan::Original
+            } else {
+                Plan::Stop
+            };
+        }
+        self.backend.plan(self.mesh.router(), planner)
+    }
+
+    /// Reads and drops the body of a refused try, so that its connection can be pooled again.
+    async fn discard(response: Response<hyper::body::Incoming>, lease: &mut Lease) {
+        let mut body = response.into_body();
+        let mut seen = 0;
+        let drained = tokio::time::timeout(DISCARD_TIME, async {
+            loop {
+                match body.frame().await {
+                    None => return true,
+                    Some(Err(_)) => return false,
+                    Some(Ok(frame)) => {
+                        seen += frame.data_ref().map_or(0, Bytes::len);
+                        if seen > DISCARD_LIMIT {
+                            return false;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !drained {
+            lease.discard();
         }
     }
 
@@ -410,12 +445,7 @@ impl Serving {
     /// by the caller).
     fn refused(&self, request: Option<&mimic_core::proxy::http1::RequestHead>) {
         exchange::refused(&self.ctx, request);
-        self.count(
-            None,
-            StatusCode::BAD_REQUEST,
-            "invalid-request",
-            Instant::now(),
-        );
+        self.count(StatusCode::BAD_REQUEST, "invalid-request", Instant::now());
     }
 
     async fn call(
@@ -446,7 +476,7 @@ impl Serving {
         if req.method() == Method::CONNECT || (http1 && req.headers().contains_key(header::UPGRADE))
         {
             let (tracker, _) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
-            self.count(None, StatusCode::NOT_IMPLEMENTED, "unsupported", began);
+            self.count(StatusCode::NOT_IMPLEMENTED, "unsupported", began);
             tracker.synthetic(StatusCode::NOT_IMPLEMENTED.as_u16());
             return Ok(answer(StatusCode::NOT_IMPLEMENTED, "unsupported", http1));
         }
@@ -456,108 +486,179 @@ impl Serving {
         }
         let (mut tracker, req) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
         let router = self.mesh.router();
-        let connect_failed = |tracker: Tracker, e: &dyn std::fmt::Display| {
-            tracing::debug!(error = %e, "connect failed");
-            self.count(
-                None,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "connect-failed",
-                began,
-            );
-            tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-            Ok(answer(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "connect-failed",
-                false,
-            ))
-        };
-        let mut conn = match self.connect(protocol).await {
-            Ok(conn) => conn,
-            Err(Unreachable::NoEndpoint) => {
-                self.count(None, StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", began);
-                tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-                return Ok(answer(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no-endpoint",
-                    false,
-                ));
-            }
-            Err(Unreachable::Connect(e)) => return connect_failed(tracker, &e),
-        };
-        tracker.route(&self.backend.label, conn.upstream);
-        // Nothing written to a connection the pod had closed: once more on a new one, whatever
-        // the method (spec §7.9).
-        let mut sent = conn.lease.send(req).await;
-        if let Sent::Unsent(again) = sent {
-            router.metrics.reconnect(&self.backend.label);
-            conn = match self.reconnect(protocol, conn).await {
-                Ok(conn) => conn,
-                Err(Unreachable::Connect(e)) => return connect_failed(tracker, &e),
-                Err(Unreachable::NoEndpoint) => return connect_failed(tracker, &"no endpoint"),
-            };
-            tracker.route(&self.backend.label, conn.upstream);
-            sent = conn.lease.send(again).await;
-        }
-        let Conn {
-            pick,
-            lease,
-            upstream,
-        } = conn;
-        match sent {
-            Sent::Response(response) => {
-                let mut answered = tracker.answered(response);
-                if http1 {
-                    strip_hop_by_hop(answered.headers_mut(), false);
+        let backend = &self.backend.label;
+        let (head, body) = req.into_parts();
+        let source = Source::new(body, self.mesh.replay());
+        let direct = self.mesh.stale() || self.mesh.off();
+        let mut planner = Planner::new(router.retries);
+        let mut tries = 0;
+        let mut again: Option<Outcome> = None;
+        let mut next = self.plan(direct, tries, &mut planner);
+        loop {
+            let pick = match next {
+                Plan::Pod(pick) => Some(pick),
+                Plan::Original => None,
+                Plan::Stop => {
+                    self.count(StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", began);
+                    tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                    return Ok(answer(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "no-endpoint",
+                        false,
+                    ));
                 }
-                self.count(pick.as_ref(), answered.status(), "none", began);
-                Ok(answered.map(|body| MeshBody {
-                    upstream: Some(body),
-                    mocked: None,
-                    _hold: Some(Hold {
-                        _in_flight: pick,
-                        _lease: lease,
-                    }),
-                    done: None,
-                }))
+            };
+            tries += 1;
+            if let Some(reason) = again.take() {
+                router.metrics.retry(backend, reason);
             }
-            Sent::Failed(e) if e.is_parse() || e.is_parse_status() || e.is_parse_too_large() => {
-                tracing::debug!(%upstream, error = %e, "the pod's response head was refused");
-                self.count(
-                    pick.as_ref(),
-                    StatusCode::BAD_GATEWAY,
-                    "invalid-response",
-                    began,
-                );
-                tracker.synthetic(StatusCode::BAD_GATEWAY.as_u16());
-                Ok(answer(StatusCode::BAD_GATEWAY, "invalid-response", false))
+            if pick.is_none() {
+                router.metrics.fallback(backend);
             }
-            Sent::Failed(e) => {
-                tracing::debug!(%upstream, error = %e, "the pod did not answer");
-                self.count_none(pick.as_ref(), began);
-                tracker.failed();
-                Err(e.into())
-            }
-            Sent::Unsent(_) => {
-                tracing::debug!(%upstream, "the request could not be written twice");
-                self.count_none(pick.as_ref(), began);
-                tracker.failed();
-                Err("connection closed".into())
+            let upstream = pick.as_ref().map_or(self.ctx.dst, |p| p.endpoint().addr);
+            tracker.route(backend, upstream, tries);
+            match self.try_once(protocol, pick, &source, &head).await {
+                Tried::Answer { response, mut conn } => {
+                    let status = response.status();
+                    let refusal = refusal_of(&response, conn.pick.as_ref());
+                    let failure = refusal.map_or(Failure::Response, Failure::Refusal);
+                    let verdict = classify(failure, head.method.as_str(), source.held(), true);
+                    router.metrics.attempt(backend, verdict.outcome);
+                    if let Some(pick) = &conn.pick {
+                        let class = status_class(status.as_u16());
+                        router
+                            .metrics
+                            .endpoint_try(backend, &pick.endpoint().label, class);
+                    }
+                    planner.failed(verdict.outcome);
+                    if verdict.retry {
+                        match self.plan(direct, tries, &mut planner) {
+                            Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                            retry => {
+                                Self::discard(response, &mut conn.lease).await;
+                                drop(conn);
+                                self.pause(verdict.outcome).await;
+                                again = Some(verdict.outcome);
+                                next = retry;
+                                continue;
+                            }
+                        }
+                    } else if let Some(skip) = verdict.skip {
+                        router.metrics.skipped(backend, skip.label());
+                    }
+                    source.release();
+                    let Conn { pick, lease } = conn;
+                    let answered = match refusal {
+                        Some(_) => tracker.answered_unrecorded(response),
+                        None => tracker.answered(response),
+                    };
+                    let mut answered = answered;
+                    if http1 {
+                        strip_hop_by_hop(answered.headers_mut(), false);
+                    }
+                    let reason = refusal.map_or("none", |r| match r {
+                        Refusal::Overloaded => "overloaded",
+                        Refusal::QueueTimeout => "queue-timeout",
+                    });
+                    self.count(answered.status(), reason, began);
+                    return Ok(answered.map(|body| MeshBody {
+                        upstream: Some(body),
+                        mocked: None,
+                        _hold: Some(Hold {
+                            _in_flight: pick,
+                            _lease: lease,
+                        }),
+                        done: None,
+                    }));
+                }
+                Tried::Failed {
+                    failure,
+                    error,
+                    pick,
+                    written,
+                } => {
+                    let verdict = classify(failure, head.method.as_str(), source.held(), written);
+                    router.metrics.attempt(backend, verdict.outcome);
+                    if let (true, Some(pick)) = (written, &pick) {
+                        let label = &pick.endpoint().label;
+                        router.metrics.endpoint_try(backend, label, "none");
+                    }
+                    planner.failed(verdict.outcome);
+                    if verdict.retry {
+                        match self.plan(direct, tries, &mut planner) {
+                            Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                            retry => {
+                                drop(pick);
+                                again = Some(verdict.outcome);
+                                next = retry;
+                                continue;
+                            }
+                        }
+                    } else if let Some(skip) = verdict.skip {
+                        router.metrics.skipped(backend, skip.label());
+                    }
+                    return self.failed(tracker, failure, error, upstream, began);
+                }
             }
         }
     }
 
-    fn count(
+    /// The delay before the try that follows a try that ended with `outcome`.
+    async fn pause(&self, outcome: Outcome) {
+        let router = self.mesh.router();
+        let pause = delay(outcome, router.unit())
+            .mul_f64(router.refusal_delay.as_secs_f64() / REFUSAL_DELAY);
+        if !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+    }
+
+    /// The request ends without a response: the answer of the sidecar, or the error that ends
+    /// the app's connection or stream.
+    fn failed(
         &self,
-        pick: Option<&InFlight>,
-        status: StatusCode,
-        reason: &'static str,
+        tracker: Tracker,
+        failure: Failure,
+        error: Option<hyper::Error>,
+        upstream: SocketAddr,
         began: Instant,
-    ) {
+    ) -> Result<Response<MeshBody>, BoxError> {
+        match failure {
+            Failure::Connect => {
+                tracing::debug!(%upstream, "connect failed");
+                self.count(StatusCode::SERVICE_UNAVAILABLE, "connect-failed", began);
+                tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                Ok(answer(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "connect-failed",
+                    false,
+                ))
+            }
+            Failure::Response => {
+                tracing::debug!(%upstream, "the pod's response head was refused");
+                self.count(StatusCode::BAD_GATEWAY, "invalid-response", began);
+                tracker.synthetic(StatusCode::BAD_GATEWAY.as_u16());
+                Ok(answer(StatusCode::BAD_GATEWAY, "invalid-response", false))
+            }
+            _ => {
+                tracing::debug!(%upstream, "the pod did not answer");
+                self.count_none(began);
+                tracker.failed();
+                // The app's stream is reset with the code the pod used, or `REFUSED_STREAM`
+                // when it refused the stream by a `GOAWAY`.
+                if failure == Failure::RefusedStream {
+                    return Err(h2::Error::from(h2::Reason::REFUSED_STREAM).into());
+                }
+                Err(error.map_or_else(|| "connection closed".into(), Into::into))
+            }
+        }
+    }
+
+    fn count(&self, status: StatusCode, reason: &'static str, began: Instant) {
         self.mesh.router().metrics.request(
             &Call {
                 service: &self.backend.service,
                 backend: &self.backend.label,
-                endpoint: pick.map(|p| &*p.endpoint().label),
                 status_class: status_class(status.as_u16()),
                 reason,
             },
@@ -566,18 +667,41 @@ impl Serving {
     }
 
     /// A request that got no response.
-    fn count_none(&self, pick: Option<&InFlight>, began: Instant) {
+    fn count_none(&self, began: Instant) {
         self.mesh.router().metrics.request(
             &Call {
                 service: &self.backend.service,
                 backend: &self.backend.label,
-                endpoint: pick.map(|p| &*p.endpoint().label),
                 status_class: "none",
                 reason: "none",
             },
             began.elapsed(),
         );
     }
+}
+
+/// Whether the answer is a trusted refusal of the pod the try went to (spec §7.9 "Retries").
+fn refusal_of(
+    response: &Response<hyper::body::Incoming>,
+    pick: Option<&InFlight>,
+) -> Option<Refusal> {
+    let pod = pick?.endpoint().addr;
+    if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    let headers = response.headers();
+    let fields: Vec<(&[u8], &[u8])> = headers
+        .get_all("x-mimic-error")
+        .iter()
+        .map(|v| (&b"x-mimic-error"[..], v.as_bytes()))
+        .chain(
+            headers
+                .get_all("x-mimic-endpoint")
+                .iter()
+                .map(|v| (&b"x-mimic-endpoint"[..], v.as_bytes())),
+        )
+        .collect();
+    trusted(response.status().as_u16(), &fields, Some(pod))
 }
 
 /// An answer of the sidecar: `x-mimic-error` and no body. With `close` the connection ends.

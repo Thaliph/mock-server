@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use mimic_core::mesh::lb::Endpoints;
+use mimic_core::mesh::retry::{Next, Planner};
 use mimic_core::mesh::view::View;
 use prometheus_client::metrics::gauge::Gauge;
 
@@ -156,6 +157,47 @@ impl Backend {
     }
 }
 
+/// Where the next try of a request goes.
+pub(crate) enum Plan {
+    /// A pod, counted in flight.
+    Pod(InFlight),
+    /// The original destination (the ClusterIP).
+    Original,
+    /// No try is left, or the backend has no endpoint.
+    Stop,
+}
+
+impl Backend {
+    /// The next try of a request (spec §7.9 "Retries"): the planner chooses over the endpoints
+    /// now, avoidance and slow start applying as in [`Backend::pick`].
+    pub(crate) fn plan(&self, router: &Router, planner: &mut Planner) -> Plan {
+        let now = router.started.elapsed();
+        let avoid_now = now_ms();
+        let state = lock(&self.state);
+        let mut draw = |n: usize| router.draw(n);
+        let next = planner.next(
+            &state.set,
+            now,
+            |i| state.endpoints[i].load(avoid_now),
+            &mut draw,
+        );
+        match next {
+            Next::Pod(addr) => {
+                let Some(endpoint) = state.endpoints.iter().find(|e| e.addr == addr).cloned()
+                else {
+                    return Plan::Stop;
+                };
+                drop(state);
+                endpoint.in_flight.fetch_add(1, Ordering::AcqRel);
+                endpoint.gauge.inc();
+                Plan::Pod(InFlight(endpoint))
+            }
+            Next::Original => Plan::Original,
+            Next::Stop => Plan::Stop,
+        }
+    }
+}
+
 impl Backend {
     /// An endpoint other than `not` (after a connect to it failed), counted in flight; `None`
     /// when the backend has no other one.
@@ -175,6 +217,10 @@ pub(crate) struct Router {
     pub(crate) connect_timeout: Duration,
     /// How long a pod whose connect failed is avoided.
     avoid: Duration,
+    /// Retries after the first try of a request.
+    pub(crate) retries: u32,
+    /// The middle of the delay before a retry after a trusted refusal.
+    pub(crate) refusal_delay: Duration,
 }
 
 impl Router {
@@ -184,6 +230,8 @@ impl Router {
         seed: Option<u64>,
         connect_timeout: Duration,
         avoid: Duration,
+        retries: u32,
+        refusal_delay: Duration,
     ) -> Router {
         Router {
             started: Instant::now(),
@@ -193,6 +241,8 @@ impl Router {
             metrics: MeshMetrics::new(max_labels),
             connect_timeout,
             avoid,
+            retries,
+            refusal_delay,
         }
     }
 
@@ -205,6 +255,12 @@ impl Router {
     /// A connection to the pod was had: it is not avoided any more.
     pub(crate) fn succeeded(&self, pick: &InFlight) {
         pick.endpoint().failed_until.store(0, Ordering::Release);
+    }
+
+    /// A number in `[0, 1]`.
+    pub(crate) fn unit(&self) -> f64 {
+        const STEPS: usize = 1_000_000;
+        self.draw(STEPS + 1) as f64 / STEPS as f64
     }
 
     /// A number below `n`.

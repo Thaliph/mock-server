@@ -2,11 +2,20 @@
 //! `MIMIC_MESH_RETRY_BUFFER` per request and `MIMIC_MESH_RETRY_BUFFER_TOTAL` for all the
 //! requests of the sidecar together.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use hyper::Request;
+use hyper::body::{Body, Frame, SizeHint};
+use hyper::header::HeaderMap;
+use hyper::http::request::Parts;
 use prometheus_client::metrics::gauge::Gauge;
+
+use crate::exchange::ReqBody;
 
 /// The bytes held by all the requests of the sidecar.
 pub struct ReplayBudget {
@@ -135,6 +144,152 @@ impl Replay {
 impl Drop for Replay {
     fn drop(&mut self) {
         self.drop_chunks();
+    }
+}
+
+struct Shared {
+    body: ReqBody,
+    replay: Replay,
+    ended: bool,
+    trailers: Option<HeaderMap>,
+    /// A frame was read from the app.
+    read: bool,
+}
+
+/// The body of a request over its tries: what the app sends is read once, held for replay while
+/// it fits, and each try gets an [`Attempt`] that starts with what was held.
+pub(crate) struct Source {
+    shared: Arc<Mutex<Shared>>,
+    hint: SizeHint,
+}
+
+fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Source {
+    pub(crate) fn new(body: ReqBody, replay: Replay) -> Source {
+        let hint = body.size_hint();
+        Source {
+            shared: Arc::new(Mutex::new(Shared {
+                body,
+                replay,
+                ended: false,
+                trailers: None,
+                read: false,
+            })),
+            hint,
+        }
+    }
+
+    /// Every byte read from the app is still held (spec §7.9 "Bodies").
+    pub(crate) fn held(&self) -> bool {
+        lock(&self.shared).replay.is_held()
+    }
+
+    /// The request can be sent again whole: nothing was read, or all of it is held.
+    pub(crate) fn intact(&self) -> bool {
+        let shared = lock(&self.shared);
+        shared.replay.is_held() || !shared.read
+    }
+
+    /// A response head came back: the bytes held are released.
+    pub(crate) fn release(&self) {
+        lock(&self.shared).replay.release();
+    }
+
+    /// The request for one try: `head` and a body that starts with the bytes held.
+    pub(crate) fn request(&self, head: &Parts) -> Request<Attempt> {
+        let queue = lock(&self.shared).replay.chunks().iter().cloned().collect();
+        let mut request = Request::new(Attempt {
+            shared: self.shared.clone(),
+            queue,
+            hint: self.hint,
+            trailed: false,
+        });
+        *request.method_mut() = head.method.clone();
+        *request.uri_mut() = head.uri.clone();
+        *request.version_mut() = head.version;
+        *request.headers_mut() = head.headers.clone();
+        *request.extensions_mut() = head.extensions.clone();
+        request
+    }
+}
+
+/// The body of one try.
+pub(crate) struct Attempt {
+    shared: Arc<Mutex<Shared>>,
+    /// What was held when the try began, still to send.
+    queue: VecDeque<Bytes>,
+    hint: SizeHint,
+    /// The trailers were handed over.
+    trailed: bool,
+}
+
+impl Body for Attempt {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        if let Some(chunk) = this.queue.pop_front() {
+            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        }
+        let mut shared = lock(&this.shared);
+        if shared.ended {
+            if !std::mem::replace(&mut this.trailed, true)
+                && let Some(trailers) = shared.trailers.clone()
+            {
+                return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+            }
+            return Poll::Ready(None);
+        }
+        let polled = Pin::new(&mut shared.body).poll_frame(cx);
+        match polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                shared.read = true;
+                match frame.into_data() {
+                    Ok(data) => {
+                        shared.replay.push(&data);
+                        Poll::Ready(Some(Ok(Frame::data(data))))
+                    }
+                    Err(frame) => {
+                        shared.ended = true;
+                        this.trailed = true;
+                        if let Ok(trailers) = frame.into_trailers() {
+                            shared.trailers = Some(trailers.clone());
+                            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+                        }
+                        Poll::Ready(None)
+                    }
+                }
+            }
+            Poll::Ready(None) => {
+                shared.ended = true;
+                this.trailed = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        if !self.queue.is_empty() {
+            return false;
+        }
+        let shared = lock(&self.shared);
+        if shared.ended {
+            shared.trailers.is_none() || self.trailed
+        } else {
+            shared.body.is_end_stream()
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.hint
     }
 }
 

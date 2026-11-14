@@ -72,6 +72,8 @@ pub struct Exchange {
     pub backend: Option<String>,
     /// Mesh-routed requests only: the pod the request went to.
     pub upstream: Option<SocketAddr>,
+    /// Mesh-routed requests only: the number of tries (spec §7.9 "Retries").
+    pub attempts: Option<u32>,
 }
 
 /// One finished opaque or TLS connection.
@@ -133,6 +135,7 @@ pub fn exchange(e: &Exchange) {
         load_run = e.load_run.as_deref(),
         backend = e.backend.as_deref(),
         upstream = e.upstream.map(|a| a.to_string()).as_deref(),
+        attempts = e.attempts,
         "http exchange"
     );
 }

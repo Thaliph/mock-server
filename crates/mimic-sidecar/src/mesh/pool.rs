@@ -20,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
-use crate::exchange::ReqBody;
+use super::replay::Attempt;
 use crate::tls::intercept::Origin;
 use crate::transport::Stream;
 
@@ -122,11 +122,11 @@ async fn dial_wire(
 /// A connection taken from a pool for one request; handed back when dropped.
 pub(crate) enum Lease {
     Http1 {
-        sender: Option<http1::SendRequest<ReqBody>>,
+        sender: Option<http1::SendRequest<Attempt>>,
         pool: Arc<H1Pool>,
     },
     Http2 {
-        sender: http2::SendRequest<ReqBody>,
+        sender: http2::SendRequest<Attempt>,
         active: Arc<AtomicUsize>,
         last_used: Arc<AtomicU64>,
         since: Instant,
@@ -144,7 +144,7 @@ impl Lease {
     }
 
     /// Sends the request. A failed HTTP/1 connection is not handed back.
-    pub(crate) async fn send(&mut self, req: Request<ReqBody>) -> Sent {
+    pub(crate) async fn send(&mut self, req: Request<Attempt>) -> Sent {
         let sent = match self {
             Lease::Http1 { sender, .. } => {
                 let Some(live) = sender.as_mut() else {
@@ -159,7 +159,7 @@ impl Lease {
             Err(mut failed) => {
                 self.discard();
                 match failed.take_message() {
-                    Some(request) => Sent::Unsent(request),
+                    Some(_) => Sent::Unsent,
                     None => Sent::Failed(failed.into_error()),
                 }
             }
@@ -174,11 +174,35 @@ impl Lease {
     }
 }
 
+/// How a request that was written failed before any response head (spec §7.9 "Retries"): a
+/// stream the pod refused (`REFUSED_STREAM`, or a `GOAWAY` that left it unprocessed), a head
+/// that does not parse (the pod did answer), or a reset.
+pub(crate) fn failure(e: &hyper::Error) -> mimic_core::mesh::retry::Failure {
+    use mimic_core::mesh::retry::Failure;
+    if e.is_parse() || e.is_parse_status() || e.is_parse_too_large() {
+        return Failure::Response;
+    }
+    let mut cause = std::error::Error::source(e);
+    while let Some(err) = cause {
+        if let Some(h2) = err.downcast_ref::<h2::Error>() {
+            let refused = h2.reason() == Some(h2::Reason::REFUSED_STREAM) && h2.is_remote()
+                || h2.is_go_away() && h2.is_remote();
+            return if refused {
+                Failure::RefusedStream
+            } else {
+                Failure::Reset
+            };
+        }
+        cause = err.source();
+    }
+    Failure::Reset
+}
+
 /// What came of sending a request.
 pub(crate) enum Sent {
     Response(Response<hyper::body::Incoming>),
-    /// Nothing of the request was written: it is returned, whole.
-    Unsent(Request<ReqBody>),
+    /// Nothing of the request was written.
+    Unsent,
     /// The request was written (or partly) and no response came.
     Failed(hyper::Error),
 }
@@ -219,7 +243,7 @@ impl Drop for Slot<'_> {
 }
 
 struct Idle {
-    sender: http1::SendRequest<ReqBody>,
+    sender: http1::SendRequest<Attempt>,
     since: Instant,
 }
 
@@ -254,7 +278,7 @@ impl H1Pool {
         }
     }
 
-    fn give_back(&self, sender: http1::SendRequest<ReqBody>) {
+    fn give_back(&self, sender: http1::SendRequest<Attempt>) {
         if self.draining.load(Ordering::Acquire) || sender.is_closed() {
             return;
         }
@@ -265,7 +289,7 @@ impl H1Pool {
         self.freed.notify_one();
     }
 
-    fn take_idle(&self) -> Option<http1::SendRequest<ReqBody>> {
+    fn take_idle(&self) -> Option<http1::SendRequest<Attempt>> {
         let mut idle = lock(&self.idle);
         // The most recently used first: the others age out.
         while let Some(entry) = idle.pop() {
@@ -310,14 +334,14 @@ impl H1Pool {
         Ok(self.lease(sender))
     }
 
-    fn lease(self: &Arc<Self>, sender: http1::SendRequest<ReqBody>) -> Lease {
+    fn lease(self: &Arc<Self>, sender: http1::SendRequest<Attempt>) -> Lease {
         Lease::Http1 {
             sender: Some(sender),
             pool: self.clone(),
         }
     }
 
-    async fn connect(self: &Arc<Self>, slot: Slot<'_>) -> io::Result<http1::SendRequest<ReqBody>> {
+    async fn connect(self: &Arc<Self>, slot: Slot<'_>) -> io::Result<http1::SendRequest<Attempt>> {
         let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http1::Builder::new()
             .preserve_header_case(true)
@@ -351,7 +375,7 @@ impl H1Pool {
 }
 
 struct Conn {
-    sender: http2::SendRequest<ReqBody>,
+    sender: http2::SendRequest<Attempt>,
     /// Requests in flight on it.
     active: Arc<AtomicUsize>,
     /// Milliseconds since the pool was created, at the last request that ended.

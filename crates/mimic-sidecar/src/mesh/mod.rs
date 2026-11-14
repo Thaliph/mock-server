@@ -474,6 +474,8 @@ impl MeshState {
                 config.seed,
                 config.connect_timeout,
                 config.avoid_failed_for,
+                config.retries,
+                config.refusal_delay,
             ),
             seen: AtomicBool::new(false),
         }))

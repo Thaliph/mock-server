@@ -84,10 +84,12 @@ enum Mode {
     Status(u16, Option<&'static str>),
 }
 
+/// (method, body, when) of every request.
+type Seen = Arc<Mutex<Vec<(String, Vec<u8>, Instant)>>>;
+
 struct Probe {
     addr: SocketAddr,
-    /// (method, body, when) of every request.
-    seen: Arc<Mutex<Vec<(String, Vec<u8>, Instant)>>>,
+    seen: Seen,
     mode: Arc<Mutex<Mode>>,
 }
 
@@ -95,7 +97,7 @@ impl Probe {
     async fn start(name: &'static str, h2: bool, mode: Mode) -> Probe {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let seen: Arc<Mutex<Vec<(String, Vec<u8>, Instant)>>> = Arc::default();
+        let seen: Seen = Arc::default();
         let mode = Arc::new(Mutex::new(mode));
         let (log, shared) = (seen.clone(), mode.clone());
         tokio::spawn(async move {
@@ -175,8 +177,8 @@ fn refusal(builder: &mut hyper::http::response::Builder, error: &str, endpoints:
     503
 }
 
-/// An `h2c` server that resets every stream with `reason`, or sends `GOAWAY` at once.
-async fn h2_refuser(reason: Option<h2::Reason>, requests: Arc<AtomicUsize>) -> SocketAddr {
+/// An `h2c` server that resets every stream with `reason`.
+async fn h2_refuser(reason: h2::Reason, requests: Arc<AtomicUsize>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -189,14 +191,52 @@ async fn h2_refuser(reason: Option<h2::Reason>, requests: Arc<AtomicUsize>) -> S
                 let Ok(mut conn) = h2::server::handshake(stream).await else {
                     return;
                 };
-                let Some(reason) = reason else {
-                    conn.abrupt_shutdown(h2::Reason::NO_ERROR);
-                    let _ = std::future::poll_fn(|cx| conn.poll_closed(cx)).await;
-                    return;
-                };
                 while let Some(Ok((_, mut respond))) = conn.accept().await {
                     requests.fetch_add(1, Ordering::SeqCst);
                     respond.send_reset(reason);
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// An `h2c` server written frame by frame: on the first `HEADERS` it sends `GOAWAY` with a
+/// last-stream-id of 0 (below the stream) and keeps the connection open.
+async fn h2_goaway(requests: Arc<AtomicUsize>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let mut preface = [0u8; 24];
+                if stream.read_exact(&mut preface).await.is_err() {
+                    return;
+                }
+                let _ = stream.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await;
+                loop {
+                    let mut head = [0u8; 9];
+                    if stream.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let len = usize::from(head[0]) << 16
+                        | usize::from(head[1]) << 8
+                        | usize::from(head[2]);
+                    let mut payload = vec![0u8; len];
+                    if stream.read_exact(&mut payload).await.is_err() {
+                        return;
+                    }
+                    if head[3] == 1 {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let ack = [0, 0, 0, 4, 1, 0, 0, 0, 0];
+                        let goaway = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                        let _ = stream.write_all(&ack).await;
+                        let _ = stream.write_all(&goaway).await;
+                    }
                 }
             });
         }
@@ -267,11 +307,12 @@ async fn rty_08_a_pod_refusing_connections_is_skipped_by_every_method_and_protoc
         let mut client = H1Client::connect(f.addr).await;
         for n in 0..150 {
             let method = if n % 2 == 0 { "POST" } else { "GET" };
+            let sent = if n % 2 == 0 { body.clone() } else { Vec::new() };
             let (status, got) = if h2 {
-                let (status, _, got) = h2_call(f.addr, method, body.clone()).await.unwrap();
+                let (status, _, got) = h2_call(f.addr, method, sent).await.unwrap();
                 (status, got)
             } else {
-                let (head, got) = h1_request(&mut client, method, &body).await;
+                let (head, got) = h1_request(&mut client, method, &sent).await;
                 (head[9..12].parse().unwrap(), got)
             };
             assert_eq!(status, 200, "request {n} (h2 {h2})");
@@ -288,12 +329,12 @@ async fn rty_08_a_pod_refusing_connections_is_skipped_by_every_method_and_protoc
             150,
             "each request reached a pod once"
         );
-        let text = f.metrics.encode();
-        let failed = attempts(&text, "connect_failed");
-        assert!(failed >= 1.0, "{text}");
-        assert_eq!(retries(&text, "connect_failed"), failed, "retries");
+        let scrape = f.metrics.encode();
+        let failed = attempts(&scrape, "connect_failed");
+        assert!(failed >= 1.0, "{scrape}");
+        assert_eq!(retries(&scrape, "connect_failed"), failed, "retries");
         assert_eq!(
-            metric(&text, "mimic_mesh_fallbacks_total", &[]),
+            metric(&scrape, "mimic_mesh_fallbacks_total", &[]),
             0.0,
             "no fallback"
         );
@@ -317,15 +358,15 @@ async fn rty_08_five_refusing_pods_end_on_the_cluster_ip_after_three_pod_connect
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert_eq!(body, "cluster");
     }
-    let text = f.metrics.encode();
+    let scrape = f.metrics.encode();
     assert_eq!(
-        attempts(&text, "connect_failed"),
+        attempts(&scrape, "connect_failed"),
         12.0,
         "3 pod connects each"
     );
-    assert_eq!(attempts(&text, "ok"), 4.0);
+    assert_eq!(attempts(&scrape, "ok"), 4.0);
     assert_eq!(
-        metric(&text, "mimic_mesh_fallbacks_total", &[]),
+        metric(&scrape, "mimic_mesh_fallbacks_total", &[]),
         4.0,
         "fallbacks"
     );
@@ -352,9 +393,9 @@ async fn rty_08_the_cluster_ip_refusing_too_answers_503_connect_failed_after_fou
         "{head}"
     );
     assert!(body.is_empty());
-    let text = f.metrics.encode();
-    assert_eq!(attempts(&text, "connect_failed"), 4.0, "{text}");
-    assert_eq!(skipped(&text, "exhausted"), 1.0, "{text}");
+    let scrape = f.metrics.encode();
+    assert_eq!(attempts(&scrape, "connect_failed"), 4.0, "{scrape}");
+    assert_eq!(skipped(&scrape, "exhausted"), 1.0, "{scrape}");
     let lines = logs.access_exactly(1).await;
     assert_eq!(lines[0]["attempts"], 4, "{}", lines[0]);
 }
@@ -362,9 +403,13 @@ async fn rty_08_the_cluster_ip_refusing_too_answers_503_connect_failed_after_fou
 #[tokio::test]
 async fn rty_09_refused_streams_and_goaway_are_retried_on_another_pod() {
     let _logs = capture_logs();
-    for reason in [Some(h2::Reason::REFUSED_STREAM), None] {
+    for reset in [true, false] {
         let seen = Arc::new(AtomicUsize::new(0));
-        let refuser = h2_refuser(reason, seen.clone()).await;
+        let refuser = if reset {
+            h2_refuser(h2::Reason::REFUSED_STREAM, seen.clone()).await
+        } else {
+            h2_goaway(seen.clone()).await
+        };
         let ok = Probe::start("ok", true, Mode::Ok).await;
         let state = state_for(cluster_ip(), &[refuser, ok.addr], |_| {});
         let f = fixture_mesh(cluster_ip(), &state, None).await;
@@ -375,12 +420,10 @@ async fn rty_09_refused_streams_and_goaway_are_retried_on_another_pod() {
             assert_eq!(got, b"ok");
         }
         assert!(ok.seen.lock().unwrap().iter().all(|(_, b, _)| *b == body));
-        let text = f.metrics.encode();
-        if reason.is_some() {
-            let refused = attempts(&text, "refused_stream");
-            assert!(refused >= 1.0, "{text}");
-            assert_eq!(retries(&text, "refused_stream"), refused);
-        }
+        let scrape = f.metrics.encode();
+        let refused = attempts(&scrape, "refused_stream");
+        assert!(refused >= 1.0, "reset {reset}: {scrape}");
+        assert_eq!(retries(&scrape, "refused_stream"), refused);
     }
 }
 
@@ -389,8 +432,8 @@ async fn rty_09_every_pod_refusing_resets_the_app_stream_with_refused_stream() {
     let logs = capture_logs();
     let seen = Arc::new(AtomicUsize::new(0));
     let (a, b) = (
-        h2_refuser(Some(h2::Reason::REFUSED_STREAM), seen.clone()).await,
-        h2_refuser(Some(h2::Reason::REFUSED_STREAM), seen.clone()).await,
+        h2_refuser(h2::Reason::REFUSED_STREAM, seen.clone()).await,
+        h2_refuser(h2::Reason::REFUSED_STREAM, seen.clone()).await,
     );
     let state = state_for(cluster_ip(), &[a, b], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
@@ -405,7 +448,7 @@ async fn rty_09_every_pod_refusing_resets_the_app_stream_with_refused_stream() {
 async fn rty_09_an_internal_error_reset_is_retried_for_a_get_and_not_for_a_post() {
     let _logs = capture_logs();
     let seen = Arc::new(AtomicUsize::new(0));
-    let broken = h2_refuser(Some(h2::Reason::INTERNAL_ERROR), seen.clone()).await;
+    let broken = h2_refuser(h2::Reason::INTERNAL_ERROR, seen.clone()).await;
     let ok = Probe::start("ok", true, Mode::Ok).await;
     let state = state_for(cluster_ip(), &[broken, ok.addr], |_| {});
     let f = fixture_mesh(cluster_ip(), &state, None).await;
@@ -448,10 +491,10 @@ async fn rty_10_a_pod_that_closes_without_answering_is_retried_for_idempotent_me
             "{method}: every request was answered by the other pod"
         );
         let saw = count_of(&closer, method);
-        assert!(saw >= 1 && saw <= 12, "{method}: {saw}");
-        let text = f.metrics.encode();
-        assert_eq!(attempts(&text, "reset"), saw as f64, "{method}");
-        assert_eq!(retries(&text, "reset"), saw as f64, "{method}");
+        assert!((1..=12).contains(&saw), "{method}: {saw}");
+        let scrape = f.metrics.encode();
+        assert_eq!(attempts(&scrape, "reset"), saw as f64, "{method}");
+        assert_eq!(retries(&scrape, "reset"), saw as f64, "{method}");
     }
 }
 
@@ -561,11 +604,11 @@ async fn rty_11_answers_of_the_app_are_passed_as_received_and_never_retried() {
         );
         assert_eq!(body, "bad");
         assert_eq!(bad.count(), 1, "seen once");
-        let text = f.metrics.encode();
+        let scrape = f.metrics.encode();
         assert_eq!(
-            metric(&text, "mimic_mesh_retries_total{", &[]),
+            metric(&scrape, "mimic_mesh_retries_total{", &[]),
             0.0,
-            "{text}"
+            "{scrape}"
         );
     }
     for line in logs.access_exactly(4).await {
@@ -607,10 +650,10 @@ async fn rty_12_a_trusted_refusal_is_retried_on_another_pod_after_a_delay() {
                     .all(|(_, got, _)| *got == body)
             );
         }
-        let text = f.metrics.encode();
-        let refused = attempts(&text, result);
-        assert!(refused >= 1.0, "{text}");
-        assert_eq!(retries(&text, result), refused, "{text}");
+        let scrape = f.metrics.encode();
+        let refused = attempts(&scrape, result);
+        assert!(refused >= 1.0, "{scrape}");
+        assert_eq!(retries(&scrape, result), refused, "{scrape}");
         // The try after a refusal starts at least 12 ms later.
         let mut events: Vec<(Instant, bool)> = Vec::new();
         events.extend(refusing.seen.lock().unwrap().iter().map(|e| (e.2, true)));
@@ -659,16 +702,16 @@ async fn rty_12_every_pod_refusing_passes_the_last_refusal_as_received() {
         4,
         "four tries"
     );
-    let text = f.metrics.encode();
-    assert_eq!(skipped(&text, "exhausted"), 1.0, "{text}");
+    let scrape = f.metrics.encode();
+    assert_eq!(skipped(&scrape, "exhausted"), 1.0, "{scrape}");
     assert_eq!(
         metric(
-            &text,
+            &scrape,
             "mimic_mesh_requests_total{",
             &["reason=\"overloaded\"", "status_class=\"5xx\""]
         ),
         1.0,
-        "{text}"
+        "{scrape}"
     );
     common::counted(
         &f.metrics,
@@ -835,18 +878,18 @@ async fn rty_15_an_unwritten_request_goes_to_another_pod_not_the_cluster_ip() {
     let (head, body) = client.get("/two").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_ne!(body, "cluster");
-    let text = f.metrics.encode();
+    let scrape = f.metrics.encode();
     assert_eq!(
-        metric(&text, "mimic_mesh_reconnects_total", &[]),
+        metric(&scrape, "mimic_mesh_reconnects_total", &[]),
         1.0,
-        "{text}"
+        "{scrape}"
     );
-    assert_eq!(attempts(&text, "connect_failed"), 1.0, "{text}");
-    assert_eq!(retries(&text, "connect_failed"), 1.0, "{text}");
+    assert_eq!(attempts(&scrape, "connect_failed"), 1.0, "{scrape}");
+    assert_eq!(retries(&scrape, "connect_failed"), 1.0, "{scrape}");
     assert_eq!(
-        metric(&text, "mimic_mesh_fallbacks_total", &[]),
+        metric(&scrape, "mimic_mesh_fallbacks_total", &[]),
         0.0,
-        "{text}"
+        "{scrape}"
     );
     assert_eq!(cluster.counts.requests(), 0);
 }
@@ -891,8 +934,7 @@ async fn rty_20_the_metrics_and_the_access_line_follow_the_tries() {
     hold(&[closed_port().await]);
     assert!(client.get("/").await.0.starts_with("HTTP/1.1 200"));
     // One refusal, then ok.
-    pod.set(Mode::RefuseTimes("overloaded", 1));
-    pod.seen.lock().unwrap().clear();
+    pod.set(Mode::RefuseTimes("overloaded", pod.count() + 1));
     hold(&[pod.addr]);
     assert!(client.get("/").await.0.starts_with("HTTP/1.1 200"));
     // One exhausted refusal.
@@ -908,29 +950,29 @@ async fn rty_20_the_metrics_and_the_access_line_follow_the_tries() {
     assert!(post.read().await.is_none());
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let text = f.metrics.encode();
-    assert_eq!(attempts(&text, "ok"), 3.0, "{text}");
-    assert_eq!(attempts(&text, "connect_failed"), 1.0, "{text}");
-    assert_eq!(attempts(&text, "overloaded"), 5.0, "{text}");
-    assert_eq!(attempts(&text, "reset"), 1.0, "{text}");
-    assert_eq!(retries(&text, "connect_failed"), 1.0, "{text}");
-    assert_eq!(retries(&text, "overloaded"), 4.0, "{text}");
-    assert_eq!(retries(&text, "reset"), 0.0, "{text}");
-    assert_eq!(skipped(&text, "exhausted"), 1.0, "{text}");
-    assert_eq!(skipped(&text, "method"), 1.0, "{text}");
+    let scrape = f.metrics.encode();
+    assert_eq!(attempts(&scrape, "ok"), 3.0, "{scrape}");
+    assert_eq!(attempts(&scrape, "connect_failed"), 1.0, "{scrape}");
+    assert_eq!(attempts(&scrape, "overloaded"), 5.0, "{scrape}");
+    assert_eq!(attempts(&scrape, "reset"), 1.0, "{scrape}");
+    assert_eq!(retries(&scrape, "connect_failed"), 1.0, "{scrape}");
+    assert_eq!(retries(&scrape, "overloaded"), 4.0, "{scrape}");
+    assert_eq!(retries(&scrape, "reset"), 0.0, "{scrape}");
+    assert_eq!(skipped(&scrape, "exhausted"), 1.0, "{scrape}");
+    assert_eq!(skipped(&scrape, "method"), 1.0, "{scrape}");
     assert_eq!(
-        metric(&text, "mimic_mesh_requests_total{", &[]),
+        metric(&scrape, "mimic_mesh_requests_total{", &[]),
         5.0,
-        "{text}"
+        "{scrape}"
     );
     assert_eq!(
         metric(
-            &text,
+            &scrape,
             "mimic_mesh_endpoint_requests_total{",
             &[&format!("endpoint=\"{}\"", pod.addr)]
         ),
         refused_by_pod as f64,
-        "{text}"
+        "{scrape}"
     );
     let lines = logs.access_exactly(5).await;
     let tries: Vec<u64> = lines
@@ -947,14 +989,14 @@ async fn rty_20_the_metrics_and_the_access_line_follow_the_tries() {
     state.hold(common::mesh_pods::view_text(&[], 0, false), "\"99-a\"");
     let now = Instant::now();
     state.evict(now + Duration::from_secs(301));
-    let text = f.metrics.encode();
+    let scrape = f.metrics.encode();
     for name in [
         "mimic_mesh_attempts_total{",
         "mimic_mesh_retries_total{",
         "mimic_mesh_retries_skipped_total{",
     ] {
         assert_eq!(
-            metric(&text, name, &["backend=\"shop/cart:80\""]),
+            metric(&scrape, name, &["backend=\"shop/cart:80\""]),
             0.0,
             "{name}"
         );
@@ -962,7 +1004,52 @@ async fn rty_20_the_metrics_and_the_access_line_follow_the_tries() {
             !text
                 .lines()
                 .any(|l| l.starts_with(name) && l.contains("shop/cart:80")),
-            "{name} series left:\n{text}"
+            "{name} series left:\n{scrape}"
         );
     }
+}
+
+#[tokio::test]
+async fn rty_14_the_total_buffer_in_use_streams_the_next_request() {
+    let _logs = capture_logs();
+    let slow = Pod::http1("slow", 1500).await;
+    let state = state_for(cluster_ip(), &[slow.addr], |c| {
+        c.retry_buffer_total = 1024 * 1024
+    });
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let body = payload(64 * 1024);
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let (addr, body) = (f.addr, body.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut client = H1Client::connect(addr).await;
+            h1_request(&mut client, "POST", &body).await.0
+        }));
+    }
+    let mut peak = 0.0f64;
+    for _ in 0..250 {
+        let held = metric(&f.metrics.encode(), "mimic_mesh_retry_buffer_bytes", &[]);
+        peak = peak.max(held);
+        assert!(held <= 1024.0 * 1024.0, "{held}");
+        if held >= 1024.0 * 1024.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(peak, 1024.0 * 1024.0, "the 16 requests hold the total");
+    let refusing = Probe::start("r", false, Mode::Refuse("overloaded")).await;
+    state.hold(view_on(cluster_ip(), &[refusing.addr], 0, true), "\"2-a\"");
+    let mut client = H1Client::connect(f.addr).await;
+    let (head, _) = h1_request(&mut client, "POST", &body).await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert_eq!(refusing.count(), 1, "not sent again");
+    assert_eq!(skipped(&f.metrics.encode(), "buffer"), 1.0);
+    for task in tasks {
+        assert!(task.await.unwrap().starts_with("HTTP/1.1 200"));
+    }
+    assert_eq!(
+        metric(&f.metrics.encode(), "mimic_mesh_retry_buffer_bytes", &[]),
+        0.0,
+        "released"
+    );
 }
