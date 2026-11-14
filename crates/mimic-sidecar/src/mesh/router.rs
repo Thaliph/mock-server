@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use mimic_core::mesh::lb::Endpoints;
 use mimic_core::mesh::policy::Policy;
 use mimic_core::mesh::retry::{Budget, Decision, Next, Planner, Verdict, decide};
+use mimic_core::mesh::route::{RouteView, Table};
 use mimic_core::mesh::view::View;
 use prometheus_client::metrics::gauge::Gauge;
 
@@ -173,6 +174,13 @@ impl Limiter {
     }
 }
 
+/// The routes of one Service port and the table that selects among their matches (spec §7.9
+/// "Routing"), built when a view is applied.
+pub(crate) struct Routed {
+    pub routes: Vec<RouteView>,
+    pub table: Table,
+}
+
 /// The endpoints of one Service port.
 pub(crate) struct Backend {
     /// `<namespace>/<name>`.
@@ -183,6 +191,8 @@ pub(crate) struct Backend {
     pub(crate) retry: Arc<ServiceRetry>,
     limiter: Mutex<Limiter>,
     state: Mutex<State>,
+    /// The routes of the port in the view held; none when it has no route.
+    routed: RwLock<Option<Arc<Routed>>>,
 }
 
 impl Backend {
@@ -196,7 +206,28 @@ impl Backend {
                 set: Endpoints::new(Duration::ZERO),
                 endpoints: Vec::new(),
             }),
+            routed: RwLock::new(None),
         }
+    }
+
+    /// The routes of the port now, if it has any.
+    pub(crate) fn routed(&self) -> Option<Arc<Routed>> {
+        self.routed
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A new view: the table of the routes that apply to `port`.
+    fn set_routes(&self, routes: &[RouteView], port: u16) {
+        let table = Table::new(routes, port);
+        let routed = (!table.is_empty()).then(|| {
+            Arc::new(Routed {
+                routes: routes.to_vec(),
+                table,
+            })
+        });
+        *self.routed.write().unwrap_or_else(PoisonError::into_inner) = routed;
     }
 
     /// Replaces the endpoints; returns the addresses that left.
@@ -356,15 +387,19 @@ impl Router {
 
     /// A number below `n`.
     fn draw(&self, n: usize) -> usize {
+        // The high bits of a 128-bit product: no modulo bias worth a branch.
+        ((u128::from(self.random()) * n as u128) >> 64) as usize
+    }
+
+    /// A uniform 64-bit value (SplitMix64).
+    pub(crate) fn random(&self) -> u64 {
         let mut z = self
             .seed
             .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
             .wrapping_add(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        // The high bits of a 128-bit product: no modulo bias worth a branch.
-        ((u128::from(z) * n as u128) >> 64) as usize
+        z ^ (z >> 31)
     }
 
     /// The sidecar's monotonic clock, the one the retry budget is given.
@@ -421,6 +456,7 @@ impl Router {
                 let backend = previous
                     .remove(&label)
                     .unwrap_or_else(|| Arc::new(Backend::new(key, label.clone(), retry.clone())));
+                backend.set_routes(&service.routes, *port);
                 self.metrics.backend_seen(&label);
                 for gone in backend.update(&addrs, window, age, &self.metrics) {
                     self.metrics.left(&backend.label, gone, now);

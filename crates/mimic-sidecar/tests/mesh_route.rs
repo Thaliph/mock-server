@@ -240,17 +240,17 @@ async fn rte_47_the_access_line_names_the_route_rule_backend_and_pod() {
     for _ in 0..20 {
         client.get("/").await;
     }
-    for line in logs.access_exactly(20).await {
-        assert_eq!(line["route"], CANARY, "{line}");
-        assert_eq!(line["rule"], 0, "{line}");
-        let backend = line["backend"].as_str().unwrap();
+    for entry in logs.access_exactly(20).await {
+        assert_eq!(entry["route"], CANARY, "{entry}");
+        assert_eq!(entry["rule"], 0, "{entry}");
+        let backend = entry["backend"].as_str().unwrap();
         let pod = if backend == "shop/cart-v1:80" {
             v1.addr
         } else {
-            assert_eq!(backend, "shop/cart-v2:80", "{line}");
+            assert_eq!(backend, "shop/cart-v2:80", "{entry}");
             v2.addr
         };
-        assert_eq!(line["upstream"], pod.to_string(), "{line}");
+        assert_eq!(entry["upstream"], pod.to_string(), "{entry}");
     }
 }
 
@@ -424,14 +424,18 @@ async fn rte_49_the_sidecar_answers_no_route_no_backend_and_invalid_backend() {
         ),
     )
     .await;
-    assert!(discovery.report().endpoints().is_empty(), "recorded");
+    let recorded = discovery.report().to_json().unwrap();
+    assert!(
+        !recorded.contains("\"404\"") && !recorded.contains("\"500\""),
+        "an answer of the sidecar was recorded: {recorded}"
+    );
     let lines = logs.access_exactly(3 + 2000).await;
-    for line in lines
+    for entry in lines
         .iter()
         .filter(|l| l["status"] == 404 || l["status"] == 500)
     {
-        assert!(line.get("backend").is_none_or(|b| b.is_null()), "{line}");
-        assert!(line.get("upstream").is_none_or(|b| b.is_null()), "{line}");
+        assert!(entry.get("backend").is_none_or(|b| b.is_null()), "{entry}");
+        assert!(entry.get("upstream").is_none_or(|b| b.is_null()), "{entry}");
     }
 }
 
@@ -570,13 +574,16 @@ async fn rte_52_an_upgrade_request_goes_to_a_pod_of_the_service_itself() {
     ]));
     let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
+    // A request that routes first, so that the connection is a mesh-routed one.
+    assert_eq!(client.get("/nothing").await.1, "v2");
     client
         .send(b"GET /ws HTTP/1.1\r\nHost: cart.shop.svc\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
         .await;
     let (head, _) = client.read().await.expect("the 101");
     assert!(head.starts_with("HTTP/1.1 101"), "{head}");
     assert_eq!(own.counts.requests(), 1, "a pod of the Service itself");
-    assert_eq!(v1.counts.requests() + v2.counts.requests(), 0);
+    assert_eq!(v2.counts.requests(), 1);
+    assert_eq!(v1.counts.requests(), 0);
 }
 
 const MODIFIERS: &str = r#"{"requestHeaders":{"add":[{"name":"x-add","value":"a"}],"remove":["x-gone"],"set":[{"name":"x-set","value":"v"}]},"responseHeaders":{"set":[{"name":"x-resp","value":"r"}]}}"#;
@@ -639,10 +646,10 @@ async fn rte_50_the_backend_gets_the_head_with_the_modifiers_applied_on_http1() 
 }
 
 /// A server that records the head of each request.
-async fn spy_h2() -> (SocketAddr, Arc<Mutex<Vec<hyper::HeaderMap>>>) {
+async fn spy_h2() -> (SocketAddr, Arc<Mutex<Vec<(hyper::HeaderMap, String)>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let seen: Arc<Mutex<Vec<hyper::HeaderMap>>> = Arc::default();
+    let seen: Arc<Mutex<Vec<(hyper::HeaderMap, String)>>> = Arc::default();
     let log = seen.clone();
     tokio::spawn(async move {
         loop {
@@ -653,11 +660,10 @@ async fn spy_h2() -> (SocketAddr, Arc<Mutex<Vec<hyper::HeaderMap>>>) {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let log = log.clone();
                 async move {
-                    let mut headers = req.headers().clone();
-                    if let Some(a) = req.uri().authority() {
-                        headers.insert(":authority", a.as_str().parse().unwrap());
-                    }
-                    log.lock().unwrap().push(headers);
+                    let authority = req.uri().authority().map(|a| a.to_string());
+                    log.lock()
+                        .unwrap()
+                        .push((req.headers().clone(), authority.unwrap_or_default()));
                     Ok::<_, std::convert::Infallible>(
                         Response::builder()
                             .header("x-up", "1")
@@ -708,13 +714,13 @@ async fn rte_50_the_backend_gets_the_head_with_the_modifiers_applied_on_h2c() {
     let _ = response.into_body().collect().await.unwrap();
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
-    let head = &seen[0];
+    let (head, authority) = &seen[0];
     assert_eq!(head["x-keep"], "1");
     assert!(head.get("x-gone").is_none());
     assert_eq!(head.get_all("x-set").iter().count(), 1);
     assert_eq!(head["x-set"], "v");
     assert_eq!(head.get_all("x-add").iter().count(), 1);
-    assert_eq!(head[":authority"], "cart.shop.svc");
+    assert_eq!(authority, "cart.shop.svc");
 }
 
 #[tokio::test]
@@ -797,14 +803,17 @@ async fn rte_50_discovery_records_the_request_the_app_sent_and_the_modified_resp
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let json = discovery.report().to_json().unwrap().to_lowercase();
+    let report = discovery.report().to_json().unwrap().to_lowercase();
     assert!(
-        json.contains("x-gone"),
-        "the request as the app sent it: {json}"
+        report.contains("x-gone"),
+        "the request as the app sent it: {report}"
     );
     assert!(
-        json.contains("x-resp"),
-        "the response as the app got it: {json}"
+        report.contains("x-resp"),
+        "the response as the app got it: {report}"
     );
-    assert!(!json.contains("x-set") && !json.contains("x-add"), "{json}");
+    assert!(
+        !report.contains("x-set") && !report.contains("x-add"),
+        "{report}"
+    );
 }

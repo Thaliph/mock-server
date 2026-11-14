@@ -3,6 +3,7 @@
 //! a query string or a body.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mimic_core::discovery::redact;
@@ -74,6 +75,10 @@ pub struct Exchange {
     pub upstream: Option<SocketAddr>,
     /// Mesh-routed requests only: the number of tries (spec §7.9 "Retries").
     pub attempts: Option<u32>,
+    /// Routed requests only (spec §7.9 "Routing"): the route that matched, `<namespace>/<name>`,
+    /// and the index of its rule.
+    pub route: Option<Arc<str>>,
+    pub rule: Option<usize>,
 }
 
 /// One finished opaque or TLS connection.
@@ -138,6 +143,8 @@ pub fn exchange(e: &Exchange) {
         backend = e.backend.as_deref(),
         upstream = e.upstream.map(|a| a.to_string()).as_deref(),
         attempts = e.attempts,
+        route = e.route.as_deref(),
+        rule = e.rule,
         "http exchange"
     );
 }
