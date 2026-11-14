@@ -7,7 +7,7 @@ use std::time::Duration;
 use mimic_core::Mode;
 use mimic_core::mesh::input::{
     Config, Destination, Endpoint, EndpointSlice, GrantFrom, GrantTo, MIMIC_GROUP, ReferenceGrant,
-    Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
+    Route, Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
 };
 use mimic_core::mesh::view::{Limits, View};
 use tokio::time::Instant;
@@ -115,6 +115,8 @@ pub(crate) fn synced(hub: &Hub) {
     hub.feed_deployments(Event::InitDone);
     hub.feed_grants(Event::Init);
     hub.feed_grants(Event::InitDone);
+    hub.feed_routes(Event::Init);
+    hub.feed_routes(Event::InitDone);
 }
 
 pub(crate) fn put_service(hub: &Hub, s: Service) {
@@ -131,6 +133,10 @@ pub(crate) fn put_config(hub: &Hub, c: Config) {
 
 pub(crate) fn put_deployment(hub: &Hub, ns: &str, name: &str) {
     hub.feed_deployments(Event::Apply(key(ns, name), ()));
+}
+
+pub(crate) fn put_route(hub: &Hub, r: Route) {
+    hub.feed_routes(Event::Apply(key(&r.namespace, &r.name), r));
 }
 
 pub(crate) fn put_grant(hub: &Hub, name: &str, g: ReferenceGrant) {
@@ -490,7 +496,7 @@ async fn msh_26_a_view_larger_than_the_cache_is_served_and_not_cached() {
 }
 
 #[derive(Clone, Default)]
-struct Lines(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Lines(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Lines {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
