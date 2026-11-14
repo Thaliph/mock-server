@@ -245,6 +245,10 @@ async fn h2_goaway(requests: Arc<AtomicUsize>, last: u8) -> SocketAddr {
                         let goaway = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, last, 0, 0, 0, 0];
                         let _ = stream.write_all(&ack).await;
                         let _ = stream.write_all(&goaway).await;
+                        if last > 0 {
+                            // The stream was processed: the pod goes away with it unanswered.
+                            return;
+                        }
                     }
                 }
             });

@@ -391,7 +391,7 @@ impl Serving {
                 conn: Conn { pick, lease },
             },
             Sent::Failed(e) => Tried::Failed {
-                failure: pool::failure(&e),
+                failure: pool::failure(&e, lease.goaway()),
                 error: Some(e),
                 pick,
                 written: true,

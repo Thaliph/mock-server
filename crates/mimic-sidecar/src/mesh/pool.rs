@@ -130,10 +130,22 @@ pub(crate) enum Lease {
         active: Arc<AtomicUsize>,
         last_used: Arc<AtomicU64>,
         since: Instant,
+        /// The last-stream-id of the `GOAWAY` the pod sent (`u32::MAX` while none came).
+        goaway: Arc<AtomicU32>,
     },
 }
 
 impl Lease {
+    /// The last-stream-id of a `GOAWAY` the pod sent on this connection (HTTP/2).
+    pub(crate) fn goaway(&self) -> Option<u32> {
+        match self {
+            Lease::Http2 { goaway, .. } => {
+                Some(goaway.load(Ordering::Acquire)).filter(|id| *id != u32::MAX)
+            }
+            Lease::Http1 { .. } => None,
+        }
+    }
+
     /// What tells this connection from another of its pool, for a stream sent again that must
     /// not take the one that failed (HTTP/2 only; 0 for HTTP/1, which opens a new one).
     pub(crate) fn id(&self) -> usize {
@@ -177,7 +189,12 @@ impl Lease {
 /// How a request that was written failed before any response head (spec §7.9 "Retries"): a
 /// stream the pod refused (`REFUSED_STREAM`, or a `GOAWAY` that left it unprocessed), a head
 /// that does not parse (the pod did answer), or a reset.
-pub(crate) fn failure(e: &hyper::Error) -> mimic_core::mesh::retry::Failure {
+///
+/// `goaway` is the last-stream-id of a `GOAWAY` the pod sent on the connection, when it did. `h2`
+/// gives a remote `GOAWAY` error to the streams above that id and also to every stream when the
+/// connection later fails, and the error does not say which; only an id of 0 leaves no doubt (no
+/// stream was processed), any other is a reset, retried by the rule of idempotent methods.
+pub(crate) fn failure(e: &hyper::Error, goaway: Option<u32>) -> mimic_core::mesh::retry::Failure {
     use mimic_core::mesh::retry::Failure;
     if e.is_parse() || e.is_parse_status() || e.is_parse_too_large() {
         return Failure::Response;
@@ -185,8 +202,10 @@ pub(crate) fn failure(e: &hyper::Error) -> mimic_core::mesh::retry::Failure {
     let mut cause = std::error::Error::source(e);
     while let Some(err) = cause {
         if let Some(h2) = err.downcast_ref::<h2::Error>() {
-            let refused = h2.reason() == Some(h2::Reason::REFUSED_STREAM) && h2.is_remote()
-                || h2.is_go_away() && h2.is_remote();
+            let refused = h2.reason() == Some(h2::Reason::REFUSED_STREAM)
+                && h2.is_remote()
+                && !h2.is_go_away()
+                || h2.is_go_away() && h2.is_remote() && goaway == Some(0);
             return if refused {
                 Failure::RefusedStream
             } else {
@@ -382,6 +401,8 @@ struct Conn {
     last_used: Arc<AtomicU64>,
     /// The peer's `MAX_CONCURRENT_STREAMS`, as it announced it (`u32::MAX` until it does).
     max_streams: Arc<AtomicU32>,
+    /// The last-stream-id of the peer's `GOAWAY` (`u32::MAX` until one comes).
+    goaway: Arc<AtomicU32>,
 }
 
 pub(crate) struct H2Pool {
@@ -428,6 +449,7 @@ impl H2Pool {
             active: Arc::new(AtomicUsize::new(1)),
             last_used: Arc::new(AtomicU64::new(0)),
             since: self.started,
+            goaway: Arc::new(AtomicU32::new(u32::MAX)),
         })
     }
 
@@ -438,6 +460,7 @@ impl H2Pool {
             active: conn.active.clone(),
             last_used: conn.last_used.clone(),
             since: self.started,
+            goaway: conn.goaway.clone(),
         }
     }
 
@@ -467,8 +490,10 @@ impl H2Pool {
         if lock(&self.conns).len() < MAX_H2_CONNECTIONS {
             let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
             let max_streams = Arc::new(AtomicU32::new(u32::MAX));
+            let goaway = Arc::new(AtomicU32::new(u32::MAX));
+            let snoop = Snoop::new(stream, max_streams.clone()).with_goaway(goaway.clone());
             let (sender, connection) = http2::Builder::new(TokioExecutor::new())
-                .handshake(TokioIo::new(Snoop::new(stream, max_streams.clone())))
+                .handshake(TokioIo::new(snoop))
                 .await
                 .map_err(io::Error::other)?;
             tokio::spawn(async move {
@@ -479,6 +504,7 @@ impl H2Pool {
                 active: Arc::new(AtomicUsize::new(0)),
                 last_used: Arc::new(AtomicU64::new(0)),
                 max_streams,
+                goaway,
             };
             let lease = self.lease(&conn);
             lock(&self.conns).push(conn);
@@ -544,10 +570,20 @@ struct Snoop {
     remaining: usize,
     /// The frame in progress is a SETTINGS frame (not an acknowledgement) of a readable size.
     settings: bool,
+    /// The frame in progress is a GOAWAY frame.
+    goaway_frame: bool,
+    /// Where the last-stream-id of a GOAWAY goes.
+    goaway: Arc<AtomicU32>,
     payload: Vec<u8>,
 }
 
 impl Snoop {
+    /// Also reads the last-stream-id of the GOAWAY frames into `goaway`.
+    fn with_goaway(mut self, goaway: Arc<AtomicU32>) -> Snoop {
+        self.goaway = goaway;
+        self
+    }
+
     fn new(inner: Wire, max_streams: Arc<AtomicU32>) -> Snoop {
         Snoop {
             inner,
@@ -556,6 +592,8 @@ impl Snoop {
             head_len: 0,
             remaining: 0,
             settings: false,
+            goaway_frame: false,
+            goaway: Arc::new(AtomicU32::new(u32::MAX)),
             payload: Vec::new(),
         }
     }
@@ -576,11 +614,17 @@ impl Snoop {
                 self.settings = self.head[3] == 0x4
                     && self.head[4] & 0x1 == 0
                     && self.remaining <= MAX_SETTINGS_PAYLOAD;
+                self.goaway_frame = self.head[3] == 0x7 && self.remaining >= 4;
                 self.payload.clear();
             } else {
                 let n = self.remaining.min(data.len());
-                if self.settings {
-                    self.payload.extend_from_slice(&data[..n]);
+                if self.settings || self.goaway_frame && self.payload.len() < 4 {
+                    let take = if self.settings {
+                        n
+                    } else {
+                        n.min(4 - self.payload.len())
+                    };
+                    self.payload.extend_from_slice(&data[..take]);
                 }
                 self.remaining -= n;
                 data = &data[n..];
@@ -597,8 +641,15 @@ impl Snoop {
                         }
                     }
                 }
+                if self.goaway_frame
+                    && let Some(id) = self.payload.first_chunk::<4>()
+                {
+                    let id = u32::from_be_bytes(*id) & 0x7fff_ffff;
+                    self.goaway.fetch_min(id, Ordering::AcqRel);
+                }
                 self.head_len = 0;
                 self.settings = false;
+                self.goaway_frame = false;
             }
         }
     }

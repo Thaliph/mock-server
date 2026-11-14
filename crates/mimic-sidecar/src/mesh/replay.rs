@@ -154,6 +154,12 @@ struct Shared {
     trailers: Option<HeaderMap>,
     /// A frame was read from the app.
     read: bool,
+    /// The number of tries that took the body: only the last one reads it.
+    generation: u64,
+    /// The request ended before an answer was delivered: no try reads any more.
+    closed: bool,
+    /// An answer was delivered: the request is not retried and its last try goes on.
+    delivered: bool,
 }
 
 /// The body of a request over its tries: what the app sends is read once, held for replay while
@@ -177,6 +183,9 @@ impl Source {
                 ended: false,
                 trailers: None,
                 read: false,
+                generation: 0,
+                closed: false,
+                delivered: false,
             })),
             hint,
         }
@@ -195,14 +204,25 @@ impl Source {
 
     /// A response head came back: the bytes held are released.
     pub(crate) fn release(&self) {
-        lock(&self.shared).replay.release();
+        let mut shared = lock(&self.shared);
+        shared.delivered = true;
+        shared.replay.release();
     }
 
     /// The request for one try: `head` and a body that starts with the bytes held.
     pub(crate) fn request(&self, head: &Parts) -> Request<Attempt> {
-        let queue = lock(&self.shared).replay.chunks().iter().cloned().collect();
+        // The try before this one reads no more: the bytes it took are in the snapshot.
+        let (queue, generation) = {
+            let mut shared = lock(&self.shared);
+            shared.generation += 1;
+            (
+                shared.replay.chunks().iter().cloned().collect(),
+                shared.generation,
+            )
+        };
         let mut request = Request::new(Attempt {
             shared: self.shared.clone(),
+            generation,
             queue,
             hint: self.hint,
             trailed: false,
@@ -216,14 +236,34 @@ impl Source {
     }
 }
 
+impl Drop for Source {
+    /// A request that ends before its answer (the app left) frees the bytes held at once, and
+    /// the tries still pending end their bodies.
+    fn drop(&mut self) {
+        let mut shared = lock(&self.shared);
+        if !shared.delivered {
+            shared.closed = true;
+            shared.replay.release();
+        }
+    }
+}
+
 /// The body of one try.
 pub(crate) struct Attempt {
     shared: Arc<Mutex<Shared>>,
+    generation: u64,
     /// What was held when the try began, still to send.
     queue: VecDeque<Bytes>,
     hint: SizeHint,
     /// The trailers were handed over.
     trailed: bool,
+}
+
+impl Attempt {
+    /// A later try took the body, or the request is over: this one ends and reads nothing.
+    fn stale(&self, shared: &Shared) -> bool {
+        shared.closed || shared.generation != self.generation
+    }
 }
 
 impl Body for Attempt {
@@ -235,10 +275,14 @@ impl Body for Attempt {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         let this = self.get_mut();
+        let mut shared = lock(&this.shared);
+        if this.stale(&shared) {
+            this.queue.clear();
+            return Poll::Ready(None);
+        }
         if let Some(chunk) = this.queue.pop_front() {
             return Poll::Ready(Some(Ok(Frame::data(chunk))));
         }
-        let mut shared = lock(&this.shared);
         if shared.ended {
             if !std::mem::replace(&mut this.trailed, true)
                 && let Some(trailers) = shared.trailers.clone()
@@ -277,10 +321,13 @@ impl Body for Attempt {
     }
 
     fn is_end_stream(&self) -> bool {
+        let shared = lock(&self.shared);
+        if self.stale(&shared) {
+            return true;
+        }
         if !self.queue.is_empty() {
             return false;
         }
-        let shared = lock(&self.shared);
         if shared.ended {
             shared.trailers.is_none() || self.trailed
         } else {
