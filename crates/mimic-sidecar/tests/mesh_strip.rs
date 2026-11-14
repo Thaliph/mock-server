@@ -113,6 +113,7 @@ async fn start(app: SocketAddr, mesh: Option<&MeshState>) -> Rig {
 }
 
 impl Rig {
+    /// The counter, 0 until the first field was removed.
     fn stripped(&self) -> u64 {
         self.metrics
             .encode()
@@ -120,7 +121,7 @@ impl Rig {
             .find(|l| l.starts_with("mimic_mesh_stripped_headers_total"))
             .and_then(|l| l.rsplit(' ').next())
             .and_then(|v| v.parse().ok())
-            .expect("the counter exists")
+            .unwrap_or(0)
     }
 }
 
@@ -167,7 +168,8 @@ async fn rty_18_http1_content_length_answers_lose_the_fields_on_a_keep_alive_con
 #[tokio::test]
 async fn rty_18_http1_chunked_and_close_delimited_bodies_are_untouched() {
     let chunked: &'static [u8] = b"HTTP/1.1 200 OK\r\nx-mimic-error: overloaded\r\nTransfer-Encoding: chunked\r\nX-Mimic-Endpoint: 10.0.0.9:80\r\nx-mimic-other: 1\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-    let want: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let want: &[u8] =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     let state = meshed();
     let rig = start(app(chunked, false).await, Some(&state)).await;
     exchange(rig.addr, GET, 2, want, false).await;
@@ -279,10 +281,11 @@ async fn rty_18_h2c_the_fields_are_gone_and_the_others_kept() {
     let off = start(app_h2(HEADERS).await, None).await;
     for (rig, stripped) in [(&on, true), (&off, false)] {
         let stream = TcpStream::connect(rig.addr).await.unwrap();
-        let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-            .handshake::<_, Full<Bytes>>(TokioIo::new(stream))
-            .await
-            .unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+                .await
+                .unwrap();
         tokio::spawn(connection);
         for _ in 0..2 {
             let request = Request::get("http://cart.shop.svc/")
@@ -303,4 +306,3 @@ async fn rty_18_h2c_the_fields_are_gone_and_the_others_kept() {
     }
     assert_eq!(on.stripped(), 6, "3 per response");
 }
-
