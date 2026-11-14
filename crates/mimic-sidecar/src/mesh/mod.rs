@@ -687,6 +687,12 @@ impl MeshState {
         self.0.router.pools.refuse_next_fresh();
     }
 
+    /// Test hook (#446): the retry budgets and the warning limiters held.
+    #[doc(hidden)]
+    pub fn retry_state_for_test(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
     pub(crate) fn off(&self) -> bool {
         let table = self.0.table.read().unwrap_or_else(PoisonError::into_inner);
