@@ -626,6 +626,11 @@ impl MeshState {
         !self.off()
     }
 
+    /// The app sent a response the codec cannot frame and its connection is closed (spec §4.1).
+    pub(crate) fn unframed_close(&self) {
+        self.0.router.metrics.unframed_close();
+    }
+
     /// `n` `x-mimic-*` fields were removed from a response of the app.
     pub(crate) fn stripped(&self, n: usize) {
         if n > 0 {

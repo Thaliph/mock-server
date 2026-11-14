@@ -441,6 +441,8 @@ async fn rty_18_an_unframeable_response_is_not_relayed_and_closes_the_connection
 
 #[tokio::test]
 async fn rty_18_an_invalid_body_framing_closes_the_connection_before_the_forged_response() {
+    // Every test that can log the close captures logs (see `capture_logs`).
+    let _logs = capture_logs();
     let reply = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nHTTP/1.1 503 X\r\nx-mimic-error: overloaded\r\n\r\n".to_vec();
     let state = meshed();
     let rig = start(app_with(reply).await, Some(&state)).await;
@@ -486,6 +488,8 @@ async fn rty_18_with_the_fields_not_removed_an_unframeable_response_is_relayed_u
 
 #[tokio::test]
 async fn rty_18_endless_blank_lines_before_the_status_line_close_the_connection_unrelayed() {
+    // Every test that can log the close captures logs (see `capture_logs`).
+    let _logs = capture_logs();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

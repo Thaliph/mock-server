@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mimic_core::mesh::strip::strip;
-use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT, READ_AHEAD};
+use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT, READ_AHEAD, Side as FrameSide};
 use prometheus_client::metrics::histogram::Histogram;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -550,6 +550,22 @@ impl<F: FnMut(Event)> Relay<F> {
             .push_back(load);
     }
 
+    /// The app sent a response the codec cannot frame while the fields are removed: counted and
+    /// logged (no byte of the app), and the error that ends the relay and closes both sockets.
+    fn unframed_close(&self) -> Failure {
+        if let Some(mesh) = &self.strip {
+            mesh.unframed_close();
+        }
+        tracing::warn!(
+            target: "mesh",
+            "response of the app the codec cannot frame: connection closed"
+        );
+        (
+            Side::Upstream,
+            io::Error::other("response the codec cannot frame"),
+        )
+    }
+
     /// Destination to client when load testing is on or the mesh strips (spec §4.1): the head
     /// of a final response is held whole to lose its `x-mimic-*` lines (meshed) and, for a load
     /// request, to lose its `x-mimic-load` lines and gain one `ok`; every other byte goes
@@ -596,13 +612,14 @@ impl<F: FnMut(Event)> Relay<F> {
             {
                 let blanks = leading_blanks(&held);
                 match response_head(&held) {
-                    Head::Open if stripping && blanks >= HEAD_LIMIT => {
-                        // The codec skips blank lines without end and so frames this
-                        // connection: the head cannot be judged, so nothing is relayed.
-                        return Err((
-                            Side::Upstream,
-                            io::Error::other("response head without status line"),
-                        ));
+                    Head::Open
+                        if stripping
+                            && (blanks >= HEAD_LIMIT || held.len() - blanks >= HEAD_LIMIT) =>
+                    {
+                        // A head of 64 KiB that is not complete cannot be completed within the
+                        // limit, and the codec skips blank lines without end: either way the
+                        // head cannot be judged, so nothing of it is relayed.
+                        return Err(self.unframed_close());
                     }
                     Head::Open if held.len() - blanks < HEAD_LIMIT => {
                         // A head that stalls is released after the stall when only a load
@@ -657,21 +674,30 @@ impl<F: FnMut(Event)> Relay<F> {
                 }
             }
             let limit = interim.unwrap_or(held.len());
-            let ((used, popped, seen), ()) = {
+            let ((used, popped, seen, unframed), ()) = {
                 let out = self.with(|codec| {
                     let before = codec.pending();
                     let (used, events) = codec.server_bytes_limited(&held[..limit]);
+                    let unframed = events.iter().any(
+                        |event| matches!(event, Event::Unframed(u) if u.side == FrameSide::Server),
+                    );
                     (
                         (
                             used,
                             before.saturating_sub(codec.pending()),
                             !events.is_empty(),
+                            unframed,
                         ),
                         events,
                     )
                 });
                 (out, ())
             };
+            if stripping && unframed {
+                // The codec stops following this connection: what the app says next could not
+                // be held and stripped, so nothing of it is relayed (spec §4.1).
+                return Err(self.unframed_close());
+            }
             {
                 let mut answers = self
                     .answers

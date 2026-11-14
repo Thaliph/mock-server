@@ -98,6 +98,8 @@ pub(crate) struct MeshMetrics {
     /// Without labels, and made by the first removal: nothing of the mesh shows until then
     /// (MSH-51).
     stripped: Family<Vec<(String, String)>, Counter>,
+    /// Same as `stripped`: inbound connections closed on a response the codec cannot frame.
+    unframed: Family<Vec<(String, String)>, Counter>,
     slots: Mutex<Slots>,
     /// By backend label.
     series: Mutex<BTreeMap<String, Series>>,
@@ -114,6 +116,7 @@ impl MeshMetrics {
             reconnects: Family::default(),
             fallbacks: Family::default(),
             stripped: Family::default(),
+            unframed: Family::default(),
             slots: Mutex::new(Slots::default()),
             series: Mutex::new(BTreeMap::new()),
             max_labels,
@@ -157,6 +160,16 @@ impl MeshMetrics {
             "x-mimic-* fields removed from the responses of the app",
             self.stripped.clone(),
         );
+        registry.register(
+            "mesh_unframed_closes",
+            "Inbound connections closed on a response of the app the codec cannot frame",
+            self.unframed.clone(),
+        );
+    }
+
+    /// An inbound connection closed on a response the codec cannot frame.
+    pub(crate) fn unframed_close(&self) {
+        self.unframed.get_or_create(&Vec::new()).inc();
     }
 
     /// `n` fields removed from the response of the app.
