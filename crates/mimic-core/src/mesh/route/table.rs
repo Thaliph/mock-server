@@ -93,7 +93,7 @@ impl Table {
                 }
             }
         }
-        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.sort_by_key(|(key, _)| *key);
         Table {
             entries: keyed.into_iter().map(|(_, e)| e).collect(),
             routed,

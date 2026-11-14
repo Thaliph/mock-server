@@ -93,7 +93,7 @@ proptest! {
         let mut count = vec![0u32; weights.len()];
         for k in 0..total {
             // r = ceil(k * 2^64 / W)
-            let r = ((k << 64) + total - 1) / total;
+            let r = (k << 64).div_ceil(total);
             let Pick::Backend(i) = draw(&b, r as u64) else {
                 return Err(TestCaseError::fail("no backend with a weight"));
             };
