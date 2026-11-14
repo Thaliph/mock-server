@@ -290,7 +290,7 @@ fn rty_43_a_failure_that_is_not_retried_leaves_the_counts_unchanged() {
             Decision::Skipped(Skip::Method),
         ),
         (
-            Failure::Connect,
+            Failure::Reset,
             "GET",
             false,
             true,

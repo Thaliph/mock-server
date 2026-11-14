@@ -246,7 +246,7 @@ impl Planner {
     /// Whether a further try is allowed: the planner is neither out of tries nor past the
     /// original destination.
     pub fn has_try(&self) -> bool {
-        unimplemented!()
+        !self.original && self.tries <= self.retries
     }
 
     /// The next try over the current `endpoints`: a pod not tried yet (P2C among them), else
@@ -301,32 +301,95 @@ impl Planner {
 /// The slots of a [`Budget`]'s ring.
 pub const BUDGET_SLOTS: usize = 10;
 
-/// The retry budget of one Service (spec §7.9 "Retry budget").
+/// The retry budget of one Service (spec §7.9 "Retry budget"): the requests and the retries
+/// granted over the last `window`, in [`BUDGET_SLOTS`] slots of `window / 10`. An event counts
+/// until the end of the tenth slot after its own. The clock is passed in; a clock that goes
+/// back counts in the latest slot and frees nothing.
 #[derive(Debug, Clone)]
-pub struct Budget {}
+pub struct Budget {
+    percent: u64,
+    min_per_second: u64,
+    window_secs: u64,
+    slot_ms: u128,
+    /// Index (time / slot) of the latest slot seen.
+    latest: u64,
+    requests: [u32; BUDGET_SLOTS],
+    retries: [u32; BUDGET_SLOTS],
+}
 
 impl Budget {
-    pub fn new(_percent: u32, _min_per_second: u32, _window: Duration) -> Budget {
-        unimplemented!()
+    pub fn new(percent: u32, min_per_second: u32, window: Duration) -> Budget {
+        Budget {
+            percent: u64::from(percent),
+            min_per_second: u64::from(min_per_second),
+            window_secs: window.as_secs(),
+            slot_ms: (window.as_millis() / BUDGET_SLOTS as u128).max(1),
+            latest: 0,
+            requests: [0; BUDGET_SLOTS],
+            retries: [0; BUDGET_SLOTS],
+        }
     }
 
-    pub fn deposit(&mut self, _now: Duration) {
-        unimplemented!()
+    /// A request (the first try of one, or a mesh-balanced L4 connection).
+    pub fn deposit(&mut self, now: Duration) {
+        self.deposit_many(now, 1);
     }
 
-    pub fn withdraw(&mut self, _now: Duration) -> bool {
-        unimplemented!()
+    fn deposit_many(&mut self, now: Duration, n: u32) {
+        let slot = self.advance(now);
+        self.requests[slot] = self.requests[slot].saturating_add(n);
     }
 
-    /// `n` requests at once (tests: saturation without 2^32 calls).
     #[cfg(test)]
-    pub(super) fn deposit_many_for_test(&mut self, _now: Duration, _n: u32) {
-        unimplemented!()
+    pub(super) fn deposit_many_for_test(&mut self, now: Duration, n: u32) {
+        self.deposit_many(now, n);
+    }
+
+    /// Asks for a retry: granted when `100 × (retries + 1) ≤ percent × requests + 100 ×
+    /// minPerSecond × window seconds` over the window (integers); a grant counts at once, a
+    /// refusal counts nothing.
+    pub fn withdraw(&mut self, now: Duration) -> bool {
+        let slot = self.advance(now);
+        let (requests, retries) = self.sums();
+        let allowed = self.percent * requests + 100 * self.min_per_second * self.window_secs;
+        if 100 * (retries + 1) <= allowed {
+            self.retries[slot] = self.retries[slot].saturating_add(1);
+            true
+        } else {
+            false
+        }
     }
 
     /// The requests and retries held at `now`.
-    pub fn counts(&mut self, _now: Duration) -> (u64, u64) {
-        unimplemented!()
+    pub fn counts(&mut self, now: Duration) -> (u64, u64) {
+        self.advance(now);
+        self.sums()
+    }
+
+    fn sums(&self) -> (u64, u64) {
+        let sum = |a: &[u32; BUDGET_SLOTS]| a.iter().map(|n| u64::from(*n)).sum();
+        (sum(&self.requests), sum(&self.retries))
+    }
+
+    /// Moves the ring to `now` (clearing the slots it leaves, all of them in one step after
+    /// a silence of a window or more) and returns the index of the slot to count in.
+    fn advance(&mut self, now: Duration) -> usize {
+        let index = u64::try_from(now.as_millis() / self.slot_ms).unwrap_or(u64::MAX);
+        if index > self.latest {
+            let gap = index - self.latest;
+            if gap >= BUDGET_SLOTS as u64 {
+                self.requests = [0; BUDGET_SLOTS];
+                self.retries = [0; BUDGET_SLOTS];
+            } else {
+                for step in 1..=gap {
+                    let slot = ((self.latest + step) % BUDGET_SLOTS as u64) as usize;
+                    self.requests[slot] = 0;
+                    self.retries[slot] = 0;
+                }
+            }
+            self.latest = index;
+        }
+        (self.latest % BUDGET_SLOTS as u64) as usize
     }
 }
 
@@ -347,11 +410,15 @@ pub enum Decision {
 
 /// Decides after a failed try; the budget is asked (and a grant counted) only for a failure
 /// that `verdict` retries and for which `planner` has a try left.
-pub fn decide(
-    _verdict: Verdict,
-    _planner: &Planner,
-    _budget: &mut Budget,
-    _now: Duration,
-) -> Decision {
-    unimplemented!()
+pub fn decide(verdict: Verdict, planner: &Planner, budget: &mut Budget, now: Duration) -> Decision {
+    if !verdict.retry {
+        return verdict.skip.map_or(Decision::Done, Decision::Skipped);
+    }
+    if !planner.has_try() {
+        Decision::Exhausted
+    } else if budget.withdraw(now) {
+        Decision::Retry
+    } else {
+        Decision::Budget
+    }
 }
