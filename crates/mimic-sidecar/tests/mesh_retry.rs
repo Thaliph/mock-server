@@ -75,6 +75,8 @@ enum Mode {
     Ok,
     /// `503` with this `x-mimic-error` and `x-mimic-endpoint` the pod's own address.
     Refuse(&'static str),
+    /// The same, answered before the body is read.
+    RefuseEarly(&'static str),
     /// The same for the first `n` requests, then answers.
     RefuseTimes(&'static str, usize),
     /// `503 overloaded` naming this endpoint.
@@ -110,7 +112,12 @@ impl Probe {
                     let (log, mode) = (log.clone(), mode.clone());
                     async move {
                         let method = req.method().to_string();
-                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let early = matches!(*mode.lock().unwrap(), Mode::RefuseEarly(_));
+                        let body = if early {
+                            Bytes::new()
+                        } else {
+                            req.into_body().collect().await.unwrap().to_bytes()
+                        };
                         let nth = {
                             let mut log = log.lock().unwrap();
                             log.push((method, body.to_vec(), Instant::now()));
@@ -120,7 +127,9 @@ impl Probe {
                         let own = addr.to_string();
                         let mut builder = Response::builder();
                         let status = match &mode {
-                            Mode::Refuse(e) => refusal(&mut builder, e, &[&own]),
+                            Mode::Refuse(e) | Mode::RefuseEarly(e) => {
+                                refusal(&mut builder, e, &[&own])
+                            }
                             Mode::RefuseTimes(e, n) if nth <= *n => {
                                 refusal(&mut builder, e, &[&own])
                             }
@@ -202,8 +211,8 @@ async fn h2_refuser(reason: h2::Reason, requests: Arc<AtomicUsize>) -> SocketAdd
 }
 
 /// An `h2c` server written frame by frame: on the first `HEADERS` it sends `GOAWAY` with a
-/// last-stream-id of 0 (below the stream) and keeps the connection open.
-async fn h2_goaway(requests: Arc<AtomicUsize>) -> SocketAddr {
+/// last-stream-id of `last` and keeps the connection open.
+async fn h2_goaway(requests: Arc<AtomicUsize>, last: u8) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -233,7 +242,7 @@ async fn h2_goaway(requests: Arc<AtomicUsize>) -> SocketAddr {
                     if head[3] == 1 {
                         requests.fetch_add(1, Ordering::SeqCst);
                         let ack = [0, 0, 0, 4, 1, 0, 0, 0, 0];
-                        let goaway = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                        let goaway = [0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, last, 0, 0, 0, 0];
                         let _ = stream.write_all(&ack).await;
                         let _ = stream.write_all(&goaway).await;
                     }
@@ -408,7 +417,7 @@ async fn rty_09_refused_streams_and_goaway_are_retried_on_another_pod() {
         let refuser = if reset {
             h2_refuser(h2::Reason::REFUSED_STREAM, seen.clone()).await
         } else {
-            h2_goaway(seen.clone()).await
+            h2_goaway(seen.clone(), 0).await
         };
         let ok = Probe::start("ok", true, Mode::Ok).await;
         let state = state_for(cluster_ip(), &[refuser, ok.addr], |_| {});
@@ -1052,4 +1061,97 @@ async fn rty_14_the_total_buffer_in_use_streams_the_next_request() {
         0.0,
         "released"
     );
+}
+
+#[tokio::test]
+async fn rty_09_a_goaway_that_covers_the_stream_is_not_a_refusal() {
+    let _logs = capture_logs();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let pod = h2_goaway(seen.clone(), 1).await;
+    let state = state_for(cluster_ip(), &[pod], |_| {});
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    assert!(h2_call(f.addr, "POST", payload(16)).await.is_err());
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "sent once");
+    let scrape = f.metrics.encode();
+    assert_eq!(attempts(&scrape, "refused_stream"), 0.0, "refused");
+    assert_eq!(skipped(&scrape, "method"), 1.0, "skipped");
+}
+
+/// A chunked body of 8 KiB chunks, the first alone and the rest after 300 ms.
+fn slow_chunks(
+    body: Vec<u8>,
+) -> impl futures::Stream<Item = Result<hyper::body::Frame<Bytes>, std::io::Error>> {
+    futures::stream::unfold(0usize, move |at| {
+        let body = body.clone();
+        async move {
+            if at >= body.len() {
+                return None;
+            }
+            if at > 0 {
+                tokio::time::sleep(Duration::from_millis(if at == 8192 { 300 } else { 5 })).await;
+            }
+            let end = (at + 8192).min(body.len());
+            let frame = hyper::body::Frame::data(Bytes::copy_from_slice(&body[at..end]));
+            Some((Ok(frame), end))
+        }
+    })
+}
+
+#[tokio::test]
+async fn rty_14_a_slow_body_refused_early_reaches_the_next_pod_whole() {
+    let _logs = capture_logs();
+    let body = payload(40 * 1024);
+    for h2 in [false, true] {
+        let refusing = Probe::start("r", h2, Mode::RefuseEarly("overloaded")).await;
+        let ok = Probe::start("ok", h2, Mode::Ok).await;
+        let state = state_for(cluster_ip(), &[refusing.addr, ok.addr], |_| {});
+        let f = fixture_mesh(cluster_ip(), &state, None).await;
+        for _ in 0..6 {
+            if h2 {
+                let stream = tokio::net::TcpStream::connect(f.addr).await.unwrap();
+                let (mut sender, connection) = hyper::client::conn::http2::Builder::new(
+                    TokioExecutor::new(),
+                )
+                .handshake::<_, http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>>(
+                    TokioIo::new(stream),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(connection);
+                let request = Request::post("http://cart.shop.svc/p")
+                    .body(http_body_util::StreamBody::new(slow_chunks(body.clone())).boxed_unsync())
+                    .unwrap();
+                let response = sender.send_request(request).await.unwrap();
+                assert_eq!(response.status(), 200);
+                let _ = response.into_body().collect().await;
+            } else {
+                let mut client = H1Client::connect(f.addr).await;
+                client
+                    .send(b"POST /p HTTP/1.1\r\nHost: cart.shop.svc\r\nTransfer-Encoding: chunked\r\n\r\n")
+                    .await;
+                for (n, chunk) in body.chunks(8192).enumerate() {
+                    if n == 1 {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    let mut part = format!("{:x}\r\n", chunk.len()).into_bytes();
+                    part.extend_from_slice(chunk);
+                    part.extend_from_slice(b"\r\n");
+                    client.send(&part).await;
+                }
+                client.send(b"0\r\n\r\n").await;
+                let (head, _) = client.read().await.expect("an answer");
+                assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            }
+        }
+        assert!(
+            retries(&f.metrics.encode(), "overloaded") >= 1.0,
+            "a request was refused (h2 {h2})"
+        );
+        let seen = ok.seen.lock().unwrap();
+        assert_eq!(seen.len(), 6, "h2 {h2}");
+        assert!(
+            seen.iter().all(|(_, got, _)| *got == body),
+            "a body with a hole (h2 {h2})"
+        );
+    }
 }
