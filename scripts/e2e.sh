@@ -84,6 +84,12 @@ cleanup() {
     # The controller may be scaled to 0 by the section: back to what the chart says.
     kubectl -n "$NS" scale deploy/$RELEASE-controller --replicas="${controller_replicas:-2}" >/dev/null 2>&1 || true
   fi
+  if [[ -n ${RTY_21_CLEANUP:-} ]]; then
+    kubectl delete namespace rty-21 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+  if [[ -n ${RTY_22_CLEANUP:-} ]]; then
+    kubectl delete namespace rty-22 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -4544,6 +4550,408 @@ echo "msh_87: rollout errors $msh_87_errors of $msh_87_total (the M2 baseline; $
 kubectl delete namespace msh-87 --wait=false >/dev/null
 MSH_87_CLEANUP=
 echo "msh_87: calls were answered with both controller replicas away, and none failed after the rollout of the callee ended"
+
+# --- Retries (#445, spec §12.22 RTY-21, RTY-22) ----------------------------------------------------------------------
+# Objects of these sections only: the namespaces rty-21 and rty-22 (injected, privileged), each deleted at the end of its
+# section and by the trap. Nothing outside them is changed. No sidecar writes a refusal yet (M5 will), so the refusing
+# pods are not injected and put their own address in x-mimic-endpoint, as the spec says.
+# rty_metric_sum <namespace> <pod> <series> [fragment]: the sum of the series of the pod's sidecar whose labels hold the
+# fragment (any, by default); 0 when there is none.
+rty_metric_sum() {
+  sidecar_metrics "$1" "$2" | awk -v n="$3" -v f="${4:-}" 'f == "" { f = "}" } index($0, n "{") == 1 && index($0, f) > 0 { s += $NF } END { print s + 0 }'
+}
+# rty_metric <namespace> <pod> <series>: the value of a series without labels, empty when absent.
+rty_metric() { sidecar_metrics "$1" "$2" | awk -v n="$3" '!found && index($0, n " ") == 1 { print $2; found = 1 }'; }
+# rty_count <namespace> <app label>: the requests counted by the pods of an app (GET /__count on each, from inside it).
+rty_count() {
+  local pod n total=0
+  for pod in $(kubectl -n "$1" get pods -l "app=$2" -o jsonpath='{.items[*].metadata.name}'); do
+    n=$(kubectl -n "$1" exec "$pod" -c app -- python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/__count").read().decode())') || return 1
+    total=$((total + n))
+  done
+  echo "$total"
+}
+
+# RTY-21: a Service of 3 pods, one of them not injected and listening on no port while Ready. An injected client sends
+# 300 requests, half GET and half POST with a body, each on a new connection (so each is balanced): every one is answered
+# 200 (the sidecar skips the refusing pod and sends the request again, nothing was written), and the client's sidecar
+# counts at least one connect_failed retry.
+log "rty_21: one of three pods refusing connections, 300 GET and POST from an injected client all answered 200"
+RTY_21_CLEANUP=1
+ns_fresh rty-21 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+cat > "$WORK/rty21-pod.py" <<'PY'
+import http.server
+import socket
+
+NAME = socket.gethostname().encode()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def answer(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(NAME)))
+        self.end_headers()
+        self.wfile.write(NAME)
+
+    do_GET = do_POST = answer
+
+    def log_message(self, *args):
+        pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+Server(("", 8080), Handler).serve_forever()
+PY
+kubectl -n rty-21 create configmap pod --from-file=pod.py="$WORK/rty21-pod.py" >/dev/null
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: pods, namespace: rty-21}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: pods}}
+  template:
+    metadata: {labels: {app: pods, svc: pods}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, /srv/pod.py]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /, port: http}, periodSeconds: 1}
+          volumeMounts: [{name: srv, mountPath: /srv}]
+      volumes: [{name: srv, configMap: {name: pod}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: dead, namespace: rty-21}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: dead}}
+  template:
+    metadata: {labels: {app: dead, svc: pods, mimic.platform.io/inject: disabled}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+          ports: [{name: http, containerPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: pods, namespace: rty-21}
+spec:
+  selector: {svc: pods}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: rty-21}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for d in pods dead client; do
+  kubectl -n rty-21 rollout status deploy/$d --timeout=3m >/dev/null || fail "rty_21: $d did not roll out Ready"
+done
+rty_21_client=$(kubectl -n rty-21 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+rty_21_dead=$(kubectl -n rty-21 get pods -l app=dead -o jsonpath='{.items[0].metadata.name}')
+rty_21_view() { [[ $(rty_metric rty-21 "$rty_21_client" mimic_mesh_view_endpoints) == 3 ]]; }
+for _ in $(seq 60); do rty_21_view && break; sleep 1; done
+rty_21_view || fail "rty_21: the sidecar of client never held a view with the 3 endpoints of pods"
+# Slow start (default 30 s, spec §7.9): the spread is checked once every endpoint is past the window.
+sleep 31
+cat > "$WORK/rty21-client.py" <<'PY'
+import http.client
+
+body = b"x" * 1024
+names = {}
+errors = 0
+for i in range(300):
+    method = "GET" if i % 2 == 0 else "POST"
+    try:
+        c = http.client.HTTPConnection("pods.rty-21.svc", 80, timeout=10)
+        c.request(method, "/", body=body if method == "POST" else None)
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        if r.status != 200:
+            raise OSError("status %d" % r.status)
+        names[data] = names.get(data, 0) + 1
+    except Exception:
+        errors += 1
+print("errors", errors)
+for name, n in sorted(names.items()):
+    print("pod", name, n)
+PY
+kubectl -n rty-21 exec -i "$rty_21_client" -c app -- python3 -c 'import sys; open("/tmp/client.py", "w").write(sys.stdin.read())' \
+  < "$WORK/rty21-client.py" || fail "rty_21: cannot copy the client script"
+rty_21_out=$(kubectl -n rty-21 exec "$rty_21_client" -c app -- python3 /tmp/client.py) || fail "rty_21: the client script failed"
+rty_21_errors=$(awk '$1 == "errors" { print $2 }' <<<"$rty_21_out")
+[[ $rty_21_errors == 0 ]] || fail "rty_21: $rty_21_errors of 300 requests were not answered 200"
+rty_21_answered=$(awk '$1 == "pod" { n += $3 } END { print n + 0 }' <<<"$rty_21_out")
+(( rty_21_answered == 300 )) || fail "rty_21: $rty_21_answered of 300 requests were answered"
+rty_21_by_dead=$(awk -v p="$rty_21_dead" '$1 == "pod" && $2 == p { n += $3 } END { print n + 0 }' <<<"$rty_21_out")
+(( rty_21_by_dead == 0 )) || fail "rty_21: the pod that listens on no port answered $rty_21_by_dead requests"
+rty_21_retried=$(rty_metric_sum rty-21 "$rty_21_client" mimic_mesh_retries_total 'reason="connect_failed"')
+(( ${rty_21_retried%.*} >= 1 )) || fail "rty_21: the sidecar of client counted no connect_failed retry"
+rty_21_seen=$(rty_metric_sum rty-21 "$rty_21_client" mimic_mesh_requests_total)
+(( ${rty_21_seen%.*} >= 300 )) || fail "rty_21: the sidecar of client counted $rty_21_seen mesh requests, at least 300 expected"
+kubectl delete namespace rty-21 --wait=false >/dev/null
+RTY_21_CLEANUP=
+echo "rty_21: 300 GET and POST were all answered 200 (error rate 0 %), the refusing pod answered none, ${rty_21_retried%.*} connect_failed retries were counted"
+
+# RTY-22: tiers A -> B -> C. c-mesh and c-off (2 pods each, not injected) answer 503 x-mimic-error: overloaded with
+# x-mimic-endpoint set to their own <pod IP>:8080, and count their requests. b-mesh (injected) forwards to c-mesh and b-off
+# (injected, MimicConfig spec.mesh.enabled false) to c-off, both passing on C's status, fields and body. A calls each B 20
+# times: through b-mesh A gets 503 without any x-mimic-* field, through b-off 503 with x-mimic-endpoint naming a c-off pod;
+# A's sidecar counts no retry; each B app counts exactly 20; c-mesh more than 20 and at most 80 (b-mesh's sidecar retried),
+# c-off exactly 20 (b-off's sidecar is not meshed). The counts come from the apps, GET /__count (not counted itself).
+log "rty_22: a refusal is consumed by the hop that receives it: it never crosses a tier, with the mesh on or off at B"
+RTY_22_CLEANUP=1
+ns_fresh rty-22 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+cat > "$WORK/rty22-c.py" <<'PY'
+# A pod of C: 503 overloaded naming itself, for every path but /__count.
+import http.server
+import os
+import threading
+
+ADDRESS = "%s:8080" % os.environ["POD_IP"]
+LOCK = threading.Lock()
+COUNT = 0
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def answer(self):
+        global COUNT
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        if self.path == "/__count":
+            body = str(COUNT).encode()
+            self.send_response(200)
+        else:
+            with LOCK:
+                COUNT += 1
+            body = b"busy"
+            self.send_response(503)
+            self.send_header("x-mimic-error", "overloaded")
+            self.send_header("x-mimic-endpoint", ADDRESS)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = answer
+
+    def log_message(self, *args):
+        pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+Server(("", 8080), Handler).serve_forever()
+PY
+cat > "$WORK/rty22-b.py" <<'PY'
+# An app of B: forwards every request but /__count to UPSTREAM and passes on its status, fields and body.
+import http.client
+import http.server
+import os
+import threading
+
+UPSTREAM = os.environ["UPSTREAM"]
+SKIP = {"content-length", "transfer-encoding", "connection", "keep-alive", "date", "server"}
+LOCK = threading.Lock()
+COUNT = 0
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def reply(self, status, fields, body):
+        self.send_response(status)
+        for name, value in fields:
+            if name.lower() not in SKIP:
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def answer(self):
+        global COUNT
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else None
+        if self.path == "/__count":
+            self.reply(200, [], str(COUNT).encode())
+            return
+        with LOCK:
+            COUNT += 1
+        try:
+            c = http.client.HTTPConnection(UPSTREAM, 80, timeout=10)
+            c.request(self.command, self.path, body=body)
+            r = c.getresponse()
+            data = r.read()
+            c.close()
+        except Exception:
+            self.reply(502, [], b"upstream failed")
+            return
+        self.reply(r.status, r.getheaders(), data)
+
+    do_GET = do_POST = answer
+
+    def log_message(self, *args):
+        pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+Server(("", 8080), Handler).serve_forever()
+PY
+kubectl -n rty-22 create configmap apps --from-file=c.py="$WORK/rty22-c.py" --from-file=b.py="$WORK/rty22-b.py" >/dev/null
+# rty_22_tier <name> <app file> <inject label> <upstream>: the Deployment and the Service of a tier.
+rty_22_tier() {
+  local env="[]" replicas
+  if [[ $2 == c.py ]]; then
+    env='[{name: POD_IP, valueFrom: {fieldRef: {fieldPath: status.podIP}}}]'
+    replicas=2
+  else
+    env="[{name: UPSTREAM, value: \"$4\"}]"
+    replicas=1
+  fi
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $1, namespace: rty-22}
+spec:
+  replicas: $replicas
+  selector: {matchLabels: {app: $1}}
+  template:
+    metadata: {labels: {app: $1, $3}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, /srv/$2]
+          env: $env
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /__count, port: http}, periodSeconds: 1}
+          volumeMounts: [{name: srv, mountPath: /srv}]
+      volumes: [{name: srv, configMap: {name: apps}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: $1, namespace: rty-22}
+spec:
+  selector: {app: $1}
+  ports: [{name: http, port: 80, targetPort: http}]
+YAML
+}
+# b-off's sidecar gets a view of "mesh": false from this MimicConfig, applied before its pod exists.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: b-off, namespace: rty-22}
+spec:
+  targetRefs: [{group: apps, kind: Deployment, name: b-off}]
+  mesh: {enabled: false}
+YAML
+rty_22_tier c-mesh c.py "mimic.platform.io/inject: disabled" ""
+rty_22_tier c-off c.py "mimic.platform.io/inject: disabled" ""
+rty_22_tier b-mesh b.py "mimic.platform.io/inject: enabled" c-mesh.rty-22.svc
+rty_22_tier b-off b.py "mimic.platform.io/inject: enabled" c-off.rty-22.svc
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: a, namespace: rty-22}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: a}}
+  template:
+    metadata: {labels: {app: a}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for d in c-mesh c-off b-mesh b-off a; do
+  kubectl -n rty-22 rollout status deploy/$d --timeout=3m >/dev/null || fail "rty_22: $d did not roll out Ready"
+done
+rty_22_a=$(kubectl -n rty-22 get pods -l app=a -o jsonpath='{.items[0].metadata.name}')
+rty_22_bmesh=$(kubectl -n rty-22 get pods -l app=b-mesh -o jsonpath='{.items[0].metadata.name}')
+rty_22_boff=$(kubectl -n rty-22 get pods -l app=b-off -o jsonpath='{.items[0].metadata.name}')
+rty_22_coff_addrs=$(kubectl -n rty-22 get pods -l app=c-off -o jsonpath='{range .items[*]}{.status.podIP}:8080 {end}')
+[[ $(wc -w <<<"$rty_22_coff_addrs") == 2 ]] || fail "rty_22: c-off does not have 2 pod IPs"
+# The sidecars of A and of b-mesh hold a view of the 6 endpoints of the namespace; the one of b-off holds a view with no
+# service (mesh false), after at least one pull.
+rty_22_views() {
+  [[ $(rty_metric rty-22 "$rty_22_a" mimic_mesh_view_endpoints) == 6 ]] || return 1
+  [[ $(rty_metric rty-22 "$rty_22_bmesh" mimic_mesh_view_endpoints) == 6 ]] || return 1
+  [[ $(rty_metric rty-22 "$rty_22_boff" mimic_mesh_view_services) == 0 ]] || return 1
+  (( $(rty_metric_sum rty-22 "$rty_22_boff" mimic_mesh_view_pulls_total 'result="ok"' | cut -d. -f1) >= 1 ))
+}
+for _ in $(seq 90); do rty_22_views && break; sleep 1; done
+rty_22_views || fail "rty_22: the sidecars do not hold the expected views (A and b-mesh 6 endpoints, b-off none)"
+cat > "$WORK/rty22-client.py" <<'PY'
+import http.client
+import sys
+
+for i in range(20):
+    c = http.client.HTTPConnection(sys.argv[1], 80, timeout=15)
+    c.request("POST", "/p", body=b"y" * 200)
+    r = c.getresponse()
+    r.read()
+    c.close()
+    fields = sorted(k.lower() for k, _ in r.getheaders() if k.lower().startswith("x-mimic-"))
+    print(r.status, ",".join(fields) or "-", r.getheader("x-mimic-endpoint") or "-")
+PY
+kubectl -n rty-22 exec -i "$rty_22_a" -c app -- python3 -c 'import sys; open("/tmp/client.py", "w").write(sys.stdin.read())' \
+  < "$WORK/rty22-client.py" || fail "rty_22: cannot copy the client script"
+rty_22_mesh_out=$(kubectl -n rty-22 exec "$rty_22_a" -c app -- python3 /tmp/client.py b-mesh.rty-22.svc) || fail "rty_22: the client script failed for b-mesh"
+rty_22_off_out=$(kubectl -n rty-22 exec "$rty_22_a" -c app -- python3 /tmp/client.py b-off.rty-22.svc) || fail "rty_22: the client script failed for b-off"
+[[ $(wc -l <<<"$rty_22_mesh_out") == 20 ]] || fail "rty_22: the client got $(wc -l <<<"$rty_22_mesh_out") answers through b-mesh, not 20"
+[[ $(wc -l <<<"$rty_22_off_out") == 20 ]] || fail "rty_22: the client got $(wc -l <<<"$rty_22_off_out") answers through b-off, not 20"
+rty_22_bad=$(awk '$1 != 503 || $2 != "-" || $3 != "-" { n++ } END { print n + 0 }' <<<"$rty_22_mesh_out")
+(( rty_22_bad == 0 )) || fail "rty_22: $rty_22_bad of 20 answers through b-mesh were not a bare 503 without x-mimic-* fields"
+rty_22_bad=$(awk -v ips="$rty_22_coff_addrs" '$1 != 503 || $2 != "x-mimic-endpoint,x-mimic-error" || index(" " ips, " " $3 " ") == 0 { n++ } END { print n + 0 }' <<<"$rty_22_off_out")
+(( rty_22_bad == 0 )) || fail "rty_22: $rty_22_bad of 20 answers through b-off were not a 503 with x-mimic-error and x-mimic-endpoint naming a c-off pod"
+for backend in b-mesh b-off; do
+  retried=$(rty_metric_sum rty-22 "$rty_22_a" mimic_mesh_retries_total "backend=\"rty-22/$backend:80\"")
+  (( ${retried%.*} == 0 )) || fail "rty_22: the sidecar of A counted ${retried%.*} retries for $backend"
+  attempts=$(rty_metric_sum rty-22 "$rty_22_a" mimic_mesh_attempts_total "backend=\"rty-22/$backend:80\"")
+  (( ${attempts%.*} == 20 )) || fail "rty_22: the sidecar of A counted ${attempts%.*} tries for $backend, 20 expected (the metrics are not read)"
+done
+for tier in b-mesh b-off; do
+  n=$(rty_count rty-22 $tier) || fail "rty_22: cannot read the count of $tier"
+  (( n == 20 )) || fail "rty_22: the app $tier counted $n requests, 20 expected"
+done
+rty_22_cmesh=$(rty_count rty-22 c-mesh) || fail "rty_22: cannot read the count of c-mesh"
+(( rty_22_cmesh > 20 && rty_22_cmesh <= 80 )) || fail "rty_22: c-mesh counted $rty_22_cmesh requests, more than 20 and at most 80 expected"
+rty_22_coff=$(rty_count rty-22 c-off) || fail "rty_22: cannot read the count of c-off"
+(( rty_22_coff == 20 )) || fail "rty_22: c-off counted $rty_22_coff requests, exactly 20 expected"
+kubectl delete namespace rty-22 --wait=false >/dev/null
+RTY_22_CLEANUP=
+echo "rty_22: through b-mesh A got a bare 503 (c-mesh counted $rty_22_cmesh tries for 20 requests), through b-off a 503 naming a c-off pod (c-off counted 20), A retried nothing, each B app counted 20"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
