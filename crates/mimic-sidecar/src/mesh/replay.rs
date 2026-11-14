@@ -3,6 +3,7 @@
 //! requests of the sidecar together.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use prometheus_client::metrics::gauge::Gauge;
@@ -10,54 +11,130 @@ use prometheus_client::metrics::gauge::Gauge;
 /// The bytes held by all the requests of the sidecar.
 pub struct ReplayBudget {
     total: usize,
+    used: AtomicUsize,
     gauge: Gauge,
 }
 
 impl ReplayBudget {
     /// `gauge` is `mimic_mesh_retry_buffer_bytes`.
     pub fn new(total: usize, gauge: Gauge) -> Arc<ReplayBudget> {
-        let _ = (total, gauge);
-        todo!()
+        Arc::new(ReplayBudget {
+            total,
+            used: AtomicUsize::new(0),
+            gauge,
+        })
+    }
+
+    /// `mimic_mesh_retry_buffer_bytes`.
+    pub fn gauge(&self) -> &Gauge {
+        &self.gauge
     }
 
     /// The bytes held now.
     pub fn used(&self) -> usize {
-        todo!()
+        self.used.load(Ordering::Relaxed)
     }
 
     /// A buffer for one request, at most `cap` bytes.
     pub fn replay(self: &Arc<Self>, cap: usize) -> Replay {
-        let _ = cap;
-        todo!()
+        Replay {
+            budget: Arc::clone(self),
+            cap,
+            held: 0,
+            chunks: Vec::new(),
+            state: State::Held,
+        }
+    }
+
+    /// Takes `n` bytes of the total, or none.
+    fn reserve(&self, n: usize) -> bool {
+        let total = self.total;
+        let taken = self
+            .used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(n).filter(|sum| *sum <= total)
+            })
+            .is_ok();
+        if taken {
+            self.gauge.inc_by(i64::try_from(n).unwrap_or(i64::MAX));
+        }
+        taken
+    }
+
+    fn give_back(&self, n: usize) {
+        self.used.fetch_sub(n, Ordering::AcqRel);
+        self.gauge.dec_by(i64::try_from(n).unwrap_or(i64::MAX));
     }
 }
 
-/// The body of one request, held while it can still be sent again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Held,
+    /// A chunk did not fit: streamed from now on.
+    Streamed,
+    /// A response head came back.
+    Released,
+}
+
+/// The body of one request, held while it can still be sent again. Dropping it releases its
+/// bytes.
 pub struct Replay {
     budget: Arc<ReplayBudget>,
+    cap: usize,
+    held: usize,
+    chunks: Vec<Bytes>,
+    state: State,
 }
 
 impl Replay {
     /// Holds a chunk read from the app. `false`: it does not fit (the request's share or the
     /// total), the chunks held are released and the body is streamed from now on.
     pub fn push(&mut self, chunk: &Bytes) -> bool {
-        let _ = (chunk, &self.budget);
-        todo!()
+        if self.state != State::Held {
+            return false;
+        }
+        let len = chunk.len();
+        let fits = len <= self.cap - self.held && self.budget.reserve(len);
+        if !fits {
+            self.drop_chunks();
+            self.state = State::Streamed;
+            return false;
+        }
+        self.held += len;
+        if len > 0 {
+            self.chunks.push(chunk.clone());
+        }
+        true
     }
 
     /// Every byte read so far is held (and the request was not released).
     pub fn is_held(&self) -> bool {
-        todo!()
+        self.state == State::Held
     }
 
     /// The chunks to send again, in order.
     pub fn chunks(&self) -> &[Bytes] {
-        todo!()
+        &self.chunks
     }
 
     /// The request can no longer be retried (a response head came back): releases the bytes.
     pub fn release(&mut self) {
-        todo!()
+        self.drop_chunks();
+        self.state = State::Released;
+    }
+
+    fn drop_chunks(&mut self) {
+        self.chunks.clear();
+        if self.held > 0 {
+            self.budget.give_back(self.held);
+            self.held = 0;
+        }
+    }
+}
+
+impl Drop for Replay {
+    fn drop(&mut self) {
+        self.drop_chunks();
     }
 }
 

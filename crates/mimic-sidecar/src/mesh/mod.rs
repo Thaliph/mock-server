@@ -36,6 +36,7 @@ use crate::discovery::Target;
 use router::Router;
 
 pub use follow::Follower;
+pub use replay::{Replay, ReplayBudget};
 pub(crate) use router::Backend;
 pub(crate) use serve::{Ended, Head, Serving, head_kind, serve};
 
@@ -48,6 +49,8 @@ const BYTES_VAR: &str = "MIMIC_MESH_MAX_VIEW_BYTES";
 const POOL_IDLE_VAR: &str = "MIMIC_MESH_POOL_IDLE_TIMEOUT";
 const CONNECT_VAR: &str = "MIMIC_MESH_CONNECT_TIMEOUT";
 const OPAQUE_VAR: &str = "MIMIC_MESH_OPAQUE_PORTS";
+const RETRY_BUFFER_VAR: &str = "MIMIC_MESH_RETRY_BUFFER";
+const RETRY_TOTAL_VAR: &str = "MIMIC_MESH_RETRY_BUFFER_TOTAL";
 const ENDPOINT_LABELS_VAR: &str = "MIMIC_METRICS_MAX_ENDPOINTS";
 
 const KIB: usize = 1024;
@@ -139,7 +142,12 @@ impl MeshConfig {
         let limits = Limits {
             max_services: number(env, SERVICES_VAR, defaults.limits.max_services, 100_000)?,
             max_endpoints: number(env, ENDPOINTS_VAR, defaults.limits.max_endpoints, 1_000_000)?,
-            max_view_bytes: size(env, BYTES_VAR, defaults.limits.max_view_bytes)?,
+            max_view_bytes: size(
+                env,
+                BYTES_VAR,
+                defaults.limits.max_view_bytes,
+                64 * KIB..=256 * MIB,
+            )?,
         };
         Ok(MeshConfig {
             enabled,
@@ -181,6 +189,13 @@ impl MeshConfig {
                 10_000,
             )?,
             opaque_ports: opaque_ports(env)?,
+            retry_buffer: size(env, RETRY_BUFFER_VAR, defaults.retry_buffer, 0..=MIB)?,
+            retry_buffer_total: size(
+                env,
+                RETRY_TOTAL_VAR,
+                defaults.retry_buffer_total,
+                MIB..=64 * MIB,
+            )?,
             ..defaults
         })
     }
@@ -246,8 +261,21 @@ fn number(env: &Env, var: &str, default: usize, max: usize) -> Result<usize, Con
     ))
 }
 
-/// `<n>`, `<n>Ki` or `<n>Mi`, from 64Ki to 256Mi.
-fn size(env: &Env, var: &str, default: usize) -> Result<usize, ConfigError> {
+/// `<n>`, `<n>Ki` or `<n>Mi` within `range`.
+fn human(bytes: usize) -> String {
+    match bytes {
+        n if n >= MIB && n % MIB == 0 => format!("{}Mi", n / MIB),
+        n if n >= KIB && n % KIB == 0 => format!("{}Ki", n / KIB),
+        n => n.to_string(),
+    }
+}
+
+fn size(
+    env: &Env,
+    var: &str,
+    default: usize,
+    range: std::ops::RangeInclusive<usize>,
+) -> Result<usize, ConfigError> {
     let Some(value) = env.optional(var) else {
         return Ok(default);
     };
@@ -261,11 +289,15 @@ fn size(env: &Env, var: &str, default: usize) -> Result<usize, ConfigError> {
         .flatten()
         .and_then(|n| n.checked_mul(unit));
     match bytes {
-        Some(n) if (64 * KIB..=256 * MIB).contains(&n) => Ok(n),
+        Some(n) if range.contains(&n) => Ok(n),
         _ => Err(ConfigError::invalid(
             var,
             value,
-            "expected a size such as 4Mi (<n>, <n>Ki or <n>Mi) from 64Ki to 256Mi",
+            format!(
+                "expected a size such as 4Mi (<n>, <n>Ki or <n>Mi) from {} to {}",
+                human(*range.start()),
+                human(*range.end())
+            ),
         )),
     }
 }
@@ -380,6 +412,8 @@ struct Inner {
     startup_wait: Duration,
     limits: Limits,
     state_file: PathBuf,
+    replay: Arc<ReplayBudget>,
+    retry_buffer: usize,
     pulls: Family<ResultLabel, Counter>,
     services: Gauge,
     endpoints: Gauge,
@@ -426,6 +460,8 @@ impl MeshState {
             startup_wait: config.startup_wait,
             limits: config.limits.clone(),
             state_file: config.state_file.clone(),
+            replay: ReplayBudget::new(config.retry_buffer_total, Gauge::default()),
+            retry_buffer: config.retry_buffer,
             pulls: Family::default(),
             services: Gauge::default(),
             endpoints: Gauge::default(),
@@ -475,7 +511,18 @@ impl MeshState {
             "Outbound connections whose destination is not a Service port of the mesh view",
             self.0.unscoped.clone(),
         );
+        registry.register_with_unit(
+            "mesh_retry_buffer",
+            "Request body bytes held for replay by all the requests of the sidecar",
+            Unit::Bytes,
+            self.0.replay.gauge().clone(),
+        );
         self.0.router.metrics.register(registry);
+    }
+
+    /// The buffer of a request that may be sent again (spec §7.9 "Retries", "Bodies").
+    pub fn replay(&self) -> Replay {
+        self.0.replay.replay(self.0.retry_buffer)
     }
 
     pub(crate) fn router(&self) -> &Router {
