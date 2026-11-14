@@ -7,8 +7,9 @@
 #            of every controller replica (and the view cache gauge) is sampled for 60 s. Budget: RSS <= 256 MiB.
 #   rollout  a namespace of 200 injected sidecars in 4 deployments of 50. The callee deployment (its Service is in
 #            every view of the namespace) is restarted. Per sidecar, the views received (pulls with result ok) per
-#            second, max and p99; the controller CPU, summed over the replicas. Budgets: <= 1 view/s per sidecar,
-#            <= 0.5 core.
+#            second, max and p99, for the sidecars present during the whole rollout (kept) and for the ones started during it
+#            (new), and over both; the controller CPU, summed over the replicas. Budgets: <= 1 view/s per kept
+#            sidecar (a new pod's first pulls over a few seconds of life are not a sustained rate), <= 0.5 core.
 #
 #   scripts/bench-controller.sh               both scenarios: the cluster, the images, the chart, then the runs (about 20 minutes, an estimate)
 #   scripts/bench-controller.sh --dry-run     the plan only, nothing started
@@ -162,7 +163,7 @@ if ((DRY_RUN)); then
       echo "scenario rollout: namespace $ROLLOUT_NS, 200 injected sidecars in 4 deployments of $ROLLOUT_REPLICAS" \
         "(callee, ${ROLLOUT_CALLERS[*]}); kubectl rollout restart deploy/callee; views per second per sidecar" \
         "and controller CPU during the rollout"
-      echo "  budgets: views <= $VIEW_RATE_BUDGET/s per sidecar (max), controller CPU <= $CPU_BUDGET cores (sum over replicas)"
+      echo "  budgets: views <= $VIEW_RATE_BUDGET/s per sidecar present during the whole rollout (max), controller CPU <= $CPU_BUDGET cores (sum over replicas)"
     fi
   done
   echo "result $OUT_FILE"
@@ -563,7 +564,13 @@ rollout_phase() {
           else
             {pod: $e.pod, kind: "new", views: $e.v, window_s: ($e.t - $start[$e.pod])}
           end] as $all
-    | ($all | map(select(.views >= 0 and .window_s > 0) | .views / .window_s) | sort) as $rates
+    | def rates(k): [$all[] | select(.views >= 0 and .window_s > 0 and (k == "all" or .kind == k)) | .views / .window_s] | sort;
+      def stats(k): rates(k) as $r | ($r | length) as $n
+        | if $n == 0 then {sidecars: 0, max: 0, p99: 0, mean: 0}
+          else {sidecars: $n, max: ($r[-1] * 1000 | round / 1000), p99: ($r[(($n * 0.99 | ceil) - 1)] * 1000 | round / 1000),
+                mean: (($r | add) / $n * 1000 | round / 1000)} end;
+      rates("all") as $rates
+    | rates("kept") as $kept
     | ($rates | length) as $n
     | ($c0 | rows | map({key: .pod, value: .}) | from_entries) as $cb
     | [($c1 | rows)[] as $e
@@ -576,14 +583,13 @@ rollout_phase() {
         pulls: {sidecars_measured: $n, kept: ($all | map(select(.kind == "kept")) | length),
                 new: ($all | map(select(.kind == "new")) | length),
                 restarted: ($all | map(select(.views < 0)) | length)},
-        views_per_s: {max: ($rates[-1] * 1000 | round / 1000), p99: ($rates[(($n * 0.99 | ceil) - 1)] * 1000 | round / 1000),
-                      mean: (($rates | add) / $n * 1000 | round / 1000)},
+        views_per_s: (stats("all") + {kept: stats("kept"), new: stats("new")}),
         controller: {replicas: ($cpu | length), cpu_cores: ($cores * 1000 | round / 1000),
                      resets: ($cpu | map(select(.reset)) | length),
                      per_replica: ($cpu | map({pod, cores: (.cores * 1000 | round / 1000)}))},
         budgets: [
-          {name: "views per second per sidecar (max)", value: ($rates[-1] * 1000 | round / 1000), unit: "views/s",
-           limit: $view_budget, met: ($rates[-1] <= $view_budget)},
+          {name: "views per second per sidecar present during the whole rollout (max)",
+           value: (stats("kept").max), unit: "views/s", limit: $view_budget, met: (stats("kept").max <= $view_budget)},
           {name: "controller CPU, sum over replicas", value: ($cores * 1000 | round / 1000), unit: "cores",
            limit: $cpu_budget, met: ($cores <= $cpu_budget)}]
       }' >"$WORK/rollout.json"
@@ -609,7 +615,7 @@ echo "wrote $OUT_FILE"
 
 jq -r '
   (.scale // empty | "scale: controller RSS max \(.rss_max_mib) MiB (view cache max \(.view_cache_max_mib) MiB), views held \(.views.clients) clients, \(.views.endpoints_min)+ endpoints each"),
-  (.rollout // empty | "rollout: \(.sidecars) sidecars, \(.rollout_s) s; views per second per sidecar max \(.views_per_s.max), p99 \(.views_per_s.p99); controller CPU \(.controller.cpu_cores) cores")
+  (.rollout // empty | "rollout: \(.sidecars) sidecars, \(.rollout_s) s; views per second per sidecar max \(.views_per_s.max) p99 \(.views_per_s.p99) (kept: max \(.views_per_s.kept.max) p99 \(.views_per_s.kept.p99), new: max \(.views_per_s.new.max)); controller CPU \(.controller.cpu_cores) cores")
 ' "$OUT_FILE"
 if ! jq -e '[.. | objects | select(has("met")) | .met] | all' "$OUT_FILE" >/dev/null; then
   jq -r '.. | objects | select(has("met") and .met == false)

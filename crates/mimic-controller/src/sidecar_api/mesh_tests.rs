@@ -49,6 +49,8 @@ fn config(watch_timeout_ms: u64, max_watches: usize) -> MeshConfig {
     MeshConfig {
         watch_timeout: Duration::from_millis(watch_timeout_ms),
         debounce: Duration::from_millis(50),
+        // The pacing of MSH-88 has tests of its own; the others change views right after one.
+        min_view_interval: Duration::ZERO,
         max_watches,
         ..MeshConfig::default()
     }
@@ -767,5 +769,105 @@ async fn msh_82_a_request_dropped_while_held_releases_every_count() {
     assert_eq!(
         (c.await.unwrap().status, d.await.unwrap().status),
         (304, 304)
+    );
+}
+
+fn paced() -> Setup {
+    setup_with(
+        Some(MeshConfig {
+            min_view_interval: Duration::from_secs(1),
+            ..config(5_000, 100)
+        }),
+        10_000,
+        true,
+    )
+}
+
+fn cart_a(extra: &[&str]) -> mimic_core::mesh::input::EndpointSlice {
+    let mut ips = vec!["10.244.0.1"];
+    ips.extend_from_slice(extra);
+    slice("shop", "cart", "cart-a", &ips)
+}
+
+#[tokio::test]
+async fn msh_88_a_held_request_is_not_answered_with_a_changed_view_within_a_second_of_the_last_view()
+ {
+    let s = paced();
+    let started = Instant::now();
+    let first = get(&s, "cart", "shop", &[]).await;
+    assert_eq!(first.status, 200);
+    // A pull without If-None-Match, or with another ETag, is answered at once, also right after.
+    assert_eq!(
+        get(&s, "cart", "shop", &[("if-none-match", "\"other\"")])
+            .await
+            .status,
+        200
+    );
+    let held = hold_as(&s, "shop", "cart-7d9f8b6c4d-x2k9p", &first.etag());
+    // Another pod is not delayed by the first pod's answer.
+    let other_first = get_at(
+        &s.router,
+        "/v1/workloads/cart/mesh?format=1",
+        Some("ns|shop|cart-7d9f8b6c4d-zzzzz|t"),
+        &[],
+    )
+    .await;
+    assert_eq!(other_first.status, 200);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    put_slice(&s.hub, cart_a(&["10.244.0.50"]));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    put_slice(&s.hub, cart_a(&["10.244.0.50", "10.244.0.51"]));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!held.is_finished(), "answered inside the interval");
+    let answer = held.await.unwrap();
+    assert_eq!(answer.status, 200);
+    assert!(
+        started.elapsed() >= Duration::from_millis(990),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(started.elapsed() < Duration::from_millis(1_500));
+    let body = answer.text();
+    assert!(
+        body.contains("10.244.0.50") && body.contains("10.244.0.51"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn msh_88_a_pod_answered_over_a_second_ago_and_another_pod_are_woken_within_the_debounce() {
+    let s = paced();
+    let first = get(&s, "cart", "shop", &[]).await;
+    tokio::time::sleep(Duration::from_millis(1_050)).await;
+    let held = hold_as(&s, "shop", "cart-7d9f8b6c4d-x2k9p", &first.etag());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let changed = Instant::now();
+    put_slice(&s.hub, cart_a(&["10.244.0.50"]));
+    assert_eq!(held.await.unwrap().status, 200);
+    assert!(
+        changed.elapsed() < Duration::from_millis(550),
+        "{:?}",
+        changed.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn msh_88_the_not_modified_on_the_timeout_is_not_delayed() {
+    let s = setup_with(
+        Some(MeshConfig {
+            min_view_interval: Duration::from_secs(1),
+            ..config(300, 100)
+        }),
+        10_000,
+        true,
+    );
+    let first = get(&s, "cart", "shop", &[]).await;
+    let started = Instant::now();
+    let again = get(&s, "cart", "shop", &[("if-none-match", &first.etag())]).await;
+    assert_eq!(again.status, 304);
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "{:?}",
+        started.elapsed()
     );
 }

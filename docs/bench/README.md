@@ -174,7 +174,9 @@ mean 2.2, highest 4.5.
 `scripts/bench-controller.sh` measures the controller of the mesh (design §14, M1): the RSS of the
 controller replicas with 1000 Services and 10 000 endpoints (synthetic objects, the view cache included;
 budget 256 MiB), and a rollout of a 50-pod deployment in a namespace of 200 sidecars (views per second per
-sidecar, budget 1; controller CPU summed over replicas, budget 0.5 core). Results go to
+sidecar, reported for the sidecars present during the whole rollout, `kept`, for the ones started during it,
+`new`, and over both; the budget of 1 applies to `kept`, since a new pod's first pulls over a few seconds of
+life are not a sustained rate; controller CPU summed over replicas, budget 0.5 core). Results go to
 `docs/bench/<date>-controller.json`, with the machine description and the budgets.
 
 ```bash
