@@ -231,8 +231,8 @@ Against the pre-mesh `discovery` rows of 2026-11-12 (the three `discovery` runs 
 
 | Budget | Measured | |
 |---|---|---|
-| Mesh-routed p50 ≤ B0 + 0.5 ms | http1 8.19–8.32 ms vs 8.00–8.25 (+0.06 to +0.19); h2c 9.63–9.69 vs 9.62–9.91 (≈ 0) | met |
-| Mesh-routed p99 ≤ B0 + 2 ms | http1 9.95–11.26 (50 rps, repeats), 10.88, 10.63 vs 10.91–13.73; h2c 13.15–13.61 vs 13.47–15.16 | met |
+| Mesh-routed p50 ≤ B0 + 0.5 ms | http1 8.19–8.32 ms vs 7.79–8.27 (per rate +0.13 to +0.25 against the mean of the three runs, at most +0.40 against the fastest); h2c 9.63–9.69 vs 9.62–9.91 (≈ 0) | met |
+| Mesh-routed p99 ≤ B0 + 2 ms | http1 9.95–11.26 (50 rps, repeats), 10.88, 10.63 vs 9.98–13.73 (at most +0.65 against the fastest run at the same rate); h2c 13.15–13.61 vs 13.47–15.16 | met |
 | EndpointSlice change → sidecar applied ≤ 2 s p99 | 20 samples (3 → 4 → 3 endpoints): 448–791 ms, p50 ≈ 0.5 s | met |
 | Sidecar RSS ≤ B0 + 16 MiB with a 100-Service / 1000-endpoint view | 16.2 → 16.6 MiB (+0.4 MiB), the view asserted loaded | met |
 | P2C pick ≤ 2 µs (criterion, `cargo bench -p mimic-core --bench mesh_lb`) | 21–41 ns (3 and 100 endpoints, steady and slow start) | met |
