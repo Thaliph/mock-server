@@ -1163,15 +1163,21 @@ the recorder keeps the first message of each side:
   object: a `namespace` key is rejected by the CRD) attach it. Fields that fit a `Deployment` target
   only: `destinations` (at most 256 `{namespace, name}` Services, §7.9) and `mesh.enabled` (default
   `true`; `false` turns the mesh off for that workload, design §3.4); a Service target only:
-  `loadBalancer.slowStart` (`<n>s`, 0 to 3600 s, bounded by CEL, default 30 s, `0s` disables). A field that fits no
-  target kind of the object is rejected by CEL. Retries, breaker, faults and admission are added by
+  `loadBalancer.slowStart` (`<n>s`, 0 to 3600 s, bounded by CEL, default 30 s, `0s` disables);
+  from M2 (#446) `retries` (integer 0 to 10, default 3: the retries after the first try, so 3 → at
+  most 4 tries, `0` disables retries and the fallback to the ClusterIP, §7.9 "Retries") and
+  `retryBudget` (`percent`, integer 0 to 100, default 20; `minPerSecond`, integer 0 to 1000,
+  default 10; `window`, `<n>s`, 1 to 60 s, default 10 s; each field absent takes its default
+  alone, §7.9 "Retry budget"). A field that fits no
+  target kind of the object is rejected by CEL. Breaker, faults and admission are added by
   later milestones. `status.conditions`: `Accepted` (False: `Conflicted`, `TargetNotFound`,
   `Invalid`) and `ResolvedRefs` (False: `RefNotPermitted`). **Precedence** (pure, `mimic-core`
   `mesh::policy`): for each target object, the valid `MimicConfig`s that target it are ordered by
   `creationTimestamp`, then by name; the first wins as a whole, the others are `Conflicted` (a config
   with several targets can win one and lose another; it applies where it wins). An invalid object
   takes no part in the precedence. `Accepted` reads `Invalid` before `TargetNotFound` before
-  `Conflicted`. Defaults without any `MimicConfig`: slow start 30 s, `mesh.enabled: true`.
+  `Conflicted`. Defaults without any `MimicConfig`: slow start 30 s, `mesh.enabled: true`,
+  `retries: 3`, `retryBudget: {percent: 20, minPerSecond: 10, window: 10s}`.
 - From F11, `MimicLoadTest` (namespaced CRD, same group and version, only when the chart's
   `loadTest.enabled` is true): one load test of `spec.deployment` in its namespace, run by a
   `mimic-load` Job while the deployment is in mock, results in its `status` (§7.8).
@@ -2542,7 +2548,8 @@ no insignificant whitespace):
 {"cluster":"local","format":1,"generations":{"mimicconfig/shop/cart@5b1c":3},"mesh":true,"mode":"none",
  "services":{"shop/cart":{"endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},
   "generations":{"endpointslice/shop/cart-x7k2p@9f3a":41},"ips":["10.96.12.7"],
-  "policy":{"loadBalancer":{"slowStartSeconds":30}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}
+  "policy":{"loadBalancer":{"slowStartSeconds":30},"retries":3,
+   "retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}
 ```
 
 - **Scope**: every Service of `n`, and the Services declared in `spec.destinations` of the winning
@@ -2558,7 +2565,9 @@ no insignificant whitespace):
   `targetPort`), per Service port the endpoints of its EndpointSlices with the same port name:
   the ready ones, else the serving and terminating ones with `ready: false`, sorted by address and
   port, without duplicates, with the `zone` when there is one; the `generations` of those
-  EndpointSlices; the `policy` of the winning `MimicConfig` of the Service (§7), defaults when none.
+  EndpointSlices; the `policy` of the winning `MimicConfig` of the Service (§7), defaults when none
+  (from #446 the policy always holds `retries` and `retryBudget`, every field set; the view is
+  unreleased before M2, so its `format` stays 1 and `from_json` refuses any other policy field).
   `mesh: false` (the winning config of `d` says so) gives a view without Services and without
   `generations`. The top-level `generations` hold the winning `MimicConfig` of `d`. The `generations` of a consented Service name its winning `MimicConfig` of the destination's namespace
   (`mimicconfig/<namespace>/<name>@<uid>`): decided, kept as is, because the consent already shares that
@@ -2765,9 +2774,33 @@ no insignificant whitespace):
   | The connection closed or reset, or the stream reset with another code, after the request was written (in part) and before any byte of a response head | `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE` only (method tokens compared exactly) | `reset` |
   | Any other response (a `503` that is not a trusted refusal, a `connect-failed` without a valid `x-mimic-origin`, an `x-mimic-error` of another value, any other status), any failure after the response head | never | `ok` (a response head came back) |
 
-  - **Tries**: at most `1 + retries` per request, `retries` being 3 (the `retries` field of the
-    sidecar's `MeshConfig`, not an environment variable; `MimicConfig` sets it from #446), so at
-    most 4 tries. A reconnect of an unwritten request (above) is part of its try.
+  - **Tries**: at most `1 + retries` per request, `retries` being the `policy.retries` of the
+    Service in the view (from #446; default 3, so at most 4 tries; `MimicConfig.spec.retries`
+    sets it, §7); `retries: 0` gives one try, no fallback to the original destination and no
+    draw on the budget. A reconnect of an unwritten request (above) is part of its try. Every
+    try after the first, the fallback to the original destination included, needs the
+    **retry budget** (below).
+  - **Retry budget** (#446, design §7; Linkerd's budget). Per caller pod (the sidecar) and per
+    backend **Service** (all its ports share one budget, as they share one policy), the sidecar
+    keeps `mimic-core` `mesh::retry::Budget`: the requests (every first try of a mesh-routed
+    request and every mesh-balanced L4 connection) and the retries granted over the last
+    `window`, in 10 slots of `window / 10` (an event counts until the end of the tenth slot
+    after its own, so between `0.9 × window` and `window`). A retry is granted when
+    `100 × (retries in the window + 1) ≤ percent × requests in the window + 100 × minPerSecond ×
+    window seconds` (integers, no rounding error); a granted retry counts at once. The budget is
+    asked only for a failure that `classify` retries and the planner has a try for; a refusal
+    ends the tries: the failure is returned **as is** (the outcome below for its kind),
+    counted once in `mimic_mesh_retry_budget_exhausted_total{backend}` (not in
+    `mimic_mesh_retries_skipped_total`), and logged by the WARN `retry budget exhausted` at most
+    once per second per backend (fields `service`, `backend`, `window_requests`,
+    `window_retries`, `suppressed`: the refusals not logged since the previous line of that
+    backend; no path, header or address). The clock is passed in (the sidecar's monotonic
+    clock); a clock that goes back counts in the latest slot and frees nothing. The state of a
+    Service is carried over every view that still holds it with the same `retryBudget.window`
+    (a new `percent` or `minPerSecond` applies to the counts held; a new `window` starts the
+    Service's budget empty), and dropped with the log limiter's state when the Service leaves
+    the view, so the sidecar holds at most one budget per Service of its view
+    (`MIMIC_MESH_MAX_SERVICES`). Without failures the budget costs one short lock per request.
   - **Where**: each retry goes to a pod **not tried yet** for this request, chosen by the P2C
     above among those (avoidance applies); when every endpoint was tried, P2C over all of them.
     When every try so far failed to connect and either no untried endpoint is left or the next
@@ -2842,7 +2875,9 @@ no insignificant whitespace):
     `status_class` of that try (`none` without a response).
   **Configuration**: the time a failed pod is avoided (5 s) is the `avoid_failed_for` field of
   the sidecar's `MeshConfig`, not an environment variable: no `MIMIC_*` variable sets it; nor
-  do `retries` (3) and the refusal delay (25 ms ± 50 %), fields of the same struct.
+  does the refusal delay (25 ms ± 50 %), a field of the same struct. From #446 `retries` and the
+  retry budget come from the view's policy only (the `MeshConfig.retries` field of #445 is
+  removed); no variable sets them.
   **Metrics** (sidecar, only with `MIMIC_MESH=on`; `service` and `backend` are
   `<namespace>/<name>` and `<namespace>/<name>:<port>`; no route exists yet: `route="none"`;
   `reason` is `none`, the `x-mimic-error` of an answer of the sidecar, or (M2) that of a trusted
@@ -2863,6 +2898,7 @@ no insignificant whitespace):
   | `mimic_mesh_stripped_headers_total` | counter (M2), `x-mimic-*` fields removed from app responses by the inbound side (§4.1) | — |
   | `mimic_mesh_unframed_closes_total` | counter (M2), inbound connections closed because the app sent a response the codec cannot frame while the fields are removed (§4.1); like the previous one, created by the first | — |
   | `mimic_mesh_inbound_refusals_total` | counter (M2, #518), inbound connections to which the sidecar answered `503` `connect-failed` because its app refused the connection (§4.1 "Refused app connections"), one per connection; created by the first | — |
+  | `mimic_mesh_retry_budget_exhausted_total` | counter (M2, #446), failures that `classify` and the planner would have retried but the retry budget refused, one per request or L4 connection at most; a series is created by its first refusal | `backend` |
 
   At most `MIMIC_METRICS_MAX_ENDPOINTS` distinct endpoints have a label of their own, the next ones
   are `other`; the series of an endpoint that left the view are removed 5 minutes after it left
@@ -2870,7 +2906,8 @@ no insignificant whitespace):
   comes back within the 5 minutes keeps its series; likewise the series of a Service port that
   left the view (`mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`,
   `mimic_mesh_fallbacks_total`, `mimic_mesh_reconnects_total`, and from M2
-  `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`). No
+  `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, and
+  from #446 `mimic_mesh_retry_budget_exhausted_total`). No
   label carries a path, a header or any caller-controlled string.
 
 ## 8. Mock
@@ -3127,7 +3164,7 @@ random numbers it hands to the draw.
   | `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauge (M1, sidecar), Services and endpoints of the view held, 0 without one | — |
   | `mimic_mesh_unscoped_connections_total` | counter (M1, sidecar), outbound connections whose destination is not a Service port of the view | — |
   | `mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_endpoint_requests_total`, `mimic_mesh_endpoint_in_flight` | (M1, #443, sidecar) mesh-routed requests, in total, their duration, and per pod; labels, bounds and eviction in §7.9 "Load balancing" | `service`, `route`, `backend`, `endpoint`, `status_class`, `reason` |
-  | `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`, `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total`, `mimic_mesh_inbound_refusals_total` | (M2, #445 and #518, sidecar) tries, retries, retryable failures not retried, body bytes held for replay, `x-mimic-*` fields removed from app responses, connections closed on an unframeable response; §7.9 "Retries" and "Metrics" | `backend`, `result`, `reason` |
+  | `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`, `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total`, `mimic_mesh_inbound_refusals_total`, `mimic_mesh_retry_budget_exhausted_total` | (M2, #445, #518 and #446, sidecar) tries, retries, retryable failures not retried, body bytes held for replay, `x-mimic-*` fields removed from app responses, connections closed on an unframeable response, retries refused by the budget; §7.9 "Retries" and "Metrics" | `backend`, `result`, `reason` |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -4245,9 +4282,21 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
 - (M2) **Idempotent by method name.** A `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` or `DELETE`
   that a pod read and then dropped without an answer (connection closed or reset, stream reset)
   is sent to another pod: an app whose such methods have side effects can see one request
-  twice. Up to #446 (retry budget) nothing bounds this per caller but `retries`, so a reset
-  that every tier propagates as a reset can cost `(1 + retries)` tries per tier; refusals and
-  connect failures never reach an app twice, at any depth.
+  twice. From #446 the retry budget bounds this per caller pod and Service: over a window the
+  retries are at most `percent` of the requests plus `minPerSecond × window`, so a reset that
+  every tier propagates as a reset costs at most a factor `(1 + percent / 100)` per tier, plus
+  the floors (`minPerSecond` per caller pod, which grows with the callers' replicas), never
+  `(1 + retries)` once the floor is spent; refusals and connect failures never reach an app
+  twice, at any depth.
+- (M2, #446) **The budget is per caller pod.** Each sidecar keeps its own budget: N caller pods
+  of a Service add N floors of `minPerSecond`, and a budget is not shared between them nor
+  kept across a restart of the sidecar (stateless). An author of a `MimicConfig` of the Service
+  can raise the budget (`percent: 100`, `minPerSecond: 1000`, `retries: 10`) for every caller of
+  that Service: that is the RBAC of `mimicconfigs` in the Service's namespace, as for every
+  other destination policy.
+- (M2, #446) **The retry budget does not wait.** A retry the budget refuses is not delayed
+  until the budget refills: the failure is returned at once (Linkerd's behaviour), so a short
+  outage can reach the app during a burst once the floor is spent.
 - (M2, #518) **An injected callee whose app refuses connections over TLS looks like a reset.**
   The sidecar of a meshed pod answers a refused app connection on cleartext HTTP/1 and `h2c`
   only (§4.1 "Refused app connections"); over inbound TLS, which it does not decrypt, it closes
@@ -5162,6 +5211,42 @@ it before M5).
 | RTY-37 | **I** (callers retry). A caller's sidecar in process with a view of three pods whose sidecars are in process too (inbound listeners whose original destination is the pod address in the view), one pod's app port closed: 300 requests (`POST` with a 1 KiB body and `GET`, HTTP/1 keep-alive and `h2c`) are all answered `200` by the apps of the two others, the body each app receives equals the one sent, no request reaches the closed app, `mimic_mesh_retries_total{reason="app_refused"}` equals `mimic_mesh_attempts_total{result="app_refused"}` and is at least 1, no fallback is counted and the client never sees an `x-mimic-*` field. With every pod's app closed the client gets the last `503` as received after at most 4 tries (no try on the original destination). With the callee over TLS interception (the CA set-up of RTY-17) and a closed app a `POST` gets the close (no retry), a `GET` is retried. |
 | RTY-38 | **D** (documentation review). The spec text of §4.1, §7.9 and §11.1 above; `docs/wiki/Mesh.md` (when it exists) and `Troubleshooting.md` say that a meshed callee answers `503` `connect-failed` and its caller retries it, and no longer say a refused app looks like a reset, but over TLS. |
 | RTY-39 | **E** (kind, `scripts/e2e.sh` section `rty_39`, own namespace, cleaned by a trap). A Service of 3 injected pods, one whose app listens on another port than the Service's target port (Ready through a probe on that port): 300 requests from an injected client, half `GET` and half `POST`, are all answered `200` by the two live pods (error rate 0 %), the client sidecar's `mimic_mesh_retries_total{reason="app_refused"}` is at least 1 and the refusing pod's `mimic_mesh_inbound_refusals_total` at least 1. |
+
+#### M2 retry budget and `MimicConfig.retries` (#446)
+
+Design: `docs/design/mimic-mesh.md` §6, §7, §10. Spec text: §7 (`MimicConfig` `retries`,
+`retryBudget`), §7.9 (the view's `policy`, "Retries": "Tries", "Retry budget", "Configuration",
+"Metrics"), §9, §11.1. Levels as above. In the **I** tests the sidecar runs in process as in
+§12.21 and RTY-08 to RTY-20, its view (with the `policy` of each Service) served by the fake
+sidecar API, its clock the process's monotonic clock unless a criterion passes one in, and its
+refusal delay shortened (a `MeshConfig` field); a **refusing** pod is the one of RTY-12
+(`503` `x-mimic-error: overloaded`, `x-mimic-endpoint` its own address). Arithmetic used below,
+with `percent` 20, `minPerSecond` 1 and `window` 10 s, every request failing on every try:
+the *i*-th request of a window may bring the retries granted to `⌊i / 5⌋ + 10`. The `MeshConfig.retries` default of RTY-05 is
+replaced by the view's policy (RTY-44, RTY-49); the rest of RTY-01 to RTY-39 holds with the default
+budget, whose floor (100 retries per window) none of their tests reaches.
+
+| ID | Criterion |
+|---|---|
+| RTY-40 | **U** (`mimic-core` `mesh::retry::Budget`, clock passed in). Arithmetic: with `percent` 20, `minPerSecond` 10, `window` 10 s and no request, 100 retries are granted and the 101st refused; after 1000 requests in the window, 300 in all; `percent` 0 and `minPerSecond` 0 grant none whatever the requests; `percent` 100 and `minPerSecond` 0 grant one retry per request; a refused retry counts nothing (asking again gives the same answer); a granted one counts at once; counts saturate (`u32::MAX` requests in a slot neither panics nor wraps) and the formula is computed in integers (`percent` 33 over 3 requests grants 0 with no floor, over 4 requests 1). |
+| RTY-41 | **U** (window). With `window` 10 s (slots of 1 s): a retry granted at 0.5 s still counts at 9.999 s and no longer at 10.0 s; a request seen at 0.5 s likewise; with `window` 1 s the slots are 100 ms and the same holds at 0.999 s and 1.0 s; after a silence longer than the window every count is 0 (one step, whatever the gap: a gap of `u64::MAX` ms neither panics nor loops); a clock that goes back counts its events in the latest slot and never frees budget; the state is a fixed array of 10 slots (its size does not depend on the number of requests). |
+| RTY-42 | **U** (`proptest`). Over any `percent` (0 to 100), `minPerSecond` (0 to 1000), `window` (1 to 60 s) and any sequence of requests and retry asks at non-decreasing times: over every span of 10 consecutive slots, `100 × granted ≤ percent × requests + 100 × minPerSecond × window` holds; the answers are a pure function of the sequence (same sequence, same answers). |
+| RTY-43 | **U** (`mimic-core` `mesh::retry`, the decision). The budget is asked only when `classify` retries the failure and the planner has a try left: a failure that is not retried (`reason="method"`, `"buffer"`, an app response), `retries: 0` and a planner out of tries (`reason="exhausted"`) leave the budget's counts unchanged; a granted ask becomes the next try (to a pod or the original destination, which needs the budget too); a refused one ends the tries with the verdict `budget`, the failure returned as is (its `result` unchanged); a reconnect of an unwritten request asks nothing. |
+| RTY-44 | **U** (`mesh::policy`). Without any `MimicConfig` the policy of a Service is `retries` 3, `retryBudget` `{percent: 20, minPerSecond: 10, windowSeconds: 10}`; the winning config's `retries` (0 included) and each `retryBudget` field it sets are taken, every field it does not set keeps its default alone; a consented Service of another namespace carries its own namespace's config (as MSH-07). `validate` gives `Invalid` (as MSH-08) for `retries` or `retryBudget` on a config without a Service target, `retries` over 10, `percent` over 100, `minPerSecond` over 1000, `window` of 0 s or over 60 s. |
+| RTY-45 | **U** (`mesh::view`). The view's `policy` holds `retries` and `retryBudget` with every field, keys sorted (the JSON of §7.9 for the defaults); a change of `retries` in the winning config gives a new ETag and a higher generation of `mimicconfig/<ns>/<name>@<uid>` in the Service's `generations`; `View::from_json` reads back what `build` wrote and refuses an unknown field in `retryBudget`, a missing `retries` or `retryBudget` field, `retries` 11, `percent` 101, `minPerSecond` 1001 and `windowSeconds` 0 or 61. |
+| RTY-46 | **U** (next to the controller's adapters, as MSH-27). A `MimicConfig` object converts with `retries` and `retryBudget` (`window: 10s` → 10 s; absent fields `None`; an absent `retryBudget` sets nothing); a `window` that does not parse makes the config `Invalid`, not a panic. |
+| RTY-47 | **E** (chart, `scripts/check-chart.sh`, as MSH-15). The rendered CRD has `retries` (integer, 0 to 10), `retryBudget.percent` (0 to 100), `retryBudget.minPerSecond` (0 to 1000), `retryBudget.window` (`<n>s`) and the CEL rules for a window of 1 to 60 s and for `retries` and `retryBudget` on a Service target only. |
+| RTY-48 | **E** (kind, `scripts/e2e.sh` section `msh_17`, its objects only). The API server accepts `retries` 0 and 10 and a `retryBudget` with any one field; it refuses `retries` -1, 11 and `"3"`, `percent` 101, `minPerSecond` 1001, `window` `0s`, `61s` and `10`, and `retries` or `retryBudget` in a config whose only target is a Deployment, each with the CEL message or schema error naming the field. |
+| RTY-49 | **I** (retries from the view). Two Services of 3 pods each, one pod of each refusing connections: with `policy.retries` 0 on `a` and 3 on `b`, a request sent to `a`'s refusing pod is answered `503` `x-mimic-error: connect-failed` after 1 try (access line `attempts` 1, no fallback, `mimic_mesh_retries_skipped_total{reason="exhausted"}` 1), while every request to `b` is answered `200`; after the next view sets `a` to `retries: 1`, the requests sent to `a` are all answered `200` with at most 2 tries each. A view whose policy has no `retries` is refused (`result="invalid"`) and the one held is kept. |
+| RTY-50 | **I** (exhaustion). One Service of 3 refusing pods, `retries` 3, `retryBudget` `{percent: 20, minPerSecond: 1, window: 10s}`: 100 sequential `POST` requests (1 KiB body, HTTP/1 keep-alive), finished within 9 s, are each answered with a refusal as received; the pods saw 130 tries in all; `mimic_mesh_retries_total{reason="overloaded"}` is 30, `mimic_mesh_retries_skipped_total{reason="exhausted"}` 3 (requests 1 to 3), `mimic_mesh_retry_budget_exhausted_total{backend}` 97, and the access lines have `attempts` 4, 4, 4, 2, 2, then 1 or 2. The same over `h2c` gives the same counts. |
+| RTY-51 | **I** (rate-limited WARN). In RTY-50: at least 1 and at most `1 + ⌈elapsed seconds⌉` lines `retry budget exhausted`, each with `service`, `backend`, `window_requests`, `window_retries` and `suppressed`; one more refused request more than 1 s after the last line logs a line, and the lines plus their `suppressed` add up to the refusals counted by the metric. Two Services exhausted in the same second each get their own line. No line holds a path, a header value, an address or a body byte of the requests (they carry distinct paths and header values that are looked for). |
+| RTY-52 | **I** (window and isolation). `retryBudget` `{percent: 0, minPerSecond: 2, window: 1s}`, 3 refusing pods: of 5 requests in a row the first gets 2 retries and the others none (5 budget refusals); 1.1 s later a request gets 2 retries again. Exhausting Service `a` leaves the budget of Service `b` whole (its requests get their 3 retries), and two ports of `a` share one budget (the refusals are counted under each port's `backend`). |
+| RTY-53 | **I** (fallback and L4). `retryBudget` `{percent: 0, minPerSecond: 0}` on a Service whose only pod refuses connections and whose ClusterIP answers: a request is answered `503` `connect-failed` after 1 try, no fallback is counted, `mimic_mesh_retry_budget_exhausted_total` 1. Five pods refusing connections, an L4 (non-HTTP) client: the connection is closed without a byte after 1 connect (budget refused, counted 1); with the default budget it reaches the original destination as in RTY-16; each L4 connection counts as one request of the budget. |
+| RTY-54 | **I** (state across views). An exhausted Service stays exhausted across a view that changes only its EndpointSlices (a pod added) or its `percent` (counts kept, the new `percent` applied: a `percent` of 100 grants the next retry); a view with a new `window` gives it an empty budget (the next request gets its retries); a Service that leaves the view and comes back has an empty budget; the budgets and log limiters held are never more than the Services of the view (a view of 0 Services leaves none, read through a test hook). |
+| RTY-55 | **I** (labels). 1000 exhausted requests with 1000 distinct paths, methods (`GET`, `POST`, an extension method) and header values give exactly one series of `mimic_mesh_retry_budget_exhausted_total` per `backend` and no other label; its series is removed 5 minutes after the backend left the view and kept when it comes back within them (clock passed in, as RTY-20). |
+| RTY-56 | **E** (kind, `scripts/e2e.sh` section `rty_56`, own namespace, cleaned by a trap). The set-up of RTY-21 (a Service of 3 pods, one not injected and listening on no port while Ready, an injected client): 100 `GET` are answered `200`; a `MimicConfig` targeting the Service with `retries: 0` is `Accepted: True`, and once the client sidecar's `mimic_mesh_view_pulls_total{result="ok"}` grew by one (at most 30 s), 100 `GET` give at least one `503` `x-mimic-error: connect-failed` while `mimic_mesh_retries_total` of that backend does not change; once the `MimicConfig` is deleted and the next view applied, 100 `GET` are all answered `200` again. |
+| RTY-57 | **D** (documentation review). `docs/wiki/Mesh.md` "Retries" explains the budget (the formula, per caller pod and Service, the window, what happens over budget, `retries: 0`) with a `MimicConfig` example and a worked number (defaults: 100 retries per 10 s window plus 20 % of the requests); `Monitoring.md` lists `mimic_mesh_retry_budget_exhausted_total`; `Troubleshooting.md` has the `retry budget exhausted` line; `CHANGELOG.md` *Unreleased* names the two fields and the metric, and that `retries: 0` also stops the fallback to the ClusterIP. |
+| RTY-58 | **D** (security review). The WARN is rate-limited per backend (RTY-51) and holds no request data; the new metric has the `backend` label only (RTY-55); budget and limiter state is bounded by the Services of the view (RTY-41, RTY-54); the CEL and `from_json` bounds hold (RTY-44, RTY-45, RTY-48); the amplification left is the one written in §11.1 ("Idempotent by method name", "The budget is per caller pod"); `mimic-core` stays pure (the clock passed in). |
 
 ## 13. Test strategy
 
