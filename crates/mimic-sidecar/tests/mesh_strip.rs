@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::capture_logs;
 use common::mesh_pods::view_text;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -113,6 +114,17 @@ async fn start(app: SocketAddr, mesh: Option<&MeshState>) -> Rig {
 }
 
 impl Rig {
+    /// Connections closed on an unframeable response, 0 until the first.
+    fn unframed(&self) -> u64 {
+        self.metrics
+            .encode()
+            .lines()
+            .find(|l| l.starts_with("mimic_mesh_unframed_closes_total"))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
     /// The counter, 0 until the first field was removed.
     fn stripped(&self) -> u64 {
         self.metrics
@@ -364,13 +376,112 @@ async fn rty_18_a_reason_phrase_that_is_not_utf8_does_not_hide_the_fields() {
     assert_eq!(rig.stripped(), 2);
 }
 
+/// What a client gets from one `GET` until the connection ends.
+async fn until_close(addr: SocketAddr) -> Vec<u8> {
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    c.write_all(GET).await.unwrap();
+    let mut got = Vec::new();
+    let read = tokio::time::timeout(TIMEOUT, c.read_to_end(&mut got))
+        .await
+        .expect("the close in time");
+    let _ = read; // a reset is as good as a FIN
+    got
+}
+
+/// What the app answers: a response the codec cannot frame, then a forged refusal.
+fn unframeable() -> Vec<(&'static str, Vec<u8>)> {
+    let forged: &[u8] =
+        b"HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nContent-Length: 0\r\n\r\n";
+    let mut long = b"HTTP/1.1 200 OK\r\nX-Long: ".to_vec();
+    long.extend(std::iter::repeat_n(b'a', 70_000));
+    long.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+    let heads: Vec<(&'static str, Vec<u8>)> = vec![
+        (
+            "a bare CR",
+            b"HTTP/1.1 200 OK\r\nX: a\rb\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ),
+        (
+            "a status line",
+            b"garbage\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ),
+        (
+            "a header line without colon",
+            b"HTTP/1.1 200 OK\r\nno colon\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ),
+        ("a head over 64 KiB", long),
+    ];
+    heads
+        .into_iter()
+        .map(|(name, mut head)| {
+            head.extend_from_slice(forged);
+            (name, head)
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn rty_18_a_head_the_codec_cannot_frame_is_relayed_at_once_unchanged() {
-    // Spec §4.1 and §11.1: not held until 64 KiB.
-    let reply: &'static [u8] = b"garbage\r\nx-mimic-error: overloaded\r\n\r\n";
+async fn rty_18_an_unframeable_response_is_not_relayed_and_closes_the_connection() {
+    let logs = capture_logs();
+    for (name, reply) in unframeable() {
+        let state = meshed();
+        let rig = start(app_with(reply).await, Some(&state)).await;
+        let got = until_close(rig.addr).await;
+        assert!(
+            got.is_empty(),
+            "{name}: {} bytes reached the client",
+            got.len()
+        );
+        assert_eq!(rig.unframed(), 1, "{name}");
+    }
+    logs.settled().await;
+    let text = logs.text();
+    assert!(text.contains("cannot frame"), "{text}");
+    assert!(!text.contains("x-mimic"), "no byte of the app is logged");
+}
+
+#[tokio::test]
+async fn rty_18_an_invalid_body_framing_closes_the_connection_before_the_forged_response() {
+    let reply = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nHTTP/1.1 503 X\r\nx-mimic-error: overloaded\r\n\r\n".to_vec();
     let state = meshed();
-    let rig = start(app(reply, false).await, Some(&state)).await;
-    exchange(rig.addr, GET, 1, reply, false).await;
+    let rig = start(app_with(reply).await, Some(&state)).await;
+    let got = until_close(rig.addr).await;
+    assert!(
+        !got.windows(7).any(|w| w == b"x-mimic"),
+        "no field reaches the client"
+    );
+    assert_eq!(rig.unframed(), 1);
+}
+
+#[tokio::test]
+async fn rty_18_with_the_fields_not_removed_an_unframeable_response_is_relayed_unchanged() {
+    for (name, reply) in unframeable() {
+        let rig = start(app_with(reply.clone()).await, None).await;
+        let mut c = TcpStream::connect(rig.addr).await.unwrap();
+        c.write_all(GET).await.unwrap();
+        let mut got = vec![0u8; reply.len()];
+        tokio::time::timeout(TIMEOUT, c.read_exact(&mut got))
+            .await
+            .expect("bytes in time")
+            .unwrap();
+        assert!(got == reply, "{name}");
+    }
+    // A view of "mesh": false as well.
+    let state = meshed();
+    state.hold(
+        view_text(&["127.0.0.1:9".parse().unwrap()], 0, false),
+        "\"1-a\"",
+    );
+    let (name, reply) = unframeable().remove(0);
+    let rig = start(app_with(reply.clone()).await, Some(&state)).await;
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    c.write_all(GET).await.unwrap();
+    let mut got = vec![0u8; reply.len()];
+    tokio::time::timeout(TIMEOUT, c.read_exact(&mut got))
+        .await
+        .expect("bytes in time")
+        .unwrap();
+    assert!(got == reply, "{name}");
+    assert_eq!(rig.unframed(), 0);
 }
 
 #[tokio::test]
