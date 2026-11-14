@@ -245,3 +245,173 @@ fn msh_08_a_target_is_always_in_the_namespace_of_its_config() {
     assert_eq!(status(&s, "shop", "x").accepted.reason, "TargetNotFound");
     assert_eq!(slow_start(&s, "risk", "other", "risk/scoring"), 30);
 }
+
+fn retry_cfg(
+    ns: &str,
+    name: &str,
+    created: i64,
+    svc: &str,
+    retries: Option<u32>,
+    budget: Option<RetryBudgetSpec>,
+) -> Config {
+    Config {
+        retries,
+        retry_budget: budget,
+        ..cfg(ns, name, created, &[(TargetKind::Service, svc)])
+    }
+}
+
+fn budget(
+    percent: Option<u32>,
+    min_per_second: Option<u32>,
+    window_seconds: Option<u32>,
+) -> RetryBudgetSpec {
+    RetryBudgetSpec {
+        percent,
+        min_per_second,
+        window_seconds,
+    }
+}
+
+fn retry_policy(s: &Snapshot, ns: &str, d: &str, key: &str) -> (u32, RetryBudget) {
+    let p = &view_of(s, ns, d).view.services[key].policy;
+    (p.retries, p.retry_budget.clone())
+}
+
+fn rb(percent: u32, min_per_second: u32, window_seconds: u32) -> RetryBudget {
+    RetryBudget {
+        percent,
+        min_per_second,
+        window_seconds,
+    }
+}
+
+#[test]
+fn rty_44_the_defaults_are_3_retries_and_a_budget_of_20_percent_10_per_second_10_s() {
+    let mut s = cluster();
+    assert_eq!(defaults().retries, 3);
+    assert_eq!(defaults().retry_budget, rb(20, 10, 10));
+    assert_eq!(effective(None), defaults());
+    assert_eq!(
+        retry_policy(&s, "shop", "cart", "shop/cart"),
+        (3, rb(20, 10, 10))
+    );
+    s.configs = vec![retry_cfg("shop", "a", 1, "cart", None, None)];
+    assert_eq!(
+        retry_policy(&s, "shop", "cart", "shop/cart"),
+        (3, rb(20, 10, 10))
+    );
+}
+
+#[test]
+fn rty_44_the_winning_config_sets_retries_and_each_budget_field_alone() {
+    let mut s = cluster();
+    s.configs = vec![retry_cfg("shop", "a", 1, "cart", Some(0), None)];
+    assert_eq!(retry_policy(&s, "shop", "cart", "shop/cart").0, 0);
+    s.configs = vec![retry_cfg("shop", "a", 1, "cart", Some(10), None)];
+    assert_eq!(retry_policy(&s, "shop", "cart", "shop/cart").0, 10);
+    for (set, want) in [
+        (budget(Some(0), None, None), rb(0, 10, 10)),
+        (budget(None, Some(0), None), rb(20, 0, 10)),
+        (budget(None, None, Some(60)), rb(20, 10, 60)),
+        (budget(Some(100), Some(1000), Some(1)), rb(100, 1000, 1)),
+        (budget(None, None, None), rb(20, 10, 10)),
+    ] {
+        s.configs = vec![retry_cfg("shop", "a", 1, "cart", None, Some(set))];
+        assert_eq!(
+            retry_policy(&s, "shop", "cart", "shop/cart"),
+            (3, want),
+            "an unset field keeps its default alone"
+        );
+    }
+}
+
+#[test]
+fn rty_44_a_consented_service_carries_the_retries_of_its_own_namespace() {
+    let mut s = cluster();
+    s.grants = Some(vec![grant("risk", "shop")]);
+    s.configs = vec![
+        dep_cfg("shop", "d", 1, "cart", &["risk/scoring"]),
+        retry_cfg(
+            "risk",
+            "p",
+            1,
+            "scoring",
+            Some(7),
+            Some(budget(Some(5), None, None)),
+        ),
+        retry_cfg("shop", "q", 1, "scoring", Some(9), None), // shop/scoring does not exist
+    ];
+    assert_eq!(
+        retry_policy(&s, "shop", "cart", "risk/scoring"),
+        (7, rb(5, 10, 10))
+    );
+    assert_eq!(
+        retry_policy(&s, "shop", "cart", "shop/cart"),
+        (3, rb(20, 10, 10))
+    );
+}
+
+#[test]
+fn rty_44_validate_refuses_retries_out_of_bounds_and_on_a_deployment() {
+    let on = |kind, retries, retry_budget| Config {
+        retries,
+        retry_budget,
+        ..cfg("shop", "x", 1, &[(kind, "cart")])
+    };
+    let svc = |retries, b| on(TargetKind::Service, retries, b);
+    assert!(validate(&svc(Some(0), None)).is_ok());
+    assert!(validate(&svc(Some(10), None)).is_ok());
+    assert!(validate(&svc(Some(11), None)).is_err());
+    assert!(validate(&svc(None, Some(budget(Some(100), Some(1000), Some(60))))).is_ok());
+    assert!(validate(&svc(None, Some(budget(Some(0), Some(0), Some(1))))).is_ok());
+    assert!(validate(&svc(None, Some(budget(None, None, None)))).is_ok());
+    for bad in [
+        budget(Some(101), None, None),
+        budget(None, Some(1001), None),
+        budget(None, None, Some(0)),
+        budget(None, None, Some(61)),
+    ] {
+        let err = validate(&svc(None, Some(bad))).expect_err("out of bounds");
+        assert!(err.contains("retryBudget"), "{err}");
+    }
+    let err = validate(&svc(Some(11), None)).unwrap_err();
+    assert!(err.contains("retries"), "{err}");
+    let dep = |retries, b| on(TargetKind::Deployment, retries, b);
+    assert!(
+        validate(&dep(Some(3), None))
+            .unwrap_err()
+            .contains("retries")
+    );
+    assert!(
+        validate(&dep(None, Some(budget(None, None, None))))
+            .unwrap_err()
+            .contains("retryBudget")
+    );
+    // A Deployment target next to a Service one still fits.
+    let both = Config {
+        retries: Some(2),
+        ..cfg(
+            "shop",
+            "x",
+            1,
+            &[
+                (TargetKind::Deployment, "cart"),
+                (TargetKind::Service, "cart"),
+            ],
+        )
+    };
+    assert!(validate(&both).is_ok());
+}
+
+#[test]
+fn rty_44_an_invalid_retries_config_is_invalid_in_the_status_and_takes_no_part() {
+    let mut s = cluster();
+    s.configs = vec![
+        retry_cfg("shop", "a", 1, "cart", Some(11), None),
+        retry_cfg("shop", "b", 2, "cart", Some(2), None),
+    ];
+    assert_eq!(status(&s, "shop", "a").accepted.reason, "Invalid");
+    assert_eq!(status(&s, "shop", "b").accepted.reason, "Accepted");
+    assert_eq!(retry_policy(&s, "shop", "cart", "shop/cart").0, 2);
+}

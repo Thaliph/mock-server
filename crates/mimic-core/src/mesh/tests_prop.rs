@@ -116,6 +116,8 @@ fn config() -> impl Strategy<Value = Config> {
                 }),
                 mesh_enabled,
                 slow_start,
+                retries: None,
+                retry_budget: None,
             },
         )
 }

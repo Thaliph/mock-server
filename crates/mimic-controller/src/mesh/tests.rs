@@ -78,6 +78,8 @@ pub(crate) fn config(ns: &str, name: &str, deployment: &str, dests: &[(&str, &st
         ),
         mesh_enabled: None,
         slow_start: None,
+        retries: None,
+        retry_budget: None,
     }
 }
 

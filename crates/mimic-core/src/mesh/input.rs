@@ -99,6 +99,21 @@ pub struct Config {
     /// `spec.loadBalancer.slowStart` in seconds (a present `loadBalancer` without it is `None`
     /// here: it sets nothing).
     pub slow_start: Option<u32>,
+    /// `spec.retries` (a Service target only).
+    pub retries: Option<u32>,
+    /// `spec.retryBudget`; `None` when the object has none (a present one without fields is
+    /// `Some` of all `None`).
+    pub retry_budget: Option<RetryBudgetSpec>,
+}
+
+/// `spec.retryBudget`; `None` is a field the object does not set. A value the adapter cannot
+/// read (a `window` that is not `<n>s`) arrives out of bounds, so that `validate` refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryBudgetSpec {
+    pub percent: Option<u32>,
+    pub min_per_second: Option<u32>,
+    /// `window` in seconds.
+    pub window_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

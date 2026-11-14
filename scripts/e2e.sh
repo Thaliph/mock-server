@@ -90,6 +90,9 @@ cleanup() {
   if [[ -n ${RTY_39_CLEANUP:-} ]]; then
     kubectl delete namespace rty-39 --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${RTY_56_CLEANUP:-} ]]; then
+    kubectl delete namespace rty-56 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   if [[ -n ${RTY_22_CLEANUP:-} ]]; then
     kubectl delete namespace rty-22 --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
@@ -455,6 +458,51 @@ mc_denied "a destination without a name" msh-d15 "$mc_dep
   destinations: [{namespace: risk}]"
 mc_denied "a mesh.enabled that is not a boolean" msh-d16 "$mc_dep
   mesh: {enabled: maybe}"
+# RTY-48 (#446): retries and retryBudget, bounds and target kinds.
+mc_accepted "retries 0" rty-a1 "$mc_svc
+  retries: 0"
+mc_accepted "retries 10" rty-a2 "$mc_svc
+  retries: 10"
+mc_accepted "a retryBudget with percent only" rty-a3 "$mc_svc
+  retryBudget: {percent: 100}"
+mc_accepted "a retryBudget with minPerSecond only" rty-a4 "$mc_svc
+  retryBudget: {minPerSecond: 1000}"
+mc_accepted "a retryBudget with window only" rty-a5 "$mc_svc
+  retryBudget: {window: 60s}"
+mc_accepted "a retryBudget with window 1s" rty-a6 "$mc_svc
+  retryBudget: {window: 1s}"
+mc_accepted "an empty retryBudget" rty-a7 "$mc_svc
+  retryBudget: {}"
+mc_accepted "retries on a config with both target kinds" rty-a8 '  targetRefs:
+    - {group: apps, kind: Deployment, name: cart}
+    - {group: "", kind: Service, name: cart}
+  retries: 2'
+mc_denied_with() { # mc_denied_with <field> <desc> <name> <spec>: refused, and the error names <field>
+  local field=$1 desc=$2 out; shift 2
+  if out=$(mimicconfig "$@" 2>&1); then fail "msh_17: $desc was accepted"; fi
+  [[ $out == *"$field"* ]] || fail "msh_17: the refusal of $desc does not name $field (got: $out)"
+}
+mc_denied_with retries "retries -1" rty-d1 "$mc_svc
+  retries: -1"
+mc_denied_with retries "retries 11" rty-d2 "$mc_svc
+  retries: 11"
+mc_denied_with retries 'retries "3"' rty-d3 "$mc_svc
+  retries: \"3\""
+mc_denied_with percent "percent 101" rty-d4 "$mc_svc
+  retryBudget: {percent: 101}"
+mc_denied_with minPerSecond "minPerSecond 1001" rty-d5 "$mc_svc
+  retryBudget: {minPerSecond: 1001}"
+mc_denied_with window "window 0s" rty-d6 "$mc_svc
+  retryBudget: {window: 0s}"
+mc_denied_with window "window 61s" rty-d7 "$mc_svc
+  retryBudget: {window: 61s}"
+mc_denied_with window "window 10 (no unit)" rty-d8 "$mc_svc
+  retryBudget: {window: 10}"
+mc_denied_with retries "retries with only a Deployment target" rty-d9 "$mc_dep
+  retries: 3"
+mc_denied_with retryBudget "retryBudget with only a Deployment target" rty-d10 "$mc_dep
+  retryBudget: {percent: 10}"
+kubectl -n default delete mimicconfig rty-a1 rty-a2 rty-a3 rty-a4 rty-a5 rty-a6 rty-a7 rty-a8 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig msh1 msh2 msh3 msh4 --ignore-not-found >/dev/null
 
 # The webhook configuration: three webhooks, one per path, fail closed, pods only, system namespaces excluded.
@@ -4814,6 +4862,141 @@ rty_39_refused=$(rty_metric_sum rty-39 "$rty_39_refusing" mimic_mesh_inbound_ref
 kubectl delete namespace rty-39 --wait=false >/dev/null
 RTY_39_CLEANUP=
 echo "rty_39: 300 GET and POST were all answered 200, ${rty_39_retried%.*} app_refused retries and ${rty_39_refused%.*} inbound refusals were counted"
+
+# RTY-56 (#446): the set-up of RTY-21 (a Service of 3 pods, one not injected and listening on no port while Ready, an
+# injected client). 100 GET are answered 200; a MimicConfig with retries: 0 on the Service is Accepted and, once the next
+# view is applied, some GET give 503 x-mimic-error: connect-failed while mimic_mesh_retries_total does not move; deleting
+# it brings the retries back within one view update: 100 GET are all answered 200 again.
+log "rty_56: retries: 0 in a MimicConfig disables the retries within one view update, deleting it brings them back"
+RTY_56_CLEANUP=1
+ns_fresh rty-56 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+kubectl -n rty-56 create configmap pod --from-file=pod.py="$WORK/rty21-pod.py" >/dev/null
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: pods, namespace: rty-56}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: pods}}
+  template:
+    metadata: {labels: {app: pods, svc: pods}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, /srv/pod.py]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /, port: http}, periodSeconds: 1}
+          volumeMounts: [{name: srv, mountPath: /srv}]
+      volumes: [{name: srv, configMap: {name: pod}}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: dead, namespace: rty-56}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: dead}}
+  template:
+    metadata: {labels: {app: dead, svc: pods, mimic.platform.io/inject: disabled}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+          ports: [{name: http, containerPort: 8080}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: pods, namespace: rty-56}
+spec:
+  selector: {svc: pods}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: rty-56}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for d in pods dead client; do
+  kubectl -n rty-56 rollout status deploy/$d --timeout=3m >/dev/null || fail "rty_56: $d did not roll out Ready"
+done
+rty_56_client=$(kubectl -n rty-56 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+rty_56_view() { [[ $(rty_metric rty-56 "$rty_56_client" mimic_mesh_view_endpoints) == 3 ]]; }
+for _ in $(seq 60); do rty_56_view && break; sleep 1; done
+rty_56_view || fail "rty_56: the sidecar of client never held a view with the 3 endpoints of pods"
+# Slow start (default 30 s, spec §7.9): every endpoint is past the window before the first request.
+sleep 31
+cat > "$WORK/rty56-client.py" <<'PY'
+import http.client
+
+counts = {}
+for _ in range(100):
+    try:
+        c = http.client.HTTPConnection("pods.rty-56.svc", 80, timeout=10)
+        c.request("GET", "/")
+        r = c.getresponse()
+        r.read()
+        key = "%d %s" % (r.status, r.getheader("x-mimic-error") or "-")
+        c.close()
+    except Exception:
+        key = "error -"
+    counts[key] = counts.get(key, 0) + 1
+for key, n in sorted(counts.items()):
+    print("answer", key, n)
+PY
+kubectl -n rty-56 exec -i "$rty_56_client" -c app -- python3 -c 'import sys; open("/tmp/client.py", "w").write(sys.stdin.read())' \
+  < "$WORK/rty56-client.py" || fail "rty_56: cannot copy the client script"
+# rty_56_run <"status error"> <variable>: 100 GET from the client; the number of answers of that kind goes to the variable.
+rty_56_run() {
+  local out
+  out=$(kubectl -n rty-56 exec "$rty_56_client" -c app -- python3 /tmp/client.py) || fail "rty_56: the client script failed"
+  printf -v "$2" '%s' "$(awk -v k="answer $1 " 'index($0, k) == 1 { n += $NF } END { print n + 0 }' <<<"$out")"
+}
+rty_56_run "200 -" rty_56_ok
+(( rty_56_ok == 100 )) || fail "rty_56: $rty_56_ok of 100 GET were answered 200 with the default retries"
+
+rty_56_pulls() { local n; n=$(rty_metric_sum rty-56 "$rty_56_client" mimic_mesh_view_pulls_total 'result="ok"'); echo "${n%.*}"; }
+rty_56_applied() { (( $(rty_56_pulls) > rty_56_before )); }
+rty_56_before=$(rty_56_pulls)
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: no-retries, namespace: rty-56}
+spec:
+  targetRefs: [{group: "", kind: Service, name: pods}]
+  retries: 0
+YAML
+rty_56_accepted() { [[ $(kubectl -n rty-56 get mimicconfig no-retries -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}') == True ]]; }
+for _ in $(seq 30); do rty_56_accepted && break; sleep 1; done
+rty_56_accepted || fail "rty_56: the MimicConfig with retries: 0 is not Accepted: True"
+for _ in $(seq 30); do rty_56_applied && break; sleep 1; done
+rty_56_applied || fail "rty_56: the sidecar of client pulled no new view within 30 s of the MimicConfig"
+rty_56_retries=$(rty_metric_sum rty-56 "$rty_56_client" mimic_mesh_retries_total)
+# A failed pod stays avoided for 5 s (avoid_failed_for): wait it out so this run can reach the refusing pod.
+sleep 6
+rty_56_run "503 connect-failed" rty_56_failed
+(( rty_56_failed >= 1 )) || fail "rty_56: with retries: 0 no GET of 100 was answered 503 connect-failed"
+rty_56_after=$(rty_metric_sum rty-56 "$rty_56_client" mimic_mesh_retries_total)
+[[ $rty_56_after == "$rty_56_retries" ]] || fail "rty_56: mimic_mesh_retries_total moved from $rty_56_retries to $rty_56_after with retries: 0"
+
+rty_56_before=$(rty_56_pulls)
+kubectl -n rty-56 delete mimicconfig no-retries >/dev/null
+for _ in $(seq 30); do rty_56_applied && break; sleep 1; done
+rty_56_applied || fail "rty_56: the sidecar of client pulled no new view within 30 s of the deletion"
+rty_56_run "200 -" rty_56_back
+(( rty_56_back == 100 )) || fail "rty_56: $rty_56_back of 100 GET were answered 200 after the MimicConfig was deleted"
+kubectl delete namespace rty-56 --wait=false >/dev/null
+RTY_56_CLEANUP=
+echo "rty_56: retries: 0 gave $rty_56_failed of 100 503 connect-failed and no retry, 100 of 100 were 200 before and after"
 
 # RTY-22: tiers A -> B -> C. c-mesh and c-off (2 pods each, not injected) answer 503 x-mimic-error: overloaded with
 # x-mimic-endpoint set to their own <pod IP>:8080, and count their requests. b-mesh (injected) forwards to c-mesh and b-off

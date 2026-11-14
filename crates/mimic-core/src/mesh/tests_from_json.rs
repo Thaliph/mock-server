@@ -168,3 +168,50 @@ fn msh_06_an_object_created_again_has_another_generations_key() {
             .contains_key("mimicconfig/shop/c@uid-c")
     );
 }
+
+#[test]
+fn rty_45_from_json_reads_back_a_policy_with_retries_and_refuses_the_rest() {
+    let mut s = snapshot();
+    s.services = vec![http_svc("shop", "cart", "10.96.12.7")];
+    let mut c = cfg("shop", "c", 1, &[(TargetKind::Service, "cart")]);
+    c.retries = Some(0);
+    c.retry_budget = Some(RetryBudgetSpec {
+        percent: Some(100),
+        min_per_second: Some(1000),
+        window_seconds: Some(60),
+    });
+    s.configs = vec![c];
+    let b = build(&s, "shop", "cart", Mode::Mock, &Limits::default());
+    let back = read(&b.json).expect("a built view reads back");
+    assert_eq!(back, b.view);
+    assert_eq!(back.to_json(), b.json);
+
+    let json = rich().json;
+    let bad = |from: &str, to: &str| {
+        assert!(json.contains(from), "{from}");
+        assert!(read(&json.replacen(from, to, 1)).is_err(), "{to}");
+    };
+    bad(r#""retryBudget":{"#, r#""retryBudget":{"extra":1,"#);
+    bad(r#""retries":3,"#, "");
+    bad(
+        r#","retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}"#,
+        "",
+    );
+    bad(r#""minPerSecond":10,"#, "");
+    bad(r#""percent":20,"#, "");
+    bad(r#""windowSeconds":10"#, r#""windowSeconds":10,"x":1"#);
+    bad(r#""retries":3"#, r#""retries":11"#);
+    bad(r#""percent":20"#, r#""percent":101"#);
+    bad(r#""minPerSecond":10"#, r#""minPerSecond":1001"#);
+    bad(r#""windowSeconds":10"#, r#""windowSeconds":0"#);
+    bad(r#""windowSeconds":10"#, r#""windowSeconds":61"#);
+    bad(r#""retries":3"#, r#""retries":-1"#);
+    bad(r#""retries":3"#, r#""retries":"3""#);
+    for ok in [
+        (r#""retries":3"#, r#""retries":10"#),
+        (r#""windowSeconds":10"#, r#""windowSeconds":1"#),
+        (r#""windowSeconds":10"#, r#""windowSeconds":60"#),
+    ] {
+        assert!(read(&json.replacen(ok.0, ok.1, 1)).is_ok(), "{}", ok.1);
+    }
+}

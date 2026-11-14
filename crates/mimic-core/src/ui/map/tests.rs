@@ -60,6 +60,8 @@ pub(super) fn config(ns: &str, name: &str, created: i64, dests: &[(&str, &str)])
         ),
         mesh_enabled: None,
         slow_start: None,
+        retries: None,
+        retry_budget: None,
     }
 }
 

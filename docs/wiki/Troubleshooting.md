@@ -79,6 +79,13 @@ retried only for the six idempotent methods: `mimic_mesh_retries_skipped_total{r
 larger than `MIMIC_MESH_RETRY_BUFFER` (64 KiB) is not retried once written: `reason="buffer"`. A `5xx` answer
 of the app is never retried.
 
+**The sidecar logs `retry budget exhausted`, and failures are not retried.** The Service the `backend`
+field names failed so often that the retries of this pod used up its budget (by default 100 retries per 10 s
+plus 20 % of the requests): the failure is returned as it is, counted in
+`mimic_mesh_retry_budget_exhausted_total{backend}`; the line is written at most once per second per backend
+(`suppressed` counts the others). Fix the failing pods; to allow more retries raise `retryBudget` in a
+`MimicConfig` on the Service ([Mesh](Mesh#retries)). `retries: 0` turns the retries off on purpose.
+
 **`503` with `x-mimic-error: connect-failed` after 4 tries.** Every pod tried and the ClusterIP refused the
 connection (`mimic_mesh_retries_skipped_total{reason="exhausted"}`). Check the pods' ports and, over
 intercepted TLS, their certificates (`tls verification failed` lines).

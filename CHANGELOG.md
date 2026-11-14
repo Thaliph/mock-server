@@ -21,6 +21,14 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Retry policy and budget per Service (#446, M2): `MimicConfig` targeting a Service gains `retries` (0 to 10,
+  default 3; `0` also stops the fallback to the ClusterIP) and `retryBudget` (`percent` 20, `minPerSecond` 10,
+  `window` 10s). Each caller pod keeps one budget per Service: a retry is granted while retries in the window
+  stay within `percent` of the requests plus `minPerSecond` per second; the defaults allow 100 retries per 10 s
+  plus 20 % of the requests. A refused retry returns the failure as is, is counted in
+  `mimic_mesh_retry_budget_exhausted_total{backend}` and logged as the warning `retry budget exhausted` (at most
+  once per second per backend). The view's `policy` carries both fields: upgrade the controller before the
+  sidecars, since a sidecar refuses a view without them.
 - Retries of mesh-routed requests (#445, M2): a request whose failure happened before the app could process it
   is tried again on another pod, at most 3 times (4 tries), then on the original destination when every try
   failed to connect. Retried: connect failures and refused HTTP/2 streams for every method, a trusted refusal
@@ -29,7 +37,7 @@ All notable changes to mimic are documented in this file. The format follows
   `TRACE`, `PUT` and `DELETE`. A response of an app is never retried. Request bodies are held for replay up to
   `MIMIC_MESH_RETRY_BUFFER` (64Ki) per request and `MIMIC_MESH_RETRY_BUFFER_TOTAL` (8Mi) in all. The access line
   gains `attempts`; new metrics `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`,
-  `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`. The retry budget is #446.
+  `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`. The retry budget is #446 (below).
 - **Meshed sidecars remove `x-mimic-*` fields from app responses** (#445, M2): with `MIMIC_MESH=on` (and a view
   that does not say `"mesh": false`) the inbound side removes every response field whose name starts with
   `x-mimic-`, so that only a sidecar writes them; counted in `mimic_mesh_stripped_headers_total`. A response the

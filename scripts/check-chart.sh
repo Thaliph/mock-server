@@ -865,6 +865,24 @@ for rule in '!has(self.namespace)' "!has(self.destinations) || self.targetRefs.e
 done
 echo "msh_15: the MimicConfig CRD is kept, has a status subresource, bounded fields and the CEL rules"
 
+# RTY-47 (#446): retries and retryBudget of the MimicConfig CRD, their bounds and their CEL rules.
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 '.properties.retries | [.type, .minimum, .maximum]') == '["integer",0,10]' ]] \
+  || fail "rty_47: retries is not an integer of 0 to 10"
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 '.properties.retryBudget.properties.percent | [.type, .minimum, .maximum]') == '["integer",0,100]' ]] \
+  || fail "rty_47: retryBudget.percent is not an integer of 0 to 100"
+[[ $(printf '%s\n' "$mc_spec" | yq -o=json -I=0 '.properties.retryBudget.properties.minPerSecond | [.type, .minimum, .maximum]') == '["integer",0,1000]' ]] \
+  || fail "rty_47: retryBudget.minPerSecond is not an integer of 0 to 1000"
+[[ $(printf '%s\n' "$mc_spec" | yq -r '.properties.retryBudget.properties.window | .type + " " + .pattern') == 'string ^[0-9]{1,2}s$' ]] \
+  || fail "rty_47: retryBudget.window is not a <n>s string"
+[[ $(printf '%s\n' "$mc_spec" | yq -r '.properties.retryBudget["x-kubernetes-validations"][0].rule') == "!has(self.window) || (int(self.window.replace('s', '')) >= 1 && int(self.window.replace('s', '')) <= 60)" ]] \
+  || fail "rty_47: retryBudget.window is not bounded to 1s to 60s by CEL"
+cel=$(printf '%s\n' "$mc_spec" | yq -r '[.["x-kubernetes-validations"][].rule] | join("\n")')
+for rule in "!has(self.retries) || self.targetRefs.exists(t, t.kind == 'Service')" \
+  "!has(self.retryBudget) || self.targetRefs.exists(t, t.kind == 'Service')"; do
+  grep -qxF -- "$rule" <<<"$cel" || fail "rty_47: the MimicConfig CRD lacks the CEL rule $rule"
+done
+echo "rty_47: the MimicConfig CRD bounds retries and retryBudget and fits them to a Service target only"
+
 # MSH-29 (#441): the controller's RBAC for the mesh watches, and the variables the mesh values render.
 role=$(yq 'select(.kind == "ClusterRole" and .metadata.name == "mimic-controller")' "$tmp/default.yaml")
 rule_verbs() { # rule_verbs <resource>: the verbs of the rules that name the resource, one line each

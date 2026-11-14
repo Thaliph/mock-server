@@ -102,7 +102,7 @@ fn service(key: &str, ips: &[&str], ports: &[u16]) -> String {
         .map(|p| format!("\"{p}\":{{\"targetPort\":8080}}"))
         .collect();
     format!(
-        "\"{key}\":{{\"endpoints\":{{\"80\":[{{\"ip\":\"10.1.0.9\",\"port\":8080,\"ready\":true}}]}},\"generations\":{{}},\"ips\":[{}],\"policy\":{{\"loadBalancer\":{{\"slowStartSeconds\":30}}}},\"ports\":{{{}}}}}",
+        "\"{key}\":{{\"endpoints\":{{\"80\":[{{\"ip\":\"10.1.0.9\",\"port\":8080,\"ready\":true}}]}},\"generations\":{{}},\"ips\":[{}],\"policy\":{{\"loadBalancer\":{{\"slowStartSeconds\":30}},\"retries\":3,\"retryBudget\":{{\"minPerSecond\":10,\"percent\":20,\"windowSeconds\":10}}}},\"ports\":{{{}}}}}",
         ips.join(","),
         ports.join(",")
     )
@@ -323,7 +323,6 @@ fn rty_05_defaults() {
     let config = config(&[]).unwrap();
     assert_eq!(config.retry_buffer, 64 * 1024);
     assert_eq!(config.retry_buffer_total, 8 * 1024 * 1024);
-    assert_eq!(config.retries, 3);
     assert_eq!(config.refusal_delay, Duration::from_millis(25));
 }
 

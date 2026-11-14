@@ -22,7 +22,9 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::head::{Stop, leaves};
-use mimic_core::mesh::retry::{Failure, Outcome, Planner, Refusal, classify, delay, trusted};
+use mimic_core::mesh::retry::{
+    Decision, Failure, Outcome, Planner, Refusal, Verdict, classify, delay, trusted,
+};
 use mimic_core::proxy::authority::status_class;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -419,6 +421,29 @@ impl Serving {
         self.backend.plan(self.mesh.router(), planner)
     }
 
+    /// What to do with a failed try: a stale view, or one that says `"mesh": false`, has no
+    /// try after the original destination and draws nothing on the budget.
+    fn decide(&self, direct: bool, verdict: Verdict, planner: &Planner) -> Decision {
+        if direct && verdict.retry {
+            return Decision::Exhausted;
+        }
+        self.backend
+            .retry
+            .decide(verdict, planner, self.mesh.router().now())
+    }
+
+    /// Counts a failure that is not retried (`Retry` is handled by the caller).
+    fn not_retried(&self, decision: Decision) {
+        let router = self.mesh.router();
+        let backend = &self.backend.label;
+        match decision {
+            Decision::Skipped(skip) => router.metrics.skipped(backend, skip.label()),
+            Decision::Exhausted => router.metrics.skipped(backend, "exhausted"),
+            Decision::Budget => self.backend.exhausted(router),
+            Decision::Done | Decision::Retry => {}
+        }
+    }
+
     /// Reads and drops the body of a refused try, so that its connection can be pooled again.
     async fn discard(response: Response<hyper::body::Incoming>, lease: &mut Lease) {
         let mut body = response.into_body();
@@ -493,7 +518,8 @@ impl Serving {
         let (head, body) = req.into_parts();
         let source = Source::new(body, self.mesh.replay());
         let direct = self.mesh.stale() || self.mesh.off();
-        let mut planner = Planner::new(router.retries);
+        let mut planner = Planner::new(self.backend.retry.retries());
+        self.backend.retry.deposit(router.now());
         let warned = AtomicBool::new(false);
         let mut tries = 0;
         let mut again: Option<Outcome> = None;
@@ -535,8 +561,8 @@ impl Serving {
                             .endpoint_try(backend, &pick.endpoint().label, class);
                     }
                     planner.failed(verdict.outcome);
-                    if verdict.retry {
-                        match self.plan(direct, tries, &mut planner) {
+                    match self.decide(direct, verdict, &planner) {
+                        Decision::Retry => match self.plan(direct, tries, &mut planner) {
                             Plan::Stop => router.metrics.skipped(backend, "exhausted"),
                             // The try in flight stops reading the app's body now, so that
                             // what the next try replays is what was read.
@@ -549,9 +575,8 @@ impl Serving {
                                 continue;
                             }
                             _ => router.metrics.skipped(backend, "buffer"),
-                        }
-                    } else if let Some(skip) = verdict.skip {
-                        router.metrics.skipped(backend, skip.label());
+                        },
+                        other => self.not_retried(other),
                     }
                     source.release();
                     let Conn { pick, lease } = conn;
@@ -592,8 +617,8 @@ impl Serving {
                         router.metrics.endpoint_try(backend, label, "none");
                     }
                     planner.failed(verdict.outcome);
-                    if verdict.retry {
-                        match self.plan(direct, tries, &mut planner) {
+                    match self.decide(direct, verdict, &planner) {
+                        Decision::Retry => match self.plan(direct, tries, &mut planner) {
                             Plan::Stop => router.metrics.skipped(backend, "exhausted"),
                             retry if source.detach() => {
                                 drop(pick);
@@ -602,9 +627,8 @@ impl Serving {
                                 continue;
                             }
                             _ => router.metrics.skipped(backend, "buffer"),
-                        }
-                    } else if let Some(skip) = verdict.skip {
-                        router.metrics.skipped(backend, skip.label());
+                        },
+                        other => self.not_retried(other),
                     }
                     return self.failed(tracker, failure, error, upstream, began);
                 }

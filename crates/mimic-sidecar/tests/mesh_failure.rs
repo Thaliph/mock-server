@@ -38,7 +38,7 @@ fn terminating(cluster: SocketAddr, pods: &[SocketAddr]) -> View {
         .map(|p| format!(r#"{{"ip":"{}","port":{},"ready":false}}"#, p.ip(), p.port()))
         .collect();
     let text = format!(
-        r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":true,"mode":"none","services":{{"shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":0}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}}}}}"#,
+        r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":true,"mode":"none","services":{{"shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":0}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}}}}}"#,
         endpoints.join(",")
     );
     View::from_json(&text, &Limits::default()).unwrap()

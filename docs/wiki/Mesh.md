@@ -146,7 +146,8 @@ function `mesh::retry` of `mimic-core`.
 | The connection closed or reset, or the stream reset with another code, after the request was written (in part) and before any byte of a response head | `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE` only (method tokens compared exactly) | `reset` |
 | Any other response (a `503` that is not a trusted refusal, an `x-mimic-error` of another value, any other status), any failure after the response head | never | `ok` (a response head came back) |
 
-**Bound per tier.** At most `1 + retries` tries per request, `retries` being 3: at most **4 tries**. A
+**Bound per tier.** At most `1 + retries` tries per request, `retries` being 3 unless a `MimicConfig` says
+otherwise: at most **4 tries** by default. A
 reconnect of an unwritten request is part of its try. Each retry goes to a pod not tried yet, chosen as in
 the load balancing (avoidance applies); when every endpoint was tried, to any of them. When every try so
 far failed to connect and either no untried pod is left or the next try is the last one, that try goes to
@@ -156,6 +157,40 @@ ClusterIP; a request never reaches more than 4 destinations. A try on the origin
 stale view, a view that turned `"mesh": false`) is never retried. On an L4 connection only connect failures
 are retried (at most 4 connects; with every try failed the connection is closed without a byte): once a
 byte was sent to a pod, a close or reset is relayed.
+
+**Retry budget.** Retries are also bounded over time, so that a failing Service is not hit by more retries
+than requests. Each caller pod (its sidecar) keeps one budget per backend Service, shared by all the ports of
+the Service. Over the last `window` (default 10 s) it counts the requests (every first try of a mesh-routed
+request, every mesh-balanced L4 connection) and the retries it granted. A retry is granted when
+
+```
+retries in the window + 1  <=  percent / 100 * requests in the window  +  minPerSecond * window seconds
+```
+
+With the defaults (`percent` 20, `minPerSecond` 10, `window` 10 s) the second term is 100 retries plus 20 % of
+the requests of the window: a pod that sent 500 requests in the last 10 s may retry up to 200 of them
+(100 + 0.2 x 500), a nearly idle one up to 100. A retry over budget is **not made**: the failure is returned
+as the "when no try is left" rules below say, `mimic_mesh_retry_budget_exhausted_total{backend}` counts it and
+the sidecar logs a warning `retry budget exhausted` (at most once per second per backend). The window slides in
+tenths, so a count stays between 0.9 and 1 window. `retries: 0` gives one try per request, with no retry and
+no fallback to the ClusterIP. Both settings are per Service, in a `MimicConfig` targeting it (each field
+that is absent keeps its default):
+
+```yaml
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: cart, namespace: shop}
+spec:
+  targetRefs: [{group: "", kind: Service, name: cart}]
+  retries: 2                # 0 to 10, default 3
+  retryBudget:
+    percent: 10             # 0 to 100, default 20
+    minPerSecond: 5         # 0 to 1000, default 10
+    window: 10s             # 1s to 60s, default 10s
+```
+
+A change reaches the callers with the next view (within the sidecar's pull interval); a changed `window`
+starts the Service's budget empty.
 
 **Delays.** Connect failures, refused streams, app refusals and resets are retried at once; a trusted refusal after a
 delay drawn between 12.5 and 37.5 ms. The body of a refused try is read and discarded up to 64 KiB (at most

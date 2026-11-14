@@ -227,7 +227,7 @@ pub fn view_on(
         .collect();
     let services = if mesh {
         format!(
-            r#""shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":{slow_start_seconds}}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#,
+            r#""shop/cart":{{"endpoints":{{"{port}":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":{slow_start_seconds}}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}}}}}"#,
             endpoints.join(",")
         )
     } else {
@@ -235,6 +235,86 @@ pub fn view_on(
     };
     let text = format!(
         r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":{mesh},"mode":"none","services":{{{services}}}}}"#
+    );
+    View::from_json(&text, &Limits::default()).unwrap()
+}
+
+/// One Service of a view with its own policy (#446): `ports` are (Service port, pods).
+pub struct Svc {
+    pub key: &'static str,
+    pub ip: &'static str,
+    pub ports: Vec<(u16, Vec<SocketAddr>)>,
+    pub retries: u32,
+    pub percent: u32,
+    pub min_per_second: u32,
+    pub window: u32,
+}
+
+impl Svc {
+    /// A Service of one port with the default policy (3 retries, 20 %, 10 per second, 10 s).
+    pub fn new(key: &'static str, ip: &'static str, port: u16, pods: &[SocketAddr]) -> Svc {
+        Svc {
+            key,
+            ip,
+            ports: vec![(port, pods.to_vec())],
+            retries: 3,
+            percent: 20,
+            min_per_second: 10,
+            window: 10,
+        }
+    }
+
+    pub fn budget(mut self, percent: u32, min_per_second: u32, window: u32) -> Svc {
+        (self.percent, self.min_per_second, self.window) = (percent, min_per_second, window);
+        self
+    }
+
+    pub fn retries(mut self, retries: u32) -> Svc {
+        self.retries = retries;
+        self
+    }
+
+    /// Where the app dials a port of this Service.
+    pub fn dst(&self, port: u16) -> SocketAddr {
+        SocketAddr::new(self.ip.parse().unwrap(), port)
+    }
+}
+
+/// A view of these Services, each with its policy.
+pub fn view_services(services: &[Svc]) -> View {
+    let mut entries = Vec::new();
+    for s in services {
+        let endpoints: Vec<String> = s
+            .ports
+            .iter()
+            .map(|(port, pods)| {
+                let list: Vec<String> = pods
+                    .iter()
+                    .map(|p| format!(r#"{{"ip":"{}","port":{},"ready":true}}"#, p.ip(), p.port()))
+                    .collect();
+                format!(r#""{port}":[{}]"#, list.join(","))
+            })
+            .collect();
+        let ports: Vec<String> = s
+            .ports
+            .iter()
+            .map(|(port, _)| format!(r#""{port}":{{"targetPort":8080}}"#))
+            .collect();
+        entries.push(format!(
+            r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":["{}"],"policy":{{"loadBalancer":{{"slowStartSeconds":0}},"retries":{},"retryBudget":{{"minPerSecond":{},"percent":{},"windowSeconds":{}}}}},"ports":{{{}}}}}"#,
+            s.key,
+            endpoints.join(","),
+            s.ip,
+            s.retries,
+            s.min_per_second,
+            s.percent,
+            s.window,
+            ports.join(",")
+        ));
+    }
+    let text = format!(
+        r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":true,"mode":"none","services":{{{}}}}}"#,
+        entries.join(",")
     );
     View::from_json(&text, &Limits::default()).unwrap()
 }

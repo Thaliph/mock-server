@@ -450,6 +450,37 @@ spec:
                   x-kubernetes-validations:
                     - rule: "!has(self.slowStart) || int(self.slowStart.replace('s', '')) <= 3600"
                       message: "loadBalancer.slowStart is at most 3600s"
+                retries:
+                  description: >-
+                    Retries after the first try, 0 to 10; `0` disables retries and the fallback to the ClusterIP.
+                    Default 3. Service targets only (spec §7.9).
+                  type: integer
+                  minimum: 0
+                  maximum: 10
+                retryBudget:
+                  description: >-
+                    Retries allowed over a window, per caller pod and Service: at most `percent` of the requests
+                    plus `minPerSecond` per second (spec §7.9). Each absent field takes its default. Service
+                    targets only.
+                  type: object
+                  properties:
+                    percent:
+                      description: Percent of the requests of the window, 0 to 100. Default 20.
+                      type: integer
+                      minimum: 0
+                      maximum: 100
+                    minPerSecond:
+                      description: Retries per second allowed whatever the requests, 0 to 1000. Default 10.
+                      type: integer
+                      minimum: 0
+                      maximum: 1000
+                    window:
+                      description: Length of the window, `<n>s`, 1s to 60s. Default 10s.
+                      type: string
+                      pattern: '^[0-9]{1,2}s$'
+                  x-kubernetes-validations:
+                    - rule: "!has(self.window) || (int(self.window.replace('s', '')) >= 1 && int(self.window.replace('s', '')) <= 60)"
+                      message: "retryBudget.window is 1s to 60s"
               x-kubernetes-validations:
                 - rule: "!has(self.destinations) || self.targetRefs.exists(t, t.kind == 'Deployment')"
                   message: "destinations fit a Deployment target only"
@@ -457,6 +488,10 @@ spec:
                   message: "mesh fits a Deployment target only"
                 - rule: "!has(self.loadBalancer) || self.targetRefs.exists(t, t.kind == 'Service')"
                   message: "loadBalancer fits a Service target only"
+                - rule: "!has(self.retries) || self.targetRefs.exists(t, t.kind == 'Service')"
+                  message: "retries fit a Service target only"
+                - rule: "!has(self.retryBudget) || self.targetRefs.exists(t, t.kind == 'Service')"
+                  message: "retryBudget fits a Service target only"
 
 ---
 # Source: mimic/templates/rbac.yaml

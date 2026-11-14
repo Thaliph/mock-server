@@ -264,6 +264,27 @@ async fn msh_33_an_invalid_view_is_refused_and_the_previous_one_kept() {
 }
 
 #[tokio::test]
+async fn rty_49_a_view_whose_policy_has_no_retries_is_refused_and_the_previous_one_kept() {
+    let _logs = capture_logs();
+    let without = two().replace("\"retries\":3,", "");
+    assert_ne!(without, two(), "the view carries retries");
+    let rig = Rig::with(
+        vec![
+            Reply::View(two(), "\"1-aaa\""),
+            Reply::View(without, "\"1-b\""),
+            Reply::View(one(), "\"1-c\""),
+        ],
+        Reply::Hold,
+        |_| {},
+    )
+    .await;
+    wait("the good view after the bad one", || rig.services() == 1).await;
+    assert_eq!(rig.pulls("invalid"), 1);
+    assert_eq!(rig.pulls("ok"), 2);
+    rig.stop().await;
+}
+
+#[tokio::test]
 async fn msh_33_errors_keep_the_view_and_the_delay_resets_after_a_200() {
     let rig = Rig::start(
         vec![

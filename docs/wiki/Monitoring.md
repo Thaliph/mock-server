@@ -75,6 +75,7 @@ minutes later.
 | `mimic_mesh_fallbacks_total` | counter, requests and L4 connections sent to the original destination (the ClusterIP) | `backend` |
 | `mimic_mesh_attempts_total` | counter, every try to a pod or to the original destination (a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
 | `mimic_mesh_retries_total` | counter, tries after the first | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`) |
+| `mimic_mesh_retry_budget_exhausted_total` | counter, retries refused because the retry budget of the Service was used up (see [Mesh](Mesh#retries)) | `backend` |
 | `mimic_mesh_retries_skipped_total` | counter, failures of a retried kind that were not retried | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
 | `mimic_mesh_retry_buffer_bytes` | gauge, request body bytes held for replay, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL` | none |
 | `mimic_mesh_stripped_headers_total` | counter, `x-mimic-*` fields removed from app responses by the inbound side | none |
@@ -91,7 +92,8 @@ minutes later.
 | `mimic_mesh_view_build_duration_seconds`, `mimic_mesh_watches`, `mimic_mesh_view_truncated_total`, `mimic_mesh_view_cache_bytes` | none |
 
 A retry rate to watch: `rate(mimic_mesh_retries_total[5m])` by `reason`; `mimic_mesh_retries_skipped_total`
-with `reason="exhausted"` rising means requests ran out of tries.
+with `reason="exhausted"` rising means requests ran out of tries; `mimic_mesh_retry_budget_exhausted_total`
+rising means the budget refused retries (a Service failing for most of its requests).
 
 ## Dashboards
 
