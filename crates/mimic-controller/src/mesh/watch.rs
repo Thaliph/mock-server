@@ -27,11 +27,15 @@ fn key_of<K: kube::Resource>(object: &K) -> Option<Key> {
 }
 
 /// Feeds the hub from a watch until it ends or the resource is gone (404). `convert` is `None`
-/// for an object that is not (or no longer) one of ours: it is removed.
+/// for an object that is not (or no longer) one of ours: it is removed. `crd` is the API of a
+/// kind served by a CRD: a watch on a deleted CRD fails with an error that is not a 404 (the
+/// API server's 404 body is plain text, read as a broken event stream), so after any watch
+/// error the resource is looked up and a 404 ends the watch.
 async fn forward<K, T, S>(
     events: S,
     convert: impl Fn(&K) -> Option<(Key, T)>,
     feed: impl Fn(Event<T>),
+    crd: Option<&Api<DynamicObject>>,
 ) where
     K: kube::Resource,
     S: Stream<Item = Result<Watched<K>, watcher::Error>>,
@@ -63,6 +67,11 @@ async fn forward<K, T, S>(
                 if gone(&error) {
                     return;
                 }
+                if let Some(api) = crd
+                    && crd_missing(api).await
+                {
+                    return;
+                }
                 tracing::warn!(error = %error, "mesh watch error");
             }
         }
@@ -80,11 +89,19 @@ fn gone(error: &watcher::Error) -> bool {
     )
 }
 
+/// The CRD of `api` is not installed: a list of it answers 404.
+async fn crd_missing(api: &Api<DynamicObject>) -> bool {
+    matches!(
+        api.list(&ListParams::default().limit(1)).await,
+        Err(kube::Error::Api(status)) if status.code == 404
+    )
+}
+
 async fn services(client: kube::Client, hub: Arc<Hub>) {
     loop {
         let api = Api::<Service>::all(client.clone());
         let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-        forward(events, convert::service, |e| hub.feed_services(e)).await;
+        forward(events, convert::service, |e| hub.feed_services(e), None).await;
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -93,7 +110,7 @@ async fn slices(client: kube::Client, hub: Arc<Hub>) {
     loop {
         let api = Api::<EndpointSlice>::all(client.clone());
         let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-        forward(events, convert::slice, |e| hub.feed_slices(e)).await;
+        forward(events, convert::slice, |e| hub.feed_slices(e), None).await;
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -107,6 +124,7 @@ async fn deployments(client: kube::Client, hub: Arc<Hub>) {
             events,
             |o| key_of(o).map(|key| (key, ())),
             |e| hub.feed_deployments(e),
+            None,
         )
         .await;
         tokio::time::sleep(RETRY).await;
@@ -122,7 +140,7 @@ async fn configs(client: kube::Client, hub: Arc<Hub>) {
     loop {
         let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
         let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-        forward(events, convert::config, |e| hub.feed_configs(e)).await;
+        forward(events, convert::config, |e| hub.feed_configs(e), None).await;
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -139,8 +157,9 @@ async fn grants(client: kube::Client, hub: Arc<Hub>) {
         let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
         match api.list(&ListParams::default().limit(1)).await {
             Ok(_) => {
-                let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-                forward(events, convert::grant, |e| hub.feed_grants(e)).await;
+                let events =
+                    watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
+                forward(events, convert::grant, |e| hub.feed_grants(e), Some(&api)).await;
                 // Gone while watched: nobody consents until it is back.
                 hub.grants_absent();
             }
@@ -167,12 +186,18 @@ pub(super) async fn routes(client: kube::Client, hub: Arc<Hub>) {
         let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
         match api.list(&ListParams::default().limit(1)).await {
             Ok(_) => {
-                let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
-                forward(events, convert::route_and_status, |e| {
-                    let (route, status) = e.split();
-                    hub.feed_routes(route);
-                    hub.feed_route_status(status);
-                })
+                let events =
+                    watcher::watcher(api.clone(), watcher::Config::default()).default_backoff();
+                forward(
+                    events,
+                    convert::route_and_status,
+                    |e| {
+                        let (route, status) = e.split();
+                        hub.feed_routes(route);
+                        hub.feed_route_status(status);
+                    },
+                    Some(&api),
+                )
                 .await;
                 hub.routes_absent();
             }
