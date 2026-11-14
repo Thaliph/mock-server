@@ -21,6 +21,20 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Retries of mesh-routed requests (#445, M2): a request whose failure happened before the app could process it
+  is tried again on another pod, at most 3 times (4 tries), then on the original destination when every try
+  failed to connect. Retried: connect failures and refused HTTP/2 streams for every method, a trusted refusal
+  (`503` with `x-mimic-error: overloaded` or `queue-timeout` and `x-mimic-endpoint` naming the pod of the try,
+  cleartext only) for every method, and a close or reset before any response head for `GET`, `HEAD`, `OPTIONS`,
+  `TRACE`, `PUT` and `DELETE`. A response of an app is never retried. Request bodies are held for replay up to
+  `MIMIC_MESH_RETRY_BUFFER` (64Ki) per request and `MIMIC_MESH_RETRY_BUFFER_TOTAL` (8Mi) in all. The access line
+  gains `attempts`; new metrics `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`,
+  `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`. The retry budget is #446.
+- **Meshed sidecars remove `x-mimic-*` fields from app responses** (#445, M2): with `MIMIC_MESH=on` (and a view
+  that does not say `"mesh": false`) the inbound side removes every response field whose name starts with
+  `x-mimic-`, so that only a sidecar writes them; counted in `mimic_mesh_stripped_headers_total`. A response the
+  sidecar cannot frame then closes the inbound connection (`mimic_mesh_unframed_closes_total`). With the mesh off
+  the relay is byte-exact as before.
 - The sidecar follows its mesh view (#442, M1): with a controller URL it long-polls
   `GET /v1/workloads/<deployment>/mesh` (backoff 1 to 30 s with jitter, token read again for each request, view
   validated and bounded, an older generation refused), keeps the last view in `/mimic/state/mesh.json` for a
@@ -81,6 +95,7 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Documentation
 
+- Wiki: new page "Mesh" (load balancing, scope, failure behaviour, retries, limits) and mesh sections in Configuration, Monitoring, Access logs, Troubleshooting and Security.
 - Wiki "Reading the API": the Endpoints tab and its filters; annotation values of the resource view are shown as set by their authors (#466, #474).
 - Wiki "Access logs": every field of the sidecar's access lines, and `jq` recipes for status classes, authorities, slow calls, mock results and load-marked requests (#437).
 

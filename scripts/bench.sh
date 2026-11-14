@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Baseline benchmarks of the sidecar (BEN-01 to BEN-10, docs/SPEC.md §12.19, #436) and of the mesh
-# (BEN-11 to BEN-16, #444). Run by hand on a quiet machine; not a CI job.
+# (BEN-11 to BEN-16, #444; mesh-refuse, RTY-23, #445). Run by hand on a quiet machine; not a CI job.
 #
-#   scripts/bench.sh               the default matrix: 12 runs of 30 s, about 8 minutes, plus the cluster
+#   scripts/bench.sh               the default matrix: 18 runs of 30 s with 10 s pauses, about 12 minutes, plus the cluster
 #   scripts/bench.sh --dry-run     the plan only, nothing started (scripts/test_bench.sh reads it)
-#   SETUPS="mesh-lb mesh-churn" scripts/bench.sh   the mesh setups (3 backend pods, routing asserted)
+#   SETUPS="mesh-lb mesh-churn mesh-refuse" scripts/bench.sh   the mesh setups (3 backend pods, routing asserted)
 #
 # Environment (defaults in brackets):
 #   CLUSTER=mimic-bench            kind cluster: created when absent, reused otherwise
@@ -13,7 +13,9 @@
 #                                  backend has 3 pods and the mesh routing of the client is asserted
 #                                  before and after the runs, then the EndpointSlice propagation and the
 #                                  RSS with a synthetic view are measured (#444); mesh-churn: mesh-lb
-#                                  with a rollout restart of the backend during each run
+#                                  with a rollout restart of the backend during each run; mesh-refuse:
+#                                  mesh-lb with 2 injected backend pods and 1 Ready pod that is not
+#                                  injected and refuses connections (RTY-23, #445)
 #   PROPAGATION_SAMPLES=20         mesh-lb only: EndpointSlice changes timed, 0 to 100; 0 skips them
 #   PROTOCOLS="http1 h2c"          HTTP/1.1 keep-alive; h2c (HTTP/2 over cleartext)
 #   RATES="50 100 200"             requests per second, each 1 to 200
@@ -56,6 +58,7 @@ SYSTEM_NS=mimic-system
 RELEASE=mimic
 RATE_CAP=200
 MESH_PODS=3                 # the backend of the mesh setups (BEN-11)
+REFUSING_PODS=1             # mesh-refuse: of the MESH_PODS backend pods, this many are not injected and refuse (RTY-23)
 PROPAGATION_BUDGET_MS=2000  # EndpointSlice change to the sidecar's view applied, p99 (design §14, M1)
 SYNTHETIC_SERVICES=100      # the synthetic view of the RSS measurement (BEN-15)
 SYNTHETIC_ENDPOINTS=10      # endpoints of each synthetic Service
@@ -83,8 +86,8 @@ read -ra RATE_LIST <<<"$RATES"
 ((${#PROTOCOL_LIST[@]} > 0)) || config_error PROTOCOLS "empty"
 ((${#RATE_LIST[@]} > 0)) || config_error RATES "empty"
 for setup in "${SETUP_LIST[@]}"; do
-  contains "$setup" plain none discovery mesh-lb mesh-churn \
-    || config_error SETUPS "$setup is not plain, none, discovery, mesh-lb or mesh-churn"
+  contains "$setup" plain none discovery mesh-lb mesh-churn mesh-refuse \
+    || config_error SETUPS "$setup is not plain, none, discovery, mesh-lb, mesh-churn or mesh-refuse"
 done
 for protocol in "${PROTOCOL_LIST[@]}"; do
   contains "$protocol" http1 h2c || config_error PROTOCOLS "$protocol is not http1 or h2c"
@@ -114,15 +117,18 @@ fi
 NODE_IMAGE=${NODE_IMAGE-$(scripts/pinned-image.sh kind-node)}
 [[ $NODE_IMAGE =~ @sha256:[0-9a-f]{64}$ ]] || config_error NODE_IMAGE "$NODE_IMAGE is not pinned by digest"
 FORTIO=$(scripts/pinned-image.sh fortio)
+# The refusing pod of mesh-refuse needs a shell-less sleep: the Python image of the e2e stages (BEN-05).
+REFUSING_IMAGE=$(scripts/pinned-image.sh e2e-app)
 TAG=${TAG:-bench-$(git rev-parse --short HEAD 2>/dev/null || echo local)-$$}
 IMAGE=${IMAGE:-ghcr.io/thaliph/mimic:$TAG}
 INIT_IMAGE=${INIT_IMAGE:-ghcr.io/thaliph/mimic-init:$TAG}
 SKIP_BUILD=${SKIP_BUILD-0}
 
 # The setups run in this order whatever the order of SETUPS: plain first, then the namespace is labelled,
-# the mesh setups last (they scale the backend to 3 pods, and the others need 1).
+# the mesh setups last (they scale the backend to 3 pods, and the others need 1). mesh-refuse is the last one:
+# its refusing pod stays in the namespace, and the setups before it must not see it.
 ORDERED_SETUPS=()
-for setup in plain none discovery mesh-lb mesh-churn; do
+for setup in plain none discovery mesh-lb mesh-churn mesh-refuse; do
   contains "$setup" "${SETUP_LIST[@]}" && ORDERED_SETUPS+=("$setup")
 done
 
@@ -180,6 +186,7 @@ if ((DRY_RUN)); then
   echo "namespace $NS, chart release $RELEASE in $SYSTEM_NS"
   echo "kind node image $NODE_IMAGE"
   echo "fortio image $FORTIO"
+  echo "refusing pod image $REFUSING_IMAGE"
   echo "images $IMAGE $INIT_IMAGE (built here unless SKIP_BUILD=1)"
   echo "machine fields: cpu cores ram kernel docker kind kubernetes node_image"
   for setup in "${ORDERED_SETUPS[@]}"; do
@@ -189,7 +196,8 @@ if ((DRY_RUN)); then
   for setup in "${ORDERED_SETUPS[@]}"; do
     case $setup in
       mesh-lb) echo "mesh-lb: backend $MESH_PODS pods, mode discovery; routing asserted before and after the runs" ;;
-      mesh-churn) echo "mesh-churn: backend $MESH_PODS pods, mode discovery; rollout restart of the backend in every run" ;;
+      mesh-churn) echo "mesh-churn: backend $MESH_PODS pods, mode discovery; rollout restart of the backend in every run; routing asserted before and after the runs" ;;
+      mesh-refuse) echo "mesh-refuse: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and refusing connections, mode discovery; routing asserted before and after the runs; retries and errors recorded" ;;
     esac
   done
   if contains mesh-lb "${ORDERED_SETUPS[@]}"; then
@@ -313,7 +321,7 @@ spec:
     matchLabels: {app: $name}
   template:
     metadata:
-      labels: {app: $name}
+      labels: {app: $name, svc: $name}
     spec:
       securityContext:
         runAsNonRoot: true
@@ -341,10 +349,50 @@ metadata:
   name: $name
   namespace: $NS
 spec:
-  selector: {app: $name}
+  selector: {svc: $name}
   ports:
   - {name: http, port: $port, targetPort: $port}
 ---
+EOF
+}
+
+# refusing_workload: the backend pod of mesh-refuse that is not injected (the inject label is disabled, so no
+# sidecar) and listens on no port while Ready: no probe, the port declared, a Python sleep (RTY-23). It has the
+# svc label of the backend Service, not the app label of the injected backend, so the injected-pod queries
+# (running_pods, backend_addrs) do not count it.
+refusing_workload() {
+  cat <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fortio-dead
+  namespace: $NS
+  labels: {app: fortio-dead}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: fortio-dead}
+  template:
+    metadata:
+      labels: {app: fortio-dead, svc: fortio-server, mimic.platform.io/inject: disabled}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: app
+        image: $REFUSING_IMAGE
+        command: [python3, -c, "import time; time.sleep(86400)"]
+        ports:
+        - {name: http, containerPort: 8080}
+        resources:
+          requests: {cpu: 10m, memory: 16Mi}
+          limits: {memory: 64Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: [ALL]}
 EOF
 }
 {
@@ -378,12 +426,22 @@ setup_mode() {
   if [[ $1 == mesh-* ]]; then echo discovery; else echo "$1"; fi
 }
 
+# injected_pods <setup>: the backend pods with a sidecar. MESH_PODS in the mesh setups, less the refusing pod of
+# mesh-refuse (BEN-11, RTY-23); 1 in the others.
+injected_pods() {
+  case $1 in
+    mesh-refuse) echo $((MESH_PODS - REFUSING_PODS)) ;;
+    mesh-*) echo "$MESH_PODS" ;;
+    *) echo 1 ;;
+  esac
+}
+
 # prepare_setup <setup>: plain runs without the sidecar, the others with it (namespace label, a MimicWorkload
-# of the mode of the setup, restart). The backend has MESH_PODS pods in the mesh setups, 1 otherwise (BEN-11).
+# of the mode of the setup, restart). The injected backend has injected_pods pods; mesh-refuse adds its refusing pod.
 prepare_setup() {
-  local setup=$1 replicas=1 pod containers
-  local -a pods
-  if [[ $setup == mesh-* ]]; then replicas=$MESH_PODS; fi
+  local setup=$1 replicas pod containers
+  local -a pods refusing
+  replicas=$(injected_pods "$setup")
   if [[ $setup != plain ]]; then
     kubectl label --overwrite namespace "$NS" mimic.platform.io/inject=enabled
     # The mode is explicit: a deployment injected by label alone is in none since M0.
@@ -399,10 +457,21 @@ YAML
     kubectl -n "$NS" rollout restart deploy/fortio-server deploy/fortio-client
   fi
   kubectl -n "$NS" scale deploy/fortio-server --replicas="$replicas" >/dev/null
+  if [[ $setup == mesh-refuse ]]; then
+    refusing_workload | kubectl apply -f -
+    kubectl -n "$NS" rollout status deploy/fortio-dead --timeout=180s
+  fi
   kubectl -n "$NS" rollout status deploy/fortio-server --timeout=180s
   kubectl -n "$NS" rollout status deploy/fortio-client --timeout=180s
   pods=("$(pod_of fortio-client)")
   while IFS= read -r pod; do pods+=("$pod"); done < <(running_pods fortio-server)
+  if [[ $setup == mesh-refuse ]]; then
+    mapfile -t refusing < <(running_pods fortio-dead)
+    if ((${#refusing[@]} != REFUSING_PODS)); then
+      echo "FAIL the refusing pod of mesh-refuse: ${#refusing[@]} ready, $REFUSING_PODS expected" >&2
+      exit 1
+    fi
+  fi
   for pod in "${pods[@]}"; do
     containers=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.initContainers[*].name}')
     if [[ $setup != plain ]] && ! grep -qw mimic-sidecar <<<"$containers"; then
@@ -414,8 +483,8 @@ YAML
       exit 1
     fi
   done
-  if [[ $setup == mesh-* ]] && (( ${#pods[@]} - 1 != MESH_PODS )); then
-    echo "FAIL the backend has $((${#pods[@]} - 1)) ready pods, $MESH_PODS expected" >&2
+  if [[ $setup == mesh-* ]] && (( ${#pods[@]} - 1 != replicas )); then
+    echo "FAIL the backend has $((${#pods[@]} - 1)) ready injected pods, $replicas expected" >&2
     exit 1
   fi
 }
@@ -467,13 +536,17 @@ warm_up() {
 }
 
 # mesh_routing <setup> <phase> <strict>: asserts the mesh routing of the client sidecar (BEN-12). Each ready
-# backend pod must have had requests (mimic_mesh_endpoint_requests_total, by endpoint address), and there must
-# be MESH_PODS of them; with strict 1 no request may have fallen back to the ClusterIP
-# (mimic_mesh_fallbacks_total). A check that does not hold yet is retried after a warm-up, for up to 60 s,
-# while the view reaches the pods; then the setup fails. The phase is written to $WORK/<setup>.routing-<phase>.json.
+# injected backend pod must have had requests (mimic_mesh_endpoint_requests_total, by endpoint address), and there
+# must be injected_pods of them; with strict 1 no request may have fallen back to the ClusterIP
+# (mimic_mesh_fallbacks_total). In mesh-refuse the refusing pod must have been tried: a connect_failed attempt
+# (mimic_mesh_attempts_total) is asserted, since a refused try is not written to the pod and has no endpoint
+# request. A check that does not hold yet is retried after a warm-up, for up to 60 s, while the view reaches the
+# pods; then the setup fails. The phase is written to $WORK/<setup>.routing-<phase>.json, with the retries
+# (mimic_mesh_retries_total) and the connect_failed attempts of the client, cumulative since its sidecar started.
 mesh_routing() {
-  local setup=$1 phase=$2 strict=$3 caller metrics pod addr n fallbacks reconnects count attempt ok out
+  local setup=$1 phase=$2 strict=$3 caller metrics pod addr n fallbacks reconnects retries refused count attempt ok out want
   out="$WORK/$setup.routing-$phase.json"
+  want=$(injected_pods "$setup")
   caller=$(pod_of fortio-client)
   for attempt in 1 2 3 4 5 6; do
     warm_up
@@ -489,22 +562,27 @@ mesh_routing() {
       if ((n == 0)); then ok=0; fi
     done < <(backend_addrs)
     count=$(jq -s length "$WORK/routing.rows")
-    if ((count != MESH_PODS)); then ok=0; fi
+    if ((count != want)); then ok=0; fi
     fallbacks=$(awk 'index($1, "mimic_mesh_fallbacks_total{") == 1 { sum += $NF } END { print sum + 0 }' <<<"$metrics")
     reconnects=$(awk 'index($1, "mimic_mesh_reconnects_total{") == 1 { sum += $NF } END { print sum + 0 }' <<<"$metrics")
+    retries=$(awk 'index($1, "mimic_mesh_retries_total{") == 1 { sum += $NF } END { print sum + 0 }' <<<"$metrics")
+    refused=$(awk 'index($1, "mimic_mesh_attempts_total{") == 1 && index($0, "result=\"connect_failed\"") { sum += $NF } END { print sum + 0 }' <<<"$metrics")
     if [[ $strict == 1 ]] && ((fallbacks != 0)); then ok=0; fi
+    if [[ $setup == mesh-refuse ]] && ((refused == 0)); then ok=0; fi
     if ((ok)); then
       jq -n --arg phase "$phase" --argjson strict "$strict" --argjson fallbacks "$fallbacks" \
-        --argjson reconnects "$reconnects" --argjson pods "$(jq -s . "$WORK/routing.rows")" \
-        '{phase: $phase, strict: ($strict == 1), pods: $pods, fallbacks: $fallbacks, reconnects: $reconnects}' \
+        --argjson reconnects "$reconnects" --argjson retries "$retries" --argjson refused "$refused" \
+        --argjson pods "$(jq -s . "$WORK/routing.rows")" \
+        '{phase: $phase, strict: ($strict == 1), pods: $pods, fallbacks: $fallbacks, reconnects: $reconnects,
+          retries: $retries, connect_failed_attempts: $refused}' \
         >"$out"
-      echo "routing $setup $phase ok: requests per pod $(jq -r '[.pods[].requests] | join(" ")' "$out"), fallbacks $fallbacks"
+      echo "routing $setup $phase ok: requests per pod $(jq -r '[.pods[].requests] | join(" ")' "$out"), fallbacks $fallbacks, retries $retries, connect_failed attempts $refused"
       return 0
     fi
-    echo "routing $setup $phase not yet (attempt $attempt): $(jq -c -s . "$WORK/routing.rows"), fallbacks $fallbacks"
+    echo "routing $setup $phase not yet (attempt $attempt): $(jq -c -s . "$WORK/routing.rows"), fallbacks $fallbacks, retries $retries, connect_failed attempts $refused"
     sleep 10
   done
-  echo "FAIL mesh routing $setup $phase: the client sidecar does not route to $MESH_PODS backend pods, see above" >&2
+  echo "FAIL mesh routing $setup $phase: the client sidecar does not route to $want injected backend pods (and, in mesh-refuse, tries the refusing pod), see above" >&2
   exit 1
 }
 
@@ -645,13 +723,18 @@ EOF
 # mesh_summary <setup>: the mesh block of the results of a mesh setup, in $WORK/<setup>.mesh.json (BEN-16).
 mesh_summary() {
   local setup=$1
-  jq -n --arg setup "$setup" --argjson pods "$MESH_PODS" \
+  jq -n --arg setup "$setup" --argjson pods "$MESH_PODS" --argjson refusing "$REFUSING_PODS" \
     --slurpfile before "$WORK/$setup.routing-before.json" --slurpfile after "$WORK/$setup.routing-after.json" \
     --slurpfile runs "$WORK/$setup.jsonl" '
     {backend_pods: $pods, routing: {before: $before[0], after: $after[0]}}
     + (if $setup == "mesh-churn" then
          {churn: {restarts: ($runs | length), errors_total: ($runs | map(.errors) | add // 0),
                   fallbacks_total: $after[0].fallbacks, reconnects_total: $after[0].reconnects}}
+       else {} end)
+    + (if $setup == "mesh-refuse" then
+         {refusing: {injected_pods: ($pods - $refusing), not_injected_pods: $refusing,
+                     errors_total: ($runs | map(.errors) | add // 0),
+                     retries_total: $after[0].retries, connect_failed_attempts: $after[0].connect_failed_attempts}}
        else {} end)' >"$WORK/$setup.mesh.json"
   if [[ $setup == mesh-lb ]]; then
     jq -n --slurpfile m "$WORK/$setup.mesh.json" --slurpfile p "$WORK/propagation.json" \
@@ -741,8 +824,9 @@ for setup in "${ORDERED_SETUPS[@]}"; do
   done
   if [[ $setup == mesh-* ]]; then
     # Fallbacks are not asserted under mesh-churn: a refused connection to a restarting pod is measured (BEN-14).
+    # mesh-refuse is strict: its refusing pod is retried to a sibling, so no try should need the ClusterIP.
     strict=0
-    if [[ $setup == mesh-lb ]]; then strict=1; fi
+    if [[ $setup == mesh-lb || $setup == mesh-refuse ]]; then strict=1; fi
     mesh_routing "$setup" after "$strict"
   fi
   if [[ $setup == mesh-lb ]]; then
