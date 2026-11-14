@@ -34,4 +34,6 @@ mod tests_retry;
 #[cfg(test)]
 mod tests_route;
 #[cfg(test)]
+mod tests_routes_view;
+#[cfg(test)]
 mod tests_strip;
