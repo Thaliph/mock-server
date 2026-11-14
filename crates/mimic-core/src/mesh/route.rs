@@ -10,6 +10,10 @@ use super::input::{
     RouteFilter, RouteRule, Service,
 };
 use super::policy::Condition;
+mod table;
+
+pub use table::{RequestParts, Table, split_target};
+
 use super::view::{
     MAX_ITEMS, MAX_MATCHES, MAX_RULES, MAX_WEIGHT, fraction, header_name, header_value, method,
     path_value,

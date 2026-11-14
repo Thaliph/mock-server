@@ -26,6 +26,8 @@ mod tests_head;
 #[cfg(test)]
 mod tests_lb;
 #[cfg(test)]
+mod tests_match;
+#[cfg(test)]
 mod tests_policy;
 #[cfg(test)]
 mod tests_prop;
