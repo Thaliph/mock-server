@@ -915,6 +915,15 @@ impl Conn<'_> {
             .filter(|_| self.direction == Direction::Inbound)
     }
 
+    /// The mesh state when this inbound side removes the `x-mimic-*` fields of its app's
+    /// responses (spec §4.1 "Mimic fields of app responses").
+    fn strip(&self) -> Option<MeshState> {
+        self.shared
+            .mesh()
+            .filter(|_| self.direction == Direction::Inbound)
+            .cloned()
+    }
+
     fn ctx(&self) -> Ctx {
         Ctx {
             direction: self.direction,
@@ -967,6 +976,7 @@ impl Conn<'_> {
                     tap.is_some(),
                     self.mock.clone(),
                     watch,
+                    self.strip(),
                     Some(proxy.overhead_histogram(direction)),
                     |event| tracker.event(event),
                     self.shared.stopped(),
@@ -1013,7 +1023,7 @@ impl Conn<'_> {
                 proxy.connection(direction, "h2", &self.authority(false));
                 let tap = self.shared.discovery();
                 let relayed = tokio::select! {
-                    r = h2::relay_with(client, upstream, buf, self.ctx(), (tap.cloned(), self.mock.clone(), self.load().cloned()), self.shared.stopped()) => r,
+                    r = h2::relay_with(client, upstream, buf, self.ctx(), (tap.cloned(), self.mock.clone(), self.load().cloned(), self.strip()), self.shared.stopped()) => r,
                     () = abort.as_mut() => Ok(()),
                 };
                 if let Err(e) = relayed {
