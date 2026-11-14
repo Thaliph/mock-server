@@ -226,14 +226,21 @@ impl Planner {
         if self.original || self.tries > self.retries {
             return Next::Stop;
         }
-        let untried = endpoints.count_where(|a| !self.tried.contains(&a));
+        // First try: nothing tried yet, so the O(1) pick over the whole set (MSH-46).
+        let untried = if self.tried.is_empty() {
+            endpoints.len()
+        } else {
+            endpoints.count_where(|a| !self.tried.contains(&a))
+        };
         let last = self.tries == self.retries;
         if self.tries > 0 && self.only_connect && (untried == 0 || last) {
             self.original = true;
             self.tries += 1;
             return Next::Original;
         }
-        let picked = if untried > 0 {
+        let picked = if self.tried.is_empty() {
+            endpoints.pick(now, &in_flight, draw)
+        } else if untried > 0 {
             endpoints.pick_where(now, &in_flight, draw, |a| !self.tried.contains(&a))
         } else {
             endpoints.pick(now, &in_flight, draw)

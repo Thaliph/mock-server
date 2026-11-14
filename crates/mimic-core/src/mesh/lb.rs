@@ -88,23 +88,51 @@ impl Endpoints {
     /// The index of the endpoint to send a request to: two distinct endpoints are drawn
     /// (`draw(n)` returns a number below `n`) and the one with the lower
     /// `(in_flight + 1) / weight` wins, the first draw on a tie. One endpoint is taken without
-    /// a draw, none gives `None`.
+    /// a draw, none gives `None`. O(1): the draws index the set directly (MSH-46).
     pub fn pick(
         &self,
         now: Duration,
         in_flight: impl Fn(usize) -> u32,
         draw: &mut impl FnMut(usize) -> usize,
     ) -> Option<usize> {
-        self.pick_where(now, in_flight, draw, |_| true)
+        let n = self.members.len();
+        match n {
+            0 => return None,
+            1 => return Some(0),
+            _ => {}
+        }
+        let first = draw(n).min(n - 1);
+        let mut second = draw(n - 1).min(n - 2);
+        if second >= first {
+            second += 1;
+        }
+        Some(self.better(first, second, now, &in_flight))
     }
 
-    /// How many endpoints `allowed` accepts.
+    /// Of two endpoints, the one with the lower `(in_flight + 1) / weight`, `first` on a tie.
+    fn better(
+        &self,
+        first: usize,
+        second: usize,
+        now: Duration,
+        in_flight: &impl Fn(usize) -> u32,
+    ) -> usize {
+        let score = |i: usize| (f64::from(in_flight(i)) + 1.0) / self.weight(i, now);
+        if score(second) < score(first) {
+            second
+        } else {
+            first
+        }
+    }
+
+    /// How many endpoints `allowed` accepts. O(n).
     pub fn count_where(&self, allowed: impl Fn(SocketAddr) -> bool) -> usize {
         self.members.iter().filter(|m| allowed(m.addr)).count()
     }
 
     /// [`Endpoints::pick`] among the endpoints `allowed` accepts: the draws are over their
-    /// number, the index returned is in the whole set. Nothing is allocated.
+    /// number, the index returned is in the whole set. Nothing is allocated. O(n), so it is
+    /// used for retries only; a first try uses [`Endpoints::pick`].
     pub fn pick_where(
         &self,
         now: Duration,
@@ -133,11 +161,6 @@ impl Endpoints {
             second += 1;
         }
         let (first, second) = (nth(first)?, nth(second)?);
-        let score = |i: usize| (f64::from(in_flight(i)) + 1.0) / self.weight(i, now);
-        Some(if score(second) < score(first) {
-            second
-        } else {
-            first
-        })
+        Some(self.better(first, second, now, &in_flight))
     }
 }
