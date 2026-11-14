@@ -95,10 +95,36 @@ impl Endpoints {
         in_flight: impl Fn(usize) -> u32,
         draw: &mut impl FnMut(usize) -> usize,
     ) -> Option<usize> {
-        let n = self.members.len();
+        self.pick_where(now, in_flight, draw, |_| true)
+    }
+
+    /// How many endpoints `allowed` accepts.
+    pub fn count_where(&self, allowed: impl Fn(SocketAddr) -> bool) -> usize {
+        self.members.iter().filter(|m| allowed(m.addr)).count()
+    }
+
+    /// [`Endpoints::pick`] among the endpoints `allowed` accepts: the draws are over their
+    /// number, the index returned is in the whole set. Nothing is allocated.
+    pub fn pick_where(
+        &self,
+        now: Duration,
+        in_flight: impl Fn(usize) -> u32,
+        draw: &mut impl FnMut(usize) -> usize,
+        allowed: impl Fn(SocketAddr) -> bool,
+    ) -> Option<usize> {
+        let n = self.count_where(&allowed);
+        // The index in the whole set of the `k`th allowed endpoint.
+        let nth = |k: usize| {
+            self.members
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| allowed(m.addr))
+                .nth(k)
+                .map(|(i, _)| i)
+        };
         match n {
             0 => return None,
-            1 => return Some(0),
+            1 => return nth(0),
             _ => {}
         }
         let first = draw(n).min(n - 1);
@@ -106,6 +132,7 @@ impl Endpoints {
         if second >= first {
             second += 1;
         }
+        let (first, second) = (nth(first)?, nth(second)?);
         let score = |i: usize| (f64::from(in_flight(i)) + 1.0) / self.weight(i, now);
         Some(if score(second) < score(first) {
             second
