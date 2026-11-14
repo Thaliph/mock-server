@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use http_body_util::BodyExt;
+use hyper::header::{HeaderMap, HeaderName};
 use hyper::service::service_fn;
 use hyper::{Request, Response, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -22,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, ReqBody, Tracker};
 use crate::load::{Body, Marker, mark_answer, refused, screen};
+use crate::mesh::MeshState;
 use crate::mock::{self, Mock};
 use crate::transport::Stream;
 
@@ -85,6 +87,9 @@ struct State {
     switched: AtomicBool,
     /// Inbound connections: the check of the load marker of every stream (spec §7.8).
     load: Option<Marker>,
+    /// Inbound connections of a meshed sidecar: the `x-mimic-*` fields of the app's responses
+    /// are removed (spec §4.1).
+    strip: Option<MeshState>,
     /// With a load check, the destination socket stays unused (not one byte written) until
     /// the first stream is forwarded: a refused stream leaves the app with nothing.
     unopened: tokio::sync::Mutex<Option<Stream>>,
@@ -144,18 +149,26 @@ pub async fn relay(
     ctx: Ctx,
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    relay_with(client, upstream, replay, ctx, (None, None, None), stop).await
+    relay_with(
+        client,
+        upstream,
+        replay,
+        ctx,
+        (None, None, None, None),
+        stop,
+    )
+    .await
 }
 
 /// Like [`relay`], with the exchanges also handed to the discovery `tap` (spec §6), the `mock`
 /// that takes the streams opened after a switch to `mock` (outbound) and the load marker check
-/// (inbound).
+/// (inbound), and the mesh state of a meshed inbound side, which strips `x-mimic-*` fields.
 pub(crate) async fn relay_with(
     client: Stream,
     upstream: Stream,
     replay: Vec<u8>,
     ctx: Ctx,
-    (tap, mock, load): (Option<Tap>, Option<Mock>, Option<Marker>),
+    (tap, mock, load, strip): (Option<Tap>, Option<Mock>, Option<Marker>, Option<MeshState>),
     stop: impl Future<Output = ()>,
 ) -> io::Result<()> {
     let lazy = load.is_some();
@@ -176,6 +189,7 @@ pub(crate) async fn relay_with(
         mocked: OnceLock::new(),
         switched: AtomicBool::new(false),
         load,
+        strip,
         unopened: tokio::sync::Mutex::new(unopened),
         driver_ended: Arc::default(),
         driver_task: Mutex::new(None),
@@ -330,6 +344,9 @@ async fn forward(
         Ok(response) => {
             let resumed = Instant::now();
             let mut answered = tracker.answered(response).map(BodyExt::boxed_unsync);
+            if let Some(mesh) = state.strip.as_ref().filter(|mesh| mesh.strips()) {
+                mesh.stripped(strip_mimic(answered.headers_mut()));
+            }
             if marked {
                 mark_answer(answered.headers_mut());
             }
@@ -342,4 +359,21 @@ async fn forward(
             Err(e.into())
         }
     }
+}
+
+/// Removes the `x-mimic-*` fields from the headers of a response; how many fields were removed.
+fn strip_mimic(headers: &mut HeaderMap) -> usize {
+    let names: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("x-mimic-"))
+        .cloned()
+        .collect();
+    names
+        .iter()
+        .map(|name| {
+            let fields = headers.get_all(name).iter().count();
+            headers.remove(name);
+            fields
+        })
+        .sum()
 }

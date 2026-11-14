@@ -7,6 +7,7 @@ pub mod input;
 pub mod lb;
 pub mod policy;
 pub mod retry;
+pub mod strip;
 pub mod view;
 
 #[cfg(test)]
@@ -27,3 +28,5 @@ mod tests_policy;
 mod tests_prop;
 #[cfg(test)]
 mod tests_retry;
+#[cfg(test)]
+mod tests_strip;

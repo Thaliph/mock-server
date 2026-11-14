@@ -1,0 +1,4 @@
+x-mimic-a HTTP/1.1 200 OK
+x-mimic-load: ok
+
+x-mimic-body: 1

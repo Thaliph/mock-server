@@ -18,13 +18,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT, READ_AHEAD};
+use mimic_core::mesh::strip::strip;
+use mimic_core::proxy::http1::{Codec, Event, HEAD_LIMIT, READ_AHEAD, Side as FrameSide};
 use prometheus_client::metrics::histogram::Histogram;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::access::Outcome;
 use crate::load::{MARKER_HEADER, REQUEST_HEADER, Refusal, Watch};
+use crate::mesh::MeshState;
 use crate::mock::Mock;
 use crate::opaque::{Side, abort, failed};
 use crate::transport::Stream;
@@ -127,6 +129,9 @@ struct Relay<F> {
     answers: Mutex<VecDeque<bool>>,
     /// The marker of a request was refused.
     refused: Mutex<Option<Refusal>>,
+    /// Inbound connections of a meshed sidecar: every final response head is held whole and
+    /// loses its `x-mimic-*` fields, unless the view says `"mesh": false` (spec §4.1).
+    strip: Option<MeshState>,
 }
 
 /// What the bytes read so far of a request head say about the load marker.
@@ -223,8 +228,33 @@ fn edited(head: &[u8], name: &str, add: Option<&[u8]>) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The end of the response head at the start of `held`, and its status.
-fn response_head(held: &[u8]) -> Option<(usize, u16)> {
+/// What the bytes held say of the response head at their start.
+#[derive(Debug, PartialEq, Eq)]
+enum Head {
+    /// The head is not complete.
+    Open,
+    /// The status line is not one the codec frames: the codec stops following the connection.
+    Bad,
+    /// The head is complete (its end, blank lines before it included) and has this status.
+    Done(usize, u16),
+}
+
+/// Bytes of blank lines (`CRLF` or `LF`) at the start of `held`: the codec skips them and
+/// counts them in no head.
+fn leading_blanks(held: &[u8]) -> usize {
+    let mut at = 0;
+    loop {
+        match &held[at..] {
+            [b'\n', ..] => at += 1,
+            [b'\r', b'\n', ..] => at += 2,
+            _ => return at,
+        }
+    }
+}
+
+/// The response head at the start of `held`, read as the codec reads it: blank lines before
+/// the status line are skipped, a reason phrase is any bytes.
+fn response_head(held: &[u8]) -> Head {
     let mut at = 0;
     let mut status = None;
     while let Some(end) = held[at..].iter().position(|&b| b == b'\n') {
@@ -232,18 +262,24 @@ fn response_head(held: &[u8]) -> Option<(usize, u16)> {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         at += end + 1;
         if line.is_empty() {
-            return status.map(|status| (at, status));
+            match status {
+                None => continue,
+                Some(status) => return Head::Done(at, status),
+            }
         }
         if status.is_none() {
-            status = std::str::from_utf8(line)
-                .ok()?
-                .split(' ')
+            let code = line
+                .split(|&b| b == b' ')
                 .nth(1)
+                .and_then(|code| std::str::from_utf8(code).ok())
                 .and_then(|code| code.parse().ok());
-            status?;
+            match code {
+                Some(code) => status = Some(code),
+                None => return Head::Bad,
+            }
         }
     }
-    None
+    Head::Open
 }
 
 impl<F: FnMut(Event)> Relay<F> {
@@ -473,8 +509,8 @@ impl<F: FnMut(Event)> Relay<F> {
         upstream: &mut (impl AsyncRead + Unpin),
         client: &mut (impl AsyncWrite + Unpin),
     ) -> Result<(), Failure> {
-        if let Some(watch) = &self.watch {
-            return self.server_pump_marked(watch, upstream, client).await;
+        if self.watch.is_some() || self.strip.is_some() {
+            return self.server_pump_marked(upstream, client).await;
         }
         let mut buf = vec![0u8; CHUNK];
         loop {
@@ -514,12 +550,28 @@ impl<F: FnMut(Event)> Relay<F> {
             .push_back(load);
     }
 
-    /// Destination to client when load testing is on: the head of the final response to a load
-    /// request is held whole to lose its `x-mimic-load` lines and gain one `ok`; every other
-    /// byte goes through as in [`Relay::server_pump`].
+    /// The app sent a response the codec cannot frame while the fields are removed: counted and
+    /// logged (no byte of the app), and the error that ends the relay and closes both sockets.
+    fn unframed_close(&self) -> Failure {
+        if let Some(mesh) = &self.strip {
+            mesh.unframed_close();
+        }
+        tracing::warn!(
+            target: "mesh",
+            "response of the app the codec cannot frame: connection closed"
+        );
+        (
+            Side::Upstream,
+            io::Error::other("response the codec cannot frame"),
+        )
+    }
+
+    /// Destination to client when load testing is on or the mesh strips (spec §4.1): the head
+    /// of a final response is held whole to lose its `x-mimic-*` lines (meshed) and, for a load
+    /// request, to lose its `x-mimic-load` lines and gain one `ok`; every other byte goes
+    /// through as in [`Relay::server_pump`].
     async fn server_pump_marked(
         &self,
-        watch: &Watch,
         upstream: &mut (impl AsyncRead + Unpin),
         client: &mut (impl AsyncWrite + Unpin),
     ) -> Result<(), Failure> {
@@ -550,45 +602,102 @@ impl<F: FnMut(Event)> Relay<F> {
                 .front()
                 .copied()
                 .unwrap_or(false);
-            if load && !release && self.with(|codec| (codec.between_responses(), Vec::new())) {
+            // An interim head is taken alone, so that the final head that may follow it is held
+            // in its turn.
+            let mut interim = None;
+            let stripping = self.strip.as_ref().is_some_and(MeshState::strips);
+            if (load || stripping)
+                && !release
+                && self.with(|codec| (codec.between_responses(), Vec::new()))
+            {
+                let blanks = leading_blanks(&held);
                 match response_head(&held) {
-                    None if held.len() < HEAD_LIMIT => {
-                        match tokio::time::timeout(watch.stall, upstream.read(&mut buf)).await {
-                            Ok(Ok(0)) | Err(_) => release = true,
-                            Ok(Ok(n)) => {
+                    Head::Open
+                        if stripping
+                            && (blanks >= HEAD_LIMIT || held.len() - blanks >= HEAD_LIMIT) =>
+                    {
+                        // A head of 64 KiB that is not complete cannot be completed within the
+                        // limit, and the codec skips blank lines without end: either way the
+                        // head cannot be judged, so nothing of it is relayed.
+                        return Err(self.unframed_close());
+                    }
+                    Head::Open if held.len() - blanks < HEAD_LIMIT => {
+                        // A head that stalls is released after the stall when only a load
+                        // marker is at stake; a stripped one is never written in part.
+                        let stall = self
+                            .watch
+                            .as_ref()
+                            .filter(|_| !stripping)
+                            .map(|watch| watch.stall);
+                        let read = match stall {
+                            Some(stall) => tokio::time::timeout(stall, upstream.read(&mut buf))
+                                .await
+                                .unwrap_or(Ok(0)),
+                            None => upstream.read(&mut buf).await,
+                        };
+                        match read {
+                            Ok(0) => release = true,
+                            Ok(n) => {
                                 self.to_client.fetch_add(n as u64, Ordering::Relaxed);
                                 held.extend_from_slice(&buf[..n]);
                             }
-                            Ok(Err(e)) => return Err((Side::Upstream, e)),
+                            Err(e) => return Err((Side::Upstream, e)),
                         }
                         continue;
                     }
                     // An interim response is not the answer.
-                    Some((end, status)) if status >= 200 || status == 101 => {
-                        let ok = format!("{MARKER_HEADER}: ok\r\n");
-                        if let Some(head) = edited(&held[..end], MARKER_HEADER, Some(ok.as_bytes()))
-                        {
-                            held.splice(..end, head);
+                    Head::Done(end, status) if status >= 200 || status == 101 => {
+                        let mut end = end;
+                        let end_before = end;
+                        if stripping {
+                            let (head, removed) = strip(&held[..end]);
+                            if removed > 0 {
+                                let head = head.into_owned();
+                                if let Some(mesh) = &self.strip {
+                                    mesh.stripped(removed);
+                                }
+                                end = head.len();
+                                held.splice(..end_before, head);
+                            }
+                        }
+                        if load {
+                            let ok = format!("{MARKER_HEADER}: ok\r\n");
+                            if let Some(head) =
+                                edited(&held[..end], MARKER_HEADER, Some(ok.as_bytes()))
+                            {
+                                held.splice(..end, head);
+                            }
                         }
                     }
+                    Head::Done(end, _) => interim = Some(end),
                     _ => {}
                 }
             }
-            let ((used, popped, seen), ()) = {
+            let limit = interim.unwrap_or(held.len());
+            let ((used, popped, seen, unframed), ()) = {
                 let out = self.with(|codec| {
                     let before = codec.pending();
-                    let (used, events) = codec.server_bytes_limited(&held);
+                    let (used, events) = codec.server_bytes_limited(&held[..limit]);
+                    let unframed = events.iter().any(
+                        |event| matches!(event, Event::Unframed(u) if u.side == FrameSide::Server),
+                    );
                     (
                         (
                             used,
                             before.saturating_sub(codec.pending()),
                             !events.is_empty(),
+                            unframed,
                         ),
                         events,
                     )
                 });
                 (out, ())
             };
+            if stripping && unframed {
+                // The codec stops following this connection: what the app says next could not
+                // be held and stripped, so nothing of it is relayed (spec §4.1).
+                return Err(self.unframed_close());
+            }
             {
                 let mut answers = self
                     .answers
@@ -681,6 +790,7 @@ pub async fn relay(
         None,
         None,
         None,
+        None,
         on_event,
         stop,
         abort_signal,
@@ -694,7 +804,8 @@ pub async fn relay(
 /// connection that became a tunnel (outcome `MockClosed`). With a `watch` (inbound, load
 /// testing on) each request head is held whole and judged for `mimic-load-run`, rewritten in
 /// place when admitted, and the relay ends before any byte of a refused one
-/// ([`Relayed::refused`]).
+/// ([`Relayed::refused`]). With a `strip` (inbound, mesh on) each final response head is held
+/// whole and loses its `x-mimic-*` fields (spec §4.1).
 #[allow(clippy::too_many_arguments)]
 pub async fn relay_with(
     client: &mut Stream,
@@ -703,6 +814,7 @@ pub async fn relay_with(
     capture: bool,
     mock: Option<Mock>,
     watch: Option<Watch>,
+    strip: Option<MeshState>,
     overhead: Option<Histogram>,
     on_event: impl FnMut(Event) + Send,
     stop: impl Future<Output = ()> + Send,
@@ -717,7 +829,7 @@ pub async fn relay_with(
                 } else {
                     Codec::new()
                 };
-                if watch.is_some() {
+                if watch.is_some() || strip.is_some() {
                     codec.one_request_at_a_time()
                 } else {
                     codec
@@ -746,6 +858,7 @@ pub async fn relay_with(
         watch,
         answers: Mutex::new(VecDeque::new()),
         refused: Mutex::new(None),
+        strip,
     };
     let mut mock_closed = false;
     let mut handed = false;

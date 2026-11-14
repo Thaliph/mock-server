@@ -249,8 +249,15 @@ would see without mimic, except for the limits listed at the end of this section
   `x-mimic-load: ok` is added. HTTP/2: the fields are removed from the response headers `hyper`
   forwards (trailers are not touched). Each field removed counts in
   `mimic_mesh_stripped_headers_total`; nothing is logged of it. With `MIMIC_MESH=off` or a view of
-  `"mesh": false` the relay is byte-exact as above. A head the codec cannot frame (unframed,
-  over 64 KiB) and inbound TLS are relayed unchanged (§11.1).
+  `"mesh": false` the relay is byte-exact as above. While the fields are removed, a response the
+  codec cannot frame (a bare CR, a header line without a colon or with a name that is not a
+  token, a head over 64 KiB, blank lines without end before the status line, a body whose
+  framing is invalid) is not relayed: the bytes of it are not forwarded, nothing more of the app
+  is relayed on that connection, and both sockets are closed, so that no later response of the
+  connection can carry a field that was not removed. The caller sees a close or reset, which its
+  sidecar takes as an app failure (§7.9 "Retries"), never as a refusal. It is counted in
+  `mimic_mesh_unframed_closes_total` and logged once per connection at `warn` without any byte
+  of the app. Inbound TLS is relayed unchanged (§11.1).
 - **Upgrades**: a request answered with `101` (WebSocket, `h2c` upgrade), or a `CONNECT`
   answered with 2xx, continues as an opaque tunnel after the response. After a request that
   asks for an upgrade or is a `CONNECT`, the relay reads no more client bytes until the final
@@ -2810,6 +2817,7 @@ no insignificant whitespace):
   | `mimic_mesh_retries_skipped_total` | counter (M2), failures of the table's retried kinds that were not retried | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
   | `mimic_mesh_retry_buffer_bytes` | gauge (M2), request body bytes held for replay, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL` | — |
   | `mimic_mesh_stripped_headers_total` | counter (M2), `x-mimic-*` fields removed from app responses by the inbound side (§4.1) | — |
+  | `mimic_mesh_unframed_closes_total` | counter (M2), inbound connections closed because the app sent a response the codec cannot frame while the fields are removed (§4.1); like the previous one, created by the first | — |
 
   At most `MIMIC_METRICS_MAX_ENDPOINTS` distinct endpoints have a label of their own, the next ones
   are `other`; the series of an endpoint that left the view are removed 5 minutes after it left
@@ -3074,7 +3082,7 @@ random numbers it hands to the draw.
   | `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauge (M1, sidecar), Services and endpoints of the view held, 0 without one | — |
   | `mimic_mesh_unscoped_connections_total` | counter (M1, sidecar), outbound connections whose destination is not a Service port of the view | — |
   | `mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_endpoint_requests_total`, `mimic_mesh_endpoint_in_flight` | (M1, #443, sidecar) mesh-routed requests, in total, their duration, and per pod; labels, bounds and eviction in §7.9 "Load balancing" | `service`, `route`, `backend`, `endpoint`, `status_class`, `reason` |
-  | `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`, `mimic_mesh_stripped_headers_total` | (M2, #445, sidecar) tries, retries, retryable failures not retried, body bytes held for replay, `x-mimic-*` fields removed from app responses; §7.9 "Retries" and "Metrics" | `backend`, `result`, `reason` |
+  | `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`, `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total` | (M2, #445, sidecar) tries, retries, retryable failures not retried, body bytes held for replay, `x-mimic-*` fields removed from app responses, connections closed on an unframeable response; §7.9 "Retries" and "Metrics" | `backend`, `result`, `reason` |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -4184,8 +4192,7 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   placeholder field (lower match tier) and its load plan treats a placeholder that is not in a
   `redacted` field as an ordinary value.
 - (M2) **A pod can make its callers retry requests sent to itself.** An app whose own sidecar
-  does not strip `x-mimic-*` (no sidecar, mesh switched off, a response head the codec cannot
-  frame, inbound TLS) can answer a forged `503` refusal bound to its own address: its callers'
+  does not strip `x-mimic-*` (no sidecar, mesh switched off, inbound TLS) can answer a forged `503` refusal bound to its own address: its callers'
   sidecars then send that request to its sibling pods, at most `retries` more times, and only
   requests that were sent to that pod. It gains nothing it could not get by failing its
   requests; it cannot make a caller retry a request sent to another pod, nor make the callers of
@@ -4206,6 +4213,13 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
 - (M2) **Inbound heads are held when the mesh is on.** The inbound HTTP/1 relay writes a
   final response head once it is whole (at most 64 KiB) instead of as it is read: timing only,
   no byte changes but the `x-mimic-*` lines.
+- (M2) **A response the codec cannot frame closes the inbound connection when the mesh is on.**
+  An app that sends a bare CR, an invalid header line, a head over 64 KiB or an invalid body
+  framing gets its connection closed without that response (§4.1 "Mimic fields of app
+  responses"): the codec stops following a connection it cannot frame, and relaying the rest
+  unchanged would let the app write `x-mimic-*` fields after it. Such an app works with the mesh
+  off or a view of `"mesh": false`. A request the codec cannot frame (client side) is still
+  relayed unchanged, and so is what the app answers to it.
 
 ## 12. Delivery plan
 

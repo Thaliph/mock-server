@@ -684,6 +684,24 @@ impl MeshState {
         table.loaded && !table.enabled
     }
 
+    /// The inbound side removes the `x-mimic-*` fields of its app's responses (spec §4.1): the
+    /// mesh is on, which holds for a state, unless the view held says `"mesh": false`.
+    pub(crate) fn strips(&self) -> bool {
+        !self.off()
+    }
+
+    /// The app sent a response the codec cannot frame and its connection is closed (spec §4.1).
+    pub(crate) fn unframed_close(&self) {
+        self.0.router.metrics.unframed_close();
+    }
+
+    /// `n` `x-mimic-*` fields were removed from a response of the app.
+    pub(crate) fn stripped(&self, n: usize) {
+        if n > 0 {
+            self.0.router.metrics.stripped(n);
+        }
+    }
+
     /// The view is older than `MIMIC_MESH_STALE_AFTER`: its pod addresses are not used.
     pub(crate) fn stale(&self) -> bool {
         lock(&self.0.contact)

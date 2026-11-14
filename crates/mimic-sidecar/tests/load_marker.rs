@@ -312,6 +312,18 @@ async fn rig_with(
     enabled: bool,
     stall: Option<Duration>,
 ) -> Rig {
+    rig_meshed(app, mode, root, enabled, stall, None).await
+}
+
+/// Like [`rig_with`], with the mesh `state` on (RTY-18): the inbound side strips `x-mimic-*`.
+async fn rig_meshed(
+    app: &App,
+    mode: Mode,
+    root: Option<&Root>,
+    enabled: bool,
+    stall: Option<Duration>,
+    mesh: Option<&mimic_sidecar::mesh::MeshState>,
+) -> Rig {
     let logs = capture_logs();
     let mut metrics = Metrics::new("sidecar", "test");
     let mode = ModeState::start(
@@ -345,6 +357,10 @@ async fn rig_with(
         .with_discovery(discovery.tap());
     if enabled {
         shared = shared.with_load(marker.clone());
+    }
+    if let Some(mesh) = mesh {
+        mesh.register(&mut metrics);
+        shared = shared.with_mesh(mesh.clone());
     }
     if let Some(stall) = stall {
         shared = shared.with_detect_stall(stall);
@@ -568,6 +584,62 @@ async fn ldt_11_h2c_the_marker_of_the_app_is_replaced_by_one_ok() {
     let mut sender = h2c(rig.addr).await;
     let answer = h2_call(&mut sender, Some(&valid(&root))).await;
     assert_forwarded(&rig, &app, &answer, "h2").await;
+}
+
+/// A load request's answer under a meshed inbound side (RTY-18): one `x-mimic-load: ok` and
+/// none of the app's other `x-mimic-*` fields.
+fn meshed() -> mimic_sidecar::mesh::MeshState {
+    mimic_sidecar::mesh::MeshState::new(&mimic_sidecar::mesh::MeshConfig {
+        enabled: true,
+        ..mimic_sidecar::mesh::MeshConfig::default()
+    })
+}
+
+#[tokio::test]
+async fn rty_18_http1_a_load_answer_has_one_ok_and_none_of_the_app_mimic_fields() {
+    let root = root("deployment root");
+    let app = app_h1(
+        "x-mimic-load: refused; reason=mode\r\nX-Mimic-Error: overloaded\r\nx-mimic-endpoint: 10.0.0.9:80\r\nX-Keep: 1\r\n",
+    )
+    .await;
+    let state = meshed();
+    let rig = rig_meshed(&app, Mode::Mock, Some(&root), true, None, Some(&state)).await;
+    let answer = call(rig.addr, &get(Some(&valid(&root)))).await;
+    assert_forwarded(&rig, &app, &answer, "http1").await;
+    let mimic: Vec<&str> = answer
+        .headers
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| n.starts_with("x-mimic-"))
+        .collect();
+    assert_eq!(mimic, vec!["x-mimic-load"], "only the sidecar's field");
+    assert_eq!(answer.header("x-keep"), vec!["1"]);
+    assert_eq!(rig.counter("mimic_mesh_stripped_headers_total"), 3);
+}
+
+#[tokio::test]
+async fn rty_18_h2c_a_load_answer_has_one_ok_and_none_of_the_app_mimic_fields() {
+    let root = root("deployment root");
+    let app = app_h2(&[
+        ("x-mimic-load", "refused; reason=mode"),
+        ("x-mimic-error", "overloaded"),
+        ("x-keep", "1"),
+    ])
+    .await;
+    let state = meshed();
+    let rig = rig_meshed(&app, Mode::Mock, Some(&root), true, None, Some(&state)).await;
+    let mut sender = h2c(rig.addr).await;
+    let answer = h2_call(&mut sender, Some(&valid(&root))).await;
+    assert_forwarded(&rig, &app, &answer, "h2").await;
+    let mimic: Vec<&str> = answer
+        .headers
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| n.starts_with("x-mimic-"))
+        .collect();
+    assert_eq!(mimic, vec!["x-mimic-load"], "only the sidecar's field");
+    assert_eq!(answer.header("x-keep"), vec!["1"]);
+    assert_eq!(rig.counter("mimic_mesh_stripped_headers_total"), 2);
 }
 
 // --- LDT-11 / LDT-20: refused -----------------------------------------------------------
