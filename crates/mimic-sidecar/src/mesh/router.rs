@@ -138,23 +138,6 @@ impl Backend {
     fn addrs(&self) -> Vec<SocketAddr> {
         lock(&self.state).endpoints.iter().map(|e| e.addr).collect()
     }
-
-    /// Chooses the endpoint of the next request (P2C least request, spec §7.9) and counts the
-    /// request in flight; `None` without an endpoint.
-    pub(crate) fn pick(&self, router: &Router) -> Option<InFlight> {
-        let now = router.started.elapsed();
-        let avoid_now = now_ms();
-        let state = lock(&self.state);
-        let mut draw = |n: usize| router.draw(n);
-        let index = state
-            .set
-            .pick(now, |i| state.endpoints[i].load(avoid_now), &mut draw)?;
-        let endpoint = state.endpoints[index].clone();
-        drop(state);
-        endpoint.in_flight.fetch_add(1, Ordering::AcqRel);
-        endpoint.gauge.inc();
-        Some(InFlight(endpoint))
-    }
 }
 
 /// Where the next try of a request goes.
@@ -195,14 +178,6 @@ impl Backend {
             Next::Original => Plan::Original,
             Next::Stop => Plan::Stop,
         }
-    }
-}
-
-impl Backend {
-    /// An endpoint other than `not` (after a connect to it failed), counted in flight; `None`
-    /// when the backend has no other one.
-    pub(crate) fn pick_other(&self, router: &Router, not: SocketAddr) -> Option<InFlight> {
-        (0..4).find_map(|_| self.pick(router).filter(|p| p.endpoint().addr != not))
     }
 }
 

@@ -92,6 +92,8 @@ pub struct Connection {
     /// the pod, or the original destination after a fallback.
     pub backend: Option<String>,
     pub upstream: Option<SocketAddr>,
+    /// The connects it took (spec §7.9 "Retries").
+    pub attempts: Option<u32>,
 }
 
 fn millis(d: Duration) -> u64 {
@@ -154,6 +156,7 @@ pub fn connection(c: &Connection) {
         bytes_out = c.bytes_out,
         backend = c.backend.as_deref(),
         upstream = c.upstream.map(|a| a.to_string()).as_deref(),
+        attempts = c.attempts,
         "connection"
     );
 }

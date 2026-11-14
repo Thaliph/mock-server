@@ -333,3 +333,86 @@ async fn msh_68_l4_connections_avoid_a_blackholed_pod() {
     );
     assert_eq!(live.accepted(), 30);
 }
+
+/// The tries counted `connect_failed`, over every backend.
+fn connect_failures(metrics: &str) -> f64 {
+    metrics
+        .lines()
+        .filter(|l| l.starts_with("mimic_mesh_attempts_total{") && l.contains("connect_failed"))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .sum()
+}
+
+/// The `attempts` of the one access line of a connection.
+async fn attempts_of(logs: &common::Logs) -> serde_json::Value {
+    logs.access_exactly(1).await.remove(0)["attempts"].clone()
+}
+
+#[tokio::test]
+async fn rty_16_five_refusing_pods_end_on_the_original_destination_after_three_pod_connects() {
+    let logs = capture_logs();
+    let cluster = EchoPod::start().await;
+    let mut pods = Vec::new();
+    for _ in 0..5 {
+        pods.push(closed_port().await);
+    }
+    let state = state_for(cluster.addr, &pods, |_| {});
+    let f = fixture_mesh(cluster.addr, &state, None).await;
+    assert_eq!(echoed(f.addr, BINARY).await, BINARY, "byte for byte");
+    assert_eq!(cluster.accepted(), 1);
+    assert_eq!(cluster.received(), BINARY);
+    let scrape = f.metrics.encode();
+    assert_eq!(connect_failures(&scrape), 3.0, "{scrape}");
+    assert_eq!(counter(&scrape, "mimic_mesh_fallbacks_total"), 1.0);
+    assert_eq!(attempts_of(&logs).await, 4);
+}
+
+#[tokio::test]
+async fn rty_16_with_the_original_destination_refusing_too_the_client_is_closed_after_four_connects()
+ {
+    let _logs = capture_logs();
+    let cluster = closed_port().await;
+    let mut pods = Vec::new();
+    for _ in 0..5 {
+        pods.push(closed_port().await);
+    }
+    let state = state_for(cluster, &pods, |_| {});
+    let f = fixture_mesh(cluster, &state, None).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(BINARY).await.unwrap();
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut got))
+        .await
+        .expect("the connection ends")
+        .ok();
+    assert!(got.is_empty(), "no byte");
+    let scrape = f.metrics.encode();
+    assert_eq!(connect_failures(&scrape), 4.0, "{scrape}");
+}
+
+#[tokio::test]
+async fn rty_16_a_pod_that_accepts_and_closes_is_not_retried() {
+    let _logs = capture_logs();
+    let (cluster, closer) = (EchoPod::start().await, EchoPod::closer().await);
+    let state = state_for(cluster.addr, &[closer.addr, closed_port().await], |_| {});
+    let f = fixture_mesh(cluster.addr, &state, None).await;
+    let mut c = TcpStream::connect(f.addr).await.unwrap();
+    c.write_all(BINARY).await.unwrap();
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut got))
+        .await
+        .expect("the connection ends")
+        .ok();
+    assert_eq!(closer.accepted(), 1);
+    assert_eq!(cluster.accepted(), 0);
+}
+
+#[tokio::test]
+async fn rty_16_a_connection_to_the_first_pod_has_one_attempt() {
+    let logs = capture_logs();
+    let pod = EchoPod::start().await;
+    let state = state_for(cluster_ip(), &[pod.addr], |_| {});
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    assert_eq!(echoed(f.addr, BINARY).await, BINARY);
+    assert_eq!(attempts_of(&logs).await, 1);
+}
