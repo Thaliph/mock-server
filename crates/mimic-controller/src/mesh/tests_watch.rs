@@ -45,11 +45,15 @@ fn client(present: &watch::Sender<bool>, seen: &Arc<Mutex<Vec<String>>>) -> kube
             let uri = request.uri().clone();
             seen.lock().unwrap().push(uri.to_string());
             if uri.path() != PATH || !*present.borrow() {
-                return Ok::<_, Infallible>(reply(
-                    404,
-                    &json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
-                            "reason": "NotFound", "code": 404, "message": "no"}),
-                ));
+                // What a real API server answers for a resource of a group it does not serve:
+                // a plain-text 404, which a watch request reads as a broken event stream.
+                return Ok::<_, Infallible>(
+                    http::Response::builder()
+                        .status(404)
+                        .header("content-type", "text/plain; charset=utf-8")
+                        .body(Full::new(Bytes::from("404 page not found\n")).boxed_unsync())
+                        .unwrap(),
+                );
             }
             if uri.query().unwrap_or("").contains("watch=true") {
                 let mut gone = present.subscribe();
