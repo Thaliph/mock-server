@@ -90,6 +90,8 @@ pub struct MeshConfig {
     pub max_endpoint_labels: usize,
     /// `MIMIC_MESH_OPAQUE_PORTS`: in-scope connections to these ports keep the byte relay.
     pub opaque_ports: std::collections::BTreeSet<u16>,
+    /// `MIMIC_POD_NAME`: the pod's name, written in `x-mimic-origin` (spec §4.1).
+    pub pod: Option<String>,
     /// `MIMIC_MESH_RETRY_BUFFER`: request body bytes held per request so that it can be retried.
     pub retry_buffer: usize,
     /// `MIMIC_MESH_RETRY_BUFFER_TOTAL`: the same for all the requests of the sidecar together.
@@ -119,6 +121,7 @@ impl Default for MeshConfig {
             avoid_failed_for: Duration::from_secs(5),
             max_endpoint_labels: 256,
             opaque_ports: DEFAULT_OPAQUE_PORTS.into_iter().collect(),
+            pod: None,
             retry_buffer: 64 * KIB,
             retry_buffer_total: 8 * MIB,
             retries: 3,
@@ -189,6 +192,7 @@ impl MeshConfig {
                 10_000,
             )?,
             opaque_ports: opaque_ports(env)?,
+            pod: env.optional("MIMIC_POD_NAME").map(str::to_string),
             retry_buffer: size(env, RETRY_BUFFER_VAR, defaults.retry_buffer, 0..=MIB)?,
             retry_buffer_total: size(
                 env,
@@ -421,6 +425,8 @@ struct Inner {
     unscoped: Counter,
     router: Router,
     opaque_ports: std::collections::BTreeSet<u16>,
+    /// The pod's name when it is valid in `x-mimic-origin`.
+    pod: Option<String>,
     /// Set once a view is held: readiness stays.
     seen: AtomicBool,
 }
@@ -468,6 +474,9 @@ impl MeshState {
             age: Gauge::default(),
             unscoped: Counter::default(),
             opaque_ports: config.opaque_ports.clone(),
+            pod: config.pod.clone().filter(|pod| {
+                mimic_core::mesh::retry::origin(format!("inbound; pod={pod}").as_bytes())
+            }),
             router: Router::new(
                 config.pool_idle_timeout,
                 config.max_endpoint_labels,
@@ -693,6 +702,16 @@ impl MeshState {
     /// The app sent a response the codec cannot frame and its connection is closed (spec §4.1).
     pub(crate) fn unframed_close(&self) {
         self.0.router.metrics.unframed_close();
+    }
+
+    /// The inbound side answered a refused app connection (spec §4.1 "Refused app connections"):
+    /// the `x-mimic-origin` value to write, and the count.
+    pub(crate) fn inbound_refusal(&self) -> String {
+        self.0.router.metrics.inbound_refusal();
+        match &self.0.pod {
+            Some(pod) => format!("inbound; pod={pod}"),
+            None => "inbound".to_string(),
+        }
     }
 
     /// `n` `x-mimic-*` fields were removed from a response of the app.

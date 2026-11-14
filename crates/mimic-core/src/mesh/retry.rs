@@ -19,6 +19,8 @@ pub enum Outcome {
     Reset,
     Overloaded,
     QueueTimeout,
+    /// The callee's sidecar answered that its app refused the connection (#518).
+    AppRefused,
 }
 
 impl Outcome {
@@ -30,6 +32,7 @@ impl Outcome {
             Outcome::Reset => "reset",
             Outcome::Overloaded => "overloaded",
             Outcome::QueueTimeout => "queue_timeout",
+            Outcome::AppRefused => "app_refused",
         }
     }
 }
@@ -39,6 +42,8 @@ impl Outcome {
 pub enum Refusal {
     Overloaded,
     QueueTimeout,
+    /// `connect-failed` written by the inbound sidecar of the pod (`x-mimic-origin`).
+    AppRefused,
 }
 
 /// A failure of one try, as the sidecar observed it.
@@ -107,6 +112,7 @@ pub fn classify(failure: Failure, method: &str, body_held: bool, written: bool) 
         Failure::RefusedStream => Outcome::RefusedStream,
         Failure::Refusal(Refusal::Overloaded) => Outcome::Overloaded,
         Failure::Refusal(Refusal::QueueTimeout) => Outcome::QueueTimeout,
+        Failure::Refusal(Refusal::AppRefused) => Outcome::AppRefused,
         Failure::Reset => Outcome::Reset,
     };
     let skip = if failure == Failure::Reset && written && !IDEMPOTENT.contains(&method) {
@@ -128,7 +134,8 @@ const IDEMPOTENT: [&str; 6] = ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE
 
 /// Whether an answer is a trusted refusal of the pod of this try: `503`, exactly one
 /// `x-mimic-error` (`overloaded` or `queue-timeout`) and exactly one `x-mimic-endpoint` equal
-/// to `pod`. Field names are compared without case; `pod` is `None` on the original destination.
+/// to `pod`; `connect-failed` also needs exactly one valid `x-mimic-origin` (see [`origin`]).
+/// Field names are compared without case; `pod` is `None` on the original destination.
 pub fn trusted(status: u16, fields: &[(&[u8], &[u8])], pod: Option<SocketAddr>) -> Option<Refusal> {
     let pod = pod?;
     if status != 503 {
@@ -136,12 +143,16 @@ pub fn trusted(status: u16, fields: &[(&[u8], &[u8])], pod: Option<SocketAddr>) 
     }
     let mut error = None;
     let mut endpoint = None;
+    let mut origins = Vec::new();
     for (name, value) in fields {
         let slot = if name.eq_ignore_ascii_case(b"x-mimic-error") {
             &mut error
         } else if name.eq_ignore_ascii_case(b"x-mimic-endpoint") {
             &mut endpoint
         } else {
+            if name.eq_ignore_ascii_case(b"x-mimic-origin") {
+                origins.push(*value);
+            }
             continue;
         };
         if slot.replace(*value).is_some() {
@@ -158,7 +169,27 @@ pub fn trusted(status: u16, fields: &[(&[u8], &[u8])], pod: Option<SocketAddr>) 
     match error? {
         b"overloaded" => Some(Refusal::Overloaded),
         b"queue-timeout" => Some(Refusal::QueueTimeout),
+        b"connect-failed" => match origins[..] {
+            [one] if origin(one) => Some(Refusal::AppRefused),
+            _ => None,
+        },
         _ => None,
+    }
+}
+
+/// Whether `value` is an `x-mimic-origin` of an inbound sidecar (spec §4.1 "Refused app
+/// connections"): `inbound`, or `inbound; pod=<name>` with a name of 1 to 253 characters
+/// `a-z 0-9 . -`.
+pub fn origin(value: &[u8]) -> bool {
+    match value.strip_prefix(b"inbound") {
+        Some(b"") => true,
+        Some(rest) => rest.strip_prefix(b"; pod=").is_some_and(|name| {
+            (1..=253).contains(&name.len())
+                && name.iter().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-')
+                })
+        }),
+        None => false,
     }
 }
 

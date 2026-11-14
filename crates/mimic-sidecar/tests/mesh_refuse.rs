@@ -88,6 +88,7 @@ fn want_head(dst: SocketAddr, origin: &str) -> String {
 
 #[tokio::test]
 async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_http1() {
+    let _logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("cart-7d9f-x2k"));
     let rig = start(app, Some(&state)).await;
@@ -129,6 +130,7 @@ async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_http1() {
 
 #[tokio::test]
 async fn rty_27_an_ipv6_pod_address_is_written_in_brackets() {
+    let _logs = capture_logs();
     let Ok(socket) = tokio::net::TcpSocket::new_v6() else {
         return;
     };
@@ -191,6 +193,7 @@ async fn h2_streams(addr: SocketAddr, n: usize) -> Vec<(u16, Vec<(String, String
 
 #[tokio::test]
 async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_h2c_then_goaway() {
+    let _logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("cart-1"));
     let rig = start(app, Some(&state)).await;
@@ -199,7 +202,12 @@ async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_h2c_then_goaway()
     for (status, headers, body) in answers {
         assert_eq!(status, 503);
         assert!(body.is_empty());
-        let names: Vec<&str> = headers.iter().map(|(n, _)| n.as_str()).collect();
+        // `date` is the HTTP/2 stack's.
+        let names: Vec<&str> = headers
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| *n != "date")
+            .collect();
         assert_eq!(
             names,
             [
@@ -220,6 +228,7 @@ async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_h2c_then_goaway()
 
 #[tokio::test]
 async fn rty_27_when_the_app_is_back_the_next_connection_is_relayed() {
+    let _logs = capture_logs();
     let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let up = live.local_addr().unwrap();
     tokio::spawn(async move {
@@ -260,6 +269,7 @@ async fn rty_27_when_the_app_is_back_the_next_connection_is_relayed() {
 
 #[tokio::test]
 async fn rty_27_a_load_request_is_answered_the_same_way() {
+    let _logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("p"));
     let rig = start(app, Some(&state)).await;
@@ -276,6 +286,7 @@ async fn rty_27_a_load_request_is_answered_the_same_way() {
 
 #[tokio::test]
 async fn rty_28_without_the_mesh_the_connection_is_closed_without_a_byte() {
+    let _logs = capture_logs();
     let app = closed_port().await;
     let off = MeshState::new(&MeshConfig {
         enabled: true,
@@ -296,6 +307,7 @@ async fn rty_28_without_the_mesh_the_connection_is_closed_without_a_byte() {
 
 #[tokio::test]
 async fn rty_28_what_the_sidecar_cannot_speak_to_is_closed_without_a_byte() {
+    let _logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("p"));
     let rig = start(app, Some(&state)).await;
@@ -335,14 +347,14 @@ async fn rty_29_each_refused_connection_is_counted_and_logged_once() {
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .filter(|v: &serde_json::Value| {
-            v["fields"]["message"] == "inbound connect failed, answered 503 connect-failed"
+            v["message"] == "inbound connect failed, answered 503 connect-failed"
         })
         .collect();
     assert_eq!(warns.len(), 4, "{}", logs.text());
     for line in &warns {
         assert_eq!(line["level"], "WARN");
-        assert_eq!(line["fields"]["dst"], app.to_string());
-        assert!(line["fields"]["error"].is_string());
+        assert_eq!(line["dst"], app.to_string());
+        assert!(line["error"].is_string());
     }
     let text = logs.text();
     for leak in ["secret-path", "s3cr3t", "token=abc", "cart.shop.svc"] {
@@ -350,7 +362,8 @@ async fn rty_29_each_refused_connection_is_counted_and_logged_once() {
     }
     assert!(
         state_label_free(&rig.metrics.encode()),
-        "the counter has no label"
+        "the counter has no label: {}",
+        rig.metrics.encode()
     );
 }
 
@@ -358,11 +371,12 @@ fn state_label_free(scrape: &str) -> bool {
     scrape
         .lines()
         .filter(|l| l.starts_with("mimic_mesh_inbound_refusals_total"))
-        .all(|l| l.starts_with("mimic_mesh_inbound_refusals_total "))
+        .all(|l| l.starts_with("mimic_mesh_inbound_refusals_total{} "))
 }
 
 #[tokio::test]
 async fn rty_28_an_app_that_forges_the_answer_is_stripped() {
+    let _logs = capture_logs();
     let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = app.local_addr().unwrap();
     tokio::spawn(async move {

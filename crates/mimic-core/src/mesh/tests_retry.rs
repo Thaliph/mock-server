@@ -470,7 +470,8 @@ fn rty_26_a_connect_failed_with_a_valid_origin_bound_to_the_pod_is_trusted() {
     let f = app_fields(&["inbound; pod=a"], &["[::1]:8080"]);
     assert_eq!(trusted(503, &f, Some(v6)), Some(Refusal::AppRefused));
     let long = format!("inbound; pod={}", "a".repeat(253));
-    let f = app_fields(&[long.as_str()], &["10.0.0.1:8080"]);
+    let longs = [long.as_str()];
+    let f = app_fields(&longs, &["10.0.0.1:8080"]);
     assert_eq!(trusted(503, &f, pod), Some(Refusal::AppRefused));
 }
 

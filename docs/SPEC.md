@@ -267,7 +267,7 @@ would see without mimic, except for the limits listed at the end of this section
   fields: `x-mimic-error: connect-failed`; `x-mimic-endpoint: <ip>:<port>`, the address of the
   pod as the caller dialled it (the original destination of the connection, `[::1]:8080`
   form for IPv6); `x-mimic-origin: inbound; pod=<name>`; `content-length: 0`; and on HTTP/1
-  `connection: close`. Grammar of `x-mimic-origin`: `inbound` optionally followed by `; pod=`
+  `connection: close` (on `h2c` the HTTP/2 stack adds `date`, and no other field). Grammar of `x-mimic-origin`: `inbound` optionally followed by `; pod=`
   and the pod name (`MIMIC_POD_NAME`, characters `a-z 0-9 . -` only, 1 to 253; the part is
   left out when the variable is unset or holds anything else); it says that the sidecar of the
   pod, on its inbound side, wrote the answer itself, never the app. On HTTP/1 the connection
