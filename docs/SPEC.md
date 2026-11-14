@@ -2770,7 +2770,12 @@ no insignificant whitespace):
     byte of it was written (counted `mimic_mesh_retries_skipped_total{reason="buffer"}`). The bytes
     held are released when a try gets its response head or the request can no longer be retried.
     A retry sends the same head (method, target, fields with their case, as `hyper` holds them)
-    and the same body bytes.
+    and the same body bytes. A request body that failed (the client left in the middle of a
+    chunked upload, a decode error) is never replayed: the request is not retried and every later
+    try fails its body, so no pod receives a cut body that looks complete. The budget counts what
+    is held in memory, the per-chunk bookkeeping included: small chunks are coalesced, so a body
+    of 1-byte chunks costs about its length, and `mimic_mesh_retry_buffer_bytes` reads that cost.
+    The bytes of a request are released when its last try has read what it holds, or ended.
   - **Outcome when no try is left**, or when a failure is not retried: connect failures →
     `503` `x-mimic-error: connect-failed`, `content-length: 0` (an answer of the sidecar, not
     recorded, MSH-85); a trusted refusal → passed to the app **as received**, its `x-mimic-error`
@@ -5105,6 +5110,11 @@ it before M5).
 | RTY-23 | **M** (main session, `scripts/bench.sh`, results in `docs/bench/`). The M2 row of design §14: with no failure, `mesh-lb` is within 0.2 ms p50 of the committed M1 run; a new setup `mesh-refuse` (one of three backend pods not injected and refusing connections) has a client error rate of 0 % and p99 at most the M1 `mesh-lb` p99 + 5 ms. |
 | RTY-24 | **D** (documentation review). `docs/wiki/Mesh.md` has a "Retries" section with the table of §7.9, the bound per tier and the binding; `Configuration.md` lists the two variables, `Monitoring.md` the new metrics, `Access-logs.md` the `attempts` field; `CHANGELOG.md` *Unreleased* says that mesh-routed requests are retried and that meshed sidecars remove `x-mimic-*` fields from app responses. |
 | RTY-25 | **D** (security and performance review). Buffers bounded: per request and in total (RTY-14), released at the response head, the inbound held head at 64 KiB, the discarded refusal body at 64 KiB; a forged `x-mimic-error` causes at most `retries` retries and only for requests sent to the forging pod (RTY-02, RTY-13); no signalled or connect-failure retry crosses a tier (RTY-19, RTY-22); the remaining reset amplification is the one written in §11.1; no header value in a label or a log field; the pure parts allocate nothing per try beyond the set of tried endpoints. |
+| RTY-26 | **U** (security review F1 of #445). A request body that fails after a first chunk (the client leaves in the middle of a chunk) is no longer held, `intact` and `detach` say no, and a try made afterwards fails its body with an error, never an end; no pod receives a complete-looking request. |
+| RTY-27 | **U** (F2). 65 536 chunks of 1 byte held by one request cost at most their length plus a bounded overhead in the budget and in `mimic_mesh_retry_buffer_bytes` (not 32 times), and replay the same bytes in order. |
+| RTY-28 | **U** (F3). The address a planner picks resolves to its endpoint without a scan of the endpoints (the index of a sorted view), for every endpoint of a view of 1000. |
+| RTY-29 | **U** (F7). The `endpoint="other"` series of a backend are removed 5 minutes after its last endpoint with that label left; a backend that left the view keeps no endpoint series. |
+| RTY-30 | **I** (F8). A request whose tries meet certificates that do not verify (three pods) logs `tls verification failed` once, not once per try. |
 
 ## 13. Test strategy
 
