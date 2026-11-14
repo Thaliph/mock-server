@@ -227,7 +227,7 @@ The first `mesh-lb` http1 50 rps run had a p99 of 19.35 ms (p99.9 36.47) — one
 about 15 requests. That point was run three more times alone (results kept out of the JSON): p99 9.95,
 11.26 and 10.39 ms, so the first value was noise.
 
-Against the pre-mesh `discovery` rows of 2026-11-12 (the four `discovery` runs of the sections "B0 after #480", "M0: mode none" and "M0 after #490", all on main before the mesh; the ranges below span those runs), design §14 M1. The committed first `mesh-lb` http1 50 rps p99 (19.35 ms) alone is above the budget; the table uses its three repeats.
+Against the pre-mesh `discovery` rows of 2026-11-12 (the three `discovery` runs of the sections "B0 after #480", "M0: mode none" and "M0 after #490", all on main after #480 and before the mesh; the first run of "Results" predates TCP_NODELAY (#481) and is left out; the ranges below span those runs), design §14 M1. The committed first `mesh-lb` http1 50 rps p99 (19.35 ms) alone is above the budget; the table uses its three repeats.
 
 | Budget | Measured | |
 |---|---|---|
