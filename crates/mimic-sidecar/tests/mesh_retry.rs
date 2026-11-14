@@ -1227,7 +1227,7 @@ async fn rty_14_a_body_that_outgrows_the_buffer_during_the_pause_is_not_cut() {
 }
 
 #[tokio::test]
-async fn rty_30_a_post_refused_by_a_callee_app_is_retried_on_another_pod() {
+async fn rty_37_a_post_refused_by_a_callee_app_is_retried_on_another_pod() {
     let _logs = capture_logs();
     for h2 in [false, true] {
         let refusing = Probe::start("r", h2, Mode::AppRefused(Some("inbound; pod=cart-r"))).await;
@@ -1269,7 +1269,7 @@ async fn rty_30_a_post_refused_by_a_callee_app_is_retried_on_another_pod() {
 }
 
 #[tokio::test]
-async fn rty_30_every_pod_refusing_passes_the_last_answer_after_four_tries() {
+async fn rty_37_every_pod_refusing_passes_the_last_answer_after_four_tries() {
     let _logs = capture_logs();
     let pods = [
         Probe::start("a", false, Mode::AppRefused(Some("inbound"))).await,
@@ -1291,7 +1291,7 @@ async fn rty_30_every_pod_refusing_passes_the_last_answer_after_four_tries() {
 }
 
 #[tokio::test]
-async fn rty_30_a_connect_failed_without_a_valid_origin_is_passed_as_received() {
+async fn rty_37_a_connect_failed_without_a_valid_origin_is_passed_as_received() {
     let _logs = capture_logs();
     for origin in [None, Some("outbound"), Some("inbound; pod=A")] {
         let pod = Probe::start("a", false, Mode::AppRefused(origin)).await;

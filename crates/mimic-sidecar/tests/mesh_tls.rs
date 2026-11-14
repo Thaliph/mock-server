@@ -664,7 +664,7 @@ async fn rty_17_a_refusal_over_intercepted_tls_is_not_trusted() {
 }
 
 #[tokio::test]
-async fn rty_30_an_app_refusal_over_intercepted_tls_is_not_trusted() {
+async fn rty_37_an_app_refusal_over_intercepted_tls_is_not_trusted() {
     let _logs = capture_logs();
     let (good_ca, good_root) = authority("good");
     let refuser = tls_pod("apprefuser", &good_ca, names(&[NAME]), &[]).await;

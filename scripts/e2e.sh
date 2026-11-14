@@ -87,8 +87,8 @@ cleanup() {
   if [[ -n ${RTY_21_CLEANUP:-} ]]; then
     kubectl delete namespace rty-21 --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
-  if [[ -n ${RTY_32_CLEANUP:-} ]]; then
-    kubectl delete namespace rty-32 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  if [[ -n ${RTY_39_CLEANUP:-} ]]; then
+    kubectl delete namespace rty-39 --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
   if [[ -n ${RTY_22_CLEANUP:-} ]]; then
     kubectl delete namespace rty-22 --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -4719,19 +4719,19 @@ kubectl delete namespace rty-21 --wait=false >/dev/null
 RTY_21_CLEANUP=
 echo "rty_21: 300 GET and POST were all answered 200 (error rate 0 %), the refusing pod answered none, ${rty_21_retried%.*} connect_failed retries were counted"
 
-# RTY-32 (#518): the full chain. A Service of 3 injected pods, one whose app listens on 9090 while the Service sends to 8080
+# RTY-39 (#518): the full chain. A Service of 3 injected pods, one whose app listens on 9090 while the Service sends to 8080
 # (its readiness is a tcpSocket probe on 9090, so it is Ready). Its inbound sidecar answers 503 connect-failed with
 # x-mimic-origin; the injected client's sidecar retries every request on another pod: 300 GET and POST, all 200, the
 # client's sidecar counts an app_refused retry and the refusing pod's sidecar an inbound refusal.
-log "rty_32: one of three injected pods whose app refuses the connection, 300 GET and POST all answered 200"
-RTY_32_CLEANUP=1
-ns_fresh rty-32 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+log "rty_39: one of three injected pods whose app refuses the connection, 300 GET and POST all answered 200"
+RTY_39_CLEANUP=1
+ns_fresh rty-39 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
 sed 's/("", 8080)/("", int(__import__("os").environ.get("APP_PORT", "8080")))/' "$WORK/rty21-pod.py" > "$WORK/rty32-pod.py"
-kubectl -n rty-32 create configmap pod --from-file=pod.py="$WORK/rty32-pod.py" >/dev/null
+kubectl -n rty-39 create configmap pod --from-file=pod.py="$WORK/rty32-pod.py" >/dev/null
 kubectl apply -f - >/dev/null <<YAML
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: pods, namespace: rty-32}
+metadata: {name: pods, namespace: rty-39}
 spec:
   replicas: 2
   selector: {matchLabels: {app: pods}}
@@ -4749,7 +4749,7 @@ spec:
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: refusing, namespace: rty-32}
+metadata: {name: refusing, namespace: rty-39}
 spec:
   replicas: 1
   selector: {matchLabels: {app: refusing}}
@@ -4768,14 +4768,14 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: pods, namespace: rty-32}
+metadata: {name: pods, namespace: rty-39}
 spec:
   selector: {svc: pods}
   ports: [{name: http, port: 80, targetPort: http}]
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: client, namespace: rty-32}
+metadata: {name: client, namespace: rty-39}
 spec:
   replicas: 1
   selector: {matchLabels: {app: client}}
@@ -4788,32 +4788,32 @@ spec:
           command: [python3, -c, "import time; time.sleep(86400)"]
 YAML
 for d in pods refusing client; do
-  kubectl -n rty-32 rollout status deploy/$d --timeout=3m >/dev/null || fail "rty_32: $d did not roll out Ready"
+  kubectl -n rty-39 rollout status deploy/$d --timeout=3m >/dev/null || fail "rty_39: $d did not roll out Ready"
 done
-rty_32_client=$(kubectl -n rty-32 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
-rty_32_refusing=$(kubectl -n rty-32 get pods -l app=refusing -o jsonpath='{.items[0].metadata.name}')
-rty_32_view() { [[ $(rty_metric rty-32 "$rty_32_client" mimic_mesh_view_endpoints) == 3 ]]; }
-for _ in $(seq 60); do rty_32_view && break; sleep 1; done
-rty_32_view || fail "rty_32: the sidecar of client never held a view with the 3 endpoints of pods"
+rty_39_client=$(kubectl -n rty-39 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+rty_39_refusing=$(kubectl -n rty-39 get pods -l app=refusing -o jsonpath='{.items[0].metadata.name}')
+rty_39_view() { [[ $(rty_metric rty-39 "$rty_39_client" mimic_mesh_view_endpoints) == 3 ]]; }
+for _ in $(seq 60); do rty_39_view && break; sleep 1; done
+rty_39_view || fail "rty_39: the sidecar of client never held a view with the 3 endpoints of pods"
 # Slow start (default 30 s, spec §7.9): the spread is checked once every endpoint is past the window.
 sleep 31
-sed 's/pods\.rty-21\.svc/pods.rty-32.svc/' "$WORK/rty21-client.py" > "$WORK/rty32-client.py"
-kubectl -n rty-32 exec -i "$rty_32_client" -c app -- python3 -c 'import sys; open("/tmp/client.py", "w").write(sys.stdin.read())' \
-  < "$WORK/rty32-client.py" || fail "rty_32: cannot copy the client script"
-rty_32_out=$(kubectl -n rty-32 exec "$rty_32_client" -c app -- python3 /tmp/client.py) || fail "rty_32: the client script failed"
-rty_32_errors=$(awk '$1 == "errors" { print $2 }' <<<"$rty_32_out")
-[[ $rty_32_errors == 0 ]] || fail "rty_32: $rty_32_errors of 300 requests were not answered 200"
-rty_32_answered=$(awk '$1 == "pod" { n += $3 } END { print n + 0 }' <<<"$rty_32_out")
-(( rty_32_answered == 300 )) || fail "rty_32: $rty_32_answered of 300 requests were answered"
-rty_32_by_refusing=$(awk -v p="$rty_32_refusing" '$1 == "pod" && $2 == p { n += $3 } END { print n + 0 }' <<<"$rty_32_out")
-(( rty_32_by_refusing == 0 )) || fail "rty_32: the pod whose app refuses answered $rty_32_by_refusing requests"
-rty_32_retried=$(rty_metric_sum rty-32 "$rty_32_client" mimic_mesh_retries_total 'reason="app_refused"')
-(( ${rty_32_retried%.*} >= 1 )) || fail "rty_32: the sidecar of client counted no app_refused retry"
-rty_32_refused=$(rty_metric_sum rty-32 "$rty_32_refusing" mimic_mesh_inbound_refusals_total)
-(( ${rty_32_refused%.*} >= 1 )) || fail "rty_32: the sidecar of the refusing pod counted no inbound refusal"
-kubectl delete namespace rty-32 --wait=false >/dev/null
-RTY_32_CLEANUP=
-echo "rty_32: 300 GET and POST were all answered 200, ${rty_32_retried%.*} app_refused retries and ${rty_32_refused%.*} inbound refusals were counted"
+sed 's/pods\.rty-21\.svc/pods.rty-39.svc/' "$WORK/rty21-client.py" > "$WORK/rty32-client.py"
+kubectl -n rty-39 exec -i "$rty_39_client" -c app -- python3 -c 'import sys; open("/tmp/client.py", "w").write(sys.stdin.read())' \
+  < "$WORK/rty32-client.py" || fail "rty_39: cannot copy the client script"
+rty_39_out=$(kubectl -n rty-39 exec "$rty_39_client" -c app -- python3 /tmp/client.py) || fail "rty_39: the client script failed"
+rty_39_errors=$(awk '$1 == "errors" { print $2 }' <<<"$rty_39_out")
+[[ $rty_39_errors == 0 ]] || fail "rty_39: $rty_39_errors of 300 requests were not answered 200"
+rty_39_answered=$(awk '$1 == "pod" { n += $3 } END { print n + 0 }' <<<"$rty_39_out")
+(( rty_39_answered == 300 )) || fail "rty_39: $rty_39_answered of 300 requests were answered"
+rty_39_by_refusing=$(awk -v p="$rty_39_refusing" '$1 == "pod" && $2 == p { n += $3 } END { print n + 0 }' <<<"$rty_39_out")
+(( rty_39_by_refusing == 0 )) || fail "rty_39: the pod whose app refuses answered $rty_39_by_refusing requests"
+rty_39_retried=$(rty_metric_sum rty-39 "$rty_39_client" mimic_mesh_retries_total 'reason="app_refused"')
+(( ${rty_39_retried%.*} >= 1 )) || fail "rty_39: the sidecar of client counted no app_refused retry"
+rty_39_refused=$(rty_metric_sum rty-39 "$rty_39_refusing" mimic_mesh_inbound_refusals_total)
+(( ${rty_39_refused%.*} >= 1 )) || fail "rty_39: the sidecar of the refusing pod counted no inbound refusal"
+kubectl delete namespace rty-39 --wait=false >/dev/null
+RTY_39_CLEANUP=
+echo "rty_39: 300 GET and POST were all answered 200, ${rty_39_retried%.*} app_refused retries and ${rty_39_refused%.*} inbound refusals were counted"
 
 # RTY-22: tiers A -> B -> C. c-mesh and c-off (2 pods each, not injected) answer 503 x-mimic-error: overloaded with
 # x-mimic-endpoint set to their own <pod IP>:8080, and count their requests. b-mesh (injected) forwards to c-mesh and b-off

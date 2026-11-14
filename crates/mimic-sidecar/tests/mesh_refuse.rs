@@ -1,4 +1,4 @@
-//! RTY-27 to RTY-29: the inbound side of a meshed sidecar answers `503` `connect-failed` when
+//! RTY-34 to RTY-36: the inbound side of a meshed sidecar answers `503` `connect-failed` when
 //! its app refuses the connection (spec §4.1 "Refused app connections"); everything else keeps
 //! the reset. An inbound sidecar in process in front of a closed port.
 
@@ -87,7 +87,7 @@ fn want_head(dst: SocketAddr, origin: &str) -> String {
 }
 
 #[tokio::test]
-async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_http1() {
+async fn rty_34_a_closed_app_is_answered_503_connect_failed_on_http1() {
     let _logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("cart-7d9f-x2k"));
@@ -129,7 +129,7 @@ async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_http1() {
 }
 
 #[tokio::test]
-async fn rty_27_an_ipv6_pod_address_is_written_in_brackets() {
+async fn rty_34_an_ipv6_pod_address_is_written_in_brackets() {
     let _logs = capture_logs();
     let Ok(socket) = tokio::net::TcpSocket::new_v6() else {
         return;
@@ -192,7 +192,7 @@ async fn h2_streams(addr: SocketAddr, n: usize) -> Vec<(u16, Vec<(String, String
 }
 
 #[tokio::test]
-async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_h2c_then_goaway() {
+async fn rty_34_a_closed_app_is_answered_503_connect_failed_on_h2c_then_goaway() {
     let _logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("cart-1"));
@@ -227,7 +227,7 @@ async fn rty_27_a_closed_app_is_answered_503_connect_failed_on_h2c_then_goaway()
 }
 
 #[tokio::test]
-async fn rty_27_when_the_app_is_back_the_next_connection_is_relayed() {
+async fn rty_34_when_the_app_is_back_the_next_connection_is_relayed() {
     let _logs = capture_logs();
     let live = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let up = live.local_addr().unwrap();
@@ -268,7 +268,7 @@ async fn rty_27_when_the_app_is_back_the_next_connection_is_relayed() {
 }
 
 #[tokio::test]
-async fn rty_27_a_load_request_is_answered_the_same_way() {
+async fn rty_34_a_load_request_is_answered_the_same_way() {
     let _logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("p"));
@@ -285,7 +285,7 @@ async fn rty_27_a_load_request_is_answered_the_same_way() {
 }
 
 #[tokio::test]
-async fn rty_28_without_the_mesh_the_connection_is_closed_without_a_byte() {
+async fn rty_35_without_the_mesh_the_connection_is_closed_without_a_byte() {
     let _logs = capture_logs();
     let app = closed_port().await;
     let off = MeshState::new(&MeshConfig {
@@ -306,7 +306,7 @@ async fn rty_28_without_the_mesh_the_connection_is_closed_without_a_byte() {
 }
 
 #[tokio::test]
-async fn rty_28_what_the_sidecar_cannot_speak_to_is_closed_without_a_byte() {
+async fn rty_35_what_the_sidecar_cannot_speak_to_is_closed_without_a_byte() {
     let _logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("p"));
@@ -326,7 +326,7 @@ async fn rty_28_what_the_sidecar_cannot_speak_to_is_closed_without_a_byte() {
 }
 
 #[tokio::test]
-async fn rty_29_each_refused_connection_is_counted_and_logged_once() {
+async fn rty_36_each_refused_connection_is_counted_and_logged_once() {
     let logs = capture_logs();
     let app = closed_port().await;
     let state = meshed(Some("p"));
@@ -375,7 +375,7 @@ fn state_label_free(scrape: &str) -> bool {
 }
 
 #[tokio::test]
-async fn rty_28_an_app_that_forges_the_answer_is_stripped() {
+async fn rty_35_an_app_that_forges_the_answer_is_stripped() {
     let _logs = capture_logs();
     let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = app.local_addr().unwrap();

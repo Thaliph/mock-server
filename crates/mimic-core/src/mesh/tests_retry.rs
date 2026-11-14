@@ -455,7 +455,7 @@ fn app_fields<'a>(origins: &'a [&'a str], endpoints: &'a [&'a str]) -> Vec<(&'a 
 }
 
 #[test]
-fn rty_26_a_connect_failed_with_a_valid_origin_bound_to_the_pod_is_trusted() {
+fn rty_33_a_connect_failed_with_a_valid_origin_bound_to_the_pod_is_trusted() {
     let pod = Some(addr(1));
     for origin in [
         "inbound",
@@ -476,7 +476,7 @@ fn rty_26_a_connect_failed_with_a_valid_origin_bound_to_the_pod_is_trusted() {
 }
 
 #[test]
-fn rty_26_a_connect_failed_without_a_valid_origin_is_not_trusted() {
+fn rty_33_a_connect_failed_without_a_valid_origin_is_not_trusted() {
     let pod = Some(addr(1));
     let long = format!("inbound; pod={}", "a".repeat(254));
     for origin in [
@@ -521,7 +521,7 @@ fn rty_26_a_connect_failed_without_a_valid_origin_is_not_trusted() {
 }
 
 #[test]
-fn rty_26_the_origin_does_not_change_overloaded_and_queue_timeout() {
+fn rty_33_the_origin_does_not_change_overloaded_and_queue_timeout() {
     let pod = Some(addr(1));
     for origin in ["inbound", "outbound", "x", "inbound; pod=A"] {
         let mut f = fields(&["overloaded"], &["10.0.0.1:8080"]);
@@ -531,7 +531,7 @@ fn rty_26_the_origin_does_not_change_overloaded_and_queue_timeout() {
 }
 
 #[test]
-fn rty_26_an_app_refusal_is_retried_for_every_method_at_once() {
+fn rty_33_an_app_refusal_is_retried_for_every_method_at_once() {
     for method in METHODS.iter().chain(["get"].iter()) {
         let v = classify(Failure::Refusal(Refusal::AppRefused), method, true, true);
         assert!(v.retry && v.skip.is_none(), "{method}");
@@ -544,7 +544,7 @@ fn rty_26_an_app_refusal_is_retried_for_every_method_at_once() {
 }
 
 #[test]
-fn rty_26_after_app_refusals_the_planner_never_ends_on_the_original_destination() {
+fn rty_33_after_app_refusals_the_planner_never_ends_on_the_original_destination() {
     let set = endpoints(2);
     let mut planner = Planner::new(3);
     let mut draw = |n: usize| n / 2;
