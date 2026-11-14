@@ -238,6 +238,19 @@ would see without mimic, except for the limits listed at the end of this section
   as `mimic-load-run : t`, `obs-fold`), a head not complete after 30 s without a byte (the
   detection stall above), and a head cut by the client's close. A request without the header
   is relayed as always.
+- **Mimic fields of app responses (M2, #445, inbound only).** With `MIMIC_MESH=on`, unless the
+  view held says `"mesh": false`, the inbound side removes every field whose name starts with
+  `x-mimic-` (ASCII case-insensitive) from the **final** response heads of its app, so that only
+  a sidecar ever writes them (§7.9 "Retries"); this also holds before the first view. HTTP/1: the
+  relay holds each final response head until it is whole (at most 64 KiB; `1xx` heads are not
+  held), then writes it unchanged when it has no such field, or without those lines, every other
+  byte (case, order, line endings, `obs-fold` of other fields) unchanged; the body, framing and
+  connection management are untouched. On a load request (above) this happens before
+  `x-mimic-load: ok` is added. HTTP/2: the fields are removed from the response headers `hyper`
+  forwards (trailers are not touched). Each field removed counts in
+  `mimic_mesh_stripped_headers_total`; nothing is logged of it. With `MIMIC_MESH=off` or a view of
+  `"mesh": false` the relay is byte-exact as above. A head the codec cannot frame (unframed,
+  over 64 KiB) and inbound TLS are relayed unchanged (§11.1).
 - **Upgrades**: a request answered with `101` (WebSocket, `h2c` upgrade), or a `CONNECT`
   answered with 2xx, continues as an opaque tunnel after the response. After a request that
   asks for an upgrade or is a `CONNECT`, the relay reads no more client bytes until the final
@@ -313,6 +326,7 @@ would see without mimic, except for the limits listed at the end of this section
   | `grpc_status` | HTTP/2 only: from the trailers, when present | — |
   | `upgrade` | `true` when the exchange became a tunnel | — |
   | `backend`, `upstream` | (M1) mesh-routed requests only (§7.9): `<namespace>/<name>:<port>` of the Service port and the pod `ip:port` the request went to | (M1) L4-balanced connections only (§7.9): the same two fields |
+  | `attempts` | (M2) mesh-routed requests only: the number of tries (§7.9 "Retries"), 1 without a retry | (M2) L4-balanced connections only: the number of connects tried |
   | `tls` | `true` when the exchange was decrypted by interception (§5) | — |
   | `interception` | — | outbound TLS only: the §5 decision other than `intercepted` (an intercepted connection writes exchange lines instead) |
   | `result` | `ok`, `upstream_reset`, `client_abort`, `unframed` (HTTP/1 the codec cannot frame), `rejected` (HTTP/2 connection error), `shutdown` (closed at the end of the grace) | `ok`, `upstream_reset`, `client_abort`, `shutdown`, (F10) `mock_closed` (§8) |
@@ -424,6 +438,10 @@ Accepted limits of the proxy:
   The mesh adds answers of its own: `503` `x-mimic-error: no-endpoint` (the Service port has
   no endpoint) and `503` `x-mimic-error: connect-failed`, `502` `x-mimic-error:
   invalid-response`, all with `content-length: 0`. They are not recorded by discovery.
+  From M2 a mesh-routed request whose failure came before the app could process it is tried
+  again on another pod (§7.9 "Retries"): an app sees no difference, a pod can see a request
+  another pod refused, and an idempotent request that a pod read and then dropped without an
+  answer can reach a second pod.
 
 ## 5. TLS interception
 
@@ -2601,12 +2619,13 @@ no insignificant whitespace):
   at once; its requests in flight finish, its idle connections close and its pool is dropped.
   Connecting to a pod has the `MIMIC_MESH_CONNECT_TIMEOUT` (2 s unless set) and the socket
   options of §4.1; connecting to the original destination has the 10 s of the relay. When
-  connecting to the chosen pod fails (nothing was written), the sidecar tries one other endpoint if the
-  backend has one, and then the **original destination** (the ClusterIP, pooled like a pod, so
-  kube-proxy chooses as it does without the mesh); that last try is counted in
-  `mimic_mesh_fallbacks_total` and its access line has `upstream` the ClusterIP. Only when that
-  fails too is the request answered `503` with `x-mimic-error: connect-failed` and
-  `content-length: 0` (no further retry: #445). A pod whose connect failed is **avoided**: for
+  connecting to the chosen pod fails (nothing was written), the request is tried again as
+  "Retries" below says (M2, #445): on pods not tried yet, and, when every try so far failed to
+  connect and no untried pod is left or the last try has come, on the **original destination**
+  (the ClusterIP, pooled like a pod, so kube-proxy chooses as it does without the mesh); that try
+  is counted in `mimic_mesh_fallbacks_total` and its access line has `upstream` the ClusterIP.
+  Only when that fails too is the request answered `503` with `x-mimic-error: connect-failed`
+  and `content-length: 0`. (Up to M1: one other pod, then the ClusterIP.) A pod whose connect failed is **avoided**: for
   5 s the choice counts it as if it had a million requests in flight, so
   it is picked only when no other endpoint can be (a Service with one endpoint still tries it
   first, then the ClusterIP), and a connect to it that succeeds ends the avoidance at once; after
@@ -2620,7 +2639,8 @@ no insignificant whitespace):
   `:authority` it sent, never the pod's address), the `dst` of the access line stays the
   original destination, and the line gains `backend` (`<namespace>/<name>:<port>` of the
   Service port) and `upstream` (`<pod IP>:<port>`), absent on lines of relayed connections. No
-  header is added to a request or a response. The **mode applies per request** on a
+  header is added to a request or a response (from M2 the inbound side removes the `x-mimic-*`
+  fields of its app's responses, §4.1). The **mode applies per request** on a
   mesh-routed connection, as it does on the byte relay (§8 "Switching"): while it is `mock`, each
   request is answered by the mock exactly as on the byte relay (same matching, recording of
   misses, `mimic_mock_*` metrics, nothing sent to a pod or the ClusterIP; a passthrough
@@ -2632,10 +2652,11 @@ no insignificant whitespace):
   connection on the byte relay stays on it).
   A request whose pooled connection the pod had closed before the request was written (nothing
   was sent) is sent once more on a new connection to the
-  same pod, whatever its method, and counted in `mimic_mesh_reconnects_total`; it is not a retry
-  policy (#445). When that new connection cannot be made either, nothing was written yet, so the
-  request goes to the original destination as after a first connect failure (counted as a
-  fallback; `503` `connect-failed` only when that fails too); an HTTP/2 stream sent again never
+  same pod, whatever its method, and counted in `mimic_mesh_reconnects_total`; it is part of the
+  same try, not a retry (it is not counted again in `mimic_mesh_attempts_total`). When that new
+  connection cannot be made either, nothing was written yet: the try ends as a connect failure
+  and "Retries" below goes on (another pod, the original destination when the rule there says
+  so; `503` `connect-failed` only when the tries are used up); an HTTP/2 stream sent again never
   takes the connection that failed, also when the pod is at its 16 connections.
   On a mesh-routed HTTP/1 connection a later request with `Upgrade` or `CONNECT` leaves
   `hyper` (§4.1 limit 8): a pod is chosen for it like for any request, the head is written as
@@ -2656,10 +2677,11 @@ no insignificant whitespace):
   `<pod IP>:<target port>` and relays the bytes untouched, in both directions, as the byte relay
   does (§4.1: TLS ClientHello, SNI and server certificate are the client's and the pod's own,
   nothing is re-originated). A connect failure (nothing was sent: the bytes read are held) is
-  retried on one other endpoint, then on the original destination (counted in
-  `mimic_mesh_fallbacks_total`); when that fails too the connection is closed without a byte, as
-  the byte relay does. The access line of the connection gains `backend` and `upstream`
-  (§4.1). A stale view, `"mesh": false` and an opaque port are the byte relay as above. TLS that
+  retried as "Retries" below says for connect failures (pods not tried yet, then the original
+  destination, counted in `mimic_mesh_fallbacks_total`; at most `1 + retries` connects); when
+  every try failed the connection is closed without a byte, as the byte relay does. Nothing else
+  is retried on an L4 connection: once a byte was sent to a pod, a close or reset is relayed. The
+  access line of the connection gains `backend`, `upstream` and `attempts` (§4.1). A stale view, `"mesh": false` and an opaque port are the byte relay as above. TLS that
   §5 passes through (every ClientHello in `none`) is balanced this way; TLS that §5 intercepts
   is not (next paragraph).
   **Intercepted TLS** (#443 step 3). A connection to an in-scope Service whose ClientHello §5
@@ -2671,8 +2693,9 @@ no insignificant whitespace):
   name, never the pod IP**, against the trust roots of §5 for intercepted destinations.
   Hostname verification is always on: no option, variable or fallback turns it off, and a pod
   whose certificate does not verify is never spoken to in cleartext. A verification failure (or
-  any failed handshake) is a connect failure on that pod: it is avoided, one other pod is tried,
-  then the original destination (verified the same way, counted as a fallback); when every try
+  any failed handshake) is a connect failure on that pod: it is avoided and the request is tried
+  again as "Retries" below says, the original destination included (verified the same way,
+  counted as a fallback); when every try
   failed the request is answered `503` `x-mimic-error: connect-failed` inside the app's TLS
   session, and the warn line `tls verification failed` carries `upstream` and `tls_error` (the
   verification error, no certificate content). The pool of a pod is per (pod IP, port,
@@ -2692,11 +2715,77 @@ no insignificant whitespace):
   same way. Access lines and exchanges are those of §4.1 (`tls: true`, `sni`, `backend`,
   `upstream`). A client that rejects the leaf is remembered as in §5 and its next connection is
   balanced per connection, untouched.
+  **Retries** (M2, #445; design §7). A mesh-routed request is tried again **only when its
+  failure happened before the app could process it**: a response of an app (any status, `5xx`
+  included) is never retried. The classification and the choice of the next try are `mimic-core`
+  `mesh::retry` (pure: the random draws are passed in, no clock):
+
+  | Failure of one try | Retried | `result` of the try, `reason` of the retry |
+  |---|---|---|
+  | Connect refused, connect timeout, failed TLS handshake or verification, a ninth TLS pool of a pod: nothing was written | every method | `connect_failed` |
+  | HTTP/2 `RST_STREAM` with `REFUSED_STREAM`, or a `GOAWAY` whose last-stream-id is below the stream | every method | `refused_stream` |
+  | A **trusted refusal**: status `503`, exactly one `x-mimic-error` field, `overloaded` or `queue-timeout`, and exactly one `x-mimic-endpoint` field whose value parses as `<ipv4>:<port>` or `[<ipv6>]:<port>` and equals the pod address of this try | every method | `overloaded`, `queue_timeout` |
+  | The connection closed or reset, or the stream reset with another code, after the request was written (in part) and before any byte of a response head | `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE` only (method tokens compared exactly) | `reset` |
+  | Any other response (a `503` that is not a trusted refusal, an `x-mimic-error` of another value, any other status), any failure after the response head | never | `ok` (a response head came back) |
+
+  - **Tries**: at most `1 + retries` per request, `retries` being 3 (the `retries` field of the
+    sidecar's `MeshConfig`, not an environment variable; `MimicConfig` sets it from #446), so at
+    most 4 tries. A reconnect of an unwritten request (above) is part of its try.
+  - **Where**: each retry goes to a pod **not tried yet** for this request, chosen by the P2C
+    above among those (avoidance applies); when every endpoint was tried, P2C over all of them.
+    When every try so far failed to connect and either no untried endpoint is left or the next
+    try is the last one, that try goes to the **original destination** instead, at most once per
+    request, and it ends the tries (counted in `mimic_mesh_fallbacks_total`). So a Service with one
+    endpoint is tried on it, then on the ClusterIP, as in M1, and a request never reaches more
+    than `1 + retries` destinations.
+  - **Trust needs a pod**: a try on the original destination (a fallback, a stale view, a view
+    that turned `"mesh": false`) has no pod address: none of its answers is a trusted refusal and
+    it is never retried (the request is sent there once, MSH-86).
+  - **When**: connect failures, refused streams and resets are retried at once; a trusted refusal
+    after a delay drawn uniformly between 12.5 and 37.5 ms (25 ms ± 50 %). The body of a refused
+    try is read and discarded up to 64 KiB, the connection then going back to its pool; a longer
+    one closes that connection.
+  - **Bodies**: a request is retried only while every byte of its body read from the app is
+    still held for replay, at most `MIMIC_MESH_RETRY_BUFFER` (64 KiB) per request and
+    `MIMIC_MESH_RETRY_BUFFER_TOTAL` (8 MiB) for all the requests of the sidecar together. A request
+    whose body grows past its share, or that finds the total in use, is streamed: it is still
+    retried after a connect failure (nothing of it was written, nothing was read), never once a
+    byte of it was written (counted `mimic_mesh_retries_skipped_total{reason="buffer"}`). The bytes
+    held are released when a try gets its response head or the request can no longer be retried.
+    A retry sends the same head (method, target, fields with their case, as `hyper` holds them)
+    and the same body bytes.
+  - **Outcome when no try is left**, or when a failure is not retried: connect failures →
+    `503` `x-mimic-error: connect-failed`, `content-length: 0` (an answer of the sidecar, not
+    recorded, MSH-85); a trusted refusal → passed to the app **as received**, its `x-mimic-error`
+    and `x-mimic-endpoint` fields included; a reset → propagated as in M1 (HTTP/1: the app's
+    connection closed without an answer; HTTP/2: the app's stream reset); a refused stream → the
+    app's stream reset with `REFUSED_STREAM`.
+  - **Never retried**: requests answered by the mock (mode `mock`), the `no-endpoint` answer,
+    an `Upgrade` or `CONNECT` once its head was written (§4.1 limit 8; its connect is retried like
+    any), an L4 connection once a byte was sent, and nothing at all on the byte relay.
+  - **Who sets the signal.** `x-mimic-error: overloaded|queue-timeout` with `x-mimic-endpoint`
+    is the refusal of the callee's own sidecar, which writes in `x-mimic-endpoint` the
+    `<pod ip>:<port>` it was reached on (the admission of M5, design §9; no sidecar generates
+    one before M5, so in M2 only a peer outside the mesh sets it). A meshed inbound sidecar removes
+    every `x-mimic-*` field of its app's responses (§4.1 "Mimic fields of app responses"), and
+    the binding to the pod of the try covers peers that do not: an app that forwards a downstream
+    refusal names the downstream pod, never the one its caller sent the try to. So a refusal
+    never makes the callers of a forwarding app retry (design §7, review B1 of #469).
+  - **Observability**: one access line per request, with `upstream` the address of the last
+    try and `attempts` the number of tries; discovery records the final exchange once, and a
+    trusted refusal passed to the app is not recorded (counted
+    `mimic_discovery_exchanges_total{result="synthetic"}` like the answers of the sidecar).
+    `mimic_mesh_requests_total` and `mimic_mesh_request_duration_seconds` stay one per request
+    (the duration spans every try; `reason` is also the value of a trusted refusal passed to the
+    app); `mimic_mesh_endpoint_requests_total` counts each try written to the pod, with the
+    `status_class` of that try (`none` without a response).
   **Configuration**: the time a failed pod is avoided (5 s) is the `avoid_failed_for` field of
-  the sidecar's `MeshConfig`, not an environment variable: no `MIMIC_*` variable sets it.
+  the sidecar's `MeshConfig`, not an environment variable: no `MIMIC_*` variable sets it; nor
+  do `retries` (3) and the refusal delay (25 ms ± 50 %), fields of the same struct.
   **Metrics** (sidecar, only with `MIMIC_MESH=on`; `service` and `backend` are
   `<namespace>/<name>` and `<namespace>/<name>:<port>`; no route exists yet: `route="none"`;
-  `reason` is `none` or the `x-mimic-error` of an answer of the sidecar):
+  `reason` is `none`, the `x-mimic-error` of an answer of the sidecar, or (M2) that of a trusted
+  refusal passed to the app):
 
   | Metric | Type | Labels |
   |---|---|---|
@@ -2706,14 +2795,20 @@ no insignificant whitespace):
   | `mimic_mesh_endpoint_in_flight` | gauge, per pod | `backend`, `endpoint` |
   | `mimic_mesh_reconnects_total` | counter, requests sent again on a new connection because nothing of them was written | `backend` |
   | `mimic_mesh_fallbacks_total` | counter, requests and L4 connections sent to the original destination (the ClusterIP) because the pods could not be connected or the view is stale | `backend` |
+  | `mimic_mesh_attempts_total` | counter (M2), every try of a mesh-routed request or L4 connection, to a pod or to the original destination (a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`; "Retries" above) |
+  | `mimic_mesh_retries_total` | counter (M2), tries after the first | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
+  | `mimic_mesh_retries_skipped_total` | counter (M2), failures of the table's retried kinds that were not retried | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
+  | `mimic_mesh_retry_buffer_bytes` | gauge (M2), request body bytes held for replay, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL` | — |
+  | `mimic_mesh_stripped_headers_total` | counter (M2), `x-mimic-*` fields removed from app responses by the inbound side (§4.1) | — |
 
   At most `MIMIC_METRICS_MAX_ENDPOINTS` distinct endpoints have a label of their own, the next ones
   are `other`; the series of an endpoint that left the view are removed 5 minutes after it left
   (a scrape sees their last values first) and their slots are free again; an endpoint that
   comes back within the 5 minutes keeps its series; likewise the series of a Service port that
   left the view (`mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`,
-  `mimic_mesh_fallbacks_total`, `mimic_mesh_reconnects_total`). No label carries a path, a header or any
-  caller-controlled string.
+  `mimic_mesh_fallbacks_total`, `mimic_mesh_reconnects_total`, and from M2
+  `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`). No
+  label carries a path, a header or any caller-controlled string.
 
 ## 8. Mock
 
@@ -2969,6 +3064,7 @@ random numbers it hands to the draw.
   | `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauge (M1, sidecar), Services and endpoints of the view held, 0 without one | — |
   | `mimic_mesh_unscoped_connections_total` | counter (M1, sidecar), outbound connections whose destination is not a Service port of the view | — |
   | `mimic_mesh_requests_total`, `mimic_mesh_request_duration_seconds`, `mimic_mesh_endpoint_requests_total`, `mimic_mesh_endpoint_in_flight` | (M1, #443, sidecar) mesh-routed requests, in total, their duration, and per pod; labels, bounds and eviction in §7.9 "Load balancing" | `service`, `route`, `backend`, `endpoint`, `status_class`, `reason` |
+  | `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`, `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`, `mimic_mesh_stripped_headers_total` | (M2, #445, sidecar) tries, retries, retryable failures not retried, body bytes held for replay, `x-mimic-*` fields removed from app responses; §7.9 "Retries" and "Metrics" | `backend`, `result`, `reason` |
 
   An intercepted connection is counted in `mimic_proxy_connections_total` and
   `mimic_proxy_bytes_total` under its decrypted protocol (`http1`, `h2`, or `tcp` for an
@@ -3409,6 +3505,8 @@ Set by the webhook; the defaults are the values it sets.
 | `MIMIC_MESH_CONNECT_TIMEOUT` | `2s` | (M1) Time allowed to connect to a pod (§7.9 "Load balancing"), 100ms–10s; the original destination keeps the 10 s of the relay. Not set by the webhook. |
 | `MIMIC_MESH_POOL_IDLE_TIMEOUT` | `90s` | (M1) A pooled connection to a pod idle for this long is closed (§7.9 "Load balancing"), 1s–1h. Not set by the webhook. |
 | `MIMIC_MESH_OPAQUE_PORTS` | `25,587,3306,4444,5432,6379,9300,11211,22,21` | (M1) Ports whose in-scope connections keep the byte relay with no detection wait (§7.9), comma-separated, at most 256 numbers from 1 to 65535, or `none` (an empty value is unset, as for every variable). Not set by the webhook. |
+| `MIMIC_MESH_RETRY_BUFFER` | `64Ki` | (M2) Request body bytes held per request so that it can be retried (§7.9 "Retries"); `<n>`, `<n>Ki`, `<n>Mi`, 0–1Mi (0: a request with a body is retried only after a connect failure). Not set by the webhook. |
+| `MIMIC_MESH_RETRY_BUFFER_TOTAL` | `8Mi` | (M2) Request body bytes held for replay by all requests together (§7.9 "Retries"); same syntax, 1Mi–64Mi. Sized for the 128 Mi sidecar limit: raising it needs a larger `MIMIC_INJECT_SIDECAR_RESOURCES` memory limit. Not set by the webhook. |
 | `MIMIC_METRICS_MAX_ENDPOINTS` | `256` | (M1) Endpoints with a label of their own in the per-pod mesh metrics (§7.9), 1–10000; the next ones are `other`. Not set by the webhook. |
 | `MIMIC_LOAD_ENABLED` | absent | (F11) `1`: the sidecar honours the load marker of inbound requests and answers `GET /load` (§4.1, §7.8). The webhook sets it when `MIMIC_LOAD_MAX_RUNS` is above 0 (chart `loadTest.enabled`); absent otherwise. A pod injected before load testing was enabled keeps its env: it is no target (its `/load` answers 404) until a rollout restarts it. |
 
@@ -4075,6 +4173,29 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   strings: it still never stores or sends a secret, but its mock may compare a value-detected
   placeholder field (lower match tier) and its load plan treats a placeholder that is not in a
   `redacted` field as an ordinary value.
+- (M2) **A pod can make its callers retry requests sent to itself.** An app whose own sidecar
+  does not strip `x-mimic-*` (no sidecar, mesh switched off, a response head the codec cannot
+  frame, inbound TLS) can answer a forged `503` refusal bound to its own address: its callers'
+  sidecars then send that request to its sibling pods, at most `retries` more times, and only
+  requests that were sent to that pod. It gains nothing it could not get by failing its
+  requests; it cannot make a caller retry a request sent to another pod, nor make the callers of
+  a pod that forwards its answers retry (the binding, §7.9 "Retries").
+- (M2) **Idempotent by method name.** A `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` or `DELETE`
+  that a pod read and then dropped without an answer (connection closed or reset, stream reset)
+  is sent to another pod: an app whose such methods have side effects can see one request
+  twice. Up to #446 (retry budget) nothing bounds this per caller but `retries`, so a reset
+  that every tier propagates as a reset can cost `(1 + retries)` tries per tier; refusals and
+  connect failures never reach an app twice, at any depth.
+- (M2) **An injected callee whose app refuses connections looks like a reset.** Its sidecar
+  accepted the connection and closes it without a byte (§4.1 "Failures"), so the caller's
+  sidecar sees the request written and the connection closed: only the methods above are
+  retried, a `POST` gets the close. A callee without sidecar refuses the connect itself and
+  every method is retried.
+- (M2) **No timeout yet.** A try that gets neither an answer nor a close waits as long as the
+  app's own connection does (§4.1); per-try and per-request timeouts come with #449.
+- (M2) **Inbound heads are held when the mesh is on.** The inbound HTTP/1 relay writes a
+  final response head once it is whole (at most 64 KiB) instead of as it is read: timing only,
+  no byte changes but the `x-mimic-*` lines.
 
 ## 12. Delivery plan
 
@@ -4102,6 +4223,7 @@ names contain the criterion ID (`fnd_02_…`).
 | F15 | Explorer UI: tab shell and the Workloads tab linking the mimic custom resources (#465) | (added 2026-11-12) |
 | M0 | Mode `none` (proxy only, nothing recorded), the new default (#439, design `docs/design/mimic-mesh.md` §2) | (added 2026-11-12) |
 | M1 | `MimicConfig` CRD and the pure mesh view (#440, design `docs/design/mimic-mesh.md` §4.2, §6, §16) | (added 2026-11-12) |
+| M2 | Retries of proxy-level failures on another pod (#445, design `docs/design/mimic-mesh.md` §7); the retry budget is #446 | (added 2026-11-14) |
 
 ### 12.1 F0 — Foundations
 
@@ -4858,7 +4980,7 @@ MSH-18 to MSH-30, MSH-80 to MSH-84 and MSH-88 are #441 (the watches, the route, 
 | MSH-56 | **D** (security and performance review). Pool bounds (1024 HTTP/1 connections and 16 HTTP/2 connections per pod, pools dropped with the endpoint, idle timeout); no header added or removed beyond the hop-by-hop ones of RFC 9110 §7.6.1; label cardinality bounded and evicted (MSH-54); nothing of a request in a metric label or a log field besides the existing access-line ones; the byte relay is untouched for everything out of scope (MSH-51); the pick is O(1) (MSH-46). |
 | MSH-57 | **U** (sidecar configuration). Unset, `MIMIC_MESH_OPAQUE_PORTS` is `25, 587, 3306, 4444, 5432, 6379, 9300, 11211, 22, 21`; a list replaces it (spaces around entries allowed), `none` means no port. Exit 2 (FND-01) for `0`, `65536`, a non-number, an empty entry and more than 256 entries. |
 | MSH-58 | **I.** A server that speaks first, behind an in-scope Service port: on an opaque port the client has the banner at once and no pod of the view is used; on another port the banner reaches the client in under 300 ms (not 1 s) through the byte relay to the original destination, the bytes are unchanged both ways, and no pod is used. HTTP on a non-opaque port is balanced as in MSH-48. |
-| MSH-59 | **I.** A pod that closes its connections right after each answer, and one that closes them when idle: 200 sequential requests on one client connection all succeed. A pod that reads a request head and closes without answering: the request is not sent again (the pod sees it once), the client's connection is closed without an answer, `mimic_mesh_requests_total` counts it with `status_class="none"` and `mimic_mesh_reconnects_total` stays 0. A pooled connection that fails before anything is written (driven through a hook that hands out an already closed connection), HTTP/1 and `h2c`: the request is sent once more on a new connection (HTTP/2: not the one that failed) and answered, the pod sees it once, `mimic_mesh_reconnects_total` is 1. |
+| MSH-59 | **I.** A pod that closes its connections right after each answer, and one that closes them when idle: 200 sequential requests on one client connection all succeed. A pod that reads a request head (a `POST`) and closes without answering: the request is not sent again (the pod sees it once), the client's connection is closed without an answer, `mimic_mesh_requests_total` counts it with `status_class="none"` and `mimic_mesh_reconnects_total` stays 0. A pooled connection that fails before anything is written (driven through a hook that hands out an already closed connection), HTTP/1 and `h2c`: the request is sent once more on a new connection (HTTP/2: not the one that failed) and answered, the pod sees it once, `mimic_mesh_reconnects_total` is 1. |
 | MSH-61 | **I.** Fallback: with the only endpoint refusing connections and the ClusterIP answering, every request is answered by the ClusterIP and `mimic_mesh_fallbacks_total` counts them (access line `upstream` the ClusterIP); with two endpoints, one refusing, every request is answered by the other and no fallback is counted; with the ClusterIP refusing too the answer is `503` `connect-failed`. With a view older than `MIMIC_MESH_STALE_AFTER` (200 ms in the test) a new connection and the next request of an open mesh-routed connection are answered by the ClusterIP and no pod of the view is used. |
 | MSH-62 | **I** (in process, the mode flipped as a pull does, `ModeState::observe`). On a mesh-routed connection, HTTP/1 keep-alive and `h2c`, started in `discovery`: a request is balanced to a pod; after the switch to `mock` the next request on the same connection is answered by the mock (`x-mimic-match`, `mimic_mock_requests_total` counts it, no pod and no ClusterIP connection sees it); after the switch back to `discovery` the next request of the same connection is balanced again (the pod got 2 of the 3 requests, one connection to it). A connection to a passthrough destination is never mocked. A request after the view became `"mesh": false` goes to the ClusterIP. |
 | MSH-60 | **I.** After one ordinary request on a mesh-routed HTTP/1 connection, a request with `Upgrade: websocket` goes to a pod of the view; the pod's `101` reaches the client with its headers, bytes then flow both ways untouched (an echo), the access line says `upgrade: true`, closing the client closes the pod's connection, and the pod's connection is not reused. The same for `CONNECT` answered `200`. A pod that declines the upgrade (`200`) leaves a plain keep-alive connection. An HTTP/2 `CONNECT` is answered `501`. |
@@ -4868,7 +4990,7 @@ MSH-18 to MSH-30, MSH-80 to MSH-84 and MSH-88 are #441 (the watches, the route, 
 | MSH-66 | **F** (fuzz target `mesh_head`, in the discovery fuzz job). The head reader on arbitrary bytes, cut into arbitrary reads, never panics; the bytes it passes on are a prefix of the input, and with the bytes it holds back at a refusal or an upgrade they are the whole input read so far, whatever the cuts; the verdict (passed bytes, refusal or upgrade) is the same for every way of cutting the input; a refused head is never among the bytes passed on. `scripts/ci_plan.py` gates the job on `mimic-core` `mesh` as for `mesh`. |
 | MSH-67 | **I** (differential corpus). The same requests sent through the byte relay (destination outside the view) and through the mesh (a pod of the view), a raw server recording the bytes: for each corpus entry the relay's bytes equal the request, and the mesh's equal the request except exactly the difference §4.1 lists for it (none for a plain `GET`, a `POST` with `Content-Length`, a `chunked` body without extensions, header case and repeated fields of one name; `Connection`, `Keep-Alive` and the fields `Connection` names removed; chunk extensions dropped; `Content-Length` dropped when `Transfer-Encoding: chunked` came with it; a refused head not sent at all and answered `400` `invalid-request`; an `Upgrade` head sent unchanged). |
 | MSH-68 | **I.** A pod that accepts no connection and does not refuse (accept queue full) with `MIMIC_MESH_CONNECT_TIMEOUT` 300 ms among two pods: the first request that picks it is answered by the other after about 300 ms, and 30 requests after it take less than 2 s in all (the pod is avoided: it is not picked again before 5 s, set shorter in the test, have passed); once the pod accepts again (and the avoidance has ended) it gets requests again within 20 requests; a Service with only that pod is answered by the original destination after the connect timeout (not 10 s) and `mimic_mesh_fallbacks_total` counts it; the avoidance of a pod ends at once when a connect to it succeeds. The same for an L4 connection. |
-| MSH-69 | **I.** An unwritten request whose new connection to the pod fails (pod gone between the two connects, driven through the hook of MSH-59) goes to the original destination and is counted as a fallback and a reconnect, HTTP/1 and `h2c`; with the original destination refusing too the answer is `503` `connect-failed`. **U** (pool): at the HTTP/2 bound of 16 connections a stream sent again never takes the connection that failed, whichever is the least busy. An HTTP/2 `CONNECT` is counted in `mimic_mesh_requests_total` (`status_class="5xx"`, `reason="unsupported"`) and writes an access line with `status` 501. |
+| MSH-69 | **I.** An unwritten request whose new connection to the only pod of the Service fails (pod gone between the two connects, driven through the hook of MSH-59) goes to the original destination (with more pods, another pod first: RTY-15) and is counted as a fallback and a reconnect, HTTP/1 and `h2c`; with the original destination refusing too the answer is `503` `connect-failed`. **U** (pool): at the HTTP/2 bound of 16 connections a stream sent again never takes the connection that failed, whichever is the least busy. An HTTP/2 `CONNECT` is counted in `mimic_mesh_requests_total` (`status_class="5xx"`, `reason="unsupported"`) and writes an access line with `status` 501. |
 | MSH-70 | **E** (kind, `scripts/e2e.sh` section `msh_70`, objects of that section only). A TCP echo Service of 3 replicas (each replica counts the connections it accepts, in its answer to a `count` command) and a client pod of the section in the view: after the slow-start window, 300 connections one after the other, each echoing a line, reach each replica 100 ± 40 times by the replicas' own counters, the access lines of the client's sidecar (`connection`) carry `backend` and `upstream` naming the replicas' pod IPs, and `mimic_mesh_fallbacks_total` stays 0. |
 | MSH-71 | **U** (sidecar configuration). Unset, `MIMIC_MESH_CONNECT_TIMEOUT` is 2 s; exit 2 (FND-01) below 100ms and over 10s. |
 
@@ -4919,6 +5041,46 @@ Generated answers (`no-endpoint`, `connect-failed`, `invalid-response`, `unsuppo
 | MSH-85 | **I** (sidecar, discovery on). A Service port with no endpoint is answered `503` `x-mimic-error: no-endpoint` `content-length: 0` at once, the ClusterIP receives nothing (no fallback, `mimic_mesh_fallbacks_total` 0), `GET /discovery` records nothing for it and `mimic_discovery_exchanges_total{direction="outbound",result="synthetic"}` counts it (a `connect-failed` answer too); a port whose endpoints are all serving and terminating (`ready: false`) is balanced over them and answered by a pod. |
 | MSH-86 | **I.** Stale view and recovery: with a view older than `MIMIC_MESH_STALE_AFTER` (200 ms) requests go to the ClusterIP and not once to a pod of the view, even when the ClusterIP refuses (the answer is then `503` `connect-failed`, never a pod); one WARN `mesh view stale` is written however many requests and ticks follow; a request on the ClusterIP is sent exactly once (no retry); when a view is applied again the next requests, on the same connection, go to the pods, `mimic_mesh_view_age_seconds` is back to 0 and a later staleness writes the WARN again. |
 | MSH-87 | **E** (kind, `scripts/e2e.sh` section `msh_87`, own namespaces, cleaned by a trap). Both controller replicas scaled to 0: a client calling a 3-pod Service by name through its sidecar keeps getting `200` for 20 s (no error), then the controller is restored and the sidecar pulls again. A rolling restart of the callee under a steady client (10 requests/s): the errors seen during the rollout are counted and printed (`msh_87: rollout errors N of M`, the M2 baseline, never a failure by themselves); the client sees none in the 10 s after the rollout ended. |
+
+### 12.22 M2 — Retries of proxy-level failures on another pod (#445)
+
+Design: `docs/design/mimic-mesh.md` §7, §10, §14, §15; review B1 of #469. Spec text: §4.1 ("Mimic
+fields of app responses", access lines, mesh-routed HTTP), §7.9 ("Retries", the connect, reconnect,
+L4 and intercepted TLS paragraphs, "Metrics"), §9, §10.3, §11.1. Levels as in §12.2, plus **F**
+(fuzz target, in the discovery fuzz job), **D** (review), **M** (main session, recorded on the
+issue). Out of scope: the retry budget and `MimicConfig.retries` (#446), timeouts (#449). In the
+**I** tests the sidecar runs in process with a view of fake pods on local listeners and the
+original destination faked to the ClusterIP, as in §12.21; a **refusing** pod is one that answers
+`503` `x-mimic-error: overloaded` with `x-mimic-endpoint` its own `ip:port` (no sidecar produces
+it before M5).
+
+| ID | Criterion |
+|---|---|
+| RTY-01 | **U** (`mimic-core` `mesh::retry`). The classification of §7.9 "Retries", exhaustively over failure kind × method (the six idempotent ones, `POST`, `PATCH`, `CONNECT`, an extension method, `get` in lower case) × body held or not × something written or not: connect failures and refused streams (`REFUSED_STREAM`, `GOAWAY` below the stream) are retried for every method; a trusted refusal for every method; a close or reset before the response head after a write only for `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT`, `DELETE` (`get` is not); any response that is not a trusted refusal and any failure after the head never; a body that is not held stops every retry once something was written and none before. Each verdict carries the `result` and `reason` labels of the table. |
+| RTY-02 | **U.** Trust: a `503` with one `x-mimic-error` `overloaded` (or `queue-timeout`) and one `x-mimic-endpoint` equal to the try's pod address is trusted, `[::1]:8080` included and whatever the case of the field names; not trusted: another status (`500`, `502`, `429`), another value (`connect-failed`, `no-endpoint`, `Overloaded`, `overloaded ` with a space), two `x-mimic-error` or two `x-mimic-endpoint` fields, no `x-mimic-endpoint`, one naming another pod, the same IP with another port, an IPv6 address without brackets, a value that does not parse, and any answer of a try on the original destination. |
+| RTY-03 | **U.** The planner: with endpoints `a b c d e` all failing to connect and `retries` 3 the tries are three distinct pods then the original destination (4 tries, the fifth pod never tried); with one endpoint, the pod then the original destination; with two, both pods then the original destination; after a trusted refusal the next try is an untried pod, and when all were tried any pod (never the original destination); a mixed sequence (refusal then connect failure) never goes to the original destination; the original destination is tried at most once and nothing follows it; `retries` 0 gives one try; draws are called with the number of candidates and an index is never out of range. Delays: 0 after `connect_failed`, `refused_stream` and `reset`; after a refusal the draw maps 0 → 12.5 ms, 1 → 37.5 ms, the middle → 25 ms. |
+| RTY-04 | **U** (`proptest`). Over any number of endpoints (0 to 20), any `retries` (0 to 5), any sequence of try outcomes and draws: at most `1 + retries` tries, no endpoint tried twice while an untried one is left, the original destination at most once and last, and only after connect failures alone; the classification is a pure function (same inputs, same verdict). |
+| RTY-05 | **U** (sidecar configuration). Unset: `MIMIC_MESH_RETRY_BUFFER` 64 KiB, `MIMIC_MESH_RETRY_BUFFER_TOTAL` 8 MiB, `MeshConfig.retries` 3. Exit 2 (FND-01) for a buffer over `1Mi` or not a size, a total under `1Mi`, over `64Mi` or not a size; `0` is a valid buffer. |
+| RTY-06 | **U** (`mimic-core`, the head stripper). On a response head: every line whose field name starts with `x-mimic-` in any case is removed with its line end, the count of removed fields is returned, every other byte is unchanged (status line, other names' case, order, duplicates, CRLF and bare LF line ends, `obs-fold` lines of other fields); a head with no such field gives "unchanged" (no copy); a continuation line (`obs-fold`) of a removed field goes with it; stripping a stripped head changes nothing (`proptest`). |
+| RTY-07 | **F** (fuzz target `mesh_strip`, in the discovery fuzz job). The stripper on arbitrary bytes never panics; its output is the input with whole lines removed, never longer, and no line of a head that parses starts with `x-mimic-` (any case) after it. |
+| RTY-08 | **I** (connect failures). Three pods, one refusing connections: 300 requests (`POST` with a 1 KiB body and `GET`, HTTP/1 keep-alive and `h2c`) are all answered `200` by the two others, the body each pod receives equals the one sent, `mimic_mesh_retries_total{reason="connect_failed"}` equals `mimic_mesh_attempts_total{result="connect_failed"}` and is at least 1, and no fallback is counted. Five pods all refusing and the ClusterIP answering: each request is answered by the ClusterIP after exactly 3 pod connects (the access line has `attempts` 4, `upstream` the ClusterIP), `mimic_mesh_fallbacks_total` counts 1 per request. The ClusterIP refusing too: `503` `x-mimic-error: connect-failed` after 4 tries, `mimic_mesh_retries_skipped_total{reason="exhausted"}` 1. |
+| RTY-09 | **I** (HTTP/2 refusals). An `h2c` pod that resets every stream with `REFUSED_STREAM`, and one that sends `GOAWAY` with a last-stream-id below the stream: a `POST` is answered `200` by another pod with the same body, counted `result="refused_stream"`; with every pod refusing, the app's stream is reset with `REFUSED_STREAM` after 4 tries. A pod that resets a stream with `INTERNAL_ERROR` before any head: a `GET` is answered by another pod, a `POST` is not sent again (the app's stream is reset, `mimic_mesh_retries_skipped_total{reason="method"}` 1). |
+| RTY-10 | **I** (resets, HTTP/1). A pod that reads a request and closes (or resets) before answering: `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` and `DELETE` are answered by another pod, the first pod having seen each once (`result="reset"`); a `POST` and a `PATCH` are not sent again (MSH-59: the app's connection closed without an answer). A pod that writes a response head then closes: a `GET` is not sent again and the app gets the partial response and the close, as in M1. |
+| RTY-11 | **I** (app statuses). A pod answering `503` without `x-mimic-error`, `503` with `x-mimic-error: connect-failed`, `500` and `502`: each is passed to the app as received (status, fields, body), the pod saw it once, `mimic_mesh_retries_total` stays 0 and the access line has `attempts` 1. |
+| RTY-12 | **I** (trusted refusals). With one refusing pod of three: every `POST` is answered `200` by another pod with the same body, the refusing pod's answer never reaches the app, the second try starts at least 12 ms after the refusal; counted `result="overloaded"` and `reason="overloaded"` (and `queue_timeout` for a pod answering `queue-timeout`). With all three refusing: 4 tries (one pod twice), the app gets the last refusal as received, with its `x-mimic-error` and `x-mimic-endpoint`; the access line has `status` 503 and `attempts` 4; `mimic_mesh_requests_total{reason="overloaded"}` counts it; `GET /discovery` records nothing for it and `result="synthetic"` counts it. |
+| RTY-13 | **I** (binding). A pod answering `503 overloaded` whose `x-mimic-endpoint` names another pod of the view, the ClusterIP, or itself twice: the answer is passed as received, the pod saw the request once, no retry is counted. With the only pod refusing connections and the ClusterIP answering `503 overloaded` naming the ClusterIP or a pod: passed as received, the ClusterIP saw the request once. With a stale view the same answer of the ClusterIP is not retried (MSH-86). |
+| RTY-14 | **I** (bodies). With `MIMIC_MESH_RETRY_BUFFER` 64Ki, against one refusing pod and one answering: a `POST` of 60 KiB (`Content-Length`, then `chunked`, then `h2c`) is retried and the second pod receives the same bytes; one of 70 KiB is not retried once written (the refusal reaches the app, `mimic_mesh_retries_skipped_total{reason="buffer"}` 1); one of 70 KiB to a pod refusing connections is retried (nothing was written) and answered. With the total at `1Mi` held by 16 slow requests of 64 KiB, a 17th request with a body is streamed and not retried after a refusal (`reason="buffer"`); `mimic_mesh_retry_buffer_bytes` never exceeds the total and is 0 once every request is answered. |
+| RTY-15 | **I** (M1 paths reconciled). An unwritten request whose new connection to its pod fails (the hook of MSH-59), on a Service of three pods: it is answered by another pod, counted as a reconnect and a `connect_failed` retry, not as a fallback; with one pod the ClusterIP answers it (MSH-69). A pod blackholed (connect timeout 300 ms) among three: avoided as in MSH-68, its first failure costs one connect timeout. The `no-endpoint` answer and the mock (mode `mock`) make no try (`mimic_mesh_attempts_total` unchanged). |
+| RTY-16 | **I** (L4). Five pods refusing connections and the original destination answering: the client-first bytes reach the original destination after 3 pod connects, byte for byte; the access line has `attempts` 4; with the original destination refusing too the client is closed without a byte after 4 connects. A pod that accepts and closes after reading is not retried (MSH-64). |
+| RTY-17 | **I** (intercepted TLS, the CA set-up of MSH-72). A pod whose certificate does not verify and two that do: every request is answered by a verified pod, counted `result="connect_failed"`; a verified pod answering a trusted refusal: the request is retried on another pod inside the same app TLS session. |
+| RTY-18 | **I** (inbound stripping). With `MIMIC_MESH=on`, an app answering with `x-mimic-error: overloaded`, `X-Mimic-Endpoint: 10.0.0.9:80` and `x-mimic-other: 1` among other fields: the client receives the head without those three lines and every other byte as the app sent it (HTTP/1 keep-alive, a `chunked` and a close-delimited body, a `HEAD`); `h2c`: the three fields are gone, the others kept; `mimic_mesh_stripped_headers_total` is 3 per response; a response without such field is byte-exact; a `100 Continue` before the final head is relayed unchanged. With `MIMIC_MESH=off` and with a view of `"mesh": false` the same responses keep the fields, byte for byte (MSH-51). With `MIMIC_LOAD_ENABLED=1` a load request's answer carries one `x-mimic-load: ok` and none of the app's `x-mimic-*` fields. |
+| RTY-19 | **I** (three tiers, in process: sidecars of A and B, B's app forwarding C's status, fields and body, three C pods all refusing). For each request of A's client: C receives at most 4 tries from B's sidecar; B's app is reached exactly once; B's inbound side strips the fields, so A's client gets a `503` without any `x-mimic-*` field, A's sidecar counts no retry and its access line has `attempts` 1. The same with B's sidecar run with `MIMIC_MESH=off`: A's client gets the `503` with C's `x-mimic-endpoint` and A's sidecar still counts no retry (the binding). |
+| RTY-20 | **I** (metrics and access line). After a known sequence (one ok, one connect failure then ok, one refusal then ok, one exhausted refusal, one `POST` reset) `mimic_mesh_attempts_total`, `mimic_mesh_retries_total` and `mimic_mesh_retries_skipped_total` have exactly the expected values and labels, `mimic_mesh_requests_total` counts 5 and `mimic_mesh_endpoint_requests_total` per pod equals what each pod counted; the series of a backend that left the view are gone 5 minutes after (clock passed in, MSH-79); no label or log field holds a header value. |
+| RTY-21 | **E** (kind, `scripts/e2e.sh` section `rty_21`, own namespace, cleaned by a trap). A Service of 3 pods, one of them not injected (pod label `mimic.platform.io/inject: disabled`) and listening on no port while Ready: 300 requests from an injected client, half `GET` and half `POST`, are all answered `200` (error rate 0 %), the refusing pod is never reached, and the client sidecar's `mimic_mesh_retries_total{reason="connect_failed"}` is at least 1. |
+| RTY-22 | **E** (kind, section `rty_22`, own namespace, cleaned by a trap). Tiers A → B → C: `c-mesh` and `c-off` are Services of 2 pods each, not injected, answering `503` `x-mimic-error: overloaded` with `x-mimic-endpoint` set to their own `<pod IP>:<port>` (downward API) and counting their requests; `b-mesh` (injected, meshed) forwards to `c-mesh`, `b-off` (injected, with a `MimicConfig` `spec.mesh.enabled: false`, the comment of #445) to `c-off`, both passing on C's status, fields and body. 20 requests of the injected client A to each B: through `b-mesh` A's app gets `503` without any `x-mimic-*` field; through `b-off` it gets `503` with `x-mimic-endpoint` naming a `c-off` pod; A's sidecar counts no retry for either backend; each B app counts exactly 20; `c-mesh` counts more than 20 and at most 4 × 20 (B's sidecar retried), `c-off` exactly 20 (B's sidecar is not meshed). |
+| RTY-23 | **M** (main session, `scripts/bench.sh`, results in `docs/bench/`). The M2 row of design §14: with no failure, `mesh-lb` is within 0.2 ms p50 of the committed M1 run; a new setup `mesh-refuse` (one of three backend pods not injected and refusing connections) has a client error rate of 0 % and p99 at most the M1 `mesh-lb` p99 + 5 ms. |
+| RTY-24 | **D** (documentation review). `docs/wiki/Mesh.md` has a "Retries" section with the table of §7.9, the bound per tier and the binding; `Configuration.md` lists the two variables, `Monitoring.md` the new metrics, `Access-logs.md` the `attempts` field; `CHANGELOG.md` *Unreleased* says that mesh-routed requests are retried and that meshed sidecars remove `x-mimic-*` fields from app responses. |
+| RTY-25 | **D** (security and performance review). Buffers bounded: per request and in total (RTY-14), released at the response head, the inbound held head at 64 KiB, the discarded refusal body at 64 KiB; a forged `x-mimic-error` causes at most `retries` retries and only for requests sent to the forging pod (RTY-02, RTY-13); no signalled or connect-failure retry crosses a tier (RTY-19, RTY-22); the remaining reset amplification is the one written in §11.1; no header value in a label or a log field; the pure parts allocate nothing per try beyond the set of tried endpoints. |
 
 ## 13. Test strategy
 

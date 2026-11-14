@@ -6,6 +6,7 @@ pub mod head;
 pub mod input;
 pub mod lb;
 pub mod policy;
+pub mod retry;
 pub mod view;
 
 #[cfg(test)]
@@ -24,3 +25,5 @@ mod tests_lb;
 mod tests_policy;
 #[cfg(test)]
 mod tests_prop;
+#[cfg(test)]
+mod tests_retry;
