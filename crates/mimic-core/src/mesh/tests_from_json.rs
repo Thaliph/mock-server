@@ -218,7 +218,7 @@ fn rty_45_from_json_reads_back_a_policy_with_retries_and_refuses_the_rest() {
 
 // RTE-12: routes.
 
-fn routed() -> Built {
+pub(super) fn routed() -> Built {
     let mut s = snapshot();
     s.services = vec![
         http_svc("shop", "cart", "10.96.0.1"),

@@ -10,8 +10,10 @@ use super::input::{
     RouteFilter, RouteRule, Service,
 };
 use super::policy::Condition;
+mod apply;
 mod table;
 
+pub use apply::{FieldList, Pick, draw};
 pub use table::{RequestParts, Table, split_target};
 
 use super::view::{
