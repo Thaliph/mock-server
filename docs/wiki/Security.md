@@ -52,7 +52,7 @@ Controller (ClusterRole / Role):
 | `mimicworkloads/status` | `patch` |
 | `mutatingwebhookconfigurations`, only its own by name | `get`, `list`, `watch`, `patch` (a `ValidatingAdmissionPolicy` limits changes to `caBundle`) |
 | `tokenreviews` | `create` |
-| `services`, `endpointslices`, `deployments` (metadata only), `mimicconfigs`, `referencegrants` (when `mesh.enabled`, the default) | `get`, `list`, `watch` |
+| `services`, `endpointslices`, `deployments` (the controller reads metadata only; RBAC grants whole objects), `mimicconfigs`, `referencegrants` (when `mesh.enabled`, the default) | `get`, `list`, `watch` |
 | `mimicconfigs/status` (when `mesh.enabled`) | `patch` (server-side apply, field manager `mimic-mesh`) |
 | Secrets, only `<release>-webhook-tls` and `<release>-tls-ca` in its namespace | `get`, `update` |
 
@@ -65,15 +65,9 @@ in the release namespace can read every discovered report.
 The [mesh](Mesh) is on by default (`mesh.enabled`); with `false` the controller serves no view, watches
 nothing and the rules below are not rendered.
 
-**What the controller reads, cluster-wide (ClusterRole, only with `mesh.enabled`):**
-
-| Resource | Verbs |
-|---|---|
-| `services`, `endpointslices` (`discovery.k8s.io`) | `get`, `list`, `watch` |
-| `deployments` (`apps`) | `get`, `list`, `watch` |
-| `mimicconfigs` | `get`, `list`, `watch` |
-| `mimicconfigs/status` | `patch` |
-| `referencegrants` (`gateway.networking.k8s.io`) | `get`, `list`, `watch` |
+**What the controller reads:** the mesh rows of the [RBAC](#rbac) table above, cluster-wide and only with
+`mesh.enabled`. RBAC cannot limit a read to metadata: the grant covers whole Deployments, and the controller
+asks for their metadata only.
 
 Nothing watched is writable. The ClusterRole has **no Secret rule**: Secrets stay in the namespaced Role,
 limited by name to the two chart Secrets. The Gateway API CRD may be absent; the rule is then harmless,

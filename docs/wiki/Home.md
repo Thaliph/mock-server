@@ -94,4 +94,4 @@ there is no upgrade from the legacy `v0.1.0`. See the
 For contributors: this release covers the features F0 to F11 of the delivery plan in the spec, and the
 monitoring work.
 
-Traces are out of scope; mesh traffic management is a later version.
+Traces are out of scope. The [mesh](Mesh) balances mesh-routed calls over pod IPs and retries proxy-level failures; routing rules, outlier detection and admission come in later milestones.
