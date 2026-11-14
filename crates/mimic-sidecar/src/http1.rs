@@ -228,8 +228,33 @@ fn edited(head: &[u8], name: &str, add: Option<&[u8]>) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The end of the response head at the start of `held`, and its status.
-fn response_head(held: &[u8]) -> Option<(usize, u16)> {
+/// What the bytes held say of the response head at their start.
+#[derive(Debug, PartialEq, Eq)]
+enum Head {
+    /// The head is not complete.
+    Open,
+    /// The status line is not one the codec frames: the codec stops following the connection.
+    Bad,
+    /// The head is complete (its end, blank lines before it included) and has this status.
+    Done(usize, u16),
+}
+
+/// Bytes of blank lines (`CRLF` or `LF`) at the start of `held`: the codec skips them and
+/// counts them in no head.
+fn leading_blanks(held: &[u8]) -> usize {
+    let mut at = 0;
+    loop {
+        match &held[at..] {
+            [b'\n', ..] => at += 1,
+            [b'\r', b'\n', ..] => at += 2,
+            _ => return at,
+        }
+    }
+}
+
+/// The response head at the start of `held`, read as the codec reads it: blank lines before
+/// the status line are skipped, a reason phrase is any bytes.
+fn response_head(held: &[u8]) -> Head {
     let mut at = 0;
     let mut status = None;
     while let Some(end) = held[at..].iter().position(|&b| b == b'\n') {
@@ -237,18 +262,24 @@ fn response_head(held: &[u8]) -> Option<(usize, u16)> {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         at += end + 1;
         if line.is_empty() {
-            return status.map(|status| (at, status));
+            match status {
+                None => continue,
+                Some(status) => return Head::Done(at, status),
+            }
         }
         if status.is_none() {
-            status = std::str::from_utf8(line)
-                .ok()?
-                .split(' ')
+            let code = line
+                .split(|&b| b == b' ')
                 .nth(1)
+                .and_then(|code| std::str::from_utf8(code).ok())
                 .and_then(|code| code.parse().ok());
-            status?;
+            match code {
+                Some(code) => status = Some(code),
+                None => return Head::Bad,
+            }
         }
     }
-    None
+    Head::Open
 }
 
 impl<F: FnMut(Event)> Relay<F> {
@@ -563,8 +594,17 @@ impl<F: FnMut(Event)> Relay<F> {
                 && !release
                 && self.with(|codec| (codec.between_responses(), Vec::new()))
             {
+                let blanks = leading_blanks(&held);
                 match response_head(&held) {
-                    None if held.len() < HEAD_LIMIT => {
+                    Head::Open if stripping && blanks >= HEAD_LIMIT => {
+                        // The codec skips blank lines without end and so frames this
+                        // connection: the head cannot be judged, so nothing is relayed.
+                        return Err((
+                            Side::Upstream,
+                            io::Error::other("response head without status line"),
+                        ));
+                    }
+                    Head::Open if held.len() - blanks < HEAD_LIMIT => {
                         // A head that stalls is released after the stall when only a load
                         // marker is at stake; a stripped one is never written in part.
                         let stall = self
@@ -589,8 +629,9 @@ impl<F: FnMut(Event)> Relay<F> {
                         continue;
                     }
                     // An interim response is not the answer.
-                    Some((end, status)) if status >= 200 || status == 101 => {
+                    Head::Done(end, status) if status >= 200 || status == 101 => {
                         let mut end = end;
+                        let end_before = end;
                         if stripping {
                             let (head, removed) = strip(&held[..end]);
                             if removed > 0 {
@@ -598,8 +639,8 @@ impl<F: FnMut(Event)> Relay<F> {
                                 if let Some(mesh) = &self.strip {
                                     mesh.stripped(removed);
                                 }
-                                held.splice(..end, head);
-                                end = response_head(&held).map_or(0, |(end, _)| end);
+                                end = head.len();
+                                held.splice(..end_before, head);
                             }
                         }
                         if load {
@@ -611,7 +652,7 @@ impl<F: FnMut(Event)> Relay<F> {
                             }
                         }
                     }
-                    Some((end, _)) => interim = Some(end),
+                    Head::Done(end, _) => interim = Some(end),
                     _ => {}
                 }
             }

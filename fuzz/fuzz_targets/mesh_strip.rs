@@ -1,7 +1,8 @@
 //! Fuzz target for the stripper of the `x-mimic-*` fields of a response head (spec RTY-07,
 //! §4.1 "Mimic fields of app responses").
 //!
-//! The stripper never panics; its output is the input with whole lines removed, never longer;
+//! Blank lines before the status line are skipped, as the HTTP/1 codec skips them. The stripper
+//! never panics; its output is the input with whole lines removed, never longer;
 //! no line of the head after it starts with `x-mimic-` in any case (the status line apart);
 //! the count is the number of lines removed that start a field; and stripping again changes
 //! nothing.
@@ -23,13 +24,17 @@ fn named(line: &[u8]) -> bool {
 fn split(data: &[u8]) -> (Vec<&[u8]>, &[u8]) {
     let mut at = 0;
     let mut lines = Vec::new();
-    for (index, line) in data.split_inclusive(|&b| b == b'\n').enumerate() {
+    for line in data.split_inclusive(|&b| b == b'\n') {
         let text = line.strip_suffix(b"\n").unwrap_or(line);
         let text = text.strip_suffix(b"\r").unwrap_or(text);
-        if index > 0 && text.is_empty() {
-            break;
+        if text.is_empty() {
+            // Blank lines before the status line are skipped, as the codec skips them.
+            if !lines.is_empty() {
+                break;
+            }
+        } else {
+            lines.push(line);
         }
-        lines.push(line);
         at += line.len();
     }
     (lines, &data[at..])

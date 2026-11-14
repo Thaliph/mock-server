@@ -306,3 +306,99 @@ async fn rty_18_h2c_the_fields_are_gone_and_the_others_kept() {
     }
     assert_eq!(on.stripped(), 6, "3 per response");
 }
+
+/// A raw app: answers each request head with `reply` built at run time.
+async fn app_with(reply: Vec<u8>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let reply = reply.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                while matches!(s.read(&mut buf).await, Ok(n) if n > 0) {
+                    if s.write_all(&reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn rty_18_blank_lines_before_the_status_line_do_not_hide_the_fields_from_a_large_body() {
+    // The codec skips the blank lines and frames the head; a 64 KiB body behind it must not
+    // make the relay give up holding the head.
+    let body = vec![b'a'; 70_000];
+    for lead in [&b"\r\n"[..], b"\n", b"\r\n\r\n\n"] {
+        let mut reply = lead.to_vec();
+        reply.extend_from_slice(
+            b"HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nX-Mimic-Endpoint: 10.0.0.9:80\r\nContent-Length: 70000\r\n\r\n",
+        );
+        reply.extend_from_slice(&body);
+        let mut want = lead.to_vec();
+        want.extend_from_slice(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 70000\r\n\r\n",
+        );
+        want.extend_from_slice(&body);
+        let state = meshed();
+        let rig = start(app_with(reply).await, Some(&state)).await;
+        exchange(rig.addr, GET, 2, &want, false).await;
+        assert_eq!(rig.stripped(), 4);
+    }
+}
+
+#[tokio::test]
+async fn rty_18_a_reason_phrase_that_is_not_utf8_does_not_hide_the_fields() {
+    let reply: &'static [u8] =
+        b"HTTP/1.1 503 Unavail\xffable\r\nx-mimic-error: overloaded\r\nContent-Length: 2\r\n\r\nok";
+    let want: &[u8] = b"HTTP/1.1 503 Unavail\xffable\r\nContent-Length: 2\r\n\r\nok";
+    let state = meshed();
+    let rig = start(app(reply, false).await, Some(&state)).await;
+    exchange(rig.addr, GET, 2, want, false).await;
+    assert_eq!(rig.stripped(), 2);
+}
+
+#[tokio::test]
+async fn rty_18_a_head_the_codec_cannot_frame_is_relayed_at_once_unchanged() {
+    // Spec §4.1 and §11.1: not held until 64 KiB.
+    let reply: &'static [u8] = b"garbage\r\nx-mimic-error: overloaded\r\n\r\n";
+    let state = meshed();
+    let rig = start(app(reply, false).await, Some(&state)).await;
+    exchange(rig.addr, GET, 1, reply, false).await;
+}
+
+#[tokio::test]
+async fn rty_18_endless_blank_lines_before_the_status_line_close_the_connection_unrelayed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = s.read(&mut buf).await;
+        let blanks = vec![b'\n'; 70_000];
+        let _ = s.write_all(&blanks).await;
+        let _ = s
+            .write_all(b"HTTP/1.1 503 X\r\nx-mimic-error: overloaded\r\n\r\n")
+            .await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let state = meshed();
+    let rig = start(addr, Some(&state)).await;
+    let mut c = TcpStream::connect(rig.addr).await.unwrap();
+    c.write_all(GET).await.unwrap();
+    let mut got = Vec::new();
+    tokio::time::timeout(TIMEOUT, c.read_to_end(&mut got))
+        .await
+        .expect("the close in time")
+        .ok();
+    assert!(
+        !got.windows(7).any(|w| w == b"x-mimic"),
+        "no field reaches the client"
+    );
+}

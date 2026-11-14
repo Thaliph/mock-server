@@ -66,6 +66,20 @@ fn rty_06_the_status_line_and_what_follows_the_head_are_left_alone() {
 }
 
 #[test]
+fn rty_06_blank_lines_before_the_status_line_are_skipped_as_the_codec_skips_them() {
+    let head =
+        b"\r\n\nHTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nKeep: 1\r\n\r\n";
+    let (out, n) = run(head);
+    assert_eq!(
+        out,
+        b"\r\n\nHTTP/1.1 503 Service Unavailable\r\nKeep: 1\r\n\r\n"
+    );
+    assert_eq!(n, 1);
+    let none = b"\r\nHTTP/1.1 200 OK\r\nKeep: 1\r\n\r\n";
+    assert!(matches!(strip(none).0, Cow::Borrowed(_)));
+}
+
+#[test]
 fn rty_06_duplicates_count_one_each() {
     let head = b"HTTP/1.1 200 OK\r\nx-mimic-a: 1\r\nx-mimic-a: 2\r\n\r\n";
     assert_eq!(run(head), (b"HTTP/1.1 200 OK\r\n\r\n".to_vec(), 2));
