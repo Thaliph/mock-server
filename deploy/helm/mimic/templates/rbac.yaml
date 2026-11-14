@@ -49,6 +49,14 @@ rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [referencegrants]
     verbs: [get, list, watch]
+  # The mesh routes (spec §7.9, M3): HTTPRoutes in any namespace are read, and only their status is written, by a
+  # JSON merge patch with a resourceVersion precondition (the status is shared with other controllers).
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
+    verbs: [get, list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes/status]
+    verbs: [patch]
   {{- end }}
   {{- if .Values.loadTest.enabled }}
   # Load tests (spec §11, F11): the MimicLoadTest objects, the status of each, and the generator's

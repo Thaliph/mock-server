@@ -924,4 +924,17 @@ echo "msh_84: one endpointslices rule with the mesh and the load tests"
 [[ $(mesh_env MIMIC_MESH_STARTUP_WAIT --set mesh.startupWait=500ms) == 500ms ]] || fail "msh_40: mesh.startupWait does not render MIMIC_MESH_STARTUP_WAIT"
 echo "msh_40: mesh.staleAfter and mesh.startupWait render the variables the sidecars get"
 
+# RTE-26 (#447): the controller's RBAC on Gateway API objects: read the HTTPRoutes, patch their status, and read the
+# ReferenceGrants; nothing else in the group, nothing on CRDs. With the mesh off, none of it.
+gw_rules() { # gw_rules <render file>: "resource verbs" of each rule of the ClusterRole that names the Gateway API group
+  yq -r 'select(.kind == "ClusterRole" and .metadata.name == "mimic-controller") | .rules[] | select(.apiGroups[] == "gateway.networking.k8s.io") | (.resources[] + " " + (.verbs | join(",")))' "$1" | sort
+}
+[[ $(gw_rules "$tmp/default.yaml") == $'httproutes get,list,watch\nhttproutes/status patch\nreferencegrants get,list,watch' ]] \
+  || fail "rte_26: the Gateway API rules are not httproutes get,list,watch, httproutes/status patch and referencegrants get,list,watch"
+[[ -z $(yq -r 'select(.kind == "ClusterRole" and .metadata.name == "mimic-controller") | .rules[] | select(.resources[] == "customresourcedefinitions")' "$tmp/default.yaml") ]] \
+  || fail "rte_26: the ClusterRole has a rule on customresourcedefinitions"
+render --set mesh.enabled=false > "$tmp/mesh-off.yaml"
+[[ -z $(gw_rules "$tmp/mesh-off.yaml") ]] || fail "rte_26: mesh.enabled=false renders a Gateway API rule"
+echo "rte_26: the controller reads HTTPRoutes and ReferenceGrants, patches only the HTTPRoute status; none with the mesh off"
+
 echo "chart checks passed"

@@ -54,9 +54,11 @@ Controller (ClusterRole / Role):
 | `tokenreviews` | `create` |
 | `services`, `endpointslices`, `deployments` (the controller reads metadata only; RBAC grants whole objects), `mimicconfigs`, `referencegrants` (when `mesh.enabled`, the default) | `get`, `list`, `watch` |
 | `mimicconfigs/status` (when `mesh.enabled`) | `patch` (server-side apply, field manager `mimic-mesh`) |
+| `httproutes`, `gateway.networking.k8s.io` (when `mesh.enabled`) | `get`, `list`, `watch` |
+| `httproutes/status`, `gateway.networking.k8s.io` (when `mesh.enabled`) | `patch` (JSON merge patch, field manager `mimic-mesh`) |
 | Secrets, only `<release>-webhook-tls` and `<release>-tls-ca` in its namespace | `get`, `update` |
 
-No access to pods, ReplicaSets or other Secrets, no write on Deployments. The mesh view a sidecar fetches holds the Services of its own namespace and the destinations its `MimicConfig` declares in a namespace that consents with a `ReferenceGrant`; a pod reads its own deployment's view only, and no Secret, label or annotation reaches a view. Whoever can `exec`/`get` the two Secrets
+No access to pods, ReplicaSets or other Secrets, no write on Deployments, no `create`, `update` or `delete` on any Gateway API object and nothing on `gateways`, `gatewayclasses` or `customresourcedefinitions`. RBAC cannot narrow the `httproutes/status` patch to mimic's entries: the controller changes only `status.parents[]` entries of `controllerName: mimic.platform.io/mesh`, but a compromised controller could rewrite the status (never the `spec`) of any route. The mesh view a sidecar fetches holds the Services of its own namespace and the destinations its `MimicConfig` declares in a namespace that consents with a `ReferenceGrant`; a pod reads its own deployment's view only, and no Secret, label or annotation reaches a view. Whoever can `exec`/`get` the two Secrets
 or the controller pods can obtain the TLS seed: restrict that access. Whoever can use `pods/portforward`
 in the release namespace can read every discovered report.
 
@@ -96,6 +98,14 @@ served even when it is full. See [Configuration](Configuration).
 `ReferenceGrant` in the destination namespace allows it: `from` = (`mimic.platform.io`, `MimicConfig`,
 the caller's namespace), `to` = (core group, `Service`, the name or none). Deleting the grant removes the
 destination from the view; the `MimicConfig` shows `ResolvedRefs: False`, reason `RefNotPermitted`.
+
+**Routes.** An `HTTPRoute` is configuration, not a Secret: its header and query values are copied into the views
+and state files of every pod it applies to (a producer route: every namespace that has the Service in its view),
+so **never put a credential in a `RequestHeaderModifier`**. A backend or mirror in another namespace is in a view
+only with a `ReferenceGrant` `from` `HTTPRoute` in its namespace; a consumer route changes the calls of its own
+namespace only; routes cannot set `host`, framing fields or `x-mimic-*`. No route value is in a log line or a
+status message. The status of a route says whether its parent Service exists, which cluster DNS already tells any
+pod. Status entries mimic wrote stay after `helm uninstall`. See [Mesh](Mesh#routes).
 
 **TLS re-origination.** A call the sidecar intercepts is re-originated over TLS to the chosen pod, and
 the pod's certificate is verified against the Service name (the SNI the app sent, else

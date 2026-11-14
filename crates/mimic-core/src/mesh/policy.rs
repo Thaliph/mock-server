@@ -236,7 +236,7 @@ pub struct Condition {
 }
 
 impl Condition {
-    fn ok(reason: &str) -> Condition {
+    pub(super) fn ok(reason: &str) -> Condition {
         Condition {
             ok: true,
             reason: reason.into(),
@@ -244,7 +244,7 @@ impl Condition {
         }
     }
 
-    fn refused(reason: &str, message: String) -> Condition {
+    pub(super) fn refused(reason: &str, message: String) -> Condition {
         Condition {
             ok: false,
             reason: reason.into(),

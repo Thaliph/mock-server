@@ -251,6 +251,70 @@ One access line is written per request, with `upstream` the address of the last 
 of tries. Discovery records the final exchange once; a trusted refusal passed to the app is not recorded
 (`mimic_discovery_exchanges_total{result="synthetic"}`).
 
+## Routes
+
+With the Gateway API CRDs installed ([Install](Install#gateway-api-optional)), the controller reads every
+`HTTPRoute` (`gateway.networking.k8s.io/v1`) whose `parentRefs` name a **Service** (`group: ""`, `kind: Service`;
+the GAMMA convention), compiles it and puts it in the views of the callers it applies to. Routes with Gateway
+parents are ignored. **The sidecar reads and validates routes but applies none of them yet**: matching,
+weights and header modifiers are #448, timeouts #449, mirrors #450. Today routes give you the status below and
+a validated view.
+
+**Supported**, per rule: `matches` with `path` (`Exact`, `PathPrefix`), `headers` and `queryParams` of type
+`Exact`, `method`; `backendRefs` to Services with `port` and `weight`; the filters `RequestHeaderModifier`,
+`ResponseHeaderModifier` and `RequestMirror`; `timeouts.request` and `timeouts.backendRequest`; `name`. `retry`
+is ignored (retries are set by `MimicConfig`, [Retries](#retries)); `hostnames` is ignored.
+
+**Refused**: a route is not programmed, and is in no view, when it has a `RegularExpression` match, a filter
+`URLRewrite`, `RequestRedirect`, `CORS` or `ExtensionRef`, `backendRefs[].filters`, a field the controller does
+not know (experimental channel), a modifier naming `host`, `Content-Length`, `Transfer-Encoding`,
+`Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade` or any `x-mimic-*` field, or a
+`spec` over 64 KiB. Its status says which.
+
+**Producer and consumer routes.** A route in the namespace of its Service is a *producer* route: every caller
+that has the Service in its view gets it. A route in another namespace than the Service is a *consumer* route
+and applies to the callers of **its own namespace only**; for them it replaces the producer routes of that
+Service. A route of a third namespace applies to nobody else.
+
+**Backends in another namespace** need a `ReferenceGrant` in the backend's namespace, `from` `HTTPRoute`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: allow-routes, namespace: backends}
+spec:
+  from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: shop}]
+  to: [{group: "", kind: Service}]
+```
+
+A grant for `MimicConfig` does not allow a route, and the other way round. Without the grant, or after it is
+deleted, the backend is not in the view and the route's `ResolvedRefs` is `False`, reason `RefNotPermitted`.
+
+**Reading the status.** For each Service parent that exists the controller writes one entry in
+`status.parents[]` with `controllerName: mimic.platform.io/mesh` and two conditions:
+
+```bash
+kubectl -n shop get httproute cart-canary -o jsonpath='{range .status.parents[?(@.controllerName=="mimic.platform.io/mesh")].conditions[*]}{.type}={.status} {.reason} {.message}{"\n"}{end}'
+```
+
+| Condition | Reason | Meaning |
+|---|---|---|
+| `Accepted` `True` | `Accepted` | Programmed. The message says `retry is configured by MimicConfig` when the route has `retry`. |
+| `Accepted` `False` | `UnsupportedValue` | Refused; the message is `unsupported: <field path>`, the first such field (`rules[0].filters[0].type`). |
+| `Accepted` `False` | `NoMatchingParent` | The entry's `port` is not a port of the Service, or it has a `sectionName`. |
+| `ResolvedRefs` `False` | `RefNotPermitted`, `InvalidKind`, `BackendNotFound` | A backend or mirror lacks a `ReferenceGrant`, is not a core Service, or does not exist (or lacks the port). The route stays programmed; that backend's share is answered `500` once the sidecar applies routes. |
+
+Entries of other controllers in the same list are never changed. The status of a route whose Service parent
+does not exist stays empty, and entries mimic wrote stay after `helm uninstall`.
+
+> **Warning: route values reach other pods.** Header and query values of a route are copied as written into
+> the views of every pod it applies to (producer routes: every namespace that has the Service in its view) and
+> into their state files. An `HTTPRoute` is configuration, not a Secret: **do not put a credential in a
+> `RequestHeaderModifier`.** See [Security](Security#mesh).
+
+Older Gateway API CRDs than 1.2 make the API server prune `timeouts` before mimic reads a route; with the
+experimental channel a route with a field mimic does not know is `UnsupportedValue`, never half-applied.
+
 ## Observability
 
 Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `backend` is
@@ -275,7 +339,7 @@ Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `
 Series of a pod that left the view are removed 5 minutes later. No label carries a path, header or
 other caller-controlled string.
 
-Controller metrics: `mimic_mesh_objects` (`kind`), `mimic_mesh_view_builds_total` (`result`),
+Controller metrics: `mimic_mesh_objects` (`kind`, with `httproute`), `mimic_mesh_gateway_api_present`, `mimic_mesh_routes` (`state`), `mimic_mesh_route_status_total` (`result`), `mimic_mesh_view_builds_total` (`result`),
 `mimic_mesh_view_build_duration_seconds`, `mimic_mesh_watches`, `mimic_mesh_view_truncated_total`,
 `mimic_mesh_view_cache_bytes`. See [Monitoring](Monitoring).
 
@@ -340,7 +404,7 @@ parse, once per streak), `tls verification failed`.
 
 - **M2**: retries of proxy-level failures on another pod are in (above); the retry budget and
   `MimicConfig.retries` are next (#446), then timeouts (#449).
-- **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror).
+- **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies them from #448.
 - **M4**: outlier detection, circuit breaker and fault injection.
 - **M5**: admission contract, failure signalling and HPA.
 - **M6**: north-south gateway.

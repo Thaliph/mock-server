@@ -40,6 +40,8 @@ zeroize = "1.9.1"
 workspace = true
 
 [dev-dependencies]
+bytes = "1.12.1"
+http-body = "1.1.0"
 http = "1.5.0"
 http-body-util = "0.1.5"
 mimic-runtime = { path = "../mimic-runtime", features = ["testing"] }

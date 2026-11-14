@@ -23,3 +23,9 @@ pub(crate) mod tests;
 mod tests_config;
 #[cfg(test)]
 mod tests_convert;
+#[cfg(test)]
+mod tests_route;
+#[cfg(test)]
+mod tests_route_status;
+#[cfg(test)]
+mod tests_watch;

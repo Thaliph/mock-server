@@ -21,6 +21,22 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Gateway API `HTTPRoute` in the controller (#447, M3): the controller reads `HTTPRoute`s whose `parentRefs` name a
+  Service (GAMMA), compiles and validates them, puts them in the views of the callers they apply to (producer routes
+  of the Service's namespace; consumer routes of the caller's own namespace) and reports `Accepted` and
+  `ResolvedRefs` in `status.parents[]` (`controllerName: mimic.platform.io/mesh`; other controllers' entries are
+  kept). A route with an unsupported field is `UnsupportedValue` and in no view; a backend of another namespace
+  needs a `ReferenceGrant` `from` `HTTPRoute` (`RefNotPermitted` without). **The sidecar reads and checks routes
+  but does not apply them yet** (#448 to #450): traffic is unchanged. New metrics `mimic_mesh_gateway_api_present`,
+  `mimic_mesh_routes`, `mimic_mesh_route_status_total` and `kind="httproute"` on `mimic_mesh_objects`. New RBAC
+  (with `mesh.enabled`): `get`, `list`, `watch` on `httproutes` and `patch` on `httproutes/status`
+  (`gateway.networking.k8s.io`), nothing else on that group but `referencegrants` `get`, `list`, `watch`.
+  **Prerequisite (optional):** the Gateway API standard-channel CRDs, version 1.2 or later (tested v1.7.0); without
+  them the controller logs `gateway api crds missing` and the mesh works without routes and without
+  `ReferenceGrant` consent. Upgrade the controller before the sidecars: an older sidecar refuses a view that holds
+  `routes`. Route header and query values reach the views of the pods the route applies to: put no credential in a
+  `RequestHeaderModifier`.
+
 - Retry policy and budget per Service (#446, M2): `MimicConfig` targeting a Service gains `retries` (0 to 10,
   default 3; `0` also stops the fallback to the ClusterIP) and `retryBudget` (`percent` 20, `minPerSecond` 10,
   `window` 10s). Each caller pod keeps one budget per Service: a retry is granted while retries in the window

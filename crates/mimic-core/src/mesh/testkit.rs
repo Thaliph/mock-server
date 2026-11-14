@@ -147,3 +147,76 @@ pub fn view_of(s: &Snapshot, ns: &str, d: &str) -> Built {
 pub fn keys(b: &Built) -> Vec<&str> {
     b.view.services.keys().map(String::as_str).collect()
 }
+
+/// A Service parent of a route (`ns` `None`: the route's namespace).
+pub fn parent(ns: Option<&str>, name: &str, port: Option<u16>) -> ParentRef {
+    ParentRef {
+        group: String::new(),
+        kind: "Service".into(),
+        namespace: ns.map(Into::into),
+        name: name.into(),
+        section_name: None,
+        port,
+    }
+}
+
+pub fn backend(ns: Option<&str>, name: &str, port: u16, weight: Option<u32>) -> BackendRef {
+    BackendRef {
+        group: String::new(),
+        kind: "Service".into(),
+        namespace: ns.map(Into::into),
+        name: name.into(),
+        port: Some(port),
+        weight,
+        has_filters: false,
+    }
+}
+
+/// A route created at `created`, generation 3, UID `uid-<name>`.
+pub fn route_at(
+    ns: &str,
+    name: &str,
+    created: i64,
+    parents: Vec<ParentRef>,
+    rules: Vec<RouteRule>,
+) -> Route {
+    Route {
+        namespace: ns.into(),
+        name: name.into(),
+        uid: format!("uid-{name}"),
+        generation: 3,
+        created,
+        parents,
+        rules,
+        unknown_fields: vec![],
+        oversize: false,
+    }
+}
+
+pub fn to_backends(backends: Vec<BackendRef>) -> RouteRule {
+    RouteRule {
+        backend_refs: backends,
+        ..RouteRule::default()
+    }
+}
+
+/// A grant in `ns` letting `HTTPRoute`s of `from_ns` reach any Service.
+pub fn route_grant(ns: &str, from_ns: &str) -> ReferenceGrant {
+    ReferenceGrant {
+        from: vec![GrantFrom {
+            group: GATEWAY_GROUP.into(),
+            kind: "HTTPRoute".into(),
+            namespace: from_ns.into(),
+        }],
+        ..grant(ns, from_ns)
+    }
+}
+
+/// The names of the routes `service` holds in `b`, in order.
+pub fn route_names(b: &Built, service: &str) -> Vec<String> {
+    b.view.services[service]
+        .routes
+        .iter()
+        .map(|r| r.name.clone())
+        .collect()
+}

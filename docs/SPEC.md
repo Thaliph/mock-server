@@ -67,6 +67,17 @@ plumbing: configuration, logs, metrics, health, shutdown), `mimic-sidecar`, `mim
 from F1 `mimic-init`, from F3 `mimic-trust` and from F11 `mimic-load`. `mimic-core` may depend on pure data crates
 (`serde`, `serde_json`, `k8s-openapi`, `rustls-pki-types`).
 
+**Prerequisites.** Kubernetes ≥ 1.33 (native sidecars, §7.1). Optional, for mesh routes and
+cross-namespace consent (M3, #447): the Gateway API CRDs, **standard channel**, version ≥ v1.2
+(`HTTPRoute` `timeouts` is Standard from v1.2.0; `retry` from v1.7.0), tested with **v1.7.0**
+(`standard-install.yaml` of that release; the kind e2e installs it from its release URL checked
+against a pinned SHA-256, `scripts/check-pins.sh`). Mimic never installs them. Without them the
+controller logs one WARN `gateway api crds missing`, sets `mimic_mesh_gateway_api_present` to 0
+and the mesh works without routes and without `ReferenceGrant` consent (§7.9). Older or
+experimental-channel CRDs are not supported: an older API server prunes the fields it does not
+know (§11.1), and a field the controller does not know keeps a route from being programmed (§7.9
+"Routes").
+
 ## 3. Modes
 
 | Mode | Inbound | Outbound |
@@ -1178,6 +1189,11 @@ the recorder keeps the first message of each side:
   takes no part in the precedence. `Accepted` reads `Invalid` before `TargetNotFound` before
   `Conflicted`. Defaults without any `MimicConfig`: slow start 30 s, `mesh.enabled: true`,
   `retries: 3`, `retryBudget: {percent: 20, minPerSecond: 10, window: 10s}`.
+- From M3 (#447), Gateway API `HTTPRoute`s (`gateway.networking.k8s.io/v1`, when the CRD exists,
+  §2) whose `parentRefs` name a Service (GAMMA) are read by both replicas, validated, compiled into
+  the views of the callers they apply to and reported in their `status.parents[]` (§7.9 "Routes").
+  The controller writes nothing else of a route, and nothing at all of a route without a Service
+  parent (Gateway parents are M6).
 - From F11, `MimicLoadTest` (namespaced CRD, same group and version, only when the chart's
   `loadTest.enabled` is true): one load test of `spec.deployment` in its namespace, run by a
   `mimic-load` Job while the deployment is in mock, results in its `status` (§7.8).
@@ -1412,7 +1428,7 @@ the recorder keeps the first message of each side:
   (nothing is read, no `TokenReview`); `503` with `Retry-After: 1` until the watches of §7.9 are
   synced; `405` with `Allow: GET` for another method; `429` over the rate. Views are built from the
   controller's watches (`Service`, `EndpointSlice`, `MimicConfig`, `MimicWorkload`, Deployment
-  metadata, `ReferenceGrant` when its CRD exists) on both replicas, so two replicas with the same
+  metadata, `ReferenceGrant` and from M3 `HTTPRoute` when their CRDs exist) on both replicas, so two replicas with the same
   objects serve the same bytes. A view is cached per input key (namespace, effective mode, winning
   `MimicConfig` of the deployment and its generation) in an LRU bounded by
   `MIMIC_MESH_VIEW_CACHE_BYTES`; a view that holds more than a bound of §7.9 is served truncated,
@@ -1420,7 +1436,7 @@ the recorder keeps the first message of each side:
   (WARN `mesh view truncated`, with the first 16 Services left out by name). The controller writes
   `status.conditions` of every `MimicConfig` (§7, `Accepted`, `ResolvedRefs` with
   `RefNotPermitted` for a destination without a `ReferenceGrant`) by server-side apply on the
-  status subresource, field manager `mimic-mesh`, when they differ from what it last applied (both replicas apply the same body, which changes nothing in the cluster: accepted). The ClusterRole reads Deployments whole, as RBAC cannot restrict a read to metadata; the controller asks for metadata only (accepted).
+  status subresource, field manager `mimic-mesh`, when they differ from what it last applied (both replicas apply the same body, which changes nothing in the cluster: accepted). From M3 it also writes the `status.parents[]` entries of HTTPRoutes with a Service parent, by a merge patch with a `resourceVersion` precondition, not by server-side apply (§7.9 "Routes": the list is atomic and shared with other controllers). The ClusterRole reads Deployments whole, as RBAC cannot restrict a read to metadata; the controller asks for metadata only (accepted).
 - **Shipping client** (sidecar, F5). Every `MIMIC_DISCOVERY_PUSH_INTERVAL` (the first one after
   a random delay within one interval, so that the pods of a rollout do not push together),
   the sidecar freezes the report recorded since its last acknowledged push into a *pending*
@@ -2540,7 +2556,7 @@ no `MimicLoadTest` and creates no Job).
 
 The **view** of a deployment `d` of namespace `n` (design §4.2) is a pure function of plain input
 structs (`mimic-core` `mesh::view`; the controller turns the watched objects into them, #441): the
-Services, EndpointSlices, `MimicConfig`s, `ReferenceGrant`s of the cluster, the existing
+Services, EndpointSlices, `MimicConfig`s, `ReferenceGrant`s and from M3 `HTTPRoute`s of the cluster, the existing
 Deployments, the effective mode (§7) and the cluster name. It holds, as canonical JSON (sorted keys,
 no insignificant whitespace):
 
@@ -2560,7 +2576,12 @@ no insignificant whitespace):
   out and the config gets `ResolvedRefs: False`, reason `RefNotPermitted`, the message naming each
   destination (`risk/scoring`); the answer is the same whether the Service exists or not. A view
   holds nothing of a namespace that did not consent: no IP, port, zone, readiness or name.
-  HTTPRoutes join the scope with #447.
+  From M3 (#447) the **route closure** adds, once, the Services that the routes of the view
+  ("Routes" below) name as valid backends or mirrors (closure depth 1: their own routes are not
+  followed, and such a Service carries `routes` only when it is in the scope by itself); a
+  backend of another namespace than its route's is valid only with that namespace's consent to
+  the route (`from: {group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: <route
+  namespace>}`), so no path puts a namespace's data in a view without its consent.
 - **Content**: per Service the ClusterIPs (none for a headless one), the ports (`name`,
   `targetPort`), per Service port the endpoints of its EndpointSlices with the same port name:
   the ready ones, else the serving and terminating ones with `ready: false`, sorted by address and
@@ -2578,14 +2599,117 @@ no insignificant whitespace):
   first, in name order, then the declared destinations in key order; a Service that does not fit
   the remaining budget (Services, endpoints or bytes) is skipped and the next ones, in the same
   order, are still tried, so one large Service hides none after it (once `max_services` is reached
-  every remaining one is skipped). The Services left out are counted (`truncated`) and their keys
+  every remaining one is skipped). From M3 the Services of the route closure come last, in key
+  order; a route that names a Service left out is left out of its Service's `routes` too (its
+  key is listed in `skippedRoutes`, at most 16, and the WARN `mesh view truncated` gains the field
+  `routes`), so a view never names a Service it does not hold. The Services left out are counted (`truncated`) and their keys
   `<namespace>/<name>`, names only, are listed in order in `skipped`, at most 16, for the
   controller to report.
 - **ETag**: `"1-"` plus the SHA-256 of the canonical bytes in hex, between double quotes: two
   replicas with the same objects serve the same bytes and ETag, whatever the order of the lists.
 - **`View::from_json`** (what a sidecar reads): refuses unknown fields at every level, a `format`
   other than 1, an unknown mode, an address or port that does not parse, a Service key that is not
-  `<namespace>/<name>`, and a document over the bounds of the `Limits` it is given.
+  `<namespace>/<name>`, and a document over the bounds of the `Limits` it is given. From M3 it also
+  refuses, in `routes`: a backend or mirror naming a Service the view does not hold or a port that
+  Service does not have, a `ports` entry the Service does not have, more items than the HTTPRoute
+  CRD allows (16 rules per route, 64 matches per rule, 16 header and 16 query matches per match,
+  16 backends per rule, 16 mirrors per rule, 16 `set`, 16 `add` and 16 `remove` per modifier), a
+  header name that is not a lower-case token, a refused modifier name ("Routes" below), a header or
+  query value with a `CR`, `LF` or `NUL` or over 4096 bytes, a path value that does not start with
+  `/` or is over 1024 bytes, a method not among the nine of the CRD, a weight over 1 000 000, a
+  mirror fraction with a denominator of 0 or a numerator over it.
+- **Routes** (M3, #447; design §5; Gateway API GAMMA). The controller reads every `HTTPRoute`
+  (`gateway.networking.k8s.io/v1`) as `mimic-core` `mesh::input::Route` (namespace, name, UID,
+  generation, creation time, parent refs, rules) and compiles it in `mimic-core` `mesh::route`
+  (pure). A **Service parent** is a `parentRefs` entry with `group: ""` and `kind: Service`; its
+  `namespace` defaults to the route's. Other parents (Gateways) are ignored (M6). `hostnames` is
+  ignored for Service parents (a Service has no host name to match).
+  - **Supported**, per rule: `matches` with `path` (`Exact`, `PathPrefix`; absent: `PathPrefix`
+    `/`), `headers` and `queryParams` of type `Exact`, `method`; `backendRefs` to core Services
+    with `port` and `weight` (default 1, 0 allowed); filters `RequestHeaderModifier`,
+    `ResponseHeaderModifier` and `RequestMirror` (with `percent` or `fraction` when the installed
+    CRD has them; absent: all requests); `timeouts.request` and `timeouts.backendRequest` (Gateway
+    API durations, `0s` disables); `name`. `retry` is ignored: the route stays programmed and its
+    `Accepted` message is `retry is configured by MimicConfig`.
+  - **Not programmed** (the route is in no view, `Accepted: False`, reason `UnsupportedValue`,
+    message `unsupported: <field path>` naming the first such field in document order, e.g.
+    `rules[0].filters[1].type: URLRewrite`; no value of the route is copied but the type): a
+    `RegularExpression` path, header or query match; a filter `URLRewrite`, `RequestRedirect`,
+    `CORS`, `ExtensionRef` or of a type the controller does not know; `backendRefs[].filters`;
+    a field the controller does not know at any level of `spec` (experimental channel); a
+    `RequestHeaderModifier` or `ResponseHeaderModifier` naming (any case) `host`,
+    `content-length`, `transfer-encoding`, `connection`, `keep-alive`, `proxy-connection`, `te`,
+    `trailer`, `upgrade` or a name starting with `x-mimic-`; a route whose `spec` is over 64 KiB of
+    JSON (message `route larger than 64 KiB`; only its key, generation and parents are held).
+  - **Parents and ports**: a Service parent with `port` applies to that Service port only, without
+    `port` to every port; one with `sectionName` is `Accepted: False`, reason `NoMatchingParent`
+    (message `sectionName is not supported for a Service parent`), as is one whose `port` the
+    Service does not have; a Service parent that does not exist gets no status entry (the Gateway
+    API rule for parents an implementation cannot resolve) and the route applies to nothing there.
+  - **Backends**: a `backendRef` of another kind than core `Service` is invalid (`InvalidKind`);
+    one in another namespace than the route without a `ReferenceGrant` of that namespace with
+    `from: {group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: <route namespace>}` and
+    `to: {group: "", kind: Service}` whose `name` is absent, empty or the Service's, or with the
+    `ReferenceGrant` CRD absent, is invalid (`RefNotPermitted`, the same whether the Service exists
+    or not); otherwise one whose Service or port does not exist is invalid (`BackendNotFound`). An
+    invalid backend keeps its weight in the view as `{"invalid":true,"weight":<w>}`, without any
+    name (the sidecar answers its share `500`, #448); an invalid mirror is left out. The route stays
+    programmed and its `ResolvedRefs` is `False` with the first reason in the order
+    `RefNotPermitted`, `InvalidKind`, `BackendNotFound`, the message naming each invalid backend
+    and mirror (`<namespace>/<name>`, at most 1024 bytes).
+  - **Scoping** (GAMMA producer and consumer routes): for a caller in `n` and a Service `m/s` of the
+    view, the routes of `m/s` are the programmed routes of namespace `n` whose Service parent is
+    `m/s` (**consumer routes**, when `n` is not `m`) if there is at least one, else the programmed
+    routes of `m` whose Service parent is `m/s` (**producer routes**). A consumer route therefore
+    changes the calls of its own namespace only, and a route of a third namespace never applies.
+  - **In the view**, per Service, `routes` (absent when none), ordered oldest first by creation
+    time then by `<namespace>/<name>` (the order the Gateway API uses to break match ties; the time
+    itself is not in the view), each rule as written in order, every list item of the route kept
+    in its order, header names lower-cased; the route's `httproute/<namespace>/<name>@<uid>`
+    generation joins the Service's `generations`:
+
+    ```json
+    "routes":[{"name":"shop/cart-canary","ports":[80],"rules":[{
+      "backends":[{"port":80,"service":"shop/cart-v1","weight":90},{"invalid":true,"weight":10}],
+      "filters":{"mirrors":[{"denominator":100,"numerator":10,"port":80,"service":"shop/cart-shadow"}],
+        "requestHeaders":{"add":[{"name":"x-from","value":"mesh"}],"remove":["x-debug"],
+        "set":[{"name":"x-env","value":"prod"}]},"responseHeaders":{"remove":["server"]}},
+      "matches":[{"headers":[{"name":"x-canary","value":"1"}],"method":"GET",
+        "path":{"type":"PathPrefix","value":"/cart"},"queryParams":[{"name":"v","value":"2"}]}],
+      "name":"canary","timeouts":{"backendRequestMs":500,"requestMs":2000}}]}]
+    ```
+
+    `ports` is absent when the route applies to every port; `name`, `matches` fields, `filters`
+    and its members and `timeouts` and its members are absent when not set; `backends` is always
+    present (`[]` for a rule without `backendRefs`, which the sidecar answers `500`, #448). Header
+    and query values are copied as written: the view is as readable as the route (§11.1).
+  - **Status**: for each route with at least one Service parent that exists, one
+    `status.parents[]` entry per such `parentRefs` entry, with that `parentRef` as written,
+    `controllerName: mimic.platform.io/mesh` and two conditions, `Accepted` (`True`, reason
+    `Accepted`; or `False` as above) and `ResolvedRefs` (`True`, reason `ResolvedRefs`; or `False`
+    as above), `observedGeneration` the route's generation. `lastTransitionTime` is the one already
+    in the cluster for that condition while its `status` is unchanged, else the replica's clock
+    (RFC 3339, seconds). The entries of other `controllerName`s are kept as they are and in their
+    order, mimic's follow in `parentRefs` order; mimic's entries for a parent no longer listed, a
+    Service gone or a route without Service parents are removed. The list is atomic in the CRD
+    (shared by every controller of the route), so the controller sends a JSON merge patch of
+    `status` on the `status` subresource carrying the `resourceVersion` it read (field manager
+    `mimic-mesh`), only when mimic's entries differ from the cluster's (ignoring
+    `lastTransitionTime` of unchanged conditions), one route at a time. A `409` (the other replica
+    or another controller wrote first) is counted `conflict` and decided again from the next
+    object read; any other failure `error`, retried after 30 s, with one WARN `httproute status
+    failed` (`route`, `error`) per route and failure streak; a list that would exceed the 32
+    entries of the CRD is not sent (`error`). `mimic_mesh_route_status_total{result}` (`ok`,
+    `conflict`, `error`) counts the patches. A change of a route's `status` alone (the
+    controller's own writes included) builds no view.
+  - **CRD presence**: the `httproutes` reflector starts when the CRD is served, looked for again
+    every 30 s (it may be installed or removed while the controller runs, as for `ReferenceGrant`);
+    `mimic_mesh_gateway_api_present` is 1 while it is served, else 0, with one WARN `gateway api
+    crds missing` per absence (also at start) and one INFO `gateway api crds found` when it comes;
+    while absent, views hold no routes and every other part of the mesh is unchanged. With
+    `MIMIC_MESH=off` routes are neither watched nor written.
+  - **Sidecar** (M3, #447): the sidecar reads and validates `routes` with the view and uses none of
+    them; matching, weights and header modifiers are #448, timeouts #449, mirrors #450.
 - **The sidecar follows its view** (M1, #442). With
   `MIMIC_MESH=on` and a controller URL the sidecar long-polls `GET /v1/workloads/<deployment>/mesh?format=1`
   (§7.2) with `If-None-Match` set to the `ETag` it holds and `Accept-Encoding: gzip`, one request
@@ -3189,7 +3313,10 @@ random numbers it hands to the draw.
 | `mimic_sidecar_api_egress_builds_total` | counter (F9, controller; the sidecar's pull metrics are `mimic_egress_*`), egress projections built (§7.7); `too_large` also counts a pull refused `507` before its build | `result` (`ok`, `too_large`, `unreadable`, `error`) |
 | `mimic_sidecar_api_egress_build_duration_seconds` | histogram (F9, controller), read, check, projection and serialisation of one build; buckets as `mimic_store_write_duration_seconds` | — |
 | `mimic_sidecar_api_egress_cache_bytes` | gauge (F9, controller), bytes of `MIMIC_SIDECAR_API_EGRESS_BUDGET` held by projections, cached or being sent (a build refused by this budget is still counted `ok` in `mimic_sidecar_api_egress_builds_total`) | — |
-| `mimic_mesh_objects` | gauge (M1, controller), objects held by the mesh watches at the last publication | `kind` (`service`, `endpointslice`, `mimicconfig`, `referencegrant`, `deployment`) |
+| `mimic_mesh_objects` | gauge (M1, controller), objects held by the mesh watches at the last publication | `kind` (`service`, `endpointslice`, `mimicconfig`, `referencegrant`, `deployment`, from M3 `httproute`) |
+| `mimic_mesh_gateway_api_present` | gauge (M3, controller), 1 while the `HTTPRoute` CRD is served, else 0 (§7.9 "Routes") | — |
+| `mimic_mesh_routes` | gauge (M3, controller), HTTPRoutes with a Service parent at the last publication | `state` (`programmed`, `unsupported`) |
+| `mimic_mesh_route_status_total` | counter (M3, controller), `status.parents[]` patches of HTTPRoutes (§7.9 "Routes") | `result` (`ok`, `conflict`, `error`) |
 | `mimic_mesh_view_builds_total` | counter (M1, controller), mesh views built (a cached view is not a build) | `result` (`ok`, `truncated`) |
 | `mimic_mesh_view_build_duration_seconds` | histogram (M1, controller), one view build, canonical JSON and ETag included; buckets as `mimic_sidecar_api_egress_build_duration_seconds` | — |
 | `mimic_mesh_watches` | gauge (M1, controller), requests of `GET /v1/workloads/<deployment>/mesh` held now, at most `MIMIC_SIDECAR_API_MAX_WATCHES` | — |
@@ -3826,6 +3953,14 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
 
 ## 11. Security baseline
 
+- Mesh RBAC (M1, with `mesh.enabled`): `get`/`list`/`watch` on `services`, `endpointslices`,
+  `mimicconfigs`, `referencegrants` and `deployments` (metadata only asked for) and `patch` on
+  `mimicconfigs/status` (MSH-29). From M3 (#447): `get`/`list`/`watch` on `httproutes` and `patch`
+  on `httproutes/status` (`gateway.networking.k8s.io`), cluster-wide, as GAMMA routes live in
+  any namespace; never `create`, `update` or `delete` on any Gateway API object, nothing on
+  `gateways`, `gatewayclasses` or `customresourcedefinitions` (M6 adds the Gateway ones). The
+  controller writes only the `status.parents[]` entries whose `controllerName` is
+  `mimic.platform.io/mesh` (§7.9 "Routes"); RBAC cannot narrow the patch to them (accepted, §11.1).
 - Every pod mimic owns runs with `runAsNonRoot`, `readOnlyRootFilesystem`, all capabilities
   dropped, `seccompProfile: RuntimeDefault`, no service account token unless needed (the
   controller needs one from F1). The only exception is `mimic-init`: UID 0 (iptables needs
@@ -4315,6 +4450,33 @@ receive them unasked; on with the bundled Grafana, because that is its only purp
   off or a view of `"mesh": false`. A request the codec cannot frame (client side) is still
   relayed unchanged, and so is what the app answers to it.
 
+- (M3, #447) **Routes are as readable as the views they reach.** Header match values, header
+  modifier values and backend names of an HTTPRoute are copied into the views of every caller it
+  applies to (producer routes: every namespace that has the Service in its view) and into the
+  sidecar's state file. HTTPRoutes are configuration, not Secrets: a credential put in a
+  `RequestHeaderModifier` reaches those pods. `docs/wiki/Mesh.md` says so.
+- (M3) **A route's status says whether its parent Service exists.** A Service parent that does
+  not exist gets no `status.parents[]` entry (the Gateway API rule), so the author of a consumer
+  route learns whether a Service of another namespace exists, which cluster DNS already tells any
+  pod. Backends of another namespace answer `RefNotPermitted` whether they exist or not.
+- (M3) **The status patch is not narrowed by RBAC.** `patch` on `httproutes/status` lets a
+  compromised controller rewrite any route's status (never its `spec`); the controller itself
+  keeps the entries of other controllers (RTE-24). Status entries mimic wrote stay after
+  `helm uninstall` (no controller is left to remove them) until another writer replaces the list.
+- (M3) **Older or experimental Gateway API CRDs.** With CRDs older than v1.2 the API server prunes
+  `timeouts` from every route before mimic reads it, so such a route is programmed without them;
+  with the experimental channel a field the controller does not know keeps the route from being
+  programmed (`UnsupportedValue`), never half-applied. Only the standard channel ≥ v1.2 is
+  supported (§2).
+- (M3) **One GAMMA implementation per Service.** Another mesh that also programs HTTPRoutes with
+  Service parents in the same namespaces would apply the same routes a second time; each writes
+  its own `status.parents[]` entry. Mixing meshes on one workload is not supported (as another
+  iptables tool in the same pod, above).
+- (M3) **Watch load.** Each controller replica holds one cluster-wide watch on `httproutes` (one
+  more per replica, relisted with backoff by `kube-runtime` like the others) and polls for the
+  CRD every 30 s with a `list` of one item while it is absent; a cluster with many routes costs
+  one copy of each route of at most 64 KiB of `spec` per replica (larger ones are held as a key).
+
 ## 12. Delivery plan
 
 One GitHub issue and one PR (or a short stack) per feature. Acceptance criteria are written in
@@ -4342,6 +4504,7 @@ names contain the criterion ID (`fnd_02_…`).
 | M0 | Mode `none` (proxy only, nothing recorded), the new default (#439, design `docs/design/mimic-mesh.md` §2) | (added 2026-11-12) |
 | M1 | `MimicConfig` CRD and the pure mesh view (#440, design `docs/design/mimic-mesh.md` §4.2, §6, §16) | (added 2026-11-12) |
 | M2 | Retries of proxy-level failures on another pod (#445, design `docs/design/mimic-mesh.md` §7); the retry budget is #446 | (added 2026-11-14) |
+| M3 | Gateway API prerequisite and HTTPRoute (GAMMA) ingestion in the controller (#447, design `docs/design/mimic-mesh.md` §4.2, §5); routing in the sidecar is #448, timeouts #449, mirrors #450 | (added 2026-11-14) |
 
 ### 12.1 F0 — Foundations
 
@@ -5247,6 +5410,46 @@ budget, whose floor (100 retries per window) none of their tests reaches.
 | RTY-56 | **E** (kind, `scripts/e2e.sh` section `rty_56`, own namespace, cleaned by a trap). The set-up of RTY-21 (a Service of 3 pods, one not injected and listening on no port while Ready, an injected client): 100 `GET` are answered `200`; a `MimicConfig` targeting the Service with `retries: 0` is `Accepted: True`, and once the client sidecar's `mimic_mesh_view_pulls_total{result="ok"}` grew by one (at most 30 s), 100 `GET` give at least one `503` `x-mimic-error: connect-failed` while `mimic_mesh_retries_total` of that backend does not change; once the `MimicConfig` is deleted and the next view applied, 100 `GET` are all answered `200` again. |
 | RTY-57 | **D** (documentation review). `docs/wiki/Mesh.md` "Retries" explains the budget (the formula, per caller pod and Service, the window, what happens over budget, `retries: 0`) with a `MimicConfig` example and a worked number (defaults: 100 retries per 10 s window plus 20 % of the requests); `Monitoring.md` lists `mimic_mesh_retry_budget_exhausted_total`; `Troubleshooting.md` has the `retry budget exhausted` line; `CHANGELOG.md` *Unreleased* names the two fields and the metric, and that `retries: 0` also stops the fallback to the ClusterIP. |
 | RTY-58 | **D** (security review). The WARN is rate-limited per backend (RTY-51) and holds no request data; the new metric has the `backend` label only (RTY-55); budget and limiter state is bounded by the Services of the view (RTY-41, RTY-54); the CEL and `from_json` bounds hold (RTY-44, RTY-45, RTY-48); the amplification left is the one written in §11.1 ("Idempotent by method name", "The budget is per caller pod"); `mimic-core` stays pure (the clock passed in). |
+
+### 12.23 M3 — HTTPRoute ingestion (#447)
+
+Design: `docs/design/mimic-mesh.md` §4.2, §5, §15. Spec text: §2 (prerequisites), §7, §7.2, §7.9
+("Scope", "Bounds", "`View::from_json`", "Routes"), §9, §11, §11.1. Levels as in §12.2, plus **D**
+(review). RTE-01 to RTE-39 are #447; #448, #449 and #450 take RTE-40 and after. Out of scope: using
+routes in the sidecar (#448 to #450), Gateway parents (M6), `GRPCRoute`. In the **I** tests the
+controller's hub runs in process with objects fed to its reflector inputs and a fake status API
+(an in-memory route store with a `resourceVersion` that answers `409` to a stale one), as MSH-25.
+
+| ID | Criterion |
+|---|---|
+| RTE-01 | **U** (`mimic-core` `mesh::route`). Compilation: a route using every supported item (§7.9 "Routes") compiles to the JSON of the example byte for byte; a rule without `matches` gets `[{"path":{"type":"PathPrefix","value":"/"}}]`, one without `backendRefs` `"backends":[]`; an absent weight is 1 and a weight 0 is kept; header names are lower-cased and every value is kept as written; durations `1h30m`, `500ms`, `2s`, `1m1s1ms` and `0s` give 5400000, 500, 2000, 61001 and 0; a mirror with `percent: 10` gives `numerator` 10 `denominator` 100, `fraction: {numerator: 1}` gives 1/100, none gives 100/100; list items keep their order. |
+| RTE-02 | **U.** Not programmed: each of a `RegularExpression` path, header and query match, a filter `URLRewrite`, `RequestRedirect`, `CORS`, `ExtensionRef` and an unknown type, a `backendRefs[].filters` entry and an unknown field gives `Accepted: False`, reason `UnsupportedValue`, message `unsupported: <path>` with the exact field path of the first one in document order (two in one route: the first is named); no header, query or path value of the route is in the message; the route is in no view, and another route of the same Service is still programmed. |
+| RTE-03 | **U.** Refused modifier names: `set`, `add` and `remove` of a `RequestHeaderModifier` and of a `ResponseHeaderModifier` naming `host`, `Content-Length`, `transfer-encoding`, `connection`, `keep-alive`, `proxy-connection`, `te`, `trailer`, `upgrade`, `x-mimic-error` or `X-Mimic-Anything` make the route `UnsupportedValue` naming the field; `x-mimic` without the dash, `hostname` and `x-content-length` are accepted. A value `View::from_json` refuses (RTE-12: `CR`, `LF` or `NUL` or over 4096 bytes in a header, query or modifier value, a path not starting with `/` or over 1024 bytes, a non-token header name, a method outside the CRD, a mirror fraction with a zero denominator or above 1, and one item over a CRD maximum of RTE-12: 16 rules, 64 matches, 16 headers, query params, backends, mirrors or modifier names per list, weight 1000001) makes the route `UnsupportedValue` naming its field path, with the same predicates, so no such route reaches a view. |
+| RTE-04 | **U.** `retry`: a route with `retry` in any rule is programmed (its `retry` in no view), `Accepted: True`, reason `Accepted`, message `retry is configured by MimicConfig`; without `retry` the message is empty; `hostnames` change nothing in the view or the status. |
+| RTE-05 | **U.** Parents: `port: 80` gives `"ports":[80]`, no `port` gives no `ports` key, two parent entries for one Service (`80` and none) give no `ports` key, `80` and `81` give `[80,81]`; a `port` the Service lacks and a `sectionName` give that entry `Accepted: False`, `NoMatchingParent`, the other entries unaffected; a Service parent that does not exist gets no entry; Gateway parents and parents of another group or kind get no entry and add nothing; a parent without `namespace` is in the route's namespace. |
+| RTE-06 | **U** (consent, as MSH-03). A `backendRef` or mirror in another namespace than the route is valid only with a `ReferenceGrant` of its namespace `from` (`gateway.networking.k8s.io`, `HTTPRoute`, the route's namespace) `to` (`""`, `Service`, name absent, empty or equal). Each of these gives `RefNotPermitted`, the message naming `<namespace>/<name>`, the same whether the Service exists: `from` namespace, kind (a `MimicConfig` grant does not count) or group wrong, `to` kind, group or name wrong, the grant in a third namespace, no grant, the CRD absent; a consumer route whose backend is its own parent Service in another namespace needs the grant too. A `backendRef` of kind `ServiceImport` gives `InvalidKind`, a missing Service or port `BackendNotFound`; with several, the reason is the first of `RefNotPermitted`, `InvalidKind`, `BackendNotFound` and the message lists each one; an invalid backend is `{"invalid":true,"weight":<w>}` with no name, an invalid mirror is absent; the route stays `Accepted: True`. |
+| RTE-07 | **U** (`mesh::view`, scoping). For Service `m/s`: a caller of `m` sees the producer routes of `m`; a caller of `n` sees the programmed consumer routes of `n` for `m/s` when there is at least one, else the producer routes of `m`; a consumer route of `n` is in no view of another namespace; a route of a third namespace whose parent is `m/s` applies to nobody else; a consumer route that is not programmed does not hide the producer routes. |
+| RTE-08 | **U.** Order and generations: routes are ordered by creation time, then `<namespace>/<name>` (same time), rules in their written order; each route of a Service puts `httproute/<namespace>/<name>@<uid>` with its generation in that Service's `generations`; a view without any route is byte-identical to the M1 view of the same objects (no `routes` key: every MSH and RTY golden view is unchanged). |
+| RTE-09 | **U** (closure). The valid backends and mirrors of the routes of a view are added as Services with their endpoints and policy, once; their own routes are not followed (a backend of another namespace with a producer route carries no `routes`, one of `n` carries its own); a backend of another namespace without the HTTPRoute grant adds nothing of that namespace (no IP, port, zone, readiness or name anywhere in the view). |
+| RTE-10 | **U** (bounds). With the closure Services over `MIMIC_MESH_MAX_SERVICES`, `_ENDPOINTS` or `_VIEW_BYTES`: the Services of `n` and the declared destinations come first, the closure ones last in key order; a route that names a Service left out is left out of its Service's `routes` and listed in `skippedRoutes` (at most 16 keys); property (`proptest`): no view names in `routes` a Service it does not hold and every view passes `View::from_json` with the same `Limits`. |
+| RTE-11 | **U** (`proptest`, as MSH-09). Any permutation of the HTTPRoutes and `ReferenceGrant`s among the other objects of MSH-09 gives byte-identical view JSON, the same ETag and the same route statuses. |
+| RTE-12 | **U** (`View::from_json`). It reads back every view `build` writes with routes; it refuses each item of §7.9 "`View::from_json`" for routes: a backend or a mirror naming a Service not held or a port it lacks, a `ports` entry the Service lacks, one item over each CRD maximum, an upper-case or non-token header name, each refused modifier name of RTE-03, a value with `CR`, `LF` or `NUL` or of 4097 bytes, a path not starting with `/` or of 1025 bytes, method `get` and `PROPFIND`, weight 1000001, a fraction 1/0 and 3/2, and an unknown field in a route, rule, match, backend, filter, modifier, mirror and timeouts. |
+| RTE-13 | **U** (next to the adapters, as MSH-27). An `HTTPRoute` object converts to `mesh::input::Route` (namespace, name, UID, generation, creation time, parent refs, rules); a field the converter does not know at any level of `spec` is kept as its path only (for RTE-02), with the experimental `sessionPersistence` and a made-up field as examples; a `spec` over 64 KiB of JSON converts to the key, generation and parents only and compiles to `UnsupportedValue` `route larger than 64 KiB`; labels, annotations and `status` are in no input struct, so two objects differing only there convert equal. |
+| RTE-14 | **U** (controller `mesh::status`, clock passed in). The `status.parents[]` list to write: the entries of other `controllerName`s kept in their order and unchanged, mimic's after them in `parentRefs` order with `controllerName: mimic.platform.io/mesh`, `observedGeneration` and both conditions; `lastTransitionTime` kept from the cluster's entry while that condition's `status` is unchanged (a new `reason` or `message` keeps it), the clock's value (RFC 3339, seconds) when it changes; mimic's entries for a parent no longer listed, for a Service gone and for a route without Service parents removed; "write needed" is false when only `lastTransitionTime` of unchanged conditions differ; a list over 32 entries is not written (`error`); messages are cut to 1024 bytes on a character boundary. |
+| RTE-15 | **I** (views follow routes). A route fed to the hub gives a new view and ETag to a caller it applies to and wakes its held request within the debounce plus 100 ms; its deletion removes its routes at the next view; a change of its `status` alone (the controller's own patch included) builds no view (`mimic_mesh_view_builds_total` unchanged) and wakes no held request; a caller it does not apply to keeps its ETag. |
+| RTE-16 | **I** (two replicas, fake status API). Two hubs fed the same objects (a programmed route, a `URLRewrite` route, a route with a cross-namespace backend and no grant, and a route whose status holds an entry of `controllerName: example.com/other`) write exactly the entries of RTE-14; per route and transition at most one patch per replica succeeds and the other is `ok` or `conflict`; after convergence 10 more publications send no patch; the other controller's entry is unchanged; a `ReferenceGrant` fed later turns `ResolvedRefs` to `True` with one more patch per replica at most; every patch carries the `resourceVersion` read and field manager `mimic-mesh`. |
+| RTE-17 | **I** (failures). A status API failing with `500`: `mimic_mesh_route_status_total{result="error"}` grows, one WARN `httproute status failed` (`route`, `error`) per route and streak, the patch is tried again after 30 s and succeeds once the API answers; the WARN holds no header, query or path value of the route. |
+| RTE-18 | **I** (CRD presence). With the `httproutes` resource answering `404`: `mimic_mesh_gateway_api_present` 0, one WARN `gateway api crds missing` (not one per 30 s), views served without routes and with their endpoints; when it answers again: one INFO `gateway api crds found`, the gauge 1, routes in the next view; when it disappears again: the routes are gone from the next view and one WARN is logged again. |
+| RTE-19 | **I** (metrics, kill switch). `mimic_mesh_objects{kind="httproute"}` counts the routes held, `mimic_mesh_routes{state}` the programmed and unsupported routes with a Service parent; `mimic_mesh_route_status_total` has the `result` label only. With `MIMIC_MESH=off` no request reaches `httproutes` and no route status is written. |
+| RTE-20 | **I** (sidecar, as MSH-33). A sidecar fed a view with routes accepts it (`mimic_mesh_view_pulls_total{result="ok"}`), and its requests are balanced over the Service's pods exactly as with the same view without routes (the routes' backends receive nothing they would not have received); a view whose route names a Service it does not hold is refused (`result="invalid"`) and the held view is kept. |
+| RTE-21 | **E** (kind, `scripts/e2e.sh` section `rte_21`, own namespaces, cleaned by a trap, the pinned CRDs of RTE-25). A route with a Service parent and two weighted backends gets, within 10 s, one `status.parents[]` entry with `controllerName: mimic.platform.io/mesh`, `Accepted: True`, `ResolvedRefs: True`, `observedGeneration` its generation; the view served to an injected caller (its state file) holds the route and both backends; with the two controller replicas running, the route's `resourceVersion` does not change over 10 s once converged. |
+| RTE-22 | **E** (same section). A route with a `URLRewrite` filter gets `Accepted: False`, `UnsupportedValue`, a message naming `rules[0].filters[0].type`, and is absent from the view; a route with a backend in another namespace gets `ResolvedRefs: False` `RefNotPermitted` until a `ReferenceGrant` `from: HTTPRoute` is created there (then `True`, the backend in the view), and back after it is deleted; an entry of `controllerName: example.com/other` patched into a route's status beforehand is still there. |
+| RTE-23 | **E** (same section). The Gateway API CRDs deleted while the mesh runs: the controller logs `gateway api crds missing` and reports `mimic_mesh_gateway_api_present 0` within 40 s, and 100 requests from the injected caller to a Service of 3 pods are all answered `200` and reach more than one pod (`mimic_mesh_endpoint_requests_total`); installed again, `gateway api crds found` is logged and a route created then gets its status. |
+| RTE-24 | **D** (code review, RTE-16, RTE-22). The controller never removes or changes a `status.parents[]` entry whose `controllerName` is not `mimic.platform.io/mesh`, and writes no field of an HTTPRoute but `status.parents`. |
+| RTE-25 | **C** (`scripts/check-pins.sh`). The Gateway API manifest of `scripts/e2e.sh` is pinned once, used by `msh_28` and `rte_21`: version `v1.7.0` (equal to the version named in §2 and `docs/wiki/Install.md`), URL `https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml`, SHA-256 `4e2602c4cbe1afbc394d86f4ac6522e1a5263b01133bba1e40a6d1a549e753a1`; the script fails when the version, URL or a 64-hex digest is missing or differs between the places; `msh_28` passes with it (its `ReferenceGrant` `v1beta1` is still served). |
+| RTE-26 | **E** (chart, `scripts/check-chart.sh`, as MSH-29). With `mesh.enabled` the ClusterRole grants `get`, `list`, `watch` on `httproutes` and `patch` on `httproutes/status` (`gateway.networking.k8s.io`), and on that group nothing else but `referencegrants` `get`, `list`, `watch`: no `create`, `update` or `delete`, no `gateways`, `gatewayclasses`; nothing on `customresourcedefinitions`; with `mesh.enabled: false` none of them; the default render is the golden file. |
+| RTE-27 | **D** (documentation review). `docs/wiki/Install.md` has a "Gateway API (optional)" prerequisite: standard channel ≥ v1.2, tested v1.7.0, the `kubectl apply --server-side` command with the pinned URL, what works without it; `docs/wiki/Mesh.md` has "Routes": what is supported and refused, producer and consumer routes, a `ReferenceGrant` `from: HTTPRoute` example, how to read the status, that the sidecar applies routes from #448, and the warning of §11.1 that route values reach callers' views; `Monitoring.md` lists the three new metrics and the new `kind`; `Troubleshooting.md` has `gateway api crds missing`, `UnsupportedValue` and `RefNotPermitted`; `CHANGELOG.md` *Unreleased* names the feature, the new RBAC and the prerequisite. |
+| RTE-28 | **D** (security review). Cross-namespace data only through `ReferenceGrant` (RTE-06, RTE-09); consumer routes affect only their namespace (RTE-07); routes cannot touch framing, `host` or `x-mimic-*` fields (RTE-03, RTE-12); memory bounded per route (RTE-13) and per view (RTE-10); no route value in logs or status messages (RTE-02, RTE-17); status writes idempotent and bounded (RTE-14, RTE-16); RBAC as RTE-26; the limits of §11.1 (M3) are written. |
 
 ## 13. Test strategy
 

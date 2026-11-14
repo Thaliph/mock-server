@@ -105,6 +105,60 @@ async fn msh_48_one_h2c_client_is_spread_over_the_three_pods() {
 }
 
 #[tokio::test]
+async fn rte_20_requests_are_balanced_as_without_routes_and_the_routes_backends_get_nothing() {
+    let _logs = capture_logs();
+    let (a, b, c) = three().await;
+    let shadow = Pod::http1("shadow", 0).await;
+    let endpoint = |p: &Pod| {
+        format!(
+            r#"{{"ip":"{}","port":{},"ready":true}}"#,
+            p.addr.ip(),
+            p.addr.port()
+        )
+    };
+    let service = |ip: &str, pods: Vec<String>, routes: &str| {
+        format!(
+            r#"{{"endpoints":{{"80":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":0}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"80":{{"targetPort":8080}}}}{routes}}}"#,
+            pods.join(",")
+        )
+    };
+    let routes = r#","routes":[{"name":"shop/canary","rules":[{"backends":[{"port":80,"service":"shop/shadow","weight":100}],"filters":{"mirrors":[{"denominator":100,"numerator":100,"port":80,"service":"shop/shadow"}]},"matches":[{"path":{"type":"PathPrefix","value":"/"}}]}]}]"#;
+    let cart = service(
+        "127.0.0.1",
+        [&a, &b, &c].iter().map(|p| endpoint(p)).collect(),
+        routes,
+    );
+    let text = format!(
+        r#"{{"cluster":"local","format":1,"generations":{{}},"mesh":true,"mode":"none","services":{{"shop/cart":{cart},"shop/shadow":{}}}}}"#,
+        service("10.96.0.99", vec![endpoint(&shadow)], "")
+    );
+    let view =
+        mimic_core::mesh::view::View::from_json(&text, &mimic_core::mesh::view::Limits::default())
+            .expect("a view with routes");
+    let state = MeshState::new(&MeshConfig {
+        enabled: true,
+        seed: Some(7),
+        ..MeshConfig::default()
+    });
+    state.hold(view, "\"1-r\"");
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    let mut bodies = Vec::new();
+    for n in 0..3000 {
+        let (head, body) = client.get(&format!("/{n}")).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        bodies.push(body);
+    }
+    // Exactly the spread of msh_48 without routes, and nothing for the routes' backend.
+    let counts = spread(bodies);
+    assert_eq!(counts.len(), 3, "{counts:?}");
+    for (pod, n) in &counts {
+        assert!((900..=1100).contains(n), "{pod} got {n}: {counts:?}");
+    }
+    assert_eq!(shadow.counts.requests(), 0);
+}
+
+#[tokio::test]
 async fn msh_49_a_slow_pod_gets_fewer_requests() {
     let _logs = capture_logs();
     let a = Pod::http1("a", 0).await;

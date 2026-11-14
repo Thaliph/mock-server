@@ -282,6 +282,8 @@ struct KubeState {
     ca_bundles: Vec<String>,
     config_version: u64,
     unknown: Vec<String>,
+    /// The paths of every request, to see what the mesh does not ask (MIMIC_MESH=off).
+    seen: Vec<String>,
 }
 
 const SECRET_PATH: &str = "/api/v1/namespaces/mimic-system/secrets/mimic-webhook-tls";
@@ -322,6 +324,7 @@ impl FakeKube {
             ca_bundles: vec![String::new(); 3],
             config_version: 1,
             unknown: Vec::new(),
+            seen: Vec::new(),
         }));
         let shared = state.clone();
         thread::spawn(move || {
@@ -384,6 +387,7 @@ fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
         let shared = state.clone();
         let mut state = state.lock().unwrap();
+        state.seen.push(path.to_string());
         let (status, reply) = match (method.as_str(), path) {
             ("GET", SECRET_PATH) => (200, secret_json(&state)),
             ("PUT", SECRET_PATH) => {
@@ -469,7 +473,8 @@ fn kube_connection(stream: TcpStream, state: Arc<Mutex<KubeState>>) {
                 (200, list)
             }
             // The mesh watches (#441): nothing in the cluster, and no `ReferenceGrant` CRD.
-            ("GET", "/apis/gateway.networking.k8s.io/v1beta1/referencegrants") => (
+            ("GET", "/apis/gateway.networking.k8s.io/v1beta1/referencegrants")
+            | ("GET", "/apis/gateway.networking.k8s.io/v1/httproutes") => (
                 404,
                 serde_json::json!({"apiVersion": "v1", "kind": "Status",
                 "status": "Failure", "reason": "NotFound", "code": 404, "message": "no"}),
@@ -903,6 +908,53 @@ fn inj_20_a_changed_or_emptied_ca_bundle_is_restored_within_10s() {
     wait_until(|| kube.ca_bundles().iter().all(|b| *b == encoded));
     assert_eq!(kube.secret(), data, "no new certificate");
     assert!(kube.state.lock().unwrap().unknown.is_empty());
+}
+
+#[test]
+fn rte_19_with_the_mesh_off_no_request_reaches_httproutes_and_with_it_on_one_does() {
+    let valkey = FakeValkey::start("127.0.0.1:0".parse().unwrap());
+    let url = format!("redis://{}", valkey.addr);
+    let asked = |kube: &FakeKube| {
+        let state = kube.state.lock().unwrap();
+        (
+            state.seen.iter().any(|p| p.ends_with("/httproutes")),
+            state.seen.iter().any(|p| p.ends_with("/services")),
+            state.unknown.clone(),
+        )
+    };
+
+    let off = FakeKube::start("rte19-off");
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[
+            ("MIMIC_VALKEY_URL", &url),
+            ("KUBECONFIG", &off.kubeconfig),
+            ("MIMIC_MESH", "off"),
+        ]),
+    );
+    wait_status(
+        controller.admin_addr(),
+        "/readyz",
+        200,
+        Duration::from_secs(15),
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(asked(&off), (false, false, vec![]));
+    drop(controller);
+
+    let on = FakeKube::start("rte19-on");
+    let mut controller = Process::spawn(
+        BIN,
+        &env(&[("MIMIC_VALKEY_URL", &url), ("KUBECONFIG", &on.kubeconfig)]),
+    );
+    wait_status(
+        controller.admin_addr(),
+        "/readyz",
+        200,
+        Duration::from_secs(15),
+    );
+    wait_until(|| asked(&on).0);
+    assert_eq!(asked(&on), (true, true, vec![]));
 }
 
 /// A non-loopback address of the host: the one it would use to reach a remote peer.
