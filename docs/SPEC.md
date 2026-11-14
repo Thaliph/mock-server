@@ -2932,7 +2932,7 @@ random numbers it hands to the draw.
   | `mimic_tls_passthrough_destinations` | gauge, remembered destinations (§5) | — |
   | `mimic_tls_intermediate_expiry_timestamp_seconds` | gauge, `notAfter` of the current intermediate, 0 when none | — |
   | `mimic_tls_intermediate_requests_total` | counter | `result` (`ok`, `error`, `mismatch`) |
-  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `authority_limit` (F7, outbound), `dropped`, `panic`, from F11 `load`: an inbound load request forwarded and not recorded, §7.8) |
+  | `mimic_discovery_exchanges_total` | counter (F4), HTTP exchanges seen by discovery | `direction`, `result` (`recorded`, `not_found`, `invalid`, `endpoint_limit`, `authority_limit` (F7, outbound), `dropped`, `panic`, from F11 `load`: an inbound load request forwarded and not recorded, §7.8, from M1 `synthetic`: an answer the mesh generated itself, §4.1) |
   | `mimic_discovery_bodies_total` | counter (F4), bodies of recorded exchanges | `direction`, `part` (`request`, `response`), `result` (`parsed`, `empty`, `opaque`, `too_large`, `encoding`, `invalid`, `budget`) |
   | `mimic_discovery_samples_total` | counter (F4), sample admissions | `direction`, `result` (`kept`, `replaced`, `rejected`, `budget`) |
   | `mimic_discovery_redactions_total` | counter (F4) | `location` (`path`, `query`, `header`, `body`), `rule` (`name`, `jwt`, `pem`, `credential`, `card`, `aws`, `token_prefix`, `userinfo`, from F7 `outbound_header`, §6.1) |
@@ -4874,6 +4874,18 @@ MSH-18 to MSH-30 and MSH-80 to MSH-84 are #441 (the watches, the route, the char
 | MSH-82 | **I.** A held request whose client goes away (the request future is dropped) releases its share of the budget, of its pod and of its namespace: the gauge is 0 and the pod holds its 2 again. |
 | MSH-83 | **U** (controller configuration). Unset: `MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD` 2, `MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT` 25; exit 2 (FND-01) for a per-pod cap of 0 or 101 and a percentage of 0 or 101. |
 | MSH-84 | **E** (chart, `scripts/check-chart.sh`). With `mesh.enabled` and `loadTest.enabled` the ClusterRole has one rule on `endpointslices`. |
+
+#### M1 failure modes (#444)
+
+Design: `docs/design/mimic-mesh.md` §13. Already covered by earlier criteria: the controller's silence keeps the view and the mode and the long-poll retries with the 1 to 30 s jittered backoff, the delay never below 1 s (MSH-31, MSH-33, MSH-35, MSH-36, MSH-41; the "controller down" row of the design's §13 is these), a view older than `MIMIC_MESH_STALE_AFTER` goes to the ClusterIP (MSH-61), the `no-endpoint` answer (MSH-53). These add what was missing: the synthetic answers are counted by discovery and never recorded, the stale fallback in both directions, and the behaviour measured on a cluster.
+
+Generated answers (`no-endpoint`, `connect-failed`, `invalid-response`, `unsupported`) count `mimic_discovery_exchanges_total{direction="outbound",result="synthetic"}` (discovery on) and are never recorded. **A stale fallback keeps no pod identity**: the request goes to the ClusterIP, the access line's `upstream` is the ClusterIP, and the retries of #445 that follow the pod that answered (`x-mimic-endpoint`) are not done on it, since the caller cannot know which pod kube-proxy chose; the sidecar makes exactly one attempt there.
+
+| ID | Criterion |
+|---|---|
+| MSH-85 | **I** (sidecar, discovery on). A Service port with no endpoint is answered `503` `x-mimic-error: no-endpoint` `content-length: 0` at once, the ClusterIP receives nothing (no fallback, `mimic_mesh_fallbacks_total` 0), `GET /discovery` records nothing for it and `mimic_discovery_exchanges_total{direction="outbound",result="synthetic"}` counts it (a `connect-failed` answer too); a port whose endpoints are all serving and terminating (`ready: false`) is balanced over them and answered by a pod. |
+| MSH-86 | **I.** Stale view and recovery: with a view older than `MIMIC_MESH_STALE_AFTER` (200 ms) requests go to the ClusterIP and not once to a pod of the view, even when the ClusterIP refuses (the answer is then `503` `connect-failed`, never a pod); one WARN `mesh view stale` is written however many requests and ticks follow; a request on the ClusterIP is sent exactly once (no retry); when a view is applied again the next requests, on the same connection, go to the pods, `mimic_mesh_view_age_seconds` is back to 0 and a later staleness writes the WARN again. |
+| MSH-87 | **E** (kind, `scripts/e2e.sh` section `msh_87`, own namespaces, cleaned by a trap). Both controller replicas scaled to 0: a client calling a 3-pod Service by name through its sidecar keeps getting `200` for 20 s (no error), then the controller is restored and the sidecar pulls again. A rolling restart of the callee under a steady client (10 requests/s): the errors seen during the rollout are counted and printed (`msh_87: rollout errors N of M`, the M2 baseline, never a failure by themselves); the client sees none in the 10 s after the rollout ended. |
 
 ## 13. Test strategy
 
