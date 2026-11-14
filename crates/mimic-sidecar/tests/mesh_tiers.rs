@@ -189,8 +189,8 @@ async fn three_tiers(b_meshed: bool) {
     for n in 1..=REQUESTS {
         let before = c_total();
         let body = vec![b'x'; 100];
-        let mut request = b"POST /p HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: 100\r\n\r\n"
-            .to_vec();
+        let mut request =
+            b"POST /p HTTP/1.1\r\nHost: cart.shop.svc\r\nContent-Length: 100\r\n\r\n".to_vec();
         request.extend_from_slice(&body);
         client.send(&request).await;
         let (head, got) = client.read().await.expect("an answer");
