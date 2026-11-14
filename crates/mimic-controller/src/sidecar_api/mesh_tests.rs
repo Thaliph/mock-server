@@ -830,7 +830,7 @@ async fn msh_88_a_held_request_is_not_answered_with_a_changed_view_within_a_seco
     let body = answer.text();
     assert!(
         body.contains("10.244.0.50") && body.contains("10.244.0.51"),
-        "{body}"
+        "the coalesced view lacks an endpoint"
     );
 }
 
