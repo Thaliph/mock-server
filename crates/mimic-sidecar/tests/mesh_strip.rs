@@ -435,7 +435,7 @@ async fn rty_18_an_unframeable_response_is_not_relayed_and_closes_the_connection
     }
     logs.settled().await;
     let text = logs.text();
-    assert!(text.contains("cannot frame"), "{text}");
+    assert!(text.contains("cannot frame"), "the close is logged");
     assert!(!text.contains("x-mimic"), "no byte of the app is logged");
 }
 
