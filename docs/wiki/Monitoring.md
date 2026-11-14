@@ -67,7 +67,7 @@ minutes later.
 
 | Metric (sidecar) | Type | Labels |
 |---|---|---|
-| `mimic_mesh_requests_total` | counter, one per mesh-routed request | `service`, `route` (`none`), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, or that of a trusted refusal passed to the app) |
+| `mimic_mesh_requests_total` | counter, one per mesh-routed request | `service`, `route` (the matched route `<namespace>/<name>`, `none` without a match; at most 256 distinct values, the next ones are `other`, and the series of a route that left the view go 5 minutes later), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, among them `no-route` (no rule of the port's routes matched), `no-backend` (every weight of the rule is 0) and `invalid-backend` (the drawn backend is not valid), or that of a trusted refusal passed to the app) |
 | `mimic_mesh_request_duration_seconds` | histogram, until the response head, spanning every try | `service`, `backend`, `status_class` |
 | `mimic_mesh_endpoint_requests_total` | counter, each try written to a pod | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
 | `mimic_mesh_endpoint_in_flight` | gauge, per pod | `backend`, `endpoint` |
