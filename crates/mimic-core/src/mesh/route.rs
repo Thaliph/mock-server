@@ -6,10 +6,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use super::input::{
-    BackendRef, GATEWAY_GROUP, HeaderModifier, NameMatch, ReferenceGrant, Route, RouteFilter,
-    RouteRule, Service,
+    BackendRef, GATEWAY_GROUP, HeaderModifier, Mirror, NameMatch, ReferenceGrant, Route,
+    RouteFilter, RouteRule, Service,
 };
 use super::policy::Condition;
+use super::view::{fraction, header_name, header_value, method, path_value};
 
 /// Field order is alphabetical in every struct below: the JSON is canonical (sorted keys).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,11 +427,7 @@ fn compile_rule(rule: &RouteRule, resolver: &mut Resolver) -> RuleView {
                 let target =
                     resolver.resolve(&m.group, &m.kind, m.namespace.as_deref(), &m.name, m.port);
                 if let Some((service, port)) = target {
-                    let (numerator, denominator) = match (m.percent, m.fraction) {
-                        (Some(p), _) => (p, 100),
-                        (None, Some((n, d))) => (n, d.unwrap_or(100)),
-                        (None, None) => (100, 100),
-                    };
+                    let (numerator, denominator) = mirror_fraction(m);
                     filters.mirrors.push(MirrorView {
                         denominator,
                         numerator,
@@ -455,6 +452,15 @@ fn compile_rule(rule: &RouteRule, resolver: &mut Resolver) -> RuleView {
         matches,
         name: rule.name.clone(),
         timeouts: (timeouts != TimeoutsView::default()).then_some(timeouts),
+    }
+}
+
+/// The numerator and denominator of a mirror: `percent`, else `fraction`, else everything.
+fn mirror_fraction(m: &Mirror) -> (u32, u32) {
+    match (m.percent, m.fraction) {
+        (Some(p), _) => (p, 100),
+        (None, Some((n, d))) => (n, d.unwrap_or(100)),
+        (None, None) => (100, 100),
     }
 }
 
@@ -589,12 +595,77 @@ fn rule_unsupported(i: usize, rule: &RouteRule) -> Option<String> {
             }
         }
     }
+    if let Some(path) = value_unsupported(&at, rule) {
+        return Some(path);
+    }
     for (field, value) in [
         ("request", &rule.request_timeout),
         ("backendRequest", &rule.backend_request_timeout),
     ] {
         if value.as_deref().is_some_and(|v| duration_ms(v).is_none()) {
             return Some(format!("{at}.timeouts.{field}"));
+        }
+    }
+    None
+}
+
+/// The path of the first value the view would refuse (`View::from_json`, RTE-12), found by the
+/// predicates it uses: a route holding one is in no view, so no sidecar rejects the whole view.
+fn value_unsupported(at: &str, rule: &RouteRule) -> Option<String> {
+    for (j, m) in rule.matches.iter().enumerate() {
+        let at = format!("{at}.matches[{j}]");
+        if let Some(p) = &m.path
+            && !path_value(&p.value)
+        {
+            return Some(format!("{at}.path.value"));
+        }
+        if m.method.as_deref().is_some_and(|v| !method(v)) {
+            return Some(format!("{at}.method"));
+        }
+        for (list, items, lower) in [
+            ("headers", &m.headers, true),
+            ("queryParams", &m.query_params, false),
+        ] {
+            for (k, n) in items.iter().enumerate() {
+                if lower && !header_name(&n.name.to_ascii_lowercase()) {
+                    return Some(format!("{at}.{list}[{k}].name"));
+                }
+                if !header_value(&n.value) {
+                    return Some(format!("{at}.{list}[{k}].value"));
+                }
+            }
+        }
+    }
+    for (j, f) in rule.filters.iter().enumerate() {
+        let at = format!("{at}.filters[{j}]");
+        if let Some(m) = &f.request_mirror {
+            let (n, d) = mirror_fraction(m);
+            if !fraction(n, d) {
+                return Some(format!("{at}.requestMirror"));
+            }
+        }
+        for (field, modifier) in [
+            ("requestHeaderModifier", &f.request_header_modifier),
+            ("responseHeaderModifier", &f.response_header_modifier),
+        ] {
+            let Some(m) = modifier else { continue };
+            for (list, pairs) in [("set", &m.set), ("add", &m.add)] {
+                for (k, (name, value)) in pairs.iter().enumerate() {
+                    if !header_name(&name.to_ascii_lowercase()) {
+                        return Some(format!("{at}.{field}.{list}[{k}].name"));
+                    }
+                    if !header_value(value) {
+                        return Some(format!("{at}.{field}.{list}[{k}].value"));
+                    }
+                }
+            }
+            if let Some(k) = m
+                .remove
+                .iter()
+                .position(|n| !header_name(&n.to_ascii_lowercase()))
+            {
+                return Some(format!("{at}.{field}.remove[{k}]"));
+            }
         }
     }
     None

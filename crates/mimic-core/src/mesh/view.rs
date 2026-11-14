@@ -160,15 +160,30 @@ const METHODS: [&str; 9] = [
 ];
 
 /// A lower-case HTTP token.
-fn header_name(name: &str) -> bool {
+pub(super) fn header_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b)
         })
 }
 
-fn header_value(value: &str) -> bool {
+pub(super) fn header_value(value: &str) -> bool {
     value.len() <= MAX_VALUE_BYTES && !value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
+}
+
+/// A path match value (the type is checked apart).
+pub(super) fn path_value(value: &str) -> bool {
+    value.starts_with('/')
+        && value.len() <= MAX_PATH_BYTES
+        && !value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
+}
+
+pub(super) fn method(method: &str) -> bool {
+    METHODS.contains(&method)
+}
+
+pub(super) fn fraction(numerator: u32, denominator: u32) -> bool {
+    denominator != 0 && numerator <= denominator
 }
 
 /// Refuses in `routes` what `build` never writes (RTE-12).
@@ -219,14 +234,11 @@ fn check_rule(rule: &RuleView, held: &dyn Fn(&str, u16) -> bool) -> Result<(), S
             }
         }
         if let Some(path) = &m.path
-            && (!matches!(path.kind.as_str(), "Exact" | "PathPrefix")
-                || !path.value.starts_with('/')
-                || path.value.len() > MAX_PATH_BYTES
-                || path.value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)))
+            && (!matches!(path.kind.as_str(), "Exact" | "PathPrefix") || !path_value(&path.value))
         {
             return Err("a path match is not valid".into());
         }
-        if m.method.as_deref().is_some_and(|m| !METHODS.contains(&m)) {
+        if m.method.as_deref().is_some_and(|m| !method(m)) {
             return Err("a method is not one of the CRD".into());
         }
     }
@@ -254,7 +266,7 @@ fn check_rule(rule: &RuleView, held: &dyn Fn(&str, u16) -> bool) -> Result<(), S
             if !held(&m.service, m.port) {
                 return Err("a mirror names a service or port not held".into());
             }
-            if m.denominator == 0 || m.numerator > m.denominator {
+            if !fraction(m.numerator, m.denominator) {
                 return Err("a mirror fraction is out of bounds".into());
             }
         }
