@@ -4757,6 +4757,21 @@ does not take it yet, so until it does, e2e and benchmark runs are kept apart by
 | BEN-09 | **D.** Machine description: the plan lists the fields it records (CPU model, cores, RAM, kernel, Docker, kind, Kubernetes, node image) and no host identity (hostname, user, address). |
 | BEN-10 | **M** (main session, recorded on #436). The B0 results are committed in `docs/bench/` with the machine description filled in. If 200 rps is not clean on that machine (errors, or a measured rate below the configured one), `docs/bench/README.md` says so and the budgets of the mesh milestones are taken at 100 rps. |
 
+#### Mesh setups (#444)
+
+The mesh setups of `scripts/bench.sh`, for the M1 budgets of design `docs/design/mimic-mesh.md` §14 and
+§17.3. Level **M** for all of them: run by hand and recorded on #444. `scripts/test_bench.sh` does not
+cover them yet, so there is no **D** level here. They are not in the default matrix (BEN-04 is unchanged).
+
+| ID | Criterion |
+|---|---|
+| BEN-11 | **M.** `SETUPS` accepts `mesh-lb` and `mesh-churn` (any other name is refused, BEN-02). They run after the other setups, with the sidecars in mode `discovery` (the B0 setup, so that the M1 budgets compare with it) and a backend of `MESH_PODS` = 3 ready pods. |
+| BEN-12 | **M.** The mesh routing is asserted with the client sidecar's metrics, before and after the runs of a mesh setup. After a 3 s warm-up at 50 rps, each ready backend pod (`<ip>:8080`) has `mimic_mesh_endpoint_requests_total` above 0, and there are exactly 3 of them. In `mesh-lb` (strict), `mimic_mesh_fallbacks_total` summed over the backends is 0 as well. A check that does not hold is retried for up to 60 s (the view reaches the pods); then the setup fails with exit 1 and its result file is not written. `mesh-churn` asserts the per-pod counts; its fallbacks and reconnects are recorded, not asserted. |
+| BEN-13 | **M.** Propagation (`mesh-lb`, `PROPAGATION_SAMPLES` samples, default 20, 0 to 100, 0 skips it). Each sample changes the backend's ready endpoints between 3 and 4, odd samples up and even ones down. t0 is the send time of the last poll of the backend's EndpointSlices that still showed the old ready count, so t0 is not later than the change; t1 is the timestamp of the first `mesh view applied` line of the client sidecar at or after t0 with the expected endpoint count. The result holds p50, p99, max and the values in ms; `within_budget` is p99 ≤ 2000 ms (design §14). The script records the budget and does not fail on it. |
+| BEN-14 | **M.** `mesh-churn`: each run starts a `kubectl rollout restart` of the backend just before its fortio load and waits for the rollout after it. Each run records its errors (responses that are not 200), its latency and `rollout_restart: true`. The callee sidecar figures are `null`, since the callee pods change; the caller's are recorded. |
+| BEN-15 | **M.** Synthetic view (`mesh-lb`, after the propagation). 100 Services without selector, each with an EndpointSlice of 10 ready addresses `10.201.s.e`, in the client's namespace. The harness waits until the client's `mimic_mesh_view_services` and `mimic_mesh_view_endpoints` have grown by 100 and by 1000, settles 10 s, and compares the client sidecar's RSS with the RSS read in the same run before the objects existed: `within_budget` is RSS ≤ baseline + 16 MiB (design §14). The objects are deleted after the measure. |
+| BEN-16 | **M.** Outputs: as BEN-07, a mesh setup's JSON has a `mesh` block (`backend_pods`; `routing.before` and `routing.after` with the per-pod counts and the fallbacks; `propagation` and `synthetic_view` for `mesh-lb`; `churn` for `mesh-churn`, with restarts, errors and fallbacks), and every run has `rollout_restart`. Other setups have `mesh: null`. No background process is started; the namespace trap of BEN-08 also removes the synthetic objects after a failure. |
+
 ### 12.20 M0 — Mode `none` (#439)
 
 Design: `docs/design/mimic-mesh.md` §2, §3.4, §14. Spec text: §3, §5, §6 "Shipping", §7, §8, §9
