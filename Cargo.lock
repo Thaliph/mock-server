@@ -2072,10 +2072,12 @@ version = "0.2.0-alpha.3"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "bytes",
  "flate2",
  "futures",
  "hkdf",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

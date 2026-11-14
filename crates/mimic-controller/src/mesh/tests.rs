@@ -7,7 +7,7 @@ use std::time::Duration;
 use mimic_core::Mode;
 use mimic_core::mesh::input::{
     Config, Destination, Endpoint, EndpointSlice, GrantFrom, GrantTo, MIMIC_GROUP, ReferenceGrant,
-    Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
+    Route, Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
 };
 use mimic_core::mesh::view::{Limits, View};
 use tokio::time::Instant;
@@ -115,6 +115,8 @@ pub(crate) fn synced(hub: &Hub) {
     hub.feed_deployments(Event::InitDone);
     hub.feed_grants(Event::Init);
     hub.feed_grants(Event::InitDone);
+    hub.feed_routes(Event::Init);
+    hub.feed_routes(Event::InitDone);
 }
 
 pub(crate) fn put_service(hub: &Hub, s: Service) {
@@ -131,6 +133,10 @@ pub(crate) fn put_config(hub: &Hub, c: Config) {
 
 pub(crate) fn put_deployment(hub: &Hub, ns: &str, name: &str) {
     hub.feed_deployments(Event::Apply(key(ns, name), ()));
+}
+
+pub(crate) fn put_route(hub: &Hub, r: Route) {
+    hub.feed_routes(Event::Apply(key(&r.namespace, &r.name), r));
 }
 
 pub(crate) fn put_grant(hub: &Hub, name: &str, g: ReferenceGrant) {
@@ -490,7 +496,7 @@ async fn msh_26_a_view_larger_than_the_cache_is_served_and_not_cached() {
 }
 
 #[derive(Clone, Default)]
-struct Lines(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Lines(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Lines {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
@@ -557,6 +563,44 @@ async fn msh_26_a_truncated_view_is_counted_and_warned_once_per_build_not_per_re
     assert!(
         warns[0].contains(r#""skipped":"shop/c,shop/d,shop/e""#),
         "the WARN names the Services left out"
+    );
+}
+
+#[tokio::test]
+async fn rte_10_a_truncated_view_names_the_routes_left_out_in_its_warn() {
+    let lines = Lines::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(lines.clone())
+            .finish(),
+    );
+    let hub = hub(MeshConfig {
+        limits: Limits {
+            max_services: 1,
+            ..Limits::default()
+        },
+        ..MeshConfig::default()
+    });
+    synced(&hub);
+    put_service(&hub, svc("shop", "cart", "10.96.0.1"));
+    put_service(&hub, svc("shop", "cart-v1", "10.96.0.2"));
+    // Only `cart` fits: the route names `cart-v1`, so it is left out of the view and listed.
+    let mut r1 = super::tests_route::cart_route("r1", 100);
+    r1.rules[0].backend_refs[0].name = "cart-v1".into();
+    put_route(&hub, r1);
+    hub.publish_now();
+    body_of(&hub, "shop", "cart", Mode::None).await;
+    let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    let warns: Vec<_> = text
+        .lines()
+        .filter(|l| l.contains("mesh view truncated"))
+        .collect();
+    assert_eq!(warns.len(), 1, "one truncation WARN");
+    assert!(
+        warns[0].contains(r#""routes":"shop/r1""#),
+        "the WARN names the routes left out: {}",
+        warns[0]
     );
 }
 

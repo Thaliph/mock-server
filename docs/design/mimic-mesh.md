@@ -360,7 +360,10 @@ explorer UI (§17.2) shows outbound authorities that look like Services of other
   release notes: `timeouts` Standard since v1.2.0, `retry` since v1.7.0.
 - **Status**: the controller writes `status.parents[]` for Service parents with
   `controllerName: mimic.platform.io/mesh` and conditions `Accepted`, `ResolvedRefs`
-  (server-side apply, field manager `mimic-mesh`, idempotent across replicas).
+  (field manager `mimic-mesh`, idempotent across replicas). `status.parents` is an atomic list
+  shared with other controllers, so it is written by a merge patch with a `resourceVersion`
+  precondition that keeps the other controllers' entries, not by server-side apply (#447, spec
+  §7.9 "Routes").
 - **ReferenceGrant** is required, per the Gateway API, for a `backendRef` or mirror in another
   namespace; without one the rule's backend counts as invalid (`ResolvedRefs: False`,
   `RefNotPermitted`) and requests to it get `500` as the spec requires. Mimic also requires one

@@ -87,7 +87,10 @@ minutes later.
 
 | Metric (controller) | Labels |
 |---|---|
-| `mimic_mesh_objects` | `kind` |
+| `mimic_mesh_objects` | `kind` (`service`, `endpointslice`, `mimicconfig`, `referencegrant`, `deployment`, `httproute`) |
+| `mimic_mesh_gateway_api_present` (gauge, 1 while the `HTTPRoute` CRD is served, else 0) | none |
+| `mimic_mesh_routes` (gauge, HTTPRoutes with a Service parent at the last publication) | `state` (`programmed`, `unsupported`) |
+| `mimic_mesh_route_status_total` (counter, `status.parents[]` patches of HTTPRoutes) | `result` (`ok`, `conflict`, `error`) |
 | `mimic_mesh_view_builds_total` | `result` |
 | `mimic_mesh_view_build_duration_seconds`, `mimic_mesh_watches`, `mimic_mesh_view_truncated_total`, `mimic_mesh_view_cache_bytes` | none |
 

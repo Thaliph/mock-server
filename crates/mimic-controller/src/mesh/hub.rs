@@ -13,15 +13,16 @@ use std::time::{Duration, Instant};
 use mimic_core::Mode;
 use mimic_core::discovery::egress::matches_etag;
 use mimic_core::mesh::input::{
-    Config, EndpointSlice, ReferenceGrant, Service, Snapshot, TargetKind,
+    Config, EndpointSlice, ReferenceGrant, Route, Service, Snapshot, TargetKind,
 };
 use mimic_core::mesh::policy::Winners;
+use mimic_core::mesh::route::compile;
 use mimic_core::mesh::view::build;
 use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use super::config::MeshConfig;
-use super::convert::Key;
+use super::convert::{Key, RouteObserved};
 use super::metrics::{MeshMetrics, label};
 
 /// The longest wait between two publications while changes keep arriving.
@@ -37,6 +38,19 @@ pub enum Event<T> {
     InitDone,
     Apply(Key, T),
     Delete(Key),
+}
+
+impl<A, B> Event<(A, B)> {
+    /// The two halves of an event on a pair.
+    pub fn split(self) -> (Event<A>, Event<B>) {
+        match self {
+            Event::Init => (Event::Init, Event::Init),
+            Event::InitApply(k, (a, b)) => (Event::InitApply(k.clone(), a), Event::InitApply(k, b)),
+            Event::InitDone => (Event::InitDone, Event::InitDone),
+            Event::Apply(k, (a, b)) => (Event::Apply(k.clone(), a), Event::Apply(k, b)),
+            Event::Delete(k) => (Event::Delete(k.clone()), Event::Delete(k)),
+        }
+    }
 }
 
 struct Table<V> {
@@ -108,6 +122,12 @@ struct Tables {
     grants: Table<ReferenceGrant>,
     /// The `ReferenceGrant` CRD is not installed: nobody consents.
     grants_absent: bool,
+    routes: Table<Route>,
+    /// What the cluster holds of the status of each route: not part of a view, so a change of it
+    /// builds none.
+    route_status: Table<RouteObserved>,
+    /// The `HTTPRoute` CRD is installed: `None` until the first look.
+    gateway_api: Option<bool>,
 }
 
 impl Tables {
@@ -117,6 +137,7 @@ impl Tables {
             && self.configs.synced
             && self.deployments.synced
             && (self.grants.synced || self.grants_absent)
+            && (self.routes.synced || self.gateway_api == Some(false))
     }
 }
 
@@ -299,6 +320,8 @@ pub struct Hub {
     /// Counts the changes; the debouncer waits on it.
     dirty: watch::Sender<u64>,
     published: watch::Sender<Arc<Published>>,
+    /// Counts the changes of the observed route statuses; the status writer waits on it.
+    observed: watch::Sender<u64>,
     cache: Mutex<Cache>,
     /// One lock per view being built: the others of that key wait for it, the other keys do not.
     gates: Mutex<BTreeMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
@@ -349,6 +372,7 @@ impl Hub {
                 own: BTreeMap::new(),
             }))
             .0,
+            observed: watch::channel(0).0,
             cache: Mutex::default(),
             gates: Mutex::default(),
             watches,
@@ -382,6 +406,67 @@ impl Hub {
             let changed = !tables.grants_absent;
             tables.grants = Table::default();
             tables.grants_absent = true;
+            changed
+        };
+        if changed {
+            self.dirty();
+        }
+    }
+
+    pub fn feed_routes(&self, event: Event<Route>) {
+        let changed = {
+            let mut tables = lock(&self.tables);
+            let was_absent = tables.gateway_api == Some(false);
+            if was_absent {
+                tracing::info!("gateway api crds found");
+            }
+            tables.gateway_api = Some(true);
+            self.metrics.gateway_api_present.set(1);
+            tables.routes.feed(event) || was_absent
+        };
+        if changed {
+            self.dirty();
+        }
+    }
+
+    /// What the cluster holds of a route's status (RTE-14), fed by the same watch as the route.
+    pub fn feed_route_status(&self, event: Event<RouteObserved>) {
+        if lock(&self.tables).route_status.feed(event) {
+            self.observed.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// What the cluster holds of the status of route `key`.
+    pub fn observed_route(&self, key: &Key) -> Option<RouteObserved> {
+        lock(&self.tables).route_status.items.get(key).cloned()
+    }
+
+    /// Counts the changes of the observed route statuses; the status writer waits on it.
+    pub fn route_changes(&self) -> watch::Receiver<u64> {
+        self.observed.subscribe()
+    }
+
+    /// `mimic_mesh_route_status_total`.
+    pub fn count_route_status(&self, result: &str) {
+        self.metrics
+            .route_status
+            .get_or_create(&label("result", result))
+            .inc();
+    }
+
+    /// The `HTTPRoute` CRD is not installed (or no longer): there are no routes. Logged once per
+    /// change, not once per look.
+    pub fn routes_absent(&self) {
+        let changed = {
+            let mut tables = lock(&self.tables);
+            let changed = tables.gateway_api != Some(false);
+            if changed {
+                tracing::warn!("gateway api crds missing");
+            }
+            tables.routes = Table::default();
+            tables.route_status = Table::default();
+            tables.gateway_api = Some(false);
+            self.metrics.gateway_api_present.set(0);
             changed
         };
         if changed {
@@ -428,6 +513,7 @@ impl Hub {
             count("endpointslice", t.slices.items.len());
             count("mimicconfig", t.configs.items.len());
             count("referencegrant", t.grants.items.len());
+            count("httproute", t.routes.items.len());
             count("deployment", t.deployments.items.len());
             let snapshot = Snapshot {
                 cluster: self.config.cluster.clone(),
@@ -435,10 +521,12 @@ impl Hub {
                 slices: t.slices.items.values().cloned().collect(),
                 configs: t.configs.items.values().cloned().collect(),
                 grants,
+                routes: t.routes.items.values().cloned().collect(),
                 deployments: t.deployments.items.keys().cloned().collect(),
             };
             (snapshot, t.synced())
         };
+        self.count_routes(&snapshot);
         let winners = Winners::new(&snapshot.configs);
         let targets: BTreeSet<Key> = snapshot
             .configs
@@ -465,6 +553,31 @@ impl Hub {
                 own,
             });
         });
+    }
+
+    /// `mimic_mesh_routes`: the routes with a Service parent, programmed or not.
+    fn count_routes(&self, snapshot: &Snapshot) {
+        let (mut programmed, mut unsupported) = (0, 0);
+        for route in &snapshot.routes {
+            if !route
+                .parents
+                .iter()
+                .any(|p| p.group.is_empty() && p.kind == "Service")
+            {
+                continue;
+            }
+            if compile(route, &snapshot.services, snapshot.grants.as_deref()).programmed {
+                programmed += 1;
+            } else {
+                unsupported += 1;
+            }
+        }
+        for (state, n) in [("programmed", programmed), ("unsupported", unsupported)] {
+            self.metrics
+                .routes
+                .get_or_create(&label("state", state))
+                .set(n);
+        }
     }
 
     /// Publishes the changes, coalesced: the debounce after a quiet period, doubled up to one
@@ -587,6 +700,7 @@ impl Hub {
                 deployment,
                 left_out = built.truncated,
                 skipped = built.skipped.join(","),
+                routes = built.skipped_routes.join(","),
                 "mesh view truncated"
             );
         }

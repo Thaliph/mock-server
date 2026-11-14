@@ -202,6 +202,7 @@ async fn msh_33_a_304_keeps_the_view() {
     .await;
     wait("304s", || rig.pulls("not_modified") == 2).await;
     assert_eq!(rig.services(), 2);
+    wait("the next request", || rig.api.count() >= 3).await;
     assert_eq!(rig.api.if_none_match(2).as_deref(), Some("\"1-aaa\""));
     rig.stop().await;
 }
@@ -260,6 +261,49 @@ async fn msh_33_an_invalid_view_is_refused_and_the_previous_one_kept() {
         .filter(|l| l.contains("mesh view rejected"))
         .count();
     assert_eq!(rejected, 1, "one warning for the streak");
+    rig.stop().await;
+}
+
+/// `two()` with routes on `shop/cart`; `backend` is the service of the route's one backend.
+fn routed(backend: &str) -> String {
+    let routes = format!(
+        r#","routes":[{{"name":"shop/canary","ports":[80],"rules":[{{"backends":[{{"port":80,"service":"{backend}","weight":90}},{{"invalid":true,"weight":10}}],"matches":[{{"path":{{"type":"PathPrefix","value":"/"}}}}]}}]}}]"#
+    );
+    let ports = r#""ports":{"80":{"targetPort":8080}}"#;
+    let text = two();
+    let at = text.find(ports).expect("cart ports") + ports.len();
+    format!("{}{routes}{}", &text[..at], &text[at..])
+}
+
+#[tokio::test]
+async fn rte_20_a_view_with_routes_is_accepted() {
+    let rig = Rig::start(
+        vec![Reply::View(routed("shop/pay"), "\"1-r\"")],
+        Reply::Hold,
+    )
+    .await;
+    wait("the view", || rig.pulls("ok") == 1).await;
+    assert_eq!(rig.services(), 2);
+    assert_eq!(rig.pulls("invalid"), 0);
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn rte_20_a_view_whose_route_names_a_service_it_does_not_hold_is_refused_and_the_held_view_kept()
+ {
+    let rig = Rig::start(
+        vec![
+            Reply::View(two(), "\"1-aaa\""),
+            Reply::View(routed("shop/nothere"), "\"1-r\""),
+        ],
+        Reply::Hold,
+    )
+    .await;
+    wait("the refusal", || rig.pulls("invalid") == 1).await;
+    assert_eq!(rig.pulls("ok"), 1);
+    assert_eq!(rig.services(), 2);
+    wait("the next request", || rig.api.count() >= 3).await;
+    assert_eq!(rig.api.if_none_match(2).as_deref(), Some("\"1-aaa\""));
     rig.stop().await;
 }
 
