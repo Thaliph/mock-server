@@ -78,6 +78,18 @@ struct State {
     endpoints: Vec<Arc<Endpoint>>,
 }
 
+impl State {
+    /// The endpoint of an address `set` picked: `endpoints` follows the sorted order of the
+    /// set, so a binary search, never a scan under the lock.
+    fn endpoint(&self, addr: SocketAddr) -> Option<&Arc<Endpoint>> {
+        let i = self
+            .endpoints
+            .binary_search_by_key(&addr, |e| e.addr)
+            .ok()?;
+        self.endpoints.get(i)
+    }
+}
+
 /// The endpoints of one Service port.
 pub(crate) struct Backend {
     /// `<namespace>/<name>`.
@@ -166,8 +178,7 @@ impl Backend {
         );
         match next {
             Next::Pod(addr) => {
-                let Some(endpoint) = state.endpoints.iter().find(|e| e.addr == addr).cloned()
-                else {
+                let Some(endpoint) = state.endpoint(addr).cloned() else {
                     return Plan::Stop;
                 };
                 drop(state);
@@ -312,5 +323,38 @@ impl Router {
         }
         drop(backends);
         self.pools.retain(&live);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rty_28_every_picked_address_resolves_to_its_endpoint_by_index() {
+        let backend = Backend::new("shop/cart", "shop/cart:80".to_string());
+        let metrics = MeshMetrics::new(10_000);
+        // Unsorted on purpose: the set sorts, and `endpoints` follows it.
+        let addrs: Vec<SocketAddr> = (0..1000u16)
+            .rev()
+            .map(|n| SocketAddr::from(([10, 0, (n / 250) as u8, (n % 250) as u8], 8000 + n)))
+            .collect();
+        backend.update(&addrs, Duration::ZERO, Duration::ZERO, &metrics);
+        let state = lock(&backend.state);
+        for addr in &addrs {
+            assert_eq!(state.endpoint(*addr).map(|e| e.addr), Some(*addr));
+        }
+        assert!(
+            state
+                .endpoint(SocketAddr::from(([10, 9, 9, 9], 1)))
+                .is_none()
+        );
+        for (i, endpoint) in state.endpoints.iter().enumerate() {
+            assert_eq!(
+                state.set.addr(i),
+                Some(endpoint.addr),
+                "parallel to the set"
+            );
+        }
     }
 }

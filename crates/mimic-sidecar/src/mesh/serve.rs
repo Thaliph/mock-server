@@ -8,6 +8,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::{Pin, pin};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -149,9 +150,10 @@ impl Body for MeshBody {
 }
 
 /// A failed connect to `upstream`: a handshake that did not verify (spec §7.9 "Intercepted TLS")
-/// is a warning with the TLS error, any other failure is routine.
-pub(super) fn connect_failed_log(upstream: &SocketAddr, e: &io::Error) {
-    if is_tls_error(e) {
+/// is a warning with the TLS error, any other failure is routine. `warned` is the request's:
+/// only its first verification failure is a warning, the tries after it log at `debug`.
+pub(super) fn connect_failed_log(upstream: &SocketAddr, e: &io::Error, warned: &AtomicBool) {
+    if is_tls_error(e) && !warned.swap(true, Ordering::Relaxed) {
         tracing::warn!(%upstream, tls_error = %e, "tls verification failed");
     } else {
         tracing::debug!(%upstream, error = %e, "connect to the pod failed");
@@ -325,6 +327,7 @@ impl Serving {
         pick: Option<InFlight>,
         source: &Source,
         head: &Parts,
+        warned: &AtomicBool,
     ) -> Tried {
         let router = self.mesh.router();
         let upstream = pick.as_ref().map_or(self.ctx.dst, |p| p.endpoint().addr);
@@ -345,7 +348,7 @@ impl Serving {
                 lease
             }
             Err(e) => {
-                connect_failed_log(&upstream, &e);
+                connect_failed_log(&upstream, &e, warned);
                 if let Some(pick) = &pick {
                     router.failed(pick);
                 }
@@ -376,7 +379,7 @@ impl Serving {
             match again {
                 Ok(new) => lease = new,
                 Err(e) => {
-                    connect_failed_log(&upstream, &e);
+                    connect_failed_log(&upstream, &e, warned);
                     if let Some(pick) = &pick {
                         router.failed(pick);
                     }
@@ -491,6 +494,7 @@ impl Serving {
         let source = Source::new(body, self.mesh.replay());
         let direct = self.mesh.stale() || self.mesh.off();
         let mut planner = Planner::new(router.retries);
+        let warned = AtomicBool::new(false);
         let mut tries = 0;
         let mut again: Option<Outcome> = None;
         let mut next = self.plan(direct, tries, &mut planner);
@@ -517,7 +521,7 @@ impl Serving {
             }
             let upstream = pick.as_ref().map_or(self.ctx.dst, |p| p.endpoint().addr);
             tracker.route(backend, upstream, tries);
-            match self.try_once(protocol, pick, &source, &head).await {
+            match self.try_once(protocol, pick, &source, &head, &warned).await {
                 Tried::Answer { response, mut conn } => {
                     let status = response.status();
                     let refusal = refusal_of(&response, conn.pick.as_ref(), self.origin.is_some());

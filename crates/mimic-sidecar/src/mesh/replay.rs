@@ -50,7 +50,9 @@ impl ReplayBudget {
             budget: Arc::clone(self),
             cap,
             held: 0,
-            chunks: Vec::new(),
+            sealed: Vec::new(),
+            tail: Vec::new(),
+            tail_charge: 0,
             state: State::Held,
         }
     }
@@ -85,13 +87,43 @@ enum State {
     Released,
 }
 
+/// Bytes taken from the total, given back when the last holder (the replay, or a try still
+/// reading what it was handed) is gone.
+struct Charge {
+    budget: Arc<ReplayBudget>,
+    bytes: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.budget.give_back(self.bytes);
+    }
+}
+
+/// A part of the held body, with the charge of the memory it occupies.
+#[derive(Clone)]
+struct Segment {
+    data: Bytes,
+    _charge: Arc<Charge>,
+}
+
 /// The body of one request, held while it can still be sent again. Dropping it releases its
 /// bytes.
+///
+/// The chunks read from the app are copied into one buffer that grows by doubling up to the
+/// request's share, and what is charged to the total is that buffer's capacity: a body of 1-byte
+/// chunks costs its length, not 32 bytes (a `Bytes` in a `Vec`) and a pinned read buffer per
+/// chunk. A buffer is sealed (shared as it is, no copy) when a try starts, and a later chunk
+/// goes into a new one.
 pub struct Replay {
     budget: Arc<ReplayBudget>,
     cap: usize,
+    /// The payload bytes held.
     held: usize,
-    chunks: Vec<Bytes>,
+    sealed: Vec<Segment>,
+    tail: Vec<u8>,
+    /// What the tail is charged: its capacity.
+    tail_charge: usize,
     state: State,
 }
 
@@ -103,16 +135,30 @@ impl Replay {
             return false;
         }
         let len = chunk.len();
-        let fits = len <= self.cap - self.held && self.budget.reserve(len);
-        if !fits {
+        if len > self.cap - self.held || !self.grow(len) {
             self.drop_chunks();
             self.state = State::Streamed;
             return false;
         }
         self.held += len;
-        if len > 0 {
-            self.chunks.push(chunk.clone());
+        self.tail.extend_from_slice(chunk);
+        true
+    }
+
+    /// Makes room in the tail for `len` more bytes, charging the total for the new capacity.
+    fn grow(&mut self, len: usize) -> bool {
+        let needed = self.tail.len() + len;
+        if needed <= self.tail_charge {
+            return true;
         }
+        let sealed = self.held - self.tail.len();
+        let room = self.cap - sealed;
+        let target = needed.max(self.tail_charge.saturating_mul(2).min(room));
+        if !self.budget.reserve(target - self.tail_charge) {
+            return false;
+        }
+        self.tail.reserve_exact(target - self.tail.len());
+        self.tail_charge = target;
         true
     }
 
@@ -121,23 +167,41 @@ impl Replay {
         self.state == State::Held
     }
 
-    /// The chunks to send again, in order.
-    pub fn chunks(&self) -> &[Bytes] {
-        &self.chunks
+    /// The payload bytes held.
+    pub fn held_bytes(&self) -> usize {
+        self.held
     }
 
-    /// The request can no longer be retried (a response head came back): releases the bytes.
+    /// The parts to send again, in order, each keeping its memory charged while it is in use.
+    fn snapshot(&mut self) -> VecDeque<Segment> {
+        if !self.tail.is_empty() {
+            let bytes = std::mem::take(&mut self.tail_charge);
+            self.sealed.push(Segment {
+                data: Bytes::from(std::mem::take(&mut self.tail)),
+                _charge: Arc::new(Charge {
+                    budget: Arc::clone(&self.budget),
+                    bytes,
+                }),
+            });
+        }
+        self.sealed.iter().cloned().collect()
+    }
+
+    /// The request can no longer be retried (a response head came back): releases the bytes
+    /// (those a try still has to send stay charged until it is done).
     pub fn release(&mut self) {
         self.drop_chunks();
         self.state = State::Released;
     }
 
     fn drop_chunks(&mut self) {
-        self.chunks.clear();
-        if self.held > 0 {
-            self.budget.give_back(self.held);
-            self.held = 0;
+        self.sealed.clear();
+        self.tail = Vec::new();
+        if self.tail_charge > 0 {
+            self.budget.give_back(self.tail_charge);
+            self.tail_charge = 0;
         }
+        self.held = 0;
     }
 }
 
@@ -158,6 +222,9 @@ struct Shared {
     generation: u64,
     /// The request ended before an answer was delivered: no try reads any more.
     closed: bool,
+    /// The app's body failed (the client left, a decode error): it is not read again (its
+    /// channel would then report a clean end), nothing is held, and every try fails.
+    failed: bool,
     /// An answer was delivered: the request is not retried and its last try goes on.
     delivered: bool,
     /// Wakes the try that last waited for the app's body.
@@ -187,6 +254,7 @@ impl Source {
                 read: false,
                 generation: 0,
                 closed: false,
+                failed: false,
                 delivered: false,
                 waker: None,
             })),
@@ -196,13 +264,14 @@ impl Source {
 
     /// Every byte read from the app is still held (spec §7.9 "Bodies").
     pub(crate) fn held(&self) -> bool {
-        lock(&self.shared).replay.is_held()
+        let shared = lock(&self.shared);
+        !shared.failed && shared.replay.is_held()
     }
 
     /// The request can be sent again whole: nothing was read, or all of it is held.
     pub(crate) fn intact(&self) -> bool {
         let shared = lock(&self.shared);
-        shared.replay.is_held() || !shared.read
+        !shared.failed && (shared.replay.is_held() || !shared.read)
     }
 
     /// The try in flight is given up because the request is to be tried again: it reads no more
@@ -211,7 +280,7 @@ impl Source {
     /// whole.
     pub(crate) fn detach(&self) -> bool {
         let mut shared = lock(&self.shared);
-        if !shared.replay.is_held() && shared.read {
+        if shared.failed || (!shared.replay.is_held() && shared.read) {
             return false;
         }
         shared.generation += 1;
@@ -234,10 +303,7 @@ impl Source {
         let (queue, generation) = {
             let mut shared = lock(&self.shared);
             shared.generation += 1;
-            (
-                shared.replay.chunks().iter().cloned().collect(),
-                shared.generation,
-            )
+            (shared.replay.snapshot(), shared.generation)
         };
         let mut request = Request::new(Attempt {
             shared: self.shared.clone(),
@@ -272,7 +338,7 @@ pub(crate) struct Attempt {
     shared: Arc<Mutex<Shared>>,
     generation: u64,
     /// What was held when the try began, still to send.
-    queue: VecDeque<Bytes>,
+    queue: VecDeque<Segment>,
     hint: SizeHint,
     /// The trailers were handed over.
     trailed: bool,
@@ -304,8 +370,12 @@ impl Body for Attempt {
                 "the request went to another pod",
             ))));
         }
-        if let Some(chunk) = this.queue.pop_front() {
-            return Poll::Ready(Some(Ok(Frame::data(chunk))));
+        if shared.failed {
+            this.queue.clear();
+            return Poll::Ready(Some(Err(std::io::Error::other("the request body failed"))));
+        }
+        if let Some(segment) = this.queue.pop_front() {
+            return Poll::Ready(Some(Ok(Frame::data(segment.data.clone()))));
         }
         if shared.ended {
             if !std::mem::replace(&mut this.trailed, true)
@@ -340,7 +410,11 @@ impl Body for Attempt {
                 this.trailed = true;
                 Poll::Ready(None)
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(std::io::Error::other(e)))),
+            Poll::Ready(Some(Err(e))) => {
+                shared.failed = true;
+                shared.replay.release();
+                Poll::Ready(Some(Err(std::io::Error::other(e))))
+            }
             Poll::Pending => {
                 shared.waker = Some(cx.waker().clone());
                 Poll::Pending
@@ -353,7 +427,7 @@ impl Body for Attempt {
         if self.stale(&shared) {
             return false;
         }
-        if !self.queue.is_empty() {
+        if shared.failed || !self.queue.is_empty() {
             return false;
         }
         if shared.ended {
@@ -388,7 +462,7 @@ mod tests {
         assert!(replay.push(&chunk(30 * 1024)));
         assert!(replay.push(&chunk(30 * 1024)));
         assert!(replay.is_held());
-        assert_eq!(replay.chunks().len(), 2);
+        assert_eq!(replay.held_bytes(), 60 * 1024);
         assert_eq!(budget.used(), 60 * 1024);
         assert_eq!(gauge.get(), 60 * 1024);
         replay.release();
@@ -407,7 +481,7 @@ mod tests {
             "70 KiB does not fit 64 KiB"
         );
         assert!(!replay.is_held());
-        assert!(replay.chunks().is_empty());
+        assert_eq!(replay.held_bytes(), 0);
         assert_eq!(budget.used(), 0);
         assert!(!replay.push(&chunk(1)), "streamed for good");
         assert_eq!(gauge.get(), 0);
@@ -454,6 +528,69 @@ mod tests {
     fn rty_14_a_body_with_no_chunk_is_held() {
         let (budget, _) = budget(1 << 20);
         assert!(budget.replay(64 * 1024).is_held());
+    }
+
+    #[test]
+    fn rty_27_one_byte_chunks_cost_their_length_not_a_vector_slot_each() {
+        let (budget, gauge) = budget(8 << 20);
+        let mut replay = budget.replay(64 * 1024);
+        for n in 0..64 * 1024 {
+            assert!(replay.push(&Bytes::from(vec![(n % 251) as u8])));
+        }
+        assert_eq!(replay.held_bytes(), 64 * 1024);
+        assert!(
+            budget.used() <= 64 * 1024,
+            "charged {} for 64 KiB of 1-byte chunks",
+            budget.used()
+        );
+        assert_eq!(gauge.get(), i64::try_from(budget.used()).unwrap());
+        let replayed: Vec<u8> = replay
+            .snapshot()
+            .iter()
+            .flat_map(|s| s.data.to_vec())
+            .collect();
+        let expected: Vec<u8> = (0..64 * 1024).map(|n| (n % 251) as u8).collect();
+        assert_eq!(replayed, expected, "same bytes, same order");
+        assert!(!replay.push(&chunk(1)), "past the share");
+        drop(replay);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(gauge.get(), 0);
+    }
+
+    #[test]
+    fn rty_27_a_small_body_is_charged_about_its_length() {
+        let (budget, _) = budget(1 << 20);
+        let mut replay = budget.replay(64 * 1024);
+        assert!(replay.push(&chunk(100)));
+        assert_eq!(budget.used(), 100);
+        assert!(replay.push(&chunk(1)));
+        assert!(budget.used() <= 202, "doubling at most");
+    }
+
+    #[test]
+    fn rty_27_the_next_try_after_a_snapshot_adds_to_the_body() {
+        let (budget, _) = budget(1 << 20);
+        let mut replay = budget.replay(64 * 1024);
+        assert!(replay.push(&chunk(10)));
+        let first = replay.snapshot();
+        assert!(replay.push(&chunk(5)));
+        let second = replay.snapshot();
+        let total = |q: &VecDeque<Segment>| q.iter().map(|s| s.data.len()).sum::<usize>();
+        assert_eq!((total(&first), total(&second)), (10, 15));
+    }
+
+    #[test]
+    fn rty_25_the_bytes_a_try_still_has_to_send_stay_charged_after_the_release() {
+        let (budget, gauge) = budget(1 << 20);
+        let mut replay = budget.replay(64 * 1024);
+        assert!(replay.push(&chunk(30 * 1024)));
+        let queue = replay.snapshot();
+        replay.release();
+        assert_eq!(budget.used(), 30 * 1024, "the try still holds them");
+        assert_eq!(gauge.get(), 30 * 1024);
+        drop(queue);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(gauge.get(), 0);
     }
 
     /// A request body arriving from a connection: the request `hyper` serves for it.
@@ -558,5 +695,38 @@ mod tests {
             .expect("woken")
             .unwrap();
         assert!(matches!(ended, Some(Err(_))));
+    }
+
+    #[tokio::test]
+    async fn rty_26_a_body_that_failed_is_never_replayed_as_a_clean_end() {
+        let head = Request::new(()).into_parts().0;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let body = incoming(&mut client, server).await;
+        let (total, gauge) = budget(1 << 20);
+        let source = Source::new(ReqBody::plain(body), total.replay(64 * 1024));
+        let mut first = source.request(&head).into_body();
+        assert!(next(&mut first).await.unwrap().is_ok());
+        // The client leaves in the middle of a chunk: the body fails.
+        drop(client);
+        assert!(matches!(next(&mut first).await, Some(Err(_))));
+        // Whatever a later try does, it never sees the end of the body.
+        let mut second = source.request(&head).into_body();
+        let mut ended = false;
+        for _ in 0..4 {
+            match next(&mut second).await {
+                Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+                None => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        assert!(!ended, "a cut body must not look complete");
+        assert!(!source.held(), "a failed body is not held");
+        assert!(!source.intact());
+        assert!(!source.detach());
+        drop(source);
+        assert_eq!(gauge.get(), 0);
     }
 }
