@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
 use hyper::Request;
@@ -160,6 +160,8 @@ struct Shared {
     closed: bool,
     /// An answer was delivered: the request is not retried and its last try goes on.
     delivered: bool,
+    /// Wakes the try that last waited for the app's body.
+    waker: Option<Waker>,
 }
 
 /// The body of a request over its tries: what the app sends is read once, held for replay while
@@ -186,6 +188,7 @@ impl Source {
                 generation: 0,
                 closed: false,
                 delivered: false,
+                waker: None,
             })),
             hint,
         }
@@ -200,6 +203,22 @@ impl Source {
     pub(crate) fn intact(&self) -> bool {
         let shared = lock(&self.shared);
         shared.replay.is_held() || !shared.read
+    }
+
+    /// The try in flight is given up because the request is to be tried again: it reads no more
+    /// of the body, and one waiting for the app is woken to fail. `false` (and nothing changes)
+    /// when the body is no longer held and some of it was read: the request cannot be sent again
+    /// whole.
+    pub(crate) fn detach(&self) -> bool {
+        let mut shared = lock(&self.shared);
+        if !shared.replay.is_held() && shared.read {
+            return false;
+        }
+        shared.generation += 1;
+        if let Some(waker) = shared.waker.take() {
+            waker.wake();
+        }
+        true
     }
 
     /// A response head came back: the bytes held are released.
@@ -322,7 +341,10 @@ impl Body for Attempt {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(std::io::Error::other(e)))),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                shared.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
         }
     }
 
@@ -509,5 +531,32 @@ mod tests {
             seen.extend_from_slice(&frame.into_data().unwrap());
         }
         assert_eq!(seen, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn rty_14_a_cut_body_is_not_detached_and_a_waiting_try_is_woken() {
+        let head = Request::new(()).into_parts().0;
+        // "abc" does not fit in 2 bytes: read and no longer held, so not to be retried.
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let body = incoming(&mut client, server).await;
+        let (total, _) = budget(1 << 20);
+        let source = Source::new(ReqBody::plain(body), total.replay(2));
+        let mut first = source.request(&head).into_body();
+        assert!(next(&mut first).await.unwrap().is_ok());
+        assert!(!source.detach());
+        // A try waiting for the app is woken by a detach and fails.
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let body = incoming(&mut client, server).await;
+        let source = Source::new(ReqBody::plain(body), total.replay(64 * 1024));
+        let mut waiter = source.request(&head).into_body();
+        assert!(next(&mut waiter).await.unwrap().is_ok());
+        let waiting = tokio::spawn(async move { next(&mut waiter).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(source.detach());
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("woken")
+            .unwrap();
+        assert!(matches!(ended, Some(Err(_))));
     }
 }

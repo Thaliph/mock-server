@@ -534,7 +534,9 @@ impl Serving {
                     if verdict.retry {
                         match self.plan(direct, tries, &mut planner) {
                             Plan::Stop => router.metrics.skipped(backend, "exhausted"),
-                            retry => {
+                            // The try in flight stops reading the app's body now, so that
+                            // what the next try replays is what was read.
+                            retry if source.detach() => {
                                 Self::discard(response, &mut conn.lease).await;
                                 drop(conn);
                                 self.pause(verdict.outcome).await;
@@ -542,6 +544,7 @@ impl Serving {
                                 next = retry;
                                 continue;
                             }
+                            _ => router.metrics.skipped(backend, "buffer"),
                         }
                     } else if let Some(skip) = verdict.skip {
                         router.metrics.skipped(backend, skip.label());
@@ -587,12 +590,13 @@ impl Serving {
                     if verdict.retry {
                         match self.plan(direct, tries, &mut planner) {
                             Plan::Stop => router.metrics.skipped(backend, "exhausted"),
-                            retry => {
+                            retry if source.detach() => {
                                 drop(pick);
                                 again = Some(verdict.outcome);
                                 next = retry;
                                 continue;
                             }
+                            _ => router.metrics.skipped(backend, "buffer"),
                         }
                     } else if let Some(skip) = verdict.skip {
                         router.metrics.skipped(backend, skip.label());
