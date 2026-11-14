@@ -589,7 +589,10 @@ async fn rty_17_a_pod_that_does_not_verify_is_a_connect_failure_and_verified_pod
         let mut tls = client(&rig, service(), &[]).await;
         let (status, body) = get(&mut tls).await;
         assert_eq!(status, "HTTP/1.1 200 OK");
-        assert!(["one", "two"].contains(&body.as_str()), "{body}");
+        assert!(
+            ["one", "two"].contains(&body.as_str()),
+            "a verified pod answered"
+        );
     }
     assert_eq!(bad.requests.load(Ordering::SeqCst), 0);
     let scrape = rig.metrics.encode();
@@ -601,32 +604,6 @@ async fn rty_17_a_pod_that_does_not_verify_is_a_connect_failure_and_verified_pod
         "{scrape}"
     );
     assert_eq!(counter(&scrape, "mimic_mesh_fallbacks_total"), 0.0);
-}
-
-#[tokio::test]
-async fn rty_17_a_verified_pod_refusing_is_retried_on_another_pod_in_the_same_session() {
-    let _logs = capture_logs();
-    let (good_ca, good_root) = authority("good");
-    let refuser = tls_pod("refuser", &good_ca, names(&[NAME]), &[]).await;
-    let other = tls_pod("other", &good_ca, names(&[NAME]), &[]).await;
-    let rig = rig(&good_root, cluster(), &[refuser.addr, other.addr]).await;
-    let mut tls = client(&rig, service(), &[]).await;
-    for _ in 0..10 {
-        let (status, body) = get(&mut tls).await;
-        assert_eq!(
-            (status.as_str(), body.as_str()),
-            ("HTTP/1.1 200 OK", "other")
-        );
-    }
-    assert!(refuser.requests.load(Ordering::SeqCst) >= 1, "it was tried");
-    let scrape = rig.metrics.encode();
-    assert!(
-        counter(
-            &scrape,
-            "mimic_mesh_retries_total{backend=\"shop/cart:80\",reason=\"overloaded\"}"
-        ) >= 1.0,
-        "{scrape}"
-    );
 }
 
 #[tokio::test]
@@ -652,5 +629,32 @@ async fn rty_17_a_decrypted_non_http_connection_skips_a_pod_that_does_not_verify
         good.sni.lock().unwrap().len(),
         10,
         "every one reached the good pod"
+    );
+}
+
+#[tokio::test]
+async fn rty_17_a_refusal_over_intercepted_tls_is_not_trusted() {
+    let _logs = capture_logs();
+    let (good_ca, good_root) = authority("good");
+    let refuser = tls_pod("refuser", &good_ca, names(&[NAME]), &[]).await;
+    let other = tls_pod("other", &good_ca, names(&[NAME]), &[]).await;
+    let rig = rig(&good_root, cluster(), &[refuser.addr, other.addr]).await;
+    let mut seen = 0;
+    for _ in 0..10 {
+        let mut tls = client(&rig, service(), &[]).await;
+        let (status, _) = get(&mut tls).await;
+        seen += usize::from(status == "HTTP/1.1 503 Service Unavailable");
+    }
+    assert!(seen >= 1, "the refusal reached the app");
+    assert_eq!(
+        refuser.requests.load(Ordering::SeqCst),
+        seen,
+        "every request the refuser saw was answered by it, none retried"
+    );
+    let scrape = rig.metrics.encode();
+    assert_eq!(
+        counter(&scrape, "mimic_mesh_retries_total"),
+        0.0,
+        "{scrape}"
     );
 }

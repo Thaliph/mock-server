@@ -411,7 +411,10 @@ async fn rty_16_a_pod_that_accepts_and_closes_is_one_attempt_and_not_retried() {
     assert_eq!(closer.accepted(), 1);
     assert_eq!(cluster.accepted(), 0);
     let line = logs.access_exactly(1).await.remove(0);
-    assert!(line["attempts"].as_u64() <= Some(2), "{line}");
+    assert!(
+        line["attempts"].as_u64() <= Some(2),
+        "attempts of the access line"
+    );
 }
 
 #[tokio::test]

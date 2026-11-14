@@ -520,7 +520,7 @@ impl Serving {
             match self.try_once(protocol, pick, &source, &head).await {
                 Tried::Answer { response, mut conn } => {
                     let status = response.status();
-                    let refusal = refusal_of(&response, conn.pick.as_ref());
+                    let refusal = refusal_of(&response, conn.pick.as_ref(), self.origin.is_some());
                     let failure = refusal.map_or(Failure::Response, Failure::Refusal);
                     let verdict = classify(failure, head.method.as_str(), source.held(), true);
                     router.metrics.attempt(backend, verdict.outcome);
@@ -684,7 +684,12 @@ impl Serving {
 fn refusal_of(
     response: &Response<hyper::body::Incoming>,
     pick: Option<&InFlight>,
+    tls: bool,
 ) -> Option<Refusal> {
+    // Over intercepted TLS the callee's sidecar cannot strip the fields (spec §7.9 "Retries").
+    if tls {
+        return None;
+    }
     let pod = pick?.endpoint().addr;
     if response.status() != StatusCode::SERVICE_UNAVAILABLE {
         return None;
