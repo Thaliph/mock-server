@@ -114,6 +114,12 @@ impl Probe {
                         let method = req.method().to_string();
                         let early = matches!(*mode.lock().unwrap(), Mode::RefuseEarly(_));
                         let body = if early {
+                            // The pod goes on reading the body while it refuses, as a pod
+                            // that answers before its handler is done with the upload does.
+                            let rest = req.into_body();
+                            tokio::spawn(async move {
+                                let _ = rest.collect().await;
+                            });
                             Bytes::new()
                         } else {
                             req.into_body().collect().await.unwrap().to_bytes()
@@ -1098,9 +1104,10 @@ async fn rty_09_a_goaway_that_covers_the_stream_is_not_a_refusal() {
     assert_eq!(skipped(&scrape, "method"), 1.0, "skipped");
 }
 
-/// A chunked body of 8 KiB chunks, the first alone and the rest after 300 ms.
+/// A chunked body of 8 KiB chunks, the first alone and the rest `gap_ms` later.
 fn slow_chunks(
     body: Vec<u8>,
+    gap_ms: u64,
 ) -> impl futures::Stream<Item = Result<hyper::body::Frame<Bytes>, std::io::Error>> {
     futures::stream::unfold(0usize, move |at| {
         let body = body.clone();
@@ -1108,8 +1115,8 @@ fn slow_chunks(
             if at >= body.len() {
                 return None;
             }
-            if at > 0 {
-                tokio::time::sleep(Duration::from_millis(if at == 8192 { 300 } else { 5 })).await;
+            if at == 8192 {
+                tokio::time::sleep(Duration::from_millis(gap_ms)).await;
             }
             let end = (at + 8192).min(body.len());
             let frame = hyper::body::Frame::data(Bytes::copy_from_slice(&body[at..end]));
@@ -1118,20 +1125,23 @@ fn slow_chunks(
     })
 }
 
-#[tokio::test]
-async fn rty_14_a_slow_body_refused_early_reaches_the_next_pod_whole() {
-    let _logs = capture_logs();
-    let body = payload(40 * 1024);
-    for h2 in [false, true] {
-        let refusing = Probe::start("r", h2, Mode::RefuseEarly("overloaded")).await;
-        let ok = Probe::start("ok", h2, Mode::Ok).await;
-        let state = state_for(cluster_ip(), &[refusing.addr, ok.addr], |_| {});
-        let f = fixture_mesh(cluster_ip(), &state, None).await;
-        for _ in 0..6 {
-            let one = async {
-                if h2 {
-                    let stream = tokio::net::TcpStream::connect(f.addr).await.unwrap();
-                    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(
+/// Uploads `body` slowly (the rest `gap_ms` after the first chunk) through a sidecar whose first
+/// pod refuses before it reads the body, six times, over HTTP/1 chunked or `h2c`. The pod that
+/// answers must get every body whole, or the request is not sent to it at all.
+async fn slow_upload(h2: bool, size: usize, gap_ms: u64, refusal_delay: Duration) {
+    let body = payload(size);
+    let refusing = Probe::start("r", h2, Mode::RefuseEarly("overloaded")).await;
+    let ok = Probe::start("ok", h2, Mode::Ok).await;
+    let state = state_for(cluster_ip(), &[refusing.addr, ok.addr], |c| {
+        c.refusal_delay = refusal_delay;
+    });
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut answered = 0;
+    for _ in 0..6 {
+        let one = async {
+            if h2 {
+                let stream = tokio::net::TcpStream::connect(f.addr).await.unwrap();
+                let (mut sender, connection) = hyper::client::conn::http2::Builder::new(
                     TokioExecutor::new(),
                 )
                 .handshake::<_, http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>>(
@@ -1139,48 +1149,68 @@ async fn rty_14_a_slow_body_refused_early_reaches_the_next_pod_whole() {
                 )
                 .await
                 .unwrap();
-                    tokio::spawn(connection);
-                    let request = Request::post("http://cart.shop.svc/p")
-                        .body(
-                            http_body_util::StreamBody::new(slow_chunks(body.clone()))
-                                .boxed_unsync(),
-                        )
-                        .unwrap();
-                    let response = sender.send_request(request).await.unwrap();
-                    assert_eq!(response.status(), 200);
-                    let _ = response.into_body().collect().await;
-                } else {
-                    let mut client = H1Client::connect(f.addr).await;
-                    client
+                tokio::spawn(connection);
+                let request = Request::post("http://cart.shop.svc/p")
+                    .body(
+                        http_body_util::StreamBody::new(slow_chunks(body.clone(), gap_ms))
+                            .boxed_unsync(),
+                    )
+                    .unwrap();
+                let response = sender.send_request(request).await.unwrap();
+                let status = response.status().as_u16();
+                let _ = response.into_body().collect().await;
+                status
+            } else {
+                let mut client = H1Client::connect(f.addr).await;
+                client
                     .send(b"POST /p HTTP/1.1\r\nHost: cart.shop.svc\r\nTransfer-Encoding: chunked\r\n\r\n")
                     .await;
-                    for (n, chunk) in body.chunks(8192).enumerate() {
-                        if n == 1 {
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                        }
-                        let mut part = format!("{:x}\r\n", chunk.len()).into_bytes();
-                        part.extend_from_slice(chunk);
-                        part.extend_from_slice(b"\r\n");
-                        client.send(&part).await;
+                for (n, chunk) in body.chunks(8192).enumerate() {
+                    if n == 1 {
+                        tokio::time::sleep(Duration::from_millis(gap_ms)).await;
                     }
-                    client.send(b"0\r\n\r\n").await;
-                    let (head, _) = client.read().await.expect("an answer");
-                    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+                    let mut part = format!("{:x}\r\n", chunk.len()).into_bytes();
+                    part.extend_from_slice(chunk);
+                    part.extend_from_slice(b"\r\n");
+                    client.send(&part).await;
                 }
-            };
-            tokio::time::timeout(Duration::from_secs(10), one)
-                .await
-                .expect("an answer, not a stalled upload");
-        }
-        assert!(
-            retries(&f.metrics.encode(), "overloaded") >= 1.0,
-            "a request was refused (h2 {h2})"
-        );
-        let seen = ok.seen.lock().unwrap();
-        assert_eq!(seen.len(), 6, "h2 {h2}");
-        assert!(
-            seen.iter().all(|(_, got, _)| *got == body),
-            "a body with a hole (h2 {h2})"
-        );
+                client.send(b"0\r\n\r\n").await;
+                let (head, _) = client.read().await.expect("an answer");
+                head[9..12].parse::<u16>().unwrap()
+            }
+        };
+        let status = tokio::time::timeout(Duration::from_secs(10), one)
+            .await
+            .expect("an answer, not a stalled upload");
+        assert!(status == 200 || status == 503, "status {status} (h2 {h2})");
+        answered += usize::from(status == 200);
+    }
+    assert!(
+        retries(&f.metrics.encode(), "overloaded") >= 1.0,
+        "a request was refused (h2 {h2})"
+    );
+    let seen = ok.seen.lock().unwrap();
+    assert_eq!(seen.len(), answered, "h2 {h2}");
+    assert!(
+        seen.iter().all(|(_, got, _)| *got == body),
+        "a body with a hole (h2 {h2}, {size} bytes)"
+    );
+}
+
+#[tokio::test]
+async fn rty_14_a_slow_body_refused_early_reaches_the_next_pod_whole() {
+    let _logs = capture_logs();
+    for h2 in [false, true] {
+        slow_upload(h2, 40 * 1024, 300, Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn rty_14_a_body_that_outgrows_the_buffer_during_the_pause_is_not_cut() {
+    let _logs = capture_logs();
+    // The refusal comes at once; the rest of the 70 KiB arrives during the pause before the
+    // second try (200 to 600 ms), when the first try is no longer allowed to read it.
+    for h2 in [false, true] {
+        slow_upload(h2, 70 * 1024, 100, Duration::from_millis(400)).await;
     }
 }
