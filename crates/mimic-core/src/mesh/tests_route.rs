@@ -738,3 +738,110 @@ fn rte_06_the_message_is_bounded() {
     let c = plain(&simple(many));
     assert!(refs(&c).2.len() <= 1024);
 }
+
+/// The view refuses (RTE-12) what the compiler must not write: RTE-03 for the value checks.
+#[test]
+fn rte_03_values_the_view_refuses_make_the_route_unsupported() {
+    let nm = |name: &str, value: &str| NameMatch {
+        kind: "Exact".into(),
+        name: name.into(),
+        value: value.into(),
+    };
+    let with_match = |m: RouteMatch| RouteRule {
+        matches: vec![m],
+        ..RouteRule::default()
+    };
+    let long = "a".repeat(4097);
+    let long_path = format!("/{}", "a".repeat(1024));
+    let mut cases: Vec<(RouteRule, &str)> = vec![];
+    for bad in ["a\nb", "a\rb", "a\0b", long.as_str()] {
+        cases.push((
+            with_match(RouteMatch {
+                headers: vec![nm("x-a", bad)],
+                ..RouteMatch::default()
+            }),
+            "rules[0].matches[0].headers[0].value",
+        ));
+        cases.push((
+            with_match(RouteMatch {
+                query_params: vec![nm("q", "ok"), nm("q", bad)],
+                ..RouteMatch::default()
+            }),
+            "rules[0].matches[0].queryParams[1].value",
+        ));
+        cases.push((
+            RouteRule {
+                filters: vec![modifier_filter(
+                    "RequestHeaderModifier",
+                    HeaderModifier {
+                        add: vec![pair("x-a", bad)],
+                        ..HeaderModifier::default()
+                    },
+                )],
+                ..RouteRule::default()
+            },
+            "rules[0].filters[0].requestHeaderModifier.add[0].value",
+        ));
+    }
+    let path = |value: &str| {
+        with_match(RouteMatch {
+            path: Some(PathMatch {
+                kind: "PathPrefix".into(),
+                value: value.into(),
+            }),
+            ..RouteMatch::default()
+        })
+    };
+    cases.push((path(&long_path), "rules[0].matches[0].path.value"));
+    cases.push((path("/a\nb"), "rules[0].matches[0].path.value"));
+    cases.push((path("a"), "rules[0].matches[0].path.value"));
+    cases.push((
+        with_match(RouteMatch {
+            headers: vec![nm("bad name", "v")],
+            ..RouteMatch::default()
+        }),
+        "rules[0].matches[0].headers[0].name",
+    ));
+    cases.push((
+        with_match(RouteMatch {
+            method: Some("get".into()),
+            ..RouteMatch::default()
+        }),
+        "rules[0].matches[0].method",
+    ));
+    for (fraction, percent) in [(Some((3, Some(2))), None), (Some((1, Some(0))), None)] {
+        cases.push((
+            RouteRule {
+                filters: vec![mirror("cart-shadow", percent, fraction)],
+                ..RouteRule::default()
+            },
+            "rules[0].filters[0].requestMirror",
+        ));
+    }
+    cases.push((
+        RouteRule {
+            filters: vec![mirror("cart-shadow", Some(101), None)],
+            ..RouteRule::default()
+        },
+        "rules[0].filters[0].requestMirror",
+    ));
+    for (rule, path) in cases {
+        let (ok, reason, message) = first_unsupported(simple(vec![rule]));
+        assert!(!ok);
+        assert_eq!(reason, "UnsupportedValue");
+        assert_eq!(message, format!("unsupported: {path}"));
+    }
+    // The bounds themselves are accepted.
+    let mut edge = with_match(RouteMatch {
+        headers: vec![nm("x-a", &"a".repeat(4096))],
+        path: Some(PathMatch {
+            kind: "PathPrefix".into(),
+            value: format!("/{}", "a".repeat(1023)),
+        }),
+        method: Some("GET".into()),
+        ..RouteMatch::default()
+    });
+    edge.backend_refs = vec![];
+    edge.filters = vec![mirror("cart-shadow", None, Some((2, Some(2))))];
+    assert!(plain(&simple(vec![edge])).programmed);
+}
