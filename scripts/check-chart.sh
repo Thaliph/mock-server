@@ -893,6 +893,12 @@ done
 lint mesh.off --set mesh.enabled=false
 echo "msh_29: the mesh RBAC is read-only on what it watches, patch on mimicconfigs/status; the mesh values render their variables"
 
+# MSH-84 (#441): the load test rules do not repeat the endpointslices rule of the mesh ones.
+slices=$(render --set loadTest.enabled=true --set image.digest="$digest" | yq 'select(.kind == "ClusterRole" and .metadata.name == "mimic-controller")' \
+  | yq -r '[.rules[] | select(.resources[] == "endpointslices")] | length')
+[[ $slices == 1 ]] || fail "msh_84: the ClusterRole has $slices rules on endpointslices with the load tests on, not 1"
+echo "msh_84: one endpointslices rule with the mesh and the load tests"
+
 # MSH-40 (#442): the values the controller hands to the sidecars it injects.
 [[ $(mesh_env MIMIC_MESH_STALE_AFTER) == 60s ]] || fail "msh_40: MIMIC_MESH_STALE_AFTER is not 60s by default"
 [[ $(mesh_env MIMIC_MESH_STARTUP_WAIT) == 2s ]] || fail "msh_40: MIMIC_MESH_STARTUP_WAIT is not 2s by default"

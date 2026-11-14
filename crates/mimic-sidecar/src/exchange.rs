@@ -355,6 +355,9 @@ impl Tracker {
         self.head = Some(head);
         self.counted = true;
         self.capture = None;
+        if let Some(tap) = self.tap.as_ref().filter(|tap| tap.active()) {
+            tap.synthetic_exchange(self.ctx.direction == Direction::Outbound);
+        }
         self.ctx.proxy.request(
             self.ctx.direction,
             self.protocol,

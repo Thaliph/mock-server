@@ -21,6 +21,10 @@ pub struct MeshConfig {
     pub cache_bytes: u64,
     /// `MIMIC_SIDECAR_API_MAX_WATCHES`.
     pub max_watches: usize,
+    /// `MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD`.
+    pub max_watches_per_pod: usize,
+    /// `MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT`.
+    pub watch_namespace_percent: usize,
     /// `MIMIC_MESH_MAX_SERVICES`, `MIMIC_MESH_MAX_ENDPOINTS` and `MIMIC_MESH_MAX_VIEW_BYTES`.
     pub limits: Limits,
     /// `MIMIC_MESH_STALE_AFTER`: not used here, handed to the sidecars (spec §7.1).
@@ -38,6 +42,8 @@ impl Default for MeshConfig {
             debounce: Duration::from_millis(100),
             cache_bytes: 64 * MIB,
             max_watches: 10_000,
+            max_watches_per_pod: 2,
+            watch_namespace_percent: 25,
             limits: Limits::default(),
             stale_after: Duration::from_secs(60),
             startup_wait: Duration::from_secs(2),
@@ -107,6 +113,20 @@ impl MeshConfig {
                 defaults.max_watches,
                 1,
                 1_000_000,
+            )?,
+            max_watches_per_pod: number(
+                env,
+                "MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD",
+                defaults.max_watches_per_pod,
+                1,
+                100,
+            )?,
+            watch_namespace_percent: number(
+                env,
+                "MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT",
+                defaults.watch_namespace_percent,
+                1,
+                100,
             )?,
             limits: Limits {
                 max_services: number(

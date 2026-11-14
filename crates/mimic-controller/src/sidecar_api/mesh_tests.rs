@@ -640,3 +640,132 @@ async fn msh_23_only_a_request_that_is_held_leaves_the_connection_cap() {
     );
     assert!(!hold.started());
 }
+
+fn config_isolated(max_watches: usize, per_pod: usize) -> MeshConfig {
+    MeshConfig {
+        max_watches_per_pod: per_pod,
+        ..config(700, max_watches)
+    }
+}
+
+/// A held request of the pod `pod` of `deployment` in `namespace`, started in the background.
+fn hold_as(s: &Setup, namespace: &str, pod: &str, etag: &str) -> tokio::task::JoinHandle<Resp> {
+    let (router, etag) = (s.router.clone(), etag.to_string());
+    let token = format!("ns|{namespace}|{pod}|t");
+    tokio::spawn(async move {
+        get_at(
+            &router,
+            "/v1/workloads/cart/mesh?format=1",
+            Some(&token),
+            &[("if-none-match", &etag)],
+        )
+        .await
+    })
+}
+
+async fn held_now(s: &Setup, n: i64) {
+    for _ in 0..100 {
+        if s.metrics.watches.get() == n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("mimic_mesh_watches is {}, not {n}", s.metrics.watches.get());
+}
+
+#[tokio::test]
+async fn msh_80_a_pod_holds_at_most_two_requests_and_the_others_are_not_affected() {
+    let s = setup_with(Some(config_isolated(100, 2)), 10_000, false);
+    let etag = get(&s, "cart", "shop", &[]).await.etag();
+    let (a, b) = (
+        hold_as(&s, "shop", "cart-7d9f8b6c4d-x2k9p", &etag),
+        hold_as(&s, "shop", "cart-7d9f8b6c4d-x2k9p", &etag),
+    );
+    held_now(&s, 2).await;
+    let third = hold_as(&s, "shop", "cart-7d9f8b6c4d-x2k9p", &etag)
+        .await
+        .unwrap();
+    assert_eq!(third.status, 503);
+    assert_eq!(third.headers["retry-after"], "1");
+    assert_eq!(s.metrics.watches.get(), 2);
+    // Another pod of the deployment, and a pod of another namespace, are held.
+    let other = hold_as(&s, "shop", "cart-7d9f8b6c4d-zzzzz", &etag);
+    let risk_etag = get(&s, "cart", "risk", &[]).await.etag();
+    let risk = hold_as(&s, "risk", "cart-7d9f8b6c4d-x2k9p", &risk_etag);
+    held_now(&s, 4).await;
+    assert_eq!(
+        (a.await.unwrap().status, b.await.unwrap().status),
+        (304, 304)
+    );
+    assert_eq!(other.await.unwrap().status, 304);
+    assert_eq!(risk.await.unwrap().status, 304);
+    // What ended is free again.
+    let again = hold_as(&s, "shop", "cart-7d9f8b6c4d-x2k9p", &etag);
+    held_now(&s, 1).await;
+    assert_eq!(again.await.unwrap().status, 304);
+    assert_eq!(s.metrics.watches.get(), 0);
+}
+
+#[tokio::test]
+async fn msh_81_a_namespace_holds_at_most_its_share_of_the_budget() {
+    let s = setup_with(Some(config_isolated(8, 1)), 10_000, false);
+    let etag = get(&s, "cart", "shop", &[]).await.etag();
+    let one = hold_as(&s, "shop", "cart-7d9f8b6c4d-bbbbb", &etag);
+    let two = hold_as(&s, "shop", "cart-7d9f8b6c4d-ddddd", &etag);
+    held_now(&s, 2).await;
+    let third = hold_as(&s, "shop", "cart-7d9f8b6c4d-ccccc", &etag)
+        .await
+        .unwrap();
+    assert_eq!(third.status, 503);
+    assert_eq!(third.headers["retry-after"], "1");
+    let risk_etag = get(&s, "cart", "risk", &[]).await.etag();
+    let risk = hold_as(&s, "risk", "cart-7d9f8b6c4d-bbbbb", &risk_etag);
+    held_now(&s, 3).await;
+    // A push-side route is served meanwhile: a certificate request.
+    let key = KeyPair::generate().unwrap();
+    let body = serde_json::to_vec(&json!({
+        "deployment": "cart",
+        "public_key": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key.subject_public_key_info()),
+    }))
+    .unwrap();
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/tls/intermediate")
+        .header("authorization", format!("Bearer {}", token("shop", "cart")))
+        .body(Body::from(body))
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(Peer("10.1.1.2".parse().unwrap()));
+    assert_eq!(
+        s.router.clone().oneshot(request).await.unwrap().status(),
+        200
+    );
+    for h in [one, two, risk] {
+        assert_eq!(h.await.unwrap().status, 304);
+    }
+}
+
+#[tokio::test]
+async fn msh_82_a_request_dropped_while_held_releases_every_count() {
+    let s = setup_with(Some(config_isolated(8, 2)), 10_000, false);
+    let etag = get(&s, "cart", "shop", &[]).await.etag();
+    let pod = "cart-7d9f8b6c4d-x2k9p";
+    let (a, b) = (
+        hold_as(&s, "shop", pod, &etag),
+        hold_as(&s, "shop", pod, &etag),
+    );
+    held_now(&s, 2).await;
+    a.abort();
+    b.abort();
+    held_now(&s, 0).await;
+    let (c, d) = (
+        hold_as(&s, "shop", pod, &etag),
+        hold_as(&s, "shop", pod, &etag),
+    );
+    held_now(&s, 2).await;
+    assert_eq!(
+        (c.await.unwrap().status, d.await.unwrap().status),
+        (304, 304)
+    );
+}

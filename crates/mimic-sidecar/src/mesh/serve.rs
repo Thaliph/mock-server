@@ -445,7 +445,7 @@ impl Serving {
         // `CONNECT` is not supported (spec §4.1 limit 8).
         if req.method() == Method::CONNECT || (http1 && req.headers().contains_key(header::UPGRADE))
         {
-            let (tracker, _) = Tracker::start(&self.ctx, label, None, req);
+            let (tracker, _) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
             self.count(None, StatusCode::NOT_IMPLEMENTED, "unsupported", began);
             tracker.synthetic(StatusCode::NOT_IMPLEMENTED.as_u16());
             return Ok(answer(StatusCode::NOT_IMPLEMENTED, "unsupported", http1));
