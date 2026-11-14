@@ -21,6 +21,13 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Retry policy and budget per Service (#446, M2): `MimicConfig` targeting a Service gains `retries` (0 to 10,
+  default 3; `0` also stops the fallback to the ClusterIP) and `retryBudget` (`percent` 20, `minPerSecond` 10,
+  `window` 10s). Each caller pod keeps one budget per Service: a retry is granted while retries in the window
+  stay within `percent` of the requests plus `minPerSecond` per second; the defaults allow 100 retries per 10 s
+  plus 20 % of the requests. A refused retry returns the failure as is, is counted in
+  `mimic_mesh_retry_budget_exhausted_total{backend}` and logged as the warning `retry budget exhausted` (at most
+  once per second per backend). The view's `policy` carries both fields.
 - Retries of mesh-routed requests (#445, M2): a request whose failure happened before the app could process it
   is tried again on another pod, at most 3 times (4 tries), then on the original destination when every try
   failed to connect. Retried: connect failures and refused HTTP/2 streams for every method, a trusted refusal
