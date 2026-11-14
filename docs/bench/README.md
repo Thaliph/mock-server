@@ -46,6 +46,40 @@ scripts/bench.sh --dry-run                                   # the plan, nothing
 - The JSON files: `mesh` (see BEN-16) and one `rollout_restart` flag per run. Output files of today's
   date must not exist yet (BEN-02).
 
+## Mesh refuse (#445, RTY-23): how to run
+
+Setup `mesh-refuse` measures the retries of M2 (SPEC §7.9 "Retries") against a backend with one pod that
+refuses connections. The backend Service has 3 pods: 2 injected (`fortio-server`, discovery mode) and 1
+`fortio-dead`, Ready, not injected (`mimic.platform.io/inject: disabled`), listening on no port, with no
+probe, sleeping in the pinned Python image of the e2e stages. The setup runs last, after `mesh-churn`.
+
+```sh
+SETUPS=mesh-refuse scripts/bench.sh                          # the refusing setup alone
+SETUPS="mesh-lb mesh-refuse" scripts/bench.sh                # with the M1 setup, same session (the 0.2 ms check)
+scripts/bench.sh --dry-run                                   # the plan, nothing started
+```
+
+- Routing, before and after the runs (BEN-12): each of the 2 injected pods has endpoint requests, no
+  fallback to the ClusterIP (strict), and the client's `mimic_mesh_attempts_total{result="connect_failed"}`
+  is above 0. A refused try is not written to a pod, so the refusing pod is shown by its connect failures,
+  not by an endpoint request.
+- The JSON: `routing.before` and `routing.after` carry `retries` (`mimic_mesh_retries_total`) and
+  `connect_failed_attempts`; the `refusing` block carries `injected_pods` 2, `not_injected_pods` 1,
+  `errors_total` (responses that are not 200, over all runs), `retries_total` and
+  `connect_failed_attempts` of the client's sidecar. The counters are cumulative since the client's sidecar
+  started (the restart of the setup), so `after` includes the `before` phase.
+- The file is `<date>-mesh-refuse.json`; its table rows go to `README.md` as for the other setups. The
+  committed M1 files are dated 2026-11-14: run on a later day, or set `BENCH_OUT_DIR` to another directory
+  (BEN-02 refuses an existing file).
+
+RTY-23 compares the runs with the committed M1 run of the same protocol and rate (table *M1: mesh setups*):
+
+- With no failure, `mesh-lb` is within 0.2 ms at p50 of that M1 row (run `SETUPS="mesh-lb mesh-refuse"` in
+  one session).
+- `mesh-refuse`: the error rate is 0 % (`errors` 0 in every run), and its p99 is at most the M1 `mesh-lb`
+  p99 + 5 ms. For http1 50 rps the M1 section takes the three repeats (9.95, 11.26, 10.39 ms) and not the
+  first run (19.35 ms, called noise there); the script does not decide, the reader reads the JSON.
+
 ## Conditions
 
 - Load: fortio `1.76.0` (digest-pinned in `images/Dockerfile`), 30 s per run, 8 connections,
