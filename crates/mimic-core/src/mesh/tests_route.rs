@@ -498,7 +498,7 @@ fn rte_05_ports_of_a_parent() {
     );
     let c = compile(&r, &[two], Some(&[]));
     assert_eq!(c.attachments.get("shop/two"), Some(&Some(vec![80, 81])));
-    assert_eq!(json(&c, "shop/two").contains(r#""ports":[80,81]"#), true);
+    assert!(json(&c, "shop/two").contains(r#""ports":[80,81]"#));
     let c = plain(&simple(vec![rule(vec![])]));
     assert!(!json(&c, "shop/cart").contains("ports"));
 }
