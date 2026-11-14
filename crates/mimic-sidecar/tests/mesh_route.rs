@@ -1,4 +1,4 @@
-//! RTE-47 to RTE-50 and RTE-52: the sidecar routes the requests of a Service port that has routes
+//! RTE-47 to RTE-53: the sidecar routes the requests of a Service port that has routes
 //! (spec §7.9 "Routing"): the weighted draw, the match and its update, the answers of the
 //! sidecar, the header modifiers on the wire and where routes do not apply (spec §12.24).
 
@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::mesh_pods::{H1Client, Pod, RawPod, cluster_ip, h2c_calls};
 use common::mock_rig::{Options, Rig, rig_with, users_set};
-use common::{capture_logs, closed_port, fixture_mesh};
+use common::{capture_logs, closed_port, fixture_mesh, fixture_mesh_dst};
 use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -33,6 +33,11 @@ struct Svc<'a> {
     routes: &'a str,
     /// A second port of the Service, with no endpoint.
     also: Option<u16>,
+    retries: u32,
+    /// `percent`, `minPerSecond`, `windowSeconds` of the retry budget.
+    budget: (u32, u32, u32),
+    /// No ClusterIP: `ips` is empty.
+    headless: bool,
 }
 
 fn svc<'a>(key: &'a str, ip: &'a str, port: u16, pods: &[SocketAddr]) -> Svc<'a> {
@@ -43,6 +48,9 @@ fn svc<'a>(key: &'a str, ip: &'a str, port: u16, pods: &[SocketAddr]) -> Svc<'a>
         pods: pods.to_vec(),
         routes: "",
         also: None,
+        retries: 3,
+        budget: (20, 10, 10),
+        headless: false,
     }
 }
 
@@ -67,11 +75,19 @@ fn view(services: &[Svc]) -> View {
                 )
             });
             format!(
-                r#""{key}":{{"endpoints":{{"{port}":[{pods}]{more_endpoints}}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":0}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"{port}":{{"targetPort":8080}}{more_ports}}}{routes}}}"#,
+                r#""{key}":{{"endpoints":{{"{port}":[{pods}]{more_endpoints}}},"generations":{{}},"ips":[{ip}],"policy":{{"loadBalancer":{{"slowStartSeconds":0}},"retries":{retries},"retryBudget":{{"minPerSecond":{min},"percent":{percent},"windowSeconds":{window}}}}},"ports":{{"{port}":{{"targetPort":8080}}{more_ports}}}{routes}}}"#,
                 key = s.key,
                 port = s.port,
                 pods = pods.join(","),
-                ip = s.ip,
+                ip = if s.headless {
+                    String::new()
+                } else {
+                    format!("\"{}\"", s.ip)
+                },
+                retries = s.retries,
+                percent = s.budget.0,
+                min = s.budget.1,
+                window = s.budget.2,
             )
         })
         .collect();
@@ -83,7 +99,11 @@ fn view(services: &[Svc]) -> View {
 }
 
 fn backend(service: &str, weight: u32) -> String {
-    format!(r#"{{"port":80,"service":"{service}","weight":{weight}}}"#)
+    backend_on(service, 80, weight)
+}
+
+fn backend_on(service: &str, port: u16, weight: u32) -> String {
+    format!(r#"{{"port":{port},"service":"{service}","weight":{weight}}}"#)
 }
 
 fn rule(matches: &str, backends: &[String], filters: &str) -> String {
@@ -815,5 +835,294 @@ async fn rte_50_discovery_records_the_request_the_app_sent_and_the_modified_resp
     assert!(
         !report.contains("x-set") && !report.contains("x-add"),
         "{report}"
+    );
+}
+
+fn exact(path: &str) -> String {
+    format!(r#"{{"path":{{"type":"Exact","value":"{path}"}}}}"#)
+}
+
+/// `/v1` goes to `cart-v1:80`, `/v2` to `cart-v2:<v2_port>`.
+fn split_routes(v2_port: u16) -> String {
+    routes(&[route(
+        CANARY,
+        "",
+        &[
+            rule(&exact("/v1"), &[backend("shop/cart-v1", 1)], ""),
+            rule(&exact("/v2"), &[backend_on("shop/cart-v2", v2_port, 1)], ""),
+        ],
+    )])
+}
+
+#[tokio::test]
+async fn rte_51_a_backend_falls_back_to_its_own_cluster_ip_and_never_to_another_backend() {
+    let logs = capture_logs();
+    let (own, v1, _) = pods().await;
+    let v2_cluster = Pod::http1("v2-cluster", 0).await;
+    let v2_port = v2_cluster.addr.port();
+    let backend_label = format!("shop/cart-v2:{v2_port}");
+    let routes = split_routes(v2_port);
+    let mut parent = svc("shop/cart", "127.0.0.1", 80, &[own.addr]);
+    parent.routes = &routes;
+    let state = state_with(view(&[
+        parent,
+        svc("shop/cart-v1", "10.96.0.1", 80, &[v1.addr]),
+        svc("shop/cart-v2", "127.0.0.1", v2_port, &[closed_port().await]),
+    ]));
+    // The parent's own destination is not the one that must be used.
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    for _ in 0..5 {
+        let (head, body) = client.get("/v2").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, "v2-cluster");
+    }
+    assert_eq!(v1.counts.requests() + own.counts.requests(), 0);
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        metric(
+            &scrape,
+            "mimic_mesh_fallbacks_total{",
+            &[&format!("backend=\"{backend_label}\"")]
+        ),
+        5.0,
+        "{scrape}"
+    );
+    for entry in logs.access_exactly(5).await {
+        assert_eq!(entry["backend"], backend_label, "{entry}");
+        assert_eq!(entry["upstream"], v2_cluster.addr.to_string(), "{entry}");
+    }
+}
+
+#[tokio::test]
+async fn rte_51_the_retries_of_the_drawn_backend_apply_and_zero_gives_one_try() {
+    let _logs = capture_logs();
+    let (own, v1, _) = pods().await;
+    let v2_cluster = Pod::http1("v2-cluster", 0).await;
+    let v2_port = v2_cluster.addr.port();
+    let routes = split_routes(v2_port);
+    let mut parent = svc("shop/cart", "127.0.0.1", 80, &[own.addr]);
+    parent.routes = &routes;
+    let mut v2 = svc("shop/cart-v2", "127.0.0.1", v2_port, &[closed_port().await]);
+    v2.retries = 0;
+    let state = state_with(view(&[
+        parent,
+        svc("shop/cart-v1", "10.96.0.1", 80, &[v1.addr]),
+        v2,
+    ]));
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    let (head, _) = client.get("/v2").await;
+    assert!(head.starts_with("HTTP/1.1 503"), "one try only: {head}");
+    assert!(lower(&head).contains("connect-failed"), "{head}");
+    assert_eq!(
+        v2_cluster.counts.requests(),
+        0,
+        "no fallback with 0 retries"
+    );
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        metric(&scrape, "mimic_mesh_attempts_total{", &["cart-v2"]),
+        1.0,
+        "{scrape}"
+    );
+}
+
+#[tokio::test]
+async fn rte_51_the_budget_is_the_drawn_backends_and_sidecar_answers_deposit_nothing() {
+    let logs = capture_logs();
+    let (own, v1, _) = pods().await;
+    let live = Pod::http1("v1-live", 0).await;
+    let routes = routes(&[route(
+        CANARY,
+        "",
+        &[
+            rule(&exact("/v1"), &[backend("shop/cart-v1", 1)], ""),
+            rule(&exact("/v2"), &[backend("shop/cart-v2", 1)], ""),
+            rule(&exact("/none"), &[], ""),
+            rule(
+                &exact("/invalid"),
+                &[r#"{"invalid":true,"weight":1}"#.to_string()],
+                "",
+            ),
+        ],
+    )]);
+    let mut parent = svc("shop/cart", "127.0.0.1", 80, &[own.addr]);
+    parent.routes = &routes;
+    let mut v2 = svc("shop/cart-v2", "10.96.0.2", 80, &[closed_port().await]);
+    // No retry is ever allowed.
+    v2.budget = (0, 0, 10);
+    let state = state_with(view(&[
+        parent,
+        svc(
+            "shop/cart-v1",
+            "10.96.0.1",
+            80,
+            &[closed_port().await, live.addr],
+        ),
+        v2,
+    ]));
+    let _ = &v1;
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    for path in ["/missing", "/none", "/invalid", "/none"] {
+        let (head, _) = client.get(path).await;
+        assert!(!head.starts_with("HTTP/1.1 200"), "{path}: {head}");
+    }
+    for _ in 0..20 {
+        let (head, body) = client.get("/v1").await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, "v1-live");
+    }
+    let (head, _) = client.get("/v2").await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    let scrape = f.metrics.encode();
+    let exhausted = |b: &str| {
+        metric(
+            &scrape,
+            "mimic_mesh_retry_budget_exhausted_total{",
+            &[&format!("backend=\"{b}\"")],
+        )
+    };
+    assert_eq!(exhausted("shop/cart-v2:80"), 1.0, "{scrape}");
+    assert_eq!(exhausted("shop/cart-v1:80"), 0.0, "{scrape}");
+    let text = logs.text();
+    let warn = text
+        .lines()
+        .find(|l| l.contains("retry budget exhausted"))
+        .unwrap_or_else(|| panic!("no warning: {text}"));
+    assert!(warn.contains("\"backend\":\"shop/cart-v2:80\""), "{warn}");
+    assert!(
+        warn.contains("\"window_requests\":1,"),
+        "the answers of the sidecar deposited: {warn}"
+    );
+}
+
+#[tokio::test]
+async fn rte_51_a_headless_backend_whose_pods_refuse_is_answered_503_without_a_fallback() {
+    let _logs = capture_logs();
+    let (own, _, _) = pods().await;
+    let routes = routes(&[route(
+        CANARY,
+        "",
+        &[rule(&exact("/v2"), &[backend("shop/cart-v2", 1)], "")],
+    )]);
+    let mut parent = svc("shop/cart", "127.0.0.1", 80, &[own.addr]);
+    parent.routes = &routes;
+    let mut v2 = svc(
+        "shop/cart-v2",
+        "10.96.0.2",
+        80,
+        &[closed_port().await, closed_port().await],
+    );
+    v2.headless = true;
+    let state = state_with(view(&[parent, v2]));
+    // The parent's destination answers: it must not be used.
+    let parent_dst = Pod::http1("parent-dst", 0).await;
+    let f = fixture_mesh(parent_dst.addr, &state, None).await;
+    let mut client = H1Client::connect(f.addr).await;
+    let (head, _) = client.get("/v2").await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert!(lower(&head).contains("connect-failed"), "{head}");
+    assert_eq!(parent_dst.counts.requests(), 0);
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        metric(&scrape, "mimic_mesh_fallbacks_total{", &["cart-v2"]),
+        0.0,
+        "{scrape}"
+    );
+}
+
+#[tokio::test]
+async fn rte_53_route_labels_are_capped_at_256_and_evicted_5_minutes_after_the_route_left() {
+    let _logs = capture_logs();
+    let pod = Pod::http1("pod", 0).await;
+    let ip = |i: usize| format!("10.{}.{}.{}", 96 + i / 60_000, (i / 250) % 240, i % 250 + 1);
+    let names: Vec<(String, String, String)> = (0..300)
+        .map(|i| (format!("shop/s{i}"), ip(i), format!("shop/r{i}")))
+        .collect();
+    let build = |renamed: Option<&str>| {
+        let routes: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, (service, _, name))| {
+                let name = match (i, renamed) {
+                    (0, Some(new)) => new,
+                    _ => name,
+                };
+                routes(&[route(name, "", &[rule("{}", &[backend(service, 1)], "")])])
+            })
+            .collect();
+        let services: Vec<Svc> = names
+            .iter()
+            .zip(&routes)
+            .map(|((service, ip, _), routes)| {
+                let mut s = svc(service, ip, 80, &[pod.addr]);
+                s.routes = routes;
+                s
+            })
+            .collect();
+        view(&services)
+    };
+    let state = state_with(build(None));
+    let next = Arc::new(Mutex::new(0usize));
+    let addrs: Vec<SocketAddr> = names
+        .iter()
+        .map(|(_, ip, _)| format!("{ip}:80").parse().unwrap())
+        .collect();
+    let dst = {
+        let (next, addrs) = (next.clone(), addrs.clone());
+        Arc::new(move |_: &_| Ok(addrs[*next.lock().unwrap()]))
+    };
+    let f = fixture_mesh_dst(dst, &state, None).await;
+    let visit = |i: usize, path: &'static str| {
+        let next = next.clone();
+        let addr = f.addr;
+        async move {
+            *next.lock().unwrap() = i;
+            let mut client = H1Client::connect(addr).await;
+            let (head, _) = client.get(path).await;
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        }
+    };
+    for i in 0..300 {
+        visit(i, "/secret-path?token=zzz-query").await;
+    }
+    let routes_of = |scrape: &str| -> std::collections::BTreeSet<String> {
+        scrape
+            .lines()
+            .filter(|l| l.starts_with("mimic_mesh_requests_total{"))
+            .filter_map(|l| l.split("route=\"").nth(1)?.split('"').next())
+            .map(str::to_string)
+            .collect()
+    };
+    let scrape = f.metrics.encode();
+    let seen = routes_of(&scrape);
+    assert_eq!(seen.len(), 257, "256 routes and other");
+    assert!(seen.contains("other"));
+    assert_eq!(requests(&scrape, &["route=\"other\""]), 44.0);
+    for line in scrape.lines().filter(|l| l.starts_with("mimic_mesh_")) {
+        assert!(
+            !line.contains("secret-path") && !line.contains("zzz-query"),
+            "{line}"
+        );
+    }
+    // Route 0 leaves the view, another takes its place.
+    state.hold(build(Some("shop/renamed")), "\"2-a\"");
+    let now = std::time::Instant::now();
+    state.evict(now + Duration::from_secs(200));
+    assert!(
+        routes_of(&f.metrics.encode()).contains("shop/r0"),
+        "kept 200 s"
+    );
+    state.evict(now + Duration::from_secs(301));
+    let scrape = f.metrics.encode();
+    assert!(!routes_of(&scrape).contains("shop/r0"), "{scrape}");
+    visit(0, "/").await;
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        requests(&scrape, &["route=\"shop/renamed\""]),
+        1.0,
+        "{scrape}"
     );
 }
