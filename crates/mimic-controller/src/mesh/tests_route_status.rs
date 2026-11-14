@@ -397,7 +397,7 @@ impl RouteSink for Replica {
     fn patch<'a>(&'a self, namespace: &'a str, name: &'a str, body: &'a Value) -> PatchFuture<'a> {
         Box::pin(async move {
             let top: Vec<_> = body.as_object().unwrap().keys().collect();
-            assert_eq!(top, ["metadata", "status"], "{body}");
+            assert_eq!(top, ["metadata", "status"], "top-level keys of the patch");
             assert_eq!(body["status"].as_object().unwrap().len(), 1);
             let read = body["metadata"]["resourceVersion"]
                 .as_str()
@@ -740,7 +740,7 @@ async fn rte_17_a_failing_status_api_is_counted_warned_once_and_tried_again_afte
         .lines()
         .filter(|l| l.contains("httproute status failed"))
         .collect();
-    assert_eq!(warns.len(), 1, "one WARN per route and streak: {text}");
+    assert_eq!(warns.len(), 1, "one WARN per route and streak");
     assert!(warns[0].contains(r#""route":"shop/split""#) && warns[0].contains("500"));
     assert!(!text.contains(CANARY), "no value of the route in a log");
 }

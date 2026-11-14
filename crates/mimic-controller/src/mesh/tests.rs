@@ -596,7 +596,7 @@ async fn rte_10_a_truncated_view_names_the_routes_left_out_in_its_warn() {
         .lines()
         .filter(|l| l.contains("mesh view truncated"))
         .collect();
-    assert_eq!(warns.len(), 1, "{text}");
+    assert_eq!(warns.len(), 1, "one truncation WARN");
     assert!(
         warns[0].contains(r#""routes":"shop/r1""#),
         "the WARN names the routes left out: {}",

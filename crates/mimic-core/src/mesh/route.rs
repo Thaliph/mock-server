@@ -10,7 +10,10 @@ use super::input::{
     RouteFilter, RouteRule, Service,
 };
 use super::policy::Condition;
-use super::view::{fraction, header_name, header_value, method, path_value};
+use super::view::{
+    MAX_ITEMS, MAX_MATCHES, MAX_RULES, MAX_WEIGHT, fraction, header_name, header_value, method,
+    path_value,
+};
 
 /// Field order is alphabetical in every struct below: the JSON is canonical (sorted keys).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,6 +551,9 @@ fn first_unsupported(route: &Route) -> Option<String> {
     if route.oversize {
         return Some("route larger than 64 KiB".into());
     }
+    if route.rules.len() > MAX_RULES {
+        return Some("rules".into());
+    }
     // The first unknown field of the converter wins over a known item of a later rule, and
     // loses to one of an earlier rule.
     let unknown = route.unknown_fields.first().map(|path| {
@@ -612,8 +618,36 @@ fn rule_unsupported(i: usize, rule: &RouteRule) -> Option<String> {
 /// The path of the first value the view would refuse (`View::from_json`, RTE-12), found by the
 /// predicates it uses: a route holding one is in no view, so no sidecar rejects the whole view.
 fn value_unsupported(at: &str, rule: &RouteRule) -> Option<String> {
+    if rule.matches.len() > MAX_MATCHES {
+        return Some(format!("{at}.matches"));
+    }
+    if rule.backend_refs.len() > MAX_ITEMS {
+        return Some(format!("{at}.backendRefs"));
+    }
+    if let Some(j) = rule
+        .backend_refs
+        .iter()
+        .position(|b| b.weight.unwrap_or(1) > MAX_WEIGHT)
+    {
+        return Some(format!("{at}.backendRefs[{j}].weight"));
+    }
+    if rule
+        .filters
+        .iter()
+        .filter(|f| f.request_mirror.is_some())
+        .count()
+        > MAX_ITEMS
+    {
+        return Some(format!("{at}.filters"));
+    }
     for (j, m) in rule.matches.iter().enumerate() {
         let at = format!("{at}.matches[{j}]");
+        if m.headers.len() > MAX_ITEMS {
+            return Some(format!("{at}.headers"));
+        }
+        if m.query_params.len() > MAX_ITEMS {
+            return Some(format!("{at}.queryParams"));
+        }
         if let Some(p) = &m.path
             && !path_value(&p.value)
         {
@@ -632,6 +666,29 @@ fn value_unsupported(at: &str, rule: &RouteRule) -> Option<String> {
                 }
                 if !header_value(&n.value) {
                     return Some(format!("{at}.{list}[{k}].value"));
+                }
+            }
+        }
+    }
+    // Modifiers of one type merge into one list: the view bounds the merged lists.
+    for (field, request) in [
+        ("requestHeaderModifier", true),
+        ("responseHeaderModifier", false),
+    ] {
+        let mut totals = [0usize; 3];
+        for (j, f) in rule.filters.iter().enumerate() {
+            let m = if request {
+                &f.request_header_modifier
+            } else {
+                &f.response_header_modifier
+            };
+            let Some(m) = m else { continue };
+            totals[0] += m.set.len();
+            totals[1] += m.add.len();
+            totals[2] += m.remove.len();
+            for (list, total) in ["set", "add", "remove"].into_iter().zip(totals) {
+                if total > MAX_ITEMS {
+                    return Some(format!("{at}.filters[{j}].{field}.{list}"));
                 }
             }
         }

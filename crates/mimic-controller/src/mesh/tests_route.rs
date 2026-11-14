@@ -269,7 +269,10 @@ async fn rte_15_a_route_changes_the_view_and_its_deletion_removes_it() {
     hub.publish_now();
     let (with, json) = body_of(&hub, "shop", "cart", Mode::None).await;
     assert_ne!(with, before, "the route changes the ETag");
-    assert!(json.contains(r#""name":"shop/split""#), "{json}");
+    assert!(
+        json.contains(r#""name":"shop/split""#),
+        "the view holds the route"
+    );
     // A caller it does not apply to keeps its view (a consumer route of `shop`).
     let (elsewhere, _) = body_of(&hub, "other", "cart", Mode::None).await;
     hub.feed_routes(Event::Delete(key("shop", "split")));
@@ -392,13 +395,16 @@ async fn rte_19_the_metrics_are_registered_with_their_names() {
         .inc();
     let mut text = String::new();
     prometheus_client::encoding::text::encode(&mut text, &registry).unwrap();
-    assert!(text.contains("mesh_gateway_api_present 1"), "{text}");
+    assert!(
+        text.contains("mesh_gateway_api_present 1"),
+        "gateway_api_present gauge"
+    );
     assert!(
         text.contains(r#"mesh_routes{state="programmed"} 2"#),
-        "{text}"
+        "routes programmed gauge"
     );
     assert!(
         text.contains(r#"mesh_route_status_total{result="conflict"} 1"#),
-        "{text}"
+        "route status conflict counter"
     );
 }

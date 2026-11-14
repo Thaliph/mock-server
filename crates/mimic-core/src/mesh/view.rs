@@ -149,10 +149,10 @@ impl ServiceView {
 }
 
 /// The HTTPRoute CRD maxima (spec §7.9 "`View::from_json`").
-const MAX_RULES: usize = 16;
-const MAX_MATCHES: usize = 64;
-const MAX_ITEMS: usize = 16;
-const MAX_WEIGHT: u32 = 1_000_000;
+pub(super) const MAX_RULES: usize = 16;
+pub(super) const MAX_MATCHES: usize = 64;
+pub(super) const MAX_ITEMS: usize = 16;
+pub(super) const MAX_WEIGHT: u32 = 1_000_000;
 const MAX_VALUE_BYTES: usize = 4096;
 const MAX_PATH_BYTES: usize = 1024;
 const METHODS: [&str; 9] = [

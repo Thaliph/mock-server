@@ -250,7 +250,7 @@ fn rte_09_a_backend_of_another_namespace_without_the_grant_adds_nothing_of_it() 
     for caller in [("shop", "cart"), ("web", "front")] {
         let b = view_of(&s, caller.0, caller.1);
         for secret in ["risk", "10.96.0.4", "10.244.0.4"] {
-            assert!(!json_has(&b, secret), "{caller:?} {secret}");
+            assert!(!json_has(&b, secret), "a secret in the view of {caller:?}");
         }
         let rule = &b.view.services["shop/cart"].routes[0].rules[0];
         assert_eq!(rule.backends[0].invalid, Some(true));

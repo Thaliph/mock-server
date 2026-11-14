@@ -225,9 +225,9 @@ fn rte_01_durations_and_mirror_fractions() {
         let mut a = rule(vec![]);
         a.request_timeout = Some(text.into());
         let c = plain(&simple(vec![a]));
-        assert!(c.programmed, "{text}");
+        assert!(c.programmed, "timeout programmed");
         let want = format!(r#""timeouts":{{"requestMs":{ms}}}"#);
-        assert!(json(&c, "shop/cart").contains(&want), "{text}");
+        assert!(json(&c, "shop/cart").contains(&want), "timeout in ms");
     }
     let mut a = rule(vec![]);
     a.filters = vec![
@@ -920,7 +920,11 @@ fn rte_03_one_item_over_each_crd_maximum_makes_the_route_unsupported() {
             "rules[0].matches[0].queryParams",
         ),
         (backends(16), backends(17), "rules[0].backendRefs"),
-        (weighted(1_000_000), weighted(1_000_001), "rules[0].backendRefs[0].weight"),
+        (
+            weighted(1_000_000),
+            weighted(1_000_001),
+            "rules[0].backendRefs[0].weight",
+        ),
         (mirrors(16), mirrors(17), "rules[0].filters"),
         (
             filter_rule(modifier("RequestHeaderModifier", 16, 16, 16)),
