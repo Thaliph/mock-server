@@ -3755,8 +3755,8 @@ kubectl -n default delete mimicworkload kept --ignore-not-found >/dev/null
 # standard Gateway API CRDs (installed here, removed at the end), a MimicConfig, a ReferenceGrant, one Deployment and
 # Service per namespace. The CRDs come after the controller started: it must notice them without a restart.
 log "msh_28: the mesh view is served per deployment, follows a ReferenceGrant and a scale, and long-polls"
-gw_version=v1.4.1
-gw_sha256=73b91b77f6be023a8c92c969fc664e5bd3b1a28aea59eac9ebc904607354dad2
+gw_version=v1.7.0
+gw_sha256=4e2602c4cbe1afbc394d86f4ac6522e1a5263b01133bba1e40a6d1a549e753a1
 curl -fsSL --max-time 120 -o "$WORK/gateway-standard.yaml" \
   "https://github.com/kubernetes-sigs/gateway-api/releases/download/$gw_version/standard-install.yaml" \
   || fail "msh_28: cannot download the Gateway API $gw_version standard CRDs"
