@@ -181,7 +181,7 @@ life are not a sustained rate; controller CPU summed over replicas, budget 0.5 c
 
 ```bash
 scripts/bench-controller.sh --dry-run   # the plan, nothing started
-scripts/bench-controller.sh             # both scenarios on cluster "mimic-ctl-bench", deleted on exit (about 20 minutes, an estimate not yet measured)
+scripts/bench-controller.sh             # both scenarios on cluster "mimic-ctl-bench", deleted on exit (about 13 minutes on this machine)
 SCENARIOS=scale scripts/bench-controller.sh   # the RSS scenario only
 ```
 
@@ -195,3 +195,19 @@ SCENARIOS=scale scripts/bench-controller.sh   # the RSS scenario only
 - `KEEP_CLUSTER=0` (the default) deletes the cluster on exit. With `KEEP_CLUSTER=1` the namespaces and the
   release are deleted and the cluster stays. The result file is never overwritten.
 - Run it on a quiet machine, not in parallel with `scripts/bench.sh` or `scripts/e2e.sh`.
+- The 200-sidecar rollout drives this machine's load average to 30–50 for a few minutes; run it rarely.
+
+### Results 2026-11-14 (design §14 M1)
+
+`scripts/bench-controller.sh` on `mesh/441-measure` (main after #517 plus the view pacing, MSH-88); JSON
+`2026-11-14-controller.json`. Two controller replicas.
+
+| Budget | Measured | |
+|---|---|---|
+| Controller RSS ≤ 256 MiB with 1000 Services / 10 000 endpoints, view cache included | max 26.5 MiB per replica (view cache 0.5 MiB); 10 clients each holding a view of 1000+ endpoints | met |
+| Rollout of a 50-pod deployment among 200 sidecars: ≤ 1 view/s per sidecar | sidecars present for the whole rollout (150): max 0.818, p99 0.812 views/s; new pods (50): max 0.977 (81 s rollout) | met |
+| Controller ≤ 0.5 core average during the rollout | 0.173 cores, both replicas summed | met |
+
+A first run without the pacing (same day, result not kept in the JSON) measured views at max 1.54/s and
+mean 1.22/s per sidecar, CPU 0.19 cores and RSS 26.3 MiB: the debounce (100 ms doubling to 1 s) let rollout
+bursts through faster than 1/s. MSH-88 spaces each pod's views at least 1 s apart.

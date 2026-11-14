@@ -1,0 +1,111 @@
+{
+  "date": "2026-11-14",
+  "machine": {
+    "cpu": "Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz",
+    "cores": 12,
+    "ram": "31.0 GiB",
+    "kernel": "7.2.15-1-omarchy",
+    "docker": "29.9.2",
+    "kind": "kind v0.33.0 go1.26.7 linux/amd64",
+    "kubernetes": "v1.33.12",
+    "node_image": "kindest/node:v1.33.12@sha256:3f5c8443c620245e4d355cfe09e96a91ead32ceaa569d3f1ca9edf0cb2fe2ff4",
+    "kubelet_max_pods": 300
+  },
+  "scale": {
+    "namespaces": 10,
+    "services": 1000,
+    "endpoints": 10000,
+    "views": {
+      "clients": 10,
+      "services_min": 100,
+      "endpoints_min": 1000
+    },
+    "window_s": 60,
+    "sample_every_s": 5,
+    "replicas": [
+      {
+        "pod": "mimic-controller-cfdbc89f7-cdgqh",
+        "rss_max_mib": 26.5,
+        "view_cache_max_mib": 0.5
+      },
+      {
+        "pod": "mimic-controller-cfdbc89f7-wnccc",
+        "rss_max_mib": 25.5,
+        "view_cache_max_mib": 0.3
+      }
+    ],
+    "rss_max_mib": 26.5,
+    "view_cache_max_mib": 0.5,
+    "budgets": [
+      {
+        "name": "controller RSS, 1000 Services and 10000 endpoints, view cache included",
+        "value": 26.5,
+        "unit": "MiB",
+        "limit": 256,
+        "met": true
+      }
+    ]
+  },
+  "rollout": {
+    "namespace": "mimic-ctl-rollout",
+    "deployment": "callee",
+    "replicas": 50,
+    "sidecars": 200,
+    "rollout_s": 80.987,
+    "pulls": {
+      "sidecars_measured": 200,
+      "kept": 150,
+      "new": 50,
+      "restarted": 0
+    },
+    "views_per_s": {
+      "sidecars": 200,
+      "max": 0.977,
+      "p99": 0.971,
+      "mean": 0.795,
+      "kept": {
+        "sidecars": 150,
+        "max": 0.818,
+        "p99": 0.812,
+        "mean": 0.772
+      },
+      "new": {
+        "sidecars": 50,
+        "max": 0.977,
+        "p99": 0.977,
+        "mean": 0.866
+      }
+    },
+    "controller": {
+      "replicas": 2,
+      "cpu_cores": 0.173,
+      "resets": 0,
+      "per_replica": [
+        {
+          "pod": "mimic-controller-cfdbc89f7-wnccc",
+          "cores": 0.07
+        },
+        {
+          "pod": "mimic-controller-cfdbc89f7-cdgqh",
+          "cores": 0.103
+        }
+      ]
+    },
+    "budgets": [
+      {
+        "name": "views per second per sidecar present during the whole rollout (max)",
+        "value": 0.818,
+        "unit": "views/s",
+        "limit": 1,
+        "met": true
+      },
+      {
+        "name": "controller CPU, sum over replicas",
+        "value": 0.173,
+        "unit": "cores",
+        "limit": 0.5,
+        "met": true
+      }
+    ]
+  }
+}
