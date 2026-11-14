@@ -323,7 +323,6 @@ fn rty_05_defaults() {
     let config = config(&[]).unwrap();
     assert_eq!(config.retry_buffer, 64 * 1024);
     assert_eq!(config.retry_buffer_total, 8 * 1024 * 1024);
-    assert_eq!(config.retries, 3);
     assert_eq!(config.refusal_delay, Duration::from_millis(25));
 }
 

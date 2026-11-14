@@ -399,7 +399,7 @@ async fn rty_52_exhausting_a_service_leaves_another_whole_and_ports_share_one_bu
     let (a, b) = (refusers(3, false).await, refusers(3, false).await);
     let state = state();
     let mut etag = 0;
-    let mut svc_a = Svc::new("shop/a", "127.0.0.2", 80, &addrs(&a)).budget(0, 2, 10);
+    let mut svc_a = Svc::new("shop/a", "127.0.0.2", 80, &addrs(&a)).budget(0, 1, 2);
     svc_a.ports.push((81, addrs(&a)));
     hold(
         &state,
@@ -571,6 +571,8 @@ async fn rty_54_state_survives_views_and_is_bounded_by_the_services() {
     assert_eq!(state.retry_state_for_test(), (0, 0), "nothing held");
     hold(&state, &mut etag, &[svc(&addresses, 0, 5)]);
     assert_eq!(state.retry_state_for_test(), (1, 1));
+    // A connection made before the Service left keeps the backend it was routed to.
+    let mut client = H1Client::connect(f.addr).await;
     for n in 8..10 {
         let before = seen(&pods) + extra.count();
         assert_eq!(send(&mut client, f.addr, false, "GET", n, b"").await, 503);

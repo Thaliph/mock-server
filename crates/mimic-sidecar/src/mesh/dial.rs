@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mimic_core::mesh::retry::{Outcome, Planner};
+use mimic_core::mesh::retry::{Decision, Failure, Outcome, Planner, classify};
 use tokio::net::TcpStream;
 
 use super::MeshState;
@@ -79,11 +79,26 @@ impl MeshState {
         // A stale view, or one that says `"mesh": false`, has the original destination for its
         // only try.
         let direct = self.stale() || self.off();
-        let mut planner = Planner::new(router.retries);
+        let mut planner = Planner::new(backend.retry.retries());
+        // Each connection is one request of the budget (spec §7.9 "Retry budget").
+        backend.retry.deposit(router.now());
         let mut tries = 0;
         let mut retry = false;
         let mut last = None;
         loop {
+            if retry && !direct {
+                // A connect failure is retried when the planner has a try and the budget
+                // grants one; without them the connection ends with the last error.
+                let verdict = classify(Failure::Connect, "", true, false);
+                match backend.retry.decide(verdict, &planner, router.now()) {
+                    Decision::Retry => {}
+                    Decision::Budget => {
+                        backend.exhausted(router);
+                        return Err(last.unwrap_or_else(|| io::Error::other("no try left")));
+                    }
+                    _ => return Err(last.unwrap_or_else(|| io::Error::other("no try left"))),
+                }
+            }
             let plan = if direct {
                 if tries == 0 {
                     Plan::Original

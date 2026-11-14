@@ -121,6 +121,7 @@ pub(crate) struct MeshMetrics {
     in_flight: Family<InFlightLabels, Gauge>,
     reconnects: Family<BackendLabels, Counter>,
     fallbacks: Family<BackendLabels, Counter>,
+    budget_exhausted: Family<BackendLabels, Counter>,
     attempts: Family<ResultLabels, Counter>,
     retries: Family<ReasonLabels, Counter>,
     skipped: Family<ReasonLabels, Counter>,
@@ -147,6 +148,7 @@ impl MeshMetrics {
             in_flight: Family::default(),
             reconnects: Family::default(),
             fallbacks: Family::default(),
+            budget_exhausted: Family::default(),
             attempts: Family::default(),
             retries: Family::default(),
             skipped: Family::default(),
@@ -185,6 +187,11 @@ impl MeshMetrics {
             "mesh_fallbacks",
             "Requests sent to the original destination instead of a pod",
             self.fallbacks.clone(),
+        );
+        registry.register(
+            "mesh_retry_budget_exhausted",
+            "Retries refused by the retry budget of the Service, by backend",
+            self.budget_exhausted.clone(),
         );
         registry.register(
             "mesh_attempts",
@@ -248,6 +255,16 @@ impl MeshMetrics {
             .inc();
     }
 
+    /// A retry the budget refused.
+    pub(crate) fn budget_exhausted(&self, backend: &str) {
+        self.track(backend, None);
+        self.budget_exhausted
+            .get_or_create(&BackendLabels {
+                backend: backend.to_string(),
+            })
+            .inc();
+    }
+
     /// One try of a request ended with `outcome`.
     pub(crate) fn attempt(&self, backend: &str, outcome: Outcome) {
         self.track(backend, None);
@@ -289,6 +306,7 @@ impl MeshMetrics {
         };
         let _ = self.reconnects.get_or_create(&labels);
         let _ = self.fallbacks.get_or_create(&labels);
+        let _ = self.budget_exhausted.get_or_create(&labels);
         self.series
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -458,6 +476,7 @@ impl MeshMetrics {
             };
             self.reconnects.remove(&labels);
             self.fallbacks.remove(&labels);
+            self.budget_exhausted.remove(&labels);
             for outcome in RESULTS {
                 self.attempts.remove(&ResultLabels {
                     backend: backend.clone(),

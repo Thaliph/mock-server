@@ -330,6 +330,12 @@ impl Budget {
         }
     }
 
+    /// Applies a new `percent` and `minPerSecond` to the counts held (the window stays).
+    pub fn set_rates(&mut self, percent: u32, min_per_second: u32) {
+        self.percent = u64::from(percent);
+        self.min_per_second = u64::from(min_per_second);
+    }
+
     /// A request (the first try of one, or a mesh-balanced L4 connection).
     pub fn deposit(&mut self, now: Duration) {
         self.deposit_many(now, 1);

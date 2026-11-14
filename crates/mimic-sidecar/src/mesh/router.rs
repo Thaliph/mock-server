@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use mimic_core::mesh::lb::Endpoints;
-use mimic_core::mesh::retry::{Next, Planner};
+use mimic_core::mesh::policy::Policy;
+use mimic_core::mesh::retry::{Budget, Decision, Next, Planner, Verdict, decide};
 use mimic_core::mesh::view::View;
 use prometheus_client::metrics::gauge::Gauge;
 
@@ -90,20 +91,107 @@ impl State {
     }
 }
 
+/// The retries of one Service (spec §7.9 "Retry budget"): its `retries` and the budget its
+/// ports share. Carried over the views that hold the Service.
+pub(crate) struct ServiceRetry {
+    retries: AtomicU32,
+    budget: Mutex<(u32, Budget)>,
+}
+
+impl ServiceRetry {
+    fn new(policy: &Policy) -> ServiceRetry {
+        let b = &policy.retry_budget;
+        ServiceRetry {
+            retries: AtomicU32::new(policy.retries),
+            budget: Mutex::new((
+                b.window_seconds,
+                Budget::new(
+                    b.percent,
+                    b.min_per_second,
+                    Duration::from_secs(u64::from(b.window_seconds)),
+                ),
+            )),
+        }
+    }
+
+    /// A new view: `retries` and the rates apply at once; a new window starts the budget empty.
+    fn configure(&self, policy: &Policy) {
+        self.retries.store(policy.retries, Ordering::Release);
+        let b = &policy.retry_budget;
+        let mut held = lock(&self.budget);
+        if held.0 == b.window_seconds {
+            held.1.set_rates(b.percent, b.min_per_second);
+        } else {
+            *held = ServiceRetry::new(policy)
+                .budget
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    pub(crate) fn retries(&self) -> u32 {
+        self.retries.load(Ordering::Acquire)
+    }
+
+    /// A request: the first try of one, or an L4 connection.
+    pub(crate) fn deposit(&self, now: Duration) {
+        lock(&self.budget).1.deposit(now);
+    }
+
+    /// What to do with a failed try; the budget is asked only when the failure is retried and
+    /// `planner` has a try left.
+    pub(crate) fn decide(&self, verdict: Verdict, planner: &Planner, now: Duration) -> Decision {
+        decide(verdict, planner, &mut lock(&self.budget).1, now)
+    }
+
+    fn counts(&self, now: Duration) -> (u64, u64) {
+        lock(&self.budget).1.counts(now)
+    }
+}
+
+/// At most one warning per second per backend, with the refusals not logged since the last.
+#[derive(Default)]
+struct Limiter {
+    last: Option<Duration>,
+    suppressed: u64,
+}
+
+impl Limiter {
+    /// A refusal at `now`: `Some(suppressed)` when a line is due, `None` when it is counted
+    /// for the next one.
+    fn refused(&mut self, now: Duration) -> Option<u64> {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_sub(last) >= Duration::from_secs(1));
+        if due {
+            self.last = Some(now);
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+}
+
 /// The endpoints of one Service port.
 pub(crate) struct Backend {
     /// `<namespace>/<name>`.
     pub service: Arc<str>,
     /// `<namespace>/<name>:<port>`.
     pub label: Arc<str>,
+    /// The retries and the budget of the Service.
+    pub(crate) retry: Arc<ServiceRetry>,
+    limiter: Mutex<Limiter>,
     state: Mutex<State>,
 }
 
 impl Backend {
-    fn new(service: &str, label: String) -> Backend {
+    fn new(service: &str, label: String, retry: Arc<ServiceRetry>) -> Backend {
         Backend {
             service: Arc::from(service),
             label: Arc::from(label),
+            retry,
+            limiter: Mutex::new(Limiter::default()),
             state: Mutex::new(State {
                 set: Endpoints::new(Duration::ZERO),
                 endpoints: Vec::new(),
@@ -163,6 +251,24 @@ pub(crate) enum Plan {
 }
 
 impl Backend {
+    /// The budget refused a retry: counted, and logged at most once per second.
+    pub(crate) fn exhausted(&self, router: &Router) {
+        router.metrics.budget_exhausted(&self.label);
+        let now = router.started.elapsed();
+        let Some(suppressed) = lock(&self.limiter).refused(now) else {
+            return;
+        };
+        let (window_requests, window_retries) = self.retry.counts(now);
+        tracing::warn!(
+            service = &*self.service,
+            backend = &*self.label,
+            window_requests,
+            window_retries,
+            suppressed,
+            "retry budget exhausted"
+        );
+    }
+
     /// The next try of a request (spec §7.9 "Retries"): the planner chooses over the endpoints
     /// now, avoidance and slow start applying as in [`Backend::pick`].
     pub(crate) fn plan(&self, router: &Router, planner: &mut Planner) -> Plan {
@@ -203,8 +309,8 @@ pub(crate) struct Router {
     pub(crate) connect_timeout: Duration,
     /// How long a pod whose connect failed is avoided.
     avoid: Duration,
-    /// Retries after the first try of a request.
-    pub(crate) retries: u32,
+    /// The retries and budget of each Service of the view held, by `<namespace>/<name>`.
+    services: Mutex<BTreeMap<String, Arc<ServiceRetry>>>,
     /// The middle of the delay before a retry after a trusted refusal.
     pub(crate) refusal_delay: Duration,
 }
@@ -216,7 +322,6 @@ impl Router {
         seed: Option<u64>,
         connect_timeout: Duration,
         avoid: Duration,
-        retries: u32,
         refusal_delay: Duration,
     ) -> Router {
         Router {
@@ -227,7 +332,7 @@ impl Router {
             metrics: MeshMetrics::new(max_labels),
             connect_timeout,
             avoid,
-            retries,
+            services: Mutex::new(BTreeMap::new()),
             refusal_delay,
         }
     }
@@ -262,6 +367,17 @@ impl Router {
         ((u128::from(z) * n as u128) >> 64) as usize
     }
 
+    /// The sidecar's monotonic clock, the one the retry budget is given.
+    pub(crate) fn now(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// The budgets and the backends (and so the warning limiters) held.
+    pub(crate) fn retry_state(&self) -> (usize, usize) {
+        let backends = self.backends.read().unwrap_or_else(PoisonError::into_inner);
+        (lock(&self.services).len(), backends.len())
+    }
+
     /// The backend of a Service port.
     pub(crate) fn backend(&self, service: &str, port: u16) -> Option<Arc<Backend>> {
         self.backends
@@ -282,7 +398,13 @@ impl Router {
             .unwrap_or_else(PoisonError::into_inner);
         let mut previous = std::mem::take(&mut *backends);
         let mut live = HashSet::new();
+        let mut held = std::mem::take(&mut *lock(&self.services));
         for (key, service) in &view.services {
+            let retry = held
+                .remove(key)
+                .unwrap_or_else(|| Arc::new(ServiceRetry::new(&service.policy)));
+            retry.configure(&service.policy);
+            lock(&self.services).insert(key.clone(), retry.clone());
             let window =
                 Duration::from_secs(u64::from(service.policy.load_balancer.slow_start_seconds));
             for port in service.ports.keys() {
@@ -298,7 +420,7 @@ impl Router {
                     .unwrap_or_default();
                 let backend = previous
                     .remove(&label)
-                    .unwrap_or_else(|| Arc::new(Backend::new(key, label.clone())));
+                    .unwrap_or_else(|| Arc::new(Backend::new(key, label.clone(), retry.clone())));
                 self.metrics.backend_seen(&label);
                 for gone in backend.update(&addrs, window, age, &self.metrics) {
                     self.metrics.left(&backend.label, gone, now);
@@ -331,8 +453,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rty_51_the_limiter_logs_once_a_second_and_counts_what_it_held_back() {
+        let mut limiter = Limiter::default();
+        let at = |ms| Duration::from_millis(ms);
+        assert_eq!(limiter.refused(at(0)), Some(0));
+        assert_eq!(limiter.refused(at(10)), None);
+        assert_eq!(limiter.refused(at(999)), None);
+        assert_eq!(limiter.refused(at(1000)), Some(2));
+        // A clock that goes back never logs early.
+        assert_eq!(limiter.refused(at(500)), None);
+        assert_eq!(limiter.refused(at(2000)), Some(1));
+    }
+
+    #[test]
     fn rty_28_every_picked_address_resolves_to_its_endpoint_by_index() {
-        let backend = Backend::new("shop/cart", "shop/cart:80".to_string());
+        let retry = Arc::new(ServiceRetry::new(&mimic_core::mesh::policy::defaults()));
+        let backend = Backend::new("shop/cart", "shop/cart:80".to_string(), retry);
         let metrics = MeshMetrics::new(10_000);
         // Unsorted on purpose: the set sorts, and `endpoints` follows it.
         let addrs: Vec<SocketAddr> = (0..1000u16)

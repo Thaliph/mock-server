@@ -96,9 +96,6 @@ pub struct MeshConfig {
     pub retry_buffer: usize,
     /// `MIMIC_MESH_RETRY_BUFFER_TOTAL`: the same for all the requests of the sidecar together.
     pub retry_buffer_total: usize,
-    /// Retries after the first try of a request (spec §7.9 "Retries"); a field, not a variable
-    /// (`MimicConfig.retries` sets it from #446).
-    pub retries: u32,
     /// The middle of the delay before a retry after a trusted refusal (±50 %); a field, not a
     /// variable: tests shorten it.
     pub refusal_delay: Duration,
@@ -124,7 +121,6 @@ impl Default for MeshConfig {
             pod: None,
             retry_buffer: 64 * KIB,
             retry_buffer_total: 8 * MIB,
-            retries: 3,
             refusal_delay: Duration::from_millis(25),
             seed: None,
         }
@@ -483,7 +479,6 @@ impl MeshState {
                 config.seed,
                 config.connect_timeout,
                 config.avoid_failed_for,
-                config.retries,
                 config.refusal_delay,
             ),
             seen: AtomicBool::new(false),
@@ -690,7 +685,7 @@ impl MeshState {
     /// Test hook (#446): the retry budgets and the warning limiters held.
     #[doc(hidden)]
     pub fn retry_state_for_test(&self) -> (usize, usize) {
-        (0, 0)
+        self.0.router.retry_state()
     }
 
     /// The view says `"mesh": false`: the workload's routing is off (spec §7.9).
