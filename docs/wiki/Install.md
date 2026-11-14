@@ -18,6 +18,24 @@ runs mimic on a shared cluster. Covers the chart of release 0.2.0-alpha.3. Value
 
 The release namespace itself runs at `restricted`: every pod the chart creates satisfies it.
 
+## Gateway API (optional)
+
+The [mesh](Mesh) reads Gateway API `HTTPRoute`s (routes of a Service, GAMMA) and `ReferenceGrant`s (consent to a
+cross-namespace destination or backend). Both are optional. Install the **standard channel**: tested with
+**v1.7.0**, version 1.2 or later is required (`timeouts` is Standard from 1.2, `retry` from 1.7). Mimic never
+installs them; a cluster that already has them keeps its own.
+
+```bash
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
+```
+
+Without the CRDs the controller logs one warning, `gateway api crds missing`, and sets
+`mimic_mesh_gateway_api_present` to 0. The mesh still works: Services, endpoints and `MimicConfig` are served as
+before, but there are no routes and no cross-namespace consent, so a `MimicConfig` destination in another
+namespace is `ResolvedRefs: False` (`RefNotPermitted`). Installing or removing the CRDs needs no restart: the
+controller looks again every 30 s (`gateway api crds found`). Older or experimental-channel CRDs are not
+supported (see [Mesh](Mesh#routes)).
+
 ## Try it on kind
 
 To try mimic on a laptop you need [kind](https://kind.sigs.k8s.io/) and Docker. The defaults are enough for

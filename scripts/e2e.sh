@@ -96,6 +96,11 @@ cleanup() {
   if [[ -n ${RTY_22_CLEANUP:-} ]]; then
     kubectl delete namespace rty-22 --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${RTE_21_CLEANUP:-} ]]; then
+    kubectl delete namespace rte-21 rte-21-b --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    # Only the CRDs this run installed: a cluster that had them keeps them.
+    [[ -z ${RTE_21_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -5234,6 +5239,228 @@ rty_22_coff=$(rty_count rty-22 c-off) || fail "rty_22: cannot read the count of 
 kubectl delete namespace rty-22 --wait=false >/dev/null
 RTY_22_CLEANUP=
 echo "rty_22: through b-mesh A got a bare 503 (c-mesh counted $rty_22_cmesh tries for 20 requests), through b-off a 503 naming a c-off pod (c-off counted 20), A retried nothing, each B app counted 20"
+
+# --- HTTPRoute status and the view (#447, spec §12.23 RTE-21, RTE-22, RTE-23) ------------------------------------------------
+# Objects of this section only: rte-21 (injected: client, which calls; web, a Service that routes name as parent; v1 and v2,
+# its backends; pods, a Service of 3 replicas) and rte-21-b (ext, a Service that needs a ReferenceGrant). The Gateway API
+# CRDs are the pinned manifest msh_28 downloaded and checked ($WORK/gateway-standard.yaml); a cluster that has them keeps
+# them, one that has not gets them here and loses them at the end. RTE-23 deletes and installs them again while the mesh runs.
+log "rte_21: an HTTPRoute gets its status and is in the view; an unsupported route, a cross-namespace backend and another controller's entry; the CRDs removed and installed again"
+[[ -s $WORK/gateway-standard.yaml ]] || fail "rte_21: the pinned Gateway API manifest of msh_28 is missing"
+RTE_21_CLEANUP=1
+if [[ -z $(kubectl get crd httproutes.gateway.networking.k8s.io -o name 2>/dev/null || true) ]]; then RTE_21_CRDS=1; fi
+kubectl apply --server-side -f "$WORK/gateway-standard.yaml" >/dev/null
+kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io --timeout=60s >/dev/null
+ns_fresh rte-21 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+ns_fresh rte-21-b
+rte_21_app() { # rte_21_app <namespace> <name> <replicas>: a Deployment answering on 8080 and its Service on 80
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $2, namespace: $1}
+spec:
+  replicas: $3
+  selector: {matchLabels: {app: $2}}
+  template:
+    metadata: {labels: {app: $2}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -m, http.server, "8080"]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: http}, periodSeconds: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: $2, namespace: $1}
+spec:
+  selector: {app: $2}
+  ports: [{name: http, port: 80, targetPort: http}]
+YAML
+}
+rte_21_app rte-21 web 1
+rte_21_app rte-21 v1 1
+rte_21_app rte-21 v2 1
+rte_21_app rte-21 pods 3
+rte_21_app rte-21-b ext 1
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: rte-21}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for dep in web v1 v2 pods client; do kubectl -n rte-21 rollout status deploy/$dep --timeout=3m >/dev/null || fail "rte_21: $dep did not roll out Ready"; done
+kubectl -n rte-21-b rollout status deploy/ext --timeout=3m >/dev/null || fail "rte_21: ext did not roll out Ready"
+# rte_21_until <timeout seconds> <description> <command...>: polls the command once a second.
+rte_21_until() {
+  local limit=$1 desc=$2; shift 2
+  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
+  fail "rte_21: $desc"
+}
+admin_forward
+# rte_21_gauge: the value of mimic_mesh_gateway_api_present on the controller replica behind the admin port-forward.
+rte_21_gauge() { curl -fs localhost:18081/metrics | awk 'index($0, "mimic_mesh_gateway_api_present ") == 1 { print $2 }'; }
+gateway_present() { [[ $(rte_21_gauge) == 1 ]]; }
+rte_21_until 60 "the controller did not report mimic_mesh_gateway_api_present 1 after the CRDs were installed" gateway_present
+# rte_21_cond <route> <condition type> <field>: a field of a condition of mimic's status entry of a route, empty when absent.
+rte_21_cond() {
+  kubectl -n rte-21 get httproute "$1" -o json 2>/dev/null | jq -r --arg t "$2" --arg f "$3" \
+    '[.status.parents[]? | select(.controllerName == "mimic.platform.io/mesh")][0] | .conditions[]? | select(.type == $t) | .[$f]' || true
+}
+rte_21_is() { [[ $(rte_21_cond "$1" "$2" "$3") == "$4" ]]; }
+# The view the controller serves to client, the one its sidecar writes to state/mesh.json.
+rte_21_client=$(kubectl -n rte-21 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+rte_21_token=$(kubectl -n rte-21 create token default --audience mimic.platform.io \
+  --bound-object-kind Pod --bound-object-name "$rte_21_client" --duration 30m) || fail "rte_21: cannot create a token"
+secret_key 'ca\.crt' | base64 -d > "$WORK/webhook-ca-rte.crt"
+kubectl -n "$NS" port-forward svc/$RELEASE-controller 18446:8444 >/dev/null 2>&1 &
+PIDS+=("$!")
+rte_21_fetch() {
+  [[ $(curl -s -o "$WORK/rte.json" -w '%{http_code}' --max-time 45 --cacert "$WORK/webhook-ca-rte.crt" \
+    --resolve "$RELEASE-controller.$NS.svc:18446:127.0.0.1" -H "Authorization: Bearer $rte_21_token" \
+    "https://$RELEASE-controller.$NS.svc:18446/v1/workloads/client/mesh?format=1" || true) == 200 ]]
+}
+# rte_21_view <jq filter>: true when the filter is true on the current view of client.
+rte_21_view() { rte_21_fetch && jq -e "$1" "$WORK/rte.json" >/dev/null; }
+rte_21_has_route() { rte_21_view '[.services["rte-21/web"].routes[]?.name] | index("rte-21/'"$1"'") != null'; }
+rte_21_no_route() { rte_21_fetch && ! rte_21_view '[.services["rte-21/web"].routes[]?.name] | index("rte-21/'"$1"'") != null'; }
+rte_21_has_service() { rte_21_view '.services | has("'"$1"'")'; }
+
+# RTE-21: a route with two weighted backends.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: split, namespace: rte-21}
+spec:
+  parentRefs: [{group: "", kind: Service, name: web, port: 80}]
+  rules:
+    - backendRefs:
+        - {name: v1, port: 80, weight: 3}
+        - {name: v2, port: 80, weight: 1}
+YAML
+split_generation=$(kubectl -n rte-21 get httproute split -o jsonpath='{.metadata.generation}')
+rte_21_until 10 "split has no Accepted True within 10 s" rte_21_is split Accepted status True
+rte_21_until 10 "split has no ResolvedRefs True within 10 s" rte_21_is split ResolvedRefs status True
+[[ $(kubectl -n rte-21 get httproute split -o json | jq -r '[.status.parents[] | select(.controllerName == "mimic.platform.io/mesh")] | length') == 1 ]] \
+  || fail "rte_21: split has not exactly one status entry of mimic.platform.io/mesh"
+for cond in Accepted ResolvedRefs; do
+  [[ $(kubectl -n rte-21 get httproute split -o json | jq -r --arg t $cond \
+    '[.status.parents[] | select(.controllerName == "mimic.platform.io/mesh")][0].conditions[] | select(.type == $t) | .observedGeneration') == "$split_generation" ]] \
+    || fail "rte_21: the $cond condition of split does not carry the generation $split_generation"
+done
+rte_21_until 30 "the view of client does not hold split with both backends" rte_21_view \
+  '[.services["rte-21/web"].routes[]? | select(.name == "rte-21/split") | .rules[0].backends | map(.service)] == [["rte-21/v1", "rte-21/v2"]]'
+rte_21_has_service rte-21/v1 || fail "rte_21: the view of client lacks the Service v1"
+rte_21_has_service rte-21/v2 || fail "rte_21: the view of client lacks the Service v2"
+# Two replicas, converged: nobody writes the status again.
+rte_21_rv=$(kubectl -n rte-21 get httproute split -o jsonpath='{.metadata.resourceVersion}')
+sleep 10
+[[ $(kubectl -n rte-21 get httproute split -o jsonpath='{.metadata.resourceVersion}') == "$rte_21_rv" ]] \
+  || fail "rte_21: the resourceVersion of split changed over 10 s once converged"
+
+# RTE-22: URLRewrite is refused, an entry of another controller stays.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: rewrite, namespace: rte-21}
+spec:
+  parentRefs: [{group: "", kind: Service, name: web, port: 80}]
+  rules:
+    - filters:
+        - type: URLRewrite
+          urlRewrite: {path: {type: ReplaceFullPath, replaceFullPath: /other}}
+      backendRefs: [{name: v1, port: 80}]
+YAML
+kubectl -n rte-21 patch httproute rewrite --subresource=status --type=merge -p '{"status":{"parents":[{
+  "parentRef":{"group":"","kind":"Service","name":"web","port":80},"controllerName":"example.com/other",
+  "conditions":[{"type":"Accepted","status":"True","reason":"Accepted","message":"kept","lastTransitionTime":"2026-01-01T00:00:00Z"}]}]}}' >/dev/null \
+  || fail "rte_21: cannot patch the status of rewrite"
+rte_21_until 15 "rewrite has no Accepted False within 15 s" rte_21_is rewrite Accepted status False
+[[ $(rte_21_cond rewrite Accepted reason) == UnsupportedValue ]] || fail "rte_21: rewrite is not Accepted False UnsupportedValue"
+[[ $(rte_21_cond rewrite Accepted message) == *'rules[0].filters[0].type'* ]] \
+  || fail "rte_21: the message of rewrite does not name rules[0].filters[0].type: $(rte_21_cond rewrite Accepted message)"
+rte_21_no_route rewrite || fail "rte_21: the view of client holds the unsupported route rewrite"
+[[ $(kubectl -n rte-21 get httproute rewrite -o json | jq -r '[.status.parents[] | select(.controllerName == "example.com/other")] | length') == 1 ]] \
+  || fail "rte_21: the status entry of example.com/other was removed from rewrite"
+[[ $(kubectl -n rte-21 get httproute rewrite -o json | jq -r '[.status.parents[] | select(.controllerName == "example.com/other")][0].conditions[0].message') == kept ]] \
+  || fail "rte_21: the status entry of example.com/other was changed"
+
+# RTE-22: a backend of another namespace needs a ReferenceGrant from HTTPRoute.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: cross, namespace: rte-21}
+spec:
+  parentRefs: [{group: "", kind: Service, name: web, port: 80}]
+  rules:
+    - backendRefs: [{name: ext, namespace: rte-21-b, port: 80}]
+YAML
+rte_21_until 15 "cross has no ResolvedRefs False within 15 s" rte_21_is cross ResolvedRefs status False
+[[ $(rte_21_cond cross ResolvedRefs reason) == RefNotPermitted ]] || fail "rte_21: cross is not ResolvedRefs False RefNotPermitted without a ReferenceGrant"
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: allow-routes, namespace: rte-21-b}
+spec:
+  from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: rte-21}]
+  to: [{group: "", kind: Service}]
+YAML
+rte_21_until 30 "cross has no ResolvedRefs True with the ReferenceGrant" rte_21_is cross ResolvedRefs status True
+rte_21_until 30 "the view of client lacks the backend ext with the ReferenceGrant" rte_21_has_service rte-21-b/ext
+kubectl -n rte-21-b delete referencegrant allow-routes >/dev/null
+rte_21_until 30 "cross is not ResolvedRefs False RefNotPermitted after the ReferenceGrant was deleted" rte_21_is cross ResolvedRefs reason RefNotPermitted
+no_ext() { rte_21_fetch && ! rte_21_has_service rte-21-b/ext; }
+rte_21_until 30 "the view of client kept the backend ext after the ReferenceGrant was deleted" no_ext
+
+# RTE-23: the CRDs deleted while the mesh runs; calls still work, balanced over the pods; installed again.
+rte_21_logs() { kubectl -n "$NS" logs -l app.kubernetes.io/name=mimic-controller --tail=-1 2>/dev/null | grep -c "$1" || true; }
+rte_21_missing_before=$(rte_21_logs 'gateway api crds missing')
+kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --timeout=120s >/dev/null || fail "rte_21: cannot delete the Gateway API CRDs"
+gateway_absent() { [[ $(rte_21_gauge) == 0 ]]; }
+rte_21_until 40 "the controller did not report mimic_mesh_gateway_api_present 0 within 40 s" gateway_absent
+(( $(rte_21_logs 'gateway api crds missing') > rte_21_missing_before )) || fail "rte_21: the controller did not log gateway api crds missing"
+kubectl -n rte-21 exec deploy/client -c app -- python3 -c '
+import urllib.request
+for _ in range(100):
+    r = urllib.request.urlopen("http://pods.rte-21.svc/", timeout=10)
+    assert r.status == 200, r.status
+    r.read()
+' || fail "rte_21: the 100 requests to pods did not all get a 200 without the Gateway API CRDs"
+# rte_21_reached: the number of endpoints of pods the sidecar of client counted a request for, and the total.
+rte_21_series=$(sidecar_metrics rte-21 "$rte_21_client" | awk 'index($0, "mimic_mesh_endpoint_requests_total{") == 1 && index($0, "backend=\"rte-21/pods:80\"") { n++; total += $2 } END { print n + 0, total + 0 }')
+read -r rte_21_endpoints rte_21_total <<<"$rte_21_series"
+(( rte_21_endpoints > 1 )) || fail "rte_21: the 100 requests reached $rte_21_endpoints endpoint of pods, more than one expected"
+(( rte_21_total >= 100 )) || fail "rte_21: the sidecar counted $rte_21_total requests for pods, at least 100 expected"
+rte_21_found_before=$(rte_21_logs 'gateway api crds found')
+kubectl apply --server-side -f "$WORK/gateway-standard.yaml" >/dev/null
+kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io --timeout=60s >/dev/null
+rte_21_until 40 "the controller did not report mimic_mesh_gateway_api_present 1 within 40 s of the new CRDs" gateway_present
+(( $(rte_21_logs 'gateway api crds found') > rte_21_found_before )) || fail "rte_21: the controller did not log gateway api crds found"
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: after, namespace: rte-21}
+spec:
+  parentRefs: [{group: "", kind: Service, name: web, port: 80}]
+  rules:
+    - backendRefs: [{name: v1, port: 80}]
+YAML
+rte_21_until 30 "after, created once the CRDs were back, has no Accepted True" rte_21_is after Accepted status True
+kubectl delete namespace rte-21 rte-21-b --wait=false >/dev/null
+[[ -z ${RTE_21_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
+RTE_21_CLEANUP=
+RTE_21_CRDS=
+echo "rte_21: split got its status and is in the view, rewrite is UnsupportedValue and absent, cross follows its ReferenceGrant, another controller's entry stays; without the CRDs $rte_21_total requests reached $rte_21_endpoints pods and the CRDs back give a status"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The
