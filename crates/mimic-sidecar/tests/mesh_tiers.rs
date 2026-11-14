@@ -219,8 +219,14 @@ async fn three_tiers(b_meshed: bool) {
         }
     }
 
-    // A's sidecar retried nothing and saw one try per request.
+    // A's sidecar retried nothing and saw one try per request: the attempts series is there and
+    // counts exactly one try per request, so a missing retries series cannot pass for "no retry".
     let scrape = a.metrics.encode();
+    assert_eq!(
+        metric_sum(&scrape, "mimic_mesh_attempts_total{"),
+        REQUESTS as f64,
+        "{scrape}"
+    );
     assert_eq!(
         metric_sum(&scrape, "mimic_mesh_retries_total{"),
         0.0,

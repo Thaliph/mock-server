@@ -317,3 +317,55 @@ SCENARIOS=scale scripts/bench-controller.sh   # the RSS scenario only
 A first run without the pacing (same day, result not kept in the JSON) measured views at max 1.54/s and
 mean 1.22/s per sidecar, CPU 0.19 cores and RSS 26.3 MiB: the debounce (100 ms doubling to 1 s) let rollout
 bursts through faster than 1/s. MSH-88 spaces each pod's views at least 1 s apart.
+
+## M2: retries (#445)
+
+Same machine and conditions. M2 code: `mesh/445-bench-docs` (main after #523, retries on). M1 code: main
+after #519 (e7e3168), before any M2 change.
+
+### No failure: M1 and M2 back to back (RTY-23, first half)
+
+A first M2 session (`2026-11-14-m2-mesh-lb.json`) measured p50 0.55–0.85 ms above the committed M1 run of the
+morning. That comparison spans hours of machine drift, so `mesh-lb` was then run four times in a row,
+alternating M1 and M2 code (`2026-11-14-ab-{m1a,m2a,m1b,m2b}-mesh-lb.json`). p50 in ms, mean of the two runs of
+each:
+
+| Protocol | Rate | M1 | M2 | Δ |
+|---|---|---|---|---|
+| http1 | 50 | 8.59 | 8.70 | +0.11 |
+| http1 | 100 | 8.61 | 8.72 | +0.12 |
+| http1 | 200 | 8.48 | 8.59 | +0.11 |
+| h2c | 50 | 10.19 | 10.32 | +0.13 |
+| h2c | 100 | 10.32 | 10.40 | +0.08 |
+| h2c | 200 | 10.33 | 10.35 | +0.03 |
+
+Every rate is within the 0.2 ms budget against M1 measured in the same session (met). M1's own p50 moved by
+0.3–0.6 ms between the morning and this session, which explains the first comparison. Routing was asserted in
+every run (3 pods served, 0 fallbacks, 0 retries).
+
+### One of three pods refusing (`mesh-refuse`, RTY-23, second half)
+
+2 injected backend pods and one Ready pod that refuses connections; same session as the first M2 `mesh-lb` run.
+Routing after the runs: 10585 and 10759 requests on the 2 live pods, 85 connect-failed retries, 0 fallbacks.
+The rows are that first M2 session: `mesh-lb`, then `mesh-refuse`.
+
+| Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-14 | mesh-lb | http1 | 50 | 49.98 | 8.95 | 10.35 | 13.7 | 20.23 | 0 | 0.056 | 0.019 | 15.2 | 14.1 |
+| 2026-11-14 | mesh-lb | http1 | 100 | 99.96 | 8.92 | 10.25 | 13.83 | 24.44 | 0 | 0.109 | 0.036 | 15.2 | 14.1 |
+| 2026-11-14 | mesh-lb | http1 | 200 | 199.93 | 8.74 | 10.09 | 13.26 | 22.5 | 0 | 0.213 | 0.07 | 15.3 | 14.1 |
+| 2026-11-14 | mesh-lb | h2c | 50 | 49.94 | 10.35 | 11.93 | 19.35 | 29.17 | 0 | 0.069 | 0.025 | 15.9 | 14.4 |
+| 2026-11-14 | mesh-lb | h2c | 100 | 99.96 | 10.32 | 11.97 | 15.15 | 18 | 0 | 0.134 | 0.048 | 15.9 | 14.5 |
+| 2026-11-14 | mesh-lb | h2c | 200 | 199.92 | 10.54 | 12.66 | 17.19 | 29.44 | 0 | 0.274 | 0.1 | 15.9 | 14.5 |
+| 2026-11-14 | mesh-refuse | http1 | 50 | 49.98 | 8.61 | 9.82 | 12.9 | 15.89 | 0 | 0.053 | 0.024 | 15.1 | 14.1 |
+| 2026-11-14 | mesh-refuse | http1 | 100 | 99.96 | 8.67 | 9.9 | 12.87 | 17 | 0 | 0.105 | 0.051 | 15.2 | 14.1 |
+| 2026-11-14 | mesh-refuse | http1 | 200 | 199.93 | 8.56 | 9.79 | 12.09 | 23.89 | 0 | 0.209 | 0.099 | 15.3 | 14.1 |
+| 2026-11-14 | mesh-refuse | h2c | 50 | 49.98 | 10.2 | 11.57 | 15.56 | 30.82 | 0 | 0.067 | 0.032 | 15.4 | 14.8 |
+| 2026-11-14 | mesh-refuse | h2c | 100 | 99.96 | 10.04 | 11.51 | 13.81 | 25 | 0 | 0.132 | 0.063 | 15.4 | 14.8 |
+| 2026-11-14 | mesh-refuse | h2c | 200 | 199.92 | 10.02 | 11.52 | 15.13 | 23.33 | 0 | 0.262 | 0.125 | 15.7 | 14.8 |
+
+| Budget (design §14 M2) | Measured | |
+|---|---|---|
+| No failure: p50 within 0.2 ms of M1 | +0.03 to +0.13 ms, back to back | met |
+| One of three pods refusing: client error rate 0 % | 0 errors in every run | met |
+| One of three pods refusing: p99 ≤ M1 `mesh-lb` p99 + 5 ms | http1 12.09–12.90 vs M1 10.63–11.26 + 5; h2c 13.81–15.56 vs 13.15–13.61 + 5 | met |
