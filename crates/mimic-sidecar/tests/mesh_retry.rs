@@ -1214,3 +1214,31 @@ async fn rty_14_a_body_that_outgrows_the_buffer_during_the_pause_is_not_cut() {
         slow_upload(h2, 70 * 1024, 100, Duration::from_millis(400)).await;
     }
 }
+
+#[tokio::test]
+async fn rty_26_a_chunked_put_cut_by_its_client_never_reaches_the_next_pod_complete() {
+    let _logs = capture_logs();
+    let refusing = Probe::start("r", false, Mode::RefuseEarly("overloaded")).await;
+    let ok = Probe::start("ok", false, Mode::Ok).await;
+    let state = state_for(cluster_ip(), &[refusing.addr, ok.addr], |c| {
+        c.refusal_delay = Duration::from_millis(400);
+    });
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
+    for _ in 0..8 {
+        let mut client = H1Client::connect(f.addr).await;
+        client
+            .send(b"PUT /doc/1 HTTP/1.1\r\nHost: cart.shop.svc\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await;
+        client.send(b"5\r\nhello\r\n").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The client leaves in the middle of a chunk, while the sidecar waits to try again.
+        client.send(b"a\r\nabc").await;
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    assert!(
+        ok.seen.lock().unwrap().is_empty(),
+        "a pod got a cut upload that looks complete: {:?}",
+        ok.seen.lock().unwrap()
+    );
+}

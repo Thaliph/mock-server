@@ -559,4 +559,37 @@ mod tests {
             .unwrap();
         assert!(matches!(ended, Some(Err(_))));
     }
+
+    #[tokio::test]
+    async fn rty_26_a_body_that_failed_is_never_replayed_as_a_clean_end() {
+        let head = Request::new(()).into_parts().0;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let body = incoming(&mut client, server).await;
+        let (total, gauge) = budget(1 << 20);
+        let source = Source::new(ReqBody::plain(body), total.replay(64 * 1024));
+        let mut first = source.request(&head).into_body();
+        assert!(next(&mut first).await.unwrap().is_ok());
+        // The client leaves in the middle of a chunk: the body fails.
+        drop(client);
+        assert!(matches!(next(&mut first).await, Some(Err(_))));
+        // Whatever a later try does, it never sees the end of the body.
+        let mut second = source.request(&head).into_body();
+        let mut ended = false;
+        for _ in 0..4 {
+            match next(&mut second).await {
+                Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+                None => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        assert!(!ended, "a cut body must not look complete");
+        assert!(!source.held(), "a failed body is not held");
+        assert!(!source.intact());
+        assert!(!source.detach());
+        drop(source);
+        assert_eq!(gauge.get(), 0);
+    }
 }
