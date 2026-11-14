@@ -3,7 +3,10 @@
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::api::DynamicObject;
-use mimic_core::mesh::input::{Destination, GrantFrom, GrantTo, Target, TargetKind, TargetPort};
+use mimic_core::mesh::input::{
+    Destination, GrantFrom, GrantTo, RetryBudgetSpec, Target, TargetKind, TargetPort,
+};
+use mimic_core::mesh::policy::validate;
 use serde_json::json;
 
 use super::convert;
@@ -206,4 +209,62 @@ fn msh_27_a_referencegrant_has_its_from_and_to() {
         ]
     );
     assert!(!format!("{g:?}").contains(CANARY));
+}
+
+fn service_config(spec: serde_json::Value) -> mimic_core::mesh::input::Config {
+    let object = dynamic(json!({
+        "apiVersion": "mimic.platform.io/v1alpha1", "kind": "MimicConfig",
+        "metadata": {"namespace": "shop", "name": "r", "generation": 1,
+                     "creationTimestamp": "2026-11-12T10:00:00Z"},
+        "spec": spec
+    }));
+    convert::config(&object).expect("a config").1
+}
+
+#[test]
+fn rty_46_retries_and_the_retry_budget_convert_and_absent_fields_are_none() {
+    let target = json!([{"group": "", "kind": "Service", "name": "cart"}]);
+    let c = service_config(json!({
+        "targetRefs": target, "retries": 0,
+        "retryBudget": {"percent": 50, "minPerSecond": 0, "window": "10s"}
+    }));
+    assert_eq!(c.retries, Some(0));
+    assert_eq!(
+        c.retry_budget,
+        Some(RetryBudgetSpec {
+            percent: Some(50),
+            min_per_second: Some(0),
+            window_seconds: Some(10)
+        })
+    );
+    let c = service_config(json!({"targetRefs": target, "retryBudget": {"window": "60s"}}));
+    assert_eq!(c.retries, None);
+    assert_eq!(
+        c.retry_budget,
+        Some(RetryBudgetSpec {
+            percent: None,
+            min_per_second: None,
+            window_seconds: Some(60)
+        })
+    );
+    let c = service_config(json!({"targetRefs": target, "retries": 10}));
+    assert_eq!((c.retries, c.retry_budget), (Some(10), None));
+    let c = service_config(json!({"targetRefs": target}));
+    assert_eq!((c.retries, c.retry_budget), (None, None));
+}
+
+#[test]
+fn rty_46_a_window_that_does_not_parse_makes_the_config_invalid_and_never_panics() {
+    let target = json!([{"group": "", "kind": "Service", "name": "cart"}]);
+    for window in [json!("soon"), json!("10"), json!(10), json!("-1s"), json!("1e1s")] {
+        let c = service_config(json!({"targetRefs": target, "retryBudget": {"window": window}}));
+        assert!(
+            validate(&c).is_err(),
+            "window {window} must not validate: {c:?}"
+        );
+    }
+    let c = service_config(json!({"targetRefs": target, "retries": "3"}));
+    assert!(validate(&c).is_err());
+    let c = service_config(json!({"targetRefs": target, "retries": -1}));
+    assert!(validate(&c).is_err());
 }

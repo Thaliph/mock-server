@@ -336,7 +336,7 @@ const GOLDEN: &str = concat!(
     r#"{"cluster":"local","format":1,"generations":{},"mesh":true,"mode":"none","services":{"shop/cart":{"#,
     r#""endpoints":{"80":[{"ip":"10.244.1.17","port":8080,"ready":true,"zone":"a"}]},"#,
     r#""generations":{"endpointslice/shop/cart-x7k2p@uid-cart-x7k2p":41},"ips":["10.96.12.7"],"#,
-    r#""policy":{"loadBalancer":{"slowStartSeconds":30}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}"#
+    r#""policy":{"loadBalancer":{"slowStartSeconds":30},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}},"ports":{"80":{"name":"http","targetPort":"http"}}}}}"#
 );
 
 #[test]
@@ -523,5 +523,39 @@ fn msh_11_the_skipped_names_are_bounded_and_the_count_is_not() {
     assert_eq!(
         (b.skipped[0].as_str(), b.skipped[15].as_str()),
         ("shop/s02", "shop/s17")
+    );
+}
+
+#[test]
+fn rty_45_the_policy_holds_retries_and_every_budget_field_and_a_change_moves_the_etag() {
+    let mut s = snapshot();
+    s.services = vec![http_svc("shop", "cart", "10.96.12.7")];
+    let base = view_of(&s, "shop", "cart");
+    assert!(
+        base.json.contains(
+            r#""policy":{"loadBalancer":{"slowStartSeconds":30},"retries":3,"retryBudget":{"minPerSecond":10,"percent":20,"windowSeconds":10}}"#
+        ),
+        "{}",
+        base.json
+    );
+    assert!(base.view.services["shop/cart"].generations.is_empty());
+    let mut c = cfg("shop", "c", 1, &[(TargetKind::Service, "cart")]);
+    c.retries = Some(1);
+    s.configs = vec![c.clone()];
+    let first = view_of(&s, "shop", "cart");
+    assert!(first.json.contains(r#""retries":1,"retryBudget":{"minPerSecond":10"#));
+    assert_ne!(first.etag, base.etag);
+    assert_eq!(
+        first.view.services["shop/cart"].generations["mimicconfig/shop/c@uid-c"],
+        1
+    );
+    c.retries = Some(2);
+    c.generation = 2;
+    s.configs = vec![c];
+    let second = view_of(&s, "shop", "cart");
+    assert_ne!(second.etag, first.etag);
+    assert_eq!(
+        second.view.services["shop/cart"].generations["mimicconfig/shop/c@uid-c"],
+        2
     );
 }

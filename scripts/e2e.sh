@@ -455,6 +455,51 @@ mc_denied "a destination without a name" msh-d15 "$mc_dep
   destinations: [{namespace: risk}]"
 mc_denied "a mesh.enabled that is not a boolean" msh-d16 "$mc_dep
   mesh: {enabled: maybe}"
+# RTY-48 (#446): retries and retryBudget, bounds and target kinds.
+mc_accepted "retries 0" rty-a1 "$mc_svc
+  retries: 0"
+mc_accepted "retries 10" rty-a2 "$mc_svc
+  retries: 10"
+mc_accepted "a retryBudget with percent only" rty-a3 "$mc_svc
+  retryBudget: {percent: 100}"
+mc_accepted "a retryBudget with minPerSecond only" rty-a4 "$mc_svc
+  retryBudget: {minPerSecond: 1000}"
+mc_accepted "a retryBudget with window only" rty-a5 "$mc_svc
+  retryBudget: {window: 60s}"
+mc_accepted "a retryBudget with window 1s" rty-a6 "$mc_svc
+  retryBudget: {window: 1s}"
+mc_accepted "an empty retryBudget" rty-a7 "$mc_svc
+  retryBudget: {}"
+mc_accepted "retries on a config with both target kinds" rty-a8 '  targetRefs:
+    - {group: apps, kind: Deployment, name: cart}
+    - {group: "", kind: Service, name: cart}
+  retries: 2'
+mc_denied_with() { # mc_denied_with <field> <desc> <name> <spec>: refused, and the error names <field>
+  local field=$1 desc=$2 out; shift 2
+  if out=$(mimicconfig "$@" 2>&1); then fail "msh_17: $desc was accepted"; fi
+  [[ $out == *"$field"* ]] || fail "msh_17: the refusal of $desc does not name $field (got: $out)"
+}
+mc_denied_with retries "retries -1" rty-d1 "$mc_svc
+  retries: -1"
+mc_denied_with retries "retries 11" rty-d2 "$mc_svc
+  retries: 11"
+mc_denied_with retries 'retries "3"' rty-d3 "$mc_svc
+  retries: \"3\""
+mc_denied_with percent "percent 101" rty-d4 "$mc_svc
+  retryBudget: {percent: 101}"
+mc_denied_with minPerSecond "minPerSecond 1001" rty-d5 "$mc_svc
+  retryBudget: {minPerSecond: 1001}"
+mc_denied_with window "window 0s" rty-d6 "$mc_svc
+  retryBudget: {window: 0s}"
+mc_denied_with window "window 61s" rty-d7 "$mc_svc
+  retryBudget: {window: 61s}"
+mc_denied_with window "window 10 (no unit)" rty-d8 "$mc_svc
+  retryBudget: {window: 10}"
+mc_denied_with retries "retries with only a Deployment target" rty-d9 "$mc_dep
+  retries: 3"
+mc_denied_with retryBudget "retryBudget with only a Deployment target" rty-d10 "$mc_dep
+  retryBudget: {percent: 10}"
+kubectl -n default delete mimicconfig rty-a1 rty-a2 rty-a3 rty-a4 rty-a5 rty-a6 rty-a7 rty-a8 --ignore-not-found >/dev/null
 kubectl -n default delete mimicconfig msh1 msh2 msh3 msh4 --ignore-not-found >/dev/null
 
 # The webhook configuration: three webhooks, one per path, fail closed, pods only, system namespaces excluded.

@@ -60,6 +60,8 @@ fn cluster(services: usize, endpoints_each: usize) -> Snapshot {
         destinations: None,
         mesh_enabled: None,
         slow_start: Some(10),
+        retries: None,
+        retry_budget: None,
     });
     s
 }
