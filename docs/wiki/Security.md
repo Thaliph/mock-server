@@ -60,6 +60,62 @@ No access to pods, ReplicaSets or other Secrets, no write on Deployments. The me
 or the controller pods can obtain the TLS seed: restrict that access. Whoever can use `pods/portforward`
 in the release namespace can read every discovered report.
 
+## Mesh
+
+The [mesh](Mesh) is on by default (`mesh.enabled`); with `false` the controller serves no view, watches
+nothing and the rules below are not rendered.
+
+**What the controller reads, cluster-wide (ClusterRole, only with `mesh.enabled`):**
+
+| Resource | Verbs |
+|---|---|
+| `services`, `endpointslices` (`discovery.k8s.io`) | `get`, `list`, `watch` |
+| `deployments` (`apps`) | `get`, `list`, `watch` |
+| `mimicconfigs` | `get`, `list`, `watch` |
+| `mimicconfigs/status` | `patch` |
+| `referencegrants` (`gateway.networking.k8s.io`) | `get`, `list`, `watch` |
+
+Nothing watched is writable. The ClusterRole has **no Secret rule**: Secrets stay in the namespaced Role,
+limited by name to the two chart Secrets. The Gateway API CRD may be absent; the rule is then harmless,
+and with no CRD nobody consents to a cross-namespace destination (fail closed).
+
+Deployments: the controller asks the API server for their **metadata only**, but RBAC cannot limit a read
+to metadata, so the grant covers whole Deployment objects in every namespace. The same cluster-wide read
+applies to Services, EndpointSlices and MimicConfigs. A compromised controller could therefore read
+every Deployment spec.
+
+**View isolation.** `GET /v1/workloads/<deployment>/mesh` serves a pod only the view of its own
+deployment. The pod's name comes from the `TokenReview` of its projected token (a token without a pod
+identity, or whose pod does not belong to the deployment named in the path, gets `403`), and the
+namespace comes from the token's service-account username, never from the path. The view cache is keyed
+by namespace first, so no view crosses namespaces. Pod identity is a name pattern on the token-bound pod
+name; it cannot cross namespaces.
+
+**Watch caps.** A sidecar holds its request open until the view changes. To keep one pod or one
+namespace from exhausting the budget for the others: at most `MIMIC_SIDECAR_API_MAX_WATCHES_PER_POD`
+(2) held requests per pod, at most `MIMIC_SIDECAR_API_WATCH_NAMESPACE_PERCENT` (25 %) of
+`MIMIC_SIDECAR_API_MAX_WATCHES` (10000 per replica) per namespace; over a cap the request gets
+`503 watch_limit` at once. Held requests have a budget of their own, so pushes and TLS issuance are
+served even when it is full. See [Configuration](Configuration).
+
+**Cross-namespace destinations.** A destination in another namespace is in the view only if a
+`ReferenceGrant` in the destination namespace allows it: `from` = (`mimic.platform.io`, `MimicConfig`,
+the caller's namespace), `to` = (core group, `Service`, the name or none). Deleting the grant removes the
+destination from the view; the `MimicConfig` shows `ResolvedRefs: False`, reason `RefNotPermitted`.
+
+**TLS re-origination.** A call the sidecar intercepts is re-originated over TLS to the chosen pod, and
+the pod's certificate is verified against the Service name (the SNI the app sent, else
+`<name>.<namespace>.svc`), never the pod IP. Hostname verification cannot be turned off and a pod is
+never spoken to in cleartext. See [TLS interception](TLS-interception).
+
+**Retries and the binding.** A refusal (`503`, `x-mimic-error: overloaded` or `queue-timeout`) makes the
+caller's sidecar retry only on a cleartext try to a pod, and only when `x-mimic-endpoint` names that pod;
+never over TLS, never the ClusterIP. A meshed inbound sidecar removes every `x-mimic-*` field from its app's
+responses, so an app cannot forge a signal for its callers through its own sidecar, and a forwarding app cannot
+make its callers retry. Buffers are bounded: `MIMIC_MESH_RETRY_BUFFER` per request, `MIMIC_MESH_RETRY_BUFFER_TOTAL`
+for all requests, the inbound held head 64 KiB, a discarded refusal body 64 KiB. No header value reaches a
+metric label or a log field. See [Mesh](Mesh#retries).
+
 ## Network
 
 - **Webhook (8443):** open to any source by default, because the API server's address depends on the
@@ -105,6 +161,12 @@ The main ones (full list: [the spec](https://github.com/Thaliph/mock-server/blob
   pod is not.
 - GitOps tools must ignore the `caBundle` of the webhook configuration and the data of the two Secrets.
 - Emptying the seed Secret rotates every root CA; running sidecars pass TLS through until recreated.
+- **Mesh retries.** An app whose sidecar does not remove `x-mimic-*` (no sidecar, mesh off, inbound TLS) can
+  answer a forged refusal bound to its own address: its callers send that request to its sibling pods, at
+  most 3 more times, and only requests sent to that pod. A `GET`, `HEAD`, `OPTIONS`, `TRACE`, `PUT` or
+  `DELETE` dropped without an answer is sent to another pod, so an app can see one request twice; until the
+  retry budget (#446) a reset that every tier propagates can cost 4 tries per tier. A response the sidecar
+  cannot frame closes the inbound connection while the mesh is on. See [Mesh](Mesh#limits).
 - **Capture is not a security boundary**: an app container with `NET_ADMIN`, or whose image runs as
   UID 1337 without declaring it, escapes the redirection.
 - **Mock.** Whoever may create or edit a `MimicWorkload` in a namespace decides the egress of every

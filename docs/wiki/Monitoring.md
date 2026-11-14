@@ -57,6 +57,41 @@ helm upgrade --install mimic deploy/helm/mimic -n mimic-system \
 
   Then open `http://localhost:3000`, log in as `admin` with the password above.
 
+## Mesh metrics
+
+The sidecar exposes these only with `MIMIC_MESH=on` ([Mesh](Mesh)); the controller's own are in the second
+table. `service` is `<namespace>/<name>`, `backend` is `<namespace>/<name>:<port>`. No label carries a path, a
+header value or another caller-controlled string; at most `MIMIC_METRICS_MAX_ENDPOINTS` pods have a label of
+their own (the rest are `other`), and the series of a pod or Service port that left the view are removed 5
+minutes later.
+
+| Metric (sidecar) | Type | Labels |
+|---|---|---|
+| `mimic_mesh_requests_total` | counter, one per mesh-routed request | `service`, `route` (`none`), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, or that of a trusted refusal passed to the app) |
+| `mimic_mesh_request_duration_seconds` | histogram, until the response head, spanning every try | `service`, `backend`, `status_class` |
+| `mimic_mesh_endpoint_requests_total` | counter, each try written to a pod | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
+| `mimic_mesh_endpoint_in_flight` | gauge, per pod | `backend`, `endpoint` |
+| `mimic_mesh_reconnects_total` | counter, requests sent again on a new connection because nothing of them was written | `backend` |
+| `mimic_mesh_fallbacks_total` | counter, requests and L4 connections sent to the original destination (the ClusterIP) | `backend` |
+| `mimic_mesh_attempts_total` | counter, every try to a pod or to the original destination (a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
+| `mimic_mesh_retries_total` | counter, tries after the first | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
+| `mimic_mesh_retries_skipped_total` | counter, failures of a retried kind that were not retried | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
+| `mimic_mesh_retry_buffer_bytes` | gauge, request body bytes held for replay, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL` | none |
+| `mimic_mesh_stripped_headers_total` | counter, `x-mimic-*` fields removed from app responses by the inbound side | none |
+| `mimic_mesh_unframed_closes_total` | counter, inbound connections closed because the app sent a response the sidecar cannot frame while the fields are removed | none |
+| `mimic_mesh_unscoped_connections_total` | counter, outbound connections whose destination is not a Service port of the view | none |
+| `mimic_mesh_view_pulls_total` | counter | `result` (`ok`, `not_modified`, `older`, `invalid`, `error`) |
+| `mimic_mesh_view_age_seconds`, `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | gauges | none |
+
+| Metric (controller) | Labels |
+|---|---|
+| `mimic_mesh_objects` | `kind` |
+| `mimic_mesh_view_builds_total` | `result` |
+| `mimic_mesh_view_build_duration_seconds`, `mimic_mesh_watches`, `mimic_mesh_view_truncated_total`, `mimic_mesh_view_cache_bytes` | none |
+
+A retry rate to watch: `rate(mimic_mesh_retries_total[5m])` by `reason`; `mimic_mesh_retries_skipped_total`
+with `reason="exhausted"` rising means requests ran out of tries.
+
 ## Dashboards
 
 Five dashboards ship with the chart in `deploy/helm/mimic/dashboards/`: `mimic-controller`, `mimic-sidecar`
