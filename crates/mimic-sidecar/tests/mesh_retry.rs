@@ -770,6 +770,23 @@ async fn rty_13_the_cluster_ip_is_never_trusted() {
 }
 
 #[tokio::test]
+async fn rty_13_a_view_that_turns_the_mesh_off_gives_the_cluster_ip_no_trust() {
+    let _logs = capture_logs();
+    let cluster = Probe::start("cluster", false, Mode::Ok).await;
+    cluster.set(Mode::Names(cluster.addr.to_string()));
+    let pod = Probe::start("pod", false, Mode::Ok).await;
+    let state = state_for(cluster.addr, &[pod.addr], |_| {});
+    state.hold(view_on(cluster.addr, &[pod.addr], 0, false), "\"2-a\"");
+    let f = fixture_mesh(cluster.addr, &state, None).await;
+    let (head, _) = H1Client::connect(f.addr).await.get("/p").await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert!(lower(&head).contains("x-mimic-error: overloaded"), "{head}");
+    assert_eq!(cluster.count(), 1, "the ClusterIP saw it once");
+    assert_eq!(pod.count(), 0, "no pod was tried");
+    assert_eq!(retries(&f.metrics.encode(), "overloaded"), 0.0);
+}
+
+#[tokio::test]
 async fn rty_14_a_body_held_in_the_buffer_is_retried_and_one_past_it_is_not_once_written() {
     let _logs = capture_logs();
     let heads = [

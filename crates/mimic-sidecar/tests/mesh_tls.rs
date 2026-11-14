@@ -135,17 +135,19 @@ async fn tls_pod(name: &str, ca: &Authority, sans: Vec<SanType>, alpn: &[&[u8]])
         pod.accepts.clone(),
         pod.name.clone(),
     );
+    let own = pod.addr.to_string();
     tokio::spawn(async move {
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
             accepts.fetch_add(1, Ordering::SeqCst);
-            let (acceptor, requests, sni, name) = (
+            let (acceptor, requests, sni, name, own) = (
                 acceptor.clone(),
                 requests.clone(),
                 sni.clone(),
                 name.clone(),
+                own.clone(),
             );
             tokio::spawn(async move {
                 let Ok(mut tls) = acceptor.accept(tcp).await else {
@@ -193,10 +195,17 @@ async fn tls_pod(name: &str, ca: &Authority, sans: Vec<SanType>, alpn: &[&[u8]])
                             echo(&mut tls).await;
                             return;
                         }
-                        let answer = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{name}",
-                            name.len()
-                        );
+                        // A pod named `refuser` refuses as an overloaded sidecar does.
+                        let answer = if name == "refuser" {
+                            format!(
+                                "HTTP/1.1 503 Service Unavailable\r\nx-mimic-error: overloaded\r\nx-mimic-endpoint: {own}\r\ncontent-length: 0\r\n\r\n"
+                            )
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{name}",
+                                name.len()
+                            )
+                        };
                         if tls.write_all(answer.as_bytes()).await.is_err() {
                             return;
                         }
@@ -565,4 +574,83 @@ async fn msh_74_a_client_that_rejects_the_leaf_is_remembered_and_its_next_connec
     let mut tls = tls.expect("the next connection reaches a pod untouched");
     let (status, body) = get(&mut tls).await;
     assert_eq!((status.as_str(), body.as_str()), ("HTTP/1.1 200 OK", "a"));
+}
+
+#[tokio::test]
+async fn rty_17_a_pod_that_does_not_verify_is_a_connect_failure_and_verified_pods_answer() {
+    let _logs = capture_logs();
+    let (good_ca, good_root) = authority("good");
+    let (bad_ca, _) = authority("unknown");
+    let bad = tls_pod("bad", &bad_ca, names(&[NAME]), &[]).await;
+    let one = tls_pod("one", &good_ca, names(&[NAME]), &[]).await;
+    let two = tls_pod("two", &good_ca, names(&[NAME]), &[]).await;
+    let rig = rig(&good_root, cluster(), &[bad.addr, one.addr, two.addr]).await;
+    for _ in 0..20 {
+        let mut tls = client(&rig, service(), &[]).await;
+        let (status, body) = get(&mut tls).await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert!(["one", "two"].contains(&body.as_str()), "{body}");
+    }
+    assert_eq!(bad.requests.load(Ordering::SeqCst), 0);
+    let scrape = rig.metrics.encode();
+    assert!(
+        counter(
+            &scrape,
+            "mimic_mesh_attempts_total{backend=\"shop/cart:80\",result=\"connect_failed\"}"
+        ) >= 1.0,
+        "{scrape}"
+    );
+    assert_eq!(counter(&scrape, "mimic_mesh_fallbacks_total"), 0.0);
+}
+
+#[tokio::test]
+async fn rty_17_a_verified_pod_refusing_is_retried_on_another_pod_in_the_same_session() {
+    let _logs = capture_logs();
+    let (good_ca, good_root) = authority("good");
+    let refuser = tls_pod("refuser", &good_ca, names(&[NAME]), &[]).await;
+    let other = tls_pod("other", &good_ca, names(&[NAME]), &[]).await;
+    let rig = rig(&good_root, cluster(), &[refuser.addr, other.addr]).await;
+    let mut tls = client(&rig, service(), &[]).await;
+    for _ in 0..10 {
+        let (status, body) = get(&mut tls).await;
+        assert_eq!(
+            (status.as_str(), body.as_str()),
+            ("HTTP/1.1 200 OK", "other")
+        );
+    }
+    assert!(refuser.requests.load(Ordering::SeqCst) >= 1, "it was tried");
+    let scrape = rig.metrics.encode();
+    assert!(
+        counter(
+            &scrape,
+            "mimic_mesh_retries_total{backend=\"shop/cart:80\",reason=\"overloaded\"}"
+        ) >= 1.0,
+        "{scrape}"
+    );
+}
+
+#[tokio::test]
+async fn rty_17_a_decrypted_non_http_connection_skips_a_pod_that_does_not_verify() {
+    let _logs = capture_logs();
+    let (good_ca, good_root) = authority("good");
+    let (bad_ca, _) = authority("unknown");
+    let bad = tls_pod("bad", &bad_ca, names(&[NAME]), &[]).await;
+    let good = tls_pod("good", &good_ca, names(&[NAME]), &[]).await;
+    let rig = rig(&good_root, cluster(), &[bad.addr, good.addr]).await;
+    let bytes = b"\x00\x01binary\xff\x00protocol";
+    for _ in 0..10 {
+        let mut tls = client(&rig, service(), &[]).await;
+        tls.write_all(bytes).await.unwrap();
+        let mut echoed = vec![0u8; bytes.len()];
+        tokio::time::timeout(TIMEOUT, tls.read_exact(&mut echoed))
+            .await
+            .expect("an echo in time")
+            .expect("an echo");
+        assert_eq!(echoed, bytes);
+    }
+    assert_eq!(
+        good.sni.lock().unwrap().len(),
+        10,
+        "every one reached the good pod"
+    );
 }
