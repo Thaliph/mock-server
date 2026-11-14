@@ -304,6 +304,9 @@ pub struct Hub {
     gates: Mutex<BTreeMap<CacheKey, Arc<tokio::sync::Mutex<()>>>>,
     watches: Arc<Semaphore>,
     holds: Arc<Mutex<Holds>>,
+    /// When each pod was last answered a `200` view, for the pacing of spec §7.2; the entries older
+    /// than the interval are dropped when another is written.
+    answered: Mutex<BTreeMap<(String, String), tokio::time::Instant>>,
     /// What one namespace may hold: its share of the budget, at least the per-pod cap.
     namespace_cap: usize,
     closed: watch::Sender<bool>,
@@ -350,6 +353,7 @@ impl Hub {
             gates: Mutex::default(),
             watches,
             holds: Arc::default(),
+            answered: Mutex::default(),
             namespace_cap,
             closed: watch::channel(false).0,
         })
@@ -674,6 +678,25 @@ impl Hub {
         cache.bytes == cache.slots.values().map(|s| s.entry.cost()).sum::<u64>()
     }
 
+    /// Notes that `pod` is answered a `200` view now.
+    fn note_view(&self, namespace: &str, pod: &str) {
+        let interval = self.config.min_view_interval;
+        if interval.is_zero() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let mut answered = lock(&self.answered);
+        answered.retain(|_, at| now.saturating_duration_since(*at) < interval);
+        answered.insert((namespace.to_string(), pod.to_string()), now);
+    }
+
+    /// When `pod` may next be answered a changed view, if that is still to come.
+    fn view_due(&self, namespace: &str, pod: &str) -> Option<tokio::time::Instant> {
+        let due = *lock(&self.answered).get(&(namespace.to_string(), pod.to_string()))?
+            + self.config.min_view_interval;
+        (due > tokio::time::Instant::now()).then_some(due)
+    }
+
     /// Answers a request for the view of `deployment` of `namespace`. `held` are the values of
     /// `If-None-Match`: when one is the current `ETag` the request waits for a change, up to
     /// `MIMIC_MESH_WATCH_TIMEOUT`; `on_hold` is called once it is held. `mode` is read at every look, so a mode that changes wakes it.
@@ -700,8 +723,10 @@ impl Hub {
         let mut entry = first;
         let current = |entry: &Entry| held.iter().any(|h| matches_etag(h, &entry.etag));
         if !current(&entry) {
+            self.note_view(namespace, pod);
             return Answer::View(entry);
         }
+        let held_etag = entry.etag.clone();
         let Some(share) = Share::take(
             &self.holds,
             namespace,
@@ -727,13 +752,31 @@ impl Hub {
                 () = async { let _ = closed.wait_for(|closed| *closed).await; } => false,
             };
             if !woken {
-                return Answer::NotModified(entry.etag.clone());
+                return Answer::NotModified(held_etag);
             }
             let published = latest(&mut changes);
             entry = self.view(&published, namespace, deployment, mode()).await;
-            if !current(&entry) {
-                return Answer::View(entry);
+            if current(&entry) {
+                continue;
             }
+            // Pacing: a pod answered a view less than the interval ago waits for the rest of it,
+            // then gets the latest view, the changes of the wait coalesced.
+            if let Some(due) = self.view_due(namespace, pod) {
+                let stop = tokio::select! {
+                    () = tokio::time::sleep_until(due.min(deadline)) => false,
+                    () = async { let _ = closed.wait_for(|closed| *closed).await; } => true,
+                };
+                if stop || tokio::time::Instant::now() >= deadline {
+                    return Answer::NotModified(held_etag);
+                }
+                let published = latest(&mut changes);
+                entry = self.view(&published, namespace, deployment, mode()).await;
+                if current(&entry) {
+                    continue;
+                }
+            }
+            self.note_view(namespace, pod);
+            return Answer::View(entry);
         }
     }
 }

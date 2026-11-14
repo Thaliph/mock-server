@@ -240,3 +240,46 @@ Against the pre-mesh `discovery` rows of 2026-11-12 (the three `discovery` runs 
 `mesh-churn` errors per 30 s run during a rolling restart: http1 0, 5, 5; h2c 3, 2, 12 (out of 1 500 to
 6 000 requests). Controller RSS with 1000 Services / 10 000 endpoints and the 200-sidecar rollout are
 measured under #441.
+
+## Controller (M1, #441)
+
+`scripts/bench-controller.sh` measures the controller of the mesh (design §14, M1): the RSS of the
+controller replicas with 1000 Services and 10 000 endpoints (synthetic objects, the view cache included;
+budget 256 MiB), and a rollout of a 50-pod deployment in a namespace of 200 sidecars (views per second per
+sidecar, reported for the sidecars present during the whole rollout, `kept`, for the ones started during it,
+`new`, and over both; the budget of 1 applies to `kept`, since a new pod's first pulls over a few seconds of
+life are not a sustained rate; controller CPU summed over replicas, budget 0.5 core). Results go to
+`docs/bench/<date>-controller.json`, with the machine description and the budgets.
+
+```bash
+scripts/bench-controller.sh --dry-run   # the plan, nothing started
+scripts/bench-controller.sh             # both scenarios on cluster "mimic-ctl-bench", deleted on exit (about 13 minutes on this machine)
+SCENARIOS=scale scripts/bench-controller.sh   # the RSS scenario only
+```
+
+- The kind node runs with kubelet `maxPods` 300 (kind's default is 110), set by the script's kind config
+  only. An existing cluster of that name must allow 300 pods, or the run stops (exit 1).
+- The sidecars request 5m CPU and 16Mi memory in this run only (the scheduler reserves them for 200 sidecars
+  on one node); the workloads are fortio servers with 1m CPU and 16Mi requests.
+- Exit codes as `scripts/bench.sh`: 0 done and every budget met; 1 a step failed or a budget is not met (the
+  JSON is written in both cases, and the `FAIL budget` line names it); 2 usage or configuration; 3 another run
+  holds a lock (`mimic-e2e`, `mimic-bench` or `mimic-controller-bench`).
+- `KEEP_CLUSTER=0` (the default) deletes the cluster on exit. With `KEEP_CLUSTER=1` the namespaces and the
+  release are deleted and the cluster stays. The result file is never overwritten.
+- Run it on a quiet machine, not in parallel with `scripts/bench.sh` or `scripts/e2e.sh`.
+- The 200-sidecar rollout drives this machine's load average to 30–50 for a few minutes; run it rarely.
+
+### Results 2026-11-14 (design §14 M1)
+
+`scripts/bench-controller.sh` on `mesh/441-measure` (main after #517 plus the view pacing, MSH-88); JSON
+`2026-11-14-controller.json`. Two controller replicas.
+
+| Budget | Measured | |
+|---|---|---|
+| Controller RSS ≤ 256 MiB with 1000 Services / 10 000 endpoints, view cache included | max 26.5 MiB per replica (view cache 0.5 MiB); 10 clients each holding a view of 1000+ endpoints | met |
+| Rollout of a 50-pod deployment among 200 sidecars: ≤ 1 view/s per sidecar | sidecars present for the whole rollout (150): max 0.818, p99 0.812 views/s; new pods (50): max 0.977 (81 s rollout) | met |
+| Controller ≤ 0.5 core average during the rollout | 0.173 cores, both replicas summed | met |
+
+A first run without the pacing (same day, result not kept in the JSON) measured views at max 1.54/s and
+mean 1.22/s per sidecar, CPU 0.19 cores and RSS 26.3 MiB: the debounce (100 ms doubling to 1 s) let rollout
+bursts through faster than 1/s. MSH-88 spaces each pod's views at least 1 s apart.

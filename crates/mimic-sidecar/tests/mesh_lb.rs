@@ -341,6 +341,8 @@ async fn msh_51_out_of_scope_the_kill_switches_and_a_mesh_off_view_keep_the_byte
         .lines()
         .filter(|l| l.starts_with("mimic_mesh_") && !l.starts_with("mimic_mesh_view_"))
         .filter(|l| !l.starts_with("mimic_mesh_unscoped"))
+        // A gauge with no label exists from the start (M2).
+        .filter(|l| !l.starts_with("mimic_mesh_retry_buffer_bytes"))
         .collect();
     assert!(series.is_empty(), "{series:?}");
 }
