@@ -531,7 +531,8 @@ fn duration_ms(text: &str) -> Option<u64> {
     (parts > 0).then_some(total)
 }
 
-fn refused_header(name: &str) -> bool {
+/// A header name a modifier may not touch.
+pub(super) fn refused_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     REFUSED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-mimic-")
 }

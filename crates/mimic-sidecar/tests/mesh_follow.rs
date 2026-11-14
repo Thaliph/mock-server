@@ -202,6 +202,7 @@ async fn msh_33_a_304_keeps_the_view() {
     .await;
     wait("304s", || rig.pulls("not_modified") == 2).await;
     assert_eq!(rig.services(), 2);
+    wait("the next request", || rig.api.count() >= 3).await;
     assert_eq!(rig.api.if_none_match(2).as_deref(), Some("\"1-aaa\""));
     rig.stop().await;
 }
@@ -301,6 +302,7 @@ async fn rte_20_a_view_whose_route_names_a_service_it_does_not_hold_is_refused_a
     wait("the refusal", || rig.pulls("invalid") == 1).await;
     assert_eq!(rig.pulls("ok"), 1);
     assert_eq!(rig.services(), 2);
+    wait("the next request", || rig.api.count() >= 3).await;
     assert_eq!(rig.api.if_none_match(2).as_deref(), Some("\"1-aaa\""));
     rig.stop().await;
 }

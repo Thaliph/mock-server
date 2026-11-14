@@ -362,7 +362,13 @@ fn rte_12_a_backend_or_mirror_of_a_service_not_held_or_a_port_it_lacks_is_refuse
     // A backend that is invalid and names a Service, or valid and names none.
     rte_12_refused(
         "invalid with a name",
-        set(&pointer("/backends/1/service"), json!("shop/cart")),
+        mutated(|v| {
+            v.pointer_mut(&pointer("/backends/1"))
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("service".into(), json!("shop/cart"));
+        }),
     );
     rte_12_refused(
         "valid without a name",
