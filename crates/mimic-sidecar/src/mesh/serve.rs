@@ -366,13 +366,13 @@ impl Serving {
         &self,
         protocol: Protocol,
         pick: Option<InFlight>,
-        backend: &Backend,
+        (backend, original): (&Backend, SocketAddr),
         source: &Source,
         head: &Parts,
         warned: &AtomicBool,
     ) -> Tried {
         let router = self.mesh.router();
-        let upstream = pick.as_ref().map_or(self.ctx.dst, |p| p.endpoint().addr);
+        let upstream = pick.as_ref().map_or(original, |p| p.endpoint().addr);
         let timeout = if pick.is_some() {
             router.connect_timeout
         } else {
@@ -449,8 +449,16 @@ impl Serving {
     }
 
     /// The next try after one failed: `Stop` without one left. A stale view, or one that says
-    /// `"mesh": false`, has the original destination for its only try (spec §7.9).
-    fn plan(&self, backend: &Backend, direct: bool, tries: u32, planner: &mut Planner) -> Plan {
+    /// `"mesh": false`, has the original destination for its only try (spec §7.9). A headless
+    /// backend (`original` none) has no destination to fall back to.
+    fn plan(
+        &self,
+        backend: &Backend,
+        original: Option<SocketAddr>,
+        direct: bool,
+        tries: u32,
+        planner: &mut Planner,
+    ) -> Plan {
         if direct {
             return if tries == 0 {
                 Plan::Original
@@ -458,7 +466,10 @@ impl Serving {
                 Plan::Stop
             };
         }
-        backend.plan(self.mesh.router(), planner)
+        match backend.plan(self.mesh.router(), planner) {
+            Plan::Original if original.is_none() => Plan::Stop,
+            plan => plan,
+        }
     }
 
     /// What to do with a failed try: a stale view, or one that says `"mesh": false`, has no
@@ -579,6 +590,9 @@ impl Serving {
         let routed = if direct { None } else { self.backend.routed() };
         let mut route = "none";
         let mut drawn = self.backend.clone();
+        // Where the fallback goes: the ClusterIP of the drawn backend (none when it is headless),
+        // else the destination the app dialled.
+        let mut original = Some(self.ctx.dst);
         let mut response_modifier = None;
         if let Some(routed) = &routed {
             match self.select(routed, &head) {
@@ -594,6 +608,9 @@ impl Serving {
                         modifier.apply(&mut Fields(&mut head.headers));
                     }
                     response_modifier = filters.and_then(|f| f.response_headers.as_ref());
+                    if !Arc::ptr_eq(&backend, &self.backend) {
+                        original = backend.original();
+                    }
                     drawn = backend;
                 }
                 Selected::Answer {
@@ -619,7 +636,7 @@ impl Serving {
         let warned = AtomicBool::new(false);
         let mut tries = 0;
         let mut again: Option<Outcome> = None;
-        let mut next = self.plan(&drawn, direct, tries, &mut planner);
+        let mut next = self.plan(&drawn, original, direct, tries, &mut planner);
         loop {
             let pick = match next {
                 Plan::Pod(pick) => Some(pick),
@@ -647,10 +664,12 @@ impl Serving {
             if pick.is_none() {
                 router.metrics.fallback(backend);
             }
-            let upstream = pick.as_ref().map_or(self.ctx.dst, |p| p.endpoint().addr);
+            // `plan` gives no original destination to a headless backend.
+            let dst = original.unwrap_or(self.ctx.dst);
+            let upstream = pick.as_ref().map_or(dst, |p| p.endpoint().addr);
             tracker.route(backend, upstream, tries);
             match self
-                .try_once(protocol, pick, &drawn, &source, &head, &warned)
+                .try_once(protocol, pick, (&drawn, dst), &source, &head, &warned)
                 .await
             {
                 Tried::Answer {
@@ -670,20 +689,22 @@ impl Serving {
                     }
                     planner.failed(verdict.outcome);
                     match self.decide(&drawn, direct, verdict, &planner) {
-                        Decision::Retry => match self.plan(&drawn, direct, tries, &mut planner) {
-                            Plan::Stop => router.metrics.skipped(backend, "exhausted"),
-                            // The try in flight stops reading the app's body now, so that
-                            // what the next try replays is what was read.
-                            retry if source.detach() => {
-                                Self::discard(response, &mut conn.lease).await;
-                                drop(conn);
-                                self.pause(verdict.outcome).await;
-                                again = Some(verdict.outcome);
-                                next = retry;
-                                continue;
+                        Decision::Retry => {
+                            match self.plan(&drawn, original, direct, tries, &mut planner) {
+                                Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                                // The try in flight stops reading the app's body now, so that
+                                // what the next try replays is what was read.
+                                retry if source.detach() => {
+                                    Self::discard(response, &mut conn.lease).await;
+                                    drop(conn);
+                                    self.pause(verdict.outcome).await;
+                                    again = Some(verdict.outcome);
+                                    next = retry;
+                                    continue;
+                                }
+                                _ => router.metrics.skipped(backend, "buffer"),
                             }
-                            _ => router.metrics.skipped(backend, "buffer"),
-                        },
+                        }
                         other => self.not_retried(&drawn, other),
                     }
                     source.release();
@@ -729,16 +750,18 @@ impl Serving {
                     }
                     planner.failed(verdict.outcome);
                     match self.decide(&drawn, direct, verdict, &planner) {
-                        Decision::Retry => match self.plan(&drawn, direct, tries, &mut planner) {
-                            Plan::Stop => router.metrics.skipped(backend, "exhausted"),
-                            retry if source.detach() => {
-                                drop(pick);
-                                again = Some(verdict.outcome);
-                                next = retry;
-                                continue;
+                        Decision::Retry => {
+                            match self.plan(&drawn, original, direct, tries, &mut planner) {
+                                Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                                retry if source.detach() => {
+                                    drop(pick);
+                                    again = Some(verdict.outcome);
+                                    next = retry;
+                                    continue;
+                                }
+                                _ => router.metrics.skipped(backend, "buffer"),
                             }
-                            _ => router.metrics.skipped(backend, "buffer"),
-                        },
+                        }
                         other => self.not_retried(&drawn, other),
                     }
                     return self.failed(tracker, (route, backend), failure, error, upstream, began);

@@ -3,7 +3,7 @@
 //! the pools, and the metrics. A view changes the endpoints; counts and connections of the
 //! endpoints it keeps stay.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
@@ -193,6 +193,9 @@ pub(crate) struct Backend {
     state: Mutex<State>,
     /// The routes of the port in the view held; none when it has no route.
     routed: RwLock<Option<Arc<Routed>>>,
+    /// The ClusterIP and port of the Service in the view held, where the fallback goes; none
+    /// for a headless Service.
+    original: Mutex<Option<SocketAddr>>,
 }
 
 impl Backend {
@@ -207,7 +210,13 @@ impl Backend {
                 endpoints: Vec::new(),
             }),
             routed: RwLock::new(None),
+            original: Mutex::new(None),
         }
+    }
+
+    /// The ClusterIP and port of the Service, none when it is headless.
+    pub(crate) fn original(&self) -> Option<SocketAddr> {
+        *lock(&self.original)
     }
 
     /// The routes of the port now, if it has any.
@@ -457,6 +466,10 @@ impl Router {
                     .remove(&label)
                     .unwrap_or_else(|| Arc::new(Backend::new(key, label.clone(), retry.clone())));
                 backend.set_routes(&service.routes, *port);
+                *lock(&backend.original) = service
+                    .ips
+                    .first()
+                    .map(|ip| SocketAddr::new(ip.to_canonical(), *port));
                 self.metrics.backend_seen(&label);
                 for gone in backend.update(&addrs, window, age, &self.metrics) {
                     self.metrics.left(&backend.label, gone, now);
@@ -480,6 +493,12 @@ impl Router {
             }
         }
         drop(backends);
+        let names: BTreeSet<&str> = view
+            .services
+            .values()
+            .flat_map(|service| service.routes.iter().map(|route| route.name.as_str()))
+            .collect();
+        self.metrics.routes_in_view(&names, now);
         self.pools.retain(&live);
     }
 }

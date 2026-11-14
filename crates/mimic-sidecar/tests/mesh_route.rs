@@ -1017,14 +1017,11 @@ async fn rte_51_a_headless_backend_whose_pods_refuse_is_answered_503_without_a_f
     );
     v2.headless = true;
     let state = state_with(view(&[parent, v2]));
-    // The parent's destination answers: it must not be used.
-    let parent_dst = Pod::http1("parent-dst", 0).await;
-    let f = fixture_mesh(parent_dst.addr, &state, None).await;
+    let f = fixture_mesh(cluster_ip(), &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
     let (head, _) = client.get("/v2").await;
     assert!(head.starts_with("HTTP/1.1 503"), "{head}");
     assert!(lower(&head).contains("connect-failed"), "{head}");
-    assert_eq!(parent_dst.counts.requests(), 0);
     let scrape = f.metrics.encode();
     assert_eq!(
         metric(&scrape, "mimic_mesh_fallbacks_total{", &["cart-v2"]),
@@ -1101,12 +1098,12 @@ async fn rte_53_route_labels_are_capped_at_256_and_evicted_5_minutes_after_the_r
     assert_eq!(seen.len(), 257, "256 routes and other");
     assert!(seen.contains("other"));
     assert_eq!(requests(&scrape, &["route=\"other\""]), 44.0);
-    for line in scrape.lines().filter(|l| l.starts_with("mimic_mesh_")) {
-        assert!(
-            !line.contains("secret-path") && !line.contains("zzz-query"),
-            "{line}"
-        );
-    }
+    let leaked = scrape
+        .lines()
+        .filter(|l| l.starts_with("mimic_mesh_"))
+        .filter(|l| l.contains("secret-path") || l.contains("zzz-query"))
+        .count();
+    assert_eq!(leaked, 0, "series carry a request value");
     // Route 0 leaves the view, another takes its place.
     state.hold(build(Some("shop/renamed")), "\"2-a\"");
     let now = std::time::Instant::now();
