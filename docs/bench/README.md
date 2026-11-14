@@ -168,3 +168,28 @@ mean 2.2, highest 4.5.
 | 2026-11-12 | discovery | h2c | 50 | 49.98 | 9.79 | 11.12 | 13.47 | 15.83 | 0 | 0.067 | 0.064 | 14.3 | 14.5 |
 | 2026-11-12 | discovery | h2c | 100 | 99.96 | 9.91 | 11.31 | 13.87 | 18.51 | 0 | 0.133 | 0.127 | 14.3 | 14.7 |
 | 2026-11-12 | discovery | h2c | 200 | 199.93 | 9.83 | 11.45 | 13.93 | 26.43 | 0 | 0.263 | 0.253 | 14.7 | 14.7 |
+
+## Controller (M1, #441)
+
+`scripts/bench-controller.sh` measures the controller of the mesh (design §14, M1): the RSS of the
+controller replicas with 1000 Services and 10 000 endpoints (synthetic objects, the view cache included;
+budget 256 MiB), and a rollout of a 50-pod deployment in a namespace of 200 sidecars (views per second per
+sidecar, budget 1; controller CPU summed over replicas, budget 0.5 core). Results go to
+`docs/bench/<date>-controller.json`, with the machine description and the budgets.
+
+```bash
+scripts/bench-controller.sh --dry-run   # the plan, nothing started
+scripts/bench-controller.sh             # both scenarios on cluster "mimic-ctl-bench", deleted on exit (about 20 minutes, an estimate not yet measured)
+SCENARIOS=scale scripts/bench-controller.sh   # the RSS scenario only
+```
+
+- The kind node runs with kubelet `maxPods` 300 (kind's default is 110), set by the script's kind config
+  only. An existing cluster of that name must allow 300 pods, or the run stops (exit 1).
+- The sidecars request 5m CPU and 16Mi memory in this run only (the scheduler reserves them for 200 sidecars
+  on one node); the workloads are fortio servers with 1m CPU and 16Mi requests.
+- Exit codes as `scripts/bench.sh`: 0 done and every budget met; 1 a step failed or a budget is not met (the
+  JSON is written in both cases, and the `FAIL budget` line names it); 2 usage or configuration; 3 another run
+  holds a lock (`mimic-e2e`, `mimic-bench` or `mimic-controller-bench`).
+- `KEEP_CLUSTER=0` (the default) deletes the cluster on exit. With `KEEP_CLUSTER=1` the namespaces and the
+  release are deleted and the cluster stays. The result file is never overwritten.
+- Run it on a quiet machine, not in parallel with `scripts/bench.sh` or `scripts/e2e.sh`.
