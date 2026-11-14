@@ -74,10 +74,11 @@ minutes later.
 | `mimic_mesh_reconnects_total` | counter, requests sent again on a new connection because nothing of them was written | `backend` |
 | `mimic_mesh_fallbacks_total` | counter, requests and L4 connections sent to the original destination (the ClusterIP) | `backend` |
 | `mimic_mesh_attempts_total` | counter, every try to a pod or to the original destination (a reconnect is not a try) | `backend`, `result` (`ok`, `connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
-| `mimic_mesh_retries_total` | counter, tries after the first | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `overloaded`, `queue_timeout`) |
+| `mimic_mesh_retries_total` | counter, tries after the first | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`) |
 | `mimic_mesh_retries_skipped_total` | counter, failures of a retried kind that were not retried | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
 | `mimic_mesh_retry_buffer_bytes` | gauge, request body bytes held for replay, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL` | none |
 | `mimic_mesh_stripped_headers_total` | counter, `x-mimic-*` fields removed from app responses by the inbound side | none |
+| `mimic_mesh_inbound_refusals_total` | counter, inbound connections answered `503` `connect-failed` because the app refused the connection (cleartext HTTP/1 and `h2c`) | none |
 | `mimic_mesh_unframed_closes_total` | counter, inbound connections closed because the app sent a response the sidecar cannot frame while the fields are removed | none |
 | `mimic_mesh_unscoped_connections_total` | counter, outbound connections whose destination is not a Service port of the view | none |
 | `mimic_mesh_view_pulls_total` | counter | `result` (`ok`, `not_modified`, `older`, `invalid`, `error`) |

@@ -83,6 +83,12 @@ of the app is never retried.
 connection (`mimic_mesh_retries_skipped_total{reason="exhausted"}`). Check the pods' ports and, over
 intercepted TLS, their certificates (`tls verification failed` lines).
 
+**`503` with `x-mimic-error: connect-failed` and `x-mimic-origin: inbound; pod=<name>`.** The app of that pod
+refused the connection (not listening, crashed, wrong port) and its meshed sidecar said so. Callers' sidecars
+retry it on another pod for every method (`mimic_mesh_retries_total{reason="app_refused"}`); you only see it
+when every try was refused. On the pod, `mimic_mesh_inbound_refusals_total` rises and the sidecar logs
+`inbound connect failed` at warn. Over TLS, or with the mesh off, the connection is closed without an answer.
+
 **`x-mimic-error` or `x-mimic-endpoint` missing from a response of my app.** A meshed sidecar removes every
 `x-mimic-*` field from the responses of its app (`mimic_mesh_stripped_headers_total`). With `MIMIC_MESH=off` or
 `MimicConfig.spec.mesh.enabled: false` they are kept.
