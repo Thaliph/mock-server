@@ -29,7 +29,7 @@ All notable changes to mimic are documented in this file. The format follows
   `TRACE`, `PUT` and `DELETE`. A response of an app is never retried. Request bodies are held for replay up to
   `MIMIC_MESH_RETRY_BUFFER` (64Ki) per request and `MIMIC_MESH_RETRY_BUFFER_TOTAL` (8Mi) in all. The access line
   gains `attempts`; new metrics `mimic_mesh_attempts_total`, `mimic_mesh_retries_total`,
-  `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`. The retry budget is #446.
+  `mimic_mesh_retries_skipped_total`, `mimic_mesh_retry_buffer_bytes`. The retry budget is #446 (below).
 - **Meshed sidecars remove `x-mimic-*` fields from app responses** (#445, M2): with `MIMIC_MESH=on` (and a view
   that does not say `"mesh": false`) the inbound side removes every response field whose name starts with
   `x-mimic-`, so that only a sidecar writes them; counted in `mimic_mesh_stripped_headers_total`. A response the
