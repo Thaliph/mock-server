@@ -57,10 +57,6 @@ fn object() -> serde_json::Value {
     })
 }
 
-fn route() -> Route {
-    convert::route(&dynamic(object())).expect("a route").1
-}
-
 #[test]
 fn rte_13_an_httproute_converts_to_the_input_route() {
     let (k, r) = convert::route(&dynamic(object())).expect("a route");

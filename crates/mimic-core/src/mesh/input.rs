@@ -148,6 +148,8 @@ pub struct Snapshot {
     pub configs: Vec<Config>,
     /// `None`: the `ReferenceGrant` CRD is not installed (no cross-namespace consent).
     pub grants: Option<Vec<ReferenceGrant>>,
+    /// The `HTTPRoute`s; empty when the Gateway API CRDs are not installed.
+    pub routes: Vec<Route>,
     /// `(namespace, name)` of the Deployments that exist.
     pub deployments: Vec<(String, String)>,
 }

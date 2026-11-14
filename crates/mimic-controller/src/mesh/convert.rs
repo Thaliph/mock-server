@@ -11,8 +11,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    Config, Destination, Endpoint, EndpointSlice, GrantFrom, GrantTo, ReferenceGrant,
-    RetryBudgetSpec, Service, ServicePort, SlicePort, Target, TargetKind, TargetPort,
+    BackendRef, Config, Destination, Endpoint, EndpointSlice, GATEWAY_GROUP, GrantFrom, GrantTo,
+    HeaderModifier, Mirror, NameMatch, ParentRef, PathMatch, ReferenceGrant, RetryBudgetSpec,
+    Route, RouteFilter, RouteMatch, RouteRule, Service, ServicePort, SlicePort, Target, TargetKind,
+    TargetPort,
 };
 use serde_json::Value;
 
@@ -236,4 +238,252 @@ pub fn grant(object: &DynamicObject) -> Option<(Key, ReferenceGrant)> {
             .collect(),
     };
     Some((key, grant))
+}
+
+/// The longest `spec` of an `HTTPRoute` that is read (RTE-13); a larger one is kept as its key,
+/// generation and parents.
+const MAX_SPEC_BYTES: usize = 64 * 1024;
+
+/// The fields of each level of an `HTTPRoute` the converter reads (or, for the filter types of
+/// the standard channel, that `mesh::route` refuses by `type`). Any other is an unknown field.
+const SPEC_FIELDS: [&str; 3] = ["parentRefs", "hostnames", "rules"];
+const PARENT_FIELDS: [&str; 6] = ["group", "kind", "namespace", "name", "sectionName", "port"];
+const RULE_FIELDS: [&str; 6] = [
+    "name",
+    "matches",
+    "filters",
+    "backendRefs",
+    "timeouts",
+    "retry",
+];
+const MATCH_FIELDS: [&str; 4] = ["path", "headers", "queryParams", "method"];
+const BACKEND_FIELDS: [&str; 7] = [
+    "group",
+    "kind",
+    "namespace",
+    "name",
+    "port",
+    "weight",
+    "filters",
+];
+const FILTER_FIELDS: [&str; 7] = [
+    "type",
+    "requestHeaderModifier",
+    "responseHeaderModifier",
+    "requestMirror",
+    "requestRedirect",
+    "urlRewrite",
+    "extensionRef",
+];
+
+/// The paths of the fields an object has besides `known`, under `at`.
+fn unknown(value: &Value, at: &str, known: &[&str], out: &mut Vec<String>) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for field in object.keys().filter(|f| !known.contains(&f.as_str())) {
+        out.push(if at.is_empty() {
+            field.clone()
+        } else {
+            format!("{at}.{field}")
+        });
+    }
+}
+
+fn list<'a>(value: &'a Value, field: &str) -> &'a [Value] {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+fn port(value: &Value) -> Option<u16> {
+    u16::try_from(value.get("port")?.as_u64()?).ok()
+}
+
+fn names(value: &Value, field: &str) -> Vec<NameMatch> {
+    list(value, field)
+        .iter()
+        .map(|n| NameMatch {
+            kind: text(n, "type").unwrap_or_else(|| "Exact".into()),
+            name: text(n, "name").unwrap_or_default(),
+            value: text(n, "value").unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn pairs(value: &Value, field: &str) -> Vec<(String, String)> {
+    list(value, field)
+        .iter()
+        .map(|p| {
+            (
+                text(p, "name").unwrap_or_default(),
+                text(p, "value").unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn modifier(value: &Value) -> HeaderModifier {
+    HeaderModifier {
+        set: pairs(value, "set"),
+        add: pairs(value, "add"),
+        remove: list(value, "remove")
+            .iter()
+            .map(|n| n.as_str().unwrap_or_default().to_string())
+            .collect(),
+    }
+}
+
+fn mirror(value: &Value) -> Mirror {
+    let backend = value.get("backendRef").unwrap_or(&Value::Null);
+    Mirror {
+        group: text(backend, "group").unwrap_or_default(),
+        kind: text(backend, "kind").unwrap_or_else(|| "Service".into()),
+        namespace: text(backend, "namespace"),
+        name: text(backend, "name").unwrap_or_default(),
+        port: port(backend),
+        percent: value.get("percent").map(bounded),
+        fraction: value.get("fraction").map(|f| {
+            (
+                f.get("numerator").map_or(0, bounded),
+                f.get("denominator").map(bounded),
+            )
+        }),
+    }
+}
+
+fn filter(value: &Value, at: &str, out: &mut Vec<String>) -> RouteFilter {
+    unknown(value, at, &FILTER_FIELDS, out);
+    let member = |field: &str| value.get(field);
+    if let Some(m) = member("requestMirror") {
+        unknown(
+            m,
+            &format!("{at}.requestMirror"),
+            &["backendRef", "percent", "fraction"],
+            out,
+        );
+    }
+    for field in ["requestHeaderModifier", "responseHeaderModifier"] {
+        if let Some(m) = member(field) {
+            unknown(m, &format!("{at}.{field}"), &["set", "add", "remove"], out);
+        }
+    }
+    RouteFilter {
+        kind: text(value, "type").unwrap_or_default(),
+        request_header_modifier: member("requestHeaderModifier").map(modifier),
+        response_header_modifier: member("responseHeaderModifier").map(modifier),
+        request_mirror: member("requestMirror").map(mirror),
+    }
+}
+
+fn rule(value: &Value, at: &str, out: &mut Vec<String>) -> RouteRule {
+    unknown(value, at, &RULE_FIELDS, out);
+    let matches = list(value, "matches")
+        .iter()
+        .enumerate()
+        .map(|(j, m)| {
+            let at = format!("{at}.matches[{j}]");
+            unknown(m, &at, &MATCH_FIELDS, out);
+            RouteMatch {
+                path: m.get("path").map(|p| PathMatch {
+                    kind: text(p, "type").unwrap_or_else(|| "PathPrefix".into()),
+                    value: text(p, "value").unwrap_or_else(|| "/".into()),
+                }),
+                headers: names(m, "headers"),
+                query_params: names(m, "queryParams"),
+                method: text(m, "method"),
+            }
+        })
+        .collect();
+    let filters = list(value, "filters")
+        .iter()
+        .enumerate()
+        .map(|(j, f)| filter(f, &format!("{at}.filters[{j}]"), out))
+        .collect();
+    let backend_refs = list(value, "backendRefs")
+        .iter()
+        .enumerate()
+        .map(|(j, b)| {
+            unknown(b, &format!("{at}.backendRefs[{j}]"), &BACKEND_FIELDS, out);
+            BackendRef {
+                group: text(b, "group").unwrap_or_default(),
+                kind: text(b, "kind").unwrap_or_else(|| "Service".into()),
+                namespace: text(b, "namespace"),
+                name: text(b, "name").unwrap_or_default(),
+                port: port(b),
+                weight: b.get("weight").map(bounded),
+                has_filters: b.get("filters").is_some(),
+            }
+        })
+        .collect();
+    let timeouts = value.get("timeouts");
+    if let Some(t) = timeouts {
+        unknown(
+            t,
+            &format!("{at}.timeouts"),
+            &["request", "backendRequest"],
+            out,
+        );
+    }
+    RouteRule {
+        name: text(value, "name"),
+        matches,
+        backend_refs,
+        filters,
+        request_timeout: timeouts.and_then(|t| text(t, "request")),
+        backend_request_timeout: timeouts.and_then(|t| text(t, "backendRequest")),
+        has_retry: value.get("retry").is_some(),
+    }
+}
+
+/// An `HTTPRoute` (RTE-13). Labels, annotations and `status` are not read, so a change of only
+/// those gives an equal [`Route`] and no new view.
+pub fn route(object: &DynamicObject) -> Option<(Key, Route)> {
+    let key = key(&object.metadata)?;
+    let spec = object.data.get("spec").unwrap_or(&Value::Null);
+    let parents = list(spec, "parentRefs")
+        .iter()
+        .map(|p| ParentRef {
+            group: text(p, "group").unwrap_or_else(|| GATEWAY_GROUP.into()),
+            kind: text(p, "kind").unwrap_or_else(|| "Gateway".into()),
+            namespace: text(p, "namespace"),
+            name: text(p, "name").unwrap_or_default(),
+            section_name: text(p, "sectionName"),
+            port: port(p),
+        })
+        .collect();
+    let oversize = spec.to_string().len() > MAX_SPEC_BYTES;
+    let mut unknown_fields = Vec::new();
+    let mut rules = Vec::new();
+    if !oversize {
+        unknown(spec, "", &SPEC_FIELDS, &mut unknown_fields);
+        for (i, p) in list(spec, "parentRefs").iter().enumerate() {
+            unknown(
+                p,
+                &format!("parentRefs[{i}]"),
+                &PARENT_FIELDS,
+                &mut unknown_fields,
+            );
+        }
+        for (i, r) in list(spec, "rules").iter().enumerate() {
+            rules.push(rule(r, &format!("rules[{i}]"), &mut unknown_fields));
+        }
+    }
+    let route = Route {
+        namespace: key.0.clone(),
+        name: key.1.clone(),
+        uid: object.metadata.uid.clone().unwrap_or_default(),
+        generation: object.metadata.generation.unwrap_or(0),
+        created: object
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map_or(0, |t| t.0.as_second()),
+        parents,
+        rules,
+        unknown_fields,
+        oversize,
+    };
+    Some((key, route))
 }

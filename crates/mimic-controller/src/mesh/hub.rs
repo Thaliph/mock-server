@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use mimic_core::Mode;
 use mimic_core::discovery::egress::matches_etag;
 use mimic_core::mesh::input::{
-    Config, EndpointSlice, ReferenceGrant, Service, Snapshot, TargetKind,
+    Config, EndpointSlice, ReferenceGrant, Route, Service, Snapshot, TargetKind,
 };
 use mimic_core::mesh::policy::Winners;
+use mimic_core::mesh::route::compile;
 use mimic_core::mesh::view::build;
 use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -108,6 +109,9 @@ struct Tables {
     grants: Table<ReferenceGrant>,
     /// The `ReferenceGrant` CRD is not installed: nobody consents.
     grants_absent: bool,
+    routes: Table<Route>,
+    /// The `HTTPRoute` CRD is installed: `None` until the first look.
+    gateway_api: Option<bool>,
 }
 
 impl Tables {
@@ -117,6 +121,7 @@ impl Tables {
             && self.configs.synced
             && self.deployments.synced
             && (self.grants.synced || self.grants_absent)
+            && (self.routes.synced || self.gateway_api == Some(false))
     }
 }
 
@@ -389,6 +394,41 @@ impl Hub {
         }
     }
 
+    pub fn feed_routes(&self, event: Event<Route>) {
+        let changed = {
+            let mut tables = lock(&self.tables);
+            let was_absent = tables.gateway_api == Some(false);
+            if was_absent {
+                tracing::info!("gateway api crds found");
+            }
+            tables.gateway_api = Some(true);
+            self.metrics.gateway_api_present.set(1);
+            tables.routes.feed(event) || was_absent
+        };
+        if changed {
+            self.dirty();
+        }
+    }
+
+    /// The `HTTPRoute` CRD is not installed (or no longer): there are no routes. Logged once per
+    /// change, not once per look.
+    pub fn routes_absent(&self) {
+        let changed = {
+            let mut tables = lock(&self.tables);
+            let changed = tables.gateway_api != Some(false);
+            if changed {
+                tracing::warn!("gateway api crds missing");
+            }
+            tables.routes = Table::default();
+            tables.gateway_api = Some(false);
+            self.metrics.gateway_api_present.set(0);
+            changed
+        };
+        if changed {
+            self.dirty();
+        }
+    }
+
     /// Something a view depends on changed (an object, a mode).
     pub fn dirty(&self) {
         self.dirty.send_modify(|n| *n += 1);
@@ -428,6 +468,7 @@ impl Hub {
             count("endpointslice", t.slices.items.len());
             count("mimicconfig", t.configs.items.len());
             count("referencegrant", t.grants.items.len());
+            count("httproute", t.routes.items.len());
             count("deployment", t.deployments.items.len());
             let snapshot = Snapshot {
                 cluster: self.config.cluster.clone(),
@@ -435,10 +476,12 @@ impl Hub {
                 slices: t.slices.items.values().cloned().collect(),
                 configs: t.configs.items.values().cloned().collect(),
                 grants,
+                routes: t.routes.items.values().cloned().collect(),
                 deployments: t.deployments.items.keys().cloned().collect(),
             };
             (snapshot, t.synced())
         };
+        self.count_routes(&snapshot);
         let winners = Winners::new(&snapshot.configs);
         let targets: BTreeSet<Key> = snapshot
             .configs
@@ -465,6 +508,31 @@ impl Hub {
                 own,
             });
         });
+    }
+
+    /// `mimic_mesh_routes`: the routes with a Service parent, programmed or not.
+    fn count_routes(&self, snapshot: &Snapshot) {
+        let (mut programmed, mut unsupported) = (0, 0);
+        for route in &snapshot.routes {
+            if !route
+                .parents
+                .iter()
+                .any(|p| p.group.is_empty() && p.kind == "Service")
+            {
+                continue;
+            }
+            if compile(route, &snapshot.services, snapshot.grants.as_deref()).programmed {
+                programmed += 1;
+            } else {
+                unsupported += 1;
+            }
+        }
+        for (state, n) in [("programmed", programmed), ("unsupported", unsupported)] {
+            self.metrics
+                .routes
+                .get_or_create(&label("state", state))
+                .set(n);
+        }
     }
 
     /// Publishes the changes, coalesced: the debounce after a quiet period, doubled up to one

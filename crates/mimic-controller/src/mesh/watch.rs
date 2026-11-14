@@ -151,6 +151,33 @@ async fn grants(client: kube::Client, hub: Arc<Hub>) {
     }
 }
 
+/// How long to wait between two looks for the `HTTPRoute` CRD.
+const CRD_LOOK: Duration = Duration::from_secs(30);
+
+/// `HTTPRoute`s, when the Gateway API CRD exists: it may be installed after the controller
+/// started (and removed), so it is looked for again every [`CRD_LOOK`] (RTE-18). The hub logs
+/// the changes of presence.
+pub(super) async fn routes(client: kube::Client, hub: Arc<Hub>) {
+    let resource = ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "gateway.networking.k8s.io",
+        "v1",
+        "HTTPRoute",
+    ));
+    loop {
+        let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
+        match api.list(&ListParams::default().limit(1)).await {
+            Ok(_) => {
+                let events = watcher::watcher(api, watcher::Config::default()).default_backoff();
+                forward(events, convert::route, |e| hub.feed_routes(e)).await;
+                hub.routes_absent();
+            }
+            Err(kube::Error::Api(status)) if status.code == 404 => hub.routes_absent(),
+            Err(error) => tracing::warn!(error = %error, "HTTPRoute CRD lookup failed"),
+        }
+        tokio::time::sleep(CRD_LOOK).await;
+    }
+}
+
 /// Wakes the hub when the `MimicWorkload`s change what a sidecar's mode is.
 async fn modes(mut changes: tokio::sync::watch::Receiver<u64>, hub: Arc<Hub>) {
     while changes.changed().await.is_ok() {
@@ -169,7 +196,8 @@ pub fn spawn(
     tokio::spawn(slices(client.clone(), hub.clone()));
     tokio::spawn(deployments(client.clone(), hub.clone()));
     tokio::spawn(configs(client.clone(), hub.clone()));
-    tokio::spawn(grants(client, hub.clone()));
+    tokio::spawn(grants(client.clone(), hub.clone()));
+    tokio::spawn(routes(client, hub.clone()));
     tokio::spawn(modes(mode_changes, hub.clone()));
     tokio::spawn(hub.clone().run());
     tokio::spawn(super::status::run(hub, sink));

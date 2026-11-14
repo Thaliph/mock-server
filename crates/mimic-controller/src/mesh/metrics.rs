@@ -20,6 +20,8 @@ pub struct MeshMetrics {
     pub(crate) watches: Gauge,
     pub(crate) truncated: Counter,
     pub(crate) cache_bytes: Gauge,
+    pub(crate) gateway_api_present: Gauge,
+    pub(crate) routes: Family<Labels, Gauge>,
 }
 
 impl Default for MeshMetrics {
@@ -33,6 +35,8 @@ impl Default for MeshMetrics {
             watches: Gauge::default(),
             truncated: Counter::default(),
             cache_bytes: Gauge::default(),
+            gateway_api_present: Gauge::default(),
+            routes: Family::default(),
         }
     }
 }
@@ -71,6 +75,16 @@ impl MeshMetrics {
             "Bytes held by the mesh view cache",
             Unit::Bytes,
             metrics.cache_bytes.clone(),
+        );
+        registry.register(
+            "mesh_gateway_api_present",
+            "1 when the Gateway API HTTPRoute CRD is installed, else 0",
+            metrics.gateway_api_present.clone(),
+        );
+        registry.register(
+            "mesh_routes",
+            "HTTPRoutes with a Service parent, by state (programmed or unsupported)",
+            metrics.routes.clone(),
         );
         metrics
     }
