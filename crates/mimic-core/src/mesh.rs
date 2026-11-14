@@ -15,6 +15,8 @@ mod testkit;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_budget;
+#[cfg(test)]
 mod tests_consent;
 #[cfg(test)]
 mod tests_from_json;

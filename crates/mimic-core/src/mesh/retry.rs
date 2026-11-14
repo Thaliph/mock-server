@@ -243,6 +243,12 @@ impl Planner {
         self.tries
     }
 
+    /// Whether a further try is allowed: the planner is neither out of tries nor past the
+    /// original destination.
+    pub fn has_try(&self) -> bool {
+        unimplemented!()
+    }
+
     /// The next try over the current `endpoints`: a pod not tried yet (P2C among them), else
     /// any pod. When every failure so far was a connect failure and either no untried pod is
     /// left or this is the last try, the original destination, once, which ends the tries.
@@ -290,4 +296,62 @@ impl Planner {
     pub fn failed(&mut self, outcome: Outcome) {
         self.only_connect &= outcome == Outcome::ConnectFailed;
     }
+}
+
+/// The slots of a [`Budget`]'s ring.
+pub const BUDGET_SLOTS: usize = 10;
+
+/// The retry budget of one Service (spec §7.9 "Retry budget").
+#[derive(Debug, Clone)]
+pub struct Budget {}
+
+impl Budget {
+    pub fn new(_percent: u32, _min_per_second: u32, _window: Duration) -> Budget {
+        unimplemented!()
+    }
+
+    pub fn deposit(&mut self, _now: Duration) {
+        unimplemented!()
+    }
+
+    pub fn withdraw(&mut self, _now: Duration) -> bool {
+        unimplemented!()
+    }
+
+    /// `n` requests at once (tests: saturation without 2^32 calls).
+    #[cfg(test)]
+    pub(super) fn deposit_many_for_test(&mut self, _now: Duration, _n: u32) {
+        unimplemented!()
+    }
+
+    /// The requests and retries held at `now`.
+    pub fn counts(&mut self, _now: Duration) -> (u64, u64) {
+        unimplemented!()
+    }
+}
+
+/// What to do with a failed try (spec §7.9 "Tries", "Retry budget").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Not a failure of a retried kind: the result stands.
+    Done,
+    /// Of a retried kind, not retried for a reason of the request.
+    Skipped(Skip),
+    /// Of a retried kind, no try left.
+    Exhausted,
+    /// Of a retried kind, a try left, the budget refused: the tries end, the failure stands.
+    Budget,
+    /// The next try may go.
+    Retry,
+}
+
+/// Decides after a failed try; the budget is asked (and a grant counted) only for a failure
+/// that `verdict` retries and for which `planner` has a try left.
+pub fn decide(
+    _verdict: Verdict,
+    _planner: &Planner,
+    _budget: &mut Budget,
+    _now: Duration,
+) -> Decision {
+    unimplemented!()
 }
