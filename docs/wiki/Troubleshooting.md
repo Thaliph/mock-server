@@ -125,6 +125,26 @@ the request. When it expired after the head the app sees a cut response (a close
 `INTERNAL_ERROR`) and the access line has the pod's status. A producer route in the callee's namespace binds
 callers that have no route of their own: check `kubectl get httproute -A`.
 
+**Mirrored requests do not arrive, or not all of them.** Look at `mimic_mesh_mirrored_total{backend,result}` of
+the caller's sidecar ([Mesh](Mesh#mirroring)); a copy is best effort and each result says why:
+
+- `skipped_body`: the body was larger than `MIMIC_MESH_RETRY_BUFFER` (64 KiB), the shared
+  `MIMIC_MESH_RETRY_BUFFER_TOTAL` was in use, the client left in the middle of the upload, or the body had not
+  ended at the copy's deadline (a long upload or an open gRPC stream is never mirrored). Raise the buffers (the
+  sidecar memory limit with the total) or accept the skips; with `MIMIC_MESH_RETRY_BUFFER=0` no request with a
+  body is mirrored.
+- `skipped_limit`: 256 copies to that Service port, or 1024 for the sidecar, were already in flight: the
+  mirror is slow or silent. The primary is not affected.
+- `error`: no copy got a response head: the mirror Service has no ready endpoint, refuses connections, resets,
+  or did not answer within 10 s (or the rule's `timeouts`). Over intercepted TLS the mirror pods must present a
+  certificate valid for the name the app sent. A copy is never retried.
+- no series at all: the mirror was never drawn (`percent: 0`), the request was not routed to a backend (`no-route`,
+  `Upgrade`, `CONNECT`, L4, mode `mock`, stale view), or the route is not in the view (`kubectl describe httproute`:
+  `RefNotPermitted` for a mirror in another namespace without a `ReferenceGrant`).
+
+The app's own answer never depends on the mirror, and the mirror's answer is discarded: a `500` from the mirror
+shows only in the mirror's own logs.
+
 **`503` with `x-mimic-error: connect-failed` after 4 tries.** Every pod tried and the ClusterIP refused the
 connection (`mimic_mesh_retries_skipped_total{reason="exhausted"}`). Check the pods' ports and, over
 intercepted TLS, their certificates (`tls verification failed` lines).

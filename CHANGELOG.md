@@ -21,6 +21,17 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Request mirroring in the sidecar (#450, M3): the `RequestMirror` filters of an `HTTPRoute` rule send a copy of
+  the requests it routes (a `percent` or `fraction` of them, at most 16 mirrors per rule) to a pod of the mirror
+  Service, in the protocol of the app, on connections of their own. The copy has the head of the primary's first
+  try (before the modifier when the mirror is written before it), the whole body and its trailers, or is skipped:
+  bodies share the replay buffer of retries (`MIMIC_MESH_RETRY_BUFFER`, `_TOTAL`). The response is discarded; a copy
+  is never retried, never falls back and is never mirrored again, and ends at the earliest of 10 s and the rule's
+  timeouts. At most 256 copies are in flight per mirror Service port and 1024 per sidecar. New metric
+  `mimic_mesh_mirrored_total{backend,result}` (`sent`, `error`, `skipped_body`, `skipped_limit`), access line
+  field `mirrored`, bench setup `mesh-mirror`. **Copies carry the caller's credentials, unredacted, to the mirror's
+  pods**; loops across apps are not detected. See Mirroring in the wiki page Mesh.
+
 - Route timeouts in the sidecar (#449, M3): `timeouts.request` (the whole call: every try, the pauses, the fallback
   and the response up to its last byte) and `timeouts.backendRequest` (one try) of an `HTTPRoute` rule are applied.
   Before the response head the sidecar answers `504` with `x-mimic-error: timeout`; after it the app's HTTP/1

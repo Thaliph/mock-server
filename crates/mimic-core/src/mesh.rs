@@ -5,6 +5,7 @@
 pub mod head;
 pub mod input;
 pub mod lb;
+pub mod mirror;
 pub mod policy;
 pub mod retry;
 pub mod route;
@@ -30,6 +31,8 @@ mod tests_head;
 mod tests_lb;
 #[cfg(test)]
 mod tests_match;
+#[cfg(test)]
+mod tests_mirror;
 #[cfg(test)]
 mod tests_policy;
 #[cfg(test)]

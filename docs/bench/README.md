@@ -369,3 +369,62 @@ The rows are that first M2 session: `mesh-lb`, then `mesh-refuse`.
 | No failure: p50 within 0.2 ms of M1 | +0.03 to +0.13 ms, back to back | met |
 | One of three pods refusing: client error rate 0 % | 0 errors in every run | met |
 | One of three pods refusing: p99 ≤ M1 `mesh-lb` p99 + 5 ms | http1 12.09–12.90 vs M1 10.63–11.26 + 5; h2c 13.81–15.56 vs 13.15–13.61 + 5 | met |
+
+## M3: request mirror (#450)
+
+### `mesh-mirror` (RTE-94)
+
+Backend of 3 pods, mode discovery, 200 rps, 8 connections, 30 s; JSON `2026-11-15-mesh-mirror.json`. Each rate and
+protocol runs three times: with no HTTPRoute (no route), with the HTTPRoute and no mirror filter (route, no mirror:
+the baseline of RTE-94), then with the filter mirroring every request to a second fortio Service (response delay
+5 ms, as the primary's). The first bench of this setup compared the mirror with no route at all and counted 8 more
+copies than fortio's requests: fortio's warm-up requests (one per connection) are not in its count but are routed and
+mirrored; the copies are now compared with the sidecar's own count of requests routed (`copies_match`).
+
+| Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-15 | mesh-mirror (no route) | http1 | 200 | 199.94 | 8.53 | 9.61 | 10.95 | 14.5 | 0 | 0.211 | 0.069 | 15.9 | 14.1 |
+| 2026-11-15 | mesh-mirror (route, no mirror) | http1 | 200 | 199.93 | 8.57 | 9.65 | 10.95 | 14.98 | 0 | 0.216 | 0.071 | 16.3 | 14.1 |
+| 2026-11-15 | mesh-mirror | http1 | 200 | 199.92 | 9.53 | 10.84 | 13.58 | 21.13 | 0 | 0.283 | 0.073 | 16.7 | 14.3 |
+| 2026-11-15 | mesh-mirror (no route) | h2c | 200 | 199.91 | 10.11 | 11.39 | 13.54 | 16 | 0 | 0.271 | 0.097 | 17.2 | 14.7 |
+| 2026-11-15 | mesh-mirror (route, no mirror) | h2c | 200 | 199.92 | 10.15 | 11.55 | 13.96 | 19.82 | 0 | 0.275 | 0.098 | 17.2 | 14.8 |
+| 2026-11-15 | mesh-mirror | h2c | 200 | 199.91 | 11.51 | 13.89 | 27.05 | 57.14 | 0 | 0.339 | 0.102 | 17.3 | 14.9 |
+
+| p50 (ms) | no route | route, no mirror | route with mirror | routing | mirror | copies = primary requests |
+|---|---|---|---|---|---|---|
+| http1 | 8.53 | 8.57 | 9.53 | +0.04 | +0.96 | 6008 = 6008 |
+| h2c | 10.11 | 10.15 | 11.51 | +0.04 | +1.37 | 6008 = 6008 |
+
+Routing alone costs 0.04 ms (budget 0.2 met). The mirror costs 0.96 ms (http1) and 1.37 ms (h2c): the budget
+(+0.2 ms) is **not met**. The cost is not in the primary's path: in process (4 workers, a 5 ms primary) the
+decision, the head clone and the spawn cost about 0.03 ms, and a mirror that answers 20 ms later than the primary
+costs the primary nothing (-0.04 to +0.1 ms, the noise of the probe). What costs is a copy whose response arrives
+at the same instant as the primary's (same delay): the work of the copy (reading its answer, the pool, the
+counters) queues with the primary's response on the sidecar's workers (+0.3 ms in process, +1 ms in the cluster).
+With a mirror Service answering after 25 ms (`MIRROR_DELAY_MS=25`, same session) the p50 delta is +0.23 (http1)
+and +0.24 ms (h2c) over the route without mirror; the sidecar uses 0.07 core more at 200 rps.
+
+#### After the decision of #450: a copy starts at the primary's response head
+
+Same setup and session conditions (load below 3, `MIRROR_DELAY_MS` 5, the symmetric worst case), the copy starting
+once the primary's response head arrived; JSON `2026-11-15-mesh-mirror.json` (this run replaces the first one,
+whose table is above).
+
+| Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-15 | mesh-mirror (no route) | http1 | 200 | 199.92 | 8.42 | 9.28 | 10.43 | 16.45 | 0 | 0.201 | 0.067 | 15.9 | 14.3 |
+| 2026-11-15 | mesh-mirror (route, no mirror) | http1 | 200 | 199.93 | 8.55 | 9.61 | 10.8 | 13.33 | 0 | 0.215 | 0.07 | 16.1 | 14.7 |
+| 2026-11-15 | mesh-mirror | http1 | 200 | 199.94 | 8.81 | 9.9 | 10.99 | 15.71 | 0 | 0.292 | 0.07 | 16.6 | 14.7 |
+| 2026-11-15 | mesh-mirror (no route) | h2c | 200 | 199.91 | 10.02 | 11.17 | 13.98 | 22.5 | 0 | 0.27 | 0.096 | 17.3 | 15.3 |
+| 2026-11-15 | mesh-mirror (route, no mirror) | h2c | 200 | 199.92 | 9.98 | 11.27 | 13.48 | 17.33 | 0 | 0.268 | 0.095 | 17.4 | 15.3 |
+| 2026-11-15 | mesh-mirror | h2c | 200 | 199.92 | 10.57 | 12.12 | 15.8 | 31.43 | 0 | 0.367 | 0.099 | 17.6 | 15.3 |
+
+| p50 (ms) | no route | route, no mirror | route with mirror | routing | mirror | copies = primary requests |
+|---|---|---|---|---|---|---|
+| http1 | 8.42 | 8.55 | 8.81 | +0.13 | +0.26 | 6008 = 6008 |
+| h2c | 10.02 | 9.98 | 10.57 | -0.04 | +0.59 | 6008 = 6008 |
+
+The mirror's cost over the route without mirror falls from +0.96 / +1.37 ms to +0.26 / +0.59 ms (http1 / h2c), still
+above the 0.2 ms budget of RTE-94 (http1 by 0.06 ms, h2c by 0.39 ms). The copy's response no longer lands with the
+primary's, what remains is the copy's own work on the same workers right after the head (the sidecar uses 0.07 to
+0.09 core more) and the run-to-run noise of the probe (routing alone moves between -0.04 and +0.13 ms).

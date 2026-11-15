@@ -257,7 +257,7 @@ With the Gateway API CRDs installed ([Install](Install#gateway-api-optional)), t
 `HTTPRoute` (`gateway.networking.k8s.io/v1`) whose `parentRefs` name a **Service** (`group: ""`, `kind: Service`;
 the GAMMA convention), compiles it and puts it in the views of the callers it applies to. Routes with Gateway
 parents are ignored. **The sidecar applies the matches, the backend weights and the header modifiers of a
-route**, timeouts included ([Timeouts](#timeouts)); mirrors are #450, and the sidecar does not apply them yet.
+route**, timeouts included ([Timeouts](#timeouts)) and mirrors ([Mirroring](#mirroring)).
 
 **Supported**, per rule: `matches` with `path` (`Exact`, `PathPrefix`), `headers` and `queryParams` of type
 `Exact`, `method`; `backendRefs` to Services with `port` and `weight`; the filters `RequestHeaderModifier`,
@@ -415,6 +415,75 @@ rules:
 A route of the callee's namespace sets the timeouts of every caller that has no route of its own; a route of the
 caller's namespace overrides it ([Limits](#limits)).
 
+### Mirroring
+
+A `RequestMirror` filter sends a **copy** of the requests a rule routes to a second Service, to try a new
+version on real traffic without answering from it:
+
+```yaml
+rules:
+  - backendRefs: [{name: cart, port: 80}]
+    filters:
+      - type: RequestMirror
+        requestMirror:
+          backendRef: {name: cart-shadow, port: 80}
+          percent: 10        # 10 % of the requests; leave it out for all of them
+```
+
+`percent` (or `fraction`, a numerator over a denominator) is drawn per request and per mirror; a rule has at most
+16 mirrors. The mirror Service may be in another namespace if that namespace has a `ReferenceGrant` for it
+(see *Backends in another namespace* above); without one the mirror is left out and the route shows
+`ResolvedRefs: False`, `RefNotPermitted`.
+
+**What is copied.** The method, the target and the `Host` as the app sent them, the fields of the request **as
+the primary backend gets them**, that is after the rule's `RequestHeaderModifier`, and the body with its
+trailers. A mirror written **before** the modifier in `filters` gets the fields as the app sent them, while the
+backend still gets the modified ones (Gateway API applies filters in order). Nothing is added to the copy, no
+marker field: the mirror sees a request like the backend's. The copy goes to one pod of the mirror Service,
+chosen like any other (least loaded of two), in the protocol the app spoke (HTTP/1 or HTTP/2, over intercepted
+TLS verified against the name the app sent), on connections of its own, so a slow mirror never takes a
+connection of the primary.
+
+**The response is discarded.** It is read and dropped, never relayed, recorded or trusted: a mirror answering
+`500` or a forged `x-mimic-error` changes nothing for the app. The app's answer, timing, retries and timeouts are
+those it would have without the mirror. A copy is **never retried**, never falls back to the ClusterIP, asks
+nothing of the retry budget and is **not routed again**: the mirror Service's own routes are not looked at, so a
+mirror is never mirrored.
+
+**Bodies.** A copy carries the whole body or is not sent. A request without a body is copied at once; otherwise
+the body is held in the same buffer as for retries, at most `MIMIC_MESH_RETRY_BUFFER` (64 KiB) per request and
+`MIMIC_MESH_RETRY_BUFFER_TOTAL` (8 MiB) for the sidecar, mirrors and retries together, one charge per request
+however many copies and tries share it. The copy starts once the end of the body was read from the app, so a
+mirror pod gets a large upload after the primary began. With `MIMIC_MESH_RETRY_BUFFER=0` only requests without
+a body are mirrored.
+
+**Best effort.** A copy is skipped when its body is larger than its share, when the total buffer is in use, when
+the body has not ended at the copy's deadline (a long gRPC or HTTP/2 stream is never mirrored), or when
+**256 copies per mirror Service port** or **1024 per sidecar** are already in flight. Each copy ends at the
+earliest of **10 s** and the rule's `timeouts.request` and `timeouts.backendRequest` (non-zero ones), counted
+from the request head. A copy waits for its body while holding its slot, up to that deadline, so slow uploads can fill
+the 256 slots of a port (the next copies are then counted `skipped_limit`). Copies in flight at the end of the `SIGTERM` grace are dropped, and none starts after it.
+Each drawn mirror is counted once in `mimic_mesh_mirrored_total{backend,result}`
+([Monitoring](Monitoring#mesh-metrics)); the access line of the request has `mirrored: true` when a copy was
+sent or failed ([Access logs](Access-logs)). Copies write no log line of their own and discovery never
+records them.
+
+**Not mirrored**: a request that no rule matched, an answer `no-route`, `no-backend` or `invalid-backend`, a
+stale view, mode `mock`, an `Upgrade` or `CONNECT`, L4 connections.
+
+> **Warning: copies carry the caller's credentials.** A copy is the request the backend sees: its
+> `Authorization` and `Cookie` fields, tokens in the query and the body go **unredacted** to the pods of the
+> mirror Service, and the mirror's app may log what it receives. Mirror only to a Service you would trust with
+> the real traffic. Who can cause it: the author of a route in the **callee's** namespace owns the parent Service
+> and already receives these requests; the author of a route in a **caller's** namespace mirrors only that
+> namespace's calls; a mirror in another namespace needs that namespace's `ReferenceGrant`, which is its consent
+> to receive. Copies leave from the caller's pod, so its NetworkPolicy applies to them.
+
+**Loops.** A mirror app that calls back (A's route mirrors to B, whose app calls A's Service) makes new requests
+that are routed and mirrored like any other: without trace context mimic cannot tell them apart. Each hop is
+bounded by its mirrors (16), the slots and the 10 s deadline, but breaking the loop is up to the route authors: use
+a `percent`, or no mirror to a Service that calls back.
+
 ## Observability
 
 Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `backend` is
@@ -431,6 +500,7 @@ Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `
 | `mimic_mesh_retries_total` (tries after the first) | `backend`, `reason` (`connect_failed`, `refused_stream`, `reset`, `app_refused`, `overloaded`, `queue_timeout`) |
 | `mimic_mesh_retries_skipped_total` (a retried kind of failure that was not retried) | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
 | `mimic_mesh_retry_buffer_bytes` (gauge, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL`) | none |
+| `mimic_mesh_mirrored_total` (one per drawn mirror of a routed request, [Mirroring](#mirroring)) | `backend` (the mirror Service port), `result` (`sent`, `error`, `skipped_body`, `skipped_limit`) |
 | `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total`, `mimic_mesh_inbound_refusals_total` (one per inbound connection answered `503` `connect-failed` because the app refused it) | none |
 | `mimic_mesh_unscoped_connections_total` | none |
 | `mimic_mesh_view_pulls_total` | `result` (`ok`, `not_modified`, `older`, `invalid`, `error`) |
@@ -509,13 +579,16 @@ parse, once per streak), `tls verification failed`.
 - **A response that cannot be framed closes the inbound connection when the mesh is on** (see
   [Retries](#retries)). Such an app works with the mesh off or a view of `"mesh": false`. A request that
   cannot be framed (client side) is still relayed unchanged, and so is what the app answers to it.
+- **Mirrors are best effort and carry credentials.** Copies are skipped when their body does not fit the replay
+  buffer, the slots are full or the body has not ended in time; they are not a delivery guarantee, and they go
+  unredacted to the mirror's pods ([Mirroring](#mirroring)).
 - Not yet: outlier ejection, circuit breaking, admission control.
 
 ## What is coming
 
 - **M2**: retries of proxy-level failures on another pod are in (above); the retry budget and
   `MimicConfig.retries` are next (#446).
-- **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts are in ([Timeouts](#timeouts)), mirrors #450.
+- **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts ([Timeouts](#timeouts)) and mirrors ([Mirroring](#mirroring)) are in.
 - **M4**: outlier detection, circuit breaker and fault injection.
 - **M5**: admission contract, failure signalling and HPA.
 - **M6**: north-south gateway.

@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mimic_core::mesh::mirror;
 use mimic_core::mesh::view::{Limits, View};
 use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
@@ -99,6 +100,14 @@ pub struct MeshConfig {
     /// The middle of the delay before a retry after a trusted refusal (±50 %); a field, not a
     /// variable: tests shorten it.
     pub refusal_delay: Duration,
+    /// Copies in flight per mirror Service port (spec §7.9 "Mirrors"); a field, not a variable:
+    /// M4 decides whether `circuitBreaker.maxRequests` replaces it.
+    pub mirror_max_in_flight: usize,
+    /// Copies in flight for the sidecar in total; a field, not a variable.
+    pub mirror_max_in_flight_total: usize,
+    /// The deadline of a copy from the request head when the rule has no shorter timeout; a
+    /// field, not a variable: tests shorten it.
+    pub mirror_timeout: Duration,
     /// A fixed seed for the random draws (tests); `None`: seeded from the system.
     pub seed: Option<u64>,
 }
@@ -122,6 +131,9 @@ impl Default for MeshConfig {
             retry_buffer: 64 * KIB,
             retry_buffer_total: 8 * MIB,
             refusal_delay: Duration::from_millis(25),
+            mirror_max_in_flight: mirror::MAX_IN_FLIGHT,
+            mirror_max_in_flight_total: mirror::MAX_IN_FLIGHT_TOTAL,
+            mirror_timeout: Duration::from_millis(mirror::TIMEOUT_MS),
             seed: None,
         }
     }
@@ -414,6 +426,8 @@ struct Inner {
     state_file: PathBuf,
     replay: Arc<ReplayBudget>,
     retry_buffer: usize,
+    /// `SIGTERM` came: no copy starts any more.
+    stopping: AtomicBool,
     pulls: Family<ResultLabel, Counter>,
     services: Gauge,
     endpoints: Gauge,
@@ -464,6 +478,7 @@ impl MeshState {
             state_file: config.state_file.clone(),
             replay: ReplayBudget::new(config.retry_buffer_total, Gauge::default()),
             retry_buffer: config.retry_buffer,
+            stopping: AtomicBool::new(false),
             pulls: Family::default(),
             services: Gauge::default(),
             endpoints: Gauge::default(),
@@ -480,6 +495,11 @@ impl MeshState {
                 config.connect_timeout,
                 config.avoid_failed_for,
                 config.refusal_delay,
+                router::MirrorConfig {
+                    max_in_flight: config.mirror_max_in_flight,
+                    max_in_flight_total: config.mirror_max_in_flight_total,
+                    timeout: config.mirror_timeout,
+                },
             ),
             seen: AtomicBool::new(false),
         }))
@@ -529,6 +549,22 @@ impl MeshState {
     /// The buffer of a request that may be sent again (spec §7.9 "Retries", "Bodies").
     pub fn replay(&self) -> Replay {
         self.0.replay.replay(self.0.retry_buffer)
+    }
+
+    /// `SIGTERM` came: no copy starts any more (spec §7.9 "Mirrors").
+    pub fn stop(&self) {
+        self.0
+            .stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn stopping(&self) -> bool {
+        self.0.stopping.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The bytes one request may hold, for retries and mirrors (`MIMIC_MESH_RETRY_BUFFER`).
+    pub(crate) fn replay_share(&self) -> usize {
+        self.0.retry_buffer
     }
 
     pub(crate) fn router(&self) -> &Router {
