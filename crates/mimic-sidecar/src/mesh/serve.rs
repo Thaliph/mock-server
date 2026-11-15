@@ -24,6 +24,7 @@ use hyper::{Method, Request, Response, StatusCode, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::head::{Stop, leaves};
 use mimic_core::mesh::mirror::{self, Candidate};
+use mimic_core::mesh::outlier::Outcome as Counted;
 use mimic_core::mesh::retry::{
     Decision, Failure, Outcome, Planner, Refusal, Verdict, classify, delay, trusted,
 };
@@ -839,7 +840,7 @@ impl Serving {
             let pick = match next {
                 Plan::Pod(pick) => Some(pick),
                 Plan::Original => None,
-                Plan::Stop => {
+                Plan::Stop | Plan::AllEjected => {
                     self.count(
                         route,
                         backend,
@@ -888,6 +889,13 @@ impl Serving {
                     let verdict = classify(failure, head.method.as_str(), source.held(), true);
                     router.metrics.attempt(backend, verdict.outcome);
                     if let Some(pick) = &conn.pick {
+                        let counted = match refusal {
+                            Some(Refusal::Overloaded) => Counted::Overloaded,
+                            Some(Refusal::QueueTimeout) => Counted::QueueTimeout,
+                            Some(Refusal::AppRefused) => Counted::AppRefused,
+                            None => Counted::Head(status.as_u16()),
+                        };
+                        drawn.record(router, pick.endpoint().addr, counted);
                         let class = status_class(status.as_u16());
                         router
                             .metrics
@@ -897,7 +905,9 @@ impl Serving {
                     match self.decide(&drawn, direct, verdict, &planner) {
                         Decision::Retry => {
                             match self.plan(&drawn, original, direct, tries, &mut planner) {
-                                Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                                Plan::Stop | Plan::AllEjected => {
+                                    router.metrics.skipped(backend, "exhausted")
+                                }
                                 // The try in flight stops reading the app's body now, so that
                                 // what the next try replays is what was read.
                                 retry if source.detach() => {
@@ -999,6 +1009,20 @@ impl Serving {
                 } => {
                     let verdict = classify(failure, head.method.as_str(), source.held(), written);
                     router.metrics.attempt(backend, verdict.outcome);
+                    if let Some(pick) = &pick {
+                        let counted = match failure {
+                            Failure::Connect => Counted::ConnectFailed,
+                            Failure::RefusedStream => Counted::RefusedStream,
+                            Failure::Response => Counted::InvalidResponse,
+                            // The app leaving is not the pod's doing.
+                            Failure::Reset if source.failed() => Counted::AppLeft,
+                            Failure::Reset => Counted::Reset,
+                            Failure::Refusal(_) | Failure::AfterHead | Failure::Timeout => {
+                                Counted::AfterHead
+                            }
+                        };
+                        drawn.record(router, pick.endpoint().addr, counted);
+                    }
                     if let (true, Some(pick)) = (written, &pick) {
                         let label = &pick.endpoint().label;
                         router.metrics.endpoint_try(backend, label, "none");
@@ -1007,7 +1031,9 @@ impl Serving {
                     match self.decide(&drawn, direct, verdict, &planner) {
                         Decision::Retry => {
                             match self.plan(&drawn, original, direct, tries, &mut planner) {
-                                Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                                Plan::Stop | Plan::AllEjected => {
+                                    router.metrics.skipped(backend, "exhausted")
+                                }
                                 retry if source.detach() => {
                                     drop(pick);
                                     again = Some(verdict.outcome);
@@ -1429,6 +1455,7 @@ impl Copy {
         let Plan::Pod(pick) = self.backend.plan(router, &mut Planner::new(0)) else {
             return "error";
         };
+        let backend = &self.backend;
         let upstream = pick.endpoint().addr;
         let mut lease: Option<Lease> = None;
         // An unwritten request, because the pod had closed the connection, goes once more on a
@@ -1453,6 +1480,7 @@ impl Copy {
                 Ok(Err(e)) => {
                     tracing::debug!(%upstream, error = %e, "connect to the mirror's pod failed");
                     router.failed(&pick);
+                    backend.record(router, upstream, Counted::ConnectFailed);
                     return "error";
                 }
                 Err(_) => return "error",
@@ -1464,11 +1492,25 @@ impl Copy {
                     return "error";
                 }
                 Ok(Sent::Response(response)) => {
+                    // A copy's status is never read: a head says the pod answers.
+                    backend.record(router, upstream, Counted::Head(200));
                     lease = Some(connected);
                     break response;
                 }
                 Ok(Sent::Unsent) if lease.is_none() => lease = Some(connected),
-                Ok(Sent::Unsent | Sent::Failed(_)) => return "error",
+                Ok(Sent::Unsent) => {
+                    backend.record(router, upstream, Counted::ConnectFailed);
+                    return "error";
+                }
+                Ok(Sent::Failed(e)) => {
+                    let counted = match pool::failure(&e, connected.goaway()) {
+                        Failure::RefusedStream => Counted::RefusedStream,
+                        Failure::Response => Counted::InvalidResponse,
+                        _ => Counted::Reset,
+                    };
+                    backend.record(router, upstream, counted);
+                    return "error";
+                }
             }
         };
         // The answer is read and dropped as it comes; one that is not over at the deadline

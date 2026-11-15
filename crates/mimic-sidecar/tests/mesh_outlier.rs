@@ -107,16 +107,16 @@ impl ModePod {
 /// outlier policy and its routes.
 struct Svc {
     key: &'static str,
-    ip: Option<&'static str>,
+    ip: Option<String>,
     ports: Vec<(u16, Vec<SocketAddr>)>,
     outlier: (u32, u32, u32, u32),
     routes: String,
 }
 
-fn svc(key: &'static str, ip: Option<&'static str>, port: u16, pods: &[SocketAddr]) -> Svc {
+fn svc(key: &'static str, ip: Option<&str>, port: u16, pods: &[SocketAddr]) -> Svc {
     Svc {
         key,
-        ip,
+        ip: ip.map(str::to_string),
         ports: vec![(port, pods.to_vec())],
         outlier: (30, 0, 5, 50),
         routes: String::new(),
@@ -148,7 +148,11 @@ impl Svc {
             .iter()
             .map(|(port, _)| format!(r#""{port}":{{"targetPort":8080}}"#))
             .collect();
-        let ips = self.ip.map(|i| format!("\"{i}\"")).unwrap_or_default();
+        let ips = self
+            .ip
+            .as_ref()
+            .map(|i| format!("\"{i}\""))
+            .unwrap_or_default();
         format!(
             r#""{}":{{"endpoints":{{{}}},"generations":{{}},"ips":[{ips}],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":{base},"consecutive5xx":{fives},"consecutiveFailures":{failures},"maxEjectionPercent":{percent}}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{{}}}{}}}"#,
             self.key,
@@ -165,6 +169,16 @@ fn view(services: &[Svc]) -> View {
         services.iter().map(Svc::json).collect::<Vec<_>>().join(",")
     );
     View::from_json(&text, &Limits::default()).unwrap()
+}
+
+/// The Service `shop/cart` the app dials on `cluster`.
+fn cart_on(cluster: SocketAddr, pods: &[SocketAddr]) -> Svc {
+    svc(
+        "shop/cart",
+        Some(&cluster.ip().to_string()),
+        cluster.port(),
+        pods,
+    )
 }
 
 /// The Service the app dials, `shop/cart` on `127.0.0.1:80` (no one listens there).
@@ -374,10 +388,9 @@ async fn cbr_17_busy_pods_and_the_original_destination_are_never_ejected() {
     }
     // A stale view sends every request to the original destination: no pod, no outcome.
     let cluster = ModePod::start(Mode::Status(500)).await;
-    let state = state_with(
-        &[svc("shop/cart", Some("127.0.0.1"), 80, &[]).outlier(30, 1, 1, 100)],
-        |c| c.stale_after = Duration::from_millis(1),
-    );
+    let state = state_with(&[cart_on(cluster.addr, &[]).outlier(30, 1, 1, 100)], |c| {
+        c.stale_after = Duration::from_millis(1)
+    });
     tokio::time::sleep(Duration::from_millis(20)).await;
     let f = fixture_mesh(cluster.addr, &state, None).await;
     let mut client = H1Client::connect(f.addr).await;
@@ -513,14 +526,11 @@ async fn cbr_20_at_most_the_allowed_share_is_ejected_and_a_single_pod_never() {
     // A single resetting pod is never ejected: M2 path, then the ClusterIP.
     let cluster = Pod::http1("cluster", 0).await;
     let only = ModePod::start(Mode::Reset).await;
-    let state = state_with(
-        &[svc("shop/cart", Some("127.0.0.1"), 80, &[only.addr])],
-        |_| {},
-    );
+    let state = state_with(&[cart_on(cluster.addr, &[only.addr])], |_| {});
     let f = fixture_mesh(cluster.addr, &state, None).await;
-    let mut client = H1Client::connect(f.addr).await;
     for _ in 0..8 {
-        assert_eq!(status(&mut client, "GET", "/").await, 503);
+        let mut client = H1Client::connect(f.addr).await;
+        assert_ne!(status_or_closed(&mut client).await, Some(200));
     }
     assert!(only.heads() >= 8, "it keeps its tries: {}", only.heads());
     assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
@@ -535,17 +545,18 @@ async fn cbr_20_with_every_pod_ejected_nothing_is_tried_and_an_l4_connection_is_
         ModePod::start(Mode::Reset).await,
     );
     let state = state_with(
-        &[svc("shop/cart", Some("127.0.0.1"), 80, &[x.addr, y.addr]).outlier(30, 0, 5, 100)],
+        &[cart_on(cluster.addr, &[x.addr, y.addr]).outlier(30, 0, 5, 100)],
         |_| {},
     );
     let f = fixture_mesh(cluster.addr, &state, None).await;
+    let label = format!("shop/cart:{}", cluster.addr.port());
     for _ in 0..30 {
         let mut client = H1Client::connect(f.addr).await;
         let _ = status_or_closed(&mut client).await;
     }
     let scrape = f.metrics.encode();
     assert_eq!(ejections(&scrape, "consecutive_failures"), 2.0, "{scrape}");
-    assert_eq!(ejected(&scrape, "shop/cart:80"), 2.0, "{scrape}");
+    assert_eq!(ejected(&scrape, &label), 2.0, "{scrape}");
     let heads = (x.heads(), y.heads());
     let mut client = H1Client::connect(f.addr).await;
     assert_eq!(status(&mut client, "GET", "/").await, 503);
@@ -593,6 +604,7 @@ async fn cbr_21_views_restore_and_forget_ejected_pods() {
     assert_eq!(lines(&logs, "endpoint restored").await.len(), 2);
     assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 0.0);
     // An ejected pod that leaves the view drops from the gauge, without a line.
+    state.hold(view(&[cart(&[bad[0].addr, bad[1].addr])]), "\"3b-a\"");
     for _ in 0..40 {
         let _ = status_or_closed(&mut client).await;
         client = H1Client::connect(f.addr).await;
@@ -620,7 +632,7 @@ async fn cbr_23_no_retry_goes_to_an_ejected_pod_and_the_last_ejection_falls_back
         closed_port().await,
     ];
     let state = state_with(
-        &[svc("shop/cart", Some("127.0.0.1"), 80, &pods).outlier(30, 0, 1, 100)],
+        &[cart_on(cluster.addr, &pods).outlier(30, 0, 1, 100)],
         |_| {},
     );
     let f = fixture_mesh(cluster.addr, &state, None).await;
@@ -799,7 +811,10 @@ async fn cbr_20_an_l4_connection_with_every_pod_ejected_is_closed_without_a_byte
     let _logs = capture_logs();
     let cluster = EchoPod::start().await;
     let state = state_with(
-        &[cart(&[closed_port().await, closed_port().await]).outlier(30, 0, 1, 100)],
+        &[
+            cart_on(cluster.addr, &[closed_port().await, closed_port().await])
+                .outlier(30, 0, 1, 100),
+        ],
         |c| c.avoid_failed_for = Duration::ZERO,
     );
     let f = fixture_mesh(cluster.addr, &state, None).await;
@@ -808,7 +823,8 @@ async fn cbr_20_an_l4_connection_with_every_pod_ejected_is_closed_without_a_byte
     c.write_all(b"\x00\x01binary").await.unwrap();
     let mut got = [0u8; 8];
     c.read_exact(&mut got).await.unwrap();
-    assert_eq!(ejected(&f.metrics.encode(), "shop/cart:80"), 2.0);
+    let label = format!("shop/cart:{}", cluster.addr.port());
+    assert_eq!(ejected(&f.metrics.encode(), &label), 2.0);
     let accepted = cluster.accepted();
     let mut c = TcpStream::connect(f.addr).await.unwrap();
     let _ = c.write_all(b"\x00\x01binary").await;

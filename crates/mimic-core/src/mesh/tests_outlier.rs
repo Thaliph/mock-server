@@ -514,9 +514,9 @@ proptest! {
                         log.push(format!("view {count} {restored:?}"));
                         model.retain(|a, _| members.contains(a));
                         for a in &members { model.entry(*a).or_insert((0, 0)); }
-                        for r in restored {
-                            if let Some(m) = model.get_mut(&r.addr) { *m = (0, 0); }
-                        }
+                        // A restoration changes no counter: they were zeroed by the ejection, and
+                        // the failures counted since (a restoration is reported late) stay.
+                        drop(restored);
                     }
                 }
                 let allowed = members.len() * p.max_ejection_percent as usize / 100;

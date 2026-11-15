@@ -3265,6 +3265,9 @@ no insignificant whitespace):
     say it works and is full, and ejecting it would move its load onto its siblings; a timeout
     is the route author's bound and the app leaving is the app's doing. A copy's status is
     never read (its `5xx` counts nothing), its proxy-level failures count as above.
+    The outcome of a try whose endpoint is ejected when it ends (a try that was in flight when
+    the endpoint got ejected), or that the view no longer holds, is ignored: it changes no
+    counter.
   - **Ejection**: when `failures` reaches `consecutiveFailures`, or `consecutive5xx` is not 0
     and `5xx` reaches it, the endpoint is **ejected** when fewer than `allowed = ⌊n ×
     maxEjectionPercent / 100⌋` endpoints of the port are ejected then, `n` being the endpoints

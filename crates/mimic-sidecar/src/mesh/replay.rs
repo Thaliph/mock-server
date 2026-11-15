@@ -339,6 +339,12 @@ impl Source {
         !shared.failed && shared.replay.is_held()
     }
 
+    /// The app's side of the request failed: its connection closed or its stream was reset
+    /// while the body was read.
+    pub(crate) fn failed(&self) -> bool {
+        lock(&self.shared).failed
+    }
+
     /// The request can be sent again whole: nothing was read, or all of it is held.
     pub(crate) fn intact(&self) -> bool {
         let shared = lock(&self.shared);

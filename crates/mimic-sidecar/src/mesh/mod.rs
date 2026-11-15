@@ -788,6 +788,7 @@ impl MeshState {
     /// Updates `mimic_mesh_view_age_seconds` and writes the stale warning once per streak.
     pub fn tick(&self) {
         self.evict(Instant::now());
+        self.0.router.sweep();
         let (age, warn) = {
             let mut c = lock(&self.0.contact);
             let Some(at) = c.at else {
