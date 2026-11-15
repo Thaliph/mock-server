@@ -264,7 +264,11 @@ impl Outlier {
         self.consecutive_5xx = policy.consecutive_5xx;
         self.base_ejection_seconds = policy.base_ejection_seconds;
         self.max_ejection_percent = policy.max_ejection_percent;
-        self.endpoints.retain(|a, _| addrs.contains(a));
+        // O(n log n): the view is searched sorted, not scanned for each endpoint.
+        let mut sorted = addrs.to_vec();
+        sorted.sort_unstable();
+        self.endpoints
+            .retain(|a, _| sorted.binary_search(a).is_ok());
         for addr in addrs {
             self.endpoints.entry(*addr).or_default();
         }

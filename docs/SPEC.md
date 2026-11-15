@@ -3265,6 +3265,11 @@ no insignificant whitespace):
     say it works and is full, and ejecting it would move its load onto its siblings; a timeout
     is the route author's bound and the app leaving is the app's doing. A copy's status is
     never read (its `5xx` counts nothing), its proxy-level failures count as above.
+    Two consequences are kept as they are: over intercepted TLS a trusted refusal `overloaded`
+    is not recognised (no refusal is trusted over TLS, "Retries" above), so its `503` counts as
+    a `5xx` toward `consecutive5xx` when that is on; and any response head from the pod resets
+    the counters of its endpoint, a mirror copy's included (its status is never read, so the
+    head counts as a final response head with a status below 500).
     The outcome of a try whose endpoint is ejected when it ends (a try that was in flight when
     the endpoint got ejected), or that the view no longer holds, is ignored: it changes no
     counter.

@@ -10,11 +10,15 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::mesh_pods::{EchoPod, H1Client, Pod, RawPod};
+use common::mock_rig::{Options, rig_with, users_set};
 use common::{Logs, capture_logs, closed_port, fixture_mesh};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use mimic_core::Mode;
 use mimic_core::mesh::view::{Limits, View};
+use mimic_sidecar::discovery::{Discovery, DiscoveryConfig};
 use mimic_sidecar::mesh::{MeshConfig, MeshState};
+use mimic_sidecar::mode::Announced;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -493,6 +497,142 @@ async fn cbr_26_mirror_copies_l4_connections_and_stale_views_hold_no_slot() {
 }
 
 #[tokio::test]
+async fn cbr_26_a_request_the_mock_answers_takes_no_slot_and_is_never_breaker_open() {
+    let _logs = capture_logs();
+    let pod = Pod::http1("slow", 1500).await;
+    let state = state_with(&[cart(&[pod.addr]).breaker(1, 1024)], |_| {});
+    let rig = rig_with(
+        users_set(5),
+        100,
+        1024,
+        None,
+        Options {
+            mode: Some(Mode::Discovery),
+            dst: Some(dst()),
+            mesh: Some(state.clone()),
+            ..Options::default()
+        },
+    )
+    .await;
+    let request = "GET /users/1 HTTP/1.1\r\nhost: users.test:8080\r\n\r\n";
+    let held = tokio::spawn({
+        let addr = rig.addr;
+        async move {
+            let mut client = H1Client::connect(addr).await;
+            client.send(request.as_bytes()).await;
+            client.read().await.expect("an answer")
+        }
+    });
+    until("the slot is held", || {
+        pod.counts.in_flight.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // The breaker is full: a balanced request is refused.
+    let mut client = H1Client::connect(rig.addr).await;
+    client.send(request.as_bytes()).await;
+    let (head, _) = client.read().await.expect("an answer");
+    assert!(head.contains("breaker-open"), "full: {head}");
+    // The mock answers the next ones, whatever the slots.
+    rig.mode
+        .observe(Announced {
+            mode: Ok(Mode::Mock),
+            factor: None,
+        })
+        .await;
+    for n in 0..5 {
+        client.send(request.as_bytes()).await;
+        let (head, _) = client.read().await.expect("an answer");
+        assert!(
+            head.starts_with("HTTP/1.1 200") && lower(&head).contains("x-mimic-match"),
+            "mocked request {n}: {head}"
+        );
+    }
+    let scrape = rig.metrics.encode();
+    assert_eq!(
+        metric(
+            &scrape,
+            "mimic_mesh_requests_total{",
+            &["reason=\"breaker-open\""]
+        ),
+        1.0,
+        "only the balanced request: {scrape}"
+    );
+    let (head, _) = held.await.unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+}
+
+/// A pod that answers `101` to an `Upgrade`, `200` to a `CONNECT`, a response whose body never
+/// ends to `/hold` and `200 ok` to anything else.
+async fn tunnel_pod() -> RawPod {
+    RawPod::start(|head| {
+        let head = String::from_utf8_lossy(head).to_ascii_lowercase();
+        if head.starts_with("connect") {
+            b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec()
+        } else if head.contains("upgrade: websocket") {
+            b"HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n"
+                .to_vec()
+        } else if head.starts_with("get /hold") {
+            b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\n12345".to_vec()
+        } else {
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec()
+        }
+    })
+    .await
+}
+
+#[tokio::test]
+async fn cbr_26_an_upgrade_and_a_connect_with_a_full_breaker_reach_the_pod_and_hold_no_slot() {
+    let _logs = capture_logs();
+    let pod = tunnel_pod().await;
+    let state = state_with(&[cart(&[pod.addr]).breaker(1, 1024)], |_| {});
+    let f = fixture_mesh(dst(), &state, None).await;
+    // A response that never ends holds the only slot.
+    let mut holder = H1Client::connect(f.addr).await;
+    holder
+        .send(b"GET /hold HTTP/1.1\r\nHost: cart.shop.svc:80\r\n\r\n")
+        .await;
+    let head = holder
+        .read_raw(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\n12345".len())
+        .await;
+    assert!(head.starts_with(b"HTTP/1.1 200"), "{head:?}");
+    let mut tunnels = Vec::new();
+    for (opening, answer) in [
+        (
+            "GET /ws HTTP/1.1\r\nHost: cart.shop.svc:80\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            "HTTP/1.1 101",
+        ),
+        (
+            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            "HTTP/1.1 200",
+        ),
+    ] {
+        let mut client = H1Client::connect(f.addr).await;
+        // A request first (the first request of a connection with an `Upgrade` keeps the byte
+        // relay): the breaker is full.
+        let (head, body) = client.get("/").await;
+        assert_open(&head, body.as_bytes());
+        client.send(opening.as_bytes()).await;
+        let (head, _) = client.read().await.expect("an answer");
+        assert!(head.starts_with(answer), "{opening}: {head}");
+        tunnels.push(client);
+    }
+    let scrape = f.metrics.encode();
+    assert_eq!(
+        metric(
+            &scrape,
+            "mimic_mesh_requests_total{",
+            &["reason=\"breaker-open\""]
+        ),
+        2.0,
+        "the two probes only: {scrape}"
+    );
+    // The tunnels hold no slot: once the long response ends, a request is served.
+    drop(holder);
+    free_again(f.addr).await;
+    drop(tunnels);
+}
+
+#[tokio::test]
 async fn cbr_27_the_ports_of_a_service_share_one_count_and_two_services_do_not() {
     let _logs = capture_logs();
     let (a, b) = (Pod::http1("a", 800).await, Pod::http1("b", 800).await);
@@ -607,6 +747,33 @@ async fn cbr_28_an_open_breaker_adds_no_try_and_is_counted_and_logged_once_a_sec
             "a breaker-open line names no pod and no tries"
         );
     }
+    assert_eq!(code(held).await, 200);
+}
+
+#[tokio::test]
+async fn cbr_28_a_breaker_open_is_counted_as_a_synthetic_exchange_of_discovery() {
+    let _logs = capture_logs();
+    let pod = Pod::http1("slow", 1500).await;
+    let state = state_with(&[cart(&[pod.addr]).breaker(1, 1024)], |_| {});
+    let discovery = Discovery::start(&DiscoveryConfig::default(), Some("pod-a".into())).unwrap();
+    let f = fixture_mesh(dst(), &state, Some(&discovery)).await;
+    let held = spawn_get(f.addr, "/");
+    until("one request in", || {
+        pod.counts.in_flight.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let mut client = H1Client::connect(f.addr).await;
+    for _ in 0..3 {
+        let (head, body) = client.get("/").await;
+        assert_open(&head, body.as_bytes());
+    }
+    let scrape = f.metrics.encode();
+    assert!(
+        scrape.contains(
+            "mimic_discovery_exchanges_total{direction=\"outbound\",result=\"synthetic\"} 3"
+        ),
+        "{scrape}"
+    );
     assert_eq!(code(held).await, 200);
 }
 

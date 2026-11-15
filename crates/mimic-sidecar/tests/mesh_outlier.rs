@@ -1086,14 +1086,81 @@ async fn cbr_17_a_route_timeout_is_never_ejected() {
     assert!(lines(&logs, "endpoint ejected").await.is_empty());
 }
 
+/// A pod that answers only once it has the whole `content-length` body of a request, and counts
+/// the connections that ended before that (the sidecar cut the request short).
+struct BodyPod {
+    addr: SocketAddr,
+    heads: Arc<AtomicUsize>,
+    cut: Arc<AtomicUsize>,
+}
+
+impl BodyPod {
+    async fn start() -> BodyPod {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (heads, cut) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (counted, ended) = (heads.clone(), cut.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (counted, ended) = (counted.clone(), ended.clone());
+                tokio::spawn(async move {
+                    let mut pending = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    // The body bytes still due before the answer.
+                    let mut due: Option<usize> = None;
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(n) if n > 0 => pending.extend_from_slice(&buf[..n]),
+                            _ => {
+                                if due.is_some() || !pending.is_empty() {
+                                    ended.fetch_add(1, Ordering::SeqCst);
+                                }
+                                return;
+                            }
+                        }
+                        if due.is_none()
+                            && let Some(p) = pending.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            let head = String::from_utf8_lossy(&pending[..p]).to_ascii_lowercase();
+                            pending.drain(..p + 4);
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            due = Some(
+                                head.split("content-length: ")
+                                    .nth(1)
+                                    .and_then(|v| v.split("\r\n").next()?.trim().parse().ok())
+                                    .unwrap_or(0),
+                            );
+                        }
+                        if let Some(n) = due
+                            && pending.len() >= n
+                        {
+                            pending.drain(..n);
+                            due = None;
+                            let answer = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                            if stream.write_all(answer.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        BodyPod { addr, heads, cut }
+    }
+}
+
 #[tokio::test]
 async fn cbr_17_a_request_the_app_abandons_is_never_ejected() {
     let logs = capture_logs();
-    let pod = Pod::http1("ok", 0).await;
+    // The pod answers only with the whole body: an abandoned upload ends in a request that was
+    // written, partly, and got no head, the case `AppLeft` keeps from counting as a `reset`.
+    let pod = BodyPod::start().await;
     let state = state_with(&[cart(&[pod.addr]).outlier(30, 1, 1, 100)], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     for n in 1..=30 {
-        // The head and a part of the body, then the app leaves.
         let mut leaving = TcpStream::connect(f.addr).await.unwrap();
         leaving
             .write_all(
@@ -1102,17 +1169,40 @@ async fn cbr_17_a_request_the_app_abandons_is_never_ejected() {
             .await
             .unwrap();
         for _ in 0..500 {
-            if pod.counts.requests() >= n {
+            if pod.heads.load(Ordering::SeqCst) >= n {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(pod.counts.requests(), n, "the pod got request {n}");
+        assert_eq!(
+            pod.heads.load(Ordering::SeqCst),
+            n,
+            "the pod got request {n}"
+        );
         drop(leaving);
+        // The pod saw the connection cut in the middle of the body.
+        for _ in 0..500 {
+            if pod.cut.load(Ordering::SeqCst) >= n {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            pod.cut.load(Ordering::SeqCst),
+            n,
+            "request {n} was cut mid-body"
+        );
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!f.metrics.encode().contains("mimic_mesh_ejections_total{"));
     assert!(lines(&logs, "endpoint ejected").await.is_empty());
+    // The pod is still a candidate: a whole request is answered by it.
+    let mut client = H1Client::connect(f.addr).await;
+    client
+        .send(b"POST / HTTP/1.1\r\nHost: cart.shop.svc:80\r\ncontent-length: 2\r\n\r\nhi")
+        .await;
+    let (head, body) = client.read().await.expect("an answer");
+    assert!(head.starts_with("HTTP/1.1 200") && body == b"ok", "{head}");
 }
 
 #[tokio::test]

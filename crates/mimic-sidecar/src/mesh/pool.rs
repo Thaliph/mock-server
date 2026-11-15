@@ -124,6 +124,8 @@ async fn dial_wire(
 pub(crate) enum Lease {
     Http1 {
         sender: Option<http1::SendRequest<Attempt>>,
+        /// Set when the connection is closed for being over `max`; read by its driver task.
+        retired: Arc<AtomicBool>,
         pool: Arc<H1Pool>,
         /// The `maxConnections` of the request's Service: a connection is handed back to the
         /// pool only while the pool holds no more than that.
@@ -233,9 +235,14 @@ pub(crate) enum Sent {
 impl Drop for Lease {
     fn drop(&mut self) {
         match self {
-            Lease::Http1 { sender, pool, max } => {
+            Lease::Http1 {
+                sender,
+                retired,
+                pool,
+                max,
+            } => {
                 if let Some(sender) = sender.take() {
-                    pool.give_back(sender, max.load(Ordering::Acquire) as usize);
+                    pool.give_back(sender, retired, max.load(Ordering::Acquire) as usize);
                 }
             }
             Lease::Http2 {
@@ -267,6 +274,7 @@ impl Drop for Slot<'_> {
 
 struct Idle {
     sender: http1::SendRequest<Attempt>,
+    retired: Arc<AtomicBool>,
     since: Instant,
 }
 
@@ -307,7 +315,12 @@ impl H1Pool {
 
     /// A connection comes back from its request. Over `max` (a lowered `maxConnections`) it is
     /// closed instead: nothing busy is ever cut, the connections go as they go idle.
-    fn give_back(&self, sender: http1::SendRequest<Attempt>, max: usize) {
+    fn give_back(
+        &self,
+        sender: http1::SendRequest<Attempt>,
+        retired: &Arc<AtomicBool>,
+        max: usize,
+    ) {
         if self.draining.load(Ordering::Acquire) || sender.is_closed() {
             return;
         }
@@ -318,21 +331,24 @@ impl H1Pool {
                     .then_some(closing + 1)
             });
         if over.is_ok() {
+            // Only the driver of this very connection gives the count back.
+            retired.store(true, Ordering::Release);
             return;
         }
         lock(&self.idle).push(Idle {
             sender,
+            retired: retired.clone(),
             since: Instant::now(),
         });
         self.freed.notify_one();
     }
 
-    fn take_idle(&self) -> Option<http1::SendRequest<Attempt>> {
+    fn take_idle(&self) -> Option<(http1::SendRequest<Attempt>, Arc<AtomicBool>)> {
         let mut idle = lock(&self.idle);
         // The most recently used first: the others age out.
         while let Some(entry) = idle.pop() {
             if !entry.sender.is_closed() && entry.since.elapsed() < self.idle_timeout {
-                return Some(entry.sender);
+                return Some((entry.sender, entry.retired));
             }
         }
         None
@@ -344,17 +360,17 @@ impl H1Pool {
             tokio::pin!(freed);
             freed.as_mut().enable();
             // A reconnect (`fresh`) leaves the healthy idle connections alone.
-            while !fresh && let Some(mut sender) = self.take_idle() {
+            while !fresh && let Some((mut sender, retired)) = self.take_idle() {
                 if let Ok(Ok(())) = tokio::time::timeout(READY_WAIT, sender.ready()).await {
-                    return Ok(self.lease(sender, limit));
+                    return Ok(self.lease(sender, retired, limit));
                 }
             }
             if self.open.fetch_add(1, Ordering::AcqRel) < limit.load(Ordering::Acquire) as usize {
                 // Dropped with the checkout (cancelled while connecting) or on an error, the
                 // guard gives the slot back; the driver task owns it once there is one.
                 let slot = Slot(self);
-                let sender = self.connect(slot).await?;
-                return Ok(self.lease(sender, limit));
+                let (sender, retired) = self.connect(slot).await?;
+                return Ok(self.lease(sender, retired, limit));
             }
             self.open.fetch_sub(1, Ordering::AcqRel);
             freed.await;
@@ -369,18 +385,27 @@ impl H1Pool {
             .await
             .map_err(io::Error::other)?;
         drop(connection);
-        Ok(self.lease(sender, max))
+        Ok(self.lease(sender, Arc::new(AtomicBool::new(false)), max))
     }
 
-    fn lease(self: &Arc<Self>, sender: http1::SendRequest<Attempt>, max: &Limit) -> Lease {
+    fn lease(
+        self: &Arc<Self>,
+        sender: http1::SendRequest<Attempt>,
+        retired: Arc<AtomicBool>,
+        max: &Limit,
+    ) -> Lease {
         Lease::Http1 {
             sender: Some(sender),
+            retired,
             pool: self.clone(),
             max: max.clone(),
         }
     }
 
-    async fn connect(self: &Arc<Self>, slot: Slot<'_>) -> io::Result<http1::SendRequest<Attempt>> {
+    async fn connect(
+        self: &Arc<Self>,
+        slot: Slot<'_>,
+    ) -> io::Result<(http1::SendRequest<Attempt>, Arc<AtomicBool>)> {
         let stream = dial_wire(self.addr, self.connect_timeout, self.origin.as_deref()).await?;
         let (sender, connection) = http1::Builder::new()
             .preserve_header_case(true)
@@ -389,16 +414,23 @@ impl H1Pool {
             .await
             .map_err(io::Error::other)?;
         let pool = self.clone();
+        let retired = Arc::new(AtomicBool::new(false));
+        let flag = retired.clone();
         std::mem::forget(slot);
         tokio::spawn(async move {
             let _ = connection.with_upgrades().await;
-            pool.open.fetch_sub(1, Ordering::AcqRel);
-            let _ = pool
-                .closing
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-            pool.freed.notify_one();
+            pool.ended(flag.load(Ordering::Acquire));
         });
-        Ok(sender)
+        Ok((sender, retired))
+    }
+
+    /// The driver of a connection ended; `retired` when it was closed for being over the limit.
+    fn ended(&self, retired: bool) {
+        self.open.fetch_sub(1, Ordering::AcqRel);
+        if retired {
+            self.closing.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.freed.notify_one();
     }
 
     fn sweep(&self) {
@@ -1054,6 +1086,39 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// An unrelated close (the pod closed a connection) while a connection closed for being over
+    /// the limit has not ended yet leaves the next give-back keeping what the limit allows.
+    #[tokio::test]
+    async fn cbr_31_an_unrelated_close_does_not_make_the_pool_close_one_more() {
+        let (addr, _) = pod(false).await;
+        let pools = Pools::new(Duration::from_secs(60));
+        let limit = Arc::new(AtomicU32::new(4));
+        let lease = async || {
+            pools
+                .checkout(addr, Protocol::Http1, None, None, (TIMEOUT, &limit))
+                .await
+                .unwrap()
+        };
+        let (a, b, c, d) = (lease().await, lease().await, lease().await, lease().await);
+        limit.store(2, Ordering::Release);
+        let pool = match &**pools.pools.lock().unwrap().values().next().unwrap() {
+            Pool::Http1(pool) => pool.clone(),
+            Pool::Http2(_) => unreachable!("an HTTP/1 pool"),
+        };
+        // Nothing yields here: the driver of `a` has not ended when `d` ends.
+        drop(a);
+        assert_eq!(pool.closing.load(Ordering::Acquire), 1, "a is closed");
+        std::mem::forget(d);
+        pool.ended(false);
+        drop(b);
+        drop(c);
+        assert_eq!(
+            pool.idle.lock().unwrap().len(),
+            2,
+            "b and c are the two the limit allows"
+        );
     }
 
     #[tokio::test]
