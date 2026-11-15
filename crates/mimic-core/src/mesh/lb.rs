@@ -5,6 +5,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// How many times [`Endpoints::pick_unejected`] draws again for an ejected endpoint.
+pub const REDRAWS: u32 = 8;
+
 /// The lowest weight of an endpoint in slow start.
 pub const MIN_WEIGHT: f64 = 0.1;
 
@@ -107,6 +110,48 @@ impl Endpoints {
             second += 1;
         }
         Some(self.better(first, second, now, &in_flight))
+    }
+
+    /// [`Endpoints::pick`] that never returns an endpoint `ejected` accepts (spec §7.9 "Outlier
+    /// detection"): the same two draws, so with nothing ejected the choice is `pick`'s, draw
+    /// for draw. A drawn endpoint that is ejected is drawn again (at most [`REDRAWS`] times
+    /// for the pair, which keeps the pick O(1) while few are ejected); past that the choice is
+    /// made among the live ones as [`Endpoints::pick_where`] does (O(n)). `None` with a
+    /// non-empty set means every endpoint is ejected.
+    pub fn pick_unejected(
+        &self,
+        now: Duration,
+        in_flight: impl Fn(usize) -> u32,
+        draw: &mut impl FnMut(usize) -> usize,
+        ejected: impl Fn(SocketAddr) -> bool,
+    ) -> Option<usize> {
+        let n = self.members.len();
+        let live = |i: usize| self.members.get(i).is_some_and(|m| !ejected(m.addr));
+        match n {
+            0 => return None,
+            1 => return live(0).then_some(0),
+            _ => {}
+        }
+        let mut redraws = 0;
+        let mut live_draw = |m: usize, past: Option<usize>| loop {
+            let mut i = draw(m).min(m - 1);
+            if past.is_some_and(|first| i >= first) {
+                i += 1;
+            }
+            if live(i) {
+                return Some(i);
+            }
+            redraws += 1;
+            if redraws > REDRAWS {
+                return None;
+            }
+        };
+        let pair = live_draw(n, None)
+            .and_then(|first| live_draw(n - 1, Some(first)).map(|second| (first, second)));
+        match pair {
+            Some((first, second)) => Some(self.better(first, second, now, &in_flight)),
+            None => self.pick_where(now, in_flight, draw, |a| !ejected(a)),
+        }
     }
 
     /// Of two endpoints, the one with the lower `(in_flight + 1) / weight`, `first` on a tie.

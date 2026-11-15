@@ -428,3 +428,43 @@ The mirror's cost over the route without mirror falls from +0.96 / +1.37 ms to +
 above the 0.2 ms budget of RTE-94 (http1 by 0.06 ms, h2c by 0.39 ms). The copy's response no longer lands with the
 primary's, what remains is the copy's own work on the same workers right after the head (the sidecar uses 0.07 to
 0.09 core more) and the run-to-run noise of the probe (routing alone moves between -0.04 and +0.13 ms).
+
+## M4: outlier detection and circuit breaker (#451, CBR-34)
+
+Backend of 3 pods, mode discovery, 200 rps, 30 s; JSON `2026-11-15-mesh-lb.json`, `2026-11-15-mesh-eject.json`
+(8 connections, http1 and h2c), `2026-11-15-mesh-breaker.json` (32 connections, http1 and h2c, a later run of the same session). Load average below 4 at
+the start. The first run of this section (8 connections for both setups) is replaced: its `mesh-eject` budget
+(5 requests per ejection) could not hold with concurrent load, and its `mesh-breaker` never exceeded `maxRequests`
+(4 breaker-open lines). CBR-34 now bounds `mesh-eject` by `consecutiveFailures + connections - 1` per ejection and
+runs `mesh-breaker` with 32 connections and at least 10 % breaker-open answers. fortio runs `mesh-breaker` with
+`-allow-initial-errors`, as its warm-up requests (one per connection) are already refused.
+
+| Date | Setup | Protocol | Rate (rps) | Measured (rps) | p50 (ms) | p90 (ms) | p99 (ms) | p99.9 (ms) | Errors | Caller CPU (cores) | Callee CPU (cores) | Caller RSS (MiB) | Callee RSS (MiB) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-15 | mesh-lb | http1 | 200 | 199.93 | 8.53 | 9.57 | 10.95 | 15.83 | 0 | 0.214 | 0.076 | 15.9 | 14.3 |
+| 2026-11-15 | mesh-lb | h2c | 200 | 199.92 | 10.03 | 11.36 | 13.98 | 18 | 0 | 0.272 | 0.098 | 17 | 14.8 |
+| 2026-11-15 | mesh-eject | http1 | 200 | 199.93 | 8.46 | 9.47 | 11.62 | 14.8 | 0 | 0.21 | 0.088 | 16 | 14.1 |
+| 2026-11-15 | mesh-eject | h2c | 200 | 199.92 | 9.78 | 10.93 | 13.29 | 16.46 | 0 | 0.262 | 0.123 | 17 | 14.7 |
+| 2026-11-15 | mesh-breaker | http1 | 200 | 199.64 | 5.71 | 56.01 | 59.61 | 59.97 | 4488 | 0.17 | 0.021 | 18.5 | 14.2 |
+| 2026-11-15 | mesh-breaker | h2c | 200 | 199.58 | 3.59 | 56.15 | 59.84 | 66.13 | 4488 | 0.137 | 0.027 | 18.9 | 14.4 |
+
+| Check | Result | Budget | Verdict |
+|---|---|---|---|
+| `mesh-eject`: error rate | 0 % (0 of 12000) | 0 % | met |
+| `mesh-eject`: requests to the resetting pod | 19 for 3 ejections (6.33 each) | at most 5 + 8 - 1 = 12 each | met |
+| `mesh-breaker`: breaker-open answers | 9024 of 11968 requests (75.4 %) | at least 10 % | met |
+| `mesh-breaker`: p99 `duration_ms` of the breaker-open lines | 0 ms (8935 at 0 ms, 70 at 1, 14 at 2, 5 at 3; largest 3) | at most 1 ms | met |
+| `mesh-lb` p50 against M3 | see below | within 0.2 ms | met against the same-day M3 runs |
+
+`mesh-breaker` errors are the 503 answers of the breaker (per protocol 1496 answers 200 and 4488 answers 503; the access
+lines count 4512, the difference being the warm-up requests, which fortio does not count). Its p50 is that of the
+accepted requests and the refused ones together. CBR-34 first bounded the largest `duration_ms` of a breaker-open line
+by 1 ms; the first run had one line of 4 ms, this one 19 of 9024 lines (0.21 %) above 1 ms, the largest 3 ms. A single
+line can wait on a worker that 32 connections keep busy, and `duration_ms` is whole milliseconds, so CBR-34 now bounds
+the p99 and records the counts per millisecond and the largest (decision on #451).
+
+`mesh-lb` p50 (no failures), 200 rps: 8.53 ms (http1) and 10.03 ms (h2c). The M3 runs of the same day, which route
+the same way with no mirror: 8.42 to 8.55 ms and 10.02 to 10.15 ms (the "no route" and "route, no mirror" rows
+above), so +0.0 to +0.11 ms and -0.12 to +0.01 ms: within 0.2 ms. Against the runs of the day before the spread of
+the machine is larger than the budget (M1 `mesh-lb` 8.19 / 9.69 ms: +0.34 / +0.34 ms; M2 8.74 / 10.54 ms: -0.21 /
+-0.51 ms), so the comparison is meaningful only within a session.

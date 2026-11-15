@@ -62,6 +62,8 @@ pub(super) fn config(ns: &str, name: &str, created: i64, dests: &[(&str, &str)])
         slow_start: None,
         retries: None,
         retry_budget: None,
+        outlier_detection: None,
+        circuit_breaker: None,
     }
 }
 

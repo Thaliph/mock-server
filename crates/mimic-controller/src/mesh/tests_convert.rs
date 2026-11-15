@@ -4,7 +4,8 @@ use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::api::DynamicObject;
 use mimic_core::mesh::input::{
-    Destination, GrantFrom, GrantTo, RetryBudgetSpec, Target, TargetKind, TargetPort,
+    BreakerSpec, Destination, GrantFrom, GrantTo, OutlierSpec, RetryBudgetSpec, Target, TargetKind,
+    TargetPort,
 };
 use mimic_core::mesh::policy::validate;
 use serde_json::json;
@@ -272,5 +273,81 @@ fn rty_46_a_window_that_does_not_parse_makes_the_config_invalid_and_never_panics
     let c = service_config(json!({"targetRefs": target, "retries": "3"}));
     assert!(validate(&c).is_err());
     let c = service_config(json!({"targetRefs": target, "retries": -1}));
+    assert!(validate(&c).is_err());
+}
+
+#[test]
+fn cbr_03_outlier_detection_and_the_circuit_breaker_convert_and_absent_fields_are_none() {
+    let target = json!([{"group": "", "kind": "Service", "name": "cart"}]);
+    let c = service_config(json!({
+        "targetRefs": target,
+        "outlierDetection": {"consecutiveFailures": 3, "consecutive5xx": 0,
+                             "baseEjectionTime": "30s", "maxEjectionPercent": 100},
+        "circuitBreaker": {"maxRequests": 8, "maxConnections": 4}
+    }));
+    assert_eq!(
+        c.outlier_detection,
+        Some(OutlierSpec {
+            consecutive_failures: Some(3),
+            consecutive_5xx: Some(0),
+            base_ejection_seconds: Some(30),
+            max_ejection_percent: Some(100)
+        })
+    );
+    assert_eq!(
+        c.circuit_breaker,
+        Some(BreakerSpec {
+            max_requests: Some(8),
+            max_connections: Some(4)
+        })
+    );
+    assert!(validate(&c).is_ok());
+    let c = service_config(json!({
+        "targetRefs": target, "outlierDetection": {"baseEjectionTime": "300s"},
+        "circuitBreaker": {}
+    }));
+    assert_eq!(
+        c.outlier_detection,
+        Some(OutlierSpec {
+            consecutive_failures: None,
+            consecutive_5xx: None,
+            base_ejection_seconds: Some(300),
+            max_ejection_percent: None
+        })
+    );
+    assert_eq!(
+        c.circuit_breaker,
+        Some(BreakerSpec {
+            max_requests: None,
+            max_connections: None
+        })
+    );
+    let c = service_config(json!({"targetRefs": target}));
+    assert_eq!((c.outlier_detection, c.circuit_breaker), (None, None));
+}
+
+#[test]
+fn cbr_03_a_base_ejection_time_that_does_not_parse_makes_the_config_invalid_and_never_panics() {
+    let target = json!([{"group": "", "kind": "Service", "name": "cart"}]);
+    for time in [
+        json!("30"),
+        json!("1m"),
+        json!("-1s"),
+        json!(30),
+        json!("soon"),
+        json!("1e1s"),
+        json!(""),
+    ] {
+        let c = service_config(
+            json!({"targetRefs": target, "outlierDetection": {"baseEjectionTime": time}}),
+        );
+        let err = validate(&c).expect_err("must not validate");
+        assert!(err.contains("baseEjectionTime"), "{time}: {err}");
+    }
+    let c = service_config(json!({"targetRefs": target, "circuitBreaker": {"maxRequests": "8"}}));
+    assert!(validate(&c).is_err());
+    let c = service_config(
+        json!({"targetRefs": target, "outlierDetection": {"consecutiveFailures": -1}}),
+    );
     assert!(validate(&c).is_err());
 }

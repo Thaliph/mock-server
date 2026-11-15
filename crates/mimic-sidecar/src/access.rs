@@ -86,6 +86,8 @@ pub struct Exchange {
     pub timeout: Option<&'static str>,
     /// Routed requests only (spec §7.9 "Mirrors"): a copy was sent to a mirror.
     pub mirrored: bool,
+    /// Mesh-routed requests the sidecar answered itself (spec §4.1): the `x-mimic-error` it wrote.
+    pub reason: Option<&'static str>,
 }
 
 /// One finished opaque or TLS connection.
@@ -154,6 +156,7 @@ pub fn exchange(e: &Exchange) {
         rule = e.rule,
         timeout = e.timeout,
         mirrored = e.mirrored.then_some(true),
+        reason = e.reason,
         "http exchange"
     );
 }

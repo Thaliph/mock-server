@@ -24,6 +24,7 @@ use hyper::{Method, Request, Response, StatusCode, server};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use mimic_core::mesh::head::{Stop, leaves};
 use mimic_core::mesh::mirror::{self, Candidate};
+use mimic_core::mesh::outlier::Outcome as Counted;
 use mimic_core::mesh::retry::{
     Decision, Failure, Outcome, Planner, Refusal, Verdict, classify, delay, trusted,
 };
@@ -42,7 +43,7 @@ use super::gate::{Gate, Progress};
 use super::metrics::{Call, INVALID_BACKEND, NO_BACKEND};
 use super::pool::{self, Lease, Protocol, Sent};
 use super::replay::{Attempt, Held, Source, Whole};
-use super::router::{Backend, InFlight, Plan, Routed, Slot};
+use super::router::{Backend, InFlight, Permit, Plan, Routed, Slot};
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, RespBody, Tracker};
 use crate::mock::{self, Mock};
@@ -105,6 +106,8 @@ impl Serving {
 struct Hold {
     _in_flight: Option<InFlight>,
     lease: Lease,
+    /// The slot of the Service's breaker, held to the response's last byte.
+    _permit: Option<Permit>,
 }
 
 /// A route deadline armed in the test hook's count while it lives.
@@ -507,9 +510,13 @@ impl Serving {
         };
         let connected = bounds
             .within(
-                router
-                    .pools
-                    .checkout(upstream, protocol, self.origin.as_ref(), None, timeout),
+                router.pools.checkout(
+                    upstream,
+                    protocol,
+                    self.origin.as_ref(),
+                    None,
+                    (timeout, &backend.retry.max_connections()),
+                ),
                 timeout::call_deadline(bounds.timeouts),
             )
             .await;
@@ -564,7 +571,7 @@ impl Serving {
                         protocol,
                         self.origin.as_ref(),
                         Some(&lease),
-                        timeout,
+                        (timeout, &backend.retry.max_connections()),
                     ),
                     deadline,
                 )
@@ -748,7 +755,7 @@ impl Serving {
                 "unsupported",
                 began,
             );
-            tracker.synthetic(StatusCode::NOT_IMPLEMENTED.as_u16());
+            tracker.synthetic(StatusCode::NOT_IMPLEMENTED.as_u16(), "unsupported");
             return Ok(answer(StatusCode::NOT_IMPLEMENTED, "unsupported", http1));
         }
         let mut req = req;
@@ -773,6 +780,8 @@ impl Serving {
         // The copies wait for it: it opens at the primary's response head, or when the call
         // ends without one (spec §7.9 "Mirrors", "Start").
         let mut gate = None;
+        // The breaker's slot, held from the first try to the response's end (spec §7.9).
+        let mut permit: Option<Permit> = None;
         if let Some(routed) = &routed {
             match self.select(routed, &head) {
                 Selected::Rule {
@@ -782,6 +791,12 @@ impl Serving {
                 } => {
                     route = &view.name;
                     tracker.matched(route, rule);
+                    match backend.admit(router) {
+                        Ok(taken) => permit = Some(taken),
+                        Err(()) => {
+                            return Ok(self.open(tracker, route, &backend, began));
+                        }
+                    }
                     let filters = view.rules[rule].filters.as_ref();
                     let mirrors = filters.map_or(&[][..], |f| &f.mirrors[..]);
                     // A mirror written before the request modifier gets the app's fields.
@@ -818,9 +833,14 @@ impl Serving {
                         tracker.matched(route, rule);
                     }
                     self.count(route, backend, status, reason, began);
-                    tracker.synthetic(status.as_u16());
+                    tracker.synthetic(status.as_u16(), reason);
                     return Ok(answer(status, reason, false));
                 }
+            }
+        } else if !direct {
+            match drawn.admit(router) {
+                Ok(taken) => permit = Some(taken),
+                Err(()) => return Ok(self.open(tracker, route, &drawn, began)),
             }
         }
         let backend = &drawn.label;
@@ -839,6 +859,11 @@ impl Serving {
             let pick = match next {
                 Plan::Pod(pick) => Some(pick),
                 Plan::Original => None,
+                Plan::AllEjected => {
+                    // Every endpoint was ejected between the check and the plan.
+                    drawn.opened(router, "all_ejected", 0);
+                    return Ok(self.open(tracker, route, &drawn, began));
+                }
                 Plan::Stop => {
                     self.count(
                         route,
@@ -847,7 +872,7 @@ impl Serving {
                         "no-endpoint",
                         began,
                     );
-                    tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                    tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "no-endpoint");
                     return Ok(answer(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "no-endpoint",
@@ -888,6 +913,13 @@ impl Serving {
                     let verdict = classify(failure, head.method.as_str(), source.held(), true);
                     router.metrics.attempt(backend, verdict.outcome);
                     if let Some(pick) = &conn.pick {
+                        let counted = match refusal {
+                            Some(Refusal::Overloaded) => Counted::Overloaded,
+                            Some(Refusal::QueueTimeout) => Counted::QueueTimeout,
+                            Some(Refusal::AppRefused) => Counted::AppRefused,
+                            None => Counted::Head(status.as_u16()),
+                        };
+                        drawn.record(router, pick.endpoint().addr, counted);
                         let class = status_class(status.as_u16());
                         router
                             .metrics
@@ -897,7 +929,9 @@ impl Serving {
                     match self.decide(&drawn, direct, verdict, &planner) {
                         Decision::Retry => {
                             match self.plan(&drawn, original, direct, tries, &mut planner) {
-                                Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                                Plan::Stop | Plan::AllEjected => {
+                                    router.metrics.skipped(backend, "exhausted")
+                                }
                                 // The try in flight stops reading the app's body now, so that
                                 // what the next try replays is what was read.
                                 retry if source.detach() => {
@@ -965,6 +999,7 @@ impl Serving {
                         hold: Some(Hold {
                             _in_flight: pick,
                             lease,
+                            _permit: permit.take(),
                         }),
                         cutoff: bounds.cutoff(deadline),
                         done: None,
@@ -999,6 +1034,20 @@ impl Serving {
                 } => {
                     let verdict = classify(failure, head.method.as_str(), source.held(), written);
                     router.metrics.attempt(backend, verdict.outcome);
+                    if let Some(pick) = &pick {
+                        let counted = match failure {
+                            Failure::Connect => Counted::ConnectFailed,
+                            Failure::RefusedStream => Counted::RefusedStream,
+                            Failure::Response => Counted::InvalidResponse,
+                            // The app leaving is not the pod's doing.
+                            Failure::Reset if source.failed() => Counted::AppLeft,
+                            Failure::Reset => Counted::Reset,
+                            Failure::Refusal(_) | Failure::AfterHead | Failure::Timeout => {
+                                Counted::AfterHead
+                            }
+                        };
+                        drawn.record(router, pick.endpoint().addr, counted);
+                    }
                     if let (true, Some(pick)) = (written, &pick) {
                         let label = &pick.endpoint().label;
                         router.metrics.endpoint_try(backend, label, "none");
@@ -1007,7 +1056,9 @@ impl Serving {
                     match self.decide(&drawn, direct, verdict, &planner) {
                         Decision::Retry => {
                             match self.plan(&drawn, original, direct, tries, &mut planner) {
-                                Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                                Plan::Stop | Plan::AllEjected => {
+                                    router.metrics.skipped(backend, "exhausted")
+                                }
                                 retry if source.detach() => {
                                     drop(pick);
                                     again = Some(verdict.outcome);
@@ -1023,6 +1074,27 @@ impl Serving {
                 }
             }
         }
+    }
+
+    /// The breaker is open: the `503` `breaker-open` of `backend`, counted and logged, with no
+    /// try and nothing asked of the budget (spec §7.9 "Circuit breaker").
+    fn open(
+        &self,
+        mut tracker: Tracker,
+        route: &str,
+        backend: &Backend,
+        began: Instant,
+    ) -> Response<MeshBody> {
+        self.count(
+            route,
+            &backend.label,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "breaker-open",
+            began,
+        );
+        tracker.backend(&backend.label);
+        tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "breaker-open");
+        answer(StatusCode::SERVICE_UNAVAILABLE, "breaker-open", false)
     }
 
     /// The call ends on a route timeout before the response head: the `504`, counted and
@@ -1228,7 +1300,7 @@ impl Serving {
                     "connect-failed",
                     began,
                 );
-                tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16(), "connect-failed");
                 Ok(answer(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "connect-failed",
@@ -1244,7 +1316,7 @@ impl Serving {
                     "invalid-response",
                     began,
                 );
-                tracker.synthetic(StatusCode::BAD_GATEWAY.as_u16());
+                tracker.synthetic(StatusCode::BAD_GATEWAY.as_u16(), "invalid-response");
                 Ok(answer(StatusCode::BAD_GATEWAY, "invalid-response", false))
             }
             _ => {
@@ -1429,6 +1501,7 @@ impl Copy {
         let Plan::Pod(pick) = self.backend.plan(router, &mut Planner::new(0)) else {
             return "error";
         };
+        let backend = &self.backend;
         let upstream = pick.endpoint().addr;
         let mut lease: Option<Lease> = None;
         // An unwritten request, because the pod had closed the connection, goes once more on a
@@ -1441,7 +1514,10 @@ impl Copy {
                     self.protocol,
                     self.origin.as_ref(),
                     lease.as_ref(),
-                    router.connect_timeout,
+                    (
+                        router.connect_timeout,
+                        &self.backend.retry.max_connections(),
+                    ),
                 ),
             )
             .await;
@@ -1453,6 +1529,7 @@ impl Copy {
                 Ok(Err(e)) => {
                     tracing::debug!(%upstream, error = %e, "connect to the mirror's pod failed");
                     router.failed(&pick);
+                    backend.record(router, upstream, Counted::ConnectFailed);
                     return "error";
                 }
                 Err(_) => return "error",
@@ -1464,11 +1541,25 @@ impl Copy {
                     return "error";
                 }
                 Ok(Sent::Response(response)) => {
+                    // A copy's status is never read: a head says the pod answers.
+                    backend.record(router, upstream, Counted::Head(200));
                     lease = Some(connected);
                     break response;
                 }
                 Ok(Sent::Unsent) if lease.is_none() => lease = Some(connected),
-                Ok(Sent::Unsent | Sent::Failed(_)) => return "error",
+                Ok(Sent::Unsent) => {
+                    backend.record(router, upstream, Counted::ConnectFailed);
+                    return "error";
+                }
+                Ok(Sent::Failed(e)) => {
+                    let counted = match pool::failure(&e, connected.goaway()) {
+                        Failure::RefusedStream => Counted::RefusedStream,
+                        Failure::Response => Counted::InvalidResponse,
+                        _ => Counted::Reset,
+                    };
+                    backend.record(router, upstream, counted);
+                    return "error";
+                }
             }
         };
         // The answer is read and dropped as it comes; one that is not over at the deadline

@@ -93,6 +93,8 @@ pub fn cfg(ns: &str, name: &str, created: i64, targets: &[(TargetKind, &str)]) -
         slow_start: None,
         retries: None,
         retry_budget: None,
+        outlier_detection: None,
+        circuit_breaker: None,
     }
 }
 

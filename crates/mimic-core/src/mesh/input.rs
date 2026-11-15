@@ -104,6 +104,28 @@ pub struct Config {
     /// `spec.retryBudget`; `None` when the object has none (a present one without fields is
     /// `Some` of all `None`).
     pub retry_budget: Option<RetryBudgetSpec>,
+    /// `spec.outlierDetection` (a Service target only, #451).
+    pub outlier_detection: Option<OutlierSpec>,
+    /// `spec.circuitBreaker` (a Service target only, #451).
+    pub circuit_breaker: Option<BreakerSpec>,
+}
+
+/// `spec.outlierDetection`; `None` is a field the object does not set. A `baseEjectionTime`
+/// the adapter cannot read arrives as 0, out of bounds, so that `validate` refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlierSpec {
+    pub consecutive_failures: Option<u32>,
+    pub consecutive_5xx: Option<u32>,
+    /// `baseEjectionTime` in seconds.
+    pub base_ejection_seconds: Option<u32>,
+    pub max_ejection_percent: Option<u32>,
+}
+
+/// `spec.circuitBreaker`; `None` is a field the object does not set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakerSpec {
+    pub max_requests: Option<u32>,
+    pub max_connections: Option<u32>,
 }
 
 /// `spec.retryBudget`; `None` is a field the object does not set. A value the adapter cannot

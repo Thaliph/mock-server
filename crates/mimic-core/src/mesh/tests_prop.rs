@@ -120,6 +120,8 @@ fn config() -> impl Strategy<Value = Config> {
                 slow_start,
                 retries: None,
                 retry_budget: None,
+                outlier_detection: None,
+                circuit_breaker: None,
             },
         )
 }

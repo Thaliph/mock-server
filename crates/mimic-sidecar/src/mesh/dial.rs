@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use mimic_core::mesh::outlier::Outcome as Counted;
 use mimic_core::mesh::retry::{Decision, Failure, Outcome, Planner, classify};
 use tokio::net::TcpStream;
 
@@ -113,6 +114,12 @@ impl MeshState {
                 Plan::Original => None,
                 // A backend without an endpoint goes to the original destination.
                 Plan::Stop if tries == 0 => None,
+                // Every pod is ejected: the connection is closed, never sent to the ClusterIP.
+                Plan::AllEjected => {
+                    return Err(
+                        last.unwrap_or_else(|| io::Error::other("every endpoint is ejected"))
+                    );
+                }
                 Plan::Stop => {
                     return Err(last.unwrap_or_else(|| io::Error::other("no try left")));
                 }
@@ -137,6 +144,7 @@ impl MeshState {
                     router.metrics.attempt(&backend.label, Outcome::Ok);
                     if let Some(pick) = &pick {
                         router.succeeded(pick);
+                        backend.record(router, upstream, Counted::Connected);
                     }
                     return Ok(Dialed {
                         stream,
@@ -152,6 +160,7 @@ impl MeshState {
                         .attempt(&backend.label, Outcome::ConnectFailed);
                     if let Some(pick) = &pick {
                         router.failed(pick);
+                        backend.record(router, upstream, Counted::ConnectFailed);
                     }
                     planner.failed(Outcome::ConnectFailed);
                     retry = true;

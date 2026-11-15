@@ -161,6 +161,50 @@ spec:
                   x-kubernetes-validations:
                     - rule: "!has(self.window) || (int(self.window.replace('s', '')) >= 1 && int(self.window.replace('s', '')) <= 60)"
                       message: "retryBudget.window is 1s to 60s"
+                outlierDetection:
+                  description: >-
+                    Passive outlier detection of the endpoints of the Service, per caller pod (spec §7.9).
+                    Each absent field takes its default. Service targets only.
+                  type: object
+                  properties:
+                    consecutiveFailures:
+                      description: Proxy-level failures in a row that eject an endpoint, 1 to 100. Default 5.
+                      type: integer
+                      minimum: 1
+                      maximum: 100
+                    consecutive5xx:
+                      description: 5xx responses in a row that eject an endpoint, 0 to 100; `0` turns it off. Default 0.
+                      type: integer
+                      minimum: 0
+                      maximum: 100
+                    baseEjectionTime:
+                      description: Time of the first ejection of an endpoint, `<n>s`, 1s to 300s; doubles for each next one. Default 30s.
+                      type: string
+                      pattern: '^[0-9]{1,3}s$'
+                    maxEjectionPercent:
+                      description: Share of the endpoints that may be ejected at once, rounded down, 0 to 100; `0` turns ejection off. Default 50.
+                      type: integer
+                      minimum: 0
+                      maximum: 100
+                  x-kubernetes-validations:
+                    - rule: "!has(self.baseEjectionTime) || (int(self.baseEjectionTime.replace('s', '')) >= 1 && int(self.baseEjectionTime.replace('s', '')) <= 300)"
+                      message: "outlierDetection.baseEjectionTime is 1s to 300s"
+                circuitBreaker:
+                  description: >-
+                    Limits per caller pod and Service (spec §7.9). Each absent field takes its default. Service
+                    targets only.
+                  type: object
+                  properties:
+                    maxRequests:
+                      description: Requests in flight above which new ones are answered 503 breaker-open, 1 to 100000. Default 1024.
+                      type: integer
+                      minimum: 1
+                      maximum: 100000
+                    maxConnections:
+                      description: HTTP/1 connections per pod pool, 1 to 100000. Default 1024.
+                      type: integer
+                      minimum: 1
+                      maximum: 100000
               x-kubernetes-validations:
                 - rule: "!has(self.destinations) || self.targetRefs.exists(t, t.kind == 'Deployment')"
                   message: "destinations fit a Deployment target only"
@@ -172,3 +216,7 @@ spec:
                   message: "retries fit a Service target only"
                 - rule: "!has(self.retryBudget) || self.targetRefs.exists(t, t.kind == 'Service')"
                   message: "retryBudget fits a Service target only"
+                - rule: "!has(self.outlierDetection) || self.targetRefs.exists(t, t.kind == 'Service')"
+                  message: "outlierDetection fits a Service target only"
+                - rule: "!has(self.circuitBreaker) || self.targetRefs.exists(t, t.kind == 'Service')"
+                  message: "circuitBreaker fits a Service target only"

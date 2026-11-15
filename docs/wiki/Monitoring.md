@@ -67,7 +67,7 @@ minutes later.
 
 | Metric (sidecar) | Type | Labels |
 |---|---|---|
-| `mimic_mesh_requests_total` | counter, one per mesh-routed request | `service`, `route` (the matched route `<namespace>/<name>`, `none` without a match; at most 256 distinct values, the next ones are `other`, and the series of a route that left the view go 5 minutes later), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, among them `timeout` (a route timeout expired before the response head, [Mesh](Mesh#timeouts)), `no-route` (no rule of the port's routes matched), `no-backend` (every weight of the rule is 0) and `invalid-backend` (the drawn backend is not valid), or that of a trusted refusal passed to the app) |
+| `mimic_mesh_requests_total` | counter, one per mesh-routed request | `service`, `route` (the matched route `<namespace>/<name>`, `none` without a match; at most 256 distinct values, the next ones are `other`, and the series of a route that left the view go 5 minutes later), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, among them `timeout` (a route timeout expired before the response head, [Mesh](Mesh#timeouts)), `no-route` (no rule of the port's routes matched), `no-backend` (every weight of the rule is 0) and `invalid-backend` (the drawn backend is not valid), `breaker-open` (the circuit breaker answered, [Mesh](Mesh#circuit-breaker)), or that of a trusted refusal passed to the app) |
 | `mimic_mesh_request_duration_seconds` | histogram, until the response head, spanning every try | `service`, `backend`, `status_class` |
 | `mimic_mesh_endpoint_requests_total` | counter, each try written to a pod | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
 | `mimic_mesh_endpoint_in_flight` | gauge, per pod | `backend`, `endpoint` |
@@ -79,6 +79,8 @@ minutes later.
 | `mimic_mesh_retries_skipped_total` | counter, failures of a retried kind that were not retried | `backend`, `reason` (`exhausted`: no try left; `method`: a `reset` of a method that is not idempotent; `buffer`: the body was not held) |
 | `mimic_mesh_retry_buffer_bytes` | gauge, request body bytes held for replay, at most `MIMIC_MESH_RETRY_BUFFER_TOTAL` | none |
 | `mimic_mesh_mirrored_total` | counter, one per drawn mirror of a routed request ([Mesh](Mesh#mirroring)); the series appears at the first copy | `backend` (the mirror Service port, bounded by the view), `result` (`sent`: a response head came back, any status; `error`: none did, or the deadline passed; `skipped_body`: the body did not fit the replay buffer or did not end in time; `skipped_limit`: no free slot, 256 per mirror Service port and 1024 per sidecar) |
+| `mimic_mesh_ejections_total` | counter, one per ejection of a pod by the caller's sidecar ([Mesh](Mesh#outlier-detection)); the series appears at the first ejection | `backend`, `reason` (`consecutive_failures`, `consecutive_5xx`) |
+| `mimic_mesh_ejected_endpoints` | gauge, pods of the Service port ejected now, updated every second and at each ejection; 0 for every Service port of the view | `backend` |
 | `mimic_mesh_stripped_headers_total` | counter, `x-mimic-*` fields removed from app responses by the inbound side | none |
 | `mimic_mesh_inbound_refusals_total` | counter, inbound connections answered `503` `connect-failed` because the app refused the connection (cleartext HTTP/1 and `h2c`) | none |
 | `mimic_mesh_unframed_closes_total` | counter, inbound connections closed because the app sent a response the sidecar cannot frame while the fields are removed | none |
@@ -97,6 +99,11 @@ minutes later.
 
 Mirrors: `rate(mimic_mesh_mirrored_total{result!="sent"}[5m])` by `result` shows copies that were lost; `skipped_body`
 and `skipped_limit` rising are the bounds of [Mesh](Mesh#mirroring) at work, `error` is the mirror Service failing.
+
+Outlier detection and the breaker: `mimic_mesh_ejected_endpoints` above 0 for a Service port is a pod the caller's
+sidecar avoids; `rate(mimic_mesh_ejections_total[10m])` by `reason` shows how often (an ejection time doubles on each
+repeat, so a flapping pod shows as a slow rate). `rate(mimic_mesh_requests_total{reason="breaker-open"}[5m])` is the
+requests the breaker refused ([Troubleshooting](Troubleshooting#mesh)).
 
 A retry rate to watch: `rate(mimic_mesh_retries_total[5m])` by `reason`; `mimic_mesh_retries_skipped_total`
 with `reason="exhausted"` rising means requests ran out of tries; `mimic_mesh_retry_budget_exhausted_total`

@@ -62,6 +62,8 @@ fn cluster(services: usize, endpoints_each: usize) -> Snapshot {
         slow_start: Some(10),
         retries: None,
         retry_budget: None,
+        outlier_detection: None,
+        circuit_breaker: None,
     });
     s
 }

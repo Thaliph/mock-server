@@ -599,3 +599,90 @@ fn rte_62_from_json_refuses_a_malformed_timeout_and_an_unknown_field() {
         }),
     );
 }
+
+#[test]
+fn cbr_02_both_objects_read_back_and_an_unknown_field_is_refused_in_either() {
+    let b = rich();
+    let back = read(&b.json).expect("reads back");
+    let p = &back.services["shop/cart"].policy;
+    assert_eq!(p.outlier_detection.consecutive_failures, 5);
+    assert_eq!(p.circuit_breaker.max_requests, 1024);
+    for (from, to) in [
+        (r#""circuitBreaker":{"#, r#""circuitBreaker":{"extra":1,"#),
+        (
+            r#""outlierDetection":{"#,
+            r#""outlierDetection":{"extra":1,"#,
+        ),
+    ] {
+        assert!(b.json.contains(from), "{from}");
+        assert!(read(&b.json.replacen(from, to, 1)).is_err(), "{from}");
+    }
+}
+
+#[test]
+fn cbr_02_a_missing_object_or_field_is_refused() {
+    let json = rich().json;
+    let without = |from: &str| {
+        assert!(json.contains(from), "{from}");
+        assert!(read(&json.replacen(from, "", 1)).is_err(), "{from}");
+    };
+    without(r#""circuitBreaker":{"maxConnections":1024,"maxRequests":1024},"#);
+    without(
+        r#""outlierDetection":{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50},"#,
+    );
+    without(r#""maxConnections":1024,"#);
+    without(r#","maxRequests":1024"#);
+    without(r#""baseEjectionSeconds":30,"#);
+    without(r#""consecutive5xx":0,"#);
+    without(r#""consecutiveFailures":5,"#);
+    without(r#","maxEjectionPercent":50"#);
+}
+
+#[test]
+fn cbr_02_a_value_outside_the_bounds_is_refused() {
+    let json = rich().json;
+    let bad = |from: &str, to: &str| {
+        assert!(json.contains(from), "{from}");
+        assert!(read(&json.replacen(from, to, 1)).is_err(), "{to}");
+    };
+    let good = |from: &str, to: &str| {
+        assert!(read(&json.replacen(from, to, 1)).is_ok(), "{to}");
+    };
+    bad(r#""consecutiveFailures":5"#, r#""consecutiveFailures":0"#);
+    bad(r#""consecutiveFailures":5"#, r#""consecutiveFailures":101"#);
+    bad(r#""consecutive5xx":0"#, r#""consecutive5xx":101"#);
+    bad(r#""baseEjectionSeconds":30"#, r#""baseEjectionSeconds":0"#);
+    bad(
+        r#""baseEjectionSeconds":30"#,
+        r#""baseEjectionSeconds":301"#,
+    );
+    bad(r#""maxEjectionPercent":50"#, r#""maxEjectionPercent":101"#);
+    bad(r#""maxRequests":1024"#, r#""maxRequests":0"#);
+    bad(r#""maxRequests":1024"#, r#""maxRequests":100001"#);
+    bad(r#""maxConnections":1024"#, r#""maxConnections":0"#);
+    bad(r#""maxConnections":1024"#, r#""maxConnections":100001"#);
+    bad(r#""maxRequests":1024"#, r#""maxRequests":-1"#);
+    good(r#""consecutiveFailures":5"#, r#""consecutiveFailures":100"#);
+    good(r#""consecutive5xx":0"#, r#""consecutive5xx":100"#);
+    good(
+        r#""baseEjectionSeconds":30"#,
+        r#""baseEjectionSeconds":300"#,
+    );
+    good(r#""maxEjectionPercent":50"#, r#""maxEjectionPercent":0"#);
+    good(r#""maxEjectionPercent":50"#, r#""maxEjectionPercent":100"#);
+    good(r#""maxRequests":1024"#, r#""maxRequests":100000"#);
+    good(r#""maxConnections":1024"#, r#""maxConnections":1"#);
+}
+
+#[test]
+fn cbr_06_the_fuzz_seed_view_holds_both_objects_and_reads_back_equal() {
+    let seed = include_str!("../../../../fuzz/seeds/mesh/view");
+    let view = read(seed.trim_end()).expect("the seed view is accepted");
+    assert!(seed.contains("outlierDetection") && seed.contains("circuitBreaker"));
+    assert_eq!(view.to_json(), seed.trim_end());
+    let non_default = view.services.values().any(|s| {
+        s.policy.outlier_detection.consecutive_5xx != 0
+            || s.policy.circuit_breaker.max_requests != 1024
+    });
+    assert!(non_default, "the seed carries a non-default value");
+}

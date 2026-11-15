@@ -11,14 +11,15 @@ use std::time::{Duration, Instant};
 
 use mimic_core::mesh::lb::Endpoints;
 use mimic_core::mesh::mirror::{self, Body, Candidate, Decision as Mirrored};
-use mimic_core::mesh::policy::Policy;
+use mimic_core::mesh::outlier::{self, Outlier, Restoration};
+use mimic_core::mesh::policy::{OutlierDetection, Policy};
 use mimic_core::mesh::retry::{Budget, Decision, Next, Planner, Verdict, decide};
 use mimic_core::mesh::route::{RouteView, Table};
 use mimic_core::mesh::view::View;
 use prometheus_client::metrics::gauge::Gauge;
 
 use super::metrics::MeshMetrics;
-use super::pool::Pools;
+use super::pool::{self, Pools};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -79,6 +80,12 @@ struct State {
     set: Endpoints,
     /// Parallel to the indices of `set`.
     endpoints: Vec<Arc<Endpoint>>,
+    /// The failures and ejections of the endpoints, kept across views (spec §7.9 "Outlier
+    /// detection"); one lock with the endpoints, so an outcome is recorded and a pick made
+    /// under the same.
+    outlier: Outlier,
+    /// The policy of the view held.
+    policy: OutlierDetection,
 }
 
 impl State {
@@ -98,6 +105,22 @@ impl State {
 pub(crate) struct ServiceRetry {
     retries: AtomicU32,
     budget: Mutex<(u32, Budget)>,
+    /// The circuit breaker of the Service (spec §7.9 "Circuit breaker"): the requests in flight
+    /// across its ports, its two limits and the limiter of its warning.
+    in_flight: Arc<AtomicUsize>,
+    max_requests: AtomicU32,
+    max_connections: pool::Limit,
+    opened: Mutex<Limiter>,
+}
+
+/// A slot of a Service's breaker, taken by a request and given back when dropped (the count it
+/// was taken on outlives the Service that left the view).
+pub(crate) struct Permit(Arc<AtomicUsize>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ServiceRetry {
@@ -113,12 +136,20 @@ impl ServiceRetry {
                     Duration::from_secs(u64::from(b.window_seconds)),
                 ),
             )),
+            in_flight: Arc::default(),
+            max_requests: AtomicU32::new(policy.circuit_breaker.max_requests),
+            max_connections: Arc::new(AtomicU32::new(policy.circuit_breaker.max_connections)),
+            opened: Mutex::new(Limiter::default()),
         }
     }
 
     /// A new view: `retries` and the rates apply at once; a new window starts the budget empty.
     fn configure(&self, policy: &Policy) {
         self.retries.store(policy.retries, Ordering::Release);
+        self.max_requests
+            .store(policy.circuit_breaker.max_requests, Ordering::Release);
+        self.max_connections
+            .store(policy.circuit_breaker.max_connections, Ordering::Release);
         let b = &policy.retry_budget;
         let mut held = lock(&self.budget);
         if held.0 == b.window_seconds {
@@ -133,6 +164,23 @@ impl ServiceRetry {
 
     pub(crate) fn retries(&self) -> u32 {
         self.retries.load(Ordering::Acquire)
+    }
+
+    /// The HTTP/1 connections a pool may hold for a request of this Service, as the view now
+    /// says (shared: a connection out sees a new value when it comes back).
+    pub(crate) fn max_connections(&self) -> pool::Limit {
+        self.max_connections.clone()
+    }
+
+    /// A slot for a request, or the number in flight when `maxRequests` are (one atomic
+    /// operation: no request is counted that was refused).
+    fn acquire(&self) -> Result<Permit, usize> {
+        let max = self.max_requests.load(Ordering::Acquire) as usize;
+        self.in_flight
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .map(|_| Permit(self.in_flight.clone()))
     }
 
     /// A request: the first try of one, or an L4 connection.
@@ -200,7 +248,12 @@ pub(crate) struct Backend {
 }
 
 impl Backend {
-    fn new(service: &str, label: String, retry: Arc<ServiceRetry>) -> Backend {
+    fn new(
+        service: &str,
+        label: String,
+        retry: Arc<ServiceRetry>,
+        policy: &OutlierDetection,
+    ) -> Backend {
         Backend {
             service: Arc::from(service),
             label: Arc::from(label),
@@ -209,6 +262,8 @@ impl Backend {
             state: Mutex::new(State {
                 set: Endpoints::new(Duration::ZERO),
                 endpoints: Vec::new(),
+                outlier: Outlier::new(policy),
+                policy: policy.clone(),
             }),
             routed: RwLock::new(None),
             original: Mutex::new(None),
@@ -240,15 +295,19 @@ impl Backend {
         *self.routed.write().unwrap_or_else(PoisonError::into_inner) = routed;
     }
 
-    /// Replaces the endpoints; returns the addresses that left.
+    /// Replaces the endpoints and the outlier policy at `age`; returns the addresses that left.
     fn update(
         &self,
         addrs: &[SocketAddr],
         window: Duration,
         age: Duration,
+        policy: &OutlierDetection,
         metrics: &MeshMetrics,
     ) -> Vec<SocketAddr> {
         let mut state = lock(&self.state);
+        let restored = state.outlier.reconcile(policy, addrs, age);
+        state.policy = policy.clone();
+        let ejected = state.outlier.ejected_count(age);
         state.set.set_window(window);
         state.set.update(addrs, age);
         let mut old: BTreeMap<SocketAddr, Arc<Endpoint>> =
@@ -272,7 +331,107 @@ impl Backend {
             endpoints.push(endpoint);
         }
         state.endpoints = endpoints;
+        drop(state);
+        self.restored(&restored, ejected, metrics);
         old.into_keys().collect()
+    }
+
+    /// The restorations of a view or a sweep: the gauge and one line each.
+    fn restored(&self, restored: &[Restoration], ejected: usize, metrics: &MeshMetrics) {
+        metrics.ejected_endpoints(&self.label, ejected);
+        for r in restored {
+            tracing::info!(
+                service = &*self.service,
+                backend = &*self.label,
+                endpoint = %r.addr,
+                cause = r.cause.label(),
+                "endpoint restored"
+            );
+        }
+    }
+
+    /// The once-a-second sweep: ejections that ended are restored, the gauge follows.
+    fn sweep(&self, router: &Router) {
+        let now = router.started.elapsed();
+        let (restored, ejected) = {
+            let mut state = lock(&self.state);
+            let addrs: Vec<SocketAddr> = state.endpoints.iter().map(|e| e.addr).collect();
+            let policy = state.policy.clone();
+            let restored = state.outlier.reconcile(&policy, &addrs, now);
+            (restored, state.outlier.ejected_count(now))
+        };
+        self.restored(&restored, ejected, &router.metrics);
+    }
+
+    /// Records the outcome of one try to the pod `addr` (spec §7.9 "Outlier detection"): an
+    /// ejection it causes is counted and logged.
+    pub(crate) fn record(&self, router: &Router, addr: SocketAddr, outcome: outlier::Outcome) {
+        let now = router.started.elapsed();
+        let (ejection, ejected) = {
+            let mut state = lock(&self.state);
+            let ejection = state.outlier.record(addr, outcome, now);
+            (ejection, state.outlier.ejected_count(now))
+        };
+        let Some(ejection) = ejection else {
+            return;
+        };
+        router
+            .metrics
+            .ejection(&self.label, ejection.reason.label());
+        router.metrics.ejected_endpoints(&self.label, ejected);
+        tracing::info!(
+            service = &*self.service,
+            backend = &*self.label,
+            endpoint = %addr,
+            reason = ejection.reason.label(),
+            ejection_seconds = ejection.seconds,
+            ejections = ejection.ejections,
+            "endpoint ejected"
+        );
+    }
+
+    /// Whether every endpoint of the port is ejected now.
+    fn all_ejected(&self, router: &Router) -> bool {
+        let now = router.started.elapsed();
+        let state = lock(&self.state);
+        !state.endpoints.is_empty()
+            && state
+                .endpoints
+                .iter()
+                .all(|e| state.outlier.is_ejected(e.addr, now))
+    }
+
+    /// The breaker takes a request (spec §7.9 "Circuit breaker"): its slot, or `Err` when the
+    /// request is to be answered `breaker-open` (already logged).
+    pub(crate) fn admit(&self, router: &Router) -> Result<Permit, ()> {
+        if self.all_ejected(router) {
+            self.opened(
+                router,
+                "all_ejected",
+                self.retry.in_flight.load(Ordering::Acquire),
+            );
+            return Err(());
+        }
+        self.retry.acquire().map_err(|in_flight| {
+            self.opened(router, "max_requests", in_flight);
+        })
+    }
+
+    /// A request was answered `breaker-open`: logged at most once per second per Service.
+    pub(crate) fn opened(&self, router: &Router, cause: &'static str, in_flight: usize) {
+        let now = router.started.elapsed();
+        let Some(suppressed) = lock(&self.retry.opened).refused(now) else {
+            return;
+        };
+        tracing::warn!(
+            service = &*self.service,
+            backend = &*self.label,
+            cause,
+            in_flight,
+            max_requests = self.retry.max_requests.load(Ordering::Acquire),
+            suppressed,
+            "breaker open"
+        );
     }
 
     /// The addresses of the endpoints now.
@@ -289,6 +448,8 @@ pub(crate) enum Plan {
     Original,
     /// No try is left, or the backend has no endpoint.
     Stop,
+    /// Every endpoint is ejected: no pod, and no fallback for an L4 connection.
+    AllEjected,
 }
 
 impl Backend {
@@ -317,11 +478,13 @@ impl Backend {
         let avoid_now = now_ms();
         let state = lock(&self.state);
         let mut draw = |n: usize| router.draw(n);
-        let next = planner.next(
+        let outlier = &state.outlier;
+        let next = planner.next_unejected(
             &state.set,
             now,
             |i| state.endpoints[i].load(avoid_now),
             &mut draw,
+            |addr| outlier.is_ejected(addr, now),
         );
         match next {
             Next::Pod(addr) => {
@@ -334,7 +497,14 @@ impl Backend {
                 Plan::Pod(InFlight(endpoint))
             }
             Next::Original => Plan::Original,
-            Next::Stop => Plan::Stop,
+            Next::Stop => {
+                let all = !state.endpoints.is_empty()
+                    && state
+                        .endpoints
+                        .iter()
+                        .all(|e| state.outlier.is_ejected(e.addr, now));
+                if all { Plan::AllEjected } else { Plan::Stop }
+            }
         }
     }
 }
@@ -505,6 +675,20 @@ impl Router {
         self.started.elapsed()
     }
 
+    /// The once-a-second sweep of the outlier state of every backend.
+    pub(crate) fn sweep(&self) {
+        let all: Vec<Arc<Backend>> = self
+            .backends
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for backend in all {
+            backend.sweep(self);
+        }
+    }
+
     /// The budgets and the backends (and so the warning limiters) held.
     pub(crate) fn retry_state(&self) -> (usize, usize) {
         let backends = self.backends.read().unwrap_or_else(PoisonError::into_inner);
@@ -557,16 +741,22 @@ impl Router {
                             .collect()
                     })
                     .unwrap_or_default();
-                let backend = previous
-                    .remove(&label)
-                    .unwrap_or_else(|| Arc::new(Backend::new(key, label.clone(), retry.clone())));
+                let backend = previous.remove(&label).unwrap_or_else(|| {
+                    Arc::new(Backend::new(
+                        key,
+                        label.clone(),
+                        retry.clone(),
+                        &service.policy.outlier_detection,
+                    ))
+                });
                 backend.set_routes(&service.routes, *port);
                 *lock(&backend.original) = service
                     .ips
                     .first()
                     .map(|ip| SocketAddr::new(ip.to_canonical(), *port));
                 self.metrics.backend_seen(&label);
-                for gone in backend.update(&addrs, window, age, &self.metrics) {
+                let outliers = &service.policy.outlier_detection;
+                for gone in backend.update(&addrs, window, age, outliers, &self.metrics) {
                     self.metrics.left(&backend.label, gone, now);
                 }
                 live.extend(backend.addrs());
@@ -619,14 +809,25 @@ mod tests {
     #[test]
     fn rty_28_every_picked_address_resolves_to_its_endpoint_by_index() {
         let retry = Arc::new(ServiceRetry::new(&mimic_core::mesh::policy::defaults()));
-        let backend = Backend::new("shop/cart", "shop/cart:80".to_string(), retry);
+        let backend = Backend::new(
+            "shop/cart",
+            "shop/cart:80".to_string(),
+            retry,
+            &mimic_core::mesh::policy::defaults().outlier_detection,
+        );
         let metrics = MeshMetrics::new(10_000);
         // Unsorted on purpose: the set sorts, and `endpoints` follows it.
         let addrs: Vec<SocketAddr> = (0..1000u16)
             .rev()
             .map(|n| SocketAddr::from(([10, 0, (n / 250) as u8, (n % 250) as u8], 8000 + n)))
             .collect();
-        backend.update(&addrs, Duration::ZERO, Duration::ZERO, &metrics);
+        backend.update(
+            &addrs,
+            Duration::ZERO,
+            Duration::ZERO,
+            &mimic_core::mesh::policy::defaults().outlier_detection,
+            &metrics,
+        );
         let state = lock(&backend.state);
         for addr in &addrs {
             assert_eq!(state.endpoint(*addr).map(|e| e.addr), Some(*addr));

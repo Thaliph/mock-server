@@ -46,6 +46,8 @@ const RESULTS: [Outcome; 7] = [
 /// Every `result` of a copy sent to a mirror (spec §7.9 "Mirrors").
 const MIRRORED: [&str; 4] = ["sent", "error", "skipped_body", "skipped_limit"];
 const SKIPS: [&str; 3] = ["exhausted", "method", "buffer"];
+/// Every `reason` of an ejection (spec §7.9 "Outlier detection").
+const EJECTIONS: [&str; 2] = ["consecutive_failures", "consecutive_5xx"];
 
 /// Every `status_class` value, to remove the series of an evicted endpoint.
 const CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "none"];
@@ -159,6 +161,10 @@ pub(crate) struct MeshMetrics {
     retries: Family<ReasonLabels, Counter>,
     skipped: Family<ReasonLabels, Counter>,
     mirrored: Family<ResultLabels, Counter>,
+    /// Ejections by backend and reason; a series exists from its first count.
+    ejections: Family<ReasonLabels, Counter>,
+    /// Endpoints ejected now, per backend of the view.
+    ejected: Family<BackendLabels, Gauge>,
     /// `x-mimic-*` fields removed from app responses by the inbound side (spec §4.1).
     /// Without labels, and made by the first removal: nothing of the mesh shows until then
     /// (MSH-51).
@@ -188,6 +194,8 @@ impl MeshMetrics {
             retries: Family::default(),
             skipped: Family::default(),
             mirrored: Family::default(),
+            ejections: Family::default(),
+            ejected: Family::default(),
             stripped: Family::default(),
             unframed: Family::default(),
             inbound_refusals: Family::default(),
@@ -249,6 +257,16 @@ impl MeshMetrics {
             "mesh_mirrored",
             "Copies of routed requests for the mirrors of the rule, by mirror Service port and result",
             self.mirrored.clone(),
+        );
+        registry.register(
+            "mesh_ejections",
+            "Endpoints ejected by outlier detection, by backend and reason",
+            self.ejections.clone(),
+        );
+        registry.register(
+            "mesh_ejected_endpoints",
+            "Endpoints ejected now by outlier detection, by backend",
+            self.ejected.clone(),
         );
         registry.register(
             "mesh_reconnects",
@@ -352,11 +370,33 @@ impl MeshMetrics {
             .inc();
     }
 
+    /// An endpoint of `backend` was ejected for `reason`.
+    pub(crate) fn ejection(&self, backend: &str, reason: &'static str) {
+        self.track(backend, None);
+        self.ejections
+            .get_or_create(&ReasonLabels {
+                backend: backend.to_string(),
+                reason,
+            })
+            .inc();
+    }
+
+    /// `n` endpoints of `backend` are ejected now.
+    pub(crate) fn ejected_endpoints(&self, backend: &str, n: usize) {
+        self.track(backend, None);
+        self.ejected
+            .get_or_create(&BackendLabels {
+                backend: backend.to_string(),
+            })
+            .set(i64::try_from(n).unwrap_or(i64::MAX));
+    }
+
     /// The series of a backend exists from the moment it is in the view, at 0.
     pub(crate) fn backend_seen(&self, backend: &str) {
         let labels = BackendLabels {
             backend: backend.to_string(),
         };
+        let _ = self.ejected.get_or_create(&labels);
         let _ = self.reconnects.get_or_create(&labels);
         let _ = self.fallbacks.get_or_create(&labels);
         let _ = self.budget_exhausted.get_or_create(&labels);
@@ -535,6 +575,13 @@ impl MeshMetrics {
             self.reconnects.remove(&labels);
             self.fallbacks.remove(&labels);
             self.budget_exhausted.remove(&labels);
+            self.ejected.remove(&labels);
+            for reason in EJECTIONS {
+                self.ejections.remove(&ReasonLabels {
+                    backend: backend.clone(),
+                    reason,
+                });
+            }
             for outcome in RESULTS {
                 self.attempts.remove(&ResultLabels {
                     backend: backend.clone(),

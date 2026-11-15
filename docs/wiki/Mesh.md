@@ -125,6 +125,11 @@ spec:
     enabled: true            # Deployment target: false = byte relay for this workload
   loadBalancer:
     slowStart: 30s           # Service target: <n>s, 0 to 3600 s, 0s disables
+  outlierDetection:          # Service target: see [Outlier detection and circuit breaker](#outlier-detection-and-circuit-breaker)
+    consecutiveFailures: 5
+    baseEjectionTime: 30s
+  circuitBreaker:
+    maxRequests: 1024
 ```
 
 Several configs for the same target: the oldest (`creationTimestamp`, then name) wins as a whole, the
@@ -250,6 +255,89 @@ sent, and anything on the byte relay.
 One access line is written per request, with `upstream` the address of the last try and `attempts` the number
 of tries. Discovery records the final exchange once; a trusted refusal passed to the app is not recorded
 (`mimic_discovery_exchanges_total{result="synthetic"}`).
+
+## Outlier detection and circuit breaker
+
+Two guards against a failing pod and an overloaded Service, both **per caller pod** (each sidecar keeps its
+own state, learns from its own requests and shares nothing) and both set by a `MimicConfig` on the **Service**:
+
+```yaml
+apiVersion: mimic.platform.io/v1alpha1
+kind: MimicConfig
+metadata: {name: cart, namespace: shop}
+spec:
+  targetRefs: [{group: "", kind: Service, name: cart}]
+  outlierDetection:
+    consecutiveFailures: 5   # 1 to 100; connect failures, resets and the like, in a row
+    consecutive5xx: 0        # 0 to 100; 0 = off (the default)
+    baseEjectionTime: 30s    # 1s to 300s
+    maxEjectionPercent: 50   # 0 to 100; 0 = never eject
+  circuitBreaker:
+    maxRequests: 1024        # 1 to 100000 requests in flight per caller pod
+    maxConnections: 1024     # 1 to 100000 HTTP/1 connections per pool
+```
+
+Each field left out takes its default (shown); the other fields of the object are not affected. Without any
+`MimicConfig` the defaults apply to every Service of the mesh.
+
+### Outlier detection
+
+A pod whose **proxy-level failures** pile up is **ejected**: it is left out of every choice of the caller's
+sidecar (first tries, retries, mirror copies, L4 connections) for an ejection time, then it is a candidate
+again.
+
+- **What counts as a failure** (`consecutiveFailures`): a connect that failed (refused, timed out, TLS
+  handshake or verification failed), a trusted refusal of the app (`app_refused`, [Retries](#retries)), a
+  connection closed or reset after the request was written and before any byte of the response head (any
+  method, retried or not), and a response head the sidecar cannot parse. **Any response head of the pod resets
+  the count.**
+- **What is neutral** (the count stays as it is): the refusals of the pod's admission (`overloaded`,
+  `queue-timeout`) and refused HTTP/2 streams (a busy pod is not a broken one, and ejecting it would move its
+  load onto its siblings), a route timeout (the author's bound), the app leaving before the head, anything after
+  the response head, and tries to the ClusterIP.
+- **`consecutive5xx`** counts the `5xx` heads a pod answers, those that are not a trusted refusal. **It is off
+  by default (`0`)**: a `5xx` is the app's answer, often caused further down the call chain, and ejecting on it
+  can spread an outage (every pod of a Service whose database is down answers `500`). Turn it on for a Service
+  whose own pods fail alone; `maxEjectionPercent` still bounds the damage.
+- **`maxEjectionPercent`**: at most `⌊n × percent / 100⌋` of the `n` endpoints of a Service port are ejected
+  at once, **rounded down, with no minimum of one**. At the default 50 %, 1 pod is **never** ejected, 2 or 3 pods
+  eject at most 1, 4 pods at most 2. `100` can eject all of them; `0` turns ejection off. The bound holds at every
+  instant: a view that shrinks the port or lowers the percentage restores the ejections that end first.
+- **Ejection time**: `baseEjectionTime × 2^k`, at most **300 s**, `k` being the earlier ejections of the pod
+  in its streak: 30 s, 60 s, 120 s, 240 s, 300 s, 300 s ... at the default. The streak ends once the pod has
+  been restored for 300 s without a new ejection. There is no probe: a restored pod simply competes again, and
+  the least-request choice gives it only its share.
+- **With avoidance.** The 5 s avoidance of a pod after a failed connect ([Failure behaviour](#failure-behaviour))
+  stays: it is the soft, immediate exclusion, ejection is the hard one on top. A blackholed pod costs one
+  connect timeout, not five.
+- **When every endpoint is ejected** (only with `maxEjectionPercent: 100`), a request is answered `503`
+  `breaker-open` without any try, an L4 connection is closed, a mirror copy is an `error`.
+
+### Circuit breaker
+
+`maxRequests` bounds the mesh-routed requests of **one caller pod** in flight to **one backend Service** (all its
+ports together). A request takes a slot from its first try until its response is complete (or it ends); its
+retries, reconnects and the fallback are inside that one slot. A request that finds no free slot is answered
+at once by the caller's sidecar: `503`, `x-mimic-error: breaker-open`, an empty body, no `x-mimic-endpoint`
+(it names no pod, so no sidecar trusts it). Nothing is sent to a pod or to the ClusterIP, the request is not
+retried and asks nothing of the retry budget.
+
+- **Held streams** (SSE, gRPC streams) keep their slot for their whole life; an `Upgrade` or `CONNECT` gives
+  it back when the answer head arrives. Size `maxRequests` above the number of streams a caller keeps open.
+- **Outside the breaker**: mirror copies (they have their own bounds, [Mirroring](#mirroring)), L4-balanced
+  connections (the app's own connections bound them), requests the mock answers, requests of a stale view.
+- `maxConnections` bounds the HTTP/1 connections of one pool (pod, port, protocol); a request over it waits for
+  a free connection, inside its slot and its timeouts. HTTP/2 keeps 16 connections per pod.
+- **Per caller pod**: a Service called by 10 pods with `maxRequests: 100` can see 1000 requests. Whoever may write
+  a `MimicConfig` for the Service can throttle all its callers (`maxRequests: 1`): it is the RBAC of the Service's
+  namespace, as for the retries.
+
+Logs: INFO `endpoint ejected` (`service`, `backend`, `endpoint`, `reason`, `ejection_seconds`, `ejections`) and
+`endpoint restored` (`cause`: `elapsed` or `max_percent`), one line each, written at most 1 s late; WARN
+`breaker open` at most once per second per Service (`cause`, `in_flight`, `max_requests`, `suppressed`).
+Metrics: `mimic_mesh_ejections_total` and `mimic_mesh_ejected_endpoints` ([Observability](#observability)); a
+`breaker-open` answer is counted in `mimic_mesh_requests_total{reason="breaker-open"}` and its access line has
+`reason`. See [Troubleshooting](Troubleshooting#mesh).
 
 ## Routes
 
@@ -491,7 +579,7 @@ Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `
 
 | Metric | Labels |
 |---|---|
-| `mimic_mesh_requests_total` (per mesh-routed request) | `service`, `route` (`<namespace>/<name>` of the matched route, `none` when no route matched; at most 256 distinct values, then `other`), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, including `no-route`, `no-backend` and `invalid-backend`, or that of a trusted refusal passed to the app) |
+| `mimic_mesh_requests_total` (per mesh-routed request) | `service`, `route` (`<namespace>/<name>` of the matched route, `none` when no route matched; at most 256 distinct values, then `other`), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, including `no-route`, `no-backend` and `invalid-backend`, `breaker-open`, or that of a trusted refusal passed to the app) |
 | `mimic_mesh_request_duration_seconds` (until the response head) | `service`, `backend`, `status_class` |
 | `mimic_mesh_endpoint_requests_total` | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
 | `mimic_mesh_endpoint_in_flight` | `backend`, `endpoint` |
@@ -503,6 +591,8 @@ Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `
 | `mimic_mesh_mirrored_total` (one per drawn mirror of a routed request, [Mirroring](#mirroring)) | `backend` (the mirror Service port), `result` (`sent`, `error`, `skipped_body`, `skipped_limit`) |
 | `mimic_mesh_stripped_headers_total`, `mimic_mesh_unframed_closes_total`, `mimic_mesh_inbound_refusals_total` (one per inbound connection answered `503` `connect-failed` because the app refused it) | none |
 | `mimic_mesh_unscoped_connections_total` | none |
+| `mimic_mesh_ejections_total` (one per ejection, [Outlier detection](#outlier-detection)) | `backend`, `reason` (`consecutive_failures`, `consecutive_5xx`) |
+| `mimic_mesh_ejected_endpoints` (gauge, ejected now) | `backend` |
 | `mimic_mesh_view_pulls_total` | `result` (`ok`, `not_modified`, `older`, `invalid`, `error`) |
 | `mimic_mesh_view_age_seconds`, `mimic_mesh_view_services`, `mimic_mesh_view_endpoints` | none |
 
@@ -520,7 +610,7 @@ ClusterIP after a fallback) and `attempts` (the number of tries, 1 without a ret
 connects tried). `dst` stays the original destination. Lines of relayed
 connections have neither.
 
-Warnings to know: `mesh view stale` (once per stale period), `mesh view rejected` (a view that does not
+Warnings to know: `breaker open`, `mesh view stale` (once per stale period), `mesh view rejected` (a view that does not
 parse, once per streak), `tls verification failed`.
 
 ## Limits
@@ -582,13 +672,17 @@ parse, once per streak), `tls verification failed`.
 - **Mirrors are best effort and carry credentials.** Copies are skipped when their body does not fit the replay
   buffer, the slots are full or the body has not ended in time; they are not a delivery guarantee, and they go
   unredacted to the mirror's pods ([Mirroring](#mirroring)).
-- Not yet: outlier ejection, circuit breaking, admission control.
+- Outlier state is per caller pod: a pod ejected by one caller is still tried by the others until they see its failures
+  themselves; the breaker is per caller pod too ([Outlier detection and circuit breaker](#outlier-detection-and-circuit-breaker)).
+  Failures forged by an app eject only its own pod. A peer or a spoofed reset can eject an address for one ejection
+  time: there is no identity check without mTLS.
+- Not yet: active health checks, admission control.
 
 ## What is coming
 
 - **M2**: retries of proxy-level failures on another pod are in (above); the retry budget and
   `MimicConfig.retries` are next (#446).
 - **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts ([Timeouts](#timeouts)) and mirrors ([Mirroring](#mirroring)) are in.
-- **M4**: outlier detection, circuit breaker and fault injection.
+- **M4**: outlier detection and circuit breaker are in ([above](#outlier-detection-and-circuit-breaker)); fault injection is next.
 - **M5**: admission contract, failure signalling and HPA.
 - **M6**: north-south gateway.

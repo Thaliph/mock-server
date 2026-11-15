@@ -21,6 +21,18 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Outlier detection and circuit breaker in the sidecar (#451, M4): `outlierDetection` (`consecutiveFailures` 5,
+  `consecutive5xx` 0 = off, `baseEjectionTime` 30 s, `maxEjectionPercent` 50) and `circuitBreaker`
+  (`maxRequests` 1024, `maxConnections` 1024) on a `MimicConfig` that targets a Service. A pod whose connects
+  fail, or whose connections are reset before any response head, is ejected by the caller's sidecar for
+  `baseEjectionTime` doubling up to 300 s, at most `⌊n × maxEjectionPercent / 100⌋` of a port at a time; admission
+  refusals, timeouts and refused streams are neutral. A request over `maxRequests` of its caller pod, or with every
+  endpoint ejected, is answered `503` `x-mimic-error: breaker-open` without any try. `maxConnections` replaces the
+  fixed 1024 HTTP/1 connections per pool. New metrics `mimic_mesh_ejections_total{backend,reason}` and
+  `mimic_mesh_ejected_endpoints{backend}`, `reason` in access lines, INFO lines `endpoint ejected` and
+  `endpoint restored`, WARN `breaker open`, bench setups `mesh-eject` and `mesh-breaker`. State and counts are per
+  caller pod. See Outlier detection and circuit breaker in the wiki page Mesh.
+
 - Request mirroring in the sidecar (#450, M3): the `RequestMirror` filters of an `HTTPRoute` rule send a copy of
   the requests it routes (a `percent` or `fraction` of them, at most 16 mirrors per rule) to a pod of the mirror
   Service, in the protocol of the app, on connections of their own. The copy has the head of the primary's first

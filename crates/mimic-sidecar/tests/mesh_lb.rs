@@ -118,7 +118,7 @@ async fn rte_20_requests_are_balanced_as_without_routes_and_the_routes_backends_
     };
     let service = |ip: &str, pods: Vec<String>, routes: &str| {
         format!(
-            r#"{{"endpoints":{{"80":[{}],"81":[]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":0}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"80":{{"targetPort":8080}},"81":{{"targetPort":8081}}}}{routes}}}"#,
+            r#"{{"endpoints":{{"80":[{}],"81":[]}},"generations":{{}},"ips":["{ip}"],"policy":{{"circuitBreaker":{{"maxConnections":1024,"maxRequests":1024}},"loadBalancer":{{"slowStartSeconds":0}},"outlierDetection":{{"baseEjectionSeconds":30,"consecutive5xx":0,"consecutiveFailures":5,"maxEjectionPercent":50}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"80":{{"targetPort":8080}},"81":{{"targetPort":8081}}}}{routes}}}"#,
             pods.join(",")
         )
     };

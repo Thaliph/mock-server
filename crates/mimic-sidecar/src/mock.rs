@@ -558,6 +558,7 @@ impl Flight {
             rule: None,
             timeout: None,
             mirrored: false,
+            reason: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.owed.store(true, Ordering::Release);
@@ -603,6 +604,7 @@ impl Drop for Flight {
             rule: None,
             timeout: None,
             mirrored: false,
+            reason: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.release();
@@ -897,6 +899,7 @@ impl Mock {
             rule: None,
             timeout: None,
             mirrored: false,
+            reason: None,
         });
     }
 }
