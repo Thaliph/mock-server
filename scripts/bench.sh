@@ -191,7 +191,8 @@ fortio_args() {
   FORTIO_ARGS=(load -qps "$2" -t "$DURATION" -c "$(setup_connections "${3:-}")" -p "50,90,99,99.9" -json -)
   if [[ $1 == h2c ]]; then FORTIO_ARGS+=(-h2); fi
   if [[ ${3:-} == mesh-breaker ]]; then
-    FORTIO_ARGS+=("http://fortio-server:8080/?size=1024&delay=${BREAKER_DELAY_MS}ms")
+    # More connections than maxRequests: the warm-up requests (one per connection) are already answered breaker-open.
+    FORTIO_ARGS+=(-allow-initial-errors "http://fortio-server:8080/?size=1024&delay=${BREAKER_DELAY_MS}ms")
   else
     FORTIO_ARGS+=("http://fortio-server:8080/")
   fi
