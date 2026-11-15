@@ -20,7 +20,7 @@ For an in-scope call the sidecar waits up to 50 ms for the client's first bytes,
 | First bytes of the connection | What the sidecar does |
 |---|---|
 | HTTP/1 request head (not `Upgrade`, not `CONNECT`) or the HTTP/2 preface (`h2c`) | **Per request**: each request goes to a pod, over a pooled connection to `<pod IP>:<target port>`. |
-| TLS that mimic intercepts ([TLS interception](TLS-interception)) | Decrypted, balanced per request, then **re-originated over TLS** to the pod. SNI is the one the app sent (none: `<name>.<namespace>.svc`) and the pod's certificate is verified against that name, never the pod IP. Hostname verification cannot be turned off, and a pod is never spoken to in cleartext. |
+| TLS that mimic intercepts ([TLS interception](TLS-interception)) | Decrypted, balanced per request, then **re-originated over TLS** to the pod. SNI is the one the app sent (none: `<name>.<namespace>.svc`) and the pod's certificate is verified against that name, never the pod IP. Hostname verification cannot be turned off, and a pod is never spoken to in cleartext. A route that sends such a request to another Service still verifies against the name the app sent, so the other Service's pods fail verification and the call is answered `503` (fails closed): route intercepted-TLS traffic only to Services whose certificates also cover the parent's name. |
 | Anything else client-first (binary protocols, TLS that is not intercepted) | **L4, per connection**: one pod is chosen, the bytes are relayed untouched. |
 | Silence for 50 ms, a first request with `Upgrade` or `CONNECT`, an opaque port, mode `mock` | The plain byte relay to the original destination, as without the mesh. |
 
@@ -256,9 +256,8 @@ of tries. Discovery records the final exchange once; a trusted refusal passed to
 With the Gateway API CRDs installed ([Install](Install#gateway-api-optional)), the controller reads every
 `HTTPRoute` (`gateway.networking.k8s.io/v1`) whose `parentRefs` name a **Service** (`group: ""`, `kind: Service`;
 the GAMMA convention), compiles it and puts it in the views of the callers it applies to. Routes with Gateway
-parents are ignored. **The sidecar reads and validates routes but applies none of them yet**: matching,
-weights and header modifiers are #448, timeouts #449, mirrors #450. Today routes give you the status below and
-a validated view.
+parents are ignored. **The sidecar applies the matches, the backend weights and the header modifiers of a
+route** (below); timeouts are #449 and mirrors #450, and the sidecar does not apply them yet.
 
 **Supported**, per rule: `matches` with `path` (`Exact`, `PathPrefix`), `headers` and `queryParams` of type
 `Exact`, `method`; `backendRefs` to Services with `port` and `weight`; the filters `RequestHeaderModifier`,
@@ -270,6 +269,73 @@ is ignored (retries are set by `MimicConfig`, [Retries](#retries)); `hostnames` 
 not know (experimental channel), a modifier naming `host`, `Content-Length`, `Transfer-Encoding`,
 `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade` or any `x-mimic-*` field, or a
 `spec` over 64 KiB. Its status says which.
+
+### Canary walkthrough
+
+Two Deployments `cart-v1` and `cart-v2`, each with its own Service, and the Service `cart` that callers use. Send
+10% of the requests to `cart-v2`:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: cart-canary, namespace: shop}
+spec:
+  parentRefs: [{group: "", kind: Service, name: cart, port: 80}]
+  rules:
+    - backendRefs:
+        - {name: cart-v1, port: 80, weight: 90}
+        - {name: cart-v2, port: 80, weight: 10}
+```
+
+1. `kubectl -n shop get httproute cart-canary -o yaml`: `Accepted` and `ResolvedRefs` are `True` in the
+   `status.parents[]` entry of `mimic.platform.io/mesh`. The sidecars of the callers pick the route up with
+   their next view (long poll, seconds).
+2. Read the split in the caller's sidecar: `mimic_mesh_requests_total{service="shop/cart",route="shop/cart-canary",backend="shop/cart-v1:80"}`
+   against the same series with `backend="shop/cart-v2:80"`; the ratio of their rates is the weights, within the
+   noise of a draw per request. An access line of the caller ([Access logs](Access-logs)) has `route`, `rule` and
+   the drawn `backend`.
+3. Send the requests that carry `x-canary: 1` to `cart-v2` only, by putting a header match first:
+
+   ```yaml
+   rules:
+     - matches: [{headers: [{type: Exact, name: x-canary, value: "1"}]}]
+       backendRefs: [{name: cart-v2, port: 80}]
+     - backendRefs:
+         - {name: cart-v1, port: 80, weight: 90}
+         - {name: cart-v2, port: 80, weight: 10}
+   ```
+
+4. Shift everything to the new version by changing the weights to `0` and `100` (a weight `0` backend is never
+   drawn): `kubectl -n shop patch httproute cart-canary --type=json -p '[{"op":"replace","path":"/spec/rules/0/backendRefs/0/weight","value":0},{"op":"replace","path":"/spec/rules/0/backendRefs/1/weight","value":100}]'`.
+   The change reaches every caller with one view update; from then on `cart-v1` has no new request.
+5. Delete the route to go back to the Service's own pods.
+
+**What a route does in the sidecar.** For a Service port that has routes (`ports` of the route), each request of a
+meshed caller is matched against every match of every rule of the port's routes, over the request as the app sent
+it: the path as received (byte for byte, no decoding, no normalisation), the method, the headers and the query
+parameters; the host is never compared (`hostnames` is ignored). The winner is the Gateway API's precedence: an
+`Exact` path before a prefix, then the longest prefix, then a `method`, then the most header matches, then the most
+query matches, then the oldest route, then the first rule written. The backend is drawn by weight, once per
+request, and the request goes to a pod of that backend with **that backend's** retry policy and budget: retries
+and the fallback never leave the backend. `RequestHeaderModifier` is applied once, before the first try, and
+`ResponseHeaderModifier` to the final response head from the pod. Upgrade and `CONNECT` requests and L4
+connections are not routed, a stale view or mode `mock` routes nothing.
+
+**When nothing matches.** A port that has routes answers a request that no rule matches `404` with
+`x-mimic-error: no-route` (nothing is sent to a pod; the answer is not recorded by discovery). This is the
+default, as in Istio and Linkerd. A rule that matches everything and names the Service itself gives the old
+behaviour back:
+
+```yaml
+rules:
+  - matches: [{path: {type: PathPrefix, value: /cart}}]
+    backendRefs: [{name: cart-v2, port: 80}]
+  - backendRefs: [{name: cart, port: 80}]   # catch-all: the rest goes to cart's own pods
+```
+
+A rule whose weights are all `0` (or with no backend) answers `500` `no-backend`; a drawn backend that is
+invalid (a Service that is not in the view, a missing `ReferenceGrant`, a missing port) answers `500`
+`invalid-backend` for its share of the requests. See [Troubleshooting](Troubleshooting#mesh).
 
 **Producer and consumer routes.** A route in the namespace of its Service is a *producer* route: every caller
 that has the Service in its view gets it. A route in another namespace than the Service is a *consumer* route
@@ -302,7 +368,7 @@ kubectl -n shop get httproute cart-canary -o jsonpath='{range .status.parents[?(
 | `Accepted` `True` | `Accepted` | Programmed. The message says `retry is configured by MimicConfig` when the route has `retry`. |
 | `Accepted` `False` | `UnsupportedValue` | Refused; the message is `unsupported: <field path>`, the first such field (`rules[0].filters[0].type`). |
 | `Accepted` `False` | `NoMatchingParent` | The entry's `port` is not a port of the Service, or it has a `sectionName`. |
-| `ResolvedRefs` `False` | `RefNotPermitted`, `InvalidKind`, `BackendNotFound` | A backend or mirror lacks a `ReferenceGrant`, is not a core Service, or does not exist (or lacks the port). The route stays programmed; that backend's share is answered `500` once the sidecar applies routes. |
+| `ResolvedRefs` `False` | `RefNotPermitted`, `InvalidKind`, `BackendNotFound` | A backend or mirror lacks a `ReferenceGrant`, is not a core Service, or does not exist (or lacks the port). The route stays programmed; that backend's share of the requests is answered `500` `invalid-backend`. |
 
 Entries of other controllers in the same list are never changed. The status of a route whose Service parent
 does not exist stays empty, and entries mimic wrote stay after `helm uninstall`.
@@ -322,7 +388,7 @@ Sidecar metrics (only with `MIMIC_MESH=on`; `service` is `<namespace>/<name>`, `
 
 | Metric | Labels |
 |---|---|
-| `mimic_mesh_requests_total` (per mesh-routed request) | `service`, `route` (`none` for now), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, or that of a trusted refusal passed to the app) |
+| `mimic_mesh_requests_total` (per mesh-routed request) | `service`, `route` (`<namespace>/<name>` of the matched route, `none` when no route matched; at most 256 distinct values, then `other`), `backend`, `status_class` (`1xx` to `5xx`, `none`), `reason` (`none`, the `x-mimic-error` of an answer of the sidecar, including `no-route`, `no-backend` and `invalid-backend`, or that of a trusted refusal passed to the app) |
 | `mimic_mesh_request_duration_seconds` (until the response head) | `service`, `backend`, `status_class` |
 | `mimic_mesh_endpoint_requests_total` | `backend`, `endpoint` (`ip:port` or `other`), `status_class` |
 | `mimic_mesh_endpoint_in_flight` | `backend`, `endpoint` |
@@ -398,13 +464,13 @@ parse, once per streak), `tls verification failed`.
 - **A response that cannot be framed closes the inbound connection when the mesh is on** (see
   [Retries](#retries)). Such an app works with the mesh off or a view of `"mesh": false`. A request that
   cannot be framed (client side) is still relayed unchanged, and so is what the app answers to it.
-- Not yet: the retry budget, routing by path or header, outlier ejection, circuit breaking, admission control.
+- Not yet: outlier ejection, circuit breaking, admission control.
 
 ## What is coming
 
 - **M2**: retries of proxy-level failures on another pod are in (above); the retry budget and
   `MimicConfig.retries` are next (#446), then timeouts (#449).
-- **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies them from #448.
+- **M3**: Gateway API `HTTPRoute` (routing, canary, timeouts, mirror): the controller reads, validates and reports routes ([Routes](#routes)); the sidecar applies matches, weights and header modifiers ([Routes](#routes)); timeouts #449, mirrors #450.
 - **M4**: outlier detection, circuit breaker and fault injection.
 - **M5**: admission contract, failure signalling and HPA.
 - **M6**: north-south gateway.

@@ -118,11 +118,19 @@ pub async fn fixture_mesh(
     state: &mimic_sidecar::mesh::MeshState,
     discovery: Option<&mimic_sidecar::discovery::Discovery>,
 ) -> Fixture {
+    fixture_mesh_dst(Arc::new(move |_| Ok(dst)), state, discovery).await
+}
+
+/// Like [`fixture_mesh`], with the original destination of each connection given by `dst`.
+pub async fn fixture_mesh_dst(
+    original_dst: OriginalDst,
+    state: &mimic_sidecar::mesh::MeshState,
+    discovery: Option<&mimic_sidecar::discovery::Discovery>,
+) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let mut metrics = Metrics::new("sidecar", "test");
     let tunnel_metrics = TunnelMetrics::register(&mut metrics);
-    let original_dst: OriginalDst = Arc::new(move |_| Ok(dst));
     let proxy = ProxyMetrics::register(&mut metrics, 50);
     state.register(&mut metrics);
     let mut shared = Shared::new(vec![addr], tunnel_metrics, original_dst)

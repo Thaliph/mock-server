@@ -218,7 +218,7 @@ fn rty_45_from_json_reads_back_a_policy_with_retries_and_refuses_the_rest() {
 
 // RTE-12: routes.
 
-fn routed() -> Built {
+pub(super) fn routed() -> Built {
     let mut s = snapshot();
     s.services = vec![
         http_svc("shop", "cart", "10.96.0.1"),
@@ -533,5 +533,26 @@ fn rte_12_an_unknown_field_is_refused_in_every_route_object() {
                     .insert("extra".into(), json!(1));
             }),
         );
+    }
+}
+
+#[test]
+fn rte_45_header_names_are_bounded_to_256_bytes() {
+    use serde_json::json;
+    for path in [
+        pointer("/matches/0/headers/0/name"),
+        pointer("/filters/requestHeaders/set/0/name"),
+        pointer("/filters/requestHeaders/add/0/name"),
+        pointer("/filters/requestHeaders/remove/0"),
+        pointer("/filters/responseHeaders/set/0/name"),
+        pointer("/filters/responseHeaders/add/0/name"),
+        pointer("/filters/responseHeaders/remove/0"),
+    ] {
+        let ok = set(&path, json!("a".repeat(256)));
+        assert!(ok.is_ok(), "{path} at 256: {ok:?}");
+        rte_12_refused(&path, set(&path, json!("a".repeat(257))));
+        for pseudo in [":authority", ":path", ":status", ":method"] {
+            rte_12_refused(&format!("{path} {pseudo}"), set(&path, json!(pseudo)));
+        }
     }
 }

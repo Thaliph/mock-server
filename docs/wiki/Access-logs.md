@@ -78,6 +78,7 @@ decrypted or not. A field that has no value is absent from the line, not `null`.
 | `grpc_status` | HTTP/2 only, from the trailers, when present. `0` is OK. |
 | `upgrade` | `true` when the exchange became a tunnel (WebSocket, `CONNECT`). Always present on an HTTP exchange. |
 | `backend`, `upstream` | Mesh-routed requests (HTTP) and L4-balanced connections only, with `MIMIC_MESH=on` ([Mesh](Mesh)): `backend` is `<namespace>/<name>:<port>` of the Service port, `upstream` the pod `ip:port` of the last try (the ClusterIP after a fallback). `dst` stays the original destination. Absent on relayed connections. |
+| `route`, `rule` | Mesh-routed requests (HTTP) that a rule of an `HTTPRoute` matched ([Mesh](Mesh#routes)): `route` is `<namespace>/<name>` and `rule` the index of the rule in it, 0 first. Absent otherwise. `backend` is then the backend Service port the draw chose, and absent on a `no-route`, `no-backend` or `invalid-backend` answer. |
 | `attempts` | Mesh-routed requests: the number of tries (1 without a retry, at most 4, see [Mesh](Mesh#retries)). L4-balanced connections: the number of connects tried. Absent on relayed connections. |
 | `tls` | `true` when the exchange was decrypted by TLS interception. Absent otherwise. |
 | `interception` | Connection only, outbound TLS only: why the connection was not intercepted (a decision other than `intercepted`, which writes exchange lines instead). |

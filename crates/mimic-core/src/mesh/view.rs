@@ -155,13 +155,16 @@ pub(super) const MAX_ITEMS: usize = 16;
 pub(super) const MAX_WEIGHT: u32 = 1_000_000;
 const MAX_VALUE_BYTES: usize = 4096;
 const MAX_PATH_BYTES: usize = 1024;
+/// A header name (RTE-45); `Table` and the modifiers never hold more.
+const MAX_NAME_BYTES: usize = 256;
 const METHODS: [&str; 9] = [
     "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
 ];
 
-/// A lower-case HTTP token.
+/// A lower-case HTTP token of at most 256 bytes.
 pub(super) fn header_name(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= MAX_NAME_BYTES
         && name.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b)
         })

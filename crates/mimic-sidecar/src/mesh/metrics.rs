@@ -21,8 +21,16 @@ use crate::red::DURATION_BUCKETS;
 /// The series of an endpoint that left the view stay this long.
 pub(crate) const EVICT_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// The label of the endpoints past `MIMIC_METRICS_MAX_ENDPOINTS`.
+/// The `backend` of a `no-route` or `no-backend` answer, and of an `invalid-backend` one.
+pub(crate) const NO_BACKEND: &str = "none";
+pub(crate) const INVALID_BACKEND: &str = "invalid";
+
+/// The label of the endpoints past `MIMIC_METRICS_MAX_ENDPOINTS`, and of the routes past
+/// [`MAX_ROUTES`].
 const OTHER: &str = "other";
+
+/// How many distinct routes have a `route` label of their own (spec §7.9 "Metrics").
+const MAX_ROUTES: usize = 256;
 
 /// Every `result` of a try and `reason` of a retry or a skipped one, to remove the series of a
 /// backend that left the view.
@@ -43,7 +51,7 @@ const CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "none"];
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct RequestLabels {
     service: String,
-    route: &'static str,
+    route: String,
     backend: String,
     status_class: &'static str,
     reason: &'static str,
@@ -101,10 +109,33 @@ struct Slot {
 /// What a backend (Service port) has made series of, to remove them when it leaves.
 #[derive(Default)]
 struct Series {
-    /// (`status_class`, `reason`) of the `mimic_mesh_requests_total` series.
-    requests: BTreeSet<(&'static str, &'static str)>,
+    /// (`service`, `route`, `status_class`, `reason`) of the `mimic_mesh_requests_total` series.
+    requests: BTreeSet<(String, String, &'static str, &'static str)>,
     /// When the backend left the view; `None` while it is in it.
     left: Option<Instant>,
+}
+
+/// The series of a route that has a `route` label of its own, to remove them when it has left
+/// the view.
+struct RouteSlot {
+    /// The route's name, or `other`.
+    label: String,
+    /// When the route left the view; `None` while it is in it.
+    left: Option<Instant>,
+    /// (`service`, `backend`, `status_class`, `reason`) of its `mimic_mesh_requests_total` series.
+    series: BTreeSet<RouteSeries>,
+}
+
+type RouteSeries = (String, String, &'static str, &'static str);
+
+#[derive(Default)]
+struct RouteSlots {
+    /// By route name, `<namespace>/<name>`.
+    map: BTreeMap<String, RouteSlot>,
+    /// Slots with a label of their own.
+    labelled: usize,
+    /// The series counted under `other`, removed with the last route that had that label.
+    other: BTreeSet<RouteSeries>,
 }
 
 #[derive(Default)]
@@ -134,6 +165,7 @@ pub(crate) struct MeshMetrics {
     /// Same as `stripped`: inbound connections answered `503` `connect-failed`.
     inbound_refusals: Family<Vec<(String, String)>, Counter>,
     slots: Mutex<Slots>,
+    routes: Mutex<RouteSlots>,
     /// By backend label.
     series: Mutex<BTreeMap<String, Series>>,
     max_labels: usize,
@@ -156,6 +188,7 @@ impl MeshMetrics {
             unframed: Family::default(),
             inbound_refusals: Family::default(),
             slots: Mutex::new(Slots::default()),
+            routes: Mutex::new(RouteSlots::default()),
             series: Mutex::new(BTreeMap::new()),
             max_labels,
         }
@@ -317,7 +350,7 @@ impl MeshMetrics {
 
     /// Notes that a series of `backend` exists. One made after the backend left the view (a
     /// request that ends late) starts the 5 minutes anew.
-    fn track(&self, backend: &str, request: Option<(&'static str, &'static str)>) {
+    fn track(&self, backend: &str, request: Option<(String, String, &'static str, &'static str)>) {
         let mut all = self.series.lock().unwrap_or_else(PoisonError::into_inner);
         if !all.contains_key(backend) {
             all.insert(
@@ -390,6 +423,7 @@ impl MeshMetrics {
     /// Removes the series of the endpoints that left the view 5 minutes before `now`.
     pub(crate) fn evict(&self, now: Instant) {
         self.evict_backends(now);
+        self.evict_routes(now);
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let due: Vec<(String, SocketAddr)> = slots
             .map
@@ -455,21 +489,25 @@ impl MeshMetrics {
             }
             // `<namespace>/<name>:<port>`.
             let service = backend.rsplit_once(':').map_or(&**backend, |(s, _)| s);
-            for &(status_class, reason) in &series.requests {
+            let mut services = BTreeSet::from([service.to_string()]);
+            for (called, route, status_class, reason) in &series.requests {
+                services.insert(called.clone());
                 self.requests.remove(&RequestLabels {
-                    service: service.to_string(),
-                    route: "none",
+                    service: called.clone(),
+                    route: route.clone(),
                     backend: backend.clone(),
                     status_class,
                     reason,
                 });
             }
-            for status_class in CLASSES {
-                self.durations.remove(&DurationLabels {
-                    service: service.to_string(),
-                    backend: backend.clone(),
-                    status_class,
-                });
+            for service in services {
+                for status_class in CLASSES {
+                    self.durations.remove(&DurationLabels {
+                        service: service.clone(),
+                        backend: backend.clone(),
+                        status_class,
+                    });
+                }
             }
             let labels = BackendLabels {
                 backend: backend.clone(),
@@ -508,11 +546,23 @@ impl MeshMetrics {
 
     /// One mesh-routed request that got a response (or none: `status_class` `none`).
     pub(crate) fn request(&self, call: &Call<'_>, elapsed: Duration) {
-        self.track(call.backend, Some((call.status_class, call.reason)));
+        let route = self.route_label(call);
+        // The answers of the sidecar that name no backend have no series to evict.
+        if !matches!(call.backend, NO_BACKEND | INVALID_BACKEND) {
+            self.track(
+                call.backend,
+                Some((
+                    call.service.to_string(),
+                    route.clone(),
+                    call.status_class,
+                    call.reason,
+                )),
+            );
+        }
         self.requests
             .get_or_create(&RequestLabels {
                 service: call.service.to_string(),
-                route: "none",
+                route,
                 backend: call.backend.to_string(),
                 status_class: call.status_class,
                 reason: call.reason,
@@ -525,6 +575,103 @@ impl MeshMetrics {
                 status_class: call.status_class,
             })
             .observe(elapsed.as_secs_f64());
+    }
+
+    /// The `route` label of a request: `none`, the route's name while a slot is free for it,
+    /// else `other`. The series is noted under the route, to be removed with it.
+    fn route_label(&self, call: &Call<'_>) -> String {
+        if call.route == "none" {
+            return "none".to_string();
+        }
+        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
+        let routes = &mut *routes;
+        let series = (
+            call.service.to_string(),
+            call.backend.to_string(),
+            call.status_class,
+            call.reason,
+        );
+        if !routes.map.contains_key(call.route) {
+            let label = if routes.labelled < MAX_ROUTES {
+                routes.labelled += 1;
+                call.route
+            } else {
+                OTHER
+            };
+            routes.map.insert(
+                call.route.to_string(),
+                RouteSlot {
+                    label: label.to_string(),
+                    left: None,
+                    series: BTreeSet::new(),
+                },
+            );
+        }
+        let Some(slot) = routes.map.get_mut(call.route) else {
+            return OTHER.to_string();
+        };
+        if slot.label == OTHER {
+            routes.other.insert(series);
+        } else {
+            slot.series.insert(series);
+        }
+        slot.label.clone()
+    }
+
+    /// The routes of the view applied at `now`: the ones that are not in it are marked as left.
+    pub(crate) fn routes_in_view(&self, names: &BTreeSet<&str>, now: Instant) {
+        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
+        for (name, slot) in &mut routes.map {
+            if names.contains(name.as_str()) {
+                slot.left = None;
+            } else {
+                slot.left.get_or_insert(now);
+            }
+        }
+    }
+
+    /// Removes the series of the routes that left the view 5 minutes before `now`.
+    fn evict_routes(&self, now: Instant) {
+        let mut routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
+        let routes = &mut *routes;
+        let due: Vec<String> = routes
+            .map
+            .iter()
+            .filter(|(_, slot)| {
+                slot.left
+                    .is_some_and(|left| now.saturating_duration_since(left) >= EVICT_AFTER)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in due {
+            let Some(slot) = routes.map.remove(&name) else {
+                continue;
+            };
+            if slot.label != OTHER {
+                routes.labelled -= 1;
+            }
+            for (service, backend, status_class, reason) in slot.series {
+                self.requests.remove(&RequestLabels {
+                    service,
+                    route: slot.label.clone(),
+                    backend,
+                    status_class,
+                    reason,
+                });
+            }
+        }
+        // The series of `other` go with the last route that had the label.
+        if !routes.map.values().any(|slot| slot.label == OTHER) {
+            for (service, backend, status_class, reason) in std::mem::take(&mut routes.other) {
+                self.requests.remove(&RequestLabels {
+                    service,
+                    route: OTHER.to_string(),
+                    backend,
+                    status_class,
+                    reason,
+                });
+            }
+        }
     }
 
     /// One try written to the pod `endpoint`, with the `status_class` of its answer.
@@ -542,6 +689,8 @@ impl MeshMetrics {
 /// What one request is counted under.
 pub(crate) struct Call<'a> {
     pub service: &'a str,
+    /// `<namespace>/<name>` of the route that matched, `none` when none did.
+    pub route: &'a str,
     pub backend: &'a str,
     pub status_class: &'static str,
     pub reason: &'static str,

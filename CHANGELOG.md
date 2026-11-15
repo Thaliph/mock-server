@@ -21,6 +21,17 @@ All notable changes to mimic are documented in this file. The format follows
 
 ### Features
 
+- Routing by `HTTPRoute` in the sidecar (#448, M3): for a Service port that has routes the sidecar matches each
+  request (path, method, headers, query parameters, the Gateway API's precedence), draws a backend by weight and
+  sends the request to a pod of that backend with the backend's retry policy and budget, and applies the
+  `RequestHeaderModifier` and `ResponseHeaderModifier` of the rule; Upgrade, `CONNECT` and L4 are not routed.
+  **Behaviour change: a request that no rule of a routed port matches is answered `404` with
+  `x-mimic-error: no-route`** (the default of Istio and Linkerd); a catch-all rule naming the Service itself gives
+  the old behaviour back. A rule with no weight above 0 answers `500` `no-backend`, a drawn invalid backend `500`
+  `invalid-backend`. Access lines gain `route` and `rule`; `mimic_mesh_requests_total` has `route` (at most 256
+  values, then `other`) and new `reason` values. Upgrade the sidecars after the controller. See the canary
+  walkthrough in the wiki page Mesh.
+
 - Gateway API `HTTPRoute` in the controller (#447, M3): the controller reads `HTTPRoute`s whose `parentRefs` name a
   Service (GAMMA), compiles and validates them, puts them in the views of the callers they apply to (producer routes
   of the Service's namespace; consumer routes of the caller's own namespace) and reports `Accepted` and

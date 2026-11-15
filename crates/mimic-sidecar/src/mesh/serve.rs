@@ -25,16 +25,17 @@ use mimic_core::mesh::head::{Stop, leaves};
 use mimic_core::mesh::retry::{
     Decision, Failure, Outcome, Planner, Refusal, Verdict, classify, delay, trusted,
 };
+use mimic_core::mesh::route::{FieldList, Pick, RequestParts, RouteView, draw, split_target};
 use mimic_core::proxy::authority::status_class;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::MeshState;
 use super::dial::CLUSTER_CONNECT_TIMEOUT;
 use super::gate::{Gate, Progress};
-use super::metrics::Call;
+use super::metrics::{Call, INVALID_BACKEND, NO_BACKEND};
 use super::pool::{self, Lease, Protocol, Sent};
 use super::replay::Source;
-use super::router::{Backend, InFlight, Plan};
+use super::router::{Backend, InFlight, Plan, Routed};
 use crate::discovery::Tap;
 use crate::exchange::{self, Ctx, RespBody, Tracker};
 use crate::mock::{self, Mock};
@@ -277,6 +278,44 @@ impl Drop for Done {
     }
 }
 
+/// What the routes of a Service port decide for a request.
+enum Selected<'a> {
+    /// A rule matched and a backend was drawn.
+    Rule {
+        view: &'a RouteView,
+        rule: usize,
+        backend: Arc<Backend>,
+    },
+    /// The sidecar answers; `view` is the route that matched, if one did.
+    Answer {
+        view: Option<&'a RouteView>,
+        rule: usize,
+        status: StatusCode,
+        reason: &'static str,
+        backend: &'static str,
+    },
+}
+
+/// The field lines of a head as [`FieldList`] for a route's header modifier.
+struct Fields<'a>(&'a mut HeaderMap);
+
+impl FieldList for Fields<'_> {
+    fn remove_all(&mut self, name: &str) {
+        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+            self.0.remove(name);
+        }
+    }
+
+    fn append(&mut self, name: &str, value: &str) {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            self.0.append(name, value);
+        }
+    }
+}
+
 /// A connection for one try: the pod it goes to (counted in flight) or the original
 /// destination (`pick` none).
 struct Conn {
@@ -327,12 +366,13 @@ impl Serving {
         &self,
         protocol: Protocol,
         pick: Option<InFlight>,
+        (backend, original): (&Backend, SocketAddr),
         source: &Source,
         head: &Parts,
         warned: &AtomicBool,
     ) -> Tried {
         let router = self.mesh.router();
-        let upstream = pick.as_ref().map_or(self.ctx.dst, |p| p.endpoint().addr);
+        let upstream = pick.as_ref().map_or(original, |p| p.endpoint().addr);
         let timeout = if pick.is_some() {
             router.connect_timeout
         } else {
@@ -367,7 +407,7 @@ impl Serving {
                     written: true,
                 };
             }
-            router.metrics.reconnect(&self.backend.label);
+            router.metrics.reconnect(&backend.label);
             let again = router
                 .pools
                 .checkout(
@@ -409,8 +449,16 @@ impl Serving {
     }
 
     /// The next try after one failed: `Stop` without one left. A stale view, or one that says
-    /// `"mesh": false`, has the original destination for its only try (spec §7.9).
-    fn plan(&self, direct: bool, tries: u32, planner: &mut Planner) -> Plan {
+    /// `"mesh": false`, has the original destination for its only try (spec §7.9). A headless
+    /// backend (`original` none) has no destination to fall back to.
+    fn plan(
+        &self,
+        backend: &Backend,
+        original: Option<SocketAddr>,
+        direct: bool,
+        tries: u32,
+        planner: &mut Planner,
+    ) -> Plan {
         if direct {
             return if tries == 0 {
                 Plan::Original
@@ -418,28 +466,37 @@ impl Serving {
                 Plan::Stop
             };
         }
-        self.backend.plan(self.mesh.router(), planner)
+        match backend.plan(self.mesh.router(), planner) {
+            Plan::Original if original.is_none() => Plan::Stop,
+            plan => plan,
+        }
     }
 
     /// What to do with a failed try: a stale view, or one that says `"mesh": false`, has no
     /// try after the original destination and draws nothing on the budget.
-    fn decide(&self, direct: bool, verdict: Verdict, planner: &Planner) -> Decision {
+    fn decide(
+        &self,
+        backend: &Backend,
+        direct: bool,
+        verdict: Verdict,
+        planner: &Planner,
+    ) -> Decision {
         if direct && verdict.retry {
             return Decision::Exhausted;
         }
-        self.backend
+        backend
             .retry
             .decide(verdict, planner, self.mesh.router().now())
     }
 
     /// Counts a failure that is not retried (`Retry` is handled by the caller).
-    fn not_retried(&self, decision: Decision) {
+    fn not_retried(&self, backend: &Backend, decision: Decision) {
         let router = self.mesh.router();
-        let backend = &self.backend.label;
+        let label = &backend.label;
         match decision {
-            Decision::Skipped(skip) => router.metrics.skipped(backend, skip.label()),
-            Decision::Exhausted => router.metrics.skipped(backend, "exhausted"),
-            Decision::Budget => self.backend.exhausted(router),
+            Decision::Skipped(skip) => router.metrics.skipped(label, skip.label()),
+            Decision::Exhausted => router.metrics.skipped(label, "exhausted"),
+            Decision::Budget => backend.exhausted(router),
             Decision::Done | Decision::Retry => {}
         }
     }
@@ -473,7 +530,13 @@ impl Serving {
     /// by the caller).
     fn refused(&self, request: Option<&mimic_core::proxy::http1::RequestHead>) {
         exchange::refused(&self.ctx, request);
-        self.count(StatusCode::BAD_REQUEST, "invalid-request", Instant::now());
+        self.count(
+            "none",
+            &self.backend.label,
+            StatusCode::BAD_REQUEST,
+            "invalid-request",
+            Instant::now(),
+        );
     }
 
     async fn call(
@@ -504,7 +567,13 @@ impl Serving {
         if req.method() == Method::CONNECT || (http1 && req.headers().contains_key(header::UPGRADE))
         {
             let (tracker, _) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
-            self.count(StatusCode::NOT_IMPLEMENTED, "unsupported", began);
+            self.count(
+                "none",
+                &self.backend.label,
+                StatusCode::NOT_IMPLEMENTED,
+                "unsupported",
+                began,
+            );
             tracker.synthetic(StatusCode::NOT_IMPLEMENTED.as_u16());
             return Ok(answer(StatusCode::NOT_IMPLEMENTED, "unsupported", http1));
         }
@@ -514,22 +583,72 @@ impl Serving {
         }
         let (mut tracker, req) = Tracker::start(&self.ctx, label, self.tap.as_ref(), req);
         let router = self.mesh.router();
-        let backend = &self.backend.label;
-        let (head, body) = req.into_parts();
+        let (mut head, body) = req.into_parts();
         let source = Source::new(body, self.mesh.replay());
         let direct = self.mesh.stale() || self.mesh.off();
-        let mut planner = Planner::new(self.backend.retry.retries());
-        self.backend.retry.deposit(router.now());
+        // The routes of the port now (spec §7.9 "Routing"): none for a stale view.
+        let routed = if direct { None } else { self.backend.routed() };
+        let mut route = "none";
+        let mut drawn = self.backend.clone();
+        // Where the fallback goes: the ClusterIP of the drawn backend (none when it is headless),
+        // else the destination the app dialled.
+        let mut original = Some(self.ctx.dst);
+        let mut response_modifier = None;
+        if let Some(routed) = &routed {
+            match self.select(routed, &head) {
+                Selected::Rule {
+                    view,
+                    rule,
+                    backend,
+                } => {
+                    route = &view.name;
+                    tracker.matched(route, rule);
+                    let filters = view.rules[rule].filters.as_ref();
+                    if let Some(modifier) = filters.and_then(|f| f.request_headers.as_ref()) {
+                        modifier.apply(&mut Fields(&mut head.headers));
+                    }
+                    response_modifier = filters.and_then(|f| f.response_headers.as_ref());
+                    if !Arc::ptr_eq(&backend, &self.backend) {
+                        original = backend.original();
+                    }
+                    drawn = backend;
+                }
+                Selected::Answer {
+                    view,
+                    rule,
+                    status,
+                    reason,
+                    backend,
+                } => {
+                    if let Some(view) = view {
+                        route = &view.name;
+                        tracker.matched(route, rule);
+                    }
+                    self.count(route, backend, status, reason, began);
+                    tracker.synthetic(status.as_u16());
+                    return Ok(answer(status, reason, false));
+                }
+            }
+        }
+        let backend = &drawn.label;
+        let mut planner = Planner::new(drawn.retry.retries());
+        drawn.retry.deposit(router.now());
         let warned = AtomicBool::new(false);
         let mut tries = 0;
         let mut again: Option<Outcome> = None;
-        let mut next = self.plan(direct, tries, &mut planner);
+        let mut next = self.plan(&drawn, original, direct, tries, &mut planner);
         loop {
             let pick = match next {
                 Plan::Pod(pick) => Some(pick),
                 Plan::Original => None,
                 Plan::Stop => {
-                    self.count(StatusCode::SERVICE_UNAVAILABLE, "no-endpoint", began);
+                    self.count(
+                        route,
+                        backend,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "no-endpoint",
+                        began,
+                    );
                     tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
                     return Ok(answer(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -545,10 +664,18 @@ impl Serving {
             if pick.is_none() {
                 router.metrics.fallback(backend);
             }
-            let upstream = pick.as_ref().map_or(self.ctx.dst, |p| p.endpoint().addr);
+            // `plan` gives no original destination to a headless backend.
+            let dst = original.unwrap_or(self.ctx.dst);
+            let upstream = pick.as_ref().map_or(dst, |p| p.endpoint().addr);
             tracker.route(backend, upstream, tries);
-            match self.try_once(protocol, pick, &source, &head, &warned).await {
-                Tried::Answer { response, mut conn } => {
+            match self
+                .try_once(protocol, pick, (&drawn, dst), &source, &head, &warned)
+                .await
+            {
+                Tried::Answer {
+                    mut response,
+                    mut conn,
+                } => {
                     let status = response.status();
                     let refusal = refusal_of(&response, conn.pick.as_ref(), self.origin.is_some());
                     let failure = refusal.map_or(Failure::Response, Failure::Refusal);
@@ -561,25 +688,30 @@ impl Serving {
                             .endpoint_try(backend, &pick.endpoint().label, class);
                     }
                     planner.failed(verdict.outcome);
-                    match self.decide(direct, verdict, &planner) {
-                        Decision::Retry => match self.plan(direct, tries, &mut planner) {
-                            Plan::Stop => router.metrics.skipped(backend, "exhausted"),
-                            // The try in flight stops reading the app's body now, so that
-                            // what the next try replays is what was read.
-                            retry if source.detach() => {
-                                Self::discard(response, &mut conn.lease).await;
-                                drop(conn);
-                                self.pause(verdict.outcome).await;
-                                again = Some(verdict.outcome);
-                                next = retry;
-                                continue;
+                    match self.decide(&drawn, direct, verdict, &planner) {
+                        Decision::Retry => {
+                            match self.plan(&drawn, original, direct, tries, &mut planner) {
+                                Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                                // The try in flight stops reading the app's body now, so that
+                                // what the next try replays is what was read.
+                                retry if source.detach() => {
+                                    Self::discard(response, &mut conn.lease).await;
+                                    drop(conn);
+                                    self.pause(verdict.outcome).await;
+                                    again = Some(verdict.outcome);
+                                    next = retry;
+                                    continue;
+                                }
+                                _ => router.metrics.skipped(backend, "buffer"),
                             }
-                            _ => router.metrics.skipped(backend, "buffer"),
-                        },
-                        other => self.not_retried(other),
+                        }
+                        other => self.not_retried(&drawn, other),
                     }
                     source.release();
                     let Conn { pick, lease } = conn;
+                    if let Some(modifier) = response_modifier {
+                        modifier.apply(&mut Fields(response.headers_mut()));
+                    }
                     let answered = match refusal {
                         Some(_) => tracker.answered_unrecorded(response),
                         None => tracker.answered(response),
@@ -593,7 +725,7 @@ impl Serving {
                         Refusal::QueueTimeout => "queue-timeout",
                         Refusal::AppRefused => "app-refused",
                     });
-                    self.count(answered.status(), reason, began);
+                    self.count(route, backend, answered.status(), reason, began);
                     return Ok(answered.map(|body| MeshBody {
                         upstream: Some(body),
                         mocked: None,
@@ -617,20 +749,78 @@ impl Serving {
                         router.metrics.endpoint_try(backend, label, "none");
                     }
                     planner.failed(verdict.outcome);
-                    match self.decide(direct, verdict, &planner) {
-                        Decision::Retry => match self.plan(direct, tries, &mut planner) {
-                            Plan::Stop => router.metrics.skipped(backend, "exhausted"),
-                            retry if source.detach() => {
-                                drop(pick);
-                                again = Some(verdict.outcome);
-                                next = retry;
-                                continue;
+                    match self.decide(&drawn, direct, verdict, &planner) {
+                        Decision::Retry => {
+                            match self.plan(&drawn, original, direct, tries, &mut planner) {
+                                Plan::Stop => router.metrics.skipped(backend, "exhausted"),
+                                retry if source.detach() => {
+                                    drop(pick);
+                                    again = Some(verdict.outcome);
+                                    next = retry;
+                                    continue;
+                                }
+                                _ => router.metrics.skipped(backend, "buffer"),
                             }
-                            _ => router.metrics.skipped(backend, "buffer"),
-                        },
-                        other => self.not_retried(other),
+                        }
+                        other => self.not_retried(&drawn, other),
                     }
-                    return self.failed(tracker, failure, error, upstream, began);
+                    return self.failed(tracker, (route, backend), failure, error, upstream, began);
+                }
+            }
+        }
+    }
+
+    /// The rule of `routed` that matches the request and its drawn backend, or the answer of
+    /// the sidecar (spec §7.9 "Routing").
+    fn select<'a>(&self, routed: &'a Routed, head: &Parts) -> Selected<'a> {
+        let headers: Vec<(&str, &[u8])> = head
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        let (path, query) = split_target(head.uri.path_and_query().map_or("", |p| p.as_str()));
+        let parts = RequestParts {
+            method: head.method.as_str(),
+            path,
+            query,
+            headers: &headers,
+        };
+        let Some((route, rule)) = routed.table.select(&parts) else {
+            return Selected::Answer {
+                view: None,
+                rule: 0,
+                status: StatusCode::NOT_FOUND,
+                reason: "no-route",
+                backend: NO_BACKEND,
+            };
+        };
+        let view = &routed.routes[route];
+        let backends = &view.rules[rule].backends;
+        let invalid = |reason, backend| Selected::Answer {
+            view: Some(view),
+            rule,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            reason,
+            backend,
+        };
+        match draw(backends, self.mesh.router().random()) {
+            Pick::NoBackend => invalid("no-backend", NO_BACKEND),
+            Pick::Invalid => invalid("invalid-backend", INVALID_BACKEND),
+            Pick::Backend(i) => {
+                let b = &backends[i];
+                let found = b
+                    .service
+                    .as_deref()
+                    .zip(b.port)
+                    .and_then(|(service, port)| self.mesh.router().backend(service, port));
+                match found {
+                    Some(backend) => Selected::Rule {
+                        view,
+                        rule,
+                        backend,
+                    },
+                    // A backend the view does not hold is as invalid as one it names so.
+                    None => invalid("invalid-backend", INVALID_BACKEND),
                 }
             }
         }
@@ -647,10 +837,11 @@ impl Serving {
     }
 
     /// The request ends without a response: the answer of the sidecar, or the error that ends
-    /// the app's connection or stream.
+    /// the app's connection or stream. `labels` are the `route` and `backend` it is counted under.
     fn failed(
         &self,
         tracker: Tracker,
+        (route, backend): (&str, &str),
         failure: Failure,
         error: Option<hyper::Error>,
         upstream: SocketAddr,
@@ -659,7 +850,13 @@ impl Serving {
         match failure {
             Failure::Connect => {
                 tracing::debug!(%upstream, "connect failed");
-                self.count(StatusCode::SERVICE_UNAVAILABLE, "connect-failed", began);
+                self.count(
+                    route,
+                    backend,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "connect-failed",
+                    began,
+                );
                 tracker.synthetic(StatusCode::SERVICE_UNAVAILABLE.as_u16());
                 Ok(answer(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -669,13 +866,19 @@ impl Serving {
             }
             Failure::Response => {
                 tracing::debug!(%upstream, "the pod's response head was refused");
-                self.count(StatusCode::BAD_GATEWAY, "invalid-response", began);
+                self.count(
+                    route,
+                    backend,
+                    StatusCode::BAD_GATEWAY,
+                    "invalid-response",
+                    began,
+                );
                 tracker.synthetic(StatusCode::BAD_GATEWAY.as_u16());
                 Ok(answer(StatusCode::BAD_GATEWAY, "invalid-response", false))
             }
             _ => {
                 tracing::debug!(%upstream, "the pod did not answer");
-                self.count_none(began);
+                self.count_none(route, backend, began);
                 tracker.failed();
                 // The app's stream is reset with the code the pod used, or `REFUSED_STREAM`
                 // when it refused the stream by a `GOAWAY`.
@@ -687,11 +890,19 @@ impl Serving {
         }
     }
 
-    fn count(&self, status: StatusCode, reason: &'static str, began: Instant) {
+    fn count(
+        &self,
+        route: &str,
+        backend: &str,
+        status: StatusCode,
+        reason: &'static str,
+        began: Instant,
+    ) {
         self.mesh.router().metrics.request(
             &Call {
                 service: &self.backend.service,
-                backend: &self.backend.label,
+                route,
+                backend,
                 status_class: status_class(status.as_u16()),
                 reason,
             },
@@ -700,11 +911,12 @@ impl Serving {
     }
 
     /// A request that got no response.
-    fn count_none(&self, began: Instant) {
+    fn count_none(&self, route: &str, backend: &str, began: Instant) {
         self.mesh.router().metrics.request(
             &Call {
                 service: &self.backend.service,
-                backend: &self.backend.label,
+                route,
+                backend,
                 status_class: "none",
                 reason: "none",
             },

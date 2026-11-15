@@ -118,11 +118,11 @@ async fn rte_20_requests_are_balanced_as_without_routes_and_the_routes_backends_
     };
     let service = |ip: &str, pods: Vec<String>, routes: &str| {
         format!(
-            r#"{{"endpoints":{{"80":[{}]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":0}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"80":{{"targetPort":8080}}}}{routes}}}"#,
+            r#"{{"endpoints":{{"80":[{}],"81":[]}},"generations":{{}},"ips":["{ip}"],"policy":{{"loadBalancer":{{"slowStartSeconds":0}},"retries":3,"retryBudget":{{"minPerSecond":10,"percent":20,"windowSeconds":10}}}},"ports":{{"80":{{"targetPort":8080}},"81":{{"targetPort":8081}}}}{routes}}}"#,
             pods.join(",")
         )
     };
-    let routes = r#","routes":[{"name":"shop/canary","rules":[{"backends":[{"port":80,"service":"shop/shadow","weight":100}],"filters":{"mirrors":[{"denominator":100,"numerator":100,"port":80,"service":"shop/shadow"}]},"matches":[{"path":{"type":"PathPrefix","value":"/"}}]}]}]"#;
+    let routes = r#","routes":[{"name":"shop/canary","ports":[81],"rules":[{"backends":[{"port":80,"service":"shop/shadow","weight":100}],"filters":{"mirrors":[{"denominator":100,"numerator":100,"port":80,"service":"shop/shadow"}]},"matches":[{"path":{"type":"PathPrefix","value":"/"}}]}]}]"#;
     let cart = service(
         "127.0.0.1",
         [&a, &b, &c].iter().map(|p| endpoint(p)).collect(),
@@ -149,7 +149,8 @@ async fn rte_20_requests_are_balanced_as_without_routes_and_the_routes_backends_
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         bodies.push(body);
     }
-    // Exactly the spread of msh_48 without routes, and nothing for the routes' backend.
+    // Exactly the spread of msh_48 without routes (the route is of port 81, since RTE-47 a route
+    // of port 80 routes), and nothing for the routes' backend.
     let counts = spread(bodies);
     assert_eq!(counts.len(), 3, "{counts:?}");
     for (pod, n) in &counts {

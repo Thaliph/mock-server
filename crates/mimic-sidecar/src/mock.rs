@@ -554,6 +554,8 @@ impl Flight {
             backend: None,
             upstream: None,
             attempts: None,
+            route: None,
+            rule: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.owed.store(true, Ordering::Release);
@@ -595,6 +597,8 @@ impl Drop for Flight {
             backend: None,
             upstream: None,
             attempts: None,
+            route: None,
+            rule: None,
         });
         if let Some(clock) = &self.conn.clock {
             clock.release();
@@ -885,6 +889,8 @@ impl Mock {
             backend: None,
             upstream: None,
             attempts: None,
+            route: None,
+            rule: None,
         });
     }
 }

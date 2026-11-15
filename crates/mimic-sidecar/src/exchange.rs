@@ -247,6 +247,9 @@ pub(crate) struct Tracker {
     upstream: Option<SocketAddr>,
     /// Mesh-routed: the number of tries.
     attempts: Option<u32>,
+    /// Mesh-routed: the route and the rule that matched (spec §7.9 "Routing").
+    route: Option<Arc<str>>,
+    rule: Option<usize>,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -335,6 +338,8 @@ impl Tracker {
             backend: None,
             upstream: None,
             attempts: None,
+            route: None,
+            rule: None,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -363,6 +368,12 @@ impl Tracker {
         self.backend = Some(backend.clone());
         self.upstream = Some(upstream);
         self.attempts = Some(attempts);
+    }
+
+    /// The request matched rule `rule` of `route` (spec §7.9 "Routing").
+    pub(crate) fn matched(&mut self, route: &str, rule: usize) {
+        self.route = Some(Arc::from(route));
+        self.rule = Some(rule);
     }
 
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
@@ -533,6 +544,8 @@ impl Tracker {
             backend: self.backend.take().map(|b| b.to_string()),
             upstream: self.upstream,
             attempts: self.attempts,
+            route: self.route.take(),
+            rule: self.rule,
         });
     }
 }
@@ -664,6 +677,8 @@ pub(crate) fn rejected(ctx: &Ctx) {
         backend: None,
         upstream: None,
         attempts: None,
+        route: None,
+        rule: None,
     });
 }
 
@@ -702,6 +717,8 @@ pub(crate) fn refused(ctx: &Ctx, request: Option<&RequestHead>) {
         backend: None,
         upstream: None,
         attempts: None,
+        route: None,
+        rule: None,
     });
 }
 
@@ -1022,6 +1039,8 @@ impl Http1Tracker {
             backend: None,
             upstream: None,
             attempts: None,
+            route: None,
+            rule: None,
         });
     }
 }

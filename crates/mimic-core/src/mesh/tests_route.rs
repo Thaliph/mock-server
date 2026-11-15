@@ -966,3 +966,91 @@ fn rte_03_one_item_over_each_crd_maximum_makes_the_route_unsupported() {
     assert_eq!(reason, "UnsupportedValue");
     assert_eq!(message, "unsupported: rules");
 }
+
+// ---- RTE-45: header names of at most 256 bytes
+
+#[test]
+fn rte_45_a_header_name_of_257_bytes_is_unsupported_and_one_of_256_is_not() {
+    let nm = |name: &str| NameMatch {
+        kind: "Exact".into(),
+        name: name.into(),
+        value: "v".into(),
+    };
+    let matched = |name: &str| RouteRule {
+        matches: vec![RouteMatch {
+            headers: vec![nm(name)],
+            ..RouteMatch::default()
+        }],
+        backend_refs: vec![backend(None, "cart-v1", 80, None)],
+        ..RouteRule::default()
+    };
+    let modified = |kind: &str, m: HeaderModifier| RouteRule {
+        filters: vec![modifier_filter(kind, m)],
+        backend_refs: vec![backend(None, "cart-v1", 80, None)],
+        ..RouteRule::default()
+    };
+    let long = "A".repeat(257);
+    let max = "A".repeat(256);
+    for (rule_of, at) in [
+        (
+            Box::new(|n: &str| matched(n)) as Box<dyn Fn(&str) -> RouteRule>,
+            "rules[0].matches[0].headers[0].name",
+        ),
+        (
+            Box::new(|n: &str| {
+                modified(
+                    "RequestHeaderModifier",
+                    HeaderModifier {
+                        set: vec![pair(n, "v")],
+                        ..HeaderModifier::default()
+                    },
+                )
+            }),
+            "rules[0].filters[0].requestHeaderModifier.set[0].name",
+        ),
+        (
+            Box::new(|n: &str| {
+                modified(
+                    "ResponseHeaderModifier",
+                    HeaderModifier {
+                        add: vec![pair(n, "v")],
+                        ..HeaderModifier::default()
+                    },
+                )
+            }),
+            "rules[0].filters[0].responseHeaderModifier.add[0].name",
+        ),
+        (
+            Box::new(|n: &str| {
+                modified(
+                    "RequestHeaderModifier",
+                    HeaderModifier {
+                        remove: vec![n.into()],
+                        ..HeaderModifier::default()
+                    },
+                )
+            }),
+            "rules[0].filters[0].requestHeaderModifier.remove[0]",
+        ),
+    ] {
+        let c = plain(&simple(vec![rule_of(&long)]));
+        assert_eq!(
+            accepted(&c),
+            (
+                false,
+                "UnsupportedValue".into(),
+                format!("unsupported: {at}")
+            )
+        );
+        assert!(
+            plain(&simple(vec![rule_of(&max)])).programmed,
+            "{at} at 256"
+        );
+        for pseudo in [":authority", ":path", ":status"] {
+            assert!(
+                !plain(&simple(vec![rule_of(pseudo)])).programmed,
+                "{pseudo}"
+            );
+        }
+    }
+}

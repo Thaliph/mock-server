@@ -101,6 +101,10 @@ cleanup() {
     # Only the CRDs this run installed: a cluster that had them keeps them.
     [[ -z ${RTE_21_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
+  if [[ -n ${RTE_55_CLEANUP:-} ]]; then
+    kubectl delete namespace rte-55 --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    [[ -z ${RTE_55_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
   [[ $BUILT == 1 ]] && docker rmi "$IMAGE" "$INIT_IMAGE" >/dev/null 2>&1 || true
   for image in "${DERIVED[@]}"; do docker rmi "$image" >/dev/null 2>&1 || true; done
   [[ -z ${CHROME:-} ]] || docker rm -f "$CHROME" >/dev/null 2>&1 || true
@@ -5461,6 +5465,230 @@ kubectl delete namespace rte-21 rte-21-b --wait=false >/dev/null
 RTE_21_CLEANUP=
 RTE_21_CRDS=
 echo "rte_21: split got its status and is in the view, rewrite is UnsupportedValue and absent, cross follows its ReferenceGrant, another controller's entry stays; without the CRDs $rte_21_total requests reached $rte_21_endpoints pods and the CRDs back give a status"
+
+# --- Canary by an HTTPRoute (#448, spec §12.23 RTE-55, RTE-56) ----------------------------------------------------------------
+# Objects of this section only: rte-55 (injected: client, which calls; cart, a Service over the pods of cart-v1 and cart-v2,
+# which answer their own name). The Gateway API CRDs are the pinned manifest msh_28 downloaded ($WORK/gateway-standard.yaml);
+# rte_21 removed them when it had installed them, so they are installed here again and removed at the end on the same terms.
+log "rte_55: a canary by an HTTPRoute (90/10, shifted to 0/100, a header match, deleted) and the no-route answer"
+[[ -s $WORK/gateway-standard.yaml ]] || fail "rte_55: the pinned Gateway API manifest of msh_28 is missing"
+RTE_55_CLEANUP=1
+# rte_21 deleted the CRDs without waiting: let a deletion in progress end before installing them again.
+for _ in $(seq 60); do
+  [[ -n $(kubectl get crd httproutes.gateway.networking.k8s.io -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true) ]] || break
+  sleep 1
+done
+if [[ -z $(kubectl get crd httproutes.gateway.networking.k8s.io -o name 2>/dev/null || true) ]]; then RTE_55_CRDS=1; fi
+kubectl apply --server-side -f "$WORK/gateway-standard.yaml" >/dev/null
+kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io crd/referencegrants.gateway.networking.k8s.io --timeout=60s >/dev/null
+ns_fresh rte-55 mimic.platform.io/inject=enabled pod-security.kubernetes.io/enforce=privileged
+rte_55_app() { # rte_55_app <name> <version label>: a Deployment answering its own name on 8080, behind Service cart and its own Service
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $1, namespace: rte-55}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: cart, version: $2}}
+  template:
+    metadata: {labels: {app: cart, version: $2}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          env: [{name: NAME, value: $1}]
+          command: [python3, -c]
+          args:
+            - |
+              import http.server, os
+              class H(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      body = os.environ["NAME"].encode()
+                      self.send_response(200)
+                      self.send_header("content-length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  def log_message(self, *args):
+                      pass
+              http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {tcpSocket: {port: http}, periodSeconds: 1}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: $1, namespace: rte-55}
+spec:
+  selector: {app: cart, version: $2}
+  ports: [{name: http, port: 80, targetPort: http}]
+YAML
+}
+rte_55_app cart-v1 v1
+rte_55_app cart-v2 v2
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Service
+metadata: {name: cart, namespace: rte-55}
+spec:
+  selector: {app: cart}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: client, namespace: rte-55}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: client}}
+  template:
+    metadata: {labels: {app: client}}
+    spec:
+      containers:
+        - name: app
+          image: $PY
+          command: [python3, -c, "import time; time.sleep(86400)"]
+YAML
+for dep in cart-v1 cart-v2 client; do kubectl -n rte-55 rollout status deploy/$dep --timeout=3m >/dev/null || fail "rte_55: $dep did not roll out Ready"; done
+# rte_55_until <timeout seconds> <description> <command...>: polls the command once a second.
+rte_55_until() {
+  local limit=$1 desc=$2; shift 2
+  for _ in $(seq "$limit"); do "$@" && return 0; sleep 1; done
+  fail "rte_55: $desc"
+}
+admin_forward
+rte_55_until 60 "the controller did not report mimic_mesh_gateway_api_present 1 after the CRDs were installed" gateway_present
+rte_55_client=$(kubectl -n rte-55 get pods -l app=client -o jsonpath='{.items[0].metadata.name}')
+# rte_55_calls <count> <path> <x-canary value or empty>: "<cart-v1> <cart-v2> <others>", the answers of count requests from client to cart.
+rte_55_calls() {
+  kubectl -n rte-55 exec deploy/client -c app -- python3 -c '
+import collections, sys, urllib.error, urllib.request
+count, path, canary = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+seen = collections.Counter()
+for _ in range(count):
+    request = urllib.request.Request("http://cart.rte-55.svc" + path)
+    if canary:
+        request.add_header("x-canary", canary)
+    try:
+        seen[urllib.request.urlopen(request, timeout=10).read().decode()] += 1
+    except urllib.error.HTTPError as error:
+        seen["http%d" % error.code] += 1
+print(seen["cart-v1"], seen["cart-v2"], sum(seen.values()) - seen["cart-v1"] - seen["cart-v2"])
+' "$@"
+}
+# rte_55_only <version> <x-canary value or empty> <path>: true when 20 requests in a row were all answered by the version.
+rte_55_only() {
+  local want=$1 got
+  got=$(rte_55_calls 20 "$3" "$2") || return 1
+  if [[ $want == cart-v1 ]]; then [[ $got == "20 0 0" ]]; else [[ $got == "0 20 0" ]]; fi
+}
+# rte_55_both: true when 60 requests reached both versions.
+rte_55_both() {
+  local got v1 v2 other
+  got=$(rte_55_calls 60 / "") || return 1
+  read -r v1 v2 other <<<"$got"
+  (( v1 > 0 && v2 > 0 && other == 0 ))
+}
+# rte_55_access <jq boolean>: the number of access lines of the sidecar of client for which the boolean holds.
+rte_55_access() {
+  kubectl -n rte-55 logs "$rte_55_client" -c mimic-sidecar 2>/dev/null \
+    | jq -R -r "fromjson? | select(.target == \"access\" and ($1)) | 1" | wc -l | tr -d ' '
+}
+rte_55_access_is() { [[ $(rte_55_access "$1") -ge 1 ]]; }
+
+# RTE-55: 90/10, then 0/100 within one view update, a header match, the route deleted.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: cart-canary, namespace: rte-55}
+spec:
+  parentRefs: [{group: "", kind: Service, name: cart, port: 80}]
+  rules:
+    - backendRefs:
+        - {name: cart-v1, port: 80, weight: 90}
+        - {name: cart-v2, port: 80, weight: 10}
+YAML
+# Until the sidecar holds the route a request is balanced over the Service's pods (about 50/50): wait for the first view with it.
+rte_55_weighted() { local got; got=$(rte_55_calls 60 / "") || return 1; read -r v1 v2 _ <<<"$got"; (( v2 <= 15 && v1 > 0 )); }
+rte_55_until 60 "the requests to cart were not weighted 90/10 within 60 s of the route" rte_55_weighted
+rte_55_counts=$(rte_55_calls 1000 / "") || fail "rte_55: the 1000 requests to cart failed"
+read -r rte_55_v1 rte_55_v2 rte_55_other <<<"$rte_55_counts"
+(( rte_55_other == 0 )) || fail "rte_55: $rte_55_other of the 1000 requests were not answered by a version"
+(( rte_55_v2 >= 50 && rte_55_v2 <= 150 )) || fail "rte_55: cart-v2 served $rte_55_v2 of 1000 requests with weights 90/10, 100 +- 50 expected"
+echo "rte_55: 90/10 gave cart-v1 $rte_55_v1 and cart-v2 $rte_55_v2 of 1000"
+
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: cart-canary, namespace: rte-55}
+spec:
+  parentRefs: [{group: "", kind: Service, name: cart, port: 80}]
+  rules:
+    - backendRefs:
+        - {name: cart-v1, port: 80, weight: 0}
+        - {name: cart-v2, port: 80, weight: 100}
+YAML
+# The shift lands with one view update: 20 requests in a row on cart-v2 are likely only after it (0.1^20 before).
+rte_55_until 60 "the requests to cart did not all go to cart-v2 within 60 s of the route at 0/100" rte_55_only cart-v2 "" /
+rte_55_counts=$(rte_55_calls 100 / "") || fail "rte_55: the 100 requests to cart at 0/100 failed"
+[[ $rte_55_counts == "0 100 0" ]] || fail "rte_55: 100 requests at 0/100 gave '$rte_55_counts' (cart-v1 cart-v2 others), 0 100 0 expected"
+
+# A header rule: x-canary: 1 goes to cart-v2, the rest to cart-v1.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: cart-canary, namespace: rte-55}
+spec:
+  parentRefs: [{group: "", kind: Service, name: cart, port: 80}]
+  rules:
+    - matches: [{headers: [{type: Exact, name: x-canary, value: "1"}]}]
+      backendRefs: [{name: cart-v2, port: 80}]
+    - backendRefs: [{name: cart-v1, port: 80}]
+YAML
+rte_55_until 60 "the requests to cart without x-canary did not all go to cart-v1 within 60 s of the header rule" rte_55_only cart-v1 "" /
+rte_55_counts=$(rte_55_calls 100 / 1) || fail "rte_55: the 100 requests with x-canary failed"
+[[ $rte_55_counts == "0 100 0" ]] || fail "rte_55: 100 requests with x-canary: 1 gave '$rte_55_counts', 0 100 0 expected"
+rte_55_counts=$(rte_55_calls 100 / "") || fail "rte_55: the 100 requests without x-canary failed"
+[[ $rte_55_counts == "100 0 0" ]] || fail "rte_55: 100 requests without x-canary gave '$rte_55_counts', 100 0 0 expected"
+rte_55_counts=$(rte_55_calls 20 / 2) || fail "rte_55: the 20 requests with x-canary: 2 failed"
+[[ $rte_55_counts == "20 0 0" ]] || fail "rte_55: 20 requests with x-canary: 2 gave '$rte_55_counts', 20 0 0 expected"
+
+# RTE-56: a route with one Exact rule; what it does not match is answered 404 no-route by the sidecar.
+kubectl apply -f - >/dev/null <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: cart-canary, namespace: rte-55}
+spec:
+  parentRefs: [{group: "", kind: Service, name: cart, port: 80}]
+  rules:
+    - matches: [{path: {type: Exact, value: /cart}}]
+      backendRefs: [{name: cart-v1, port: 80}]
+YAML
+rte_55_error() { # the x-mimic-error and the status of a request to /other
+  kubectl -n rte-55 exec deploy/client -c app -- python3 -c '
+import urllib.error, urllib.request
+try:
+    urllib.request.urlopen("http://cart.rte-55.svc/other", timeout=10)
+    print("200")
+except urllib.error.HTTPError as error:
+    print(error.code, error.headers.get("x-mimic-error"))
+'
+}
+rte_55_is_no_route() { [[ $(rte_55_error) == "404 no-route" ]]; }
+rte_55_until 60 "a request to /other was not answered 404 no-route within 60 s of the Exact rule" rte_55_is_no_route
+rte_55_counts=$(rte_55_calls 1 /cart "") || fail "rte_55: the request to /cart failed"
+[[ $rte_55_counts == "1 0 0" ]] || fail "rte_55: a request to /cart gave '$rte_55_counts', 1 0 0 expected"
+rte_55_until 10 "no access line of client holds GET /other 404 without route, backend and upstream" rte_55_access_is \
+  '.direction == "outbound" and .path == "/other" and .status == 404 and (has("route") | not) and (has("backend") | not) and (has("upstream") | not)'
+rte_55_until 10 "no access line of client holds GET /cart with route rte-55/cart-canary, rule 0 and a backend" rte_55_access_is \
+  '.direction == "outbound" and .path == "/cart" and .status == 200 and .route == "rte-55/cart-canary" and .rule == 0 and (.backend | type == "string")'
+
+# RTE-55: the route deleted, requests reach both versions again (the Service's own pods).
+kubectl -n rte-55 delete httproute cart-canary >/dev/null
+rte_55_until 60 "60 requests to cart did not reach both versions within 60 s of the route deleted" rte_55_both
+
+kubectl delete namespace rte-55 --wait=false >/dev/null
+[[ -z ${RTE_55_CRDS:-} ]] || kubectl delete -f "$WORK/gateway-standard.yaml" --ignore-not-found --wait=false >/dev/null
+RTE_55_CLEANUP=
+RTE_55_CRDS=
+echo "rte_55: the canary followed 90/10, 0/100 and the header rule within a view update, /other got 404 no-route with its access line, and the deleted route gave both versions back"
 
 # --- Production overlay (#438, spec §12.18 CHT-08) -------------------------------------------------------------------
 # One install with deploy/helm/mimic/values-production.yaml, last so that the sections above see the defaults. The

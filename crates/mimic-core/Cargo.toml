@@ -36,3 +36,7 @@ harness = false
 [[bench]]
 name = "mesh_lb"
 harness = false
+
+[[bench]]
+name = "mesh_route"
+harness = false
