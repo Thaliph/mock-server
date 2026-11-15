@@ -21,7 +21,7 @@ FROM docker.io/grafana/grafana:13.2.4-distroless@sha256:ae3d3add290adbe6a8841222
 FROM quay.io/kiwigrid/k8s-sidecar:2.14.1@sha256:092dbe0c335fba9af414a27630ca68f34df6185784fa847d9954187e69dbfdd7 AS k8s-sidecar
 
 # Valkey: the chart's default (deploy/helm/mimic/values.yaml, valkey.image), also scanned by Trivy in CI.
-FROM docker.io/valkey/valkey:9.0-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416 AS valkey
+FROM docker.io/valkey/valkey:9.1-alpine@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b AS valkey
 
 # kind node image of the Kubernetes floor of the e2e matrix (.github/workflows/ci.yml).
 FROM kindest/node:v1.33.12@sha256:3f5c8443c620245e4d355cfe09e96a91ead32ceaa569d3f1ca9edf0cb2fe2ff4 AS kind-node
