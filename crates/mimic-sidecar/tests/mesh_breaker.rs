@@ -604,7 +604,7 @@ async fn cbr_28_an_open_breaker_adds_no_try_and_is_counted_and_logged_once_a_sec
         assert_eq!(line["rule"], 0);
         assert!(
             line.get("upstream").is_none() && line.get("attempts").is_none(),
-            "{line}"
+            "a breaker-open line names no pod and no tries"
         );
     }
     assert_eq!(code(held).await, 200);
@@ -790,7 +790,14 @@ async fn cbr_31_h2c_keeps_its_sixteen_connections_whatever_maxconnections() {
     let state = state_with(&[cart(&[pod.addr]).breaker(1024, 2)], |_| {});
     let f = fixture_mesh(dst(), &state, None).await;
     let sender = h2_client(f.addr).await;
-    let jobs: Vec<_> = (0..6).map(|_| h2_get(&sender)).collect();
+    // One request first, so that the sidecar knows the pod's stream limit of 1.
+    assert_eq!(h2_get(&sender).await.unwrap().0, 200);
+    // Spaced, so that each new connection announced its limit before the next stream.
+    let mut jobs = Vec::new();
+    for _ in 0..6 {
+        jobs.push(h2_get(&sender));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
     for job in jobs {
         assert_eq!(job.await.unwrap().0, 200);
     }
