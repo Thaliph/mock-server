@@ -256,6 +256,8 @@ pub(crate) struct Tracker {
     /// Mesh-routed: a copy of the request was sent to a mirror (spec §7.9 "Mirrors").
     /// Set by the request when a copy has its body and is sent (spec §4.1 `mirrored`).
     mirrored: Arc<AtomicBool>,
+    /// Mesh-routed: the `x-mimic-error` of an answer of the sidecar (spec §4.1 `reason`).
+    reason: Option<&'static str>,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -348,6 +350,7 @@ impl Tracker {
             rule: None,
             timeout: None,
             mirrored: Arc::new(AtomicBool::new(false)),
+            reason: None,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -378,6 +381,12 @@ impl Tracker {
         self.attempts = Some(attempts);
     }
 
+    /// The request was answered before any try, for `backend` (spec §7.9 "Circuit breaker"): the
+    /// access line names the backend but no pod and no tries.
+    pub(crate) fn backend(&mut self, backend: &Arc<str>) {
+        self.backend = Some(backend.clone());
+    }
+
     /// The request matched rule `rule` of `route` (spec §7.9 "Routing").
     pub(crate) fn matched(&mut self, route: &str, rule: usize) {
         self.route = Some(Arc::from(route));
@@ -391,8 +400,10 @@ impl Tracker {
     }
 
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
-    /// logged like a response, and never handed to discovery.
-    pub(crate) fn synthetic(self, status: u16) {
+    /// logged like a response, and never handed to discovery; `reason` is the `x-mimic-error`
+    /// it carries.
+    pub(crate) fn synthetic(mut self, status: u16, reason: &'static str) {
+        self.reason = Some(reason);
         self.answered_by_sidecar(status, Outcome::Ok);
     }
 
@@ -400,6 +411,7 @@ impl Tracker {
     /// `504`, logged with `result: timeout` and the timeout that expired.
     pub(crate) fn timed_out(mut self, kind: Kind) {
         self.timeout = Some(kind.label());
+        self.reason = Some("timeout");
         self.answered_by_sidecar(StatusCode::GATEWAY_TIMEOUT.as_u16(), Outcome::Timeout);
     }
 
@@ -573,6 +585,7 @@ impl Tracker {
             rule: self.rule,
             timeout: self.timeout,
             mirrored: self.mirrored.load(Ordering::SeqCst),
+            reason: self.reason,
         });
     }
 }
@@ -717,6 +730,7 @@ pub(crate) fn rejected(ctx: &Ctx) {
         rule: None,
         timeout: None,
         mirrored: false,
+        reason: None,
     });
 }
 
@@ -759,6 +773,7 @@ pub(crate) fn refused(ctx: &Ctx, request: Option<&RequestHead>) {
         rule: None,
         timeout: None,
         mirrored: false,
+        reason: None,
     });
 }
 
@@ -1083,6 +1098,7 @@ impl Http1Tracker {
             rule: None,
             timeout: None,
             mirrored: false,
+            reason: None,
         });
     }
 }

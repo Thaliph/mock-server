@@ -19,7 +19,7 @@ use mimic_core::mesh::view::View;
 use prometheus_client::metrics::gauge::Gauge;
 
 use super::metrics::MeshMetrics;
-use super::pool::Pools;
+use super::pool::{self, Pools};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -105,6 +105,22 @@ impl State {
 pub(crate) struct ServiceRetry {
     retries: AtomicU32,
     budget: Mutex<(u32, Budget)>,
+    /// The circuit breaker of the Service (spec §7.9 "Circuit breaker"): the requests in flight
+    /// across its ports, its two limits and the limiter of its warning.
+    in_flight: Arc<AtomicUsize>,
+    max_requests: AtomicU32,
+    max_connections: pool::Limit,
+    opened: Mutex<Limiter>,
+}
+
+/// A slot of a Service's breaker, taken by a request and given back when dropped (the count it
+/// was taken on outlives the Service that left the view).
+pub(crate) struct Permit(Arc<AtomicUsize>);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ServiceRetry {
@@ -120,12 +136,20 @@ impl ServiceRetry {
                     Duration::from_secs(u64::from(b.window_seconds)),
                 ),
             )),
+            in_flight: Arc::default(),
+            max_requests: AtomicU32::new(policy.circuit_breaker.max_requests),
+            max_connections: Arc::new(AtomicU32::new(policy.circuit_breaker.max_connections)),
+            opened: Mutex::new(Limiter::default()),
         }
     }
 
     /// A new view: `retries` and the rates apply at once; a new window starts the budget empty.
     fn configure(&self, policy: &Policy) {
         self.retries.store(policy.retries, Ordering::Release);
+        self.max_requests
+            .store(policy.circuit_breaker.max_requests, Ordering::Release);
+        self.max_connections
+            .store(policy.circuit_breaker.max_connections, Ordering::Release);
         let b = &policy.retry_budget;
         let mut held = lock(&self.budget);
         if held.0 == b.window_seconds {
@@ -140,6 +164,23 @@ impl ServiceRetry {
 
     pub(crate) fn retries(&self) -> u32 {
         self.retries.load(Ordering::Acquire)
+    }
+
+    /// The HTTP/1 connections a pool may hold for a request of this Service, as the view now
+    /// says (shared: a connection out sees a new value when it comes back).
+    pub(crate) fn max_connections(&self) -> pool::Limit {
+        self.max_connections.clone()
+    }
+
+    /// A slot for a request, or the number in flight when `maxRequests` are (one atomic
+    /// operation: no request is counted that was refused).
+    fn acquire(&self) -> Result<Permit, usize> {
+        let max = self.max_requests.load(Ordering::Acquire) as usize;
+        self.in_flight
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .map(|_| Permit(self.in_flight.clone()))
     }
 
     /// A request: the first try of one, or an L4 connection.
@@ -346,6 +387,50 @@ impl Backend {
             ejection_seconds = ejection.seconds,
             ejections = ejection.ejections,
             "endpoint ejected"
+        );
+    }
+
+    /// Whether every endpoint of the port is ejected now.
+    fn all_ejected(&self, router: &Router) -> bool {
+        let now = router.started.elapsed();
+        let state = lock(&self.state);
+        !state.endpoints.is_empty()
+            && state
+                .endpoints
+                .iter()
+                .all(|e| state.outlier.is_ejected(e.addr, now))
+    }
+
+    /// The breaker takes a request (spec §7.9 "Circuit breaker"): its slot, or `Err` when the
+    /// request is to be answered `breaker-open` (already logged).
+    pub(crate) fn admit(&self, router: &Router) -> Result<Permit, ()> {
+        if self.all_ejected(router) {
+            self.opened(
+                router,
+                "all_ejected",
+                self.retry.in_flight.load(Ordering::Acquire),
+            );
+            return Err(());
+        }
+        self.retry.acquire().map_err(|in_flight| {
+            self.opened(router, "max_requests", in_flight);
+        })
+    }
+
+    /// A request was answered `breaker-open`: logged at most once per second per Service.
+    pub(crate) fn opened(&self, router: &Router, cause: &'static str, in_flight: usize) {
+        let now = router.started.elapsed();
+        let Some(suppressed) = lock(&self.retry.opened).refused(now) else {
+            return;
+        };
+        tracing::warn!(
+            service = &*self.service,
+            backend = &*self.label,
+            cause,
+            in_flight,
+            max_requests = self.retry.max_requests.load(Ordering::Acquire),
+            suppressed,
+            "breaker open"
         );
     }
 
