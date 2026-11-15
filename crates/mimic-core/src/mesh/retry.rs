@@ -272,6 +272,22 @@ impl Planner {
         in_flight: impl Fn(usize) -> u32,
         draw: &mut impl FnMut(usize) -> usize,
     ) -> Next {
+        self.next_unejected(endpoints, now, in_flight, draw, |_| false)
+    }
+
+    /// [`Planner::next`] with the endpoints `ejected` accepts out of the choice (spec §7.9
+    /// "Outlier detection"): an ejected pod is never planned and is no untried pod, also one
+    /// that this request's own tries ejected, so the original destination follows the same
+    /// rule as without ejection. With every pod ejected at the first try: [`Next::Stop`]
+    /// (the caller tells it from `no-endpoint` by the endpoints it holds).
+    pub fn next_unejected(
+        &mut self,
+        endpoints: &Endpoints,
+        now: Duration,
+        in_flight: impl Fn(usize) -> u32,
+        draw: &mut impl FnMut(usize) -> usize,
+        ejected: impl Fn(SocketAddr) -> bool,
+    ) -> Next {
         if self.original || self.tries > self.retries {
             return Next::Stop;
         }
@@ -279,7 +295,7 @@ impl Planner {
         let untried = if self.tried.is_empty() {
             endpoints.len()
         } else {
-            endpoints.count_where(|a| !self.tried.contains(&a))
+            endpoints.count_where(|a| !self.tried.contains(&a) && !ejected(a))
         };
         let last = self.tries == self.retries;
         if self.tries > 0 && self.only_connect && (untried == 0 || last) {
@@ -288,11 +304,13 @@ impl Planner {
             return Next::Original;
         }
         let picked = if self.tried.is_empty() {
-            endpoints.pick(now, &in_flight, draw)
+            endpoints.pick_unejected(now, &in_flight, draw, &ejected)
         } else if untried > 0 {
-            endpoints.pick_where(now, &in_flight, draw, |a| !self.tried.contains(&a))
+            endpoints.pick_where(now, &in_flight, draw, |a| {
+                !self.tried.contains(&a) && !ejected(a)
+            })
         } else {
-            endpoints.pick(now, &in_flight, draw)
+            endpoints.pick_unejected(now, &in_flight, draw, &ejected)
         };
         match picked.and_then(|i| endpoints.addr(i)) {
             Some(pod) => {
