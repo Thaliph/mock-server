@@ -75,7 +75,9 @@ REFUSING_PODS=1             # mesh-refuse: of the MESH_PODS backend pods, this m
 BREAKER_MAX_REQUESTS=8      # mesh-breaker: circuitBreaker.maxRequests of the backend Service (CBR-34)
 BREAKER_DELAY_MS=50         # mesh-breaker: the response delay of the backend
 BREAKER_OPEN_BUDGET_MS=1    # mesh-breaker: the access duration_ms of every breaker-open line, at most (CBR-34)
-EJECT_PER_EJECTION=5        # mesh-eject: requests the resetting pod may receive per ejection (consecutiveFailures default)
+EJECT_PER_EJECTION=5        # mesh-eject: consecutiveFailures (default); the bound per ejection adds the connections in flight - 1
+BREAKER_CONNECTIONS=32      # mesh-breaker: fortio connections, more than maxRequests so that the breaker opens (BEN-03: at most 64)
+BREAKER_OPEN_MIN_PERCENT=10 # mesh-breaker: breaker-open answers, at least this share of the requests, proves it opened (CBR-34)
 PROPAGATION_BUDGET_MS=2000  # EndpointSlice change to the sidecar's view applied, p99 (design §14, M1)
 SYNTHETIC_SERVICES=100      # the synthetic view of the RSS measurement (BEN-15)
 SYNTHETIC_ENDPOINTS=10      # endpoints of each synthetic Service
@@ -174,10 +176,19 @@ for setup in "${ORDERED_SETUPS[@]}"; do
   [[ ! -e $file ]] || config_error BENCH_OUT_DIR "$file already exists, not overwritten"
 done
 
+# setup_connections <setup>: the fortio connections of a setup: CONNECTIONS, BREAKER_CONNECTIONS for mesh-breaker.
+setup_connections() {
+  if [[ $1 == mesh-breaker ]]; then echo "$BREAKER_CONNECTIONS"; else echo "$CONNECTIONS"; fi
+}
+
+# eject_bound: requests the resetting pod may receive per ejection (CBR-34): the consecutive failures that eject it,
+# plus the requests already in flight on the other connections, which an ejection cannot recall.
+eject_bound() { echo $((EJECT_PER_EJECTION + CONNECTIONS - 1)); }
+
 # fortio_args <protocol> <rate> [setup]: the fortio load command of one run, in FORTIO_ARGS (BEN-03). mesh-breaker asks
 # the backend for its own delay in the URL (the echo parameters of fortio's server), the others use the default.
 fortio_args() {
-  FORTIO_ARGS=(load -qps "$2" -t "$DURATION" -c "$CONNECTIONS" -p "50,90,99,99.9" -json -)
+  FORTIO_ARGS=(load -qps "$2" -t "$DURATION" -c "$(setup_connections "${3:-}")" -p "50,90,99,99.9" -json -)
   if [[ $1 == h2c ]]; then FORTIO_ARGS+=(-h2); fi
   if [[ ${3:-} == mesh-breaker ]]; then
     FORTIO_ARGS+=("http://fortio-server:8080/?size=1024&delay=${BREAKER_DELAY_MS}ms")
@@ -240,8 +251,8 @@ if ((DRY_RUN)); then
       mesh-churn) echo "mesh-churn: backend $MESH_PODS pods, mode discovery; rollout restart of the backend in every run; routing asserted before and after the runs" ;;
       mesh-mirror) echo "mesh-mirror: backend $MESH_PODS pods, mode discovery; every rate and protocol runs without any HTTPRoute, with the HTTPRoute and no mirror, then with it mirroring every request to a second fortio Service; routing asserted before and after the runs; the primary p50 budget is +$MIRROR_P50_BUDGET_MS ms and the mirror must receive as many requests as the primary" ;;
       mesh-refuse) echo "mesh-refuse: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and refusing connections, mode discovery; routing asserted before and after the runs; retries and errors recorded" ;;
-      mesh-eject) echo "mesh-eject: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and resetting every connection, mode discovery; routing and an ejection asserted before and after the runs; the error rate must be 0 % and the resetting pod receives at most $EJECT_PER_EJECTION requests per ejection of the caller sidecar" ;;
-      mesh-breaker) echo "mesh-breaker: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, MimicConfig circuitBreaker.maxRequests $BREAKER_MAX_REQUESTS, mode discovery; routing asserted before and after the runs; the access duration_ms of every breaker-open line must be at most $BREAKER_OPEN_BUDGET_MS ms" ;;
+      mesh-eject) echo "mesh-eject: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and resetting every connection, mode discovery; routing and an ejection asserted before and after the runs; the error rate must be 0 % and the resetting pod receives at most $(eject_bound) requests per ejection of the caller sidecar ($EJECT_PER_EJECTION consecutive failures + $CONNECTIONS connections - 1)" ;;
+      mesh-breaker) echo "mesh-breaker: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, MimicConfig circuitBreaker.maxRequests $BREAKER_MAX_REQUESTS, $BREAKER_CONNECTIONS connections, mode discovery; routing asserted before and after the runs; at least $BREAKER_OPEN_MIN_PERCENT % of the requests must be answered breaker-open and the access duration_ms of every breaker-open line must be at most $BREAKER_OPEN_BUDGET_MS ms" ;;
     esac
   done
   if contains mesh-lb "${ORDERED_SETUPS[@]}"; then
@@ -1061,22 +1072,22 @@ mesh_summary() {
 
 # eject_summary: the mesh-eject block, in $WORK/mesh-eject.extra.json (CBR-34): the requests the resetting pod
 # received (its own count, read through the API server) against the ejections of the caller sidecar, and the error
-# rate of the runs. Both budgets are in the block: no error, at most EJECT_PER_EJECTION requests per ejection.
+# rate of the runs. Both budgets are in the block: no error, at most eject_bound requests per ejection.
 eject_summary() {
   local pod received ejections
   pod=$(running_pods fortio-reset | head -n 1)
   received=$(kubectl get --raw "/api/v1/namespaces/$NS/pods/$pod:8081/proxy/")
   ejections=$(jq -r '.ejections' "$WORK/mesh-eject.routing-after.json")
-  jq -n --argjson received "$received" --argjson ejections "$ejections" --argjson per "$EJECT_PER_EJECTION" \
+  jq -n --argjson received "$received" --argjson ejections "$ejections" --argjson per "$(eject_bound)" --argjson fails "$EJECT_PER_EJECTION" --argjson conns "$CONNECTIONS" \
     --slurpfile runs "$WORK/mesh-eject.jsonl" '
     ($runs | map(.requests) | add // 0) as $requests | ($runs | map(.errors) | add // 0) as $errors
     | {requests_total: $requests, errors_total: $errors,
        error_rate_percent: (if $requests == 0 then 0 else (($errors / $requests) * 100000 | round) / 1000 end),
-       resetting_pod_requests: $received, ejections: $ejections, budget_per_ejection: $per,
+       resetting_pod_requests: $received, ejections: $ejections, consecutive_failures: $fails, connections: $conns, budget_per_ejection: $per,
        requests_per_ejection: (if $ejections == 0 then null else (($received / $ejections) * 100 | round) / 100 end),
        within_budget: ($errors == 0 and $ejections >= 1 and $received <= $per * $ejections)}' \
     >"$WORK/mesh-eject.extra.json"
-  echo "mesh-eject: $received requests reached the resetting pod for $ejections ejections, $(jq -r '.errors_total' "$WORK/mesh-eject.extra.json") errors"
+  echo "mesh-eject: $received requests reached the resetting pod for $ejections ejections ($(jq -r '.requests_per_ejection' "$WORK/mesh-eject.extra.json") per ejection, bound $(eject_bound)), $(jq -r '.errors_total' "$WORK/mesh-eject.extra.json") errors"
 }
 
 # breaker_summary: the mesh-breaker block, in $WORK/mesh-breaker.extra.json (CBR-34): the access lines of the client
@@ -1088,12 +1099,15 @@ breaker_summary() {
   lines=$(kubectl -n "$NS" logs "$caller" -c mimic-sidecar --tail=-1 2>>"$WORK/logs.log" \
     | jq -R -c 'fromjson? | select(.target == "access" and .reason == "breaker-open") | .duration_ms' | jq -s -c .)
   jq -n --argjson durations "$lines" --argjson budget "$BREAKER_OPEN_BUDGET_MS" --argjson max "$BREAKER_MAX_REQUESTS" \
-    --slurpfile runs "$WORK/mesh-breaker.jsonl" '
-    {max_requests: $max, breaker_open_lines: ($durations | length), duration_ms_max: ($durations | max),
+    --argjson minpct "$BREAKER_OPEN_MIN_PERCENT" --argjson conns "$BREAKER_CONNECTIONS" --slurpfile runs "$WORK/mesh-breaker.jsonl" '
+    ($runs | map(.requests) | add // 0) as $requests
+    | {max_requests: $max, connections: $conns, requests_total: $requests, breaker_open_lines: ($durations | length),
+     breaker_open_percent: (if $requests == 0 then 0 else (($durations | length) / $requests * 10000 | round) / 100 end),
+     min_breaker_open_percent: $minpct, duration_ms_max: ($durations | max),
      budget_duration_ms: $budget, errors_total: ($runs | map(.errors) | add // 0),
-     within_budget: (($durations | length) > 0 and ($durations | max) <= $budget)}' \
+     within_budget: ($requests > 0 and ($durations | length) * 100 >= $minpct * $requests and ($durations | max) <= $budget)}' \
     >"$WORK/mesh-breaker.extra.json"
-  echo "mesh-breaker: $(jq -r '.breaker_open_lines' "$WORK/mesh-breaker.extra.json") breaker-open lines, longest $(jq -r '.duration_ms_max' "$WORK/mesh-breaker.extra.json") ms"
+  echo "mesh-breaker: $(jq -r '.breaker_open_lines' "$WORK/mesh-breaker.extra.json") breaker-open lines ($(jq -r '.breaker_open_percent' "$WORK/mesh-breaker.extra.json") % of the requests, minimum $BREAKER_OPEN_MIN_PERCENT %), longest $(jq -r '.duration_ms_max' "$WORK/mesh-breaker.extra.json") ms"
 }
 
 # run_one <setup> <protocol> <rate> <index> <total> <variant>: one fortio run, sidecars measured before and after
@@ -1146,7 +1160,7 @@ run_one() {
     callee_json=$(sidecar_json "$callee_before" "$callee_after" "$callee_rss" "$DURATION_S")
   fi
   jq -c -n --arg setup "$setup" --arg protocol "$protocol" --argjson rate "$rate" \
-    --argjson connections "$CONNECTIONS" --argjson duration_s "$DURATION_S" --argjson fortio "$raw" \
+    --argjson connections "$(setup_connections "$setup")" --argjson duration_s "$DURATION_S" --argjson fortio "$raw" \
     --argjson caller "$caller_json" --argjson callee "$callee_json" --argjson churn "$churn" \
     --argjson mirror "$mirror_json" '
     def pct($p): [$fortio.DurationHistogram.Percentiles[] | select(.Percentile == $p) | .Value * 1000][0];
@@ -1168,7 +1182,7 @@ write_results() {
   local setup=$1 file="$OUT_DIR/$TODAY-$1.json" mesh=null
   if [[ -f $WORK/$setup.mesh.json ]]; then mesh=$(cat "$WORK/$setup.mesh.json"); fi
   jq -s --arg date "$TODAY" --arg setup "$setup" --argjson machine "$MACHINE" \
-    --arg duration "$DURATION" --argjson connections "$CONNECTIONS" --argjson mesh "$mesh" \
+    --arg duration "$DURATION" --argjson connections "$(setup_connections "$setup")" --argjson mesh "$mesh" \
     '{date: $date, setup: $setup, machine: $machine, duration: $duration, connections: $connections, mesh: $mesh, runs: .}' \
     "$WORK/$setup.jsonl" >"$file"
   jq -r --arg date "$TODAY" --arg setup "$setup" '
@@ -1221,7 +1235,7 @@ for setup in "${ORDERED_SETUPS[@]}"; do
       >"$WORK/$setup.mesh.json.tmp"
     mv "$WORK/$setup.mesh.json.tmp" "$WORK/$setup.mesh.json"
     if [[ $(jq -r '.within_budget' "$WORK/$setup.extra.json") != true ]]; then
-      echo "FAIL mesh-eject: the error rate is not 0 % or the resetting pod received more than $EJECT_PER_EJECTION requests per ejection (within_budget false in the results)" >&2
+      echo "FAIL mesh-eject: the error rate is not 0 % or the resetting pod received more than $(eject_bound) requests per ejection (within_budget false in the results)" >&2
       FAILED_SETUPS+=("$setup")
     fi
   fi
@@ -1231,7 +1245,7 @@ for setup in "${ORDERED_SETUPS[@]}"; do
       >"$WORK/$setup.mesh.json.tmp"
     mv "$WORK/$setup.mesh.json.tmp" "$WORK/$setup.mesh.json"
     if [[ $(jq -r '.within_budget' "$WORK/$setup.extra.json") != true ]]; then
-      echo "FAIL mesh-breaker: no breaker-open access line, or one lasted more than $BREAKER_OPEN_BUDGET_MS ms (within_budget false in the results)" >&2
+      echo "FAIL mesh-breaker: fewer than $BREAKER_OPEN_MIN_PERCENT % of the requests answered breaker-open, or one lasted more than $BREAKER_OPEN_BUDGET_MS ms (within_budget false in the results)" >&2
       FAILED_SETUPS+=("$setup")
     fi
     kubectl -n "$NS" delete mimicconfig fortio-breaker --ignore-not-found >/dev/null
