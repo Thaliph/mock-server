@@ -75,8 +75,12 @@ pub struct ModifierView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MirrorView {
+    /// The mirror comes before the rule's `RequestHeaderModifier` in `filters`: its copy has
+    /// the fields as the app sent them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub before_modifier: bool,
     pub denominator: u32,
     pub numerator: u32,
     pub port: u16,
@@ -451,6 +455,7 @@ fn compile_rule(rule: &RouteRule, resolver: &mut Resolver) -> RuleView {
                 if let Some((service, port)) = target {
                     let (numerator, denominator) = mirror_fraction(m);
                     filters.mirrors.push(MirrorView {
+                        before_modifier: false,
                         denominator,
                         numerator,
                         port,
