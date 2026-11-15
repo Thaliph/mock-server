@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mimic_core::mesh::mirror;
 use mimic_core::mesh::view::{Limits, View};
 use mimic_runtime::config::{ConfigError, Env};
 use mimic_runtime::metrics::Metrics;
@@ -99,6 +100,14 @@ pub struct MeshConfig {
     /// The middle of the delay before a retry after a trusted refusal (±50 %); a field, not a
     /// variable: tests shorten it.
     pub refusal_delay: Duration,
+    /// Copies in flight per mirror Service port (spec §7.9 "Mirrors"); a field, not a variable:
+    /// M4 decides whether `circuitBreaker.maxRequests` replaces it.
+    pub mirror_max_in_flight: usize,
+    /// Copies in flight for the sidecar in total; a field, not a variable.
+    pub mirror_max_in_flight_total: usize,
+    /// The deadline of a copy from the request head when the rule has no shorter timeout; a
+    /// field, not a variable: tests shorten it.
+    pub mirror_timeout: Duration,
     /// A fixed seed for the random draws (tests); `None`: seeded from the system.
     pub seed: Option<u64>,
 }
@@ -122,6 +131,9 @@ impl Default for MeshConfig {
             retry_buffer: 64 * KIB,
             retry_buffer_total: 8 * MIB,
             refusal_delay: Duration::from_millis(25),
+            mirror_max_in_flight: mirror::MAX_IN_FLIGHT,
+            mirror_max_in_flight_total: mirror::MAX_IN_FLIGHT_TOTAL,
+            mirror_timeout: Duration::from_millis(mirror::TIMEOUT_MS),
             seed: None,
         }
     }

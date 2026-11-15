@@ -253,6 +253,8 @@ pub(crate) struct Tracker {
     rule: Option<usize>,
     /// Mesh-routed: the route timeout that expired (spec §7.9 "Timeouts").
     timeout: Option<&'static str>,
+    /// Mesh-routed: a copy of the request was sent to a mirror (spec §7.9 "Mirrors").
+    mirrored: bool,
 }
 
 /// A head as the HTTP/1 text the recorder parses: the HTTP/2 message has none.
@@ -344,6 +346,7 @@ impl Tracker {
             route: None,
             rule: None,
             timeout: None,
+            mirrored: false,
         };
         let (parts, inner) = req.into_parts();
         let mut tee = capture.as_ref().map(|c| Tee::new(c, true));
@@ -378,6 +381,11 @@ impl Tracker {
     pub(crate) fn matched(&mut self, route: &str, rule: usize) {
         self.route = Some(Arc::from(route));
         self.rule = Some(rule);
+    }
+
+    /// A copy of the request was sent to a mirror (spec §7.9 "Mirrors"): the access line says so.
+    pub(crate) fn mirrored(&mut self) {
+        self.mirrored = true;
     }
 
     /// The sidecar answered itself with `status` (spec §4.1 "Mesh-routed HTTP"): counted and
@@ -562,6 +570,7 @@ impl Tracker {
             route: self.route.take(),
             rule: self.rule,
             timeout: self.timeout,
+            mirrored: self.mirrored,
         });
     }
 }
@@ -705,6 +714,7 @@ pub(crate) fn rejected(ctx: &Ctx) {
         route: None,
         rule: None,
         timeout: None,
+        mirrored: false,
     });
 }
 
@@ -746,6 +756,7 @@ pub(crate) fn refused(ctx: &Ctx, request: Option<&RequestHead>) {
         route: None,
         rule: None,
         timeout: None,
+        mirrored: false,
     });
 }
 
@@ -1069,6 +1080,7 @@ impl Http1Tracker {
             route: None,
             rule: None,
             timeout: None,
+            mirrored: false,
         });
     }
 }

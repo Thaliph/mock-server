@@ -84,6 +84,8 @@ pub struct Exchange {
     pub rule: Option<usize>,
     /// With `result: timeout`: the route timeout that expired, `request` or `backendRequest`.
     pub timeout: Option<&'static str>,
+    /// Routed requests only (spec §7.9 "Mirrors"): a copy was sent to a mirror.
+    pub mirrored: bool,
 }
 
 /// One finished opaque or TLS connection.
@@ -151,6 +153,7 @@ pub fn exchange(e: &Exchange) {
         route = e.route.as_deref(),
         rule = e.rule,
         timeout = e.timeout,
+        mirrored = e.mirrored.then_some(true),
         "http exchange"
     );
 }
