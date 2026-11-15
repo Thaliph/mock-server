@@ -117,6 +117,30 @@ plus 20 % of the requests): the failure is returned as it is, counted in
 (`suppressed` counts the others). Fix the failing pods; to allow more retries raise `retryBudget` in a
 `MimicConfig` on the Service ([Mesh](Mesh#retries)). `retries: 0` turns the retries off on purpose.
 
+**`503` with `x-mimic-error: breaker-open`.** The caller's sidecar refused the request at once; nothing was sent to
+any pod. Two causes, named by the `cause` field of the WARN line `breaker open` (written at most once per second
+per Service, with `suppressed` counting the others):
+
+- `max_requests`: the caller pod already had `maxRequests` requests in flight to that Service
+  ([Mesh](Mesh#circuit-breaker)). Pods that are slow, or streams that stay open (SSE, gRPC), hold the slots. Look at
+  `in_flight` and `max_requests` in the line; raise `circuitBreaker.maxRequests` in the `MimicConfig` of the Service
+  or find why the pods are slow. The limit is per caller pod.
+- `all_ejected`: every endpoint of the port is ejected (possible only with `maxEjectionPercent: 100`). See the
+  next entry.
+
+`mimic_mesh_requests_total{reason="breaker-open"}` counts them and the access line has `reason: breaker-open`.
+The answer is never retried and names no pod.
+
+**Log lines `endpoint ejected` and `endpoint restored`; `mimic_mesh_ejected_endpoints` above 0.** The caller's
+sidecar stopped sending requests to a pod after `consecutiveFailures` failures in a row (connect failures, resets
+before any response head, refusals of its app) or, with `consecutive5xx`, `5xx` answers: `reason` says which, `endpoint` is the pod `ip:port` and
+`ejection_seconds` how long (30 s, doubling at each repeat up to 300 s). `endpoint restored` follows with
+`cause: elapsed`, or `max_percent` when a view lowered the bound. A pod is **not** ejected when it is the only one
+of its Service port, or when `⌊n × maxEjectionPercent / 100⌋` pods are already ejected (at 50 %, 1 of 2 or 3);
+then it is only avoided for 5 s after each failed connect. A pod that is busy or refuses by admission (`overloaded`)
+is not ejected, nor one whose requests time out under a route. Ejection is per caller pod: other callers may still
+send to it. Look at the pod (`kubectl logs`, its readiness) rather than at the mesh.
+
 **`504` with `x-mimic-error: timeout`.** A route timeout expired before the pod's response head
 ([Mesh](Mesh#timeouts)). The access line has `result: timeout` and `timeout: request` or `backendRequest`
 (which of the rule's two it was); `mimic_mesh_requests_total{reason="timeout"}` rises. Raise the timeout in the
