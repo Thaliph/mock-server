@@ -494,6 +494,8 @@ async fn pul_13_pulls_with_the_etag_held_and_follows_the_snapshot() {
 
 #[tokio::test]
 async fn pul_13_the_metrics_name_the_sidecar_and_exist_from_the_start() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(vec![Reply::Silent], Reply::Silent).await;
     let text = rig.metrics.encode();
     for name in [
@@ -551,6 +553,8 @@ async fn pul_14_503_401_403_429_and_a_reset_are_errors_retried_after_a_second() 
 
 #[tokio::test]
 async fn pul_14_an_answer_past_the_timeout_is_an_error_and_is_retried() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start_with(
         vec![Reply::Silent],
         Reply::NotModified,
@@ -613,6 +617,8 @@ async fn pul_14_failures_back_off_and_log_one_warning_then_one_recovery() {
 
 #[tokio::test]
 async fn pul_14_retry_after_waits_at_least_that_long() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(vec![Reply::RetryAfter(503, 3)], Reply::NotModified).await;
     wait(|| rig.api.count() >= 2).await;
     let gap = rig.api.at(1).duration_since(rig.api.at(0));
@@ -622,6 +628,8 @@ async fn pul_14_retry_after_waits_at_least_that_long() {
 
 #[tokio::test]
 async fn pul_14_404_and_405_are_unsupported_and_retried_one_interval_later() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     for status in [404, 405] {
         let rig = Rig::start(vec![Reply::Status(status)], Reply::Status(status)).await;
         wait(|| rig.api.count() >= 3).await;
@@ -639,6 +647,8 @@ async fn pul_14_404_and_405_are_unsupported_and_retried_one_interval_later() {
 
 #[tokio::test]
 async fn pul_14_a_507_is_too_large_and_keeps_the_snapshot() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let one = set_json(&["/v1/ping"], false);
     let rig = Rig::start(vec![ok(&one, "\"1-aa\"")], Reply::Status(507)).await;
     wait(|| rig.pulls("too_large") >= 2).await;
@@ -649,6 +659,8 @@ async fn pul_14_a_507_is_too_large_and_keeps_the_snapshot() {
 
 #[tokio::test]
 async fn pul_14_a_body_over_the_cap_is_too_large_and_the_read_stops_at_the_cap() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let one = set_json(&["/v1/ping"], false);
     let cap = 64 * 1024;
     let rig = Rig::start_with(
@@ -745,6 +757,8 @@ fn pul_15_without_a_controller_url_nothing_is_pulled_and_one_line_says_so() {
 
 #[tokio::test]
 async fn pul_15_without_a_target_the_puller_is_not_built() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let config = EgressConfig {
         interval: INTERVAL,
         max_bytes: 4 << 20,
@@ -757,6 +771,8 @@ async fn pul_15_without_a_target_the_puller_is_not_built() {
 
 #[tokio::test]
 async fn pul_15_no_pull_starts_after_the_stop_and_a_pull_in_flight_is_abandoned() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let rig = Rig::start(vec![], Reply::NotModified).await;
     wait(|| rig.api.count() >= 2).await;
     let api = rig.api.seen.clone();
@@ -804,6 +820,8 @@ fn sidecar(api: &FakeApi, dir: &std::path::Path, extra: &[(&str, &str)]) -> Proc
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pul_15_sigterm_with_a_silent_api_exits_within_the_bound() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dir = tempfile::tempdir().unwrap();
     let api = fake_api(vec![], Reply::Silent).await;
     let mut process = sidecar(&api, dir.path(), &[]);
@@ -833,6 +851,8 @@ fn peak_rss(pid: u32) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pul_14_a_one_gib_body_is_read_up_to_the_cap_only() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dir = tempfile::tempdir().unwrap();
     let api = fake_api(vec![], Reply::Endless).await;
     // The first pull comes at a random time within one interval.
@@ -1176,6 +1196,8 @@ async fn one_call(held: Option<&str>) -> (Vec<u8>, String, Vec<serde_json::Value
 
 #[tokio::test]
 async fn pul_15_a_held_snapshot_changes_no_traffic() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let set = set_json(&["/v1/ping"], true);
     let (plain, plain_recorded, plain_lines) = one_call(None).await;
     let (held, held_recorded, held_lines) = one_call(Some(&set)).await;
@@ -1290,6 +1312,8 @@ fn f12_set() -> (EgressSet, String) {
 
 #[tokio::test]
 async fn plh_07_an_f12_set_is_upgraded_by_the_pull_and_the_mock_answers_placeholders() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     use mimic_core::mock::Request;
     let (current, legacy) = f12_set();
     assert!(legacy.contains("<redacted>"));

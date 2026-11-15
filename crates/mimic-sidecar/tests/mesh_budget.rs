@@ -277,6 +277,8 @@ async fn exhaust(h2: bool) -> (MeshState, Vec<Refuser>, Logs, std::time::Duratio
 
 #[tokio::test]
 async fn rty_50_an_exhausted_budget_returns_the_refusals_as_received_http1() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let (_state, _pods, logs, _) = exhaust(false).await;
     let lines = logs.access_exactly(100).await;
     let tries: Vec<u64> = lines
@@ -289,11 +291,15 @@ async fn rty_50_an_exhausted_budget_returns_the_refusals_as_received_http1() {
 
 #[tokio::test]
 async fn rty_50_an_exhausted_budget_returns_the_refusals_as_received_h2c() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let _ = exhaust(true).await;
 }
 
 #[tokio::test]
 async fn rty_51_the_warning_is_rate_limited_and_holds_no_request_data() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let (state, pods, logs, elapsed) = exhaust(false).await;
     logs.settled().await;
     let lines = warnings(&logs);

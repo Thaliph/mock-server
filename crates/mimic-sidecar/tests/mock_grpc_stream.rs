@@ -158,6 +158,8 @@ async fn replayed(factor: u32) -> (Rig, Vec<Instant>, Vec<Bytes>, Option<HeaderM
 
 #[tokio::test]
 async fn grp_44_the_messages_come_in_order_at_the_recorded_pace_then_the_trailers() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let (rig, at, data, trailers) = replayed(100).await;
     let messages: Vec<String> = data.iter().map(|d| unframed(d)).collect();
     assert_eq!(
@@ -186,6 +188,8 @@ async fn grp_44_the_messages_come_in_order_at_the_recorded_pace_then_the_trailer
 
 #[tokio::test]
 async fn grp_44_the_latency_factor_scales_the_pace() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let (_, at, data, _) = replayed(200).await;
     assert_eq!(data.len(), 5);
     for gap in gaps(&at) {

@@ -495,6 +495,8 @@ async fn tls_17_a_client_gets_a_leaf_from_the_intermediate_and_the_destination_s
 
 #[tokio::test]
 async fn tls_17_h2_follows_the_destinations_alpn_and_a_client_without_alpn_gets_http1() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dest = destination(&[b"h2", b"http/1.1"]).await;
     let (ca, root) = ca_state();
     let sidecar = sidecar(&dest, Some(ca), "").await;
@@ -533,6 +535,8 @@ async fn tls_17_h2_follows_the_destinations_alpn_and_a_client_without_alpn_gets_
 
 #[tokio::test]
 async fn tls_17_without_sni_the_leaf_names_the_destination_ip_and_leaves_are_reused() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dest = destination(&[]).await;
     let (ca, root) = ca_state();
     let sidecar = sidecar(&dest, Some(ca), "").await;
@@ -562,6 +566,8 @@ async fn tls_17_without_sni_the_leaf_names_the_destination_ip_and_leaves_are_reu
 
 #[tokio::test]
 async fn tls_22_the_clients_close_notify_reaches_the_destination_after_the_request() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dest = destination(&[]).await;
     let (ca, root) = ca_state();
     let sidecar = sidecar(&dest, Some(ca), "").await;
@@ -706,6 +712,8 @@ async fn tls_18_an_unverifiable_destination_is_passed_through_and_remembered() {
 
 #[tokio::test]
 async fn tls_18_a_destination_that_resets_during_the_handshake_resets_the_client() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -845,6 +853,8 @@ async fn tls_21_excluded_unsupported_and_inbound_connections_are_not_intercepted
 
 #[tokio::test]
 async fn tls_22_a_client_reset_reaches_the_destination_and_the_reverse() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dest = destination(&[]).await;
     let (ca, root) = ca_state();
     let sidecar = sidecar(&dest, Some(ca), "").await;
@@ -957,6 +967,8 @@ async fn tls_27_a_client_that_resets_during_the_handshake_is_not_remembered() {
 
 #[tokio::test]
 async fn tls_27_a_server_first_protocol_over_an_intercepted_connection_gets_its_banner() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = common::capture_logs();
     let dest = destination_full(&[], true, None, Some(b"220 hello\r\n")).await;
     let (ca, root) = ca_state();
     let sidecar = sidecar(&dest, Some(ca), "").await;
