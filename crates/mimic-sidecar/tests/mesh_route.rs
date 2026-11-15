@@ -193,6 +193,8 @@ async fn pods() -> (Pod, Pod, Pod) {
 
 #[tokio::test]
 async fn rte_47_a_90_10_canary_splits_http1_requests_and_counts_them_per_backend() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let (own, v1, v2) = pods().await;
     let state = state_with(canary_view(&own, &v1, &v2, &canary((90, 10))));
     let f = fixture_mesh(cluster_ip(), &state, None).await;
@@ -224,6 +226,8 @@ async fn rte_47_a_90_10_canary_splits_http1_requests_and_counts_them_per_backend
 
 #[tokio::test]
 async fn rte_47_a_90_10_canary_splits_h2c_requests() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let own = Pod::h2c("own", 0, None).await;
     let (v1, v2) = (Pod::h2c("v1", 0, None).await, Pod::h2c("v2", 0, None).await);
     let mut parent = svc("shop/cart", "127.0.0.1", 80, &[own.addr]);
@@ -284,6 +288,8 @@ fn header_rule(backend_service: &str, name: &str) -> String {
 
 #[tokio::test]
 async fn rte_48_header_and_path_matches_pick_the_backend_and_exact_beats_prefix() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let (own, v1, v2) = pods().await;
     let rules = routes(&[
         route(
@@ -329,6 +335,8 @@ async fn rte_48_header_and_path_matches_pick_the_backend_and_exact_beats_prefix(
 
 #[tokio::test]
 async fn rte_48_a_new_view_applies_to_the_next_request_of_the_same_connection() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let (own, v1, v2) = pods().await;
     let state = state_with(canary_view(&own, &v1, &v2, &canary((100, 0))));
     let f = fixture_mesh(cluster_ip(), &state, None).await;
@@ -495,6 +503,8 @@ async fn mock_rig(own: &Pod, v1: &Pod, v2: &Pod, stale: Option<Duration>) -> (Ri
 
 #[tokio::test]
 async fn rte_52_in_mode_mock_the_mock_answers_and_no_route_is_matched() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let (own, v1, v2) = pods().await;
     let (rig, _state) = mock_rig(&own, &v1, &v2, None).await;
     rig.mode
@@ -516,6 +526,8 @@ async fn rte_52_in_mode_mock_the_mock_answers_and_no_route_is_matched() {
 
 #[tokio::test]
 async fn rte_52_a_stale_view_routes_nothing_and_mesh_false_routes_nothing() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let (own, _, v2) = (
         Pod::http1("own", 0).await,
         Pod::http1("v1", 0).await,
@@ -566,6 +578,8 @@ async fn rte_52_a_stale_view_routes_nothing_and_mesh_false_routes_nothing() {
 
 #[tokio::test]
 async fn rte_52_an_upgrade_request_goes_to_a_pod_of_the_service_itself() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let own = RawPod::start(|head| {
         if head.starts_with(b"GET /ws") {
             b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
@@ -623,6 +637,8 @@ fn count(haystack: &str, needle: &str) -> usize {
 
 #[tokio::test]
 async fn rte_50_the_backend_gets_the_head_with_the_modifiers_applied_on_http1() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let v2 = RawPod::start(|_| {
         b"HTTP/1.1 200 OK\r\nX-Up: 1\r\nTrailer-Like: keep\r\ncontent-length: 2\r\n\r\nok".to_vec()
     })
@@ -704,6 +720,8 @@ async fn spy_h2() -> (SocketAddr, Arc<Mutex<Vec<(hyper::HeaderMap, String)>>>) {
 
 #[tokio::test]
 async fn rte_50_the_backend_gets_the_head_with_the_modifiers_applied_on_h2c() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let (v2, seen) = spy_h2().await;
     let own = Pod::h2c("own", 0, None).await;
     let v1 = Pod::h2c("v1", 0, None).await;
@@ -745,6 +763,8 @@ async fn rte_50_the_backend_gets_the_head_with_the_modifiers_applied_on_h2c() {
 
 #[tokio::test]
 async fn rte_50_answers_of_the_sidecar_carry_no_modified_field_and_a_retry_adds_once() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let spy = RawPod::start(|_| b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec()).await;
     let (own, v1, _) = pods().await;
     let dead = closed_port().await;
@@ -800,6 +820,8 @@ async fn rte_50_answers_of_the_sidecar_carry_no_modified_field_and_a_retry_adds_
 
 #[tokio::test]
 async fn rte_50_discovery_records_the_request_the_app_sent_and_the_modified_response() {
+    // Every test that drives the sidecar captures: see `capture_logs`.
+    let _logs = capture_logs();
     let v2 = RawPod::start(|_| b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec()).await;
     let (own, v1, _) = pods().await;
     let mut parent = svc("shop/cart", "127.0.0.1", 80, &[own.addr]);
@@ -986,6 +1008,7 @@ async fn rte_51_the_budget_is_the_drawn_backends_and_sidecar_answers_deposit_not
     };
     assert_eq!(exhausted("shop/cart-v2:80"), 1.0, "{scrape}");
     assert_eq!(exhausted("shop/cart-v1:80"), 0.0, "{scrape}");
+    logs.settled().await;
     let text = logs.text();
     let warn = text
         .lines()
