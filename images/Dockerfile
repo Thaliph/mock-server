@@ -10,7 +10,7 @@ FROM docker.io/oliver006/redis_exporter:v1.95.0@sha256:afb21407aba3df1b4010899f1
 
 # Bundled Prometheus (#379, spec §10.7): the chart's monitoring.prometheus.image, v3.15.1 published 2026-10-21
 # (GitHub release), outside the 14-day cooldown.
-FROM quay.io/prometheus/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2 AS prometheus
+FROM quay.io/prometheus/prometheus:v3.16.0@sha256:9332054523223e2ddc18d8101799d54a4a8d823b030c53216f063a6c117773cd AS prometheus
 
 # Bundled Grafana (#379, spec §10.7): the chart's monitoring.grafana.image, v13.2.4 published 2026-10-13 (GitHub
 # release), outside the 14-day cooldown.
