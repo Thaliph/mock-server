@@ -60,6 +60,8 @@ NS=mimic-bench
 SYSTEM_NS=mimic-system
 RELEASE=mimic
 RATE_CAP=200
+MIRROR_MISMATCH=0
+FAILED_SETUPS=()
 MIRROR_P50_BUDGET_MS=0.2    # mesh-mirror: the primary's p50 with the mirror over its p50 without (design §14, M3)
 MESH_PODS=3                 # the backend of the mesh setups (BEN-11)
 REFUSING_PODS=1             # mesh-refuse: of the MESH_PODS backend pods, this many are not injected and refuse (RTY-23)
@@ -819,8 +821,9 @@ YAML
   exit 1
 }
 
-# mirror_settle <sent before> <requests>: waits up to 30 s for the copies of a run with the mirror, and fails
-# unless the client counted exactly as many sent copies as the primary had requests (RTE-94). Prints the count.
+# mirror_settle <sent before> <requests>: waits up to 30 s for the copies of a run with the mirror and prints
+# the count. A count other than the primary's requests (RTE-94) is reported on stderr and recorded in the results
+# (`copies_match`); run_one sets MIRROR_MISMATCH and the verdict of the setup fails at its end, not the whole run.
 mirror_settle() {
   local before=$1 requests=$2 sent deadline=$((SECONDS + 30))
   while :; do
@@ -830,7 +833,6 @@ mirror_settle() {
   done
   if ((sent != requests)); then
     echo "FAIL mesh-mirror: the mirror counted $sent sent copies for $requests primary requests, as many expected" >&2
-    exit 1
   fi
   echo "$sent"
 }
@@ -901,8 +903,11 @@ run_one() {
   jq -e '.DurationHistogram.Count' <<<"$raw" >/dev/null || { echo "FAIL run $index printed no fortio JSON" >&2; exit 1; }
   if [[ $variant == off ]]; then mirror_json='{"enabled": false}'; fi
   if [[ $variant == on ]]; then
-    mirror_json=$(jq -nc --argjson sent "$(mirror_settle "$sent_before" "$(jq '.DurationHistogram.Count' <<<"$raw")")" \
-      '{enabled: true, copies_sent: $sent}')
+    local requests copies
+    requests=$(jq '.DurationHistogram.Count' <<<"$raw")
+    copies=$(mirror_settle "$sent_before" "$requests")
+    if ((copies != requests)); then MIRROR_MISMATCH=1; fi
+    mirror_json=$(jq -nc --argjson sent "$copies" '{enabled: true, copies_sent: $sent}')
   fi
   if [[ $setup != plain ]]; then
     ca=$(scrape "$caller" process_cpu_seconds_total)
@@ -985,5 +990,14 @@ for setup in "${ORDERED_SETUPS[@]}"; do
   fi
   if [[ $setup == mesh-* ]]; then mesh_summary "$setup"; fi
   write_results "$setup"
+  if ((MIRROR_MISMATCH)); then
+    echo "FAIL $setup: the copies counted sent differ from the primary requests (copies_match false in the results)" >&2
+    FAILED_SETUPS+=("$setup")
+    MIRROR_MISMATCH=0
+  fi
 done
 echo "done: $total runs"
+if ((${#FAILED_SETUPS[@]} > 0)); then
+  echo "FAIL setups: ${FAILED_SETUPS[*]}" >&2
+  exit 1
+fi

@@ -1114,7 +1114,8 @@ impl Serving {
         (timeouts, began): (Option<&TimeoutsView>, Instant),
         (protocol, sent): (Protocol, &Arc<AtomicBool>),
     ) {
-        if mirrors.is_empty() {
+        // No copy starts after `SIGTERM`: none is decided, so none is claimed as sent.
+        if mirrors.is_empty() || self.mesh.stopping() {
             return;
         }
         let router = self.mesh.router();
@@ -1144,6 +1145,8 @@ impl Serving {
             };
             let result = match (decision, slot) {
                 (decision @ (mirror::Decision::Send | mirror::Decision::AwaitBody), Some(slot)) => {
+                    // The mirror left the view since the decision: no request is made, the
+                    // copy counts as `error` (spec: "sent or error").
                     let Some(backend) = router.backend(&m.service, m.port) else {
                         router.metrics.mirrored(label, "error");
                         sent.store(true, Ordering::SeqCst);

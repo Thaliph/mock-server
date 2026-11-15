@@ -273,11 +273,11 @@ impl Shared {
             hint: self.hint,
         });
         for (copy, sent) in self.copies.drain(..) {
-            // The copy has its body and will be sent: the access line may say so.
-            if held.is_some() {
+            // The copy has its body and will be sent: the access line may say so, unless its
+            // task already gave up (deadline) and nobody gets the body.
+            if copy.send(held.clone()).is_ok() && held.is_some() {
                 sent.store(true, Ordering::SeqCst);
             }
-            let _ = copy.send(held.clone());
         }
         if self.delivered {
             self.replay.release();
@@ -376,6 +376,8 @@ impl Source {
     pub(crate) fn release(&self) {
         let mut shared = lock(&self.shared);
         shared.delivered = true;
+        // A copy that gave up (its deadline) dropped its receiver: it holds nothing back.
+        shared.copies.retain(|(tx, _)| !tx.is_closed());
         if shared.copies.is_empty() {
             shared.replay.release();
         }

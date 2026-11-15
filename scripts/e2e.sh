@@ -6006,6 +6006,8 @@ rte_93_first_copy() { rte_93_post 0 1 >/dev/null || return 1; [[ $(rte_93_stats 
 rte_93_until 60 "no request was mirrored to cart-shadow within 60 s of the route" rte_93_first_copy
 rte_93_has_sent() { [[ $(rte_93_sent) -ge 1 ]]; }
 rte_93_until 15 "the first copy was not counted sent by the sidecar of client" rte_93_has_sent
+# A copy of the warm-up still in flight must not land after the baselines: they are taken once stable.
+sleep 2
 rte_93_count_before=$(rte_93_stats '.count')
 rte_93_sent_before=$(rte_93_sent)
 rte_93_access_before=$(rte_93_access '.direction == "outbound" and .mirrored == true')

@@ -461,7 +461,8 @@ a body are mirrored.
 the body has not ended at the copy's deadline (a long gRPC or HTTP/2 stream is never mirrored), or when
 **256 copies per mirror Service port** or **1024 per sidecar** are already in flight. Each copy ends at the
 earliest of **10 s** and the rule's `timeouts.request` and `timeouts.backendRequest` (non-zero ones), counted
-from the request head. Copies in flight at the end of the `SIGTERM` grace are dropped, and none starts after it.
+from the request head. A copy waits for its body while holding its slot, up to that deadline, so slow uploads can fill
+the 256 slots of a port (the next copies are then counted `skipped_limit`). Copies in flight at the end of the `SIGTERM` grace are dropped, and none starts after it.
 Each drawn mirror is counted once in `mimic_mesh_mirrored_total{backend,result}`
 ([Monitoring](Monitoring#mesh-metrics)); the access line of the request has `mirrored: true` when a copy was
 sent or failed ([Access logs](Access-logs)). Copies write no log line of their own and discovery never
