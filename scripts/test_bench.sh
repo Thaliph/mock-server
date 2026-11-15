@@ -266,7 +266,7 @@ ben_12_mesh_eject_and_breaker_planned() {
   check "the plan has 2 injected and 1 resetting pod" has "mesh-eject: backend 3 pods, 2 injected and 1 not injected and resetting every connection"
   check "the plan names the budget of mesh-eject" has "at most 12 requests per ejection of the caller sidecar (5 consecutive failures + 8 connections - 1)"
   check "the plan names the breaker" has "mesh-breaker: backend 3 pods answering after 50 ms, MimicConfig circuitBreaker.maxRequests 8, 32 connections"
-  check "the plan names the budget of mesh-breaker" has "at least 10 % of the requests must be answered breaker-open and the access duration_ms of every breaker-open line must be at most 1 ms"
+  check "the plan names the budget of mesh-breaker" has "at least 10 % of the requests must be answered breaker-open and the p99 of the access duration_ms of the breaker-open lines must be at most 1 ms"
   check "only mesh-breaker asks for the delay" count_is "delay=50ms" 1
   check "the results file of mesh-eject is named" has "$today-mesh-eject.json"
   check "the results file of mesh-breaker is named" has "$today-mesh-breaker.json"

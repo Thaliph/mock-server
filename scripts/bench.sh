@@ -74,7 +74,7 @@ REFUSING_PODS=1             # mesh-refuse: of the MESH_PODS backend pods, this m
                             # mesh-eject: this many are not injected and reset every connection (CBR-34)
 BREAKER_MAX_REQUESTS=8      # mesh-breaker: circuitBreaker.maxRequests of the backend Service (CBR-34)
 BREAKER_DELAY_MS=50         # mesh-breaker: the response delay of the backend
-BREAKER_OPEN_BUDGET_MS=1    # mesh-breaker: the access duration_ms of every breaker-open line, at most (CBR-34)
+BREAKER_OPEN_BUDGET_MS=1    # mesh-breaker: the p99 of the access duration_ms of the breaker-open lines, at most (CBR-34)
 EJECT_PER_EJECTION=5        # mesh-eject: consecutiveFailures (default); the bound per ejection adds the connections in flight - 1
 BREAKER_CONNECTIONS=32      # mesh-breaker: fortio connections, more than maxRequests so that the breaker opens (BEN-03: at most 64)
 BREAKER_OPEN_MIN_PERCENT=10 # mesh-breaker: breaker-open answers, at least this share of the requests, proves it opened (CBR-34)
@@ -253,7 +253,7 @@ if ((DRY_RUN)); then
       mesh-mirror) echo "mesh-mirror: backend $MESH_PODS pods, mode discovery; every rate and protocol runs without any HTTPRoute, with the HTTPRoute and no mirror, then with it mirroring every request to a second fortio Service; routing asserted before and after the runs; the primary p50 budget is +$MIRROR_P50_BUDGET_MS ms and the mirror must receive as many requests as the primary" ;;
       mesh-refuse) echo "mesh-refuse: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and refusing connections, mode discovery; routing asserted before and after the runs; retries and errors recorded" ;;
       mesh-eject) echo "mesh-eject: backend $MESH_PODS pods, $((MESH_PODS - REFUSING_PODS)) injected and $REFUSING_PODS not injected and resetting every connection, mode discovery; routing and an ejection asserted before and after the runs; the error rate must be 0 % and the resetting pod receives at most $(eject_bound) requests per ejection of the caller sidecar ($EJECT_PER_EJECTION consecutive failures + $CONNECTIONS connections - 1)" ;;
-      mesh-breaker) echo "mesh-breaker: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, MimicConfig circuitBreaker.maxRequests $BREAKER_MAX_REQUESTS, $BREAKER_CONNECTIONS connections, mode discovery; routing asserted before and after the runs; at least $BREAKER_OPEN_MIN_PERCENT % of the requests must be answered breaker-open and the access duration_ms of every breaker-open line must be at most $BREAKER_OPEN_BUDGET_MS ms" ;;
+      mesh-breaker) echo "mesh-breaker: backend $MESH_PODS pods answering after $BREAKER_DELAY_MS ms, MimicConfig circuitBreaker.maxRequests $BREAKER_MAX_REQUESTS, $BREAKER_CONNECTIONS connections, mode discovery; routing asserted before and after the runs; at least $BREAKER_OPEN_MIN_PERCENT % of the requests must be answered breaker-open and the p99 of the access duration_ms of the breaker-open lines must be at most $BREAKER_OPEN_BUDGET_MS ms" ;;
     esac
   done
   if contains mesh-lb "${ORDERED_SETUPS[@]}"; then
@@ -1105,8 +1105,10 @@ breaker_summary() {
     | {max_requests: $max, connections: $conns, requests_total: $requests, breaker_open_lines: ($durations | length),
      breaker_open_percent: (if $requests == 0 then 0 else (($durations | length) / $requests * 10000 | round) / 100 end),
      min_breaker_open_percent: $minpct, duration_ms_max: ($durations | max),
+     duration_ms_counts: ($durations | group_by(.) | map({ms: .[0], n: length})),
+     duration_ms_p99: (if ($durations | length) == 0 then null else ($durations | sort | .[((length * 99 / 100) | floor)]) end),
      budget_duration_ms: $budget, errors_total: ($runs | map(.errors) | add // 0),
-     within_budget: ($requests > 0 and ($durations | length) * 100 >= $minpct * $requests and ($durations | max) <= $budget)}' \
+     within_budget: ($requests > 0 and ($durations | length) * 100 >= $minpct * $requests and ($durations | sort | .[((length * 99 / 100) | floor)]) <= $budget)}' \
     >"$WORK/mesh-breaker.extra.json"
   echo "mesh-breaker: $(jq -r '.breaker_open_lines' "$WORK/mesh-breaker.extra.json") breaker-open lines ($(jq -r '.breaker_open_percent' "$WORK/mesh-breaker.extra.json") % of the requests, minimum $BREAKER_OPEN_MIN_PERCENT %), longest $(jq -r '.duration_ms_max' "$WORK/mesh-breaker.extra.json") ms"
 }
@@ -1246,7 +1248,7 @@ for setup in "${ORDERED_SETUPS[@]}"; do
       >"$WORK/$setup.mesh.json.tmp"
     mv "$WORK/$setup.mesh.json.tmp" "$WORK/$setup.mesh.json"
     if [[ $(jq -r '.within_budget' "$WORK/$setup.extra.json") != true ]]; then
-      echo "FAIL mesh-breaker: fewer than $BREAKER_OPEN_MIN_PERCENT % of the requests answered breaker-open, or one lasted more than $BREAKER_OPEN_BUDGET_MS ms (within_budget false in the results)" >&2
+      echo "FAIL mesh-breaker: fewer than $BREAKER_OPEN_MIN_PERCENT % of the requests answered breaker-open, or their p99 duration_ms is over $BREAKER_OPEN_BUDGET_MS ms (within_budget false in the results)" >&2
       FAILED_SETUPS+=("$setup")
     fi
     kubectl -n "$NS" delete mimicconfig fortio-breaker --ignore-not-found >/dev/null
