@@ -21,6 +21,8 @@ pub enum Outcome {
     QueueTimeout,
     /// The callee's sidecar answered that its app refused the connection (#518).
     AppRefused,
+    /// A route timeout expired before the response head (never retried).
+    Timeout,
 }
 
 impl Outcome {
@@ -33,6 +35,7 @@ impl Outcome {
             Outcome::Overloaded => "overloaded",
             Outcome::QueueTimeout => "queue_timeout",
             Outcome::AppRefused => "app_refused",
+            Outcome::Timeout => "timeout",
         }
     }
 }
@@ -61,6 +64,8 @@ pub enum Failure {
     Response,
     /// A failure after the response head.
     AfterHead,
+    /// A route timeout expired before the response head: the request may have been processed.
+    Timeout,
 }
 
 /// Why a failure of a retried kind is not retried (`mimic_mesh_retries_skipped_total`).
@@ -99,6 +104,13 @@ pub fn classify(failure: Failure, method: &str, body_held: bool, written: bool) 
             return Verdict {
                 outcome: Outcome::ConnectFailed,
                 retry: true,
+                skip: None,
+            };
+        }
+        Failure::Timeout => {
+            return Verdict {
+                outcome: Outcome::Timeout,
+                retry: false,
                 skip: None,
             };
         }
